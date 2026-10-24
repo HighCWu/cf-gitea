@@ -93,6 +93,11 @@ scripts/               # Repo-level tooling (contract checks, codegen)
 - Subagents are dispatched as **background** agents (`run_in_background`), never
   blocking the orchestrator; agents message the orchestrator when blocked, and the
   orchestrator integrates, reviews, and adjusts direction mid-flight.
+- **Completion-loop discipline (user-mandated)**: after EVERY subagent
+  completion — review, verify, commit, AND immediately dispatch a
+  replacement to hold the pool at the target concurrency (6). A landing
+  that ends at the summary without a re-dispatch wastes the slot; keep a
+  warm queue of dependency-ready unowned goals for exactly this moment.
 - Every dispatched task declares **exclusive file ownership**; an agent must not
   create or modify files outside its ownership. Shared files (e.g. `src/index.ts`,
   root `package.json`, `wrangler.jsonc`) are touched ONLY by the orchestrator or by
