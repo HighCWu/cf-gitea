@@ -76,3 +76,49 @@ mid-R2-operation.
 finalize-success-response-lost retry convergence, fetch×compaction race,
 full clone with cross-pack delta bases, incremental fetch relying on
 REF_DELTA + negotiated haves.
+
+## Round-4 additions (lease-expiry vs R2-delete protocol)
+
+**Accepted counter-example (renewal in flight, lease expired)**: "periodically
+sending renewals" ≠ "holding a valid lease" — GC may observe zero live leases
+while a renewal RPC is still in flight, delete the pack, and the reader then
+reads a deleted object with no component having violated the (implicit,
+under-specified) protocol.
+
+**v1 property choice: SAFETY (its Proposition A), not availability.** Any
+successfully completed fetch has complete, parseable, protocol-valid output;
+lease failure or object unavailability must never be reported as success.
+Rationale: git clients already verify packs end-to-end (index-pack rejects
+truncated/missing-object packs), so safety is doubly guaranteed (our abort
+discipline + protocol-level client verification). Availability-under-GC (B)
+is explicitly NOT promised in v1.
+
+**Read-safety protocol (closes the counter-example deterministically)**: no
+R2 GET segment may start without a lease whose expiry the Worker has
+CONFIRMED covers the segment. The re-framing loop awaits the renewal RPC
+inline before pulling the next chunk (the Worker paces the stream, so a
+slow renewal back-pressures the client instead of racing GC); a rejected or
+expired renewal aborts the response (terminate-and-retry posture). Fencing
+tokens are honest about their boundary: R2 does not check DO tokens — the
+Worker's pre-read check is the enforcement point, which is sufficient under
+Property A (a missed check can fail a fetch but cannot corrupt one).
+
+**Lease durability & state rules**: read leases persist in DO SQLite (the
+leases table); DO restart preserves unexpired leases; renewal and GC
+eligibility evaluate in the same serialized control domain; RECLAIMABLE is
+irreversible in v1 (a late renewal for a RECLAIMABLE pack is rejected →
+reader aborts; re-marking readable requires an explicit recovery
+transaction, out of scope); R2 DELETE failures retry idempotently.
+
+**Two-proposition acceptance (verbatim from the review)**:
+- Safety invariant: any successful fetch's output object set is complete,
+  parseable, and Git-pack-protocol-valid; lease expiry or unavailability is
+  never reported as success.
+- GC isolation invariant: while a valid read authorization protects a
+  fetch's dependency set, GC must not make those packs unavailable.
+
+**Fault-injection additions**: (A) renewal-late — delay DO processing so GC
+pre-empts; assert renewal rejected, reader abandons the plan; (B) DO restart
+mid-fetch — assert unexpired leases still block deletion; (C) delete vs
+renewal race — GC pauses at RECLAIMABLE before R2 DELETE; assert the system
+never grants both the renewal and the delete.
