@@ -13,6 +13,7 @@
     "typecheck": "pnpm -r typecheck",
     "lint": "eslint .",
     "test": "pnpm -r test",
+    "test:lfs": "bash scripts/lfs-e2e.sh",
     "check:api": "node scripts/check-openapi.mjs",
     "check:contract": "node scripts/check-contract-frozen.mjs",
     "build:assets": "node scripts/build-gitea-assets.mjs",
