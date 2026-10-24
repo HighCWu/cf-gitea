@@ -1,9 +1,11 @@
 /**
  * Schema/migration parity (the 0005 consolidation of the service-side
- * DDL-in-waiting): a D1 freshly applied the generated migrations must accept
- * exactly the operations the superseded raw-DDL path
- * (`LFS_OBJECTS_DDL_STATEMENTS`, `ORG_DDL_STATEMENTS`) allowed, and the
- * Drizzle table objects must drive those same statements.
+ * DDL-in-waiting, extended by the 0007 sweep): a D1 freshly applied the
+ * generated migrations must accept exactly the operations the superseded
+ * raw-DDL paths (`LFS_OBJECTS_DDL_STATEMENTS`, `ORG_DDL_STATEMENTS`, and the
+ * batch-7 `REPO_TOPICS/REPO_WATCHERS/REPO_COLLABORATORS/REPO_SETTINGS/
+ * FOLLOWS_DDL_STATEMENTS`) allowed, and the Drizzle table objects must drive
+ * those same statements.
  *
  * Structure is asserted against `sqlite_master`/`PRAGMA table_info`
  * (composite PK, index names, column types/nullability/defaults — matching
@@ -20,7 +22,17 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { lfsObjects, orgMembers, userRedirects, users } from "./schema";
+import {
+  follows,
+  lfsObjects,
+  orgMembers,
+  repoCollaborators,
+  repoSettings,
+  repoTopics,
+  repoWatchers,
+  userRedirects,
+  users,
+} from "./schema";
 
 beforeAll(applyAuthD1Migrations);
 
@@ -240,6 +252,148 @@ describe("user_redirects parity (superseded ORG_DDL_STATEMENTS table)", () => {
     await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(userId).run();
     expect(
       await env.DB.prepare("SELECT count(*) AS n FROM user_redirects WHERE lower_name = 'parityold'").first<{ n: number }>(),
+    ).toEqual({ n: 0 });
+  });
+});
+
+describe("batch-7 stores parity (superseded REPO_*_DDL_STATEMENTS)", () => {
+  it("repo_topics: composite PK structure and the diffed-replace write rule", async () => {
+    const db = drizzle(env.DB);
+    const columns = await tableColumns("repo_topics");
+    expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
+      ["repo_id", "TEXT", 1, 1],
+      ["topic", "TEXT", 1, 2],
+    ]);
+
+    // Drizzle path: the replace delta (delete removed + insert added).
+    await db.batch([
+      db.insert(repoTopics).values({ repoId: "t1", topic: "go" }),
+      db.insert(repoTopics).values({ repoId: "t1", topic: "web" }),
+    ]);
+    await db.delete(repoTopics).where(and(eq(repoTopics.repoId, "t1"), eq(repoTopics.topic, "web")));
+    const kept = await env.DB.prepare("SELECT topic FROM repo_topics WHERE repo_id = 't1'").all<{ topic: string }>();
+    expect(kept.results).toEqual([{ topic: "go" }]);
+
+    // The (repo_id, topic) PK arbitrates duplicates on the raw path too.
+    await expect(
+      env.DB.prepare("INSERT INTO repo_topics (repo_id, topic) VALUES ('t1', 'go')").run(),
+    ).rejects.toThrow();
+  });
+
+  it("repo_watchers: composite PK, user index, first-created_at upsert", async () => {
+    const db = drizzle(env.DB);
+    const columns = await tableColumns("repo_watchers");
+    expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
+      ["repo_id", "TEXT", 1, 1],
+      ["user_id", "INTEGER", 1, 2],
+      ["created_at", "INTEGER", 0, 0],
+    ]);
+    expect(await indexNames("repo_watchers")).toContain("idx_repo_watchers_user");
+
+    // DO NOTHING keeps the FIRST created_at on repeat watches.
+    await db.insert(repoWatchers).values({ repoId: "w1", userId: 7, createdAt: new Date(1000) });
+    await db.insert(repoWatchers).values({ repoId: "w1", userId: 7, createdAt: new Date(5000) }).onConflictDoNothing();
+    expect(
+      await env.DB.prepare("SELECT created_at FROM repo_watchers WHERE repo_id = 'w1'").first<{ created_at: number }>(),
+    ).toEqual({ created_at: 1 });
+  });
+
+  it("repo_collaborators: composite PK, 'write' default, upsert arbitration", async () => {
+    const db = drizzle(env.DB);
+    const columns = await tableColumns("repo_collaborators");
+    expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
+      ["repo_id", "TEXT", 1, 1],
+      ["user_id", "INTEGER", 1, 2],
+      ["mode", "TEXT", 1, 0],
+      ["created_at", "INTEGER", 0, 0],
+      ["updated_at", "INTEGER", 0, 0],
+    ]);
+    expect(await indexNames("repo_collaborators")).toContain("idx_repo_collaborators_user");
+
+    // Raw insert with omitted columns → the raw DDL's DEFAULT 'write'.
+    await env.DB.prepare("INSERT INTO repo_collaborators (repo_id, user_id) VALUES ('c1', 3)").run();
+    expect(
+      await env.DB.prepare("SELECT mode FROM repo_collaborators WHERE repo_id = 'c1'").first<{ mode: string }>(),
+    ).toEqual({ mode: "write" });
+
+    // Both paths arbitrate the (repo_id, user_id) upsert.
+    await expect(
+      env.DB.prepare("INSERT INTO repo_collaborators (repo_id, user_id) VALUES ('c1', 3)").run(),
+    ).rejects.toThrow();
+    await db
+      .insert(repoCollaborators)
+      .values({ repoId: "c1", userId: 3, mode: "admin", createdAt: new Date(2000), updatedAt: new Date(2000) })
+      .onConflictDoUpdate({
+        target: [repoCollaborators.repoId, repoCollaborators.userId],
+        set: { mode: "admin", updatedAt: new Date(2000) },
+      });
+    expect(
+      await env.DB.prepare("SELECT mode FROM repo_collaborators WHERE repo_id = 'c1'").first<{ mode: string }>(),
+    ).toEqual({ mode: "admin" });
+  });
+
+  it("repo_settings: 1:1 PK row, declared defaults on omitted columns", async () => {
+    const db = drizzle(env.DB);
+    const columns = await tableColumns("repo_settings");
+    expect(columns.map((c) => [c.name, c.type, c.notnull])).toEqual([
+      ["repo_id", "TEXT", 1],
+      ["description", "TEXT", 1],
+      ["website", "TEXT", 1],
+      ["has_issues", "INTEGER", 1],
+      ["has_wiki", "INTEGER", 1],
+      ["has_pull_requests", "INTEGER", 1],
+      ["has_releases", "INTEGER", 1],
+      ["has_projects", "INTEGER", 1],
+      ["has_packages", "INTEGER", 1],
+      ["has_actions", "INTEGER", 1],
+      ["updated_at", "INTEGER", 0],
+    ]);
+
+    // Insert omitting every defaulted column → upstream defaults (the raw
+    // DDL's 1/0; drizzle-kit records the `true`/`false` keyword aliases).
+    await db.insert(repoSettings).values({ repoId: "s1" });
+    expect(
+      await env.DB
+        .prepare(
+          `SELECT description, website, has_issues, has_projects, has_actions
+           FROM repo_settings WHERE repo_id = 's1'`,
+        )
+        .first<Record<string, unknown>>(),
+    ).toEqual({ description: "", website: "", has_issues: 1, has_projects: 0, has_actions: 0 });
+
+    // The repo_id PK arbitrates the PATCH upsert.
+    await expect(db.insert(repoSettings).values({ repoId: "s1" })).rejects.toThrow();
+  });
+
+  it("follows: UNIQUE pair + reverse index, cascade on either user", async () => {
+    const db = drizzle(env.DB);
+    const ids = await seedUsers("ParityFollower", "ParityFollowed");
+    const followerId = ids[0]!;
+    const followedId = ids[1]!;
+
+    const columns = await tableColumns("follows");
+    expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
+      ["id", "INTEGER", 1, 1],
+      ["user_id", "INTEGER", 1, 0],
+      ["follow_id", "INTEGER", 1, 0],
+      ["created_at", "INTEGER", 1, 0],
+    ]);
+    expect(await indexNames("follows")).toContain("follows_user_follow_uq");
+    expect(await indexNames("follows")).toContain("follows_follow_idx");
+
+    // Drizzle write (followUser's guarded insert), raw UNIQUE check.
+    await db.insert(follows).values({ userId: followerId, followId: followedId, createdAt: new Date(3000) });
+    await expect(
+      env.DB
+        .prepare("INSERT INTO follows (user_id, follow_id, created_at) VALUES (?, ?, 0)")
+        .bind(followerId, followedId)
+        .run(),
+    ).rejects.toThrow();
+
+    // ON DELETE CASCADE fires on both edges (the declared FKs).
+    await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(followerId).run();
+    expect(
+      await env.DB.prepare("SELECT count(*) AS n FROM follows WHERE follow_id = ?").bind(followedId).first<{ n: number }>(),
     ).toEqual({ n: 0 });
   });
 });

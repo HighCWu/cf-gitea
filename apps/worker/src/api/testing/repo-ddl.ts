@@ -1,33 +1,26 @@
 import { env } from "cloudflare:workers";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { REPO_COLLABORATORS_DDL_STATEMENTS } from "../services/repo-collaborators";
-import { REPO_SETTINGS_DDL_STATEMENTS } from "../services/repo-settings";
-import { REPO_TOPICS_DDL_STATEMENTS } from "../services/repo-topics";
-import { REPO_WATCHERS_DDL_STATEMENTS } from "../services/repo-watchers";
 
 /**
- * Test bootstrap for the batch-7 raw-D1 stores (the LFS `testing.ts`
- * pattern): the generated migrations cover the landed tables; the four
- * batch-7 stores (repo_topics, repo_watchers, repo_collaborators,
- * repo_settings) are the documented SCHEMA GAP and bootstrap from their
- * services' DDL statements until the migration owner's sweep lands them in
- * schema.ts. `IF NOT EXISTS` keeps repeat applications (per-file isolation)
- * idempotent.
+ * Test bootstrap for the batch-7 raw-D1 stores — retired into the migration
+ * path by the 0007 sweep (the 0005 consolidation pattern): the five tables
+ * the four batch-7 services plus `follows` used to bootstrap by hand
+ * (repo_topics, repo_watchers, repo_collaborators, repo_settings, follows)
+ * are in the generated migrations now, so this module just applies them. The
+ * historical name (`applyRepoExtrasDdl`) stays so callers need not change;
+ * the per-service DDL constants survive only as superseded records.
+ *
+ * The vitest plugin's per-file storage isolation retains schema created in
+ * `beforeAll` for every test in the file; `IF NOT EXISTS` semantics are
+ * inherited from the migration ledger (d1_migrations), not needed here.
  */
 export async function applyRepoExtrasDdl(): Promise<void> {
   await applyAuthD1Migrations();
-  for (const statement of [
-    ...REPO_TOPICS_DDL_STATEMENTS,
-    ...REPO_WATCHERS_DDL_STATEMENTS,
-    ...REPO_COLLABORATORS_DDL_STATEMENTS,
-    ...REPO_SETTINGS_DDL_STATEMENTS,
-  ]) {
-    await env.DB.prepare(statement).run();
-  }
 }
 
-/** Clear the batch-7 raw stores between tests (schema persists). */
+/** Clear the batch-7 stores between tests (schema persists; only rows are
+ *  per-test scratch). */
 export async function resetRepoExtrasTables(): Promise<void> {
   for (const table of ["repo_topics", "repo_watchers", "repo_collaborators", "repo_settings"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();

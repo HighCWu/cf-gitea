@@ -893,3 +893,127 @@ export const userRedirects = sqliteTable(
   },
   (t) => [uniqueIndex("user_redirects_lower_uq").on(t.lowerName)],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0004 batch-7 stores — the migration sweep of the raw-D1 schema gap
+// (`REPO_TOPICS/REPO_WATCHERS/REPO_COLLABORATORS/REPO_SETTINGS_DDL_STATEMENTS`
+// in the services, ported verbatim; same supersede pattern as migration
+// 0005's LFS/org consolidation). All four key on the TEXT `repositories.id`,
+// all four are repo-scoped rows deleted in the deleteRepository cascade
+// (src/repos/service.ts) — no declared FK, per the schema conventions above.
+// Timestamps stay the raw DDL's bare INTEGER unix seconds (app-managed, no
+// unixepoch() defaults — the services always bind them explicitly).
+// ---------------------------------------------------------------------------
+
+/**
+ * Repo topics (upstream pairs a `topic` + `repo_topic` join with a
+ * denormalized `repository.topics` render cache; the join half is the one the
+ * API semantics need — see services/repo-topics.ts). `(repo_id, topic)` is
+ * the PK: SaveTopics' diffed replace relies on it (a naive delete-all +
+ * re-insert would abort on kept rows).
+ */
+export const repoTopics = sqliteTable(
+  "repo_topics",
+  {
+    repoId: text("repo_id").notNull(),
+    /** Sanitized name: trimmed, lowercased, `^[a-z0-9][-.a-z0-9]*$`, ≤ 35. */
+    topic: text("topic").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.repoId, t.topic] })],
+);
+
+/**
+ * Repo-level watch edges (upstream `repo_watcher`, models/repo/watch.go —
+ * deliberately NOT `issue_watch`, which is `issue_subscriptions` here).
+ * `(repo_id, user_id)` PK; `ON CONFLICT DO NOTHING` keeps the FIRST
+ * `created_at` on repeat watches. `ignored` is always false at this tier
+ * (user-notification setting) and has no column.
+ */
+export const repoWatchers = sqliteTable(
+  "repo_watchers",
+  {
+    repoId: text("repo_id").notNull(),
+    userId: integer("user_id").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }),
+  },
+  (t) => [
+    primaryKey({ columns: [t.repoId, t.userId] }),
+    index("idx_repo_watchers_user").on(t.userId),
+  ],
+);
+
+/**
+ * Repo collaborators (upstream `collaboration`,
+ * models/repo/collaboration.go) — one row per (repo, user) with the
+ * `read|write|admin` access mode. The composite PK is the upsert arbiter
+ * (AddOrUpdateCollaborator), `mode` defaults to 'write' when the Add
+ * Collaborator body omits `permission`; implicit rowid order = upstream's
+ * `collaboration.id` order (the list/assignee renders order by it).
+ */
+export const repoCollaborators = sqliteTable(
+  "repo_collaborators",
+  {
+    repoId: text("repo_id").notNull(),
+    userId: integer("user_id").notNull(),
+    mode: text("mode", { enum: ["read", "write", "admin"] }).notNull().default("write"),
+    createdAt: integer("created_at", { mode: "timestamp" }),
+    updatedAt: integer("updated_at", { mode: "timestamp" }),
+  },
+  (t) => [
+    primaryKey({ columns: [t.repoId, t.userId] }),
+    index("idx_repo_collaborators_user").on(t.userId),
+  ],
+);
+
+/**
+ * Repo-edit stored subset (SPEC-0004 §2.4 `PATCH /repos/{owner}/{repo}`):
+ * the `EditRepoOption` fields with no landed `repositories` column that must
+ * survive a PATCH→GET round trip — profile text and the has_* unit flags.
+ * Upstream keeps these on the repository row itself; a side table (1:1,
+ * `repo_id` PK) avoids touching the hot `repositories` schema. Missing row =
+ * upstream defaults (services/repo-settings.ts DEFAULT_REPO_SETTINGS).
+ */
+export const repoSettings = sqliteTable("repo_settings", {
+  repoId: text("repo_id").primaryKey(),
+  description: text("description").notNull().default(""),
+  website: text("website").notNull().default(""),
+  hasIssues: integer("has_issues", { mode: "boolean" }).notNull().default(true),
+  hasWiki: integer("has_wiki", { mode: "boolean" }).notNull().default(true),
+  hasPullRequests: integer("has_pull_requests", { mode: "boolean" }).notNull().default(true),
+  hasReleases: integer("has_releases", { mode: "boolean" }).notNull().default(true),
+  hasProjects: integer("has_projects", { mode: "boolean" }).notNull().default(false),
+  hasPackages: integer("has_packages", { mode: "boolean" }).notNull().default(false),
+  hasActions: integer("has_actions", { mode: "boolean" }).notNull().default(false),
+  updatedAt: integer("updated_at", { mode: "timestamp" }),
+});
+
+// ---------------------------------------------------------------------------
+// SPEC-0004 appendix A — user follows (tier-2 follow trio).
+// ---------------------------------------------------------------------------
+
+/**
+ * User follows (port of upstream `Follow`, models/user/follow.go:13–19):
+ * `user_id` follows `follow_id`; the pair is UNIQUE (upstream
+ * `UNIQUE(follow)`), the reverse direction gets its own index for follower
+ * listings. Both edges cascade on the user row (the delete-user flow's
+ * explicit follow cleanup upstream). User-scoped — NOT part of the
+ * repo-delete cascade. `created_at` is unix seconds mirroring `CreatedUnix
+ * xorm:"INDEX created"`.
+ */
+export const follows = sqliteTable(
+  "follows",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    followId: integer("follow_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("follows_user_follow_uq").on(t.userId, t.followId),
+    index("follows_follow_idx").on(t.followId),
+  ],
+);

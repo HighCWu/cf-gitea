@@ -1,7 +1,7 @@
 import { drizzle } from "drizzle-orm/d1";
-import { inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 
-import { users } from "../../db/schema";
+import { repoCollaborators, users } from "../../db/schema";
 import type { UserRow } from "./repository";
 
 /**
@@ -10,15 +10,12 @@ import type { UserRow } from "./repository";
  * repoGetAssignees) — upstream `collaboration` (models/repo/collaboration.go)
  * reduced to one row per (repo, user) with a `read|write|admin` mode.
  *
- * SCHEMA GAP (the raw-D1 + DDL-comment pattern of SPEC-0006's LFS
- * bootstrap): `src/db/schema.ts` is owned by a parallel change this batch and
- * migrations must not be hand-edited, so collaborators live OUTSIDE the
- * Drizzle schema for now, accessed with prepared statements from this mapper
- * (never in routes). DDL for the migration owner's sweep is
- * `REPO_COLLABORATORS_DDL_STATEMENTS`; the sweep also adds the table to the
- * `repositories` delete cascade (src/repos/service.ts deleteRepository) and
- * to the api repoDelete housekeeping (deleteRepoCollaborators). User rows
- * themselves stay on Drizzle (`users` is a landed table).
+ * The table lives in the Drizzle schema (`repoCollaborators`,
+ * src/db/schema.ts) and landed as migration 0007; D1 access goes through
+ * Drizzle per the architecture boundary (no hand-written SQL in services).
+ * Superseded: `REPO_COLLABORATORS_DDL_STATEMENTS` below is kept only as the
+ * historical record of the pre-migration bootstrap (the batch-7 schema gap) —
+ * the generated migration is authoritative now.
  *
  * Semantics mirrored (routers/api/v1/repo/collaborators.go +
  * services/repository/collaboration.go):
@@ -33,8 +30,9 @@ import type { UserRow } from "./repository";
  */
 
 /**
- * Pre-migration bootstrap DDL (superseded by the schema entry the migration
- * owner lands; kept exactly like `LFS_OBJECTS_DDL_STATEMENTS`).
+ * SUPERSEDED by migration 0007 (`repoCollaborators` in src/db/schema.ts) —
+ * kept only so pre-migration scratch databases can still be bootstrapped by
+ * hand. Do not extend; change the schema + regenerate instead (AGENTS.md).
  */
 export const REPO_COLLABORATORS_DDL_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS repo_collaborators (
@@ -60,34 +58,32 @@ export interface CollaboratorRow {
   updatedAt: Date | null;
 }
 
-function fromUnix(seconds: number | null): Date | null {
-  return seconds === null ? null : new Date(seconds * 1000);
-}
-
 /** `IsCollaborator` (collaboration.go:114). */
 export async function isCollaborator(d1: D1Database, repoId: string, userId: number): Promise<boolean> {
-  const row = await d1
-    .prepare("SELECT 1 AS one FROM repo_collaborators WHERE repo_id = ?1 AND user_id = ?2")
-    .bind(repoId, userId)
-    .first<{ one: number }>();
-  return row !== null;
+  const row = await drizzle(d1)
+    .select({ repoId: repoCollaborators.repoId })
+    .from(repoCollaborators)
+    .where(and(eq(repoCollaborators.repoId, repoId), eq(repoCollaborators.userId, userId)))
+    .get();
+  return row !== undefined;
 }
 
 /** The (repo, user) collaboration row, or null. */
 export async function findCollaborator(d1: D1Database, repoId: string, userId: number): Promise<CollaboratorRow | null> {
-  const row = await d1
-    .prepare("SELECT repo_id, user_id, mode, created_at, updated_at FROM repo_collaborators WHERE repo_id = ?1 AND user_id = ?2")
-    .bind(repoId, userId)
-    .first<{ repo_id: string; user_id: number; mode: string; created_at: number | null; updated_at: number | null }>();
-  if (row === null) {
+  const row = await drizzle(d1)
+    .select()
+    .from(repoCollaborators)
+    .where(and(eq(repoCollaborators.repoId, repoId), eq(repoCollaborators.userId, userId)))
+    .get();
+  if (row === undefined) {
     return null;
   }
   return {
-    repoId: row.repo_id,
-    userId: row.user_id,
-    mode: row.mode as CollaboratorMode,
-    createdAt: fromUnix(row.created_at),
-    updatedAt: fromUnix(row.updated_at),
+    repoId: row.repoId,
+    userId: row.userId,
+    mode: row.mode,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }
 
@@ -99,25 +95,24 @@ export async function addOrUpdateCollaborator(
   mode: CollaboratorMode,
   now: Date,
 ): Promise<void> {
-  const unix = Math.floor(now.getTime() / 1000);
-  await d1
-    .prepare(
-      `INSERT INTO repo_collaborators (repo_id, user_id, mode, created_at, updated_at)
-       VALUES (?1, ?2, ?3, ?4, ?4)
-       ON CONFLICT (repo_id, user_id) DO UPDATE SET mode = ?3, updated_at = ?4`,
-    )
-    .bind(repoId, userId, mode, unix)
-    .run();
+  await drizzle(d1)
+    .insert(repoCollaborators)
+    .values({ repoId, userId, mode, createdAt: now, updatedAt: now })
+    .onConflictDoUpdate({
+      target: [repoCollaborators.repoId, repoCollaborators.userId],
+      set: { mode, updatedAt: now },
+    });
 }
 
 /** `DeleteCollaboration` — idempotent (absent row deletes zero rows, still
  *  a success, exactly like upstream's unconditional delete). */
 export async function deleteCollaborator(d1: D1Database, repoId: string, userId: number): Promise<void> {
-  await d1.prepare("DELETE FROM repo_collaborators WHERE repo_id = ?1 AND user_id = ?2").bind(repoId, userId).run();
+  await drizzle(d1)
+    .delete(repoCollaborators)
+    .where(and(eq(repoCollaborators.repoId, repoId), eq(repoCollaborators.userId, userId)));
 }
 
-/** UserRow lookup shared by the join renders — `users` is a landed table, so
- *  this half stays on Drizzle (only repo_collaborators is the schema gap). */
+/** UserRow lookup shared by the join renders. */
 async function userRowsByIds(d1: D1Database, ids: readonly number[]): Promise<Map<number, UserRow>> {
   const map = new Map<number, UserRow>();
   if (ids.length === 0) {
@@ -136,9 +131,10 @@ async function userRowsByIds(d1: D1Database, ids: readonly number[]): Promise<Ma
 
 /**
  * `GetCollaborators` — user rows joined onto the collaboration rows in
- * insertion order (upstream orders by `collaboration.id` ASC = our rowid).
- * Pagination (page/limit) plus the unpaginated total, like every list
- * service here.
+ * insertion order (upstream orders by `collaboration.id` ASC = our rowid;
+ * the composite-PK table keeps a rowid, ordered here with a raw `rowid`
+ * fragment — drizzle has no column object for it). Pagination (page/limit)
+ * plus the unpaginated total, like every list service here.
  */
 export async function listRepoCollaborators(
   d1: D1Database,
@@ -146,26 +142,29 @@ export async function listRepoCollaborators(
   page: number,
   limit: number,
 ): Promise<{ items: Array<{ user: UserRow; mode: CollaboratorMode }>; total: number }> {
-  const totalRow = await d1
-    .prepare("SELECT COUNT(*) AS n FROM repo_collaborators WHERE repo_id = ?1")
-    .bind(repoId)
-    .first<{ n: number }>();
-  const { results } = await d1
-    .prepare(
-      `SELECT user_id, mode FROM repo_collaborators
-       WHERE repo_id = ?1 ORDER BY rowid ASC LIMIT ?2 OFFSET ?3`,
-    )
-    .bind(repoId, limit, (page - 1) * limit)
-    .all<{ user_id: number; mode: string }>();
+  const db = drizzle(d1);
+  const totalRow = await db
+    .select({ n: sql<number>`count(*)` })
+    .from(repoCollaborators)
+    .where(eq(repoCollaborators.repoId, repoId))
+    .get();
+  const rows = await db
+    .select({ userId: repoCollaborators.userId, mode: repoCollaborators.mode })
+    .from(repoCollaborators)
+    .where(eq(repoCollaborators.repoId, repoId))
+    .orderBy(sql`rowid ASC`)
+    .limit(limit)
+    .offset((page - 1) * limit)
+    .all();
   const usersById = await userRowsByIds(
     d1,
-    results.map((row) => row.user_id),
+    rows.map((row) => row.userId),
   );
   const items: Array<{ user: UserRow; mode: CollaboratorMode }> = [];
-  for (const row of results) {
-    const user = usersById.get(row.user_id);
+  for (const row of rows) {
+    const user = usersById.get(row.userId);
     if (user !== undefined) {
-      items.push({ user, mode: row.mode as CollaboratorMode });
+      items.push({ user, mode: row.mode });
     }
   }
   return { items, total: totalRow?.n ?? 0 };
@@ -180,14 +179,13 @@ export async function listRepoAssignees(
   d1: D1Database,
   repo: { id: string; ownerId: number | null },
 ): Promise<UserRow[]> {
-  const { results } = await d1
-    .prepare(
-      `SELECT user_id FROM repo_collaborators
-       WHERE repo_id = ?1 AND mode IN ('write', 'admin') ORDER BY rowid ASC`,
-    )
-    .bind(repo.id)
-    .all<{ user_id: number }>();
-  const ids = results.map((row) => row.user_id);
+  const rows = await drizzle(d1)
+    .select({ userId: repoCollaborators.userId })
+    .from(repoCollaborators)
+    .where(and(eq(repoCollaborators.repoId, repo.id), inArray(repoCollaborators.mode, ["write", "admin"])))
+    .orderBy(sql`rowid ASC`)
+    .all();
+  const ids = rows.map((row) => row.userId);
   if (repo.ownerId !== null && !ids.includes(repo.ownerId)) {
     ids.push(repo.ownerId);
   }
@@ -209,7 +207,9 @@ export async function collaboratorModeOf(
   return row === null ? "none" : row.mode;
 }
 
-/** Repo-scoped collaborator delete (the api repoDelete path's housekeeping). */
+/** Repo-scoped collaborator delete (the api repoDelete path's housekeeping;
+ *  the deleteRepository cascade covers the same rows through the schema
+ *  table). */
 export async function deleteRepoCollaborators(d1: D1Database, repoId: string): Promise<void> {
-  await d1.prepare("DELETE FROM repo_collaborators WHERE repo_id = ?1").bind(repoId).run();
+  await drizzle(d1).delete(repoCollaborators).where(eq(repoCollaborators.repoId, repoId));
 }

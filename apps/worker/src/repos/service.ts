@@ -49,10 +49,14 @@ import {
   reactions,
   releaseAssets,
   releases,
+  repoCollaborators,
   repoCounters,
   repoRedirects,
+  repoSettings,
+  repoTopics,
   repoTransfer,
   repoUnits,
+  repoWatchers,
   pullRequests,
   repositories,
   users,
@@ -563,6 +567,13 @@ export class RepoService {
       this.db.delete(webhookDeliveries).where(eq(webhookDeliveries.repoId, repoId)),
       this.db.delete(repoCounters).where(eq(repoCounters.repoId, repoId)),
       this.db.delete(repoUnits).where(eq(repoUnits.repoId, repoId)),
+      // Batch-7 stores (migration 0007): topics, watch edges, collaborators,
+      // and the PATCH-stored settings subset. `follows` is user-scoped —
+      // it belongs to the (future) delete-user flow, not this cascade.
+      this.db.delete(repoTopics).where(eq(repoTopics.repoId, repoId)),
+      this.db.delete(repoWatchers).where(eq(repoWatchers.repoId, repoId)),
+      this.db.delete(repoCollaborators).where(eq(repoCollaborators.repoId, repoId)),
+      this.db.delete(repoSettings).where(eq(repoSettings.repoId, repoId)),
       this.db.delete(repoRedirects).where(eq(repoRedirects.redirectRepoId, repoId)),
       this.db.delete(repoTransfer).where(eq(repoTransfer.repoId, repoId)),
       // The row is gone: git requests miss at repo resolution; the §4.1 race

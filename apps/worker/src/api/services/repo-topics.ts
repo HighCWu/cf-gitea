@@ -2,16 +2,14 @@
  * Repo topics (SPEC-0004 §2.4 rows repoListTopics / repoUpdateTopics) —
  * upstream `models/repo/topic.go` reduced to per-repo name storage.
  *
- * SCHEMA GAP (the raw-D1 + DDL-comment pattern of SPEC-0006's LFS
- * bootstrap): `src/db/schema.ts` is owned by a parallel change this batch and
- * migrations must not be hand-edited, so the topics store lives OUTSIDE the
- * Drizzle schema for now and is accessed with prepared statements from this
- * mapper (never in routes; the AGENTS "Drizzle only" boundary returns when
- * the table lands in the schema). DDL for the migration owner's sweep is
- * `REPO_TOPICS_DDL_STATEMENTS`; the sweep also adds the table to the
- * `repositories` delete cascade (src/repos/service.ts deleteRepository).
+ * The table lives in the Drizzle schema (`repoTopics`, src/db/schema.ts) and
+ * landed as migration 0007; D1 access goes through Drizzle per the
+ * architecture boundary (no hand-written SQL in services). Superseded:
+ * `REPO_TOPICS_DDL_STATEMENTS` below is kept only as the historical record of
+ * the pre-migration bootstrap (the batch-7 schema gap) — the generated
+ * migration is authoritative now.
  *
- * Storage decision recorded for that sweep: a `(repo_id, topic)` join table —
+ * Storage decision recorded at the sweep: a `(repo_id, topic)` join table —
  * upstream itself pairs a `topic` + `repo_topic` table pair with a
  * denormalized `repository.topics` JSON column; the join half is the one the
  * API semantics (GET = name list, PUT = whole-list replace, 422
@@ -25,10 +23,15 @@
  * topic.go UpdateTopics).
  */
 
+import { and, asc, eq } from "drizzle-orm";
+import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
+
+import { repoTopics } from "../../db/schema";
+
 /**
- * Pre-migration bootstrap DDL (superseded by the schema entry the migration
- * owner lands; kept exactly like `LFS_OBJECTS_DDL_STATEMENTS` so tests and
- * scratch databases can bootstrap by hand until then).
+ * SUPERSEDED by migration 0007 (`repoTopics` in src/db/schema.ts) — kept only
+ * so pre-migration scratch databases can still be bootstrapped by hand. Do
+ * not extend; change the schema + regenerate instead (AGENTS.md).
  */
 export const REPO_TOPICS_DDL_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS repo_topics (
@@ -74,11 +77,13 @@ export function sanitizeAndValidateTopics(topicNames: readonly string[]): Saniti
  *  ToOrders: "when render topics for a repo, it's better to sort them by
  *  name, to get consistent result"). */
 export async function listRepoTopics(d1: D1Database, repoId: string): Promise<string[]> {
-  const { results } = await d1
-    .prepare("SELECT topic FROM repo_topics WHERE repo_id = ?1 ORDER BY topic ASC")
-    .bind(repoId)
-    .all<{ topic: string }>();
-  return results.map((row) => row.topic);
+  const rows = await drizzle(d1)
+    .select({ topic: repoTopics.topic })
+    .from(repoTopics)
+    .where(eq(repoTopics.repoId, repoId))
+    .orderBy(asc(repoTopics.topic))
+    .all();
+  return rows.map((row) => row.topic);
 }
 
 /**
@@ -100,21 +105,26 @@ export async function replaceRepoTopics(
   if (added.length === 0 && removed.length === 0) {
     return;
   }
-  const statements: D1PreparedStatement[] = [];
+  const db = drizzle(d1);
+  const statements: DrizzleD1DatabaseBatchItem[] = [];
   for (const topic of removed) {
-    statements.push(d1.prepare("DELETE FROM repo_topics WHERE repo_id = ?1 AND topic = ?2").bind(repoId, topic));
+    statements.push(
+      db.delete(repoTopics).where(and(eq(repoTopics.repoId, repoId), eq(repoTopics.topic, topic))),
+    );
   }
   for (const topic of added) {
-    statements.push(d1.prepare("INSERT INTO repo_topics (repo_id, topic) VALUES (?1, ?2)").bind(repoId, topic));
+    statements.push(db.insert(repoTopics).values({ repoId, topic }));
   }
-  await d1.batch(statements);
+  // Non-empty here: the both-empty case returned above — the tuple shape
+  // drizzle's d1 batch requires.
+  await db.batch(statements as [DrizzleD1DatabaseBatchItem, ...DrizzleD1DatabaseBatchItem[]]);
 }
 
 /** Repo-scoped topic delete (the api repoDelete path's housekeeping; the
- *  engine-wave purge covers pre-migration scratch rows too). */
+ *  deleteRepository cascade covers the same rows through the schema table). */
 export async function deleteRepoTopics(d1: D1Database, repoId: string): Promise<void> {
-  await d1.prepare("DELETE FROM repo_topics WHERE repo_id = ?1").bind(repoId).run();
+  await drizzle(d1).delete(repoTopics).where(eq(repoTopics.repoId, repoId));
 }
 
-/** Statement type accepted by D1's batch (raw-D1 mapper shim). */
-type D1PreparedStatement = Parameters<D1Database["batch"]>[number][number];
+/** One batch item of the drizzle/d1 batch (statement type shim). */
+type DrizzleD1DatabaseBatchItem = Parameters<DrizzleD1Database["batch"]>[number][number];
