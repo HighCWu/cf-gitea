@@ -8,8 +8,11 @@ import {
 } from "./auth";
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
+import { registerLabelRoutes } from "./routes/labels";
 import { registerMarkdownRoutes } from "./routes/markdown";
+import { registerMilestoneRoutes } from "./routes/milestones";
 import { registerRepoRoutes } from "./routes/repo";
+import { registerStatusRoutes } from "./routes/statuses";
 import { registerUserReposRoutes } from "./routes/user-repos";
 import { registerUserRoute } from "./routes/user";
 import { registerUsersRoutes } from "./routes/users";
@@ -44,6 +47,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerUsersRoutes(app, optionalAuth);
   registerUserReposRoutes(app, requireAuth, optionalAuth);
   registerRepoRoutes(app, requireAuth, optionalAuth);
+  registerStatusRoutes(app, requireAuth, optionalAuth);
+  registerLabelRoutes(app, requireAuth, optionalAuth);
+  registerMilestoneRoutes(app, requireAuth, optionalAuth);
   registerMarkdownRoutes(app, requireAuth);
 
   return app;

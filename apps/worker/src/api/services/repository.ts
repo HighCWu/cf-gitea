@@ -26,6 +26,15 @@ type RepositoryRow = typeof repositories.$inferSelect;
 /** D1 row of the `users` table (src/db/schema.ts). */
 type UserRow = typeof users.$inferSelect;
 
+/**
+ * `{origin}/api/v1/repos/{owner}/{repo}` — upstream `Repository.APIURL`
+ * (models/repo/repo.go:362–365); the prefix of every repo-scoped API URL
+ * (labels, statuses, …).
+ */
+export function apiRepositoryUrl(pair: RepositoryWithOwner, origin: string): string {
+  return `${origin}/api/v1/repos/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
+}
+
 /** A repository row paired with its owner's user row (inner join — org-owned
  * repositories have no users row yet and stay invisible until orgs land). */
 export interface RepositoryWithOwner {
@@ -105,12 +114,14 @@ export function repositoryPermissions(viewer: Viewer, row: RepositoryRow): Permi
 }
 
 /**
- * `Repository.owner` (upstream `ToUserWithAccessMode`, which hardcodes
- * `authed=false`: admin/active/login fields stay Go-zero even for the
- * owner). The primary email shows only to the user themself or a site admin
- * (upstream hides private emails behind a placeholder we do not render yet).
+ * `Repository.owner` / embedded creators (upstream `ToUserWithAccessMode`,
+ * which hardcodes `authed=false`: admin/active/login fields stay Go-zero even
+ * for the owner). The primary email shows only to the user themself or a site
+ * admin (upstream hides private emails behind a placeholder we do not render
+ * yet). Exported for the converters that embed a `User` (commit-status
+ * creator), matching upstream `convert.ToUser`.
  */
-function apiUserFromRow(row: UserRow, viewer: Viewer): User {
+export function apiUserFromRow(row: UserRow, viewer: Viewer): User {
   const authed =
     viewer.requester !== null &&
     (viewer.requester.is_admin === true || requesterLoginLower(viewer) === row.usernameLower);
