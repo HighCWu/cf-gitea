@@ -168,3 +168,32 @@ jobs:
           name: bench-results
           path: .bench-results/
           if-no-files-found: ignore
+
+  # UI assets build determinism + submodule hygiene (SPEC-0008 §2.3.1/§5.4;
+  # U1 "CI ordering", formal guard lands with U5). Two full builds must emit
+  # byte-identical Vite manifests, and the gitea/ submodule must stay pristine
+  # (the build runs in a scratch dir — AGENTS.md submodule hygiene rule).
+  assets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build assets (pass 1)
+        run: pnpm build:assets
+      - name: Record manifest + submodule state
+        run: |
+          cp apps/worker/public/assets/.vite/manifest.json /tmp/manifest-1.json
+          test -z "$(git -C gitea status --porcelain)" || {
+            echo "::error::gitea/ submodule dirty after asset build"; git -C gitea status --short; exit 1; }
+      - name: Build assets (pass 2, scratch rebuild)
+        run: pnpm build:assets
+      - name: Manifests must be byte-identical
+        run: cmp /tmp/manifest-1.json apps/worker/public/assets/.vite/manifest.json
