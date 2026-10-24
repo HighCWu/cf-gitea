@@ -23,6 +23,7 @@
     "pretest": "pnpm gen:icons",
     "setup:deploy": "node scripts/setup-deploy.mjs",
     "smoke": "node scripts/deploy-smoke.mjs",
+    "diff:test": "node scripts/diff-test.mjs",
     "db:generate": "pnpm --filter cf-gitea-worker db:generate",
     "db:migrate:local": "pnpm --filter cf-gitea-worker db:migrate:local",
     "db:migrate:remote": "pnpm --filter cf-gitea-worker db:migrate:remote"
