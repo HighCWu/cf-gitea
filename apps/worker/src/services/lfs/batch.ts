@@ -356,7 +356,13 @@ export async function buildDownloadHref(
   const presigned = await deps.store.presignGet({ key: lfsKey(ctx.storageKey, oid), now: deps.now ?? new Date() });
   if (presigned !== null) return toBatchLink(presigned);
   const relayBase = buildRelayHrefBase(ctx);
-  return { href: relayDownloadHref(relayBase, oid), header: withAuth({}, ctx.authHeader) };
+  const header = withAuth({}, ctx.authHeader);
+  const href = relayDownloadHref(relayBase, oid);
+  // Upstream `WithHeader` skips empty values, so an anonymous relay link's
+  // Header map stays nil and the `header` key is omitted from the JSON — not
+  // emitted as an empty object (git-lfs treats both the same, but the wire
+  // shape is upstream's).
+  return Object.keys(header).length === 0 ? { href } : { href, header: { ...header } };
 }
 
 /**

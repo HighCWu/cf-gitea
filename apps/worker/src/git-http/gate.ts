@@ -63,6 +63,7 @@ import {
 } from "./respond";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
+import { handleLfsGateBranch, parseLfsRoute } from "../lfs/router";
 import { repoCounters, repoUnits, repositories } from "../db/schema";
 import { RepoNameCollisionError, RepoService, lookupRedirect } from "../repos/service";
 
@@ -93,8 +94,17 @@ export async function gitHttpGate(
 ): Promise<Response> {
   const url = new URL(req.url);
   const route = parseGitHttpRoute(url.pathname);
-  // Not one of the four git routes (or malformed): the engine's paths.
-  if (route === null) return engine.fetch(req, env, ctx);
+  // Not one of the four git routes (or malformed): first the SPEC-0006 §2.1
+  // LFS family (`/:owner/:repo(.git)?/info/lfs/*`) — intercepted BEFORE
+  // engine delegation, with repos resolved through the same D1 pipeline
+  // below; a D1-missing repo falls through to the engine exactly as before
+  // this branch existed (the transitional passthrough, byte-identical so the
+  // e2e suite keeps working). Everything else is the engine's paths.
+  if (route === null) {
+    const lfsRoute = parseLfsRoute(url.pathname, req.method);
+    if (lfsRoute !== null) return handleLfsGateBranch(req, env, ctx, engine, lfsRoute);
+    return engine.fetch(req, env, ctx);
+  }
 
   // §2.1 item 1: `?go-get=1` short-circuits before auth and regardless of
   // existence/access (go-get ignores .netrc, so the meta needs no auth).

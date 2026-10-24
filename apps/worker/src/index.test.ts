@@ -615,3 +615,42 @@ describe("gitHttpGate transitional passthrough (D1 row missing, TODO SPEC-0003 M
     expect(response.headers.get("content-type")).toContain("application/json");
   });
 });
+
+describe("gitHttpGate LFS interception (SPEC-0006 §2.1)", () => {
+  const LFS_JSON = "application/vnd.git-lfs+json";
+  const batch = (owner: string, repo: string, headers: Record<string, string> = {}): Promise<Response> =>
+    SELF.fetch(`https://example.com/${owner}/${repo}.git/info/lfs/objects/batch`, {
+      method: "POST",
+      headers: { accept: LFS_JSON, "content-type": LFS_JSON, ...headers },
+      body: JSON.stringify({ operation: "upload", objects: [] }),
+    });
+
+  it("keeps the engine's 404 for info/lfs paths on D1-missing repos (no challenge)", async () => {
+    const response = await batch("demo", "absent");
+
+    // The LFS branch resolves through the same D1 pipeline: no row, no
+    // redirect → the ORIGINAL request flows to the engine (its own plain 404),
+    // never an LFS challenge. The vendored e2e suite (32/35 allowlist) runs
+    // entirely against D1-missing repos, so this passthrough staying
+    // byte-identical is what keeps its numbers stable. The engine owns the
+    // 404's shape; we pin only that the LFS family did not answer.
+    expect(response.status).toBe(404);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    expect(response.headers.get("content-type")).not.toContain("vnd.git-lfs");
+  });
+
+  it("claims info/lfs for a D1-backed repo with the gitea-lfs realm (not the git-HTTP matrix)", async () => {
+    await seedAclFixtures();
+
+    const response = await batch("alice", "private");
+
+    // The family answers for D1-backed repos: an anonymous upload on a
+    // private repo is the LFS 401 challenge with realm="gitea-lfs" — not the
+    // git-HTTP `realm="Gitea"` challenge and not the engine's JSON 404 —
+    // proving the interception branch (not the git routes) handled it.
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+    expect(response.headers.get("content-type")).toBe(LFS_JSON);
+    expect(await response.json()).toEqual({ message: "Unauthorized" });
+  });
+});
