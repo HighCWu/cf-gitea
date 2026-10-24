@@ -81,6 +81,19 @@ const RUNTIME_ONLY_RESPONSES = {
       422: "non-full-length sha input rejected at runtime (upstream resolves refs via the engine and 500s on unknown — neither reproducible without engine ref resolution); declared set stays {201,400,404}",
     },
   },
+  "/user/followers": {
+    get: { 401: "upstream reqToken(); contract documents 200 only" },
+  },
+  "/user/following/{username}": {
+    put: { 401: "upstream reqToken(); contract documents 204/404 only" },
+    delete: { 401: "upstream reqToken(); contract documents 204/404 only" },
+  },
+  "/users/{username}/keys": {
+    get: { 401: "upstream reqToken(); contract documents 200 only" },
+  },
+  "/users/{username}/gpg_keys": {
+    get: { 401: "upstream reqToken(); contract documents 200 only" },
+  },
   "/repos/{owner}/{repo}/milestones/{id}": {
     patch: {
       400: "due_on parse failure returns upstream's 'invalid date format' at runtime; undeclared in the vendored contract (same class as /user 401)",
