@@ -5,9 +5,10 @@
  *
  * UI route inventory (§2.1 — all GET, all rendered through the shell):
  *
- *   /:owner/:repo                          repo home (U3 page; 404 shell now)
- *   /:owner/:repo/commits[/{ref-suffix}]   commit log (U3)
- *   /:owner/:repo/src[/{ref-suffix}]       file view (U3; §3.3 requires the
+ *   /:owner/:repo                          repo home (pages/home.tsx)
+ *   /:owner/:repo/commits[/{ref-suffix}]   commit log (pages/commits.tsx)
+ *   /:owner/:repo/src[/{ref-suffix}]       file view (pages/file-view.tsx;
+ *                                          §3.3 requires the
  *                                          `branch|tag|commit` prefix)
  *
  * Every other repo-scoped path stays with the engine — the four git-protocol
@@ -44,11 +45,12 @@
  * sub-app only ever sees families it claims and its miss path can never
  * swallow an engine route.
  *
- * U2.5 honesty note: the three U3 pages do not exist yet — every claimed
- * route currently renders the §4.5 404 shell (with repo context when the D1
- * lookup resolves a public repository, bare otherwise). The parsers below
- * (`parseUiRoute`, `splitRefSuffix`, `resolveRefSuffix`) are the U3
- * foundation and ship with their semantics tests now.
+ * U3 note: the three pages render for real (home / commits / src, wired in
+ * render.tsx's page switch). Every claimed route answers from the same
+ * pipeline: parse → public-repo read (§2.5) → page data via direct service
+ * calls (§3.2) → shell render; anything unresolved 404-shells. The parsers
+ * below (`parseUiRoute`, `splitRefSuffix`, `resolveRefSuffix`) are the
+ * pages' URL contract and ship with their semantics tests.
  */
 
 import { Hono, type Context } from "hono";
@@ -57,7 +59,7 @@ import { trimTrailingSlash } from "hono/trailing-slash";
 import { isReservedOwnerName } from "../repos/service";
 import { AssetBuildError, loadManifest } from "./manifest";
 import { resolvePublicRepository } from "./repo-view";
-import { renderNotFound } from "./render";
+import { renderNotFound, renderUiPage } from "./render";
 import { shellAssetsFromManifest, type UiContext } from "./ui-context";
 import { resolveViewer } from "./viewer";
 
@@ -298,9 +300,10 @@ export function assetsNotBuilt(error: AssetBuildError): Response {
  * One handler for every claimed family: the parser re-reads the pathname
  * (the route registrations below exist so the sub-app never claims beyond
  * the parser's families), the repo resolves through the §2.5 public-repo
- * read, and the page renders. U3 swaps the final line for the real page
- * switch on `route.family` + `resolveRefSuffix` — every family 404-shells
- * for now, which IS the U2.5 contract.
+ * read, and the page switch renders (render.tsx delegates per family).
+ * All routes are GET-only (§2.1); every unresolved repo/ref/path answers the
+ * §4.5 404 shell, and a missing/unreadable manifest answers the §2.3.4 503
+ * before any page work happens.
  */
 async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const url = new URL(c.req.url);
@@ -320,11 +323,13 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   }
 
   const repo = await resolvePublicRepository(c.env, route.owner, route.repo);
-  if (repo !== null) ctx.repo = repo;
+  if (repo === null) return c.html(renderNotFound(ctx), 404);
+  ctx.repo = repo;
 
-  // U3: switch on route.family (home | commits | src) here. All routes are
-  // GET-only (§2.1) and every handled route answers 404 in U2.5.
-  return c.html(renderNotFound(ctx), 404);
+  // U3 page switch (render.tsx — home | commits | src), with the 404 shell
+  // for unresolvable refs/paths (§4.5).
+  const { status, html } = await renderUiPage({ env: c.env, ctx, route, url });
+  return c.html(html, status);
 }
 
 export const uiRouter = new Hono<{ Bindings: Env }>();

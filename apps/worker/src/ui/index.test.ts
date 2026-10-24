@@ -283,12 +283,12 @@ describe("assetsBinding", () => {
 // --- uiRouter (U2.5: every claimed route renders the 404-in-shell) ---------------
 
 describe("uiRouter", () => {
-  it("renders the 404 shell WITH repo context for a resolved public repo", async () => {
+  it("renders the U3 empty-repo home page for a resolved repo the engine has no content for", async () => {
     await seedVerifiedUser({ username: "Alice" });
     await seedRepo("alice", "hello");
 
     const res = await fetchUi("/alice/hello");
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
     expect(res.headers.get("content-type") ?? "").toContain("text/html");
     const html = await res.text();
 
@@ -299,23 +299,22 @@ describe("uiRouter", () => {
     expect(html).toContain('src="/assets/js/iife.abcd1234.js"');
     expect(html).toContain('href="/assets/css/index.1111aaaa.css"');
     expect(html).toContain('<nav id="navbar"');
-    expect(html).toContain("<footer");
+    expect(html).toContain('<footer class="page-footer"');
 
     // Repo context: header, original-row casing (D1 stores folded names),
-    // visibility badge, and the repository page discriminator.
-    expect(html).toContain("<title>Page Not Found - alice/hello</title>");
+    // visibility badge — and the §4.1 empty-repo render (unborn HEAD, the
+    // engine cell was never pushed): clone command + push hint, no file list.
+    expect(html).toContain("<title>Quick Start - alice/hello</title>");
     expect(html).toContain('<div class="repo-header flex-left-right">');
     expect(html).toContain('href="/alice/hello"');
     expect(html).toContain('<span class="ui basic orange label">Public Access</span>');
-    expect(html).toContain('class="page-content repository"');
-
-    // The §4.5 404 content, and never the bare engine 404.
-    expect(html).toContain('<div class="status-page-error">');
-    expect(html).toContain('<div class="status-page-error-title">404 Not Found</div>');
-    expect(html).not.toContain("Repository not found");
+    expect(html).toContain('class="page-content repository quickstart"');
+    expect(html).toContain("https://test.local/alice/hello.git");
+    expect(html).not.toContain("repo-files-table");
+    expect(html).not.toContain("status-page-error");
   });
 
-  it("renders the same repo-context shell for the commits and src families", async () => {
+  it("404-shells the commits and src families while the engine cell is empty (§4.5)", async () => {
     await seedVerifiedUser({ username: "Alice" });
     await seedRepo("alice", "hello");
 
@@ -398,10 +397,14 @@ describe("uiRouter", () => {
     expect(await res.text()).toMatch(/pnpm build:assets|not configured/);
   });
 
-  it("keeps GET-only surface: a HEAD request misses into the plain 404 (§2.1)", async () => {
+  it("serves HEAD on claimed families through the GET handler (upstream chi parity)", async () => {
+    // Hono registers GET handlers for HEAD too; §2.1's GET-only rule means
+    // the UI claims no separate HEAD surface — the page status mirrors GET
+    // (200 on a live page; the pre-U3 suite's "plain 404" was the stub-era
+    // answer, and the runtime strips the body for HEAD).
     await seedVerifiedUser({ username: "Alice" });
     await seedRepo("alice", "hello");
     const res = await uiRouter.fetch(new Request("https://test.local/alice/hello", { method: "HEAD" }), uiEnv);
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
   });
 });
