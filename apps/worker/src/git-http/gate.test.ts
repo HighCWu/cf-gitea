@@ -19,6 +19,17 @@
  *   - D1-backed public   + anonymous advert     → 200 (row 1 stays open);
  *   - no D1 row (the transitional e2e population) → the engine hook decides,
  *     unchanged (public reads open, writes to the engine's create-by-push).
+ *
+ * The second wave under test (SPEC-0003 §2.1 gate-scope widening,
+ * defense-in-depth): the repository-scoped ENGINE JSON/admin paths
+ * (`/{owner}/{repo}/api/*`, PUT config/description, POST gc, DELETE root) for
+ * D1-RESOLVED repos run the same matrix — the engine's own hook would decide
+ * them from the registry's best-effort `priv` mirror (seedRepoExtras), so a
+ * drifted/failed setConfig must not turn a private repo's JSON refs (or its
+ * admin mutations) anonymous while the git routes correctly 401. D1-missing
+ * repos keep the engine verbatim there; page/unknown shapes stay passthrough
+ * (the engine headless-404s them BEFORE its authorize hook); the LFS family
+ * (SPEC-0006) keeps its own branch, realm and error shapes.
  */
 
 import { SELF, env } from "cloudflare:test";
@@ -30,6 +41,8 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { settleCreatingRepo } from "./gate";
 import { repositories } from "../db/schema";
+import { RepoService } from "../repos/service";
+import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
 import { buildPack, buildReceivePackBody } from "../repos/testing/git-pack";
 
 beforeAll(async () => {
@@ -190,5 +203,180 @@ describe("transitional passthrough unchanged: repos with NO D1 row (TODO SPEC-00
     );
     expect(response.status).toBe(404);
     expect(response.headers.get("www-authenticate")).toBeNull();
+  });
+});
+
+/** RepoService over the real registry binding (create/rename fixtures for the
+ *  engine-path suite; all other deps optional, queue never exercised here). */
+function repoService(): RepoService {
+  return new RepoService(env.DB, { registry: env.REGISTRY.getByName("registry") });
+}
+
+/** The sole fixture repo's owner id (repositories.owner_id is nullable in the
+ *  schema; every repo this suite creates seeds it). */
+async function soleRepoOwnerId(): Promise<number> {
+  const rows = await drizzle(env.DB).select().from(repositories).all();
+  const ownerId = rows[0]!.ownerId;
+  if (ownerId === null) throw new Error("fixture repo has no owner");
+  return ownerId;
+}
+
+describe("engine JSON API for D1-resolved repos runs the matrix (SPEC-0003 §2.1 gate-scope widening)", () => {
+  it("401-challenges the anonymous JSON refs API of a private D1-backed repo (the drifted-priv finding)", async () => {
+    await pushCreateAndSettle("apileak");
+
+    const refs = await SELF.fetch("https://example.com/alice/apileak/api/refs");
+    expect(refs.status).toBe(401);
+    expect(refs.headers.get("www-authenticate")).toBe(CHALLENGE);
+    expect(new TextDecoder().decode(await refs.arrayBuffer())).not.toContain("refs/heads");
+  });
+
+  it("serves the JSON refs API to the authenticated owner via the matrix read grant", async () => {
+    await pushCreateAndSettle("apiowner");
+    const aliceToken = (await mintFor(await soleRepoOwnerId(), "r", "read:repository")).plaintext;
+
+    const refs = await SELF.fetch("https://example.com/alice/apiowner/api/refs", {
+      headers: { authorization: basicTokenHeader(aliceToken) },
+    });
+    expect(refs.status).toBe(200);
+    const body = new TextDecoder().decode(await refs.arrayBuffer());
+    expect(body).toContain("refs/heads/main");
+  });
+
+  it("keeps the JSON API anonymous-readable for a D1-backed PUBLIC repo (row 1)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "apipublic", isPrivate: false });
+
+    const refs = await SELF.fetch("https://example.com/alice/apipublic/api/refs");
+    expect(refs.status).toBe(200);
+    const body = new TextDecoder().decode(await refs.arrayBuffer());
+    expect(JSON.parse(body)).toEqual({ head: null, refs: [] });
+  });
+
+  it("keeps the engine's JSON 404 (no challenge) for api paths of repos missing from BOTH sides", async () => {
+    const refs = await SELF.fetch("https://example.com/demo/norepo/api/refs");
+    expect(refs.status).toBe(404);
+    expect(refs.headers.get("www-authenticate")).toBeNull();
+    expect(JSON.parse(new TextDecoder().decode(await refs.arrayBuffer()))).toEqual({
+      error: "repository not found: demo/norepo",
+    });
+  });
+
+  it("keeps the transitional passthrough: a registry-only repo's JSON API answers via the engine", async () => {
+    await env.REGISTRY.getByName("registry").upsert("demo/apionly", Date.now());
+    expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
+
+    const refs = await SELF.fetch("https://example.com/demo/apionly/api/refs");
+    // The engine hook's public-read decides (registry priv defaults false) —
+    // byte-identical with the pre-widening behavior for this population.
+    expect(refs.status).toBe(200);
+    expect(JSON.parse(new TextDecoder().decode(await refs.arrayBuffer()))).toEqual({ head: null, refs: [] });
+  });
+
+  it("claims percent-encoded engine tails for D1-resolved repos (fail-closed vs runtime decode divergence)", async () => {
+    await pushCreateAndSettle("apienc");
+
+    const refs = await SELF.fetch("https://example.com/alice/apienc/api%2Frefs");
+    // The matrix decides (401 challenge); it must NOT fall through to the
+    // engine, where a hypothetical wildcard-decoding runtime would classify
+    // the tail as /api/refs and decide from the registry priv instead.
+    expect(refs.status).toBe(401);
+    expect(refs.headers.get("www-authenticate")).toBe(CHALLENGE);
+  });
+
+  it("leaves the engine's pre-auth 404 shapes untouched for D1-resolved repos (pages, wrong-method admin)", async () => {
+    await pushCreateAndSettle("pageshape");
+
+    // GET /config and GET /gc are neither api- nor admin-shaped (the admin
+    // shapes pin their methods) — the engine headless-404s them BEFORE its
+    // authorize hook, so the passthrough must stay challenge-free.
+    for (const path of ["/alice/pageshape/config", "/alice/pageshape/gc"]) {
+      const page = await SELF.fetch(`https://example.com${path}`);
+      expect(page.status).toBe(404);
+      expect(page.headers.get("www-authenticate")).toBeNull();
+    }
+  });
+});
+
+describe("engine admin shapes for D1-resolved repos take the matrix WRITE decision (§2.1 widening)", () => {
+  it("challenges anonymous admin DELETE on a private D1-backed repo and leaves the repo intact", async () => {
+    await pushCreateAndSettle("adminwipe");
+    const aliceToken = (await mintFor(await soleRepoOwnerId(), "r", "read:repository")).plaintext;
+
+    const wipe = await SELF.fetch("https://example.com/alice/adminwipe", { method: "DELETE" });
+    expect(wipe.status).toBe(401);
+    expect(wipe.headers.get("www-authenticate")).toBe(CHALLENGE);
+
+    // The engine's wipe never ran: the JSON API still serves through the gate.
+    const refs = await SELF.fetch("https://example.com/alice/adminwipe/api/refs", {
+      headers: { authorization: basicTokenHeader(aliceToken) },
+    });
+    expect(refs.status).toBe(200);
+  });
+
+  it("404-masks the admin DELETE for an authenticated non-owner (row 8)", async () => {
+    await pushCreateAndSettle("adminother");
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const bobToken = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+
+    const wipe = await SELF.fetch("https://example.com/alice/adminother", {
+      method: "DELETE",
+      headers: { authorization: basicTokenHeader(bobToken) },
+    });
+    expect(wipe.status).toBe(404);
+    expect(new TextDecoder().decode(await wipe.arrayBuffer())).toBe("Repository not found");
+  });
+
+  it("requires write scope for the admin config PUT (row 7) and allows the owner holding it", async () => {
+    await pushCreateAndSettle("admincfg");
+    const ownerId = await soleRepoOwnerId();
+    const readToken = (await mintFor(ownerId, "r", "read:repository")).plaintext;
+    const writeToken = (await mintFor(ownerId, "w2", "write:repository")).plaintext;
+
+    const forbidden = await SELF.fetch("https://example.com/alice/admincfg/config", {
+      method: "PUT",
+      headers: { authorization: basicTokenHeader(readToken), "content-type": "application/json" },
+      body: JSON.stringify({ description: "nope", private: true }),
+    });
+    expect(forbidden.status).toBe(403);
+    expect(forbidden.headers.get("www-authenticate")).toBeNull();
+
+    const allowed = await SELF.fetch("https://example.com/alice/admincfg/config", {
+      method: "PUT",
+      headers: { authorization: basicTokenHeader(writeToken), "content-type": "application/json" },
+      body: JSON.stringify({ description: "engine mirror only; D1 stays the authority" }),
+    });
+    expect(allowed.status).toBe(200);
+    const echo = (await allowed.json()) as { description: string };
+    expect(echo.description).toBe("engine mirror only; D1 stays the authority");
+  });
+
+  it("301s a renamed repo's old JSON API URL before any auth (row 13)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const created = await repoService().create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "apiorig",
+      isPrivate: false,
+    });
+    await repoService().rename(created.id, "apinew");
+
+    const moved = await SELF.fetch("https://example.com/alice/apiorig/api/refs", { redirect: "manual" });
+    expect(moved.status).toBe(301);
+    expect(moved.headers.get("location")).toBe("https://example.com/alice/apinew/api/refs");
+  });
+});
+
+describe("the LFS family stays on its own branch (SPEC-0006 §2.1, untouched by the widening)", () => {
+  it("answers the anonymous batch of a private D1-backed repo with the gitea-lfs challenge, not the git 401", async () => {
+    await pushCreateAndSettle("lfsbranch");
+
+    const batch = await SELF.fetch("https://example.com/alice/lfsbranch.git/info/lfs/objects/batch", {
+      method: "POST",
+      headers: { accept: LFS_MEDIA_TYPE, "content-type": LFS_MEDIA_TYPE },
+      body: JSON.stringify({ operation: "download", objects: [] }),
+    });
+    expect(batch.status).toBe(401);
+    expect(batch.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+    expect(JSON.parse(new TextDecoder().decode(await batch.arrayBuffer()))).toEqual({ message: "Unauthorized" });
   });
 });

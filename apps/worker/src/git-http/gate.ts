@@ -24,9 +24,28 @@
  *   D1-backed (registry sync alone is not sufficient: engine-known-but-
  *   D1-unknown repos must keep working until their creation path owns rows).
  *
- * The gate only claims the four §2.1 git-protocol routes; every other
- * repository-scoped path (engine JSON API, admin endpoints, UI-404s) passes
- * through verbatim, so the engine keeps owning them.
+ * The gate's claim (SPEC-0003 §2.1, as widened by the defense-in-depth wave):
+ * the four git-protocol routes ALWAYS, plus the repository-scoped ENGINE
+ * JSON/admin paths (`/{owner}/{repo}/api/*`, PUT `config`/`description`,
+ * POST `gc`, DELETE of the repo root — parse.ts `parseEngineRoute`) for
+ * D1-RESOLVED repositories. Rationale: the engine's own authorize hook
+ * decides those paths from the registry's `priv` mirror, which is set
+ * best-effort at create/visibility-flip time (RepoService.seedRepoExtras →
+ * `registry.setConfig`); a failed or drifted sync would otherwise serve a
+ * PRIVATE repo's JSON refs anonymously — or expose the engine's admin
+ * mutations — while the four git routes correctly 401. D1 is the authority:
+ * for a D1-resolved repo those engine paths run the same §2.4 matrix (JSON
+ * reads through the read rows incl. the §3.1 code-unit anonymous-read grant;
+ * admin shapes through the WRITE rows — the Worker API, not these HTTP
+ * shapes, is the sanctioned admin channel: src/repos drives Registry/RepoDO
+ * RPCs directly, and the import/mirror consumers call engine.fetch on
+ * gate-cleared git-protocol requests that never traverse this gate).
+ * For repositories WITHOUT a D1 row those paths still pass through verbatim
+ * (the transitional population below), and every other repository-scoped
+ * shape (pages, unknown tails) passes through for everyone: the engine
+ * headless-404s it BEFORE its authorize hook, so nothing can leak there. The
+ * LFS family (SPEC-0006 §2.1) is intercepted before all of this and is
+ * unaffected.
  */
 
 import { and, eq } from "drizzle-orm";
@@ -45,8 +64,10 @@ import {
   SAFE_GIT_PROTOCOL_HEADER,
   infoRefsOp,
   isGzipEncoded,
+  parseEngineRoute,
   parseGitHttpRoute,
   rpcRequestContentType,
+  type EngineRoute,
   type GitHttpRoute,
 } from "./parse";
 import {
@@ -103,6 +124,11 @@ export async function gitHttpGate(
   if (route === null) {
     const lfsRoute = parseLfsRoute(url.pathname, req.method);
     if (lfsRoute !== null) return handleLfsGateBranch(req, env, ctx, engine, lfsRoute);
+    // §2.1 gate-scope widening: repository-scoped ENGINE JSON/admin paths for
+    // D1-resolved repos run the ACL matrix here (defense-in-depth — see the
+    // module header); D1-missing repos keep the verbatim passthrough.
+    const engineRoute = parseEngineRoute(url.pathname, req.method);
+    if (engineRoute !== null) return handleEnginePathBranch(req, url, env, ctx, engine, engineRoute);
     return engine.fetch(req, env, ctx);
   }
 
@@ -334,6 +360,68 @@ async function handleUnknownRepository(
   const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey);
   ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`));
   return response;
+}
+
+/**
+ * Repository-scoped ENGINE JSON/admin paths for a repo the classifier claims
+ * (§2.1 gate-scope widening — parseEngineRoute). Repo resolution and the
+ * redirect rule are the git routes' pipeline; only the decision differs:
+ *
+ * - D1 row EXISTS: the §2.4 matrix decides — `api/*` with the read rows
+ *   (including rows 4/5: the code unit's anonymous-read grant on a private
+ *   repo), admin shapes with the WRITE rows (row 7 scope, row 10 archived,
+ *   row 8: owner/site-admin only). This is the D1-authority backstop for the
+ *   engine hook's registry-`priv` dependency (module header). D1 resolution
+ *   failures propagate (worker 500) — fail-closed, like every git route.
+ * - D1 row MISSING: a redirect row 301s to the canonical path before any
+ *   auth challenge (row 13, §2.5.3 — engine paths ride the same redirect
+ *   fabric as git/LFS URLs); with no redirect the request passes through to
+ *   the engine VERBATIM — the transitional population is unchanged.
+ *
+ * The allow tail is the shared gate-cleared forward (no `storageKey`: only
+ * receive-pack forwards carry the D1 storage key, §2.1 item 5), so the
+ * engine's own hook waves an already-authorized request instead of
+ * re-deciding from the registry mirror.
+ */
+async function handleEnginePathBranch(
+  req: Request,
+  url: URL,
+  env: Env,
+  ctx: ExecutionContext,
+  engine: DurableGitHandler<Env>,
+  route: EngineRoute,
+): Promise<Response> {
+  const ownerLower = route.owner.toLowerCase();
+  const repoLower = route.repo.toLowerCase();
+  const resolved = await resolveRepository(env.DB, ownerLower, repoLower);
+
+  if (resolved === null) {
+    const redirect = await lookupRedirect(env.DB, ownerLower, repoLower);
+    if (redirect !== null) return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug);
+    return engine.fetch(req, env, ctx);
+  }
+
+  const op: "read" | "write" = route.kind === "admin" ? "write" : "read";
+  // Rows 4/5: only a private repo can carry the code unit's anonymous-read
+  // grant (same computation as the git-route reads).
+  const unitAnonymousRead =
+    op === "read" && resolved.repo.visibility === "private"
+      ? await codeUnitAnonymousRead(env.DB, resolved.repo.id)
+      : false;
+
+  const decision = await authorizeGitHttp({
+    req,
+    env,
+    waitUntil: (p) => ctx.waitUntil(p),
+    op,
+    repo: resolved.repo,
+    owner: resolved.owner,
+    ownerVisibility: resolved.ownerVisibility,
+    unitAnonymousRead,
+  });
+  if (decision !== true) return decision;
+
+  return forwardToEngine(req, url, env, ctx, engine);
 }
 
 /**
