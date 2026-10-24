@@ -122,3 +122,52 @@ pre-empts; assert renewal rejected, reader abandons the plan; (B) DO restart
 mid-fetch — assert unexpired leases still block deletion; (C) delete vs
 renewal race — GC pauses at RECLAIMABLE before R2 DELETE; assert the system
 never grants both the renewal and the delete.
+
+## Round-5 additions (final): read-protection precision
+
+**Accepted residual window**: inline renewal proves `t_GET-start < t_expiry`,
+not `t_GET-end < t_expiry`. The v1 safety proposition is therefore REWORDED:
+we do NOT prove "R2 reads never overlap legal GC deletes"; we prove "any
+overlap never produces a wrongly-successful fetch". A GET spanning lease
+expiry either completes (fine) or fails (whole-fetch failure, never false
+success). Renewal-confirmed and read-fully-protected are two separate
+propositions; v1 claims only the first + the overlap-safety rewording.
+
+**Read segments are explicit R2 Range GETs, not stream chunks.** Pausing
+`reader.read()` does not provably stop underlying R2 I/O (prefetch/buffer) —
+we no longer rely on that assumption. Two serve paths, both defined:
+- segmented (multi-pack union): per-entry bounded Range GETs, each triggered
+  after a confirmed `renewAndAuthorizeRead` (the reviewer's readPackRange
+  sketch is the reference shape); segment sizes bounded for the 128 MiB
+  isolate.
+- fast path (whole-pack clone-cache stream): ONE long-lived GET; the lease
+  covers the entire stream duration; if a concurrent delete truncates it,
+  the fetch fails whole — Property A holds, availability for that path
+  relies on clone-cache packs being immutable (they are: keyed by
+  refs_version, deleted only with the version they serve — GC of a
+  clone-cache entry makes future plans not reference it, in-flight streams
+  are the only readers, and the same overlap-safety covers them).
+
+**Server owns negotiated closure (correction to our index-pack claim)**:
+`SuccessfulFetch ⇒ ValidPack ∧ ValidNegotiatedObjectClosure` — the closure
+is guaranteed SERVER-side by the serve plan's wants−haves closure walk (the
+same closure machinery receive validation uses); the client's connectivity
+check is defense-in-depth, not the guarantee (a self-consistent pack
+missing negotiated objects may pass bare pack verification on some
+client paths — shallow boundaries). Failure discipline: fetch "success" is
+structural — full data, then checksum trailer, then flush; an aborted or
+truncated stream can never carry a success-completing tail.
+
+**Lease release semantics**: leases protect R2-read dependency, NOT the
+HTTP response lifetime. Release when "all dependent R2 reads completed AND
+no future reads will target the protected packs" — for segmented serve,
+after the last Range GET; for the fast path, at stream end. This decouples
+GC from slow-client transfer (buffered bytes need no pack protection).
+
+**Round-5 fault-injection additions**: GET spanning lease expiry (start
+before, end after — assert complete-or-fail, never false success); stream
+prefetch probe (assert nothing depends on pause-stops-I/O); valid-but-
+incomplete pack (correct checksum, missing negotiated objects — assert
+server-side plan rejection OR client connectivity rejection; server-side
+is the contract); early lease release (last R2 read done, HTTP still
+sending — assert GC may reclaim and the fetch still completes correctly).
