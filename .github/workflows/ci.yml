@@ -214,3 +214,78 @@ jobs:
         run: pnpm build:assets
       - name: Manifests must be byte-identical
         run: cmp /tmp/manifest-1.json apps/worker/public/assets/.vite/manifest.json
+
+  # git-lfs client e2e suite (scripts/lfs-e2e.sh, SPEC-0006 §5 black-box
+  # layer): the REAL git-lfs client against the dev Worker, fully green gate
+  # (no allowlist — unlike the e2e job every check must pass). All traffic
+  # runs in relay mode (SPEC-0006 §2.3) — local dev has no R2 S3 credentials
+  # — so no cloud secrets are needed and the job stays a cheap local run.
+  # The suite asserts local D1 state (the `lfs_objects` table of migration
+  # 0005) and the local R2 object through the wrangler CLI, hence
+  # db:migrate:local before the server starts. git-lfs install: apt-get per
+  # scripts/lfs-e2e.README.md's suggested job (ubuntu-latest already carries
+  # a git-lfs; the official git-lfs/setup-git-lfs action would pin upstream
+  # releases if the distro version ever lags behind the >=3 requirement).
+  lfs-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gen:icons reads committed svg bodies from the gitea/ submodule
+          # (same as the e2e job).
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install git-lfs (the real client, >= 3)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+      - name: git lfs install
+        run: git lfs install
+      - name: Generate UI icons
+        run: pnpm gen:icons
+      # Not covered by pnpm test:lfs — pnpm pre-hooks match exact script
+      # names, so `pretest` fires only for `pnpm test` (and predev already
+      # regenerates for the dev server); explicit here like the e2e job.
+      - name: Dev vars (wrangler.jsonc requires the GIT_TOKEN secret locally)
+        run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+      - name: Apply local D1 migrations
+        run: pnpm db:migrate:local
+      - name: Start dev Worker (vite dev, workerd)
+        run: |
+          pnpm dev > /tmp/dev-server.log 2>&1 &
+          echo $! > /tmp/dev-server.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
+              echo "dev server up (attempt $i)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "dev server did not come up"; cat /tmp/dev-server.log; exit 1
+      - name: Run LFS e2e suite
+        run: |
+          rc=0
+          pnpm test:lfs > /tmp/lfs-e2e.log 2>&1 || rc=$?
+          cat /tmp/lfs-e2e.log
+          exit $rc
+      # A red run deliberately leaves its fixtures in place for debugging
+      # (scripts/lfs-e2e.README.md): scratch dir /tmp/cgit-lfs-e2e.XXXXXX
+      # (its RESULT line names it) holds GIT_TRACE captures, push output and
+      # the suite's dev-server.log. Upload it so the failure is diagnosable.
+      # The e2e PAT in the traces is runner-local only (minted for the
+      # lfse2e fixture user against the ephemeral local D1).
+      - name: Upload suite scratch (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lfs-e2e-failure
+          path: |
+            /tmp/lfs-e2e.log
+            /tmp/dev-server.log
+            /tmp/cgit-lfs-e2e.*/**
+          if-no-files-found: ignore
