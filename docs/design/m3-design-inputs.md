@@ -282,3 +282,41 @@ instance; diffs must be explainable by declared compatibility rules.
 **P0 dispatched**: the stopgap + fail-closed dispatch + ordering assertion
 + poisoning-combo tests went into the in-flight engine wave's landing
 gates (ownership respected — the wave owns those files).
+
+## Round-9: P0 acceptance formalized (gates G1-G5), status tracked separately
+
+**Risk-state accuracy**: spec-injected ≠ fixed — P0 remains OPEN until
+patch merged + tests green + real-git regression + production deploy.
+Tracked separately from the engine wave's functional completion.
+
+**V2 error-shape correction accepted**: v2 errors are `ERR` pkt-lines at
+the applicable point (no dedicated "error section") — acceptance is "git
+CLI recognizes the failure" (non-zero exit, remote error shown), verified
+with a real client, not a section name.
+
+**Sharpened invariant**: `ParsedSuccessfully ⇒ EverySemanticInputIs-
+RepresentedOrRejected` — recognize-then-drop and default-to-deepen=0 both
+violate; conflicting args (deepen + deepen-since) resolve via protocol
+combination rules over a DISCRIMINATED shallow-mode union, never field
+overwrite.
+
+**Gates (all mandatory for the P0 landing)**: G1 complete recognition;
+G2 protocol-shaped errors; G3 cache unreachability from illegal/
+unsupported negotiation (the root-cause cut — the cache stops needing to
+know all protocol semantics); G4 combination safety; G5 real-client
+verification (exit status + .git/shallow).
+
+**Type-level boundary (aid, not safety)**: branded ValidatedFetchRequest
+constructible only by the validator; planFetch/cache predicate accept
+only the branded type. Runtime checks remain the contract.
+
+**Core invariant quartet (elevated)**: copy-before-finalize ·
+CAS-before-ref-update · lease-before-read · **validate-before-plan**.
+
+**Interim mitigation decision**: NO pre-deploy shallow-request blocking —
+a string-matching interceptor would be exactly the second incomplete
+parser the reviewer warned against; exposure accepted until the in-flight
+patch lands (deepen-since traffic is rare; the wave is imminent).
+
+**Next review deliverable**: the P0 diff + real git CLI exit states +
+.git/shallow results — single-point fix vs structural elimination.
