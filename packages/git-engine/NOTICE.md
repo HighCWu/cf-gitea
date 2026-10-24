@@ -1,0 +1,53 @@
+# NOTICE — @cf-gitea/git-engine
+
+This package is a vendored copy of the [durable-git](https://github.com/littledivy/durable-git)
+library ("dgit"), a git smart-HTTP server implemented as a Cloudflare Durable Object.
+
+- Upstream repository: https://github.com/littledivy/durable-git
+- Vendored commit: `d5eba04eda584b855a1bde1f86a836b751c378c0` (tag `v0.0.8`, 2026-08-21)
+- Vendored date: 2026-10-24
+- License: MIT — see [./LICENSE](./LICENSE) (Copyright (c) 2026 Divy Srivastava), kept verbatim
+- Copied verbatim: `src/` (whole tree), `scripts/e2e.sh`, `scripts/gen-sha1dc-tables.mjs`
+- Package-level files added by this repository: `package.json`, `tsconfig.json`, `NOTICE.md`, `e2e/`
+- Vendoring rules and adaptation policy: `specs/0001-storage-engine.md` §8
+  (adaptations stay reviewable; provenance rule — never copy from ziggit (GPL-2.0);
+  gitoxide snippets (MIT OR Apache-2.0) allowed only with an attribution comment)
+
+Provenance rule for this package: every deviation from the vendored commit must be
+recorded in "Local adaptations" below, one line per change, with the reason. Deep
+adaptation (split-plane architecture, R2 layout, RepoDO schema per SPEC-0001 §2–§4)
+is Wave 2 and lands as reviewable patches on top of this commit.
+
+Packaging-level deviations (not source changes): `package.json` renames the
+package to `@cf-gitea/git-engine` and drops upstream's wrangler dev/deploy
+scripts (the root `wrangler.jsonc` is the single source of truth per AGENTS.md);
+`tsconfig.json` extends the repo strict base and locally relaxes three flags
+(`noUncheckedIndexedAccess`, `verbatimModuleSyntax`, `noImplicitOverride`) that
+the verbatim upstream source does not satisfy — see the notes in
+`tsconfig.json`; `e2e/e2e.sh` is the adapted copy of upstream's
+`scripts/e2e.sh` (header only) and is the ONLY copy kept in this repo — the
+verbatim duplicate at `scripts/e2e.sh` was removed 2026-10-24 to avoid two
+diverging copies; `scripts/gen-sha1dc-tables.mjs` stays verbatim. Source
+adaptations begin with SPEC-0001 M2 Step 1 — see "Local adaptations" below.
+
+## Local adaptations
+
+Wave 2 (SPEC-0001 M2 Step 1, receive data plane → Worker) landed 2026-10-24.
+Every deviation below is against upstream `d5eba04eda584b855a1bde1f86a836b751c378c0`;
+categories follow `specs/0001a-split-plane-amendment.md` §7.
+
+| Date | File(s) | Reason |
+|------|---------|--------|
+| 2026-10-24 | `src/control-plane.ts` (NEW) | Receive lease control plane per SPEC-0001a §3 Step 1: the `BeginReceiveInput`/`BeginReceiveResult`/`FinalizedPack`/`FinalizeReceiveInput`/`FinalizeReceiveResult`/`ReleaseReceiveInput`/`ReleaseReceiveResult` tagged unions verbatim (application outcomes never throw across the RPC boundary) plus the begin/finalize/release/expiry-sweep lease implementations the `RepoCell` RPC methods delegate to. Split-plane reason: pack bytes leave the DO; the DO keeps refs, the object index, and the lease. |
+| 2026-10-24 | `src/mod.ts` | Receive data plane moved into the Worker (SPEC-0001a §3 Step 1): parses ONLY the pkt-line command section (strict 4-hex framing), opens the lease, streams the pack remainder straight into R2 staging — `FixedLengthStream` single PUT when Content-Length is known, 16 MiB multipart parts (`MultipartCapture`, moved unchanged) when chunked — verifies the trailer SHA-1 through a 20-byte sliding window, copies staging → `packs/` BEFORE `finalizeReceive` (copy-before-finalize ordering), then renders report-status byte-identically from the typed result. Registry upsert/onPush bookkeeping keyed off `FinalizeCommitted.updates`/`commitTime` instead of response headers; registry memo invalidation moved to the new receive branch. |
+| 2026-10-24 | `src/repo.ts` | New public RPC methods `beginReceive`/`finalizeReceive`/`releaseReceive` (spec §7 category 5: dist-types regenerated) delegating to control-plane.ts via a `LeaseHost` adapter; `bindR2`/`purgePackCache` moved to the `REPO_PACKS` bucket (purge covers `repos/<key>/` and legacy `raw/`); `meta.repo` persisted unconditionally so request-less RPC paths can rebind; gc defers while a receive lease is active; alarm sweeps expired leases before the gc-pending branch. |
+| 2026-10-24 | `src/env.ts` | Added `REPO_PACKS?: R2Bucket` (receive staging + stored packs, matching the worker's wrangler.jsonc binding name — SPEC-0001a §8 correction 4). `PACK_CACHE` stays the separate, optional full-clone cache binding (M4/Step 3 unify them). |
+| 2026-10-24 | `src/git/store.ts` | `leases` table (lease_token, kind, expires_at, payload) + create/get/delete/active/expired helpers (SPEC-0001 §4 `leases`, created at Step 1 per SPEC-0001a §3 Step 4 table); `refs_version()`/`bumpRefsVersion()` meta counter — begin echoes it, finalize bumps it inside the commit transaction (T4 edge-cache key; Step 4 formalizes the key set); `wipe()` drops leases. |
+| 2026-10-24 | `src/git/packstore.ts` | `ingest()` (request-stream phase-A byte feed + R2-vs-SQLite backend selection) replaced by `ingestStored(r2Key, totalBytes, opts)`: the DO reads the Worker-staged R2 object back through the chunk cache and only index rows land in SQLite ("staging object is the store"); `pack_meta` gains `r2_key` (receive packs record `repos/<storage_key>/packs/<packName>.pack`), and `chunk()`/`deleteR2Packs()`/the orphan sweep resolve per-pack R2 keys (legacy rows fall back to `raw/<repo>/<packId>`). |
+| 2026-10-24 | `src/git/protocol.ts` | Refname validation extracted into exported `validRefName` — shared by `validatePush` and the lease's pre-stream check (`control-plane.ts`); pure extraction, rules unchanged. |
+| 2026-10-24 | `src/repo.ts`, `src/mod.ts` | DELETED: the `x-changed`/`x-commit-time`/`x-ref-updates` response-header channel (lossy 8 KiB truncation included) — replaced by the typed `FinalizeReceiveResult` (`updates` reach the onPush hook untruncated). The config-PUT `x-commit-time` admin header remains until SPEC-0003 owns repo bookkeeping. |
+| 2026-10-24 | `src/repo.ts` | DELETED: `receiveChain` promise serialization — replaced by the exclusive receive lease (`beginReceive` busy → 503 Retry-After: 10, T7; expiry sweep makes retry safe; finalize idempotent-on-`lease_mismatch`). |
+| 2026-10-24 | `src/repo.ts` | DELETED: the DO's `receive`/`processReceive` request-stream pipeline (`POST /git-receive-pack` no longer reaches the cell) — pack bytes never pass through the DO; the cell ingests from the stored R2 object. |
+| 2026-10-24 | `src/git/packstore.ts` | DELETED: phase-A streaming storage into `pack_data` for received packs — `pack_data` remains only as the legacy SQLite read path (dead on the Worker, kept for pre-Step-1 repos and the celld fallback shape). |
+| 2026-10-24 | `src/mod.ts` | DEVIATION: git push now requires the `REPO_PACKS` R2 binding (500 without it) — the no-bucket receive fallback died with the DO request-stream path; cf-gitea's Worker always binds it (celld is not a cf-gitea target). |
+| 2026-10-24 | `src/control-plane.ts`, `src/mod.ts` | Step-1 conventions recorded here: `pack.packBytes === 0` denotes a deletes-only push (no pack exists; a real pack is ≥32 bytes); `idxBytes` is 0 until Step 2 emits idx v2; `objectCount` is advisory in Step 1 (the DO's own scan re-derives the count and its structural checks bind); a begin-rejected push (funny refname) rejects the whole command section (no partial lease); a DO-side scan failure surfaces as `unpack ok` + per-command `ng … unpacker error` in Step 1 because the raw scan-error text does not cross the RPC boundary (the text returns in Step 2 when the scan is Worker-side); storage_key is the persisted repo name (`meta.repo`) until SPEC-0003 supplies the D1-minted `r_<id>`; lease TTL is 15 minutes (crashed holders recover immediately via release-on-abort; the TTL is the sweep backstop). |

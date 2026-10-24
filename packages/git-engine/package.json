@@ -1,0 +1,28 @@
+{
+  "name": "@cf-gitea/git-engine",
+  "version": "0.0.8",
+  "private": true,
+  "description": "Git storage engine for cf-gitea. Vendored from durable-git (github.com/littledivy/durable-git) — see NOTICE.md for provenance and local adaptations.",
+  "type": "module",
+  "main": "src/mod.ts",
+  "types": "dist-types/mod.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist-types/mod.d.ts",
+      "default": "./src/mod.ts"
+    }
+  },
+  "license": "MIT",
+  "scripts": {
+    "build:types": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "pako": "^2.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260811.1",
+    "@types/pako": "^2.0.3",
+    "typescript": "~6.0.3"
+  }
+}

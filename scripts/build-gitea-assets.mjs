@@ -36,6 +36,7 @@
 // Exit codes: 0 success; 1 usage/config error; build failures propagate pnpm's code.
 
 import {spawnSync} from 'node:child_process';
+import console from 'node:console';
 import {
   cpSync,
   existsSync,
@@ -48,7 +49,8 @@ import {
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {fileURLToPath} from 'node:url';
+import process from 'node:process';
+import {fileURLToPath, URL} from 'node:url';
 
 // ---------------------------------------------------------------------------
 // CLI parsing
@@ -84,6 +86,7 @@ function parseArgs(argv) {
       case '--help': case '-h':
         console.log(readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(0, 30).join('\n'));
         process.exit(0);
+        break; // eslint no-fallthrough: exit(0) never returns, default is unreachable
       default: fail(`unknown option: ${arg} (see --help)`);
     }
   }
@@ -269,7 +272,6 @@ walk(out);
 // 6) Report
 // ---------------------------------------------------------------------------
 
-const kb = (n) => `${(n / 1024).toFixed(1)} kB`;
 const indexEntry = manifest['web_src/js/index.ts'];
 const iifeEntry = manifest['web_src/js/iife.ts'];
 console.log(`

@@ -1,0 +1,44 @@
+#!/bin/sh
+# cf-gitea e2e wiring (packages/git-engine/e2e/README.md): force git's
+# --progress display so e2e.sh's output-scraping checks work outside a tty.
+#
+# git requests the server's sideband progress (the "remote: ..." lines) only
+# when stderr is a tty; e2e.sh scrapes those lines from command substitutions
+# and pipes (section 4 "incremental fetch is small", section 5 "sideband
+# progress"), where stderr is never a tty — against any server, GitHub
+# included. Prepending this shim directory to PATH appends --progress to
+# fetch/clone invocations, restoring the interactive display the suite was
+# written against. --progress only affects client-side display, never the
+# protocol exchange, so the assertions stay honest.
+
+REAL="${REAL_GIT:-/usr/bin/git}"
+[ -x "$REAL" ] || REAL="$(command -v git)"
+
+# the subcommand is the first argument not consumed by a global flag
+# (the suite only ever uses `git -c <k=v> <subcommand> ...`)
+skip=
+sub=
+for a in "$@"; do
+  if [ "$skip" = yes ]; then skip=; continue; fi
+  case "$a" in
+    -c) skip=yes ;;
+    -*) ;;
+    *) sub="$a"; break ;;
+  esac
+done
+
+case "$sub" in
+  fetch|clone) ;;
+  *) exec "$REAL" "$@" ;;
+esac
+
+# an explicit progress flag on the command line is left untouched
+for a in "$@"; do
+  case "$a" in
+    --progress|--no-progress) exec "$REAL" "$@" ;;
+  esac
+done
+
+# git's parse-options permutes, so --progress can trail the positional args —
+# no argv surgery needed
+exec "$REAL" "$@" --progress

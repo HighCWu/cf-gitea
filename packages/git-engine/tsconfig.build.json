@@ -1,0 +1,15 @@
+// Emits declaration files only: the public API surface (mod.ts exports) that
+// apps/worker type-checks against. Vendored internals keep their own relaxed
+// tsconfig (see tsconfig.json); consumers never compile them under their own
+// strict settings — this is the type boundary for the vendored package.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist-types"
+  },
+  "include": ["src/**/*.ts"]
+}

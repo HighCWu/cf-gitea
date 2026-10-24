@@ -19,8 +19,9 @@ import { gitHttpGate } from "./git-http/gate";
  * - `cors` unset: no cross-origin engine API yet.
  * - `onPush` unset: repo bookkeeping stays inside the engine (registry DO)
  *   until SPEC-0003 wires repo lifecycle to D1.
- * - `PACK_CACHE` (R2 full-clone fast path) intentionally not bound yet —
- *   SPEC-0001 §10 defers the clone cache; the engine degrades to the DO path.
+ * - `REPO_PACKS` (R2) is bound and used by the engine's receive path for
+ *   pack staging + final packs (SPEC-0001a §3 Step 1). The full-clone cache
+ *   key family (`clone-cache/`) stays unwritten until M4 (SPEC-0001 §10).
  */
 const gitHttp = createDurableGit<Env>({ authorize, ui: false, namespaces: true });
 

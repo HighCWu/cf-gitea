@@ -1,0 +1,24 @@
+// packages/git-engine — vendored durable-git (SPEC-0001 §8).
+// Extends the repo-root strict base. Three flags are relaxed LOCALLY because
+// the byte-verbatim upstream source (commit d5eba04) does not satisfy them; per
+// the minimal-adaptation policy we prefer config relaxation over editing
+// vendored code. Wave 2 may patch the source (recorded in NOTICE.md "Local
+// adaptations") and re-enable them:
+//   - noUncheckedIndexedAccess: false — ~500 "possibly undefined" errors across
+//     the pack parser / blame / protocol code (upstream was written without it).
+//   - verbatimModuleSyntax: false — upstream mixes value+type imports (17
+//     type-only-import errors); isolatedModules (from the base) still applies.
+//   - noImplicitOverride: false — repo.ts's fetch/alarm members override the
+//     DurableObject base class without the `override` modifier (2 errors).
+// Everything else is inherited unchanged; `strict: true` passes with zero
+// source edits. Local deltas must stay exactly this small.
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types"],
+    "noUncheckedIndexedAccess": false,
+    "verbatimModuleSyntax": false,
+    "noImplicitOverride": false
+  },
+  "include": ["src/**/*.ts"]
+}
