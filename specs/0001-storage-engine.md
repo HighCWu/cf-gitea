@@ -20,6 +20,10 @@ In scope:
 - Receive path: streaming staging, quota gate, two-pass index, atomic finalize (§5).
 - Serve path: v2 fetch negotiation, single-pack R2 fast path, refs edge cache (§5).
 - Compaction (alarm-triggered, queue-executed) and orphan sweeps.
+- Merge/fork/diff primitives (engine-resident typed RPCs: mergeBase, three-way
+  tree merge, mergeability classification, executeMerge/rebaseOnto, range walks,
+  CAS ref delete, fork catalog replication + PR relay) — per
+  `specs/0001b-merge-fork-primitives.md`, the design-of-record for that surface.
 - Fuzzing, e2e harness, benchmark CI regression stage (§6–7).
 
 Out of scope (later SPECs): auth/ACL/token semantics (0002), git HTTP routes,
@@ -118,7 +122,10 @@ push vs API-write races resolve purely by CAS (loser gets `ref_conflict` +
 `currentOid`). The lighter connectivity gate (tip + root tree, not the full closure
 walk) is deliberate: the caller is a same-account Worker over a service binding and
 every stored object is oid-verified. M3 compaction treats API-written loose objects
-as steady-state input, not just GC-migration debris.
+as steady-state input, not just GC-migration debris. A third write entry point,
+`executeMerge` (0001b §4), constructs merge/rebase commits the same way — derived
+loose objects stored via `GitStore.put` inside the landing transaction's build
+phase, under the same CAS/`refs_version` machinery.
 
 ## 6. Acceptance criteria — defect/solution table (each row is a test)
 
@@ -156,8 +163,10 @@ reclaims staging + non-`active` rows.
   NOTICE recording the upstream commit; we carry patches.
 - Adaptations (R2 layout, Worker-side data plane, our DO schema) live behind our own
   port interfaces so upstream diffs stay reviewable.
-- Provenance rule: never copy code from ziggit (GPL-2.0); gitoxide snippets (MIT OR
-  Apache-2.0) allowed with attribution comment.
+- Provenance rule: never copy code from ziggit (GPL-2.0). Apache-2.0 sources
+  (gitoxide [MIT OR Apache-2.0], gitorange [Apache-2.0]) are allowed with an
+  attribution comment, a reference to the upstream license, and a statement of
+  changes — the generalization exercised by 0001b §8 category 3.
 
 ## 9. Benchmarks — required CI regression stage (per ADR-0001 annex)
 

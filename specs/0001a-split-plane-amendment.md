@@ -241,6 +241,10 @@ export interface FinalizeReceiveInput {
   pack: FinalizedPack;
   /** unpacker/scan failure text, null on success — forces every command to fail */
   unpackError: string | null;
+  /** OPTIONAL engine-internal ref updates riding the same transaction (added by
+   *  SPEC-0001b §4.7: PR-head sync `refs/pull/N/head` on push). `results` stays
+   *  index-aligned with the client's `commands` only. */
+  extraRefUpdates?: RefUpdate[];
 }
 
 export type FinalizeCommitted = {
@@ -522,6 +526,11 @@ Method signatures on `RepoCell`:
 async putApiObjects(objects: ApiObject[]): Promise<PutApiObjectsResult>;
 async commitApiChange(input: CommitApiChangeInput): Promise<CommitApiChangeResult>;
 ```
+
+`commitApiChange` **cannot delete refs** (its CAS expects an `expectedOldOid` →
+`newOid` move). The CAS-delete counterpart is `deleteApiRef(ref, expectedOldOid)`
+per `specs/0001b-merge-fork-primitives.md` §4.8 — branch/PR ref deletes route
+there, never through receive.
 
 DO-side semantics, locked here:
 
