@@ -81,7 +81,15 @@ export type EngineDivergenceResult =
  */
 export function engineReads(env: ApiEnv["Bindings"], pair: { ownerNamespace: string; slug: string }): EngineReads {
   const cell = env.REPO.getByName(engineRepoName(pair));
-  const safe = <T>(pending: Promise<T>): Promise<T | null> => pending.catch(() => null);
+  // async/await erases the RPC stub's `Promise & Pick` intersection types,
+  // which break plain `.catch(() => null)` inference on union results.
+  const safe = async <T>(pending: Promise<T>): Promise<T | null> => {
+    try {
+      return await pending;
+    } catch {
+      return null;
+    }
+  };
   return {
     listRefs: () => safe(cell.listRefs()),
     readCommit: (id) => safe(cell.readCommit(id)),
@@ -89,10 +97,12 @@ export function engineReads(env: ApiEnv["Bindings"], pair: { ownerNamespace: str
     listTree: (ref, path) => safe(cell.listTree(ref, path)),
     readBlob: (ref, path) => safe(cell.readBlob(ref, path)),
     readDiff: (id, id2) => safe(cell.readDiff(id, id2)),
-    mergeBase: (a, b) => safe(cell.mergeBase(a, b)),
+    // the union-returning RPCs carry explicit type arguments — the RPC stub's
+    // `Promise & Pick` intersections make inference pick one union member
+    mergeBase: (a, b) => safe<EngineMergeBaseResult>(cell.mergeBase(a, b)),
     listCommitsRange: (base, head, limit, page) => safe(cell.listCommitsRange(base, head, limit, page)),
-    countDivergence: (base, head) => safe(cell.countDivergence(base, head)),
-    checkMergeability: (input) => safe(cell.checkMergeability(input)),
+    countDivergence: (base, head) => safe<EngineDivergenceResult>(cell.countDivergence(base, head)),
+    checkMergeability: (input) => safe<CheckMergeabilityResult>(cell.checkMergeability(input)),
   };
 }
 
@@ -166,37 +176,42 @@ export function resolveNamedRef(
  * engine's refname/object validation → the declared 422.
  */
 export function commitApiChangeError(result: Exclude<CommitApiChangeResult, { tag: "committed" }>): ApiError {
-  switch (result.tag) {
-    case "ref_conflict":
-      return new ApiError(409, `The branch update has failed, the ref moved [current: ${result.currentOid}]`);
-    case "invalid":
-      return new ApiError(422, result.reason);
+  if (result.tag === "ref_conflict") {
+    return new ApiError(409, `The branch update has failed, the ref moved [current: ${result.currentOid}]`);
   }
+  // "importing" (the fork-import gate) and "invalid" (refname/object
+  // validation) both refuse the write; the declared 422 carries the reason
+  // where the engine supplies one.
+  return new ApiError(422, result.tag === "invalid" ? result.reason : "repository is importing");
 }
 
 /** deleteApiRef outcome — a null currentOid is the engine's "already gone" ok. */
 export function deleteApiRefError(result: Exclude<DeleteApiRefResult, { tag: "deleted" }>): ApiError | null {
-  if (result.tag === "ref_conflict" && result.currentOid === null) {
-    return null; // idempotent delete: the ref is already absent
-  }
   if (result.tag === "invalid") {
     return new ApiError(422, result.reason);
+  }
+  if (result.currentOid === null) {
+    return null; // idempotent delete: the ref is already absent
   }
   return new ApiError(409, `The ref delete has failed, the ref moved [current: ${result.currentOid}]`);
 }
 
 /** executeMerge outcome → the merge route's declared {405, 409} family. */
 export function executeMergeError(result: Exclude<ExecuteMergeResult, { tag: "committed" }>): ApiError {
-  switch (result.tag) {
-    case "not_fast_forward":
-      return new ApiError(405, "not a fast forward");
-    case "conflict":
-      return new ApiError(405, "merge would conflict");
-    case "nothing_to_merge":
-      return new ApiError(405, `nothing to merge [status: ${result.status}]`);
-    case "ref_conflict":
-      return new ApiError(409, `The merge has failed, the base ref moved [current: ${result.currentOid}]`);
-    case "invalid":
-      return new ApiError(405, result.reason);
+  if (result.tag === "not_fast_forward") {
+    return new ApiError(405, "not a fast forward");
   }
+  if (result.tag === "conflict") {
+    return new ApiError(405, "merge would conflict");
+  }
+  if (result.tag === "nothing_to_merge") {
+    return new ApiError(405, `nothing to merge [status: ${result.status}]`);
+  }
+  if (result.tag === "ref_conflict") {
+    return new ApiError(409, `The merge has failed, the base ref moved [current: ${result.currentOid}]`);
+  }
+  // "invalid" carries the engine's reason; "importing" is the fork-import
+  // gate refusing while replication is in flight.
+  return new ApiError(405, result.tag === "invalid" ? result.reason : "repository is importing");
 }
+

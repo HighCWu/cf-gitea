@@ -28,7 +28,7 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 import { serializeCommit, serializeTag, serializeTree } from "@cf-gitea/git-engine";
 
 import contractRaw from "../../compat/contract/v1-swagger.generated.json?raw";
-import { comments, milestones, repositories, users } from "../../db/schema";
+import { comments, milestones, pullRequests, repositories, users } from "../../db/schema";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { applyOrgsDdl } from "../../services/orgs/testing";
 import { OrgService } from "../../services/orgs/orgs";
@@ -342,6 +342,12 @@ beforeAll(async () => {
     pullA: pullA.issue.index,
     pullB: pullB.issue.index,
   });
+  // repoGetCommitPullRequest join seed: the alpha pull's head_sha cache
+  // points at the suite's shared commit sha (the D1 join target).
+  await drizzle(env.DB)
+    .update(pullRequests)
+    .set({ headSha: SEED_SHA })
+    .where(eq(pullRequests.id, pullA.pullRequest.id));
 
   // ---------------------------------------------------------------------
   // Batch-7 D1 block (SPEC-0004 §2.4 rows repoListTopics … repoTransfer):
@@ -382,10 +388,22 @@ beforeAll(async () => {
   await relService.createRelease({ repoId: "9004", publisherId: ownerId, tagName: "compat-v2", title: "compat v2", now: relNow(1) });
   await relService.createRelease({ repoId: "9004", publisherId: ownerId, tagName: "compat-v-del", title: "compat v del", now: relNow(2) });
   const relD = await relService.createRelease({ repoId: "9004", publisherId: ownerId, tagName: "compat-v-del-id", title: "compat v del id", now: relNow(3) });
+  // The asset-family victim: a draft so repoGetLatestRelease and the
+  // anonymous release reads stay untouched by the asset scenarios.
+  const relAssets = await relService.createRelease({
+    repoId: "9004",
+    publisherId: ownerId,
+    tagName: "compat-v-assets",
+    target: "main",
+    title: "compat v assets",
+    isDraft: true,
+    now: relNow(4),
+  });
 
   Object.assign(seeds, {
     releaseEditId: relA.id,
     releaseDeleteId: relD.id,
+    assetsReleaseId: relAssets.id,
   });
 
   // ---------------------------------------------------------------------
@@ -463,6 +481,81 @@ beforeAll(async () => {
     gitTree: gitTree.oid,
     gitBlob: gitBlobOid,
     gitAnnotatedTag: gitAnnotated.oid,
+  });
+
+  // ---------------------------------------------------------------------
+  // PR-engine seeds (SPEC-0005 §3.4, batch-8 rows repoDownloadPullDiffOrPatch
+  // … repoMergeUpstream): a topic/done commit pair children of the seed
+  // commit, two PR rows on the compat-git repo (one open+mergeable for the
+  // diff/commits/files/merge scenarios, one pre-merged for the is-merged
+  // 204), their base-repo refs/pull/N/head landed through the same
+  // receive-less commitApiChange the create route uses. The mergeable state
+  // machine runs lazily on GET (ensurePullRequestChecked), so the rows here
+  // stay checking — the merge scenario drives the real engine execution.
+  // ---------------------------------------------------------------------
+  const topicBlobData = new TextEncoder().encode("topic change\n");
+  const topicBlobOid = await gitObjectOid("blob", topicBlobData);
+  const topicTree = serializeTree([
+    { mode: "100644", name: "compat.txt", oid: gitBlobOid },
+    { mode: "100644", name: "topic.txt", oid: topicBlobOid },
+  ]);
+  const topicCommit = serializeCommit({
+    tree: topicTree.oid,
+    parents: [gitCommit.oid],
+    author: gitPerson,
+    committer: gitPerson,
+    message: "compat topic commit\n",
+  });
+  const doneCommit = serializeCommit({
+    tree: topicTree.oid,
+    parents: [gitCommit.oid],
+    author: gitPerson,
+    committer: gitPerson,
+    message: "compat done commit\n",
+  });
+  const storedPrObjects = await gitCell.putApiObjects([
+    { oid: topicBlobOid, type: "blob", data: topicBlobData },
+    { oid: topicTree.oid, type: "tree", data: topicTree.data },
+    { oid: topicCommit.oid, type: "commit", data: topicCommit.data },
+    { oid: doneCommit.oid, type: "commit", data: doneCommit.data },
+  ]);
+  if (storedPrObjects.tag !== "ok") {
+    throw new Error(`pr seed putApiObjects failed: ${storedPrObjects.tag}`);
+  }
+  await landSeedRef("refs/heads/compat-topic", topicCommit.oid);
+  await landSeedRef("refs/heads/compat-done", doneCommit.oid);
+  await landSeedRef("refs/heads/compat-create-head", gitCommit.oid);
+
+  const gitIssues = new IssuesService(env.DB);
+  const prTopic = await gitIssues.createPullRequest({
+    repoId: "9008",
+    headRepoId: "9008",
+    baseBranch: "main",
+    headBranch: "compat-topic",
+    title: "compat engine pull",
+    posterId: ownerId,
+    headSha: topicCommit.oid,
+  });
+  const prMerged = await gitIssues.createPullRequest({
+    repoId: "9008",
+    headRepoId: "9008",
+    baseBranch: "main",
+    headBranch: "compat-done",
+    title: "compat merged pull",
+    posterId: ownerId,
+    headSha: doneCommit.oid,
+  });
+  await landSeedRef(`refs/pull/${prTopic.pullRequest.index}/head`, topicCommit.oid);
+  await landSeedRef(`refs/pull/${prMerged.pullRequest.index}/head`, doneCommit.oid);
+  // pre-merge the done PR's row (the is-merged 204 scenario reads only the row)
+  await drizzle(env.DB)
+    .update(pullRequests)
+    .set({ hasMerged: true, mergedCommitId: doneCommit.oid, mergerId: ownerId, mergedAt: SEED_NOW, status: 3 })
+    .where(eq(pullRequests.id, prMerged.pullRequest.id));
+
+  Object.assign(seeds, {
+    prTopic: prTopic.issue.index,
+    prMerged: prMerged.issue.index,
   });
 
   // ---------------------------------------------------------------------
@@ -545,6 +638,20 @@ const JSON_HEADERS = { "Content-Type": "application/json" };
 
 const repoPath = (ctx: CompatScenarioContext): string =>
   `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.repoSlug)}`;
+
+/**
+ * Deterministic multipart body for the repoCreateReleaseAttachment scenario
+ * (the `attachment` file part of the contract's formData declaration).
+ */
+const ASSET_MULTIPART_BYTES = new TextEncoder().encode(
+  '--compat-asset\r\n' +
+    'Content-Disposition: form-data; name="attachment"; filename="compat-asset.bin"\r\n' +
+    'Content-Type: application/octet-stream\r\n' +
+    '\r\n' +
+    'compat asset bytes\n' +
+    '\r\n' +
+    '--compat-asset--\r\n',
+);
 
 const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   getVersion: [{ name: "instance version", status: 200, request: () => ({ path: "/version" }) }],
@@ -1009,14 +1116,29 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   ],
   repoCreatePullRequest: [
     {
-      name: "create",
+      // The create validates base/head against the ENGINE (SPEC-0005 §3.4):
+      // both branches live on the compat-git repo, and the created PR's
+      // refs/pull/N/head lands through commitApiChange.
+      name: "create (engine-validated base/head)",
       status: 201,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/pulls`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ title: "compat-created pull", body: "created by the compat suite", head: "compat-create-head", base: "main" }),
+        }),
+      }),
+    },
+    {
+      name: "missing head branch → declared 404",
+      status: 404,
       request: (ctx) => ({
         path: `${repoPath(ctx)}/pulls`,
         init: ctx.withAuth({
           method: "POST",
           headers: JSON_HEADERS,
-          body: JSON.stringify({ title: "compat-created pull", body: "created by the compat suite", head: "compat-created", base: "main" }),
+          body: JSON.stringify({ title: "x", head: "compat-ghost", base: "main" }),
         }),
       }),
     },
@@ -1070,6 +1192,103 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       name: "missing targets → runtime-body 404",
       status: 404,
       request: (ctx) => ({ path: `${repoPath(ctx)}/pulls/main/ghost` }),
+    },
+  ],
+  repoGetCommitPullRequest: [
+    {
+      // The alpha pull's head_sha cache points at the shared seed sha (the
+      // join target; upstream joins merged_commit_id — the documented
+      // divergence of services/commit-pull.ts).
+      name: "the PR carrying the seeded commit sha",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/commits/${String(ctx.seeds.sha)}/pull` }),
+    },
+    {
+      name: "sha no PR carries → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/commits/${"f".repeat(40)}/pull` }),
+    },
+  ],
+
+  // ---------------------------------------------------------------------
+  // PR deferred family (batch 8, SPEC-0005 §3.4): the engine-backed
+  // {index}.{diffType} / commits / files / merge rows over the compat-git
+  // PR seeds. The merge scenario consumes the dedicated open pull (fixture
+  // order runs it after the diff/commits/files reads); the 405/409 gates are
+  // the route tests' business here — the fixture pins the 200 empty happy
+  // path.
+  // ---------------------------------------------------------------------
+
+  repoDownloadPullDiffOrPatch: [
+    {
+      name: "raw diff of the seeded engine pull",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/pulls/${String(ctx.seeds.prTopic)}.diff`,
+      }),
+    },
+  ],
+  repoGetPullRequestCommits: [
+    {
+      name: "commits of the seeded engine pull",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/pulls/${String(ctx.seeds.prTopic)}/commits`,
+      }),
+    },
+  ],
+  repoGetPullRequestFiles: [
+    {
+      name: "changed files of the seeded engine pull",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/pulls/${String(ctx.seeds.prTopic)}/files`,
+      }),
+    },
+  ],
+  repoPullRequestIsMerged: [
+    {
+      name: "merged pull → 204",
+      status: 204,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/pulls/${String(ctx.seeds.prMerged)}/merge`,
+      }),
+    },
+    {
+      name: "open pull → 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/pulls/${String(ctx.seeds.prTopic)}/merge`,
+      }),
+    },
+  ],
+  repoMergePullRequest: [
+    {
+      name: "merge the seeded engine pull (200 empty)",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/pulls/${String(ctx.seeds.prTopic)}/merge`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ do: "merge", merge_title_field: "compat merge" }),
+        }),
+      }),
+    },
+  ],
+  repoMergeUpstream: [
+    {
+      // forks cannot exist yet (SPEC-0003 primitives pending) — the declared 404
+      name: "no upstream → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/merge-upstream`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ branch: "main" }),
+        }),
+      }),
     },
   ],
 
@@ -1545,6 +1764,49 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       request: (ctx) => ({
         path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/${String(ctx.seeds.releaseDeleteId)}`,
         init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+  repoListReleaseAttachments: [
+    {
+      // The dedicated draft assets-release; the owner token sees drafts
+      // (upstream hides drafts from release-reads without write access).
+      name: "assets of the seeded draft release",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/${String(ctx.seeds.assetsReleaseId)}/assets`,
+        init: ctx.withAuth(),
+      }),
+    },
+    {
+      name: "missing release → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({ path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/99999/assets` }),
+    },
+  ],
+  repoCreateReleaseAttachment: [
+    {
+      name: "multipart upload of the compat asset",
+      status: 201,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/${String(ctx.seeds.assetsReleaseId)}/assets`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: { "Content-Type": "multipart/form-data; boundary=compat-asset" },
+          body: ASSET_MULTIPART_BYTES,
+        }),
+      }),
+    },
+    {
+      name: "missing release → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/99999/assets`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: "compat asset bytes\n",
+        }),
       }),
     },
   ],

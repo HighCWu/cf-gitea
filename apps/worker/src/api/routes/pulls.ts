@@ -1,3 +1,53 @@
+/**
+ * Tier-1 PR-block routes (SPEC-0004 §2.4 rows repoListPullRequests /
+ * repoCreatePullRequest / repoGetPullRequest / repoEditPullRequest /
+ * repoGetPullRequestByBaseHead / repoDownloadPullDiffOrPatch /
+ * repoGetPullRequestCommits / repoGetPullRequestFiles /
+ * repoPullRequestIsMerged / repoMergePullRequest / repoMergeUpstream —
+ * 8 paths, 11 operations; behavior per SPEC-0005 §2.4/§3.4).
+ *
+ * Engine semantics (services/pull-engine.ts): POST validates the base/head
+ * branch existence (engine reads) and writes `refs/pull/N/head` through the
+ * receive-less commitApiChange (SPEC-0001b §4.4 mapping); a failed D1
+ * creation after the ref landed deletes the row again (upstream cleanup
+ * order, services/pull/pull.go:157). GET …/{index} runs the LAZY
+ * mergeability check (a `checking` row fires checkMergeability and CAS-writes
+ * the result), renders the real mergeability trio (mergeable/base.sha/
+ * merge_base) and feeds PATCH's merged precondition. The diff/patch/commits/
+ * files reads compose `merge_base...refs/pull/N/head` (0001b §10.8 — the API
+ * service owns the composition). POST …/merge requires the mergeable state
+ * (405 otherwise — the not-mergeable semantics of the contract's 405), refuses
+ * WIP titles and already-merged rows with 405, and refuses the auto-merge
+ * schedule with the declared 409. POST /merge-upstream answers 404: forks
+ * cannot exist yet (SPEC-0003 primitives pending).
+ *
+ * `GET …/pulls/{index}.{diffType}` is a DOT-SUFFIX path (SPEC-0004 §4): the
+ * contract path is declared doc-only via the registry (hono's `:a.:b` two-
+ * param segment does not route), and a plain pre-handler on the one-segment
+ * pulls path intercepts `^(\d+)\.(diff|patch)$` before the `{index}` route.
+ *
+ * Auth: reads are anonymous-capable on public repos (upstream group carries
+ * `reqRepoReader(TypeCode)`); POST/PATCH require a token (SPEC-0002
+ * `write:repository`); the ACL matrix lands with SPEC-0002 — requireAuth
+ * stands in (the hooks-routes convention). Repo resolution follows the
+ * anti-enumeration 404; a wrong index answers the upstream
+ * ErrPullRequestNotExist message (`pull request does not exist [id: 0, …]`).
+ * Upstream PATCH has NO mustNotBeArchived (unlike POST) — 423 is not
+ * declared here and never emitted; the PATCH precondition family is the 412
+ * "cannot change state of this pull request, it was already merged".
+ *
+ * RUNTIME-ONLY code the handlers can still emit (undeclared; the
+ * orchestrator-owned RUNTIME_ONLY_RESPONSES tables are not extended by this
+ * batch): POST pulls 400 (invalid due_date format — upstream
+ * ApplyAPIDeadlineTimestamp "invalid date format: X"); POST merge 403
+ * ("User not allowed to merge PR" — the write-scope stand-in requires a
+ * token but no per-user merge whitelist exists yet).
+ *
+ * The PATCH `base` retarget stays engine-gated upstream (branch existence +
+ * ChangeTargetBranch) and is still ignored this wave (same treatment as the
+ * issue PATCH's assignee fields).
+ */
+
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { Context, MiddlewareHandler } from "hono";
@@ -5,7 +55,7 @@ import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import { z } from "zod";
 
-import { issues, pullRequests, users } from "../../db/schema";
+import { issues, PRStatus, pullRequests, users } from "../../db/schema";
 import { IssueError, MilestoneNotExistError } from "../../issues/errors";
 import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
@@ -15,12 +65,15 @@ import type { ApiEnv } from "../env";
 import {
   createPullRequestOptionSchema,
   editPullRequestOptionSchema,
+  mergePullRequestOptionSchema,
+  mergeUpstreamRequestSchema,
   pullRequestListSchema,
   pullRequestSchema,
   type PullRequest,
 } from "../models/pull";
+import { changedFileListSchema, commitListSchema } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
-import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, changeIssueTitle, issueErrorToApiError } from "../services/issues";
+import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, changeIssueTitle, hasWorkInProgressPrefix, issueErrorToApiError } from "../services/issues";
 import { parseMilestoneDeadline } from "../services/milestones";
 import {
   existingRepoLabelIds,
@@ -34,13 +87,17 @@ import {
   toApiPullRequest,
 } from "../services/pulls";
 import {
-  canViewRepository,
-  findRepositoryByPath,
-  repositoryPermissions,
-  toApiRepository,
-  viewerOf,
-  type RepositoryWithOwner,
-} from "../services/repository";
+  createPullHeadRef,
+  ensurePullRequestChecked,
+  mergePullRequest as mergePullRequestEngine,
+  mergeableOfRow,
+  mergeUpstream as mergeUpstreamEngine,
+  pullRequestDiff,
+} from "../services/pull-engine";
+import { branchRef, engineReads } from "../services/engine";
+import { renderUnifiedDiff, renderPatch, toApiCommit, toChangedFiles, usernamesByEmail } from "../services/git-models";
+import { canViewRepository, findRepositoryByPath, repositoryPermissions, toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
+import { canWriteRepository } from "../services/repo-access";
 
 /**
  * Tier-1 PR-block routes (SPEC-0004 §2.4 rows repoListPullRequests /
@@ -148,6 +205,27 @@ const bindValidationHook = ({ success }: { success: boolean }): undefined => {
 /** Tri-state pointer rule: absent and JSON-null both mean "unchanged". */
 function patchField<T>(value: T | null | undefined): T | undefined {
   return value === null || value === undefined ? undefined : value;
+}
+
+/** The stat/files boolean query flags (default TRUE — ParseCommitOptions). */
+function formBoolDefault(url: URL, key: string): boolean {
+  const raw = url.searchParams.get(key);
+  if (raw === null || raw === "") return true;
+  return ["1", "t", "T", "true", "TRUE", "True", "on"].includes(raw);
+}
+
+/**
+ * The contract's X-* header family (CommitList / ChangedFileList are the only
+ * two responses declaring it — SPEC-0004 §2.5). X-Total-Count carries the
+ * commits/files SO FAR (the engine's range walk reports no total; the
+ * approximation is documented in the routes).
+ */
+function setCommitListHeaders(c: Context<ApiEnv>, opts: { page: number; limit: number }, countSoFar: number, hasMore: boolean): void {
+  c.header("X-Total-Count", String(countSoFar));
+  c.header("X-Page", String(opts.page));
+  c.header("X-PerPage", String(opts.limit));
+  c.header("X-PageCount", String(Math.max(Math.ceil(countSoFar / opts.limit), opts.page > 1 ? opts.page : 1)));
+  c.header("X-HasMore", hasMore ? "true" : "false");
 }
 
 /** Data-layer typed errors → ApiError with the pinned status/message. */
@@ -398,6 +476,62 @@ export function registerPullRoutes(
   optionalAuth: MiddlewareHandler<ApiEnv>,
 ): void {
   // -------------------------------------------------------------------------
+  // GET /repos/{owner}/{repo}/pulls/{index}.{diffType}
+  // (repoDownloadPullDiffOrPatch) — raw text diff/patch over the PR range.
+  // The contract's DOT-SUFFIX path cannot route through hono's param
+  // conversion (`:index.:diffType` does not bind params), so the path is
+  // declared DOC-ONLY through the registry and a plain pre-handler on the
+  // one-segment pulls path intercepts `^(\d+)\.(diff|patch)$`, falling through
+  // to the openapi `{index}` route otherwise.
+  // -------------------------------------------------------------------------
+  const pullDiffDocRoute = createRoute({
+    method: "get",
+    path: "/repos/{owner}/{repo}/pulls/{index}.{diffType}",
+    middleware: [optionalAuth],
+    tags: ["repository"],
+    summary: "Get a pull request diff",
+    operationId: "repoDownloadPullDiffOrPatch",
+    request: {
+      params: z.object({
+        ...ownerRepoParams,
+        index: z.string().min(1).openapi({ type: "integer", format: "int64", description: "index of the pull request to get" }),
+        diffType: z.string().min(1).openapi({ type: "string", enum: ["diff", "patch"], description: "type of diff" }),
+        binary: z.string().optional().openapi({ type: "boolean", description: "whether to include binary file changes" }),
+      }),
+    },
+    responses: {
+      200: { description: "string", content: { "text/plain": { schema: z.string() } } },
+      404: notFoundResponse,
+    },
+  });
+  app.openAPIRegistry.registerPath(pullDiffDocRoute);
+
+  const handlePullDiff = async (c: Context<ApiEnv>, owner: string, repo: string, rawIndex: string, diffType: string): Promise<Response> => {
+    const { found } = await requireVisibleRepo(c, { owner, repo });
+    const { pullRequest } = await requirePullRequest(c, found, rawIndex);
+    const checked = await ensurePullRequestChecked(c, found, pullRequest);
+    const { files, mergeBase, head } = await pullRequestDiff(c, found, checked);
+    void mergeBase;
+    if (diffType === "patch") {
+      const headCommit = (await engineReads(c.env, found.repo).readCommit(head)) ?? null;
+      if (headCommit === null) {
+        throw new ApiError(404, "not found");
+      }
+      return c.text(renderPatch(headCommit, files), 200);
+    }
+    return c.text(renderUnifiedDiff(files), 200);
+  };
+
+  app.get("/repos/:owner/:repo/pulls/:segment", async (c, next) => {
+    const match = /^(\d+)\.(diff|patch)$/.exec(c.req.param("segment") ?? "");
+    if (match === null) {
+      return next();
+    }
+    const { owner, repo } = c.req.param();
+    return handlePullDiff(c, owner, repo, match[1] as string, match[2] as string);
+  });
+
+  // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/pulls (repoListPullRequests)
   // -------------------------------------------------------------------------
   app.openapi(listPullsRoute(optionalAuth), async (c) => {
@@ -471,11 +605,10 @@ export function registerPullRoutes(
         throw new ApiError(422, "Invalid PullRequest: There are no changes between the head and the base");
       }
 
-      // parseCompareInfo reduced to the D1 registry: the base resolves inside
-      // this repo (owner-qualified forms must name this repo — forks cannot
-      // exist yet), the head resolves through resolveHeadRepo (`owner:branch`
-      // fork form). Branch EXISTENCE is an engine read — accepted per
-      // upstream shape, validated at the mergeability wave (file header).
+      // parseCompareInfo: the base resolves inside this repo (owner-qualified
+      // forms must name this repo — forks cannot exist yet), the head
+      // resolves through resolveHeadRepo (`owner:branch` fork form). Branch
+      // EXISTENCE is an engine read (SPEC-0005 §3.4 creation flow step 1).
       let baseBranch = form.base;
       if (baseBranch.includes(":")) {
         const colon = baseBranch.indexOf(":");
@@ -486,6 +619,17 @@ export function registerPullRoutes(
         baseBranch = baseBranch.slice(colon + 1);
       }
       const head = await resolveHeadRepo(c.env.DB, found, form.head);
+
+      const reads = engineReads(c.env, found.repo);
+      const baseTip = await reads.readCommit(branchRef(baseBranch));
+      const headTip = head.headRepoId === found.repo.id ? await reads.readCommit(branchRef(head.headBranch)) : null;
+      if (baseTip === null) {
+        // parseCompareInfo's base miss → APIErrorNotFound
+        throw new ApiError(404, "not found");
+      }
+      if (headTip === null) {
+        throw new ApiError(404, `Head branch does not exist [name: ${head.headBranch}]`);
+      }
 
       // GetUnmergedPullRequest duplicate check → 409 (issue_id = the INDEX).
       const existing = await findUnmergedPullRequest(c.env.DB, head.headRepoId, found.repo.id, head.headBranch, baseBranch);
@@ -522,9 +666,21 @@ export function registerPullRoutes(
           milestoneId,
           labelIds,
           allowMaintainerEdit: form.allow_maintainer_edit ?? true, // DefaultAllowMaintainerEdit (repo_unit default)
+          headSha: headTip.oid,
         }));
       } catch (error) {
         asApiError(error);
+        throw error;
+      }
+
+      // The base-repo head ref: a receive-less CAS write (commitApiChange,
+      // SPEC-0001b §4.4 mapping). Failure after the D1 commit deletes the row
+      // again (upstream's cleanup order, services/pull/pull.go:157).
+      try {
+        await createPullHeadRef(c, found, pr.index, headTip.oid);
+      } catch (error) {
+        await drizzle(c.env.DB).delete(issues).where(eq(issues.id, issue.id));
+        await drizzle(c.env.DB).delete(pullRequests).where(eq(pullRequests.id, pr.id));
         throw error;
       }
       if (deadlineAt !== null) {
@@ -550,12 +706,23 @@ export function registerPullRoutes(
   );
 
   // -------------------------------------------------------------------------
-  // GET /repos/{owner}/{repo}/pulls/{index} (repoGetPullRequest)
+  // GET /repos/{owner}/{repo}/pulls/{index} (repoGetPullRequest) — runs the
+  // LAZY mergeability check (SPEC-0005 §3.4: a `checking` row fires the
+  // read-only engine check and CAS-writes the row) and renders the real
+  // mergeable/base.sha pair.
   // -------------------------------------------------------------------------
   app.openapi(getPullRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
     const { issue, pullRequest } = await requirePullRequest(c, found, c.req.valid("param").index);
-    return c.json(await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "single"), 200);
+    const checked = await ensurePullRequestChecked(c, found, pullRequest);
+    const baseSha = (await engineReads(c.env, found.repo).readCommit(branchRef(checked.baseBranch)))?.oid;
+    return c.json(
+      await toApiPullRequest(c.env.DB, viewer, found, issue, checked, "single", {
+        mergeable: mergeableOfRow(checked),
+        ...(baseSha === undefined ? {} : { baseSha }),
+      }),
+      200,
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -750,6 +917,265 @@ export function registerPullRoutes(
     bindValidationHook,
   );
 
+
+
+  // -------------------------------------------------------------------------
+  // GET /repos/{owner}/{repo}/pulls/{index}/commits (repoGetPullRequestCommits)
+  // — the PR range walk (CommitList carries the contract's X-* header family).
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/pulls/{index}/commits",
+      middleware: [optionalAuth],
+      tags: ["repository"],
+      summary: "Get commits for a pull request",
+      operationId: "repoGetPullRequestCommits",
+      request: {
+        params: z.object(pullIndexParams),
+        query: z.object({
+          page: pageLimitQuery.page,
+          limit: pageLimitQuery.limit,
+          verification: z.string().optional().openapi({ type: "boolean", description: "include verification for every commit (default true)" }),
+          files: z.string().optional().openapi({ type: "boolean", description: "include a list of affected files for every commit (default true)" }),
+        }),
+      },
+      responses: {
+        200: { description: "CommitList", content: { "application/json": { schema: commitListSchema } } },
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+      const { pullRequest } = await requirePullRequest(c, found, c.req.valid("param").index);
+      const checked = await ensurePullRequestChecked(c, found, pullRequest);
+      const listOptions = parseListOptions(new URL(c.req.url));
+      const url = new URL(c.req.url);
+      const statFlag = formBoolDefault(url, "stat");
+      const filesFlag = formBoolDefault(url, "files");
+
+      const reads = engineReads(c.env, found.repo);
+      const range = await pullRequestDiff(c, found, checked);
+      const rangeCommits =
+        checked.mergeBase === null ? { commits: [], more: false } : ((await reads.listCommitsRange(checked.mergeBase, range.head, listOptions.limit, listOptions.page - 1)) ?? { commits: [], more: false });
+      const commits = rangeCommits.commits;
+      // X-Total-Count approximation: commits SO FAR (module doc on
+      // setCommitListHeaders); the Link header gets a next relation when the
+      // walk reports more.
+      const soFar = (listOptions.page - 1) * listOptions.limit + commits.length;
+      setPaginationHeaders(c, soFar + (rangeCommits.more ? 1 : 0), listOptions);
+      setCommitListHeaders(c, listOptions, soFar, rangeCommits.more);
+
+      const usernames = await usernamesByEmail(c.env.DB, commits);
+      const viewer = viewerOf(c);
+      const rendered = await Promise.all(
+        commits.map(async (commit) =>
+          toApiCommit(c.env.DB, reads, viewer, found, commit, usernames, { stat: statFlag, files: filesFlag }),
+        ),
+      );
+      return c.json(rendered, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /repos/{owner}/{repo}/pulls/{index}/files (repoGetPullRequestFiles)
+  // — ChangedFileList over the range diff (the other X-* header family).
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/pulls/{index}/files",
+      middleware: [optionalAuth],
+      tags: ["repository"],
+      summary: "Get changed files for a pull request",
+      operationId: "repoGetPullRequestFiles",
+      request: {
+        params: z.object(pullIndexParams),
+        query: z.object({
+          skip_to: z.string().optional().openapi({ description: "skip to given file" }),
+          whitespace: z.string().optional().openapi({ type: "string", enum: ["ignore-all", "ignore-change", "ignore-eol", "show-all"], description: "whitespace behaviour" }),
+          page: pageLimitQuery.page,
+          limit: pageLimitQuery.limit,
+        }),
+      },
+      responses: {
+        200: { description: "ChangedFileList", content: { "application/json": { schema: changedFileListSchema } } },
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+      const { pullRequest } = await requirePullRequest(c, found, c.req.valid("param").index);
+      const checked = await ensurePullRequestChecked(c, found, pullRequest);
+      const listOptions = parseListOptions(new URL(c.req.url));
+      const range = await pullRequestDiff(c, found, checked);
+      const files = toChangedFiles(
+        range.files,
+        found,
+        viewerOf(c).origin,
+        range.head,
+      );
+      const soFar = (listOptions.page - 1) * listOptions.limit + files.length;
+      setCommitListHeaders(c, listOptions, soFar, files.length > listOptions.page * listOptions.limit);
+      const start = (listOptions.page - 1) * listOptions.limit;
+      return c.json(files.slice(start, start + listOptions.limit), 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /repos/{owner}/{repo}/pulls/{index}/merge (repoPullRequestIsMerged)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/pulls/{index}/merge",
+      middleware: [optionalAuth],
+      tags: ["repository"],
+      summary: "Check if a pull request has been merged",
+      operationId: "repoPullRequestIsMerged",
+      request: { params: z.object(pullIndexParams) },
+      responses: {
+        204: { description: "empty" },
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+      const { pullRequest } = await requirePullRequest(c, found, c.req.valid("param").index);
+      if (!pullRequest.hasMerged) {
+        throw new ApiError(404, "not found");
+      }
+      return c.body(null, 204);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /repos/{owner}/{repo}/pulls/{index}/merge (repoMergePullRequest)
+  // — 200 empty on success; the 405 family is the not-mergeable semantics
+  // (SPEC-0004 §2.5), 409 the lost base-ref CAS.
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/repos/{owner}/{repo}/pulls/{index}/merge",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Merge a pull request",
+      operationId: "repoMergePullRequest",
+      request: {
+        params: z.object(pullIndexParams),
+        body: { content: { "application/json": { schema: mergePullRequestOptionSchema } } },
+      },
+      responses: {
+        200: { description: "empty" },
+        403: forbiddenResponse,
+        404: notFoundResponse,
+        405: { description: "empty" },
+        409: errorResponse,
+        423: repoArchivedResponse,
+      },
+    }),
+    async (c) => {
+      const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+      assertNotArchived(found);
+      if (!(await canWriteRepository(c, found))) {
+        throw new ApiError(403, "User not allowed to merge PR");
+      }
+      const { issue, pullRequest } = await requirePullRequest(c, found, c.req.valid("param").index);
+      const form = c.req.valid("json");
+
+      // CheckPullMergeable (405 family): merged, WIP, not-mergeable. The
+      // auto-merge schedule gate runs first (upstream checks
+      // MergeWhenChecksSucceed before the mergeable state).
+      if (pullRequest.hasMerged) {
+        throw new ApiError(405, "The PR is already merged");
+      }
+      if (form.merge_when_checks_succeed === true) {
+        // the auto-merge schedule is not modeled (no scheduled-merge table)
+        throw new ApiError(409, "scheduled auto-merge is not supported");
+      }
+      if (hasWorkInProgressPrefix(issue.title)) {
+        throw new ApiError(405, "Work in progress PRs cannot be merged");
+      }
+      const requester = c.get("authUser");
+      if (requester === undefined) {
+        throw new ApiError(401, "token is required"); // unreachable behind requireAuth
+      }
+
+      // The mergeable precondition runs the LAZY check on a `checking` row
+      // (same self-healing pass as the GET): not-mergeable after the check →
+      // the upstream 405 "Please try again later".
+      const checked = await ensurePullRequestChecked(c, found, pullRequest);
+      if (checked.hasMerged || checked.status === PRStatus.Ancestor) {
+        throw new ApiError(405, "The PR is already merged");
+      }
+      if (checked.status !== PRStatus.Mergeable) {
+        throw new ApiError(405, "Please try again later");
+      }
+
+      const { commitOid } = await mergePullRequestEngine(c, found, issue, checked, {
+        style: form.do,
+        title: form.merge_title_field ?? "",
+        message: form.merge_message_field ?? "",
+        deleteBranchAfterMerge: form.delete_branch_after_merge === true,
+        mergeCommitId: form.merge_commit_id,
+        doerId: requester.id ?? 0,
+        now: new Date(),
+      });
+
+      // Webhook: pull_request closed with merged=true (the merged trio set).
+      const merged = await findPullRequestByIndex(c.env.DB, found.repo.id, checked.index);
+      if (merged !== null) {
+        const rendered = await toApiPullRequest(c.env.DB, viewerOf(c), found, merged.issue, merged.pullRequest, "single");
+        await emitPullWebhook(c, {
+          repoId: found.repo.id,
+          ownerId: found.repo.ownerId,
+          eventType: "pull_request",
+          payload: pullRequestPayload("closed", rendered, merged.issue.index, toApiRepository(viewerOf(c), found), requester, {
+            commitId: commitOid ?? "",
+          }),
+        });
+      }
+      return c.body(null, 200);
+    },
+    bindValidationHook,
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /repos/{owner}/{repo}/merge-upstream (repoMergeUpstream) — 404:
+  // forks cannot exist yet (SPEC-0003 fork primitives pending); the write
+  // gate still runs so private-repo enumeration stays the 404 it already is.
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/repos/{owner}/{repo}/merge-upstream",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Sync a fork's branch with the upstream repository",
+      operationId: "repoMergeUpstream",
+      request: {
+        params: z.object(ownerRepoParams),
+        body: { content: { "application/json": { schema: mergeUpstreamRequestSchema } } },
+      },
+      responses: {
+        // the MergeUpstreamResponse shape is declared in models/pull.ts and
+        // carried for the fork wave; forks cannot exist yet, so this handler
+        // never reaches 200 (the declared empty family)
+        200: { description: "MergeUpstreamResponse" },
+        400: errorResponse,
+        404: notFoundResponse,
+        409: errorResponse,
+      },
+    }),
+    async (c) => {
+      const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+      c.req.valid("json"); // bind (fast-forward_only accepted per upstream shape)
+      await mergeUpstreamEngine(c, found);
+      return c.body(null, 200); // unreachable — mergeUpstreamEngine throws
+    },
+    bindValidationHook,
+  );
   // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/pulls/{base}/{head} (repoGetPullRequestByBaseHead)
   // — the pure D1 lookup on the base/head columns; the fork form

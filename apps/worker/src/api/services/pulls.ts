@@ -6,6 +6,7 @@ import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { ApiError } from "../errors";
 import type { PullRequest, PRBranchInfo } from "../models/pull";
 import { hasWorkInProgressPrefix, toApiIssue } from "./issues";
+import { mergeableOfRow } from "./pull-engine";
 import { apiUserFromRow, findRepositoryByPath, toApiRepository, type RepositoryWithOwner, type Viewer } from "./repository";
 
 /**
@@ -19,16 +20,20 @@ import { apiUserFromRow, findRepositoryByPath, toApiRepository, type RepositoryW
  * filtered PR list (models/issues/pull_list.go PullRequests), the
  * duplicate-PR check (GetUnmergedPullRequest), and the base/head lookup.
  *
- * Engine boundary (this wave): everything here is D1-only. Upstream resolves
- * `Base.Sha`/`Head.Sha` through the git repo and computes mergeability
- * asynchronously (services/convert/pull.go:151–273); those are engine reads
- * (SPEC-0005 §3.4, specs/0001b). Until the engine RPCs land:
- *   - `mergeable` renders **null** (unknown — the create-time check has not
- *     run; upstream's checking status renders not-mergeable through
- *     `pr.Mergeable(ctx)` gating), the documented deviation from the
- *     contract's boolean type,
- *   - `base.sha` renders "" (branch-tip engine read) and `head.sha` from the
- *     `pull_requests.head_sha` cache ("" when the ref has not landed),
+ * Engine boundary (the mergeability wave, SPEC-0005 §3.4): the converter
+ * renders from the D1 row's cached state machine; the ENGINE reads (base
+ * branch tip, mergeability, diffs, merges) live in services/pull-engine.ts
+ * and flow in through `extras`. Upstream resolves `Base.Sha`/`Head.Sha`
+ * through the git repo and computes mergeability asynchronously
+ * (services/convert/pull.go:151–273):
+ *   - `mergeable` renders from the row's status (checking → **null** —
+ *     unknown; mergeable → true; otherwise false — upstream's checking
+ *     status renders not-mergeable through `pr.Mergeable(ctx)` gating), the
+ *     documented deviation from the contract's boolean type,
+ *   - `base.sha` renders "" unless the caller supplies `extras.baseSha`
+ *     (the single-GET route resolves the engine tip),
+ *   - `head.sha` renders from the `pull_requests.head_sha` cache ("" when
+ *     the ref has not landed),
  *   - `additions`/`deletions`/`changed_files`/`review_comments` stay omitted
  *     (upstream omits them in lists too: services/convert/pull.go:488–492),
  *   - POST /pulls accepts the create per upstream shape without the
@@ -265,8 +270,8 @@ function baseBranchInfo(viewer: Viewer, pair: RepositoryWithOwner, pr: PullReque
   return {
     label: pr.baseBranch,
     ref: pr.baseBranch,
-    // Base branch tip — an engine read this wave (services/convert/pull.go
-    // resolves it through the git repo; "" upstream when the branch is gone).
+    // Base branch tip — an engine read; the single-GET route supplies it via
+    // extras.baseSha (services/pull-engine.ts), lists render "".
     sha: "",
     repo_id: repoIdNumber(pr.baseRepoId),
     repo: toApiRepository(viewer, pair),
@@ -299,6 +304,12 @@ function headBranchInfo(viewer: Viewer, pair: RepositoryWithOwner, pr: PullReque
  * `pulls` path for `is_pull` rows). `mode` mirrors the single-vs-list
  * converter split: the single converter empties `assignees`
  * (`util.SliceNilAsEmpty`), the list one passes the raw null through.
+ *
+ * `extras` carries the engine-derived fields the routes resolve (the
+ * mergeability wave, SPEC-0005 §3.4): `mergeable` renders from the row's
+ * status machine (checking → null, mergeable → true, else false; a merged
+ * PR → false) and `base.sha` from the base branch tip — list rendering keeps
+ * the null/"" defaults to stay D1-only.
  */
 export async function toApiPullRequest(
   d1: D1Database,
@@ -307,6 +318,7 @@ export async function toApiPullRequest(
   issue: IssueRow,
   pr: PullRequestRow,
   mode: "single" | "list",
+  extras?: { mergeable?: boolean | null; baseSha?: string },
 ): Promise<PullRequest> {
   const apiIssue = await toApiIssue(d1, viewer, pair, issue);
   const htmlUrl =
@@ -350,14 +362,17 @@ export async function toApiPullRequest(
     html_url: htmlUrl,
     diff_url: `${htmlUrl}.diff`,
     patch_url: `${htmlUrl}.patch`,
-    // Mergeability state machine — engine wave (SPEC-0005 §3.4). Null = unknown.
-    mergeable: null,
+    // Mergeability state machine (SPEC-0005 §3.4): checking → null (unknown),
+    // mergeable → true, conflict/empty/ancestor/error → false. The single
+    // route resolves it lazily (ensurePullRequestChecked) and passes the
+    // value through `extras`; the list renders from the cached row.
+    mergeable: extras?.mergeable !== undefined ? extras.mergeable : mergeableOfRow(pr),
     merged: pr.hasMerged,
     merged_at: mergedAt,
     merge_commit_sha: mergeCommitSha,
     merged_by: mergedBy,
     allow_maintainer_edit: pr.allowMaintainerEdit,
-    base: baseBranchInfo(viewer, pair, pr),
+    base: { ...baseBranchInfo(viewer, pair, pr), ...(extras?.baseSha === undefined ? {} : { sha: extras.baseSha }) },
     head: headBranchInfo(viewer, pair, pr),
     merge_base: pr.mergeBase ?? "",
     due_date: apiIssue.due_date,
