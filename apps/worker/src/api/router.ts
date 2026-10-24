@@ -29,6 +29,7 @@ import { registerLabelRoutes } from "./routes/labels";
 import { registerLanguageRoutes } from "./routes/languages";
 import { registerMarkdownRoutes } from "./routes/markdown";
 import { registerMilestoneRoutes } from "./routes/milestones";
+import { registerMiscT2Routes } from "./routes/misc-t2";
 import { registerOrgRoutes } from "./routes/org-repos";
 import { registerOrgProfileRoutes } from "./routes/orgs";
 import { registerPullAutoMergeRoutes } from "./routes/pull-automerge";
@@ -44,6 +45,7 @@ import { registerSubscriptionRoutes } from "./routes/subscription";
 import { registerTopicItemRoutes } from "./routes/topic-items";
 import { registerTopicRoutes } from "./routes/topics";
 import { registerUserReposRoutes } from "./routes/user-repos";
+import { registerUserReadT2Routes } from "./routes/user-read-t2";
 import { registerUserRoute } from "./routes/user";
 import { registerUserSettingsRoutes } from "./routes/user-settings";
 import { registerUsersRoutes } from "./routes/users";
@@ -173,6 +175,12 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // Tier-2 issue writes: label detach + the pin trio (pin/unpin/move). Same
   // deep paths as the family above; writes reqToken per upstream.
   registerIssueWriteT2Routes(app, requireAuth);
+  // Tier-2 table-free misc reads: option templates (gitignore/label/license),
+  // published settings, /markup, /token lifecycle. Anonymous except the
+  // auth'd trio, mirroring upstream api.go routing.
+  registerMiscT2Routes(app, requireAuth);
+  // Tier-2 user reads: heatmap + current-following check.
+  registerUserReadT2Routes(app, requireAuth, optionalAuth);
   // Tier-2 social listings (stargazers, subscribers, watched/starred repos
   // by user, the doer's following list). The repo listings ride optionalAuth
   // (upstream repoAssignment); the /user + /users listings requireAuth.
