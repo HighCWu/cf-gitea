@@ -1,13 +1,14 @@
 import pako from "pako";
 import { ObjType } from "./objects";
 import { applyDelta } from "./pack";
+import { packR2Key } from "./r2keys";
 import type { IndexRow, LookupObjectHit, LookupObjectResult } from "../control-plane";
 import { ObjCache, ObjRec } from "../receive/objcache";
 
 export const PACK_CHUNK = 1024 * 1024;
 /** Size threshold from SPEC-0001 §3/§8: packs at least this large exist only in
- * R2; smaller packs MAY live in DO SQLite (pack_data) for latency — the Step 4
- * pack_catalog location column carries that decision. Since Step 1 every
+ * R2; smaller packs MAY live in DO SQLite (pack_data) for latency — the
+ * pack_catalog `location` column carries that decision. Since Step 1 every
  * received pack is staged in R2 by the Worker regardless of size; this bound
  * remains the small-pack local-store rule for later milestones. */
 export const R2_PACK_MIN_BYTES = 16 * 1024 * 1024;
@@ -46,7 +47,8 @@ const inflateAll = (data: Uint8Array): Uint8Array => {
 
 export interface PackedEntry {
   oid: string;
-  packId: number;
+  /** the pack catalog's key (= R2 object stem, `pack-<sha1>`) */
+  packKey: string;
   offset: number;
   dataOff: number;
   dataLen: number;
@@ -73,148 +75,181 @@ export const LOOSE_LOOKUP_CAP = 64 * 1024 * 1024;
 const ROW_BATCH_ROWS = 8;
 
 /**
+ * Pack lifecycle states (docs/design/m3-design-inputs.md). Only 'active' is
+ * written today; the RETIRED/RECLAIMABLE machinery is M3 compaction.
+ */
+export type PackState = "active" | "retired" | "reclaimable" | "deleted";
+
+/**
+ * One pack_catalog row (SPEC-0001 §4, renamed from dgit's `pack_meta` at the
+ * Step 4 schema alignment — the shape diverged materially, and integer pack
+ * ids leaked engine internals into keys). `packKey` is `pack-<sha1>` (the R2
+ * object stem, deterministic); `seq` is the `next_pack_seq` catalog order
+ * (never an R2 name); `state`/`superseded_by` are reserved for M3.
+ */
+export interface PackCatalogRow {
+  packKey: string;
+  seq: number;
+  /** 'receive' today, 'compact' from M3 */
+  kind: string;
+  state: PackState;
+  /** 'r2' | 'sqlite' (SPEC-0001a §8 correction 2) */
+  location: "r2" | "sqlite";
+  objectCount: number;
+  packBytes: number;
+  idxBytes: number;
+  createdAt: number;
+  supersededBy: string | null;
+}
+
+/**
  * Pack-native object database: received packfiles are stored verbatim — since
  * SPEC-0001a §3 the Worker stages them straight into R2, SCANS them, and
  * pushes the resulting index rows here (`putIndexRows`); the DO never reads
- * pack bytes on the receive path (pack_meta.r2_key records
- * `repos/<storage_key>/packs/<name>.pack`; legacy packs under
- * `raw/<repo>/<packId>`), else in SQLite chunk rows (the fallback / celld
- * path). Only the index ever lives in SQLite for an R2-backed pack, so pack
- * data escapes the per-DO storage ceiling. This is what lets large repos fit
- * and stream.
+ * pack bytes on the receive path. The bytes of an R2-backed pack live at the
+ * key built by src/git/r2keys.ts from the repo's storage key and the pack
+ * name (`repos/<storage_key>/packs/<packName>.pack`); only the index ever
+ * lives in SQLite for such a pack, so pack data escapes the per-DO storage
+ * ceiling. This is what lets large repos fit and stream.
  */
 export class PackStore {
-  /** LRU of decoded pack chunks, keyed "packId:seq" (SQLite row or R2 range). */
+  /** LRU of decoded pack chunks, keyed "packKey:seq" (SQLite row or R2 range). */
   private chunks = new Map<string, Uint8Array>();
   /**
-   * R2 raw-pack backend for this repo, or null when no bucket is bound (celld /
+   * R2 pack backend for this repo, or null when no bucket is bound (celld /
    * Workers without the binding). Received packs store their bytes in R2 and
-   * keep only the index in SQLite; pre-existing SQLite packs keep working
-   * (backend is recorded per pack).
+   * keep only the index in SQLite. Keys are derived from the persisted
+   * storage key via r2keys.ts — no repo name is involved.
    */
-  private r2: { bucket: R2Bucket; repo: string } | null = null;
-  /** Cached backend ('sql' | 'r2') per pack id, from pack_meta.store. */
-  private backend = new Map<number, "sql" | "r2">();
-  /** Cached R2 object key per pack id, from pack_meta.r2_key (receive packs
-   * live at repos/<storage_key>/packs/<name>.pack per SPEC-0001 §3; legacy
-   * packs fall back to rawKey). */
-  private r2Keys = new Map<number, string>();
+  private r2: { bucket: R2Bucket; storageKey: string } | null = null;
+  /** Cached backend ('r2' | 'sqlite') per pack key, from pack_catalog.location. */
+  private backend = new Map<string, "r2" | "sqlite">();
+  /**
+   * R2 object key override per pack key. The one legal non-derived state: a
+   * receive in flight, whose bytes are still the Worker's STAGING object (the
+   * catalog row does not exist until finalize, after the copy). recordPack
+   * clears the override; the derived packs/ key takes over.
+   */
+  private r2KeyOverrides = new Map<string, string>();
 
   constructor(private sql: SqlStorage, private extern: ExternalResolver) {
     this.init();
   }
 
   /** Bind (or clear) the R2 backend. Idempotent; the DO is per-repo so this is
-   * set on each request from the repo name. */
-  setR2(bucket: R2Bucket | undefined, repo: string): void {
-    this.r2 = bucket ? { bucket, repo } : null;
+   * set on each request from the persisted storage key. */
+  setR2(bucket: R2Bucket | undefined, storageKey: string): void {
+    this.r2 = bucket ? { bucket, storageKey } : null;
   }
 
-  private rawKey(packId: number): string {
-    return `raw/${this.r2!.repo}/${packId}`;
+  /**
+   * The R2 object key holding a pack's bytes: the staging override while a
+   * receive is in flight, else the r2keys.ts derivation
+   * `repos/<storage_key>/packs/<packName>.pack`. There is no legacy fallback —
+   * pre-Step-3 keys (`raw/<repo>/<id>`) belonged to a schema generation the
+   * Step 4 cutover wipes.
+   */
+  r2KeyOf(packKey: string): string {
+    const override = this.r2KeyOverrides.get(packKey);
+    if (override) return override;
+    if (!this.r2) throw new Error(`pack ${packKey}: no R2 backend bound for key derivation`);
+    return packR2Key(this.r2.storageKey, packKey);
   }
 
-  /** The R2 object key holding a pack's bytes. `recordPack` primes the cache
-   * before pack_meta exists; recorded keys (receive packs) win over the legacy
-   * raw/<repo>/<packId> derivation. */
-  r2KeyOf(packId: number): string {
-    const cached = this.r2Keys.get(packId);
-    if (cached) return cached;
-    const rows = this.sql
-      .exec<{ r2_key: string | null }>("SELECT r2_key FROM pack_meta WHERE pack_id = ?", packId)
-      .toArray();
-    const key = rows[0]?.r2_key || this.rawKey(packId);
-    this.r2Keys.set(packId, key);
-    return key;
-  }
-
-  /** Storage backend of a pack. Cached; falls back to a pack_meta lookup. */
-  private backendOf(packId: number): "sql" | "r2" {
-    const hit = this.backend.get(packId);
+  /** Storage backend of a pack. Cached; falls back to a pack_catalog lookup. */
+  private backendOf(packKey: string): "r2" | "sqlite" {
+    const hit = this.backend.get(packKey);
     if (hit) return hit;
     const rows = this.sql
-      .exec<{ store: string }>("SELECT store FROM pack_meta WHERE pack_id = ?", packId)
+      .exec<{ location: string }>("SELECT location FROM pack_catalog WHERE pack_key = ?", packKey)
       .toArray();
-    const b = rows[0]?.store === "r2" ? "r2" : "sql";
-    this.backend.set(packId, b);
+    // default 'r2': every post-Step-1 pack is R2-backed (the Worker stages
+    // it); a 'sqlite' location is recorded explicitly by the small-pack path
+    const b = rows[0]?.location === "sqlite" ? "sqlite" : "r2";
+    this.backend.set(packKey, b);
     return b;
   }
 
   private init(): void {
     this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS pack_meta (
-        pack_id INTEGER PRIMARY KEY,
-        size INTEGER NOT NULL,
-        count INTEGER NOT NULL,
-        created INTEGER NOT NULL,
-        store TEXT NOT NULL DEFAULT 'sql'
+      CREATE TABLE IF NOT EXISTS pack_catalog (
+        pack_key TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'receive',
+        state TEXT NOT NULL DEFAULT 'active',
+        location TEXT NOT NULL DEFAULT 'r2',
+        object_count INTEGER NOT NULL,
+        pack_bytes INTEGER NOT NULL,
+        idx_bytes INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        superseded_by TEXT
       );
+      CREATE INDEX IF NOT EXISTS idx_pack_catalog_seq ON pack_catalog(seq);
       CREATE TABLE IF NOT EXISTS pack_data (
-        pack_id INTEGER NOT NULL,
+        pack_key TEXT NOT NULL,
         seq INTEGER NOT NULL,
         data BLOB NOT NULL,
-        PRIMARY KEY (pack_id, seq)
+        PRIMARY KEY (pack_key, seq)
       );
       CREATE TABLE IF NOT EXISTS pack_objects (
         oid TEXT PRIMARY KEY,
-        pack_id INTEGER NOT NULL,
+        pack_key TEXT NOT NULL,
         offset INTEGER NOT NULL,
         data_off INTEGER NOT NULL,
         data_len INTEGER NOT NULL,
         type TEXT NOT NULL,
         size INTEGER NOT NULL,
         entry_size INTEGER NOT NULL,
-        base_oid TEXT
+        base_oid TEXT,
+        crc32 INTEGER NOT NULL DEFAULT 0
       );
-      CREATE INDEX IF NOT EXISTS idx_pack_objects_loc ON pack_objects(pack_id, offset);
+      CREATE INDEX IF NOT EXISTS idx_pack_objects_loc ON pack_objects(pack_key, offset);
     `);
-    // back-fill the store column on repos whose pack_meta predates the R2 backend:
-    // every such pack is SQLite-backed, which the 'sql' default records
-    const cols = this.sql.exec<{ name: string }>("PRAGMA table_info(pack_meta)").toArray();
-    if (!cols.some((c) => c.name === "store")) {
-      this.sql.exec("ALTER TABLE pack_meta ADD COLUMN store TEXT NOT NULL DEFAULT 'sql'");
-    }
-    // back-fill the R2 key column (SPEC-0001a §3 Step 1): receive packs record
-    // their repos/<storage_key>/packs/<name> object; legacy rows are null and
-    // resolve through rawKey
-    if (!cols.some((c) => c.name === "r2_key")) {
-      this.sql.exec("ALTER TABLE pack_meta ADD COLUMN r2_key TEXT");
-    }
-    // back-fill the idx CRC column (SPEC-0001a §3 Step 2): the Worker scan
-    // supplies per-entry CRC-32 for idx v2; rows written before Step 2 are 0
-    const objCols = this.sql.exec<{ name: string }>("PRAGMA table_info(pack_objects)").toArray();
-    if (!objCols.some((c) => c.name === "crc32")) {
-      this.sql.exec("ALTER TABLE pack_objects ADD COLUMN crc32 INTEGER NOT NULL DEFAULT 0");
-    }
   }
 
   wipe(): void {
-    for (const t of ["pack_meta", "pack_data", "pack_objects"]) {
+    for (const t of ["pack_catalog", "pack_data", "pack_objects"]) {
       this.sql.exec(`DROP TABLE IF EXISTS ${t}`);
     }
-    this.chunks.clear(); // pack ids restart from 1: cached rows would be stale
+    this.chunks.clear(); // pack keys are content-derived, but caches hold chunk bytes
     this.backend.clear();
-    this.r2Keys.clear();
+    this.r2KeyOverrides.clear();
+    this.init();
   }
 
   /** Drop all packs and start empty (small-repo gc migrates objects out first). */
   reset(): void {
     this.wipe();
-    this.init();
   }
 
-  /** Pack ids of the currently R2-backed packs (for GC to delete their R2 bytes). */
-  r2PackIds(): number[] {
+  /**
+   * The pack_catalog sequence (meta `next_pack_seq`, SPEC-0001 §4): catalog
+   * ordering only — it never appears in an R2 key (SPEC-0001a §3 Step 3).
+   * Reads GitStore's meta table directly (same SQLite database); only ever
+   * called after GitStore.init has created it.
+   */
+  private nextPackSeq(): number {
+    const rows = this.sql.exec<{ value: string }>("SELECT value FROM meta WHERE key = 'next_pack_seq'").toArray();
+    const next = (Number(rows[0]?.value ?? "0") || 0) + 1;
+    this.sql.exec(
+      "INSERT INTO meta (key, value) VALUES ('next_pack_seq', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      String(next)
+    );
+    return next;
+  }
+
+  /** Pack keys of the currently R2-backed packs (for GC to delete their R2 bytes). */
+  r2PackKeys(): string[] {
     return this.sql
-      .exec<{ pack_id: number }>("SELECT pack_id FROM pack_meta WHERE store = 'r2'")
+      .exec<{ pack_key: string }>("SELECT pack_key FROM pack_catalog WHERE location = 'r2'")
       .toArray()
-      .map((r) => r.pack_id);
+      .map((r) => r.pack_key);
   }
 
-  /** Delete the R2 raw objects for the given pack ids (no-op without a binding). */
-  async deleteR2Packs(packIds: number[]): Promise<void> {
-    if (!this.r2 || !packIds.length) return;
-    const keys = packIds.map((id) => this.r2KeyOf(id));
+  /** Delete the R2 raw objects for the given packs (no-op without a binding). */
+  async deleteR2Packs(packKeys: string[]): Promise<void> {
+    if (!this.r2 || !packKeys.length) return;
+    const keys = packKeys.map((name) => packR2Key(this.r2!.storageKey, name));
     for (let i = 0; i < keys.length; i += 100) {
       try {
         await this.r2.bucket.delete(keys.slice(i, i + 100));
@@ -230,7 +265,7 @@ export class PackStore {
 
   /** Total stored bytes across all indexed packs (0 when pack-empty). */
   totalPackBytes(): number {
-    return this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size), 0) AS n FROM pack_meta").one().n;
+    return this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(pack_bytes), 0) AS n FROM pack_catalog").one().n;
   }
 
   /**
@@ -246,17 +281,17 @@ export class PackStore {
   lookup(oid: string): PackedEntry | null {
     const rows = this.sql
       .exec<{
-        pack_id: number; offset: number; data_off: number; data_len: number;
+        pack_key: string; offset: number; data_off: number; data_len: number;
         type: ObjType; size: number; entry_size: number; base_oid: string | null;
       }>(
-        "SELECT pack_id, offset, data_off, data_len, type, size, entry_size, base_oid FROM pack_objects WHERE oid = ?",
+        "SELECT pack_key, offset, data_off, data_len, type, size, entry_size, base_oid FROM pack_objects WHERE oid = ?",
         oid
       )
       .toArray();
     const r = rows[0];
     if (!r) return null;
     return {
-      oid, packId: r.pack_id, offset: r.offset, dataOff: r.data_off, dataLen: r.data_len,
+      oid, packKey: r.pack_key, offset: r.offset, dataOff: r.data_off, dataLen: r.data_len,
       type: r.type, size: r.size, entrySize: r.entry_size, baseOid: r.base_oid,
     };
   }
@@ -288,12 +323,12 @@ export class PackStore {
    * fetched one at a time: a wide range in a single SELECT can exceed the
    * runtime's result-set size cap (celld materializes blob rows as JSON).
    */
-  async readRaw(packId: number, off: number, len: number): Promise<Uint8Array> {
+  async readRaw(packKey: string, off: number, len: number): Promise<Uint8Array> {
     const first = Math.floor(off / PACK_CHUNK);
     const last = Math.floor((off + len - 1) / PACK_CHUNK);
     const out = new Uint8Array(len);
     for (let seq = first; seq <= last; seq++) {
-      const chunk = await this.chunk(packId, seq);
+      const chunk = await this.chunk(packKey, seq);
       const chunkStart = seq * PACK_CHUNK;
       const from = Math.max(off, chunkStart);
       const to = Math.min(off + len, chunkStart + chunk.length);
@@ -311,8 +346,8 @@ export class PackStore {
    * reset, or the sweep paths, both of which clear the cache), so a hit can
    * never be stale.
    */
-  private async chunk(packId: number, seq: number): Promise<Uint8Array> {
-    const key = `${packId}:${seq}`;
+  private async chunk(packKey: string, seq: number): Promise<Uint8Array> {
+    const key = `${packKey}:${seq}`;
     const hit = this.chunks.get(key);
     if (hit) {
       this.chunks.delete(key); // reinsert: most-recently-used goes last
@@ -320,23 +355,23 @@ export class PackStore {
       return hit;
     }
     let chunk: Uint8Array;
-    if (this.backendOf(packId) === "r2") {
-      if (!this.r2) throw new Error(`pack ${packId}: R2 backend not bound`);
-      const key = this.r2KeyOf(packId);
+    if (this.backendOf(packKey) === "r2") {
+      if (!this.r2) throw new Error(`pack ${packKey}: R2 backend not bound`);
+      const key = this.r2KeyOf(packKey);
       const obj = await this.r2.bucket.get(key, {
         range: { offset: seq * PACK_CHUNK, length: PACK_CHUNK },
       });
-      if (!obj) throw new Error(`pack ${packId}: missing R2 object ${key}`);
+      if (!obj) throw new Error(`pack ${packKey}: missing R2 object ${key}`);
       chunk = new Uint8Array(await obj.arrayBuffer());
     } else {
       const rows = this.sql
         .exec<{ data: ArrayBuffer }>(
-          "SELECT data FROM pack_data WHERE pack_id = ? AND seq = ?",
-          packId,
+          "SELECT data FROM pack_data WHERE pack_key = ? AND seq = ?",
+          packKey,
           seq
         )
         .toArray();
-      if (!rows.length) throw new Error(`pack ${packId}: missing chunk ${seq}`);
+      if (!rows.length) throw new Error(`pack ${packKey}: missing chunk ${seq}`);
       chunk = new Uint8Array(rows[0].data);
     }
     this.chunks.set(key, chunk);
@@ -371,7 +406,7 @@ export class PackStore {
       if (seen.has(cur.oid)) throw new Error(`cyclic delta chain at ${cur.oid}`);
       seen.add(cur.oid);
       if (!cur.baseOid) {
-        base = { type: cur.type, data: inflateAll(await this.readRaw(cur.packId, cur.dataOff, cur.dataLen)) };
+        base = { type: cur.type, data: inflateAll(await this.readRaw(cur.packKey, cur.dataOff, cur.dataLen)) };
         break;
       }
       if (chain.length >= MAX_DELTA_DEPTH) throw new Error(`delta chain exceeds depth ${MAX_DELTA_DEPTH} at ${oid}`);
@@ -392,7 +427,7 @@ export class PackStore {
     let obj = base;
     for (let i = chain.length - 1; i >= 0; i--) {
       const d = chain[i];
-      const delta = inflateAll(await this.readRaw(d.packId, d.dataOff, d.dataLen));
+      const delta = inflateAll(await this.readRaw(d.packKey, d.dataOff, d.dataLen));
       obj = { type: base.type, data: applyDelta(obj.data, delta) };
       cache.put(d.oid, obj);
     }
@@ -403,27 +438,27 @@ export class PackStore {
   // ---- Worker-pushed index rows (SPEC-0001a §3 Step 2) ----------------------
   //
   // The Worker scans and resolves the pack; only these control-plane writes
-  // remain. Rows land BEFORE finalize; pack_meta is recorded by finalize's
-  // commit transaction, so rows without a pack_meta entry are crash debris the
+  // remain. Rows land BEFORE finalize; the pack_catalog row is recorded by
+  // finalize's commit transaction, so rows without one are crash debris the
   // sweeps reclaim — the same story the DO-side ingest had.
 
-  /** Next free pack id (allocation is lease-serialized: one receive lease). */
-  nextPackId(): number {
-    return (this.sql.exec<{ m: number | null }>("SELECT MAX(pack_id) AS m FROM pack_meta").one().m ?? 0) + 1;
-  }
-
-  /** Batched insert of Worker-resolved rows. `INSERT OR IGNORE` keeps a
-   * duplicate oid's FIRST location — including within one batch. */
-  putRows(packId: number, rows: IndexRow[]): void {
+  /**
+   * Batched insert of Worker-resolved rows, keyed by the pack's NAME
+   * (`pack-<sha1>`, built by r2keys.ts and carried to the DO in the lease
+   * payload). `INSERT OR IGNORE` keeps a duplicate oid's FIRST location —
+   * including within one batch; an identical repack re-pushing the same bytes
+   * is a no-op by the same token (content-addressed rows).
+   */
+  putRows(packKey: string, rows: IndexRow[]): void {
     for (let i = 0; i < rows.length; i += ROW_BATCH_ROWS) {
       const slice = rows.slice(i, i + ROW_BATCH_ROWS);
       const values = slice.map(() => "(?,?,?,?,?,?,?,?,?,?)").join(",");
       const args: (string | number | null)[] = [];
       for (const r of slice) {
-        args.push(r.oid, packId, r.offset, r.dataOff, r.dataLen, r.type, r.size, r.entrySize, r.baseOid, r.crc32);
+        args.push(r.oid, packKey, r.offset, r.dataOff, r.dataLen, r.type, r.size, r.entrySize, r.baseOid, r.crc32);
       }
       this.sql.exec(
-        `INSERT OR IGNORE INTO pack_objects (oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid, crc32) VALUES ${values}`,
+        `INSERT OR IGNORE INTO pack_objects (oid, pack_key, offset, data_off, data_len, type, size, entry_size, base_oid, crc32) VALUES ${values}`,
         ...args
       );
     }
@@ -431,56 +466,68 @@ export class PackStore {
     // per-pack caches only hold chunk/key/backend state, which is unaffected
   }
 
-  /** Prime the per-pack backend caches BEFORE pack_meta exists: rows land via
+  /**
+   * Prime the per-pack caches BEFORE the catalog row exists: rows land via
    * putIndexRows while the pack bytes are still the Worker's staging object,
-   * and DO-side reads over those rows (isAncestor's ancestry walk) must hit
-   * the right R2 key, not fall back to the 'sql' backend. recordPack re-primes
-   * to the final packs/ key; the bytes are identical, so cached chunks stay
-   * valid across the re-point. */
-  primePack(packId: number, r2Key: string): void {
-    this.backend.set(packId, "r2");
-    this.r2Keys.set(packId, r2Key);
+   * and DO-side reads over those rows (the ancestry walk in validatePush)
+   * must hit the staging key, not a missing catalog row. recordPack clears
+   * the override — the bytes are identical, so cached chunks stay valid
+   * across the re-point.
+   */
+  primePack(packKey: string, stagingR2Key: string): void {
+    this.backend.set(packKey, "r2");
+    this.r2KeyOverrides.set(packKey, stagingR2Key);
   }
 
-  /** Record the pack catalog row (finalize's commit transaction). The count is
-   * the actual indexed-row count, not the pack header's declaration. */
-  recordPack(packId: number, sizeBytes: number, r2Key: string): void {
+  /**
+   * Record the pack_catalog row (finalize's commit transaction). The count is
+   * the actual indexed-row count, not the pack header's declaration. The
+   * catalog key IS the R2 object stem (`pack-<sha1>`); the sequence comes from
+   * the formal `next_pack_seq` meta key. kind='receive' (M3 adds 'compact'),
+   * state='active' (M3 adds the RETIRED/RECLAIMABLE transitions),
+   * location='r2' (the <16 MiB sqlite location is a later-milestone writer).
+   */
+  recordPack(packKey: string, packBytes: number, idxBytes: number): void {
     const count = this.sql
-      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_id = ?", packId)
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key = ?", packKey)
       .one().n;
     this.sql.exec(
-      "INSERT INTO pack_meta (pack_id, size, count, created, store, r2_key) VALUES (?, ?, ?, ?, 'r2', ?)",
-      packId, sizeBytes, count, Date.now(), r2Key
+      `INSERT INTO pack_catalog (pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by)
+       VALUES (?, ?, 'receive', 'active', 'r2', ?, ?, ?, ?, NULL)
+       ON CONFLICT(pack_key) DO NOTHING`,
+      packKey, this.nextPackSeq(), count, packBytes, idxBytes, Date.now()
     );
-    this.primePack(packId, r2Key);
+    this.backend.set(packKey, "r2");
+    this.r2KeyOverrides.delete(packKey);
   }
 
-  /** Delete every index/data row of one pack id (lease sweeps, abandoned
-   * receives). Cache state is cleared because ids can be reallocated. */
-  sweepPackRows(packId: number): void {
-    this.sql.exec("DELETE FROM pack_objects WHERE pack_id = ?", packId);
-    this.sql.exec("DELETE FROM pack_data WHERE pack_id = ?", packId);
+  /** Delete every index/data row of one pack (lease sweeps, abandoned
+   * receives). Cache state is cleared because chunk keys overlap by prefix. */
+  sweepPackRows(packKey: string): void {
+    this.sql.exec("DELETE FROM pack_objects WHERE pack_key = ?", packKey);
+    this.sql.exec("DELETE FROM pack_data WHERE pack_key = ?", packKey);
+    this.sql.exec("DELETE FROM pack_catalog WHERE pack_key = ?", packKey);
     this.chunks.clear();
-    this.backend.delete(packId);
-    this.r2Keys.delete(packId);
+    this.backend.delete(packKey);
+    this.r2KeyOverrides.delete(packKey);
   }
 
-  /** Reclaim rows whose pack id never reached pack_meta — the debris of a
-   * receive that died between putIndexRows and finalize. `keepPackId` (the
+  /** Reclaim rows whose pack never reached pack_catalog — the debris of a
+   * receive that died between putIndexRows and finalize. `keepPackKey` (the
    * current lease's pack, still being written) is preserved. */
-  sweepOrphanRows(keepPackId: number | null): void {
+  sweepOrphanRows(keepPackKey: string | null): void {
     const orphans = this.sql
-      .exec<{ pack_id: number }>(
-        `SELECT pack_id FROM (
-           SELECT DISTINCT pack_id FROM pack_data WHERE pack_id NOT IN (SELECT pack_id FROM pack_meta)
+      .exec<{ pack_key: string }>(
+        `SELECT pack_key FROM (
+           SELECT DISTINCT pack_key FROM pack_data WHERE pack_key NOT IN (SELECT pack_key FROM pack_catalog)
            UNION
-           SELECT DISTINCT pack_id FROM pack_objects WHERE pack_id NOT IN (SELECT pack_id FROM pack_meta)
-         ) WHERE pack_id != ?`,
-        keepPackId ?? -1
+           SELECT DISTINCT pack_key FROM pack_objects WHERE pack_key NOT IN (SELECT pack_key FROM pack_catalog)
+         ) WHERE pack_key != ?`,
+        keepPackKey ?? "-"
       )
       .toArray()
-      .map((r) => r.pack_id);
-    for (const id of orphans) this.sweepPackRows(id);
+      .map((r) => r.pack_key);
+    for (const key of orphans) this.sweepPackRows(key);
   }
 
   /**
@@ -488,17 +535,17 @@ export class PackStore {
    * aligned with the input, null where the object is not packed (the caller
    * falls back to loose storage). One indexed probe per oid — workerd's SQLite
    * rejects multi-placeholder IN lists, and a batch is bounded by the RPC's
-   * 512-oid cap anyway, so flat per-oid probes stay microseconds each. The R2
-   * key resolves through the per-pack cache.
+   * 512-oid cap anyway, so flat per-oid probes stay microseconds each. The
+   * full R2 key resolves through the per-pack override/derivation chain.
    */
   lookupPacked(oids: string[]): (LookupObjectHit | null)[] {
     return oids.map((oid) => {
       const rows = this.sql
         .exec<{
-          pack_id: number; offset: number; data_off: number; data_len: number;
+          pack_key: string; offset: number; data_off: number; data_len: number;
           type: ObjType; base_oid: string | null;
         }>(
-          "SELECT pack_id, offset, data_off, data_len, type, base_oid FROM pack_objects WHERE oid = ?",
+          "SELECT pack_key, offset, data_off, data_len, type, base_oid FROM pack_objects WHERE oid = ?",
           oid
         )
         .toArray();
@@ -506,7 +553,7 @@ export class PackStore {
       if (!r) return null;
       return {
         found: true,
-        packKey: this.r2KeyOf(r.pack_id),
+        packKey: this.r2KeyOf(r.pack_key),
         offset: r.offset,
         dataOff: r.data_off,
         dataLen: r.data_len,
@@ -518,11 +565,11 @@ export class PackStore {
 
   /** Keyset page of a pack's indexed oids (validatePush builds the reachable
    * set for a cached fast-forward from the rows alone — no pack bytes). */
-  packOidsAfter(packId: number, after: string, limit: number): string[] {
+  packOidsAfter(packKey: string, after: string, limit: number): string[] {
     return this.sql
       .exec<{ oid: string }>(
-        "SELECT oid FROM pack_objects WHERE pack_id = ? AND oid > ? ORDER BY oid LIMIT ?",
-        packId, after, limit
+        "SELECT oid FROM pack_objects WHERE pack_key = ? AND oid > ? ORDER BY oid LIMIT ?",
+        packKey, after, limit
       )
       .toArray()
       .map((r) => r.oid);

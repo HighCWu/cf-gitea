@@ -98,6 +98,11 @@ $GITC clone -q "$BASE/demo.git" post-gc 2>/dev/null && (cd post-gc && git fsck >
 echo "== 7. branch create/delete, non-ff rejection =="
 (cd src && git checkout -qb feature && echo f > f.txt && git add -A && git commit -qm "feature work" && $GITC push -q "$AUTH_BASE/demo.git" feature && git checkout -q main); check $? 0 "branch push"
 (cd src && $GITC push -q "$AUTH_BASE/demo.git" :feature); check $? 0 "branch delete"
+# regression (SPEC-0001a wave-2 hotfix): a branch whose tip the server already
+# has is pushed as a ZERO-object pack — putIndexRows never lands a batch, so
+# finalize must still record the (rowless) pack catalog entry, not reject.
+(cd src && git branch empty-pack && $GITC push -q "$AUTH_BASE/demo.git" empty-pack); check $? 0 "empty-pack branch create (tip already known)"
+$GITC ls-remote "$BASE/demo.git" refs/heads/empty-pack > /dev/null; check $? 0 "empty-pack branch advertised"
 (cd full && git commit -q --allow-empty -m "diverge" && $GITC push -q "$AUTH_BASE/demo.git" main > /dev/null 2>&1); check $? 1 "non-ff push rejected"
 (cd full && git reset -q --hard origin/main)
 

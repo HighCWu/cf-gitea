@@ -4,6 +4,7 @@ import { td, isOid } from "./git/util";
 import { GitStore } from "./git/store";
 import { OidSet } from "./git/oidset";
 import { gunzipLimited } from "./git/zlib";
+import { cloneCacheKey, repoPrefix } from "./git/r2keys";
 import {
   advertisement,
   uploadPack,
@@ -14,20 +15,26 @@ import {
 } from "./git/protocol";
 import {
   beginReceive,
+  destroy,
   finalizeReceive,
   lookupObjects,
+  markDeleted,
   putIndexRows,
   releaseReceive,
+  setHead,
   sweepExpiredLeases,
   type BeginReceiveInput,
   type BeginReceiveResult,
+  type DestroyResult,
   type FinalizeReceiveInput,
   type FinalizeReceiveResult,
   type IndexRow,
   type LeaseHost,
   type LookupObjectResult,
+  type MarkDeletedResult,
   type ReleaseReceiveInput,
   type ReleaseReceiveResult,
+  type SetHeadResult,
 } from "./control-plane";
 import {
   Commit,
@@ -168,14 +175,22 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /**
-   * Bind the R2 pack backend (REPO_PACKS: receive staging + stored packs) for
-   * this repo. The DO is per-repo, so the name is stable; persist it once so
-   * request-less paths — lease RPCs, alarm-driven sweeps, gc — can rebind and
-   * rebuild keys without a request.
+   * Bind the R2 pack backend (REPO_PACKS: receive staging, stored packs, and
+   * the clone cache — one bucket, keys from src/git/r2keys.ts) for this repo.
+   * The DO is per-repo, so the name is stable; persist it (and the storage
+   * key, which equals the name until SPEC-0003 supplies the D1 r_<id>) once
+   * so request-less paths — lease RPCs, alarm-driven sweeps, gc — can rebind
+   * and rebuild keys without a request.
    */
   private bindR2(repo: string): void {
-    this.store.setR2(this.env.REPO_PACKS, repo);
+    this.store.setR2(this.env.REPO_PACKS, this.storageKey(repo));
     if (this.store.getMeta("repo") !== repo) this.store.setMeta("repo", repo);
+  }
+
+  /** The persisted storage key (meta.storage_key), falling back to the request
+   * name — the same resolution control-plane.ts's beginReceive performs. */
+  private storageKey(requestName?: string): string {
+    return this.store.getMeta("storage_key") ?? this.store.getMeta("repo") ?? requestName ?? "repo";
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -221,7 +236,7 @@ export class RepoCell extends DurableObject<Env> {
           this.activeUploads--;
         };
         try {
-          return await uploadPack(this.store, await this.readBody(req), release, this.packCacheFor(repo));
+          return await uploadPack(this.store, await this.readBody(req), release, this.packCacheFor());
         } catch (err) {
           release();
           // an over-inflating body is the client's fault, not a server error
@@ -242,23 +257,26 @@ export class RepoCell extends DurableObject<Env> {
         return this.handleConfig(JSON.stringify({ description: (await req.text()).trim() }));
       }
       if ((path === "/" || path === "") && req.method === "DELETE") {
-        // the whole wipe must be atomic: a concurrent request landing between
-        // the table drop and the re-init hits missing tables and 500s
-        await this.ctx.blockConcurrencyWhile(async () => {
-          // wipe() drops every table we own; deliberately NOT storage.deleteAll():
-          // on celld, deleteAll sweeps the ltx replication control tables too and
-          // permanently breaks WAL capture for the cell (patch submitted upstream)
+        // the whole wipe is ONE transactionSync: drop + re-create the schema
+        // atomically, so a concurrent request can never land between the table
+        // drop and the re-init (SPEC-0001a §3 Step 4 — Rule 3: the last
+        // blockConcurrencyWhile on this path is gone)
+        this.ctx.storage.transactionSync(() => {
           this.store.wipe();
-          await this.ctx.storage.deleteAlarm();
-          // this instance stays resident: bring the (empty) schema back so
-          // later requests — including a re-creating push — find their tables
-          this.store = new GitStore(this.ctx.storage.sql);
-          this.bindR2(repo);
         });
-        // the R2 packs (clone cache + raw pack store) outlive the SQLite wipe;
-        // purge them so a re-created repo never inherits stale bytes (its
-        // versioned keys would differ anyway)
-        await this.purgePackCache(repo);
+        try {
+          await this.ctx.storage.deleteAlarm();
+        } catch {
+          // best effort: an un-cleared alarm fires on an empty schema and no-ops
+        }
+        // this instance stays resident: re-persist the storage key so later
+        // requests — including a re-creating push — find their bindings
+        this.bindR2(repo);
+        // the R2 subtree (packs, staging, clone cache — one prefix under the
+        // new key layout) outlives the SQLite wipe; purge it so a re-created
+        // repo never inherits stale bytes (its versioned keys would differ
+        // anyway)
+        await this.purgePackCache();
         return new Response("deleted\n");
       }
       if (path === "/gc" && req.method === "POST") {
@@ -296,8 +314,9 @@ export class RepoCell extends DurableObject<Env> {
     }
     // clear first: at-most-once, so a throwing sweep can't trigger a retry storm
     this.store.setMeta("gc-pending", "0");
-    // no request here to carry x-repo: rebind R2 from the persisted repo name so
-    // the sweep can read R2-backed objects and drop their raw objects
+    // no request here to carry x-repo: rebind R2 from the persisted repo name
+    // (meta.storage_key backfills from it) so the sweep can read R2-backed
+    // objects and drop their raw objects
     this.bindR2(this.store.getMeta("repo") ?? "repo");
     try {
       await this.gc();
@@ -355,7 +374,7 @@ export class RepoCell extends DurableObject<Env> {
       return { removed: 0, kept: this.store.objectCount(), skipped: true };
     }
     const reachable = new OidSet(Math.max(this.store.objectCount(), 4096));
-    const stack: string[] = this.store.refs().map((r) => r.target);
+    const stack: string[] = this.store.refs().map((r) => r.oid);
     const head = this.store.resolveHead();
     if (head) stack.push(head);
     while (stack.length) {
@@ -406,11 +425,11 @@ export class RepoCell extends DurableObject<Env> {
         }
       }
       removed += packCount - migrated;
-      // capture the R2-backed pack ids before the index is dropped, then delete
-      // their raw objects after reset so no orphaned bytes linger in R2
-      const r2ids = this.store.packs.r2PackIds();
+      // capture the R2-backed pack keys before the index is dropped, then
+      // delete their raw objects after reset so no orphaned bytes linger in R2
+      const r2keys = this.store.packs.r2PackKeys();
       this.store.packs.reset();
-      await this.store.packs.deleteR2Packs(r2ids);
+      await this.store.packs.deleteR2Packs(r2keys);
     }
     // sweep loose objects (including anything just migrated) unreachable now
     for (const oid of this.store.allOids()) {
@@ -425,13 +444,15 @@ export class RepoCell extends DurableObject<Env> {
   /**
    * Cheap full-clone key probe for the Worker's R2 fast path: returns the
    * versioned pack key iff `wants` is exactly the current ref tips (a true full
-   * clone). Reads ref state only — it never generates a pack. null (wants are
-   * not all tips) sends the Worker back to the normal DO clone path. The key is
-   * the ref version, so it can never name a stale/force-pushed pack.
+   * clone). Reads ref state only — it never generates a pack. The key is the
+   * ref-version hash, so it can never name a stale/force-pushed pack.
+   *
+   * `repo` is advisory since the Step 3 key layout: the key's namespace comes
+   * from the persisted storage key (meta.storage_key), not the request name.
    */
   currentPackKey(repo: string, wants: string[]): string | null {
     if (!wantsAreAllTips(this.store, wants)) return null;
-    return `pack/${repo}/${this.store.reachableVersion()}`;
+    return cloneCacheKey(this.storageKey(repo), this.store.reachableVersion());
   }
 
   // ---- receive control plane (SPEC-0001a §3 Steps 1-2) ---------------------
@@ -465,6 +486,9 @@ export class RepoCell extends DurableObject<Env> {
           console.log(`[r2 ${this.store.getMeta("repo") ?? ""}] sweep delete failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       },
+      removeFromRegistry: async (name) => {
+        await this.env.REGISTRY.getByName("registry").remove(name);
+      },
     };
   }
 
@@ -480,15 +504,38 @@ export class RepoCell extends DurableObject<Env> {
     return releaseReceive(this.leaseHost(), input);
   }
 
-  /** Land one bounded batch of Worker-resolved index rows (Step 2). */
-  async putIndexRows(leaseToken: string, rows: IndexRow[]): Promise<{ tag: "ok" } | { tag: "lease_mismatch" }> {
-    return putIndexRows(this.leaseHost(), leaseToken, rows);
+  /** Land one bounded batch of Worker-resolved index rows (Step 2), keyed by
+   * the pack name the Worker derives from the pack's own SHA-1. */
+  async putIndexRows(leaseToken: string, packName: string, rows: IndexRow[]): Promise<{ tag: "ok" } | { tag: "lease_mismatch" }> {
+    return putIndexRows(this.leaseHost(), leaseToken, packName, rows);
   }
 
   /** Resolve oids for the Worker's thin-pack bases and connectivity
    * anti-checks (Step 2); the Worker R2-reads packed hits itself. */
   async lookupObjects(leaseToken: string, oids: string[]): Promise<LookupObjectResult[]> {
     return lookupObjects(this.leaseHost(), leaseToken, oids);
+  }
+
+  // ---- repo lifecycle (SPEC-0003 §2.5.5; LIFECYCLE gap RPCs) ----------------
+
+  /** Tombstone the repo (delete step 2): new leases are refused, a finalize
+   * mid-flight aborts inside its commit transaction. Idempotent. */
+  async markDeleted(): Promise<MarkDeletedResult> {
+    return markDeleted(this.leaseHost());
+  }
+
+  /** Destroy the repo cell (delete step 4, after the R2 prefix purge): one
+   * transactional wipe, alarm cleared, registry row removed via the host
+   * hook. Does NOT touch R2. Idempotent. */
+  async destroy(): Promise<DestroyResult> {
+    return destroy(this.leaseHost());
+  }
+
+  /** Default-branch setter (SPEC-0003 §2.5.2): accepts "main" or
+   * "refs/heads/main"; validates, requires an existing branch on a non-empty
+   * repo, writes meta.head + bumps refs_version in one transaction. */
+  async setHead(branch: string): Promise<SetHeadResult> {
+    return setHead(this.leaseHost(), branch);
   }
 
   // ---- typed content surface ----------------------------------------------
@@ -502,10 +549,12 @@ export class RepoCell extends DurableObject<Env> {
     this.rpcBind();
     const refs: RefsResult["refs"] = [];
     for (const r of this.store.refs()) {
-      const entry: RefsResult["refs"][number] = { name: r.name, target: r.target };
+      const entry: RefsResult["refs"][number] = { name: r.name, target: r.oid };
       if (r.name.startsWith("refs/tags/")) {
-        const peeled = await this.peelToCommit(r.target);
-        if (peeled && peeled.oid !== r.target) entry.peeled = peeled.oid;
+        // peeledRefTarget reads the refs row's peeled column (written once at
+        // first peel), so repeat calls never re-walk the tag object
+        const peeled = await this.store.peeledRefTarget(r.name, r.oid);
+        if (peeled && peeled !== r.oid) entry.peeled = peeled;
       }
       refs.push(entry);
     }
@@ -631,15 +680,18 @@ export class RepoCell extends DurableObject<Env> {
   /**
    * R2 full-clone offload adapter (write side), or undefined when no bucket is
    * bound (celld and Workers without the binding both fall back to the pure DO
-   * path). A throwing createMultipartUpload (celld deliberately makes R2 throw)
+   * path). Since the Step 3 unification this is the SAME bucket as receive
+   * (REPO_PACKS) — the clone cache lives under repos/<storage_key>/clone-cache/.
+   * A throwing createMultipartUpload (celld deliberately makes R2 throw)
    * degrades to null so the clone still streams uncached; part-level failures
    * are handled by MultipartCapture aborting the upload.
    */
-  private packCacheFor(repo: string): PackCache | undefined {
-    const bucket = this.env.PACK_CACHE;
+  private packCacheFor(): PackCache | undefined {
+    const bucket = this.env.REPO_PACKS;
     if (!bucket) return undefined;
+    const storageKey = this.storageKey();
     return {
-      repo,
+      storageKey,
       beginMultipart: async (key, objects) => {
         try {
           const mp = await bucket.createMultipartUpload(key, {
@@ -658,34 +710,29 @@ export class RepoCell extends DurableObject<Env> {
             },
           };
         } catch (err) {
-          console.log(`[r2 ${repo}] multipart begin failed: ${err instanceof Error ? err.message : String(err)}`);
+          console.log(`[r2 ${storageKey}] multipart begin failed: ${err instanceof Error ? err.message : String(err)}`);
           return null;
         }
       },
     };
   }
 
-  /** Purge every R2 object for a repo on delete: receive packs + staging
-   * (REPO_PACKS, both key generations), and the clone cache (PACK_CACHE). */
-  private async purgePackCache(repo: string): Promise<void> {
-    const buckets: { bucket: R2Bucket | undefined; prefixes: string[] }[] = [
-      { bucket: this.env.REPO_PACKS, prefixes: [`repos/${repo}/`, `raw/${repo}/`] },
-      { bucket: this.env.PACK_CACHE, prefixes: [`pack/${repo}/`] },
-    ];
-    for (const { bucket, prefixes } of buckets) {
-      if (!bucket) continue;
-      for (const prefix of prefixes) {
-        try {
-          for (let cursor: string | undefined; ; ) {
-            const listed = await bucket.list({ prefix, cursor });
-            if (listed.objects.length) await bucket.delete(listed.objects.map((o) => o.key));
-            if (!listed.truncated) break;
-            cursor = listed.cursor;
-          }
-        } catch (err) {
-          console.log(`[r2 ${repo}] purge ${prefix} failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
+  /** Purge every R2 object for a repo on delete: packs, staging and clone
+   * cache share ONE prefix (repos/<storage_key>/) since the Step 3 key
+   * layout; no request name is involved. */
+  private async purgePackCache(): Promise<void> {
+    const bucket = this.env.REPO_PACKS;
+    if (!bucket) return;
+    const prefix = repoPrefix(this.storageKey());
+    try {
+      for (let cursor: string | undefined; ; ) {
+        const listed = await bucket.list({ prefix, cursor });
+        if (listed.objects.length) await bucket.delete(listed.objects.map((o) => o.key));
+        if (!listed.truncated) break;
+        cursor = listed.cursor;
       }
+    } catch (err) {
+      console.log(`[r2 ${prefix}] purge failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -769,7 +816,7 @@ export class RepoCell extends DurableObject<Env> {
     const cached = this.store.loadReachable();
     if (cached) return cached.hasHex(target);
     const seen = new OidSet(Math.max(this.store.objectCount(), 4096));
-    const stack: string[] = this.store.refs().map((r) => r.target);
+    const stack: string[] = this.store.refs().map((r) => r.oid);
     const head = this.store.resolveHead();
     if (head) stack.push(head);
     while (stack.length) {
@@ -950,11 +997,11 @@ export class RepoCell extends DurableObject<Env> {
     const r = `/${repoUrl(repo)}`;
     for (const ref of this.store.refs()) {
       let html = "";
-      let target = ref.target;
+      let target = ref.oid;
       if (ref.name.startsWith("refs/heads/")) {
         html = `<a class='branch-deco' href='${r}/log/?h=${encodeURIComponent(ref.name.slice(11))}'>${esc(ref.name.slice(11))}</a>`;
       } else if (ref.name.startsWith("refs/tags/")) {
-        const peeled = await this.peelToCommit(ref.target);
+        const peeled = await this.peelToCommit(ref.oid);
         if (peeled) target = peeled.oid;
         html = `<a class='tag-deco' href='${r}/tag/?h=${encodeURIComponent(ref.name.slice(10))}'>${esc(ref.name.slice(10))}</a>`;
       } else continue;
@@ -1159,7 +1206,7 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
       .slice(0, 10)
       .map(async (b) => {
         const name = b.name.slice(11);
-        const c = await this.peelToCommit(b.target);
+        const c = await this.peelToCommit(b.oid);
         if (!c) return "";
         return `<tr><td><a href='${r}/log/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
           `<td><a href='${r}/commit/?id=${c.oid}'>${esc(c.commit.subject)}</a></td>` +
@@ -1171,9 +1218,9 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
       .slice(0, 10)
       .map(async (t) => {
         const name = t.name.slice(10);
-        const obj = await this.store.get(t.target);
+        const obj = await this.store.get(t.oid);
         let when = 0;
-        let target = t.target;
+        let target = t.oid;
         if (obj?.type === "tag") {
           const tag = parseTag(obj.data);
           when = tag.tagger?.time ?? 0;
@@ -1283,21 +1330,21 @@ ${rows || "<tr class='nohover'><td colspan='3'>(no matching commits)</td></tr>"}
     const branchRows = (await Promise.all(branches
       .map(async (b) => {
         const name = b.name.slice(11);
-        const c = await this.peelToCommit(b.target);
+        const c = await this.peelToCommit(b.oid);
         const snap = `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
           `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.zip'>zip</a>`;
         return `<tr><td><a href='${r}/log/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
-          `<td class='sha1'><a href='${r}/commit/?id=${b.target}'>${b.target.slice(0, 10)}</a></td>` +
+          `<td class='sha1'><a href='${r}/commit/?id=${b.oid}'>${b.oid.slice(0, 10)}</a></td>` +
           `<td>${esc(c?.commit.author.name ?? "")}</td><td>${c ? age(c.commit.committer.time) : ""}</td><td class='snapshots'>${snap}</td></tr>`;
       })))
       .join("");
     const tagRows = (await Promise.all(tags
       .map(async (t) => {
         const name = t.name.slice(10);
-        const obj = await this.store.get(t.target);
+        const obj = await this.store.get(t.oid);
         let when = 0;
         let who = "";
-        let target = t.target;
+        let target = t.oid;
         if (obj?.type === "tag") {
           const tag = parseTag(obj.data);
           when = tag.tagger?.time ?? 0;

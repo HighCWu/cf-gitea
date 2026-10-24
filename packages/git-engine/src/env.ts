@@ -4,14 +4,14 @@ import type { RepoCell } from "./repo";
 export interface Env {
   REPO: DurableObjectNamespace<RepoCell>;
   REGISTRY: DurableObjectNamespace<Registry>;
-  /** R2 bucket holding received packs (SPEC-0001 §3): the Worker stages push
-   * bodies into it and copies them to their final packs/ keys; the DO indexes
-   * them and sweeps lease staging. Required for git push since SPEC-0001a §3
-   * Step 1 (no bucket = pushes fail; the clone-cache PACK_CACHE stays separate
-   * and optional). */
+  /** The ONE pack R2 bucket (SPEC-0001 §3, SPEC-0001a §3 Step 3 site 11):
+   * receive staging, stored packs, and the full-clone cache all live under
+   * `repos/<storage_key>/` in it — every key built by src/git/r2keys.ts.
+   * Required for git push since Step 1 (no bucket = pushes fail). This field
+   * replaces upstream's separate optional PACK_CACHE clone-cache binding
+   * (removed; the unified binding is the worker's wrangler.jsonc name —
+   * single source of truth per AGENTS.md). */
   REPO_PACKS?: R2Bucket;
-  /** optional R2 bucket that offloads full-clone packs (absent on celld) */
-  PACK_CACHE?: R2Bucket;
   /** shared secret required for git push (Basic auth password) */
   GIT_TOKEN?: string;
   /** optional comma-separated extra tokens (multiple users) */

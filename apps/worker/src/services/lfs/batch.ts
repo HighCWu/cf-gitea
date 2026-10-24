@@ -327,10 +327,15 @@ export async function shapeBatchObject(
   if (presigned !== null) {
     actions.upload = toBatchLink(presigned);
   } else {
-    // Upstream `UploadLink` + the chunked-transfer hint (server.go:510-515).
+    // Relay upload href. Upstream sends a `Transfer-Encoding: chunked` hint
+    // (server.go:510-515) because its handler accepts unknown-length bodies;
+    // our relay PUT streams into R2 and requires Content-Length (411 without
+    // it) — the hint makes git-lfs omit the length (tq/basic_upload.go:58-59),
+    // so it is dropped: clients send a concrete length instead. Documented
+    // cosmetic wire divergence (verified end-to-end by scripts/lfs-e2e.sh).
     actions.upload = {
       href: relayUploadHref(relayBase, oid, size),
-      header: withAuth({ "Transfer-Encoding": "chunked" }, ctx.authHeader),
+      header: withAuth({}, ctx.authHeader),
     };
   }
 

@@ -1,17 +1,39 @@
 import { concat, te, sha1hex } from "./util";
 import { deflate, inflate } from "./zlib";
-import { ObjType } from "./objects";
+import { ObjType, parseTag } from "./objects";
 import { OidSet } from "./oidset";
 import { PackStore, LOOSE_LOOKUP_CAP } from "./packstore";
 import { ObjCache, ObjRec } from "../receive/objcache";
 import type { LookupObjectHit, LookupObjectResult } from "../control-plane";
+
+/**
+ * RepoDO schema generation (SPEC-0001a §3 Step 4). A store whose persisted
+ * `schema_version` meta row differs from this constant is dev-scratch state
+ * from an older layout: no production data exists pre-M1, so the cutover is a
+ * clean wipe-and-recreate (SPEC-0001a §3: "no dual-layout code is carried").
+ * Bump on any future breaking schema change.
+ */
+export const SCHEMA_VERSION = "0001a-step4";
+
+/** A ref row (SPEC-0001 §4 `refs`). `peeled` caches a tag tip's commit target
+ * (null for branches and lightweight tags); `updatedAt` feeds lease/sweep
+ * diagnostics. HEAD is NOT a row — it lives in `meta.head`. */
+export interface RefRow {
+  name: string;
+  oid: string;
+  /** commit target when this ref is an annotated tag (resolved once, at first
+   * peel), else null */
+  peeled: string | null;
+  /** unix millis of the last write */
+  updatedAt: number;
+}
 
 /** A reachable pack entry, streamed in storage order by `reachablePackedAfter`.
  *  The `size` field of a full PackedEntry is not needed to emit the pack, so it
  *  is left unselected. */
 export interface PackedReachable {
   oid: string;
-  packId: number;
+  packKey: string;
   offset: number;
   dataOff: number;
   dataLen: number;
@@ -39,6 +61,14 @@ export interface LeaseRow {
  * Git object database + refs, stored in a Durable Object's SQLite database.
  * Small/legacy objects live loose (zlib-deflated, chunked across rows);
  * pushed packs are kept verbatim and served through the PackStore index.
+ *
+ * Schema (SPEC-0001 §4, aligned at SPEC-0001a §3 Step 4): refs(name, oid,
+ * peeled, updated_at) with HEAD in meta.head; meta(key, value) carrying the
+ * formal key set `head`, `refs_version`, `next_pack_seq`,
+ * `compaction_wanted_at` (plus legacy UI keys until the content split);
+ * pack_catalog/pack_objects/pack_data (see packstore.ts); leases. The
+ * `reachable`/`peeled`/`stats_cache` tables are kept per the amendment's
+ * decision table (M4 clone fast path / oid peel cache / UI stats).
  */
 export class GitStore {
   readonly packs: PackStore;
@@ -55,7 +85,28 @@ export class GitStore {
 
   constructor(private sql: SqlStorage) {
     this.packs = new PackStore(sql, (oid) => this.getLoose(oid));
-    sql.exec(`
+    this.init();
+    // clean cutover (SPEC-0001a §3 Step 4): a store from an older schema
+    // generation is wiped wholesale — no production data exists pre-M1
+    if (this.getMeta("schema_version") !== SCHEMA_VERSION) {
+      this.wipe();
+      this.setMeta("schema_version", SCHEMA_VERSION);
+    }
+    const flag = this.getMeta("has-loose");
+    if (flag === null) {
+      // back-fill: a repo migrated by an older build may already hold loose
+      // objects with no flag set — probe once and record the answer
+      const any = this.sql.exec("SELECT 1 FROM objects LIMIT 1").toArray().length > 0;
+      this.setMeta("has-loose", any ? "1" : "0");
+      this.hasLoose = any;
+    } else {
+      this.hasLoose = flag === "1";
+    }
+  }
+
+  /** Create every table this store owns (idempotent). */
+  private init(): void {
+    this.sql.exec(`
       CREATE TABLE IF NOT EXISTS objects (
         oid TEXT PRIMARY KEY,
         type TEXT NOT NULL,
@@ -69,7 +120,9 @@ export class GitStore {
       );
       CREATE TABLE IF NOT EXISTS refs (
         name TEXT PRIMARY KEY,
-        target TEXT NOT NULL
+        oid TEXT NOT NULL,
+        peeled TEXT,
+        updated_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
@@ -95,16 +148,6 @@ export class GitStore {
         payload TEXT NOT NULL
       );
     `);
-    const flag = this.getMeta("has-loose");
-    if (flag === null) {
-      // back-fill: a repo migrated by an older build may already hold loose
-      // objects with no flag set — probe once and record the answer
-      const any = this.sql.exec("SELECT 1 FROM objects LIMIT 1").toArray().length > 0;
-      this.setMeta("has-loose", any ? "1" : "0");
-      this.hasLoose = any;
-    } else {
-      this.hasLoose = flag === "1";
-    }
   }
 
   has(oid: string): boolean {
@@ -140,12 +183,13 @@ export class GitStore {
   }
 
   /**
-   * Bind (or clear) the R2 raw-pack backend for this repo. Absent binding keeps
-   * every pack in SQLite (celld / Workers without the binding). Idempotent and
-   * cheap: the DO is per-repo, so this is set on each request from the repo name.
+   * Bind (or clear) the R2 pack backend. Absent binding keeps every pack in
+   * SQLite (celld / Workers without the binding). Idempotent and cheap; the
+   * DO is per-repo, so this is set on each request. R2 keys are built by
+   * src/git/r2keys.ts from the persisted storage key, not from a repo name.
    */
-  setR2(bucket: R2Bucket | undefined, repo: string): void {
-    this.packs.setR2(bucket, repo);
+  setR2(bucket: R2Bucket | undefined, storageKey: string): void {
+    this.packs.setR2(bucket, storageKey);
   }
 
   put(oid: string, type: ObjType, data: Uint8Array): void {
@@ -250,7 +294,7 @@ export class GitStore {
   }
 
   /** Persist new lease payload JSON (the Worker's first putIndexRows batch
-   * allocates the pack id; finalize and the sweeps read it from here). */
+   * allocates the pack; finalize and the sweeps read it from here). */
   updateLeasePayload(leaseToken: string, payload: string): void {
     this.sql.exec("UPDATE leases SET payload = ? WHERE lease_token = ?", payload, leaseToken);
   }
@@ -272,10 +316,10 @@ export class GitStore {
       .map((r) => this.toLeaseRow(r));
   }
 
-  // --- refs_version (T4 edge-cache key) -------------------------------------
-  // Bumped by every committed ref change (finalizeReceive's transaction), so a
-  // push invalidates every refs cache entry at once. Step 4 moves the counter
-  // into the formal meta key set; the read/bump surface is final now.
+  // --- refs_version (T4 edge-cache key, formal meta key per SPEC-0001 §4) ----
+  // Bumped by every committed ref change (finalizeReceive's transaction, the
+  // API commit builder, setHead), so a push invalidates every refs cache
+  // entry at once.
 
   refsVersion(): string {
     const current = this.getMeta("refs_version");
@@ -289,6 +333,27 @@ export class GitStore {
   bumpRefsVersion(): void {
     const next = Number(this.refsVersion()) + 1;
     this.setMeta("refs_version", String(next));
+  }
+
+  /**
+   * The formal meta key set (SPEC-0001 §4):
+   *   head                 — the HEAD symref target ("refs/heads/main")
+   *   refs_version         — monotonic counter, bumped by every ref change
+   *   next_pack_seq        — pack_catalog sequence allocator (catalog order
+   *                          only; never an R2 name — SPEC-0001a §3 Step 3)
+   *   compaction_wanted_at — M3 compaction trigger stamp; written alongside
+   *                          the M2 `gc-pending` flag today, consumed by M3
+   * Legacy keys (`description`, `owner`, `section`, `private`, `has-loose`,
+   * `reachable-version`, `repo`, `storage_key`, `created`, `last-push`,
+   * `gc-pending`, `schema_version`, `deleted`) are retained until the
+   * UI/content split moves them (SPEC-0001a §3 Step 4 decision table).
+   */
+
+  /** The pack_catalog sequence (meta `next_pack_seq`), allocated monotonically. */
+  nextPackSeq(): number {
+    const current = Number(this.getMeta("next_pack_seq") ?? "0") || 0;
+    this.setMeta("next_pack_seq", String(current + 1));
+    return current + 1;
   }
 
   /** Resolve an abbreviated oid; null if unknown or ambiguous. */
@@ -317,37 +382,72 @@ export class GitStore {
     return this.sql.databaseSize;
   }
 
+  /**
+   * Drop EVERY table this store owns — both the current schema generation and
+   * any older layouts a pre-cutover store may carry — then re-create the
+   * current one. Synchronous end to end so a caller can run it inside ONE
+   * `storage.transactionSync` (the delete wipe; Rule 3 — the last
+   * blockConcurrencyWhile on this path). The instance stays usable afterward:
+   * in-memory caches are reset and the fresh (empty) schema is in place, so a
+   * re-creating push finds its tables. Deliberately NOT storage.deleteAll():
+   * on celld, deleteAll sweeps the ltx replication control tables too and
+   * permanently breaks WAL capture for the cell (patch submitted upstream).
+   */
   wipe(): void {
-    for (const t of ["objects", "chunks", "refs", "meta", "reachable", "peeled", "stats_cache", "leases"]) {
+    for (const t of [
+      // current generation
+      "objects",
+      "chunks",
+      "refs",
+      "meta",
+      "reachable",
+      "peeled",
+      "stats_cache",
+      "leases",
+      "pack_catalog",
+      "pack_data",
+      "pack_objects",
+      // pre-Step-4 generations (dev-scratch; the clean cutover drops them)
+      "pack_meta",
+      "pack_pending",
+      "push_edges",
+    ]) {
       this.sql.exec(`DROP TABLE IF EXISTS ${t}`);
     }
+    this.init();
     this.packs.wipe();
     // meta (with the flag) is gone; a fresh empty repo has no loose objects
     this.hasLoose = false;
   }
 
+  // --- refs (SPEC-0001 §4 `refs(name PK, oid, peeled, updated_at)`) ----------
+  // HEAD is NOT a ref row: it is the meta.head symref target (moved out of the
+  // table at the Step 4 schema alignment). All refs methods below exclude it
+  // by construction.
 
-  /** All refs except HEAD, sorted by name. */
-  refs(): { name: string; target: string }[] {
+  /** All refs, sorted by name. */
+  refs(): RefRow[] {
     return this.sql
-      .exec<{ name: string; target: string }>(
-        "SELECT name, target FROM refs WHERE name != 'HEAD' ORDER BY name"
+      .exec<{ name: string; oid: string; peeled: string | null; updated_at: number }>(
+        "SELECT name, oid, peeled, updated_at FROM refs ORDER BY name"
       )
-      .toArray();
+      .toArray()
+      .map((r) => ({ name: r.name, oid: r.oid, peeled: r.peeled, updatedAt: r.updated_at }));
   }
 
   getRef(name: string): string | null {
     const rows = this.sql
-      .exec<{ target: string }>("SELECT target FROM refs WHERE name = ?", name)
+      .exec<{ oid: string }>("SELECT oid FROM refs WHERE name = ?", name)
       .toArray();
-    return rows[0]?.target ?? null;
+    return rows[0]?.oid ?? null;
   }
 
-  setRef(name: string, target: string): void {
+  setRef(name: string, oid: string): void {
     this.sql.exec(
-      "INSERT INTO refs (name, target) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET target = excluded.target",
+      "INSERT INTO refs (name, oid, peeled, updated_at) VALUES (?, ?, NULL, ?) ON CONFLICT(name) DO UPDATE SET oid = excluded.oid, peeled = NULL, updated_at = excluded.updated_at",
       name,
-      target
+      oid,
+      Date.now()
     );
   }
 
@@ -355,22 +455,62 @@ export class GitStore {
     this.sql.exec("DELETE FROM refs WHERE name = ?", name);
   }
 
-  /** HEAD symref target, e.g. "refs/heads/main". */
-  head(): string {
-    const raw = this.getRef("HEAD");
-    if (raw?.startsWith("ref: ")) return raw.slice(5);
-    return raw ?? "refs/heads/main";
+  /** Cache a tag ref's peeled commit target on its row (SPEC-0001 §4 `peeled`):
+   * the first peel after a tag lands pays the object reads, every later
+   * advertisement/ls-refs reads the column instead. Guarded on the tip still
+   * being `oid`, so a concurrent ref move never caches a stale peel. */
+  setRefPeeled(name: string, oid: string, peeled: string): void {
+    this.sql.exec("UPDATE refs SET peeled = ? WHERE name = ? AND oid = ? AND peeled IS NULL", peeled, name, oid);
   }
 
+  /**
+   * The peeled commit target of ref `name` (or of the oid itself for a
+   * non-ref peel): follows tag objects down to the commit, caching the answer
+   * on the refs row when the oid is a current ref tip. null when the object
+   * chain does not reach a commit.
+   */
+  async peeledRefTarget(name: string, oid: string): Promise<string | null> {
+    const rows = this.sql.exec<{ oid: string; peeled: string | null }>(
+      "SELECT oid, peeled FROM refs WHERE name = ?",
+      name
+    ).toArray();
+    if (rows[0]) {
+      if (rows[0].oid !== oid) return null; // moved underneath: nothing to cache
+      if (rows[0].peeled) return rows[0].peeled;
+      if (this.typeAndSize(oid)?.type !== "tag") return null; // lightweight/branch
+    }
+    let cur = oid;
+    for (let i = 0; i < 10; i++) {
+      const obj = await this.get(cur);
+      if (!obj) return null;
+      if (obj.type === "commit") {
+        if (cur !== oid && rows[0]) this.setRefPeeled(name, oid, cur);
+        return cur;
+      }
+      if (obj.type === "tag") {
+        cur = parseTag(obj.data).object;
+        continue;
+      }
+      return null;
+    }
+    return null;
+  }
+
+  /** HEAD symref target, e.g. "refs/heads/main" (meta.head; the instance
+   * default when never set). */
+  head(): string {
+    return this.getMeta("head") ?? "refs/heads/main";
+  }
+
+  /** Point HEAD at a branch (meta.head — SPEC-0001 §4). */
   setHead(refName: string): void {
-    this.setRef("HEAD", `ref: ${refName}`);
+    this.setMeta("head", refName);
   }
 
   /** Resolve HEAD to an oid, or null for an empty/unborn repo. */
   resolveHead(): string | null {
     return this.getRef(this.head());
   }
-
 
   getMeta(key: string): string | null {
     const rows = this.sql
@@ -388,8 +528,9 @@ export class GitStore {
   }
 
   /**
-   * Cached peel target for an oid (tag -> ... -> commit). Tag oids are
-   * content-addressed and immutable, so a hit never needs a version check.
+   * Cached peel target for an arbitrary oid (tag -> ... -> commit). Tag oids
+   * are content-addressed and immutable, so a hit never needs a version
+   * check. (Tag TIPS additionally cache on their refs row — peeledRefTarget.)
    */
   getPeeled(oid: string): string | null {
     const rows = this.sql.exec<{ target: string }>("SELECT target FROM peeled WHERE oid = ?", oid).toArray();
@@ -425,12 +566,13 @@ export class GitStore {
    * A tag over the current ref state (names + tips + HEAD). The cached
    * reachable object set is keyed on it: any push, ref delete, or gc changes
    * a tip and so bumps the version, which is exactly when the set can change.
-   * A sha1 hex string never collides with the "" invalidation sentinel.
+   * A sha1 hex string never collides with the "" invalidation sentinel. This
+   * hash is also the clone-cache key's refsVersionHash (r2keys.ts).
    */
   reachableVersion(): string {
     const parts: string[] = [];
-    for (const r of this.refs()) parts.push(`${r.name}\0${r.target}`);
-    parts.push(`HEAD\0${this.getRef("HEAD") ?? ""}`);
+    for (const r of this.refs()) parts.push(`${r.name}\0${r.oid}`);
+    parts.push(`HEAD\0${this.head()}`);
     return sha1hex(te.encode(parts.join("\n")));
   }
 
@@ -518,17 +660,17 @@ export class GitStore {
 
   /**
    * Reachable objects that live in a pack, one keyset page at a time in
-   * (pack_id, offset) storage order. Marching each pack sequentially keeps the
-   * raw-chunk cache hitting, and the (pack_id, offset) cursor holds no
-   * per-object state in the isolate — so a warm full clone streams in O(page)
-   * memory no matter how many objects the repo has, replacing the OidSet and
-   * parallel typed arrays the walk path builds.
+   * (pack_key, offset) order — the SPEC-0001 §4 keyset ordering. Marching each
+   * pack sequentially keeps the raw-chunk cache hitting, and the (pack_key,
+   * offset) cursor holds no per-object state in the isolate — so a warm full
+   * clone streams in O(page) memory no matter how many objects the repo has,
+   * replacing the OidSet and parallel typed arrays the walk path builds.
    */
-  reachablePackedAfter(afterPack: number, afterOffset: number, limit: number): PackedReachable[] {
+  reachablePackedAfter(afterPack: string, afterOffset: number, limit: number): PackedReachable[] {
     return this.sql
       .exec<{
         oid: string;
-        pack_id: number;
+        pack_key: string;
         offset: number;
         data_off: number;
         data_len: number;
@@ -536,10 +678,10 @@ export class GitStore {
         entry_size: number;
         base_oid: string | null;
       }>(
-        `SELECT p.oid, p.pack_id, p.offset, p.data_off, p.data_len, p.type, p.entry_size, p.base_oid
+        `SELECT p.oid, p.pack_key, p.offset, p.data_off, p.data_len, p.type, p.entry_size, p.base_oid
            FROM reachable r JOIN pack_objects p ON p.oid = r.oid
-          WHERE p.pack_id > ? OR (p.pack_id = ? AND p.offset > ?)
-          ORDER BY p.pack_id, p.offset
+          WHERE p.pack_key > ? OR (p.pack_key = ? AND p.offset > ?)
+          ORDER BY p.pack_key, p.offset
           LIMIT ?`,
         afterPack,
         afterPack,
@@ -549,7 +691,7 @@ export class GitStore {
       .toArray()
       .map((r) => ({
         oid: r.oid,
-        packId: r.pack_id,
+        packKey: r.pack_key,
         offset: r.offset,
         dataOff: r.data_off,
         dataLen: r.data_len,

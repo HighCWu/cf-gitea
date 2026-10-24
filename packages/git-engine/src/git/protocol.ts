@@ -5,8 +5,9 @@ import { PackWriter } from "./pack";
 import { OidSet } from "./oidset";
 import { MultipartCapture, MultipartPackUpload } from "./multipart";
 import { parseCommit, parseTag, parseTree, isGitlinkMode, isTreeMode, TYPE_NUM, NUM_TYPE, ObjType } from "./objects";
+import { cloneCacheKey } from "./r2keys";
 
-const AGENT = "agent=dgit/0.3";
+const AGENT = "dgit/0.3";
 const INFINITE_DEPTH = 0x7fffffff;
 const SIDEBAND_CHUNK = 32 * 1024;
 const WALK_YIELD = 5000;
@@ -27,9 +28,12 @@ export type Service = "git-upload-pack" | "git-receive-pack";
  * whole pack in isolate memory (no size cap). Absent on celld and on Workers
  * without the binding, in which case every clone is served from the DO exactly
  * as before. HITs are served by the Worker streaming R2 directly, not the DO.
+ * Since the SPEC-0001a §3 Step 3 unification this is the SAME bucket as
+ * receive (REPO_PACKS); keys come from r2keys.ts under the repo's storage key.
  */
 export interface PackCache {
-  repo: string;
+  /** the repo's immutable storage key (meta.storage_key); namespaces the keys */
+  storageKey: string;
   /** Begin a multipart pack build under `key`, stamping the object count as
    * customMetadata; null when R2 is unavailable (the clone still streams). */
   beginMultipart(key: string, objects: number): Promise<MultipartPackUpload | null>;
@@ -53,10 +57,10 @@ export function advertisement(store: GitStore, service: Service, v2 = false): Ui
       : ["report-status", "delete-refs", "ofs-delta", "side-band-64k", AGENT].join(" ");
 
   const lines: Uint8Array[] = [pkt(`# service=${service}\n`), FLUSH];
-  const refs: { name: string; target: string }[] = [];
+  const refs: { name: string; oid: string }[] = [];
   if (service === "git-upload-pack") {
     const head = store.resolveHead();
-    if (head) refs.push({ name: "HEAD", target: head });
+    if (head) refs.push({ name: "HEAD", oid: head });
   }
   refs.push(...store.refs());
 
@@ -64,7 +68,7 @@ export function advertisement(store: GitStore, service: Service, v2 = false): Ui
     lines.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
   } else {
     refs.forEach((r, i) => {
-      lines.push(pkt(i === 0 ? `${r.target} ${r.name}\0${caps}\n` : `${r.target} ${r.name}\n`));
+      lines.push(pkt(i === 0 ? `${r.oid} ${r.name}\0${caps}\n` : `${r.oid} ${r.name}\n`));
     });
   }
   lines.push(FLUSH);
@@ -87,11 +91,13 @@ export async function advertisedOids(store: GitStore): Promise<Set<string>> {
   const head = store.resolveHead();
   if (head) oids.add(head);
   for (const r of store.refs()) {
-    oids.add(r.target);
-    // peel annotated tags; lightweight tags already point at the commit
+    oids.add(r.oid);
+    // peel annotated tags; lightweight tags already point at the commit.
+    // peeledRefTarget consults the refs row's peeled column, so steady-state
+    // requests read the cached target instead of re-walking tag objects
     if (!r.name.startsWith("refs/tags/")) continue;
-    if (store.typeAndSize(r.target)?.type !== "tag") continue;
-    const peeled = await peelToCommitOid(store, r.target);
+    if (store.typeAndSize(r.oid)?.type !== "tag") continue;
+    const peeled = await store.peeledRefTarget(r.name, r.oid);
     if (peeled) oids.add(peeled);
   }
   return oids;
@@ -105,7 +111,7 @@ export async function advertisedOids(store: GitStore): Promise<Set<string>> {
  */
 export function wantsAreAllTips(store: GitStore, wants: string[]): boolean {
   const tips = new Set<string>();
-  for (const r of store.refs()) tips.add(r.target);
+  for (const r of store.refs()) tips.add(r.oid);
   if (tips.size === 0) return false;
   const wantSet = new Set(wants);
   if (wantSet.size !== tips.size) return false;
@@ -312,11 +318,13 @@ async function lsRefs(store: GitStore, req: UploadRequest): Promise<Uint8Array> 
   if (head) lines.push(pkt(`${head} HEAD${req.caps.has("symrefs") ? ` symref-target:${store.head()}` : ""}\n`));
   for (const ref of store.refs()) {
     let peeled = "";
-    if (req.caps.has("peel") && ref.name.startsWith("refs/tags/") && store.typeAndSize(ref.target)?.type === "tag") {
-      const oid = await peelToCommitOid(store, ref.target);
+    // the peel resolves through the refs row's peeled column (cached at first
+    // peel), so ls-refs no longer re-walks tag objects per request
+    if (req.caps.has("peel") && ref.name.startsWith("refs/tags/") && store.typeAndSize(ref.oid)?.type === "tag") {
+      const oid = await store.peeledRefTarget(ref.name, ref.oid);
       if (oid) peeled = ` peeled:${oid}`;
     }
-    lines.push(pkt(`${ref.target} ${ref.name}${peeled}\n`));
+    lines.push(pkt(`${ref.oid} ${ref.name}${peeled}\n`));
   }
   return concat([...lines, FLUSH]);
 }
@@ -346,7 +354,7 @@ export async function latestCommitTime(store: GitStore): Promise<number> {
   const tips = new Set<string>();
   const head = store.resolveHead();
   if (head) tips.add(head);
-  for (const r of store.refs()) tips.add(r.target);
+  for (const r of store.refs()) tips.add(r.oid);
   let max = 0;
   for (const tip of tips) {
     try {
@@ -734,13 +742,14 @@ export async function uploadPack(
   // R2 full-clone offload (write side). Only a standard side-band-64k full clone
   // is eligible, and it is reached only after the advertised-oids gate above — so
   // the versioned key can never warm an unreachable/force-pushed object. The key
-  // is the ref version, so a push/force-push/delete lands on a fresh key and
-  // stale packs are simply never referenced. HITs are served by the Worker
-  // streaming R2 directly; the DO only reaches here on a MISS, where it serves
-  // the client and self-warms the cache via multipart while it streams (see
-  // `capture` below). Absent R2 (celld / no binding) this is a plain DO clone.
+  // is built by r2keys.ts from the repo's storage key and the ref-version hash,
+  // so a push/force-push/delete lands on a fresh key and stale packs are simply
+  // never referenced. HITs are served by the Worker streaming R2 directly; the DO
+  // only reaches here on a MISS, where it serves the client and self-warms the
+  // cache via multipart while it streams (see `capture` below). Absent R2 (celld
+  // / no binding) this is a plain DO clone.
   const r2Key =
-    fullClone && sideband && packCache ? `pack/${packCache.repo}/${store.reachableVersion()}` : null;
+    fullClone && sideband && packCache ? cloneCacheKey(packCache.storageKey, store.reachableVersion()) : null;
 
   // Warm full-clone fast path: the reachable set is persisted and current, so
   // stream the pack straight out of storage in (pack_id, offset) order without
@@ -812,11 +821,13 @@ export async function uploadPack(
   // than live objects (~204 B/obj) is what keeps a one-shot full clone inside
   // the 128MB isolate at multi-million-object scale.
   //
-  //   ePack     Int32     pack id (1-based), or LOOSE_PACK for objects with no
-  //             pack entry (loose / unindexed) — those sort last, by oid.
+  //   ePack     Int32     dense ordinal of the pack catalog key (packs group
+  //             together; ordinals come from a first-seen map), or LOOSE_PACK
+  //             for objects with no pack entry (loose / unindexed) — those
+  //             sort last, by oid.
   //   eDataOff  Float64   start of the stored (compressed) region. Offsets on a
   //             pack past 4GB exceed 2^32, so this must NOT be a Uint32. The
-  //             (packId, dataOff) pair is also the sort key: dataOff rises
+  //             (pack, dataOff) pair is also the sort key: dataOff rises
   //             monotonically with entry offset within a pack, so ordering by
   //             it reproduces pack storage order exactly.
   //   eDataLen  Uint32    length of that region (a single entry never reaches
@@ -836,12 +847,25 @@ export async function uploadPack(
   const total = send.markedSize;
   let order: Int32Array | null = null;
   let ePack: Int32Array | null = null;
+  /** pack catalog keys indexed by (ePack ordinal - 1); null on the unsorted path */
+  let ePackKeys: string[] | null = null;
   let eDataOff: Float64Array | null = null;
   let eDataLen: Uint32Array | null = null;
   let eSize: Float64Array | null = null;
   let eCode: Int32Array | null = null;
   const LOOSE_PACK = 0x7fffffff; // sorts after every real (1-based) pack id
   if (store.packs.totalPackBytes() > store.packs.rawCacheWindow()) {
+    // dense per-pack ordinals: packs group in the sort, storage order inside a
+    // pack comes from dataOff. Keyed by the pack catalog key (pack-<sha1>).
+    const packKeys: string[] = [];
+    const packIndex = new Map<string, number>();
+    const ordinalOf = (packKey: string): number => {
+      const known = packIndex.get(packKey);
+      if (known !== undefined) return known + 1;
+      packIndex.set(packKey, packKeys.length);
+      packKeys.push(packKey);
+      return packKeys.length;
+    };
     ePack = new Int32Array(total);
     eDataOff = new Float64Array(total);
     eDataLen = new Uint32Array(total);
@@ -853,7 +877,7 @@ export async function uploadPack(
         ePack[i] = LOOSE_PACK;
         eCode[i] = -1;
       } else {
-        ePack[i] = entry.packId;
+        ePack[i] = ordinalOf(entry.packKey);
         eDataOff[i] = entry.dataOff;
         eDataLen[i] = entry.dataLen;
         eSize[i] = entry.entrySize;
@@ -877,6 +901,7 @@ export async function uploadPack(
       }
       return eDataOff![a] - eDataOff![b];
     });
+    ePackKeys = packKeys;
   }
 
   // stream the pack: preamble, then pack bytes (side-band framed if negotiated)
@@ -929,9 +954,9 @@ export async function uploadPack(
             const oid = send.markedAtHex(idx);
             const entry = store.packs.lookup(oid);
             if (entry && !entry.baseOid) {
-              writer.rawFull(entry.type, entry.entrySize, await store.packs.readRaw(entry.packId, entry.dataOff, entry.dataLen));
+              writer.rawFull(entry.type, entry.entrySize, await store.packs.readRaw(entry.packKey, entry.dataOff, entry.dataLen));
             } else if (entry && entry.baseOid && send.isMarkedHex(entry.baseOid)) {
-              writer.rawDelta(entry.entrySize, entry.baseOid, await store.packs.readRaw(entry.packId, entry.dataOff, entry.dataLen));
+              writer.rawDelta(entry.entrySize, entry.baseOid, await store.packs.readRaw(entry.packKey, entry.dataOff, entry.dataLen));
             } else {
               const obj = await store.get(oid);
               if (!obj) throw new Error(`missing object ${oid}`);
@@ -943,9 +968,9 @@ export async function uploadPack(
           // the lean typed arrays, so no SQL lookup happens here.
           const code = eCode[idx];
           if (code <= -3) {
-            writer.rawFull(NUM_TYPE[-2 - code], eSize![idx], await store.packs.readRaw(ePack![idx], eDataOff![idx], eDataLen![idx]));
+            writer.rawFull(NUM_TYPE[-2 - code], eSize![idx], await store.packs.readRaw(ePackKeys![ePack![idx] - 1], eDataOff![idx], eDataLen![idx]));
           } else if (code >= 0) {
-            writer.rawDelta(eSize![idx], send.atHex(code), await store.packs.readRaw(ePack![idx], eDataOff![idx], eDataLen![idx]));
+            writer.rawDelta(eSize![idx], send.atHex(code), await store.packs.readRaw(ePackKeys![ePack![idx] - 1], eDataOff![idx], eDataLen![idx]));
           } else {
             const oid = send.markedAtHex(idx);
             const obj = await store.get(oid);
@@ -995,7 +1020,7 @@ export async function uploadPack(
  * Stream a full clone straight from the persisted reachable set, holding no
  * object set in the isolate. The reachable cache is current (the caller checked
  * `reachableCacheValid`), so the objects to send are exactly its rows: emit the
- * packed ones in (pack_id, offset) storage order a keyset page at a time, then
+ * packed ones in (pack_key, offset) storage order a keyset page at a time, then
  * the loose ones by oid. Peak memory is one page plus one object, independent
  * of repo size — the walk path's OidSet and parallel typed arrays are gone.
  *
@@ -1025,17 +1050,17 @@ async function warmFullClone(
   // One emit-thunk per object, in storage order: every packed reachable object
   // (marching packs sequentially), then every loose reachable object by oid.
   async function* objects(): AsyncGenerator<(w: PackWriter) => Promise<void>> {
-    let curPack = 0;
+    let curPack = "";
     let curOff = -1;
     for (;;) {
       const rows = store.reachablePackedAfter(curPack, curOff, PAGE);
       for (const e of rows) {
-        curPack = e.packId;
+        curPack = e.packKey;
         curOff = e.offset;
         if (e.baseOid !== null && store.reachableHas(e.baseOid)) {
           const base = e.baseOid;
           yield async (w) =>
-            w.rawDelta(e.entrySize, base, await store.packs.readRaw(e.packId, e.dataOff, e.dataLen));
+            w.rawDelta(e.entrySize, base, await store.packs.readRaw(e.packKey, e.dataOff, e.dataLen));
         } else if (e.baseOid !== null) {
           // base is not itself being sent: it cannot be a ref-delta, inflate it
           yield async (w) => {
@@ -1045,7 +1070,7 @@ async function warmFullClone(
           };
         } else {
           yield async (w) =>
-            w.rawFull(e.type, e.entrySize, await store.packs.readRaw(e.packId, e.dataOff, e.dataLen));
+            w.rawFull(e.type, e.entrySize, await store.packs.readRaw(e.packKey, e.dataOff, e.dataLen));
         }
       }
       if (rows.length < PAGE) break;
@@ -1294,7 +1319,7 @@ export async function validatePush(
   store: GitStore,
   commands: PushCommand[],
   unpackError: string | null,
-  scan: { packId: number | null; packIncomplete: boolean }
+  scan: { packKey: string | null; packIncomplete: boolean }
 ): Promise<PushPlan> {
   // whether the reachable cache is valid for the pre-push refs: only then can
   // it be extended in place (union with the connectivity walk) instead of
@@ -1303,17 +1328,17 @@ export async function validatePush(
   // pre-existing ref tips bound the extendable set: their closure was
   // validated at their own push
   const known = new OidSet(4096);
-  for (const r of store.refs()) known.addHex(r.target);
+  for (const r of store.refs()) known.addHex(r.oid);
   const knownHead = store.resolveHead();
   if (knownHead) known.addHex(knownHead);
   // A cached fast-forward extends the persisted reachable set with the pack's
   // own rows: every object a complete pack introduces is reachable from its
   // new tips, so the union closes over the new reachable set without the DO
   // walking (or inflating) a single object. Built from index rows alone.
-  if (hadCache && !unpackError && !scan.packIncomplete && scan.packId !== null) {
+  if (hadCache && !unpackError && !scan.packIncomplete && scan.packKey !== null) {
     let after = "";
     for (;;) {
-      const page = store.packs.packOidsAfter(scan.packId, after, 1000);
+      const page = store.packs.packOidsAfter(scan.packKey, after, 1000);
       if (!page.length) break;
       for (const oid of page) known.addHex(oid);
       after = page[page.length - 1];

@@ -16,6 +16,7 @@ import { isOid, concat, te, toHex, ZERO_OID, Sha1 } from "./git/util";
 import { gunzipLimited } from "./git/zlib";
 import { MultipartCapture, beginRawMultipart } from "./git/multipart";
 import { overDeclaredLength, tooLargeResponse } from "./repo";
+import { idxR2Key, packName, packR2Key } from "./git/r2keys";
 import {
   asCommandResults,
   NO_PACK,
@@ -34,19 +35,23 @@ export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, BlobResult, Log
 export type { Person } from "./git/objects";
 // receive control plane (SPEC-0001a §3 Steps 1-2): the Worker-side data plane
 // in this file drives these lease RPCs; consumers of the engine re-export them
-// so the typed boundary is complete.
+// so the typed boundary is complete. The repo lifecycle RPCs
+// (markDeleted/destroy/setHead, SPEC-0003 §2.5.5) ride the same boundary.
 export type {
   BeginReceiveInput,
   BeginReceiveResult,
+  DestroyResult,
   FinalizedPack,
   FinalizeReceiveInput,
   FinalizeReceiveResult,
   IndexRow,
   LookupObjectHit,
   LookupObjectResult,
+  MarkDeletedResult,
   ReceiveCommandResult,
   ReleaseReceiveInput,
   ReleaseReceiveResult,
+  SetHeadResult,
 } from "./control-plane";
 
 /** an upload-pack negotiation body is wants/haves/caps only — a few hundred KB */
@@ -338,7 +343,9 @@ async function serveCloneFromR2(
   body: Uint8Array,
   stub: DurableObjectStub<RepoCell>
 ): Promise<Response | null> {
-  const bucket = env.PACK_CACHE;
+  // the ONE pack bucket since the SPEC-0001a §3 Step 3 unification: the clone
+  // cache lives under repos/<storage_key>/clone-cache/ in REPO_PACKS
+  const bucket = env.REPO_PACKS;
   if (!bucket) return null;
   const req = parseUploadRequest(body);
   // G3 (cache unreachability): a request carrying unsupported-but-semantics-
@@ -696,11 +703,16 @@ async function receivePack<E extends Env>(
     const sideband = push.caps.includes("side-band-64k");
     const wantStatus = push.caps.includes("report-status");
 
-    // 2. open the lease (refname validation happens before any byte streams)
+    // 2. open the lease (refname validation happens before any byte streams).
+    // The x-storage-key header (SPEC-0001a §3 Step 3) carries the D1-minted
+    // immutable storage key when the caller knows it (cf-gitea's git-http
+    // gate sets it from the repositories row); absent, the DO falls back to
+    // its persisted meta.storage_key / meta.repo — see control-plane.ts.
     const begin = await stub.beginReceive({
       commands: push.commands,
       capabilities: push.caps,
       packBytesHint: push.hint,
+      storageKey: req.headers.get("x-storage-key"),
     });
     if (begin.tag === "busy") {
       return new Response("busy: too many concurrent pushes, retry shortly\n", {
@@ -742,8 +754,11 @@ async function receivePack<E extends Env>(
     let pack: FinalizedPack = NO_PACK;
     let packIncomplete = false;
     if (staged && !unpackError) {
-      const packKey = `repos/${begin.storageKey}/packs/pack-${staged.packSha1}.pack`;
-      const idxKey = `repos/${begin.storageKey}/packs/pack-${staged.packSha1}.idx`;
+      // final keys via the single builder (r2keys.ts): packs/<pack-<sha1>>.pack
+      // + the idx v2 sidecar, both under the lease's storage key
+      const name = packName(staged.packSha1);
+      const packKey = packR2Key(begin.storageKey, name);
+      const idxKey = idxR2Key(begin.storageKey, name);
       try {
         const progress = (msg: string) => {
           if (sideband) for (const f of sidebandFrames(2, te.encode(msg))) emit(f);
@@ -772,7 +787,7 @@ async function receivePack<E extends Env>(
             },
             putRows: async (rows) => {
               metrics.rowRpcs++;
-              return stub.putIndexRows(begin.leaseToken, rows);
+              return stub.putIndexRows(begin.leaseToken, name, rows);
             },
           },
           {
@@ -845,7 +860,7 @@ async function receivePack<E extends Env>(
       } catch (err) {
         // scan/resolution/idx failures surface verbatim in report-status
         // ("unpack <msg>"); rows already pushed are crash debris the DO's
-        // orphan sweep reclaims (their pack id never reaches pack_meta)
+        // orphan sweep reclaims (their pack never reaches pack_catalog)
         unpackError = err instanceof Error ? err.message : String(err);
         console.log(`[receive ${repo}] index failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
       }
@@ -1149,7 +1164,7 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
               parsed = new Uint8Array(0);
             }
           }
-          if (env.PACK_CACHE && parsed.length) {
+          if (env.REPO_PACKS && parsed.length) {
             const hit = await serveCloneFromR2(env, repo, parsed, stub);
             if (hit) return hit;
           }

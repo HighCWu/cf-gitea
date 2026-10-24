@@ -1,5 +1,6 @@
 /**
- * Receive control plane (SPEC-0001a §3 Steps 1-2).
+ * Receive control plane (SPEC-0001a §3 Steps 1-2) and repo lifecycle RPCs
+ * (SPEC-0003 §2.5.5).
  *
  * The push data plane (pkt-line parse, pack staging, scan, delta resolution,
  * idx emission, staging→packs copy) runs in the Worker; the DO keeps refs,
@@ -13,6 +14,22 @@
  * {@link putIndexRows} in bounded control-plane batches, and thin-pack /
  * cross-pack bases resolve through {@link lookupObjects} — the DO never reads
  * pack bytes.
+ *
+ * Step 3 pins the storage_key contract: every R2 key is built by
+ * src/git/r2keys.ts from ONE immutable storage key, resolved per receive as
+ *
+ *   1. `input.storageKey` — the Worker's explicit value, and
+ *   2. meta.storage_key   — the persisted one, else
+ *   3. meta.repo          — the legacy name-addressed fallback.
+ *
+ * The resolution is persisted to meta.storage_key on first touch (meta.repo
+ * migrates transparently; today the repo name IS the storage key until
+ * SPEC-0003 supplies the D1-minted r_<id>). The WORKER→DO transport for (1)
+ * is the `x-storage-key` HTTP request header on POST /git-receive-pack:
+ * cf-gitea's git-http gate sets it from the D1 `repositories.storage_key`
+ * row before delegating; the engine's receive flow reads it and passes it
+ * here. Absent header ⇒ the fallback chain (documented behavior, not an
+ * error) so the stock dgit Worker keeps working without it.
  */
 import {
   commitPush,
@@ -24,6 +41,7 @@ import {
 } from "./git/protocol";
 import { ObjType } from "./git/objects";
 import { ZERO_OID } from "./git/util";
+import { isValidStorageKey, packR2Key, stagingKey as buildStagingKey, packName as catalogPackName } from "./git/r2keys";
 import type { GitStore } from "./git/store";
 import type { RefUpdate } from "./mod";
 
@@ -41,6 +59,14 @@ export interface BeginReceiveInput {
   capabilities: string[];
   /** remaining byte count (Content-Length minus command section), null when chunked */
   packBytesHint: number | null;
+  /**
+   * OPTIONAL immutable storage key (r_<id>) from the Worker's D1 row
+   * (SPEC-0001a §3 Step 3; transported as the `x-storage-key` request header
+   * — see the module doc). Absent/invalid ⇒ meta.storage_key, else meta.repo.
+   * The chosen value is persisted to meta.storage_key so alarm/sweep paths
+   * can rebuild keys without a request.
+   */
+  storageKey?: string | null;
 }
 
 export type BeginReceiveOk = {
@@ -99,7 +125,8 @@ export interface FinalizeReceiveInput {
 export type FinalizeCommitted = {
   tag: "committed";
   results: ReceiveCommandResult[];
-  /** post-commit refs_version (edge cache key, T4) */
+  /** post-commit refs_version (edge cache key, T4; formal meta key per
+   * SPEC-0001 §4 — bumped inside the commit transaction) */
   refsVersion: string;
   /** newest committer date, for the Worker's registry upsert */
   commitTime: number;
@@ -175,8 +202,9 @@ export type LookupObjectResult = LookupObjectHit | { found: false };
 interface LeasePayload {
   stagingKey?: string;
   storageKey?: string;
-  /** allocated when the first IndexRow batch lands (pack_meta keys it later) */
-  packId?: number;
+  /** the pack NAME (pack-<sha1>, r2keys.ts) — set by the Worker's first
+   * putIndexRows batch; pack_catalog keys the rows by it at finalize */
+  packName?: string;
 }
 
 // ---- Step-1/2 semantics notes -----------------------------------------------
@@ -189,10 +217,11 @@ interface LeasePayload {
 //   renders it verbatim ("unpack <msg>"), replacing Step 1's generic
 //   "unpacker error" placeholder.
 // - index rows land BEFORE finalize; a crash between them leaves rows whose
-//   pack id has no pack_meta entry — sweepOrphanRows (each finalize) and the
-//   lease sweeps reclaim them, mirroring the old ingest-crash story.
-// - storageKey is the persisted repo name (meta.repo) until SPEC-0003 supplies
-//   the D1-minted r_<id>; R2 keys stay per-repo-namespaced either way.
+//   pack name has no pack_catalog entry — sweepOrphanRows (each finalize) and
+//   the lease sweeps reclaim them, mirroring the old ingest-crash story.
+// - storageKey: until SPEC-0003 supplies the D1-minted r_<id>, the persisted
+//   repo name doubles as the storage key; R2 keys stay per-repo-namespaced
+//   either way and every construction goes through src/git/r2keys.ts.
 
 /**
  * How long a receive lease blocks concurrent pushes (T7). Generous enough for
@@ -211,6 +240,11 @@ export interface LeaseHost {
   storage: DurableObjectStorage;
   /** best-effort deletes in the REPO_PACKS bucket (no-op without a binding) */
   deletePackObjects(keys: string[]): Promise<void>;
+  /**
+   * The repo's registry bookkeeping (registry.remove), for destroy()'s
+   * remove hook. Optional: the stock dgit Worker may run without a registry.
+   */
+  removeFromRegistry?(name: string): Promise<void>;
 }
 
 function toCommandResults(results: CommandResult[]): ReceiveCommandResult[] {
@@ -218,19 +252,43 @@ function toCommandResults(results: CommandResult[]): ReceiveCommandResult[] {
 }
 
 /** Control-plane results → protocol CommandResults, for report-status
- * rendering on the Worker side (renderStatus consumes the protocol shape). */
+ * rendering on the Worker side (renderStatus consumes the protocol shape).
+ * The inverse of toCommandResults: ReceiveCommandResult carries `message`,
+ * CommandResult carries `msg` — mapping via the other direction drops the
+ * ng text and report-status renders a literal "undefined". */
 export function asCommandResults(results: ReceiveCommandResult[]): CommandResult[] {
-  return toCommandResults(results);
+  return results.map((r) => ({ ref: r.ref, ok: r.ok, msg: r.message }));
 }
 
 function parseLeasePayload(payload: string): LeasePayload {
   try {
     return JSON.parse(payload) as LeasePayload;
   } catch {
-    // a corrupt payload leaves no staging/pack id to sweep; the row is
+    // a corrupt payload leaves no staging/pack name to sweep; the row is
     // authoritative either way
     return {};
   }
+}
+
+/**
+ * The repo's storage key (SPEC-0001a §3 Step 3): `explicit` when valid, else
+ * the persisted meta.storage_key, else meta.repo. The resolution is persisted
+ * to meta.storage_key on first touch, so later request-less paths (alarm
+ * sweeps, GC, clone-cache probes) rebuild identical keys.
+ */
+function resolveStorageKey(store: GitStore, explicit?: string | null): string {
+  const chosen =
+    (explicit && isValidStorageKey(explicit) ? explicit : null) ??
+    store.getMeta("storage_key") ??
+    store.getMeta("repo") ??
+    "";
+  if (chosen && store.getMeta("storage_key") !== chosen) {
+    // migrate meta.repo → meta.storage_key on first touch (clean cutover: the
+    // legacy meta.repo key is retained for the UI/registry name, which the
+    // storage key may legitimately differ from once SPEC-0003 lands)
+    store.setMeta("storage_key", chosen);
+  }
+  return chosen;
 }
 
 /** Sweep expired leases plus their staging objects and orphaned index rows.
@@ -242,16 +300,23 @@ export async function sweepExpiredLeases(host: LeaseHost): Promise<void> {
     host.store.deleteLease(lease.leaseToken);
     if (lease.kind !== "receive") continue;
     const payload = parseLeasePayload(lease.payload);
-    if (typeof payload.packId === "number") host.store.packs.sweepPackRows(payload.packId);
+    if (payload.packName) host.store.packs.sweepPackRows(payload.packName);
     if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
   }
+}
+
+/** True when the repo is tombstoned (meta.deleted, markDeleted below). */
+function isDeleted(store: GitStore): boolean {
+  return store.getMeta("deleted") === "1";
 }
 
 /**
  * Open a receive lease. Validates refnames BEFORE any byte streams; a single
  * funny refname rejects the whole command section (there is no partial lease).
- * On success the lease is exclusive: the next beginReceive busy-waits (503
- * Retry-After) until finalize/release/expiry.
+ * A tombstoned repo (markDeleted) rejects the push outright — deleted repos
+ * never take leases (SPEC-0003 §2.5.5 step 2). On success the lease is
+ * exclusive: the next beginReceive busy-waits (503 Retry-After) until
+ * finalize/release/expiry.
  */
 export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): Promise<BeginReceiveResult> {
   const { store } = host;
@@ -267,11 +332,15 @@ export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): P
       results: input.commands.map((cmd) => ({ ref: cmd.ref, ok: false, message: "funny refname" })),
     };
   }
-  // meta.repo is persisted by the first HTTP request (the advert always
-  // precedes a push); until SPEC-0003 it doubles as the storage key
-  const storageKey = store.getMeta("repo") ?? "";
+  if (isDeleted(store)) {
+    return {
+      tag: "rejected",
+      results: input.commands.map((cmd) => ({ ref: cmd.ref, ok: false, message: "repository deleted" })),
+    };
+  }
+  const storageKey = resolveStorageKey(store, input.storageKey);
   const leaseToken = crypto.randomUUID().replaceAll("-", "");
-  const stagingKey = `repos/${storageKey}/staging/pack-rx-${leaseToken}.pack`;
+  const stagingKey = buildStagingKey(storageKey, leaseToken);
   const leaseExpiresAt = Date.now() + RECEIVE_LEASE_TTL_MS;
   const payload: LeasePayload = { stagingKey, storageKey };
   store.createLease(leaseToken, "receive", leaseExpiresAt, JSON.stringify(payload));
@@ -287,36 +356,51 @@ export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): P
     stagingKey,
     storageKey,
     refsVersion: store.refsVersion(),
-    refTips: store.refs().map((r) => ({ name: r.name, oid: r.target })),
+    refTips: store.refs().map((r) => ({ name: r.name, oid: r.oid })),
     leaseExpiresAt,
   };
 }
 
 /**
  * Land one bounded batch of Worker-resolved index rows for the lease's pack.
- * The pack id is allocated on the first batch and persisted in the lease
- * payload, so finalize (and every sweep) can name the rows without another
- * channel. `INSERT OR IGNORE` keeps a duplicate oid's FIRST location — the
- * same semantics the DO's own ingest inserts had.
+ * `packName` (r2keys.packName(packSha1)) is the deterministic catalog key the
+ * Worker already derives from the staged pack's trailer; the FIRST batch
+ * records it in the lease payload, so finalize (and every sweep) can name the
+ * rows without another channel. Rows are keyed under that name from the start
+ * — no integer pack id exists anymore (SPEC-0001a §3 Step 4: pack_catalog is
+ * string-keyed). `INSERT OR IGNORE` keeps a duplicate oid's FIRST location.
  */
-export async function putIndexRows(host: LeaseHost, leaseToken: string, rows: IndexRow[]): Promise<{ tag: "ok" } | { tag: "lease_mismatch" }> {
+export async function putIndexRows(
+  host: LeaseHost,
+  leaseToken: string,
+  packName: string,
+  rows: IndexRow[]
+): Promise<{ tag: "ok" } | { tag: "lease_mismatch" }> {
   const lease = host.store.getLease(leaseToken);
   if (!lease || lease.kind !== "receive" || lease.expiresAt <= Date.now()) {
     return { tag: "lease_mismatch" };
   }
   if (!rows.length) return { tag: "ok" };
   const payload = parseLeasePayload(lease.payload);
-  let packId = payload.packId;
-  if (typeof packId !== "number") {
-    packId = host.store.packs.nextPackId();
-    host.store.updateLeasePayload(leaseToken, JSON.stringify({ ...payload, packId }));
+  if (payload.packName && payload.packName !== packName) {
+    // one lease = one pack; a second name under the same lease is a caller bug
+    return { tag: "lease_mismatch" };
+  }
+  if (!payload.packName) {
+    if (!isValidPackName(packName)) return { tag: "lease_mismatch" };
+    host.store.updateLeasePayload(leaseToken, JSON.stringify({ ...payload, packName }));
     // rows for this pack are readable from this RPC on: prime the backend to
     // the staging object so DO-side reads over the fresh rows (the ancestry
-    // walk in validatePush) resolve through R2, not a missing SQLite backend
-    if (payload.stagingKey) host.store.packs.primePack(packId, payload.stagingKey);
+    // walk in validatePush) resolve through R2, not a missing catalog row
+    if (payload.stagingKey) host.store.packs.primePack(packName, payload.stagingKey);
   }
-  host.store.packs.putRows(packId, rows);
+  host.store.packs.putRows(packName, rows);
   return { tag: "ok" };
+}
+
+/** pack-<40 hex> — the only shape putIndexRows accepts as a pack name. */
+function isValidPackName(name: string): boolean {
+  return /^pack-[0-9a-f]{40}$/.test(name);
 }
 
 /**
@@ -340,9 +424,12 @@ export async function lookupObjects(host: LeaseHost, leaseToken: string, oids: s
 /**
  * Validate, then apply per-command CAS + multi-ref commit + refs_version bump
  * in ONE transactionSync. The pack was already scanned, resolved and indexed
- * by the Worker (rows landed via putIndexRows); finalize records pack_meta,
+ * by the Worker (rows landed via putIndexRows); finalize records pack_catalog,
  * re-checks CAS, and sweeps the staging object so a successful finalize leaves
- * exactly one copy of the pack bytes.
+ * exactly one copy of the pack bytes. A repo tombstoned mid-flight aborts
+ * here: the lease is released, the staging object swept, and every command
+ * fails (SPEC-0003 §2.5.5 §4.2 — the Worker's retry then hits the tombstone
+ * rejection at beginReceive, so the client always sees a sideband failure).
  */
 export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInput): Promise<FinalizeReceiveResult> {
   const { store } = host;
@@ -350,18 +437,26 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
   if (!lease || lease.kind !== "receive" || lease.expiresAt <= Date.now()) {
     return { tag: "lease_mismatch" };
   }
+  if (isDeleted(store)) {
+    store.deleteLease(input.leaseToken);
+    const dead = parseLeasePayload(lease.payload);
+    if (dead.packName) store.packs.sweepPackRows(dead.packName);
+    if (dead.stagingKey) await host.deletePackObjects([dead.stagingKey]);
+    return { tag: "lease_mismatch" };
+  }
   const leaseData = parseLeasePayload(lease.payload);
   const stagingKey = leaseData.stagingKey ?? "";
-  const packId = typeof leaseData.packId === "number" ? leaseData.packId : null;
+  const packName = leaseData.packName ?? null;
   // re-prime the backend cache (it is in-memory and this DO instance may have
   // been recycled since the rows landed): validatePush's ancestry walk reads
   // the fresh rows through the staging object until recordPack re-points at
   // the copied packs/ key
-  if (packId !== null && stagingKey) store.packs.primePack(packId, stagingKey);
+  if (packName && stagingKey) store.packs.primePack(packName, stagingKey);
 
-  // reclaim SQLite debris of crashed ingests: rows whose pack id never
-  // reached pack_meta. The lease's own pack (rows landed mid-receive) is kept.
-  store.packs.sweepOrphanRows(packId);
+  // reclaim SQLite debris of crashed ingests: rows whose pack name never
+  // reached pack_catalog. The lease's own pack (rows landed mid-receive) is
+  // kept.
+  store.packs.sweepOrphanRows(packName);
 
   // object-reading validation first (async: the ancestry walk reads stored
   // objects over the network, which transactionSync cannot await), then the
@@ -370,13 +465,15 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
   // this window. The Worker's scan already resolved every delta and ran the
   // connectivity anti-check; validatePush consumes its verdict.
   const plan = await validatePush(store, input.commands, input.unpackError, {
-    packId,
+    packKey: packName,
     packIncomplete: input.packIncomplete === true,
   });
   const outcome = host.storage.transactionSync(() => {
-    // the lease may have been swept/released while the async passes ran
+    // the lease may have been swept/released/tombstoned while the async
+    // passes ran (SPEC-0003 §4.2: the tombstone check sits INSIDE the commit
+    // transaction)
     const live = store.getLease(input.leaseToken);
-    if (!live || live.kind !== "receive") return { lost: true as const };
+    if (!live || live.kind !== "receive" || isDeleted(store)) return { lost: true as const };
     if (store.refsVersion() !== input.expectedRefsVersion) {
       // a push landed in between: every command is behind ("fetch first")
       return {
@@ -388,11 +485,37 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
     }
     // record the pack catalog entry inside the transaction that first points
     // refs at it. A refs_version mismatch above skips this — the abandoned
-    // copy's rows are orphaned and reclaimed by a later sweep.
+    // copy's rows are orphaned and reclaimed by a later sweep. The catalog
+    // key is the pack NAME; the Worker's copy key is verified against the
+    // r2keys.ts derivation, so a namespace fork can never be committed over.
     const hasPack = input.unpackError === null && input.pack.packBytes > 0;
     if (hasPack) {
-      const id = packId ?? store.packs.nextPackId(); // 0-entry packs never allocated one
-      store.packs.recordPack(id, input.pack.packBytes, input.pack.packKey);
+      // A zero-object pack (the tips the server already has — e.g. pushing a
+      // second branch that points at a known commit) never lands an index
+      // row, so the lease payload carries no pack name. Derive it from the
+      // pack's own trailer hash — exactly the name the Worker used for the
+      // final R2 keys. A pack WITH objects must have landed rows through
+      // putIndexRows (any row-landing failure sets unpackError, which
+      // already forces hasPack false); a missing name there stays a reject.
+      const name = packName ?? (input.pack.objectCount === 0 ? catalogPackName(input.pack.packSha1) : null);
+      if (!name || !isValidPackName(name)) {
+        return {
+          lost: false as const,
+          results: input.commands.map((c) => ({ ref: c.ref, ok: false, msg: "unpacker error" })),
+          changed: false,
+          needsGc: false,
+        };
+      }
+      const derived = packR2Key(leaseData.storageKey ?? "", name);
+      if (input.pack.packKey !== derived) {
+        return {
+          lost: false as const,
+          results: input.commands.map((c) => ({ ref: c.ref, ok: false, msg: "unpacker error" })),
+          changed: false,
+          needsGc: false,
+        };
+      }
+      store.packs.recordPack(name, input.pack.packBytes, input.pack.idxBytes);
     }
     // DO-side guard for "no ref may point into unindexed storage": every
     // non-null new tip must be present in the store before the CAS commits
@@ -415,6 +538,9 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
 
   if (needsGc) {
     store.setMeta("gc-pending", "1");
+    // the formal M3 trigger key (SPEC-0001 §4): written alongside the M2
+    // gc-pending flag; compaction consumes it, nothing reads it yet
+    store.setMeta("compaction_wanted_at", String(Date.now()));
     try {
       await host.storage.setAlarm(Date.now() + 5 * 60 * 1000);
     } catch (err) {
@@ -461,10 +587,100 @@ export async function releaseReceive(host: LeaseHost, input: ReleaseReceiveInput
   host.store.deleteLease(input.leaseToken);
   if (input.sweep) {
     const payload = parseLeasePayload(lease.payload);
-    if (typeof payload.packId === "number") host.store.packs.sweepPackRows(payload.packId);
+    if (payload.packName) host.store.packs.sweepPackRows(payload.packName);
     if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
   }
   return { tag: "released" };
+}
+
+// ---- repo lifecycle RPCs (SPEC-0003 §2.5.5) ---------------------------------
+
+export type MarkDeletedResult = { tag: "ok" };
+
+/**
+ * Tombstone the repo (delete pipeline step 2, AFTER the D1 row is gone).
+ * Sets meta.deleted=1 in one transaction; idempotent. Effects:
+ *   - beginReceive refuses new leases ("repository deleted");
+ *   - finalizeReceive on a repo tombstoned mid-flight aborts inside its commit
+ *     transaction, releases the lease, and sweeps the staging object;
+ *   - reads/refs keep answering until destroy() (nothing can reach them once
+ *     the D1 row is gone, and refs never dangle because they live here).
+ * Deliberately does NOT wait out an active receive lease: the pipeline's step
+ * 1 already removed the D1 row, so any in-flight push is doomed regardless.
+ */
+export function markDeleted(host: LeaseHost): MarkDeletedResult {
+  host.storage.transactionSync(() => {
+    host.store.setMeta("deleted", "1");
+  });
+  return { tag: "ok" };
+}
+
+export type DestroyResult = { tag: "ok" };
+
+/**
+ * Destroy the repo cell (delete pipeline step 4, AFTER the R2 prefix purge —
+ * this does NOT touch R2): one transactional wipe (SQLite schema dropped and
+ * re-created empty — Rule 3, no blockConcurrencyWhile), alarm cleared, then
+ * the registry row removed via the host hook. Idempotent: destroying a
+ * destroyed (or never-created) cell re-initializes an empty one. The caller
+ * should have called markDeleted first (SPEC-0003 §2.5.5 order: D1 row →
+ * tombstone → queue purge → destroy), but destroy does not require it.
+ */
+export async function destroy(host: LeaseHost): Promise<DestroyResult> {
+  const name = host.store.getMeta("repo") ?? host.store.getMeta("storage_key") ?? "";
+  // one transaction: the whole wipe (drop + re-create) is atomic for callers
+  host.storage.transactionSync(() => {
+    host.store.wipe();
+  });
+  try {
+    await host.storage.deleteAlarm();
+  } catch {
+    // no alarm set, or the alarm store is busy — nothing to sweep either way
+  }
+  if (host.removeFromRegistry && name) {
+    try {
+      await host.removeFromRegistry(name);
+    } catch (err) {
+      // best effort: the queue consumer removes the row independently
+      console.log(`[destroy ${name}] registry remove failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return { tag: "ok" };
+}
+
+export type SetHeadResult =
+  | { tag: "ok"; head: string }
+  | { tag: "invalid"; reason: string }
+  | { tag: "not_found" };
+
+/**
+ * Default-branch setter (SPEC-0003 §2.5.2: later explicit default-branch
+ * changes update DO meta.head via CAS). Accepts a bare branch name or a full
+ * `refs/heads/...` ref; anything else (tags, invalid names) is `invalid`. The
+ * branch may be unborn on an empty repo (the instance default), but on a repo
+ * with branches the target must exist — `not_found` otherwise. Bumps
+ * refs_version: HEAD changes the advertisement (symref capability, HEAD
+ * advert line) and the clone-cache key.
+ */
+export function setHead(host: LeaseHost, branch: string): SetHeadResult {
+  const { store } = host;
+  const refName = branch.startsWith("refs/heads/") ? branch : `refs/heads/${branch}`;
+  if (!validRefName(refName)) {
+    return { tag: "invalid", reason: `not a valid branch name: ${branch}` };
+  }
+  const short = refName.slice("refs/heads/".length);
+  if (!short) {
+    return { tag: "invalid", reason: `not a branch name: ${branch}` };
+  }
+  const branches = store.refs().filter((r) => r.name.startsWith("refs/heads/"));
+  if (branches.length > 0 && !branches.some((b) => b.name === refName)) {
+    return { tag: "not_found" };
+  }
+  host.storage.transactionSync(() => {
+    store.setHead(refName);
+    store.bumpRefsVersion();
+  });
+  return { tag: "ok", head: refName };
 }
 
 /** The zero pack a deletes-only push carries (see the semantics notes above). */
