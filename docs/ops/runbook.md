@@ -52,8 +52,16 @@ set). New failures = regression.
 
 ```bash
 pnpm setup:deploy   # idempotent: ensure D1+R2, fill database_id, remote migrations
+pnpm build          # REQUIRED before deploy: wrangler deploys dist/cf_gitea's
+                    # generated config — a stale dist carries the old wrangler
+                    # state (a pre-fill dist caused a placeholder-database_id
+                    # deploy failure on first attempt)
 pnpm deploy         # wrangler deploy from apps/worker
 ```
+
+Live (first deploy 2026-10-24): **https://cf-gitea.hecongw.workers.dev** —
+smoke-verified end to end: remote admin bootstrap, PAT-authenticated
+create-by-push, `ls-remote`, Basic-auth token API, `last_used_at` updates.
 
 Cloud resources and IDs: `docs/ops/deploy-notes.md`. Secrets: `GIT_TOKEN` is
 declared required in wrangler.jsonc (`wrangler secret put GIT_TOKEN`) — used
