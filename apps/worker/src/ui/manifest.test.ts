@@ -24,7 +24,7 @@ const manifest: UiManifest = {
     css: ["css/secondary.3333cccc.css"],
   },
   "web_src/css/themes/theme-gitea-light.css": { file: "css/theme-gitea-light.4444dddd.css" },
-  "web_src/js/features/user-events.sharedworker.ts": { file: "js/user-events.5555eeee.js" },
+  "web_src/js/user-events.sharedworker.ts": { file: "js/user-events.5555eeee.js" },
 };
 
 const okAssets = { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) };
