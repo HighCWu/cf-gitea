@@ -44,9 +44,67 @@ PATH="$PWD/packages/git-engine/e2e/shim:$PATH" \
   packages/git-engine/e2e/e2e.sh http://127.0.0.1:5173/demo devtoken
 ```
 
-Expected at engine milestone M1: 32 passed / 35 failed where the 35 are the
-documented headless-UI allowlist (`.github/workflows/ci.yml` enforces the exact
-set). New failures = regression.
+Expected score, as of 2026-10-24 23:15 CST: **34 passed / 35 failed**, where the
+35 are the documented headless-UI allowlist (enforced as an exact-set gate by
+`.github/workflows/ci.yml`). History: at engine M1 the split was 32/35; commit
+59a0776 (SPEC-0001a Steps 3-4 + branch-create hotfix) added two zero-object-pack
+regression checks — both pass, so the pass line moved 32 → 34 while the
+allowlist rows stayed unchanged at 35 (69 checks total). New failures = regression.
+
+## Differential testing (git-CLI battery, `pnpm diff:test`)
+
+```bash
+pnpm diff:test -- --ours http://127.0.0.1:5173 --token <PAT>
+# optionally against a real Gitea (or any git smart-HTTP server):
+pnpm diff:test -- --ours http://127.0.0.1:5173 --token <PAT> \
+  --theirs https://gitea.example.com --theirs-token <PAT>
+```
+
+Runs the SAME real git-CLI commands (read + write batteries in
+`scripts/diff-cases/`, 10 cases) against "ours" (local dev or the deployed
+Worker) and, when `--theirs` is given, a reference server; the stored reports
+must differ only in ways the declared compatibility rules allow
+(`scripts/diff-cases/rules.mjs`). Without `--theirs` the run is an ours-only
+baseline snapshot for a future `--compare`. Reports land in
+`scripts/diff-report-*.json` (gitignored — compare pairs against the committed
+rules, not against the repo). Harness landed in 48903f8; not wired into CI.
+
+## LFS e2e (real git-lfs client, `pnpm test:lfs`)
+
+```bash
+pnpm test:lfs                        # or: bash scripts/lfs-e2e.sh [base-url]
+```
+
+33 checks exercising the REAL `git-lfs` binary against a running dev Worker:
+D1-backed push-create, >100 KB LFS push asserted via `GIT_TRACE_CURL` (batch /
+PUT / verify, `lfs_objects` row flipping to `verified`, R2 object hashing back
+to the oid), fresh-clone smudge byte-identity, no-reupload on re-push. All
+traffic goes through the relay store (local dev has no R2 S3 credentials).
+Requires `git-lfs` on PATH. Details: `scripts/lfs-e2e.README.md` (landed in
+0e48e77; CI wiring deliberately not in the script — the README carries the
+suggested job).
+
+## Import / mirror clients
+
+Landed vs in flight, as of 2026-10-24 23:15 CST (parallel import wave was
+mid-flight — verify with `git status` before relying on this split):
+
+- **`scripts/import-client.mjs`** — chunked import client, the SPEC-0003 §2.6
+  producer side: splits a repo's history into self-contained topo-ordered
+  commit windows (non-thin packs), uploads them through the Worker-relayed
+  chunk endpoint, starts the import with a validated manifest, polls until the
+  server lands the refs. Zero npm dependencies (git plumbing + fetch). **In
+  flight** — uncommitted at snapshot; depends on the server-side channel
+  (`apps/worker` imports routes/services + migration 0006) landing first.
+- **`scripts/import-batched-push.sh`** — client-side batched push, the
+  SPEC-0003 §2.7 fallback that needs no server changes: advances the branch
+  tip through topo-ordered windows so each push transfers only the thin-pack
+  delta since the previous tip. **In flight** — uncommitted at snapshot.
+- **SPEC-0009 mirror sync** (outbound smart-HTTP client, AES-GCM creds): spec
+  only — no client code landed yet.
+
+Use either import path for histories above the proxy body cap (see the 413
+entry under Troubleshooting).
 
 ## Deployment
 

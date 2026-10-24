@@ -155,6 +155,27 @@ stream one R2 GET body, not many ranged reads), DO row-write cost on monorepo im
 (≈ $1/M objects), SSH protocol not possible on Workers (HTTPS git only; Spectrum or a
 container would be needed if SSH is ever required).
 
+### Annex note — engine-landing verification (2026-10-24, commit 59a0776)
+
+Recorded while landing SPEC-0001a Steps 3-4 (storage_key addressing, pack_catalog,
+lifecycle RPCs); the same commit carried a hotfix and a companion discovery:
+
+- **e2e allowlist evolution, 32 → 34 passed.** The real-git suite grew from 67
+  checks (32 passed / 35 failed at M1) to 69 (34 passed / 35 failed): 59a0776 added
+  two zero-object-pack regression checks, and both pass. The headless-UI allowlist
+  itself did not move — it has stayed the same 35 rows since the CI exact-set gate
+  was introduced. The pass line is the quantity that evolved.
+- **Hotfix discovery 1 — branch create at a known tip.** A new branch pointing at a
+  commit the server already has pushes a ZERO-object pack; the new hasPack guard
+  introduced with pack_catalog rejected it. Fix: derive the pack name from the
+  trailer hash, restoring HEAD's zero-entry semantics, plus an asCommandResults
+  msg/message correction (both in 59a0776).
+- **Hotfix discovery 2 — LFS relay chunked hint.** The batch response's chunked
+  hint caused a 411 (Length Required) conflict on upload through the relay; the
+  hint was dropped and the `pnpm test:lfs` suite verified green (also 59a0776,
+  with the Worker-side unit expectations for the new relay-header shape pinned
+  in the follow-up test commit 5b08638).
+
 ## Rejected alternatives (summary)
 
 | Alternative | Why rejected |
