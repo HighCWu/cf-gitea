@@ -146,6 +146,14 @@ Implementation follows the SPEC; if the design changes during implementation, up
 - No `any` on `Env` or handler params; use generated and platform types. No `as unknown as T` casts to force type matches.
 - Local dev runs in **workerd, not Node** — Node-only APIs require `nodejs_compat`; prefer Web-standard APIs.
 - Local D1 data is dev-only scratch: schema changes must be applied to remote explicitly (`pnpm db:migrate:remote`).
+- **CPU vs wall (official limits, verified 2026-10-24)**: HTTP requests have
+  UNLIMITED wall time while the client stays connected; only CPU time counts
+  (waiting on fetch/R2/D1 is free), capped by `limits.cpu_ms` (we set the 5-min
+  maximum). Heavy work streams; never assume a wall-clock bound on request
+  handlers. `ctx.waitUntil` extends only 30 s past the response — sub-second
+  tasks only. **Cron triggers with intervals < 1 h get only 30 s CPU** (15 min
+  wall only for ≥1 h intervals); queue consumers get 15 min wall + the CPU
+  limit per invocation — crons enqueue, consumers do the work.
 
 ## Gitea Compatibility References
 
