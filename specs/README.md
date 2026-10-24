@@ -21,6 +21,7 @@ observed; "in flight" items were uncommitted or mid-wave at that time).
 | [0007](0007-orgs-teams.md) | Organizations & teams (tier-1 org endpoints) | accepted (org-as-user-row; teams deferred to tier-2 with stub) · **services + tier-1 org routes landed** (4495f3c, 4744cdd) | 0002, 0003 §2.5.6, 0004 tier-1 org paths | org storage decision, org grants |
 | [0008](0008-ui-tier2.md) | Tier-2 UI: asset reuse, Hono JSX pages, first slice | accepted · **U1-U2.5 landed** (assets + icon gen U1, shell U2, router module U2.5 mounted 893d3c9); **U3 three pages in flight** (pages/ holds only not-found at snapshot) | ADR-0001 D2, ui-tier2-plan, 0004 tier-1 | assets pipeline, DOM contract, page auth |
 | [0009](0009-mirrors-import.md) | Mirrors & import (outbound smart-HTTP client, AES-GCM creds) | accepted (draft→reviewed) | 0003 §2.6, 0001a pipeline, 0006 follow-up | mirror sync, import-from-URL, egress policy |
+| [0010](0010-ui-session.md) | UI session (PAT login, id:secret cookie, rotation) | draft — GATED (implement on private browsing / first UI write) | 0008 §2.5, 0002 §2.8 | sessions, viewer extension, CSRF stance |
 
 Supporting records: [ADR-0001](../docs/decisions/0001-technical-direction.md) (technical
 direction), [ADR-0002](../docs/decisions/0002-contract-freeze.md) (compatibility contract
