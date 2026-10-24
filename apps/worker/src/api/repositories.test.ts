@@ -7,24 +7,29 @@
  * runtime pagination headers.
  */
 
-import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users } from "../db/schema";
+import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
+import { REPO_SETTINGS_DDL_STATEMENTS } from "./services/repo-settings";
 import contract from "../compat/contract/v1-swagger.generated.json";
 
 // The vitest plugin's per-test storage isolation discards setupFiles-era D1
 // writes; schema from `beforeAll` migrations persists for the file (same
-// pattern as the SPEC-0002 suites, shared helper).
+// pattern as the SPEC-0002 suites, shared helper). repoGet overlays the
+// batch-7 repo_settings raw store — the documented SCHEMA GAP with no
+// migration yet — so its DDL-in-waiting is applied here too (the
+// testing/repo-ddl.ts umbrella does this for the whole batch; both bootstrap
+// calls disappear when the migration owner's sweep lands).
 beforeAll(async () => {
-  if (env.TEST_MIGRATIONS === undefined) {
-    throw new Error("TEST_MIGRATIONS binding missing — vitest.config.ts must inject readD1Migrations()");
+  await applyAuthD1Migrations();
+  for (const statement of REPO_SETTINGS_DDL_STATEMENTS) {
+    await env.DB.prepare(statement).run();
   }
-  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
 });
 
 beforeEach(async () => {
@@ -91,6 +96,7 @@ async function seedRepo(
   opts: {
     visibility?: "public" | "private";
     refsVersion?: number;
+    isEmpty?: boolean;
     id?: string;
     createdAt?: string;
     numIssues?: number;
@@ -105,6 +111,7 @@ async function seedRepo(
     slug,
     visibility: opts.visibility ?? "public",
     refsVersion: opts.refsVersion ?? 0,
+    isEmpty: opts.isEmpty ?? true,
     backend: "self-hosted",
     numIssues: opts.numIssues ?? 0,
     numPulls: opts.numPulls ?? 0,
@@ -140,7 +147,10 @@ describe("GET /repos/{owner}/{repo} (repoGet)", () => {
   it("fills D1-sourced fields and documented zero-defaults", async () => {
     const owner = await seedUser("Alice");
     await seedRepo(owner.usernameLower, "visible", {
-      refsVersion: 3,
+      // True post-settle row shape (push-create AND import settle): is_empty
+      // flipped, refs_version still 0 — D1's refs_version is observability-
+      // only (git-http/gate.ts §2.5.2) and must NOT drive the empty flag.
+      isEmpty: false,
       id: "101",
       numIssues: 2,
       numPulls: 1,

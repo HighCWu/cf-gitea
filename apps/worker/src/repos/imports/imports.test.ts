@@ -14,6 +14,7 @@ import { eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { REPO_SETTINGS_DDL_STATEMENTS } from "../../api/services/repo-settings";
 import { mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
 import { repoImports, repositories, users } from "../../db/schema";
 import { RepoService } from "../service";
@@ -33,7 +34,13 @@ import {
 import { cleanupAbortedImport, handleImportTask, indexChunk } from "./pipeline";
 
 beforeAll(async () => {
+  // The regression suite GETs the repo through the API; repoGet overlays the
+  // batch-7 repo_settings raw store — no migration yet (SCHEMA GAP), so its
+  // DDL-in-waiting is applied here (same bootstrap as api/testing/repo-ddl.ts).
   await applyAuthD1Migrations();
+  for (const statement of REPO_SETTINGS_DDL_STATEMENTS) {
+    await env.DB.prepare(statement).run();
+  }
 });
 
 beforeEach(async () => {
@@ -416,6 +423,31 @@ describe("import state machine (SPEC-0003 §2.6, §3.1)", () => {
     expect(repo.isEmpty).toBe(false);
     expect(repo.defaultBranch).toBe("trunk");
     expect((await service.get(row.id))?.state).toBe("done");
+  });
+
+  it("GET /repos/{owner}/{repo} reflects the settle both ways: empty:true before, empty:false after (refs_version stays 0)", async () => {
+    const { repoId } = await seedRepo("flagged");
+    const service = importService();
+    const { row } = await service.create(repoId);
+
+    // Fresh (post-create, mid-import) repo renders empty like upstream.
+    const before = await SELF.fetch(`${API}/repos/alice/flagged`);
+    expect(before.status).toBe(200);
+    expect((await before.json<Record<string, unknown>>()).empty).toBe(true);
+
+    await env.DB.prepare("UPDATE repo_imports SET state = 'finalizing' WHERE id = ?")
+      .bind(row.id)
+      .run();
+    await service.settleDone(row.id, "trunk");
+
+    // Regression: the settle flips is_empty but refs_version is
+    // observability-only and stays 0 — the API must read is_empty, or an
+    // imported repo renders empty:true (and size:0) forever.
+    const after = await SELF.fetch(`${API}/repos/alice/flagged`);
+    expect(after.status).toBe(200);
+    const body = await after.json<Record<string, unknown>>();
+    expect(body.empty).toBe(false);
+    expect(body.default_branch).toBe("trunk");
   });
 
   it("validateManifest is a pure contract over the staged record", () => {

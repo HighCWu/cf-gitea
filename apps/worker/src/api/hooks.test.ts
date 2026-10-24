@@ -13,6 +13,7 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users, webhookDeliveries, webhooks } from "../db/schema";
@@ -78,6 +79,7 @@ async function seedRepo(slug: string, refsVersion = 1): Promise<string> {
       slug,
       visibility: "public",
       refsVersion,
+      isEmpty: false, // settled non-empty: hook tests must fire (the empty early-204 reads is_empty)
       backend: "self-hosted",
       createdAt: new Date("2026-02-03T04:05:06Z"),
     })
@@ -460,7 +462,8 @@ describe("POST /repos/{owner}/{repo}/hooks/{id}/tests (repoTestHook)", () => {
   });
 
   it("204s an empty repository WITHOUT firing (upstream ctx.Repo.Commit == nil early return, hook unchecked)", async () => {
-    const repoId = await seedRepo("empty", 0); // refsVersion 0 ⇔ no commits
+    const repoId = await seedRepo("empty", 0);
+    await db().update(repositories).set({ isEmpty: true }).where(eq(repositories.id, repoId));
     await seedHook(repoId);
 
     const res = await router()("/repos/alice/empty/hooks/999999/tests", { method: "POST", headers: authHeaders });

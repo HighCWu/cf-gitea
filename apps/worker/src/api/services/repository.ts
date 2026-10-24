@@ -7,6 +7,7 @@ import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
 import type { Permission, Repository } from "../models/repository";
 import type { User } from "../models/user";
+import type { RepoSettings } from "./repo-settings";
 
 /**
  * Repo-metadata reads backing the tier-1 `Repository` routes (SPEC-0004
@@ -22,9 +23,9 @@ import type { User } from "../models/user";
  */
 
 /** D1 row of the `repositories` table (src/db/schema.ts). */
-type RepositoryRow = typeof repositories.$inferSelect;
+export type RepositoryRow = typeof repositories.$inferSelect;
 /** D1 row of the `users` table (src/db/schema.ts). */
-type UserRow = typeof users.$inferSelect;
+export type UserRow = typeof users.$inferSelect;
 
 /**
  * `{origin}/api/v1/repos/{owner}/{repo}` — upstream `Repository.APIURL`
@@ -69,8 +70,8 @@ export const GO_ZERO_TIME = "0001-01-01T00:00:00Z";
 /**
  * Upstream's default branch for new repositories
  * (gitea/modules/setting/repository.go `Repository.DefaultBranch = "main"`).
- * TODO(SPEC-0005): `repositories.default_branch` column — repos cannot rename
- * their default branch until repo lifecycle lands anyway.
+ * Kept for callers that need the instance default; the converter renders the
+ * row's `default_branch` column (SPEC-0003 §3.1, editable via repoEdit).
  */
 export const DEFAULT_BRANCH = "main";
 
@@ -170,8 +171,13 @@ function repositoryIdNumber(id: string): number {
  * The four upstream-`omitempty` reference fields that stay nil for our data
  * (`parent`, `external_tracker`, `external_wiki`, `repo_transfer`) and
  * `default_target_branch` (empty string) are omitted, exactly like Go.
+ *
+ * `settings` overlays the repo-edit stored subset (services/repo-settings.ts
+ * — description/website/has_*) when the caller loaded it; list/search paths
+ * keep the upstream defaults (the settings row is the not-yet-swept column
+ * store, same discipline as the TODO(SPEC-0005) zero-defaults below).
  */
-export function toApiRepository(viewer: Viewer, pair: RepositoryWithOwner): Repository {
+export function toApiRepository(viewer: Viewer, pair: RepositoryWithOwner, settings?: RepoSettings): Repository {
   const { repo: row, owner } = pair;
   const ownerNamespace = encodeURIComponent(row.ownerNamespace);
   const slug = encodeURIComponent(row.slug);
@@ -184,10 +190,14 @@ export function toApiRepository(viewer: Viewer, pair: RepositoryWithOwner): Repo
     owner: apiUserFromRow(owner, viewer),
     name: row.slug,
     full_name: `${row.ownerNamespace}/${row.slug}`,
-    description: "", // TODO(SPEC-0005): description column
-    // refs_version bumps on every push (SPEC-0001 §5), so zero pushes ⇔ the
-    // upstream `IsEmpty` flag. TODO(SPEC-0005): dedicated is_empty column.
-    empty: row.refsVersion === 0,
+    description: settings?.description ?? "", // TODO(SPEC-0005): description column (repo_settings until the sweep)
+    // Upstream `IsEmpty` — the dedicated D1 column (SPEC-0003 §3.1) that both
+    // real transitions flip: the push-create settle (git-http/gate.ts §2.5.2)
+    // and the import settle (repos/imports/service.ts settleDone). D1's
+    // refs_version is observability-only — deliberately never synced from the
+    // engine (gate.ts §2.5.2) — so it cannot proxy "has content": an imported
+    // repo keeps refs_version 0 while holding a full history.
+    empty: row.isEmpty,
     private: row.visibility === "private",
     fork: false, // TODO(SPEC-0005): forks (SPEC-0003 fork primitives)
     template: false, // TODO(SPEC-0005): is_template column
@@ -203,7 +213,7 @@ export function toApiRepository(viewer: Viewer, pair: RepositoryWithOwner): Repo
     ssh_url: `git@${sshHost}:${ownerNamespace}/${slug}.git`,
     clone_url: `${htmlUrl}.git`,
     original_url: "",
-    website: "", // TODO(SPEC-0005): website column
+    website: settings?.website ?? "", // TODO(SPEC-0005): website column (repo_settings until the sweep)
     stars_count: 0, // TODO(SPEC-0005): stars table (engine counters)
     forks_count: 0,
     watchers_count: 0,
@@ -212,26 +222,26 @@ export function toApiRepository(viewer: Viewer, pair: RepositoryWithOwner): Repo
     open_issues_count: row.numIssues,
     open_pr_counter: row.numPulls,
     release_counter: 0, // TODO(SPEC-0005): releases table
-    default_branch: DEFAULT_BRANCH,
+    default_branch: row.defaultBranch,
     created_at: createdIso,
     updated_at: createdIso, // TODO(SPEC-0005): updated_unix column (starts == created)
-    archived: false, // TODO(SPEC-0005): is_archived column
+    archived: row.isArchived,
     archived_at: GO_ZERO_TIME,
     permissions: repositoryPermissions(viewer, row),
     has_code: true,
-    has_issues: true,
+    has_issues: settings?.hasIssues ?? true,
     internal_tracker: {
       enable_time_tracker: true,
       allow_only_contributors_to_track_time: true,
       enable_issue_dependencies: true,
     },
-    has_wiki: true,
-    has_pull_requests: true,
-    has_projects: false,
+    has_wiki: settings?.hasWiki ?? true,
+    has_pull_requests: settings?.hasPullRequests ?? true,
+    has_projects: settings?.hasProjects ?? false,
     projects_mode: "all",
-    has_releases: true,
-    has_packages: false,
-    has_actions: false,
+    has_releases: settings?.hasReleases ?? true,
+    has_packages: settings?.hasPackages ?? false,
+    has_actions: settings?.hasActions ?? false,
     ignore_whitespace_conflicts: false,
     // PR-unit defaults from upstream DefaultPullRequestsConfig + ToRepo.
     allow_merge_commits: true,

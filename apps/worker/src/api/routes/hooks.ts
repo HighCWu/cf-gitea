@@ -298,10 +298,10 @@ export function registerHookRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Middle
   app.openapi(testHookRoute(requireAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
     // Upstream: a repo without commits fires nothing (TestHook's
-    // `ctx.Repo.Commit == nil` early-204). The landed registry's
-    // zero-pushes ⇔ no-commits equivalence is the Repository converter's
-    // `empty` predicate (refs_version bumps on every push, SPEC-0001 §5).
-    if (found.repo.refsVersion === 0) {
+    // `ctx.Repo.Commit == nil` early-204). The is_empty flag is the
+    // settled truth (push-create and import settles both write it; the
+    // refs_version column is observability-only and never synced).
+    if (found.repo.isEmpty) {
       return c.body(null, 204);
     }
     const { id } = c.req.valid("param");
