@@ -19,17 +19,10 @@ import { isCfGiteaTokenShape, tokenLookupPrefix } from "./token-format";
 function rng(seed: number): () => number {
   let h = seed + 0x9e3779b9;
   const mix = (): number => {
-    h ^= h >>> 16;
-    h = Math.imul(h, 0x85ebca6b);
-    h ^= h >>> 13;
-    h = Math.imul(h, 0xc2b2ae35);
-    h ^= h >>> 16;
-    return h >>> 0;
+    h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13;
+    h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
   };
   let a = mix();
-  let b = mix();
-  let c = mix();
-  let d = mix();
   return () => {
     a >>>= 0; a = (a + 0x6d2b79f5) >>> 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
@@ -46,18 +39,27 @@ const seedString = (rand: () => number, maxLen: number): string => {
   return s;
 };
 
+/** Pure-random strings almost never carry a valid scheme word — bias part of
+ *  the corpus with real prefixes so the parse-hit sanity check can hold. */
+const SCHEMES = ["Basic ", "basic ", "token ", "TOKEN ", "Bearer ", "bEaReR "];
+const fuzzHeader = (rand: () => number): string => {
+  const body = seedString(rand, 120);
+  if (rand() < 0.25) return SCHEMES[Math.floor(rand() * SCHEMES.length)] + body;
+  return body;
+};
+
 describe("fuzz: Authorization header parsing never throws", () => {
   it("50k seeded random header values produce typed outcomes only", () => {
     const rand = rng(42);
     let bears = 0;
     let basics = 0;
     for (let i = 0; i < 50_000; i++) {
-      const value = seedString(rand, 120);
+      const value = fuzzHeader(rand);
       let parsed: unknown;
       try {
         parsed = parseAuthorizationHeader(value);
       } catch (e) {
-        throw new Error(`parseAuthorizationHeader threw on input #${i}: ${String(e)}`);
+        throw new Error(`parseAuthorizationHeader threw on input #${i}: ${String(e)}`, { cause: e });
       }
       if (parsed === null) continue;
       // Real shape: { basicAuth | null, bearerToken | null } (httpauth.ts)
@@ -73,8 +75,7 @@ describe("fuzz: Authorization header parsing never throws", () => {
     for (let i = 0; i < 10_000; i++) {
       const header = { scheme: "basic", token: seedString(rand, 80), user: "", password: "" };
       expect(() => basicAuthTokenCandidate(header as never)).not.toThrow();
-    }
-  });
+    }  });
 });
 
 describe("fuzz: token shape helpers are total functions", () => {

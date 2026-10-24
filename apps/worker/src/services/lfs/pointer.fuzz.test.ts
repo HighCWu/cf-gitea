@@ -20,7 +20,7 @@ function rng(seed: number): () => number {
     h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13;
     h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; return h >>> 0;
   };
-  let a = mix(); let b = mix(); let c = mix(); let d = mix();
+  let a = mix();
   return () => {
     a >>>= 0; a = (a + 0x6d2b79f5) >>> 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
@@ -34,7 +34,6 @@ const TYPED = [PointerTooLargeError, NotAPointerError, InvalidPointerError];
 describe("fuzz: pointer parser throws only typed errors", () => {
   it("30k random payloads (both strict modes) stay within the error contract", () => {
     const rand = rng(1234);
-    let parsed = 0;
     for (let i = 0; i < 30_000; i++) {
       const len = Math.floor(rand() * 1400);
       const bytes = new Uint8Array(len);
@@ -47,12 +46,11 @@ describe("fuzz: pointer parser throws only typed errors", () => {
       }
       for (const strict of [true, false]) {
         try {
-          const result = parsePointer(bytes, { strict });
-          if (result !== null) parsed++;
+          parsePointer(bytes, { strict });
         } catch (e) {
           const typed = TYPED.some((cls) => e instanceof cls);
           if (!typed) {
-            throw new Error(`unexpected throw on input #${i} strict=${strict}: ${String(e)}`);
+            throw new Error(`unexpected throw on input #${i} strict=${strict}: ${String(e)}`, { cause: e });
           }
         }
       }
