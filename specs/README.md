@@ -16,7 +16,8 @@ not yet ratified for implementation), **accepted** (orchestrator-reviewed, imple
 | [0005](0005-issues-prs-webhooks.md) | Issues, PRs, releases, webhooks | accepted | 0004, 0001a §4 | D1 issue/PR/release/webhook schema, Queues delivery |
 | [0006](0006-lfs.md) | Git LFS (batch API, R2 presign/relay, GC) | accepted | 0003, 0004 media route | lfs/ prefix, lfs_objects, sweeps |
 | [0007](0007-orgs-teams.md) | Organizations & teams (tier-1 org endpoints) | accepted (org-as-user-row; teams deferred to tier-2 with stub) | 0002, 0003 §2.5.6, 0004 tier-1 org paths | org storage decision, org grants |
-| [0008](0008-ui-tier2.md) | Tier-2 UI: asset reuse, Hono JSX pages, first slice | in flight (built on docs/ui-tier2-plan.md spike) | ADR-0001 D2, ui-tier2-plan, 0004 tier-1 | assets pipeline, DOM contract, page auth |
+| [0008](0008-ui-tier2.md) | Tier-2 UI: asset reuse, Hono JSX pages, first slice | accepted · U1 TS-half + assets landed; U2 shell in flight | ADR-0001 D2, ui-tier2-plan, 0004 tier-1 | assets pipeline, DOM contract, page auth |
+| [0009](0009-mirrors-import.md) | Mirrors & import (outbound smart-HTTP client, AES-GCM creds) | accepted (draft→reviewed) | 0003 §2.6, 0001a pipeline, 0006 follow-up | mirror sync, import-from-URL, egress policy |
 
 Supporting records: [ADR-0001](../docs/decisions/0001-technical-direction.md) (technical
 direction), [ADR-0002](../docs/decisions/0002-contract-freeze.md) (compatibility contract
