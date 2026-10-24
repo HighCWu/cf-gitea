@@ -228,7 +228,9 @@ inlined) — the rule is harmless.
   expanding to exactly what upstream `AssetCSSLinks` produces (spike §4.1 note: for
   `index.ts` this is the single `css/index.<h8>.css`).
 - Failure mode: missing manifest file or missing required key (`iife.ts`, `index.ts`,
-  `theme-gitea-light.css`, `user-events.sharedworker.ts`) → typed `AssetBuildError` →
+  `theme-gitea-light.css`, `user-events.sharedworker.ts` — exact key
+  `web_src/js/user-events.sharedworker.ts`, verified against the real build's
+  manifest 2026-10-24; no `features/` prefix) → typed `AssetBuildError` →
   the shell answers **503 plain text** ("UI assets not built — run `pnpm build:assets`").
   Fail fast beats a broken page; git/API routes are unaffected because the assets
   config never routes them through the shell. Re-checked at every re-pin (§5.4).

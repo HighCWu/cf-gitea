@@ -27,7 +27,7 @@ const manifest: UiManifest = {
   "web_src/js/features/user-events.sharedworker.ts": { file: "js/user-events.5555eeee.js" },
 };
 
-const okAssets = { fetch: () => new Response(JSON.stringify(manifest), { status: 200 }) };
+const okAssets = { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) };
 
 describe("assetURI", () => {
   it("maps a manifest key to the served URI", () => {
@@ -71,14 +71,14 @@ describe("loadManifest", () => {
     resetManifestCache();
     const broken = { ...manifest };
     delete broken["web_src/js/iife.ts"];
-    const bad = { fetch: () => new Response(JSON.stringify(broken), { status: 200 }) };
+    const bad = { fetch: () => Promise.resolve(new Response(JSON.stringify(broken), { status: 200 })) };
     await expect(loadManifest(bad, "https://example.com/")).rejects.toThrow(/iife\.ts/);
     resetManifestCache();
   });
 
   it("fails fast on a non-200 manifest fetch", async () => {
     resetManifestCache();
-    const missing = { fetch: () => new Response("not found", { status: 404 }) };
+    const missing = { fetch: () => Promise.resolve(new Response("not found", { status: 404 })) };
     await expect(loadManifest(missing, "https://example.com/")).rejects.toThrow(/build:assets/);
     resetManifestCache();
   });
