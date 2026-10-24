@@ -20,3 +20,4 @@ coverage/
 .bench-fixtures/
 .bench-results/
 apps/worker/public/assets/
+**/worker-configuration.d.ts
