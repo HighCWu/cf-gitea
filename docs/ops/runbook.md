@@ -44,12 +44,16 @@ PATH="$PWD/packages/git-engine/e2e/shim:$PATH" \
   packages/git-engine/e2e/e2e.sh http://127.0.0.1:5173/demo devtoken
 ```
 
-Expected score, as of 2026-10-24 23:15 CST: **34 passed / 35 failed**, where the
+Expected score, as of 2026-10-25 02:20 CST: **34 passed / 35 failed**, where the
 35 are the documented headless-UI allowlist (enforced as an exact-set gate by
 `.github/workflows/ci.yml`). History: at engine M1 the split was 32/35; commit
 59a0776 (SPEC-0001a Steps 3-4 + branch-create hotfix) added two zero-object-pack
 regression checks — both pass, so the pass line moved 32 → 34 while the
-allowlist rows stayed unchanged at 35 (69 checks total). New failures = regression.
+allowlist rows stayed unchanged at 35 (69 checks total). The SPEC-0001b
+merge/fork/invariants waves added their gates as separate tsx check scripts
+(`packages/git-engine/e2e/check-merge-*.mjs`, `check-fork-replicate.mjs`,
+`check-catalog-rpc.mjs`, `check-deepen-parse.mjs`), not e2e.sh rows, so this
+score has not moved since. New failures = regression.
 
 ## Differential testing (git-CLI battery, `pnpm diff:test`)
 
@@ -61,13 +65,16 @@ pnpm diff:test -- --ours http://127.0.0.1:5173 --token <PAT> \
 ```
 
 Runs the SAME real git-CLI commands (read + write batteries in
-`scripts/diff-cases/`, 10 cases) against "ours" (local dev or the deployed
-Worker) and, when `--theirs` is given, a reference server; the stored reports
-must differ only in ways the declared compatibility rules allow
+`scripts/diff-cases/`, 10 cases — 6 read + 4 write) against "ours" (local dev or
+the deployed Worker) and, when `--theirs` is given, a reference server; the
+stored reports must differ only in ways the declared compatibility rules allow
 (`scripts/diff-cases/rules.mjs`). Without `--theirs` the run is an ours-only
 baseline snapshot for a future `--compare`. Reports land in
 `scripts/diff-report-*.json` (gitignored — compare pairs against the committed
-rules, not against the repo). Harness landed in 48903f8; not wired into CI.
+rules, not against the repo). Harness landed in 48903f8; the `--theirs` compare
+mode has been exercised for real (compare reports from 2026-10-24 runs exist
+alongside ours-only baselines). Not wired into CI — run it before claiming a
+compatibility regression is fixed.
 
 ## LFS e2e (real git-lfs client, `pnpm test:lfs`)
 
@@ -84,27 +91,90 @@ Requires `git-lfs` on PATH. Details: `scripts/lfs-e2e.README.md` (landed in
 0e48e77; CI wiring deliberately not in the script — the README carries the
 suggested job).
 
-## Import / mirror clients
+## Import / mirror clients (final state, 2026-10-25 02:20 CST)
 
-Landed vs in flight, as of 2026-10-24 23:15 CST (parallel import wave was
-mid-flight — verify with `git status` before relying on this split):
+All three clients are landed and committed; the Worker-side mirror-sync half of
+SPEC-0009 is the only outstanding piece of this family.
 
 - **`scripts/import-client.mjs`** — chunked import client, the SPEC-0003 §2.6
   producer side: splits a repo's history into self-contained topo-ordered
   commit windows (non-thin packs), uploads them through the Worker-relayed
   chunk endpoint, starts the import with a validated manifest, polls until the
-  server lands the refs. Zero npm dependencies (git plumbing + fetch). **In
-  flight** — uncommitted at snapshot; depends on the server-side channel
-  (`apps/worker` imports routes/services + migration 0006) landing first.
+  server lands the refs. Zero npm dependencies (git plumbing + fetch).
+  **Landed** in 09132c1 together with the server-side channel
+  (`apps/worker` imports routes/services + migration 0006).
 - **`scripts/import-batched-push.sh`** — client-side batched push, the
   SPEC-0003 §2.7 fallback that needs no server changes: advances the branch
   tip through topo-ordered windows so each push transfers only the thin-pack
-  delta since the previous tip. **In flight** — uncommitted at snapshot.
-- **SPEC-0009 mirror sync** (outbound smart-HTTP client, AES-GCM creds): spec
-  only — no client code landed yet.
+  delta since the previous tip. **Landed** in 09132c1.
+- **`scripts/mirror-import.mjs`** — the SPEC-0009 §2.6 import-from-URL
+  producer (ab56ec9, README in `scripts/mirror-import.README.md`): a real
+  outbound `git clone --mirror` of any https source, split into pack windows
+  and driven through the SAME import channel as a user upload. https-only by
+  policy (§1 divergence); credentials never in URLs/argv/logs; `--dry-run`
+  plans locally; `--resume <id>` re-enters an import.
+- **SPEC-0009 mirror sync, Worker half** (outbound smart-HTTP client,
+  `services/mirror/gitclient.ts`, AES-GCM creds): **not landed** — spec only.
+  Until it exists, scheduled pull-mirroring means running `mirror-import.mjs`
+  from a cron/CI machine.
 
 Use either import path for histories above the proxy body cap (see the 413
 entry under Troubleshooting).
+
+## Repository invariant checker
+
+The periodic-prover item from the external review
+(`docs/design/m3-design-inputs.md`): for every repository, prove that every
+advertised ref points at an existing, readable object, that reachable closures
+are complete, that a terminal push leaves no dangling staging, and that the
+DO's `pack_catalog` and the REPO_PACKS bucket agree in both directions
+(c91135d + 53276b7). Code: `apps/worker/src/invariants/` (`check.ts` per-repo
+walker over the engine's public read RPCs + R2 probes; `run-all.ts` the
+fleet-wide sweep). Exercised today by the vitest suite
+(`apps/worker/src/invariants/invariants.test.ts` — healthy-repo passes,
+injected-violation detection, budget/partial semantics); **the production
+wiring below is not connected yet** (no consumer guard in
+`apps/worker/src/repos/purge.ts`, no cron in `wrangler.jsonc` as of
+2026-10-25 02:20 CST).
+
+Two invocation shapes, both bounded per invocation (crons enqueue, consumers
+do the work):
+
+- `enqueueRepoInvariantChecks(env)` — pages the `repositories` table and
+  sends one REPO_TASKS message per repo (`{kind: "invariant-check",
+  engineName, storageKey}`). Consuming needs one guard clause at the top of
+  the shared consumer's message loop (`src/repos/purge.ts`):
+
+  ```ts
+  import { isInvariantCheckMessage, handleInvariantCheckMessage } from "./invariants/run-all";
+  // inside the batch loop, before the purge/import dispatch:
+  if (isInvariantCheckMessage(message.body)) {
+    await handleInvariantCheckMessage(env, message.body);
+    message.ack();
+    continue;
+  }
+  ```
+
+- `runAllInvariantChecks(env, { maxRepos })` — enumerate + check inline, for
+  an admin endpoint or a small fleet. Cron wiring sketch for `wrangler.jsonc`
+  (every 6 h) plus the scheduled handler:
+
+  ```jsonc
+  "triggers": { "crons": ["0 0,6,12,18 * * *"] }
+  // export default { …, async scheduled(_event, env, _ctx) {
+  //   await enqueueRepoInvariantChecks(env, {});
+  // } }
+  ```
+
+Semantics an operator should know: repos in `creating`/`migrating` status are
+skipped (engine cells not settled yet); content violations are reported and
+acked (facts, not failures) — only transport-class faults throw so the queue
+retries; `partial: true` in a report means a budget stopped the proof early,
+so `ok` asserts less, never more. Detection horizon: the DO's GitStore cache
+keeps every commit that was EVER a ref tip readable until the cell recycles,
+so ref-tip-level faults on such commits surface only after eviction — trees,
+blobs, never-advertised ancestors, and catalog↔R2 mismatches are observed
+immediately.
 
 ## Deployment
 

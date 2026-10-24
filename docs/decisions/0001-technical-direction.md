@@ -176,6 +176,65 @@ lifecycle RPCs); the same commit carried a hotfix and a companion discovery:
   with the Worker-side unit expectations for the new relay-header shape pinned
   in the follow-up test commit 5b08638).
 
+### Annex note — merge/fork/invariants wave and corrections timeline (2026-10-25)
+
+Recorded at the build session's final docs panorama (snapshot 02:20 CST), while
+REG-MERGE-2 — the batch-8 router registration — sat in the working tree,
+uncommitted. Timeline with hashes, newest last:
+
+- **3b30ba3 — SPEC-0001b merge surface.** Merge-base/graph/diff3/tree-merge/
+  rebase/patch-id primitives plus the `checkMergeability`/`executeMerge`/
+  `rebaseOnto`/`deleteApiRef` RPCs and the SPEC-0001a §4 commit builder
+  (`commitApiChange`). Diff3 is differential-tested byte-exact against
+  `git merge-file`; tree merge and rebase are STRUCTURAL PORTS of gitorange
+  @ b3d5b08 (Apache-2.0) with the provenance + per-file CHANGES statement
+  recorded in `packages/git-engine/NOTICE.md` (the fork/invariants waves took
+  NOTICE.md to 105 adaptation lines).
+- **0223cb9 — SPEC-0001b §5 fork machinery.** Catalog-replication RPCs
+  (`listCatalogPage`/`beginForkImport`/`adoptForkPacks`/`finalizeForkImport`)
+  and the Worker consumer loop. VERIFIED DEVIATION from the SPEC's wording:
+  the R2 binding has NO server-side copy (workerd#1349), so §5.2's
+  "N_packs server-side copy ops" is N_packs worker-mediated streaming copies —
+  the cost properties (opaque bytes, one bucket, r2keys-derived keys) hold.
+  50-check gate (`e2e/check-fork-replicate.mjs`) judges the fork by REAL git:
+  clone parity, `fsck --strict`, rev-list counts, R2 byte equality, crash
+  injection between adopt pages. The fork→PR relay needed ZERO new engine code.
+- **c91135d + 53276b7 — the invariant checker** (external-review backlog
+  item). c91135d landed the per-repo prover over the engine's public read
+  surface (ref closure, reachable-closure completeness, dangling-staging);
+  53276b7 landed the second half, the catalog↔R2 cross-check, on a new
+  lease-free `listPackCatalog` RPC (all lifecycle states visible — a
+  superseded row's object may legitimately be gone). Consumer guard + cron
+  wiring deliberately NOT connected yet; runbook carries the snippet.
+- **0946236 — empty-reads correction, the settled truth.** An earlier
+  empty-repo shortcut (`refs_version === 0` ⇒ empty) predated the
+  `is_empty` column: both settles (push-create, import) write the flag while
+  `refs_version` is observability-only and never synced, so a repo that had
+  just settled an import still read as empty. Converter now reads
+  `row.isEmpty` (upstream `innerToRepo` parity); the hooks test-fire
+  early-204 predicate aligned; regression pins the GET-before/after-import
+  flip with `refs_version` still 0. Lesson recorded: never derive product
+  state from an observability counter.
+- **f9b4ef5 / 48ae608 / 6b699aa — batch 8 + stragglers.** f9b4ef5 completed
+  tier-1 batch 8 (the engine-read block: branches/tags/git-blobs/contents/
+  commits — "67 ops at merge; tree 69/78, 115/129 with prior regs" in the
+  message), 48ae608 added release-asset upload/download, 6b699aa landed
+  migration 0008 (stars + user_settings, the fourth DDL sweep).
+- **ceb1106 — duplicate trio dropped.** The commit-pull trio existed twice
+  (a registered pure-D1 variant and batch 8's engine-resolving one); the
+  engine-resolving handler won, the duplicate was deleted, and the pure-D1
+  variant's upstream-exact 404 body is noted for a refinement follow-up.
+- **REG-MERGE-2 — in flight at snapshot.** The batch-8 + release-assets +
+  starred + user-settings router registration sat in the working tree at
+  02:17 CST with `pnpm check:api` reading **73/78 paths, 123/129
+  operations, PASS**, then was withdrawn before committing (02:20 CST:
+  committed HEAD and working tree both read 49/78, 85/129 again). All
+  batch-8 route modules are committed; only the registration rides. The
+  remaining 6 operations (archive download, diffpatch, forks, languages,
+  PR-merge DELETE) belong to the wave landing concurrently
+  (`routes/archive.ts`, `services/diffpatch.ts`, `services/forks.ts`
+  untracked at snapshot).
+
 ## Rejected alternatives (summary)
 
 | Alternative | Why rejected |
