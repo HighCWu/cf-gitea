@@ -30,6 +30,7 @@ import { registerLanguageRoutes } from "./routes/languages";
 import { registerMarkdownRoutes } from "./routes/markdown";
 import { registerMilestoneRoutes } from "./routes/milestones";
 import { registerMiscT2Routes } from "./routes/misc-t2";
+import { registerNotificationsRoutes } from "./routes/notifications";
 import { registerOrgRoutes } from "./routes/org-repos";
 import { registerOrgProfileRoutes } from "./routes/orgs";
 import { registerPullAutoMergeRoutes } from "./routes/pull-automerge";
@@ -181,6 +182,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerMiscT2Routes(app, requireAuth);
   // Tier-2 user reads: heatmap + current-following check.
   registerUserReadT2Routes(app, requireAuth, optionalAuth);
+  // Tier-2 notifications: derived threads over issue/comment activity; all
+  // seven ops reqToken (upstream reqToken on the whole tag).
+  registerNotificationsRoutes(app, requireAuth);
   // Tier-2 social listings (stargazers, subscribers, watched/starred repos
   // by user, the doer's following list). The repo listings ride optionalAuth
   // (upstream repoAssignment); the /user + /users listings requireAuth.
