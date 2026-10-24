@@ -15,6 +15,7 @@
  * consumer; it only ever reads rows this module wrote.
  */
 
+import type { DiffFileJson, DiffResult } from "@cf-gitea/git-engine";
 import { and, eq, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
@@ -232,4 +233,139 @@ export async function emitWebhookDeliveries(
     await options.enqueue(deliveryIds);
   }
   return { deliveryIds };
+}
+
+// ---------------------------------------------------------------------------
+// Push-payload commit file lists — §2.7 `PayloadCommit.added/removed/modified`
+// (the mirror-wave deviation #2). Upstream fills them in ToAPIPayloadCommit
+// (modules/repository/commits.go:72,91-93) through GetCommitFileStatus
+// (modules/git/commit_file.go:69-88): `git log --name-status -m --first-parent
+// --no-renames -z -1 <sha>` — i.e. ONE first-parent diff per commit (root
+// commits diff against the empty tree; `-m --first-parent` reduces a merge to
+// its first parent). Both the user-push path (services/repository/push.go:185-192
+// → services/webhook/notifier.go:662) and the mirror-sync path
+// (services/mirror/mirror_pull.go → notifier.go:903) funnel every payload
+// commit through that same mapper, so the enrichment below is the single
+// central step for both of ours.
+// ---------------------------------------------------------------------------
+
+/** The three per-commit file lists of upstream `api.PayloadCommit` (modules/structs/hook.go:170-175). */
+export interface CommitFileLists {
+  added: string[];
+  removed: string[];
+  modified: string[];
+}
+
+/**
+ * The diff-read slice the enrichment needs. Satisfied by the repo cell's
+ * `readDiff(id)` (packages/git-engine, repo.ts:760: one id = diff against the
+ * commit's first parent, root commits against the empty tree) and by the API
+ * layer's `EngineReads.readDiff` (src/api/services/engine.ts:116).
+ */
+export type CommitDiffRead = (id: string) => Promise<DiffResult | null>;
+
+/**
+ * File-type class of a tree-entry mode — the distinction git's --name-status
+ * `T` (typechange) letter is built on: regular file (100644/100755), symlink
+ * (120000), gitlink (160000). A mode change WITHIN a class is `M`; a change
+ * across classes is `T`.
+ */
+function modeClass(mode: string): "file" | "symlink" | "gitlink" {
+  if (mode === "120000") return "symlink";
+  if (mode === "160000") return "gitlink";
+  return "file";
+}
+
+/**
+ * Port of upstream's classification (parseCommitFileStatus,
+ * modules/git/commit_file.go:57-64, fed by GetCommitFileStatus :69-88 with
+ * `--no-renames`): exactly the A/D/M letters map into the three lists and every
+ * other letter is dropped. On the engine's structured DiffFileJson the letters
+ * are:
+ *   - `old === null` → `A` (added) — includes every file of a root commit,
+ *     because readDiff diffs a root against the empty tree (repo.ts:769-771);
+ *   - `new === null` → `D` (removed);
+ *   - both sides present, same mode class → `M` (modified — content and
+ *     exec-bit-only changes are both M upstream);
+ *   - both sides present, class changed (file↔symlink) → upstream's `T`,
+ *     which parseCommitFileStatus's switch has no case for (commit_file.go:57-64)
+ *     and is therefore dropped from all three lists.
+ * Renames: `--no-renames` disables rename detection upstream, so a rename is a
+ * removed(old path) + added(new path) pair, never a modified — the engine's
+ * computeDiff matches by path name with no rename detection either
+ * (packages/git-engine/src/repo.ts:1216-1227), mirroring that exactly.
+ *
+ * DEVIATIONS (documented, engine-boundary level):
+ *   - gitlink (submodule) paths never appear in readDiff output at all — the
+ *     engine's flattenTree excludes mode 160000 entries (repo.ts:1205-1212) —
+ *     while upstream's --name-status lists them as A/D/M.
+ *   - List order is the engine's lexicographic diff order, not git's tree
+ *     traversal order; per-status list contents are unaffected.
+ *   - The engine caps a per-commit diff at MAX_DIFF_FILES=100 paths
+ *     (repo.ts:94,1228, `truncated` flag); upstream lists every path.
+ *
+ * All three arrays are always present (possibly empty) — upstream initializes
+ * them to empty (commit_file.go:23-27) and PayloadCommit always carries them
+ * (commits.go:91-93).
+ */
+export function commitFileLists(files: readonly DiffFileJson[]): CommitFileLists {
+  const lists: CommitFileLists = { added: [], removed: [], modified: [] };
+  for (const file of files) {
+    if (file.old === null && file.new !== null) {
+      lists.added.push(file.path);
+    } else if (file.old !== null && file.new === null) {
+      lists.removed.push(file.path);
+    } else if (file.old !== null && file.new !== null && modeClass(file.old.mode) === modeClass(file.new.mode)) {
+      lists.modified.push(file.path);
+    }
+    // else: typechange (upstream `T`) — dropped, like upstream's switch.
+  }
+  return lists;
+}
+
+/**
+ * Outcome of `enrichCommitsWithFileLists`: either every commit carries the
+ * three lists, or the input array came back untouched (payload shape exactly
+ * as before the wave — lists omitted).
+ */
+export type CommitFileListEnrichment<C> = { enriched: true; commits: Array<C & CommitFileLists> } | { enriched: false; commits: readonly C[] };
+
+/**
+ * Fill `added`/`removed`/`modified` on already-rendered payload commits
+ * (anything with an `id`) before the payload is serialized — the step the
+ * push/mirror renderers call between `toPayloadCommit` and
+ * `emitWebhookDeliveries`. Cost discipline: exactly ONE readDiff per array
+ * element, sequential, nothing else — the payload window is capped at
+ * FEED_MAX_COMMIT_NUM=5 commits, so the ceiling is 5 diffs per event. The
+ * array is order-preserving (upstream renders commits in rev-list order and
+ * the lists ride along); the input objects are never mutated.
+ *
+ * Best-effort posture (the mirror-wave rule): a failed or unresolvable diff
+ * read degrades to the CURRENT payload shape — the whole enrichment is
+ * abandoned and the original array returns with the lists omitted — and this
+ * function never throws, so a diff failure can never fail a delivery. Upstream
+ * in contrast aborts the entire webhook when GetCommitFileStatus fails
+ * (commits.go:72-74 → notifier.go:662-665); keeping the list-less delivery is
+ * our documented deviation.
+ */
+export async function enrichCommitsWithFileLists<C extends { id: string }>(
+  commits: readonly C[],
+  readDiff: CommitDiffRead,
+): Promise<CommitFileListEnrichment<C>> {
+  const enriched: Array<C & CommitFileLists> = [];
+  for (const commit of commits) {
+    let diff: DiffResult | null;
+    try {
+      diff = await readDiff(commit.id);
+    } catch {
+      diff = null; // transport failure — same degradation as a null read
+    }
+    // A null diff (engine not-found or transport failure caught upstream)
+    // abandons the enrichment: lists omitted beats lists half-filled.
+    if (diff === null) {
+      return { enriched: false, commits };
+    }
+    enriched.push({ ...commit, ...commitFileLists(diff.files) });
+  }
+  return { enriched: true, commits: enriched };
 }
