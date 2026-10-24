@@ -55,6 +55,8 @@ const ctx: UiContext = {
     createdAt: new Date(1700000000 * 1000),
     updatedAt: null,
     forkParent: null,
+    isMirror: false,
+    originalUrl: null,
   } satisfies RepoRow,
 };
 

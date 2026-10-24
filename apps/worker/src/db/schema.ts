@@ -1,5 +1,5 @@
 import { desc, sql } from "drizzle-orm";
-import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { check, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 /**
  * D1 schema.
@@ -90,6 +90,21 @@ export const repositories = sqliteTable(
      *  `WHERE fork_parent = ?` scan (FindForks' `fork_id` lookup,
      *  fork.go:253) and findForkByOwner's one-fork-per-owner arbitration. */
     forkParent: text("fork_parent"),
+    // -------------------------------------------------------------------------
+    // SPEC-0009 §3.1 — the mirror edge (the sixth raw-DDL sweep: the wave's
+    // pinned DDL, read raw by services/mirror/sync.ts until migration 0010).
+    // Kept LAST like fork_parent above — ALTER TABLE ADD COLUMN physically
+    // appends, so the table_info order stays the migration order.
+    // -------------------------------------------------------------------------
+    /** Upstream `Repository.IsMirror` (models/repo/repo.go:189): the repo is
+     *  a pull mirror; its schedule/state lives in the 1:1 `repo_mirrors` row
+     *  (the UNIQUE repo_id there is the per-repo arbiter). */
+    isMirror: integer("is_mirror", { mode: "boolean" }).notNull().default(false),
+    /** Upstream `OriginalUrl` (repo.go:163) — the sanitized source URL
+     *  (userinfo stripped, modules/util/url.go:21-27). Nullable with no
+     *  default (the ALTER ADD COLUMN constraint): null for non-mirrors and
+     *  pre-existing rows. */
+    originalUrl: text("original_url"),
   },
   (t) => [
     // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point
@@ -1090,3 +1105,78 @@ export const userSettings = sqliteTable("user_settings", {
   hideEmail: integer("hide_email", { mode: "boolean" }).notNull().default(false),
   hideActivity: integer("hide_activity", { mode: "boolean" }).notNull().default(false),
 });
+
+// ---------------------------------------------------------------------------
+// SPEC-0009 §3.1 — pull-mirror schedule/state (the sixth raw-DDL sweep: the
+// wave's pinned DDL comment in services/mirror/sync.ts, ported verbatim into
+// this table; the sync service's raw reads/writes swapped one-for-one in the
+// same change). Upstream `Mirror`, models/repo/mirror.go:23-38.
+// ---------------------------------------------------------------------------
+
+/**
+ * One pull mirror per repository — `repo_id` UNIQUE is the per-repo
+ * arbitration point (upstream `GetMirrorByRepoID` assumes ≤ 1,
+ * mirror.go:80-88). Plain `repo_id` column (no FK) per the schema
+ * conventions above; rows are removed by the deleteRepository cascade
+ * (SPEC-0009 §4.3.13 → SPEC-0003 §2.5.5 step 1). Timestamps are unix
+ * seconds; `next_sync_at`/`last_sync_at` stay plain integers (no timestamp
+ * mode) because the sync arithmetic (`now + interval`), the due scan
+ * (`next_sync_at <= now AND next_sync_at != 0`) and the `0 = unscheduled`
+ * sentinel all work on raw numbers. The sync-state machine (§2.6):
+ *
+ *   idle --cron CAS--> queued --claim CAS--> syncing --success--> idle
+ *      \                     \                  \
+ *       \                     + delete race     + failure settle --> idle
+ *        + (any CAS loser is a no-op: 0 rows)    (next_sync_at stays due)
+ */
+export const repoMirrors = sqliteTable(
+  "repo_mirrors",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The mirrored repository's `repositories.id`; UNIQUE = one pull mirror
+     *  per repo. AAD half of the credential envelope (§4.2). */
+    repoId: text("repo_id").notNull().unique(),
+    /** Sync cadence seconds; `0` = disabled; validated ≥ MIRROR_MIN_INTERVAL
+     *  (default 600) unless 0 (upstream `Interval`/`ScheduleNextUpdate`,
+     *  mirror.go:71-77). 28800 = upstream's 8 h default. */
+    intervalSeconds: integer("interval_seconds").notNull().default(28800),
+    /** Delete remote-side refs that vanished upstream (§2.6 step 2). */
+    enablePrune: integer("enable_prune", { mode: "boolean" }).notNull().default(true),
+    /** Reserved for LFS mirroring (§1; upstream mirror.go:34-35) — created
+     *  now, unengineered until the LFS-mirror wave. */
+    lfsEnabled: integer("lfs_enabled", { mode: "boolean" }).notNull().default(false),
+    lfsEndpoint: text("lfs_endpoint"),
+    /** Sanitized source URL (userinfo stripped, modules/util/url.go:21-27) —
+     *  the egress gate re-checks THIS stored value on every sync (§4.1). */
+    remoteAddress: text("remote_address").notNull(),
+    /** Not secret (§3.1): upstream keeps it in the remote URL. */
+    credentialsUsername: text("credentials_username"),
+    /** AES-256-GCM over the full Authorization header value (§4.2), keyed by
+     *  the MIRROR_CREDENTIAL_KEY KEK, AAD-bound to `(mirror_id, repo_id)`. */
+    credentialsCiphertext: text("credentials_ciphertext"),
+    /** The enqueue/serialization guard (§2.6 step 1): `idle → queued` (cron
+     *  producer), `queued|idle → syncing` (consumer claim), back to `idle`
+     *  on settle. CHECK'd in DDL exactly like the sweep's pinned DDL. */
+    syncState: text("sync_state", { enum: ["idle", "queued", "syncing"] })
+      .notNull()
+      .default("idle"),
+    /** Next scheduled sync (unix seconds); `0` = unscheduled/disabled
+     *  (upstream `NextUpdateUnix`). */
+    nextSyncAt: integer("next_sync_at").notNull().default(0),
+    /** Last successful sync (unix seconds); null until the first one
+     *  (upstream `LastUpdateUnix`) — the due scan's oldest-first order key. */
+    lastSyncAt: integer("last_sync_at"),
+    /** Sanitized last failure (§2.6 step 5); cleared on success. Failure
+     *  leaves `next_sync_at` due so the next cron retries (upstream posture,
+     *  mirror_pull.go:303-308). */
+    lastError: text("last_error"),
+    createdAt: integer("created_at", { mode: "timestamp" })
+      .notNull()
+      .default(sql`(unixepoch())`),
+    /** Bumped by every CAS write (the sync service always sets it). */
+    updatedAt: integer("updated_at", { mode: "timestamp" })
+      .notNull()
+      .default(sql`(unixepoch())`),
+  },
+  (t) => [check("repo_mirrors_sync_state_check", sql`${t.syncState} IN ('idle', 'queued', 'syncing')`)],
+);

@@ -31,11 +31,13 @@
  *      (mirror_pull.go:303-308).
  *
  * SKELETON SCOPE (honest gaps, each with its landing wave):
- *   - `repo_mirrors` has no Drizzle schema/migration yet (the DDL comment
- *     below pins the §3.1 shape this module reads). The row reads here go
- *     through raw D1 against that exact shape; when the migration lands they
- *     move to Drizzle one-for-one. Until then a missing table surfaces as
- *     `skipped: "storage-pending"` — the skeleton never fakes a sync.
+ *   - `repo_mirrors` and the repositories mirror columns landed with
+ *     migration 0010 (the sixth raw-DDL sweep): the pinned §3.1 DDL is now
+ *     the `repoMirrors` Drizzle table in src/db/schema.ts, and the row
+ *     reads/writes below moved from raw D1 to Drizzle one-for-one. A D1 the
+ *     migration has not been applied to yet (e.g. a remote pending
+ *     db:migrate:remote) still surfaces as `skipped: "storage-pending"` —
+ *     the sync never fakes a sync.
  *   - Webhook notify per ref delta (§2.7) and `setHead` fixup on dangling
  *     HEAD (§4.3.8) are not driven yet; the command list returned in the
  *     result IS the updates delta that wave needs.
@@ -76,11 +78,11 @@
  *   // transfer inside it.
  */
 
-import { eq } from "drizzle-orm";
+import { and, eq, inArray, lte, ne, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { createDurableGit, type RefsResult } from "@cf-gitea/git-engine";
 
-import { repositories } from "../../db/schema";
+import { repoMirrors, repositories } from "../../db/schema";
 import { authorize } from "../../git-http/authorize";
 import { markGateCleared } from "../../git-http/gate";
 import { parseHostPolicy, type HostPolicy } from "../../webhooks/ssrf";
@@ -148,7 +150,7 @@ export interface MirrorSyncOptions {
 export type MirrorSyncSkip =
   | "missing-row" // repo or mirror row gone (a delete raced the sync, §2.6 step 1)
   | "busy" // sync_state CAS lost — another sync/import owns the repo
-  | "storage-pending" // repo_mirrors migration not applied yet (skeleton gap)
+  | "storage-pending" // repo_mirrors migration 0010 not applied to this D1
   | "egress-denied" // §4.1 re-check failed — recorded, retried by the cron
   | "no-changes"; // advertisement fully landed; nothing fetched
 
@@ -162,32 +164,21 @@ export interface MirrorSyncResult {
 }
 
 // ---------------------------------------------------------------------------
-// repo_mirrors — the SPEC-0009 §3.1 DDL this module reads (raw D1 until the
-// Drizzle schema + generated migration land; the column names below are the
-// contract the migration must satisfy)
+// repo_mirrors — the SPEC-0009 §3.1 DDL, now the Drizzle schema (the sixth
+// raw-DDL sweep: migration 0010 landed the table this module's pinned-DDL
+// comment used to describe, and the raw reads/writes below swapped to
+// Drizzle one-for-one)
 // ---------------------------------------------------------------------------
 
 /**
- * SPEC-0009 §3.1 (upstream Mirror, models/repo/mirror.go:23-38):
- *
- *   CREATE TABLE repo_mirrors (
- *     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
- *     repo_id                TEXT NOT NULL UNIQUE,          -- one pull mirror per repo
- *     interval_seconds       INTEGER NOT NULL DEFAULT 28800,-- 0 = disabled; ≥ 600 else 0
- *     enable_prune           INTEGER NOT NULL DEFAULT 1,
- *     lfs_enabled            INTEGER NOT NULL DEFAULT 0,    -- reserved (§1)
- *     lfs_endpoint           TEXT,                          -- reserved (§1)
- *     remote_address         TEXT NOT NULL,                 -- sanitized (userinfo stripped)
- *     credentials_username   TEXT,                          -- not secret (§3.1)
- *     credentials_ciphertext TEXT,                          -- AES-256-GCM, §4.2
- *     sync_state             TEXT NOT NULL DEFAULT 'idle'   -- idle|queued|syncing
- *                            CHECK (sync_state IN ('idle','queued','syncing')),
- *     next_sync_at           INTEGER NOT NULL DEFAULT 0,    -- 0 = unscheduled
- *     last_sync_at           INTEGER,
- *     last_error             TEXT,                          -- sanitized
- *     created_at             INTEGER NOT NULL DEFAULT (unixepoch()),
- *     updated_at             INTEGER NOT NULL DEFAULT (unixepoch())
- *   );
+ * The mirror row, as SPEC-0009 §3.1 (upstream Mirror, models/repo/mirror.go:
+ * 23-38) landed it: `repoMirrors` in src/db/schema.ts + migration 0010 carry
+ * the pinned contract verbatim — `interval_seconds` 28800 default,
+ * `enable_prune` true, reserved `lfs_*`, sanitized `remote_address`,
+ * AES-256-GCM `credentials_ciphertext`, the `idle|queued|syncing` CHECK,
+ * `next_sync_at` 0 = unscheduled and the UNIQUE `repo_id` arbiter. This
+ * narrow projection is what a sync reads; every write below is the sync-
+ * state CAS (0 rows on a lost race, exactly the raw statements' contract).
  */
 interface MirrorRow {
   id: number;
@@ -203,72 +194,56 @@ interface MirrorRow {
 }
 
 async function readMirrorRow(db: D1Database, repoId: string): Promise<MirrorRow | null> {
-  const row = await db
-    .prepare(
-      "SELECT id, repo_id, interval_seconds, enable_prune, remote_address, " +
-        "credentials_username, credentials_ciphertext, sync_state, next_sync_at, last_sync_at " +
-        "FROM repo_mirrors WHERE repo_id = ?1",
-    )
-    .bind(repoId)
-    .first<{
-      id: number;
-      repo_id: string;
-      interval_seconds: number;
-      enable_prune: number;
-      remote_address: string;
-      credentials_username: string | null;
-      credentials_ciphertext: string | null;
-      sync_state: string;
-      next_sync_at: number;
-      last_sync_at: number | null;
-    }>();
-  if (row === null) return null;
+  const row = await drizzle(db).select().from(repoMirrors).where(eq(repoMirrors.repoId, repoId)).get();
+  if (row === undefined) return null;
   return {
     id: row.id,
-    repoId: row.repo_id,
-    intervalSeconds: row.interval_seconds,
-    enablePrune: row.enable_prune !== 0,
-    remoteAddress: row.remote_address,
-    credentialsUsername: row.credentials_username,
-    credentialsCiphertext: row.credentials_ciphertext,
-    syncState: (row.sync_state === "queued" || row.sync_state === "syncing" ? row.sync_state : "idle"),
-    nextSyncAt: row.next_sync_at,
-    lastSyncAt: row.last_sync_at,
+    repoId: row.repoId,
+    intervalSeconds: row.intervalSeconds,
+    enablePrune: row.enablePrune,
+    remoteAddress: row.remoteAddress,
+    credentialsUsername: row.credentialsUsername,
+    credentialsCiphertext: row.credentialsCiphertext,
+    syncState: row.syncState,
+    nextSyncAt: row.nextSyncAt,
+    lastSyncAt: row.lastSyncAt,
   };
 }
 
-/** §2.6 step 1 — CAS `idle|queued → syncing` (0 rows changed = someone else
- *  owns the repo). Raw D1 for the same reason as the read above. */
+/** §2.6 step 1 — CAS `idle|queued → syncing` (0 rows = someone else owns the
+ *  repo). The WHERE guard is the whole lock: a racing sync/import loses here. */
 async function claimMirrorRow(db: D1Database, repoId: string): Promise<boolean> {
-  const result = await db
-    .prepare("UPDATE repo_mirrors SET sync_state = 'syncing', updated_at = unixepoch() WHERE repo_id = ?1 AND sync_state IN ('idle','queued')")
-    .bind(repoId)
-    .run();
-  return (result.meta.changes ?? 0) > 0;
+  const claimed = await drizzle(db)
+    .update(repoMirrors)
+    .set({ syncState: "syncing", updatedAt: new Date() })
+    .where(and(eq(repoMirrors.repoId, repoId), inArray(repoMirrors.syncState, ["idle", "queued"])))
+    .returning({ repoId: repoMirrors.repoId })
+    .all();
+  return claimed.length > 0;
 }
 
 /** §2.6 step 5 — success settle (CAS'd on the claim so an abort/delete race
  *  can never resurrect the row state). */
 async function settleMirrorSuccess(db: D1Database, repoId: string, intervalSeconds: number, now: number): Promise<void> {
-  await db
-    .prepare(
-      "UPDATE repo_mirrors SET last_sync_at = ?2, next_sync_at = ?3, sync_state = 'idle', last_error = NULL, " +
-        "updated_at = unixepoch() WHERE repo_id = ?1 AND sync_state = 'syncing'",
-    )
-    .bind(repoId, now, intervalSeconds > 0 ? now + intervalSeconds : 0)
-    .run();
+  await drizzle(db)
+    .update(repoMirrors)
+    .set({
+      lastSyncAt: now,
+      nextSyncAt: intervalSeconds > 0 ? now + intervalSeconds : 0,
+      syncState: "idle",
+      lastError: null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(repoMirrors.repoId, repoId), eq(repoMirrors.syncState, "syncing")));
 }
 
 /** §2.6 step 5 — failure settle: `last_error` (sanitized), back to idle,
  *  `next_sync_at` untouched (it stays due — the next cron retries). */
 async function settleMirrorFailure(db: D1Database, repoId: string, errorText: string): Promise<void> {
-  await db
-    .prepare(
-      "UPDATE repo_mirrors SET last_error = ?2, sync_state = 'idle', updated_at = unixepoch() " +
-        "WHERE repo_id = ?1 AND sync_state = 'syncing'",
-    )
-    .bind(repoId, errorText.slice(0, 2000))
-    .run();
+  await drizzle(db)
+    .update(repoMirrors)
+    .set({ lastError: errorText.slice(0, 2000), syncState: "idle", updatedAt: new Date() })
+    .where(and(eq(repoMirrors.repoId, repoId), eq(repoMirrors.syncState, "syncing")));
 }
 
 // ---------------------------------------------------------------------------
@@ -562,8 +537,9 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
   try {
     mirror = await readMirrorRow(env.DB, repoId);
   } catch (error) {
-    // No repo_mirrors table yet (migration pending — the skeleton's one
-    // honest gap). Never fake a sync; report and get out.
+    // No repo_mirrors table yet (migration 0010 not applied to this D1 —
+    // e.g. a remote pending db:migrate:remote). Never fake a sync; report
+    // and get out.
     return {
       ok: false,
       skipped: "storage-pending",
@@ -673,23 +649,24 @@ export async function enqueueDueMirrorSyncs(env: MirrorSyncEnv, options: { now?:
   if (env.MIRROR_SYNC_QUEUE === undefined) {
     throw new SmartHttpError("MIRROR_SYNC_QUEUE is not bound (wrangler.jsonc — SPEC-0009 §3.3); the cron producer cannot enqueue");
   }
-  const due = await env.DB.prepare(
-    "SELECT repo_id FROM repo_mirrors " +
-      "WHERE next_sync_at <= ?1 AND next_sync_at != 0 AND sync_state = 'idle' " +
-      "ORDER BY COALESCE(last_sync_at, 0) LIMIT ?2",
-  )
-    .bind(now, limit)
-    .all<{ repo_id: string }>();
+  const db = drizzle(env.DB);
+  const due = await db
+    .select({ repoId: repoMirrors.repoId })
+    .from(repoMirrors)
+    .where(and(lte(repoMirrors.nextSyncAt, now), ne(repoMirrors.nextSyncAt, 0), eq(repoMirrors.syncState, "idle")))
+    .orderBy(sql`coalesce(${repoMirrors.lastSyncAt}, 0)`)
+    .limit(limit);
 
   const messages: MirrorSyncMessage[] = [];
-  for (const row of due.results) {
+  for (const row of due) {
     // CAS wins the right to enqueue — no double-enqueue under contention.
-    const claimed = await env.DB.prepare(
-      "UPDATE repo_mirrors SET sync_state = 'queued', updated_at = unixepoch() WHERE repo_id = ?1 AND sync_state = 'idle'",
-    )
-      .bind(row.repo_id)
-      .run();
-    if ((claimed.meta.changes ?? 0) > 0) messages.push({ kind: "mirror-sync", repoId: row.repo_id });
+    const claimed = await db
+      .update(repoMirrors)
+      .set({ syncState: "queued", updatedAt: new Date() })
+      .where(and(eq(repoMirrors.repoId, row.repoId), eq(repoMirrors.syncState, "idle")))
+      .returning({ repoId: repoMirrors.repoId })
+      .all();
+    if (claimed.length > 0) messages.push({ kind: "mirror-sync", repoId: row.repoId });
   }
   for (let i = 0; i < messages.length; i += 100) {
     await env.MIRROR_SYNC_QUEUE.sendBatch(messages.slice(i, i + 100).map((message) => ({ body: message })));

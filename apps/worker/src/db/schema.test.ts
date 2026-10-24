@@ -1,12 +1,14 @@
 /**
  * Schema/migration parity (the 0005 consolidation of the service-side
- * DDL-in-waiting, extended by the 0007, 0008 and 0009 sweeps): a D1 freshly
- * applied the generated migrations must accept exactly the operations the
- * superseded raw-DDL paths (`LFS_OBJECTS_DDL_STATEMENTS`, `ORG_DDL_STATEMENTS`,
- * the batch-7 `REPO_TOPICS/REPO_WATCHERS/REPO_COLLABORATORS/REPO_SETTINGS/
- * FOLLOWS_DDL_STATEMENTS`, and the straggler `STARS`/`USER_SETTINGS`/
- * `FORKS_DDL_STATEMENTS`) allowed, and the Drizzle table objects must drive
- * those same statements.
+ * DDL-in-waiting, extended by the 0007, 0008, 0009 and 0010 sweeps): a D1
+ * freshly applied the generated migrations must accept exactly the operations
+ * the superseded raw-DDL paths (`LFS_OBJECTS_DDL_STATEMENTS`,
+ * `ORG_DDL_STATEMENTS`, the batch-7
+ * `REPO_TOPICS/REPO_WATCHERS/REPO_COLLABORATORS/REPO_SETTINGS/
+ * FOLLOWS_DDL_STATEMENTS`, the straggler `STARS`/`USER_SETTINGS`/
+ * `FORKS_DDL_STATEMENTS`, and the mirror wave's pinned §3.1 DDL that
+ * services/mirror/sync.ts read raw) allowed, and the Drizzle table objects
+ * must drive those same statements.
  *
  * Structure is asserted against `sqlite_master`/`PRAGMA table_info`
  * (composite PK, index names, column types/nullability/defaults — matching
@@ -18,7 +20,7 @@
  */
 
 import { env } from "cloudflare:workers";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, lte, ne } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
@@ -28,6 +30,7 @@ import {
   lfsObjects,
   orgMembers,
   repoCollaborators,
+  repoMirrors,
   repoSettings,
   repoTopics,
   repoWatchers,
@@ -528,7 +531,8 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
     const columns = await tableColumns("repositories");
     // The full physical order: the ALTER ADD COLUMN constraint puts
     // fork_parent LAST and pins migration 0009 additive-only (no
-    // pre-existing column may drift).
+    // pre-existing column may drift). Migration 0010 appends the mirror
+    // columns after it — same additive rule (SPEC-0009 §3.1).
     expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
       ["id", "TEXT", 1, 1],
       ["storage_key", "TEXT", 1, 0],
@@ -551,9 +555,14 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
       ["status", "TEXT", 1, 0],
       ["updated_at", "INTEGER", 0, 0],
       ["fork_parent", "TEXT", 0, 0],
+      ["is_mirror", "INTEGER", 1, 0],
+      ["original_url", "TEXT", 0, 0],
     ]);
-    // Nullable with NO default — the raw DDL's bare `ADD COLUMN fork_parent
-    // TEXT`: pre-existing rows read NULL.
+    // Both appended columns keep the ALTER ADD COLUMN constraints: is_mirror
+    // is NOT NULL with the keyword-alias default (`false` = 0), original_url
+    // nullable with NO default — the bare `ADD COLUMN original_url text`:
+    // pre-existing rows read NULL (fork_parent above reads the same way).
+    expect(columns.at(-2)?.dflt_value).toBe("false");
     expect(columns.at(-1)?.dflt_value).toBeNull();
     expect(await indexNames("repositories")).toContain("repositories_fork_parent_idx");
   });
@@ -616,5 +625,199 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
     expect(
       await env.DB.prepare("SELECT count(*) AS n FROM repositories WHERE fork_parent = 'pf_src'").first<{ n: number }>(),
     ).toEqual({ n: 0 });
+  });
+});
+
+describe("repositories is_mirror/original_url parity (SPEC-0009 §3.1, migration 0010)", () => {
+  it("defaults inserts to plain repos and round-trips the mirror stamp", async () => {
+    const db = drizzle(env.DB);
+
+    // Insert omitting the appended columns → non-mirror defaults (the raw
+    // ALTERs' behavior for every pre-0010 row: is_mirror 0, original_url NULL).
+    await env.DB
+      .prepare(
+        "INSERT INTO repositories (id, storage_key, owner_namespace, slug, visibility) VALUES ('im_plain', 'r_im_plain', 'paritymirror', 'plain', 'public')",
+      )
+      .run();
+    expect(
+      await env.DB.prepare("SELECT is_mirror, original_url FROM repositories WHERE id = 'im_plain'").first(),
+    ).toEqual({ is_mirror: 0, original_url: null });
+
+    // Drizzle stamp (the mirror-PATCH/migrate wave's write), raw read back.
+    await db
+      .update(repositories)
+      .set({ isMirror: true, originalUrl: "https://git.example.com/upstream.git" })
+      .where(eq(repositories.id, "im_plain"));
+    expect(
+      await env.DB
+        .prepare("SELECT is_mirror, original_url FROM repositories WHERE id = 'im_plain'")
+        .first<{ is_mirror: number; original_url: string | null }>(),
+    ).toEqual({ is_mirror: 1, original_url: "https://git.example.com/upstream.git" });
+  });
+});
+
+describe("repo_mirrors parity (the mirror wave's pinned §3.1 DDL, migration 0010)", () => {
+  it("has the pinned-DDL structure: defaults, the sync_state CHECK, the repo_id arbiter", async () => {
+    const columns = await tableColumns("repo_mirrors");
+    expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
+      ["id", "INTEGER", 1, 1],
+      ["repo_id", "TEXT", 1, 0],
+      ["interval_seconds", "INTEGER", 1, 0],
+      ["enable_prune", "INTEGER", 1, 0],
+      ["lfs_enabled", "INTEGER", 1, 0],
+      ["lfs_endpoint", "TEXT", 0, 0],
+      ["remote_address", "TEXT", 1, 0],
+      ["credentials_username", "TEXT", 0, 0],
+      ["credentials_ciphertext", "TEXT", 0, 0],
+      ["sync_state", "TEXT", 1, 0],
+      ["next_sync_at", "INTEGER", 1, 0],
+      ["last_sync_at", "INTEGER", 0, 0],
+      ["last_error", "TEXT", 0, 0],
+      ["created_at", "INTEGER", 1, 0],
+      ["updated_at", "INTEGER", 1, 0],
+    ]);
+    const byName = new Map(columns.map((c) => [c.name, c]));
+    expect(byName.get("interval_seconds")?.dflt_value).toBe("28800");
+    // drizzle-kit records the boolean defaults as the keyword literals
+    // (`true`/`false` — SQLite's 1/0 aliases, proven by the insert-omitting
+    // test below); sync_state defaults to the CHECK's base state.
+    expect(byName.get("enable_prune")?.dflt_value).toBe("true");
+    expect(byName.get("lfs_enabled")?.dflt_value).toBe("false");
+    expect(byName.get("sync_state")?.dflt_value).toBe("'idle'");
+    expect(byName.get("next_sync_at")?.dflt_value).toBe("0");
+    expect(byName.get("created_at")?.dflt_value).toBe("unixepoch()");
+    expect(byName.get("updated_at")?.dflt_value).toBe("unixepoch()");
+
+    // UNIQUE(repo_id) — one pull mirror per repo (upstream GetMirrorByRepoID
+    // assumes ≤ 1) — and the idle|queued|syncing CHECK in the table DDL.
+    expect(await indexNames("repo_mirrors")).toContain("repo_mirrors_repo_id_unique");
+    const ddl = await env.DB
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repo_mirrors'")
+      .first<{ sql: string }>();
+    expect(ddl?.sql).toContain("repo_mirrors_sync_state_check");
+  });
+
+  it("defaults inserts like the pinned DDL and arbitrates one-mirror-per-repo on both paths", async () => {
+    const db = drizzle(env.DB);
+
+    // Raw insert omitting every defaulted column → upstream creation values.
+    await env.DB
+      .prepare("INSERT INTO repo_mirrors (repo_id, remote_address) VALUES ('pm1', 'https://src.example.com/up.git')")
+      .run();
+    expect(
+      await env.DB
+        .prepare(
+          `SELECT interval_seconds, enable_prune, lfs_enabled, sync_state, next_sync_at, last_sync_at, last_error
+           FROM repo_mirrors WHERE repo_id = 'pm1'`,
+        )
+        .first<Record<string, unknown>>(),
+    ).toEqual({
+      interval_seconds: 28800,
+      enable_prune: 1,
+      lfs_enabled: 0,
+      sync_state: "idle",
+      next_sync_at: 0,
+      last_sync_at: null,
+      last_error: null,
+    });
+
+    // UNIQUE(repo_id): both write paths refuse a second pull mirror.
+    await expect(
+      env.DB.prepare("INSERT INTO repo_mirrors (repo_id, remote_address) VALUES ('pm1', 'https://other.example.com/x.git')").run(),
+    ).rejects.toThrow();
+    await expect(
+      db.insert(repoMirrors).values({ repoId: "pm1", remoteAddress: "https://other.example.com/x.git" }),
+    ).rejects.toThrow();
+
+    // The sync_state CHECK is a real constraint (a raw out-of-enum write fails).
+    await expect(
+      env.DB.prepare("INSERT INTO repo_mirrors (repo_id, remote_address, sync_state) VALUES ('pm2', 'https://x', 'bogus')").run(),
+    ).rejects.toThrow();
+  });
+
+  it("drives the §2.6 sync-state machine through the sync service's drizzle CAS shapes", async () => {
+    const db = drizzle(env.DB);
+    await db.insert(repoMirrors).values({
+      repoId: "pm3",
+      remoteAddress: "https://src.example.com/m.git",
+      intervalSeconds: 600,
+      nextSyncAt: 1000,
+    });
+
+    // Cron producer CAS: idle → queued, only from idle — the enqueue guard
+    // (a second producer racing the first moves 0 rows).
+    const enqueueCas = (repoId: string) =>
+      db
+        .update(repoMirrors)
+        .set({ syncState: "queued", updatedAt: new Date() })
+        .where(and(eq(repoMirrors.repoId, repoId), eq(repoMirrors.syncState, "idle")))
+        .returning({ repoId: repoMirrors.repoId })
+        .all();
+    expect((await enqueueCas("pm3")).map((r) => r.repoId)).toEqual(["pm3"]);
+    expect(await enqueueCas("pm3")).toEqual([]);
+
+    // Consumer claim CAS: queued|idle → syncing (re-guard over the enqueue —
+    // the mirror-sync API can race the cron producer).
+    const claimCas = (repoId: string) =>
+      db
+        .update(repoMirrors)
+        .set({ syncState: "syncing", updatedAt: new Date() })
+        .where(and(eq(repoMirrors.repoId, repoId), inArray(repoMirrors.syncState, ["idle", "queued"])))
+        .returning({ repoId: repoMirrors.repoId })
+        .all();
+    expect(await claimCas("pm3")).toHaveLength(1);
+
+    // Failure settle: back to idle with the sanitized last_error;
+    // next_sync_at stays due so the next cron retries (upstream posture,
+    // mirror_pull.go:303-308).
+    await db
+      .update(repoMirrors)
+      .set({ lastError: "mirror sync failed: boom", syncState: "idle", updatedAt: new Date() })
+      .where(and(eq(repoMirrors.repoId, "pm3"), eq(repoMirrors.syncState, "syncing")));
+    expect(
+      await env.DB.prepare("SELECT sync_state, next_sync_at, last_error FROM repo_mirrors WHERE repo_id = 'pm3'").first(),
+    ).toEqual({ sync_state: "idle", next_sync_at: 1000, last_error: "mirror sync failed: boom" });
+
+    // The due scan picks the failed row back up
+    // (`next_sync_at <= now AND != 0 AND idle`, oldest-synced first).
+    expect(
+      await db
+        .select({ repoId: repoMirrors.repoId })
+        .from(repoMirrors)
+        .where(and(lte(repoMirrors.nextSyncAt, 2000), ne(repoMirrors.nextSyncAt, 0), eq(repoMirrors.syncState, "idle")))
+        .orderBy(repoMirrors.repoId)
+        .all(),
+    ).toEqual([{ repoId: "pm3" }]);
+
+    // Success settle: last_sync_at = now, next_sync_at = now + interval,
+    // last_error cleared — CAS'd on 'syncing' so an abort/delete race can
+    // never resurrect the row state.
+    await claimCas("pm3");
+    await db
+      .update(repoMirrors)
+      .set({ lastSyncAt: 5000, nextSyncAt: 5000 + 600, syncState: "idle", lastError: null, updatedAt: new Date() })
+      .where(and(eq(repoMirrors.repoId, "pm3"), eq(repoMirrors.syncState, "syncing")));
+    expect(
+      await env.DB.prepare("SELECT sync_state, last_sync_at, next_sync_at, last_error FROM repo_mirrors WHERE repo_id = 'pm3'").first(),
+    ).toEqual({ sync_state: "idle", last_sync_at: 5000, next_sync_at: 5600, last_error: null });
+
+    // A disabled interval (0) settles unscheduled — and the due scan's
+    // `next_sync_at != 0` guard keeps it out.
+    await db.update(repoMirrors).set({ intervalSeconds: 0 }).where(eq(repoMirrors.repoId, "pm3"));
+    await db
+      .update(repoMirrors)
+      .set({ syncState: "syncing", updatedAt: new Date() })
+      .where(and(eq(repoMirrors.repoId, "pm3"), eq(repoMirrors.syncState, "idle")));
+    await db
+      .update(repoMirrors)
+      .set({ lastSyncAt: 6000, nextSyncAt: 0, syncState: "idle", lastError: null, updatedAt: new Date() })
+      .where(and(eq(repoMirrors.repoId, "pm3"), eq(repoMirrors.syncState, "syncing")));
+    expect(
+      await db
+        .select({ repoId: repoMirrors.repoId })
+        .from(repoMirrors)
+        .where(and(lte(repoMirrors.nextSyncAt, 9000), ne(repoMirrors.nextSyncAt, 0), eq(repoMirrors.syncState, "idle")))
+        .all(),
+    ).toEqual([]);
   });
 });
