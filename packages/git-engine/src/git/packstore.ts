@@ -1,8 +1,8 @@
 import pako from "pako";
-import { td, toHex, Sha1 } from "./util";
-import { Sha1Dc, Sha1CollisionError } from "./sha1";
-import { ObjType, NUM_TYPE, objectHeader } from "./objects";
+import { ObjType } from "./objects";
 import { applyDelta } from "./pack";
+import type { IndexRow, LookupObjectHit, LookupObjectResult } from "../control-plane";
+import { ObjCache, ObjRec } from "../receive/objcache";
 
 export const PACK_CHUNK = 1024 * 1024;
 /** Size threshold from SPEC-0001 §3/§8: packs at least this large exist only in
@@ -13,11 +13,6 @@ export const PACK_CHUNK = 1024 * 1024;
 export const R2_PACK_MIN_BYTES = 16 * 1024 * 1024;
 /** real Workers isolates have a hard 128MB total; self-hosted celld nodes run multi-GB heaps */
 const TIGHT_MEMORY = typeof caches !== "undefined";
-const MAX_BUFFERED_ENTRY = (TIGHT_MEMORY ? 8 : 32) * 1024 * 1024;
-/** full entries up to this size are kept in cache — they are likely delta bases */
-const CACHE_ENTRY_LIMIT = (TIGHT_MEMORY ? 2 : 4) * 1024 * 1024;
-/** recent entry offsets kept in memory for ofs-delta base resolution */
-const OFFSET_WINDOW = 150_000;
 /**
  * Decoded pack chunks kept hot for readRaw. The clone loop reads one object
  * per call in walk order, so without this every object re-SELECTs and
@@ -49,11 +44,6 @@ const inflateAll = (data: Uint8Array): Uint8Array => {
   return inf.result as Uint8Array;
 };
 
-export interface ObjRec {
-  type: ObjType;
-  data: Uint8Array;
-}
-
 export interface PackedEntry {
   oid: string;
   packId: number;
@@ -68,120 +58,39 @@ export interface PackedEntry {
 
 export type ExternalResolver = (oid: string) => ObjRec | null;
 
-/** Byte-budgeted LRU cache of inflated objects (delta-chain bases, hot commits/trees). */
-export class ObjCache {
-  private map = new Map<string, ObjRec>();
-  private bytes = 0;
-
-  constructor(private budget: number) {}
-
-  get(oid: string): ObjRec | undefined {
-    const hit = this.map.get(oid);
-    if (hit) {
-      this.map.delete(oid);
-      this.map.set(oid, hit);
-    }
-    return hit;
-  }
-
-  put(oid: string, obj: ObjRec): void {
-    if (obj.data.length > this.budget / 4) return;
-    if (this.map.has(oid)) return;
-    this.map.set(oid, obj);
-    this.bytes += obj.data.length;
-    while (this.bytes > this.budget) {
-      const oldest = this.map.keys().next().value as string;
-      this.bytes -= this.map.get(oldest)!.data.length;
-      this.map.delete(oldest);
-    }
-  }
-}
-
-// ingest is strictly sequential, so scratch hashers serve every object. The
-// SHA-1DC pair is used only when collision detection is enabled; the plain
-// streaming hasher covers the flag-off huge-object path.
-const scratchSha = new Sha1Dc();
-const streamSha = new Sha1Dc();
-const streamShaPlain = new Sha1();
-
 /**
- * Finish a SHA-1DC hash, refusing anything carrying a SHA-1 collision-attack
- * block. This is git's post-SHAttered rule: the id is still plain SHA-1, but
- * an object built to collide never enters the database.
+ * Loose objects bigger than this are not shipped to the Worker by
+ * `lookupObjects` (their presence still holds for connectivity; the content
+ * would stress the RPC for no realistic thin-pack base). Mirrors the
+ * Worker-side handover bounds (receive/scan.ts).
  */
-function finishOid(h: Sha1Dc): string {
-  const oid = toHex(h.digest());
-  if (h.collision) throw new Sha1CollisionError(oid);
-  return oid;
-}
-
+export const LOOSE_LOOKUP_CAP = 64 * 1024 * 1024;
 /**
- * Hash a fully-materialized object. With collision detection off (default) the
- * id comes from native crypto.subtle — byte-identical to plain SHA-1 but ~24x
- * faster than the JS hasher; with it on, SHA-1DC screens every block. The
- * object is already in memory here, so the one-shot header+data buffer adds no
- * unbounded allocation.
+ * Index rows land in bounded batches from the Worker (SPEC-0001a §3 Step 2).
+ * workerd caps a DO SQL statement at ~100 bound variables (celld's stock
+ * SQLite allows more); 8 rows x 10 cols = 80 stays under that on both.
  */
-async function hashObjectAsync(type: ObjType, data: Uint8Array, cd: boolean): Promise<string> {
-  if (cd) return finishOid(scratchSha.reset().update(objectHeader(type, data.length)).update(data));
-  const header = objectHeader(type, data.length);
-  const buf = new Uint8Array(header.length + data.length);
-  buf.set(header);
-  buf.set(data, header.length);
-  return toHex(new Uint8Array(await crypto.subtle.digest("SHA-1", buf)));
-}
-
-/**
- * Buffered sequential reader over a pack stored as SQLite chunk rows or an R2
- * object. Chunks are loaded through the owning PackStore's chunk cache (async
- * because an R2-backed chunk is a range GET), so byte()/window() await; the SQL
- * backend resolves without I/O.
- */
-class PackReader {
-  pos = 0;
-  private seq = -1;
-  private chunk: Uint8Array = new Uint8Array(0);
-
-  constructor(private load: (seq: number) => Promise<Uint8Array>, readonly size: number) {}
-
-  private async ensure(): Promise<void> {
-    const want = Math.floor(this.pos / PACK_CHUNK);
-    if (want !== this.seq) {
-      this.chunk = await this.load(want);
-      this.seq = want;
-    }
-  }
-
-  async byte(): Promise<number> {
-    await this.ensure();
-    return this.chunk[this.pos++ - this.seq * PACK_CHUNK];
-  }
-
-  /** Remaining bytes of the chunk containing pos (never empty while pos < size). */
-  async window(): Promise<Uint8Array> {
-    await this.ensure();
-    return this.chunk.subarray(this.pos - this.seq * PACK_CHUNK);
-  }
-}
+const ROW_BATCH_ROWS = 8;
 
 /**
  * Pack-native object database: received packfiles are stored verbatim — since
- * SPEC-0001a §3 Step 1 the Worker stages them straight into R2 (receive packs
- * under `repos/<storage_key>/packs/<name>.pack`, recorded per pack in
- * pack_meta.r2_key; legacy packs under `raw/<repo>/<packId>`), else in SQLite
- * chunk rows (the fallback / celld path) — and indexed (oid ->
- * pack/offset/base), preserving the client's delta compression. Only the index
- * ever lives in SQLite for an R2-backed pack, so pack data escapes the per-DO
- * storage ceiling. This is what lets large repos fit and stream.
+ * SPEC-0001a §3 the Worker stages them straight into R2, SCANS them, and
+ * pushes the resulting index rows here (`putIndexRows`); the DO never reads
+ * pack bytes on the receive path (pack_meta.r2_key records
+ * `repos/<storage_key>/packs/<name>.pack`; legacy packs under
+ * `raw/<repo>/<packId>`), else in SQLite chunk rows (the fallback / celld
+ * path). Only the index ever lives in SQLite for an R2-backed pack, so pack
+ * data escapes the per-DO storage ceiling. This is what lets large repos fit
+ * and stream.
  */
 export class PackStore {
   /** LRU of decoded pack chunks, keyed "packId:seq" (SQLite row or R2 range). */
   private chunks = new Map<string, Uint8Array>();
   /**
    * R2 raw-pack backend for this repo, or null when no bucket is bound (celld /
-   * Workers without the binding). When set, ingested packs store their bytes in
-   * R2 and keep only the index in SQLite; pre-existing SQLite packs keep
-   * working (backend is recorded per pack).
+   * Workers without the binding). Received packs store their bytes in R2 and
+   * keep only the index in SQLite; pre-existing SQLite packs keep working
+   * (backend is recorded per pack).
    */
   private r2: { bucket: R2Bucket; repo: string } | null = null;
   /** Cached backend ('sql' | 'r2') per pack id, from pack_meta.store. */
@@ -205,10 +114,10 @@ export class PackStore {
     return `raw/${this.r2!.repo}/${packId}`;
   }
 
-  /** The R2 object key holding a pack's bytes. Ingest primes the cache before
-   * pack_meta exists; recorded keys (receive packs) win over the legacy
+  /** The R2 object key holding a pack's bytes. `recordPack` primes the cache
+   * before pack_meta exists; recorded keys (receive packs) win over the legacy
    * raw/<repo>/<packId> derivation. */
-  private r2KeyOf(packId: number): string {
+  r2KeyOf(packId: number): string {
     const cached = this.r2Keys.get(packId);
     if (cached) return cached;
     const rows = this.sql
@@ -219,9 +128,7 @@ export class PackStore {
     return key;
   }
 
-  /** Storage backend of a pack. Cached; falls back to a pack_meta lookup. The
-   * cache is primed at ingest start (before pack_meta exists) so phase B/C read
-   * the right source. */
+  /** Storage backend of a pack. Cached; falls back to a pack_meta lookup. */
   private backendOf(packId: number): "sql" | "r2" {
     const hit = this.backend.get(packId);
     if (hit) return hit;
@@ -260,16 +167,6 @@ export class PackStore {
         base_oid TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_pack_objects_loc ON pack_objects(pack_id, offset);
-      CREATE TABLE IF NOT EXISTS pack_pending (
-        pack_id INTEGER NOT NULL,
-        offset INTEGER NOT NULL,
-        data_off INTEGER NOT NULL,
-        data_len INTEGER NOT NULL,
-        entry_size INTEGER NOT NULL,
-        base_oid TEXT,
-        base_offset INTEGER,
-        PRIMARY KEY (pack_id, offset)
-      );
     `);
     // back-fill the store column on repos whose pack_meta predates the R2 backend:
     // every such pack is SQLite-backed, which the 'sql' default records
@@ -283,10 +180,16 @@ export class PackStore {
     if (!cols.some((c) => c.name === "r2_key")) {
       this.sql.exec("ALTER TABLE pack_meta ADD COLUMN r2_key TEXT");
     }
+    // back-fill the idx CRC column (SPEC-0001a §3 Step 2): the Worker scan
+    // supplies per-entry CRC-32 for idx v2; rows written before Step 2 are 0
+    const objCols = this.sql.exec<{ name: string }>("PRAGMA table_info(pack_objects)").toArray();
+    if (!objCols.some((c) => c.name === "crc32")) {
+      this.sql.exec("ALTER TABLE pack_objects ADD COLUMN crc32 INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   wipe(): void {
-    for (const t of ["pack_meta", "pack_data", "pack_objects", "pack_pending"]) {
+    for (const t of ["pack_meta", "pack_data", "pack_objects"]) {
       this.sql.exec(`DROP TABLE IF EXISTS ${t}`);
     }
     this.chunks.clear(); // pack ids restart from 1: cached rows would be stale
@@ -402,11 +305,11 @@ export class PackStore {
   /**
    * One decoded pack chunk, through the LRU. For a SQLite-backed pack this is a
    * `pack_data` row; for an R2-backed pack it is an aligned ~1 MiB range GET
-   * against `raw/<repo>/<packId>`, so sorted sequential reads (a clone) issue
+   * against the pack's R2 object, so sorted sequential reads (a clone) issue
    * ~one GET per chunk instead of one per object. Chunks are immutable once
    * written — a pack is inserted once and only ever removed wholesale (wipe/
-   * reset, or the orphan sweep at the top of ingest, both of which clear the
-   * cache), so a hit can never be stale.
+   * reset, or the sweep paths, both of which clear the cache), so a hit can
+   * never be stale.
    */
   private async chunk(packId: number, seq: number): Promise<Uint8Array> {
     const key = `${packId}:${seq}`;
@@ -497,328 +400,131 @@ export class PackStore {
     return obj;
   }
 
-  /**
-   * Index a packfile the Worker has already staged and copied in R2
-   * (SPEC-0001a §3 Step 1: pack bytes never pass through the DO). The stored
-   * object IS the pack store — the old request-stream phase A byte feed is
-   * gone; this reads the object back in ~1 MiB range GETs through the chunk
-   * cache while scanning and resolving deltas, and only index rows land in
-   * SQLite. The SHA-1 trailer was verified during the Worker's stream (20-byte
-   * sliding window, before the staging object was completed); the structural
-   * checks below (signature, version, per-entry bounds, exact byte accounting)
-   * still bind here.
-   */
-  async ingestStored(
-    r2Key: string,
-    totalBytes: number,
-    opts: {
-      cache: ObjCache;
-      onProgress?: (msg: string) => void;
-      /** called periodically so the runtime can flush its write buffer —
-       * workerd holds a request's dirty pages in the 128MB isolate heap */
-      flush?: () => Promise<void>;
-      /** screen every block with SHA-1DC (git-parity collision detection);
-       * default hashes with native crypto.subtle, which yields the identical
-       * oid without the collision check */
-      collisionDetect?: boolean;
+  // ---- Worker-pushed index rows (SPEC-0001a §3 Step 2) ----------------------
+  //
+  // The Worker scans and resolves the pack; only these control-plane writes
+  // remain. Rows land BEFORE finalize; pack_meta is recorded by finalize's
+  // commit transaction, so rows without a pack_meta entry are crash debris the
+  // sweeps reclaim — the same story the DO-side ingest had.
+
+  /** Next free pack id (allocation is lease-serialized: one receive lease). */
+  nextPackId(): number {
+    return (this.sql.exec<{ m: number | null }>("SELECT MAX(pack_id) AS m FROM pack_meta").one().m ?? 0) + 1;
+  }
+
+  /** Batched insert of Worker-resolved rows. `INSERT OR IGNORE` keeps a
+   * duplicate oid's FIRST location — including within one batch. */
+  putRows(packId: number, rows: IndexRow[]): void {
+    for (let i = 0; i < rows.length; i += ROW_BATCH_ROWS) {
+      const slice = rows.slice(i, i + ROW_BATCH_ROWS);
+      const values = slice.map(() => "(?,?,?,?,?,?,?,?,?,?)").join(",");
+      const args: (string | number | null)[] = [];
+      for (const r of slice) {
+        args.push(r.oid, packId, r.offset, r.dataOff, r.dataLen, r.type, r.size, r.entrySize, r.baseOid, r.crc32);
+      }
+      this.sql.exec(
+        `INSERT OR IGNORE INTO pack_objects (oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid, crc32) VALUES ${values}`,
+        ...args
+      );
     }
-  ): Promise<{ packId: number; count: number }> {
-    if (!this.r2) throw new Error("pack ingest requires a bound R2 backend");
-    const cd = opts.collisionDetect ?? false;
-    // a failed or interrupted ingest leaves rows (or an R2 object) without a
-    // pack_meta entry; reclaim that space before starting (pack_meta is only
-    // written on success). Union across every per-pack table so an ingest that
-    // died mid-index is caught too. The bytes of a crash between the Worker's
-    // copy and this point sit under a packs/ key no row names — the orphan
-    // sweep reclaims those (M3); here only SQLite rows are recoverable.
+    // the freshly written rows are readable through the same connection; the
+    // per-pack caches only hold chunk/key/backend state, which is unaffected
+  }
+
+  /** Prime the per-pack backend caches BEFORE pack_meta exists: rows land via
+   * putIndexRows while the pack bytes are still the Worker's staging object,
+   * and DO-side reads over those rows (isAncestor's ancestry walk) must hit
+   * the right R2 key, not fall back to the 'sql' backend. recordPack re-primes
+   * to the final packs/ key; the bytes are identical, so cached chunks stay
+   * valid across the re-point. */
+  primePack(packId: number, r2Key: string): void {
+    this.backend.set(packId, "r2");
+    this.r2Keys.set(packId, r2Key);
+  }
+
+  /** Record the pack catalog row (finalize's commit transaction). The count is
+   * the actual indexed-row count, not the pack header's declaration. */
+  recordPack(packId: number, sizeBytes: number, r2Key: string): void {
+    const count = this.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_id = ?", packId)
+      .one().n;
+    this.sql.exec(
+      "INSERT INTO pack_meta (pack_id, size, count, created, store, r2_key) VALUES (?, ?, ?, ?, 'r2', ?)",
+      packId, sizeBytes, count, Date.now(), r2Key
+    );
+    this.primePack(packId, r2Key);
+  }
+
+  /** Delete every index/data row of one pack id (lease sweeps, abandoned
+   * receives). Cache state is cleared because ids can be reallocated. */
+  sweepPackRows(packId: number): void {
+    this.sql.exec("DELETE FROM pack_objects WHERE pack_id = ?", packId);
+    this.sql.exec("DELETE FROM pack_data WHERE pack_id = ?", packId);
+    this.chunks.clear();
+    this.backend.delete(packId);
+    this.r2Keys.delete(packId);
+  }
+
+  /** Reclaim rows whose pack id never reached pack_meta — the debris of a
+   * receive that died between putIndexRows and finalize. `keepPackId` (the
+   * current lease's pack, still being written) is preserved. */
+  sweepOrphanRows(keepPackId: number | null): void {
     const orphans = this.sql
       .exec<{ pack_id: number }>(
         `SELECT pack_id FROM (
-           SELECT DISTINCT pack_id FROM pack_data
-           UNION SELECT DISTINCT pack_id FROM pack_objects
-           UNION SELECT DISTINCT pack_id FROM pack_pending
-         ) WHERE pack_id NOT IN (SELECT pack_id FROM pack_meta)`
+           SELECT DISTINCT pack_id FROM pack_data WHERE pack_id NOT IN (SELECT pack_id FROM pack_meta)
+           UNION
+           SELECT DISTINCT pack_id FROM pack_objects WHERE pack_id NOT IN (SELECT pack_id FROM pack_meta)
+         ) WHERE pack_id != ?`,
+        keepPackId ?? -1
       )
-      .toArray();
-    for (const o of orphans) {
-      for (const t of ["pack_data", "pack_objects", "pack_pending"]) {
-        this.sql.exec(`DELETE FROM ${t} WHERE pack_id = ?`, o.pack_id);
-      }
-      // best effort: an interrupted pack's recorded key, else the legacy
-      // derivation (which misses for receive packs — acceptable, unreferenced)
-      if (this.r2) {
-        try {
-          await this.r2.bucket.delete(this.r2KeyOf(o.pack_id));
-        } catch {
-          // best effort: the packId is reused next and its key re-primed
-        }
-      }
-    }
-    // the reclaimed pack id is about to be handed out again: drop anything the
-    // chunk LRU still holds for it (and for anything else — it is only a cache)
-    if (orphans.length) {
-      this.chunks.clear();
-      this.r2Keys.clear();
-    }
-    const packId =
-      (this.sql.exec<{ m: number | null }>("SELECT MAX(pack_id) AS m FROM pack_meta").one().m ?? 0) + 1;
-    // prime the backend caches NOW — before pack_meta exists — so phase B/C
-    // chunk reads hit the staged object
-    this.backend.set(packId, "r2");
-    this.r2Keys.set(packId, r2Key);
-    const started = Date.now();
-    const say = (msg: string) => {
-      opts.onProgress?.(msg);
-      console.log(`[ingest pack ${packId} +${Math.round((Date.now() - started) / 1000)}s] ${msg.trim()}`);
-    };
+      .toArray()
+      .map((r) => r.pack_id);
+    for (const id of orphans) this.sweepPackRows(id);
+  }
 
-    // the Worker declared the byte count from its own stream; a mismatch means
-    // the staged object is not what was hashed — refuse before scanning
-    const head = await this.r2.bucket.head(r2Key);
-    if (!head) throw new Error("staged pack object missing from R2");
-    if (head.size !== totalBytes) throw new Error("staged pack size mismatch");
-    const total = totalBytes;
-
-    // phase B: sequential scan with eager delta resolution, over ~1 MiB range
-    // GETs of the stored object
-    const r = new PackReader((s) => this.chunk(packId, s), total);
-    const magic = new Uint8Array(4);
-    for (let i = 0; i < 4; i++) magic[i] = await r.byte();
-    if (td.decode(magic) !== "PACK") throw new Error("bad pack signature");
-    let version = 0, count = 0;
-    for (let i = 0; i < 4; i++) version = (version << 8) | (await r.byte());
-    for (let i = 0; i < 4; i++) count = (count << 8) | (await r.byte());
-    if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
-
-    // batched index inserts: one exec per object made pack_objects a top SQL
-    // cost, and deferring rows is safe because delta bases resolve from the
-    // in-memory offset window and object cache — the flush points below cover
-    // the rare pack_objects SELECT fallbacks (oidByOffset miss, getObject).
-    // OR IGNORE keeps a duplicate oid's FIRST location — including within one
-    // batch — so a failed ingest's orphan sweep can't strand a stored object.
-    // workerd caps a DO SQL statement at ~100 bound variables (celld's stock
-    // SQLite allows more); 10 rows x 9 cols = 90 stays under that on both.
-    const OBJ_BATCH = 10;
-    let objBatch: (string | number | null)[] = [];
-    let objBatchRows = 0;
-    const flushObjects = () => {
-      if (!objBatchRows) return;
-      const values = Array(objBatchRows).fill("(?,?,?,?,?,?,?,?,?)").join(",");
-      this.sql.exec(
-        `INSERT OR IGNORE INTO pack_objects (oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid) VALUES ${values}`,
-        ...objBatch
-      );
-      objBatch = [];
-      objBatchRows = 0;
-    };
-    const insertObject = (row: (string | number | null)[]) => {
-      for (const v of row) objBatch.push(v);
-      if (++objBatchRows >= OBJ_BATCH) flushObjects();
-    };
-    const insertPending = (row: (string | number | null)[]) => {
-      this.sql.exec(
-        "INSERT INTO pack_pending (pack_id, offset, data_off, data_len, entry_size, base_oid, base_offset) VALUES (?,?,?,?,?,?,?)",
-        ...row
-      );
-    };
-
-    // rotating offset -> oid window: ofs-delta bases are nearly always recent
-    let winCur = new Map<number, string>();
-    let winPrev = new Map<number, string>();
-    const winPut = (off: number, oid: string) => {
-      winCur.set(off, oid);
-      if (winCur.size >= OFFSET_WINDOW) {
-        winPrev = winCur;
-        winCur = new Map();
-      }
-    };
-    const oidByOffset = (off: number): string | null => {
-      const hit = winCur.get(off) ?? winPrev.get(off);
-      if (hit) return hit;
-      flushObjects(); // a windowed miss falls back to SELECT: deferred rows must be visible
+  /**
+   * Resolve oids against the pack index for the Worker (lookupObjects RPC):
+   * aligned with the input, null where the object is not packed (the caller
+   * falls back to loose storage). One indexed probe per oid — workerd's SQLite
+   * rejects multi-placeholder IN lists, and a batch is bounded by the RPC's
+   * 512-oid cap anyway, so flat per-oid probes stay microseconds each. The R2
+   * key resolves through the per-pack cache.
+   */
+  lookupPacked(oids: string[]): (LookupObjectHit | null)[] {
+    return oids.map((oid) => {
       const rows = this.sql
-        .exec<{ oid: string }>("SELECT oid FROM pack_objects WHERE pack_id = ? AND offset = ?", packId, off)
+        .exec<{
+          pack_id: number; offset: number; data_off: number; data_len: number;
+          type: ObjType; base_oid: string | null;
+        }>(
+          "SELECT pack_id, offset, data_off, data_len, type, base_oid FROM pack_objects WHERE oid = ?",
+          oid
+        )
         .toArray();
-      return rows[0]?.oid ?? null;
-    };
-
-    let pendingCount = 0;
-    for (let i = 0; i < count; i++) {
-      const offset = r.pos;
-      let byte = await r.byte();
-      const type = (byte >> 4) & 7;
-      let entrySize = byte & 15;
-      let shift = 4;
-      while (byte & 0x80) {
-        byte = await r.byte();
-        entrySize += (byte & 0x7f) * 2 ** shift;
-        shift += 7;
-      }
-      let baseOid: string | null = null;
-      let baseOffset: number | null = null;
-      if (type === 6) {
-        byte = await r.byte();
-        let off = byte & 0x7f;
-        while (byte & 0x80) {
-          byte = await r.byte();
-          off = (off + 1) * 128 + (byte & 0x7f);
-        }
-        baseOffset = offset - off;
-      } else if (type === 7) {
-        const b = new Uint8Array(20);
-        for (let j = 0; j < 20; j++) b[j] = await r.byte();
-        baseOid = toHex(b);
-      } else if (!NUM_TYPE[type]) {
-        throw new Error(`bad object type ${type} at ${offset}`);
-      }
-
-      const dataOff = r.pos;
-      const isFull = type >= 1 && type <= 4;
-      const objType = isFull ? NUM_TYPE[type] : null;
-      const buffered = entrySize <= MAX_BUFFERED_ENTRY;
-      // buffered entries inflate straight into one exact-size buffer (no piece
-      // array + concat, which would hold the object twice at once)
-      const content = buffered ? new Uint8Array(entrySize) : null;
-      if (isFull && !buffered) {
-        if (cd) streamSha.reset().update(objectHeader(objType!, entrySize));
-        else streamShaPlain.reset().update(objectHeader(objType!, entrySize));
-      }
-      let inflated = 0;
-      const inf = new pako.Inflate({ chunkSize: INFLATE_CHUNK });
-      (inf as unknown as { onData: (c: Uint8Array) => void }).onData = (c: Uint8Array) => {
-        if (content) content.set(c, inflated);
-        else if (isFull) (cd ? streamSha : streamShaPlain).update(c);
-        inflated += c.length;
+      const r = rows[0];
+      if (!r) return null;
+      return {
+        found: true,
+        packKey: this.r2KeyOf(r.pack_id),
+        offset: r.offset,
+        dataOff: r.data_off,
+        dataLen: r.data_len,
+        type: r.type,
+        baseOid: r.base_oid,
       };
-      const anyInf = inf as unknown as { err: number; msg: string; ended: boolean; strm: { avail_in: number } };
-      while (!anyInf.ended) {
-        if (r.pos >= total) throw new Error(`truncated pack entry at ${offset}`);
-        const win = await r.window();
-        inf.push(win, false);
-        if (anyInf.err) throw new Error(`inflate failed at ${dataOff}: ${anyInf.msg}`);
-        r.pos += anyInf.ended ? win.length - anyInf.strm.avail_in : win.length;
-      }
-      if (inflated !== entrySize) throw new Error(`entry size mismatch at ${offset}`);
-      const dataLen = r.pos - dataOff;
+    });
+  }
 
-      if (isFull) {
-        const oid = buffered
-          ? await hashObjectAsync(objType!, content!, cd)
-          : cd
-            ? finishOid(streamSha)
-            : toHex(streamShaPlain.digest());
-        insertObject([oid, packId, offset, dataOff, dataLen, objType!, entrySize, entrySize, null]);
-        winPut(offset, oid);
-        if (content && content.length <= CACHE_ENTRY_LIMIT) {
-          opts.cache.put(oid, { type: objType!, data: content });
-        }
-      } else {
-        const resolvedBase = baseOid ?? (baseOffset !== null ? oidByOffset(baseOffset) : null);
-        let resolved = false;
-        if (buffered && resolvedBase) {
-          let base: ObjRec | null = opts.cache.get(resolvedBase) ?? null;
-          if (!base) {
-            flushObjects(); // getObject SELECTs pack_objects: deferred rows must be visible
-            try {
-              base = await this.getObject(resolvedBase, opts.cache);
-            } catch {
-              base = null;
-            }
-          }
-          if (!base) base = this.extern(resolvedBase);
-          if (base) {
-            const data = applyDelta(base.data, content!);
-            const oid = await hashObjectAsync(base.type, data, cd);
-            insertObject([oid, packId, offset, dataOff, dataLen, base.type, data.length, entrySize, resolvedBase]);
-            winPut(offset, oid);
-            if (data.length <= CACHE_ENTRY_LIMIT) {
-              opts.cache.put(oid, { type: base.type, data });
-            }
-            resolved = true;
-          }
-        }
-        if (!resolved) {
-          insertPending([packId, offset, dataOff, dataLen, entrySize, baseOid, baseOffset]);
-          pendingCount++;
-        }
-      }
-
-      if (i % 2000 === 1999) {
-        await new Promise((res) => setTimeout(res, 0));
-        await opts.flush?.();
-        if (i % 100000 === 99999) say(`Indexing objects: ${i + 1}/${count}\n`);
-      }
-    }
-    // the header count must account for every byte up to the 20-byte trailer;
-    // otherwise objects were silently dropped (or junk trails the pack)
-    if (r.pos !== total - 20) throw new Error("pack has trailing data or bad object count");
-    await opts.flush?.();
-    say(`Indexed ${count} objects (${pendingCount} deferred)\n`);
-
-    // phase C: stragglers — deltas whose base appeared later in the pack,
-    // or thin-pack bases that live in another pack / loose storage
-    let pendingTotal = this.sql
-      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_pending WHERE pack_id = ?", packId)
-      .one().n;
-    let resolvedTotal = 0;
-    while (pendingTotal > 0) {
-      let resolvedThisPass = 0;
-      let lastOffset = -1;
-      for (;;) {
-        const page = this.sql
-          .exec<{
-            offset: number; data_off: number; data_len: number; entry_size: number;
-            base_oid: string | null; base_offset: number | null;
-          }>(
-            "SELECT offset, data_off, data_len, entry_size, base_oid, base_offset FROM pack_pending WHERE pack_id = ? AND offset > ? ORDER BY offset LIMIT 500",
-            packId,
-            lastOffset
-          )
-          .toArray();
-        if (!page.length) break;
-        for (const row of page) {
-          lastOffset = row.offset;
-          let baseOid = row.base_oid;
-          if (!baseOid && row.base_offset !== null) {
-            baseOid = oidByOffset(row.base_offset);
-            if (!baseOid) continue; // base itself still pending
-          }
-          if (!baseOid) continue;
-          let base: ObjRec | null = null;
-          flushObjects(); // getObject SELECTs pack_objects: deferred rows must be visible
-          try {
-            base = (await this.getObject(baseOid, opts.cache)) ?? this.extern(baseOid);
-          } catch {
-            base = null;
-          }
-          if (!base) continue; // thin base not available (yet)
-          const delta = inflateAll(await this.readRaw(packId, row.data_off, row.data_len));
-          const data = applyDelta(base.data, delta);
-          const oid = await hashObjectAsync(base.type, data, cd);
-          insertObject([oid, packId, row.offset, row.data_off, row.data_len, base.type, data.length, row.entry_size, baseOid]);
-          this.sql.exec("DELETE FROM pack_pending WHERE pack_id = ? AND offset = ?", packId, row.offset);
-          winPut(row.offset, oid);
-          if (data.length <= CACHE_ENTRY_LIMIT) opts.cache.put(oid, { type: base.type, data });
-          resolvedTotal++;
-          resolvedThisPass++;
-          if (resolvedTotal % 2000 === 0) {
-            await new Promise((res) => setTimeout(res, 0));
-            if (resolvedTotal % 100000 === 0) say(`Resolving deltas: ${resolvedTotal}\n`);
-          }
-        }
-      }
-      pendingTotal -= resolvedThisPass;
-      if (resolvedThisPass === 0 && pendingTotal > 0) {
-        throw new Error(`cannot resolve ${pendingTotal} delta object(s): missing base`);
-      }
-    }
-    if (resolvedTotal) say(`Resolved ${resolvedTotal} deferred delta(s)\n`);
-    flushObjects(); // commit the final partial batch before pack_meta marks the pack complete
-
-    this.sql.exec(
-      "INSERT INTO pack_meta (pack_id, size, count, created, store, r2_key) VALUES (?, ?, ?, ?, 'r2', ?)",
-      packId, total, count, Date.now(), r2Key
-    );
-    return { packId, count };
+  /** Keyset page of a pack's indexed oids (validatePush builds the reachable
+   * set for a cached fast-forward from the rows alone — no pack bytes). */
+  packOidsAfter(packId: number, after: string, limit: number): string[] {
+    return this.sql
+      .exec<{ oid: string }>(
+        "SELECT oid FROM pack_objects WHERE pack_id = ? AND oid > ? ORDER BY oid LIMIT ?",
+        packId, after, limit
+      )
+      .toArray()
+      .map((r) => r.oid);
   }
 }

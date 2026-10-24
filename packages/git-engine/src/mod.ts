@@ -22,6 +22,9 @@ import {
   type FinalizedPack,
 } from "./control-plane";
 import type { RepoCell } from "./repo";
+import { DeltaResolver } from "./receive/delta";
+import { walkPack } from "./receive/scan";
+import { writeIdx } from "./receive/idx";
 
 export { RepoCell } from "./repo";
 export { Registry } from "./registry";
@@ -29,15 +32,18 @@ export type { Env } from "./env";
 export type { RepoInfo, RepoConfig } from "./registry";
 export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, BlobResult, LogResult, DiffResult, DiffFileJson } from "./repo";
 export type { Person } from "./git/objects";
-// receive control plane (SPEC-0001a §3 Step 1): the Worker-side data plane in
-// this file drives these lease RPCs; consumers of the engine re-export them so
-// the typed boundary is complete.
+// receive control plane (SPEC-0001a §3 Steps 1-2): the Worker-side data plane
+// in this file drives these lease RPCs; consumers of the engine re-export them
+// so the typed boundary is complete.
 export type {
   BeginReceiveInput,
   BeginReceiveResult,
   FinalizedPack,
   FinalizeReceiveInput,
   FinalizeReceiveResult,
+  IndexRow,
+  LookupObjectHit,
+  LookupObjectResult,
   ReceiveCommandResult,
   ReleaseReceiveInput,
   ReleaseReceiveResult,
@@ -335,12 +341,18 @@ async function serveCloneFromR2(
   const bucket = env.PACK_CACHE;
   if (!bucket) return null;
   const req = parseUploadRequest(body);
+  // G3 (cache unreachability): a request carrying unsupported-but-semantics-
+  // changing fetch arguments (deepen-since/deepen-not/deepen-relative/filter,
+  // unknowns) must never reach the full-clone cache probe — the parse verdict
+  // short-circuits BEFORE the fullClone predicate and the currentPackKey RPC,
+  // and the DO's uploadPack renders the protocol-shaped ERR instead.
+  if (req.badArgument) return null;
   const fullClone =
     req.wants.length > 0 &&
     req.wants.every(isOid) &&
     req.haves.length === 0 &&
     req.done &&
-    req.deepen === 0 &&
+    req.deepen.kind === "none" &&
     req.clientShallows.length === 0 &&
     (req.command === "fetch" || req.caps.has("side-band-64k"));
   if (!fullClone) return null;
@@ -380,14 +392,18 @@ function corsPreflight(origin: string): Response {
   });
 }
 
-// ---- receive data plane (SPEC-0001a §3 Step 1) -----------------------------
+// ---- receive data plane (SPEC-0001a §3 Steps 1-2) ---------------------------
 //
 // Pack bytes never pass through the DO: this side parses ONLY the pkt-line
 // command section, opens a receive lease, streams the pack remainder straight
 // into R2 staging (FixedLengthStream when Content-Length is known, 16 MiB
-// multipart parts otherwise), copies staging → packs/ BEFORE finalize (so a
-// crash in between leaves an unreferenced packs/ object the orphan sweep
-// reclaims — never a committed ref pointing at a missing object), then calls
+// multipart parts otherwise), scans + delta-resolves the staging object with
+// ONE streaming GET (per-entry CRC-32, inflate bounds, chain/cycle caps),
+// streams index rows to the DO in bounded batches (putIndexRows), resolves
+// thin-pack bases through lookupObjects, emits idx v2 byte-equivalent to
+// `git index-pack`, copies staging → packs/ BEFORE finalize (so a crash in
+// between leaves an unreferenced packs/ object the orphan sweep reclaims —
+// never a committed ref pointing at a missing object), then calls
 // finalizeReceive and renders report-status exactly as the DO path did.
 
 interface ParsedPush {
@@ -492,8 +508,6 @@ async function parsePushRequest(req: Request, maxBytes: number): Promise<ParsedP
 interface StagedPack {
   packSha1: string;
   packBytes: number;
-  /** object count from the pack header (advisory in Step 1; the DO's scan binds) */
-  objectCount: number;
 }
 
 /**
@@ -510,15 +524,13 @@ async function stagePack(
   push: ParsedPush,
   maxBytes: number,
   sideband: boolean,
-  emit: (chunk: Uint8Array) => void
+  emit: (chunk: Uint8Array) => void,
+  metrics: { stagingPuts: number; stagingParts: number }
 ): Promise<StagedPack> {
   const sha = new Sha1();
   let tail = new Uint8Array(0); // rolling 20-byte lookbehind (the trailer)
   let total = 0;
   let lastLogged = 0;
-  // first >=12 bytes: the pack header (object count). A holder object because
-  // the only writes happen inside the absorb closure.
-  const headRef: { bytes: Uint8Array | null } = { bytes: null };
   const absorb = (data: Uint8Array) => {
     total += data.length;
     if (total > maxBytes) throw new Error("pack exceeds maximum push size");
@@ -526,12 +538,6 @@ async function stagePack(
       lastLogged = total;
       const msg = `Receiving pack: ${Math.round(total / 1048576)}MB\n`;
       if (sideband) for (const f of sidebandFrames(2, te.encode(msg))) emit(f);
-    }
-    if (headRef.bytes === null || headRef.bytes.length < 12) {
-      const prev = headRef.bytes;
-      headRef.bytes = prev
-        ? concat([prev, data]).subarray(0, Math.min(12, prev.length + data.length))
-        : data.subarray(0, Math.min(12, data.length));
     }
     const joined = tail.length ? concat([tail, data]) : data;
     if (joined.length > 20) {
@@ -545,9 +551,13 @@ async function stagePack(
   if (!push.reader) {
     // fully buffered (gzipped): hash the remainder, then one plain PUT
     if (push.head.length) absorb(push.head);
-    if (total) await bucket.put(stagingKey, push.head);
+    if (total) {
+      metrics.stagingPuts++;
+      await bucket.put(stagingKey, push.head);
+    }
   } else if (push.hint !== null) {
     // known length: R2 PUT over a FixedLengthStream
+    metrics.stagingPuts++;
     const fixed = new FixedLengthStream(push.hint);
     const writer = fixed.writable.getWriter();
     const put = bucket.put(stagingKey, fixed.readable);
@@ -578,6 +588,11 @@ async function stagePack(
     // chunked: 16 MiB multipart parts
     const mp = await beginRawMultipart(bucket, stagingKey);
     if (!mp) throw new Error("pack staging unavailable: R2 refused the multipart upload");
+    const uploadPart = mp.uploadPart;
+    mp.uploadPart = (data) => {
+      metrics.stagingParts++;
+      return uploadPart(data);
+    };
     const capture = new MultipartCapture(mp);
     try {
       if (push.head.length) {
@@ -609,12 +624,7 @@ async function stagePack(
   if (total < 32) throw new Error("pack too small");
   const packSha1 = toHex(sha.digest());
   if (toHex(tail) !== packSha1) throw new Error("pack checksum mismatch");
-  let objectCount = 0;
-  const head = headRef.bytes;
-  if (head && head.length >= 12) {
-    objectCount = ((head[8] << 24) | (head[9] << 16) | (head[10] << 8) | head[11]) >>> 0;
-  }
-  return { packSha1, packBytes: total, objectCount };
+  return { packSha1, packBytes: total };
 }
 
 /**
@@ -666,6 +676,19 @@ async function receivePack<E extends Env>(
   const stub = env.REPO.getByName(repo);
   const chunks: Uint8Array[] = [];
   const emit = (chunk: Uint8Array) => chunks.push(chunk);
+  // subrequest accounting for the T3 checkpoint (SPEC-0001 §6): every R2
+  // operation and DO RPC the receive path spends, logged at the end
+  const metrics = {
+    stagingPuts: 0,
+    stagingParts: 0,
+    scanGets: 0,
+    rangeGets: 0,
+    idxPuts: 0,
+    copies: 0,
+    rowRpcs: 0,
+    lookupRpcs: 0,
+    lookupOids: 0,
+  };
   let leaseToken: string | null = null;
   try {
     // 1. the command section only — the pack is never parsed here
@@ -700,7 +723,7 @@ async function receivePack<E extends Env>(
     let staged: StagedPack | null = null;
     if (push.head.length > 0) {
       try {
-        staged = await stagePack(bucket, begin.stagingKey, push, maxBytes, sideband, emit);
+        staged = await stagePack(bucket, begin.stagingKey, push, maxBytes, sideband, emit, metrics);
       } catch (err) {
         unpackError = err instanceof Error ? err.message : String(err);
         console.log(`[receive ${repo}] staging failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
@@ -712,22 +735,124 @@ async function receivePack<E extends Env>(
       }
     }
 
-    // 4. copy staging → packs/ BEFORE finalize (crash ordering, see header)
+    // 4. scan + delta resolution + idx v2 (SPEC-0001a §3 Step 2): the Worker
+    // reads the staging object directly, resolves every delta, streams index
+    // rows to the DO in bounded batches, and emits the idx — the DO never
+    // touches pack bytes.
     let pack: FinalizedPack = NO_PACK;
+    let packIncomplete = false;
     if (staged && !unpackError) {
       const packKey = `repos/${begin.storageKey}/packs/pack-${staged.packSha1}.pack`;
-      await copyObject(bucket, begin.stagingKey, packKey);
-      pack = {
-        packKey,
-        packSha1: staged.packSha1,
-        packBytes: staged.packBytes,
-        objectCount: staged.objectCount,
-        idxBytes: 0, // idx v2 emission is the Worker scan's job from Step 2
-      };
+      const idxKey = `repos/${begin.storageKey}/packs/pack-${staged.packSha1}.idx`;
+      try {
+        const progress = (msg: string) => {
+          if (sideband) for (const f of sidebandFrames(2, te.encode(msg))) emit(f);
+        };
+        // 4a. one streaming GET of the staging object drives the whole walk;
+        // rows stream out through putIndexRows as deltas resolve
+        const stagedObj = await bucket.get(begin.stagingKey);
+        if (!stagedObj) throw new Error("staged pack object missing from R2");
+        if (stagedObj.size !== staged.packBytes) throw new Error("staged pack size mismatch");
+        metrics.scanGets++;
+        const collisionDetect = env.SHA1DC === "1";
+        const cacheMb = parseInt(env.INGEST_CACHE_MB ?? "", 10) || 16;
+        const resolver = new DeltaResolver(
+          {
+            selfPackKey: begin.stagingKey,
+            lookupObjects: async (oids) => {
+              metrics.lookupRpcs++;
+              metrics.lookupOids += oids.length;
+              return stub.lookupObjects(begin.leaseToken, oids);
+            },
+            readEntryBytes: async (key, off, len) => {
+              metrics.rangeGets++;
+              const region = await bucket.get(key, { range: { offset: off, length: len } });
+              if (!region) throw new Error(`pack object missing from R2: ${key}`);
+              return new Uint8Array(await region.arrayBuffer());
+            },
+            putRows: async (rows) => {
+              metrics.rowRpcs++;
+              return stub.putIndexRows(begin.leaseToken, rows);
+            },
+          },
+          {
+            cacheBytes: Math.max(1, cacheMb) * 1024 * 1024,
+            collisionDetect,
+            onProgress: progress,
+          }
+        );
+        await walkPack(
+          { body: stagedObj.body, size: stagedObj.size },
+          (entry) => resolver.onEntry(entry),
+          { collisionDetect, onHeader: (count) => resolver.init(count), onProgress: progress }
+        );
+        const resolved = await resolver.finish();
+        packIncomplete = resolved.incomplete;
+        if (resolved.incomplete) {
+          console.log(`[receive ${repo}] connectivity check failed: missing ${resolved.firstMissing}`);
+        }
+
+        // 4b. idx v2 streamed to its final key. The length is exact up front
+        // (fixed header + fanout + 28N + large offsets + two checksums), so
+        // the PUT rides a FixedLengthStream and a short write fails loudly.
+        let largeOffsets = 0;
+        for (let i = 0; i < resolved.oidEntry.length; i++) {
+          if (resolved.entryOffsets[resolved.oidEntry[i]] >= 0x80000000) largeOffsets++;
+        }
+        const expectedIdx = 1072 + 28 * resolved.objects + 8 * largeOffsets;
+        const fixed = new FixedLengthStream(expectedIdx);
+        const put = bucket.put(idxKey, fixed.readable);
+        const writer = fixed.writable.getWriter();
+        let idxBytes: number;
+        try {
+          idxBytes = await writeIdx((chunk) => writer.write(chunk), {
+            oids: resolved.oids,
+            oidEntry: resolved.oidEntry,
+            entryCrcs: resolved.entryCrcs,
+            entryOffsets: resolved.entryOffsets,
+            packSha1: staged.packSha1,
+          });
+          await writer.close();
+        } catch (err) {
+          try {
+            await writer.abort(err);
+          } catch {
+            // already errored by the short write
+          }
+          try {
+            await put;
+          } catch {
+            // the destination rejects alongside the failed write
+          }
+          throw err;
+        }
+        await put;
+        metrics.idxPuts++;
+        if (idxBytes !== expectedIdx) {
+          throw new Error(`idx length mismatch: wrote ${idxBytes}, expected ${expectedIdx}`);
+        }
+
+        // 4c. copy staging → packs/ BEFORE finalize (crash ordering, see header)
+        await copyObject(bucket, begin.stagingKey, packKey);
+        metrics.copies++;
+        pack = {
+          packKey,
+          packSha1: staged.packSha1,
+          packBytes: staged.packBytes,
+          objectCount: resolved.objects,
+          idxBytes,
+        };
+      } catch (err) {
+        // scan/resolution/idx failures surface verbatim in report-status
+        // ("unpack <msg>"); rows already pushed are crash debris the DO's
+        // orphan sweep reclaims (their pack id never reaches pack_meta)
+        unpackError = err instanceof Error ? err.message : String(err);
+        console.log(`[receive ${repo}] index failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+      }
     }
 
-    // 5. finalize: the DO ingests from the R2 object, re-checks per-command CAS
-    // and commits refs + refs_version in one transaction
+    // 5. finalize: the DO re-checks per-command CAS and commits refs +
+    // refs_version in one transaction (the pack is already indexed)
     const fin = await stub.finalizeReceive({
       leaseToken: begin.leaseToken,
       expectedRefsVersion: begin.refsVersion,
@@ -735,6 +860,7 @@ async function receivePack<E extends Env>(
       newTips: push.commands.map((c) => (c.next === ZERO_OID ? null : c.next)),
       pack,
       unpackError,
+      packIncomplete,
     });
     leaseToken = null; // finalize decided the lease; the release below is a no-op sweep
     if (fin.tag === "lease_mismatch") {
@@ -745,6 +871,24 @@ async function receivePack<E extends Env>(
 
     // 6. report-status — byte-identical to the pre-split DO rendering
     if (wantStatus) emit(renderStatus(asCommandResults(fin.results), unpackError, sideband));
+
+    const doRpcs = 2 + metrics.rowRpcs + metrics.lookupRpcs;
+    const subrequests =
+      metrics.stagingPuts +
+      metrics.stagingParts +
+      metrics.scanGets +
+      metrics.rangeGets +
+      metrics.idxPuts +
+      metrics.copies * 2 +
+      doRpcs;
+    console.log(
+      `[receive ${repo}] subrequests: total=${subrequests}` +
+        ` staging=${metrics.stagingPuts + metrics.stagingParts}` +
+        ` scanGets=${metrics.scanGets} rangeGets=${metrics.rangeGets}` +
+        ` idxPuts=${metrics.idxPuts} copies=${metrics.copies}` +
+        ` rows=${metrics.rowRpcs} lookups=${metrics.lookupRpcs}/${metrics.lookupOids}` +
+        ` doRpcs=${doRpcs}`
+    );
 
     // bookkeeping after an applied push (was keyed on the x-changed header)
     if (fin.tag === "committed" && fin.updates.length > 0) {

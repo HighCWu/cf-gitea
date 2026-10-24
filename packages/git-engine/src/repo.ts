@@ -2,7 +2,6 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { td, isOid } from "./git/util";
 import { GitStore } from "./git/store";
-import { ObjCache } from "./git/packstore";
 import { OidSet } from "./git/oidset";
 import { gunzipLimited } from "./git/zlib";
 import {
@@ -16,13 +15,17 @@ import {
 import {
   beginReceive,
   finalizeReceive,
+  lookupObjects,
+  putIndexRows,
   releaseReceive,
   sweepExpiredLeases,
   type BeginReceiveInput,
   type BeginReceiveResult,
   type FinalizeReceiveInput,
   type FinalizeReceiveResult,
+  type IndexRow,
   type LeaseHost,
+  type LookupObjectResult,
   type ReleaseReceiveInput,
   type ReleaseReceiveResult,
 } from "./control-plane";
@@ -431,11 +434,13 @@ export class RepoCell extends DurableObject<Env> {
     return `pack/${repo}/${this.store.reachableVersion()}`;
   }
 
-  // ---- receive control plane (SPEC-0001a §3 Step 1) ------------------------
-  // Public lease RPCs, callable as Workers RPC by the Worker-side data plane
-  // (mod.ts receive flow). The implementations live in control-plane.ts; the
-  // DO contributes storage, env-derived knobs, and the R2 delete adapter.
-  // Tagged unions only — application outcomes never throw across this boundary.
+  // ---- receive control plane (SPEC-0001a §3 Steps 1-2) ---------------------
+  // Public lease/index RPCs, callable as Workers RPC by the Worker-side data
+  // plane (mod.ts receive flow). The implementations live in control-plane.ts;
+  // the DO contributes storage and the R2 delete adapter. Tagged unions only —
+  // application outcomes never throw across this boundary (lookupObjects'
+  // lost-lease case is the one deliberate exception: the push is dead
+  // regardless, so it surfaces as a transport-class failure).
 
   /** Request-less RPC paths rebind R2 from the persisted repo name (set by the
    * first HTTP request — the advert always precedes a push). */
@@ -446,20 +451,9 @@ export class RepoCell extends DurableObject<Env> {
 
   private leaseHost(): LeaseHost {
     this.rpcBind();
-    // a dedicated cache makes pack-adjacent delta bases nearly free, but a
-    // miss just reloads the base from SQLite, so the budget bounds peak
-    // memory rather than correctness. Real Workers have a hard 128MB
-    // isolate (stay tiny); celld runs a multi-GB heap but a push must still
-    // fit a bounded container, so default to 64MB there instead of holding
-    // the whole working set. Operators tune it with INGEST_CACHE_MB.
-    const onWorkers = typeof caches !== "undefined";
-    const defaultCacheMb = onWorkers ? 16 : 64;
-    const cacheMb = parseInt(this.env.INGEST_CACHE_MB ?? "", 10) || defaultCacheMb;
     return {
       store: this.store,
       storage: this.ctx.storage,
-      ingestCacheBytes: Math.max(1, cacheMb) * 1024 * 1024,
-      collisionDetect: this.env.SHA1DC === "1",
       deletePackObjects: async (keys) => {
         const bucket = this.env.REPO_PACKS;
         if (!bucket) return;
@@ -484,6 +478,17 @@ export class RepoCell extends DurableObject<Env> {
 
   async releaseReceive(input: ReleaseReceiveInput): Promise<ReleaseReceiveResult> {
     return releaseReceive(this.leaseHost(), input);
+  }
+
+  /** Land one bounded batch of Worker-resolved index rows (Step 2). */
+  async putIndexRows(leaseToken: string, rows: IndexRow[]): Promise<{ tag: "ok" } | { tag: "lease_mismatch" }> {
+    return putIndexRows(this.leaseHost(), leaseToken, rows);
+  }
+
+  /** Resolve oids for the Worker's thin-pack bases and connectivity
+   * anti-checks (Step 2); the Worker R2-reads packed hits itself. */
+  async lookupObjects(leaseToken: string, oids: string[]): Promise<LookupObjectResult[]> {
+    return lookupObjects(this.leaseHost(), leaseToken, oids);
   }
 
   // ---- typed content surface ----------------------------------------------

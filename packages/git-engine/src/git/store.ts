@@ -2,7 +2,9 @@ import { concat, te, sha1hex } from "./util";
 import { deflate, inflate } from "./zlib";
 import { ObjType } from "./objects";
 import { OidSet } from "./oidset";
-import { PackStore, ObjCache, ObjRec } from "./packstore";
+import { PackStore, LOOSE_LOOKUP_CAP } from "./packstore";
+import { ObjCache, ObjRec } from "../receive/objcache";
+import type { LookupObjectHit, LookupObjectResult } from "../control-plane";
 
 /** A reachable pack entry, streamed in storage order by `reachablePackedAfter`.
  *  The `size` field of a full PackedEntry is not needed to emit the pack, so it
@@ -86,9 +88,6 @@ export class GitStore {
         data TEXT NOT NULL,
         PRIMARY KEY (tip_oid, period)
       );
-      CREATE TABLE IF NOT EXISTS push_edges (
-        child TEXT NOT NULL
-      );
       CREATE TABLE IF NOT EXISTS leases (
         lease_token TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -169,55 +168,50 @@ export class GitStore {
     return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM objects").one().n + this.packs.countObjects();
   }
 
-  // --- push connectivity ---------------------------------------------------
-  // Connectivity of a fresh push is checked in SQL, not by an in-memory graph
-  // walk: the pushed pack must be complete, i.e. every object it introduces
-  // must have its referenced children in `pack_objects` ∪ `objects`. Children
-  // are staged into `push_edges` in bounded batches and each batch is
-  // anti-joined against the stores, so the check costs O(batch) rows of scratch
-  // rather than an OidSet that scales with the object count.
+  // --- Worker object lookups (SPEC-0001a §3 Step 2) --------------------------
+  // Thin-pack base resolution and the receive connectivity anti-check run in
+  // the Worker; this is their only window into the object database. Packed
+  // hits return the pack key + entry range (the Worker R2-reads the bytes
+  // itself); loose hits ship their content inline, because loose bytes live in
+  // DO SQLite where the Worker cannot reach.
 
-  /** A page of a pack's non-blob oids after `after` (keyset, so the scan holds
-   * one page, never the whole pack). Empty array ends the walk. */
-  packNonBlobOidsAfter(packId: number, after: string, limit: number): string[] {
-    return this.sql
-      .exec<{ oid: string }>(
-        "SELECT oid FROM pack_objects WHERE pack_id = ? AND type != 'blob' AND oid > ? ORDER BY oid LIMIT ?",
-        packId,
-        after,
-        limit,
-      )
-      .toArray()
-      .map((r) => r.oid);
-  }
-
-  resetPushEdges(): void {
-    this.sql.exec("DELETE FROM push_edges");
-  }
-
-  /** Stage referenced child oids, chunked under the DO's ~100 bound-variable
-   * statement cap. */
-  addPushEdges(children: string[]): void {
-    for (let i = 0; i < children.length; i += 64) {
-      const batch = children.slice(i, i + 64);
-      const values = batch.map(() => "(?)").join(",");
-      this.sql.exec(`INSERT INTO push_edges (child) VALUES ${values}`, ...batch);
+  /** Aligned with the input oids; packed hits first, loose content as fallback. */
+  lookupObjectsForWorker(oids: string[]): LookupObjectResult[] {
+    const packed = this.packs.lookupPacked(oids);
+    const out: LookupObjectResult[] = new Array(oids.length);
+    for (let i = 0; i < oids.length; i++) {
+      const hit = packed[i];
+      if (hit) {
+        out[i] = hit;
+        continue;
+      }
+      out[i] = this.lookupLooseForWorker(oids[i]);
     }
+    return out;
   }
 
-  /** The first staged child absent from both stores, or null when every staged
-   * child is present. SQLite runs the membership test over its own indexes, so
-   * no oid set is built in the isolate. */
-  firstMissingPushEdge(): string | null {
+  private lookupLooseForWorker(oid: string): LookupObjectResult {
+    if (!this.hasLoose) return { found: false };
     const rows = this.sql
-      .exec<{ child: string }>(
-        `SELECT e.child FROM push_edges e
-         WHERE NOT EXISTS (SELECT 1 FROM pack_objects p WHERE p.oid = e.child)
-           AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.oid = e.child)
-         LIMIT 1`,
-      )
+      .exec<{ type: ObjType; size: number }>("SELECT type, size FROM objects WHERE oid = ?", oid)
       .toArray();
-    return rows.length ? rows[0].child : null;
+    if (!rows.length) return { found: false };
+    const hit: LookupObjectHit = {
+      found: true,
+      packKey: "", // loose: no pack entry; the Worker cannot range-read SQLite
+      offset: -1,
+      dataOff: -1,
+      dataLen: rows[0].size,
+      type: rows[0].type,
+      baseOid: null,
+    };
+    if (rows[0].size <= LOOSE_LOOKUP_CAP) {
+      const chunks = this.sql
+        .exec<{ data: ArrayBuffer }>("SELECT data FROM chunks WHERE oid = ? ORDER BY seq", oid)
+        .toArray();
+      hit.data = inflate(concat(chunks.map((r) => new Uint8Array(r.data))));
+    }
+    return hit;
   }
 
   // --- receive leases (SPEC-0001a §3 Step 1) --------------------------------
@@ -253,6 +247,12 @@ export class GitStore {
 
   deleteLease(leaseToken: string): void {
     this.sql.exec("DELETE FROM leases WHERE lease_token = ?", leaseToken);
+  }
+
+  /** Persist new lease payload JSON (the Worker's first putIndexRows batch
+   * allocates the pack id; finalize and the sweeps read it from here). */
+  updateLeasePayload(leaseToken: string, payload: string): void {
+    this.sql.exec("UPDATE leases SET payload = ? WHERE lease_token = ?", payload, leaseToken);
   }
 
   hasActiveReceiveLease(now: number): boolean {

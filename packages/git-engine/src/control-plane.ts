@@ -1,15 +1,19 @@
 /**
- * Receive control plane (SPEC-0001a §3 Step 1).
+ * Receive control plane (SPEC-0001a §3 Steps 1-2).
  *
- * The push data plane (pkt-line parse, pack staging, staging→packs copy) runs
- * in the Worker; the DO keeps refs, the object index, and the receive LEASE.
- * These are the three public RPCs on `RepoCell` (exposed as Workers RPC), and
- * every application outcome crosses the boundary as a tagged union — never a
- * thrown error (transport failures still throw and are retryable-unknown:
- * finalize is idempotent-on-`lease_mismatch` and the lease expiry sweep makes
- * retry safe).
+ * The push data plane (pkt-line parse, pack staging, scan, delta resolution,
+ * idx emission, staging→packs copy) runs in the Worker; the DO keeps refs,
+ * the object INDEX, and the receive LEASE. These are the public RPCs on
+ * `RepoCell` (exposed as Workers RPC), and every application outcome crosses
+ * the boundary as a tagged union — never a thrown error (transport failures
+ * still throw and are retryable-unknown: finalize is idempotent-on-
+ * `lease_mismatch` and the lease expiry sweep makes retry safe).
+ *
+ * Step 2 moves the scan itself into the Worker: index rows arrive through
+ * {@link putIndexRows} in bounded control-plane batches, and thin-pack /
+ * cross-pack bases resolve through {@link lookupObjects} — the DO never reads
+ * pack bytes.
  */
-import { ObjCache } from "./git/packstore";
 import {
   commitPush,
   latestCommitTime,
@@ -18,6 +22,7 @@ import {
   CommandResult,
   PushCommand,
 } from "./git/protocol";
+import { ObjType } from "./git/objects";
 import { ZERO_OID } from "./git/util";
 import type { GitStore } from "./git/store";
 import type { RefUpdate } from "./mod";
@@ -84,6 +89,11 @@ export interface FinalizeReceiveInput {
   pack: FinalizedPack;
   /** unpacker/scan failure text, null on success — forces every command to fail */
   unpackError: string | null;
+  /** Worker-side connectivity outcome (SPEC-0001a §3 Step 2): true when the
+   * scan's anti-check found a referenced child absent from the pack and the
+   * object database. validatePush then rejects every non-delete command with
+   * "missing necessary objects" exactly as the deleted packComplete() did. */
+  packIncomplete?: boolean;
 }
 
 export type FinalizeCommitted = {
@@ -115,14 +125,72 @@ export interface ReleaseReceiveInput {
 }
 export type ReleaseReceiveResult = { tag: "released" } | { tag: "lease_mismatch" };
 
-// ---- Step-1 semantics notes (SPEC-0001a §3 Step 1) ------------------------
+// ---- Step-2 index RPCs (SPEC-0001a §3 Step 2) -------------------------------
+
+/**
+ * One object of the received pack, scanned and resolved by the Worker. The
+ * full dgit `pack_objects` column set — verbatim entry re-emission (serve
+ * path) and idx v2 need all of it (SPEC-0001a §8 correction 1).
+ */
+export interface IndexRow {
+  oid: string;
+  /** entry start offset in the pack (the type/size header) */
+  offset: number;
+  /** start of the stored (compressed) region */
+  dataOff: number;
+  /** length of the stored region (incl. REF_DELTA base oid / ofs bytes) */
+  dataLen: number;
+  type: ObjType;
+  /** inflated object size */
+  size: number;
+  /** inflated entry size (the delta stream for deltas) */
+  entrySize: number;
+  /** delta base oid, null for full entries */
+  baseOid: string | null;
+  /** CRC-32 of the raw stored bytes — the idx v2 field */
+  crc32: number;
+}
+
+export type LookupObjectHit = {
+  found: true;
+  /** full R2 key of the pack holding the object ("" for loose hits) */
+  packKey: string;
+  /** entry start offset, -1 for loose hits */
+  offset: number;
+  dataOff: number;
+  dataLen: number;
+  type: ObjType;
+  baseOid: string | null;
+  /** present ONLY for loose hits: loose content lives in DO SQLite, which the
+   * Worker cannot read, so the DO ships it inline; packed hits carry no bytes
+   * — the Worker R2-reads their entry range itself (SPEC-0001a §3 Step 2).
+   * Loose content beyond LOOSE_LOOKUP_CAP is omitted (the Worker then treats
+   * the base as unavailable for deltas; presence still holds for
+   * connectivity). */
+  data?: Uint8Array;
+};
+export type LookupObjectResult = LookupObjectHit | { found: false };
+
+/** Lease payload JSON persisted with the receive lease row. */
+interface LeasePayload {
+  stagingKey?: string;
+  storageKey?: string;
+  /** allocated when the first IndexRow batch lands (pack_meta keys it later) */
+  packId?: number;
+}
+
+// ---- Step-1/2 semantics notes -----------------------------------------------
 // - packBytes === 0 means "no pack" (a deletes-only push): finalize skips the
-//   ingest and goes straight to the ref transaction. A real pack is never
+//   pack work and goes straight to the ref transaction. A real pack is never
 //   smaller than 32 bytes, so 0 is unambiguous.
-// - idxBytes is always 0 in Step 1: idx v2 emission is the Worker's job from
-//   Step 2 on (SPEC-0001a §3 Step 2).
-// - objectCount is advisory in Step 1 (read off the pack header by the Worker);
-//   the DO's own scan re-derives the true count and its structural checks bind.
+// - objectCount is the Worker scan's unique-object count and idxBytes the
+//   emitted idx v2 length (both real from Step 2 on).
+// - unpackError carries the Worker scan's actual failure text — report-status
+//   renders it verbatim ("unpack <msg>"), replacing Step 1's generic
+//   "unpacker error" placeholder.
+// - index rows land BEFORE finalize; a crash between them leaves rows whose
+//   pack id has no pack_meta entry — sweepOrphanRows (each finalize) and the
+//   lease sweeps reclaim them, mirroring the old ingest-crash story.
 // - storageKey is the persisted repo name (meta.repo) until SPEC-0003 supplies
 //   the D1-minted r_<id>; R2 keys stay per-repo-namespaced either way.
 
@@ -141,10 +209,6 @@ export interface LeaseHost {
   store: GitStore;
   /** transactionSync / setAlarm */
   storage: DurableObjectStorage;
-  /** ingest cache budget in bytes (env INGEST_CACHE_MB, default 16 on Workers) */
-  ingestCacheBytes: number;
-  /** screen every object with SHA-1DC (env SHA1DC === "1") */
-  collisionDetect: boolean;
   /** best-effort deletes in the REPO_PACKS bucket (no-op without a binding) */
   deletePackObjects(keys: string[]): Promise<void>;
 }
@@ -156,26 +220,30 @@ function toCommandResults(results: CommandResult[]): ReceiveCommandResult[] {
 /** Control-plane results → protocol CommandResults, for report-status
  * rendering on the Worker side (renderStatus consumes the protocol shape). */
 export function asCommandResults(results: ReceiveCommandResult[]): CommandResult[] {
-  return toCommandResultsFromInput(results);
+  return toCommandResults(results);
 }
 
-function toCommandResultsFromInput(results: ReceiveCommandResult[]): CommandResult[] {
-  return results.map((r) => ({ ref: r.ref, ok: r.ok, msg: r.message }));
+function parseLeasePayload(payload: string): LeasePayload {
+  try {
+    return JSON.parse(payload) as LeasePayload;
+  } catch {
+    // a corrupt payload leaves no staging/pack id to sweep; the row is
+    // authoritative either way
+    return {};
+  }
 }
 
-/** Sweep expired leases and their staging objects. Runs at every beginReceive
- * (so a crashed holder never blocks past its TTL) and from the alarm. */
+/** Sweep expired leases plus their staging objects and orphaned index rows.
+ * Runs at every beginReceive (so a crashed holder never blocks past its TTL)
+ * and from the alarm. */
 export async function sweepExpiredLeases(host: LeaseHost): Promise<void> {
   const expired = host.store.expiredLeases(Date.now());
   for (const lease of expired) {
     host.store.deleteLease(lease.leaseToken);
     if (lease.kind !== "receive") continue;
-    try {
-      const payload = JSON.parse(lease.payload) as { stagingKey?: string };
-      if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
-    } catch {
-      // a corrupt payload must not keep the lease row alive; it is gone already
-    }
+    const payload = parseLeasePayload(lease.payload);
+    if (typeof payload.packId === "number") host.store.packs.sweepPackRows(payload.packId);
+    if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
   }
 }
 
@@ -205,7 +273,8 @@ export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): P
   const leaseToken = crypto.randomUUID().replaceAll("-", "");
   const stagingKey = `repos/${storageKey}/staging/pack-rx-${leaseToken}.pack`;
   const leaseExpiresAt = Date.now() + RECEIVE_LEASE_TTL_MS;
-  store.createLease(leaseToken, "receive", leaseExpiresAt, JSON.stringify({ stagingKey, storageKey }));
+  const payload: LeasePayload = { stagingKey, storageKey };
+  store.createLease(leaseToken, "receive", leaseExpiresAt, JSON.stringify(payload));
   try {
     // the sweep backstop: fire shortly after expiry even if no push arrives
     await host.storage.setAlarm(leaseExpiresAt + 1000);
@@ -224,11 +293,56 @@ export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): P
 }
 
 /**
- * Ingest (from the R2 object the Worker staged and copied — never the request
- * stream), validate connectivity, then apply per-command CAS + multi-ref
- * commit + refs_version bump in ONE transactionSync. The copied packs/ object
- * is recorded in pack_meta with its R2 key; the staging object is swept here so
- * a successful finalize leaves exactly one copy.
+ * Land one bounded batch of Worker-resolved index rows for the lease's pack.
+ * The pack id is allocated on the first batch and persisted in the lease
+ * payload, so finalize (and every sweep) can name the rows without another
+ * channel. `INSERT OR IGNORE` keeps a duplicate oid's FIRST location — the
+ * same semantics the DO's own ingest inserts had.
+ */
+export async function putIndexRows(host: LeaseHost, leaseToken: string, rows: IndexRow[]): Promise<{ tag: "ok" } | { tag: "lease_mismatch" }> {
+  const lease = host.store.getLease(leaseToken);
+  if (!lease || lease.kind !== "receive" || lease.expiresAt <= Date.now()) {
+    return { tag: "lease_mismatch" };
+  }
+  if (!rows.length) return { tag: "ok" };
+  const payload = parseLeasePayload(lease.payload);
+  let packId = payload.packId;
+  if (typeof packId !== "number") {
+    packId = host.store.packs.nextPackId();
+    host.store.updateLeasePayload(leaseToken, JSON.stringify({ ...payload, packId }));
+    // rows for this pack are readable from this RPC on: prime the backend to
+    // the staging object so DO-side reads over the fresh rows (the ancestry
+    // walk in validatePush) resolve through R2, not a missing SQLite backend
+    if (payload.stagingKey) host.store.packs.primePack(packId, payload.stagingKey);
+  }
+  host.store.packs.putRows(packId, rows);
+  return { tag: "ok" };
+}
+
+/**
+ * Resolve oids against the object database for the Worker's thin-pack base
+ * resolution and connectivity anti-checks (SPEC-0001a §3 Step 2): packed
+ * objects return their pack key + entry range (the Worker R2-reads the bytes
+ * itself), loose objects return their content inline. Results are
+ * index-aligned with the input. A lost lease has no result variant to return —
+ * the push is dead regardless, so it surfaces as an RPC failure (transport
+ * class, retryable-unknown).
+ */
+export async function lookupObjects(host: LeaseHost, leaseToken: string, oids: string[]): Promise<LookupObjectResult[]> {
+  const lease = host.store.getLease(leaseToken);
+  if (!lease || lease.kind !== "receive" || lease.expiresAt <= Date.now()) {
+    throw new Error("receive lease invalid for lookupObjects");
+  }
+  const out = host.store.lookupObjectsForWorker(oids);
+  return out;
+}
+
+/**
+ * Validate, then apply per-command CAS + multi-ref commit + refs_version bump
+ * in ONE transactionSync. The pack was already scanned, resolved and indexed
+ * by the Worker (rows landed via putIndexRows); finalize records pack_meta,
+ * re-checks CAS, and sweeps the staging object so a successful finalize leaves
+ * exactly one copy of the pack bytes.
  */
 export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInput): Promise<FinalizeReceiveResult> {
   const { store } = host;
@@ -236,36 +350,29 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
   if (!lease || lease.kind !== "receive" || lease.expiresAt <= Date.now()) {
     return { tag: "lease_mismatch" };
   }
-  let stagingKey = "";
-  try {
-    stagingKey = (JSON.parse(lease.payload) as { stagingKey?: string }).stagingKey ?? "";
-  } catch {
-    // treat as empty; the sweep below then only clears the row
-  }
+  const leaseData = parseLeasePayload(lease.payload);
+  const stagingKey = leaseData.stagingKey ?? "";
+  const packId = typeof leaseData.packId === "number" ? leaseData.packId : null;
+  // re-prime the backend cache (it is in-memory and this DO instance may have
+  // been recycled since the rows landed): validatePush's ancestry walk reads
+  // the fresh rows through the staging object until recordPack re-points at
+  // the copied packs/ key
+  if (packId !== null && stagingKey) store.packs.primePack(packId, stagingKey);
 
-  // unpacker/scan failures force every command to fail (the scan ran here in
-  // Step 1; from Step 2 the Worker supplies unpackError for its own scan)
-  let unpackError = input.unpackError;
-  let packId: number | null = null;
-  const hasPack = unpackError === null && input.pack.packBytes > 0;
-  if (hasPack) {
-    try {
-      const ingested = await store.packs.ingestStored(input.pack.packKey, input.pack.packBytes, {
-        cache: new ObjCache(host.ingestCacheBytes),
-        flush: () => host.storage.sync(),
-        collisionDetect: host.collisionDetect,
-      });
-      packId = ingested.packId;
-    } catch (err) {
-      unpackError = err instanceof Error ? err.message : String(err);
-    }
-  }
+  // reclaim SQLite debris of crashed ingests: rows whose pack id never
+  // reached pack_meta. The lease's own pack (rows landed mid-receive) is kept.
+  store.packs.sweepOrphanRows(packId);
 
-  // object-reading validation first (async: R2-backed objects are fetched over
-  // the network, which transactionSync cannot await), then the ref writes and
-  // version bump under one savepoint — a multi-ref push must not leave half
-  // its branches moved. Exactly one receive lease can be in this window.
-  const plan = await validatePush(store, input.commands, unpackError, packId);
+  // object-reading validation first (async: the ancestry walk reads stored
+  // objects over the network, which transactionSync cannot await), then the
+  // ref writes and version bump under one savepoint — a multi-ref push must
+  // not leave half its branches moved. Exactly one receive lease can be in
+  // this window. The Worker's scan already resolved every delta and ran the
+  // connectivity anti-check; validatePush consumes its verdict.
+  const plan = await validatePush(store, input.commands, input.unpackError, {
+    packId,
+    packIncomplete: input.packIncomplete === true,
+  });
   const outcome = host.storage.transactionSync(() => {
     // the lease may have been swept/released while the async passes ran
     const live = store.getLease(input.leaseToken);
@@ -278,6 +385,14 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
         changed: false,
         needsGc: false,
       };
+    }
+    // record the pack catalog entry inside the transaction that first points
+    // refs at it. A refs_version mismatch above skips this — the abandoned
+    // copy's rows are orphaned and reclaimed by a later sweep.
+    const hasPack = input.unpackError === null && input.pack.packBytes > 0;
+    if (hasPack) {
+      const id = packId ?? store.packs.nextPackId(); // 0-entry packs never allocated one
+      store.packs.recordPack(id, input.pack.packBytes, input.pack.packKey);
     }
     // DO-side guard for "no ref may point into unindexed storage": every
     // non-null new tip must be present in the store before the CAS commits
@@ -335,26 +450,24 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
 
 /**
  * Abandon a lease (scan failure, client gone, size cap hit). `sweep` also
- * removes the staging object. A lease finalize already decided is
- * `lease_mismatch` — finalize is idempotent-on-lease_mismatch, so a Worker
- * retrying after a transport failure can always call this.
+ * removes the staging object and any index rows the Worker already pushed. A
+ * lease finalize already decided is `lease_mismatch` — finalize is
+ * idempotent-on-lease_mismatch, so a Worker retrying after a transport failure
+ * can always call this.
  */
 export async function releaseReceive(host: LeaseHost, input: ReleaseReceiveInput): Promise<ReleaseReceiveResult> {
   const lease = host.store.getLease(input.leaseToken);
   if (!lease || lease.kind !== "receive") return { tag: "lease_mismatch" };
   host.store.deleteLease(input.leaseToken);
   if (input.sweep) {
-    try {
-      const payload = JSON.parse(lease.payload) as { stagingKey?: string };
-      if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
-    } catch {
-      // row is gone either way; a corrupt payload leaves no staging to sweep
-    }
+    const payload = parseLeasePayload(lease.payload);
+    if (typeof payload.packId === "number") host.store.packs.sweepPackRows(payload.packId);
+    if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
   }
   return { tag: "released" };
 }
 
-/** The zero pack a deletes-only push carries (see the Step-1 notes above). */
+/** The zero pack a deletes-only push carries (see the semantics notes above). */
 export const NO_PACK: FinalizedPack = {
   packKey: "",
   packSha1: ZERO_OID,
