@@ -222,7 +222,11 @@ export function registerGitRoutes(
       if (commit === null) {
         throw new ApiError(400, `sha not found [${sha}]`);
       }
-      const listRef = resolved !== null ? resolved.target : sha;
+      // listTree peels its ref argument to a COMMIT — when the caller passed
+      // a raw sha it may BE the commit's tree oid or the commit oid; resolve
+      // to the commit oid so the peel always works (the audit wave's finding:
+      // passing a tree oid peels nowhere and 404s every well-formed sha).
+      const listRef = resolved !== null ? resolved.target : (await reads.readCommit(sha))?.oid ?? sha;
       const tree = await reads.listTree(listRef);
       if (tree === null) {
         throw new ApiError(404, "not found");
