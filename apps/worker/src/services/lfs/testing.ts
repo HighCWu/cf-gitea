@@ -2,22 +2,22 @@
  * Test bootstrap for the SPEC-0006 suites (the auth `testing/` pattern):
  * real D1 + real R2 from wrangler.jsonc bindings, no mocks.
  *
- * `lfs_objects` is not in the generated migrations yet (schema.ts is owned by
- * another change), so suites create it from `LFS_OBJECTS_DDL_STATEMENTS` in a
- * top-level `beforeAll` — the vitest plugin's per-file storage isolation
- * discards other files' writes but retains schema created in `beforeAll` for
- * every test in the file. TODO: delete this module once the drizzle migration
- * lands and migrations cover the table.
+ * `lfs_objects` is in the generated migrations (migration 0005), so the
+ * bootstrap applies the migrations — the vitest plugin's per-file storage
+ * isolation discards other files' writes but retains schema created in
+ * `beforeAll` for every test in the file. The function keeps its historical
+ * name (`applyLfsObjectsDdl`) so callers need not change; the pre-migration
+ * DDL bootstrap it replaced lives on only as the superseded
+ * `LFS_OBJECTS_DDL_STATEMENTS` constant.
  */
 
 import { env } from "cloudflare:workers";
 
-import { LFS_OBJECTS_DDL_STATEMENTS } from "./state";
+import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 
+/** Apply the generated Drizzle migrations (creates `lfs_objects`). */
 export async function applyLfsObjectsDdl(): Promise<void> {
-  for (const statement of LFS_OBJECTS_DDL_STATEMENTS) {
-    await env.DB.prepare(statement).run();
-  }
+  await applyAuthD1Migrations();
 }
 
 /** Clear rows between tests (schema persists; only rows are per-test scratch). */

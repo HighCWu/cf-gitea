@@ -2,23 +2,21 @@
  * Test bootstrap for the SPEC-0007 suites (the LFS `testing.ts` pattern):
  * real D1 from the wrangler.jsonc binding, no mocks.
  *
- * The org schema is not in the generated migrations yet (schema.ts is owned
- * by another change), so suites apply the landed migrations
- * (`applyAuthD1Migrations`) plus `ORG_DDL_STATEMENTS` in a top-level
- * `beforeAll` — the vitest plugin's per-file storage isolation retains
- * schema created in `beforeAll` for every test in the file. TODO: delete
- * this module once the drizzle migration lands and migrations cover the
- * tables.
+ * The org schema is in the generated migrations (migration 0005), so the
+ * bootstrap applies the migrations — the vitest plugin's per-file storage
+ * isolation retains schema created in `beforeAll` for every test in the
+ * file. The function keeps its historical name (`applyOrgsDdl`) so callers
+ * need not change; the pre-migration DDL bootstrap it replaced lives on only
+ * as the superseded `ORG_DDL_STATEMENTS` constant.
  */
 
 import { env } from "cloudflare:workers";
 
-import { ORG_DDL_STATEMENTS } from "./orgs";
+import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 
+/** Apply the generated Drizzle migrations (creates the org tables). */
 export async function applyOrgsDdl(): Promise<void> {
-  for (const statement of ORG_DDL_STATEMENTS) {
-    await env.DB.prepare(statement).run();
-  }
+  await applyAuthD1Migrations();
 }
 
 /** Clear rows between tests (schema persists; only rows are per-test scratch).

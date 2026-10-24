@@ -203,13 +203,52 @@ export const users = sqliteTable(
     /** SPEC-0003 §2.5.6 — upstream VisibleType
      *  (modules/structs/visible_type.go:9-18): 'public' | 'limited' (repos
      *  visible to any authenticated principal) | 'private' (owner + site
-     *  admin only). Gates ACL row 2 alongside `repositories.visibility`. */
+     *  admin only). Gates ACL row 2 alongside `repositories.visibility`.
+     *  Recorded deviation from SPEC-0007 §3.2's INTEGER-ladder sketch: the
+     *  landed TEXT enum stays (0003); the org service expresses the listing
+     *  ceiling as an IN-list instead of a range compare. */
     visibility: text("visibility", { enum: ["public", "limited", "private"] })
       .notNull()
       .default("public"),
+    // -------------------------------------------------------------------------
+    // SPEC-0007 §3.2 — org-as-user-row amendments (users is ALTERed, not
+    // recreated): type, profile columns, the maintained member counter, and
+    // the org-only team-access flag. Upstream user.go:48–165.
+    // -------------------------------------------------------------------------
+    /** Upstream UserType 0/1 (user.go:48–67): 'user' | 'org' — orgs ARE user
+     *  rows (upstream's own trick, `Organization.TableName()` = "user",
+     *  gitea/models/organization/org.go:76–87). Usernames and org slugs share
+     *  `users_username_lower_uq`; owner lookups stay one type-blind read.
+     *  Reserved variants (2–5) have no cf-gitea equivalent yet. */
+    type: text("type", { enum: ["user", "org"] }).notNull().default("user"),
+    /** Upstream FullName (user.go:99–105); null for unused profile fields. */
+    fullName: text("full_name"),
+    description: text("description"),
+    website: text("website"),
+    location: text("location"),
+    /** AvatarEmail — the hash input, not a URL (upstream AvatarEmail). No
+     *  identicon is generated at org create (SPEC-0007 §4.6 divergence). */
+    avatarEmail: text("avatar_email"),
+    useCustomAvatar: integer("use_custom_avatar", { mode: "boolean" }).notNull().default(false),
+    /** Maintained org member counter (upstream NumMembers, org.go:330–331/537);
+     *  0 on plain users. Bumped/decremented in the same batch as membership
+     *  writes. */
+    numMembers: integer("num_members").notNull().default(0),
+    /** Org-only flag, honored when teams land (upstream user.go:165); stored
+     *  now so the tier-2 PATCH /orgs/{org} body has a home. */
+    repoAdminChangeTeamAccess: integer("repo_admin_change_team_access", {
+      mode: "boolean",
+    })
+      .notNull()
+      .default(false),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   },
-  (t) => [uniqueIndex("users_username_lower_uq").on(t.usernameLower)],
+  (t) => [
+    uniqueIndex("users_username_lower_uq").on(t.usernameLower),
+    // SPEC-0007 §3.2: the type-aware partial index keeps org lookups and user
+    // listings cheap.
+    index("users_type_idx").on(t.type),
+  ],
 );
 
 /**
@@ -688,4 +727,101 @@ export const webhookDeliveries = sqliteTable(
     uniqueIndex("webhook_deliveries_uuid_uq").on(t.uuid),
     index("webhook_deliveries_hook_idx").on(t.hookId),
   ],
+);
+
+// ---------------------------------------------------------------------------
+// SPEC-0006 §3.2 — LFS metadata state machine (lfs_objects).
+// ---------------------------------------------------------------------------
+
+/**
+ * LFS object metadata — the batch/verify/adopt/GC state machine rows
+ * (SPEC-0006 §3.2–3.4; the storage counterpart of upstream `LFSMetaObject`).
+ * Rows exist only for objects the LFS API touched — a pointer merely seen in
+ * git history never creates a row. Timestamps are unix seconds (`mode:
+ * "timestamp"`; the LFS state service converts explicitly). State
+ * transitions (§3.3):
+ *
+ *   absent --batch(upload)--> uploading --verify(200)--> verified
+ *   absent --adopt(HEAD ok)--> verified        (upload finished, verify lost)
+ *   uploading --sweep(HEAD ok)--> verified     (stale >24 h)
+ *   uploading --sweep(HEAD missing)--> deleted
+ *   verified --GC(unreachable > grace)--> row+object deleted
+ *
+ * `repo_id` is the NUMERIC repo key the LFS router derives (SPEC-0006 §2.1);
+ * the composite PK `(repo_id, oid)` is the per-repo object identity, and
+ * `(repo_id, state, updated_at)` serves the stale-sweep fan-out and GC
+ * candidate pages (§3.4). Ported verbatim from the service-side
+ * `LFS_OBJECTS_DDL_STATEMENTS` (migration 0005), which it supersedes.
+ */
+export const lfsObjects = sqliteTable(
+  "lfs_objects",
+  {
+    /** Numeric repo key derived by the LFS router (not `repositories.id`). */
+    repoId: integer("repo_id").notNull(),
+    /** sha256 hex of the object content (= the LFS oid). */
+    oid: text("oid").notNull(),
+    /** Declared byte size; quota projection sums this (§4.7). */
+    size: integer("size").notNull(),
+    /** 'uploading' | 'verified' (§3.3). */
+    state: text("state", { enum: ["uploading", "verified"] }).notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.repoId, t.oid] }),
+    index("idx_lfs_objects_repo_state_updated").on(t.repoId, t.state, t.updatedAt),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// SPEC-0007 §3.3/§3.6 — org membership and user/org rename redirects.
+// ---------------------------------------------------------------------------
+
+/**
+ * Org membership (SPEC-0007 §3.3; port of upstream `OrgUser`,
+ * org_user.go:26–31, plus our Owners-team collapse into `role`: 'owner' ⟺
+ * membership in the upstream synthetic Owners team at tier 1). Cascades on
+ * either side's user row (org deletion lands later; the FK is declared now).
+ */
+export const orgMembers = sqliteTable(
+  "org_members",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    orgId: integer("org_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Public member listing flag (upstream IsPublic; default false =
+     *  `DefaultOrgMemberVisible`). Grants/denies NO repo access (§4.5). */
+    isPublic: integer("is_public", { mode: "boolean" }).notNull().default(false),
+    /** 'owner' | 'member' — the §3.4 repo-create grant is `role = 'owner'`. */
+    role: text("role", { enum: ["owner", "member"] }).notNull().default("member"),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("org_members_org_user_uq").on(t.orgId, t.userId),
+    index("org_members_user_idx").on(t.userId),
+  ],
+);
+
+/**
+ * User/org rename redirects (SPEC-0007 §3.6; port of upstream `user_redirect`,
+ * models/user/redirect.go:33–46). The namespace-wide alias table for user AND
+ * org renames — distinct from `repo_redirects` (keyed (owner_id, lower_name)):
+ * owner renames write here, repo renames there. At most one redirect per
+ * lower-cased old name; creating an account/org on a live redirect consumes it.
+ */
+export const userRedirects = sqliteTable(
+  "user_redirects",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Case-folded old name — UNIQUE: one redirect per name. */
+    lowerName: text("lower_name").notNull(),
+    redirectUserId: integer("redirect_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+  },
+  (t) => [uniqueIndex("user_redirects_lower_uq").on(t.lowerName)],
 );

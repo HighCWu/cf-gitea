@@ -2,18 +2,16 @@
  * Organization service — SPEC-0007 (M2): org-as-user-row storage, membership,
  * the repo-create grant, rename + namespace redirects, visibility.
  *
- * Raw D1 access per the LFS-SVC pattern (src/services/lfs/state.ts): the org
- * tables are NOT yet in the Drizzle schema (schema.ts is owned by another
- * change), so D1 access goes through thin mappers over raw `D1Database`
- * prepared statements, with the DDL below. TODO(drizzle migration): port
- * `ORG_DDL_STATEMENTS` into `src/db/schema.ts` (a `type` column + org profile
- * columns on `users`, an `orgMembers` table, a `userRedirects` table) and run
- * `pnpm db:generate`; delete `applyOrgsDdl` and the test-side DDL bootstrap
- * once the generated migration exists. Until then tests create the schema
- * from this constant (schema applied in `beforeAll` persists per file).
- * The same TODO covers the two raw reads of tables that DO exist in the
- * landed schema (`users`, `repositories`): the migration owner should switch
- * those statements to Drizzle too so the module stops hand-writing SQL.
+ * D1 access goes through Drizzle ORM (src/db/schema.ts: the SPEC-0007 columns
+ * on `users`, `orgMembers`, `userRedirects` — migration 0005), per the
+ * architecture boundary (no hand-written SQL in services). Superseded:
+ * `ORG_DDL_STATEMENTS` below is kept only as the historical record of the
+ * pre-migration bootstrap — the generated migration is authoritative now,
+ * including its recorded deviation: `users.visibility` is the landed TEXT
+ * enum (migration 0003), NOT the INTEGER ladder sketched in SPEC-0007 §3.2;
+ * the service expresses the listing ceiling as an IN-list instead of a range
+ * compare. Raw reads of `users`/`repositories` (both long landed) go through
+ * Drizzle too, so the module no longer hand-writes any SQL.
  *
  * Storage decision (SPEC-0007 §3.1): organizations are `users` rows with
  * `type='org'` — upstream's own trick (`Organization` is a `user_model.User`
@@ -21,12 +19,20 @@
  * Usernames and org slugs share `UNIQUE(users.username_lower)`; owner lookups
  * (SPEC-0003 §2.1 step 4) stay one type-blind indexed read.
  *
- * Timestamps are unix seconds (repo convention). Booleans are 0/1. The
+ * Timestamps are unix seconds (repo convention, `mode: "timestamp"`). The
  * org-scoped queries all carry the `type='org'`/`role='owner'` filters that
  * mirror upstream `GetOrgByName` (org.go:400–413) and the Owners-team
- * collapse (§3.3–3.4).
+ * collapse (§3.3–3.4). Multi-statement mutations are ONE `db.batch([...])`
+ * (a single SQLite transaction on D1, the repos/issues service discipline);
+ * `UNIQUE(users.username_lower)` / `UNIQUE(org_members.org_id, user_id)` are
+ * the race arbiters — the loser catches the unique violation (drizzle wraps
+ * the driver error; see `isUniqueViolation`).
  */
 
+import { and, asc, eq, inArray, sql, type SQL } from "drizzle-orm";
+import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
+
+import { orgMembers, repositories, userRedirects, users } from "../../db/schema";
 import {
   LastOrgOwnerError,
   MAX_ORG_NAME_LENGTH,
@@ -41,9 +47,10 @@ import {
 } from "./errors";
 
 /**
- * The future Drizzle migration body (SPEC-0007 §3.2–3.4, §3.6). Kept here as
- * the single source of truth until schema.ts can own the tables (see the
- * module TODO).
+ * SUPERSEDED by migration 0005 (`users` amendments, `org_members` and
+ * `user_redirects` in src/db/schema.ts) — kept only so pre-migration scratch
+ * databases can still be bootstrapped by hand. Do not extend; change the
+ * schema + regenerate instead (AGENTS.md).
  *
  * `users` is ALTERed, not recreated: the landed table (migrations 0001/0003)
  * already carries `id, username, username_lower, email, display_name,
@@ -280,109 +287,62 @@ export interface ListOptions {
 export const DEFAULT_PAGE_SIZE = 30;
 export const MAX_PAGE_SIZE = 50;
 
-interface UserSqlRow {
-  id: number;
-  username: string;
-  username_lower: string;
-  email: string | null;
-  full_name: string | null;
-  description: string | null;
-  website: string | null;
-  location: string | null;
-  avatar_email: string | null;
-  use_custom_avatar: number;
-  visibility: string;
-  num_members: number;
-  repo_admin_change_team_access: number;
-  created_at: number;
-  type: string;
+/** The org projection of a `users` row as selected from Drizzle — OrgRecord
+ *  plus the `type` discriminator the §4.11 type gate reads. */
+interface OrgUserRow extends OrgRecord {
+  type: "user" | "org";
 }
 
-interface MembershipSqlRow {
-  id: number;
-  org_id: number;
-  user_id: number;
-  is_public: number;
-  role: string;
-  created_at: number;
-}
+/** Shared projection: the org columns of `users` (the landed table's
+ *  `display_name`/`is_admin` are not part of the org projection). */
+const ORG_USER_SELECTION = {
+  id: users.id,
+  username: users.username,
+  usernameLower: users.usernameLower,
+  email: users.email,
+  fullName: users.fullName,
+  description: users.description,
+  website: users.website,
+  location: users.location,
+  avatarEmail: users.avatarEmail,
+  useCustomAvatar: users.useCustomAvatar,
+  visibility: users.visibility,
+  numMembers: users.numMembers,
+  repoAdminChangeTeamAccess: users.repoAdminChangeTeamAccess,
+  createdAt: users.createdAt,
+  type: users.type,
+};
 
-interface RepoSqlRow {
-  id: string;
-  storage_key: string;
-  owner_namespace: string;
-  owner_id: number | null;
-  slug: string;
-  visibility: string;
-  default_branch: string;
-  is_empty: number;
-  is_archived: number;
-  status: string;
-  created_at: number;
-  updated_at: number | null;
-}
+/** Membership projection (§3.3: membership test = row exists). */
+const MEMBERSHIP_SELECTION = {
+  id: orgMembers.id,
+  orgId: orgMembers.orgId,
+  userId: orgMembers.userId,
+  isPublic: orgMembers.isPublic,
+  role: orgMembers.role,
+  createdAt: orgMembers.createdAt,
+};
 
-const ORG_COLUMNS = `id, username, username_lower, email, full_name, description, website, location, avatar_email, use_custom_avatar, visibility, num_members, repo_admin_change_team_access, created_at, type`;
-/** Same list, qualified for the org_members ⨝ users join. */
-const ORG_COLUMNS_U = ORG_COLUMNS.split(",")
-  .map((column) => `u.${column.trim()}`)
-  .join(", ");
-const REPO_COLUMNS = `id, storage_key, owner_namespace, owner_id, slug, visibility, default_branch, is_empty, is_archived, status, created_at, updated_at`;
-
-const toUnix = (date: Date): number => Math.floor(date.getTime() / 1000);
-const fromUnix = (seconds: number): Date => new Date(seconds * 1000);
+/** Repo projection for §2.2 row 2 listings. */
+const REPO_SELECTION = {
+  id: repositories.id,
+  storageKey: repositories.storageKey,
+  ownerNamespace: repositories.ownerNamespace,
+  ownerId: repositories.ownerId,
+  slug: repositories.slug,
+  visibility: repositories.visibility,
+  defaultBranch: repositories.defaultBranch,
+  isEmpty: repositories.isEmpty,
+  isArchived: repositories.isArchived,
+  status: repositories.status,
+  createdAt: repositories.createdAt,
+  updatedAt: repositories.updatedAt,
+};
 
 function clampPagination(options: ListOptions = {}): { limit: number; offset: number } {
   const page = Math.max(1, Math.floor(options.page ?? 1));
   const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, Math.floor(options.pageSize ?? DEFAULT_PAGE_SIZE)));
   return { limit: pageSize, offset: (page - 1) * pageSize };
-}
-
-function rowToOrg(row: UserSqlRow): OrgRecord {
-  return {
-    id: row.id,
-    username: row.username,
-    usernameLower: row.username_lower,
-    email: row.email,
-    fullName: row.full_name,
-    description: row.description,
-    website: row.website,
-    location: row.location,
-    avatarEmail: row.avatar_email,
-    useCustomAvatar: row.use_custom_avatar !== 0,
-    visibility: row.visibility as Visibility,
-    numMembers: row.num_members,
-    repoAdminChangeTeamAccess: row.repo_admin_change_team_access !== 0,
-    createdAt: fromUnix(row.created_at),
-  };
-}
-
-function rowToMembership(row: MembershipSqlRow): OrgMembershipRecord {
-  return {
-    id: row.id,
-    orgId: row.org_id,
-    userId: row.user_id,
-    isPublic: row.is_public !== 0,
-    role: row.role === "owner" ? "owner" : "member",
-    createdAt: fromUnix(row.created_at),
-  };
-}
-
-function rowToRepo(row: RepoSqlRow): OrgRepoRow {
-  return {
-    id: row.id,
-    storageKey: row.storage_key,
-    ownerNamespace: row.owner_namespace,
-    ownerId: row.owner_id,
-    slug: row.slug,
-    visibility: row.visibility === "private" ? "private" : "public",
-    defaultBranch: row.default_branch,
-    isEmpty: row.is_empty !== 0,
-    isArchived: row.is_archived !== 0,
-    status: row.status as OrgRepoRow["status"],
-    createdAt: fromUnix(row.created_at),
-    updatedAt: row.updated_at === null ? null : fromUnix(row.updated_at),
-  };
 }
 
 /** D1 unique-violation probe — the §4.1 shared-namespace race arbiter (same
@@ -402,7 +362,11 @@ function isUniqueViolation(error: unknown): boolean {
 // ---------------------------------------------------------------------------
 
 export class OrgService {
-  constructor(private readonly d1: D1Database) {}
+  private readonly db: DrizzleD1Database;
+
+  constructor(d1: D1Database) {
+    this.db = drizzle(d1);
+  }
 
   /**
    * Create an org — the port of upstream `CreateOrganization`
@@ -414,7 +378,9 @@ export class OrgService {
    * (org.go:335–337), insert the `users` row (`type='org'`,
    * `num_members=1`), insert the creator's membership row
    * (`role='owner'`, `is_public=false` = upstream `DefaultOrgMemberVisible`,
-   * org.go:347–353). No identicon/avatar generation (§4.6 divergence).
+   * org.go:347–353) — the membership's `org_id` is a scalar subquery on the
+   * just-inserted row, keeping the whole create one transaction. No
+   * identicon/avatar generation (§4.6 divergence).
    *
    * Not enforced here (caller-level, upstream parity): the
    * `CanCreateOrganization` site-config gate and the admin bypass
@@ -428,47 +394,50 @@ export class OrgService {
 
     const lower = input.name.toLowerCase();
     const now = input.now ?? new Date();
-    const seconds = toUnix(now);
 
     // Shared-namespace pre-check (upstream IsUserExist is type-blind,
     // user.go:546–555); the UNIQUE index stays the race arbiter below.
-    const existing = await this.d1
-      .prepare("SELECT id FROM users WHERE username_lower = ?")
-      .bind(lower)
-      .first<{ id: number }>();
-    if (existing !== null) throw new OrgNameCollisionError(input.name);
+    const existing = await this.db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, lower))
+      .get();
+    if (existing !== undefined) throw new OrgNameCollisionError(input.name);
 
     try {
-      await this.d1.batch([
+      await this.db.batch([
         // CreateOrganization pre-deletes redirects at the name (org.go:335–337):
         // creating on a live redirect consumes it (§4.10).
-        this.d1.prepare("DELETE FROM user_redirects WHERE lower_name = ?").bind(lower),
-        this.d1.prepare(
-          `INSERT INTO users (
-             username, username_lower, email, display_name, is_admin, status, visibility,
-             full_name, description, website, location, avatar_email,
-             use_custom_avatar, num_members, repo_admin_change_team_access, type, created_at
-           ) VALUES (?, ?, ?, NULL, 0, 'active', ?, ?, ?, ?, ?, NULL, 0, 1, 0, 'org', ?)`,
-        ).bind(
-          input.name,
-          lower,
-          input.email ?? null,
-          input.visibility ?? "public",
-          input.fullName ?? null,
-          input.description ?? null,
-          input.website ?? null,
-          input.location ?? null,
-          seconds,
-        ),
+        this.db.delete(userRedirects).where(eq(userRedirects.lowerName, lower)),
+        this.db.insert(users).values({
+          username: input.name,
+          usernameLower: lower,
+          email: input.email ?? null,
+          displayName: null,
+          isAdmin: false,
+          status: "active",
+          visibility: input.visibility ?? "public",
+          fullName: input.fullName ?? null,
+          description: input.description ?? null,
+          website: input.website ?? null,
+          location: input.location ?? null,
+          avatarEmail: null,
+          useCustomAvatar: false,
+          numMembers: 1,
+          repoAdminChangeTeamAccess: false,
+          type: "org",
+          createdAt: now,
+        }),
         // The creator's membership row — upstream inserts OrgUser plus the
         // synthetic Owners team + TeamUser rows (org.go:347–395); tier 1
         // collapses those into role='owner' (§3.3).
-        this.d1
-          .prepare(
-            `INSERT INTO org_members (org_id, user_id, is_public, role, created_at)
-             VALUES ((SELECT id FROM users WHERE username_lower = ?), ?, 0, 'owner', ?)`,
-          )
-          .bind(lower, input.ownerId, seconds),
+        this.db.insert(orgMembers).values({
+          orgId: sql`(select id from users where username_lower = ${lower})`,
+          userId: input.ownerId,
+          isPublic: false,
+          role: "owner",
+          createdAt: now,
+        }),
       ]);
     } catch (error) {
       if (isUniqueViolation(error)) throw new OrgNameCollisionError(input.name);
@@ -489,30 +458,28 @@ export class OrgService {
    */
   async getOrgByUsername(name: string): Promise<OrgRecord | null> {
     const lower = name.toLowerCase();
-    const row = await this.d1
-      .prepare(`SELECT ${ORG_COLUMNS} FROM users WHERE username_lower = ?`)
-      .bind(lower)
-      .first<UserSqlRow>();
-    if (row === null) return null;
+    const row = await this.db
+      .select(ORG_USER_SELECTION)
+      .from(users)
+      .where(eq(users.usernameLower, lower))
+      .get();
+    if (row === undefined) return null;
     return this.assertOrgRow(row);
   }
 
   /** Org by id (the redirect-gate flow: `LookupUserRedirect` → id → row). */
   async getOrgById(id: number): Promise<OrgRecord | null> {
-    const row = await this.d1
-      .prepare(`SELECT ${ORG_COLUMNS} FROM users WHERE id = ?`)
-      .bind(id)
-      .first<UserSqlRow>();
-    if (row === null) return null;
+    const row = await this.db.select(ORG_USER_SELECTION).from(users).where(eq(users.id, id)).get();
+    if (row === undefined) return null;
     return this.assertOrgRow(row);
   }
 
   /** §4.11 type gate shared by both lookups — non-org rows read as misses. */
-  private assertOrgRow(row: UserSqlRow): OrgRecord | null {
-    // Plain users (and rows predating the migration, which the DDL defaults
-    // to 'user') fail the check exactly like upstream GetOrgByName's
-    // `type = 1` predicate.
-    return row.type === "org" ? rowToOrg(row) : null;
+  private assertOrgRow(row: OrgUserRow): OrgRecord | null {
+    // Plain users (and rows predating migration 0005, which the column
+    // default sets to 'user') fail the check exactly like upstream
+    // GetOrgByName's `type = 1` predicate.
+    return row.type === "org" ? row : null;
   }
 
   /**
@@ -526,41 +493,37 @@ export class OrgService {
     const { limit, offset } = clampPagination(options);
     const maxVisibility = options.maxVisibility ?? "private";
 
-    const conds = ["m.user_id = ?", "u.type = 'org'"];
-    const binds: (number | string)[] = [userId];
+    const conds: SQL[] = [eq(orgMembers.userId, userId), eq(users.type, "org")];
     if (maxVisibility !== "private") {
       // Landed TEXT encoding of the SPEC §3.2 INTEGER ladder: the ceiling is
       // a set membership, not a range compare.
       conds.push(
         maxVisibility === "public"
-          ? `u.visibility = 'public'`
-          : `u.visibility IN ('public', 'limited')`,
+          ? eq(users.visibility, "public")
+          : inArray(users.visibility, ["public", "limited"]),
       );
+      // Upstream queryUserOrgIDs(uid, includePrivate = IncludeVisibility ==
+      // private) — non-public memberships only surface to self/admin lists.
+      conds.push(eq(orgMembers.isPublic, true));
     }
-    // Upstream queryUserOrgIDs(uid, includePrivate = IncludeVisibility ==
-    // private) — non-public memberships only surface to self/admin lists.
-    if (maxVisibility !== "private") conds.push("m.is_public = 1");
-    const where = conds.join(" AND ");
+    const where = and(...conds);
 
-    const rows = await this.d1
-      .prepare(
-        `SELECT ${ORG_COLUMNS_U} FROM org_members m
-         INNER JOIN users u ON u.id = m.org_id
-         WHERE ${where}
-         ORDER BY u.username_lower ASC LIMIT ? OFFSET ?`,
-      )
-      .bind(...binds, limit, offset)
-      .all<UserSqlRow>();
-    const totalRow = await this.d1
-      .prepare(
-        `SELECT COUNT(*) AS total FROM org_members m
-         INNER JOIN users u ON u.id = m.org_id
-         WHERE ${where}`,
-      )
-      .bind(...binds)
-      .first<{ total: number }>();
+    const rows = await this.db
+      .select(ORG_USER_SELECTION)
+      .from(orgMembers)
+      .innerJoin(users, eq(users.id, orgMembers.orgId))
+      .where(where)
+      .orderBy(asc(users.usernameLower))
+      .limit(limit)
+      .offset(offset);
+    const totalRow = await this.db
+      .select({ total: sql<number>`count(*)` })
+      .from(orgMembers)
+      .innerJoin(users, eq(users.id, orgMembers.orgId))
+      .where(where)
+      .get();
     return {
-      items: rows.results.map((row) => rowToOrg(row)),
+      items: rows.map((row) => row),
       total: totalRow?.total ?? 0,
     };
   }
@@ -585,22 +548,35 @@ export class OrgService {
     const isOwner =
       doer.isAdmin === true ||
       (doer.id !== null &&
-        (await this.d1
-          .prepare("SELECT id FROM org_members WHERE org_id = ? AND user_id = ? AND role = 'owner'")
-          .bind(orgId, doer.id)
-          .first<{ id: number }>()) !== null);
+        (await this.db
+          .select({ id: orgMembers.id })
+          .from(orgMembers)
+          .where(
+            and(
+              eq(orgMembers.orgId, orgId),
+              eq(orgMembers.userId, doer.id),
+              eq(orgMembers.role, "owner"),
+            ),
+          )
+          .get()) !== undefined);
 
-    const where = isOwner ? "owner_id = ?" : "owner_id = ? AND visibility = 'public'";
-    const rows = await this.d1
-      .prepare(`SELECT ${REPO_COLUMNS} FROM repositories WHERE ${where} ORDER BY slug ASC LIMIT ? OFFSET ?`)
-      .bind(orgId, limit, offset)
-      .all<RepoSqlRow>();
-    const totalRow = await this.d1
-      .prepare(`SELECT COUNT(*) AS total FROM repositories WHERE ${where}`)
-      .bind(orgId)
-      .first<{ total: number }>();
+    const where = isOwner
+      ? eq(repositories.ownerId, orgId)
+      : and(eq(repositories.ownerId, orgId), eq(repositories.visibility, "public"));
+    const rows = await this.db
+      .select(REPO_SELECTION)
+      .from(repositories)
+      .where(where)
+      .orderBy(asc(repositories.slug))
+      .limit(limit)
+      .offset(offset);
+    const totalRow = await this.db
+      .select({ total: sql<number>`count(*)` })
+      .from(repositories)
+      .where(where)
+      .get();
     return {
-      items: rows.results.map(rowToRepo),
+      items: rows.map((row) => row),
       total: totalRow?.total ?? 0,
     };
   }
@@ -615,11 +591,14 @@ export class OrgService {
    * (`prepareDoerCreateRepoInOrg`, fork.go:97–108), as upstream.
    */
   async canCreateOrgRepo(orgId: number, userId: number): Promise<boolean> {
-    const row = await this.d1
-      .prepare("SELECT id FROM org_members WHERE org_id = ? AND user_id = ? AND role = 'owner'")
-      .bind(orgId, userId)
-      .first<{ id: number }>();
-    return row !== null;
+    const row = await this.db
+      .select({ id: orgMembers.id })
+      .from(orgMembers)
+      .where(
+        and(eq(orgMembers.orgId, orgId), eq(orgMembers.userId, userId), eq(orgMembers.role, "owner")),
+      )
+      .get();
+    return row !== undefined;
   }
 
   /**
@@ -638,26 +617,30 @@ export class OrgService {
   ): Promise<boolean> {
     const org = await this.getOrgById(orgId);
     if (org === null) throw new OrgNotExistError({ id: orgId });
-    const user = await this.d1
-      .prepare("SELECT username FROM users WHERE id = ?")
-      .bind(userId)
-      .first<{ username: string }>();
-    if (user === null) throw new OrgMemberUserNotExistError({ id: userId });
+    const user = await this.db
+      .select({ username: users.username })
+      .from(users)
+      .where(eq(users.id, userId))
+      .get();
+    if (user === undefined) throw new OrgMemberUserNotExistError({ id: userId });
 
     const existing = await this.findMembership(orgId, userId);
     if (existing !== null) return false;
 
-    const seconds = toUnix(options.now ?? new Date());
+    const now = options.now ?? new Date();
     try {
-      await this.d1.batch([
-        this.d1
-          .prepare(
-            "INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, ?, ?, ?)",
-          )
-          .bind(orgId, userId, options.isPublic === true ? 1 : 0, options.role ?? "member", seconds),
-        this.d1
-          .prepare("UPDATE users SET num_members = num_members + 1 WHERE id = ?")
-          .bind(orgId),
+      await this.db.batch([
+        this.db.insert(orgMembers).values({
+          orgId,
+          userId,
+          isPublic: options.isPublic === true,
+          role: options.role ?? "member",
+          createdAt: now,
+        }),
+        this.db
+          .update(users)
+          .set({ numMembers: sql`${users.numMembers} + 1` })
+          .where(eq(users.id, orgId)),
       ]);
       return true;
     } catch (error) {
@@ -676,22 +659,28 @@ export class OrgService {
    * Raises `LastOrgOwnerError` (upstream `ErrLastOrgOwner` → API 500, §4.3).
    */
   async removeMember(orgId: number, userId: number): Promise<boolean> {
-    const results = await this.d1.batch([
-      this.d1
-        .prepare(
-          `DELETE FROM org_members
-           WHERE org_id = ? AND user_id = ?
-             AND (role != 'owner' OR (SELECT COUNT(*) FROM org_members WHERE org_id = ? AND role = 'owner') > 1)`,
+    const results = await this.db.batch([
+      this.db
+        .delete(orgMembers)
+        .where(
+          and(
+            eq(orgMembers.orgId, orgId),
+            eq(orgMembers.userId, userId),
+            sql`(role != 'owner' or (select count(*) from org_members where org_id = ${orgId} and role = 'owner') > 1)`,
+          ),
         )
-        .bind(orgId, userId, orgId),
-      this.d1
-        .prepare(
-          `UPDATE users SET num_members = num_members - 1
-           WHERE id = ? AND (SELECT COUNT(*) FROM org_members WHERE org_id = ? AND user_id = ?) = 0`,
-        )
-        .bind(orgId, orgId, userId),
+        .returning({ userId: orgMembers.userId }),
+      this.db
+        .update(users)
+        .set({ numMembers: sql`${users.numMembers} - 1` })
+        .where(
+          and(
+            eq(users.id, orgId),
+            sql`(select count(*) from org_members where org_id = ${orgId} and user_id = ${userId}) = 0`,
+          ),
+        ),
     ]);
-    if ((results[0]?.meta.changes ?? 0) > 0) return true;
+    if (results[0].length > 0) return true;
     // The guard held the delete: either not a member (false) or the last
     // owner (typed 500, upstream message).
     const member = await this.findMembership(orgId, userId);
@@ -706,16 +695,20 @@ export class OrgService {
    * the member is the only `role='owner'` row. Non-member ⇒ false.
    */
   async setMemberRole(orgId: number, userId: number, role: OrgMemberRole): Promise<boolean> {
-    const result = await this.d1
-      .prepare(
-        `UPDATE org_members SET role = ?
-         WHERE org_id = ? AND user_id = ?
-           AND (? = 'owner' OR role != 'owner'
-                OR (SELECT COUNT(*) FROM org_members WHERE org_id = ? AND role = 'owner') > 1)`,
+    const updated = await this.db
+      .update(orgMembers)
+      .set({ role })
+      .where(
+        and(
+          eq(orgMembers.orgId, orgId),
+          eq(orgMembers.userId, userId),
+          // `${role}` binds the requested role; bare `role` reads the row's
+          // current value — the demote guard (§4.3).
+          sql`(${role} = 'owner' or role != 'owner' or (select count(*) from org_members where org_id = ${orgId} and role = 'owner') > 1)`,
+        ),
       )
-      .bind(role, orgId, userId, role, orgId)
-      .run();
-    if ((result.meta.changes ?? 0) > 0) return true;
+      .returning({ userId: orgMembers.userId });
+    if (updated.length > 0) return true;
     const member = await this.findMembership(orgId, userId);
     if (member === null) return false;
     throw new LastOrgOwnerError(userId);
@@ -759,34 +752,35 @@ export class OrgService {
 
     if (newLower === org.usernameLower) {
       // Case-only: display case flips, no redirect row (user.go:48–59).
-      await this.d1
-        .prepare("UPDATE users SET username = ? WHERE id = ? AND type = 'org'")
-        .bind(newName, orgId)
-        .run();
+      await this.db
+        .update(users)
+        .set({ username: newName })
+        .where(and(eq(users.id, orgId), eq(users.type, "org")));
       return (await this.getOrgById(orgId)) ?? org;
     }
 
     // Shared-namespace pre-check (any row is a collision: newLower ≠ own).
-    const existing = await this.d1
-      .prepare("SELECT id FROM users WHERE username_lower = ?")
-      .bind(newLower)
-      .first<{ id: number }>();
-    if (existing !== null) throw new OrgNameCollisionError(newName);
+    const existing = await this.db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, newLower))
+      .get();
+    if (existing !== undefined) throw new OrgNameCollisionError(newName);
 
-    const seconds = toUnix(options.now ?? new Date());
+    const now = options.now ?? new Date();
     try {
-      await this.d1.batch([
-        this.d1
-          .prepare("UPDATE users SET username = ?, username_lower = ? WHERE id = ? AND type = 'org'")
-          .bind(newName, newLower, orgId),
-        this.d1.prepare("DELETE FROM user_redirects WHERE lower_name = ?").bind(org.usernameLower),
-        this.d1.prepare("DELETE FROM user_redirects WHERE lower_name = ?").bind(newLower),
-        this.d1
-          .prepare("INSERT INTO user_redirects (lower_name, redirect_user_id) VALUES (?, ?)")
-          .bind(org.usernameLower, orgId),
-        this.d1
-          .prepare("UPDATE repositories SET owner_namespace = ?, updated_at = ? WHERE owner_id = ?")
-          .bind(newLower, seconds, orgId),
+      await this.db.batch([
+        this.db
+          .update(users)
+          .set({ username: newName, usernameLower: newLower })
+          .where(and(eq(users.id, orgId), eq(users.type, "org"))),
+        this.db.delete(userRedirects).where(eq(userRedirects.lowerName, org.usernameLower)),
+        this.db.delete(userRedirects).where(eq(userRedirects.lowerName, newLower)),
+        this.db.insert(userRedirects).values({ lowerName: org.usernameLower, redirectUserId: orgId }),
+        this.db
+          .update(repositories)
+          .set({ ownerNamespace: newLower, updatedAt: now })
+          .where(eq(repositories.ownerId, orgId)),
       ]);
     } catch (error) {
       if (isUniqueViolation(error)) throw new OrgNameCollisionError(newName);
@@ -802,11 +796,12 @@ export class OrgService {
    * (git gate, org lookups) re-reading the row.
    */
   async setOrgVisibility(orgId: number, visibility: Visibility): Promise<OrgRecord> {
-    const result = await this.d1
-      .prepare("UPDATE users SET visibility = ? WHERE id = ? AND type = 'org'")
-      .bind(visibility, orgId)
-      .run();
-    if ((result.meta.changes ?? 0) === 0) throw new OrgNotExistError({ id: orgId });
+    const updated = await this.db
+      .update(users)
+      .set({ visibility })
+      .where(and(eq(users.id, orgId), eq(users.type, "org")))
+      .returning({ id: users.id });
+    if (updated.length === 0) throw new OrgNotExistError({ id: orgId });
     const org = await this.getOrgById(orgId);
     if (org === null) throw new OrgNotExistError({ id: orgId });
     return org;
@@ -819,11 +814,12 @@ export class OrgService {
    * visibility check on the target (context_response.go:40–47).
    */
   async lookupUserRedirect(nameLower: string): Promise<number | null> {
-    const row = await this.d1
-      .prepare("SELECT redirect_user_id FROM user_redirects WHERE lower_name = ?")
-      .bind(nameLower.toLowerCase())
-      .first<{ redirect_user_id: number }>();
-    return row === null ? null : row.redirect_user_id;
+    const row = await this.db
+      .select({ redirectUserId: userRedirects.redirectUserId })
+      .from(userRedirects)
+      .where(eq(userRedirects.lowerName, nameLower.toLowerCase()))
+      .get();
+    return row?.redirectUserId ?? null;
   }
 
   /** Membership row (§3.3: membership test = row exists). */
@@ -832,10 +828,11 @@ export class OrgService {
   }
 
   private async findMembership(orgId: number, userId: number): Promise<OrgMembershipRecord | null> {
-    const row = await this.d1
-      .prepare("SELECT id, org_id, user_id, is_public, role, created_at FROM org_members WHERE org_id = ? AND user_id = ?")
-      .bind(orgId, userId)
-      .first<MembershipSqlRow>();
-    return row === null ? null : rowToMembership(row);
+    const row = await this.db
+      .select(MEMBERSHIP_SELECTION)
+      .from(orgMembers)
+      .where(and(eq(orgMembers.orgId, orgId), eq(orgMembers.userId, userId)))
+      .get();
+    return row ?? null;
   }
 }

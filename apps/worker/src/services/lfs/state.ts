@@ -1,17 +1,17 @@
 /**
- * `lfs_objects` state machine over raw D1 (SPEC-0006 §3.2–3.4).
+ * `lfs_objects` state machine over Drizzle ORM (SPEC-0006 §3.2–3.4).
  *
- * The table is NOT yet in the Drizzle schema (schema.ts is owned by another
- * change): D1 access goes through a thin mapper over raw `D1Database`
- * prepared statements, with the DDL below. TODO(drizzle migration): port
- * `LFS_OBJECTS_DDL` into `src/db/schema.ts` as a `lfsObjects` table and run
- * `pnpm db:generate`; delete `applyLfsObjectsDdl` and the test-side DDL
- * bootstrap once the generated migration exists. Until then tests create the
- * table from this constant (schema applied in `beforeAll` persists per file).
+ * The table lives in the Drizzle schema (`lfsObjects`, src/db/schema.ts) and
+ * landed as migration 0005; D1 access goes through Drizzle per the
+ * architecture boundary (no hand-written SQL in services). Superseded:
+ * `LFS_OBJECTS_DDL_STATEMENTS` below is kept only as the historical record of
+ * the pre-migration bootstrap — the generated migration is authoritative now.
  *
- * Timestamps are unix seconds (repo convention, cf. auth seeds' `unixepoch()`).
- * Rows exist only for objects the LFS API touched — a pointer merely seen in
- * git history never creates a row. State transitions (§3.3):
+ * Timestamps are unix seconds (repo convention, `mode: "timestamp"` — drizzle
+ * maps Date ↔ integer seconds exactly like the previous raw `toUnix`/
+ * `fromUnix` helpers). Rows exist only for objects the LFS API touched — a
+ * pointer merely seen in git history never creates a row. State transitions
+ * (§3.3):
  *
  *   absent --batch(upload)--> uploading --verify(200)--> verified
  *   absent --adopt(HEAD ok)--> verified        (upload finished, verify lost)
@@ -20,12 +20,17 @@
  *   verified --GC(unreachable > grace)--> row+object deleted
  */
 
+import { and, asc, eq, gt, inArray, lt, sql } from "drizzle-orm";
+import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
+
+import { lfsObjects } from "../../db/schema";
 import type { LfsObjectStat } from "./store";
 import { pointerBlobSha1, type LfsPointer } from "./pointer";
 
 /**
- * The future Drizzle migration body. Kept here as the single source of truth
- * until schema.ts can own the table (see file TODO above).
+ * SUPERSEDED by migration 0005 (`lfsObjects` in src/db/schema.ts) — kept only
+ * so pre-migration scratch databases can still be bootstrapped by hand. Do
+ * not extend; change the schema + regenerate instead (AGENTS.md).
  */
 export const LFS_OBJECTS_DDL_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS lfs_objects (
@@ -59,15 +64,6 @@ export interface LfsObjectRow {
   updatedAt: Date;
 }
 
-interface LfsObjectSqlRow {
-  repo_id: number;
-  oid: string;
-  size: number;
-  state: string;
-  created_at: number;
-  updated_at: number;
-}
-
 /** HEAD seam used by adopt/sweep — backed by the store in production. */
 export type LfsHeadFn = (oid: string) => Promise<LfsObjectStat | null>;
 
@@ -98,15 +94,20 @@ export function validateAdoptStat(
 }
 
 export class LfsStateService {
-  constructor(private readonly d1: D1Database) {}
+  private readonly db: DrizzleD1Database;
+
+  constructor(d1: D1Database) {
+    this.db = drizzle(d1);
+  }
 
   /** Row lookup — the batch API's per-object meta read (PK covers it). */
   async get(repoId: number, oid: string): Promise<LfsObjectRow | null> {
-    const row = await this.d1
-      .prepare("SELECT repo_id, oid, size, state, created_at, updated_at FROM lfs_objects WHERE repo_id = ? AND oid = ?")
-      .bind(repoId, oid)
-      .first<LfsObjectSqlRow>();
-    return row === null ? null : sqlToRow(row);
+    const row = await this.db
+      .select()
+      .from(lfsObjects)
+      .where(and(eq(lfsObjects.repoId, repoId), eq(lfsObjects.oid, oid)))
+      .get();
+    return row ?? null;
   }
 
   /**
@@ -118,16 +119,13 @@ export class LfsStateService {
    * object vanished from R2 — is the self-heal path that WANTS the demotion.
    */
   async ensureUploading(repoId: number, oid: string, size: number, now: Date): Promise<void> {
-    const seconds = toUnix(now);
-    await this.d1
-      .prepare(
-        `INSERT INTO lfs_objects (repo_id, oid, size, state, created_at, updated_at)
-         VALUES (?, ?, ?, 'uploading', ?, ?)
-         ON CONFLICT (repo_id, oid) DO UPDATE
-         SET size = excluded.size, state = 'uploading', updated_at = excluded.updated_at`,
-      )
-      .bind(repoId, oid, size, seconds, seconds)
-      .run();
+    await this.db
+      .insert(lfsObjects)
+      .values({ repoId, oid, size, state: "uploading", createdAt: now, updatedAt: now })
+      .onConflictDoUpdate({
+        target: [lfsObjects.repoId, lfsObjects.oid],
+        set: { size, state: "uploading", updatedAt: now },
+      });
   }
 
   /**
@@ -135,16 +133,13 @@ export class LfsStateService {
    * (§3.3). Validates nothing itself; compose with `validateAdoptStat`.
    */
   async insertVerified(repoId: number, oid: string, size: number, now: Date): Promise<void> {
-    const seconds = toUnix(now);
-    await this.d1
-      .prepare(
-        `INSERT INTO lfs_objects (repo_id, oid, size, state, created_at, updated_at)
-         VALUES (?, ?, ?, 'verified', ?, ?)
-         ON CONFLICT (repo_id, oid) DO UPDATE
-         SET size = excluded.size, state = 'verified', updated_at = excluded.updated_at`,
-      )
-      .bind(repoId, oid, size, seconds, seconds)
-      .run();
+    await this.db
+      .insert(lfsObjects)
+      .values({ repoId, oid, size, state: "verified", createdAt: now, updatedAt: now })
+      .onConflictDoUpdate({
+        target: [lfsObjects.repoId, lfsObjects.oid],
+        set: { size, state: "verified", updatedAt: now },
+      });
   }
 
   /**
@@ -167,19 +162,20 @@ export class LfsStateService {
 
   /** The verify handler's state flip (`uploading → verified`). */
   async markVerified(repoId: number, oid: string, now: Date): Promise<boolean> {
-    const result = await this.d1
-      .prepare("UPDATE lfs_objects SET state = 'verified', updated_at = ? WHERE repo_id = ? AND oid = ?")
-      .bind(toUnix(now), repoId, oid)
-      .run();
-    return (result.meta.changes ?? 0) > 0;
+    const updated = await this.db
+      .update(lfsObjects)
+      .set({ state: "verified", updatedAt: now })
+      .where(and(eq(lfsObjects.repoId, repoId), eq(lfsObjects.oid, oid)))
+      .returning({ oid: lfsObjects.oid });
+    return updated.length > 0;
   }
 
   async delete(repoId: number, oid: string): Promise<boolean> {
-    const result = await this.d1
-      .prepare("DELETE FROM lfs_objects WHERE repo_id = ? AND oid = ?")
-      .bind(repoId, oid)
-      .run();
-    return (result.meta.changes ?? 0) > 0;
+    const deleted = await this.db
+      .delete(lfsObjects)
+      .where(and(eq(lfsObjects.repoId, repoId), eq(lfsObjects.oid, oid)))
+      .returning({ oid: lfsObjects.oid });
+    return deleted.length > 0;
   }
 
   /** Batch existence map for the (future) push gate — chunked IN at ≤90. */
@@ -188,12 +184,11 @@ export class LfsStateService {
     for (let i = 0; i < oids.length; i += D1_IN_CHUNK) {
       const chunk = oids.slice(i, i + D1_IN_CHUNK);
       if (chunk.length === 0) continue;
-      const placeholders = chunk.map(() => "?").join(", ");
-      const rows = await this.d1
-        .prepare(`SELECT oid FROM lfs_objects WHERE repo_id = ? AND oid IN (${placeholders})`)
-        .bind(repoId, ...chunk)
-        .all<{ oid: string }>();
-      for (const row of rows.results) found.add(row.oid);
+      const rows = await this.db
+        .select({ oid: lfsObjects.oid })
+        .from(lfsObjects)
+        .where(and(eq(lfsObjects.repoId, repoId), inArray(lfsObjects.oid, chunk)));
+      for (const row of rows) found.add(row.oid);
     }
     return found;
   }
@@ -202,35 +197,36 @@ export class LfsStateService {
    * `uploading` rows on purpose: abandoned uploads overcount only until the
    * sweep reclaims them — the conservative direction for a quota. */
   async sumSize(repoId: number): Promise<number> {
-    const row = await this.d1
-      .prepare("SELECT COALESCE(SUM(size), 0) AS total FROM lfs_objects WHERE repo_id = ?")
-      .bind(repoId)
-      .first<{ total: number }>();
-    return row?.total ?? 0;
+    const rows = await this.db
+      .select({ total: sql<number>`coalesce(sum(${lfsObjects.size}), 0)` })
+      .from(lfsObjects)
+      .where(eq(lfsObjects.repoId, repoId));
+    return rows[0]?.total ?? 0;
   }
 
   /** Cron fan-out shape: one Queue message per repo with stale rows (§3.4). */
   async repoIdsWithStaleUploading(cutoff: Date, limit = 100): Promise<number[]> {
-    const rows = await this.d1
-      .prepare(
-        `SELECT DISTINCT repo_id FROM lfs_objects
-         WHERE state = 'uploading' AND updated_at < ? LIMIT ?`,
-      )
-      .bind(toUnix(cutoff), limit)
-      .all<{ repo_id: number }>();
-    return rows.results.map((row) => row.repo_id);
+    const rows = await this.db
+      .selectDistinct({ repoId: lfsObjects.repoId })
+      .from(lfsObjects)
+      .where(and(eq(lfsObjects.state, "uploading"), lt(lfsObjects.updatedAt, cutoff)))
+      .limit(limit);
+    return rows.map((row) => row.repoId);
   }
 
   /** Sweep consumer shape: one repo's stale-`uploading` rows. */
   async listStaleUploading(repoId: number, cutoff: Date, limit = 100): Promise<LfsObjectRow[]> {
-    const rows = await this.d1
-      .prepare(
-        `SELECT repo_id, oid, size, state, created_at, updated_at FROM lfs_objects
-         WHERE repo_id = ? AND state = 'uploading' AND updated_at < ? LIMIT ?`,
+    return this.db
+      .select()
+      .from(lfsObjects)
+      .where(
+        and(
+          eq(lfsObjects.repoId, repoId),
+          eq(lfsObjects.state, "uploading"),
+          lt(lfsObjects.updatedAt, cutoff),
+        ),
       )
-      .bind(repoId, toUnix(cutoff), limit)
-      .all<LfsObjectSqlRow>();
-    return rows.results.map(sqlToRow);
+      .limit(limit);
   }
 
   /**
@@ -271,15 +267,20 @@ export class LfsStateService {
   ): Promise<LfsObjectRow[]> {
     const limit = options.limit ?? 100;
     const after = options.afterOid ?? "";
-    const rows = await this.d1
-      .prepare(
-        `SELECT repo_id, oid, size, state, created_at, updated_at FROM lfs_objects
-         WHERE repo_id = ? AND state = 'verified' AND created_at < ? AND updated_at < ? AND oid > ?
-         ORDER BY oid LIMIT ?`,
+    return this.db
+      .select()
+      .from(lfsObjects)
+      .where(
+        and(
+          eq(lfsObjects.repoId, repoId),
+          eq(lfsObjects.state, "verified"),
+          lt(lfsObjects.createdAt, grace.olderThan),
+          lt(lfsObjects.updatedAt, grace.updatedLessRecentlyThan),
+          gt(lfsObjects.oid, after),
+        ),
       )
-      .bind(repoId, toUnix(grace.olderThan), toUnix(grace.updatedLessRecentlyThan), after, limit)
-      .all<LfsObjectSqlRow>();
-    return rows.results.map(sqlToRow);
+      .orderBy(asc(lfsObjects.oid))
+      .limit(limit);
   }
 }
 
@@ -298,17 +299,3 @@ export async function isLfsObjectUnreachable(
   const blobSha1 = await pointerBlobSha1(pointer);
   return !(await hasBlob(blobSha1));
 }
-
-function sqlToRow(row: LfsObjectSqlRow): LfsObjectRow {
-  return {
-    repoId: row.repo_id,
-    oid: row.oid,
-    size: row.size,
-    state: row.state === "verified" ? "verified" : "uploading",
-    createdAt: fromUnix(row.created_at),
-    updatedAt: fromUnix(row.updated_at),
-  };
-}
-
-const toUnix = (date: Date): number => Math.floor(date.getTime() / 1000);
-const fromUnix = (seconds: number): Date => new Date(seconds * 1000);
