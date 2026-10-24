@@ -57,6 +57,20 @@ in the route adapter before lookup (§4.4):
 | POST, OPTIONS | `/:owner/:repo(.git)?/git-receive-pack` | push data plane | lease → stream → index → `finalizeReceive` (SPEC-0001 §5) |
 | GET, OPTIONS | `/:owner/:repo(.git)?/HEAD` | synthetic `ref: refs/heads/<head>` from DO `meta.head`, `text/plain`, no-cache | DO meta read |
 
+**Amendment (2026-10-25, defense-in-depth wave — commit 70c9c3d):** the gate's claim
+widens beyond the four git routes. Repository-scoped ENGINE JSON/admin paths —
+`/api/*` (JSON content reads) and the admin shapes (PUT `config`/`description`,
+POST `gc`, DELETE of the repo root) — for **D1-resolved** repositories run the same
+§2.4 matrix (JSON reads through the read rows; admin shapes through the WRITE rows:
+the Worker API is the sanctioned admin channel). Rationale: the engine's own
+authorize hook decides those paths from the registry's best-effort `priv` mirror
+(`seedRepoExtras` → `registry.setConfig`); a drifted or failed sync must never
+serve a private repo's JSON refs anonymously while the git routes correctly 401.
+D1 row missing → a `repo_redirects` row 301s to the canonical path (row 13), else
+the request passes through verbatim (the transitional population, unchanged).
+Page/unknown shapes stay passthrough for everyone: the engine headless-404s them
+BEFORE its authorize hook. The LFS family (SPEC-0006 §2.1) keeps its own branch.
+
 Route handlers stay thin per AGENTS.md ("Routes are thin"): each handler runs the shared
 `gitHttpGate` pipeline — parse → auth (SPEC-0002) → resolve repo (D1) → authorize →
 engine invoke → respond — implemented once in `src/services/githttp/`, with per-service
