@@ -673,10 +673,11 @@ describe("Tier-2 UI mount (dispatcher branch order: api → ui → gate)", () =>
     await seedAclFixtures();
     await seedEngineRegistry("alice/public");
 
-    // The bare repo URL is a UI family; the protocol URL one segment deeper
-    // never reaches the sub-app.
+    // The bare repo URL is a UI family; with U3 a resolved public repo
+    // renders the empty-repo page (200) — the protocol URL one segment
+    // deeper never reaches the sub-app.
     const page = await SELF.fetch("https://example.com/alice/public");
-    expect(page.status).toBe(404);
+    expect(page.status).toBe(200);
     expect(page.headers.get("content-type")).toBe("text/html; charset=UTF-8");
 
     const advert = await SELF.fetch("https://example.com/alice/public.git/info/refs?service=git-upload-pack");
