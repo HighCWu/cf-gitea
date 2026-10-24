@@ -25,6 +25,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
+import { serializeCommit, serializeTag, serializeTree } from "@cf-gitea/git-engine";
 
 import contractRaw from "../../compat/contract/v1-swagger.generated.json?raw";
 import { comments, milestones, repositories, users } from "../../db/schema";
@@ -38,8 +39,11 @@ import { STUB_USER } from "../auth";
 import { createRepoHook } from "../services/hooks";
 import { createRepoLabel } from "../services/labels";
 import { createCommitStatus } from "../services/commit-status";
+import { ZERO_OID } from "../services/engine";
 import { addOrUpdateCollaborator } from "../services/repo-collaborators";
 import { watchRepo } from "../services/repo-watchers";
+import { STARS_DDL_STATEMENTS, starRepo } from "../services/stars";
+import { USER_SETTINGS_DDL_STATEMENTS } from "../services/user-settings";
 import { applyRepoExtrasDdl } from "../testing/repo-ddl";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -182,6 +186,21 @@ async function seedHook(repoId: string, name: string, url: string, events: strin
     active: false,
   });
   return row.id;
+}
+
+/**
+ * SHA-1 over the canonical git object header + content — the engine's
+ * hashObjectOid is not on the runtime export surface, so the git-object seeds
+ * hash Worker-side (workerd-native crypto.subtle; putApiObjects re-verifies
+ * before storing, so a mismatch fails the seed loudly rather than corrupting).
+ */
+async function gitObjectOid(type: string, data: Uint8Array): Promise<string> {
+  const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+  const bytes = new Uint8Array(header.byteLength + data.byteLength);
+  bytes.set(header, 0);
+  bytes.set(data, header.byteLength);
+  const digest = await crypto.subtle.digest("SHA-1", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 beforeAll(async () => {
@@ -370,6 +389,83 @@ beforeAll(async () => {
   });
 
   // ---------------------------------------------------------------------
+  // Git-object seeds (SPEC-0004 §2.4 rows repoListBranches … GetAnnotatedTag):
+  // the branch/tag/raw-git families answer from the ENGINE cell, so beforeAll
+  // builds one dedicated repo with real objects — a self-contained blob →
+  // tree → commit, an annotated tag over it, and the victim refs the mutation
+  // scenarios consume — landed through the same public RPCs the API layer
+  // itself uses (putApiObjects + commitApiChange + setHead; commitApiChange
+  // caches the tag peel on the refs row). The D1 row carries the post-push
+  // state (isEmpty=false, refs_version=1); the shared fixture repo stays
+  // isEmpty=true, which is exactly the upstream empty-repo guard family those
+  // routes mirror (404 branch mutations / 405 tag writes).
+  // ---------------------------------------------------------------------
+  await seedRepo("9008", OWNER.toLowerCase(), "compat-git");
+  await drizzle(env.DB)
+    .update(repositories)
+    .set({ isEmpty: false, refsVersion: 1 })
+    .where(eq(repositories.id, "9008"));
+
+  const gitPerson = {
+    name: "Compat Owner",
+    email: "compat@suite.invalid",
+    time: Math.floor(SEED_NOW.getTime() / 1000),
+    tz: "+0000",
+  };
+  const gitBlobData = new TextEncoder().encode("hello compat git\n");
+  const gitBlobOid = await gitObjectOid("blob", gitBlobData);
+  const gitTree = serializeTree([{ mode: "100644", name: "compat.txt", oid: gitBlobOid }]);
+  const gitCommit = serializeCommit({
+    tree: gitTree.oid,
+    parents: [],
+    author: gitPerson,
+    committer: gitPerson,
+    message: "compat suite seed commit\n",
+  });
+  const gitAnnotated = serializeTag({
+    object: gitCommit.oid,
+    type: "commit",
+    tag: "compat-annotated",
+    tagger: gitPerson,
+    message: "compat suite annotated tag\n",
+  });
+
+  const gitCell = env.REPO.getByName(`${OWNER.toLowerCase()}/compat-git`);
+  const storedGitObjects = await gitCell.putApiObjects([
+    { oid: gitBlobOid, type: "blob", data: gitBlobData },
+    { oid: gitTree.oid, type: "tree", data: gitTree.data },
+    { oid: gitCommit.oid, type: "commit", data: gitCommit.data },
+    { oid: gitAnnotated.oid, type: "tag", data: gitAnnotated.data },
+  ]);
+  if (storedGitObjects.tag !== "ok") {
+    throw new Error(`git-object seed putApiObjects failed: ${storedGitObjects.tag}`);
+  }
+  const landSeedRef = async (ref: string, oid: string): Promise<void> => {
+    const result = await gitCell.commitApiChange({ ref, expectedOldOid: ZERO_OID, newOid: oid });
+    if (result.tag !== "committed") {
+      throw new Error(`git-object seed ref landing failed: ${ref} (${result.tag})`);
+    }
+  };
+  await landSeedRef("refs/heads/main", gitCommit.oid); // the default branch (setHead below)
+  await landSeedRef("refs/heads/compat-del-branch", gitCommit.oid); // repoDeleteBranch victim
+  await landSeedRef("refs/heads/compat-rename-src", gitCommit.oid); // repoRenameBranch victim
+  await landSeedRef("refs/tags/compat-annotated", gitAnnotated.oid); // annotated (peeled refs row)
+  await landSeedRef("refs/tags/compat-light", gitCommit.oid); // lightweight tag
+  await landSeedRef("refs/tags/compat-del-tag", gitCommit.oid); // repoDeleteTag victim (no release row)
+  const gitHead = await gitCell.setHead("main");
+  if (gitHead.tag !== "ok") {
+    throw new Error(`git-object seed setHead failed: ${gitHead.tag}`);
+  }
+
+  Object.assign(seeds, {
+    gitRepoSlug: "compat-git",
+    gitCommit: gitCommit.oid,
+    gitTree: gitTree.oid,
+    gitBlob: gitBlobOid,
+    gitAnnotatedTag: gitAnnotated.oid,
+  });
+
+  // ---------------------------------------------------------------------
   // Tier-2 org + identity block (SPEC-0004 appendix A category a, T2 rows):
   // membership seeds for the CompatOrg (a concealed member + a public one),
   // a dedicated rename pair, and follow edges. The follow table is
@@ -413,6 +509,28 @@ beforeAll(async () => {
     renamedOrg: "CompatRenamedOrg",
     renamedOrgNew: "CompatRenamedOrgNew",
   });
+
+  // ---------------------------------------------------------------------
+  // Tier-1 user-straggler block (SPEC-0004 §2.4 rows createCurrentUserRepo,
+  // getUserSettings/updateUserSettings, userCurrentListStarred +
+  // userCurrent{CheckStarring,PutStar,DeleteStar}): the stars + user_settings
+  // raw-D1 stores bootstrap from their services' DDL statements (the follows
+  // pattern), star edges pre-seed the starred fixtures (the list needs
+  // total ≥ 2; the DELETE victim "rel" is the third star so any case order
+  // keeps the list paginated), and user_settings stays rowless (GET renders
+  // the upstream defaults until the PATCH scenario writes them).
+  // ---------------------------------------------------------------------
+  for (const statement of STARS_DDL_STATEMENTS) {
+    await env.DB.prepare(statement).run();
+  }
+  for (const statement of USER_SETTINGS_DDL_STATEMENTS) {
+    await env.DB.prepare(statement).run();
+  }
+  await env.DB.prepare("DELETE FROM stars").run();
+  await env.DB.prepare("DELETE FROM user_settings").run();
+  await starRepo(env.DB, ownerId, SHARED_REPO_ID, SEED_NOW);
+  await starRepo(env.DB, ownerId, "9002", SEED_NOW);
+  await starRepo(env.DB, ownerId, "9004", SEED_NOW);
 });
 
 // ---------------------------------------------------------------------------
@@ -474,6 +592,138 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       status: 200,
       linkRels: ["next", "last"],
       request: (ctx) => ({ path: "/user/repos?limit=1", init: ctx.withAuth() }),
+    },
+  ],
+  createCurrentUserRepo: [
+    {
+      name: "create",
+      status: 201,
+      request: (ctx) => ({
+        path: "/user/repos",
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: "compat-user-created", description: "created by the compat suite", private: false }),
+        }),
+      }),
+    },
+    {
+      // The engine lands the initial commit (services/user-repos.ts) — the
+      // response row re-reads with empty:false.
+      name: "auto_init lands the initial commit",
+      status: 201,
+      request: (ctx) => ({
+        path: "/user/repos",
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({
+            name: "compat-user-init",
+            description: "initialized by the compat suite",
+            private: false,
+            auto_init: true,
+          }),
+        }),
+      }),
+    },
+    {
+      name: "unknown readme template → declared 400",
+      status: 400,
+      request: (ctx) => ({
+        path: "/user/repos",
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: "compat-user-readme", auto_init: true, readme: "Nope" }),
+        }),
+      }),
+    },
+    {
+      name: "duplicate of the seeded repo → declared 409",
+      status: 409,
+      request: (ctx) => ({
+        path: "/user/repos",
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: String(ctx.seeds.repoSlug) }),
+        }),
+      }),
+    },
+    {
+      name: "invalid name → declared 422",
+      status: 422,
+      request: (ctx) => ({
+        path: "/user/repos",
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: "bad name!" }),
+        }),
+      }),
+    },
+  ],
+
+  getUserSettings: [
+    {
+      name: "upstream defaults",
+      status: 200,
+      request: (ctx) => ({ path: "/user/settings", init: ctx.withAuth() }),
+    },
+  ],
+  updateUserSettings: [
+    {
+      name: "update the presented fields",
+      status: 200,
+      request: (ctx) => ({
+        path: "/user/settings",
+        init: ctx.withAuth({
+          method: "PATCH",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ full_name: "Compat Owner (edited)", location: "compat-vale", hide_email: true, theme: "gitea-dark" }),
+        }),
+      }),
+    },
+  ],
+
+  userCurrentListStarred: [
+    {
+      name: "seeded stars, first page",
+      status: 200,
+      linkRels: ["next", "last"],
+      request: (ctx) => ({ path: "/user/starred?limit=1", init: ctx.withAuth() }),
+    },
+  ],
+  userCurrentCheckStarring: [
+    {
+      name: "seeded star",
+      status: 204,
+      request: (ctx) => ({ path: `/user/starred/${String(ctx.seeds.repoOwner)}/shared`, init: ctx.withAuth() }),
+    },
+    {
+      name: "visible but unstarred → declared 404",
+      status: 404,
+      request: (ctx) => ({ path: `/user/starred/${String(ctx.seeds.repoOwner)}/org-shared`, init: ctx.withAuth() }),
+    },
+  ],
+  userCurrentPutStar: [
+    {
+      name: "star (idempotent on the seeded edge)",
+      status: 204,
+      request: (ctx) => ({
+        path: `/user/starred/${String(ctx.seeds.repoOwner)}/shared`,
+        init: ctx.withAuth({ method: "PUT" }),
+      }),
+    },
+  ],
+  userCurrentDeleteStar: [
+    {
+      name: "unstar the dedicated seed",
+      status: 204,
+      request: (ctx) => ({
+        path: `/user/starred/${String(ctx.seeds.repoOwner)}/rel`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
     },
   ],
 
@@ -1358,6 +1608,337 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       request: (ctx) => ({
         path: `/repos/${String(ctx.seeds.repoOwner)}/compat-del`,
         init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+
+  // ---------------------------------------------------------------------
+  // Branch/tag/raw-git block (SPEC-0004 §2.4 rows repoListBranches …
+  // GetAnnotatedTag): the engine-backed families. Reads and ref writes run
+  // against the dedicated compat-git repo seeded in beforeAll (real blob →
+  // tree → commit + refs through the engine's public RPCs); the shared
+  // fixture repo stays empty (isEmpty=true), driving the upstream empty-repo
+  // guard family the routes mirror (404 branch mutations, 405 tag writes —
+  // both fixture-declared). The 400 sha-family cases need no git data.
+  // ---------------------------------------------------------------------
+
+  repoListBranches: [
+    {
+      name: "seeded branches, first page",
+      status: 200,
+      linkRels: ["next", "last"],
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/branches?limit=1`,
+      }),
+    },
+    {
+      // Upstream's IsEmpty short-circuit: the LIST answers 200 [] (the
+      // mutations are the ones that 404).
+      name: "empty repo lists empty",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/branches` }),
+    },
+  ],
+  repoCreateBranch: [
+    {
+      name: "create from the default branch",
+      status: 201,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/branches`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ new_branch_name: "compat-created-branch" }),
+        }),
+      }),
+    },
+    {
+      name: "empty repo → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/branches`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ new_branch_name: "compat-nowhere" }),
+        }),
+      }),
+    },
+  ],
+  repoGetBranch: [
+    {
+      name: "seeded default branch",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/branches/main`,
+      }),
+    },
+    {
+      name: "missing branch → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/branches/ghost`,
+      }),
+    },
+  ],
+  repoUpdateBranch: [
+    {
+      // The ref CAS with old_commit_id matching the tip and the new id equal
+      // to it: upstream's early-return no-op still lands the CAS — 204.
+      name: "no-op CAS onto the current tip",
+      status: 204,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/branches/main`,
+        init: ctx.withAuth({
+          method: "PUT",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ new_commit_id: String(ctx.seeds.gitCommit), old_commit_id: String(ctx.seeds.gitCommit) }),
+        }),
+      }),
+    },
+    {
+      name: "stale old_commit_id → declared 422",
+      status: 422,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/branches/main`,
+        init: ctx.withAuth({
+          method: "PUT",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ new_commit_id: String(ctx.seeds.gitCommit), old_commit_id: String(ctx.seeds.sha) }),
+        }),
+      }),
+    },
+  ],
+  repoDeleteBranch: [
+    {
+      name: "delete the dedicated seed branch",
+      status: 204,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/branches/compat-del-branch`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+    {
+      name: "empty repo → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/branches/ghost`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+  repoRenameBranch: [
+    {
+      name: "rename the dedicated seed branch",
+      status: 204,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/branches/compat-rename-src`,
+        init: ctx.withAuth({
+          method: "PATCH",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: "compat-rename-dst" }),
+        }),
+      }),
+    },
+    {
+      name: "same-name rename → declared 422",
+      status: 422,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/branches/main`,
+        init: ctx.withAuth({
+          method: "PATCH",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: "main" }),
+        }),
+      }),
+    },
+  ],
+
+  repoListAllGitRefs: [
+    {
+      name: "seeded refs table",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/refs`,
+      }),
+    },
+    {
+      // Upstream getGitRefsInternal: len(refs)==0 is the APIErrorNotFound 404.
+      name: "empty repo → declared 404",
+      status: 404,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/git/refs` }),
+    },
+  ],
+  repoListGitRefs: [
+    {
+      // GetRefsFiltered is PREFIX matching on "refs/" + param; several matches
+      // answer the Reference ARRAY (the single-exact-match bare-object quirk
+      // is the union the contract's ReferenceList schema does not model, so
+      // the fixture array shape drives the multi-match branch).
+      name: "tag prefix matches several refs",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/refs/tags`,
+      }),
+    },
+    {
+      name: "no match → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        // Single-segment filter: the hono `{ref}` param never matches the
+        // multi-segment shape upstream's wildcard route accepts.
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/refs/ghostheads`,
+      }),
+    },
+  ],
+  GetTree: [
+    // TODO(reg-merge/compat): the 200 fixture case is INTENTIONALLY absent —
+    // routes/git.ts GetTree passes `commit.tree` (a TREE oid) to the engine's
+    // listTree, which peels its ref argument to a COMMIT first
+    // (packages/git-engine src/repo.ts listTree → peelToCommit; a tree oid
+    // peels nowhere → null → the route 404s). Every well-formed sha/ref
+    // therefore answers 404 and no 200-shape scenario can pass until the
+    // route reads `listTree(commit.oid)` (TreeResult.oid still carries the
+    // real tree id the response renders). Add the seeded-commit-tree 200 case
+    // — path `/repos/{owner}/{repo}/git/trees/<seeds.gitCommit>` — when the
+    // module owner lands that fix.
+    {
+      // resolveNamedRef falls back to the default-branch tip, so the
+      // "sha not found" 400 is only reachable on a tip-less repo — the
+      // shared fixture repo (no refs at all), not compat-git.
+      name: "unknown sha → declared 400",
+      status: 400,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/git/trees/zzz-missing`,
+      }),
+    },
+  ],
+  GetBlob: [
+    {
+      name: "seeded blob",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/blobs/${String(ctx.seeds.gitBlob)}`,
+      }),
+    },
+    {
+      name: "malformed sha → declared 400",
+      status: 400,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/blobs/zzz`,
+      }),
+    },
+    {
+      name: "unknown oid → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/blobs/${"ab".repeat(20)}`,
+      }),
+    },
+  ],
+
+  repoListTags: [
+    {
+      name: "seeded tags, first page",
+      status: 200,
+      linkRels: ["next", "last"],
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/tags?limit=1`,
+      }),
+    },
+    {
+      name: "empty repo lists empty",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/tags` }),
+    },
+  ],
+  repoCreateTag: [
+    {
+      // Upstream answers 200 (not 201) with the Tag — the contract quirk.
+      name: "create lightweight (200 quirk)",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/tags`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ tag_name: "compat-created-tag" }),
+        }),
+      }),
+    },
+    {
+      // Upstream CreateTag on an empty repository: the declared 405.
+      name: "empty repo → declared 405",
+      status: 405,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/tags`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ tag_name: "compat-nowhere" }),
+        }),
+      }),
+    },
+    {
+      name: "missing tag_name → bind 422",
+      status: 422,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/tags`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ message: "no tag name given" }),
+        }),
+      }),
+    },
+  ],
+  repoGetTag: [
+    {
+      name: "seeded annotated tag",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/tags/compat-annotated`,
+      }),
+    },
+    {
+      name: "missing tag → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/tags/ghost`,
+      }),
+    },
+  ],
+  repoDeleteTag: [
+    {
+      name: "delete the dedicated seed tag",
+      status: 204,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/tags/compat-del-tag`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+    {
+      name: "empty repo → declared 405",
+      status: 405,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/tags/ghost`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+  GetAnnotatedTag: [
+    {
+      name: "seeded annotated tag object",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/tags/${String(ctx.seeds.gitAnnotatedTag)}`,
+      }),
+    },
+    {
+      name: "malformed sha → declared 400",
+      status: 400,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/tags/zzz`,
       }),
     },
   ],
