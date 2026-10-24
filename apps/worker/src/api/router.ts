@@ -8,8 +8,12 @@ import {
 } from "./auth";
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
+import { registerBranchRoutes } from "./routes/branches";
 import { registerCollaboratorRoutes } from "./routes/collaborators";
+import { registerCommitRoutes } from "./routes/commits";
+import { registerContentsRoutes } from "./routes/contents";
 import { registerFollowRoutes } from "./routes/follows";
+import { registerGitRoutes } from "./routes/git";
 import { registerHookRoutes } from "./routes/hooks";
 import { registerIdentityRoutes } from "./routes/identity";
 import { registerImportRoutes } from "./routes/imports";
@@ -20,13 +24,17 @@ import { registerMilestoneRoutes } from "./routes/milestones";
 import { registerOrgRoutes } from "./routes/org-repos";
 import { registerOrgProfileRoutes } from "./routes/orgs";
 import { registerPullRoutes } from "./routes/pulls";
+import { registerReleaseAssetRoutes } from "./routes/release-assets";
 import { registerReleaseRoutes } from "./routes/releases";
 import { registerRepoRoutes } from "./routes/repo";
+import { registerStarredRoutes } from "./routes/starred";
 import { registerStatusRoutes } from "./routes/statuses";
+import { registerTagRoutes } from "./routes/tags";
 import { registerSubscriptionRoutes } from "./routes/subscription";
 import { registerTopicRoutes } from "./routes/topics";
 import { registerUserReposRoutes } from "./routes/user-repos";
 import { registerUserRoute } from "./routes/user";
+import { registerUserSettingsRoutes } from "./routes/user-settings";
 import { registerUsersRoutes } from "./routes/users";
 import { registerVersionRoute } from "./routes/version";
 
@@ -105,6 +113,36 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // 0004 — see routes/imports.ts). Registration order is irrelevant: the
   // paths are import-family-specific and collide with nothing above.
   registerImportRoutes(app, requireAuth);
+  // Batch-8 git-surface families (REG-MERGE-2): branches, tags, raw git
+  // objects, contents (the read union + the file-change writes) and the
+  // commit family. All are deeper `/repos/{owner}/{repo}/<family>` paths, so
+  // none shadows the static `/repos/issues/search` guarded above or the
+  // `/repos/{owner}/{repo}` metadata routes; the shared doer/optional split
+  // matches upstream (reads optional, writes reqToken).
+  registerBranchRoutes(app, requireAuth, optionalAuth);
+  registerTagRoutes(app, requireAuth, optionalAuth);
+  registerGitRoutes(app, requireAuth, optionalAuth);
+  registerContentsRoutes(app, requireAuth, optionalAuth);
+  // The commit family owns `commits/{sha}/pull` (repoGetCommitPullRequest)
+  // inline. The PULL-ASSETS wave's duplicate pure-D1 variant
+  // (routes/commit-pull.ts) was dropped at its landing review (ceb1106) —
+  // this registration is the only repoGetCommitPullRequest.
+  registerCommitRoutes(app, requireAuth, optionalAuth);
+  // Release attachment list + upload (the PULL-ASSETS wave's tier-1 pair;
+  // rides the releases module's family paths — registered after the release
+  // routes like any deeper family).
+  registerReleaseAssetRoutes(app, requireAuth, optionalAuth);
+  // User-account stragglers: the signed-in settings read/patch and the star
+  // family (upstream reqToken's the whole /user group — requireAuth only).
+  registerUserSettingsRoutes(app, requireAuth);
+  registerStarredRoutes(app, requireAuth);
+  // TODO(REG-MERGE-3): the remaining tier-1 families — archive
+  // (routes/archive.ts + services/archive.ts + migration 0008), forks
+  // (routes/forks.ts + repos/fork-task.ts), languages (routes/languages.ts),
+  // diffpatch (routes/diffpatch.ts) and the pull auto-merge/delete pair
+  // (routes/pull-automerge.ts) — were still mid-flight (untracked
+  // working-tree files, tsc red) at this merge; register each once its wave
+  // lands and the compat suite's loud guard will demand their scenarios.
 
   return app;
 }

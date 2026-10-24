@@ -25,7 +25,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
-import { serializeCommit, serializeTag, serializeTree } from "@cf-gitea/git-engine";
+import { serializeCommit, serializeTag, serializeTree, createDurableGit } from "@cf-gitea/git-engine";
 
 import contractRaw from "../../compat/contract/v1-swagger.generated.json?raw";
 import { comments, milestones, pullRequests, repositories, users } from "../../db/schema";
@@ -34,6 +34,10 @@ import { applyOrgsDdl } from "../../services/orgs/testing";
 import { OrgService } from "../../services/orgs/orgs";
 import { FOLLOWS_DDL_STATEMENTS } from "../services/follows";
 import { IssuesService } from "../../issues/service";
+import { handleForkMessage } from "../../repos/fork-task";
+import { buildPack, buildReceivePackBody } from "../../repos/testing/git-pack";
+import { authorize } from "../../git-http/authorize";
+import { markGateCleared } from "../../git-http/gate";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware } from "../auth";
 import { STUB_USER } from "../auth";
 import { createRepoHook } from "../services/hooks";
@@ -43,6 +47,8 @@ import { ZERO_OID } from "../services/engine";
 import { addOrUpdateCollaborator } from "../services/repo-collaborators";
 import { watchRepo } from "../services/repo-watchers";
 import { starRepo } from "../services/stars";
+import { FORKS_DDL_STATEMENTS } from "../services/forks";
+import { registerForkRoutes } from "../routes/forks";
 import { applyRepoExtrasDdl } from "../testing/repo-ddl";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -200,6 +206,39 @@ async function gitObjectOid(type: string, data: Uint8Array): Promise<string> {
   bytes.set(data, header.byteLength);
   const digest = await crypto.subtle.digest("SHA-1", bytes);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * In-process engine handler for the fork-source seed push (the import
+ * channel's stage-as-receive construction — a stateless function bundle over
+ * the shared bindings, gate-cleared requests only).
+ */
+const forkSeedEngine = createDurableGit<Env>({ authorize, ui: false, namespaces: true });
+
+/** No-op ExecutionContext for the seed engine's fetch (the receive path only
+ *  awaits its own work — options.onPush is unset — so nothing is read; the
+ *  modern platform type still wants the full surface, mirrored from
+ *  src/repos/imports/pipeline.ts). */
+function noopExecContext(): ExecutionContext {
+  const noop = () => {};
+  return {
+    waitUntil: noop,
+    passThroughOnException: noop,
+    abort: noop,
+    exports: undefined as never,
+    props: undefined,
+    tracing: {
+      enterSpan: <T, A extends unknown[]>(name: string, callback: (span: unknown, ...args: A) => T, ...args: A): T =>
+        callback({ name }, ...args),
+      startActiveSpan: <T, A extends unknown[]>(name: string, callback: (span: unknown, ...args: A) => T, ...args: A): T =>
+        callback({ name }, ...args),
+      startSpan: (name: string) => ({ name }),
+      getActiveSpan: () => undefined,
+      Span: function (this: { name: string }, name: string) {
+        this.name = name;
+      } as unknown as new (name: string) => unknown,
+    },
+  };
 }
 
 beforeAll(async () => {
@@ -615,6 +654,61 @@ beforeAll(async () => {
   await starRepo(env.DB, ownerId, SHARED_REPO_ID, SEED_NOW);
   await starRepo(env.DB, ownerId, "9002", SEED_NOW);
   await starRepo(env.DB, ownerId, "9004", SEED_NOW);
+
+  // ---------------------------------------------------------------------
+  // Fork block (SPEC-0004 §2.4 rows listForks/createFork + the SPEC-0001b
+  // §5.3 queue consumer): the raw fork_parent column bootstraps from the
+  // service's DDL statements (the stars/follows pre-migration pattern), and
+  // the fork SOURCE gets real pushed content — one self-contained pack
+  // landed through the engine's own receive path in-process (the import
+  // channel's stage-as-receive pattern: gate-cleared request, x-storage-key
+  // carrying the seeded D1 row's key), so the replication consumer copies a
+  // REAL pack catalog and the equality checks read objects back through the
+  // fork's own bytes.
+  // ---------------------------------------------------------------------
+  for (const statement of FORKS_DDL_STATEMENTS) {
+    await env.DB.prepare(statement).run();
+  }
+  await seedRepo("9009", OWNER.toLowerCase(), "compat-fork-src");
+  const forkPack = await buildPack();
+  const forkPushBody = buildReceivePackBody([{ ref: "refs/heads/main", oid: forkPack.oid }], forkPack.pack);
+  const forkPushRequest = new Request(
+    `${ORIGIN}/${OWNER.toLowerCase()}/compat-fork-src.git/git-receive-pack`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-git-receive-pack-request",
+        "content-length": String(forkPushBody.byteLength),
+        "x-storage-key": "r_9009",
+      },
+      body: forkPushBody,
+    },
+  );
+  markGateCleared(forkPushRequest);
+  const forkPushed = await forkSeedEngine.fetch(forkPushRequest, env, noopExecContext());
+  if (forkPushed.status !== 200) {
+    throw new Error(`fork source seed push failed: ${forkPushed.status} ${await forkPushed.text()}`);
+  }
+  // The in-process receive bypasses the git gate (which normally performs the
+  // §2.5.2 settle), so the D1 row gets the post-push state by hand — the
+  // compat-git seed's pattern above.
+  await drizzle(env.DB)
+    .update(repositories)
+    .set({ isEmpty: false, refsVersion: 1 })
+    .where(eq(repositories.id, "9009"));
+
+  const forkMemberRow = await drizzle(env.DB)
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "compatmember"))
+    .get();
+  if (forkMemberRow === undefined) throw new Error("compat member seed missing for the fork block");
+  Object.assign(seeds, {
+    forkSource: "compat-fork-src",
+    forkSourceRepoId: "9009",
+    forkMemberId: forkMemberRow.id,
+    forkPushedOid: forkPack.oid,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +1295,85 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       name: "sha no PR carries → runtime-body 404",
       status: 404,
       request: (ctx) => ({ path: `${repoPath(ctx)}/commits/${"f".repeat(40)}/pull` }),
+    },
+  ],
+
+  // ---------------------------------------------------------------------
+  // Commit-family block (SPEC-0004 §2.4 rows repoGetAllCommits …
+  // repoCompareDiff): engine log/diff reads over the compat-git seeds.
+  // Fixture order runs these BEFORE the contents-write block below, so the
+  // walk targets here see exactly the seeded single-commit history.
+  // ---------------------------------------------------------------------
+
+  repoGetAllCommits: [
+    {
+      // main carries exactly the seed commit at this fixture position (the
+      // PR-merge scenario lands later); limit=1 answers the single-element
+      // page with the contract-declared commit-list X-* family.
+      name: "the seeded commit",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/commits?limit=1`,
+      }),
+    },
+    {
+      // Empty repo → upstream's 409 EmptyRepository quirk, not 200 [].
+      name: "empty repo → declared 409",
+      status: 409,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/commits` }),
+    },
+  ],
+  repoGetSingleCommit: [
+    {
+      name: "the seeded commit",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/commits/${String(ctx.seeds.gitCommit)}`,
+      }),
+    },
+    {
+      name: "unknown sha → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/commits/${"f".repeat(40)}`,
+      }),
+    },
+  ],
+  repoDownloadCommitDiffOrPatch: [
+    {
+      // The dot-suffix form rides the plain pre-handler on the one-segment
+      // git/commits path (hono's `:a.:b` cannot bind params — routes/commits.ts);
+      // the seed commit is a root commit, whose diff is against the empty tree.
+      name: "raw diff of the seeded commit",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/commits/${String(ctx.seeds.gitCommit)}.diff`,
+      }),
+    },
+    {
+      name: "unknown sha → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/commits/${"f".repeat(40)}.patch`,
+      }),
+    },
+  ],
+  repoCompareDiff: [
+    {
+      // Three-dot (merge-base) compare: the topic commit is a child of the
+      // seed commit, so the range is exactly the one topic commit.
+      name: "main...compat-topic",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/main...compat-topic`,
+      }),
+    },
+    {
+      name: "malformed basehead → declared 400",
+      status: 400,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/nodots`,
+      }),
     },
   ],
 
@@ -2203,6 +2376,256 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       }),
     },
   ],
+
+  // ---------------------------------------------------------------------
+  // Contents block (SPEC-0004 §2.4 rows repoGetContentsList …
+  // repoGetIssueTemplates): the read union over the seeded compat.txt plus
+  // the file-change writes through the commit builder. Fixture order runs
+  // contents BEFORE the git-object reads (git/blobs walks the HEAD tree), so
+  // the write scenarios keep the seeded blob reachable: creates/deletes use
+  // dedicated file names and the update writes BYTE-IDENTICAL content (same
+  // blob oid — content-addressed), leaving the head tree's oid set intact.
+  // ---------------------------------------------------------------------
+
+  repoGetContentsList: [
+    {
+      name: "the seeded tree",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents`,
+      }),
+    },
+    {
+      // The shared fixture repo has no refs at all — the default-branch
+      // resolution is upstream's "The target couldn't be found." 404.
+      name: "repo without a default branch → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/contents` }),
+    },
+  ],
+  repoGetContents: [
+    {
+      // The union: a FILE answers the bare ContentsResponse object.
+      name: "seeded file object",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents/compat.txt`,
+      }),
+    },
+    {
+      name: "missing path → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents/ghost.txt`,
+      }),
+    },
+  ],
+  repoCreateFile: [
+    {
+      // The dedicated victim for the delete scenario below — its blob oid is
+      // derivable from the exact content bytes (gitObjectOid), which is how
+      // repoDeleteFile's CAS sha stays deterministic without a tree read.
+      name: "create",
+      status: 201,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents/compat-created.txt`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ content: "Y3JlYXRlZCBieSB0aGUgY29tcGF0IHN1aXRlCg==", message: "compat create file" }),
+        }),
+      }),
+    },
+    {
+      name: "invalid base64 content → declared 422",
+      status: 422,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents/compat-invalid.txt`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ content: "!!not base64!!" }),
+        }),
+      }),
+    },
+  ],
+  repoUpdateFile: [
+    {
+      // sha CAS against the seeded blob — the update arm (200; the create arm
+      // is repoCreateFile's). The content is byte-identical to the seeded
+      // file, so the blob oid — and the head tree — never moves (see the
+      // block comment; git/blobs' 200 walk runs after this in fixture order).
+      name: "update the seeded file",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents/compat.txt`,
+        init: ctx.withAuth({
+          method: "PUT",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ content: "aGVsbG8gY29tcGF0IGdpdAo=", sha: String(ctx.seeds.gitBlob), message: "compat update file" }),
+        }),
+      }),
+    },
+  ],
+  repoDeleteFile: [
+    {
+      // CAS sha = the exact blob oid repoCreateFile landed (content-derived —
+      // see the create scenario), so the delete is deterministic.
+      name: "delete the created file",
+      status: 200,
+      request: async (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents/compat-created.txt`,
+        init: ctx.withAuth({
+          method: "DELETE",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({
+            sha: await gitObjectOid("blob", new TextEncoder().encode("created by the compat suite\n")),
+            message: "compat delete file",
+          }),
+        }),
+      }),
+    },
+    {
+      // A sha that matches no target file → upstream's 422 family
+      // (handleChangeRepoFilesError's sha-mismatch mapping).
+      name: "stale sha → declared 422",
+      status: 422,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents/compat-batch.txt`,
+        init: ctx.withAuth({
+          method: "DELETE",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ sha: String(ctx.seeds.gitBlob) }),
+        }),
+      }),
+    },
+  ],
+  repoChangeFiles: [
+    {
+      name: "batch create",
+      status: 201,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({
+            files: [{ operation: "create", path: "compat-batch.txt", content: "Y29tcGF0IGJhdGNoIGZpbGUK" }],
+            message: "compat batch change",
+          }),
+        }),
+      }),
+    },
+  ],
+  repoGetRawFile: [
+    {
+      name: "seeded file bytes",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/raw/compat.txt`,
+      }),
+    },
+    {
+      name: "missing path → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/raw/ghost.txt`,
+      }),
+    },
+  ],
+  repoGetRawFileOrLFS: [
+    {
+      // Byte-identical pre-LFS (SPEC-0006 resolves pointers) — the raw twin.
+      name: "seeded file bytes via the media twin",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/media/compat.txt`,
+      }),
+    },
+  ],
+  repoGetEditorConfig: [
+    {
+      // No .editorconfig in the seeded tree — the declared 404 (the frozen
+      // fixture models the 200 schema-less, so the suite drives the 404 arm).
+      name: "no .editorconfig → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/editorconfig/compat.txt`,
+      }),
+    },
+  ],
+  repoGetIssueTemplates: [
+    {
+      // The seeded tree carries no .gitea/.github templates — upstream
+      // answers 200 with an empty list.
+      name: "no templates → empty list",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/issue_templates`,
+      }),
+    },
+  ],
+
+  // ---------------------------------------------------------------------
+  // Fork routes (listForks/createFork — SPEC-0004 §2.4). INERT until the
+  // orchestrator's router.ts one-liner registers registerForkRoutes: the
+  // dynamic suite only runs IMPLEMENTED operations, so these scenarios stay
+  // skipped (never failed) while the routes are unregistered and start
+  // passing untouched the moment the registration lands. Fixture order runs
+  // listForks BEFORE createFork, so the list case asserts the pre-create
+  // empty page; the create case rides the fork-block source seed
+  // (compat-fork-src). The full 202 → consume → equality flow lives in the
+  // dedicated fork describe block after the tier-2 block (the dynamic
+  // harness cannot drive the queue consumer).
+  // ---------------------------------------------------------------------
+  listForks: [
+    {
+      name: "seeded source, pre-create empty page",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.forkSource)}/forks`,
+      }),
+    },
+    {
+      name: "missing repo → runtime-body 404",
+      status: 404,
+      request: () => ({ path: "/repos/ghost/nope/forks" }),
+    },
+  ],
+  createFork: [
+    {
+      name: "fork the seeded source (202 async)",
+      status: 202,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.forkSource)}/forks`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: "compat-fork-list" }),
+        }),
+      }),
+    },
+    {
+      name: "missing source → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        path: "/repos/ghost/nope/forks",
+        init: ctx.withAuth({ method: "POST", headers: JSON_HEADERS, body: JSON.stringify({}) }),
+      }),
+    },
+    {
+      name: "invalid fork name → declared 422",
+      status: 422,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.forkSource)}/forks`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: "bad name!" }),
+        }),
+      }),
+    },
+  ],
 };
 
 // ---------------------------------------------------------------------------
@@ -2470,6 +2893,174 @@ describe("tier-2 compat scenarios — org profile, members, public members, foll
       init: authed(),
     });
     expect(notFollowed.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fork flow (SPEC-0004 §2.4 rows listForks/createFork + SPEC-0001b §5.3): the
+// full async contract the dynamic harness cannot express — POST answers 202
+// with the queue message CAPTURED (a stub producer rides the route's
+// REPO_TASKS seam), the consumer is driven by hand (handleForkMessage — the
+// exact body the REPO_TASKS dispatch calls), and the replica is proven
+// content-equal to the source through the engine's own RPCs: refs + HEAD
+// (fsck: every copied ref tip readable from the fork's OWN pack bytes), the
+// pack-catalog index rows, the rev-list chain from main, and blob bytes.
+// Cases are order-sensitive where they write (create → consume → list/guards).
+// The local mount is the orchestrator one-liner's seam — it keeps working
+// unchanged once registerForkRoutes lands in router.ts.
+// ---------------------------------------------------------------------------
+
+/** The fork scenarios' REPO_TASKS capture (send-side stub, the imports
+ *  tests' quietQueue shape plus recording). */
+const forkQueueSends: Array<Record<string, unknown>> = [];
+const capturingForkQueue: Queue = {
+  send: (message: unknown) => {
+    forkQueueSends.push(message as Record<string, unknown>);
+    return Promise.resolve({ metrics: { backlogCount: 0, backlogBytes: 0 } });
+  },
+  sendBatch: () => Promise.resolve({ metrics: { backlogCount: 0, backlogBytes: 0 } }),
+  metrics: () => Promise.resolve({ backlogCount: 0, backlogBytes: 0 }),
+};
+
+/** The CompatMember identity — the fork-into-org 403's ungranted doer. */
+const MEMBER_TOKEN = "compat-member-token";
+const forkMemberResolver = {
+  resolveToken: (token: string) => {
+    if (token === TOKEN) return Promise.resolve(suiteIdentity());
+    if (token === MEMBER_TOKEN) {
+      const memberId = seeds.forkMemberId;
+      if (typeof memberId !== "number") throw new Error("fork seeds not applied — beforeAll has not run");
+      return Promise.resolve({
+        ...STUB_USER,
+        id: memberId,
+        login: "CompatMember",
+        full_name: "CompatMember",
+        created: SEED_NOW.toISOString(),
+      });
+    }
+    return Promise.resolve(null);
+  },
+};
+
+const forkSendFor =
+  (resolver: { resolveToken: (token: string) => Promise<User | null> }): CompatRequestSender =>
+  (request: CompatRequest): Promise<Response> => {
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerForkRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    const testEnv: ApiEnv["Bindings"] = { ...env, REPO_TASKS: capturingForkQueue };
+    return Promise.resolve(app.fetch(new Request(`${ORIGIN}${request.path}`, request.init), testEnv));
+  };
+const forkSend = forkSendFor(suiteResolver);
+const forkAuthed = (token: string) => (init?: RequestInit): RequestInit => {
+  const headers = new Headers(init?.headers);
+  headers.set("Authorization", `token ${token}`);
+  return { ...init, headers };
+};
+
+/** Lazy path builder — seeds are applied in beforeAll, after describe
+ *  collection, so the source path must resolve at call time. */
+const forkSourcePath = (): string => `/repos/${String(seeds.repoOwner)}/${String(seeds.forkSource)}`;
+
+describe("fork flow — 202, REPO_TASKS replication, content-equal replica (SPEC-0001b §5.3)", () => {
+  it("POST forks: 202 + the fork Repository (fork/parent/owner perms) + exactly one repo-fork message", async () => {
+    const response = await forkSend({
+      path: `${forkSourcePath()}/forks`,
+      init: forkAuthed(TOKEN)({ method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ name: "compat-fork-dst" }) }),
+    });
+    expect(response.status).toBe(202);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body.fork).toBe(true);
+    expect(body.full_name).toBe(`${String(seeds.repoOwner)}/compat-fork-dst`);
+    // The honest pre-replication state: nothing is servable before finalize.
+    expect(body.empty).toBe(true);
+    expect((body.parent as Record<string, unknown>).full_name).toBe(`${String(seeds.repoOwner)}/${String(seeds.forkSource)}`);
+    expect(body.permissions).toEqual({ admin: true, push: true, pull: true });
+
+    expect(forkQueueSends).toEqual([
+      { kind: "repo-fork", sourceRepoId: String(seeds.forkSourceRepoId), forkRepoId: expect.any(String) },
+    ]);
+  });
+
+  it("consumer: handleForkMessage replicates the catalog and settles ready/non-empty", async () => {
+    const msg = forkQueueSends[0] as { sourceRepoId: string; forkRepoId: string };
+    await handleForkMessage(env, { kind: "repo-fork", sourceRepoId: msg.sourceRepoId, forkRepoId: msg.forkRepoId });
+    const forkRow = await drizzle(env.DB)
+      .select({ status: repositories.status, isEmpty: repositories.isEmpty })
+      .from(repositories)
+      .where(eq(repositories.id, msg.forkRepoId))
+      .get();
+    expect(forkRow?.status).toBe("ready");
+    expect(forkRow?.isEmpty).toBe(false);
+  });
+
+  it("fork cell equals source: refs+head, catalog rows, rev-list chain, blob bytes", async () => {
+    const srcCell = env.REPO.getByName(`${String(seeds.repoOwner)}/${String(seeds.forkSource)}`);
+    const dstCell = env.REPO.getByName(`${String(seeds.repoOwner)}/compat-fork-dst`);
+
+    // refs + HEAD — and every copied tip readable in the fork's own store
+    // (finalizeForkImport already refused to commit unresolvable tips, so
+    // this doubles as the fsck arm).
+    const [srcRefs, dstRefs] = [await srcCell.listRefs(), await dstCell.listRefs()];
+    expect(dstRefs.head).toBe(srcRefs.head);
+    expect(dstRefs.refs.map((r) => [r.name, r.target]).sort()).toEqual(
+      srcRefs.refs.map((r) => [r.name, r.target]).sort(),
+    );
+
+    // pack catalog + index rows (kind/location are provenance — 'receive' vs
+    // 'fork' — so equality compares keys and the oid sets they index).
+    const [srcPage, dstPage] = [await srcCell.listCatalogPage("", 65536), await dstCell.listCatalogPage("", 65536)];
+    expect(dstPage.more).toBe(false);
+    expect(dstPage.packs.map((p) => [p.packKey, p.rows.map((r) => r.oid)])).toEqual(
+      srcPage.packs.map((p) => [p.packKey, p.rows.map((r) => r.oid)]),
+    );
+
+    // rev-list analog: the identical commit chain from main.
+    const [srcLog, dstLog] = [await srcCell.listLog("main"), await dstCell.listLog("main")];
+    expect(dstLog.commits.map((c) => c.oid)).toEqual(srcLog.commits.map((c) => c.oid));
+    expect(dstLog.commits).toEqual(srcLog.commits);
+
+    // content equality through the fork's own pack bytes.
+    const srcBlob = await srcCell.readBlob("main", "file.txt");
+    const dstBlob = await dstCell.readBlob("main", "file.txt");
+    expect(new TextDecoder().decode(dstBlob.data)).toBe(new TextDecoder().decode(srcBlob.data));
+  });
+
+  it("GET forks lists the replica with the runtime headers", async () => {
+    const response = await forkSend({ path: `${forkSourcePath()}/forks?limit=1` });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Total-Count")).toBe("1");
+    const body = (await response.json()) as Array<Record<string, unknown>>;
+    expect(body).toHaveLength(1);
+    expect(body[0]?.full_name).toBe(`${String(seeds.repoOwner)}/compat-fork-dst`);
+  });
+
+  it("POST guards: 409 same-owner re-fork, 409 name collision, 403 ungranted org member", async () => {
+    // GetUserFork: CompatOwner already forks this source (compat-fork-dst) —
+    // a second fork under a DIFFERENT name is still the upstream 409.
+    const refork = await forkSend({
+      path: `${forkSourcePath()}/forks`,
+      init: forkAuthed(TOKEN)({ method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ name: "compat-fork-dst-2" }) }),
+    });
+    expect(refork.status).toBe(409);
+    // slug collision: the fork would take an existing repo's name.
+    const collision = await forkSend({
+      path: `/repos/${String(seeds.repoOwner)}/shared/forks`,
+      init: forkAuthed(TOKEN)({ method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ name: "second" }) }),
+    });
+    expect(collision.status).toBe(409);
+    // the org grant chain: CompatMember is a member without repo-create rights.
+    const ungranted = await forkSendFor(forkMemberResolver)({
+      path: `${forkSourcePath()}/forks`,
+      init: forkAuthed(MEMBER_TOKEN)({
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ organization: String(seeds.org) }),
+      }),
+    });
+    expect(ungranted.status).toBe(403);
+    // none of the guards got as far as enqueueing.
+    expect(forkQueueSends).toHaveLength(1);
   });
 });
 
