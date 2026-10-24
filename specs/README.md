@@ -5,7 +5,10 @@ and implementation updates its SPEC in the same change. Status legend: **draft**
 not yet ratified for implementation), **accepted** (orchestrator-reviewed, implementable),
 **in flight** (being written or implemented).
 
-Status snapshot below: **2026-10-25 03:08 CST**. Three `pnpm check:api` readings —
+**TIER-1 COMPLETE — 78/78 paths, 129/129 operations** (commit dcb422f,
+2026-10-25 03:35 CST; the forks registration landed as REG-MERGE-4).
+
+Prior status snapshot (kept for the record): **2026-10-25 03:08 CST**. Three `pnpm check:api` readings —
 03:02:41, 03:06:31, 03:08:00 CST — all `PASS` at **77/78 paths, 127/129 ops** (one
 short of the 78/78 tier-1 terminal state, so no completion banner yet). REG-MERGE-2
 (9877544), the tier-1 tail (6e3c322) and REG-MERGE-3 (a969312) landed since the last
