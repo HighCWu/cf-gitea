@@ -145,7 +145,9 @@ client-bandwidth-bound via R2 fast path (reference: Artifacts measured 4x larger
 at ~3.5 MB/s; GitHub ~11 MB/s for same repo — we store client-deltified packs verbatim);
 push indexing ≈ seconds per 50 MB pack within 300s CPU ceiling, product quota ~1 GB/push;
 repeat clones of the same commit served from edge Cache / R2 clone-pack cache
-(refs_version-keyed, g1t pattern). Benchmark regression is a required CI stage from
+(refs_version-keyed, g1t pattern). First baseline RECORDED 2026-10-24 (milestone m2, 5m fixture, local workerd): clone 14.2 MiB/s ·
+push 192 ms · incremental ratio 0.000245 · info/refs p50 12.5 ms — CI gate enforced.
+Benchmark regression is a required CI stage from
 SPEC-0001 onward: track clone MB/s, push wall/CPU time per 50 MB and 500 MB fixtures,
 API p95, and peak memory; reference-repo numbers (g1t, durable-git, cloudflare-agent-git
 spike) are leads to re-verify ourselves, not accepted baselines. Known watch-items: subrequest budget (index scan must

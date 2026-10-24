@@ -24,9 +24,9 @@ Deep-dive: [ADR-0001](docs/decisions/0001-technical-direction.md) ·
 
 **Live** (first deploy 2026-10-24): <https://cf-gitea.hecongw.workers.dev> — real git
 hosting works end to end against it (PAT-authenticated push, clone, token API). Landed:
-vendored engine with the M2 receive-in-Worker split (lease RPCs, R2 staging), SPEC-0002
+vendored engine through M2 Step 2 (Worker-side scan/delta/idx, lease RPCs, fail-closed protocol parser) with an enforced benchmark baseline (m2: clone 14.2 MiB/s local), SPEC-0002
 auth (PATs, scopes, token API), the git-HTTP ACL gate (SPEC-0003 M1), issue/PR webhook
-data layer, tier-1 API batches in flight (~9 of 78 paths), Tier-2 UI underway (asset
+data layer, tier-1 API batches in flight (16 of 78 paths, batches landing), Tier-2 UI underway (asset
 pipeline proven, shell landing). Nine SPECs + three ADRs; CI runs typecheck/lint/tests,
 contract checks, the real-git e2e suite, benchmarks, and asset determinism. See the
 [SPEC index](specs/), [ADR-0002](docs/decisions/0002-contract-freeze.md) (contract

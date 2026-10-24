@@ -8,7 +8,7 @@ not yet ratified for implementation), **accepted** (orchestrator-reviewed, imple
 | SPEC | Title | Status | Depends on | Owns |
 |---|---|---|---|---|
 | [0001](0001-storage-engine.md) | Git storage engine (R2 + DO, vendored durable-git) | accepted (amended) · **M1 landed & independently e2e-verified 2026-10-24** | ADR-0001 | engine receive/serve paths, R2/DO layout, quotas, fuzz/bench |
-| [0001a](0001a-split-plane-amendment.md) | Split-plane amendment: receive-in-Worker, lease RPCs, key switch, schema, commit builder | accepted · **Step 1 in flight** | 0001 | M2 design-of-record; exact RPC signatures |
+| [0001a](0001a-split-plane-amendment.md) | Split-plane amendment: receive-in-Worker, lease RPCs, key switch, schema, commit builder | accepted · Steps 1-2 landed (P0 gates G1-G5 satisfied); Steps 3-4 in flight | 0001 | M2 design-of-record; exact RPC signatures |
 | [0001b](0001b-merge-fork-primitives.md) | Engine merge/fork/diff primitives | accepted · corrections 5-8 folded into 0004/0005; 1-4 queued post-M2-S1 | 0001a, 0005 §3.4, 0004 OQ#4 | merge surface, fork model (full copy + PR relay), copyObjects-free |
 | [0002](0002-auth.md) | Authentication (users, PATs, scopes, middleware) | accepted | 0001 (refs), ADR-0001 D3 | D1 users/tokens, auth semantics |
 | [0003](0003-repo-lifecycle-git-http.md) | Repo lifecycle & git smart-HTTP adapter, push-create, import channel | accepted | 0001, 0002 | route table, ACL matrix, lifecycle, >1 GiB import |

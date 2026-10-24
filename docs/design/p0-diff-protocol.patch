@@ -1,0 +1,365 @@
+diff --git a/packages/git-engine/src/git/protocol.ts b/packages/git-engine/src/git/protocol.ts
+index b3982f7..6a5c3ce 100644
+--- a/packages/git-engine/src/git/protocol.ts
++++ b/packages/git-engine/src/git/protocol.ts
+@@ -176,14 +176,42 @@ export function streamingCloneResponse(
+   return new Response(stream, { headers });
+ }
+ 
++/**
++ * The shallow-negotiation request, as a discriminated union: exactly one of
++ * the modes is in effect, and an unsupported deepen-family argument REPLACES
++ * rather than coexists — `deepen 10` followed by `deepen-since` never
++ * silently degrades to a plain depth fetch (G4: combination safety).
++ * - none: a complete fetch; no shallow negotiation.
++ * - depth: `deepen <n>` — the only deepen form implemented (client boundary
++ *   commits computed server-side; `--unshallow` rides the same field).
++ * - unsupported: `deepen-since` / `deepen-not` / `deepen-relative` (MUST be
++ *   honored once the `shallow` fetch feature is advertised; we do not
++ *   implement them) — the request is rejected at parse time, never answered
++ *   with a silently wrong (e.g. full) pack.
++ */
++export type DeepenRequest =
++  | { kind: "none" }
++  | { kind: "depth"; depth: number }
++  | { kind: "unsupported"; argument: string };
++
+ interface UploadRequest {
+   command: "fetch" | "ls-refs" | null;
+   wants: string[];
+   haves: string[];
+   done: boolean;
++  /** the client's existing shallow boundaries (`shallow <oid>` lines) */
+   clientShallows: string[];
+-  deepen: number; // 0 = no depth limit requested
++  deepen: DeepenRequest;
+   caps: Set<string>;
++  /**
++   * First unsupported-but-semantics-changing fetch argument, or null — set
++   * together with `deepen.kind = "unsupported"` for the deepen family, and
++   * for `filter` (partial clone; MUST be honored, not implemented). Parsed
++   * requests are rejected at THIS boundary, before any cache predicate or
++   * pack generation: the silent-drop used to turn `git fetch
++   * --shallow-since` into a full clone.
++   */
++  badArgument: string | null;
+ }
+ 
+ export function parseUploadRequest(body: Uint8Array): UploadRequest {
+@@ -194,33 +222,90 @@ export function parseUploadRequest(body: Uint8Array): UploadRequest {
+     haves: [],
+     done: false,
+     clientShallows: [],
+-    deepen: 0,
++    deepen: { kind: "none" },
+     caps: new Set(),
++    badArgument: null,
++  };
++  // Phase-aware dispatch: v2 requests carry capability-update lines
++  // (agent=…, object-format=…) BEFORE the DELIM and fetch arguments after it;
++  // v0 requests are fetch arguments throughout. Reject-unknown applies to
++  // fetch-argument lines only — command headers, capability updates, and
++  // section markers are never fetch arguments.
++  let argsPhase = false;
++  const reject = (arg: string): void => {
++    if (!req.badArgument) req.badArgument = arg;
++    if (req.deepen.kind !== "unsupported") req.deepen = { kind: "unsupported", argument: arg };
+   };
+   for (let p = parser.read(); p !== null; p = parser.read()) {
+-    if (p.kind !== "line") continue;
++    if (p.kind === "delim") {
++      argsPhase = true; // v2: capability section ended, fetch arguments begin
++      continue;
++    }
++    if (p.kind !== "line") continue; // flush / section markers
+     const line = p.text;
+-    if (line === "command=fetch" || line === "command=ls-refs") {
+-      req.command = line === "command=fetch" ? "fetch" : "ls-refs";
+-    } else if (line === "no-progress" || line === "symrefs" || line === "peel") {
+-      req.caps.add(line);
+-    } else if (line.startsWith("want ")) {
++    if (line.startsWith("command=")) {
++      // v2 command header — never a fetch argument
++      if (line === "command=fetch") req.command = "fetch";
++      else if (line === "command=ls-refs") req.command = "ls-refs";
++      continue;
++    }
++    if (!argsPhase && /^[a-z][a-z0-9-]*=/.test(line)) {
++      continue; // capability update (agent=, object-format=, session-id=…)
++    }
++    if (line.startsWith("want ")) {
+       req.wants.push(line.slice(5, 45));
+       // capabilities ride on the first want line
+       for (const cap of line.slice(45).trim().split(" ")) if (cap) req.caps.add(cap);
++      argsPhase = true; // v0 has no DELIM: the first want opens the args phase
+     } else if (line.startsWith("have ")) {
+       req.haves.push(line.slice(5, 45));
+     } else if (line.startsWith("shallow ")) {
+       req.clientShallows.push(line.slice(8, 48));
+     } else if (line.startsWith("deepen ")) {
+-      req.deepen = parseInt(line.slice(7), 10) || 0;
++      // combination safety: an unsupported deepen-family argument already seen
++      // keeps the request rejected — a later `deepen <n>` never overwrites it
++      const depth = parseInt(line.slice(7), 10) || 0;
++      if (req.deepen.kind !== "unsupported") req.deepen = { kind: "depth", depth };
+     } else if (line === "done") {
+       req.done = true;
++    } else if (knownIgnorable(req.command, line)) {
++      if (line === "no-progress" || line === "symrefs" || line === "peel") req.caps.add(line);
++      continue;
++    } else {
++      // deepen-relative / deepen-since / deepen-not / filter, and anything
++      // else unclassified: semantics-changing and unimplemented -> fail closed
++      reject(line.split(" ")[0]);
+     }
+   }
+   return req;
+ }
+ 
++/**
++ * Fetch/ls-refs arguments that are compliant to ignore: SHOULD-honor extras
++ * (include-tag), wire-encoding choices (thin-pack, ofs-delta, side-band),
++ * progress framing (no-progress), and — for ls-refs — response-shaping
++ * options whose absence keeps the reply valid (symrefs, peel, ref-prefix,
++ * unborn). Everything else unrecognized changes the negotiated result and is
++ * rejected by the caller.
++ */
++function knownIgnorable(command: "fetch" | "ls-refs" | null, line: string): boolean {
++  const token = line.split(" ")[0];
++  if (command === "ls-refs") {
++    // ref-prefix carries a value: "ref-prefix <prefix>"
++    return (
++      line === "symrefs" || line === "peel" || line === "unborn" || token === "ref-prefix"
++    );
++  }
++  return (
++    line === "no-progress" ||
++    line === "include-tag" ||
++    line === "thin-pack" ||
++    line === "ofs-delta" ||
++    line === "side-band" ||
++    line === "side-band-64k"
++  );
++}
++
+ async function lsRefs(store: GitStore, req: UploadRequest): Promise<Uint8Array> {
+   const lines: Uint8Array[] = [];
+   const head = store.resolveHead();
+@@ -527,6 +612,19 @@ export async function uploadPack(
+     "cache-control": "no-cache",
+   };
+   const req = parseUploadRequest(body);
++  // Fail closed at parse: unsupported-but-semantics-changing fetch arguments
++  // (deepen-since/deepen-not/deepen-relative/filter, unknowns) get a
++  // protocol-shaped ERR — recognizable by the git CLI in both v0 and v2
++  // (protocol-v2 aborts on ERR packets) — never a silently wrong pack and
++  // never an HTTP 500. The shallow e2e sections (plain `deepen <n>`) are
++  // untouched.
++  if (req.badArgument) {
++    release();
++    return new Response(
++      pkt(`ERR upload-pack: unsupported fetch argument '${req.badArgument}' (only depth-limited shallow fetches are supported)\n`) as unknown as BodyInit,
++      { headers }
++    );
++  }
+   if (req.command === "ls-refs") {
+     release();
+     return new Response(await lsRefs(store, req) as unknown as BodyInit, { headers });
+@@ -549,16 +647,16 @@ export async function uploadPack(
+ 
+   // shallow section (only when the client asked to deepen)
+   let commitLimit: Set<string> | null = null;
+-  if (req.deepen > 0) {
++  if (req.deepen.kind === "depth") {
+     if (v2) preamble.push(pkt("shallow-info\n"));
+     const clientShallowSet = new Set(req.clientShallows);
+-    if (req.deepen >= INFINITE_DEPTH) {
++    if (req.deepen.depth >= INFINITE_DEPTH) {
+       // --unshallow: full history, everything the client thought was shallow opens up
+       for (const s of req.clientShallows) {
+         if (store.has(s)) preamble.push(pkt(`unshallow ${s}\n`));
+       }
+     } else {
+-      const { commits, boundary } = await computeDepthSet(store, req.wants, req.deepen);
++      const { commits, boundary } = await computeDepthSet(store, req.wants, req.deepen.depth);
+       commitLimit = commits;
+       for (const b of boundary) {
+         if (!clientShallowSet.has(b)) preamble.push(pkt(`shallow ${b}\n`));
+@@ -630,7 +728,8 @@ export async function uploadPack(
+   // missing or stale cache (version mismatch, or any failure) falls straight
+   // through to the walk, which then repopulates it — so a wrong pack is never
+   // served, and existing repos become fast on their next full clone.
+-  const fullClone = !req.haves.length && req.deepen === 0 && wantsAreAllTips(store, req.wants);
++  const fullClone =
++    !req.haves.length && req.deepen.kind === "none" && wantsAreAllTips(store, req.wants);
+ 
+   // R2 full-clone offload (write side). Only a standard side-band-64k full clone
+   // is eligible, and it is reached only after the advertised-oids gate above — so
+@@ -667,13 +766,15 @@ export async function uploadPack(
+     // a plain clone enumerates the whole database: size the walk's set up front
+     // so it never doubles (a doubling keeps the old and new arrays live at once)
+     const expected =
+-      !req.haves.length && !commitLimit && !req.deepen ? Math.max(store.objectCount(), 4096) : 4096;
++      !req.haves.length && !commitLimit && req.deepen.kind === "none"
++        ? Math.max(store.objectCount(), 4096)
++        : 4096;
+     send = await collectPackOids(
+       store,
+       req.wants,
+       excluded,
+       commitLimit,
+-      req.deepen > 0, // descendThroughExcluded: only while deepening/unshallowing
++      req.deepen.kind === "depth", // descendThroughExcluded: only while deepening/unshallowing
+       expected
+     );
+     if (fullClone) {
+@@ -1129,31 +1230,14 @@ export function validRefName(ref: string): boolean {
+ 
+ /**
+  * Every object in the closure of `tip` is present, so setting a ref to it
+- * cannot brick the repo. A thin/broken pack that fails to close over its new
+- * ref leaves a referenced object absent; walking commit->tree->subtrees+blobs
+- * (and tag->target) with a presence probe at each node catches it before the
+- * ref moves. `known` is pre-seeded with the pre-existing ref tips, whose
+- * closure was validated at their own push, so descent stops there — the walk
+- * touches only objects this push introduced.
++ * cannot brick the repo. Since SPEC-0001a §3 Step 2 this closure check is the
++ * Worker scan's connectivity anti-check (receive/delta.ts): the pack's
++ * non-blob objects are parsed as they resolve and each referenced child is
++ * anti-checked against the pack's own oid set plus the object database via
++ * batched lookupObjects. validatePush consumes the verdict through
++ * `scan.packIncomplete` plus a presence probe on each new tip — the DO never
++ * reads pack bytes on the receive path.
+  */
+-async function reachableComplete(store: GitStore, tip: string, known: OidSet): Promise<boolean> {
+-  // Cursor BFS over `known` itself: newly reached oids append past `start`,
+-  // and pre-existing entries (a fast-forward's already-validated closure) sit
+-  // before it and are never re-walked. Reusing the set as its own frontier
+-  // needs no separate hex-oid stack to walk it.
+-  const start = known.size;
+-  if (!known.addHex(tip)) return true; // tip already in a validated closure
+-  for (let i = start; i < known.size; i++) {
+-    const oid = known.atHex(i);
+-    const meta = store.typeAndSize(oid);
+-    if (!meta) return false;
+-    if (meta.type === "blob") continue;
+-    const obj = await store.get(oid);
+-    if (!obj) return false;
+-    for (const child of childOids(obj)) known.addHex(child);
+-  }
+-  return true;
+-}
+ 
+ /** Per-command outcome decided by the object-reading validation pass. */
+ interface PushDecision {
+@@ -1201,76 +1285,40 @@ function childOids(obj: { type: ObjType; data: Uint8Array }): string[] {
+ }
+ 
+ /**
+- * Verify a freshly ingested pack is connectivity-complete — every child oid its
+- * objects reference is present in `pack_objects` ∪ `objects` — and return the
+- * first missing child, or null when complete. This is the storage-backed
+- * counterpart to walking the graph: it scans the pack's non-blob objects one
+- * keyset page at a time, stages their referenced children into `push_edges` in
+- * bounded batches, and lets SQLite anti-join each batch against the stores. A
+- * complete pack means every tip in it has a complete closure (by induction over
+- * the edges), so the whole push is connected — checked in flat memory, with no
+- * OidSet that scales with the object count. Used for a fresh push, where the
+- * old walk built a reachable set the commit step then discarded anyway.
++ * Verify a freshly received pack is connectivity-complete. The check itself
++ * ran in the Worker (receive/delta.ts anti-check); this comment records where
++ * the old `packComplete`/`push_edges` SQL machinery lived until Step 2 deleted
++ * it — connectivity membership is now batched `lookupObjects` anti-checks.
+  */
+-async function packComplete(store: GitStore, packId: number): Promise<string | null> {
+-  const PAGE = 1000;
+-  const EDGE_BATCH = 8192;
+-  store.resetPushEdges();
+-  let after = "";
+-  let pending: string[] = [];
+-  const flush = (): string | null => {
+-    if (!pending.length) return null;
+-    store.addPushEdges(pending);
+-    pending = [];
+-    const miss = store.firstMissingPushEdge();
+-    store.resetPushEdges();
+-    return miss;
+-  };
+-  for (;;) {
+-    const page = store.packNonBlobOidsAfter(packId, after, PAGE);
+-    if (!page.length) break;
+-    for (const oid of page) {
+-      const obj = await store.get(oid);
+-      if (!obj) return oid; // indexed but unreadable — the pack is not complete
+-      for (const child of childOids(obj)) pending.push(child);
+-      if (pending.length >= EDGE_BATCH) {
+-        const miss = flush();
+-        if (miss) return miss;
+-      }
+-    }
+-    after = page[page.length - 1];
+-  }
+-  return flush();
+-}
+-
+ export async function validatePush(
+   store: GitStore,
+   commands: PushCommand[],
+   unpackError: string | null,
+-  packId: number | null
++  scan: { packId: number | null; packIncomplete: boolean }
+ ): Promise<PushPlan> {
+   // whether the reachable cache is valid for the pre-push refs: only then can
+   // it be extended in place (union with the connectivity walk) instead of
+   // rebuilt from scratch on the next full clone
+   const hadCache = store.getMeta("reachable-version") === store.reachableVersion();
+-  // A fresh push (no cache to extend) verifies connectivity in SQL rather than
+-  // by walking into an OidSet — the walk's result would be discarded by the
+-  // commit step's invalidate below, so it was pure memory spent to reject a
+-  // broken pack. `packMissing` names the first unresolved child, or stays null.
+-  // A fast-forward keeps the cheap new-object walk, which both verifies and
+-  // extends the cache in one pass.
+-  const packMissing =
+-    !hadCache && !unpackError && packId !== null ? await packComplete(store, packId) : null;
+-  // pre-existing ref tips bound the connectivity walk: their closure is
+-  // already validated, so a normal fast-forward only re-checks new objects
++  // pre-existing ref tips bound the extendable set: their closure was
++  // validated at their own push
+   const known = new OidSet(4096);
+-  for (const r of store.refs()) {
+-    known.addHex(r.target);
+-    const c = await peelToCommitOid(store, r.target);
+-    if (c) known.addHex(c);
+-  }
++  for (const r of store.refs()) known.addHex(r.target);
+   const knownHead = store.resolveHead();
+   if (knownHead) known.addHex(knownHead);
++  // A cached fast-forward extends the persisted reachable set with the pack's
++  // own rows: every object a complete pack introduces is reachable from its
++  // new tips, so the union closes over the new reachable set without the DO
++  // walking (or inflating) a single object. Built from index rows alone.
++  if (hadCache && !unpackError && !scan.packIncomplete && scan.packId !== null) {
++    let after = "";
++    for (;;) {
++      const page = store.packs.packOidsAfter(scan.packId, after, 1000);
++      if (!page.length) break;
++      for (const oid of page) known.addHex(oid);
++      after = page[page.length - 1];
++    }
++  }
+ 
+   const decisions: PushDecision[] = [];
+   for (const cmd of commands) {
+@@ -1292,9 +1340,9 @@ export async function validatePush(
+       decisions.push({ ref: cmd.ref, expectedOld: cmd.old, del: true });
+       continue;
+     }
+-    const connected = hadCache
+-      ? await reachableComplete(store, cmd.next, known)
+-      : packMissing === null && store.has(cmd.next);
++    // the Worker anti-checked every referenced child of every pack object; a
++    // tip that is not even present fails here, an incomplete pack fails all
++    const connected = !scan.packIncomplete && store.has(cmd.next);
+     if (!connected) {
+       decisions.push({ ref: cmd.ref, expectedOld: cmd.old, reject: "missing necessary objects" });
+       continue;
