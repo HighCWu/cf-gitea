@@ -92,7 +92,7 @@ import { compareUrl } from "../../api/services/hooks";
 import { apiUserFromRow, findRepositoryById, toApiRepository, type Viewer } from "../../api/services/repository";
 import { toPayloadCommit, usernamesByEmail } from "../../api/services/git-models";
 import { repoMirrors, repositories } from "../../db/schema";
-import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
+import { emitWebhookDeliveries, enrichCommitsWithFileLists, type HookEventType } from "../../issues/webhooks";
 import { authorize } from "../../git-http/authorize";
 import { markGateCleared } from "../../git-http/gate";
 import { parseHostPolicy, type HostPolicy } from "../../webhooks/ssrf";
@@ -526,7 +526,12 @@ async function notifyMirrorSyncDelta(env: MirrorSyncEnv, repo: RepoRow, updates:
           continue;
         }
         const usernames = await usernamesByEmail(env.DB, walk.commits);
-        const commits = [...walk.commits].reverse().map((commit) => toPayloadCommit(commit, pair, usernames, origin));
+        let commits = [...walk.commits].reverse().map((commit) => toPayloadCommit(commit, pair, usernames, origin));
+        // Upstream's payload mapper fills added/removed/modified per commit
+        // (ToAPIPayloadCommit's diff-tree); the shared enricher costs one
+        // readDiff RPC per payload commit and degrades to the list-less
+        // shape on any failure (its documented deviation).
+        ({ commits } = await enrichCommitsWithFileLists(commits, (id) => cell.readDiff(id)));
         // head_commit — upstream renders the new tip from its own
         // GetCommit(newCommitID) read (:373-378), matched into the list by id
         // (ToAPIPayloadCommits). DEVIATION (documented, SPEC-0009 §2.7 wave):
@@ -541,7 +546,13 @@ async function notifyMirrorSyncDelta(env: MirrorSyncEnv, repo: RepoRow, updates:
         let headCommit = commits.find((commit) => commit.id === update.next) ?? null;
         if (headCommit === null) {
           const tip = await cell.readCommit(update.next);
-          headCommit = tip === null ? null : toPayloadCommit(tip, pair, usernames, origin);
+          // The tip rides the same enricher (upstream's mapper fills
+          // head_commit's lists identically — modules/repository/commits.go:
+          // 117-123); outside-the-window tip = one extra readDiff.
+          headCommit =
+            tip === null
+              ? null
+              : (await enrichCommitsWithFileLists([toPayloadCommit(tip, pair, usernames, origin)], (id) => cell.readDiff(id))).commits[0]!;
         }
         const push: PushPayload = {
           ref: update.ref,
