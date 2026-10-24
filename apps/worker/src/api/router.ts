@@ -8,6 +8,7 @@ import {
 } from "./auth";
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
+import { registerAdminT2Routes } from "./routes/admin-t2";
 import { registerArchiveRoutes } from "./routes/archive";
 import { registerBranchRoutes } from "./routes/branches";
 import { registerCollaboratorRoutes } from "./routes/collaborators";
@@ -151,6 +152,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // family (upstream reqToken's the whole /user group — requireAuth only).
   registerUserSettingsRoutes(app, requireAuth);
   registerStarredRoutes(app, requireAuth);
+  // Tier-2 admin surface: user search/create/edit/delete, org create,
+  // rename, admin repo create. Every op site-admin gated (upstream
+  // reqSiteAdmin); PAT-only deviations documented in the module header.
+  registerAdminT2Routes(app, requireAuth);
   // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
   // download, the diffpatch apply, the languages listing and the scheduled
   // auto-merge cancellation. All are deeper `/repos/{owner}/{repo}/<family>`
