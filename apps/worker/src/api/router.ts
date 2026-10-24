@@ -27,6 +27,7 @@ import { registerIssueRoutes } from "./routes/issues";
 import { registerIssueT2Routes } from "./routes/issue-t2";
 import { registerIssueWriteT2Routes } from "./routes/issue-write-t2";
 import { registerLabelRoutes } from "./routes/labels";
+import { registerLabelsT2Routes } from "./routes/labels-t2";
 import { registerLanguageRoutes } from "./routes/languages";
 import { registerMarkdownRoutes } from "./routes/markdown";
 import { registerMilestoneRoutes } from "./routes/milestones";
@@ -116,6 +117,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerSubscriptionRoutes(app, requireAuth);
   registerStatusRoutes(app, requireAuth, optionalAuth);
   registerLabelRoutes(app, requireAuth, optionalAuth);
+  // Tier-2 org label family: org-scoped CRUD reusing the repo-family
+  // edit/delete cascades (upstream owner-independent UpdateLabel).
+  registerLabelsT2Routes(app, requireAuth, optionalAuth);
   registerMilestoneRoutes(app, requireAuth, optionalAuth);
   registerHookRoutes(app, requireAuth);
   registerOrgRoutes(app, requireAuth, optionalAuth);
