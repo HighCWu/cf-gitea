@@ -15,6 +15,7 @@ import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
 import { registerDiffPatchRoutes } from "./routes/diffpatch";
 import { registerFollowRoutes } from "./routes/follows";
+import { registerMirrorRoutes } from "./routes/mirror";
 import { registerForkRoutes } from "./routes/forks";
 import { registerGitRoutes } from "./routes/git";
 import { registerHookRoutes } from "./routes/hooks";
@@ -78,6 +79,7 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // userListFollowing / userCheckFollowing) — requireAuth per the upstream
   // reqToken() at the whole /users group.
   registerFollowRoutes(app, requireAuth);
+  registerMirrorRoutes(app, requireAuth); // SPEC-0009 mirror family (non-contract)
   registerUserReposRoutes(app, requireAuth, optionalAuth);
   // Issue routes register BEFORE the repo-metadata routes: the static
   // `/repos/issues/search` path must win over the same-shape

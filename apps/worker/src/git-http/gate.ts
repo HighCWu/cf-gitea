@@ -181,6 +181,16 @@ export async function gitHttpGate(
   });
   if (decision !== true) return decision;
 
+  // SPEC-0009 §2.4 row 21 (upstream githttp.go:202-205): mirrors are
+  // read-only — any authenticated, authorized PUSH onto an is_mirror repo
+  // answers 403 with upstream's exact text (reads unaffected).
+  if (op === "write" && resolved.repo.isMirror) {
+    return new Response("mirror repository is read-only\n", {
+      status: 403,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  }
+
   // §2.1 item 5: invoke the engine and stream its response. The engine hook
   // sees the gate-cleared mark and waves the request through. Receive-pack
   // forwards carry the D1-minted immutable storage key (SPEC-0001a §3 Step
