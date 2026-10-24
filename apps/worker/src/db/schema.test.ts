@@ -1,10 +1,11 @@
 /**
  * Schema/migration parity (the 0005 consolidation of the service-side
- * DDL-in-waiting, extended by the 0007 sweep): a D1 freshly applied the
- * generated migrations must accept exactly the operations the superseded
- * raw-DDL paths (`LFS_OBJECTS_DDL_STATEMENTS`, `ORG_DDL_STATEMENTS`, and the
+ * DDL-in-waiting, extended by the 0007 and 0008 sweeps): a D1 freshly applied
+ * the generated migrations must accept exactly the operations the superseded
+ * raw-DDL paths (`LFS_OBJECTS_DDL_STATEMENTS`, `ORG_DDL_STATEMENTS`, the
  * batch-7 `REPO_TOPICS/REPO_WATCHERS/REPO_COLLABORATORS/REPO_SETTINGS/
- * FOLLOWS_DDL_STATEMENTS`) allowed, and the Drizzle table objects must drive
+ * FOLLOWS_DDL_STATEMENTS`, and the straggler `STARS`/`USER_SETTINGS_DDL_STATEMENTS`)
+ * allowed, and the Drizzle table objects must drive
  * those same statements.
  *
  * Structure is asserted against `sqlite_master`/`PRAGMA table_info`
@@ -30,7 +31,9 @@ import {
   repoSettings,
   repoTopics,
   repoWatchers,
+  stars,
   userRedirects,
+  userSettings,
   users,
 } from "./schema";
 
@@ -395,5 +398,126 @@ describe("batch-7 stores parity (superseded REPO_*_DDL_STATEMENTS)", () => {
     expect(
       await env.DB.prepare("SELECT count(*) AS n FROM follows WHERE follow_id = ?").bind(followedId).first<{ n: number }>(),
     ).toEqual({ n: 0 });
+  });
+});
+
+describe("stars parity (superseded STARS_DDL_STATEMENTS)", () => {
+  it("has the raw-DDL structure: autoincrement id, pair arbiter, repo index", async () => {
+    const columns = await tableColumns("stars");
+    expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
+      ["id", "INTEGER", 1, 1],
+      ["user_id", "INTEGER", 1, 0],
+      ["repo_id", "TEXT", 1, 0],
+      ["created_at", "INTEGER", 1, 0],
+    ]);
+    expect(await indexNames("stars")).toContain("stars_user_repo_uq");
+    expect(await indexNames("stars")).toContain("stars_repo_idx");
+  });
+
+  it("accepts the same writes via raw D1 and the drizzle schema, cascades on the user", async () => {
+    const db = drizzle(env.DB);
+    const ids = await seedUsers("ParityStargazer");
+    const userId = ids[0]!;
+
+    // Raw path (starRepo's guarded insert): DO NOTHING keeps the FIRST
+    // created_at on repeat stars.
+    await env.DB.prepare("INSERT INTO stars (user_id, repo_id, created_at) VALUES (?, ?, 100)").bind(userId, "p1").run();
+    await env.DB
+      .prepare(
+        "INSERT INTO stars (user_id, repo_id, created_at) VALUES (?, ?, 500) ON CONFLICT (user_id, repo_id) DO NOTHING",
+      )
+      .bind(userId, "p1")
+      .run();
+    // Drizzle path: a second edge plus the same guarded repeat
+    // (starRepo's onConflictDoNothing on the pair). Timestamp-mode dates
+    // store as unix seconds (new Date(200_000) → 200).
+    await db.insert(stars).values({ userId, repoId: "p2", createdAt: new Date(200_000) });
+    await db
+      .insert(stars)
+      .values({ userId, repoId: "p2", createdAt: new Date(600_000) })
+      .onConflictDoNothing({ target: [stars.userId, stars.repoId] });
+    const starRows = await env.DB
+      .prepare("SELECT repo_id, created_at FROM stars ORDER BY created_at")
+      .all<{ repo_id: string; created_at: number }>();
+    expect(starRows.results).toEqual([
+      { repo_id: "p1", created_at: 100 },
+      { repo_id: "p2", created_at: 200 },
+    ]);
+
+    // UNIQUE(user_id, repo_id) is a real constraint on both paths: a bare
+    // duplicate (no DO NOTHING arm) fails.
+    await expect(
+      env.DB.prepare("INSERT INTO stars (user_id, repo_id, created_at) VALUES (?, ?, 900)").bind(userId, "p1").run(),
+    ).rejects.toThrow();
+    await expect(db.insert(stars).values({ userId, repoId: "p2", createdAt: new Date(900_000) })).rejects.toThrow();
+
+    // ON DELETE CASCADE fires on the user edge (the declared FK); repo-scoped
+    // rows go through the deleteRepository cascade (src/repos/service.ts).
+    await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(userId).run();
+    expect(await env.DB.prepare("SELECT count(*) AS n FROM stars").first<{ n: number }>()).toEqual({ n: 0 });
+  });
+});
+
+describe("user_settings parity (superseded USER_SETTINGS_DDL_STATEMENTS)", () => {
+  it("has the raw-DDL structure: 1:1 user PK and upstream creation defaults", async () => {
+    const columns = await tableColumns("user_settings");
+    expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
+      ["user_id", "INTEGER", 1, 1],
+      ["theme", "TEXT", 1, 0],
+      ["language", "TEXT", 1, 0],
+      ["diff_view_style", "TEXT", 1, 0],
+      ["hide_email", "INTEGER", 1, 0],
+      ["hide_activity", "INTEGER", 1, 0],
+    ]);
+    const byName = new Map(columns.map((c) => [c.name, c]));
+    expect(byName.get("theme")?.dflt_value).toBe("'gitea-auto'");
+    expect(byName.get("language")?.dflt_value).toBe("''");
+    expect(byName.get("diff_view_style")?.dflt_value).toBe("''");
+    // drizzle-kit records the boolean default as the keyword literal `false`
+    // (SQLite's 1/0 alias — behaviorally the raw DDL's DEFAULT 0, proven by
+    // the insert-omitting-columns test below).
+    expect(byName.get("hide_email")?.dflt_value).toBe("false");
+    expect(byName.get("hide_activity")?.dflt_value).toBe("false");
+  });
+
+  it("defaults inserts like the raw DDL, upserts on the user PK, cascades on the user", async () => {
+    const db = drizzle(env.DB);
+    const ids = await seedUsers("ParitySettings", "ParitySettings2");
+    const userId = ids[0]!;
+    const otherId = ids[1]!;
+
+    // Raw insert omitting every defaulted column → upstream creation values
+    // (theme 'gitea-auto', empty style/language, private flags 0).
+    await env.DB.prepare("INSERT INTO user_settings (user_id) VALUES (?)").bind(userId).run();
+    expect(
+      await env.DB
+        .prepare("SELECT theme, language, diff_view_style, hide_email, hide_activity FROM user_settings WHERE user_id = ?")
+        .bind(userId)
+        .first<Record<string, unknown>>(),
+    ).toEqual({ theme: "gitea-auto", language: "", diff_view_style: "", hide_email: 0, hide_activity: 0 });
+
+    // The PATCH write (saveUserSettings): drizzle upsert on the user_id PK,
+    // non-presented fields keeping their stored value.
+    await db
+      .insert(userSettings)
+      .values({ userId, theme: "gitea-dark", hideEmail: true })
+      .onConflictDoUpdate({ target: userSettings.userId, set: { theme: "gitea-dark", hideEmail: true } });
+    expect(
+      await env.DB
+        .prepare("SELECT theme, language, hide_email FROM user_settings WHERE user_id = ?")
+        .bind(userId)
+        .first<Record<string, unknown>>(),
+    ).toEqual({ theme: "gitea-dark", language: "", hide_email: 1 });
+
+    // Drizzle insert omitting the defaulted columns → the schema defaults.
+    await db.insert(userSettings).values({ userId: otherId });
+    expect(
+      await env.DB.prepare("SELECT theme, hide_activity FROM user_settings WHERE user_id = ?").bind(otherId).first(),
+    ).toEqual({ theme: "gitea-auto", hide_activity: 0 });
+
+    // ON DELETE CASCADE fires on the user edge (the declared FK).
+    await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(userId).run();
+    const remaining = await env.DB.prepare("SELECT user_id FROM user_settings").all<{ user_id: number }>();
+    expect(remaining.results).toEqual([{ user_id: otherId }]);
   });
 });

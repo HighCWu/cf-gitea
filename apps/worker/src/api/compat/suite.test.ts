@@ -42,8 +42,7 @@ import { createCommitStatus } from "../services/commit-status";
 import { ZERO_OID } from "../services/engine";
 import { addOrUpdateCollaborator } from "../services/repo-collaborators";
 import { watchRepo } from "../services/repo-watchers";
-import { STARS_DDL_STATEMENTS, starRepo } from "../services/stars";
-import { USER_SETTINGS_DDL_STATEMENTS } from "../services/user-settings";
+import { starRepo } from "../services/stars";
 import { applyRepoExtrasDdl } from "../testing/repo-ddl";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -342,12 +341,6 @@ beforeAll(async () => {
     pullA: pullA.issue.index,
     pullB: pullB.issue.index,
   });
-  // repoGetCommitPullRequest join seed: the alpha pull's head_sha cache
-  // points at the suite's shared commit sha (the D1 join target).
-  await drizzle(env.DB)
-    .update(pullRequests)
-    .set({ headSha: SEED_SHA })
-    .where(eq(pullRequests.id, pullA.pullRequest.id));
 
   // ---------------------------------------------------------------------
   // Batch-7 D1 block (SPEC-0004 §2.4 rows repoListTopics … repoTransfer):
@@ -556,6 +549,10 @@ beforeAll(async () => {
   Object.assign(seeds, {
     prTopic: prTopic.issue.index,
     prMerged: prMerged.issue.index,
+    // repoGetCommitPullRequest: the topic pull's head_sha cache carries this
+    // real seed commit, so the scenario is implementation-agnostic (the pure
+    // D1 head_sha join and the engine-resolving variant both answer 200).
+    gitTopicCommit: topicCommit.oid,
   });
 
   // ---------------------------------------------------------------------
@@ -607,18 +604,12 @@ beforeAll(async () => {
   // Tier-1 user-straggler block (SPEC-0004 §2.4 rows createCurrentUserRepo,
   // getUserSettings/updateUserSettings, userCurrentListStarred +
   // userCurrent{CheckStarring,PutStar,DeleteStar}): the stars + user_settings
-  // raw-D1 stores bootstrap from their services' DDL statements (the follows
-  // pattern), star edges pre-seed the starred fixtures (the list needs
-  // total ≥ 2; the DELETE victim "rel" is the third star so any case order
-  // keeps the list paginated), and user_settings stays rowless (GET renders
-  // the upstream defaults until the PATCH scenario writes them).
+  // tables arrived with migration 0008 (the raw-D1 sweep), so only the row
+  // scratch is needed here. Star edges pre-seed the starred fixtures (the
+  // list needs total ≥ 2; the DELETE victim "rel" is the third star so any
+  // case order keeps the list paginated), and user_settings stays rowless
+  // (GET renders the upstream defaults until the PATCH scenario writes them).
   // ---------------------------------------------------------------------
-  for (const statement of STARS_DDL_STATEMENTS) {
-    await env.DB.prepare(statement).run();
-  }
-  for (const statement of USER_SETTINGS_DDL_STATEMENTS) {
-    await env.DB.prepare(statement).run();
-  }
   await env.DB.prepare("DELETE FROM stars").run();
   await env.DB.prepare("DELETE FROM user_settings").run();
   await starRepo(env.DB, ownerId, SHARED_REPO_ID, SEED_NOW);
@@ -1196,12 +1187,15 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   ],
   repoGetCommitPullRequest: [
     {
-      // The alpha pull's head_sha cache points at the shared seed sha (the
-      // join target; upstream joins merged_commit_id — the documented
-      // divergence of services/commit-pull.ts).
-      name: "the PR carrying the seeded commit sha",
+      // The compat-git topic pull's head_sha cache carries the real seed
+      // commit (upstream joins merged_commit_id — the documented divergence
+      // of the head_sha lookup); the scenario rides the git-seeded repo so
+      // either commit→PR implementation answers it.
+      name: "the PR carrying the seeded commit",
       status: 200,
-      request: (ctx) => ({ path: `${repoPath(ctx)}/commits/${String(ctx.seeds.sha)}/pull` }),
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/commits/${String(ctx.seeds.gitTopicCommit)}/pull`,
+      }),
     },
     {
       name: "sha no PR carries → runtime-body 404",
@@ -1792,7 +1786,12 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
         path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/${String(ctx.seeds.assetsReleaseId)}/assets`,
         init: ctx.withAuth({
           method: "POST",
-          headers: { "Content-Type": "multipart/form-data; boundary=compat-asset" },
+          // In-process Requests do not derive Content-Length — declare it
+          // like the LFS relay tests do (the 411 requirement is the same).
+          headers: {
+            "Content-Type": "multipart/form-data; boundary=compat-asset",
+            "Content-Length": String(ASSET_MULTIPART_BYTES.byteLength),
+          },
           body: ASSET_MULTIPART_BYTES,
         }),
       }),

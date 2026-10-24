@@ -57,6 +57,13 @@
       "when": 1792860100365,
       "tag": "0007_brief_albert_cleary",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1792865136819,
+      "tag": "0008_awesome_lilith",
+      "breakpoints": true
     }
   ]
 }

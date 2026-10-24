@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { users } from "../../db/schema";
+import { userSettings, users } from "../../db/schema";
 
 /**
  * User account settings behind `GET/PATCH /user/settings` (SPEC-0004 §2.4 row;
@@ -14,45 +14,25 @@ import { users } from "../../db/schema";
  *     `website`, `location`;
  *   - the five preference fields with NO landed column (`theme`, `language`,
  *     `diff_view_style`, `hide_email`, `hide_activity`) live in the
- *     `user_settings` side store below.
+ *     `user_settings` side store (`userSettings`, src/db/schema.ts).
  *
- * PENDING MIGRATION — raw-D1 bootstrap, the superseded `FOLLOWS_DDL_STATEMENTS`
- * pattern inverted (services/follows.ts): `user_settings` is NOT in the
- * Drizzle schema yet (src/db is owned by the migration wave), so this module
- * carries the DDL block for the schema owner (below) and reads through
- * parameterized raw D1 until the table lands in src/db/schema.ts + a generated
- * migration. When it does: delete `USER_SETTINGS_DDL_STATEMENTS` and port the
- * two queries to Drizzle (1:1 on `user_id`, the `repo_settings` sweep shape).
- * The AGENTS.md boundary ("D1 access goes through Drizzle ORM only") is
- * honored in spirit: every statement lives HERE, parameterized, mirroring one
- * upstream read/write.
+ * The table lives in the Drizzle schema and landed as migration 0008 (the
+ * fourth raw-DDL sweep, the 0005/0007 supersede pattern); D1 access goes
+ * through Drizzle per the architecture boundary (no hand-written SQL in
+ * services). Superseded: the bootstrap `USER_SETTINGS_DDL_STATEMENTS` block
+ * was deleted with the sweep — the generated migration is authoritative now.
  *
  * Defaults are upstream's creation values (user.go:706–711 + the xorm column
  * defaults: KeepEmailPrivate = setting.Service.DefaultKeepEmailPrivate, whose
  * app.example.ini default is false; Theme = setting.UI.DefaultTheme =
- * "gitea-auto"; DiffViewStyle '' / Language '' / KeepActivityPrivate false).
- * Unknown-key settings cannot occur — the PATCH body schema is the exact
- * contract mirror (models/user-settings.ts), so every presented key has a
- * store; the documented no-store divergence is Go's MaxSize/ValidUrl binding
- * limits (accepted-and-ignored, the createOrgRepo precedent).
+ * "gitea-auto"; DiffViewStyle '' / Language '' / KeepActivityPrivate false) —
+ * declared as the schema's column defaults AND mirrored by
+ * DEFAULT_USER_SETTINGS for the rowless read. Unknown-key settings cannot
+ * occur — the PATCH body schema is the exact contract mirror
+ * (models/user-settings.ts), so every presented key has a store; the
+ * documented no-store divergence is Go's MaxSize/ValidUrl binding limits
+ * (accepted-and-ignored, the createOrgRepo precedent).
  */
-
-/**
- * DDL for the migration owner (report verbatim). Port of the upstream `user`
- * preference columns (models/user/user.go:171–173 + :102 + :119): 1:1 on the
- * user row, FK cascade like the rest of the users-adjacent tables. Booleans
- * are the repo-convention INTEGERs.
- */
-export const USER_SETTINGS_DDL_STATEMENTS: readonly string[] = [
-  `CREATE TABLE IF NOT EXISTS user_settings (
-  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  theme TEXT NOT NULL DEFAULT 'gitea-auto',
-  language TEXT NOT NULL DEFAULT '',
-  diff_view_style TEXT NOT NULL DEFAULT '',
-  hide_email INTEGER NOT NULL DEFAULT 0,
-  hide_activity INTEGER NOT NULL DEFAULT 0
-)`,
-];
 
 /** The five stored preference fields (the not-yet-swept user columns). */
 export interface UserPreferenceSettings {
@@ -72,33 +52,19 @@ export const DEFAULT_USER_SETTINGS: UserPreferenceSettings = {
   hideActivity: false,
 };
 
-/** Raw snake_case projection of the `user_settings` row. */
-interface RawUserSettingsRow {
-  theme: string;
-  language: string;
-  diff_view_style: string;
-  hide_email: number;
-  hide_activity: number;
-}
-
-/** Row → settings; integers → booleans. */
-function rawToSettings(raw: RawUserSettingsRow): UserPreferenceSettings {
-  return {
-    theme: raw.theme,
-    language: raw.language,
-    diffViewStyle: raw.diff_view_style,
-    hideEmail: raw.hide_email === 1,
-    hideActivity: raw.hide_activity === 1,
-  };
-}
-
 /** The stored preferences of one user; an absent row renders the defaults. */
 export async function loadUserSettings(d1: D1Database, userId: number): Promise<UserPreferenceSettings> {
-  const row = await d1
-    .prepare("SELECT theme, language, diff_view_style, hide_email, hide_activity FROM user_settings WHERE user_id = ?1")
-    .bind(userId)
-    .first<RawUserSettingsRow>();
-  return row === null ? DEFAULT_USER_SETTINGS : rawToSettings(row);
+  const row = await drizzle(d1).select().from(userSettings).where(eq(userSettings.userId, userId)).get();
+  if (row === undefined) {
+    return DEFAULT_USER_SETTINGS;
+  }
+  return {
+    theme: row.theme,
+    language: row.language,
+    diffViewStyle: row.diffViewStyle,
+    hideEmail: row.hideEmail,
+    hideActivity: row.hideActivity,
+  };
 }
 
 /** The PATCH write for the preference half: upsert only the fields the body
@@ -115,21 +81,10 @@ export async function saveUserSettings(
     Object.entries(patch).filter(([, value]) => value !== undefined),
   ) as Partial<UserPreferenceSettings>;
   const merged = { ...(await loadUserSettings(d1, userId)), ...present };
-  await d1
-    .prepare(
-      "INSERT INTO user_settings (user_id, theme, language, diff_view_style, hide_email, hide_activity) " +
-        "VALUES (?1, ?2, ?3, ?4, ?5, ?6) " +
-        "ON CONFLICT (user_id) DO UPDATE SET theme = ?2, language = ?3, diff_view_style = ?4, hide_email = ?5, hide_activity = ?6",
-    )
-    .bind(
-      userId,
-      merged.theme,
-      merged.language,
-      merged.diffViewStyle,
-      merged.hideEmail ? 1 : 0,
-      merged.hideActivity ? 1 : 0,
-    )
-    .run();
+  await drizzle(d1)
+    .insert(userSettings)
+    .values({ userId, ...merged })
+    .onConflictDoUpdate({ target: userSettings.userId, set: merged });
 }
 
 /**

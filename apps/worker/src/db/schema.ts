@@ -1017,3 +1017,57 @@ export const follows = sqliteTable(
     index("follows_follow_idx").on(t.followId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0004 §2.4 stragglers — user stars + account preference settings (the
+// fourth raw-DDL sweep; `STARS_DDL_STATEMENTS`/`USER_SETTINGS_DDL_STATEMENTS`
+// in the services, ported verbatim; the 0005/0007 supersede pattern).
+// ---------------------------------------------------------------------------
+
+/**
+ * Repo stars (port of upstream `Star`, models/repo/star.go:17–22):
+ * `UNIQUE(user_id, repo_id)` is the idempotence arbitration point (the PUT
+ * star's ON CONFLICT DO NOTHING), the reverse index serves repo-side counts
+ * and the delete cascade, `created_at` is unix seconds (repo convention)
+ * mirroring `CreatedUnix xorm:"INDEX created"`. `user_id` cascades like the
+ * rest of the users-adjacent tables; `repo_id` is the registry's TEXT id
+ * (no FK — plain column per the schema conventions above), and its rows are
+ * deleted in the deleteRepository cascade (src/repos/service.ts).
+ */
+export const stars = sqliteTable(
+  "stars",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    repoId: text("repo_id").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("stars_user_repo_uq").on(t.userId, t.repoId),
+    index("stars_repo_idx").on(t.repoId),
+  ],
+);
+
+/**
+ * User account preference settings (the five upstream `user` preference
+ * columns with no landed `users` column — user.go:171–173 + :102 + :119,
+ * reduced into this side store by services/user-settings.ts): 1:1 on the
+ * user row (`user_id` PK), FK cascade like the rest of the users-adjacent
+ * tables. Booleans are the repo-convention INTEGERs. The defaults are
+ * upstream's creation values (theme 'gitea-auto'; empty style/language;
+ * keep-email/activity private false) — an absent row renders the same
+ * defaults (the service's DEFAULT_USER_SETTINGS). User-scoped — NOT part
+ * of the repo-delete cascade.
+ */
+export const userSettings = sqliteTable("user_settings", {
+  userId: integer("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  theme: text("theme").notNull().default("gitea-auto"),
+  language: text("language").notNull().default(""),
+  diffViewStyle: text("diff_view_style").notNull().default(""),
+  hideEmail: integer("hide_email", { mode: "boolean" }).notNull().default(false),
+  hideActivity: integer("hide_activity", { mode: "boolean" }).notNull().default(false),
+});
