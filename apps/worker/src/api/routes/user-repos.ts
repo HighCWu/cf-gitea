@@ -3,10 +3,12 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
+import { RepoNameCollisionError, RepoNameInvalidError } from "../../repos/service";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
-import { repositoryListSchema } from "../models/repository";
+import { createRepoOptionSchema, repositoryListSchema, repositorySchema } from "../models/repository";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { toCreatedOrgRepository } from "../services/org-repos";
 import {
   findUserByName,
   listOwnedRepositories,
@@ -14,16 +16,28 @@ import {
   toApiRepository,
   viewerOf,
 } from "../services/repository";
+import { createUserRepository, findDoerRow, resolveAutoInitReadme } from "../services/user-repos";
 
 /**
- * Tier-1 `user`-tagged repository lists (SPEC-0004 §2.4):
- * `GET /users/{username}/repos` (userListRepos) and `GET /user/repos`
- * (userCurrentListRepos). Both send the runtime list headers upstream sends
- * on every list (`X-Total-Count`, `Link`).
+ * Tier-1 `user`-tagged repository routes (SPEC-0004 §2.4 rows:
+ * `GET /users/{username}/repos` (userListRepos), `GET /user/repos`
+ * (userCurrentListRepos) and `POST /user/repos` (createCurrentUserRepo)). The
+ * two lists send the runtime list headers upstream sends on every list
+ * (`X-Total-Count`, `Link`).
  */
 
 const notFoundResponse = {
   description: "notFound",
+  content: { "application/json": { schema: apiErrorSchema } },
+} as const;
+
+const errorResponse = {
+  description: "error",
+  content: { "application/json": { schema: apiErrorSchema } },
+} as const;
+
+const validationErrorResponse = {
+  description: "validationError",
   content: { "application/json": { schema: apiErrorSchema } },
 } as const;
 
@@ -99,6 +113,39 @@ function userCurrentListReposRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
   });
 }
 
+/**
+ * `POST /user/repos` — 201 + the Repository at owner permissions
+ * (createCurrentUserRepo → upstream repo.Create). Upstream wires the route
+ * `rejectPublicOnly()` inside the reqToken'd /user group (api.go:1181) — a
+ * signed-in caller is required (anonymous → the runtime 401 `token is
+ * required` body, the /user RUNTIME_ONLY class; not declared: the vendored
+ * contract declares only {201, 400, 409, 422}). Guard order mirrors
+ * CreateUserRepo: unknown readme template → 400; duplicate name → 409 with
+ * the upstream message; invalid/reserved name → 422 (the IsUsableRepoName
+ * port; our message text differs from Go's error strings — the createOrgRepo
+ * note applies). `auto_init` lands the initial commit through the engine
+ * (services/user-repos.ts owns the fidelity notes and divergences).
+ */
+function createCurrentUserRepoRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
+  return createRoute({
+    method: "post",
+    path: "/user/repos",
+    tags: ["user"],
+    summary: "Create a repository",
+    operationId: "createCurrentUserRepo",
+    middleware: [requireAuth],
+    request: {
+      body: { content: { "application/json": { schema: createRepoOptionSchema } } },
+    },
+    responses: {
+      201: { description: "Repository", content: { "application/json": { schema: repositorySchema } } },
+      400: errorResponse,
+      409: { description: "The repository with the same name already exists." },
+      422: validationErrorResponse,
+    },
+  });
+}
+
 export function registerUserReposRoutes(
   app: OpenAPIHono<ApiEnv>,
   requireAuth: MiddlewareHandler<ApiEnv>,
@@ -123,5 +170,36 @@ export function registerUserReposRoutes(
     const { items, total } = await listOwnedRepositories(c.env.DB, viewer, listOptions);
     setPaginationHeaders(c, total, listOptions);
     return c.json(items.map((pair) => toApiRepository(viewer, pair)), 200);
+  });
+
+  app.openapi(createCurrentUserRepoRoute(requireAuth), async (c) => {
+    const doer = c.get("authUser");
+    const form = c.req.valid("json");
+    // 400 arm first (upstream CreateUserRepo validates the readme template
+    // before touching the database).
+    resolveAutoInitReadme(form);
+    const owner = await findDoerRow(c.env.DB, doer);
+    if (owner === null) {
+      throw new ApiError(401, "token is required");
+    }
+    let repo;
+    try {
+      repo = await createUserRepository(c.env.DB, c.env, owner, form, new Date());
+    } catch (error) {
+      if (error instanceof RepoNameCollisionError) {
+        throw new ApiError(409, "The repository with the same name already exists.");
+      }
+      if (error instanceof RepoNameInvalidError) {
+        // upstream 422s err.Error() for reserved/pattern violations; our
+        // ported message text differs from Go's error strings
+        throw new ApiError(422, error.message);
+      }
+      throw error;
+    }
+    const viewer = viewerOf(c);
+    // The CreateUserRepo tail: `convert.ToRepo(ctx, repo, Permission{
+    // AccessModeOwner})` — the creator's embedded permissions block is the
+    // full owner triple (services/org-repos.ts toCreatedOrgRepository).
+    return c.json(toCreatedOrgRepository(viewer, { repo, owner }), 201);
   });
 }
