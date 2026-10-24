@@ -219,24 +219,49 @@ const forkSeedEngine = createDurableGit<Env>({ authorize, ui: false, namespaces:
  *  awaits its own work — options.onPush is unset — so nothing is read; the
  *  modern platform type still wants the full surface, mirrored from
  *  src/repos/imports/pipeline.ts). */
+class SeedNoopSpan {
+  get isTraced(): boolean {
+    return false;
+  }
+  spanContext(): TracingSpanContext {
+    return { traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 };
+  }
+  setAttribute(_key: string, _value: boolean | number | string): this {
+    return this;
+  }
+  setAttributes(_attributes: Record<string, boolean | number | string | undefined>): this {
+    return this;
+  }
+  recordException(
+    _exception: string | { code: string | number; name?: string; message?: string; stack?: string },
+  ): void {}
+  updateName(_name: string): this {
+    return this;
+  }
+  setStatus(_status: TracingSpanStatus): this {
+    return this;
+  }
+  end(): void {}
+}
+
 function noopExecContext(): ExecutionContext {
-  const noop = () => {};
   return {
-    waitUntil: noop,
-    passThroughOnException: noop,
-    abort: noop,
+    waitUntil: () => {},
+    passThroughOnException: () => {},
+    abort: () => {},
     exports: undefined as never,
     props: undefined,
     tracing: {
-      enterSpan: <T, A extends unknown[]>(name: string, callback: (span: unknown, ...args: A) => T, ...args: A): T =>
-        callback({ name }, ...args),
-      startActiveSpan: <T, A extends unknown[]>(name: string, callback: (span: unknown, ...args: A) => T, ...args: A): T =>
-        callback({ name }, ...args),
-      startSpan: (name: string) => ({ name }),
+      enterSpan: <T, A extends unknown[]>(_name: string, callback: (span: SeedNoopSpan, ...args: A) => T, ...args: A): T =>
+        callback(new SeedNoopSpan(), ...args),
+      startActiveSpan: <T, A extends unknown[]>(
+        _name: string,
+        callback: (span: SeedNoopSpan, ...args: A) => T,
+        ...args: A
+      ): T => callback(new SeedNoopSpan(), ...args),
+      startSpan: (_name: string) => new SeedNoopSpan(),
       getActiveSpan: () => undefined,
-      Span: function (this: { name: string }, name: string) {
-        this.name = name;
-      } as unknown as new (name: string) => unknown,
+      Span: SeedNoopSpan,
     },
   };
 }
@@ -2378,6 +2403,88 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   ],
 
   // ---------------------------------------------------------------------
+  // Archive / diffpatch / languages / auto-merge-cancel block (SPEC-0004 §2.4
+  // straggler rows): the archive tail resolves refs strictly (no
+  // default-branch fallback), so the 404 needs no mutation; the diffpatch
+  // 200 runs against compat.txt (its extra line lands AFTER the contents
+  // scenarios in fixture order — "diffpatch" > "contents" — and the moved
+  // head never disturbs the oid-addressed git-object reads); the languages
+  // 200 reads the refless shared repo (the empty {} upstream answers for a
+  // stats-less repository); the auto-merge cancel always 404s (this backend
+  // never schedules — POST merge refuses the schedule with 409).
+  // ---------------------------------------------------------------------
+
+  repoGetArchive: [
+    {
+      name: "unknown ref → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/archive/ghost.tar.gz`,
+      }),
+    },
+  ],
+  repoApplyDiffPatch: [
+    {
+      name: "apply a unified diff to the seeded file (200 FileResponse)",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/diffpatch`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({
+            content: [
+              "diff --git a/compat.txt b/compat.txt",
+              "--- a/compat.txt",
+              "+++ b/compat.txt",
+              "@@ -1 +1,2 @@",
+              " hello compat git",
+              "+patched by the compat suite",
+            ].join("\n"),
+          }),
+        }),
+      }),
+    },
+    {
+      name: "missing repo → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/ghost-repo/diffpatch`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ content: "not a patch" }),
+        }),
+      }),
+    },
+  ],
+  repoGetLanguages: [
+    {
+      name: "stats-less repository → the empty map",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/languages` }),
+    },
+  ],
+  repoCancelScheduledAutoMerge: [
+    {
+      name: "existing PR, nothing scheduled → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/pulls/${String(ctx.seeds.prTopic)}/merge`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+    {
+      name: "missing index → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/pulls/999/merge`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+
+  // ---------------------------------------------------------------------
   // Contents block (SPEC-0004 §2.4 rows repoGetContentsList …
   // repoGetIssueTemplates): the read union over the seeded compat.txt plus
   // the file-change writes through the commit builder. Fixture order runs
@@ -2573,8 +2680,12 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   // skipped (never failed) while the routes are unregistered and start
   // passing untouched the moment the registration lands. Fixture order runs
   // listForks BEFORE createFork, so the list case asserts the pre-create
-  // empty page; the create case rides the fork-block source seed
-  // (compat-fork-src). The full 202 → consume → equality flow lives in the
+  // empty page. The create case deliberately forks the SHARED fixture repo,
+  // not the fork block's compat-fork-src: upstream allows one fork of a
+  // source per owner (GetUserFork), and the dedicated fork-flow block below
+  // forks compat-fork-src as the SAME suite identity — forking it here too
+  // would turn that block's 202 into a 409 once these scenarios leave the
+  // skipped state. The full 202 → consume → equality flow lives in the
   // dedicated fork describe block after the tier-2 block (the dynamic
   // harness cannot drive the queue consumer).
   // ---------------------------------------------------------------------
@@ -2594,10 +2705,10 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   ],
   createFork: [
     {
-      name: "fork the seeded source (202 async)",
+      name: "fork the shared fixture repo (202 async)",
       status: 202,
       request: (ctx) => ({
-        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.forkSource)}/forks`,
+        path: `${repoPath(ctx)}/forks`,
         init: ctx.withAuth({
           method: "POST",
           headers: JSON_HEADERS,
@@ -2916,9 +3027,9 @@ const forkQueueSends: Array<Record<string, unknown>> = [];
 const capturingForkQueue: Queue = {
   send: (message: unknown) => {
     forkQueueSends.push(message as Record<string, unknown>);
-    return Promise.resolve({ metrics: { backlogCount: 0, backlogBytes: 0 } });
+    return Promise.resolve({ metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } });
   },
-  sendBatch: () => Promise.resolve({ metrics: { backlogCount: 0, backlogBytes: 0 } }),
+  sendBatch: () => Promise.resolve({ metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } }),
   metrics: () => Promise.resolve({ backlogCount: 0, backlogBytes: 0 }),
 };
 
@@ -2969,7 +3080,7 @@ describe("fork flow — 202, REPO_TASKS replication, content-equal replica (SPEC
       init: forkAuthed(TOKEN)({ method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ name: "compat-fork-dst" }) }),
     });
     expect(response.status).toBe(202);
-    const body = (await response.json()) as Record<string, unknown>;
+    const body: Record<string, unknown> = await response.json();
     expect(body.fork).toBe(true);
     expect(body.full_name).toBe(`${String(seeds.repoOwner)}/compat-fork-dst`);
     // The honest pre-replication state: nothing is servable before finalize.
@@ -2977,9 +3088,10 @@ describe("fork flow — 202, REPO_TASKS replication, content-equal replica (SPEC
     expect((body.parent as Record<string, unknown>).full_name).toBe(`${String(seeds.repoOwner)}/${String(seeds.forkSource)}`);
     expect(body.permissions).toEqual({ admin: true, push: true, pull: true });
 
-    expect(forkQueueSends).toEqual([
-      { kind: "repo-fork", sourceRepoId: String(seeds.forkSourceRepoId), forkRepoId: expect.any(String) },
-    ]);
+    const [queued] = forkQueueSends;
+    expect(queued?.kind).toBe("repo-fork");
+    expect(queued?.sourceRepoId).toBe(String(seeds.forkSourceRepoId));
+    expect(typeof queued?.forkRepoId).toBe("string");
   });
 
   it("consumer: handleForkMessage replicates the catalog and settles ready/non-empty", async () => {
@@ -3023,6 +3135,9 @@ describe("fork flow — 202, REPO_TASKS replication, content-equal replica (SPEC
     // content equality through the fork's own pack bytes.
     const srcBlob = await srcCell.readBlob("main", "file.txt");
     const dstBlob = await dstCell.readBlob("main", "file.txt");
+    if (srcBlob === null || dstBlob === null) {
+      throw new Error("blob read failed on the seeded pack content");
+    }
     expect(new TextDecoder().decode(dstBlob.data)).toBe(new TextDecoder().decode(srcBlob.data));
   });
 
@@ -3030,7 +3145,7 @@ describe("fork flow — 202, REPO_TASKS replication, content-equal replica (SPEC
     const response = await forkSend({ path: `${forkSourcePath()}/forks?limit=1` });
     expect(response.status).toBe(200);
     expect(response.headers.get("X-Total-Count")).toBe("1");
-    const body = (await response.json()) as Array<Record<string, unknown>>;
+    const body: Array<Record<string, unknown>> = await response.json();
     expect(body).toHaveLength(1);
     expect(body[0]?.full_name).toBe(`${String(seeds.repoOwner)}/compat-fork-dst`);
   });
