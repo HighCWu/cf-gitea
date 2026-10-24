@@ -1,9 +1,15 @@
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { orgMembers, users } from "../../db/schema";
 import { LastOrgOwnerError, OrgError } from "../../services/orgs/errors";
-import { OrgService, type ListOptions, type OrgMembershipRecord, type OrgRecord } from "../../services/orgs/orgs";
+import {
+  OrgService,
+  type ListOptions,
+  type OrgMembershipRecord,
+  type OrgRecord,
+  type Visibility,
+} from "../../services/orgs/orgs";
 import { ApiError } from "../errors";
 import type { EditOrgOption } from "../models/organization";
 import { orgVisibleToDoer, type OrgDoer } from "./org-repos";
@@ -27,7 +33,11 @@ import { orgVisibleToDoer, type OrgDoer } from "./org-repos";
  *     `checkCanChangeOrgUserStatus` (routers/api/v1/org/member.go:243–259)
  *     — requireCanChangeOrgUserStatus + setOrgMembershipPublic;
  *   - `org.Edit` (routers/api/v1/org/org.go:373–413 over
- *     `user_service.UpdateOptions`) — editOrgProfile.
+ *     `user_service.UpdateOptions`) — editOrgProfile;
+ *   - `org.GetAll`'s Visible ladder (org.go:184–234 over
+ *     `SearchUserOptions.Visible`) — listVisibleOrgs;
+ *   - `DoerViewOtherVisibility` (org_list.go:79–90, the
+ *     `/users/{username}/orgs` ceiling) — doerViewOtherVisibility.
  *
  * Public-only tokens (`DoerCanViewPrivate`, models/user/user_extdata.go:110–112)
  * are not modeled in the api identity yet: a resolved doer is always
@@ -246,6 +256,77 @@ export async function setOrgMembershipPublic(
     .update(orgMembers)
     .set({ isPublic })
     .where(and(eq(orgMembers.orgId, orgId), eq(orgMembers.userId, userId)));
+}
+
+// ---------------------------------------------------------------------------
+// Org listings (GET /orgs + GET /users/{username}/orgs ceilings)
+// ---------------------------------------------------------------------------
+
+/**
+ * `DoerViewOtherVisibility` (models/organization/org_list.go:79–90) — the
+ * listing ceiling a doer gets on ANOTHER principal's org memberships:
+ * anonymous/public-only ⇒ 'public', self/site-admin ⇒ 'private', everyone
+ * else ⇒ 'limited'. The `IsRestricted` arm (public) is unreachable — no
+ * users.restricted column yet (same standing gate as doerCanViewPrivate).
+ */
+export function doerViewOtherVisibility(doer: OrgProfileDoer | null, subjectId: number): Visibility {
+  if (doer === null || !doerCanViewPrivate(doer)) return "public";
+  if (doer.isAdmin || doer.id === subjectId) return "private";
+  return "limited";
+}
+
+/** Org columns of `users` (the storage service's ORG_USER_SELECTION — the
+ *  route-family listing selects them here so the storage service stays
+ *  create/mutate-only; same shape contract as `MemberUserRow`). */
+const ORG_LIST_SELECTION = {
+  id: users.id,
+  username: users.username,
+  usernameLower: users.usernameLower,
+  email: users.email,
+  fullName: users.fullName,
+  description: users.description,
+  website: users.website,
+  location: users.location,
+  avatarEmail: users.avatarEmail,
+  useCustomAvatar: users.useCustomAvatar,
+  visibility: users.visibility,
+  numMembers: users.numMembers,
+  repoAdminChangeTeamAccess: users.repoAdminChangeTeamAccess,
+  createdAt: users.createdAt,
+};
+
+/**
+ * One page of `GET /orgs` (org.GetAll, routers/api/v1/org/org.go:184–234):
+ * `SearchUsers` over `UserTypeOrganization` ordered alphabetically
+ * (`lower_name ASC`), capped by the Visible ladder — anonymous ⇒ public,
+ * signed-in ⇒ public+limited, site admin ⇒ public+limited+private. The
+ * `BuildCanSeeUserCondition` membership arm (search.go:173–187) is subsumed
+ * by that Visible IN-list on this route (a membership can only widen access
+ * WITHIN the cap, and private rows never pass the signed-in cap), so the
+ * landed query is the ladder alone.
+ */
+export async function listVisibleOrgs(
+  d1: D1Database,
+  doer: OrgProfileDoer | null,
+  options: ListOptions,
+): Promise<{ items: OrgRecord[]; total: number }> {
+  const db = drizzle(d1);
+  const visible: Visibility[] = doer === null ? ["public"] : doer.isAdmin ? ["public", "limited", "private"] : ["public", "limited"];
+  const where = and(eq(users.type, "org"), inArray(users.visibility, visible));
+  const limit = options.pageSize ?? 30;
+  const offset = ((options.page ?? 1) - 1) * limit;
+  const rows = await db
+    .select(ORG_LIST_SELECTION)
+    .from(users)
+    .where(where)
+    .orderBy(asc(users.usernameLower))
+    .limit(limit)
+    .offset(offset);
+  const totalRow = await db.select({ total: sql<number>`count(*)` }).from(users).where(where).get();
+  return {
+    items: rows.map((row) => row),
+    total: totalRow?.total ?? 0,
+  };
 }
 
 // ---------------------------------------------------------------------------

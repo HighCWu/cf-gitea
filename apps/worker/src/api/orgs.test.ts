@@ -1,16 +1,22 @@
 /**
  * Tier-2 organization routes on real D1 (SPEC-0004 appendix A category a):
- * `GET/PATCH /orgs/{org}` (orgGet/orgEdit), the members family
- * (orgListMembers/orgIsMember/orgDeleteMember) and the public-members family
- * (orgListPublicMembers/orgIsPublicMember/orgPublicizeMember/orgConcealMember).
- * Orgs seed through the landed OrgService (org-as-user-row model, SPEC-0007)
- * and memberships through its addMember/setMemberRole primitives; the wire
- * shapes assert against the frozen contract — including the mirrored upstream
- * quirks: the anonymous email blank on GET /orgs/{org}, the members listing's
- * reqToken 401 (the swagger declares only 200/404), the 303 oracle redirect
- * on GET /orgs/{org}/members/{username}, the silent-204 member delete, the
- * 500 last-owner guard, the admin's all-members view of public_members, and
- * the renamed-org 307 seam.
+ * `GET/PATCH/DELETE /orgs/{org}` (orgGet/orgEdit/orgDelete), `POST
+ * /orgs/{org}/rename` (renameOrg), `GET /orgs` (orgGetAll), `POST /orgs`
+ * (orgCreate), `GET /users/{username}/orgs` (orgListUserOrgs), `GET
+ * /users/{username}/orgs/{org}/permissions` (orgGetUserPermissions), the
+ * members family (orgListMembers/orgIsMember/orgDeleteMember) and the
+ * public-members family (orgListPublicMembers/orgIsPublicMember/
+ * orgPublicizeMember/orgConcealMember). Orgs seed through the landed
+ * OrgService (org-as-user-row model, SPEC-0007) and memberships through its
+ * addMember/setMemberRole primitives; the wire shapes assert against the
+ * frozen contract — including the mirrored upstream quirks: the anonymous
+ * email blank on GET /orgs/{org} (and its ABSENCE on the GET /orgs listing),
+ * the members listing's reqToken 401 (the swagger declares only 200/404),
+ * the 303 oracle redirect on GET /orgs/{org}/members/{username}, the
+ * silent-204 member delete, the 500 last-owner guard, the 500 org-owns-repos
+ * guard, the admin's all-members view of public_members, the visibility
+ * ladders of the two listings, the rename 422s + redirect seam, and the
+ * renamed-org 307 seam.
  *
  * Bootstrap: `applyOrgsDdl()` (src/services/orgs/testing.ts — the generated
  * migrations) + `resetOrgTables()`. The routes are mounted on a local
@@ -31,6 +37,7 @@ import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import type { User } from "./models/user";
 import { registerOrgProfileRoutes } from "./routes/orgs";
+import { RepoService } from "../repos/service";
 import { OrgService } from "../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../services/orgs/testing";
 import contract from "../compat/contract/v1-swagger.generated.json";
@@ -45,6 +52,9 @@ beforeEach(async () => {
 const db = () => drizzle(env.DB);
 
 const ORGANIZATION_FIELDS = Object.keys(contract.definitions.Organization.properties).sort();
+const ORGANIZATION_PERMISSIONS_FIELDS = Object.keys(
+  contract.definitions.OrganizationPermissions.properties,
+).sort();
 const USER_FIELDS = Object.keys(contract.definitions.User.properties);
 const ERROR_URL = "https://example.com/api/swagger";
 
@@ -612,5 +622,525 @@ describe("PUT/DELETE /orgs/{org}/public_members/{username} (orgPublicizeMember/o
     expect(
       (await send(`/orgs/acme/members/${seed.publicMember.username}`, { headers: authHeaders(seed.owner.id) })).status,
     ).toBe(204);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /orgs (orgGetAll)
+// ---------------------------------------------------------------------------
+
+/** Four orgs spanning the visibility ladder, named for the alphabetical
+ *  order assertions (lower_name ASC, the SearchOrderByAlphabetically port). */
+async function seedOrgLadder(): Promise<{ owner: SeededUser; outsider: SeededUser; admin: SeededUser }> {
+  const owner = await seedUser("ladder-owner");
+  const outsider = await seedUser("ladder-outsider");
+  const admin = await seedUser("ladder-admin", true);
+  const orgs = new OrgService(env.DB);
+  await orgs.createOrg({ name: "acme", ownerId: owner.id });
+  await orgs.createOrg({ name: "zenith", ownerId: owner.id });
+  await orgs.createOrg({ name: "limco", ownerId: owner.id, visibility: "limited" });
+  await orgs.createOrg({ name: "darkco", ownerId: owner.id, visibility: "private" });
+  return { owner, outsider, admin };
+}
+
+describe("GET /orgs (orgGetAll)", () => {
+  it("lists public orgs alphabetically for anonymous callers in the contract Organization shape", async () => {
+    await seedOrgLadder();
+    const response = await router()("/orgs");
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body.map((org) => org.name)).toEqual(["acme", "zenith"]);
+    for (const entry of body) {
+      expect(Object.keys(entry).sort()).toEqual(ORGANIZATION_FIELDS);
+    }
+    expect(response.headers.get("X-Total-Count")).toBe("2");
+  });
+
+  it("widens the Visible ladder: signed-in callers add limited orgs, admins add private ones", async () => {
+    const seed = await seedOrgLadder();
+    const send = router();
+    const authed: Array<{ name?: unknown }> = await (
+      await send("/orgs", { headers: authHeaders(seed.outsider.id) })
+    ).json();
+    expect(authed.map((org) => org.name)).toEqual(["acme", "limco", "zenith"]);
+    const adminView: Array<{ name?: unknown }> = await (
+      await send("/orgs", { headers: authHeaders(seed.admin.id) })
+    ).json();
+    expect(adminView.map((org) => org.name)).toEqual(["acme", "darkco", "limco", "zenith"]);
+  });
+
+  it("does NOT blank the org email — GetAll renders ToOrganization verbatim, unlike Get", async () => {
+    const seed = await seedOrgLadder();
+    const send = router();
+    await send("/orgs/acme", {
+      method: "PATCH",
+      headers: authHeaders(seed.owner.id),
+      body: JSON.stringify({ email: "crew@acme.example" }),
+    });
+    const body: Array<{ name?: string; email?: string }> = await (await send("/orgs")).json();
+    expect(body.find((org) => org.name === "acme")?.email).toBe("crew@acme.example");
+  });
+
+  it("paginates with the runtime headers (limit=1, full total)", async () => {
+    await seedOrgLadder();
+    const response = await router()("/orgs?limit=1");
+    expect(response.status).toBe(200);
+    const body: Array<unknown> = await response.json();
+    expect(body).toHaveLength(1);
+    expect(response.headers.get("X-Total-Count")).toBe("2");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /orgs (orgCreate)
+// ---------------------------------------------------------------------------
+
+describe("POST /orgs (orgCreate)", () => {
+  it("creates the org (201, contract Organization shape) and installs the creator as owner", async () => {
+    const creator = await seedUser("bravo-creator");
+    const response = await router()("/orgs", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ username: "bravo" }),
+    });
+    expect(response.status).toBe(201);
+    const body: Record<string, unknown> = await response.json();
+    expect(Object.keys(body).sort()).toEqual(ORGANIZATION_FIELDS);
+    expect(body.name).toBe("bravo");
+    expect(body.visibility).toBe("public");
+    const orgs = new OrgService(env.DB);
+    const org = await orgs.getOrgByUsername("bravo");
+    expect(org?.numMembers).toBe(1);
+    expect((await orgs.getMembership(org!.id, creator.id))?.role).toBe("owner");
+  });
+
+  it("honors the optional profile fields, visibility, and the team-access flag", async () => {
+    const creator = await seedUser("charlie-creator");
+    const response = await router()("/orgs", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({
+        username: "charlie",
+        full_name: "Charlie Co",
+        description: "chocolate",
+        website: "https://charlie.example",
+        location: "Lucerna",
+        email: "hi@charlie.example",
+        visibility: "limited",
+        repo_admin_change_team_access: true,
+      }),
+    });
+    expect(response.status).toBe(201);
+    const org = await new OrgService(env.DB).getOrgByUsername("charlie");
+    expect(org?.visibility).toBe("limited");
+    expect(org?.fullName).toBe("Charlie Co");
+    expect(org?.description).toBe("chocolate");
+    expect(org?.website).toBe("https://charlie.example");
+    expect(org?.location).toBe("Lucerna");
+    expect(org?.email).toBe("hi@charlie.example");
+    expect(org?.repoAdminChangeTeamAccess).toBe(true);
+    // the limited org reads as a miss for anonymous GET /orgs/{org}…
+    expect((await router()("/orgs/charlie")).status).toBe(404);
+    // …but surfaces on the authed GET /orgs listing (the ladder).
+    const listing: Array<{ name?: string }> = await (
+      await router()("/orgs", { headers: authHeaders(creator.id) })
+    ).json();
+    expect(listing.some((org) => org.name === "charlie")).toBe(true);
+  });
+
+  it("422s a name colliding with an existing org or user, upstream message verbatim", async () => {
+    const creator = await seedUser("delta-creator");
+    await seedUser("delta-user");
+    const send = router();
+    const first = await send("/orgs", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ username: "delta" }),
+    });
+    expect(first.status).toBe(201);
+    const again = await send("/orgs", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ username: "delta" }),
+    });
+    expect(again.status).toBe(422);
+    expect(await again.json()).toEqual({ message: "user already exists [name: delta]", url: ERROR_URL });
+    // the shared user/org namespace: an existing plain user blocks it too
+    const userCollision = await send("/orgs", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ username: "delta-user" }),
+    });
+    expect(userCollision.status).toBe(422);
+    expect(await userCollision.json()).toEqual({ message: "user already exists [name: delta-user]", url: ERROR_URL });
+  });
+
+  it("422s reserved, invalid, and oversized names with the ported errclass messages", async () => {
+    const creator = await seedUser("echo-creator");
+    const send = router();
+    const reserved = await send("/orgs", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ username: "org" }),
+    });
+    expect(reserved.status).toBe(422);
+    expect(await reserved.json()).toEqual({ message: "name is reserved [name: org]", url: ERROR_URL });
+    const invalid = await send("/orgs", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ username: "a b" }),
+    });
+    expect(invalid.status).toBe(422);
+    expect(await invalid.json()).toEqual({
+      message: "name is invalid [a b]: must be valid alpha or numeric or dash(-_) or dot characters",
+      url: ERROR_URL,
+    });
+    const oversized = await send("/orgs", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ username: "x".repeat(41) }),
+    });
+    expect(oversized.status).toBe(422);
+    expect(await oversized.json()).toEqual({
+      message: `username is too long [name: ${"x".repeat(41)}] (max 40)`,
+      url: ERROR_URL,
+    });
+  });
+
+  it("consumes a user_redirect squatting the name (create-over-redirect)", async () => {
+    const creator = await seedUser("foxtrot-creator");
+    const orgs = new OrgService(env.DB);
+    const first = await orgs.createOrg({ name: "foxtrot", ownerId: creator.id });
+    await orgs.renameOrg(first.id, "foxtrot-two");
+    const response = await router()("/orgs", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ username: "foxtrot" }),
+    });
+    expect(response.status).toBe(201);
+    // the old name now resolves DIRECTLY to the new org — no 307
+    expect((await router()("/orgs/foxtrot")).status).toBe(200);
+  });
+
+  it("401s anonymous callers (runtime-only; reqToken upstream)", async () => {
+    await seedUser("golf-creator");
+    const response = await router()("/orgs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "golf" }),
+    });
+    expect(response.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /users/{username}/orgs (orgListUserOrgs)
+// ---------------------------------------------------------------------------
+
+/** owner owns pubco (public) / limco (limited) / privco (private); member
+ *  joined pubco CONCEALED and limco publicized — the is_public filter's two
+ *  arms under every ceiling. */
+async function seedUserOrgs(): Promise<{
+  owner: SeededUser;
+  member: SeededUser;
+  outsider: SeededUser;
+  admin: SeededUser;
+}> {
+  const owner = await seedUser("list-owner");
+  const member = await seedUser("list-member");
+  const outsider = await seedUser("list-outsider");
+  const admin = await seedUser("list-admin", true);
+  const orgs = new OrgService(env.DB);
+  const pub = await orgs.createOrg({ name: "pubco", ownerId: owner.id });
+  const lim = await orgs.createOrg({ name: "limco", ownerId: owner.id, visibility: "limited" });
+  await orgs.createOrg({ name: "privco", ownerId: owner.id, visibility: "private" });
+  await orgs.addMember(pub.id, member.id, { isPublic: false });
+  await orgs.addMember(lim.id, member.id, { isPublic: true });
+  return { owner, member, outsider, admin };
+}
+
+describe("GET /users/{username}/orgs (orgListUserOrgs)", () => {
+  it("self-lists every membership, concealed ones included (the private ceiling skips is_public)", async () => {
+    const seed = await seedUserOrgs();
+    const response = await router()(`/users/${seed.member.username}/orgs`, {
+      headers: authHeaders(seed.member.id),
+    });
+    expect(response.status).toBe(200);
+    const body: Array<{ name?: string }> = await response.json();
+    expect(body.map((org) => org.name)).toEqual(["limco", "pubco"]);
+    expect(response.headers.get("X-Total-Count")).toBe("2");
+  });
+
+  it("gives a signed-in outsider the limited ceiling: limited+public orgs, public memberships only", async () => {
+    const seed = await seedUserOrgs();
+    const response = await router()(`/users/${seed.member.username}/orgs`, {
+      headers: authHeaders(seed.outsider.id),
+    });
+    expect(response.status).toBe(200);
+    const body: Array<{ name?: string }> = await response.json();
+    // pubco is public but the membership is concealed; limco passes both arms
+    expect(body.map((org) => org.name)).toEqual(["limco"]);
+  });
+
+  it("401s anonymous callers (reqToken upstream) — the public ceiling is the public-only-token downgrade", async () => {
+    const seed = await seedUserOrgs();
+    const response = await router()(`/users/${seed.member.username}/orgs`);
+    expect(response.status).toBe(401);
+  });
+
+  it("gives site admins the private ceiling over another principal's list", async () => {
+    const seed = await seedUserOrgs();
+    const adminView: Array<{ name?: string }> = await (
+      await router()(`/users/${seed.member.username}/orgs`, { headers: authHeaders(seed.admin.id) })
+    ).json();
+    expect(adminView.map((org) => org.name)).toEqual(["limco", "pubco"]);
+    const ownerAdminView: Array<{ name?: string }> = await (
+      await router()(`/users/${seed.owner.username}/orgs`, { headers: authHeaders(seed.admin.id) })
+    ).json();
+    expect(ownerAdminView.map((org) => org.name)).toEqual(["limco", "privco", "pubco"]);
+  });
+
+  it("404s a missing subject with the shared error body", async () => {
+    const seed = await seedUserOrgs();
+    const missing = await router()("/users/ghost-user/orgs", { headers: authHeaders(seed.outsider.id) });
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual({ message: "not found", url: ERROR_URL });
+    expect((await router()("/users/ghost-user/orgs")).status).toBe(401);
+  });
+
+  it("200s an empty list for a subject with no memberships and for an org subject (type-blind quirk)", async () => {
+    const seed = await seedUserOrgs();
+    const bare = await seedUser("bare-human");
+    const bareBody: Array<unknown> = await (
+      await router()(`/users/${bare.username}/orgs`, { headers: authHeaders(seed.outsider.id) })
+    ).json();
+    expect(bareBody).toEqual([]);
+    const orgSubject: Array<unknown> = await (
+      await router()("/users/pubco/orgs", { headers: authHeaders(seed.outsider.id) })
+    ).json();
+    expect(orgSubject).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /orgs/{org}/rename (renameOrg)
+// ---------------------------------------------------------------------------
+
+describe("POST /orgs/{org}/rename (renameOrg)", () => {
+  it("renames (204, empty body); the old name 307s to the new one", async () => {
+    const seed = await seedOrg();
+    const response = await router()("/orgs/acme/rename", {
+      method: "POST",
+      headers: authHeaders(seed.owner.id),
+      body: JSON.stringify({ new_name: "acme-corp" }),
+    });
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+    const redirected = await router()("/orgs/acme");
+    expect(redirected.status).toBe(307);
+    expect(redirected.headers.get("Location")).toBe("/orgs/acme-corp");
+    expect((await router()("/orgs/acme-corp")).status).toBe(200);
+  });
+
+  it("applies a case-only rename to the display case without writing a redirect", async () => {
+    const seed = await seedOrg();
+    const response = await router()("/orgs/acme/rename", {
+      method: "POST",
+      headers: authHeaders(seed.owner.id),
+      body: JSON.stringify({ new_name: "ACME" }),
+    });
+    expect(response.status).toBe(204);
+    const org = await new OrgService(env.DB).getOrgByUsername("acme");
+    expect(org?.username).toBe("ACME");
+    // same lower name — the lookup still hits, no 307 seam involved
+    expect((await router()("/orgs/acme")).status).toBe(200);
+  });
+
+  it("403s non-owners with the exact message, 401s anonymous, 404s missing orgs", async () => {
+    const seed = await seedOrg();
+    const send = router();
+    const forbidden = await send("/orgs/acme/rename", {
+      method: "POST",
+      headers: authHeaders(seed.member.id),
+      body: JSON.stringify({ new_name: "hijacked" }),
+    });
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toEqual({ message: "Must be an organization owner", url: ERROR_URL });
+    const anonymous = await send("/orgs/acme/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_name: "hijacked" }),
+    });
+    expect(anonymous.status).toBe(401);
+    const missing = await send("/orgs/ghost/rename", {
+      method: "POST",
+      headers: authHeaders(seed.owner.id),
+      body: JSON.stringify({ new_name: "somewhere" }),
+    });
+    expect(missing.status).toBe(404);
+  });
+
+  it("422s collisions and reserved names with the upstream messages", async () => {
+    const seed = await seedOrg();
+    // a second org through the service (seedOrg's fixed user names collide)
+    const rivalOwner = await seedUser("zenith-owner");
+    await new OrgService(env.DB).createOrg({ name: "zenith", ownerId: rivalOwner.id });
+    const send = router();
+    const collision = await send("/orgs/acme/rename", {
+      method: "POST",
+      headers: authHeaders(seed.owner.id),
+      body: JSON.stringify({ new_name: "zenith" }),
+    });
+    expect(collision.status).toBe(422);
+    expect(await collision.json()).toEqual({ message: "user already exists [name: zenith]", url: ERROR_URL });
+    const reserved = await send("/orgs/acme/rename", {
+      method: "POST",
+      headers: authHeaders(seed.owner.id),
+      body: JSON.stringify({ new_name: "org" }),
+    });
+    expect(reserved.status).toBe(422);
+    expect(await reserved.json()).toEqual({ message: "name is reserved [name: org]", url: ERROR_URL });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /orgs/{org} (orgDelete)
+// ---------------------------------------------------------------------------
+
+describe("DELETE /orgs/{org} (orgDelete)", () => {
+  it("deletes an empty org (204): the org row, memberships, and redirect rows all go", async () => {
+    const seed = await seedOrg();
+    const orgs = new OrgService(env.DB);
+    await orgs.renameOrg(seed.orgId, "acme-two"); // live redirect old→org at delete time
+    const response = await router()("/orgs/acme-two", {
+      method: "DELETE",
+      headers: authHeaders(seed.owner.id),
+    });
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+    expect(await orgs.getOrgById(seed.orgId)).toBeNull();
+    expect(await orgs.getMembership(seed.orgId, seed.member.id)).toBeNull();
+    // the redirect row is gone — the old name reads as a plain 404, not a 307
+    expect((await router()("/orgs/acme")).status).toBe(404);
+    expect((await router()("/orgs/acme-two")).status).toBe(404);
+  });
+
+  it("500s through the blanked internal body while the org owns repositories", async () => {
+    const seed = await seedOrg();
+    await new RepoService(env.DB).create({
+      owner: { id: seed.orgId, usernameLower: "acme" },
+      name: "owned",
+    });
+    const response = await router()("/orgs/acme", {
+      method: "DELETE",
+      headers: authHeaders(seed.owner.id),
+    });
+    expect(response.status).toBe(500);
+    // APIErrorInternal blanks the message — ErrUserOwnRepos rides the same seam
+    expect(await response.json()).toEqual({ message: "", url: ERROR_URL });
+    // and the org survives
+    expect((await router()("/orgs/acme")).status).toBe(200);
+  });
+
+  it("403s non-owners with the exact message, 401s anonymous, 404s missing orgs", async () => {
+    const seed = await seedOrg();
+    const send = router();
+    const forbidden = await send("/orgs/acme", { method: "DELETE", headers: authHeaders(seed.member.id) });
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toEqual({ message: "Must be an organization owner", url: ERROR_URL });
+    expect((await send("/orgs/acme", { method: "DELETE" })).status).toBe(401);
+    expect((await send("/orgs/ghost", { method: "DELETE", headers: authHeaders(seed.owner.id) })).status).toBe(404);
+  });
+
+  it("307s a renamed org before any ownership work (the group seam answers first)", async () => {
+    const seed = await seedOrg();
+    await new OrgService(env.DB).renameOrg(seed.orgId, "acme-two");
+    // even the NON-OWNER member receives the redirect — it precedes reqToken
+    const response = await router()("/orgs/acme", {
+      method: "DELETE",
+      headers: authHeaders(seed.member.id),
+    });
+    expect(response.status).toBe(307);
+    expect(response.headers.get("Location")).toBe("/orgs/acme-two");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /users/{username}/orgs/{org}/permissions (orgGetUserPermissions)
+// ---------------------------------------------------------------------------
+
+describe("GET /users/{username}/orgs/{org}/permissions (orgGetUserPermissions)", () => {
+  it("answers the all-true block for the org owner subject", async () => {
+    const seed = await seedOrg();
+    const response = await router()(`/users/${seed.owner.username}/orgs/acme/permissions`, {
+      headers: authHeaders(seed.owner.id),
+    });
+    expect(response.status).toBe(200);
+    const body: Record<string, unknown> = await response.json();
+    expect(Object.keys(body).sort()).toEqual(ORGANIZATION_PERMISSIONS_FIELDS);
+    expect(body).toEqual({
+      can_read: true,
+      can_write: true,
+      is_admin: true,
+      is_owner: true,
+      can_create_repository: true,
+    });
+  });
+
+  it("answers all-false for a plain member and a non-member subject (no teams modeled ⇒ authorize 0)", async () => {
+    const seed = await seedOrg();
+    const send = router();
+    for (const subject of [seed.member, seed.outsider]) {
+      const body: Record<string, boolean> = await (
+        await send(`/users/${subject.username}/orgs/acme/permissions`, {
+          headers: authHeaders(seed.owner.id),
+        })
+      ).json();
+      expect(body).toEqual({
+        can_read: false,
+        can_write: false,
+        is_admin: false,
+        is_owner: false,
+        can_create_repository: false,
+      });
+    }
+  });
+
+  it("is type-blind on the org param: a plain user answers all-false; a renamed org 307s", async () => {
+    const seed = await seedOrg();
+    const plainUser = await router()(
+      `/users/${seed.owner.username}/orgs/${seed.outsider.username}/permissions`,
+      { headers: authHeaders(seed.owner.id) },
+    );
+    expect(plainUser.status).toBe(200);
+    expect(await plainUser.json()).toEqual({
+      can_read: false,
+      can_write: false,
+      is_admin: false,
+      is_owner: false,
+      can_create_repository: false,
+    });
+    await new OrgService(env.DB).renameOrg(seed.orgId, "acme-two");
+    const redirected = await router()(`/users/${seed.owner.username}/orgs/acme/permissions`, {
+      headers: authHeaders(seed.owner.id),
+    });
+    expect(redirected.status).toBe(307);
+    expect(redirected.headers.get("Location")).toBe(`/users/${seed.owner.username}/orgs/acme-two/permissions`);
+  });
+
+  it("401s anonymous callers (runtime-only) and 404s missing params", async () => {
+    const seed = await seedOrg();
+    const send = router();
+    expect((await send(`/users/${seed.owner.username}/orgs/acme/permissions`)).status).toBe(401);
+    expect(
+      (await send(`/users/ghost-user/orgs/acme/permissions`, { headers: authHeaders(seed.owner.id) })).status,
+    ).toBe(404);
+    expect(
+      (
+        await send(`/users/${seed.owner.username}/orgs/ghost-org/permissions`, {
+          headers: authHeaders(seed.owner.id),
+        })
+      ).status,
+    ).toBe(404);
   });
 });

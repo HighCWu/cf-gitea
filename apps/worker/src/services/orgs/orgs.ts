@@ -243,6 +243,10 @@ export interface CreateOrgInput {
   website?: string | null;
   location?: string | null;
   email?: string | null;
+  /** Upstream `CreateOrgOption.RepoAdminChangeTeamAccess`
+   *  (modules/structs/org.go:46–48) — carried through Create verbatim
+   *  (routers/api/v1/org/org.go:278). */
+  repoAdminChangeTeamAccess?: boolean;
   now?: Date;
 }
 
@@ -424,7 +428,7 @@ export class OrgService {
           avatarEmail: null,
           useCustomAvatar: false,
           numMembers: 1,
-          repoAdminChangeTeamAccess: false,
+          repoAdminChangeTeamAccess: input.repoAdminChangeTeamAccess === true,
           type: "org",
           createdAt: now,
         }),
@@ -795,6 +799,44 @@ export class OrgService {
       throw error;
     }
     return (await this.getOrgById(orgId)) ?? org;
+  }
+
+  /**
+   * Delete an org — the port of upstream `DeleteOrganization` + the
+   * `deleteOrganization` cascade it wraps (services/org/org.go:58–88 +
+   * 29–52): the caller-level repository guard first (upstream answers the
+   * count>0 case with `ErrUserOwnRepos` INSIDE the tx — the API route maps
+   * every error through `APIErrorInternal`, so the message never surfaces),
+   * then ONE D1 batch: the membership rows (`OrgUser`), any redirect rows
+   * pointing at or squatting the org's names (upstream relies on the
+   * `user_redirect.redirect_user_id` FK cascade; deleting by the lower_name
+   * too keeps the namespace immediately reusable), and the `users` row
+   * itself (`type='org'`-guarded). Teams/TeamUsers are the tier-1
+   * `role` collapse (SPEC-0007 §3.3) — no separate rows exist to delete;
+   * unmodeled upstream beans (secrets, actions runners, packages) have no
+   * tables yet. Returns false when the org row is already gone.
+   */
+  async deleteOrg(orgId: number): Promise<boolean> {
+    const org = await this.getOrgById(orgId);
+    if (org === null) return false;
+    const repoCount = await this.db
+      .select({ total: sql<number>`count(*)` })
+      .from(repositories)
+      .where(eq(repositories.ownerId, orgId))
+      .get();
+    if ((repoCount?.total ?? 0) > 0) {
+      // Upstream `ErrUserOwnRepos` (models/repo ErrUserOwnRepos{UID}) —
+      // deliberately an UNTYPED error: the API surface routes it through
+      // APIErrorInternal → the blank-message 500, never a 4xx.
+      throw new Error(`organization owns repositories [uid: ${orgId}]`);
+    }
+    await this.db.batch([
+      this.db.delete(orgMembers).where(eq(orgMembers.orgId, orgId)),
+      this.db.delete(userRedirects).where(eq(userRedirects.redirectUserId, orgId)),
+      this.db.delete(userRedirects).where(eq(userRedirects.lowerName, org.usernameLower)),
+      this.db.delete(users).where(and(eq(users.id, orgId), eq(users.type, "org"))),
+    ]);
+    return true;
   }
 
   /**

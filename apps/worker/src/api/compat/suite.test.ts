@@ -2425,7 +2425,13 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   ],
   repoApplyDiffPatch: [
     {
-      name: "apply a unified diff to the seeded file (200 FileResponse)",
+      // The apply arm CREATES a dedicated file instead of patching
+      // compat.txt (the contents-block rule above): the commit lands
+      // through the same applyFileChanges seam, but every pre-existing
+      // blob oid stays in the head tree, so the later git-object reads
+      // (GetBlob's "seeded blob" walks from the HEAD tip) keep finding
+      // the seeded blob.
+      name: "apply a unified diff creating a dedicated file (200 FileResponse)",
       status: 200,
       request: (ctx) => ({
         path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/diffpatch`,
@@ -2434,12 +2440,12 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
           headers: JSON_HEADERS,
           body: JSON.stringify({
             content: [
-              "diff --git a/compat.txt b/compat.txt",
-              "--- a/compat.txt",
-              "+++ b/compat.txt",
-              "@@ -1 +1,2 @@",
-              " hello compat git",
-              "+patched by the compat suite",
+              "diff --git a/diffpatch-added.txt b/diffpatch-added.txt",
+              "new file mode 100644",
+              "--- /dev/null",
+              "+++ b/diffpatch-added.txt",
+              "@@ -0,0 +1 @@",
+              "+added by the compat diffpatch scenario",
             ].join("\n"),
           }),
         }),
@@ -3176,6 +3182,142 @@ describe("fork flow — 202, REPO_TASKS replication, content-equal replica (SPEC
     expect(ungranted.status).toBe(403);
     // none of the guards got as far as enqueueing.
     expect(forkQueueSends).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tier-2 compat scenarios — org identity surface (T2): GET/POST /orgs, GET
+// /users/{username}/orgs, POST /orgs/{org}/rename, DELETE /orgs/{org}, GET
+// /users/{username}/orgs/{org}/permissions. Same harness shape as the block
+// above — a local mount over the shared beforeAll seeds — with its own
+// unique-named fixtures (CompatT2*) so the parallel blocks never collide.
+// Order-sensitive where they write (create → rename → delete at the tail).
+// The shared CompatOrg seed is only ever READ here (its owner-subject
+// permissions), never mutated.
+// ---------------------------------------------------------------------------
+
+const orgIdentitySend: CompatRequestSender = (request: CompatRequest): Promise<Response> => {
+  const app = new OpenAPIHono<ApiEnv>();
+  app.onError(giteaErrorHandler);
+  registerOrgProfileRoutes(app, createTokenAuthMiddleware(suiteResolver), createOptionalTokenAuthMiddleware(suiteResolver));
+  return Promise.resolve(app.fetch(new Request(`${ORIGIN}${request.path}`, request.init), env));
+};
+
+describe("tier-2 compat scenarios — org identity surface: list, create, user orgs, rename, delete, permissions (T2)", () => {
+  const authed = (init?: RequestInit): RequestInit => {
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", `token ${TOKEN}`);
+    return { ...init, headers };
+  };
+  const jsonAuthed = (body: unknown, method: string): RequestInit =>
+    authed({ method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+  it("orgGetAll: anonymous lists public orgs in the Organization shape, shared seed included", async () => {
+    const response = await orgIdentitySend({ path: "/orgs" });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body.length).toBeGreaterThan(0);
+    for (const entry of body) {
+      for (const key of Object.keys(entry)) {
+        expect(ORG_FIELDS.has(key), `orgGetAll field ${key} declared by the contract`).toBe(true);
+      }
+    }
+    expect(body.some((org) => org.name === seeds.org)).toBe(true);
+  });
+
+  it("orgCreate: POST /orgs answers 201 with the Organization projection and installs the creator as owner", async () => {
+    const response = await orgIdentitySend({
+      path: "/orgs",
+      init: jsonAuthed({ username: "CompatT2Created", description: "created by the compat suite" }, "POST"),
+    });
+    expect(response.status).toBe(201);
+    const body: Record<string, unknown> = await response.json();
+    for (const key of Object.keys(body)) {
+      expect(ORG_FIELDS.has(key), `orgCreate field ${key} declared by the contract`).toBe(true);
+    }
+    expect(body.name).toBe("CompatT2Created");
+    expect(body.description).toBe("created by the compat suite");
+    // the created org reads back through orgGet
+    expect((await orgIdentitySend({ path: "/orgs/CompatT2Created" })).status).toBe(200);
+  });
+
+  it("orgCreate: 422s the shared-namespace collision and reserved names with the upstream messages", async () => {
+    const collision = await orgIdentitySend({
+      path: "/orgs",
+      init: jsonAuthed({ username: "CompatT2Created" }, "POST"),
+    });
+    expect(collision.status).toBe(422);
+    const collisionBody: { message?: string } = await collision.json();
+    expect(collisionBody.message).toBe("user already exists [name: CompatT2Created]");
+    const reserved = await orgIdentitySend({ path: "/orgs", init: jsonAuthed({ username: "org" }, "POST") });
+    expect(reserved.status).toBe(422);
+    const reservedBody: { message?: string } = await reserved.json();
+    expect(reservedBody.message).toBe("name is reserved [name: org]");
+  });
+
+  it("orgListUserOrgs: the owner's self-list carries the shared org (Organization shapes, headers, 401 anonymous)", async () => {
+    const response = await orgIdentitySend({
+      path: `/users/${String(seeds.owner)}/orgs?limit=1`,
+      init: authed(),
+    });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body).toHaveLength(1); // the limit page, not the total
+    for (const entry of body) {
+      for (const key of Object.keys(entry)) {
+        expect(ORG_FIELDS.has(key), `orgListUserOrgs field ${key} declared by the contract`).toBe(true);
+      }
+    }
+    expect(Number(response.headers.get("X-Total-Count"))).toBeGreaterThanOrEqual(1);
+    expect((await orgIdentitySend({ path: "/users/ghost-user/orgs", init: authed() })).status).toBe(404);
+    expect((await orgIdentitySend({ path: `/users/${String(seeds.owner)}/orgs` })).status).toBe(401);
+  });
+
+  it("orgGetUserPermissions: the owner subject reads the all-true block on the shared org", async () => {
+    const response = await orgIdentitySend({
+      path: `/users/${String(seeds.owner)}/orgs/${String(seeds.org)}/permissions`,
+      init: authed(),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      can_read: true,
+      can_write: true,
+      is_admin: true,
+      is_owner: true,
+      can_create_repository: true,
+    });
+    expect(
+      (await orgIdentitySend({ path: `/users/${String(seeds.owner)}/orgs/${String(seeds.org)}/permissions` })).status,
+    ).toBe(401);
+  });
+
+  it("renameOrg: the owner renames the created org (204); the old name 307s through the seam; reserved 422s", async () => {
+    const response = await orgIdentitySend({
+      path: "/orgs/CompatT2Created/rename",
+      init: jsonAuthed({ new_name: "CompatT2Renamed" }, "POST"),
+    });
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+    const redirected = await orgIdentitySend({ path: "/orgs/CompatT2Created" });
+    expect(redirected.status).toBe(307);
+    expect(redirected.headers.get("Location")).toBe("/orgs/CompatT2Renamed");
+    const reserved = await orgIdentitySend({
+      path: "/orgs/CompatT2Renamed/rename",
+      init: jsonAuthed({ new_name: "org" }, "POST"),
+    });
+    expect(reserved.status).toBe(422);
+  });
+
+  it("orgDelete: the repo-less renamed org deletes (204); both names read as plain 404s afterwards", async () => {
+    const response = await orgIdentitySend({
+      path: "/orgs/CompatT2Renamed",
+      init: authed({ method: "DELETE" }),
+    });
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+    // the redirect row died with the org — 404, not the 307 seam
+    expect((await orgIdentitySend({ path: "/orgs/CompatT2Created" })).status).toBe(404);
+    expect((await orgIdentitySend({ path: "/orgs/CompatT2Renamed" })).status).toBe(404);
   });
 });
 
