@@ -27,6 +27,7 @@ import {
   executeMerge,
   finalizeReceive,
   listCommitsRange,
+  listPackCatalog,
   lookupObjects,
   markDeleted,
   mergeBase,
@@ -58,6 +59,8 @@ import {
   type FinalizeReceiveResult,
   type IndexRow,
   type LeaseHost,
+  type ListPackCatalogInput,
+  type ListPackCatalogResult,
   type LookupObjectResult,
   type MarkDeletedResult,
   type PutApiObjectsResult,
@@ -653,6 +656,20 @@ export class RepoCell extends DurableObject<Env> {
    * commits. */
   async finalizeForkImport(input: FinalizeForkImportInput): Promise<FinalizeForkImportResult> {
     return finalizeForkImport(this.leaseHost(), input);
+  }
+
+  // ---- invariants read RPC ---------------------------------------------------
+  // Read-only, lease-free: the Worker's invariants checker pages the pack
+  // catalog to cross-check it against R2 (tagged unions only, per the RPC
+  // discipline above; the checker must never take or contend on a lease).
+
+  /** Keyset page over the pack catalog — EVERY lifecycle state, pack_key
+   * order (the invariants checker classifies non-active rows itself; a
+   * superseded row's object may legitimately be gone). `input.cursor` is the
+   * previous page's nextCursor (null = first page); `input.limit` is
+   * 1..500 (default 200). */
+  async listPackCatalog(input: ListPackCatalogInput): Promise<ListPackCatalogResult> {
+    return listPackCatalog(this.leaseHost(), input);
   }
 
   // ---- repo lifecycle (SPEC-0003 §2.5.5; LIFECYCLE gap RPCs) ----------------

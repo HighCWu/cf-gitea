@@ -1307,3 +1307,84 @@ export async function finalizeForkImport(
  * builders construct the canonical bytes these RPCs verify and store. */
 export { serializeCommit, serializeTag, personLine };
 
+// ---- invariants read RPCs -----------------------------------------------------
+// Read-only, lease-free catalog reads for the Worker's invariants checker
+// (apps/worker/src/invariants). Same tagged-union discipline as every RPC
+// above — application outcomes never throw across the boundary — and no
+// receive lease is taken or consulted: the checker runs unattended and must
+// never contend with a push. Distinct from the fork replication's
+// listCatalogPage: that one serves the copy loop (active rows + index rows +
+// sqlite bytes); this one is the raw catalog view the checker cross-checks
+// against R2, and it must list NON-active rows too (a superseded row's
+// object may legitimately be gone — flagging it would be noise).
+
+/** Hard cap on one listPackCatalog page. */
+export const LIST_PACK_CATALOG_MAX_LIMIT = 500;
+/** Page size when ListPackCatalogInput.limit is omitted. */
+export const LIST_PACK_CATALOG_DEFAULT_LIMIT = 200;
+
+/** One pack_catalog row of the checker's paged catalog read. Field names
+ * mirror the catalog table's columns verbatim (the raw catalog view, not an
+ * engine-internal record); `created_at` is unix millis. */
+export interface PackCatalogEntry {
+  pack_key: string;
+  kind: string;
+  state: string;
+  location: string;
+  object_count: number;
+  pack_bytes: number;
+  created_at: number;
+}
+
+export interface ListPackCatalogInput {
+  /** Keyset cursor: the previous page's nextCursor (the last pack_key
+   * served), or null/absent for the first page. Order is pack_key. */
+  cursor?: string | null;
+  /** Page size, 1..LIST_PACK_CATALOG_MAX_LIMIT (default 200). */
+  limit?: number;
+}
+
+export type ListPackCatalogOk = {
+  tag: "ok";
+  rows: PackCatalogEntry[];
+  /** Pass as the next call's cursor; null when the walk is exhausted. */
+  nextCursor: string | null;
+};
+export type ListPackCatalogError = { tag: "error"; reason: string };
+export type ListPackCatalogResult = ListPackCatalogOk | ListPackCatalogError;
+
+/**
+ * Paged read over the WHOLE pack catalog — every lifecycle state, pack_key
+ * order. Pure SQLite read; nothing is written and no lease is involved.
+ * `limit` outside 1..LIST_PACK_CATALOG_MAX_LIMIT and a `cursor` that is not
+ * a pack key (pack-<40 hex>) come back as { tag: "error", reason } rather
+ * than throwing, per the boundary discipline.
+ */
+export function listPackCatalog(host: LeaseHost, input: ListPackCatalogInput): ListPackCatalogResult {
+  const limit = input.limit ?? LIST_PACK_CATALOG_DEFAULT_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > LIST_PACK_CATALOG_MAX_LIMIT) {
+    return { tag: "error", reason: `limit must be an integer in 1..${LIST_PACK_CATALOG_MAX_LIMIT}` };
+  }
+  const cursor = input.cursor ?? null;
+  if (cursor !== null && !isValidPackName(cursor)) {
+    return { tag: "error", reason: "cursor is not a pack key (pack-<40 hex>)" };
+  }
+  // one probe row past the page decides nextCursor
+  const rows = host.store.packs.catalogPage(cursor, limit + 1);
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  return {
+    tag: "ok",
+    rows: page.map((r) => ({
+      pack_key: r.packKey,
+      kind: r.kind,
+      state: r.state,
+      location: r.location,
+      object_count: r.objectCount,
+      pack_bytes: r.packBytes,
+      created_at: r.createdAt,
+    })),
+    nextCursor: hasMore ? page[page.length - 1]!.packKey : null,
+  };
+}
+

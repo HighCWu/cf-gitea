@@ -756,5 +756,43 @@ export class PackStore {
     this.backend.set(packKey, "r2");
     this.r2KeyOverrides.delete(packKey);
   }
+
+  // ---- invariants catalog read ----------------------------------------------
+  // The Worker invariants checker's listPackCatalog RPC is the only consumer.
+  // Unlike the fork replication's active-only pages above, this read spans
+  // EVERY lifecycle state: the checker must SEE superseded/reclaimable rows
+  // to leave their (possibly already-deleted) objects unflagged.
+
+  /** Keyset page of catalog rows in pack_key order (the primary key), every
+   * state included. `afterPackKey` null starts the listing. */
+  catalogPage(afterPackKey: string | null, limit: number): PackCatalogRow[] {
+    return this.sql
+      .exec<{
+        pack_key: string; seq: number; kind: string; state: string; location: string;
+        object_count: number; pack_bytes: number; idx_bytes: number; created_at: number;
+        superseded_by: string | null;
+      }>(
+        `SELECT pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by
+           FROM pack_catalog
+          WHERE pack_key > ?
+          ORDER BY pack_key
+          LIMIT ?`,
+        afterPackKey ?? "",
+        limit
+      )
+      .toArray()
+      .map((r) => ({
+        packKey: r.pack_key,
+        seq: r.seq,
+        kind: r.kind,
+        state: r.state as PackState,
+        location: r.location === "sqlite" ? "sqlite" : "r2",
+        objectCount: r.object_count,
+        packBytes: r.pack_bytes,
+        idxBytes: r.idx_bytes,
+        createdAt: r.created_at,
+        supersededBy: r.superseded_by,
+      }));
+  }
 }
 

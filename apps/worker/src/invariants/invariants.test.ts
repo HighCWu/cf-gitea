@@ -6,13 +6,17 @@
  * (SELF.fetch), so the packs under test are genuine engine output; violations
  * are INJECTED by deleting the R2 pack objects a ref's closure needs, which
  * is exactly the failure class the checker must catch through the public
- * read path (the engine-side catalog RPC is parallel-owned/blocked — see
- * check.ts).
+ * read path. The catalog half runs against the engine's real listPackCatalog
+ * RPC (read-only, lease-free) — the pack_catalog ↔ R2 cross-check needs no
+ * eviction choreography at all: catalog rows and R2 objects are read
+ * directly, so a deleted pack is catalog-pack-missing immediately, even when
+ * the DO's object cache still serves the ref tips whose bytes died with it
+ * (see check.ts "Detection horizon").
  *
  * Cache-warmth determinism (verified empirically, see check.ts "Detection
  * horizon"): a ref update peels its target, so every pushed TIP commit is
  * inflated into the DO's lifetime object cache and its pack's raw chunk into
- * a 4-slot chunk LRU — deleting a tip's pack is invisible to reads within
+ * a 4-slot chunk LRU — deleting a tip's pack is invisible to READS within
  * the same DO instance. Trees, blobs, and commits that were never ref tips
  * read through to R2, and their pack chunks are evicted after ~4 subsequent
  * pushes. The fixtures exploit exactly that:
@@ -43,7 +47,7 @@ import { basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/see
 import { repositories, users } from "../db/schema";
 import { RepoService } from "../repos/service";
 import { checkRepoInvariants, type InvariantsEnv, type InvariantReport } from "./check";
-import type { CommitJson } from "@cf-gitea/git-engine";
+import type { CommitJson, PackCatalogEntry } from "@cf-gitea/git-engine";
 import {
   enumerateRepos,
   enqueueInvariantChecks,
@@ -255,7 +259,8 @@ describe("checkRepoInvariants: healthy repos", () => {
     expect(report.ok).toBe(true);
     expect(report.partial).toBe(false);
     expect(report.violations).toEqual([]);
-    expect(report.checked).toEqual({ refs: 1, commits: 3, trees: 2, blobs: 2 });
+    // one HEAD per cataloged pack — every push landed exactly one pack.
+    expect(report.checked).toEqual({ refs: 1, commits: 3, trees: 2, blobs: 2, packs: 3 });
   });
 
   it("a seven-pack repo passes (walk crosses pack boundaries)", async () => {
@@ -323,11 +328,17 @@ describe("checkRepoInvariants: injected violations", () => {
     expect(report.partial).toBe(false);
     // A mid-chain pack loss poisons every tip's provable closure (the DO's
     // reachability walk reads through the dead node), so every visited tip
-    // reports — but every violation is a closure-broken, and the never-
-    // advertised ancestor A (the actually-deleted content) is among them.
+    // reports — but every READ-path violation is a closure-broken, and the
+    // never-advertised ancestor A (the actually-deleted content) is among
+    // them. The catalog cross-check adds the one catalog-pack-missing for
+    // the deleted pack itself (cache-independent — see the docstring).
     expect(report.violations.length).toBeGreaterThanOrEqual(1);
-    expect(report.violations.every((v) => v.kind === "closure-broken")).toBe(true);
+    expect(
+      report.violations.every((v) => v.kind === "closure-broken" || v.kind === "catalog-pack-missing"),
+    ).toBe(true);
     expect(report.violations.some((v) => v.oid === seeded.oids.a)).toBe(true);
+    const missing = report.violations.find((v) => v.kind === "catalog-pack-missing");
+    expect(missing?.detail).toContain("pack");
   });
 
   it("deleting a tree's pack ⇒ tree-missing under the readable tip", async () => {
@@ -337,9 +348,10 @@ describe("checkRepoInvariants: injected violations", () => {
     expect(report.ok).toBe(false);
     // The tip commit itself reads from the DO's object cache (mask, see the
     // module docstring); its tree and blob do not. Tips above the dead pack
-    // also lose their provable closure (see the closure test above).
+    // also lose their provable closure (see the closure test above), and the
+    // catalog half flags the deleted pack directly.
     const kinds = new Set(report.violations.map((v) => v.kind));
-    expect([...kinds].sort()).toEqual(["closure-broken", "tree-missing"]);
+    expect([...kinds].sort()).toEqual(["catalog-pack-missing", "closure-broken", "tree-missing"]);
     const tree = report.violations.find((v) => v.kind === "tree-missing");
     expect(tree?.oid).toBe(seeded.treeC1);
   });
@@ -384,34 +396,41 @@ describe("checkRepoInvariants: injected violations", () => {
 // 3. Classification the warm cache masks on a real cell: stubbed RPCs
 // ---------------------------------------------------------------------------
 
+/** Minimal checker env over hand-rolled RPC outcomes — the checker takes
+ *  a structural env slice, so no casts are involved. Tips resolve by ref
+ *  name (and later by their returned oid, for the parent walk); a tree
+ *  with no blob entries keeps the blob spot check out of the picture.
+ *  `catalogRows` feeds the listPackCatalog stub; R2 stays the REAL bucket
+ *  (absent objects read as missing, so catalog fixtures need no R2 setup).
+ *  `target.storageKey` picks a private packs/ prefix per test. */
+function stubEnv(
+  tips: Record<string, () => Promise<CommitJson | null>>,
+  catalogRows: PackCatalogEntry[] = [],
+): InvariantsEnv {
+  const byOid = new Map<string, () => Promise<CommitJson | null>>();
+  const stub = {
+    listRefs: () =>
+      Promise.resolve({
+        head: "refs/heads/one",
+        refs: Object.keys(tips).map((name) => ({ name, target: `oid-${name}` })),
+      }),
+    readCommit: async (id?: string) => {
+      const key = id ?? "refs/heads/one";
+      const resolve = tips[key] ?? byOid.get(key);
+      if (resolve === undefined) throw new Error(`unresolvable: ${key}`);
+      const commit = await resolve();
+      if (commit !== null) byOid.set(commit.oid, resolve);
+      return commit;
+    },
+    listTree: () => Promise.resolve({ oid: "tree", entries: [] }),
+    readBlob: () => Promise.resolve(null),
+    listPackCatalog: () =>
+      Promise.resolve({ tag: "ok" as const, rows: catalogRows, nextCursor: null }),
+  };
+  return { REPO: { getByName: () => stub }, REPO_PACKS: env.REPO_PACKS };
+}
+
 describe("checkRepoInvariants: tip classification (stubbed RPCs)", () => {
-  /** Minimal checker env over hand-rolled RPC outcomes — the checker takes
-   *  a structural env slice, so no casts are involved. Tips resolve by ref
-   *  name (and later by their returned oid, for the parent walk); a tree
-   *  with no blob entries keeps the blob spot check out of the picture. */
-  function stubEnv(
-    tips: Record<string, () => Promise<CommitJson | null>>,
-  ): InvariantsEnv {
-    const byOid = new Map<string, () => Promise<CommitJson | null>>();
-    const stub = {
-      listRefs: () =>
-        Promise.resolve({
-          head: "refs/heads/one",
-          refs: Object.keys(tips).map((name) => ({ name, target: `oid-${name}` })),
-        }),
-      readCommit: async (id?: string) => {
-        const key = id ?? "refs/heads/one";
-        const resolve = tips[key] ?? byOid.get(key);
-        if (resolve === undefined) throw new Error(`unresolvable: ${key}`);
-        const commit = await resolve();
-        if (commit !== null) byOid.set(commit.oid, resolve);
-        return commit;
-      },
-      listTree: () => Promise.resolve({ oid: "tree", entries: [] }),
-      readBlob: () => Promise.resolve(null),
-    };
-    return { REPO: { getByName: () => stub }, REPO_PACKS: undefined };
-  }
 
   it("an unreadable tip is ref-tip-missing and the walk never starts from it", async () => {
     const okTip = () =>
@@ -445,6 +464,107 @@ describe("checkRepoInvariants: tip classification (stubbed RPCs)", () => {
     const report = await checkRepoInvariants(envSlice, { engineName: "stub" });
     // HEAD names ref one, which already reported — no head-missing dup.
     expect(report.violations).toEqual([{ kind: "ref-tip-missing", ref: "refs/heads/one", oid: "oid-refs/heads/one" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3b. pack_catalog ↔ R2 cross-check (the cache-independent half)
+// ---------------------------------------------------------------------------
+
+describe("checkRepoInvariants: catalog cross-check", () => {
+  const row = (overrides: Partial<PackCatalogEntry>): PackCatalogEntry => ({
+    pack_key: `pack-${"a".repeat(40)}`,
+    kind: "receive",
+    state: "active",
+    location: "r2",
+    object_count: 3,
+    pack_bytes: 1024,
+    created_at: T0,
+    ...overrides,
+  });
+
+  it("an active row whose R2 object vanished ⇒ catalog-pack-missing (no eviction choreography needed)", async () => {
+    // The cache-mask point: pack2's bytes sit under a ref tip the DO's object
+    // cache still serves, so the READ-path fixture needed a seven-push
+    // eviction dance — the catalog half needs none (it reads R2 directly).
+    const seeded = await threePackRepo("inv-cat-missing");
+    await env.REPO_PACKS.delete(seeded.packs.p2);
+    const report = await checkRepoInvariants(env, seeded.target);
+    expect(report.ok).toBe(false);
+    expect(report.partial).toBe(false);
+    const missing = report.violations.filter((v) => v.kind === "catalog-pack-missing");
+    expect(missing).toHaveLength(1);
+    expect(missing[0]?.detail).toContain(seeded.packs.p2.split("/").pop()!);
+    expect(report.checked.packs).toBe(3); // every catalog row was HEADed
+  });
+
+  it("an R2 pack object no catalog row claims ⇒ catalog-orphan; .idx sidecars are not packs", async () => {
+    const seeded = await threePackRepo("inv-cat-orphan");
+    const orphanKey = `repos/${seeded.storageKey}/packs/pack-${"f".repeat(40)}.pack`;
+    const idxKey = `repos/${seeded.storageKey}/packs/pack-${"e".repeat(40)}.idx`;
+    await env.REPO_PACKS.put(orphanKey, new Uint8Array([1]));
+    await env.REPO_PACKS.put(idxKey, new Uint8Array([2]));
+    const report = await checkRepoInvariants(env, seeded.target);
+    expect(report.ok).toBe(false);
+    const orphans = report.violations.filter((v) => v.kind === "catalog-orphan");
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0]?.detail).toContain("pack-");
+    await env.REPO_PACKS.delete(orphanKey);
+    await env.REPO_PACKS.delete(idxKey);
+  });
+
+  it("a row budget truncates the catalog walk and marks the report partial", async () => {
+    const seeded = await threePackRepo("inv-cat-budget");
+    const report = await checkRepoInvariants(env, seeded.target, { maxCatalogRows: 2 });
+    expect(report.ok).toBe(true); // the two rows seen were healthy
+    expect(report.partial).toBe(true);
+    expect(report.checked.packs).toBe(2);
+  });
+
+  it("stubbed catalog: active-with-missing-object flags, superseded does not", async () => {
+    const okTip = () =>
+      Promise.resolve({
+        oid: "1".repeat(40),
+        tree: "2".repeat(40),
+        parents: [],
+        author: { name: "x", email: "x@x", time: 0, tz: "+0000" },
+        committer: { name: "x", email: "x@x", time: 0, tz: "+0000" },
+        subject: "ok",
+        message: "ok\n",
+      });
+    const goneActive = row({ pack_key: `pack-${"a".repeat(40)}` });
+    const goneSuperseded = row({
+      pack_key: `pack-${"b".repeat(40)}`,
+      state: "superseded",
+    });
+    const sqliteBacked = row({
+      pack_key: `pack-${"c".repeat(40)}`,
+      location: "sqlite",
+    });
+
+    // Active + r2 + no object ⇒ flagged; the superseded and sqlite rows
+    // beside it are deliberately unverified (M3 deletion lifecycle / DO
+    // SQLite bytes no R2 probe can see).
+    const flagged = await checkRepoInvariants(
+      stubEnv({ "refs/heads/one": okTip }, [goneActive, goneSuperseded, sqliteBacked]),
+      { engineName: "stub", storageKey: "stub-catalog-mixed" },
+    );
+    expect(flagged.ok).toBe(false);
+    expect(flagged.violations).toHaveLength(1);
+    expect(flagged.violations[0]?.kind).toBe("catalog-pack-missing");
+    expect(flagged.violations[0]?.detail).toContain(goneActive.pack_key);
+    expect(flagged.checked.packs).toBe(1); // only the active r2 row is HEADed
+
+    // The same vanished object under a superseded row is NOT a violation:
+    // compaction states are scheduled for deletion, their objects may
+    // legitimately be gone already.
+    const clean = await checkRepoInvariants(
+      stubEnv({ "refs/heads/one": okTip }, [goneSuperseded]),
+      { engineName: "stub", storageKey: "stub-catalog-superseded" },
+    );
+    expect(clean.ok).toBe(true);
+    expect(clean.violations).toEqual([]);
+    expect(clean.checked.packs).toBe(0);
   });
 });
 
