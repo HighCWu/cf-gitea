@@ -1,0 +1,196 @@
+import type { OpenAPIHono } from "@hono/zod-openapi";
+import type { Context, MiddlewareHandler } from "hono";
+import { z } from "zod";
+
+import { ApiError } from "../errors";
+import type { ApiEnv } from "../env";
+import {
+  canViewRepository,
+  findRepositoryByPath,
+  repositoryPermissions,
+  viewerOf,
+  type RepositoryWithOwner,
+} from "../services/repository";
+import {
+  getMirrorStatus,
+  registerMirror,
+  MirrorConflictError,
+  MirrorCredentialKeyError,
+  MirrorValidationError,
+} from "../services/mirror";
+
+/**
+ * Mirror/migrate routes (SPEC-0009 §2.2/§2.3 — the repo-scoped HTTP surface
+ * over the sync service) — NON-CONTRACT, plain Hono, exactly like the
+ * imports family: these paths are OUTSIDE the frozen SPEC-0004 swagger
+ * inventory (upstream's migrate lives at the global POST /repos/migrate,
+ * which creates the target; the repo-scoped into-empty shape here has no
+ * upstream path key), so they must NOT enter the generated OpenAPI document
+ * and must stay engine-free in the route module graph
+ * (scripts/check-openapi.mjs bundles src/api/openapi.ts — see
+ * api/services/mirror.ts for the boundary note).
+ *
+ *   POST /repos/{owner}/{repo}/migrate       attach a pull mirror to an
+ *                                            EXISTING EMPTY repo: validate
+ *                                            per upstream MigrateRepoOption,
+ *                                            register the repo_mirrors row
+ *                                            (sanitized URL, §4.2-encrypted
+ *                                            credentials), kick one
+ *                                            mirror-sync message → 202
+ *   GET  /repos/{owner}/{repo}/mirror        the sync_state row (status/
+ *                                            schedule/last_error; never
+ *                                            credentials) → 200
+ *   POST /repos/{owner}/{repo}/mirror-sync   force a sync now: enqueue →
+ *                                            200 empty (upstream
+ *                                            AddPullMirrorToQueue shape,
+ *                                            routers/api/v1/repo/mirror.go
+ *                                            :29-77)
+ *
+ * The message is `{kind: "mirror-sync", repoId}` on MIRROR_SYNC_QUEUE — the
+ * literal shape of sync.ts's MirrorSyncMessage (inlined here so the route
+ * graph stays engine-free, the same discipline as imports.ts's
+ * `{kind: "import-abort"}`); the consumer CAS re-guards every state, so a
+ * racing cron/duplicate message is a harmless `skipped: "busy"`.
+ *
+ * Handlers stay thin (AGENTS.md): parse → authorize → service → respond.
+ */
+
+/** The migrate body is a small JSON document; reject oversized ones before
+ *  buffering (the imports manifest cap pattern, SPEC-0003 §2.6 limits). */
+const MIGRATE_BODY_MAX_BYTES = 64 * 1024;
+
+/**
+ * Upstream `MigrateRepoOption` (modules/structs/repo.go:419-450), field
+ * names verbatim. Accepted-but-ignored here (the target repo IS the path):
+ * repo_owner/uid/repo_name/private/description. Semantics live in
+ * api/services/mirror.ts (422/409 families per SPEC-0009 §2.2).
+ */
+const migrateOptionsSchema = z.object({
+  clone_addr: z.string().min(1),
+  service: z.string().optional(),
+  auth_username: z.string().optional(),
+  auth_password: z.string().optional(),
+  auth_token: z.string().optional(),
+  mirror: z.boolean().optional(),
+  lfs: z.boolean().optional(),
+  lfs_endpoint: z.string().optional(),
+  private: z.boolean().optional(),
+  description: z.string().optional(),
+  wiki: z.boolean().optional(),
+  issues: z.boolean().optional(),
+  milestones: z.boolean().optional(),
+  labels: z.boolean().optional(),
+  pull_requests: z.boolean().optional(),
+  releases: z.boolean().optional(),
+  mirror_interval: z.string().optional(),
+  repo_owner: z.string().optional(),
+  uid: z.number().optional(),
+  repo_name: z.string().optional(),
+});
+
+/** Owner-or-admin gate (the imports family's requireAdminRepo): managing a
+ *  repo's source URL and credentials is an owner operation; invisible repos
+ *  are the 404 anti-enumeration. */
+async function requireAdminRepo(c: Context<ApiEnv>, owner: string, repo: string): Promise<RepositoryWithOwner> {
+  const viewer = viewerOf(c);
+  const found = await findRepositoryByPath(c.env.DB, owner, repo);
+  if (found === null || !canViewRepository(viewer, found.repo)) throw new ApiError(404, "not found");
+  if (!repositoryPermissions(viewer, found.repo).admin) {
+    throw new ApiError(403, "only the repository owner or a site admin can manage the mirror");
+  }
+  return found;
+}
+
+/** Service error family → upstream status codes (§2.2 table): validation
+ *  422, target conflicts 409, unconfigured-KEK 500. Unknown errors rethrow
+ *  into the global handler's 500. Use as `.catch(toApiError)`. */
+function toApiError(error: unknown): never {
+  if (error instanceof MirrorValidationError) throw new ApiError(422, error.message);
+  if (error instanceof MirrorConflictError) throw new ApiError(409, error.message);
+  if (error instanceof MirrorCredentialKeyError) throw new ApiError(500, error.message);
+  throw error;
+}
+
+export function registerMirrorRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>): void {
+  // POST — migrate INTO an existing empty repo (§2.2's into-empty shape of
+  // upstream POST /repos/migrate): mirror=true registers the pull mirror and
+  // 202s with the mirror status; the initial population is the enqueued
+  // mirror-sync (a delta sync against an empty repo fetches every advertised
+  // tip — sync.ts handles old = ZERO_OID creates). The credential half runs
+  // in the service: https-only + egress-gated URL, §4.2 AES-GCM envelope.
+  app.post("/repos/:owner/:repo/migrate", requireAuth, async (c) => {
+    const { owner, repo } = c.req.param();
+    const found = await requireAdminRepo(c, owner, repo);
+
+    const declared = Number.parseInt(c.req.header("content-length") ?? "", 10);
+    if (Number.isInteger(declared) && declared > MIGRATE_BODY_MAX_BYTES) {
+      throw new ApiError(413, `migrate options exceed the ${MIGRATE_BODY_MAX_BYTES} byte cap`);
+    }
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      throw new ApiError(400, "migrate options must be a JSON object");
+    }
+    const parsed = migrateOptionsSchema.safeParse(raw);
+    if (!parsed.success) {
+      throw new ApiError(422, `invalid migrate options: ${parsed.error.issues[0]?.message ?? "malformed"}`);
+    }
+
+    const status = await registerMirror(c.env.DB, c.env, found.repo, parsed.data).catch(toApiError);
+
+    // Kick the initial sync (§2.6 — the enqueue is best-effort: the row is
+    // registered due at now, so a failed send self-heals at the next cron
+    // tick; the consumer re-checks every state on its own).
+    const queue = c.env.MIRROR_SYNC_QUEUE;
+    if (queue) {
+      try {
+        await queue.send({ kind: "mirror-sync", repoId: found.repo.id });
+      } catch (error) {
+        console.error(
+          `[mirror] sync enqueue failed for ${found.repo.ownerNamespace}/${found.repo.slug}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    return c.json(status, 202);
+  });
+
+  // GET — the sync_state row (schedule, last sync, sanitized last error).
+  // Owner-or-admin like the imports status read: operational detail, and
+  // last_error/remote_address are not part of the public repo JSON.
+  app.get("/repos/:owner/:repo/mirror", requireAuth, async (c) => {
+    const { owner, repo } = c.req.param();
+    const found = await requireAdminRepo(c, owner, repo);
+    const status = await getMirrorStatus(c.env.DB, found.repo.id);
+    if (status === null) throw new ApiError(404, "repository has no mirror");
+    return c.json(status, 200);
+  });
+
+  // POST — force a sync now (§2.3): token + code-write (upstream
+  // reqRepoWriter(unit.TypeCode), api.go:1430; until collaborator tables
+  // land, repositoryPermissions.push is owner/admin only), non-archived,
+  // and a mirror row — upstream's exact `400 "Repository is not a mirror"`
+  // otherwise (repo/mirror.go:29-77). 200 with an EMPTY body on enqueue,
+  // like upstream; the sync itself runs on the queue consumer.
+  app.post("/repos/:owner/:repo/mirror-sync", requireAuth, async (c) => {
+    const { owner, repo } = c.req.param();
+    const viewer = viewerOf(c);
+    const found = await findRepositoryByPath(c.env.DB, owner, repo);
+    if (found === null || !canViewRepository(viewer, found.repo)) throw new ApiError(404, "not found");
+    if (!repositoryPermissions(viewer, found.repo).push) {
+      throw new ApiError(403, "mirror sync requires write access to the repository");
+    }
+    if (found.repo.isArchived) {
+      throw new ApiError(409, "repository is archived");
+    }
+    if (!(await getMirrorStatus(c.env.DB, found.repo.id))) {
+      throw new ApiError(400, "Repository is not a mirror");
+    }
+    const queue = c.env.MIRROR_SYNC_QUEUE;
+    if (!queue) throw new ApiError(500, "MIRROR_SYNC_QUEUE binding missing");
+    await queue.send({ kind: "mirror-sync", repoId: found.repo.id });
+    return c.body(null, 200);
+  });
+}
