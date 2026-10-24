@@ -153,3 +153,34 @@ export const editPullRequestOptionSchema = z.object({
 });
 
 export type EditPullRequestOption = z.infer<typeof editPullRequestOptionSchema>;
+
+/** `#/definitions/MergePullRequestOption` — POST …/pulls/{index}/merge body. */
+export const mergePullRequestOptionSchema = z.object({
+  delete_branch_after_merge: z.boolean().optional(),
+  do: z
+    .enum(["merge", "rebase", "rebase-merge", "squash", "fast-forward-only", "manually-merged"])
+    .openapi({ description: "merge style" }),
+  force_merge: z.boolean().optional(),
+  head_commit_id: z.string().optional(),
+  merge_commit_id: z.string().optional().openapi({ description: "manually-merged: the commit the caller merged" }),
+  merge_message_field: z.string().optional(),
+  merge_title_field: z.string().optional(),
+  merge_when_checks_succeed: z.boolean().optional(),
+});
+
+export type MergePullRequestOption = z.infer<typeof mergePullRequestOptionSchema>;
+
+/** `#/definitions/MergeUpstreamRequest` — POST /merge-upstream body. */
+export const mergeUpstreamRequestSchema = z.object({
+  branch: z.string().openapi({ description: "branch to merge into" }),
+  ff_only: z.boolean().optional(),
+});
+
+export type MergeUpstreamRequest = z.infer<typeof mergeUpstreamRequestSchema>;
+
+/** `#/definitions/MergeUpstreamResponse`. */
+export const mergeUpstreamResponseSchema = z.object({
+  merge_type: z.string().optional(),
+});
+
+export type MergeUpstreamResponse = z.infer<typeof mergeUpstreamResponseSchema>;

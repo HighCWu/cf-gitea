@@ -24,20 +24,30 @@ import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
+import { OpenAPIHono } from "@hono/zod-openapi";
 
 import contractRaw from "../../compat/contract/v1-swagger.generated.json?raw";
 import { comments, milestones, repositories, users } from "../../db/schema";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { applyOrgsDdl } from "../../services/orgs/testing";
 import { OrgService } from "../../services/orgs/orgs";
+import { FOLLOWS_DDL_STATEMENTS } from "../services/follows";
 import { IssuesService } from "../../issues/service";
+import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware } from "../auth";
 import { STUB_USER } from "../auth";
 import { createRepoHook } from "../services/hooks";
 import { createRepoLabel } from "../services/labels";
 import { createCommitStatus } from "../services/commit-status";
+import { addOrUpdateCollaborator } from "../services/repo-collaborators";
+import { watchRepo } from "../services/repo-watchers";
+import { applyRepoExtrasDdl } from "../testing/repo-ddl";
+import { giteaErrorHandler } from "../errors";
+import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { getGeneratedSpec } from "../openapi";
 import { createApiRouter } from "../router";
+import { registerOrgProfileRoutes } from "../routes/orgs";
+import { registerFollowRoutes } from "../routes/follows";
 import {
   TIER1_EXPECTED_OPERATIONS,
   TIER1_EXPECTED_PATHS,
@@ -47,6 +57,7 @@ import {
 } from "./gen-fixtures";
 import fixturesRaw from "./tier1-fixtures.json?raw";
 import {
+  contractModelFields,
   formatCoverage,
   implementedOperations,
   operationKey,
@@ -105,11 +116,17 @@ function suiteIdentity(): User {
   return { ...STUB_USER, id: ownerId, login: OWNER, full_name: OWNER, created: SEED_NOW.toISOString() };
 }
 
+/** The api-layer identity both senders resolve the suite token to — the
+ *  seeded owner row rendered through the contract User model (STUB_USER
+ *  carries the exact field set; id/login are re-pointed at the D1 row so
+ *  doer-scoped routes see the seeded principal). */
+const suiteResolver = {
+  resolveToken: (token: string) => Promise.resolve(token === TOKEN ? suiteIdentity() : null),
+};
+
 /** Fresh in-process router per request, real test-worker bindings (no SELF.fetch). */
 const send: CompatRequestSender = (request: CompatRequest): Promise<Response> => {
-  const app = createApiRouter({
-    auth: { resolveToken: (token) => Promise.resolve(token === TOKEN ? suiteIdentity() : null) },
-  });
+  const app = createApiRouter({ auth: suiteResolver });
   return Promise.resolve(app.fetch(new Request(`${ORIGIN}${request.path}`, request.init), env));
 };
 
@@ -174,9 +191,10 @@ beforeAll(async () => {
   await applyOrgsDdl();
 
   const ownerId = await seedUser(OWNER);
-  await seedUser("CompatNeighbor"); // second user so /users/search paginates
+  const neighborId = await seedUser("CompatNeighbor"); // second user so /users/search paginates
   const orgs = new OrgService(env.DB);
-  await orgs.createOrg({ name: ORG, ownerId, fullName: "Compat Org", now: SEED_NOW });
+  const compatOrg = await orgs.createOrg({ name: ORG, ownerId, fullName: "Compat Org", now: SEED_NOW });
+  Object.assign(seeds, { ownerId, neighborId, orgId: compatOrg.id });
 
   await seedRepo(SHARED_REPO_ID, OWNER.toLowerCase(), "shared"); // the shared read fixture
   await seedRepo("9002", OWNER.toLowerCase(), "second"); // second repo → list pagination
@@ -304,6 +322,96 @@ beforeAll(async () => {
   Object.assign(seeds, {
     pullA: pullA.issue.index,
     pullB: pullB.issue.index,
+  });
+
+  // ---------------------------------------------------------------------
+  // Batch-7 D1 block (SPEC-0004 §2.4 rows repoListTopics … repoTransfer):
+  // the raw-D1 stores bootstrap from their services' DDL statements (the
+  // services document the schema gap), then each family gets dedicated
+  // seeds — releases ride a NON-empty repo (refs_version 1), repo-edit and
+  // transfer get their own repos so the shared read fixture stays untouched.
+  // ---------------------------------------------------------------------
+  await applyRepoExtrasDdl();
+
+  await seedRepo("9004", OWNER.toLowerCase(), "rel"); // releases: needs a non-empty repo
+  await drizzle(env.DB).update(repositories).set({ refsVersion: 1 }).where(eq(repositories.id, "9004"));
+  await seedRepo("9005", OWNER.toLowerCase(), "compat-edit"); // repoEdit victim
+  await seedRepo("9006", OWNER.toLowerCase(), "compat-transfer"); // repoTransfer victim
+  await seedRepo("9007", OWNER.toLowerCase(), "compat-del"); // repoDelete victim
+
+  const compatCollab1 = await seedUser("CompatCollab");
+  const compatCollab2 = await seedUser("CompatCollab2");
+  // read-mode rows: they show in the collaborator list but not in the
+  // write-or-above assignee set (order-independent scenarios either way).
+  await addOrUpdateCollaborator(env.DB, SHARED_REPO_ID, compatCollab1, "read", SEED_NOW);
+  await addOrUpdateCollaborator(env.DB, SHARED_REPO_ID, compatCollab2, "read", SEED_NOW);
+  // The watch row pre-exists so userCurrentCheckSubscription (which runs
+  // before the PUT in fixture order) sees the subscribed state.
+  await watchRepo(env.DB, SHARED_REPO_ID, ownerId, SEED_NOW);
+
+  const relNow = (minutes: number) => new Date(SEED_NOW.getTime() + minutes * 60_000);
+  const relService = new IssuesService(env.DB);
+  const relA = await relService.createRelease({
+    repoId: "9004",
+    publisherId: ownerId,
+    tagName: "compat-v1",
+    target: "main",
+    title: "compat v1",
+    note: "seeded by the compat suite",
+    now: relNow(0),
+  });
+  await relService.createRelease({ repoId: "9004", publisherId: ownerId, tagName: "compat-v2", title: "compat v2", now: relNow(1) });
+  await relService.createRelease({ repoId: "9004", publisherId: ownerId, tagName: "compat-v-del", title: "compat v del", now: relNow(2) });
+  const relD = await relService.createRelease({ repoId: "9004", publisherId: ownerId, tagName: "compat-v-del-id", title: "compat v del id", now: relNow(3) });
+
+  Object.assign(seeds, {
+    releaseEditId: relA.id,
+    releaseDeleteId: relD.id,
+  });
+
+  // ---------------------------------------------------------------------
+  // Tier-2 org + identity block (SPEC-0004 appendix A category a, T2 rows):
+  // membership seeds for the CompatOrg (a concealed member + a public one),
+  // a dedicated rename pair, and follow edges. The follow table is
+  // pre-migration (services/follows.ts DDL block) — the raw bootstrap
+  // applies it here like applyOrgsDdl does for the org tables. These seeds
+  // back the tier-2 scenario describe below; the tier-1 fixture scenarios
+  // above are untouched (the owner's org list gains no rows).
+  // ---------------------------------------------------------------------
+  for (const statement of FOLLOWS_DDL_STATEMENTS) {
+    await env.DB.prepare(statement).run();
+  }
+  await env.DB.prepare("DELETE FROM follows").run();
+
+  // seedUser here returns the ROW ID (a number), not a handle object.
+  const memberUserId = await seedUser("CompatMember"); // concealed member (delete victim)
+  const loudUserId = await seedUser("CompatLoud"); // public member
+  const renameHolderId = await seedUser("CompatRenameHolder"); // owns the pre-rename org
+  const orgsService = new OrgService(env.DB);
+  await orgsService.addMember(compatOrg.id, memberUserId, { isPublic: false });
+  await orgsService.addMember(compatOrg.id, loudUserId, { isPublic: true });
+  // Dedicated rename pair for the 307 seam scenario (GET /orgs/{old} → 307).
+  const renameOrg = await orgsService.createOrg({
+    name: "CompatRenamedOrg",
+    ownerId: renameHolderId,
+    now: SEED_NOW,
+  });
+  await orgsService.renameOrg(renameOrg.id, "CompatRenamedOrgNew");
+
+  // Follow edges: owner ⇄ neighbor (the follow-listing/check scenarios).
+  const followStmt = env.DB.prepare(
+    "INSERT INTO follows (user_id, follow_id, created_at) VALUES (?, ?, ?)",
+  );
+  const followUnix = Math.floor(SEED_NOW.getTime() / 1000);
+  await followStmt.bind(ownerId, neighborId, followUnix).run();
+  await followStmt.bind(neighborId, ownerId, followUnix).run();
+
+  Object.assign(seeds, {
+    neighbor: "CompatNeighbor",
+    member: "CompatMember",
+    loudMember: "CompatLoud",
+    renamedOrg: "CompatRenamedOrg",
+    renamedOrgNew: "CompatRenamedOrgNew",
   });
 });
 
@@ -988,6 +1096,271 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       }),
     },
   ],
+
+  // ---------------------------------------------------------------------
+  // Batch-7 D1 block (SPEC-0004 §2.4 rows repoListTopics … repoTransfer).
+  // Scenario order mirrors the fixture order; the seeds pre-create every
+  // read target so case order never matters. The suite identity is the
+  // shared repo's OWNER, so every admin/writer gate passes.
+  // ---------------------------------------------------------------------
+
+  repoListTopics: [
+    {
+      name: "listed topics",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/topics` }),
+    },
+  ],
+  repoUpdateTopics: [
+    {
+      name: "replace",
+      status: 204,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/topics`,
+        init: ctx.withAuth({ method: "PUT", headers: JSON_HEADERS, body: JSON.stringify({ topics: ["compat", "batch7"] }) }),
+      }),
+    },
+    {
+      name: "invalid names → invalidTopics 422",
+      status: 422,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/topics`,
+        init: ctx.withAuth({ method: "PUT", headers: JSON_HEADERS, body: JSON.stringify({ topics: ["Bad Topic"] }) }),
+      }),
+    },
+  ],
+
+  userCurrentCheckSubscription: [
+    {
+      name: "pre-seeded watch",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/subscription`, init: ctx.withAuth() }),
+    },
+  ],
+  userCurrentPutSubscription: [
+    {
+      name: "watch (idempotent)",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/subscription`, init: ctx.withAuth({ method: "PUT" }) }),
+    },
+  ],
+  userCurrentDeleteSubscription: [
+    {
+      name: "unwatch",
+      status: 204,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/subscription`, init: ctx.withAuth({ method: "DELETE" }) }),
+    },
+  ],
+
+  repoListCollaborators: [
+    {
+      name: "first page (two seeded rows)",
+      status: 200,
+      linkRels: ["next", "last"],
+      request: (ctx) => ({ path: `${repoPath(ctx)}/collaborators?limit=1`, init: ctx.withAuth() }),
+    },
+  ],
+  repoCheckCollaborator: [
+    {
+      name: "seeded collaborator",
+      status: 204,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/collaborators/CompatCollab`, init: ctx.withAuth() }),
+    },
+    {
+      name: "unknown user → declared 422",
+      status: 422,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/collaborators/nobody`, init: ctx.withAuth() }),
+    },
+  ],
+  repoAddCollaborator: [
+    {
+      name: "upsert at the default mode",
+      status: 204,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/collaborators/CompatNeighbor`,
+        init: ctx.withAuth({ method: "PUT", headers: JSON_HEADERS, body: "{}" }),
+      }),
+    },
+  ],
+  repoDeleteCollaborator: [
+    {
+      name: "delete the seeded collaborator",
+      status: 204,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/collaborators/CompatCollab2`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+  repoGetAssignees: [
+    {
+      name: "owner + write-or-above collaborators",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/assignees`, init: ctx.withAuth() }),
+    },
+  ],
+
+  repoListReleases: [
+    {
+      name: "seeded releases, first page",
+      status: 200,
+      linkRels: ["next", "last"],
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases?limit=1`,
+      }),
+    },
+  ],
+  repoCreateRelease: [
+    {
+      name: "create",
+      status: 201,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ tag_name: "compat-v-new", name: "compat new", body: "created by the compat suite" }),
+        }),
+      }),
+    },
+    {
+      name: "duplicate tag → declared 409",
+      status: 409,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ tag_name: "compat-v1" }),
+        }),
+      }),
+    },
+  ],
+  repoGetLatestRelease: [
+    {
+      name: "newest published release",
+      status: 200,
+      request: (ctx) => ({ path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/latest` }),
+    },
+  ],
+  repoGetReleaseByTag: [
+    {
+      name: "seeded tag",
+      status: 200,
+      request: (ctx) => ({ path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/tags/compat-v1` }),
+    },
+  ],
+  repoDeleteReleaseByTag: [
+    {
+      name: "delete the dedicated seed release",
+      status: 204,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/tags/compat-v-del`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+  repoGetRelease: [
+    {
+      name: "seeded global id",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/${String(ctx.seeds.releaseEditId)}`,
+      }),
+    },
+    {
+      name: "missing id → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({ path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/99999` }),
+    },
+  ],
+  repoEditRelease: [
+    {
+      name: "edit the seeded release",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/${String(ctx.seeds.releaseEditId)}`,
+        init: ctx.withAuth({
+          method: "PATCH",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: "compat v1 (edited)" }),
+        }),
+      }),
+    },
+  ],
+  repoDeleteRelease: [
+    {
+      name: "delete the dedicated seed release",
+      status: 204,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/rel/releases/${String(ctx.seeds.releaseDeleteId)}`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+
+  repoEdit: [
+    {
+      name: "edit the dedicated repo",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/compat-edit`,
+        init: ctx.withAuth({
+          method: "PATCH",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ description: "edited by the compat suite" }),
+        }),
+      }),
+    },
+    {
+      name: "invalid rename → declared 422",
+      status: 422,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/compat-edit`,
+        init: ctx.withAuth({
+          method: "PATCH",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ name: "bad name!" }),
+        }),
+      }),
+    },
+  ],
+  repoTransfer: [
+    {
+      name: "file a pending transfer (async 202)",
+      status: 202,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/compat-transfer/transfer`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ new_owner: "CompatNeighbor" }),
+        }),
+      }),
+    },
+    {
+      name: "unknown owner → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/compat-transfer/transfer`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ new_owner: "nobody-here" }),
+        }),
+      }),
+    },
+  ],
+  repoDelete: [
+    {
+      name: "delete the dedicated seed repo",
+      status: 204,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/compat-del`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
 };
 
 // ---------------------------------------------------------------------------
@@ -1069,6 +1442,192 @@ describe("compat suite bookkeeping (check:api consistency)", () => {
     for (const key of report.outOfSuite) {
       expect(fixtureKeys.has(key), `${key} reported out-of-suite but has a fixture`).toBe(false);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tier-2 compat scenarios (SPEC-0004 appendix A, category-a T2 rows). The
+// dynamic suite above drives the tier-1 fixtures only; these T2 operations
+// have no fixture file, so they run here against the same harness shape — a
+// fresh router per request over the shared beforeAll seeds — with
+// contract-shape assertions via contractModelFields. The local mount is
+// exactly the orchestrator one-liner's seam, so the block keeps working
+// unchanged once registerOrgProfileRoutes/registerFollowRoutes land in
+// router.ts (the dynamic suite then lists the ops in report.outOfSuite).
+// Cases are order-sensitive where they write (the delete/conceal pair runs
+// after the read scenarios that need their targets).
+// ---------------------------------------------------------------------------
+
+const tier2Send: CompatRequestSender = (request: CompatRequest): Promise<Response> => {
+  const app = new OpenAPIHono<ApiEnv>();
+  app.onError(giteaErrorHandler);
+  registerOrgProfileRoutes(app, createTokenAuthMiddleware(suiteResolver), createOptionalTokenAuthMiddleware(suiteResolver));
+  registerFollowRoutes(app, createTokenAuthMiddleware(suiteResolver));
+  return Promise.resolve(app.fetch(new Request(`${ORIGIN}${request.path}`, request.init), env));
+};
+
+/** Declared field set of one contract model (the fixture-shape oracle). */
+function declaredModelFields(modelRef: string): ReadonlySet<string> {
+  return new Set(contractModelFields(contract, modelRef).map((field) => field.name));
+}
+
+const ORG_FIELDS = declaredModelFields("Organization");
+const T2_USER_FIELDS = declaredModelFields("User");
+
+describe("tier-2 compat scenarios — org profile, members, public members, follows (T2)", () => {
+  const authed = (init?: RequestInit): RequestInit => {
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", `token ${TOKEN}`);
+    return { ...init, headers };
+  };
+
+  it("orgGet: seeded org answers the Organization projection, email blanked for anonymous", async () => {
+    const response = await tier2Send({ path: `/orgs/${String(seeds.org)}` });
+    expect(response.status).toBe(200);
+    const body: Record<string, unknown> = await response.json();
+    for (const key of Object.keys(body)) {
+      expect(ORG_FIELDS.has(key), `orgGet field ${key} declared by the contract`).toBe(true);
+    }
+    expect(body.name).toBe(seeds.org);
+    expect(body.email).toBe("");
+  });
+
+  it("orgGet: renamed org 307s through the redirect seam (path+query preserved)", async () => {
+    const response = await tier2Send({ path: `/orgs/${String(seeds.renamedOrg)}?page=2` });
+    expect(response.status).toBe(307);
+    expect(response.headers.get("Location")).toBe(`/orgs/${String(seeds.renamedOrgNew)}?page=2`);
+  });
+
+  it("orgGet: missing org → the runtime APIError 404", async () => {
+    const response = await tier2Send({ path: "/orgs/ghost-org" });
+    expect(response.status).toBe(404);
+    const missBody: Record<string, unknown> = await response.json();
+    expect(Object.keys(missBody).sort()).toEqual(["message", "url"]);
+  });
+
+  it("orgEdit: PATCH applies the presented fields and answers the edited Organization", async () => {
+    const response = await tier2Send({
+      path: `/orgs/${String(seeds.org)}`,
+      init: authed({ method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ description: "edited by the compat suite" }) }),
+    });
+    expect(response.status).toBe(200);
+    const body: Record<string, unknown> = await response.json();
+    for (const key of Object.keys(body)) {
+      expect(ORG_FIELDS.has(key), `orgEdit field ${key} declared by the contract`).toBe(true);
+    }
+    expect(body.description).toBe("edited by the compat suite");
+  });
+
+  it("orgListMembers: an org member sees every member, hidden ones included (paginated)", async () => {
+    const response = await tier2Send({
+      path: `/orgs/${String(seeds.org)}/members?limit=1`,
+      init: authed(),
+    });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body).toHaveLength(1); // limit=1 — the page, not the total
+    for (const entry of body) {
+      for (const key of Object.keys(entry)) {
+        expect(T2_USER_FIELDS.has(key), `member field ${key} declared by the contract`).toBe(true);
+      }
+    }
+    expect(response.headers.get("X-Total-Count")).toBe("3"); // owner + member + loud member
+  });
+
+  it("orgIsMember: 204 for a member, 404 for a miss, 401 for anonymous (reqToken upstream)", async () => {
+    const member = await tier2Send({
+      path: `/orgs/${String(seeds.org)}/members/${String(seeds.owner)}`,
+      init: authed(),
+    });
+    expect(member.status).toBe(204);
+    const miss = await tier2Send({ path: `/orgs/${String(seeds.org)}/members/ghost-user`, init: authed() });
+    expect(miss.status).toBe(404);
+    // Upstream wires reqToken() on this GET — anonymous is the runtime-only
+    // 401; the 303 oracle ladder needs a signed-in non-member doer (covered
+    // by the routes tests' outsider identity).
+    const anonymous = await tier2Send({ path: `/orgs/${String(seeds.org)}/members/${String(seeds.owner)}` });
+    expect(anonymous.status).toBe(401);
+  });
+
+  it("orgListPublicMembers: only is_public rows, anonymous (paginated)", async () => {
+    const response = await tier2Send({ path: `/orgs/${String(seeds.org)}/public_members?limit=1` });
+    expect(response.status).toBe(200);
+    const body: Array<{ login?: string }> = await response.json();
+    expect(body).toHaveLength(1);
+    expect(body[0]?.login).toBe(seeds.loudMember);
+    expect(response.headers.get("X-Total-Count")).toBe("1");
+  });
+
+  it("orgIsPublicMember: 204 for the public member, 404 for the concealed one", async () => {
+    expect((await tier2Send({ path: `/orgs/${String(seeds.org)}/public_members/${String(seeds.loudMember)}` })).status).toBe(204);
+    expect((await tier2Send({ path: `/orgs/${String(seeds.org)}/public_members/${String(seeds.member)}` })).status).toBe(404);
+  });
+
+  it("orgPublicizeMember: the owner publicizes the concealed member (204)", async () => {
+    const response = await tier2Send({
+      path: `/orgs/${String(seeds.org)}/public_members/${String(seeds.member)}`,
+      init: authed({ method: "PUT" }),
+    });
+    expect(response.status).toBe(204);
+    expect((await tier2Send({ path: `/orgs/${String(seeds.org)}/public_members/${String(seeds.member)}` })).status).toBe(204);
+  });
+
+  it("orgConcealMember: the owner conceals the public member (204), the check flips to 404", async () => {
+    const response = await tier2Send({
+      path: `/orgs/${String(seeds.org)}/public_members/${String(seeds.loudMember)}`,
+      init: authed({ method: "DELETE" }),
+    });
+    expect(response.status).toBe(204);
+    expect((await tier2Send({ path: `/orgs/${String(seeds.org)}/public_members/${String(seeds.loudMember)}` })).status).toBe(404);
+  });
+
+  it("orgDeleteMember: removes the victim (204, empty body)", async () => {
+    const response = await tier2Send({
+      path: `/orgs/${String(seeds.org)}/members/${String(seeds.member)}`,
+      init: authed({ method: "DELETE" }),
+    });
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+  });
+
+  it("userListFollowers: the owner's follower page (200, User shapes, runtime headers)", async () => {
+    const response = await tier2Send({
+      path: `/users/${String(seeds.owner)}/followers?limit=1`,
+      init: authed(),
+    });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body).toHaveLength(1);
+    for (const key of Object.keys(body[0] ?? {})) {
+      expect(T2_USER_FIELDS.has(key), `follower field ${key} declared by the contract`).toBe(true);
+    }
+    expect(response.headers.get("X-Total-Count")).toBe("1");
+    // reqToken upstream: anonymous is the runtime-only 401.
+    expect((await tier2Send({ path: `/users/${String(seeds.owner)}/followers` })).status).toBe(401);
+  });
+
+  it("userListFollowing: the owner's following page (200)", async () => {
+    const response = await tier2Send({
+      path: `/users/${String(seeds.owner)}/following?limit=1`,
+      init: authed(),
+    });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body).toHaveLength(1);
+    expect(response.headers.get("X-Total-Count")).toBe("1");
+  });
+
+  it("userCheckFollowing: 204 on the edge, 404 off it", async () => {
+    const followed = await tier2Send({
+      path: `/users/${String(seeds.owner)}/following/${String(seeds.neighbor)}`,
+      init: authed(),
+    });
+    expect(followed.status).toBe(204);
+    const notFollowed = await tier2Send({
+      path: `/users/${String(seeds.owner)}/following/ghost-user`,
+      init: authed(),
+    });
+    expect(notFollowed.status).toBe(404);
   });
 });
 

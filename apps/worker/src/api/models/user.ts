@@ -53,3 +53,8 @@ export const userSchema = z.object({
 });
 
 export type User = z.infer<typeof userSchema>;
+
+/** `#/responses/UserList` — plain `User[]` (member/follow listings). */
+export const userListSchema = z.array(userSchema);
+
+export type UserList = z.infer<typeof userListSchema>;

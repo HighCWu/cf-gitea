@@ -59,6 +59,12 @@ export const giteaErrorHandler: ErrorHandler<ApiEnv> = (err, c) => {
     return c.json({ message: err.message, url: swaggerDocUrl(c), ...err.extra }, err.status);
   }
   if (err instanceof HTTPException) {
+    // An HTTPException that carries its own prepared response passes through
+    // untouched — the org-rename 307 seam (routes/orgs.ts) needs the Location
+    // header + empty body, which the APIError conversion below would erase.
+    if (err.res !== undefined) {
+      return err.res;
+    }
     return c.json({ message: err.message, url: swaggerDocUrl(c) }, err.status);
   }
   return c.json({ message: "", url: swaggerDocUrl(c) }, 500);

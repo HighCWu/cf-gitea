@@ -45,3 +45,38 @@ export type Organization = z.infer<typeof organizationSchema>;
 export const organizationListSchema = z.array(organizationSchema);
 
 export type OrganizationList = z.infer<typeof organizationListSchema>;
+
+/**
+ * Mirror of the vendored contract's `EditOrgOption` definition
+ * (#/definitions/EditOrgOption), field-for-field: every field optional (Go
+ * pointers — absent ⇔ "leave unchanged"; empty string ⇔ "clear").
+ *
+ * The Go struct's `binding` tags (full_name MaxSize(100), email/description/
+ * website MaxSize(255), location MaxSize(50), website ValidUrl, visibility
+ * In(public,limited,private)) are NOT mirrored as zod rejections: the
+ * contract declares only {200, 404} for PATCH /orgs/{org}, so an oversized or
+ * non-URL body would produce a runtime-only 4xx upstream sends as 422 (see
+ * routes/orgs.ts). The visibility enum IS mirrored — it is part of the
+ * contract schema, and an out-of-enum value dies in the request validator
+ * (documented runtime-only 400 divergence, routes/orgs.ts header).
+ */
+export const editOrgOptionSchema = z.object({
+  description: z.string().optional().openapi({ description: "The description of the organization" }),
+  email: z
+    .string()
+    .optional()
+    .openapi({ description: "The email address of the organization; use empty string to clear" }),
+  full_name: z.string().optional().openapi({ description: "The full display name of the organization" }),
+  location: z.string().optional().openapi({ description: "The location of the organization" }),
+  repo_admin_change_team_access: z
+    .boolean()
+    .optional()
+    .openapi({ description: "Whether repository administrators can change team access" }),
+  visibility: z
+    .enum(["public", "limited", "private"])
+    .optional()
+    .openapi({ description: "possible values are `public`, `limited` or `private`" }),
+  website: z.string().optional().openapi({ description: "The website URL of the organization" }),
+});
+
+export type EditOrgOption = z.infer<typeof editOrgOptionSchema>;

@@ -234,3 +234,146 @@ export const createRepoOptionSchema = z.object({
 });
 
 export type CreateRepoOption = z.infer<typeof createRepoOptionSchema>;
+
+/**
+ * Mirror of the vendored contract's `EditRepoOption`
+ * (#/definitions/EditRepoOption) — all 39 properties, field-for-field.
+ * `PATCH /repos/{owner}/{repo}` (repoEdit) applies the MEANINGFUL SUBSET the
+ * D1 registry can store today and accepts-and-ignores the rest, exactly like
+ * the converter's TODO(SPEC-0005) zero-defaults (routes/repo.ts documents
+ * both halves):
+ *  - applied: `name` (rename via the landed repos service), `description`,
+ *    `website`, `private` (visibility flip), `default_branch` (D1 value +
+ *    best-effort engine setHead), `archived`, and the has_* unit flags that
+ *    drive the 412 feature gates (`has_issues`/`has_wiki`/`has_pull_requests`
+ *    /`has_releases`/`has_projects`/`has_packages`/`has_actions` via
+ *    services/repo-settings.ts);
+ *  - accepted-and-ignored (no store yet — SPEC-0005 sweep): the PR-merge
+ *    configuration flags, `template`, `projects_mode`,
+ *    `ignore_whitespace_conflicts`, `default_*_merge_style` family,
+ *    `squash_merge_commit_message`, `autodetect_manual_merge`,
+ *    `default_allow_maintainer_edit`, `default_delete_branch_after_merge`,
+ *    `has_code`, and the mirror fields (`mirror_interval`, `enable_prune`,
+ *    `mirror_username`/`mirror_password`/`mirror_token`);
+ *  - the `external_tracker`/`external_wiki`/`internal_tracker` objects are
+ *    accepted per shape and ignored the same way.
+ */
+export const editRepoOptionSchema = z.object({
+  allow_fast_forward_only_merge: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to allow fast-forward-only merging pull requests, or `false` to prevent fast-forward-only merging." }),
+  allow_manual_merge: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to allow mark pr as merged manually, or `false` to prevent it." }),
+  allow_merge_commits: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to allow merging pull requests with a merge commit, or `false` to prevent merging pull requests with merge commits." }),
+  allow_merge_update: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to allow updating pull request branch by merge, or `false` to prevent it." }),
+  allow_rebase: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to allow rebase-merging pull requests, or `false` to prevent rebase-merging." }),
+  allow_rebase_explicit: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to allow rebase with explicit merge commits (--no-ff), or `false` to prevent rebase with explicit merge commits." }),
+  allow_rebase_update: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to enable updating pull request branch by rebase, or `false` to prevent it." }),
+  allow_squash_merge: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to allow squash-merging pull requests, or `false` to prevent squash-merging." }),
+  archived: z.boolean().optional().openapi({ description: "set to `true` to archive this repository." }),
+  autodetect_manual_merge: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to enable AutodetectManualMerge, or `false` to prevent it. Note: In some special cases, misjudgments can occur." }),
+  default_allow_maintainer_edit: z
+    .boolean()
+    .optional()
+    .openapi({ description: "set to `true` to allow edits from maintainers by default" }),
+  default_branch: z.string().optional().openapi({ description: "sets the default branch for this repository." }),
+  default_delete_branch_after_merge: z
+    .boolean()
+    .optional()
+    .openapi({ description: "set to `true` to delete pr branch after merge by default" }),
+  default_merge_style: z
+    .string()
+    .optional()
+    .openapi({ description: 'set to a merge style to be used by this repository: "merge", "rebase", "rebase-merge", "squash", or "fast-forward-only".' }),
+  default_update_style: z
+    .string()
+    .optional()
+    .openapi({ description: 'set to an update style to be used by this repository: "merge" or "rebase".' }),
+  description: z.string().optional().openapi({ description: "a short description of the repository." }),
+  enable_prune: z
+    .boolean()
+    .optional()
+    .openapi({ description: "enable prune - remove obsolete remote-tracking references when mirroring" }),
+  external_tracker: externalTrackerSchema.optional(),
+  external_wiki: externalWikiSchema.optional(),
+  has_actions: z.boolean().optional().openapi({ description: "either `true` to enable actions unit, or `false` to disable them." }),
+  has_code: z.boolean().optional().openapi({ description: "either `true` to enable code for this repository or `false` to disable it." }),
+  has_issues: z.boolean().optional().openapi({ description: "either `true` to enable issues for this repository or `false` to disable them." }),
+  has_packages: z.boolean().optional().openapi({ description: "either `true` to enable packages unit, or `false` to disable them." }),
+  has_projects: z.boolean().optional().openapi({ description: "either `true` to enable project unit, or `false` to disable them." }),
+  has_pull_requests: z.boolean().optional().openapi({ description: "either `true` to allow pull requests, or `false` to prevent pull request." }),
+  has_releases: z.boolean().optional().openapi({ description: "either `true` to enable releases unit, or `false` to disable them." }),
+  has_wiki: z.boolean().optional().openapi({ description: "either `true` to enable the wiki for this repository or `false` to disable it." }),
+  ignore_whitespace_conflicts: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to ignore whitespace for conflicts, or `false` to not ignore whitespace." }),
+  internal_tracker: internalTrackerSchema.optional(),
+  mirror_interval: z
+    .string()
+    .optional()
+    .openapi({ description: "set to a string like `8h30m0s` to set the mirror interval time" }),
+  mirror_password: z.string().optional().openapi({ description: "authentication password for the remote repository (mirrors)" }),
+  mirror_token: z.string().optional().openapi({ description: "authentication token for the remote repository (mirrors)" }),
+  mirror_username: z.string().optional().openapi({ description: "authentication username for the remote repository (mirrors)" }),
+  name: z.string().optional().openapi({ description: "name of the repository" }),
+  private: z
+    .boolean()
+    .optional()
+    .openapi({ description: "either `true` to make the repository private or `false` to make it public. Note: you will get a 422 error if the repository attempts to private." }),
+  projects_mode: z
+    .string()
+    .optional()
+    .openapi({ description: "`repo` to only allow repo-level projects, `owner` to only allow owner projects, `all` to allow both." }),
+  squash_merge_commit_message: z
+    .string()
+    .optional()
+    .openapi({ description: 'set the default squash merge commit message body: "PR_BODY", "COMMIT_MESSAGES", or "BLANK".' }),
+  template: z.boolean().optional().openapi({ description: "either `true` to make this repository a template or `false` to make it a normal repository" }),
+  website: z.string().optional().openapi({ description: "a URL with more information about the repository." }),
+});
+
+export type EditRepoOption = z.infer<typeof editRepoOptionSchema>;
+
+/**
+ * Mirror of the vendored contract's `TransferRepoOption`
+ * (#/definitions/TransferRepoOption) — `new_owner` is the one required field.
+ * `team_ids` is accepted per shape; teams land with SPEC-0007 (the route
+ * answers the upstream `team %d not found` 422 while none exist).
+ */
+export const transferRepoOptionSchema = z.object({
+  new_owner: z.string().openapi({ description: "The new owner's name" }),
+  team_ids: z
+    .array(z.number().int().openapi({ format: "int64" }))
+    .optional()
+    .openapi({
+      description:
+        "ID of the team or teams to add to the repository. Teams can only be added to organization-owned repositories.",
+    }),
+});
+
+export type TransferRepoOption = z.infer<typeof transferRepoOptionSchema>;

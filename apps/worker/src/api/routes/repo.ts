@@ -3,13 +3,35 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+
+import { repositories } from "../../db/schema";
+import {
+  OwnerNotAssignableError,
+  RepoNameCollisionError,
+  RepoNameInvalidError,
+  RepoService,
+} from "../../repos/service";
+import { tombstoneRepoDO } from "../../repos/purge";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
-import { repositorySchema, searchResultsSchema } from "../models/repository";
+import {
+  editRepoOptionSchema,
+  repositorySchema,
+  searchResultsSchema,
+  transferRepoOptionSchema,
+} from "../models/repository";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { requireRepoAdmin, requireRepoDangerZone, requireVisibleRepo } from "../services/repo-access";
+import { deleteRepoCollaborators } from "../services/repo-collaborators";
+import { deleteRepoSettings, loadRepoSettings, saveRepoSettings, type RepoSettings } from "../services/repo-settings";
+import { deleteRepoTopics } from "../services/repo-topics";
+import { deleteRepoWatchers } from "../services/repo-watchers";
 import {
   findRepositoryById,
   findRepositoryByPath,
+  findUserByName,
   formBool,
   formBoolValue,
   formInt64,
@@ -23,14 +45,26 @@ import {
 } from "../services/repository";
 
 /**
- * Tier-1 `repository`-tagged repo-metadata reads (SPEC-0004 §2.4):
- * `GET /repos/{owner}/{repo}` (repoGet), `GET /repos/search` (repoSearch),
- * `GET /repositories/{id}` (repoGetByID).
+ * Tier-1 `repository`-tagged repo-metadata routes (SPEC-0004 §2.4 rows:
+ * repoGet / repoSearch / repoGetByID / repoEdit / repoDelete / repoTransfer).
  *
  * 404s follow the upstream anti-enumeration rule: a missing repository and a
  * private repository invisible to the requester are indistinguishable
  * (APIErrorNotFound → `{message: "not found", url}` at runtime; the vendored
  * contract declares the notFound response body-less — SPEC-0004 §2.5 quirk).
+ *
+ * repoEdit applies the meaningful EditRepoOption subset (the model file
+ * documents the accepted-and-ignored remainder): rename via the landed
+ * repos service, visibility flip, default branch (D1 + best-effort engine
+ * setHead), archived flip, and the stored settings subset; upstream registers
+ * NO mustNotBeArchived on this PATCH, so 423 is never emitted here.
+ * repoDelete runs the landed §2.5.5 pipeline (D1 cascade → DO tombstone →
+ * queue purge) plus the raw-D1 housekeeping of this batch's tables.
+ * repoTransfer files the pending `repo_transfer` row via the repos service
+ * and answers the SPEC-pinned async 202 (SPEC-0004 §2.4: "202 Accepted —
+ * async, pending transfer; not the final state"; upstream's synchronous
+ * 201-on-immediate-transfer path needs the team machinery this instance
+ * defers, and its pending-transfer 201 would contradict the contract).
  */
 
 const notFoundResponse = {
@@ -174,6 +208,120 @@ function getRepoByIdRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
   });
 }
 
+/**
+ * `PATCH /repos/{owner}/{repo}` — upstream `reqToken + reqAdmin` (api.go:1245,
+ * NO mustNotBeArchived on this PATCH), 200 → the edited Repository.
+ * Declared responses: {200, 403, 404, 422}.
+ */
+function editRepoRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
+  return createRoute({
+    method: "patch",
+    path: "/repos/{owner}/{repo}",
+    middleware: [requireAuth],
+    tags: ["repository"],
+    summary: "Edit a repository's properties. Only fields that are set will be changed.",
+    operationId: "repoEdit",
+    request: {
+      params: z.object({
+        owner: z.string().min(1).openapi({ description: "owner of the repo to edit" }),
+        repo: z.string().min(1).openapi({ description: "name of the repo to edit" }),
+      }),
+      body: { content: { "application/json": { schema: editRepoOptionSchema } } },
+    },
+    responses: {
+      200: {
+        description: "Repository",
+        content: { "application/json": { schema: repositorySchema } },
+      },
+      403: {
+        description: "forbidden",
+        content: { "application/json": { schema: apiErrorSchema } },
+      },
+      404: notFoundResponse,
+      422: {
+        description: "validationError",
+        content: { "application/json": { schema: apiErrorSchema } },
+      },
+    },
+  });
+}
+
+/**
+ * `DELETE /repos/{owner}/{repo}` — upstream `reqToken + reqRepoDangerZone`
+ * (api.go:1244), 204; the engine-backed storage purge rides the landed
+ * §2.5.5 pipeline. Declared responses: {204, 403, 404}.
+ */
+function deleteRepoRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
+  return createRoute({
+    method: "delete",
+    path: "/repos/{owner}/{repo}",
+    middleware: [requireAuth],
+    tags: ["repository"],
+    summary: "Delete a repository",
+    operationId: "repoDelete",
+    request: {
+      params: z.object({
+        owner: z.string().min(1).openapi({ description: "owner of the repo to delete" }),
+        repo: z.string().min(1).openapi({ description: "name of the repo to delete" }),
+      }),
+    },
+    responses: {
+      204: { description: "empty" },
+      403: {
+        description: "forbidden",
+        content: { "application/json": { schema: apiErrorSchema } },
+      },
+      404: notFoundResponse,
+    },
+  });
+}
+
+/**
+ * `POST /repos/{owner}/{repo}/transfer` — upstream `reqToken +
+ * reqRepoDangerZone` (api.go:1246–1249), **202 Accepted** with the
+ * Repository (SPEC-0004 §2.4: async, pending transfer). Declared responses:
+ * {202, 403, 404, 422}.
+ */
+const transferRepoRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+  createRoute({
+    method: "post",
+    path: "/repos/{owner}/{repo}/transfer",
+    middleware: [requireAuth],
+    tags: ["repository"],
+    summary: "Transfer a repo ownership",
+    operationId: "repoTransfer",
+    request: {
+      params: z.object({
+        owner: z.string().min(1).openapi({ description: "owner of the repo to transfer" }),
+        repo: z.string().min(1).openapi({ description: "name of the repo to transfer" }),
+      }),
+      body: { content: { "application/json": { schema: transferRepoOptionSchema } } },
+    },
+    responses: {
+      202: {
+        description: "Repository",
+        content: { "application/json": { schema: repositorySchema } },
+      },
+      403: {
+        description: "forbidden",
+        content: { "application/json": { schema: apiErrorSchema } },
+      },
+      404: notFoundResponse,
+      422: {
+        description: "validationError",
+        content: { "application/json": { schema: apiErrorSchema } },
+      },
+    },
+  });
+
+/** Body bind hook: upstream's Go bind answers malformed bodies with 422. */
+const repoBodyHook = ({ success }: { success: boolean }): undefined => {
+  if (!success) {
+    throw new ApiError(422, "invalid request body");
+  }
+  return undefined;
+};
+
 /** Throws the upstream 422 for `mode` values outside the contract enum. */
 function validateSearchMode(raw: string): "fork" | "source" | "mirror" | "collaborative" | "" {
   switch (raw) {
@@ -208,7 +356,11 @@ export function registerRepoRoutes(
       // Missing and invisible are the same 404 upstream (anti-enumeration).
       throw new ApiError(404, "not found");
     }
-    return c.json(toApiRepository(viewer, found), 200);
+    // Single-repo renders overlay the stored repo-edit subset (PATCH→GET
+    // round trip); list/search paths keep the defaults (the settings row is
+    // the not-yet-swept column store — see toApiRepository).
+    const settings = await loadRepoSettings(c.env.DB, found.repo.id);
+    return c.json(toApiRepository(viewer, found, settings), 200);
   });
 
   app.openapi(searchReposRoute(optionalAuth), async (c) => {
@@ -247,6 +399,155 @@ export function registerRepoRoutes(
     if (found === null || !canViewRepository(viewer, found.repo)) {
       throw new ApiError(404, "not found");
     }
-    return c.json(toApiRepository(viewer, found), 200);
+    const settings = await loadRepoSettings(c.env.DB, found.repo.id);
+    return c.json(toApiRepository(viewer, found, settings), 200);
   });
+
+  // -------------------------------------------------------------------------
+  // PATCH /repos/{owner}/{repo} (repoEdit) — the meaningful-subset edit.
+  // -------------------------------------------------------------------------
+  app.openapi(
+    editRepoRoute(requireAuth),
+    async (c) => {
+      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireRepoAdmin(c, found);
+      // Upstream registers NO mustNotBeArchived on this PATCH (api.go:1245).
+      const form = c.req.valid("json");
+      const service = new RepoService(c.env.DB);
+      const now = new Date();
+
+      // Name: rename only on a case-insensitive change (upstream
+      // `!strings.EqualFold(lower_name, newName)`); invalid/reserved names
+      // and collisions are the declared 422s (updateBasicProperties).
+      if (form.name !== undefined && form.name.toLowerCase() !== found.repo.slug) {
+        try {
+          await service.rename(found.repo.id, form.name);
+        } catch (error) {
+          if (error instanceof RepoNameInvalidError || error instanceof RepoNameCollisionError) {
+            throw new ApiError(422, error.message);
+          }
+          throw error;
+        }
+      }
+
+      // Private flip (forks cannot exist yet — no base-repo sync needed).
+      if (form.private !== undefined && form.private !== (found.repo.visibility === "private")) {
+        await service.setVisibility(found.repo.id, form.private);
+      }
+
+      // Default branch: D1 value + the engine setHead best-effort (the
+      // service logs, never throws). DEVIATION documented: upstream gates the
+      // change on branch existence (an engine read) or an empty repo; ours
+      // applies and lets the engine's own setHead guard reject unknown
+      // branches engine-side while D1 keeps the metadata.
+      if (form.default_branch !== undefined && form.default_branch !== found.repo.defaultBranch) {
+        await service.setDefaultBranch(found.repo.id, form.default_branch);
+      }
+
+      // Archived flip (repositories.is_archived, SPEC-0003 §2.4 row 10).
+      if (form.archived !== undefined && form.archived !== found.repo.isArchived) {
+        await drizzle(c.env.DB)
+          .update(repositories)
+          .set({ isArchived: form.archived, updatedAt: now })
+          .where(eq(repositories.id, found.repo.id));
+      }
+
+      // The stored settings subset: description/website + has_* unit flags.
+      const settingsPatch: Partial<RepoSettings> = {};
+      if (form.description !== undefined) settingsPatch.description = form.description;
+      if (form.website !== undefined) settingsPatch.website = form.website;
+      if (form.has_issues !== undefined) settingsPatch.hasIssues = form.has_issues;
+      if (form.has_wiki !== undefined) settingsPatch.hasWiki = form.has_wiki;
+      if (form.has_pull_requests !== undefined) settingsPatch.hasPullRequests = form.has_pull_requests;
+      if (form.has_releases !== undefined) settingsPatch.hasReleases = form.has_releases;
+      if (form.has_projects !== undefined) settingsPatch.hasProjects = form.has_projects;
+      if (form.has_packages !== undefined) settingsPatch.hasPackages = form.has_packages;
+      if (form.has_actions !== undefined) settingsPatch.hasActions = form.has_actions;
+      if (Object.keys(settingsPatch).length > 0) {
+        await saveRepoSettings(c.env.DB, found.repo.id, settingsPatch, now);
+      }
+
+      // Re-render through the same converter as GET (the rename may have
+      // moved the row's slug; the settings read picks up this PATCH's write).
+      const fresh = await findRepositoryByPath(
+        c.env.DB,
+        found.repo.ownerNamespace,
+        form.name !== undefined ? form.name.toLowerCase() : found.repo.slug,
+      );
+      if (fresh === null) {
+        throw new ApiError(404, "not found"); // unreachable: the row survived the edit
+      }
+      const settings = await loadRepoSettings(c.env.DB, found.repo.id);
+      const viewer = viewerOf(c);
+      return c.json(toApiRepository(viewer, fresh, settings), 200);
+    },
+    repoBodyHook,
+  );
+
+  // -------------------------------------------------------------------------
+  // DELETE /repos/{owner}/{repo} (repoDelete) — the landed §2.5.5 pipeline.
+  // -------------------------------------------------------------------------
+  app.openapi(deleteRepoRoute(requireAuth), async (c) => {
+    const found = await requireVisibleRepo(c, c.req.valid("param"));
+    await requireRepoDangerZone(c, found);
+    // Housekeeping for this batch's raw-D1 stores FIRST (the repos service's
+    // cascade cannot see them until the migration owner's sweep lands —
+    // services/repo-*.ts document the gap).
+    await Promise.all([
+      deleteRepoTopics(c.env.DB, found.repo.id),
+      deleteRepoWatchers(c.env.DB, found.repo.id),
+      deleteRepoCollaborators(c.env.DB, found.repo.id),
+      deleteRepoSettings(c.env.DB, found.repo.id),
+    ]);
+    // Then the landed pipeline: D1 cascade → DO tombstone → queue purge.
+    await new RepoService(c.env.DB, {
+      registry: c.env.REGISTRY.getByName("registry"),
+      queue: c.env.REPO_TASKS,
+      tombstone: (engineName) => tombstoneRepoDO(c.env, engineName),
+    }).deleteRepository(found.repo.id);
+    return c.body(null, 204);
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /repos/{owner}/{repo}/transfer (repoTransfer) — 202 + pending row.
+  // -------------------------------------------------------------------------
+  app.openapi(
+    transferRepoRoute(requireAuth),
+    async (c) => {
+      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireRepoDangerZone(c, found);
+      const form = c.req.valid("json");
+
+      // The new owner must exist: upstream answers the anti-enumeration 404
+      // message for missing (and invisible org) targets (transfer.go:60–73).
+      const target = await findUserByName(c.env.DB, form.new_owner);
+      if (target === null) {
+        throw new ApiError(404, "The new owner does not exist or cannot be found");
+      }
+      // Teams land with SPEC-0007 — every id misses, in upstream's message
+      // shape (transfer.go:96–99; the non-org check fires first upstream,
+      // but with zero teams both reduce to the same 422).
+      if (form.team_ids !== undefined && form.team_ids.length > 0) {
+        throw new ApiError(422, `team ${form.team_ids[0]} not found`);
+      }
+
+      const requester = c.get("authUser");
+      try {
+        await new RepoService(c.env.DB).requestTransfer(found.repo.id, requester.id ?? 0, target.id);
+      } catch (error) {
+        if (error instanceof OwnerNotAssignableError) {
+          // Self-transfer and inactive targets: the declared 422 family.
+          throw new ApiError(422, error.message);
+        }
+        throw error;
+      }
+
+      // 202 + the CURRENT Repository — the transfer is pending, not applied
+      // (SPEC-0004 §2.4; acceptance is the tier-2 transfer/accept surface).
+      const viewer = viewerOf(c);
+      const settings = await loadRepoSettings(c.env.DB, found.repo.id);
+      return c.json(toApiRepository(viewer, found, settings), 202);
+    },
+    repoBodyHook,
+  );
 }
