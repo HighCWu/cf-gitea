@@ -55,6 +55,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # gen:icons reads committed svg bodies from the gitea/ submodule;
+          # required once src/index.ts imports ./ui (predev regenerates).
+          submodules: recursive
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -62,6 +66,8 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Generate UI icons
+        run: pnpm gen:icons
       - name: Dev vars (GIT_TOKEN=devtoken)
         run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
       - name: Start dev Worker (vite dev, workerd)
@@ -145,6 +151,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Same as e2e: the dev server loads the ui module graph once wired.
+          submodules: recursive
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
