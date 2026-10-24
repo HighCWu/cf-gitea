@@ -279,6 +279,32 @@ beforeAll(async () => {
     commentB: commentB.id,
     closeComment: closeCommentRow?.id ?? 0,
   });
+
+  // PR-block seeds (SPEC-0005 §2.4 discipline): two same-repo PRs through the
+  // landed service (drawn from the SAME shared counter as the issues above),
+  // one of them dedicated to the PATCH scenario.
+  const pullA = await issuesService.createPullRequest({
+    repoId: SHARED_REPO_ID,
+    title: "compat alpha pull",
+    content: "seeded by the compat suite",
+    posterId: ownerId,
+    headRepoId: SHARED_REPO_ID,
+    baseBranch: "main",
+    headBranch: "compat-topic",
+  });
+  const pullB = await issuesService.createPullRequest({
+    repoId: SHARED_REPO_ID,
+    title: "compat beta pull",
+    posterId: ownerId,
+    headRepoId: SHARED_REPO_ID,
+    baseBranch: "main",
+    headBranch: "compat-topic-2",
+  });
+
+  Object.assign(seeds, {
+    pullA: pullA.issue.index,
+    pullB: pullB.issue.index,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -603,6 +629,89 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       name: "closed issue timeline (comment + close)",
       status: 200,
       request: (ctx) => ({ path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueC)}/timeline` }),
+    },
+  ],
+
+  // ---------------------------------------------------------------------
+  // PR block (SPEC-0004 §2.4 rows repoListPullRequests …
+  // repoGetPullRequestByBaseHead). Scenario order mirrors the fixture
+  // order: list/create first, then the {index}/{base}/{head} paths. The
+  // engine-backed siblings ({index}.{diffType}, /commits, /files, /merge)
+  // stay unimplemented (DECLARED-BUT-DEFERRED with specs/0001b).
+  // ---------------------------------------------------------------------
+
+  repoListPullRequests: [
+    {
+      // state matches ONLY "open"/"closed" upstream — absent lists both.
+      name: "first page (absent state lists open+closed)",
+      status: 200,
+      linkRels: ["next", "last"],
+      request: (ctx) => ({ path: `${repoPath(ctx)}/pulls?limit=1` }),
+    },
+  ],
+  repoCreatePullRequest: [
+    {
+      name: "create",
+      status: 201,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/pulls`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ title: "compat-created pull", body: "created by the compat suite", head: "compat-created", base: "main" }),
+        }),
+      }),
+    },
+    {
+      name: "head equals base → declared 422",
+      status: 422,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/pulls`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ title: "x", head: "main", base: "main" }),
+        }),
+      }),
+    },
+  ],
+  repoGetPullRequest: [
+    {
+      name: "seeded pull",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/pulls/${String(ctx.seeds.pullA)}` }),
+    },
+    {
+      name: "missing index → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/pulls/999` }),
+    },
+  ],
+  repoEditPullRequest: [
+    {
+      // PATCH answers 201 upstream (the quirk the fixture records).
+      name: "edit the seeded pull (201 quirk)",
+      status: 201,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/pulls/${String(ctx.seeds.pullA)}`,
+        init: ctx.withAuth({
+          method: "PATCH",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ title: "compat alpha pull (edited)" }),
+        }),
+      }),
+    },
+  ],
+  repoGetPullRequestByBaseHead: [
+    {
+      name: "seeded base/head",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/pulls/main/compat-topic` }),
+    },
+    {
+      name: "missing targets → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/pulls/main/ghost` }),
     },
   ],
 
