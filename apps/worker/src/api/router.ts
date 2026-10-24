@@ -9,11 +9,13 @@ import {
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
 import { registerHookRoutes } from "./routes/hooks";
+import { registerImportRoutes } from "./routes/imports";
 import { registerIssueRoutes } from "./routes/issues";
 import { registerLabelRoutes } from "./routes/labels";
 import { registerMarkdownRoutes } from "./routes/markdown";
 import { registerMilestoneRoutes } from "./routes/milestones";
 import { registerOrgRoutes } from "./routes/org-repos";
+import { registerPullRoutes } from "./routes/pulls";
 import { registerRepoRoutes } from "./routes/repo";
 import { registerStatusRoutes } from "./routes/statuses";
 import { registerUserReposRoutes } from "./routes/user-repos";
@@ -55,6 +57,11 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // `m.Get("/issues/search", …)` before the `/{username}/{reponame}` group —
   // static-over-param precedence, routers/api/v1/api.go).
   registerIssueRoutes(app, requireAuth, optionalAuth);
+  // PR routes ride the issue services; `/repos/{owner}/{repo}/pulls/{index}`
+  // (one segment) and `…/pulls/{base}/{head}` (two segments) never collide,
+  // and the static `/repos/issues/search` above still wins its precedence
+  // battle before the `{owner}` params.
+  registerPullRoutes(app, requireAuth, optionalAuth);
   registerRepoRoutes(app, requireAuth, optionalAuth);
   registerStatusRoutes(app, requireAuth, optionalAuth);
   registerLabelRoutes(app, requireAuth, optionalAuth);
@@ -62,6 +69,11 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerHookRoutes(app, requireAuth);
   registerOrgRoutes(app, requireAuth, optionalAuth);
   registerMarkdownRoutes(app, requireAuth);
+  // SPEC-0003 §2.6 import channel: plain Hono routes OUTSIDE the generated
+  // OpenAPI document (the SPEC declares the surface here, swagger-shaped in
+  // 0004 — see routes/imports.ts). Registration order is irrelevant: the
+  // paths are import-family-specific and collide with nothing above.
+  registerImportRoutes(app, requireAuth);
 
   return app;
 }

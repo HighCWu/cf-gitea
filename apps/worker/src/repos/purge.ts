@@ -25,6 +25,8 @@
  * (current + redirected renames/transfers re-seed fresh cells).
  */
 
+import { handleImportTask, isImportMessage } from "./imports/pipeline";
+
 /** Queue message (REPO_TASKS): what the delete pipeline must purge.
  *  `storageKey` (r_<id>) names the R2 prefixes; `engineNames` is every
  *  combined name the repo was known by (current + redirected) — each names
@@ -108,15 +110,33 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
 }
 
 /**
- * REPO_TASKS consumer. Per message: tombstone every engine name (retry of a
- * step-2 failure is a no-op), purge the storage-key R2 prefixes, then destroy
- * every engine name as the FINAL step. Per AGENTS.md, storage errors never
- * fail the user-facing delete — they surface here as queue retries, and
- * after max_retries land in the queue's dead-letter handling (the
- * admin-notice equivalent).
+ * REPO_TASKS consumer. Two message families share the queue (both serialized:
+ * max_batch_size=1 + max_concurrency=1, SPEC-0003 §3.3):
+ *
+ *   - repo delete purges ({storageKey, engineNames}): tombstone every engine
+ *     name, purge the storage-key R2 prefixes, then destroy — in that order,
+ *     per SPEC-0003 §2.5.5.
+ *   - import tasks ({kind: import-chunk|import-abort|import-sweep, …},
+ *     SPEC-0003 §2.6): the chunked import pipeline (src/repos/imports/).
+ *
+ * Per message: idempotent work, then ack; a throw retries THAT message (the
+ * redelivery re-runs the idempotent steps). Storage errors never fail the
+ * user-facing delete — they surface here as queue retries, and after
+ * max_retries land in the queue's dead-letter handling (the admin-notice
+ * equivalent).
  */
 export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): Promise<void> {
   for (const message of batch.messages) {
+    if (isImportMessage(message.body)) {
+      try {
+        await handleImportTask(env, message.body);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] import task ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
     if (!isRepoPurgeMessage(message.body)) {
       console.error(`[repo-tasks] dropping malformed purge message ${message.id}`);
       message.ack();

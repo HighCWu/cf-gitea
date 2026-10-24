@@ -774,6 +774,74 @@ export const lfsObjects = sqliteTable(
 );
 
 // ---------------------------------------------------------------------------
+// SPEC-0003 §3.1/§2.6 — async chunked import channel (repo_imports).
+// ---------------------------------------------------------------------------
+
+/**
+ * One row per chunked import (SPEC-0003 §2.6, >1 GiB histories). State
+ * machine (`state`, D1-authoritative — the SPEC's DO-side
+ * `imports_checkpoints` awaits the engine's importCheckpoint/importFinalize
+ * RPCs, a documented ENGINE-WAVE gap; the D1 row carries the same
+ * information and the queue consumer is single-threaded per repo):
+ *
+ *   staged --start--> indexing --all chunks done--> finalizing --> done
+ *      \                  \                            \
+ *       \                  + chunk failure ------------> failed
+ *        + abort -----------------------------(purge)--> failed
+ *
+ * `manifest` is the start-time JSON contract ({head, refs, chunks,
+ * totalBytes}); `staged` is the upload-time JSON map (chunk index → {bytes,
+ * sha1}) recorded by the relay PUTs before the manifest exists. Chunk
+ * checkpoints mutate `manifest.chunks[i].status` in place under the
+ * `state='indexing'` CAS guard, so a concurrent abort makes every in-flight
+ * checkpoint a no-op (0 rows changed).
+ */
+export const repoImports = sqliteTable(
+  "repo_imports",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: text("repo_id").notNull(),
+    /** sha256 hex of the one-time import token (SPEC §3.1: hashed like PATs;
+     *  plaintext is returned once by the POST and never stored). Unique:
+     *  O(1) token → row resolution for the relay-chunk auth. */
+    importTokenSha256: text("import_token_sha256").notNull(),
+    /** 'staged' | 'indexing' | 'finalizing' | 'done' | 'failed' (§2.6). */
+    state: text("state", { enum: ["staged", "indexing", "finalizing", "done", "failed"] })
+      .notNull()
+      .default("staged"),
+    /** Start-time manifest JSON (ImportManifest) — null until start. */
+    manifest: text("manifest"),
+    /** Upload-time staged-chunk map JSON (Record<string, {bytes, sha1}>) —
+     *  cf-gitea extension beyond the SPEC's column sketch (the relay needs a
+     *  pre-manifest record of what landed; GET status exposes it). */
+    staged: text("staged"),
+    /** Chunk size cap frozen at POST time (bytes) — PUT/start enforce the
+     *  value the client was told, even if the instance limit changes
+     *  mid-import. */
+    chunkCap: integer("chunk_cap").notNull(),
+    /** Manifest-declared total (bytes); 0 until start. */
+    totalBytes: integer("total_bytes").notNull().default(0),
+    /** Terminal failure text (abort/failure reason). */
+    error: text("error"),
+    /** Consumer liveness (unix seconds); the 24 h sweep abandons on silence. */
+    heartbeatAt: integer("heartbeat_at", { mode: "timestamp" }),
+    createdAt: integer("created_at", { mode: "timestamp" })
+      .notNull()
+      .default(sql`(unixepoch())`),
+  },
+  (t) => [
+    uniqueIndex("repo_imports_token_uq").on(t.importTokenSha256),
+    index("repo_imports_repo_idx").on(t.repoId),
+    // §2.6 "one active import per repo": the partial unique index is the
+    // arbitration point — a second POST racing the first loses here (the
+    // whole create batch, repo status flip included, rolls back).
+    uniqueIndex("repo_imports_active_uq")
+      .on(t.repoId)
+      .where(sql`state IN ('staged', 'indexing', 'finalizing')`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // SPEC-0007 §3.3/§3.6 — org membership and user/org rename redirects.
 // ---------------------------------------------------------------------------
 
