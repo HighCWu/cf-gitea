@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Install once, then the three fast gates: typecheck, lint, unit tests
+  # (vitest in workerd with real bindings — @cloudflare/vitest-plugin).
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4 # version comes from package.json packageManager
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Dev vars (test suite authenticates with the dev token)
+        run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+      - name: Generate worker-configuration.d.ts (gitignored, never committed)
+        run: pnpm --filter cf-gitea-worker exec wrangler types
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Test
+        run: pnpm test
+      - name: API contract check (declared routes vs frozen contract, SPEC-0004 §5.1)
+        run: pnpm check:api
+      - name: "Contract freeze guard (ADR-0002: frozen copy verbatim + sha256)"
+        run: pnpm check:contract
+
+  # Real-git end-to-end suite (packages/git-engine/e2e/) against the dev
+  # Worker. Sections 8-11 (upstream dgit's web UI) and one headless-mode
+  # check in section 12 fail by design while the engine runs `ui: false` —
+  # they become Gitea-API-level checks in a later SPEC (see
+  # packages/git-engine/e2e/README.md). CI asserts the failure set stays
+  # EXACTLY that documented set: any new failing check fails the build.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Dev vars (GIT_TOKEN=devtoken)
+        run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+      - name: Start dev Worker (vite dev, workerd)
+        run: |
+          pnpm dev > /tmp/dev-server.log 2>&1 &
+          echo $! > /tmp/dev-server.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
+              echo "dev server up (attempt $i)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "dev server did not come up"; cat /tmp/dev-server.log; exit 1
+      - name: Run e2e suite
+        run: |
+          PATH="$PWD/packages/git-engine/e2e/shim:$PATH" \
+            packages/git-engine/e2e/e2e.sh http://127.0.0.1:5173/demo devtoken \
+            > /tmp/e2e.log 2>&1 || true
+          cat /tmp/e2e.log
+      - name: Check failures against the documented UI-section allowlist
+        run: |
+          # observed failures, reduced to check names (drop "(got ... want ...)")
+          grep '^FAIL:' /tmp/e2e.log | sed 's/ (got.*//' | sort > /tmp/observed.txt
+          cat > /tmp/allowed.txt <<'EOF'
+          FAIL: tar.gz extracts
+          FAIL: tar.gz content matches v1.0
+          FAIL: symlink preserved in tar
+          FAIL: zip extracts
+          FAIL: zip content matches
+          FAIL: git am applies /patch output
+          FAIL: am result tree == original commit
+          FAIL: git apply accepts /rawdiff output
+          FAIL: GET /demo/
+          FAIL: GET /demo/about/
+          FAIL: GET /demo/refs/
+          FAIL: GET /demo/log/
+          FAIL: GET /demo/log/?qt=author&q=two
+          FAIL: GET /demo/log/?path=docs/guide.txt
+          FAIL: GET /demo/tree/
+          FAIL: GET /demo/tree/lib/math.js
+          FAIL: GET /demo/blame/lib/math.js
+          FAIL: GET /demo/commit/
+          FAIL: GET /demo/diff/
+          FAIL: GET /demo/stats/
+          FAIL: GET /demo/stats/?period=w
+          FAIL: GET /demo/tag/?h=v1.0
+          FAIL: GET /demo/atom/
+          FAIL: about renders markdown h1
+          FAIL: about renders bold
+          FAIL: author search finds commit
+          FAIL: path-limited log
+          FAIL: syntax highlighting present
+          FAIL: blame page has attributions
+          FAIL: tag page shows message
+          FAIL: atom feed
+          FAIL: blob by id
+          FAIL: index shows description
+          FAIL: old-date-repo age reflects 2010 commit, not push time
+          FAIL: private UI needs auth
+          EOF
+          sort -o /tmp/allowed.txt /tmp/allowed.txt
+          if ! diff -u /tmp/allowed.txt /tmp/observed.txt; then
+            echo "::error::e2e failure set diverged from the documented allowlist (packages/git-engine/e2e/README.md)"
+            exit 1
+          fi
+          echo "failure set matches the documented allowlist"
+
+  # Benchmark regression stage (specs/0001-storage-engine.md §9): external
+  # metrics (clone MB/s, incremental-fetch ratio, push wall, info/refs p50/p95)
+  # per fixture size against the committed baseline in
+  # scripts/bench-baselines/, >10% regression fails the job (scripts/
+  # bench-run.mjs). Internal metrics (CPU-ms, peak memory, subrequests) stay
+  # null until the M2 Step 2 T3 instrumentation; a missing baseline file is
+  # report-only by design — per the deferred-baseline policy NO official
+  # baseline exists yet (the receive path is being rewritten in M2), the first
+  # one records when M2 Step 2 lands, so this job is green until then. Only
+  # the 5 MiB fixture runs here (42 MiB opt-in, 500 MiB never in CI) to keep
+  # the job at a few minutes; fixture generation (~1s for 5m) happens on first
+  # use since .bench-fixtures/ is gitignored.
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Dev vars (GIT_TOKEN=devtoken)
+        run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+      - name: Start dev Worker (vite dev, workerd)
+        run: |
+          pnpm dev > /tmp/dev-server.log 2>&1 &
+          echo $! > /tmp/dev-server.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
+              echo "dev server up (attempt $i)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "dev server did not come up"; cat /tmp/dev-server.log; exit 1
+      - name: Benchmark (compare vs m2-pre baseline; report-only until it records)
+        run: node scripts/bench-run.mjs --compare m2-pre --sizes 5m --base-url http://127.0.0.1:5173
+      - name: Upload benchmark results (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: .bench-results/
+          if-no-files-found: ignore
