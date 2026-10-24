@@ -367,17 +367,18 @@ export async function* parseMultipartParts(
   const delimiter = encoder.encode(`--${boundary}`);
   // Preamble: discard bytes until the first delimiter (keep a partial-
   // match tail so a delimiter split across chunks is still found).
-  let at = -1;
   for (;;) {
-    at = window.indexOf(delimiter, 0);
-    if (at !== -1) break;
+    const at = window.indexOf(delimiter, 0);
+    if (at !== -1) {
+      window.drop(at + delimiter.byteLength);
+      break;
+    }
     const retain = Math.min(window.buffered, delimiter.byteLength - 1);
     if (window.buffered > retain) window.drop(window.buffered - retain);
     if (!(await window.ensure(window.buffered + 1))) {
       throw new MalformedMultipartError("boundary never found");
     }
   }
-  window.drop(at + delimiter.byteLength);
 
     for (;;) {
       // After the delimiter: optional transport padding, then the closing
@@ -467,12 +468,12 @@ async function* readPartContent(window: ByteWindow, delimiter: Uint8Array): Asyn
 export function readableStreamFromGenerator(gen: AsyncGenerator<Uint8Array>): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
-      const { done, value } = await gen.next();
-      if (done || value === undefined) {
-        controller.close();
-      } else {
-        controller.enqueue(value);
+      const step = await gen.next();
+      if (step.done !== true) {
+        controller.enqueue(step.value);
+        return;
       }
+      controller.close();
     },
     cancel() {
       void gen.return(undefined);
@@ -652,7 +653,7 @@ async function streamIntoMultipartUpload(
   let partNumber = 1;
   let forwarded = 0;
   try {
-    let buffer = new Uint8Array(UPLOAD_PART_BYTES);
+    const buffer = new Uint8Array(UPLOAD_PART_BYTES);
     let filled = 0;
     const flush = async (): Promise<void> => {
       if (filled === 0) return;

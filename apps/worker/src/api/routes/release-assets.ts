@@ -12,7 +12,6 @@ import {
   AssetSizeMismatchError,
   AssetTooLargeError,
   MalformedMultipartError,
-  type MultipartPart,
   MAX_RELEASE_ASSET_BYTES,
   listReleaseAssets,
   parseMultipartParts,
@@ -202,59 +201,62 @@ export function registerReleaseAssetRoutes(
     const contentType = request.headers.get("content-type") ?? "";
     const declaredLength = contentLength(request);
 
-    let filenameFromPart: string | null = null;
-    let nameField: string | null = null;
-    let content: ReadableStream<Uint8Array> | null = null;
-    let multipart = false;
-    const boundary = multipartBoundary(contentType);
-    if (boundary !== null) {
-      // multipart/form-data: the `attachment` file part carries the bytes
-      // (its filename names the asset unless `name` overrides). The parts
-      // stream is consumed sequentially; once the file part is captured the
-      // loop breaks (single-pass — the body tail is not parsed, so a `name`
-      // field is honored only when it precedes the attachment part; the
-      // contract's `?name=` query always wins and is order-independent).
-      multipart = true;
-      for await (const part of parseMultipartParts(ensureBody(request), boundary)) {
-        if (part.name === "attachment" && content === null) {
-          filenameFromPart = part.filename;
-          content = readableStreamFromGenerator(part.content);
-          break;
-        }
-        if (part.name === "name") {
-          const text = await readTextFieldPart(part);
-          if (text !== "") nameField = text;
-        } else {
-          await readTextFieldPart(part); // drain unknown fields
-        }
-      }
-    } else {
-      // octet-stream (any non-multipart type, upstream's else branch): the
-      // body IS the asset; ?name= is the only name source.
-      content = ensureBody(request);
-    }
-
-    // Upstream name priority: the query (`FormString` reads the URL query
-    // first), then the multipart `name` field, then the file part's filename.
-    const name = queryName !== "" ? queryName : (nameField ?? filenameFromPart);
-    if (name === null || name === "") {
-      throw new ApiError(400, "Could not determine name of attachment.");
-    }
-    if (content === null) {
-      // A multipart body with no `attachment` part (upstream FormFile fails
-      // with an internal error; ours keeps the request-scoped failure class).
-      throw new ApiError(400, "no attachment file in request");
-    }
-    // 413 before streaming when the length is known (SPEC-0005 §3.3);
-    // 411 when it is not (the relay-store Content-Length discipline).
-    if (declaredLength === null) {
-      throw new ApiError(411, "Content-Length header is required");
-    }
-    if (declaredLength > MAX_RELEASE_ASSET_BYTES) {
-      throw new ApiError(413, "attachment is too large");
-    }
-
+    // Both the multipart scan and the streaming upload fail with the typed
+    // Asset*Error classes — map them onto the upstream status family here so
+    // the handlers above stay parse-only.
     try {
+      let filenameFromPart: string | null = null;
+      let nameField: string | null = null;
+      let content: ReadableStream<Uint8Array> | null = null;
+      let multipart = false;
+      const boundary = multipartBoundary(contentType);
+      if (boundary !== null) {
+        // multipart/form-data: the `attachment` file part carries the bytes
+        // (its filename names the asset unless `name` overrides). The parts
+        // stream is consumed sequentially; once the file part is captured the
+        // loop breaks (single-pass — the body tail is not parsed, so a `name`
+        // field is honored only when it precedes the attachment part; the
+        // contract's `?name=` query always wins and is order-independent).
+        multipart = true;
+        for await (const part of parseMultipartParts(ensureBody(request), boundary)) {
+          if (part.name === "attachment" && content === null) {
+            filenameFromPart = part.filename;
+            content = readableStreamFromGenerator(part.content);
+            break;
+          }
+          if (part.name === "name") {
+            const text = await readTextFieldPart(part);
+            if (text !== "") nameField = text;
+          } else {
+            await readTextFieldPart(part); // drain unknown fields
+          }
+        }
+      } else {
+        // octet-stream (any non-multipart type, upstream's else branch): the
+        // body IS the asset; ?name= is the only name source.
+        content = ensureBody(request);
+      }
+
+      // Upstream name priority: the query (`FormString` reads the URL query
+      // first), then the multipart `name` field, then the part filename.
+      const name = queryName !== "" ? queryName : (nameField ?? filenameFromPart);
+      if (name === null || name === "") {
+        throw new ApiError(400, "Could not determine name of attachment.");
+      }
+      if (content === null) {
+        // A multipart body with no `attachment` part (upstream FormFile fails
+        // with an internal error; ours keeps the request-scoped failure class).
+        throw new ApiError(400, "no attachment file in request");
+      }
+      // 413 before streaming when the length is known (SPEC-0005 §3.3);
+      // 411 when it is not (the relay-store Content-Length discipline).
+      if (declaredLength === null) {
+        throw new ApiError(411, "Content-Length header is required");
+      }
+      if (declaredLength > MAX_RELEASE_ASSET_BYTES) {
+        throw new ApiError(413, "attachment is too large");
+      }
+
       const row = await uploadReleaseAsset({
         bucket: c.env.REPO_PACKS,
         d1: c.env.DB,
@@ -269,11 +271,9 @@ export function registerReleaseAssetRoutes(
       });
       return c.json(toApiAttachment(new URL(c.req.url).origin, row), 201);
     } catch (error) {
+      if (error instanceof ApiError) throw error;
       const mapped = assetErrorToApiError(error);
-      if (mapped !== undefined) {
-        throw mapped;
-      }
-      throw error;
+      throw mapped ?? error;
     }
   });
 }
@@ -281,7 +281,19 @@ export function registerReleaseAssetRoutes(
 /** The request body — a zero-byte stream when absent (a Content-Length: 0
  *  POST upstream creates a 0-byte attachment; keep that behavior). */
 function ensureBody(request: Request): ReadableStream<Uint8Array> {
-  return request.body ?? new Blob([]).stream();
+  // The platform types the body's element as `any`; the wire contract here is
+  // bytes, and the zero-byte stand-in covers a body-less Content-Length: 0 POST.
+  const body = request.body as ReadableStream<Uint8Array> | null;
+  return body ?? emptyStream();
+}
+
+/** A closed zero-byte stream. */
+function emptyStream(): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.close();
+    },
+  });
 }
 
 /** The declared Content-Length (null when absent or not a valid integer). */

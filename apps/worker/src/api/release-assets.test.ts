@@ -72,14 +72,34 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
     .join("");
 }
 
-async function storedBytes(key: string): Promise<Uint8Array | null> {
+async function storedBytes(key: string): Promise<Uint8Array> {
   const stored = await env.REPO_PACKS.get(key);
-  return stored === null ? null : new Uint8Array(await stored.arrayBuffer());
+  if (stored === null) throw new Error(`missing R2 object: ${key}`);
+  return new Uint8Array(await stored.arrayBuffer());
 }
 
-async function storedSize(key: string): Promise<number | null> {
+async function storedSize(key: string): Promise<number> {
   const head = await env.REPO_PACKS.head(key);
-  return head === null ? null : head.size;
+  if (head === null) throw new Error(`missing R2 object: ${key}`);
+  return head.size;
+}
+
+/** A one-shot byte stream (typed; Blob.stream() is ReadableStream<any>). */
+function streamOf(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+/** The single row of a one-row result (test-failure when not exactly one). */
+function only<T>(rows: T[]): T {
+  expect(rows).toHaveLength(1);
+  const row = rows[0];
+  if (row === undefined) throw new Error("expected exactly one row");
+  return row;
 }
 
 /** Every object key under the test repo's asset prefix. */
@@ -101,7 +121,9 @@ function multipartBody(
   parts: { name: string; filename?: string; body: string }[],
 ): { bytes: Uint8Array; contentType: string } {
   const chunks: Uint8Array[] = [];
-  const push = (text: string): void => chunks.push(new TextEncoder().encode(text));
+  const push = (text: string): void => {
+    chunks.push(new TextEncoder().encode(text));
+  };
   for (const part of parts) {
     push(`--${boundary}\r\n`);
     push(`Content-Disposition: form-data; name="${part.name}"`);
@@ -177,6 +199,9 @@ beforeEach(async () => {
   });
   await new IssuesService(env.DB).ensureRepoCounters(REPO_ID);
   await addOrUpdateCollaborator(env.DB, REPO_ID, 2, "read", new Date("2026-02-03T04:05:06Z"));
+  for (const key of await listAssetKeys()) {
+    await env.REPO_PACKS.delete(key);
+  }
 });
 
 describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAttachment)", () => {
@@ -185,7 +210,11 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
     const payload = new TextEncoder().encode("release asset payload bytes\n");
     const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}/assets?name=dist.zip`, {
       method: "POST",
-      headers: { ...auth, "Content-Type": "application/octet-stream" },
+      headers: {
+        ...auth,
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(payload.byteLength),
+      },
       body: payload,
     });
     expect(res.status).toBe(201);
@@ -197,9 +226,7 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
     expect(body.created_at).toBeTypeOf("string");
     expect(body.browser_download_url).toBe(`https://example.com/attachments/${String(body.uuid)}`);
 
-    const rows = await drizzle(env.DB).select().from(releaseAssets).all();
-    expect(rows).toHaveLength(1);
-    const row = rows[0];
+    const row = only(await drizzle(env.DB).select().from(releaseAssets).all());
     expect(row.uuid).toBe(body.uuid);
     expect(row.checksumSha256).toBe(await sha256Hex(payload));
     expect(row.r2Key).toBe(releaseAssetKey("r_7401", releaseId, row.uuid, "dist.zip"));
@@ -216,16 +243,14 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
     ]);
     const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}/assets`, {
       method: "POST",
-      headers: { ...auth, "Content-Type": contentType },
+      headers: { ...auth, "Content-Type": contentType, "Content-Length": String(bytes.byteLength) },
       body: bytes,
     });
     expect(res.status).toBe(201);
     const body = await res.json<Record<string, unknown>>();
     expect(body.name).toBe("binary v2.tar.gz");
 
-    const rows = await drizzle(env.DB).select().from(releaseAssets).all();
-    expect(rows).toHaveLength(1);
-    const row = rows[0];
+    const row = only(await drizzle(env.DB).select().from(releaseAssets).all());
     expect(new TextDecoder().decode(await storedBytes(row.r2Key))).toBe(payload);
     expect(row.size).toBe(payload.length);
     // the key segment is sanitized; the display name stays verbatim in D1
@@ -241,7 +266,7 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
     ]);
     const resField = await makeApp()(`${REPO_PATH}/releases/${releaseId}/assets`, {
       method: "POST",
-      headers: { ...auth, "Content-Type": withField.contentType },
+      headers: { ...auth, "Content-Type": withField.contentType, "Content-Length": String(withField.bytes.byteLength) },
       body: withField.bytes,
     });
     expect(resField.status).toBe(201);
@@ -253,7 +278,7 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
     ]);
     const resQuery = await makeApp()(`${REPO_PATH}/releases/${releaseId2}/assets?name=from-query`, {
       method: "POST",
-      headers: { ...auth, "Content-Type": withQuery.contentType },
+      headers: { ...auth, "Content-Type": withQuery.contentType, "Content-Length": String(withQuery.bytes.byteLength) },
       body: withQuery.bytes,
     });
     expect(resQuery.status).toBe(201);
@@ -264,7 +289,7 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
     const releaseId = await seedRelease();
     const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}/assets`, {
       method: "POST",
-      headers: { ...auth, "Content-Type": "application/octet-stream" },
+      headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "7" },
       body: "no name",
     });
     expect(res.status).toBe(400);
@@ -279,7 +304,7 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
     const { bytes, contentType } = multipartBody("compat-boundary-42", [{ name: "name", body: "x.zip" }]);
     const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}/assets`, {
       method: "POST",
-      headers: { ...auth, "Content-Type": contentType },
+      headers: { ...auth, "Content-Type": contentType, "Content-Length": String(bytes.byteLength) },
       body: bytes,
     });
     expect(res.status).toBe(400);
@@ -290,7 +315,7 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
     const releaseId = await seedRelease();
     const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}/assets`, {
       method: "POST",
-      headers: { ...auth, "Content-Type": "multipart/form-data; boundary=never" },
+      headers: { ...auth, "Content-Type": "multipart/form-data; boundary=never", "Content-Length": "3" },
       body: "abc",
     });
     expect(res.status).toBe(400);
@@ -304,7 +329,7 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
       headers: { Authorization: `token ${TOKEN}`, "Content-Type": "application/octet-stream" },
       body: new Blob(["chunked bytes"]).stream(),
       duplex: "half",
-    });
+    } as RequestInit);
     const res = await makeApp()(request);
     expect(res.status).toBe(411);
   });
@@ -356,13 +381,13 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
     const releaseId = await seedRelease();
     const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}/assets?name=empty.bin`, {
       method: "POST",
-      headers: { ...auth, "Content-Type": "application/octet-stream" },
+      headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "0" },
       body: new Uint8Array(0),
     });
     expect(res.status).toBe(201);
     const body = await res.json<Record<string, unknown>>();
     expect(body.size).toBe(0);
-    const row = (await drizzle(env.DB).select().from(releaseAssets).all())[0];
+    const row = only(await drizzle(env.DB).select().from(releaseAssets).all());
     expect(await storedSize(row.r2Key)).toBe(0);
   });
 });
@@ -371,10 +396,11 @@ describe("GET /repos/{owner}/{repo}/releases/{id}/assets (repoListReleaseAttachm
   it("lists a release's assets in id order with the Attachment shape", async () => {
     const releaseId = await seedRelease();
     for (const name of ["beta.zip", "alpha.zip"]) {
+      const body = new TextEncoder().encode(`bytes of ${name}`);
       const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}/assets?name=${name}`, {
         method: "POST",
-        headers: { ...auth, "Content-Type": "application/octet-stream" },
-        body: `bytes of ${name}`,
+        headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": String(body.byteLength) },
+        body,
       });
       expect(res.status).toBe(201);
     }
@@ -424,7 +450,7 @@ describe("release-asset storage internals (SPEC-0005 §3.3)", () => {
         releaseId,
         uploaderId: 1,
         name: "too-big.zip",
-        content: new Blob([new Uint8Array(64).fill(7)]).stream(),
+        content: streamOf(new Uint8Array(64).fill(7)),
         multipart: false,
         declaredLength: 64,
         maxBytes: 32,
@@ -445,7 +471,7 @@ describe("release-asset storage internals (SPEC-0005 §3.3)", () => {
         releaseId,
         uploaderId: 1,
         name: "too-big.bin",
-        content: new Blob([new Uint8Array(64).fill(9)]).stream(),
+        content: streamOf(new Uint8Array(64).fill(9)),
         multipart: true,
         maxBytes: 32,
       }),
@@ -465,7 +491,7 @@ describe("release-asset storage internals (SPEC-0005 §3.3)", () => {
         releaseId,
         uploaderId: 1,
         name: "lying.zip",
-        content: new Blob([new Uint8Array(8).fill(1)]).stream(),
+        content: streamOf(new Uint8Array(8).fill(1)),
         multipart: false,
         declaredLength: 100,
       }),
