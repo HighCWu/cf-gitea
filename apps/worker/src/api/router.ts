@@ -24,6 +24,7 @@ import { registerIdentityRoutes } from "./routes/identity";
 import { registerImportRoutes } from "./routes/imports";
 import { registerIssueRoutes } from "./routes/issues";
 import { registerIssueT2Routes } from "./routes/issue-t2";
+import { registerIssueWriteT2Routes } from "./routes/issue-write-t2";
 import { registerLabelRoutes } from "./routes/labels";
 import { registerLanguageRoutes } from "./routes/languages";
 import { registerMarkdownRoutes } from "./routes/markdown";
@@ -169,6 +170,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // `/repos/{owner}/{repo}/issues|pulls/…` paths that shadow nothing above;
   // reads optional, writes reqToken — the upstream split.
   registerIssueT2Routes(app, requireAuth, optionalAuth);
+  // Tier-2 issue writes: label detach + the pin trio (pin/unpin/move). Same
+  // deep paths as the family above; writes reqToken per upstream.
+  registerIssueWriteT2Routes(app, requireAuth);
   // Tier-2 social listings (stargazers, subscribers, watched/starred repos
   // by user, the doer's following list). The repo listings ride optionalAuth
   // (upstream repoAssignment); the /user + /users listings requireAuth.
