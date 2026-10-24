@@ -78,15 +78,27 @@
     ]
   },
 
+  // Cron triggers (SPEC-0009 §2.6): the pull-mirror sync producer fires the
+  // 10-minute `update_mirrors` cadence (upstream tasks_basic.go:35). Sub-hour
+  // crons get a 30 s CPU budget (AGENTS.md Workers rules), so the scheduled
+  // handler only SELECTs due repo_mirrors rows and enqueues — the mirror-sync
+  // work happens in the queue consumer.
+  "triggers": {
+    "crons": ["*/10 * * * *"]
+  },
+
   // Queues: REPO_TASKS drives the repo delete purge (SPEC-0003 §2.5.5 steps
   // 2-3: D1 tx → DO tombstone → queue → R2 prefix purge). Batch 1 + a single
   // in-flight delivery keep each purge inside its own subrequest budget; the
   // consumer's steps are idempotent, so redelivery is safe. The import
-  // indexing consumer (§2.6) joins this queue in SPEC-0003 M5.
+  // indexing consumer (§2.6) and the pull-mirror sync consumer (SPEC-0009
+  // §2.6, {kind: "mirror-sync"} messages from MIRROR_SYNC_QUEUE) join the
+  // same queue + serialized consumer via the handleRepoTasks dispatch.
   "queues": {
     "producers": [
       { "binding": "WEBHOOK_DELIVERY", "queue": "webhook-delivery" },
-      { "binding": "REPO_TASKS", "queue": "repo-tasks" }
+      { "binding": "REPO_TASKS", "queue": "repo-tasks" },
+      { "binding": "MIRROR_SYNC_QUEUE", "queue": "repo-tasks" }
     ],
     "consumers": [
       { "queue": "webhook-delivery", "max_retries": 3, "dead_letter_queue": "webhook-delivery-dlq" },

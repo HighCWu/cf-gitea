@@ -6,6 +6,7 @@ import { createApiRouter } from "./api/router";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
+import { enqueueDueMirrorSyncs } from "./services/mirror/sync";
 import { handlesUiRoute, uiRouter } from "./ui";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
@@ -86,9 +87,21 @@ export default {
     return app.fetch(req, env, ctx);
   },
 
-  // Queue consumers: REPO_TASKS = delete purge (SPEC-0003 §2.5.5);
-  // webhook-delivery (+dlq) = SPEC-0005 §3.6 deliveries. The runtime
-  // delivers MessageBatch<unknown>; each consumer narrows to its own type.
+  // Cron producer (SPEC-0009 §2.6): the 10-minute mirror cadence selects the
+  // due repo_mirrors rows, CAS-claims each idle → queued and enqueues one
+  // {kind: "mirror-sync"} message per claim. Sub-hour crons get a 30 s CPU
+  // budget (AGENTS.md Workers rules) — SELECT + enqueue ONLY here; the sync
+  // itself runs in the REPO_TASKS consumer (handleRepoTasks →
+  // handleMirrorSync).
+  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
+    await enqueueDueMirrorSyncs(env, {});
+  },
+
+  // Queue consumers: REPO_TASKS = delete purge (SPEC-0003 §2.5.5), import
+  // tasks (§2.6) and mirror syncs (SPEC-0009 §2.6) — one serialized dispatch
+  // (handleRepoTasks); webhook-delivery (+dlq) = SPEC-0005 §3.6 deliveries.
+  // The runtime delivers MessageBatch<unknown>; each consumer narrows to its
+  // own type.
   async queue(batch: MessageBatch<unknown>, env: Env, _ctx: ExecutionContext) {
     if (batch.queue === "webhook-delivery-dlq") {
       return webhookDlqHandler(batch as unknown as Parameters<typeof webhookDlqHandler>[0], env, _ctx);

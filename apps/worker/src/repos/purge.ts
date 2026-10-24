@@ -25,6 +25,7 @@
  * (current + redirected renames/transfers re-seed fresh cells).
  */
 
+import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
 import { handleImportTask, isImportMessage } from "./imports/pipeline";
 
 /** Queue message (REPO_TASKS): what the delete pipeline must purge.
@@ -110,7 +111,7 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
 }
 
 /**
- * REPO_TASKS consumer. Two message families share the queue (both serialized:
+ * REPO_TASKS consumer. Three message families share the queue (all serialized:
  * max_batch_size=1 + max_concurrency=1, SPEC-0003 §3.3):
  *
  *   - repo delete purges ({storageKey, engineNames}): tombstone every engine
@@ -118,6 +119,11 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
  *     per SPEC-0003 §2.5.5.
  *   - import tasks ({kind: import-chunk|import-abort|import-sweep, …},
  *     SPEC-0003 §2.6): the chunked import pipeline (src/repos/imports/).
+ *   - mirror syncs ({kind: "mirror-sync", repoId}, SPEC-0009 §2.6): one
+ *     pull-mirror fetch window; the cron producer (src/index.ts scheduled →
+ *     enqueueDueMirrorSyncs) CAS-guards the enqueue, and handleMirrorSync
+ *     re-checks every state, so redelivery is safe. A throw is that
+ *     handler's queue-retry signal.
  *
  * Per message: idempotent work, then ack; a throw retries THAT message (the
  * redelivery re-runs the idempotent steps). Storage errors never fail the
@@ -133,6 +139,16 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] import task ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    if (isMirrorSyncMessage(message.body)) {
+      try {
+        await handleMirrorSync(env, { repoId: message.body.repoId });
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] mirror-sync ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
         message.retry();
       }
       continue;

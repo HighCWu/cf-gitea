@@ -117,9 +117,10 @@ export interface MirrorSyncEnv extends Env {
   /** AES-256-GCM KEK for `repo_mirrors.credentials_ciphertext` (§4.2,
    *  `wrangler secret put MIRROR_CREDENTIAL_KEY`). */
   MIRROR_CREDENTIAL_KEY?: string;
-  /** Sync message queue — the producer side; absent until the binding lands
-   *  in wrangler.jsonc (§3.3), which makes enqueue attempts fail closed. */
-  MIRROR_SYNC_QUEUE?: Queue;
+  /** Sync message queue — the producer side. The binding is live in the
+   *  generated Env (required since the wrangler wiring landed); the runtime
+   *  guard below stays as fail-closed defense. */
+  MIRROR_SYNC_QUEUE: Queue;
 }
 
 /** The only thing a producer puts on MIRROR_SYNC_QUEUE (§2.6 scheduling). */
