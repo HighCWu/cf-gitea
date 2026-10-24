@@ -83,12 +83,81 @@ server's ERR pkt-line verbatim.)
   pages, 11 config-via-index, 12's private-UI 401-vs-404 check). No new
   failures.
 
+## Empirical status — PRODUCTION (2026-10-25 ~04:2x CST, the P0 close-out)
+
+Deploy: version `cf93d51f-8361-4533-ac96-909b126ec8e3` on
+https://cf-gitea.hecongw.workers.dev (Worker startup 75 ms; D1 `cf-gitea`
+a72f93d3-f85a-411e-880e-7effaed306bb; R2 `cf-gitea-packs`). Remote migrations
+applied by `pnpm setup:deploy` immediately before: **0005, 0006, 0007, 0008,
+0009, 0010 — all ✅**. Probe repo `p0probe/p0-shallow` created by authenticated
+push (create-by-push): `main` = `502abd2` (c3, 2026-10-23) → `5e661b1` (c2,
+2026-10-22) → `491195a` (c1, 2026-10-10, also `refs/heads/old-base`) —
+commits straddle the cutoff so `--shallow-since` has real work to do.
+
+| # | Probe (real git CLI, against production) | Exit | Outcome | Gate |
+|---|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `fatal: 远程错误：upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` — clean protocol reject, **never a silent full clone** | G2/G5 |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` | G2/G5 |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` exists with exactly `502abd2d5561536873088528a9f57f02cd1633e1` (= HEAD c3, the correct depth boundary); `log --oneline | wc -l` = 1; `fsck` clean; `rev-parse --is-shallow-repository` = `true` | G5 (supported path unregressed) |
+
+(Client messages are from a zh_CN locale git; the `远程错误:` text is the
+server's ERR pkt-line verbatim. Auth went via `http.extraHeader`, so the URLs
+in client output carry no credentials.)
+
+The reviewer package is now complete: P0 diff + this file (dev probes above) +
+the production probes in this section. `p0probe/p0-shallow` is left live on the
+Worker so the reviewer can re-run the three commands; everything else the
+probing created was deleted (see the two deploy-smoke leftovers below).
+
+### Deploy-gate snapshot at deploy time (2026-10-25 04:15 CST)
+
+- `tsc --noEmit` (apps/worker): **0 errors**.
+- `vitest run`: 1534-1540 / 1540 pass across four runs on the identical
+  committed HEAD — the rotating 0-6 failures (invariants seven-pack/budgets,
+  push-create rows 17/19, lifecycle transfer/delete, pull-engine,
+  imports relay, engine-read) change identity run-to-run on static code =
+  workerd timing flake, fully committed-attributed (nothing uncommitted).
+- `pnpm check:api` **PASS** (78/78 paths, 129/129 operations; one documented
+  warn: GET /user 401 runtime-only exception). `pnpm check:contract` **PASS**
+  (frozen sha `529a3314…` verbatim vs the pinned submodule swagger).
+- `pnpm build:assets`: 784 files / 13.9 MB → `public/assets`, Vite manifest
+  present; deploy reported no asset changes (content-hash dedupe vs the
+  already-uploaded set).
+
+### Found during post-deploy smoke (reported, NOT fixed this wave — code owners)
+
+`pnpm smoke` (2 runs, identical shape): 4 pass / 1 fail / 2 skip — healthz,
+anon-git-surface, receive-advert, migrate-check (all 19 expected tables incl.
+`stars`, `user_settings`, `repo_mirrors`, `repo_imports`) PASS;
+`push-lsremote` **FAIL**, cleanup skipped:
+
+1. **Settle-window race (deterministic red)**: the smoke pushes (create-by-push
+   succeeds), then immediately runs an ANONYMOUS `ls-remote`. Push-create
+   inserts `status='creating'` (`gate.ts` §2.5.2) and
+   `settleCreatingRepo` flips it to `ready` via `ctx.waitUntil` AFTER the push
+   response — reads inside that window get `401 Unauthorized`. Measured:
+   anonymous reads succeed by ~t+2.3 s after push (first 500 ms poll), while
+   the smoke fires at ~t+0.1 s → it loses the race every time (2/2 runs).
+   Fix belongs to the smoke owner (settle-aware retry or authenticated
+   ls-remote) or the gate owner (settle before the response is observable).
+   Two `p0probe/smoke-*` leftovers from the skipped cleanups were deleted
+   (204 ×2).
+2. **ACL row #2 gap (production-verified)**: `gate.ts` push-create inserts
+   `visibility='private'`, yet anonymous `git ls-remote` on the ready repo
+   returns **200 with full refs** (verified against remote D1:
+   `p0probe/p0-shallow` `visibility='private'`, `status='ready'`). SPEC-0003
+   §2.4 row #2 requires `401` + challenge for anonymous × private × fetch —
+   the gate's anonymous branch appears to key on repo status only and never
+   checks visibility. Row #15 (anonymous push) and the authed paths behave;
+   the anonymous-FETCH visibility check is the gap.
+
 ## Still pending (not this wave)
 
-- Production deploy + post-deploy `--shallow-since` /
-  `--shallow-exclude` probes against
-  https://cf-gitea.hecongw.workers.dev (reviewer package: P0 diff + this file
-  + post-deploy CLI exit states + `.git/shallow` results).
+- ~~Production deploy + post-deploy `--shallow-since` / `--shallow-exclude`
+  probes~~ — **DONE** (section above; probes 1-3 all green).
+- ACL row #2 visibility enforcement on the anonymous fetch path (finding 2
+  above) + the smoke's settle-window retry (finding 1) — both for their code
+  owners; production evidence recorded here.
 
 Reviewer package (per the external review's request): P0 diff + these
 probe outputs + post-deploy CLI exit states + `.git/shallow` results.
