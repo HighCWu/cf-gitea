@@ -212,3 +212,37 @@ M3/M4 docs; unadvertised-and-rejected beats plausible-but-wrong.
 (wants/haves/shallow/filter/capability parsing), clone-cache hit predicate,
 the R2 read + sideband re-frame loop ordering (get → read → renew → emit →
 fail-stop), and the GC RETIRED→RECLAIMABLE transaction with renewal race.
+
+## Round-7: code-level findings (three artifacts read)
+
+1. **Cache stores RAW pack bytes; framing regenerated per request** —
+   streamingCloneResponse emits `v2 ? "packfile\n" : "NAK\n"` at serve time,
+   then sideband-frames pack chunks; error path `ctrl.error` (stream error =
+   truncated fetch), FLUSH+close only on reader completion (structural
+   success). The reviewer's CachedClonePack boundary matches reality.
+2. **Hit predicate is SEVEN conditions at the call site** (mod.ts
+   serveCloneFromR2): wants>0 ∧ all-OIDs ∧ haves=0 ∧ done ∧ deepen=0 ∧
+   clientShallows=0 ∧ protocol-shape guard (`v2 fetch command OR
+   side-band-64k` — v0-without-sideband never hits the cache). Stronger
+   than the five previously described. wantsAreAllTips = strict set
+   equality against ALL refs — no per-ref visibility exists today
+   (repo-granular ACL); SPEC-0003 hidden-refs becomes a documented
+   predicate constraint when it lands.
+3. **NormalizedFetchRequest effectively exists** (UploadRequest struct) —
+   the predicate reads the struct, not raw pkt-lines. Reviewer's
+   recommendation already implemented in shape.
+4. **BUG FOUND (reviewer's predicted class)**: parseUploadRequest handles
+   only `deepen <n>`; `deepen-since`/`deepen-not`/`deepen-relative` fall
+   through the else-if chain and are silently DROPPED — while the v2
+   advertisement's `shallow` capability implies the whole deepen family.
+   `git fetch --shallow-since` silently receives a full clone with no
+   shallow boundary: valid pack, valid checksum, WRONG semantics.
+   **Fix direction**: parse the deepen-family args; respond with an
+   explicit ERR (v2 permits server-side error) or implement them — never
+   silently ignore. e2e addition: --shallow-since must fail cleanly (or
+   behave correctly), never silently return a non-shallow result.
+   Ownership: next engine wave (with the LIFECYCLE gap list).
+5. Narrow note: v2 packfile section framed in sideband unconditionally —
+   valid for stock git (always requests sideband when advertised, e2e
+   green); a non-sideband v2 client is outside the tested envelope —
+   document the assumption in the capability matrix.
