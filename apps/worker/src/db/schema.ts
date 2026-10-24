@@ -1180,3 +1180,52 @@ export const repoMirrors = sqliteTable(
   },
   (t) => [check("repo_mirrors_sync_state_check", sql`${t.syncState} IN ('idle', 'queued', 'syncing')`)],
 );
+
+// ---------------------------------------------------------------------------
+// Tier-2 notifications — the Gitea `notification` tag (7 contract ops,
+// SPEC-0004 §2.6 tier-3 row promoted). The notification thread set is
+// DERIVED from issue/comment activity (repos the user watches or owns plus
+// issue participation — see routes/notifications.ts for the upstream
+// deviations this model documents); the only materialized per-user state is
+// the read marker and the pin flag, one row per (user, issue) — migration
+// 0011. Upstream materializes a `notification` row per recipient per issue
+// at activity time (models/activities/notification.go:52-73); the derived
+// model reaches the same observable thread list without a write-path hook
+// into the issue services.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-user notification read/pin state, keyed `(user_id, issue_id)` — the
+ * upstream `GetIssueNotification` identity (one notification per user per
+ * issue, models/activities/notification.go:199-206). The upstream status
+ * enum (unread=1 / read=2 / pinned=3, notification.go:31-38) collapses into
+ * the `(read_at_unix, pinned)` pair: a thread is *unread* while activity on
+ * the issue is newer than `read_at_unix` (0 = never read), *pinned* while
+ * `pinned` is set (pinning implies non-unread, mirroring ToNotificationThread's
+ * `Unread = !(read || pinned)`, services/convert/notification.go:20). New
+ * activity after a read therefore re-marks the thread unread without any
+ * write-path hook — the property the derived model is built around.
+ * `read_at_unix` stays a plain integer (not `mode: "timestamp"`) because the
+ * derived-thread comparisons bind raw unix column values.
+ */
+export const notificationStates = sqliteTable(
+  "notification_states",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id").notNull(),
+    /** The thread's underlying `issues.id` — the API thread id IS this issue
+     *  id (one thread per user per issue; issue ids are globally unique, so
+     *  the thread id space is collision-free). */
+    issueId: integer("issue_id").notNull(),
+    /** Unix seconds of the last activity the user consumed; 0 = nothing read
+     *  (any activity leaves the thread unread). */
+    readAtUnix: integer("read_at_unix").notNull().default(0),
+    pinned: integer("pinned", { mode: "boolean" }).notNull().default(false),
+    /** Last state write (unix seconds; set explicitly by the mark paths). */
+    updatedAt: integer("updated_at", { mode: "timestamp" }),
+  },
+  (t) => [
+    uniqueIndex("notification_states_user_issue_uq").on(t.userId, t.issueId),
+    index("notification_states_user_idx").on(t.userId),
+  ],
+);
