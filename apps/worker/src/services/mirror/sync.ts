@@ -26,9 +26,11 @@
  *      concurrent writer surfaces as "fetch first" (§2.6 step 4).
  *   4. settle D1: success → `last_sync_at = now`, `next_sync_at = now +
  *      interval` (0 → unscheduled), `sync_state='idle'`, clear `last_error`;
- *      failure → sanitized `last_error`, `sync_state='idle'`, `next_sync_at`
- *      left DUE so the next cron retries — upstream's retry posture
- *      (mirror_pull.go:303-308).
+ *      the first sync that gives the still-empty repo refs also settles the
+ *      repositories row (`is_empty=false` + the engine's HEAD branch — the
+ *      import channel's settleDone shape); failure → sanitized `last_error`,
+ *      `sync_state='idle'`, `next_sync_at` left DUE so the next cron retries
+ *      — upstream's retry posture (mirror_pull.go:303-308).
  *
  * SKELETON SCOPE (honest gaps, each with its landing wave):
  *   - `repo_mirrors` and the repositories mirror columns landed with
@@ -223,18 +225,63 @@ async function claimMirrorRow(db: D1Database, repoId: string): Promise<boolean> 
 }
 
 /** §2.6 step 5 — success settle (CAS'd on the claim so an abort/delete race
- *  can never resurrect the row state). */
-async function settleMirrorSuccess(db: D1Database, repoId: string, intervalSeconds: number, now: number): Promise<void> {
-  await drizzle(db)
+ *  can never resurrect the row state), plus the population settle: a sync
+ *  that gave the still-empty repo its first refs flips the repositories row
+ *  (the import channel's settleDone shape, imports/service.ts — is_empty +
+ *  default_branch; status is NOT written because a mirror repo never leaves
+ *  `ready`, unlike an import's `migrating`). Best-effort: the refs are
+ *  already in the engine and the next sync's settle re-checks, so a failed
+ *  flip here logs and self-heals instead of failing a landed sync. */
+async function settleMirrorSuccess(env: MirrorSyncEnv, repo: RepoRow, mirror: MirrorRow, now: number): Promise<void> {
+  await drizzle(env.DB)
     .update(repoMirrors)
     .set({
       lastSyncAt: now,
-      nextSyncAt: intervalSeconds > 0 ? now + intervalSeconds : 0,
+      nextSyncAt: mirror.intervalSeconds > 0 ? now + mirror.intervalSeconds : 0,
       syncState: "idle",
       lastError: null,
       updatedAt: new Date(),
     })
-    .where(and(eq(repoMirrors.repoId, repoId), eq(repoMirrors.syncState, "syncing")));
+    .where(and(eq(repoMirrors.repoId, repo.id), eq(repoMirrors.syncState, "syncing")));
+  if (!repo.isEmpty) return; // steady state — already populated, nothing to flip
+  try {
+    await settlePopulatedRepo(env, repo);
+  } catch (error) {
+    console.error(
+      `[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: population settle failed (the next sync re-checks): ${errorText(error)}`,
+    );
+  }
+}
+
+/**
+ * The population settle — the empty → populated transition. `listRefs` at
+ * settle time is the verdict ("the engine now has refs"), NOT the plan's
+ * command list: a source that legitimately advertises zero refs syncs to a
+ * still-empty repo and must stay `is_empty` (upstream too keeps an empty
+ * mirror empty). The `is_empty = true` guard in the UPDATE is the CAS — a
+ * concurrent settle or user push can never be double-applied or overwritten.
+ * The default branch is the engine's HEAD (the engine's first-receive
+ * adoption set meta.head); when the DO head is unborn or non-branch
+ * (tags-only source), it falls back to the alphabetically-first branch
+ * (listRefs is name-ordered — the push-create settle's rule) and only
+ * flips emptiness when no branch exists at all.
+ */
+async function settlePopulatedRepo(env: MirrorSyncEnv, repo: RepoRow): Promise<void> {
+  const listed = await env.REPO.getByName(engineName(repo.ownerNamespace, repo.slug)).listRefs();
+  if (listed.refs.length === 0) return; // a legitimately empty source — stays empty
+  const firstBranch = listed.refs.find((r) => r.name.startsWith("refs/heads/"))?.name.slice("refs/heads/".length);
+  const branch =
+    listed.head !== null && listed.head.startsWith("refs/heads/")
+      ? listed.head.slice("refs/heads/".length)
+      : (firstBranch ?? null);
+  await drizzle(env.DB)
+    .update(repositories)
+    .set({
+      isEmpty: false,
+      ...(branch !== null ? { defaultBranch: branch } : {}),
+      updatedAt: new Date(),
+    })
+    .where(and(eq(repositories.id, repo.id), eq(repositories.isEmpty, true)));
 }
 
 /** §2.6 step 5 — failure settle: `last_error` (sanitized), back to idle,
@@ -600,7 +647,7 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
   try {
     if (plan.wants.length === 0) {
       if (commands.length === 0) {
-        await settleMirrorSuccess(env.DB, repoId, mirror.intervalSeconds, nowSec);
+        await settleMirrorSuccess(env, repo, mirror, nowSec);
         return { ok: true, skipped: "no-changes", created: 0, updated: 0, deleted: 0 };
       }
       // Prune-only sync: a refs-only receive (deletes shape — no pack bytes),
@@ -631,7 +678,7 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
 
   // §2.6 step 5 — success settle. (Notification of the updates delta, §2.7,
   // lands with the webhook wave; `commands` above IS that delta.)
-  await settleMirrorSuccess(env.DB, repoId, mirror.intervalSeconds, nowSec);
+  await settleMirrorSuccess(env, repo, mirror, nowSec);
   return { ok: true, created: plan.creates.length, updated: plan.updates.length, deleted: plan.deletes.length };
 }
 
