@@ -19,9 +19,11 @@ import { registerMirrorRoutes } from "./routes/mirror";
 import { registerForkRoutes } from "./routes/forks";
 import { registerGitRoutes } from "./routes/git";
 import { registerHookRoutes } from "./routes/hooks";
+import { registerHookDeliveryRoute } from "./routes/hook-delivery";
 import { registerIdentityRoutes } from "./routes/identity";
 import { registerImportRoutes } from "./routes/imports";
 import { registerIssueRoutes } from "./routes/issues";
+import { registerIssueT2Routes } from "./routes/issue-t2";
 import { registerLabelRoutes } from "./routes/labels";
 import { registerLanguageRoutes } from "./routes/languages";
 import { registerMarkdownRoutes } from "./routes/markdown";
@@ -33,10 +35,12 @@ import { registerPullRoutes } from "./routes/pulls";
 import { registerReleaseAssetRoutes } from "./routes/release-assets";
 import { registerReleaseRoutes } from "./routes/releases";
 import { registerRepoRoutes } from "./routes/repo";
+import { registerSocialT2Routes } from "./routes/social-t2";
 import { registerStarredRoutes } from "./routes/starred";
 import { registerStatusRoutes } from "./routes/statuses";
 import { registerTagRoutes } from "./routes/tags";
 import { registerSubscriptionRoutes } from "./routes/subscription";
+import { registerTopicItemRoutes } from "./routes/topic-items";
 import { registerTopicRoutes } from "./routes/topics";
 import { registerUserReposRoutes } from "./routes/user-repos";
 import { registerUserRoute } from "./routes/user";
@@ -160,6 +164,22 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // nothing registered above; listForks reads optional, create reqToken,
   // matching upstream's reqToken/optional split.
   registerForkRoutes(app, requireAuth, optionalAuth);
+  // Tier-2 issue-family extras (reactions, subscriptions, pins, deadline,
+  // lock, the deprecated nested comment pair). All are deeper
+  // `/repos/{owner}/{repo}/issues|pulls/…` paths that shadow nothing above;
+  // reads optional, writes reqToken — the upstream split.
+  registerIssueT2Routes(app, requireAuth, optionalAuth);
+  // Tier-2 social listings (stargazers, subscribers, watched/starred repos
+  // by user, the doer's following list). The repo listings ride optionalAuth
+  // (upstream repoAssignment); the /user + /users listings requireAuth.
+  registerSocialT2Routes(app, requireAuth, optionalAuth);
+  // Tier-2 topic items (PUT/DELETE topics/{topic}) — METHOD-disjoint from
+  // registerTopicRoutes (PUT/DELETE on `topics` vs `topics/{topic}`), so
+  // registration order between the two is irrelevant.
+  registerTopicItemRoutes(app, requireAuth);
+  // Tier-2 webhook delivery item (GET hooks/{id}/deliveries/{uuid}) — deeper
+  // than the landed deliveries list; requireAuth like the whole hook family.
+  registerHookDeliveryRoute(app, requireAuth);
 
   return app;
 }
