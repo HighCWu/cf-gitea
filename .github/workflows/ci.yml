@@ -176,8 +176,8 @@ jobs:
             sleep 2
           done
           echo "dev server did not come up"; cat /tmp/dev-server.log; exit 1
-      - name: Benchmark (compare vs m2-pre baseline; report-only until it records)
-        run: node scripts/bench-run.mjs --compare m2-pre --sizes 5m --base-url http://127.0.0.1:5173
+      - name: Benchmark (compare vs the recorded m2 baseline — 10% regression gate now ENFORCED)
+        run: node scripts/bench-run.mjs --compare m2 --sizes 5m --base-url http://127.0.0.1:5173
       - name: Upload benchmark results (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
