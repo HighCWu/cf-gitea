@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+coverage/
+
+# Wrangler / Cloudflare local state
+.wrangler/
+
+# Environment files and local-only config
+.env
+.env.*
+*.local
+
+# OS noise
+.DS_Store
+.dev.vars
+**/dist-types/
+.bench-fixtures/
+.bench-results/

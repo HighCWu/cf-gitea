@@ -1,0 +1,5 @@
+# Local dev secrets — copy this file to .dev.vars (gitignored).
+# GIT_TOKEN gates git push/admin on the engine (SPEC-0001 M1); the e2e suite
+# authenticates with this value as the Basic password ("x:<token>").
+# TODO(SPEC-0002): replaced by real user/token auth.
+GIT_TOKEN=devtoken

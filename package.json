@@ -1,0 +1,29 @@
+{
+  "name": "cf-gitea",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.13.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --filter cf-gitea-worker dev",
+    "build": "pnpm --filter cf-gitea-worker build",
+    "deploy": "pnpm --filter cf-gitea-worker deploy",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint .",
+    "test": "pnpm -r test",
+    "check:api": "node scripts/check-openapi.mjs",
+    "check:contract": "node scripts/check-contract-frozen.mjs",
+    "build:assets": "node scripts/build-gitea-assets.mjs",
+    "setup:deploy": "node scripts/setup-deploy.mjs",
+    "db:generate": "pnpm --filter cf-gitea-worker db:generate",
+    "db:migrate:local": "pnpm --filter cf-gitea-worker db:migrate:local",
+    "db:migrate:remote": "pnpm --filter cf-gitea-worker db:migrate:remote"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "typescript-eslint": "^8.72.0"
+  }
+}

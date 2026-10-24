@@ -1,0 +1,17 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Dependencies whose postinstall scripts must run (native binaries: esbuild,
+# workerd). pnpm 10+ blocks dependency build scripts unless explicitly allowed
+# (pnpm 12: `allowBuilds` map; strictDepBuilds fails the install otherwise).
+allowBuilds:
+  esbuild: true
+  workerd: true
+
+# @cloudflare/vitest-pool-workers@0.23.0 pins an older miniflare alpha whose
+# bundled workerd cannot run the project's compatibility_date. Pin every
+# miniflare consumer to the exact version wrangler 4.152.x itself pairs with,
+# so `vite dev`, `vite build`, and `vitest` all run the same runtime.
+overrides:
+  miniflare: 5.20261019.2-beta

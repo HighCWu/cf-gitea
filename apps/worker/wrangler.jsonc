@@ -1,0 +1,74 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-gitea",
+  "main": "src/index.ts",
+  // Newest date the current local runtime supports (AGENTS.md wants today's
+  // date; no published workerd supports 2026-10-24 yet). Bump to the current
+  // date together with `pnpm update wrangler` + `pnpm install`, then run
+  // `wrangler types`.
+  "compatibility_date": "2026-10-19",
+  "limits": {
+    "cpu_ms": 300000
+  },
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+
+  // Single source of truth for bindings (AGENTS.md). After any change here,
+  // run `wrangler types` to regenerate worker-configuration.d.ts.
+
+  // D1: relational metadata (ADR-0001 D3). The database_id is a placeholder
+  // until `wrangler d1 create cf-gitea` provisions the real database for
+  // deployment; local dev and tests do not use it.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cf-gitea",
+      "database_id": "a72f93d3-f85a-411e-880e-7effaed306bb",
+      "migrations_dir": "src/db/migrations"
+    }
+  ],
+
+  // R2: blob storage (packs, later LFS/attachments) — SPEC-0001 §3.
+  "r2_buckets": [
+    {
+      "binding": "REPO_PACKS",
+      "bucket_name": "cf-gitea-packs"
+    }
+  ],
+
+  // Durable Objects: the vendored engine's classes (packages/git-engine).
+  // RepoCell = per-repo git storage (SPEC-0001 §2); Registry = repo index.
+  // SQLite-backed classes only.
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REPO",
+        "class_name": "RepoCell"
+      },
+      {
+        "name": "REGISTRY",
+        "class_name": "Registry"
+      }
+    ]
+  },
+
+  // Secrets (names only — values are NEVER in this file; AGENTS.md Workers
+  // rules). `wrangler types` includes these in Env even without .dev.vars, so
+  // CI typechecks stay honest; local dev supplies values via .dev.vars (copy
+  // .dev.vars.example). Production: `wrangler secret put GIT_TOKEN`.
+  // GIT_TOKEN gates git push/admin on the engine (SPEC-0001 M1); SPEC-0002
+  // replaces the static token with real auth.
+  "secrets": {
+    "required": ["GIT_TOKEN"]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RepoCell", "Registry"]
+    }
+  ]
+}
