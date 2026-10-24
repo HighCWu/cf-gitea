@@ -328,17 +328,16 @@ export function registerHookRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Middle
     if (queue !== null) {
       // c.executionCtx throws outside a real worker invocation (in-process
       // test callers have none — the pending D1 row is the durable truth, so
-      // skipping the enqueue there is safe). Its VALUE is the runtime
-      // ExecutionContext; grab the type from the getter's return without
-      // naming the drifted generated global.
-      const tryGetCtx = (): ReturnType<typeof c.executionCtx> | undefined => {
-        try {
-          return c.executionCtx;
-        } catch {
-          return undefined;
-        }
-      };
-      const execCtx = tryGetCtx();
+      // skipping the enqueue there is safe). Access it in VALUE position
+      // only: Hono's accessor signature references the generated global
+      // ExecutionContext type, which drifted (no tracing/abort) — never name
+      // or typeof it in type position.
+      let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+      try {
+        execCtx = c.executionCtx;
+      } catch {
+        execCtx = undefined;
+      }
       if (execCtx !== undefined) {
         execCtx.waitUntil(
           queue.sendBatch([{ deliveryId }]).then(undefined, (error: unknown) => {
