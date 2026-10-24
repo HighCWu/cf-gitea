@@ -1,33 +1,34 @@
 /**
- * Repo delete purge — SPEC-0003 §2.5.5 steps 2-3 (M4 pipeline, landed with
- * the M2 D1 halves).
+ * Repo delete purge — SPEC-0003 §2.5.5 steps 2-4 (the ENGINE-WAVE flip of the
+ * M4 pipeline: the tombstone and destroy are now the real RepoCell RPCs, and
+ * R2 addressing is the immutable D1 storage key).
  *
- * The engine exposes NO `markDeleted` / `destroy` RPCs (the RepoCell surface
- * is beginReceive/finalizeReceive/releaseReceive + the read RPCs; see
- * TODO(SPEC-0003 ENGINE-WAVE) in src/repos/service.ts). The best available
- * primitives, used here:
+ *   - Tombstone (step 2): `RepoCell.markDeleted()` — sets meta.deleted=1 in
+ *     one transaction; beginReceive refuses new leases ("repository
+ *     deleted"), a finalize mid-flight aborts inside its commit transaction
+ *     (§4.2), reads keep answering until destroy. Idempotent.
+ *   - Queue purge (step 3): paged R2 `list` + batch `delete` over the two
+ *     prefixes the storage-key-addressed engine ever writes for the repo
+ *     (`repos/<storage_key>/` — packs, staging, clone cache — plus
+ *     `imports/<storage_key>/`). Steps are idempotent; a purge that dies
+ *     mid-way is retried by queue redelivery, and a prefix too large for one
+ *     invocation's subrequest budget throws to trigger that redelivery (T3
+ *     discipline).
+ *   - Destroy (step 4, AFTER the R2 prefix purge — destroy does NOT touch
+ *     R2): `RepoCell.destroy()` — one transactional wipe, alarm cleared,
+ *     registry row removed via the engine's host hook. Idempotent.
  *
- *   - Tombstone: a direct `DELETE /` request to the repo's DO (the same wipe
- *     the engine's admin DELETE drives): RepoCell drops its SQLite (refs
- *     never dangle; an in-flight finalizeReceive fails on the wiped lease
- *     table, §4.2) and purges the R2 pack prefixes. The `x-repo` header MUST
- *     carry the engine name — RepoCell binds its storage name from it.
- *   - Queue purge: paged R2 `list` + batch `delete` over every prefix the
- *     name-addressed engine ever wrote for the repo (`repos/<name>/`,
- *     `raw/<name>/`, `imports/<name>/`), plus a final Registry DO removal.
- *     Steps are idempotent; a purge that dies mid-way is retried by queue
- *     redelivery, and a prefix too large for one invocation's subrequest
- *     budget throws to trigger that redelivery (T3 discipline).
- *
- * TODO(SPEC-0003 ENGINE-WAVE): once RepoCell exposes markDeleted/destroy and
- * storage_key addressing, the tombstone becomes the real RPC and the purge
- * prefixes collapse to `repos/<storage_key>/` + `imports/<storage_key>/`.
+ * DO addressing stays by the combined engine name (`owner/repo`): the cell
+ * binds its name from the request path, while the storage key (meta.storage_key,
+ * persisted from the gate's x-storage-key header on receives) names the R2
+ * prefixes. `engineNames` covers every combined name the repo was known by
+ * (current + redirected renames/transfers re-seed fresh cells).
  */
 
 /** Queue message (REPO_TASKS): what the delete pipeline must purge.
- *  `engineNames` is every combined name the repo was known by (current +
- *  redirected) — the name-addressed engine spread storage across all of them;
- *  `storageKey` (r_<id>) is carried for the storage-key engine wave. */
+ *  `storageKey` (r_<id>) names the R2 prefixes; `engineNames` is every
+ *  combined name the repo was known by (current + redirected) — each names
+ *  a RepoCell that must be tombstoned and destroyed. */
 export interface RepoPurgeMessage {
   storageKey: string;
   engineNames: string[];
@@ -44,22 +45,16 @@ export function isRepoPurgeMessage(value: unknown): value is RepoPurgeMessage {
 }
 
 /**
- * §2.5.5 step 2 — DO tombstone. Wipes the repo DO's storage (gate: the Worker
- * is trusted infrastructure; the DO route has no auth of its own).
- * Idempotent: deleting an already-deleted/never-created DO re-initializes an
- * empty cell.
+ * §2.5.5 step 2 — DO tombstone via the engine's markDeleted RPC. Idempotent:
+ * tombstoning an already-tombstoned (or never-created) cell re-initializes an
+ * empty one and marks it; destroy later wipes it either way.
  */
 export async function tombstoneRepoDO(env: Env, engineName: string): Promise<void> {
-  // The DO-internal route is "/" (mod.ts rewrites the sub-path before
-  // stub.fetch); RepoCell binds its persisted storage name (meta.repo → R2
-  // prefixes) from x-repo — omitting it would rebind the cell to "repo".
-  const req = new Request("https://repo-tasks.local/", {
-    method: "DELETE",
-    headers: { "x-repo": engineName },
-  });
-  const res = await env.REPO.getByName(engineName).fetch(req);
-  if (!res.ok) {
-    throw new Error(`repo DO tombstone for ${engineName} failed: HTTP ${res.status}`);
+  const result = await env.REPO.getByName(engineName).markDeleted();
+  if (result.tag !== "ok") {
+    // The engine's tagged union has a single variant today; guarded so a
+    // future variant cannot silently pass as success.
+    throw new Error(`repo DO tombstone for ${engineName}: unexpected ${JSON.stringify(result)}`);
   }
 }
 
@@ -84,24 +79,41 @@ async function purgePrefix(bucket: R2Bucket, prefix: string, budget: { calls: nu
 }
 
 /**
- * §2.5.5 step 3 — R2 prefix purge for one engine name. Idempotent; throws
- * when the subrequest budget runs out (queue redelivery resumes).
+ * §2.5.5 step 3 — R2 prefix purge for the repo's immutable storage key
+ * (repos/<storage_key>/ since the Step 3 key layout: packs, staging and the
+ * clone cache share ONE prefix; imports/<storage_key>/ is the import
+ * channel's). Idempotent; throws when the subrequest budget runs out (queue
+ * redelivery resumes).
  */
-export async function purgeRepoStorage(env: Env, engineName: string): Promise<void> {
+export async function purgeRepoStorage(env: Env, storageKey: string): Promise<void> {
   const bucket = env.REPO_PACKS;
   if (!bucket) return;
   const budget = { calls: 0 };
-  for (const prefix of [`repos/${engineName}/`, `raw/${engineName}/`, `imports/${engineName}/`]) {
+  for (const prefix of [`repos/${storageKey}/`, `imports/${storageKey}/`]) {
     await purgePrefix(bucket, prefix, budget);
   }
 }
 
 /**
+ * §2.5.5 step 4 — DO destroy via the engine's destroy RPC (after the R2
+ * prefix purge; destroy wipes SQLite + the alarm and removes the registry
+ * row, never R2). Idempotent: destroying a destroyed/never-created cell
+ * re-initializes an empty one.
+ */
+export async function destroyRepoDO(env: Env, engineName: string): Promise<void> {
+  const result = await env.REPO.getByName(engineName).destroy();
+  if (result.tag !== "ok") {
+    throw new Error(`repo DO destroy for ${engineName}: unexpected ${JSON.stringify(result)}`);
+  }
+}
+
+/**
  * REPO_TASKS consumer. Per message: tombstone every engine name (retry of a
- * step-2 failure is a no-op), purge the R2 prefixes, drop any Registry row
- * left behind. Per AGENTS.md, storage errors never fail the user-facing
- * delete — they surface here as queue retries, and after max_retries land in
- * the queue's dead-letter handling (the admin-notice equivalent).
+ * step-2 failure is a no-op), purge the storage-key R2 prefixes, then destroy
+ * every engine name as the FINAL step. Per AGENTS.md, storage errors never
+ * fail the user-facing delete — they surface here as queue retries, and
+ * after max_retries land in the queue's dead-letter handling (the
+ * admin-notice equivalent).
  */
 export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): Promise<void> {
   for (const message of batch.messages) {
@@ -116,16 +128,33 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
 }
 
 /** One purge message's work (exported so tests drive it without fabricating
- *  a MessageBatch; the steps are idempotent). */
+ *  a MessageBatch; the steps are idempotent, so a redelivery re-runs them). */
 export async function purgeRepoMessage(env: Env, body: RepoPurgeMessage): Promise<void> {
+  // Step 2: tombstone every cell the repo was known under. Failures are
+  // logged and the pipeline continues — the steps below still run, and a
+  // redelivery re-executes the idempotent tombstone.
   for (const name of body.engineNames) {
     try {
       await tombstoneRepoDO(env, name);
     } catch (error) {
       console.error(`[repo-tasks] tombstone ${name}: ${error instanceof Error ? error.message : String(error)}`);
-      // continue: the registry removal + prefix purge below still run
     }
-    await purgeRepoStorage(env, name);
+  }
+
+  // Step 3: R2 prefix purge under the immutable storage key. Throws on a
+  // budget overrun → the queue redelivers before destroy ever runs.
+  await purgeRepoStorage(env, body.storageKey);
+
+  // Step 4 (final): destroy every cell. A failure throws so the redelivery
+  // retries; destroy (and everything above it) is idempotent.
+  for (const name of body.engineNames) {
+    await destroyRepoDO(env, name);
+  }
+
+  // Registry backstop: destroy's host hook already removes the row for cells
+  // whose meta bound a name; this sweep covers cells that were never reached
+  // over HTTP. receivePack upserts heal any false removal.
+  for (const name of body.engineNames) {
     try {
       await env.REGISTRY.getByName("registry").remove(name);
     } catch {

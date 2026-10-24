@@ -17,19 +17,19 @@
  * upserts on every committed push, so the next push heals the row; failures
  * land in the observability log (the admin-notice equivalent).
  *
- * storage_key addressing — engine gap (TODO(SPEC-0003 ENGINE-WAVE)):
- * SPEC-0003 §3.3 addresses RepoDOs by `idFromName(storage_key)` and R2 keys
- * by `repos/<storage_key>/`. The vendored engine derives BOTH from the URL's
- * combined name (`owner/name`: mod.ts `repoPath` → `getByName(repo)`,
- * repo.ts `bindR2` → `meta.repo`), and exposes no override, so worker-side
- * storage-key addressing is impossible until the engine accepts one (an
- * x-storage-key request context or a getByName(storageKey) contract).
- * Deliberate consequences, all recorded for the next engine wave:
- *   - The gate and purge paths address DOs/R2 by the engine's combined name.
- *   - rename/transfer update D1 + redirects fully, but engine storage (DO
- *     SQLite + R2 prefixes) stays under the pre-move name until the engine
- *     supplies a storage-move/adopt RPC; pushes to the new URL re-seed a
- *     fresh empty DO (git data written before the move is not migrated).
+ * storage_key addressing (the ENGINE-WAVE flip): SPEC-0003 §3.3 addresses R2
+ * keys by `repos/<storage_key>/` and persists meta.storage_key in the cell.
+ * The engine consumes the immutable key from the `x-storage-key` header the
+ * gate sets on receive-pack forwards (SPEC-0001a §3 Step 3), and RepoCell now
+ * exposes markDeleted/destroy/setHead RPCs (used by src/repos/purge.ts and
+ * setDefaultBranch below). Still name-addressed: the RepoCell itself (DO id)
+ * and every non-receive delegation (`env.REPO.getByName("owner/repo")`) key
+ * on the combined name — a storage-move/adopt RPC for renames/transfers
+ * remains the documented engine gap. Consequence, unchanged: rename/transfer
+ * update D1 + redirects fully, but engine storage (DO SQLite + R2 prefixes)
+ * stays under the pre-move name; pushes to the new URL re-seed a fresh empty
+ * DO (git data written before the move is not migrated) while R2 addressing
+ * follows the immutable storage_key either way.
  */
 
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -206,10 +206,12 @@ export interface RepoEngineDeps {
   registry?: DurableObjectStub<Registry>;
   /** REPO_TASKS producer — delete-purge messages (§2.5.5 step 3). */
   queue?: { send(message: RepoPurgeMessage): Promise<unknown> };
-  /** DO tombstone (§2.5.5 step 2). The engine exposes no markDeleted RPC; the
-   *  best available primitive (engine admin DELETE, see purge.ts) is injected
-   *  so the service stays engine-agnostic. Best-effort. */
+  /** RepoCell tombstone (§2.5.5 step 2): the engine's markDeleted RPC,
+   *  injected so the service stays engine-agnostic. Best-effort. */
   tombstone?: (engineName: string) => Promise<void>;
+  /** RepoCell setHead (§2.5.2 default-branch change): maps the engine's
+   *  SetHeadResult tag. Best-effort; D1 is the metadata source of truth. */
+  setHead?: (engineName: string, branch: string) => Promise<"ok" | "invalid" | "not_found">;
 }
 
 export interface CreateRepoInput {
@@ -474,6 +476,42 @@ export class RepoService {
   }
 
   /**
+   * §2.5.2 default-branch change (upstream SetDefaultBranch): one D1 UPDATE,
+   * then the engine's setHead RPC best-effort — meta.head CAS inside the DO
+   * bumps refs_version, so the advertisement's symref capability, the
+   * synthetic HEAD file and the clone-cache key all follow. D1 is the
+   * metadata source of truth: the update lands regardless of the engine
+   * outcome, and pointing at an unborn branch is legal (an empty repo's D1
+   * default names a branch the DO has not seen; the gate's synthetic HEAD
+   * falls back to D1 for exactly that). "invalid"/"not_found" and transport
+   * failures are logged (the admin-notice equivalent), never thrown; refname
+   * validation is the caller's (upstream CheckRefNumValid) plus the engine's
+   * own setHead guard — the DO never adopts a rejected branch.
+   */
+  async setDefaultBranch(repoId: string, branch: string): Promise<RepoRow> {
+    const repo = await this.get(repoId);
+    if (repo === null) throw new RepoNotExistError(repoId);
+    await this.db
+      .update(repositories)
+      .set({ defaultBranch: branch, updatedAt: new Date() })
+      .where(eq(repositories.id, repoId));
+    if (this.deps.setHead) {
+      const name = engineName(repo.ownerNamespace, repo.slug);
+      try {
+        const outcome = await this.deps.setHead(name, branch);
+        if (outcome !== "ok") {
+          console.error(`[repos] setHead ${name} -> ${branch} rejected: ${outcome}`);
+        }
+      } catch (error) {
+        console.error(`[repos] setHead ${name} -> ${branch} failed: ${errorMessage(error)}`);
+      }
+    }
+    const row = await this.get(repoId);
+    if (row === null) throw new RepoNotExistError(repoId);
+    return row;
+  }
+
+  /**
    * §2.5.5 delete, upstream ordering with a queue in the middle
    * (services/repository/delete.go:53-394): ALL D1 rows go in one
    * transaction FIRST — the row, every dependent table that exists today
@@ -481,14 +519,15 @@ export class RepoService {
    * transfer — so every subsequent git request misses at repo resolution and
    * a same-name repo can be re-created immediately (§4.8; fresh storage_key).
    *
-   * Then the DO tombstone (best-effort, synchronous; engine gap: no
-   * markDeleted RPC — the injected primitive is the engine's admin DELETE)
-   * and the queue purge message (best-effort; a lost enqueue strands R2 bytes
-   * and is logged — the upstream `CreateNotice` analog — never failing the
-   * user-facing delete).
+   * Then the DO tombstone (best-effort, synchronous; the engine's
+   * markDeleted RPC) and the queue purge message (best-effort; a lost
+   * enqueue strands R2 bytes and is logged — the upstream `CreateNotice`
+   * analog — never failing the user-facing delete). The consumer runs the
+   * storage-key R2 prefix purge and the final destroy (src/repos/purge.ts).
    *
    * Returns the engine names the repo was known by (current + redirected), so
-   * the purge consumer reaches every prefix the name-addressed engine wrote.
+   * the purge consumer tombstones and destroys every cell the repo ever
+   * lived in; R2 itself is reached through the single immutable storage_key.
    */
   async deleteRepository(repoId: string): Promise<{ engineNames: string[] }> {
     const repo = await this.get(repoId);
@@ -531,9 +570,10 @@ export class RepoService {
       this.db.delete(repositories).where(eq(repositories.id, repoId)),
     ] satisfies BatchStatements);
 
-    // Step 2: DO tombstone — refuses new receive leases and aborts in-flight
-    // finalizes (§4.2). Best-effort: D1 already won; a tombstone failure is
-    // logged and retried by the queue consumer (steps are idempotent).
+    // Step 2: DO tombstone (markDeleted RPC) — refuses new receive leases and
+    // aborts in-flight finalizes (§4.2). Best-effort: D1 already won; a
+    // tombstone failure is logged and retried by the queue consumer (the
+    // steps are idempotent).
     if (this.deps.tombstone) {
       for (const name of engineNames) {
         try {
@@ -544,7 +584,7 @@ export class RepoService {
       }
     }
 
-    // Step 3: queue purge (R2 prefixes + destroy). Best-effort enqueue.
+    // Step 3: queue purge (storage-key R2 prefixes, then the final destroy).
     if (this.deps.queue) {
       try {
         await this.deps.queue.send({ storageKey: repo.storageKey, engineNames });

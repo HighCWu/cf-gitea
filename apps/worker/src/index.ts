@@ -6,6 +6,7 @@ import { createApiRouter } from "./api/router";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
+import { handlesUiRoute, uiRouter } from "./ui";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
 
@@ -18,8 +19,9 @@ import { webhookQueueHandler } from "./webhooks/consumer";
  * endpoints (config/gc/DELETE) and the repo JSON API — everything the handler
  * classifies as protocol/api/admin.
  *
- * - `ui: false` runs it headless: repo pages 404 so the official Gitea
- *   frontend owns the UI (AGENTS.md project overview).
+ * - `ui: false` runs it headless: repo pages 404 so the Tier-2 UI router
+ *   (SPEC-0008, src/ui) owns the page families (AGENTS.md project overview —
+ *   the official Gitea frontend is the frontend; uiRouter renders the shell).
  * - `cors` unset: no cross-origin engine API yet.
  * - `onPush` unset: repo bookkeeping stays inside the engine (registry DO)
  *   until SPEC-0003 wires repo lifecycle to D1.
@@ -42,6 +44,12 @@ app.use("/api/v1/*", resolveAuth());
 app.route("/api/v1", tokenRouter);
 app.route("/api/v1", createApiRouter());
 
+// Tier-2 UI (SPEC-0008 §2.2): the sub-app claims only the page families its
+// parser owns (/:owner/:repo[/commits|/src]); the dispatcher consults
+// handlesUiRoute BEFORE Hono routes, so a miss here can never swallow an
+// engine route. api registrations stay first; healthz is unaffected.
+app.route("/", uiRouter);
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const { pathname } = new URL(req.url);
@@ -57,12 +65,23 @@ export default {
     // stream straight into the storage DO (AGENTS.md Workers rules). The
     // engine parses the exact repo/sub-path and answers 404 for malformed,
     // reserved, or unknown non-push paths.
-    // "api" stays in Hono-land for /api/v1 (SPEC-0004).
+    // "api" stays in Hono-land for /api/v1 (SPEC-0004). UI page families
+    // (SPEC-0008 §2.2 — src/ui is the single source of route truth) are
+    // GET-only (§2.1) and canonical (§4.13: the UI never emits trailing
+    // slashes), so the UI claims exactly that shape: every other method (the
+    // engine admin DELETE, the JSON API's non-GET surfaces) and every
+    // trailing-slash URL keeps its pre-UI owner — the engine passthrough the
+    // e2e suite runs against stays byte-identical.
     const isRepoScoped =
       segments.length >= 2 && segments[1] !== "" && segments[0] !== "api";
-    if (isRepoScoped) return gitHttpGate(req, env, ctx, gitHttp);
+    if (isRepoScoped) {
+      if (req.method === "GET" && !pathname.endsWith("/") && handlesUiRoute(pathname)) {
+        return app.fetch(req, env, ctx);
+      }
+      return gitHttpGate(req, env, ctx, gitHttp);
+    }
 
-    // Everything else (healthz, future /api/v1, bare paths) is Hono's, whose
+    // Everything else (healthz, /api/v1, bare paths) is Hono's, whose
     // default is a 404.
     return app.fetch(req, env, ctx);
   },

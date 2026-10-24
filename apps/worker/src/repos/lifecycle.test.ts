@@ -38,9 +38,9 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM users WHERE username_lower != 'assets'").run();
 });
 
-// Service with the real engine bindings (registry + tombstone via the repo
-// DO's admin DELETE); the queue producer is not wired in vitest, so delete
-// tests drive purgeRepoMessage directly.
+// Service with the real engine bindings (registry + the RepoCell markDeleted
+// RPC tombstone); the queue producer is not wired in vitest, so delete tests
+// drive purgeRepoMessage directly.
 function service(): RepoService {
   return new RepoService(env.DB, {
     registry: env.REGISTRY.getByName("registry"),
@@ -282,9 +282,11 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "doomed");
     await svc.rename(repo.id, "doomed-renamed"); // leaves a redirect at doomed
 
-    // Storage + registry rows the name-addressed engine wrote.
-    await env.REPO_PACKS.put(`repos/alice/doomed-renamed/packs/pack-x.pack`, new Uint8Array([1, 2, 3]));
-    await env.REPO_PACKS.put(`imports/alice/doomed-renamed/chunk-0.pack`, new Uint8Array([4]));
+    // Storage + registry rows the storage-key-addressed engine wrote (R2 is
+    // namespaced by the immutable D1 storage_key; the DOs stay name-bound).
+    await env.REPO_PACKS.put(`repos/${repo.storageKey}/packs/pack-x.pack`, new Uint8Array([1, 2, 3]));
+    await env.REPO_PACKS.put(`repos/${repo.storageKey}/staging/pack-rx-x.pack`, new Uint8Array([9]));
+    await env.REPO_PACKS.put(`imports/${repo.storageKey}/chunk-0.pack`, new Uint8Array([4]));
     await env.REGISTRY.getByName("registry").upsert("alice/doomed-renamed", Date.now());
 
     const { engineNames } = await svc.deleteRepository(repo.id);
@@ -295,11 +297,20 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     expect(await drizzle(env.DB).select().from(repoRedirects).all()).toHaveLength(0);
     expect(await drizzle(env.DB).select().from(repoCounters).all()).toHaveLength(0);
 
-    // Steps 2-3: the queue message drives tombstone + R2 prefix purge.
+    // Steps 2-4: the queue message drives tombstone (markDeleted RPC) → R2
+    // prefix purge under the storage_key → the final destroy.
     await purgeRepoMessage(env, { storageKey: repo.storageKey, engineNames });
-    expect((await env.REPO_PACKS.list({ prefix: "repos/alice/doomed-renamed/" })).objects).toHaveLength(0);
-    expect((await env.REPO_PACKS.list({ prefix: "imports/alice/doomed-renamed/" })).objects).toHaveLength(0);
+    expect((await env.REPO_PACKS.list({ prefix: `repos/${repo.storageKey}/` })).objects).toHaveLength(0);
+    expect((await env.REPO_PACKS.list({ prefix: `imports/${repo.storageKey}/` })).objects).toHaveLength(0);
     expect(await env.REGISTRY.getByName("registry").get("alice/doomed-renamed")).toBeNull();
+    // Destroy (the final step) wiped the cells: a re-created empty DO holds
+    // no tombstone flag, so beginReceive answers instead of rejecting.
+    const revived = await env.REPO.getByName("alice/doomed-renamed").beginReceive({
+      commands: [{ ref: "refs/heads/main", old: ZERO_OID, next: ZERO_OID }],
+      capabilities: [],
+      packBytesHint: null,
+    });
+    expect(revived.tag).toBe("ok");
   });
 
   it("§4.2: a push holding a receive lease fails cleanly when the delete lands mid-flight", async () => {
@@ -315,12 +326,29 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     });
     expect(begin.tag).toBe("ok");
 
-    // Delete wins the race: the tombstone wipes the DO under the lease.
+    // Delete wins the race: the markDeleted tombstone flags the DO under the
+    // lease (markDeleted deliberately does not wait out the lease — the D1
+    // row is gone, so the push is doomed regardless).
     await service().deleteRepository(repo.id);
 
-    // The in-flight finalize aborts on the wiped lease table — no dangling
-    // refs, the client sees a failed push.
+    // New leases are refused outright once the doomed lease is gone
+    // (markDeleted deliberately does not wait out an active lease — the D1
+    // row is gone, so the push is doomed regardless) and the in-flight
+    // finalize aborts on the flag — no dangling refs, the client sees a
+    // failed push.
     if (begin.tag !== "ok") throw new Error("expected a lease");
+    await stub.releaseReceive({ leaseToken: begin.leaseToken, sweep: false });
+    const rebegin = await stub.beginReceive({
+      commands: [{ ref: "refs/heads/main", old: ZERO_OID, next: ZERO_OID }],
+      capabilities: [],
+      packBytesHint: null,
+    });
+    expect(rebegin.tag).toBe("rejected");
+    if (rebegin.tag === "rejected") {
+      expect(rebegin.results).toEqual([
+        { ref: "refs/heads/main", ok: false, message: "repository deleted" },
+      ]);
+    }
     const fin = await stub.finalizeReceive({
       leaseToken: begin.leaseToken,
       expectedRefsVersion: begin.refsVersion,
@@ -372,6 +400,77 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
   });
 });
 
+describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => {
+  /** Service wired to the REAL RepoCell.setHead (the production injection
+   *  shape: the engine's SetHeadResult tag mapped straight through). */
+  function serviceWithSetHead(): RepoService {
+    return new RepoService(env.DB, {
+      setHead: async (name, branch) => (await env.REPO.getByName(name).setHead(branch)).tag,
+    });
+  }
+
+  it("aligns the DO head with the adopted branch when a multi-branch first push diverges", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const body = buildReceivePackBody(
+      [
+        { ref: "refs/heads/develop", oid },
+        { ref: "refs/heads/main", oid },
+      ],
+      pack,
+    );
+    const push = await SELF.fetch("https://example.com/alice/branchy.git/git-receive-pack", {
+      method: "POST",
+      headers: {
+        authorization: basicTokenHeader(token),
+        "content-type": "application/x-git-receive-pack-request",
+      },
+      body,
+    });
+    expect(push.status).toBe(200);
+
+    // The engine's first-push adoption prefers main; the settle's
+    // alphabetical adoption picks develop — the setHead alignment re-points
+    // the DO so the advertisement's HEAD agrees with D1.
+    const svc = service();
+    const creating = await svc.getBySlug("alice", "branchy");
+    expect(creating).not.toBeNull();
+    if (creating === null) throw new Error("unreachable");
+    await settleCreatingRepo(env, creating.id, "alice/branchy");
+    const settled = (await svc.get(creating.id))!;
+    expect(settled.defaultBranch).toBe("develop");
+    expect((await env.REPO.getByName("alice/branchy").listRefs()).head).toBe("refs/heads/develop");
+  });
+
+  it("setDefaultBranch updates D1 and the DO head; engine rejections never block the D1 truth", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const svc = serviceWithSetHead();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "headed");
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    await SELF.fetch("https://example.com/alice/headed.git/git-receive-pack", {
+      method: "POST",
+      headers: {
+        authorization: basicTokenHeader(token),
+        "content-type": "application/x-git-receive-pack-request",
+      },
+      body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
+    });
+
+    // OK path: both stores move.
+    await svc.setDefaultBranch(repo.id, "feature");
+    expect((await svc.get(repo.id))!.defaultBranch).toBe("feature");
+    expect((await env.REPO.getByName("alice/headed").listRefs()).head).toBe("refs/heads/feature");
+
+    // not_found: an unborn branch is legal in D1 (the empty-repo convention);
+    // the DO keeps its head and the rejection is logged, not thrown.
+    await svc.setDefaultBranch(repo.id, "ghost");
+    expect((await svc.get(repo.id))!.defaultBranch).toBe("ghost");
+    expect((await env.REPO.getByName("alice/headed").listRefs()).head).toBe("refs/heads/feature");
+  });
+});
+
 describe("SPEC-0008 'assets' reservation and create bookkeeping", () => {
   it("reserves the owner name 'assets' at the DB level (migration seed row + UNIQUE lower_name)", async () => {
     const seeded = await drizzle(env.DB)
@@ -411,7 +510,7 @@ describe("SPEC-0008 'assets' reservation and create bookkeeping", () => {
     expect(counters[0]?.issueIndex).toBe(0);
   });
 
-  it("pushes land a first commit and the HEAD endpoint agrees with the adopted default branch", async () => {
+  it("pushes land a first commit under the D1 storage_key and the HEAD endpoint agrees with the adopted default branch", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
     const { oid, pack } = await buildPack();
@@ -427,12 +526,19 @@ describe("SPEC-0008 'assets' reservation and create bookkeeping", () => {
     expect(push.status).toBe(200);
 
     // Settle deterministically (the gate schedules this via waitUntil); the
-    // adoption writes default_branch=trunk, which the unborn-HEAD fallback
-    // serves (the engine's HEAD row is only set by an explicit SetDefaultBranch
-    // — the ENGINE-WAVE gap in src/repos/service.ts).
+    // adoption writes default_branch=trunk, and the DO head already agrees
+    // (the engine adopts the only pushed branch on first push).
     const svc = service();
     const creating = await svc.getBySlug("alice", "heady");
     if (creating) await settleCreatingRepo(env, creating.id, "alice/heady");
+
+    // The receive forwarded x-storage-key (r_<id>): the pack landed under the
+    // immutable storage-key prefix — never a name-addressed one.
+    expect(creating).not.toBeNull();
+    if (creating === null) throw new Error("unreachable");
+    const keyed = await env.REPO_PACKS.list({ prefix: `repos/${creating.storageKey}/packs/` });
+    expect(keyed.objects.length).toBeGreaterThan(0);
+    expect((await env.REPO_PACKS.list({ prefix: "repos/alice/heady/" })).objects).toHaveLength(0);
 
     // The synthetic HEAD file (§2.1 row 4) resolves through the DO.
     const head = await SELF.fetch("https://example.com/alice/heady.git/HEAD", {
@@ -440,5 +546,28 @@ describe("SPEC-0008 'assets' reservation and create bookkeeping", () => {
     });
     expect(head.status).toBe(200);
     expect(await head.text()).toBe("ref: refs/heads/trunk\n");
+  });
+
+  it("overrides a client-supplied x-storage-key with the D1 row's on D1-backed receive forwards", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "forgery", true);
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const body = buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack);
+    const push = await SELF.fetch("https://example.com/alice/forgery.git/git-receive-pack", {
+      method: "POST",
+      headers: {
+        authorization: basicTokenHeader(token),
+        "content-type": "application/x-git-receive-pack-request",
+        // A forged header must never redirect the storage namespace: the gate
+        // re-wraps the forward and sets the header from the D1 row.
+        "x-storage-key": "forged-key",
+      },
+      body,
+    });
+    expect(push.status).toBe(200);
+    expect((await env.REPO_PACKS.list({ prefix: "repos/forged-key/" })).objects).toHaveLength(0);
+    const keyed = await env.REPO_PACKS.list({ prefix: `repos/${repo.storageKey}/packs/` });
+    expect(keyed.objects.length).toBeGreaterThan(0);
   });
 });

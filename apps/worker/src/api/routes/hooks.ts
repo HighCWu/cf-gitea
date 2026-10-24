@@ -330,7 +330,9 @@ export function registerHookRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Middle
       // callers (tests via app.request) have none — the row already sits
       // `pending` (the durable source of truth), so skipping the enqueue
       // outside a request context is the documented safe path.
-      let execCtx: ExecutionContext | undefined;
+      // ExecutionContext here is Hono's (fetch-scoped, no tracing/abort);
+      // the runtime global type drifted in generated worker-configuration.
+      let execCtx: ReturnType<typeof c.executionCtx> | undefined;
       try {
         execCtx = c.executionCtx;
       } catch {

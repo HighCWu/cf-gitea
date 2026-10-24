@@ -40,6 +40,28 @@
     }
   ],
 
+  // Static assets (SPEC-0008 §2.3.2, exact): the built Gitea frontend tree
+  // (`pnpm build:assets` → ./public/assets, gitignored) plus the committed
+  // public/_headers. Assets-first/worker-on-miss routing: GET/HEAD matching a
+  // file in public/ is edge-served; a miss invokes the Worker. The four
+  // git-protocol routes, /api/* and the LFS family are pinned to the Worker
+  // first so they can never be shadowed by the asset tree (see the spec for
+  // the enumeration rationale; two leading wildcards span /:owner/:repo(.git)?).
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "html_handling": "none",
+    "not_found_handling": "none",
+    "run_worker_first": [
+      "/api/*",
+      "/*/*/info/refs",
+      "/*/*/git-upload-pack",
+      "/*/*/git-receive-pack",
+      "/*/*/HEAD",
+      "/*/*/info/lfs/*"
+    ]
+  },
+
   // Durable Objects: the vendored engine's classes (packages/git-engine).
   // RepoCell = per-repo git storage (SPEC-0001 §2); Registry = repo index.
   // SQLite-backed classes only.

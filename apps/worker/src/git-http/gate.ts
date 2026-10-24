@@ -182,8 +182,18 @@ export async function gitHttpGate(
   if (decision !== true) return decision;
 
   // §2.1 item 5: invoke the engine and stream its response. The engine hook
-  // sees the gate-cleared mark and waves the request through.
-  return forwardToEngine(req, url, env, ctx, engine);
+  // sees the gate-cleared mark and waves the request through. Receive-pack
+  // forwards carry the D1-minted immutable storage key (SPEC-0001a §3 Step
+  // 3): the engine's beginReceive resolves R2 addressing from it instead of
+  // the URL name, so renames/transfers never fork the storage namespace.
+  return forwardToEngine(
+    req,
+    url,
+    env,
+    ctx,
+    engine,
+    route.kind === "receive-pack" ? resolved.repo.storageKey : undefined,
+  );
 }
 
 /**
@@ -285,15 +295,16 @@ async function handleUnknownRepository(
     // §2.5.2 finalize handshake (scheduled AFTER the response below — the
     // async settle body starts at call time, so scheduling it before the
     // forward would race the receive's finalize with an empty-DO listRefs).
-    const response = await forwardToEngine(req, url, env, ctx, engine);
+    const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey);
     ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`));
     return response;
   }
 
   // The dummy advertisement bypassed the engine, so this POST is the repo
   // DO's first contact: warm it once so beginReceive persists meta.repo (the
-  // engine's storage key) before the receive lease opens — otherwise the
-  // first pack would stage under an empty name and split the R2 prefixes.
+  // engine's registry/destroy name) before the receive lease opens. R2
+  // addressing itself comes from the forwarded x-storage-key (r_<id>) on the
+  // receive below — the warm-up only needs to bind the cell's name.
   try {
     const warm = new Request(`${url.origin}/${route.owner}/${route.repo}/info/refs?service=git-receive-pack`);
     markGateCleared(warm);
@@ -307,8 +318,10 @@ async function handleUnknownRepository(
   // outcome is settled — flip status/is_empty/default_branch on a committed
   // first push, or undo the create when no ref landed. Scheduled AFTER the
   // forward (the settle body starts at call time; scheduling it earlier would
-  // race the finalize with an empty-DO listRefs).
-  const response = await forwardToEngine(req, url, env, ctx, engine);
+  // race the finalize with an empty-DO listRefs). The forward carries the
+  // fresh row's storage key: the very first receive already addresses R2 by
+  // r_<id>, so no name-addressed prefix ever gets written for this repo.
+  const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey);
   ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`));
   return response;
 }
@@ -317,19 +330,23 @@ async function handleUnknownRepository(
  * Build the request handed to the engine. Identity fast path: when nothing
  * needs sanitizing the original request object flows through untouched, so
  * push/fetch bodies stream into the storage DO without re-wrapping.
- * Otherwise: an invalid `Git-Protocol` header is dropped (§2.3) and gzip
+ * Otherwise: an invalid `Git-Protocol` header is dropped (§2.3), gzip
  * bodies are decompressed with the §4.6 cap (the engine then sees a plain
- * body, so its own Content-Length/encoding assumptions stay valid).
+ * body, so its own Content-Length/encoding assumptions stay valid), and a
+ * D1 `storageKey` overrides the `x-storage-key` header (SPEC-0001a §3 Step
+ * 3) — always re-wrapping in that case, so a client-supplied header can
+ * never redirect a D1-backed repo's storage namespace.
  */
-async function prepareEngineRequest(req: Request, url: URL): Promise<Request> {
+async function prepareEngineRequest(req: Request, url: URL, storageKey?: string): Promise<Request> {
   const gitProtocol = req.headers.get("git-protocol");
   const badProtocol = gitProtocol !== null && !SAFE_GIT_PROTOCOL_HEADER.test(gitProtocol);
   const gzip = isGzipEncoded(req);
 
-  if (!badProtocol && !gzip) return req;
+  if (!badProtocol && !gzip && storageKey === undefined) return req;
 
   const headers = new Headers(req.headers);
   if (badProtocol) headers.delete("git-protocol");
+  if (storageKey !== undefined) headers.set("x-storage-key", storageKey);
   const methodHasBody = req.method !== "GET" && req.method !== "HEAD";
   const streams = methodHasBody && req.body !== null;
   let body: BodyInit | null = null;
@@ -354,17 +371,21 @@ async function prepareEngineRequest(req: Request, url: URL): Promise<Request> {
   });
 }
 
-/** Gate-cleared engine invocation (the shared §2.1 item 5 tail). */
+/** Gate-cleared engine invocation (the shared §2.1 item 5 tail). `storageKey`
+ *  (D1 repositories.storage_key) rides the x-storage-key header on
+ *  receive-pack forwards; every other route passes it unset and keeps the
+ *  byte-identical passthrough (the D1-missing e2e population depends on it). */
 async function forwardToEngine(
   req: Request,
   url: URL,
   env: Env,
   ctx: ExecutionContext,
   engine: DurableGitHandler<Env>,
+  storageKey?: string,
 ): Promise<Response> {
   let forwarded: Request;
   try {
-    forwarded = await prepareEngineRequest(req, url);
+    forwarded = await prepareEngineRequest(req, url, storageKey);
   } catch {
     // Malformed gzip surfaces on the first decompressed chunk — answer the
     // upstream bare 400 before any engine/storage touch (§2.3, §4.6).
@@ -403,9 +424,10 @@ async function serveHead(env: Env, route: GitHttpRoute, defaultBranch: string): 
  * - refs/heads/* present → the create becomes real: `status='ready'`,
  *   `is_empty=false`, `default_branch=<first pushed branch>` — one
  *   conditional UPDATE (`status='creating' AND is_empty`), so a concurrent
- *   settle/undo can never double-apply. The DO's `meta.head` CAS inside the
- *   finalize transaction is the engine's missing RPC (see service.ts); until
- *   then the synthetic HEAD endpoint resolves through D1 for unborn repos.
+ *   settle/undo can never double-apply. The DO's meta.head is aligned to the
+ *   adopted branch via the engine's setHead RPC when it diverged (the
+ *   engine's first-push adoption prefers main/master; see below); the
+ *   synthetic HEAD endpoint falls back to D1 only for unborn repos.
  * - no branch ref (receive failed, client vanished, worker crashed
  *   mid-receive) → the row is deleted again, conditional on
  *   `status='creating' AND is_empty` — a half-usable repo never lingers.
@@ -420,8 +442,11 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
     if (row === undefined || row.status !== "creating" || !row.isEmpty) return;
 
     let refNames: string[] | null = null;
+    let doHead: string | null = null;
     try {
-      refNames = (await env.REPO.getByName(engineRepo).listRefs()).refs.map((r) => r.name);
+      const listed = await env.REPO.getByName(engineRepo).listRefs();
+      refNames = listed.refs.map((r) => r.name);
+      doHead = listed.head;
     } catch {
       refNames = null; // unreadable/unwarming DO: treat as no refs
     }
@@ -463,6 +488,25 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
           eq(repositories.isEmpty, true),
         ),
       );
+
+    // §2.5.2 (ENGINE-WAVE): the DO's meta.head must agree with the adopted
+    // branch. The engine's own first-push adoption prefers main/master over
+    // the alphabetically-first rule this settle applies, so a multi-branch
+    // first push can diverge — setHead re-points it (idempotent CAS, bumps
+    // refs_version). Skipped when they already agree, so the common
+    // single-branch push pays no extra RPC.
+    if (doHead !== null && doHead !== `refs/heads/${firstBranch}`) {
+      try {
+        const set = await env.REPO.getByName(engineRepo).setHead(firstBranch);
+        if (set.tag !== "ok") {
+          console.error(`[push-create] settle ${repoId}: setHead ${firstBranch} rejected: ${set.tag}`);
+        }
+      } catch (error) {
+        console.error(
+          `[push-create] settle ${repoId}: setHead ${firstBranch} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
   } catch (error) {
     console.error(
       `[push-create] settle ${repoId} failed: ${error instanceof Error ? error.message : String(error)}`,

@@ -55,15 +55,22 @@ const fakeAssets: UiAssetsFetcher = {
   fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })),
 };
 
-/** The test bindings: real D1 plus the injected ASSETS fetcher. (The real
- *  wrangler.jsonc has no assets block yet — U1 orchestrator wiring — so the
- *  raw `env` exercises the 503 path.) */
-const uiEnv: Env & { ASSETS?: UiAssetsFetcher } = { ...env, ASSETS: fakeAssets };
+/**
+ * The test bindings type: ASSETS re-narrowed to the fetcher the ui module
+ * reads. The landed wrangler.jsonc assets block makes Env.ASSETS the
+ * generated `Fetcher`; these tests inject a synthetic manifest fetcher (or
+ * drop the binding entirely to exercise the 503 path), so the member is
+ * re-declared optional. The single `as Env` at the fetch boundary re-widens
+ * for the router's Bindings — the shapes agree everywhere the router reads.
+ */
+type UiTestEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+
+const uiEnv: UiTestEnv = { ...env, ASSETS: fakeAssets };
 
 /** An env that deterministically has no usable ASSETS binding. */
-const envWithoutAssets: Env & { ASSETS?: UiAssetsFetcher } = { ...env, ASSETS: undefined };
+const envWithoutAssets: UiTestEnv = { ...env, ASSETS: undefined };
 
-async function fetchUi(path: string, e: Env & { ASSETS?: UiAssetsFetcher } = uiEnv): Promise<Response> {
+async function fetchUi(path: string, e: UiTestEnv = uiEnv): Promise<Response> {
   return uiRouter.fetch(new Request(`https://test.local${path}`), e);
 }
 
@@ -268,8 +275,8 @@ describe("resolveRefSuffix", () => {
 
 describe("assetsBinding", () => {
   it("reads a present binding and returns undefined when absent or malformed", () => {
-    expect(assetsBinding(uiEnv)).toBe(fakeAssets);
-    expect(assetsBinding(envWithoutAssets)).toBeUndefined();
+    expect(assetsBinding(uiEnv as Env)).toBe(fakeAssets);
+    expect(assetsBinding(envWithoutAssets as Env)).toBeUndefined();
   });
 });
 
