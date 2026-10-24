@@ -22,13 +22,15 @@
  */
 import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import contractRaw from "../../compat/contract/v1-swagger.generated.json?raw";
-import { milestones, repositories, users } from "../../db/schema";
+import { comments, milestones, repositories, users } from "../../db/schema";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { applyOrgsDdl } from "../../services/orgs/testing";
 import { OrgService } from "../../services/orgs/orgs";
+import { IssuesService } from "../../issues/service";
 import { STUB_USER } from "../auth";
 import { createRepoHook } from "../services/hooks";
 import { createRepoLabel } from "../services/labels";
@@ -223,6 +225,60 @@ beforeAll(async () => {
     hookA,
     hookB,
   });
+
+  // Issue-block seeds (SPEC-0005 §5.3 discipline): four issues through the
+  // landed service — two open (one enriched), one closed (carries the close
+  // system comment the issueGetComment 204 scenario reads), one deleted by
+  // the issueDelete scenario — plus three user comments. The compat identity
+  // resolves to the owner row, so every write scenario rides the
+  // poster-or-writer path.
+  const issuesService = new IssuesService(env.DB);
+  const issueA = await issuesService.createIssue({
+    repoId: SHARED_REPO_ID,
+    title: "compat alpha issue",
+    content: "seeded by the compat suite",
+    posterId: ownerId,
+    labelIds: [labelA.id],
+    milestoneId: milestoneA,
+  });
+  const issueB = await issuesService.createIssue({
+    repoId: SHARED_REPO_ID,
+    title: "compat beta issue",
+    content: "second seed",
+    posterId: ownerId,
+    labelIds: [labelA.id, labelB.id],
+  });
+  const issueC = await issuesService.createIssue({
+    repoId: SHARED_REPO_ID,
+    title: "compat closed issue",
+    posterId: ownerId,
+  });
+  await issuesService.closeIssue(issueC.id, { actorId: ownerId });
+  const issueD = await issuesService.createIssue({
+    repoId: SHARED_REPO_ID,
+    title: "compat doomed issue",
+    posterId: ownerId,
+  });
+
+  const commentA = await issuesService.addComment({ issueId: issueA.id, posterId: ownerId, content: "seeded comment alpha" });
+  const commentB = await issuesService.addComment({ issueId: issueA.id, posterId: ownerId, content: "seeded comment beta" });
+  await issuesService.addComment({ issueId: issueC.id, posterId: ownerId, content: "seeded comment on the closed issue" });
+  const closeCommentRow = await drizzle(env.DB)
+    .select()
+    .from(comments)
+    .where(and(eq(comments.issueId, issueC.id), eq(comments.type, 2)))
+    .limit(1)
+    .then((rows) => rows[0]);
+
+  Object.assign(seeds, {
+    issueA: issueA.index,
+    issueB: issueB.index,
+    issueC: issueC.index,
+    issueD: issueD.index,
+    commentA: commentA.id,
+    commentB: commentB.id,
+    closeComment: closeCommentRow?.id ?? 0,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -351,6 +407,202 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       name: "seeded sha as ref",
       status: 200,
       request: (ctx) => ({ path: `${repoPath(ctx)}/commits/${String(ctx.seeds.sha)}/status?limit=1` }),
+    },
+  ],
+
+  // ---------------------------------------------------------------------
+  // Issue block (SPEC-0004 §2.4 rows issueListIssues … issueSearchIssues).
+  // Scenario order mirrors the fixture order: search runs FIRST (only the
+  // beforeAll seeds exist), then list/create, then the {index} paths.
+  // ---------------------------------------------------------------------
+
+  issueSearchIssues: [
+    {
+      name: "keyword hit, first page",
+      status: 200,
+      linkRels: ["next", "last"],
+      request: () => ({ path: `/repos/issues/search?q=${encodeURIComponent("compat ")}&limit=1` }),
+    },
+    {
+      name: "unknown owner → declared 400",
+      status: 400,
+      request: () => ({ path: "/repos/issues/search?owner=ghost" }),
+    },
+  ],
+  issueListIssues: [
+    {
+      name: "first page (state defaults to open)",
+      status: 200,
+      linkRels: ["next", "last"],
+      request: (ctx) => ({ path: `${repoPath(ctx)}/issues?limit=1` }),
+    },
+  ],
+  issueCreateIssue: [
+    {
+      name: "create",
+      status: 201,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/issues`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ title: "compat-created issue", body: "created by the compat suite" }),
+        }),
+      }),
+    },
+  ],
+  issueGetRepoComments: [
+    {
+      name: "first page of the repo-wide feed",
+      status: 200,
+      linkRels: ["next", "last"],
+      request: (ctx) => ({ path: `${repoPath(ctx)}/issues/comments?limit=1` }),
+    },
+  ],
+  issueGetComment: [
+    {
+      name: "seeded comment (global id)",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/issues/comments/${String(ctx.seeds.commentA)}` }),
+    },
+    {
+      name: "system comment → empty 204",
+      status: 204,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/issues/comments/${String(ctx.seeds.closeComment)}` }),
+    },
+  ],
+  issueDeleteComment: [
+    {
+      name: "delete the dedicated seed comment",
+      status: 204,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/issues/comments/${String(ctx.seeds.commentB)}`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+  issueEditComment: [
+    {
+      name: "edit the seeded comment",
+      status: 200,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/issues/comments/${String(ctx.seeds.commentA)}`,
+        init: ctx.withAuth({
+          method: "PATCH",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ body: "edited by the compat suite" }),
+        }),
+      }),
+    },
+  ],
+  issueGetIssue: [
+    {
+      name: "seeded issue",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueA)}` }),
+    },
+    {
+      name: "missing index → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/issues/999` }),
+    },
+  ],
+  issueDelete: [
+    {
+      name: "delete the dedicated seed issue",
+      status: 204,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueD)}`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+  issueEditIssue: [
+    {
+      // PATCH answers 201 upstream (the quirk the fixture records).
+      name: "edit the seeded issue (201 quirk)",
+      status: 201,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueA)}`,
+        init: ctx.withAuth({
+          method: "PATCH",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ title: "compat alpha issue (edited)" }),
+        }),
+      }),
+    },
+  ],
+  issueGetComments: [
+    {
+      name: "seeded issue comments",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueA)}/comments` }),
+    },
+  ],
+  issueCreateComment: [
+    {
+      name: "comment on the seeded issue",
+      status: 201,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueA)}/comments`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ body: "created by the compat suite" }),
+        }),
+      }),
+    },
+  ],
+  issueGetLabels: [
+    {
+      name: "seeded issue labels",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueA)}/labels` }),
+    },
+  ],
+  issueReplaceLabels: [
+    {
+      name: "replace with the first seeded label",
+      status: 200,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueA)}/labels`,
+        init: ctx.withAuth({
+          method: "PUT",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ labels: [Number(ctx.seeds.labelA)] }),
+        }),
+      }),
+    },
+  ],
+  issueAddLabel: [
+    {
+      name: "add the second seeded label (200, never 201)",
+      status: 200,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueA)}/labels`,
+        init: ctx.withAuth({
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ labels: [Number(ctx.seeds.labelB)] }),
+        }),
+      }),
+    },
+  ],
+  issueClearLabels: [
+    {
+      name: "clear",
+      status: 204,
+      request: (ctx) => ({
+        path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueA)}/labels`,
+        init: ctx.withAuth({ method: "DELETE" }),
+      }),
+    },
+  ],
+  issueGetCommentsAndTimeline: [
+    {
+      name: "closed issue timeline (comment + close)",
+      status: 200,
+      request: (ctx) => ({ path: `${repoPath(ctx)}/issues/${String(ctx.seeds.issueC)}/timeline` }),
     },
   ],
 

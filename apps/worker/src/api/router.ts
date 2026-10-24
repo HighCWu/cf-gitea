@@ -9,6 +9,7 @@ import {
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
 import { registerHookRoutes } from "./routes/hooks";
+import { registerIssueRoutes } from "./routes/issues";
 import { registerLabelRoutes } from "./routes/labels";
 import { registerMarkdownRoutes } from "./routes/markdown";
 import { registerMilestoneRoutes } from "./routes/milestones";
@@ -48,6 +49,12 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerUserRoute(app, requireAuth);
   registerUsersRoutes(app, optionalAuth);
   registerUserReposRoutes(app, requireAuth, optionalAuth);
+  // Issue routes register BEFORE the repo-metadata routes: the static
+  // `/repos/issues/search` path must win over the same-shape
+  // `/repos/{owner}/{repo}` param route (upstream registers
+  // `m.Get("/issues/search", …)` before the `/{username}/{reponame}` group —
+  // static-over-param precedence, routers/api/v1/api.go).
+  registerIssueRoutes(app, requireAuth, optionalAuth);
   registerRepoRoutes(app, requireAuth, optionalAuth);
   registerStatusRoutes(app, requireAuth, optionalAuth);
   registerLabelRoutes(app, requireAuth, optionalAuth);
