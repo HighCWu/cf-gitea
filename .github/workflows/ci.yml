@@ -161,6 +161,8 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Generate UI icons
+        run: pnpm gen:icons
       - name: Dev vars (GIT_TOKEN=devtoken)
         run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
       - name: Start dev Worker (vite dev, workerd)
