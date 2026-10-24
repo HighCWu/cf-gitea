@@ -171,3 +171,44 @@ incomplete pack (correct checksum, missing negotiated objects — assert
 server-side plan rejection OR client connectivity rejection; server-side
 is the contract); early lease release (last R2 read done, HTTP still
 sending — assert GC may reclaim and the fetch still completes correctly).
+
+## Round-6 additions: fetch protocol correctness as its own acceptance line
+
+**Two-layer success (adopted)**: `ServerSuccess = ValidNegotiatedObjectClosure
+∧ CompletePackEmission ∧ ValidProtocolTermination`; `ClientSuccess =
+ServerSuccess ∧ ClientValidation` (end-to-end goal; server cannot observe
+client validation). The structural tail (data+checksum+flush) proves
+transport/format only — a complete, checksummed stream CAN be semantically
+wrong if the PLAN is wrong; plan correctness is the load-bearing half.
+
+**clone-cache responsibility split**: immutability (refs_version keying)
+guarantees content-version correctness; read-lease/abort-on-failure
+guarantees safety under concurrent deletion. Different jobs, both required.
+**Hit condition is exact-full-clone ONLY** (already the design): wants ==
+current tips ∧ no haves ∧ done ∧ no shallow ∧ no filter — any other
+negotiation shape takes the segmented planning path and never touches the
+cache. The M4 cache work must ship this hit-condition as code + the
+reviewer's mismatch test matrix (depth=1, filter=blob:none, different
+wants, different capabilities, stale-version-no-false-hit). "Full pack is a
+superset" is NOT an acceptable hit rationale — shallow/filter semantics
+change the client's interpretation of boundaries and missing objects.
+
+**Closure policy separation (formalized)**: `validateReceiveClosure()`
+(prove new refs' closure exists complete) vs `planNegotiatedFetchClosure()`
+(determine the send set under negotiation semantics: haves/common
+ancestors, shallow boundaries, filters, thin bases, tag peeling, format).
+Shared graph primitives; DIFFERENT boundary conditions. Partial-clone
+omissions and shallow-outside boundaries are NOT missing objects.
+
+**Capability matrix (required deliverable)**: current serve surface — v0
+and v2 fetch, shallow/deepen/unshallow (e2e-green), sideband-64k; filter
+(partial clone) is NOT advertised → clients decline gracefully to full
+transfer (explicit non-support, not wrong-support). The matrix ships with
+M3/M4 docs; unadvertised-and-rejected beats plausible-but-wrong.
+
+**Round-6 tests (top priority)**: the six-row cache-mismatch matrix above.
+
+**Next review agenda (code-level, four artifacts)**: fetch planning entry
+(wants/haves/shallow/filter/capability parsing), clone-cache hit predicate,
+the R2 read + sideband re-frame loop ordering (get → read → renew → emit →
+fail-stop), and the GC RETIRED→RECLAIMABLE transaction with renewal race.
