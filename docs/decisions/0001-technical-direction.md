@@ -125,6 +125,9 @@ header forms.
 
 Later / out of scope initially: Gitea Actions compat (gitorange's container model is
 the reference), repo mirrors, OAuth provider endpoints, email notifications.
+(2026-10-25: repo mirrors + external imports are no longer deferred — landed as
+`specs/0009-mirrors-import.md`, accepted and implemented; the remaining three items
+are still out of scope.)
 
 ## Annex — Performance & cost model (2026-10 prices, to be validated by SPEC-0001 benchmarks)
 
