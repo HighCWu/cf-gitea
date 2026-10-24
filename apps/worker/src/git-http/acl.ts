@@ -25,6 +25,7 @@ import {
   basicChallenge,
   ownerUnavailable,
   rateLimited,
+  repositoryArchived,
   repositoryNotFound,
   scopeForbidden,
 } from "./respond";
@@ -33,7 +34,7 @@ import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpa
 import { ScopeSet } from "../auth/scopes";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
 import type { AuthUser } from "../auth/auth-context";
-import { repositories, users } from "../db/schema";
+import { repoUnits, repositories, users } from "../db/schema";
 
 type RepositoryRow = typeof repositories.$inferSelect;
 
@@ -41,12 +42,14 @@ type RepositoryRow = typeof repositories.$inferSelect;
  *  (§2.1 item 4: `(owner, lower_name)` lookup; §4.5 case-insensitivity).
  *  LEFT JOIN so an orphaned repo row (owner user gone) resolves as
  *  "exists but invisible" instead of "missing" (which would pass through to
- *  the engine). */
+ *  the engine). Also returns the owner's `visibility` (SPEC-0003 §2.5.6,
+ *  upstream VisibleType) — it lives on the joined users row, not on the
+ *  SPEC-0002 AuthUser projection. */
 export async function resolveRepository(
   d1: D1Database,
   ownerLower: string,
   repoLower: string,
-): Promise<{ repo: RepositoryRow; owner: AuthUser | null } | null> {
+): Promise<{ repo: RepositoryRow; owner: AuthUser | null; ownerVisibility: "public" | "limited" | "private" } | null> {
   const db = drizzle(d1);
   const row = await db
     .select({ repo: repositories, owner: users })
@@ -58,6 +61,7 @@ export async function resolveRepository(
   const owner = row.owner;
   return {
     repo: row.repo,
+    ownerVisibility: owner?.visibility ?? "private",
     owner:
       owner === null
         ? null
@@ -74,6 +78,47 @@ export async function resolveRepository(
   };
 }
 
+/**
+ * ACL rows 4/5: the code unit's anonymous access grant (SPEC-0003 §3.1,
+ * upstream `RepoUnit.AnonymousAccessMode`). Only meaningful for private
+ * repositories — a public repo is anonymous-readable anyway (row 1).
+ */
+export async function codeUnitAnonymousRead(d1: D1Database, repoId: string): Promise<boolean> {
+  const db = drizzle(d1);
+  const unit = await db
+    .select({ anonymousAccessMode: repoUnits.anonymousAccessMode })
+    .from(repoUnits)
+    .where(and(eq(repoUnits.repoId, repoId), eq(repoUnits.type, "code")))
+    .get();
+  return unit?.anonymousAccessMode === "read";
+}
+
+/**
+ * The request credential, if any: the bearer token, or the Basic password
+ * (token-as-password, SPEC-0002 §2.5). Shared by the ACL matrix and the
+ * push-create interceptor so both read credentials identically.
+ */
+export function requestCredential(req: Request): string | null {
+  const header = req.headers.get("authorization");
+  const parsed = header === null ? null : parseAuthorizationHeader(header);
+  return parsed?.bearerToken?.token ?? (parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null);
+}
+
+/** Case-folded user lookup for the push-create namespace resolution (rows
+ *  16-20: site-admin create into an existing active user's namespace). */
+export async function userByUsernameLower(
+  d1: D1Database,
+  usernameLower: string,
+): Promise<{ id: number; usernameLower: string; status: "active" | "prohibited" } | null> {
+  const db = drizzle(d1);
+  const row = await db
+    .select({ id: users.id, usernameLower: users.usernameLower, status: users.status })
+    .from(users)
+    .where(eq(users.usernameLower, usernameLower))
+    .get();
+  return row ?? null;
+}
+
 export interface GitHttpAclInput {
   req: Request;
   env: Env;
@@ -82,6 +127,10 @@ export interface GitHttpAclInput {
   op: GitHttpOp;
   repo: RepositoryRow;
   owner: AuthUser | null;
+  /** Owner visibility (§2.5.6); 'private' when the owner row is gone. */
+  ownerVisibility: "public" | "limited" | "private";
+  /** Rows 4/5: the private repo's code unit grants anonymous read. */
+  unitAnonymousRead: boolean;
 }
 
 /**
@@ -134,35 +183,41 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
         ? new TokenService(env.DB).touchLastUsed(verified.token.id, now)
         : Promise.resolve(),
     );
-    return decide(op, repo, owner, verified.user, scope);
+    return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, verified.user, scope);
   }
 
-  return decide(op, repo, owner, null, null);
+  return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, null, null);
 }
 
 /**
  * The matrix. `doer === null` is the anonymous doer; `scope === null` only
- * alongside it. See the table in SPEC-0003 §2.4 — rows marked M2 below need
- * columns/settings that land with the lifecycle migration.
+ * alongside it. See the table in SPEC-0003 §2.4.
  */
 function decide(
   op: GitHttpOp,
   repo: RepositoryRow,
   owner: AuthUser | null,
+  ownerVisibility: "public" | "limited" | "private",
+  unitAnonymousRead: boolean,
   doer: AuthUser | null,
   scope: ScopeSet | null,
 ): Response | true {
-  // M1 visibility model: repo `is_private` × owner status. The
-  // `users.visibility` column (public/limited/private, SPEC-0003 §2.5.6) does
-  // not exist yet, so every resolvable owner is treated as public — row 2's
-  // "limited/private owner" branch arrives with M2.
-  const publiclyVisible = repo.visibility === "public" && owner?.status === "active";
+  // Visibility model (§2.5.6): repo `visibility` × owner `users.visibility`.
+  // Row 1: public repo + active PUBLIC owner. Row 2's limited/private-owner
+  // branches arrive with the M2 `users.visibility` column: a limited owner's
+  // public repos are authenticated-only, a private owner's are owner/admin-only.
+  const ownerActive = owner !== null && owner.status === "active";
+  const repoPublic = repo.visibility === "public";
+  const publiclyVisible = repoPublic && ownerActive && ownerVisibility === "public";
+  // Rows 4/5: an explicit anonymous-read grant on the private repo's code
+  // unit (upstream git_smart_http_test.go:163-189) — read only, and still
+  // requires a public, active owner.
+  const anonymousUnitRead = op === "read" && unitAnonymousRead && ownerActive && ownerVisibility === "public";
 
   if (doer === null) {
-    // Row 1: anonymous fetch of a public repo under a public owner.
-    if (op === "read" && publiclyVisible) return true;
-    // Rows 2/3: everything else anonymous challenges. Row 4/5 (anonymous
-    // unit-read on a private repo) needs the M2 `repo_units` table.
+    if (anonymousUnitRead || (op === "read" && publiclyVisible)) return true;
+    // Rows 2/3/5: every other anonymous request challenges — pushes always
+    // need identity, and unit read never grants write (test :184).
     return basicChallenge();
   }
 
@@ -179,21 +234,25 @@ function decide(
   if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
 
   // M1 grant model: no collaborator tables exist yet (SPEC-0005), so the
-  // grant set is exactly { repo owner, site admin }. Rows 4/5/8's
-  // read-only-collaborator variants extend this when collaboration lands.
+  // grant set is exactly { repo owner, site admin }. Rows 8's
+  // read-only-collaborator variant extends this when collaboration lands.
   const isOwner = owner !== null && doer.id === owner.id;
   const isSiteAdmin = doer.isAdmin;
 
-  // Row 9 (+ public-only masking, SPEC-0002 §4.1): no read grant on an
-  // invisible repo → 404, existence hidden.
-  const canRead = publiclyVisible || isOwner || isSiteAdmin;
+  // Row 9 (+ §2.5.6 visibility three-way): no read grant on an invisible
+  // repo → 404, existence hidden. Limited owners expose their public repos
+  // to any authenticated principal; private owners only to owner/admin.
+  const canRead =
+    publiclyVisible || isOwner || isSiteAdmin || (repoPublic && ownerActive && ownerVisibility === "limited");
+  // Public-only tokens (SPEC-0002 §4.1) see exactly what anonymous visitors
+  // could: a limited owner's public repo stays masked.
   const maskedByPublicOnly = scope.publicOnly && !publiclyVisible;
   if (!canRead || maskedByPublicOnly) return repositoryNotFound();
 
   if (op === "write") {
-    // Row 10: archived repos refuse pushes. `repositories.is_archived` lands
-    // with the SPEC-0003 M2 lifecycle migration; the check site is kept here.
-    // if (repo.isArchived) return repositoryArchived();
+    // Row 10: archived repos refuse pushes (upstream :124-128 message text);
+    // clones keep working — the check only gates the write path.
+    if (repo.isArchived) return repositoryArchived();
     // Row 8: visible but no write grant → 404 (write capability hidden).
     if (!isOwner && !isSiteAdmin) return repositoryNotFound();
   }

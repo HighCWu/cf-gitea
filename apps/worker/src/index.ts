@@ -4,6 +4,7 @@ import { createDurableGit, Registry, RepoCell } from "@cf-gitea/git-engine";
 import { resolveAuth, tokenRouter } from "./auth";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
+import { handleRepoTasks } from "./repos/purge";
 
 /**
  * Git smart-HTTP engine mount (SPEC-0001 M1).
@@ -42,14 +43,15 @@ export default {
     const segments = pathname.slice(1).split("/");
 
     // Repository-scoped requests (/owner/repo[/...]) first run the
-    // SPEC-0003 M1 gitHttpGate pipeline (parse → go-get/HEAD → resolve repo
-    // in D1 → ACL matrix §2.4): it answers the matrix/go-get/HEAD routes
-    // itself and otherwise delegates to the engine. Repositories without a
-    // D1 row (everything predating lifecycle, incl. the e2e suite) pass
-    // through to the engine verbatim — method, URL and body untouched so
-    // push bodies stream straight into the storage DO (AGENTS.md Workers
-    // rules). The engine parses the exact repo/sub-path and answers 404 for
-    // malformed, reserved, or unknown non-push paths.
+    // SPEC-0003 gitHttpGate pipeline (parse → go-get/HEAD → resolve repo in
+    // D1 (+ redirects, row 13) → ACL matrix §2.4 → push-create rows 15-20):
+    // it answers the matrix/go-get/HEAD/push-create routes itself and
+    // otherwise delegates to the engine. Repositories without a D1 row
+    // (everything predating lifecycle, incl. the e2e suite) pass through to
+    // the engine verbatim — method, URL and body untouched so push bodies
+    // stream straight into the storage DO (AGENTS.md Workers rules). The
+    // engine parses the exact repo/sub-path and answers 404 for malformed,
+    // reserved, or unknown non-push paths.
     // "api" stays in Hono-land for /api/v1 (SPEC-0004).
     const isRepoScoped =
       segments.length >= 2 && segments[1] !== "" && segments[0] !== "api";
@@ -58,6 +60,12 @@ export default {
     // Everything else (healthz, future /api/v1, bare paths) is Hono's, whose
     // default is a 404.
     return app.fetch(req, env, ctx);
+  },
+
+  // REPO_TASKS consumer (SPEC-0003 §2.5.5): the delete purge — DO tombstone
+  // retry, R2 prefix purge, registry removal (src/repos/purge.ts).
+  async queue(batch, env, _ctx) {
+    await handleRepoTasks(batch, env);
   },
 } satisfies ExportedHandler<Env>;
 

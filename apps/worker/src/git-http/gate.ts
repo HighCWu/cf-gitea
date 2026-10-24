@@ -2,30 +2,46 @@
  * `gitHttpGate` — the SPEC-0003 §2.1 adapter pipeline:
  *
  *   parse (.git normalize, service/op) → go-get short-circuit → resolve repo
- *   (D1) → authorize (SPEC-0002 + ACL matrix, acl.ts) → invoke engine →
- *   stream response.
+ *   (D1, then repo_redirects) → authorize (SPEC-0002 + ACL matrix, acl.ts) →
+ *   push-create intercept (rows 15-20, src/repos/service.ts) → invoke engine
+ *   → stream response.
  *
- * Transitional M1.5 split (keeps the e2e suite green while repo lifecycle has
- * not landed):
- * - D1 row MISSING: the request passes through to the engine untouched —
- *   exactly the pre-gate behavior, with the engine `authorize` hook deciding
- *   (GIT_TOKEN dev fallback, PAT verify). TODO(SPEC-0003 M3): remove the
- *   passthrough once every repo has a D1 row (lifecycle owns creation).
+ * Repository resolution split (SPEC-0003 M2/M3):
  * - D1 row EXISTS: the ACL matrix (§2.4 rows 1-14) decides here; the engine
  *   is invoked only on allow, and its hook waves the request through via the
  *   gate-cleared mark below.
+ * - D1 row MISSING, redirect row EXISTS: `301` to the canonical path before
+ *   any auth challenge (row 13, §2.5.3).
+ * - D1 row MISSING, no redirect: writes get the push-create treatment —
+ *   anonymous challenges (row 15), a SPEC-0002-verifiable credential runs the
+ *   rows 16-20 matrix (probe → dummy advertisement, POST → create via
+ *   RepoService with status='creating'), and every other credential passes
+ *   through to the engine untouched. Reads and the HEAD file also pass
+ *   through. That residual passthrough is DELIBERATE and stays: the engine's
+ *   own create-by-push (GIT_TOKEN auth) is the transitional population — the
+ *   e2e suite's repositories live there (no D1 rows, `devtoken` auth) — and
+ *   TODO(SPEC-0003 ENGINE-WAVE) removes it only when every engine repo is
+ *   D1-backed (registry sync alone is not sufficient: engine-known-but-
+ *   D1-unknown repos must keep working until their creation path owns rows).
  *
  * The gate only claims the four §2.1 git-protocol routes; every other
  * repository-scoped path (engine JSON API, admin endpoints, UI-404s) passes
  * through verbatim, so the engine keeps owning them.
  */
 
+import { and, eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 import type { DurableGitHandler } from "@cf-gitea/git-engine";
 
-import { authorizeGitHttp, resolveRepository } from "./acl";
+import {
+  authorizeGitHttp,
+  codeUnitAnonymousRead,
+  requestCredential,
+  resolveRepository,
+  userByUsernameLower,
+} from "./acl";
 import { asByteStream, gunzipCapped, withVerifiedStart } from "./gzip";
 import {
-  DEFAULT_BRANCH,
   SAFE_GIT_PROTOCOL_HEADER,
   infoRefsOp,
   isGzipEncoded,
@@ -34,12 +50,21 @@ import {
   type GitHttpRoute,
 } from "./parse";
 import {
+  accountDisabled,
   bareBadRequest,
+  basicChallenge,
+  dummyAdvertisement,
   goGetMeta,
   headFile,
+  redirectPermanent,
   repositoryNotFound,
   routeOp,
+  scopeForbidden,
 } from "./respond";
+import { ScopeSet } from "../auth/scopes";
+import { TokenService } from "../auth/token-service";
+import { repoCounters, repoUnits, repositories } from "../db/schema";
+import { RepoNameCollisionError, RepoService, lookupRedirect } from "../repos/service";
 
 /**
  * Requests the gate has already authorized. The engine `authorize` hook
@@ -52,6 +77,12 @@ const gateCleared = new WeakSet<Request>();
 
 export function isGateCleared(req: Request): boolean {
   return gateCleared.has(req);
+}
+
+/** Mark a Worker-constructed request as gate-authorized (trusted internal
+ *  calls: the push-create DO warm-up, the delete tombstone in src/repos). */
+export function markGateCleared(req: Request): void {
+  gateCleared.add(req);
 }
 
 export async function gitHttpGate(
@@ -74,11 +105,22 @@ export async function gitHttpGate(
   // §4.4: `*.wiki` URLs are excluded until a wiki SPEC exists — plain 404.
   if (route.repo.endsWith(".wiki")) return repositoryNotFound();
 
+  const ownerLower = route.owner.toLowerCase();
+  const repoLower = route.repo.toLowerCase();
+  const resolved = await resolveRepository(env.DB, ownerLower, repoLower);
+
+  if (resolved === null) {
+    // Row 13: a renamed/transferred repo's old URL 301s to the canonical
+    // path BEFORE any auth challenge (§2.5.3; git clients must see the
+    // redirect before a Basic prompt).
+    const redirect = await lookupRedirect(env.DB, ownerLower, repoLower);
+    if (redirect !== null) return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug);
+    return handleUnknownRepository(req, env, ctx, engine, url, route, ownerLower, repoLower);
+  }
+
   // Route table row 4: the synthetic HEAD file (a read).
   if (route.kind === "head") {
     if (req.method !== "GET") return engine.fetch(req, env, ctx);
-    const resolved = await resolveRepository(env.DB, route.owner.toLowerCase(), route.repo.toLowerCase());
-    if (resolved === null) return engine.fetch(req, env, ctx); // TODO(SPEC-0003 M3)
     const decision = await authorizeGitHttp({
       req,
       env,
@@ -86,18 +128,11 @@ export async function gitHttpGate(
       op: "read",
       repo: resolved.repo,
       owner: resolved.owner,
+      ownerVisibility: resolved.ownerVisibility,
+      unitAnonymousRead: false,
     });
     if (decision !== true) return decision;
-    return serveHead(env, route);
-  }
-
-  // info/refs + RPC data plane.
-  const resolved = await resolveRepository(env.DB, route.owner.toLowerCase(), route.repo.toLowerCase());
-  if (resolved === null) {
-    // TODO(SPEC-0003 M3): D1 row missing — transitional passthrough so repos
-    // that predate the registry (and the e2e suite) behave exactly as before
-    // the gate existed. The engine authorize hook decides.
-    return engine.fetch(req, env, ctx);
+    return serveHead(env, route, resolved.repo.defaultBranch);
   }
 
   // §2.1 item 2: service parse before auth, like upstream's httpBase switch
@@ -116,6 +151,13 @@ export async function gitHttpGate(
     }
   }
 
+  // Rows 4/5: only a private repo can carry the code unit's anonymous-read
+  // grant (a public repo is anonymous-readable anyway — row 1).
+  const unitAnonymousRead =
+    op === "read" && resolved.repo.visibility === "private"
+      ? await codeUnitAnonymousRead(env.DB, resolved.repo.id)
+      : false;
+
   // §2.1 items 3-4: SPEC-0002 auth + the §2.4 ACL matrix.
   const decision = await authorizeGitHttp({
     req,
@@ -124,42 +166,141 @@ export async function gitHttpGate(
     op,
     repo: resolved.repo,
     owner: resolved.owner,
+    ownerVisibility: resolved.ownerVisibility,
+    unitAnonymousRead,
   });
   if (decision !== true) return decision;
 
   // §2.1 item 5: invoke the engine and stream its response. The engine hook
   // sees the gate-cleared mark and waves the request through.
-  let forwarded: Request;
-  try {
-    forwarded = await prepareEngineRequest(req, url);
-  } catch {
-    // Malformed gzip surfaces on the first decompressed chunk — answer the
-    // upstream bare 400 before any engine/storage touch (§2.3, §4.6).
-    return bareBadRequest();
-  }
-  gateCleared.add(forwarded);
-  return engine.fetch(forwarded, env, ctx);
+  return forwardToEngine(req, url, env, ctx, engine);
 }
 
 /**
- * Synthetic HEAD file (§2.1 row 4): `ref: refs/heads/<head>` from the
- * engine's public `RepoCell.listRefs()` RPC — head is the resolved HEAD ref;
- * an empty/unborn repo falls back to the instance default branch.
- *
- * The DO is addressed by the engine's namespaced repo name (request casing),
- * which is where the engine stores this URL's data today. TODO(SPEC-0003 M2):
- * DO addressing switches to `storage_key` when lifecycle lands; the D1
- * `default_branch` column then replaces the DEFAULT_BRANCH fallback.
+ * Everything below runs only when the repositories row is missing (and no
+ * redirect claims the name): the push-create surface (§2.4 rows 15-20) plus
+ * the deliberate transitional passthrough.
  */
-async function serveHead(env: Env, route: GitHttpRoute): Promise<Response> {
-  let head: string | null = null;
-  try {
-    head = (await env.REPO.getByName(`${route.owner}/${route.repo}`).listRefs()).head;
-  } catch {
-    // Unreadable storage must not break the unborn-HEAD contract (§4.13);
-    // fall through to the default branch.
+async function handleUnknownRepository(
+  req: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  engine: DurableGitHandler<Env>,
+  url: URL,
+  route: GitHttpRoute,
+  ownerLower: string,
+  repoLower: string,
+): Promise<Response> {
+  // Reads and the HEAD file pass through untouched (the engine's public-read
+  // behavior for legacy repos is unchanged; §4.13's HEAD probe 404s there).
+  if (route.kind === "head") return engine.fetch(req, env, ctx);
+  // The receive-pack advert probe (GET info/refs?service=git-receive-pack) is
+  // the push-create probe; every other read (upload-pack, unknown/missing
+  // service) passes through — the engine answers its own 400 (§2.1 item 2).
+  let probe = false;
+  if (route.kind === "info-refs") {
+    const refsOp = infoRefsOp(url);
+    if (refsOp === null || refsOp === "read") return engine.fetch(req, env, ctx);
+    probe = true;
+  } else if (route.kind === "upload-pack") {
+    return engine.fetch(req, env, ctx);
   }
-  return headFile(head ?? `refs/heads/${DEFAULT_BRANCH}`);
+  // Only receive-pack (advert probe or RPC) reaches the push-create surface.
+  if (route.kind !== "receive-pack" && !probe) return engine.fetch(req, env, ctx);
+
+  // Row 15: anonymous pushes never reach push-create logic — 401 + challenge.
+  const credential = requestCredential(req);
+  if (credential === null) return basicChallenge();
+
+  // Verify SPEC-0002-style, WITHOUT limiter side effects: unverifiable
+  // credentials (the engine's GIT_TOKEN population, incl. the e2e suite)
+  // fall through to the engine hook, which owns their auth — identical to
+  // the pre-gate behavior for this population.
+  const verified = await new TokenService(env.DB).verify(credential).catch(() => null);
+  if (verified === null) return engine.fetch(req, env, ctx);
+
+  // Row 7 upstream of push-create: a verified token still needs write scope.
+  const scope = ScopeSet.parseLenient(verified.token.scopes);
+  if (!scope.has("write:repository")) return scopeForbidden();
+  // Row 11: disabled/prohibited doers never push-create.
+  if (verified.user.status === "prohibited") return accountDisabled();
+
+  // Upstream ordering quirk (§2.4 note): the enable-flag checks run BEFORE
+  // the dummy advertisement. cf-gitea defaults user push-create ON (§2.4
+  // documented divergence — a headless forge's primary create path) and org
+  // push-create awaits SPEC-0007, so the upstream "Push to create is not
+  // enabled …" 403s (rows 18/20) have no live branch: the probe serves the
+  // dummy empty advertisement (§2.2) and POST decides.
+  if (probe) return dummyAdvertisement();
+
+  // POST-time create. Own namespace by default; another namespace is site
+  // admin only (upstream PushCreateRepo, services/repository/repository.go:
+  // 87-96) and only when that owner exists and is active — everything else
+  // 404s (rows 16/20; the org-grant allow branch of row 19 lands with
+  // SPEC-0007 orgs).
+  let owner = { id: verified.user.id, usernameLower: verified.user.usernameLower };
+  if (ownerLower !== owner.usernameLower) {
+    if (!verified.user.isAdmin) return repositoryNotFound();
+    const ownerUser = await userByUsernameLower(env.DB, ownerLower);
+    if (ownerUser === null || ownerUser.status !== "active") return repositoryNotFound();
+    owner = { id: ownerUser.id, usernameLower: ownerUser.usernameLower };
+  }
+
+  const service = new RepoService(env.DB, { registry: env.REGISTRY.getByName("registry"), queue: env.REPO_TASKS });
+  let created: Awaited<ReturnType<RepoService["create"]>>;
+  try {
+    // §2.5.2: create BEFORE reading the pack, status='creating' guards the
+    // crash window (a half-usable repo must never look empty-but-ready);
+    // push-created repos default private (upstream DefaultPushCreatePrivate).
+    created = await service.create({ owner, name: route.repo, isPrivate: true, status: "creating" });
+  } catch (error) {
+    if (!(error instanceof RepoNameCollisionError)) throw error;
+    // §4.1 concurrent create-by-push: the UNIQUE(owner, slug) insert decided;
+    // the loser re-reads and proceeds with a normal receive against the
+    // now-existing repo (its commands are zero-id creates; the DO lease
+    // serializes the two finalizes).
+    const raced = await resolveRepository(env.DB, ownerLower, repoLower);
+    if (raced === null) return repositoryNotFound();
+    const decision = await authorizeGitHttp({
+      req,
+      env,
+      waitUntil: (p) => ctx.waitUntil(p),
+      op: "write",
+      repo: raced.repo,
+      owner: raced.owner,
+      ownerVisibility: raced.ownerVisibility,
+      unitAnonymousRead: false,
+    });
+    if (decision !== true) return decision;
+    // §2.5.2 finalize handshake (scheduled AFTER the response below — the
+    // async settle body starts at call time, so scheduling it before the
+    // forward would race the receive's finalize with an empty-DO listRefs).
+    const response = await forwardToEngine(req, url, env, ctx, engine);
+    ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`));
+    return response;
+  }
+
+  // The dummy advertisement bypassed the engine, so this POST is the repo
+  // DO's first contact: warm it once so beginReceive persists meta.repo (the
+  // engine's storage key) before the receive lease opens — otherwise the
+  // first pack would stage under an empty name and split the R2 prefixes.
+  try {
+    const warm = new Request(`${url.origin}/${route.owner}/${route.repo}/info/refs?service=git-receive-pack`);
+    markGateCleared(warm);
+    await engine.fetch(warm, env, ctx);
+  } catch {
+    // The receive below rebinds on its own path; a failed warm-up is not fatal.
+  }
+
+  // §2.5.2 finalize handshake: the engine's receivePack completes finalize
+  // BEFORE its response returns, so once the response is observable the
+  // outcome is settled — flip status/is_empty/default_branch on a committed
+  // first push, or undo the create when no ref landed. Scheduled AFTER the
+  // forward (the settle body starts at call time; scheduling it earlier would
+  // race the finalize with an empty-DO listRefs).
+  const response = await forwardToEngine(req, url, env, ctx, engine);
+  ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`));
+  return response;
 }
 
 /**
@@ -201,4 +342,120 @@ async function prepareEngineRequest(req: Request, url: URL): Promise<Request> {
     // stream passthrough (AGENTS.md: never buffer an unbounded body)
     ...(streams ? { duplex: "half" as const } : {}),
   });
+}
+
+/** Gate-cleared engine invocation (the shared §2.1 item 5 tail). */
+async function forwardToEngine(
+  req: Request,
+  url: URL,
+  env: Env,
+  ctx: ExecutionContext,
+  engine: DurableGitHandler<Env>,
+): Promise<Response> {
+  let forwarded: Request;
+  try {
+    forwarded = await prepareEngineRequest(req, url);
+  } catch {
+    // Malformed gzip surfaces on the first decompressed chunk — answer the
+    // upstream bare 400 before any engine/storage touch (§2.3, §4.6).
+    return bareBadRequest();
+  }
+  gateCleared.add(forwarded);
+  return engine.fetch(forwarded, env, ctx);
+}
+
+/**
+ * Synthetic HEAD file (§2.1 row 4): `ref: refs/heads/<head>` from the
+ * engine's public `RepoCell.listRefs()` RPC — head is the resolved HEAD ref;
+ * an empty/unborn repo falls back to the repo's D1 `default_branch` (the
+ * push-create adoption writes it, §2.5.2).
+ *
+ * The DO is addressed by the engine's combined repo name (request casing),
+ * which is where the engine stores this URL's data. TODO(SPEC-0003
+ * ENGINE-WAVE): DO addressing switches to `storage_key` when the engine
+ * accepts the override (see src/repos/service.ts).
+ */
+async function serveHead(env: Env, route: GitHttpRoute, defaultBranch: string): Promise<Response> {
+  let head: string | null = null;
+  try {
+    head = (await env.REPO.getByName(`${route.owner}/${route.repo}`).listRefs()).head;
+  } catch {
+    // Unreadable storage must not break the unborn-HEAD contract (§4.13);
+    // fall through to the default branch.
+  }
+  return headFile(head ?? `refs/heads/${defaultBranch}`);
+}
+
+/**
+ * §2.5.2 push-create finalize handshake. Runs after the receive response is
+ * observable (the engine commits refs before returning it):
+ *
+ * - refs/heads/* present → the create becomes real: `status='ready'`,
+ *   `is_empty=false`, `default_branch=<first pushed branch>` — one
+ *   conditional UPDATE (`status='creating' AND is_empty`), so a concurrent
+ *   settle/undo can never double-apply. The DO's `meta.head` CAS inside the
+ *   finalize transaction is the engine's missing RPC (see service.ts); until
+ *   then the synthetic HEAD endpoint resolves through D1 for unborn repos.
+ * - no branch ref (receive failed, client vanished, worker crashed
+ *   mid-receive) → the row is deleted again, conditional on
+ *   `status='creating' AND is_empty` — a half-usable repo never lingers.
+ *
+ * `refs_version` is deliberately not synced: the engine's finalize result
+ * carries no version (engine gap), and the column is observability-only.
+ */
+export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: string): Promise<void> {
+  try {
+    const db = drizzle(env.DB);
+    const row = await db.select().from(repositories).where(eq(repositories.id, repoId)).get();
+    if (row === undefined || row.status !== "creating" || !row.isEmpty) return;
+
+    let refNames: string[] | null = null;
+    try {
+      refNames = (await env.REPO.getByName(engineRepo).listRefs()).refs.map((r) => r.name);
+    } catch {
+      refNames = null; // unreadable/unwarming DO: treat as no refs
+    }
+    const branches = refNames?.filter((name) => name.startsWith("refs/heads/")) ?? [];
+
+    if (refNames === null || branches.length === 0) {
+      // Undo the create (§2.5.2: "deleted again, D1 conditional on
+      // status='creating' AND is_empty"). The FK-bearing dependents the
+      // create seeded (counters, units) go first, in the same batch.
+      await db.batch([
+        db.delete(repoCounters).where(eq(repoCounters.repoId, repoId)),
+        db.delete(repoUnits).where(eq(repoUnits.repoId, repoId)),
+        db
+          .delete(repositories)
+          .where(
+            and(
+              eq(repositories.id, repoId),
+              eq(repositories.status, "creating"),
+              eq(repositories.isEmpty, true),
+            ),
+          ),
+      ]);
+      return;
+    }
+
+    // First non-empty branch push adopts the default branch (§2.5.2,
+    // upstream pushNewBranch). listRefs orders by name, so a single-branch
+    // push — the dominant push-create shape — is exact; a multi-branch first
+    // push adopts the alphabetically first branch (upstream adopts the pushed
+    // branch; indistinguishable here without an engine hook).
+    const firstBranch = branches[0]?.slice("refs/heads/".length) ?? row.defaultBranch;
+    await db
+      .update(repositories)
+      .set({ status: "ready", isEmpty: false, defaultBranch: firstBranch, updatedAt: new Date() })
+      .where(
+        and(
+          eq(repositories.id, repoId),
+          eq(repositories.status, "creating"),
+          eq(repositories.isEmpty, true),
+        ),
+      );
+  } catch (error) {
+    console.error(
+      `[push-create] settle ${repoId} failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }

@@ -17,41 +17,146 @@ import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "driz
  * Every change here must go through `pnpm db:generate`; never hand-edit SQL
  * under drizzle/migrations (AGENTS.md).
  */
-export const repositories = sqliteTable("repositories", {
-  /** Immutable repository id; `storage_key` is derived as `r_<id>` (ADR-0001 D3). */
-  id: text("id").primaryKey(),
-  /** Immutable storage key (`r_<id>`); never changes on rename (SPEC-0001 §3). */
-  storageKey: text("storage_key").notNull().unique(),
-  /** Owner namespace (user or org slug); ownership model lands in SPEC-0002. */
-  ownerNamespace: text("owner_namespace").notNull(),
-  /** Repository slug within the owner namespace (renamable). */
-  slug: text("slug").notNull(),
-  /** Repository visibility. */
-  visibility: text("visibility", { enum: ["public", "private"] }).notNull(),
-  /** Bumped on every push; cache buster for edge ref caches (SPEC-0001 §5). */
-  refsVersion: integer("refs_version").notNull().default(0),
-  /** Storage backend routing; only 'self-hosted' exists today (ADR-0001 D1). */
-  backend: text("backend").notNull().default("self-hosted"),
-  // ---------------------------------------------------------------------------
-  // SPEC-0005 §3.2 maintained counters — updated in the same D1 batch as the
-  // state change (issue/PR create, close, reopen, milestone create/delete).
-  numIssues: integer("num_issues").notNull().default(0),
-  numClosedIssues: integer("num_closed_issues").notNull().default(0),
-  numPulls: integer("num_pulls").notNull().default(0),
-  numClosedPulls: integer("num_closed_pulls").notNull().default(0),
-  numMilestones: integer("num_milestones").notNull().default(0),
-  /** SPEC-0005 §4.6: whether commits on any branch may close issues (upstream
-   *  `CloseIssuesViaCommitInAnyBranch`, default false). */
-  closeIssuesViaCommitInAnyBranch: integer("close_issues_via_commit_in_any_branch", {
+export const repositories = sqliteTable(
+  "repositories",
+  {
+    /** Immutable repository id; `storage_key` is derived as `r_<id>` (ADR-0001 D3). */
+    id: text("id").primaryKey(),
+    /** Immutable storage key (`r_<id>`); never changes on rename (SPEC-0001 §3). */
+    storageKey: text("storage_key").notNull().unique(),
+    /** Owner namespace (user or org slug); ownership model lands in SPEC-0002. */
+    ownerNamespace: text("owner_namespace").notNull(),
+    /** SPEC-0003 §3.1: `users.id` of the owner. Plain column (no FK) per the
+     *  schema conventions above; `owner_namespace` is the case-folded lookup key
+     *  the git gate joins on, kept in lockstep by the rename/transfer service. */
+    ownerId: integer("owner_id"),
+    /** Repository slug within the owner namespace (renamable). */
+    slug: text("slug").notNull(),
+    /** Repository visibility. */
+    visibility: text("visibility", { enum: ["public", "private"] }).notNull(),
+    /** SPEC-0003 §2.5.1: instance default branch; push-create adopts the first
+     *  pushed branch (§2.5.2). */
+    defaultBranch: text("default_branch").notNull().default("main"),
+    /** SPEC-0003 §3.1: no refs advertised yet. Existing rows (engine-created
+     *  repos predating lifecycle) default true; dev-scratch only. */
+    isEmpty: integer("is_empty", { mode: "boolean" }).notNull().default(true),
+    /** SPEC-0003 §2.4 row 10: archived repos refuse pushes (clone stays OK). */
+    isArchived: integer("is_archived", { mode: "boolean" }).notNull().default(false),
+    /** SPEC-0003 §3.1: 'ready' | 'creating' | 'migrating' ('broken' reserved) —
+     *  mirrors upstream RepositoryStatus (models/repo/repo.go:146-149). */
+    status: text("status", { enum: ["ready", "creating", "migrating", "broken"] })
+    .notNull()
+    .default("ready"),
+    /** Bumped on every push; cache buster for edge ref caches (SPEC-0001 §5). */
+    refsVersion: integer("refs_version").notNull().default(0),
+    /** Storage backend routing; only 'self-hosted' exists today (ADR-0001 D1). */
+    backend: text("backend").notNull().default("self-hosted"),
+    // ---------------------------------------------------------------------------
+    // SPEC-0005 §3.2 maintained counters — updated in the same D1 batch as the
+    // state change (issue/PR create, close, reopen, milestone create/delete).
+    numIssues: integer("num_issues").notNull().default(0),
+    numClosedIssues: integer("num_closed_issues").notNull().default(0),
+    numPulls: integer("num_pulls").notNull().default(0),
+    numClosedPulls: integer("num_closed_pulls").notNull().default(0),
+    numMilestones: integer("num_milestones").notNull().default(0),
+    /** SPEC-0005 §4.6: whether commits on any branch may close issues (upstream
+     *  `CloseIssuesViaCommitInAnyBranch`, default false). */
+    closeIssuesViaCommitInAnyBranch: integer("close_issues_via_commit_in_any_branch", {
     mode: "boolean",
-  })
+    })
     .notNull()
     .default(false),
-  /** Row creation timestamp (unix epoch seconds). */
-  createdAt: integer("created_at", { mode: "timestamp" })
+    /** Row creation timestamp (unix epoch seconds). */
+    createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .default(sql`(unixepoch())`),
-});
+    /** Row mutation timestamp (unix epoch seconds). Nullable: SQLite forbids
+     *  non-constant defaults in ALTER TABLE ADD COLUMN, so the lifecycle
+     *  service sets it explicitly on every rename/transfer/status write. */
+    updatedAt: integer("updated_at", { mode: "timestamp" }),
+  },
+  (t) => [
+    // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point
+    // for every create path" — the §4.1 concurrent push-create race, rename
+    // collisions and recreate-after-delete all decide here (the landed
+    // owner/slug columns stand in for owner_id/lower_name).
+    uniqueIndex("repositories_owner_slug_uq").on(t.ownerNamespace, t.slug),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// SPEC-0003 §3.1 — lifecycle tables: redirects, pending transfers, units.
+// ---------------------------------------------------------------------------
+
+/**
+ * Old-URL → repo mapping after rename/transfer (SPEC-0003 §2.5.3/§2.5.4;
+ * port of upstream `repo_redirect`, models/repo/redirect.go:27-33).
+ * `UNIQUE(owner_id, lower_name)` is the shadow rule: at most one redirect per
+ * (owner, name), deleted before a rename/create claims the name (§4.11).
+ * `owner_namespace` is the case-folded lookup key (the git gate's row-13
+ * check resolves old URLs without a users join).
+ */
+export const repoRedirects = sqliteTable(
+  "repo_redirects",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Owner namespace at the time of the redirect (users.id). */
+    ownerId: integer("owner_id").notNull(),
+    /** Case-folded owner name the old URL was filed under. */
+    ownerNamespace: text("owner_namespace").notNull(),
+    /** Case-folded old repository name. */
+    lowerName: text("lower_name").notNull(),
+    /** The repository the old URL now serves. */
+    redirectRepoId: text("redirect_repo_id").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" })
+      .notNull()
+      .default(sql`(unixepoch())`),
+  },
+  (t) => [
+    uniqueIndex("repo_redirects_owner_name_uq").on(t.ownerId, t.lowerName),
+    index("repo_redirects_lookup_idx").on(t.ownerNamespace, t.lowerName),
+    index("repo_redirects_repo_idx").on(t.redirectRepoId),
+  ],
+);
+
+/**
+ * Pending transfer (SPEC-0003 §2.5.4; upstream `repo_transfer`). One live
+ * request per repo (`repo_id` UNIQUE); the repo stays fully usable while the
+ * row exists. Teams column deferred to SPEC-0005.
+ */
+export const repoTransfer = sqliteTable(
+  "repo_transfer",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: text("repo_id").notNull().unique(),
+    /** Who filed the request. */
+    doerId: integer("doer_id").notNull(),
+    /** Target owner (users.id). */
+    newOwnerId: integer("new_owner_id").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" })
+      .notNull()
+      .default(sql`(unixepoch())`),
+  },
+);
+
+/**
+ * Per-repo units (SPEC-0003 §3.1, minimal: 'code' only; extended in 0005).
+ * `anonymous_access_mode` backs ACL rows 4/5 (upstream
+ * `RepoUnit.AnonymousAccessMode`, git_smart_http_test.go:163-189).
+ */
+export const repoUnits = sqliteTable(
+  "repo_units",
+  {
+    repoId: text("repo_id").notNull(),
+    /** Unit type; 'code' is the only unit today. */
+    type: text("type", { enum: ["code"] }).notNull().default("code"),
+    /** What anonymous visitors may do on this unit: 'none' | 'read'. */
+    anonymousAccessMode: text("anonymous_access_mode", { enum: ["none", "read"] })
+      .notNull()
+      .default("none"),
+  },
+  (t) => [primaryKey({ columns: [t.repoId, t.type] })],
+);
 
 // ---------------------------------------------------------------------------
 // SPEC-0005 §3.1 — per-repo monotonic issue/PR number allocation.
@@ -95,6 +200,13 @@ export const users = sqliteTable(
     status: text("status", { enum: ["active", "prohibited"] })
       .notNull()
       .default("active"),
+    /** SPEC-0003 §2.5.6 — upstream VisibleType
+     *  (modules/structs/visible_type.go:9-18): 'public' | 'limited' (repos
+     *  visible to any authenticated principal) | 'private' (owner + site
+     *  admin only). Gates ACL row 2 alongside `repositories.visibility`. */
+    visibility: text("visibility", { enum: ["public", "limited", "private"] })
+      .notNull()
+      .default("public"),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   },
   (t) => [uniqueIndex("users_username_lower_uq").on(t.usernameLower)],
@@ -474,6 +586,11 @@ export const commitStatuses = sqliteTable(
   },
   (t) => [index("commit_statuses_repo_sha_idx").on(t.repoId, t.sha)],
 );
+
+// Canonical row types for consumers (API/services); feature modules may
+// re-derive their own — these stay the shared reference.
+export type CommitStatusRow = typeof commitStatuses.$inferSelect;
+export type LabelRow = typeof labels.$inferSelect;
 
 /** Issue pins (tier-2 surface, table now per §3.2). */
 export const issuePins = sqliteTable("issue_pins", {

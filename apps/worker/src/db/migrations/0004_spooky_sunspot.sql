@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `repositories_owner_slug_uq` ON `repositories` (`owner_namespace`,`slug`);

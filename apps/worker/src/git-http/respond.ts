@@ -66,6 +66,53 @@ export function repositoryArchived(): Response {
 }
 
 /**
+ * Row 13 / §2.5.3: a renamed (or transferred) repository's old URL answers
+ * `301` to the canonical path, preserving the `.git` suffix, the sub-route
+ * tail and the query string — BEFORE any auth challenge (githttp.go:117-119,
+ * `LookupRedirect` at services/context/repo.go:420-436; the ordering is
+ * required by git clients, per the upstream test comment at
+ * tests/integration/git_smart_http_test.go:139).
+ */
+export function redirectPermanent(originalUrl: string, ownerNamespace: string, slug: string): Response {
+  const source = new URL(originalUrl);
+  const target = new URL(source.origin);
+  // Raw (still-encoded) path: ["", owner, repo(.git)?, ...tail]. The `.git`
+  // suffix and the tail are preserved verbatim so git clients re-request the
+  // identical resource at the canonical location (§2.5.3).
+  const segments = source.pathname.split("/");
+  const repoSegment = segments[2] ?? "";
+  const gitSuffix = repoSegment.endsWith(".git") ? ".git" : "";
+  const tail = segments.slice(3).join("/");
+  target.pathname = `/${encodeURIComponent(ownerNamespace)}/${encodeURIComponent(slug)}${gitSuffix}${tail ? `/${tail}` : ""}`;
+  target.search = source.search;
+  return new Response(`Moved Permanently\n`, {
+    status: 301,
+    headers: { location: target.toString(), "content-type": "text/plain;charset=utf-8" },
+  });
+}
+
+/**
+ * Dummy empty advertisement for the push-create probe (§2.2/§2.4 rows 15-20,
+ * upstream `dummyInfoRefs` githttp.go:268-300): the exact bytes a fresh empty
+ * repository would advertise for receive-pack — `# service=` pkt-line, flush,
+ * `<zero-oid> capabilities^{}` with the engine's receive capability set, flush —
+ * so the client believes the repo exists and sends zero-id create commands
+ * (§2.5.2; no protocol special-casing needed).
+ */
+export function dummyAdvertisement(): Response {
+  const zeroOid = "0".repeat(40);
+  // pkt-line payload: 40 oid + space + 15 "capabilities^{}" + NUL + caps + LF
+  const capabilities = "report-status delete-refs ofs-delta side-band-64k agent=dgit/0.3";
+  const payload = `${zeroOid} capabilities^{}\0${capabilities}\n`;
+  const pkt = (s: string): string => `${(s.length + 4).toString(16).padStart(4, "0")}${s}`;
+  const body = `${pkt("# service=git-receive-pack\n")}0000${pkt(payload)}0000`;
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "application/x-git-receive-pack-advertisement", ...NO_CACHE_HEADERS },
+  });
+}
+
+/**
  * Protocol-level 400: upstream writes the bare status code with no body and
  * no Content-Type (githttp.go:82-84 unknown service, :376-381 content-type
  * mismatch, :400-403 malformed gzip).

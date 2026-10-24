@@ -56,6 +56,31 @@
     ]
   },
 
+  // Queues: REPO_TASKS drives the repo delete purge (SPEC-0003 §2.5.5 steps
+  // 2-3: D1 tx → DO tombstone → queue → R2 prefix purge). Batch 1 + a single
+  // in-flight delivery keep each purge inside its own subrequest budget; the
+  // consumer's steps are idempotent, so redelivery is safe. The import
+  // indexing consumer (§2.6) joins this queue in SPEC-0003 M5.
+  "queues": {
+    "producers": [
+      {
+        "binding": "REPO_TASKS",
+        "queue": "repo-tasks"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "repo-tasks",
+        "max_batch_size": 1,
+        "max_concurrency": 1,
+        "max_retries": 5
+        // No dead_letter_queue yet: after max_retries the message is dropped
+        // with an observability-log trace per attempt (the admin-notice
+        // equivalent). A DLQ joins when the import consumer (M5) lands.
+      }
+    ]
+  },
+
   // Secrets (names only — values are NEVER in this file; AGENTS.md Workers
   // rules). `wrangler types` includes these in Env even without .dev.vars, so
   // CI typechecks stay honest; local dev supplies values via .dev.vars (copy
