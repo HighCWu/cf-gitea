@@ -654,3 +654,71 @@ describe("gitHttpGate LFS interception (SPEC-0006 §2.1)", () => {
     expect(await response.json()).toEqual({ message: "Unauthorized" });
   });
 });
+
+// --- SPEC-0008 §2.2: the Tier-2 UI mount ---------------------------------------
+
+describe("Tier-2 UI mount (dispatcher branch order: api → ui → gate)", () => {
+  it("answers /:owner/:repo with the 404-in-shell (text/html), not the engine's JSON 404", async () => {
+    const response = await SELF.fetch("https://example.com/demo/absent");
+
+    // The engine runs headless (ui: false); the mounted uiRouter owns the
+    // bare repo-home family and renders the §4.5 shell even for a repo with
+    // no D1 row (bare 404 shell, no repo context).
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+    expect(await response.text()).toContain("<html");
+  });
+
+  it("keeps the git protocol routes on the gate beside a same-named UI page", async () => {
+    await seedAclFixtures();
+    await seedEngineRegistry("alice/public");
+
+    // The bare repo URL is a UI family; the protocol URL one segment deeper
+    // never reaches the sub-app.
+    const page = await SELF.fetch("https://example.com/alice/public");
+    expect(page.status).toBe(404);
+    expect(page.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+
+    const advert = await SELF.fetch("https://example.com/alice/public.git/info/refs?service=git-upload-pack");
+    expect(advert.status).toBe(200);
+    expect(advert.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+    const body = new TextDecoder().decode(await advert.arrayBuffer());
+    expect(body).toContain("# service=git-upload-pack");
+  });
+
+  it("keeps the engine JSON API passthrough off the UI router", async () => {
+    const response = await SELF.fetch("https://example.com/demo/absent/api/refs");
+
+    // Not a UI family (third segment) → gate → engine verbatim, its headless
+    // JSON 404 shape — the passthrough identity the e2e suite pins.
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).toContain("application/json");
+  });
+
+  it("serves the UI families GET-only: other methods and trailing slashes keep the engine", async () => {
+    // The engine admin DELETE (how the vendored e2e suite deletes repos) must
+    // reach the engine — its own GIT_TOKEN challenge (the D1-missing
+    // passthrough runs the engine hook, not the ACL matrix), never a
+    // UI-family 404.
+    const del = await SELF.fetch("https://example.com/demo/absent", { method: "DELETE" });
+    expect(del.status).toBe(401);
+    expect(del.headers.get("www-authenticate")).toBe('Basic realm="dgit"');
+
+    // Trailing-slash family URLs keep their pre-UI owner (§4.13
+    // canonicalization is the router's concern; the dispatcher does not
+    // claim the shape) — no 301, no shell.
+    const slashed = await SELF.fetch("https://example.com/demo/absent/");
+    expect(slashed.status).toBe(404);
+    expect(slashed.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
+
+    // HEAD/POST: no UI answer, no challenge (404 status parity with the
+    // pre-UI engine answer).
+    const head = await SELF.fetch("https://example.com/demo/absent", { method: "HEAD" });
+    expect(head.status).toBe(404);
+    expect(head.headers.get("www-authenticate")).toBeNull();
+
+    const post = await SELF.fetch("https://example.com/demo/absent", { method: "POST", body: "" });
+    expect(post.status).toBe(404);
+    expect(post.headers.get("www-authenticate")).toBeNull();
+  });
+});

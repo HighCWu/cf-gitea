@@ -189,7 +189,7 @@ describe("upload op per-object table", () => {
     expect(result.error).toBeUndefined();
     expect(result.actions?.upload).toEqual({
       href: relayUploadHref(RELAY_BASE, OID.UPLOAD, SIZE),
-      header: { "Transfer-Encoding": "chunked", Authorization: AUTH },
+      header: { Authorization: AUTH }, // chunked hint dropped (411 conflict, lfs-e2e)
     });
     expect(result.actions?.verify).toEqual({
       href: relayVerifyHref(RELAY_BASE),

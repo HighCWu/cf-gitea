@@ -3,7 +3,8 @@
  * worker path (gate branch → router → services) for the default RELY store
  * mode, plus a direct `serveLfs` pass for presign mode — both href modes of
  * the batch roundtrip. git-lfs client-shaped fixtures (Accept/Content-Type
- * media types, `transfers`/`ref` envelopes, Transfer-Encoding chunked hints)
+ * media types, `transfers`/`ref` envelopes; relay upload hints carry no
+ * Transfer-Encoding since 59a0776 — clients must send Content-Length)
  * and the upstream error tables throughout.
  */
 
@@ -423,7 +424,7 @@ describe("LFS batch envelope (§2.2, upstream error tables)", () => {
     expect(body.objects[0]?.oid).toBe(oid);
     expect(body.objects[0]?.actions.upload).toEqual({
       href: `${repoUrl(fixtures.privateRepo)}/info/lfs/objects/${oid}/${bytes.byteLength}`,
-      header: { "Transfer-Encoding": "chunked", Authorization: auth },
+      header: { Authorization: auth }, // chunked hint dropped (411 conflict, lfs-e2e)
     });
     expect(body.objects[0]?.actions.verify).toEqual({
       href: `${repoUrl(fixtures.privateRepo)}/info/lfs/verify`,
