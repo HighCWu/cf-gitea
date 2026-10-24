@@ -326,18 +326,19 @@ export function registerHookRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Middle
     const deliveryId = await fireTestDelivery(c.env.DB, hook, "push", payload, { repoId: found.repo.id });
     const queue = webhookDeliveryQueue(c.env);
     if (queue !== null) {
-      // c.executionCtx exists only inside a real worker invocation; in-process
-      // callers (tests via app.request) have none — the row already sits
-      // `pending` (the durable source of truth), so skipping the enqueue
-      // outside a request context is the documented safe path.
-      // ExecutionContext here is Hono's (fetch-scoped, no tracing/abort);
-      // the runtime global type drifted in generated worker-configuration.
-      let execCtx: ReturnType<typeof c.executionCtx> | undefined;
-      try {
-        execCtx = c.executionCtx;
-      } catch {
-        execCtx = undefined;
-      }
+      // c.executionCtx throws outside a real worker invocation (in-process
+      // test callers have none — the pending D1 row is the durable truth, so
+      // skipping the enqueue there is safe). Its VALUE is the runtime
+      // ExecutionContext; grab the type from the getter's return without
+      // naming the drifted generated global.
+      const tryGetCtx = (): ReturnType<typeof c.executionCtx> | undefined => {
+        try {
+          return c.executionCtx;
+        } catch {
+          return undefined;
+        }
+      };
+      const execCtx = tryGetCtx();
       if (execCtx !== undefined) {
         execCtx.waitUntil(
           queue.sendBatch([{ deliveryId }]).then(undefined, (error: unknown) => {
