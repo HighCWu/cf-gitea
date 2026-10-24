@@ -26,7 +26,7 @@
  * vitest uses — and the bundled module exports `getGeneratedSpec()`. Run via
  * the root script: `pnpm check:api`.
  */
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -130,18 +130,32 @@ async function loadGeneratedSpec() {
   const { build } = await import(workerRequire.resolve("vite"));
 
   const outDir = await mkdtemp(path.join(tmpdir(), "cf-gitea-openapi-"));
+  // The bundled api graph reaches the vendored engine's SOURCES (the package
+  // entry is src/mod.ts, and the api layer imports its commit serializers at
+  // value level), and engine sources `import { DurableObject } from
+  // "cloudflare:workers"` — a workerd-virtual module plain-node vite can
+  // neither resolve nor execute. Merely marking it external would leave a
+  // static import this script's `await import()` cannot serve. getGeneratedSpec()
+  // only walks the route registry (no handler runs, no Durable Object is ever
+  // constructed), so the module stands in as the bare base class the engine
+  // DO classes extend. The stub lives in its own temp dir, removed below.
+  const stubDir = await mkdtemp(path.join(tmpdir(), "cf-gitea-openapi-stub-"));
+  const workersStub = path.join(stubDir, "cloudflare-workers.mjs");
+  await writeFile(workersStub, "export class DurableObject {}\n");
   try {
     await build({
       root: WORKER_DIR,
       configFile: false,
       logLevel: "warn",
       build: { ssr: SPEC_ENTRY, outDir, emptyOutDir: true, minify: false },
+      resolve: { alias: [{ find: /^cloudflare:workers$/, replacement: workersStub }] },
       ssr: { noExternal: true },
     });
     const module = await import(pathToFileURL(path.join(outDir, "openapi.js")).href);
     return module.getGeneratedSpec();
   } finally {
     await rm(outDir, { recursive: true, force: true });
+    await rm(stubDir, { recursive: true, force: true });
   }
 }
 
