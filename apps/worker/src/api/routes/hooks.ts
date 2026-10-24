@@ -326,11 +326,23 @@ export function registerHookRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Middle
     const deliveryId = await fireTestDelivery(c.env.DB, hook, "push", payload, { repoId: found.repo.id });
     const queue = webhookDeliveryQueue(c.env);
     if (queue !== null) {
-      c.executionCtx.waitUntil(
-        queue.sendBatch([{ deliveryId }]).then(undefined, (error: unknown) => {
-          console.error(`[hooks] delivery enqueue failed for ${deliveryId}: ${errorMessage(error)}`);
-        }),
-      );
+      // c.executionCtx exists only inside a real worker invocation; in-process
+      // callers (tests via app.request) have none — the row already sits
+      // `pending` (the durable source of truth), so skipping the enqueue
+      // outside a request context is the documented safe path.
+      let execCtx: ExecutionContext | undefined;
+      try {
+        execCtx = c.executionCtx;
+      } catch {
+        execCtx = undefined;
+      }
+      if (execCtx !== undefined) {
+        execCtx.waitUntil(
+          queue.sendBatch([{ deliveryId }]).then(undefined, (error: unknown) => {
+            console.error(`[hooks] delivery enqueue failed for ${deliveryId}: ${errorMessage(error)}`);
+          }),
+        );
+      }
     }
     return c.body(null, 204);
   });
