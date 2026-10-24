@@ -85,8 +85,10 @@
  *    ```
  *
  *    Producer side: pass
- *    `(ids) => env.WEBHOOK_DELIVERY.sendBatch(ids.map((deliveryId) => ({ deliveryId })))`
- *    as `emitWebhookDeliveries`' `enqueue` callback. `cleanupWebhookDeliveries`
+ *    `(ids) => env.WEBHOOK_DELIVERY.sendBatch(ids.map((deliveryId) => ({ body: { deliveryId } })))`
+ *    as `emitWebhookDeliveries`' `enqueue` callback (the `body` wrapper is the
+ *    queue envelope — workerd rejects a bare body-less message with
+ *    "Message body cannot be undefined"). `cleanupWebhookDeliveries`
  *    + `sweepStuckDeliveries` (./dlq) hang off the cron/periodic job
  *    (`scheduled` handler + `"triggers": {"crons": [...]}` in wrangler.jsonc).
  * ---------------------------------------------------------------------------

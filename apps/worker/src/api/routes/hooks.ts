@@ -238,10 +238,10 @@ async function requireVisibleRepo(c: Context<ApiEnv>, path: { owner: string; rep
  */
 function webhookDeliveryQueue(
   env: ApiEnv["Bindings"],
-): { sendBatch(messages: WebhookDeliveryMessage[]): Promise<unknown> } | null {
+): { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null {
   const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
   if (candidate === undefined || candidate === null) return null;
-  const queue = candidate as { sendBatch?: (messages: WebhookDeliveryMessage[]) => Promise<unknown> };
+  const queue = candidate as { sendBatch?: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> };
   return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
 }
 
@@ -340,7 +340,7 @@ export function registerHookRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Middle
       }
       if (execCtx !== undefined) {
         execCtx.waitUntil(
-          queue.sendBatch([{ deliveryId }]).then(undefined, (error: unknown) => {
+          queue.sendBatch([{ body: { deliveryId } }]).then(undefined, (error: unknown) => {
             console.error(`[hooks] delivery enqueue failed for ${deliveryId}: ${errorMessage(error)}`);
           }),
         );

@@ -294,10 +294,10 @@ function canEditPullRequest(c: Context<ApiEnv>, found: RepositoryWithOwner, post
 /** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired. */
 function webhookDeliveryQueue(
   env: ApiEnv["Bindings"],
-): { sendBatch(messages: WebhookDeliveryMessage[]): Promise<unknown> } | null {
+): { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null {
   const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
   if (candidate === undefined || candidate === null) return null;
-  const queue = candidate as { sendBatch?: (messages: WebhookDeliveryMessage[]) => Promise<unknown> };
+  const queue = candidate as { sendBatch?: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> };
   return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
 }
 
@@ -322,7 +322,7 @@ async function emitPullWebhook(
         queue !== null && execCtx !== undefined
           ? (deliveryIds) => {
               execCtx.waitUntil(
-                queue.sendBatch(deliveryIds.map((deliveryId) => ({ deliveryId }))).then(undefined, (error: unknown) => {
+                queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(undefined, (error: unknown) => {
                   console.error(`[pulls] delivery enqueue failed (${input.eventType}): ${errorMessage(error)}`);
                 }),
               );
