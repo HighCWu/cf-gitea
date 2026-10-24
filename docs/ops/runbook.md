@@ -85,5 +85,10 @@ per engine milestone (M2 lands the first).
 - **`no such table` from the worker in dev**: run `pnpm db:migrate:local`.
 - **Contract check fails after a submodule move**: that is ADR-0002's re-pin
   procedure, not a bug — see `apps/worker/src/compat/contract/README.md`.
+- **Push fails with HTTP 413 (content too large)**: the Cloudflare proxy caps
+  request bodies (~100 MB on non-Enterprise plans) before the Worker runs —
+  verified empirically 2026-10-24 (110 MiB push → 413). Route histories above
+  the cap through the import channel (SPEC-0003 §2.6; presigned R2 uploads
+  bypass the proxy) or negotiate a higher plan body limit.
 - **e2e new failures beyond the allowlist**: bisect against the gate/engine
   changes; CI fails the build on any divergence by design.
