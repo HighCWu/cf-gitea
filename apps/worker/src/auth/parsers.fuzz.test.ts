@@ -65,7 +65,8 @@ describe("fuzz: Authorization header parsing never throws", () => {
       // Real shape: { basicAuth | null, bearerToken | null } (httpauth.ts)
       if ((parsed as { basicAuth: unknown }).basicAuth !== null) basics++;
       if ((parsed as { bearerToken: unknown }).bearerToken !== null) bears++;
-      basicAuthTokenCandidate(parsed); // must never throw either
+      // candidate extraction consumes a parsed Basic header; total-function check
+      basicAuthTokenCandidate(parsed as never);
     }
     expect(bears + basics).toBeGreaterThan(0);
   });

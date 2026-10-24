@@ -63,6 +63,13 @@
   // indexing consumer (§2.6) joins this queue in SPEC-0003 M5.
   "queues": {
     "producers": [
+      { "binding": "WEBHOOK_DELIVERY", "queue": "webhook-delivery" }
+    ],
+    "consumers": [
+      { "queue": "webhook-delivery", "max_retries": 3, "dead_letter_queue": "webhook-delivery-dlq" },
+      { "queue": "webhook-delivery-dlq", "max_retries": 1, "max_batch_size": 10 }
+    ],
+    "producers": [
       {
         "binding": "REPO_TASKS",
         "queue": "repo-tasks"

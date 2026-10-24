@@ -2,9 +2,12 @@ import { Hono } from "hono";
 
 import { createDurableGit, Registry, RepoCell } from "@cf-gitea/git-engine";
 import { resolveAuth, tokenRouter } from "./auth";
+import { createApiRouter } from "./api/router";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
+import { webhookDlqHandler } from "./webhooks/dlq";
+import { webhookQueueHandler } from "./webhooks/consumer";
 
 /**
  * Git smart-HTTP engine mount (SPEC-0001 M1).
@@ -31,11 +34,13 @@ const app = new Hono<{ Bindings: Env }>();
 app.get("/healthz", (c) => c.json({ ok: true }));
 
 // /api/v1 (SPEC-0002/0004): resolveAuth parses credentials (anonymous stays
-// anonymous); tokenRouter carries the token CRUD. The zod-openapi API router
-// (version/user, then tier-1 batches) mounts alongside once its real auth
-// resolver wiring lands with the tier-1 batch work.
+// anonymous; its D1-verified identity wins inside the api middlewares);
+// tokenRouter carries token CRUD; createApiRouter mounts the zod-openapi
+// tier-1 surface (version/user/repos/users/markdown + batches), declared
+// against the frozen contract (pnpm check:api).
 app.use("/api/v1/*", resolveAuth());
 app.route("/api/v1", tokenRouter);
+app.route("/api/v1", createApiRouter());
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -62,9 +67,16 @@ export default {
     return app.fetch(req, env, ctx);
   },
 
-  // REPO_TASKS consumer (SPEC-0003 §2.5.5): the delete purge — DO tombstone
-  // retry, R2 prefix purge, registry removal (src/repos/purge.ts).
-  async queue(batch, env, _ctx) {
+  // Queue consumers: REPO_TASKS = delete purge (SPEC-0003 §2.5.5);
+  // webhook-delivery (+dlq) = SPEC-0005 §3.6 deliveries. The runtime
+  // delivers MessageBatch<unknown>; each consumer narrows to its own type.
+  async queue(batch: MessageBatch<unknown>, env: Env, _ctx: ExecutionContext) {
+    if (batch.queue === "webhook-delivery-dlq") {
+      return webhookDlqHandler(batch as unknown as Parameters<typeof webhookDlqHandler>[0], env, _ctx);
+    }
+    if (batch.queue === "webhook-delivery") {
+      return webhookQueueHandler(batch as unknown as Parameters<typeof webhookQueueHandler>[0], env, _ctx);
+    }
     await handleRepoTasks(batch, env);
   },
 } satisfies ExportedHandler<Env>;
