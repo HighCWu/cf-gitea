@@ -19,3 +19,4 @@ coverage/
 **/dist-types/
 .bench-fixtures/
 .bench-results/
+apps/worker/public/assets/

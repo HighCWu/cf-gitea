@@ -1,0 +1,14 @@
+/assets/js/*
+  Cache-Control: public, max-age=31536000, immutable
+/assets/css/*
+  Cache-Control: public, max-age=31536000, immutable
+/assets/fonts/*
+  Cache-Control: public, max-age=31536000, immutable
+/assets/.vite/manifest.json
+  Cache-Control: public, max-age=300
+/assets/img/*
+  Cache-Control: public, max-age=3600
+/assets/emoji.json
+  Cache-Control: public, max-age=3600
+/assets/licenses.txt
+  Cache-Control: public, max-age=3600
