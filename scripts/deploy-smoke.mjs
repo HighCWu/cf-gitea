@@ -27,8 +27,12 @@
  *      proves the git smart-HTTP surface answers; headers asserted sane.
  *   c. with --token: authenticated receive advert on a fresh random repo
  *      (200 + pkt-line `# service=git-receive-pack` + `capabilities^{}`),
- *      then a REAL tiny push (temp dir, one commit, `git push`), then
- *      `git ls-remote` asserting the ref, then best-effort cleanup via the
+ *      then a REAL tiny push (temp dir, one commit, `git push`), then an
+ *      AUTHENTICATED `git ls-remote` asserting the ref (retried briefly to
+ *      clear the §2.5.2 settle window), then the security property — the
+ *      ANONYMOUS upload-pack advert must 401-challenge (the smoke repo is
+ *      private, SPEC-0003 §2.4 row 2; a 200 here serves its refs to the
+ *      world and is reported as FAIL) — then best-effort cleanup via the
  *      engine's DELETE endpoint (a failed cleanup is documented, not fatal).
  *   d. --migrate-check: `wrangler d1 execute cf-gitea --remote --json` over
  *      sqlite_master — every expected table must exist (missing ones are
@@ -49,6 +53,7 @@ import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import process from "node:process";
+import { setTimeout as sleep } from "node:timers/promises";
 import { URL, fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -248,13 +253,19 @@ const checkReceiveAdvert = async (user, repo) => {
 const GIT_ENV = { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "echo" };
 const git = (args, cwd) => run("git", ["-c", "credential.helper=", ...args], { cwd, env: GIT_ENV });
 
+/** Settle-window retry budget for the post-push read-side checks: the §2.5.2
+ *  settle runs in waitUntil AFTER the push response (production measured it
+ *  visible by ~t+2.3s), so reads are retried up to ~5 s at 500 ms intervals. */
+const SETTLE_RETRY_MS = 5_000;
+const SETTLE_RETRY_INTERVAL_MS = 500;
+
 const checkPushAndLsRemote = async (user, repo) => {
   const target = new URL(opts.baseUrl);
   const basePath = target.pathname.replace(/\/+$/, "");
   const pushUrl =
     `${target.protocol}//${encodeURIComponent(user)}:${encodeURIComponent(opts.token)}@${target.host}` +
     `${basePath}/${user}/${repo}.git`;
-  const anonUrl = `${opts.baseUrl}/${user}/${repo}.git`;
+  const anonAdvertUrl = `${opts.baseUrl}/${user}/${repo}.git/info/refs?service=git-upload-pack`;
 
   const tmp = await mkdtemp(path.join(os.tmpdir(), "cf-gitea-smoke-"));
   try {
@@ -270,14 +281,42 @@ const checkPushAndLsRemote = async (user, repo) => {
     r = await git(["push", pushUrl, "HEAD:refs/heads/main"], tmp);
     expect(r.ok, `git push failed: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
 
-    r = await git(["ls-remote", anonUrl, "refs/heads/main"]);
-    expect(r.ok, `git ls-remote failed: ${r.stderr.trim()}`);
+    // The pushed repo is PRIVATE (push-create default, DefaultPushCreatePrivate):
+    // reads need the credential. ls-remote with the token, retried across the
+    // settle window (the advert may not be servable the instant push returns).
+    let lastErr = "";
+    const deadline = Date.now() + SETTLE_RETRY_MS;
+    for (;;) {
+      r = await git(["ls-remote", pushUrl, "refs/heads/main"]);
+      if (r.ok) break;
+      lastErr = (r.stderr || r.stdout).trim();
+      if (Date.now() + SETTLE_RETRY_INTERVAL_MS >= deadline) break;
+      await sleep(SETTLE_RETRY_INTERVAL_MS);
+    }
+    expect(r.ok, `authenticated git ls-remote failed: ${lastErr.slice(0, 300)}`);
     const lines = r.stdout.trim().split("\n").filter(Boolean);
     expect(lines.length === 1, `ls-remote returned ${lines.length} refs (expected exactly refs/heads/main): ${r.stdout.trim()}`);
     const [oid, ref] = lines[0].split("\t");
     expect(/^[0-9a-f]{40}$/.test(oid) && !/^0+$/.test(oid), `ls-remote returned a non-oid: ${lines[0]}`);
     expect(ref === "refs/heads/main", `ls-remote returned ${ref} (expected refs/heads/main)`);
-    return `pushed ${oid.slice(0, 10)}…, ls-remote sees ${ref}`;
+
+    // Security property (SPEC-0003 §2.4 row 2): the anonymous upload-pack
+    // advert must 401-challenge on this private repo — a 200 serves its refs
+    // to the world (the 2026-10-24 read leak this check exists to catch).
+    let anon;
+    const anonDeadline = Date.now() + SETTLE_RETRY_MS;
+    for (;;) {
+      anon = await fetchT(anonAdvertUrl);
+      await anon.text(); // drain the body either way
+      if (anon.status === 401 || Date.now() >= anonDeadline) break;
+      await sleep(SETTLE_RETRY_INTERVAL_MS);
+    }
+    expect(anon.status === 401,
+      `anonymous advert status ${anon.status} (expected 401 — the smoke repo is private; 200 would serve its refs anonymously)`);
+    expect(String(anon.headers.get("www-authenticate") ?? "").includes("Basic"),
+      "anonymous 401 without a www-authenticate: Basic challenge");
+
+    return `pushed ${oid.slice(0, 10)}…, authed ls-remote sees ${ref}, anonymous advert 401 Basic challenge`;
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
