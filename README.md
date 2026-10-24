@@ -22,11 +22,15 @@ Deep-dive: [ADR-0001](docs/decisions/0001-technical-direction.md) ·
 
 ## Status
 
-Early construction. Engine vendored and wired for local dev; SPECs 0001–0005 written;
-auth, `/api/v1` skeleton, and CI landing now. See the [SPEC index](specs/) and
-[ADR-0002](docs/decisions/0002-contract-freeze.md) for the compatibility-contract
-freeze (the vendored `gitea/` submodule's swagger at its pinned commit is the
-authoritative API contract).
+**Live** (first deploy 2026-10-24): <https://cf-gitea.hecongw.workers.dev> — real git
+hosting works end to end against it (PAT-authenticated push, clone, token API). Landed:
+vendored engine with the M2 receive-in-Worker split (lease RPCs, R2 staging), SPEC-0002
+auth (PATs, scopes, token API), the git-HTTP ACL gate (SPEC-0003 M1), issue/PR webhook
+data layer, tier-1 API batches in flight (~9 of 78 paths), Tier-2 UI underway (asset
+pipeline proven, shell landing). Nine SPECs + three ADRs; CI runs typecheck/lint/tests,
+contract checks, the real-git e2e suite, benchmarks, and asset determinism. See the
+[SPEC index](specs/), [ADR-0002](docs/decisions/0002-contract-freeze.md) (contract
+freeze) and the [runbook](docs/ops/runbook.md) (dev/deploy/bootstrap).
 
 ## Development
 
