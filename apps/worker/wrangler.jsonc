@@ -120,9 +120,12 @@
   // CI typechecks stay honest; local dev supplies values via .dev.vars (copy
   // .dev.vars.example). Production: `wrangler secret put GIT_TOKEN`.
   // GIT_TOKEN gates git push/admin on the engine (SPEC-0001 M1); SPEC-0002
-  // replaces the static token with real auth.
+  // replaces the static token with real auth. The two MIRROR_* keys are
+  // SPEC-0009 §4.1/§4.2 runtime config (SSRF allow-list + credential AES
+  // key) — until they are declared here, wrangler silently ignores them in
+  // .dev.vars (only declared names load; probed on wrangler 4.152).
   "secrets": {
-    "required": ["GIT_TOKEN"]
+    "required": ["GIT_TOKEN", "MIRROR_ALLOWED_HOST_LIST", "MIRROR_CREDENTIAL_KEY"]
   },
   "migrations": [
     {
