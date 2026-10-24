@@ -15,6 +15,7 @@ import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
 import { registerDiffPatchRoutes } from "./routes/diffpatch";
 import { registerFollowRoutes } from "./routes/follows";
+import { registerForkRoutes } from "./routes/forks";
 import { registerGitRoutes } from "./routes/git";
 import { registerHookRoutes } from "./routes/hooks";
 import { registerIdentityRoutes } from "./routes/identity";
@@ -151,11 +152,12 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerDiffPatchRoutes(app, requireAuth);
   registerLanguageRoutes(app, requireAuth, optionalAuth);
   registerPullAutoMergeRoutes(app, requireAuth);
-  // TODO(REG-MERGE-4): forks (routes/forks.ts + services/forks.ts +
-  // repos/fork-task.ts) was still mid-flight (untracked working-tree files)
-  // at this merge — register registerForkRoutes(app, requireAuth,
-  // optionalAuth) once its wave lands; the compat suite's loud guard will
-  // demand its scenarios.
+  // Fork family (REG-MERGE-4, trio committed 8fb87a2): the 202-async
+  // createFork POST and the listForks listing, backed by the repo-fork
+  // queue consumer. Deeper `/repos/{owner}/{repo}/forks` paths — shadows
+  // nothing registered above; listForks reads optional, create reqToken,
+  // matching upstream's reqToken/optional split.
+  registerForkRoutes(app, requireAuth, optionalAuth);
 
   return app;
 }

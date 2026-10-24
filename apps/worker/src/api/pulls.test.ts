@@ -20,10 +20,12 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
+import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
 import { comments, issueLabels, issues, labels, milestones, pullRequests, repoCounters, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
+import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
 import { createApiRouter } from "./router";
 import contract from "../compat/contract/v1-swagger.generated.json";
 
@@ -57,6 +59,24 @@ beforeEach(async () => {
   await env.DB.prepare(
     "INSERT INTO users (id, username, username_lower, is_admin, status, created_at) VALUES (1, 'cf-gitea-stub', 'cf-gitea-stub', 0, 'active', 0)",
   ).run();
+  // The DO cells persist across tests (only D1 is wiped above), so a previous
+  // test's createPull left `refs/pull/N/head` behind — the next PR with the
+  // same per-repo index would CAS-conflict on the head-ref landing (a 500).
+  // Drop them for every repo name this suite creates PRs on; the seed helper
+  // re-creates the branches idempotently.
+  for (const [ownerLower, slug] of [["alice", "visible"], ["cf-gitea-stub", "visible"]] as const) {
+    const cell = env.REPO.getByName(`${ownerLower}/${slug}`);
+    const { refs } = await cell.listRefs();
+    for (const ref of refs) {
+      if (!ref.name.startsWith("refs/pull/")) {
+        continue;
+      }
+      const deleted = await cell.deleteApiRef({ ref: ref.name, expectedOid: ref.target });
+      if (deleted.tag === "invalid") {
+        throw new Error(`seed ref cleanup failed: ${ref.name} (${deleted.reason})`);
+      }
+    }
+  }
 });
 
 const db = () => drizzle(env.DB);
@@ -104,6 +124,66 @@ async function seedRepo(ownerNamespace: string, slug: string, options: { archive
   });
   await service().ensureRepoCounters(id);
   return id;
+}
+
+/** Worker-side object hash (workerd crypto.subtle; putApiObjects re-verifies). */
+async function gitObjectOid(type: string, data: Uint8Array): Promise<string> {
+  const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+  const bytes = new Uint8Array(header.byteLength + data.byteLength);
+  bytes.set(header, 0);
+  bytes.set(data, header.byteLength);
+  const digest = await crypto.subtle.digest("SHA-1", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Real engine content for the POST family: batch 8 added branch-existence
+ * ENGINE reads to repoCreatePullRequest (parseCompareInfo step 1), so a PR
+ * creation 404s against a bare D1-seeded repo. One deterministic root commit
+ * lands on `main` through the same public RPCs the API layer uses
+ * (putApiObjects → commitApiChange; the compat suite's seed pattern), and the
+ * named branches point at it. Idempotent: the DO cell outlives the per-test
+ * D1 wipes, so already-present refs are left alone. Returns the shared branch
+ * tip — the commit oid the head-sha assertions pin.
+ */
+async function seedEngineBranches(ownerLower: string, slug: string, branches: string[]): Promise<string> {
+  const pair = { ownerNamespace: ownerLower, slug };
+  const cell = env.REPO.getByName(`${ownerLower}/${slug}`);
+  const tips = refTipMap(await engineReads(env, pair).listRefs());
+  const land = async (ref: string, oid: string): Promise<void> => {
+    const result = await cell.commitApiChange({ ref, expectedOldOid: ZERO_OID, newOid: oid });
+    if (result.tag !== "committed") {
+      throw new Error(`seed ref landing failed: ${ref} (${result.tag})`);
+    }
+  };
+  let tip = tips.get(branchRef("main"))?.target;
+  if (tip === undefined) {
+    const blob = new TextEncoder().encode(`# ${slug}\n`);
+    const blobOid = await gitObjectOid("blob", blob);
+    const tree = serializeTree([{ mode: "100644", name: "README.md", oid: blobOid }]);
+    const person = { name: "seed", email: "seed@pulls.invalid", time: 1761000000, tz: "+0000" };
+    const commit = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "seed\n" });
+    const put = await cell.putApiObjects([
+      { oid: blobOid, type: "blob", data: blob },
+      { oid: tree.oid, type: "tree", data: tree.data },
+      { oid: commit.oid, type: "commit", data: commit.data },
+    ]);
+    if (put.tag !== "ok") {
+      throw new Error(`seed putApiObjects failed: ${put.tag}`);
+    }
+    tip = commit.oid;
+    await land(branchRef("main"), commit.oid);
+    const head = await cell.setHead("main");
+    if (head.tag !== "ok") {
+      throw new Error("seed setHead failed");
+    }
+  }
+  for (const branch of branches) {
+    if (tips.get(branchRef(branch)) === undefined) {
+      await land(branchRef(branch), tip);
+    }
+  }
+  return tip;
 }
 
 async function seedLabel(repoId: string, name: string): Promise<number> {
@@ -208,6 +288,7 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
   it("creates a PR with 201 and the exact contract PullRequest field set", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
+    const featureTip = await seedEngineBranches(owner.usernameLower, "visible", ["feature"]);
 
     const res = await createPull("/repos/Alice/visible/pulls", {
       title: "created by the suite",
@@ -260,7 +341,7 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
     expect(body.head).toMatchObject({
       label: "feature",
       ref: "refs/pull/1/head", // GetGitHeadRefName — the base-repo PR head ref
-      sha: "", // head_sha cache empty until the engine ref write
+      sha: featureTip, // head_sha cache: the branch tip read at creation
       repo_id: Number(repoId),
     });
   });
@@ -268,6 +349,7 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
   it("draws the PR index from the shared counter and lists via issues?type=pulls", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
+    await seedEngineBranches(owner.usernameLower, "visible", ["feature"]);
     const issue = await seedIssue(repoId, "a plain issue");
     const res = await createPull("/repos/Alice/visible/pulls", { title: "a pr", head: "feature", base: "main" });
     expect(res.status).toBe(201);
@@ -302,6 +384,9 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
   it("attaches milestone and labels (unknown label ids silently dropped)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
+    // f2/f3: the later calls' head branches must RESOLVE (the engine reads run
+    // before the milestone/due-date validation they pin).
+    await seedEngineBranches(owner.usernameLower, "visible", ["feature", "f2", "f3"]);
     const labelId = await seedLabel(repoId, "bug");
     const milestoneId = await seedMilestone(repoId, "v1");
 
@@ -330,6 +415,7 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
   it("422s head == base, 409s duplicate open targets (issue_id = the index), 400s bad due_date", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
+    await seedEngineBranches(owner.usernameLower, "visible", ["feature", "f3"]); // f3: the bad-date call's head must resolve
 
     const same = await createPull("/repos/Alice/visible/pulls", { title: "x", head: "main", base: "main" });
     expect(same.status).toBe(422);
@@ -357,6 +443,7 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
   it("resolves the fork-form head and 404s unknown head repos / foreign base forms", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
+    await seedEngineBranches(owner.usernameLower, "visible", ["feature"]);
 
     const sameOwnerForkForm = await createPull("/repos/Alice/visible/pulls", { title: "fork form", head: "alice:feature", base: "main" });
     expect(sameOwnerForkForm.status).toBe(201);
@@ -396,6 +483,7 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
   it("emits the pull_request opened webhook to subscribed active hooks only", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
+    await seedEngineBranches(owner.usernameLower, "visible", ["feature"]);
     const wrongHook = await seedHook(repoId, ["issues"]); // not subscribed
     await seedHook(repoId, ["pull_request"]);
 
@@ -632,6 +720,7 @@ describe("PATCH /repos/{owner}/{repo}/pulls/{index} (repoEditPullRequest)", () =
     // (CanWrite TypePullRequests) — run as the repo OWNER (the stub identity
     // owning its own repo).
     const repoId = await seedRepo("cf-gitea-stub", "visible");
+    await seedEngineBranches("cf-gitea-stub", "visible", ["feature"]);
     const a = await seedLabel(repoId, "alpha");
     const b = await seedLabel(repoId, "beta");
     const v1 = await seedMilestone(repoId, "v1");
