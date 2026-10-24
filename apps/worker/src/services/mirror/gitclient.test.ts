@@ -101,6 +101,12 @@ function v2CapsBytes(): Uint8Array {
   return concatBytes(pkt("version 2\n"), pkt("agent=git/2.45\n"), pkt("ls-refs=unborn\n"), pkt("fetch=shallow wait-for-done\n"), pkt("object-format=sha1\n"), FLUSH_PKT);
 }
 
+/** Real smart-HTTP servers (git http-backend parity) write the `# service=`
+ * preamble + flush before the v2 capability advert too. */
+function v2CapsWithPreambleBytes(): Uint8Array {
+  return concatBytes(pkt("# service=git-upload-pack\n"), FLUSH_PKT, v2CapsBytes());
+}
+
 function v2LsRefsBytes(): Uint8Array {
   return concatBytes(
     pkt(`${OID} HEAD symref-target:refs/heads/main\n`),
@@ -189,6 +195,25 @@ const laxPolicy = () => parseHostPolicy(undefined, "lax");
 // ---------------------------------------------------------------------------
 // Advertisement parses
 // ---------------------------------------------------------------------------
+
+describe("parseInfoRefsAdvert (v2)", () => {
+  it("parses the bare v2 capability advert", () => {
+    const advert = parseInfoRefsAdvert(v2CapsBytes());
+    expect(advert.protocolVersion).toBe(2);
+    expect(advert.refs).toEqual([]);
+    expect(advert.capabilities).toContain("fetch=shallow wait-for-done");
+  });
+
+  it("parses the v2 advert behind the # service= preamble (real smart-HTTP servers)", () => {
+    // Regression: git http-backend writes `# service=git-upload-pack` + flush
+    // before BOTH protocol versions; the advert must never fall into the v0
+    // ref parser (previously: "malformed oid in v0 advertisement: 2").
+    const advert = parseInfoRefsAdvert(v2CapsWithPreambleBytes());
+    expect(advert.protocolVersion).toBe(2);
+    expect(advert.refs).toEqual([]);
+    expect(advert.capabilities).toContain("ls-refs=unborn");
+  });
+});
 
 describe("parseInfoRefsAdvert (v0)", () => {
   it("parses refs, symref HEAD and the peeled tag", () => {
@@ -465,7 +490,11 @@ describe("fetchPack (v2)", () => {
   it("skips acknowledgments when the server answers done with the packfile section directly", async () => {
     const { oid, pack } = await buildPack();
     const advert: Advertisement = { protocolVersion: 2, capabilities: ["object-format=sha1", "fetch=shallow wait-for-done"], refs: [], headSymref: null, unbornHead: null };
-    const body = concatBytes(pkt("packfile\n"), TE.encode("0001"), ...sideband(1, pack), FLUSH_PKT);
+    // Regression: real git sends the sideband frames DIRECTLY after the
+    // `packfile` section header — no delim-pkt follows the header (the delim
+    // separates the PREVIOUS section; previously this shape errored with
+    // "expected the packfile section's delim-pkt from source").
+    const body = concatBytes(pkt("packfile\n"), ...sideband(1, pack), FLUSH_PKT);
     const { fetchImpl, calls } = stubFetch([resultResponse(body)]);
     const fetched = await fetchPack("https://src.example.com/repo.git", [oid], [], { fetchImpl, policy: laxPolicy(), advert });
     expect(fetched.protocolVersion).toBe(2);

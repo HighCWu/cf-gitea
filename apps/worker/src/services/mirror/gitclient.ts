@@ -234,11 +234,15 @@ function capsOf(lineText: string): string[] {
 }
 
 /**
- * Parse the GET info/refs body. Detects the protocol: a first pkt-line of
+ * Parse the GET info/refs body. Detects the protocol: a pkt-line reading
  * "version 2" is the v2 capability advert (refs arrive via the ls-refs
  * round); anything else must be the v0 ref advertisement
  * (`# service=git-upload-pack` header, capabilities on the first ref line,
  * `^{}` peel continuation lines, `capabilities^{}` for an empty source).
+ * Real smart-HTTP servers write the `# service=` preamble + flush before
+ * BOTH protocol versions (git http-backend parity), so the v2 advert is
+ * re-detected after the preamble too — a preamble-followed-by-`version 2`
+ * must never fall into the v0 ref parser.
  */
 export function parseInfoRefsAdvert(bytes: Uint8Array): Advertisement {
   const advert: Advertisement = { protocolVersion: 0, capabilities: [], refs: [], headSymref: null, unbornHead: null };
@@ -249,19 +253,7 @@ export function parseInfoRefsAdvert(bytes: Uint8Array): Advertisement {
   pos = first.next;
 
   if (firstText === "version 2") {
-    // v2 capability advert: plain lines until the flush (or end of body —
-    // tolerated; the flush-less shape appears behind some proxies).
-    const caps: string[] = [];
-    for (;;) {
-      const f = frameAt(bytes, pos);
-      if (f === null) break;
-      pos = f.next;
-      if (f.frame.kind === "flush") break;
-      if (f.frame.kind === "line") caps.push(frameText(f.frame.payload).trimEnd());
-    }
-    advert.protocolVersion = 2;
-    advert.capabilities = caps;
-    return advert;
+    return parseV2Advert(bytes, first.next);
   }
 
   // v0: optional "# service=…" header pkt + flush, then ref lines.
@@ -269,6 +261,11 @@ export function parseInfoRefsAdvert(bytes: Uint8Array): Advertisement {
     const sep = frameAt(bytes, pos);
     if (sep === null || sep.frame.kind !== "flush") throw new SmartHttpError("v0 advertisement header not followed by a flush");
     pos = sep.next;
+    // The preamble precedes the v2 advert as well: re-detect.
+    const afterPreamble = frameAt(bytes, pos);
+    if (afterPreamble !== null && afterPreamble.frame.kind === "line" && frameText(afterPreamble.frame.payload).trimEnd() === "version 2") {
+      return parseV2Advert(bytes, pos, afterPreamble.next);
+    }
   }
 
   let capsSource: string | null = null;
@@ -317,6 +314,24 @@ export function parseInfoRefsAdvert(bytes: Uint8Array): Advertisement {
     }
   }
   return advert;
+}
+
+/**
+ * Parse a v2 capability advert body starting AFTER its `version 2` line:
+ * plain capability lines until the flush (or end of body — tolerated; the
+ * flush-less shape appears behind some proxies).
+ */
+function parseV2Advert(bytes: Uint8Array, afterVersionLine: number): Advertisement {
+  const caps: string[] = [];
+  let pos = afterVersionLine;
+  for (;;) {
+    const f = frameAt(bytes, pos);
+    if (f === null) break;
+    pos = f.next;
+    if (f.frame.kind === "flush") break;
+    if (f.frame.kind === "line") caps.push(frameText(f.frame.payload).trimEnd());
+  }
+  return { protocolVersion: 2, capabilities: caps, refs: [], headSymref: null, unbornHead: null };
 }
 
 /**
@@ -459,7 +474,7 @@ export function demuxPackResponse(
   let buf = new Uint8Array(0);
   let pos = 0;
   let total = 0;
-  let state: "header" | "packfile-delim" | "sideband" | "raw" | "done" = "header";
+  let state: "header" | "sideband" | "raw" | "done" = "header";
   const acks: string[] = [];
   let resolveAcks!: (v: string[]) => void;
   let rejectAcks!: (e: unknown) => void;
@@ -584,29 +599,22 @@ export function demuxPackResponse(
             // frames.
             if (text === "packfile") {
               finishAcks(); // acks are final once the packfile section begins (v2 has no v0-style NAK terminator)
-              state = "packfile-delim";
-              continue;
-            }
-            const ack = /^ACK ([0-9a-f]{40})$/.exec(text);
-            if (ack !== null) acks.push(ack[1]!);
-            continue;
-          }
-
-          if (state === "packfile-delim") {
-            if (frame.kind === "delim") {
               if (!shape.sideband) {
                 // v2 packfile sections are ALWAYS multiplexed (module doc);
                 // reaching here means the caller misdeclared the shape.
                 throw new SmartHttpError("v2 packfile section received without a negotiated sideband");
               }
+              // The delim-pkt separates the PREVIOUS section from this
+              // header (consumed as a tolerated frame above); real servers
+              // send the sideband frames DIRECTLY after the header — there
+              // is no post-header delim (gitprotocol-v2 section grammar,
+              // verified against real git upload-pack).
               state = "sideband";
               continue;
             }
-            if (frame.kind === "flush") {
-              state = "done"; // empty packfile section — protocol end
-              continue;
-            }
-            throw new SmartHttpError("expected the packfile section's delim-pkt from source");
+            const ack = /^ACK ([0-9a-f]{40})$/.exec(text);
+            if (ack !== null) acks.push(ack[1]!);
+            continue;
           }
 
           if (state === "sideband") {
