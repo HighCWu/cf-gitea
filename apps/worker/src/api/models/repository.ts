@@ -200,3 +200,37 @@ export const searchResultsSchema = z.object({
 });
 
 export type SearchResults = z.infer<typeof searchResultsSchema>;
+
+/**
+ * Mirror of the vendored contract's `CreateRepoOption`
+ * (#/definitions/CreateRepoOption) — field-for-field including the enums.
+ * `name` is the one required field. Consumed by `POST /orgs/{org}/repos`
+ * (createOrgRepo); the engine-dependent options (`auto_init` + template
+ * scaffolding: `readme`/`license`/`gitignores`/`issue_labels`) are accepted
+ * per the contract and deferred to the commit-builder wave (SPEC-0004 §3.4).
+ */
+export const createRepoOptionSchema = z.object({
+  auto_init: z.boolean().optional().openapi({ description: "Whether the repository should be auto-initialized?" }),
+  default_branch: z
+    .string()
+    .optional()
+    .openapi({ description: "DefaultBranch of the repository (used when initializes and in template)" }),
+  description: z.string().optional().openapi({ description: "Description of the repository to create" }),
+  gitignores: z.string().optional().openapi({ description: "Gitignores to use" }),
+  issue_labels: z.string().optional().openapi({ description: "Label-Set to use" }),
+  license: z.string().optional().openapi({ description: "License to use" }),
+  name: z.string().openapi({ description: "Name of the repository to create" }),
+  object_format_name: z
+    .enum(["sha1", "sha256"])
+    .optional()
+    .openapi({ description: "ObjectFormatName of the underlying git repository, empty string for default (sha1)" }),
+  private: z.boolean().optional().openapi({ description: "Whether the repository is private" }),
+  readme: z.string().optional().openapi({ description: "Readme of the repository to create" }),
+  template: z.boolean().optional().openapi({ description: "Whether the repository is template" }),
+  trust_model: z
+    .enum(["default", "collaborator", "committer", "collaboratorcommitter"])
+    .optional()
+    .openapi({ description: "TrustModel of the repository" }),
+});
+
+export type CreateRepoOption = z.infer<typeof createRepoOptionSchema>;

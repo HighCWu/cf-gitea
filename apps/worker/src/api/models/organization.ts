@@ -40,3 +40,8 @@ export const organizationSchema = z.object({
 });
 
 export type Organization = z.infer<typeof organizationSchema>;
+
+/** `#/responses/OrganizationList` — plain `Organization[]` (GET /user/orgs). */
+export const organizationListSchema = z.array(organizationSchema);
+
+export type OrganizationList = z.infer<typeof organizationListSchema>;
