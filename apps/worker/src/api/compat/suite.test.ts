@@ -47,7 +47,6 @@ import { ZERO_OID } from "../services/engine";
 import { addOrUpdateCollaborator } from "../services/repo-collaborators";
 import { watchRepo } from "../services/repo-watchers";
 import { starRepo } from "../services/stars";
-import { FORKS_DDL_STATEMENTS } from "../services/forks";
 import { registerForkRoutes } from "../routes/forks";
 import { applyRepoExtrasDdl } from "../testing/repo-ddl";
 import { giteaErrorHandler } from "../errors";
@@ -682,8 +681,8 @@ beforeAll(async () => {
 
   // ---------------------------------------------------------------------
   // Fork block (SPEC-0004 §2.4 rows listForks/createFork + the SPEC-0001b
-  // §5.3 queue consumer): the raw fork_parent column bootstraps from the
-  // service's DDL statements (the stars/follows pre-migration pattern), and
+  // §5.3 queue consumer): the fork_parent column arrived with migration 0009
+  // (the fifth raw-DDL sweep), so no DDL bootstrap is needed here, and
   // the fork SOURCE gets real pushed content — one self-contained pack
   // landed through the engine's own receive path in-process (the import
   // channel's stage-as-receive pattern: gate-cleared request, x-storage-key
@@ -691,9 +690,6 @@ beforeAll(async () => {
   // REAL pack catalog and the equality checks read objects back through the
   // fork's own bytes.
   // ---------------------------------------------------------------------
-  for (const statement of FORKS_DDL_STATEMENTS) {
-    await env.DB.prepare(statement).run();
-  }
   await seedRepo("9009", OWNER.toLowerCase(), "compat-fork-src");
   const forkPack = await buildPack();
   const forkPushBody = buildReceivePackBody([{ ref: "refs/heads/main", oid: forkPack.oid }], forkPack.pack);

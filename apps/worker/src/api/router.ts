@@ -8,10 +8,12 @@ import {
 } from "./auth";
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
+import { registerArchiveRoutes } from "./routes/archive";
 import { registerBranchRoutes } from "./routes/branches";
 import { registerCollaboratorRoutes } from "./routes/collaborators";
 import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
+import { registerDiffPatchRoutes } from "./routes/diffpatch";
 import { registerFollowRoutes } from "./routes/follows";
 import { registerGitRoutes } from "./routes/git";
 import { registerHookRoutes } from "./routes/hooks";
@@ -19,10 +21,12 @@ import { registerIdentityRoutes } from "./routes/identity";
 import { registerImportRoutes } from "./routes/imports";
 import { registerIssueRoutes } from "./routes/issues";
 import { registerLabelRoutes } from "./routes/labels";
+import { registerLanguageRoutes } from "./routes/languages";
 import { registerMarkdownRoutes } from "./routes/markdown";
 import { registerMilestoneRoutes } from "./routes/milestones";
 import { registerOrgRoutes } from "./routes/org-repos";
 import { registerOrgProfileRoutes } from "./routes/orgs";
+import { registerPullAutoMergeRoutes } from "./routes/pull-automerge";
 import { registerPullRoutes } from "./routes/pulls";
 import { registerReleaseAssetRoutes } from "./routes/release-assets";
 import { registerReleaseRoutes } from "./routes/releases";
@@ -136,13 +140,22 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // family (upstream reqToken's the whole /user group — requireAuth only).
   registerUserSettingsRoutes(app, requireAuth);
   registerStarredRoutes(app, requireAuth);
-  // TODO(REG-MERGE-3): the remaining tier-1 families — archive
-  // (routes/archive.ts + services/archive.ts + migration 0008), forks
-  // (routes/forks.ts + repos/fork-task.ts), languages (routes/languages.ts),
-  // diffpatch (routes/diffpatch.ts) and the pull auto-merge/delete pair
-  // (routes/pull-automerge.ts) — were still mid-flight (untracked
-  // working-tree files, tsc red) at this merge; register each once its wave
-  // lands and the compat suite's loud guard will demand their scenarios.
+  // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
+  // download, the diffpatch apply, the languages listing and the scheduled
+  // auto-merge cancellation. All are deeper `/repos/{owner}/{repo}/<family>`
+  // paths that shadow nothing registered above. pull-automerge is
+  // METHOD-disjoint from registerPullRoutes (DELETE on
+  // `pulls/{index}/merge` vs the POST/GET family there), so registration
+  // order between the two is irrelevant.
+  registerArchiveRoutes(app, requireAuth, optionalAuth);
+  registerDiffPatchRoutes(app, requireAuth);
+  registerLanguageRoutes(app, requireAuth, optionalAuth);
+  registerPullAutoMergeRoutes(app, requireAuth);
+  // TODO(REG-MERGE-4): forks (routes/forks.ts + services/forks.ts +
+  // repos/fork-task.ts) was still mid-flight (untracked working-tree files)
+  // at this merge — register registerForkRoutes(app, requireAuth,
+  // optionalAuth) once its wave lands; the compat suite's loud guard will
+  // demand its scenarios.
 
   return app;
 }
