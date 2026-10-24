@@ -15,6 +15,10 @@ import {
 } from "./git/protocol";
 import {
   beginReceive,
+  beginForkImport,
+  adoptForkPacks,
+  finalizeForkImport,
+  listCatalogPage,
   commitApiChange,
   checkMergeability,
   countDivergence,
@@ -34,8 +38,11 @@ import {
   setHead,
   sweepExpiredLeases,
   type ApiObject,
+  type AdoptForkPacksResult,
+  type BeginForkImportResult,
   type BeginReceiveInput,
   type BeginReceiveResult,
+  type CatalogPage,
   type CheckMergeabilityInput,
   type CheckMergeabilityResult,
   type CommitApiChangeInput,
@@ -45,6 +52,8 @@ import {
   type DestroyResult,
   type ExecuteMergeInput,
   type ExecuteMergeResult,
+  type FinalizeForkImportInput,
+  type FinalizeForkImportResult,
   type FinalizeReceiveInput,
   type FinalizeReceiveResult,
   type IndexRow,
@@ -488,9 +497,12 @@ export class RepoCell extends DurableObject<Env> {
   // regardless, so it surfaces as a transport-class failure).
 
   /** Request-less RPC paths rebind R2 from the persisted repo name (set by the
-   * first HTTP request — the advert always precedes a push). */
+   * first HTTP request — the advert always precedes a push); fork replication
+   * is the request-less path's request-less path — a fresh fork DO's first
+   * contact is beginForkImport, which persists meta.storage_key before any
+   * pack key is derived — so the storage key is the fallback name source. */
   private rpcBind(): void {
-    const name = this.store.getMeta("repo");
+    const name = this.store.getMeta("repo") ?? this.store.getMeta("storage_key");
     if (name) this.bindR2(name);
   }
 
@@ -508,6 +520,18 @@ export class RepoCell extends DurableObject<Env> {
           // best effort: an unswept staging object is reclaimed by the
           // lease-expiry sweep's retry on the next begin/alarm
           console.log(`[r2 ${this.store.getMeta("repo") ?? ""}] sweep delete failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+      readPackTail: async (r2Key, len) => {
+        const bucket = this.env.REPO_PACKS;
+        if (!bucket) return null;
+        try {
+          const obj = await bucket.get(r2Key, { range: { suffix: len } });
+          if (!obj) return null;
+          return new Uint8Array(await obj.arrayBuffer());
+        } catch (err) {
+          console.log(`[r2 ${r2Key}] tail read failed: ${err instanceof Error ? err.message : String(err)}`);
+          return null;
         }
       },
       removeFromRegistry: async (name) => {
@@ -596,6 +620,39 @@ export class RepoCell extends DurableObject<Env> {
   /** Store a replay's objects through the commit builder's budgets (§4.5). */
   async putRebaseObjects(objects: { oid: string; type: ObjType; data: Uint8Array }[]): Promise<PutRebaseObjectsResult> {
     return putRebaseObjects(this.leaseHost(), objects);
+  }
+
+  // ---- fork catalog replication (SPEC-0001b §5.3) ---------------------------
+  // The parent/fork pair of the replication lease. listCatalogPage runs on the
+  // PARENT (paged catalog + index-row read); begin/adopt/finalize run on the
+  // FORK. The bytes move Worker-side — src/fork/replicate.ts is the consumer
+  // loop the fork endpoint's queue consumer calls.
+
+  /** Paged read of this repo's ACTIVE pack catalog + index rows (parent side
+   * of §5.3's copy loop). `afterPackKey` is the previous page's nextAfter
+   * cursor ("" starts); `limit` is the page's index-row budget. */
+  async listCatalogPage(afterPackKey: string, limit: number): Promise<CatalogPage> {
+    return listCatalogPage(this.leaseHost(), afterPackKey, limit);
+  }
+
+  /** Open the replication lease on this (fresh, empty) fork DO: persists the
+   * storage key, sets meta.importing (gates beginReceive/commitApiChange/
+   * executeMerge), clears stale staging. Idempotent during the import. */
+  async beginForkImport(storageKey: string): Promise<BeginForkImportResult> {
+    return beginForkImport(this.leaseHost(), storageKey);
+  }
+
+  /** Adopt one catalog page: verify the copied pack bytes against their keys,
+   * land the index rows, stage completed packs for finalize. */
+  async adoptForkPacks(page: CatalogPage): Promise<AdoptForkPacksResult> {
+    return adoptForkPacks(this.leaseHost(), page);
+  }
+
+  /** Finalize: catalog rows (kind='fork') + refs + HEAD + refs_version bump in
+   * ONE transaction; clears meta.importing. Idempotent-safe re-run until this
+   * commits. */
+  async finalizeForkImport(input: FinalizeForkImportInput): Promise<FinalizeForkImportResult> {
+    return finalizeForkImport(this.leaseHost(), input);
   }
 
   // ---- repo lifecycle (SPEC-0003 §2.5.5; LIFECYCLE gap RPCs) ----------------

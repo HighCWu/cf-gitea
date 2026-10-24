@@ -212,6 +212,18 @@ export class GitStore {
     return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM objects").one().n + this.packs.countObjects();
   }
 
+  /** Whether the repo holds ANY content — a ref, a catalog row, an index row
+   * or a loose object. beginForkImport's empty-target check (SPEC-0001b §5.3:
+   * a fork target that already finalized its import must never re-begin). */
+  hasAnyContent(): boolean {
+    return (
+      this.refs().length > 0 ||
+      this.sql.exec("SELECT 1 FROM pack_catalog LIMIT 1").toArray().length > 0 ||
+      this.sql.exec("SELECT 1 FROM pack_objects LIMIT 1").toArray().length > 0 ||
+      this.sql.exec("SELECT 1 FROM objects LIMIT 1").toArray().length > 0
+    );
+  }
+
   // --- Worker object lookups (SPEC-0001a §3 Step 2) --------------------------
   // Thin-pack base resolution and the receive connectivity anti-check run in
   // the Worker; this is their only window into the object database. Packed

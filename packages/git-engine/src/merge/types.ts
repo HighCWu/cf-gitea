@@ -62,13 +62,18 @@ export type MergeRefConflict = {
   currentOid: string;
 };
 export type MergeInvalid = { tag: "invalid"; reason: string };
+/** A fork import is in flight on this repo (meta.importing, SPEC-0001b §5.3):
+ * the replication loop must finish — or be re-run to completion — before any
+ * ref-moving landing can proceed. */
+export type MergeImporting = { tag: "importing" };
 export type ExecuteMergeResult =
   | MergeCommitted
   | MergeNotFastForward
   | MergeConflict
   | MergeNothing
   | MergeRefConflict
-  | MergeInvalid;
+  | MergeInvalid
+  | MergeImporting;
 
 // ---- §4.3 mergeability classification ----------------------------------------
 

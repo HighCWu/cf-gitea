@@ -144,6 +144,9 @@ function resolveBaseRef(store: GitStore, base: string): { ref: string; oid: stri
  */
 export async function executeMerge(host: LeaseHost, input: ExecuteMergeInput): Promise<ExecuteMergeResult> {
   const { store } = host;
+  // a fork import in flight gates every ref-moving landing (SPEC-0001b §5.3:
+  // "gates beginReceive/commitApiChange/executeMerge with a busy variant")
+  if (store.getMeta("importing") === "1") return { tag: "importing" };
   // 1. resolve base to its CURRENT tip and CAS against the caller's value
   const baseRef = resolveBaseRef(store, input.base);
   if (!baseRef) return { tag: "invalid", reason: `base is not a resolvable ref: ${input.base}` };

@@ -40,8 +40,9 @@ import {
   PushCommand,
 } from "./git/protocol";
 import { ObjType, hashObject, parseCommit } from "./git/objects";
-import { ZERO_OID, isOid } from "./git/util";
+import { ZERO_OID, isOid, toHex } from "./git/util";
 import { isValidStorageKey, packR2Key, stagingKey as buildStagingKey, packName as catalogPackName } from "./git/r2keys";
+import type { PackState } from "./git/packstore";
 import type { GitStore } from "./git/store";
 import type { RefUpdate } from "./mod";
 import { serializeCommit, serializeTag, personLine } from "./commit/serialize";
@@ -60,6 +61,14 @@ import type {
   DeleteApiRefResult,
 } from "./merge/types";
 import type { MergeObject } from "./merge/tree";
+import type {
+  CatalogPage,
+  CatalogPackEntry,
+  BeginForkImportResult,
+  AdoptForkPacksResult,
+  FinalizeForkImportInput,
+  FinalizeForkImportResult,
+} from "./fork/types";
 
 // the SPEC-0001b §4 RPC contract types ride the control-plane boundary (the
 // dist-types generation consumes this module's exports)
@@ -78,6 +87,17 @@ export type {
   RebasedCommit,
 } from "./merge/types";
 export type { MergeConflictPath, MergeObject, MergePlan, TreeChange } from "./merge/tree";
+// the SPEC-0001b §5.3 fork-replication contract types ride the same boundary
+export type {
+  AdoptForkPacksResult,
+  BeginForkImportResult,
+  CatalogPage,
+  CatalogPackEntry,
+  FinalizeForkImportInput,
+  FinalizeForkImportOk,
+  FinalizeForkImportResult,
+  ForkInvalid,
+} from "./fork/types";
 
 /** Per-call budget for one putApiObjects/putRebaseObjects call — total bytes
  * across the objects, default 8 MiB (SPEC-0001a §4.3: API_COMMIT_MAX_BYTES). */
@@ -126,12 +146,21 @@ export type BeginReceiveBusy = {
   /** value for the 503 Retry-After header (T7: 10) */
   retryAfterSeconds: number;
 };
+/** A fork import is in flight (meta.importing, SPEC-0001b §5.3): pushes are
+ * refused until the replication loop finalizes. Distinct from `busy` so the
+ * Worker can answer 503 with an import-aware retry hint instead of spinning
+ * on a lease that will never free. */
+export type BeginReceiveImporting = { tag: "importing" };
 export type BeginReceiveRejected = {
   tag: "rejected";
   /** per-command refname-validation failures (checked BEFORE any byte streams) */
   results: ReceiveCommandResult[];
 };
-export type BeginReceiveResult = BeginReceiveOk | BeginReceiveBusy | BeginReceiveRejected;
+export type BeginReceiveResult =
+  | BeginReceiveOk
+  | BeginReceiveBusy
+  | BeginReceiveImporting
+  | BeginReceiveRejected;
 
 export interface FinalizedPack {
   /** final pack key: repos/<storage_key>/packs/<packName>.pack — the Worker has
@@ -287,6 +316,15 @@ export interface LeaseHost {
   /** best-effort deletes in the REPO_PACKS bucket (no-op without a binding) */
   deletePackObjects(keys: string[]): Promise<void>;
   /**
+   * Range-read the TAIL of an R2 object. fork replication's adopt/finalize
+   * verify a copied pack's 20-byte SHA-1 trailer against its catalog key —
+   * the same name↔bytes check receive's finalize does against the r2keys.ts
+   * derivation. Optional: hosts without an R2 backend (stock dgit / celld)
+   * cannot verify, and adoptForkPacks/finalizeForkImport fail closed without
+   * it (fork replication requires the bucket, exactly like receive does).
+   */
+  readPackTail?(r2Key: string, len: number): Promise<Uint8Array | null>;
+  /**
    * The repo's registry bookkeeping (registry.remove), for destroy()'s
    * remove hook. Optional: the stock dgit Worker may run without a registry.
    */
@@ -356,6 +394,11 @@ function isDeleted(store: GitStore): boolean {
   return store.getMeta("deleted") === "1";
 }
 
+/** True while a fork catalog import is in flight (meta.importing, §5.3). */
+function isImporting(store: GitStore): boolean {
+  return store.getMeta("importing") === "1";
+}
+
 /**
  * Open a receive lease. Validates refnames BEFORE any byte streams; a single
  * funny refname rejects the whole command section (there is no partial lease).
@@ -383,6 +426,11 @@ export async function beginReceive(host: LeaseHost, input: BeginReceiveInput): P
       tag: "rejected",
       results: input.commands.map((cmd) => ({ ref: cmd.ref, ok: false, message: "repository deleted" })),
     };
+  }
+  if (isImporting(store)) {
+    // a fork's catalog is being replicated into this repo (§5.3): no push can
+    // race it, so the client sees a clean refusal instead of missing objects
+    return { tag: "importing" };
   }
   const storageKey = resolveStorageKey(store, input.storageKey);
   const leaseToken = crypto.randomUUID().replaceAll("-", "");
@@ -813,10 +861,12 @@ export type CommitApiRefConflict = {
   currentOid: string;
 };
 export type CommitApiInvalid = { tag: "invalid"; reason: string };
+export type CommitApiImporting = { tag: "importing" };
 export type CommitApiChangeResult =
   | CommitApiCommitted
   | CommitApiRefConflict
-  | CommitApiInvalid;
+  | CommitApiInvalid
+  | CommitApiImporting;
 
 /**
  * Verify + store a batch of Worker-built objects. Idempotent (content-
@@ -850,6 +900,8 @@ export async function putApiObjects(host: LeaseHost, objects: ApiObject[]): Prom
  */
 export async function commitApiChange(host: LeaseHost, input: CommitApiChangeInput): Promise<CommitApiChangeResult> {
   const { store } = host;
+  // a fork import in flight gates every ref-moving landing (§5.3)
+  if (isImporting(store)) return { tag: "importing" };
   if (!validRefName(input.ref)) return { tag: "invalid", reason: `funny refname: ${input.ref}` };
   if (!isOid(input.newOid)) return { tag: "invalid", reason: "malformed new oid" };
   if (!store.has(input.newOid)) return { tag: "invalid", reason: `object not stored: ${input.newOid.slice(0, 12)}…` };
@@ -1002,6 +1054,256 @@ export async function putRebaseObjects(host: LeaseHost, objects: MergeObject[]):
   return r;
 }
 
+// ---- fork catalog replication RPCs (SPEC-0001b §5.3) ---------------------------
+// The parent side reads (listCatalogPage) are pure; the fork side
+// (beginForkImport/adoptForkPacks/finalizeForkImport) is the replication
+// lease. Pack bytes never cross this boundary for 'r2' packs — the Worker
+// consumer streams bucket.get(parentKey) → bucket.put(forkKey) — with the one
+// documented exception of inline packData for location='sqlite' packs. The
+// crash story is idempotent re-run: rows are keyed (INSERT OR IGNORE), R2
+// copies overwrite, staging is replaced, and only finalize's single
+// transactionSync makes any of it visible (catalog + refs together).
+
+/** Hard cap on the index rows one listCatalogPage returns (a page stays well
+ * under the DO RPC message budget; the consumer tunes `limit` below it). */
+export const FORK_PAGE_MAX_ROWS = 65536;
+
+/**
+ * Paged read of the parent's ACTIVE pack catalog with each pack's index rows
+ * (§5.3 copy loop's parent side). `afterPackKey` is the PREVIOUS page's
+ * `nextAfter` cursor (engine-produced, opaque: "" starts the listing). `limit`
+ * is the page's index-row budget, clamped to [1, FORK_PAGE_MAX_ROWS]; a pack
+ * with more rows than fit is split across pages (rowsComplete: false) and the
+ * continuation rides the returned cursor. Only state='active' rows are ever
+ * listed — non-active states are compaction debris a fork must not copy.
+ */
+export function listCatalogPage(host: LeaseHost, afterPackKey: string, limit: number): CatalogPage {
+  const { store } = host;
+  const budget = Math.min(Math.max(1, Math.floor(limit) || 1), FORK_PAGE_MAX_ROWS);
+  const packs: CatalogPackEntry[] = [];
+  let hasLocalPacks = false;
+
+  // cursor shapes: "<packKey>" resumes AFTER that pack; "<packKey> <oid>"
+  // continues that pack's rows after <oid> (pack names cannot contain spaces)
+  let resumePack = afterPackKey;
+  let resumeOid = "";
+  const sp = afterPackKey.indexOf(" ");
+  if (sp > 0) {
+    resumePack = afterPackKey.slice(0, sp);
+    resumeOid = afterPackKey.slice(sp + 1);
+  }
+
+  const entryOf = (row: {
+    packKey: string; kind: string; state: PackState; location: "r2" | "sqlite";
+    objectCount: number; packBytes: number; idxBytes: number;
+  }, rows: IndexRow[], rowsFrom: string, rowsComplete: boolean): CatalogPackEntry => {
+    const entry: CatalogPackEntry = {
+      packKey: row.packKey, kind: row.kind, state: row.state, location: row.location,
+      objectCount: row.objectCount, packBytes: row.packBytes, idxBytes: row.idxBytes,
+      rows, rowsFrom, rowsComplete,
+    };
+    if (row.location === "sqlite" && rowsFrom === "") {
+      // the small-pack bytes are DO-local (pack_data chunks): they ride the
+      // page for the consumer to rehydrate into the fork's R2 prefix — bounded
+      // by the < 16 MiB threshold (SPEC-0001a §8 correction 2)
+      entry.packData = store.packs.sqlitePackBytes(row.packKey);
+      hasLocalPacks = true;
+    }
+    return entry;
+  };
+
+  let remaining = budget;
+  let nextAfter = resumePack;
+
+  if (resumeOid !== "") {
+    // continuation of a pack split across pages
+    const got = store.packs.indexRowsAfter(resumePack, resumeOid, remaining + 1);
+    const slice = got.slice(0, remaining);
+    const complete = got.length <= remaining;
+    const row = store.packs.activeCatalogRow(resumePack);
+    if (!row) {
+      // the pack vanished between pages (parent compaction): skip it — the
+      // idempotent re-run re-lists from scratch and converges
+      return { packs, hasLocalPacks, more: store.packs.hasActiveCatalogAfter(resumePack), nextAfter: resumePack };
+    }
+    packs.push(entryOf(row, slice, resumeOid, complete));
+    remaining -= slice.length;
+    if (!complete) {
+      return {
+        packs,
+        hasLocalPacks,
+        more: true,
+        nextAfter: `${resumePack} ${slice[slice.length - 1].oid}`,
+      };
+    }
+  }
+
+  for (;;) {
+    if (remaining <= 0) {
+      // budget spent exactly on a pack boundary: probe for a follower
+      return { packs, hasLocalPacks, more: store.packs.hasActiveCatalogAfter(nextAfter), nextAfter };
+    }
+    const row = store.packs.activeCatalogAfter(nextAfter, 1)[0];
+    if (!row) return { packs, hasLocalPacks, more: false, nextAfter };
+    const got = store.packs.indexRowsAfter(row.packKey, "", remaining + 1);
+    const slice = got.slice(0, remaining);
+    const complete = got.length <= remaining;
+    packs.push(entryOf(row, slice, "", complete));
+    remaining -= slice.length;
+    if (!complete) {
+      return { packs, hasLocalPacks, more: true, nextAfter: `${row.packKey} ${slice[slice.length - 1].oid}` };
+    }
+    nextAfter = row.packKey;
+  }
+}
+
+/**
+ * Open the replication lease on the FORK (§5.3 step 2): persists the fork's
+ * storage key, sets meta.importing=1 — gating beginReceive / commitApiChange /
+ * executeMerge with their `importing` variants — and clears any crashed
+ * attempt's staging rows. Idempotent during the import (the consumer's re-run
+ * re-begins); refused on a tombstoned repo and on a repo that already
+ * finalized an import (refs/catalog present), so a post-finalize retry cannot
+ * gate a live repo's writes forever.
+ */
+export function beginForkImport(host: LeaseHost, storageKey: string): BeginForkImportResult {
+  const { store } = host;
+  if (!isValidStorageKey(storageKey)) {
+    return { tag: "invalid", reason: `invalid storage key: ${storageKey.slice(0, 24)}` };
+  }
+  if (isDeleted(store)) return { tag: "invalid", reason: "repository deleted" };
+  if (!isImporting(store)) {
+    // a fork target must be an EMPTY DO: any ref, catalog row, index row or
+    // loose object means an import already finalized here — a re-begin would
+    // gate a live repo's writes forever (the consumer's post-finalize retry
+    // reads this as "already done")
+    if (store.hasAnyContent()) {
+      return {
+        tag: "invalid",
+        reason: "fork target is not empty (import already finalized?)",
+      };
+    }
+  }
+  host.storage.transactionSync(() => {
+    store.setMeta("storage_key", storageKey);
+    store.setMeta("importing", "1");
+    store.packs.clearForkStaging();
+  });
+  return { tag: "ok", storageKey };
+}
+
+/**
+ * Adopt one catalog page on the FORK (§5.3 step 3's fork side): verifies the
+ * consumer's copied pack bytes against their keys (first slice only), lands
+ * the page's index rows (idempotent INSERT OR IGNORE), and — when the slice
+ * completes a pack — stages its catalog entry for finalize. The consumer MUST
+ * have copied/rehydrated both .pack and .idx under the fork's prefix BEFORE
+ * this call (copy-before-stage, the receive path's ordering); a missing or
+ * mismatched object is `invalid`, never a partial commit.
+ */
+export async function adoptForkPacks(host: LeaseHost, page: CatalogPage): Promise<AdoptForkPacksResult> {
+  const { store } = host;
+  if (!isImporting(store)) return { tag: "invalid", reason: "no fork import in progress (beginForkImport first)" };
+  const storageKey = store.getMeta("storage_key");
+  if (!storageKey) return { tag: "invalid", reason: "fork has no persisted storage key" };
+  for (const entry of page.packs) {
+    if (!isValidPackName(entry.packKey)) {
+      return { tag: "invalid", reason: `malformed pack key: ${entry.packKey.slice(0, 24)}` };
+    }
+    if (entry.location === "sqlite" && entry.rowsFrom === "" && !entry.packData) {
+      return { tag: "invalid", reason: `sqlite pack without inline bytes: ${entry.packKey}` };
+    }
+    if (entry.rowsFrom === "") {
+      const tail = await host.readPackTail?.(packR2Key(storageKey, entry.packKey), 20);
+      // the pack's 20-byte TRAILER is its own SHA-1 — the name's hash, verbatim
+      if (!tail || toHex(tail) !== entry.packKey.slice("pack-".length)) {
+        return { tag: "invalid", reason: `pack bytes missing or not matching ${entry.packKey}` };
+      }
+    }
+    if (entry.rows.length) store.packs.putRows(entry.packKey, entry.rows);
+    if (entry.rowsComplete) {
+      // the fork's own count: rows actually keyed under this pack (an oid's
+      // row lives under the FIRST pack that indexed it — exactly what
+      // recordPack would write for the same row set)
+      store.packs.stageForkPack(entry.packKey, store.packs.countPackRows(entry.packKey), entry.packBytes, entry.idxBytes);
+    }
+  }
+  return { tag: "ok" };
+}
+
+/**
+ * Finalize the import on the FORK (§5.3 step 4): re-verifies every staged
+ * pack's bytes against its key, then ONE transactionSync inserts the
+ * pack_catalog rows (kind='fork' — these never came from a receive lease),
+ * writes refs (+ tag peels cached on the rows) and meta.head, clears
+ * meta.importing, and bumps refs_version. Nothing is servable before this
+ * transaction: a crash anywhere earlier leaves rows-without-catalog (the
+ * sweeps' debris class) and the consumer's idempotent re-run completes it.
+ */
+export async function finalizeForkImport(
+  host: LeaseHost,
+  input: FinalizeForkImportInput
+): Promise<FinalizeForkImportResult> {
+  const { store } = host;
+  if (!isImporting(store)) return { tag: "invalid", reason: "no fork import in progress (beginForkImport first)" };
+  const seen = new Set<string>();
+  for (const r of input.refs) {
+    if (!validRefName(r.name)) return { tag: "invalid", reason: `funny refname: ${r.name}` };
+    if (!isOid(r.oid)) return { tag: "invalid", reason: `malformed oid for ${r.name}` };
+    if (seen.has(r.name)) return { tag: "invalid", reason: `duplicate ref: ${r.name}` };
+    seen.add(r.name);
+  }
+  let headRef: string | null = null;
+  if (input.head !== null) {
+    headRef = input.head.startsWith("refs/") ? input.head : `refs/heads/${input.head}`;
+    if (!validRefName(headRef)) return { tag: "invalid", reason: `invalid head: ${input.head}` };
+    if (!input.refs.some((r) => r.name === headRef)) {
+      return { tag: "invalid", reason: `head does not name a copied ref: ${input.head}` };
+    }
+  }
+  // async validation BEFORE the transaction (transactionSync cannot await):
+  // every ref tip must exist in the adopted object set
+  for (const r of input.refs) {
+    if (!store.has(r.oid)) return { tag: "invalid", reason: `object not imported: ${r.oid.slice(0, 12)}… (${r.name})` };
+  }
+  // tag tips cache their peeled commit on the refs row at write time (same
+  // as commitApiChange)
+  const peeled = new Map<string, string>();
+  for (const r of input.refs) {
+    if (!r.name.startsWith("refs/tags/")) continue;
+    const p = await store.peeledRefTarget(r.name, r.oid);
+    if (p && p !== r.oid) peeled.set(r.name, p);
+  }
+  // "verifying pack names still match their row keys" (§5.3 step 4): the
+  // staged packs' 20-byte SHA-1 trailers against their catalog keys
+  const staged = store.packs.stagedForkPacks();
+  const storageKey = store.getMeta("storage_key") ?? "";
+  for (const s of staged) {
+    const tail = await host.readPackTail?.(packR2Key(storageKey, s.packKey), 20);
+    if (!tail || toHex(tail) !== s.packKey.slice("pack-".length)) {
+      return { tag: "invalid", reason: `staged pack bytes missing or not matching ${s.packKey}` };
+    }
+  }
+  let refsVersion = "";
+  host.storage.transactionSync(() => {
+    for (const s of staged) {
+      store.packs.recordPack(s.packKey, s.packBytes, s.idxBytes, "fork");
+    }
+    store.packs.clearForkStaging();
+    for (const r of input.refs) {
+      store.setRef(r.name, r.oid);
+      const p = peeled.get(r.name);
+      if (p) store.setRefPeeled(r.name, r.oid, p);
+    }
+    if (headRef) store.setHead(headRef);
+    store.setMeta("importing", "0");
+    store.bumpRefsVersion();
+    refsVersion = store.refsVersion();
+  });
+  return { tag: "ok", refsVersion };
+}
+
 /** serializeCommit/serializeTag/personLine re-exports: the Worker-side
  * builders construct the canonical bytes these RPCs verify and store. */
 export { serializeCommit, serializeTag, personLine };
+

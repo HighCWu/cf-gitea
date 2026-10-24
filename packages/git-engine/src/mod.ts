@@ -26,6 +26,7 @@ import type { RepoCell } from "./repo";
 import { DeltaResolver } from "./receive/delta";
 import { walkPack } from "./receive/scan";
 import { writeIdx } from "./receive/idx";
+import { copyObject } from "./fork/replicate";
 
 export { RepoCell } from "./repo";
 export { Registry } from "./registry";
@@ -90,6 +91,21 @@ export type {
 export type { MergeConflictPath, MergeObject, MergePlan, TreeChange } from "./merge/tree";
 export type { WalkAnswer, WalkOpts } from "./merge/graph";
 export { MERGE_BASE_MAX_VISITS } from "./merge/graph";
+// fork catalog replication (SPEC-0001b §5.3): the four RepoCell RPCs plus the
+// Worker-side consumer loop the fork endpoint's queue consumer calls (the
+// streamed bucket.get → bucket.put copy — the R2 binding has no server-side
+// copy — lives in replicate.ts and is reused by the receive path below)
+export type {
+  AdoptForkPacksResult,
+  BeginForkImportResult,
+  CatalogPage,
+  CatalogPackEntry,
+  FinalizeForkImportInput,
+  FinalizeForkImportResult,
+  ForkInvalid,
+} from "./fork/types";
+export type { ForkSourceRepo, ForkTargetRepo, ReplicateForkOpts, ReplicateForkResult } from "./fork/replicate";
+export { copyObject, replicateForkCatalog } from "./fork/replicate";
 
 /** an upload-pack negotiation body is wants/haves/caps only — a few hundred KB */
 const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
@@ -671,28 +687,9 @@ async function stagePack(
   return { packSha1, packBytes: total };
 }
 
-/**
- * Server-side R2 copy (staging → packs/), streamed through a FixedLengthStream
- * so the destination is length-exact. Runs BEFORE finalizeReceive: a crash
- * here strands an unreferenced packs/ object (orphan sweep), never a ref.
- */
-async function copyObject(bucket: R2Bucket, from: string, to: string): Promise<void> {
-  const obj = await bucket.get(from);
-  if (!obj) throw new Error(`staging object missing: ${from}`);
-  const fixed = new FixedLengthStream(obj.size);
-  const put = bucket.put(to, fixed.readable);
-  try {
-    await obj.body.pipeTo(fixed.writable);
-  } catch (err) {
-    try {
-      await put;
-    } catch {
-      // the destination rejects alongside the failed pipe
-    }
-    throw err;
-  }
-  await put;
-}
+// copyObject (staging → packs/, and the fork replication's pack copies) is
+// shared with src/fork/replicate.ts — imported at the top; see its doc there
+// for the FixedLengthStream contract and the buffered host fallback.
 
 /**
  * POST /git-receive-pack — the Worker-side receive flow. Auth (write) has
@@ -755,6 +752,15 @@ async function receivePack<E extends Env>(
       return new Response("busy: too many concurrent pushes, retry shortly\n", {
         status: 503,
         headers: { "retry-after": String(begin.retryAfterSeconds) },
+      });
+    }
+    if (begin.tag === "importing") {
+      // a fork catalog import is replicating into this repo (SPEC-0001b §5.3):
+      // the push cannot be served until it finalizes — a distinctly-worded 503
+      // with a longer retry hint than the lease-busy case
+      return new Response("busy: repository is being created (fork import in progress), retry shortly\n", {
+        status: 503,
+        headers: { "retry-after": "30" },
       });
     }
     if (begin.tag === "rejected") {

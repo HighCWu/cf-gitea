@@ -2,6 +2,7 @@ import pako from "pako";
 import { ObjType } from "./objects";
 import { applyDelta } from "./pack";
 import { packR2Key } from "./r2keys";
+import { concat } from "./util";
 import type { IndexRow, LookupObjectHit, LookupObjectResult } from "../control-plane";
 import { ObjCache, ObjRec } from "../receive/objcache";
 
@@ -204,11 +205,18 @@ export class PackStore {
         crc32 INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_pack_objects_loc ON pack_objects(pack_key, offset);
+      CREATE TABLE IF NOT EXISTS fork_import (
+        pack_key TEXT PRIMARY KEY,
+        object_count INTEGER NOT NULL,
+        pack_bytes INTEGER NOT NULL,
+        idx_bytes INTEGER NOT NULL,
+        staged_at INTEGER NOT NULL
+      );
     `);
   }
 
   wipe(): void {
-    for (const t of ["pack_catalog", "pack_data", "pack_objects"]) {
+    for (const t of ["pack_catalog", "pack_data", "pack_objects", "fork_import"]) {
       this.sql.exec(`DROP TABLE IF EXISTS ${t}`);
     }
     this.chunks.clear(); // pack keys are content-derived, but caches hold chunk bytes
@@ -480,26 +488,10 @@ export class PackStore {
   }
 
   /**
-   * Record the pack_catalog row (finalize's commit transaction). The count is
-   * the actual indexed-row count, not the pack header's declaration. The
-   * catalog key IS the R2 object stem (`pack-<sha1>`); the sequence comes from
-   * the formal `next_pack_seq` meta key. kind='receive' (M3 adds 'compact'),
-   * state='active' (M3 adds the RETIRED/RECLAIMABLE transitions),
-   * location='r2' (the <16 MiB sqlite location is a later-milestone writer).
+   * Record the pack_catalog row (finalize's commit transaction) — implemented
+   * in the fork-replication section below (same class; the `kind` parameter
+   * defaults to 'receive' for the receive path).
    */
-  recordPack(packKey: string, packBytes: number, idxBytes: number): void {
-    const count = this.sql
-      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key = ?", packKey)
-      .one().n;
-    this.sql.exec(
-      `INSERT INTO pack_catalog (pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by)
-       VALUES (?, ?, 'receive', 'active', 'r2', ?, ?, ?, ?, NULL)
-       ON CONFLICT(pack_key) DO NOTHING`,
-      packKey, this.nextPackSeq(), count, packBytes, idxBytes, Date.now()
-    );
-    this.backend.set(packKey, "r2");
-    this.r2KeyOverrides.delete(packKey);
-  }
 
   /** Delete every index/data row of one pack (lease sweeps, abandoned
    * receives). Cache state is cleared because chunk keys overlap by prefix. */
@@ -574,4 +566,195 @@ export class PackStore {
       .toArray()
       .map((r) => r.oid);
   }
+
+  // ---- fork replication reads (SPEC-0001b §5.3) ------------------------------
+  // The parent side of catalog replication: paged reads over the ACTIVE pack
+  // catalog and the per-pack index rows, plus the small-pack bytes a sqlite
+  // location hides from every other DO. Control data only — pack bytes for
+  // 'r2' packs are streamed by the Worker consumer straight from R2.
+
+  /** Keyset page of ACTIVE catalog rows in pack_key order. Non-active states
+   * ('retired'/'reclaimable'/'deleted') are compaction debris whose objects
+   * the active set already holds — a fork copy must never resurrect them. */
+  activeCatalogAfter(afterPackKey: string, limit: number): PackCatalogRow[] {
+    return this.sql
+      .exec<{
+        pack_key: string; seq: number; kind: string; state: string; location: string;
+        object_count: number; pack_bytes: number; idx_bytes: number; created_at: number;
+        superseded_by: string | null;
+      }>(
+        `SELECT pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by
+           FROM pack_catalog
+          WHERE state = 'active' AND pack_key > ?
+          ORDER BY pack_key
+          LIMIT ?`,
+        afterPackKey,
+        limit
+      )
+      .toArray()
+      .map((r) => ({
+        packKey: r.pack_key,
+        seq: r.seq,
+        kind: r.kind,
+        state: r.state as PackState,
+        location: r.location === "sqlite" ? "sqlite" : "r2",
+        objectCount: r.object_count,
+        packBytes: r.pack_bytes,
+        idxBytes: r.idx_bytes,
+        createdAt: r.created_at,
+        supersededBy: r.superseded_by,
+      }));
+  }
+
+  /** Whether another ACTIVE pack exists after `afterPackKey` (the `more` probe
+   * of listCatalogPage's last page). */
+  hasActiveCatalogAfter(afterPackKey: string): boolean {
+    return (
+      this.sql
+        .exec("SELECT 1 FROM pack_catalog WHERE state = 'active' AND pack_key > ? LIMIT 1", afterPackKey)
+        .toArray()
+        .length > 0
+    );
+  }
+
+  /** One ACTIVE catalog row by exact key (listCatalogPage's split-pack
+   * continuation fetches the row it is mid-way through). */
+  activeCatalogRow(packKey: string): PackCatalogRow | null {
+    const rows = this.sql
+      .exec<{
+        pack_key: string; seq: number; kind: string; state: string; location: string;
+        object_count: number; pack_bytes: number; idx_bytes: number; created_at: number;
+        superseded_by: string | null;
+      }>(
+        `SELECT pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by
+           FROM pack_catalog
+          WHERE state = 'active' AND pack_key = ?`,
+        packKey
+      )
+      .toArray();
+    const r = rows[0];
+    if (!r) return null;
+    return {
+      packKey: r.pack_key,
+      seq: r.seq,
+      kind: r.kind,
+      state: r.state as PackState,
+      location: r.location === "sqlite" ? "sqlite" : "r2",
+      objectCount: r.object_count,
+      packBytes: r.pack_bytes,
+      idxBytes: r.idx_bytes,
+      createdAt: r.created_at,
+      supersededBy: r.superseded_by,
+    };
+  }
+
+  /** Full-shape keyset page of one pack's index rows (listCatalogPage's row
+   * slices; the same columns receive's putIndexRows landed). */
+  indexRowsAfter(packKey: string, afterOid: string, limit: number): IndexRow[] {
+    return this.sql
+      .exec<{
+        oid: string; offset: number; data_off: number; data_len: number;
+        type: ObjType; size: number; entry_size: number; base_oid: string | null; crc32: number;
+      }>(
+        `SELECT oid, offset, data_off, data_len, type, size, entry_size, base_oid, crc32
+           FROM pack_objects
+          WHERE pack_key = ? AND oid > ?
+          ORDER BY oid
+          LIMIT ?`,
+        packKey,
+        afterOid,
+        limit
+      )
+      .toArray()
+      .map((r) => ({
+        oid: r.oid,
+        offset: r.offset,
+        dataOff: r.data_off,
+        dataLen: r.data_len,
+        type: r.type,
+        size: r.size,
+        entrySize: r.entry_size,
+        baseOid: r.base_oid,
+        crc32: r.crc32,
+      }));
+  }
+
+  /** The stored bytes of a sqlite-location pack, reassembled from its 1 MiB
+   * pack_data chunks (listCatalogPage's inline `packData`). No R2-backed pack
+   * ever takes this path. */
+  sqlitePackBytes(packKey: string): Uint8Array {
+    const rows = this.sql
+      .exec<{ data: ArrayBuffer }>("SELECT data FROM pack_data WHERE pack_key = ? ORDER BY seq", packKey)
+      .toArray();
+    return concat(rows.map((r) => new Uint8Array(r.data)));
+  }
+
+  /** Index rows actually keyed under one pack (an oid's row lives under the
+   * FIRST pack that indexed it — INSERT OR IGNORE — so a copy's count is the
+   * recomputed one, exactly what recordPack writes). */
+  countPackRows(packKey: string): number {
+    return this.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key = ?", packKey)
+      .one().n;
+  }
+
+  // ---- fork import staging (SPEC-0001b §5.3 step 4) --------------------------
+  // adoptForkPacks stages each completed pack here; finalizeForkImport turns
+  // staging into pack_catalog rows in the ONE transaction that also writes
+  // refs — a crash before finalize leaves servable nothing (no catalog, no
+  // refs) and the idempotent re-run restages everything.
+
+  /** Record a completed pack for finalize. REPLACE: an idempotent re-run
+   * restages the same pack with recomputed values. */
+  stageForkPack(packKey: string, objectCount: number, packBytes: number, idxBytes: number): void {
+    this.sql.exec(
+      `INSERT INTO fork_import (pack_key, object_count, pack_bytes, idx_bytes, staged_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(pack_key) DO UPDATE SET object_count = excluded.object_count, pack_bytes = excluded.pack_bytes, idx_bytes = excluded.idx_bytes, staged_at = excluded.staged_at`,
+      packKey,
+      objectCount,
+      packBytes,
+      idxBytes,
+      Date.now()
+    );
+  }
+
+  stagedForkPacks(): { packKey: string; objectCount: number; packBytes: number; idxBytes: number }[] {
+    return this.sql
+      .exec<{ pack_key: string; object_count: number; pack_bytes: number; idx_bytes: number }>(
+        "SELECT pack_key, object_count, pack_bytes, idx_bytes FROM fork_import ORDER BY pack_key"
+      )
+      .toArray()
+      .map((r) => ({ packKey: r.pack_key, objectCount: r.object_count, packBytes: r.pack_bytes, idxBytes: r.idx_bytes }));
+  }
+
+  /** Clear the staging table (beginForkImport's fresh start and finalize's
+   * commit). Must run inside the caller's transaction where atomicity matters. */
+  clearForkStaging(): void {
+    this.sql.exec("DELETE FROM fork_import");
+  }
+
+  /**
+   * Record the pack_catalog row (finalize's commit transaction). The count is
+   * the actual indexed-row count, not the pack header's declaration. The catalog
+   * key IS the R2 object stem (`pack-<sha1>`); the sequence comes from
+   * the formal `next_pack_seq` meta key. kind='receive' (M3 adds 'compact',
+   * fork replication records 'fork'), state='active' (M3 adds the
+   * RETIRED/RECLAIMABLE transitions), location='r2' (the <16 MiB sqlite
+   * location is a later-milestone writer).
+   */
+  recordPack(packKey: string, packBytes: number, idxBytes: number, kind: string = "receive"): void {
+    const count = this.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key = ?", packKey)
+      .one().n;
+    this.sql.exec(
+      `INSERT INTO pack_catalog (pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by)
+       VALUES (?, ?, ?, 'active', 'r2', ?, ?, ?, ?, NULL)
+       ON CONFLICT(pack_key) DO NOTHING`,
+      packKey, this.nextPackSeq(), kind, count, packBytes, idxBytes, Date.now()
+    );
+    this.backend.set(packKey, "r2");
+    this.r2KeyOverrides.delete(packKey);
+  }
 }
+
