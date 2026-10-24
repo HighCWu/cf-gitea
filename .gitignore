@@ -21,3 +21,4 @@ coverage/
 .bench-results/
 apps/worker/public/assets/
 **/worker-configuration.d.ts
+apps/worker/src/ui/icons.generated.ts
