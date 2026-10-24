@@ -1030,6 +1030,7 @@ describe("DELETE /orgs/{org} (orgDelete)", () => {
     await new RepoService(env.DB).create({
       owner: { id: seed.orgId, usernameLower: "acme" },
       name: "owned",
+      isPrivate: false,
     });
     const response = await router()("/orgs/acme", {
       method: "DELETE",
