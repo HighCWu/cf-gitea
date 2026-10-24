@@ -23,7 +23,9 @@ export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
   {
-    files: ["**/*.ts"],
+    // .tsx included for the SPEC-0008 UI shell's hono/jsx components
+    // (apps/worker/src/ui) — type-aware linting needs projectService there too.
+    files: ["**/*.ts", "**/*.tsx"],
     languageOptions: {
       parserOptions: {
         projectService: true,
