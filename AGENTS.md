@@ -75,7 +75,14 @@ scripts/               # Repo-level tooling (contract checks, codegen)
   one feature module / one docs+specs batch. The orchestrator commits a unit when
   its owning agent lands and gates are green; **agents never run git commit**.
 - Never commit while a unit's agent is mid-flight (moving target); the landing
-  review is the commit point.
+  review is the commit point. **Pre-commit checklist (hard-learned):** (1) see
+  the actual `Tests ` line for the affected scope with your own eyes — never
+  pattern-match or trust the agent's claim; (2) `git status` the whole tree and
+  diff every path your change touched — `git add` by directory silently misses
+  sibling paths (two escaped commits this session); (3) after ANY concurrent
+  edit window, re-verify your own change landed (grep/json.load) before
+  committing — a rejected edit + a successful commit of a neighbor's change
+  looks identical to success.
 - Generated artifacts stay out (see Structure Rules); `pnpm-lock.yaml` IS committed.
 - **Submodule hygiene**: `gitea/` stays pristine — never run installs or builds
   inside it (asset builds run in scratch dirs, `scripts/build-gitea-assets.mjs`);
