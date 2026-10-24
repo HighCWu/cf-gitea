@@ -92,3 +92,32 @@ design while the engine runs headless (`ui: false`):
 Those become Gitea-API-level checks in a later SPEC, or are covered by the
 official Gitea UI itself. CI asserts the failure set stays exactly this
 documented set — any new failing check fails the build.
+
+## SPEC-0001b merge-primitive checks (tsx, no server needed)
+
+The merge/graph primitives add three tsx-run check scripts alongside
+`check-deepen-parse.mjs` — plain Node, no dev server: a `node:sqlite` adapter
+(`helpers/lib.mjs`) runs the real `GitStore` + control-plane (real
+BEGIN/COMMIT transactions), and real `git` fixture repositories provide the
+oracles (`git merge-base`, `git rev-list --topo-order/--left-right`,
+`git merge-file`, `git merge-tree --write-tree`, `git rebase`).
+
+```bash
+TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
+node "$TSX" packages/git-engine/e2e/check-merge-graph.mjs   # §4.1 graph primitives (14 checks)
+node "$TSX" packages/git-engine/e2e/check-merge-tree.mjs    # §4.2 tree merge + diff3 vs git (25 checks)
+node "$TSX" packages/git-engine/e2e/check-merge-engine.mjs  # §4.3-4.5/4.8 RPC semantics (29 checks)
+```
+
+Notes on the oracles (see the scripts' headers for details):
+
+- `git merge-tree --write-tree` embeds conflict-marker file content in its
+  CONFLICTED tree (the tree a real merge leaves in the worktree); our plan
+  drops conflicted paths instead (a conflicted merge is never landed), so the
+  tree-oid equality holds for CLEAN merges and the conflicted-file list for
+  all. Marker byte-exactness is proven per-file by the `git merge-file` cases.
+- criss-cross fixtures have TWO valid merge bases; the engine's deterministic
+  pick (newest committer time, then smaller oid) is asserted to be a member of
+  `git merge-base --all`'s set and stable across calls.
+- The §4.6 read-only rule is asserted by an object-count + refs + refs_version
+  snapshot around every read RPC (including `rebaseOnto`).

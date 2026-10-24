@@ -15,29 +15,53 @@ import {
 } from "./git/protocol";
 import {
   beginReceive,
+  commitApiChange,
+  checkMergeability,
+  countDivergence,
+  deleteApiRef,
   destroy,
+  executeMerge,
   finalizeReceive,
+  listCommitsRange,
   lookupObjects,
   markDeleted,
+  mergeBase,
+  putApiObjects,
   putIndexRows,
+  putRebaseObjects,
+  rebaseOnto,
   releaseReceive,
   setHead,
   sweepExpiredLeases,
+  type ApiObject,
   type BeginReceiveInput,
   type BeginReceiveResult,
+  type CheckMergeabilityInput,
+  type CheckMergeabilityResult,
+  type CommitApiChangeInput,
+  type CommitApiChangeResult,
+  type DeleteApiRefInput,
+  type DeleteApiRefResult,
   type DestroyResult,
+  type ExecuteMergeInput,
+  type ExecuteMergeResult,
   type FinalizeReceiveInput,
   type FinalizeReceiveResult,
   type IndexRow,
   type LeaseHost,
   type LookupObjectResult,
   type MarkDeletedResult,
+  type PutApiObjectsResult,
+  type PutRebaseObjectsResult,
+  type RebaseOntoInput,
+  type RebaseOutcome,
   type ReleaseReceiveInput,
   type ReleaseReceiveResult,
   type SetHeadResult,
 } from "./control-plane";
 import {
   Commit,
+  ObjType,
   Person,
   parseCommit,
   parseTag,
@@ -514,6 +538,64 @@ export class RepoCell extends DurableObject<Env> {
    * anti-checks (Step 2); the Worker R2-reads packed hits itself. */
   async lookupObjects(leaseToken: string, oids: string[]): Promise<LookupObjectResult[]> {
     return lookupObjects(this.leaseHost(), leaseToken, oids);
+  }
+
+  // ---- API commit builder (SPEC-0001a §4) + merge surface (SPEC-0001b §4) --
+  // Public RPCs over the LeaseHost delegation, same tagged-union discipline as
+  // the receive lease RPCs above. The read paths (mergeBase through
+  // rebaseOnto) perform NO durable writes (SPEC-0001b §4.6); executeMerge /
+  // putApiObjects / commitApiChange / deleteApiRef are the CAS landings.
+
+  /** Verify + store Worker-built objects (SPEC-0001a §4.3). Idempotent. */
+  async putApiObjects(objects: ApiObject[]): Promise<PutApiObjectsResult> {
+    return putApiObjects(this.leaseHost(), objects);
+  }
+
+  /** One CAS ref landing for a Worker-built commit/tag/branch (SPEC-0001a
+   * §4.3). Cannot delete refs — deleteApiRef below. */
+  async commitApiChange(input: CommitApiChangeInput): Promise<CommitApiChangeResult> {
+    return commitApiChange(this.leaseHost(), input);
+  }
+
+  /** CAS ref delete (SPEC-0001b §4.8): PR cleanup, cascade and branch deletes. */
+  async deleteApiRef(input: DeleteApiRefInput): Promise<DeleteApiRefResult> {
+    return deleteApiRef(this.leaseHost(), input);
+  }
+
+  /** Best common ancestor of two refs/oids (SPEC-0001b §4.1). */
+  async mergeBase(a: string, b: string): Promise<{ tag: "ok"; base: string | null; exhausted: boolean } | { tag: "missing"; which: "a" | "b" }> {
+    return mergeBase(this.leaseHost(), a, b);
+  }
+
+  /** `base..head` commits, topological, oldest first (SPEC-0001b §4.1). */
+  async listCommitsRange(base: string, head: string, limit: number, page = 0): Promise<{ commits: CommitJson[]; more: boolean } | null> {
+    return listCommitsRange(this.leaseHost(), base, head, limit, page);
+  }
+
+  /** `rev-list --left-right --count base head` in one walk (§4.1). */
+  async countDivergence(base: string, head: string): Promise<{ tag: "ok"; ahead: number; behind: number; exhausted: boolean } | { tag: "missing" }> {
+    return countDivergence(this.leaseHost(), base, head);
+  }
+
+  /** Read-only mergeability classification (§4.3; writes nothing — §4.6). */
+  async checkMergeability(input: CheckMergeabilityInput): Promise<CheckMergeabilityResult> {
+    return checkMergeability(this.leaseHost(), input);
+  }
+
+  /** Merge execution: one landing primitive, styles as parameters (§4.4). */
+  async executeMerge(input: ExecuteMergeInput): Promise<ExecuteMergeResult> {
+    return executeMerge(this.leaseHost(), input);
+  }
+
+  /** Rebase replay — read-only + in-memory; objects come back in the outcome
+   * and land through putRebaseObjects + a fast-forward-only executeMerge (§4.5). */
+  async rebaseOnto(input: RebaseOntoInput): Promise<RebaseOutcome> {
+    return rebaseOnto(this.leaseHost(), input);
+  }
+
+  /** Store a replay's objects through the commit builder's budgets (§4.5). */
+  async putRebaseObjects(objects: { oid: string; type: ObjType; data: Uint8Array }[]): Promise<PutRebaseObjectsResult> {
+    return putRebaseObjects(this.leaseHost(), objects);
   }
 
   // ---- repo lifecycle (SPEC-0003 §2.5.5; LIFECYCLE gap RPCs) ----------------

@@ -33,13 +33,30 @@ export type { Env } from "./env";
 export type { RepoInfo, RepoConfig } from "./registry";
 export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, BlobResult, LogResult, DiffResult, DiffFileJson } from "./repo";
 export type { Person } from "./git/objects";
+// object serializers (SPEC-0001a §4.1): the Worker-side builders construct the
+// canonical bytes that putApiObjects verifies and stores
+export {
+  serializeCommit,
+  serializeCommit as serializeCommitObject,
+  serializeTag,
+  serializeTree,
+  emptyTree,
+  EMPTY_TREE_OID,
+  personLine,
+  type CommitSpec,
+  type TagSpec,
+  type SerializeTreeEntry,
+} from "./commit/serialize";
 // receive control plane (SPEC-0001a §3 Steps 1-2): the Worker-side data plane
 // in this file drives these lease RPCs; consumers of the engine re-export them
 // so the typed boundary is complete. The repo lifecycle RPCs
 // (markDeleted/destroy/setHead, SPEC-0003 §2.5.5) ride the same boundary.
 export type {
+  ApiObject,
   BeginReceiveInput,
   BeginReceiveResult,
+  CommitApiChangeInput,
+  CommitApiChangeResult,
   DestroyResult,
   FinalizedPack,
   FinalizeReceiveInput,
@@ -48,11 +65,31 @@ export type {
   LookupObjectHit,
   LookupObjectResult,
   MarkDeletedResult,
+  PutApiObjectsResult,
+  PutRebaseObjectsResult,
   ReceiveCommandResult,
   ReleaseReceiveInput,
   ReleaseReceiveResult,
   SetHeadResult,
 } from "./control-plane";
+// merge surface (SPEC-0001b §4): the PR/compare API waves consume these
+// through the generated dist-types boundary
+export type {
+  CheckMergeabilityInput,
+  CheckMergeabilityResult,
+  DeleteApiRefInput,
+  DeleteApiRefResult,
+  ExecuteMergeInput,
+  ExecuteMergeResult,
+  ExtraRefUpdate,
+  MergeabilityStatus,
+  MergeStyle,
+  RebaseOntoInput,
+  RebaseOutcome,
+} from "./merge/types";
+export type { MergeConflictPath, MergeObject, MergePlan, TreeChange } from "./merge/tree";
+export type { WalkAnswer, WalkOpts } from "./merge/graph";
+export { MERGE_BASE_MAX_VISITS } from "./merge/graph";
 
 /** an upload-pack negotiation body is wants/haves/caps only — a few hundred KB */
 const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;

@@ -39,11 +39,49 @@ import {
   CommandResult,
   PushCommand,
 } from "./git/protocol";
-import { ObjType } from "./git/objects";
-import { ZERO_OID } from "./git/util";
+import { ObjType, hashObject, parseCommit } from "./git/objects";
+import { ZERO_OID, isOid } from "./git/util";
 import { isValidStorageKey, packR2Key, stagingKey as buildStagingKey, packName as catalogPackName } from "./git/r2keys";
 import type { GitStore } from "./git/store";
 import type { RefUpdate } from "./mod";
+import { serializeCommit, serializeTag, personLine } from "./commit/serialize";
+import { mergeBase as graphMergeBase, listCommitsRange as graphListCommitsRange, countDivergence as graphCountDivergence, resolveCommitish } from "./merge/graph";
+import { checkMergeability as classifyMergeability, executeMerge as runExecuteMerge } from "./merge/engine";
+import { rebaseOnto as runRebaseOnto } from "./merge/rebase";
+import type {
+  ExtraRefUpdate,
+  CheckMergeabilityInput,
+  CheckMergeabilityResult,
+  ExecuteMergeInput,
+  ExecuteMergeResult,
+  RebaseOntoInput,
+  RebaseOutcome,
+  DeleteApiRefInput,
+  DeleteApiRefResult,
+} from "./merge/types";
+import type { MergeObject } from "./merge/tree";
+
+// the SPEC-0001b §4 RPC contract types ride the control-plane boundary (the
+// dist-types generation consumes this module's exports)
+export type {
+  CheckMergeabilityInput,
+  CheckMergeabilityResult,
+  DeleteApiRefInput,
+  DeleteApiRefResult,
+  ExecuteMergeInput,
+  ExecuteMergeResult,
+  ExtraRefUpdate,
+  MergeabilityStatus,
+  MergeStyle,
+  RebaseOntoInput,
+  RebaseOutcome,
+  RebasedCommit,
+} from "./merge/types";
+export type { MergeConflictPath, MergeObject, MergePlan, TreeChange } from "./merge/tree";
+
+/** Per-call budget for one putApiObjects/putRebaseObjects call — total bytes
+ * across the objects, default 8 MiB (SPEC-0001a §4.3: API_COMMIT_MAX_BYTES). */
+export const API_COMMIT_MAX_BYTES = 8 * 1024 * 1024;
 
 /** Per-command outcome, one per input command, in order. */
 export interface ReceiveCommandResult {
@@ -120,6 +158,14 @@ export interface FinalizeReceiveInput {
    * object database. validatePush then rejects every non-delete command with
    * "missing necessary objects" exactly as the deleted packComplete() did. */
   packIncomplete?: boolean;
+  /** PR-head (and similar housekeeping) ref updates applied in the SAME
+   * transaction as `commands` (SPEC-0001b §4.7), CAS'd per entry, but
+   * EXCLUDED from `results` (which stays index-aligned with the client's
+   * commands — report-status must never name a ref the client did not send)
+   * and INCLUDED in `updates` (hooks/webhooks see them). An entry whose CAS
+   * mismatches (or whose object is missing) is skipped — housekeeping never
+   * fails the user's push; the Queue worker's next check re-syncs the ref. */
+  extraRefUpdates?: ExtraRefUpdate[];
 }
 
 export type FinalizeCommitted = {
@@ -481,6 +527,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
         results: input.commands.map((c) => ({ ref: c.ref, ok: false, msg: "fetch first" })),
         changed: false,
         needsGc: false,
+        extraApplied: [] as RefUpdate[],
       };
     }
     // record the pack catalog entry inside the transaction that first points
@@ -504,6 +551,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
           results: input.commands.map((c) => ({ ref: c.ref, ok: false, msg: "unpacker error" })),
           changed: false,
           needsGc: false,
+          extraApplied: [] as RefUpdate[],
         };
       }
       const derived = packR2Key(leaseData.storageKey ?? "", name);
@@ -513,6 +561,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
           results: input.commands.map((c) => ({ ref: c.ref, ok: false, msg: "unpacker error" })),
           changed: false,
           needsGc: false,
+          extraApplied: [] as RefUpdate[],
         };
       }
       store.packs.recordPack(name, input.pack.packBytes, input.pack.idxBytes);
@@ -526,12 +575,33 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
       }
     }
     const applied = commitPush(store, plan);
-    if (applied.changed) {
-      store.setMeta("created", "1");
-      store.setMeta("last-push", String(Date.now()));
+    // PR-head (and similar housekeeping) choreography rides the SAME
+    // transaction (SPEC-0001b §4.7): CAS per entry, best-effort — an entry
+    // whose CAS mismatches or whose object is missing is skipped (never
+    // fails the user's push; the Queue worker re-syncs). Excluded from
+    // `results` (index-aligned with the client's commands only), included in
+    // `updates`.
+    const extraApplied: RefUpdate[] = [];
+    for (const x of input.extraRefUpdates ?? []) {
+      if (!validRefName(x.ref)) continue;
+      const cur = store.getRef(x.ref) ?? ZERO_OID;
+      if (cur !== x.expectedOldOid) continue;
+      if (x.newOid !== null && !store.has(x.newOid)) continue;
+      if (x.newOid === null) {
+        if (cur !== ZERO_OID) store.delRef(x.ref);
+      } else {
+        store.setRef(x.ref, x.newOid);
+      }
+      extraApplied.push({ ref: x.ref, old: x.expectedOldOid, new: x.newOid ?? ZERO_OID });
+    }
+    if (applied.changed || extraApplied.length) {
+      if (applied.changed) {
+        store.setMeta("created", "1");
+        store.setMeta("last-push", String(Date.now()));
+      }
       store.bumpRefsVersion();
     }
-    return { lost: false as const, ...applied };
+    return { lost: false as const, ...applied, extraApplied };
   });
   if (outcome.lost) return { tag: "lease_mismatch" };
   const { results, changed, needsGc } = outcome;
@@ -557,10 +627,15 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
   // the updates a push actually applied. results[i] is the outcome of
   // commands[i] — the join is by index, not ref name: a crafted request can
   // send two commands for the same ref, and a name join would let the
-  // rejected one inherit the applied one's success.
-  const updates: RefUpdate[] = input.commands
-    .filter((_, i) => results[i]?.ok === true)
-    .map((c) => ({ ref: c.ref, old: c.old, new: c.next }));
+  // rejected one inherit the applied one's success. The PR-head extras that
+  // rode the same transaction are appended here (hooks/webhooks see them;
+  // report-status results never name them).
+  const updates: RefUpdate[] = [
+    ...input.commands
+      .filter((_, i) => results[i]?.ok === true)
+      .map((c) => ({ ref: c.ref, old: c.old, new: c.next })),
+    ...outcome.extraApplied,
+  ];
 
   if (!changed && results.some((r) => !r.ok && r.msg === "fetch first")) {
     return { tag: "ref_conflict", results: toCommandResults(results) };
@@ -691,3 +766,242 @@ export const NO_PACK: FinalizedPack = {
   objectCount: 0,
   idxBytes: 0,
 };
+
+// ---- API-side commit builder (SPEC-0001a §4) ---------------------------------
+// Objects are constructed Worker-side (data plane) and land here: re-verified,
+// stored into the loose objects/chunks tables, then the ref moves via CAS in
+// one transactionSync. The builder takes NO receive lease (§4.5) — correctness
+// rests on CAS + content addressing, the same posture executeMerge reuses for
+// the SPEC-0001b landing.
+
+/** One canonical git object built in the Worker. `data` is the canonical git
+ * serialization (NOT zlib-deflated — storage deflation is GitStore.put's job). */
+export interface ApiObject {
+  /** Worker-computed sha1(header + content); the DO re-verifies before storing */
+  oid: string;
+  type: ObjType;
+  data: Uint8Array;
+}
+
+export type PutApiObjectsResult =
+  | { tag: "ok"; stored: number }
+  | { tag: "too_large"; limitBytes: number }
+  | { tag: "invalid"; reason: string }; // oid/type mismatch or oversized object
+
+export interface CommitApiChangeInput {
+  /** full ref name; must pass the same refname validation as receive */
+  ref: string;
+  /** CAS base: the ref tip the caller built on; ZERO_OID = create-on-empty */
+  expectedOldOid: string;
+  /** target oid; must already be stored (by putApiObjects, or pre-existing) */
+  newOid: string;
+}
+
+export type CommitApiCommitted = {
+  tag: "committed";
+  ref: string;
+  oldOid: string; // actual pre-commit tip (== expectedOldOid)
+  newOid: string;
+  /** post-commit refs_version — same edge-cache key a push bumps (T4) */
+  refsVersion: string;
+  /** newest committer date, for the Worker's registry upsert */
+  commitTime: number;
+};
+export type CommitApiRefConflict = {
+  tag: "ref_conflict";
+  /** current tip, so the caller can retry atop it (SPEC-0004 maps to 409) */
+  currentOid: string;
+};
+export type CommitApiInvalid = { tag: "invalid"; reason: string };
+export type CommitApiChangeResult =
+  | CommitApiCommitted
+  | CommitApiRefConflict
+  | CommitApiInvalid;
+
+/**
+ * Verify + store a batch of Worker-built objects. Idempotent (content-
+ * addressed; an existing oid is a no-op), so retries and concurrent writers
+ * are safe. Every object is re-hashed BEFORE storing — a Worker oid/type
+ * mismatch is `invalid`, never a corrupted store entry. Partial writes from a
+ * transport failure are harmless: unreferenced loose objects are reclaimed by
+ * the sweep (GC today, M3 compaction).
+ */
+export async function putApiObjects(host: LeaseHost, objects: ApiObject[]): Promise<PutApiObjectsResult> {
+  let total = 0;
+  for (const o of objects) total += o.data.length;
+  if (total > API_COMMIT_MAX_BYTES) return { tag: "too_large", limitBytes: API_COMMIT_MAX_BYTES };
+  for (const o of objects) {
+    if (!isOid(o.oid)) return { tag: "invalid", reason: `malformed oid: ${o.oid.slice(0, 12)}…` };
+    if (hashObject(o.type, o.data) !== o.oid) {
+      return { tag: "invalid", reason: `oid/type mismatch for ${o.oid.slice(0, 12)}…` };
+    }
+  }
+  for (const o of objects) host.store.put(o.oid, o.type, o.data);
+  return { tag: "ok", stored: objects.length };
+}
+
+/**
+ * One CAS ref landing in a single transactionSync (SPEC-0001a §4.3): refname
+ * validation → presence check (`store.has(newOid)`; for a commit target also
+ * its root tree) → CAS → ref write (+ the tag peel cached on the refs row for
+ * tag targets, computed BEFORE the transaction — transactionSync cannot await)
+ * → `refs_version` bump → the commitPush HEAD fixup → commitTime. Cannot
+ * delete refs: branch/PR ref deletes route to deleteApiRef (SPEC-0001b §4.8).
+ */
+export async function commitApiChange(host: LeaseHost, input: CommitApiChangeInput): Promise<CommitApiChangeResult> {
+  const { store } = host;
+  if (!validRefName(input.ref)) return { tag: "invalid", reason: `funny refname: ${input.ref}` };
+  if (!isOid(input.newOid)) return { tag: "invalid", reason: "malformed new oid" };
+  if (!store.has(input.newOid)) return { tag: "invalid", reason: `object not stored: ${input.newOid.slice(0, 12)}…` };
+  const meta = store.typeAndSize(input.newOid);
+  if (!meta) return { tag: "invalid", reason: `object not readable: ${input.newOid.slice(0, 12)}…` };
+  if (meta.type === "commit") {
+    const obj = await store.get(input.newOid);
+    const tree = obj?.type === "commit" ? parseCommit(obj.data).tree : null;
+    if (!tree || !store.has(tree)) {
+      return { tag: "invalid", reason: `root tree not stored for ${input.newOid.slice(0, 12)}…` };
+    }
+  }
+  // tag targets cache their peeled commit on the refs row at write time
+  let peeled: string | null = null;
+  if (meta.type === "tag") peeled = await store.peeledRefTarget(input.ref, input.newOid);
+
+  const current = store.getRef(input.ref) ?? ZERO_OID;
+  if (current !== input.expectedOldOid) return { tag: "ref_conflict", currentOid: current };
+
+  host.storage.transactionSync(() => {
+    store.setRef(input.ref, input.newOid);
+    if (peeled && peeled !== input.newOid) store.setRefPeeled(input.ref, input.newOid, peeled);
+    if (store.getRef(store.head()) === null) {
+      const branches = store.refs().filter((r) => r.name.startsWith("refs/heads/"));
+      const preferred =
+        branches.find((b) => b.name === "refs/heads/main") ??
+        branches.find((b) => b.name === "refs/heads/master") ??
+        branches[0];
+      if (preferred) store.setHead(preferred.name);
+    }
+    store.bumpRefsVersion();
+  });
+  return {
+    tag: "committed",
+    ref: input.ref,
+    oldOid: current,
+    newOid: input.newOid,
+    refsVersion: store.refsVersion(),
+    commitTime: await latestCommitTime(store),
+  };
+}
+
+/**
+ * CAS ref delete (SPEC-0001b §4.8) — the counterpart commitApiChange lacks.
+ * One transactionSync: refname validation → CAS (`current === expectedOid`) →
+ * `delRef` → `refs_version` bump. Delete idempotence: a ref already gone
+ * returns `ref_conflict` with `currentOid: null` when the caller expected a
+ * value (the caller-friendly "already deleted, nothing to do"), and `deleted`
+ * when the caller's CAS base was ZERO_OID (the create-absent expectation is
+ * satisfied by absence). Serves PR creation-failure cleanup, issue-delete
+ * cascade and merged-head-branch deletion; real branch deletes go through
+ * the same RPC from the SPEC-0004 branch service.
+ */
+export async function deleteApiRef(host: LeaseHost, input: DeleteApiRefInput): Promise<DeleteApiRefResult> {
+  const { store } = host;
+  if (!validRefName(input.ref)) return { tag: "invalid", reason: `funny refname: ${input.ref}` };
+  if (!isOid(input.expectedOid)) return { tag: "invalid", reason: "malformed expected oid" };
+  let outcome: { deleted: boolean; current: string | null };
+  host.storage.transactionSync(() => {
+    const current = store.getRef(input.ref);
+    if (current === null) {
+      outcome = { deleted: input.expectedOid === ZERO_OID, current: null };
+      if (input.expectedOid === ZERO_OID) store.bumpRefsVersion();
+      return;
+    }
+    if (current !== input.expectedOid) {
+      outcome = { deleted: false, current };
+      return;
+    }
+    store.delRef(input.ref);
+    store.bumpRefsVersion();
+    outcome = { deleted: true, current: null };
+  });
+  const r = outcome!;
+  if (r.deleted) return { tag: "deleted", refsVersion: store.refsVersion() };
+  return { tag: "ref_conflict", currentOid: r.current };
+}
+
+// ---- merge surface RPCs (SPEC-0001b §4.1, §4.3-§4.5, §4.8) --------------------
+// Thin LeaseHost delegations; the algorithms live in src/merge/*.ts. All the
+// read paths (mergeBase/listCommitsRange/countDivergence/checkMergeability/
+// rebaseOnto) are pure reads — §4.6's rule that checks never write.
+
+/** §4.1 merge-base over refs or oids; `missing` names the unresolvable side. */
+export async function mergeBase(
+  host: LeaseHost,
+  a: string,
+  b: string
+): Promise<{ tag: "ok"; base: string | null; exhausted: boolean } | { tag: "missing"; which: "a" | "b" }> {
+  const oa = await resolveCommitish(host.store, a);
+  if (!oa) return { tag: "missing", which: "a" };
+  const ob = await resolveCommitish(host.store, b);
+  if (!ob) return { tag: "missing", which: "b" };
+  const r = await graphMergeBase(host.store, oa, ob);
+  return { tag: "ok", base: r.value, exhausted: r.exhausted };
+}
+
+/** §4.1 `base..head`, topological, oldest first, `page` 0-based. Null when
+ * either side does not resolve to a commit. */
+export async function listCommitsRange(
+  host: LeaseHost,
+  base: string,
+  head: string,
+  limit: number,
+  page = 0
+): Promise<{ commits: import("./repo").CommitJson[]; more: boolean } | null> {
+  return graphListCommitsRange(host.store, base, head, limit, page);
+}
+
+/** §4.1 `rev-list --left-right --count base head` in one walk. */
+export async function countDivergence(
+  host: LeaseHost,
+  base: string,
+  head: string
+): Promise<{ tag: "ok"; ahead: number; behind: number; exhausted: boolean } | { tag: "missing" }> {
+  const ob = await resolveCommitish(host.store, base);
+  const oh = await resolveCommitish(host.store, head);
+  if (!ob || !oh) return { tag: "missing" };
+  const r = await graphCountDivergence(host.store, ob, oh);
+  if (r.value === null) return { tag: "missing" };
+  return { tag: "ok", ahead: r.value.ahead, behind: r.value.behind, exhausted: r.exhausted };
+}
+
+/** §4.3 read-only mergeability classification (writes nothing — §4.6). */
+export async function checkMergeability(host: LeaseHost, input: CheckMergeabilityInput): Promise<CheckMergeabilityResult> {
+  return classifyMergeability(host.store, input);
+}
+
+/** §4.4 merge execution: one landing primitive, styles as parameters. */
+export async function executeMerge(host: LeaseHost, input: ExecuteMergeInput): Promise<ExecuteMergeResult> {
+  return runExecuteMerge(host, input);
+}
+
+/** §4.5 rebase replay (read-only + in-memory). */
+export async function rebaseOnto(host: LeaseHost, input: RebaseOntoInput): Promise<RebaseOutcome> {
+  return runRebaseOnto(host.store, input);
+}
+
+/** §4.5 the replay's objects, through putApiObjects' budgets and verification
+ * (same result family; the `stored` count collapses into `ok`). */
+export type PutRebaseObjectsResult =
+  | { tag: "ok" }
+  | { tag: "too_large"; limitBytes: number }
+  | { tag: "invalid"; reason: string };
+
+export async function putRebaseObjects(host: LeaseHost, objects: MergeObject[]): Promise<PutRebaseObjectsResult> {
+  const r = await putApiObjects(host, objects);
+  if (r.tag === "ok") return { tag: "ok" };
+  if (r.tag === "too_large") return r;
+  return r;
+}
+
+/** serializeCommit/serializeTag/personLine re-exports: the Worker-side
+ * builders construct the canonical bytes these RPCs verify and store. */
+export { serializeCommit, serializeTag, personLine };
