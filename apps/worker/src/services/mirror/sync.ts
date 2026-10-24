@@ -31,6 +31,12 @@
  *      import channel's settleDone shape); failure → sanitized `last_error`,
  *      `sync_state='idle'`, `next_sync_at` left DUE so the next cron retries
  *      — upstream's retry posture (mirror_pull.go:303-308).
+ *   5. notify (§2.7): POST-SETTLE best-effort webhook fan-out from the
+ *      applied updates delta — per created ref the zero-commit push event +
+ *      the create event, per deleted ref the delete event, per updated ref
+ *      the push event with the capped old→new commit list, exactly upstream's
+ *      split (mirror_pull.go:332-389). A notification failure never fails the
+ *      sync or the settle (upstream likewise only logs per-ref errors).
  *
  * SKELETON SCOPE (honest gaps, each with its landing wave):
  *   - `repo_mirrors` and the repositories mirror columns landed with
@@ -40,9 +46,7 @@
  *     migration has not been applied to yet (e.g. a remote pending
  *     db:migrate:remote) still surfaces as `skipped: "storage-pending"` —
  *     the sync never fakes a sync.
- *   - Webhook notify per ref delta (§2.7) and `setHead` fixup on dangling
- *     HEAD (§4.3.8) are not driven yet; the command list returned in the
- *     result IS the updates delta that wave needs.
+ *   - `setHead` fixup on dangling HEAD (§4.3.8) is not driven yet.
  *   - The receive helpers below mirror pipeline.ts's private ones (command
  *     section, prepend, report-status parse, cell warm-up + the no-op
  *     execution-context stub — the R2-bind engine gap pipeline.ts documents).
@@ -84,7 +88,11 @@ import { and, eq, inArray, lte, ne, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { createDurableGit, type RefsResult } from "@cf-gitea/git-engine";
 
+import { compareUrl } from "../../api/services/hooks";
+import { apiUserFromRow, findRepositoryById, toApiRepository, type Viewer } from "../../api/services/repository";
+import { toPayloadCommit, usernamesByEmail } from "../../api/services/git-models";
 import { repoMirrors, repositories } from "../../db/schema";
+import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import { authorize } from "../../git-http/authorize";
 import { markGateCleared } from "../../git-http/gate";
 import { parseHostPolicy, type HostPolicy } from "../../webhooks/ssrf";
@@ -121,6 +129,15 @@ export interface MirrorSyncEnv extends Env {
   /** AES-256-GCM KEK for `repo_mirrors.credentials_ciphertext` (§4.2,
    *  `wrangler secret put MIRROR_CREDENTIAL_KEY`). */
   MIRROR_CREDENTIAL_KEY?: string;
+  /** Upstream `setting.AppURL` — the instance origin the §2.7 webhook payload
+   *  URLs are built against (upstream builds them absolute: notifier.go:913
+   *  `setting.AppURL + commits.CompareURL`, convert's `HTMLURL + "/commit/…"`).
+   *  Optional until the orchestrator binds an instance-origin var (HTTP paths
+   *  take the origin from the request; a queue consumer has none). Unset it
+   *  falls back to upstream's own default ROOT_URL, `http://localhost:3000`
+   *  (modules/setting/server.go:119-120) — payloads stay upstream-shaped and
+   *  absolute, exactly like a default-installed gitea without ROOT_URL. */
+  APP_URL?: string;
   /** Sync message queue — the producer side. The binding is live in the
    *  generated Env (required since the wrangler wiring landed); the runtime
    *  guard below stays as fail-closed defense. */
@@ -292,6 +309,275 @@ async function settleMirrorFailure(db: D1Database, repoId: string, errorText: st
     .set({ lastError: errorText.slice(0, 2000), syncState: "idle", updatedAt: new Date() })
     .where(and(eq(repoMirrors.repoId, repoId), eq(repoMirrors.syncState, "syncing")));
 }
+
+// ---------------------------------------------------------------------------
+// §2.7 — webhook notifications from the applied updates delta
+// ---------------------------------------------------------------------------
+
+/**
+ * `setting.UI.FeedMaxCommitNum` (default 5, modules/setting/ui.go:92) — the
+ * push payload's commit cap. The mirror walk applies it IN the query
+ * (mirror_pull.go:363: `CommitsBetween(new, old, FeedMaxCommitNum)` renders
+ * `rev-list --max-count`), unlike the user-push path which caps after walking
+ * (services/repository/push.go:190-192), so `total_commits` here is the
+ * capped list's length (≤ 5), exactly as upstream's mirror flow emits.
+ */
+const FEED_MAX_COMMIT_NUM = 5;
+
+/** The compat-frozen PushPayload field set (SPEC-0005 §2.7,
+ *  modules/structs/hook.go:154-176 — the same shape api/services/hooks.ts
+ *  renders for the test-fire). */
+interface PushPayload {
+  ref: string;
+  before: string;
+  after: string;
+  compare_url: string;
+  commits: unknown[];
+  total_commits: number;
+  head_commit: unknown;
+  repository: unknown;
+  pusher: unknown;
+  sender: unknown;
+}
+
+/** Upstream `RefName.RefType` (modules/git/ref.go:221-231) reduced to the
+ *  webhook's `branch|tag` vocabulary: anything that is neither prefix renders
+ *  upstream's empty-string default. */
+function refTypeOf(fullRef: string): string {
+  if (fullRef.startsWith("refs/heads/")) return "branch";
+  if (fullRef.startsWith("refs/tags/")) return "tag";
+  return "";
+}
+
+/** Upstream `RefName.ShortName` (modules/git/ref.go:170-178): the branch/tag
+ *  tail; any other ref keeps its full name. The `create`/`delete` payloads
+ *  carry the short name (notifier.go:824, 861). */
+function shortRefName(fullRef: string): string {
+  if (fullRef.startsWith("refs/heads/")) return fullRef.slice("refs/heads/".length);
+  if (fullRef.startsWith("refs/tags/")) return fullRef.slice("refs/tags/".length);
+  return fullRef;
+}
+
+/** Upstream's default ROOT_URL (modules/setting/server.go:119-120:
+ *  `defaultAppURL := protocol + "://localhost:" + HTTPPort`, HTTPPort 3000)
+ *  — an unset APP_URL behaves like a default-installed gitea, whose payloads
+ *  carry localhost URLs. Upstream's AppURL additionally always carries the
+ *  trailing "/" suffix (server.go:50-51); `instanceOrigin` returns it
+ *  trimmed, and the one site that renders the bare AppURL (the zero-commit
+ *  push event's compare_url) appends the suffix explicitly. */
+const DEFAULT_APP_URL = "http://localhost:3000";
+
+/** `setting.AppURL` equivalent for a queue consumer (no request to take an
+ *  origin from): the optional APP_URL var, trailing slashes trimmed like
+ *  upstream's AppURL normalization (server.go:127-137 strips default ports;
+ *  a configured ROOT_URL is used verbatim otherwise). */
+function instanceOrigin(env: MirrorSyncEnv): string {
+  return (env.APP_URL ?? DEFAULT_APP_URL).replace(/\/+$/, "");
+}
+
+/**
+ * The `WEBHOOK_DELIVERY` Queue producer probe — the api/routes pattern
+ * (hooks.ts `webhookDeliveryQueue`): a structural lookup so a binding gap
+ * degrades to `pending` delivery rows instead of a thrown error (the rows
+ * are the source of truth, SPEC-0005 §3.6; the generated Env types the
+ * binding as required, this only defends the runtime).
+ */
+function webhookDeliveryQueue(env: MirrorSyncEnv): { sendBatch(messages: { body: { deliveryId: number } }[]): Promise<unknown> } | null {
+  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
+  if (candidate === undefined || candidate === null) return null;
+  const queue = candidate as { sendBatch?: (messages: { body: { deliveryId: number } }[]) => Promise<unknown> };
+  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+}
+
+/**
+ * The §2.7 fan-out: the push-family notifications for one sync's applied ref
+ * updates, splitting each entry exactly as upstream's post-sync loop does
+ * (mirror_pull.go:332-389):
+ *
+ *   - `refs/pull/*` deltas are FETCHED but NEVER notified (:334-337 —
+ *     GitHub's PR refs ride the mirror refspec);
+ *   - created ref (old = zero oid, :339-354): the zero-commit push event
+ *     FIRST (SyncPushCommits with an empty PushCommits, :347 — rendered by
+ *     services/webhook/notifier.go:901-923 as before=empty-oid, after=tip,
+ *     commits=[], total_commits=0, head_commit=null and compare_url = bare
+ *     AppURL, because ComposeCompareURL only runs in the update branch :375),
+ *     THEN the create event (SyncCreateRef :352 → CreateRef, notifier.go:
+ *     821-836: sha = the ref's commit id, ref = ShortName, ref_type =
+ *     RefType);
+ *   - deleted ref (new = zero oid, :356-359): the delete event (SyncDeleteRef
+ *     :358 → DeleteRef, notifier.go:858-870: ref = ShortName, ref_type,
+ *     pusher_type "user");
+ *   - updated ref (:361-389): the push event with the old→new commit list —
+ *     `CommitsBetween(new, old, FeedMaxCommitNum)` (:363) = `rev-list
+ *     --max-count 5 old..new`, NEWEST-first, `total_commits` = the capped
+ *     length, `head_commit` = the new tip's commit, `compare_url` =
+ *     ComposeCompareURL(old, new) (:375).
+ *
+ * SENDER IDENTITY: upstream passes `m.Repo.MustOwner(ctx)` — the repository
+ * OWNER — as the pusher/doer of every mirror-sync notification
+ * (mirror_pull.go:347, 352, 358, 379), and the webhook renderer sets BOTH
+ * `Pusher` and `Sender` to that user (notifier.go:919-920). We use the repo
+ * owner row the sync already resolves (`findRepositoryById`), converted by
+ * the same API serializers the REST responses use (`apiUserFromRow` with a
+ * requester-less viewer — upstream's `convert.ToUser(ctx, pusher, nil)`,
+ * notifier.go:902).
+ *
+ * THE UPDATES DELTA: the receive pipeline's own command list. On a successful
+ * receive this IS `FinalizeCommitted.updates` byte-for-byte: `runReceive`
+ * translates any rejected command ("ng" report-status line) into a thrown
+ * sync failure, and the git-receive-pack handler never adds
+ * `extraRefUpdates` (only input-driven — control-plane.ts:633; mod.ts:917-923
+ * passes none), so every applied update is a sent command.
+ *
+ * FAILURE POSTURE — post-settle best-effort, the imports pipeline's
+ * receive-awaits-own-work rule (pipeline.ts): the caller runs this AFTER
+ * `settleMirrorSuccess`, and nothing here may fail the sync. Per-ref errors
+ * log and continue (upstream :343-345, :364-367); a fan-out error (hook
+ * resolution, D1, enqueue) logs — the delivery rows already written stand and
+ * the settled sync stands.
+ */
+async function notifyMirrorSyncDelta(env: MirrorSyncEnv, repo: RepoRow, updates: { ref: string; old: string; next: string }[]): Promise<void> {
+  // mirror_pull.go:334-337 — GitHub PR refs ride the mirror, never the hooks.
+  const notifiable = updates.filter((update) => !update.ref.startsWith("refs/pull/"));
+  if (notifiable.length === 0) return;
+
+  try {
+    const pair = await findRepositoryById(env.DB, repo.id);
+    if (pair === null) {
+      // An org-owned repository has no users row yet (orgs are still
+      // landing); upstream's MustOwner would panic — we degrade to a log.
+      console.error(`[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: owner row missing — webhook notifications skipped`);
+      return;
+    }
+    const origin = instanceOrigin(env);
+    const viewer: Viewer = { origin, requester: null };
+    const sender = apiUserFromRow(pair.owner, viewer);
+    const repository = toApiRepository(viewer, pair);
+    const queue = webhookDeliveryQueue(env);
+    const enqueue =
+      queue === null
+        ? undefined
+        : async (deliveryIds: number[]): Promise<void> => {
+            // The message is `{ deliveryId }` WRAPPED in the platform's
+            // MessageSendRequest `{ body }` — the consumer reads
+            // `message.body.deliveryId` (consumer.ts §3.6).
+            await queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } })));
+          };
+    const emit = (eventType: HookEventType, payload: unknown, refName: string): Promise<unknown> =>
+      emitWebhookDeliveries(
+        env.DB,
+        { repoId: repo.id, ownerId: pair.owner.id, eventType, payload, refName },
+        { enqueue },
+      );
+
+    for (const update of notifiable) {
+      try {
+        if (update.old === ZERO_OID && update.next !== ZERO_OID) {
+          // Created ref — the zero-commit push event, then the create event
+          // (mirror_pull.go:347, 352 — upstream's emission order).
+          const push: PushPayload = {
+            ref: update.ref,
+            before: ZERO_OID,
+            after: update.next,
+            // notifier.go:913 with CompareURL "" (:347's empty PushCommits)
+            // renders the bare AppURL — suffix "/" included (server.go:50).
+            compare_url: `${origin}/`,
+            commits: [],
+            total_commits: 0,
+            head_commit: null,
+            repository,
+            pusher: sender,
+            sender,
+          };
+          await emit("push", push, update.ref);
+          await emit(
+            "create",
+            { sha: update.next, ref: shortRefName(update.ref), ref_type: refTypeOf(update.ref), repository, sender },
+            update.ref,
+          );
+          continue;
+        }
+
+        if (update.next === ZERO_OID) {
+          // Deleted ref — mirror_pull.go:358, notifier.go:858-870.
+          await emit(
+            "delete",
+            { ref: shortRefName(update.ref), ref_type: refTypeOf(update.ref), pusher_type: "user", repository, sender },
+            update.ref,
+          );
+          continue;
+        }
+
+        // Updated ref — the capped old→new walk (mirror_pull.go:363). The
+        // repo cell's listCommitsRange IS the engine's `base..head` rev-list
+        // equivalent: topological, parents-before-children, capped at the
+        // limit, tag objects peeled (the merge/graph primitive, SPEC-0001b
+        // §4.1). It is OLDEST-first, so the payload list reverses it into
+        // upstream's rev-list order (newest-first).
+        const cell = env.REPO.getByName(engineName(repo.ownerNamespace, repo.slug));
+        const walk = await cell.listCommitsRange(update.old, update.next, FEED_MAX_COMMIT_NUM);
+        if (walk === null) {
+          // Upstream logs and skips the ref (:364-367) — the other refs and
+          // the sync itself are unaffected.
+          console.error(
+            `[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: commit walk failed for ${update.ref} ` +
+              `(${update.old.slice(0, 7)}..${update.next.slice(0, 7)}) — ref not notified`,
+          );
+          continue;
+        }
+        const usernames = await usernamesByEmail(env.DB, walk.commits);
+        const commits = [...walk.commits].reverse().map((commit) => toPayloadCommit(commit, pair, usernames, origin));
+        // head_commit — upstream renders the new tip from its own
+        // GetCommit(newCommitID) read (:373-378), matched into the list by id
+        // (ToAPIPayloadCommits). DEVIATION (documented, SPEC-0009 §2.7 wave):
+        // our range RPC caps the OLDEST-first order (page semantics), while
+        // rev-list --max-count keeps the NEWEST five — so when the delta
+        // exceeds the cap (walk.more) the window lacks the tip, and a peeled
+        // tag update never contains the tag oid. The tip then gets its own
+        // readCommit read, producing the same shape upstream's USER-push
+        // payload has when its commits list is capped after the fact
+        // (services/repository/push.go:185-192 — head_commit names the tip
+        // regardless of the commits cap).
+        let headCommit = commits.find((commit) => commit.id === update.next) ?? null;
+        if (headCommit === null) {
+          const tip = await cell.readCommit(update.next);
+          headCommit = tip === null ? null : toPayloadCommit(tip, pair, usernames, origin);
+        }
+        const push: PushPayload = {
+          ref: update.ref,
+          before: update.old,
+          after: update.next,
+          // ComposeCompareURL + the AppURL prefix (mirror_pull.go:375,
+          // notifier.go:913 — ComposeCompareURL is origin-less, AppURL ends
+          // with "/").
+          compare_url: `${origin}/${compareUrl(pair, update.old, update.next)}`,
+          commits,
+          total_commits: commits.length,
+          head_commit: headCommit,
+          repository,
+          pusher: sender,
+          sender,
+        };
+        await emit("push", push, update.ref);
+      } catch (error) {
+        // Per-ref resilience — upstream logs and continues (:343-345,
+        // :364-367); one ref's failure never silences the others.
+        console.error(
+          `[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: notification failed for ${update.ref}: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  } catch (error) {
+    // The fan-out itself (owner resolution, hook query) failed — the sync
+    // and the settle stand (§2.7 posture; pipeline.ts's own-work rule).
+    console.error(
+      `[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: webhook fan-out failed (the settled sync stands): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // Credentials (§4.2) — AES-256-GCM decryption of the stored ciphertext
@@ -676,9 +962,13 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
     return await fail(errorText(error));
   }
 
-  // §2.6 step 5 — success settle. (Notification of the updates delta, §2.7,
-  // lands with the webhook wave; `commands` above IS that delta.)
+  // §2.6 step 5 — success settle, then §2.7: POST-SETTLE best-effort
+  // notifications from the applied updates delta (`commands` — on a
+  // successful receive that IS FinalizeCommitted.updates, see
+  // notifyMirrorSyncDelta). A notification failure cannot fail the settled
+  // sync: notifyMirrorSyncDelta catches its own.
   await settleMirrorSuccess(env, repo, mirror, nowSec);
+  await notifyMirrorSyncDelta(env, repo, commands);
   return { ok: true, created: plan.creates.length, updated: plan.updates.length, deleted: plan.deletes.length };
 }
 
