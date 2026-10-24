@@ -246,3 +246,39 @@ fail-stop), and the GC RETIRED→RECLAIMABLE transaction with renewal race.
    valid for stock git (always requests sideband when advertised, e2e
    green); a non-sideband v2 client is outside the tested envelope —
    document the assumption in the capability matrix.
+
+## Round-8: the forbidden pattern + P0 stopgap (dispatched)
+
+**Forbidden pattern (CI-enforced from now on)**: protocol parser silently
+ignoring unknown semantic input → normalized request losing constraints →
+cache predicate misjudging → format-valid, semantics-wrong response. The
+deepen-family bug is its first instance; the parser must be fail-closed
+(phase-aware: capability/command/section lines exempt; unknown FETCH
+arguments rejected with protocol-shaped errors, never dropped, never 500).
+
+**Ordering constraint**: Parse → ValidateCapabilities → Normalize →
+Authorize → Plan/CacheHit → Emit — semantics-affecting fields MUST be
+resolved before Plan/CacheHit (an error after output starts can only
+abort; an error after a cache hit may be too late).
+
+**Correction accepted**: "advertising shallow promises the whole deepen
+family" was overclaimed — the universal principle is the stronger rule:
+any uninterpretable semantics-changing parameter must never be silently
+ignored into success. Persistent rejection of advertised standard
+features is a transitional state only, not a compatible end-state.
+
+**Consistency gate**: `AdvertisedFeature ⇒ ParsedAndHandled` (Handled =
+correct execution or explicit protocol rejection; never silent drop) —
+the capability matrix becomes test-generated, not hand-maintained.
+
+**Regression matrix (param-level, not just one e2e)**: deepen<n> correct;
+deepen-since/-not/-relative correct-or-explicit-reject; shallow<oid>
+recognized; filter never silently accepted when unadvertised; unknown
+fetch args rejected; combinations must not poison the clone-cache —
+especially deepen-since + no-haves + wants=allTips. Plus cheap
+differential testing: same repo, same git CLI commands, vs a real Gitea
+instance; diffs must be explainable by declared compatibility rules.
+
+**P0 dispatched**: the stopgap + fail-closed dispatch + ordering assertion
++ poisoning-combo tests went into the in-flight engine wave's landing
+gates (ownership respected — the wave owns those files).
