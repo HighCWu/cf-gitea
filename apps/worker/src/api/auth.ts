@@ -1,5 +1,6 @@
-import type { MiddlewareHandler } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 
+import type { AuthUser } from "../auth";
 import { ApiError } from "./errors";
 import type { ApiEnv } from "./env";
 import type { User } from "./models/user";
@@ -43,10 +44,64 @@ export function extractTokenHeader(authorization: string | undefined): string | 
  * silent and reqToken rejects unconditionally. The resolved user lands in
  * `c.get("authUser")`.
  */
+/**
+ * Convert a SPEC-0002 verified user (D1 row shape) into the contract `User`.
+ */
+function toApiUser(u: AuthUser): User {
+  return {
+    id: u.id,
+    login: u.username,
+    email: u.email ?? "",
+    full_name: u.displayName ?? "",
+    avatar_url: "",
+    html_url: "",
+    language: "en-US",
+    location: "",
+    website: "",
+    description: "",
+    active: u.status === "active",
+    is_admin: u.isAdmin,
+    prohibit_login: u.status === "prohibited",
+    restricted: false,
+    login_name: "",
+    source_id: 0,
+    followers_count: 0,
+    following_count: 0,
+    starred_repos_count: 0,
+    created: u.createdAt.toISOString(),
+    last_login: "0001-01-01T00:00:00Z",
+    type: "User",
+    visibility: "public",
+  };
+}
+
+/**
+ * Identity precedence inside the api middlewares: (1) the SPEC-0002
+ * `resolveAuth` middleware mounted at `/api/v1/*` already verified the
+ * credential against D1 — its `c.var.auth` result wins when present;
+ * (2) standalone router usage (tests, embedding) falls back to the injected
+ * resolver parsing the header itself.
+ */
+function identityFrom(c: Context<ApiEnv>, resolver: AuthResolver): Promise<User | null> {
+  const ctxAuth = c.get("auth");
+  if (ctxAuth !== undefined) {
+    return Promise.resolve(ctxAuth.user === null ? null : toApiUser(ctxAuth.user));
+  }
+  const token = extractTokenHeader(c.req.header("Authorization"));
+  return token === null ? Promise.resolve(null) : resolver.resolveToken(token);
+}
+
+/**
+ * Token auth middleware for routes that require a signed-in caller (upstream
+ * `reqToken`). Absent/foreign-scheme header or unknown token → 401 with
+ * Gitea's exact body — upstream messages both cases "token is required"
+ * (gitea/routers/api/v1/api.go reqToken + ctx.APIError): auth failures are
+ * silent and reqToken rejects unconditionally. The resolved user lands in
+ * `c.get("authUser")`.
+ */
 export function createTokenAuthMiddleware(resolver: AuthResolver): MiddlewareHandler<ApiEnv> {
   return async (c, next) => {
-    const token = extractTokenHeader(c.req.header("Authorization"));
-    const user = token === null ? null : await resolver.resolveToken(token);
+    const user = await identityFrom(c, resolver);
     if (user === null) {
       throw new ApiError(401, "token is required");
     }
@@ -66,12 +121,9 @@ export function createTokenAuthMiddleware(resolver: AuthResolver): MiddlewareHan
  */
 export function createOptionalTokenAuthMiddleware(resolver: AuthResolver): MiddlewareHandler<ApiEnv> {
   return async (c, next) => {
-    const token = extractTokenHeader(c.req.header("Authorization"));
-    if (token !== null) {
-      const user = await resolver.resolveToken(token);
-      if (user !== null) {
-        c.set("authUser", user);
-      }
+    const user = await identityFrom(c, resolver);
+    if (user !== null) {
+      c.set("authUser", user);
     }
     await next();
   };

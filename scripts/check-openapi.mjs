@@ -55,6 +55,16 @@ const RUNTIME_ONLY_RESPONSES = {
       401: "upstream reqToken() rejects anonymous callers; swagger documents only 200",
     },
   },
+  "/repositories/{id}": {
+    get: {
+      401: "upstream reqToken() (token required for repoGetByID); contract documents 200/404 only",
+    },
+  },
+  "/user/repos": {
+    get: {
+      401: "upstream reqToken() (token required for userCurrentListRepos); contract documents 200 only",
+    },
+  },
 };
 
 /**
