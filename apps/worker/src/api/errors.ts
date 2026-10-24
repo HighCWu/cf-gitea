@@ -1,5 +1,6 @@
 import { z } from "@hono/zod-openapi";
 import type { Context, ErrorHandler } from "hono";
+import { HTTPException } from "hono/http-exception";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 
 import { SWAGGER_DOC_PATH } from "./config";
@@ -47,13 +48,18 @@ export class ApiError extends Error {
 
 /**
  * onError middleware producing Gitea's exact error body. Known `ApiError`s
- * render `{message, url}` (+ extras) with their status; anything else is an
- * internal error rendered like upstream's `APIErrorInternal` in production:
- * status 500 with an empty message (never leak internals).
+ * render `{message, url}` (+ extras) with their status; `HTTPException`s
+ * (hono/@hono-zod-openapi internals — e.g. the declared-body media-type
+ * gate's 415) render through the same family with their status; anything
+ * else is an internal error rendered like upstream's `APIErrorInternal` in
+ * production: status 500 with an empty message (never leak internals).
  */
 export const giteaErrorHandler: ErrorHandler<ApiEnv> = (err, c) => {
   if (err instanceof ApiError) {
     return c.json({ message: err.message, url: swaggerDocUrl(c), ...err.extra }, err.status);
+  }
+  if (err instanceof HTTPException) {
+    return c.json({ message: err.message, url: swaggerDocUrl(c) }, err.status);
   }
   return c.json({ message: "", url: swaggerDocUrl(c) }, 500);
 };

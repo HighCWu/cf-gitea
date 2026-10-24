@@ -65,6 +65,17 @@ const RUNTIME_ONLY_RESPONSES = {
       401: "upstream reqToken() (token required for userCurrentListRepos); contract documents 200 only",
     },
   },
+  "/markdown": {
+    post: {
+      401: "upstream reqToken() (routers/api/v1/api.go:1018); contract documents 200/422 only",
+      400: "hono validator rejects malformed JSON before route mapping (upstream bind 422s everything, api.go:841-844) — documented divergence",
+    },
+  },
+  "/markdown/raw": {
+    post: {
+      401: "upstream reqToken() (routers/api/v1/api.go:1018); contract documents 200/422 only",
+    },
+  },
 };
 
 /**

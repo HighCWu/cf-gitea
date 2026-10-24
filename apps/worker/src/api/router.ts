@@ -8,9 +8,11 @@ import {
 } from "./auth";
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
+import { registerMarkdownRoutes } from "./routes/markdown";
 import { registerRepoRoutes } from "./routes/repo";
 import { registerUserReposRoutes } from "./routes/user-repos";
 import { registerUserRoute } from "./routes/user";
+import { registerUsersRoutes } from "./routes/users";
 import { registerVersionRoute } from "./routes/version";
 
 export interface ApiRouterOptions {
@@ -39,8 +41,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   const optionalAuth = createOptionalTokenAuthMiddleware(options.auth ?? createStubAuthResolver());
   registerVersionRoute(app);
   registerUserRoute(app, requireAuth);
+  registerUsersRoutes(app, optionalAuth);
   registerUserReposRoutes(app, requireAuth, optionalAuth);
   registerRepoRoutes(app, requireAuth, optionalAuth);
+  registerMarkdownRoutes(app, requireAuth);
 
   return app;
 }
