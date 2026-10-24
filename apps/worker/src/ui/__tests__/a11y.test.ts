@@ -1,0 +1,156 @@
+/**
+ * §5.5 accessibility smoke over the committed goldens (no browser), plus
+ * unit pins for the hand-rolled walker (a11y.ts) so the smoke itself cannot
+ * silently mis-parse. Runs purely on the committed bytes — no seeding, no
+ * engine, no rendering.
+ */
+
+import { describe, expect, it } from "vitest";
+
+import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } from "./a11y";
+import bareShellGolden from "./goldens/bare-shell.html?raw";
+import commitsGolden from "./goldens/commits.html?raw";
+import fileViewCodeGolden from "./goldens/file-view-code.html?raw";
+import homeGolden from "./goldens/home.html?raw";
+import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
+import { GOLDEN_CASES } from "./harness";
+
+const goldens: Record<string, string> = {
+  "home.html": homeGolden,
+  "commits.html": commitsGolden,
+  "file-view-code.html": fileViewCodeGolden,
+  "not-found-repo.html": notFoundRepoGolden,
+  "bare-shell.html": bareShellGolden,
+};
+
+function classList(el: { attrs: Record<string, string> }): string[] {
+  return (el.attrs.class ?? "").split(/\s+/).filter(Boolean);
+}
+
+function hasClass(el: { attrs: Record<string, string> }, cls: string): boolean {
+  return classList(el).includes(cls);
+}
+
+// --- the smoke over every golden ------------------------------------------------
+
+describe("§5.5 a11y smoke over the goldens", () => {
+  for (const golden of GOLDEN_CASES) {
+    it(`${golden.file} passes the structural rules`, () => {
+      const violations = runA11y(goldens[golden.file] ?? "");
+      expect(violations, `${golden.file}: ${JSON.stringify(violations)}`).toEqual([]);
+    });
+  }
+
+  it("home carries exactly one h1 — the README heading (deviation note: the shell has no repo-name h1)", () => {
+    const root = parseHtmlTree(homeGolden);
+    const h1s = descendants(root).filter((el) => el.tag === "h1");
+    expect(h1s).toHaveLength(1);
+    expect(h1s[0]?.attrs.id).toBe("user-content-hello-cf-gitea");
+  });
+
+  it("#repo-files-table is the upstream div shape with complete row cells (not an HTML table)", () => {
+    const root = parseHtmlTree(homeGolden);
+    const table = getElementById(root, "repo-files-table");
+    expect(table).not.toBeNull();
+    expect(table?.tag).toBe("div");
+    expect(descendants(table ?? root).some((el) => hasClass(el, "repo-file-last-commit"))).toBe(true);
+
+    const items = descendants(table ?? root).filter((el) => hasClass(el, "repo-file-item"));
+    expect(items).toHaveLength(4); // README.md, app.ts, docs/, logo.png
+    for (const item of items) {
+      const cells = descendants(item);
+      expect(cells.some((el) => hasClass(el, "repo-file-cell") && hasClass(el, "name")), "name cell").toBe(true);
+      expect(
+        cells.some((el) => hasClass(el, "repo-file-cell") && hasClass(el, "message") && hasClass(el, "commit-summary")),
+        "message cell",
+      ).toBe(true);
+      expect(cells.some((el) => hasClass(el, "repo-file-cell") && hasClass(el, "age")), "age cell").toBe(true);
+    }
+  });
+
+  it("the blob file view has no file list and keeps the enhancement registry", () => {
+    const root = parseHtmlTree(fileViewCodeGolden);
+    expect(getElementById(root, "repo-files-table")).toBeNull();
+    expect(getElementById(root, "commits-table")).toBeNull();
+    expect(descendants(root).some((el) => el.attrs["data-global-init"] === "initRepoFileView")).toBe(true);
+  });
+});
+
+// --- walker unit pins -------------------------------------------------------------
+
+describe("a11y walker pins", () => {
+  it("reads accessible names: text, aria-label precedence, aria-hidden exclusion", () => {
+    expect(accessibleName(parseHtmlTree('<a href="/x">Label</a>').children[0] ?? ({} as never))).toBe("Label");
+    expect(
+      accessibleName(parseHtmlTree('<a href="/x"><span aria-hidden="true">icon</span>Label</a>').children[0] ?? ({} as never)),
+    ).toBe("Label");
+    expect(accessibleName(parseHtmlTree('<a href="/x" aria-label="Buy">no text</a>').children[0] ?? ({} as never))).toBe("Buy");
+    // A hidden anchor is skipped by R5 (runA11y), and a VISIBLE-only child
+    // still names its anchor when a sibling is hidden.
+    expect(
+      runA11y('<html><body><a href="/x" aria-hidden="true"><svg/></a></body></html>').filter((v) => v.rule === "R5-link-name"),
+    ).toEqual([]);
+    expect(runA11y('<html><body><a href="/x"><span aria-hidden="true">i</span></a></body></html>').map((v) => v.rule)).toContain(
+      "R5-link-name",
+    );
+  });
+
+  it("treats script/style bodies as raw text (config JSON, error collector, hostile <)", () => {
+    const violations = runA11y(
+      '<html><body><script>if (a < b && "</div>".length) x();</script><style>a > b { color: red }</style>' +
+        '<img src="/i.png"><a href="/x">ok</a></body></html>',
+    );
+    // The stray < inside the script body did not derail the walk: the img is
+    // still found (R4) and the anchor still has its name (no R5). (Landmark
+    // violations are expected on this synthetic snippet and not asserted.)
+    expect(violations.filter((v) => v.rule !== "R3-landmarks").map((v) => v.rule)).toEqual(["R4-img-alt"]);
+  });
+
+  it("keeps quoted `>` inside attribute values and parses self-closing/void tags", () => {
+    const root = parseHtmlTree('<div><a title="a > b" href="/x" >t</a><img src="/y.png" alt="y"/><br/></div>');
+    const anchor = root.children[0]?.children[0];
+    expect(anchor?.attrs.title).toBe("a > b");
+    expect(anchor?.attrs.href).toBe("/x");
+    expect(root.children[0]?.children.map((el) => el.tag)).toEqual(["a", "img", "br"]);
+  });
+
+  it("flags upward heading skips, not downward returns", () => {
+    const skip = runA11y("<html><body><h1>a</h1><h3>b</h3></body></html>");
+    expect(skip.filter((v) => v.rule === "R2-no-skip").map((v) => `${v.rule} ${v.detail}`)).toEqual([
+      "R2-no-skip <h1> followed by <h3>",
+    ]);
+    expect(runA11y("<html><body><h3>a</h3><h1>b</h1></body></html>").some((v) => v.rule === "R2-no-skip")).toBe(false);
+  });
+
+  it("enforces the landmark triad", () => {
+    expect(runA11y("<html><body><p>nothing</p></body></html>").filter((v) => v.rule === "R3-landmarks")).toHaveLength(3);
+    expect(
+      runA11y(
+        '<html><body><nav id="navbar" aria-label="n"></nav><div role="main" aria-label="m"></div><footer></footer></body></html>',
+      ),
+    ).toEqual([]);
+  });
+
+  it("requires thead + explicit scope on real tables, exempting the code-view line table", () => {
+    const noScope = runA11y("<html><body><table><thead><tr><th>a</th></tr></thead></table></body></html>");
+    expect(noScope.filter((v) => v.rule === "R6-table-headers")).toHaveLength(1);
+    expect(
+      runA11y('<html><body><table><thead><tr><th scope="col">a</th></tr></thead></table></body></html>').some(
+        (v) => v.rule === "R6-table-headers",
+      ),
+    ).toBe(false);
+    // A thead-less table outside the exemption is a violation…
+    const headerless = runA11y("<html><body><table><tbody><tr><td>a</td></tr></tbody></table></body></html>");
+    expect(headerless.filter((v) => v.rule === "R6-table-headers")).toHaveLength(1);
+    // …while the code-view line table (presentational, upstream shape) is not.
+    const codeView = runA11y(
+      '<html><body><div class="file-view code-view"><table><tbody><tr><td class="lines-num">1</td></tr></tbody></table></div></body></html>',
+    );
+    expect(codeView.filter((v) => v.rule === "R6-table-headers")).toEqual([]);
+  });
+
+  it("counts h1 and tolerates entity-bearing text", () => {
+    const two = runA11y("<html><body><h1>a</h1><h1>b &amp; c</h1></body></html>");
+    expect(two.filter((v) => v.rule === "R1-single-h1")).toHaveLength(1);
+  });
+});

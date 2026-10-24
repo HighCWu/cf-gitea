@@ -44,10 +44,12 @@ export function CommitList(props: { repoLink: string; commits: readonly CommitJs
       <table class="ui very basic table unstackable" id="commits-table">
         <thead>
           <tr>
-            <th class="three wide">{commitsLocale.author}</th>
-            <th class="two wide sha">{commitsLocale.sha}</th>
-            <th class="eight wide message">{commitsLocale.message}</th>
-            <th class="two wide tw-text-right">{commitsLocale.date}</th>
+            {/* scope=col: the U5 §5.5 smoke requires explicit scope on real
+                table headers (additive attribute, no CSS/JS reads it). */}
+            <th scope="col" class="three wide">{commitsLocale.author}</th>
+            <th scope="col" class="two wide sha">{commitsLocale.sha}</th>
+            <th scope="col" class="eight wide message">{commitsLocale.message}</th>
+            <th scope="col" class="two wide tw-text-right">{commitsLocale.date}</th>
           </tr>
         </thead>
         <tbody class="commit-list">
