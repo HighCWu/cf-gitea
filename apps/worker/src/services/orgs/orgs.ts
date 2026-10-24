@@ -651,14 +651,21 @@ export class OrgService {
 
   /**
    * Remove a member — port of upstream `RemoveOrgUser`
-   * (services/org/user.go:36–52): a non-member is a silent no-op (false);
-   * the §4.3 last-owner guard runs in the SAME batch as the delete — the
-   * conditional `DELETE … WHERE role != 'owner' OR (SELECT COUNT(*) …) > 1`
-   * makes the guard race-proof, and the `num_members` decrement is guarded
-   * on the row actually being gone (a lost guard decrements nothing).
-   * Raises `LastOrgOwnerError` (upstream `ErrLastOrgOwner` → API 500, §4.3).
+   * (services/org/user.go:22–52): a non-member is a silent no-op (false) via
+   * the pre-batch membership check (upstream's `!has → return nil`,
+   * user.go:31–35). That check is load-bearing for the counter: the batch's
+   * `(SELECT COUNT(*) …) = 0` decrement guard is ALSO true for a row that
+   * never existed, so without the pre-check removing a never-member would
+   * decrement `num_members`. The service owns that semantics — callers need
+   * no pre-check. The §4.3 last-owner guard then runs in the SAME batch as
+   * the delete — the conditional
+   * `DELETE … WHERE role != 'owner' OR (SELECT COUNT(*) …) > 1` makes the
+   * guard race-proof, and for a real last owner the row survives so the
+   * count guard skips the decrement. Raises `LastOrgOwnerError` (upstream
+   * `ErrLastOrgOwner` → API 500, §4.3).
    */
   async removeMember(orgId: number, userId: number): Promise<boolean> {
+    if ((await this.findMembership(orgId, userId)) === null) return false;
     const results = await this.db.batch([
       this.db
         .delete(orgMembers)
@@ -681,8 +688,9 @@ export class OrgService {
         ),
     ]);
     if (results[0].length > 0) return true;
-    // The guard held the delete: either not a member (false) or the last
-    // owner (typed 500, upstream message).
+    // The guard held the delete: the last owner (typed 500, upstream
+    // message) — or, only in a race, the row vanished between the pre-check
+    // and the batch, which stays a silent no-op.
     const member = await this.findMembership(orgId, userId);
     if (member === null) return false;
     throw new LastOrgOwnerError(userId);

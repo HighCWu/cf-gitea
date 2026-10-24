@@ -327,6 +327,25 @@ describe("membership guards (§4.3 last-owner, §4.5 states)", () => {
     ]);
   });
 
+  it("removeMember on a never-member is a silent no-op: counter untouched, idempotent", async () => {
+    const org = await seedOrg("Stable");
+    const outsider = (await seedVerifiedUser({ username: "Outsider" })).id;
+    expect((await rawUserRow("stable"))?.num_members).toBe(1); // creator only
+
+    // Regression: removing a user who was NEVER a member must not decrement
+    // num_members — the in-batch `(SELECT COUNT(*) …) = 0` guard is also
+    // true for absent rows, so the service pre-checks the membership itself
+    // (upstream RemoveOrgUser `!has → return nil`, user.go:31–35). No error,
+    // false, and repeated calls stay no-ops.
+    expect(await service().removeMember(org.id, outsider)).toBe(false);
+    expect((await rawUserRow("stable"))?.num_members).toBe(1);
+
+    expect(await service().removeMember(org.id, outsider)).toBe(false);
+    expect(await service().removeMember(org.id, 424242)).toBe(false);
+    expect((await rawUserRow("stable"))?.num_members).toBe(1);
+    expect(await rawMemberships(org.id)).toHaveLength(1); // creator untouched
+  });
+
   it("addMember is idempotent (upstream AddOrgUser silence) and validates targets", async () => {
     const org = await seedOrg("Members");
     const user = (await seedVerifiedUser({ username: "Newbie" })).id;
