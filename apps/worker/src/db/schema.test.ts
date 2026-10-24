@@ -1,11 +1,11 @@
 /**
  * Schema/migration parity (the 0005 consolidation of the service-side
- * DDL-in-waiting, extended by the 0007 and 0008 sweeps): a D1 freshly applied
- * the generated migrations must accept exactly the operations the superseded
- * raw-DDL paths (`LFS_OBJECTS_DDL_STATEMENTS`, `ORG_DDL_STATEMENTS`, the
- * batch-7 `REPO_TOPICS/REPO_WATCHERS/REPO_COLLABORATORS/REPO_SETTINGS/
- * FOLLOWS_DDL_STATEMENTS`, and the straggler `STARS`/`USER_SETTINGS_DDL_STATEMENTS`)
- * allowed, and the Drizzle table objects must drive
+ * DDL-in-waiting, extended by the 0007, 0008 and 0009 sweeps): a D1 freshly
+ * applied the generated migrations must accept exactly the operations the
+ * superseded raw-DDL paths (`LFS_OBJECTS_DDL_STATEMENTS`, `ORG_DDL_STATEMENTS`,
+ * the batch-7 `REPO_TOPICS/REPO_WATCHERS/REPO_COLLABORATORS/REPO_SETTINGS/
+ * FOLLOWS_DDL_STATEMENTS`, and the straggler `STARS`/`USER_SETTINGS`/
+ * `FORKS_DDL_STATEMENTS`) allowed, and the Drizzle table objects must drive
  * those same statements.
  *
  * Structure is asserted against `sqlite_master`/`PRAGMA table_info`
@@ -31,6 +31,7 @@ import {
   repoSettings,
   repoTopics,
   repoWatchers,
+  repositories,
   stars,
   userRedirects,
   userSettings,
@@ -519,5 +520,101 @@ describe("user_settings parity (superseded USER_SETTINGS_DDL_STATEMENTS)", () =>
     await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(userId).run();
     const remaining = await env.DB.prepare("SELECT user_id FROM user_settings").all<{ user_id: number }>();
     expect(remaining.results).toEqual([{ user_id: otherId }]);
+  });
+});
+
+describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", () => {
+  it("appends the edge as the last column — nullable TEXT, no default, source index", async () => {
+    const columns = await tableColumns("repositories");
+    // The full physical order: the ALTER ADD COLUMN constraint puts
+    // fork_parent LAST and pins migration 0009 additive-only (no
+    // pre-existing column may drift).
+    expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
+      ["id", "TEXT", 1, 1],
+      ["storage_key", "TEXT", 1, 0],
+      ["owner_namespace", "TEXT", 1, 0],
+      ["slug", "TEXT", 1, 0],
+      ["visibility", "TEXT", 1, 0],
+      ["refs_version", "INTEGER", 1, 0],
+      ["backend", "TEXT", 1, 0],
+      ["created_at", "INTEGER", 1, 0],
+      ["num_issues", "INTEGER", 1, 0],
+      ["num_closed_issues", "INTEGER", 1, 0],
+      ["num_pulls", "INTEGER", 1, 0],
+      ["num_closed_pulls", "INTEGER", 1, 0],
+      ["num_milestones", "INTEGER", 1, 0],
+      ["close_issues_via_commit_in_any_branch", "INTEGER", 1, 0],
+      ["owner_id", "INTEGER", 0, 0],
+      ["default_branch", "TEXT", 1, 0],
+      ["is_empty", "INTEGER", 1, 0],
+      ["is_archived", "INTEGER", 1, 0],
+      ["status", "TEXT", 1, 0],
+      ["updated_at", "INTEGER", 0, 0],
+      ["fork_parent", "TEXT", 0, 0],
+    ]);
+    // Nullable with NO default — the raw DDL's bare `ADD COLUMN fork_parent
+    // TEXT`: pre-existing rows read NULL.
+    expect(columns.at(-1)?.dflt_value).toBeNull();
+    expect(await indexNames("repositories")).toContain("repositories_fork_parent_idx");
+  });
+
+  it("accepts the same edge writes via raw D1 and the drizzle schema, serves the fork scans", async () => {
+    const db = drizzle(env.DB);
+    const ownerId = (await seedUsers("ParityForker"))[0]!;
+    await env.DB
+      .prepare(
+        "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, visibility) VALUES ('pf_src', 'r_pf_src', 'parityforker', ?, 'src', 'public')",
+      )
+      .bind(ownerId)
+      .run();
+    await env.DB
+      .prepare(
+        "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, visibility) VALUES ('pf_fork', 'r_pf_fork', 'parityforker', ?, 'fork', 'public')",
+      )
+      .bind(ownerId)
+      .run();
+
+    // Raw write path — createFork's superseded stamp statement.
+    await env.DB.prepare("UPDATE repositories SET fork_parent = ?1 WHERE id = ?2").bind("pf_src", "pf_fork").run();
+    // Raw read paths — findForkByOwner's one-fork-per-owner arbitration
+    // SELECT and listForks' source scan.
+    expect(
+      await env.DB
+        .prepare("SELECT id, owner_namespace, slug FROM repositories WHERE fork_parent = ?1 AND owner_id = ?2 LIMIT 1")
+        .bind("pf_src", ownerId)
+        .first<Record<string, unknown>>(),
+    ).toEqual({ id: "pf_fork", owner_namespace: "parityforker", slug: "fork" });
+    expect(
+      await env.DB.prepare("SELECT count(*) AS total FROM repositories WHERE fork_parent = ?1").bind("pf_src").first<{ total: number }>(),
+    ).toEqual({ total: 1 });
+
+    // Drizzle write path — createFork's merged .set stamp (unstamp first,
+    // then restamp with the upstream-copied metadata in the same update).
+    await db.update(repositories).set({ forkParent: null }).where(eq(repositories.id, "pf_fork"));
+    expect(
+      await env.DB.prepare("SELECT fork_parent FROM repositories WHERE id = 'pf_fork'").first<{ fork_parent: string | null }>(),
+    ).toEqual({ fork_parent: null });
+    await db
+      .update(repositories)
+      .set({ forkParent: "pf_src", updatedAt: new Date(100_000) })
+      .where(eq(repositories.id, "pf_fork"));
+
+    // Drizzle read paths — findForkByOwner/listForks' swapped queries.
+    expect(
+      await db
+        .select({ id: repositories.id, slug: repositories.slug })
+        .from(repositories)
+        .where(and(eq(repositories.forkParent, "pf_src"), eq(repositories.ownerId, ownerId)))
+        .get(),
+    ).toEqual({ id: "pf_fork", slug: "fork" });
+    expect(
+      await db.select({ id: repositories.id }).from(repositories).where(eq(repositories.forkParent, "pf_src")).all(),
+    ).toEqual([{ id: "pf_fork" }]);
+
+    // No delete-cascade row: the edge dies with the repositories row itself.
+    await env.DB.prepare("DELETE FROM repositories WHERE id = 'pf_fork'").run();
+    expect(
+      await env.DB.prepare("SELECT count(*) AS n FROM repositories WHERE fork_parent = 'pf_src'").first<{ n: number }>(),
+    ).toEqual({ n: 0 });
   });
 });

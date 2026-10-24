@@ -1,4 +1,4 @@
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users } from "../../db/schema";
@@ -20,9 +20,10 @@ import { toApiRepository, type RepositoryWithOwner, type Viewer } from "./reposi
  * adds the fork edge + the async hand-off:
  *
  *   - `fork_parent` (the edge to the source's repositories.id — upstream's
- *     `Repository.ForkID`) is NOT a Drizzle column yet, so it rides the
- *     raw-D1 bootstrap below (the STARS_DDL_STATEMENTS pattern; swept in the
- *     next migration together with the schema-owner port).
+ *     `Repository.ForkID`) landed as the Drizzle column with migration 0009
+ *     (the fifth raw-DDL sweep: this file's FORKS_DDL_STATEMENTS is deleted,
+ *     the 0005/0007/0008 supersede pattern). No delete-cascade row is needed
+ *     — the edge dies with the repositories row itself.
  *   - the git content is NOT copied here: the POST enqueues ONE
  *     `{kind: "repo-fork"}` REPO_TASKS message and answers 202; the consumer
  *     (src/repos/fork-task.ts) runs the engine's replicateForkCatalog and
@@ -43,18 +44,6 @@ import { toApiRepository, type RepositoryWithOwner, type Viewer } from "./reposi
  *     synchronously and cleans up on failure.
  */
 
-/**
- * DDL for the migration owner (report verbatim). `fork_parent` is the fork
- * edge: the source's `repositories.id` (upstream `Repository.ForkID int64`,
- * models/repo/repo.go), NULL for non-forks. Plain TEXT column, no FK, per the
- * repositories-adjacent schema conventions; the index serves the fork list's
- * `WHERE fork_parent = ?` scan (FindForks' `fork_id` lookup, fork.go:253).
- */
-export const FORKS_DDL_STATEMENTS: readonly string[] = [
-  `ALTER TABLE repositories ADD COLUMN fork_parent TEXT`,
-  `CREATE INDEX IF NOT EXISTS repositories_fork_parent_idx ON repositories (fork_parent)`,
-];
-
 /** Queue producer seam narrowed to the fork message family (mirrors
  *  ImportQueueProducer: tests inject a capturing stub). */
 export interface ForkQueueProducer {
@@ -73,19 +62,26 @@ export type CreatedFork = RepoRow;
 /**
  * POST /repos/{owner}/{repo}/forks body guard (upstream CreateFork:
  * `GetUserFork` — at most one fork of a given source per owner, fork.go:78-88;
- * the error unwraps util.ErrAlreadyExist → the 409 family). Pure D1, raw
- * column.
+ * the error unwraps util.ErrAlreadyExist → the 409 family). Drizzle over the
+ * 0009 `fork_parent` column (the raw SELECT it supersedes arbitrated the same
+ * `fork_parent AND owner_id` pair — the fork_parent_idx serves it).
  */
 export async function findForkByOwner(
   d1: D1Database,
   sourceRepoId: string,
   ownerId: number,
 ): Promise<{ id: string; ownerNamespace: string; slug: string } | null> {
-  const row = await d1
-    .prepare("SELECT id, owner_namespace, slug FROM repositories WHERE fork_parent = ?1 AND owner_id = ?2 LIMIT 1")
-    .bind(sourceRepoId, ownerId)
-    .first<{ id: string; owner_namespace: string; slug: string }>();
-  return row === null ? null : { id: row.id, ownerNamespace: row.owner_namespace, slug: row.slug };
+  const row = await drizzle(d1)
+    .select({
+      id: repositories.id,
+      ownerNamespace: repositories.ownerNamespace,
+      slug: repositories.slug,
+    })
+    .from(repositories)
+    .where(and(eq(repositories.forkParent, sourceRepoId), eq(repositories.ownerId, ownerId)))
+    .limit(1)
+    .get();
+  return row ?? null;
 }
 
 /**
@@ -117,21 +113,17 @@ export async function createFork(
   });
 
   // Upstream copies DefaultBranch + Description + IsPrivate at insert time.
-  // default_branch is a Drizzle column; description rides the repo-edit side
-  // store (the same one the createOrgRepo auto-init path writes); fork_parent
-  // is the raw column until the migration sweep.
+  // default_branch and fork_parent are Drizzle columns (0009); description
+  // rides the repo-edit side store (the same one the createOrgRepo auto-init
+  // path writes).
   const settings = await loadRepoSettings(d1, source.id);
   await drizzle(d1)
     .update(repositories)
-    .set({ defaultBranch: source.defaultBranch, updatedAt: new Date() })
+    .set({ defaultBranch: source.defaultBranch, forkParent: source.id, updatedAt: new Date() })
     .where(eq(repositories.id, created.id));
   if (settings.description !== "") {
     await saveRepoSettings(d1, created.id, { description: settings.description }, new Date());
   }
-  await d1
-    .prepare("UPDATE repositories SET fork_parent = ?1 WHERE id = ?2")
-    .bind(source.id, created.id)
-    .run();
 
   // The 202 contract: the replication is the queue's work. A lost enqueue
   // strands the fork in 'creating' — logged (the admin-notice equivalent),
@@ -164,33 +156,39 @@ export async function listForks(
   sourceRepoId: string,
   options: { page: number; pageSize: number; doerLoginLower: string | null; isAdmin: boolean },
 ): Promise<{ items: RepositoryWithOwner[]; total: number }> {
+  // The reduced accessible-condition (admin all; doer + public; anonymous
+  // public only) as Drizzle — the string filter the raw count/id SELECTs it
+  // supersedes interpolated.
   const visibility =
     options.isAdmin || options.doerLoginLower === null
       ? options.isAdmin
-        ? { sql: "", params: [] as unknown[] }
-        : { sql: "repositories.visibility = 'public'", params: [] as unknown[] }
-      : {
-          sql: "(repositories.visibility = 'public' OR repositories.owner_namespace = ?)",
-          params: [options.doerLoginLower] as unknown[],
-        };
-  const where = "fork_parent = ?1" + (visibility.sql === "" ? "" : ` AND ${visibility.sql}`);
-  const params: unknown[] = [sourceRepoId, ...visibility.params];
+        ? undefined
+        : eq(repositories.visibility, "public")
+      : or(eq(repositories.visibility, "public"), eq(repositories.ownerNamespace, options.doerLoginLower));
+  const where =
+    visibility === undefined
+      ? eq(repositories.forkParent, sourceRepoId)
+      : and(eq(repositories.forkParent, sourceRepoId), visibility);
+  const db = drizzle(d1);
 
-  const totalRow = await d1
-    .prepare(`SELECT count(*) AS total FROM repositories WHERE ${where}`)
-    .bind(...params)
-    .first<{ total: number }>();
-  const idRows = await d1
-    .prepare(
-      `SELECT id FROM repositories WHERE ${where} ORDER BY CAST(id AS INTEGER) ASC LIMIT ? OFFSET ?`,
-    )
-    .bind(...params, options.pageSize, (options.page - 1) * options.pageSize)
-    .all<{ id: string }>();
-  const ids = idRows.results.map((row) => row.id);
+  const totalRow = await db
+    .select({ total: sql<number>`count(*)` })
+    .from(repositories)
+    .where(where)
+    .get();
+  const idRows = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(where)
+    .orderBy(sql`CAST(${repositories.id} AS INTEGER) ASC`)
+    .limit(options.pageSize)
+    .offset((options.page - 1) * options.pageSize)
+    .all();
+  const ids = idRows.map((row) => row.id);
   if (ids.length === 0) {
     return { items: [], total: totalRow?.total ?? 0 };
   }
-  const rows = await drizzle(d1)
+  const rows = await db
     .select({ repo: repositories, owner: users })
     .from(repositories)
     .innerJoin(users, eq(users.usernameLower, repositories.ownerNamespace))

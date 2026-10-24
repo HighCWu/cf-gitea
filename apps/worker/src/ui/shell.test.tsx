@@ -59,6 +59,7 @@ function makeRepoRow(overrides: Partial<RepoRow> = {}): RepoRow {
     closeIssuesViaCommitInAnyBranch: false,
     createdAt: new Date(1700000000 * 1000),
     updatedAt: null,
+    forkParent: null,
     ...overrides,
   };
 }

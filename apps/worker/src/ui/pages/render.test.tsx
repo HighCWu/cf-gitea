@@ -54,6 +54,7 @@ const ctx: UiContext = {
     closeIssuesViaCommitInAnyBranch: false,
     createdAt: new Date(1700000000 * 1000),
     updatedAt: null,
+    forkParent: null,
   } satisfies RepoRow,
 };
 

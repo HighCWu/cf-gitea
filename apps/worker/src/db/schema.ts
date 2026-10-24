@@ -74,6 +74,22 @@ export const repositories = sqliteTable(
      *  non-constant defaults in ALTER TABLE ADD COLUMN, so the lifecycle
      *  service sets it explicitly on every rename/transfer/status write. */
     updatedAt: integer("updated_at", { mode: "timestamp" }),
+    // -------------------------------------------------------------------------
+    // SPEC-0004 §2.4 forks — the fork edge (the fifth raw-DDL sweep,
+    // superseding `FORKS_DDL_STATEMENTS` in services/forks.ts; the 0005/0007/
+    // 0008 supersede pattern). Kept LAST in this object because ALTER TABLE
+    // ADD COLUMN physically appends the column — the table_info order below
+    // is the migration order.
+    // -------------------------------------------------------------------------
+    /** The fork edge: the source's `repositories.id` (upstream
+     *  `Repository.ForkID int64`, models/repo/repo.go), NULL for non-forks
+     *  and for existing rows (nullable, no default — the ALTER ADD COLUMN
+     *  constraint). Plain TEXT column, no FK, per the schema conventions
+     *  above; rows need no delete-cascade entry (the edge dies with the
+     *  repositories row itself). The index serves the fork list's
+     *  `WHERE fork_parent = ?` scan (FindForks' `fork_id` lookup,
+     *  fork.go:253) and findForkByOwner's one-fork-per-owner arbitration. */
+    forkParent: text("fork_parent"),
   },
   (t) => [
     // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point
@@ -81,6 +97,9 @@ export const repositories = sqliteTable(
     // collisions and recreate-after-delete all decide here (the landed
     // owner/slug columns stand in for owner_id/lower_name).
     uniqueIndex("repositories_owner_slug_uq").on(t.ownerNamespace, t.slug),
+    // SPEC-0004 §2.4: the fork list's source scan (verbatim from the
+    // superseded FORKS_DDL_STATEMENTS index).
+    index("repositories_fork_parent_idx").on(t.forkParent),
   ],
 );
 
