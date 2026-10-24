@@ -8,6 +8,13 @@ not yet ratified for implementation), **accepted** (orchestrator-reviewed, imple
 **TIER-1 COMPLETE — 78/78 paths, 129/129 operations** (commit dcb422f,
 2026-10-25 03:35 CST; the forks registration landed as REG-MERGE-4).
 
+**TIER-2 IN PROGRESS — 178/554 frozen-contract operations declared** (reading at
+commit 579897e via `pnpm check:api`; contract totals by tag: repository 229, user 98,
+organization 88, issue 72, admin 33, miscellaneous 14, package 9, notification 7,
+settings 4). Recent: org identity 9c4b64e, T2-SWEEP 579897e (+26). In flight at this
+writing: notifications (+ migration 0011), table-free misc/user reads, issue
+comment/label/pin writes.
+
 Prior status snapshot (kept for the record): **2026-10-25 03:08 CST**. Three `pnpm check:api` readings —
 03:02:41, 03:06:31, 03:08:00 CST — all `PASS` at **77/78 paths, 127/129 ops** (one
 short of the 78/78 tier-1 terminal state, so no completion banner yet). REG-MERGE-2
