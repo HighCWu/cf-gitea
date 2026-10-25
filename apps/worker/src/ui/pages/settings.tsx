@@ -35,9 +35,11 @@
  * ## Auth + CSRF posture (SPEC-0010 §2.5/§2.8, the new-issue page's shape)
  *
  * Both pages render for the repo ADMIN viewer only — the landed
- * `isRepositoryAdmin` predicate (src/api/services/repo-access.ts) ported to
- * the session viewer: owner (case-folded namespace match) / site admin /
- * collaborator with the `admin` mode (`collaboratorModeOf`). The router
+ * `isRepositoryAdmin` predicate (src/api/services/repo-access.ts) evaluated
+ * through the shared session bridge (../repo-grants.ts): owner
+ * (case-folded namespace match) / site admin / collaborator with the
+ * `admin` mode / admin-or-owner-mode org-team grant (the org owner through
+ * the Owners-team bridge). The router
  * resolves the repo first (invisible → 404 shell), an anonymous viewer 303s
  * onto `/login?redirect_to=…`, and a signed-in non-admin 404-shells (upstream
  * settings pages are admin-only and equally undiscoverable). Both POSTs run
@@ -176,7 +178,7 @@ import {
   type WebhookRow,
 } from "../../api/services/hooks";
 import { apiUserFromRow, toApiRepository, type RepositoryWithOwner, type UserRow } from "../../api/services/repository";
-import { collaboratorModeOf } from "../../api/services/repo-collaborators";
+import { isRepositoryAdmin } from "../../api/services/repo-access";
 import { getMirrorStatus, type MirrorStatus } from "../../api/services/mirror";
 import { loadRepoSettings, saveRepoSettings } from "../../api/services/repo-settings";
 import { RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
@@ -184,6 +186,7 @@ import { timeSinceParts } from "../page-data";
 import { TimeSince } from "../components/file-list";
 import { HookStatus, webhookDeliveries } from "../../db/schema";
 import type { IconName } from "../icons";
+import { sessionRepoGrant } from "../repo-grants";
 import type { RepoRow, UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -215,22 +218,21 @@ export const settingsLocale = {
 } as const;
 
 // ---------------------------------------------------------------------------
-// The admin predicate (the landed isRepositoryAdmin matrix, session-viewer
-// port — repo-access.ts's module header)
+// The admin predicate (the landed isRepositoryAdmin, unforked — repo-access.ts)
 // ---------------------------------------------------------------------------
 
 /**
- * The repo-admin grant for the settings pages: site admin, the repo's owner
- * (case-folded namespace vs the viewer username — the same fold the D1
- * lookup uses), or a collaborator with the `admin` mode. Anonymous viewers
- * are never admins.
+ * The repo-admin grant for the settings pages, evaluated through the LANDED
+ * `isRepositoryAdmin` service predicate (api/services/repo-access.ts) via
+ * the shared session bridge (../repo-grants.ts): site admin, the repo's
+ * owner (case-folded namespace fold), a collaborator with the `admin` mode,
+ * or an admin/owner-mode org-team grant (the org owner through the
+ * Owners-team bridge) — the same arms `requireRepoAdmin` enforces, so an
+ * admin-granted member SEES the settings family the API seams admit.
+ * Anonymous viewers are never admins (zero D1 reads).
  */
-export async function canAdminRepo(d1: D1Database, repo: RepoRow, viewer: Viewer): Promise<boolean> {
-  if (viewer.kind === "user") {
-    if (viewer.isAdmin || repo.ownerNamespace.toLowerCase() === viewer.username.toLowerCase()) return true;
-    return (await collaboratorModeOf(d1, repo.id, viewer.id)) === "admin";
-  }
-  return false;
+export async function canAdminRepo(env: Env, repo: RepoRow, viewer: Viewer): Promise<boolean> {
+  return sessionRepoGrant(env, repo, viewer, isRepositoryAdmin);
 }
 
 // ---------------------------------------------------------------------------

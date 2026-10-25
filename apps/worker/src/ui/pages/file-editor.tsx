@@ -73,14 +73,16 @@
  * Every route runs the §2.8 layer-2 Origin/Referer check first
  * (`sameOriginGuard`), then the repo resolution (invisible repos 404-shell,
  * existence never leaks), then anonymous → the login 303 round-trip. The
- * write predicate is `canWriteRepo` — the session-viewer port of the landed
- * `canWriteRepository` (api/services/repo-access.ts:74-85: site admin, the
- * case-folded owner, or a write/admin collaborator); non-writers 404-shell
- * like the settings pages. Archived repos 404-shell both verbs (upstream
- * `RepoMustNotBeArchived` wraps the editor group and answers NotFound,
- * services/context/repo.go:136-141). The file view renders the Edit/Delete
- * entry links (and the tree chrome the New File link) only under the same
- * predicate.
+ * write predicate is `canWriteRepo` — the UI delegate onto the LANDED
+ * `canWriteRepository` (api/services/repo-access.ts, via ../repo-grants.ts):
+ * site admin, the case-folded owner, a write/admin collaborator, or a
+ * write/admin/owner-mode org-team grant — the same arms the contents PUT
+ * enforces, so a team-granted member sees the editor entry the write seam
+ * admits; non-writers 404-shell like the settings pages. Archived repos
+ * 404-shell both verbs (upstream `RepoMustNotBeArchived` wraps the editor
+ * group and answers NotFound, services/context/repo.go:136-141). The file
+ * view renders the Edit/Delete entry links (and the tree chrome the New
+ * File link) only under the same predicate.
  *
  * ## Documented v1 degradations (§6 method)
  *
@@ -114,8 +116,8 @@ import { ApiError } from "../../api/errors";
 import type { ApiEnv } from "../../api/env";
 import { applyFileChanges } from "../../api/services/contents";
 import { toPerson } from "../../api/services/git-models";
+import { canWriteRepository } from "../../api/services/repo-access";
 import { apiUserFromRow, findRepositoryById, type UserRow } from "../../api/services/repository";
-import { collaboratorModeOf } from "../../api/services/repo-collaborators";
 import { handleUserPushNotifications } from "../../services/webhooks-push";
 import type { TreeEntryJson } from "@cf-gitea/git-engine";
 import type { EngineClient } from "../engine";
@@ -123,6 +125,7 @@ import { readUrlEncodedForm } from "../forms";
 import { MAX_DISPLAY_FILE_SIZE, isBinaryData, pathEscapeSegments } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
+import { sessionRepoGrant } from "../repo-grants";
 import type { Viewer } from "../viewer";
 import { FileTreeSidebar } from "./file-view";
 import { resolveHeadBranch, type ResolvedRefs } from "./home";
@@ -162,23 +165,20 @@ export const fileEditorLocale = {
 export const EDITOR_FORM_MAX_BYTES = 12 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// The write predicate (the settings canAdminRepo shape over the landed
-// canWriteRepository arms — repo-access.ts:74-85)
+// The write predicate (the landed canWriteRepository, unforked — repo-access.ts)
 // ---------------------------------------------------------------------------
 
 /**
- * The repo-write grant for the editor surfaces: site admin, the repo's owner
- * (case-folded namespace vs the viewer username — the same fold the D1 lookup
- * uses), or a collaborator with the `write`/`admin` mode. Anonymous viewers
- * never write.
+ * The repo-write grant for the editor surfaces, evaluated through the LANDED
+ * `canWriteRepository` service predicate (repo-access.ts) via the shared
+ * session bridge (../repo-grants.ts): site admin, the repo's owner
+ * (case-folded namespace fold), a collaborator with the `write`/`admin`
+ * mode, or a write/admin/owner-mode org-team grant — the same arms the
+ * contents PUT enforces, so a write-team member SEES the editor entry the
+ * write seam admits. Anonymous viewers never write (zero D1 reads).
  */
-export async function canWriteRepo(d1: D1Database, repo: RepoEditorRow, viewer: Viewer): Promise<boolean> {
-  if (viewer.kind === "user") {
-    if (viewer.isAdmin || repo.ownerNamespace.toLowerCase() === viewer.username.toLowerCase()) return true;
-    const mode = await collaboratorModeOf(d1, repo.id, viewer.id);
-    return mode === "write" || mode === "admin";
-  }
-  return false;
+export async function canWriteRepo(env: Env, repo: RepoEditorRow, viewer: Viewer): Promise<boolean> {
+  return sessionRepoGrant(env, repo, viewer, canWriteRepository);
 }
 
 /** The repository row the editor touches (the ui-context RepoRow). */

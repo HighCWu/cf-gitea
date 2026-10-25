@@ -290,6 +290,14 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // alice/golden's two fixture rules — the priority ranks, the glob badge
   // on release/*, the counts lines and the move/edit/delete controls.
   { file: "settings-branches.html", path: "/alice/golden/settings/branches", status: 200, signedIn: true },
+  // The team-grant render gates (SPEC-0007 §3.5's UI half): the SIGNED-IN
+  // TEAM-GRANTED views of acme/anvil — alice (a `Developers` write member)
+  // sees the editor entry (the blob view's Edit/Delete actions) her grant
+  // admits, and morgan (the org owner, admin through the Owners-team bridge)
+  // sees the settings family. Anonymous/stranger renders of the same routes
+  // stay control-free — the committed goldens above pin those bytes.
+  { file: "file-view-team-writer.html", path: "/acme/anvil/src/branch/main/README.md", status: 200, signedIn: true },
+  { file: "settings-team-admin.html", path: "/acme/anvil/settings", status: 200, signedIn: true, sessionUser: "morgan" },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
@@ -949,6 +957,40 @@ async function seedGoldenBranchProtections(): Promise<void> {
   ]);
 }
 
+/**
+ * The team-grant fixture (the SPEC-0007 §3.5 UI render-gate wave): REAL
+ * engine content pushed into the EXISTING public `acme/anvil` (the wave-6
+ * org seed's D1-only repo — no committed golden reads its git content), so
+ * the signed-in team-member goldens render a file view. The roster is
+ * UNTOUCHED: alice's write grant comes from the wave-12 `Developers` team
+ * (she is a member; the team covers anvil) and morgan's admin grant from the
+ * Owners-team bridge — no new team rows, no new members, no new repos, so
+ * org-teams/org-team-detail/explore/org-home bytes cannot shift. The push
+ * is guarded on the branch's existence like ensureSeededRepo, and anvil's
+ * seeded `updated_at` (T0+60) is re-pinned afterwards — the receive flow
+ * stamps it only on the creating→ready CAS (anvil is created ready, so the
+ * stamp cannot fire; the pin is determinism insurance, §5.2).
+ */
+const TEAM_WRITER_COMMITS: SeedCommit[] = [
+  {
+    message: "seed: anvil blueprint",
+    time: T0,
+    files: [{ path: "README.md", content: "# anvil\n\nDrop-tested delivery hardware.\n" }],
+  },
+];
+
+async function seedGoldenTeamWriter(): Promise<void> {
+  const refs = await env.REPO.getByName("acme/anvil").listRefs();
+  const refNames = new Set((refs?.refs ?? []).map((ref) => ref.name));
+  if (!refNames.has("refs/heads/main")) {
+    await ensureSeededRepo({ owner: "acme", slug: "anvil", commits: TEAM_WRITER_COMMITS });
+  }
+  await drizzle(env.DB)
+    .update(repositories)
+    .set({ updatedAt: new Date((T0 + 60) * 1000) })
+    .where(and(eq(repositories.ownerNamespace, "acme"), eq(repositories.slug, "anvil")));
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
@@ -1004,6 +1046,11 @@ export function setupGoldenFixtures(): void {
     // Wave-15: alice/golden's protected-branch rules (the settings-branches
     // golden) — after the seeds the repo and owner rows hang off.
     await seedGoldenBranchProtections();
+    // The team-grant wave: acme/anvil's engine content (the signed-in
+    // team-member goldens — the file view for alice's Developers write grant,
+    // the settings page for morgan's Owners-bridge admin grant) — after the
+    // org + team seeds that create the grants.
+    await seedGoldenTeamWriter();
     // Wave 7: the user-profile golden renders the shared/repo/list rows'
     // "Updated {TimeSince}" from `repositories.updated_at` — the issue and
     // milestone seeders above stamp it with wall-clock time (the counter-

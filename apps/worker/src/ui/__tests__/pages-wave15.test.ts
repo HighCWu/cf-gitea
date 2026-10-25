@@ -367,9 +367,10 @@ describe("GET /{owner}/{repo}/settings/branches/edit (the form)", () => {
 
   it("renders the team inputs on an org-owned repo only", async () => {
     const fixture = await ensureWave15Fixtures();
-    // The org owner is NOT a repo admin under the settings pages' landed
-    // predicate (canAdminRepo: site admin, namespace owner, collaborator
-    // admin) — the site admin renders the org repo's form here.
+    // The org repo's form renders for the site admin here (the org owner's
+    // admin grant rides the Owners-team bridge through the landed
+    // isRepositoryAdmin — see pages-wave16.test.ts; this test pins the
+    // team-input rendering on an org-owned repo, whichever principal).
     const orgPage = await fetchUi("/bporg/wave15-org/settings/branches/edit", withCookie(fixture.adminCookie));
     expect(orgPage.status).toBe(200);
     const orgHtml = await orgPage.text();

@@ -68,9 +68,11 @@ export async function renderUiPage(options: {
       const data = await loadFileViewData(engine, repo, url.origin, route.refSuffix);
       if ("notFound" in data) return notFound();
       // Wave 8: the file view's write chrome (Edit/Delete actions + the New
-      // File link) rides the editor's write predicate — anonymous resolves
-      // false with zero D1 reads, so the golden renders stay byte-stable.
-      const canWrite = repo.isArchived ? false : await canWriteRepo(env.DB, repo, ctx.viewer);
+      // File link) rides the editor's write predicate — the LANDED
+      // canWriteRepository through ../repo-grants.ts (team grants included);
+      // anonymous resolves false with zero D1 reads, so the golden renders
+      // stay byte-stable.
+      const canWrite = repo.isArchived ? false : await canWriteRepo(env, repo, ctx.viewer);
       return { status: 200, html: renderPage(<FileViewPage ctx={ctx} data={data} canWrite={canWrite} />) };
     }
   }

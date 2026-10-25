@@ -1410,15 +1410,16 @@ async function issueNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
 
 /** The settings admin gate (pages/settings.tsx header): anonymous → the
  *  login 303; a signed-in non-admin → the 404 shell (upstream settings
- *  pages are admin-only and equally undiscoverable). Returns the Response to
- *  answer, or `null` to proceed. */
+ *  pages are admin-only and equally undiscoverable). The grant rides the
+ *  landed `isRepositoryAdmin` (repo-access.ts via ../repo-grants.ts — team
+ *  grants included). Returns the Response to answer, or `null` to proceed. */
 async function settingsGate(
   c: Context<{ Bindings: Env }>,
   resolved: Extract<ResolvedUiRequest, { ok: true }>,
 ): Promise<Response | null> {
   const { url, ctx, viewer, repo, respond } = resolved;
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
-  if (!(await canAdminRepo(c.env.DB, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
+  if (!(await canAdminRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
   return null;
 }
 
@@ -1872,7 +1873,7 @@ async function milestonesPage(c: Context<{ Bindings: Env }>): Promise<Response> 
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond, repo } = resolved;
   const data = await loadMilestonesData(c.env.DB, repo.id, url.searchParams);
-  data.canWrite = await canAdminRepo(c.env.DB, repo, viewer);
+  data.canWrite = await canAdminRepo(c.env, repo, viewer);
   return respond(c.html(renderMilestonesPage(ctx, data), 200));
 }
 
@@ -2165,7 +2166,8 @@ const FILE_EDITOR_MODES = {
  * them), the anonymous login 303, then the write posture — the archived
  * refusal (upstream `RepoMustNotBeArchived` answers NotFound,
  * services/context/repo.go:136-141) and the write predicate (`canWriteRepo`,
- * the session-viewer port of the landed canWriteRepository; non-writers
+ * the UI delegate onto the landed canWriteRepository, repo-access.ts via
+ * ../repo-grants.ts — team grants included; non-writers
  * 404-shell like the settings pages — no fork-to-edit flow exists to offer
  * readers). Returns the ready Response, or null to proceed.
  */
@@ -2175,7 +2177,7 @@ async function fileEditorGate(
 ): Promise<Response | null> {
   const { url, ctx, viewer, repo, respond } = resolved;
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
-  if (repo.isArchived || !(await canWriteRepo(c.env.DB, repo, viewer))) {
+  if (repo.isArchived || !(await canWriteRepo(c.env, repo, viewer))) {
     return respond(c.html(renderNotFound(ctx), 404));
   }
   return null;
@@ -2421,7 +2423,7 @@ async function issueCommentSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   const form = parseCommentForm(await readUrlEncodedForm(c.req.raw));
   // The merged-PR guard needs the PR extension row only.
   const pr = issue.isPull ? ((await findPullRequestByIndex(c.env.DB, repo.id, route.index))?.pullRequest ?? null) : null;
-  const access = await resolveIssueDetailAccess(c.env.DB, repo, viewer, issue);
+  const access = await resolveIssueDetailAccess(c.env, repo, viewer, issue);
   const result = await createCommentFromForm(c.env.DB, repo, issue, pr, viewer, access, form);
   if (result.outcome === "created") {
     return respond(new Response(null, { status: 303, headers: { location: `${canonicalPath}#issuecomment-${result.comment.id}` } }));
@@ -2451,7 +2453,7 @@ async function issueLabelsSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, repo, respond } = resolved;
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
-  if (!(await canAdminRepo(c.env.DB, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
+  if (!(await canAdminRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
 
   const form = parseIssueLabelForm(await readUrlEncodedForm(c.req.raw));
   // The issue_ids selector scopes GLOBAL label ids to THIS repo's issues
@@ -2466,7 +2468,7 @@ async function issueLabelsSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   }
   const data = await loadIssueDetailData(c.env.DB, repo, issue.isPull ? "pulls" : "issues", issue.index, url.origin, viewer);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
-  const access = await resolveIssueDetailAccess(c.env.DB, repo, viewer, issue);
+  const access = await resolveIssueDetailAccess(c.env, repo, viewer, issue);
   return respond(c.html(renderIssueDetailPage(ctx, data, access, { content: "", error: result.message }), 200));
 }
 
@@ -2524,7 +2526,7 @@ async function pullReviewSubmit(c: Context<{ Bindings: Env }>): Promise<Response
     if (message === null) throw error;
     const data = await loadIssueDetailData(c.env.DB, repo, "pulls", route.index, url.origin, viewer);
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
-    const access = await resolveIssueDetailAccess(c.env.DB, repo, viewer, data.issue);
+    const access = await resolveIssueDetailAccess(c.env, repo, viewer, data.issue);
     return respond(c.html(renderIssueDetailPage(ctx, data, access, undefined, { content: form.content, error: message }), 200));
   }
 }
@@ -2581,7 +2583,7 @@ async function pullReviewRequestSubmit(c: Context<{ Bindings: Env }>): Promise<R
     if (message === null) throw error;
     const data = await loadIssueDetailData(c.env.DB, repo, "pulls", issue.index, url.origin, viewer);
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
-    const access = await resolveIssueDetailAccess(c.env.DB, repo, viewer, data.issue);
+    const access = await resolveIssueDetailAccess(c.env, repo, viewer, data.issue);
     return respond(c.html(renderIssueDetailPage(ctx, data, access, undefined, undefined, message), 200));
   }
 }
@@ -2614,7 +2616,7 @@ async function pullReviewDismissSubmit(c: Context<{ Bindings: Env }>): Promise<R
   const route = resolved.route;
   if (route.family !== "issue-dismiss-review") return respond(await c.notFound());
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
-  if (!(await canAdminRepo(c.env.DB, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404)); // reqRepoAdmin
+  if (!(await canAdminRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404)); // reqRepoAdmin
   if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived (web.go:1436's group)
 
   const form = parseDismissReviewForm(await readUrlEncodedForm(c.req.raw));
@@ -2666,7 +2668,7 @@ async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
     viewer.kind === "user" &&
     data.baseKind === "branch" &&
     data.headKind === "branch" &&
-    (await canWriteRepo(c.env.DB, repo, viewer));
+    (await canWriteRepo(c.env, repo, viewer));
   return respond(
     c.html(
       renderComparePage({
@@ -2686,7 +2688,8 @@ async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
  * POST /{owner}/{repo}/compare/{base}...{head} (upstream
  * CompareAndPullRequestPost, routers/web/repo/pull.go:1318, over the landed
  * create route's arms): the §2.8 Origin guard, the repo→viewer order, the
- * WRITER gate (`canWriteRepo` — the file-editor predicate; a signed-in
+ * WRITER gate (`canWriteRepo` — the landed canWriteRepository through
+ * ../repo-grants.ts; a signed-in
  * non-writer 404-shells like the editor surfaces, anonymous 303s onto the
  * login round-trip; upstream admits any pulls-reader, the pages/compare.tsx
  * header documents the divergence), then the landed create arms in the API
@@ -2707,7 +2710,7 @@ async function compareSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   // answers it with chi's 405; a null-side tail POST is hand-crafted (404).
   if (route.family !== "compare" || route.head === null) return respond(await c.notFound());
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
-  if (repo.isArchived || !(await canWriteRepo(c.env.DB, repo, viewer))) {
+  if (repo.isArchived || !(await canWriteRepo(c.env, repo, viewer))) {
     return respond(c.html(renderNotFound(ctx), 404));
   }
   const doerRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
@@ -2796,7 +2799,7 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     if (redirect !== null) return respond(new Response(null, { status: 303, headers: { location: redirect } }));
     // Wave-5: the signed-in chrome (status button + admin label form) needs
     // the viewer's grants; anonymous resolves to the all-false access.
-    const access = await resolveIssueDetailAccess(c.env.DB, repo, resolved.viewer, data.issue);
+    const access = await resolveIssueDetailAccess(c.env, repo, resolved.viewer, data.issue);
     return respond(c.html(renderIssueDetailPage(ctx, data, access), 200));
   }
   // Wave-5 dispatch: the PR files diff view (render.tsx never sees this

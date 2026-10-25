@@ -402,9 +402,12 @@ export interface IssueDetailAccess {
 }
 
 /** Resolve both grants in one place (the settings gate's order: anonymous
- *  viewers never qualify). */
+ *  viewers never qualify). The admin arm rides the landed `isRepositoryAdmin`
+ *  through `canAdminRepo` (../repo-grants.ts's bridge) — it needs the full
+ *  `Env` the service predicates read; the issue-unit arms keep their D1-only
+ *  collaborator/poster reads. */
 export async function resolveIssueDetailAccess(
-  d1: D1Database,
+  env: Env,
   repo: RepoRow,
   viewer: Viewer,
   issue: IssueRow,
@@ -412,13 +415,14 @@ export async function resolveIssueDetailAccess(
   if (viewer.kind === "anonymous") {
     return { canChangeState: false, labelOptions: null, canChangeReviewRequests: false, canDismissReviews: false };
   }
+  const d1 = env.DB;
   const isOwner = repo.ownerNamespace.toLowerCase() === viewer.username.toLowerCase();
   const collabMode: "none" | "read" | "write" | "admin" = isOwner
     ? "admin" // the owner outranks any collaborator row (canAdminRepo's owner line)
     : await collaboratorModeOf(d1, repo.id, viewer.id);
   const canChangeState =
     viewer.isAdmin || isOwner || issue.posterId === viewer.id || collabMode === "write" || collabMode === "admin";
-  const admin = await canAdminRepo(d1, repo, viewer);
+  const admin = await canAdminRepo(env, repo, viewer);
   const labelOptions = admin ? (await listRepoLabels(d1, repo.id, "", 1, ISSUE_DETAIL_PICKER_LIMIT)).items : null;
   // Wave-11: the request predicate (pull-reviews.ts:388-396) — poster /
   // site admin / repo owner / collaborator, never on an archived repo.

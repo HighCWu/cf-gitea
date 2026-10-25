@@ -18,6 +18,7 @@ import dashboardGolden from "./goldens/dashboard.html?raw";
 import exploreReposGolden from "./goldens/explore-repos.html?raw";
 import exploreUsersGolden from "./goldens/explore-users.html?raw";
 import fileViewCodeGolden from "./goldens/file-view-code.html?raw";
+import fileViewTeamWriterGolden from "./goldens/file-view-team-writer.html?raw";
 import homeGolden from "./goldens/home.html?raw";
 import issueDetailGolden from "./goldens/issue-detail.html?raw";
 import issuesClosedGolden from "./goldens/issues-closed.html?raw";
@@ -40,6 +41,7 @@ import pullsOpenGolden from "./goldens/pulls-open.html?raw";
 import settingsBranchesGolden from "./goldens/settings-branches.html?raw";
 import settingsHookDetailGolden from "./goldens/settings-hook-detail.html?raw";
 import settingsMirrorGolden from "./goldens/settings-mirror.html?raw";
+import settingsTeamAdminGolden from "./goldens/settings-team-admin.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
 import userProfileGolden from "./goldens/user-profile.html?raw";
 import userSettingsProfileGolden from "./goldens/user-settings-profile.html?raw";
@@ -89,6 +91,10 @@ const goldens: Record<string, string> = {
   "compare-form.html": compareFormGolden,
   "compare-has-pr.html": compareHasPrGolden,
   "compare-nothing.html": compareNothingGolden,
+  // The team-grant render gates (SPEC-0007 §3.5's UI half): the signed-in
+  // write-team member's file view and the org owner's settings page.
+  "file-view-team-writer.html": fileViewTeamWriterGolden,
+  "settings-team-admin.html": settingsTeamAdminGolden,
 };
 
 function classList(el: { attrs: Record<string, string> }): string[] {
