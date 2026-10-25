@@ -28,6 +28,11 @@
  */
 
 import { env } from "cloudflare:workers";
+
+/** Payload origin per the service's instanceOrigin(): the wrangler APP_URL
+ *  var when configured (tests ride the real config), upstream's default
+ *  ROOT_URL otherwise. */
+const EXPECTED_ORIGIN = ((env as { APP_URL?: string }).APP_URL ?? "http://localhost:3000").replace(/\/+$/, "");
 import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -435,7 +440,7 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
       ref: "refs/heads/main",
       before: PUSH_ZERO_OID,
       after: tip,
-      compare_url: "http://localhost:3000/",
+      compare_url: `${EXPECTED_ORIGIN}/`,
       commits: [],
       total_commits: 0,
       head_commit: null,
@@ -519,7 +524,7 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
     expect(payload.before).toBe(before);
     expect(payload.after).toBe(newTip);
     // ComposeCompareURL + the AppURL prefix (mirror_pull.go:375).
-    expect(payload.compare_url).toBe(`http://localhost:3000/alice/pushupdate/compare/${before}...${newTip}`);
+    expect(payload.compare_url).toBe(`${EXPECTED_ORIGIN}/alice/pushupdate/compare/${before}...${newTip}`);
     // Newest-first (rev-list order) over the oldest-first range walk.
     expect(payload.commits.map((c) => c.id)).toEqual([newTip, append.tips[0]!]);
     expect(payload.total_commits).toBe(2);

@@ -7,6 +7,7 @@ import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
 import { enqueueDueMirrorSyncs } from "./services/mirror/sync";
+import { handleUserPushEvent } from "./services/webhooks-push";
 import { handlesUiRoute, uiRouter } from "./ui";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
@@ -24,13 +25,21 @@ import { webhookQueueHandler } from "./webhooks/consumer";
  *   (SPEC-0008, src/ui) owns the page families (AGENTS.md project overview —
  *   the official Gitea frontend is the frontend; uiRouter renders the shell).
  * - `cors` unset: no cross-origin engine API yet.
- * - `onPush` unset: repo bookkeeping stays inside the engine (registry DO)
- *   until SPEC-0003 wires repo lifecycle to D1.
+ * - `onPush` (SPEC-0005 §3, wired fff6094): after finalizeReceive commits,
+ *   the engine fires the hook in waitUntil with the APPLIED updates delta —
+ *   the user-push webhook family (pusher = repo owner until the engine
+ *   plumbs authenticated identity). Mirror/import receives use their own
+ *   engine instances without the hook (no double emission).
  * - `REPO_PACKS` (R2) is bound and used by the engine's receive path for
  *   pack staging + final packs (SPEC-0001a §3 Step 1). The full-clone cache
  *   key family (`clone-cache/`) stays unwritten until M4 (SPEC-0001 §10).
  */
-const gitHttp = createDurableGit<Env>({ authorize, ui: false, namespaces: true });
+const gitHttp = createDurableGit<Env>({
+  authorize,
+  ui: false,
+  namespaces: true,
+  onPush: (event, env) => handleUserPushEvent(env, event),
+});
 
 const app = new Hono<{ Bindings: Env }>();
 

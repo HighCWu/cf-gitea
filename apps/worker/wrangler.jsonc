@@ -10,6 +10,11 @@
   "limits": {
     "cpu_ms": 300000
   },
+  // Webhook payload compare URLs (mirror sync + user push) — upstream's own
+  // AppURL equivalent. Local dev overrides via .dev.vars if needed.
+  "vars": {
+    "APP_URL": "https://cf-gitea.hecongw.workers.dev"
+  },
   "observability": {
     "enabled": true,
     "traces": {

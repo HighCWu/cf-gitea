@@ -29,6 +29,11 @@
  */
 
 import { env } from "cloudflare:workers";
+
+/** Payload origin per the service's instanceOrigin(): the wrangler APP_URL
+ *  var when configured (tests ride the real config), upstream's default
+ *  ROOT_URL otherwise. */
+const EXPECTED_ORIGIN = ((env as { APP_URL?: string }).APP_URL ?? "http://localhost:3000").replace(/\/+$/, "");
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { asc, eq } from "drizzle-orm";
@@ -460,7 +465,7 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
     expect(push.ref).toBe("refs/heads/main");
     expect(push.before).toBe(tips[0]);
     expect(push.after).toBe(tips[6]);
-    expect(push.compare_url).toBe(`http://localhost:3000/cf-gitea-stub/mirror-update/compare/${tips[0]}...${tips[6]}`);
+    expect(push.compare_url).toBe(`${EXPECTED_ORIGIN}/cf-gitea-stub/mirror-update/compare/${tips[0]}...${tips[6]}`);
 
     // The capped commit list. DEVIATION (documented in sync.ts): the engine's
     // listCommitsRange caps the OLDEST-first topological order, so the 6-commit
@@ -490,7 +495,7 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
       signer: null,
       payload: "",
     });
-    expect(commit.url).toBe(`http://localhost:3000/cf-gitea-stub/mirror-update/commit/${tips[5]}`);
+    expect(commit.url).toBe(`${EXPECTED_ORIGIN}/cf-gitea-stub/mirror-update/commit/${tips[5]}`);
   });
 
   it("emits the delete event for a pruned ref", async () => {
