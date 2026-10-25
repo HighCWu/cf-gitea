@@ -5,6 +5,7 @@ import { packR2Key } from "./r2keys";
 import { concat } from "./util";
 import type { IndexRow, LookupObjectHit, LookupObjectResult } from "../control-plane";
 import { ObjCache, ObjRec } from "../receive/objcache";
+import { REPO_PACK_BASELINE_SQL, replayRepoSchema, schemaSealedError } from "./migrations";
 
 export const PACK_CHUNK = 1024 * 1024;
 /** Size threshold from SPEC-0001 §3/§8: packs at least this large exist only in
@@ -133,8 +134,20 @@ export class PackStore {
    */
   private r2KeyOverrides = new Map<string, string>();
 
-  constructor(private sql: SqlStorage, private extern: ExternalResolver) {
+  constructor(
+    private sql: SqlStorage,
+    private extern: ExternalResolver,
+    /** Sealed posture (SPEC-0011 §8): the schema journal refused this
+     * database — touch nothing, fail every data access with the sealed
+     * diagnostic until an explicit wipe unseals. */
+    private sealed = false
+  ) {
     this.init();
+  }
+
+  /** The distinct sealed-posture diagnostic (mirror of GitStore.assertOpen). */
+  private assertOpen(): void {
+    if (this.sealed) throw schemaSealedError("pack store sealed with its GitStore");
   }
 
   /** Bind (or clear) the R2 backend. Idempotent; the DO is per-repo so this is
@@ -171,58 +184,29 @@ export class PackStore {
     return b;
   }
 
+  /** Create this store's tables (idempotent). The DDL is the migration
+   * baseline's PackStore half — one copy lives in migrations.ts (the GitStore
+   * constructor runs the journal before this store is constructed, so on any
+   * normal open these statements no-op). A sealed store creates nothing. */
   private init(): void {
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS pack_catalog (
-        pack_key TEXT PRIMARY KEY,
-        seq INTEGER NOT NULL,
-        kind TEXT NOT NULL DEFAULT 'receive',
-        state TEXT NOT NULL DEFAULT 'active',
-        location TEXT NOT NULL DEFAULT 'r2',
-        object_count INTEGER NOT NULL,
-        pack_bytes INTEGER NOT NULL,
-        idx_bytes INTEGER NOT NULL,
-        created_at INTEGER NOT NULL,
-        superseded_by TEXT
-      );
-      CREATE INDEX IF NOT EXISTS idx_pack_catalog_seq ON pack_catalog(seq);
-      CREATE TABLE IF NOT EXISTS pack_data (
-        pack_key TEXT NOT NULL,
-        seq INTEGER NOT NULL,
-        data BLOB NOT NULL,
-        PRIMARY KEY (pack_key, seq)
-      );
-      CREATE TABLE IF NOT EXISTS pack_objects (
-        oid TEXT PRIMARY KEY,
-        pack_key TEXT NOT NULL,
-        offset INTEGER NOT NULL,
-        data_off INTEGER NOT NULL,
-        data_len INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        entry_size INTEGER NOT NULL,
-        base_oid TEXT,
-        crc32 INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE INDEX IF NOT EXISTS idx_pack_objects_loc ON pack_objects(pack_key, offset);
-      CREATE TABLE IF NOT EXISTS fork_import (
-        pack_key TEXT PRIMARY KEY,
-        object_count INTEGER NOT NULL,
-        pack_bytes INTEGER NOT NULL,
-        idx_bytes INTEGER NOT NULL,
-        staged_at INTEGER NOT NULL
-      );
-    `);
+    if (this.sealed) return;
+    this.sql.exec(REPO_PACK_BASELINE_SQL);
   }
 
   wipe(): void {
+    this.sealed = false; // the explicit wipe recovers a sealed store
     for (const t of ["pack_catalog", "pack_data", "pack_objects", "fork_import"]) {
       this.sql.exec(`DROP TABLE IF EXISTS ${t}`);
     }
     this.chunks.clear(); // pack keys are content-derived, but caches hold chunk bytes
     this.backend.clear();
     this.r2KeyOverrides.clear();
-    this.init();
+    // the journal now over-reports (its rows claim schema this wipe just
+    // dropped) — replayRepoSchema clears it and re-applies the idempotent
+    // migration list, rebuilding the pack tables AND the journal truthfully
+    // (SPEC-0011 §8: wipes return to schema head through the replay
+    // primitive, never through the unrecognized-state machinery)
+    replayRepoSchema(this.sql);
   }
 
   /** Drop all packs and start empty (small-repo gc migrates objects out first). */
@@ -248,6 +232,7 @@ export class PackStore {
 
   /** Pack keys of the currently R2-backed packs (for GC to delete their R2 bytes). */
   r2PackKeys(): string[] {
+    this.assertOpen();
     return this.sql
       .exec<{ pack_key: string }>("SELECT pack_key FROM pack_catalog WHERE location = 'r2'")
       .toArray()
@@ -268,11 +253,13 @@ export class PackStore {
   }
 
   countObjects(): number {
+    this.assertOpen();
     return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects").one().n;
   }
 
   /** Total stored bytes across all indexed packs (0 when pack-empty). */
   totalPackBytes(): number {
+    this.assertOpen();
     return this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(pack_bytes), 0) AS n FROM pack_catalog").one().n;
   }
 
@@ -287,6 +274,7 @@ export class PackStore {
   }
 
   lookup(oid: string): PackedEntry | null {
+    this.assertOpen();
     const rows = this.sql
       .exec<{
         pack_key: string; offset: number; data_off: number; data_len: number;
@@ -305,6 +293,7 @@ export class PackStore {
   }
 
   typeAndSize(oid: string): { type: ObjType; size: number } | null {
+    this.assertOpen();
     const rows = this.sql
       .exec<{ type: ObjType; size: number }>("SELECT type, size FROM pack_objects WHERE oid = ?", oid)
       .toArray();
@@ -313,6 +302,7 @@ export class PackStore {
 
   /** Distinct delta-base oids: a second reference edge gc must not sever. */
   baseOids(): string[] {
+    this.assertOpen();
     return this.sql
       .exec<{ base_oid: string }>("SELECT DISTINCT base_oid FROM pack_objects WHERE base_oid IS NOT NULL")
       .toArray()
@@ -320,6 +310,7 @@ export class PackStore {
   }
 
   findOidPrefix(prefix: string): string[] {
+    this.assertOpen();
     return this.sql
       .exec<{ oid: string }>("SELECT oid FROM pack_objects WHERE oid LIKE ? LIMIT 2", prefix + "%")
       .toArray()
@@ -332,6 +323,7 @@ export class PackStore {
    * runtime's result-set size cap (celld materializes blob rows as JSON).
    */
   async readRaw(packKey: string, off: number, len: number): Promise<Uint8Array> {
+    this.assertOpen();
     const first = Math.floor(off / PACK_CHUNK);
     const last = Math.floor((off + len - 1) / PACK_CHUNK);
     const out = new Uint8Array(len);
@@ -458,6 +450,7 @@ export class PackStore {
    * is a no-op by the same token (content-addressed rows).
    */
   putRows(packKey: string, rows: IndexRow[]): void {
+    this.assertOpen();
     for (let i = 0; i < rows.length; i += ROW_BATCH_ROWS) {
       const slice = rows.slice(i, i + ROW_BATCH_ROWS);
       const values = slice.map(() => "(?,?,?,?,?,?,?,?,?,?)").join(",");
@@ -496,6 +489,7 @@ export class PackStore {
   /** Delete every index/data row of one pack (lease sweeps, abandoned
    * receives). Cache state is cleared because chunk keys overlap by prefix. */
   sweepPackRows(packKey: string): void {
+    this.assertOpen();
     this.sql.exec("DELETE FROM pack_objects WHERE pack_key = ?", packKey);
     this.sql.exec("DELETE FROM pack_data WHERE pack_key = ?", packKey);
     this.sql.exec("DELETE FROM pack_catalog WHERE pack_key = ?", packKey);
@@ -508,6 +502,7 @@ export class PackStore {
    * receive that died between putIndexRows and finalize. `keepPackKey` (the
    * current lease's pack, still being written) is preserved. */
   sweepOrphanRows(keepPackKey: string | null): void {
+    this.assertOpen();
     const orphans = this.sql
       .exec<{ pack_key: string }>(
         `SELECT pack_key FROM (
@@ -531,6 +526,7 @@ export class PackStore {
    * full R2 key resolves through the per-pack override/derivation chain.
    */
   lookupPacked(oids: string[]): (LookupObjectHit | null)[] {
+    this.assertOpen();
     return oids.map((oid) => {
       const rows = this.sql
         .exec<{
@@ -558,6 +554,7 @@ export class PackStore {
   /** Keyset page of a pack's indexed oids (validatePush builds the reachable
    * set for a cached fast-forward from the rows alone — no pack bytes). */
   packOidsAfter(packKey: string, after: string, limit: number): string[] {
+    this.assertOpen();
     return this.sql
       .exec<{ oid: string }>(
         "SELECT oid FROM pack_objects WHERE pack_key = ? AND oid > ? ORDER BY oid LIMIT ?",
@@ -577,6 +574,7 @@ export class PackStore {
    * ('retired'/'reclaimable'/'deleted') are compaction debris whose objects
    * the active set already holds — a fork copy must never resurrect them. */
   activeCatalogAfter(afterPackKey: string, limit: number): PackCatalogRow[] {
+    this.assertOpen();
     return this.sql
       .exec<{
         pack_key: string; seq: number; kind: string; state: string; location: string;
@@ -609,6 +607,7 @@ export class PackStore {
   /** Whether another ACTIVE pack exists after `afterPackKey` (the `more` probe
    * of listCatalogPage's last page). */
   hasActiveCatalogAfter(afterPackKey: string): boolean {
+    this.assertOpen();
     return (
       this.sql
         .exec("SELECT 1 FROM pack_catalog WHERE state = 'active' AND pack_key > ? LIMIT 1", afterPackKey)
@@ -620,6 +619,7 @@ export class PackStore {
   /** One ACTIVE catalog row by exact key (listCatalogPage's split-pack
    * continuation fetches the row it is mid-way through). */
   activeCatalogRow(packKey: string): PackCatalogRow | null {
+    this.assertOpen();
     const rows = this.sql
       .exec<{
         pack_key: string; seq: number; kind: string; state: string; location: string;
@@ -651,6 +651,7 @@ export class PackStore {
   /** Full-shape keyset page of one pack's index rows (listCatalogPage's row
    * slices; the same columns receive's putIndexRows landed). */
   indexRowsAfter(packKey: string, afterOid: string, limit: number): IndexRow[] {
+    this.assertOpen();
     return this.sql
       .exec<{
         oid: string; offset: number; data_off: number; data_len: number;
@@ -683,6 +684,7 @@ export class PackStore {
    * pack_data chunks (listCatalogPage's inline `packData`). No R2-backed pack
    * ever takes this path. */
   sqlitePackBytes(packKey: string): Uint8Array {
+    this.assertOpen();
     const rows = this.sql
       .exec<{ data: ArrayBuffer }>("SELECT data FROM pack_data WHERE pack_key = ? ORDER BY seq", packKey)
       .toArray();
@@ -693,6 +695,7 @@ export class PackStore {
    * FIRST pack that indexed it — INSERT OR IGNORE — so a copy's count is the
    * recomputed one, exactly what recordPack writes). */
   countPackRows(packKey: string): number {
+    this.assertOpen();
     return this.sql
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key = ?", packKey)
       .one().n;
@@ -707,6 +710,7 @@ export class PackStore {
   /** Record a completed pack for finalize. REPLACE: an idempotent re-run
    * restages the same pack with recomputed values. */
   stageForkPack(packKey: string, objectCount: number, packBytes: number, idxBytes: number): void {
+    this.assertOpen();
     this.sql.exec(
       `INSERT INTO fork_import (pack_key, object_count, pack_bytes, idx_bytes, staged_at)
        VALUES (?, ?, ?, ?, ?)
@@ -720,6 +724,7 @@ export class PackStore {
   }
 
   stagedForkPacks(): { packKey: string; objectCount: number; packBytes: number; idxBytes: number }[] {
+    this.assertOpen();
     return this.sql
       .exec<{ pack_key: string; object_count: number; pack_bytes: number; idx_bytes: number }>(
         "SELECT pack_key, object_count, pack_bytes, idx_bytes FROM fork_import ORDER BY pack_key"
@@ -731,6 +736,7 @@ export class PackStore {
   /** Clear the staging table (beginForkImport's fresh start and finalize's
    * commit). Must run inside the caller's transaction where atomicity matters. */
   clearForkStaging(): void {
+    this.assertOpen();
     this.sql.exec("DELETE FROM fork_import");
   }
 
@@ -744,6 +750,7 @@ export class PackStore {
    * location is a later-milestone writer).
    */
   recordPack(packKey: string, packBytes: number, idxBytes: number, kind: string = "receive"): void {
+    this.assertOpen();
     const count = this.sql
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key = ?", packKey)
       .one().n;
@@ -766,6 +773,7 @@ export class PackStore {
   /** Keyset page of catalog rows in pack_key order (the primary key), every
    * state included. `afterPackKey` null starts the listing. */
   catalogPage(afterPackKey: string | null, limit: number): PackCatalogRow[] {
+    this.assertOpen();
     return this.sql
       .exec<{
         pack_key: string; seq: number; kind: string; state: string; location: string;

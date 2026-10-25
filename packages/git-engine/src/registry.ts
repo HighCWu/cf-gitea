@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
+import { runRegistryMigrations } from "./git/migrations";
 
 export type RepoInfo = {
   name: string;
@@ -24,25 +25,13 @@ export type RepoConfig = {
 export class Registry extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS repos (
-        name TEXT PRIMARY KEY,
-        desc TEXT NOT NULL DEFAULT '',
-        owner TEXT NOT NULL DEFAULT '',
-        section TEXT NOT NULL DEFAULT '',
-        priv INTEGER NOT NULL DEFAULT 0,
-        idle INTEGER NOT NULL DEFAULT 0,
-        ver INTEGER NOT NULL DEFAULT 1
-      );
-    `);
-    // upgrade path for databases created by earlier versions
-    for (const col of ["section TEXT NOT NULL DEFAULT ''", "priv INTEGER NOT NULL DEFAULT 0", "ver INTEGER NOT NULL DEFAULT 1"]) {
-      try {
-        ctx.storage.sql.exec(`ALTER TABLE repos ADD COLUMN ${col}`);
-      } catch {
-        // column already exists
-      }
-    }
+    // SPEC-0011 §8 (M3.0): the same forward-only journal mechanism as
+    // RepoCell, on this DO's separate SQLite database with its own step list
+    // (REGISTRY_MIGRATIONS). The 0001 baseline is the constructor's old
+    // inline DDL verbatim — CREATE + the try-ALTER column adds — so every
+    // existing registry database (any column vintage) adopts the journal
+    // untouched; future registry schema steps append to the list.
+    runRegistryMigrations(ctx.storage.sql, { tx: (fn) => ctx.storage.transactionSync(fn) });
   }
 
   upsert(name: string, idle: number): void {

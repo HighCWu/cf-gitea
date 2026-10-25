@@ -207,7 +207,12 @@ export class RepoCell extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.store = new GitStore(ctx.storage.sql);
+    // SPEC-0011 §8 (M3.0): the GitStore constructor runs the forward-only
+    // schema migration journal BEFORE any store use — each upgrade txn is
+    // atomic under storage.transactionSync. Unrecognized pre-baseline states
+    // open SEALED (data access fails closed; the DELETE request path wipes
+    // and unseals) — see src/git/migrations.ts for the state model.
+    this.store = new GitStore(ctx.storage.sql, { tx: (fn) => ctx.storage.transactionSync(fn) });
   }
 
   /**
@@ -235,7 +240,27 @@ export class RepoCell extends DurableObject<Env> {
     const host = req.headers.get("x-host") ?? url.host;
     const proto = req.headers.get("x-proto") ?? "https";
     const path = url.pathname;
-    this.bindR2(repo);
+    // SPEC-0011 §8 (M3.0): a SEALED cell (unrecognized pre-baseline schema,
+    // refused at construction) serves exactly ONE request — the explicit
+    // DELETE, whose wipe unseals and rebuilds the cell — and fails closed
+    // with the refusal reason for everything else. Nothing is ever served
+    // from an unrecognized schema, and the cell is never undeletable.
+    if (this.store.schemaState.refused !== null) {
+      if (req.method === "DELETE" && (path === "/" || path === "")) {
+        console.error(
+          `[schema] LOUD: DELETE on sealed repo cell "${repo}" — explicitly wiping an ` +
+            `unrecognized-schema state (${this.store.schemaState.refused})`
+        );
+      } else {
+        return new Response(
+          `error: [schema sealed] ${this.store.schemaState.refused}\n` +
+            `Recovery: DELETE this repo, or open it with allowUnknownSchemaReset.\n`,
+          { status: 500 }
+        );
+      }
+    } else {
+      this.bindR2(repo);
+    }
 
     try {
       if (path === "/info/refs" && req.method === "GET") {
@@ -328,6 +353,9 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    // sealed cells (SPEC-0011 §8) hold no openable schema — sweeps would only
+    // throw "no such table"; the cell is deleted or flagged-reset instead
+    if (this.store.schemaState.refused !== null) return;
     // lease-expiry sweep first: reclaim crashed pushes' staging objects and
     // free the lease slot. Cheap (a SELECT over an almost-always-empty table)
     // and safe during clones — it never touches pack data.
@@ -505,6 +533,9 @@ export class RepoCell extends DurableObject<Env> {
    * contact is beginForkImport, which persists meta.storage_key before any
    * pack key is derived — so the storage key is the fallback name source. */
   private rpcBind(): void {
+    // sealed cells (SPEC-0011 §8): binding reads meta — refuse-adjacent paths
+    // skip it so the destroy/delete RPCs stay reachable on a sealed store
+    if (this.store.schemaState.refused !== null) return;
     const name = this.store.getMeta("repo") ?? this.store.getMeta("storage_key");
     if (name) this.bindR2(name);
   }

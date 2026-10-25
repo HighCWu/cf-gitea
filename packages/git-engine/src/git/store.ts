@@ -5,15 +5,35 @@ import { OidSet } from "./oidset";
 import { PackStore, LOOSE_LOOKUP_CAP } from "./packstore";
 import { ObjCache, ObjRec } from "../receive/objcache";
 import type { LookupObjectHit, LookupObjectResult } from "../control-plane";
+import {
+  REPO_STORE_BASELINE_SQL,
+  dropRepoSchema,
+  runRepoMigrations,
+  schemaSealedError,
+  type SchemaMigrationOutcome,
+} from "./migrations";
 
 /**
- * RepoDO schema generation (SPEC-0001a §3 Step 4). A store whose persisted
- * `schema_version` meta row differs from this constant is dev-scratch state
- * from an older layout: no production data exists pre-M1, so the cutover is a
- * clean wipe-and-recreate (SPEC-0001a §3: "no dual-layout code is carried").
- * Bump on any future breaking schema change.
+ * Options for opening a GitStore. The schema itself is owned by the
+ * forward-only migration journal (src/git/migrations.ts, SPEC-0011 §8) —
+ * constructed DBs are versioned by the `schema_migrations` journal table, not
+ * a single version scalar.
  */
-export const SCHEMA_VERSION = "0001a-step4";
+export interface GitStoreOptions {
+  /** Wraps each schema migration + its journal insert in ONE transaction —
+   * pass `ctx.storage.transactionSync` at the DO construction site. Absent,
+   * the idempotent steps run autocommit. */
+  tx?: (fn: () => void) => void;
+  /**
+   * LOUD dev-scratch escape hatch (default FALSE): an unrecognized
+   * pre-baseline schema state (an older dev-scratch generation's
+   * `meta.schema_version`) opens the store SEALED — every data access fails
+   * CLOSED until the DO is explicitly wiped — unless this flag resets it at
+   * construction, logging loudly before dropping anything. It must never
+   * silently destroy a production repo's data (SPEC-0011 §8).
+   */
+  allowUnknownSchemaReset?: boolean;
+}
 
 /** A ref row (SPEC-0001 §4 `refs`). `peeled` caches a tag tip's commit target
  * (null for branches and lightweight tags); `updatedAt` feeds lease/sweep
@@ -68,11 +88,23 @@ export interface LeaseRow {
  * `compaction_wanted_at` (plus legacy UI keys until the content split);
  * pack_catalog/pack_objects/pack_data (see packstore.ts); leases. The
  * `reachable`/`peeled`/`stats_cache` tables are kept per the amendment's
- * decision table (M4 clone fast path / oid peel cache / UI stats).
+ * decision table (M4 clone fast path / oid peel cache / UI stats). Since
+ * SPEC-0011 §8 (M3.0) the schema is versioned by the forward-only
+ * `schema_migrations` journal (src/git/migrations.ts) — schema changes land
+ * as ordered migration steps, never as another dev-scratch version bump.
  */
 export class GitStore {
   readonly packs: PackStore;
   readonly cache = new ObjCache(CACHE_BUDGET);
+  /** The constructor migration's outcome (diagnostics/tests): what the
+   * journal did when this store opened. `refused` non-null means the store
+   * is SEALED (see below) — mutable so `wipe()` can clear the posture after
+   * rebuilding the schema. */
+  schemaState: SchemaMigrationOutcome;
+  /** Sealed posture (SPEC-0011 §8): an unrecognized pre-baseline schema was
+   * detected and the store refuses every data access until an explicit wipe
+   * (the repo's DELETE endpoint) rebuilds it. */
+  private sealed: boolean;
   /**
    * Whether the loose `objects` table holds anything. A pushed repo is
    * pack-native — loose objects only appear after a gc migration (see
@@ -83,14 +115,22 @@ export class GitStore {
    */
   private hasLoose: boolean;
 
-  constructor(private sql: SqlStorage) {
-    this.packs = new PackStore(sql, (oid) => this.getLoose(oid));
-    this.init();
-    // clean cutover (SPEC-0001a §3 Step 4): a store from an older schema
-    // generation is wiped wholesale — no production data exists pre-M1
-    if (this.getMeta("schema_version") !== SCHEMA_VERSION) {
-      this.wipe();
-      this.setMeta("schema_version", SCHEMA_VERSION);
+  constructor(private sql: SqlStorage, opts: GitStoreOptions = {}) {
+    // SPEC-0011 §8 (M3.0): the forward-only migration journal runs BEFORE any
+    // store use. A fresh DO replays baseline + steps uniformly; an existing
+    // `0001a-step4` DO (every pre-M3 database) adopts the journal in place
+    // with its data untouched; an unrecognized pre-baseline state — or a
+    // journal ahead of this build — returns refused and the store opens
+    // SEALED (below). The decision itself writes nothing, so a refused
+    // database is byte-untouched and the DO's DELETE endpoint (which wipes)
+    // stays reachable. See migrations.ts for the state model.
+    this.schemaState = runRepoMigrations(sql, opts);
+    this.sealed = this.schemaState.refused !== null;
+    this.packs = new PackStore(sql, (oid) => this.getLoose(oid), this.sealed);
+    if (this.sealed) {
+      // touch nothing: the probe would read tables of an unrecognized layout
+      this.hasLoose = false;
+      return;
     }
     const flag = this.getMeta("has-loose");
     if (flag === null) {
@@ -104,58 +144,30 @@ export class GitStore {
     }
   }
 
-  /** Create every table this store owns (idempotent). */
+  /** The distinct sealed-posture diagnostic — thrown by every data access on
+   * a store whose schema was unrecognized (schemaState.refused carries the
+   * reason; the error text names the recoveries). */
+  private assertOpen(): void {
+    if (this.sealed) throw schemaSealedError(this.schemaState.refused!);
+  }
+
+  /** Create this store's tables (idempotent). The DDL is the migration
+   * baseline's GitStore half — one copy lives in migrations.ts so the
+   * constructors and the baseline step can never drift apart. A sealed store
+   * creates nothing (an unrecognized database is never written). */
   private init(): void {
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS objects (
-        oid TEXT PRIMARY KEY,
-        type TEXT NOT NULL,
-        size INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS chunks (
-        oid TEXT NOT NULL,
-        seq INTEGER NOT NULL,
-        data BLOB NOT NULL,
-        PRIMARY KEY (oid, seq)
-      );
-      CREATE TABLE IF NOT EXISTS refs (
-        name TEXT PRIMARY KEY,
-        oid TEXT NOT NULL,
-        peeled TEXT,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS reachable (
-        oid TEXT PRIMARY KEY
-      );
-      CREATE TABLE IF NOT EXISTS peeled (
-        oid TEXT PRIMARY KEY,
-        target TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS stats_cache (
-        tip_oid TEXT NOT NULL,
-        period TEXT NOT NULL,
-        data TEXT NOT NULL,
-        PRIMARY KEY (tip_oid, period)
-      );
-      CREATE TABLE IF NOT EXISTS leases (
-        lease_token TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        expires_at INTEGER NOT NULL,
-        payload TEXT NOT NULL
-      );
-    `);
+    if (this.sealed) return;
+    this.sql.exec(REPO_STORE_BASELINE_SQL);
   }
 
   has(oid: string): boolean {
+    this.assertOpen();
     if (this.hasLoose && this.sql.exec("SELECT 1 FROM objects WHERE oid = ?", oid).toArray().length > 0) return true;
     return this.packs.typeAndSize(oid) !== null;
   }
 
   typeAndSize(oid: string): { type: ObjType; size: number } | null {
+    this.assertOpen();
     if (this.hasLoose) {
       const rows = this.sql
         .exec<{ type: ObjType; size: number }>("SELECT type, size FROM objects WHERE oid = ?", oid)
@@ -179,6 +191,7 @@ export class GitStore {
   }
 
   async get(oid: string): Promise<{ type: ObjType; data: Uint8Array } | null> {
+    this.assertOpen();
     return this.getLoose(oid) ?? (await this.packs.getObject(oid, this.cache));
   }
 
@@ -193,6 +206,7 @@ export class GitStore {
   }
 
   put(oid: string, type: ObjType, data: Uint8Array): void {
+    this.assertOpen();
     if (this.sql.exec("SELECT 1 FROM objects WHERE oid = ?", oid).toArray().length > 0) return;
     const packed = deflate(data);
     this.sql.exec("INSERT INTO objects (oid, type, size) VALUES (?, ?, ?)", oid, type, data.length);
@@ -209,6 +223,7 @@ export class GitStore {
   }
 
   objectCount(): number {
+    this.assertOpen();
     return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM objects").one().n + this.packs.countObjects();
   }
 
@@ -216,6 +231,7 @@ export class GitStore {
    * or a loose object. beginForkImport's empty-target check (SPEC-0001b §5.3:
    * a fork target that already finalized its import must never re-begin). */
   hasAnyContent(): boolean {
+    this.assertOpen();
     return (
       this.refs().length > 0 ||
       this.sql.exec("SELECT 1 FROM pack_catalog LIMIT 1").toArray().length > 0 ||
@@ -233,6 +249,7 @@ export class GitStore {
 
   /** Aligned with the input oids; packed hits first, loose content as fallback. */
   lookupObjectsForWorker(oids: string[]): LookupObjectResult[] {
+    this.assertOpen();
     const packed = this.packs.lookupPacked(oids);
     const out: LookupObjectResult[] = new Array(oids.length);
     for (let i = 0; i < oids.length; i++) {
@@ -282,6 +299,7 @@ export class GitStore {
   }
 
   createLease(leaseToken: string, kind: string, expiresAt: number, payload: string): void {
+    this.assertOpen();
     this.sql.exec(
       "INSERT INTO leases (lease_token, kind, expires_at, payload) VALUES (?, ?, ?, ?) ON CONFLICT(lease_token) DO UPDATE SET kind = excluded.kind, expires_at = excluded.expires_at, payload = excluded.payload",
       leaseToken,
@@ -292,6 +310,7 @@ export class GitStore {
   }
 
   getLease(leaseToken: string): LeaseRow | null {
+    this.assertOpen();
     const rows = this.sql
       .exec<{ lease_token: string; kind: string; expires_at: number; payload: string }>(
         "SELECT lease_token, kind, expires_at, payload FROM leases WHERE lease_token = ?",
@@ -302,16 +321,19 @@ export class GitStore {
   }
 
   deleteLease(leaseToken: string): void {
+    this.assertOpen();
     this.sql.exec("DELETE FROM leases WHERE lease_token = ?", leaseToken);
   }
 
   /** Persist new lease payload JSON (the Worker's first putIndexRows batch
    * allocates the pack; finalize and the sweeps read it from here). */
   updateLeasePayload(leaseToken: string, payload: string): void {
+    this.assertOpen();
     this.sql.exec("UPDATE leases SET payload = ? WHERE lease_token = ?", payload, leaseToken);
   }
 
   hasActiveReceiveLease(now: number): boolean {
+    this.assertOpen();
     return (
       this.sql.exec("SELECT 1 FROM leases WHERE kind = 'receive' AND expires_at > ? LIMIT 1", now).toArray().length >
       0
@@ -319,6 +341,7 @@ export class GitStore {
   }
 
   expiredLeases(now: number): LeaseRow[] {
+    this.assertOpen();
     return this.sql
       .exec<{ lease_token: string; kind: string; expires_at: number; payload: string }>(
         "SELECT lease_token, kind, expires_at, payload FROM leases WHERE expires_at <= ?",
@@ -370,6 +393,7 @@ export class GitStore {
 
   /** Resolve an abbreviated oid; null if unknown or ambiguous. */
   findOid(prefix: string): string | null {
+    this.assertOpen();
     if (!/^[0-9a-f]{4,40}$/.test(prefix)) return null;
     const loose = this.hasLoose
       ? this.sql
@@ -382,10 +406,12 @@ export class GitStore {
   }
 
   allOids(): string[] {
+    this.assertOpen();
     return this.sql.exec<{ oid: string }>("SELECT oid FROM objects").toArray().map((r) => r.oid);
   }
 
   deleteObject(oid: string): void {
+    this.assertOpen();
     this.sql.exec("DELETE FROM objects WHERE oid = ?", oid);
     this.sql.exec("DELETE FROM chunks WHERE oid = ?", oid);
   }
@@ -395,38 +421,31 @@ export class GitStore {
   }
 
   /**
-   * Drop EVERY table this store owns — both the current schema generation and
-   * any older layouts a pre-cutover store may carry — then re-create the
-   * current one. Synchronous end to end so a caller can run it inside ONE
-   * `storage.transactionSync` (the delete wipe; Rule 3 — the last
-   * blockConcurrencyWhile on this path). The instance stays usable afterward:
-   * in-memory caches are reset and the fresh (empty) schema is in place, so a
-   * re-creating push finds its tables. Deliberately NOT storage.deleteAll():
+   * Drop EVERY table this store owns — the current schema generation, the
+   * migration journal, and any older layouts a pre-cutover store may carry —
+   * then rebuild at the CURRENT schema head. Synchronous end to end so a
+   * caller can run it inside ONE `storage.transactionSync` (the delete wipe;
+   * Rule 3 — the last blockConcurrencyWhile on this path). The instance stays
+   * usable afterward: in-memory caches are reset and the fresh (empty)
+   * schema is in place, so a re-creating push finds its tables. This is also
+   * the SEALED-store recovery (SPEC-0011 §8): the repo DELETE endpoint is the
+   * one request path a sealed DO still serves, and wiping it unseals the
+   * instance — an unrecognized-schema cell is always deletable, never bricked.
+   * The journal is rebuilt by `replayRepoSchema` (via packs.wipe) rather than
+   * the detection runner: after a drop the idempotent list is simply
+   * re-applied and re-recorded — a wiped repo comes back at head, never via
+   * the unrecognized-state machinery. Deliberately NOT storage.deleteAll():
    * on celld, deleteAll sweeps the ltx replication control tables too and
    * permanently breaks WAL capture for the cell (patch submitted upstream).
    */
   wipe(): void {
-    for (const t of [
-      // current generation
-      "objects",
-      "chunks",
-      "refs",
-      "meta",
-      "reachable",
-      "peeled",
-      "stats_cache",
-      "leases",
-      "pack_catalog",
-      "pack_data",
-      "pack_objects",
-      // pre-Step-4 generations (dev-scratch; the clean cutover drops them)
-      "pack_meta",
-      "pack_pending",
-      "push_edges",
-    ]) {
-      this.sql.exec(`DROP TABLE IF EXISTS ${t}`);
-    }
+    this.sealed = false; // the explicit wipe recovers a sealed store
+    this.schemaState = { applied: [], adopted: false, reset: false, refused: null };
+    dropRepoSchema(this.sql);
     this.init();
+    // drops the pack tables, clears the caches, then replayRepoSchema
+    // rebuilds the pack schema, the baseline no-ops and the journal —
+    // store + pack tables and the journal all end at head, together
     this.packs.wipe();
     // meta (with the flag) is gone; a fresh empty repo has no loose objects
     this.hasLoose = false;
@@ -439,6 +458,7 @@ export class GitStore {
 
   /** All refs, sorted by name. */
   refs(): RefRow[] {
+    this.assertOpen();
     return this.sql
       .exec<{ name: string; oid: string; peeled: string | null; updated_at: number }>(
         "SELECT name, oid, peeled, updated_at FROM refs ORDER BY name"
@@ -448,6 +468,7 @@ export class GitStore {
   }
 
   getRef(name: string): string | null {
+    this.assertOpen();
     const rows = this.sql
       .exec<{ oid: string }>("SELECT oid FROM refs WHERE name = ?", name)
       .toArray();
@@ -455,6 +476,7 @@ export class GitStore {
   }
 
   setRef(name: string, oid: string): void {
+    this.assertOpen();
     this.sql.exec(
       "INSERT INTO refs (name, oid, peeled, updated_at) VALUES (?, ?, NULL, ?) ON CONFLICT(name) DO UPDATE SET oid = excluded.oid, peeled = NULL, updated_at = excluded.updated_at",
       name,
@@ -464,6 +486,7 @@ export class GitStore {
   }
 
   delRef(name: string): void {
+    this.assertOpen();
     this.sql.exec("DELETE FROM refs WHERE name = ?", name);
   }
 
@@ -525,6 +548,7 @@ export class GitStore {
   }
 
   getMeta(key: string): string | null {
+    this.assertOpen();
     const rows = this.sql
       .exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", key)
       .toArray();
@@ -532,6 +556,7 @@ export class GitStore {
   }
 
   setMeta(key: string, value: string): void {
+    this.assertOpen();
     this.sql.exec(
       "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       key,
@@ -545,11 +570,13 @@ export class GitStore {
    * check. (Tag TIPS additionally cache on their refs row — peeledRefTarget.)
    */
   getPeeled(oid: string): string | null {
+    this.assertOpen();
     const rows = this.sql.exec<{ target: string }>("SELECT target FROM peeled WHERE oid = ?", oid).toArray();
     return rows[0]?.target ?? null;
   }
 
   setPeeled(oid: string, target: string): void {
+    this.assertOpen();
     this.sql.exec("INSERT OR IGNORE INTO peeled (oid, target) VALUES (?, ?)", oid, target);
   }
 
@@ -559,6 +586,7 @@ export class GitStore {
    * commit oid is immutable, so no version check is needed for a hit.
    */
   getStatsCache(tipOid: string, period: string): string | null {
+    this.assertOpen();
     const rows = this.sql
       .exec<{ data: string }>("SELECT data FROM stats_cache WHERE tip_oid = ? AND period = ?", tipOid, period)
       .toArray();
@@ -566,6 +594,7 @@ export class GitStore {
   }
 
   setStatsCache(tipOid: string, period: string, data: string): void {
+    this.assertOpen();
     this.sql.exec(
       "INSERT OR REPLACE INTO stats_cache (tip_oid, period, data) VALUES (?, ?, ?)",
       tipOid,
@@ -660,6 +689,7 @@ export class GitStore {
   /** Size of the cached reachable set — the exact object count a warm full
    *  clone declares in its pack header. */
   reachableCount(): number {
+    this.assertOpen();
     return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM reachable").one().n;
   }
 
@@ -667,6 +697,7 @@ export class GitStore {
    *  stored delta ships as a ref-delta only when its base is also being sent,
    *  i.e. also reachable; otherwise that object is inflated whole. */
   reachableHas(oid: string): boolean {
+    this.assertOpen();
     return this.sql.exec("SELECT 1 FROM reachable WHERE oid = ? LIMIT 1", oid).toArray().length > 0;
   }
 
@@ -679,6 +710,7 @@ export class GitStore {
    * replacing the OidSet and parallel typed arrays the walk path builds.
    */
   reachablePackedAfter(afterPack: string, afterOffset: number, limit: number): PackedReachable[] {
+    this.assertOpen();
     return this.sql
       .exec<{
         oid: string;
@@ -716,6 +748,7 @@ export class GitStore {
   /** Reachable objects with no pack entry (loose), ordered by oid — streamed
    *  after every packed object so a warm full clone has a stable total order. */
   reachableLooseAfter(afterOid: string, limit: number): string[] {
+    this.assertOpen();
     return this.sql
       .exec<{ oid: string }>(
         `SELECT r.oid FROM reachable r
