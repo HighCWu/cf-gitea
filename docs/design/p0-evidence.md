@@ -776,3 +776,132 @@ earlier runs still carry token-shaped plaintexts (`git110.log`,
 `leak-repro/mint3.txt`) — every one corresponds to a PAT row already
 deleted (whole-table count 1, the standing admin PAT), so all are dead
 credentials, but their owning sessions should shred them.
+
+## Redeploy verification — 2026-10-25 18:15+18:38 UTC (02:15+02:38 CST Oct 26), same-deployment-state block
+
+Deploy shipped in TWO versions in one window: **v1 `c190f3fe-011b-4786-8c73-18f4e8ba9976`**
+(tree `a5506d2` + one in-tree gate fix, below) and — after the secrets-variables REG
+commit `9f92950` (declared 362→385) landed mid-window — the final
+**v2 `193cecc7-2b58-475a-9e90-0b28773b2159`** (tree `9f92950`, clean) on
+https://cf-gitea.hecongw.workers.dev. Content shipped: the registry series
+(create+mutation halves — API-created repos now reach the engine registry), API
+inventory batches 1/2/4/5/11 (tokens/times/GPG-verify, hooks-scopes, avatars,
+deploy-keys + migration 0020, admin-degenerate; plus batch 3 secrets/variables +
+migration 0021 via the sibling wave `a5506d2` and its REG `9f92950`), UI waves
+16-20, org-labels union, API delete protection. Assets rebuilt: **784 files,
+13.9 MB** (same pin `fc4936884584`).
+
+Sibling-wave log (secrets batch, per the window protocol): tree clean at
+`a01c464` at window open; the wave materialized uncommitted at 01:56-01:59 CST
+(migration `0021_hesitant_thanos` = `secrets` + `action_variables`, service +
+routes + a 692-line test), ran its own full vitest 02:08-02:11, and landed as
+`a5506d2` 02:12:42 — I held the deploy until it settled and shipped WITH it.
+Its REG follow-on `9f92950` (router wiring only) landed 02:14:31, AFTER v1;
+since the brief's intent was to ship the batch end-to-end, I re-gated, rebuilt
+and redeployed as v2. v2 is the live version; every probe below was run
+against v1 AND (where marked) re-run against v2.
+
+Gate incident, recorded for the landing review: at clean `a01c464` the
+typecheck gate FAILED — `src/api/router.ts(199): TS2554 Expected 3 arguments,
+but got 2`: commit 76e8ca4 registered `registerAdminOrgExtrasRoutes(app,
+requireAuth)` but the module (bfccc02) takes required `optionalAuth` (used by
+the repo signing-key routes, admin-org-extras.ts:335-336; its own test calls
+with 3 args). `vite build` does not typecheck, so this would have shipped
+`middleware: [undefined]` on GET /repos/{owner}/{repo}/signing-key.gpg|.pub. I
+(DEPLOY, owner of p0-evidence.md only) applied the obvious one-liner
+(`..., requireAuth, optionalAuth`) in-tree to pass the gate — OUTSIDE my file
+ownership, flagged; the orchestrator folded it into `9f92950` (verified in its
+diff), so nothing of mine remains uncommitted.
+
+Remote migrations immediately before v1: **0020_mute_nocturne** (deploy_keys +
+`gitea:deploy-key` system principal id -3, verified seeded) and — after the
+sibling landed — **0021_hesitant_thanos** (secrets, action_variables) before
+v2. Ledger verified **22/22 applied**; `deploy_keys`, `secrets`,
+`action_variables` all present in sqlite_master.
+
+Deploy gates — at `a01c464`+fix: `pnpm typecheck` **0 errors** (after the
+one-liner); `check-openapi` **PASS** (declared **362** ops/230 paths ⊆ contract
+554 ops/350 paths, tier-1 **78/78 paths, 129/129 ops**); `check-contract`
+**PASS** (sha256 `529a3314…`); `vitest run --maxWorkers=8`: **2775 passed |
+5 skipped (2780)**, zero failures. At `9f92950`: typecheck **0 errors**;
+check-openapi **PASS** (declared **385** ops/241 paths, tier-1 78/78);
+check-contract **PASS**; vitest: run of record **2803 passed | 5 skipped
+(2808), 0 failed**; two sibling runs each hit ONE timeout flake —
+`src/invariants/invariants.test.ts > injected violations > deleting a
+never-advertised ancestor's pack` (5000 ms test timeout under 8-way worker
+saturation, no assertion failure); the file passes **17/17 solo** — load-flake
+in a git-engine invariant test, unrelated to the router wiring; worth a
+testTimeout bump next time the file is touched.
+
+`pnpm smoke` equivalent (deploy-smoke.mjs, fresh mint-per-run PAT via 0600
+temp file, `--user p0probe`): v1 — two consecutive passes, first with
+`--migrate-check`: **6 pass / 0 fail / 1 skip**, `ok: true`. Verbatim key
+lines: `[pass] healthz — {"ok":true}`; `[pass] anon-git-surface —
+probe-143c4e14/probe-7e406d29.git: git-upload-pack 404 not-found,
+git-receive-pack 401 Basic challenge`; `[pass] receive-advert — advert ok
+(165 bytes)`; `[pass] push-lsremote — pushed 731181ca35…, authed ls-remote
+sees refs/heads/main, anonymous advert 401 Basic challenge`; `[pass] cleanup —
+repo p0probe/smoke-aa0cf48e deleted`; `[pass] migrate-check — all 19 expected
+tables present (+36 system/aux … deploy_keys, action_variables, secrets)` (an
+earlier same-version invocation: pushed 5fa265680a…, cleanup `smoke-edf967d2
+deleted`). v2 — one pass **6/0/1**: pushed b616d2f807…, cleanup
+`smoke-bd596495 deleted`, same migrate-check detail.
+
+P0 probes re-run against BOTH versions (auth via `http.extraHeader`; results
+**unchanged** vs all prior tables — v2 numbers shown, v1 identical):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1`; `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean |
+
+`p0probe/p0-shallow` remains live intentionally; anonymous GET answers **404**
+and anonymous `info/refs` answers **401 Basic challenge** (`www-authenticate:
+Basic realm="Gitea"`), re-verified this run on v2.
+
+**Registry-fix production probe (the batch's headline).** v1: `POST
+/api/v1/user/repos` `{"private":false,"auto_init":true}` → **201** in 3.3 s
+(`p0probe/regprobe-60d4d503`, default `main` @ `f218d9a8`); **IMMEDIATELY**
+anonymous `git ls-remote` → **exit 0, lists HEAD + refs/heads/main** — **THE
+FIX VERIFIED** (pre-fix this 404'd until a push). Re-verified on v2:
+`regprobe2-…` → 201 in 2.9 s → immediate anonymous listing (`14863f14` HEAD +
+main) → DELETE **204** → GET **404**. **OPEN ISSUE (rename/mutation half —
+PARTIAL, new): the refs do not follow a rename.** v1: PATCH rename → **200**
+(`…-r2`); immediate anonymous ls-remote on the NEW url → **exit 0 but EMPTY
+advert** (`capabilities^{}` only), persisting minutes; API `/branches` → `[]`
+while `default_branch` still `"main"`; a heal push lands (`refs/heads/heal`)
+and lists ONLY that ref — fresh cell, auto-init `main` NOT carried. Secondary
+finding, scoped: after API DELETE (204; API/page 404; old-name git path
+correctly `repository not found`; D1 row gone) the RENAMED path's registry
+entry kept serving `refs/heads/heal` **anonymously for 48 s+ (read-after-delete
+stale cell)** — non-renamed deleted repos (both v1 smoke repos) answer
+`repository not found`, so this is specific to the rename-created registry
+entry. Benign for this public probe; a renamed-then-deleted PRIVATE repo would
+keep serving its refs — P1 for the registry-series owner. Also noted: the
+engine-level `DELETE /{owner}/{repo}` (no /api/v1; the smoke harness's cleanup
+path) returned 404 "not found" for the renamed repo while `/api/v1` DELETE
+worked — same stale-entry suspicion. Suggested next-wave fix: make the rename
+half re-point (not re-create) the registry entry / migrate the cell, and tie
+entry lifetime to the repositories row (delete must drop every entry for the
+repo id, including rename aliases).
+
+Cleanup proof (API-verified + remote D1): registry probe repo DELETE → **204**,
+GET-after **404** (both names), page **404**; smoke repos deleted by the
+harness (3 across the window); `repositories WHERE owner_namespace='p0probe'`
+= **1** (`p0-shallow`, intentionally live), `regprobe%`/`smoke-%` = **0**;
+`repo_redirects` total = **0**. Per-run credentials: PAT `cfg_006a63bc` and PAT
+`cfg_2442e3a0` each DELETEd by prefix+user (changes = 1 each);
+`personal_access_tokens` joined to p0probe = **0 rows**; whole-table count =
+**1** (the standing `admin` bootstrap PAT `cfg_23077afd`, pre-existing).
+Credential temp files (2× 0600 PAT files + both scratch dirs, including
+credentialed-URL `.git/config` files inside probe clones) shredded and
+removed; `ls` after = no matches.
+
+Environment footnote (recorded honestly): a ~60 s window of local
+SNI-reset/TLS interference (workers.dev resolving to non-Cloudflare IPs,
+`SSL_ERROR_SYSCALL`, HTTP 000) interrupted the v1 rename probe mid-flight;
+production was unaffected (healthz 200 immediately on recovery) and the
+affected verifications were re-run to completion after recovery. One probe
+command's first push failed on a shell quoting bug (literal quotes in the
+URL → `remote: not found`); re-run with a clean URL — no production effect.
