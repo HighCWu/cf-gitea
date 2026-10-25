@@ -115,6 +115,11 @@
  * - Reactions, context menus, attachments, content history and the rest of
  *   the comment-header chrome are write actions or signed-in JS features
  *   (§2.5) — not rendered.
+ * - Wave-11 (the review interactions, pages/pull-reviews.tsx): the sidebar
+ *   leads with the Reviewers section for PRs (sidebar.tmpl:5-9), the
+ *   comment form gains the review verdict form below it, and the two POST
+ *   re-render paths thread the same data — see that module's header for the
+ *   full contract.
  *
  * Bodies render through the SHARED markdown pipeline (§3.4 —
  * src/api/services/markdown.ts in upstream's `comment` mode): relative links
@@ -144,6 +149,12 @@ import { IssueAlreadyChangedError, IssueError } from "../../issues/errors";
 import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
 import { TimeSince } from "../components/file-list";
 import { userLink } from "../links";
+import {
+  loadPullReviewEntries,
+  ReviewFormBlock,
+  ReviewersSidebar,
+  type PullReviewEntry,
+} from "./pull-reviews";
 import { LabelBadge } from "./issues-list";
 import { canAdminRepo } from "./settings";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -227,6 +238,9 @@ export interface IssueDetailData {
   /** The description through the §3.4 pipeline; `""` = no-content variant. */
   bodyHtml: string;
   timeline: TimelineEntry[];
+  /** Wave-11: the visible review rows (PRs only — the sidebar Reviewers
+   *  section; the pending-privacy filter applied per the viewer). */
+  reviews: PullReviewEntry[];
 }
 
 /**
@@ -260,6 +274,9 @@ function unixSeconds(date: Date): number {
  * Load one issue/PR with its render inputs. Returns `null` when the index
  * misses (the caller 404-shells) — the row is otherwise rendered as-is,
  * whatever its family; the caller owns the upstream type/URL redirect.
+ * Wave-11: the viewer drives the review-row privacy filter (PENDING rows
+ * are visible to their reviewer and site admins only — the landed list
+ * arm's filter), so a PR's `reviews` load rides the same call.
  */
 export async function loadIssueDetailData(
   d1: D1Database,
@@ -267,12 +284,14 @@ export async function loadIssueDetailData(
   urlKind: "issues" | "pulls",
   index: number,
   origin: string,
+  viewer: Viewer,
 ): Promise<IssueDetailData | null> {
   const issue = await findIssueByRepoAndIndex(d1, repo.id, index);
   if (issue === null) return null;
 
   const pr = issue.isPull ? ((await findPullRequestByIndex(d1, repo.id, index))?.pullRequest ?? null) : null;
   const mergeable = pr === null ? null : mergeableOfRow(pr);
+  const reviews = pr === null ? [] : await loadPullReviewEntries(d1, issue.id, viewer);
 
   const [labels, timelineRows, milestoneRow] = await Promise.all([
     issueLabelRows(d1, issue.id),
@@ -329,6 +348,7 @@ export async function loadIssueDetailData(
     issue,
     pr,
     mergeable,
+    reviews,
     labels,
     milestone: milestoneRow,
     posterName: nameOf(issue.posterId),
@@ -371,6 +391,14 @@ export interface IssueDetailAccess {
    *  settings predicate); `null` = not an admin, the sidebar renders
    *  display-only exactly as before wave 5. */
   labelOptions: LabelRow[] | null;
+  /** Wave-11: `CanDoerChangeReviewRequests` (the landed
+   *  pull-reviews.ts:388-396 port) — gates the Reviewers section's
+   *  request-review control. */
+  canChangeReviewRequests: boolean;
+  /** Wave-11: the repo-admin half of upstream `CanBeDismissed`
+   *  (issue_page_meta.go:477-478 — `canAdminRepo`, the settings predicate,
+   *  stands in for `ctx.Repo.Permission.IsAdmin()`). */
+  canDismissReviews: boolean;
 }
 
 /** Resolve both grants in one place (the settings gate's order: anonymous
@@ -381,7 +409,9 @@ export async function resolveIssueDetailAccess(
   viewer: Viewer,
   issue: IssueRow,
 ): Promise<IssueDetailAccess> {
-  if (viewer.kind === "anonymous") return { canChangeState: false, labelOptions: null };
+  if (viewer.kind === "anonymous") {
+    return { canChangeState: false, labelOptions: null, canChangeReviewRequests: false, canDismissReviews: false };
+  }
   const isOwner = repo.ownerNamespace.toLowerCase() === viewer.username.toLowerCase();
   const collabMode: "none" | "read" | "write" | "admin" = isOwner
     ? "admin" // the owner outranks any collaborator row (canAdminRepo's owner line)
@@ -390,7 +420,12 @@ export async function resolveIssueDetailAccess(
     viewer.isAdmin || isOwner || issue.posterId === viewer.id || collabMode === "write" || collabMode === "admin";
   const admin = await canAdminRepo(d1, repo, viewer);
   const labelOptions = admin ? (await listRepoLabels(d1, repo.id, "", 1, ISSUE_DETAIL_PICKER_LIMIT)).items : null;
-  return { canChangeState, labelOptions };
+  // Wave-11: the request predicate (pull-reviews.ts:388-396) — poster /
+  // site admin / repo owner / collaborator, never on an archived repo.
+  const canChangeReviewRequests =
+    !repo.isArchived &&
+    (viewer.isAdmin || isOwner || issue.posterId === viewer.id || collabMode !== "none");
+  return { canChangeState, labelOptions, canChangeReviewRequests, canDismissReviews: admin };
 }
 
 /** The parsed `application/x-www-form-urlencoded` comment POST (`content`
@@ -850,24 +885,49 @@ function PullMergeBox(props: { data: IssueDetailData }) {
   );
 }
 
-/** The reduced sidebar (`view_content/sidebar.tmpl`): the labels list
- *  (badges linking into the live list filters) and the milestone (plain
- *  text — `/milestone/{id}` is a dead page). Wave 5: an admin viewer gets
- *  the no-JS label edit form above the badge list (the two-control
- *  reduction of sidebar/label_list.tmpl's JS dropdown — the upstream
- *  `issue_ids`/`label_ids` field names); everyone sees the badges
- *  re-rendered with ContrastColor as before. */
+/** The reduced sidebar (`view_content/sidebar.tmpl`): PRs lead with the
+ *  wave-11 Reviewers section (sidebar.tmpl:5-9 mounts reviewer_list first
+ *  for is_pull rows), then the labels list (badges linking into the live
+ *  list filters) and the milestone (plain text — `/milestone/{id}` is a dead
+ *  page). Wave 5: an admin viewer gets the no-JS label edit form above the
+ *  badge list (the two-control reduction of sidebar/label_list.tmpl's JS
+ *  dropdown — the upstream `issue_ids`/`label_ids` field names); everyone
+ *  sees the badges re-rendered with ContrastColor as before. */
 function IssueSidebar(props: {
   repoLink: string;
   data: IssueDetailData;
+  /** The resolved repo row (the Reviewers section's archived gate). */
+  repo: RepoRow;
   /** Repo labels for the edit form; `null` = display-only (non-admin). */
   labelOptions: LabelRow[] | null;
+  /** Wave-11 grants (the Reviewers section's control + dismiss forms). */
+  viewer: Viewer;
+  canChangeReviewRequests: boolean;
+  canDismissReviews: boolean;
+  /** The re-rendered request-review failure (null = pristine GET). */
+  reviewersError: string | null;
 }) {
-  const { labels, milestone, issue } = props.data;
+  const { labels, milestone, issue, pr } = props.data;
   const listBase = `${props.repoLink}/${issue.isPull ? "pulls" : "issues"}`;
   const selectedIds = new Set(labels.map((label) => label.id));
   return (
     <div class="issue-content-right ui segment">
+      {issue.isPull ? (
+        <>
+          <ReviewersSidebar
+            repoLink={props.repoLink}
+            issue={issue}
+            pr={pr}
+            repo={props.repo}
+            viewer={props.viewer}
+            entries={props.data.reviews}
+            canDoerChange={props.canChangeReviewRequests}
+            canDismiss={props.canDismissReviews}
+            error={props.reviewersError}
+          />
+          <div class="divider" />
+        </>
+      ) : null}
       <div class="issue-sidebar-combo" data-selection-mode="multiple" data-update-algo="diff">
         <div class="fixed-text muted">
           <strong>{issueDetailLocale.labels}</strong>
@@ -1028,19 +1088,24 @@ function CommentFormBlock(props: {
  *  pure-TS router module, so the JSX invocation lives beside the component).
  *  `access`/`form` come from the router (the GET handler resolves the
  *  viewer's grants; the POST handlers re-render with the error + kept
- *  submission); omitted = the anonymous pristine GET shape. */
+ *  submission); omitted = the anonymous pristine GET shape. Wave-11 adds
+ *  the review form's state and the Reviewers section's error channel. */
 export function renderIssueDetailPage(
   ctx: UiContext,
   data: IssueDetailData,
   access?: IssueDetailAccess,
   form?: { content: string; error: string | null },
+  reviewForm?: { content: string; error: string | null },
+  reviewersError?: string | null,
 ): string {
   return renderPage(
     <IssueDetailPage
       ctx={ctx}
       data={data}
-      access={access ?? { canChangeState: false, labelOptions: null }}
+      access={access ?? { canChangeState: false, labelOptions: null, canChangeReviewRequests: false, canDismissReviews: false }}
       form={form ?? { content: "", error: null }}
+      reviewForm={reviewForm ?? { content: "", error: null }}
+      reviewersError={reviewersError ?? null}
     />,
   );
 }
@@ -1052,6 +1117,10 @@ export function IssueDetailPage(props: {
   data: IssueDetailData;
   access: IssueDetailAccess;
   form: { content: string; error: string | null };
+  /** Wave-11: the verdict form's kept draft + failure message. */
+  reviewForm: { content: string; error: string | null };
+  /** Wave-11: the Reviewers section's request-arm failure message. */
+  reviewersError: string | null;
 }) {
   const { ctx, data } = props;
   const repo = ctx.repo;
@@ -1060,6 +1129,10 @@ export function IssueDetailPage(props: {
   const showMergeBox = data.pr !== null && !data.issue.isClosed && !data.pr.hasMerged;
   const showForm =
     ctx.viewer.kind === "user" && !repo.isArchived && (!data.issue.isLocked || props.access.canChangeState);
+  // Wave-11: the review verdict form — signed-in, non-archived PRs only
+  // (the header's auth posture; upstream's diff-page combobox reduced).
+  const showReviewForm =
+    data.issue.isPull && data.pr !== null && ctx.viewer.kind === "user" && !repo.isArchived;
   return (
     <BaseLayout
       ctx={ctx}
@@ -1088,9 +1161,26 @@ export function IssueDetailPage(props: {
               {showForm || ctx.viewer.kind === "anonymous" ? (
                 <CommentFormBlock ctx={ctx} repoLink={repoLink} data={data} access={props.access} form={props.form} />
               ) : null}
+              {showReviewForm ? (
+                <ReviewFormBlock
+                  repoLink={repoLink}
+                  issue={data.issue}
+                  isPoster={ctx.viewer.kind === "user" && data.issue.posterId === ctx.viewer.id}
+                  form={props.reviewForm}
+                />
+              ) : null}
             </div>
           </div>
-          <IssueSidebar repoLink={repoLink} data={data} labelOptions={props.access.labelOptions} />
+          <IssueSidebar
+            repoLink={repoLink}
+            data={data}
+            repo={repo}
+            labelOptions={props.access.labelOptions}
+            viewer={ctx.viewer}
+            canChangeReviewRequests={props.access.canChangeReviewRequests}
+            canDismissReviews={props.access.canDismissReviews}
+            reviewersError={props.reviewersError}
+          />
         </div>
       </div>
     </BaseLayout>

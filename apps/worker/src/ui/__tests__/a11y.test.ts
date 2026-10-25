@@ -28,6 +28,7 @@ import orgHomeEmptyGolden from "./goldens/org-home-empty.html?raw";
 import orgHomeGolden from "./goldens/org-home.html?raw";
 import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
+import pullReviewSignedInGolden from "./goldens/pull-review-signed-in.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
 import settingsMirrorGolden from "./goldens/settings-mirror.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
@@ -44,6 +45,7 @@ const goldens: Record<string, string> = {
   "pulls-open.html": pullsOpenGolden,
   "issue-detail.html": issueDetailGolden,
   "pull-detail.html": pullDetailGolden,
+  "pull-review-signed-in.html": pullReviewSignedInGolden,
   "pull-files.html": pullFilesGolden,
   "org-home.html": orgHomeGolden,
   "org-home-empty.html": orgHomeEmptyGolden,

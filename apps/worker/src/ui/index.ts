@@ -128,6 +128,24 @@
  *                                          admin viewer only; the Synchronize
  *                                          Now POST enqueues the landed
  *                                          mirror-sync message)
+ *   /:owner/:repo/pulls/{index}/files/reviews/submit  review verdict write,
+ *                                          POST (pages/pull-reviews.tsx —
+ *                                          wave 11; upstream web.go:1678
+ *                                          SubmitReview; success 303s onto
+ *                                          the PR page's #issuecomment
+ *                                          anchor; anonymous 303s onto
+ *                                          /login; GET → 405)
+ *   /:owner/:repo/issues/request_review     review request add/detach, POST
+ *                                          (pages/pull-reviews.tsx — wave
+ *                                          11; upstream web.go:1435
+ *                                          UpdatePullReviewRequest; the
+ *                                          issue/reviewer ids ride the
+ *                                          form; GET → 405)
+ *   /:owner/:repo/issues/dismiss_review     review dismiss, POST
+ *                                          (pages/pull-reviews.tsx — wave
+ *                                          11; upstream web.go:1436
+ *                                          DismissReview, admin only;
+ *                                          GET → 405)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -212,6 +230,16 @@ import {
   resolveIssueDetailAccess,
 } from "./pages/issue-detail";
 import {
+  changeReviewRequestFromForm,
+  dismissReviewFromForm,
+  parseDismissReviewForm,
+  parseReviewRequestForm,
+  parseReviewSubmitForm,
+  PullReviewError,
+  pullReviewErrorMessage,
+  submitReviewFromForm,
+} from "./pages/pull-reviews";
+import {
   countUnreadNotifications,
   loadNotificationsData,
   markNotificationThread,
@@ -265,6 +293,7 @@ import {
 } from "./pages/settings";
 import { findIssueByRepoAndIndex } from "../api/services/issues";
 import { findPullRequestByIndex } from "../api/services/pulls";
+import { findRepositoryById } from "../api/services/repository";
 import { IssuesService } from "../issues/service";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
@@ -377,6 +406,20 @@ export interface PullFilesRoute {
   owner: string;
   repo: string;
   index: number;
+}
+
+/** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
+ *  three web POSTs — the verdict form's
+ *  `/pulls/{index}/files/reviews/submit` (web.go:1678, the index rides the
+ *  URL) and the repo-scoped `/issues/request_review` + `/issues/
+ *  dismiss_review` (web.go:1435-1436, the issue/review ids ride the form —
+ *  exactly upstream's field-carried shapes). POST-only. */
+export interface PullReviewRoute {
+  family: "pull-review-submit" | "issue-request-review" | "issue-dismiss-review";
+  owner: string;
+  repo: string;
+  /** The PR index (the submit family only). */
+  index?: number;
 }
 
 /** The wave-6 milestones list family (pages/milestones.tsx): upstream
@@ -492,6 +535,7 @@ export type ParsedUiRoute =
   | IssueCommentRoute
   | IssueLabelsRoute
   | PullFilesRoute
+  | PullReviewRoute
   | MilestonesRoute
   | MilestoneNewRoute
   | OwnerHomeRoute
@@ -607,6 +651,10 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (head === "issues" && rest[0] === "new") return { family: "issue-new", owner, repo };
       // Wave-5: the sidebar label-write POST (upstream data-update-url).
       if (head === "issues" && rest[0] === "labels") return { family: "issue-labels", owner, repo };
+      // Wave-11: the review-request + dismiss POSTs (web.go:1435-1436 —
+      // repo-scoped, the issue/review ids ride the form fields).
+      if (head === "issues" && rest[0] === "request_review") return { family: "issue-request-review", owner, repo };
+      if (head === "issues" && rest[0] === "dismiss_review") return { family: "issue-dismiss-review", owner, repo };
       if (/^-?\d+$/.test(rest[0] as string)) {
         return { family: "issue-detail", owner, repo, urlKind: head, index: Number.parseInt(rest[0] as string, 10) };
       }
@@ -618,6 +666,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       const index = Number.parseInt(rest[0] as string, 10);
       if (rest[1] === "comments") return { family: "issue-comment", owner, repo, urlKind: head, index };
       if (head === "pulls" && rest[1] === "files") return { family: "pull-files", owner, repo, index };
+    }
+    // Wave-11: the review verdict form POST (web.go:1678 — the
+    // /pulls/{index}/files/reviews group's /submit tail; the GET new_comment
+    // + POST comments code-comment siblings stay unclaimed, no landed UI).
+    if (
+      head === "pulls" &&
+      rest.length === 4 &&
+      /^-?\d+$/.test(rest[0] as string) &&
+      rest[1] === "files" &&
+      rest[2] === "reviews" &&
+      rest[3] === "submit"
+    ) {
+      return { family: "pull-review-submit", owner, repo, index: Number.parseInt(rest[0] as string, 10) };
     }
     return null;
   }
@@ -1524,7 +1585,7 @@ async function issueCommentSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
     return respond(new Response(null, { status: 303, headers: { location: canonicalPath } }));
   }
   // Re-render with the message and the kept draft (the new-issue convention).
-  const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin);
+  const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin, viewer);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderIssueDetailPage(ctx, data, access, { content: form.content, error: result.message }), 200));
 }
@@ -1558,10 +1619,182 @@ async function issueLabelsSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   if (result.outcome === "applied") {
     return respond(new Response(null, { status: 303, headers: { location: canonicalPath } }));
   }
-  const data = await loadIssueDetailData(c.env.DB, repo, issue.isPull ? "pulls" : "issues", issue.index, url.origin);
+  const data = await loadIssueDetailData(c.env.DB, repo, issue.isPull ? "pulls" : "issues", issue.index, url.origin, viewer);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   const access = await resolveIssueDetailAccess(c.env.DB, repo, viewer, issue);
   return respond(c.html(renderIssueDetailPage(ctx, data, access, { content: "", error: result.message }), 200));
+}
+
+/**
+ * POST /{owner}/{repo}/pulls/{index}/files/reviews/submit (pages/
+ * pull-reviews.tsx — upstream SubmitReview, routers/web/repo/pull_review.go
+ * :222-270 over the landed create-review arm's pipeline): the §2.8 Origin
+ * guard, the repo→viewer order, then the landed SubmitReview port — the
+ * verdict select maps approve/comment/reject onto the wire events, the
+ * poster's self-approval/self-rejection and the REQUEST_CHANGES body
+ * requirement 422 the same messages, the head tip resolves the absent
+ * commit, the CommentTypeReview system comment lands with the review, and
+ * the webhook family rides the write. Success 303s onto
+ * `pulls/{index}#issuecomment-{id}` (upstream JSONRedirect's
+ * `comm.HashTag()` target — CommentHashTag, comment.go:554-556); the
+ * re-render carries the message + kept draft (the login failure convention).
+ */
+async function pullReviewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "pull-review-submit" || route.index === undefined) return respond(await c.notFound());
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  // RepoMustNotBeArchived wraps upstream's reviews group (web.go:1677).
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404));
+
+  const issue = await findIssueByRepoAndIndex(c.env.DB, repo.id, route.index);
+  if (issue === null || !issue.isPull) return respond(c.html(renderNotFound(ctx), 404)); // upstream `if !issue.IsPull`
+  const joined = await findPullRequestByIndex(c.env.DB, repo.id, route.index);
+  if (joined === null) return respond(c.html(renderNotFound(ctx), 404));
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  const form = parseReviewSubmitForm(await readUrlEncodedForm(c.req.raw));
+  try {
+    const result = await submitReviewFromForm({
+      request: c,
+      origin: url.origin,
+      pair,
+      repo,
+      issue,
+      pr: joined.pullRequest,
+      doerId: viewer.id,
+      form,
+    });
+    return respond(
+      new Response(null, { status: 303, headers: { location: `${repoLink}/pulls/${issue.index}#issuecomment-${result.commentId}` } }),
+    );
+  } catch (error) {
+    const message = pullReviewErrorMessage(error);
+    if (message === null) throw error;
+    const data = await loadIssueDetailData(c.env.DB, repo, "pulls", route.index, url.origin, viewer);
+    if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+    const access = await resolveIssueDetailAccess(c.env.DB, repo, viewer, data.issue);
+    return respond(c.html(renderIssueDetailPage(ctx, data, access, undefined, { content: form.content, error: message }), 200));
+  }
+}
+
+/**
+ * POST /{owner}/{repo}/issues/request_review (pages/pull-reviews.tsx —
+ * upstream UpdatePullReviewRequest, routers/web/repo/pull_review.go:339
+ * over the landed request arms): the sameOriginGuard + repo→viewer order,
+ * the issue resolved from `issue_ids` (the labels-write pattern — upstream
+ * getActionIssues' field), then attach (the no-JS `reviewer` NAME through
+ * the landed resolver) or detach (upstream's numeric `id`). Success 303s
+ * onto the PR's canonical page (the link-action reload upstream's JS
+ * performs); failures re-render the PR detail page with the landed message
+ * under the Reviewers control (upstream flashes/403s — the re-render is the
+ * no-JS convention).
+ */
+async function pullReviewRequestSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-request-review") return respond(await c.notFound());
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived (web.go:1419-1421)
+
+  const form = parseReviewRequestForm(await readUrlEncodedForm(c.req.raw));
+  // The issue_ids selector scopes GLOBAL issue ids to THIS repo (upstream
+  // getActionIssues' repo check) — a foreign id or a non-PR 404-shells
+  // (upstream answers Status(403) for the non-PR arm; the shell hides it).
+  const issue = form.issueId === null ? null : await new IssuesService(c.env.DB).getIssueById(form.issueId);
+  if (issue === null || issue.repoId !== repo.id || !issue.isPull) return respond(c.html(renderNotFound(ctx), 404));
+  const joined = await findPullRequestByIndex(c.env.DB, repo.id, issue.index);
+  if (joined === null) return respond(c.html(renderNotFound(ctx), 404));
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+
+  const canonicalPath = `/${repo.ownerNamespace}/${repo.slug}/pulls/${issue.index}`;
+  try {
+    await changeReviewRequestFromForm({
+      request: c,
+      origin: url.origin,
+      pair,
+      repo,
+      issue,
+      pr: joined.pullRequest,
+      doerId: viewer.id,
+      form,
+    });
+    return respond(new Response(null, { status: 303, headers: { location: canonicalPath } }));
+  } catch (error) {
+    const message = pullReviewErrorMessage(error);
+    if (message === null) throw error;
+    const data = await loadIssueDetailData(c.env.DB, repo, "pulls", issue.index, url.origin, viewer);
+    if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+    const access = await resolveIssueDetailAccess(c.env.DB, repo, viewer, data.issue);
+    return respond(c.html(renderIssueDetailPage(ctx, data, access, undefined, undefined, message), 200));
+  }
+}
+
+/** The gate's plain-text error shape (the dismiss arm's non-form states —
+ *  upstream's own dismiss handler answers bare statuses, pull_review.go
+ *  :288-291). */
+function pullReviewStatusError(status: number, message: string): Response {
+  return new Response(`${message}\n`, {
+    status,
+    headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+/**
+ * POST /{owner}/{repo}/issues/dismiss_review (pages/pull-reviews.tsx —
+ * upstream DismissReview, routers/web/repo/pull_review.go:280-293 over the
+ * landed dismissal arm): the settings predicate stands in for reqRepoAdmin
+ * (web.go:1436 — non-admins 404-shell, the settingsGate posture), then the
+ * landed port (approve/reject rows only, closed/merged 403, the flag flip,
+ * the CommentTypeDismissReview comment). Success 303s onto
+ * `pulls/{index}#issuecomment-{id}` (upstream's redirect target).
+ */
+async function pullReviewDismissSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-dismiss-review") return respond(await c.notFound());
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (!(await canAdminRepo(c.env.DB, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404)); // reqRepoAdmin
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived (web.go:1436's group)
+
+  const form = parseDismissReviewForm(await readUrlEncodedForm(c.req.raw));
+  if (form.reviewId === null) return respond(c.html(renderNotFound(ctx), 404));
+  try {
+    const result = await dismissReviewFromForm({
+      request: c,
+      repoId: repo.id,
+      doerId: viewer.id,
+      reviewId: form.reviewId,
+      message: form.message,
+    });
+    return respond(
+      new Response(null, {
+        status: 303,
+        headers: { location: `/${repo.ownerNamespace}/${repo.slug}/pulls/${result.issueIndex}#issuecomment-${result.commentId}` },
+      }),
+    );
+  } catch (error) {
+    if (error instanceof PullReviewError) {
+      if (error.status === 404) return respond(c.html(renderNotFound(ctx), 404));
+      return respond(pullReviewStatusError(error.status, error.message));
+    }
+    throw error;
+  }
 }
 
 /**
@@ -1576,7 +1809,7 @@ async function issueLabelsSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
 async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { url, route, ctx, respond, repo } = resolved;
+  const { url, route, ctx, viewer, respond, repo } = resolved;
 
   // Wave-2 dispatch (render.tsx never sees these families). The redirect
   // and the list page run AFTER the same §2.5 repo resolution as the
@@ -1599,7 +1832,7 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   // an unknown index 404-shells with the repo context (§4.5).
   if (route.family === "issue-detail") {
     const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
-    const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin);
+    const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin, viewer);
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
     const redirect = crossFamilyRedirect(route.urlKind, repoLink, data.issue.index, data.issue.isPull);
     if (redirect !== null) return respond(new Response(null, { status: 303, headers: { location: redirect } }));
@@ -1677,6 +1910,13 @@ uiRouter.post("/:owner/:repo/issues/new", (c) => issueNewSubmit(c));
 // /issues/labels shape would otherwise be absorbed by issues/:index).
 uiRouter.post("/:owner/:repo/issues/labels", (c) => issueLabelsSubmit(c));
 uiRouter.get("/:owner/:repo/issues/labels", () => methodNotAllowed("POST"));
+// Wave-11 review-write literals — the SAME static-before-dynamic rule (the
+// wave-9 RegExpRouter note: a static registered after the dynamic :index
+// LOSES to it). POSTs run the §2.8 sameOriginGuard; GET answers chi's 405.
+uiRouter.post("/:owner/:repo/issues/request_review", (c) => pullReviewRequestSubmit(c));
+uiRouter.get("/:owner/:repo/issues/request_review", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/dismiss_review", (c) => pullReviewDismissSubmit(c));
+uiRouter.get("/:owner/:repo/issues/dismiss_review", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/issues/:index", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls/:index", (c) => uiPage(c));
@@ -1689,6 +1929,10 @@ uiRouter.post("/:owner/:repo/pulls/:index/comments", (c) => issueCommentSubmit(c
 uiRouter.get("/:owner/:repo/issues/:index/comments", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/pulls/:index/comments", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/pulls/:index/files", (c) => uiPage(c));
+// Wave-11 verdict-form family (the deeper 4-segment tail under /files — no
+// shorter POST/GET pattern can absorb it; the GET answers chi's 405).
+uiRouter.post("/:owner/:repo/pulls/:index/files/reviews/submit", (c) => pullReviewSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/files/reviews/submit", () => methodNotAllowed("POST"));
 // Wave-4 write families (parseUiRoute claims exactly these shapes; the
 // POSTs run the §2.8 sameOriginGuard first — session.ts's convention).
 uiRouter.get("/:owner/:repo/settings", (c) => settingsPage(c));

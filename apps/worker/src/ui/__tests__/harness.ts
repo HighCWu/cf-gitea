@@ -26,7 +26,7 @@ import { beforeAll } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { issues, repositories, repoMirrors, users } from "../../db/schema";
+import { issues, pullReviews, repositories, repoMirrors, users } from "../../db/schema";
 import { type UiManifest } from "../manifest";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import {
@@ -186,6 +186,11 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // the PR #4 (checking mergeability) through the same is_pull component.
   { file: "issue-detail.html", path: "/alice/golden/issues/1", status: 200 },
   { file: "pull-detail.html", path: "/alice/golden/pulls/4", status: 200 },
+  // PR review interactions (wave 11): the SIGNED-IN PR detail — alice is the
+  // poster, so the verdict form renders with the disabled approve/reject
+  // options, the request-review control renders (the poster's grant), and
+  // morgan's REQUEST + APPROVED rows render with the remove/dismiss forms.
+  { file: "pull-review-signed-in.html", path: "/alice/golden/pulls/4", status: 200, signedIn: true },
   // PR files diff view (wave 5): the PR #4 range diff (the seedGoldenPullDiff
   // fixture pushes docs-seed + refs/pull/4/head ahead of main).
   { file: "pull-files.html", path: "/alice/golden/pulls/4/files", status: 200 },
@@ -592,6 +597,38 @@ async function seedGoldenMirror(): Promise<void> {
   });
 }
 
+/**
+ * The wave-11 review fixtures for the PR-detail goldens: morgan carries a
+ * REQUEST row and an APPROVED row on alice/golden's PR (the sidebar
+ * Reviewers section renders them — one item per row, upstream's
+ * CurrentPullReviewers shape). Direct `pull_reviews` inserts (no comments,
+ * no counter changes — the timeline and tab counts stay byte-stable), every
+ * timestamp pinned to T0-derived values. Runs AFTER the org seed (morgan is
+ * the org owner's user row). Idempotent by the per-issue row presence.
+ */
+async function seedGoldenPullReviews(): Promise<void> {
+  const db = drizzle(env.DB);
+  const repo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "golden")))
+    .get();
+  const morgan = await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, "morgan")).get();
+  if (repo === undefined || morgan === undefined) throw new Error("golden review fixture rows missing");
+  const pr = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(and(eq(issues.repoId, repo.id), eq(issues.isPull, true)))
+    .get();
+  if (pr === undefined) throw new Error("golden PR row missing before review seeding");
+  const existing = await db.select({ id: pullReviews.id }).from(pullReviews).where(eq(pullReviews.issueId, pr.id)).all();
+  if (existing.length > 0) return;
+  await db.insert(pullReviews).values([
+    { type: 4, reviewerId: morgan.id, issueId: pr.id, content: "", official: false, createdAt: new Date((T0 + 55) * 1000), updatedAt: new Date((T0 + 55) * 1000) },
+    { type: 1, reviewerId: morgan.id, issueId: pr.id, content: "Seeded approval.", official: false, createdAt: new Date((T0 + 56) * 1000), updatedAt: new Date((T0 + 56) * 1000) },
+  ]);
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
@@ -630,6 +667,9 @@ export function setupGoldenFixtures(): void {
     await seedGoldenMilestones();
     await seedGoldenDashboard();
     await seedGoldenMirror();
+    // Wave-11: the PR-detail goldens' review rows (morgan requested +
+    // approved on golden's PR) — after the org seed that creates morgan.
+    await seedGoldenPullReviews();
     // Wave 7: the user-profile golden renders the shared/repo/list rows'
     // "Updated {TimeSince}" from `repositories.updated_at` — the issue and
     // milestone seeders above stamp it with wall-clock time (the counter-
