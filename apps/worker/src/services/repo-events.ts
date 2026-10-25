@@ -127,9 +127,9 @@ export async function emitRepoEvent(request: RepoEventRequest, emission: RepoEve
     request.env,
     emission,
     queue !== null && execCtx !== undefined
-      ? async (deliveryIds) => {
+      ? (deliveryIds) => {
           const batch = queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } })));
-          execCtx!.waitUntil(batch.then(undefined, (error: unknown) => {
+          execCtx.waitUntil(batch.then(undefined, (error: unknown) => {
             console.error(`[repo-events] delivery enqueue failed (${emission.eventType}): ${errorMessage(error)}`);
           }));
         }

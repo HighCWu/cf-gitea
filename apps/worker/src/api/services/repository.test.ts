@@ -155,7 +155,8 @@ describe("canViewRepositoryWithTeams — a team-granted member sees a private or
     expect(await canViewRepositoryWithTeams(env.DB, viewerFor(member), vault.repo)).toBe(true);
     // The anti-enumeration 404 every ungated route renders.
     expect(await canViewRepositoryWithTeams(env.DB, viewerFor(outsider), vault.repo)).toBe(false);
-    expect(await canViewRepository(viewerFor(outsider), vault.repo)).toBe(false);
+    // The sync two-arg shape (back-compat arm) returns boolean — no await.
+    expect(canViewRepository(viewerFor(outsider), vault.repo)).toBe(false);
   });
 
   it("covers via includes_all teams and via unit-collapsed teams (units_map write)", async () => {
