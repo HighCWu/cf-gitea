@@ -71,6 +71,42 @@ export const COMPARE_RULES = [
     acceptable: (rec) => rec.outcome === "shallow-ok" || rec.outcome === "clean-reject",
   },
   {
+    id: "deepen-family-strict-reject",
+    cases: ["deepen-strict-reject"],
+    fields: ["outcome", "commands.exits", "checks", "refs_local", "refs_remote", "shallow", "object_count", "commit_count"],
+    enforced: true,
+    rule: "The unsupported deepen-family modes (deepen-since / deepen-not / deepen-relative) are in " +
+      "the documented P0-stopgap transitional state (docs/design/m3-design-inputs.md Rounds 7-9, " +
+      "docs/design/p0-evidence.md): ours rejects them with a protocol-shaped ERR pkt-line (git exit 128, " +
+      "no repo dir, shallow boundary untouched) where a fully-implemented Gitea shallow-clones. BOTH " +
+      "shapes are acceptable — outcome clean-reject (the transitional reject) or shallow-ok (the " +
+      "implemented end-state; Round-8: rejection is transitional, never the goal). Any other terminal " +
+      "state — silent full clone, wrong subset, shallow-file mutation after a rejected deepen — is a " +
+      "VIOLATION on every side.",
+    acceptable: (rec) => rec.outcome === "clean-reject" || rec.outcome === "shallow-ok",
+  },
+  {
+    id: "push-family-ours-only",
+    cases: ["push-lifecycle", "push-tags-move", "push-atomic"],
+    fields: ["outcome", "commands.exits", "checks", "refs_local", "refs_remote", "shallow", "object_count", "commit_count"],
+    enforced: true,
+    rule: "The push family is validated against ours only this wave: the battery's optional theirs run " +
+      "is read-only, so a theirs-side record carries the note ours_only_skip and no commands. A side " +
+      "that actually runs the family must come out ok — any real failure is a VIOLATION on that side.",
+    acceptable: (rec) => (rec.notes?.ours_only_skip != null) || rec.outcome === "ok",
+  },
+  {
+    id: "capability-matrix-endpoint-specific",
+    cases: ["advert-capability-matrix"],
+    fields: ["outcome", "commands.exits", "checks", "refs_local", "refs_remote"],
+    enforced: false,
+    rule: "The capability-matrix dump is endpoint-descriptive by design (Round-8: test-generated, not " +
+      "hand-maintained): ours must never advertise filter (enforced inside the case for ours), while a " +
+      "real Gitea legitimately advertises it via stock git upload-pack; agent strings and capability " +
+      "sets differ legitimately. Divergences here DOCUMENT the matrix — they are not protocol regressions.",
+    acceptable: () => true,
+  },
+  {
     id: "head-default-branch-info",
     cases: "*",
     fields: ["head_ref"],
