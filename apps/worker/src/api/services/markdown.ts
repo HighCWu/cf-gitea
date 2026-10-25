@@ -1,4 +1,7 @@
-import MarkdownIt, { type Token } from "markdown-it";
+import MarkdownIt from "markdown-it";
+// markdown-it 15 bundles its own types: the default export is the callable
+// constructor VALUE; the instance TYPE is a separate named export.
+import type { MarkdownIt as MarkdownItInstance, Token } from "markdown-it";
 
 import { ApiError } from "../errors";
 
@@ -174,7 +177,7 @@ function anchorWrapsImage(tokens: Token[], idx: number): boolean {
 /** Build a renderer for one request — per-call instances keep the rewrite
  * policy out of module state (AGENTS Workers rule: no mutable request state
  * at module level). */
-function createRenderer(policy: RewritePolicy | null): MarkdownIt {
+function createRenderer(policy: RewritePolicy | null): MarkdownItInstance {
   const md = new MarkdownIt({ html: false, linkify: true, typographer: false });
 
   md.core.ruler.push("cf_gitea_heading_anchor", (state) => {
@@ -195,7 +198,7 @@ function createRenderer(policy: RewritePolicy | null): MarkdownIt {
   md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
     const token: Token | undefined = tokens[idx];
     if (token !== undefined) {
-      const href = token.attrGet("href") ?? "";
+      const href = String(token.attrGet("href") ?? "");
       if (policy !== null && isRelativeTarget(href)) {
         token.attrSet("href", resolveRelativeTarget(href, policy.linkBase));
       }
@@ -215,7 +218,7 @@ function createRenderer(policy: RewritePolicy | null): MarkdownIt {
   md.renderer.rules.image = (tokens, idx, options, env, self) => {
     const token: Token | undefined = tokens[idx];
     if (token !== undefined) {
-      const src = token.attrGet("src") ?? "";
+      const src = String(token.attrGet("src") ?? "");
       if (policy !== null && isRelativeTarget(src)) {
         token.attrSet("src", resolveRelativeTarget(src, policy.imageBase));
       }

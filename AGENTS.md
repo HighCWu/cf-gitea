@@ -62,12 +62,19 @@ scripts/               # Repo-level tooling (contract checks, codegen)
 - Intentional holds (record any new one here with its reason):
   - `pako ^2` — the vendored engine is written against the pako 2 API; pako 3 would
     force source edits (revisit at the M2 adaptation).
+  - `@types/pako ^2` — latest 3.0.0 is a deprecated stub ("pako provides its own
+    type definitions" — pako 3 only); moves with the pako hold, stays 2.0.4.
   - `typescript ~6.0.3` — typescript-eslint peer range caps at `<6.1.0`; bump with it.
   - `compatibility_date 2026-10-19` — newest date the pinned workerd/miniflare
     supports; raise it together with wrangler updates (see wrangler.jsonc comment).
   - `@cloudflare/workers-types ^5.20261025.1` — daily-types package kept at latest
     stable; each fresh version is younger than pnpm's release-age gate, so the
     upgrade adds a `minimumReleaseAgeExclude` entry to pnpm-workspace.yaml.
+- pnpm 12 enforces a default release-age gate (`minimumReleaseAge`, unset in
+  config) — a just-published version resolves as "already up to date" and a
+  lockfile carrying it FAILS plain `pnpm install` (observed 2026-10-25: hono
+  4.13.14, published that morning). Young upgrades simply wait; only packages
+  needing day-one freshness (workers-types above) get an exclude entry.
 - eslint lives at the ROOT only (flat config lints the whole repo); per-package lint
   scripts and eslint deps are forbidden.
 - pnpm is the only package manager; `pnpm-lock.yaml` is committed.

@@ -2,10 +2,11 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cf-gitea",
   "main": "src/index.ts",
-  // Newest date the current local runtime supports (AGENTS.md wants today's
-  // date; no published workerd supports 2026-10-24 yet). Bump to the current
-  // date together with `pnpm update wrangler` + `pnpm install`, then run
-  // `wrangler types`.
+  // Newest date the pinned local runtime supports (AGENTS.md wants today's
+  // date; re-verified 2026-10-25 — wrangler 4.152.0 still pairs miniflare
+  // 5.20261019.2-beta, the newest 5.x build, so no newer date is runnable).
+  // Bump to the current date together with `pnpm update wrangler` +
+  // `pnpm install`, then run `wrangler types`.
   "compatibility_date": "2026-10-19",
   "limits": {
     "cpu_ms": 300000
