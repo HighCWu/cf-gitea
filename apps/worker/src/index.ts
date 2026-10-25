@@ -89,7 +89,17 @@ export default {
     const isRepoScoped =
       segments.length >= 2 && segments[1] !== "" && segments[0] !== "api";
     if (isRepoScoped) {
-      if (req.method === "GET" && !pathname.endsWith("/") && handlesUiRoute(pathname)) {
+      // All methods for the UI's write families (new/edit/delete file,
+      // new-issue, comments, settings, milestones — waves 4-8 are POSTs on
+      // 3+-segment paths parseUiRoute owns; it never claims git-protocol
+      // routes). ONE carve-out: a bare two-segment DELETE is the engine
+      // admin wipe (the vendored e2e suite's repo-clearing channel and the
+      // D1-missing transitional population's only delete) — the gate's
+      // engine-path branch owns it (D1-resolved repos get the §2.5.5
+      // cascade there). The UI has no DELETE handlers, so the carve-out
+      // costs nothing. Trailing-slash rule keeps pre-UI ownership identical.
+      const engineAdminRootDelete = req.method === "DELETE" && segments.length === 2;
+      if (!engineAdminRootDelete && !pathname.endsWith("/") && handlesUiRoute(pathname)) {
         return app.fetch(req, env, ctx);
       }
       return gitHttpGate(req, env, ctx, gitHttp);
