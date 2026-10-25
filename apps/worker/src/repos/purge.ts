@@ -27,6 +27,7 @@
 
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
 import { handleImportTask, isImportMessage } from "./imports/pipeline";
+import { RepoNotExistError, RepoService, type RepoRow } from "./service";
 
 /** Queue message (REPO_TASKS): what the delete pipeline must purge.
  *  `storageKey` (r_<id>) names the R2 prefixes; `engineNames` is every
@@ -197,4 +198,44 @@ export async function purgeRepoMessage(env: Env, body: RepoPurgeMessage): Promis
       // registry rows heal via receivePack upserts; nothing to do
     }
   }
+}
+
+/**
+ * The engine-admin DELETE shape (`DELETE /{owner}/{repo}`) for a D1-RESOLVED
+ * repository, run through the sanctioned §2.5.5 pipeline instead of the
+ * engine's bare cell wipe.
+ *
+ * Production finding (2026-10-24, security-wave follow-up): the gate used to
+ * forward an authorized admin DELETE verbatim to the engine, whose handler
+ * (packages/git-engine src/repo.ts DELETE "/") wipes the cell's SQLite and the
+ * `repos/<storage_key>/` R2 prefix but knows nothing of D1 — the repositories
+ * row and its dependents (redirects, transfer, counters, …) survived as an
+ * orphan that still resolved, still gated every route, and pointed at dead
+ * storage (`imports/<storage_key>/` was never reclaimed, and the burnt
+ * UNIQUE(owner, slug) blocked re-creation). This helper is the fix's engine
+ * side: the SAME pipeline as the Worker API channel (src/api/routes/repo.ts
+ * repoDelete) — RepoService.deleteRepository's D1 cascade FIRST, then the
+ * tombstone, then the queue purge whose final destroy is the ONLY cell wipe —
+ * never a bare engine destroy. Callers (the gate's engine-path branch) must
+ * have already decided the request with the matrix WRITE rows; the D1-missing
+ * transitional population keeps the verbatim engine passthrough.
+ *
+ * The response is the engine's wire contract byte-for-byte (200, `deleted\n`)
+ * so engine-shape callers keep working unchanged — scripts/deploy-smoke.mjs
+ * checkCleanup asserts exactly this body.
+ */
+export async function deleteRepositoryViaEngineShape(env: Env, repo: RepoRow): Promise<Response> {
+  try {
+    await new RepoService(env.DB, {
+      registry: env.REGISTRY.getByName("registry"),
+      queue: env.REPO_TASKS,
+      tombstone: (engineName) => tombstoneRepoDO(env, engineName),
+    }).deleteRepository(repo.id);
+  } catch (error) {
+    if (!(error instanceof RepoNotExistError)) throw error;
+    // A concurrent delete won the race; the requested end state (the repo
+    // gone everywhere) already holds — idempotent-delete semantics, like the
+    // engine's own wipe.
+  }
+  return new Response("deleted\n");
 }

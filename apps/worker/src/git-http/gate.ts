@@ -86,6 +86,7 @@ import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
 import { handleLfsGateBranch, parseLfsRoute } from "../lfs/router";
 import { repoCounters, repoUnits, repositories } from "../db/schema";
+import { deleteRepositoryViaEngineShape } from "../repos/purge";
 import { RepoNameCollisionError, RepoService, lookupRedirect } from "../repos/service";
 
 /**
@@ -420,6 +421,16 @@ async function handleEnginePathBranch(
     unitAnonymousRead,
   });
   if (decision !== true) return decision;
+
+  // Admin DELETE of a D1-resolved repo runs the sanctioned §2.5.5 pipeline
+  // (D1 cascade → tombstone → REPO_TASKS; the consumer's destroy stays the
+  // only cell wipe) — never a bare engine destroy, which orphans the D1 row
+  // (the security wave's live-demonstrated finding). The engine's wire
+  // contract (200, "deleted\n") is preserved so engine-shape clients
+  // (deploy-smoke's cleanup) are unchanged.
+  if (route.kind === "admin" && req.method === "DELETE") {
+    return deleteRepositoryViaEngineShape(env, resolved.repo);
+  }
 
   return forwardToEngine(req, url, env, ctx, engine);
 }

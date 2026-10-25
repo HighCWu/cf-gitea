@@ -30,6 +30,16 @@
  * repos keep the engine verbatim there; page/unknown shapes stay passthrough
  * (the engine headless-404s them BEFORE its authorize hook); the LFS family
  * (SPEC-0006) keeps its own branch, realm and error shapes.
+ *
+ * The third wave under test (the orphaned-row finding): an ALLOWED admin
+ * DELETE of a D1-resolved repo must not reach the engine as a bare cell wipe
+ * — the engine (packages/git-engine src/repo.ts DELETE "/") knows nothing of
+ * D1, so the repositories row and its dependents survived as an orphan that
+ * still resolved and gated routes against dead storage. The allow tail runs
+ * the sanctioned §2.5.5 pipeline instead (src/repos/purge.ts
+ * deleteRepositoryViaEngineShape) and answers with the engine's wire
+ * contract; the D1-missing transitional population keeps the verbatim
+ * passthrough.
  */
 
 import { SELF, env } from "cloudflare:test";
@@ -40,10 +50,11 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { settleCreatingRepo } from "./gate";
-import { repositories } from "../db/schema";
+import { repoCounters, repoRedirects, repositories } from "../db/schema";
+import { purgeRepoMessage } from "../repos/purge";
 import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
-import { buildPack, buildReceivePackBody } from "../repos/testing/git-pack";
+import { ZERO_OID, buildPack, buildReceivePackBody } from "../repos/testing/git-pack";
 
 beforeAll(async () => {
   await applyAuthD1Migrations();
@@ -347,9 +358,117 @@ describe("engine admin shapes for D1-resolved repos take the matrix WRITE decisi
       body: JSON.stringify({ description: "engine mirror only; D1 stays the authority" }),
     });
     expect(allowed.status).toBe(200);
-    const echo = (await allowed.json()) as { description: string };
+    const echo = await allowed.json<{ description: string }>();
     expect(echo.description).toBe("engine mirror only; D1 stays the authority");
   });
+
+  it("403s an admin DELETE carrying a read-only scope (row 7) and leaves both stores intact", async () => {
+    await pushCreateAndSettle("admindeny");
+    const ownerId = await soleRepoOwnerId();
+    const readToken = (await mintFor(ownerId, "r", "read:repository")).plaintext;
+    const writeToken = (await mintFor(ownerId, "w2", "write:repository")).plaintext;
+
+    const wipe = await SELF.fetch("https://example.com/alice/admindeny", {
+      method: "DELETE",
+      headers: { authorization: basicTokenHeader(readToken) },
+    });
+    // Identity was established, the write scope was not: plain 403, never a
+    // challenge (§2.4 row 7) — and no cascade may run on a rejected shape.
+    expect(wipe.status).toBe(403);
+    expect(wipe.headers.get("www-authenticate")).toBeNull();
+
+    // Both stores intact: the D1 row still resolves and the engine still
+    // serves the repo's refs through the gate.
+    expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(1);
+    const refs = await SELF.fetch("https://example.com/alice/admindeny/api/refs", {
+      headers: { authorization: basicTokenHeader(writeToken) },
+    });
+    expect(refs.status).toBe(200);
+  });
+
+  it("deletes an authorized admin DELETE through the sanctioned pipeline: D1 cascade now, engine destroy only via the purge", async () => {
+    await pushCreateAndSettle("admincascade");
+    const svc = repoService();
+    const row = (await svc.getBySlug("alice", "admincascade"))!;
+    const ownerId = await soleRepoOwnerId();
+    // "w2": pushCreateAndSettle already minted a "w"-named token for this user.
+    const writeToken = (await mintFor(ownerId, "w2", "write:repository")).plaintext;
+    // Dependents the cascade must remove: a rename's redirect (the delete
+    // also tombstones/destroys the cell under the OLD name) and an
+    // imports/<storage_key>/ object — a prefix the engine's own DELETE shape
+    // never purges (packages/git-engine repo.ts purgePackCache covers only
+    // repos/<storage_key>/), i.e. exactly the bytes the old leak stranded.
+    await svc.rename(row.id, "admincascade2");
+    await env.REPO_PACKS.put(`imports/${row.storageKey}/chunk-0.pack`, new Uint8Array([4]));
+
+    const wipe = await SELF.fetch("https://example.com/alice/admincascade2", {
+      method: "DELETE",
+      headers: { authorization: basicTokenHeader(writeToken) },
+    });
+    // The engine's wire contract, byte-for-byte (scripts/deploy-smoke.mjs
+    // checkCleanup asserts 200 + "deleted") — the shape keeps working, it
+    // just stopped leaking.
+    expect(wipe.status).toBe(200);
+    expect(await wipe.text()).toBe("deleted\n");
+
+    // Step 1 landed synchronously: the row and its dependents are gone — no
+    // orphan resolves or gates routes anymore.
+    expect(await svc.get(row.id)).toBeNull();
+    expect(await drizzle(env.DB).select().from(repoCounters).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(repoRedirects).all()).toHaveLength(0);
+
+    // Steps 2-4 ran on the queue the gate scheduled; driven here exactly like
+    // src/repos/lifecycle.test.ts (the consumer is not wired in vitest, and
+    // every step is idempotent). The engine destroy happens ONLY here — never
+    // as a bare engine wipe inside the request.
+    const engineNames = ["alice/admincascade2", "alice/admincascade"];
+    await purgeRepoMessage(env, { storageKey: row.storageKey, engineNames });
+    expect((await env.REPO_PACKS.list({ prefix: `repos/${row.storageKey}/` })).objects).toHaveLength(0);
+    expect((await env.REPO_PACKS.list({ prefix: `imports/${row.storageKey}/` })).objects).toHaveLength(0);
+    const registry = env.REGISTRY.getByName("registry");
+    expect(await registry.get("alice/admincascade2")).toBeNull();
+    expect(await registry.get("alice/admincascade")).toBeNull();
+    // Destroy (not tombstone) is the terminal state: a revived cell accepts
+    // receives, so a same-name re-create starts clean (§4.8).
+    const revived = await env.REPO.getByName("alice/admincascade2").beginReceive({
+      commands: [{ ref: "refs/heads/main", old: ZERO_OID, next: ZERO_OID }],
+      capabilities: [],
+      packBytesHint: null,
+    });
+    expect(revived.tag).toBe("ok");
+  });
+
+  it.skipIf(!env.GIT_TOKEN)(
+    "keeps the engine's verbatim admin DELETE for a D1-missing (registry-only) repo",
+    async () => {
+      // The transitional population: engine Registry row only, no D1 row —
+      // the gate passes the shape through verbatim and the engine's own hook
+      // + wipe decide (a 200 proves the engine decided: the gate's matrix
+      // would have 401-challenged this non-D1 credential).
+      await env.REGISTRY.getByName("registry").upsert("demo/enginewipe", Date.now());
+      expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
+
+      const wipe = await SELF.fetch("https://example.com/demo/enginewipe", {
+        method: "DELETE",
+        headers: { authorization: basicHeader("x", env.GIT_TOKEN) },
+      });
+      expect(wipe.status).toBe(200);
+      expect(await wipe.text()).toBe("deleted\n");
+
+      // Nothing cascaded (there is no D1 row) and the engine behavior is
+      // unchanged — full ENGINE-side teardown exactly as before the fix: the
+      // wiped cell is gone from the registry too (the engine's dispatch
+      // removes the row after a successful DELETE, mod.ts), so the repo
+      // answers the engine's JSON not-found from here on.
+      expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
+      expect(await env.REGISTRY.getByName("registry").get("demo/enginewipe")).toBeNull();
+      const refs = await SELF.fetch("https://example.com/demo/enginewipe/api/refs");
+      expect(refs.status).toBe(404);
+      expect(JSON.parse(new TextDecoder().decode(await refs.arrayBuffer()))).toEqual({
+        error: "repository not found: demo/enginewipe",
+      });
+    },
+  );
 
   it("301s a renamed repo's old JSON API URL before any auth (row 13)", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
