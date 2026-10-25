@@ -34,15 +34,14 @@
  * 303 per services/context/base.go:157). Validation failures (empty title,
  * unknown label/milestone id — the service's IssueError) re-render the form
  * at 200 with the message and the submitted values preserved, exactly the
- * login page's failure convention.
+ * login page's failure convention. Success fans the SAME `issues` "opened"
+ * webhook out through the shared issue-family seam (services/issue-events.ts
+ * `emitSessionIssueOpened`) the API POST route runs — the wave-4 divergence
+ * (web-created issues invisible to hook subscribers) is closed; the emission
+ * is best-effort and never fails the write.
  *
  * ## Documented v1 degradations (data/services that have not landed, §6)
  *
- * - WEBHOOK FAN-OUT IS NOT EMITTED on this path yet: the tier-1 POST
- *   /repos/{o}/{r}/issues route emits the `issues` "opened" delivery through
- *   emitWebhookDeliveries with route-internal payload builders; extracting
- *   that helper behind a service is the data-layer owner's move. A
- *   web-created issue is invisible to hook subscribers until then.
  * - The combo markdown editor (shared/combomarkdowneditor + easymde) and the
  *   attachment dropzone reduce to a plain `<textarea>` — the editor toolbar
  *   is a client bundle feature and uploads are a write surface of their own.
@@ -70,6 +69,7 @@ import { IssueError } from "../../issues/errors";
 import type { IssueRow, LabelRow, MilestoneRow } from "../../issues/service";
 import { listRepoLabels } from "../../api/services/labels";
 import { listRepoMilestones } from "../../api/services/milestones";
+import { emitSessionIssueOpened, type IssueEventRequest } from "../../services/issue-events";
 import { readUrlEncodedForm } from "../forms";
 import { LabelBadge } from "./issues-list";
 import { BaseLayout, renderPage } from "../shell";
@@ -158,17 +158,29 @@ export type NewIssueSubmitResult =
   | { outcome: "created"; issue: IssueRow }
   | { outcome: "invalid"; message: string };
 
+/** The write's webhook-fan-out inputs, handed over by the POST handler (the
+ *  hono request source + the instance origin). Omitted → no emission (the
+ *  historical shape; every real caller passes it). */
+export interface NewIssueEmission {
+  request: IssueEventRequest;
+  origin: string;
+}
+
 /**
  * The write: validate the title, then the tier-1 service with the session
  * viewer as poster. A rejected label/milestone id surfaces as the service's
  * IssueError message (the API's 404 body text) re-rendered inline — never a
- * partial write (createIssue batches its statements).
+ * partial write (createIssue batches its statements). On success the SAME
+ * `issues` "opened" webhook the API POST route emits fans out through the
+ * shared seam (best-effort — a fan-out failure never fails the created
+ * issue, the emission function's own catch-and-log posture).
  */
 export async function createIssueFromForm(
   d1: D1Database,
   repoId: string,
   form: NewIssueForm,
   posterId: number,
+  emission?: NewIssueEmission,
 ): Promise<NewIssueSubmitResult> {
   if (form.title === "") return { outcome: "invalid", message: newIssueLocale.title_required };
   try {
@@ -180,6 +192,9 @@ export async function createIssueFromForm(
       milestoneId: form.milestoneId,
       labelIds: form.labelIds,
     });
+    if (emission !== undefined) {
+      await emitSessionIssueOpened({ request: emission.request, origin: emission.origin, repoId, issue, posterId });
+    }
     return { outcome: "created", issue };
   } catch (error) {
     if (error instanceof IssueError) return { outcome: "invalid", message: error.message };

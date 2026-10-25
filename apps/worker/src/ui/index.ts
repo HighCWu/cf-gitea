@@ -579,7 +579,9 @@ async function issueNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
     const data = await loadNewIssueData(c.env.DB, repo.id);
     return respond(c.html(renderNewIssuePage({ ctx, data, form, error: newIssueLocale.repo_archived }), 200));
   }
-  const result = await createIssueFromForm(c.env.DB, repo.id, form, viewer.id);
+  // The emission hook rides the write (services/issue-events.ts): the SAME
+  // issues "opened" fan-out the API POST route emits — the wave-4 divergence.
+  const result = await createIssueFromForm(c.env.DB, repo.id, form, viewer.id, { request: c, origin: ctx.origin });
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   if (result.outcome === "created") {
     return respond(new Response(null, { status: 303, headers: { location: `${repoLink}/issues/${result.issue.index}` } }));

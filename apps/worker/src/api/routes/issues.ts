@@ -5,12 +5,12 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
-import { issues } from "../../db/schema";
+import { issues, pullRequests } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssueError, IssueNotExistError, MilestoneNotExistError } from "../../issues/errors";
-import { IssuesService, type IssueRow } from "../../issues/service";
-import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
-import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
+import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
+import type { HookEventType } from "../../issues/webhooks";
+import { emitIssueEvent, issueEventIdentity, issueEventPayload, type IssueEventIdentity } from "../../services/issue-events";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import {
@@ -66,13 +66,13 @@ import {
   visibleRepoIds,
 } from "../services/issues";
 import { parseMilestoneDeadline } from "../services/milestones";
+import { toApiPullRequest } from "../services/pulls";
 import {
   apiRepositoryUrl,
   canViewRepository,
   findRepositoryById,
   findRepositoryByPath,
   repositoryPermissions,
-  toApiRepository,
   viewerOf,
   type RepositoryWithOwner,
 } from "../services/repository";
@@ -118,7 +118,9 @@ import {
  *
  * Webhook triggers (SPEC-0005 §3.5): issues opened (POST) / edited (title,
  * body) / closed+reopened (PATCH state) and issue_comment created (POST
- * comments), through emitWebhookDeliveries — see emitIssueWebhook.
+ * comments), through the SHARED issue-family seam emitIssueEvent
+ * (src/services/issue-events.ts) — the same fan-out the UI new-issue write
+ * path runs (issueEventIdentity below is that module's identity assembly).
  */
 
 const notFoundResponse = {
@@ -250,99 +252,85 @@ function canEditIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, posterId: 
 }
 
 // ---------------------------------------------------------------------------
-// Webhook triggers (SPEC-0005 §3.5) — the hooks.ts guard copied: the
-// delivery-row insert is the request-visible effect and runs INLINE after
-// the mutation committed (upstream CreateHookTask is synchronous too);
-// failures are logged, never propagated. The Queue producer ({deliveryId}
-// batch) hangs off the executionCtx-guarded waitUntil — real worker
-// invocations enqueue; in-process callers (tests via app.request) have no
-// executionCtx, skip the enqueue, and leave the rows `pending` (the durable
-// source of truth; the consumer's idempotent CAS makes a later enqueue a
-// safe replay).
+// Webhook triggers (SPEC-0005 §3.5) — the delivery mechanics live in the
+// SHARED issue-family seam (src/services/issue-events.ts, moved here verbatim
+// so the UI new-issue write path fans out identically); this module keeps
+// only the API-request identity assembly.
 // ---------------------------------------------------------------------------
 
-/** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired. */
-function webhookDeliveryQueue(
-  env: ApiEnv["Bindings"],
-): { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null {
-  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
-  if (candidate === undefined || candidate === null) return null;
-  const queue = candidate as { sendBatch?: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> };
-  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+/** Issue-event bundle: the webhook `repository` object + doer sender. */
+function issueEventContext(c: Context<ApiEnv>, found: RepositoryWithOwner): IssueEventIdentity {
+  return issueEventIdentity(viewerOf(c), found, c.get("authUser"));
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/** The single PR row of an issue (upstream `issue.LoadPullRequest`). */
+async function findPullRequestRowByIssueId(d1: D1Database, issueId: number): Promise<PullRequestRow | null> {
+  const rows = await drizzle(d1).select().from(pullRequests).where(eq(pullRequests.issueId, issueId)).limit(1).all();
+  return rows[0] ?? null;
 }
 
-/** Fire one issue-family webhook event. The delivery-row insert is AWAITED
- *  inline (request-visible, the hooks.ts fireTestDelivery precedent — upstream
- *  CreateHookTask is synchronous too) so tests and downstream observers see
- *  the row when the response lands; failures are caught and logged, never
- *  propagated into the response. Only the Queue producer ({deliveryId} batch)
- *  hangs off the executionCtx-guarded waitUntil — real worker invocations
- *  enqueue; in-process callers (tests via app.request) have no executionCtx,
- *  skip the enqueue, and leave the rows `pending` (the durable source of
- *  truth; the consumer's idempotent CAS makes a later enqueue a safe replay). */
-async function emitIssueWebhook(
-  c: Context<ApiEnv>,
-  input: { repoId: string; ownerId: number | null; eventType: HookEventType; payload: unknown },
-): Promise<void> {
-  // Structural minimal type: hono's `c.executionCtx` and the regenerated
-  // global ExecutionContext annotation drifted (the binding types now carry
-  // required tracing/abort members); only waitUntil is consumed here.
-  let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
-  try {
-    execCtx = c.executionCtx;
-  } catch {
-    execCtx = undefined; // in-process caller (tests): no execution context
-  }
-  const queue = webhookDeliveryQueue(c.env);
-  try {
-    await emitWebhookDeliveries(c.env.DB, { ...input, refName: null }, {
-      enqueue:
-        queue !== null && execCtx !== undefined
-          ? (deliveryIds) => {
-              execCtx.waitUntil(
-                queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(undefined, (error: unknown) => {
-                  console.error(`[issues] delivery enqueue failed (${input.eventType}): ${errorMessage(error)}`);
-                }),
-              );
-            }
-          : undefined,
-    });
-  } catch (error) {
-    console.error(`[issues] webhook fan-out failed (${input.eventType}): ${errorMessage(error)}`);
-  }
-}
-
-/** The shared IssuePayload wrapper (§2.7, modules/structs/hook.go:435). */
-function issuePayload(
+/** The shared PullRequestPayload wrapper for the label events — the same
+ *  field set the landed pulls.ts emissions use (§2.7, hook.go:484 minus the
+ *  null-only `requested_reviewer`/`review` fields, before/after omitted). */
+function pullRequestEventPayload(
   action: string,
-  apiIssue: Issue,
+  apiPullRequest: Awaited<ReturnType<typeof toApiPullRequest>>,
   index: number,
   repository: unknown,
   sender: unknown,
-  options: { changes?: Record<string, { from: string }>; commitId?: string } = {},
 ): Record<string, unknown> {
   return {
     action,
     number: index,
-    ...(options.changes === undefined ? {} : { changes: options.changes }),
-    issue: apiIssue,
+    pull_request: apiPullRequest,
     repository,
     sender,
-    commit_id: options.commitId ?? "",
+    commit_id: "",
   };
 }
 
-/** Issue-event bundle: the webhook `repository` object + doer sender. */
-function issueEventContext(c: Context<ApiEnv>, found: RepositoryWithOwner): { repository: unknown; sender: unknown; ownerId: number | null } {
-  return {
-    repository: toApiRepository(viewerOf(c), found),
-    sender: c.get("authUser"),
-    ownerId: found.repo.ownerId,
-  };
+/**
+ * The label attach/replace/clear webhook: `issue_label` / `pull_request_label`
+ * picked by the upstream `issue.IsPull` discriminant (services/webhook/
+ * notifier.go IssueChangeLabels:572-605 and IssueClearLabels:46-73). The
+ * payload is the shared Issue/PullRequest wrapper with NO `changes` block —
+ * upstream's label notifiers set none. The pull arm renders upstream's
+ * ToPayloadPullRequest through toApiPullRequest; a missing PR row skips the
+ * emission (upstream's LoadPullRequest failure logs and returns before
+ * PrepareWebhooks).
+ */
+async function emitLabelEvent(
+  c: Context<ApiEnv>,
+  found: RepositoryWithOwner,
+  issue: IssueRow,
+  action: "label_updated" | "label_cleared",
+): Promise<void> {
+  const event = issueEventContext(c, found);
+  if (issue.isPull) {
+    const pr = await findPullRequestRowByIssueId(c.env.DB, issue.id);
+    if (pr === null) {
+      return;
+    }
+    await emitIssueEvent(c, {
+      repoId: found.repo.id,
+      ownerId: event.ownerId,
+      eventType: "pull_request_label",
+      payload: pullRequestEventPayload(
+        action,
+        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "single"),
+        issue.index,
+        event.repository,
+        event.sender,
+      ),
+    });
+    return;
+  }
+  await emitIssueEvent(c, {
+    repoId: found.repo.id,
+    ownerId: event.ownerId,
+    eventType: "issue_label",
+    payload: issueEventPayload(action, await toApiIssue(c.env.DB, viewerOf(c), found, issue), issue.index, event.repository, event.sender),
+  });
 }
 
 /** `IssueLabelsOption` id/name resolution (prepareForReplaceOrAdd): integers
@@ -882,18 +870,18 @@ export function registerIssueRoutes(
       const rendered = await toApiIssue(c.env.DB, viewer, found, issue);
       // Webhooks: opened (always), then closed (form.closed) — the upstream
       // NewIssue → CloseIssue notification order.
-      await emitIssueWebhook(c, {
+      await emitIssueEvent(c, {
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        payload: issuePayload("opened", rendered, issue.index, event.repository, event.sender),
+        payload: issueEventPayload("opened", rendered, issue.index, event.repository, event.sender),
       });
       if (form.closed === true) {
-        await emitIssueWebhook(c, {
+        await emitIssueEvent(c, {
           repoId: found.repo.id,
           ownerId: event.ownerId,
           eventType: "issues",
-          payload: issuePayload("closed", rendered, issue.index, event.repository, event.sender),
+          payload: issueEventPayload("closed", rendered, issue.index, event.repository, event.sender),
         });
       }
       return c.json(rendered, 201);
@@ -1040,11 +1028,11 @@ export function registerIssueRoutes(
       if (updated !== null) {
         issue = updated;
       }
-      await emitIssueWebhook(c, {
+      await emitIssueEvent(c, {
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        payload: issuePayload("edited", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender, {
+        payload: issueEventPayload("edited", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender, {
           changes: { title: { from: oldTitle } },
         }),
       });
@@ -1059,11 +1047,11 @@ export function registerIssueRoutes(
         throw new ApiError(409, "the issue is already changed");
       }
       issue = updated;
-      await emitIssueWebhook(c, {
+      await emitIssueEvent(c, {
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        payload: issuePayload("edited", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender, {
+        payload: issueEventPayload("edited", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender, {
           changes: { body: { from: oldContent } },
         }),
       });
@@ -1118,11 +1106,11 @@ export function registerIssueRoutes(
         asApiError(error);
         throw error;
       }
-      await emitIssueWebhook(c, {
+      await emitIssueEvent(c, {
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        payload: issuePayload("closed", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender),
+        payload: issueEventPayload("closed", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender),
       });
     } else if (state === "open" && issue.isClosed) {
       try {
@@ -1131,11 +1119,11 @@ export function registerIssueRoutes(
         asApiError(error);
         throw error;
       }
-      await emitIssueWebhook(c, {
+      await emitIssueEvent(c, {
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        payload: issuePayload("reopened", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender),
+        payload: issueEventPayload("reopened", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender),
       });
     }
 
@@ -1188,7 +1176,7 @@ export function registerIssueRoutes(
       // pull_request_comment with the same payload shape, §2.7).
       const eventType: HookEventType = issue.isPull ? "pull_request_comment" : "issue_comment";
       const event = issueEventContext(c, found);
-      await emitIssueWebhook(c, {
+      await emitIssueEvent(c, {
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType,
