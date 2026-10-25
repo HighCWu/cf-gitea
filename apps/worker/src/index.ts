@@ -9,6 +9,7 @@ import { handleRepoTasks } from "./repos/purge";
 import { enqueueDueMirrorSyncs } from "./services/mirror/sync";
 import { handleUserPushEvent } from "./services/webhooks-push";
 import { handlesUiRoute, uiRouter } from "./ui";
+import { sessionRouter } from "./ui/session";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
 
@@ -59,6 +60,9 @@ app.route("/api/v1", createApiRouter());
 // handlesUiRoute BEFORE Hono routes, so a miss here can never swallow an
 // engine route. api registrations stay first; healthz is unaffected.
 app.route("/", uiRouter);
+// SPEC-0010: /login + /logout are single-segment top-level routes (§2.1) —
+// never repo-scoped, so the dispatcher and the engine never see them.
+app.route("/", sessionRouter);
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
