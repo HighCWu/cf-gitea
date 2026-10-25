@@ -11,13 +11,18 @@
  * `.page-content.repository.view.issue.pull` (upstream emits both
  * discriminators unconditionally — mirrored verbatim), then inside one
  * `.ui.container`: the `.issue-title-header` (`h1` title + `.index` span,
- * `.issue-title-meta` state label + poster line), the
+ * `.issue-title-meta` state label + poster line), the PR tab menu
+ * (templates/repo/pulls/tab_menu.tmpl — wave 5: Conversation + Files, the
+ * Commits tab stays unrendered because that page does not exist), the
  * `.issue-content` two-column grid — `.issue-content-left > .comment-list`
  * holding the root issue comment (`#issue-{id}`), the timeline
  * (`.timeline-item.comment` cards for user comments,
  * `.timeline-item.event` lines with `.badge` state dots for close/reopen/
- * merge, the reduced `.pull-merge-box` for open PRs) — and
- * `.issue-content-right.ui.segment` (the reduced sidebar: labels + milestone).
+ * merge, the reduced `.pull-merge-box` for open PRs, and — wave 5 — the
+ * signed-in comment form `.timeline-item.comment.form` with the
+ * `#status-button` close/reopen toggle) — and
+ * `.issue-content-right.ui.segment` (the reduced sidebar: labels + milestone,
+ * plus the wave-5 admin label edit form).
  *
  * ## Cross-family URL semantics (upstream ViewIssue, issue_view.go:347-352)
  *
@@ -65,11 +70,49 @@
  * - Avatar images are not rendered (no avatar route exists; an `<img>` to a
  *   missing route is a dead link) — the timeline items keep the upstream
  *   content structure without the `.timeline-avatar` slots.
- * - The PR conversation tab menu (`repo/pulls/tab_menu.tmpl`) is not rendered:
- *   Conversation is this page, and the Commits/Files tabs would be dead links
- *   (those pages don't exist).
- * - The comment form, reactions, context menus and status-change buttons are
- *   write actions or signed-in chrome (§2.5) — not rendered.
+ * - The PR conversation tab menu (`repo/pulls/tab_menu.tmpl`) renders the
+ *   live tabs only (wave 5): Conversation and Files (the files page exists —
+ *   pages/pull-files.tsx); the Commits tab would be a dead link (no commits
+ *   page) and is not rendered. The tab icons (octicon-comment-discussion /
+ *   octicon-git-commit / octicon-diff) are outside the generated icon
+ *   allowlist (scripts/gen-ui-icons.mjs is not a ui/ file) — the tabs render
+ *   text + count labels only.
+ * - The PR files count on the tab menu renders upstream's empty branch ("-"):
+ *   the number would cost the full engine diff read on every conversation
+ *   view (the files page shows the real count).
+ * - Wave-5 writes (SPEC-0008 U3 extension, the second write wave):
+ *   - The comment form (view_content.tmpl:71-136) renders for signed-in
+ *     viewers; anonymous sees the upstream sign-in warning
+ *     (`repo.issues.sign_in_require_desc` onto the /login round-trip), and
+ *     archived repos show the upstream `repo.archive.*.nocomment` message.
+ *     The combo markdown editor + attachments reduce to a plain
+ *     `<textarea name="content">` (the new-issue reduction). POST routes:
+ *     `/{owner}/{repo}/{issues|pulls}/{index}/comments` (upstream
+ *     routers/web/web.go:1376) — handlers in index.ts, write helpers in this
+ *     module (createCommentFromForm), success 303 onto the page with the
+ *     `#issuecomment-{id}` anchor when a comment was created (upstream's
+ *     `redirect += "#" + comment.HashTag()`, issue_comment.go:74-77).
+ *   - The status button (`view_content.tmpl:86-107`) rides the same form
+ *     (`name="status" value="close|reopen"`) for the poster or a write-
+ *     capable viewer (upstream `CanWriteIssuesOrPulls || IsPoster`,
+ *     issue_comment.go:100-102 — reduced to owner/site-admin/write-or-admin
+ *     collaborator/poster; a read-mode collaborator misses the button).
+ *     Merged PRs show the merged label only — no toggle (upstream's
+ *     `!(issue.IsPull && issue.PullRequest.HasMerged)` guard).
+ *   - The sidebar label edit form (`sidebar/label_list.tmpl` reduced to a
+ *     no-JS two-control shape: the `label_ids` checkbox group + Save) posts
+ *     `issue_ids` + `label_ids` to `/{owner}/{repo}/issues/labels` (the
+ *     upstream `data-update-url` shape, sidebar/label_list.tmpl:4-6) and
+ *     diffs the full set through the landed `IssuesService.replaceLabels`.
+ *     The grant is the settings predicate (`canAdminRepo`), NOT upstream's
+ *     `reqRepoIssuesOrPullsWriter` (web.go:1397) — the reduced matrix has no
+ *     issue-write permission bit; owner/admin is the closest landed grant.
+ *   - The status button's reopen glyph degrades: upstream
+ *     `octicon-issue-reopened` is outside the generated icon allowlist — the
+ *     landed `octicon-issue-opened` stands in (same green).
+ * - Reactions, context menus, attachments, content history and the rest of
+ *   the comment-header chrome are write actions or signed-in JS features
+ *   (§2.5) — not rendered.
  *
  * Bodies render through the SHARED markdown pipeline (§3.4 —
  * src/api/services/markdown.ts in upstream's `comment` mode): relative links
@@ -82,21 +125,27 @@ import { eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { renderMarkdownToHtml } from "../../api/services/markdown";
+import { listRepoLabels } from "../../api/services/labels";
 import {
   findIssueByRepoAndIndex,
   hasWorkInProgressPrefix,
   issueLabelRows,
   listIssueTimeline,
 } from "../../api/services/issues";
+import { collaboratorModeOf } from "../../api/services/repo-collaborators";
 import { mergeableOfRow } from "../../api/services/pull-engine";
 import { findPullRequestByIndex } from "../../api/services/pulls";
 import { milestones, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
+import { IssuesService } from "../../issues/service";
+import { IssueAlreadyChangedError, IssueError } from "../../issues/errors";
 import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
 import { TimeSince } from "../components/file-list";
 import { LabelBadge } from "./issues-list";
+import { canAdminRepo } from "./settings";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
+import type { Viewer } from "../viewer";
 
 /** Page chrome text (component-local, the issuesLocale pattern — locale.ts
  *  is shared and not this wave's file). */
@@ -127,6 +176,22 @@ export const issueDetailLocale = {
   merge_box_mergeable: "This branch has no conflicts with the base branch.",
   merge_box_conflict: "This branch has conflicts that must be resolved.",
   merge_box_checking: "Pull request mergeability is being computed.",
+  // Wave-5 write chrome — the upstream locale strings verbatim.
+  create_comment: "Comment", // "repo.issues.create_comment"
+  close_issue: "Close Issue", // "repo.issues.close"
+  reopen_issue: "Reopen Issue", // "repo.issues.reopen_issue"
+  close_pull: "Close Pull Request", // "repo.pulls.close"
+  reopen_pull: "Reopen Pull Request", // "repo.pulls.reopen"
+  comment_no_content: "No comment provided.", // "repo.issues.comment_no_content"
+  comment_on_locked: "You cannot comment on a locked issue.", // "repo.issues.comment_on_locked"
+  archive_issue_nocomment: "This repo is archived. You cannot comment on issues.", // "repo.archive.issue.nocomment"
+  archive_pull_nocomment: "This repo is archived. You cannot comment on pull requests.", // "repo.archive.pull.nocomment"
+  sign_in_require: " to join this conversation.", // "repo.issues.sign_in_require_desc" tail (the <a> prefix renders separately)
+  // Tab menu ("repo.pulls.tab_conversation" / "repo.pulls.tab_files").
+  tab_conversation: "Conversation",
+  tab_files: "Files Changed",
+  save: "Save", // "repo.issues.save" (the no-JS label form's submit)
+  comment_placeholder: "", // "repo.diff.comment.placeholder" left empty: the plain-textarea reduction (new-issue pattern)
 } as const;
 
 /** Timeline cap (upstream renders the full timeline unpaginated; the cap
@@ -286,14 +351,184 @@ export function crossFamilyRedirect(
 }
 
 // ---------------------------------------------------------------------------
+// Wave-5 write paths (§3.2 — the landed services, never a self-fetch)
+// ---------------------------------------------------------------------------
+
+/** Sidebar picker cap (the new-issue page's NEW_ISSUE_PICKER_LIMIT pattern:
+ *  one page read; the upstream dropdown pages too, through the JS path). */
+export const ISSUE_DETAIL_PICKER_LIMIT = 100;
+
+/** The per-viewer write grants the detail page's forms render against. */
+export interface IssueDetailAccess {
+  /** The status button's grant — upstream `CanWriteIssuesOrPulls ||
+   *  IsPoster` (issue_comment.go:100-102), reduced to site admin / owner
+   *  (case-folded namespace) / write-or-admin collaborator / poster. */
+  canChangeState: boolean;
+  /** The repo's labels for the admin edit form (`canAdminRepo` — the
+   *  settings predicate); `null` = not an admin, the sidebar renders
+   *  display-only exactly as before wave 5. */
+  labelOptions: LabelRow[] | null;
+}
+
+/** Resolve both grants in one place (the settings gate's order: anonymous
+ *  viewers never qualify). */
+export async function resolveIssueDetailAccess(
+  d1: D1Database,
+  repo: RepoRow,
+  viewer: Viewer,
+  issue: IssueRow,
+): Promise<IssueDetailAccess> {
+  if (viewer.kind === "anonymous") return { canChangeState: false, labelOptions: null };
+  const isOwner = repo.ownerNamespace.toLowerCase() === viewer.username.toLowerCase();
+  const collabMode: "none" | "read" | "write" | "admin" = isOwner
+    ? "admin" // the owner outranks any collaborator row (canAdminRepo's owner line)
+    : await collaboratorModeOf(d1, repo.id, viewer.id);
+  const canChangeState =
+    viewer.isAdmin || isOwner || issue.posterId === viewer.id || collabMode === "write" || collabMode === "admin";
+  const admin = await canAdminRepo(d1, repo, viewer);
+  const labelOptions = admin ? (await listRepoLabels(d1, repo.id, "", 1, ISSUE_DETAIL_PICKER_LIMIT)).items : null;
+  return { canChangeState, labelOptions };
+}
+
+/** The parsed `application/x-www-form-urlencoded` comment POST (`content`
+ *  single-value, `status` single-value — the close/reopen submit button's
+ *  field; anything else means a plain comment). */
+export interface CommentForm {
+  content: string;
+  status: string;
+}
+
+export function parseCommentForm(params: URLSearchParams): CommentForm {
+  return { content: params.get("content") ?? "", status: params.get("status") ?? "" };
+}
+
+export type CommentSubmitResult =
+  | { outcome: "created"; comment: CommentRow; stateChanged: boolean }
+  | { outcome: "state-only"; stateChanged: boolean }
+  | { outcome: "invalid"; message: string };
+
+/**
+ * The comment/state write — upstream `NewComment`
+ * (routers/web/repo/issue_comment.go:37-118) reduced to the landed services:
+ *
+ * - archived repos refuse the write (the `MustAllowUserComment`-family
+ *   posture; the message cites the upstream `repo.archive.*.nocomment` text);
+ * - a locked issue is commentable only by a state-capable viewer (the
+ *   middleware's `IsLocked && !CanWrite && !IsAdmin` branch, issue.go:86-90);
+ * - non-empty content creates through `IssuesService.addComment`;
+ * - empty content with no `status` is the upstream "No comment provided."
+ *   rejection (issue_comment.go:84-88);
+ * - a `close`/`reopen` status from a state-capable viewer (never on a merged
+ *   PR — issue_comment.go:101-102) runs `IssuesService.closeIssue` /
+ *   `reopenIssue` with the viewer as actor; a CAS race (IssueAlreadyChanged)
+ *   degrades to a plain redirect — the winner's state is already what the
+ *   button asked for.
+ */
+export async function createCommentFromForm(
+  d1: D1Database,
+  repo: RepoRow,
+  issue: IssueRow,
+  pr: PullRequestRow | null,
+  viewer: Viewer,
+  access: IssueDetailAccess,
+  form: CommentForm,
+): Promise<CommentSubmitResult> {
+  const archivedMessage = issue.isPull ? issueDetailLocale.archive_pull_nocomment : issueDetailLocale.archive_issue_nocomment;
+  if (repo.isArchived) return { outcome: "invalid", message: archivedMessage };
+  if (issue.isLocked && !access.canChangeState) {
+    return { outcome: "invalid", message: issueDetailLocale.comment_on_locked };
+  }
+
+  const content = form.content;
+  let comment: CommentRow | null = null;
+  if (content !== "") {
+    try {
+      comment = await new IssuesService(d1).addComment({ issueId: issue.id, posterId: viewer.kind === "user" ? viewer.id : null, content });
+    } catch (error) {
+      if (error instanceof IssueError) return { outcome: "invalid", message: error.message };
+      throw error;
+    }
+  } else if (form.status === "") {
+    return { outcome: "invalid", message: issueDetailLocale.comment_no_content };
+  }
+
+  let stateChanged = false;
+  if ((form.status === "close" || form.status === "reopen") && access.canChangeState && !(pr !== null && pr.hasMerged)) {
+    const service = new IssuesService(d1);
+    try {
+      if (form.status === "close") await service.closeIssue(issue.id, { actorId: viewer.kind === "user" ? viewer.id : null });
+      else await service.reopenIssue(issue.id, { actorId: viewer.kind === "user" ? viewer.id : null });
+      stateChanged = true;
+    } catch (error) {
+      if (!(error instanceof IssueAlreadyChangedError)) throw error;
+      // CAS loser: the requested state already holds (a concurrent toggle
+      // won). Upstream tolerates the no-op and redirects; so do we.
+      stateChanged = false;
+    }
+  }
+  if (comment !== null) return { outcome: "created", comment, stateChanged };
+  return { outcome: "state-only", stateChanged };
+}
+
+/** The parsed `/{owner}/{repo}/issues/labels` POST (`issue_ids` first value,
+ *  `label_ids` multi-value — the upstream field names, sidebar/label_list.tmpl
+ *  lines 4-6; non-numeric ids are dropped like parseNewIssueForm's). */
+export interface IssueLabelForm {
+  issueId: number | null;
+  labelIds: number[];
+}
+
+export function parseIssueLabelForm(params: URLSearchParams): IssueLabelForm {
+  const rawIssue = (params.get("issue_ids") ?? "").trim();
+  return {
+    issueId: /^\d+$/.test(rawIssue) ? Number.parseInt(rawIssue, 10) : null,
+    labelIds: [...new Set(
+      params
+        .getAll("label_ids")
+        .map((entry) => Number.parseInt(entry, 10))
+        .filter((entry) => Number.isInteger(entry) && entry > 0),
+    )],
+  };
+}
+
+export type IssueLabelResult = { outcome: "applied" } | { outcome: "invalid"; message: string };
+
+/**
+ * The label add/remove write: the submitted set REPLACES the issue's labels
+ * through `IssuesService.replaceLabels` — the service diffs attach/detach
+ * with the closed-state-aware counter maintenance (upstream's per-id
+ * attach/detach POSTs from repo-issue-sidebar-combolist.ts reduced to one
+ * diff-based write with the same end state). A rejected label id (foreign
+ * repo/org) surfaces the service's NoSuchLabel message inline.
+ */
+export async function applyIssueLabels(
+  d1: D1Database,
+  issue: IssueRow,
+  form: IssueLabelForm,
+): Promise<IssueLabelResult> {
+  try {
+    await new IssuesService(d1).replaceLabels(issue.id, form.labelIds, { ownerOrgId: null });
+    return { outcome: "applied" };
+  } catch (error) {
+    if (error instanceof IssueError) return { outcome: "invalid", message: error.message };
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------
+
+/** The title-bar slice of IssueDetailData — the pull-files page rebuilds the
+ *  same bar from its lighter loader (pulls/files.tmpl renders view_title
+ *  above the tab menu). */
+export type IssueTitleData = Pick<IssueDetailData, "issue" | "pr" | "posterName" | "mergerName">;
 
 /** The state chip of view_title.tmpl, in the template's branch order:
  *  merged → closed → draft → open, with the exact label/icon pairs (the
  *  issue-state octicons render since the wave-4 multi-path Icon — the
  *  wave-3 degradation note is retired). */
-export function IssueStateBadge(props: { data: IssueDetailData }) {
+export function IssueStateBadge(props: { data: IssueTitleData }) {
   const { issue, pr } = props.data;
   if (pr !== null && pr.hasMerged) {
     return (
@@ -333,7 +568,7 @@ export function IssueStateBadge(props: { data: IssueDetailData }) {
 
 /** The issue meta line: "opened {time} by {poster} · {n} comments" — poster
  *  plain text (no profile pages), `original_author` winning like upstream. */
-function IssueMetaLine(props: { data: IssueDetailData }) {
+function IssueMetaLine(props: { data: IssueTitleData }) {
   const { issue, posterName } = props.data;
   const author = issue.originalAuthor ?? posterName;
   const count =
@@ -352,7 +587,7 @@ function IssueMetaLine(props: { data: IssueDetailData }) {
  *  "{merger} merged … {time}") — the upstream pull-desc shape with the
  *  branch names as `<code>` text (branch links + commit count are engine
  *  reads; header comment). */
-function PullMetaLine(props: { data: IssueDetailData }) {
+function PullMetaLine(props: { data: IssueTitleData }) {
   const { pr, posterName, mergerName } = props.data;
   if (pr === null) return null;
   if (pr.hasMerged) {
@@ -380,7 +615,7 @@ function PullMetaLine(props: { data: IssueDetailData }) {
 
 /** `view_title.tmpl` reduced: the `h1` (#index included) and the state/meta
  *  line — the edit/New buttons are write actions, not rendered (§2.5). */
-function IssueTitleBar(props: { data: IssueDetailData }) {
+export function IssueTitleBar(props: { data: IssueTitleData }) {
   const { issue, pr } = props.data;
   return (
     <div class="issue-title-header">
@@ -393,6 +628,33 @@ function IssueTitleBar(props: { data: IssueDetailData }) {
         <IssueStateBadge data={props.data} />
         <div class="flex-text-block">{pr === null ? <IssueMetaLine data={props.data} /> : <PullMetaLine data={props.data} />}</div>
       </div>
+    </div>
+  );
+}
+
+/** The PR conversation tab menu (`repo/pulls/tab_menu.tmpl` reduced to the
+ *  live tabs: Conversation + Files — the Commits page does not exist and
+ *  dead links are not emitted; the tab octicons are outside the generated
+ *  allowlist, so the items render text + count only). The Files count on
+ *  the conversation page renders upstream's empty branch "-" — the real
+ *  count would cost the full engine diff read here (the files page shows
+ *  it). */
+export function PullTabs(props: { repoLink: string; issue: IssueRow; active: "conversation" | "files"; filesCount: number | null }) {
+  const conversationHref = `${props.repoLink}/pulls/${props.issue.index}`;
+  const filesHref = `${props.repoLink}/pulls/${props.issue.index}/files`;
+  return (
+    <div class="ui pull tabs container">
+      <div class="ui top attached pull tabular menu">
+        <a class={props.active === "conversation" ? "active item" : "item"} href={conversationHref}>
+          {issueDetailLocale.tab_conversation}
+          <span class="ui small label">{props.issue.numComments}</span>
+        </a>
+        <a class={props.active === "files" ? "active item" : "item"} href={filesHref}>
+          {issueDetailLocale.tab_files}
+          <span class="ui small label">{props.filesCount === null ? "-" : props.filesCount}</span>
+        </a>
+      </div>
+      <div class="ui tabs divider" />
     </div>
   );
 }
@@ -547,17 +809,55 @@ function PullMergeBox(props: { data: IssueDetailData }) {
 
 /** The reduced sidebar (`view_content/sidebar.tmpl`): the labels list
  *  (badges linking into the live list filters) and the milestone (plain
- *  text — `/milestone/{id}` is a dead page). The edit dropdowns behind the
- *  upstream section headings are write actions — not rendered (§2.5). */
-function IssueSidebar(props: { repoLink: string; data: IssueDetailData }) {
+ *  text — `/milestone/{id}` is a dead page). Wave 5: an admin viewer gets
+ *  the no-JS label edit form above the badge list (the two-control
+ *  reduction of sidebar/label_list.tmpl's JS dropdown — the upstream
+ *  `issue_ids`/`label_ids` field names); everyone sees the badges
+ *  re-rendered with ContrastColor as before. */
+function IssueSidebar(props: {
+  repoLink: string;
+  data: IssueDetailData;
+  /** Repo labels for the edit form; `null` = display-only (non-admin). */
+  labelOptions: LabelRow[] | null;
+}) {
   const { labels, milestone, issue } = props.data;
   const listBase = `${props.repoLink}/${issue.isPull ? "pulls" : "issues"}`;
+  const selectedIds = new Set(labels.map((label) => label.id));
   return (
     <div class="issue-content-right ui segment">
       <div class="issue-sidebar-combo" data-selection-mode="multiple" data-update-algo="diff">
         <div class="fixed-text muted">
           <strong>{issueDetailLocale.labels}</strong>
         </div>
+        {props.labelOptions !== null ? (
+          <form class="ui form" action={`${props.repoLink}/issues/labels`} method="post">
+            <input type="hidden" name="issue_ids" value={String(issue.id)} />
+            {props.labelOptions.length === 0 ? (
+              <span class="item empty-list">{issueDetailLocale.no_labels}</span>
+            ) : (
+              <div class="ui list labels-list">
+                {props.labelOptions.map((label) => {
+                  const id = `issue-label-${label.id}`;
+                  return (
+                    <div class="item">
+                      <div class="ui checkbox">
+                        <input id={id} name="label_ids" type="checkbox" value={String(label.id)} checked={selectedIds.has(label.id)} />
+                        <label for={id}>
+                          <LabelBadge label={label} />
+                        </label>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div class="field">
+              <button type="submit" class="ui tiny primary button">
+                {issueDetailLocale.save}
+              </button>
+            </div>
+          </form>
+        ) : null}
         <div class="ui list labels-list">
           {labels.length === 0 ? (
             <span class="item empty-list">{issueDetailLocale.no_labels}</span>
@@ -590,20 +890,133 @@ function IssueSidebar(props: { repoLink: string; data: IssueDetailData }) {
   );
 }
 
+/** The signed-in comment form (`view_content.tmpl:71-136` reduced: no
+ *  avatar slot — no avatar route; the combo editor + attachments reduce to
+ *  a plain textarea). The `#status-button` close/reopen toggle rides the
+ *  same form (`name="status"`) exactly like upstream; it renders for the
+ *  state-capable viewers only and never on a merged PR. Anonymous viewers
+ *  get the upstream sign-in warning (a live /login round-trip link);
+ *  archived repos the `repo.archive.*.nocomment` message. */
+function CommentFormBlock(props: {
+  ctx: UiContext;
+  repoLink: string;
+  data: IssueDetailData;
+  access: IssueDetailAccess;
+  /** The re-rendered submission ("", no error, on the plain GET). */
+  form: { content: string; error: string | null };
+}) {
+  const { ctx, data, access } = props;
+  const { issue, pr } = data;
+  const repo = ctx.repo;
+  if (repo === undefined) throw new Error("CommentFormBlock requires ctx.repo");
+  const family = issue.isPull ? "pulls" : "issues";
+  const action = `${props.repoLink}/${family}/${issue.index}/comments`;
+
+  if (ctx.viewer.kind === "anonymous") {
+    return (
+      <div class="ui warning message">
+        <a href={`/login?redirect_to=${encodeURIComponent(`${props.repoLink}/${family}/${issue.index}`)}`}>Sign in</a>
+        {issueDetailLocale.sign_in_require}
+      </div>
+    );
+  }
+  if (repo.isArchived) {
+    return <div class="ui warning message tw-text-center">{issue.isPull ? issueDetailLocale.archive_pull_nocomment : issueDetailLocale.archive_issue_nocomment}</div>;
+  }
+  if (issue.isLocked && !access.canChangeState) {
+    return <div class="ui warning message">{issueDetailLocale.comment_on_locked}</div>;
+  }
+
+  // The status button branch order and icon/color pairs are view_content.tmpl:88-107
+  // verbatim; the issue reopen glyph degrades to the allowlisted
+  // octicon-issue-opened (upstream octicon-issue-reopened is not generated).
+  const closeState = !issue.isClosed;
+  const statusValue = closeState ? "close" : "reopen";
+  const statusText = closeState
+    ? issue.isPull
+      ? issueDetailLocale.close_pull
+      : issueDetailLocale.close_issue
+    : issue.isPull
+      ? issueDetailLocale.reopen_pull
+      : issueDetailLocale.reopen_issue;
+  const statusIcon = closeState
+    ? issue.isPull
+      ? "octicon-git-pull-request-closed"
+      : "octicon-issue-closed"
+    : issue.isPull
+      ? "octicon-git-pull-request"
+      : "octicon-issue-opened";
+  const statusIconColor = closeState ? "tw-text-red" : "tw-text-green";
+
+  return (
+    <div class="timeline-item comment form">
+      <div class="content">
+        <div class="ui segment avatar-content-left-arrow">
+          <form class="ui form" id="comment-form" action={action} method="post">
+            {props.form.error !== null ? <div class="ui negative message">{props.form.error}</div> : null}
+            <div class="field">
+              <textarea name="content" rows={10} placeholder={issueDetailLocale.comment_placeholder}>
+                {props.form.content}
+              </textarea>
+            </div>
+            <div class="field footer">
+              <div class="flex-text-block tw-justify-end">
+                {access.canChangeState && !(pr !== null && pr.hasMerged) ? (
+                  <button type="submit" id="status-button" class="ui button" name="status" value={statusValue}>
+                    <span class={`status-button-icon ${statusIconColor}`}>
+                      <Icon name={statusIcon} />
+                    </span>
+                    <span class="status-button-text">{statusText}</span>
+                  </button>
+                ) : null}
+                <button type="submit" id="comment-button" class="ui primary button">
+                  {issueDetailLocale.create_comment}
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** The full-document render (the render.tsx pattern — `index.ts` stays a
- *  pure-TS router module, so the JSX invocation lives beside the component). */
-export function renderIssueDetailPage(ctx: UiContext, data: IssueDetailData): string {
-  return renderPage(<IssueDetailPage ctx={ctx} data={data} />);
+ *  pure-TS router module, so the JSX invocation lives beside the component).
+ *  `access`/`form` come from the router (the GET handler resolves the
+ *  viewer's grants; the POST handlers re-render with the error + kept
+ *  submission); omitted = the anonymous pristine GET shape. */
+export function renderIssueDetailPage(
+  ctx: UiContext,
+  data: IssueDetailData,
+  access?: IssueDetailAccess,
+  form?: { content: string; error: string | null },
+): string {
+  return renderPage(
+    <IssueDetailPage
+      ctx={ctx}
+      data={data}
+      access={access ?? { canChangeState: false, labelOptions: null }}
+      form={form ?? { content: "", error: null }}
+    />,
+  );
 }
 
 /** The issue/PR detail page (§2.4.1 discriminator: `repository view issue
  *  pull` — upstream view.tmpl:4 emits both classes unconditionally). */
-export function IssueDetailPage(props: { ctx: UiContext; data: IssueDetailData }) {
+export function IssueDetailPage(props: {
+  ctx: UiContext;
+  data: IssueDetailData;
+  access: IssueDetailAccess;
+  form: { content: string; error: string | null };
+}) {
   const { ctx, data } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("IssueDetailPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const showMergeBox = data.pr !== null && !data.issue.isClosed && !data.pr.hasMerged;
+  const showForm =
+    ctx.viewer.kind === "user" && !repo.isArchived && (!data.issue.isLocked || props.access.canChangeState);
   return (
     <BaseLayout
       ctx={ctx}
@@ -613,6 +1026,9 @@ export function IssueDetailPage(props: { ctx: UiContext; data: IssueDetailData }
     >
       <div class="ui container">
         <IssueTitleBar data={data} />
+        {data.issue.isPull ? (
+          <PullTabs repoLink={repoLink} issue={data.issue} active="conversation" filesCount={null} />
+        ) : null}
         <div class="issue-content">
           <div class="issue-content-left">
             <div class="comment-list">
@@ -626,9 +1042,12 @@ export function IssueDetailPage(props: { ctx: UiContext; data: IssueDetailData }
               )}
               <div class="timeline-item tw-hidden" id="timeline-comments-end" />
               {showMergeBox ? <PullMergeBox data={data} /> : null}
+              {showForm || ctx.viewer.kind === "anonymous" ? (
+                <CommentFormBlock ctx={ctx} repoLink={repoLink} data={data} access={props.access} form={props.form} />
+              ) : null}
             </div>
           </div>
-          <IssueSidebar repoLink={repoLink} data={data} />
+          <IssueSidebar repoLink={repoLink} data={data} labelOptions={props.access.labelOptions} />
         </div>
       </div>
     </BaseLayout>

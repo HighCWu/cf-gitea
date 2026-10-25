@@ -19,15 +19,22 @@
  */
 
 import { env } from "cloudflare:test";
+import { SELF } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { and, eq } from "drizzle-orm";
 import { beforeAll } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { basicTokenHeader, mintFor } from "../../auth/testing/seeds";
 import { repositories, users } from "../../db/schema";
 import { type UiManifest } from "../manifest";
 import { uiRouter, type UiAssetsFetcher } from "../index";
-import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
+import {
+  buildHistoryPack,
+  buildReceivePackBody,
+  ensureSeededRepo,
+  type SeedCommit,
+} from "../testing/seed-repo";
 import { IssuesService } from "../../issues/service";
 import { createRepoLabel } from "../../api/services/labels";
 import { issues } from "../../db/schema";
@@ -146,6 +153,9 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // the PR #4 (checking mergeability) through the same is_pull component.
   { file: "issue-detail.html", path: "/alice/golden/issues/1", status: 200 },
   { file: "pull-detail.html", path: "/alice/golden/pulls/4", status: 200 },
+  // PR files diff view (wave 5): the PR #4 range diff (the seedGoldenPullDiff
+  // fixture pushes docs-seed + refs/pull/4/head ahead of main).
+  { file: "pull-files.html", path: "/alice/golden/pulls/4/files", status: 200 },
   // 404 shell WITH repo context (the repo resolved, the ref did not, §4.5).
   { file: "not-found-repo.html", path: "/alice/golden/commits/branch/nope", status: 404 },
   // Bare shell: 404 for an unknown owner/repo — navbar/main/footer, no repo
@@ -244,6 +254,66 @@ async function seedGoldenIssues(): Promise<void> {
   await svc.addComment({ issueId: labeled.id, posterId: owner.id, content: "Reproduced on two machines.", now: t(60) });
 }
 
+/**
+ * The wave-5 PR-diff fixture for the pull-files golden: PR #4's head branch
+ * gets REAL content ahead of main — a third commit whose first two commits
+ * are byte-identical to GOLDEN_COMMITS (same fixed times/contents → the
+ * same oids, so the merge base IS the pushed main tip) plus a guide edit
+ * (del + add lines) and a created file (all-add lines). The refs push once
+ * through the REAL receive flow, guarded on the branch's existence like
+ * ensureSeededRepo.
+ */
+const GOLDEN_GUIDE_V2 = ["# Guide", "", "Walkthrough text.", "", "## Seeding", "", "How the seed format works.", ""].join("\n");
+const GOLDEN_EXTRA_MD = "# Extra page\n\nLinked from the guide.\n";
+
+const GOLDEN_DIFF_COMMITS: SeedCommit[] = [
+  ...GOLDEN_COMMITS,
+  {
+    message: "docs: expand the guide, add the extra page",
+    time: T0 + 180,
+    files: [
+      { path: "README.md", content: README },
+      { path: "app.ts", content: APP_TS },
+      { path: "docs/guide.md", content: GOLDEN_GUIDE_V2 },
+      { path: "docs/extra.md", content: GOLDEN_EXTRA_MD },
+      { path: "logo.png", content: LOGO_PNG },
+    ],
+  },
+];
+
+async function seedGoldenPullDiff(): Promise<void> {
+  const db = drizzle(env.DB);
+  const refs = await env.REPO.getByName("alice/golden").listRefs();
+  const refNames = new Set((refs?.refs ?? []).map((ref) => ref.name));
+  if (refNames.has("refs/heads/docs-seed")) return;
+  const owner = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "alice"))
+    .get();
+  if (owner === undefined) throw new Error("golden owner row missing before the PR-diff push");
+  await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?")
+    .bind(owner.id, "ui-page-seed-golden-diff")
+    .run();
+  const token = (await mintFor(owner.id, "ui-page-seed-golden-diff", "write:repository")).plaintext;
+  const { tips, pack } = await buildHistoryPack(GOLDEN_DIFF_COMMITS);
+  const response = await SELF.fetch("https://test.local/alice/golden.git/git-receive-pack", {
+    method: "POST",
+    headers: { authorization: basicTokenHeader(token), "content-type": "application/x-git-receive-pack-request" },
+    body: buildReceivePackBody(
+      [
+        { ref: "refs/heads/docs-seed", oid: tips[2] as string },
+        { ref: "refs/pull/4/head", oid: tips[2] as string },
+      ],
+      pack,
+    ),
+  });
+  const body = response.status === 200 ? new TextDecoder().decode(await response.arrayBuffer()) : "";
+  if (response.status !== 200 || body.includes("ng ")) {
+    throw new Error(`golden PR-diff push failed: ${response.status} ${body.slice(0, 400)}`);
+  }
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
@@ -267,5 +337,6 @@ export function setupGoldenFixtures(): void {
         .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, slug)));
     }
     await seedGoldenIssues();
+    await seedGoldenPullDiff();
   });
 }

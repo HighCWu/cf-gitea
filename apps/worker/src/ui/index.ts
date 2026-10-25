@@ -37,6 +37,21 @@
  *   /:owner/:repo/settings/hooks           webhooks list + add form, GET +
  *                                          POST (pages/settings.tsx — admin
  *                                          viewer only)
+ *   /:owner/:repo/{issues|pulls}/{index}/comments   comment write, POST
+ *                                          (pages/issue-detail.tsx — wave 5;
+ *                                          the `status` field carries the
+ *                                          close/reopen toggle; success
+ *                                          303s onto the canonical page
+ *                                          with the #issuecomment anchor;
+ *                                          anonymous 303s onto /login;
+ *                                          GET → 405, upstream chi parity)
+ *   /:owner/:repo/issues/labels            sidebar label write, POST
+ *                                          (pages/issue-detail.tsx — wave 5;
+ *                                          admin viewer only; GET → 405)
+ *   /:owner/:repo/pulls/{index}/files      PR files diff view, GET
+ *                                          (pages/pull-files.tsx — wave 5;
+ *                                          the landed pullRequestDiff
+ *                                          service)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -97,7 +112,16 @@ import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
 import { sameOriginGuard } from "./session";
 import { treeRedirectResponse } from "./pages/repo-home";
-import { crossFamilyRedirect, loadIssueDetailData, renderIssueDetailPage } from "./pages/issue-detail";
+import {
+  applyIssueLabels,
+  createCommentFromForm,
+  crossFamilyRedirect,
+  loadIssueDetailData,
+  parseCommentForm,
+  parseIssueLabelForm,
+  renderIssueDetailPage,
+  resolveIssueDetailAccess,
+} from "./pages/issue-detail";
 import { loadIssuesListData, renderIssuesListPage } from "./pages/issues-list";
 import {
   createIssueFromForm,
@@ -106,6 +130,7 @@ import {
   readNewIssueForm,
   renderNewIssuePage,
 } from "./pages/new-issue";
+import { loadPullFilesData, renderPullFilesPage } from "./pages/pull-files";
 import {
   applyRepoBasics,
   canAdminRepo,
@@ -117,6 +142,9 @@ import {
   renderHooksSettingsPage,
   renderRepoSettingsPage,
 } from "./pages/settings";
+import { findIssueByRepoAndIndex } from "../api/services/issues";
+import { findPullRequestByIndex } from "../api/services/pulls";
+import { IssuesService } from "../issues/service";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -199,9 +227,48 @@ export interface SettingsRoute {
   repo: string;
 }
 
+/** The wave-5 comment-write family (pages/issue-detail.tsx): upstream
+ *  `m.Combo("/comments").Post(...)` under both issue URL families
+ *  (routers/web/web.go:1376) — POST-only, the `status` field carries the
+ *  close/reopen toggle. */
+export interface IssueCommentRoute {
+  family: "issue-comment";
+  owner: string;
+  repo: string;
+  urlKind: "issues" | "pulls";
+  index: number;
+}
+
+/** The wave-5 label-write family (pages/issue-detail.tsx): upstream
+ *  `POST /issues/labels` — the sidebar JS dropdown's `data-update-url`
+ *  (sidebar/label_list.tmpl:4-6), POST-only, admin-viewer-only. */
+export interface IssueLabelsRoute {
+  family: "issue-labels";
+  owner: string;
+  repo: string;
+}
+
+/** The wave-5 PR files family (pages/pull-files.tsx): upstream
+ *  `m.Group("/files")` under the pulls group (web.go:1670-1680) — GET. */
+export interface PullFilesRoute {
+  family: "pull-files";
+  owner: string;
+  repo: string;
+  index: number;
+}
+
 /** Everything `parseUiRoute` can return; `UiRoute` remains the slice-1 view
  *  render.tsx consumes. */
-export type ParsedUiRoute = UiRoute | TreeRoute | IssuesListRoute | IssueDetailRoute | IssueNewRoute | SettingsRoute;
+export type ParsedUiRoute =
+  | UiRoute
+  | TreeRoute
+  | IssuesListRoute
+  | IssueDetailRoute
+  | IssueNewRoute
+  | SettingsRoute
+  | IssueCommentRoute
+  | IssueLabelsRoute
+  | PullFilesRoute;
 
 
 /**
@@ -259,9 +326,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 0) return { family: head, owner, repo };
     if (rest.length === 1) {
       if (head === "issues" && rest[0] === "new") return { family: "issue-new", owner, repo };
+      // Wave-5: the sidebar label-write POST (upstream data-update-url).
+      if (head === "issues" && rest[0] === "labels") return { family: "issue-labels", owner, repo };
       if (/^-?\d+$/.test(rest[0] as string)) {
         return { family: "issue-detail", owner, repo, urlKind: head, index: Number.parseInt(rest[0] as string, 10) };
       }
+    }
+    // Wave-5: the comment write + the PR files view, under BOTH families'
+    // index tails (upstream hangs /comments on `/{type:issues|pulls}/{index}`
+    // — web.go:1376 — and /files on the pulls group only — web.go:1670).
+    if (rest.length === 2 && /^-?\d+$/.test(rest[0] as string)) {
+      const index = Number.parseInt(rest[0] as string, 10);
+      if (rest[1] === "comments") return { family: "issue-comment", owner, repo, urlKind: head, index };
+      if (head === "pulls" && rest[1] === "files") return { family: "pull-files", owner, repo, index };
     }
     return null;
   }
@@ -669,6 +746,97 @@ async function hooksSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   return respond(c.html(renderHooksSettingsPage({ ctx, data, error: result.message }), 200));
 }
 
+/** GET on a POST-only family — upstream chi answers 405 for a registered
+ *  path with the wrong method (the gate's plainTextInternal shape). */
+function methodNotAllowed(allow: string): Response {
+  return new Response("Method Not Allowed\n", {
+    status: 405,
+    headers: { "content-type": "text/plain;charset=utf-8", allow, "x-content-type-options": "nosniff" },
+  });
+}
+
+/**
+ * POST /{owner}/{repo}/{issues|pulls}/{index}/comments (pages/issue-detail.tsx
+ * — upstream NewComment, routers/web/repo/issue_comment.go:37-118): the §2.8
+ * Origin guard, the same repo→viewer order as the GET pages (invisible repos
+ * 404 before the redirect could leak them), then the landed
+ * `IssuesService.addComment` (+ the `status` close/reopen through
+ * closeIssue/reopenIssue). Success 303s onto the row's OWN family page with
+ * the `#issuecomment-{id}` anchor when a comment was created (upstream
+ * `redirect += "#" + comment.HashTag()`); validation failures re-render the
+ * detail page at 200 with the message and the kept draft (the login failure
+ * convention).
+ */
+async function issueCommentSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-comment") return respond(await c.notFound()); // registration/parser drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+
+  const issue = await findIssueByRepoAndIndex(c.env.DB, repo.id, route.index);
+  if (issue === null) return respond(c.html(renderNotFound(ctx), 404));
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  // The redirect target is the ROW's own family (upstream issueType,
+  // issue_comment.go:70) — a POST through the twin family still lands
+  // canonically. The cross-family GET redirect stays the detail route's.
+  const canonicalPath = `${repoLink}/${issue.isPull ? "pulls" : "issues"}/${issue.index}`;
+
+  const form = parseCommentForm(await readUrlEncodedForm(c.req.raw));
+  // The merged-PR guard needs the PR extension row only.
+  const pr = issue.isPull ? ((await findPullRequestByIndex(c.env.DB, repo.id, route.index))?.pullRequest ?? null) : null;
+  const access = await resolveIssueDetailAccess(c.env.DB, repo, viewer, issue);
+  const result = await createCommentFromForm(c.env.DB, repo, issue, pr, viewer, access, form);
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: `${canonicalPath}#issuecomment-${result.comment.id}` } }));
+  }
+  if (result.outcome === "state-only") {
+    return respond(new Response(null, { status: 303, headers: { location: canonicalPath } }));
+  }
+  // Re-render with the message and the kept draft (the new-issue convention).
+  const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderIssueDetailPage(ctx, data, access, { content: form.content, error: result.message }), 200));
+}
+
+/**
+ * POST /{owner}/{repo}/issues/labels (pages/issue-detail.tsx — the sidebar
+ * label edit): admin viewers only (`canAdminRepo` — the settings predicate;
+ * anonymous 303s onto the login round-trip, a signed-in non-admin 404-
+ * shells). The submitted `label_ids` set REPLACES the issue's labels through
+ * the landed `IssuesService.replaceLabels` (diff-based attach/detach with
+ * the counter maintenance); success 303s onto the issue's canonical page,
+ * the service's NoSuchLabel message re-renders inline.
+ */
+async function issueLabelsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (!(await canAdminRepo(c.env.DB, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
+
+  const form = parseIssueLabelForm(await readUrlEncodedForm(c.req.raw));
+  // The issue_ids selector scopes GLOBAL label ids to THIS repo's issues
+  // (upstream getActionIssues' repo check) — a foreign id 404-shells.
+  const issue = form.issueId === null ? null : await new IssuesService(c.env.DB).getIssueById(form.issueId);
+  if (issue === null || issue.repoId !== repo.id) return respond(c.html(renderNotFound(ctx), 404));
+
+  const result = await applyIssueLabels(c.env.DB, issue, form);
+  const canonicalPath = `/${repo.ownerNamespace}/${repo.slug}/${issue.isPull ? "pulls" : "issues"}/${issue.index}`;
+  if (result.outcome === "applied") {
+    return respond(new Response(null, { status: 303, headers: { location: canonicalPath } }));
+  }
+  const data = await loadIssueDetailData(c.env.DB, repo, issue.isPull ? "pulls" : "issues", issue.index, url.origin);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  const access = await resolveIssueDetailAccess(c.env.DB, repo, viewer, issue);
+  return respond(c.html(renderIssueDetailPage(ctx, data, access, { content: "", error: result.message }), 200));
+}
+
 /**
  * One handler for every claimed GET page family: the parser re-reads the
  * pathname (the route registrations below exist so the sub-app never claims
@@ -708,7 +876,17 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
     const redirect = crossFamilyRedirect(route.urlKind, repoLink, data.issue.index, data.issue.isPull);
     if (redirect !== null) return respond(new Response(null, { status: 303, headers: { location: redirect } }));
-    return respond(c.html(renderIssueDetailPage(ctx, data), 200));
+    // Wave-5: the signed-in chrome (status button + admin label form) needs
+    // the viewer's grants; anonymous resolves to the all-false access.
+    const access = await resolveIssueDetailAccess(c.env.DB, repo, resolved.viewer, data.issue);
+    return respond(c.html(renderIssueDetailPage(ctx, data, access), 200));
+  }
+  // Wave-5 dispatch: the PR files diff view (render.tsx never sees this
+  // family; non-pull rows 404-shell — pull-files.tsx header).
+  if (route.family === "pull-files") {
+    const data = await loadPullFilesData(c, repo.id, route.index);
+    if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(c.html(renderPullFilesPage({ ctx, data }), 200));
   }
 
   // U3 page switch (render.tsx — home | commits | src), with the 404 shell
@@ -744,9 +922,22 @@ uiRouter.get("/:owner/:repo/issues", (c) => uiPage(c));
 // static segments first; this makes it local and obvious).
 uiRouter.get("/:owner/:repo/issues/new", (c) => issueNewPage(c));
 uiRouter.post("/:owner/:repo/issues/new", (c) => issueNewSubmit(c));
+// Wave-5 label-write family — same static-before-dynamic rule (the bare
+// /issues/labels shape would otherwise be absorbed by issues/:index).
+uiRouter.post("/:owner/:repo/issues/labels", (c) => issueLabelsSubmit(c));
+uiRouter.get("/:owner/:repo/issues/labels", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/issues/:index", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls/:index", (c) => uiPage(c));
+// Wave-5 write/read families (parseUiRoute claims exactly these shapes;
+// the POSTs run the §2.8 sameOriginGuard first — session.ts's convention).
+// The POST-only families answer GET with chi's 405 (registered so the
+// sub-app's reach equals handlesUiRoute's).
+uiRouter.post("/:owner/:repo/issues/:index/comments", (c) => issueCommentSubmit(c));
+uiRouter.post("/:owner/:repo/pulls/:index/comments", (c) => issueCommentSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/comments", () => methodNotAllowed("POST"));
+uiRouter.get("/:owner/:repo/pulls/:index/comments", () => methodNotAllowed("POST"));
+uiRouter.get("/:owner/:repo/pulls/:index/files", (c) => uiPage(c));
 // Wave-4 write families (parseUiRoute claims exactly these shapes; the
 // POSTs run the §2.8 sameOriginGuard first — session.ts's convention).
 uiRouter.get("/:owner/:repo/settings", (c) => settingsPage(c));

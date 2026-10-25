@@ -37,10 +37,13 @@
  *                         each carry an explicit scope attribute (scope=col
  *                         added additively to the one real data table,
  *                         components/commit-list.tsx). Exemption: the
- *                         code-view line table (file-content.tsx mirrors
+ *                         code-view line table (file-view.tsx mirrors
  *                         upstream view_file.tmpl's `<table>` of line
- *                         numbers/cells) is presentational — it has no
- *                         header semantics to scope. #repo-files-table is
+ *                         numbers/cells) and — pages wave 5 — the diff line
+ *                         table (upstream section_unified.tmpl's `<table
+ *                         class="chroma">` of line numbers/cells, the same
+ *                         presentational shape) are exempt: no header
+ *                         semantics to scope. #repo-files-table is
  *                         deliberately NOT an HTML table (§2.4.1 upstream
  *                         div shape) — its row/cell structure is asserted
  *                         structurally in a11y.test.ts instead.
@@ -246,10 +249,12 @@ function hasClass(el: A11yElement, cls: string): boolean {
   return (el.attrs.class ?? "").split(/\s+/).includes(cls);
 }
 
-function hasCodeViewAncestor(el: A11yElement): boolean {
+function hasPresentationalTableAncestor(el: A11yElement): boolean {
   let node: A11yElement | null = el;
   while (node !== null) {
-    if (hasClass(node, "code-view")) return true;
+    // code-view: the blob file view's line table; code-diff: the diff view's
+    // unified line table (same presentational shape, upstream section_unified.tmpl).
+    if (hasClass(node, "code-view") || hasClass(node, "code-diff")) return true;
     node = node.parent;
   }
   return false;
@@ -317,9 +322,10 @@ export function runA11y(html: string): A11yViolation[] {
   }
 
   // R6 — real data tables: thead present, every th carries an explicit
-  // scope. The code-view line table is presentational (upstream shape).
+  // scope. The code-view / code-diff line tables are presentational
+  // (upstream shapes).
   for (const table of all.filter((el) => el.tag === "table")) {
-    if (hasCodeViewAncestor(table)) continue;
+    if (hasPresentationalTableAncestor(table)) continue;
     const thead = table.children.find((child) => child.tag === "thead");
     if (thead === undefined) {
       add("R6-table-headers", `table#${table.attrs.id ?? "(no id)"} has no thead`);

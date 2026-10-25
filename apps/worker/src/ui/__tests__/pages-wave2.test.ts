@@ -177,10 +177,12 @@ describe("wave-2 parser surface", () => {
   it.each([
     "/octo/hello/treeX/branch/main",
     "/octo/hello/issuesX",
-    "/octo/hello/issues/5/comments", // (/issues/new became the wave-4 form family — wave-4 tests own it)
     "/octo/hello/issues/5x", // non-numeric index → engine 404 (chi PathParamInt64 parity)
-    "/octo/hello/pulls/7/8",
+    "/octo/hello/pulls/7/8", // deeper tails stay engine-owned (/files is pulls-only, wave 5)
+    "/octo/hello/issues/5/labels", // the label write hangs off the bare /issues/labels shape only
     "/octo/hello/Issues", // family literals are lowercase-exact
+    // (/issues/new became the wave-4 form family and /issues/{n}/comments +
+    //  /pulls/{n}/files the wave-5 families — their tests own those shapes.)
   ])("does not claim: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(false);
   });

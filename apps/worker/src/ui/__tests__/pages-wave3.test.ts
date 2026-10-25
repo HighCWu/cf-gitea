@@ -305,8 +305,14 @@ describe("pull request detail (/pulls/{index})", () => {
     expect(html).toContain('<a class="active item" href="/alice/wave3/pulls" data-shortcut-keys="g p">');
     // The PR body renders through the shared pipeline.
     expect(html).toContain("Implements the thing.");
-    // No conversation tab menu (Commits/Files pages don't exist — dead links).
-    expect(html).not.toContain('class="ui top attached pull tabular menu"');
+    // Wave 5: the reduced tab menu (Conversation + Files — the Commits page
+    // does not exist, its tab is not a dead link emitted; text-only items,
+    // the tab octicons are outside the generated allowlist).
+    expect(html).toContain('<div class="ui pull tabs container">');
+    expect(html).toContain('<a class="active item" href="/alice/wave3/pulls/3">Conversation<span class="ui small label">0</span></a>');
+    expect(html).toContain('<a class="item" href="/alice/wave3/pulls/3/files">Files Changed<span class="ui small label">-</span></a>');
+    // …and no Commits tab (that page does not exist — no dead links).
+    expect(html).not.toContain('/alice/wave3/pulls/3/commits');
   });
 
   it("renders the closed PR: closed state with the closed-PR glyph and no merge box", async () => {
@@ -356,11 +362,13 @@ describe("issue detail negative paths", () => {
   it("leaves non-numeric and deeper tails engine-owned (404 from the sub-app, never a page)", async () => {
     // (/issues/new became the wave-4 form family — pages-wave4.test.ts owns
     // its behavior; it no longer 404s here.)
-    for (const path of ["/alice/wave3/issues/abc", "/alice/wave3/issues/1/comments"]) {
+    for (const path of ["/alice/wave3/issues/abc"]) {
       const res = await fetchUi(path);
       expect(res.status).toBe(404);
       expect(await res.text()).not.toContain("issue-title-header");
     }
+    // (/issues/{n}/comments became the wave-5 write family — its GET answers
+    // chi's 405; pages-wave5.test.ts owns the POST behavior.)
   });
 
   it("404-shells private repos before any issue work (§2.5)", async () => {

@@ -17,6 +17,7 @@ import issuesClosedGolden from "./goldens/issues-closed.html?raw";
 import issuesOpenGolden from "./goldens/issues-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
 import pullDetailGolden from "./goldens/pull-detail.html?raw";
+import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
 import { GOLDEN_CASES } from "./harness";
@@ -31,6 +32,7 @@ const goldens: Record<string, string> = {
   "pulls-open.html": pullsOpenGolden,
   "issue-detail.html": issueDetailGolden,
   "pull-detail.html": pullDetailGolden,
+  "pull-files.html": pullFilesGolden,
   "not-found-repo.html": notFoundRepoGolden,
   "bare-shell.html": bareShellGolden,
 };
@@ -190,6 +192,11 @@ describe("a11y walker pins", () => {
       '<html><body><div class="file-view code-view"><table><tbody><tr><td class="lines-num">1</td></tr></tbody></table></div></body></html>',
     );
     expect(codeView.filter((v) => v.rule === "R6-table-headers")).toEqual([]);
+    // The wave-5 diff line table (presentational, same shape) is exempt too.
+    const codeDiff = runA11y(
+      '<html><body><div class="file-body file-code code-diff code-diff-unified"><table><tbody><tr class="add-code"><td class="lines-num"></td></tr></tbody></table></div></body></html>',
+    );
+    expect(codeDiff.filter((v) => v.rule === "R6-table-headers")).toEqual([]);
   });
 
   it("counts h1 and tolerates entity-bearing text", () => {
