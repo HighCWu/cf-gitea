@@ -1831,3 +1831,74 @@ export const protectedBranches = sqliteTable(
     index("protected_branches_repo_idx").on(t.repoId),
   ],
 );
+
+/**
+ * Repository deploy keys and deploy tokens (upstream `DeployKey`,
+ * models/deploykey/deploykey.go:25-46). ONE table carries BOTH principals:
+ * `key_type` 1 = an SSH deploy key (a `public_keys` row of `type=2` shared by
+ * every repo that adds the same content — FindOrAddDeployPublicKey,
+ * asymkey/ssh_key.go:93-120) and 2 = an HTTPS deploy token (`gdt_…` secret;
+ * the plaintext is returned exactly once at create, only `token_hash`
+ * sha256 persists — deploykey_token.go:12-44).
+ *
+ * `key_id` mirrors upstream's raw `KeyID INDEX` — a plain column, NO FK
+ * constraint: token rows carry Go's zero key_id 0 (GetDeployKeyByRepoPublicKey
+ * filters `key_type = 1` precisely because "every token row carries key id
+ * 0", deploykey_ssh.go:60), and upstream's xorm tag is INDEX only. The
+ * referenced `public_keys` row is itself FK-less on our side of the design:
+ * upstream materializes deploy public-key rows with `owner_id = 0` (no owner
+ * — invisible to every /user/keys owner filter), which our landed
+ * `public_keys.owner_id → users.id` FK cannot store; the service layer points
+ * them at the upstream system principal `gitea:deploy-key` (user_system.go:76,
+ * DeployKeyUserID = -3) seeded by migration 0020 and re-asserted on demand —
+ * same shape as the migration-0003 'assets' reservation row (prohibited
+ * status, un-takeable at the DB level, never a token holder).
+ *
+ * `repo_id` keys the landed TEXT repositories.id — the repo-scoped-table
+ * convention (plain column, no FK; rows die with the deleteRepository
+ * cascade arm — upstream's DeleteBeans census carries the DeployKey bean,
+ * services/repository/delete.go). `fingerprint` copies the public key's
+ * SHA-256 fingerprint onto the deploy row for upstream's by-fingerprint list
+ * filter; token rows store the masked scan-bait rendering instead
+ * (generateToken, deploykey_token.go:22-26). Name uniqueness per repo is a
+ * CODE check, not a constraint (checkDeployKeyName, deploykey.go:55-69).
+ * `created`/`updated` are upstream's xorm auto-columns (the latter doubles as
+ * last-used once the git-HTTP arm lands; AfterLoad's HasUsed gate,
+ * deploykey.go:49-52).
+ */
+export const deployKeys = sqliteTable(
+  "deploy_keys",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The shared `public_keys.id` for ssh rows; 0 for token rows (upstream
+     *  `KeyID INDEX` — no FK; see above). */
+    keyId: integer("key_id").notNull().default(0),
+    /** Keys the landed TEXT repositories.id — the repo-scoped convention. */
+    repoId: text("repo_id").notNull(),
+    /** Caller-chosen title; duplicate-per-repo rejected in code
+     *  (checkDeployKeyName), not by constraint — upstream form. */
+    name: text("name").notNull(),
+    /** Raw KeyType integer; 1 = ssh, 2 = token (upstream NOT NULL DEFAULT 1). */
+    keyType: integer("key_type").notNull().default(1),
+    /** ssh rows: the public key's "SHA256:…" fingerprint; token rows: the
+     *  masked "gdt_xx********yy" rendering (generateToken). */
+    fingerprint: text("fingerprint").notNull(),
+    /** sha256 hex of the plaintext token; '' for ssh rows (upstream
+     *  `TokenHash INDEX` — "sha256 … need[s] no salt", deploykey.go:38). */
+    tokenHash: text("token_hash").notNull().default(""),
+    /** Raw perm.AccessMode integer; 1 = read, 2 = write (upstream
+     *  `NOT NULL DEFAULT 1`). */
+    mode: integer("mode").notNull().default(1),
+    /** Row creation (upstream `CreatedUnix xorm:"created"`). */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Upstream `UpdatedUnix xorm:"updated"` — last token/key use once the
+     *  git-HTTP arm lands; equals createdAt at insert (HasUsed gate). */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's xorm INDEX trio (deploykey.go:27,28,38).
+    index("deploy_keys_key_id_idx").on(t.keyId),
+    index("deploy_keys_repo_id_idx").on(t.repoId),
+    index("deploy_keys_token_hash_idx").on(t.tokenHash),
+  ],
+);
