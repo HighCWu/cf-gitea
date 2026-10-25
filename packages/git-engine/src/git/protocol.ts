@@ -7,7 +7,14 @@ import { MultipartCapture, MultipartPackUpload } from "./multipart";
 import { parseCommit, parseTag, parseTree, isGitlinkMode, isTreeMode, TYPE_NUM, NUM_TYPE, ObjType } from "./objects";
 import { cloneCacheKey } from "./r2keys";
 
-const AGENT = "dgit/0.3";
+/**
+ * The agent capability exactly as it goes on the wire: key=value per git
+ * convention (both the v0 capability list and the v2 capability update
+ * advertise `agent=<name>/<version>`; a bare token only happens to be
+ * tolerated by stock git). Closes the differential-matrix quirk recorded
+ * 2026-10-25 (scripts/diff-cases/README.md).
+ */
+const AGENT = "agent=dgit/0.3";
 const INFINITE_DEPTH = 0x7fffffff;
 const SIDEBAND_CHUNK = 32 * 1024;
 const WALK_YIELD = 5000;

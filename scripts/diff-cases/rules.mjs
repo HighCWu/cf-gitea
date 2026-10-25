@@ -103,7 +103,9 @@ export const COMPARE_RULES = [
     rule: "The capability-matrix dump is endpoint-descriptive by design (Round-8: test-generated, not " +
       "hand-maintained): ours must never advertise filter (enforced inside the case for ours), while a " +
       "real Gitea legitimately advertises it via stock git upload-pack; agent strings and capability " +
-      "sets differ legitimately. Divergences here DOCUMENT the matrix — they are not protocol regressions.",
+      "sets differ legitimately (ours=agent=dgit/0.3, theirs=agent=git/x.y — both key=value per git " +
+      "convention since the 2026-10-25 bare-token fix). Divergences here DOCUMENT the matrix — they " +
+      "are not protocol regressions.",
     acceptable: () => true,
   },
   {

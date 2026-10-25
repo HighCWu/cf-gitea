@@ -101,10 +101,12 @@ probe: shallow boundary or protocol-shaped reject, never a silent full clone).
 The deepen cases (`deepen-strict-reject`, `shallow-depth1`) are the
 family-level proof of that implication.
 
-Matrix quirk recorded (engine owner's to revisit, not a battery failure): the
-agent token is advertised BARE (`dgit/0.3`), not as `agent=dgit/0.3`, in both
-the v2 capability advert and the v0 capability list; stock git tolerates the
-unknown token.
+Quirk closed (2026-10-25): the agent capability is advertised in git's
+key=value convention (`agent=dgit/0.3`) in both the v2 capability advert and
+the v0 capability lists (upload-pack + receive-pack), matching stock git
+(`agent=git/x.y`). The bare `dgit/0.3` token previously recorded here was
+tolerated by real clients but flagged by the differential matrix; the case now
+asserts the key=value form on ours (`ours-advertises-agent-key-value`).
 
 ## Declared rules (rules.mjs)
 

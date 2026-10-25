@@ -431,7 +431,8 @@ export const PROTOCOL_CASES = [
     seed: "history",
     describe: "GIT_TRACE_PACKET handshakes for both protocol versions are parsed into the report " +
       "(advertised capability lines per endpoint — the Round-8 test-generated matrix input); asserts: " +
-      "version lines parse, ours NEVER advertises filter, and advertised shallow implies the deepen " +
+      "version lines parse, ours NEVER advertises filter, ours advertises the agent capability in " +
+      "git's key=value convention (agent=<name>/<version>), and advertised shallow implies the deepen " +
       "family is handled-or-rejected (proven in-place with a depth-1 probe)",
     async run(t) {
       const isOurs = t.endpointKind === "ours";
@@ -458,7 +459,12 @@ export const PROTOCOL_CASES = [
       const shallowAdvertised = capTokens.has("shallow") || v2FetchArgs.includes("shallow");
       t.note("filter_advertised", filterAdvertised);
       t.note("shallow_advertised", shallowAdvertised);
-      const agentToken = [...v0Caps, ...v2Caps].find((c) => /^agent=/.test(c)) ?? [...v2Caps, ...v0Caps].find((c) => /^d?git\//.test(c)) ?? null;
+      // git convention: the agent capability is a key=value token
+      // (agent=<name>/<version>) in both the v2 capability advert and the v0
+      // capability list. Ours used to advertise a bare `dgit/0.3` token
+      // (differential-matrix quirk, recorded 2026-10-25, fixed in the engine);
+      // the key=value form is the recorded expectation, asserted on ours below.
+      const agentToken = [...v0Caps, ...v2Caps].find((c) => /^agent=/.test(c)) ?? null;
       t.note("agent_token", agentToken);
 
       // THE Round-8 assertion: unadvertised-and-rejected beats
@@ -468,6 +474,8 @@ export const PROTOCOL_CASES = [
       if (isOurs) {
         t.check("ours-never-advertises-filter", !filterAdvertised,
           `filter in advert: v0 caps = [${v0Caps.filter((c) => c === "filter").join("")}], v2 fetch args = [${v2FetchArgs.join(" ")}]`);
+        t.check("ours-advertises-agent-key-value", agentToken !== null && /^agent=[^/\s]+\/\S/.test(agentToken),
+          `agent capability = ${String(agentToken)} — expected the key=value form agent=<name>/<version> per git convention`);
       } else {
         t.note("filter_check_scope", "the never-advertise-filter assertion applies to ours only; this endpoint's advert is recorded for the matrix");
       }
