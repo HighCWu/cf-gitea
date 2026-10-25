@@ -32,6 +32,8 @@ import {
   repositories,
   trackedTimes,
   users,
+  webhookDeliveries,
+  webhooks,
 } from "../../db/schema";
 import {
   STUB_USER,
@@ -231,6 +233,34 @@ function issueRow(issueId: number) {
     .then((rows) => rows[0]!);
 }
 
+/** Active webhook subscribed to the given events — the fan-out matcher target. */
+async function seedHook(repoId: string, events: string[]): Promise<number> {
+  const rows = await drizzle(env.DB)
+    .insert(webhooks)
+    .values({
+      repoId,
+      url: "https://hooks.invalid/assignee-test",
+      events: JSON.stringify({ choose_events: true, branch_filter: "*", events: Object.fromEntries(events.map((e) => [e, true])) }),
+      isActive: true,
+      type: "gitea",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning({ id: webhooks.id })
+    .then((rows) => rows[0]!);
+  return rows.id;
+}
+
+type DeliveryRow = typeof webhookDeliveries.$inferSelect;
+
+async function deliveriesFor(hookId: number): Promise<DeliveryRow[]> {
+  return drizzle(env.DB)
+    .select()
+    .from(webhookDeliveries)
+    .where(eq(webhookDeliveries.hookId, hookId))
+    .all();
+}
+
 // ---------------------------------------------------------------------------
 // assignees
 // ---------------------------------------------------------------------------
@@ -357,6 +387,121 @@ describe("POST/DELETE /repos/{owner}/{repo}/issues/{index}/assignees (issueAddAs
     expect(((await vault.json<Record<string, unknown>>())).message).toBe(
       `user doesn't have access to repo [user_id: ${neighborId}, repo_name: vault]`,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue_assign / pull_request_assign webhook emissions (upstream
+// services/webhook/notifier.go IssueChangeAssignee:161-202 — ONE event per
+// actually-changed assignee, action assigned/unassigned, the one-element
+// changes.added_assignees / removed_assignees block; the `issue.IsPull`
+// discriminant picks the event type).
+// ---------------------------------------------------------------------------
+
+describe("assignee webhook emissions (issueAddAssignees / issueRemoveAssignees)", () => {
+  it("emits one issue_assign assigned event per added assignee with changes.added_assignees", async () => {
+    const hookId = await seedHook(REPO_ID, ["issue_assign"]);
+
+    const res = await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/assignees`, authed(jsonBody({ assignees: ["neighbor", "recluse"] })));
+    expect(res.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_assign", "issue_assign"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["assigned", "assigned"]);
+    const first = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 IssuePayload (hook.go:435) + the ChangesPayload assignee side.
+    expect(Object.keys(first).sort()).toEqual(["action", "changes", "commit_id", "issue", "number", "repository", "sender"]);
+    expect(first.number).toBe(issueA.index);
+    // The changed side only (ChangesPayload.assignees lists are omitempty)
+    // with the one assignee rendered as the §2.7 User object.
+    expect(Object.keys(first.changes as object).sort()).toEqual(["added_assignees"]);
+    const firstChanges = first.changes as { added_assignees: Array<Record<string, unknown>> };
+    expect(firstChanges.added_assignees).toHaveLength(1);
+    expect(firstChanges.added_assignees[0]).toMatchObject({ login: "neighbor" });
+    expect(first.commit_id).toBe("");
+    expect(first.sender).toMatchObject({ login: "cf-gitea-stub" });
+    expect(first.repository).toMatchObject({ full_name: "cf-gitea-stub/writes" });
+    // The payload issue renders the POST-change assignee set (upstream
+    // ToAPIIssue LoadAssignees) through the module's enriched wire.
+    const second = JSON.parse(deliveries[1]!.payloadContent) as {
+      changes: { added_assignees: Array<{ login: string }> };
+      issue: { assignees: Array<{ login: string }> | null };
+    };
+    expect(second.changes.added_assignees.map((u) => u.login)).toEqual(["recluse"]);
+    expect(second.issue.assignees?.map((u) => u.login)).toEqual(["neighbor", "recluse"]);
+  });
+
+  it("emits unassigned with changes.removed_assignees on DELETE and the emptied issue assignee set", async () => {
+    const hookId = await seedHook(REPO_ID, ["issue_assign"]);
+    const path = `/repos/cf-gitea-stub/writes/issues/${issueA.index}/assignees`;
+    expect((await send(path, authed(jsonBody({ assignees: ["neighbor"] })))).status).toBe(201);
+
+    expect((await send(path, authed(jsonBody({ assignees: ["neighbor"] }, "DELETE")))).status).toBe(200);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_assign", "issue_assign"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["assigned", "unassigned"]);
+    const removed = JSON.parse(deliveries[1]!.payloadContent) as {
+      changes: { removed_assignees: Array<Record<string, unknown>> };
+      issue: { assignees: Array<unknown> | null };
+    };
+    expect(Object.keys(removed.changes as object).sort()).toEqual(["removed_assignees"]);
+    expect(removed.changes.removed_assignees).toHaveLength(1);
+    expect(removed.changes.removed_assignees[0]).toMatchObject({ login: "neighbor" });
+    expect(removed.issue.assignees).toBeNull();
+  });
+
+  it("stays silent for no-op assign/unassign writes, push-only hooks, and sibling subscriptions", async () => {
+    const hookId = await seedHook(REPO_ID, ["issue_assign"]);
+    const pushHook = await seedHook(REPO_ID, ["push"]); // push-only-style selection
+    const issuesHook = await seedHook(REPO_ID, ["issues"]);
+    const path = `/repos/cf-gitea-stub/writes/issues/${issueA.index}/assignees`;
+
+    expect((await send(path, authed(jsonBody({ assignees: ["neighbor"] })))).status).toBe(201);
+    expect(await deliveriesFor(hookId)).toHaveLength(1);
+
+    // Already-assigned → AddAssigneeIfNotAssigned skips, no notification.
+    expect((await send(path, authed(jsonBody({ assignees: ["neighbor"] })))).status).toBe(201);
+    // Not-assigned removal → the silent skip, no notification.
+    expect((await send(path, authed(jsonBody({ assignees: ["recluse"] }, "DELETE")))).status).toBe(200);
+    expect(await deliveriesFor(hookId)).toHaveLength(1);
+    expect(await deliveriesFor(pushHook)).toHaveLength(0);
+    expect(await deliveriesFor(issuesHook)).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(webhookDeliveries).all()).toHaveLength(1);
+  });
+
+  it("routes PR assignee writes to pull_request_assign with the PullRequestPayload field set", async () => {
+    const service = new IssuesService(env.DB);
+    const pull = await service.createPullRequest({
+      repoId: REPO_ID,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "PR assignees",
+      posterId: 1,
+    });
+    const hookId = await seedHook(REPO_ID, ["pull_request_assign"]);
+    const issuesHook = await seedHook(REPO_ID, ["issue_assign"]);
+
+    const res = await send(`/repos/cf-gitea-stub/writes/issues/${pull.issue.index}/assignees`, authed(jsonBody({ assignees: ["neighbor"] })));
+    expect(res.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request_assign");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 PullRequestPayload (hook.go:484) + the ChangesPayload assignee
+    // side — the landed pulls.ts emission field set.
+    expect(Object.keys(payload).sort()).toEqual(["action", "changes", "commit_id", "number", "pull_request", "repository", "sender"]);
+    expect(payload.action).toBe("assigned");
+    expect(payload.number).toBe(pull.issue.index);
+    expect((payload.changes as { added_assignees: Array<{ login: string }> }).added_assignees.map((u) => u.login)).toEqual(["neighbor"]);
+    expect((payload.pull_request as Record<string, unknown>).title).toBe("PR assignees");
+    // A pull_request_assign-subscribed hook never sees issue_assign traffic.
+    expect(await deliveriesFor(issuesHook)).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(webhookDeliveries).all()).toHaveLength(1);
   });
 });
 

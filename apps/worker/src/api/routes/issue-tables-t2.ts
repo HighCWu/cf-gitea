@@ -12,6 +12,7 @@ import {
   issuePins,
   issueStopwatches,
   issues,
+  pullRequests,
   repositories,
   trackedTimes,
   users,
@@ -19,11 +20,13 @@ import {
 import { CommentType } from "../../issues/comment-types";
 import { IssueNotExistError } from "../../issues/errors";
 import type { IssueRow } from "../../issues/service";
+import { emitIssueEvent, issueEventIdentity } from "../../services/issue-events";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { issueListSchema, issueSchema } from "../models/issue";
 import type { Issue } from "../models/issue";
+import { toApiPullRequest } from "../services/pulls";
 import { canWriteRepository, isRepositoryAdmin } from "../services/repo-access";
 import { findCollaborator } from "../services/repo-collaborators";
 import {
@@ -35,7 +38,7 @@ import {
   findUserByName,
   viewerOf,
 } from "../services/repository";
-import type { RepositoryRow, RepositoryWithOwner, Viewer } from "../services/repository";
+import type { RepositoryRow, RepositoryWithOwner, UserRow, Viewer } from "../services/repository";
 import {
   findIssueByRepoAndIndex,
   issueErrorToApiError,
@@ -140,6 +143,15 @@ import {
  *   - GET …/times embeds the full issue in every entry (upstream
  *     ToTrackedTime after LoadAttributes); the `user` query filter behaves
  *     upstream-exact including the cantSetUser scoping (:108-119).
+ *
+ * Webhook triggers: the assignees POST/DELETE emit `issue_assign` /
+ * `pull_request_assign` through the shared issue-family seam
+ * (emitIssueEvent, src/services/issue-events.ts) — ONE `assigned` /
+ * `unassigned` event per actually-changed assignee, in the post-write notify
+ * position upstream's AddAssignees/RemoveAssignees hold (services/issue/
+ * assignee.go:236-247 / :274-286 → services/webhook/notifier.go
+ * IssueChangeAssignee:161-202; `changes.added_assignees` /
+ * `changes.removed_assignees`, the IsPull discriminant picks the type).
  */
 
 // ---------------------------------------------------------------------------
@@ -798,15 +810,18 @@ async function writeAssigneeComment(d1: D1Database, issue: IssueRow, assigneeId:
  * user aborts with the upstream 400/403 (validateAssignee) before its own
  * insert — earlier inserts of the same call stand (upstream's tx rolls the
  * whole add back; we keep the committed prefix, see header deviations).
+ * Returns the assignees actually added — upstream notifies per changed
+ * assignee after the writes (assignee.go:236-247).
  */
 async function addIssueAssignees(
   d1: D1Database,
   issue: IssueRow,
-  assignees: Array<{ id: number; isAdmin: boolean; type: string }>,
+  assignees: UserRow[],
   found: RepositoryWithOwner,
   actorId: number,
   now: Date,
-): Promise<void> {
+): Promise<UserRow[]> {
+  const added: UserRow[] = [];
   for (const user of assignees) {
     await requireAssignable(d1, found, user);
     const existing = await drizzle(d1)
@@ -826,26 +841,101 @@ async function addIssueAssignees(
     if (inserted.length === 0) {
       continue; // a concurrent add won the unique index — same skip
     }
+    added.push(user);
     await writeAssigneeComment(d1, issue, user.id, false, actorId, now);
   }
+  return added;
 }
 
 /**
  * RemoveAssignees (services/issue/assignee.go:249-286) reduced: per
  * assigned user — the delete + the type-9 removal comment. Users not
- * assigned are skipped silently (isAssigned → continue).
+ * assigned are skipped silently (isAssigned → continue). Returns the
+ * assignees actually removed — upstream notifies per changed assignee
+ * after the writes (assignee.go:274-286).
  */
-async function removeIssueAssignees(d1: D1Database, issue: IssueRow, assignees: Array<{ id: number }>, actorId: number, now: Date): Promise<void> {
+async function removeIssueAssignees(d1: D1Database, issue: IssueRow, assignees: UserRow[], actorId: number, now: Date): Promise<UserRow[]> {
+  const removed: UserRow[] = [];
   for (const user of assignees) {
-    const removed = await drizzle(d1)
+    const deleted = await drizzle(d1)
       .delete(issueAssignees)
       .where(and(eq(issueAssignees.issueId, issue.id), eq(issueAssignees.assigneeId, user.id)))
       .returning({ id: issueAssignees.id });
-    if (removed.length === 0) {
+    if (deleted.length === 0) {
       continue;
     }
+    removed.push(user);
     await writeAssigneeComment(d1, issue, user.id, true, actorId, now);
   }
+  return removed;
+}
+
+/** The single PR row of an issue (upstream `issue.LoadPullRequest`). */
+async function findPullRequestRowByIssueId(d1: D1Database, issueId: number) {
+  const rows = await drizzle(d1).select().from(pullRequests).where(eq(pullRequests.issueId, issueId)).limit(1).all();
+  return rows[0] ?? null;
+}
+
+/**
+ * The assignee add/remove webhook (services/webhook/notifier.go
+ * IssueChangeAssignee:161-202): ONE event per actually-changed assignee, in
+ * the handler AFTER the writes committed (the AddAssignees/RemoveAssignees
+ * post-tx notify loops). action=assigned/unassigned; `changes` carries the
+ * one-element `added_assignees` / `removed_assignees` side (ChangesPayload,
+ * hook.go:486-489 — the lists are omitempty, only the changed side is set).
+ * The `issue.IsPull` discriminant picks issue_assign vs pull_request_assign;
+ * the payload's issue object renders the POST-change assignee set
+ * (upstream's ToAPIIssue LoadAssignees — convert/issue.go:105-112) through
+ * the module's assignee-enriched wire; a missing PR row skips the emission
+ * (the issues.ts label/milestone pull-arm degradation).
+ */
+async function emitAssignEvent(
+  c: Context<ApiEnv>,
+  found: RepositoryWithOwner,
+  issue: IssueRow,
+  assignee: UserRow,
+  removed: boolean,
+): Promise<void> {
+  const event = issueEventIdentity(viewerOf(c), found, c.get("authUser"));
+  const changes = removed
+    ? { removed_assignees: [apiUserFromRow(assignee, viewerOf(c))] }
+    : { added_assignees: [apiUserFromRow(assignee, viewerOf(c))] };
+  const action = removed ? "unassigned" : "assigned";
+  if (issue.isPull) {
+    const pr = await findPullRequestRowByIssueId(c.env.DB, issue.id);
+    if (pr === null) {
+      return;
+    }
+    await emitIssueEvent(c, {
+      repoId: found.repo.id,
+      ownerId: event.ownerId,
+      eventType: "pull_request_assign",
+      payload: {
+        action,
+        number: issue.index,
+        changes,
+        pull_request: await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "single"),
+        repository: event.repository,
+        sender: event.sender,
+        commit_id: "",
+      },
+    });
+    return;
+  }
+  await emitIssueEvent(c, {
+    repoId: found.repo.id,
+    ownerId: event.ownerId,
+    eventType: "issue_assign",
+    payload: {
+      action,
+      number: issue.index,
+      changes,
+      issue: await toApiIssueWithAssignees(c.env.DB, viewerOf(c), found, issue),
+      repository: event.repository,
+      sender: event.sender,
+      commit_id: "",
+    },
+  });
 }
 
 /**
@@ -1198,6 +1288,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // POST …/issues/{index}/assignees (issueAddAssignees) — writer-only,
   // archived-gated; per-name resolution (422), assignability (400 org /
   // 403 access); new assignees get the type-9 comment; 201 with the issue.
+  // Webhook: one issue_assign / pull_request_assign `assigned` event per
+  // actually-added assignee (IssueChangeAssignee:161, post-write).
   // -------------------------------------------------------------------------
   app.openapi(addAssigneesRoute(requireAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
@@ -1206,14 +1298,19 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     await assertIssueWriter(c, found);
     const names = c.req.valid("json").assignees ?? [];
     const assignees = await resolveAssigneesByName(c.env.DB, names);
-    await addIssueAssignees(c.env.DB, issue, assignees, found, requireDoerId(c), new Date());
-    const reloaded = await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index);
-    return c.json(await toApiIssueWithAssignees(c.env.DB, viewer, found, reloaded ?? issue), 201);
+    const added = await addIssueAssignees(c.env.DB, issue, assignees, found, requireDoerId(c), new Date());
+    const reloaded = (await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index)) ?? issue;
+    for (const user of added) {
+      await emitAssignEvent(c, found, reloaded, user, false);
+    }
+    return c.json(await toApiIssueWithAssignees(c.env.DB, viewer, found, reloaded), 201);
   });
 
   // -------------------------------------------------------------------------
   // DELETE …/issues/{index}/assignees (issueRemoveAssignees) — the removal
   // twin: assigned users drop with the type-9 removal comment; 200.
+  // Webhook: one `unassigned` event per actually-removed assignee
+  // (IssueChangeAssignee:161 with removed=true, post-write).
   // -------------------------------------------------------------------------
   app.openapi(removeAssigneesRoute(requireAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
@@ -1222,9 +1319,12 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     await assertIssueWriter(c, found);
     const names = c.req.valid("json").assignees ?? [];
     const assignees = await resolveAssigneesByName(c.env.DB, names);
-    await removeIssueAssignees(c.env.DB, issue, assignees, requireDoerId(c), new Date());
-    const reloaded = await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index);
-    return c.json(await toApiIssueWithAssignees(c.env.DB, viewer, found, reloaded ?? issue), 200);
+    const removed = await removeIssueAssignees(c.env.DB, issue, assignees, requireDoerId(c), new Date());
+    const reloaded = (await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index)) ?? issue;
+    for (const user of removed) {
+      await emitAssignEvent(c, found, reloaded, user, true);
+    }
+    return c.json(await toApiIssueWithAssignees(c.env.DB, viewer, found, reloaded), 200);
   });
 
   // -------------------------------------------------------------------------

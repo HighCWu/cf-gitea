@@ -128,6 +128,9 @@ import {
  * `pull_request_label` through the same seam — see emitLabelEvent (the
  * `issue.IsPull` discriminant picks the event type, per upstream
  * services/webhook/notifier.go IssueChangeLabels:572 / IssueClearLabels:46).
+ * The PATCH milestone change emits `issue_milestone` / `pull_request_milestone`
+ * the same way — emitMilestoneEvent (IssueChangeMilestone:618-647; action
+ * milestoned/demilestoned, no `changes` block).
  */
 
 const notFoundResponse = {
@@ -276,19 +279,22 @@ async function findPullRequestRowByIssueId(d1: D1Database, issueId: number): Pro
   return rows[0] ?? null;
 }
 
-/** The shared PullRequestPayload wrapper for the label events — the same
- *  field set the landed pulls.ts emissions use (§2.7, hook.go:484 minus the
- *  null-only `requested_reviewer`/`review` fields, before/after omitted). */
+/** The shared PullRequestPayload wrapper for the label/milestone events — the
+ *  same field set the landed pulls.ts emissions use (§2.7, hook.go:484 minus
+ *  the null-only `requested_reviewer`/`review` fields, before/after omitted;
+ *  `changes` only when the notifier sets one). */
 function pullRequestEventPayload(
   action: string,
   apiPullRequest: Awaited<ReturnType<typeof toApiPullRequest>>,
   index: number,
   repository: unknown,
   sender: unknown,
+  options: { changes?: Record<string, unknown> } = {},
 ): Record<string, unknown> {
   return {
     action,
     number: index,
+    ...(options.changes === undefined ? {} : { changes: options.changes }),
     pull_request: apiPullRequest,
     repository,
     sender,
@@ -374,6 +380,50 @@ async function emitLabelEvent(
     repoId: found.repo.id,
     ownerId: event.ownerId,
     eventType: "issue_label",
+    payload: issueEventPayload(action, await toApiIssue(c.env.DB, viewerOf(c), found, issue), issue.index, event.repository, event.sender),
+  });
+}
+
+/**
+ * The milestone set/clear webhook: `issue_milestone` / `pull_request_milestone`
+ * picked by the upstream `issue.IsPull` discriminant (services/webhook/
+ * notifier.go IssueChangeMilestone:618-647). action=milestoned when the issue
+ * now carries a milestone, demilestoned on the clear (structs/hook.go:422-425
+ * — NOT entered/exited); the payload is the shared Issue/PullRequest wrapper
+ * with NO `changes` block — upstream's milestone notifier sets none. The pull
+ * arm renders ToPayloadPullRequest through toApiPullRequest; a missing PR row
+ * skips the emission (the label events' LoadPullRequest degradation).
+ */
+async function emitMilestoneEvent(
+  c: Context<ApiEnv>,
+  found: RepositoryWithOwner,
+  issue: IssueRow,
+  action: "milestoned" | "demilestoned",
+): Promise<void> {
+  const event = issueEventContext(c, found);
+  if (issue.isPull) {
+    const pr = await findPullRequestRowByIssueId(c.env.DB, issue.id);
+    if (pr === null) {
+      return;
+    }
+    await emitIssueEvent(c, {
+      repoId: found.repo.id,
+      ownerId: event.ownerId,
+      eventType: "pull_request_milestone",
+      payload: pullRequestEventPayload(
+        action,
+        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "single"),
+        issue.index,
+        event.repository,
+        event.sender,
+      ),
+    });
+    return;
+  }
+  await emitIssueEvent(c, {
+    repoId: found.repo.id,
+    ownerId: event.ownerId,
+    eventType: "issue_milestone",
     payload: issueEventPayload(action, await toApiIssue(c.env.DB, viewerOf(c), found, issue), issue.index, event.repository, event.sender),
   });
 }
@@ -1161,6 +1211,10 @@ export function registerIssueRoutes(
       const oldMilestoneId = issue.milestoneId;
       await changeIssueMilestone(c.env.DB, issue, newMilestoneId, oldMilestoneId, actorId, now);
       issue = { ...issue, milestoneId: newMilestoneId };
+      // Webhook: IssueChangeMilestone (notifier.go:618) — milestoned when the
+      // issue now carries one, demilestoned on the clear; the IsPull
+      // discriminant picks issue_milestone / pull_request_milestone.
+      await emitMilestoneEvent(c, found, issue, newMilestoneId !== null ? "milestoned" : "demilestoned");
     }
 
     // form.assignee(s): upstream replaces the assignee set — no

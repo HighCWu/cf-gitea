@@ -1372,6 +1372,110 @@ describe("comment edit/delete webhook emissions (issueEditComment / issueDeleteC
 });
 
 // ---------------------------------------------------------------------------
+// issue_milestone / pull_request_milestone webhook emissions (upstream
+// services/webhook/notifier.go IssueChangeMilestone:618-647 — the
+// `issue.IsPull` discriminant picks the event type; action milestoned on a
+// set and demilestoned on a clear, NO `changes` block).
+// ---------------------------------------------------------------------------
+
+describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)", () => {
+  it("emits milestoned on the set and demilestoned on the clear, with the IssuePayload field set", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const milestoneId = await seedMilestone(repoId, "v1");
+    await seedIssue(repoId, "milestoned", { posterId: 1 });
+    const hookId = await seedHook(repoId, ["issue_milestone"]);
+
+    const set = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ milestone: milestoneId }),
+    });
+    expect(set.status).toBe(201);
+
+    const clear = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ milestone: 0 }),
+    });
+    expect(clear.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_milestone", "issue_milestone"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["milestoned", "demilestoned"]);
+    const setPayload = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 IssuePayload (hook.go:435) — the milestone notifier sets NO `changes`.
+    expect(Object.keys(setPayload).sort()).toEqual(["action", "commit_id", "issue", "number", "repository", "sender"]);
+    expect(setPayload.number).toBe(1);
+    expect((setPayload.issue as { milestone: { id: number } | null }).milestone?.id).toBe(milestoneId);
+    expect(setPayload.repository).toMatchObject({ full_name: "alice/visible" });
+    expect(deliveries[1]!.payloadContent).toContain('\n  "action": "demilestoned"');
+    expect((JSON.parse(deliveries[1]!.payloadContent) as { issue: { milestone: unknown } }).issue.milestone).toBeNull();
+  });
+
+  it("stays silent on an unchanged milestone PATCH, for push-only hooks, and for sibling subscriptions", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const milestoneId = await seedMilestone(repoId, "v1");
+    await seedIssue(repoId, "quiet", { posterId: 1, milestoneId });
+    const hookId = await seedHook(repoId, ["issue_milestone"]);
+    const pushHook = await seedHook(repoId, ["push"]); // push_only-style selection
+    const issuesHook = await seedHook(repoId, ["issues"]);
+
+    // Same milestone again → upstream's `!=` guard skips the change entirely.
+    const noop = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ milestone: milestoneId }),
+    });
+    expect(noop.status).toBe(201);
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+    expect(await deliveriesFor(pushHook)).toHaveLength(0);
+    expect(await deliveriesFor(issuesHook)).toHaveLength(0);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(0);
+  });
+
+  it("routes PR milestone writes to pull_request_milestone with the PullRequestPayload field set", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const milestoneId = await seedMilestone(repoId, "v1");
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "PR milestone",
+      posterId: 1,
+    });
+    const hookId = await seedHook(repoId, ["pull_request_milestone"]);
+    const issuesHook = await seedHook(repoId, ["issue_milestone"]);
+
+    const set = await router()(`/repos/alice/visible/issues/${pull.issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ milestone: milestoneId }),
+    });
+    expect(set.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request_milestone");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 PullRequestPayload (hook.go:484) minus the null-only
+    // requested_reviewer/review fields — the landed pulls.ts emission shape.
+    expect(Object.keys(payload).sort()).toEqual(["action", "commit_id", "number", "pull_request", "repository", "sender"]);
+    expect(payload.action).toBe("milestoned");
+    expect(payload.number).toBe(pull.issue.index);
+    expect((payload.pull_request as Record<string, unknown>).number).toBe(pull.pullRequest.index);
+    // A pull_request_milestone-subscribed hook never sees issue_milestone
+    // traffic and vice versa.
+    expect(await deliveriesFor(issuesHook)).toHaveLength(0);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /repos/{owner}/{repo}/issues/{index}/timeline (issueGetCommentsAndTimeline)
 // ---------------------------------------------------------------------------
 
