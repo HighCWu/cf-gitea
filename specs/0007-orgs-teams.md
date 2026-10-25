@@ -504,3 +504,13 @@ git-HTTP gate, and rendered permissions cannot drift. Remaining known: the
 UI render-gate forks (file-editor canWriteRepo / settings canAdminRepo read
 collaboratorModeOf only — team members can POST but don't SEE the controls;
 the service seam carries the grant underneath).
+
+**§3.5(c) COMPLETE (2026-10-25, 05d1f2c + 17b6c94)**: the UI render gates
+ride the service predicates (sessionRepoGrant bridge — zero predicate forks,
+anonymous zero-read) and the page-visibility seam carries the team grant
+(fast-arms first, ONE team lookup only on miss). Verified in production at
+f4b740b6: a read-team member sees the private org repo's page via a real
+session (200, signed-in chrome, correctly NO admin controls) and the API
+grants pull-only — every surface (API, git-HTTP, page visibility, render
+gates) now rides the one composition. SPEC-0007's team story is closed
+end-to-end.
