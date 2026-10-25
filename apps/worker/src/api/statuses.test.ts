@@ -7,15 +7,31 @@
  * semantics of gitea/models/git/commit_status.go, and the byte-exact error
  * bodies. The ref-vs-sha wave limitation (full-length ids only, engine TODO)
  * is pinned here too.
+ *
+ * The `status` webhook emission tests (repoCreateStatus → upstream
+ * services/webhook/notifier.go CreateCommitStatus:925) run against REAL
+ * engine content: the ui/testing seed-repo push pattern seeds commits through
+ * the receive flow (the pull-engine.test.ts convention) so the payload's
+ * commit object renders; a well-formed-but-unknown sha stores its row yet
+ * stays silent (upstream never reaches the notifier for an unresolvable
+ * commit — the documented deviation's observable twin).
  */
 
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
+import { eq } from "drizzle-orm";
+import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { commitStatuses, repositories, users } from "../db/schema";
-import { STUB_USER } from "./auth";
+import { ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
+import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { commitStatuses, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { STUB_USER, type AuthResolver } from "./auth";
+import { createTokenAuthMiddleware } from "./auth";
+import { giteaErrorHandler } from "./errors";
+import type { ApiEnv } from "./env";
+import { registerStatusRoutes } from "./routes/statuses";
 import { createApiRouter } from "./router";
 import contract from "../compat/contract/v1-swagger.generated.json";
 
@@ -24,10 +40,25 @@ beforeAll(async () => {
     throw new Error("TEST_MIGRATIONS binding missing — vitest.config.ts must inject readD1Migrations()");
   }
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
+  // The emission describe's seed mints real personal-access tokens
+  // (ensureSeededRepo → mintFor) — the auth tables must exist.
+  await applyAuthD1Migrations();
 });
 
 beforeEach(async () => {
-  for (const table of ["commit_statuses", "repositories", "users"]) {
+  // FK delete order: deliveries→hooks, statuses/tokens (users refs), then the
+  // repository-referencing rows (releases, repo_counters — the emission
+  // describe's push-create seeds counters) before their parents.
+  for (const table of [
+    "webhook_deliveries",
+    "webhooks",
+    "commit_statuses",
+    "personal_access_tokens",
+    "releases",
+    "repo_counters",
+    "repositories",
+    "users",
+  ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
 });
@@ -483,5 +514,175 @@ describe("GET /repos/{owner}/{repo}/commits/{ref}/status (repoGetCombinedStatusB
     const ghost = await router()(`/repos/alice/ghost/commits/${SHA}/status`);
     expect(ghost.status).toBe(404);
     expect(await ghost.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `status` webhook emissions (repoCreateStatus → upstream CreateCommitStatus
+// notifier.go:925) — REAL engine content (the pull-engine.test.ts pattern:
+// seed-repo pushes through the receive flow; routes mount locally with a
+// resolver for the seeded owner).
+// ---------------------------------------------------------------------------
+
+const EMIT_OWNER = "statuses-suite";
+const EMIT_SLUG = "ci";
+const EMIT_TOKEN = "status-suite-token";
+const T0 = 1_762_000_000;
+
+const EMIT_COMMITS: SeedCommit[] = [
+  {
+    message: "base: initial commit",
+    time: T0,
+    files: [
+      { path: "README.md", content: "# status suite\n" },
+      { path: "shared.txt", content: "shared base\n" },
+    ],
+  },
+  {
+    message: "base: docs",
+    time: T0 + 30,
+    files: [
+      // README.md's CONTENT changes here — the diff is content-based, so the
+      // tip commit diffs as modified(README.md) + added(docs/base.txt).
+      { path: "README.md", content: "# status suite v2\n" },
+      { path: "shared.txt", content: "shared base\n" },
+      { path: "docs/base.txt", content: "base doc\n" },
+    ],
+  },
+];
+
+describe("POST /repos/{owner}/{repo}/statuses/{sha} webhook emissions (status)", () => {
+  let ownerId = 0;
+
+  beforeEach(async () => {
+    // The file-level wipe runs first; re-seed idempotently (re-pushes when
+    // the isolate has no HEAD, re-creates the wiped D1 rows).
+    const seeded = await ensureSeededRepo({ owner: EMIT_OWNER, slug: EMIT_SLUG, commits: EMIT_COMMITS });
+    void seeded;
+    const row = await db().select({ id: users.id }).from(users).where(eq(users.usernameLower, EMIT_OWNER)).get();
+    if (row === undefined) throw new Error("status-suite owner missing");
+    ownerId = row.id;
+  });
+
+  function identity() {
+    return { ...STUB_USER, id: ownerId, login: EMIT_OWNER, full_name: EMIT_OWNER, created: new Date(T0 * 1000).toISOString() };
+  }
+
+  const resolver: AuthResolver = {
+    resolveToken: (token) => Promise.resolve(token === EMIT_TOKEN ? identity() : null),
+  };
+
+  function emitApp(): (path: string, init?: RequestInit) => Promise<Response> {
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerStatusRoutes(app, createTokenAuthMiddleware(resolver), createTokenAuthMiddleware(resolver));
+    return (path, init) => Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), env));
+  }
+
+  async function seedEmitHook(events: string[]): Promise<number> {
+    const repo = await db().select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, EMIT_SLUG)).get();
+    if (repo === undefined) throw new Error("status-suite repo missing");
+    const rows = await db()
+      .insert(webhooks)
+      .values({
+        repoId: repo.id,
+        url: "https://hooks.invalid/status-test",
+        events: JSON.stringify({ choose_events: true, branch_filter: "*", events: Object.fromEntries(events.map((e) => [e, true])) }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const row = rows[0];
+    if (row === undefined) throw new Error("hook seed failed");
+    return row.id;
+  }
+
+  const authedInit = (body: unknown): RequestInit => ({
+    method: "POST",
+    headers: { Authorization: `token ${EMIT_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  it("emits `status` with the CommitStatusPayload field set and the enriched engine commit", async () => {
+    const seeded = await ensureSeededRepo({ owner: EMIT_OWNER, slug: EMIT_SLUG, commits: EMIT_COMMITS });
+    const tip = seeded.tips[1] as string;
+    const hookId = await seedEmitHook(["status"]);
+
+    const res = await emitApp()(`/repos/${EMIT_OWNER}/${EMIT_SLUG}/statuses/${tip}`, authedInit({
+      state: "success",
+      context: "ci/test",
+      target_url: "https://ci.example.com/1",
+      description: "tests passed",
+    }));
+    expect(res.status).toBe(201);
+
+    const deliveries = await db().select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
+    expect(deliveries).toHaveLength(1);
+    const delivery = deliveries[0]!;
+    expect(delivery.eventType).toBe("status");
+    expect(delivery.eventGroup).toBe("status"); // not in EVENT_GROUPS → identity group
+    expect(delivery.state).toBe("pending");
+    const payload = JSON.parse(delivery.payloadContent) as Record<string, unknown>;
+    // §2.7 CommitStatusPayload (hook.go:647): NO `action` field.
+    expect(Object.keys(payload).sort()).toEqual([
+      "commit",
+      "context",
+      "created_at",
+      "description",
+      "id",
+      "repository",
+      "sender",
+      "sha",
+      "state",
+      "target_url",
+      "updated_at",
+    ]);
+    expect(payload.context).toBe("ci/test");
+    expect(payload.sha).toBe(tip);
+    expect(payload.state).toBe("success");
+    expect(payload.target_url).toBe("https://ci.example.com/1");
+    expect(payload.description).toBe("tests passed");
+    expect(payload.repository).toMatchObject({ full_name: `${EMIT_OWNER}/${EMIT_SLUG}` });
+    expect(payload.sender).toMatchObject({ login: EMIT_OWNER });
+    const commit = payload.commit as Record<string, unknown>;
+    // The commit renders through the shared toPayloadCommit + the push
+    // family's file-list enrichment (upstream ToAPIPayloadCommit,
+    // modules/repository/commits.go:72,91-93): a root-commit diff against the
+    // empty tree lists every path as added.
+    expect(commit.id).toBe(tip);
+    expect(commit.message).toBe("base: docs\n"); // the raw commit message, newline included
+    expect(commit.url).toBe(`https://example.com/${EMIT_OWNER}/${EMIT_SLUG}/commit/${tip}`);
+    expect(commit.added).toEqual(["docs/base.txt"]);
+    expect(commit.removed).toEqual([]);
+    expect(commit.modified).toEqual(["README.md"]);
+    expect(delivery.payloadContent).toContain('\n  "context": "ci/test"');
+  });
+
+  it("stores a well-formed unknown sha (201, the documented deviation) but emits nothing", async () => {
+    const seeded = await ensureSeededRepo({ owner: EMIT_OWNER, slug: EMIT_SLUG, commits: EMIT_COMMITS });
+    void seeded;
+    const hookId = await seedEmitHook(["status"]);
+    const ghostSha = "0123456789abcdef0123456789abcdef01234567";
+
+    const res = await emitApp()(`/repos/${EMIT_OWNER}/${EMIT_SLUG}/statuses/${ghostSha}`, authedInit({ state: "pending" }));
+    expect(res.status).toBe(201);
+
+    // Upstream parity: the commit never resolves, the notifier never fires.
+    const deliveries = await db().select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
+    expect(deliveries).toHaveLength(0);
+  });
+
+  it("stays silent for hooks not subscribed to status", async () => {
+    const seeded = await ensureSeededRepo({ owner: EMIT_OWNER, slug: EMIT_SLUG, commits: EMIT_COMMITS });
+    const tip = seeded.tips[0] as string;
+    const hookId = await seedEmitHook(["push"]); // not subscribed to status
+
+    const res = await emitApp()(`/repos/${EMIT_OWNER}/${EMIT_SLUG}/statuses/${tip}`, authedInit({ state: "success" }));
+    expect(res.status).toBe(201);
+    expect((await db().select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all())).toHaveLength(0);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(0);
   });
 });

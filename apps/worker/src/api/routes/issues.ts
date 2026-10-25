@@ -121,6 +121,10 @@ import {
  * comments), through the SHARED issue-family seam emitIssueEvent
  * (src/services/issue-events.ts) — the same fan-out the UI new-issue write
  * path runs (issueEventIdentity below is that module's identity assembly).
+ * The label family (POST/PUT/DELETE …/labels) emits `issue_label` /
+ * `pull_request_label` through the same seam — see emitLabelEvent (the
+ * `issue.IsPull` discriminant picks the event type, per upstream
+ * services/webhook/notifier.go IssueChangeLabels:572 / IssueClearLabels:46).
  */
 
 const notFoundResponse = {
@@ -1232,6 +1236,9 @@ export function registerIssueRoutes(
         asApiError(error);
         throw error;
       }
+      // Webhook: IssueChangeLabels (notifier.go:572) — upstream's service
+      // layer notifies unconditionally after AddLabels, with no `changes`.
+      await emitLabelEvent(c, found, issue, "label_updated");
       const rows = await issueLabelRows(c.env.DB, issue.id);
       return c.json(rows.map((row) => toApiLabel(row, apiRepositoryUrl(found, viewer.origin))), 200);
     },
@@ -1262,6 +1269,9 @@ export function registerIssueRoutes(
         asApiError(error);
         throw error;
       }
+      // Webhook: IssueChangeLabels (notifier.go:572) — ReplaceLabels notifies
+      // unconditionally too (services/issue/label.go:79-87).
+      await emitLabelEvent(c, found, issue, "label_updated");
       const rows = await issueLabelRows(c.env.DB, issue.id);
       return c.json(rows.map((row) => toApiLabel(row, apiRepositoryUrl(found, viewer.origin))), 200);
     },
@@ -1287,6 +1297,9 @@ export function registerIssueRoutes(
       asApiError(error);
       throw error;
     }
+    // Webhook: IssueClearLabels (notifier.go:46) — ClearLabels notifies
+    // unconditionally (services/issue/label.go:16-27), even on an empty set.
+    await emitLabelEvent(c, found, issue, "label_cleared");
     return c.body(null, 204);
   });
 

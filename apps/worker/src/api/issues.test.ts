@@ -1146,6 +1146,108 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
 });
 
 // ---------------------------------------------------------------------------
+// issue_label / pull_request_label webhook emissions (upstream
+// services/webhook/notifier.go IssueChangeLabels:572-605 / IssueClearLabels:
+// 46-73 — the `issue.IsPull` discriminant picks the event type; payload =
+// the shared Issue/PullRequest wrapper with NO `changes` block).
+// ---------------------------------------------------------------------------
+
+describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / issueClearLabels)", () => {
+  it("emits label_updated on POST and PUT and label_cleared on DELETE, with the IssuePayload field set", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const a = await seedLabel(repoId, "alpha");
+    const b = await seedLabel(repoId, "beta");
+    await seedIssue(repoId, "labeled");
+    const hookId = await seedHook(repoId, ["issue_label"]);
+
+    const add = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [a, b] }),
+    });
+    expect(add.status).toBe(200);
+
+    const replace = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "PUT",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [b] }),
+    });
+    expect(replace.status).toBe(200);
+
+    const clear = await router()("/repos/alice/visible/issues/1/labels", { method: "DELETE", headers: authHeaders });
+    expect(clear.status).toBe(204);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_label", "issue_label", "issue_label"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["label_updated", "label_updated", "label_cleared"]);
+    const added = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 IssuePayload (hook.go:435) — the label notifiers set NO `changes`.
+    expect(Object.keys(added).sort()).toEqual(["action", "commit_id", "issue", "number", "repository", "sender"]);
+    expect(added.number).toBe(1);
+    expect(added.commit_id).toBe("");
+    expect((added.issue as { labels: Array<{ id: number }> }).labels.map((l) => l.id)).toEqual([a, b]);
+    expect(added.repository).toMatchObject({ full_name: "alice/visible" });
+    expect(deliveries[2]!.payloadContent).toContain('\n  "action": "label_cleared"');
+  });
+
+  it("stays silent for hooks not subscribed to issue_label", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const labelId = await seedLabel(repoId, "bug");
+    await seedIssue(repoId, "quiet");
+    const hookId = await seedHook(repoId, ["issues"]); // sibling event, not issue_label
+
+    const add = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [labelId] }),
+    });
+    expect(add.status).toBe(200);
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(0);
+  });
+
+  it("routes PR label writes to pull_request_label with the PullRequestPayload field set", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const labelId = await seedLabel(repoId, "approved");
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "PR labels",
+      posterId: 1,
+    });
+    const hookId = await seedHook(repoId, ["pull_request_label"]);
+
+    const add = await router()(`/repos/alice/visible/issues/${pull.issue.index}/labels`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [labelId] }),
+    });
+    expect(add.status).toBe(200);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request_label");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 PullRequestPayload (hook.go:484) minus the null-only
+    // requested_reviewer/review fields — the landed pulls.ts emission shape.
+    expect(Object.keys(payload).sort()).toEqual(["action", "commit_id", "number", "pull_request", "repository", "sender"]);
+    expect(payload.action).toBe("label_updated");
+    expect(payload.number).toBe(pull.issue.index);
+    expect((payload.pull_request as Record<string, unknown>).number).toBe(pull.pullRequest.index);
+    expect((payload.pull_request as Record<string, unknown>).title).toBe("PR labels");
+    // A pull_request_label-subscribed hook never sees issue_label traffic and
+    // vice versa: the issue-arm event type would not match this config.
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /repos/{owner}/{repo}/issues/{index}/timeline (issueGetCommentsAndTimeline)
 // ---------------------------------------------------------------------------
 

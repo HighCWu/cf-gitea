@@ -5,13 +5,15 @@ import { and, eq, gt, gte, inArray, isNull, lt, sql } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import { z } from "zod";
 
-import { comments, issueLabels, issuePins, issues, labels } from "../../db/schema";
+import { comments, issueLabels, issuePins, issues, labels, pullRequests } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssueNotExistError } from "../../issues/errors";
-import type { IssueRow, LabelRow } from "../../issues/service";
-import { findIssueByRepoAndIndex, issueErrorToApiError } from "../services/issues";
+import type { IssueRow, LabelRow, PullRequestRow } from "../../issues/service";
+import { emitIssueEvent, issueEventIdentity, issueEventPayload, type IssueEventIdentity } from "../../services/issue-events";
+import { findIssueByRepoAndIndex, issueErrorToApiError, toApiIssue } from "../services/issues";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
+import { toApiPullRequest } from "../services/pulls";
 import { canWriteRepository } from "../services/repo-access";
 import { canViewRepository, findRepositoryByPath, viewerOf } from "../services/repository";
 import type { RepositoryWithOwner } from "../services/repository";
@@ -73,11 +75,18 @@ import type { RepositoryWithOwner } from "../services/repository";
  * detach only (upstream registers mustNotBeArchived there and NOT on the pin
  * group — the asymmetry is mirrored); the pin shift filters the issue/pull
  * split through an issues join because our `issue_pins` carries no is_pull
- * column (the landed listPinnedIssues does the same join); the label detach
- * emits no `issue_label` webhook — the landed POST/PUT/DELETE …/labels issue
- * routes don't either (routes/issues.ts), so the family stays consistent;
- * wiring the whole family's emissions needs routes/issues.ts edits and is
- * left to the orchestrator.
+ * column (the landed listPinnedIssues does the same join).
+ *
+ * Webhook trigger (SPEC-0005 §3.5, the wave that lifted the old
+ * "label detach emits nothing" deviation): the detach emits `issue_label` /
+ * `pull_request_label` through the SHARED issue-family seam emitIssueEvent
+ * (src/services/issue-events.ts) — see emitLabelDetachEvent. Upstream's
+ * RemoveLabel (services/issue/label.go:56-75 → IssueChangeLabels,
+ * services/webhook/notifier.go:572) notifies after the models-layer delete
+ * with NO affected-rows guard, so the not-attached (silent-204) path emits
+ * too; the payload is the shared Issue/PullRequest wrapper with action
+ * "label_updated" and no `changes` block, the `issue.IsPull` discriminant
+ * picks the event type.
  */
 
 const notFoundResponse = {
@@ -268,6 +277,71 @@ function assertNotArchived(found: RepositoryWithOwner): void {
   if (found.repo.isArchived) {
     throw new ApiError(423, "repo is archived");
   }
+}
+
+// ---------------------------------------------------------------------------
+// Webhook trigger (issue_label / pull_request_label) — the SHARED issue-family
+// seam (src/services/issue-events.ts); this module keeps only the payload
+// assembly the detach route needs.
+// ---------------------------------------------------------------------------
+
+/** The single PR row of an issue (upstream `issue.LoadPullRequest`). */
+async function findPullRequestRowByIssueId(d1: D1Database, issueId: number): Promise<PullRequestRow | null> {
+  const rows = await drizzle(d1).select().from(pullRequests).where(eq(pullRequests.issueId, issueId)).limit(1).all();
+  return rows[0] ?? null;
+}
+
+/**
+ * The detach's webhook (`issue_label`, or `pull_request_label` for PRs — the
+ * upstream `issue.IsPull` discriminant, notifier.go IssueChangeLabels:572-
+ * 605). Payload = the shared Issue/PullRequest wrapper, action
+ * "label_updated", no `changes` block — exactly the family shape routes/
+ * issues.ts's emitLabelEvent emits. A missing PR row skips the emission
+ * (upstream's LoadPullRequest failure logs and returns before
+ * PrepareWebhooks). Never throws.
+ */
+async function emitLabelDetachEvent(c: Context<ApiEnv>, found: RepositoryWithOwner, issue: IssueRow): Promise<void> {
+  const identity: IssueEventIdentity = issueEventIdentity(viewerOf(c), found, c.get("authUser"));
+  try {
+    if (issue.isPull) {
+      const pr = await findPullRequestRowByIssueId(c.env.DB, issue.id);
+      if (pr === null) {
+        return;
+      }
+      await emitIssueEvent(c, {
+        repoId: found.repo.id,
+        ownerId: identity.ownerId,
+        eventType: "pull_request_label",
+        payload: {
+          action: "label_updated",
+          number: issue.index,
+          pull_request: await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "single"),
+          repository: identity.repository,
+          sender: identity.sender,
+          commit_id: "",
+        },
+      });
+      return;
+    }
+    await emitIssueEvent(c, {
+      repoId: found.repo.id,
+      ownerId: identity.ownerId,
+      eventType: "issue_label",
+      payload: issueEventPayload(
+        "label_updated",
+        await toApiIssue(c.env.DB, viewerOf(c), found, issue),
+        issue.index,
+        identity.repository,
+        identity.sender,
+      ),
+    });
+  } catch (error) {
+    console.error(`[issue-write-t2] webhook fan-out failed (issue_label): ${errorMessage(error)}`);
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +574,10 @@ export function registerIssueWriteT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth
       throw labelNotExistError(labelId, found);
     }
     await removeIssueLabel(c.env.DB, issue, label, requireDoerId(c), new Date());
+    // Webhook: IssueChangeLabels (notifier.go:572 via services/issue/
+    // label.go:71-75) — the notify has no affected-rows guard, so the
+    // not-attached silent-204 path emits too.
+    await emitLabelDetachEvent(c, found, issue);
     return c.body(null, 204);
   });
 

@@ -10,9 +10,11 @@
  * the `created_unix DESC, id DESC` ordering, the latest-release contract
  * (no drafts/prereleases/tag-only rows), the case-insensitive tag lookup,
  * the PATCH set-fields rule + publish stamp, the DELETE cascades (assets
- * included), the writer gate (403), and the pin's NO-mustNotBeArchived
+ * included), the writer gate (403), the pin's NO-mustNotBeArchived
  * registration (a release write on an archived repo still answers 200-family,
- * unlike the topics family).
+ * unlike the topics family), and the `release` webhook emissions (published/
+ * updated/deleted through emitWebhookDeliveries, the upstream `!IsDraft`
+ * gate: drafts emit nothing).
  */
 
 import { env } from "cloudflare:workers";
@@ -21,7 +23,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { releaseAssets, releases, repositories } from "../db/schema";
+import { releaseAssets, releases, repositories, webhookDeliveries, webhooks } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { createOptionalTokenAuthMiddleware, createStubAuthResolver, createTokenAuthMiddleware } from "./auth";
 import { giteaErrorHandler } from "./errors";
@@ -66,13 +68,39 @@ async function seedRelease(options: {
   return row.id;
 }
 
+/** Active webhook subscribed to the given events — the fan-out matcher target. */
+async function seedHook(repoId: string, events: string[]): Promise<number> {
+  const rows = await drizzle(env.DB)
+    .insert(webhooks)
+    .values({
+      repoId,
+      url: "https://hooks.invalid/release-test",
+      events: JSON.stringify({ choose_events: true, branch_filter: "*", events: Object.fromEntries(events.map((e) => [e, true])) }),
+      isActive: true,
+      type: "gitea",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning({ id: webhooks.id })
+    .all();
+  const row = rows[0];
+  if (row === undefined) throw new Error("hook seed failed");
+  return row.id;
+}
+
+type DeliveryRow = typeof webhookDeliveries.$inferSelect;
+
+async function deliveriesFor(hookId: number): Promise<DeliveryRow[]> {
+  return drizzle(env.DB).select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
+}
+
 beforeAll(async () => {
   await applyRepoExtrasDdl();
 });
 
 beforeEach(async () => {
   await resetRepoExtrasTables();
-  for (const table of ["release_assets", "releases", "repositories", "users"]) {
+  for (const table of ["webhook_deliveries", "webhooks", "release_assets", "releases", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare(
@@ -398,5 +426,107 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
     expect((await makeApp()(`${REPO_PATH}/releases/9999`, { method: "DELETE", headers: jsonAuth })).status).toBe(404);
     expect((await makeApp()(`${REPO_PATH}/releases/${tagOnlyId}`, { method: "DELETE", headers: jsonAuth })).status).toBe(404);
     expect((await makeApp()(`${REPO_PATH}/releases/${releaseId}`, { method: "DELETE" })).status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `release` webhook emissions (upstream sendReleaseHook:879 — NewRelease:889
+// "published" / UpdateRelease:893 "updated" / DeleteRelease:897 "deleted",
+// all gated on `!rel.IsDraft`, services/release/release.go:198,358,435).
+// ---------------------------------------------------------------------------
+
+describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDeleteRelease)", () => {
+  it("emits `release` action=published on create, with the upstream ReleasePayload field set", async () => {
+    const hookId = await seedHook("7301", ["release"]);
+
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v1.0.0", name: "First", body: "notes" }),
+    });
+    expect(res.status).toBe(201);
+    const created = (await res.json<{ id: number; tag_name: string }>()).id;
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    const delivery = deliveries[0]!;
+    expect(delivery.eventType).toBe("release");
+    expect(delivery.eventGroup).toBe("release"); // not in EVENT_GROUPS → identity group
+    expect(delivery.repoId).toBe("7301");
+    expect(delivery.state).toBe("pending"); // in-process tests skip the Queue enqueue
+    const payload = JSON.parse(delivery.payloadContent) as Record<string, unknown>;
+    // §2.7 ReleasePayload (hook.go:332): action/release/repository/sender.
+    expect(Object.keys(payload).sort()).toEqual(["action", "release", "repository", "sender"]);
+    expect(payload.action).toBe("published"); // NewRelease, never "created"
+    expect(payload.release).toMatchObject({ id: created, tag_name: "v1.0.0", name: "First", draft: false });
+    expect(payload.repository).toMatchObject({ full_name: "cf-gitea-stub/rel" });
+    expect(payload.sender).toMatchObject({ login: "cf-gitea-stub" });
+    expect(delivery.payloadContent).toContain('\n  "action": "published"'); // 2-space §2.7 serialization
+  });
+
+  it("emits `updated` on edit and `published` on the draft→published flip (upstream isTagCreated arm)", async () => {
+    const hookId = await seedHook("7301", ["release"]);
+    const releaseId = await seedRelease({ tag: "v1", minutesOffset: 0 });
+    const draftId = await seedRelease({ tag: "v2-draft", isDraft: true, minutesOffset: 1 });
+    expect(await deliveriesFor(hookId)).toHaveLength(0); // seedRelease is not a route write
+
+    const renamed = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ name: "Renamed" }),
+    });
+    expect(renamed.status).toBe(200);
+
+    const published = await makeApp()(`${REPO_PATH}/releases/${draftId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ draft: false }),
+    });
+    expect(published.status).toBe(200);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action)).toEqual(["updated", "published"]);
+    expect((JSON.parse(deliveries[0]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("v1");
+    expect((JSON.parse(deliveries[1]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("v2-draft");
+  });
+
+  it("stays silent while a release is a draft (create, edit, delete) and on a lost PATCH race", async () => {
+    const hookId = await seedHook("7301", ["release"]);
+
+    const created = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v0-draft", draft: true }),
+    });
+    expect(created.status).toBe(201);
+    const draftId = (await created.json<{ id: number }>()).id;
+
+    const edited = await makeApp()(`${REPO_PATH}/releases/${draftId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ name: "still draft" }),
+    });
+    expect(edited.status).toBe(200);
+
+    const deleted = await makeApp()(`${REPO_PATH}/releases/${draftId}`, { method: "DELETE", headers: jsonAuth });
+    expect(deleted.status).toBe(204);
+
+    expect(await deliveriesFor(hookId)).toHaveLength(0); // upstream: drafts never notify
+  });
+
+  it("emits `deleted` on both delete routes and nothing for a non-subscribed hook", async () => {
+    const releaseId = await seedRelease({ tag: "v1", minutesOffset: 0 });
+    await seedRelease({ tag: "v2", minutesOffset: 1 });
+    const releaseHook = await seedHook("7301", ["release"]);
+    const pushHook = await seedHook("7301", ["push"]); // not subscribed to release
+
+    expect((await makeApp()(`${REPO_PATH}/releases/tags/v2`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
+    expect((await makeApp()(`${REPO_PATH}/releases/${releaseId}`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
+
+    const deliveries = await deliveriesFor(releaseHook);
+    expect(deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action)).toEqual(["deleted", "deleted"]);
+    expect((JSON.parse(deliveries[0]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("v2");
+    expect((JSON.parse(deliveries[1]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("v1");
+    expect(await deliveriesFor(pushHook)).toHaveLength(0);
   });
 });

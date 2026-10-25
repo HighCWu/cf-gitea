@@ -6,6 +6,8 @@ import { z } from "zod";
 import { ReleaseAlreadyExistError } from "../../issues/errors";
 import type { ReleaseRow } from "../../issues/service";
 import { IssuesService } from "../../issues/service";
+import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
+import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
 import { issueErrorToApiError } from "../services/issues";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
@@ -18,6 +20,7 @@ import {
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { canWriteRepository, requireVisibleRepo } from "../services/repo-access";
 import { loadRepoSettings } from "../services/repo-settings";
+import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
 import {
   assertDraftVisible,
   assertNotTagRecord,
@@ -59,6 +62,16 @@ import {
  * creating/editing a release does NOT create/rename the git tag through the
  * engine commit-builder (SPEC-0004 §3.4), and DELETE does not delete it;
  * `sha1` stays null and target_commitish is a stored string.
+ *
+ * Webhook triggers (`release`, upstream services/webhook/notifier.go
+ * sendReleaseHook:879 ← NewRelease:889 / UpdateRelease:893 / DeleteRelease:897,
+ * callers services/release/release.go:198,363,366,437): every mutation emits
+ * through emitWebhookDeliveries — see emitReleaseWebhook. Upstream gates ALL
+ * three actions on `!rel.IsDraft` (release.go:198,358,435): drafts emit
+ * nothing, including on delete. Action mapping: create → "published";
+ * edit → "updated", EXCEPT the draft→published flip which upstream reaches
+ * through UpdateRelease's tag creation (isTagCreated → NewRelease, release.go:
+ * 363-366) and therefore maps to "published"; delete → "deleted".
  */
 
 const notFoundResponse = {
@@ -149,6 +162,92 @@ async function requireReleaseById(c: Context<ApiEnv>, repoId: string, rawId: str
   }
   assertNotTagRecord(row);
   return row;
+}
+
+// ---------------------------------------------------------------------------
+// Webhook triggers (`release`) — the routes/issues.ts emit pattern: the
+// delivery-row insert runs INLINE after the mutation committed (upstream
+// CreateHookTask is synchronous too); only the Queue producer ({deliveryId}
+// batch) hangs off the executionCtx-guarded waitUntil — in-process callers
+// (tests via app.request) have no executionCtx, skip the enqueue, and leave
+// the rows `pending`. Failures are logged, never propagated.
+// ---------------------------------------------------------------------------
+
+/** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired. */
+function webhookDeliveryQueue(
+  env: ApiEnv["Bindings"],
+): { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null {
+  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
+  if (candidate === undefined || candidate === null) return null;
+  const queue = candidate as { sendBatch?: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> };
+  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Fire one `release` webhook event (upstream sendReleaseHook:879). */
+async function emitReleaseWebhook(
+  c: Context<ApiEnv>,
+  input: { repoId: string; ownerId: number | null; eventType: HookEventType; payload: unknown },
+): Promise<void> {
+  let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+  try {
+    execCtx = c.executionCtx;
+  } catch {
+    execCtx = undefined; // in-process caller (tests): no execution context
+  }
+  const queue = webhookDeliveryQueue(c.env);
+  try {
+    await emitWebhookDeliveries(c.env.DB, { ...input, refName: null }, {
+      enqueue:
+        queue !== null && execCtx !== undefined
+          ? (deliveryIds) => {
+              execCtx.waitUntil(
+                queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(undefined, (error: unknown) => {
+                  console.error(`[releases] delivery enqueue failed (${input.eventType}): ${errorMessage(error)}`);
+                }),
+              );
+            }
+          : undefined,
+    });
+  } catch (error) {
+    console.error(`[releases] webhook fan-out failed (${input.eventType}): ${errorMessage(error)}`);
+  }
+}
+
+/** The ReleasePayload wrapper (§2.7, modules/structs/hook.go:332). */
+function releasePayload(
+  action: string,
+  apiRelease: Awaited<ReturnType<typeof toApiRelease>>,
+  repository: unknown,
+  sender: unknown,
+): Record<string, unknown> {
+  return { action, release: apiRelease, repository, sender };
+}
+
+/**
+ * The post-mutation emit shared by the three write routes. `row` is the
+ * release state the payload renders (post-edit for PATCH, the deleted row for
+ * DELETE); drafts stay silent per the upstream `!rel.IsDraft` gate
+ * (release.go:198,358,435).
+ */
+async function emitReleaseEvent(
+  c: Context<ApiEnv>,
+  found: RepositoryWithOwner,
+  row: ReleaseRow,
+  action: string,
+): Promise<void> {
+  if (row.isDraft) {
+    return; // upstream emits nothing for drafts (any action)
+  }
+  await emitReleaseWebhook(c, {
+    repoId: found.repo.id,
+    ownerId: found.repo.ownerId,
+    eventType: "release",
+    payload: releasePayload(action, await toApiRelease(c.env.DB, viewerOf(c), found, row), toApiRepository(viewerOf(c), found), c.get("authUser")),
+  });
 }
 
 const listReleasesRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
@@ -356,6 +455,8 @@ export function registerReleaseRoutes(
         }
         throw error;
       }
+      // Webhook: NewRelease (release.go:198) — drafts stay silent.
+      await emitReleaseEvent(c, found, row, "published");
       return c.json(await toApiRelease(c.env.DB, viewer, found, row), 201);
     },
     releaseBodyHook,
@@ -394,6 +495,8 @@ export function registerReleaseRoutes(
     }
     assertNotTagRecord(row);
     await deleteRelease(c.env.DB, row);
+    // Webhook: DeleteRelease (release.go:437) — drafts stay silent.
+    await emitReleaseEvent(c, found, row, "deleted");
     return c.body(null, 204);
   });
 
@@ -429,12 +532,17 @@ export function registerReleaseRoutes(
       if (updated === null) {
         // Lost a concurrent rename/delete — the upstream UpdateRelease would
         // surface as an internal error; the re-read keeps the answer honest.
+        // (The degraded concurrent path emits no webhook.)
         const fresh = await findReleaseForRepoById(c.env.DB, found.repo.id, row.id);
         if (fresh === null) {
           throw releaseNotExist();
         }
         return c.json(await toApiRelease(c.env.DB, viewer, found, fresh), 200);
       }
+      // Webhook: UpdateRelease (release.go:363) — except the draft→published
+      // flip, which upstream reaches through the tag creation arm and maps to
+      // NewRelease/"published" (release.go:366, isTagCreated).
+      await emitReleaseEvent(c, found, updated, row.isDraft && !updated.isDraft ? "published" : "updated");
       return c.json(await toApiRelease(c.env.DB, viewer, found, updated), 200);
     },
     releaseBodyHook,
@@ -446,6 +554,8 @@ export function registerReleaseRoutes(
     const { id } = c.req.valid("param");
     const row = await requireReleaseById(c, found.repo.id, id);
     await deleteRelease(c.env.DB, row);
+    // Webhook: DeleteRelease (release.go:437) — drafts stay silent.
+    await emitReleaseEvent(c, found, row, "deleted");
     return c.body(null, 204);
   });
 }

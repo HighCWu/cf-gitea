@@ -3,6 +3,8 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { Context, MiddlewareHandler } from "hono";
 import { z } from "zod";
 
+import { enrichCommitsWithFileLists, emitWebhookDeliveries } from "../../issues/webhooks";
+import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import {
@@ -12,6 +14,8 @@ import {
   createStatusOptionSchema,
 } from "../models/commit-status";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { engineReads } from "../services/engine";
+import { toPayloadCommit, usernamesByEmail } from "../services/git-models";
 import {
   createCommitStatus,
   isFullLengthCommitId,
@@ -27,6 +31,7 @@ import {
   findRepositoryByPath,
   toApiRepository,
   viewerOf,
+  type RepositoryWithOwner,
 } from "../services/repository";
 
 /**
@@ -54,6 +59,18 @@ import {
  *  - Slash-bearing refs must be URL-encoded (`refs%2Fheads%2Fmain`): hono
  *    path params are single-segment, while upstream's chi `<ref:*>` also
  *    matches raw slashes (api.go:1488–1490 deliberately supports both).
+ *
+ * Webhook trigger (`status`, upstream services/webhook/notifier.go
+ * CreateCommitStatus:925→:955, caller services/repository/commitstatus/
+ * commitstatus.go:104): the POST emits through emitWebhookDeliveries — see
+ * emitStatusWebhook. Upstream resolves the sha through gitRepo.GetCommit
+ * BEFORE the status row exists, so an unresolvable commit never reaches the
+ * notifier; our store-any-full-length-sha deviation keeps the row but the
+ * emission stays silent on an engine miss (the same observable: no commit,
+ * no webhook). Payload = CommitStatusPayload (modules/structs/hook.go:647):
+ * no `action` field; the commit renders through the shared toPayloadCommit
+ * converter plus the push family's file-list enrichment (upstream's
+ * ToAPIPayloadCommit fills added/removed/modified, commits.go:72,91-93).
  */
 
 const notFoundResponse = {
@@ -237,6 +254,93 @@ const statusBodyHook = ({ success }: { success: boolean }): undefined => {
   return undefined;
 };
 
+// ---------------------------------------------------------------------------
+// Webhook trigger (`status`) — the routes/issues.ts emit pattern: the
+// delivery-row insert runs INLINE after the mutation committed (upstream
+// CreateHookTask is synchronous too); only the Queue producer ({deliveryId}
+// batch) hangs off the executionCtx-guarded waitUntil — in-process callers
+// (tests via app.request) have no executionCtx, skip the enqueue, and leave
+// the rows `pending`. Failures are logged, never propagated.
+// ---------------------------------------------------------------------------
+
+/** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired. */
+function webhookDeliveryQueue(
+  env: ApiEnv["Bindings"],
+): { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null {
+  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
+  if (candidate === undefined || candidate === null) return null;
+  const queue = candidate as { sendBatch?: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> };
+  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Fire the `status` webhook for one created commit status (upstream
+ * CreateCommitStatus:925). The payload's `commit` needs the engine commit
+ * (upstream resolves it before the row and renders ToAPIPayloadCommit); an
+ * engine miss stays silent — upstream never reaches the notifier for an
+ * unresolvable sha. Never throws.
+ */
+async function emitStatusWebhook(
+  c: Context<ApiEnv>,
+  found: RepositoryWithOwner,
+  row: Awaited<ReturnType<typeof createCommitStatus>>,
+): Promise<void> {
+  let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+  try {
+    execCtx = c.executionCtx;
+  } catch {
+    execCtx = undefined; // in-process caller (tests): no execution context
+  }
+  try {
+    const reads = engineReads(c.env, found.repo);
+    const commit = await reads.readCommit(row.sha);
+    if (commit === null) {
+      return; // upstream parity: no resolvable commit, no webhook
+    }
+    const usernames = await usernamesByEmail(c.env.DB, [commit]);
+    // The literal re-assert mirrors webhooks-push.ts:326 (the converter's
+    // CommitJson oid typing drifts from the wire field).
+    const rendered = await enrichCommitsWithFileLists([{ ...toPayloadCommit(commit, found, usernames, new URL(c.req.url).origin), id: commit.oid }], (id) =>
+      reads.readDiff(id),
+    );
+    // createCommitStatus stamps both timestamps; the null fallbacks mirror
+    // the service's isoOrGoZero tolerance for nullable columns.
+    const createdAt = row.createdAt ?? new Date();
+    const payload = {
+      commit: rendered.commits[0],
+      context: row.context,
+      created_at: createdAt.toISOString(),
+      description: row.description ?? "",
+      id: row.id,
+      repository: toApiRepository(viewerOf(c), found),
+      sender: c.get("authUser") ?? null,
+      sha: row.sha,
+      state: row.state,
+      target_url: row.targetUrl ?? "",
+      updated_at: (row.updatedAt ?? createdAt).toISOString(),
+    };
+    const queue = webhookDeliveryQueue(c.env);
+    await emitWebhookDeliveries(c.env.DB, { repoId: found.repo.id, ownerId: found.repo.ownerId, eventType: "status", payload, refName: null }, {
+      enqueue:
+        queue !== null && execCtx !== undefined
+          ? (deliveryIds) => {
+              execCtx.waitUntil(
+                queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(undefined, (error: unknown) => {
+                  console.error(`[statuses] delivery enqueue failed (status): ${errorMessage(error)}`);
+                }),
+              );
+            }
+          : undefined,
+    });
+  } catch (error) {
+    console.error(`[statuses] webhook fan-out failed (status): ${errorMessage(error)}`);
+  }
+}
+
 export function registerStatusRoutes(
   app: OpenAPIHono<ApiEnv>,
   requireAuth: MiddlewareHandler<ApiEnv>,
@@ -286,6 +390,9 @@ export function registerStatusRoutes(
         context: context === "" ? "default" : context,
         creatorId: viewer.requester?.id ?? null,
       });
+      // Webhook: `status` (upstream CreateCommitStatus:955) — silent on an
+      // engine commit miss (module header).
+      await emitStatusWebhook(c, found, row);
       return c.json(
         toApiCommitStatus(row, {
           repoApiUrl: apiRepositoryUrl(found, viewer.origin),

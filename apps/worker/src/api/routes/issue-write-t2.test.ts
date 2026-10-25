@@ -20,7 +20,7 @@ import { and, asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { comments, issueLabels, issuePins, issues, labels, repositories, users } from "../../db/schema";
+import { comments, issueLabels, issuePins, issues, labels, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createStubAuthResolver, createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -172,6 +172,30 @@ async function seedAttachedLabel(issueId: number, name: string) {
   return label;
 }
 
+/** Active webhook subscribed to the given events — the fan-out matcher target. */
+async function seedHook(events: string[]): Promise<number> {
+  const rows = await drizzle(env.DB)
+    .insert(webhooks)
+    .values({
+      repoId: REPO_ID,
+      url: "https://hooks.invalid/issue-write-t2",
+      events: JSON.stringify({ choose_events: true, branch_filter: "*", events: Object.fromEntries(events.map((e) => [e, true])) }),
+      isActive: true,
+      type: "gitea",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning({ id: webhooks.id })
+    .all();
+  const row = rows[0];
+  if (row === undefined) throw new Error("hook seed failed");
+  return row.id;
+}
+
+async function deliveriesFor(hookId: number) {
+  return drizzle(env.DB).select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
+}
+
 /** The issue_pins rows joined with their issue index, pin_order ASC (index
  *  ASC as the tiebreak so the issue/pull halves interleave deterministically). */
 async function pinOrderPairs(): Promise<Array<{ index: number; pinOrder: number }>> {
@@ -292,6 +316,79 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index}/labels/{id} (issueRemoveLa
     ).toBe(403);
     await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, REPO_ID));
     expect((await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/labels/${label.id}`, authed({ method: "DELETE" }))).status).toBe(423);
+  });
+
+  it("emits `issue_label` action=label_updated with the IssuePayload field set (no `changes` block)", async () => {
+    const label = await seedAttachedLabel(issueA.id, "bug");
+    const hookId = await seedHook(["issue_label"]);
+
+    expect((await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/labels/${label.id}`, authed({ method: "DELETE" }))).status).toBe(204);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("issue_label");
+    expect(deliveries[0]!.repoId).toBe(REPO_ID);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 IssuePayload (hook.go:435) — the label notifiers set NO `changes`.
+    expect(Object.keys(payload).sort()).toEqual(["action", "commit_id", "issue", "number", "repository", "sender"]);
+    expect(payload.action).toBe("label_updated");
+    expect(payload.number).toBe(issueA.index);
+    expect(payload.repository).toMatchObject({ full_name: "cf-gitea-stub/writes" });
+  });
+
+  it("emits on the not-attached (silent-204) path too — upstream RemoveLabel notifies without an affected-rows guard", async () => {
+    // services/issue/label.go:56-75: the notify follows the models-layer
+    // deleteIssueLabel unconditionally (only comment/counter folds are
+    // skipped on 0 rows, models/issues/issue_label.go:158-166).
+    const label = await createRepoLabel(env.DB, REPO_ID, {
+      name: "unattached",
+      exclusive: false,
+      color: "#112233",
+      description: "",
+      isArchived: false,
+      now: NOW,
+    });
+    const hookId = await seedHook(["issue_label"]);
+
+    expect((await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/labels/${label.id}`, authed({ method: "DELETE" }))).status).toBe(204);
+    expect(await systemCommentTypes(issueA.id)).toEqual([]); // no comment — the DB side stays silent
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect((JSON.parse(deliveries[0]!.payloadContent) as { action: string }).action).toBe("label_updated");
+  });
+
+  it("routes a PR detach to pull_request_label with the PullRequestPayload field set", async () => {
+    const pull = await new IssuesService(env.DB).createPullRequest({
+      repoId: REPO_ID,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "PR detach",
+      posterId: 1,
+    });
+    const label = await seedAttachedLabel(pull.issue.id, "ship");
+    const hookId = await seedHook(["pull_request_label"]);
+
+    expect((await send(`/repos/cf-gitea-stub/writes/issues/${pull.issue.index}/labels/${label.id}`, authed({ method: "DELETE" }))).status).toBe(204);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request_label");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual(["action", "commit_id", "number", "pull_request", "repository", "sender"]);
+    expect(payload.action).toBe("label_updated");
+    expect(payload.number).toBe(pull.issue.index);
+    expect((payload.pull_request as Record<string, unknown>).number).toBe(pull.pullRequest.index);
+  });
+
+  it("stays silent for hooks not subscribed to issue_label", async () => {
+    const label = await seedAttachedLabel(issueA.id, "quiet");
+    const hookId = await seedHook(["issues"]); // sibling event, not issue_label
+
+    expect((await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/labels/${label.id}`, authed({ method: "DELETE" }))).status).toBe(204);
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(webhookDeliveries).all()).toHaveLength(0);
   });
 });
 
