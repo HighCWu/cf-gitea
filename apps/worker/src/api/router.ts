@@ -13,6 +13,7 @@ import { registerAccountAggregatesRoutes } from "./routes/account-aggregates";
 import { registerAdminDegenerateRoutes } from "./routes/admin-degenerate";
 import { registerAdminOrgExtrasRoutes } from "./routes/admin-org-extras";
 import { registerDeployKeyRoutes } from "./routes/deploy-keys";
+import { registerSecretsVariablesRoutes } from "./routes/secrets-variables";
 import { registerAdminT2Routes } from "./routes/admin-t2";
 import { registerArchiveRoutes } from "./routes/archive";
 import { registerBranchProtectionRoutes } from "./routes/branch-protections";
@@ -196,9 +197,13 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // Inventory batch 1: tokens family, times/stopwatch aggregates, GPG
   // verify, org-repo alias + bulk delete, repo signing keys.
   registerAccountAggregatesRoutes(app, requireAuth);
-  registerAdminOrgExtrasRoutes(app, requireAuth);
+  registerAdminOrgExtrasRoutes(app, requireAuth, optionalAuth);
   // Inventory batch 5: repo deploy keys + deploy tokens (migration 0020).
   registerDeployKeyRoutes(app, requireAuth);
+  // Inventory batch 3: actions secrets + variables (repo/org/user scopes,
+  // migration 0021 — storage+API surface; the Actions runtime stays
+  // SPEC-0012-gated).
+  registerSecretsVariablesRoutes(app, requireAuth);
   // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
   // download, the diffpatch apply, the languages listing and the scheduled
   // auto-merge cancellation. All are deeper `/repos/{owner}/{repo}/<family>`
