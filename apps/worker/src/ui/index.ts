@@ -142,10 +142,42 @@
  *                                          issue/reviewer ids ride the
  *                                          form; GET → 405)
  *   /:owner/:repo/issues/dismiss_review     review dismiss, POST
- *                                          (pages/pull-reviews.tsx — wave
- *                                          11; upstream web.go:1436
+ *                                          (pages/pull-reviews.tsx —
+ *                                          wave 11; upstream web.go:1436
  *                                          DismissReview, admin only;
  *                                          GET → 405)
+ *   /:org/teams                             org teams list, GET (pages/
+ *                                          org-teams.tsx — wave 12;
+ *                                          upstream web.go:993 org.Teams
+ *                                          at the landed requireOrgOwnership
+ *                                          posture — owner/site-admin
+ *                                          viewers only, everyone else
+ *                                          404-shells; the literal claims
+ *                                          the shape before the repo parse,
+ *                                          upstream's own shadowing order)
+ *   /:org/teams/new                         create-team form, GET + POST
+ *                                          (pages/org-teams.tsx — wave 12;
+ *                                          upstream teams.go:316-390
+ *                                          NewTeam/NewTeamPost at the
+ *                                          owner gate; POST → the landed
+ *                                          createTeam arm → 303 onto the
+ *                                          created team's detail slice)
+ *   /:org/teams/{id}                        team detail slice, GET (pages/
+ *                                          org-teams.tsx — wave 12; the
+ *                                          members + repo-access lists,
+ *                                          upstream members.tmpl +
+ *                                          repositories.tmpl merged; the id
+ *                                          keys the landed /teams/{id} read
+ *                                          arms — upstream's name links are
+ *                                          the documented divergence)
+ *   /user/settings                          user settings profile, GET + POST
+ *                                          (pages/user-settings.tsx — wave
+ *                                          12; upstream's reqSignIn
+ *                                          /user/settings group at the
+ *                                          settingsGate posture — anonymous
+ *                                          303s onto /login; POST re-plays
+ *                                          the landed PATCH route's service
+ *                                          sequence → 303)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -260,6 +292,23 @@ import {
   renderNewMilestonePage,
 } from "./pages/milestones";
 import { loadOrgHomeData, renderOrgHomePage, resolveOrgHome } from "./pages/org-home";
+import {
+  canManageOrgTeams,
+  createTeamFromForm,
+  loadOrgTeamDetailData,
+  loadOrgTeamsData,
+  parseTeamNewForm,
+  renderOrgTeamDetailPage,
+  renderOrgTeamNewPage,
+  renderOrgTeamsPage,
+  resolveOrgTeamsOrg,
+} from "./pages/org-teams";
+import {
+  applyUserProfileForm,
+  loadUserSettingsPageData,
+  parseUserProfileForm,
+  renderUserSettingsPage,
+} from "./pages/user-settings";
 import { loadUserProfileData, renderUserProfilePage, resolveUserProfile } from "./pages/user-profile";
 import { loadDashboardData, renderDashboardPage, renderLandingPage } from "./pages/dashboard";
 import {
@@ -295,6 +344,7 @@ import { findIssueByRepoAndIndex } from "../api/services/issues";
 import { findPullRequestByIndex } from "../api/services/pulls";
 import { findRepositoryById } from "../api/services/repository";
 import { IssuesService } from "../issues/service";
+import type { OrgRecord } from "../services/orgs/orgs";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -514,6 +564,36 @@ export interface ExploreRoute {
   family: "explore-root" | "explore-repos" | "explore-users";
 }
 
+/** The wave-12 user settings family (pages/user-settings.tsx): upstream's
+ *  literal `/user/settings` (routers/web/shared/user settings header +
+ *  user/settings/profile.tmpl — web.go's /user group registers ahead of the
+ *  dynamic pairs, so upstream shadows a `{user: "user", repo: "settings"}`
+ *  repository identically; "user" is additionally a reserved username,
+ *  orgs.ts's RESERVED_USERNAMES port). The deeper settings tails (account,
+ *  security, applications, keys, …) stay unclaimed → the engine's 404: no
+ *  landed surfaces. */
+export interface UserSettingsRoute {
+  family: "user-settings";
+}
+
+/** The wave-12 org teams families (pages/org-teams.tsx): upstream's
+ *  `/{org}/teams` group (web.go:993-1013) at the landed API shapes — the
+ *  list, the id-keyed detail slice (upstream links by team name; the slice
+ *  follows the landed /teams/{id} read arms), and the create form. The
+ *  literal `teams` second segment claims the shapes before the repo parse
+ *  could read them as a repository named "teams" — upstream shadows such a
+ *  repo identically (web.go:993 registers ahead of :1292's
+ *  `/{username}/{reponame}`). The deeper tails (`/{id}/repositories`,
+ *  `/{id}/edit`, `/{id}/delete`, the `/action/*` writes) stay unclaimed →
+ *  the engine's 404. */
+export interface OrgTeamsRoute {
+  family: "org-teams" | "org-team-new" | "org-team-detail";
+  /** Decoded org segment. */
+  owner: string;
+  /** The team id (the detail family only). */
+  id?: number;
+}
+
 /** Top-level single-segment paths this router must never claim: the session
  *  router's literals (registered on the SAME parent app AFTER this sub-app,
  *  so a dynamic `/:owner` registration would shadow them — SPEC-0010 §2.1)
@@ -542,7 +622,9 @@ export type ParsedUiRoute =
   | FileEditorRoute
   | SiteHomeRoute
   | ExploreRoute
-  | NotificationsRoute;
+  | NotificationsRoute
+  | UserSettingsRoute
+  | OrgTeamsRoute;
 
 
 /**
@@ -595,6 +677,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return null;
   }
 
+  // The wave-12 user settings literal (pages/user-settings.tsx — upstream's
+  // reqSignIn /user/settings): claimed before the owner/repo parse could
+  // read it as a repository named "settings" under a user named "user" (the
+  // notifications precedent; upstream's /user group registers ahead of the
+  // dynamic pairs, and "user" is a reserved username besides). Deeper
+  // settings tails stay unclaimed — no landed surfaces.
+  if (raw.length === 3 && raw[1] === "user" && raw[2] === "settings") {
+    return { family: "user-settings" };
+  }
+
   let owner: string;
   try {
     owner = decodeURIComponent(raw[1] as string);
@@ -626,6 +718,30 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   if (repo.endsWith(".git")) repo = repo.slice(0, -4);
   if (repo === "") return null;
+
+  // The wave-12 org teams families (pages/org-teams.tsx — upstream's
+  // /{org}/teams group, web.go:993-1013): the literal `teams` second segment
+  // claimed before the tail parse could read it as a repository named
+  // "teams" (the notifications/explore precedent). Upstream shadows such a
+  // repo identically — the org route group registers at web.go:993, ahead
+  // of :1292's `/{username}/{reponame}` — so /{user}/teams 404-shells at
+  // resolve time exactly like upstream's OrgAssignment miss. The bare URL
+  // is the list; `new` the create form (the static literal upstream
+  // registers ahead of the {team} param, chi tree order); a positive
+  // integer the id-keyed detail slice (the landed /teams/{id} read arms —
+  // PathParamInt64 parity, so "007" parses as 7). Every other tail
+  // (`/{id}/repositories`, `/{id}/edit`, the `/action/*` writes) stays
+  // unclaimed → the engine's 404.
+  if (repo === "teams") {
+    if (raw.length === 3) return { family: "org-teams", owner };
+    if (raw.length === 4) {
+      if (raw[3] === "new") return { family: "org-team-new", owner };
+      if (/^\d+$/.test(raw[3] as string)) {
+        return { family: "org-team-detail", owner, id: Number.parseInt(raw[3] as string, 10) };
+      }
+    }
+    return null;
+  }
 
   const tail = raw.slice(3);
   if (tail.length === 0) return { family: "home", owner, repo, refSuffix: null };
@@ -1302,6 +1418,143 @@ async function milestoneNewSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
 }
 
 // ---------------------------------------------------------------------------
+// The wave-12 user settings page (pages/user-settings.tsx — upstream's
+// reqSignIn /user/settings)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /user/settings (pages/user-settings.tsx — the profile form): the
+ * session prologue WITHOUT the repo read, then the signed-in gate — an
+ * anonymous viewer 303s onto the login round-trip (upstream reqSignIn), a
+ * signed-in viewer manages exactly their own row. A session doer without a
+ * D1 row 404-shells (the silent-auth-failure convention).
+ */
+async function userSettingsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const data = await loadUserSettingsPageData(c.env.DB, viewer.id);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderUserSettingsPage(ctx, data), 200));
+}
+
+/**
+ * POST /user/settings — the profile write: the §2.8 Origin guard, the same
+ * session→gate order as the GET, then the PATCH route's exact service
+ * sequence (saveUserProfileColumns + saveUserSettings, pages/user-settings.tsx
+ * module header). Always succeeds — the landed services carry no validation
+ * arms — so success 303s back onto the canonical URL (upstream
+ * SettingsPost's redirect; the flash reduction).
+ */
+async function userSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const row = await loadUserSettingsPageData(c.env.DB, viewer.id);
+  if (row === null) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseUserProfileForm(await readUrlEncodedForm(c.req.raw));
+  await applyUserProfileForm(c.env.DB, viewer.id, form);
+  return respond(new Response(null, { status: 303, headers: { location: "/user/settings" } }));
+}
+
+// ---------------------------------------------------------------------------
+// The wave-12 org teams family (pages/org-teams.tsx — upstream's
+// /{org}/teams group, web.go:993-1013)
+// ---------------------------------------------------------------------------
+
+/** The org-teams prologue the four handlers share (the settings gate's shape
+ *  over the org resolution): the session half, the owner-segment drift
+ *  guard, the org resolution (a renamed org 307s onto the new name, an
+ *  unknown name 404-shells), the anonymous login 303, then the landed
+ *  `requireOrgOwnership` posture — a signed-in non-owner 404-shells (the
+ *  pages/org-teams.tsx header; upstream answers NotFound for every
+ *  non-member). */
+type ResolvedOrgTeamsRequest = Extract<ResolvedUiSession, { ok: true }> & { org: OrgRecord };
+
+async function resolveOrgTeamsRequest(c: Context<{ Bindings: Env }>): Promise<ResolvedOrgTeamsRequest | { ok: false; response: Response }> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved;
+  const { url, ctx, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (!("owner" in route)) return { ok: false, response: respond(await c.notFound()) }; // registration/parser drift guard
+  const doer = viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false };
+  const query = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+  const org = await resolveOrgTeamsOrg(c.env.DB, route.owner, doer, url.pathname, query);
+  if (org.kind === "redirect") {
+    return { ok: false, response: respond(new Response(null, { status: 307, headers: { location: org.location } })) };
+  }
+  if (org.kind === "missing") return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname)) };
+  if (!(await canManageOrgTeams(c.env.DB, org.org, viewer))) {
+    return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  }
+  return { ...resolved, org: org.org };
+}
+
+/** GET /{org}/teams (pages/org-teams.tsx — the teams list; the landed
+ *  orgListTeams read's owner arm). */
+async function orgTeamsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, respond } = resolved;
+  if (resolved.route.family !== "org-teams") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgTeamsData(c.env.DB, resolved.org, url.searchParams);
+  return respond(c.html(renderOrgTeamsPage(ctx, data), 200));
+}
+
+/** GET /{org}/teams/{id} (pages/org-teams.tsx — the detail slice: the
+ *  members list + the repo-access list; an unknown or foreign-org id
+ *  404-shells). */
+async function orgTeamDetailPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-team-detail" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  const data = await loadOrgTeamDetailData(c.env.DB, resolved.org, route.id);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderOrgTeamDetailPage(ctx, data), 200));
+}
+
+/** GET /{org}/teams/new (pages/org-teams.tsx — the create form; the same
+ *  gate as the list). */
+async function orgTeamNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond } = resolved;
+  if (resolved.route.family !== "org-team-new") return respond(await c.notFound()); // drift guard
+  return respond(c.html(renderOrgTeamNewPage(ctx, { org: resolved.org, form: { name: "", permission: "read" }, error: null }), 200));
+}
+
+/**
+ * POST /{org}/teams/new (upstream NewTeamPost, routers/web/org/teams.go:
+ * 344-390 over the landed create arm): the §2.8 Origin guard, the shared
+ * prologue, then `TeamsService.createTeam` — success 303s onto the created
+ * team's detail slice (upstream redirects onto the team's page; the slice
+ * keys on the id — the module header's route-shape note); the typed NewTeam
+ * 422s re-render the form at 200 with the message and the submitted values
+ * (the login failure convention).
+ */
+async function orgTeamNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-team-new") return respond(await c.notFound()); // drift guard
+  const form = parseTeamNewForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createTeamFromForm(c.env.DB, org, form);
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/teams/${result.team.id}` } }));
+  }
+  return respond(c.html(renderOrgTeamNewPage(ctx, { org, form, error: result.message }), 200));
+}
+
+// ---------------------------------------------------------------------------
 // The wave-8 file editor (pages/file-editor.tsx — upstream's
 // _new/_edit/_delete editor Combos, web.go:1453-1461)
 // ---------------------------------------------------------------------------
@@ -1892,6 +2145,19 @@ uiRouter.post("/notifications/status", (c) => notificationStatusSubmit(c));
 uiRouter.post("/notifications/purge", (c) => notificationPurgeSubmit(c));
 uiRouter.get("/notifications/status", () => methodNotAllowed("POST"));
 uiRouter.get("/notifications/purge", () => methodNotAllowed("POST"));
+// Wave-12 families (parseUiRoute claims exactly these shapes; registered
+// with the wave-9 statics so the literals beat the dynamic owner/repo and
+// owner regexes — the wave-9 RegExpRouter note: a static registered after
+// the dynamic pair LOSES to it, and /:owner/teams must beat /:owner/:repo
+// the same way). The POST-only tails answer GET with chi's 405 posture is
+// not needed here: /user/settings POST carries the literal GET above, and
+// the teams POSTs hang off the /new literal's own GET+POST pair.
+uiRouter.get("/user/settings", (c) => userSettingsPage(c));
+uiRouter.post("/user/settings", (c) => userSettingsSubmit(c));
+uiRouter.get("/:owner/teams", (c) => orgTeamsPage(c));
+uiRouter.get("/:owner/teams/new", (c) => orgTeamNewPage(c));
+uiRouter.post("/:owner/teams/new", (c) => orgTeamNewSubmit(c));
+uiRouter.get("/:owner/teams/:id", (c) => orgTeamDetailPage(c));
 uiRouter.get("/:owner/:repo", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));

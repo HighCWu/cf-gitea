@@ -26,7 +26,7 @@ import { beforeAll } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { issues, pullReviews, repositories, repoMirrors, users } from "../../db/schema";
+import { issues, pullReviews, repositories, repoMirrors, teams, users } from "../../db/schema";
 import { type UiManifest } from "../manifest";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import {
@@ -39,6 +39,7 @@ import { IssuesService } from "../../issues/service";
 import { createRepoLabel } from "../../api/services/labels";
 import { isWatchingRepo, watchRepo } from "../../api/services/repo-watchers";
 import { saveRepoSettings } from "../../api/services/repo-settings";
+import { TeamsService } from "../../api/routes/org-teams";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { OrgService } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
@@ -132,10 +133,15 @@ export async function renderRoute(path: string, init?: RequestInit): Promise<{ s
 
 /** A signed-in render of one golden case: the session cookie rides the
  *  request when the case says so (the wave-9 dashboard golden; anonymous is
- *  every pre-wave-9 case). */
+ *  every pre-wave-9 case). `sessionUser` picks the principal (default
+ *  "alice"; the wave-12 org-teams goldens ride morgan — acme's owner). */
 export async function renderCase(golden: GoldenCase): Promise<{ status: number; html: string }> {
   if (golden.signedIn !== true) return renderRoute(golden.path);
-  return renderRoute(golden.path, { headers: { cookie: `${SESSION_COOKIE_NAME}=${await aliceSessionCookie()}` } });
+  const cookie =
+    golden.sessionUser === undefined || golden.sessionUser === "alice"
+      ? await aliceSessionCookie()
+      : await namedSessionCookie(golden.sessionUser);
+  return renderRoute(golden.path, { headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` } });
 }
 
 /** Alice's session cookie, minted once per module (the wave-4 pattern; the
@@ -154,6 +160,23 @@ export async function aliceSessionCookie(): Promise<string> {
   return aliceSession;
 }
 
+/** Named principal's session cookie (the wave-12 owner goldens) — cached
+ *  like aliceSessionCookie; the value is never rendered. */
+const namedSessions = new Map<string, string>();
+export async function namedSessionCookie(username: string): Promise<string> {
+  const cached = namedSessions.get(username);
+  if (cached !== undefined) return cached;
+  const row = await drizzle(env.DB)
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, username))
+    .get();
+  if (row === undefined) throw new Error(`golden principal row missing before the session mint: ${username}`);
+  const cookie = await mintSession(env.DB, row.id);
+  namedSessions.set(username, cookie);
+  return cookie;
+}
+
 // --- the golden inventory (§5.2: three pages + 404 shell + bare shell) ---------
 
 export interface GoldenCase {
@@ -164,10 +187,13 @@ export interface GoldenCase {
   /** Expected HTTP status (404 shells are goldens too, §4.5). */
   status: number;
   /** Render signed-in (pages wave 9 — the dashboard golden): the route
-   *  request carries alice's session cookie. The cookie value itself is
+   *  request carries a session cookie. The cookie value itself is
    *  crypto-random per run and never rendered, so the bytes stay stable
    *  (§5.2 determinism is a fixture property). */
   signedIn?: boolean;
+  /** Which principal's session rides the request (default "alice" — the
+   *  wave-12 org-teams goldens name morgan, acme's owner). */
+  sessionUser?: string;
 }
 
 export const GOLDEN_CASES: GoldenCase[] = [
@@ -229,6 +255,14 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // Mirror panel (wave 10): the signed-in admin view of alice/golden's
   // mirror row (the table, the status lines, the honest-absence note).
   { file: "settings-mirror.html", path: "/alice/golden/settings/mirror", status: 200, signedIn: true },
+  // Org teams (wave 12): the SIGNED-IN owner view (morgan owns acme) — the
+  // teams list with both fixture teams, the Developers detail slice (members
+  // + repo access), and the user settings profile (alice's own row; the
+  // teams pages are owner/admin-only, the settings page is self-only — both
+  // goldens ride the session cookie, whose value never renders).
+  { file: "org-teams.html", path: "/acme/teams", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "org-team-detail.html", path: "/acme/teams/1", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "user-settings-profile.html", path: "/user/settings", status: 200, signedIn: true },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
@@ -629,6 +663,62 @@ async function seedGoldenPullReviews(): Promise<void> {
   ]);
 }
 
+/**
+ * The wave-12 team fixtures for the acme org (the org-teams goldens): two
+ * teams through the LANDED TeamsService.createTeam arm (so the ids,
+ * maintained counters and includes-all fan-out are exactly the service's —
+ * the fresh goldens storage makes them ids 1 and 2, deterministic by the
+ * fixed seed order). Members are morgan + ALICE — existing golden
+ * principals only, so no committed golden shifts (explore-users lists every
+ * active user; a dedicated fixture user would insert a row there, and the
+ * dashboard/user-profile reads touch no org-membership table, so alice's
+ * new acme membership renders nowhere else):
+ *
+ *   - `Developers` (id 1): write permission, private, specific repos —
+ *     members morgan + alice, repo access anvil (public) + bird-seed
+ *     (private);
+ *   - `Readers` (id 2): read permission, private, includes-all (the create
+ *     fan-out covers the org's three repos — numRepos 3).
+ *
+ * Runs AFTER the org seed (acme + morgan + the repos must exist). Adding
+ * teams changes no other golden bytes — the org home renders the repo list
+ * only, no other page reads teams. Idempotent by the first team row.
+ */
+async function seedGoldenTeams(): Promise<void> {
+  const db = drizzle(env.DB);
+  const org = await new OrgService(env.DB).getOrgByUsername("acme");
+  if (org === null) throw new Error("acme org row missing before team seeding");
+  const existing = await db.select({ id: teams.id }).from(teams).where(eq(teams.orgId, org.id)).limit(1).all();
+  if (existing.length > 0) return;
+
+  const morgan = await db.select().from(users).where(eq(users.usernameLower, "morgan")).get();
+  const alice = await db.select().from(users).where(eq(users.usernameLower, "alice")).get();
+  if (morgan === undefined || alice === undefined) throw new Error("team fixture principals missing");
+
+  const service = new TeamsService(env.DB);
+  const developers = await service.createTeam(org, {
+    name: "Developers",
+    permission: "write",
+    description: "Ships the anvil deliveries.",
+  });
+  await service.addTeamMember(developers, morgan.id);
+  await service.addTeamMember(developers, alice.id);
+  for (const slug of ["anvil", "bird-seed"]) {
+    const repo = await db
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerId, org.id), eq(repositories.slug, slug)))
+      .get();
+    if (repo === undefined) throw new Error(`acme/${slug} repo row missing before team seeding`);
+    await service.addTeamRepo(developers, repo.id);
+  }
+  await service.createTeam(org, {
+    name: "Readers",
+    permission: "read",
+    includes_all_repositories: true,
+  });
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
@@ -670,6 +760,9 @@ export function setupGoldenFixtures(): void {
     // Wave-11: the PR-detail goldens' review rows (morgan requested +
     // approved on golden's PR) — after the org seed that creates morgan.
     await seedGoldenPullReviews();
+    // Wave-12: the acme team fixtures (the org-teams goldens) — after the
+    // org seed that creates acme, morgan and the repos.
+    await seedGoldenTeams();
     // Wave 7: the user-profile golden renders the shared/repo/list rows'
     // "Updated {TimeSince}" from `repositories.updated_at` — the issue and
     // milestone seeders above stamp it with wall-clock time (the counter-

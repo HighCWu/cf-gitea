@@ -22,6 +22,8 @@ import landingGolden from "./goldens/landing.html?raw";
 import milestonesClosedGolden from "./goldens/milestones-closed.html?raw";
 import milestonesOpenGolden from "./goldens/milestones-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
+import orgTeamDetailGolden from "./goldens/org-team-detail.html?raw";
+import orgTeamsGolden from "./goldens/org-teams.html?raw";
 import notificationsReadGolden from "./goldens/notifications-read.html?raw";
 import notificationsUnreadGolden from "./goldens/notifications-unread.html?raw";
 import orgHomeEmptyGolden from "./goldens/org-home-empty.html?raw";
@@ -33,6 +35,7 @@ import pullsOpenGolden from "./goldens/pulls-open.html?raw";
 import settingsMirrorGolden from "./goldens/settings-mirror.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
 import userProfileGolden from "./goldens/user-profile.html?raw";
+import userSettingsProfileGolden from "./goldens/user-settings-profile.html?raw";
 import { GOLDEN_CASES } from "./harness";
 
 const goldens: Record<string, string> = {
@@ -61,6 +64,11 @@ const goldens: Record<string, string> = {
   "notifications-unread.html": notificationsUnreadGolden,
   "notifications-read.html": notificationsReadGolden,
   "settings-mirror.html": settingsMirrorGolden,
+  // Pages wave 12: the org teams list + detail slices and the user
+  // settings profile (the GOLDEN_CASES entries above).
+  "org-teams.html": orgTeamsGolden,
+  "org-team-detail.html": orgTeamDetailGolden,
+  "user-settings-profile.html": userSettingsProfileGolden,
 };
 
 function classList(el: { attrs: Record<string, string> }): string[] {
