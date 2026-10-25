@@ -1340,3 +1340,53 @@ export const issueStopwatches = sqliteTable(
     index("stopwatch_issue_idx").on(t.issueId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0010 §3 — web sessions: the D1 store behind the `gitea_session`
+// cookie (SPEC-0008 milestone U4). Migration 0013.
+// ---------------------------------------------------------------------------
+
+/**
+ * One row per live web session (SPEC-0010 §3). The row shape mirrors
+ * upstream's `auth_token` table (models/auth/auth_token.go: `ID` string pk,
+ * `TokenHash`, `UserID`, `ExpiresUnix`, `PreviousTokenHash`, `RotatedUnix`)
+ * plus the throttled `last_seen_at`. The row plays the role of upstream's
+ * server-side session store verbatim: the cookie carries only `id:secret`
+ * (§2.3), the 256-bit secret itself is never stored — `sha256_digest` is
+ * hex(sha256(secret)) and every comparison is timing-safe
+ * (src/auth/digest.ts). `previous_sha256_digest` identifies in-flight stale
+ * cookies without authenticating them (the 60 s rotation grace, §2.4 step 3),
+ * `rotated_at` bounds that grace and triggers re-rotation (≥ 24 h), and
+ * `expires_at` is the hard TTL (24 h at mint, extended on every rotation —
+ * an actively used session keeps living, an idle one dies). Timestamps are
+ * unix seconds (`mode: "timestamp"`, SPEC-0002 §3 conventions); GC is lazy —
+ * expiry is checked before authority (§2.4 step 2) and each POST /login
+ * sweeps expired rows in waitUntil; no cron exists.
+ */
+export const sessions = sqliteTable(
+  "sessions",
+  {
+    /** Public row id: 10 chars of crypto-random alphanumeric (upstream
+     *  `util.CryptoRandomString(10)`, services/auth/auth_token.go:100). Not
+     *  secret; the secret half of the cookie is. */
+    id: text("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** hex(sha256(secret)); the 256-bit secret itself is never stored. */
+    sha256Digest: text("sha256_digest", { length: 64 }).notNull(),
+    /** Previous secret's digest — identifies in-flight stale cookies without
+     *  authenticating them (upstream `PreviousTokenHash`). */
+    previousSha256Digest: text("previous_sha256_digest", { length: 64 }),
+    /** Bounds the 60 s stale-cookie grace window; rotation trigger. */
+    rotatedAt: integer("rotated_at", { mode: "timestamp" }).notNull(),
+    /** Hard expiry; extended on rotation (§2.3). */
+    expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+    /** Throttled write: at most once per hour per session (§3). */
+    lastSeenAt: integer("last_seen_at", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    index("sessions_user_idx").on(t.userId),
+    index("sessions_expires_idx").on(t.expiresAt),
+  ],
+);

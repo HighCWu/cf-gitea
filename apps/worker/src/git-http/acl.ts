@@ -190,6 +190,36 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
 }
 
 /**
+ * The read-grant predicate shared by the git-HTTP matrix and the UI page
+ * resolution (SPEC-0010 §2.6 — exactly one copy, so page visibility and
+ * git-HTTP visibility cannot drift): the gate's own grant lines
+ * (`publiclyVisible`, isOwner, isSiteAdmin, the limited-owner branch).
+ * `doer === null` is the anonymous doer — matrix row 1's collapse verbatim.
+ * Owner-account status is NOT part of this predicate: git-HTTP refuses a
+ * prohibited owner separately (below, 403 shape) and pages treat a missing
+ * or prohibited owner as invisible for every viewer (repo-view.ts, §4.8,
+ * 404-shell shape) — the boolean refusal is the same on both surfaces.
+ */
+export function readGrant(input: {
+  repoVisibility: "public" | "private";
+  owner: { id: number; status: "active" | "prohibited" } | null;
+  ownerVisibility: "public" | "limited" | "private";
+  doer: { id: number; isAdmin: boolean } | null;
+}): boolean {
+  const ownerActive = input.owner !== null && input.owner.status === "active";
+  const repoPublic = input.repoVisibility === "public";
+  const publiclyVisible = repoPublic && ownerActive && input.ownerVisibility === "public";
+  if (input.doer === null) return publiclyVisible;
+  // M1 grant model: no collaborator tables exist yet (SPEC-0005), so the
+  // grant set is exactly { repo owner, site admin } (see decide below).
+  const isOwner = input.owner !== null && input.doer.id === input.owner.id;
+  const isSiteAdmin = input.doer.isAdmin;
+  return (
+    publiclyVisible || isOwner || isSiteAdmin || (repoPublic && ownerActive && input.ownerVisibility === "limited")
+  );
+}
+
+/**
  * The matrix. `doer === null` is the anonymous doer; `scope === null` only
  * alongside it. See the table in SPEC-0003 §2.4.
  */
@@ -206,13 +236,18 @@ function decide(
   // Row 1: public repo + active PUBLIC owner. Row 2's limited/private-owner
   // branches arrive with the M2 `users.visibility` column: a limited owner's
   // public repos are authenticated-only, a private owner's are owner/admin-only.
-  const ownerActive = owner !== null && owner.status === "active";
-  const repoPublic = repo.visibility === "public";
-  const publiclyVisible = repoPublic && ownerActive && ownerVisibility === "public";
+  const ownerShape = owner === null ? null : { id: owner.id, status: owner.status };
+  const publiclyVisible = readGrant({
+    repoVisibility: repo.visibility,
+    owner: ownerShape,
+    ownerVisibility,
+    doer: null,
+  });
   // Rows 4/5: an explicit anonymous-read grant on the private repo's code
   // unit (upstream git_smart_http_test.go:163-189) — read only, and still
   // requires a public, active owner.
-  const anonymousUnitRead = op === "read" && unitAnonymousRead && ownerActive && ownerVisibility === "public";
+  const anonymousUnitRead =
+    op === "read" && unitAnonymousRead && owner !== null && owner.status === "active" && ownerVisibility === "public";
 
   if (doer === null) {
     if (anonymousUnitRead || (op === "read" && publiclyVisible)) return true;
@@ -242,8 +277,13 @@ function decide(
   // Row 9 (+ §2.5.6 visibility three-way): no read grant on an invisible
   // repo → 404, existence hidden. Limited owners expose their public repos
   // to any authenticated principal; private owners only to owner/admin.
-  const canRead =
-    publiclyVisible || isOwner || isSiteAdmin || (repoPublic && ownerActive && ownerVisibility === "limited");
+  // The grant lines are the shared readGrant predicate (SPEC-0010 §2.6).
+  const canRead = readGrant({
+    repoVisibility: repo.visibility,
+    owner: ownerShape,
+    ownerVisibility,
+    doer: { id: doer.id, isAdmin: doer.isAdmin },
+  });
   // Public-only tokens (SPEC-0002 §4.1) see exactly what anonymous visitors
   // could: a limited owner's public repo stays masked.
   const maskedByPublicOnly = scope.publicOnly && !publiclyVisible;

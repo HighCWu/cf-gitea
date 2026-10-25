@@ -49,6 +49,20 @@ export const locale = {
     " to view it.",
   ] satisfies EmphasizedText,
   go_back: "Go Back", // "go_back" (rendered only with a back target — none in slice 1)
+
+  // --- SPEC-0010 §2.2/§2.5 — session chrome + the /login form ----------------
+  sign_in: "Sign In", // "sign_in" (navbar link, form title, submit button)
+  sign_out: "Sign Out", // "sign_out" (navbar POST button)
+  uname_holder: "Username or Email Address", // "home.uname_holder" (optional owner check)
+  password: "Password", // "password" (the field carries a PAT — SPEC-0010 §2.2)
+  remember_me: "Remember This Device", // "auth.remember_me"
+  /** cf-gitea additions — upstream has no PAT login form at the pin; the
+   *  invalid wording deliberately mirrors "form.user_not_exist"'s
+   *  non-committal shape (unknown/expired/malformed are indistinguishable,
+   *  §4.11). */
+  login_error_invalid_token: "The token is not valid.",
+  login_error_scope: "The token cannot sign in: it does not grant repository read access.",
+  login_error_prohibited: "This account is prohibited from signing in.",
 } as const;
 
 /** The complete client i18n surface: `window.config.i18n` carries exactly

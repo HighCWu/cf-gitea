@@ -18,7 +18,7 @@ import { loadFileViewData, FileViewPage } from "./file-view";
 import { loadHomeData, HomePage } from "./home";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
-import { resolveViewer } from "../viewer";
+import type { Viewer } from "../viewer";
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -30,7 +30,7 @@ const manifest: UiManifest = {
 };
 
 const ctx: UiContext = {
-  viewer: resolveViewer(),
+  viewer: { kind: "anonymous" } satisfies Viewer,
   origin: "https://test.local",
   assets: shellAssetsFromManifest(manifest),
   repo: {
