@@ -117,8 +117,11 @@ import {
  * column yet — the Repository converter hardcodes has_issues: true).
  *
  * Webhook triggers (SPEC-0005 §3.5): issues opened (POST) / edited (title,
- * body) / closed+reopened (PATCH state) and issue_comment created (POST
- * comments), through the SHARED issue-family seam emitIssueEvent
+ * body) / closed+reopened (PATCH state) and the comment family (POST
+ * comments → issue_comment / pull_request_comment created; PATCH+DELETE
+ * …/comments/{id} → edited with `changes.body.from` / deleted with no
+ * `changes` — upstream UpdateComment:420-461 / DeleteComment:493-541), through
+ * the SHARED issue-family seam emitIssueEvent
  * (src/services/issue-events.ts) — the same fan-out the UI new-issue write
  * path runs (issueEventIdentity below is that module's identity assembly).
  * The label family (POST/PUT/DELETE …/labels) emits `issue_label` /
@@ -291,6 +294,44 @@ function pullRequestEventPayload(
     sender,
     commit_id: "",
   };
+}
+
+/**
+ * The comment edit/delete webhook: `issue_comment` / `pull_request_comment`
+ * picked by the upstream `issue.IsPull` discriminant (services/webhook/
+ * notifier.go UpdateComment:420-461 — action=edited with
+ * `changes.body.from` = the pre-edit content; DeleteComment:493-541 —
+ * action=deleted with NO `changes` block; CreateIssueComment:463-489 already
+ * emits from the POST route inline). The payload is the created emission's
+ * shape (§2.7 IssueCommentPayload, hook.go:297-314, minus the nullable
+ * `pull_request` field that emission already omits — documented deviation);
+ * `changes` renders upstream's `ChangesPayload.body` minimally, the landed
+ * issue title/body emissions' convention (the Go struct's non-omitempty
+ * `added_labels`/`removed_labels` nil-slice nulls are not copied).
+ */
+async function emitCommentEvent(
+  c: Context<ApiEnv>,
+  found: RepositoryWithOwner,
+  issue: IssueRow,
+  comment: Awaited<ReturnType<typeof toApiComment>>,
+  action: "edited" | "deleted",
+  options: { changes?: Record<string, { from: string }> } = {},
+): Promise<void> {
+  const event = issueEventContext(c, found);
+  await emitIssueEvent(c, {
+    repoId: found.repo.id,
+    ownerId: event.ownerId,
+    eventType: issue.isPull ? "pull_request_comment" : "issue_comment",
+    payload: {
+      action,
+      issue: await toApiIssue(c.env.DB, viewerOf(c), found, issue),
+      comment,
+      ...(options.changes === undefined ? {} : { changes: options.changes }),
+      repository: event.repository,
+      sender: event.sender,
+      is_pull: issue.isPull,
+    },
+  });
 }
 
 /**
@@ -957,8 +998,23 @@ export function registerIssueRoutes(
     }
     const form = c.req.valid("json");
     if (form.body !== (row.comment.content ?? "")) {
+      // Upstream editIssueComment (routers/api/v1/repo/issue_comment.go:569-577)
+      // updates and notifies only on an actual content change, carrying the
+      // pre-edit content into the notifier (UpdateComment:420-461's
+      // `changes.body.from`).
+      const oldContent = row.comment.content ?? "";
       await updateCommentBody(c.env.DB, row.comment.id, form.body, new Date());
       row.comment = { ...row.comment, content: form.body };
+      // Webhook: comment edited — the `issue.IsPull` discriminant picks
+      // issue_comment / pull_request_comment.
+      await emitCommentEvent(
+        c,
+        found,
+        row.issue,
+        await toApiComment(c.env.DB, viewer, found, row.issue, row.comment),
+        "edited",
+        { changes: { body: { from: oldContent } } },
+      );
     }
     return c.json(await toApiComment(c.env.DB, viewer, found, row.issue, row.comment), 200);
   });
@@ -967,7 +1023,7 @@ export function registerIssueRoutes(
   // DELETE /repos/{owner}/{repo}/issues/comments/{id} (issueDeleteComment)
   // -------------------------------------------------------------------------
   app.openapi(deleteCommentRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+    const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
     assertNotArchived(found);
     const commentId = pathId(c.req.valid("param").id);
     const row = await findRepoCommentById(c.env.DB, found.repo.id, commentId);
@@ -981,7 +1037,17 @@ export function registerIssueRoutes(
       // Upstream deleteIssueComment answers StatusBadRequest (undeclared).
       throw new ApiError(400, "comment type does not support content");
     }
-    await deleteComment(c.env.DB, row.comment, new Date());
+    // Render before the delete (upstream DeleteComment:493-541 serializes the
+    // in-memory comment) — toApiComment reads only the poster row, so the
+    // render stays valid across the deletion; the issue object the payload
+    // embeds is re-read fresh (upstream reloads the issue too, picking up the
+    // decremented num_comments).
+    const rendered = await toApiComment(c.env.DB, viewer, found, row.issue, row.comment);
+    const removed = await deleteComment(c.env.DB, row.comment, new Date());
+    // Webhook: comment deleted (DeleteComment:517) — no `changes` block.
+    if (removed) {
+      await emitCommentEvent(c, found, row.issue, rendered, "deleted");
+    }
     return c.body(null, 204);
   });
 

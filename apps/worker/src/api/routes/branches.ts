@@ -68,10 +68,10 @@ import type { MiddlewareHandler } from "hono";
  * ref_type "branch") and DeletePayload (DeleteRef:858→:870 — pusher_type
  * "user"). The sender is the authenticated API caller (upstream's `pusher`
  * doer); the repository renders with the caller's viewer, like every
- * api-routes emission. Upstream additionally fires CreateRef+DeleteRef on
- * branch RENAME (services/repository/branch.go:493-494) — the PATCH handler
- * below stays silent (its own wave; the create-then-delete pair would need
- * order + failure nuance).
+ * api-routes emission. Upstream additionally fires DeleteRef+CreateRef on
+ * branch RENAME (services/repository/branch.go:492-493) — the PATCH handler
+ * emits that pair (delete first, upstream's order) after the whole rename
+ * succeeded, with the shared tip as the create's sha.
  */
 
 const notFoundResponse = {
@@ -624,6 +624,38 @@ export function registerBranchRoutes(
           .set({ defaultBranch: newName })
           .where(eq(repositories.id, pair.repo.id));
       }
+
+      // Webhook: upstream fires DeleteRef(from) → CreateRef(to, the shared
+      // tip) on a rename (services/repository/branch.go:492-493) — the same
+      // DeletePayload/CreatePayload shapes the DELETE/POST handlers emit, in
+      // upstream's notification order (delete first), after the whole rename
+      // (including the default-branch fixup) succeeded.
+      await emitRefWebhook(
+        c,
+        pair,
+        "delete",
+        {
+          ref: oldName,
+          ref_type: "branch",
+          pusher_type: "user",
+          repository: toApiRepository(viewerOf(c), pair),
+          sender: c.get("authUser") ?? null,
+        },
+        branchRef(oldName),
+      );
+      await emitRefWebhook(
+        c,
+        pair,
+        "create",
+        {
+          sha: tip.target,
+          ref: newName,
+          ref_type: "branch",
+          repository: toApiRepository(viewerOf(c), pair),
+          sender: c.get("authUser") ?? null,
+        },
+        branchRef(newName),
+      );
       return c.body(null, 204);
     },
     bindValidationHook,

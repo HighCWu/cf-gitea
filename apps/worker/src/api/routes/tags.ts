@@ -65,9 +65,11 @@ import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
  * to what emitPushFamilyUpdates emits for a pushed annotated tag); upstream's
  * own API path passes the pre-peel target commit instead (release.go:136
  * resolves GetCommit(target) before CreateAnnotatedTag) — a quirk we do not
- * copy. Upstream's API tag create/delete additionally fire a `push` event
- * around the create/delete pair (release.go:134-137, 400-404) — out of this
- * wave's scope (create/delete only), noted as the remaining sub-gap.
+ * copy. Upstream's API tag create/delete additionally fire a zero-commit
+ * `push` event around the create/delete pair (release.go:136-143 / :396-403,
+ * always push first) — emitted here with the push family's zero-commit shape
+ * (zeroCommitPushPayload below), so an API-written tag and a pushed tag
+ * produce byte-identical `push` payloads.
  */
 
 const notFoundResponse = {
@@ -167,7 +169,7 @@ function errorMessage(error: unknown): string {
 async function emitRefWebhook(
   c: Context<ApiEnv>,
   pair: RepositoryWithOwner,
-  eventType: Extract<HookEventType, "create" | "delete">,
+  eventType: Extract<HookEventType, "create" | "delete" | "push">,
   payload: unknown,
   refName: string,
 ): Promise<void> {
@@ -198,6 +200,41 @@ async function emitRefWebhook(
   } catch (error) {
     console.error(`[tags] webhook fan-out failed (${eventType}): ${errorMessage(error)}`);
   }
+}
+
+/**
+ * The zero-commit `push` payload around an API tag write — the push family's
+ * created/deleted-ref shape (services/webhooks-push.ts:260-272, upstream's
+ * mirror path: SyncPushCommits → notifier.go:901-909 with an empty
+ * PushCommits struct, mirror_pull.go:347): FULL ref, before/after oids,
+ * compare_url the bare origin + "/" (AppURL + CompareURL ""), no commits,
+ * head_commit null, and `pusher` AND `sender` the authenticated caller
+ * (notifier.go:919-920 — both apiPusher). Upstream's git-push/release tag
+ * paths additionally set head_commit + a composed compare URL for created
+ * tags (push.go:123-136, release.go:131-134) — the landed family already
+ * emits the mirror-path shape for pushed tags, and this stays byte-identical
+ * with it (the documented family-level deviation, not a new one).
+ */
+function zeroCommitPushPayload(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  ref: string,
+  before: string,
+  after: string,
+): Record<string, unknown> {
+  const sender = c.get("authUser") ?? null;
+  return {
+    ref,
+    before,
+    after,
+    compare_url: `${viewerOf(c).origin}/`,
+    commits: [],
+    total_commits: 0,
+    head_commit: null,
+    repository: toApiRepository(viewerOf(c), pair),
+    pusher: sender,
+    sender,
+  };
 }
 
 export function registerTagRoutes(
@@ -353,6 +390,14 @@ export function registerTagRoutes(
         throw commitApiChangeError(result);
       }
 
+      // Upstream's API tag create fires the zero-commit `push` event around
+      // the `create` event (services/release/release.go:136-143 — PushCommits
+      // :136 first, CreateRef :143; the mirror create path orders it the same
+      // way, mirror_pull.go:347-352). Before = the zero oid (nothing existed),
+      // after = the new ref tip — the TAG OBJECT oid for the annotated case,
+      // exactly what the create payload below pins as `sha`.
+      await emitRefWebhook(c, pair, "push", zeroCommitPushPayload(c, pair, tagRef(name), ZERO_OID, newTarget), tagRef(name));
+
       // Upstream CreateRef (notifier.go:821→:830): ref is the SHORT tag name
       // (never an oid — the annotated peel stays out of `ref`), ref_type
       // "tag", sha the created ref's tip — the TAG OBJECT oid for the
@@ -473,6 +518,14 @@ export function registerTagRoutes(
       if (result.tag !== "deleted") {
         const error = deleteApiRefError(result);
         if (error !== null) throw error;
+      }
+      // Upstream's API tag delete fires the zero-commit `push` event too
+      // (services/release/release.go:396-403 — PushCommits with
+      // OldCommitID = the tag's sha and the empty NewCommitID, then
+      // DeleteRef :403): before = the pre-delete ref tip, after = the zero
+      // oid. Emission order push → delete matches upstream.
+      if (result.tag === "deleted") {
+        await emitRefWebhook(c, pair, "push", zeroCommitPushPayload(c, pair, tagRef(tagName), tip.target, ZERO_OID), tagRef(tagName));
       }
       // Upstream DeleteRef (notifier.go:858→:870): pusher_type is always
       // "user" (api.PusherTypeUser). The idempotent already-absent arm

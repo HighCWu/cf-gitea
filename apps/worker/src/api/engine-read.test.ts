@@ -723,6 +723,117 @@ describe("API branch/tag create+delete webhook emissions (ref events)", () => {
     expect(payload.ref).toBe("hooked-lw");
     expect(payload.ref_type).toBe("tag");
     expect(payload.pusher_type).toBe("user");
-    expect(await deliveriesFor(pushOnlyHook)).toHaveLength(0); // the push-only gate silences ref events
+    // The push-only hook sees exactly the wave-2 zero-commit `push` events
+    // (one around the create, one around the delete) — still zero `create`/
+    // `delete` rows (the push-only gate keeps silencing ref events).
+    const pushOnlyDeliveries = await deliveriesFor(pushOnlyHook);
+    expect(pushOnlyDeliveries.map((d) => d.eventType)).toEqual(["push", "push"]);
+    for (const row of pushOnlyDeliveries) {
+      const pushPayload = JSON.parse(row.payloadContent) as Record<string, unknown>;
+      expect(pushPayload.ref).toBe("refs/tags/hooked-lw");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// API tag push-pair + branch-rename webhook emissions (upstream
+// release.go:136-143 / :396-403 — the zero-commit `push` around API tag
+// create/delete, always push first; branch.go:492-493 — the rename pair
+// DeleteRef(from) → CreateRef(to, shared tip)).
+// ---------------------------------------------------------------------------
+
+describe("API tag push-pair + branch-rename webhook emissions (ref family wave 2)", () => {
+  async function repoId(): Promise<string> {
+    const row = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, SLUG)).get();
+    if (row === undefined) throw new Error("seed repo missing");
+    return row.id;
+  }
+
+  it("emits the zero-commit push+create pair on POST /tags, push first", async () => {
+    const id = await repoId();
+    const hook = await seedHook(id, { choose_events: true, branch_filter: "*", events: { push: true, create: true } });
+
+    const res = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "paired-tag", message: "paired\n", target: TIP1 }));
+    expect(res.status).toBe(200);
+    const tag = await jsonBody(res);
+
+    const deliveries = await deliveriesFor(hook);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["push", "create"]); // release.go:136→:143 order
+    const push = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // zero-commit PushPayload — the push family's created-ref shape
+    // (webhooks-push.ts created-ref branch; mirror_pull.go:347 →
+    // notifier.go:901-909 with an empty PushCommits struct).
+    expect(Object.keys(push).sort()).toEqual([
+      "after",
+      "before",
+      "commits",
+      "compare_url",
+      "head_commit",
+      "pusher",
+      "ref",
+      "repository",
+      "sender",
+      "total_commits",
+    ]);
+    expect(push.ref).toBe("refs/tags/paired-tag"); // the FULL ref (the create payload carries the short name)
+    expect(push.before).toBe(ZERO_OID);
+    expect(push.after).toBe(tag.id); // the annotated tag object oid — the ref tip, same sha the create payload pins
+    expect(push.commits).toEqual([]);
+    expect(push.total_commits).toBe(0);
+    expect(push.head_commit).toBeNull();
+    expect(push.compare_url).toBe(`${ORIGIN}/`); // AppURL + CompareURL "" (the zero-commit compare_url)
+    expect(push.pusher).toMatchObject({ login: OWNER }); // pusher AND sender = the authenticated caller (notifier.go:919-920)
+    expect(push.sender).toMatchObject({ login: OWNER });
+    expect(push.repository).toMatchObject({ full_name: `${OWNER}/${SLUG}` });
+    const create = JSON.parse(deliveries[1]!.payloadContent) as Record<string, unknown>;
+    expect(create.ref).toBe("paired-tag");
+    expect(create.sha).toBe(tag.id);
+  });
+
+  it("emits the zero-commit push+delete pair on DELETE /tags/{tag} (before = the pre-delete tip)", async () => {
+    const id = await repoId();
+    // a LIGHTWEIGHT tag — the ref tip is the commit oid
+    expect((await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "paired-lw", target: TIP1 }))).status).toBe(200);
+    const hook = await seedHook(id, { choose_events: true, branch_filter: "*", events: { push: true, delete: true } });
+
+    expect((await send(`${REPO_PATH}/tags/paired-lw`, authed({ method: "DELETE" }))).status).toBe(204);
+
+    const deliveries = await deliveriesFor(hook);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["push", "delete"]); // release.go:396→:403 order
+    const push = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    expect(push.ref).toBe("refs/tags/paired-lw");
+    expect(push.before).toBe(TIP1); // OldCommitID = the tag's sha (release.go:400)
+    expect(push.after).toBe(ZERO_OID); // the empty NewCommitID (release.go:401)
+    expect(push.commits).toEqual([]);
+    expect(push.total_commits).toBe(0);
+    expect(push.head_commit).toBeNull();
+    const del = JSON.parse(deliveries[1]!.payloadContent) as Record<string, unknown>;
+    expect(del.ref).toBe("paired-lw");
+    expect(del.pusher_type).toBe("user");
+  });
+
+  it("emits delete(old) then create(new) on PATCH rename; push-only hooks stay silent", async () => {
+    const id = await repoId();
+    // the branch lands BEFORE the hooks are seeded — its create event must not
+    // pollute this test's fan-out
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "pair-br", old_ref_name: TIP1 }))).status).toBe(201);
+    const renameHook = await seedHook(id, { choose_events: true, branch_filter: "*", events: { create: true, delete: true } });
+    const pushOnlyHook = await seedHook(id, { push_only: true });
+
+    const res = await send(`${REPO_PATH}/branches/pair-br`, jsonInit("PATCH", { name: "pair-br-renamed" }));
+    expect(res.status).toBe(204);
+
+    const deliveries = await deliveriesFor(renameHook);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["delete", "create"]); // upstream's order (branch.go:492-493)
+    const deleted = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    expect(deleted.ref).toBe("pair-br"); // the OLD short name
+    expect(deleted.ref_type).toBe("branch");
+    expect(deleted.pusher_type).toBe("user");
+    const created = JSON.parse(deliveries[1]!.payloadContent) as Record<string, unknown>;
+    expect(created.ref).toBe("pair-br-renamed");
+    expect(created.ref_type).toBe("branch");
+    expect(created.sha).toBe(TIP1); // the shared tip (fromBranch.CommitID)
+    expect(created.sender).toMatchObject({ login: OWNER });
+    expect(await deliveriesFor(pushOnlyHook)).toHaveLength(0); // delete/create never reach push-only hooks
   });
 });

@@ -1248,6 +1248,130 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
 });
 
 // ---------------------------------------------------------------------------
+// Comment edit/delete webhook emissions (upstream services/webhook/notifier.go
+// UpdateComment:420-461 — action=edited + changes.body.from — and
+// DeleteComment:493-541 — action=deleted, no changes; the IsPull discriminant
+// picks issue_comment vs pull_request_comment).
+// ---------------------------------------------------------------------------
+
+describe("comment edit/delete webhook emissions (issueEditComment / issueDeleteComment)", () => {
+  it("emits issue_comment edited with changes.body.from on PATCH, deleted (no changes) on DELETE", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "commented");
+    // Poster = the stub token identity (id 1) — the PATCH/DELETE doer must
+    // pass the poster-or-writer gate.
+    const comment = await service().addComment({ issueId: issue.id, posterId: 1, content: "first draft" });
+    const hookId = await seedHook(repoId, ["issue_comment"]);
+
+    const edit = await router()(`/repos/alice/visible/issues/comments/${comment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "second draft" }),
+    });
+    expect(edit.status).toBe(200);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("issue_comment");
+    const edited = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 IssueCommentPayload (hook.go:297-314) minus the nullable
+    // `pull_request` field — the landed created-emission shape + `changes`.
+    expect(Object.keys(edited).sort()).toEqual(["action", "changes", "comment", "is_pull", "issue", "repository", "sender"]);
+    expect(edited.action).toBe("edited");
+    expect(edited.changes).toEqual({ body: { from: "first draft" } }); // the pre-edit content
+    expect(edited.is_pull).toBe(false);
+    expect(edited.comment).toMatchObject({ id: comment.id, body: "second draft" });
+    expect(edited.repository).toMatchObject({ full_name: "alice/visible" });
+
+    const del = await router()(`/repos/alice/visible/issues/comments/${comment.id}`, { method: "DELETE", headers: authHeaders });
+    expect(del.status).toBe(204);
+
+    const after = await deliveriesFor(hookId);
+    expect(after.map((d) => d.eventType)).toEqual(["issue_comment", "issue_comment"]);
+    const deleted = JSON.parse(after[1]!.payloadContent) as Record<string, unknown>;
+    expect(Object.keys(deleted).sort()).toEqual(["action", "comment", "is_pull", "issue", "repository", "sender"]); // no `changes`
+    expect(deleted.action).toBe("deleted");
+    expect(deleted.comment).toMatchObject({ id: comment.id, body: "second draft" }); // the pre-delete body
+    expect(deleted.is_pull).toBe(false);
+  });
+
+  it("routes PR comment edits/deletes to pull_request_comment", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "PR comments",
+      posterId: 1,
+    });
+    const comment = await service().addComment({ issueId: pull.issue.id, posterId: 1, content: "review note" });
+    const hookId = await seedHook(repoId, ["pull_request_comment"]);
+    const issuesHook = await seedHook(repoId, ["issue_comment"]);
+
+    const edit = await router()(`/repos/alice/visible/issues/comments/${comment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "review note (edited)" }),
+    });
+    expect(edit.status).toBe(200);
+    await router()(`/repos/alice/visible/issues/comments/${comment.id}`, { method: "DELETE", headers: authHeaders });
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["pull_request_comment", "pull_request_comment"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["edited", "deleted"]);
+    const edited = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    expect(edited.is_pull).toBe(true);
+    expect(edited.changes).toEqual({ body: { from: "review note" } });
+    expect(edited.issue).toMatchObject({ number: pull.issue.index });
+    // An issue_comment-subscribed hook never sees pull_request_comment traffic.
+    expect(await deliveriesFor(issuesHook)).toHaveLength(0);
+  });
+
+  it("stays silent on an unchanged PATCH body, on system comments, and for unsubscribed hooks", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "quiet");
+    // Poster = the stub token identity (id 1), so the PATCH passes the
+    // poster-or-writer gate.
+    const comment = await service().addComment({ issueId: issue.id, posterId: 1, content: "stable" });
+    const hookId = await seedHook(repoId, ["issue_comment"]);
+    const siblingHook = await seedHook(repoId, ["issues"]);
+
+    // Upstream editIssueComment (issue_comment.go:569) notifies only when the
+    // body actually changed.
+    const noop = await router()(`/repos/alice/visible/issues/comments/${comment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "stable" }),
+    });
+    expect(noop.status).toBe(200);
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+
+    // System comments take the 204/400 early arms before any emission (the
+    // stub identity is the close actor so the permission gate passes first).
+    await service().closeIssue(issue.id, { actorId: 1 });
+    const systemComment = (await db().select().from(comments).where(eq(comments.type, CommentType.Close)).all())[0];
+    expect(systemComment).toBeDefined();
+
+    const systemEdit = await router()(`/repos/alice/visible/issues/comments/${systemComment!.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "nope" }),
+    });
+    expect(systemEdit.status).toBe(204);
+    const systemDelete = await router()(`/repos/alice/visible/issues/comments/${systemComment!.id}`, { method: "DELETE", headers: authHeaders });
+    expect(systemDelete.status).toBe(400);
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(0);
+    expect(await deliveriesFor(siblingHook)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /repos/{owner}/{repo}/issues/{index}/timeline (issueGetCommentsAndTimeline)
 // ---------------------------------------------------------------------------
 
