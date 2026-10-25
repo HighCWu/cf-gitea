@@ -9,6 +9,8 @@ import { describe, expect, it } from "vitest";
 
 import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } from "./a11y";
 import bareShellGolden from "./goldens/bare-shell.html?raw";
+import branchesGolden from "./goldens/branches.html?raw";
+import branchesWriterGolden from "./goldens/branches-writer.html?raw";
 import commitsGolden from "./goldens/commits.html?raw";
 import compareCommitsGolden from "./goldens/compare-commits.html?raw";
 import compareFormGolden from "./goldens/compare-form.html?raw";
@@ -98,6 +100,10 @@ const goldens: Record<string, string> = {
   // write-team member's file view and the org owner's settings page.
   "file-view-team-writer.html": fileViewTeamWriterGolden,
   "settings-team-admin.html": settingsTeamAdminGolden,
+  // Pages wave 16: the repo branches page — the anonymous list and the
+  // signed-in owner view (the GOLDEN_CASES entries above).
+  "branches.html": branchesGolden,
+  "branches-writer.html": branchesWriterGolden,
 };
 
 function classList(el: { attrs: Record<string, string> }): string[] {

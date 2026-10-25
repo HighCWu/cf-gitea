@@ -162,6 +162,20 @@
  *   /:owner/:repo/settings/branches/{id}/delete
  *                                          the rule delete write, POST
  *                                          (upstream's literal shape)
+ *   /:owner/:repo/branches                the repo branches list, GET
+ *                                          (pages/branches.tsx — wave 16;
+ *                                          anonymous-capable; the DEFAULT
+ *                                          badge + the SPEC-0013 §3.6
+ *                                          protection badge's first
+ *                                          consumer; `?q=` filter,
+ *                                          `?page=` pager)
+ *   /:owner/:repo/branches/delete         the branch delete write, POST
+ *                                          (upstream's literal route —
+ *                                          web.go:1481 DeleteBranchPost —
+ *                                          re-playing the landed API
+ *                                          DELETE arm + the M2 deletion
+ *                                          predicate; the refusals flash
+ *                                          upstream's exact texts)
  *   /{org}/labels                          org labels management, GET
  *                                          (pages/org-labels.tsx — wave 14;
  *                                          the landed org-label family's
@@ -420,6 +434,12 @@ import {
   renderRepoSettingsPage,
   syncMirrorNow,
 } from "./pages/settings";
+import {
+  applyBranchDelete,
+  loadBranchesData,
+  parseBranchDeleteForm,
+  renderBranchesPage,
+} from "./pages/branches";
 import {
   applyBranchProtectionForm,
   deleteRuleById,
@@ -1071,6 +1091,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       base: base === "" ? null : base,
       head: headSide === "" ? null : headSide,
     };
+  }
+  // Wave-16 branches family (pages/branches.tsx — upstream web.go:1478-1482's
+  // group): the bare URL is the list; the `/delete` tail is the POST-only
+  // write (the branch name rides the form field). Every other tail
+  // (`/branches/abc`, upstream's `/_new/*` create + `/restore` writes, which
+  // have no landed flows) stays engine-owned → the engine's 404.
+  if (head === "branches") {
+    if (rest.length === 0) return { family: "branches", owner, repo };
+    if (rest.length === 1 && rest[0] === "delete") return { family: "branch-delete", owner, repo };
+    return null;
   }
   // Wave-8 file editor: the `new`/`edit`/`delete` literals claim the
   // branch+path tail shape (FileEditorRoute). Bare literals fall through to
@@ -1857,6 +1887,88 @@ async function branchProtectionPrioritySubmit(c: Context<{ Bindings: Env }>): Pr
   if (repo.isArchived) return respond(c.html(renderNotFound(resolved.ctx), 404)); // RepoMustNotBeArchived (wraps upstream's route)
   await reorderRules(c.env.DB, repo.id, parsePriorityIds(await readUrlEncodedForm(c.req.raw)));
   return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/settings/branches` } }));
+}
+
+// ---------------------------------------------------------------------------
+// The wave-16 branches family (pages/branches.tsx — upstream's
+// `m.Get("/branches", repo.Branches)` list + `m.Post("/branches/delete",
+// repo.DeleteBranchPost)` write, web.go:1478-1482's group)
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/branches (pages/branches.tsx — the list): every
+ *  viewer who can see the repo reads it (anonymous-capable — the page's
+ *  controls gate themselves on the loaded grants); `?q=` filters, `?page=`
+ *  paginates, and the deletion-flash params are display-only. */
+async function branchesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "branches") return respond(await c.notFound()); // registration/parser drift guard
+  const page = parsePageNumber(url.searchParams.get("page"));
+  const keyword = (url.searchParams.get("q") ?? "").slice(0, 255);
+  const data = await loadBranchesData(c.env, c.env.DB, repo, { page, keyword, viewer });
+  // The Switch Default Branch link rides the settings page's own gate
+  // (pages/branches.tsx's divergence note — upstream gates on IsWriter).
+  const canAdmin = await canAdminRepo(c.env, repo, viewer);
+  return respond(
+    c.html(
+      renderBranchesPage({
+        ctx,
+        data,
+        canAdmin,
+        flash: {
+          deleted: url.searchParams.get("deleted"),
+          errorKind: url.searchParams.get("delete_error"),
+          errorName: url.searchParams.get("name") ?? "",
+        },
+      }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/branches/delete — the delete write (upstream
+ * DeleteBranchPost's literal route over the landed API DELETE arm's steps
+ * plus the M2 deletion predicate — pages/branches.tsx's module header
+ * carries the why): the §2.8 Origin guard, the repo→viewer order, the
+ * archived/empty 404 shells (RepoMustNotBeArchived + MustBeNotEmpty's UI
+ * posture), then applyBranchDelete. Every refusal 303s back onto the list
+ * with its flash param (upstream's JSONError texts), a deleted branch too
+ * (the success flash); a missing branch name 404-shells (the API arm's
+ * declared 404 — existence stays hidden).
+ */
+async function branchDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "branch-delete") return respond(await c.notFound()); // registration/parser drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (repo.isArchived || repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  const name = parseBranchDeleteForm(await readUrlEncodedForm(c.req.raw));
+  if (name === "") return respond(c.html(renderNotFound(ctx), 404));
+  const doerRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (doerRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  let waitUntil: ((promise: Promise<unknown>) => void) | undefined;
+  try {
+    waitUntil = c.executionCtx.waitUntil.bind(c.executionCtx);
+  } catch {
+    waitUntil = undefined; // in-process test callers have no execution context
+  }
+  const result = await applyBranchDelete(c.env, repo, viewer, name, { pair, doer: doerRow, origin: url.origin, waitUntil });
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const listPath = `/${repo.ownerNamespace}/${repo.slug}/branches`;
+  const location =
+    result.outcome === "deleted"
+      ? `${listPath}?deleted=${encodeURIComponent(result.name)}`
+      : `${listPath}?delete_error=${result.outcome === "refused-default" ? "default" : result.outcome === "refused-protected" ? "protected" : "failed"}&name=${encodeURIComponent(result.name)}`;
+  return respond(new Response(null, { status: 303, headers: { location } }));
 }
 
 /**
@@ -3001,6 +3113,13 @@ uiRouter.post("/:owner/:repo/settings/branches/priority", (c) => branchProtectio
 uiRouter.get("/:owner/:repo/settings/branches/priority", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/settings/branches/:id/delete", (c) => branchProtectionDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/settings/branches/:id/delete", () => methodNotAllowed("POST"));
+// Wave-16 branches family (parseUiRoute claims exactly these shapes —
+// upstream's web.go:1478-1482 group; the delete POST runs the §2.8
+// sameOriginGuard first and answers GET with chi's 405 — the hook
+// test/delete convention).
+uiRouter.get("/:owner/:repo/branches", (c) => branchesPage(c));
+uiRouter.post("/:owner/:repo/branches/delete", (c) => branchDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/branches/delete", () => methodNotAllowed("POST"));
 // Wave-6 milestones families (parseUiRoute claims exactly these shapes; the
 // static literal registers before any deeper dynamic tail could — there is
 // none this slice, the shape is kept for the reasons above).

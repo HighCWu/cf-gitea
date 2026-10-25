@@ -302,6 +302,15 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // stay control-free — the committed goldens above pin those bytes.
   { file: "file-view-team-writer.html", path: "/acme/anvil/src/branch/main/README.md", status: 200, signedIn: true },
   { file: "settings-team-admin.html", path: "/acme/anvil/settings", status: 200, signedIn: true, sessionUser: "morgan" },
+  // The repo branches page (wave 16): the ANONYMOUS list over alice/golden —
+  // the Default Branch section (shield + rule name on the "main"-rule-matched
+  // default), the DEFAULT badge, the docs-seed/feature/compare rows with
+  // their divergence bars and last-commit lines, no controls — and the
+  // SIGNED-IN owner view where the delete buttons render per upstream's
+  // CanDelete arms (docs-seed + feature/compare; never on the protected
+  // default) beside the Switch Default Branch link.
+  { file: "branches.html", path: "/alice/golden/branches", status: 200 },
+  { file: "branches-writer.html", path: "/alice/golden/branches", status: 200, signedIn: true },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
