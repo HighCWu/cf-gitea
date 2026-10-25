@@ -318,3 +318,22 @@ forward-only migration path with an upgrade txn.
   mixed-generation plans, segment bounds). Plan-time reads (negotiation/
   closure computation before planFetch) remain ungated by reviewed M3.1
   posture — GC flips there fail the fetch whole.
+
+- **M3.3 (0303f5d, 2026-10-25)**: triggers `COMPACTION_ACTIVE_PACK_THRESHOLD=8`
+  (above the invariants seven-pack fixture by design; a 9-pack repo converges
+  in one round), window = oldest-first ≤8 packs / 32 MiB / 50k objects, lease
+  TTL 10 min no-renewal (crashed holder expires into the sweep), manual RPC
+  `compactNow({force?})`. The `state` column lands as migration step
+  `0003-pack-catalog-state-live` — the Step-4 alignment had physically
+  reserved the columns, so the step journal-records activation +
+  guarded-ALTERs older vintages + backfills ACTIVE (never a version bump).
+  Crash windows: lease payload names output keys BEFORE the R2 write; publish
+  is one transactionSync re-guarded on lease liveness; the sweep converges by
+  payload + catalog state (unpublished output → deleted; published output
+  kept). Inputs are never deleted here (M3.4 owns deletion). Finalize premise
+  holds across ACTIVE→RETIRED (publish only re-points identical content
+  atomically); `renewAndAuthorizeRead` membership is now state-aware
+  (non-member ACTIVE = the re-pointed successor → authorized). Verified by
+  `e2e/check-compaction.mjs` (8 checks: byte-identical closure walks over
+  fulls/cross-pack REF/OFS/loose-base deltas, determinism, both crash
+  windows, RETIRED-serves-readers mixed-generation clone, lease exclusion).
