@@ -161,3 +161,64 @@ anon-git-surface, receive-advert, migrate-check (all 19 expected tables incl.
 
 Reviewer package (per the external review's request): P0 diff + these
 probe outputs + post-deploy CLI exit states + `.git/shallow` results.
+
+## Post-review addendum (2026-10-25, answering the reviewer's final round)
+
+**1. Risk wording — adopted verbatim (scoped, not absolute):**
+
+> 当前已知复现路径在现有仓库级权限模型下，主要造成浅克隆语义失效与
+> 额外数据传输；未发现跨权限数据泄露证据。该结论不自动适用于未来的
+> 隐藏引用或对象级权限模型。
+
+(English record of the same scope: under the CURRENT repo-granular ACL —
+no hidden refs, no object-level authorization, no per-ref visibility — the
+known reproduction paths cause shallow-semantics failure and excess object
+transfer; no cross-permission exposure was observed. The conclusion does NOT
+automatically extend to hidden-refs or object-granular permission models and
+must be re-evaluated when either lands.)
+
+**2. Proof target restated and adopted:** the property to prove is
+`AcceptedRequest ⇒ SemanticsPreserved`, where SemanticsPreserved means every
+result-affecting protocol constraint is either correctly represented and
+participates in planning, or the request is explicitly rejected before
+planning. Type-level unreachability (the branded request type) is an AID,
+not the proof — the standing position since round 9 ("Runtime checks remain
+the contract"). The three reviewer caveats map to runtime evidence, not
+types: (a) assertion bypass → the gates below exercise the runtime path;
+(b) parser misclassification of a legal input → the param-level matrix
+(e2e/check-deepen-parse.mjs 16/16 across v0+v2 argument phases; the
+differential battery's deepen cases); (c) Normalize-stage overwrite → the
+discriminated shallow-mode union resolves combinations at the parse boundary
+(no field overwrite exists to perform), pinned by the G4 combination tests
+including the sticky `deepen-relative`-after-`deepen <n>` case and the
+poisoning combo.
+
+**3. Branch-coverage concern (did the test actually take the affected
+path?) — addressed with recorded wire evidence, not exit codes alone:**
+- The differential case `advert-capability-matrix` (scripts/diff-cases,
+  commit ec5f7c9) captures `GIT_TRACE_PACKET` handshakes per endpoint and
+  records client protocol version + the actual advertisement + the v2
+  capability set — the negotiation shape is IN the report.
+- The differential case `deepen-strict-reject` asserts the conjunction:
+  exit 128 AND no repo directory AND the server's ERR pkt-line naming the
+  exact rejected argument AND `.git/shallow` unchanged — a fallback/alternate
+  negotiation path cannot satisfy all four.
+- G3 is exercised structurally: the poisoning combo (deepen-since + no haves
+  + done + wants=all-tips) satisfies every OTHER fullClone cache condition,
+  so the only mechanism preventing a cache hit is the parse-boundary verdict;
+  the cache short-circuit before the `currentPackKey` probe is asserted in
+  the engine wave's tests.
+- The CLI probes inspect `.git/shallow` contents and `rev-list --count`, not
+  just exit status (see the tables above).
+
+**4. Reviewer status table — all rows green as of this addendum:**
+root cause: reported+analyzed (round 7); fix spec: gated (rounds 8-9); code
+fix: LANDED (engine wave, diff in p0-diff-protocol.patch); protocol tests:
+LANDED GREEN (16/16 param matrix + e2e family); real git CLI: dev 7/7 probes
++ production 3/3 probes verbatim above; production deploy: DONE (cf93d51f,
+probes against it; a routine redeploy shipping the day's follow-ups is in
+flight). The two smoke findings recorded above were later resolved: the
+anon-read "leak" was proven a stale pre-lifecycle deploy artifact (current
+production 401s across the settle window; 7-test regression pin 961ea22) and
+the settle-window race is fixed in the smoke (authed ls-remote + anon-401
+assertion + retry, 562f257).
