@@ -421,6 +421,10 @@ export class GitStore {
    *                          only; never an R2 name — SPEC-0001a §3 Step 3)
    *   compaction_wanted_at — M3 compaction trigger stamp; written alongside
    *                          the M2 `gc-pending` flag today, consumed by M3
+   *   gc_wanted_at         — M3.4 GC trigger stamp (SPEC-0011 §2): written by
+   *                          committed ref changes (staled clone-cache entry)
+   *                          and by compaction rounds (RETIRED inputs);
+   *                          consumed by the alarm's GC pass in src/gc.ts
    * Legacy keys (`description`, `owner`, `section`, `private`, `has-loose`,
    * `reachable-version`, `repo`, `storage_key`, `created`, `last-push`,
    * `gc-pending`, `schema_version`, `deleted`) are retained until the

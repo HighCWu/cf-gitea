@@ -65,3 +65,23 @@ export function idxR2Key(storageKey: string, name: string): string {
 export function cloneCacheKey(storageKey: string, refsVersionHash: string): string {
   return `repos/${storageKey}/clone-cache/${refsVersionHash}.pack`;
 }
+
+/**
+ * `repos/<storage_key>/clone-cache/` — the listing prefix the GC drain walks
+ * (M3.4). The write-side constructor above stays the only way an object key
+ * is BUILT; this is its listing dual, so the namespace keeps one definition.
+ */
+export function cloneCachePrefix(storageKey: string): string {
+  return `repos/${storageKey}/clone-cache/`;
+}
+
+/**
+ * The refs-version hash a clone-cache object key serves — null when `key` is
+ * not a clone-cache object shape. The GC drain (M3.4) compares it against the
+ * current reachableVersion() to decide whether the entry is still hot; any
+ * key that does not parse is foreign and is never touched.
+ */
+export function cloneCacheVersionOf(key: string): string | null {
+  const m = /^repos\/[^/]+\/clone-cache\/([0-9a-f]{40})\.pack$/.exec(key);
+  return m ? m[1] : null;
+}

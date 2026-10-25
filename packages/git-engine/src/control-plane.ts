@@ -691,11 +691,21 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
   if (outcome.lost) return { tag: "lease_mismatch" };
   const { results, changed, needsGc } = outcome;
 
+  if (changed || outcome.extraApplied.length > 0) {
+    // M3.4 GC cadence (SPEC-0011 §2): the committed ref change moved
+    // refs_version, staling the clone-cache entry it served — stamp the GC
+    // consumer (the DO alarm pass collects drained cache entries and
+    // compaction debris by catalog state). Distinct from needsGc (stranded
+    // history): a fast-forward push stales the cache too.
+    store.setMeta("gc_wanted_at", String(Date.now()));
+  }
   if (needsGc) {
     store.setMeta("gc-pending", "1");
     // the formal M3 trigger key (SPEC-0001 §4): written alongside the M2
     // gc-pending flag; compaction consumes it, nothing reads it yet
     store.setMeta("compaction_wanted_at", String(Date.now()));
+  }
+  if (changed || outcome.extraApplied.length > 0 || needsGc) {
     try {
       await host.storage.setAlarm(Date.now() + 5 * 60 * 1000);
     } catch (err) {

@@ -129,6 +129,11 @@ export {
   COMPACTION_WINDOW_PACKS,
   runCompaction,
 } from "./compaction";
+// GC (SPEC-0011 §2, M3.4): the RETIRED→RECLAIMABLE→DELETED transitions + the
+// clone-cache drain, re-exported for the same reason — the entry points are
+// the RepoCell.gcNow RPC and the DO alarm pass over `gc_wanted_at`.
+export type { GcCollected, GcHost, GcPassResult } from "./gc";
+export { GC_RETRY_MS, runGcPass } from "./gc";
 // fork catalog replication (SPEC-0001b §5.3): the four RepoCell RPCs plus the
 // Worker-side consumer loop the fork endpoint's queue consumer calls (the
 // streamed bucket.get → bucket.put copy — the R2 binding has no server-side

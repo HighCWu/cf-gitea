@@ -774,6 +774,89 @@ export class PackStore {
     return rows[0]?.state ?? null;
   }
 
+  /** The `superseded_by` link of one catalog row (null when the row does not
+   * exist or was never superseded) — the GC successor-premise walk (M3.4,
+   * src/gc.ts) follows these links transitively through chained compactions. */
+  supersededByOf(packKey: string): string | null {
+    this.assertOpen();
+    const rows = this.sql
+      .exec<{ superseded_by: string | null }>("SELECT superseded_by FROM pack_catalog WHERE pack_key = ?", packKey)
+      .toArray();
+    return rows[0]?.superseded_by ?? null;
+  }
+
+  /** Full catalog rows in one non-ACTIVE lifecycle state (M3.4 GC's scan
+   * inputs: the RETIRED→RECLAIMABLE listing and the RECLAIMABLE→DELETED
+   * listing). ACTIVE rows have their own ordered windows above; GC never
+   * touches those. */
+  catalogRowsInState(state: "retired" | "reclaimable"): PackCatalogRow[] {
+    this.assertOpen();
+    return this.sql
+      .exec<{
+        pack_key: string; seq: number; kind: string; state: string; location: string;
+        object_count: number; pack_bytes: number; idx_bytes: number; created_at: number;
+        superseded_by: string | null;
+      }>(
+        `SELECT pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by
+           FROM pack_catalog
+          WHERE state = ?
+          ORDER BY pack_key`,
+        state
+      )
+      .toArray()
+      .map((r) => ({
+        packKey: r.pack_key,
+        seq: r.seq,
+        kind: r.kind,
+        state: r.state as PackState,
+        location: r.location === "sqlite" ? "sqlite" : "r2",
+        objectCount: r.object_count,
+        packBytes: r.pack_bytes,
+        idxBytes: r.idx_bytes,
+        createdAt: r.created_at,
+        supersededBy: r.superseded_by,
+      }));
+  }
+
+  /**
+   * The §2 RETIRED→RECLAIMABLE flip (M3.4, src/gc.ts): guarded on the state
+   * still being 'retired' so an idempotent re-scan (or a row that moved
+   * between the caller's listing and this write inside the same transaction)
+   * converges instead of double-writing. Callers run the zero-live-lease and
+   * successor-premise checks in the SAME transaction (SPEC-0011 §2); RECLAIMABLE
+   * is irreversible in v1 — no method here ever writes 'reclaimable' →
+   * 'retired'.
+   */
+  markPackReclaimable(packKey: string): void {
+    this.assertOpen();
+    this.sql.exec("UPDATE pack_catalog SET state = 'reclaimable' WHERE pack_key = ? AND state = 'retired'", packKey);
+  }
+
+  /**
+   * The §2 RECLAIMABLE→DELETED row removal (M3.4, src/gc.ts): the caller has
+   * already awaited the R2 DELETE ack (an ack must mean deleted) and runs
+   * this inside ONE transaction guarded on the state — an already-moved or
+   * already-gone row removes nothing and returns false (idempotent re-run).
+   * Index/data rows keyed under the pack are debris by definition (the
+   * compaction publish re-pointed every row; sqlite-location inputs' pack_data
+   * chunks die here), deleted defensively so no stale row can outlive its
+   * catalog entry. Cache state cleared: chunk keys overlap by prefix.
+   */
+  deleteReclaimablePack(packKey: string): boolean {
+    this.assertOpen();
+    const rows = this.sql
+      .exec<{ state: PackState }>("SELECT state FROM pack_catalog WHERE pack_key = ?", packKey)
+      .toArray();
+    if (rows[0]?.state !== "reclaimable") return false;
+    this.sql.exec("DELETE FROM pack_objects WHERE pack_key = ?", packKey);
+    this.sql.exec("DELETE FROM pack_data WHERE pack_key = ?", packKey);
+    this.sql.exec("DELETE FROM pack_catalog WHERE pack_key = ? AND state = 'reclaimable'", packKey);
+    this.chunks.clear();
+    this.backend.delete(packKey);
+    this.r2KeyOverrides.delete(packKey);
+    return true;
+  }
+
   /** Count of ACTIVE catalog rows — the compaction trigger's pack-count
    * threshold input (SPEC-0011 §5.1; Q1's conservative start lives in
    * src/compaction.ts). */

@@ -102,6 +102,7 @@ import {
   type CompactionHost,
   type CompactionResult,
 } from "./compaction";
+import { GC_RETRY_MS, runGcPass, type GcHost, type GcPassResult } from "./gc";
 import { esc, repoUrl, repoBase, age, fmtDate, fmtDate2822, layout, htmlResponse, errorPage, LayoutOpts } from "./ui/html";
 import { renderMarkdown } from "./ui/markdown";
 import { highlightLines } from "./ui/highlight";
@@ -412,6 +413,14 @@ export class RepoCell extends DurableObject<Env> {
     // Runs AFTER the gc branch (a gc round resets the pack tables wholesale;
     // compacting first would be wasted work the gc un-does).
     await this.maybeCompactFromAlarm();
+    // M3.4 GC consumer (SPEC-0011 §2) — compaction's stamp pattern one step
+    // downstream: `gc_wanted_at` is stamped by every committed ref change
+    // (which stales the clone-cache entry it served) and by every compaction
+    // round that landed RETIRED inputs; the pass collects what read leases
+    // have drained and re-arms (the periodic sweep) until the catalog
+    // converges. Ordered after the sweep + compaction so expired read leases
+    // are reaped before the pass consults them.
+    await this.maybeGcFromAlarm();
   }
 
   /** The alarm-side compaction trigger (SPEC-0011 §5.1): threshold-gated,
@@ -445,6 +454,9 @@ export class RepoCell extends DurableObject<Env> {
       return;
     }
     if (result.tag === "compacted") {
+      // §5.2 step 5 / M3.4: the round landed RETIRED inputs — GC reclaims
+      // them once leases drain (the stamp this alarm's GC consumer reads)
+      this.store.setMeta("gc_wanted_at", String(Date.now()));
       if (this.store.packs.activePackCount() > COMPACTION_ACTIVE_PACK_THRESHOLD) {
         // still above the trigger: keep the stamp, converge next round
         this.store.setMeta("compaction_wanted_at", String(Date.now()));
@@ -500,7 +512,112 @@ export class RepoCell extends DurableObject<Env> {
     } catch {
       // a failed sweep must not block the manual round; the next one converges
     }
-    return runCompaction(this.compactionHost(), { force: opts.force === true });
+    const result = await runCompaction(this.compactionHost(), { force: opts.force === true });
+    if (result.tag === "compacted") {
+      // §5.2 step 5 / M3.4: the round landed RETIRED inputs — stamp + arm the
+      // GC consumer (the alarm pass collects once leases drain)
+      this.stampGcWanted();
+    }
+    return result;
+  }
+
+  // ---- M3.4 GC (SPEC-0011 §2): RETIRED→RECLAIMABLE→DELETED -----------------
+  // The alarm consumer (maybeGcFromAlarm) + the manual RPC (gcNow). The
+  // transitions and their guards live in src/gc.ts; this is the cadence:
+  // compaction's stamp pattern — stamp `gc_wanted_at` when work is created
+  // (a compaction round's RETIRED inputs; every committed ref change's
+  // staled clone-cache entry — see finalizeReceive), run a pass from the
+  // alarm, re-arm while the pass reports pending work (lease drain, delete
+  // retry), consume the stamp at convergence.
+
+  /** Stamp + arm the GC consumer (post-compaction; the pass runs on the next
+   * alarm — the re-arm cadence keeps it converging while work pends). */
+  private stampGcWanted(): void {
+    this.store.setMeta("gc_wanted_at", String(Date.now()));
+    void this.ctx.storage.setAlarm(Date.now() + GC_RETRY_MS).catch(() => {
+      // alarm store busy under a burst: the next push/compaction re-arms
+    });
+  }
+
+  /** The alarm-side GC trigger: stamp-gated, re-armed while pending. */
+  private async maybeGcFromAlarm(): Promise<void> {
+    if (!this.store.getMeta("gc_wanted_at")) return;
+    const rearm = async (ms: number): Promise<void> => {
+      try {
+        await this.ctx.storage.setAlarm(Date.now() + ms);
+      } catch {
+        // alarm store busy: the next push's finalize re-arms instead
+      }
+    };
+    if (!this.env.REPO_PACKS) {
+      // no R2 backend: nothing is reclaimable (a RECLAIMABLE→DELETED row
+      // removal requires the delete ack) — drop the stamp rather than spin
+      this.store.setMeta("gc_wanted_at", "");
+      return;
+    }
+    this.bindR2(this.store.getMeta("repo") ?? "repo");
+    let result: GcPassResult;
+    try {
+      result = await runGcPass(this.gcHost());
+    } catch (err) {
+      console.log(`gc pass failed: ${err instanceof Error ? err.message : String(err)}`);
+      await rearm(GC_RETRY_MS);
+      return;
+    }
+    if (result.tag !== "collected") return;
+    if (result.pending) {
+      // lease-drain / delete-retry pending: keep the stamp, sweep again on
+      // the retry cadence (the periodic sweep)
+      await rearm(GC_RETRY_MS);
+    } else {
+      this.store.setMeta("gc_wanted_at", "");
+    }
+  }
+
+  /** The GC host over this cell's DO storage + R2 binding. Unlike the
+   * compaction host's best-effort deletes, GC's delete adapter THROWS when
+   * unbound: the RECLAIMABLE→DELETED row removal requires the delete to have
+   * actually happened — a silent no-op would strand the bytes. */
+  private gcHost(): GcHost {
+    return {
+      store: this.store,
+      storage: this.ctx.storage,
+      deletePackObjects: async (keys) => {
+        const bucket = this.env.REPO_PACKS;
+        if (!bucket) throw new Error(`gc: REPO_PACKS unbound, cannot delete ${keys[0] ?? ""}`);
+        await bucket.delete(keys);
+      },
+      listPackObjects: async (prefix) => {
+        const bucket = this.env.REPO_PACKS;
+        if (!bucket) return [];
+        const keys: string[] = [];
+        for (let cursor: string | undefined; ; ) {
+          const listed = await bucket.list({ prefix, cursor });
+          keys.push(...listed.objects.map((o) => o.key));
+          if (!listed.truncated) break;
+          cursor = listed.cursor;
+        }
+        return keys;
+      },
+    };
+  }
+
+  /**
+   * Manual GC entry point (SPEC-0011 §2, M3.4) — the tests/benches (and
+   * admin) surface, mirroring compactNow: sweeps expired leases first (a
+   * crashed holder's read lease stops blocking), then runs one pass. The
+   * production trigger rides the alarm (maybeGcFromAlarm).
+   */
+  async gcNow(): Promise<GcPassResult> {
+    if (this.store.schemaState.refused !== null) return { tag: "skipped", reason: "sealed" };
+    this.rpcBind();
+    if (!this.env.REPO_PACKS) return { tag: "skipped", reason: "no_r2_backend" };
+    try {
+      await sweepExpiredLeases(this.leaseHost());
+    } catch {
+      // a failed sweep must not block the manual pass; the next one converges
+    }
+    return runGcPass(this.gcHost());
   }
 
   /**
