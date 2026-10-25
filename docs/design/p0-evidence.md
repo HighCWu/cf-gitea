@@ -264,6 +264,29 @@ path?) — addressed with recorded wire evidence, not exit codes alone:**
   the engine wave's tests.
 - The CLI probes inspect `.git/shallow` contents and `rev-list --count`, not
   just exit status (see the tables above).
+- **G3 upgraded to DIRECT evidence (2026-10-24, closing the reviewer's
+  independent-audit condition):** `packages/git-engine/e2e/check-cache-unreachable.mjs`
+  (same tsx convention as check-deepen-parse.mjs; 10/10) invokes the REAL
+  public serve path — `createDurableGit().fetch`, the production call site of
+  the module-private `serveCloneFromR2`, with an authorize-pass hook and
+  stubbed REPO/REGISTRY bindings — so ZERO engine source change was needed
+  (the seam is the public caller; `serveCloneFromR2` stays module-private;
+  the check's `cloudflare:workers` import resolves via a resolve-hook shim
+  that supplies an inert `DurableObject` base class, since the DO is the stub
+  itself). The DO stub is a spy: its `currentPackKey` increments a call log,
+  and every REPO_PACKS R2 method records and throws-if-called. The poisoned
+  request (deepen-since + wants=all-tips + no haves + done, v2 — the exact
+  bytes of the G3 parse check) yields **ZERO `currentPackKey` RPC calls and
+  zero R2 interactions**, falling through to the DO where the G2 ERR renders;
+  the control case (a legal full clone) reaches `currentPackKey` exactly once
+  with the request's wants and serves the R2 cache response
+  (`x-pack-cache: hit`) — proving the stub is wired, not vacuous. Mutation
+  exercise recorded: removing the `badArgument` short-circuit alone still
+  passes — the fullClone predicate's `deepen.kind === "none"` member is a
+  SECOND independent barrier, so the "only mechanism" wording in the G3
+  bullet above understates the defense — while removing BOTH barriers fails
+  the zero-calls assertion (exit 1): the check pins the unreachability
+  property itself, not any single line.
 
 **4. Reviewer status table — all rows green as of this addendum:**
 root cause: reported+analyzed (round 7); fix spec: gated (rounds 8-9); code
