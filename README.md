@@ -11,7 +11,8 @@ long-term frontend (asset-reuse strategy, SPEC-0008+).
 git client ──▶ Worker (Hono, edge)
                  ├─ git smart-HTTP ──▶ RepoDO (refs, leases, catalog) + R2 (packs)
                  ├─ /api/v1 ─────────▶ D1 (users, repos, issues) + engine object reads
-                 └─ auth ────────────▶ D1 (tokens: sha256 digests, scoped)
+                 ├─ UI pages ────────▶ Hono JSX (public browse + login sessions)
+                 └─ auth ────────────▶ D1 (PATs: sha256 digests, scoped)
 ```
 
 Self-hosted git engine (vendored [durable-git], evolving per the split-plane design):
@@ -20,56 +21,91 @@ D1 (Drizzle ORM) holds all product metadata. No containers, no managed git servi
 Deep-dive: [ADR-0001](docs/decisions/0001-technical-direction.md) ·
 [reference-project survey](docs/research/tech-route-survey.md).
 
-## Status
+## Quickstart
 
-Status snapshot **2026-10-25 02:20 CST** (parallel agent waves were landing while
-observed; in-flight items are marked, not counted as done).
+Prerequisites: **Node ≥ 22**, **pnpm** (version from the `packageManager` field —
+`corepack enable`), **git ≥ 2.22**. Wrangler itself ships as a devDependency (the
+repo's scripts always invoke it via `pnpm exec`); you only need a Wrangler login
+(`pnpm exec wrangler login`) for the deploy path.
 
-**Live** (first deploy 2026-10-24): <https://cf-gitea.hecongw.workers.dev> — real git
-hosting works end to end against it (PAT-authenticated push, clone, token API). Landed:
-the vendored engine through SPEC-0001a in full (Worker-side receive/scan/delta/idx,
-lease RPCs, `storage_key` R2 addressing, pack_catalog, lifecycle RPCs, fail-closed
-protocol parser; m2 benchmark baseline enforced: clone 14.2 MiB/s local) plus
-SPEC-0001b **in full** — merge base/graph/diff3/tree-merge/rebase/patch-id,
-mergeability + executeMerge RPCs (3b30ba3) and the fork machinery (catalog
-replication, 0223cb9; the PR `mergeable` field is live) — SPEC-0002 auth (PATs,
-scopes, token API), SPEC-0003 M1-M5 (git-HTTP ACL gate, lifecycle, redirects,
-push-create, delete queue, and the >100 MB chunked import channel with its
-`scripts/import-client.mjs` / `import-batched-push.sh` clients, 09132c1), the
-SPEC-0005 issue/PR/release data layer + webhook delivery Queue consumer, SPEC-0006
-LFS routes + services + a 33-check real-`git-lfs` e2e (`pnpm test:lfs`, CI job),
-SPEC-0007 org services + tier-1 org routes, SPEC-0008 UI U1-U3+U5 (asset pipeline,
-shell, router module, the three repo pages, goldens/a11y/determinism), the
-SPEC-0009 client half (`scripts/mirror-import.mjs` import-from-URL producer,
-ab56ec9), the repository invariant checker (ref-closure + catalog↔R2 cross-check,
-c91135d + 53276b7), and the differential git-CLI harness (`pnpm diff:test`).
-Tier-1 API coverage mounted at HEAD: **49 of 78 paths, 85 of 129 operations**
-(`pnpm check:api`, observed 02:20 CST). REG-MERGE-2 — the batch-8 /
-release-assets / starred / user-settings router registration — sat in the
-working tree at 02:17 CST reading **73/78 paths, 123/129 ops, PASS**, then was
-withdrawn before committing: it is still pending at snapshot. The batch-8
-route modules themselves are committed; only the registration rides. The 6
-remaining operations (archive download, diffpatch, forks, languages, PR-merge
-DELETE) belong to the wave in flight at snapshot time (`routes/archive.ts`,
-`services/diffpatch.ts`, `services/forks.ts` untracked). Twelve SPECs + three ADRs; CI runs
-typecheck/lint/tests, contract checks, the real-git e2e suite (34 passed /
-35-row headless-UI allowlist), the LFS e2e job, benchmarks, and asset
-determinism. See the [SPEC index](specs/),
-[ADR-0002](docs/decisions/0002-contract-freeze.md) (contract freeze) and the
-[runbook](docs/ops/runbook.md) (dev/deploy/bootstrap, differential/LFS e2e,
-import/mirror clients, invariant checker).
-
-## Development
+### Run it locally
 
 ```bash
-git submodule update --init --recursive   # after clone (gitea/ is read-only reference)
+git submodule update --init --recursive        # gitea/ reference sources (read-only)
 pnpm install
-pnpm dev          # vite dev — Worker runs in workerd with real local D1/DO/R2
-pnpm typecheck && pnpm lint && pnpm test
-pnpm db:migrate:local                    # apply Drizzle migrations to local D1
+cp apps/worker/.dev.vars.example apps/worker/.dev.vars   # GIT_TOKEN=devtoken
+pnpm db:migrate:local                          # apply Drizzle migrations to local D1
+pnpm dev                                       # http://127.0.0.1:5173 — workerd, real local D1/DO/R2
 ```
 
-Full conventions (structure rules, dependency policy, parallel-agent workflow) live in
-[AGENTS.md](AGENTS.md). New features start with a SPEC in `specs/`.
+`wrangler.jsonc` declares three required secret names (`GIT_TOKEN`,
+`MIRROR_ALLOWED_HOST_LIST`, `MIRROR_CREDENTIAL_KEY`). Plain local dev — git hosting,
+API, UI — needs only `GIT_TOKEN` (the example file's value); the two `MIRROR_*` keys
+are read by the pull-mirror features and `pnpm test:mirror`, which preflights them
+and prints the exact missing piece (recipes: [scripts/mirror-e2e.README.md](scripts/mirror-e2e.README.md)).
+
+The users table starts empty — create the first admin and mint an all-scopes PAT
+(the plaintext prints exactly once; only its sha256 digest is stored):
+
+```bash
+node scripts/bootstrap-admin.mjs <username> [email]      # local D1 by default; add --remote for production
+```
+
+Then use it like any git host — the first push **creates** the repo (private by
+default; push-create, SPEC-0003):
+
+```bash
+git init myrepo && cd myrepo
+git remote add origin http://<username>:<PAT>@127.0.0.1:5173/<username>/<repo>.git
+git push -u origin main                                      # push = create
+git ls-remote origin                                         # authenticated reads work
+curl -H "Authorization: token <PAT>" http://127.0.0.1:5173/api/v1/user
+```
+
+### Deploy it
+
+```bash
+pnpm exec wrangler login
+pnpm setup:deploy          # idempotent: ensures D1 cf-gitea + R2 cf-gitea-packs,
+                           # fills database_id into wrangler.jsonc, applies remote migrations
+                           # (read-only drift check: pnpm setup:deploy -- --check)
+cd apps/worker
+pnpm exec wrangler secret put GIT_TOKEN                    # dev-fallback credential
+pnpm exec wrangler secret put MIRROR_ALLOWED_HOST_LIST     # mirror egress allow-list
+pnpm exec wrangler secret put MIRROR_CREDENTIAL_KEY        # mirror credential KEK (32 base64 bytes)
+cd ../..
+pnpm db:migrate:remote     # idempotent — setup:deploy applied what existed when it ran;
+                           # re-run whenever new migrations land
+pnpm build && pnpm deploy  # build REQUIRED before deploy: wrangler deploys dist/ with the
+                           # generated config — a stale dist carries stale wrangler state
+pnpm smoke --base-url https://<your-worker>.workers.dev [--token <PAT>] [--migrate-check]
+```
+
+`pnpm smoke` (scripts/deploy-smoke.mjs, `--base-url` required) asserts `/healthz`,
+that the anonymous git surface answers 401/404 (never an advert), and with `--token`
+performs a real push to a throwaway private repo, confirms authenticated reads, and
+fails if the **anonymous** upload-pack advert does not 401-challenge (the private-repo
+read-leak regression class); it cleans the repo up afterwards. A live instance running
+this path: <https://cf-gitea.hecongw.workers.dev>.
+
+## Status
+
+Snapshot **2026-10-25** (HEAD 72626e5); every number below is re-measurable from the
+tree (`pnpm check:api`, `scripts/bench-baselines/m2.json`).
+
+| Area | State |
+|---|---|
+| **Engine** | Vendored durable-git, fully landed through SPEC-0001a/0001b: smart-HTTP v0/v2 receive/serve in the Worker (fail-closed protocol parser), lease RPCs, `storage_key` R2 addressing, `pack_catalog`, lifecycle/mergeability/executeMerge RPCs, fork catalog replication. P0-hardened — the deepen-family silent-drop was eliminated structurally (parse/type/control-flow) and pinned by real-git probes + regression matrix ([P0 package](docs/design/p0-package-README.md)); SPEC-0011 ratified (two green deploys + P0 closed), M3 compaction/GC begins. m2 bench baseline (5 MiB fixture, local workerd, CI-enforced at 10%): clone 14.2 MiB/s · push 192 ms · incremental-fetch ratio 0.000245 · info/refs p50 12.5 ms |
+| **API** | `/api/v1` against the frozen Gitea contract ([ADR-0002](docs/decisions/0002-contract-freeze.md)): **tier-1 terminal — 78/78 paths, 129/129 operations** (incl. webhooks/hook-deliveries, archives, diff/patch, languages); tier-2 in progress at **260/554 operations declared across 171 paths** (`pnpm check:api` PASS). Landed tier-2 families: repository extras (transfer, reviewers, issue-config, PR review threads, release assets) · issue/PR comment/label/pin writes + the issue tables (milestones, subscriptions, reactions) · organizations (identity/rename/delete, org repos, org labels) · users (table-free reads, settings, starred/follows/subscriptions, key/GPG stubs) · notifications · admin · misc/settings table-free reads + signing-key. Non-contract side surfaces (outside the frozen inventory): repo-scoped mirror migrate/sync and the >100 MB import channel |
+| **UI** | Server-rendered Hono JSX (SPEC-0008 waves 1-3 + SPEC-0010): public repo browse — repo home, commit log, file view (`/src/…`, `/tree` redirects), issues + PRs lists and detail pages — plus `/login`/`/logout` PAT web sessions (`gitea_session` cookie, rotation + reuse detection). Not there yet: the write-path UI — no repo/issue creation, no settings/admin/org/user dashboards; unclaimed repo-scoped paths still answer from the API/engine |
+| **Webhooks** | Hook CRUD + delivery pipeline over Queues (consumer with retries + dead-letter queue, SSRF-screened targets); the push event family is emitted from BOTH the user-push path (engine `onPush` seam) and the pull-mirror sync path through one shared builder; deliveries queryable per hook |
+| **LFS** | Batch API + relay/presign store over R2, gate-intercepted routes (`/*/*/info/lfs/*`); verified by a 33-check real-`git-lfs` e2e (`pnpm test:lfs`) |
+| **Mirrors** | Pull-mirror sync end to end: outbound smart-HTTP client (v0/v2), AES-GCM-encrypted source credentials, 10-minute cron producer + queue consumer, sync notifications on the push family. Egress gate defaults to https-only with private/loopback/reserved addresses and `localhost`/`.local`/`.internal` denied; `MIRROR_EGRESS_MODE=strict` narrows to an explicit allow-list. 11-scenario black-box e2e (`pnpm test:mirror`). Large history import: >100 MB chunked channel + clients (`scripts/import-client.mjs`, `import-batched-push.sh`, `mirror-import.mjs`) |
+| **Verification** | Six-layer stack — workerd unit tests, golden-DOM/a11y, black-box e2e suites (real git / git-lfs / smart-HTTP source), a 20-case differential git-CLI battery, production smoke probes, CI bench baseline — with its rules recorded in [ADR-0005](docs/decisions/0005-verification-strategy.md). CI runs typecheck/lint/tests, both contract checks, the real-git e2e allowlist gate, lfs + mirror e2e jobs, benchmarks, asset determinism |
+
+Thirteen SPECs + four ADRs; new features start with a SPEC (see the
+[SPEC index](specs/README.md) for per-SPEC status). Full conventions live in
+[AGENTS.md](AGENTS.md); the operator runbook (daily dev, bootstrap, e2e suites,
+import/mirror clients, troubleshooting) is [docs/ops/runbook.md](docs/ops/runbook.md).
 
 [durable-git]: https://github.com/littledivy/durable-git
