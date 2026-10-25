@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import type { HookEventConfig, HookEventType } from "../../issues/webhooks";
@@ -17,18 +17,35 @@ import {
 import type { RepositoryWithOwner } from "./repository";
 
 /**
- * Webhook CRUD + delivery-log reads backing the tier-1 `repository` hook
- * routes (SPEC-0004 §2.4 rows repoListHooks / repoCreateHook / repoGetHook /
- * repoEditHook / repoDeleteHook / repoTestHook / repoListHookDeliveries;
- * behavior owned by SPEC-0005 §2.6/§3.5–3.6). Reads/writes the landed
- * `webhooks` + `webhook_deliveries` D1 tables (SPEC-0005 §3.2) through
- * Drizzle; nothing here talks to the delivery Queue — rows are written
- * `state='pending'` and the consumer (src/webhooks/consumer.ts) owns the
- * outbound HTTP.
+ * Webhook CRUD + delivery-log reads backing the hook route families over the
+ * landed `webhooks` table's three scopes (SPEC-0005 §2.6/§3.5–3.6):
+ *   - `repository` (tier-1: repoListHooks / repoCreateHook / repoGetHook /
+ *     repoEditHook / repoDeleteHook / repoTestHook / repoListHookDeliveries —
+ *     routes/hooks.ts);
+ *   - `organization` + `user` owner scopes and the `admin` global scope
+ *     (routes/hooks-scopes.ts: orgListHooks…orgDeleteHook, userListHooks…
+ *     userDeleteHook, adminListHooks…adminDeleteHook).
+ *
+ * Reads/writes the landed `webhooks` + `webhook_deliveries` D1 tables
+ * (SPEC-0005 §3.2) through Drizzle; nothing here talks to the delivery
+ * Queue — rows are written `state='pending'` and the consumer
+ * (src/webhooks/consumer.ts) owns the outbound HTTP.
  *
  * Upstream citations (submodule pin fc4936884584):
  *   - validation + create/edit ports: `routers/api/v1/utils/hook.go`
  *     (checkCreateHookOption / addHook / editHook);
+ *   - owner-scope reads/deletes: `models/webhook/webhook.go`
+ *     (ListWebhookOptions ToConds: `owner_id = ?` alone, GetWebhookByOwnerID,
+ *     DeleteWebhookByOwnerID — the org/user routers in routers/api/v1/org/hook.go
+ *     + user/hook.go drive them through routers/api/v1/utils/hook.go's
+ *     ListOwnerHooks / GetOwnerHook / AddOwnerHook / EditOwnerHook /
+ *     DeleteOwnerHook);
+ *   - global scope: `models/webhook/webhook_system.go`
+ *     (ListSystemWebhookOptions ToConds: `repo_id = 0 AND owner_id = 0` plus
+ *     the optional `is_system_webhook` filter, GetSystemOrDefaultWebhook,
+ *     DeleteDefaultSystemWebhook; the admin router in routers/api/v1/admin/hooks.go);
+ *     our NULL-adapted columns stand in for upstream's sentinel 0s
+ *     (schema.ts: repo_id NULL = not repo-scoped, owner_id NULL = not owner-scoped);
  *   - response converter: `services/webhook/general.go ToHook`;
  *   - delivery converter: `services/webhook/general.go ToHookDelivery`
  *     (list variant blanks request/response payloads, `routers/api/v1/repo/hook.go ListDeliveries`);
@@ -377,6 +394,17 @@ export async function getRepoHook(d1: D1Database, repoId: string, hookId: number
 }
 
 /**
+ * Which single scope a webhook row belongs to — exactly one arm non-null,
+ * mirroring upstream's (ownerID, repoID) sentinel pair (0 = "not this scope",
+ * our NULL adaptation). `addHook` receives it verbatim
+ * (routers/api/v1/utils/hook.go addHook(ctx, form, ownerID, repoID)).
+ */
+interface HookScope {
+  ownerId: number | null;
+  repoId: string | null;
+}
+
+/**
  * `addHook` (routers/api/v1/utils/hook.go) — the checkCreateHookOption
  * validation runs in upstream's exact order with upstream's exact messages:
  *  1. `IsValidHookTaskType` → 422 "Invalid hook type: X" (the declared zod
@@ -386,12 +414,13 @@ export async function getRepoHook(d1: D1Database, repoId: string, hookId: number
  *  3. config key `content_type` → 422 "Missing config option: content_type";
  *  4. `IsValidHookContentType` → 422 "Invalid content type";
  *  5. `IsValidURL` → 422 "Invalid url";
- * then the addHook body: `is_system_webhook` parse (422), Slack `channel`
- * requirement (422 missing / 400 invalid), HTTP method fixed POST,
- * `active` default FALSE (SPEC-0004 §2.4), events default ["push"],
- * branch_filter glob accepted and stored.
+ * then the addHook body: `is_system_webhook` parse (422 — parsed for EVERY
+ * scope, upstream quirk: an owner hook created with the flag set becomes a
+ * system webhook), Slack `channel` requirement (422 missing / 400 invalid),
+ * HTTP method fixed POST, `active` default FALSE (SPEC-0004 §2.4), events
+ * default ["push"], branch_filter glob accepted and stored.
  */
-export async function createRepoHook(d1: D1Database, repoId: string, form: CreateHookOption): Promise<WebhookRow> {
+async function addHook(d1: D1Database, scope: HookScope, form: CreateHookOption): Promise<WebhookRow> {
   if (!isValidHookTaskType(form.type)) {
     throw new ApiError(422, `Invalid hook type: ${form.type}`);
   }
@@ -444,7 +473,8 @@ export async function createRepoHook(d1: D1Database, repoId: string, form: Creat
   const result = await drizzle(d1)
     .insert(webhooks)
     .values({
-      repoId,
+      ownerId: scope.ownerId,
+      repoId: scope.repoId,
       name: (form.name ?? "").trim(),
       url: form.config.url ?? "",
       contentType: toHookContentTypeId(form.config.content_type ?? ""),
@@ -469,6 +499,24 @@ export async function createRepoHook(d1: D1Database, repoId: string, form: Creat
   return row;
 }
 
+/** `AddRepoHook` — addHook(ctx, form, 0, repo.Repository.ID), NULL-adapted. */
+export async function createRepoHook(d1: D1Database, repoId: string, form: CreateHookOption): Promise<WebhookRow> {
+  return addHook(d1, { ownerId: null, repoId }, form);
+}
+
+/** `AddOwnerHook` (utils/hook.go) — addHook(ctx, form, owner.ID, 0): the
+ *  org/user webhook create behind orgCreateHook / userCreateHook. */
+export async function createOwnerHook(d1: D1Database, ownerId: number, form: CreateHookOption): Promise<WebhookRow> {
+  return addHook(d1, { ownerId, repoId: null }, form);
+}
+
+/** `AddSystemHook` (utils/hook.go) — addHook(ctx, form, 0, 0): the global
+ *  (system or default, per the parsed `is_system_webhook` config key) webhook
+ *  behind adminCreateHook. */
+export async function createGlobalHook(d1: D1Database, form: CreateHookOption): Promise<WebhookRow> {
+  return addHook(d1, { ownerId: null, repoId: null }, form);
+}
+
 /**
  * `editHook` (routers/api/v1/utils/hook.go) — upstream quirks kept verbatim:
  * config `url`/`content_type` validate only when the key is present;
@@ -476,6 +524,11 @@ export async function createRepoHook(d1: D1Database, repoId: string, form: Creat
  * them resets the subscription to push-only and clears the filter — the
  * upstream `w.HookEvents = updateHookEvents(form.Events)` line with nil
  * form.Events); `active`/`name` apply only when provided.
+ *
+ * Scope-agnostic by construction (upstream's single shared editHook body
+ * serves the repo/owner/system callers alike — EditRepoHook / EditOwnerHook /
+ * EditSystemHook): operates on the CALLER-FETCHED row, so the scope guard is
+ * whoever fetched it.
  */
 export async function editRepoHook(
   d1: D1Database,
@@ -541,6 +594,116 @@ export async function deleteRepoHook(d1: D1Database, repoId: string, hookId: num
   const result = await drizzle(d1)
     .delete(webhooks)
     .where(and(eq(webhooks.repoId, repoId), eq(webhooks.id, hookId)))
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Owner scope (org + user families) — models/webhook/webhook.go
+// ---------------------------------------------------------------------------
+
+/**
+ * `ListWebhookOptions{OwnerID}` + `db.FindAndCount` — id ASC (find default).
+ * The condition is `owner_id = ?` ALONE (upstream ToConds: RepoID=0 adds no
+ * arm): repo rows carry owner_id 0/NULL and never leak into an owner listing.
+ */
+export async function listOwnerHooks(
+  d1: D1Database,
+  ownerId: number,
+  opts: { page: number; limit: number },
+): Promise<ListPage<WebhookRow>> {
+  const db = drizzle(d1);
+  const { limit, offset } = clampPage(opts.page, opts.limit);
+  const where = eq(webhooks.ownerId, ownerId);
+  const items = await db
+    .select()
+    .from(webhooks)
+    .where(where)
+    .orderBy(webhooks.id)
+    .limit(limit)
+    .offset(offset)
+    .all();
+  const totalRows = await db.select({ value: sql<number>`count(*)` }).from(webhooks).where(where);
+  return { items, total: Number(totalRows[0]?.value ?? 0) };
+}
+
+/** `GetWebhookByOwnerID` (`id=? AND owner_id=?`) — null when missing. */
+export async function getOwnerHook(d1: D1Database, ownerId: number, hookId: number): Promise<WebhookRow | null> {
+  const row = await drizzle(d1)
+    .select()
+    .from(webhooks)
+    .where(and(eq(webhooks.ownerId, ownerId), eq(webhooks.id, hookId)))
+    .get();
+  return row ?? null;
+}
+
+/** `DeleteWebhookByOwnerID` — true when a row was deleted. */
+export async function deleteOwnerHook(d1: D1Database, ownerId: number, hookId: number): Promise<boolean> {
+  const result = await drizzle(d1)
+    .delete(webhooks)
+    .where(and(eq(webhooks.ownerId, ownerId), eq(webhooks.id, hookId)))
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Global scope (admin family) — models/webhook/webhook_system.go
+// ---------------------------------------------------------------------------
+
+/** The `adminListHooks` `type` query param (admin/hooks.go ListHooks). */
+export type GlobalHookType = "system" | "default" | "all";
+
+/**
+ * `ListSystemWebhookOptions.ToConds` + `GetGlobalWebhooks` — global rows only
+ * (`repo_id` AND `owner_id` both NULL — our stand-in for upstream's sentinel
+ * 0s), `is_system_webhook` filtered per the `type` param: "system" → true,
+ * "default" → false, "all" → unfiltered (any other value upstream leaves the
+ * default Some(true) — the route maps that to "system"). id ASC.
+ */
+export async function listGlobalHooks(
+  d1: D1Database,
+  opts: { page: number; limit: number },
+  type: GlobalHookType,
+): Promise<ListPage<WebhookRow>> {
+  const db = drizzle(d1);
+  const { limit, offset } = clampPage(opts.page, opts.limit);
+  const where = and(
+    isNull(webhooks.repoId),
+    isNull(webhooks.ownerId),
+    type === "all" ? undefined : eq(webhooks.isSystemWebhook, type === "system"),
+  );
+  const items = await db
+    .select()
+    .from(webhooks)
+    .where(where)
+    .orderBy(webhooks.id)
+    .limit(limit)
+    .offset(offset)
+    .all();
+  const totalRows = await db.select({ value: sql<number>`count(*)` }).from(webhooks).where(where);
+  return { items, total: Number(totalRows[0]?.value ?? 0) };
+}
+
+/**
+ * `GetSystemOrDefaultWebhook` — a GLOBAL webhook of either kind by id
+ * (the `repo_id=0 AND owner_id=0` condition; no is_system_webhook arm).
+ */
+export async function getGlobalHook(d1: D1Database, hookId: number): Promise<WebhookRow | null> {
+  const row = await drizzle(d1)
+    .select()
+    .from(webhooks)
+    .where(and(isNull(webhooks.repoId), isNull(webhooks.ownerId), eq(webhooks.id, hookId)))
+    .get();
+  return row ?? null;
+}
+
+/** `DeleteDefaultSystemWebhook` minus the HookTask sweep (the landed
+ *  convention — deleteRepoHook likewise leaves the delivery log) — true when
+ *  a global row was deleted. */
+export async function deleteGlobalHook(d1: D1Database, hookId: number): Promise<boolean> {
+  const result = await drizzle(d1)
+    .delete(webhooks)
+    .where(and(isNull(webhooks.repoId), isNull(webhooks.ownerId), eq(webhooks.id, hookId)))
     .run();
   return (result.meta.changes ?? 0) > 0;
 }
