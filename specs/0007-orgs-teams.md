@@ -494,3 +494,13 @@ never shows a repo the per-repo seam would 404). Anti-enumeration unchanged
 (invisible ≡ missing, byte-identical). Known remaining: `listOrgRepos`
 (orgs.ts) and the WRITE-grant team arms (isRepositoryAdmin/canWriteRepository
 still collaborator-rows-only) — follow-up wave.
+
+**§3.5(c) tail closed (2026-10-25, 5f6d798)**: `listOrgRepos` carries the
+team-grant EXISTS twin (upstream parity verified — repo.go:41-45 +
+repo_permission.go:483, no divergence); `isRepositoryAdmin`/
+`canWriteRepository` gained the team arms through the ONE composition
+(viewerTeamAccessMode → doerRepoAccessMode → repositoryPermissions) — grant,
+git-HTTP gate, and rendered permissions cannot drift. Remaining known: the
+UI render-gate forks (file-editor canWriteRepo / settings canAdminRepo read
+collaboratorModeOf only — team members can POST but don't SEE the controls;
+the service seam carries the grant underneath).
