@@ -577,3 +577,100 @@ deletion — the standing rule is capture-to-0600-file; all rows are deleted
 and the exposure window is closed by the DELETE, but the next run should
 restore the temp-file pattern. The standing `p0probe` user survives (probe
 namespace, no PAT rows remain against it).
+
+## Redeploy verification — 2026-10-25 14:4x UTC (22:4x CST), same-deployment-state block
+
+Deploy: version `f4b740b6-7357-406d-ae40-1d2e1fd1832b` on
+https://cf-gitea.hecongw.workers.dev at commit `17b6c94` — the ACL completion
+inch: UI render gates ride the service predicates (`05d1f2c`) + the
+page-visibility seam carries the team grant — private org repo pages render
+for team members (`17b6c94`). Assets rebuilt: **784 files, 13.9 MB**.
+
+Remote migrations immediately before deploy: **none to apply**;
+`d1_migrations` ledger verified **20/20 applied** (`SELECT COUNT(*)` = 20).
+
+Deploy gates at `17b6c94` (clean tree, freeze guarantee, no siblings):
+`pnpm typecheck` **0 errors** (types regenerated first); `pnpm lint` **0
+errors**; `node scripts/check-openapi.mjs` **PASS** (declared **318**
+operations across 203 paths ⊆ contract 554 ops/350 paths, tier-1 **78/78
+paths, 129/129 operations**; same documented warns: GET /user 401,
+GET /signing-key.gpg/.pub 404); `node scripts/check-contract-frozen.mjs`
+**PASS** (sha256 `529a3314…` matches the frozen README and the pinned
+submodule swagger verbatim); `vitest run --maxWorkers=8`: **Tests 2527
+passed | 5 skipped (2532)** — 108 files passed + 1 skipped (109), 71.38 s,
+zero failures first try.
+
+`pnpm smoke` equivalent (`deploy-smoke.mjs`, fresh mint-per-run PAT,
+`--user p0probe`, with `--migrate-check`): **6 pass / 0 fail / 1 skip**
+(bench-report not requested), `ok: true`. Verbatim: `[pass] healthz —
+{"ok":true}`; `[pass] anon-git-surface — probe-060d9b5e/probe-b3a1ae56.git:
+git-upload-pack 404 not-found, git-receive-pack 401 Basic challenge`;
+`[pass] receive-advert — advert ok (165 bytes)`; `[pass] push-lsremote —
+pushed 29b4244f99…, authed ls-remote sees refs/heads/main, anonymous advert
+401 Basic challenge`; `[pass] cleanup — repo p0probe/smoke-3d9d9715 deleted`;
+`[pass] migrate-check — all 19 expected tables present (+33 system/aux …)`.
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`,
+results **unchanged** vs all prior tables):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1`; `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean (exit 0) |
+
+`p0probe/p0-shallow` remains live intentionally (reviewer re-run repo);
+anonymous GET answers 404 (private repo, ACL row #2 holds).
+
+**FIRST production probe of the shipped ACL inch (05d1f2c + 17b6c94) —
+team-ACL, end to end.** Fixtures, all via the API: admin create member
+`aclmemb6891bc3` (`POST /admin/users` → **201**; `is_admin=0` verified in
+remote D1, user id 15), owner PAT `cfg_c71ac352` + member PAT `cfg_db0c4833`
+both minted via `bootstrap-admin --remote` into **0600 temp files** and
+expanded at runtime only (`"$(cat …)"`) — the 1d093940 hygiene deviation is
+restored, no plaintext token in any shell log; private org
+`aclorgb6891bc3` (POST /orgs → 201), private org repo `aclrepob6891bc3`
+(auto_init, POST /orgs/{org}/repos → 201, `private: true` echoed), read team
+id **8** `acl-read` permission `read` (POST → 201), wiring `PUT
+/teams/8/members/aclmemb6891bc3` → **204** and `PUT
+/teams/8/repos/aclorgb6891bc3/aclrepob6891bc3` → **204**. The shipped grant:
+
+- Member `GET /api/v1/repos/aclorgb6891bc3/aclrepob6891bc3` (PAT auth) →
+  **200**, `permissions {"admin":false,"push":false,"pull":true}` — the
+  read-team predicate, API-side.
+- Page seam (the `17b6c94` gap): anonymous `GET /aclorgb6891bc3/aclrepob6891bc3`
+  (cookie-less) → **404** "Page Not Found - cf-gitea" (masked shape);
+  member `POST /login` (form `user_name` + PAT) → **303** → `/` with the
+  `gitea_session` Set-Cookie; member `GET /aclorgb6891bc3/aclrepob6891bc3`
+  **with the session cookie** → **200**, `<title>Quick Start -
+  aclorgb6891bc3/aclrepob6891bc3</title>`, README.md entry rendered,
+  signed-in chrome present (`/notifications`) — **the page-visibility seam
+  renders for a team member in production**. Predicate honesty on controls:
+  the read-arm page shows NO settings/editor controls (the only "Settings"
+  hit is `notificationSettings` inside the embedded page config JSON) —
+  correct for `pull`-only; the editor/settings render gates for
+  grant-holding arms ride the suite (05d1f2c), not re-probed here.
+- Anon git surface on the private org repo: `info/refs` for
+  `git-upload-pack` AND `git-receive-pack` → **401 Basic challenge** both —
+  ACL row #2 holds on org-owned private repos at the git seam too.
+- Incidental (recorded honestly): the first `POST /login` attempt answered
+  the designed failure shape — **200 re-render with the inline
+  "The token is not valid." error** — caused by MY trailing newline in the
+  token file, not a product fault; retry with the sanitized value succeeded.
+  The failure path (inline error, no lockout) thus also observed live.
+
+Cleanup proof (all API-verified + verified in remote D1): repo DELETE →
+**204**, org DELETE → **204** (team 8 + memberships cascade — `DELETE
+/teams/8` afterwards **404**), member `DELETE /admin/users/aclmemb6891bc3`
+→ **204**. D1 after: `personal_access_tokens` joined to
+p0probe/aclmemb6891bc3 = **0 rows** (member row cascaded with its user;
+owner row id 19 prefix `cfg_c71ac352` deleted by id, changes = 1);
+`users` LIKE 'aclmem%'/'aclorg%' = **0**; `teams` = **0**; `team_members` =
+**0**; `team_repo_access` = **0**; `repositories` owner_namespace LIKE
+'aclorg%' = **0**. The standing `p0probe` user survives (probe namespace,
+**0 PAT rows remain** against it). Credential temp files (2 PATs + 1
+sanitized copy + 1 session-cookie jar) shredded and removed; `ls` after = no
+matches, and a grep for the token shape across every leftover artifact =
+none. Hygiene footnote: the cookie jar briefly carried 0664 bits (curl
+umask) before deletion — single-user box, session row dies with TTL/GC;
+next run should pre-create the jar 0600.
