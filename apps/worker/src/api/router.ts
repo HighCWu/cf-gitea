@@ -19,6 +19,7 @@ import { registerPushMirrorRoutes } from "./routes/push-mirrors";
 import { registerTagProtectionRoutes } from "./routes/tag-protections";
 import { registerWikiRoutes } from "./routes/wiki";
 import { registerGitHookRoutes } from "./routes/git-hooks";
+import { registerProjectsRepoRoutes } from "./routes/projects-repo";
 import { registerAdminT2Routes } from "./routes/admin-t2";
 import { registerArchiveRoutes } from "./routes/archive";
 import { registerBranchProtectionRoutes } from "./routes/branch-protections";
@@ -279,6 +280,11 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // /hooks/git ahead of hooks.ts's /hooks/{id}. reqToken+repo-admin gates
   // documented in RUNTIME_ONLY_RESPONSES.
   registerGitHookRoutes(app, requireAuth);
+  // Inventory batch 6 stage 1: repo-scoped project boards (projects,
+  // columns, column-issues, workflows — migration 0024; stages 2-3 add the
+  // org/user scopes over the same service). Reads ride optionalAuth where
+  // the contract allows; writes reqToken.
+  registerProjectsRepoRoutes(app, requireAuth, optionalAuth);
 
   return app;
 }
