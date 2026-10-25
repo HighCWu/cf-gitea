@@ -337,3 +337,30 @@ forward-only migration path with an upgrade txn.
   `e2e/check-compaction.mjs` (8 checks: byte-identical closure walks over
   fulls/cross-pack REF/OFS/loose-base deltas, determinism, both crash
   windows, RETIRED-serves-readers mixed-generation clone, lease exclusion).
+
+- **M3.4 (b4bab63, 2026-10-25)**: `gc.ts` — RETIRED→RECLAIMABLE in one DO txn
+  guarded by (a) zero live read leases and (b) the as-built premise guard,
+  which STRENGTHENS the spec: the sweeper transitively VERIFIES the
+  supersession chain reaches an ACTIVE pack (a direct-successor check would
+  strand rows forever when the successor is itself retired by the next round
+  — found by check-compaction's chained-cadence scenario; unverifiable
+  chains stay RETIRED as `premiseUnsafe`, retried). RECLAIMABLE→DELETED
+  removes the catalog row only after the R2 DELETE resolves (unbound-host
+  adapter throws so an ack means deleted); idempotent retry; defensive
+  zero-lease re-check before delete (fault C's never-grant-both,
+  structural). RECLAIMABLE irreversibility pinned by test. Trigger:
+  `gc_wanted_at` stamped by every RETIRED-producing compaction round and
+  every committed ref change; alarm order sweep → M2 gc → compaction → GC;
+  manual `RepoCell.gcNow()`. Clone-cache GC: lease-drain-only (OQ4's
+  conservative half; version-window retention stays open for M3.5).
+  **§7.1 closing counter-example: construction FAILED as designed** — a
+  real uploadPack stream interleaved with mid-stream GC passes (publish,
+  flips, R2 deletes, row removals all succeed) never sees a deleted pack;
+  the mid-stream pass is lease-blocked; the stream completes with its flush
+  tail (never a false success); post-hoc closure walk byte-identical.
+  Verified by `e2e/check-gc.mjs` (8 checks); all 12 engine check scripts
+  green (223 checks total).
+
+**Implementation milestones M3.0–M3.4 COMPLETE (2026-10-25). M3.5 (the
+full fault-injection matrix of §7.2 rows 1-5 + capability-matrix generation
++ differential wiring) remains as the acceptance-hardening tail.**
