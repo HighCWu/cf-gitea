@@ -15,7 +15,11 @@ import homeGolden from "./goldens/home.html?raw";
 import issueDetailGolden from "./goldens/issue-detail.html?raw";
 import issuesClosedGolden from "./goldens/issues-closed.html?raw";
 import issuesOpenGolden from "./goldens/issues-open.html?raw";
+import milestonesClosedGolden from "./goldens/milestones-closed.html?raw";
+import milestonesOpenGolden from "./goldens/milestones-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
+import orgHomeEmptyGolden from "./goldens/org-home-empty.html?raw";
+import orgHomeGolden from "./goldens/org-home.html?raw";
 import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
@@ -33,6 +37,10 @@ const goldens: Record<string, string> = {
   "issue-detail.html": issueDetailGolden,
   "pull-detail.html": pullDetailGolden,
   "pull-files.html": pullFilesGolden,
+  "org-home.html": orgHomeGolden,
+  "org-home-empty.html": orgHomeEmptyGolden,
+  "milestones-open.html": milestonesOpenGolden,
+  "milestones-closed.html": milestonesClosedGolden,
   "not-found-repo.html": notFoundRepoGolden,
   "bare-shell.html": bareShellGolden,
 };

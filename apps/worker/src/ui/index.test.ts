@@ -29,8 +29,8 @@ import {
   resolveRefSuffix,
   splitRefSuffix,
   uiRouter,
+  type ParsedUiRoute,
   type UiAssetsFetcher,
-  type UiRoute,
 } from "./index";
 
 // --- fixtures ----------------------------------------------------------------
@@ -134,14 +134,21 @@ describe("handlesUiRoute", () => {
     "/octo/hello/settings/hooks", // wave-4 webhooks family
     "/octo/api/commits", // reserved names bind the OWNER segment only
     "/octo/hello%20two",
+    "/octo/hello/milestones", // wave-6 milestones list family
+    "/octo/hello/milestones/new", // wave-6 new-milestone family (GET + POST)
+    "/octo", // wave-6 org home — the single-segment family (the dispatcher
+    "/octo/", // never consults the gate for it; the parser still owns it)
   ])("claims UI family: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(true);
   });
 
   it.each([
     "/", // root — Hono-land
-    "/octo", // single segment
-    "/octo/",
+    "/login", // the session router's literals (TOP_LEVEL_EXCLUDED — a
+    "/LOGOUT", // dynamic /:owner registration would shadow them)
+    "/healthz", // the dispatcher's own static route
+    "/octo.keys", // upstream org Home's early-NotFound suffixes
+    "/octo.gpg",
     "/octo//hello", // empty segment
     "/octo/hello//commits",
     "/octo/.git", // repo trims to empty
@@ -169,12 +176,24 @@ describe("handlesUiRoute", () => {
 // --- parseUiRoute --------------------------------------------------------------
 
 describe("parseUiRoute", () => {
-  const table: Array<[string, UiRoute | null]> = [
+  const table: Array<[string, ParsedUiRoute | null]> = [
     ["/octo/hello", { family: "home", owner: "octo", repo: "hello", refSuffix: null }],
     // exactly one trailing .git trimmed after decoding (gate convention, §4.4)
     ["/octo/hello.git", { family: "home", owner: "octo", repo: "hello", refSuffix: null }],
     ["/octo/r%2Egit/commits", { family: "commits", owner: "octo", repo: "r", refSuffix: null }],
     ["/octo/hello/", { family: "home", owner: "octo", repo: "hello", refSuffix: null }],
+    // wave-6: the single-segment org family (no .git trim — an owner
+    // namespace, not a repo), its excluded literals, and the milestones pair
+    ["/octo", { family: "org-home", owner: "octo" }],
+    ["/octo/", { family: "org-home", owner: "octo" }],
+    ["/OCTO", { family: "org-home", owner: "OCTO" }], // request casing preserved
+    ["/login", null],
+    ["/healthz", null],
+    ["/octo.keys", null],
+    ["/octo/hello/milestones", { family: "milestones", owner: "octo", repo: "hello" }],
+    ["/octo/hello/milestones/new", { family: "milestone-new", owner: "octo", repo: "hello" }],
+    ["/octo/hello/milestones/1", null], // the deeper write tails stay engine-owned
+    ["/octo/hello/milestones/1/edit", null],
     [
       "/octo/hello/commits/branch/feature%20one/file.md",
       { family: "commits", owner: "octo", repo: "hello", refSuffix: "branch/feature one/file.md" },

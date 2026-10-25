@@ -49,8 +49,14 @@ const repoRoot = path.resolve(scriptDir, '..');
 // wave-3 header deferred: octicon-issue-opened / octicon-issue-closed carry
 // TWO <path> elements each, which the multi-path Icon now carries (the
 // single-path-era degradation notes in issues-list.tsx / issue-detail.tsx
-// were retired with it).
+// were retired with it). Wave 6 (org home + milestones) adds the org-profile
+// header glyphs (organization avatar placeholder, location/link/email rows),
+// the milestone row marks (calendar due date, clock closed/updated stamps)
+// and the closed-issue tab count (check).
 const ALLOWLIST = [
+  'octicon-calendar',
+  'octicon-check',
+  'octicon-clock',
   'octicon-code',
   'octicon-dot-fill',
   'octicon-file',
@@ -63,7 +69,11 @@ const ALLOWLIST = [
   'octicon-history',
   'octicon-issue-closed',
   'octicon-issue-opened',
+  'octicon-link',
+  'octicon-location',
+  'octicon-mail',
   'octicon-milestone',
+  'octicon-organization',
   'octicon-repo',
   'octicon-three-bars',
 ];

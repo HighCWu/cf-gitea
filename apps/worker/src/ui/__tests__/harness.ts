@@ -25,8 +25,8 @@ import { and, eq } from "drizzle-orm";
 import { beforeAll } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { basicTokenHeader, mintFor } from "../../auth/testing/seeds";
-import { repositories, users } from "../../db/schema";
+import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
+import { issues, repositories, users } from "../../db/schema";
 import { type UiManifest } from "../manifest";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import {
@@ -37,7 +37,9 @@ import {
 } from "../testing/seed-repo";
 import { IssuesService } from "../../issues/service";
 import { createRepoLabel } from "../../api/services/labels";
-import { issues } from "../../db/schema";
+import { saveRepoSettings } from "../../api/services/repo-settings";
+import { OrgService } from "../../services/orgs/orgs";
+import { RepoService } from "../../repos/service";
 
 // --- deterministic fixtures (mirrors pages.test.ts's seeding) -----------------
 
@@ -161,6 +163,15 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // Bare shell: 404 for an unknown owner/repo — navbar/main/footer, no repo
   // header, no discriminator class.
   { file: "bare-shell.html", path: "/nobody/nothing", status: 404 },
+  // Org home (wave 6): the public acme org's visible list (anonymous — the
+  // private fixture repo stays hidden), and the zero-repo empty placeholder.
+  { file: "org-home.html", path: "/acme", status: 200 },
+  { file: "org-home-empty.html", path: "/emptyorg", status: 200 },
+  // Milestones list (wave 6): the open default (a 50% progress bar, an
+  // overdue-red past deadline, "No due date") and the closed tab (the
+  // closed-stamp line + the 100% milestone).
+  { file: "milestones-open.html", path: "/alice/golden-ms/milestones", status: 200 },
+  { file: "milestones-closed.html", path: "/alice/golden-ms/milestones?state=closed", status: 200 },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
@@ -314,17 +325,148 @@ async function seedGoldenPullDiff(): Promise<void> {
   }
 }
 
+/**
+ * The wave-6 org fixture: the public `acme` org (owned by a dedicated
+ * `morgan` user) with three repositories — two public (one archived, for the
+ * row badge) and one private (hidden from the anonymous golden; the signed-in
+ * wave-6 route tests see it) — plus the zero-repo `emptyorg`. D1-only rows
+ * through the landed services (the org page never reads engine content, so
+ * no receive-pack is needed), every timestamp pinned to T0-derived values.
+ *
+ * Idempotent: the org lookup gates the whole block (org creation arbitrates
+ * the shared username namespace — re-running would collide, not converge).
+ */
+async function seedGoldenOrg(): Promise<void> {
+  const orgs = new OrgService(env.DB);
+  if ((await orgs.getOrgByUsername("acme")) !== null) return;
+
+  const morgan = await seedVerifiedUser({ username: "morgan" });
+  await orgs.createOrg({
+    name: "acme",
+    ownerId: morgan.id,
+    visibility: "public",
+    fullName: "Acme Corporation",
+    description: "Everything the coyote orders.",
+    location: "Desert Mesa",
+    website: "https://acme.example",
+    now: new Date(T0 * 1000),
+  });
+  const org = await orgs.getOrgByUsername("acme");
+  if (org === null) throw new Error("acme org row missing after create");
+
+  const service = new RepoService(env.DB);
+  const repos: Array<{ slug: string; isPrivate: boolean; isArchived: boolean; description: string; updated: number }> = [
+    { slug: "anvil", isPrivate: false, isArchived: false, description: "Drop-tested delivery hardware.", updated: T0 + 60 },
+    { slug: "rocket-skates", isPrivate: false, isArchived: true, description: "", updated: T0 + 120 },
+    { slug: "bird-seed", isPrivate: true, isArchived: false, description: "Supercharged, members only.", updated: T0 + 180 },
+  ];
+  for (const repo of repos) {
+    const row = await service.create({
+      owner: { id: org.id, usernameLower: "acme" },
+      name: repo.slug,
+      isPrivate: repo.isPrivate,
+      status: "ready",
+    });
+    await drizzle(env.DB)
+      .update(repositories)
+      .set({ createdAt: new Date(T0 * 1000), updatedAt: new Date(repo.updated * 1000), isArchived: repo.isArchived })
+      .where(eq(repositories.id, row.id));
+    if (repo.description !== "") {
+      await saveRepoSettings(env.DB, row.id, { description: repo.description }, new Date(T0 * 1000));
+    }
+  }
+
+  await orgs.createOrg({ name: "emptyorg", ownerId: morgan.id, visibility: "public", now: new Date(T0 * 1000) });
+}
+
+/** One engine-seeded commit for the golden milestones repo (content is
+ *  irrelevant — the milestones page reads D1 only; the seed exists so the
+ *  repo row + ownership resolve exactly like every other golden repo). */
+const GOLDEN_MS_COMMITS: SeedCommit[] = [
+  { message: "seed: milestone fixture repo", time: T0, files: [{ path: "README.md", content: "# golden-ms\n" }] },
+];
+
+/**
+ * The wave-6 milestone fixtures for `alice/golden-ms`: three milestones with
+ * maintained counters — `v1.0` open at 50% (one open + one closed issue),
+ * `past-due` open with a fixed past deadline (the overdue-red line, zero
+ * issues), `v0.9` closed at 100% (one closed issue; closed-date stamped).
+ * Every write passes a fixed `now`, so progress bars, stamps and tab counts
+ * are byte-stable (§5.2); the deadline is decades in the past, so the
+ * overdue branch is stable for the lifetime of the fixtures.
+ *
+ * Idempotent like seedGoldenIssues: any issue row for the repo skips the
+ * block (the milestones are created first, so the leaf write's presence
+ * implies the whole block).
+ */
+async function seedGoldenMilestones(): Promise<void> {
+  const db = drizzle(env.DB);
+  const repo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "golden-ms")))
+    .get();
+  if (repo === undefined) throw new Error("golden-ms repo row missing before milestone seeding");
+  const existing = await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, repo.id)).limit(1).all();
+  if (existing.length > 0) return;
+
+  const owner = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "alice"))
+    .get();
+  if (owner === undefined) throw new Error("golden owner row missing before milestone seeding");
+
+  const svc = new IssuesService(env.DB);
+  const t = (offsetSeconds: number): Date => new Date((T0 + offsetSeconds) * 1000);
+
+  const v1 = await svc.createMilestone({ repoId: repo.id, name: "v1.0", now: t(0) });
+  await svc.createMilestone({
+    repoId: repo.id,
+    name: "past-due",
+    deadlineAt: t(86_400), // T0 + 1 day — fixed past → the overdue branch
+    now: t(0),
+  });
+  const v09 = await svc.createMilestone({ repoId: repo.id, name: "v0.9", now: t(0) });
+
+  await svc.createIssue({
+    repoId: repo.id,
+    title: "open: wired to v1.0",
+    posterId: owner.id,
+    milestoneId: v1.id,
+    now: t(10),
+  });
+  const v1Closed = await svc.createIssue({
+    repoId: repo.id,
+    title: "closed: wired to v1.0",
+    posterId: owner.id,
+    milestoneId: v1.id,
+    now: t(20),
+  });
+  await svc.closeIssue(v1Closed.id, { now: t(30) });
+
+  const v09Closed = await svc.createIssue({
+    repoId: repo.id,
+    title: "closed: wired to v0.9",
+    posterId: owner.id,
+    milestoneId: v09.id,
+    now: t(50),
+  });
+  await svc.closeIssue(v09Closed.id, { now: t(60) });
+  await svc.updateMilestone(v09.id, { state: "closed", now: t(70) });
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
     if (seeded) return;
     seeded = true;
     await applyAuthD1Migrations();
-    for (const slug of ["golden", "golden-alt"]) {
+    for (const slug of ["golden", "golden-alt", "golden-ms"]) {
       await ensureSeededRepo({
         owner: "alice",
         slug,
-        commits: slug === "golden" ? GOLDEN_COMMITS : ALT_COMMITS,
+        commits: slug === "golden" ? GOLDEN_COMMITS : slug === "golden-alt" ? ALT_COMMITS : GOLDEN_MS_COMMITS,
         tags: slug === "golden" ? [{ name: "v1", commitIndex: 1 }] : undefined,
       });
       // The shell renders the row's `created_at` ("Created <relative-time…>");
@@ -338,5 +480,7 @@ export function setupGoldenFixtures(): void {
     }
     await seedGoldenIssues();
     await seedGoldenPullDiff();
+    await seedGoldenOrg();
+    await seedGoldenMilestones();
   });
 }

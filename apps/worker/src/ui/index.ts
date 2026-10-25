@@ -52,6 +52,21 @@
  *                                          (pages/pull-files.tsx — wave 5;
  *                                          the landed pullRequestDiff
  *                                          service)
+ *   /:owner/:repo/milestones               milestones list, GET (pages/
+ *                                          milestones.tsx — wave 6; the
+ *                                          landed listRepoMilestones read;
+ *                                          `?state=` the open/closed facet)
+ *   /:owner/:repo/milestones/new           new-milestone form, GET + POST
+ *                                          (pages/milestones.tsx — wave 6;
+ *                                          admin viewer only; POST → the
+ *                                          landed milestone-create service
+ *                                          → 303 back onto the list)
+ *   /{org}                                 org home, GET (pages/org-home.tsx
+ *                                          — wave 6; the first non-repo-
+ *                                          scoped family: the landed org
+ *                                          resolution + HasOrgOrUserVisible
+ *                                          predicates, then the
+ *                                          listOrgRepositories listing)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -123,6 +138,15 @@ import {
   resolveIssueDetailAccess,
 } from "./pages/issue-detail";
 import { loadIssuesListData, renderIssuesListPage } from "./pages/issues-list";
+import {
+  createMilestoneFromForm,
+  loadMilestonesData,
+  milestonesLocale,
+  parseMilestoneForm,
+  renderMilestonesPage,
+  renderNewMilestonePage,
+} from "./pages/milestones";
+import { loadOrgHomeData, renderOrgHomePage, resolveOrgHome } from "./pages/org-home";
 import {
   createIssueFromForm,
   loadNewIssueData,
@@ -257,6 +281,46 @@ export interface PullFilesRoute {
   index: number;
 }
 
+/** The wave-6 milestones list family (pages/milestones.tsx): upstream
+ *  `m.Get("/milestones", repo.Milestones)` (web.go:1339) — GET, `?state=`
+ *  facet. The deeper tails (`/{id}/edit`, `/{id}/{action}`, `/delete`) stay
+ *  engine-owned — those write routes/pages are not in this slice. */
+export interface MilestonesRoute {
+  family: "milestones";
+  owner: string;
+  repo: string;
+}
+
+/** The wave-6 new-milestone family (pages/milestones.tsx): upstream
+ *  `m.Combo("/new").Get(repo.NewMilestone).Post(repo.NewMilestonePost)`
+ *  under the /milestones group (web.go:1424-1425). */
+export interface MilestoneNewRoute {
+  family: "milestone-new";
+  owner: string;
+  repo: string;
+}
+
+/** The wave-6 org home family (pages/org-home.tsx): the SINGLE-SEGMENT
+ *  `/org` profile (upstream `m.Get("/{username}", org.Home)` over the org
+ *  routes — routers/web/org/home.go Home; a plain user name resolves to a
+ *  miss in the handler's org type gate). The first non-repo-scoped UI
+ *  family: the dispatcher never consults `handlesUiRoute` for it
+ *  (single-segment requests fall straight to `app.fetch`, where this
+ *  sub-app's registration answers), but the parser is still the single
+ *  owner of the shape. */
+export interface OrgHomeRoute {
+  family: "org-home";
+  /** Decoded owner segment — the org slug. */
+  owner: string;
+}
+
+/** Top-level single-segment paths this router must never claim: the session
+ *  router's literals (registered on the SAME parent app AFTER this sub-app,
+ *  so a dynamic `/:owner` registration would shadow them — SPEC-0010 §2.1)
+ *  and the dispatcher's own `/healthz`. Upstream reserves several of these
+ *  names at create time for the same reason. */
+const TOP_LEVEL_EXCLUDED = new Set(["login", "logout", "healthz"]);
+
 /** Everything `parseUiRoute` can return; `UiRoute` remains the slice-1 view
  *  render.tsx consumes. */
 export type ParsedUiRoute =
@@ -268,7 +332,10 @@ export type ParsedUiRoute =
   | SettingsRoute
   | IssueCommentRoute
   | IssueLabelsRoute
-  | PullFilesRoute;
+  | PullFilesRoute
+  | MilestonesRoute
+  | MilestoneNewRoute
+  | OrgHomeRoute;
 
 
 /**
@@ -287,20 +354,35 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // parser classifies the trimmed shape so the dispatcher admits them.
   const trimmed = pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
   const raw = trimmed.split("/");
-  if (raw.length < 3) return null; // need /owner/repo at minimum
+  if (raw.length < 2) return null; // need at least /owner
   if (raw.slice(1).some((segment) => segment === "")) return null;
 
   let owner: string;
-  let repo: string;
   try {
     owner = decodeURIComponent(raw[1] as string);
-    repo = decodeURIComponent(raw[2] as string);
   } catch {
     return null;
   }
   // Reserved owner names can never exist in D1 (SPEC-0003 §3); refusing them
   // here keeps `/api/*` and the edge-served `/assets/*` tree engine-owned.
   if (isReservedOwnerName(owner)) return null;
+
+  // The wave-6 single-segment family (pages/org-home.tsx): `/{org}`. The
+  // top-level literals stay with their routers (TOP_LEVEL_EXCLUDED), and the
+  // `.keys`/`.gpg` suffixes are upstream Home's early NotFound
+  // (routers/web/org/home.go:31-34 — those names are reserved at create).
+  if (raw.length === 2) {
+    if (TOP_LEVEL_EXCLUDED.has(owner.toLowerCase())) return null;
+    if (owner.toLowerCase().endsWith(".keys") || owner.toLowerCase().endsWith(".gpg")) return null;
+    return { family: "org-home", owner };
+  }
+
+  let repo: string;
+  try {
+    repo = decodeURIComponent(raw[2] as string);
+  } catch {
+    return null;
+  }
   if (repo.endsWith(".git")) repo = repo.slice(0, -4);
   if (repo === "") return null;
 
@@ -345,6 +427,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (head === "settings") {
     if (rest.length === 0) return { family: "settings", owner, repo };
     if (rest.length === 1 && rest[0] === "hooks") return { family: "settings-hooks", owner, repo };
+    return null;
+  }
+  // Wave-6: the milestones list (the bare URL, `?state=` carries the facet)
+  // and the `/milestones/new` form (GET + POST). Every deeper tail
+  // (`/{id}/edit`, `/{id}/{action}`, `/delete`) stays engine-owned — those
+  // write routes and pages are not in this slice.
+  if (head === "milestones") {
+    if (rest.length === 0) return { family: "milestones", owner, repo };
+    if (rest.length === 1 && rest[0] === "new") return { family: "milestone-new", owner, repo };
     return null;
   }
   let suffix: string;
@@ -530,25 +621,25 @@ function isSliceOneRoute(route: ParsedUiRoute): route is UiRoute {
 // ---------------------------------------------------------------------------
 
 /** The resolved parts every uiRouter handler shares (the §2.3.4 manifest
- *  load, the SPEC-0010 §2.5 viewer resolution and its Set-Cookie plumbing,
- *  the §2.5 repo read). `ok: false` carries the ready Response: the 503
- *  assets failure, the null-parse 404 (registration/parser drift or a
- *  trailing slash — the middleware below 301s those), or the §4.5 repo 404
- *  shell (existence stays hidden for invisible repos, §2.5/§2.6). */
-type ResolvedUiRequest =
+ *  load, the SPEC-0010 §2.5 viewer resolution and its Set-Cookie plumbing).
+ *  `ok: false` carries the ready Response: the 503 assets failure or the
+ *  null-parse 404 (registration/parser drift or a trailing slash — the
+ *  middleware below 301s those). Repo-scoped handlers stack the §2.5 repo
+ *  read on top (`ResolvedUiRequest`); the org home resolves an ORG instead
+ *  (pages/org-home.tsx). */
+type ResolvedUiSession =
   | {
       ok: true;
       url: URL;
       route: ParsedUiRoute;
       ctx: UiContext;
       viewer: Viewer;
-      repo: RepoRow;
       /** Attach the resolution's Set-Cookie directive (§2.4) when directed. */
       respond: (res: Response) => Response;
     }
   | { ok: false; response: Response };
 
-async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<ResolvedUiRequest> {
+async function resolveUiSession(c: Context<{ Bindings: Env }>): Promise<ResolvedUiSession> {
   const url = new URL(c.req.url);
   const route = parseUiRoute(url.pathname);
   // Only reachable through registration/parser drift or a trailing slash
@@ -586,15 +677,29 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
     headers.append("set-cookie", setCookie);
     return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
   };
+  return { ok: true, url, route, ctx, viewer, respond };
+}
 
-  // SPEC-0010 §2.6: the §2.5 repo read widens through the gate's own grant
-  // lines (shared readGrant predicate) — anonymous keeps the row-1 collapse
-  // verbatim, a session viewer gains the authenticated read paths; anything
-  // without a grant 404-shells exactly as before (existence stays hidden).
-  const repo = await resolveRepositoryForViewer(c.env, viewer, route.owner, route.repo);
-  if (repo === null) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
-  ctx.repo = repo;
-  return { ok: true, url, route, ctx, viewer, repo, respond };
+type ResolvedUiRequest = Extract<ResolvedUiSession, { ok: true }> & { repo: RepoRow };
+
+/**
+ * The repo-scoped prologue: the shared session half, then the §2.5 repo
+ * read — SPEC-0010 §2.6: the read widens through the gate's own grant lines
+ * (shared readGrant predicate) — anonymous keeps the row-1 collapse
+ * verbatim, a session viewer gains the authenticated read paths; anything
+ * without a grant 404-shells exactly as before (existence stays hidden).
+ */
+async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<ResolvedUiRequest | { ok: false; response: Response }> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved;
+  // The org-home family has no repo segment — only reachable through
+  // registration drift (orgHomePage never calls this).
+  const route = resolved.route;
+  if (!("repo" in route)) return { ok: false, response: resolved.respond(await c.notFound()) };
+  const repo = await resolveRepositoryForViewer(c.env, resolved.viewer, route.owner, route.repo);
+  if (repo === null) return { ok: false, response: resolved.respond(c.html(renderNotFound(resolved.ctx), 404)) };
+  resolved.ctx.repo = repo;
+  return { ...resolved, repo };
 }
 
 /**
@@ -753,6 +858,85 @@ function methodNotAllowed(allow: string): Response {
     status: 405,
     headers: { "content-type": "text/plain;charset=utf-8", allow, "x-content-type-options": "nosniff" },
   });
+}
+
+/**
+ * GET /{org} (pages/org-home.tsx): the session prologue WITHOUT the repo
+ * read — the org resolves instead (the orgAssignment + RedirectToUser seam,
+ * then HasOrgOrUserVisible): a renamed org 307s onto the new name, an
+ * invisible or plain-user name 404-shells (indistinguishable from missing,
+ * existence never leaks). Everything else is the org's visible-repo listing.
+ */
+async function orgHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, route, ctx, viewer, respond } = resolved;
+  if (route.family !== "org-home") return respond(await c.notFound()); // registration/parser drift guard
+  const doer = viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false };
+  const resolution = await resolveOrgHome(c.env.DB, route.owner, doer, url.pathname, url.search.startsWith("?") ? url.search.slice(1) : url.search);
+  if (resolution.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: resolution.location } }));
+  }
+  if (resolution.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadOrgHomeData(c.env.DB, resolution.org, doer, url.searchParams);
+  return respond(c.html(renderOrgHomePage(ctx, data), 200));
+}
+
+/** GET /{owner}/{repo}/milestones (pages/milestones.tsx — the list; every
+ *  viewer who can see the repo; the write predicate rides along for the New
+ *  button's admin gate). */
+async function milestonesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  const data = await loadMilestonesData(c.env.DB, repo.id, url.searchParams);
+  data.canWrite = await canAdminRepo(c.env.DB, repo, viewer);
+  return respond(c.html(renderMilestonesPage(ctx, data), 200));
+}
+
+/** GET /{owner}/{repo}/milestones/new (pages/milestones.tsx — the form).
+ *  The settings gate's order: anonymous → the login 303 (repo resolution
+ *  FIRST, so an invisible repo 404-shells before the redirect could leak
+ *  it), a signed-in non-admin → the 404 shell. */
+async function milestoneNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  return resolved.respond(
+    c.html(renderNewMilestonePage({ ctx: resolved.ctx, form: { title: "", content: "", deadline: "" }, error: null }), 200),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/milestones/new (upstream NewMilestonePost,
+ * routers/web/repo/milestone.go:107-136): the §2.8 Origin guard, the same
+ * repo→gate order as the GET, then the landed `createRepoMilestone` —
+ * success 303s back onto the list (`ctx.Redirect(RepoLink + "/milestones")`,
+ * 303 per base.go:157); validation failures re-render the form at 200 with
+ * the message and the submitted values (the login failure convention).
+ * Archived repos refuse the write (upstream `context.RepoMustNotBeArchived()`
+ * wraps the milestones group) with the API's exact message re-rendered.
+ */
+async function milestoneNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const form = parseMilestoneForm(await readUrlEncodedForm(c.req.raw));
+  if (repo.isArchived) {
+    return respond(c.html(renderNewMilestonePage({ ctx, form, error: milestonesLocale.repo_archived }), 200));
+  }
+  const result = await createMilestoneFromForm(c.env.DB, repo.id, form);
+  if (result.outcome === "created") {
+    return respond(
+      new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/milestones` } }),
+    );
+  }
+  return respond(c.html(renderNewMilestonePage({ ctx, form, error: result.message }), 200));
 }
 
 /**
@@ -944,3 +1128,16 @@ uiRouter.get("/:owner/:repo/settings", (c) => settingsPage(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
+// Wave-6 milestones families (parseUiRoute claims exactly these shapes; the
+// static literal registers before any deeper dynamic tail could — there is
+// none this slice, the shape is kept for the reasons above).
+uiRouter.get("/:owner/:repo/milestones", (c) => milestonesPage(c));
+uiRouter.get("/:owner/:repo/milestones/new", (c) => milestoneNewPage(c));
+uiRouter.post("/:owner/:repo/milestones/new", (c) => milestoneNewSubmit(c));
+// Wave-6 org home — the SINGLE-SEGMENT family. The label regex refuses the
+// top-level literals (TOP_LEVEL_EXCLUDED: /login + /logout are registered on
+// the parent app AFTER this mount, so the dynamic shape would shadow them —
+// verified Hono registration-order precedence; /healthz is the dispatcher's
+// static route) so those requests miss this sub-app to their own routers.
+// The parser stays the source of truth; the handler 404-shells any drift.
+uiRouter.get("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => orgHomePage(c));
