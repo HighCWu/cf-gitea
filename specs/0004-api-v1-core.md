@@ -835,3 +835,12 @@ with the same script on re-pin.
 | `/users/{username}/tokens/{token}` | DELETE | a | T2 |
 | `/version` | GET | g | T1 |
 
+
+**Error-family note (2026-10-25, d598626)**: untyped internal 500s render
+the constant "internal server error" (upstream's user-facing string,
+helper.go:41 / context.go:272) — the empty-message 500 that faithfully
+mirrored upstream's prod-blanked APIErrorInternal (api.go:117-130) proved
+undebuggable in production (the D1-bench finding). Deliberate exceptions
+that still render "": the typed ApiError(500, "") seams (collaborators
+inactive-account, pulls StringsToInt64s) — upstream declares those exact
+bodies in the frozen contract.
