@@ -876,7 +876,7 @@ describe("branch render extras (SPEC-0013 §3.6)", () => {
       repoId,
       ruleName: GUARDED,
       priority: 1,
-      rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }),
+      rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true, requiredApprovals: 2 }),
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -901,6 +901,10 @@ describe("branch render extras (SPEC-0013 §3.6)", () => {
     expect(branch.user_can_push).toBe(true);
     expect(branch.user_can_merge).toBe(true);
     expect(branch.effective_branch_protection_name).toBe(GUARDED);
+    // The protection placeholders are overridden when a rule matched (the
+    // M3-tail follow-up: git-models' toBranch cannot know the rules).
+    expect(branch.protected).toBe(true);
+    expect(branch.required_approvals).toBeGreaterThan(0);
   });
 
   it("writer doer: a narrowing rule beats write access (can_push off, empty merge whitelist)", async () => {

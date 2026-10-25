@@ -158,7 +158,10 @@ function assertNotEmpty(pair: { repo: { isEmpty: boolean } }): void {
 }
 
 /** The protection-aware Branch fields this module renders (SPEC-0013 §3.6). */
-type BranchRenderExtras = Pick<Branch, "user_can_push" | "user_can_merge" | "effective_branch_protection_name">;
+type BranchRenderExtras = Pick<
+  Branch,
+  "user_can_push" | "user_can_merge" | "effective_branch_protection_name" | "protected" | "required_approvals"
+>;
 
 /** Per-request rule context — loaded ONCE, evaluated per branch. */
 interface BranchProtectionContext {
@@ -204,13 +207,17 @@ function firstMatchRule(rules: ProtectedBranchRow[], branchName: string): Protec
 async function branchRenderExtras(d1: D1Database, context: BranchProtectionContext, branchName: string): Promise<BranchRenderExtras> {
   const rule = firstMatchRule(context.rules, branchName);
   if (rule === null) {
-    return { user_can_push: context.access.write, user_can_merge: context.access.write, effective_branch_protection_name: "" };
+    return { user_can_push: context.access.write, user_can_merge: context.access.write, effective_branch_protection_name: "", protected: false, required_approvals: 0 };
   }
   const config = parseRuleConfig(rule.rules);
   return {
     user_can_push: await canUserPush(d1, config, context.access),
     user_can_merge: await isUserMergeWhitelisted(d1, config, context.access),
     effective_branch_protection_name: rule.ruleName,
+    // Override git-models' protection placeholders when a rule matched —
+    // toBranch cannot know the rules (the M3-tail follow-up).
+    protected: true,
+    required_approvals: config.requiredApprovals ?? 0,
   };
 }
 
