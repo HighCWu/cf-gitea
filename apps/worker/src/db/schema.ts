@@ -1390,3 +1390,55 @@ export const sessions = sqliteTable(
     index("sessions_expires_idx").on(t.expiresAt),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0005 §3.3 — issue/comment attachments: the D1 half of the relay-store
+// family (routes/issue-attachments.ts). Migration 0014.
+// ---------------------------------------------------------------------------
+
+/**
+ * Issue and comment attachments (upstream `attachment`,
+ * models/repo/attachment.go:34-49 — one shared table for release/issue/
+ * comment assets). The release half already landed as `release_assets`
+ * (split out per SPEC-0005 §3.2: different storage path and flow); this is
+ * the issue/comment half, addressed by `issue_id` with `comment_id = 0`
+ * marking a direct issue attachment (upstream's
+ * `attachmentBelongsToRepoOrIssue`/`…OrComment` split,
+ * routers/api/v1/repo/issue_attachment.go:371-387 and
+ * issue_comment_attachment.go:396-413).
+ *
+ * Storage: R2 keys are `repos/<storage_key>/attachments/<attachment_id>/<sanitized
+ * name>` under the shared REPO_PACKS bucket — a NEW key family next to
+ * `release-assets/`, covered by the repo-prefix purge (SPEC-0005 §4.13) and
+ * documented in SPEC-0005 §3.3. Row-first landing (the id is part of the
+ * key): the row is inserted before the bytes stream, so `r2_key` starts
+ * NULL and flips on upload completion — the two-phase relay of
+ * routes/issue-attachments.ts. Conventions follow `release_assets` (uuid
+ * unique, download_count, size, created_unix; timestamps unix seconds).
+ */
+export const issueAttachments = sqliteTable(
+  "issue_attachments",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    uuid: text("uuid").notNull(),
+    issueId: integer("issue_id").notNull(),
+    /** 0 = a direct issue attachment; > 0 = an attachment of that comment. */
+    commentId: integer("comment_id").notNull().default(0),
+    uploaderId: integer("uploader_id"),
+    /** Display filename (verbatim in D1; the R2 key segment is sanitized). */
+    name: text("name").notNull(),
+    size: integer("size").notNull().default(0),
+    downloadCount: integer("download_count").notNull().default(0),
+    /** Bare R2 key; NULL until the relay upload completed (row-first landing). */
+    r2Key: text("r2_key"),
+    /** hex sha256 of the stored bytes (cheap — the single streaming pass
+     *  already digests them; the `release_assets` convention). */
+    checksumSha256: text("checksum_sha256"),
+    createdAt: integer("created_unix", { mode: "timestamp" }),
+  },
+  (t) => [
+    uniqueIndex("issue_attachments_uuid_uq").on(t.uuid),
+    index("issue_attachments_issue_idx").on(t.issueId),
+    index("issue_attachments_comment_idx").on(t.commentId),
+  ],
+);

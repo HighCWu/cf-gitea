@@ -467,6 +467,7 @@ counts likewise (`updateIssueNumbers` pattern).
 
 ```
 repos/<storage_key>/release-assets/<release_id>/<asset_uuid>   # release asset blobs
+repos/<storage_key>/attachments/<attachment_id>/<name>         # issue/comment attachment blobs
 ```
 
 Bare keys only in D1 (`release_assets.r2_key`); `storage_key` keeps rename/transfer
@@ -480,6 +481,19 @@ the client confirms, the Worker verifies the R2 checksum, then inserts the D1 ro
 Max asset size mirrors the `attachment` setting (default production cap 2048 MiB
 upstream; ours fixed at 512 MiB until a settings SPEC) — over-limit → **413** before
 streaming starts when `Content-Length` is known (SPEC-0001 T1 pattern).
+
+The second key family above is the issue/comment attachment store (the landed
+`issue_attachments` table, migration 0014, routes/issue-attachments.ts — the
+`issueList/Create/Get/Edit/DeleteIssue(Comment)Attachment` ops): row-first landing
+(the id is part of the key, so the row exists before the bytes and `r2_key` flips on
+completion), the same 512 MiB cap, and the SPEC-0006 relay shapes — an inline
+multipart/octet-stream POST (upstream's formData wire) or a body-less POST that
+answers 201 + a `Location` upload URL into the worker-internal relay PUT
+(`…/issues/attachments/{id}/blob`, plain-hono outside the frozen contract), with the
+bytes served back by the matching GET under the issue-read ACL (download-count
+increment parity with upstream's web ServeAttachment). Presigned PUTs remain a
+release-assets-only deferral; the issue family ships relay-only from day one because
+its payloads are small and the relay needs no S3 credentials.
 
 ### 3.4 PR engine semantics (engine deltas)
 
