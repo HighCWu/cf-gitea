@@ -1,6 +1,10 @@
 # SPEC-0010: UI web sessions (U4) — PAT login, `gitea_session` cookie, viewer extension
 
-Status: **draft — GATED, do not implement until the §1.1 entry criteria are met** ·
+Status: **accepted — ratified 2026-10-25** (the §1.1 entry criteria are met:
+the tier-2 UI page waves are in flight, which is exactly the private-browsing
+demand trigger; migration 0013 is free — schema ownership released by the
+issue-tables wave 4bb3c26). Ratified by the orchestrator for implementation
+as one batch ·
 Date: 2026-10-24 · Fills SPEC-0008 milestone **U4** (placeholder, its open question 4).
 
 Inputs (cited throughout, not re-derived):
