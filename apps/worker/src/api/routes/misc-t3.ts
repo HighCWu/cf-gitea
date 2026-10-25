@@ -27,6 +27,14 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *     (RUNTIME_ONLY_RESPONSES — the orchestrator-granted entry). Upstream
  *     wires the route in the anonymous "Misc (public accessible)" group
  *     (routers/api/v1/api.go:1015) — no auth middleware here either.
+ *   - GET /signing-key.pub (getSigningKeySSH): the SAME story one helper over —
+ *     upstream's SigningKeySSH calls the identical getSigningKey helper with
+ *     the SSH expected format (gitea/routers/api/v1/misc/signing.go:67,100), so
+ *     the blank-format branch — and therefore the exact 404 message
+ *     "no signing key" (signing.go:19-21) — matches /signing-key.gpg verbatim;
+ *     only the contract's 200 description differs ("ssh public key"). The
+ *     orchestrator-granted RUNTIME_ONLY_RESPONSES entry covers it the same
+ *     way, and upstream wires it anonymously right next to .gpg (api.go:1016).
  *   - GET/DELETE /user/keys[/{id}] + GET/DELETE /user/gpg_keys[/{id}]
  *     (userCurrentListKeys / userCurrentGetKey / userCurrentDeleteKey /
  *     userCurrentListGPGKeys / userCurrentGetGPGKey /
@@ -50,10 +58,8 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *     documented-unreachable-403 precedent).
  *
  * Re-enumerated and NOT shipped (with reasons, so the next wave does not
- * re-litigate):
- *   - GET /signing-key.pub (getSigningKeySSH): the same always-404 situation,
- *     but the orchestrator's RUNTIME_ONLY_RESPONSES grant covers exactly the
- *     /signing-key.gpg entry — a second exception needs its own grant.
+ * re-litigate; /signing-key.pub graduated out of this list once its
+ * RUNTIME_ONLY_RESPONSES grant landed):
  *   - GET/POST/DELETE /users/{username}/tokens: upstream gates them with
  *     `reqSelfOrAdmin(), reqBasicOrRevProxyAuth()` (api.go:1070-1072) —
  *     basic-auth-only; the users schema stores no password credential, and
@@ -131,6 +137,25 @@ const signingKeyGpgRoute = createRoute({
     // reachable status without a signing-key configuration — the contract
     // documents the 200 alone. Declared so the operation's served set mirrors
     // the contract plus the one documented exception.
+    404: notFoundResponse,
+  },
+});
+
+const signingKeyPubRoute = createRoute({
+  method: "get",
+  path: "/signing-key.pub",
+  tags: ["miscellaneous"],
+  summary: "Get default signing-key.pub",
+  operationId: "getSigningKeySSH",
+  responses: {
+    200: {
+      description: "ssh public key",
+      content: { "text/plain": { schema: z.string() } },
+    },
+    // Runtime-only (check-openapi.mjs RUNTIME_ONLY_RESPONSES): same story as
+    // /signing-key.gpg — SigningKeySSH feeds the SSH expected format into the
+    // SAME getSigningKey helper (misc/signing.go:100), so without a
+    // signing-key configuration the blank-format arm answers identically.
     404: notFoundResponse,
   },
 });
@@ -270,6 +295,12 @@ export function registerMiscT3Routes(
   // has no signing-key configuration, so PublicSigningKey's format is blank
   // and upstream's own handler answers APIErrorNotFound("no signing key").
   app.openapi(signingKeyGpgRoute, () => {
+    throw new ApiError(404, "no signing key");
+  });
+
+  // GET /signing-key.pub — the same helper's same arm (SigningKeySSH at
+  // signing.go:100), hence the verbatim message.
+  app.openapi(signingKeyPubRoute, () => {
     throw new ApiError(404, "no signing key");
   });
 

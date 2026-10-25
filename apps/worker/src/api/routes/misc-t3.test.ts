@@ -1,10 +1,11 @@
 /**
  * Tier-3 misc stragglers on real bindings (SPEC-0004 appendix A): routes/
- * misc-t3.ts — the always-404 GET /signing-key.gpg and the doer-scoped key
- * families (GET/DELETE /user/keys[/{id}], GET/DELETE /user/gpg_keys[/{id}]).
- * One standalone app per the misc-t2.test.ts convention (the routes ARE
- * registered in router.ts by the orchestrator after this batch lands; the
- * isolated mount keeps the family independently assertable).
+ * misc-t3.ts — the always-404 GET /signing-key.gpg + GET /signing-key.pub and
+ * the doer-scoped key families (GET/DELETE /user/keys[/{id}], GET/DELETE
+ * /user/gpg_keys[/{id}]). One standalone app per the misc-t2.test.ts
+ * convention (the routes ARE registered in router.ts by the orchestrator
+ * after this batch lands; the isolated mount keeps the family independently
+ * assertable).
  *
  * None of these routes touch D1 — that IS the feature: cf-gitea has no
  * signing-key configuration (misc/signing.go's blank-format arm) and no key
@@ -46,7 +47,7 @@ const miscSend = familyApp((app) =>
 // ---------------------------------------------------------------------------
 
 describe("misc-t3 declared operations (misc-t3)", () => {
-  it("declares exactly the contract codes, plus the one granted signing-key 404 exception", () => {
+  it("declares exactly the contract codes, plus the granted signing-key 404 exceptions", () => {
     const app = new OpenAPIHono<ApiEnv>();
     app.onError(giteaErrorHandler);
     registerMiscT3Routes(app, createTokenAuthMiddleware(createStubAuthResolver()));
@@ -55,11 +56,14 @@ describe("misc-t3 declared operations (misc-t3)", () => {
       info: { title: "misc-t3", version: "0" },
     });
 
-    /** Declared → contract-allowed (the /signing-key.gpg 404 is the
-     *  RUNTIME_ONLY_RESPONSES entry this batch adds to check-openapi.mjs;
-     *  every other code is contract-declared verbatim). */
+    /** Declared → contract-allowed (the /signing-key.gpg and /signing-key.pub
+     *  404s are the RUNTIME_ONLY_RESPONSES entries this batch adds to
+     *  check-openapi.mjs; every other code is contract-declared verbatim). */
     const expected: Record<string, Record<string, string[]>> = {
       "/signing-key.gpg": {
+        get: ["200", "404"], // contract {200}; 404 = the granted runtime-only exception
+      },
+      "/signing-key.pub": {
         get: ["200", "404"], // contract {200}; 404 = the granted runtime-only exception
       },
       "/user/keys": {
@@ -110,6 +114,32 @@ describe("GET /signing-key.gpg (misc-t3)", () => {
 
   it("the 404 is caller-independent (a token cannot conjure a signing key)", async () => {
     const response = await miscSend("/signing-key.gpg", authed());
+    expect(response.status).toBe(404);
+    const body: Record<string, unknown> = await response.json();
+    expect(body.message).toBe("no signing key");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /signing-key.pub (SigningKeySSH — the same getSigningKey helper, hence
+// the verbatim no-key arm; misc/signing.go:67,100 + 19-21)
+// ---------------------------------------------------------------------------
+
+describe("GET /signing-key.pub (misc-t3)", () => {
+  it("answers the same honest no-signing-key 404 with the {message, url} body, anonymously", async () => {
+    // Upstream wires the route in the anonymous misc group (api.go:1016) —
+    // no token presented here.
+    const response = await miscSend("/signing-key.pub");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toContain("application/json");
+    expect(await response.json()).toEqual({
+      message: "no signing key",
+      url: "https://example.com/api/swagger",
+    });
+  });
+
+  it("the 404 is caller-independent (a token cannot conjure a signing key)", async () => {
+    const response = await miscSend("/signing-key.pub", authed());
     expect(response.status).toBe(404);
     const body: Record<string, unknown> = await response.json();
     expect(body.message).toBe("no signing key");

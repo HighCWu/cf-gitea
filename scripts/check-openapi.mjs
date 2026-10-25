@@ -104,6 +104,11 @@ const RUNTIME_ONLY_RESPONSES = {
       404: "cf-gitea has no signing-key configuration, so the format is blank and upstream's own handler answers APIErrorNotFound(\"no signing key\") at runtime (gitea/routers/api/v1/misc/signing.go:14-24); the contract documents only the 200 text/plain",
     },
   },
+  "/signing-key.pub": {
+    get: {
+      404: "same helper as /signing-key.gpg — SigningKeySSH feeds the SSH expected format into getSigningKey (gitea/routers/api/v1/misc/signing.go:100), so with no signing-key configuration the blank-format arm answers APIErrorNotFound(\"no signing key\") verbatim (signing.go:19-21); the contract documents only the 200 text/plain",
+    },
+  },
 };
 
 /**
