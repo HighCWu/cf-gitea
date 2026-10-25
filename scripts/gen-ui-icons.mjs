@@ -54,7 +54,9 @@ const repoRoot = path.resolve(scriptDir, '..');
 // the milestone row marks (calendar due date, clock closed/updated stamps)
 // and the closed-issue tab count (check). Wave 7 (user profile) adds the
 // profile avatar placeholder glyph (octicon-person — the org placeholder's
-// user twin).
+// user twin). Wave 8 (web file editor) adds the file-view write actions'
+// glyphs (view_file.tmpl:72-84 CanContentChange block): pencil (edit), trash
+// (delete) and the tree chrome's New File mark (plus).
 const ALLOWLIST = [
   'octicon-calendar',
   'octicon-check',
@@ -76,9 +78,12 @@ const ALLOWLIST = [
   'octicon-mail',
   'octicon-milestone',
   'octicon-organization',
+  'octicon-pencil',
   'octicon-person',
+  'octicon-plus',
   'octicon-repo',
   'octicon-three-bars',
+  'octicon-trash',
 ];
 
 // What shell.tsx's Icon component hardcodes; a body needing anything else

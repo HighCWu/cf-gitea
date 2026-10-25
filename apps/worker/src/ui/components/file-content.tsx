@@ -155,6 +155,12 @@ export function FileContentView(props: {
   isSymlink?: boolean;
   latestCommit: CommitJson | null;
   readmeInList?: boolean;
+  /** Wave 8 (the web file editor): the write actions of view_file.tmpl:72-84
+   *  (CanContentChange block) — pencil → the edit form, trash → the delete
+   *  confirmation. Undefined = not rendered (non-branch refs, archived repos,
+   *  viewers without write access — the anonymous goldens stay byte-stable). */
+  editHref?: string;
+  deleteHref?: string;
 }) {
   const rawLink = rawFileLink(props.repoLink, props.treePath, props.ref);
   return (
@@ -222,6 +228,20 @@ export function FileContentView(props: {
           <a class="btn-octicon" data-global-click="onCopyContentButtonClick" data-tooltip-content={fileViewLocale.copy}>
             {fileViewLocale.copy}
           </a>
+          {/* view_file.tmpl:72-84 at the editor's literal route names (the
+              pencil/trash btn-octicons; the octicons are allowlisted for wave
+              8). README renders (readmeInList) keep the actions hidden — the
+              home README has no write context. */}
+          {!props.readmeInList && props.editHref !== undefined ? (
+            <a class="btn-octicon" href={props.editHref} aria-label="Edit" title="Edit">
+              <Icon name="octicon-pencil" />
+            </a>
+          ) : null}
+          {!props.readmeInList && props.deleteHref !== undefined ? (
+            <a class="btn-octicon" href={props.deleteHref} aria-label="Delete" title="Delete">
+              <Icon name="octicon-trash" />
+            </a>
+          ) : null}
         </div>
       </h4>
 

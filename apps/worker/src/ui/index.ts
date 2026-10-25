@@ -71,6 +71,21 @@
  *                                          family `owner-home`, upstream's
  *                                          OwnerProfile dispatch
  *                                          routers/web/user/profile.go:37)
+ *   /:owner/:repo/new/{branch}[/{dir}]     web file editor, GET + POST
+ *   /:owner/:repo/edit/{branch}/{path}     (pages/file-editor.tsx — wave 8;
+ *   /:owner/:repo/delete/{branch}/{path}   upstream's _new/_edit/_delete
+ *                                          editor Combos under
+ *                                          RepoRefByType(branch),
+ *                                          web.go:1453-1461, at the brief's
+ *                                          literal names; POST → the landed
+ *                                          applyFileChanges with the
+ *                                          session viewer as author/committer
+ *                                          and the push-webhook family
+ *                                          riding the delta; success 303s
+ *                                          onto the file view / tree;
+ *                                          anonymous GET+POST 303 onto
+ *                                          /login, non-writers and archived
+ *                                          repos 404-shell)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -122,15 +137,28 @@
  */
 
 import { Hono, type Context } from "hono";
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 import { trimTrailingSlash } from "hono/trailing-slash";
 
 import { isReservedOwnerName } from "../repos/service";
+import { users } from "../db/schema";
+import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
 import { AssetBuildError, loadManifest } from "./manifest";
+import { pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
 import { sameOriginGuard } from "./session";
 import { treeRedirectResponse } from "./pages/repo-home";
+import {
+  canWriteRepo,
+  commitFileFromForm,
+  editorFormFromData,
+  loadFileEditorData,
+  readEditorForm,
+  renderFileEditorPage,
+} from "./pages/file-editor";
 import {
   applyIssueLabels,
   createCommentFromForm,
@@ -322,6 +350,24 @@ export interface OwnerHomeRoute {
   owner: string;
 }
 
+/** The wave-8 file-editor family (pages/file-editor.tsx): upstream's
+ *  `/{editor_action:_edit|_new|_delete}/*` Combos under
+ *  `RepoRefByType(git.RefTypeBranch)` (web.go:1453-1461) at the wave brief's
+ *  literal names (`new`/`edit`/`delete`). The tail is the decoded
+ *  branch+path rest; it resolves against the BRANCH universe only at page
+ *  time (pages/file-editor.tsx's loadFileEditorData — the /src walk's
+ *  branch arm, so a slash-bearing branch takes the shortest existing
+ *  prefix). The bare literals stay unclaimed: upstream chi's `/*` requires
+ *  the tail too. */
+export interface FileEditorRoute {
+  family: "file-new" | "file-edit" | "file-delete";
+  owner: string;
+  repo: string;
+  /** Decoded branch+path tail after the family literal (never claimed
+   *  empty). */
+  refSuffix: string;
+}
+
 /** Top-level single-segment paths this router must never claim: the session
  *  router's literals (registered on the SAME parent app AFTER this sub-app,
  *  so a dynamic `/:owner` registration would shadow them — SPEC-0010 §2.1)
@@ -345,7 +391,8 @@ export type ParsedUiRoute =
   | PullFilesRoute
   | MilestonesRoute
   | MilestoneNewRoute
-  | OwnerHomeRoute;
+  | OwnerHomeRoute
+  | FileEditorRoute;
 
 
 /**
@@ -450,6 +497,24 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 0) return { family: "milestones", owner, repo };
     if (rest.length === 1 && rest[0] === "new") return { family: "milestone-new", owner, repo };
     return null;
+  }
+  // Wave-8 file editor: the `new`/`edit`/`delete` literals claim the
+  // branch+path tail shape (FileEditorRoute). Bare literals fall through to
+  // the engine (upstream chi requires the `/*` tail as well).
+  if (head === "new" || head === "edit" || head === "delete") {
+    if (rest.length === 0) return null;
+    let suffix: string;
+    try {
+      suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
+    } catch {
+      return null;
+    }
+    return {
+      family: head === "new" ? "file-new" : head === "edit" ? "file-edit" : "file-delete",
+      owner,
+      repo,
+      refSuffix: suffix,
+    };
   }
   let suffix: string;
   try {
@@ -970,6 +1035,111 @@ async function milestoneNewSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   return respond(c.html(renderNewMilestonePage({ ctx, form, error: result.message }), 200));
 }
 
+// ---------------------------------------------------------------------------
+// The wave-8 file editor (pages/file-editor.tsx — upstream's
+// _new/_edit/_delete editor Combos, web.go:1453-1461)
+// ---------------------------------------------------------------------------
+
+/** Parse family → page mode. */
+const FILE_EDITOR_MODES = {
+  "file-new": "new",
+  "file-edit": "edit",
+  "file-delete": "delete",
+} as const;
+
+/**
+ * The editor prologue the GET and POST share (after the POST's §2.8 Origin
+ * guard, and after each handler's own family drift check): the repo
+ * resolution (invisible repos 404-shell before any redirect could leak
+ * them), the anonymous login 303, then the write posture — the archived
+ * refusal (upstream `RepoMustNotBeArchived` answers NotFound,
+ * services/context/repo.go:136-141) and the write predicate (`canWriteRepo`,
+ * the session-viewer port of the landed canWriteRepository; non-writers
+ * 404-shell like the settings pages — no fork-to-edit flow exists to offer
+ * readers). Returns the ready Response, or null to proceed.
+ */
+async function fileEditorGate(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+): Promise<Response | null> {
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (repo.isArchived || !(await canWriteRepo(c.env.DB, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  return null;
+}
+
+/** GET /{owner}/{repo}/{new|edit|delete}/{branch}[/{path}] (the form;
+ *  `?filename=` prefills the new-file name input — upstream 303s onto the
+ *  path URL instead, editor.go:274-284, the header's documented
+ *  simplification). */
+async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorRoute["family"]): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== family) return respond(await c.notFound()); // registration/parser drift guard
+  const gate = await fileEditorGate(c, resolved);
+  if (gate !== null) return gate;
+  const mode = FILE_EDITOR_MODES[family];
+  const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
+  const data = await loadFileEditorData(engine, repo, mode, route.refSuffix, url.searchParams.get("filename"));
+  if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderFileEditorPage({ ctx, data, form: editorFormFromData(data), error: null }), 200));
+}
+
+/**
+ * POST /{owner}/{repo}/{new|edit|delete}/{branch}[/{path}] (upstream
+ * EditFilePost / DeleteFilePost): the §2.8 layer-2 Origin guard FIRST, then
+ * the GET's prologue, then the landed `applyFileChanges` through
+ * `commitFileFromForm` — author = committer = the session viewer, the
+ * blob-sha hidden field arming the service's CAS, the push-webhook family
+ * riding the applied delta (pages/file-editor.tsx module header). A refused
+ * edit (binary / too large — the GET's NotEditableReason) re-renders the
+ * refusal; success 303s onto the file view on the target branch (upstream
+ * redirectForCommitChoice's tail, editor.go:227-230; the delete lands on
+ * the containing tree); every service arm re-renders the form at 200 with
+ * the message and the submitted values (the login failure convention).
+ */
+async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEditorRoute["family"]): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== family) return respond(await c.notFound()); // registration/parser drift guard
+  const gate = await fileEditorGate(c, resolved);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the gate above admitted only users
+  const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (userRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const mode = FILE_EDITOR_MODES[family];
+  const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
+  const data = await loadFileEditorData(engine, repo, mode, route.refSuffix, url.searchParams.get("filename"));
+  if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  const values = await readEditorForm(c.req.raw);
+  if (data.notEditableReason !== null) {
+    // The refusal stands on POST too (upstream's content-absent degenerate
+    // arm — editor.go:345-357 — reduced to the page's own message).
+    return respond(c.html(renderFileEditorPage({ ctx, data, form: editorFormFromData(data), error: null }), 200));
+  }
+  const result = await commitFileFromForm(c.env, c.req.raw, repo, userRow, mode, values);
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  if (result.outcome === "committed") {
+    const branchPart = `${repoLink}/src/branch/${pathEscapeSegments(result.branch)}`;
+    const location =
+      mode === "delete"
+        ? result.treePath.includes("/")
+          ? `${branchPart}/${pathEscapeSegments(result.treePath.slice(0, result.treePath.lastIndexOf("/")))}`
+          : branchPart
+        : `${branchPart}/${pathEscapeSegments(result.treePath)}`;
+    return respond(new Response(null, { status: 303, headers: { location } }));
+  }
+  return respond(c.html(renderFileEditorPage({ ctx, data, form: values, error: result.message }), 200));
+}
+
 /**
  * POST /{owner}/{repo}/{issues|pulls}/{index}/comments (pages/issue-detail.tsx
  * — upstream NewComment, routers/web/repo/issue_comment.go:37-118): the §2.8
@@ -1165,6 +1335,17 @@ uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
 uiRouter.get("/:owner/:repo/milestones", (c) => milestonesPage(c));
 uiRouter.get("/:owner/:repo/milestones/new", (c) => milestoneNewPage(c));
 uiRouter.post("/:owner/:repo/milestones/new", (c) => milestoneNewSubmit(c));
+// Wave-8 file editor families (parseUiRoute claims exactly these shapes; the
+// POSTs run the §2.8 sameOriginGuard first — session.ts's convention; the
+// `*` tail is the branch+path rest the handlers resolve against the branch
+// universe). All three carry GET (the forms) + POST (the writes) — even the
+// delete, whose confirmation page is where a failed CAS re-renders.
+uiRouter.get("/:owner/:repo/new/*", (c) => fileEditorPage(c, "file-new"));
+uiRouter.post("/:owner/:repo/new/*", (c) => fileEditorSubmit(c, "file-new"));
+uiRouter.get("/:owner/:repo/edit/*", (c) => fileEditorPage(c, "file-edit"));
+uiRouter.post("/:owner/:repo/edit/*", (c) => fileEditorSubmit(c, "file-edit"));
+uiRouter.get("/:owner/:repo/delete/*", (c) => fileEditorPage(c, "file-delete"));
+uiRouter.post("/:owner/:repo/delete/*", (c) => fileEditorSubmit(c, "file-delete"));
 // Wave-6 single-segment family, wave-7-extended into the owner home (org
 // rows → the org home, user rows → the user profile — upstream's
 // OwnerProfile dispatch). The label regex is wave 6's VERBATIM (it already

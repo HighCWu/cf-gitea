@@ -27,11 +27,12 @@ import {
   enrichTreeCommits,
   MAX_DISPLAY_FILE_SIZE,
   mediaKindOf,
+  pathEscapeSegments,
   renderRepoMarkdown,
   splitLines,
   type BlobViewVariant,
 } from "../page-data";
-import { BaseLayout } from "../shell";
+import { BaseLayout, Icon } from "../shell";
 import type { UiContext } from "../ui-context";
 import { resolveHeadBranch, type ResolvedRefs } from "./home";
 
@@ -67,8 +68,10 @@ function parentDirOf(path: string): string {
   return path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
 }
 
-/** The current-dir sidebar (§2.1: one listTree call, no lazy tree v1). */
-function FileTreeSidebar(props: {
+/** The current-dir sidebar (§2.1: one listTree call, no lazy tree v1).
+ *  Exported for the file editor (pages wave 8) — editor/edit.tmpl renders the
+ *  same view_file_tree beside its form. */
+export function FileTreeSidebar(props: {
   repoLink: string;
   refType: RefType;
   ref: string;
@@ -262,11 +265,21 @@ export async function loadFileViewData(
   };
 }
 
-/** The file/tree view page. §2.4.1 discriminators: the upstream view.tmpl
- *  base `repository file list`, extended with `view file` on blob views
- *  (§2.4.1's "repository view file-style" note; directory views keep the
- *  plain list discriminator). */
-export function FileViewPage(props: { ctx: UiContext; data: FileViewData }) {
+/**
+ * The file/tree view page. §2.4.1 discriminators: the upstream view.tmpl
+ * base `repository file list`, extended with `view file` on blob views
+ * (§2.4.1's "repository view file-style" note; directory views keep the
+ * plain list discriminator).
+ *
+ * Wave 8 (the web file editor): `canWrite` — computed by the route handler
+ * (pages/file-editor.tsx's `canWriteRepo`, the session-viewer port of the
+ * landed canWriteRepository) — adds the write chrome: the New File link in
+ * the button row (branch views only) and the Edit/Delete actions on blob
+ * views (view_file.tmpl:72-84's CanContentChange block, at the editor's
+ * literal route names). The golden renders are anonymous → canWrite false →
+ * byte-identical to the pre-wave DOM.
+ */
+export function FileViewPage(props: { ctx: UiContext; data: FileViewData; canWrite?: boolean }) {
   const { ctx, data } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("FileViewPage requires ctx.repo");
@@ -275,6 +288,13 @@ export function FileViewPage(props: { ctx: UiContext; data: FileViewData }) {
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const { refType, ref } = data.active;
   const treePath = data.kind === "tree" ? data.dirPath : data.treePath;
+  // The write chrome shows on branch views of unarchived repos only (the
+  // editor routes resolve branches; tags/commits have no editor target).
+  const canEdit = props.canWrite === true && refType === "branch" && !repo.isArchived;
+  const newFileHref =
+    canEdit && data.kind === "tree"
+      ? `${repoLink}/new/${pathEscapeSegments(ref)}${data.dirPath === "" ? "" : `/${pathEscapeSegments(data.dirPath)}`}`
+      : undefined;
 
   const chrome = (
     <div class="repo-button-row">
@@ -288,6 +308,13 @@ export function FileViewPage(props: { ctx: UiContext; data: FileViewData }) {
         />
         <TreeBreadcrumb repoSlug={repo.slug} repoLink={repoLink} refType={refType} ref={ref} treePath={treePath} />
       </div>
+      {newFileHref !== undefined ? (
+        <div class="repo-button-row-right">
+          <a class="ui mini primary button" href={newFileHref}>
+            <Icon name="octicon-plus" size={14} /> New File
+          </a>
+        </div>
+      ) : null}
     </div>
   );
 
@@ -336,6 +363,12 @@ export function FileViewPage(props: { ctx: UiContext; data: FileViewData }) {
               numLines={data.text !== undefined ? splitLines(data.text).length : null}
               isSymlink={data.entry.mode === "120000"}
               latestCommit={data.latestCommit}
+              editHref={
+                canEdit ? `${repoLink}/edit/${pathEscapeSegments(ref)}/${pathEscapeSegments(data.treePath)}` : undefined
+              }
+              deleteHref={
+                canEdit ? `${repoLink}/delete/${pathEscapeSegments(ref)}/${pathEscapeSegments(data.treePath)}` : undefined
+              }
             />
           </div>
         </div>

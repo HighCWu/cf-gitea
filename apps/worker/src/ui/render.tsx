@@ -11,6 +11,7 @@
 
 import { engineClient } from "./engine";
 import { renderPage } from "./shell";
+import { canWriteRepo } from "./pages/file-editor";
 import { CommitsPage, loadCommitsData } from "./pages/commits";
 import { FileViewPage, loadFileViewData } from "./pages/file-view";
 import { HomePage, loadHomeData } from "./pages/home";
@@ -66,7 +67,11 @@ export async function renderUiPage(options: {
       if (route.refSuffix === null) return notFound(); // §3.3: prefix required
       const data = await loadFileViewData(engine, repo, url.origin, route.refSuffix);
       if ("notFound" in data) return notFound();
-      return { status: 200, html: renderPage(<FileViewPage ctx={ctx} data={data} />) };
+      // Wave 8: the file view's write chrome (Edit/Delete actions + the New
+      // File link) rides the editor's write predicate — anonymous resolves
+      // false with zero D1 reads, so the golden renders stay byte-stable.
+      const canWrite = repo.isArchived ? false : await canWriteRepo(env.DB, repo, ctx.viewer);
+      return { status: 200, html: renderPage(<FileViewPage ctx={ctx} data={data} canWrite={canWrite} />) };
     }
   }
 }
