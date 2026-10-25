@@ -426,7 +426,17 @@ export function registerRepoRoutes(
       await requireRepoAdmin(c, found);
       // Upstream registers NO mustNotBeArchived on this PATCH (api.go:1245).
       const form = c.req.valid("json");
-      const service = new RepoService(c.env.DB);
+      // The engine deps ride the PATCH (REDEPLOY8's flagged tail — the delete
+      // arm below threads the same registry): bare construction silently skips
+      // rename's syncRegistryMove, setVisibility's setConfig(priv), and
+      // setDefaultBranch's setHead — D1 moves while the engine keeps serving
+      // and indexing the old name/visibility/head. The setHead injection maps
+      // the RepoCell RPC's SetHeadResult tag straight through (the production
+      // shape repos/lifecycle.test.ts wires at the service seam).
+      const service = new RepoService(c.env.DB, {
+        registry: c.env.REGISTRY.getByName("registry"),
+        setHead: async (name, branch) => (await c.env.REPO.getByName(name).setHead(branch)).tag,
+      });
       const now = new Date();
 
       // Name: rename only on a case-insensitive change (upstream

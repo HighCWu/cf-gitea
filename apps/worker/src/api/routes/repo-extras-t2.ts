@@ -1162,7 +1162,13 @@ export function registerRepoExtrasT2Routes(
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       const doer = doerOf(c);
       try {
-        await new RepoService(c.env.DB).acceptTransfer(found.repo.id, { id: doer.id, isAdmin: doer.isAdmin });
+        // The registry rides the accept (REDEPLOY8's flagged tail — the
+        // repoEdit PATCH threads the same dep): bare construction skips
+        // syncRegistryMove, so the moved repo 404s "repository not found" at
+        // its NEW url while the registry still advertises the stale old key.
+        await new RepoService(c.env.DB, {
+          registry: c.env.REGISTRY.getByName("registry"),
+        }).acceptTransfer(found.repo.id, { id: doer.id, isAdmin: doer.isAdmin });
       } catch (error) {
         if (error instanceof TransferNotExistError || error instanceof OwnerNotAssignableError) {
           throw new ApiError(404, error.message);
