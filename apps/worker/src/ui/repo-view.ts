@@ -24,6 +24,7 @@
  */
 
 import { readGrant, resolveRepository } from "../git-http/acl";
+import { viewerTeamAccessMode } from "../api/services/repository";
 import type { Viewer } from "./viewer";
 import type { RepoRow } from "./ui-context";
 
@@ -45,11 +46,25 @@ export async function resolveRepositoryForViewer(
   // Owner row missing (orphaned repo) or prohibited → invisible for every
   // viewer (§4.8; the gate answers its 403 shape on the git-HTTP side).
   if (resolved.owner === null || resolved.owner.status !== "active") return null;
+  const doer = viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : null;
   const grant = readGrant({
     repoVisibility: resolved.repo.visibility,
     owner: { id: resolved.owner.id, status: resolved.owner.status },
     ownerVisibility: resolved.ownerVisibility,
-    doer: viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : null,
+    doer,
   });
-  return grant ? resolved.repo : null;
+  if (grant) return resolved.repo;
+  // The cheap arms missed: pay ONE team-mode lookup (the same composition the
+  // gate and the API ride — wave16's flagged gap: git-HTTP and the API admit
+  // team members to private org repos; the pages must too, or invisible ≢
+  // missing breaks across surfaces for the same principal).
+  if (doer === null) return null;
+  // Project onto the service Viewer's three read fields (the repo-grants.ts
+  // bridge precedent — the wire type's rest is optional).
+  const mode = await viewerTeamAccessMode(
+    env.DB,
+    { origin: "", requester: { id: doer.id, login: "", is_admin: doer.isAdmin } },
+    resolved.repo,
+  );
+  return mode !== "none" && mode !== null ? resolved.repo : null;
 }
