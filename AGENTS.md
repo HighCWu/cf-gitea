@@ -65,6 +65,9 @@ scripts/               # Repo-level tooling (contract checks, codegen)
   - `typescript ~6.0.3` — typescript-eslint peer range caps at `<6.1.0`; bump with it.
   - `compatibility_date 2026-10-19` — newest date the pinned workerd/miniflare
     supports; raise it together with wrangler updates (see wrangler.jsonc comment).
+  - `@cloudflare/workers-types ^5.20261025.1` — daily-types package kept at latest
+    stable; each fresh version is younger than pnpm's release-age gate, so the
+    upgrade adds a `minimumReleaseAgeExclude` entry to pnpm-workspace.yaml.
 - eslint lives at the ROOT only (flat config lints the whole repo); per-package lint
   scripts and eslint deps are forbidden.
 - pnpm is the only package manager; `pnpm-lock.yaml` is committed.
