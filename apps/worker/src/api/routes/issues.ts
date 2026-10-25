@@ -394,7 +394,7 @@ async function emitLabelEvent(
  * arm renders ToPayloadPullRequest through toApiPullRequest; a missing PR row
  * skips the emission (the label events' LoadPullRequest degradation).
  */
-async function emitMilestoneEvent(
+export async function emitMilestoneEvent(
   c: Context<ApiEnv>,
   found: RepositoryWithOwner,
   issue: IssueRow,

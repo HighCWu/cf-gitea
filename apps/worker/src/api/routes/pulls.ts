@@ -98,6 +98,7 @@ import { branchRef, engineReads } from "../services/engine";
 import { renderUnifiedDiff, renderPatch, toApiCommit, toChangedFiles, usernamesByEmail } from "../services/git-models";
 import { canViewRepository, findRepositoryByPath, repositoryPermissions, toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
 import { canWriteRepository } from "../services/repo-access";
+import { emitMilestoneEvent } from "./issues";
 
 /**
  * Tier-1 PR-block routes (SPEC-0004 §2.4 rows repoListPullRequests /
@@ -834,6 +835,10 @@ export function registerPullRoutes(
         const oldMilestoneId = issue.milestoneId;
         await changeIssueMilestone(c.env.DB, issue, newMilestoneId, oldMilestoneId, actorId, now);
         issue = { ...issue, milestoneId: newMilestoneId };
+        // Upstream's milestone notifier fires from the shared issue service —
+        // the pulls-PATCH arm is the same mutation and must not stay silent
+        // (the EMIT-5 wave's flagged gap; same action discriminant).
+        await emitMilestoneEvent(c, found, issue, newMilestoneId !== null ? "milestoned" : "demilestoned");
       }
 
       // Labels: writer-gated REPLACE semantics (ReplaceIssueLabels); unknown
