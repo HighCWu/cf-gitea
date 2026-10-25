@@ -1229,3 +1229,114 @@ export const notificationStates = sqliteTable(
     index("notification_states_user_idx").on(t.userId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0005 §2.2 tier-2 issue TABLE families — assignees, dependencies,
+// tracked times, stopwatches (migration 0012; routes/issue-tables-t2.ts).
+// All four mirror their upstream table verbatim in column form (upstream
+// xorm DDL, models/issues/{assignees,dependency,tracked_time,stopwatch}.go);
+// the routes around them carry the citations and collapsed-gate notes.
+// ---------------------------------------------------------------------------
+
+/**
+ * Issue↔assignee edges (upstream `issue_assignees`, models/issues/
+ * assignees.go:15-21: `ID pk autoincr, AssigneeID INDEX, IssueID INDEX`).
+ * Upstream guards duplicates in code (`AddAssigneeIfNotAssigned`); the
+ * `(issue_id, assignee_id)` unique index here is the same arbitration point
+ * the landed `issue_pins`/`issue_subscriptions` tables use (the ON CONFLICT
+ * DO NOTHING add path — concurrent adds lose silently, the re-add is also
+ * the code-path skip). The reverse index serves "issues assigned to you"
+ * reads. Rows are deleted with the issue (§4.12 cascade owner: the landed
+ * deleteIssueCascade; the join-table sweep lands with it).
+ */
+export const issueAssignees = sqliteTable(
+  "issue_assignees",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    issueId: integer("issue_id").notNull(),
+    assigneeId: integer("assignee_id").notNull(),
+  },
+  (t) => [
+    uniqueIndex("issue_assignees_issue_assignee_uq").on(t.issueId, t.assigneeId),
+    index("issue_assignees_assignee_idx").on(t.assigneeId),
+  ],
+);
+
+/**
+ * Issue dependency edge — `issue_id` depends on `dependency_id` (upstream
+ * `issue_dependency`, models/issues/dependency.go:101-110: `ID pk, UserID
+ * NOT NULL, IssueID + DependencyID UNIQUE(issue_dependency), CreatedUnix,
+ * UpdatedUnix`). ONE row per direction: "A is blocked by B" is
+ * `(issue_id=A, dependency_id=B)`, so the blocks family reads the same rows
+ * from the other side. The reverse index serves the blocking direction's
+ * scans (`BlockingDependencies`, models/issues/issue.go:691-708).
+ */
+export const issueDependencies = sqliteTable(
+  "issue_dependency",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The doer that created the edge (upstream `UserID NOT NULL`). */
+    userId: integer("user_id").notNull(),
+    /** The dependent issue (the one being blocked). */
+    issueId: integer("issue_id").notNull(),
+    /** The blocker issue. */
+    dependencyId: integer("dependency_id").notNull(),
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("issue_dependency_issue_dep_uq").on(t.issueId, t.dependencyId),
+    index("issue_dependency_dependency_idx").on(t.dependencyId),
+  ],
+);
+
+/**
+ * Tracked time entries (upstream `tracked_time`, models/issues/
+ * tracked_time.go:16-26: `ID pk autoincr, IssueID INDEX, UserID INDEX,
+ * CreatedUnix created, Time NOT NULL, Deleted NOT NULL DEFAULT false`).
+ * `seconds` is upstream's `Time` (int64 seconds — a negative value is
+ * upstream-legal and passes through). Soft delete mirrors upstream exactly:
+ * `DeleteIssueUserTimes`/`DeleteTime` flip `deleted` and every read filters
+ * `deleted = false` (`FindTrackedTimesOptions.ToConds`), so the ids stay
+ * addressable in timelines (`comments.time_id` points at them).
+ */
+export const trackedTimes = sqliteTable(
+  "tracked_time",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    issueId: integer("issue_id").notNull(),
+    userId: integer("user_id").notNull(),
+    /** Seconds spent (upstream `Time NOT NULL`). */
+    seconds: integer("seconds").notNull(),
+    /** Upstream `Deleted` — soft-delete flag; lists filter it out. */
+    deleted: integer("deleted", { mode: "boolean" }).notNull().default(false),
+    createdAt: integer("created_unix", { mode: "timestamp" }),
+  },
+  (t) => [
+    index("tracked_time_issue_idx").on(t.issueId),
+    index("tracked_time_user_idx").on(t.userId),
+  ],
+);
+
+/**
+ * Running stopwatches (upstream `stopwatch`, models/issues/stopwatch.go:16-22:
+ * `ID pk autoincr, IssueID INDEX, UserID INDEX, CreatedUnix created`). At
+ * most one row per USER exists at a time (upstream `CreateIssueStopwatch`
+ * finishes any other stopwatch the user had — models/issues/stopwatch.go:
+ * 172-206); the elapsed value is derived as `now - created_unix`, never
+ * stored. Mirrors the two single-column indexes (no pair unique — the
+ * single-per-user rule is enforced by the start path's read + swap).
+ */
+export const issueStopwatches = sqliteTable(
+  "stopwatch",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    issueId: integer("issue_id").notNull(),
+    userId: integer("user_id").notNull(),
+    /** Stopwatch start (unix seconds; the elapsed value derives from it). */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    index("stopwatch_user_idx").on(t.userId),
+    index("stopwatch_issue_idx").on(t.issueId),
+  ],
+);
