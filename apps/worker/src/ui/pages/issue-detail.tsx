@@ -54,9 +54,11 @@
  *   remaining system-event types (labels/milestones/title/xrefs/…) are
  *   omitted rather than rendered with approximated text (the §2.4.1 dead-UI
  *   rule applied to prose); they land with their feature waves.
- * - Poster/merger names are plain text (upstream links `/{username}` profile
- *   pages — none exist this slice); the issue row's `original_author` (mirrored
- *   imports) wins over the user row when set, as upstream renders it.
+ * - Poster/merger names anchor the `/{username}` profile since wave 7 (the
+ *   dead-link unlock — userLink; plain text before the page existed); the
+ *   issue row's `original_author` (mirrored imports — no user row, no
+ *   profile) still renders plain text / upstream's href-less authorlink
+ *   anchor, winning over the user row exactly as upstream renders it.
  * - PR branch names render as `<code>` without links and without the commit
  *   count ("wants to merge X commits from … into …"): both need engine reads
  *   (branch existence, the PR commit range) deferred with the mergeability
@@ -141,6 +143,7 @@ import { IssuesService } from "../../issues/service";
 import { IssueAlreadyChangedError, IssueError } from "../../issues/errors";
 import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
 import { TimeSince } from "../components/file-list";
+import { userLink } from "../links";
 import { LabelBadge } from "./issues-list";
 import { canAdminRepo } from "./settings";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -566,18 +569,26 @@ export function IssueStateBadge(props: { data: IssueTitleData }) {
   );
 }
 
-/** The issue meta line: "opened {time} by {poster} · {n} comments" — poster
- *  plain text (no profile pages), `original_author` winning like upstream. */
+/** The issue meta line: "opened {time} by {poster} · {n} comments" — wave 7
+ *  (the dead-link unlock): the poster anchors the `/{username}` profile
+ *  (upstream view_title.tmpl:135-136's HomeLink shape); `original_author`
+ *  (mirrored imports — no user row, no profile) wins as plain text exactly
+ *  like upstream's opened_by_fake branch (view_title.tmpl:133-134). */
 function IssueMetaLine(props: { data: IssueTitleData }) {
   const { issue, posterName } = props.data;
-  const author = issue.originalAuthor ?? posterName;
   const count =
     issue.numComments === 1 ? issueDetailLocale.num_comments_1 : `${issue.numComments} ${issueDetailLocale.num_comments}`;
   return (
     <span class="time-desc">
       opened{" "}
       {issue.createdAt !== null ? <TimeSince unixSeconds={unixSeconds(issue.createdAt)} tz="+0000" /> : null}
-      {author !== null ? <> by {author}</> : null}
+      {issue.originalAuthor !== null ? (
+        <> by {issue.originalAuthor}</>
+      ) : posterName !== null ? (
+        <>
+          {" "}by <a href={userLink(posterName)}>{posterName}</a>
+        </>
+      ) : null}
       {` · ${count}`}
     </span>
   );
@@ -586,7 +597,8 @@ function IssueMetaLine(props: { data: IssueTitleData }) {
 /** The PR meta line: "{poster} wants to merge {head} into {base}" (merged:
  *  "{merger} merged … {time}") — the upstream pull-desc shape with the
  *  branch names as `<code>` text (branch links + commit count are engine
- *  reads; header comment). */
+ *  reads; header comment). Wave 7: the actor anchors the `/{username}`
+ *  profile (shared/user/authorlink.tmpl's HomeLink shape via userLink). */
 function PullMetaLine(props: { data: IssueTitleData }) {
   const { pr, posterName, mergerName } = props.data;
   if (pr === null) return null;
@@ -594,7 +606,11 @@ function PullMetaLine(props: { data: IssueTitleData }) {
     const actor = mergerName ?? posterName;
     return (
       <span id="pull-desc-display" class="pull-desc">
-        {actor !== null ? <>{actor} </> : null}
+        {actor !== null ? (
+          <a class="tw-font-semibold" href={userLink(actor)}>
+            {actor}
+          </a>
+        ) : null}{" "}
         merged <code>{pr.headBranch}</code> {issueDetailLocale.merged_into} <code>{pr.baseBranch}</code>
         {pr.mergedAt !== null && pr.mergedAt !== undefined ? (
           <>
@@ -607,7 +623,11 @@ function PullMetaLine(props: { data: IssueTitleData }) {
   }
   return (
     <span id="pull-desc-display" class="pull-desc">
-      {posterName !== null ? <>{posterName} </> : null}
+      {posterName !== null ? (
+        <a class="tw-font-semibold" href={userLink(posterName)}>
+          {posterName}
+        </a>
+      ) : null}{" "}
       wants to merge <code>{pr.headBranch}</code> {issueDetailLocale.merged_into} <code>{pr.baseBranch}</code>
     </span>
   );
@@ -660,13 +680,28 @@ export function PullTabs(props: { repoLink: string; issue: IssueRow; active: "co
 }
 
 /** The comment header line both comment cards share: "{poster} commented
- *  {time}" — the upstream `commented_at` shape with the author plain-text. */
-function CommentHeader(props: { hash: string; posterName: string | null; createdAt: Date | null }) {
+ *  {time}" — the upstream `commented_at` shape. Wave 7 (the dead-link
+ *  unlock): the poster anchors the `/{username}` profile through
+ *  shared/user/authorlink.tmpl's shape (`tw-font-semibold` + HomeLink);
+ *  an original author (mirrored import — no user row, no profile) keeps
+ *  upstream's href-less authorlink anchor (comments.tmpl:31-34). */
+function CommentHeader(props: {
+  hash: string;
+  posterName: string | null;
+  originalAuthor?: string | null;
+  createdAt: Date | null;
+}) {
   return (
     <div class="comment-header avatar-content-left-arrow" role="heading" aria-level="3">
       <div class="comment-header-left">
         <span class="tw-text-text-light muted-links">
-          {props.posterName !== null ? <>{props.posterName}{" "}</> : null}
+          {props.originalAuthor != null ? (
+            <a class="tw-font-semibold">{props.originalAuthor}</a>
+          ) : props.posterName !== null ? (
+            <a class="tw-font-semibold" href={userLink(props.posterName)}>
+              {props.posterName}
+            </a>
+          ) : null}{" "}
           {issueDetailLocale.commented_at}{" "}
           {props.createdAt !== null ? (
             <a href={`#${props.hash}`}>
@@ -701,11 +736,15 @@ function CommentBody(props: { bodyHtml: string }) {
 function RootComment(props: { data: IssueDetailData }) {
   const { issue, posterName, bodyHtml } = props.data;
   const hash = `issue-${issue.id}`;
-  const author = issue.originalAuthor ?? posterName;
   return (
     <div id={hash} class="timeline-item comment issue-content-comment">
       <div class="content comment-container">
-        <CommentHeader hash={hash} posterName={author} createdAt={issue.createdAt} />
+        <CommentHeader
+          hash={hash}
+          posterName={posterName}
+          originalAuthor={issue.originalAuthor}
+          createdAt={issue.createdAt}
+        />
         <CommentBody bodyHtml={bodyHtml} />
       </div>
     </div>
@@ -757,7 +796,11 @@ function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEn
     <div id={hash} class="timeline-item event">
       <span class={`badge ${badgeColor} tw-text-white`}>{badge}</span>
       <span class="comment-text-line">
-        {posterName !== null ? <>{posterName}{" "}</> : null}
+        {posterName !== null ? (
+          <a class="tw-font-semibold" href={userLink(posterName)}>
+            {posterName}
+          </a>
+        ) : null}{" "}
         {kind === "merge" ? (
           <>
             {issueDetailLocale.merged_commit} <b>{comment.commitSha === null || comment.commitSha === "" ? "" : comment.commitSha.slice(0, 10)}</b>{" "}

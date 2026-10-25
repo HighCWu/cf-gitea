@@ -226,13 +226,24 @@ describe("org home (/{org})", () => {
     expect(await authed.text()).toContain(">Limited</span>");
   });
 
-  it("404-shells a plain user name and an unknown name — never an org-shaped page", async () => {
-    for (const path of ["/plainhuman", "/nobody-org"]) {
+  it("serves a plain user name from the USER half (wave 7) and 404-shells an unknown name", async () => {
+    // Since wave 7 the single-segment family dispatches on the row type:
+    // `plainhuman` is a USER row → the user profile page (never an
+    // org-shaped page); an unknown name stays the 404 shell.
+    const user = await fetchUi("/plainhuman");
+    expect(user.status).toBe(200);
+    const userHtml = await user.text();
+    expect(userHtml).not.toContain("Page Not Found");
+    expect(userHtml).not.toContain("organization profile");
+    expect(userHtml).toContain('class="page-content user profile"');
+
+    for (const path of ["/nobody-org"]) {
       const res = await fetchUi(path);
       expect(res.status, path).toBe(404);
       const html = await res.text();
       expect(html, path).toContain("Page Not Found");
       expect(html, path).not.toContain("organization profile");
+      expect(html, path).not.toContain("user profile");
     }
   });
 

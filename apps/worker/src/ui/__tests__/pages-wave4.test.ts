@@ -290,7 +290,7 @@ describe("new issue POST (/issues/new)", () => {
     expect(html).toContain("Body with <strong>markdown</strong>.");
     expect(html).toContain(`href="/alice/wave4/issues?labels=${fixture.bugLabelId}"`);
     expect(html).toContain(">v3.0</span>");
-    expect(html).toContain(" by alice · 0 comments</span>");
+    expect(html).toContain(' by <a href="/alice">alice</a> · 0 comments</span>');
   });
 
   it("re-renders at 200 with the message and the submitted values on an empty title", async () => {

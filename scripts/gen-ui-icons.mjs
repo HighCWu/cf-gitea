@@ -52,7 +52,9 @@ const repoRoot = path.resolve(scriptDir, '..');
 // were retired with it). Wave 6 (org home + milestones) adds the org-profile
 // header glyphs (organization avatar placeholder, location/link/email rows),
 // the milestone row marks (calendar due date, clock closed/updated stamps)
-// and the closed-issue tab count (check).
+// and the closed-issue tab count (check). Wave 7 (user profile) adds the
+// profile avatar placeholder glyph (octicon-person — the org placeholder's
+// user twin).
 const ALLOWLIST = [
   'octicon-calendar',
   'octicon-check',
@@ -74,6 +76,7 @@ const ALLOWLIST = [
   'octicon-mail',
   'octicon-milestone',
   'octicon-organization',
+  'octicon-person',
   'octicon-repo',
   'octicon-three-bars',
 ];

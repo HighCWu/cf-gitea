@@ -24,6 +24,7 @@ import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
+import userProfileGolden from "./goldens/user-profile.html?raw";
 import { GOLDEN_CASES } from "./harness";
 
 const goldens: Record<string, string> = {
@@ -39,6 +40,7 @@ const goldens: Record<string, string> = {
   "pull-files.html": pullFilesGolden,
   "org-home.html": orgHomeGolden,
   "org-home-empty.html": orgHomeEmptyGolden,
+  "user-profile.html": userProfileGolden,
   "milestones-open.html": milestonesOpenGolden,
   "milestones-closed.html": milestonesClosedGolden,
   "not-found-repo.html": notFoundRepoGolden,

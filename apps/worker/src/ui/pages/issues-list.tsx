@@ -21,8 +21,8 @@
  * - Milestone badge renders as plain text (upstream links
  *   `/{repo}/milestone/{id}` — no milestone page exists; the §2.4.1 rule
  *   "dead links are not emitted" wins over the upstream shape).
- * - Poster names are plain text (upstream links the `/{username}` profile —
- *   no profile page exists this slice).
+ * - Poster names anchor the `/{username}` profile since wave 7 (the
+ *   dead-link unlock — userLink; plain text before the page existed).
  * - Search box and the label/milestone management buttons are not rendered
  *   (no search route, no management pages — dead links forbidden §2.4.1).
  *   The New Issue button renders like upstream (list.tmpl, unconditional —
@@ -65,6 +65,7 @@ import {
 import type { IssueRow, LabelRow, MilestoneRow } from "../../issues/service";
 import { milestones, pullRequests, users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
+import { userLink } from "../links";
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
@@ -386,7 +387,8 @@ export function IssuesPagination(props: {
 
 /** The event line: "opened {time} by {poster}" / "closed {time} …" — the
  *  upstream GetLastEventLabel facts from the denormalized columns (header
- *  comment). Poster is plain text: no profile page exists this slice. */
+ *  comment). Wave 7 (the dead-link unlock): the poster anchors the
+ *  `/{username}` profile (upstream issuelist.tmpl's poster link shape). */
 function EventLine(props: { item: IssueListItem }) {
   const { issue } = props.item;
   const event = issue.isClosed
@@ -396,7 +398,11 @@ function EventLine(props: { item: IssueListItem }) {
     <div class="flex-text-inline">
       {issue.isClosed ? "closed" : "opened"}{" "}
       {event !== null ? <TimeSince unixSeconds={unixSeconds(event)} tz="+0000" /> : null}
-      {props.item.posterName !== null ? <> by {props.item.posterName}</> : null}
+      {props.item.posterName !== null ? (
+        <>
+          {" "}by <a href={userLink(props.item.posterName)}>{props.item.posterName}</a>
+        </>
+      ) : null}
     </div>
   );
 }

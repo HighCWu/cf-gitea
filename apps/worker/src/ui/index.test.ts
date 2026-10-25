@@ -136,8 +136,9 @@ describe("handlesUiRoute", () => {
     "/octo/hello%20two",
     "/octo/hello/milestones", // wave-6 milestones list family
     "/octo/hello/milestones/new", // wave-6 new-milestone family (GET + POST)
-    "/octo", // wave-6 org home — the single-segment family (the dispatcher
-    "/octo/", // never consults the gate for it; the parser still owns it)
+    "/octo", // wave-6 org home extended in wave 7 — the single-segment
+    "/octo/", // owner-home family (the dispatcher never consults the gate
+              // for it; the parser still owns it)
   ])("claims UI family: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(true);
   });
@@ -182,14 +183,19 @@ describe("parseUiRoute", () => {
     ["/octo/hello.git", { family: "home", owner: "octo", repo: "hello", refSuffix: null }],
     ["/octo/r%2Egit/commits", { family: "commits", owner: "octo", repo: "r", refSuffix: null }],
     ["/octo/hello/", { family: "home", owner: "octo", repo: "hello", refSuffix: null }],
-    // wave-6: the single-segment org family (no .git trim — an owner
-    // namespace, not a repo), its excluded literals, and the milestones pair
-    ["/octo", { family: "org-home", owner: "octo" }],
-    ["/octo/", { family: "org-home", owner: "octo" }],
-    ["/OCTO", { family: "org-home", owner: "OCTO" }], // request casing preserved
+    // wave-6: the single-segment owner-home family (no .git trim — an owner
+    // namespace, not a repo), its excluded literals, and the milestones pair.
+    // Wave 7: the family serves USER profiles too — the URL shape is the
+    // same, so the parse result is identical for user and org names; the
+    // row type picks the page at resolution (pages/user-profile.tsx).
+    ["/octo", { family: "owner-home", owner: "octo" }],
+    ["/octo/", { family: "owner-home", owner: "octo" }],
+    ["/OCTO", { family: "owner-home", owner: "OCTO" }], // request casing preserved
+    ["/alice", { family: "owner-home", owner: "alice" }], // a user name — same family
     ["/login", null],
     ["/healthz", null],
     ["/octo.keys", null],
+    ["/octo.gpg", null],
     ["/octo/hello/milestones", { family: "milestones", owner: "octo", repo: "hello" }],
     ["/octo/hello/milestones/new", { family: "milestone-new", owner: "octo", repo: "hello" }],
     ["/octo/hello/milestones/1", null], // the deeper write tails stay engine-owned

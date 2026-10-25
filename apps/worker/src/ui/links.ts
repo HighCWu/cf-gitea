@@ -11,7 +11,12 @@
  *   `/api/v1/repos/{owner}/{repo}/raw/{path}?ref={ref}` (§3.3 — documented
  *   divergence from upstream's web-shaped `/raw/branch/…`, open question 3);
  * - commit links: `/{owner}/{repo}/commit/{oid}` — upstream-shaped URLs that
- *   land on the 404 shell this slice (§1.2, open question 1).
+ *   land on the 404 shell this slice (§1.2, open question 1);
+ * - profile links: `/{username}` — upstream `HomeLink()`'s shape (wave 7's
+ *   dead-link unlock: every rendered poster/owner name anchors here). The
+ *   single-segment namespace serves the OWNER profile (routers/web/user/
+ *   profile.go:37 OwnerProfile): org rows render the org home
+ *   (pages/org-home.tsx), user rows the user profile (pages/user-profile.tsx).
  */
 
 import { pathEscapeSegments } from "./page-data";
@@ -40,4 +45,14 @@ export function rawFileLink(repoLink: string, treePath: string, ref: string): st
 /** The commits page's `?path=` filter form (§3.3 file-view History link). */
 export function commitsHistoryLink(repoLink: string, treePath: string): string {
   return `${repoLink}/commits?path=${encodeURIComponent(treePath)}`;
+}
+
+/**
+ * The owner profile link, `/{username}` (upstream `HomeLink()`) — user AND
+ * org names share the single-segment namespace, so every name that renders
+ * from a user row anchors through this one helper (wave 7: the profile page
+ * is live, dead-link rule §2.4.1 no longer forces plain text).
+ */
+export function userLink(username: string): string {
+  return `/${pathEscapeSegments(username)}`;
 }

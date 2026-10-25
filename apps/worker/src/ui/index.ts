@@ -61,12 +61,16 @@
  *                                          admin viewer only; POST → the
  *                                          landed milestone-create service
  *                                          → 303 back onto the list)
- *   /{org}                                 org home, GET (pages/org-home.tsx
- *                                          — wave 6; the first non-repo-
- *                                          scoped family: the landed org
- *                                          resolution + HasOrgOrUserVisible
- *                                          predicates, then the
- *                                          listOrgRepositories listing)
+ *   /{org}                                 owner home — org rows: org home, GET
+ *   /{user}                                owner home — user rows: user
+ *                                          profile, GET (the SINGLE-SEGMENT
+ *                                          family; wave 6 landed the org
+ *                                          half — pages/org-home.tsx — and
+ *                                          wave 7 the user half — pages/
+ *                                          user-profile.tsx; one parse
+ *                                          family `owner-home`, upstream's
+ *                                          OwnerProfile dispatch
+ *                                          routers/web/user/profile.go:37)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -147,6 +151,7 @@ import {
   renderNewMilestonePage,
 } from "./pages/milestones";
 import { loadOrgHomeData, renderOrgHomePage, resolveOrgHome } from "./pages/org-home";
+import { loadUserProfileData, renderUserProfilePage, resolveUserProfile } from "./pages/user-profile";
 import {
   createIssueFromForm,
   loadNewIssueData,
@@ -300,17 +305,20 @@ export interface MilestoneNewRoute {
   repo: string;
 }
 
-/** The wave-6 org home family (pages/org-home.tsx): the SINGLE-SEGMENT
- *  `/org` profile (upstream `m.Get("/{username}", org.Home)` over the org
- *  routes — routers/web/org/home.go Home; a plain user name resolves to a
- *  miss in the handler's org type gate). The first non-repo-scoped UI
- *  family: the dispatcher never consults `handlesUiRoute` for it
+/** The wave-6 single-segment family — EXTENDED in wave 7 into the OWNER
+ *  home (pages/org-home.tsx + pages/user-profile.tsx): upstream's
+ *  `/{username}` route answers user AND org names through one handler
+ *  (`OwnerProfile` — routers/web/user/profile.go:37, dispatching on
+ *  `ContextUser.IsOrganization()`), so ONE parse family owns the shape and
+ *  the resolution picks the page: an org row renders the org home (the wave-6
+ *  `resolveOrgHome` seam), a user row the user profile, a renamed name 307s
+ *  onto the target. The dispatcher never consults `handlesUiRoute` for it
  *  (single-segment requests fall straight to `app.fetch`, where this
  *  sub-app's registration answers), but the parser is still the single
  *  owner of the shape. */
-export interface OrgHomeRoute {
-  family: "org-home";
-  /** Decoded owner segment — the org slug. */
+export interface OwnerHomeRoute {
+  family: "owner-home";
+  /** Decoded owner segment — the user or org name. */
   owner: string;
 }
 
@@ -318,7 +326,9 @@ export interface OrgHomeRoute {
  *  router's literals (registered on the SAME parent app AFTER this sub-app,
  *  so a dynamic `/:owner` registration would shadow them — SPEC-0010 §2.1)
  *  and the dispatcher's own `/healthz`. Upstream reserves several of these
- *  names at create time for the same reason. */
+ *  names at create time for the same reason. The wave-7 owner-home family
+ *  (user profiles AND org homes share the shape) extends wave 6's label
+ *  regex verbatim — it admits every name except these literals. */
 const TOP_LEVEL_EXCLUDED = new Set(["login", "logout", "healthz"]);
 
 /** Everything `parseUiRoute` can return; `UiRoute` remains the slice-1 view
@@ -335,7 +345,7 @@ export type ParsedUiRoute =
   | PullFilesRoute
   | MilestonesRoute
   | MilestoneNewRoute
-  | OrgHomeRoute;
+  | OwnerHomeRoute;
 
 
 /**
@@ -367,14 +377,17 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // here keeps `/api/*` and the edge-served `/assets/*` tree engine-owned.
   if (isReservedOwnerName(owner)) return null;
 
-  // The wave-6 single-segment family (pages/org-home.tsx): `/{org}`. The
-  // top-level literals stay with their routers (TOP_LEVEL_EXCLUDED), and the
-  // `.keys`/`.gpg` suffixes are upstream Home's early NotFound
-  // (routers/web/org/home.go:31-34 — those names are reserved at create).
+  // The wave-6 single-segment family, wave-7-extended into the owner home
+  // (pages/user-profile.tsx beside pages/org-home.tsx): `/{user-or-org}`.
+  // The top-level literals stay with their routers (TOP_LEVEL_EXCLUDED), and
+  // the `.keys`/`.gpg` suffixes are upstream's early-NotFound suffixes
+  // (routers/web/user/home.go:728-735 for users, org/home.go:31-34 for orgs
+  // — those upstream routes are not in this slice, so the names stay
+  // refused and fall to the parent app's 404).
   if (raw.length === 2) {
     if (TOP_LEVEL_EXCLUDED.has(owner.toLowerCase())) return null;
     if (owner.toLowerCase().endsWith(".keys") || owner.toLowerCase().endsWith(".gpg")) return null;
-    return { family: "org-home", owner };
+    return { family: "owner-home", owner };
   }
 
   let repo: string;
@@ -692,8 +705,8 @@ type ResolvedUiRequest = Extract<ResolvedUiSession, { ok: true }> & { repo: Repo
 async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<ResolvedUiRequest | { ok: false; response: Response }> {
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved;
-  // The org-home family has no repo segment — only reachable through
-  // registration drift (orgHomePage never calls this).
+  // The owner-home family has no repo segment — only reachable through
+  // registration drift (neither page handler calls this).
   const route = resolved.route;
   if (!("repo" in route)) return { ok: false, response: resolved.respond(await c.notFound()) };
   const repo = await resolveRepositoryForViewer(c.env, resolved.viewer, route.owner, route.repo);
@@ -861,25 +874,43 @@ function methodNotAllowed(allow: string): Response {
 }
 
 /**
- * GET /{org} (pages/org-home.tsx): the session prologue WITHOUT the repo
- * read — the org resolves instead (the orgAssignment + RedirectToUser seam,
- * then HasOrgOrUserVisible): a renamed org 307s onto the new name, an
- * invisible or plain-user name 404-shells (indistinguishable from missing,
- * existence never leaks). Everything else is the org's visible-repo listing.
+ * GET /{owner} — the owner home (upstream `OwnerProfile`,
+ * routers/web/user/profile.go:37): the session prologue WITHOUT the repo
+ * read; the name resolves as an ORG first (pages/org-home.tsx — the
+ * orgAssignment + RedirectToUser seam, then HasOrgOrUserVisible), then as a
+ * USER (pages/user-profile.tsx — the type-gated user lookup, the shared
+ * RedirectToUser redirect seam, then IsUserVisibleToViewer). A renamed name
+ * 307s onto the new name (the shared user_redirects seam, query preserved),
+ * an invisible or unknown name 404-shells — indistinguishable from missing,
+ * existence never leaks.
  */
-async function orgHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+async function ownerHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, route, ctx, viewer, respond } = resolved;
-  if (route.family !== "org-home") return respond(await c.notFound()); // registration/parser drift guard
+  if (route.family !== "owner-home") return respond(await c.notFound()); // registration/parser drift guard
   const doer = viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false };
-  const resolution = await resolveOrgHome(c.env.DB, route.owner, doer, url.pathname, url.search.startsWith("?") ? url.search.slice(1) : url.search);
-  if (resolution.kind === "redirect") {
-    return respond(new Response(null, { status: 307, headers: { location: resolution.location } }));
+  const pathname = url.pathname;
+  const query = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+  // The ORG half first (upstream ContextUser.IsOrganization's true arm): an
+  // org renders the org home; its redirect arm is the shared seam.
+  const org = await resolveOrgHome(c.env.DB, route.owner, doer, pathname, query);
+  if (org.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: org.location } }));
   }
-  if (resolution.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
-  const data = await loadOrgHomeData(c.env.DB, resolution.org, doer, url.searchParams);
-  return respond(c.html(renderOrgHomePage(ctx, data), 200));
+  if (org.kind === "org") {
+    const data = await loadOrgHomeData(c.env.DB, org.org, doer, url.searchParams);
+    return respond(c.html(renderOrgHomePage(ctx, data), 200));
+  }
+  // The USER half (the false arm): a plain user renders the profile, a
+  // renamed user 307s through the same seam, anything else 404-shells.
+  const profile = await resolveUserProfile(c.env.DB, route.owner, doer, pathname, query);
+  if (profile.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: profile.location } }));
+  }
+  if (profile.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadUserProfileData(c.env.DB, profile.user, doer, url.searchParams);
+  return respond(c.html(renderUserProfilePage(ctx, data), 200));
 }
 
 /** GET /{owner}/{repo}/milestones (pages/milestones.tsx — the list; every
@@ -1134,10 +1165,13 @@ uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
 uiRouter.get("/:owner/:repo/milestones", (c) => milestonesPage(c));
 uiRouter.get("/:owner/:repo/milestones/new", (c) => milestoneNewPage(c));
 uiRouter.post("/:owner/:repo/milestones/new", (c) => milestoneNewSubmit(c));
-// Wave-6 org home — the SINGLE-SEGMENT family. The label regex refuses the
-// top-level literals (TOP_LEVEL_EXCLUDED: /login + /logout are registered on
-// the parent app AFTER this mount, so the dynamic shape would shadow them —
-// verified Hono registration-order precedence; /healthz is the dispatcher's
-// static route) so those requests miss this sub-app to their own routers.
-// The parser stays the source of truth; the handler 404-shells any drift.
-uiRouter.get("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => orgHomePage(c));
+// Wave-6 single-segment family, wave-7-extended into the owner home (org
+// rows → the org home, user rows → the user profile — upstream's
+// OwnerProfile dispatch). The label regex is wave 6's VERBATIM (it already
+// admits every name — user pages included — except TOP_LEVEL_EXCLUDED:
+// /login + /logout are registered on the parent app AFTER this mount, so
+// the dynamic shape would shadow them — verified Hono registration-order
+// precedence; /healthz is the dispatcher's static route) so those requests
+// miss this sub-app to their own routers. The parser stays the source of
+// truth; the handler 404-shells any drift.
+uiRouter.get("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => ownerHomePage(c));

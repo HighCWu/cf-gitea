@@ -2,7 +2,10 @@
  * The org home page, `/{org}` — pages wave 6 (SPEC-0008 U3 extension): the
  * public org profile — header, the reduced org menu, and the org's visible
  * repository list. The FIRST single-segment (non-repo-scoped) UI family, and
- * the first org-scoped page.
+ * the first org-scoped page. Since wave 7 the `/{name}` shape serves the
+ * OWNER home (upstream `OwnerProfile` dispatch): org rows land here, user
+ * rows on pages/user-profile.tsx — one parse family (`owner-home`), this
+ * module stays the org half.
  *
  * ## DOM contract (templates/org/home.tmpl + org/header.tmpl + org/menu.tmpl +
  *  shared/repo/list.tmpl + repo/icon.tmpl at the pin)
@@ -285,8 +288,10 @@ export function OrgRepoListItem(props: { orgLink: string; item: OrgHomeRepoItem;
 }
 
 /** The Older/Newer pagination — the issues list's DOM shape
- *  (div.center.page.buttons), driven by `page * size < total`. */
-function OrgHomePagination(props: { orgLink: string; page: number; more: boolean }) {
+ *  (div.center.page.buttons), driven by `page * size < total`. Exported for
+ *  the user profile (wave 7) — the same shared/repo/list pager serves both
+ *  owner homes. */
+export function OrgHomePagination(props: { orgLink: string; page: number; more: boolean }) {
   if (props.page <= 1 && !props.more) return null;
   return (
     <div class="center page buttons">
@@ -359,9 +364,12 @@ export type OrgHomeResolution =
 
 /**
  * Resolve the org for the page viewer: `resolveOrgForRequest` (the
- * orgAssignment + RedirectToUser seam — plain users are misses, renamed orgs
- * 307), then `orgVisibleToDoer` (HasOrgOrUserVisible — an invisible org is
- * indistinguishable from a missing one).
+ * orgAssignment + RedirectToUser seam — non-org rows are misses, renamed
+ * orgs 307), then `orgVisibleToDoer` (HasOrgOrUserVisible — an invisible org
+ * is indistinguishable from a missing one). Since wave 7 the router calls
+ * this as the ORG HALF of the owner-home dispatch: a plain USER name is a
+ * `missing` here and falls through to the user half (pages/user-profile.tsx)
+ * instead of 404-ing.
  */
 export async function resolveOrgHome(
   d1: D1Database,

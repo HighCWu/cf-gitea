@@ -244,7 +244,7 @@ describe("Navbar", () => {
         <p>page body</p>
       </BaseLayout>,
     );
-    expect(html).toContain('<span class="item" id="navbar-username">octocat</span>');
+    expect(html).toContain('<a class="item" id="navbar-username" href="/octocat">octocat</a>');
     // POST-only logout (§2.7) — a plain form button, no GET logout link.
     expect(html).toContain('<form class="item" method="post" action="/logout">');
     expect(html).toContain(">Sign Out</button>");

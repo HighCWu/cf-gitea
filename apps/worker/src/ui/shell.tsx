@@ -10,6 +10,7 @@ import { renderToString } from "hono/jsx/dom/server";
 import type { Child } from "hono/jsx";
 
 import { locale, configI18n } from "./locale";
+import { userLink } from "./links";
 import { ICON_PATHS, type IconName } from "./icons";
 import type { Viewer } from "./viewer";
 import type { UiContext } from "./ui-context";
@@ -138,9 +139,11 @@ function Head(props: { ctx: UiContext; title: string }) {
  * page exists). User viewers gain the upstream signed-in chrome REDUCED to
  * the username + a sign-out POST button (head_navbar.tmpl at the pin, minus
  * everything that needs services we have not built: no `+` create menu, no
- * notification bell, no avatar image — the avatar pipeline does not exist;
- * the username is plain text because a profile page is not in the §2.1
- * inventory and dead links are not emitted, same rule as the tab strip).
+ * notification bell, no avatar image — the avatar pipeline does not exist).
+ * Wave 7 (the dead-link unlock): the username anchors the `/{username}`
+ * profile (head_navbar.tmpl:98's `HomeLink()` shape, via the shared
+ * `userLink` helper) — before the profile page existed it was plain text
+ * (§2.4.1: dead links are not emitted).
  */
 export function Navbar(props: { viewer: Viewer }) {
   return (
@@ -163,9 +166,9 @@ export function Navbar(props: { viewer: Viewer }) {
           </a>
         ) : (
           <>
-            <span class="item" id="navbar-username">
+            <a class="item" id="navbar-username" href={userLink(props.viewer.username)}>
               {props.viewer.username}
-            </span>
+            </a>
             <form class="item" method="post" action="/logout">
               <button type="submit" class="button">
                 {locale.sign_out}

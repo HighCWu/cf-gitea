@@ -196,9 +196,10 @@ describe("issue detail page (/issues/{index})", () => {
     expect(html).toContain('<div class="ui green label issue-state-label">');
     expect(html).toContain('class="svg octicon-issue-opened"');
     expect(html).toContain(" Open</div>");
-    // Meta line: opened + fixed-epoch relative-time + poster (plain text) + count.
+    // Meta line: opened + fixed-epoch relative-time + poster (a profile link
+    // since wave 7's dead-link unlock) + count.
     expect(html).toContain('<span class="time-desc">opened <relative-time prefix="" tense="past"');
-    expect(html).toContain(" by alice · 3 comments</span>");
+    expect(html).toContain(' by <a href="/alice">alice</a> · 3 comments</span>');
     // The issues tab is active, pulls is not.
     expect(html).toContain('<a class="active item" href="/alice/wave3/issues" data-shortcut-keys="g i">');
     expect(html).toContain('<a class="item" href="/alice/wave3/pulls" data-shortcut-keys="g p">');
@@ -261,7 +262,7 @@ describe("issue detail page (/issues/{index})", () => {
     expect(html).toContain('<span class="item empty-list">No labels</span>');
     expect(html).toContain('<span class="item empty-list">No Milestone</span>');
     // Meta line without a comment pluralization error at 0.
-    expect(html).toContain(" by alice · 0 comments</span>");
+    expect(html).toContain(' by <a href="/alice">alice</a> · 0 comments</span>');
   });
 
   it("renders the mirrored-import poster as plain original_author text", async () => {
@@ -293,9 +294,10 @@ describe("pull request detail (/pulls/{index})", () => {
     expect(html).toContain('<title>#3 - wave3: feature branch - alice/wave3</title>');
     expect(html).toContain('<div class="ui green label issue-state-label">');
     expect(html).toContain('class="svg octicon-git-pull-request"');
-    // Upstream pull-desc: poster + wants-to-merge with <code> branch names
+    // Upstream pull-desc: poster (a profile link since wave 7) +
+    // wants-to-merge with <code> branch names
     // (unlinked, no commit count — engine reads, issue-detail.tsx header).
-    expect(html).toContain('<span id="pull-desc-display" class="pull-desc">alice wants to merge <code>feature-wave3</code> into <code>main</code></span>');
+    expect(html).toContain('<span id="pull-desc-display" class="pull-desc"><a class="tw-font-semibold" href="/alice">alice</a> wants to merge <code>feature-wave3</code> into <code>main</code></span>');
     // The reduced merge box with the checking note (cached row state).
     expect(html).toContain('class="timeline-item comment pull-merge-box"');
     expect(html).toContain("Pull request mergeability is being computed.");

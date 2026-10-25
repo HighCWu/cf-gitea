@@ -167,6 +167,10 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // private fixture repo stays hidden), and the zero-repo empty placeholder.
   { file: "org-home.html", path: "/acme", status: 200 },
   { file: "org-home-empty.html", path: "/emptyorg", status: 200 },
+  // User profile (wave 7): the USER half of the single-segment family —
+  // alice's public repos (golden/golden-alt/golden-ms, no descriptions,
+  // updatedAt never stamped → no "Updated" lines, byte-stable).
+  { file: "user-profile.html", path: "/alice", status: 200 },
   // Milestones list (wave 6): the open default (a 50% progress bar, an
   // overdue-red past deadline, "No due date") and the closed tab (the
   // closed-stamp line + the 100% milestone).
@@ -478,9 +482,29 @@ export function setupGoldenFixtures(): void {
         .set({ createdAt: new Date(T0 * 1000) })
         .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, slug)));
     }
+    // Wave 7: the user-profile golden renders alice's "Joined on" from her
+    // users row — pin it to the fixed epoch like the repo rows (seedVerifiedUser
+    // stamps wall-clock createdAt; §5.2 determinism is a fixture property).
+    const alice = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "alice"))
+      .get();
+    if (alice === undefined) throw new Error("golden owner row missing before the createdAt pin");
+    await drizzle(env.DB).update(users).set({ createdAt: new Date(T0 * 1000) }).where(eq(users.id, alice.id));
     await seedGoldenIssues();
     await seedGoldenPullDiff();
     await seedGoldenOrg();
     await seedGoldenMilestones();
+    // Wave 7: the user-profile golden renders the shared/repo/list rows'
+    // "Updated {TimeSince}" from `repositories.updated_at` — the issue and
+    // milestone seeders above stamp it with wall-clock time (the counter-
+    // maintenance batches). Pin alice's rows to the fixed epoch like the
+    // createdAt pins (§5.2: determinism is a fixture property; the repo-
+    // scoped goldens never read this column, so they are unaffected).
+    await drizzle(env.DB)
+      .update(repositories)
+      .set({ updatedAt: new Date(T0 * 1000) })
+      .where(eq(repositories.ownerNamespace, "alice"));
   });
 }
