@@ -314,3 +314,81 @@ Operational note (2026-10-25): the redeploy wave's smoke PAT (prefix
 cfg_9be84293) was echoed into agent logs, then deleted from
 personal_access_tokens by the orchestrator (mint-per-run remains the
 standing rule for probe credentials).
+
+## Redeploy verification — 2026-10-25 06:59 UTC (14:59 CST), same-deployment-state block
+
+Deploy: version `c68af947-cc6b-4ba6-b2d6-ea271cf6ce09` on
+https://cf-gitea.hecongw.workers.dev at commit `a2ecd92` — the
+dispatch-freeze point: everything the five landing waves shipped through the
+freeze is in this deployment (UI pages waves 4-8 incl. the web file editor,
+webhook 18/26, org teams + ACL + narrowing, attachments, emails/keys/GPG
+(migration 0016), fork-dispatch P1 fix, engine M3.0-M3.4 incl.
+RETIRED→RECLAIMABLE→DELETED lease-gated deletion, SPEC-0011 as-built, SPEC-0012
+draft, declared 301/554). Assets rebuilt: **784 files** (content-hashed).
+Remote migrations applied immediately before deploy: **0014
+(issue_attachments), 0015 (teams / team_members / team_repo_access), 0016
+(email_addresses / gpg_keys / public_keys), 0017 (comments covering index
+`comments_issue_covering_idx`) — all ✅**; remote D1 now **48 tables**,
+sqlite_master set verified against the migration contents.
+
+Deploy gates at `a2ecd92`: `tsc --noEmit` **0 errors** (re-run after `a2ecd92`
+itself, a comment-only router.ts touch that landed mid-window);
+`pnpm check:api` **PASS** (78/78 paths, 129/129 operations; documented warns:
+GET /user 401, GET /signing-key.gpg/.pub 404); `vitest run --maxWorkers=8`
+**2153 passed / 5 skipped, 91 files passed + 1 skipped (92), 99.6 s** —
+first fully green full-suite run on the frozen tree.
+
+`pnpm smoke` (fresh mint-per-run PAT, `--user p0probe`, with
+`--migrate-check`): **6 pass / 0 fail / 1 skip** (bench-report not
+requested). Verbatim: `[pass] push-lsremote (11107 ms) — pushed 122f7477ab…,
+authed ls-remote sees refs/heads/main, anonymous advert 401 Basic challenge`;
+`[pass] cleanup (1072 ms) — repo p0probe/smoke-97ec8519 deleted`;
+`[pass] migrate-check (6397 ms) — all 19 expected tables present (+31
+system/aux …)`. The smoke repo and its refs are gone; the anon × private
+fetch still answers **401 Basic challenge** (ACL row #2 holds).
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`,
+results **unchanged** vs both prior tables — recorded for the
+same-deployment-state condition):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `fatal: 远程错误：upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1` (HEAD c3); `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean |
+
+**First production bench** (`bench-run.mjs --compare m2 --sizes 5m
+--base-url <prod> --user p0probe --remote --yes`): **RUNNABLE and exit 0** —
+the `--user` production mode (fixtures create-by-push into the token's own
+namespace, authenticated read legs) closes the gap the 01:28 block recorded
+("attempted, not runnable"). Numbers (NOT baseline-comparable: remote
+includes network RTT/TLS variance; gate skipped, report-only):
+`clone 7799.82 ms (0.69 MiB/s, 5,694,917 B received) | push 2072.22 ms
+(518 B) | fetch incremental 2064.51 ms / 1422 B (ratio 0.00025) | info/refs
+p50 382.84 ms / p95 562.98 ms`. Results:
+`.bench-results/bench-compare-m2-2026-10-25T06-38-55-338Z.json`; fixture repo
+`p0probe/bench-5m-ade587d2` DELETEd after (204, GET-after 404).
+
+bench-d1 production attempt: **partial — aborted by client-side network
+errors, fixtures fully cleaned.** First invocation died at fixture setup
+(`[fatal] fetch failed`); retry captured the settle phases
+(`seq ops/s=1.92 p50=486.06ms p95=704.87ms wall=104040ms; p8 ops/s=7.94
+p50=631.37ms p95=1114.72ms; p32 ops/s=11.68 p50=2035.78ms p95=3151.16ms`)
+then died with the same `fetch failed` before the CAS/issue/token/list/team
+phases (exit 1). Transient local-network failure, not a production fault
+(the full bench-run workload against the same deployment succeeded
+immediately before); no results file written for the aborted run. Note for
+any retry: the same PAT was passed as `--member-token`, so the token's user
+(p0probe) is simultaneously the org owner and the added team member — the
+team workload would short-circuit the team-ACL path via owner privileges
+(the `fixtures: team member p0probe added` line confirmed the add).
+Leftover fixtures from the aborted run (`p0probe/d1bench-ef218253-data`,
+`d1benchorgef218253/d1bench-ef218253-orgrepo`, org `d1benchorgef218253`)
+were DELETEd via the API (3× 204); remote D1 counts **zero** `d1bench-*`
+repos/orgs after. `p0probe/p0-shallow` remains live intentionally (reviewer
+re-run repo, per the 04:2x section).
+
+Credential hygiene (standing rule): this run's PAT (prefix `cfg_f7f95289`,
+minted via `bootstrap-admin.mjs p0probe --remote`) was captured to a 0600
+temp file, never echoed to agent logs, and is deleted from
+`personal_access_tokens` at the end of this run.
