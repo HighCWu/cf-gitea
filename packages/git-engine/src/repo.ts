@@ -10,9 +10,13 @@ import {
   uploadPack,
   latestCommitTime,
   wantsAreAllTips,
+  openPlanLease,
+  releasePlanLease,
+  serveReadGate,
   Service,
   PackCache,
 } from "./git/protocol";
+import type { ReadGate } from "./git/packstore";
 import {
   beginReceive,
   beginForkImport,
@@ -87,6 +91,7 @@ import { diffLines, toHunks, isBinary, Hunk, DiffOp } from "./git/diff";
 import { blame, BlameHistoryEntry } from "./git/blame";
 import { tarGz, zip, SnapshotFile } from "./git/snapshot";
 import {
+  planFetch,
   planFetchInsideTransaction,
   releaseReadLease,
   renewAndAuthorizeRead,
@@ -648,6 +653,8 @@ export class RepoCell extends DurableObject<Env> {
     // backfill the registry sort key: re-PUTing config recomputes idle from the
     // real latest-commit date, so a mirrored repo's index age stops tracking
     // its push time. The Worker reads this and threads it into the registry.
+    // The tip peels are served content reads: they run under the content lease.
+    const commitTime = await this.withContentLease((gate) => latestCommitTime(this.store, gate));
     return Response.json(
       {
         description: this.store.getMeta("description") ?? "",
@@ -655,7 +662,7 @@ export class RepoCell extends DurableObject<Env> {
         section: this.store.getMeta("section") ?? "",
         private: this.store.getMeta("private") === "1",
       },
-      { headers: { "x-commit-time": String(await latestCommitTime(this.store)) } }
+      { headers: { "x-commit-time": String(commitTime) } }
     );
   }
 
@@ -663,6 +670,13 @@ export class RepoCell extends DurableObject<Env> {
    * Delete loose objects unreachable from any ref. Objects inside stored
    * packs are kept (deleting mid-pack is impossible without a repack);
    * huge repos skip the sweep entirely — the walk isn't worth it.
+   *
+   * Its object reads are deliberately NOT content-lease-gated (SPEC-0011 §3
+   * posture survey, the only ungated serve-adjacent reads in this file): the
+   * caller runs the whole migration under `blockConcurrencyWhile`, so nothing
+   * — GC, compaction, a content read — interleaves with it, and it defers to
+   * in-flight uploads instead of racing them. There is no concurrent
+   * transition to be lease-protected against.
    */
   private async runGc(): Promise<{ removed: number; kept: number; skipped?: boolean }> {
     if (this.store.objectCount() > 300_000) {
@@ -1014,98 +1028,155 @@ export class RepoCell extends DurableObject<Env> {
   // auth, a service binding is already trusted infrastructure
   // (rpcBind above rebinds R2 for it).
 
+  /**
+   * The content-path read lease (SPEC-0011 §3 applied to everything OUTSIDE
+   * the two upload-pack arms — closes the gap the M3.2 as-built record named:
+   * "content-path reads outside upload-pack (UI blobs, ls-refs peels) remain
+   * lease-free"). Every served content read — the six typed content RPCs and
+   * the DO's own ui()/config pages — runs through this wrapper:
+   *
+   * 1. `planFetch` registers a `kind='read'` lease over the READABLE catalog
+   *    (active + retired — the conservative whole-catalog dependency set, the
+   *    same derivation the serve paths use) in ONE transaction with the
+   *    catalog read. From that instant a GC pass cannot flip any dependency
+   *    RETIRED→RECLAIMABLE (`hasLiveReadLeaseFor` gates the flip) — the bytes
+   *    every read below may name stay in R2 for the wrapper's duration.
+   * 2. `gate` (the M3.2 per-segment `serveReadGate`) rides down to every
+   *    `store.get` R2 chunk read: past half the TTL it renews INLINE before
+   *    the read (a long request keeps its lease indefinitely while it keeps
+   *    reading; a request that stalls past the expiry loses only availability
+   *    — the next gated read rejects and the whole request fails, Property A).
+   *    A rejected renewal, like any mid-read unavailability, throws: the RPC
+   *    fails WHOLE, never a torn/partial answer (a snapshot page can no longer
+   *    silently omit a blob whose pack was reclaimed mid-archive — the read
+   *    cannot name a reclaimed pack while the lease is live, and an unhelmeted
+   *    failure surfaces instead).
+   * 3. Release fires in `finally` — on completion, error and cancel alike —
+   *    decoupling GC from client transfer time (§3.4: buffered response bytes
+   *    need no pack protection).
+   *
+   * A repo with an EMPTY catalog (loose-only: API-created repos before their
+   * first push) takes no row and no gate (`planFetch` short-circuits to the
+   * guard-free plan id) — nothing R2-backed exists to protect. The cost on
+   * the populated path is one small in-DO transaction + one delete per RPC,
+   * the same shape the serve arms pay per stream.
+   */
+  private async withContentLease<T>(fn: (gate: ReadGate | undefined) => Promise<T>): Promise<T> {
+    const lease = openPlanLease(this.store, planFetch(this.store, { generation: this.store.refsVersion() }));
+    const gate = serveReadGate(this.store, lease);
+    try {
+      return await fn(gate);
+    } finally {
+      releasePlanLease(this.store, lease);
+    }
+  }
+
   async listRefs(): Promise<RefsResult> {
     this.rpcBind();
-    const refs: RefsResult["refs"] = [];
-    for (const r of this.store.refs()) {
-      const entry: RefsResult["refs"][number] = { name: r.name, target: r.oid };
-      if (r.name.startsWith("refs/tags/")) {
-        // peeledRefTarget reads the refs row's peeled column (written once at
-        // first peel), so repeat calls never re-walk the tag object
-        const peeled = await this.store.peeledRefTarget(r.name, r.oid);
-        if (peeled && peeled !== r.oid) entry.peeled = peeled;
+    return this.withContentLease(async (gate) => {
+      const refs: RefsResult["refs"] = [];
+      for (const r of this.store.refs()) {
+        const entry: RefsResult["refs"][number] = { name: r.name, target: r.oid };
+        if (r.name.startsWith("refs/tags/")) {
+          // peeledRefTarget reads the refs row's peeled column (written once at
+          // first peel), so repeat calls never re-walk the tag object; a cold
+          // peel's tag-object reads ride the content lease (gate)
+          const peeled = await this.store.peeledRefTarget(r.name, r.oid, gate);
+          if (peeled && peeled !== r.oid) entry.peeled = peeled;
+        }
+        refs.push(entry);
       }
-      refs.push(entry);
-    }
-    return { head: this.store.resolveHead() ? this.store.head() : null, refs };
+      return { head: this.store.resolveHead() ? this.store.head() : null, refs };
+    });
   }
 
   /** `id` is a branch, tag, full ref, or reachable oid; absent means HEAD. */
   async readCommit(id?: string): Promise<CommitJson | null> {
     this.rpcBind();
-    const rr = await this.resolveRef(id);
-    if (!rr) return null;
-    const c = await this.peelToCommit(rr.oid);
-    return c ? commitJson(c.oid, c.commit) : null;
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(id, gate);
+      if (!rr) return null;
+      const c = await this.peelToCommit(rr.oid, gate);
+      return c ? commitJson(c.oid, c.commit) : null;
+    });
   }
 
   async listLog(ref?: string, opts: { path?: string; ofs?: number; n?: number } = {}): Promise<LogResult> {
     this.rpcBind();
-    const rr = await this.resolveRef(ref);
-    if (!rr) return { commits: [], more: false };
-    const n = Math.min(Math.max(opts.n ?? LOG_PAGE, 1), 100);
-    const ofs = Math.max(opts.ofs ?? 0, 0);
-    const filter: LogFilter = opts.path ? { path: decodePath("/" + opts.path) } : {};
-    const { entries, more } = await this.walkLog(rr.oid, ofs, n, filter);
-    return { commits: entries.map((e) => commitJson(e.oid, e.commit)), more };
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(ref, gate);
+      if (!rr) return { commits: [], more: false };
+      const n = Math.min(Math.max(opts.n ?? LOG_PAGE, 1), 100);
+      const ofs = Math.max(opts.ofs ?? 0, 0);
+      const filter: LogFilter = opts.path ? { path: decodePath("/" + opts.path) } : {};
+      const { entries, more } = await this.walkLog(rr.oid, ofs, n, filter, gate);
+      return { commits: entries.map((e) => commitJson(e.oid, e.commit)), more };
+    });
   }
 
   async listTree(ref?: string, path = ""): Promise<TreeResult | null> {
     this.rpcBind();
-    const rr = await this.resolveRef(ref);
-    if (!rr) return null;
-    const head = await this.peelToCommit(rr.oid);
-    if (!head) return null;
-    const segs = decodePath("/" + path);
-    const found = await this.lookupPath(head.commit.tree, segs);
-    if (!found || found.kind !== "tree") return null;
-    const entries: TreeEntryJson[] = found.entries.map((e) => {
-      const type = isTreeMode(e.mode) ? ("tree" as const) : isGitlinkMode(e.mode) ? ("commit" as const) : ("blob" as const);
-      const out: TreeEntryJson = { name: e.name, mode: e.mode, type, oid: e.oid };
-      const meta = type === "blob" ? this.store.typeAndSize(e.oid) : null;
-      if (meta) out.size = meta.size;
-      return out;
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(ref, gate);
+      if (!rr) return null;
+      const head = await this.peelToCommit(rr.oid, gate);
+      if (!head) return null;
+      const segs = decodePath("/" + path);
+      const found = await this.lookupPath(head.commit.tree, segs, gate);
+      if (!found || found.kind !== "tree") return null;
+      const entries: TreeEntryJson[] = found.entries.map((e) => {
+        const type = isTreeMode(e.mode) ? ("tree" as const) : isGitlinkMode(e.mode) ? ("commit" as const) : ("blob" as const);
+        const out: TreeEntryJson = { name: e.name, mode: e.mode, type, oid: e.oid };
+        // typeAndSize is an index-only SQLite read — no R2 GET, nothing to gate
+        const meta = type === "blob" ? this.store.typeAndSize(e.oid) : null;
+        if (meta) out.size = meta.size;
+        return out;
+      });
+      return { oid: found.oid, entries };
     });
-    return { oid: found.oid, entries };
   }
 
   /** Changes id2..id (default id2 = first parent of id, like the diff page). */
   async readDiff(id?: string, id2?: string): Promise<DiffResult | null> {
     this.rpcBind();
-    const rr = await this.resolveRef(id);
-    if (!rr) return null;
-    const head = await this.peelToCommit(rr.oid);
-    if (!head) return null;
-    let oldOid: string | null = null;
-    if (id2) {
-      const rr2 = await this.resolveRef(id2);
-      const c2 = rr2 ? await this.peelToCommit(rr2.oid) : null;
-      if (!c2) return null;
-      oldOid = c2.oid;
-    } else {
-      oldOid = head.commit.parents[0] ?? null;
-    }
-    const oldCommit = oldOid ? await this.loadCommit(oldOid) : null;
-    const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, head.commit.tree);
-    return {
-      old: oldOid,
-      new: head.oid,
-      truncated,
-      files: files.map((f) => ({ path: f.path, old: f.o, new: f.n, kind: f.kind, add: f.add, del: f.del, hunks: f.hunks })),
-    };
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(id, gate);
+      if (!rr) return null;
+      const head = await this.peelToCommit(rr.oid, gate);
+      if (!head) return null;
+      let oldOid: string | null = null;
+      if (id2) {
+        const rr2 = await this.resolveRef(id2, gate);
+        const c2 = rr2 ? await this.peelToCommit(rr2.oid, gate) : null;
+        if (!c2) return null;
+        oldOid = c2.oid;
+      } else {
+        oldOid = head.commit.parents[0] ?? null;
+      }
+      const oldCommit = oldOid ? await this.loadCommit(oldOid, gate) : null;
+      const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, head.commit.tree, gate);
+      return {
+        old: oldOid,
+        new: head.oid,
+        truncated,
+        files: files.map((f) => ({ path: f.path, old: f.o, new: f.n, kind: f.kind, add: f.add, del: f.del, hunks: f.hunks })),
+      };
+    });
   }
 
   async readBlob(ref: string | undefined, path: string): Promise<BlobResult | null> {
     this.rpcBind();
-    const rr = await this.resolveRef(ref);
-    if (!rr) return null;
-    const head = await this.peelToCommit(rr.oid);
-    if (!head) return null;
-    const found = await this.lookupPath(head.commit.tree, decodePath("/" + path));
-    if (!found || found.kind !== "blob") return null;
-    const obj = await this.store.get(found.entry.oid);
-    if (!obj || obj.type !== "blob") return null;
-    return { oid: found.entry.oid, mode: found.entry.mode, data: obj.data };
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(ref, gate);
+      if (!rr) return null;
+      const head = await this.peelToCommit(rr.oid, gate);
+      if (!head) return null;
+      const found = await this.lookupPath(head.commit.tree, decodePath("/" + path), gate);
+      if (!found || found.kind !== "blob") return null;
+      const obj = await this.store.get(found.entry.oid, gate);
+      if (!obj || obj.type !== "blob") return null;
+      return { oid: found.entry.oid, mode: found.entry.mode, data: obj.data };
+    });
   }
 
   /** The content methods over HTTP. GET-only; routed from ui(). */
@@ -1214,7 +1285,7 @@ export class RepoCell extends DurableObject<Env> {
     return body;
   }
 
-  private async base(repo: string, tab: string, ref?: string, formAction?: string): Promise<Omit<LayoutOpts, "body">> {
+  private async base(repo: string, tab: string, ref?: string, formAction?: string, gate?: ReadGate): Promise<Omit<LayoutOpts, "body">> {
     const branches = this.store
       .refs()
       .filter((r) => r.name.startsWith("refs/heads/"))
@@ -1229,39 +1300,65 @@ export class RepoCell extends DurableObject<Env> {
       sub: this.store.getMeta("description") || "[no description]",
       tab,
       ref: ref ?? headBranch,
-      hasAbout: (await this.findReadme()) !== null,
+      hasAbout: (await this.findReadme(gate)) !== null,
       branches,
       formAction: formAction ?? `/${repoUrl(repo)}/`,
     };
   }
 
+  /**
+   * The DO's own web UI boundary: ONE content read lease spans the whole page
+   * render (SPEC-0011 §3 content-path coverage — the M3.2 record's "UI blobs"
+   * gap). Every object read below — tree walks, blob bodies, snapshot
+   * archives, log walks — rides the lease and the per-read gate: a concurrent
+   * RETIRED→RECLAIMABLE flip is blocked for the render's duration, a rejection
+   * or expiry throws and fails the page whole (snapshotPage's silent
+   * `if (!obj) continue` can no longer omit a reclaimed blob from an archive —
+   * under the lease the read cannot name a reclaimed pack, and an unfixable
+   * read surfaces as a failed request instead).
+   */
   private async ui(repo: string, host: string, proto: string, path: string, q: URLSearchParams): Promise<Response> {
+    // /api/* re-enters the typed content RPCs, which lease themselves — route
+    // them around the page lease so a request holds exactly one (the gate
+    // parameter is theirs to consume, not the page's)
+    if (path.startsWith("/api/")) return this.uiPage(repo, host, proto, path, q, undefined);
+    return this.withContentLease((gate) => this.uiPage(repo, host, proto, path, q, gate));
+  }
+
+  private async uiPage(
+    repo: string,
+    host: string,
+    proto: string,
+    path: string,
+    q: URLSearchParams,
+    gate: ReadGate | undefined
+  ): Promise<Response> {
     const h = q.get("h") ?? undefined;
     if (path.startsWith("/api/")) return this.api(path, q);
-    if (path === "/" || path === "") return this.summaryPage(repo, host, proto);
-    if (path === "/about/" || path === "/about") return this.aboutPage(repo, h);
+    if (path === "/" || path === "") return this.summaryPage(repo, host, proto, gate);
+    if (path === "/about/" || path === "/about") return this.aboutPage(repo, h, gate);
     if (path === "/log/" || path === "/log")
       return this.logPage(repo, h, parseInt(q.get("ofs") ?? "0", 10) || 0, {
         path: q.get("path") ? decodePath("/" + q.get("path")!) : undefined,
         qt: q.get("qt") ?? undefined,
         q: q.get("q") ?? undefined,
-      });
-    if (path === "/refs/" || path === "/refs") return this.refsPage(repo);
-    if (path === "/commit/" || path === "/commit") return this.commitPage(repo, q.get("id") ?? undefined, h);
+      }, gate);
+    if (path === "/refs/" || path === "/refs") return this.refsPage(repo, gate);
+    if (path === "/commit/" || path === "/commit") return this.commitPage(repo, q.get("id") ?? undefined, h, gate);
     if (path === "/diff/" || path === "/diff")
-      return this.diffPage(repo, q.get("id") ?? undefined, q.get("id2") ?? undefined, h, false);
+      return this.diffPage(repo, q.get("id") ?? undefined, q.get("id2") ?? undefined, h, false, gate);
     if (path === "/rawdiff/" || path === "/rawdiff")
-      return this.diffPage(repo, q.get("id") ?? undefined, q.get("id2") ?? undefined, h, true);
-    if (path === "/patch/" || path === "/patch") return this.patchPage(repo, q.get("id") ?? undefined, h);
-    if (path === "/tag/" || path === "/tag") return this.tagPage(repo, q.get("h") ?? q.get("id") ?? undefined);
-    if (path === "/atom/" || path === "/atom") return this.atomPage(repo, host, proto, h);
-    if (path === "/stats/" || path === "/stats") return this.statsPage(repo, h, q.get("period") ?? "m");
-    if (path === "/blob/" || path === "/blob") return this.blobByIdPage(q.get("id") ?? "");
-    if (path.startsWith("/tree")) return this.treePage(repo, h, decodePath(path.slice("/tree".length)));
-    if (path.startsWith("/plain")) return this.plainPage(h, decodePath(path.slice("/plain".length)));
-    if (path.startsWith("/blame")) return this.blamePage(repo, h, decodePath(path.slice("/blame".length)));
-    if (path.startsWith("/snapshot/")) return this.snapshotPage(repo, decodeURIComponent(path.slice("/snapshot/".length)));
-    return errorPage(await this.base(repo, "summary"), `page not found: ${path}`);
+      return this.diffPage(repo, q.get("id") ?? undefined, q.get("id2") ?? undefined, h, true, gate);
+    if (path === "/patch/" || path === "/patch") return this.patchPage(repo, q.get("id") ?? undefined, h, gate);
+    if (path === "/tag/" || path === "/tag") return this.tagPage(repo, q.get("h") ?? q.get("id") ?? undefined, gate);
+    if (path === "/atom/" || path === "/atom") return this.atomPage(repo, host, proto, h, gate);
+    if (path === "/stats/" || path === "/stats") return this.statsPage(repo, h, q.get("period") ?? "m", gate);
+    if (path === "/blob/" || path === "/blob") return this.blobByIdPage(q.get("id") ?? "", gate);
+    if (path.startsWith("/tree")) return this.treePage(repo, h, decodePath(path.slice("/tree".length)), gate);
+    if (path.startsWith("/plain")) return this.plainPage(h, decodePath(path.slice("/plain".length)), gate);
+    if (path.startsWith("/blame")) return this.blamePage(repo, h, decodePath(path.slice("/blame".length)), gate);
+    if (path.startsWith("/snapshot/")) return this.snapshotPage(repo, decodeURIComponent(path.slice("/snapshot/".length)), gate);
+    return errorPage(await this.base(repo, "summary", undefined, undefined, gate), `page not found: ${path}`);
   }
 
 
@@ -1272,13 +1369,13 @@ export class RepoCell extends DurableObject<Env> {
    * brute-forced through the UI even after the protocol side stopped serving
    * unreachable objects.
    */
-  private async resolveServable(id: string): Promise<string | null> {
+  private async resolveServable(id: string, gate?: ReadGate): Promise<string | null> {
     if (!isOid(id) || !this.store.has(id)) return null;
-    return (await this.reachableOid(id)) ? id : null;
+    return (await this.reachableOid(id, gate)) ? id : null;
   }
 
   /** Is `target` reachable from any current ref (or HEAD)? */
-  private async reachableOid(target: string): Promise<boolean> {
+  private async reachableOid(target: string, gate?: ReadGate): Promise<boolean> {
     // the full-clone reachable-set cache is versioned against current refs
     // (null on any mismatch), so a hit here is exactly as correct as the walk
     // below and skips inflating/parsing the whole object graph
@@ -1295,7 +1392,7 @@ export class RepoCell extends DurableObject<Env> {
       const meta = this.store.typeAndSize(oid);
       if (!meta) continue;
       if (meta.type === "blob") continue;
-      const obj = await this.store.get(oid);
+      const obj = await this.store.get(oid, gate);
       if (!obj) continue;
       if (obj.type === "commit") {
         const c = parseCommit(obj.data);
@@ -1313,7 +1410,7 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** Resolve ?h= (branch, tag, full ref, or oid) to an object id. */
-  private async resolveRef(h?: string): Promise<{ refName: string | null; oid: string } | null> {
+  private async resolveRef(h: string | undefined, gate?: ReadGate): Promise<{ refName: string | null; oid: string } | null> {
     if (!h) {
       const oid = this.store.resolveHead();
       return oid ? { refName: this.store.head(), oid } : null;
@@ -1322,7 +1419,7 @@ export class RepoCell extends DurableObject<Env> {
       const oid = this.store.getRef(cand);
       if (oid) return { refName: cand, oid };
     }
-    const full = await this.resolveServable(h);
+    const full = await this.resolveServable(h, gate);
     if (full) return { refName: null, oid: full };
     return null;
   }
@@ -1332,15 +1429,15 @@ export class RepoCell extends DurableObject<Env> {
    * content, so a start oid that actually peeled through a tag has its final
    * commit oid cached — a hit skips every intermediate tag object read.
    */
-  private async peelToCommit(oid: string): Promise<{ oid: string; commit: Commit } | null> {
+  private async peelToCommit(oid: string, gate?: ReadGate): Promise<{ oid: string; commit: Commit } | null> {
     const start = oid;
     const cached = this.store.getPeeled(start);
     if (cached !== null) {
-      const obj = await this.store.get(cached);
+      const obj = await this.store.get(cached, gate);
       return obj?.type === "commit" ? { oid: cached, commit: parseCommit(obj.data) } : null;
     }
     for (let i = 0; i < 10; i++) {
-      const obj = await this.store.get(oid);
+      const obj = await this.store.get(oid, gate);
       if (!obj) return null;
       if (obj.type === "commit") {
         if (oid !== start) this.store.setPeeled(start, oid);
@@ -1355,16 +1452,16 @@ export class RepoCell extends DurableObject<Env> {
     return null;
   }
 
-  private async loadCommit(oid: string): Promise<Commit | null> {
-    const obj = await this.store.get(oid);
+  private async loadCommit(oid: string, gate?: ReadGate): Promise<Commit | null> {
+    const obj = await this.store.get(oid, gate);
     return obj?.type === "commit" ? parseCommit(obj.data) : null;
   }
 
   /** oid of the entry at `path` in this commit's tree (any type), or null. */
-  private async pathOid(commit: Commit, path: string[]): Promise<string | null> {
+  private async pathOid(commit: Commit, path: string[], gate?: ReadGate): Promise<string | null> {
     let oid = commit.tree;
     for (const seg of path) {
-      const obj = await this.store.get(oid);
+      const obj = await this.store.get(oid, gate);
       if (obj?.type !== "tree") return null;
       const entry = parseTree(obj.data).find((e) => e.name === seg);
       if (!entry) return null;
@@ -1374,12 +1471,17 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** pathOid keyed by the root tree it starts from: shared across a log walk. */
-  private async pathOidCached(treeOid: string, path: string[], memo: Map<string, string | null>): Promise<string | null> {
+  private async pathOidCached(
+    treeOid: string,
+    path: string[],
+    memo: Map<string, string | null>,
+    gate?: ReadGate
+  ): Promise<string | null> {
     const hit = memo.get(treeOid);
     if (hit !== undefined) return hit;
     let oid: string | null = treeOid;
     for (const seg of path) {
-      const obj = await this.store.get(oid);
+      const obj = await this.store.get(oid, gate);
       if (obj?.type !== "tree") { oid = null; break; }
       const entry = parseTree(obj.data).find((e) => e.name === seg);
       if (!entry) { oid = null; break; }
@@ -1389,11 +1491,11 @@ export class RepoCell extends DurableObject<Env> {
     return oid;
   }
 
-  private async matchesFilter(e: LogEntry, filter: LogFilter, memo: Map<string, string | null>): Promise<boolean> {
+  private async matchesFilter(e: LogEntry, filter: LogFilter, memo: Map<string, string | null>, gate?: ReadGate): Promise<boolean> {
     if (filter.path && filter.path.length) {
-      const mine = await this.pathOidCached(e.commit.tree, filter.path, memo);
-      const parentTree = e.commit.parents[0] ? (await this.loadCommit(e.commit.parents[0]))?.tree : undefined;
-      const theirs = parentTree ? await this.pathOidCached(parentTree, filter.path, memo) : null;
+      const mine = await this.pathOidCached(e.commit.tree, filter.path, memo, gate);
+      const parentTree = e.commit.parents[0] ? (await this.loadCommit(e.commit.parents[0], gate))?.tree : undefined;
+      const theirs = parentTree ? await this.pathOidCached(parentTree, filter.path, memo, gate) : null;
       if (mine === theirs) return false;
     }
     if (filter.q) {
@@ -1411,8 +1513,14 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** Date-ordered commit walk (newest first) with optional filtering. */
-  private async walkLog(tip: string, skip: number, limit: number, filter: LogFilter = {}): Promise<{ entries: LogEntry[]; more: boolean }> {
-    const first = await this.peelToCommit(tip);
+  private async walkLog(
+    tip: string,
+    skip: number,
+    limit: number,
+    filter: LogFilter = {},
+    gate?: ReadGate
+  ): Promise<{ entries: LogEntry[]; more: boolean }> {
+    const first = await this.peelToCommit(tip, gate);
     if (!first) return { entries: [], more: false };
     skip = Math.min(skip, MAX_LOG_SCAN); // a wild ofs must not drive the walk to its cap for an empty page
     const scanCap = filter.path?.length ? PATH_LOG_SCAN : MAX_LOG_SCAN;
@@ -1424,11 +1532,11 @@ export class RepoCell extends DurableObject<Env> {
     while (frontier.length && out.length < skip + limit + 1 && scanned++ < scanCap) {
       frontier.sort((a, b) => b.commit.committer.time - a.commit.committer.time);
       const cur = frontier.shift()!;
-      if (await this.matchesFilter(cur, filter, memo)) out.push(cur);
+      if (await this.matchesFilter(cur, filter, memo, gate)) out.push(cur);
       for (const p of cur.commit.parents) {
         if (seen.has(p)) continue;
         seen.add(p);
-        const c = await this.loadCommit(p);
+        const c = await this.loadCommit(p, gate);
         if (c) frontier.push({ oid: p, commit: c });
       }
     }
@@ -1436,17 +1544,17 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** First-parent history of a path (for blame), newest first, with blobs. */
-  private async pathHistory(tip: string, path: string[], cap: number, maxBytes: number): Promise<BlameHistoryEntry[]> {
+  private async pathHistory(tip: string, path: string[], cap: number, maxBytes: number, gate?: ReadGate): Promise<BlameHistoryEntry[]> {
     const out: BlameHistoryEntry[] = [];
-    let cur = await this.peelToCommit(tip);
+    let cur = await this.peelToCommit(tip, gate);
     let steps = 0;
     let bytes = 0;
     while (cur && steps++ < MAX_LOG_SCAN && out.length < cap) {
-      const myOid = await this.pathOid(cur.commit, path);
-      const parent = cur.commit.parents[0] ? await this.peelToCommit(cur.commit.parents[0]) : null;
-      const parentOid = parent ? await this.pathOid(parent.commit, path) : null;
+      const myOid = await this.pathOid(cur.commit, path, gate);
+      const parent = cur.commit.parents[0] ? await this.peelToCommit(cur.commit.parents[0], gate) : null;
+      const parentOid = parent ? await this.pathOid(parent.commit, path, gate) : null;
       if (myOid !== parentOid) {
-        const blob = myOid ? await this.store.get(myOid) : null;
+        const blob = myOid ? await this.store.get(myOid, gate) : null;
         const data = blob?.type === "blob" ? blob.data : null;
         if (data) {
           bytes += data.length;
@@ -1461,7 +1569,7 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** Map oid -> decorations (branch/tag pointing at it). */
-  private async decorations(repo: string): Promise<Map<string, string>> {
+  private async decorations(repo: string, gate?: ReadGate): Promise<Map<string, string>> {
     const map = new Map<string, string>();
     const r = `/${repoUrl(repo)}`;
     for (const ref of this.store.refs()) {
@@ -1470,7 +1578,7 @@ export class RepoCell extends DurableObject<Env> {
       if (ref.name.startsWith("refs/heads/")) {
         html = `<a class='branch-deco' href='${r}/log/?h=${encodeURIComponent(ref.name.slice(11))}'>${esc(ref.name.slice(11))}</a>`;
       } else if (ref.name.startsWith("refs/tags/")) {
-        const peeled = await this.peelToCommit(ref.oid);
+        const peeled = await this.peelToCommit(ref.oid, gate);
         if (peeled) target = peeled.oid;
         html = `<a class='tag-deco' href='${r}/tag/?h=${encodeURIComponent(ref.name.slice(10))}'>${esc(ref.name.slice(10))}</a>`;
       } else continue;
@@ -1481,11 +1589,12 @@ export class RepoCell extends DurableObject<Env> {
 
   private async lookupPath(
     rootTree: string,
-    path: string[]
+    path: string[],
+    gate?: ReadGate
   ): Promise<{ kind: "tree"; oid: string; entries: TreeEntry[] } | { kind: "blob"; entry: TreeEntry } | null> {
     let treeOid = rootTree;
     for (let i = 0; i < path.length; i++) {
-      const obj = await this.store.get(treeOid);
+      const obj = await this.store.get(treeOid, gate);
       if (obj?.type !== "tree") return null;
       const entry = parseTree(obj.data).find((e) => e.name === path[i]);
       if (!entry) return null;
@@ -1495,17 +1604,17 @@ export class RepoCell extends DurableObject<Env> {
       if (!isTreeMode(entry.mode)) return null;
       treeOid = entry.oid;
     }
-    const obj = await this.store.get(treeOid);
+    const obj = await this.store.get(treeOid, gate);
     if (obj?.type !== "tree") return null;
     return { kind: "tree", oid: treeOid, entries: parseTree(obj.data) };
   }
 
-  private async findReadme(): Promise<{ name: string; oid: string } | null> {
+  private async findReadme(gate?: ReadGate): Promise<{ name: string; oid: string } | null> {
     const head = this.store.resolveHead();
     if (!head) return null;
-    const c = await this.peelToCommit(head);
+    const c = await this.peelToCommit(head, gate);
     if (!c) return null;
-    const root = await this.store.get(c.commit.tree);
+    const root = await this.store.get(c.commit.tree, gate);
     if (root?.type !== "tree") return null;
     const entries = parseTree(root.data);
     for (const want of README_NAMES) {
@@ -1515,22 +1624,22 @@ export class RepoCell extends DurableObject<Env> {
     return null;
   }
 
-  private async flattenTree(treeOid: string, prefix: string, out: Map<string, { oid: string; mode: string }>): Promise<void> {
-    const obj = await this.store.get(treeOid);
+  private async flattenTree(treeOid: string, prefix: string, out: Map<string, { oid: string; mode: string }>, gate?: ReadGate): Promise<void> {
+    const obj = await this.store.get(treeOid, gate);
     if (obj?.type !== "tree") return;
     for (const e of parseTree(obj.data)) {
       const p = prefix ? `${prefix}/${e.name}` : e.name;
-      if (isTreeMode(e.mode)) await this.flattenTree(e.oid, p, out);
+      if (isTreeMode(e.mode)) await this.flattenTree(e.oid, p, out, gate);
       else if (!isGitlinkMode(e.mode)) out.set(p, { oid: e.oid, mode: e.mode });
     }
   }
 
 
-  private async computeDiff(oldTree: string | null, newTree: string): Promise<{ files: FileDiff[]; truncated: boolean }> {
+  private async computeDiff(oldTree: string | null, newTree: string, gate?: ReadGate): Promise<{ files: FileDiff[]; truncated: boolean }> {
     const oldFiles = new Map<string, { oid: string; mode: string }>();
     const newFiles = new Map<string, { oid: string; mode: string }>();
-    if (oldTree) await this.flattenTree(oldTree, "", oldFiles);
-    await this.flattenTree(newTree, "", newFiles);
+    if (oldTree) await this.flattenTree(oldTree, "", oldFiles, gate);
+    await this.flattenTree(newTree, "", newFiles, gate);
     const paths = [...new Set([...oldFiles.keys(), ...newFiles.keys()])].sort();
     const files: FileDiff[] = [];
     let truncated = false;
@@ -1542,8 +1651,8 @@ export class RepoCell extends DurableObject<Env> {
         truncated = true;
         break;
       }
-      const oldData = o ? (await this.store.get(o.oid))?.data ?? new Uint8Array(0) : new Uint8Array(0);
-      const newData = n ? (await this.store.get(n.oid))?.data ?? new Uint8Array(0) : new Uint8Array(0);
+      const oldData = o ? (await this.store.get(o.oid, gate))?.data ?? new Uint8Array(0) : new Uint8Array(0);
+      const newData = n ? (await this.store.get(n.oid, gate))?.data ?? new Uint8Array(0) : new Uint8Array(0);
       const fd: FileDiff = { path: p, o, n, kind: "text", ops: null, hunks: [], add: 0, del: 0 };
       if (isBinary(oldData) || isBinary(newData)) {
         fd.kind = "binary";
@@ -1638,11 +1747,11 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
   }
 
 
-  private async aboutPage(repo: string, h: string | undefined): Promise<Response> {
-    const base = await this.base(repo, "about", h, `/${repoUrl(repo)}/about/`);
-    const readme = await this.findReadme();
+  private async aboutPage(repo: string, h: string | undefined, gate?: ReadGate): Promise<Response> {
+    const base = await this.base(repo, "about", h, `/${repoUrl(repo)}/about/`, gate);
+    const readme = await this.findReadme(gate);
     if (!readme) return errorPage(base, "no readme found");
-    const obj = await this.store.get(readme.oid);
+    const obj = await this.store.get(readme.oid, gate);
     if (!obj) return errorPage(base, "missing readme blob");
     const text = td.decode(obj.data);
     const lower = readme.name.toLowerCase();
@@ -1653,8 +1762,8 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private async summaryPage(repo: string, host: string, proto: string): Promise<Response> {
-    const base = await this.base(repo, "summary");
+  private async summaryPage(repo: string, host: string, proto: string, gate?: ReadGate): Promise<Response> {
+    const base = await this.base(repo, "summary", undefined, undefined, gate);
     const branches = this.store.refs().filter((r) => r.name.startsWith("refs/heads/"));
     const tags = this.store.refs().filter((r) => r.name.startsWith("refs/tags/"));
     const r = `/${repoUrl(repo)}`;
@@ -1675,7 +1784,7 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
       .slice(0, 10)
       .map(async (b) => {
         const name = b.name.slice(11);
-        const c = await this.peelToCommit(b.oid);
+        const c = await this.peelToCommit(b.oid, gate);
         if (!c) return "";
         return `<tr><td><a href='${r}/log/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
           `<td><a href='${r}/commit/?id=${c.oid}'>${esc(c.commit.subject)}</a></td>` +
@@ -1687,7 +1796,7 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
       .slice(0, 10)
       .map(async (t) => {
         const name = t.name.slice(10);
-        const obj = await this.store.get(t.oid);
+        const obj = await this.store.get(t.oid, gate);
         let when = 0;
         let target = t.oid;
         if (obj?.type === "tag") {
@@ -1695,7 +1804,7 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
           when = tag.tagger?.time ?? 0;
           target = tag.object;
         }
-        const c = await this.peelToCommit(target);
+        const c = await this.peelToCommit(target, gate);
         if (c && !when) when = c.commit.committer.time;
         const snap = `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
           `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.zip'>zip</a>`;
@@ -1706,8 +1815,8 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
       .join("");
 
     const headOid = this.store.resolveHead();
-    const recent = headOid ? (await this.walkLog(headOid, 0, 10)).entries : [];
-    const deco = await this.decorations(repo);
+    const recent = headOid ? (await this.walkLog(headOid, 0, 10, {}, gate)).entries : [];
+    const deco = await this.decorations(repo, gate);
     const logRows = recent
       .map(
         (e) =>
@@ -1732,18 +1841,18 @@ ${logRows}
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private async logPage(repo: string, h: string | undefined, ofs: number, filter: LogFilter): Promise<Response> {
+  private async logPage(repo: string, h: string | undefined, ofs: number, filter: LogFilter, gate?: ReadGate): Promise<Response> {
     const r = `/${repoUrl(repo)}`;
-    const base = await this.base(repo, "log", h, `${r}/log/`);
+    const base = await this.base(repo, "log", h, `${r}/log/`, gate);
     let tip = h;
     if (filter.qt === "range" && filter.q) {
       tip = filter.q;
       filter = {};
     }
-    const rr = await this.resolveRef(tip);
+    const rr = await this.resolveRef(tip, gate);
     if (!rr) return errorPage(base, tip ? `bad ref: ${tip}` : "empty repository");
-    const { entries, more } = await this.walkLog(rr.oid, ofs, LOG_PAGE, filter);
-    const deco = await this.decorations(repo);
+    const { entries, more } = await this.walkLog(rr.oid, ofs, LOG_PAGE, filter, gate);
+    const deco = await this.decorations(repo, gate);
     const rows = entries
       .map(
         (e) =>
@@ -1790,16 +1899,16 @@ ${rows || "<tr class='nohover'><td colspan='3'>(no matching commits)</td></tr>"}
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private async refsPage(repo: string): Promise<Response> {
+  private async refsPage(repo: string, gate?: ReadGate): Promise<Response> {
     const r = `/${repoUrl(repo)}`;
-    const base = await this.base(repo, "refs", undefined, `${r}/refs/`);
+    const base = await this.base(repo, "refs", undefined, `${r}/refs/`, gate);
     const refs = this.store.refs();
     const branches = refs.filter((x) => x.name.startsWith("refs/heads/"));
     const tags = refs.filter((x) => x.name.startsWith("refs/tags/"));
     const branchRows = (await Promise.all(branches
       .map(async (b) => {
         const name = b.name.slice(11);
-        const c = await this.peelToCommit(b.oid);
+        const c = await this.peelToCommit(b.oid, gate);
         const snap = `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
           `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.zip'>zip</a>`;
         return `<tr><td><a href='${r}/log/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
@@ -1810,7 +1919,7 @@ ${rows || "<tr class='nohover'><td colspan='3'>(no matching commits)</td></tr>"}
     const tagRows = (await Promise.all(tags
       .map(async (t) => {
         const name = t.name.slice(10);
-        const obj = await this.store.get(t.oid);
+        const obj = await this.store.get(t.oid, gate);
         let when = 0;
         let who = "";
         let target = t.oid;
@@ -1853,19 +1962,19 @@ ${tagRows || "<tr class='nohover'><td colspan='5'>none</td></tr>"}
     return html;
   }
 
-  private async treePage(repo: string, h: string | undefined, path: string[]): Promise<Response> {
+  private async treePage(repo: string, h: string | undefined, path: string[], gate?: ReadGate): Promise<Response> {
     const r = `/${repoUrl(repo)}`;
-    const base = await this.base(repo, "tree", h, `${r}/tree/${path.map(encodeURIComponent).join("/")}`);
-    const rr = await this.resolveRef(h);
+    const base = await this.base(repo, "tree", h, `${r}/tree/${path.map(encodeURIComponent).join("/")}`, gate);
+    const rr = await this.resolveRef(h, gate);
     if (!rr) return errorPage(base, h ? `bad ref: ${h}` : "empty repository");
-    const head = await this.peelToCommit(rr.oid);
+    const head = await this.peelToCommit(rr.oid, gate);
     if (!head) return errorPage(base, "no commit found");
-    const found = await this.lookupPath(head.commit.tree, path);
+    const found = await this.lookupPath(head.commit.tree, path, gate);
     if (!found) return errorPage(base, `path not found: ${path.join("/")}`);
     const withPath = { ...base, pathBar: this.pathBar(repo, h, path) };
 
     if (found.kind === "blob") {
-      return this.blobPage(repo, h, path, found.entry, withPath);
+      return this.blobPage(repo, h, path, found.entry, withPath, gate);
     }
 
     const q = h ? `?h=${encodeURIComponent(h)}` : "";
@@ -1899,9 +2008,10 @@ ${rows}
     h: string | undefined,
     path: string[],
     entry: TreeEntry,
-    base: Omit<LayoutOpts, "body">
+    base: Omit<LayoutOpts, "body">,
+    gate?: ReadGate
   ): Promise<Response> {
-    const obj = await this.store.get(entry.oid);
+    const obj = await this.store.get(entry.oid, gate);
     if (!obj) return errorPage(base, "missing blob");
     const r = `/${repoUrl(repo)}`;
     const q = h ? `?h=${encodeURIComponent(h)}` : "";
@@ -1923,22 +2033,22 @@ ${rows}
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private async blamePage(repo: string, h: string | undefined, path: string[]): Promise<Response> {
+  private async blamePage(repo: string, h: string | undefined, path: string[], gate?: ReadGate): Promise<Response> {
     const r = `/${repoUrl(repo)}`;
-    const base = await this.base(repo, "tree", h, `${r}/blame/${path.map(encodeURIComponent).join("/")}`);
+    const base = await this.base(repo, "tree", h, `${r}/blame/${path.map(encodeURIComponent).join("/")}`, gate);
     const withPath = { ...base, pathBar: this.pathBar(repo, h, path) };
-    const rr = await this.resolveRef(h);
+    const rr = await this.resolveRef(h, gate);
     if (!rr) return errorPage(withPath, "empty repository");
     if (!path.length) return errorPage(withPath, "blame needs a file path");
     // size-gate the tip blob before walking history: a large file would
     // otherwise load up to 200 full revisions into memory before blame() bails
-    const tip = await this.peelToCommit(rr.oid);
+    const tip = await this.peelToCommit(rr.oid, gate);
     if (!tip) return errorPage(withPath, "no commit found");
-    const tipOid = await this.pathOid(tip.commit, path);
+    const tipOid = await this.pathOid(tip.commit, path, gate);
     const meta = tipOid ? this.store.typeAndSize(tipOid) : null;
     if (!meta || meta.type !== "blob") return errorPage(withPath, `no such file: ${path.join("/")}`);
     if (meta.size > MAX_BLAME_BYTES) return errorPage(withPath, "blame skipped: file too large");
-    const history = await this.pathHistory(rr.oid, path, 200, MAX_BLAME_HISTORY_BYTES);
+    const history = await this.pathHistory(rr.oid, path, 200, MAX_BLAME_HISTORY_BYTES, gate);
     if (!history.length || !history[0].blob) return errorPage(withPath, `no such file: ${path.join("/")}`);
     if (isBinary(history[0].blob)) return errorPage(withPath, "cannot blame a binary file");
     const result = blame(history);
@@ -1964,37 +2074,37 @@ ${rows}
     return htmlResponse(layout({ ...withPath, body }));
   }
 
-  private async plainPage(h: string | undefined, path: string[]): Promise<Response> {
-    const rr = await this.resolveRef(h);
+  private async plainPage(h: string | undefined, path: string[], gate?: ReadGate): Promise<Response> {
+    const rr = await this.resolveRef(h, gate);
     if (!rr) return new Response("not found\n", { status: 404 });
-    const head = await this.peelToCommit(rr.oid);
+    const head = await this.peelToCommit(rr.oid, gate);
     if (!head) return new Response("not found\n", { status: 404 });
-    const found = await this.lookupPath(head.commit.tree, path);
+    const found = await this.lookupPath(head.commit.tree, path, gate);
     if (!found || found.kind !== "blob") return new Response("not found\n", { status: 404 });
-    const obj = await this.store.get(found.entry.oid);
+    const obj = await this.store.get(found.entry.oid, gate);
     if (!obj) return new Response("not found\n", { status: 404 });
     return rawBlobResponse(obj.data, path[path.length - 1] ?? "");
   }
 
-  private async blobByIdPage(id: string): Promise<Response> {
-    const oid = await this.resolveServable(id);
+  private async blobByIdPage(id: string, gate?: ReadGate): Promise<Response> {
+    const oid = await this.resolveServable(id, gate);
     if (!oid) return new Response("not found\n", { status: 404 });
-    const obj = await this.store.get(oid);
+    const obj = await this.store.get(oid, gate);
     if (!obj || obj.type !== "blob") return new Response("not a blob\n", { status: 404 });
     return rawBlobResponse(obj.data, "");
   }
 
-  private async commitPage(repo: string, id: string | undefined, h: string | undefined): Promise<Response> {
+  private async commitPage(repo: string, id: string | undefined, h: string | undefined, gate?: ReadGate): Promise<Response> {
     const r = `/${repoUrl(repo)}`;
-    const base = await this.base(repo, "commit", h, `${r}/commit/`);
-    const oid = await this.resolveCommitId(id, h);
+    const base = await this.base(repo, "commit", h, `${r}/commit/`, gate);
+    const oid = await this.resolveCommitId(id, h, gate);
     if (!oid) return errorPage(base, "commit not found");
-    const commit = await this.loadCommit(oid);
+    const commit = await this.loadCommit(oid, gate);
     if (!commit) return errorPage(base, `commit not found: ${oid}`);
 
-    const parent = commit.parents[0] ? await this.loadCommit(commit.parents[0]) : null;
-    const { files, truncated } = await this.computeDiff(parent?.tree ?? null, commit.tree);
-    const deco = await this.decorations(repo);
+    const parent = commit.parents[0] ? await this.loadCommit(commit.parents[0], gate) : null;
+    const { files, truncated } = await this.computeDiff(parent?.tree ?? null, commit.tree, gate);
+    const deco = await this.decorations(repo, gate);
 
     const body = `
 <table class='commit-info'>
@@ -2011,30 +2121,37 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private async resolveCommitId(id: string | undefined, h: string | undefined): Promise<string | null> {
+  private async resolveCommitId(id: string | undefined, h: string | undefined, gate?: ReadGate): Promise<string | null> {
     if (id) {
-      const full = await this.resolveServable(id);
-      return full ? (await this.peelToCommit(full))?.oid ?? null : null;
+      const full = await this.resolveServable(id, gate);
+      return full ? (await this.peelToCommit(full, gate))?.oid ?? null : null;
     }
-    const rr = await this.resolveRef(h);
-    return rr ? (await this.peelToCommit(rr.oid))?.oid ?? null : null;
+    const rr = await this.resolveRef(h, gate);
+    return rr ? (await this.peelToCommit(rr.oid, gate))?.oid ?? null : null;
   }
 
   /** diff/rawdiff: changes id2..id (default id2 = first parent of id). */
-  private async diffPage(repo: string, id: string | undefined, id2: string | undefined, h: string | undefined, raw: boolean): Promise<Response> {
-    const base = await this.base(repo, "diff", h, `/${repoUrl(repo)}/diff/`);
-    const newOid = await this.resolveCommitId(id, h);
+  private async diffPage(
+    repo: string,
+    id: string | undefined,
+    id2: string | undefined,
+    h: string | undefined,
+    raw: boolean,
+    gate?: ReadGate
+  ): Promise<Response> {
+    const base = await this.base(repo, "diff", h, `/${repoUrl(repo)}/diff/`, gate);
+    const newOid = await this.resolveCommitId(id, h, gate);
     if (!newOid) return raw ? new Response("not found\n", { status: 404 }) : errorPage(base, "commit not found");
-    const commit = (await this.loadCommit(newOid))!;
+    const commit = (await this.loadCommit(newOid, gate))!;
     let oldOid: string | null = null;
     if (id2) {
-      oldOid = await this.resolveCommitId(id2, undefined);
+      oldOid = await this.resolveCommitId(id2, undefined, gate);
       if (!oldOid) return raw ? new Response("bad id2\n", { status: 404 }) : errorPage(base, `bad id2: ${id2}`);
     } else {
       oldOid = commit.parents[0] ?? null;
     }
-    const oldCommit = oldOid ? await this.loadCommit(oldOid) : null;
-    const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, commit.tree);
+    const oldCommit = oldOid ? await this.loadCommit(oldOid, gate) : null;
+    const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, commit.tree, gate);
     if (raw) {
       return new Response(this.renderRawDiff(files), { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
@@ -2045,12 +2162,12 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
   }
 
   /** git-format-patch style output, applies with `git am`. */
-  private async patchPage(repo: string, id: string | undefined, h: string | undefined): Promise<Response> {
-    const oid = await this.resolveCommitId(id, h);
+  private async patchPage(repo: string, id: string | undefined, h: string | undefined, gate?: ReadGate): Promise<Response> {
+    const oid = await this.resolveCommitId(id, h, gate);
     if (!oid) return new Response("not found\n", { status: 404 });
-    const commit = (await this.loadCommit(oid))!;
-    const parent = commit.parents[0] ? await this.loadCommit(commit.parents[0]) : null;
-    const { files } = await this.computeDiff(parent?.tree ?? null, commit.tree);
+    const commit = (await this.loadCommit(oid, gate))!;
+    const parent = commit.parents[0] ? await this.loadCommit(commit.parents[0], gate) : null;
+    const { files } = await this.computeDiff(parent?.tree ?? null, commit.tree, gate);
     const bodyText = commit.message.split("\n").slice(1).join("\n").trim();
     let statLines = "";
     let totalAdd = 0, totalDel = 0;
@@ -2075,13 +2192,13 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
     return new Response(patch, { headers: { "content-type": "text/plain; charset=utf-8" } });
   }
 
-  private async tagPage(repo: string, name: string | undefined): Promise<Response> {
+  private async tagPage(repo: string, name: string | undefined, gate?: ReadGate): Promise<Response> {
     const r = `/${repoUrl(repo)}`;
-    const base = await this.base(repo, "refs", undefined, `${r}/refs/`);
+    const base = await this.base(repo, "refs", undefined, `${r}/refs/`, gate);
     if (!name) return errorPage(base, "no tag given");
-    const target = this.store.getRef(`refs/tags/${name}`) ?? (await this.resolveServable(name));
+    const target = this.store.getRef(`refs/tags/${name}`) ?? (await this.resolveServable(name, gate));
     if (!target) return errorPage(base, `tag not found: ${name}`);
-    const obj = await this.store.get(target);
+    const obj = await this.store.get(target, gate);
     if (!obj) return errorPage(base, `missing object`);
     let body: string;
     if (obj.type === "tag") {
@@ -2104,7 +2221,7 @@ ${tag.tagger ? `<tr><th>tag date</th><td>${fmtDate(tag.tagger.time, tag.tagger.t
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private async snapshotPage(repo: string, filename: string): Promise<Response> {
+  private async snapshotPage(repo: string, filename: string, gate?: ReadGate): Promise<Response> {
     let format: "tar.gz" | "zip";
     let stem: string;
     if (filename.endsWith(".tar.gz")) {
@@ -2126,20 +2243,25 @@ ${tag.tagger ? `<tr><th>tag date</th><td>${fmtDate(tag.tagger.time, tag.tagger.t
     for (const c of [...candidates]) candidates.push(`v${c}`);
     let commit: { oid: string; commit: Commit } | null = null;
     for (const cand of candidates) {
-      const rr = await this.resolveRef(cand);
+      const rr = await this.resolveRef(cand, gate);
       if (rr) {
-        commit = await this.peelToCommit(rr.oid);
+        commit = await this.peelToCommit(rr.oid, gate);
         if (commit) break;
       }
     }
     if (!commit) return new Response(`no ref matches snapshot name: ${stem}\n`, { status: 404 });
 
     const flat = new Map<string, { oid: string; mode: string }>();
-    await this.flattenTree(commit.commit.tree, "", flat);
+    await this.flattenTree(commit.commit.tree, "", flat, gate);
     const files: SnapshotFile[] = [];
     let total = 0;
     for (const [path, info] of flat) {
-      const obj = await this.store.get(info.oid);
+      // under the page's content lease this read cannot name a reclaimed pack
+      // (the lease blocks the RETIRED→RECLAIMABLE flip), so the missing-object
+      // skip below is reachable only for genuinely broken refs — never as the
+      // silent partial-archive a mid-render GC delete used to be able to
+      // produce (the M3.2 record's known gap)
+      const obj = await this.store.get(info.oid, gate);
       if (!obj) continue;
       total += obj.data.length;
       if (total > MAX_SNAPSHOT_BYTES) {
@@ -2164,10 +2286,10 @@ ${tag.tagger ? `<tr><th>tag date</th><td>${fmtDate(tag.tagger.time, tag.tagger.t
     });
   }
 
-  private async atomPage(repo: string, host: string, proto: string, h: string | undefined): Promise<Response> {
-    const rr = await this.resolveRef(h);
+  private async atomPage(repo: string, host: string, proto: string, h: string | undefined, gate?: ReadGate): Promise<Response> {
+    const rr = await this.resolveRef(h, gate);
     if (!rr) return new Response("empty repository\n", { status: 404 });
-    const { entries } = await this.walkLog(rr.oid, 0, 20);
+    const { entries } = await this.walkLog(rr.oid, 0, 20, {}, gate);
     const abs = `${proto}://${host}/${repoUrl(repo)}`;
     const iso = (t: number) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
     const updated = entries[0] ? iso(entries[0].commit.committer.time) : iso(0);
@@ -2204,11 +2326,12 @@ ${items}
    */
   private async computeStats(
     tipOid: string,
-    period: string
+    period: string,
+    gate?: ReadGate
   ): Promise<{ periodKeys: string[]; authors: { name: string; counts: Record<string, number> }[]; totals: Record<string, number>; count: number }> {
     const cached = this.store.getStatsCache(tipOid, period);
     if (cached) return JSON.parse(cached);
-    const { entries } = await this.walkLog(tipOid, 0, MAX_STATS_SCAN);
+    const { entries } = await this.walkLog(tipOid, 0, MAX_STATS_SCAN, {}, gate);
     const keyOf = (t: number): string => {
       const d = new Date(t * 1000);
       if (period === "y") return String(d.getUTCFullYear());
@@ -2246,12 +2369,12 @@ ${items}
     return result;
   }
 
-  private async statsPage(repo: string, h: string | undefined, period: string): Promise<Response> {
+  private async statsPage(repo: string, h: string | undefined, period: string, gate?: ReadGate): Promise<Response> {
     const r = `/${repoUrl(repo)}`;
-    const base = await this.base(repo, "stats", h, `${r}/stats/`);
-    const rr = await this.resolveRef(h);
+    const base = await this.base(repo, "stats", h, `${r}/stats/`, gate);
+    const rr = await this.resolveRef(h, gate);
     if (!rr) return errorPage(base, "empty repository");
-    const agg = await this.computeStats(rr.oid, period);
+    const agg = await this.computeStats(rr.oid, period, gate);
 
     const cols = agg.periodKeys.slice(0, 8);
     const authors = agg.authors

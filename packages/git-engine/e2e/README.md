@@ -156,5 +156,15 @@ and the real `RepoCell` RPC surface.
 
 ```bash
 TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
-node "$TSX" packages/git-engine/e2e/check-read-leases.mjs   # 20 checks
+node "$TSX" packages/git-engine/e2e/check-read-leases.mjs   # 25 checks
 ```
+
+The five CONTENT checks are the content-path coverage that closes the M3.2
+as-built record's known gap (reads OUTSIDE the two upload-pack arms):
+`readBlob` acquires and releases the read lease around the read (counting
+stub), a concurrent GC pass at the R2 seam is flip-blocked by the live lease
+(§6.6) and a drained pack reclaims only after release (the post-reclaim read
+refuses whole), a lease past its renew margin plus a mid-renewal reclaim
+rejects the gate and fails the RPC whole (fault A/C, never a partial answer),
+ls-refs peels and `listRefs` peels run under one lease, and a loose-only repo
+(empty catalog) stays guard-free.

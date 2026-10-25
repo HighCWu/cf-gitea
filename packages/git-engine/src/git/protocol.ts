@@ -390,7 +390,16 @@ function knownIgnorable(command: "fetch" | "ls-refs" | null, line: string): bool
   );
 }
 
-async function lsRefs(store: GitStore, req: UploadRequest): Promise<Uint8Array> {
+/**
+ * Serve one v2 ls-refs request. `gate` (SPEC-0011 §3 as applied to the content
+ * path) reaches the peel's tag-object reads: a `peel` ls-refs is a COMPLETE
+ * served response, so its reads run under the caller's content read lease —
+ * the M3.2 as-built record's "ls-refs peels" gap. A GC transition mid-peel
+ * either finds the lease live (the tag object is still readable) or the peel's
+ * R2 read throws and the whole ls-refs response dies — never a silently
+ * peeled-less reply (the wrong-partial a missing `peeled:` line would be).
+ */
+async function lsRefs(store: GitStore, req: UploadRequest, gate?: ReadGate): Promise<Uint8Array> {
   const lines: Uint8Array[] = [];
   const head = store.resolveHead();
   if (head) lines.push(pkt(`${head} HEAD${req.caps.has("symrefs") ? ` symref-target:${store.head()}` : ""}\n`));
@@ -399,7 +408,7 @@ async function lsRefs(store: GitStore, req: UploadRequest): Promise<Uint8Array> 
     // the peel resolves through the refs row's peeled column (cached at first
     // peel), so ls-refs no longer re-walks tag objects per request
     if (req.caps.has("peel") && ref.name.startsWith("refs/tags/") && store.typeAndSize(ref.oid)?.type === "tag") {
-      const oid = await store.peeledRefTarget(ref.name, ref.oid);
+      const oid = await store.peeledRefTarget(ref.name, ref.oid, gate);
       if (oid) peeled = ` peeled:${oid}`;
     }
     lines.push(pkt(`${ref.oid} ${ref.name}${peeled}\n`));
@@ -407,10 +416,14 @@ async function lsRefs(store: GitStore, req: UploadRequest): Promise<Uint8Array> 
   return concat([...lines, FLUSH]);
 }
 
-/** Follow tag objects down to the underlying commit oid (or null). */
-async function peelToCommitOid(store: GitStore, oid: string): Promise<string | null> {
+/** Follow tag objects down to the underlying commit oid (or null). `gate`
+ * reaches the object reads when the caller serves under a lease (latestCommitTime
+ * on the content path); plan-construction callers pass none — their posture is
+ * the reviewed plan-construction-phase argument (a flip degrades the peel to
+ * null, which every caller handles as skip/reject, never as data). */
+async function peelToCommitOid(store: GitStore, oid: string, gate?: ReadGate): Promise<string | null> {
   for (let i = 0; i < 10; i++) {
-    const obj = await store.get(oid);
+    const obj = await store.get(oid, gate);
     if (!obj) return null;
     if (obj.type === "commit") return oid;
     if (obj.type === "tag") {
@@ -427,8 +440,14 @@ async function peelToCommitOid(store: GitStore, oid: string): Promise<string | n
  * peeled through annotated tags to its commit and its committer time taken;
  * non-commit tips are ignored, parse errors skipped. Falls back to Date.now()
  * when the repo holds no commits. Committer time is unix seconds, so ×1000.
+ *
+ * `gate` covers the peel reads when the caller is a served content read (the
+ * config endpoint's header, repo.ts) — the content lease keeps the tip objects
+ * readable for the whole scan. Uncovered callers (the commit/merge landings)
+ * keep the skip-on-null posture: a mid-read flip degrades the echoed timestamp,
+ * never the landing itself.
  */
-export async function latestCommitTime(store: GitStore): Promise<number> {
+export async function latestCommitTime(store: GitStore, gate?: ReadGate): Promise<number> {
   const tips = new Set<string>();
   const head = store.resolveHead();
   if (head) tips.add(head);
@@ -436,9 +455,9 @@ export async function latestCommitTime(store: GitStore): Promise<number> {
   let max = 0;
   for (const tip of tips) {
     try {
-      const oid = await peelToCommitOid(store, tip);
+      const oid = await peelToCommitOid(store, tip, gate);
       if (!oid) continue;
-      const obj = await store.get(oid);
+      const obj = await store.get(oid, gate);
       if (obj?.type !== "commit") continue;
       const t = parseCommit(obj.data).committer.time;
       if (t > max) max = t;
@@ -686,13 +705,14 @@ async function collectPackOids(
  * R2 read through serveReadGate's per-segment gate; release fires on finish,
  * error and cancel — never on the HTTP response lifetime. Everything is
  * synchronous here: the DO reads its own SQLite in its own serialized control
- * domain. Exported alongside serveReadGate for the serve-path checks. */
+ * domain. Exported alongside serveReadGate for the serve-path checks and for
+ * the content-path wrapper (repo.ts) — one lease shape everywhere. */
 export interface PlanLeaseState {
   planId: string;
   expiresAt: number;
 }
 
-function openPlanLease(store: GitStore, plan: PlanFetchResult): PlanLeaseState | null {
+export function openPlanLease(store: GitStore, plan: PlanFetchResult): PlanLeaseState | null {
   if (plan.tag === "rejected") throw new Error(`fetch plan rejected: ${plan.reason}`);
   return plan.planId ? { planId: plan.planId, expiresAt: plan.expiresAt } : null;
 }
@@ -733,7 +753,9 @@ export function serveReadGate(store: GitStore, lease: PlanLeaseState | null): Re
   };
 }
 
-function releasePlanLease(store: GitStore, lease: PlanLeaseState | null): void {
+/** Release the plan's read lease. Exported for the content-path wrapper
+ * (repo.ts) and the checks — release is idempotent (read-leases.ts). */
+export function releasePlanLease(store: GitStore, lease: PlanLeaseState | null): void {
   if (lease) releaseReadLease(store, lease.planId);
 }
 
@@ -769,7 +791,19 @@ export async function uploadPack(
   }
   if (req.command === "ls-refs") {
     release();
-    return new Response(await lsRefs(store, req) as unknown as BodyInit, { headers });
+    // SPEC-0011 §3 content-path coverage (the M3.2 as-built record's known
+    // gap): an ls-refs with `peel` reads tag objects — a COMPLETE served
+    // response, so its reads run under their own short-lived plan-style lease.
+    // A concurrent RETIRED→RECLAIMABLE flip mid-response finds the lease live
+    // and is blocked; a rejection (irreversible reclaim, expiry) throws and
+    // the response dies whole — never a silently peeled-less advertisement.
+    const lease = openPlanLease(store, planFetch(store, { generation: store.refsVersion() }));
+    const gate = serveReadGate(store, lease);
+    try {
+      return new Response(await lsRefs(store, req, gate) as unknown as BodyInit, { headers });
+    } finally {
+      releasePlanLease(store, lease);
+    }
   }
   const v2 = req.command === "fetch";
   if (!req.wants.length || req.wants.some((w) => !isOid(w))) {

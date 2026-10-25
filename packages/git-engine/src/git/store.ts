@@ -550,8 +550,14 @@ export class GitStore {
    * non-ref peel): follows tag objects down to the commit, caching the answer
    * on the refs row when the oid is a current ref tip. null when the object
    * chain does not reach a commit.
+   *
+   * `gate` (SPEC-0011 §3 content-path coverage) reaches the tag-object reads
+   * when the caller serves under a read lease (listRefs, ls-refs peels,
+   * advertisedOids' want-validation is a plan-construction caller and passes
+   * none — a flip there degrades the peel to null, which the caller rejects
+   * on, never silently serves).
    */
-  async peeledRefTarget(name: string, oid: string): Promise<string | null> {
+  async peeledRefTarget(name: string, oid: string, gate?: ReadGate): Promise<string | null> {
     const rows = this.sql.exec<{ oid: string; peeled: string | null }>(
       "SELECT oid, peeled FROM refs WHERE name = ?",
       name
@@ -563,7 +569,7 @@ export class GitStore {
     }
     let cur = oid;
     for (let i = 0; i < 10; i++) {
-      const obj = await this.get(cur);
+      const obj = await this.get(cur, gate);
       if (!obj) return null;
       if (obj.type === "commit") {
         if (cur !== oid && rows[0]) this.setRefPeeled(name, oid, cur);

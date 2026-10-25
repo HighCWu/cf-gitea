@@ -32,6 +32,14 @@
 //         margin, rejected renewal terminates without the success tail.
 //   RPC   the real RepoCell surface (shimmed DO base): planCloneStream miss /
 //         leased (+ cache payload), renewAndAuthorizeRead, releaseReadLease.
+//   CONTENT the content-path coverage (closes the M3.2 as-built record's known
+//         gap — reads OUTSIDE the two upload-pack arms): readBlob acquires +
+//         releases the lease around the read (counting stub); a concurrent GC
+//         pass at the R2 seam is flip-blocked by the live lease (§6.6) and the
+//         drained drain reclaims after release (post-reclaim read refuses
+//         whole); fault A/C — a lease aged into the margin + a mid-read
+//         reclaim rejects the gate and fails the RPC whole; ls-refs peels and
+//         listRefs peels run under one lease; loose-only repos stay guard-free.
 const { DatabaseSync } = await import("node:sqlite");
 const { register } = await import("node:module");
 
@@ -572,6 +580,261 @@ await check("RepoCell RPCs: planCloneStream miss/leased, renewAndAuthorizeRead, 
 
   assertEq((await cell.releaseReadLease(plan.planId)).tag, "released", "RPC release");
   assertEq(readLeaseRows(t).length, 0, "row gone after the RPC release");
+});
+
+// ---------------------------------------------------------------------------
+// Content-path coverage (SPEC-0011 §3 outside the two upload-pack arms —
+// closes the gap the M3.2 as-built record named: "content-path reads outside
+// upload-pack (UI blobs, ls-refs peels) remain lease-free"). The typed content
+// RPCs (readBlob et al) and the ls-refs arm run under `withContentLease` /
+// the ls-refs lease: planFetch over the readable catalog + the M3.2 per-read
+// gate, released at completion.
+// ---------------------------------------------------------------------------
+
+const PACK_S = "pack-" + "s".repeat(40); // the active successor (the premise terminus)
+const { deflateSync } = await import("node:zlib");
+const { serializeTag, emptyTree } = await import("../src/commit/serialize.ts");
+
+/**
+ * A fixture repo whose BLOB is genuinely R2-backed: the index row names PACK_A
+ * and the (still-compressed) region bytes exist only in the stub bucket —
+ * a content read of it must cross the gated R2 seam. Commit/tree stay loose
+ * (SQLite reads — no gate). PACK_A is RETIRED with an ACTIVE successor PACK_S
+ * (a fabricated compaction publish), so the GC flip's successor premise
+ * VERIFIES and the flip decision actually reaches the lease gate.
+ */
+function seedContentRepo(t) {
+  const body = Buffer.from(`content-path fixture payload ${"x".repeat(512)}`);
+  const region = deflateSync(body);
+  const oid = hashObject("blob", new Uint8Array(body));
+  t.store.packs.putRows(PACK_A, [
+    { oid, offset: 0, dataOff: 0, dataLen: region.length, type: "blob", size: body.length, entrySize: region.length, baseOid: null, crc32: 0 },
+  ]);
+  t.store.packs.recordPack(PACK_A, region.length, 256);
+  const tree = serializeTree([{ mode: "100644", oid, name: "f.txt" }]);
+  t.store.put(tree.oid, "tree", tree.data);
+  const person = { name: "t", email: "t@t", time: 1700000000000, tz: "+0000" };
+  const commit = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "content fixture" });
+  t.store.put(commit.oid, "commit", commit.data);
+  t.store.setRef("refs/heads/main", commit.oid);
+  t.store.setHead("refs/heads/main");
+  t.store.packs.recordPack(PACK_S, 4096, 256);
+  t.store.sql.exec("UPDATE pack_catalog SET state = 'retired', superseded_by = ? WHERE pack_key = ?", PACK_S, PACK_A);
+  return { oid, body, region, commit };
+}
+
+/** An R2 bucket stub serving the packed region; `onGet` runs at the seam
+ * (after the gate, "during" the R2 read) — the concurrent-GC hook. */
+function stubBucket(region, onGet) {
+  const deleted = [];
+  return {
+    deleted,
+    get: async () => {
+      if (onGet) await onGet();
+      return { arrayBuffer: async () => region.buffer.slice(region.byteOffset, region.byteOffset + region.length) };
+    },
+    delete: async (keys) => {
+      deleted.push(...keys);
+    },
+    list: async () => ({ objects: [], truncated: false }),
+  };
+}
+
+/** A RepoCell over the store with the stub bucket bound (rpcBind's name
+ * source is meta.repo — set here the way the first fetch() would). */
+function contentCell(t, bucket) {
+  const { RepoCell } = RepoCellModule;
+  const cell = new RepoCell(
+    { storage: { sql: t.sql, transactionSync: (fn) => fn(), setAlarm: () => Promise.resolve() } },
+    {}
+  );
+  cell.env = { REPO_PACKS: bucket };
+  cell.ctx = { storage: { transactionSync: (fn) => fn(), setAlarm: () => Promise.resolve() } };
+  t.store.setMeta("repo", "r0");
+  return cell;
+}
+
+// lazy: repo.ts (and its DurableObject base) is imported once, below
+let RepoCellModule;
+
+await check("content path: readBlob acquires + releases the read lease around the read (counting stub)", async () => {
+  RepoCellModule = await import("../src/repo.ts");
+  const t = makeT();
+  const fx = seedContentRepo(t);
+  const cell = contentCell(t, stubBucket(fx.region));
+  const events = [];
+  const origCreate = cell.store.createLease.bind(cell.store);
+  const origDelete = cell.store.deleteLease.bind(cell.store);
+  cell.store.createLease = (tok, kind, exp, payload) => {
+    events.push(`create:${kind}`);
+    origCreate(tok, kind, exp, payload);
+  };
+  cell.store.deleteLease = (tok) => {
+    events.push("delete");
+    origDelete(tok);
+  };
+  const blob = await cell.readBlob("main", "f.txt");
+  assert(blob !== null, "blob served");
+  assertEq(Buffer.from(blob.data).toString(), fx.body.toString(), "blob bytes intact through the gated seam");
+  assertEq(events, ["create:read", "delete"], "exactly one read lease: acquired before, released at completion");
+  assertEq(readLeaseRows(t).length, 0, "nothing left at the end — GC is decoupled from the response lifetime");
+});
+
+await check("content path vs concurrent GC: a RETIRED pack being read is flip-blocked — the read succeeds whole", async () => {
+  const t = makeT();
+  const fx = seedContentRepo(t);
+  let midReadGc = null;
+  const bucket = stubBucket(fx.region, async () => {
+    // the concurrent GC pass lands AT the R2 seam, mid-read: the content
+    // lease is live, so the RETIRED→RECLAIMABLE flip must be blocked
+    midReadGc = await cell.gcNow();
+  });
+  const cell = contentCell(t, bucket);
+  const blob = await cell.readBlob("main", "f.txt");
+  assert(blob !== null, "the read completed despite the concurrent GC pass");
+  assertEq(Buffer.from(blob.data).toString(), fx.body.toString(), "bytes intact — never a torn read");
+  assert(midReadGc !== null, "the GC pass ran mid-read");
+  assertEq(midReadGc.tag, "collected", "the pass ran");
+  assertEq(midReadGc.flippedToReclaimable, [], "§6.6 GC isolation: the live lease blocked the flip");
+  assert(midReadGc.blockedByLeases.includes(PACK_A), `the pack is lease-blocked: ${JSON.stringify(midReadGc.blockedByLeases)}`);
+  assertEq(t.store.packs.catalogStateOf(PACK_A), "retired", "still retired (still in the readable set)");
+  assertEq(readLeaseRows(t).length, 0, "the lease released at completion");
+  // drain: with no reader left the pass flips, deletes (R2 ack first) and removes
+  const drained = await cell.gcNow();
+  assertEq(drained.flippedToReclaimable, [PACK_A], "the drain flips the drained pack");
+  assertEq(drained.deleted, [PACK_A], "the drain reclaims it (delete ack, then row)");
+  // post-reclaim content read: a whole "not found" refusal, never partial bytes.
+  // A FRESH cell (a new request): the previous read's in-memory object cache
+  // legitimately still holds the content it read under the lease — immutable
+  // objects, no staleness — so the storage-level refusal is asserted cold.
+  const fresh = contentCell(t, stubBucket(new Uint8Array(0)));
+  const after = await fresh.readBlob("main", "f.txt");
+  assertEq(after, null, "post-reclaim read refuses whole (the object is genuinely gone)");
+});
+
+await check("content path fault A/C: lease past its renew margin + mid-renewal reclaim → the gate REJECTS, the RPC fails whole", async () => {
+  const t = makeT();
+  const fx = seedContentRepo(t);
+  const cell = contentCell(t, stubBucket(fx.region));
+  // Fault A's shape is a delayed DO: after the lease row lands, the clock
+  // jumps 40 s — the in-memory confirmed expiry (now+60s at registration)
+  // crosses the 30 s renew margin, so the first gated read must renew INLINE
+  // before it starts. (The skew activates AFTER registration, so the confirmed
+  // expiry stays a real now+60s: exactly the stall the fault describes.)
+  const realNow = Date.now;
+  let skewInstalled = false;
+  const origCreate = cell.store.createLease.bind(cell.store);
+  cell.store.createLease = (tok, kind, exp, payload) => {
+    origCreate(tok, kind, exp, payload);
+    if (!skewInstalled) {
+      skewInstalled = true;
+      Date.now = () => realNow() + 40_000;
+    }
+  };
+  // the renewal's lease lookup flips the pack first: fault C's never-grant-both
+  let flipped = false;
+  const origGetLease = cell.store.getLease.bind(cell.store);
+  cell.store.getLease = (tok) => {
+    if (!flipped) {
+      flipped = true;
+      t.store.sql.exec("UPDATE pack_catalog SET state = 'reclaimable' WHERE pack_key = ?", PACK_A);
+    }
+    return origGetLease(tok);
+  };
+  let threw = "";
+  try {
+    await cell.readBlob("main", "f.txt");
+  } catch (err) {
+    threw = err instanceof Error ? err.message : String(err);
+  } finally {
+    Date.now = realNow;
+  }
+  assert(skewInstalled, "the lease row was registered (the skew window opened)");
+  assert(/read lease rejected/.test(threw), `the gate's rejection failed the request whole: ${threw}`);
+  assert(/no longer readable/.test(threw), `RECLAIMABLE is irreversible — renewal refused: ${threw}`);
+  assertEq(readLeaseRows(t).length, 0, "the abandoned lease was released (the wrapper's finally)");
+});
+
+await check("content path: ls-refs peels and listRefs peels run under the lease (the M3.2 record's ls-refs-peels gap)", async () => {
+  const t = makeT();
+  // annotated-tag fixture: commit + tag loose, catalog non-empty (a real plan)
+  const person = { name: "t", email: "t@t", time: 1700000000000, tz: "+0000" };
+  const tree = emptyTree();
+  t.store.put(tree.oid, "tree", tree.data);
+  const commit = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "tag fixture" });
+  t.store.put(commit.oid, "commit", commit.data);
+  const tag = serializeTag({ object: commit.oid, type: "commit", tag: "v1", tagger: person, message: "one" });
+  t.store.put(tag.oid, "tag", tag.data);
+  t.store.setRef("refs/heads/main", commit.oid);
+  t.store.setRef("refs/tags/v1", tag.oid);
+  t.store.setHead("refs/heads/main");
+  t.store.packs.recordPack(PACK_A, 4096, 256);
+
+  // the ls-refs arm: one lease around the whole response, peel served
+  const pkt = (s) => Buffer.from((s.length + 4).toString(16).padStart(4, "0") + s);
+  const req = Buffer.concat([pkt("command=ls-refs"), Buffer.from("0001"), pkt("peel"), pkt("symrefs"), Buffer.from(FLUSH_BYTES)]);
+  const events = [];
+  const origCreate = t.store.createLease.bind(t.store);
+  const origDelete = t.store.deleteLease.bind(t.store);
+  t.store.createLease = (tok, kind, exp, payload) => {
+    events.push(`create:${kind}`);
+    origCreate(tok, kind, exp, payload);
+  };
+  t.store.deleteLease = (tok) => {
+    events.push("delete");
+    origDelete(tok);
+  };
+  const res = await uploadPack(t.store, req);
+  const text = new TextDecoder().decode(await drain(res));
+  assert(text.includes(` peeled:${commit.oid}`), `the peel line is served: ${text.split("\n").find((l) => l.includes("refs/tags/"))}`);
+  assertEq(events, ["create:read", "delete"], "ls-refs took and released exactly one read lease");
+
+  // the typed RPC arm (listRefs — the worker serveHead/mirror/imports peel path)
+  events.length = 0;
+  const cell = contentCell(t, stubBucket(new Uint8Array(0)));
+  const cellOrigCreate = cell.store.createLease.bind(cell.store);
+  const cellOrigDelete = cell.store.deleteLease.bind(cell.store);
+  cell.store.createLease = (tok, kind, exp, payload) => {
+    events.push(`create:${kind}`);
+    cellOrigCreate(tok, kind, exp, payload);
+  };
+  cell.store.deleteLease = (tok) => {
+    events.push("delete");
+    cellOrigDelete(tok);
+  };
+  const refs = await cell.listRefs();
+  const tagEntry = refs.refs.find((r) => r.name === "refs/tags/v1");
+  assert(tagEntry && tagEntry.peeled === commit.oid, "listRefs peels the annotated tag");
+  assertEq(events, ["create:read", "delete"], "listRefs took and released exactly one read lease");
+});
+
+await check("content path: loose-only repo (empty catalog) takes no lease and no gate — guard-free", async () => {
+  const t = makeT(); // no catalog rows: planFetch short-circuits
+  const person = { name: "t", email: "t@t", time: 1700000000000, tz: "+0000" };
+  const blob = te.encode("loose-only blob");
+  const oid = hashObject("blob", blob);
+  t.store.put(oid, "blob", blob);
+  const tree = serializeTree([{ mode: "100644", oid, name: "f.txt" }]);
+  t.store.put(tree.oid, "tree", tree.data);
+  const commit = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "loose fixture" });
+  t.store.put(commit.oid, "commit", commit.data);
+  t.store.setRef("refs/heads/main", commit.oid);
+  t.store.setHead("refs/heads/main");
+  const cell = contentCell(t, stubBucket(new Uint8Array(0)));
+  const events = [];
+  const origCreate = cell.store.createLease.bind(cell.store);
+  const origDelete = cell.store.deleteLease.bind(cell.store);
+  cell.store.createLease = (tok, kind, exp, payload) => {
+    events.push(`create:${kind}`);
+    origCreate(tok, kind, exp, payload);
+  };
+  cell.store.deleteLease = (tok) => {
+    events.push("delete");
+    origDelete(tok);
+  };
+  const out = await cell.readBlob("main", "f.txt");
+  assert(out !== null && Buffer.from(out.data).toString() === "loose-only blob", "served guard-free");
+  assertEq(events, [], "nothing R2-backed exists — no lease row, no gate");
 });
 
 // ---------------------------------------------------------------------------
