@@ -39,8 +39,11 @@
  * cap, rerun with a smaller --window.
  */
 
+/* global fetch, setTimeout -- Web globals provided by Node >= 18 (no node: module exports them) */
 import { execFile } from "node:child_process";
+import console from "node:console";
 import { createHash } from "node:crypto";
+import process from "node:process";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);

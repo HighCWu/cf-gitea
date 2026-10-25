@@ -165,7 +165,7 @@ export function parseEngineRoute(pathname: string, method: string): EngineRoute 
   const rawTail = segments.slice(3).join("/");
   if (rawTail === "") return method === "DELETE" ? { owner, repo, kind: "admin" } : null;
 
-  let decodedTail: string | null = null;
+  let decodedTail: string | null;
   try {
     decodedTail = decodeURIComponent(rawTail);
   } catch {

@@ -94,8 +94,9 @@ async function findPathOfOid(
   return walk(entries, "");
 }
 
-/** The prefix-match refs read shared by the openapi route + the catchall. */
-async function gitRefsFiltered(c: Context<ApiEnv>, owner: string, repo: string, ref: string): Promise<Response> {
+/** The prefix-match refs read shared by the openapi route + the catchall —
+ *  returns the union payload; callers serialize it with their own c.json. */
+async function gitRefsFiltered(c: Context<ApiEnv>, owner: string, repo: string, ref: string): Promise<Reference | Reference[]> {
   const pair = await requireVisibleRepo(c, { owner, repo });
   const filter = "refs/" + ref;
   const refs = await engineReads(c.env, pair.repo).listRefs();
@@ -107,8 +108,7 @@ async function gitRefsFiltered(c: Context<ApiEnv>, owner: string, repo: string, 
   const tips = refTipMap(refs);
   const rendered = matched.map((entry) => toReference(entry.name, tips.get(entry.name) ?? { target: entry.target }, pair, origin));
   // the union quirk: a single exact match answers the bare object
-  const payload: Reference | Reference[] = rendered.length === 1 && matched[0]!.name === filter ? rendered[0]! : rendered;
-  return c.json(payload, 200);
+  return rendered.length === 1 && matched[0]!.name === filter ? rendered[0]! : rendered;
 }
 
 export function registerGitRoutes(
@@ -168,14 +168,9 @@ export function registerGitRoutes(
         404: notFoundResponse,
       },
     }),
-    (c) => {
+    async (c) => {
       const { owner, repo, ref } = c.req.valid("param");
-      // Union (single-bare-object | array) response: hono's typed helpers
-      // can't narrow z.union at this position — cast at the route boundary
-      // (the repoGetContentsList precedent).
-      return gitRefsFiltered(c, owner, repo, ref) as unknown as ReturnType<
-        typeof c.json<never>
-      >;
+      return c.json(await gitRefsFiltered(c, owner, repo, ref), 200);
     },
   );
 
@@ -316,9 +311,9 @@ export function registerGitRoutes(
 
   // Plain-hono catchall (outside the generated doc): the multi-segment ref
   // filter form (`git/refs/heads/main`) the one-param route cannot match.
-  app.get("/repos/:owner/:repo/git/refs/*", (c) => {
+  app.get("/repos/:owner/:repo/git/refs/*", async (c) => {
     const { owner, repo } = c.req.param();
     const rest = decodeURIComponent(c.req.path.slice(c.req.path.indexOf(`/${owner}/${repo}/git/refs/`) + `/${owner}/${repo}/git/refs/`.length));
-    return gitRefsFiltered(c, owner, repo, rest);
+    return c.json(await gitRefsFiltered(c, owner, repo, rest), 200);
   });
 }
