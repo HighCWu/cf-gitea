@@ -2000,3 +2000,350 @@ export const actionVariables = sqliteTable(
     index("action_variables_repo_id_idx").on(t.repoId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0004 appendix A — user blocks (inventory batch 9, wave-api-blocks).
+// ---------------------------------------------------------------------------
+
+/**
+ * User blocks (port of upstream `Blocking`, gitea/models/user/block.go:24-36,
+ * table `user_blocking`): `blocker_id` blocks `blockee_id`, the pair is
+ * UNIQUE (upstream `UNIQUE(block)`), and the blocker may be an organization
+ * (orgs ARE user rows, SPEC-0007 §3.2). Both edges cascade on the user row
+ * like the rest of the users-adjacent tables. `note` is the optional block
+ * note (upstream `Note string`; the API's `?note=` query param,
+ * routers/api/v1/user/block.go:62-65). `created_at` is unix seconds (repo
+ * convention) mirroring `CreatedUnix timeutil.TimeStamp xorm:"INDEX created"`;
+ * the extra blockee-side index serves `HasBlocking`'s
+ * `blockee_id = ? AND blocker_id IN (…)` probes (block.go:56-66) — upstream
+ * scans, we index (the follows reverse-index precedent).
+ */
+export const userBlocking = sqliteTable(
+  "user_blocking",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The blocking side — a user OR an organization id (block.go:24-31). */
+    blockerId: integer("blocker_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** The blocked side — always an individual (blocking an org is a 400,
+     *  services/user/block.go:97-99). */
+    blockeeId: integer("blockee_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    note: text("note").notNull().default(""),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's UNIQUE(block) (block.go:26,28).
+    uniqueIndex("user_blocking_block_uq").on(t.blockerId, t.blockeeId),
+    index("user_blocking_blockee_idx").on(t.blockeeId),
+    // Upstream's `CreatedUnix xorm:"INDEX created"` (block.go:31).
+    index("user_blocking_created_idx").on(t.createdAt),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Repo push mirrors (inventory batch 7, wave-api-push-mirrors — upstream
+// `PushMirror`, gitea/models/repo/pushmirror.go:17-28).
+// ---------------------------------------------------------------------------
+
+/**
+ * Push mirrors (port of upstream `PushMirror`, gitea/models/repo/
+ * pushmirror.go:17-28): N rows per repository — each row is one remote the
+ * repo pushes itself OUT to, the write-side twin of the 1:1 `repo_mirrors`
+ * (pull) table. Upstream's xorm table is `push_mirror` (PushMirrorsIterate's
+ * `Table("push_mirror")`); the plural name follows the `repo_mirrors`
+ * adaptation.
+ *
+ * `remote_name` is SERVER-GENERATED at insert ("remote_mirror_" + 10 crypto
+ * alphanumerics, routers/api/v1/repo/mirror.go CreatePushMirror — the client
+ * never names a push mirror; the {name} path param is an exact-match lookup
+ * against stored values), so no UNIQUE(repo_id, remote_name): upstream
+ * enforces none and the generated names collide with negligible probability.
+ * `remote_address` stores the SANITIZED target URL (userinfo stripped,
+ * util.SanitizeURL parity — the credential half lives in
+ * `credentials_ciphertext`, the same §4.2 AES-GCM envelope as the pull table,
+ * AAD-bound to `(row.id, repo_id)`); it is never echoed anywhere.
+ * `interval_seconds` 0 = push only on commit (upstream `Interval
+ * time.Duration` zero); `sync_on_commit` defaults true (upstream
+ * `xorm:"NOT NULL DEFAULT true"`). `last_update_unix`/`last_error` are the
+ * consumer's sync-status pair (UpdatePushMirrorSyncStatus). Upstream keeps
+ * the git remote in the repo's config (AddPushMirrorRemote) — cf-gitea has
+ * no git-config layer, so this row IS the record and the delete cascade to
+ * the stored credentials is simply the row delete (upstream
+ * RemovePushMirrorRemote parity).
+ */
+export const pushMirrors = sqliteTable(
+  "push_mirrors",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The mirroring repository's `repositories.id` (TEXT adaptation; MANY
+     *  rows per repo, upstream `RepoID int64 xorm:"INDEX"`). AAD half of the
+     *  credential envelope. */
+    repoId: text("repo_id").notNull(),
+    /** Server-generated "remote_mirror_<10 alphanumerics>" (upstream
+     *  `RemoteName`). */
+    remoteName: text("remote_name").notNull(),
+    /** Sanitized target URL — userinfo stripped (upstream stores
+     *  `util.SanitizeURL(option.RemoteAddress)` in `RemoteAddress
+     *  VARCHAR(2048)`). */
+    remoteAddress: text("remote_address").notNull(),
+    /** Also push on every commit (upstream `SyncOnCommit bool
+     *  xorm:"NOT NULL DEFAULT true"`). */
+    syncOnCommit: integer("sync_on_commit", { mode: "boolean" }).notNull().default(true),
+    /** Push cadence seconds; `0` = commit-triggered only (upstream
+     *  `Interval time.Duration`; validated ≥ 10 min unless 0). */
+    intervalSeconds: integer("interval_seconds").notNull().default(0),
+    /** Row creation (upstream `CreatedUnix timeutil.TimeStamp
+     *  xorm:"created"`). */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Last push attempt, success or failure (upstream `LastUpdateUnix
+     *  timeutil.TimeStamp xorm:"INDEX last_update"`); null until the first
+     *  sync (AsTimePtr → null last_update on the wire). */
+    lastUpdateUnix: integer("last_update_unix", { mode: "timestamp" }),
+    /** Last failure text, "" when clean (upstream `LastError string
+     *  xorm:"text"`). */
+    lastError: text("last_error").notNull().default(""),
+    /** Not secret; kept for the §3.1 parity with `repo_mirrors` (upstream
+     *  embeds it in the remote URL — we never do). */
+    credentialsUsername: text("credentials_username"),
+    /** AES-256-GCM over the full Authorization header value (§4.2), keyed by
+     *  the MIRROR_CREDENTIAL_KEY KEK, AAD-bound to `(row.id, repo_id)`. */
+    credentialsCiphertext: text("credentials_ciphertext"),
+  },
+  (t) => [
+    // Upstream's xorm INDEX tags (pushmirror.go:20,27).
+    index("push_mirrors_repo_id_idx").on(t.repoId),
+    index("push_mirrors_last_update_idx").on(t.lastUpdateUnix),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Project boards (the inventory batch `wave-api-projects-repo` — upstream
+// `Project`, gitea/models/project/project.go:85-107, `Column` (physical table
+// `project_board`), gitea/models/project/column.go:49-63, `ProjectIssue`,
+// gitea/models/project/issue.go:15-25, and `Workflow` (physical table
+// `project_workflow`), gitea/models/project/workflows.go:160-169). ONE shared
+// store serves all three scopes — repo / org / user: this wave mounts the
+// repo scope (`/repos/{owner}/{repo}/projects…`); the org/user stages reuse
+// the same tables with different gates. `repo_id` follows the
+// secrets-table sentinel convention: TEXT repositories.id on repo rows, ''
+// (upstream's 0) on owner-level rows; `owner_id` is upstream's exact inverse
+// (0 on repository projects, the users.id on org/user rows).
+// ---------------------------------------------------------------------------
+
+/**
+ * Projects (mirrors `Project`, project.go:85-107). Enum ints are upstream's
+ * raw uint8 columns: `board_type` TemplateType (0 none / 1 basic_kanban /
+ * 2 bug_triage, template.go:19-26), `card_type` CardType (0 text_only /
+ * 1 images_and_text, column.go:31-36), `type` Type (1 individual /
+ * 2 repository / 3 organization, project.go:35-43). Titles truncate to 255
+ * display-width chars at write time (NewProject/UpdateProject,
+ * `util.EllipsisDisplayString`). No UNIQUE constraint upstream — the
+ * (repo_id, type, is_closed) list reads ride the repo_id/owner_id indexes.
+ *
+ * DEVIATION (this wave): upstream maintains `repository.num_projects` /
+ * `num_closed_projects` counters (project.go:282,359-379); the landed
+ * repositories table carries no such columns and this batch cannot ALTER it,
+ * so the counters are not maintained (nothing in the contract renders them —
+ * the repository model has no project count field).
+ */
+export const projects = sqliteTable(
+  "projects",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Display title, EllipsisDisplayString(255) at write time. */
+    title: text("title").notNull(),
+    /** Upstream `Description xorm:"TEXT"`, Go zero "" (never NULL). */
+    description: text("description").notNull().default(""),
+    /** users.id of the owner on org/user projects; 0 on repository projects
+     *  (upstream `OwnerID xorm:"INDEX"`). */
+    ownerId: integer("owner_id").notNull().default(0),
+    /** TEXT repositories.id on repo rows; '' (upstream's 0) on owner-level
+     *  rows (upstream `RepoID xorm:"INDEX"`). */
+    repoId: text("repo_id").notNull().default(""),
+    /** users.id of the creator (upstream `CreatorID NOT NULL`). */
+    creatorId: integer("creator_id").notNull(),
+    isClosed: integer("is_closed", { mode: "boolean" }).notNull().default(false),
+    /** Upstream physical column `board_type` (TemplateType). */
+    boardType: integer("board_type").notNull().default(0),
+    /** CardType. */
+    cardType: integer("card_type").notNull().default(0),
+    /** Project.Type 1/2/3. */
+    type: integer("type").notNull(),
+    /** Upstream `ClosedDateUnix` — stamped on EVERY open<->close transition,
+     *  including reopen (changeProjectStatus, project.go:404-416), so it only
+     *  reads as meaningful while is_closed. */
+    closedAtUnix: integer("closed_date_unix", { mode: "timestamp" }),
+    /** Upstream `CreatedUnix xorm:"INDEX created"`. */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Upstream `UpdatedUnix xorm:"INDEX updated"`. */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's xorm INDEX quartet (project.go:87,89,91,94).
+    index("projects_title_idx").on(t.title),
+    index("projects_owner_id_idx").on(t.ownerId),
+    index("projects_repo_id_idx").on(t.repoId),
+    index("projects_is_closed_idx").on(t.isClosed),
+  ],
+);
+
+/**
+ * Project columns (mirrors `Column`, column.go:49-63; upstream's physical
+ * table name is the legacy `project_board` — renamed here to the post-TODO
+ * intent, column.go:66-68). `sorting` is upstream's int8 domain (-128..127);
+ * appends compute `min(max(sorting)+1, 127)` (NewColumn, column.go:162).
+ * The default flag marks the column new issues land in — exactly one per
+ * project is enforced procedurally (SetDefaultColumn), not by index; the
+ * physical column name is `is_default` because `default` is an SQL keyword
+ * (upstream's own xorm column is `` `default` ``).
+ */
+export const projectColumns = sqliteTable(
+  "project_columns",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** EllipsisDisplayString(255) at write time. */
+    title: text("title").notNull(),
+    /** Upstream `Default bool xorm:"NOT NULL DEFAULT false"` — issues not
+     *  assigned to a specific column land here (legacy project_issues rows
+     *  with column 0 read as this column, issue.go:36-44). */
+    isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+    /** int8 domain (-128..127); EditProjectColumnOption rejects outside it. */
+    sorting: integer("sorting").notNull().default(0),
+    /** `#rrggbb` or "" (upstream `VARCHAR(7)`, ColumnColorPattern
+     *  `^#[0-9a-fA-F]{6}$`). */
+    color: text("color").notNull().default(""),
+    projectId: integer("project_id").notNull(),
+    creatorId: integer("creator_id").notNull(),
+    /** Upstream `CreatedUnix xorm:"INDEX created"`. */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Upstream `UpdatedUnix xorm:"INDEX updated"`. */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's `ProjectID xorm:"INDEX NOT NULL"` (column.go:56) plus the
+    // created/updated INDEX tags (column.go:61,62).
+    index("project_columns_project_id_idx").on(t.projectId),
+    index("project_columns_created_idx").on(t.createdAt),
+    index("project_columns_updated_idx").on(t.updatedAt),
+  ],
+);
+
+/**
+ * Issue <-> project membership (mirrors `ProjectIssue`,
+ * gitea/models/project/issue.go:15-25). Upstream's physical column
+ * `project_board_id` carries the post-1.22 column id; rows predating columns
+ * store 0 and read as the project's default column (issue.go:36-44) — the
+ * default column's membership read therefore claims BOTH its own id and 0
+ * (columnIssueIDs). No UNIQUE(project_id, issue_id) upstream — membership is
+ * diff-computed in IssueAssignOrRemoveProject, so the pair indexes stay
+ * non-unique to mirror it.
+ */
+export const projectIssues = sqliteTable(
+  "project_issues",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Global issues.id (not the repo-local index). */
+    issueId: integer("issue_id").notNull(),
+    projectId: integer("project_id").notNull(),
+    /** Upstream physical column `project_board_id` (`project_column_id` is
+     *  the upstream TODO rename, issue.go:20); 0 = legacy default-column
+     *  encoding. NOT NULL DEFAULT 0 upstream. */
+    projectColumnId: integer("project_column_id").notNull().default(0),
+    /** Position within the column, ascending (int64 upstream). */
+    sorting: integer("sorting").notNull().default(0),
+  },
+  (t) => [
+    // Upstream's xorm INDEX trio (issue.go:17,18,21).
+    index("project_issues_issue_id_idx").on(t.issueId),
+    index("project_issues_project_id_idx").on(t.projectId),
+    index("project_issues_column_id_idx").on(t.projectColumnId),
+  ],
+);
+
+/**
+ * Project workflows (mirrors `Workflow`,
+ * gitea/models/project/workflows.go:160-169; upstream's physical table
+ * `project_workflow`). Automated reactions to project events: `filters` /
+ * `actions` are the JSON-serialized WorkflowFilters / WorkflowActions
+ * structs (upstream `xorm:"TEXT JSON"`), `event` one of the eight
+ * WorkflowEvent string values. Execution (the notifier reacting to item
+ * events) is NOT part of this batch — only the CRUD surface is (the 5
+ * workflow ops upstream shares across scopes).
+ */
+export const projectWorkflows = sqliteTable(
+  "project_workflows",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    projectId: integer("project_id").notNull(),
+    /** WorkflowEvent string (`item_added_to_project`, `pull_request_merged`,
+     *  …) — validity is checked at create/update time against the eight
+     *  known values. */
+    event: text("event").notNull().default(""),
+    /** JSON WorkflowFilters ({issue_type, source_column_id,
+     *  target_column_id, label_ids}, omitempty upstream). */
+    filters: text("filters").notNull().default("{}"),
+    /** JSON WorkflowActions ({column_id, add_label_ids, remove_label_ids,
+     *  issue_state}, omitempty upstream). */
+    actions: text("actions").notNull().default("{}"),
+    /** Upstream `Enabled bool xorm:"DEFAULT true NOT NULL"`. */
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+    /** Upstream `CreatedUnix xorm:"created"`. */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Upstream `UpdatedUnix xorm:"updated"`. */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's `ProjectID xorm:"INDEX"` (workflows.go:162).
+    index("project_workflows_project_id_idx").on(t.projectId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Protected tags (inventory batch 8, wave-api-tag-protections — upstream
+// `ProtectedTag`, gitea/models/git/protected_tag.go:21-32).
+// ---------------------------------------------------------------------------
+
+/**
+ * Protected tags (upstream `ProtectedTag`, models/git/protected_tag.go:21-32)
+ * — a repo-scoped name pattern plus a control allowlist. The API family is
+ * /repos/{owner}/{repo}/tag_protections (api/routes/tag-protections.ts); the
+ * enforcement arms are the pre-receive tag walk (routers/private/
+ * hook_pre_receive.go preReceiveTag:308-339) and the API tag create/delete
+ * path (services/release/release.go:87-102/:376-390).
+ *
+ * The two allowlists carry upstream's `xorm:"JSON TEXT"` encoding — JSON
+ * arrays in TEXT columns. NO UNIQUE(repo_id, name_pattern): upstream declares
+ * none on ProtectedTag (unlike ProtectedBranch), so the create collision is
+ * the pre-check 403 "Tag protection already exist"
+ * (routers/api/v1/repo/tag.go:423-428), not a constraint. The plain repo_id
+ * index is the protected_branches precedent, not an upstream port: every read
+ * (GetProtectedTags :117-121, the per-push enforcement load) filters by
+ * repo_id.
+ */
+export const protectedTags = sqliteTable(
+  "protected_tags",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Keys the landed TEXT repositories.id — the repo-scoped-table
+     *  convention (no FK; rows die with the deleteRepository cascade). */
+    repoId: text("repo_id").notNull(),
+    /** Upstream column `name_pattern` — a glob, or a REGEX when wrapped in
+     *  literal slashes (EnsureCompiledPattern, protected_tag.go:36-45). */
+    namePattern: text("name_pattern").notNull(),
+    /** `AllowlistUserIDs []int64 xorm:"JSON TEXT"` (protected_tag.go:27). */
+    allowlistUserIds: text("allowlist_user_ids").notNull().default("[]"),
+    /** `AllowlistTeamIDs []int64 xorm:"JSON TEXT"` (protected_tag.go:28). */
+    allowlistTeamIds: text("allowlist_team_ids").notNull().default("[]"),
+    /** Row creation (upstream `CreatedUnix xorm:"created"`). */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Last edit (upstream `UpdatedUnix xorm:"updated"`). */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Every read filters by repo_id (see the table comment).
+    index("protected_tags_repo_idx").on(t.repoId),
+  ],
+);
