@@ -1730,3 +1730,66 @@ export const gpgKeys = sqliteTable(
     index("gpg_keys_primary_key_id_idx").on(t.primaryKeyId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// PR review family (SPEC-0005 §3.2 tail — the `review` table port). One table
+// carries BOTH the submitted/pending reviews AND the reviewer requests:
+// upstream stores a request as a `review` row of `ReviewTypeRequest`
+// (gitea/models/issues/review.go:697–770 AddReviewRequest — there is no
+// separate review_request table), so cf-gitea mirrors that exactly.
+// ---------------------------------------------------------------------------
+
+/** `pull_reviews.type` — upstream `ReviewType`
+ *  (gitea/models/issues/review.go:96–103). */
+export const ReviewType = {
+  /** Not published yet (the draft a SubmitPullReview converts). */
+  Pending: 0,
+  Approve: 1,
+  Comment: 2,
+  /** REQUEST_CHANGES on the wire (upstream name: Reject). */
+  Reject: 3,
+  /** A reviewer REQUEST row, not feedback (ReviewTypeRequest). */
+  Request: 4,
+} as const;
+
+/**
+ * PR reviews + reviewer requests (mirrors `Review`,
+ * gitea/models/issues/review.go:107–141). Rows hang off the joined issue
+ * (`issue_id` — the PR's issue row, like every issue-family table); request
+ * rows are `type=4` with `reviewer_id>0` (user) or `reviewer_team_id>0`
+ * (team). Original-author importer columns (upstream OriginalAuthor*) are
+ * omitted: no cf-gitea migration surface writes reviews.
+ */
+export const pullReviews = sqliteTable(
+  "pull_reviews",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** `ReviewType` 0–4. */
+    type: integer("type").notNull(),
+    /** Reviewer user id; 0 on team-request rows (upstream NOT NULL DEFAULT 0). */
+    reviewerId: integer("reviewer_id").notNull().default(0),
+    /** Requesting team id (org teams); 0 on user rows. */
+    reviewerTeamId: integer("reviewer_team_id").notNull().default(0),
+    issueId: integer("issue_id").notNull(),
+    /** Review body (empty for request rows — upstream leaves it ''). */
+    content: text("content"),
+    /** Review by someone whose approval counts (write access; the
+     *  protected-branch whitelist upstream arm has no cf-gitea surface). */
+    official: integer("official", { mode: "boolean" }).notNull().default(false),
+    /** Head commit the review was made against (VARCHAR(64) upstream). */
+    commitId: text("commit_id"),
+    /** Invalidated by a head-branch push (MarkReviewsAsStale). */
+    stale: integer("stale", { mode: "boolean" }).notNull().default(false),
+    /** Dismissal state (DismissReview, models/issues/review.go:638–652). */
+    dismissed: integer("dismissed", { mode: "boolean" }).notNull().default(false),
+    createdAt: integer("created_unix", { mode: "timestamp" }),
+    updatedAt: integer("updated_unix", { mode: "timestamp" }),
+  },
+  (t) => [
+    // List/recount reads filter by the PR's issue (FindReviews, review_list.go).
+    index("pull_reviews_issue_idx").on(t.issueId),
+    // The latest-review-per-reviewer lookups (GetReviewByIssueIDAndUserID,
+    // review.go:586–593) and the official-flag clears key on the reviewer.
+    index("pull_reviews_reviewer_idx").on(t.issueId, t.reviewerId, t.type),
+  ],
+);

@@ -22,7 +22,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { comments, issueLabels, issues, labels, milestones, pullRequests, repoCounters, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { comments, issueLabels, issues, labels, milestones, pullRequests, pullReviews, repoCounters, repositories, ReviewType, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
@@ -44,6 +44,7 @@ beforeEach(async () => {
     "issue_subscriptions",
     "issue_pins",
     "pull_requests",
+    "pull_reviews",
     "comments",
     "issue_labels",
     "issues",
@@ -629,6 +630,29 @@ describe("GET /repos/{owner}/{repo}/pulls/{index} (repoGetPullRequest)", () => {
       merge_commit_sha: "abc123",
       merged_by: { login: "Alice" },
     });
+  });
+
+  it("renders requested_reviewers from the review-request rows (the pull-reviews consult)", async () => {
+    const owner = await seedUser("Alice");
+    const reviewer = await seedUser("bob");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const pr = await seedPull(repoId, "needs review", { posterId: owner.id });
+    // A review-REQUEST row (migration 0018's pull_reviews, type=4) — what
+    // routes/pull-reviews.ts's requested_reviewersOf consult reads.
+    await db().insert(pullReviews).values({
+      type: ReviewType.Request,
+      reviewerId: reviewer.id,
+      issueId: pr.id,
+      content: "",
+      createdAt: new Date("2026-06-01T00:00:00Z"),
+      updatedAt: new Date("2026-06-01T00:00:00Z"),
+    });
+
+    const res = await router()("/repos/alice/visible/pulls/1");
+    expect(res.status).toBe(200);
+    expect((await res.json<Record<string, unknown>>()).requested_reviewers).toEqual([
+      expect.objectContaining({ login: "bob" }),
+    ]);
   });
 
   it("404s a plain-issue index from the shared space and garbage indexes", async () => {

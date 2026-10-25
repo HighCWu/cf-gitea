@@ -99,6 +99,7 @@ import { renderUnifiedDiff, renderPatch, toApiCommit, toChangedFiles, usernamesB
 import { canViewRepository, findRepositoryByPath, repositoryPermissions, toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
 import { canWriteRepository } from "../services/repo-access";
 import { emitMilestoneEvent } from "./issues";
+import { requestedReviewersOf } from "./pull-reviews";
 
 /**
  * Tier-1 PR-block routes (SPEC-0004 §2.4 rows repoListPullRequests /
@@ -710,20 +711,23 @@ export function registerPullRoutes(
   // GET /repos/{owner}/{repo}/pulls/{index} (repoGetPullRequest) — runs the
   // LAZY mergeability check (SPEC-0005 §3.4: a `checking` row fires the
   // read-only engine check and CAS-writes the row) and renders the real
-  // mergeable/base.sha pair.
+  // mergeable/base.sha pair. The REVIEW-CONSULT (the pull-reviews wave):
+  // `requested_reviewers` renders from the review-REQUEST rows
+  // (services/convert/pull.go:124 LoadRequestedReviewers) instead of the
+  // converter's `[]` default — the PR-detail read arm only, like the
+  // mergeability extras.
   // -------------------------------------------------------------------------
   app.openapi(getPullRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
     const { issue, pullRequest } = await requirePullRequest(c, found, c.req.valid("param").index);
     const checked = await ensurePullRequestChecked(c, found, pullRequest);
     const baseSha = (await engineReads(c.env, found.repo).readCommit(branchRef(checked.baseBranch)))?.oid;
-    return c.json(
-      await toApiPullRequest(c.env.DB, viewer, found, issue, checked, "single", {
-        mergeable: mergeableOfRow(checked),
-        ...(baseSha === undefined ? {} : { baseSha }),
-      }),
-      200,
-    );
+    const rendered = await toApiPullRequest(c.env.DB, viewer, found, issue, checked, "single", {
+      mergeable: mergeableOfRow(checked),
+      ...(baseSha === undefined ? {} : { baseSha }),
+    });
+    const requestedReviewers = await requestedReviewersOf(c.env.DB, issue.id, viewer);
+    return c.json({ ...rendered, requested_reviewers: requestedReviewers }, 200);
   });
 
   // -------------------------------------------------------------------------

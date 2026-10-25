@@ -5,7 +5,9 @@ Audit refreshed 2026-10-25 (first edition 2026-10-24). Emission set current thro
 create/delete `c16f1e5`; comment edit/delete + tag push pairs + branch rename pair `1ea2b12`;
 milestone + assign events `812f999`/`7242825` — the wave that was in-flight when this refresh
 started landed mid-audit, so its rows are marked EMITTED, not "in-flight"; this refresh closes
-the `repository` migrate question by parity ANALYSIS — no emission needed, see the row). Upstream pin: `gitea`
+the `repository` migrate question by parity ANALYSIS — no emission needed, see the row), with
+the four PR-review rows closed by the PR-reviews wave (`api/routes/pull-reviews.ts` — this
+refresh's second pass). Upstream pin: `gitea`
 submodule at `fc4936884584a41931906553d96c2601d750e6ef` (v1.22.0-rc1-3919-gfc49368845) — unchanged
 since the first edition; every upstream and worker citation below was re-verified in-tree at HEAD.
 
@@ -49,11 +51,11 @@ since the first edition; every upstream and worker citation below was re-verifie
 | `pull_request_label` | IssueChangeLabels:572→:597; IssueClearLabels:46→:65 | PullRequestPayload | **EMITTED** (closed `705eb9c`) — `issues.ts` pull arm `:365-:368`; detach `issue-write-t2.ts:314` | tests: `api/issues.test.ts`, `issue-write-t2.test.ts` | P2 |
 | `pull_request_milestone` | IssueChangeMilestone:618→:639 | PullRequestPayload | **EMITTED** (closed `812f999`/`7242825`) — `pulls.ts` PATCH milestone arm emits `:841` through the shared `emitMilestoneEvent` (exported from `routes/issues.ts:397`, PR arm `:412`), same `milestoned`/`demilestoned` discriminant | tests: `api/pulls.test.ts` | P2 |
 | `pull_request_comment` | event picks: created :469 (CreateIssueComment), edited :438 (UpdateComment), deleted :514 (DeleteComment) — first edition had created/edited swapped | IssueCommentPayload | **EMITTED — full triple** (was `created` only; closed `1ea2b12`) — the same emissions as `issue_comment`, discriminated at `issues.ts:330` (created `:1303`, edited `:1060`, deleted `:1099`) | landed; tests: `api/issues.test.ts` | P2 |
-| `pull_request_review_approved` | PullRequestReview:751 (pick `:756`, PrepareWebhooks `:777`) | PullRequestPayload (+ReviewPayload `hook.go:515`) | **N/A** — no PR-review routes exist anywhere in `src/api/routes/` (re-verified this audit) | the future PR-review routes wave (subscription flag already modeled: `webhooks.ts` HookEventConfig `pull_request_review`) | P2 |
-| `pull_request_review_rejected` | PullRequestReview:751 (pick `:760`) | PullRequestPayload | **N/A** — same | same | P2 |
-| `pull_request_review_comment` | PullRequestReview:751 (pick `:758`) | PullRequestPayload | **N/A** — same | same | P2 |
+| `pull_request_review_approved` | PullRequestReview:751 (pick `:756`, PrepareWebhooks `:777`) | PullRequestPayload (+ReviewPayload `hook.go:515`) | **EMITTED** (was N/A — closed by the PR-reviews wave, `api/routes/pull-reviews.ts`) — the create (POST …/reviews) and submit (POST …/reviews/{id}) arms emit through `emitIssueEvent` (`services/issue-events.ts:113`): action `reviewed`, `requested_reviewer` = the reviewer (= the doer on the API arms), `sender` = the REVIEWER (notifier.go:773), `review` `{type: "pull_request_review_approved", content}` (:768–772); PENDING submissions stay silent (notifier.go:763–766); dismissal/deletion are silence arms (no upstream notifier — mailer/feed only) | tests: `api/routes/pull-reviews.test.ts` (event shapes + the silence arms) | P2 |
+| `pull_request_review_rejected` | PullRequestReview:751 (pick `:760`) | PullRequestPayload | **EMITTED** (was N/A — same wave) — the REQUEST_CHANGES arm of the same `emitReviewSubmitted` seam (event pick in `pull-reviews.ts` `reviewEventTypeOf`: Reject→`_rejected`), identical payload shape | tests: `api/routes/pull-reviews.test.ts` | P2 |
+| `pull_request_review_comment` | PullRequestReview:751 (pick `:758`) | PullRequestPayload | **EMITTED** (was N/A — same wave) — the COMMENT arm of the same seam, identical payload shape | tests: `api/routes/pull-reviews.test.ts` | P2 |
 | `pull_request_sync` | PullRequestSynchronized:835→:845 (fired by the push that updates a PR head branch; EventSource = the PR's BASE repo) | PullRequestPayload | **EMITTED** (was NOT-EMITTED, closed `308fa21`) — `webhooks-push.ts` `emitPullRequestSyncs:430`, emit `:479-489` (action `synchronized`, before/after oids, base-repo routing for fork heads, open github-flow PRs whose head is the pushed branch), invoked `:393-395` on branch updates inside `emitPushFamilyUpdates`; rides both trigger paths (`:546` user push, `mirror/sync.ts:390` mirror) | landed; tests: `webhooks-push.test.ts:800-831` | P2 |
-| `pull_request_review_request` | PullRequestReviewRequest:793→:815 | PullRequestPayload | **N/A** — no review-request feature | PR-review wave | P2 |
+| `pull_request_review_request` | PullRequestReviewRequest:793→:815 | PullRequestPayload | **EMITTED** (was N/A — closed by the PR-reviews wave) — POST/DELETE `…/pulls/{index}/requested_reviewers` emit per actually-created/removed USER request, action `review_requested` / `review_request_removed`, `requested_reviewer` = the reviewer, `sender` = the doer (notifier.go:793–815); a no-op request (already requested / nothing to remove) is silent (upstream `comment == nil`); team-request ADD fires one event with `requested_reviewer` omitted (upstream fans out per team MEMBER — `services/issue/review_request.go` teamReviewRequestNotify — documented deviation); team-request REMOVAL is silent upstream-faithfully (`review_request.go:44–47` — `!isAdd` returns before the notifier) | tests: `api/routes/pull-reviews.test.ts` | P2 |
 | `wiki` | NewWikiPage:534→:536; EditWikiPage:547→:549; DeleteWikiPage:560→:562 (callers `routers/web/repo/wiki.go:683` etc.) | WikiPayload (`hook.go:535`) | **N/A** — no wiki feature (no wiki routes in `src/api/routes/`) | the future wiki wave (routes own the seam) | P2 |
 | `repository` | CreateRepository:114→:116; DeleteRepository:126→:127; RenameRepository:137→:138; MigrateRepository:149→:151 (fork case: :103) | RepositoryPayload (`hook.go:566`) | **EMITTED** (was EMITTED-PARTIAL; the "migrate gap" closed by parity analysis, NOT emission — 2026-10-25 refresh) — `services/repo-events.ts` (`emitRepoEvent:118`, `emitRepoEventInline:152`): created `api/routes/user-repos.ts:209` + `api/routes/org-repos.ts:225` + push-create settle `src/git-http/gate.ts:621`; renamed `api/routes/repo.ts:439` (`changes.name.from`); deleted `repo.ts:535`; transfer stays silent upstream-faithfully (NullNotifier no-op, documented in the repo-events header). **Migrate analysis**: upstream fires MigrateRepository→`HookRepoCreated` exactly once, at task completion (`routers/api/v1/repo/migrate.go` → `services/task/task.go:60` → `services/task/migrate.go:57` → `services/notify/notify.go:377` → `notifier.go:149-151`); the migration's own repo row is created model-layer (`services/migrations/migrate.go`, no notifier call). Our migrated-repo journeys (client-chunked import `api/routes/imports.ts`; into-empty mirror attach `api/routes/mirror.ts:121`) create NO repo rows — the only `repositories` INSERT is `repos/service.ts:272`, whose callers (POST /repos user/org, push-create settle, fork) each announce their event — so the created event already fires exactly once per migration, at repo birth. Emitting again at import completion would double-fire a duplicate upstream never produces. **Documented divergence (timing, not presence)**: our created fires at birth (empty payload — itself upstream-shaped: plain POST /repos without auto_init fires created empty too), upstream's at completion (populated payload). The unlanded SPEC-0009 §2.2/§2.6 server-driven migrate creates the repo row itself, so ITS finalize step owns the single created (`emitRepoEvent`, per SPEC-0009 §2.6 step 4) | tests: `api/repo-edit.test.ts:288`/`:376`, `git-http/gate.test.ts:540-580`, `repos/imports/imports.test.ts` (migrate-surface silence guard: no deliveries from the import create/settle arms) | P2 |
 | `release` | sendReleaseHook:872→:879 (shared; NewRelease:889, UpdateRelease:893, DeleteRelease:897; callers `services/release/release.go:198`, `:363`, `:366`, `:437`) | ReleasePayload (`hook.go:332`) | **EMITTED** (was NOT-EMITTED, closed `705eb9c`) — `api/routes/releases.ts` `emitReleaseWebhook:191` (→ `:203`), `emitReleaseEvent:236` with the drafts-stay-silent guard `:241`: published `:459` (POST create), updated / draft→published flip `:545` (PATCH), deleted `:499` (by-tag) / `:558` (by-id) | landed; tests: `api/releases.test.ts` (`:464` published shape, `:488` ["updated","published"], `:527` ["deleted","deleted"]) | P1 |
@@ -67,17 +69,19 @@ since the first edition; every upstream and worker citation below was re-verifie
 
 Over the 26 wire event types of `AllEvents()` (`type.go:50-77`), at HEAD `7242825`:
 
-- **Fully emitted: 18/26** (`push`, `create`, `delete`, `fork`, `issues`, `issue_assign`,
+- **Fully emitted: 22/26** (`push`, `create`, `delete`, `fork`, `issues`, `issue_assign`,
   `issue_label`, `issue_milestone`, `issue_comment`, `pull_request`, `pull_request_assign`,
-  `pull_request_label`, `pull_request_milestone`, `pull_request_comment`, `pull_request_sync`,
-  `release`, `status`, `repository`) — **69%** (3/26 at the first edition, 7/26 partially;
-  `repository` joined with this refresh — its migrate arm closed by parity analysis, not emission).
-- **At least partially emitted: 18/26 — 69%** (same set: no row remains partial).
+  `pull_request_label`, `pull_request_milestone`, `pull_request_comment`,
+  `pull_request_review_approved`, `pull_request_review_rejected`,
+  `pull_request_review_comment`, `pull_request_review_request`, `pull_request_sync`,
+  `release`, `status`, `repository`) — **85%** (3/26 at the first edition, 18/26 before
+  this refresh; the four PR-review rows joined with the pull-reviews wave,
+  `api/routes/pull-reviews.ts`).
+- **At least partially emitted: 22/26 — 85%** (same set: no row remains partial).
 - **NOT-EMITTED with the triggering feature already present: 0/26** — the bucket the first
   edition filled with 9 types is empty; its last occupants (milestone/assign) closed with
-  `812f999`/`7242825`.
-- **N/A, feature absent: 8/26** — the three PR-review events + `pull_request_review_request`,
-  `wiki`, `package`, `workflow_run`, `workflow_job`.
+  `812f999`/`7242825`, the four PR-review rows with this wave.
+- **N/A, feature absent: 4/26** — `wiki`, `package`, `workflow_run`, `workflow_job`.
 
 ## Remaining work (ranked)
 
@@ -91,12 +95,13 @@ and the follow-up milestone+assign wave are all landed as of `7242825`. What rem
    (`status='migrating'`), so its finalize step must fire the ONE `repository` created
    (`emitRepoEvent`) — SPEC-0009 §2.6 step 4's plan, mirroring upstream
    `services/task/migrate.go:57` → `notifier.go:149`.
-2. **PR-review wave** (four N/A types) — needs the review routes themselves first; the
-   subscription vocabulary (`pull_request_review` group flag) is already modeled.
-3. **Wiki / package-registry waves** — same shape: the triggering feature is the prerequisite;
-   the emission seam pattern (`emitRepoEvent`-style family module) is established.
-4. **Gitea-Actions wave** — `workflow_run`/`workflow_job` (+ `schedule`, outside `AllEvents`)
+2. **Wiki / package-registry waves** — same shape: the triggering feature is the prerequisite;
+   the emission seam pattern (`emitRepoEvent`-style family module) is established. (The PR-review
+   wave — the former item 2 — landed: `api/routes/pull-reviews.ts` owns all four former N/A rows.)
+3. **Gitea-Actions wave** — `workflow_run`/`workflow_job` (+ `schedule`, outside `AllEvents`)
    arrive only with Actions itself.
-5. **Housekeeping**: PATCH-assignee support (`issues.ts:1221`/`pulls.ts:821` still ignore
+4. **Housekeeping**: PATCH-assignee support (`issues.ts:1221`/`pulls.ts:821` still ignore
    `form.assignee(s)`) would let the assign emissions ride the PATCH path like upstream; the
-   `fork` event still lacks a dedicated delivery assertion in the test suite.
+   `fork` event still lacks a dedicated delivery assertion in the test suite; the reviews' diff
+   hunks (`comments.patch`) are not captured at creation yet, so `diff_hunk` renders "" on the
+   new code comments (routes/pull-reviews.ts header deviation).
