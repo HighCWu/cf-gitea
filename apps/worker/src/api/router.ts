@@ -37,6 +37,7 @@ import { registerMiscT2Routes } from "./routes/misc-t2";
 import { registerMiscT3Routes } from "./routes/misc-t3";
 import { registerNotificationsRoutes } from "./routes/notifications";
 import { registerOrgRoutes } from "./routes/org-repos";
+import { registerOrgTeamsRoutes } from "./routes/org-teams";
 import { registerOrgProfileRoutes } from "./routes/orgs";
 import { registerPullAutoMergeRoutes } from "./routes/pull-automerge";
 import { registerPullRoutes } from "./routes/pulls";
@@ -135,6 +136,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // members and public_members families): same doer/optional split as the
   // org-repos group above.
   registerOrgProfileRoutes(app, requireAuth, optionalAuth);
+  // Tier-2 org teams: team CRUD/membership/repo-access (migration 0015,
+  // SPEC-0007's deferred core; owners bridge = org_members.role).
+  registerOrgTeamsRoutes(app, requireAuth, optionalAuth);
   registerMarkdownRoutes(app, requireAuth);
   // SPEC-0003 §2.6 import channel: plain Hono routes OUTSIDE the generated
   // OpenAPI document (the SPEC declares the surface here, swagger-shaped in
