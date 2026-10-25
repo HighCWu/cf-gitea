@@ -40,6 +40,7 @@ import { registerPullAutoMergeRoutes } from "./routes/pull-automerge";
 import { registerPullRoutes } from "./routes/pulls";
 import { registerReleaseAssetRoutes } from "./routes/release-assets";
 import { registerReleaseRoutes } from "./routes/releases";
+import { registerRepoExtrasT2Routes } from "./routes/repo-extras-t2";
 import { registerRepoRoutes } from "./routes/repo";
 import { registerSocialT2Routes } from "./routes/social-t2";
 import { registerStarredRoutes } from "./routes/starred";
@@ -104,6 +105,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // battle before the `{owner}` params.
   registerPullRoutes(app, requireAuth, optionalAuth);
   registerRepoRoutes(app, requireAuth, optionalAuth);
+  // Tier-2 repo extras: transfer accept/reject, topic search, repo
+  // permissions, reviewers/issue-config, pull-review comment threads,
+  // file-contents GET/POST, release-attachment trio.
+  registerRepoExtrasT2Routes(app, requireAuth, optionalAuth);
   // Repo-scoped families of the B7/D1 wave (each registers only deeper
   // `/repos/{owner}/{repo}/<family>` paths, so none of them can shadow the
   // static `/repos/issues/search` guarded above or be shadowed by the
