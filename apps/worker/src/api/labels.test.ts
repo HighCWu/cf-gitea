@@ -270,6 +270,36 @@ describe("GET /repos/{owner}/{repo}/labels (issueListLabels)", () => {
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ message: "not found", url: ERROR_URL });
   });
+
+  it("keeps the list repo-only on an org-owned repo — org labels never union in (upstream asymmetry)", async () => {
+    // Upstream ListLabels reads GetLabelsByRepoID (`Where("repo_id = ?")`,
+    // routers/api/v1/repo/label.go:52 over models/issues/label.go:420-450):
+    // even on an org-owned repo — whose issues DO carry the org's labels
+    // through the attach arms (routers/api/v1/repo/issue_label.go:342-363) —
+    // the admin list stays repo-scoped. GET /labels/{id} is repo-scoped too
+    // (GetLabelInRepoByID, repo/label.go:102-107). Pinned so a future wave
+    // doesn't "fix" the list into divergence.
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    await env.DB.prepare("UPDATE users SET type = 'org' WHERE id = ?").bind(owner.id).run();
+    await seedLabel(repoId, { name: "repo-only" });
+    const orgLabel = await db()
+      .insert(labels)
+      .values({ repoId: null, orgId: owner.id, name: "org-wide", color: "#778899", description: "" })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+
+    const res = await router()("/repos/alice/visible/labels");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Total-Count")).toBe("1");
+    const body = await res.json<Array<{ id: number; name: string }>>();
+    expect(body.map((l) => l.name)).toEqual(["repo-only"]);
+    expect(body.map((l) => l.id)).not.toContain(orgLabel);
+
+    const miss = await router()(`/repos/alice/visible/labels/${String(orgLabel)}`);
+    expect(miss.status).toBe(404);
+  });
 });
 
 describe("GET /repos/{owner}/{repo}/labels/{id} (issueGetLabel)", () => {

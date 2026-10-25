@@ -137,8 +137,6 @@ export function toEmbeddedLabel(row: LabelRow, pair: RepositoryWithOwner, origin
   is_archived: boolean;
   url: string;
 } {
-  const ownerNamespace = encodeURIComponent(pair.repo.ownerNamespace);
-  const slug = encodeURIComponent(pair.repo.slug);
   return {
     id: row.id,
     name: row.name,
@@ -146,8 +144,22 @@ export function toEmbeddedLabel(row: LabelRow, pair: RepositoryWithOwner, origin
     color: (row.color ?? "").replace(/^#+/, "").toLowerCase(),
     description: row.description ?? "",
     is_archived: row.archivedAt !== null,
-    url: `${origin}/api/v1/repos/${ownerNamespace}/${slug}/labels/${row.id}`,
+    url: `${issueLabelApiUrlBase(row, pair, origin)}/labels/${row.id}`,
   };
+}
+
+/**
+ * `convert.ToLabel`'s URL branch (services/convert/issue.go:269-280) for a
+ * label rendered in a repo/issue context: repo rows use the repo API URL,
+ * ORG rows (`repo_id` NULL, `org_id` set — labels an org-owned repo's issues
+ * carry alongside repo labels) use `{origin}/api/v1/orgs/{owner}/labels/{id}`
+ * when the repo's owner is that org (url.PathEscape → encodeURIComponent).
+ */
+export function issueLabelApiUrlBase(row: LabelRow, pair: RepositoryWithOwner, origin: string): string {
+  if (row.repoId === null && row.orgId !== null && pair.owner.type === "org") {
+    return `${origin}/api/v1/orgs/${encodeURIComponent(pair.owner.username)}`;
+  }
+  return apiRepositoryUrl(pair, origin);
 }
 
 /** Poster → `convert.ToAuthor` (unknown/absent poster → null). */
@@ -500,6 +512,35 @@ export async function labelIdsByRepoNames(d1: D1Database, repoId: string, names:
     .orderBy(asc(labels.name))
     .all();
   return rows.map((row) => row.id);
+}
+
+/** `GetLabelIDsInOrgByNames` (models/issues/label.go:384-393) — org-scoped,
+ * silently ignores misses; the owner-org fallthrough of the issue
+ * attach/replace name branch (prepareForReplaceOrAdd,
+ * routers/api/v1/repo/issue_label.go:342-359). */
+export async function labelIdsByOrgNames(d1: D1Database, orgId: number, names: string[]): Promise<number[]> {
+  if (names.length === 0 || orgId <= 0) return [];
+  const rows = await drizzle(d1)
+    .select({ id: labels.id })
+    .from(labels)
+    .where(and(eq(labels.orgId, orgId), inArray(labels.name, names)))
+    .orderBy(asc(labels.name))
+    .all();
+  return rows.map((row) => row.id);
+}
+
+/** The names of the given label rows — prepareForReplaceOrAdd's re-read of
+ * the repo-matched labels (`GetLabelsByIDs(ctx, repoLabelIDs, "name")`,
+ * routers/api/v1/repo/issue_label.go:343); drives which requested names fall
+ * through to the owner org (issue_label.go:348-359). */
+export async function labelNamesByIds(d1: D1Database, labelIds: number[]): Promise<Set<string>> {
+  if (labelIds.length === 0) return new Set();
+  const rows = await drizzle(d1)
+    .select({ name: labels.name })
+    .from(labels)
+    .where(inArray(labels.id, labelIds))
+    .all();
+  return new Set(rows.map((row) => row.name));
 }
 
 /** `GetLabelIDsByNames` — GLOBAL by name (SearchIssues), misses discarded. */

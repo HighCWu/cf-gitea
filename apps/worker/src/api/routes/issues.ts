@@ -43,9 +43,12 @@ import {
   findIssueByRepoAndIndex,
   findRepoCommentById,
   issueErrorToApiError,
+  issueLabelApiUrlBase,
   issueLabelRows,
   labelIdsByGlobalNames,
+  labelIdsByOrgNames,
   labelIdsByRepoNames,
+  labelNamesByIds,
   listIssueComments,
   listIssueTimeline,
   listRepoComments,
@@ -68,7 +71,6 @@ import {
 import { parseMilestoneDeadline } from "../services/milestones";
 import { toApiPullRequest } from "../services/pulls";
 import {
-  apiRepositoryUrl,
   canViewRepositoryWithTeams,
   findRepositoryById,
   findRepositoryByPath,
@@ -131,6 +133,20 @@ import {
  * The PATCH milestone change emits `issue_milestone` / `pull_request_milestone`
  * the same way — emitMilestoneEvent (IssueChangeMilestone:618-647; action
  * milestoned/demilestoned, no `changes` block).
+ *
+ * Org labels on org-owned repos (pin survey fc49368845): upstream lets an
+ * org's labels ride the repo's issues — the attach/replace arms
+ * (prepareForReplaceOrAdd, routers/api/v1/repo/issue_label.go:304-370)
+ * resolve NAMES the repo does not carry against the owner org (:342-359, the
+ * pin's 7448b49aac repo-wins semantics) and ids validate repo-or-owner-org
+ * scoped here (upstream's id branch reads the unscoped GetLabelsByIDs,
+ * models/issues/label.go:317-327 — it silently drops unknown ids and
+ * over-accepts foreign-repo ids at this pin; our miss is the landed scoped
+ * 404, the same shape as the DELETE arm's GetLabelInRepoOrOrgByID,
+ * label.go:344-354 — deliberate divergence). Attached org rows render the
+ * org API URL (convert.ToLabel's org branch, services/convert/issue.go:
+ * 269-280). The repo label ADMIN list does NOT union (repo/label.go:52,58) —
+ * surveyed in services/labels.ts listRepoLabels.
  */
 
 const notFoundResponse = {
@@ -428,12 +444,19 @@ export async function emitMilestoneEvent(
   });
 }
 
-/** `IssueLabelsOption` id/name resolution (prepareForReplaceOrAdd): integers
- *  are ids, strings are names; a mixed array is the runtime 400, unknown
- *  names silently drop (GetLabelIDsInRepoByNames). */
+/**
+ * `IssueLabelsOption` id/name resolution (prepareForReplaceOrAdd,
+ * routers/api/v1/repo/issue_label.go:304-370): integers are ids, strings are
+ * names; a mixed array is the runtime 400, unknown names silently drop
+ * (GetLabelIDsInRepoByNames). On ORG-owned repos the names the repo does not
+ * carry fall through to the owner org (:342-359 — the pin's 7448b49aac
+ * repo-wins rule: a name carried by both attaches the repo label only); ids
+ * pass through to the service's scoped validation (repo rows, plus owner-org
+ * rows on org-owned repos — see ownerOrgIdOf).
+ */
 async function resolveLabelOptionIds(
   d1: D1Database,
-  repoId: string,
+  found: RepositoryWithOwner,
   entries: Array<number | string> | undefined,
 ): Promise<number[]> {
   if (entries === undefined) {
@@ -452,9 +475,28 @@ async function resolveLabelOptionIds(
     throw new ApiError(400, "labels should be an array of strings or integers");
   }
   if (names.length > 0) {
-    ids.push(...(await labelIdsByRepoNames(d1, repoId, names)));
+    const repoLabelIds = await labelIdsByRepoNames(d1, found.repo.id, names);
+    ids.push(...repoLabelIds);
+    if (found.owner.type === "org") {
+      // The unmatched-name set: upstream re-reads the repo-matched names
+      // (GetLabelsByIDs(ctx, repoLabelIDs, "name"), issue_label.go:343)
+      // and resolves only the remainder against the org.
+      const repoMatched = await labelNamesByIds(d1, repoLabelIds);
+      const orgNames = names.filter((name) => !repoMatched.has(name));
+      ids.push(...(await labelIdsByOrgNames(d1, found.owner.id, [...new Set(orgNames)])));
+    }
   }
   return ids;
+}
+
+/**
+ * The owner-org scope of issue-label mutations — the `ownerIsOrg`
+ * discriminant of GetLabelInRepoOrOrgByID (models/issues/label.go:348):
+ * null on user-owned repos, the owner user-row id on org-owned ones (the
+ * IssuesService then accepts that org's labels alongside repo labels).
+ */
+function ownerOrgIdOf(found: RepositoryWithOwner): number | null {
+  return found.owner.type === "org" ? found.owner.id : null;
 }
 
 /** `q`/`labels`/`milestones` comma-split form parsing. */
@@ -1332,7 +1374,7 @@ export function registerIssueRoutes(
     const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const rows = await issueLabelRows(c.env.DB, issue.id);
-    return c.json(rows.map((row) => toApiLabel(row, apiRepositoryUrl(found, viewer.origin))), 200);
+    return c.json(rows.map((row) => toApiLabel(row, issueLabelApiUrlBase(row, found, viewer.origin))), 200);
   });
 
   // -------------------------------------------------------------------------
@@ -1346,11 +1388,11 @@ export function registerIssueRoutes(
       assertNotArchived(found);
       const issue = await requireIssue(c, found, c.req.valid("param").index);
       const form = c.req.valid("json");
-      const labelIds = await resolveLabelOptionIds(c.env.DB, found.repo.id, form.labels);
+      const labelIds = await resolveLabelOptionIds(c.env.DB, found, form.labels);
       const service = new IssuesService(c.env.DB);
       try {
         for (const labelId of labelIds) {
-          await service.setLabel(issue.id, labelId, { ownerOrgId: null });
+          await service.setLabel(issue.id, labelId, { ownerOrgId: ownerOrgIdOf(found) });
         }
       } catch (error) {
         asApiError(error);
@@ -1360,7 +1402,7 @@ export function registerIssueRoutes(
       // layer notifies unconditionally after AddLabels, with no `changes`.
       await emitLabelEvent(c, found, issue, "label_updated");
       const rows = await issueLabelRows(c.env.DB, issue.id);
-      return c.json(rows.map((row) => toApiLabel(row, apiRepositoryUrl(found, viewer.origin))), 200);
+      return c.json(rows.map((row) => toApiLabel(row, issueLabelApiUrlBase(row, found, viewer.origin))), 200);
     },
     ({ success }: { success: boolean }) => {
       if (!success) {
@@ -1381,10 +1423,10 @@ export function registerIssueRoutes(
       assertNotArchived(found);
       const issue = await requireIssue(c, found, c.req.valid("param").index);
       const form = c.req.valid("json");
-      const labelIds = await resolveLabelOptionIds(c.env.DB, found.repo.id, form.labels);
+      const labelIds = await resolveLabelOptionIds(c.env.DB, found, form.labels);
       const service = new IssuesService(c.env.DB);
       try {
-        await service.replaceLabels(issue.id, labelIds, { ownerOrgId: null });
+        await service.replaceLabels(issue.id, labelIds, { ownerOrgId: ownerOrgIdOf(found) });
       } catch (error) {
         asApiError(error);
         throw error;
@@ -1393,7 +1435,7 @@ export function registerIssueRoutes(
       // unconditionally too (services/issue/label.go:79-87).
       await emitLabelEvent(c, found, issue, "label_updated");
       const rows = await issueLabelRows(c.env.DB, issue.id);
-      return c.json(rows.map((row) => toApiLabel(row, apiRepositoryUrl(found, viewer.origin))), 200);
+      return c.json(rows.map((row) => toApiLabel(row, issueLabelApiUrlBase(row, found, viewer.origin))), 200);
     },
     ({ success }: { success: boolean }) => {
       if (!success) {

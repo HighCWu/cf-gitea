@@ -82,8 +82,15 @@ export function labelOrderBy(sort: LabelSortType): SQL[] {
   }
 }
 
-/** `ListLabels` — repo labels only (org labels have repo_id NULL and are
- * never repo-visible upstream); total ignores pagination (CountLabelsByRepoID). */
+/** `ListLabels` — repo labels only; total ignores pagination
+ * (CountLabelsByRepoID). The org-label NO-union is upstream-shaped at the
+ * pin: ListLabels reads GetLabelsByRepoID / CountLabelsByRepoID, both
+ * `Where("repo_id = ?")` (routers/api/v1/repo/label.go:52,58 over
+ * models/issues/label.go:420-450), and GET /labels/{id} stays repo-scoped
+ * (GetLabelInRepoByID/ByName, repo/label.go:102-107). Org labels (repo_id
+ * NULL) surface on the ISSUE attach/replace/detach/render arms only —
+ * surveyed at the pin, see routes/issues.ts' header and
+ * routes/issue-write-t2.ts' GetLabelInRepoOrOrgByID seam. */
 export async function listRepoLabels(
   d1: D1Database,
   repoId: string,

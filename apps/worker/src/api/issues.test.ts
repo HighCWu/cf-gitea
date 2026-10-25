@@ -1143,6 +1143,149 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
     });
     expect(archived.status).toBe(423);
   });
+
+  it("attaches an owner-org label by id on an org-owned repo and renders the org URL — while the repo label list stays repo-only", async () => {
+    // The upstream org union (prepareForReplaceOrAdd, routers/api/v1/repo/
+    // issue_label.go:304-370): an org-owned repo's issues carry the OWNER
+    // ORG's labels; attached org rows render convert.ToLabel's org branch
+    // (services/convert/issue.go:269-280). The admin list does NOT union
+    // (repo/label.go:52,58) — the pinned asymmetry.
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    await env.DB.prepare("UPDATE users SET type = 'org' WHERE id = ?").bind(owner.id).run();
+    const repoLabel = await seedLabel(repoId, "repo-side");
+    const orgLabel = await db()
+      .insert(labels)
+      .values({ repoId: null, orgId: owner.id, name: "org-wide", color: "#778899", description: "" })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    await seedIssue(repoId, "org-labeled");
+
+    const add = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [orgLabel] }),
+    });
+    expect(add.status).toBe(200);
+    const added = await add.json<Array<{ id: number; url: string }>>();
+    expect(added.map((l) => l.id)).toEqual([orgLabel]);
+    expect(added[0]?.url).toBe(`https://example.com/api/v1/orgs/Alice/labels/${String(orgLabel)}`);
+
+    // The issue render rides the attach rows with the org shape …
+    const list = await router()("/repos/alice/visible/issues/1/labels");
+    expect((await list.json<Array<{ url: string }>>())[0]?.url).toBe(
+      `https://example.com/api/v1/orgs/Alice/labels/${String(orgLabel)}`,
+    );
+    const detail = await router()("/repos/alice/visible/issues/1");
+    expect((await detail.json<{ labels: Array<{ url: string }> }>()).labels[0]?.url).toBe(
+      `https://example.com/api/v1/orgs/Alice/labels/${String(orgLabel)}`,
+    );
+
+    // … while the repo label ADMIN list stays repo-only.
+    const admin = await router()("/repos/alice/visible/labels");
+    expect((await admin.json<Array<{ id: number }>>()).map((l) => l.id)).toEqual([repoLabel]);
+  });
+
+  it("falls org-only names through to the owner org and keeps repo names repo-wins (pin 7448b49aac)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    await env.DB.prepare("UPDATE users SET type = 'org' WHERE id = ?").bind(owner.id).run();
+    const shared = await seedLabel(repoId, "shared"); // the repo AND the org carry the name
+    await db()
+      .insert(labels)
+      .values({ repoId: null, orgId: owner.id, name: "shared", color: "#778899", description: "" })
+      .returning({ id: labels.id })
+      .all();
+    const orgOnly = await db()
+      .insert(labels)
+      .values({ repoId: null, orgId: owner.id, name: "org-only", color: "#445566", description: "" })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    await seedIssue(repoId, "by-name");
+    await seedIssue(repoId, "shared-name");
+
+    const orgName = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: ["org-only"] }),
+    });
+    expect(orgName.status).toBe(200);
+    expect((await orgName.json<Array<{ id: number }>>()).map((l) => l.id)).toEqual([orgOnly]);
+
+    // A name carried by BOTH attaches the repo label only — the org label is
+    // NOT double-attached (the pin's repo-wins fix).
+    const sharedName = await router()("/repos/alice/visible/issues/2/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: ["shared"] }),
+    });
+    expect(sharedName.status).toBe(200);
+    expect((await sharedName.json<Array<{ id: number }>>()).map((l) => l.id)).toEqual([shared]);
+  });
+
+  it("PUT replaces with a mixed repo+org id set and still rejects foreign-repo ids on the org-owned repo", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    await env.DB.prepare("UPDATE users SET type = 'org' WHERE id = ?").bind(owner.id).run();
+    const repoLabel = await seedLabel(repoId, "repo-side");
+    const orgLabel = await db()
+      .insert(labels)
+      .values({ repoId: null, orgId: owner.id, name: "org-wide", color: "#778899", description: "" })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    await seedIssue(repoId, "mixed");
+    const otherRepo = await seedRepo(owner.usernameLower, "other");
+    const foreign = await seedLabel(otherRepo, "foreign");
+
+    const put = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "PUT",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [orgLabel, repoLabel] }),
+    });
+    expect(put.status).toBe(200);
+    expect((await put.json<Array<{ id: number; url: string }>>()).map((l) => l.id)).toEqual([repoLabel, orgLabel].sort((a, b) => a - b));
+
+    // Our id validation stays owner-scoped (GetLabelInRepoOrOrgByID's shape,
+    // models/issues/label.go:344-354) — a foreign-REPO id is the same 404 as
+    // a missing one, unlike upstream's unscoped GetLabelsByIDs id branch at
+    // this pin (documented divergence).
+    const foreignPut = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "PUT",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [foreign] }),
+    });
+    expect(foreignPut.status).toBe(404);
+    expect(await foreignPut.json()).toEqual({
+      message: `label does not exist [label_id: ${foreign}, repo_id: ${repoId}]`,
+      url: ERROR_URL,
+    });
+  });
+
+  it("rejects org label ids on user-owned repos as today (owner is not an org)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const orgLabel = await db()
+      .insert(labels)
+      .values({ repoId: null, orgId: owner.id, name: "org-wide", color: "#778899", description: "" })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    await seedIssue(repoId, "user-owned");
+
+    const add = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [orgLabel] }),
+    });
+    expect(add.status).toBe(404);
+    expect(await add.json()).toEqual({
+      message: `label does not exist [label_id: ${orgLabel}, repo_id: ${repoId}]`,
+      url: ERROR_URL,
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
