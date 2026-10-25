@@ -484,3 +484,13 @@ service (create/rename/visibility/member guards + unit tests) · M3 tier-1 read 
 (`/user/orgs`, org repos listing) with pagination headers · M4 `POST
 /orgs/{org}/repos` over the engine commit-builder + grant wiring into SPEC-0003
 push-create · M5 compat/oracle run + SPEC-0003 §5 checklist extension.
+
+**§3.5(c) as-built refresh (2026-10-25, d496ab8)**: repo-scoped READ visibility
+resolves through `canViewRepositoryWithTeams` at every seam — the shared
+repo-access resolver (~90 call sites in one point), the 15 route-file local
+copies, repoGet/ByID, and the list SQL (`visibilityConditions` carries the
+EXISTS twin of the grant, incl. the units_map json_each collapse — a list
+never shows a repo the per-repo seam would 404). Anti-enumeration unchanged
+(invisible ≡ missing, byte-identical). Known remaining: `listOrgRepos`
+(orgs.ts) and the WRITE-grant team arms (isRepositoryAdmin/canWriteRepository
+still collaborator-rows-only) — follow-up wave.
