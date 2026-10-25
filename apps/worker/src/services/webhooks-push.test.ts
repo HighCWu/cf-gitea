@@ -26,8 +26,11 @@
  * exclusion on a mixed receive, the subscription gates (push_only,
  * branch_filter, inactive, no hooks), owner-level hook resolution, the
  * never-fail-the-push guarantees (the engine's hook catch + the fan-out's
- * per-ref resilience), the pusher identity (owner fallback + explicit
- * authenticated-pusher override) and the missing-owner/unknown-repo degrades.
+ * per-ref resilience), the pusher identity (the gate-threaded authenticated
+ * pusher — a non-owner collaborator names himself; owner pushes unchanged;
+ * client-forged x-push-user headers ignored on both the gated and the
+ * engine-native path; the owner fallback for identity-less receives; the
+ * explicit users-row override) and the missing-owner/unknown-repo degrades.
  */
 
 import { env } from "cloudflare:workers";
@@ -43,12 +46,14 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createDurableGit, type DurableGitHandler } from "@cf-gitea/git-engine";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
+import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { findRepositoryById } from "../api/services/repository";
+import { TeamsService } from "../api/routes/org-teams";
 import { users, webhookDeliveries, webhooks } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { authorize } from "../git-http/authorize";
 import { gitHttpGate } from "../git-http/gate";
+import { OrgService } from "../services/orgs/orgs";
 import { RepoService, type RepoRow } from "../repos/service";
 import {
   emitPushFamilyUpdates,
@@ -71,7 +76,7 @@ const wiredEngine = createDurableGit<Env>({
   onPush: (event, env2) => handleUserPushEvent(env2, event),
 });
 
-/** The seam's failure half (packages/git-engine mod.ts:966 catches hook
+/** The seam's failure half (packages/git-engine mod.ts:1051 catches hook
  *  rejections off the response path): a push must land even when the hook
  *  explodes. The fan-out's own never-throw posture is pinned separately. */
 const rejectingEngine = createDurableGit<Env>({
@@ -159,6 +164,12 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   for (const table of [
+    // Team tables first (gate.test.ts's sweep order); org_members cascades
+    // with the users delete below, but team_repo_access.repo_id declares no
+    // FK and is swept explicitly.
+    "team_repo_access",
+    "team_members",
+    "teams",
     "personal_access_tokens",
     "repo_units",
     "repo_transfer",
@@ -475,8 +486,8 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
       head_commit: null,
     });
     expect((branchPush.repository as { full_name: string }).full_name).toBe("alice/pushweb");
-    // The documented deviation: pusher/sender = the repository owner until
-    // the engine plumbs the authenticated identity into PushEvent.
+    // The authenticated pusher (gate-threaded, PushEvent.pusherId) — Alice
+    // pushed on her own token, so the payload coincides with the owner shape.
     expect((branchPush.pusher as { login: string }).login).toBe("Alice");
     expect((branchPush.sender as { login: string }).login).toBe("Alice");
 
@@ -846,8 +857,8 @@ describe("pull_request_sync — PR-head branch updates ride the push (notifier.g
     expect(payload.number).toBe(index);
     expect(payload.pull_request.title).toBe("sync me");
     expect(payload.repository.full_name).toBe("alice/syncbasic");
-    // The push family's identity: sender = the owner until the engine plumbs
-    // the authenticated pusher.
+    // The push family's identity: the authenticated pusher (Alice — also the
+    // owner here, where the fallback shape is indistinguishable).
     expect(payload.sender.login).toBe("Alice");
     expect(payload.commit_id).toBe("");
   });
@@ -935,7 +946,7 @@ describe("pusher identity and degrades", () => {
       env,
       row,
       [{ ref: "refs/heads/main", old: PUSH_ZERO_OID, next: "a".repeat(40) }],
-      bobRow, // the future seam's authenticated identity
+      bobRow, // the fan-out's pusher seam (the engine's PushEvent.pusherId resolves here)
     );
     const rows = await deliveries();
     expect(rows).toHaveLength(2); // push + create
@@ -960,5 +971,188 @@ describe("pusher identity and degrades", () => {
       handleUserPushEvent(env, { repo: "ghost/none", updates: [{ ref: "refs/heads/main", old: PUSH_ZERO_OID, new: "c".repeat(40) }], commitTime: 0 }),
     ).resolves.toBeUndefined();
     expect(await deliveries()).toHaveLength(0);
+  });
+});
+
+describe("the gate threads the authenticated pusher (the identity-gap closure)", () => {
+  /** An org-owned repo (`<org>` owned by Alice) with Bob as a write-mode team
+   *  collaborator — the SPEC-0007 §3.5 grant that lets a non-owner push. */
+  async function seedOrgRepoWithCollaborator(
+    slug: string,
+  ): Promise<{ row: RepoRow; orgName: string; collabToken: string }> {
+    const orgs = new OrgService(env.DB);
+    const teams = new TeamsService(env.DB);
+    const existing = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get();
+    const alice = existing ?? (await seedVerifiedUser({ username: "Alice" }));
+    const orgName = `acme-${slug}`;
+    const org = await orgs.createOrg({ name: orgName, ownerId: alice.id });
+    const service = new RepoService(env.DB, { registry: env.REGISTRY.getByName("registry") });
+    const row = await service.create({ owner: { id: org.id, usernameLower: org.usernameLower }, name: slug, isPrivate: false });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const writers = await teams.createTeam(org, { name: "writers", permission: "write" });
+    await teams.addTeamRepo(writers, row.id);
+    await teams.addTeamMember(writers, bob.id);
+    return { row, orgName, collabToken: (await mintFor(bob.id, `${slug}-collab`, "write:repository")).plaintext };
+  }
+
+  it("a non-owner collaborator's push names the collaborator, not the owner", async () => {
+    const fx = await seedOrgRepoWithCollaborator("pushcollab");
+    await seedHook({ repoId: fx.row.id });
+
+    // First push (branch create) by Bob: the zero-commit push + create pair.
+    const initial = await buildChainPack(null, [
+      { message: "seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000130 },
+    ]);
+    expect(
+      (
+        await pushThroughGate(
+          fx.row,
+          wiredEngine,
+          [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/main" }],
+          initial.pack,
+          fx.collabToken,
+        )
+      ).status,
+    ).toBe(200);
+    await expectRef(fx.row.ownerNamespace, fx.row.slug, "refs/heads/main", initial.tips[0]!);
+
+    let rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
+    const created = JSON.parse(rows[0]!.payloadContent) as {
+      pusher: { login: string };
+      sender: { login: string };
+      repository: { owner: { login: string } };
+    };
+    expect(created.pusher.login).toBe("Bob");
+    expect(created.sender.login).toBe("Bob");
+    // The repository object stays the repo's real owner (the org), upstream
+    // push.go shape: Pusher is the doer, Repository.Owner the namespace.
+    expect(created.repository.owner.login).toBe(fx.orgName);
+
+    // An UPDATE by Bob: the push payload again names the collaborator.
+    await clearDeliveries();
+    const append = await buildChainPack(initial.tips[0]!, [
+      { message: "work", files: [{ path: "README.md", content: "work\n" }], time: 1700000131 },
+    ]);
+    expect(
+      (
+        await pushThroughGate(
+          fx.row,
+          wiredEngine,
+          [{ old: initial.tips[0]!, oid: append.tips[0]!, ref: "refs/heads/main" }],
+          append.pack,
+          fx.collabToken,
+        )
+      ).status,
+    ).toBe(200);
+    rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push"]);
+    const updated = JSON.parse(rows[0]!.payloadContent) as { pusher: { login: string }; sender: { login: string } };
+    expect(updated.pusher.login).toBe("Bob");
+    expect(updated.sender.login).toBe("Bob");
+  });
+
+  it("a client-forged x-push-user header never names the pusher (owner push unchanged)", async () => {
+    const { row, token } = await seedRepoWithToken("pushforge");
+    await seedHook({ repoId: row.id });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+
+    // Alice (the owner) pushes with a FORGED identity header naming Bob. The
+    // gate reads no such header (the identity rides the engine call argument,
+    // gate.ts resolvePushPusher), so the payload must name the real
+    // authenticated pusher — Alice — never the client-supplied identity.
+    const forged = { "x-push-user": `${bob.id}:bob` };
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "honest", files: [{ path: "README.md", content: "honest\n" }], time: 1700000140 },
+    ]);
+    const base = `${ORIGIN}/${row.ownerNamespace}/${row.slug}.git`;
+    const advert = await gitHttpGate(
+      new Request(`${base}/info/refs?service=git-receive-pack`, {
+        headers: { authorization: basicTokenHeader(token), ...forged },
+      }),
+      env,
+      ctx,
+      wiredEngine,
+    );
+    expect(advert.status).toBe(200);
+    const response = await gitHttpGate(
+      new Request(`${base}/git-receive-pack`, {
+        method: "POST",
+        headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT, ...forged },
+        body: concatBytes(commandSection([{ old: PUSH_ZERO_OID, oid: tips[0]!, ref: "refs/heads/main" }]), pack),
+      }),
+      env,
+      ctx,
+      wiredEngine,
+    );
+    expect(response.status).toBe(200);
+    await drainWaits();
+
+    const rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
+    for (const row2 of rows) {
+      const payload = JSON.parse(row2.payloadContent) as { pusher?: { login: string }; sender?: { login: string } };
+      expect(payload.pusher?.login ?? payload.sender?.login).toBe("Alice");
+    }
+  });
+
+  it("an anonymous forged-header push is challenged before any identity is read", async () => {
+    const { row } = await seedRepoWithToken("pushanonforge");
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const response = await gitHttpGate(
+      new Request(`${ORIGIN}/${row.ownerNamespace}/${row.slug}.git/git-receive-pack`, {
+        method: "POST",
+        headers: { "content-type": RECEIVE_CT, "x-push-user": `${bob.id}:bob` },
+        body: commandSection([{ old: PUSH_ZERO_OID, oid: "d".repeat(40), ref: "refs/heads/main" }]),
+      }),
+      env,
+      ctx,
+      wiredEngine,
+    );
+    // Row 2/3: pushes always need identity — 401 before the engine, so the
+    // forged header never reaches a receive, and nothing is notified.
+    expect(response.status).toBe(401);
+    expect(await deliveries()).toHaveLength(0);
+  });
+
+  it("an engine-native receive (no gate) carries no identity: owner fallback, forged header ignored", async () => {
+    const { row, token } = await seedRepoWithToken("pushnative");
+    await seedHook({ repoId: row.id });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+
+    // Direct to the engine — the mirror/import/e2e shape: no gate-cleared
+    // mark, no internal argument, raw client headers (with a forged identity
+    // header aboard). The engine invents no pusher from them: PushEvent
+    // carries none, and the fan-out falls back to the repository owner.
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "native", files: [{ path: "README.md", content: "native\n" }], time: 1700000150 },
+    ]);
+    const base = `${ORIGIN}/${row.ownerNamespace}/${row.slug}.git`;
+    // The engine's native credential shape: the token as the Basic PASSWORD
+    // (the engine's parseBasic reads the password side — the gate's
+    // token-as-username shape never appears on this path). Plus the forged
+    // identity header.
+    const forged = { authorization: basicHeader("git", token), "x-push-user": `${bob.id}:bob` };
+    const advert = await wiredEngine.fetch(new Request(`${base}/info/refs?service=git-receive-pack`, { headers: forged }), env, ctx);
+    expect(advert.status).toBe(200);
+    const response = await wiredEngine.fetch(
+      new Request(`${base}/git-receive-pack`, {
+        method: "POST",
+        headers: { ...forged, "content-type": RECEIVE_CT },
+        body: concatBytes(commandSection([{ old: PUSH_ZERO_OID, oid: tips[0]!, ref: "refs/heads/main" }]), pack),
+      }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(200);
+    await drainWaits();
+    await expectRef(row.ownerNamespace, row.slug, "refs/heads/main", tips[0]!);
+
+    const rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
+    for (const row2 of rows) {
+      const payload = JSON.parse(row2.payloadContent) as { pusher?: { login: string }; sender?: { login: string } };
+      expect(payload.pusher?.login ?? payload.sender?.login).toBe("Alice");
+    }
   });
 });

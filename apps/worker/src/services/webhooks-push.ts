@@ -3,9 +3,10 @@
  * pipeline") — the push/create/delete family emitted from the engine's
  * `onPush` seam.
  *
- * SEAM (packages/git-engine mod.ts:963-970): after `finalizeReceive` returns
+ * SEAM (packages/git-engine mod.ts:1043-1052): after `finalizeReceive` returns
  * `committed` with at least one applied ref update, the engine calls
- * `options.onPush({ repo, updates, commitTime }, env)` inside `ctx.waitUntil`
+ * `options.onPush({ repo, updates, commitTime, pusherId?, pusherLogin? }, env)`
+ * inside `ctx.waitUntil`
  * — off the response path, with a catching wrapper so a throwing hook can
  * never fail an already-applied push. `updates` is the exact applied delta
  * (`FinalizeCommitted.updates`, control-plane.ts:208 — "applied updates for
@@ -48,18 +49,22 @@
  * identity + walk seam are parameters — the mirror path passes the owner
  * identity and shares `engineWalk`).
  *
- * PUSHER IDENTITY — DEVIATION (documented, this wave): upstream sets
+ * PUSHER IDENTITY (CLOSED — was the documented deviation): upstream sets
  * `pusher`/`sender` to the AUTHENTICATED user (services/repository/push.go
- * `opts.Pusher`); our engine's `PushEvent` carries no identity and the gate
- * resolves the D1 user only inside its own frame (git-http/acl.ts
- * `authorizeGitHttp`), so nothing at the seam names the pusher. Until the
- * engine plumbs the authenticated identity into `PushEvent` (engine-package
- * change, its own wave), the fan-out resolves the pusher exactly like the
- * mirror path does — the repository OWNER (upstream's mirror precedent,
- * mirror_pull.go:347 `m.Repo.MustOwner(ctx)` → notifier.go:919-920 sets both
- * `Pusher` and `Sender`). `handleUserPushNotifications` takes an explicit
- * `pusher` users-row override so the wiring upgrade is a one-argument change
- * once a seam provides the real identity.
+ * `opts.Pusher`). The engine's `PushEvent` now carries that identity —
+ * optional `pusherId`/`pusherLogin` — and the gate threads it onto its
+ * receive-pack forwards as an in-process `engine.fetch` call argument, never
+ * a request header: a receive CAN reach the engine with raw client headers
+ * (the D1-missing transitional passthrough, git-http/gate.ts), where a
+ * header would be forgeable; a call argument has no client-reachable path
+ * (gate.ts `resolvePushPusher` states the analysis). `handleUserPushEvent`
+ * resolves the id to the users row and uses it as pusher AND sender; the row
+ * resolving to nothing (stale/deleted id) and every identity-less receive —
+ * the engine-native transitional population, the mirror path — keep the
+ * repository OWNER (upstream's mirror precedent, mirror_pull.go:347
+ * `m.Repo.MustOwner(ctx)` → notifier.go:919-920 sets both `Pusher` and
+ * `Sender`). `handleUserPushNotifications` keeps its explicit `pusher`
+ * users-row override as the fan-out's seam.
  *
  * FAILURE POSTURE — the mirror wave's best-effort rule, unchanged: this runs
  * AFTER the receive committed (inside the engine's waitUntil), nothing here
@@ -84,7 +89,7 @@ import {
   type UserRow,
   type Viewer,
 } from "../api/services/repository";
-import { issues, PRFlow, pullRequests } from "../db/schema";
+import { issues, PRFlow, pullRequests, users } from "../db/schema";
 import {
   enrichCommitsWithFileLists,
   emitWebhookDeliveries,
@@ -526,8 +531,9 @@ export interface UserPushNotificationOptions {
  *
  * `pusher` is the AUTHENTICATED user's row when the caller holds one (the
  * payload's `pusher` AND `sender` — upstream `opts.Pusher`); undefined/null
- * falls back to the repository owner row — the documented deviation,
- * identical to the mirror path's upstream behavior.
+ * falls back to the repository owner row — upstream's mirror behavior, and
+ * the shape of every identity-less receive (the engine-native transitional
+ * population and the mirror path).
  */
 export async function handleUserPushNotifications(
   env: WebhookPushEnv,
@@ -564,8 +570,8 @@ export async function handleUserPushNotifications(
   }
 }
 
-/** The engine `PushEvent` (mod.ts:147-153) — the adapter consumes it verbatim
- *  so the entrypoint wiring stays a one-liner. */
+/** The engine `PushEvent` — the adapter consumes it verbatim so the
+ *  entrypoint wiring stays a one-liner. */
 export type PushEventLike = PushEvent;
 
 /**
@@ -573,9 +579,13 @@ export type PushEventLike = PushEvent;
  * hook (`onPush: (event, env) => handleUserPushEvent(env, event)`). Resolves
  * the D1 repositories row from the event's combined name (case-folded — the
  * engine preserves request casing, D1 is lower-case) and hands the delta to
- * `handleUserPushNotifications`. Repositories without a D1 row (the
- * transitional engine-only population, incl. the e2e suite) and the receive
- * warm-up probes have no hooks to notify — silent no-op, never a log storm.
+ * `handleUserPushNotifications`. The gate-threaded identity
+ * (`event.pusherId`, an in-process engine call argument — see the header)
+ * resolves to the users row and names the payload's pusher/sender; a row that
+ * no longer resolves and every identity-less receive (repositories without a
+ * D1 row — the transitional engine-only population, incl. the e2e suite — and
+ * the receive warm-up probes) have no hooks or fall back to the owner —
+ * silent no-op or owner attribution, never a log storm.
  */
 export async function handleUserPushEvent(env: WebhookPushEnv, event: PushEventLike): Promise<void> {
   if (event.updates.length === 0) return;
@@ -588,5 +598,12 @@ export async function handleUserPushEvent(env: WebhookPushEnv, event: PushEventL
   // The engine names the applied tip `new`; the receive-pipeline vocabulary
   // (and every payload builder below) says `next`.
   const updates = event.updates.map((update) => ({ ref: update.ref, old: update.old, next: update.new }));
-  await handleUserPushNotifications(env, pair.repo, updates, pair.owner);
+  // The authenticated pusher when the id still resolves to a row; anything
+  // else (stale id, identity-less receive) leaves null and the fan-out falls
+  // back to the repository owner (the mirror precedent).
+  let pusher: UserRow | null = null;
+  if (event.pusherId !== undefined) {
+    pusher = (await drizzle(env.DB).select().from(users).where(eq(users.id, event.pusherId)).get()) ?? null;
+  }
+  await handleUserPushNotifications(env, pair.repo, updates, pusher);
 }

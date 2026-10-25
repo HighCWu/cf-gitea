@@ -190,6 +190,16 @@ export interface PushEvent {
   updates: RefUpdate[];
   /** unix millis of the newest committer date after the push */
   commitTime: number;
+  /**
+   * The authenticated pusher, when the embedding Worker resolved one for this
+   * receive and passed it on the fetch call (`internal.pusher` — see
+   * `PusherIdentity` for why this is a call argument, not a request header).
+   * Absent for engine-native receives (no argument passed); consumers must
+   * fall back to their own attribution (e.g. the repository owner) and never
+   * derive the pusher from client-controlled request data.
+   */
+  pusherId?: number;
+  pusherLogin?: string;
 }
 
 export interface DurableGitOptions<E extends Env = Env> {
@@ -764,6 +774,10 @@ async function stagePack(
  * already run. Wire behavior is unchanged end to end: 503 Retry-After when
  * another push holds the lease (T7), report-status with per-command ok/ng
  * lines otherwise, byte-identical to the pre-split DO rendering.
+ *
+ * `pusher` is the embedding Worker's authenticated identity for this receive
+ * (the optional `internal.pusher` fetch argument) — surfaced verbatim on the
+ * `onPush` event, never used for authorization.
  */
 async function receivePack<E extends Env>(
   req: Request,
@@ -771,7 +785,8 @@ async function receivePack<E extends Env>(
   repo: string,
   ctx: ExecutionContext,
   registry: DurableObjectStub<Registry>,
-  options: DurableGitOptions<E>
+  options: DurableGitOptions<E>,
+  pusher?: PusherIdentity,
 ): Promise<Response> {
   const bucket = env.REPO_PACKS;
   if (!bucket) {
@@ -1026,7 +1041,12 @@ async function receivePack<E extends Env>(
         // registry deferred
       }
       if (options.onPush) {
-        const event: PushEvent = { repo, updates: fin.updates, commitTime: idle };
+        const event: PushEvent = {
+          repo,
+          updates: fin.updates,
+          commitTime: idle,
+          ...(pusher !== undefined ? { pusherId: pusher.id, pusherLogin: pusher.login } : {}),
+        };
         ctx.waitUntil(
           Promise.resolve(options.onPush(event, env)).catch((err) => {
             console.log(`[onPush ${repo}] hook failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1062,7 +1082,33 @@ function receiveHeaders(): Record<string, string> {
 /** The returned handler: a valid Worker default export, with `fetch` non-optional
  * so it can also be delegated to from a wrapping router. */
 export interface DurableGitHandler<E extends Env = Env> {
-  fetch(req: Request, env: E, ctx: ExecutionContext): Promise<Response>;
+  fetch(req: Request, env: E, ctx: ExecutionContext, internal?: EngineCallOptions): Promise<Response>;
+}
+
+/**
+ * An authenticated identity the embedding Worker resolved for a receive and
+ * hands to the engine on the fetch call. In-process by construction: the
+ * identity never rides the wire, so a client cannot forge it on any path —
+ * including the paths that bypass an embedding Worker's auth gate and reach
+ * the engine with raw client headers, where a request-header channel (e.g. an
+ * `x-push-user` header) WOULD be forgeable. The engine surfaces it verbatim
+ * on `PushEvent.pusherId`/`pusherLogin`; it performs no authorization with it.
+ */
+export interface PusherIdentity {
+  /** the pusher's stable id in the embedding Worker's store */
+  id: number;
+  /** the pusher's case-folded login */
+  login: string;
+}
+
+/**
+ * Per-call options for an embedding Worker's `engine.fetch` invocation. The
+ * parameter is positional and optional, so every existing caller — including
+ * the runtime's three-argument default-export invocation — is unaffected.
+ */
+export interface EngineCallOptions {
+  /** Attribution for a receive-pack apply, surfaced on `PushEvent`. */
+  pusher?: PusherIdentity;
 }
 
 /**
@@ -1122,7 +1168,7 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
     pathname: namespaced ? "/:owner/:name{.git}?{/*}?" : "/:name{.git}?{/*}?",
   });
   return {
-    async fetch(req: Request, env: E, ctx: ExecutionContext): Promise<Response> {
+    async fetch(req: Request, env: E, ctx: ExecutionContext, internal?: EngineCallOptions): Promise<Response> {
       const url = new URL(req.url);
       const path = url.pathname;
 
@@ -1245,7 +1291,7 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
       // invalidated on return: a create-by-push must be visible to the next
       // request on this isolate immediately.
       if (sub === "/git-receive-pack" && req.method === "POST") {
-        const received = await receivePack(req, env, repo, ctx, registry, options);
+        const received = await receivePack(req, env, repo, ctx, registry, options, internal?.pusher);
         if (isReceive || isAdmin) infoMemo.delete(repo); // this isolate sees its own mutations
         return received;
       }

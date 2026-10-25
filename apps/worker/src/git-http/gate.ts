@@ -50,7 +50,7 @@
 
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import type { DurableGitHandler } from "@cf-gitea/git-engine";
+import type { DurableGitHandler, PusherIdentity } from "@cf-gitea/git-engine";
 
 import {
   authorizeGitHttp,
@@ -225,14 +225,19 @@ export async function gitHttpGate(
   // sees the gate-cleared mark and waves the request through. Receive-pack
   // forwards carry the D1-minted immutable storage key (SPEC-0001a §3 Step
   // 3): the engine's beginReceive resolves R2 addressing from it instead of
-  // the URL name, so renames/transfers never fork the storage namespace.
+  // the URL name, so renames/transfers never fork the storage namespace —
+  // and the authenticated pusher (in-process, see resolvePushPusher), which
+  // the engine surfaces on PushEvent so the push webhooks name the real
+  // pusher instead of the owner fallback.
+  const isPush = route.kind === "receive-pack";
   return forwardToEngine(
     req,
     url,
     env,
     ctx,
     engine,
-    route.kind === "receive-pack" ? resolved.repo.storageKey : undefined,
+    isPush ? resolved.repo.storageKey : undefined,
+    isPush ? await resolvePushPusher(env, req) : undefined,
   );
 }
 
@@ -335,7 +340,7 @@ async function handleUnknownRepository(
     // §2.5.2 finalize handshake (scheduled AFTER the response below — the
     // async settle body starts at call time, so scheduling it before the
     // forward would race the receive's finalize with an empty-DO listRefs).
-    const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey);
+    const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified));
     ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`));
     return response;
   }
@@ -361,7 +366,7 @@ async function handleUnknownRepository(
   // race the finalize with an empty-DO listRefs). The forward carries the
   // fresh row's storage key: the very first receive already addresses R2 by
   // r_<id>, so no name-addressed prefix ever gets written for this repo.
-  const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey);
+  const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey, verifiedPusher(verified));
   ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`));
   return response;
 }
@@ -483,10 +488,44 @@ async function prepareEngineRequest(req: Request, url: URL, storageKey?: string)
   });
 }
 
+/** The verified token user, as the engine's `PusherIdentity` (the push-create
+ *  forwards already hold the verification in hand — no re-resolve). */
+function verifiedPusher(verified: { user: { id: number; usernameLower: string } }): PusherIdentity {
+  return { id: verified.user.id, login: verified.user.usernameLower };
+}
+
+/**
+ * The authenticated pusher for a receive-pack forward: the D1 user the
+ * credential verifies to, re-resolved here because `authorizeGitHttp` decides
+ * allow/deny from its own verification and returns no identity (acl.ts).
+ *
+ * TRUST SHAPE (closes webhooks-push.ts's identity gap): the pusher travels as
+ * an in-process `engine.fetch` ARGUMENT, never as a request header. The
+ * header shape fails verification — a receive-pack request CAN reach the
+ * engine with raw client headers: the D1-missing, unverifiable-credential
+ * passthrough below (`verified === null` → verbatim `engine.fetch`) forwards
+ * the client's own header set, and nothing engine-side could distinguish a
+ * client-supplied `x-push-user` from a gate-set one (the gate-cleared mark is
+ * Worker-internal; the engine's authorize hook allows the request either
+ * way). A function argument has no wire representation, so no client-reachable
+ * path can supply it — the engine may surface it on PushEvent verbatim.
+ * `null` (a token revoked between the matrix's verify and this one; anonymous
+ * cannot reach an allowed write, kept as defense) forwards no identity and the
+ * webhook fan-out falls back to the repository owner.
+ */
+async function resolvePushPusher(env: Env, req: Request): Promise<PusherIdentity | null> {
+  const credential = requestCredential(req);
+  if (credential === null) return null;
+  const verified = await new TokenService(env.DB).verify(credential).catch(() => null);
+  return verified === null ? null : verifiedPusher(verified);
+}
+
 /** Gate-cleared engine invocation (the shared §2.1 item 5 tail). `storageKey`
  *  (D1 repositories.storage_key) rides the x-storage-key header on
  *  receive-pack forwards; every other route passes it unset and keeps the
- *  byte-identical passthrough (the D1-missing e2e population depends on it). */
+ *  byte-identical passthrough (the D1-missing e2e population depends on it).
+ *  `pusher` rides the engine's in-process call-options argument on receive
+ *  forwards only (resolvePushPusher) — the engine puts it on PushEvent. */
 async function forwardToEngine(
   req: Request,
   url: URL,
@@ -494,6 +533,7 @@ async function forwardToEngine(
   ctx: ExecutionContext,
   engine: DurableGitHandler<Env>,
   storageKey?: string,
+  pusher?: PusherIdentity | null,
 ): Promise<Response> {
   let forwarded: Request;
   try {
@@ -504,7 +544,7 @@ async function forwardToEngine(
     return bareBadRequest();
   }
   gateCleared.add(forwarded);
-  return engine.fetch(forwarded, env, ctx);
+  return engine.fetch(forwarded, env, ctx, pusher ? { pusher } : undefined);
 }
 
 /**
