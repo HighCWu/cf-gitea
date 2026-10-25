@@ -4,6 +4,11 @@
  *
  *   GET/POST /{owner}/{repo}/settings        the basics form (this module)
  *   GET/POST /{owner}/{repo}/settings/hooks  the webhooks list + add form
+ *   GET/POST /{owner}/{repo}/settings/hooks/{id}
+ *                                            the per-hook page (wave 14 —
+ *                                            below; edit form + recent
+ *                                            deliveries + the test-fire POST
+ *                                            + delete)
  *   GET/POST /{owner}/{repo}/settings/mirror the mirror panel (wave 10 —
  *                                            below; the brief's dedicated
  *                                            sub-page for options.tmpl's
@@ -56,12 +61,16 @@
  *   template flag has no consumer; website is stored by saveRepoSettings but
  *   no page renders it yet), the mirror/archive-tint sections, and every
  *   other navbar item (collaboration/branches/keys/LFS/Actions — no pages).
- * - The hooks list is read-only: upstream links each row to its settings
- *   page and carries the edit/delete/test-fire actions — none of those pages
- *   or POST routes exist in the UI inventory, so rows render as text with a
- *   delivery count (upstream's per-hook LastStatus dot renders neutral: no
- *   last-status column exists). The provider dropdown menu (link_menu) is
- *   replaced by the single inline add form below the list.
+ * - The hooks list links every row onto its settings page (wave 14 —
+ *   upstream base_list.tmpl's name + pencil anchors; before that page
+ *   existed the rows rendered as text) and the per-hook LastStatus dot
+ *   renders the maintained `webhooks.last_status` (green/red/neutral —
+ *   base_list.tmpl's three classes; the wave-4 "no last-status column"
+ *   note predates the consumer's stamp). Delete/test-fire live on the
+ *   detail page — upstream's list trash button is a JS link-action whose
+ *   confirm modal is not reproduced; dead controls are forbidden (§2.4.1).
+ *   The provider dropdown menu (link_menu) is replaced by the single inline
+ *   add form below the list.
  * - The add form fixes the hook type to `gitea` (the generic JSON webhook):
  *   the other nine HOOK_TYPES need provider-specific config fields (Slack
  *   channel &c.) the form does not render. Events stay the service default
@@ -87,20 +96,89 @@
  * are forbidden (§2.4.1). `?sync=queued` renders the upstream
  * pull_mirror_sync_in_progress flash text as an info message (the flash
  * reduction — no session-flash plumbing exists; the param is display-only).
+ *
+ * ## The per-hook page (wave 14 — upstream repo/settings/webhook/{new,
+ *  settings,history}.tmpl over WebHooksEdit/TestWebhook/DeleteWebhook)
+ *
+ *   GET  /{owner}/{repo}/settings/hooks/{id}          the edit form + the
+ *                                                     recent-deliveries list
+ *   POST /{owner}/{repo}/settings/hooks/{id}          the edit write
+ *   POST /{owner}/{repo}/settings/hooks/{id}/test     the test-fire write
+ *   POST /{owner}/{repo}/settings/hooks/{id}/delete   the delete write
+ *
+ * The GET renders upstream's edit page: gitea.tmpl's payload_url +
+ * content_type pair and settings.tmpl's name/active fields, plus the branch
+ * filter (a landed PATCH-arm field the add form never rendered). The page
+ * discriminator is `repository settings new webhook` — upstream renders the
+ * EDIT page through new.tmpl (WebHooksEdit → orCtx.NewTemplate), so that is
+ * the literal class at this pin. The edit write re-plays the landed hooks
+ * PATCH arm (routes/hooks.ts repoEditHook over services/hooks.ts
+ * editRepoHook): validation 422s re-render inline, success 303s back onto
+ * the page (upstream editWebhook's redirect). Documented divergences:
+ *   - The edit POST rides the page URL; upstream type-prefixes it
+ *     (`/settings/hooks/gitea/{id}`, GiteaHooksEditPost) — the landed add
+ *     form fixes the type to `gitea`, so the page's own URL carries the
+ *     write (the wave-4 posture).
+ *   - The secret field is not rendered: the landed PATCH arm has NO secret
+ *     write (editRepoHook applies url/content_type only from config), so an
+ *     input bound to it would be a dead control (§2.4.1).
+ *   - The authorization-header field is not rendered: the stored header is
+ *     write-only (toApiHook renders ""), so a form bound to it would CLEAR
+ *     the stored value on every submit; the PATCH arm keeps it when the
+ *     field is absent.
+ *   - The event radio/checkbox matrix stays the wave-4 degradation; because
+ *     the PATCH arm rewrites subscriptions UNCONDITIONALLY (an absent field
+ *     resets to push-only), the form carries the hook's current events as
+ *     hidden inputs so an edit preserves them, and "Trigger On:" renders
+ *     the subscription as read-only text.
+ * The recent-deliveries list is the landed hook-delivery read arm
+ * (listHookDeliveries, newest first) with upstream history.tmpl's status
+ * marks: succeeded rows green (octicon-check), undelivered rows orange
+ * (pending/delivering/skipped — octicon-clock stands in for upstream's
+ * octicon-stopwatch, which is not in the landed icon allowlist —
+ * scripts/gen-ui-icons.mjs is outside this wave's ownership), delivered
+ * failures red (the dot fill stands in for octicon-alert, same allowlist
+ * note). The rows are the collapsed history items: uuid, event type, time
+ * — the request/response payload tabs and the per-delivery replay are not
+ * rendered (no JS plumbing; the payload bodies would need the tab
+ * switcher). The test-fire POST re-plays the landed repoTestHook arm over
+ * the same services the API route calls (buildTestPushPayload +
+ * fireTestDelivery): an empty repository fires nothing (the arm's
+ * early-204), success enqueues through the same structural WEBHOOK_DELIVERY
+ * producer probe as routes/hooks.ts (absent binding ⇒ the row stays
+ * `pending` with the log complete) and 303s back with `?test=queued` — the
+ * flash reduction rendering upstream's repo.settings.webhook.delivery.success
+ * text as an info message. Delete answers upstream DeleteWebhook's
+ * list redirect: the arm-scoped tail carries the id (upstream's shared
+ * `/settings/hooks/delete?id=` form target exists for the list's trash
+ * buttons, which this UI does not render), a miss 404-shells (the landed
+ * DELETE arm's 404, the settings pages' existence-hiding posture).
  */
 
 import { inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { ApiError } from "../../api/errors";
-import { createRepoHook, hookEventsArray, listRepoHooks, type WebhookRow } from "../../api/services/hooks";
+import {
+  buildTestPushPayload,
+  createRepoHook,
+  editRepoHook,
+  getRepoHook,
+  hookEventsArray,
+  listHookDeliveries,
+  listRepoHooks,
+  fireTestDelivery,
+  type WebhookRow,
+} from "../../api/services/hooks";
+import { apiUserFromRow, toApiRepository, type RepositoryWithOwner, type UserRow } from "../../api/services/repository";
 import { collaboratorModeOf } from "../../api/services/repo-collaborators";
 import { getMirrorStatus, type MirrorStatus } from "../../api/services/mirror";
 import { loadRepoSettings, saveRepoSettings } from "../../api/services/repo-settings";
 import { RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
 import { timeSinceParts } from "../page-data";
 import { TimeSince } from "../components/file-list";
-import { webhookDeliveries } from "../../db/schema";
+import { HookStatus, webhookDeliveries } from "../../db/schema";
+import type { IconName } from "../icons";
 import type { RepoRow, UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -124,6 +202,8 @@ export const settingsLocale = {
   secret: "Secret", // "repo.settings.secret"
   active: "Active", // "repo.settings.active"
   no_webhooks: "No webhooks yet.", // cf-gitea addition (upstream renders an empty segment)
+  webhook_name_empty: "Unnamed Webhook", // "repo.settings.webhook.name_empty" (wave 14: the rows link, so the fallback text renders)
+  edit_hook_aria: "Edit this webhook", // cf-gitea addition — the pencil link's accessible name (upstream's is icon-only)
   deliveries_1: "delivery", // cf-gitea addition: the per-hook delivery count chip
   deliveries: "deliveries", // cf-gitea addition
 } as const;
@@ -408,24 +488,41 @@ export function HooksSettingsPage(props: { ctx: UiContext; data: HooksSettingsDa
               <div>{settingsLocale.no_webhooks}</div>
             ) : (
               <div class="flex-divided-list">
-                {data.hooks.map((hook) => (
-                  <div class="item flex-text-block">
-                    {/* No last-status column: the neutral dot branch of
-                        base_list.tmpl (tw-text-text-light) for every row. */}
-                    <span class="tw-text-text-light">
-                      <Icon name="octicon-dot-fill" size={22} />
-                    </span>
-                    <div class="gt-ellipsis tw-flex-1">
-                      <span title={hook.row.url}>{hook.row.name !== "" ? hook.row.name : hook.row.url}</span>
-                      <span class="tw-ml-2 tw-text-grey-light">{hook.row.url}</span>
+                {data.hooks.map((hook) => {
+                  // base_list.tmpl's three dot classes over the maintained
+                  // last_status (webhooks/consumer.ts stamps it per delivery
+                  // outcome): Succeed green, Fail red, else the neutral gray.
+                  const statusClass =
+                    hook.row.lastStatus === HookStatus.Succeed
+                      ? "tw-text-green"
+                      : hook.row.lastStatus === HookStatus.Fail
+                        ? "tw-text-red"
+                        : "tw-text-text-light";
+                  const hookLink = `${repoLink}/settings/hooks/${hook.row.id}`;
+                  return (
+                    <div class="item flex-text-block">
+                      <span class={statusClass}>
+                        <Icon name="octicon-dot-fill" size={22} />
+                      </span>
+                      <div class="gt-ellipsis tw-flex-1">
+                        <a title={hook.row.url} href={hookLink}>
+                          {hook.row.name !== "" ? hook.row.name : settingsLocale.webhook_name_empty}
+                        </a>
+                        <span class="tw-ml-2 tw-text-grey-light">{hook.row.url}</span>
+                      </div>
+                      <span class="ui tiny label">
+                        {hook.deliveries === 1
+                          ? `1 ${settingsLocale.deliveries_1}`
+                          : `${hook.deliveries} ${settingsLocale.deliveries}`}
+                      </span>
+                      {/* base_list.tmpl's pencil anchor (aria-label additive —
+                          upstream's is icon-only, §2.4.1). */}
+                      <a class="muted" href={hookLink} aria-label={settingsLocale.edit_hook_aria}>
+                        <Icon name="octicon-pencil" />
+                      </a>
                     </div>
-                    <span class="ui tiny label">
-                      {hook.deliveries === 1
-                        ? `1 ${settingsLocale.deliveries_1}`
-                        : `${hook.deliveries} ${settingsLocale.deliveries}`}
-                    </span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -672,6 +769,363 @@ function MirrorSettingsPage(props: { ctx: UiContext; data: MirrorSettingsData; e
                     — rendered read-only, never dead controls (§2.4.1). */}
                 <p class="tw-text-placeholder-text">{mirrorLocale.editing_unavailable}</p>
               </>
+            )}
+          </div>
+        </div>
+      </div>
+    </BaseLayout>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The per-hook page (GET/POST /settings/hooks/{id} + the test/delete POSTs —
+// pages wave 14; upstream WebHooksEdit / GiteaHooksEditPost / TestWebhook /
+// DeleteWebhook)
+// ---------------------------------------------------------------------------
+
+/** Page chrome text (the settingsLocale pattern; upstream locale keys cited). */
+export const hookDetailLocale = {
+  update_webhook: "Update Webhook", // "repo.settings.update_webhook"
+  branch_filter: "Branch filter", // "repo.settings.branch_filter"
+  event_desc: "Trigger On:", // "repo.settings.event_desc"
+  recent_deliveries: "Recent Deliveries", // "repo.settings.recent_deliveries"
+  test_delivery: "Test Push Event", // "repo.settings.webhook.test_delivery"
+  test_delivery_desc: "Test this webhook with a fake push event.", // "repo.settings.webhook.test_delivery_desc"
+  test_queued:
+    "An event has been added to the delivery queue. It may take few seconds before it shows up in the delivery history.", // "repo.settings.webhook.delivery.success" (the ?test=queued flash reduction's text)
+  delete_webhook: "Remove Webhook", // "repo.settings.delete_webhook"
+  no_deliveries: "No deliveries yet.", // cf-gitea addition (upstream renders an empty segment)
+} as const;
+
+/** One-page cap for the recent-deliveries list (listHookDeliveries is
+ *  paginated, newest first; the cap mirrors HOOKS_LIST_LIMIT — upstream
+ *  pages the history at 10 with a pager this page does not render). */
+export const HOOK_DELIVERIES_LIMIT = 20;
+
+/** One rendered delivery row: the consumer's row as stored. */
+export type HookDeliveryRow = typeof webhookDeliveries.$inferSelect;
+
+/** The stored branch filter — inside the HookEvent JSON (services/hooks.ts's
+ *  private branchFilterOf, re-parsed here; malformed blob ⇒ ""). */
+export function hookBranchFilterOf(row: WebhookRow): string {
+  try {
+    return (JSON.parse(row.events) as { branch_filter?: string }).branch_filter ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** The per-hook page's render inputs: the hook row, its subscription names,
+ *  branch filter, the edit-form binding and the newest deliveries. */
+export interface HookDetailData {
+  hook: WebhookRow;
+  events: string[];
+  branchFilter: string;
+  deliveries: HookDeliveryRow[];
+  /** The pagination-independent delivery total (the read arm's count). */
+  deliveryTotal: number;
+  /** The edit form's binding (the stored values; overwritten with the kept
+   *  submission on a validation re-render). */
+  form: HookEditForm;
+}
+
+/** Load the per-hook page (the landed repoGetHook + repoListHookDeliveries
+ *  arms). `null` = the 404 shell: an unknown or foreign-repo hook id. */
+export async function loadHookDetailData(d1: D1Database, repoId: string, hookId: number): Promise<HookDetailData | null> {
+  const hook = await getRepoHook(d1, repoId, hookId);
+  if (hook === null) return null;
+  const { items, total } = await listHookDeliveries(d1, hook.id, { page: 1, limit: HOOK_DELIVERIES_LIMIT });
+  const events = hookEventsArray(hook.events);
+  return {
+    hook,
+    events,
+    branchFilter: hookBranchFilterOf(hook),
+    deliveries: items,
+    deliveryTotal: total,
+    form: hookEditFormOf(hook, events),
+  };
+}
+
+/** The edit form's fields — the landed PATCH arm's form-mapped subset
+ *  (name, config.url, config.content_type, branch_filter, events, active;
+ *  the secret and authorization header are the module header's not-rendered
+ *  notes). Field names are upstream gitea.tmpl's. */
+export interface HookEditForm {
+  name: string;
+  payloadUrl: string;
+  contentType: string;
+  branchFilter: string;
+  events: string[];
+  active: boolean;
+}
+
+/** The stored row as the form binding (hookContentTypeName for the stored
+ *  id; the subscription names drive the hidden preserve inputs). */
+export function hookEditFormOf(hook: WebhookRow, events: string[]): HookEditForm {
+  return {
+    name: hook.name,
+    payloadUrl: hook.url,
+    contentType: hook.contentType === 2 ? "form" : "json",
+    branchFilter: hookBranchFilterOf(hook),
+    events,
+    active: hook.isActive,
+  };
+}
+
+/** Parse the urlencoded edit POST. The `events` hidden preserve inputs ride
+ *  the same field name upstream's JS form submits (the PATCH arm rewrites
+ *  subscriptions unconditionally — the module header). */
+export function parseHookEditForm(params: URLSearchParams): HookEditForm {
+  const contentType = params.get("content_type") ?? "json";
+  return {
+    name: (params.get("name") ?? "").trim(),
+    payloadUrl: (params.get("payload_url") ?? "").trim(),
+    contentType: contentType === "form" ? "form" : "json",
+    branchFilter: params.get("branch_filter") ?? "",
+    events: params.getAll("events"),
+    active: (params.get("active") ?? "") !== "",
+  };
+}
+
+export type HookEditResult = { outcome: "saved" } | { outcome: "invalid"; message: string };
+
+/**
+ * The edit write — exactly the PATCH arm's service call (`editRepoHook`):
+ * url/content_type validate with the API's 422 messages (re-rendered
+ * inline), the events rewrite + branch filter apply unconditionally (the
+ * form always sends them), name/active apply from the form.
+ */
+export async function editHookFromForm(d1: D1Database, hook: WebhookRow, form: HookEditForm): Promise<HookEditResult> {
+  try {
+    await editRepoHook(d1, hook, {
+      name: form.name,
+      active: form.active,
+      branch_filter: form.branchFilter,
+      events: form.events,
+      config: { url: form.payloadUrl, content_type: form.contentType },
+    });
+    return { outcome: "saved" };
+  } catch (error) {
+    if (error instanceof ApiError) return { outcome: "invalid", message: error.message };
+    throw error;
+  }
+}
+
+// --- the test-fire (the landed repoTestHook arm's steps) -----------------------
+
+/** Structural shape of the WEBHOOK_DELIVERY Queue producer, as probed by the
+ *  API's test arm (routes/hooks.ts webhookDeliveryQueue — the binding is
+ *  absent from the generated Env today; the probe is structural so the
+ *  enqueue starts the moment the binding lands). */
+export interface HookDeliveryQueue {
+  sendBatch(messages: { body: { deliveryId: number } }[]): Promise<unknown>;
+}
+
+export function hookDeliveryQueueOf(env: unknown): HookDeliveryQueue | null {
+  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
+  if (candidate === undefined || candidate === null) return null;
+  const queue = candidate as { sendBatch?: (messages: { body: { deliveryId: number } }[]) => Promise<unknown> };
+  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+}
+
+export type HookTestResult = { outcome: "fired"; deliveryId: number };
+
+/**
+ * The test-fire write (routes/hooks.ts's repoTestHook handler body over the
+ * same landed services — the empty-repo no-fire arm is the caller's): the
+ * representative push payload at `refs/heads/<default branch>` (the arm's
+ * default — the UI form carries no ref field), the delivery row insert
+ * INLINE (the request-visible effect), and the optional Queue enqueue hung
+ * off the caller's `waitUntil` (sub-second, never fails the response; a
+ * missing producer leaves the row `pending` — SPEC-0005 §3.6).
+ */
+export async function fireHookTestDelivery(args: {
+  d1: D1Database;
+  hook: WebhookRow;
+  pair: RepositoryWithOwner;
+  /** The signed-in doer's user row (the payload's pusher/sender). */
+  user: UserRow;
+  origin: string;
+  queue: HookDeliveryQueue | null;
+  waitUntil?: (promise: Promise<unknown>) => void;
+}): Promise<HookTestResult> {
+  const ref = `refs/heads/${args.pair.repo.defaultBranch}`;
+  // The payload's pusher/sender/repository are the route's converted API
+  // objects (routes/hooks.ts passes c.get("authUser") — the same
+  // apiUserFromRow conversion the file-editor's webhook emissions build).
+  const apiUser = apiUserFromRow(args.user, { origin: args.origin, requester: null });
+  const payload = buildTestPushPayload(args.pair, ref, {
+    repository: toApiRepository({ origin: args.origin, requester: apiUser }, args.pair),
+    pusher: apiUser,
+    sender: apiUser,
+  });
+  const deliveryId = await fireTestDelivery(args.d1, args.hook, "push", payload, { repoId: args.pair.repo.id });
+  if (args.queue !== null && args.waitUntil !== undefined) {
+    args.waitUntil(
+      args.queue.sendBatch([{ body: { deliveryId } }]).then(undefined, (error: unknown) => {
+        console.error(`[hooks] delivery enqueue failed for ${deliveryId}: ${error instanceof Error ? error.message : String(error)}`);
+      }),
+    );
+  }
+  return { outcome: "fired", deliveryId };
+}
+
+// --- components -----------------------------------------------------------------
+
+/** history.tmpl's status mark for one delivery: succeeded green (check),
+ *  undelivered orange (pending/delivering/skipped — the clock stands in for
+ *  the un-allowlisted octicon-stopwatch), delivered failure red (the dot
+ *  fill stands in for octicon-alert — the module header's allowlist note). */
+function deliveryStatus(row: HookDeliveryRow): { cls: string; icon: IconName } {
+  if (row.isSucceed) return { cls: "tw-text-green", icon: "octicon-check" };
+  if (row.state !== "delivered") return { cls: "tw-text-orange", icon: "octicon-clock" };
+  return { cls: "tw-text-red", icon: "octicon-dot-fill" };
+}
+
+/** The delivery row's time: delivered when stamped, created otherwise (a
+ *  pending row's queue age — upstream's blank Delivered cell reduced to the
+ *  created stamp; cf-gitea addition). */
+function DeliveryTime(props: { row: HookDeliveryRow }) {
+  const at = props.row.deliveredAt ?? props.row.createdAt;
+  if (at === null) return null;
+  return <TimeSince unixSeconds={Math.floor(at.getTime() / 1000)} tz="+0000" />;
+}
+
+function DeliveryItem(props: { row: HookDeliveryRow }) {
+  const { row } = props;
+  const status = deliveryStatus(row);
+  return (
+    <div class="item">
+      <div class="flex-left-right">
+        <div class="flex-text-inline">
+          <span class={status.cls}>
+            <Icon name={status.icon} />
+          </span>
+          <span class="tw-font-mono">{row.uuid}</span>
+        </div>
+        <div class="flex-text-block">
+          <span class="ui tiny label">{row.eventType}</span>
+          <span class="tw-text-text-light">
+            <DeliveryTime row={row} />
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The full-document render (the render.tsx pattern). */
+export function renderHookDetailPage(options: {
+  ctx: UiContext;
+  data: HookDetailData;
+  error: string | null;
+  /** The `?test=queued` flash reduction (the module header). */
+  testQueued: boolean;
+}): string {
+  return renderPage(
+    <HookDetailPage ctx={options.ctx} data={options.data} error={options.error} testQueued={options.testQueued} />,
+  );
+}
+
+/**
+ * The per-hook page (§2.4.1 discriminator: `repository settings new webhook`
+ * — upstream renders the EDIT page through new.tmpl, so that is the literal
+ * class; the module header). The edit form + the recent-deliveries segment
+ * with the Test Push Event button (history.tmpl's header shape).
+ */
+export function HookDetailPage(props: { ctx: UiContext; data: HookDetailData; error: string | null; testQueued: boolean }) {
+  const { ctx, data } = props;
+  const repo = ctx.repo;
+  if (repo === undefined) throw new Error("HookDetailPage requires ctx.repo");
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  const hookLink = `${repoLink}/settings/hooks/${data.hook.id}`;
+  const form = data.form;
+  return (
+    <BaseLayout ctx={ctx} title={hookDetailLocale.update_webhook} pageClass="repository settings new webhook">
+      <div class="ui container flex-container">
+        <SettingsNav repoLink={repoLink} active="hooks" />
+        <div class="flex-container-main">
+          {/* gitea.tmpl's form + settings.tmpl's fields (the module
+              header's not-rendered notes for secret/auth-header/events). */}
+          <h4 class="ui top attached header">{hookDetailLocale.update_webhook}</h4>
+          <div class="ui attached segment">
+            <form class="ui form" action={hookLink} method="post">
+              {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
+              {form.events.map((event) => (
+                <input type="hidden" name="events" value={event} />
+              ))}
+              <div class="required field">
+                <label for="payload_url">{settingsLocale.payload_url}</label>
+                <input id="payload_url" name="payload_url" type="url" required value={form.payloadUrl} />
+              </div>
+              <div class="field">
+                <label for="content_type">{settingsLocale.content_type}</label>
+                <select id="content_type" name="content_type" class="ui selection dropdown">
+                  <option value="json" selected={form.contentType === "json"}>
+                    JSON
+                  </option>
+                  <option value="form" selected={form.contentType === "form"}>
+                    application/x-www-form-urlencoded
+                  </option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="hook_name">{settingsLocale.webhook_name}</label>
+                <input id="hook_name" name="name" type="text" maxlength={255} value={form.name} />
+              </div>
+              <div class="field">
+                <label for="branch_filter">{hookDetailLocale.branch_filter}</label>
+                <input id="branch_filter" name="branch_filter" type="text" value={form.branchFilter} />
+              </div>
+              <div class="inline field">
+                <div class="ui checkbox">
+                  <input id="hook_active" name="active" type="checkbox" checked={form.active} />
+                  <label for="hook_active">{settingsLocale.active}</label>
+                </div>
+              </div>
+              <div class="field">
+                <button type="submit" class="ui primary button">
+                  {hookDetailLocale.update_webhook}
+                </button>
+              </div>
+            </form>
+            {/* The read-only subscription line (settings.tmpl's matrix
+                reduced — the hidden inputs above preserve it through the
+                PATCH arm's unconditional rewrite). */}
+            <p class="tw-text-placeholder-text">
+              {hookDetailLocale.event_desc} {form.events.length > 0 ? form.events.join(", ") : "push"}
+            </p>
+            <form method="post" action={`${hookLink}/delete`}>
+              <button type="submit" class="ui red button">
+                {hookDetailLocale.delete_webhook}
+              </button>
+            </form>
+          </div>
+          {/* history.tmpl's header shape: the list title + the test-fire
+              button (upstream's JS data-link POST reduced to a form). */}
+          <h4 class="ui top attached header flex-left-right">
+            <span>{hookDetailLocale.recent_deliveries}</span>
+            <form method="post" action={`${hookLink}/test`}>
+              <button
+                type="submit"
+                class="ui tiny button"
+                title={hookDetailLocale.test_delivery_desc}
+                aria-label={hookDetailLocale.test_delivery_desc}
+              >
+                {hookDetailLocale.test_delivery}
+              </button>
+            </form>
+          </h4>
+          <div class="ui attached segment">
+            {props.testQueued ? <div class="ui info message">{hookDetailLocale.test_queued}</div> : null}
+            {data.deliveries.length === 0 ? (
+              <div>{hookDetailLocale.no_deliveries}</div>
+            ) : (
+              <div class="flex-divided-list">
+                {data.deliveries.map((row) => (
+                  <DeliveryItem row={row} />
+                ))}
+              </div>
             )}
           </div>
         </div>

@@ -468,7 +468,10 @@ describe("settings webhooks (/settings/hooks)", () => {
     const html = await (
       await fetchUi("/alice/wave4/settings/hooks", { headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` } })
     ).text();
-    expect(html).toContain(">build hook</span>");
+    // Wave 14: the row name links onto the per-hook page (base_list.tmpl's
+    // anchor), the URL span rides along.
+    expect(html).toContain('href="/alice/wave4/settings/hooks/');
+    expect(html).toContain(">build hook</a>");
     expect(html).toContain('<span class="tw-ml-2 tw-text-grey-light">https://hooks.example.com/cf-gitea</span>');
     expect(html).toContain("0 deliveries</span>");
     // The stored row validates through the service: active flag, gitea type.

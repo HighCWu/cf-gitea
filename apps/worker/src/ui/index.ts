@@ -128,6 +128,36 @@
  *                                          admin viewer only; the Synchronize
  *                                          Now POST enqueues the landed
  *                                          mirror-sync message)
+ *   /:owner/:repo/settings/hooks/{id}      per-hook page, GET (pages/
+ *                                          settings.tsx — wave 14; the edit
+ *                                          form + the recent-deliveries
+ *                                          list; admin viewer only)
+ *   /:owner/:repo/settings/hooks/{id}[/test|/delete]
+ *                                          the per-hook writes, POST (the
+ *                                          edit rides the page URL —
+ *                                          upstream type-prefixes it; test
+ *                                          mirrors TestWebhook's literal
+ *                                          tail; delete carries the id on
+ *                                          the tail — upstream's shared
+ *                                          /delete?id= target exists for
+ *                                          the list trash buttons this UI
+ *                                          does not render)
+ *   /{org}/labels                          org labels management, GET
+ *                                          (pages/org-labels.tsx — wave 14;
+ *                                          the landed org-label family's
+ *                                          list over the org-teams owner
+ *                                          gate; the brief's literal URL —
+ *                                          upstream nests the page under
+ *                                          /org/{org}/settings/labels, the
+ *                                          documented divergence; claims
+ *                                          the `labels` second segment
+ *                                          before the repo parse, shadowing
+ *                                          a repo named "labels" exactly
+ *                                          like the teams literal)
+ *   /{org}/labels/{new|edit|delete}        the label writes, POST (upstream's
+ *                                          exact POST segments, org.NewLabel
+ *                                          /UpdateLabel/DeleteLabel; GET →
+ *                                          405)
  *   /:owner/:repo/compare[/{base}...{head}]  compare view, GET + POST
  *                                          (pages/compare.tsx — wave 13;
  *                                          upstream web.go:1307-1315's
@@ -314,6 +344,16 @@ import {
   resolveOrgTeamsOrg,
 } from "./pages/org-teams";
 import {
+  createOrgLabelFromForm,
+  deleteOrgLabelFromForm,
+  editOrgLabelFromForm,
+  formLabelId,
+  loadOrgLabelsData,
+  NEW_LABEL_DEFAULT_COLOR,
+  parseOrgLabelForm,
+  renderOrgLabelsPage,
+} from "./pages/org-labels";
+import {
   applyUserProfileForm,
   loadUserSettingsPageData,
   parseUserProfileForm,
@@ -340,18 +380,25 @@ import {
   applyRepoBasics,
   canAdminRepo,
   createHookFromForm,
+  editHookFromForm,
+  fireHookTestDelivery,
+  hookDeliveryQueueOf,
+  loadHookDetailData,
   loadHooksSettings,
   loadMirrorSettings,
   loadRepoBasics,
   mirrorLocale,
   parseCreateHookForm,
+  parseHookEditForm,
   parseRepoBasicsForm,
+  renderHookDetailPage,
   renderHooksSettingsPage,
   renderMirrorSettingsPage,
   renderRepoSettingsPage,
   syncMirrorNow,
 } from "./pages/settings";
 import { findIssueByRepoAndIndex } from "../api/services/issues";
+import { deleteRepoHook, getRepoHook } from "../api/services/hooks";
 import { findPullRequestByIndex } from "../api/services/pulls";
 import { findRepositoryById } from "../api/services/repository";
 import { IssuesService } from "../issues/service";
@@ -431,12 +478,21 @@ export interface IssueNewRoute {
 }
 
 /** The wave-4 settings families (pages/settings.tsx): the basics form, the
- *  webhooks sub-page, and — wave 10 — the mirror panel, each GET + POST —
- *  admin-viewer-only surfaces. */
+ *  webhooks sub-page, the mirror panel — wave 10 — and the wave-14 per-hook
+ *  page with its two POST tails, each GET + POST except the two POST-only
+ *  tails — admin-viewer-only surfaces. */
 export interface SettingsRoute {
-  family: "settings" | "settings-hooks" | "settings-mirror";
+  family:
+    | "settings"
+    | "settings-hooks"
+    | "settings-mirror"
+    | "settings-hook-detail"
+    | "settings-hook-test"
+    | "settings-hook-delete";
   owner: string;
   repo: string;
+  /** The hook id (the detail/test/delete families only). */
+  id?: number;
 }
 
 /** The wave-5 comment-write family (pages/issue-detail.tsx): upstream
@@ -605,6 +661,18 @@ export interface OrgTeamsRoute {
   id?: number;
 }
 
+/** The wave-14 org labels management families (pages/org-labels.tsx): the
+ *  brief's literal `/{org}/labels` page plus upstream's three POST segments
+ *  (`/labels/new`, `/labels/edit`, `/labels/delete` — web.go:1043-1048's
+ *  writes; the brief's literal claims the `labels` second segment before the
+ *  repo parse, the teams precedent). The `/labels/initialize` template
+ *  loader and any deeper tail stay unclaimed → the engine's 404. */
+export interface OrgLabelsRoute {
+  family: "org-labels" | "org-label-new" | "org-label-edit" | "org-label-delete";
+  /** Decoded org segment. */
+  owner: string;
+}
+
 /** The wave-13 compare family (pages/compare.tsx): upstream's
  *  `m.Get("/compare")` + the `/compare/*` path group (web.go:1307-1315) —
  *  the bare URL (both sides the default branch) and the `{base}...{head}`
@@ -656,6 +724,7 @@ export type ParsedUiRoute =
   | NotificationsRoute
   | UserSettingsRoute
   | OrgTeamsRoute
+  | OrgLabelsRoute
   | CompareRoute;
 
 
@@ -775,6 +844,23 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return null;
   }
 
+  // The wave-14 org labels families (pages/org-labels.tsx — the brief's
+  // literal `/{org}/labels` + upstream's three POST segments): the literal
+  // `labels` second segment claimed before the tail parse could read it as a
+  // repository named "labels" (the teams precedent; upstream nests the page
+  // under /org/{org}/settings/labels and shadows nothing here — pages/
+  // org-labels.tsx's divergence note). The `/labels/initialize` template
+  // loader and every other tail stay unclaimed → the engine's 404.
+  if (repo === "labels") {
+    if (raw.length === 3) return { family: "org-labels", owner };
+    if (raw.length === 4) {
+      if (raw[3] === "new") return { family: "org-label-new", owner };
+      if (raw[3] === "edit") return { family: "org-label-edit", owner };
+      if (raw[3] === "delete") return { family: "org-label-delete", owner };
+    }
+    return null;
+  }
+
   const tail = raw.slice(3);
   if (tail.length === 0) return { family: "home", owner, repo, refSuffix: null };
 
@@ -836,6 +922,20 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // Wave 10: the mirror panel (the brief's literal URL; upstream renders
     // the section on options.tmpl — pages/settings.tsx's divergence note).
     if (rest.length === 1 && rest[0] === "mirror") return { family: "settings-mirror", owner, repo };
+    // Wave 14: the per-hook page + its two POST tails (upstream's
+    // /settings/hooks/{id} WebHooksEdit + /{id}/test TestWebhook; the delete
+    // rides the arm-scoped tail — upstream's shared /delete?id= form target
+    // exists for the list trash buttons this UI does not render;
+    // pages/settings.tsx's wave-14 header). PathParamInt64 parity: "007"
+    // parses as 7, a negative is admitted here and 404-shells on the lookup
+    // (the issue-detail convention). Any other tail (/settings/hooks/abc,
+    // /{id}/edit, deeper) stays engine-owned — upstream has no such routes.
+    if (rest.length >= 2 && rest[0] === "hooks" && /^-?\d+$/.test(rest[1] as string)) {
+      const id = Number.parseInt(rest[1] as string, 10);
+      if (rest.length === 2) return { family: "settings-hook-detail", owner, repo, id };
+      if (rest.length === 3 && rest[2] === "test") return { family: "settings-hook-test", owner, repo, id };
+      if (rest.length === 3 && rest[2] === "delete") return { family: "settings-hook-delete", owner, repo, id };
+    }
     return null;
   }
   // Wave-6: the milestones list (the bare URL, `?state=` carries the facet)
@@ -1379,6 +1479,139 @@ async function mirrorSyncSubmit(c: Context<{ Bindings: Env }>): Promise<Response
   });
 }
 
+// ---------------------------------------------------------------------------
+// The wave-14 per-hook family (pages/settings.tsx — upstream WebHooksEdit /
+// GiteaHooksEditPost / TestWebhook / DeleteWebhook)
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/settings/hooks/{id} (pages/settings.tsx — the edit
+ *  form + the recent-deliveries list; `?test=queued` renders the flash
+ *  reduction's info message). The settings gate's order (repo → anonymous
+ *  login 303 → signed-in non-admin 404 shell), the drift guard, then the
+ *  repo-scoped hook read — an unknown or foreign-repo id 404-shells (the
+ *  landed repoGetHook arm). */
+async function hookDetailPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, ctx, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-hook-detail" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  const data = await loadHookDetailData(c.env.DB, resolved.repo.id, route.id);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  const testQueued = url.searchParams.get("test") === "queued";
+  return respond(c.html(renderHookDetailPage({ ctx, data, error: null, testQueued }), 200));
+}
+
+/**
+ * POST /{owner}/{repo}/settings/hooks/{id} — the edit write (upstream
+ * GiteaHooksEditPost over the landed PATCH arm's service call): success 303s
+ * back onto the page (upstream editWebhook's redirect), the 422
+ * validations re-render at 200 with the message and the kept submission
+ * (the login failure convention). The POST rides the page URL — upstream
+ * type-prefixes it (`/gitea/{id}`); the module header's divergence note.
+ */
+async function hookDetailSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-hook-detail" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  const hook = await getRepoHook(c.env.DB, repo.id, route.id);
+  if (hook === null) return respond(c.html(renderNotFound(ctx), 404));
+  const hookLink = `${repoLinkOf(repo)}/settings/hooks/${hook.id}`;
+  const form = parseHookEditForm(await readUrlEncodedForm(c.req.raw));
+  const result = await editHookFromForm(c.env.DB, hook, form);
+  if (result.outcome === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: hookLink } }));
+  }
+  const data = await loadHookDetailData(c.env.DB, repo.id, hook.id);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  data.form = form;
+  return respond(c.html(renderHookDetailPage({ ctx, data, error: result.message, testQueued: false }), 200));
+}
+
+/** The resolved repo row's canonical link (the handlers' `RepoLink`). */
+function repoLinkOf(repo: RepoRow): string {
+  return `/${repo.ownerNamespace}/${repo.slug}`;
+}
+
+/**
+ * POST /{owner}/{repo}/settings/hooks/{id}/test — the test-fire write
+ * (upstream TestWebhook's literal tail over the landed repoTestHook arm's
+ * steps): an empty repository fires nothing (the arm's early-204 answered
+ * as a silent 303 back), then the representative push payload is built and
+ * the delivery row inserted through fireHookTestDelivery — the Queue
+ * enqueue rides c.executionCtx.waitUntil when the producer binding exists
+ * (routes/hooks.ts's structural probe; VALUE-position access — never name
+ * ExecutionContext in type position). Success 303s back with
+ * `?test=queued` (the flash reduction).
+ */
+async function hookTestSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-hook-test" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  const hook = await getRepoHook(c.env.DB, repo.id, route.id);
+  if (hook === null) return respond(c.html(renderNotFound(ctx), 404));
+  const hookLink = `${repoLinkOf(repo)}/settings/hooks/${hook.id}`;
+  // The landed arm's empty-repo no-fire (TestHook's ctx.Repo.Commit == nil
+  // early-204 — the services/hooks.ts header).
+  if (repo.isEmpty) return respond(new Response(null, { status: 303, headers: { location: hookLink } }));
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the gate above admitted only users
+  const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (userRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  let waitUntil: ((promise: Promise<unknown>) => void) | undefined;
+  try {
+    waitUntil = c.executionCtx.waitUntil.bind(c.executionCtx);
+  } catch {
+    waitUntil = undefined; // in-process test callers have none (the pending D1 row is the truth)
+  }
+  await fireHookTestDelivery({
+    d1: c.env.DB,
+    hook,
+    pair,
+    user: userRow,
+    origin: resolved.url.origin,
+    queue: hookDeliveryQueueOf(c.env),
+    waitUntil,
+  });
+  return respond(new Response(null, { status: 303, headers: { location: `${hookLink}?test=queued` } }));
+}
+
+/**
+ * POST /{owner}/{repo}/settings/hooks/{id}/delete — upstream
+ * DeleteWebhook's write (the landed deleteRepoHook arm): success 303s onto
+ * the hooks list (upstream JSONRedirect's target); a miss 404-shells (the
+ * landed DELETE arm's 404 — existence stays hidden).
+ */
+async function hookDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-hook-delete" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  const deleted = await deleteRepoHook(c.env.DB, repo.id, route.id);
+  if (!deleted) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/hooks` } }));
+}
+
 /** GET on a POST-only family — upstream chi answers 405 for a registered
  *  path with the wrong method (the gate's plainTextInternal shape). */
 function methodNotAllowed(allow: string): Response {
@@ -1620,6 +1853,94 @@ async function orgTeamNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response
     return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/teams/${result.team.id}` } }));
   }
   return respond(c.html(renderOrgTeamNewPage(ctx, { org, form, error: result.message }), 200));
+}
+
+// ---------------------------------------------------------------------------
+// The wave-14 org labels family (pages/org-labels.tsx — the brief's literal
+// /{org}/labels page + upstream's /labels/{new,edit,delete} POST segments)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{org}/labels (pages/org-labels.tsx — the management list + create
+ * form). The org-teams prologue is family-agnostic (session → org resolve →
+ * the requireOrgOwnership gate) and serves unchanged: an anonymous viewer
+ * 303s onto the login round-trip, a signed-in non-owner 404-shells (the
+ * upstream page sits in the "require owner permission" org group), a renamed
+ * org 307s onto the new name.
+ */
+async function orgLabelsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, respond } = resolved;
+  if (resolved.route.family !== "org-labels") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgLabelsData(c.env.DB, resolved.org, url.searchParams);
+  return respond(c.html(renderOrgLabelsPage({ ctx, data, form: { title: "", color: NEW_LABEL_DEFAULT_COLOR }, error: null }), 200));
+}
+
+/**
+ * POST /{org}/labels/new (upstream org.NewLabel over the landed create arm):
+ * the §2.8 Origin guard, the shared prologue, then `normalizeLabelColor` +
+ * `createOrgLabel` — success 303s back onto the list (upstream
+ * JSONRedirect's target), the empty-title guard and the color 422 re-render
+ * at 200 with the message and the kept submission (the login failure
+ * convention).
+ */
+async function orgLabelNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-label-new") return respond(await c.notFound()); // drift guard
+  const form = parseOrgLabelForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createOrgLabelFromForm(c.env.DB, org.id, form);
+  if (result.outcome === "applied") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/labels` } }));
+  }
+  const data = await loadOrgLabelsData(c.env.DB, org, new URLSearchParams());
+  return respond(c.html(renderOrgLabelsPage({ ctx, data, form, error: result.message }), 200));
+}
+
+/**
+ * POST /{org}/labels/edit (upstream org.UpdateLabel over the landed edit
+ * arm's order — the org-scoped lookup before any color 422): success 303s
+ * back onto the list; a missing/foreign id 404-shells (the landed PATCH
+ * arm's plain "not found"); the failures re-render with the error banner
+ * and the STORED row values (pages/org-labels.tsx's re-render note).
+ */
+async function orgLabelEditSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-label-edit") return respond(await c.notFound()); // drift guard
+  const params = await readUrlEncodedForm(c.req.raw);
+  const form = parseOrgLabelForm(params);
+  const result = await editOrgLabelFromForm(c.env.DB, org.id, formLabelId(params.get("id")), form);
+  if (result.outcome === "applied") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/labels` } }));
+  }
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadOrgLabelsData(c.env.DB, org, new URLSearchParams());
+  return respond(c.html(renderOrgLabelsPage({ ctx, data, form: { title: "", color: NEW_LABEL_DEFAULT_COLOR }, error: result.message }), 200));
+}
+
+/**
+ * POST /{org}/labels/delete (upstream org.DeleteLabel over the landed
+ * delete arm): the cascade delete when the org-scoped row exists, SUCCESS
+ * either way (the arm's zero-row 204) — both arms 303 back onto the list.
+ */
+async function orgLabelDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { org, respond } = resolved;
+  if (resolved.route.family !== "org-label-delete") return respond(await c.notFound()); // drift guard
+  const params = await readUrlEncodedForm(c.req.raw);
+  await deleteOrgLabelFromForm(c.env.DB, org.id, formLabelId(params.get("id")));
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/labels` } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -2339,6 +2660,17 @@ uiRouter.get("/:owner/teams", (c) => orgTeamsPage(c));
 uiRouter.get("/:owner/teams/new", (c) => orgTeamNewPage(c));
 uiRouter.post("/:owner/teams/new", (c) => orgTeamNewSubmit(c));
 uiRouter.get("/:owner/teams/:id", (c) => orgTeamDetailPage(c));
+// Wave-14 org labels family (parseUiRoute claims exactly these shapes; the
+// literal `labels` registers with the wave-9/12 statics so it beats the
+// dynamic /:owner/:repo pair — the wave-9 RegExpRouter note). The three
+// POST-only write tails answer GET with chi's 405.
+uiRouter.get("/:owner/labels", (c) => orgLabelsPage(c));
+uiRouter.post("/:owner/labels/new", (c) => orgLabelNewSubmit(c));
+uiRouter.get("/:owner/labels/new", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/labels/edit", (c) => orgLabelEditSubmit(c));
+uiRouter.get("/:owner/labels/edit", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/labels/delete", (c) => orgLabelDeleteSubmit(c));
+uiRouter.get("/:owner/labels/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));
@@ -2394,6 +2726,15 @@ uiRouter.get("/:owner/:repo/settings", (c) => settingsPage(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
+// Wave-14 per-hook family (parseUiRoute claims exactly these shapes; the
+// POSTs run the §2.8 sameOriginGuard first; the POST-only test/delete tails
+// answer GET with chi's 405 — the comment/label write convention).
+uiRouter.get("/:owner/:repo/settings/hooks/:id", (c) => hookDetailPage(c));
+uiRouter.post("/:owner/:repo/settings/hooks/:id", (c) => hookDetailSubmit(c));
+uiRouter.post("/:owner/:repo/settings/hooks/:id/test", (c) => hookTestSubmit(c));
+uiRouter.get("/:owner/:repo/settings/hooks/:id/test", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/hooks/:id/delete", (c) => hookDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
 // Wave-10 mirror panel (parseUiRoute claims exactly this shape; the same
 // settings gate as the other two sub-pages).
 uiRouter.get("/:owner/:repo/settings/mirror", (c) => mirrorSettingsPage(c));

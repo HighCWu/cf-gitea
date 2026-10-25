@@ -26,6 +26,7 @@ import landingGolden from "./goldens/landing.html?raw";
 import milestonesClosedGolden from "./goldens/milestones-closed.html?raw";
 import milestonesOpenGolden from "./goldens/milestones-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
+import orgLabelsGolden from "./goldens/org-labels.html?raw";
 import orgTeamDetailGolden from "./goldens/org-team-detail.html?raw";
 import orgTeamsGolden from "./goldens/org-teams.html?raw";
 import notificationsReadGolden from "./goldens/notifications-read.html?raw";
@@ -36,6 +37,7 @@ import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullReviewSignedInGolden from "./goldens/pull-review-signed-in.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
+import settingsHookDetailGolden from "./goldens/settings-hook-detail.html?raw";
 import settingsMirrorGolden from "./goldens/settings-mirror.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
 import userProfileGolden from "./goldens/user-profile.html?raw";
@@ -73,6 +75,10 @@ const goldens: Record<string, string> = {
   "org-teams.html": orgTeamsGolden,
   "org-team-detail.html": orgTeamDetailGolden,
   "user-settings-profile.html": userSettingsProfileGolden,
+  // Pages wave 14: the org labels management page and the per-hook page
+  // (the GOLDEN_CASES entries above).
+  "org-labels.html": orgLabelsGolden,
+  "settings-hook-detail.html": settingsHookDetailGolden,
   // Pages wave 13: the compare family (the plain comparison, the writer's
   // new-PR form view, the has-PR pair, the same-tip tag state).
   "compare-commits.html": compareCommitsGolden,

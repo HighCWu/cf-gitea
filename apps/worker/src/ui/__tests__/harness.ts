@@ -37,12 +37,15 @@ import {
 } from "../testing/seed-repo";
 import { IssuesService } from "../../issues/service";
 import { createRepoLabel } from "../../api/services/labels";
+import { createOrgLabel, listOrgLabels } from "../../api/services/labels-t2";
+import { createRepoHook } from "../../api/services/hooks";
 import { isWatchingRepo, watchRepo } from "../../api/services/repo-watchers";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { TeamsService } from "../../api/routes/org-teams";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { OrgService } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
+import { webhookDeliveries, webhooks } from "../../db/schema";
 
 // --- deterministic fixtures (mirrors pages.test.ts's seeding) -----------------
 
@@ -273,6 +276,15 @@ export const GOLDEN_CASES: GoldenCase[] = [
   { file: "org-teams.html", path: "/acme/teams", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "org-team-detail.html", path: "/acme/teams/1", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "user-settings-profile.html", path: "/user/settings", status: 200, signedIn: true },
+  // Org labels management (wave 14): the SIGNED-IN owner view (morgan owns
+  // acme) — the two fixture labels with their ContrastColor badges, the
+  // create form and the per-row edit/delete controls.
+  { file: "org-labels.html", path: "/acme/labels", status: 200, signedIn: true, sessionUser: "morgan" },
+  // The per-hook page (wave 14): the SIGNED-IN admin view of alice/golden's
+  // fixture hook — the edit form bound to the stored row and the
+  // recent-deliveries list with the three status marks (the fixed-uuid
+  // delivery rows keep the bytes stable).
+  { file: "settings-hook-detail.html", path: "/alice/golden/settings/hooks/1", status: 200, signedIn: true },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
@@ -790,6 +802,107 @@ async function seedGoldenTeams(): Promise<void> {
   });
 }
 
+/**
+ * The wave-14 org labels fixtures for the acme org (the org-labels golden):
+ * two labels through the LANDED create arm (createOrgLabel — the labels
+ * table carries no timestamp column, so the rows are deterministic by
+ * construction). Runs AFTER the org seed. Changing no other page's bytes —
+ * only the management page reads org labels. Idempotent by the org's label
+ * total.
+ */
+async function seedGoldenOrgLabels(): Promise<void> {
+  const org = await new OrgService(env.DB).getOrgByUsername("acme");
+  if (org === null) throw new Error("acme org row missing before org-label seeding");
+  if ((await listOrgLabels(env.DB, org.id, "", 1, 1)).total > 0) return;
+  await createOrgLabel(env.DB, org.id, {
+    name: "blocked",
+    exclusive: false,
+    color: "#d73a4a",
+    description: "Blocked by another issue",
+  });
+  await createOrgLabel(env.DB, org.id, {
+    name: "good-first-issue",
+    exclusive: false,
+    color: "#7057ff",
+    description: "Good for newcomers",
+  });
+}
+
+/**
+ * The wave-14 webhook fixtures for alice/golden (the per-hook golden): one
+ * hook through the LANDED create arm plus three delivery rows inserted
+ * DIRECTLY — fireTestDelivery stamps crypto uuids and wall-clock times, so
+ * the fixed uuids + T0-pinned stamps here are the determinism (§5.2). One
+ * row per status branch: delivered+succeeded, pending (the queue producer
+ * is absent from the golden Env, so real fires would stay pending anyway),
+ * and a delivered failure. Runs AFTER the issue seed (the repo row must
+ * exist; the hook reads no issue data). Only the per-hook page and the
+ * hooks list read webhooks — no committed golden carries the hooks list, so
+ * no other bytes shift. Idempotent by the repo's first hook row.
+ */
+async function seedGoldenHooks(): Promise<void> {
+  const db = drizzle(env.DB);
+  const repo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "golden")))
+    .get();
+  if (repo === undefined) throw new Error("golden repo row missing before hook seeding");
+  if ((await db.select({ id: webhooks.id }).from(webhooks).where(eq(webhooks.repoId, repo.id)).limit(1).all()).length > 0) return;
+
+  await createRepoHook(env.DB, repo.id, {
+    type: "gitea",
+    name: "CI relay",
+    config: { url: "https://hooks.example.com/golden", content_type: "json", secret: "golden-secret" },
+    active: true,
+    branch_filter: "main",
+    events: ["push"],
+  });
+  const hook = (await db.select().from(webhooks).where(eq(webhooks.repoId, repo.id)).get())!;
+
+  await db.insert(webhookDeliveries).values([
+    {
+      hookId: hook.id,
+      repoId: repo.id,
+      uuid: "golden-delivery-succeed",
+      eventType: "push",
+      eventGroup: "push",
+      payloadContent: "{}",
+      state: "delivered",
+      attempts: 1,
+      isSucceed: true,
+      requestContent: JSON.stringify({ url: "https://hooks.example.com/golden", http_method: "POST" }),
+      responseContent: JSON.stringify({ status: 200 }),
+      createdAt: new Date((T0 + 60) * 1000),
+      deliveredAt: new Date((T0 + 61) * 1000),
+    },
+    {
+      hookId: hook.id,
+      repoId: repo.id,
+      uuid: "golden-delivery-pending",
+      eventType: "push",
+      eventGroup: "push",
+      payloadContent: "{}",
+      state: "pending",
+      createdAt: new Date((T0 + 70) * 1000),
+    },
+    {
+      hookId: hook.id,
+      repoId: repo.id,
+      uuid: "golden-delivery-failed",
+      eventType: "push",
+      eventGroup: "push",
+      payloadContent: "{}",
+      state: "delivered",
+      attempts: 3,
+      isSucceed: false,
+      responseContent: JSON.stringify({ status: 500 }),
+      createdAt: new Date((T0 + 80) * 1000),
+      deliveredAt: new Date((T0 + 81) * 1000),
+    },
+  ]);
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
@@ -837,6 +950,11 @@ export function setupGoldenFixtures(): void {
     // Wave-12: the acme team fixtures (the org-teams goldens) — after the
     // org seed that creates acme, morgan and the repos.
     await seedGoldenTeams();
+    // Wave-14: the acme org labels + alice/golden's hook and delivery log
+    // (the org-labels and per-hook goldens) — both after the seeds their
+    // org/repo rows hang off.
+    await seedGoldenOrgLabels();
+    await seedGoldenHooks();
     // Wave 7: the user-profile golden renders the shared/repo/list rows'
     // "Updated {TimeSince}" from `repositories.updated_at` — the issue and
     // milestone seeders above stamp it with wall-clock time (the counter-
