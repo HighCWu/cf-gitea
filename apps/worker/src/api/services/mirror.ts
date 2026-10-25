@@ -35,13 +35,18 @@ import { parseHostPolicy } from "../../webhooks/ssrf";
  * row atomically — the arbitration points decide, never a read.
  */
 
-/** The env vars this service reads (structural slice, sync.ts's
- *  `MirrorSyncEnv` pattern — extends the generated Env, the MIRROR_* vars
- *  optional: absent = the lax default posture). */
-export interface MirrorSettingsEnv extends Env {
+/** The env the mirror settings/migrate orchestration reads: the queue binding
+ *  the enqueue side needs, picked from the generated Env (a wrangler.jsonc
+ *  rename surfaces as a keyof error HERE instead of hiding behind a stale
+ *  generated file), plus the MIRROR_* config vars kept OPTIONAL on purpose —
+ *  absent = the lax default posture, and the KEK guard fails closed (tests
+ *  drive the absent-KEK path with an explicit undefined). The generated Env
+ *  satisfies this structurally. */
+export interface MirrorSettingsEnv extends Pick<Env, "MIRROR_SYNC_QUEUE"> {
   /** `MIRROR_ALLOWED_HOST_LIST` (upstream MIGRATIONS_ALLOWED_HOSTS). */
   MIRROR_ALLOWED_HOST_LIST?: string;
-  /** `lax` (default) | `strict` (§4.1 — same syntax as the webhook lists). */
+  /** `lax` (default) | `strict` (§4.1 — same syntax as the webhook lists;
+   *  not declared in wrangler.jsonc — undeclared vars never load). */
   MIRROR_EGRESS_MODE?: string;
   /** AES-256-GCM KEK for `repo_mirrors.credentials_ciphertext` (§4.2). */
   MIRROR_CREDENTIAL_KEY?: string;

@@ -92,14 +92,24 @@ import {
 } from "../issues/webhooks";
 import { engineName, type RepoRow } from "../repos/service";
 
-/** The bindings/vars the push fan-out touches (structural, sync.ts pattern). */
-export interface WebhookPushEnv extends Env {
+/**
+ * The bindings/vars the push fan-out touches: the generated Env members it
+ * actually reads, picked (a wrangler.jsonc rename surfaces as a keyof error
+ * HERE instead of hiding behind a stale generated file), plus the one config
+ * var this module deliberately reads as runtime-optional. The generated Env
+ * satisfies this structurally; WEBHOOK_DELIVERY stays out of the type — the
+ * producer probe below looks it up structurally so a binding gap degrades to
+ * `pending` delivery rows instead of a type-level requirement.
+ */
+export interface WebhookPushEnv extends Pick<Env, "DB" | "REPO"> {
   /** Upstream `setting.AppURL` — the instance origin the §2.7 payload URLs
-   *  are built against. Optional: HTTP paths take the origin from the request,
-   *  and the engine's onPush seam carries none. Unset it falls back to
-   *  upstream's own default ROOT_URL, `http://localhost:3000`
-   *  (modules/setting/server.go:119-120) — payloads stay upstream-shaped and
-   *  absolute, exactly like a default-installed gitea without ROOT_URL. */
+   *  are built against. Optional IN THIS SLICE (the generated Env types the
+   *  declared var as required): HTTP paths take the origin from the request,
+   *  and the engine's onPush seam carries none, so test/embedding envs may
+   *  omit it. Unset it falls back to upstream's own default ROOT_URL,
+   *  `http://localhost:3000` (modules/setting/server.go:119-120) — payloads
+   *  stay upstream-shaped and absolute, exactly like a default-installed
+   *  gitea without ROOT_URL. */
   APP_URL?: string;
 }
 

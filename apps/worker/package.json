@@ -6,7 +6,7 @@
     "dev": "vite dev",
     "build": "vite build",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "wrangler types && tsc --noEmit",
     "db:migrate:remote": "wrangler d1 migrations apply cf-gitea --remote",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",

@@ -112,36 +112,34 @@ const TE = new TextEncoder();
 const TD = new TextDecoder();
 
 // ---------------------------------------------------------------------------
-// Env slice (structural, consumer.ts pattern) + queue message
+// Env (the generated Env + the one undeclared config read) + queue message
 // ---------------------------------------------------------------------------
 
 /**
- * The bindings/vars a mirror sync touches. The generated `Env` satisfies this
- * structurally; the MIRROR_* vars are optional reads (absent = lax egress, no
- * KEK).
+ * The bindings/vars a mirror sync touches. The sync runs the ENTRYPOINT'S
+ * engine mount (the `engine` instance below is index.ts's twin — its
+ * `authorize` hook is typed against the generated `Env`), so like the import
+ * channel's pipeline.ts the base is the generated `Env` INHERITED, not
+ * re-declared: wrangler-types drift surfaces at every read site instead of
+ * hiding behind parallel declarations (the 2026-10-25 incident — a stale
+ * generated file let `APP_URL`/`MIRROR_ALLOWED_HOST_LIST`/`MIRROR_CREDENTIAL_KEY`
+ * drift out from under the old optional re-declarations). Those three are now
+ * declared in wrangler.jsonc (var + secrets.required) and typed required —
+ * the runtime guards below stay as fail-closed defense anyway, exactly the
+ * webhookDeliveryQueue pattern (the generated Env types the binding as
+ * required, the code only defends the runtime). MIRROR_EGRESS_MODE is the
+ * one config read undeclared anywhere, so it stays an optional addition.
+ * The generated Env satisfies this structurally.
  */
 export interface MirrorSyncEnv extends Env {
-  /** `MIRROR_ALLOWED_HOST_LIST` (upstream MIGRATIONS_ALLOWED_HOSTS semantics,
-   *  §4.1 — same list syntax as WEBHOOK_ALLOWED_HOST_LIST). */
-  MIRROR_ALLOWED_HOST_LIST?: string;
-  /** `lax` (default) | `strict`. */
+  /** `lax` (default) | `strict`. Not declared in wrangler.jsonc, so the
+   *  generated Env never carries it (§4.1 — undeclared vars never load). */
   MIRROR_EGRESS_MODE?: string;
-  /** AES-256-GCM KEK for `repo_mirrors.credentials_ciphertext` (§4.2,
-   *  `wrangler secret put MIRROR_CREDENTIAL_KEY`). */
-  MIRROR_CREDENTIAL_KEY?: string;
-  /** Upstream `setting.AppURL` — the instance origin the §2.7 webhook payload
-   *  URLs are built against (upstream builds them absolute: notifier.go:913
-   *  `setting.AppURL + commits.CompareURL`, convert's `HTMLURL + "/commit/…"`).
-   *  Optional until the orchestrator binds an instance-origin var (HTTP paths
-   *  take the origin from the request; a queue consumer has none). Unset it
-   *  falls back to upstream's own default ROOT_URL, `http://localhost:3000`
-   *  (modules/setting/server.go:119-120) — payloads stay upstream-shaped and
-   *  absolute, exactly like a default-installed gitea without ROOT_URL. */
-  APP_URL?: string;
-  /** Sync message queue — the producer side. The binding is live in the
-   *  generated Env (required since the wrangler wiring landed); the runtime
-   *  guard below stays as fail-closed defense. */
-  MIRROR_SYNC_QUEUE: Queue;
+  // MIRROR_ALLOWED_HOST_LIST / MIRROR_CREDENTIAL_KEY / APP_URL ride the
+  // inherited generated Env members (declared vars/secrets — required); the
+  // guards in mirrorEgressPolicy/mirrorAuthHeader/instanceOrigin stay as
+  // fail-closed defense, and MIRROR_SYNC_QUEUE likewise (required binding,
+  // enqueueDueMirrorSyncs re-guards at runtime).
 }
 
 /** The only thing a producer puts on MIRROR_SYNC_QUEUE (§2.6 scheduling). */
