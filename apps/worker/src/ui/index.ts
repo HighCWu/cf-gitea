@@ -24,18 +24,33 @@
  *                                          upstream's type/URL match 303s the
  *                                          mismatched family onto the right
  *                                          one, issue_view.go:347-352)
+ *   /:owner/:repo/issues/new               new-issue form, GET + POST
+ *                                          (pages/new-issue.tsx — the first
+ *                                          authed write surface; POST → the
+ *                                          tier-1 IssuesService.createIssue →
+ *                                          303 onto the created detail page;
+ *                                          anonymous GET 303s onto
+ *                                          /login?redirect_to=…)
+ *   /:owner/:repo/settings                 repo basics form, GET + POST
+ *                                          (pages/settings.tsx — admin
+ *                                          viewer only)
+ *   /:owner/:repo/settings/hooks           webhooks list + add form, GET +
+ *                                          POST (pages/settings.tsx — admin
+ *                                          viewer only)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
  * separate TreeRoute/IssuesListRoute/IssueDetailRoute types below instead of
- * new UiFamily members. The rest of the suffixed /issues//pulls space
- * (`/issues/new`, `/issues/{index}/comments`, non-numeric or deeper tails)
- * and every other repo-scoped path stay with the engine — the four
- * git-protocol routes, the LFS family, and the engine JSON API/admin
- * surface. The parser claims families by shape and never protocol or engine
- * paths, and the reserved owner names (`api`, `assets` — SPEC-0003 §3) are
- * refused outright, so `/api/v1` and the edge-served `/assets/*` tree are
- * out of reach by construction.
+ * new UiFamily members. The wave-4 write families (issue-new/settings/
+ * settings-hooks) dispatch here too, with their own GET+POST handlers.
+ * The rest of the suffixed /issues//pulls space (`/issues/{index}/comments`,
+ * non-numeric or deeper tails), the deeper /settings/* space
+ * (`/settings/branches`, …), and every other repo-scoped path stay with the
+ * engine — the four git-protocol routes, the LFS family, and the engine
+ * JSON API/admin surface. The parser claims families by shape and never
+ * protocol or engine paths, and the reserved owner names (`api`, `assets` —
+ * SPEC-0003 §3) are refused outright, so `/api/v1` and the edge-served
+ * `/assets/*` tree are out of reach by construction.
  *
  * ## Dispatcher integration (orchestrator-owned `src/index.ts`, §2.2)
  *
@@ -76,13 +91,33 @@ import { Hono, type Context } from "hono";
 import { trimTrailingSlash } from "hono/trailing-slash";
 
 import { isReservedOwnerName } from "../repos/service";
+import { readUrlEncodedForm } from "./forms";
 import { AssetBuildError, loadManifest } from "./manifest";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
+import { sameOriginGuard } from "./session";
 import { treeRedirectResponse } from "./pages/repo-home";
 import { crossFamilyRedirect, loadIssueDetailData, renderIssueDetailPage } from "./pages/issue-detail";
 import { loadIssuesListData, renderIssuesListPage } from "./pages/issues-list";
-import { shellAssetsFromManifest, type UiContext } from "./ui-context";
+import {
+  createIssueFromForm,
+  loadNewIssueData,
+  newIssueLocale,
+  readNewIssueForm,
+  renderNewIssuePage,
+} from "./pages/new-issue";
+import {
+  applyRepoBasics,
+  canAdminRepo,
+  createHookFromForm,
+  loadHooksSettings,
+  loadRepoBasics,
+  parseCreateHookForm,
+  parseRepoBasicsForm,
+  renderHooksSettingsPage,
+  renderRepoSettingsPage,
+} from "./pages/settings";
+import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
 // ---------------------------------------------------------------------------
@@ -147,9 +182,26 @@ export interface IssueDetailRoute {
   index: number;
 }
 
+/** The wave-4 new-issue family (pages/new-issue.tsx): the form GET + the
+ *  write POST — upstream's `/issues/new` (routers/web/repo/issue.go
+ *  NewIssue/NewIssuePost). */
+export interface IssueNewRoute {
+  family: "issue-new";
+  owner: string;
+  repo: string;
+}
+
+/** The wave-4 settings families (pages/settings.tsx): the basics form and
+ *  the webhooks sub-page, each GET + POST — admin-viewer-only surfaces. */
+export interface SettingsRoute {
+  family: "settings" | "settings-hooks";
+  owner: string;
+  repo: string;
+}
+
 /** Everything `parseUiRoute` can return; `UiRoute` remains the slice-1 view
  *  render.tsx consumes. */
-export type ParsedUiRoute = UiRoute | TreeRoute | IssuesListRoute | IssueDetailRoute;
+export type ParsedUiRoute = UiRoute | TreeRoute | IssuesListRoute | IssueDetailRoute | IssueNewRoute | SettingsRoute;
 
 
 /**
@@ -195,15 +247,27 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // swaps the still-encoded text, view_home.go:521). /issues and /pulls
   // claim the bare list URLs plus the wave-3 single-integer detail tail
   // (upstream chi `/{index}` + PathParamInt64: "007" is 7, a negative is
-  // admitted here and 404-shells on the row lookup); anything else in the
-  // space (`/issues/new`, `/issues/1/comments`, non-numeric) stays
-  // engine-owned, the same posture as `/commit/{sha}` (§1.2, open question 1).
+  // admitted here and 404-shells on the row lookup) and — wave 4 — the
+  // `/issues/new` form (the family literal wins before the integer shape
+  // could, and the POST carries no family of its own). Anything else in the
+  // space (`/issues/1/comments`, non-numeric) stays engine-owned, the same
+  // posture as `/commit/{sha}` (§1.2, open question 1). `/settings` claims
+  // the bare basics URL and the `/settings/hooks` sub-page (wave 4); the
+  // deeper settings space stays engine-owned.
   if (head === "tree") return { family: "tree", owner, repo, rawSuffix: rest.join("/") };
   if (head === "issues" || head === "pulls") {
     if (rest.length === 0) return { family: head, owner, repo };
-    if (rest.length === 1 && /^-?\d+$/.test(rest[0] as string)) {
-      return { family: "issue-detail", owner, repo, urlKind: head, index: Number.parseInt(rest[0] as string, 10) };
+    if (rest.length === 1) {
+      if (head === "issues" && rest[0] === "new") return { family: "issue-new", owner, repo };
+      if (/^-?\d+$/.test(rest[0] as string)) {
+        return { family: "issue-detail", owner, repo, urlKind: head, index: Number.parseInt(rest[0] as string, 10) };
+      }
     }
+    return null;
+  }
+  if (head === "settings") {
+    if (rest.length === 0) return { family: "settings", owner, repo };
+    if (rest.length === 1 && rest[0] === "hooks") return { family: "settings-hooks", owner, repo };
     return null;
   }
   let suffix: string;
@@ -384,22 +448,36 @@ function isSliceOneRoute(route: ParsedUiRoute): route is UiRoute {
   return route.family === "home" || route.family === "commits" || route.family === "src";
 }
 
-/**
- * One handler for every claimed family: the parser re-reads the pathname
- * (the route registrations below exist so the sub-app never claims beyond
- * the parser's families), the repo resolves through the §2.5 public-repo
- * read, and the page switch renders (render.tsx delegates per family).
- * All routes are GET-only (§2.1); every unresolved repo/ref/path answers the
- * §4.5 404 shell, and a missing/unreadable manifest answers the §2.3.4 503
- * before any page work happens.
- */
-async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+// ---------------------------------------------------------------------------
+// Shared handler prologue + the wave-4 write handlers (§2.2)
+// ---------------------------------------------------------------------------
+
+/** The resolved parts every uiRouter handler shares (the §2.3.4 manifest
+ *  load, the SPEC-0010 §2.5 viewer resolution and its Set-Cookie plumbing,
+ *  the §2.5 repo read). `ok: false` carries the ready Response: the 503
+ *  assets failure, the null-parse 404 (registration/parser drift or a
+ *  trailing slash — the middleware below 301s those), or the §4.5 repo 404
+ *  shell (existence stays hidden for invisible repos, §2.5/§2.6). */
+type ResolvedUiRequest =
+  | {
+      ok: true;
+      url: URL;
+      route: ParsedUiRoute;
+      ctx: UiContext;
+      viewer: Viewer;
+      repo: RepoRow;
+      /** Attach the resolution's Set-Cookie directive (§2.4) when directed. */
+      respond: (res: Response) => Response;
+    }
+  | { ok: false; response: Response };
+
+async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<ResolvedUiRequest> {
   const url = new URL(c.req.url);
   const route = parseUiRoute(url.pathname);
   // Only reachable through registration/parser drift or a trailing slash
   // (the middleware below turns the trailing-slash 404 into the canonical
   // 301) — never render the shell for a path the parser does not claim.
-  if (route === null) return c.notFound();
+  if (route === null) return { ok: false, response: await c.notFound() };
 
   // SPEC-0010 §2.5 viewer resolution (the session wave's transition note in
   // viewer.ts): the session cookie is verified per request and every
@@ -422,7 +500,7 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     viewer = resolution.viewer;
     ctx = { viewer: resolution.viewer, origin: url.origin, assets: shellAssetsFromManifest(manifest) };
   } catch (error) {
-    if (error instanceof AssetBuildError) return assetsNotBuilt(error);
+    if (error instanceof AssetBuildError) return { ok: false, response: assetsNotBuilt(error) };
     throw error;
   }
   const respond = (res: Response): Response => {
@@ -437,8 +515,171 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   // verbatim, a session viewer gains the authenticated read paths; anything
   // without a grant 404-shells exactly as before (existence stays hidden).
   const repo = await resolveRepositoryForViewer(c.env, viewer, route.owner, route.repo);
-  if (repo === null) return respond(c.html(renderNotFound(ctx), 404));
+  if (repo === null) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
   ctx.repo = repo;
+  return { ok: true, url, route, ctx, viewer, repo, respond };
+}
+
+/**
+ * The authed-page redirect (SPEC-0010 §2.5, the session wave's convention):
+ * an anonymous viewer 303s onto the login form with this path as the
+ * `redirect_to` round-trip target (the session router re-validates it
+ * through `safeRedirectTarget` at use time). Repo resolution happens FIRST,
+ * so an invisible repo 404-shells and never reveals itself through the
+ * redirect.
+ */
+function loginRedirect(pathname: string): Response {
+  return new Response(null, {
+    status: 303,
+    headers: { location: `/login?redirect_to=${encodeURIComponent(pathname)}` },
+  });
+}
+
+/** GET /{owner}/{repo}/issues/new (pages/new-issue.tsx): the form for the
+ *  signed-in viewer; anonymous 303s onto the login round-trip. */
+async function issueNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const data = await loadNewIssueData(c.env.DB, repo.id);
+  return respond(
+    c.html(
+      renderNewIssuePage({
+        ctx,
+        data,
+        form: { title: "", content: "", labelIds: [], milestoneId: null },
+        error: null,
+      }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/issues/new (upstream NewIssuePost): the §2.8 layer-2
+ * Origin guard, then the same repo→viewer order as the GET (invisible repos
+ * 404 before the redirect could leak them), then the tier-1
+ * `IssuesService.createIssue` — success 303s onto the created issue's detail
+ * page (upstream `ctx.Redirect(issue.Link())`, 303 per base.go:157),
+ * validation failures re-render the form at 200 with the message and the
+ * submitted values (the login failure convention).
+ */
+async function issueNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const form = await readNewIssueForm(c.req.raw);
+  // Archived repos refuse the write (the API create route's
+  // assertNotArchived posture — the message cites it verbatim).
+  if (repo.isArchived) {
+    const data = await loadNewIssueData(c.env.DB, repo.id);
+    return respond(c.html(renderNewIssuePage({ ctx, data, form, error: newIssueLocale.repo_archived }), 200));
+  }
+  const result = await createIssueFromForm(c.env.DB, repo.id, form, viewer.id);
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLink}/issues/${result.issue.index}` } }));
+  }
+  const data = await loadNewIssueData(c.env.DB, repo.id);
+  return respond(c.html(renderNewIssuePage({ ctx, data, form, error: result.message }), 200));
+}
+
+/** The settings admin gate (pages/settings.tsx header): anonymous → the
+ *  login 303; a signed-in non-admin → the 404 shell (upstream settings
+ *  pages are admin-only and equally undiscoverable). Returns the Response to
+ *  answer, or `null` to proceed. */
+async function settingsGate(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+): Promise<Response | null> {
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (!(await canAdminRepo(c.env.DB, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
+  return null;
+}
+
+/** GET /{owner}/{repo}/settings (pages/settings.tsx — the basics form). */
+async function settingsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const data = await loadRepoBasics(c.env.DB, resolved.repo);
+  return resolved.respond(c.html(renderRepoSettingsPage({ ctx: resolved.ctx, data, error: null }), 200));
+}
+
+/** POST /{owner}/{repo}/settings — the basics write through the landed
+ *  services (RepoService.rename/setVisibility + saveRepoSettings); success
+ *  303s back onto the CANONICAL settings URL (a rename moves the slug). */
+async function settingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const form = parseRepoBasicsForm(await readUrlEncodedForm(c.req.raw));
+  const result = await applyRepoBasics(c.env.DB, repo, form);
+  if (result.outcome === "applied") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${result.slug}/settings` } }));
+  }
+  const data = await loadRepoBasics(c.env.DB, repo);
+  data.form = { name: form.name, description: form.description, isPrivate: form.isPrivate };
+  return respond(c.html(renderRepoSettingsPage({ ctx, data, error: result.message }), 200));
+}
+
+/** GET /{owner}/{repo}/settings/hooks (pages/settings.tsx — the webhooks
+ *  list + add form). */
+async function hooksSettingsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const data = await loadHooksSettings(c.env.DB, resolved.repo.id);
+  return resolved.respond(c.html(renderHooksSettingsPage({ ctx: resolved.ctx, data, error: null }), 200));
+}
+
+/** POST /{owner}/{repo}/settings/hooks — the add-hook write through the
+ *  landed `createRepoHook`; success 303s back onto the list, the service's
+ *  validation message re-renders the form with the submission kept. */
+async function hooksSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const form = parseCreateHookForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createHookFromForm(c.env.DB, repo.id, form);
+  if (result.outcome === "created") {
+    return respond(
+      new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/settings/hooks` } }),
+    );
+  }
+  const data = await loadHooksSettings(c.env.DB, repo.id);
+  data.form = { name: form.name, payloadUrl: form.payloadUrl, contentType: form.contentType };
+  return respond(c.html(renderHooksSettingsPage({ ctx, data, error: result.message }), 200));
+}
+
+/**
+ * One handler for every claimed GET page family: the parser re-reads the
+ * pathname (the route registrations below exist so the sub-app never claims
+ * beyond the parser's families), the repo resolves through the §2.5
+ * public-repo read, and the page switch renders (render.tsx delegates per
+ * family). All routes are GET-only (§2.1); every unresolved repo/ref/path
+ * answers the §4.5 404 shell, and a missing/unreadable manifest answers the
+ * §2.3.4 503 before any page work happens.
+ */
+async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, route, ctx, respond, repo } = resolved;
 
   // Wave-2 dispatch (render.tsx never sees these families). The redirect
   // and the list page run AFTER the same §2.5 repo resolution as the
@@ -496,6 +737,17 @@ uiRouter.get("/:owner/:repo/src/*", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/tree", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/tree/*", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/issues", (c) => uiPage(c));
+// The static literal registers before the dynamic :index so handler choice
+// never depends on router precedence subtleties (Hono's RegExpRouter ranks
+// static segments first; this makes it local and obvious).
+uiRouter.get("/:owner/:repo/issues/new", (c) => issueNewPage(c));
+uiRouter.post("/:owner/:repo/issues/new", (c) => issueNewSubmit(c));
 uiRouter.get("/:owner/:repo/issues/:index", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls/:index", (c) => uiPage(c));
+// Wave-4 write families (parseUiRoute claims exactly these shapes; the
+// POSTs run the §2.8 sameOriginGuard first — session.ts's convention).
+uiRouter.get("/:owner/:repo/settings", (c) => settingsPage(c));
+uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
+uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
+uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));

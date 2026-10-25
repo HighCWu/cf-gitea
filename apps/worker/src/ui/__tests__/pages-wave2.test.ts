@@ -177,8 +177,7 @@ describe("wave-2 parser surface", () => {
   it.each([
     "/octo/hello/treeX/branch/main",
     "/octo/hello/issuesX",
-    "/octo/hello/issues/new", // the rest of the detail space stays engine-owned
-    "/octo/hello/issues/5/comments",
+    "/octo/hello/issues/5/comments", // (/issues/new became the wave-4 form family — wave-4 tests own it)
     "/octo/hello/issues/5x", // non-numeric index → engine 404 (chi PathParamInt64 parity)
     "/octo/hello/pulls/7/8",
     "/octo/hello/Issues", // family literals are lowercase-exact
@@ -300,8 +299,8 @@ describe("issues list page", () => {
     // The labeled issue (oldest open) is on page 2 — asserted there.
 
     // Tab counts over the SAME filter set, both states always shown.
-    expect(html).toContain(">26 Open</a>");
-    expect(html).toContain(">1 Closed</a>");
+    expect(html).toContain("26 Open</a>");
+    expect(html).toContain("1 Closed</a>");
     const tabs = html.slice(
       html.indexOf('<div class="small-menu-items ui compact tiny menu">'),
       html.indexOf('id="issue-list"'),
@@ -311,7 +310,7 @@ describe("issues list page", () => {
     expect(tabs.indexOf('class="active item flex-text-inline"')).toBeLessThan(tabs.indexOf('class="item flex-text-inline"'));
 
     // Event line: relative-time with the fixed seed timestamps + the verb
-    // (state icons are the documented icon-allowlist degradation).
+    // (the state glyph lives in the row's .item-leading slot — wave 4).
     expect(html).toContain('<relative-time prefix="" tense="past"');
     expect(html).toContain(">opened <relative-time"); // verb text (no icons this wave)
     // The `#{index}` index anchor of the leading row.
@@ -350,8 +349,8 @@ describe("issues list page", () => {
     expect(items).toHaveLength(1);
     expect(html).toContain(">closed early bird</a>");
     expect(html).toContain(">closed <relative-time"); // closed verb on the event line
-    expect(html).toContain(">26 Open</a>"); // counts span both tabs
-    expect(html).toContain(">1 Closed</a>");
+    expect(html).toContain("26 Open</a>"); // counts span both tabs
+    expect(html).toContain("1 Closed</a>");
     const tabs = html.slice(
       html.indexOf('<div class="small-menu-items ui compact tiny menu">'),
       html.indexOf('id="issue-list"'),
@@ -388,8 +387,8 @@ describe("issues list page", () => {
     const items = html.match(/<div class="item">/g) ?? [];
     expect(items).toHaveLength(1);
     expect(html).toContain(">pull: wave2 feature branch</a>");
-    expect(html).toContain(">1 Open</a>");
-    expect(html).toContain(">0 Closed</a>");
+    expect(html).toContain("1 Open</a>");
+    expect(html).toContain("0 Closed</a>");
     expect(html).not.toContain("pagination issue");
     // The PR row's title/index links use the upstream issue-link family
     // (/issues/{index} — upstream redirects PR numbers there).
@@ -415,8 +414,8 @@ describe("issues list page", () => {
     expect(first.status).toBe(200);
     const html = await first.text();
     expect(html).toContain('<h3 class="tw-my-4">No results</h3>');
-    expect(html).toContain(">0 Open</a>");
-    expect(html).toContain(">0 Closed</a>");
+    expect(html).toContain("0 Open</a>");
+    expect(html).toContain("0 Closed</a>");
     expect(html).not.toContain('id="issue-list"');
 
     const second = await fetchUi("/alice/wave2-empty/issues");

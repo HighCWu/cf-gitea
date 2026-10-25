@@ -14,11 +14,13 @@
 // wired as predev/prebuild/pretest and a CI step before typecheck) must run
 // before typecheck/tests, exactly like the gitignored assets build output.
 //
-// Shell constraint: shell.tsx's Icon hardcodes viewBox="0 0 16 16" and a
-// single `<path>`, so every allowlisted icon must be a single-path 16x16
-// octicon; anything else fails here (same fail-fast as the assets build's
-// input assertions). gitea/ is only ever READ — never written, never emitted
-// into (AGENTS.md submodule hygiene).
+// Shell constraint: shell.tsx's Icon hardcodes viewBox="0 0 16 16" and
+// renders one `<path>` per extracted d body, so every allowlisted icon must
+// be a 16x16 octicon with AT LEAST one `<path>`; single- and multi-path
+// bodies coexist (the wave-4 extension: octicon-issue-opened/-closed carry
+// two paths each). Anything else fails here (same fail-fast as the assets
+// build's input assertions). gitea/ is only ever READ — never written, never
+// emitted into (AGENTS.md submodule hygiene).
 //
 // Usage:
 //   node scripts/gen-ui-icons.mjs [options]
@@ -41,12 +43,13 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, '..');
 
 // SPEC-0008 §2.4.1 icon allowlist (sorted; derivation in the header above).
-// Wave 3 (issue/PR detail + tab strip) adds the single-path issue-family
-// glyphs: PR state machine (open/closed/draft), merge, the reopen event dot
-// and the sidebar milestone mark. octicon-issue-opened / octicon-issue-closed
-// stay OUT: they carry two <path> elements each, which fails the single-path
-// shell constraint asserted below — their slots degrade to text (see
-// shell.tsx / pages/issue-detail.tsx) until Icon learns multi-path bodies.
+// Wave 3 (issue/PR detail + tab strip) adds the issue-family glyphs: PR state
+// machine (open/closed/draft), merge, the reopen event dot and the sidebar
+// milestone mark. Wave 4 (pages wave 4) restores the issue-state glyphs the
+// wave-3 header deferred: octicon-issue-opened / octicon-issue-closed carry
+// TWO <path> elements each, which the multi-path Icon now carries (the
+// single-path-era degradation notes in issues-list.tsx / issue-detail.tsx
+// were retired with it).
 const ALLOWLIST = [
   'octicon-code',
   'octicon-dot-fill',
@@ -58,6 +61,8 @@ const ALLOWLIST = [
   'octicon-git-pull-request-draft',
   'octicon-globe',
   'octicon-history',
+  'octicon-issue-closed',
+  'octicon-issue-opened',
   'octicon-milestone',
   'octicon-repo',
   'octicon-three-bars',
@@ -88,7 +93,7 @@ function parseArgs(argv) {
       case '--gitea': opts.gitea = path.resolve(next()); break;
       case '--out': opts.out = path.resolve(next()); break;
       case '--help': case '-h':
-        console.log(readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(0, 31).join('\n'));
+        console.log(readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(0, 32).join('\n'));
         process.exit(0);
         break; // eslint no-fallthrough: exit(0) never returns, default is unreachable
       default: fail(`unknown option: ${arg} (see --help)`);
@@ -109,7 +114,7 @@ if (!existsSync(svgDir) || !statSync(svgDir).isDirectory()) {
   fail(`missing ${svgDir} (is the gitea/ submodule checked out? git submodule update --init)`);
 }
 
-// Extract one `<path d="…">` body per allowlisted icon; fail fast, listing
+// Extract every `<path d="…">` body per allowlisted icon; fail fast, listing
 // every problem at once (missing file = same failure class as the assets
 // build's required-input assertions).
 const bodies = {};
@@ -128,24 +133,26 @@ for (const name of ALLOWLIST) {
     continue;
   }
   const ds = [...svg.matchAll(/<path\b[^>]*?\bd="([^"]+)"/g)].map((m) => m[1]);
-  if (ds.length !== 1) {
-    unusable.push(`${name}.svg: expected exactly 1 <path d>, found ${ds.length} (single-path octicons only)`);
+  if (ds.length === 0) {
+    unusable.push(`${name}.svg: no <path d> found (Icon renders one <path> per body)`);
     continue;
   }
-  bodies[name] = ds[0];
+  bodies[name] = ds;
 }
 if (missing.length > 0) {
   fail(`missing icon file(s) in ${svgDir}: ${missing.map((n) => `${n}.svg`).join(', ')}`);
 }
 if (unusable.length > 0) {
-  fail(`icon file(s) unusable by the shell's single-path 16x16 Icon:\n  ${unusable.join('\n  ')}`);
+  fail(`icon file(s) unusable by the shell's 16x16 multi-path Icon:\n  ${unusable.join('\n  ')}`);
 }
 
 // Deterministic emission: fixed allowlist order, no timestamps — byte-identical
-// output across runs, so regeneration is diff-clean.
+// output across runs, so regeneration is diff-clean. Every value is the
+// icon's `<path d>` list (single-path icons keep exactly one entry, so their
+// rendered DOM is unchanged).
 const entries = ALLOWLIST.map((name) => {
-  const d = bodies[name].replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-  return `  "${name}": "${d}",`;
+  const ds = bodies[name].map((d) => `"${d.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`).join(', ');
+  return `  "${name}": [${ds}],`;
 }).join('\n');
 
 const generated = `/**
@@ -156,8 +163,9 @@ const generated = `/**
  * gitea/public/assets/img/svg/octicon-<name>.svg bodies, the committed
  * facade is src/ui/icons.ts, which re-exports this module unchanged.
  *
- * Single-path 16x16 octicons only — shell.tsx's Icon hardcodes
- * viewBox="0 0 16 16" and one <path>; the generator asserts both.
+ * 16x16 octicons, one entry per \`<path d>\` body (single- and multi-path
+ * both allowed) — shell.tsx's Icon hardcodes viewBox="0 0 16 16" and renders
+ * one <path> per entry; the generator asserts the viewbox and non-emptiness.
  */
 
 export const ICON_PATHS = {

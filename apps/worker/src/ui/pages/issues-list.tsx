@@ -10,37 +10,40 @@
  *
  * `.page-content.repository.issue-list` (both lists share the upstream
  * template), `div#issue-list.flex-divided-list.items-with-main` with one
- * `.item` per row (`.item-main` > `.item-header` title + `.labels-list`
- * badges, `.item-body` #index / event line / milestone), `.item-trailing`
- * comment count, the `small-menu-items ui compact tiny menu` open/closed
- * tabs, and the `tw-text-center tw-p-8` empty state.
+ * `.item` per row (`.item-leading` state glyph + `.item-main` > `.item-header`
+ * title + `.labels-list` badges, `.item-body` #index / event line /
+ * milestone), `.item-trailing` comment count, the `small-menu-items ui
+ * compact tiny menu` open/closed tabs, and the `tw-text-center tw-p-8` empty
+ * state.
  *
  * ## Documented v1 degradations (data that has no landed source, §6 method)
  *
- * - State glyphs (`shared/issueicon.tmpl`: octicon-issue-opened/closed,
- *   octicon-git-pull-request): the icon allowlist is the generator's
- *   committed constant (scripts/gen-ui-icons.mjs — outside this wave's file
- *   ownership), so no issue-family octicons exist yet. The `.item-leading`
- *   slot is omitted and state is carried textually: the Open/Closed tab
- *   counts and the "opened/closed …" event line verbs. Restoring the glyphs
- *   is one allowlist line + `pnpm gen:icons` + this template spot.
  * - Milestone badge renders as plain text (upstream links
  *   `/{repo}/milestone/{id}` — no milestone page exists; the §2.4.1 rule
  *   "dead links are not emitted" wins over the upstream shape).
  * - Poster names are plain text (upstream links the `/{username}` profile —
  *   no profile page exists this slice).
- * - Issue links are the upstream-shaped `/{owner}/{repo}/issues/{index}`;
- *   the detail page is future work, so they land on the engine 404 — the
- *   same sanctioned posture as the slice-1 commit links (open question 1).
- * - Search box, label/milestone management buttons and the New button are
- *   not rendered (no search route, write actions need auth §2.5, dead links
- *   forbidden §2.4.1). The `?labels=` / `?milestone=` FILTERS are wired —
- *   the label badges link into them (upstream QueryBuild parity, reduced to
- *   the params this page actually honors).
+ * - Search box and the label/milestone management buttons are not rendered
+ *   (no search route, no management pages — dead links forbidden §2.4.1).
+ *   The New Issue button renders like upstream (list.tmpl, unconditional —
+ *   wave 4's /issues/new page is live; anonymous viewers land on the authed
+ *   page's /login round-trip) and hidden on archived repos (upstream's
+ *   `if not .Repository.IsArchived`). The `?labels=` / `?milestone=` FILTERS
+ *   are wired — the label badges link into them (upstream QueryBuild parity,
+ *   reduced to the params this page actually honors).
  * - Event line timestamp: `createdAt` for open issues, `closedAt` for
  *   closed ones (upstream computes the full last-event timeline; the
  *   denormalized columns carry the same facts for this render). Rendered
  *   through the shared `<relative-time>` component — no timestamps-of-render.
+ *
+ * State glyphs (the wave-3 tail, restored in wave 4): the row's
+ * `.item-leading` slot carries the shared/issueicon.tmpl octicon —
+ * octicon-issue-opened/-closed for plain issues (2-path bodies, carried by
+ * the multi-path Icon since wave 4) and the single-path PR state machine for
+ * pull rows. Merged-vs-closed needs the `pull_requests` extension row, so
+ * the loader batch-reads `has_merged` for the page's PR rows (the wave-2
+ * batching pattern). The wave-3 icon-allowlist degradation note (text-only
+ * state) is retired with the multi-path generator extension.
  *
  * Data comes from the tier-1 service layer directly (§3.2: never a
  * self-fetch): `listRepoIssues` + `issueLabelRows` +
@@ -53,16 +56,17 @@ import { inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
+  hasWorkInProgressPrefix,
   issueLabelRows,
   listRepoIssues,
   milestoneIdsByRepoEntries,
   type IssueListFilters,
 } from "../../api/services/issues";
 import type { IssueRow, LabelRow, MilestoneRow } from "../../issues/service";
-import { milestones, users } from "../../db/schema";
+import { milestones, pullRequests, users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import { parsePageNumber } from "../page-data";
-import { BaseLayout, renderPage } from "../shell";
+import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 
 /** Page chrome text (component-local, the components/commit-list.tsx
@@ -74,6 +78,7 @@ export const issuesLocale = {
   closed_title: "Closed", // "repo.issues.closed_title"
   noResults: "No results", // "repo.issues.filter_no_results"
   noResultsPlaceholder: "Try adjusting your search filters.", // "repo.issues.filter_no_results_placeholder"
+  new_issue: "New Issue", // "repo.issues.new" (wave 4: the /issues/new page exists)
 } as const;
 
 /** Upstream `setting.UI.IssuePagingNum` (modules/setting/ui.go:89). */
@@ -147,6 +152,9 @@ export interface IssueListItem {
   milestone: MilestoneRow | null;
   /** Display-cased poster username; `null` = no poster (mirrored imports). */
   posterName: string | null;
+  /** The `pull_requests.has_merged` extension flag — PR rows only (the state
+   *  glyph's merged branch, shared/issueicon.tmpl); false for plain issues. */
+  prMerged: boolean;
 }
 
 /** The issues/pulls page render inputs, loaded by loadIssuesListData. */
@@ -234,8 +242,24 @@ export async function loadIssuesListData(
       labels: await issueLabelRows(d1, issue.id),
       milestone: null,
       posterName: null,
+      prMerged: false,
     })),
   );
+
+  // Batched PR extension flags for the is_pull rows (the state glyph's
+  // merged branch — one read for the whole page, the wave-2 pattern).
+  const pullIds = items.filter((item) => item.issue.isPull).map((item) => item.issue.id);
+  if (pullIds.length > 0) {
+    const rows = await db
+      .select({ issueId: pullRequests.issueId, hasMerged: pullRequests.hasMerged })
+      .from(pullRequests)
+      .where(inArray(pullRequests.issueId, pullIds))
+      .all();
+    const mergedByIssue = new Map(rows.map((row) => [row.issueId, row.hasMerged]));
+    for (const item of items) {
+      item.prMerged = mergedByIssue.get(item.issue.id) ?? false;
+    }
+  }
 
   // Batched milestone names (unique ids across the page).
   const milestoneIds = [...new Set(items.map((item) => item.issue.milestoneId).filter((id): id is number => id !== null))];
@@ -286,8 +310,11 @@ function listHref(basePath: string, state: "open" | "closed", labelIds: number[]
   return query === "" ? basePath : `${basePath}?${query}`;
 }
 
-/** The open/closed tab menu (repo/issue/openclose.tmpl, minus the state
- *  octicons — allowlist degradation, header comment). */
+/** The open/closed tab menu (repo/issue/openclose.tmpl — the Open tab
+ *  carries the list's own state glyph, octicon-git-pull-request on the pulls
+ *  list and octicon-issue-opened on issues; the Closed tab always
+ *  octicon-issue-closed). The wave-3 icon degradation note is retired with
+ *  the wave-4 multi-path Icon. */
 export function OpenCloseTabs(props: {
   basePath: string;
   state: "open" | "closed";
@@ -297,6 +324,8 @@ export function OpenCloseTabs(props: {
   milestoneId: number | null;
   openTitle: string;
   closedTitle: string;
+  /** Which open-tab glyph the list carries (upstream `.PageIsPullList`). */
+  pullList: boolean;
 }) {
   const tab = (count: number, title: string): string => {
     return count === 1 ? `1 ${title}` : `${count} ${title}`;
@@ -307,13 +336,14 @@ export function OpenCloseTabs(props: {
         class={props.state === "open" ? "active item flex-text-inline" : "item flex-text-inline"}
         href={listHref(props.basePath, "open", props.labelIds, props.milestoneId)}
       >
+        <Icon name={props.pullList ? "octicon-git-pull-request" : "octicon-issue-opened"} />{" "}
         {tab(props.openCount, props.openTitle)}
       </a>
       <a
         class={props.state === "closed" ? "active item flex-text-inline" : "item flex-text-inline"}
         href={listHref(props.basePath, "closed", props.labelIds, props.milestoneId)}
       >
-        {tab(props.closedCount, props.closedTitle)}
+        <Icon name="octicon-issue-closed" /> {tab(props.closedCount, props.closedTitle)}
       </a>
     </div>
   );
@@ -371,12 +401,43 @@ function EventLine(props: { item: IssueListItem }) {
   );
 }
 
+/** The shared/issueicon.tmpl state glyph with its `getIssueIcon` color
+ *  classes (16px, like upstream's `{{svg … 16}}` calls): the PR state
+ *  machine (merged → merge-purple, closed → closed-red, WIP → draft-grey,
+ *  open → green) over the plain-issue open/closed pair. */
+export function IssueStateIcon(props: { item: IssueListItem; size?: number }) {
+  const { issue, prMerged } = props.item;
+  if (issue.isPull) {
+    if (issue.isClosed) {
+      return prMerged ? (
+        <Icon name="octicon-git-merge" size={props.size ?? 16} class="tw-text-purple" />
+      ) : (
+        <Icon name="octicon-git-pull-request-closed" size={props.size ?? 16} class="tw-text-red" />
+      );
+    }
+    if (hasWorkInProgressPrefix(issue.title)) {
+      return <Icon name="octicon-git-pull-request-draft" size={props.size ?? 16} class="tw-text-text-light" />;
+    }
+    return <Icon name="octicon-git-pull-request" size={props.size ?? 16} class="tw-text-green" />;
+  }
+  return issue.isClosed ? (
+    <Icon name="octicon-issue-closed" size={props.size ?? 16} class="tw-text-red" />
+  ) : (
+    <Icon name="octicon-issue-opened" size={props.size ?? 16} class="tw-text-green" />
+  );
+}
+
 /** One `.item` row of shared/issuelist.tmpl (degradations: header comment). */
 function IssueListItemRow(props: { repoLink: string; item: IssueListItem }) {
   const { item } = props;
   const href = `${props.repoLink}/issues/${item.issue.index}`;
   return (
     <div class="item">
+      <div class="item-leading">
+        <div class="flex-text-inline tw-mt-[3px]">
+          <IssueStateIcon item={item} />
+        </div>
+      </div>
       <div class="item-main">
         <div class="item-header">
           <div>
@@ -442,6 +503,17 @@ export function IssuesListPage(props: { ctx: UiContext; data: IssuesListData }) 
   return (
     <BaseLayout ctx={ctx} title={title} pageClass="repository issue-list">
       <div class="ui container">
+        {/* The New Issue button (list.tmpl's list-header row, reduced to the
+            live link): issues list only, hidden on archived repos — the
+            upstream `if not .Repository.IsArchived` gate. Anonymous viewers
+            clicking it land on the authed page's /login round-trip. */}
+        {data.listKind === "issues" && !repo.isArchived ? (
+          <div class="list-header flex-text-block">
+            <a class="ui small primary button issue-list-new" href={`${repoLink}/issues/new`}>
+              {issuesLocale.new_issue}
+            </a>
+          </div>
+        ) : null}
         <div class="issue-list-toolbar-left">
           <OpenCloseTabs
             basePath={basePath}
@@ -452,6 +524,7 @@ export function IssuesListPage(props: { ctx: UiContext; data: IssuesListData }) 
             milestoneId={data.milestoneId}
             openTitle={issuesLocale.open_title}
             closedTitle={issuesLocale.closed_title}
+            pullList={data.listKind === "pulls"}
           />
         </div>
         {data.items.length === 0 ? (

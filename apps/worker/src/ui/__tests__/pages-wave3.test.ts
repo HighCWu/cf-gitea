@@ -191,9 +191,11 @@ describe("issue detail page (/issues/{index})", () => {
     expect(html).toContain('<div role="main" aria-label="#1 - wave3: renderer crashes on empty tree" class="page-content repository view issue pull">');
     expect(html).toContain('<div class="issue-title-header">');
     expect(html).toContain("<h1>wave3: renderer crashes on empty tree <span class=\"index\">#1</span></h1>");
-    // Reopened → the open state label. Its issue-opened octicon is 2-path and
-    // degrades (issue-detail.tsx header comment) — text only, no PR icon.
-    expect(html).toContain('<div class="ui green label issue-state-label">Open</div>');
+    // Reopened → the open state label with its issue-opened glyph (2-path,
+    // carried by the wave-4 multi-path Icon).
+    expect(html).toContain('<div class="ui green label issue-state-label">');
+    expect(html).toContain('class="svg octicon-issue-opened"');
+    expect(html).toContain(" Open</div>");
     // Meta line: opened + fixed-epoch relative-time + poster (plain text) + count.
     expect(html).toContain('<span class="time-desc">opened <relative-time prefix="" tense="past"');
     expect(html).toContain(" by alice · 3 comments</span>");
@@ -217,10 +219,11 @@ describe("issue detail page (/issues/{index})", () => {
   it("renders the timeline: comment card + close/reopen event lines with anchors", async () => {
     const html = await (await fetchUi("/alice/wave3/issues/1")).text();
     expect(html).toContain('<div id="issuecomment-1" class="timeline-item comment">');
-    // Close event (red badge — its octicon is 2-path, degraded empty badge;
-    // the seeded transition carries no actor, so the verb stands alone).
+    // Close event (red badge carrying the 2-path octicon-issue-closed —
+    // wave-4 multi-path Icon; the seeded transition carries no actor, so the
+    // verb stands alone).
     expect(html).toContain('<div id="event-2" class="timeline-item event">');
-    expect(html).toContain('<span class="badge tw-bg-red tw-text-white"></span>');
+    expect(html).toContain('<span class="badge tw-bg-red tw-text-white"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" class="svg octicon-issue-closed"');
     expect(html).toContain('closed this issue <a id="event-2" href="#event-2"');
     // Reopen event (green badge with the dot glyph).
     expect(html).toContain('<span class="badge tw-bg-green tw-text-white">');
@@ -351,7 +354,9 @@ describe("issue detail negative paths", () => {
   });
 
   it("leaves non-numeric and deeper tails engine-owned (404 from the sub-app, never a page)", async () => {
-    for (const path of ["/alice/wave3/issues/abc", "/alice/wave3/issues/1/comments", "/alice/wave3/issues/new"]) {
+    // (/issues/new became the wave-4 form family — pages-wave4.test.ts owns
+    // its behavior; it no longer 404s here.)
+    for (const path of ["/alice/wave3/issues/abc", "/alice/wave3/issues/1/comments"]) {
       const res = await fetchUi(path);
       expect(res.status).toBe(404);
       expect(await res.text()).not.toContain("issue-title-header");

@@ -40,13 +40,6 @@
  *
  * ## Documented v1 degradations (data that has no landed source, §6 method)
  *
- * - Issue-state octicons (`octicon-issue-opened` / `octicon-issue-closed`)
- *   carry two `<path>` elements each and fail the shell Icon's single-path
- *   contract that scripts/gen-ui-icons.mjs asserts — the green/closed state
- *   label and the close-event badge render without the glyph (the PR-family
- *   icons — open/closed/draft/merge — are single-path and render). Restoring
- *   them is a small multi-path extension to shell.tsx's Icon + the generator,
- *   then one allowlist line.
  * - The PR merge box renders the cached mergeability summary only (the
  *   upstream merge FORM is a write action, §2.5, and its Vue island needs the
  *   pageData payload — neither lands this wave). Mergeability comes from
@@ -297,8 +290,9 @@ export function crossFamilyRedirect(
 // ---------------------------------------------------------------------------
 
 /** The state chip of view_title.tmpl, in the template's branch order:
- *  merged → closed → draft → open, with the exact label/icon pairs
- *  (issue-state octicons degrade per the header comment). */
+ *  merged → closed → draft → open, with the exact label/icon pairs (the
+ *  issue-state octicons render since the wave-4 multi-path Icon — the
+ *  wave-3 degradation note is retired). */
 export function IssueStateBadge(props: { data: IssueDetailData }) {
   const { issue, pr } = props.data;
   if (pr !== null && pr.hasMerged) {
@@ -311,8 +305,7 @@ export function IssueStateBadge(props: { data: IssueDetailData }) {
   if (issue.isClosed) {
     return (
       <div class="ui red label issue-state-label">
-        {issue.isPull ? <Icon name="octicon-git-pull-request-closed" /> : null}
-        {issue.isPull ? " " : ""}
+        <Icon name={issue.isPull ? "octicon-git-pull-request-closed" : "octicon-issue-closed"} />{" "}
         {issueDetailLocale.closed_title}
       </div>
     );
@@ -331,7 +324,11 @@ export function IssueStateBadge(props: { data: IssueDetailData }) {
       </div>
     );
   }
-  return <div class="ui green label issue-state-label">{issueDetailLocale.open_title}</div>;
+  return (
+    <div class="ui green label issue-state-label">
+      <Icon name="octicon-issue-opened" /> {issueDetailLocale.open_title}
+    </div>
+  );
 }
 
 /** The issue meta line: "opened {time} by {poster} · {n} comments" — poster
@@ -468,8 +465,9 @@ function TimelineCommentCard(props: { entry: Extract<TimelineEntry, { kind: "com
 }
 
 /** A lifecycle event line (`comments.tmpl` types 1/2/28): the colored badge
- *  (close degrades to an empty badge — its octicon is 2-path) and the
- *  upstream verb with the `#event-{id}` time anchor. */
+ *  (close carries the 2-path octicon-issue-closed since the wave-4
+ *  multi-path Icon) and the upstream verb with the `#event-{id}` time
+ *  anchor. */
 function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEntry, { kind: "reopen" | "close" | "merge" }> }) {
   const { issue, pr } = props.data;
   const { kind, comment, posterName } = props.entry;
@@ -489,7 +487,9 @@ function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEn
       <Icon name="octicon-dot-fill" />
     ) : kind === "merge" ? (
       <Icon name="octicon-git-merge" />
-    ) : null; // close: octicon-issue-closed is 2-path — empty badge (header comment)
+    ) : (
+      <Icon name="octicon-issue-closed" />
+    );
   const badgeColor = kind === "reopen" ? "tw-bg-green" : kind === "merge" ? "tw-bg-purple" : "tw-bg-red";
   return (
     <div id={hash} class="timeline-item event">

@@ -20,7 +20,9 @@ import type { UiContext } from "./ui-context";
 
 /** Upstream `{{svg "octicon-x" size class}}` analog: an inline SVG with the
  *  exact `svg octicon-x` classes the Gitea CSS targets. Bodies come from the
- *  allowlist in icons.ts (TODO there: generated module wiring). */
+ *  allowlist in icons.ts (TODO there: generated module wiring). Multi-path
+ *  octicons (pages wave 4: octicon-issue-opened/-closed) render one `<path>`
+ *  per stored body — single-path icons keep their exact prior DOM. */
 export function Icon(props: { name: IconName; size?: number; class?: string }) {
   const classes = props.class === undefined ? `svg ${props.name}` : `svg ${props.name} ${props.class}`;
   return (
@@ -32,7 +34,9 @@ export function Icon(props: { name: IconName; size?: number; class?: string }) {
       class={classes}
       aria-hidden="true"
     >
-      <path d={ICON_PATHS[props.name]} />
+      {ICON_PATHS[props.name].map((d) => (
+        <path d={d} />
+      ))}
     </svg>
   );
 }

@@ -129,6 +129,9 @@ describe("handlesUiRoute", () => {
     "/octo/hello/src",
     "/octo/hello/src/branch/main/deep/file.md",
     "/octo/hello.git/src/branch/main",
+    "/octo/hello/issues/new", // wave-4 form family (GET + POST handlers)
+    "/octo/hello/settings", // wave-4 basics family
+    "/octo/hello/settings/hooks", // wave-4 webhooks family
     "/octo/api/commits", // reserved names bind the OWNER segment only
     "/octo/hello%20two",
   ])("claims UI family: %s", (pathname) => {
@@ -153,7 +156,7 @@ describe("handlesUiRoute", () => {
     "/octo/hello/git-receive-pack",
     "/octo/hello/HEAD",
     "/octo/hello/info/lfs/locks", // SPEC-0006 family
-    "/octo/hello/settings", // engine JSON API/admin keeps ownership
+    "/octo/hello/settings/branches", // the deeper settings space stays engine-owned (wave 4 claims only /settings + /settings/hooks)
     "/octo/hello/commit/abc1234", // commit-detail dead links (open question 1)
     "/octo/hello/raw/branch/main/x", // upstream raw shape not in this slice
     "/octo/hello/commitsX", // family literals are exact
