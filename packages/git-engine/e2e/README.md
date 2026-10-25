@@ -121,3 +121,16 @@ Notes on the oracles (see the scripts' headers for details):
   `git merge-base --all`'s set and stable across calls.
 - The §4.6 read-only rule is asserted by an object-count + refs + refs_version
   snapshot around every read RPC (including `rebaseOnto`).
+
+## G3 cache-unreachability check (tsx, no dev server)
+
+`check-cache-unreachable.mjs` — the P0 direct-evidence gate: drives the real
+serve fast path through `createDurableGit().fetch` with counting stubs and
+asserts the poisoned deepen-since request makes ZERO `currentPackKey` RPCs
+and zero R2 interactions (control: the legal full clone makes exactly one of
+each). Mutation-tested — see the script header and NOTICE.md.
+
+```bash
+TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
+node "$TSX" packages/git-engine/e2e/check-cache-unreachable.mjs   # 10 checks
+```
