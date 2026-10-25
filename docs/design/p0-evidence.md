@@ -162,6 +162,60 @@ anon-git-surface, receive-advert, migrate-check (all 19 expected tables incl.
 Reviewer package (per the external review's request): P0 diff + these
 probe outputs + post-deploy CLI exit states + `.git/shallow` results.
 
+## Redeploy verification — 2026-10-25 01:28 UTC (09:28 CST), same-deployment-state block
+
+Deploy: version `15802991-5bde-4881-a362-aba56c57ca40` on
+https://cf-gitea.hecongw.workers.dev (routine redeploy of the day's
+accumulated work at commit `bde4cb1`; Worker startup 79 ms; assets content-hash
+deduped, no re-upload). Remote migrations applied immediately before: **0011
+(notification_states), 0012 (issue_assignees / issue_dependency family),
+0013 (sessions) — all ✅**; remote D1 now 43 tables, expected set verified.
+Secrets `MIRROR_ALLOWED_HOST_LIST` (empty allow-list string — mirror egress
+disabled-by-default; syntax per ssrf.ts `parseList`: comma-separated
+`host` / `*.host` / IP literal / CIDR / `private` / `loopback`, optional
+`:port` / `:lo-hi` / `:*` / `:[p|p-p|…]`) and `MIRROR_CREDENTIAL_KEY`
+(32 random bytes, base64) uploaded just before migration.
+
+Deploy gates at `bde4cb1`: `tsc --noEmit` **0 errors**; `vitest run
+--maxWorkers=8` **1854/1854 passed, 80/80 files** (full-width 80-worker runs
+rotate 18-19 load-induced failures through the same invariants/pull-engine/
+imports/lifecycle families as last wave — capped-workers run is clean and is
+the attributed gate); `pnpm check:api` **PASS** (78/78 paths, 129/129
+operations; documented warns: GET /user 401, GET /signing-key.gpg 404).
+
+`pnpm smoke` (with `--token`, `--user p0probe`): **5 pass / 0 fail / 2 skip**
+(migrate-check, bench-report not requested). Verbatim: `[pass] push-lsremote
+(9476 ms) — pushed 6bd7048565…, authed ls-remote sees refs/heads/main,
+anonymous advert 401 Basic challenge`; `[pass] cleanup (1107 ms) — repo
+p0probe/smoke-41369118 deleted`, and remote D1 shows zero `smoke-*` rows.
+**Both findings in the 04:15 section above are resolved in production**: the
+smoke's settle-window handling is in (push→anonymous-read no longer races),
+and the anonymous × private fetch now answers **401 Basic challenge** (ACL row
+#2 closed). Anonymous matrix additionally verified by hand: nonexistent repo
+`git-upload-pack` → 404, `git-receive-pack` → 401; private ready repo
+(`p0probe/p0-shallow`, the only pre-existing repo) anonymous `ls-remote` →
+401; a throwaway **public** repo anonymous `ls-remote` → 200 with full refs
+(deleted after: 204, then 404 + zero D1 rows — engine-admin DELETE → D1
+cascade re-validated end-to-end).
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`,
+results **unchanged** vs the 04:2x table — recorded for the
+same-deployment-state condition):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `fatal: 远程错误：upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1` (HEAD c3); `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean |
+
+Production bench spot-check: **attempted, not runnable** — `bench-run.mjs`
+accepts `--base-url` mechanically, but its create-by-push targets a `bench`
+user namespace that does not exist in production (push → `HTTP 404`, exit 1)
+and its measured clone/fetch legs are anonymous, which the private-by-default
+ACL now (correctly) rejects; it remains a local-dev runner until it grows an
+authenticated-owner + public-visibility mode. No production bench numbers
+recorded; nothing was left behind (zero `bench-%` D1 rows).
+
 ## Post-review addendum (2026-10-25, answering the reviewer's final round)
 
 **1. Risk wording — adopted verbatim (scoped, not absolute):**
