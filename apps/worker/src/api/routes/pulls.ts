@@ -40,8 +40,13 @@
  * orchestrator-owned RUNTIME_ONLY_RESPONSES tables are not extended by this
  * batch): POST pulls 400 (invalid due_date format — upstream
  * ApplyAPIDeadlineTimestamp "invalid date format: X"); POST merge 403
- * ("User not allowed to merge PR" — the write-scope stand-in requires a
- * token but no per-user merge whitelist exists yet).
+ * ("User not allowed to merge PR" — the write-scope stand-in, plus the
+ * SPEC-0013 merge-whitelist arm when a protection rule covers the base
+ * branch). The SPEC-0013 §3.3 protection gate answers the 405 family with
+ * the upstream message texts verbatim ("Does not have enough approvals",
+ * "There are requested changes", "There are official review requests",
+ * "The head branch is behind the base branch") — the ErrNotReadyToMerge
+ * Error() render rule (modules/util/error.go:56–58).
  *
  * The PATCH `base` retarget stays engine-gated upstream (branch existence +
  * ChangeTargetBranch) and is still ignored this wave (same treatment as the
@@ -98,6 +103,7 @@ import { branchRef, engineReads } from "../services/engine";
 import { renderUnifiedDiff, renderPatch, toApiCommit, toChangedFiles, usernamesByEmail } from "../services/git-models";
 import { canViewRepository, findRepositoryByPath, repositoryPermissions, toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
 import { canWriteRepository } from "../services/repo-access";
+import { canBypassBranchProtection, checkPullBranchProtections, findRule, isUserMergeWhitelisted, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
 import { emitMilestoneEvent } from "./issues";
 import { requestedReviewersOf } from "./pull-reviews";
 
@@ -1092,6 +1098,22 @@ export function registerPullRoutes(
       }
       const { issue, pullRequest } = await requirePullRequest(c, found, c.req.valid("param").index);
       const form = c.req.valid("json");
+      const requester = c.get("authUser");
+      if (requester === undefined) {
+        throw new ApiError(401, "token is required"); // unreachable behind requireAuth
+      }
+
+      // SPEC-0013 §3.3 — the protection gate. IsUserAllowedToMerge
+      // (services/pull/merge.go:671–691) runs FIRST (before the 405 family,
+      // like upstream): no rule → the write check above already passed; a
+      // rule → the merge whitelist. Failure stays the existing 403 text.
+      const rule = await findRule(c.env.DB, found.repo.id, pullRequest.baseBranch);
+      if (rule !== null) {
+        const access = await principalAccessOf(c.env.DB, found.repo, requester);
+        if (!(await isUserMergeWhitelisted(c.env.DB, parseRuleConfig(rule.rules), access))) {
+          throw new ApiError(403, "User not allowed to merge PR");
+        }
+      }
 
       // CheckPullMergeable (405 family): merged, WIP, not-mergeable. The
       // auto-merge schedule gate runs first (upstream checks
@@ -1106,10 +1128,6 @@ export function registerPullRoutes(
       if (hasWorkInProgressPrefix(issue.title)) {
         throw new ApiError(405, "Work in progress PRs cannot be merged");
       }
-      const requester = c.get("authUser");
-      if (requester === undefined) {
-        throw new ApiError(401, "token is required"); // unreachable behind requireAuth
-      }
 
       // The mergeable precondition runs the LAZY check on a `checking` row
       // (same self-healing pass as the GET): not-mergeable after the check →
@@ -1120,6 +1138,31 @@ export function registerPullRoutes(
       }
       if (checked.status !== PRStatus.Mergeable) {
         throw new ApiError(405, "Please try again later");
+      }
+
+      // SPEC-0013 §3.3 — CheckPullBranchProtections (merge.go:694–742) after
+      // the mergeable precondition, with the commits-behind count the check
+      // surfaced. "Manually merged" skips the checks entirely
+      // (check.go:162–165). A failure answers 405 with the upstream message
+      // text VERBATIM; `force_merge` clears it only through
+      // CanBypassBranchProtection (check.go:192–207).
+      if (rule !== null && form.do !== "manually-merged") {
+        const failure = await checkPullBranchProtections(c.env.DB, rule, {
+          issueId: issue.id,
+          commitsBehind: checked.commitsBehind ?? 0,
+        });
+        if (failure !== null) {
+          const bypass =
+            form.force_merge === true &&
+            (await canBypassBranchProtection(
+              c.env.DB,
+              parseRuleConfig(rule.rules),
+              await principalAccessOf(c.env.DB, found.repo, requester),
+            ));
+          if (!bypass) {
+            throw new ApiError(405, failure);
+          }
+        }
       }
 
       const { commitOid } = await mergePullRequestEngine(c, found, issue, checked, {

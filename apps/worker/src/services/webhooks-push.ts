@@ -71,15 +71,20 @@
  * may fail the push, per-ref errors log and continue (one ref's failure never
  * silences the others), and a fan-out error (owner resolution, hook query)
  * logs with the already-written delivery rows standing.
+ *
+ * The notification family is not the only onPush consumer: `markStaleReviewsOnPush`
+ * (SPEC-0013 §3.4) rides the same seam beside `emitPushFamilyUpdates` — the
+ * head-push stale/dismiss maintenance for open PRs on the pushed branch.
  */
 
 import type { CommitJson, DiffResult, PushEvent } from "@cf-gitea/git-engine";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { toApiPullRequest } from "../api/services/pulls";
 import { toPayloadCommit, usernamesByEmail } from "../api/services/git-models";
 import { compareUrl } from "../api/services/hooks";
+import { branchRef } from "../api/services/engine";
 import {
   apiUserFromRow,
   findRepositoryById,
@@ -89,13 +94,19 @@ import {
   type UserRow,
   type Viewer,
 } from "../api/services/repository";
-import { issues, PRFlow, pullRequests, users } from "../db/schema";
+import { comments, issues, PRFlow, pullRequests, pullReviews, ReviewType, users } from "../db/schema";
+import { CommentType } from "../issues/comment-types";
 import {
   enrichCommitsWithFileLists,
   emitWebhookDeliveries,
   type HookEventType,
 } from "../issues/webhooks";
 import { engineName, type RepoRow } from "../repos/service";
+import { findRule, parseRuleConfig } from "./branch-protection";
+
+/** DismissApprovalReviews' fixed comment text (services/pull/review.go:362). */
+export const DISMISS_STALE_MESSAGE =
+  "New commits pushed, approval review dismissed automatically according to repository settings";
 
 /**
  * The bindings/vars the push fan-out touches: the generated Env members it
@@ -574,6 +585,184 @@ export async function handleUserPushNotifications(
  *  entrypoint wiring stays a one-liner. */
 export type PushEventLike = PushEvent;
 
+export interface PushReviewLegsOptions {
+  /** Test clock for the comment rows. */
+  now?: Date;
+  /** Log sink override (tests); default console.error. */
+  log?: (message: string) => void;
+}
+
+/**
+ * The §3.4(f) head-push legs (SPEC-0013): for every open github-flow PR whose
+ * HEAD branch is an UPDATED branch of the pushed repo (the exact sync filter
+ * of emitPullRequestSyncs — created/deleted refs never ride, push.go:292),
+ * run upstream's push-time review maintenance (services/pull/pull.go:425–461):
+ *
+ *   1. content changed? — checkIfPRContentChanged (:503–538) compares the
+ *      PR's patch range old→new; the bounded port diffs both tips against
+ *      their merge bases in the pushed repo's cell and compares the results
+ *      (same-repo heads, the only population today; a fork-head read failure
+ *      degrades to "unchanged" with upstream's log-and-continue posture,
+ *      :529–535).
+ *   2. changed → MarkReviewsAsStale (:440, models/issues/review.go:623–628 —
+ *      EVERY review row of the issue), then — when the BASE branch's rule
+ *      sets dismiss_stale_approvals — DismissApprovalReviews (:444–453,
+ *      services/pull/review.go:338–380): the undismissed approvals flip
+ *      `dismissed` and each lands a `CommentTypeDismissReview` comment with
+ *      the fixed text + the num_comments bump (the landed issue-tables
+ *      discipline).
+ *   3. MarkReviewsAsNotStale against the new tip (:455, review.go:630–635) —
+ *      unconditionally, reviews made against the new tip are un-staled even
+ *      when the diff check failed.
+ *
+ * Budget: bounded D1 writes per open PR on the pushed branch (the OQ-3
+ * instrument is the rewritten-row count), inline under the onPush hook's 30 s
+ * waitUntil cap at hobby scale. Never throws — per-PR resilience, one PR's
+ * failure is logged and never silences the others, mirroring the fan-out.
+ */
+export async function markStaleReviewsOnPush(
+  env: WebhookPushEnv,
+  pushedPair: RepositoryWithOwner,
+  updates: readonly PushRefUpdate[],
+  pusher?: UserRow | null,
+  options: PushReviewLegsOptions = {},
+): Promise<void> {
+  const log = options.log ?? ((message: string) => console.error(message));
+  for (const update of updates) {
+    if (!update.ref.startsWith("refs/heads/")) continue;
+    if (update.old === PUSH_ZERO_OID || update.next === PUSH_ZERO_OID) continue;
+    const branch = update.ref.slice("refs/heads/".length);
+    let heads: Array<{ issue: typeof issues.$inferSelect; pullRequest: typeof pullRequests.$inferSelect }>;
+    try {
+      heads = await drizzle(env.DB)
+        .select({ issue: issues, pullRequest: pullRequests })
+        .from(pullRequests)
+        .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+        .where(
+          and(
+            eq(pullRequests.headRepoId, pushedPair.repo.id),
+            eq(pullRequests.headBranch, branch),
+            eq(pullRequests.hasMerged, false),
+            eq(pullRequests.flow, PRFlow.Github),
+            eq(issues.isClosed, false),
+          ),
+        )
+        .all();
+    } catch (error) {
+      log(
+        `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR head lookup failed for ${update.ref}: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+      continue;
+    }
+    for (const head of heads) {
+      try {
+        await applyPushReviewLegs(env, pushedPair, head, update, pusher, log, options);
+      } catch (error) {
+        log(
+          `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: stale/dismiss legs failed for PR #${head.issue.index}: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+}
+
+/** The per-PR leg body (the 3-step maintenance above). */
+async function applyPushReviewLegs(
+  env: WebhookPushEnv,
+  pushedPair: RepositoryWithOwner,
+  head: { issue: typeof issues.$inferSelect; pullRequest: typeof pullRequests.$inferSelect },
+  update: PushRefUpdate,
+  pusher: UserRow | null | undefined,
+  log: (message: string) => void,
+  options: PushReviewLegsOptions,
+): Promise<void> {
+  const { issue, pullRequest } = head;
+  const db = drizzle(env.DB);
+
+  // Step 1 — the content-change detection. Both tips and their merge bases
+  // read in the PUSHED repo's cell (the head commits live there; the
+  // same-repo-head population is exact, fork heads degrade below). Direct
+  // cell reads — engineReads types the full generated Env, this module's
+  // WebhookPushEnv is the structural Pick; a thrown RPC failure is the
+  // per-PR catch's business (logged, legs skipped for that PR).
+  let changed = false;
+  const cell = env.REPO.getByName(engineName(pushedPair.repo.ownerNamespace, pushedPair.repo.slug));
+  const baseTip = await cell.readCommit(branchRef(pullRequest.baseBranch));
+  if (baseTip === null) {
+    log(
+      `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR #${issue.index} base branch ` +
+        `${pullRequest.baseBranch} unreadable — stale marking skipped`,
+    );
+  } else {
+    const oldMergeBase = await cell.mergeBase(baseTip.oid, update.old);
+    const newMergeBase = await cell.mergeBase(baseTip.oid, update.next);
+    if (oldMergeBase.tag !== "ok" || oldMergeBase.base === null || newMergeBase.tag !== "ok" || newMergeBase.base === null) {
+      log(
+        `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR #${issue.index} merge-base read failed — ` +
+          `stale marking skipped (upstream's log-and-continue, pull.go:529-535)`,
+      );
+    } else {
+      const oldDiff = await cell.readDiff(update.old, oldMergeBase.base);
+      const newDiff = await cell.readDiff(update.next, newMergeBase.base);
+      if (oldDiff === null || newDiff === null) {
+        log(
+          `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR #${issue.index} diff read failed — ` +
+            `stale marking skipped (upstream's log-and-continue, pull.go:529-535)`,
+        );
+      } else {
+        // The content comparison covers the FILE list only — the DiffResult
+        // envelope carries the tip oids, which differ on every push by
+        // definition (upstream compares `git diff --name-only` output,
+        // pull.go:516).
+        changed = JSON.stringify(oldDiff.files) !== JSON.stringify(newDiff.files);
+      }
+    }
+  }
+
+  const now = options.now ?? new Date();
+  if (changed) {
+    // Step 2a — MarkReviewsAsStale: EVERY review row of the issue
+    // (models/issues/review.go:625 — no type filter upstream either).
+    await db.update(pullReviews).set({ stale: true, updatedAt: now }).where(eq(pullReviews.issueId, issue.id)).run();
+
+    // Step 2b — DismissApprovalReviews under the BASE rule's
+    // dismiss_stale_approvals (services/pull/pull.go:444–453).
+    const baseRule = await findRule(env.DB, pullRequest.baseRepoId, pullRequest.baseBranch);
+    if (baseRule !== null && parseRuleConfig(baseRule.rules).dismissStaleApprovals) {
+      const approvals = await db
+        .select({ id: pullReviews.id })
+        .from(pullReviews)
+        .where(and(eq(pullReviews.issueId, issue.id), eq(pullReviews.type, ReviewType.Approve), eq(pullReviews.dismissed, false)))
+        .all();
+      for (const approval of approvals) {
+        await db.batch([
+          db.update(pullReviews).set({ dismissed: true, updatedAt: now }).where(eq(pullReviews.id, approval.id)),
+          db.insert(comments).values({
+            type: CommentType.DismissReview,
+            posterId: pusher?.id ?? null,
+            issueId: issue.id,
+            content: DISMISS_STALE_MESSAGE,
+            reviewId: approval.id,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          db.update(issues).set({ numComments: sql`num_comments + 1`, updatedAt: now }).where(eq(issues.id, issue.id)),
+        ]);
+      }
+    }
+  }
+
+  // Step 3 — MarkReviewsAsNotStale against the new tip (runs even when the
+  // diff check failed, upstream :455).
+  await db
+    .update(pullReviews)
+    .set({ stale: false, updatedAt: now })
+    .where(and(eq(pullReviews.issueId, issue.id), eq(pullReviews.commitId, update.next)))
+    .run();
+}
+
 /**
  * The engine onPush adapter — the shape the entrypoint's wiring passes as the
  * hook (`onPush: (event, env) => handleUserPushEvent(env, event)`). Resolves
@@ -606,4 +795,14 @@ export async function handleUserPushEvent(env: WebhookPushEnv, event: PushEventL
     pusher = (await drizzle(env.DB).select().from(users).where(eq(users.id, event.pusherId)).get()) ?? null;
   }
   await handleUserPushNotifications(env, pair.repo, updates, pusher);
+  // SPEC-0013 §3.4 — the head-push stale/dismiss legs beside the notification
+  // fan-out (same never-fail-the-push posture: the applied push stands).
+  try {
+    await markStaleReviewsOnPush(env, pair, updates, pusher);
+  } catch (error) {
+    console.error(
+      `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: stale/dismiss legs failed (the applied push stands): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }

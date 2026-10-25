@@ -1793,3 +1793,39 @@ export const pullReviews = sqliteTable(
     index("pull_reviews_reviewer_idx").on(t.issueId, t.reviewerId, t.type),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// Protected branches (SPEC-0013 §3.1 — the `protected_branch` table port,
+// gitea/models/git/protected_branch.go:30–42, minus ORM plumbing). One row
+// per rule; the six user/team allowlists stay inside the single `rules` JSON
+// blob exactly like upstream's one `config` column.
+// ---------------------------------------------------------------------------
+
+export const protectedBranches = sqliteTable(
+  "protected_branches",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Keys the landed TEXT repositories.id — the repo-scoped-table
+     *  convention (no FK; rows die with the deleteRepository cascade). */
+    repoId: text("repo_id").notNull(),
+    /** Upstream column `branch_name` (RuleName, protected_branch.go:34 — "a
+     *  branch name or a glob match to branch name"); we keep the semantic
+     *  name and the API carries `rule_name`. */
+    ruleName: text("rule_name").notNull(),
+    /** First-match ordering input (protected_branch.go:35, NOT NULL DEFAULT 0). */
+    priority: integer("priority").notNull().default(0),
+    /** The `ProtectedBranchConfig` JSON verbatim under upstream's exact
+     *  snake_case json keys (protected_branch.go:45–80) so contract
+     *  rendering is a read-and-echo (SPEC-0013 §3.1). */
+    rules: text("rules").notNull(),
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's UNIQUE(s) pair (RepoID, RuleName) — protected_branch.go:32,34.
+    uniqueIndex("protected_branches_repo_rule_uq").on(t.repoId, t.ruleName),
+    // FindRepoProtectedBranchRules loads every repo rule per request
+    // (protected_branch_list.go:38).
+    index("protected_branches_repo_idx").on(t.repoId),
+  ],
+);

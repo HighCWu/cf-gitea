@@ -22,8 +22,9 @@
  *     doer's latest PENDING review is
  *     converted (or a fresh row created), an approve/reject clears the
  *     reviewer's other official flags first and computes `official` fresh
- *     (IsOfficialReviewer :276 — the protected-branch whitelist arm has no
- *     cf-gitea surface, so write access on the base repo decides), a
+ *     (IsOfficialReviewer :276 — the SPEC-0013 whitelist arm: the base
+ *     branch's protection rule decides; without a rule or without the
+ *     approvals whitelist, write access on the base repo decides), a
  *     non-pending submit deletes the reviewer's outstanding REQUEST rows
  *     (:540, CreateReview :403), an approve/reject dismisses the reviewer's
  *     previous approve/reject rows (CreateReview :408–412), a
@@ -150,6 +151,7 @@ import {
   type Viewer,
 } from "../services/repository";
 import { engineReads } from "../services/engine";
+import { findRule, isUserOfficialReviewer, parseRuleConfig, principalAccessOfRow } from "../../services/branch-protection";
 
 type ReviewRow = typeof pullReviews.$inferSelect;
 
@@ -358,20 +360,19 @@ async function prepareSingleReview(
 }
 
 /**
- * IsOfficialReviewer (models/issues/review.go:276–306) minus the protected
- * branch arm (no cf-gitea protected-branch surface): no rule exists, so a
- * reviewer with WRITE access on the base repo makes official reviews. Takes
- * the reviewer's row — not the request doer — because request arms evaluate
- * the REVIEWER's officialness.
+ * IsOfficialReviewer (models/issues/review.go:276–306) over the SPEC-0013
+ * rule service: the base branch's first-match rule decides — without a rule,
+ * or without `enable_approvals_whitelist`, a reviewer with WRITE access on
+ * the base repo makes official reviews; with the whitelist, the approvals
+ * whitelist (user/team) only. Takes the reviewer's row — not the request
+ * doer — because request arms evaluate the REVIEWER's officialness, and the
+ * PR's base branch (the rule is matched against the BASE).
  */
-async function isOfficialReviewer(d1: D1Database, found: RepositoryWithOwner, reviewer: UserRow | null): Promise<boolean> {
+async function isOfficialReviewer(d1: D1Database, found: RepositoryWithOwner, baseBranch: string, reviewer: UserRow | null): Promise<boolean> {
   if (reviewer === null) return false;
-  if (reviewer.isAdmin) return true;
-  const reviewerViewer: Viewer = { origin: "", requester: apiUserFromRow(reviewer, { origin: "", requester: null }) };
-  const permissions = repositoryPermissions(reviewerViewer, found.repo);
-  if (permissions.admin === true || permissions.push === true) return true;
-  const mode = await collaboratorModeOf(d1, found.repo.id, reviewer.id);
-  return mode === "write" || mode === "admin";
+  const rule = await findRule(d1, found.repo.id, baseBranch);
+  const access = await principalAccessOfRow(d1, found.repo, reviewer);
+  return isUserOfficialReviewer(d1, rule === null ? null : parseRuleConfig(rule.rules), access);
 }
 
 /** The doer's full user row (requireAuth guarantees presence on write arms). */
@@ -651,6 +652,8 @@ interface SubmitReviewInput {
   doerId: number;
   doerRow: UserRow | null;
   issue: IssueRow;
+  /** The PR's base branch — the official predicate matches the rule on it. */
+  baseBranch: string;
   reviewType: number;
   content: string;
   commitId: string;
@@ -688,7 +691,7 @@ async function submitReview(c: Context<ApiEnv>, found: RepositoryWithOwner, inpu
       .set({ official: false })
       .where(and(eq(pullReviews.issueId, issue.id), eq(pullReviews.reviewerId, doerId)))
       .run();
-    official = await isOfficialReviewer(c.env.DB, found, input.doerRow);
+    official = await isOfficialReviewer(c.env.DB, found, input.baseBranch, input.doerRow);
   }
 
   // CreateReview's side-effects (models/issues/review.go:396–428): a
@@ -864,7 +867,7 @@ async function addReviewRequest(
     throw new ApiError(403, "cannot request a re-review on a closed or merged PR");
   }
 
-  const official = await isOfficialReviewer(c.env.DB, found, reviewer);
+  const official = await isOfficialReviewer(c.env.DB, found, pullRequest.baseBranch, reviewer);
   if (official) {
     await db
       .update(pullReviews)
@@ -873,9 +876,12 @@ async function addReviewRequest(
       .run();
   }
 
+  // CreateReview carries the official flag ON the request row
+  // (models/issues/review.go:759 `Official: official`) — the SPEC-0013
+  // block_on_official_review_requests arm reads exactly it.
   const inserted = await db
     .insert(pullReviews)
-    .values({ type: ReviewType.Request, reviewerId: reviewer.id, issueId: issue.id, content: "", createdAt: now, updatedAt: now })
+    .values({ type: ReviewType.Request, reviewerId: reviewer.id, issueId: issue.id, content: "", official, createdAt: now, updatedAt: now })
     .returning()
     .all();
   const review = inserted[0]!;
@@ -909,6 +915,7 @@ async function removeReviewRequest(
   c: Context<ApiEnv>,
   found: RepositoryWithOwner,
   issue: IssueRow,
+  baseBranch: string,
   reviewer: UserRow,
 ): Promise<boolean> {
   const db = drizzle(c.env.DB);
@@ -922,7 +929,7 @@ async function removeReviewRequest(
   }
   await db.delete(pullReviews).where(eq(pullReviews.id, lastReview.id)).run();
 
-  if (await isOfficialReviewer(c.env.DB, found, reviewer)) {
+  if (await isOfficialReviewer(c.env.DB, found, baseBranch, reviewer)) {
     const restored = await latestDecisionReview(c.env.DB, issue.id, reviewer.id);
     if (restored !== null) {
       await db.update(pullReviews).set({ official: true }).where(eq(pullReviews.id, restored.id)).run();
@@ -1146,6 +1153,7 @@ export function registerPullReviewRoutes(
         doerId,
         doerRow: await doerRowOf(c, doerId),
         issue,
+        baseBranch: pullRequest.baseBranch,
         reviewType,
         content: form.body ?? "",
         commitId,
@@ -1228,6 +1236,7 @@ export function registerPullReviewRoutes(
         doerId,
         doerRow: await doerRowOf(c, doerId),
         issue,
+        baseBranch: pullRequest.baseBranch,
         reviewType,
         content: form.body ?? "",
         commitId: head?.oid ?? "",
@@ -1671,7 +1680,7 @@ export function registerPullReviewRoutes(
     // SILENT (:44–47 — `!isAdd` returns before the notifier). Silence on
     // no-ops (nothing removed → no event, upstream comment == nil).
     for (const reviewer of reviewers) {
-      const removed = await removeReviewRequest(c, found, issue, reviewer);
+      const removed = await removeReviewRequest(c, found, issue, pullRequest.baseBranch, reviewer);
       if (removed) {
         await emitIssueEvent(c, {
           repoId: found.repo.id,
