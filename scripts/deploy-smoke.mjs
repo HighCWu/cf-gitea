@@ -374,9 +374,17 @@ const checkBenchReport = async () => {
   }
   expect(benchStat.isFile(), `${BENCH_RUN} is not a file`);
   log("  bench-run starting (report-only; its own output follows)...");
+  // Production mode per bench-run's guard contract: non-localhost targets
+  // require --remote (cost ack) + --user (namespace = the token's user;
+  // the old hard-coded `bench` namespace 404s). --record stays refused —
+  // baselines are local-only by design.
+  const isLocal = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(
+    (() => { try { return new URL(opts.baseUrl).host; } catch { return ""; } })(),
+  );
   const r = await run(process.execPath,
     [BENCH_RUN, "--compare", "m2-pre", "--sizes", "5m", "--base-url", opts.baseUrl,
-      ...(opts.token ? ["--token", opts.token] : [])],
+      ...(opts.token ? ["--token", opts.token] : []),
+      ...(!isLocal && opts.token && opts.user ? ["--remote", "--yes", "--user", opts.user] : [])],
     { timeoutMs: 600_000 });
   const out = `${r.stdout}${r.stderr}`.trim();
   if (out) log(out.split("\n").map((l) => `    ${l}`).join("\n"));
