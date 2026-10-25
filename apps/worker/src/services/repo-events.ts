@@ -132,6 +132,11 @@ export async function emitRepoEvent(request: RepoEventRequest, emission: RepoEve
           execCtx.waitUntil(batch.then(undefined, (error: unknown) => {
             console.error(`[repo-events] delivery enqueue failed (${emission.eventType}): ${errorMessage(error)}`);
           }));
+          // fanOut's enqueue param is Promise<void>-typed; returning the
+          // batch (voided) keeps the callback sync (no require-await
+          // violation) while satisfying the contract — waitUntil still
+          // owns the timing.
+          return batch.then(() => {});
         }
       : undefined,
     "repo-events",
