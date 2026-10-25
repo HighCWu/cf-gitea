@@ -1902,3 +1902,101 @@ export const deployKeys = sqliteTable(
     index("deploy_keys_token_hash_idx").on(t.tokenHash),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// Actions secrets + variables (the inventory batch `wave-api-secrets-variables`
+// — upstream `Secret`, gitea/models/secret/secret.go:35-44, and
+// `ActionVariable`, gitea/models/actions/variable.go:27-37). Owner-scoped KV
+// stores for the CI surface; NO runner required — this is the only
+// actions-family surface that works without the actions runtime (SPEC-0012).
+// ---------------------------------------------------------------------------
+
+/**
+ * Actions secrets (mirrors `Secret`, gitea/models/secret/secret.go:35-44).
+ * Scope encoding is upstream's exact rule (the model's own doc comment): a
+ * repo-level row carries `owner_id = 0` and `repo_id` set; an org/user-level
+ * row carries `owner_id` set and `repo_id` empty; both set, or both empty
+ * (global secrets) are unsupported upstream and unrepresentable here.
+ *
+ * `owner_id`/`repo_id` are PLAIN columns — no FK — exactly like upstream's
+ * xorm INDEX tags: the `owner_id = 0` repo-scope sentinel cannot reference
+ * users (the FK form is reserved for owner-always-real tables like
+ * public_keys/gpg_keys), and `repo_id` keys the landed TEXT repositories.id
+ * with the empty string as upstream's 0 sentinel (the webhooks NULL-adaptation
+ * is unusable here because NULLs are DISTINCT in SQLite unique indexes — a
+ * nullable repo_id would not enforce per-owner name uniqueness). The
+ * UNIQUE(owner_repo_name) triple carries the scope + name; `name` is stored
+ * UPPERCASE-normalized (InsertEncryptedSecret / InsertVariable).
+ *
+ * `data` is upstream's LONGTEXT encrypted-data column (SecretDataMaxLength
+ * 65536); cf-gitea stores plaintext with the divergence documented in
+ * services/secrets-variables.ts — upstream encrypts with the instance
+ * SecretKey (EncryptSecret), an instance key model does not exist yet (same
+ * seam as webhooks.header_authorization_encrypted, services/hooks.ts:488-491).
+ * `description` truncates at 4096 runes (SecretDescriptionMaxLength).
+ */
+export const secrets = sqliteTable(
+  "secrets",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** users.id for org/user-scope rows; the 0 sentinel on repo rows
+     *  (upstream `OwnerID UNIQUE(owner_repo_name) NOT NULL`). */
+    ownerId: integer("owner_id").notNull().default(0),
+    /** TEXT repositories.id on repo rows; '' (upstream's 0 sentinel) on
+     *  org/user rows (upstream `RepoID … NOT NULL DEFAULT 0`). */
+    repoId: text("repo_id").notNull().default(""),
+    /** Uppercase-normalized at insert and lookup (strings.ToUpper). */
+    name: text("name").notNull(),
+    /** Secret value; plaintext in cf-gitea (see the table comment). */
+    data: text("data").notNull(),
+    description: text("description").notNull().default(""),
+    /** Row creation (upstream `CreatedUnix xorm:"created"`). */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's UNIQUE(owner_repo_name) (secret.go:38,39,40).
+    uniqueIndex("secrets_owner_repo_name_uq").on(t.ownerId, t.repoId, t.name),
+    // Upstream's xorm INDEX pair (secret.go:38,39).
+    index("secrets_owner_idx").on(t.ownerId),
+    index("secrets_repo_id_idx").on(t.repoId),
+  ],
+);
+
+/**
+ * Actions variables (mirrors `ActionVariable`,
+ * gitea/models/actions/variable.go:27-37) — the plaintext counterpart of the
+ * secrets table with the identical scope encoding, name normalization, and
+ * sentinel adaptation (see the secrets table comment). `data` is
+ * VariableDataMaxLength 65536 RUNES upstream (the insert/update gate counts
+ * runes, unlike secrets' bytes); `description` truncates at 4096 runes;
+ * values are EOL-normalized to "\n" (NormalizeStringEOL) and `updated_unix`
+ * tracks the last PUT.
+ */
+export const actionVariables = sqliteTable(
+  "action_variables",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** users.id for org/user-scope rows; the 0 sentinel on repo rows. */
+    ownerId: integer("owner_id").notNull().default(0),
+    /** TEXT repositories.id on repo rows; '' (upstream's 0 sentinel) on
+     *  org/user rows. */
+    repoId: text("repo_id").notNull().default(""),
+    /** Uppercase-normalized at insert, lookup, and rename. */
+    name: text("name").notNull(),
+    /** Variable value, EOL-normalized ("\r\n" → "\n"). */
+    data: text("data").notNull(),
+    description: text("description").notNull().default(""),
+    /** Row creation (upstream `CreatedUnix xorm:"created"`). */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Last PUT (upstream `UpdatedUnix xorm:"updated"`); equals createdAt at
+     *  insert (the deploy_keys convention). */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's UNIQUE(owner_repo_name) (variable.go:30,31,32).
+    uniqueIndex("action_variables_owner_repo_name_uq").on(t.ownerId, t.repoId, t.name),
+    // Upstream's xorm INDEX pair (variable.go:30,31).
+    index("action_variables_owner_idx").on(t.ownerId),
+    index("action_variables_repo_id_idx").on(t.repoId),
+  ],
+);
