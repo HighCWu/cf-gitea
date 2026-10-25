@@ -79,6 +79,8 @@ export const dashboardLocale = {
   watched_repos: "Watched Repositories", // cf-gitea addition (the brief's second list)
   watched_empty: "No watched repositories.", // cf-gitea addition
   repos_empty: "No repositories yet.", // "org.repos.empty" shape, dashboard arm
+  new_repo: "New Repository", // "new_repo" (the wave-19 heading link, RepoList.vue:397)
+  new_org: "New Organization", // "new_org" (the wave-19 heading link, RepoList.vue:519)
   landing_tagline: "A painless, self-hosted Git service", // "startpage.app_desc"
   landing_install: "Easy to install", // "startpage.install"
   landing_platform: "Cross-platform", // "startpage.platform"
@@ -407,11 +409,30 @@ export function DashboardActivity(props: { data: DashboardData }) {
 /** One repo-list section: the header + the shared list rows (or the muted
  *  empty line). The shared row's internal-badge rule resolves per row from
  *  the item's ownerVisibility (a public repo under a private-visibility
- *  owner is "Internal" — exactly OrgRepoListItem's orgPrivate arm). */
-function DashboardRepoList(props: { heading: string; items: DashboardRepoItem[]; emptyText: string }) {
+ *  owner is "Internal" — exactly OrgRepoListItem's orgPrivate arm).
+ *
+ *  `createLinks` renders the wave-19 heading actions on the viewer's OWN
+ *  list (upstream DashboardRepoList.vue:397 + 519 — the muted `+` links to
+ *  `/repo/create` (tooltip "new_repo") and `/org/create` (tooltip
+ *  "new_org", gated on CanCreateOrganization — always true at the landed
+ *  tier); the widget's `?org=` deep-link parameter is the org-switcher's,
+ *  which this reduction does not render, so the plain URLs stand). */
+function DashboardRepoList(props: { heading: string; items: DashboardRepoItem[]; emptyText: string; createLinks?: boolean }) {
   return (
     <div>
-      <h2>{props.heading}</h2>
+      <div class="flex-text-block">
+        <h2>{props.heading}</h2>
+        {props.createLinks === true ? (
+          <span class="tw-ml-auto flex-text-block">
+            <a class="tw-flex tw-items-center muted" href="/repo/create" data-tooltip-content={dashboardLocale.new_repo} aria-label={dashboardLocale.new_repo}>
+              <Icon name="octicon-plus" />
+            </a>
+            <a class="tw-flex tw-items-center muted" href="/org/create" data-tooltip-content={dashboardLocale.new_org} aria-label={dashboardLocale.new_org}>
+              <Icon name="octicon-organization" />
+            </a>
+          </span>
+        ) : null}
+      </div>
       {props.items.length === 0 ? (
         <p class="tw-text-placeholder-text">{props.emptyText}</p>
       ) : (
@@ -444,7 +465,12 @@ export function DashboardPage(props: { ctx: UiContext; data: DashboardData }) {
           <DashboardActivity data={data} />
         </div>
         <div id="dashboard-repo-list" class="flex-container-sidebar">
-          <DashboardRepoList heading={dashboardLocale.my_repos} items={data.myRepos} emptyText={dashboardLocale.repos_empty} />
+          <DashboardRepoList
+            heading={dashboardLocale.my_repos}
+            items={data.myRepos}
+            emptyText={dashboardLocale.repos_empty}
+            createLinks={true}
+          />
           <DashboardRepoList
             heading={dashboardLocale.watched_repos}
             items={data.watched}
