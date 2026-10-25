@@ -33,6 +33,7 @@ import { registerLanguageRoutes } from "./routes/languages";
 import { registerMarkdownRoutes } from "./routes/markdown";
 import { registerMilestoneRoutes } from "./routes/milestones";
 import { registerMiscT2Routes } from "./routes/misc-t2";
+import { registerMiscT3Routes } from "./routes/misc-t3";
 import { registerNotificationsRoutes } from "./routes/notifications";
 import { registerOrgRoutes } from "./routes/org-repos";
 import { registerOrgProfileRoutes } from "./routes/orgs";
@@ -199,6 +200,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // published settings, /markup, /token lifecycle. Anonymous except the
   // auth'd trio, mirroring upstream api.go routing.
   registerMiscT2Routes(app, requireAuth);
+  // Tier-3 misc stragglers: signing-key 404 (no key configured — upstream
+  // behavior) + the doer-scoped key/gpg list/get/delete honest stubs.
+  registerMiscT3Routes(app, requireAuth, optionalAuth);
   // Tier-2 user reads: heatmap + current-following check.
   registerUserReadT2Routes(app, requireAuth, optionalAuth);
   // Tier-2 notifications: derived threads over issue/comment activity; all
