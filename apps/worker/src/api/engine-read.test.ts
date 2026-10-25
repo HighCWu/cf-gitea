@@ -959,4 +959,22 @@ describe("branch render extras (SPEC-0013 §3.6)", () => {
     expect(frozen.user_can_merge).toBe(false);
     expect(frozen.effective_branch_protection_name).toBe("release-*");
   });
+
+  it("DELETE: a protected branch refuses with the upstream text; an unprotected one deletes", async () => {
+    // CanDeleteBranchWithPermission (branch.go:561-581): the first-match rule
+    // gates the delete on CanUserDelete → ErrBranchIsProtected ("branch is
+    // protected", protected_branch.go:27). The API arm predated SPEC-0013 and
+    // carried no rule check — the UI-16 wave's flagged bypass, now closed.
+    const guardedDelete = await send(`${REPO_PATH}/branches/${GUARDED}`, authed({ method: "DELETE" }));
+    expect(guardedDelete.status).toBe(403);
+    const guardedBody = await jsonBody(guardedDelete);
+    expect(guardedBody.message).toBe("branch is protected");
+    // GUARDED survives the refusal...
+    expect((await send(`${REPO_PATH}/branches/${GUARDED}`, authed({ method: "GET" }))).status).toBe(200);
+    // ...and an unprotected branch still deletes through the same arm (a
+    // fresh branch matching no rule — FROZEN matches release-* and is also
+    // protected, so the free arm needs its own branch).
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "free-to-delete" }))).status).toBe(201);
+    expect((await send(`${REPO_PATH}/branches/free-to-delete`, authed({ method: "DELETE" }))).status).toBe(204);
+  });
 });

@@ -34,6 +34,7 @@ import {
 } from "../services/repo-access";
 import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
 import {
+  canUserDelete,
   canUserPush,
   compileRuleName,
   isUserMergeWhitelisted,
@@ -623,6 +624,22 @@ export function registerBranchRoutes(
       const branchName = c.req.valid("param").branch;
       if (branchName === pair.repo.defaultBranch) {
         throw new ApiError(403, "can not delete default or pull request target branch");
+      }
+      // Upstream CanDeleteBranchWithPermission (services/repository/branch.go
+      // :561-581): a first-match rule gates the delete on its CanUserDelete —
+      // ErrBranchIsProtected ("branch is protected", models/git/
+      // protected_branch.go:27). This arm predated SPEC-0013 and carried no
+      // rule check (the UI-16 wave's flagged bypass); the git-HTTP gate and
+      // the UI arm already enforce. Admins ride canUserDelete's own arm.
+      {
+        const rules = await listRepoRules(c.env.DB, pair.repo.id);
+        const rule = firstMatchRule(rules, branchName);
+        if (rule !== null) {
+          const access = await principalAccessOf(c.env.DB, pair.repo, viewerOf(c).requester);
+          if (!(await canUserDelete(c.env.DB, parseRuleConfig(rule.rules), access))) {
+            throw new ApiError(403, "branch is protected");
+          }
+        }
       }
       const reads = engineReads(c.env, pair.repo);
       const tip = refTipMap(await reads.listRefs()).get(branchRef(branchName));
