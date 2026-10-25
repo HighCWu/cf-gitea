@@ -5,6 +5,8 @@ Stock git clients (`clone`/`push`), Gitea API tooling (SDKs, `tea`, release auto
 terraform providers) work against it unmodified; the official Gitea web UI is the
 long-term frontend (asset-reuse strategy, SPEC-0008+).
 
+v1.0 release notes — what shipped, how it was verified, known limitations: [docs/RELEASE-NOTES-v1.0.md](docs/RELEASE-NOTES-v1.0.md).
+
 ## Architecture at a glance
 
 ```
