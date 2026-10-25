@@ -37,6 +37,7 @@ import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullReviewSignedInGolden from "./goldens/pull-review-signed-in.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
+import settingsBranchesGolden from "./goldens/settings-branches.html?raw";
 import settingsHookDetailGolden from "./goldens/settings-hook-detail.html?raw";
 import settingsMirrorGolden from "./goldens/settings-mirror.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
@@ -79,6 +80,9 @@ const goldens: Record<string, string> = {
   // (the GOLDEN_CASES entries above).
   "org-labels.html": orgLabelsGolden,
   "settings-hook-detail.html": settingsHookDetailGolden,
+  // Pages wave 15: the protected-branches settings panel (the GOLDEN_CASES
+  // entry above).
+  "settings-branches.html": settingsBranchesGolden,
   // Pages wave 13: the compare family (the plain comparison, the writer's
   // new-PR form view, the has-PR pair, the same-tip tag state).
   "compare-commits.html": compareCommitsGolden,

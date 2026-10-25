@@ -132,6 +132,7 @@ describe("handlesUiRoute", () => {
     "/octo/hello/issues/new", // wave-4 form family (GET + POST handlers)
     "/octo/hello/settings", // wave-4 basics family
     "/octo/hello/settings/hooks", // wave-4 webhooks family
+    "/octo/hello/settings/branches", // wave-15 protected-branches family
     "/octo/api/commits", // reserved names bind the OWNER segment only
     "/octo/hello%20two",
     "/octo/hello/milestones", // wave-6 milestones list family
@@ -168,7 +169,7 @@ describe("handlesUiRoute", () => {
     "/octo/hello/git-receive-pack",
     "/octo/hello/HEAD",
     "/octo/hello/info/lfs/locks", // SPEC-0006 family
-    "/octo/hello/settings/branches", // the deeper settings space stays engine-owned (wave 4 claims only /settings + /settings/hooks)
+    "/octo/hello/settings/keys", // the deeper settings space stays engine-owned (wave 4 claims /settings + /settings/hooks; wave 15 claims /settings/branches + its writes — keys/tags stay engine-owned)
     "/octo/hello/commit/abc1234", // commit-detail dead links (open question 1)
     "/octo/hello/raw/branch/main/x", // upstream raw shape not in this slice
     "/octo/hello/commitsX", // family literals are exact

@@ -26,7 +26,7 @@ import { beforeAll } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { issues, pullReviews, repositories, repoMirrors, teams, users } from "../../db/schema";
+import { issues, protectedBranches, pullReviews, repositories, repoMirrors, teams, users } from "../../db/schema";
 import { type UiManifest } from "../manifest";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import {
@@ -45,6 +45,7 @@ import { TeamsService } from "../../api/routes/org-teams";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { OrgService } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
+import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { webhookDeliveries, webhooks } from "../../db/schema";
 
 // --- deterministic fixtures (mirrors pages.test.ts's seeding) -----------------
@@ -285,6 +286,10 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // recent-deliveries list with the three status marks (the fixed-uuid
   // delivery rows keep the bytes stable).
   { file: "settings-hook-detail.html", path: "/alice/golden/settings/hooks/1", status: 200, signedIn: true },
+  // The protected-branches panel (wave 15): the SIGNED-IN admin view of
+  // alice/golden's two fixture rules — the priority ranks, the glob badge
+  // on release/*, the counts lines and the move/edit/delete controls.
+  { file: "settings-branches.html", path: "/alice/golden/settings/branches", status: 200, signedIn: true },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
@@ -903,6 +908,47 @@ async function seedGoldenHooks(): Promise<void> {
   ]);
 }
 
+/**
+ * The wave-15 protected-branch fixtures for alice/golden (the
+ * settings-branches golden): two rules inserted DIRECTLY with T0-pinned
+ * stamps — the plain "main" (approvals-armed: required approvals 1 +
+ * dismiss-stale) and the glob "release/*" (push-allowlist-armed: can_push +
+ * whitelist with alice's id, so the counts line renders a user count). Only
+ * the settings-branches page reads protected_branches, so no other golden
+ * bytes shift. Idempotent by the repo's first rule row.
+ */
+async function seedGoldenBranchProtections(): Promise<void> {
+  const db = drizzle(env.DB);
+  const repo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "golden")))
+    .get();
+  if (repo === undefined) throw new Error("golden repo row missing before branch-protection seeding");
+  const existing = await db.select({ id: protectedBranches.id }).from(protectedBranches).where(eq(protectedBranches.repoId, repo.id)).limit(1).all();
+  if (existing.length > 0) return;
+  const alice = await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get();
+  if (alice === undefined) throw new Error("golden owner row missing before branch-protection seeding");
+  await db.insert(protectedBranches).values([
+    {
+      repoId: repo.id,
+      ruleName: "main",
+      priority: 1,
+      rules: serializeRuleConfig({ ...emptyRuleConfig(), requiredApprovals: 1, dismissStaleApprovals: true }),
+      createdAt: new Date(T0 * 1000),
+      updatedAt: new Date(T0 * 1000),
+    },
+    {
+      repoId: repo.id,
+      ruleName: "release/*",
+      priority: 2,
+      rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true, enableWhitelist: true, whitelistUserIds: [alice.id] }),
+      createdAt: new Date((T0 + 1) * 1000),
+      updatedAt: new Date((T0 + 1) * 1000),
+    },
+  ]);
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
@@ -955,6 +1001,9 @@ export function setupGoldenFixtures(): void {
     // org/repo rows hang off.
     await seedGoldenOrgLabels();
     await seedGoldenHooks();
+    // Wave-15: alice/golden's protected-branch rules (the settings-branches
+    // golden) — after the seeds the repo and owner rows hang off.
+    await seedGoldenBranchProtections();
     // Wave 7: the user-profile golden renders the shared/repo/list rows'
     // "Updated {TimeSince}" from `repositories.updated_at` — the issue and
     // milestone seeders above stamp it with wall-clock time (the counter-

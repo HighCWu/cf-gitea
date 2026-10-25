@@ -13,6 +13,11 @@
  *                                            below; the brief's dedicated
  *                                            sub-page for options.tmpl's
  *                                            Mirror Settings section)
+ *   GET    /{owner}/{repo}/settings/branches the protected-branches panel
+ *                                            (wave 15 — pages/
+ *                                            branch-protection.tsx, its own
+ *                                            module; this module owns only
+ *                                            the shared SettingsNav item)
  *
  * ## DOM contract (templates/repo/settings/{layout_head,navbar,options}.tmpl
  *  + webhook/{base,base_list,settings,new}.tmpl + webhook/gitea.tmpl at the
@@ -196,6 +201,7 @@ export const settingsLocale = {
   private_toggle: "Make Private", // "repo.settings.visibility.private.button" (checkbox form)
   update_settings: "Update Settings", // "repo.settings.update_settings"
   add_webhook: "Add Webhook", // "repo.settings.add_webhook"
+  branches: "Branches", // "repo.settings.branches" (wave 15 — the protected-branches panel's navbar item)
   webhook_name: "Webhook name", // "repo.settings.webhook.name"
   payload_url: "Target URL", // "repo.settings.payload_url"
   content_type: "POST Content Type", // "repo.settings.content_type"
@@ -308,11 +314,15 @@ export function renderRepoSettingsPage(options: {
 
 /** The settings navbar (repo/settings/navbar.tmpl reduced to the live items
  *  — the header comment's dead-link rule; wave 10 adds the Mirror item —
- *  the brief's `/settings/mirror` sub-page; upstream at this pin renders
- *  mirror settings as a SECTION of options.tmpl, no navbar item, so the
- *  item text is the options section's own "Mirror Settings" header and the
- *  placement (last) keeps the upstream relative order intact). */
-function SettingsNav(props: { repoLink: string; active: "options" | "hooks" | "mirror" }) {
+ *  the brief's `/settings/mirror` sub-page; upstream renders mirror settings
+ *  as a SECTION of options.tmpl, no navbar item, so the item text is the
+ *  options section's own "Mirror Settings" header and the placement (last)
+ *  keeps the upstream relative order intact). Wave 15 adds the Branches
+ *  item between Webhooks and Mirror — upstream's own order
+ *  (navbar.tmpl:16-23 puts branches after hooks; mirror stays adjacent to
+ *  its options-section origin at the tail). Exported for pages/
+ *  branch-protection.tsx, which renders it with `branches` active. */
+export function SettingsNav(props: { repoLink: string; active: "options" | "hooks" | "branches" | "mirror" }) {
   return (
     <div class="flex-container-nav">
       <div class="ui fluid vertical menu">
@@ -322,6 +332,9 @@ function SettingsNav(props: { repoLink: string; active: "options" | "hooks" | "m
         </a>
         <a class={props.active === "hooks" ? "active item" : "item"} href={`${props.repoLink}/settings/hooks`}>
           {settingsLocale.hooks}
+        </a>
+        <a class={props.active === "branches" ? "active item" : "item"} href={`${props.repoLink}/settings/branches`}>
+          {settingsLocale.branches}
         </a>
         <a class={props.active === "mirror" ? "active item" : "item"} href={`${props.repoLink}/settings/mirror`}>
           {mirrorLocale.mirror_settings}

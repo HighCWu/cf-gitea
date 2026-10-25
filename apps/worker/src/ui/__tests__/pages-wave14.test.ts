@@ -331,7 +331,11 @@ describe("wave-14 parser families (parseUiRoute / handlesUiRoute)", () => {
     expect(parseUiRoute("/octo/hello/settings/hooks/abc")).toBeNull();
     expect(parseUiRoute("/octo/hello/settings/hooks/42/edit")).toBeNull();
     expect(parseUiRoute("/octo/hello/settings/hooks/42/test/extra")).toBeNull();
-    expect(parseUiRoute("/octo/hello/settings/branches")).toBeNull(); // the standing wave-4 pin
+    // Wave 15 claimed /settings/branches (pages/branch-protection.tsx); the
+    // rest of the deeper settings space stays engine-owned (the wave-4 pin,
+    // narrowed by the wave-15 claim).
+    expect(parseUiRoute("/octo/hello/settings/keys")).toBeNull();
+    expect(parseUiRoute("/octo/hello/settings/tags")).toBeNull();
   });
 });
 

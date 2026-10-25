@@ -142,6 +142,21 @@
  *                                          /delete?id= target exists for
  *                                          the list trash buttons this UI
  *                                          does not render)
+ *   /:owner/:repo/settings/branches       protected-branches rules list,
+ *                                          GET (pages/branch-protection.tsx
+ *                                          — wave 15; admin viewer only)
+ *   /:owner/:repo/settings/branches/edit  the create/edit rule form, GET +
+ *                                          POST (upstream's literal; the
+ *                                          GET keyed by `?rule_name=` —
+ *                                          unknown falls back to create —
+ *                                          the POST by the hidden rule_id)
+ *   /:owner/:repo/settings/branches/priority
+ *                                          the reorder write, POST (the
+ *                                          no-JS repeated-ids form of the
+ *                                          landed priority op)
+ *   /:owner/:repo/settings/branches/{id}/delete
+ *                                          the rule delete write, POST
+ *                                          (upstream's literal shape)
  *   /{org}/labels                          org labels management, GET
  *                                          (pages/org-labels.tsx — wave 14;
  *                                          the landed org-label family's
@@ -225,8 +240,10 @@
  * new UiFamily members. The wave-4 write families (issue-new/settings/
  * settings-hooks) dispatch here too, with their own GET+POST handlers.
  * The rest of the suffixed /issues//pulls space (`/issues/{index}/comments`,
- * non-numeric or deeper tails), the deeper /settings/* space
- * (`/settings/branches`, …), and every other repo-scoped path stay with the
+ * non-numeric or deeper tails), the rest of the deeper /settings/* space
+ * (wave 15 claimed `/settings/branches` + its `/edit`, `/priority` and
+ * `/{id}/delete` writes — pages/branch-protection.tsx; keys/tags/LFS and
+ * friends stay engine-owned), and every other repo-scoped path stay with the
  * engine — the four git-protocol routes, the LFS family, and the engine
  * JSON API/admin surface. The parser claims families by shape and never
  * protocol or engine paths, and the reserved owner names (`api`, `assets` —
@@ -397,6 +414,20 @@ import {
   renderRepoSettingsPage,
   syncMirrorNow,
 } from "./pages/settings";
+import {
+  applyBranchProtectionForm,
+  deleteRuleById,
+  editFormOfRule,
+  emptyBranchProtectionForm,
+  loadBranchProtectionRules,
+  loadOwnerIsOrg,
+  parseBranchProtectionForm,
+  parsePriorityIds,
+  reorderRules,
+  renderBranchProtectionEditPage,
+  renderBranchProtectionListPage,
+  type BranchProtectionEditData,
+} from "./pages/branch-protection";
 import { findIssueByRepoAndIndex } from "../api/services/issues";
 import { deleteRepoHook, getRepoHook } from "../api/services/hooks";
 import { findPullRequestByIndex } from "../api/services/pulls";
@@ -480,7 +511,11 @@ export interface IssueNewRoute {
 /** The wave-4 settings families (pages/settings.tsx): the basics form, the
  *  webhooks sub-page, the mirror panel — wave 10 — and the wave-14 per-hook
  *  page with its two POST tails, each GET + POST except the two POST-only
- *  tails — admin-viewer-only surfaces. */
+ *  tails — admin-viewer-only surfaces. Wave 15 adds the protected-branches
+ *  family (pages/branch-protection.tsx): the list, the create/edit form
+ *  (upstream's `/edit` literal keyed by `?rule_name=` on the GET), the
+ *  id-keyed delete and the priority reorder POSTs — upstream's literal
+ *  route shapes (web.go:1206-1212). */
 export interface SettingsRoute {
   family:
     | "settings"
@@ -488,10 +523,15 @@ export interface SettingsRoute {
     | "settings-mirror"
     | "settings-hook-detail"
     | "settings-hook-test"
-    | "settings-hook-delete";
+    | "settings-hook-delete"
+    | "settings-branches"
+    | "settings-branch-edit"
+    | "settings-branch-delete"
+    | "settings-branch-priority";
   owner: string;
   repo: string;
-  /** The hook id (the detail/test/delete families only). */
+  /** The hook id (the detail/test/delete families only) or the rule id (the
+   *  branch-delete family). */
   id?: number;
 }
 
@@ -935,6 +975,21 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest.length === 2) return { family: "settings-hook-detail", owner, repo, id };
       if (rest.length === 3 && rest[2] === "test") return { family: "settings-hook-test", owner, repo, id };
       if (rest.length === 3 && rest[2] === "delete") return { family: "settings-hook-delete", owner, repo, id };
+    }
+    // Wave 15: the protected-branches family (pages/branch-protection.tsx —
+    // upstream's literal group, web.go:1206-1212): the list, the shared
+    // create/edit form at the `/edit` literal (the GET keyed by
+    // `?rule_name=`, the POST by the hidden rule_id), the priority reorder
+    // POST (upstream's JS sends the {ids} JSON; our no-JS form posts the
+    // urlencoded repeated ids — pages/branch-protection.tsx's header), and
+    // the id-keyed delete POST (PathParamInt64 parity, the hook-id
+    // convention). Every deeper/junk tail (/branches/abc, /{id}/edit,
+    // /edit/more) stays engine-owned.
+    if (rest.length === 1 && rest[0] === "branches") return { family: "settings-branches", owner, repo };
+    if (rest.length === 2 && rest[0] === "branches" && rest[1] === "edit") return { family: "settings-branch-edit", owner, repo };
+    if (rest.length === 2 && rest[0] === "branches" && rest[1] === "priority") return { family: "settings-branch-priority", owner, repo };
+    if (rest.length === 3 && rest[0] === "branches" && /^-?\d+$/.test(rest[1] as string) && rest[2] === "delete") {
+      return { family: "settings-branch-delete", owner, repo, id: Number.parseInt(rest[1] as string, 10) };
     }
     return null;
   }
@@ -1619,6 +1674,154 @@ function methodNotAllowed(allow: string): Response {
     status: 405,
     headers: { "content-type": "text/plain;charset=utf-8", allow, "x-content-type-options": "nosniff" },
   });
+}
+
+// ---------------------------------------------------------------------------
+// The wave-15 protected-branches family (pages/branch-protection.tsx —
+// upstream's /settings/branches group, web.go:1206-1212, over the landed
+// branch_protections API arms)
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/settings/branches (pages/branch-protection.tsx — the
+ *  rules list; the settings gate's order, the `?rule_name=` save-flash
+ *  reduction display-only). */
+async function branchProtectionListPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, ctx, repo, respond } = resolved;
+  // The saved-rule flash rides the save POST's redirect target (upstream's
+  // exact `?rule_name=` target, protected_branch.go:337); display-only.
+  const savedRule = url.searchParams.get("rule_name");
+  // An archived repo renders the warning instead of the list — the rows
+  // need not load (branches.tmpl's IsArchived arm).
+  const rules = repo.isArchived ? [] : await loadBranchProtectionRules(c.env.DB, repo.id);
+  return respond(
+    c.html(
+      renderBranchProtectionListPage({
+        ctx,
+        data: { rules, isOrg: await loadOwnerIsOrg(c.env.DB, repo), savedRule: savedRule ?? null },
+      }),
+      200,
+    ),
+  );
+}
+
+/** GET /{owner}/{repo}/settings/branches/edit (pages/branch-protection.tsx —
+ *  the create/edit form; `?rule_name=` keys the rule under edit, an unknown
+ *  or foreign name falls back to the CREATE form exactly like upstream's
+ *  SettingsProtectedBranch nil-rule arm). */
+async function branchProtectionEditPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, ctx, repo, respond } = resolved;
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const isOrg = await loadOwnerIsOrg(c.env.DB, repo);
+  // Archived repos render the warning instead of the form (the module
+  // header — the POST could only 404).
+  if (repo.isArchived) {
+    return respond(
+      c.html(renderBranchProtectionEditPage({ ctx, data: { form: emptyBranchProtectionForm(), isOrg, rule: null }, error: null }), 200),
+    );
+  }
+  const ruleName = url.searchParams.get("rule_name") ?? "";
+  const rule = ruleName === "" ? null : (await loadBranchProtectionRules(c.env.DB, repo.id)).find((item) => item.row.ruleName === ruleName) ?? null;
+  const form = rule === null ? emptyBranchProtectionForm() : await editFormOfRule(c.env.DB, pair, rule);
+  return respond(c.html(renderBranchProtectionEditPage({ ctx, data: { form, isOrg, rule }, error: null }), 200));
+}
+
+/**
+ * POST /{owner}/{repo}/settings/branches/edit — the create-or-edit write
+ * (upstream SettingsProtectedBranchPost over the landed create/PATCH arms;
+ * pages/branch-protection.tsx's header carries the arm-by-arm citations):
+ * the hidden rule_id splits the arms, the 403/422 messages re-render the
+ * form with the kept submission (the login failure convention), success
+ * 303s onto `/settings/branches?rule_name=<saved>` — upstream's exact
+ * redirect target. An edit id that is missing or foreign 404-shells
+ * (existence hidden, the hook-detail posture).
+ */
+async function branchProtectionEditSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const isOrg = await loadOwnerIsOrg(c.env.DB, repo);
+  const form = parseBranchProtectionForm(await readUrlEncodedForm(c.req.raw));
+  const result = await applyBranchProtectionForm(c.env.DB, pair, form);
+  if (result.outcome === "created" || result.outcome === "saved") {
+    return respond(
+      new Response(null, {
+        status: 303,
+        headers: { location: `/${repo.ownerNamespace}/${repo.slug}/settings/branches?rule_name=${encodeURIComponent(result.ruleName)}` },
+      }),
+    );
+  }
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  // The invalid re-render keeps the submission (the login failure
+  // convention); the rule binding stays whatever the form's rule_id says —
+  // a validation re-render of an EDIT keeps the edit header only when the
+  // row actually resolved, which the apply call just proved it did not need.
+  const ruleId = form.ruleId;
+  const rule =
+    ruleId === 0
+      ? null
+      : ((await loadBranchProtectionRules(c.env.DB, repo.id)).find((item) => item.row.id === ruleId) ?? null);
+  const data: BranchProtectionEditData = { form, isOrg, rule };
+  return respond(c.html(renderBranchProtectionEditPage({ ctx, data, error: result.message }), 200));
+}
+
+/**
+ * POST /{owner}/{repo}/settings/branches/{id}/delete — the delete write
+ * (upstream DeleteProtectedBranchRulePost's literal route over the landed
+ * DELETE arm): success 303s onto the list (upstream's JSONRedirect target),
+ * a missing/foreign id 404-shells (the arm's 404 — existence stays hidden).
+ */
+async function branchProtectionDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-branch-delete" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived posture
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const deleted = await deleteRuleById(c.env.DB, pair, route.id);
+  if (!deleted) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/settings/branches` } }));
+}
+
+/**
+ * POST /{owner}/{repo}/settings/branches/priority — the reorder write
+ * (upstream UpdateBranchProtectionPriories' literal route over the landed
+ * priority op): the repeated `ids` fields carry the full reordered id list
+ * (the no-JS form's `{ids}` shape — pages/branch-protection.tsx's header);
+ * success 303s back onto the list (upstream's JS reloads the page).
+ */
+async function branchProtectionPrioritySubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { repo, respond } = resolved;
+  if (repo.isArchived) return respond(c.html(renderNotFound(resolved.ctx), 404)); // RepoMustNotBeArchived (wraps upstream's route)
+  await reorderRules(c.env.DB, repo.id, parsePriorityIds(await readUrlEncodedForm(c.req.raw)));
+  return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/settings/branches` } }));
 }
 
 /**
@@ -2739,6 +2942,17 @@ uiRouter.get("/:owner/:repo/settings/hooks/:id/delete", () => methodNotAllowed("
 // settings gate as the other two sub-pages).
 uiRouter.get("/:owner/:repo/settings/mirror", (c) => mirrorSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/mirror", (c) => mirrorSyncSubmit(c));
+// Wave-15 protected-branches family (parseUiRoute claims exactly these
+// shapes — upstream's web.go:1206-1212 group; the POSTs run the §2.8
+// sameOriginGuard first; the POST-only write tails answer GET with chi's
+// 405 — the hook test/delete convention).
+uiRouter.get("/:owner/:repo/settings/branches", (c) => branchProtectionListPage(c));
+uiRouter.get("/:owner/:repo/settings/branches/edit", (c) => branchProtectionEditPage(c));
+uiRouter.post("/:owner/:repo/settings/branches/edit", (c) => branchProtectionEditSubmit(c));
+uiRouter.post("/:owner/:repo/settings/branches/priority", (c) => branchProtectionPrioritySubmit(c));
+uiRouter.get("/:owner/:repo/settings/branches/priority", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/branches/:id/delete", (c) => branchProtectionDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/settings/branches/:id/delete", () => methodNotAllowed("POST"));
 // Wave-6 milestones families (parseUiRoute claims exactly these shapes; the
 // static literal registers before any deeper dynamic tail could — there is
 // none this slice, the shape is kept for the reasons above).
