@@ -278,7 +278,9 @@ describe("POST /repos/{owner}/{repo}/migrate", () => {
   it("fails cleanly (500) when credentials arrive without a usable KEK — before any write", async () => {
     await seedRepo();
     const queue = recordingQueue();
-    const app = makeApp(queue); // no MIRROR_CREDENTIAL_KEY
+    // Explicit absence (ADR-0005 D3): the ambient env may carry
+    // MIRROR_CREDENTIAL_KEY from .dev.vars — the test needs it unset.
+    const app = makeApp(queue, { MIRROR_CREDENTIAL_KEY: undefined });
     const res = await app(`${repoBase}/migrate`, {
       method: "POST",
       headers: jsonAuth,
