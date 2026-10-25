@@ -301,3 +301,20 @@ forward-only migration path with an upgrade txn.
    vs lease-drain-only.
 5. Whether `listPackCatalog` gains a `state` filter in v1 or stays
    worker-internal.
+
+## As-built records (landed milestones)
+
+- **M3.2 (e359e44, 2026-10-25)**: the segmented path's gap was real — the DO
+  serve arms renewed PLAN-level only at batch boundaries; the R2 Range GET
+  seam inside `PackStore.chunk()` had no per-pack authorization. Landed:
+  `ReadGate` invoked synchronously immediately before every Range GET on a
+  chunk-LRU miss (cache hits consult nothing), `SERVE_SEGMENT_BYTES =
+  PACK_CHUNK` (1 MiB — ~4 orders under the isolate bound; ≤1 renewal txn per
+  MiB), rejection throws → the pull loop errors the stream before any flush
+  (fail-stop per Property A), installed at every emission read site of both
+  DO arms. The Worker fast path was already M3.1-correct and is unchanged.
+  Verified by `e2e/check-segmented-serve.mjs` (10 checks: renew-then-read
+  ordering via counting-stub event timeline, mid-stream RECLAIMABLE flip,
+  mixed-generation plans, segment bounds). Plan-time reads (negotiation/
+  closure computation before planFetch) remain ungated by reviewed M3.1
+  posture — GC flips there fail the fetch whole.
