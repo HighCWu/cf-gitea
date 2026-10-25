@@ -82,7 +82,14 @@ scripts/               # Repo-level tooling (contract checks, codegen)
   sibling paths (two escaped commits this session); (3) after ANY concurrent
   edit window, re-verify your own change landed (grep/json.load) before
   committing — a rejected edit + a successful commit of a neighbor's change
-  looks identical to success.
+  looks identical to success; (4) **git safety under concurrency** (the
+  shared-index incident, 2026-10-25): commit ONLY via pathspec
+  (`git commit -m "…" -- <your exact paths>`), NEVER reset/rebase/amend while
+  sibling waves are in flight, and verify with `git show --stat HEAD` that
+  only your paths landed — a sibling's staged files swept into your commit
+  (or your commit referencing their untracked file) means STOP and escalate
+  to the orchestrator, never attempt history surgery yourself; (5) `tsc
+  --noEmit` is its own gate — vitest does not typecheck across files.
 - Generated artifacts stay out (see Structure Rules); `pnpm-lock.yaml` IS committed.
 - **Submodule hygiene**: `gitea/` stays pristine — never run installs or builds
   inside it (asset builds run in scratch dirs, `scripts/build-gitea-assets.mjs`);
