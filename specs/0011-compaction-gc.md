@@ -364,3 +364,21 @@ forward-only migration path with an upgrade txn.
 **Implementation milestones M3.0–M3.4 COMPLETE (2026-10-25). M3.5 (the
 full fault-injection matrix of §7.2 rows 1-5 + capability-matrix generation
 + differential wiring) remains as the acceptance-hardening tail.**
+
+- **Content-path lease coverage (2fce4cd, 2026-10-25 — closes M3.2's known
+  follow-up)**: every R2 content read is now lease-covered or provably
+  clean-fail. `withContentLease` at the engine's RPC boundary wraps the six
+  typed content RPCs (readBlob/readCommit/listLog/listTree/readDiff +
+  listRefs) and the ui() page renders (one lease per render; `/api/*`
+  routed around the double-lease) with the M3.2 `serveReadGate` threaded to
+  every chunk read and release in `finally` — zero worker-side changes (the
+  boundary covers all EngineClient consumers transitively). The v2 ls-refs
+  peel arm is leased (its silent missing-`peeled:` line was the other real
+  wrong-partial, alongside snapshot's silent file omission — both now
+  impossible). Plan-construction reads (want-validation, closure walks,
+  `commitApiChange`/merge validation) remain ungated BY PROOF: every such
+  caller converts a mid-GC null into a conservative whole-response outcome
+  (want rejected / plan throws / CAS aborted / mergeability degrades to
+  error) — never a wrong success. Verified by check-read-leases' five
+  CONTENT checks (25 total), incl. concurrent-GC flip-blocking at the R2
+  seam and post-reclaim whole-refusal.
