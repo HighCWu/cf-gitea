@@ -119,6 +119,27 @@ const RUNTIME_ONLY_RESPONSES = {
       404: "repo arm of SigningKeySSH (misc/signing.go:100 via api.go:1531) — same blank-format answer as /repos/{owner}/{repo}/signing-key.gpg; the contract documents only the 200 text/plain",
     },
   },
+  "/repos/{owner}/{repo}/hooks/git": {
+    get: {
+      401: "upstream reqToken() (gitea/routers/api/v1/api.go:1276) rejects anonymous callers; the contract declares {200,404} only",
+      403: "upstream reqAdmin (api.go:383-390) — the repo-admin gate 403s before the handler; the contract documents no 403 on the list (routes/git-hooks.ts)",
+    },
+  },
+  "/repos/{owner}/{repo}/hooks/git/{id}": {
+    get: {
+      401: "same reqToken class as the list (api.go:1276); contract documents {200,404} only",
+      403: "reqAdmin (api.go:383-390); contract documents {200,404} only",
+    },
+    patch: {
+      401: "same reqToken class as the list (api.go:1276)",
+      403: "reqAdmin (api.go:383-390)",
+      422: "Go bind → APIErrorValidation on a schema-invalid body",
+    },
+    delete: {
+      401: "same reqToken class as the list (api.go:1276)",
+      403: "reqAdmin (api.go:383-390); contract documents {204,404} only",
+    },
+  },
   "/admin/users/{username}/keys": {
     post: {
       401: "upstream reqToken() runs inside the admin group's tokenRequiresScopes(admin) chain (gitea/routers/api/v1/api.go:1824-); the admin tag declares no 401 anywhere (routes/misc-t3.ts admin wiring note)",

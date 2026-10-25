@@ -18,6 +18,7 @@ import { registerBlockRoutes } from "./routes/blocks";
 import { registerPushMirrorRoutes } from "./routes/push-mirrors";
 import { registerTagProtectionRoutes } from "./routes/tag-protections";
 import { registerWikiRoutes } from "./routes/wiki";
+import { registerGitHookRoutes } from "./routes/git-hooks";
 import { registerAdminT2Routes } from "./routes/admin-t2";
 import { registerArchiveRoutes } from "./routes/archive";
 import { registerBranchProtectionRoutes } from "./routes/branch-protections";
@@ -273,6 +274,11 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerTagProtectionRoutes(app, requireAuth);
   registerBlockRoutes(app, requireAuth);
   registerWikiRoutes(app, requireAuth, optionalAuth);
+  // Server-side git hooks: degenerate sample surface + R2-persisted edits
+  // (githooks/<repo_id>/<hook_name>) — static-over-param keeps the literal
+  // /hooks/git ahead of hooks.ts's /hooks/{id}. reqToken+repo-admin gates
+  // documented in RUNTIME_ONLY_RESPONSES.
+  registerGitHookRoutes(app, requireAuth);
 
   return app;
 }
