@@ -10,6 +10,7 @@ import { z } from "zod";
 import { orgMembers, repositories, teamMembers, teamRepoAccess, teams, users, type TeamAccessMode } from "../../db/schema";
 import { LastOrgOwnerError } from "../../services/orgs/errors";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
+import { scrubTeamFromOrgRules } from "../../services/branch-protection";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { teamSchema, type Team } from "../models/team";
@@ -332,9 +333,12 @@ export interface TeamListOptions {
 
 export class TeamsService {
   private readonly db: DrizzleD1Database;
+  /** The raw binding — the SPEC-0013 M4 scrub primitive takes D1Database. */
+  private readonly d1: D1Database;
   private readonly orgs: OrgService;
 
   constructor(d1: D1Database) {
+    this.d1 = d1;
     this.db = drizzle(d1);
     this.orgs = new OrgService(d1);
   }
@@ -495,10 +499,19 @@ export class TeamsService {
    * runs the whole delete in ONE transaction, so a refused membership
    * removal (`ErrLastOrgOwner`, the §4.3 blanked 500) rolls EVERYTHING back.
    * Ported as: the last-owner pre-check first (nothing deleted when it
-   * fires), then ONE batch — team delete + the guarded membership deletes
-   * (the `removeMember` guard SQL, orgs.ts) + the member-counter
-   * decrements. `team_invite`/branch-protection/PR-review cleanup upstream
-   * performs has no cf-gitea tables yet.
+   * fires), then the branch-protection scrub + ONE batch — team delete +
+   * the guarded membership deletes (the `removeMember` guard SQL, orgs.ts) +
+   * the member-counter decrements.
+   *
+   * The branch-protection scrub (SPEC-0013 M4) ports upstream's
+   * "update branch protections" block (team.go:191–210, inside the tx BEFORE
+   * the team row goes): the team id is stripped from every allowlist column
+   * of every rule on the org's repos; running it before the batch keeps the
+   * rollback shape (a failed scrub deletes nothing). Still-unmodeled upstream
+   * cleanups: `team_invite` (no table), and the review-request rows —
+   * upstream deletes Review{Type: Request, ReviewerTeamID: t.ID} in its
+   * DeleteBeans (team.go:218–223) while our pull_reviews.reviewerTeamId rows
+   * survive the delete (the reviews family's gap, not this module's).
    */
   async deleteTeam(team: TeamRecord): Promise<void> {
     const memberIds = (
@@ -511,6 +524,8 @@ export class TeamsService {
         throw new LastOrgOwnerError(userId);
       }
     }
+    // Branch-protection scrub (SPEC-0013 M4, team.go:191-210) — see above.
+    await scrubTeamFromOrgRules(this.d1, team.orgId, team.id);
     const statements: BatchItem<"sqlite">[] = [
       // The batch is sequential: the team_members rows for this team are
       // already gone when the guards below evaluate.

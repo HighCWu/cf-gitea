@@ -8,11 +8,14 @@ import { protectedBranches, teams, users } from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
 import {
+  ACTIONS_USER_ID,
+  DEPLOY_KEY_USER_ID,
   emptyRuleConfig,
   isRuleNameSpecial,
   listRepoRules,
   parseRuleConfig,
   recomputeOfficialForRule,
+  sanitizeRuleWhitelists,
   serializeRuleConfig,
   type ProtectedBranchConfig,
 } from "../../services/branch-protection";
@@ -84,16 +87,19 @@ import { assertNotArchived, requireRepoAdmin, requireVisibleRepo } from "../serv
  * (upstream-parity; ordering changes first-match, not any single rule's
  * predicates). The rewritten count is logged — the OQ-3 instrument.
  *
- * M4 DEFERRAL (recorded per SPEC-0013 §5): the save-side whitelist
- * sanitization (updateUserWhitelist's CanWrite filter, updateApprovalWhitelist,
- * updateTeamWhitelist — protected_branch.go:549-624) is M4's milestone; M3
- * stores the RESOLVED ids verbatim, and the render maps ids→names without
- * upstream's readers filter (getAllowListUserNames, convert.go:123-137) —
- * vanished principals render as nothing, never invented.
+ * M4 SANITIZATION (SPEC-0013 §5's last milestone): both save arms run the
+ * merged config through sanitizeRuleWhitelists (the service module's
+ * UpdateProtectBranch port — updateUserWhitelist's write filter, the approvals
+ * any-access filter, updateTeamWhitelist's repo-access filter, each with
+ * upstream's SliceSortedEqual short-circuit) before the row is written, so
+ * resolved-but-unprivileged or vanished principals never persist (§4.4). The
+ * render still maps ids→names without upstream's readers filter
+ * (getAllowListUserNames, convert.go:123-137) — vanished principals render as
+ * nothing, never invented; after M4 the scrub + sanitization keep such ids
+ * out of storage in the first place.
  */
 
-const DEPLOY_KEY_USER_ID = -3; // user_model.DeployKeyUserID (user_system.go:51)
-const ACTIONS_USER_ID = -2; // user_model.ActionsUserID — resolvable by name
+
 
 const notFoundResponse = {
   description: "notFound",
@@ -646,6 +652,13 @@ export function registerBranchProtectionRoutes(app: OpenAPIHono<ApiEnv>, require
       config.bypassAllowlistUserIds = bypassAllowlistUsers;
       config.bypassAllowlistTeamIds = bypassAllowlistTeams;
 
+      // The save-side sanitization (M4): upstream's create lands in
+      // UpdateProtectBranch too (the new-rule branch), so every freshly
+      // resolved id still passes the write/any-access/repo-access filters
+      // (:438-493) — a resolved name whose principal lacks the access is
+      // silently dropped, exactly like the settings UI's multiselect.
+      await sanitizeRuleWhitelists(c.env.DB, pair.repo, config, emptyRuleConfig());
+
       const now = new Date();
       const priority = form.priority ?? 0;
       await drizzle(c.env.DB).insert(protectedBranches).values({
@@ -728,6 +741,10 @@ export function registerBranchProtectionRoutes(app: OpenAPIHono<ApiEnv>, require
       const ruleName = c.req.valid("param").name;
       const rule = requireRule(await findRuleByName(c.env.DB, pair.repo.id, ruleName));
       const config = configOf(rule);
+      // The short-circuit's comparison side: the config AS LOADED, before any
+      // pointer patch merges over it (sanitizeRuleWhitelists keeps a list the
+      // edit did not change verbatim — updateUserWhitelist :575-577 et al.).
+      const stored = configOf(rule);
 
       // The push master cascades its sub-flags (branch.go:894-913); the
       // deploy-key booleans ride the same cascade (HasDeployKeyPush input).
@@ -849,6 +866,13 @@ export function registerBranchProtectionRoutes(app: OpenAPIHono<ApiEnv>, require
       config.approvalsWhitelistTeamIds = approvalsWhitelistTeams;
       config.bypassAllowlistUserIds = bypassEnabled ? bypassAllowlistUsers : [];
       config.bypassAllowlistTeamIds = bypassEnabled ? bypassAllowlistTeams : [];
+
+      // The save-side sanitization (M4) — the merged lists pass the
+      // write/any-access/repo-access filters before the row is written; an
+      // absent name array equals the stored list and short-circuits through
+      // untouched (upstream keeps already-stored ids on an unchanged list;
+      // the deletion scrub owns those).
+      await sanitizeRuleWhitelists(c.env.DB, pair.repo, config, stored);
 
       await drizzle(c.env.DB)
         .update(protectedBranches)

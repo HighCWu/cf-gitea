@@ -19,6 +19,7 @@ import {
 import { RepoNameCollisionError, RepoNameInvalidError } from "../../repos/service";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
+import { scrubUserFromAllRules } from "../../services/branch-protection";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { createOrgOptionSchema, organizationSchema } from "../models/organization";
@@ -985,6 +986,13 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     if ((membershipCount?.total ?? 0) > 0) {
       throw new ApiError(422, `user still has membership of organizations [uid: ${target.id}]`);
     }
+
+    // Branch-protection whitelist scrub (SPEC-0013 M4) — upstream DeleteUser's
+    // "***** START: Branch Protections *****" block (services/user/delete.go:
+    // 134-155): the deleted id is stripped from every allowlist column of every
+    // rule (ids are JSON-serialized, so the sweep pages all rules). Pre-batch
+    // like upstream's in-tx ordering: a failed scrub aborts the delete.
+    await scrubUserFromAllRules(c.env.DB, target.id);
 
     // The delete sweep: FK-cascade tables ride the users row; the FK-less
     // user-associable stores are cleared by id (delete.go:74–103 census).

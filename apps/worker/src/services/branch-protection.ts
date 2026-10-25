@@ -45,6 +45,37 @@
  * Error() renders only the message, modules/util/error.go:56–58). The
  * status-check, codeowner and protected-file arms are stored-but-unenforced
  * (SPEC-0013 §6 — no status consumer, no CODEOWNERS, no file walking).
+ *
+ * SANITIZATION (SPEC-0013 M4) — the save-side whitelist normalization port of
+ * UpdateProtectBranch (protected_branch.go:418–527): every user allowlist runs
+ * through updateUserWhitelist (:572–601 — keep only repo-code WRITE users,
+ * deploy-key/Actions pseudo-ids excepted :580–583), the approvals allowlist
+ * through updateApprovalWhitelist (:549–568 — keep users with ANY explicit
+ * unit access, GetUserIDsWithAnyUnitAccess :553–556), every team allowlist
+ * through updateTeamWhitelist (:605–624 — keep teams holding repo access,
+ * GetTeamsWithAccessToAnyRepoUnit :609–612). Upstream's SliceSortedEqual
+ * short-circuit (:575/:551/:608) ports too: a list the edit did not change
+ * keeps its stored ids verbatim. One recorded normalization (§4.4): a VANISHED
+ * principal is DROPPED — upstream's literal arm errors the whole save
+ * (GetUserByID wrapped failure, :585–589); this port follows the SPEC's
+ * drop-not-fail reading, making the scrub (below) the only other writer of
+ * stale ids.
+ *
+ * DELETION SCRUB (SPEC-0013 M4) — the RemoveUserIDFromProtectedBranch /
+ * RemoveTeamIDFromProtectedBranch ports (:648–693, removeIDsFromProtectedBranch):
+ * a deleted principal is stripped from every allowlist column of every affected
+ * rule in one config rewrite (changed rows only, `config` column only —
+ * upstream's `.Cols("config")` leaves updated_unix alone). Callers are the
+ * delete cascades: user delete (services/user/delete.go:134–155 — the
+ * "***** START: Branch Protections *****" sweep, batched 50 because ids are
+ * JSON-serialized and unfilterable server-side; we page the same size), team
+ * delete (services/org/team.go:191–210 — scoped to the ORG's repos via the
+ * `repo_id IN (SELECT id FROM repository WHERE owner_id = ?)` builder), repo
+ * delete (services/repository/delete.go:171 — the rows die wholesale with the
+ * repo; repos/service.ts's cascade). Divergence, per the SPEC's "every
+ * allowlist column": the port scrubs all SIX user and SIX team arrays —
+ * upstream's five-array sweep predates the bypass allowlist and misses
+ * bypass_allowlist_user_ids/team_ids (:654–668).
  */
 
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
@@ -53,7 +84,17 @@ import { drizzle } from "drizzle-orm/d1";
 import type { User } from "../api/models/user";
 import { repositoryPermissions, type RepositoryRow, type Viewer } from "../api/services/repository";
 import { collaboratorModeOf } from "../api/services/repo-collaborators";
-import { issues, protectedBranches, pullRequests, pullReviews, ReviewType, teamMembers, users } from "../db/schema";
+import { issues, protectedBranches, pullRequests, pullReviews, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users } from "../db/schema";
+
+// ---------------------------------------------------------------------------
+// The system pseudo-principals (user_system.go:51) — resolvable by name at the
+// API edge (branch.go:712-724) and carved out of the whitelist sanitization
+// (protected_branch.go:580-583). The route module imports these so the two
+// sites cannot drift.
+// ---------------------------------------------------------------------------
+
+export const DEPLOY_KEY_USER_ID = -3; // user_model.DeployKeyUserID
+export const ACTIONS_USER_ID = -2; // user_model.ActionsUserID
 
 // ---------------------------------------------------------------------------
 // The config JSON (protected_branch.go:45–80) — upstream's exact keys.
@@ -752,6 +793,278 @@ export async function recomputeOfficialForRule(d1: D1Database, repo: RepositoryR
       const official = await isUserOfficialReviewer(d1, config, access);
       if (official === review.official) continue;
       await drizzle(d1).update(pullReviews).set({ official }).where(eq(pullReviews.id, review.id));
+      rewritten += 1;
+    }
+  }
+  return rewritten;
+}
+
+// ---------------------------------------------------------------------------
+// Save-side whitelist sanitization (SPEC-0013 M4 — UpdateProtectBranch,
+// protected_branch.go:418–527, via updateUserWhitelist :572–601,
+// updateApprovalWhitelist :549–568, updateTeamWhitelist :605–624).
+// ---------------------------------------------------------------------------
+
+/** util.SliceSortedEqual — order-insensitive list equality (the :575/:551/:608
+ *  short-circuit inputs). */
+function sortedIdsEqual(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) return false;
+  const left = [...a].sort((x, y) => x - y);
+  const right = [...b].sort((x, y) => x - y);
+  return left.every((value, index) => value === right[index]);
+}
+
+/** GetUserByID + GetIndividualUserRepoPermission(...).CanWrite(TypeCode)
+ *  (:585–597) over our ACL pair: the users row must exist (a vanished id
+ *  fails the filter — the §4.4 drop normalization; upstream's literal arm
+ *  errors the save) and hold repo-code write (the matrix push/admin grant or
+ *  a write/admin collaborator row — principalAccessOfRow's composition). */
+async function userHasRepoCodeWrite(d1: D1Database, repo: RepositoryRow, userId: number): Promise<boolean> {
+  const row = (await drizzle(d1).select().from(users).where(eq(users.id, userId)).limit(1).all())[0];
+  if (row === undefined) return false;
+  const access = await principalAccessOfRow(d1, repo, row);
+  return access.write;
+}
+
+/** updateApprovalWhitelist's GetUserIDsWithAnyUnitAccess (:553–556) — an
+ *  EXPLICIT access row at read or above (owner, site admin, any collaborator
+ *  row). A public repo's implicit pull does NOT count, matching upstream's
+ *  access-table semantics. Ownership matches the way the whole module's
+ *  permission input does: the ownerId cell OR the owner-namespace login
+ *  (repositoryPermissions' isRepositoryOwner, repository.ts:100-102). */
+async function userHasAnyUnitAccess(d1: D1Database, repo: RepositoryRow, userId: number): Promise<boolean> {
+  const row = (
+    await drizzle(d1)
+      .select({ isAdmin: users.isAdmin, usernameLower: users.usernameLower })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1)
+      .all()
+  )[0];
+  if (row === undefined) return false;
+  if (row.isAdmin === true || repo.ownerId === userId || row.usernameLower === repo.ownerNamespace) return true;
+  return (await collaboratorModeOf(d1, repo.id, userId)) !== "none";
+}
+
+/** GetTeamsWithAccessToAnyRepoUnit (:609–612) over our model: a team of the
+ *  repo's org holds access through a materialized team_repo_access row OR the
+ *  includes_all coverage union (the teams read path's same union). */
+async function teamIdsWithRepoAccess(d1: D1Database, repo: RepositoryRow): Promise<Set<number>> {
+  if (repo.ownerId === null) return new Set();
+  const orgTeams = await drizzle(d1)
+    .select({ id: teams.id, includesAll: teams.includesAllRepositories })
+    .from(teams)
+    .where(eq(teams.orgId, repo.ownerId))
+    .all();
+  const granted = new Set(
+    (await drizzle(d1).select({ teamId: teamRepoAccess.teamId }).from(teamRepoAccess).where(eq(teamRepoAccess.repoId, repo.id)).all()).map(
+      (row) => row.teamId,
+    ),
+  );
+  return new Set(orgTeams.filter((team) => team.includesAll === true || granted.has(team.id)).map((team) => team.id));
+}
+
+/**
+ * updateUserWhitelist port (:572–601): an unchanged list keeps its stored ids
+ * verbatim (:575–577 — the deletion scrub, not the save, owns already-stored
+ * stale ids); a changed list keeps the two pseudo-principals (:580–583) and
+ * drops every user without repo-code write — demoted (:595–597) or vanished
+ * (the §4.4 drop normalization) alike.
+ */
+export async function sanitizeUserWhitelist(d1: D1Database, repo: RepositoryRow, current: readonly number[], incoming: readonly number[]): Promise<number[]> {
+  if (sortedIdsEqual(current, incoming)) return [...current];
+  const kept: number[] = [];
+  for (const id of incoming) {
+    if (id === ACTIONS_USER_ID || id === DEPLOY_KEY_USER_ID) {
+      kept.push(id);
+      continue;
+    }
+    if (await userHasRepoCodeWrite(d1, repo, id)) {
+      kept.push(id);
+    }
+  }
+  return kept;
+}
+
+/**
+ * updateApprovalWhitelist port (:549–568): unchanged short-circuit, else keep
+ * every user holding ANY explicit unit access (:560–563 — no pseudo-id
+ * carve-out here; upstream's approvals filter has none either).
+ */
+export async function sanitizeApprovalWhitelist(d1: D1Database, repo: RepositoryRow, current: readonly number[], incoming: readonly number[]): Promise<number[]> {
+  if (sortedIdsEqual(current, incoming)) return [...current];
+  const kept: number[] = [];
+  for (const id of incoming) {
+    if (await userHasAnyUnitAccess(d1, repo, id)) {
+      kept.push(id);
+    }
+  }
+  return kept;
+}
+
+/**
+ * updateTeamWhitelist port (:605–624): unchanged short-circuit, else keep only
+ * the teams that still hold repo access (:615–619 — a vanished team or one
+ * that lost its grant is dropped; ids outside the repo's org can never hold
+ * access and drop unconditionally).
+ */
+export async function sanitizeTeamWhitelist(d1: D1Database, repo: RepositoryRow, current: readonly number[], incoming: readonly number[]): Promise<number[]> {
+  if (sortedIdsEqual(current, incoming)) return [...current];
+  const withAccess = await teamIdsWithRepoAccess(d1, repo);
+  return incoming.filter((id) => withAccess.has(id));
+}
+
+/**
+ * UpdateProtectBranch's twelve allowlist assignments (:438–493) in upstream
+ * order — five user lists plus bypass through updateUserWhitelist, the
+ * approvals list through updateApprovalWhitelist, all six team lists through
+ * updateTeamWhitelist. Mutates `config` in place (the route's post-merge
+ * config) and returns it; `stored` is the config AS LOADED from the row
+ * (the short-circuit's comparison side — an edit that leaves a list untouched
+ * keeps its stored ids exactly like upstream). The create arm passes the
+ * zero config as `stored`: every non-empty fresh list differs, so every
+ * create sanitizes (upstream's new-rule branch runs the same filters).
+ */
+export async function sanitizeRuleWhitelists(d1: D1Database, repo: RepositoryRow, config: ProtectedBranchConfig, stored: ProtectedBranchConfig): Promise<ProtectedBranchConfig> {
+  config.whitelistUserIds = await sanitizeUserWhitelist(d1, repo, stored.whitelistUserIds, config.whitelistUserIds);
+  config.forcePushAllowlistUserIds = await sanitizeUserWhitelist(d1, repo, stored.forcePushAllowlistUserIds, config.forcePushAllowlistUserIds);
+  config.deletionAllowlistUserIds = await sanitizeUserWhitelist(d1, repo, stored.deletionAllowlistUserIds, config.deletionAllowlistUserIds);
+  config.mergeWhitelistUserIds = await sanitizeUserWhitelist(d1, repo, stored.mergeWhitelistUserIds, config.mergeWhitelistUserIds);
+  config.approvalsWhitelistUserIds = await sanitizeApprovalWhitelist(d1, repo, stored.approvalsWhitelistUserIds, config.approvalsWhitelistUserIds);
+  config.bypassAllowlistUserIds = await sanitizeUserWhitelist(d1, repo, stored.bypassAllowlistUserIds, config.bypassAllowlistUserIds);
+  config.whitelistTeamIds = await sanitizeTeamWhitelist(d1, repo, stored.whitelistTeamIds, config.whitelistTeamIds);
+  config.forcePushAllowlistTeamIds = await sanitizeTeamWhitelist(d1, repo, stored.forcePushAllowlistTeamIds, config.forcePushAllowlistTeamIds);
+  config.deletionAllowlistTeamIds = await sanitizeTeamWhitelist(d1, repo, stored.deletionAllowlistTeamIds, config.deletionAllowlistTeamIds);
+  config.mergeWhitelistTeamIds = await sanitizeTeamWhitelist(d1, repo, stored.mergeWhitelistTeamIds, config.mergeWhitelistTeamIds);
+  config.approvalsWhitelistTeamIds = await sanitizeTeamWhitelist(d1, repo, stored.approvalsWhitelistTeamIds, config.approvalsWhitelistTeamIds);
+  config.bypassAllowlistTeamIds = await sanitizeTeamWhitelist(d1, repo, stored.bypassAllowlistTeamIds, config.bypassAllowlistTeamIds);
+  return config;
+}
+
+// ---------------------------------------------------------------------------
+// Deletion scrub (SPEC-0013 M4 — removeIDsFromProtectedBranch :640–684 and its
+// two cascade callers: services/user/delete.go:134–155,
+// services/org/team.go:191–210).
+// ---------------------------------------------------------------------------
+
+/** Upstream pages 50 per fetch (delete.go:138) — the port keeps the bound. */
+const SCRUB_PAGE_SIZE = 50;
+
+/** The six user allowlist arrays upstream's sweep covers (:654–668), widened
+ *  to the bypass pair per the SPEC's "every allowlist column". */
+function scrubUserIdFromConfig(config: ProtectedBranchConfig, userId: number): boolean {
+  const before =
+    config.whitelistUserIds.length +
+    config.forcePushAllowlistUserIds.length +
+    config.deletionAllowlistUserIds.length +
+    config.approvalsWhitelistUserIds.length +
+    config.mergeWhitelistUserIds.length +
+    config.bypassAllowlistUserIds.length;
+  config.whitelistUserIds = config.whitelistUserIds.filter((id) => id !== userId);
+  config.forcePushAllowlistUserIds = config.forcePushAllowlistUserIds.filter((id) => id !== userId);
+  config.deletionAllowlistUserIds = config.deletionAllowlistUserIds.filter((id) => id !== userId);
+  config.approvalsWhitelistUserIds = config.approvalsWhitelistUserIds.filter((id) => id !== userId);
+  config.mergeWhitelistUserIds = config.mergeWhitelistUserIds.filter((id) => id !== userId);
+  config.bypassAllowlistUserIds = config.bypassAllowlistUserIds.filter((id) => id !== userId);
+  const after =
+    config.whitelistUserIds.length +
+    config.forcePushAllowlistUserIds.length +
+    config.deletionAllowlistUserIds.length +
+    config.approvalsWhitelistUserIds.length +
+    config.mergeWhitelistUserIds.length +
+    config.bypassAllowlistUserIds.length;
+  return after !== before; // the rewrite only fires when something changed (:669-683)
+}
+
+/** The team mirror of scrubUserIdFromConfig (:655–668's team half + bypass). */
+function scrubTeamIdFromConfig(config: ProtectedBranchConfig, teamId: number): boolean {
+  const before =
+    config.whitelistTeamIds.length +
+    config.forcePushAllowlistTeamIds.length +
+    config.deletionAllowlistTeamIds.length +
+    config.approvalsWhitelistTeamIds.length +
+    config.mergeWhitelistTeamIds.length +
+    config.bypassAllowlistTeamIds.length;
+  config.whitelistTeamIds = config.whitelistTeamIds.filter((id) => id !== teamId);
+  config.forcePushAllowlistTeamIds = config.forcePushAllowlistTeamIds.filter((id) => id !== teamId);
+  config.deletionAllowlistTeamIds = config.deletionAllowlistTeamIds.filter((id) => id !== teamId);
+  config.approvalsWhitelistTeamIds = config.approvalsWhitelistTeamIds.filter((id) => id !== teamId);
+  config.mergeWhitelistTeamIds = config.mergeWhitelistTeamIds.filter((id) => id !== teamId);
+  config.bypassAllowlistTeamIds = config.bypassAllowlistTeamIds.filter((id) => id !== teamId);
+  const after =
+    config.whitelistTeamIds.length +
+    config.forcePushAllowlistTeamIds.length +
+    config.deletionAllowlistTeamIds.length +
+    config.approvalsWhitelistTeamIds.length +
+    config.mergeWhitelistTeamIds.length +
+    config.bypassAllowlistTeamIds.length;
+  return after !== before;
+}
+
+/** The config-column-only rewrite (:669–683's `.Cols("config")` — updated_unix
+ *  deliberately untouched, so the render's updated_at keeps the admin's last
+ *  deliberate edit). */
+async function rewriteRuleConfig(d1: D1Database, ruleId: number, config: ProtectedBranchConfig): Promise<void> {
+  await drizzle(d1).update(protectedBranches).set({ rules: serializeRuleConfig(config) }).where(eq(protectedBranches.id, ruleId));
+}
+
+/**
+ * RemoveUserIDFromProtectedBranch over EVERY rule (delete.go:134–155): ids
+ * live inside the JSON blob, so the sweep pages all rules (50 at a time,
+ * upstream's batchSize) and rewrites the changed ones. Returns the number of
+ * rules rewritten. Pseudo-principal ids are refused — they are never users
+ * and must survive every scrub.
+ */
+export async function scrubUserFromAllRules(d1: D1Database, userId: number): Promise<number> {
+  if (userId <= 0) return 0;
+  let rewritten = 0;
+  for (let offset = 0; ; offset += SCRUB_PAGE_SIZE) {
+    const rows = await drizzle(d1)
+      .select()
+      .from(protectedBranches)
+      .orderBy(asc(protectedBranches.id))
+      .limit(SCRUB_PAGE_SIZE)
+      .offset(offset)
+      .all();
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      const config = parseRuleConfig(row.rules);
+      if (!scrubUserIdFromConfig(config, userId)) continue;
+      await rewriteRuleConfig(d1, row.id, config);
+      rewritten += 1;
+    }
+  }
+  return rewritten;
+}
+
+/**
+ * RemoveTeamIDFromProtectedBranch scoped like the DeleteTeam caller
+ * (team.go:196–205): only the ORG's repos' rules can reference the team
+ * (`repo_id IN (SELECT id FROM repository WHERE owner_id = t.OrgID)`), so the
+ * sweep is scoped the same way. Returns the number of rules rewritten.
+ */
+export async function scrubTeamFromOrgRules(d1: D1Database, orgId: number, teamId: number): Promise<number> {
+  if (teamId <= 0) return 0;
+  // The caller's scope (team.go:198-201's builder): repo_id IN (the org's repos).
+  const repoIds = (await drizzle(d1).select({ id: repositories.id }).from(repositories).where(eq(repositories.ownerId, orgId)).all()).map(
+    (row) => row.id,
+  );
+  if (repoIds.length === 0) return 0;
+  let rewritten = 0;
+  for (let offset = 0; ; offset += SCRUB_PAGE_SIZE) {
+    const rows = await drizzle(d1)
+      .select()
+      .from(protectedBranches)
+      .where(inArray(protectedBranches.repoId, repoIds))
+      .orderBy(asc(protectedBranches.id))
+      .limit(SCRUB_PAGE_SIZE)
+      .offset(offset)
+      .all();
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      const config = parseRuleConfig(row.rules);
+      if (!scrubTeamIdFromConfig(config, teamId)) continue;
+      await rewriteRuleConfig(d1, row.id, config);
       rewritten += 1;
     }
   }

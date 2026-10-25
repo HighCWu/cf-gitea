@@ -24,7 +24,8 @@ import {
 } from "./service";
 import { purgeRepoMessage, tombstoneRepoDO } from "./purge";
 import { settleCreatingRepo } from "../git-http/gate";
-import { repoCounters, repoRedirects, repositories, repoTransfer, repoUnits, users } from "../db/schema";
+import { protectedBranches, repoCounters, repoRedirects, repositories, repoTransfer, repoUnits, users } from "../db/schema";
+import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { ZERO_OID, buildPack, buildReceivePackBody } from "./testing/git-pack";
 
 beforeAll(async () => {
@@ -32,7 +33,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["personal_access_tokens", "repo_units", "repo_transfer", "repo_redirects", "repo_counters", "repositories"]) {
+  for (const table of ["personal_access_tokens", "protected_branches", "repo_units", "repo_transfer", "repo_redirects", "repo_counters", "repositories"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare("DELETE FROM users WHERE username_lower != 'assets'").run();
@@ -394,6 +395,33 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     // with NO stale team grants (schema.ts's documented cascade convention).
     expect(
       (await env.DB.prepare("SELECT COUNT(*) AS n FROM team_repo_access WHERE repo_id = ?").bind(repo.id).first<{ n: number }>())
+        ?.n,
+    ).toBe(0);
+  });
+
+  it("cascades the protected_branches rows with the repo (SPEC-0013 M4 — the delete.go:171 DeleteBeans arm)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const svc = service();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "protected", true);
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId: repo.id,
+      ruleName: "main",
+      priority: 1,
+      rules: serializeRuleConfig(emptyRuleConfig()),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    expect(
+      (await env.DB.prepare("SELECT COUNT(*) AS n FROM protected_branches WHERE repo_id = ?").bind(repo.id).first<{ n: number }>())
+        ?.n,
+    ).toBe(1);
+
+    await svc.deleteRepository(repo.id);
+    // The rules died in the delete batch (upstream's delete census deletes the
+    // same rows, services/repository/delete.go:171) — a same-name re-create
+    // starts unprotected.
+    expect(
+      (await env.DB.prepare("SELECT COUNT(*) AS n FROM protected_branches WHERE repo_id = ?").bind(repo.id).first<{ n: number }>())
         ?.n,
     ).toBe(0);
   });

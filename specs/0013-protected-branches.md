@@ -566,3 +566,91 @@ protection_name` renders unconditionally where upstream gates on IsAdmin
 `required_approvals` placeholders in git-models' toBranch are overridden by
 the extras spread when a rule matched (6558f3c — toBranch cannot know the
 rules).
+
+## As-built — M4 (2026-10-25 — SPEC COMPLETE)
+
+**Save-side whitelist sanitization** (the M3 header's deferred note, landed):
+`sanitizeUserWhitelist` / `sanitizeApprovalWhitelist` / `sanitizeTeamWhitelist`
+/ `sanitizeRuleWhitelists` (services/branch-protection.ts) port
+UpdateProtectBranch's twelve allowlist assignments (protected_branch.go:438-493
+via updateUserWhitelist :572-601 / updateApprovalWhitelist :549-568 /
+updateTeamWhitelist :605-624), wired into BOTH save arms of
+routes/branch-protections.ts: create passes the zero config as the comparison
+side (every fresh list filters — a resolved name whose principal lacks the
+access is silently dropped, like upstream's settings-UI multiselect), edit
+keeps the AS-LOADED config as the comparison side so the upstream
+SliceSortedEqual short-circuit (:575/:551/:608) ports verbatim — an edit that
+re-submits an unchanged list keeps its stored ids (even stale ones; the scrub
+owns those). Access mapping: WRITE = the module's principalAccess composition
+(matrix admin/owner grant + collaborator write/admin rows, site admins
+included); approvals = ANY explicit unit access (owner via ownerId or the
+isRepositoryOwner namespace match, site admin, any collaborator row — a public
+repo's implicit pull does NOT count, GetUserIDsWithAnyUnitAccess semantics);
+teams = a team_repo_access row OR the includes_all coverage union.
+Recorded normalization (§4.4): a VANISHED principal is DROPPED — upstream's
+literal arm errors the whole save (GetUserByID wrapped failure, :585-589);
+this port follows the spec's drop-not-fail reading. The deploy-key/Actions
+pseudo-id carve-out (:580-583) moved to the service module (the
+DEPLOY_KEY_USER_ID/ACTIONS_USER_ID constants are now exported from
+branch-protection.ts; the route imports them — one source, no drift).
+
+**Principal-deletion scrub**: `scrubUserFromAllRules` (the
+RemoveUserIDFromProtectedBranch port over EVERY rule, paged 50 like
+services/user/delete.go:138's batchSize; ids are JSON-serialized so no
+server-side filter exists — same comment as upstream) and
+`scrubTeamFromOrgRules` (the DeleteTeam caller's org scope, team.go:196-205's
+`repo_id IN (SELECT id FROM repository WHERE owner_id = ...)`, materialized as
+an id list) — both rewrite ONLY the rules JSON column (upstream's
+`.Cols("config")`: updated_unix untouched) and only changed rows (:669-683).
+Divergence per the spec's "every allowlist column" wording: the port scrubs
+all SIX user and SIX team arrays — upstream's five-array sweep
+(:654-668) predates the bypass allowlist and misses bypass_allowlist_*. Hooks
+(upstream's own deletion sites): repo delete → the rows die wholesale in the
+repos/service.ts deleteRepository batch (delete.go:171's DeleteBeans arm —
+the schema's repo-scoped convention promised this sweep since 0019); user
+delete → one pre-batch call in admin-t2.ts's DELETE /admin/users handler
+(delete.go:134-155's "***** START: Branch Protections *****" block —
+pre-batch preserves upstream's in-tx ordering, a failed scrub aborts the
+delete); team delete → one call in org-teams.ts's TeamsService.deleteTeam
+after the §4.3 last-owner pre-check, before the batch (team.go:191-210 runs
+inside the tx BEFORE the team row goes). **Org delete needs NO hook**: the
+deleteOrg guard refuses while the org owns repos, and team ids only ever
+appear on the org's own repos' rules (resolveTeamIds is repo-owner-scoped) —
+nothing can reference a deletable org's teams; upstream is identical
+(DeleteOrganization has no protected-branch arm either). The org-teams.ts
+deleteTeam docstring's stale "branch-protection cleanup has no cf-gitea
+tables yet" claim is fixed; the genuinely unmodeled upstream cleanups now
+named there: team_invite (no table) and the pull_reviews.reviewerTeamId
+request rows (upstream deletes Review{Type: Request, ReviewerTeamID} in the
+same DeleteBeans, team.go:218-223 — the reviews family's recorded gap).
+
+**Bypass/admin-override matrix pinned** (CanBypassBranchProtection :242-261):
+the full nine-cell table (admin × block_admin_merge_override × bypass
+allowlist user/team/not-listed) is table-driven over real D1 in
+services/branch-protection.test.ts — including the two composition cells the
+route-level tests left implicit: the OVERRIDDEN admin rescued by the
+allowlist (user or team arm) and the overridden admin off the allowlist
+refused. The merge-RPC cells were already pinned (pull-merge-protection.test.ts:
+admin force_merge clears, block_admin_merge_override refuses verbatim,
+allowlisted non-admin forces through). The push gate deliberately has NO
+bypass arm (§4.8: our merges never traverse receive-pack, so upstream's
+push-path bypass — the opts.PullRequestID escape hatch, hook_pre_receive.go
+:236-312 — has no cf-gitea counterpart; the push predicates' own matrix is
+pinned by branch-protection-push.test.ts + the service predicate tests).
+
+**Priority op edge cases** (the M4 row's third item): partial id lists
+renumber only the listed rules (unlisted keep their priorities) and absent/
+empty id lists 204 with nothing written — joining the M3 cells (renumber,
+first-match flip, foreign-repo no-op, unknown repo).
+
+Tests: services/branch-protection.test.ts 45/45 (+19: sanitization table,
+scrub sweeps incl. idempotence/pseudo-id refusal/org scoping/updated_at
+preservation, the 9-cell bypass matrix); routes/branch-protections.test.ts
+29/29 (+7: create drop cells — reader vs writer vs site-admin vs
+team-with/without access; the edit short-circuit keeping a vanished id;
+the changed-list drop cells — vanished and demoted; the two priority edge
+cases; three M3 tests re-seeded for the new filters); repos/lifecycle.test.ts
+22/22 (+1 cascade); routes/admin-t2.test.ts and routes/org-teams.test.ts
+delete tests extended with scrub assertions; neighbors pull-merge-protection
++ pull-reviews + webhooks-push + push-stale 72/72. check:api PASS tier-1
+78/78; typecheck clean; eslint clean.

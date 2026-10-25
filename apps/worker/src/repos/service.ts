@@ -59,6 +59,7 @@ import {
   repoUnits,
   repoWatchers,
   pullRequests,
+  protectedBranches,
   repositories,
   stars,
   teamRepoAccess,
@@ -589,6 +590,11 @@ export class RepoService {
       // Mirror rows (migration 0010; SPEC-0009 §4.3.13) — the encrypted
       // credentials die with the repo that owned them.
       this.db.delete(repoMirrors).where(eq(repoMirrors.repoId, repoId)),
+      // Protected-branch rules die with the repo (SPEC-0013 M4's cascade arm —
+      // upstream's DeleteBeans census carries &git_model.ProtectedBranch
+      // {RepoID: repoID}, services/repository/delete.go:171). The schema's
+      // repo-scoped convention (no FK) already promised this sweep.
+      this.db.delete(protectedBranches).where(eq(protectedBranches.repoId, repoId)),
       this.db.delete(repoRedirects).where(eq(repoRedirects.redirectRepoId, repoId)),
       this.db.delete(repoTransfer).where(eq(repoTransfer.repoId, repoId)),
       // The row is gone: git requests miss at repo resolution; the §4.1 race

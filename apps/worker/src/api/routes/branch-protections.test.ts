@@ -23,7 +23,7 @@ import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { protectedBranches, pullReviews, repoCollaborators, repositories, ReviewType, teamMembers, teams } from "../../db/schema";
+import { protectedBranches, pullReviews, repoCollaborators, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users } from "../../db/schema";
 import { IssuesService } from "../../issues/service";
 import { emptyRuleConfig, findRule, serializeRuleConfig } from "../../services/branch-protection";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
@@ -135,15 +135,22 @@ async function seedRepo(options: { orgOwned?: boolean; archived?: boolean } = {}
   return { slug, repoId };
 }
 
-/** The org's one team with bob as the member (team_members org-scoped rows). */
-async function seedTeam(): Promise<number> {
+/**
+ * The org's teams: `devs` by default; a second name avoids the
+ * UNIQUE(org_id, lower_name) collision. With a repoId, the team holds a
+ * team_repo_access row on it — the M4 sanitization's repo-access filter input.
+ */
+async function seedTeam(repoId?: string, name = "devs"): Promise<number> {
   const inserted = await db()
     .insert(teams)
-    .values({ orgId: 20, lowerName: "devs", name: "devs", authorize: "write" })
+    .values({ orgId: 20, lowerName: name, name, authorize: "write" })
     .returning({ id: teams.id })
     .all();
   const teamId = inserted[0]!.id;
   await db().insert(teamMembers).values({ orgId: 20, teamId, userId: 2 });
+  if (repoId !== undefined) {
+    await db().insert(teamRepoAccess).values({ orgId: 20, teamId, repoId });
+  }
   return teamId;
 }
 
@@ -223,6 +230,10 @@ const repoPath = (slug: string): string => `/api/v1/repos/alice/${slug}/branch_p
 describe("repoCreateBranchProtection", () => {
   it("201 happy path: renders upstream shapes and stores the upstream json keys", async () => {
     const { slug, repoId } = await seedRepo();
+    // M4 sanitization: whitelisted principals need their access — bob/cara
+    // are write collaborators so their lists survive (the M3-era verbatim
+    // storage of unprivileged ids is exactly what M4 stopped).
+    await seedCollaborators(repoId);
     const res = await post(repoPath(slug), {
       rule_name: "main",
       enable_push: true,
@@ -307,7 +318,8 @@ describe("repoCreateBranchProtection", () => {
 
   it("resolves team names to ids on org-owned repos and stores the deploy-key pseudo-id", async () => {
     const { slug, repoId } = await seedRepo({ orgOwned: true });
-    const teamId = await seedTeam();
+    // the team holds repo access so the M4 sanitization keeps it
+    const teamId = await seedTeam(repoId);
     const res = await post(`/api/v1/repos/acme/${slug}/branch_protections`, {
       rule_name: "main",
       enable_push: true,
@@ -427,6 +439,7 @@ describe("repoEditBranchProtection", () => {
 
   it("replaces whitelists when names are given (422 unknown) and keeps them when absent", async () => {
     const { slug, repoId } = await seedRepo();
+    await seedCollaborators(repoId); // cara (5) holds write — the M4 write filter keeps her
     await seedRule(repoId, "main", { ...emptyRuleConfig(), enableMergeWhitelist: true, mergeWhitelistUserIds: [2] });
 
     const unknown = await patch(`${repoPath(slug)}/main`, { merge_whitelist_usernames: ["ghost"] });
@@ -548,5 +561,126 @@ describe("the recompute instrument (wired at M3)", () => {
     // with the rule gone the whitelist arm evaporates: cara's write access
     // makes her official again (the recompute evaluates the no-rule config)
     expect(await reviewOfficialOf(issueId, 5)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC-0013 M4 — the save-side whitelist sanitization through the API arms
+// (UpdateProtectBranch :418-527: a resolved-but-unprivileged or vanished
+// principal never persists).
+// ---------------------------------------------------------------------------
+
+describe("M4 save-side sanitization (create + edit arms)", () => {
+  it("create drops users without repo-code write from the push/merge lists; the approvals list keeps explicit read access", async () => {
+    const { slug, repoId } = await seedRepo();
+    await seedCollaborators(repoId); // bob (2) + cara (5) write
+    await db().insert(repoCollaborators).values({ repoId, userId: 1, mode: "read", createdAt: new Date(), updatedAt: new Date() });
+    const res = await post(repoPath(slug), {
+      rule_name: "main",
+      enable_push: true,
+      enable_push_whitelist: true,
+      push_whitelist_usernames: ["doer", "bob"], // reader + writer
+      enable_merge_whitelist: true,
+      merge_whitelist_usernames: ["doer"], // reader — dropped (CanWrite(TypeCode) :595-597)
+      enable_approvals_whitelist: true,
+      approvals_whitelist_username: ["doer", "bob"], // ANY explicit access keeps both (:549-568)
+    });
+    expect(res.status).toBe(201);
+    const body = await jsonBody(res);
+    expect(body.push_whitelist_usernames).toEqual(["bob"]);
+    expect(body.merge_whitelist_usernames).toEqual([]);
+    expect(body.approvals_whitelist_username).toEqual(["doer", "bob"]);
+    const rules = (await ruleRowByName(repoId, "main"))?.rules as Record<string, unknown>;
+    expect(rules.whitelist_user_ids).toEqual([2]);
+    expect(rules.merge_whitelist_user_ids).toEqual([]);
+    expect(rules.approvals_whitelist_user_ids).toEqual([1, 2]);
+  });
+
+  it("create keeps the site admin (the admin matrix grant is write) and drops teams without repo access", async () => {
+    const { slug, repoId } = await seedRepo({ orgOwned: true });
+    const grantedTeam = await seedTeam(repoId, "devs");
+    await seedTeam(undefined, "extras"); // no team_repo_access row on this repo
+    const res = await post(`/api/v1/repos/acme/${slug}/branch_protections`, {
+      rule_name: "main",
+      enable_push: true,
+      enable_push_whitelist: true,
+      push_whitelist_usernames: ["chief"], // site admin — principalAccessOf's admin grant
+      push_whitelist_teams: ["devs", "extras"],
+    }, CHIEF_TOKEN);
+    expect(res.status).toBe(201);
+    const body = await jsonBody(res);
+    expect(body.push_whitelist_usernames).toEqual(["chief"]);
+    expect(body.push_whitelist_teams).toEqual(["devs"]); // extras holds no access (:605-624)
+    const rules = (await ruleRowByName(repoId, "main"))?.rules as Record<string, unknown>;
+    expect(rules.whitelist_user_ids).toEqual([3]);
+    expect(rules.whitelist_team_ids).toEqual([grantedTeam]);
+  });
+
+  it("edit keeps an UNCHANGED list verbatim — a vanished id survives an untouched list (the :575 short-circuit; the scrub owns it)", async () => {
+    const { slug, repoId } = await seedRepo();
+    await seedRule(repoId, "main", { ...emptyRuleConfig(), canPush: true, enableWhitelist: true, whitelistUserIds: [2] });
+    await db().delete(users).where(eq(users.id, 2)); // bob vanishes
+    const res = await patch(`${repoPath(slug)}/main`, { required_approvals: 1 });
+    expect(res.status).toBe(200);
+    expect((await jsonBody(res)).push_whitelist_usernames).toEqual([]); // renders as nothing...
+    const rules = (await ruleRowByName(repoId, "main"))?.rules as Record<string, unknown>;
+    expect(rules.whitelist_user_ids).toEqual([2]); // ...but the storage keeps the list untouched
+  });
+
+  it("edit drops a vanished id once the list CHANGES (the §4.4 normalization — upstream errors the save, the spec pins drop)", async () => {
+    const { slug, repoId } = await seedRepo();
+    await seedCollaborators(repoId);
+    await seedRule(repoId, "main", { ...emptyRuleConfig(), canPush: true, enableWhitelist: true, whitelistUserIds: [2, 5] });
+    await db().delete(users).where(eq(users.id, 2)); // bob vanishes
+    const res = await patch(`${repoPath(slug)}/main`, { push_whitelist_usernames: ["cara"] });
+    expect(res.status).toBe(200);
+    expect((await jsonBody(res)).push_whitelist_usernames).toEqual(["cara"]);
+    const rules = (await ruleRowByName(repoId, "main"))?.rules as Record<string, unknown>;
+    expect(rules.whitelist_user_ids).toEqual([5]); // the vanished id is gone from storage
+  });
+
+  it("edit drops a DEMOTED principal when the list changes (the changed-list write filter)", async () => {
+    const { slug, repoId } = await seedRepo();
+    await seedCollaborators(repoId);
+    // stored: cara only. An edit re-submitting the SAME set would short-circuit
+    // (the :575 keep — upstream identical); the write filter fires on a list
+    // that actually changed.
+    await seedRule(repoId, "main", { ...emptyRuleConfig(), canPush: true, enableWhitelist: true, whitelistUserIds: [5] });
+    await db().update(repoCollaborators).set({ mode: "read" }).where(and(eq(repoCollaborators.repoId, repoId), eq(repoCollaborators.userId, 5)));
+    const res = await patch(`${repoPath(slug)}/main`, { push_whitelist_usernames: ["bob", "cara"] });
+    expect(res.status).toBe(200);
+    expect((await jsonBody(res)).push_whitelist_usernames).toEqual(["bob"]);
+    const rules = (await ruleRowByName(repoId, "main"))?.rules as Record<string, unknown>;
+    expect(rules.whitelist_user_ids).toEqual([2]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC-0013 M4 — priority op edge cases (UpdateProtectBranchPriorities
+// :529-545 ports beyond the M3 happy path).
+// ---------------------------------------------------------------------------
+
+describe("priority op edge cases (M4)", () => {
+  it("a partial id list renumbers only the listed rules; unlisted rules keep their priorities", async () => {
+    const { slug, repoId } = await seedRepo();
+    const a = await seedRule(repoId, "a", emptyRuleConfig(), 7);
+    const b = await seedRule(repoId, "b", emptyRuleConfig(), 8);
+    const c = await seedRule(repoId, "c", emptyRuleConfig(), 9);
+    const res = await post(`${repoPath(slug)}/priority`, { ids: [b] });
+    expect(res.status).toBe(204);
+    const rows = await db().select().from(protectedBranches).where(eq(protectedBranches.repoId, repoId)).all();
+    const priorityOf = new Map(rows.map((row) => [row.id, row.priority]));
+    expect(priorityOf.get(b)).toBe(1); // renumbered from the list head
+    expect(priorityOf.get(a)).toBe(7); // untouched
+    expect(priorityOf.get(c)).toBe(9); // untouched
+  });
+
+  it("absent and empty id lists 204 with nothing written", async () => {
+    const { slug, repoId } = await seedRepo();
+    const a = await seedRule(repoId, "main", emptyRuleConfig(), 3);
+    expect((await post(`${repoPath(slug)}/priority`, {})).status).toBe(204);
+    expect((await post(`${repoPath(slug)}/priority`, { ids: [] })).status).toBe(204);
+    const row = (await db().select().from(protectedBranches).where(eq(protectedBranches.id, a)).all())[0]!;
+    expect(row.priority).toBe(3);
   });
 });

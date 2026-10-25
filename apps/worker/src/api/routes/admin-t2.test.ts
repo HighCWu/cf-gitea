@@ -23,7 +23,8 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { orgMembers, personalAccessTokens, repositories, userRedirects, users } from "../../db/schema";
+import { orgMembers, personalAccessTokens, protectedBranches, repositories, userRedirects, users } from "../../db/schema";
+import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { createStubAuthResolver, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -87,6 +88,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   for (const table of [
     "personal_access_tokens",
+    "protected_branches",
     "org_members",
     "user_redirects",
     "repo_watchers",
@@ -562,12 +564,38 @@ describe("DELETE /admin/users/{username} (adminDeleteUser)", () => {
     await env.DB.prepare("INSERT INTO follows (user_id, follow_id, created_at) VALUES (?1, ?2, 0)")
       .bind(neighborId, adminId)
       .run();
+    // A rule on the admin's repo whitelisting the neighbor across the lists
+    // (SPEC-0013 M4 — the delete.go:134-155 "Branch Protections" block).
+    await seedRepo(adminId, "root", "guarded", "adm_repo_1");
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId: "adm_repo_1",
+      ruleName: "main",
+      priority: 1,
+      rules: serializeRuleConfig({
+        ...emptyRuleConfig(),
+        whitelistUserIds: [neighborId, adminId],
+        mergeWhitelistUserIds: [neighborId],
+        approvalsWhitelistUserIds: [adminId],
+        bypassAllowlistUserIds: [neighborId],
+      }),
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
 
     const res = await adminSend("/admin/users/neighbor", authed({ method: "DELETE" }));
     expect(res.status).toBe(204);
     expect(await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId))).toHaveLength(0);
     expect(await drizzle(env.DB).select().from(personalAccessTokens)).toHaveLength(0); // FK cascade
     expect(await new OrgService(env.DB).lookupUserRedirect("old-neighbor")).toBeNull(); // FK cascade
+    // The whitelist scrub: every reference to the deleted id is gone from the
+    // rule; the other principal's references survive.
+    const rule = (await drizzle(env.DB).select().from(protectedBranches).all())[0];
+    expect(rule).not.toBeUndefined();
+    const config = JSON.parse(rule!.rules) as Record<string, number[]>;
+    expect(config.whitelist_user_ids).toEqual([adminId]);
+    expect(config.merge_whitelist_user_ids).toEqual([]);
+    expect(config.approvals_whitelist_user_ids).toEqual([adminId]);
+    expect(config.bypass_allowlist_user_ids).toEqual([]);
   });
 
   it("422s the guard ladder: org target, self, repos, memberships", async () => {
