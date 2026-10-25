@@ -18,7 +18,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repoRedirects, repoTransfer, repositories, users } from "../db/schema";
+import { repoRedirects, repoTransfer, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { createOptionalTokenAuthMiddleware, createStubAuthResolver, createTokenAuthMiddleware, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
@@ -83,7 +83,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await resetRepoExtrasTables();
-  for (const table of ["repo_transfer", "repo_redirects", "repo_counters", "repositories", "users"]) {
+  for (const table of ["repo_transfer", "repo_redirects", "repo_counters", "webhook_deliveries", "webhooks", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare(
@@ -116,6 +116,25 @@ beforeEach(async () => {
 
 const jsonAuth = { Authorization: `token ${TOKEN}`, "Content-Type": "application/json" };
 const repoPath = "/repos/cf-gitea-stub/edit-me";
+
+/** An active send-everything hook row over the seeded repo — the emission
+ *  assertion surface is the delivery log (§3.6), rows stay `pending` because
+ *  in-process callers have no executionCtx to enqueue with. */
+async function seedHook(): Promise<number> {
+  const inserted = await drizzle(env.DB)
+    .insert(webhooks)
+    .values({
+      repoId: "7401",
+      url: "https://hooks.example.com/repo",
+      events: JSON.stringify({ send_everything: true }),
+      isActive: true,
+    })
+    .returning({ id: webhooks.id })
+    .all();
+  return inserted[0]!.id;
+}
+
+const deliveries = () => drizzle(env.DB).select().from(webhookDeliveries).orderBy(webhookDeliveries.id).all();
 
 describe("PATCH /repos/{owner}/{repo} (repoEdit) — stored settings subset", () => {
   it("updates description/website and renders them on the PATCH and on GET", async () => {
@@ -260,6 +279,34 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — rename, visibility, default
   it("404s an invisible repo (anti-enumeration)", async () => {
     expect((await makeApp()("/repos/cf-gitea-stub/ghost", { method: "PATCH", headers: jsonAuth, body: "{}" })).status).toBe(404);
   });
+
+  it("a rename emits repository action=renamed with changes.name.from (notifier.go:137-138)", async () => {
+    const hookId = await seedHook();
+    const res = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ name: "Renamed" }) });
+    expect(res.status).toBe(200);
+    const rows = await deliveries();
+    expect(rows.map((r) => [r.hookId, r.eventType, r.eventGroup, r.state])).toEqual([[hookId, "repository", "repository", "pending"]]);
+    const payload = JSON.parse(rows[0]!.payloadContent) as {
+      action: string;
+      repository: { full_name: string };
+      organization: { login: string };
+      sender: { login: string };
+      changes: { name: { from: string } };
+    };
+    expect(payload.action).toBe("renamed");
+    // The repository object renders the NEW row; changes.name.from the old slug.
+    expect(payload.repository.full_name).toBe("cf-gitea-stub/renamed");
+    expect(payload.changes.name.from).toBe("edit-me");
+    expect(payload.organization.login).toBe("cf-gitea-stub");
+    expect(payload.sender.login).toBe("cf-gitea-stub");
+  });
+
+  it("a case-only rename (no-op) and a failed rename emit nothing", async () => {
+    await seedHook();
+    expect((await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ name: "Edit-Me" }) })).status).toBe(200);
+    expect((await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ name: "bad name!" }) })).status).toBe(422);
+    expect(await deliveries()).toEqual([]);
+  });
 });
 
 describe("DELETE /repos/{owner}/{repo} (repoDelete)", () => {
@@ -290,6 +337,58 @@ describe("DELETE /repos/{owner}/{repo} (repoDelete)", () => {
     expect((await makeApp()(repoPath, { method: "DELETE", headers: { Authorization: `token ${TOKEN_OTHER}` } })).status).toBe(403);
     expect((await makeApp()("/repos/cf-gitea-stub/ghost", { method: "DELETE", headers: jsonAuth })).status).toBe(404);
   });
+
+  it("emits repository action=deleted — owner/system watchers only (the repo's own hooks are cascaded)", async () => {
+    // The §2.5.5 cascade deletes the repo-scoped hook rows BEFORE the
+    // post-pipeline fan-out resolves hooks (the deviation documented at the
+    // handler — upstream triggers first because its queued tasks outlive the
+    // hook rows): the deleted repo's own hook never hears the event.
+    await seedHook();
+    expect((await makeApp()(repoPath, { method: "DELETE", headers: { Authorization: `token ${TOKEN}` } })).status).toBe(204);
+    expect(await deliveries()).toEqual([]);
+
+    // Owner-level hooks survive the cascade and take the event, over the
+    // pre-delete repository render.
+    const ownerHook = await drizzle(env.DB)
+      .insert(webhooks)
+      .values({
+        repoId: null,
+        ownerId: 1,
+        url: "https://hooks.example.com/owner",
+        events: JSON.stringify({ send_everything: true }),
+        isActive: true,
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    await drizzle(env.DB).insert(repositories).values({
+      id: "7402",
+      storageKey: "r_7402",
+      ownerNamespace: "cf-gitea-stub",
+      ownerId: 1,
+      slug: "delete-event",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date(),
+    });
+    expect((await makeApp()("/repos/cf-gitea-stub/delete-event", { method: "DELETE", headers: jsonAuth })).status).toBe(204);
+    const rows = await deliveries();
+    expect(rows.map((r) => [r.hookId, r.eventType, r.eventGroup, r.state])).toEqual([
+      [ownerHook[0]!.id, "repository", "repository", "pending"],
+    ]);
+    const payload = JSON.parse(rows[0]!.payloadContent) as {
+      action: string;
+      repository: { full_name: string };
+      organization: { login: string };
+      sender: { login: string };
+      changes?: unknown;
+    };
+    expect(payload.action).toBe("deleted");
+    expect(payload.repository.full_name).toBe("cf-gitea-stub/delete-event");
+    expect(payload.organization.login).toBe("cf-gitea-stub");
+    expect(payload.sender.login).toBe("cf-gitea-stub");
+    expect(payload.changes).toBeUndefined(); // renamed-only field (omitempty)
+  });
 });
 
 describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
@@ -305,6 +404,14 @@ describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
     const pending = await drizzle(env.DB).select().from(repoTransfer).all();
     expect(pending).toHaveLength(1);
     expect(pending[0]?.newOwnerId).toBe(otherUserId);
+  });
+
+  it("emits no webhook (upstream-faithful: HookRepoAction has no transfer member)", async () => {
+    await seedHook();
+    expect(
+      (await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other" }) })).status,
+    ).toBe(202);
+    expect(await deliveries()).toEqual([]);
   });
 
   it("re-files (upsert) a repeat request", async () => {

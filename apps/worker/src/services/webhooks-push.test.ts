@@ -19,7 +19,10 @@
  *
  * Covered: the per-created-ref zero-commit push + create pair, the updated-ref
  * capped push payload (newest-first commit list, added/removed/modified
- * enrichment, head_commit, compare_url), the delete event, the refs/pull/*
+ * enrichment, head_commit, compare_url), the delete event, the
+ * pull_request_sync family (an updated PR head branch syncs every open
+ * github-flow PR on it with the delta; created refs, non-PR branches and
+ * closed PRs stay silent; the subscription gates), the refs/pull/*
  * exclusion on a mixed receive, the subscription gates (push_only,
  * branch_filter, inactive, no hooks), owner-level hook resolution, the
  * never-fail-the-push guarantees (the engine's hook catch + the fan-out's
@@ -43,6 +46,7 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { findRepositoryById } from "../api/services/repository";
 import { users, webhookDeliveries, webhooks } from "../db/schema";
+import { IssuesService } from "../issues/service";
 import { authorize } from "../git-http/authorize";
 import { gitHttpGate } from "../git-http/gate";
 import { RepoService, type RepoRow } from "../repos/service";
@@ -160,6 +164,8 @@ beforeEach(async () => {
     "repo_transfer",
     "repo_redirects",
     "repo_counters",
+    "pull_requests",
+    "issues",
     "repositories",
     "webhook_deliveries",
     "webhooks",
@@ -200,6 +206,29 @@ async function seedHook(hook: {
     .returning({ id: webhooks.id })
     .all();
   return inserted[0]!.id;
+}
+
+/** An open github-flow PR through the landed service (the pulls.test.ts
+ *  seedPull shape) — head in the SAME repo unless told otherwise. */
+async function seedPull(
+  repoId: string,
+  title: string,
+  options: { headBranch?: string; baseBranch?: string; closed?: boolean; posterId?: number | null } = {},
+): Promise<{ issueId: number; index: number }> {
+  const service = new IssuesService(env.DB);
+  await service.ensureRepoCounters(repoId);
+  const { issue } = await service.createPullRequest({
+    repoId,
+    title,
+    posterId: options.posterId ?? null,
+    headRepoId: repoId,
+    baseBranch: options.baseBranch ?? "main",
+    headBranch: options.headBranch ?? "feature",
+  });
+  if (options.closed === true) {
+    await service.closeIssue(issue.id, { actorId: null });
+  }
+  return { issueId: issue.id, index: issue.index };
 }
 
 /** The delivery log, oldest first — the assertion surface (§3.6). */
@@ -764,6 +793,133 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
     expect(rows.map(refOf)).toEqual([
       ["push", "refs/heads/fresh"],
       ["create", "fresh"],
+    ]);
+  });
+});
+
+describe("pull_request_sync — PR-head branch updates ride the push (notifier.go:835-845)", () => {
+  /** The two-push shape: seed the PR, create its head branch (no sync —
+   *  created refs never sync, push.go:292), then UPDATE it and return the
+   *  delivery log. */
+  async function pushPrHead(slug: string, title: string): Promise<{ rows: Awaited<ReturnType<typeof deliveries>>; before: string; after: string; index: number }> {
+    const { row, token } = await seedRepoWithToken(slug);
+    await seedHook({ repoId: row.id });
+    const { index } = await seedPull(row.id, title, { headBranch: "feature", baseBranch: "main" });
+
+    const initial = await buildChainPack(null, [
+      { message: "seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000100 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/feature" }], initial.pack, token)).status,
+    ).toBe(200);
+    await clearDeliveries();
+
+    const append = await buildChainPack(initial.tips[0]!, [
+      { message: "pr work", files: [{ path: "README.md", content: "work\n" }], time: 1700000101 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: initial.tips[0]!, oid: append.tips[0]!, ref: "refs/heads/feature" }], append.pack, token)).status,
+    ).toBe(200);
+    return { rows: await deliveries(), before: initial.tips[0]!, after: append.tips[0]!, index };
+  }
+
+  it("an update to a PR head branch emits push, then pull_request_sync with the delta", async () => {
+    const { rows, before, after, index } = await pushPrHead("syncbasic", "sync me");
+    // Upstream's order: the push event, then the sync task's event.
+    expect(rows.map((r) => [r.eventType, r.eventGroup])).toEqual([
+      ["push", "push"],
+      ["pull_request_sync", "pull_request"],
+    ]);
+    const payload = JSON.parse(rows[1]!.payloadContent) as {
+      action: string;
+      before: string;
+      after: string;
+      number: number;
+      pull_request: { title: string };
+      repository: { full_name: string };
+      sender: { login: string };
+      commit_id: string;
+    };
+    expect(payload.action).toBe("synchronized");
+    expect(payload.before).toBe(before);
+    expect(payload.after).toBe(after);
+    expect(payload.number).toBe(index);
+    expect(payload.pull_request.title).toBe("sync me");
+    expect(payload.repository.full_name).toBe("alice/syncbasic");
+    // The push family's identity: sender = the owner until the engine plumbs
+    // the authenticated pusher.
+    expect(payload.sender.login).toBe("Alice");
+    expect(payload.commit_id).toBe("");
+  });
+
+  it("created refs, non-PR branches and closed PRs stay silent", async () => {
+    const { row, token } = await seedRepoWithToken("syncquiet");
+    await seedHook({ repoId: row.id });
+    const { index: openIndex } = await seedPull(row.id, "open pr", { headBranch: "feature" });
+    await seedPull(row.id, "closed pr", { headBranch: "feature", closed: true });
+
+    const initial = await buildChainPack(null, [
+      { message: "seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000110 },
+    ]);
+    // Creating a branch never syncs — even the PR's own head branch.
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/feature" }], initial.pack, token)).status,
+    ).toBe(200);
+    expect((await deliveries()).map((r) => r.eventType)).toEqual(["push", "create"]);
+    await clearDeliveries();
+
+    // Updating a branch with NO open PR head is just a push.
+    const other = await buildChainPack(null, [
+      { message: "other", files: [{ path: "docs.md", content: "other\n" }], time: 1700000111 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: other.tips[0]!, ref: "refs/heads/other" }], other.pack, token)).status,
+    ).toBe(200);
+    expect((await deliveries()).map((r) => r.eventType)).toEqual(["push", "create"]);
+    await clearDeliveries();
+
+    // Updating the PR head branch syncs the OPEN PR only (the closed one is
+    // unmerged-but-closed — GetUnmergedPullRequestsByHeadInfo filters it).
+    const append = await buildChainPack(initial.tips[0]!, [
+      { message: "work", files: [{ path: "README.md", content: "work\n" }], time: 1700000112 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: initial.tips[0]!, oid: append.tips[0]!, ref: "refs/heads/feature" }], append.pack, token)).status,
+    ).toBe(200);
+    const rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push", "pull_request_sync"]);
+    const payload = JSON.parse(rows[1]!.payloadContent) as { number: number };
+    expect(payload.number).toBe(openIndex);
+  });
+
+  it("a pull_request_sync subscription gates the event; a push_only hook never sees it", async () => {
+    const { row, token } = await seedRepoWithToken("syncsubs");
+    const syncOnly = await seedHook({ repoId: row.id, events: { choose_events: true, events: { pull_request_sync: true } } });
+    const pushOnly = await seedHook({ repoId: row.id, events: { push_only: true } });
+    await seedPull(row.id, "subscribed", { headBranch: "feature" });
+
+    const initial = await buildChainPack(null, [
+      { message: "seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000120 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/feature" }], initial.pack, token)).status,
+    ).toBe(200);
+    // The created-ref push notifies the push_only hook only (choose-events
+    // with just pull_request_sync has no push subscription).
+    expect((await deliveries()).map((r) => [r.hookId, r.eventType])).toEqual([[pushOnly, "push"]]);
+    await clearDeliveries();
+
+    const append = await buildChainPack(initial.tips[0]!, [
+      { message: "work", files: [{ path: "README.md", content: "work\n" }], time: 1700000121 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: initial.tips[0]!, oid: append.tips[0]!, ref: "refs/heads/feature" }], append.pack, token)).status,
+    ).toBe(200);
+    // The update notifies BOTH: the push_only hook takes the push event, the
+    // sync-subscribed hook takes the sync event (the group flag check).
+    expect((await deliveries()).map((r) => [r.hookId, r.eventType])).toEqual([
+      [pushOnly, "push"],
+      [syncOnly, "pull_request_sync"],
     ]);
   });
 });

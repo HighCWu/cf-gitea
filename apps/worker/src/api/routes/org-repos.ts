@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import { RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
 import { OrgService } from "../../services/orgs/orgs";
+import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { organizationListSchema } from "../models/organization";
@@ -19,7 +20,7 @@ import {
   toApiOrganization,
   toCreatedOrgRepository,
 } from "../services/org-repos";
-import { toApiRepository, viewerOf } from "../services/repository";
+import { findRepositoryById, toApiRepository, viewerOf } from "../services/repository";
 
 /**
  * Tier-1 `organization`-tagged routes (SPEC-0007 §2.2 rows 1–3):
@@ -214,6 +215,20 @@ export function registerOrgRoutes(
       throw error;
     }
     const viewer = viewerOf(c);
+    // Webhook: repository created (upstream CreateRepository,
+    // notifier.go:114-116 with u = the ORG owner — Organization renders the
+    // owner; Sender is the creating doer). A webhook failure is caught
+    // inside the fan-out and never fails the 201.
+    const created = await findRepositoryById(c.env.DB, repo.id);
+    if (created !== null) {
+      const identity = repositoryEventIdentity(viewer, created);
+      await emitRepoEvent(c, {
+        repoId: created.repo.id,
+        ownerId: created.repo.ownerId,
+        eventType: "repository",
+        payload: repositoryEventPayload("created", identity.repository, identity.organization, c.get("authUser")),
+      });
+    }
     return c.json(
       toCreatedOrgRepository(viewer, {
         repo,

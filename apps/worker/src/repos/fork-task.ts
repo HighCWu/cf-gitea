@@ -31,6 +31,12 @@
  * servable before finalize, so `empty:true` during the window is the honest
  * wire state (documented divergence from upstream, which copies IsEmpty from
  * the base before the clone).
+ *
+ * WEBHOOK (SPEC-0005 §3.5): the settle's winning invocation emits the `fork`
+ * event through services/repo-events.ts — upstream's ForkRepository
+ * (services/webhook/notifier.go:86-91), routed through the SOURCE repository
+ * and CAS-gated so a redelivery never duplicates it. The source-vanished
+ * degraded shell settles silently (nothing was replicated; no event).
  */
 
 import { and, eq } from "drizzle-orm";
@@ -42,7 +48,10 @@ import {
   type ReplicateForkResult,
 } from "@cf-gitea/git-engine";
 
+import { apiUserFromRow, findRepositoryById, toApiRepository, type Viewer } from "../api/services/repository";
 import { repositories } from "../db/schema";
+import { emitRepoEventInline, forkEventPayload } from "../services/repo-events";
+import { appOrigin } from "../services/webhooks-push";
 import type { RepoRow } from "./service";
 
 /** REPO_TASKS message of the fork family (the `{kind: "repo-fork", …}` shape
@@ -131,24 +140,55 @@ export async function handleForkMessage(env: Env, msg: RepoForkMessage): Promise
   }
   void result; // counts are observability-only today (no D1 columns for them)
 
-  await settleForkRow(db, fork, source.isEmpty);
+  const settled = await settleForkRow(db, fork, source.isEmpty);
+  if (settled) {
+    // `fork` event (upstream ForkRepository, notifier.go:86-91): emitted once
+    // the fork is servable, gated on the settle's CAS so an at-least-once
+    // redelivery never duplicates it. Upstream routes it through the SOURCE
+    // repository (`EventSource{Repository: oldRepo}`) — its hooks and the
+    // source owner's receive it — with `forkee` = the source and
+    // `repository` = the new fork (the struct field doc is stale upstream;
+    // the notifier is authoritative). Sender: the fork's owner IS the
+    // creating doer (the forks route mints owner = caller); a future
+    // org-target fork would render the org — none exist today.
+    const [sourcePair, forkPair] = [
+      await findRepositoryById(env.DB, source.id),
+      await findRepositoryById(env.DB, fork.id),
+    ];
+    if (sourcePair !== null && forkPair !== null) {
+      const viewer: Viewer = { origin: appOrigin(env), requester: null };
+      await emitRepoEventInline(env, {
+        repoId: sourcePair.repo.id,
+        ownerId: sourcePair.owner.id,
+        eventType: "fork",
+        payload: forkEventPayload(
+          toApiRepository(viewer, sourcePair),
+          toApiRepository(viewer, forkPair),
+          apiUserFromRow(forkPair.owner, viewer),
+        ),
+      });
+    }
+  }
 }
 
 /**
  * The import-settle pattern (imports/service.ts settleDone): one CAS UPDATE,
  * `status='creating' → 'ready'`, emptiness copied from the source. 0 rows
  * changed on a redelivery (or after a concurrent delete) — a no-op, never a
- * resurrection.
+ * resurrection. Returns whether THIS invocation flipped the row — the fork
+ * event's exactly-once gate.
  */
 async function settleForkRow(
   db: DrizzleD1Database,
   fork: RepoRow,
   sourceEmpty: boolean,
-): Promise<void> {
-  await db
+): Promise<boolean> {
+  const settled = await db
     .update(repositories)
     .set({ status: "ready", isEmpty: sourceEmpty, updatedAt: new Date() })
-    .where(and(eq(repositories.id, fork.id), eq(repositories.status, "creating")));
+    .where(and(eq(repositories.id, fork.id), eq(repositories.status, "creating")))
+    .run();
+  return (settled.meta.changes ?? 0) > 0;
 }
 
 /**

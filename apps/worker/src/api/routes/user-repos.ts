@@ -4,12 +4,14 @@ import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
 import { RepoNameCollisionError, RepoNameInvalidError } from "../../repos/service";
+import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { createRepoOptionSchema, repositoryListSchema, repositorySchema } from "../models/repository";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { toCreatedOrgRepository } from "../services/org-repos";
 import {
+  findRepositoryById,
   findUserByName,
   listOwnedRepositories,
   listUserRepositories,
@@ -197,6 +199,20 @@ export function registerUserReposRoutes(
       throw error;
     }
     const viewer = viewerOf(c);
+    // Webhook: repository created (upstream CreateRepository,
+    // notifier.go:114-116 — Sender is the creating doer, Organization the
+    // owner user). Emitted after the create committed; a webhook failure is
+    // caught inside the fan-out and never fails the 201.
+    const created = await findRepositoryById(c.env.DB, repo.id);
+    if (created !== null) {
+      const identity = repositoryEventIdentity(viewer, created);
+      await emitRepoEvent(c, {
+        repoId: created.repo.id,
+        ownerId: created.repo.ownerId,
+        eventType: "repository",
+        payload: repositoryEventPayload("created", identity.repository, identity.organization, doer),
+      });
+    }
     // The CreateUserRepo tail: `convert.ToRepo(ctx, repo, Permission{
     // AccessModeOwner})` — the creator's embedded permissions block is the
     // full owner triple (services/org-repos.ts toCreatedOrgRepository).

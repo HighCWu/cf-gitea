@@ -45,12 +45,12 @@
 import { SELF, env } from "cloudflare:test";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { settleCreatingRepo } from "./gate";
-import { repoCounters, repoRedirects, repositories } from "../db/schema";
+import { repoCounters, repoRedirects, repositories, webhookDeliveries, webhooks } from "../db/schema";
 import { purgeRepoMessage } from "../repos/purge";
 import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
@@ -67,6 +67,8 @@ beforeEach(async () => {
     "repo_transfer",
     "repo_redirects",
     "repo_counters",
+    "webhook_deliveries",
+    "webhooks",
     "repositories",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
@@ -497,5 +499,92 @@ describe("the LFS family stays on its own branch (SPEC-0006 §2.1, untouched by 
     expect(batch.status).toBe(401);
     expect(batch.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
     expect(JSON.parse(new TextDecoder().decode(await batch.arrayBuffer()))).toEqual({ message: "Unauthorized" });
+  });
+});
+
+describe("settleCreatingRepo emits repository action=created (the push-create arm)", () => {
+  /** An OWNER-level hook subscribed to ONLY the repository family, seeded
+   *  BEFORE the push: the gate's own waitUntil-scheduled settle (the
+   *  production path, live under SELF.fetch) can fire before any repo-scoped
+   *  hook could exist — the owner-level resolution covers both settle
+   *  orders, and the subscription keeps the onPush push/create events out of
+   *  the asserted log. */
+  async function seedRepositoryHook(ownerId: number): Promise<number> {
+    const inserted = await drizzle(env.DB)
+      .insert(webhooks)
+      .values({
+        repoId: null,
+        ownerId,
+        url: "https://hooks.example.com/settle",
+        events: JSON.stringify({ choose_events: true, events: { repository: true } }),
+        isActive: true,
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    return inserted[0]!.id;
+  }
+
+  const settleDeliveries = (hookId: number) =>
+    drizzle(env.DB).select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
+
+  it("the winning settle emits created; a re-settle never duplicates it", async () => {
+    const slug = "settlecreated";
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const hookId = await seedRepositoryHook(alice.id);
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const push = await SELF.fetch(`https://example.com/alice/${slug}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack),
+    });
+    expect(push.status).toBe(200);
+    const rows = await drizzle(env.DB).select().from(repositories).all();
+    expect(rows).toHaveLength(1);
+
+    // The create becomes real → one repository/created delivery. (The gate's
+    // own waitUntil-scheduled settle races the explicit call for the CAS —
+    // exactly one of them emits, but when the gate's settle wins, its
+    // emission lands on the waitUntil queue and may settle AFTER this
+    // statement — so the row is awaited, not assumed.) The two replay
+    // settles return first, so once one row is visible no other emitter
+    // remains: the count stays exactly one.
+    await settleCreatingRepo(env, rows[0]!.id, `alice/${slug}`);
+    await settleCreatingRepo(env, rows[0]!.id, `alice/${slug}`); // idempotent replay
+
+    await vi.waitFor(async () => {
+      expect(await settleDeliveries(hookId)).toHaveLength(1);
+    }, { timeout: 10_000 });
+    const deliveries = await settleDeliveries(hookId);
+    expect(deliveries.map((r) => [r.eventType, r.eventGroup])).toEqual([["repository", "repository"]]);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      action: string;
+      repository: { full_name: string; private: boolean };
+      organization: { login: string };
+      sender: { login: string };
+    };
+    expect(payload.action).toBe("created");
+    expect(payload.repository.full_name).toBe(`alice/${slug}`);
+    // The owner-fallback sender (the settle carries no pusher identity — the
+    // push family's documented deviation) and upstream's organization = owner.
+    expect(payload.organization.login).toBe("Alice");
+    expect(payload.sender.login).toBe("Alice");
+  });
+
+  it("the undo arm (no refs landed) stays silent", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const hookId = await seedRepositoryHook(alice.id);
+    // A 'creating' row whose DO was never warmed: listRefs fails → the settle
+    // deletes the row again (§2.5.2 undo) and notifies nobody — the repo was
+    // never servable.
+    const created = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "settledoomed",
+      isPrivate: true,
+      status: "creating",
+    });
+    await settleCreatingRepo(env, created.id, "alice/settledoomed");
+    expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
+    expect(await settleDeliveries(hookId)).toEqual([]);
   });
 });

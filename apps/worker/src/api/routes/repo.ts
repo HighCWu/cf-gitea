@@ -28,6 +28,7 @@ import { deleteRepoCollaborators } from "../services/repo-collaborators";
 import { deleteRepoSettings, loadRepoSettings, saveRepoSettings, type RepoSettings } from "../services/repo-settings";
 import { deleteRepoTopics } from "../services/repo-topics";
 import { deleteRepoWatchers } from "../services/repo-watchers";
+import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import {
   findRepositoryById,
   findRepositoryByPath,
@@ -428,6 +429,22 @@ export function registerRepoRoutes(
           }
           throw error;
         }
+        // Webhook: repository renamed (upstream RenameRepository,
+        // notifier.go:137-138 — changes.name.from carries the old name; the
+        // payload's repository object renders the NEW row, like upstream's
+        // convert.ToRepo(ctx, repo)).
+        const renamed = await findRepositoryById(c.env.DB, found.repo.id);
+        if (renamed !== null) {
+          const identity = repositoryEventIdentity(viewerOf(c), renamed);
+          await emitRepoEvent(c, {
+            repoId: renamed.repo.id,
+            ownerId: renamed.repo.ownerId,
+            eventType: "repository",
+            payload: repositoryEventPayload("renamed", identity.repository, identity.organization, c.get("authUser"), {
+              changes: { name: { from: found.repo.slug } },
+            }),
+          });
+        }
       }
 
       // Private flip (forks cannot exist yet — no base-repo sync needed).
@@ -505,6 +522,22 @@ export function registerRepoRoutes(
       queue: c.env.REPO_TASKS,
       tombstone: (engineName) => tombstoneRepoDO(c.env, engineName),
     }).deleteRepository(found.repo.id);
+    // Webhook: repository deleted (upstream DeleteRepository,
+    // notifier.go:126-127). DEVIATION (documented): upstream triggers BEFORE
+    // its cascade ("we need to trigger them before deleting it…",
+    // services/repository/repository.go:69-70) because its queued hook tasks
+    // outlive the hook rows; our delivery rows ARE the source of truth and
+    // the landed §2.5.5 cascade deletes webhook_deliveries with the repo —
+    // so this fan-out runs AFTER the pipeline and the deleted repo's OWN
+    // hooks (already cascaded) never hear the event, while owner-level and
+    // system hooks still do.
+    const identity = repositoryEventIdentity(viewerOf(c), found);
+    await emitRepoEvent(c, {
+      repoId: found.repo.id,
+      ownerId: found.repo.ownerId,
+      eventType: "repository",
+      payload: repositoryEventPayload("deleted", identity.repository, identity.organization, c.get("authUser")),
+    });
     return c.body(null, 204);
   });
 
@@ -544,6 +577,9 @@ export function registerRepoRoutes(
 
       // 202 + the CURRENT Repository — the transfer is pending, not applied
       // (SPEC-0004 §2.4; acceptance is the tier-2 transfer/accept surface).
+      // No webhook: upstream fires none for transfers — its webhookNotifier
+      // inherits NullNotifier's no-op TransferRepository, and HookRepoAction
+      // has no transfer member (modules/structs/hook.go:557-562).
       const viewer = viewerOf(c);
       const settings = await loadRepoSettings(c.env.DB, found.repo.id);
       return c.json(toApiRepository(viewer, found, settings), 202);

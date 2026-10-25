@@ -82,12 +82,15 @@ import {
   routeOp,
   scopeForbidden,
 } from "./respond";
+import { findRepositoryById } from "../api/services/repository";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
 import { handleLfsGateBranch, parseLfsRoute } from "../lfs/router";
 import { repoCounters, repoUnits, repositories } from "../db/schema";
 import { deleteRepositoryViaEngineShape } from "../repos/purge";
 import { RepoNameCollisionError, RepoService, lookupRedirect } from "../repos/service";
+import { emitRepoEventInline, repositoryEventIdentity, repositoryEventPayload } from "../services/repo-events";
+import { appOrigin } from "../services/webhooks-push";
 
 /**
  * Requests the gate has already authorized. The engine `authorize` hook
@@ -587,7 +590,7 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
     // push adopts the alphabetically first branch (upstream adopts the pushed
     // branch; indistinguishable here without an engine hook).
     const firstBranch = branches[0]?.slice("refs/heads/".length) ?? row.defaultBranch;
-    await db
+    const settled = await db
       .update(repositories)
       .set({ status: "ready", isEmpty: false, defaultBranch: firstBranch, updatedAt: new Date() })
       .where(
@@ -596,7 +599,33 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
           eq(repositories.status, "creating"),
           eq(repositories.isEmpty, true),
         ),
-      );
+      )
+      .run();
+
+    // `repository` action=created — the create is real the moment the CAS
+    // flip lands (upstream CreateRepository, notifier.go:114-116, fires at
+    // once because its push-create row is never 'creating'; our §2.5.2
+    // crash-window settle is the honest equivalent). Gated on rows-changed so
+    // a concurrent/duplicate settle emits exactly once; the undo arm above
+    // stays silent — the repo was never servable, so there is no deletion to
+    // notify. Runs inside the caller's waitUntil, hence the inline enqueue.
+    if ((settled.meta.changes ?? 0) > 0) {
+      const pair = await findRepositoryById(env.DB, repoId);
+      if (pair !== null) {
+        const identity = repositoryEventIdentity({ origin: appOrigin(env), requester: null }, pair);
+        // Sender: the owner-fallback pusher — the settle carries no pusher
+        // identity (the push family's documented deviation, webhooks-push.ts
+        // header), and upstream push-create only creates in the pusher's own
+        // namespace (site-admin overrides aside).
+        const sender = identity.organization;
+        await emitRepoEventInline(env, {
+          repoId: pair.repo.id,
+          ownerId: pair.owner.id,
+          eventType: "repository",
+          payload: repositoryEventPayload("created", identity.repository, identity.organization, sender),
+        });
+      }
+    }
 
     // §2.5.2 (ENGINE-WAVE): the DO's meta.head must agree with the adopted
     // branch. The engine's own first-push adoption prefers main/master over

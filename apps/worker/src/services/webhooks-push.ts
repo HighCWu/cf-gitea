@@ -26,11 +26,19 @@
  *   - created ref (old = zero oid): the zero-commit push event FIRST, then
  *     the create event (mirror_pull.go:347, 352 — upstream's order);
  *   - deleted ref (new = zero oid): the delete event (notifier.go:858-870);
- *   - updated ref: the push event with the capped old→new commit list —
+ *   - updated BRANCH ref: the push event with the capped old→new commit list —
  *     `listCommitsRange(old, new, FeedMaxCommitNum)` = the engine's
  *     `rev-list --max-count` equivalent, rendered newest-first, with the
  *     `added/removed/modified` file lists enriched per commit and
- *     `head_commit` naming the new tip regardless of the cap.
+ *     `head_commit` naming the new tip regardless of the cap — THEN the
+ *     `pull_request_sync` event for every open github-flow PR whose head
+ *     branch it is (notifier.go:835-845, fired upstream from exactly this
+ *     path: pushUpdateBranch → AddTestPullRequestTask, push.go:292 —
+ *     "only update branch can trigger pull request task because the pull
+ *     request hasn't been created yet when creating a branch", so created and
+ *     deleted refs never sync). Each event routes through the PR's BASE
+ *     repository (`EventSource{Repository: pr.Issue.Repo}`) — for fork-head
+ *     PRs that is a different repo than the one pushed to.
  *
  * The builder lives HERE rather than in src/issues/webhooks.ts because it
  * composes api/services converters (`compareUrl`, `toPayloadCommit`,
@@ -61,7 +69,10 @@
  */
 
 import type { CommitJson, DiffResult, PushEvent } from "@cf-gitea/git-engine";
+import { and, eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 
+import { toApiPullRequest } from "../api/services/pulls";
 import { toPayloadCommit, usernamesByEmail } from "../api/services/git-models";
 import { compareUrl } from "../api/services/hooks";
 import {
@@ -73,6 +84,7 @@ import {
   type UserRow,
   type Viewer,
 } from "../api/services/repository";
+import { issues, PRFlow, pullRequests } from "../db/schema";
 import {
   enrichCommitsWithFileLists,
   emitWebhookDeliveries,
@@ -107,8 +119,10 @@ const DEFAULT_APP_URL = "http://localhost:3000";
 
 /** `setting.AppURL` equivalent for the onPush seam (no request to take an
  *  origin from): the optional APP_URL var, trailing slashes trimmed like
- *  upstream's AppURL normalization (server.go:127-137). */
-function appOrigin(env: WebhookPushEnv): string {
+ *  upstream's AppURL normalization (server.go:127-137). Exported for the
+ *  other off-response emitters (the push-create settle) that build §2.7
+ *  payload URLs without a request origin. */
+export function appOrigin(env: WebhookPushEnv): string {
   return (env.APP_URL ?? DEFAULT_APP_URL).replace(/\/+$/, "");
 }
 
@@ -375,6 +389,12 @@ export async function emitPushFamilyUpdates(
           sender: identity.sender,
         };
         await emit("push", push, update.ref);
+        // Branch updates pull the sync event along (push.go:292 — created
+        // refs never sync, "the pull request hasn't been created yet when
+        // creating a branch"; deletes close, they don't sync).
+        if (update.ref.startsWith("refs/heads/")) {
+          await emitPullRequestSyncs(env, pair, identity, origin, emit, log, update);
+        }
       } catch (error) {
         // Per-ref resilience — upstream logs and continues (:343-345,
         // :364-367); one ref's failure never silences the others.
@@ -391,6 +411,91 @@ export async function emitPushFamilyUpdates(
       `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: webhook fan-out failed (the applied push stands): ` +
         `${error instanceof Error ? error.message : String(error)}`,
     );
+  }
+}
+
+/**
+ * The `pull_request_sync` arm of an updated branch ref (upstream
+ * PullRequestSynchronized, notifier.go:835-845): for every OPEN github-flow
+ * PR whose head is the pushed branch of THIS repository (`GetUnmergedPullRequestsByHeadInfo`
+ * semantics — head_repo_id = the pushed repo, head_branch = the pushed
+ * branch, unmerged; agit-flow PRs are skipped upstream, pull.go:407-410), one
+ * event with action="synchronized" and the push's before/after oids. Each
+ * event routes through the PR's BASE repository (`EventSource{Repository:
+ * pr.Issue.Repo}`, notifier.go:843) — fork-head PRs notify the base repo's
+ * hooks, and the payload's `repository`/`pull_request` render against that
+ * base — with the same per-PR resilience the ref loop has (one PR's failure
+ * is logged, never silencing the others).
+ */
+async function emitPullRequestSyncs(
+  env: WebhookPushEnv,
+  pushedPair: RepositoryWithOwner,
+  identity: WebhookPushIdentity,
+  origin: string,
+  emit: (eventType: HookEventType, payload: unknown, refName: string) => Promise<unknown>,
+  log: (message: string) => void,
+  update: PushRefUpdate,
+): Promise<void> {
+  const branch = update.ref.slice("refs/heads/".length);
+  let heads: Array<{ issue: typeof issues.$inferSelect; pullRequest: typeof pullRequests.$inferSelect }>;
+  try {
+    heads = await drizzle(env.DB)
+      .select({ issue: issues, pullRequest: pullRequests })
+      .from(pullRequests)
+      .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+      .where(
+        and(
+          eq(pullRequests.headRepoId, pushedPair.repo.id),
+          eq(pullRequests.headBranch, branch),
+          eq(pullRequests.hasMerged, false),
+          eq(pullRequests.flow, PRFlow.Github),
+          eq(issues.isClosed, false),
+        ),
+      )
+      .all();
+  } catch (error) {
+    log(
+      `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR head lookup failed for ${update.ref}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return;
+  }
+  if (heads.length === 0) return;
+  const viewer: Viewer = { origin, requester: null };
+  for (const head of heads) {
+    try {
+      // Same-repo heads reuse the pair in hand; fork heads resolve their base.
+      const basePair =
+        head.pullRequest.baseRepoId === pushedPair.repo.id
+          ? pushedPair
+          : await findRepositoryById(env.DB, head.pullRequest.baseRepoId);
+      if (basePair === null) {
+        log(
+          `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR #${head.issue.index} base repo ` +
+            `${head.pullRequest.baseRepoId} missing — sync event skipped`,
+        );
+        continue;
+      }
+      await emit(
+        "pull_request_sync",
+        {
+          action: "synchronized",
+          before: update.old,
+          after: update.next,
+          number: head.issue.index,
+          pull_request: await toApiPullRequest(env.DB, viewer, basePair, head.issue, head.pullRequest, "single"),
+          repository: toApiRepository(viewer, basePair),
+          sender: identity.sender,
+          commit_id: "",
+        },
+        update.ref,
+      );
+    } catch (error) {
+      log(
+        `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: sync event failed for PR #${head.issue.index}: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 }
 
