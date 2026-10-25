@@ -2,7 +2,7 @@ import { concat, te, sha1hex } from "./util";
 import { deflate, inflate } from "./zlib";
 import { ObjType, parseTag } from "./objects";
 import { OidSet } from "./oidset";
-import { PackStore, LOOSE_LOOKUP_CAP } from "./packstore";
+import { PackStore, LOOSE_LOOKUP_CAP, type ReadGate } from "./packstore";
 import { ObjCache, ObjRec } from "../receive/objcache";
 import type { LookupObjectHit, LookupObjectResult } from "../control-plane";
 import {
@@ -197,9 +197,14 @@ export class GitStore {
     return { type: rows[0].type, data: inflate(packed) };
   }
 
-  async get(oid: string): Promise<{ type: ObjType; data: Uint8Array } | null> {
+  /**
+   * Resolve an object: loose storage first, then packs. `gate` (the serve
+   * paths' per-segment read authorization, SPEC-0011 §4.1) reaches pack reads
+   * only — loose objects live in SQLite, where there is no R2 GET to gate.
+   */
+  async get(oid: string, gate?: ReadGate): Promise<{ type: ObjType; data: Uint8Array } | null> {
     this.assertOpen();
-    return this.getLoose(oid) ?? (await this.packs.getObject(oid, this.cache));
+    return this.getLoose(oid) ?? (await this.packs.getObject(oid, this.cache, gate));
   }
 
   /**

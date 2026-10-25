@@ -8,6 +8,31 @@ import { ObjCache, ObjRec } from "../receive/objcache";
 import { REPO_PACK_BASELINE_SQL, replayRepoSchema, schemaSealedError } from "./migrations";
 
 export const PACK_CHUNK = 1024 * 1024;
+/**
+ * The segmented serve path's R2 Range-GET segment bound (SPEC-0011 §4.1, M3.2).
+ * Chosen as one PACK_CHUNK (1 MiB): readRaw already fetches pack regions as
+ * sequences of aligned 1 MiB chunk GETs, so this is the largest single R2 read
+ * the serve path can issue — four orders of magnitude under the 128 MiB
+ * isolate bound the spec names, small enough that a segment's transfer time is
+ * negligible next to READ_RENEW_MARGIN_MS (every segment starts with >= 30 s of
+ * Worker-confirmed lease coverage), and large enough that per-segment renewal
+ * costs one in-DO SQLite transaction per MiB, not per object (Q2's RPC-cost
+ * vs GC-latency balance). Exported so the serve-path gate and its checks pin
+ * the same constant.
+ */
+export const SERVE_SEGMENT_BYTES = PACK_CHUNK;
+
+/**
+ * The per-segment authorization gate the serve paths install (SPEC-0011
+ * §3.3/§4.1, M3.2): invoked SYNCHRONOUSLY by PackStore immediately before an
+ * R2 Range GET segment starts (chunk cache miss — an LRU/SQLite hit issues no
+ * R2 GET and needs no authorization). `offset`/`length` name the segment's
+ * byte range (context for diagnostics; mid-pack resume stays out of scope for
+ * v1 — §3.5). A gate that returns granted the segment; a gate that THROWS
+ * aborts the read mid-emission — the fail-stop terminate-and-retry posture
+ * (the serving stream errors before its flush tail, never a false success).
+ */
+export type ReadGate = (packKey: string, offset: number, length: number) => void;
 /** Size threshold from SPEC-0001 §3/§8: packs at least this large exist only in
  * R2; smaller packs MAY live in DO SQLite (pack_data) for latency — the
  * pack_catalog `location` column carries that decision. Since Step 1 every
@@ -321,14 +346,19 @@ export class PackStore {
    * Raw stored (still-compressed) bytes of a pack region. Chunk rows are
    * fetched one at a time: a wide range in a single SELECT can exceed the
    * runtime's result-set size cap (celld materializes blob rows as JSON).
+   *
+   * `gate` (SPEC-0011 §4.1, M3.2) rides down to every R2-backed chunk miss:
+   * each underlying Range GET — the serve path's "segment" — is authorized
+   * inline immediately before it starts. SQLite-backed chunks never consult
+   * the gate (no R2 GET, nothing to authorize).
    */
-  async readRaw(packKey: string, off: number, len: number): Promise<Uint8Array> {
+  async readRaw(packKey: string, off: number, len: number, gate?: ReadGate): Promise<Uint8Array> {
     this.assertOpen();
     const first = Math.floor(off / PACK_CHUNK);
     const last = Math.floor((off + len - 1) / PACK_CHUNK);
     const out = new Uint8Array(len);
     for (let seq = first; seq <= last; seq++) {
-      const chunk = await this.chunk(packKey, seq);
+      const chunk = await this.chunk(packKey, seq, gate);
       const chunkStart = seq * PACK_CHUNK;
       const from = Math.max(off, chunkStart);
       const to = Math.min(off + len, chunkStart + chunk.length);
@@ -345,8 +375,13 @@ export class PackStore {
    * written — a pack is inserted once and only ever removed wholesale (wipe/
    * reset, or the sweep paths, both of which clear the cache), so a hit can
    * never be stale.
+   *
+   * The R2 GET is the segmented serve path's "segment" (SPEC-0011 §4.1): on a
+   * miss, `gate` fires INLINE and SYNCHRONOUSLY before `bucket.get` — no R2
+   * GET segment may start without the lease authorization it performs (§3.3).
+   * A throwing gate aborts the read before any R2 bytes move (fail-stop).
    */
-  private async chunk(packKey: string, seq: number): Promise<Uint8Array> {
+  private async chunk(packKey: string, seq: number, gate?: ReadGate): Promise<Uint8Array> {
     const key = `${packKey}:${seq}`;
     const hit = this.chunks.get(key);
     if (hit) {
@@ -357,6 +392,7 @@ export class PackStore {
     let chunk: Uint8Array;
     if (this.backendOf(packKey) === "r2") {
       if (!this.r2) throw new Error(`pack ${packKey}: R2 backend not bound`);
+      gate?.(packKey, seq * PACK_CHUNK, PACK_CHUNK);
       const key = this.r2KeyOf(packKey);
       const obj = await this.r2.bucket.get(key, {
         range: { offset: seq * PACK_CHUNK, length: PACK_CHUNK },
@@ -388,8 +424,11 @@ export class PackStore {
    * the chain length and detecting cycles before a single delta is inflated —
    * then applied from the base upward, holding at most two inflated buffers at
    * a time. This caps both stack depth and peak memory regardless of input.
+   *
+   * `gate` rides every raw read (base entries and delta entries alike — a
+   * cross-pack delta base is exactly the multi-pack union §4.1 gates).
    */
-  async getObject(oid: string, cache: ObjCache): Promise<ObjRec | null> {
+  async getObject(oid: string, cache: ObjCache, gate?: ReadGate): Promise<ObjRec | null> {
     const cached = cache.get(oid);
     if (cached) return cached;
     const first = this.lookup(oid);
@@ -406,7 +445,7 @@ export class PackStore {
       if (seen.has(cur.oid)) throw new Error(`cyclic delta chain at ${cur.oid}`);
       seen.add(cur.oid);
       if (!cur.baseOid) {
-        base = { type: cur.type, data: inflateAll(await this.readRaw(cur.packKey, cur.dataOff, cur.dataLen)) };
+        base = { type: cur.type, data: inflateAll(await this.readRaw(cur.packKey, cur.dataOff, cur.dataLen, gate)) };
         break;
       }
       if (chain.length >= MAX_DELTA_DEPTH) throw new Error(`delta chain exceeds depth ${MAX_DELTA_DEPTH} at ${oid}`);
@@ -427,7 +466,7 @@ export class PackStore {
     let obj = base;
     for (let i = chain.length - 1; i >= 0; i--) {
       const d = chain[i];
-      const delta = inflateAll(await this.readRaw(d.packKey, d.dataOff, d.dataLen));
+      const delta = inflateAll(await this.readRaw(d.packKey, d.dataOff, d.dataLen, gate));
       obj = { type: base.type, data: applyDelta(obj.data, delta) };
       cache.put(d.oid, obj);
     }

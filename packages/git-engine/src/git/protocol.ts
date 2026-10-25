@@ -6,6 +6,7 @@ import { OidSet } from "./oidset";
 import { MultipartCapture, MultipartPackUpload } from "./multipart";
 import { parseCommit, parseTag, parseTree, isGitlinkMode, isTreeMode, TYPE_NUM, NUM_TYPE, ObjType } from "./objects";
 import { cloneCacheKey } from "./r2keys";
+import type { ReadGate } from "./packstore";
 import {
   planFetch,
   renewAndAuthorizeRead,
@@ -681,12 +682,12 @@ async function collectPackOids(
 }
 
 /** The DO arm's in-process read-lease state (SPEC-0011 §3): planFetch's row
- * guards emission; renewal is plan-level (packKey null: EVERY dependency must
- * still be readable — one reclaim kills the whole plan) at pull-batch
- * boundaries past the margin; release fires on finish, error and cancel —
- * never on the HTTP response lifetime. Everything is synchronous here: the DO
- * reads its own SQLite in its own serialized control domain. */
-interface PlanLeaseState {
+ * guards emission; the plan id plus the Worker-confirmed expiry ride to every
+ * R2 read through serveReadGate's per-segment gate; release fires on finish,
+ * error and cancel — never on the HTTP response lifetime. Everything is
+ * synchronous here: the DO reads its own SQLite in its own serialized control
+ * domain. Exported alongside serveReadGate for the serve-path checks. */
+export interface PlanLeaseState {
   planId: string;
   expiresAt: number;
 }
@@ -696,13 +697,40 @@ function openPlanLease(store: GitStore, plan: PlanFetchResult): PlanLeaseState |
   return plan.planId ? { planId: plan.planId, expiresAt: plan.expiresAt } : null;
 }
 
-function renewPlanLease(store: GitStore, lease: PlanLeaseState | null): void {
-  if (!lease || Date.now() < lease.expiresAt - READ_RENEW_MARGIN_MS) return;
-  const r = renewAndAuthorizeRead(store, lease.planId, null);
-  if (r.tag !== "authorized") {
-    throw new Error(`read lease rejected (${r.reason}); terminating — re-fetch`);
-  }
-  lease.expiresAt = r.expiresAt;
+/**
+ * The segmented serve path's per-segment read gate (SPEC-0011 §3.3 + §4.1,
+ * M3.2): PackStore invokes this before EVERY R2 Range GET segment (per
+ * catalog entry, bounded to SERVE_SEGMENT_BYTES) — read segments are explicit
+ * bounded Range GETs, never stream-chunk pauses (round 5: pausing
+ * reader.read() does not provably stop underlying R2 I/O).
+ *
+ * Confirmed-coverage discipline: the plan registration or the last renewal
+ * established an expiry the Worker has CONFIRMED; while coverage stays outside
+ * the margin the segment starts covered and no renewal work is spent (Q2: the
+ * cadence is bounded by RPC cost — 1 MiB segments mean at most one in-DO
+ * renewal transaction per MiB). Past the margin the renewal is per PACK (the
+ * specific catalog entry being read): one transaction re-checks that this pack
+ * is still in the protected set and still READABLE (active or retired —
+ * RECLAIMABLE is irreversible, §2), then extends the confirmed expiry that
+ * covers the following segments. The byteRange names the segment for
+ * diagnostics; mid-pack resume stays out of scope (§3.5).
+ *
+ * Rejection (expired lease, pack reclaimed, plan lost) THROWS: the emission
+ * loop dies mid-pack, the stream errors before its flush tail (terminate-and-
+ * retry; Property A — never a false success), and the error path releases the
+ * lease. A slow renewal back-pressures the client: the Worker paces the
+ * stream, so GC can never overtake a confirmed-covered segment.
+ */
+export function serveReadGate(store: GitStore, lease: PlanLeaseState | null): ReadGate | undefined {
+  if (!lease) return undefined;
+  return (packKey, offset, length) => {
+    if (Date.now() < lease.expiresAt - READ_RENEW_MARGIN_MS) return;
+    const r = renewAndAuthorizeRead(store, lease.planId, packKey, { offset, length });
+    if (r.tag !== "authorized") {
+      throw new Error(`read lease rejected (${r.reason}); terminating — re-fetch`);
+    }
+    lease.expiresAt = r.expiresAt;
+  };
 }
 
 function releasePlanLease(store: GitStore, lease: PlanLeaseState | null): void {
@@ -911,6 +939,10 @@ export async function uploadPack(
   // the set (never a new plan's dependency), one after it is blocked by the
   // lease. A lease-less plan (empty catalog, loose-only) guards nothing.
   const lease = openPlanLease(store, planFetch(store, { generation: store.refsVersion() }));
+  // §4.1 (M3.2): every emission R2 read below rides this gate — a confirmed
+  // per-pack renewal before each bounded Range GET segment; rejection is
+  // fail-stop (the pull's catch errors the stream before any flush).
+  const gate = serveReadGate(store, lease);
   // Emit objects in pack storage order — (packId, offset) — rather than the
   // DFS walk order they were collected in. Reused entries are copied straight
   // out of stored packs via readRaw, and the raw-chunk LRU only pays off when
@@ -1062,10 +1094,6 @@ export async function uploadPack(
     },
     pull: async (ctrl) => {
       try {
-        // §3.3: plan-level inline renewal at the batch boundary — the batch's
-        // chunk reads start only under confirmed coverage; rejection aborts
-        // the response (terminate-and-retry) before another segment is read.
-        renewPlanLease(store, lease);
         for (let n = 0; n < 64 && i < total; n++, i++) {
           const idx = order ? order[i] : i;
           if (!eCode) {
@@ -1074,11 +1102,11 @@ export async function uploadPack(
             const oid = send.markedAtHex(idx);
             const entry = store.packs.lookup(oid);
             if (entry && !entry.baseOid) {
-              writer.rawFull(entry.type, entry.entrySize, await store.packs.readRaw(entry.packKey, entry.dataOff, entry.dataLen));
+              writer.rawFull(entry.type, entry.entrySize, await store.packs.readRaw(entry.packKey, entry.dataOff, entry.dataLen, gate));
             } else if (entry && entry.baseOid && send.isMarkedHex(entry.baseOid)) {
-              writer.rawDelta(entry.entrySize, entry.baseOid, await store.packs.readRaw(entry.packKey, entry.dataOff, entry.dataLen));
+              writer.rawDelta(entry.entrySize, entry.baseOid, await store.packs.readRaw(entry.packKey, entry.dataOff, entry.dataLen, gate));
             } else {
-              const obj = await store.get(oid);
+              const obj = await store.get(oid, gate);
               if (!obj) throw new Error(`missing object ${oid}`);
               writer.object(obj.type, obj.data);
             }
@@ -1088,12 +1116,12 @@ export async function uploadPack(
           // the lean typed arrays, so no SQL lookup happens here.
           const code = eCode[idx];
           if (code <= -3) {
-            writer.rawFull(NUM_TYPE[-2 - code], eSize![idx], await store.packs.readRaw(ePackKeys![ePack![idx] - 1], eDataOff![idx], eDataLen![idx]));
+            writer.rawFull(NUM_TYPE[-2 - code], eSize![idx], await store.packs.readRaw(ePackKeys![ePack![idx] - 1], eDataOff![idx], eDataLen![idx], gate));
           } else if (code >= 0) {
-            writer.rawDelta(eSize![idx], send.atHex(code), await store.packs.readRaw(ePackKeys![ePack![idx] - 1], eDataOff![idx], eDataLen![idx]));
+            writer.rawDelta(eSize![idx], send.atHex(code), await store.packs.readRaw(ePackKeys![ePack![idx] - 1], eDataOff![idx], eDataLen![idx], gate));
           } else {
             const oid = send.markedAtHex(idx);
-            const obj = await store.get(oid);
+            const obj = await store.get(oid, gate);
             if (!obj) throw new Error(`missing object ${oid}`);
             writer.object(obj.type, obj.data);
           }
@@ -1174,8 +1202,11 @@ async function warmFullClone(
   const PAGE = 1000;
   // §3.1 plan+lease atomic: the warm path's dependency set is the readable
   // catalog (every pack holding a reachable object), registered with the
-  // catalog read in one transaction. §3.3/§3.4 wiring matches the cold path.
+  // catalog read in one transaction. §3.3/§4.1 wiring matches the cold path:
+  // every R2 read below is gated per segment (confirmed per-pack renewal
+  // before each bounded Range GET), release at finish/error/cancel.
   const lease = openPlanLease(store, planFetch(store, { generation: store.refsVersion() }));
+  const gate = serveReadGate(store, lease);
 
   // One emit-thunk per object, in storage order: every packed reachable object
   // (marching packs sequentially), then every loose reachable object by oid.
@@ -1190,17 +1221,17 @@ async function warmFullClone(
         if (e.baseOid !== null && store.reachableHas(e.baseOid)) {
           const base = e.baseOid;
           yield async (w) =>
-            w.rawDelta(e.entrySize, base, await store.packs.readRaw(e.packKey, e.dataOff, e.dataLen));
+            w.rawDelta(e.entrySize, base, await store.packs.readRaw(e.packKey, e.dataOff, e.dataLen, gate));
         } else if (e.baseOid !== null) {
           // base is not itself being sent: it cannot be a ref-delta, inflate it
           yield async (w) => {
-            const obj = await store.get(e.oid);
+            const obj = await store.get(e.oid, gate);
             if (!obj) throw new Error(`missing object ${e.oid}`);
             w.object(obj.type, obj.data);
           };
         } else {
           yield async (w) =>
-            w.rawFull(e.type, e.entrySize, await store.packs.readRaw(e.packKey, e.dataOff, e.dataLen));
+            w.rawFull(e.type, e.entrySize, await store.packs.readRaw(e.packKey, e.dataOff, e.dataLen, gate));
         }
       }
       if (rows.length < PAGE) break;
@@ -1211,7 +1242,7 @@ async function warmFullClone(
       for (const oid of loose) {
         afterOid = oid;
         yield async (w) => {
-          const obj = await store.get(oid);
+          const obj = await store.get(oid, gate);
           if (!obj) throw new Error(`missing object ${oid}`);
           w.object(obj.type, obj.data);
         };
@@ -1257,9 +1288,6 @@ async function warmFullClone(
     },
     pull: async (ctrl) => {
       try {
-        // §3.3 plan-level inline renewal at the page boundary (before this
-        // batch's chunk reads); rejection terminates the response.
-        renewPlanLease(store, lease);
         let drained = false;
         for (let n = 0; n < 64; n++) {
           const next = await it.next();
