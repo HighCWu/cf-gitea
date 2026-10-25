@@ -1,16 +1,19 @@
-import type { OpenAPIHono } from "@hono/zod-openapi";
+import { createRoute, type OpenAPIHono } from "@hono/zod-openapi";
 import type { Context, MiddlewareHandler } from "hono";
 import { z } from "zod";
 
-import { ApiError } from "../errors";
+import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import {
   canViewRepository,
   findRepositoryByPath,
+  findRepositoryById,
   repositoryPermissions,
   viewerOf,
   type RepositoryWithOwner,
 } from "../services/repository";
+import { toCreatedOrgRepository } from "../services/org-repos";
+import { findDoerRow } from "../services/user-repos";
 import {
   getMirrorStatus,
   registerMirror,
@@ -18,37 +21,50 @@ import {
   MirrorCredentialKeyError,
   MirrorValidationError,
 } from "../services/mirror";
+import { migrateRepository, resolveMigrateOwner } from "../../services/migrate";
+import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
+import { repositorySchema } from "../models/repository";
 
 /**
- * Mirror/migrate routes (SPEC-0009 §2.2/§2.3 — the repo-scoped HTTP surface
- * over the sync service) — NON-CONTRACT, plain Hono, exactly like the
- * imports family: these paths are OUTSIDE the frozen SPEC-0004 swagger
- * inventory (upstream's migrate lives at the global POST /repos/migrate,
- * which creates the target; the repo-scoped into-empty shape here has no
- * upstream path key), so they must NOT enter the generated OpenAPI document
- * and must stay engine-free in the route module graph
- * (scripts/check-openapi.mjs bundles src/api/openapi.ts — see
- * api/services/mirror.ts for the boundary note).
+ * Mirror/migrate routes (SPEC-0009 §2.2/§2.3 — the HTTP surface over the sync
+ * service). Two shapes share this module:
  *
- *   POST /repos/{owner}/{repo}/migrate       attach a pull mirror to an
- *                                            EXISTING EMPTY repo: validate
- *                                            per upstream MigrateRepoOption,
- *                                            register the repo_mirrors row
- *                                            (sanitized URL, §4.2-encrypted
- *                                            credentials), kick one
- *                                            mirror-sync message → 202
- *   GET  /repos/{owner}/{repo}/mirror        the sync_state row (status/
- *                                            schedule/last_error; never
- *                                            credentials) → 200
- *   POST /repos/{owner}/{repo}/mirror-sync   force a sync now: enqueue →
- *                                            200 empty (upstream
- *                                            AddPullMirrorToQueue shape,
- *                                            routers/api/v1/repo/mirror.go
- *                                            :29-77)
+ *  - THE CONTRACT PATH, POST /repos/migrate (upstream operationId
+ *    repoMigrate, frozen-contract responses {201,403,409,422}) — the
+ *    SERVER-DRIVEN arm: it CREATES the target repository (services/migrate.ts,
+ *    SPEC-0009 §2.2) and drives the right channel (mirror attach +
+ *    mirror-sync enqueue for mirror=true; the chunked-import bootstrap
+ *    otherwise), settling ready via each channel's own settle. DECLARED via
+ *    app.openapi (it has an upstream path key, so it enters the generated
+ *    OpenAPI document and scripts/check-openapi.mjs guards its response
+ *    subset — unlike the repo-scoped family below).
+ *
+ *  - THE REPO-SCOPED FAMILY — NON-CONTRACT, plain Hono, exactly like the
+ *    imports family: these paths are OUTSIDE the frozen SPEC-0004 swagger
+ *    inventory (the into-empty attach has no upstream path key), so they must
+ *    NOT enter the generated OpenAPI document and must stay engine-free in
+ *    the route module graph (scripts/check-openapi.mjs bundles
+ *    src/api/openapi.ts — see api/services/mirror.ts for the boundary note).
+ *
+ *    POST /repos/{owner}/{repo}/migrate       attach a pull mirror to an
+ *                                             EXISTING EMPTY repo: validate
+ *                                             per upstream MigrateRepoOption,
+ *                                             register the repo_mirrors row
+ *                                             (sanitized URL, §4.2-encrypted
+ *                                             credentials), kick one
+ *                                             mirror-sync message → 202
+ *    GET  /repos/{owner}/{repo}/mirror        the sync_state row (status/
+ *                                             schedule/last_error; never
+ *                                             credentials) → 200
+ *    POST /repos/{owner}/{repo}/mirror-sync   force a sync now: enqueue →
+ *                                             200 empty (upstream
+ *                                             AddPullMirrorToQueue shape,
+ *                                             routers/api/v1/repo/mirror.go
+ *                                             :29-77)
  *
  * The message is `{kind: "mirror-sync", repoId}` on MIRROR_SYNC_QUEUE — the
- * literal shape of sync.ts's MirrorSyncMessage (inlined here so the route
- * graph stays engine-free, the same discipline as imports.ts's
+ * literal shape of sync.ts's MirrorSyncMessage (inlined so the route graph
+ * stays engine-free, the same discipline as imports.ts's
  * `{kind: "import-abort"}`); the consumer CAS re-guards every state, so a
  * racing cron/duplicate message is a harmless `skipped: "busy"`.
  *
@@ -88,6 +104,17 @@ const migrateOptionsSchema = z.object({
   repo_name: z.string().optional(),
 });
 
+/**
+ * The CONTRACT path's body: upstream `MigrateRepoOptions` binds clone_addr
+ * and repo_name Required (modules/structs/repo.go:419-450 — Go Required is
+ * non-empty, so min(1), not merely present) — the same shape as the
+ * into-empty schema above, with those two tightened.
+ */
+const migrateRepoMigrateSchema = migrateOptionsSchema.extend({
+  clone_addr: z.string().min(1),
+  repo_name: z.string().min(1),
+});
+
 /** Owner-or-admin gate (the imports family's requireAdminRepo): managing a
  *  repo's source URL and credentials is an owner operation; invisible repos
  *  are the 404 anti-enumeration. */
@@ -112,6 +139,84 @@ function toApiError(error: unknown): never {
 }
 
 export function registerMirrorRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>): void {
+  // POST /repos/migrate — THE CONTRACT PATH (upstream repoMigrate, responses
+  // {201,403,409,422}): the SERVER-DRIVEN migrate (SPEC-0009 §2.2). The route
+  // creates the repository itself (services/migrate.ts) and drives the right
+  // channel — mirror attach + one mirror-sync enqueue for mirror=true (the
+  // initial population is that first sync), the chunked-import bootstrap
+  // otherwise (the body's `import` extension carries the one-time token the
+  // caller uploads chunks with; a documented divergence field, Gitea clients
+  // ignore unknown JSON members). 201 renders the born repo — upstream's API
+  // arm blocks and returns the completed repo; ours returns the migrating
+  // one (§2.2's documented async divergence), status='migrating' on the
+  // import arm, ready+empty on the mirror arm (the sync's population settle
+  // flips is_empty; mirrors never leave ready).
+  //
+  // THE SINGLE BIRTH EMISSION (the f5406c3 audit): the repositories INSERT
+  // inside migrateRepository is the birth, created silently (RepoService —
+  // not createUserRepository, so no create-route emission fires underneath);
+  // THIS handler's post-service emit is the arm's finalize step and owns the
+  // one `repository` action=created — in-request, exactly like upstream's
+  // synchronous API arm (migrate.go:188-214 fires the notifier in-request);
+  // no settle site emits a birth (imports.test.ts's silence guard, sync.ts's
+  // push-family-only fan-out), so the per-migration count is exactly one.
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/repos/migrate",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Migrate a remote git repository",
+      operationId: "repoMigrate",
+      request: {
+        body: { content: { "application/json": { schema: migrateRepoMigrateSchema } } },
+      },
+      responses: {
+        201: { description: "Repository", content: { "application/json": { schema: repositorySchema } } },
+        403: { description: "forbidden", content: { "application/json": { schema: apiErrorSchema } } },
+        409: { description: "The repository with the same name already exists." },
+        422: { description: "validationError", content: { "application/json": { schema: apiErrorSchema } } },
+      },
+    }),
+    async (c) => {
+      const options = c.req.valid("json");
+      const doer = c.get("authUser");
+      const doerRow = await findDoerRow(c.env.DB, doer);
+      if (doerRow === null) throw new ApiError(401, "token is required");
+      const owner = await resolveMigrateOwner(c.env.DB, { id: doerRow.id, isAdmin: doerRow.isAdmin }, options);
+      const outcome = await migrateRepository(c.env.DB, c.env, owner, options, new Date()).catch(toApiError);
+
+      const viewer = viewerOf(c);
+      const pair = await findRepositoryById(c.env.DB, outcome.repo.id);
+      if (pair !== null) {
+        // Webhook: repository created — the arm's ONE birth emission (see the
+        // block comment; upstream CreateRepository-notifier parity with the
+        // migration's created repo, Sender the migrating doer, Organization
+        // the owner row). Failures are caught inside the fan-out.
+        const identity = repositoryEventIdentity(viewer, pair);
+        await emitRepoEvent(c, {
+          repoId: pair.repo.id,
+          ownerId: pair.repo.ownerId,
+          eventType: "repository",
+          payload: repositoryEventPayload("created", identity.repository, identity.organization, doer),
+        });
+      }
+
+      const body = toCreatedOrgRepository(viewer, { repo: outcome.repo, owner });
+      // The import arm's bootstrap rides as the documented extension field —
+      // the declared schema stays the contract's Repository.
+      return c.json(
+        outcome.importBootstrap === null ? body : { ...body, import: outcome.importBootstrap },
+        201,
+      );
+    },
+    // upstream's Go bind answers malformed bodies with 422 (bodyBind422).
+    ({ success }: { success: boolean }): undefined => {
+      if (!success) throw new ApiError(422, "invalid migrate options: malformed body");
+      return undefined;
+    },
+  );
+
   // POST — migrate INTO an existing empty repo (§2.2's into-empty shape of
   // upstream POST /repos/migrate): mirror=true registers the pull mirror and
   // 202s with the mirror status; the initial population is the enqueued
