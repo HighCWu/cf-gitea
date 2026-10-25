@@ -202,7 +202,7 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerMiscT2Routes(app, requireAuth);
   // Tier-3 misc stragglers: signing-key 404 (no key configured — upstream
   // behavior) + the doer-scoped key/gpg list/get/delete honest stubs.
-  registerMiscT3Routes(app, requireAuth, optionalAuth);
+  registerMiscT3Routes(app, requireAuth);
   // Tier-2 user reads: heatmap + current-following check.
   registerUserReadT2Routes(app, requireAuth, optionalAuth);
   // Tier-2 notifications: derived threads over issue/comment activity; all
