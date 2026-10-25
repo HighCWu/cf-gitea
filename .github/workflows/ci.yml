@@ -46,9 +46,14 @@ jobs:
         run: pnpm check:contract
 
   # Real-git end-to-end suite (packages/git-engine/e2e/) against the dev
-  # Worker. Sections 8-11 (upstream dgit's web UI) and one headless-mode
-  # check in section 12 fail by design while the engine runs `ui: false` —
-  # they become Gitea-API-level checks in a later SPEC (see
+  # Worker. Sections 8-11 (upstream dgit's web UI) and the section-12
+  # "private UI needs auth" probe fail PERMANENTLY by design — not pending a
+  # later SPEC: the engine is created `ui: false` (SPEC-0008 gave the page
+  # families to the Tier-2 UI router), so the dgit pages these checks scrape
+  # 404 for good; and the probe's trailing-slash URL stays on the engine
+  # passthrough (SPEC-0008 §4 item 13 — the UI only claims canonical
+  # slash-less URLs), where headless pages 404 BEFORE the auth gate, so the
+  # dgit 401 is unreachable (full rationale:
   # packages/git-engine/e2e/README.md). CI asserts the failure set stays
   # EXACTLY that documented set: any new failing check fails the build.
   e2e:

@@ -67,31 +67,45 @@ The suite's protocol core carries over and passes:
 - 4: incremental fetch stays small (thin negotiation) — pass
 - 5: sideband progress (`remote:` lines) — pass
 - 6: force push + `/gc` reclaiming stranded objects — pass (the `/gc` admin
-  call is dgit-specific; our compaction design is alarm/queue-driven per
-  SPEC §5 and will get its own check)
+  call is dgit-specific; compaction/GC is alarm/queue-driven per SPEC-0011
+  and has its own tsx checks, `check-compaction.mjs` / `check-gc.mjs`)
 - 7: branch create/delete, non-fast-forward rejection — pass
 - 12: private repos, authed/anonymous clone semantics — pass, except one
   headless-mode check (below)
 - 13: repo deletion — pass
 - 14: auth hard checks (401/404 semantics) — pass
 
-Sections expected to be **replaced, not reused** (they exercise upstream
-dgit's cgit-style web UI and admin endpoints, which cf-gitea swaps for the
-official Gitea frontend + `/api/v1`, SPEC-0001 out-of-scope list) fail by
-design while the engine runs headless (`ui: false`):
+Sections that fail **permanently, by design** (re-verified 2026-10-25, after
+the Tier-2 UI (SPEC-0008) and sessions (SPEC-0010) landed: 34 passed /
+35 failed, and the failure set is exactly the CI allowlist —
+`.github/workflows/ci.yml`, job `e2e`). They exercise upstream dgit's
+cgit-style web UI, which cf-gitea replaced for good: the engine is created
+with `ui: false` (see "How it is wired" above), so the dgit pages these
+checks scrape do not exist and will never come back:
 
 - 8: snapshots (`/snapshot/*.tar.gz|zip`) — engine pages 404
-- 9: `/patch/` + `/rawdiff/` round-trips — same; becomes Gitea-API checks
+- 9: `/patch/` + `/rawdiff/` round-trips — same (the Gitea API/UI own this
+  surface now)
 - 10: UI pages, markdown/highlight/atom rendering — 404 by design
 - 11: `/config` PUT works (admin, engine-owned) but its assertions read the
   dgit index page — 404 by design
-- 12, one check: "private UI needs auth" expects the dgit UI's 401; headless
-  returns 404 for pages before the auth gate. The protocol semantics of the
-  same section (private clone 401/authed clone) pass.
+- 12, one check: "private UI needs auth" expects the dgit UI's 401. The 401
+  is unreachable for good, for two compounding reasons — WHERE the probe
+  lands and WHAT answers it. Its URL keeps dgit's trailing slash
+  (`GET /demo/private-repo/`), and the worker dispatcher pins every
+  trailing-slash repository URL to the engine passthrough (SPEC-0008 §4
+  item 13: the Tier-2 UI only claims canonical slash-less URLs), so neither
+  the uiRouter nor SPEC-0010 sessions can ever answer this request. The
+  headless engine then 404s page-shaped requests BEFORE its auth gate (the
+  leak-avoidance posture recorded in the gate: "nothing can leak there"),
+  so the observed code is 404, not 401. The protocol semantics of the same
+  section (private clone 401/authed clone) pass.
 
-Those become Gitea-API-level checks in a later SPEC, or are covered by the
-official Gitea UI itself. CI asserts the failure set stays exactly this
-documented set — any new failing check fails the build.
+The page-level coverage these sections used to provide lives in the Tier-2
+UI suite (`apps/worker/src/ui/*.test.ts`, SPEC-0008 §5) and the Gitea API
+contract (SPEC-0004, `pnpm check:api`) — not in this suite, which is
+deliberately pinned to the engine passthrough. CI asserts the failure set
+stays exactly this documented set — any new failing check fails the build.
 
 ## SPEC-0001b merge-primitive checks (tsx, no server needed)
 

@@ -4,8 +4,9 @@
 # against the local dev Worker ("pnpm dev", workerd, bindings from wrangler.jsonc).
 # Usage: packages/git-engine/e2e/e2e.sh [base-url] [token]
 # Defaults target the local dev server: http://127.0.0.1:8787 with dev token
-# "devtoken" (provide it via .dev.vars as GIT_TOKEN). NOT wired into CI yet —
-# see e2e/README.md for the planned wiring and known-not-applicable sections.
+# "devtoken" (provide it via .dev.vars as GIT_TOKEN). Wired into CI as the
+# `e2e` job (.github/workflows/ci.yml) — see e2e/README.md for the wiring and
+# the permanently-by-design failing sections (the documented allowlist).
 BASE=${1:-http://127.0.0.1:8787}
 TOKEN=${2:-devtoken}
 HOSTPORT=${BASE#http://}; HOSTPORT=${HOSTPORT#https://}
