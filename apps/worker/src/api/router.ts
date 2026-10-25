@@ -41,6 +41,7 @@ import { registerOrgTeamsRoutes } from "./routes/org-teams";
 import { registerOrgProfileRoutes } from "./routes/orgs";
 import { registerPullAutoMergeRoutes } from "./routes/pull-automerge";
 import { registerPullRoutes } from "./routes/pulls";
+import { registerPullReviewRoutes } from "./routes/pull-reviews";
 import { registerReleaseAssetRoutes } from "./routes/release-assets";
 import { registerReleaseRoutes } from "./routes/releases";
 import { registerRepoExtrasT2Routes } from "./routes/repo-extras-t2";
@@ -107,6 +108,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // and the static `/repos/issues/search` above still wins its precedence
   // battle before the `{owner}` params.
   registerPullRoutes(app, requireAuth, optionalAuth);
+  // Tier-2 PR reviews: the review family + reviewer requests (type=4 rows,
+  // upstream-shaped) + the four review events (migration 0018).
+  registerPullReviewRoutes(app, requireAuth, optionalAuth);
   registerRepoRoutes(app, requireAuth, optionalAuth);
   // Tier-2 repo extras: transfer accept/reject, topic search, repo
   // permissions, reviewers/issue-config, pull-review comment threads,

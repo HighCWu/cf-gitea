@@ -1483,9 +1483,13 @@ export function registerPullReviewRoutes(
       },
       responses: {
         ...(method === "post"
-          ? { 201: { description: "PullReviewList", content: { "application/json": { schema: z.array(pullReviewSchema) } } } }
-          : { 204: { description: "empty" } }),
-        403: forbiddenResponse,
+          ? {
+              201: { description: "PullReviewList", content: { "application/json": { schema: z.array(pullReviewSchema) } } },
+              // The contract's create arm has NO 403 (its runtime writer-gate
+              // 403 is the documented runtime-only class); only the DELETE
+              // arm declares 403 per the frozen swagger.
+            }
+          : { 204: { description: "empty" }, 403: forbiddenResponse }),
         404: notFoundResponse,
         422: validationErrorResponse,
       },
