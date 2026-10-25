@@ -40,6 +40,18 @@
  * deleteRepositoryViaEngineShape) and answers with the engine's wire
  * contract; the D1-missing transitional population keeps the verbatim
  * passthrough.
+ *
+ * The fourth wave under test (SPEC-0007 §3.5 team grants, the TEAMS-ACL
+ * tail): the matrix's grant lines now include the doer's org/team grant,
+ * resolved per request by `authorizeGitHttp` through the repository-service
+ * `doerRepoAccessMode` (acl.ts:194) — the SAME predicate the API visibility
+ * layer uses, so gate and API cannot drift. These are the direct git-HTTP
+ * happy paths (the service-level coverage lives in
+ * src/api/services/repository.test.ts): read-mode team ⇒ clone allowed /
+ * push 404-masked (row 8, acl.ts:322-323 — teamWrites is write|admin|owner
+ * only), write-mode team ⇒ both adverts, non-member ⇒ 404 on both, the
+ * includes-all union-on-read, and the Owners-team bridge (org owners can
+ * reach their own org's private repos without any team row).
  */
 
 import { SELF, env } from "cloudflare:test";
@@ -49,12 +61,15 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
+import { doerRepoAccessMode } from "../api/services/repository";
+import { TeamsService } from "../api/routes/org-teams";
+import { OrgService } from "../services/orgs/orgs";
 import { settleCreatingRepo } from "./gate";
 import { repoCounters, repoRedirects, repositories, webhookDeliveries, webhooks } from "../db/schema";
 import { purgeRepoMessage } from "../repos/purge";
 import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
-import { ZERO_OID, buildPack, buildReceivePackBody } from "../repos/testing/git-pack";
+import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "../repos/testing/git-pack";
 
 beforeAll(async () => {
   await applyAuthD1Migrations();
@@ -62,6 +77,12 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   for (const table of [
+    // Team tables first (the org-teams.test.ts sweep order); teams and
+    // team_members would cascade with the users delete below, but
+    // team_repo_access.repo_id declares no FK and is swept explicitly.
+    "team_repo_access",
+    "team_members",
+    "teams",
     "personal_access_tokens",
     "repo_units",
     "repo_transfer",
@@ -586,5 +607,202 @@ describe("settleCreatingRepo emits repository action=created (the push-create ar
     await settleCreatingRepo(env, created.id, "alice/settledoomed");
     expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
     expect(await settleDeliveries(hookId)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC-0007 §3.5 — team grants over the git-HTTP surface (TEAMS-ACL tail)
+// ---------------------------------------------------------------------------
+
+/** The team-grant fixture, seeded through the LANDED teams module's services
+ *  (OrgService/TeamsService) over real D1 — exactly the rows acl.ts's
+ *  `doerRepoAccessMode` consultation (acl.ts:194) reads. Org `acme` owns the
+ *  private repo `vault` carrying one real commit (pushed by the org owner,
+ *  which is itself the bridge's write arm). Teams: `readers` (read mode),
+ *  `writers` (write mode) — both repo-scoped via team_repo_access — and the
+ *  includes-all `all-hands`. The second repo `extra` is created AFTER the
+ *  team fan-out, so it is covered only by the includes-all union-on-read. */
+async function seedTeamGrantFixture(): Promise<{
+  reader: { id: number };
+  allhands: { id: number };
+  outsider: { id: number };
+  oid: string;
+  tokens: { ownerRead: string; readerRead: string; readerWrite: string; writerWrite: string; allhandsRead: string; outsiderWrite: string };
+}> {
+  const orgs = new OrgService(env.DB);
+  const teams = new TeamsService(env.DB);
+
+  const owner = await seedVerifiedUser({ username: "OrgOwner" });
+  const reader = await seedVerifiedUser({ username: "TeamReader" });
+  const writer = await seedVerifiedUser({ username: "TeamWriter" });
+  const allhands = await seedVerifiedUser({ username: "AllHands" });
+  const outsider = await seedVerifiedUser({ username: "Outsider" });
+
+  const org = await orgs.createOrg({ name: "acme", ownerId: owner.id });
+  const vault = await repoService().create({
+    owner: { id: org.id, usernameLower: org.usernameLower },
+    name: "vault",
+    isPrivate: true,
+  });
+
+  // One real commit so the clone assertions pin actual refs. Allowed through
+  // the bridge itself: `role='owner'` resolves mode 'owner' (teamWrites).
+  const { oid, pack } = await buildPack();
+  const push = await SELF.fetch("https://example.com/acme/vault.git/git-receive-pack", {
+    method: "POST",
+    headers: {
+      authorization: basicTokenHeader((await mintFor(owner.id, "w", "write:repository")).plaintext),
+      "content-type": RECEIVE_CT,
+    },
+    body: buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack),
+  });
+  expect(push.status).toBe(200);
+
+  const readers = await teams.createTeam(org, { name: "readers", permission: "read" });
+  await teams.addTeamRepo(readers, vault.id);
+  await teams.addTeamMember(readers, reader.id);
+  const writers = await teams.createTeam(org, { name: "writers", permission: "write" });
+  await teams.addTeamRepo(writers, vault.id);
+  await teams.addTeamMember(writers, writer.id);
+  // includes-all: deliberately NO addTeamRepo — coverage is the flag itself.
+  const allTeam = await teams.createTeam(org, {
+    name: "all-hands",
+    permission: "read",
+    includes_all_repositories: true,
+  });
+  await teams.addTeamMember(allTeam, allhands.id);
+
+  // Created after the fan-out: no team_repo_access row materialized for it.
+  await repoService().create({
+    owner: { id: org.id, usernameLower: org.usernameLower },
+    name: "extra",
+    isPrivate: true,
+  });
+
+  return {
+    reader,
+    allhands,
+    outsider,
+    oid,
+    tokens: {
+      ownerRead: (await mintFor(owner.id, "r", "read:repository")).plaintext,
+      readerRead: (await mintFor(reader.id, "r", "read:repository")).plaintext,
+      // The push-advert case needs a scope-adequate credential (row 7 runs
+      // first): with the read-only token the reader's push answers 403, not
+      // the row-8 mask.
+      readerWrite: (await mintFor(reader.id, "w", "write:repository")).plaintext,
+      writerWrite: (await mintFor(writer.id, "w", "write:repository")).plaintext,
+      allhandsRead: (await mintFor(allhands.id, "r", "read:repository")).plaintext,
+      outsiderWrite: (await mintFor(outsider.id, "w", "write:repository")).plaintext,
+    },
+  };
+}
+
+describe("team grants decide the git-HTTP matrix (SPEC-0007 §3.5 via authorizeGitHttp)", () => {
+  it("read-mode team member: clone advert + upload-pack RPC ok, push advert 404-masked (row 8)", async () => {
+    const fx = await seedTeamGrantFixture();
+
+    // The grant is load-bearing: without it the private org repo is
+    // anonymous-opaque (row 2 — 401 challenge, never a ref leak).
+    const anon = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-upload-pack");
+    expect(anon.status).toBe(401);
+    expect(anon.headers.get("www-authenticate")).toBe(CHALLENGE);
+
+    const auth = { authorization: basicTokenHeader(fx.tokens.readerRead) };
+
+    const advert = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-upload-pack", {
+      headers: auth,
+    });
+    expect(advert.status).toBe(200);
+    expect(advert.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+    expect(new TextDecoder().decode(await advert.arrayBuffer())).toContain(fx.oid);
+
+    // One cross-check against the service layer (the full predicate matrix
+    // lives in repository.test.ts): the gate consumed exactly the shared
+    // repository-service grant — one resolution, no drift (acl.ts:39-41).
+    const vault = (await repoService().getBySlug("acme", "vault"))!;
+    expect(await doerRepoAccessMode(env.DB, { id: vault.id, ownerId: vault.ownerId }, fx.reader.id)).toBe("read");
+
+    // The full fetch round-trip: want the pushed commit, get NAK + pack.
+    const rpc = await SELF.fetch("https://example.com/acme/vault.git/git-upload-pack", {
+      method: "POST",
+      headers: { ...auth, "content-type": UPLOAD_CT },
+      body: `${pktLine(`want ${fx.oid}\n`)}0000${pktLine("done\n")}`,
+    });
+    expect(rpc.status).toBe(200);
+    expect(rpc.headers.get("content-type")).toBe("application/x-git-upload-pack-result");
+    expect(new TextDecoder().decode(await rpc.arrayBuffer())).toContain("NAK");
+
+    // Row 8 (acl.ts:322-323): `teamWrites = write|admin|owner` — a read-mode
+    // team stays read-only, and the write capability is 404-masked (upstream's
+    // invisible-push shape), plain text, no challenge re-prompt. The token
+    // carries write scope on purpose: a read-scope token would stop at row 7's
+    // plain 403 before the mask (the scope check precedes the grant rows).
+    const pushAdvert = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-receive-pack", {
+      headers: { authorization: basicTokenHeader(fx.tokens.readerWrite) },
+    });
+    expect(pushAdvert.status).toBe(404);
+    expect(new TextDecoder().decode(await pushAdvert.arrayBuffer())).toBe("Repository not found");
+    expect(pushAdvert.headers.get("www-authenticate")).toBeNull();
+  });
+
+  it("write-mode team member: both the fetch and the push advert are allowed", async () => {
+    const fx = await seedTeamGrantFixture();
+    const auth = { authorization: basicTokenHeader(fx.tokens.writerWrite) };
+
+    const fetchAdvert = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-upload-pack", {
+      headers: auth,
+    });
+    expect(fetchAdvert.status).toBe(200);
+    expect(fetchAdvert.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+
+    const pushAdvert = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-receive-pack", {
+      headers: auth,
+    });
+    expect(pushAdvert.status).toBe(200);
+    expect(pushAdvert.headers.get("content-type")).toBe("application/x-git-receive-pack-advertisement");
+  });
+
+  it("non-member authenticated: 404 mask on both adverts (existence hidden, not a scope 403)", async () => {
+    const fx = await seedTeamGrantFixture();
+    // Write scope on purpose: the 404s below are row 9's existence mask, not
+    // row 7's missing-scope 403 — an org non-member learns nothing.
+    const auth = { authorization: basicTokenHeader(fx.tokens.outsiderWrite) };
+
+    const fetchAdvert = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-upload-pack", {
+      headers: auth,
+    });
+    expect(fetchAdvert.status).toBe(404);
+    expect(new TextDecoder().decode(await fetchAdvert.arrayBuffer())).toBe("Repository not found");
+    expect(fetchAdvert.headers.get("www-authenticate")).toBeNull();
+
+    const pushAdvert = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-receive-pack", {
+      headers: auth,
+    });
+    expect(pushAdvert.status).toBe(404);
+    expect(new TextDecoder().decode(await pushAdvert.arrayBuffer())).toBe("Repository not found");
+    expect(pushAdvert.headers.get("www-authenticate")).toBeNull();
+  });
+
+  it("includes-all covers a repo created after the fan-out; the org owner clones via the Owners-team bridge", async () => {
+    const fx = await seedTeamGrantFixture();
+
+    // Union-on-read (orgs.ts teamRepoAccessMode: covered = includesAll ?
+    // true : team_repo_access row): `extra` has no materialized grant row.
+    const extraAdvert = await SELF.fetch("https://example.com/acme/extra.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(fx.tokens.allhandsRead) },
+    });
+    expect(extraAdvert.status).toBe(200);
+    expect(extraAdvert.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+
+    // The §3.3 bridge: org_members.role='owner' resolves 'owner' through
+    // doerRepoAccessMode (repository.ts:141-143) with NO team rows at all —
+    // the org owner reads their own org's private repo over git-HTTP.
+    const ownerClone = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(fx.tokens.ownerRead) },
+    });
+    expect(ownerClone.status).toBe(200);
+    expect(ownerClone.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+    expect(new TextDecoder().decode(await ownerClone.arrayBuffer())).toContain(fx.oid);
   });
 });
