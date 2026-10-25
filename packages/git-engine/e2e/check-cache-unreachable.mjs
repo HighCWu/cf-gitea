@@ -280,6 +280,32 @@ check("M3.1 fault A/C: a rejected renewal errors the stream (terminate-and-retry
 check("M3.1 fault A/C: the renewal was attempted inline before the segment", logC.renew.length === 1);
 check("M3.1 fault A/C: the abandoned lease was released (no stranded row)", logC.release.length === 1);
 
+// ---- SPEC-0011 §7.3 clone-cache mismatch matrix, capability row (M3.5):
+// the fast path serves ONLY the standard side-band full clone — a request
+// whose capability set differs (no side-band-64k negotiated) never probes
+// the cache, so a nonstandard capability can never pull a cached pack.
+const noSidebandBody = Buffer.concat([
+  pkt(`want ${OID}`),
+  pkt("no-progress"),
+  FLUSH,
+  pkt("done"),
+]);
+const noSideband = parseUploadRequest(noSidebandBody);
+check(
+  "mismatch matrix (capabilities): the no-side-band full clone satisfies every OTHER cache predicate",
+  noSideband.badArgument === null && noSideband.haves.length === 0 && noSideband.done && noSideband.deepen.kind === "none"
+);
+const logD = newLog();
+logD.packKey = "repos/r0/clone-cache/k.pack";
+const resD = await handler.fetch(uploadPackRequest(noSidebandBody), makeEnv(logD, async () => null), CTX);
+check("mismatch matrix (capabilities): planCloneStream RPC called ZERO times for a non-side-band clone", logD.planCloneStream.length === 0);
+check("mismatch matrix (capabilities): zero R2 bucket interactions", logD.r2.length === 0 && logD.r2Keys.length === 0);
+const textD = await resD.text();
+check(
+  "mismatch matrix (capabilities): the request fell through to the DO (served there, no cache response)",
+  resD.headers.get("x-pack-cache") === null && textD === "DO-PATH" && logD.doFetch === 1
+);
+
 if (failures) {
   console.log(`\n${failures} check(s) FAILED`);
   process.exit(1);

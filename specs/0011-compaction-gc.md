@@ -361,9 +361,133 @@ forward-only migration path with an upgrade txn.
   Verified by `e2e/check-gc.mjs` (8 checks); all 12 engine check scripts
   green (223 checks total).
 
-**Implementation milestones M3.0–M3.4 COMPLETE (2026-10-25). M3.5 (the
-full fault-injection matrix of §7.2 rows 1-5 + capability-matrix generation
-+ differential wiring) remains as the acceptance-hardening tail.**
+**Implementation milestones M3.0–M3.5 COMPLETE (2026-10-25).**
+
+- **M3.5 (2026-10-25)**: the acceptance-hardening tail — §7.2 rows 1-5
+  completed, §7.3's correctness-tier additions landed as engine checks, and
+  the capability matrix made TEST-GENERATED (round 8's consistency gate).
+  All 15 engine check scripts green, **260 checks total** (was 12 scripts /
+  223 checks at M3.4; +3 scripts, +37 checks).
+
+  **§7.2 rows 1-5 — per-row audit and completion.**
+  - Row 1 (fetch × compaction concurrency): WAS covered for
+    compaction-then-fetch (check-compaction §2/§5.4: a pre-compaction plan
+    keeps reading; both succeed). ADDED (`check-fault-matrix.mjs`): a REAL
+    `runCompaction` publish interleaved INTO an in-flight segmented fetch at
+    the segment-GET seam — both succeed, the per-segment seam guard stays
+    armed across the publish (every post-publish GET lease-protected), the
+    flush tail stands, the closure is byte-identical, retired inputs keep
+    serving mid-stream. The abort-cleanly leg is row 3/C's landed posture.
+  - Row 2 (slow-client throttled fetch during GC): WAS covered half-landed —
+    check-read-leases §4.2/§3.4 pins release-exactly-at-last-R2-read for a
+    slow client (no GC running); check-gc §7.1 runs GC mid-stream with a
+    fast drain. ADDED: a GC pass MID-TRANSFER of a paced fetch — every flip
+    blocked (`blockedByLeases`), bytes untouched, transfer completes — plus
+    row 12's early-release overlap on the same timeline: GC flips and
+    reclaims WHILE the response is still draining and the drain still
+    delivers its flush tail.
+  - Row 3 (lease expiry mid-stream): WAS covered as units (check-read-leases
+    §3.3 fault A + the fast-path rejected-renewal termination;
+    check-segmented-serve §3.3 unit + fault-C mid-stream flip). ADDED: a
+    REAL mid-stream expiry on the segmented path — a deterministic clock
+    crossing the TTL between segments, the inline confirmed renewal REJECTED
+    (fault A), the reader abandoning the plan: stream errors BEFORE the
+    flush tail, lease released, never a false success.
+  - Row 4 (compaction crash before publish): WAS landed (check-compaction
+    §5.3: orphan swept by payload + catalog state, catalog byte-unchanged,
+    next round succeeds). The row's remaining assertion — "fetches
+    unaffected" — APPENDED to that check: a full clone straight after the
+    sweep completes with its flush tail and leaves the catalog
+    byte-unchanged.
+  - Row 5 (crash after publish, mid-delete): WAS landed in outcome
+    (check-gc §2 crash-mid-R2-delete + delete-failing-whole: idempotent
+    retry converges) but on a SQL-fabricated retired row. ADDED: the full
+    composition — a REAL publish lands, the first GC delete pass crashes
+    mid-R2-batch (per-pack deletes are independent: the crashed pack stays
+    RECLAIMABLE awaiting its ack while the others reclaim in-pass), the
+    retry converges, the successor stays ACTIVE and serves, closure
+    identical.
+
+  **§7.3 correctness-tier CI additions** — audited: none existed as
+  automated checks (bench fixtures cover throughput only; e2e.sh needs a
+  running Worker). Landed as `check-correctness-tier.mjs` (7 checks), which
+  drives the REAL Worker-side receive flow — `createDurableGit().fetch` with
+  the real `parsePushRequest`/`stagePack`/scan/`finalizeReceive` pipeline,
+  the DO RPCs executed by the real control plane over node:sqlite, R2
+  staged in memory — plus real `git` as the serve oracle:
+  - 99/101 MB boundary pushes: the ~100 MB decimal cap is the Cloudflare
+    PROXY's (SPEC-0001 §6 T1 — >100 MB histories must use the import
+    channel), so the engine-side contract is pinned size-parametrized at
+    `MAX_PUSH_MB=1` MiB: under-cap lands; an over-cap DECLARED length is a
+    413 BEFORE any DO RPC or R2 write; an over-cap UNDECLARED body aborts AT
+    the cap mid-staging (multipart aborted, staging swept) with every
+    command ng in report-status and zero refs touched.
+  - newTip-exists-tree-missing injection: a pack carrying only the tip
+    commit — the scan's connectivity anti-check flags the missing tree,
+    finalize rejects "missing necessary objects", no ref moves, staging
+    swept.
+  - finalize-success-response-lost retry convergence: the retried finalize
+    and the Worker's `releaseReceive(sweep)` both return `lease_mismatch`
+    WITHOUT un-applying anything — ref, catalog row, index rows and packs/
+    bytes survive; the new tip serves with its flush tail.
+  - full clone with cross-pack delta bases: the served pack ships every
+    cross-pack REF-delta base — real `git index-pack` WITHOUT `--fix-thin`
+    accepts it, `git verify-pack -v` shows the delta shipped AS a delta over
+    the cross-pack base, `git fsck --strict` is clean over the cloned refs.
+  - incremental fetch relying on REF_DELTA + negotiated haves: the
+    `multi_ack_detailed` ACK/last-ACK shape, the exact new-object set (new
+    tip, its tree, its new blob — haves-side objects never re-sent, and
+    never a thin delta against an unshipped base), then the real-client
+    validation: the pack drops onto a repo holding only the haves' objects
+    and `git fsck --strict` is clean.
+  - The six-row clone-cache mismatch matrix: deepen-family poisoning +
+    parse-struct rows were landed (check-cache-unreachable G3-direct,
+    mutation-tested + check-deepen-parse); the CAPABILITY row is now
+    directly pinned (a non-side-band full clone satisfying every other
+    predicate makes ZERO planCloneStream RPCs and zero R2 reads — appended
+    to check-cache-unreachable, now 19 checks); different-wants →
+    not-all-tips miss was landed (check-read-leases RepoCell); filter →
+    rejected at parse (check-deepen-parse + the capability matrix's
+    contrapositive); stale-version-no-false-hit holds by construction (the
+    probe key derives from the LIVE `reachableVersion` — a stale entry is a
+    different key that is never probed) with the stale-entry lifecycle
+    pinned by check-gc §4.2's drain check.
+  - Differential testing vs a real Gitea instance: the harness and battery
+    were already landed outside the engine (scripts/diff-test.mjs +
+    scripts/diff-cases/ with declared rules; CI job `diff-battery`,
+    ours-only since the 2026-10-25 no-egress attempt) — nothing added here.
+
+  **Test-generated capability matrix** (`check-capability-matrix.mjs`, 18
+  checks): the advertised-capability table is derived from the LIVE
+  handshakes — v0 upload-pack, v0 receive-pack, protocol v2 — by parsing
+  the advertisement BYTES; every advertised token must resolve to a
+  REGISTERED PROOF that drives the real request path (uploadPack / the
+  control plane / the receive scanner) and asserts its semantics:
+  `multi_ack_detailed` (ACK common + final ACK), `no-done` (ready+NAK+ACK
+  and the pack in the same response), `shallow` (deepen <n> handled;
+  deepen-since/not/relative rejected fail-closed), `side-band-64k` (band-1
+  data + band-2 progress + flush tail; push-side report-status framing),
+  `symref=HEAD:<target>` (advertisement value == live HEAD == ls-refs
+  symref-target), `agent=<name>/<version>` (key=value wire form;
+  capability updates never fetch arguments), `version 2` (a v2 fetch
+  answers `packfile`), `ls-refs` (listing + symrefs), `fetch=shallow` (v2
+  shallow-info section), `report-status` (per-command ok/ng rendering),
+  `delete-refs` (a delete command removes the ref), `ofs-delta` (the
+  scanner resolves type-6 OFS entries end to end). An edit that advertises
+  a capability without a handler proof FAILS the gate. Contrapositive
+  pins: `filter` NOT advertised anywhere and rejected in both v0 and v2;
+  unknown arguments fail closed; the empty-repo `capabilities^{}`
+  advertisement well-formed.
+
+  Gates observed with my own eyes: all 15 scripts green (totals per
+  script: cache-unreachable 19, capability-matrix 18, catalog-rpc 10,
+  compaction 8, correctness-tier 7, deepen-parse 16, fault-matrix 4,
+  fork-replicate 50, gc 8, merge-engine 29, merge-graph 14, merge-tree 25,
+  migrations 17, read-leases 25, segmented-serve 10); engine
+  `tsc -p tsconfig.build.json` clean. (The workspace `pnpm typecheck`
+  failure at commit time is a SIBLING WAVE's mid-flight apps/worker change
+  — untracked pull-reviews.test.ts importing not-yet-landed modules —
+  outside engine ownership; not this milestone's gate.)
 
 - **Content-path lease coverage (2fce4cd, 2026-10-25 — closes M3.2's known
   follow-up)**: every R2 content read is now lease-covered or provably

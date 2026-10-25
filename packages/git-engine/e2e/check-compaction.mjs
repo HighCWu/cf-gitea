@@ -559,7 +559,7 @@ await check("§5.3 crash before publish: the written-but-unpublished output is a
   const t = makeT();
   const objects = new Map();
   t.store.setR2(fakeBucket(objects), STORAGE); // bound before any packed read
-  seedRepo(t.store, objects);
+  const oids = seedRepo(t.store, objects);
   const preCatalog = JSON.parse(JSON.stringify(catalogRows(t)));
   const preRows = t.sql.exec("SELECT COUNT(*) AS n FROM pack_objects").one().n;
   const host = hostOf(t, objects);
@@ -602,6 +602,15 @@ await check("§5.3 crash before publish: the written-but-unpublished output is a
   assertEq(objects.get(payload.outputIdxR2Key), undefined, "orphan idx bytes swept");
   assertEq(JSON.parse(JSON.stringify(catalogRows(t))), preCatalog, "catalog still byte-unchanged after the sweep");
   assertEq(t.sql.exec("SELECT COUNT(*) AS n FROM leases").one().n, 0, "the stale lease row is gone");
+
+  // §7.2 matrix row 4 (M3.5): "fetches unaffected" — the orphan never touched
+  // the catalog, so straight after the sweep a full clone over the pre-crash
+  // refs completes with its flush tail (the crashed round left no trace the
+  // serve path can observe)
+  const postCrash = await drainCapture(await Promise.resolve(uploadPack(t.store, uploadPackRequest(oids.commit2))));
+  assert(postCrash.err === null, `fetch unaffected by the crashed round: ${postCrash.err?.message}`);
+  assert(new TextDecoder().decode(postCrash.bytes).endsWith(FLUSH_BYTES), "the post-crash fetch's flush tail is intact");
+  assertEq(JSON.parse(JSON.stringify(catalogRows(t))), preCatalog, "the fetch itself left the catalog byte-unchanged");
 
   // and the repo is immediately compactable again (converged, not wedged)
   const retry = await runCompaction(host, { force: true });
