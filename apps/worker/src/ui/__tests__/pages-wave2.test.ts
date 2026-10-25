@@ -168,6 +168,8 @@ describe("wave-2 parser surface", () => {
     "/octo/hello/tree/branch/feature/deep/dir",
     "/octo/hello/issues",
     "/octo/hello/pulls",
+    "/octo/hello/issues/5", // wave 3: the detail family (single integer tail)
+    "/octo/hello/pulls/7",
   ])("claims UI family: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(true);
   });
@@ -175,9 +177,10 @@ describe("wave-2 parser surface", () => {
   it.each([
     "/octo/hello/treeX/branch/main",
     "/octo/hello/issuesX",
-    "/octo/hello/issues/5", // the detail space stays engine-owned
-    "/octo/hello/issues/new",
-    "/octo/hello/pulls/7",
+    "/octo/hello/issues/new", // the rest of the detail space stays engine-owned
+    "/octo/hello/issues/5/comments",
+    "/octo/hello/issues/5x", // non-numeric index → engine 404 (chi PathParamInt64 parity)
+    "/octo/hello/pulls/7/8",
     "/octo/hello/Issues", // family literals are lowercase-exact
   ])("does not claim: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(false);
@@ -193,6 +196,27 @@ describe("wave-2 parser surface", () => {
     expect(parseUiRoute("/octo/hello/tree")).toEqual({ family: "tree", owner: "octo", repo: "hello", rawSuffix: "" });
     expect(parseUiRoute("/octo/hello/issues")).toEqual({ family: "issues", owner: "octo", repo: "hello" });
     expect(parseUiRoute("/octo/hello/pulls")).toEqual({ family: "pulls", owner: "octo", repo: "hello" });
+  });
+
+  it("parses the wave-3 detail family: single integer tail, urlKind preserved (chi PathParamInt64 parity)", () => {
+    expect(parseUiRoute("/octo/hello/issues/5")).toEqual({
+      family: "issue-detail",
+      owner: "octo",
+      repo: "hello",
+      urlKind: "issues",
+      index: 5,
+    });
+    expect(parseUiRoute("/octo/hello/pulls/7")).toEqual({
+      family: "issue-detail",
+      owner: "octo",
+      repo: "hello",
+      urlKind: "pulls",
+      index: 7,
+    });
+    // Leading zeros are base-10 (upstream ParseInt), a negative is admitted
+    // at parse time and 404-shells on the row lookup.
+    expect(parseUiRoute("/octo/hello/issues/007")).toMatchObject({ family: "issue-detail", index: 7 });
+    expect(parseUiRoute("/octo/hello/issues/-1")).toMatchObject({ family: "issue-detail", index: -1 });
   });
 });
 

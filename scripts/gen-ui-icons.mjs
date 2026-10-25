@@ -41,12 +41,24 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, '..');
 
 // SPEC-0008 §2.4.1 icon allowlist (sorted; derivation in the header above).
+// Wave 3 (issue/PR detail + tab strip) adds the single-path issue-family
+// glyphs: PR state machine (open/closed/draft), merge, the reopen event dot
+// and the sidebar milestone mark. octicon-issue-opened / octicon-issue-closed
+// stay OUT: they carry two <path> elements each, which fails the single-path
+// shell constraint asserted below — their slots degrade to text (see
+// shell.tsx / pages/issue-detail.tsx) until Icon learns multi-path bodies.
 const ALLOWLIST = [
   'octicon-code',
+  'octicon-dot-fill',
   'octicon-file',
   'octicon-file-directory-fill',
+  'octicon-git-merge',
+  'octicon-git-pull-request',
+  'octicon-git-pull-request-closed',
+  'octicon-git-pull-request-draft',
   'octicon-globe',
   'octicon-history',
+  'octicon-milestone',
   'octicon-repo',
   'octicon-three-bars',
 ];

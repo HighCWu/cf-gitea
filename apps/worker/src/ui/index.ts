@@ -18,17 +18,24 @@
  *   /:owner/:repo/issues                   issues list (pages/issues-list.tsx)
  *   /:owner/:repo/pulls                    pulls list (same component over
  *                                          is_pull rows — issues-list.tsx)
+ *   /:owner/:repo/issues/{index}           issue detail (pages/issue-detail.tsx)
+ *   /:owner/:repo/pulls/{index}            PR detail (same component over
+ *                                          is_pull rows — issue-detail.tsx;
+ *                                          upstream's type/URL match 303s the
+ *                                          mismatched family onto the right
+ *                                          one, issue_view.go:347-352)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
- * separate TreeRoute/IssuesListRoute types below instead of new UiFamily
- * members. The suffixed /issues//pulls space (detail, new, …) and every
- * other repo-scoped path stay with the engine — the four git-protocol
- * routes, the LFS family, and the engine JSON API/admin surface. The parser
- * claims families by shape and never protocol or engine paths, and the
- * reserved owner names (`api`, `assets` — SPEC-0003 §3) are refused outright,
- * so `/api/v1` and the edge-served `/assets/*` tree are out of reach by
- * construction.
+ * separate TreeRoute/IssuesListRoute/IssueDetailRoute types below instead of
+ * new UiFamily members. The rest of the suffixed /issues//pulls space
+ * (`/issues/new`, `/issues/{index}/comments`, non-numeric or deeper tails)
+ * and every other repo-scoped path stay with the engine — the four
+ * git-protocol routes, the LFS family, and the engine JSON API/admin
+ * surface. The parser claims families by shape and never protocol or engine
+ * paths, and the reserved owner names (`api`, `assets` — SPEC-0003 §3) are
+ * refused outright, so `/api/v1` and the edge-served `/assets/*` tree are
+ * out of reach by construction.
  *
  * ## Dispatcher integration (orchestrator-owned `src/index.ts`, §2.2)
  *
@@ -70,12 +77,13 @@ import { trimTrailingSlash } from "hono/trailing-slash";
 
 import { isReservedOwnerName } from "../repos/service";
 import { AssetBuildError, loadManifest } from "./manifest";
-import { resolvePublicRepository } from "./repo-view";
+import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
 import { treeRedirectResponse } from "./pages/repo-home";
+import { crossFamilyRedirect, loadIssueDetailData, renderIssueDetailPage } from "./pages/issue-detail";
 import { loadIssuesListData, renderIssuesListPage } from "./pages/issues-list";
 import { shellAssetsFromManifest, type UiContext } from "./ui-context";
-import { resolveViewer } from "./viewer";
+import { resolveViewer, type Viewer } from "./viewer";
 
 // ---------------------------------------------------------------------------
 // Route parsers (the single source of truth — handlesUiRoute and uiRouter
@@ -120,18 +128,28 @@ export interface TreeRoute {
 }
 
 /** The `/issues` and `/pulls` list families (pages/issues-list.tsx): the
- *  bare URLs only — the suffixed issue/PR-detail space (`/issues/{index}`,
- *  `/issues/new`, …) is future-page territory and stays engine-owned, the
- *  same posture as `/commit/{sha}` (§1.2, open question 1). */
+ *  bare URLs — the wave-3 detail routes below own the single-index tails. */
 export interface IssuesListRoute {
   family: "issues" | "pulls";
   owner: string;
   repo: string;
 }
 
+/** The wave-3 detail family (pages/issue-detail.tsx): `/issues/{index}` and
+ *  `/pulls/{index}` — one component over the shared issue rows; `urlKind`
+ *  records which literal addressed it (upstream ViewIssue redirects the
+ *  mismatched family onto `Issue.Link()`, issue_view.go:347-352). */
+export interface IssueDetailRoute {
+  family: "issue-detail";
+  owner: string;
+  repo: string;
+  urlKind: "issues" | "pulls";
+  index: number;
+}
+
 /** Everything `parseUiRoute` can return; `UiRoute` remains the slice-1 view
  *  render.tsx consumes. */
-export type ParsedUiRoute = UiRoute | TreeRoute | IssuesListRoute;
+export type ParsedUiRoute = UiRoute | TreeRoute | IssuesListRoute | IssueDetailRoute;
 
 
 /**
@@ -174,12 +192,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // (`{type:branch|tag|commit}` routes; `gitea/routers/web/web.go:1749`).
   const [head, ...rest] = tail;
   // Wave-2 families: /tree re-emits its suffix RAW (RedirectRepoTreeToSrc
-  // swaps the still-encoded text, view_home.go:521); /issues and /pulls
-  // claim the bare list URLs only (the detail space stays engine-owned).
+  // swaps the still-encoded text, view_home.go:521). /issues and /pulls
+  // claim the bare list URLs plus the wave-3 single-integer detail tail
+  // (upstream chi `/{index}` + PathParamInt64: "007" is 7, a negative is
+  // admitted here and 404-shells on the row lookup); anything else in the
+  // space (`/issues/new`, `/issues/1/comments`, non-numeric) stays
+  // engine-owned, the same posture as `/commit/{sha}` (§1.2, open question 1).
   if (head === "tree") return { family: "tree", owner, repo, rawSuffix: rest.join("/") };
   if (head === "issues" || head === "pulls") {
-    if (rest.length > 0) return null;
-    return { family: head, owner, repo };
+    if (rest.length === 0) return { family: head, owner, repo };
+    if (rest.length === 1 && /^-?\d+$/.test(rest[0] as string)) {
+      return { family: "issue-detail", owner, repo, urlKind: head, index: Number.parseInt(rest[0] as string, 10) };
+    }
+    return null;
   }
   let suffix: string;
   try {
@@ -376,17 +401,43 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   // 301) — never render the shell for a path the parser does not claim.
   if (route === null) return c.notFound();
 
+  // SPEC-0010 §2.5 viewer resolution (the session wave's transition note in
+  // viewer.ts): the session cookie is verified per request and every
+  // response carries the rotation Set-Cookie when one is directed.
+  // `c.executionCtx` is unavailable under direct `router.fetch` invocations
+  // (the tests) — the resolver then settles its background work inline.
+  let waitUntil: ((promise: Promise<unknown>) => void) | undefined;
+  try {
+    waitUntil = c.executionCtx.waitUntil.bind(c.executionCtx);
+  } catch {
+    waitUntil = undefined;
+  }
   let ctx: UiContext;
+  let setCookie: string | null = null;
+  let viewer: Viewer;
   try {
     const manifest = await loadManifest(assetsBinding(c.env), url.origin);
-    ctx = { viewer: resolveViewer(), origin: url.origin, assets: shellAssetsFromManifest(manifest) };
+    const resolution = await resolveViewer(c.env, c.req.raw, { waitUntil });
+    setCookie = resolution.setCookie;
+    viewer = resolution.viewer;
+    ctx = { viewer: resolution.viewer, origin: url.origin, assets: shellAssetsFromManifest(manifest) };
   } catch (error) {
     if (error instanceof AssetBuildError) return assetsNotBuilt(error);
     throw error;
   }
+  const respond = (res: Response): Response => {
+    if (setCookie === null) return res;
+    const headers = new Headers(res.headers);
+    headers.append("set-cookie", setCookie);
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  };
 
-  const repo = await resolvePublicRepository(c.env, route.owner, route.repo);
-  if (repo === null) return c.html(renderNotFound(ctx), 404);
+  // SPEC-0010 §2.6: the §2.5 repo read widens through the gate's own grant
+  // lines (shared readGrant predicate) — anonymous keeps the row-1 collapse
+  // verbatim, a session viewer gains the authenticated read paths; anything
+  // without a grant 404-shells exactly as before (existence stays hidden).
+  const repo = await resolveRepositoryForViewer(c.env, viewer, route.owner, route.repo);
+  if (repo === null) return respond(c.html(renderNotFound(ctx), 404));
   ctx.repo = repo;
 
   // Wave-2 dispatch (render.tsx never sees these families). The redirect
@@ -394,22 +445,34 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   // slice-1 pages: unknown/private repos 404-shell, never redirect.
   if (route.family === "tree") {
     // Bare /tree has no upstream route (chi needs the slash) → §4.5 shell.
-    if (route.rawSuffix === "") return c.html(renderNotFound(ctx), 404);
+    if (route.rawSuffix === "") return respond(c.html(renderNotFound(ctx), 404));
     // The target prefix is the RESOLVED row's canonical link (upstream
     // ctx.Repo.RepoLink); the suffix and query travel verbatim.
     const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
-    return treeRedirectResponse(repoLink, route.rawSuffix, url.search);
+    return respond(treeRedirectResponse(repoLink, route.rawSuffix, url.search));
   }
   if (route.family === "issues" || route.family === "pulls") {
     const data = await loadIssuesListData(c.env.DB, repo.id, route.family, url.searchParams);
-    return c.html(renderIssuesListPage(ctx, data), 200);
+    return respond(c.html(renderIssuesListPage(ctx, data), 200));
+  }
+  // Wave-3 dispatch: the issue/PR detail page (render.tsx never sees this
+  // family). Upstream's type/URL match runs after the row lookup
+  // (issue_view.go:347-352) — a mismatched family 303s onto Issue.Link(),
+  // an unknown index 404-shells with the repo context (§4.5).
+  if (route.family === "issue-detail") {
+    const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+    const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin);
+    if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+    const redirect = crossFamilyRedirect(route.urlKind, repoLink, data.issue.index, data.issue.isPull);
+    if (redirect !== null) return respond(new Response(null, { status: 303, headers: { location: redirect } }));
+    return respond(c.html(renderIssueDetailPage(ctx, data), 200));
   }
 
   // U3 page switch (render.tsx — home | commits | src), with the 404 shell
   // for unresolvable refs/paths (§4.5).
-  if (!isSliceOneRoute(route)) return c.notFound(); // registration/parser drift guard
+  if (!isSliceOneRoute(route)) return respond(await c.notFound()); // registration/parser drift guard
   const { status, html } = await renderUiPage({ env: c.env, ctx, route, url });
-  return c.html(html, status);
+  return respond(c.html(html, status));
 }
 
 export const uiRouter = new Hono<{ Bindings: Env }>();
@@ -433,4 +496,6 @@ uiRouter.get("/:owner/:repo/src/*", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/tree", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/tree/*", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/issues", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/issues/:index", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/pulls/:index", (c) => uiPage(c));

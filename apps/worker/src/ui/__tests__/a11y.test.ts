@@ -12,9 +12,11 @@ import bareShellGolden from "./goldens/bare-shell.html?raw";
 import commitsGolden from "./goldens/commits.html?raw";
 import fileViewCodeGolden from "./goldens/file-view-code.html?raw";
 import homeGolden from "./goldens/home.html?raw";
+import issueDetailGolden from "./goldens/issue-detail.html?raw";
 import issuesClosedGolden from "./goldens/issues-closed.html?raw";
 import issuesOpenGolden from "./goldens/issues-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
+import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
 import { GOLDEN_CASES } from "./harness";
@@ -27,6 +29,8 @@ const goldens: Record<string, string> = {
   "issues-open.html": issuesOpenGolden,
   "issues-closed.html": issuesClosedGolden,
   "pulls-open.html": pullsOpenGolden,
+  "issue-detail.html": issueDetailGolden,
+  "pull-detail.html": pullDetailGolden,
   "not-found-repo.html": notFoundRepoGolden,
   "bare-shell.html": bareShellGolden,
 };

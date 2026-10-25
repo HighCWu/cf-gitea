@@ -11,6 +11,7 @@ import type { Child } from "hono/jsx";
 
 import { locale, configI18n } from "./locale";
 import { ICON_PATHS, type IconName } from "./icons";
+import type { Viewer } from "./viewer";
 import type { UiContext } from "./ui-context";
 
 // ---------------------------------------------------------------------------
@@ -123,10 +124,21 @@ function Head(props: { ctx: UiContext; title: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// Navbar (anonymous; templates/base/head_navbar.tmpl)
+// Navbar (templates/base/head_navbar.tmpl)
 // ---------------------------------------------------------------------------
 
-export function Navbar() {
+/**
+ * The navbar for both viewer kinds (SPEC-0010 §2.5 — the only component
+ * change sessions make). Anonymous viewers gain the Sign in link (`/login` —
+ * deliberately absent before SPEC-0010; Explore stays unrendered: no explore
+ * page exists). User viewers gain the upstream signed-in chrome REDUCED to
+ * the username + a sign-out POST button (head_navbar.tmpl at the pin, minus
+ * everything that needs services we have not built: no `+` create menu, no
+ * notification bell, no avatar image — the avatar pipeline does not exist;
+ * the username is plain text because a profile page is not in the §2.1
+ * inventory and dead links are not emitted, same rule as the tab strip).
+ */
+export function Navbar(props: { viewer: Viewer }) {
   return (
     <nav id="navbar" aria-label={locale.navbar_aria}>
       <a class="item" id="navbar-logo" href="/" aria-label={locale.home_title}>
@@ -136,15 +148,28 @@ export function Navbar() {
         <Icon name="octicon-three-bars" />
       </button>
       <div class="navbar-list navbar-left">
-        {/* Anonymous chrome only. Deliberately not rendered (dead links are
-            not emitted, same rule as the tab strip, §2.4.1): Explore (no
-            explore page exists this slice) and Sign In (there is deliberately
-            no /login route, §2.5). */}
         <a class="item" target="_blank" href="https://docs.gitea.com">
           {locale.help}
         </a>
       </div>
-      <div class="navbar-list navbar-right" />
+      <div class="navbar-list navbar-right">
+        {props.viewer.kind === "anonymous" ? (
+          <a class="item" href="/login">
+            {locale.sign_in}
+          </a>
+        ) : (
+          <>
+            <span class="item" id="navbar-username">
+              {props.viewer.username}
+            </span>
+            <form class="item" method="post" action="/logout">
+              <button type="submit" class="button">
+                {locale.sign_out}
+              </button>
+            </form>
+          </>
+        )}
+      </div>
     </nav>
   );
 }
@@ -153,8 +178,25 @@ export function Navbar() {
 // Repo header + tab strip (templates/repo/header.tmpl)
 // ---------------------------------------------------------------------------
 
-/** Tabs that back real pages this slice — the strip shows only these. */
-export type RepoTab = "code" | "commits";
+/** Tabs that back real pages this slice — the strip shows only these.
+ *  Upstream order is Code → Issues → Pulls (header.tmpl); Commits is the
+ *  cf-gitea addition (SPEC-0008 §2.4.1 — /commits is a slice-1 page) and
+ *  keeps last so the upstream relative order stays intact. */
+export type RepoTab = "code" | "issues" | "pulls" | "commits";
+
+/** Tab chrome text for the wave-3 tabs (the components/commit-list.tsx
+ *  component-local pattern — locale.ts is shared and not this wave's file). */
+const tabLocale = {
+  repo_issues: "Issues", // "repo.issues"
+  repo_pulls: "Pull Requests", // "repo.pulls"
+} as const;
+
+/** Upstream shows `{{if .Repository.NumOpenIssues}}` count labels; D1 keeps
+ *  lifetime (num_issues) + closed (num_closed_issues) counters, so the open
+ *  count is the difference (close/reopen moves only the closed counter). */
+function openCountOf(total: number, closed: number): number {
+  return Math.max(total - closed, 0);
+}
 
 export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
   const activeTab = props.activeTab ?? "code";
@@ -163,6 +205,8 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
     throw new Error("RepoHeader requires ctx.repo (BaseLayout renders it only when resolved)");
   }
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  const openIssues = openCountOf(repo.numIssues, repo.numClosedIssues);
+  const openPulls = openCountOf(repo.numPulls, repo.numClosedPulls);
   return (
     <div class="secondary-nav">
       <div class="ui container">
@@ -202,6 +246,14 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
           <div class="overflow-menu-items">
             <a class={activeTab === "code" ? "active item" : "item"} href={repoLink} data-shortcut-keys="g c">
               <Icon name="octicon-code" /> {locale.repo_code}
+            </a>
+            <a class={activeTab === "issues" ? "active item" : "item"} href={`${repoLink}/issues`} data-shortcut-keys="g i">
+              {tabLocale.repo_issues}
+              {openIssues > 0 ? <span class="ui small label">{openIssues}</span> : null}
+            </a>
+            <a class={activeTab === "pulls" ? "active item" : "item"} href={`${repoLink}/pulls`} data-shortcut-keys="g p">
+              <Icon name="octicon-git-pull-request" /> {tabLocale.repo_pulls}
+              {openPulls > 0 ? <span class="ui small label">{openPulls}</span> : null}
             </a>
             <a class={activeTab === "commits" ? "active item" : "item"} href={`${repoLink}/commits`}>
               <Icon name="octicon-history" /> {locale.repo_commits}
@@ -268,7 +320,7 @@ export function BaseLayout(props: {
       <body>
         <div class="full height">
           <noscript>{locale.enable_javascript}</noscript>
-          <Navbar />
+          <Navbar viewer={ctx.viewer} />
           <div
             role="main"
             aria-label={props.title ?? pageTitle}

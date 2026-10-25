@@ -142,6 +142,10 @@ export const GOLDEN_CASES: GoldenCase[] = [
   { file: "issues-open.html", path: "/alice/golden/issues", status: 200 },
   { file: "issues-closed.html", path: "/alice/golden/issues?state=closed", status: 200 },
   { file: "pulls-open.html", path: "/alice/golden/pulls", status: 200 },
+  // Issue/PR detail (wave 3): the labeled+milestone+commented issue #1 and
+  // the PR #4 (checking mergeability) through the same is_pull component.
+  { file: "issue-detail.html", path: "/alice/golden/issues/1", status: 200 },
+  { file: "pull-detail.html", path: "/alice/golden/pulls/4", status: 200 },
   // 404 shell WITH repo context (the repo resolved, the ref did not, §4.5).
   { file: "not-found-repo.html", path: "/alice/golden/commits/branch/nope", status: 404 },
   // Bare shell: 404 for an unknown owner/repo — navbar/main/footer, no repo

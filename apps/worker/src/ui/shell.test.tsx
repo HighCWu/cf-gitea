@@ -11,7 +11,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { assetURI, type UiManifest } from "./manifest";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
-import { resolveViewer } from "./viewer";
+import type { Viewer } from "./viewer";
 import { configI18n } from "./locale";
 import { BaseLayout, buildWindowConfig, renderPage, serializeWindowConfig } from "./shell";
 import { NotFoundPage } from "./pages/not-found";
@@ -66,7 +66,7 @@ function makeRepoRow(overrides: Partial<RepoRow> = {}): RepoRow {
   };
 }
 
-const anonymousCtx: UiContext = { viewer: resolveViewer(), origin, assets };
+const anonymousCtx: UiContext = { viewer: { kind: "anonymous" } satisfies Viewer, origin, assets };
 const repoCtx: UiContext = { ...anonymousCtx, repo: makeRepoRow() };
 
 function page(props: { ctx?: UiContext; title?: string; pageClass?: string } = {}): string {
@@ -221,15 +221,37 @@ describe("window.config (§2.4.1)", () => {
 // --- navbar / repo header / tab strip / footer -------------------------------
 
 describe("Navbar", () => {
-  it("renders the anonymous navbar landmark without dead links", () => {
+  it("renders the anonymous navbar landmark with the Sign in link and no other dead links", () => {
     const html = page();
     expect(html).toContain('<nav id="navbar" aria-label="Navigation Bar">');
     expect(html).toContain('id="navbar-logo"');
     expect(html).toContain('<img width="30" height="30" src="/assets/img/logo.svg"');
     expect(html).toContain('href="https://docs.gitea.com"');
-    // No login route (§2.5) and no explore page this slice — no dead links.
+    // SPEC-0010 §2.5: the anonymous chrome gains exactly the Sign in link
+    // (the /login route exists now); Explore stays unrendered (no page).
+    expect(html).toContain('<a class="item" href="/login">Sign In</a>');
     expect(html).not.toContain("/user/login");
     expect(html).not.toContain("/explore/");
+    // No signed-in chrome leaks for an anonymous viewer.
+    expect(html).not.toContain('id="navbar-username"');
+    expect(html).not.toContain('action="/logout"');
+  });
+
+  it("renders the signed-in chrome reduced to username + sign-out POST button (SPEC-0010 §2.5)", () => {
+    const viewer: Viewer = { kind: "user", id: 7, username: "octocat", isAdmin: false };
+    const html = renderPage(
+      <BaseLayout ctx={{ ...anonymousCtx, viewer }}>
+        <p>page body</p>
+      </BaseLayout>,
+    );
+    expect(html).toContain('<span class="item" id="navbar-username">octocat</span>');
+    // POST-only logout (§2.7) — a plain form button, no GET logout link.
+    expect(html).toContain('<form class="item" method="post" action="/logout">');
+    expect(html).toContain(">Sign Out</button>");
+    expect(html).not.toContain('href="/logout"');
+    // No Sign in link, no dead upstream chrome (+ create menu, bell, avatar).
+    expect(html).not.toContain('href="/login"');
+    expect(html).not.toContain("octicon-plus");
   });
 });
 
@@ -241,20 +263,39 @@ describe("RepoHeader tab strip", () => {
     return html.slice(start, end);
   }
 
-  it("renders exactly the Code and Commits tabs, in order, with active tracking", () => {
+  it("renders exactly the Code, Issues, Pulls, Commits tabs, in order, with active tracking", () => {
     const strip = tabStrip(page({ ctx: repoCtx }));
-    expect(strip.match(/<a class="(?:active )?item"/g)).toHaveLength(2);
+    expect(strip.match(/<a class="(?:active )?item"/g)).toHaveLength(4);
     expect(strip).toContain('<a class="active item" href="/octocat/hello" data-shortcut-keys="g c">');
+    expect(strip).toContain('<a class="item" href="/octocat/hello/issues" data-shortcut-keys="g i">');
+    expect(strip).toContain('<a class="item" href="/octocat/hello/pulls" data-shortcut-keys="g p">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/commits">');
-    // Inline octicon SVGs, upstream {{svg}} shape.
+    // Inline octicon SVGs, upstream {{svg}} shape. The Issues tab degrades to
+    // text: its octicon-issue-opened glyph is a 2-path octicon, which the
+    // shell's single-path Icon contract cannot carry (gen-ui-icons.mjs).
     expect(strip).toContain('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" class="svg octicon-code"');
+    expect(strip).toContain('class="svg octicon-git-pull-request"');
     expect(strip).toContain('class="svg octicon-history"');
     expect(strip.indexOf("> Code</a>")).toBeGreaterThan(0);
+    // The degraded Issues tab has no icon, so its text hugs the `>` directly.
+    expect(strip.indexOf(">Issues</a>")).toBeGreaterThan(strip.indexOf("> Code</a>"));
+    expect(strip.indexOf("> Pull Requests</a>")).toBeGreaterThan(strip.indexOf(">Issues</a>"));
     expect(strip).toContain("> Commits</a>");
-    // Only existing pages: no Issues/Pulls/Releases/Wiki/Settings dead tabs.
-    for (const dead of ["Issues", "Pulls", "Releases", "Wiki", "Settings"]) {
+    expect(strip).not.toContain('class="svg octicon-issue-opened"');
+    // Only existing pages: no Releases/Wiki/Settings dead tabs.
+    for (const dead of ["Releases", "Wiki", "Settings"]) {
       expect(strip).not.toContain(dead);
     }
+
+    const stripOnIssues = tabStrip(
+      renderPage(
+        <BaseLayout ctx={repoCtx} title="Issues" activeTab="issues">
+          <p>issues</p>
+        </BaseLayout>,
+      ),
+    );
+    expect(stripOnIssues).toContain('<a class="item" href="/octocat/hello" data-shortcut-keys="g c">');
+    expect(stripOnIssues).toContain('<a class="active item" href="/octocat/hello/issues" data-shortcut-keys="g i">');
 
     const stripOnCommits = tabStrip(
       renderPage(
@@ -265,6 +306,21 @@ describe("RepoHeader tab strip", () => {
     );
     expect(stripOnCommits).toContain('<a class="item" href="/octocat/hello" data-shortcut-keys="g c">');
     expect(stripOnCommits).toContain('<a class="active item" href="/octocat/hello/commits">');
+  });
+
+  it("shows the open-issue/pull count labels from the D1 counters (upstream NumOpenIssues shape)", () => {
+    // D1 keeps lifetime + closed counters; the open count is the difference.
+    const counted = makeRepoRow({ numIssues: 5, numClosedIssues: 2, numPulls: 3, numClosedPulls: 0 });
+    const strip = tabStrip(renderPage(
+      <BaseLayout ctx={{ ...anonymousCtx, repo: counted }}>
+        <p>counts</p>
+      </BaseLayout>,
+    ));
+    expect(strip).toContain('>Issues<span class="ui small label">3</span></a>');
+    expect(strip).toContain('> Pull Requests<span class="ui small label">3</span></a>');
+    // Zero open pulls render no label (upstream `{{if .Repository.NumOpenPulls}}`).
+    const zeroed = tabStrip(page({ ctx: repoCtx }));
+    expect(zeroed).not.toContain('class="ui small label"');
   });
 
   it("renders the repo header shell and closes with .ui.tabs.divider", () => {
