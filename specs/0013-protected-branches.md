@@ -537,3 +537,22 @@ merge-base file diff, stale → dismiss_stale_approvals dismissal with the
 fixed comment + num_comments bump → un-stale at the new tip). Deviation:
 `syncCommitDivergence` not ported (lazy mergeability re-heals divergence —
 documented, revisit if a UI ever renders divergence eagerly).
+
+## As-built — M2 (d7fdc49, 2026-10-25)
+
+The push gate: `validatePush` rides `EngineCallOptions` (the per-call in-process
+channel, same discipline as `pusher` — NOT DurableGitOptions, so mirror/import
+engines are unenforced by construction and index.ts untouched). OQ-1 decided:
+`ClassifiedPushCommand` kinds with force classification by REAL ancestry — one
+batched `classifyReceive` DO RPC per push (never per command) walking
+isAncestor over lease-staged rows (new tips resolve only post-scan; the hook
+sits after-scan-before-finalize, a recorded deviation from the spec's literal
+pre-lease placement which cannot classify force). Verdicts are index-aligned
+(positional joins — a crafted two-commands-one-ref request can never cross-match);
+malformed return or a throwing hook fails CLOSED; per-ref rejection filters the
+finalize input (siblings land), all-rejected skips finalize with a full sweep.
+Upstream texts verbatim per case + the default-branch-delete absolute arm.
+Boundary: D1-resolved forwards only — mirror/import/transitional carry no
+callback (proven by test). Signed-commits/protected-files arms not ported
+(§6). Verified by check-validate-push.mjs (9) + branch-protection-push.test
+(7) + 303-test scoped sweep.
