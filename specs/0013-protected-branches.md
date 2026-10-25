@@ -556,3 +556,13 @@ Boundary: D1-resolved forwards only — mirror/import/transitional carry no
 callback (proven by test). Signed-commits/protected-files arms not ported
 (§6). Verified by check-validate-push.mjs (9) + branch-protection-push.test
 (7) + 303-test scoped sweep.
+
+**M3 COMPLETE (1312fdb + 6558f3c, 2026-10-25)**: the render extras land with
+`loadBranchProtectionContext` (one rule-load + principal-access read per
+request, per-branch first-match in memory; team-whitelist arms hit D1 only
+when a whitelist names teams). Divergences recorded: `effective_branch_
+protection_name` renders unconditionally where upstream gates on IsAdmin
+(convert.go:106-108 — documented + test-pinned); the `protected`/
+`required_approvals` placeholders in git-models' toBranch are overridden by
+the extras spread when a rule matched (6558f3c — toBranch cannot know the
+rules).
