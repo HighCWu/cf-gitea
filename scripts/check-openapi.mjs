@@ -109,6 +109,16 @@ const RUNTIME_ONLY_RESPONSES = {
       404: "same helper as /signing-key.gpg — SigningKeySSH feeds the SSH expected format into getSigningKey (gitea/routers/api/v1/misc/signing.go:100), so with no signing-key configuration the blank-format arm answers APIErrorNotFound(\"no signing key\") verbatim (signing.go:19-21); the contract documents only the 200 text/plain",
     },
   },
+  "/repos/{owner}/{repo}/signing-key.gpg": {
+    get: {
+      404: "repo arm of the same getSigningKey helper (misc/signing.go:14-24 via api.go:1530) — cf-gitea has no signing-key configuration, so the blank-format arm answers APIErrorNotFound(\"no signing key\") like the landed global pair; the contract documents only the 200 text/plain",
+    },
+  },
+  "/repos/{owner}/{repo}/signing-key.pub": {
+    get: {
+      404: "repo arm of SigningKeySSH (misc/signing.go:100 via api.go:1531) — same blank-format answer as /repos/{owner}/{repo}/signing-key.gpg; the contract documents only the 200 text/plain",
+    },
+  },
   "/admin/users/{username}/keys": {
     post: {
       401: "upstream reqToken() runs inside the admin group's tokenRequiresScopes(admin) chain (gitea/routers/api/v1/api.go:1824-); the admin tag declares no 401 anywhere (routes/misc-t3.ts admin wiring note)",
@@ -123,6 +133,37 @@ const RUNTIME_ONLY_RESPONSES = {
   "/admin/unadopted/{owner}/{repo}": {
     delete: {
       404: "upstream's DeleteUnadoptedRepository answers APIErrorNotFound() at runtime for an unknown owner, an already-adopted repo and a repo absent from disk — every branch of the handler (gitea/routers/api/v1/admin/adopt.go) — though its swagger documents only {204,403}; in cf-gitea the absent-from-disk branch is EVERY call (no filesystem — routes/admin-degenerate.ts), so the 404 is the operation's one reachable outcome behind the gates",
+    },
+  },
+  "/user/avatar": {
+    post: {
+      400: "base64 decode failure answers upstream's exact ctx.APIError(400, err) text (user/avatar.go:33-37); at/over the 262144-byte origin cap cf-gitea 400s (no image pipeline — documented divergence, services/avatars.ts)",
+      401: "reqToken() 401s anonymous callers; the contract documents only 204",
+      413: "the MAX_AVATAR_WIRE_BYTES guard middleware rejects an over-cap declared Content-Length before any body byte (routes/avatars.ts)",
+      422: "zod body bind failures",
+      500: "unknown/corrupt/oversized-dimension image is upstream's APIErrorInternal (image.DecodeConfig arms) — the landed constant-fallback convention (routes/avatars.ts header)",
+    },
+  },
+  "/orgs/{org}/avatar": {
+    post: {
+      400: "same base64/origin-cap arms as /user/avatar (the org arm is user_service.UploadAvatar(org.AsUser()) — org/avatar.go:46)",
+      401: "reqToken(); contract documents only 204",
+      403: "reqOrgOwnership 403s non-owners (upstream's exact message) — the contract documents only 204",
+      404: "org assignment miss (rename-307 seam's terminal arm)",
+      413: "the wire-cap guard (as /user/avatar)",
+      422: "zod body bind failures",
+      500: "the image arms (as /user/avatar)",
+    },
+  },
+  "/repos/{owner}/{repo}/avatar": {
+    post: {
+      400: "same base64/origin-cap arms (the repo arm shares the upload service)",
+      401: "reqToken(); contract documents only 204",
+      403: "requireRepoAdmin 403s non-admins (upstream's exact message)",
+      404: "repo resolution miss (anti-enumeration)",
+      413: "the wire-cap guard",
+      422: "zod body bind failures",
+      500: "the image arms",
     },
   },
 };

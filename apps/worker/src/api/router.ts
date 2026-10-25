@@ -8,6 +8,7 @@ import {
 } from "./auth";
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
+import { registerAvatarRoutes } from "./routes/avatars";
 import { registerAdminDegenerateRoutes } from "./routes/admin-degenerate";
 import { registerAdminT2Routes } from "./routes/admin-t2";
 import { registerArchiveRoutes } from "./routes/archive";
@@ -186,6 +187,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // webhooks store) + the degenerate-but-honest admin five.
   registerHookScopeRoutes(app, requireAuth);
   registerAdminDegenerateRoutes(app, requireAuth);
+  // Inventory batch 4: the avatar upload/delete trio over the R2 avatar
+  // store (avatars/u_<id> + avatars/<storage_key>).
+  registerAvatarRoutes(app, requireAuth);
   // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
   // download, the diffpatch apply, the languages listing and the scheduled
   // auto-merge cancellation. All are deeper `/repos/{owner}/{repo}/<family>`
