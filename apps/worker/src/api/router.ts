@@ -8,6 +8,7 @@ import {
 } from "./auth";
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
+import { registerAdminDegenerateRoutes } from "./routes/admin-degenerate";
 import { registerAdminT2Routes } from "./routes/admin-t2";
 import { registerArchiveRoutes } from "./routes/archive";
 import { registerBranchProtectionRoutes } from "./routes/branch-protections";
@@ -21,6 +22,7 @@ import { registerMirrorRoutes } from "./routes/mirror";
 import { registerForkRoutes } from "./routes/forks";
 import { registerGitRoutes } from "./routes/git";
 import { registerHookRoutes } from "./routes/hooks";
+import { registerHookScopeRoutes } from "./routes/hooks-scopes";
 import { registerHookDeliveryRoute } from "./routes/hook-delivery";
 import { registerIdentityRoutes } from "./routes/identity";
 import { registerImportRoutes } from "./routes/imports";
@@ -180,6 +182,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // rename, admin repo create. Every op site-admin gated (upstream
   // reqSiteAdmin); PAT-only deviations documented in the module header.
   registerAdminT2Routes(app, requireAuth);
+  // Inventory batches: hooks scope families (org/user/admin over the landed
+  // webhooks store) + the degenerate-but-honest admin five.
+  registerHookScopeRoutes(app, requireAuth);
+  registerAdminDegenerateRoutes(app, requireAuth);
   // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
   // download, the diffpatch apply, the languages listing and the scheduled
   // auto-merge cancellation. All are deeper `/repos/{owner}/{repo}/<family>`
