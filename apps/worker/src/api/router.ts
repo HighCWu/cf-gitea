@@ -24,6 +24,7 @@ import { registerHookDeliveryRoute } from "./routes/hook-delivery";
 import { registerIdentityRoutes } from "./routes/identity";
 import { registerImportRoutes } from "./routes/imports";
 import { registerIssueRoutes } from "./routes/issues";
+import { registerIssueTablesT2Routes } from "./routes/issue-tables-t2";
 import { registerIssueT2Routes } from "./routes/issue-t2";
 import { registerIssueWriteT2Routes } from "./routes/issue-write-t2";
 import { registerLabelRoutes } from "./routes/labels";
@@ -185,6 +186,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // Tier-2 issue writes: label detach + the pin trio (pin/unpin/move). Same
   // deep paths as the family above; writes reqToken per upstream.
   registerIssueWriteT2Routes(app, requireAuth);
+  // Tier-2 issue tables: assignees/dependencies/blocks/stopwatch/tracked
+  // times over migration 0012 — writes reqToken, reads ride optionalAuth
+  // where the contract allows anonymous listing.
+  registerIssueTablesT2Routes(app, requireAuth, optionalAuth);
   // Tier-2 table-free misc reads: option templates (gitignore/label/license),
   // published settings, /markup, /token lifecycle. Anonymous except the
   // auth'd trio, mirroring upstream api.go routing.
