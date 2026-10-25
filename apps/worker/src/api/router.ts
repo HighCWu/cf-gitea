@@ -14,6 +14,10 @@ import { registerAdminDegenerateRoutes } from "./routes/admin-degenerate";
 import { registerAdminOrgExtrasRoutes } from "./routes/admin-org-extras";
 import { registerDeployKeyRoutes } from "./routes/deploy-keys";
 import { registerSecretsVariablesRoutes } from "./routes/secrets-variables";
+import { registerBlockRoutes } from "./routes/blocks";
+import { registerPushMirrorRoutes } from "./routes/push-mirrors";
+import { registerTagProtectionRoutes } from "./routes/tag-protections";
+import { registerWikiRoutes } from "./routes/wiki";
 import { registerAdminT2Routes } from "./routes/admin-t2";
 import { registerArchiveRoutes } from "./routes/archive";
 import { registerBranchProtectionRoutes } from "./routes/branch-protections";
@@ -259,6 +263,16 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // Tier-2 webhook delivery item (GET hooks/{id}/deliveries/{uuid}) — deeper
   // than the landed deliveries list; requireAuth like the whole hook family.
   registerHookDeliveryRoute(app, requireAuth);
+  // Wave-22 inventory batches: push mirrors (migration 0023; the sync op
+  // enqueues on the mirror lane), tag protections (0025; the create/delete
+  // arms of routes/tags.ts + the git-http push gate enforce the patterns),
+  // and the user/org block surface (0022; storage+API now, visibility
+  // enforcement is the mapped follow-up). The wiki family rides a sibling
+  // engine cell (specs/wiki.md) — reads optionalAuth, writes reqToken.
+  registerPushMirrorRoutes(app, requireAuth);
+  registerTagProtectionRoutes(app, requireAuth);
+  registerBlockRoutes(app, requireAuth);
+  registerWikiRoutes(app, requireAuth, optionalAuth);
 
   return app;
 }
