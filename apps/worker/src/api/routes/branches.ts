@@ -19,7 +19,13 @@ import {
   deleteApiRefError,
 } from "../services/engine";
 import { toBranch, toPayloadCommit, usernamesByEmail } from "../services/git-models";
-import { branchSchema, createBranchOptionSchema, renameBranchOptionSchema, updateBranchOptionSchema } from "../models/git";
+import {
+  branchSchema,
+  createBranchOptionSchema,
+  renameBranchOptionSchema,
+  updateBranchOptionSchema,
+  type Branch,
+} from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import {
   assertNotArchived,
@@ -27,6 +33,17 @@ import {
   requireVisibleRepo,
 } from "../services/repo-access";
 import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
+import {
+  canUserPush,
+  compileRuleName,
+  isUserMergeWhitelisted,
+  listRepoRules,
+  parseRuleConfig,
+  principalAccessOf,
+  ruleMatches,
+  type PrincipalAccess,
+  type ProtectedBranchRow,
+} from "../../services/branch-protection";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
 import type { MiddlewareHandler } from "hono";
@@ -72,6 +89,23 @@ import type { MiddlewareHandler } from "hono";
  * branch RENAME (services/repository/branch.go:492-493) — the PATCH handler
  * emits that pair (delete first, upstream's order) after the whole rename
  * succeeded, with the shared tip as the create's sha.
+ *
+ * Branch render extras (SPEC-0013 §3.6 — the LIST and the single GET only;
+ * POST keeps the family default render): the repo's rules load once per
+ * request (listRepoRules) and every branch resolves its first-match rule
+ * (GetFirstMatchProtectedBranchRule, protected_branch_list.go:92-98) against
+ * the authenticated doer's access pair. Upstream is ToBranch — the pinned
+ * submodule keeps it at services/convert/convert.go:67-118 (newer upstream
+ * moves it to routers/api/v1/convert/branch.go): the no-rule arm renders
+ * code-unit-write access for both flags (HasAccessUnit TypeCode write :73,
+ * CanMaintainerWriteToBranch :82, UserCanPush/UserCanMerge :92-93 → our
+ * PrincipalAccess.write); a matching rule renders CanUserPush (:116 → our
+ * canUserPush) and IsUserMergeWhitelisted (:117 → our isUserMergeWhitelisted)
+ * plus the rule name as effective_branch_protection_name. Upstream gates that
+ * name on Permission.IsAdmin() (:106-108); SPEC-0013 §3.6 renders it for
+ * every matched branch unconditionally — intentional divergence, noted here
+ * for the SPEC's divergence log (git-models.ts toBranch's placeholder values
+ * are overridden by this module on the two GET arms).
  */
 
 const notFoundResponse = {
@@ -123,19 +157,84 @@ function assertNotEmpty(pair: { repo: { isEmpty: boolean } }): void {
   }
 }
 
+/** The protection-aware Branch fields this module renders (SPEC-0013 §3.6). */
+type BranchRenderExtras = Pick<Branch, "user_can_push" | "user_can_merge" | "effective_branch_protection_name">;
+
+/** Per-request rule context — loaded ONCE, evaluated per branch. */
+interface BranchProtectionContext {
+  /** The repo's rules in first-match order (listRepoRules). */
+  rules: ProtectedBranchRow[];
+  /** The authenticated doer's reduced ACL (anonymous → all false). */
+  access: PrincipalAccess;
+}
+
+/**
+ * The per-request load: the repo's rules once (listRepoRules, the
+ * FindRepoProtectedBranchRules port) + the doer's access pair once
+ * (principalAccessOf — the repositoryPermissions + collaboratorModeOf
+ * composition). D1 reads stay per-request like every ACL decision (§4.7).
+ */
+async function loadBranchProtectionContext(c: Context<ApiEnv>, pair: RepositoryWithOwner): Promise<BranchProtectionContext> {
+  const [rules, access] = await Promise.all([
+    listRepoRules(c.env.DB, pair.repo.id),
+    principalAccessOf(c.env.DB, pair.repo, viewerOf(c).requester),
+  ]);
+  return { rules, access };
+}
+
+/**
+ * GetFirstMatchProtectedBranchRule (protected_branch_list.go:92-98) over the
+ * request-loaded list — findRule's per-branch half without re-reading D1.
+ */
+function firstMatchRule(rules: ProtectedBranchRow[], branchName: string): ProtectedBranchRow | null {
+  for (const rule of rules) {
+    if (ruleMatches(compileRuleName(rule.ruleName), branchName)) {
+      return rule;
+    }
+  }
+  return null;
+}
+
+/**
+ * ToBranch's protection split for ONE branch (services/convert/convert.go:
+ * 67-118): no rule → the bp == nil arm's plain write-access flags (:92-93)
+ * with an empty name; a rule → CanUserPush (:116) / IsUserMergeWhitelisted
+ * (:117) over the rule config + the first-match rule's name.
+ */
+async function branchRenderExtras(d1: D1Database, context: BranchProtectionContext, branchName: string): Promise<BranchRenderExtras> {
+  const rule = firstMatchRule(context.rules, branchName);
+  if (rule === null) {
+    return { user_can_push: context.access.write, user_can_merge: context.access.write, effective_branch_protection_name: "" };
+  }
+  const config = parseRuleConfig(rule.rules);
+  return {
+    user_can_push: await canUserPush(d1, config, context.access),
+    user_can_merge: await isUserMergeWhitelisted(d1, config, context.access),
+    effective_branch_protection_name: rule.ruleName,
+  };
+}
+
 /** The rendered Branch for one ref tip (readCommit on the resolved target). */
-async function renderBranch(c: Context<ApiEnv>, pair: Parameters<typeof toBranch>[3], branchName: string, target: string) {
+async function renderBranch(
+  c: Context<ApiEnv>,
+  pair: Parameters<typeof toBranch>[3],
+  branchName: string,
+  target: string,
+  extras?: BranchRenderExtras | Promise<BranchRenderExtras>,
+) {
   const reads = engineReads(c.env, pair.repo);
   const commit = await reads.readCommit(target);
   if (commit === null) return null;
   const usernames = await usernamesByEmail(c.env.DB, [commit]);
   const viewer = viewerOf(c);
-  return toBranch(
+  const branch = toBranch(
     branchName,
     toPayloadCommit(commit, pair, usernames, viewer.origin),
     viewer,
     pair,
   );
+  if (extras === undefined) return branch;
+  return { ...branch, ...(await extras) };
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +345,13 @@ export function registerBranchRoutes(
       setPaginationHeaders(c, branches.length, listOptions);
       const start = (listOptions.page - 1) * listOptions.limit;
       const page = branches.slice(start, start + listOptions.limit);
-      const rendered = await Promise.all(page.map((branch) => renderBranch(c, pair, branch.name, branch.target)));
+      // SPEC-0013 §3.6: one rule load + one access evaluation per request,
+      // first-match evaluated per branch (extras start concurrently with the
+      // per-branch commit reads).
+      const protection = await loadBranchProtectionContext(c, pair);
+      const rendered = await Promise.all(
+        page.map((branch) => renderBranch(c, pair, branch.name, branch.target, branchRenderExtras(c.env.DB, protection, branch.name))),
+      );
       return c.json(rendered.filter((branch) => branch !== null), 200);
     },
   );
@@ -383,7 +488,13 @@ export function registerBranchRoutes(
       if (tip === undefined) {
         throw new ApiError(404, "not found");
       }
-      const branch = await renderBranch(c, pair, branchName, tip.target);
+      const branch = await renderBranch(
+        c,
+        pair,
+        branchName,
+        tip.target,
+        branchRenderExtras(c.env.DB, await loadBranchProtectionContext(c, pair), branchName),
+      );
       if (branch === null) {
         throw new ApiError(404, "not found");
       }

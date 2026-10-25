@@ -31,7 +31,8 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { repositories, protectedBranches, users, webhookDeliveries, webhooks } from "../db/schema";
+import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
@@ -102,7 +103,18 @@ function identity(): User {
   return { ...STUB_USER, id: OWNER_ID, login: OWNER, full_name: OWNER, created: new Date(T0 * 1000).toISOString() };
 }
 
-const resolver: AuthResolver = { resolveToken: (token: string) => Promise.resolve(token === TOKEN ? identity() : null) };
+const OUTSIDER_TOKEN = "engine-suite-outsider";
+const OUTSIDER_ID = 4242;
+
+/** An authenticated NON-collaborator — visible on the public seed repo, no write. */
+function outsiderIdentity(): User {
+  return { ...STUB_USER, id: OUTSIDER_ID, login: "outsider", full_name: "outsider", created: new Date(T0 * 1000).toISOString() };
+}
+
+const resolver: AuthResolver = {
+  resolveToken: (token: string) =>
+    Promise.resolve(token === TOKEN ? identity() : token === OUTSIDER_TOKEN ? outsiderIdentity() : null),
+};
 
 /** Local mount — the deferred router.ts one-liner's exact seam. */
 function app(): OpenAPIHono<ApiEnv> {
@@ -835,5 +847,112 @@ describe("API tag push-pair + branch-rename webhook emissions (ref family wave 2
     expect(created.sha).toBe(TIP1); // the shared tip (fromBranch.CommitID)
     expect(created.sender).toMatchObject({ login: OWNER });
     expect(await deliveriesFor(pushOnlyHook)).toHaveLength(0); // delete/create never reach push-only hooks
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Branch render extras (SPEC-0013 §3.6) — user_can_push / user_can_merge /
+// effective_branch_protection_name on the two GET arms, the ToBranch bp split
+// (services/convert/convert.go:67-118): no rule → plain write-access flags;
+// a rule → the rule's CanUserPush / IsUserMergeWhitelisted + the rule name.
+// Matrix: protected/unprotected branches × writer/non-writer doers.
+// ---------------------------------------------------------------------------
+
+describe("branch render extras (SPEC-0013 §3.6)", () => {
+  const GUARDED = "guarded"; // plain-name rule
+  const FROZEN = "release-9"; // matches the "release-*" glob rule
+
+  let repoId = "";
+
+  beforeAll(async () => {
+    const row = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, SLUG)).get();
+    if (row === undefined) throw new Error("seed repo missing");
+    repoId = row.id;
+    // the two fresh branches the rules key on (created while still unprotected)
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: GUARDED }))).status).toBe(201);
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: FROZEN }))).status).toBe(201);
+    // GUARDED: can_push for writers (no whitelist) — merge falls back to write
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId,
+      ruleName: GUARDED,
+      priority: 1,
+      rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    // release-*: can_push off + an empty merge whitelist → even writers can
+    // neither push nor merge (the protection-aware narrowing arm).
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId,
+      ruleName: "release-*",
+      priority: 2,
+      rules: serializeRuleConfig({ ...emptyRuleConfig(), enableMergeWhitelist: true }),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+  });
+
+  it("writer doer: a protected branch renders the rule predicates + rule name (detail)", async () => {
+    const res = await send(`${REPO_PATH}/branches/${GUARDED}`, authed({ method: "GET" }));
+    expect(res.status).toBe(200);
+    const branch = await jsonBody(res);
+    // can_push=true without a whitelist → the write fallback (owner-writer passes);
+    // merge whitelist off → the same write fallback (convert.go:116-117)
+    expect(branch.user_can_push).toBe(true);
+    expect(branch.user_can_merge).toBe(true);
+    expect(branch.effective_branch_protection_name).toBe(GUARDED);
+  });
+
+  it("writer doer: a narrowing rule beats write access (can_push off, empty merge whitelist)", async () => {
+    const branch = await jsonBody(await send(`${REPO_PATH}/branches/${FROZEN}`, authed({ method: "GET" })));
+    // can_push=false → nobody pushes (CanUserPush :135-158); the merge
+    // whitelist names nobody → even the write fallback is gone (:218-238)
+    expect(branch.user_can_push).toBe(false);
+    expect(branch.user_can_merge).toBe(false);
+    expect(branch.effective_branch_protection_name).toBe("release-*");
+  });
+
+  it("writer doer: the LIST evaluates per branch over one rule load (unprotected main stays nameless)", async () => {
+    const res = await send(`${REPO_PATH}/branches`, authed({ method: "GET" }));
+    expect(res.status).toBe(200);
+    const branches: Array<Record<string, unknown>> = await res.json();
+    const byName = new Map(branches.map((branch) => [branch.name as string, branch]));
+    const guarded = byName.get(GUARDED) as Record<string, unknown>;
+    expect(guarded.user_can_push).toBe(true);
+    expect(guarded.user_can_merge).toBe(true);
+    expect(guarded.effective_branch_protection_name).toBe(GUARDED);
+    // main matches no rule → the bp == nil arm: the writer's write access,
+    // empty protection name (convert.go:68-94)
+    const main = byName.get("main") as Record<string, unknown>;
+    expect(main.user_can_push).toBe(true);
+    expect(main.user_can_merge).toBe(true);
+    expect(main.effective_branch_protection_name).toBe("");
+  });
+
+  it("anonymous doer (non-writer): flags render false, the matched rule name still renders", async () => {
+    const guarded = await jsonBody(await get(`${REPO_PATH}/branches/${GUARDED}`));
+    expect(guarded.user_can_push).toBe(false);
+    expect(guarded.user_can_merge).toBe(false);
+    // SPEC-0013 §3.6 renders the name unconditionally (upstream gates it on
+    // Permission.IsAdmin(), convert.go:106-108 — the intentional divergence)
+    expect(guarded.effective_branch_protection_name).toBe(GUARDED);
+    const main = await jsonBody(await get(`${REPO_PATH}/branches/main`));
+    expect(main.user_can_push).toBe(false);
+    expect(main.user_can_merge).toBe(false);
+    expect(main.effective_branch_protection_name).toBe("");
+  });
+
+  it("authenticated non-collaborator (non-writer): same false flags, name intact", async () => {
+    // NOT via authed() — it would overwrite the Authorization header with the
+    // owner token; the outsider carries its own.
+    const outsiderInit: RequestInit = { method: "GET", headers: { Authorization: `token ${OUTSIDER_TOKEN}` } };
+    const guarded = await jsonBody(await send(`${REPO_PATH}/branches/${GUARDED}`, outsiderInit));
+    expect(guarded.user_can_push).toBe(false);
+    expect(guarded.user_can_merge).toBe(false);
+    expect(guarded.effective_branch_protection_name).toBe(GUARDED);
+    const frozen = await jsonBody(await send(`${REPO_PATH}/branches/${FROZEN}`, outsiderInit));
+    expect(frozen.user_can_push).toBe(false);
+    expect(frozen.user_can_merge).toBe(false);
+    expect(frozen.effective_branch_protection_name).toBe("release-*");
   });
 });
