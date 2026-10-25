@@ -69,6 +69,7 @@ const ALLOWLIST = [
   'octicon-checklist',
   'octicon-clock',
   'octicon-code',
+  'octicon-search',
   'octicon-dot-fill',
   'octicon-file',
   'octicon-file-directory-fill',
