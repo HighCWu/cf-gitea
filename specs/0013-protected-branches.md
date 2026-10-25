@@ -516,3 +516,24 @@ commit (`pull-reviews.ts`, migration 0018).
 - **OQ-4 (product)**: default `required_approvals`/whitelist semantics for
   push-created repos — none (upstream creates no rules implicitly either; rules
   exist only where an admin created them).
+
+## As-built — M1 (0c33d07, 2026-10-25)
+
+Merge gate: two insertion arms in pulls.ts POST merge mirroring upstream
+CheckPullMergeable's order (merge-whitelist 403 after the write check;
+`checkPullBranchProtections` 405s after the mergeable precondition, texts
+verbatim; `force_merge` only via canBypassBranchProtection — OQ-2 resolved,
+the bind was already frozen). Table `protected_branches` (0019): repo_id TEXT
+(repo-scoped convention), rule_name/priority, rules JSON under upstream's
+exact snake_case keys. Service home `services/branch-protection.ts`: the
+glob port (plain-Compile semantics, QuoteMeta fallback, RE2-invalid [] error
+path), first-match ordering (priority → plain-before-glob → created), all
+M2's push/force/delete predicates pre-ported, `recomputeOfficialForRule`
+(the OQ-3 instrument, bounded, wired at M3). Reviews interplay:
+isOfficialReviewer's whitelist arm (admin-off-whitelist NOT official —
+upstream-verbatim), official persisted on REQUEST rows, head-push legs
+(`markStaleReviewsOnPush` in webhooks-push: content-change detection via
+merge-base file diff, stale → dismiss_stale_approvals dismissal with the
+fixed comment + num_comments bump → un-stale at the new tip). Deviation:
+`syncCommitDivergence` not ported (lazy mergeability re-heals divergence —
+documented, revisit if a UI ever renders divergence eagerly).

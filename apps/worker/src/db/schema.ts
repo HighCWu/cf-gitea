@@ -1773,8 +1773,10 @@ export const pullReviews = sqliteTable(
     issueId: integer("issue_id").notNull(),
     /** Review body (empty for request rows — upstream leaves it ''). */
     content: text("content"),
-    /** Review by someone whose approval counts (write access; the
-     *  protected-branch whitelist upstream arm has no cf-gitea surface). */
+    /** Review by someone whose approval counts. Since SPEC-0013 M1 the
+     *  protected-branch whitelist arm EXISTS (services/branch-protection.ts
+     *  isOfficialReviewer: no rule/no whitelist → write access; whitelist →
+     *  listed users/teams only; an admin off the whitelist is NOT official). */
     official: integer("official", { mode: "boolean" }).notNull().default(false),
     /** Head commit the review was made against (VARCHAR(64) upstream). */
     commitId: text("commit_id"),
