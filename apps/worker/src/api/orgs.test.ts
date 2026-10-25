@@ -31,7 +31,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { users } from "../db/schema";
+import { teamMembers, teams, users } from "../db/schema";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
@@ -1143,5 +1143,83 @@ describe("GET /users/{username}/orgs/{org}/permissions (orgGetUserPermissions)",
         })
       ).status,
     ).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The §3.4 create grant is NOT ownership (SPEC-0007 §3.4 follow-up): the
+// ownership guards ride `isOrgOwner` (role='owner'), not `canCreateOrgRepo`.
+// The create arm itself (POST /orgs/{org}/repos 201 for the grant holder) is
+// pinned in api/org-repos.test.ts's createOrgRepo describe.
+// ---------------------------------------------------------------------------
+
+/** `seedOrg` plus a can_create_org_repo team holding the plain member. */
+async function seedOrgWithCreateGrantTeam(): Promise<OrgSeed> {
+  const seed = await seedOrg();
+  const team = await db()
+    .insert(teams)
+    .values({ orgId: seed.orgId, lowerName: "creators", name: "creators", authorize: "read", canCreateOrgRepo: true })
+    .returning({ id: teams.id })
+    .all();
+  await db().insert(teamMembers).values({ orgId: seed.orgId, teamId: team[0]!.id, userId: seed.member.id });
+  return seed;
+}
+
+describe("create-grant members are not owners (requireOrgOwnership/requireCanChangeOrgUserStatus narrowed)", () => {
+  it("403s the grant holder on every owner-only op of this family and the member-visibility flip", async () => {
+    const seed = await seedOrgWithCreateGrantTeam();
+    const send = router();
+    // requireOrgOwnership (orgEdit):
+    const edit = await send("/orgs/acme", {
+      method: "PATCH",
+      headers: authHeaders(seed.member.id),
+      body: JSON.stringify({ description: "hijacked" }),
+    });
+    expect(edit.status).toBe(403);
+    expect(await edit.json()).toEqual({ message: "Must be an organization owner", url: ERROR_URL });
+    // requireOrgOwnership (rename + delete):
+    expect(
+      (
+        await send("/orgs/acme/rename", {
+          method: "POST",
+          headers: authHeaders(seed.member.id),
+          body: JSON.stringify({ new_name: "hijacked" }),
+        })
+      ).status,
+    ).toBe(403);
+    expect((await send("/orgs/acme", { method: "DELETE", headers: authHeaders(seed.member.id) })).status).toBe(403);
+    // requireCanChangeOrgUserStatus (flipping SOMEONE ELSE's flag — the
+    // self-flip arm stays open to the member, upstream member.go:243–259):
+    const flipOther = await send(`/orgs/acme/public_members/${seed.publicMember.username}`, {
+      method: "DELETE",
+      headers: authHeaders(seed.member.id),
+    });
+    expect(flipOther.status).toBe(403);
+    expect(await flipOther.json()).toEqual({ message: "Cannot change member visibility", url: ERROR_URL });
+  });
+
+  it("keeps the member's own-flag flip open (the target-themself arm) while the owner passes both guards", async () => {
+    const seed = await seedOrgWithCreateGrantTeam();
+    const send = router();
+    // The self arm: a create-grant member still publicizes themself.
+    expect(
+      (await send(`/orgs/acme/public_members/${seed.member.username}`, { method: "PUT", headers: authHeaders(seed.member.id) }))
+        .status,
+    ).toBe(204);
+    // The owner passes the ownership guard (edit) AND the flip guard (someone
+    // else's flag).
+    expect(
+      (
+        await send("/orgs/acme", {
+          method: "PATCH",
+          headers: authHeaders(seed.owner.id),
+          body: JSON.stringify({ description: "mine" }),
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (await send(`/orgs/acme/public_members/${seed.member.username}`, { method: "DELETE", headers: authHeaders(seed.owner.id) }))
+        .status,
+    ).toBe(204);
   });
 });

@@ -856,10 +856,15 @@ export class TeamsService {
 // (models/perm/access/repo_permission.go:751–757).
 // ---------------------------------------------------------------------------
 
-/** `IsOrganizationOwner` under the bridge: the role='owner' membership. */
+/**
+ * `IsOrganizationOwner` under the bridge: the role='owner' membership —
+ * `OrgService.isOrgOwner`, NOT the §3.4 create grant (repo creation without
+ * ownership, org_user.go:66–77 vs 98–106): every caller here is an
+ * ownership-grade arm (team manage/list trims), none a repo-create grant.
+ */
 async function isOrgOwner(orgs: OrgService, org: OrgRecord, doer: OrgProfileDoer): Promise<boolean> {
   if (doer.id === null) return false;
-  return orgs.canCreateOrgRepo(org.id, doer.id);
+  return orgs.isOrgOwner(org.id, doer.id);
 }
 
 async function isOrgMember(orgs: OrgService, org: OrgRecord, doer: OrgProfileDoer): Promise<boolean> {

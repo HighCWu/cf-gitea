@@ -140,11 +140,14 @@ export async function requireOrgVisible(orgs: OrgService, org: OrgRecord, doer: 
 /**
  * `reqOrgOwnership` (api.go:422–450), org context: org owner
  * (`IsOrganizationOwner` — the tier-1 `role='owner'` collapse, SPEC-0007
- * §3.3) or site admin, else the exact upstream 403 message.
+ * §3.3) or site admin, else the exact upstream 403 message. This is the
+ * OWNERSHIP predicate — `isOrgOwner`, NOT `canCreateOrgRepo`: the §3.4
+ * team grant confers repo creation without ownership (org_user.go:66–77
+ * vs 98–106), so a create-grant team member still 403s here.
  */
 export async function requireOrgOwnership(orgs: OrgService, org: OrgRecord, doer: OrgProfileDoer): Promise<void> {
   if (doer.isAdmin) return;
-  if (doer.id === null || !(await orgs.canCreateOrgRepo(org.id, doer.id))) {
+  if (doer.id === null || !(await orgs.isOrgOwner(org.id, doer.id))) {
     throw new ApiError(403, "Must be an organization owner");
   }
 }
@@ -226,9 +229,11 @@ export async function listOrgMemberRows(
 /**
  * `checkCanChangeOrgUserStatus` (routers/api/v1/org/member.go:243–259): the
  * target themself, a site admin, or an org owner may flip membership
- * visibility — everyone else gets the exact upstream 403. (Upstream wires
- * `reqOrgMembership` in front of this, so the reachable non-owner case is a
- * member touching someone else's flag.)
+ * visibility — everyone else gets the exact upstream 403. Owner means
+ * `isOrgOwner` (upstream `IsOrganizationOwner`), not the §3.4 create
+ * grant — creating repos confers no say over member visibility. (Upstream
+ * wires `reqOrgMembership` in front of this, so the reachable non-owner
+ * case is a member touching someone else's flag.)
  */
 export async function requireCanChangeOrgUserStatus(
   orgs: OrgService,
@@ -237,7 +242,7 @@ export async function requireCanChangeOrgUserStatus(
   targetUserId: number,
 ): Promise<void> {
   if (doer.id !== null && (doer.isAdmin || doer.id === targetUserId)) return;
-  if (doer.id !== null && (await orgs.canCreateOrgRepo(org.id, doer.id))) return;
+  if (doer.id !== null && (await orgs.isOrgOwner(org.id, doer.id))) return;
   throw new ApiError(403, "Cannot change member visibility");
 }
 

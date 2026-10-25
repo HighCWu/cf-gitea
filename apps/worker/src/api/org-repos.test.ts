@@ -20,7 +20,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { users } from "../db/schema";
+import { teamMembers, teams, users } from "../db/schema";
 import { RepoService } from "../repos/service";
 import { OrgService, type OrgRecord } from "../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../services/orgs/testing";
@@ -368,6 +368,52 @@ describe("POST /orgs/{org}/repos (createOrgRepo)", () => {
     const res = await router()("/orgs/acme/repos", { method: "POST", headers: anonHeaders, body: createBody });
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ message: "token is required", url: ERROR_URL });
+  });
+
+  it("keeps the §3.4 team grant repo-create-only: a grant team member creates (201) yet 403s owner-only ops; the owner passes both", async () => {
+    const alice = await seedUser("Alice");
+    const creator = await seedUser("Creator");
+    const org = await seedOrg("Acme", alice.id);
+    await orgs().addMember(org.id, creator.id);
+    // A can_create_org_repo team holding `creator` (raw rows — the team family
+    // is exercised in the org-teams suite; only the grant arm matters here).
+    const team = await db()
+      .insert(teams)
+      .values({ orgId: org.id, lowerName: "creators", name: "creators", authorize: "read", canCreateOrgRepo: true })
+      .returning({ id: teams.id })
+      .all();
+    await db().insert(teamMembers).values({ orgId: org.id, teamId: team[0]!.id, userId: creator.id });
+
+    // The grant creates…
+    const granted = await router()("/orgs/acme/repos", {
+      method: "POST",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ name: "granted" }),
+    });
+    expect(granted.status).toBe(201);
+    // …but confers no ownership: PATCH /orgs/{org} rides requireOrgOwnership
+    // (isOrgOwner — the SPEC-0007 §3.4 follow-up narrowing).
+    const hijack = await router()("/orgs/acme", {
+      method: "PATCH",
+      headers: authHeaders(creator.id),
+      body: JSON.stringify({ description: "hijacked" }),
+    });
+    expect(hijack.status).toBe(403);
+    expect(await hijack.json()).toEqual({ message: "Must be an organization owner", url: ERROR_URL });
+
+    // The owner passes both arms.
+    const ownerEdit = await router()("/orgs/acme", {
+      method: "PATCH",
+      headers: authHeaders(alice.id),
+      body: JSON.stringify({ description: "mine" }),
+    });
+    expect(ownerEdit.status).toBe(200);
+    const ownerCreate = await router()("/orgs/acme/repos", {
+      method: "POST",
+      headers: authHeaders(alice.id),
+      body: JSON.stringify({ name: "owned" }),
+    });
+    expect(ownerCreate.status).toBe(201);
   });
 
   it("409s a duplicate name and 422s an invalid/reserved name (upstream messages)", async () => {

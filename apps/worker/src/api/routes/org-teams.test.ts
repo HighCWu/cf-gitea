@@ -839,3 +839,98 @@ describe("GET /teams/{id}/activities/feeds (orgListTeamActivityFeeds)", () => {
     expect((await send(`/teams/${vaultId}/activities/feeds`, { headers: authHeaders(s.outsider.id) })).status).toBe(404);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The §3.4 create grant is NOT ownership (SPEC-0007 §3.4 follow-up): the
+// team family's owner arms ride isOrgOwner (role='owner'), not the grant.
+// The grant's CREATE arm (POST /orgs/{org}/repos 201) is pinned in
+// api/org-repos.test.ts's createOrgRepo describe.
+// ---------------------------------------------------------------------------
+
+/** `seedActors` plus a can_create_org_repo team holding the plain member
+ *  (addTeamMember installs the org membership as its AddOrgUser side effect). */
+async function seedActorWithCreateGrant(): Promise<TeamsSeed & { creatorsId: number }> {
+  const s = await seedActors();
+  const service = new TeamsService(env.DB);
+  const creators = await service.createTeam(s.org, {
+    name: "creators",
+    permission: "read",
+    can_create_org_repo: true,
+  });
+  await service.addTeamMember(creators, s.member.id);
+  return { ...s, creatorsId: creators.id };
+}
+
+describe("create-grant members are not owners (org-teams owner arms narrowed)", () => {
+  it("403s the grant holder on orgCreateTeam/orgEditTeam/orgAddTeamMember with the exact owner message", async () => {
+    const s = await seedActorWithCreateGrant();
+    const send = router();
+    // orgCreateTeam's requireOrgOwnership:
+    const create = await send(`/orgs/${s.org.username}/teams`, {
+      method: "POST",
+      headers: authHeaders(s.member.id),
+      body: JSON.stringify({ name: "sneaky", permission: "read" }),
+    });
+    expect(create.status).toBe(403);
+    expect((await create.json<Record<string, unknown>>()).message).toBe("Must be an organization owner");
+    // orgEditTeam (the grant holder's OWN team passes read access, not ownership):
+    const edit = await send(`/teams/${s.creatorsId}`, {
+      method: "PATCH",
+      headers: authHeaders(s.member.id),
+      body: JSON.stringify({ description: "self-promoted" }),
+    });
+    expect(edit.status).toBe(403);
+    expect((await edit.json<Record<string, unknown>>()).message).toBe("Must be an organization owner");
+    // orgAddTeamMember:
+    expect(
+      (
+        await send(`/teams/${s.creatorsId}/members/${s.outsider.username}`, {
+          method: "PUT",
+          headers: authHeaders(s.member.id),
+        })
+      ).status,
+    ).toBe(403);
+  });
+
+  it("does not widen the team listings: the grant holder still sees the member-filtered view", async () => {
+    const s = await seedActorWithCreateGrant();
+    const send = router();
+    // The member ladder = own teams UNION public+limited: `creators` (their
+    // own private team) and `docs` (public) — but never `vault-team`. The
+    // pre-narrowing owner arm would have listed every team instead.
+    const res = await send(`/orgs/${s.org.username}/teams`, { headers: authHeaders(s.member.id) });
+    expect(res.status).toBe(200);
+    expect((await res.json<Array<Record<string, unknown>>>()).map((team) => team.name)).toEqual(["creators", "docs"]);
+  });
+
+  it("keeps the owner passing every arm (create 201, edit 200, member add 204)", async () => {
+    const s = await seedActorWithCreateGrant();
+    const send = router();
+    expect(
+      (
+        await send(`/orgs/${s.org.username}/teams`, {
+          method: "POST",
+          headers: authHeaders(s.owner.id),
+          body: JSON.stringify({ name: "owner-team", permission: "read" }),
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await send(`/teams/${s.creatorsId}`, {
+          method: "PATCH",
+          headers: authHeaders(s.owner.id),
+          body: JSON.stringify({ description: "the create grant" }),
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await send(`/teams/${s.creatorsId}/members/${s.outsider.username}`, {
+          method: "PUT",
+          headers: authHeaders(s.owner.id),
+        })
+      ).status,
+    ).toBe(204);
+  });
+});
