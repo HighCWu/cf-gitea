@@ -62,6 +62,11 @@ import type { DurableGitHandler } from "@cf-gitea/git-engine";
 import type { AuthUser } from "../auth/auth-context";
 import { D1FailureLimiter } from "../auth/failure-limiter";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpauth";
+import {
+  limiterCheckFailOpen,
+  limiterRecordFailureFailOpen,
+  limiterResetFailOpen,
+} from "../auth/middleware";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
 import { resolveRepository } from "../git-http/acl";
@@ -294,14 +299,16 @@ export async function authorizeLfs(input: {
   }
 
   // Credential path: same limiter discipline as the git-HTTP gate (SPEC-0002
-  // §2.7) — anonymous requests have nothing to brute-force.
+  // §2.7) — anonymous requests have nothing to brute-force. The limiter's
+  // calls fail open (ef2c049): a broken limiter must not 500 the request it
+  // guards; verification below stays fail-closed.
   const now = new Date();
   const limiter = new D1FailureLimiter(env.DB);
   const ip =
     req.headers.get("cf-connecting-ip") ??
     req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
     "unknown";
-  const verdict = await limiter.check(ip, now);
+  const verdict = await limiterCheckFailOpen(limiter, ip, now);
   if (verdict.blocked) return rateLimited(verdict.retryAfterSeconds);
 
   let verified: VerifiedAuth | null;
@@ -315,12 +322,12 @@ export async function authorizeLfs(input: {
     });
   }
   if (verified === null) {
-    input.waitUntil(limiter.recordFailure(ip, now));
+    input.waitUntil(limiterRecordFailureFailOpen(limiter, ip, now));
     return lfsChallenge();
   }
 
   const scope = ScopeSet.parseLenient(verified.token.scopes);
-  input.waitUntil(limiter.reset(ip));
+  input.waitUntil(limiterResetFailOpen(limiter, ip));
   input.waitUntil(
     new TokenService(env.DB).needsLastUsedTouch(verified.token, now)
       ? new TokenService(env.DB).touchLastUsed(verified.token.id, now)

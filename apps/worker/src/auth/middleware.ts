@@ -16,7 +16,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 
 import type { AuthEnv, AuthInfo, AuthUser } from "./auth-context";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "./httpauth";
-import { D1FailureLimiter, type RateLimitHook } from "./failure-limiter";
+import { D1FailureLimiter, type RateLimitHook, type RateLimitVerdict } from "./failure-limiter";
 import { requiredScopeNames, type ScopeCategory, ScopeSet, type ScopeLevel } from "./scopes";
 import { TokenService } from "./token-service";
 
@@ -46,6 +46,45 @@ export function apiErrorResponse(c: Context<AuthEnv>, status: ContentfulStatusCo
 /** Upstream `APIErrorNotFound` (api.go:922–927): existence is not disclosed. */
 export function apiErrorNotFound(c: Context<AuthEnv>): Response {
   return apiErrorResponse(c, 404, "not found");
+}
+
+// --- Failure-limiter fail-open (production finding ef2c049) ------------------
+//
+// The failure limiter is brute-force protection, not an authz gate: its D1
+// backend throws intermittently under concurrency, and the unguarded calls
+// turned that into a 500 — a rate limiter 500-ing the very request it
+// guards. Every credential-path limiter call site (resolveAuth, git-HTTP
+// ACL, LFS auth, UI login) routes through these never-throwing wrappers: a
+// backend failure logs one line and the request proceeds. Credential
+// VERIFICATION stays deliberately fail-closed (SPEC-0002 §4.5); only the
+// limiter's availability is relaxed.
+
+/** Never-throwing `limiter.check` — an unblocked verdict on backend failure. */
+export async function limiterCheckFailOpen(
+  limiter: RateLimitHook,
+  ip: string,
+  now: Date,
+): Promise<RateLimitVerdict> {
+  try {
+    return await limiter.check(ip, now);
+  } catch (err) {
+    console.error(`failure-limiter: check failed for ip=${ip}; failing open`, err);
+    return { blocked: false, retryAfterSeconds: 0 };
+  }
+}
+
+/** Never-throwing `limiter.recordFailure` — the count update is dropped. */
+export function limiterRecordFailureFailOpen(limiter: RateLimitHook, ip: string, now: Date): Promise<void> {
+  return limiter.recordFailure(ip, now).catch((err: unknown) => {
+    console.error(`failure-limiter: recordFailure failed for ip=${ip}; dropping the count`, err);
+  });
+}
+
+/** Never-throwing `limiter.reset` — a stale counter survives until its window expires. */
+export function limiterResetFailOpen(limiter: RateLimitHook, ip: string): Promise<void> {
+  return limiter.reset(ip).catch((err: unknown) => {
+    console.error(`failure-limiter: reset failed for ip=${ip}; ignoring`, err);
+  });
 }
 
 // --- resolveAuth ------------------------------------------------------------
@@ -78,8 +117,9 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
     }
 
     // Failure limiting guards the credential-testing path only: anonymous
-    // requests carry nothing to brute-force.
-    const verdict = await limiter.check(ip, now);
+    // requests carry nothing to brute-force. Fails open (ef2c049): a broken
+    // limiter must not 500 the request it guards.
+    const verdict = await limiterCheckFailOpen(limiter, ip, now);
     if (verdict.blocked) {
       return c.json({ message: RATE_LIMITED_MESSAGE, url: swaggerUrl(c) }, 429, {
         "Retry-After": String(verdict.retryAfterSeconds),
@@ -88,7 +128,8 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
 
     const verified = await service.verify(credential, { now });
     if (verified === null) {
-      await limiter.recordFailure(ip, now);
+      // The 401 must not depend on the limiter backend's health.
+      await limiterRecordFailureFailOpen(limiter, ip, now);
       return apiErrorResponse(c, 401, INVALID_CREDENTIAL_MESSAGE);
     }
 
@@ -119,7 +160,7 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
     await runBackground(c, service.needsLastUsedTouch(verified.token, now)
       ? service.touchLastUsed(verified.token.id, now)
       : Promise.resolve());
-    await runBackground(c, limiter.reset(ip));
+    await runBackground(c, limiterResetFailOpen(limiter, ip));
 
     await next();
   };

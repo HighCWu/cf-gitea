@@ -6,9 +6,10 @@
 
 import { Hono } from "hono";
 import { env } from "cloudflare:workers";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AuthEnv } from "./auth-context";
+import type { RateLimitHook } from "./failure-limiter";
 import { requireScope, requireToken, requireSiteAdmin, resolveAuth, sudo } from "./middleware";
 import { basicHeader, basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "./testing/seeds";
 import { TokenService } from "./token-service";
@@ -296,5 +297,82 @@ describe("Basic token forms (services/auth/basic.go:44–68)", () => {
       headers: { Authorization: basicHeader("someone", seeded.token) },
     });
     expect(response.status).toBe(200);
+  });
+});
+
+describe("failure limiter fails open (production finding ef2c049)", () => {
+  /** Limiter hook whose every backend call rejects — the production D1
+   *  intermittent-throw shape. */
+  const brokenLimiter = (): RateLimitHook => {
+    const blip = () => new Error("d1 concurrency blip");
+    return {
+      check: () => Promise.reject(blip()),
+      recordFailure: () => Promise.reject(blip()),
+      reset: () => Promise.reject(blip()),
+    };
+  };
+
+  const buildBrokenApp = (): Hono<AuthEnv> => {
+    const app = new Hono<AuthEnv>();
+    app.use("*", resolveAuth({ failureLimiter: () => brokenLimiter() }));
+    app.get("/_repo", requireToken(), (c) => c.json({ ok: true }));
+    return app;
+  };
+
+  it("limiter.check throwing does not block a valid credential (200, not 500/429)", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const seeded = await seedWithToken("FailOpenValid", "all");
+    const response = await buildBrokenApp().request(
+      "https://example.com/_repo",
+      {
+        headers: { Authorization: `token ${seeded.token}`, "CF-Connecting-IP": "203.0.113.9" },
+      },
+      env,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    // Both limiter ops on the success path (check + reset) failed open and
+    // logged one line each with the IP and the error — the request itself
+    // never noticed.
+    expect(consoleError).toHaveBeenCalledTimes(2);
+    expect(String(consoleError.mock.calls[0]?.[0])).toContain("check failed for ip=203.0.113.9");
+    expect(consoleError.mock.calls[0]?.[1]).toBeInstanceOf(Error);
+    expect(String(consoleError.mock.calls[1]?.[0])).toContain("reset failed for ip=203.0.113.9");
+  });
+
+  it("limiter.recordFailure throwing still answers the 401 challenge", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const response = await buildBrokenApp().request("https://example.com/_repo", {
+      headers: { Authorization: "token cfg_00000000_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+    }, env);
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual(INVALID_CREDENTIALS);
+  });
+
+  it("a broken limiter D1 (dropped table) proceeds through the DEFAULT limiter wiring", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // Production-faithful breakage: the limiter's own table is gone, so the
+    // default D1FailureLimiter throws on check/recordFailure/reset while the
+    // credential tables stay healthy.
+    await env.DB.prepare("DROP TABLE auth_failures").run();
+    try {
+      const seeded = await seedWithToken("FailOpenDropped", "all");
+      const ok = await call("https://example.com/_repo", {
+        headers: { Authorization: `token ${seeded.token}` },
+      });
+      expect(ok.status).toBe(200);
+
+      const bad = await call("https://example.com/_repo", {
+        headers: { Authorization: "token cfg_00000000_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      });
+      expect(bad.status).toBe(401);
+      expect(await bad.json()).toEqual(INVALID_CREDENTIALS);
+    } finally {
+      // Restore the shared schema — this file's beforeEach DELETEs from
+      // auth_failures and sibling tests need the table present.
+      await env.DB.prepare(
+        "CREATE TABLE `auth_failures` (`ip` text PRIMARY KEY NOT NULL, `window_start` integer NOT NULL, `count` integer DEFAULT 0 NOT NULL)",
+      ).run();
+    }
   });
 });

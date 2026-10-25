@@ -40,6 +40,11 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { D1FailureLimiter } from "../auth/failure-limiter";
 import { sha256Hex, timingSafeDigestEqual } from "../auth/digest";
+import {
+  limiterCheckFailOpen,
+  limiterRecordFailureFailOpen,
+  limiterResetFailOpen,
+} from "../auth/middleware";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
 import { sessions, users } from "../db/schema";
@@ -632,13 +637,20 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   const sink = backgroundSink(c);
 
   // Step 1: the shared per-IP budget across every auth surface (SPEC-0002
-  // §2.7 window; deliberate — §2.2 step 1).
-  const verdict = await limiter.check(ip, now);
+  // §2.7 window; deliberate — §2.2 step 1). Fails open (ef2c049): a broken
+  // limiter must not turn the login POST into a 500 — the credential
+  // verification below stays the real gate.
+  const verdict = await limiterCheckFailOpen(limiter, ip, now);
   if (verdict.blocked) return loginRateLimited(verdict.retryAfterSeconds);
 
   const form = await parseLoginForm(c.req.raw);
   const invalid = (): Promise<Response> =>
-    renderLoginFailure(c, form.redirectTo, locale.login_error_invalid_token, limiter.recordFailure(ip, now));
+    renderLoginFailure(
+      c,
+      form.redirectTo,
+      locale.login_error_invalid_token,
+      limiterRecordFailureFailOpen(limiter, ip, now),
+    );
 
   // Step 2: verify the PAT unchanged (prefix lookup + sha256 + timing-safe
   // compare + expiry, src/auth/token-service.ts:165-188). Unknown,
@@ -660,19 +672,29 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   // acl.ts decide + SPEC-0002 §4.1).
   const scope = ScopeSet.parseLenient(verified.token.scopes);
   if (!scope.has("read:repository") || scope.publicOnly) {
-    return renderLoginFailure(c, form.redirectTo, locale.login_error_scope, limiter.recordFailure(ip, now));
+    return renderLoginFailure(
+      c,
+      form.redirectTo,
+      locale.login_error_scope,
+      limiterRecordFailureFailOpen(limiter, ip, now),
+    );
   }
 
   // Step 4: prohibited account → no session, no row, no cookie (upstream
   // refusing login for prohibit-login users, githttp.go:194-197 semantics).
   if (verified.user.status !== "active") {
-    return renderLoginFailure(c, form.redirectTo, locale.login_error_prohibited, limiter.recordFailure(ip, now));
+    return renderLoginFailure(
+      c,
+      form.redirectTo,
+      locale.login_error_prohibited,
+      limiterRecordFailureFailOpen(limiter, ip, now),
+    );
   }
 
   // Step 5: mint row + cookie in one response; limiter reset + expired-row
   // sweep in waitUntil (§2.2 step 5).
   const cookieValue = await mintSession(c.env.DB, verified.user.id, { now });
-  sink(limiter.reset(ip));
+  sink(limiterResetFailOpen(limiter, ip));
   sink(sweepExpiredSessions(c.env.DB, now));
 
   // Step 6: the validated redirect (§2.2 step 6, §4.6).

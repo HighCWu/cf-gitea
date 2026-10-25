@@ -30,6 +30,11 @@ import {
   scopeForbidden,
 } from "./respond";
 import { D1FailureLimiter } from "../auth/failure-limiter";
+import {
+  limiterCheckFailOpen,
+  limiterRecordFailureFailOpen,
+  limiterResetFailOpen,
+} from "../auth/middleware";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpauth";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
@@ -141,7 +146,9 @@ export interface GitHttpAclInput {
  * Decide the request against ACL matrix rows 1-14. Returns `true` to invoke
  * the engine, or the matrix Response to send instead. Never throws for
  * authz outcomes; D1 failures while verifying a credential fail closed (500,
- * SPEC-0002 §4.5 "never fail open").
+ * SPEC-0002 §4.5 "never fail open"). The failure limiter is the one
+ * deliberate exception: its calls fail open (ef2c049) — brute-force
+ * protection must not break the git transport it guards.
  */
 export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response | true> {
   const { req, env, op, repo, owner } = input;
@@ -160,7 +167,7 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
       req.headers.get("cf-connecting-ip") ??
       req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
       "unknown";
-    const verdict = await limiter.check(ip, now);
+    const verdict = await limiterCheckFailOpen(limiter, ip, now);
     if (verdict.blocked) return rateLimited(verdict.retryAfterSeconds);
 
     let verified: VerifiedAuth | null;
@@ -176,12 +183,12 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
     if (verified === null) {
       // Unknown/revoked/expired/malformed credential → 401 challenge
       // (identity not established; §2.4 edge 4.14).
-      input.waitUntil(limiter.recordFailure(ip, now));
+      input.waitUntil(limiterRecordFailureFailOpen(limiter, ip, now));
       return basicChallenge();
     }
 
     const scope = ScopeSet.parseLenient(verified.token.scopes);
-    input.waitUntil(limiter.reset(ip));
+    input.waitUntil(limiterResetFailOpen(limiter, ip));
     input.waitUntil(
       new TokenService(env.DB).needsLastUsedTouch(verified.token, now)
         ? new TokenService(env.DB).touchLastUsed(verified.token.id, now)

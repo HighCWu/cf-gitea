@@ -26,12 +26,15 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories, teamMembers, teamRepoAccess, teams, users } from "../../db/schema";
+import { repositories, teamMembers, teamRepoAccess, teams, users,
+  protectedBranches,
+} from "../../db/schema";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { registerOrgTeamsRoutes, TeamsService } from "./org-teams";
+import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../../services/orgs/testing";
 
@@ -40,7 +43,7 @@ beforeAll(applyOrgsDdl);
 beforeEach(async () => {
   // The team tables first (no dependents), then the org sweep (repositories,
   // users-without-the-reserved-'assets'-row, org_members, redirects).
-  for (const table of ["team_repo_access", "team_members", "teams"]) {
+  for (const table of ["protected_branches", "team_repo_access", "team_members", "teams"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await resetOrgTables();
@@ -432,7 +435,7 @@ describe("PATCH /teams/{id} (orgEditTeam)", () => {
     expect(row).toMatchObject({ lowerName: "writers" });
   });
 
-  it("renames collide into the upstream blanked 500 (UpdateTeam → APIErrorInternal)", async () => {
+  it("renames collide into the internal-error 500 (UpdateTeam → APIErrorInternal seam)", async () => {
     const s = await seedActors();
     const send = router();
     const docsId = await teamIdByName("docs");
@@ -442,8 +445,11 @@ describe("PATCH /teams/{id} (orgEditTeam)", () => {
       body: JSON.stringify({ name: "VAULT-TEAM" }),
     });
     expect(res.status).toBe(500);
+    // The untyped rename failure rides giteaErrorHandler's default branch —
+    // the constant `internal server error` fallback (ef2c049: never the
+    // blank or internal message on the wire).
     expect(await res.json<Record<string, unknown>>()).toEqual({
-      message: "",
+      message: "internal server error",
       url: "https://example.com/api/swagger",
     });
   });
@@ -475,10 +481,34 @@ describe("DELETE /teams/{id} (orgDeleteTeam)", () => {
     // removeInvalidOrgUser scan has a member to re-home.
     const service = new TeamsService(env.DB);
     await service.addTeamMember(await mustTeam(service, docsId), s.member.id);
+    // A rule on the org's repo whitelisting BOTH teams (SPEC-0013 M4 — the
+    // team.go:191-210 "update branch protections" block).
+    const vaultId = await teamIdByName("vault-team");
+    await db().insert(protectedBranches).values({
+      repoId: "t_public_repo",
+      ruleName: "main",
+      priority: 1,
+      rules: serializeRuleConfig({
+        ...emptyRuleConfig(),
+        whitelistTeamIds: [docsId, vaultId],
+        approvalsWhitelistTeamIds: [docsId],
+        bypassAllowlistTeamIds: [vaultId],
+      }),
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
     const res = await send(`/teams/${docsId}`, { method: "DELETE", headers: authHeaders(s.owner.id) });
     expect(res.status).toBe(204);
     expect(await db().select().from(teams).where(eq(teams.id, docsId)).get()).toBeUndefined();
     expect(await db().select().from(teamMembers).where(eq(teamMembers.teamId, docsId)).all()).toEqual([]);
+    // The rule survives with the deleted team's references scrubbed from every
+    // allowlist column; the other org team's references stay.
+    const rule = (await db().select().from(protectedBranches).all())[0];
+    expect(rule).not.toBeUndefined();
+    const config = JSON.parse(rule!.rules) as Record<string, number[]>;
+    expect(config.whitelist_team_ids).toEqual([vaultId]);
+    expect(config.approvals_whitelist_team_ids).toEqual([]);
+    expect(config.bypass_allowlist_team_ids).toEqual([vaultId]);
     // The removed-from-team member KEEPS the org membership only while another
     // team holds them — `member` had none left, but they were never an
     // owner, so removeMember silently dropped the org membership too.
@@ -496,7 +526,9 @@ describe("DELETE /teams/{id} (orgDeleteTeam)", () => {
     await service.addTeamMember(await mustTeam(service, vaultId), s.owner.id);
     const res = await send(`/teams/${vaultId}`, { method: "DELETE", headers: authHeaders(s.owner.id) });
     expect(res.status).toBe(500);
-    expect((await res.json<Record<string, unknown>>()).message).toBe("");
+    // Untyped guard error → the default-branch `internal server error`
+    // fallback (ef2c049: never a blank/internal message on the wire).
+    expect((await res.json<Record<string, unknown>>()).message).toBe("internal server error");
     // The team survived the guarded transaction.
     expect(await db().select().from(teams).where(eq(teams.id, vaultId)).get()).not.toBeUndefined();
   });
@@ -592,7 +624,9 @@ describe("PUT/DELETE /teams/{id}/members/{username} (orgAddTeamMember/orgRemoveT
       headers: authHeaders(s.owner.id),
     });
     expect(res.status).toBe(500);
-    expect((await res.json<Record<string, unknown>>()).message).toBe("");
+    // Untyped guard error → the default-branch `internal server error`
+    // fallback (ef2c049).
+    expect((await res.json<Record<string, unknown>>()).message).toBe("internal server error");
   });
 });
 

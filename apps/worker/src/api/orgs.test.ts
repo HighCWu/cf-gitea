@@ -496,9 +496,10 @@ describe("DELETE /orgs/{org}/members/{username} (orgDeleteMember)", () => {
       headers: authHeaders(seed.owner.id),
     });
     expect(response.status).toBe(500);
-    // APIErrorInternal blanks the message in prod for non-admins — the
-    // unmapped OrgError lands in giteaErrorHandler's default branch.
-    expect(await response.json()).toEqual({ message: "", url: ERROR_URL });
+    // The unmapped OrgError lands in giteaErrorHandler's default branch —
+    // the constant `internal server error` fallback (ef2c049: upstream
+    // APIErrorInternal's blank message is never rendered).
+    expect(await response.json()).toEqual({ message: "internal server error", url: ERROR_URL });
   });
 });
 
@@ -1037,8 +1038,9 @@ describe("DELETE /orgs/{org} (orgDelete)", () => {
       headers: authHeaders(seed.owner.id),
     });
     expect(response.status).toBe(500);
-    // APIErrorInternal blanks the message — ErrUserOwnRepos rides the same seam
-    expect(await response.json()).toEqual({ message: "", url: ERROR_URL });
+    // ErrUserOwnRepos rides the same default-branch seam — the constant
+    // `internal server error` fallback (ef2c049)
+    expect(await response.json()).toEqual({ message: "internal server error", url: ERROR_URL });
     // and the org survives
     expect((await router()("/orgs/acme")).status).toBe(200);
   });

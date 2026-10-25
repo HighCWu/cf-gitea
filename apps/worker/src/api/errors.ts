@@ -47,12 +47,27 @@ export class ApiError extends Error {
 }
 
 /**
+ * Generic user-facing message for untyped internal errors — the exact string
+ * upstream substitutes for end users on its own 500 paths: the packages API
+ * `ProcessErrorForUser` (gitea/routers/api/packages/helper/helper.go:41,
+ * `message = "internal server error"` in prod for non-admins) and the web
+ * JSON error path (`gitea/services/context/context.go:272`,
+ * `buildUserErrorMessage("internal server error", err)`).
+ */
+const INTERNAL_ERROR_MESSAGE = "internal server error";
+
+/**
  * onError middleware producing Gitea's exact error body. Known `ApiError`s
  * render `{message, url}` (+ extras) with their status; `HTTPException`s
  * (hono/@hono-zod-openapi internals — e.g. the declared-body media-type
  * gate's 415) render through the same family with their status; anything
- * else is an internal error rendered like upstream's `APIErrorInternal` in
- * production: status 500 with an empty message (never leak internals).
+ * else is an internal error: the thrown value is logged (upstream logs it
+ * too, `apiErrorInternal`'s `log.ErrorWithSkip`) and the body carries the
+ * constant `internal server error` fallback. Upstream's own
+ * `APIErrorInternal` (gitea/services/context/api.go:117–130) blanks the
+ * message entirely in prod — an intentional divergence (production finding
+ * ef2c049): `{"message":""}` is a body no client can render, and even
+ * `err.message` stays in the logs rather than the wire.
  */
 export const giteaErrorHandler: ErrorHandler<ApiEnv> = (err, c) => {
   if (err instanceof ApiError) {
@@ -67,5 +82,6 @@ export const giteaErrorHandler: ErrorHandler<ApiEnv> = (err, c) => {
     }
     return c.json({ message: err.message, url: swaggerDocUrl(c) }, err.status);
   }
-  return c.json({ message: "", url: swaggerDocUrl(c) }, 500);
+  console.error(`api: unhandled error on ${c.req.method} ${c.req.path}`, err);
+  return c.json({ message: INTERNAL_ERROR_MESSAGE, url: swaggerDocUrl(c) }, 500);
 };
