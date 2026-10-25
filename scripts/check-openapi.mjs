@@ -109,6 +109,12 @@ const RUNTIME_ONLY_RESPONSES = {
       404: "same helper as /signing-key.gpg — SigningKeySSH feeds the SSH expected format into getSigningKey (gitea/routers/api/v1/misc/signing.go:100), so with no signing-key configuration the blank-format arm answers APIErrorNotFound(\"no signing key\") verbatim (signing.go:19-21); the contract documents only the 200 text/plain",
     },
   },
+  "/admin/users/{username}/keys": {
+    post: {
+      401: "upstream reqToken() runs inside the admin group's tokenRequiresScopes(admin) chain (gitea/routers/api/v1/api.go:1824-); the admin tag declares no 401 anywhere (routes/misc-t3.ts admin wiring note)",
+      404: "the /users/{username} subgroup's context.UserAssignmentAPI() answers 404 'user redirect does not exist [name: …]' for an unknown username at runtime (gitea/services/context/user.go userAssignment; emitted by routes/misc-t3.ts resolveAdminTargetRow); the contract documents {201,403,422} only",
+    },
+  },
 };
 
 /**

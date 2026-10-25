@@ -3,18 +3,23 @@
  * follow-self appendix row + the key listings):
  * `GET /user/followers` (userCurrentListFollowers), `PUT/DELETE
  * /user/following/{username}` (userCurrentPutFollow / userCurrentDeleteFollow)
- * and the no-key-store stubs `GET /users/{username}/keys` (userListKeys) +
- * `GET /users/{username}/gpg_keys` (userListGPGKeys). Same bootstrap as
- * follows.test.ts: org migrations + the raw `follows` DDL (the table has no
- * generated migration yet — services/follows.ts header), edges seeded and
- * probed through raw D1.
+ * and the REAL key listings `GET /users/{username}/keys` (userListKeys) +
+ * `GET /users/{username}/gpg_keys` (userListGPGKeys) over the migration-0016
+ * `public_keys`/`gpg_keys` tables. Same bootstrap as follows.test.ts: org
+ * migrations (which apply the full generated migration set, 0016 included)
+ * + the raw `follows` DDL (the table has no generated migration yet —
+ * services/follows.ts header), edges/rows seeded and probed through raw D1.
  *
  * Covered upstream shapes: the doer-anchored follower listing (visibility
  * cond included); FollowUser's silent no-ops (self / already following) and
- * the UserAssignmentAPI 404; UnfollowUser's idempotent 204; the key listings'
- * empty arrays over both a user and an org target (type-blind §4.11) with
- * runtime pagination headers. All five routes reqToken upstream (401
- * runtime-only for anonymous).
+ * the UserAssignmentAPI 404; UnfollowUser's idempotent 204; the key
+ * listings' upstream visibility rule — the keys are PUBLIC (any
+ * authenticated caller lists any assigned user's keys, key.go
+ * listPublicKeys / gpg_key.go ListGPGKeys), with the private fields
+ * (owner/read_only/key_type) reserved to the owner or a site admin; the
+ * empty (200 []) vs missing (404) distinction, orgs own no keys; the
+ * fingerprint filter scoped to the target. All five routes reqToken upstream
+ * (401 runtime-only for anonymous).
  */
 
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -22,7 +27,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { users } from "../db/schema";
+import { gpgKeys, publicKeys, users } from "../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "./auth";
 import contract from "../compat/contract/v1-swagger.generated.json";
 import { giteaErrorHandler } from "./errors";
@@ -32,6 +37,7 @@ import { registerIdentityRoutes } from "./routes/identity";
 import { FOLLOWS_DDL_STATEMENTS, followUser, isFollowing, unfollowUser } from "./services/follows";
 import { OrgService } from "../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../services/orgs/testing";
+import { GO_ZERO_TIME } from "./services/repository";
 
 beforeAll(async () => {
   await applyOrgsDdl();
@@ -42,6 +48,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await env.DB.prepare("DELETE FROM follows").run();
+  await env.DB.prepare("DELETE FROM gpg_keys").run();
+  await env.DB.prepare("DELETE FROM public_keys").run();
   await resetOrgTables();
   seededUsers.clear();
 });
@@ -154,6 +162,66 @@ async function seedFollowGraph(): Promise<{
   });
   await followUser(env.DB, bob.id, alice.id); // bob → alice
   return { alice, bob, carol, orgId: org.id };
+}
+
+// ---------------------------------------------------------------------------
+// Key fixtures — direct row inserts (the listings read, they do not parse)
+// ---------------------------------------------------------------------------
+
+const KEY_SEEDED_AT = new Date("2026-02-01T00:00:00Z");
+const GPG_CREATED_AT = new Date("2026-01-15T00:00:00Z");
+
+/** Raw `public_keys` row (migration 0016 columns; the write path's parsing
+ *  is misc-t3's concern — the identity listings only read). */
+async function seedPublicKey(
+  ownerId: number,
+  fields: { name: string; fingerprint: string; content: string; mode?: number },
+): Promise<{ id: number }> {
+  const rows = await db()
+    .insert(publicKeys)
+    .values({
+      ownerId,
+      name: fields.name,
+      fingerprint: fields.fingerprint,
+      content: fields.content,
+      mode: fields.mode ?? 2,
+      type: 1,
+      loginSourceId: 0,
+      verified: false,
+      createdAt: KEY_SEEDED_AT,
+      updatedAt: KEY_SEEDED_AT,
+    })
+    .returning({ id: publicKeys.id })
+    .all();
+  return rows[0]!;
+}
+
+/** Raw `gpg_keys` row — a primary when `primaryKeyId` is absent, a subkey
+ *  when it names the parent's key id (upstream stores subkeys as rows with
+ *  primary_key_id set). */
+async function seedGpgKey(
+  ownerId: number,
+  fields: { keyId: string; primaryKeyId?: string; content?: string },
+): Promise<{ id: number }> {
+  const rows = await db()
+    .insert(gpgKeys)
+    .values({
+      ownerId,
+      keyId: fields.keyId,
+      primaryKeyId: fields.primaryKeyId ?? "",
+      content: fields.content ?? "dGVzdC1wdWJsaWMta2V5",
+      verified: false,
+      canSign: true,
+      canEncryptComms: false,
+      canEncryptStorage: false,
+      canCertify: true,
+      createdAt: GPG_CREATED_AT,
+      expiresAt: null,
+      addedAt: KEY_SEEDED_AT,
+    })
+    .returning({ id: gpgKeys.id })
+    .all();
+  return rows[0]!;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,38 +344,167 @@ describe("DELETE /user/following/{username} (userCurrentDeleteFollow)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /users/{username}/keys + /gpg_keys (userListKeys / userListGPGKeys)
+// GET /users/{username}/keys (userListKeys — real public_keys rows)
 // ---------------------------------------------------------------------------
 
-describe("GET /users/{username}/keys + /gpg_keys (the no-key-store stubs)", () => {
-  it("renders the declared empty array for a user and an org target alike", async () => {
-    await seedFollowGraph();
-    const send = router();
-    const viewer = authHeaders((await seedUser("viewer")).id);
-    for (const path of ["/users/alice/keys", "/users/alice/gpg_keys", "/users/acme/keys", "/users/acme/gpg_keys"]) {
-      const response = await send(path, { headers: viewer });
-      expect(response.status).toBe(200);
-      expect(await response.json()).toEqual([]);
-    }
-  });
+describe("GET /users/{username}/keys (userListKeys, real rows)", () => {
+  const ALICE_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICQgLhusngED6SvOcMDWHg9wVjgOJ4QTN77gPol4OtTU ed25519-comment user@host";
+  const ALICE_FP = "SHA256:nBIbxZfae58Hod5zlVgetQGtfn2OhEymkNryw9sEXR8";
 
-  it("sends the runtime pagination headers with total 0 and accepts the declared fingerprint filter", async () => {
-    await seedFollowGraph();
-    const response = await router()("/users/alice/keys?fingerprint=AA:BB&limit=1", {
-      headers: authHeaders((await seedUser("s1")).id),
-    });
+  it("renders the target's keys in the ToPublicKey shape; the self view carries the private fields", async () => {
+    const seed = await seedFollowGraph();
+    const key = await seedPublicKey(seed.alice.id, { name: "laptop", fingerprint: ALICE_FP, content: ALICE_KEY });
+    const response = await router()(`/users/${seed.alice.username}/keys`, { headers: authHeaders(seed.alice.id) });
     expect(response.status).toBe(200);
-    expect(response.headers.get("X-Total-Count")).toBe("0");
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body).toHaveLength(1);
+    expect(body[0]).toMatchObject({
+      id: key.id,
+      key: ALICE_KEY,
+      url: `https://example.com/api/v1/user/keys/${key.id}`,
+      title: "laptop",
+      fingerprint: ALICE_FP,
+      created_at: KEY_SEEDED_AT.toISOString(),
+      last_used_at: KEY_SEEDED_AT.toISOString(),
+    });
+    const first = body[0]!;
+    // appendPrivateInformation (key.go:26-47) — owner + read_only + key_type.
+    expect(first.key_type).toBe("user");
+    expect(first.read_only).toBe(false);
+    expect((first.user as Record<string, unknown>).login).toBe("alice");
+    // the pagination header reports the REAL total (was the stub's 0).
+    expect(response.headers.get("X-Total-Count")).toBe("1");
   });
 
-  it("404s a missing target and 401s anonymous callers", async () => {
-    await seedFollowGraph();
+  it("another user lists the same keys WITHOUT the private fields (upstream: keys are public, key.go:96-99)", async () => {
+    const seed = await seedFollowGraph();
+    await seedPublicKey(seed.alice.id, { name: "laptop", fingerprint: ALICE_FP, content: ALICE_KEY });
+    const response = await router()(`/users/${seed.alice.username}/keys`, { headers: authHeaders(seed.bob.id) });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body.map((entry) => entry.fingerprint)).toEqual([ALICE_FP]);
+    const first = body[0]!;
+    expect(first.title).toBe("laptop");
+    expect(first).not.toHaveProperty("user");
+    expect(first).not.toHaveProperty("read_only");
+    expect(first).not.toHaveProperty("key_type");
+  });
+
+  it("a site admin gets the private fields on another user's keys", async () => {
+    const seed = await seedFollowGraph();
+    await seedPublicKey(seed.alice.id, { name: "laptop", fingerprint: ALICE_FP, content: ALICE_KEY });
+    const admin = await seedUser("root", { isAdmin: true });
+    const response = await router()(`/users/${seed.alice.username}/keys`, { headers: authHeaders(admin.id) });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    const first = body[0]!;
+    expect(first.key_type).toBe("user");
+    expect(first.read_only).toBe(false);
+    expect((first.user as Record<string, unknown>).login).toBe("alice");
+  });
+
+  it("the fingerprint filter scopes to the target (key.go:59-70: the named-user arm stays restricted)", async () => {
+    const seed = await seedFollowGraph();
+    await seedPublicKey(seed.alice.id, { name: "laptop", fingerprint: ALICE_FP, content: ALICE_KEY });
+    const BOB_FP = "SHA256:I5plbz5CJDzZiBSGXjZBVDpAS8c0FI3jzxrjbQSfaaU";
+    await seedPublicKey(seed.bob.id, { name: "bob-key", fingerprint: BOB_FP, content: "ssh-rsa AAAAB3NzaC1yc2E bob" });
     const send = router();
-    const viewerId = (await seedUser("s2")).id;
-    for (const path of ["/users/ghost/keys", "/users/ghost/gpg_keys"]) {
-      expect((await send(path, { headers: authHeaders(viewerId) })).status).toBe(404);
-      expect((await send(path)).status).toBe(401);
+    const viewer = authHeaders(seed.alice.id);
+    // Own key by fingerprint.
+    const own = await send(`/users/${seed.alice.username}/keys?fingerprint=${encodeURIComponent(ALICE_FP)}`, { headers: viewer });
+    expect(await own.json()).toMatchObject([{ fingerprint: ALICE_FP }]);
+    // Bob's fingerprint through alice's route filters to EMPTY — it must not
+    // leak another owner's key ("Querying not just listing" is /user/keys'
+    // unrestricted arm; the named-user route keeps OwnerID = target).
+    const foreign = await send(`/users/${seed.alice.username}/keys?fingerprint=${encodeURIComponent(BOB_FP)}`, { headers: viewer });
+    expect(await foreign.json()).toEqual([]);
+  });
+
+  it("distinguishes empty (200 []) from missing (404); orgs own no keys → []", async () => {
+    const seed = await seedFollowGraph();
+    const send = router();
+    const viewer = authHeaders(seed.carol.id);
+    const empty = await send(`/users/${seed.alice.username}/keys`, { headers: viewer });
+    expect(empty.status).toBe(200);
+    expect(await empty.json()).toEqual([]);
+    const org = await send("/users/acme/keys", { headers: viewer });
+    expect(org.status).toBe(200);
+    expect(await org.json()).toEqual([]);
+    for (const viewerId of [seed.alice.id]) {
+      expect((await send("/users/ghost/keys", { headers: authHeaders(viewerId) })).status).toBe(404);
     }
+    expect((await send("/users/ghost/keys")).status).toBe(401); // runtime-only reqToken 401
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /users/{username}/gpg_keys (userListGPGKeys — real gpg_keys rows)
+// ---------------------------------------------------------------------------
+
+describe("GET /users/{username}/gpg_keys (userListGPGKeys, real rows)", () => {
+  const PRIMARY_ID = "4ECAE2C6059CEC8C";
+  const SUBKEY_ID = "0123456789ABCDEF";
+
+  it("lists primary keys with subkeys attached in the ToGPGKey shape (subkey rows never render top-level)", async () => {
+    const seed = await seedFollowGraph();
+    const primary = await seedGpgKey(seed.alice.id, { keyId: PRIMARY_ID });
+    const subkey = await seedGpgKey(seed.alice.id, { keyId: SUBKEY_ID, primaryKeyId: PRIMARY_ID });
+    const response = await router()(`/users/${seed.alice.username}/gpg_keys`, { headers: authHeaders(seed.alice.id) });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Total-Count")).toBe("1");
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body).toHaveLength(1); // the subkey row is folded into `subkeys`
+    expect(body[0]).toMatchObject({
+      id: primary.id,
+      primary_key_id: "",
+      key_id: PRIMARY_ID,
+      emails: [],
+      can_sign: true,
+      can_encrypt_comms: false,
+      can_encrypt_storage: false,
+      can_certify: true,
+      verified: false,
+      created_at: GPG_CREATED_AT.toISOString(),
+      expires_at: GO_ZERO_TIME, // never expires renders Go's zero time
+    });
+    const first = body[0]!;
+    expect(first.subkeys).toEqual([
+      {
+        id: subkey.id,
+        primary_key_id: PRIMARY_ID,
+        key_id: SUBKEY_ID,
+        public_key: "dGVzdC1wdWJsaWMta2V5",
+        emails: [],
+        subkeys: [],
+        can_sign: true,
+        can_encrypt_comms: false,
+        can_encrypt_storage: false,
+        can_certify: true,
+        verified: false,
+        created_at: GPG_CREATED_AT.toISOString(),
+        expires_at: GO_ZERO_TIME,
+      },
+    ]);
+  });
+
+  it("another user's gpg keys are listable (upstream ListGPGKeys has no viewer filter)", async () => {
+    const seed = await seedFollowGraph();
+    await seedGpgKey(seed.alice.id, { keyId: PRIMARY_ID });
+    const response = await router()(`/users/${seed.alice.username}/gpg_keys`, { headers: authHeaders(seed.bob.id) });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body.map((entry) => entry.key_id)).toEqual([PRIMARY_ID]);
+  });
+
+  it("distinguishes empty (200 []) from missing (404)", async () => {
+    const seed = await seedFollowGraph();
+    const send = router();
+    const viewer = authHeaders(seed.carol.id);
+    const empty = await send(`/users/${seed.alice.username}/gpg_keys`, { headers: viewer });
+    expect(empty.status).toBe(200);
+    expect(await empty.json()).toEqual([]);
+    expect((await send("/users/ghost/gpg_keys", { headers: viewer })).status).toBe(404);
+    expect((await send("/users/ghost/gpg_keys")).status).toBe(401);
   });
 });
 
