@@ -674,3 +674,105 @@ matches, and a grep for the token shape across every leftover artifact =
 none. Hygiene footnote: the cookie jar briefly carried 0664 bits (curl
 umask) before deletion — single-user box, session row dies with TTL/GC;
 next run should pre-create the jar 0600.
+
+## Redeploy verification — 2026-10-25 16:19 UTC (00:19 CST), same-deployment-state block
+
+Deploy: version `922c5643-794f-40a3-a944-a8bdbab1b45a` on
+https://cf-gitea.hecongw.workers.dev at commit `b447a7d` — the parity ship:
+org labels ride org-owned repos' issue attach/replace arms (upstream MIXED
+verdict pinned: attach unions, list stays repo-only); UI waves 16-18 — the
+branches page + protection badge + the M2-predicated delete, the PR Commits
+tab (three-tab menu completes), and the commit view page (the parity survey's
+#1 dead-end); the API DELETE-branch arm gains the protection check
+(`CanDeleteBranchWithPermission` port — UI-16's flagged bypass). Assets
+rebuilt: **784 files, 13.9 MB**.
+
+Remote migrations immediately before deploy: **none to apply**;
+`d1_migrations` ledger verified **20/20 applied** (`SELECT COUNT(*)` = 20).
+
+Deploy gates at `b447a7d` (clean tree, freeze guarantee, no siblings):
+`pnpm typecheck` **0 errors** (types regenerated first); `pnpm lint` **0
+errors**; `node scripts/check-openapi.mjs` **PASS** (declared **318**
+operations across 203 paths ⊆ contract 554 ops/350 paths, tier-1 **78/78
+paths, 129/129 operations**; same documented warns: GET /user 401,
+GET /signing-key.gpg/.pub 404); `node scripts/check-contract-frozen.mjs`
+**PASS** (sha256 `529a3314…` matches the frozen README and the pinned
+submodule swagger verbatim); `vitest run --maxWorkers=8`: **Tests 2580
+passed | 5 skipped (2585)** — 111 files passed + 1 skipped (112), zero
+failures first try.
+
+`pnpm smoke` equivalent (`deploy-smoke.mjs`, fresh mint-per-run PAT via
+0600 temp file, `--user p0probe`, with `--migrate-check`): **6 pass / 0 fail
+/ 1 skip** (bench-report not requested), `ok: true`, 24025 ms. Verbatim:
+`[pass] healthz — {"ok":true}`; `[pass] anon-git-surface —
+probe-39c5a610/probe-dcce003c.git: git-upload-pack 404 not-found,
+git-receive-pack 401 Basic challenge`; `[pass] receive-advert — advert ok
+(165 bytes)`; `[pass] push-lsremote — pushed 46b7516e97…, authed ls-remote
+sees refs/heads/main, anonymous advert 401 Basic challenge`; `[pass]
+cleanup — repo p0probe/smoke-a5b648eb deleted`; `[pass] migrate-check — all
+19 expected tables present (+33 system/aux …)`.
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`,
+results **unchanged** vs all prior tables):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1`; `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean (exit 0, silent) |
+
+`p0probe/p0-shallow` remains live intentionally (reviewer re-run repo);
+anonymous GET answers **404** and anonymous `info/refs` answers **401 Basic
+challenge** (private repo, ACL row #2 holds, re-verified this run).
+
+**Spot check — UI waves 16 + 18 anonymous on a public repo (first
+production probe of the shipped pages).** Throwaway created via API: `POST
+/api/v1/user/repos` `{"private":false,"auto_init":true}` → **201**
+(`p0probe/spot-22af58c9`, default branch `main`, initial commit
+`5ded60bc68ae93d9e1accda7fc968106e56f42a1`). Anonymous, cookie-less GETs:
+
+- `GET /p0probe/spot-22af58c9/branches` → **200** `text/html`, `<title>Branches - p0probe/spot-22af58c9</title>` (wave 16 renders for the world on a public repo).
+- `GET /p0probe/spot-22af58c9/commit/5ded60bc68ae93d9e1accda7fc968106e56f42a1` → **200** `text/html`, `<title>Initial commit · 5ded60bc68 - p0probe/spot-22af58c9</title>`, message + README rendered (wave 18 — the parity survey's #1 dead-end — serves anonymously in production).
+
+**OPEN ISSUE (pre-existing, NOT this wave's regression): API-created repos
+are invisible to the git smart-HTTP surface until a push lands.** Observed
+live: for minutes after the 201, `info/refs` (anonymous AND token-authed),
+`git ls-remote`, and `git clone` all answered **404 "repository not found:
+p0probe/spot-22af58c9"** while the web pages and the API served the
+auto-init commit fine. Attribution: `POST /user/repos` constructs `new
+RepoService(d1)` with NO deps (`src/api/services/user-repos.ts:177`); the
+engine-registry mirror is gated `if (this.deps.registry)`
+(`src/repos/service.ts:323`) whose own comment says "creates MUST upsert …
+next push heals" — the API arm doesn't satisfy the MUST. The git gate's
+push-create path DOES pass the registry (`src/git-http/gate.ts:327`), which
+is why every smoke push-create works. `forks.ts:107` and
+`org-repos.ts:198` construct the same bare deps (org-created and forked
+repos presumably affected identically — unverified). Heal proven empirically:
+one applied push to any ref (`refs/heads/heal`) → anonymous `ls-remote`
+lists all refs, anonymous `clone` succeeds (main's `5ded60bc` intact), both
+pages still 200. Suggested next-wave fix: thread
+`{ registry: env.REGISTRY.getByName("registry") }` into the API create
+paths, or move the upsert into the cell's `commitApiChange` landing.
+
+Cleanup proof (API-verified + remote D1): spot repo DELETE → **204**,
+GET-after **404** (API + page); smoke repo deleted by the harness (cleanup
+check above); `repositories WHERE owner_namespace='p0probe'` = **1**
+(`p0-shallow`, intentionally live), `smoke-%`/`spot-%` = **0**. Per-run
+credential: PAT prefix `cfg_20197c62` DELETEd by prefix+user (changes = 1);
+`personal_access_tokens` joined to p0probe = **0 rows**; whole-table count =
+**1** (the standing `admin` bootstrap PAT, pre-existing). Credential temp
+files (0600 PAT file + mint stderr + smoke logs + scratch dir, including a
+credentialed-URL `.git/config` inside the heal clone) shredded and removed;
+`ls` after = no matches.
+
+Hygiene footnote (recorded honestly): the FIRST smoke invocation of this
+run executed with an EMPTY token — the extraction regex used the base32
+class `[A-Z2-7]`, but the token alphabet is `…23456789` (includes 8/9), so
+`--token` expanded empty and the token-path checks skipped (healthz + anon
+surface only; nothing created, nothing to clean); corrected to `[A-Z0-9]`
+and the full pass re-ran clean. Also: pre-existing `/tmp` leftovers from
+earlier runs still carry token-shaped plaintexts (`git110.log`,
+`remote-bootstrap.txt`, `d1bench-local3-pats.txt`, `bootstrap-out.txt`,
+`leak-repro/mint3.txt`) — every one corresponds to a PAT row already
+deleted (whole-table count 1, the standing admin PAT), so all are dead
+credentials, but their owning sessions should shred them.
