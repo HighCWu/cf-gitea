@@ -1,8 +1,10 @@
 # SPEC-0013: Protected branches & approval-gated merges — draft, gated
 
-Status: **draft — gated** (research-only; upstream surface inventory at the pin verified
-in this document. NOTHING in it is built until the §1.1 entry criteria fire — same
-discipline as SPEC-0012 §1.1 and SPEC-0011's gated ratification) ·
+Status: **accepted — ratified 2026-10-25** (the §1.1 entry criterion "the
+landed-but-idle reviews family pulling" is met: the reviews wave landed with
+merge-blocking explicitly deferred for want of this surface — the gap is
+live in the product. Implementation begins at M1; M2's engine hook requires
+the vendored-deviation ledger discipline) ·
 Date: 2026-10-25 · Fills the deferred item the reviews wave recorded twice: the
 `isOfficialReviewer` protected-branch whitelist arm ("the protected-branch whitelist
 arm has no cf-gitea surface",
