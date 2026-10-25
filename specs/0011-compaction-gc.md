@@ -1,6 +1,13 @@
 # SPEC-0011: Pack compaction & garbage collection (read leases, four-state pack lifecycle)
 
-Status: **draft — design complete (external review rounds 1–9, `docs/design/m3-design-inputs.md` adopted); ratification gated on M2 production stability: DEPLOY green + P0 review package delivered. Do not implement until ratified.** · Date: 2026-10-24
+Status: **accepted — ratified 2026-10-25** (the M2 stability gate is met: two
+production deploys green — cf93d51f and 15802991 — with 1854/1854 attributed
+gates, smoke 5/0/2 incl. the anon-401 and DELETE-cascade validations, and the
+P0 review package delivered with same-deployment-state probe evidence;
+reviewer verdict: engineering-verified, independent audit pending as a
+separate track). Implementation begins at milestone M3.0 (the DO schema
+migration mechanism — §9); the fault-injection gate (§7) is the acceptance
+bar. · Date: 2026-10-24 · Ratified: 2026-10-25
 Depends on: SPEC-0001 (storage engine, incl. 0001a lease RPCs), SPEC-0003 (git-HTTP serve paths), `docs/design/m3-design-inputs.md` (normative inputs, adopted verbatim where cited)
 Owns: pack lifecycle states, DO read leases, compaction algorithm & publish ordering, GC triggers & deletion, the M3 fault-injection acceptance suite.
 
