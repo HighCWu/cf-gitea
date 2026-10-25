@@ -392,3 +392,79 @@ Credential hygiene (standing rule): this run's PAT (prefix `cfg_f7f95289`,
 minted via `bootstrap-admin.mjs p0probe --remote`) was captured to a 0600
 temp file, never echoed to agent logs, and is deleted from
 `personal_access_tokens` at the end of this run.
+
+## Redeploy verification — 2026-10-25 11:16 UTC (19:16 CST), same-deployment-state block
+
+Deploy: version `1ab1d802-61a1-4ca8-a852-4ece74b22d49` on
+https://cf-gitea.hecongw.workers.dev at commit `5906a95` (SPEC-0013 M4, SPEC
+COMPLETE) — the largest batch yet in one deployment: UI waves 9-13 (dashboard,
+explore search, notifications + navbar bell, mirror panel, PR review
+interactions, org teams pages, user settings, compare view + new-PR form);
+SPEC-0013 COMPLETE (approval-gated merges, push-time per-ref protection,
+branch_protections API + render extras + sanitization/scrubs/bypass matrix;
+migrations 0018-0019); PR reviews family + reviewer requests + 4 review events
+(coverage 22/26); engine PushEvent authenticated pusher (in-process channel),
+M3.5 fault-injection matrix + test-generated capability matrix, content-path
+lease coverage; server-driven POST /repos/migrate; auth limiter fail-open
+hotfix + sane 500 fallback; deps refresh (markdown-it 15, workers-types
+current); declared 302→318. Assets rebuilt: **784 files, 13.9 MB**
+(content-hashed; deploy reported no asset delta to upload). Worker Startup
+Time 107 ms.
+
+Remote migrations applied immediately before deploy: **0018
+(`pull_reviews`), 0019 (`protected_branches`) — both ✅**; `d1_migrations`
+ledger **20/20 applied**; remote D1 now **49 application tables**, the
+sqlite_master set verified name-for-name against the CREATE TABLE statements
+across migrations 0000-0019 (exact match; plus `d1_migrations` bookkeeping and
+D1-internal `_cf_KV`).
+
+Deploy gates at `5906a95`: `tsc --noEmit` **0 errors** (types regenerated
+first); `pnpm lint` **0 errors**; `node scripts/check-openapi.mjs` **PASS**
+(declared **318/554** operations across 203 paths, tier-1 **78/78 paths,
+129/129 operations**; documented warns: GET /user 401, GET /signing-key.gpg/.pub
+404); `node scripts/check-contract-frozen.mjs` **PASS** (sha256
+`529a3314…bd4` matches the frozen README and the pinned submodule swagger
+verbatim); `vitest run --maxWorkers=8` **2437 passed / 5 skipped, 103 files
+passed + 1 skipped (104), 85.5 s**. Honesty note: the FIRST full-suite run at
+8 workers reported 41 failures — every one a 5000 ms test timeout (workerd/D1/DO
+simulation contention on a busy box, 16 workerd processes); all affected files
+re-pass in isolation (spot-checked 128/128 across the five heaviest) and the
+immediate full-suite re-run was fully green with zero timeouts. No logic
+failures anywhere; recorded as load flake, not a gate waiver.
+
+`pnpm smoke` equivalent (`deploy-smoke.mjs`, fresh mint-per-run PAT,
+`--user p0probe`, with `--migrate-check`): **6 pass / 0 fail / 1 skip**
+(bench-report not requested). Verbatim: `[pass] push-lsremote — pushed
+65b8aaddc1…, authed ls-remote sees refs/heads/main, anonymous advert 401
+Basic challenge`; `[pass] cleanup — repo p0probe/smoke-195c2dbe deleted`;
+`[pass] migrate-check — all 19 expected tables present (+33 system/aux …)`.
+The smoke repo and its refs are gone; the anon × private fetch still answers
+**401 Basic challenge** (ACL row #2 holds).
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`,
+results **unchanged** vs all prior tables — recorded for the
+same-deployment-state condition):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1` (HEAD c3); `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean |
+
+Production bench spot (`bench-run.mjs --compare m2 --sizes 5m --base-url
+<prod> --token <PAT> --user p0probe --remote --yes`): **RUNNABLE, exit 0,
+report-only** (NOT baseline-comparable: remote includes network RTT/TLS/CDN
+variance; gate skipped, no baseline read or written). Numbers:
+`clone 7081.31 ms (0.76 MiB/s, 5,694,917 B received) | push 2156.8 ms
+(519 B) | fetch incremental 1844.45 ms / 1423 B (ratio 0.00025) | info/refs
+p50 310.34 ms / p95 586.61 ms`. Results:
+`.bench-results/bench-compare-m2-2026-10-25T11-15-05-008Z.json`; fixture repo
+`p0probe/bench-5m-5224c237` DELETEd after (204, GET-after 404); remote D1
+counts **zero** `bench-5m-*`/`smoke-*` repos after.
+`p0probe/p0-shallow` remains live intentionally (reviewer re-run repo).
+
+Credential hygiene (standing rule): three mint-per-run PATs this run (smoke,
+probes, bench — rows 13, 14, 15 in `personal_access_tokens`, all minted via
+`bootstrap-admin.mjs p0probe --remote`), each captured to a 0600 temp file,
+never echoed to agent logs, and each DELETEd at the end of its use;
+`SELECT COUNT(*)` for the p0probe join afterwards: **0 rows remain**.
