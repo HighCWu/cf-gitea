@@ -120,6 +120,21 @@ const FIXTURE_REPO = `bench${RUN_TAG}data`;
  *  owner namespace — the fixture repo lives under the same owner). */
 const SETTLE_PREFIX = `stl${RUN_TAG.slice(0, 6)}`;
 
+/** Regression bound for the list phase, in metered rows_read per CANDIDATE
+ *  issue (bench-only — see the assertion in the list test). Measured shape,
+ *  2026-10-25 at the default ops: ~14.5 rows/candidate (page pipeline ~8.7 —
+ *  join probes + the full-candidate ORDER BY enumeration — plus the count's
+ *  ~5.8 re-enumeration). A candidate-replacing rewrite must beat this, not
+ *  regress it (the GROUP BY derived-join variant measured ~16.3 — worse:
+ *  D1 meters the per-statement comments materialization, and correlated
+ *  subquery reads are invisible to the meter either way). 15.5 sits ~7%
+ *  above the measured band with rows_read deterministic run-to-run. */
+const LIST_ROWS_READ_PER_CANDIDATE_BOUND = 15.5;
+/** The candidate set at list time: the fixture repo's issues plus every
+ *  issue the `issues` workload created before this phase runs (its warmup
+ *  plus one op per phase: seq + the two parallelism levels). */
+const LIST_CANDIDATES = 120 + WARMUP_OPS + OPS * (PARALLELISM.length + 1);
+
 // ---------------------------------------------------------------------------
 // Metering D1 wrapper — accumulates rows_read/rows_written across the phase's
 // statements. Two paths, because drizzle's driver splits them:
@@ -781,6 +796,15 @@ describe.skipIf(!BENCH_ENABLED)("D1 metadata-plane bench", () => {
       RESULTS.push(await runPhase("list", `p${p}`, OPS, p, op, meter));
     }
     for (const m of RESULTS.slice(-3)) printPhase(m);
+    // Regression bound (bench-only — plain `pnpm test` never executes this
+    // file): metered rows_read must stay within the measured per-candidate
+    // band for the derived-thread page+count pair. The correlated comments
+    // probes are meter-blind (they run against comments_issue_covering_idx,
+    // migration 0017), so this bounds the JOIN pipeline: a rewrite that
+    // inflates it (e.g. a derived-table materialization per statement) trips.
+    for (const m of RESULTS.filter((phase) => phase.workload === "list")) {
+      expect(m.rowsRead / m.ops).toBeLessThan(LIST_CANDIDATES * LIST_ROWS_READ_PER_CANDIDATE_BOUND);
+    }
   }, 600_000);
 
   // -- (e) team-access predicate read ----------------------------------------

@@ -481,6 +481,12 @@ export const comments = sqliteTable(
   },
   (t) => [
     index("comments_issue_idx").on(t.issueId),
+    // Covering index for the per-issue comment aggregates the derived-thread
+    // notifications page probes (last foreign-authored activity +
+    // comment-participant existence, 7 correlated evaluations per candidate
+    // row across the page+count pair): issue_id equality + the poster filter
+    // + the timestamp payload, so each probe reads index-only entries.
+    index("comments_issue_covering_idx").on(t.issueId, t.posterId, t.updatedAt, t.createdAt),
     index("comments_ref_issue_idx").on(t.refIssueId),
     index("comments_ref_repo_idx").on(t.refRepoId),
   ],

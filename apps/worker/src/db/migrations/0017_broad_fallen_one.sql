@@ -1,0 +1,1 @@
+CREATE INDEX `comments_issue_covering_idx` ON `comments` (`issue_id`,`poster_id`,`updated_unix`,`created_unix`);
