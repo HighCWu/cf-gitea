@@ -94,7 +94,7 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // userListFollowing / userCheckFollowing) — requireAuth per the upstream
   // reqToken() at the whole /users group.
   registerFollowRoutes(app, requireAuth);
-  registerMirrorRoutes(app, requireAuth); // SPEC-0009 mirror family (non-contract)
+  registerMirrorRoutes(app, requireAuth); // SPEC-0009 mirror family (repo-scoped non-contract pairs + the declared contract route POST /repos/migrate, 0fe6b04)
   registerUserReposRoutes(app, requireAuth, optionalAuth);
   // Issue routes register BEFORE the repo-metadata routes: the static
   // `/repos/issues/search` path must win over the same-shape

@@ -100,9 +100,14 @@
  *   Honest readings from the first run: local D1 serializes writers, so
  *   parallelism (p8/p32) buys ~nothing in throughput for the write workloads
  *   (settle/issues) — it only pools per-op latency. The heavy finding is the
- *   list page: ~10.6k rows_read per op (the derived-thread lastActivity
- *   correlated subquery over every candidate issue) — ~2.1M rows per 200-op
- *   phase, and per-op p50 at concurrency grows into the seconds locally.
+ *   list page: ~10.6k rows_read per op. ATTRIBUTION CORRECTED (the
+ *   list-opt wave's ablation probes, aaf1abd): D1 does NOT meter
+ *   correlated-subquery reads — the metered total is the outer join
+ *   pipeline (join probes + the full-candidate ORDER BY enumeration +
+ *   the count's re-enumeration), not the lastActivity subqueries. The
+ *   covering index (comments_issue_covering_idx, 0017) made the probes
+ *   index-only and improved wall latency ~13% p50 without moving the
+ *   meter — the meter's bound (15.5× candidates) guards the JOIN shape.
  *   rows_read/rows_written are per-phase totals: writes/batches captured
  *   live, SELECTs via the untimed post-phase replay (see the harness's
  *   metering notes); phases are deterministic enough that both phase arms of
