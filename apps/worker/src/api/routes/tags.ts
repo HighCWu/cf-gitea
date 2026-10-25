@@ -21,8 +21,10 @@ import { toAnnotatedTag, toTag } from "../services/git-models";
 import { annotatedTagSchema, createTagOptionSchema, tagSchema } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { assertNotArchived, canWriteRepository, requireVisibleRepo } from "../services/repo-access";
-import { viewerOf } from "../services/repository";
+import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
 import { serializeTag } from "@cf-gitea/git-engine";
+import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
+import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
 
 /**
  * Tier-1 tag routes (SPEC-0004 §2.4 rows repoListTags / repoCreateTag /
@@ -47,9 +49,25 @@ import { serializeTag } from "@cf-gitea/git-engine";
  * Documented deviation (services/git-models.ts toTag/toAnnotatedTag): the tag
  * message and tagger render "" / null — annotated-tag object bytes are
  * engine-resident and the landed public RPC surface exposes targets + the
- * peel cache only. Webhook fan-out (create/delete ref events) is the push
- * pipeline's job upstream; the API-side writes do not fan out yet
- * (SPEC-0005 §3.5 gap).
+ * peel cache only.
+ *
+ * Webhook fan-out (the `create`/`delete` ref events): the CREATE and DELETE
+ * handlers emit through the landed emitWebhookDeliveries pipeline — the
+ * API-side half of upstream's ref-family notifications, whose git-push and
+ * mirror halves already emit via emitPushFamilyUpdates. Payloads are the
+ * upstream renderers verbatim (services/webhook/notifier.go): CreatePayload
+ * (CreateRef:821→:830 — ref = the SHORT tag name, ref_type "tag", sha = the
+ * created ref's tip) and DeletePayload (DeleteRef:858→:870 — pusher_type
+ * "user"). The sender is the authenticated API caller (upstream's `pusher`
+ * doer); the repository renders with the caller's viewer, like every
+ * api-routes emission. The annotated-tag `sha` is the TAG OBJECT oid — the
+ * ref tip `Sha: refID` actually carries (the push path's semantics, identical
+ * to what emitPushFamilyUpdates emits for a pushed annotated tag); upstream's
+ * own API path passes the pre-peel target commit instead (release.go:136
+ * resolves GetCommit(target) before CreateAnnotatedTag) — a quirk we do not
+ * copy. Upstream's API tag create/delete additionally fire a `push` event
+ * around the create/delete pair (release.go:134-137, 400-404) — out of this
+ * wave's scope (create/delete only), noted as the remaining sub-gap.
  */
 
 const notFoundResponse = {
@@ -114,6 +132,72 @@ async function hasRelease(d1: D1Database, repoId: string, tagName: string): Prom
     .limit(1)
     .then((rows) => rows[0]);
   return row !== undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Webhook triggers — the routes/releases.ts emit pattern (the per-file twin
+// of the branches route's helper; the api-routes emission family keeps its
+// queue probe + error sink file-local): the delivery-row insert runs INLINE
+// after the ref mutation committed; only the Queue producer ({deliveryId}
+// batch) hangs off the executionCtx-guarded waitUntil — in-process callers
+// (tests via app.request) have no executionCtx, skip the enqueue, and leave
+// the rows `pending`. Failures are logged, never propagated — a webhook miss
+// can never fail the API write (§3.5's post-commit posture).
+// ---------------------------------------------------------------------------
+
+/** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired. */
+function webhookDeliveryQueue(
+  env: ApiEnv["Bindings"],
+): { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null {
+  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
+  if (candidate === undefined || candidate === null) return null;
+  const queue = candidate as { sendBatch?: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> };
+  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Fan one committed tag ref write out as a `create`/`delete` event. `refName`
+ * is the FULL ref, matching what the push family passes to the branch filter
+ * (emitPushFamilyUpdates); the payload itself carries upstream's SHORT name.
+ */
+async function emitRefWebhook(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  eventType: Extract<HookEventType, "create" | "delete">,
+  payload: unknown,
+  refName: string,
+): Promise<void> {
+  let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+  try {
+    execCtx = c.executionCtx;
+  } catch {
+    execCtx = undefined; // in-process caller (tests): no execution context
+  }
+  const queue = webhookDeliveryQueue(c.env);
+  try {
+    await emitWebhookDeliveries(
+      c.env.DB,
+      { repoId: pair.repo.id, ownerId: pair.repo.ownerId, eventType, payload, refName },
+      {
+        enqueue:
+          queue !== null && execCtx !== undefined
+            ? (deliveryIds) => {
+                execCtx.waitUntil(
+                  queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(undefined, (error: unknown) => {
+                    console.error(`[tags] delivery enqueue failed (${eventType}): ${errorMessage(error)}`);
+                  }),
+                );
+              }
+            : undefined,
+      },
+    );
+  } catch (error) {
+    console.error(`[tags] webhook fan-out failed (${eventType}): ${errorMessage(error)}`);
+  }
 }
 
 export function registerTagRoutes(
@@ -269,6 +353,25 @@ export function registerTagRoutes(
         throw commitApiChangeError(result);
       }
 
+      // Upstream CreateRef (notifier.go:821→:830): ref is the SHORT tag name
+      // (never an oid — the annotated peel stays out of `ref`), ref_type
+      // "tag", sha the created ref's tip — the TAG OBJECT oid for the
+      // annotated case (newTarget), matching the push family's create
+      // payloads for the same action; the sender is the authenticated caller.
+      await emitRefWebhook(
+        c,
+        pair,
+        "create",
+        {
+          sha: newTarget,
+          ref: name,
+          ref_type: "tag",
+          repository: toApiRepository(viewerOf(c), pair),
+          sender: c.get("authUser") ?? null,
+        },
+        tagRef(name),
+      );
+
       const viewer = viewerOf(c);
       return c.json(
         toTag(
@@ -370,6 +473,24 @@ export function registerTagRoutes(
       if (result.tag !== "deleted") {
         const error = deleteApiRefError(result);
         if (error !== null) throw error;
+      }
+      // Upstream DeleteRef (notifier.go:858→:870): pusher_type is always
+      // "user" (api.PusherTypeUser). The idempotent already-absent arm
+      // (deleteApiRefError's null) removed nothing — no event for it.
+      if (result.tag === "deleted") {
+        await emitRefWebhook(
+          c,
+          pair,
+          "delete",
+          {
+            ref: tagName,
+            ref_type: "tag",
+            pusher_type: "user",
+            repository: toApiRepository(viewerOf(c), pair),
+            sender: c.get("authUser") ?? null,
+          },
+          tagRef(tagName),
+        );
       }
       return c.body(null, 204);
     },

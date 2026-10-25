@@ -26,7 +26,9 @@ import {
   canWriteRepository,
   requireVisibleRepo,
 } from "../services/repo-access";
-import { viewerOf } from "../services/repository";
+import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
+import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
+import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
 import type { MiddlewareHandler } from "hono";
 
 /**
@@ -56,8 +58,20 @@ import type { MiddlewareHandler } from "hono";
  * the handlers can still emit (undeclared; the orchestrator-owned
  * RUNTIME_ONLY_RESPONSES tables are not extended by this batch): 404 on the
  * branches LIST for an invisible repository (upstream repo-group middleware).
- * Webhook fan-out (create/delete ref events) rides the push pipeline upstream;
- * the API-side ref writes do not fan out yet — documented SPEC-0005 §3.5 gap.
+ *
+ * Webhook fan-out (the `create`/`delete` ref events): the CREATE and DELETE
+ * handlers emit through the landed emitWebhookDeliveries pipeline — the
+ * API-side half of upstream's ref-family notifications, whose git-push and
+ * mirror halves already emit via emitPushFamilyUpdates. Payloads are the
+ * upstream renderers verbatim (services/webhook/notifier.go): CreatePayload
+ * (CreateRef:821→:830 — sha = the created ref's tip, ref = the SHORT name,
+ * ref_type "branch") and DeletePayload (DeleteRef:858→:870 — pusher_type
+ * "user"). The sender is the authenticated API caller (upstream's `pusher`
+ * doer); the repository renders with the caller's viewer, like every
+ * api-routes emission. Upstream additionally fires CreateRef+DeleteRef on
+ * branch RENAME (services/repository/branch.go:493-494) — the PATCH handler
+ * below stays silent (its own wave; the create-then-delete pair would need
+ * order + failure nuance).
  */
 
 const notFoundResponse = {
@@ -122,6 +136,73 @@ async function renderBranch(c: Context<ApiEnv>, pair: Parameters<typeof toBranch
     viewer,
     pair,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Webhook triggers — the routes/releases.ts emit pattern: the delivery-row
+// insert runs INLINE after the ref mutation committed (upstream CreateHookTask
+// is synchronous too); only the Queue producer ({deliveryId} batch) hangs off
+// the executionCtx-guarded waitUntil — in-process callers (tests via
+// app.request) have no executionCtx, skip the enqueue, and leave the rows
+// `pending`. Failures are logged, never propagated — a webhook miss can never
+// fail the API write (§3.5's post-commit posture).
+// ---------------------------------------------------------------------------
+
+/** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired. */
+function webhookDeliveryQueue(
+  env: ApiEnv["Bindings"],
+): { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null {
+  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
+  if (candidate === undefined || candidate === null) return null;
+  const queue = candidate as { sendBatch?: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> };
+  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Fan one committed branch ref write out as a `create`/`delete` event (the
+ * per-file twin of the tags route's helper — the api-routes emission family
+ * keeps its queue probe + error sink file-local). `refName` is the FULL ref,
+ * matching what the push family passes to the branch filter
+ * (emitPushFamilyUpdates); the payload itself carries upstream's SHORT name.
+ */
+async function emitRefWebhook(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  eventType: Extract<HookEventType, "create" | "delete">,
+  payload: unknown,
+  refName: string,
+): Promise<void> {
+  let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+  try {
+    execCtx = c.executionCtx;
+  } catch {
+    execCtx = undefined; // in-process caller (tests): no execution context
+  }
+  const queue = webhookDeliveryQueue(c.env);
+  try {
+    await emitWebhookDeliveries(
+      c.env.DB,
+      { repoId: pair.repo.id, ownerId: pair.repo.ownerId, eventType, payload, refName },
+      {
+        enqueue:
+          queue !== null && execCtx !== undefined
+            ? (deliveryIds) => {
+                execCtx.waitUntil(
+                  queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(undefined, (error: unknown) => {
+                    console.error(`[branches] delivery enqueue failed (${eventType}): ${errorMessage(error)}`);
+                  }),
+                );
+              }
+            : undefined,
+      },
+    );
+  } catch (error) {
+    console.error(`[branches] webhook fan-out failed (${eventType}): ${errorMessage(error)}`);
+  }
 }
 
 export function registerBranchRoutes(
@@ -251,6 +332,22 @@ export function registerBranchRoutes(
       if (branch === null) {
         throw new ApiError(500, "");
       }
+      // Upstream CreateRef (notifier.go:821→:830): sha is the created ref's
+      // tip, ref the SHORT branch name, ref_type "branch"; the sender is the
+      // authenticated caller (upstream's `pusher` doer).
+      await emitRefWebhook(
+        c,
+        pair,
+        "create",
+        {
+          sha: source.target,
+          ref: newName,
+          ref_type: "branch",
+          repository: toApiRepository(viewerOf(c), pair),
+          sender: c.get("authUser") ?? null,
+        },
+        branchRef(newName),
+      );
       return c.json(branch, 201);
     },
     bindValidationHook,
@@ -421,6 +518,24 @@ export function registerBranchRoutes(
       if (result.tag !== "deleted") {
         const error = deleteApiRefError(result);
         if (error !== null) throw error;
+      }
+      // Upstream DeleteRef (notifier.go:858→:870): pusher_type is always
+      // "user" (api.PusherTypeUser). The idempotent already-absent arm
+      // (deleteApiRefError's null) removed nothing — no event for it.
+      if (result.tag === "deleted") {
+        await emitRefWebhook(
+          c,
+          pair,
+          "delete",
+          {
+            ref: branchName,
+            ref_type: "branch",
+            pusher_type: "user",
+            repository: toApiRepository(viewerOf(c), pair),
+            sender: c.get("authUser") ?? null,
+          },
+          branchRef(branchName),
+        );
       }
       return c.body(null, 204);
     },

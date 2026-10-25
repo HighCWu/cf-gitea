@@ -16,8 +16,10 @@
  * chain) / delete (204, release-coupled 409, empty-repo 405), the contents
  * union shapes (object vs array), the write family through the commit builder
  * (create 201 / update 200-vs-201 / delete 200 / batch / new_branch), raw's
- * legacy {ref}/{filepath} parsing, editorconfig section resolution, and the
- * issue-template front-matter read.
+ * legacy {ref}/{filepath} parsing, editorconfig section resolution, the
+ * issue-template front-matter read, and the API-side create/delete ref
+ * webhook emissions (upstream CreateRef/DeleteRef shapes, push-only-hook
+ * silence).
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -29,7 +31,7 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { repositories, users } from "../db/schema";
+import { repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
@@ -590,5 +592,137 @@ describe("editorconfig + issue_templates", () => {
     expect(templates[0]?.name).toBe("Bug report");
     expect(templates[0]?.labels).toEqual(["bug"]);
     expect(templates[0]?.assignees).toEqual(["apisuite"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// API branch/tag create+delete webhook emissions (upstream CreateRef:821→:830
+// / DeleteRef:858→:870) — the API-side half of the ref-family events, through
+// the landed emitWebhookDeliveries pipeline (event-type config gates incl.
+// the push-only flag, branch filter). Each test seeds its own hook rows, so
+// `deliveriesFor(hookId)` sees only its own fan-out.
+// ---------------------------------------------------------------------------
+
+/** Active webhook with the given subscription config — the fan-out matcher target. */
+async function seedHook(repoId: string, config: Record<string, unknown>): Promise<number> {
+  const rows = await drizzle(env.DB)
+    .insert(webhooks)
+    .values({
+      repoId,
+      url: "https://hooks.invalid/engine-ref-events",
+      events: JSON.stringify(config),
+      isActive: true,
+      type: "gitea",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning({ id: webhooks.id })
+    .all();
+  const row = rows[0];
+  if (row === undefined) throw new Error("hook seed failed");
+  return row.id;
+}
+
+type DeliveryRow = typeof webhookDeliveries.$inferSelect;
+
+async function deliveriesFor(hookId: number): Promise<DeliveryRow[]> {
+  return drizzle(env.DB).select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
+}
+
+describe("API branch/tag create+delete webhook emissions (ref events)", () => {
+  async function repoId(): Promise<string> {
+    const row = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, SLUG)).get();
+    if (row === undefined) throw new Error("seed repo missing");
+    return row.id;
+  }
+
+  it("emits `create` (ref_type branch, SHORT ref name) on POST /branches; a push-only hook stays silent", async () => {
+    const id = await repoId();
+    const createHook = await seedHook(id, { choose_events: true, branch_filter: "*", events: { create: true } });
+    const pushOnlyHook = await seedHook(id, { push_only: true });
+
+    const res = await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "hooked-br", old_ref_name: TIP1 }));
+    expect(res.status).toBe(201);
+
+    const deliveries = await deliveriesFor(createHook);
+    expect(deliveries).toHaveLength(1);
+    const delivery = deliveries[0]!;
+    expect(delivery.eventType).toBe("create");
+    expect(delivery.eventGroup).toBe("create"); // not in EVENT_GROUPS → identity group
+    expect(delivery.repoId).toBe(id);
+    expect(delivery.state).toBe("pending"); // in-process tests skip the Queue enqueue
+    const payload = JSON.parse(delivery.payloadContent) as Record<string, unknown>;
+    // §2.7 CreatePayload (hook.go:206): sha/ref/ref_type/repository/sender.
+    expect(Object.keys(payload).sort()).toEqual(["ref", "ref_type", "repository", "sender", "sha"]);
+    expect(payload.ref).toBe("hooked-br"); // the SHORT name (notifier.go:825), never the full ref
+    expect(payload.ref_type).toBe("branch");
+    expect(payload.sha).toBe(TIP1); // the created ref's tip (pinned old_ref_name)
+    expect(payload.sender).toMatchObject({ login: OWNER }); // the authenticated caller
+    expect(payload.repository).toMatchObject({ full_name: `${OWNER}/${SLUG}` });
+    expect(delivery.payloadContent).toContain('\n  "ref_type": "branch"'); // §2.7 2-space bytes
+    expect(await deliveriesFor(pushOnlyHook)).toHaveLength(0); // the push-only gate silences ref events
+  });
+
+  it("emits `delete` (pusher_type user, no sha) on DELETE /branches/{branch}", async () => {
+    const id = await repoId();
+    const deleteHook = await seedHook(id, { choose_events: true, branch_filter: "*", events: { delete: true } });
+
+    expect((await send(`${REPO_PATH}/branches/hooked-br`, authed({ method: "DELETE" }))).status).toBe(204);
+
+    const deliveries = await deliveriesFor(deleteHook);
+    expect(deliveries).toHaveLength(1);
+    const delivery = deliveries[0]!;
+    expect(delivery.eventType).toBe("delete");
+    expect(delivery.eventGroup).toBe("delete");
+    const payload = JSON.parse(delivery.payloadContent) as Record<string, unknown>;
+    // §2.7 DeletePayload (hook.go:253): ref/ref_type/pusher_type/repository/sender — no sha.
+    expect(Object.keys(payload).sort()).toEqual(["pusher_type", "ref", "ref_type", "repository", "sender"]);
+    expect(payload.ref).toBe("hooked-br");
+    expect(payload.ref_type).toBe("branch");
+    expect(payload.pusher_type).toBe("user"); // api.PusherTypeUser (notifier.go:864)
+    expect(payload.sender).toMatchObject({ login: OWNER });
+  });
+
+  it("emits tag `create` with the ANNOTATED object oid as sha and the tag NAME as ref", async () => {
+    const id = await repoId();
+    const createHook = await seedHook(id, { choose_events: true, branch_filter: "*", events: { create: true } });
+
+    const res = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "hooked-tag", message: "hooked\n", target: TIP1 }));
+    expect(res.status).toBe(200);
+    const tag = await jsonBody(res);
+
+    const deliveries = await deliveriesFor(createHook);
+    expect(deliveries).toHaveLength(1);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual(["ref", "ref_type", "repository", "sender", "sha"]);
+    expect(payload.ref).toBe("hooked-tag"); // the tag NAME — never a peeled oid (notifier.go:825)
+    expect(payload.ref_type).toBe("tag");
+    expect(payload.sha).toBe(tag.id); // the annotated TAG OBJECT oid — the ref tip, what the push family emits too
+    expect(payload.sha).not.toBe(TIP1); // ...not the peeled commit
+  });
+
+  it("emits tag `delete` (pusher_type user) on DELETE /tags/{tag}; push-only hooks stay silent", async () => {
+    const id = await repoId();
+    const deleteHook = await seedHook(id, { choose_events: true, branch_filter: "*", events: { delete: true } });
+    const pushOnlyHook = await seedHook(id, { push_only: true });
+
+    // a LIGHTWEIGHT tag this time (sha = the commit oid) — the delete event is name-shaped either way
+    const created = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "hooked-lw", target: TIP1 }));
+    expect(created.status).toBe(200);
+    expect(await deliveriesFor(deleteHook)).toHaveLength(0); // not subscribed to `create`
+
+    expect((await send(`${REPO_PATH}/tags/hooked-lw`, authed({ method: "DELETE" }))).status).toBe(204);
+
+    const deliveries = await deliveriesFor(deleteHook);
+    expect(deliveries).toHaveLength(1);
+    const delivery = deliveries[0]!;
+    expect(delivery.eventType).toBe("delete");
+    expect(delivery.eventGroup).toBe("delete");
+    const payload = JSON.parse(delivery.payloadContent) as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual(["pusher_type", "ref", "ref_type", "repository", "sender"]);
+    expect(payload.ref).toBe("hooked-lw");
+    expect(payload.ref_type).toBe("tag");
+    expect(payload.pusher_type).toBe("user");
+    expect(await deliveriesFor(pushOnlyHook)).toHaveLength(0); // the push-only gate silences ref events
   });
 });
