@@ -13,13 +13,61 @@
  *                             started). Without it the runner spawns its own
  *                             `pnpm dev` (vite, 127.0.0.1:5173), waits for
  *                             /healthz, and kills it when done.
- *     --token <t>             push/delete auth token (default "devtoken", the
- *                             .dev.vars.example value; reads are public)
+ *     --token <t>             push/delete auth credential (default "devtoken",
+ *                             the .dev.vars.example GIT_TOKEN; local reads are
+ *                             public so only the push needs it)
+ *     --user <name>           PRODUCTION MODE: create-by-push the fixtures
+ *                             into this user's namespace (the token's own
+ *                             user, deploy-smoke conventions). Requires an
+ *                             explicit --token. Repo names become
+ *                             bench-<size>-<hex> (unique per run, like the
+ *                             smoke's). Measured read legs authenticate with
+ *                             the same credential — push-created repos are
+ *                             PRIVATE by default (DefaultPushCreatePrivate).
+ *     --public-fixtures       with --user: flip each fixture repo public via
+ *                             PATCH /api/v1/repos/<owner>/<repo> right after
+ *                             the push; the measured clone/fetch/info-refs
+ *                             legs then run ANONYMOUS (same traffic shape as
+ *                             the local baseline). The push stays
+ *                             authenticated. Minimal honest trade-off: either
+ *                             you measure the real private-repo auth path
+ *                             (default) or the public-read path this flag
+ *                             selects — never an anonymous read of a private
+ *                             repo (that is a 401, not a number).
+ *     --remote                REQUIRED for a non-localhost --base-url:
+ *                             acknowledges the run meters real production
+ *                             quota. Prints the estimated fixture size and
+ *                             honors a 5s Ctrl-C grace before starting
+ *                             unless --yes is passed.
+ *     --yes                   skip the --remote 5s grace window
  *     --runs <n>              info/refs sample count (default 50)
  *     --baseline-dir <dir>    baseline location (default scripts/bench-baselines)
  *     --results-dir <dir>     transient results dir (default .bench-results)
  *     --fixtures-dir <dir>    fixture location (default .bench-fixtures)
  *     --force                 --record: overwrite an existing baseline
+ *
+ * PRODUCTION MODE (non-local --base-url targets)
+ *   Remote runs consume real quota (Worker requests, D1 writes, R2 storage),
+ *   so three guards hold, enforced before any network I/O:
+ *     (1) --remote must be passed explicitly; the run then prints a fixture
+ *         size estimate (manifests when present, nominal targets otherwise)
+ *         and waits 5s unless --yes.
+ *     (2) --user <name> is required: fixtures create-by-push into the token's
+ *         own user namespace. The historical fixed `bench` namespace does not
+ *         exist in production and 404s (recorded 2026-10-25, p0-evidence), so
+ *         it is local-only. Names are unique per run (bench-<size>-<hex>) so
+ *         repeat runs never collide with leftovers. Fixtures are LEFT BEHIND
+ *         on the target by design (same as the smoke's failure path) — see
+ *         sizes.*.remote_repo in the results JSON; DELETE them when desired.
+ *     (3) --record is refused outright: BASELINES ARE LOCAL-ONLY.
+ *
+ * BASELINE POLICY
+ *   scripts/bench-baselines/ holds LOCAL workerd numbers only (CI and the m2
+ *   gate compare local vs local). Any non-localhost --base-url run is NOT
+ *   baseline-comparable — network variance (RTT, TLS, CDN) dwarfs the
+ *   regressions this gate exists to catch — so a remote run never reads a
+ *   baseline, never writes one, never gates: --compare is report-only (exit 0)
+ *   with a clear "not baseline-comparable" banner, --record exits 2.
  *
  * MODES
  *   --record <milestone>  runs the suite and writes
@@ -68,9 +116,10 @@
  * FIXTURES
  *   Reuses .bench-fixtures/<size>/ when manifest.json exists (determinism:
  *   never regenerates). Only a missing manifest invokes
- *   scripts/gen-bench-fixtures.mjs for that size. Repos are exercised as
- *   `bench/bench-<size>` on the target (create-by-push, wiped with a DELETE
- *   first for a clean slate).
+ *   scripts/gen-bench-fixtures.mjs for that size. Locally (no --user) repos
+ *   are exercised as `bench/bench-<size>` (create-by-push, wiped with a DELETE
+ *   first for a clean slate); in production mode they are
+ *   `<--user>/bench-<size>-<hex>` — see PRODUCTION MODE above.
  *
  * OUTPUT
  *   Full results JSON -> <results-dir>/bench-<mode>-<milestone|run>-<ts>.json
@@ -83,6 +132,7 @@
 import { spawn } from "node:child_process";
 import console from "node:console";
 import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import http from "node:http";
@@ -100,7 +150,11 @@ const SCHEMA_VERSION = 1;
 const REGRESSION_THRESHOLD = 0.1; // >10% delta counts as a regression (SPEC-0001 §9)
 const INFOREFS_WARMUPS = 3;
 const SERVER_WAIT_MS = 90_000;
-const OWNER = "bench";
+const OWNER = "bench"; // LOCAL-dev namespace only (engine GIT_TOKEN path — no D1 user needed); production requires --user (see PRODUCTION MODE)
+// Targets whose numbers are baseline-eligible: same-host workerd, no network hop.
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const SIZE_MULT = { k: 1024, m: 1024 ** 2, g: 1024 ** 3 };
+const REMOTE_GRACE_MS = 5_000;
 // Metrics where "higher is better"; everything else recorded here is gated as
 // lower-is-better. Unknown future keys (e.g. filled internal.* counters) fall
 // through to lower-is-better, which is right for cpu/memory/subrequest counts.
@@ -112,9 +166,44 @@ const usageExit = (msg) => {
   if (msg) console.error(`error: ${msg}`);
   console.error("usage: node scripts/bench-run.mjs --record <milestone> | --compare <milestone> [options]\n" +
     "  --sizes 5m[,42m,500m]  --base-url <url>  --token <t>  --runs <n>\n" +
-    "  --baseline-dir <dir>  --results-dir <dir>  --fixtures-dir <dir>  --force");
+    "  --baseline-dir <dir>  --results-dir <dir>  --fixtures-dir <dir>  --force\n" +
+    "  production mode: --user <name>  [--public-fixtures]  --remote  --yes");
   process.exit(2);
 };
+
+function isLocalTarget(baseUrl) {
+  if (!baseUrl) return true; // no --base-url: the runner spawns its own local dev server
+  try {
+    return LOCAL_HOSTNAMES.has(new URL(baseUrl).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+/** Nominal byte target of a size label (5m -> 5 MiB); 0 when unparseable. */
+function sizeTargetBytes(label) {
+  const m = /^(\d+)(k|m|g)$/.exec(label);
+  return m === null ? 0 : Number(m[1]) * SIZE_MULT[m[2]];
+}
+
+/** Best-effort per-size fixture pack estimate for the --remote guard message:
+ *  the manifest's actual pack size when the fixture was already generated,
+ *  otherwise the nominal target. Synchronous on purpose — it runs in argument
+ *  validation, before any network I/O. */
+function estimateFixtureBytes(sizes, fixturesDir) {
+  const per = [];
+  let total = 0;
+  for (const size of sizes) {
+    let bytes = sizeTargetBytes(size);
+    try {
+      const manifest = JSON.parse(fs.readFileSync(path.join(fixturesDir, size, "manifest.json"), "utf8"));
+      if (typeof manifest.actual_pack_bytes === "number") bytes = manifest.actual_pack_bytes;
+    } catch { /* nominal target */ }
+    per.push([size, bytes]);
+    total += bytes;
+  }
+  return { per, total };
+}
 
 function parseArgs(argv) {
   const opts = {
@@ -123,6 +212,11 @@ function parseArgs(argv) {
     sizes: ["5m"],
     baseUrl: null,
     token: "devtoken",
+    tokenGiven: false,
+    user: null,
+    publicFixtures: false,
+    remote: false,
+    yes: false,
     runs: 50,
     baselineDir: path.join(repoRoot, "scripts", "bench-baselines"),
     resultsDir: path.join(repoRoot, ".bench-results"),
@@ -140,7 +234,13 @@ function parseArgs(argv) {
       opts.milestone = next();
     } else if (a === "--sizes") opts.sizes = next().split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
     else if (a === "--base-url") opts.baseUrl = next().replace(/\/+$/, "");
-    else if (a === "--token") opts.token = next();
+    else if (a === "--token") {
+      opts.token = next();
+      opts.tokenGiven = true;
+    } else if (a === "--user") opts.user = next();
+    else if (a === "--public-fixtures") opts.publicFixtures = true;
+    else if (a === "--remote") opts.remote = true;
+    else if (a === "--yes") opts.yes = true;
     else if (a === "--runs") opts.runs = Number(next());
     else if (a === "--baseline-dir") opts.baselineDir = path.resolve(next());
     else if (a === "--results-dir") opts.resultsDir = path.resolve(next());
@@ -160,6 +260,42 @@ function parseArgs(argv) {
     if (!/^(\d+)(k|m|g)$/.test(s)) usageExit(`bad size "${s}" (expected forms like 5m, 42m, 500m)`);
   }
   if (opts.sizes.length === 0) usageExit("--sizes resolved to nothing");
+  if (opts.user !== null && !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,38}$/.test(opts.user)) {
+    usageExit(`bad --user "${opts.user}" (letters, digits, dot, dash, underscore; <= 39 chars)`);
+  }
+
+  // ---- production-mode guards (before ANY network I/O; see header) ----
+  const remoteTarget = !isLocalTarget(opts.baseUrl);
+  if (remoteTarget && !opts.remote) {
+    const est = estimateFixtureBytes(opts.sizes, opts.fixturesDir);
+    usageExit(
+      `--base-url ${opts.baseUrl} is a non-local target: a production run meters real quota ` +
+      `(Worker requests, D1 writes, R2 storage — fixture packs ~${fmtMiB(est.total)} for the requested ` +
+      `size(s), roughly 3-4x that on the wire across the push/clone/fetch legs, plus ` +
+      `${opts.runs + INFOREFS_WARMUPS} info/refs request(s) per size). ` +
+      "Re-run with --remote to acknowledge, --yes to skip the 5s grace, and --user <name> for the fixture namespace.",
+    );
+  }
+  if (remoteTarget && !opts.user) {
+    usageExit(
+      "--user <name> is required for remote targets: fixtures create-by-push into the token's own user " +
+      "namespace. The local 'bench' namespace does not exist in production and its pushes 404 " +
+      "(recorded 2026-10-25 in docs/design/p0-evidence.md).",
+    );
+  }
+  if (opts.user !== null && !opts.tokenGiven) {
+    usageExit("--user requires an explicit --token <PAT>: the namespace owner is the token's user");
+  }
+  if (opts.publicFixtures && !opts.user) {
+    usageExit("--public-fixtures requires --user <name>: the visibility flip authenticates with the token");
+  }
+  if (remoteTarget && opts.mode === "record") {
+    usageExit(
+      "--record is local-only: baselines are recorded from local workerd runs and remote numbers are " +
+      "not baseline-comparable (network variance). Use --compare for a report-only remote run.",
+    );
+  }
+  opts.remote = remoteTarget;
   return opts;
 }
 
@@ -368,11 +504,13 @@ async function cloneMeasured(args, cwd, cloneDir) {
   }
 }
 
-/** Anonymous protocol-v2 advertisement latency over the pushed fixture repo. */
-async function measureInfoRefs(baseUrl, token, size, runs) {
-  const url = `${baseUrl}/${OWNER}/bench-${size}.git/info/refs?service=git-upload-pack`;
+/** Protocol-v2 advertisement latency over the pushed fixture repo. The request
+ *  is authenticated unless the fixture repo is deliberately public
+ *  (--public-fixtures): push-created repos are private-by-default and an
+ *  anonymous read of a private repo is a 401, not a number. */
+async function measureInfoRefs(url, auth, runs) {
   const headers = { "Git-Protocol": "version=2" };
-  if (token) headers.Authorization = `Basic ${Buffer.from(`x:${token}`).toString("base64")}`;
+  if (auth) headers.Authorization = auth;
   for (let i = 0; i < INFOREFS_WARMUPS; i++) await fetch(url, { headers });
   const samples = [];
   for (let i = 0; i < runs; i++) {
@@ -395,28 +533,37 @@ async function measureInfoRefs(baseUrl, token, size, runs) {
 // ---------- one size ----------
 
 async function benchSize({ size, manifest, repoPath }, ctx) {
-  const name = `bench-${size}`;
-  const anonBase = ctx.baseUrl;
-  const authBase = ctx.token
-    ? ctx.baseUrl.replace("://", `://x:${encodeURIComponent(ctx.token)}@`)
-    : ctx.baseUrl;
-  // Measured traffic goes through the byte-counting proxy; the initial
-  // fixture push and the info/refs latency probe stay direct.
-  const anonUrl = `${ctx.proxy.url}/${OWNER}/${name}.git`;
-  const proxyAuthBase = ctx.token
-    ? ctx.proxy.url.replace("://", `://x:${encodeURIComponent(ctx.token)}@`)
-    : ctx.proxy.url;
-  const authPushUrl = `${proxyAuthBase}/${OWNER}/${name}.git`;
+  const name = ctx.repoName;
+  const owner = ctx.owner;
+  // Credential shape: deploy-smoke conventions — pushes authenticate as
+  // `<user>:<token>` in production (create-by-push under the token's own
+  // user), `x:devtoken` against the local engine GIT_TOKEN path.
+  const basicUser = ctx.user ?? "x";
+  const basicHeader = `Basic ${Buffer.from(`${basicUser}:${ctx.token}`).toString("base64")}`;
+  const creds = `${encodeURIComponent(basicUser)}:${encodeURIComponent(ctx.token)}`;
+  const withCreds = (base) => base.replace("://", `://${creds}@`);
+  // Measured read legs: anonymous ONLY when the fixture repo is deliberately
+  // public (--public-fixtures). Production default is fully authenticated
+  // (push-created repos are private, DefaultPushCreatePrivate); local reads
+  // of engine-path repos are public, so local keeps the anonymous shape.
+  const readWithCreds = ctx.user !== null && !ctx.publicFixtures;
+  const pushUrl = withCreds(`${ctx.baseUrl}/${owner}/${name}.git`);
+  const proxyPushUrl = withCreds(`${ctx.proxy.url}/${owner}/${name}.git`);
+  const cloneUrl = readWithCreds
+    ? withCreds(`${ctx.proxy.url}/${owner}/${name}.git`)
+    : `${ctx.proxy.url}/${owner}/${name}.git`;
   // Same client flags as the e2e suite: no credential helper, no detach advice
   // noise on clone.
   const GITC = ["-c", "credential.helper=", "-c", "advice.detachedHead=false"];
   const metrics = {};
   const notes = [];
 
-  // Clean slate: create-by-push below needs the repo absent (repeat runs).
-  await fetch(`${anonBase}/${OWNER}/${name}`, {
+  // Clean slate: create-by-push below needs the repo absent (defensive — the
+  // production names are unique per run, so this DELETE is a 404 no-op unless
+  // a previous attempt with the same tag crashed mid-run).
+  await fetch(`${ctx.baseUrl}/${owner}/${name}`, {
     method: "DELETE",
-    headers: ctx.token ? { Authorization: `Basic ${Buffer.from(`x:${ctx.token}`).toString("base64")}` } : {},
+    headers: ctx.token ? { Authorization: basicHeader } : {},
   }).catch(() => {}); // 404 on first ever run is fine
   // The engine memoizes negative repo lookups for 2s per isolate
   // (INFO_NEG_TTL_MS, packages/git-engine/src/mod.ts): without this settle
@@ -426,33 +573,52 @@ async function benchSize({ size, manifest, repoPath }, ctx) {
   await new Promise((resolve) => setTimeout(resolve, 2500));
 
   // Initial upload of the fixture history (setup, untimed).
-  console.log(`  pushing fixture -> ${OWNER}/${name} (create-by-push)`);
-  await git([...GITC, "push", "-q", authBase + `/${OWNER}/${name}.git`, "main"], { cwd: repoPath });
+  console.log(`  pushing fixture -> ${owner}/${name} (create-by-push)`);
+  await git([...GITC, "push", "-q", pushUrl, "main"], { cwd: repoPath });
+
+  // --public-fixtures: flip the repo public so the measured read legs run
+  // anonymous (same traffic shape as the local baseline). Authenticated API
+  // PATCH, mirroring upstream PATCH /repos/{owner}/{repo} `private` handling.
+  if (ctx.publicFixtures) {
+    const res = await fetch(`${ctx.baseUrl}/api/v1/repos/${owner}/${name}`, {
+      method: "PATCH",
+      headers: { Authorization: basicHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ private: false }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const body = await res.text();
+    if (res.status !== 200) {
+      throw new Error(`--public-fixtures: PATCH /api/v1/repos/${owner}/${name} returned ${res.status}: ${body.slice(0, 200)}`);
+    }
+    notes.push("repo flipped public via PATCH — clone/fetch/info-refs legs measure the anonymous public path");
+  }
 
   // 1. Full clone: wall time + exact received bytes + effective MB/s.
   const cloneDir = path.join(ctx.workDir, `clone-${size}`);
-  console.log("  measuring full clone");
+  console.log(`  measuring full clone (${readWithCreds ? "authenticated" : "anonymous"} read)`);
   ctx.proxy.reset();
-  const clone = await cloneMeasured([...GITC, "clone", anonUrl, cloneDir], ctx.workDir, cloneDir);
+  const clone = await cloneMeasured([...GITC, "clone", cloneUrl, cloneDir], ctx.workDir, cloneDir);
   metrics.clone_wall_ms = clone.wallMs;
   metrics.clone_received_bytes = ctx.proxy.read().recv;
   metrics.clone_effective_mib_per_s = r2((manifest.actual_pack_bytes / 2 ** 20) / (clone.wallMs / 1000));
 
   // 2. info/refs advertisement latency (p50/p95 over --runs; direct, no proxy).
   console.log(`  measuring info/refs latency (N=${ctx.runs})`);
-  Object.assign(metrics, await measureInfoRefs(anonBase, ctx.token, size, ctx.runs));
+  const inforefsUrl = `${ctx.baseUrl}/${owner}/${name}.git/info/refs?service=git-upload-pack`;
+  const inforefsAuth = ctx.publicFixtures ? null : (ctx.token ? basicHeader : null);
+  Object.assign(metrics, await measureInfoRefs(inforefsUrl, inforefsAuth, ctx.runs));
 
   // 3. Push wall time: fresh clone -> fixed-content commit -> push.
   //    Fixed file name/content/message keep the pushed pack byte-stable.
   const pushDir = path.join(ctx.workDir, `push-${size}`);
   console.log("  measuring push (fresh clone -> commit -> push)");
-  await cloneMeasured([...GITC, "clone", anonUrl, pushDir], ctx.workDir, pushDir);
+  await cloneMeasured([...GITC, "clone", cloneUrl, pushDir], ctx.workDir, pushDir);
   await fsp.writeFile(path.join(pushDir, "bench-push.txt"), `bench push marker for ${name}\n`);
   const ident = ["-c", "user.name=Bench Runner", "-c", "user.email=bench@example.invalid"];
   await git(["add", "bench-push.txt"], { cwd: pushDir });
   await git([...ident, "commit", "-qm", `bench: push sample (${name})`], { cwd: pushDir });
   ctx.proxy.reset();
-  const push = await timeGit([...GITC, ...ident, "push", authPushUrl, "main"], pushDir);
+  const push = await timeGit([...GITC, ...ident, "push", proxyPushUrl, "main"], pushDir);
   metrics.push_wall_ms = push.wallMs;
   metrics.push_bytes = ctx.proxy.read().sent;
 
@@ -490,6 +656,11 @@ async function gitVersion() {
 
 async function runSuite(opts) {
   await fsp.mkdir(opts.resultsDir, { recursive: true });
+  // Production fixture identity: the token's own user namespace, names unique
+  // per run (smoke conventions) so repeat runs never collide with leftovers.
+  // Local keeps the historical `bench/bench-<size>` shape.
+  const runTag = opts.user ? randomUUID().replaceAll("-", "").slice(0, 8) : null;
+  const owner = opts.user ?? OWNER;
   const results = {
     schema_version: SCHEMA_VERSION,
     mode: opts.mode,
@@ -500,7 +671,11 @@ async function runSuite(opts) {
       git: await gitVersion(),
       platform: `${process.platform} ${os.arch()}`,
       base_url: opts.baseUrl,
-      note: "internal.* metrics are null placeholders — filled by TODO(M2 instrumentation) (SPEC-0001a Step 2 T3 counter)",
+      target: opts.remote ? "remote" : "local",
+      baseline_comparable: !opts.remote,
+      note: opts.remote
+        ? "remote run — NOT baseline-comparable (network variance); baselines are recorded from local workerd runs only"
+        : "internal.* metrics are null placeholders — filled by TODO(M2 instrumentation) (SPEC-0001a Step 2 T3 counter)",
     },
     sizes: {},
   };
@@ -511,7 +686,7 @@ async function runSuite(opts) {
   const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), `cgit-bench-${runId}-`));
   try {
     if (opts.baseUrl) {
-      console.log(`target: external server at ${opts.baseUrl}`);
+      console.log(`target: external server at ${opts.baseUrl}${opts.remote ? " (REMOTE — not baseline-comparable)" : ""}`);
       // Tolerate a target that is mid-restart (vite restarts workerd on file
       // changes): poll /healthz for up to 15s instead of failing instantly.
       const t0 = performance.now();
@@ -536,14 +711,30 @@ async function runSuite(opts) {
     for (const size of opts.sizes) {
       console.log(`[size ${size}]`);
       const fixture = await ensureFixture(size, opts.fixturesDir);
+      const repoName = `bench-${size}${runTag ? `-${runTag}` : ""}`;
+      console.log(
+        `  fixture repo ${owner}/${repoName} — ` +
+        (opts.user
+          ? (opts.publicFixtures ? "public fixtures: anonymous read legs (auth push only)" : "private: authenticated read legs")
+          : "local dev namespace (public reads)"),
+      );
       const { metrics, notes } = await benchSize(fixture, {
         baseUrl: opts.baseUrl,
         proxy,
         token: opts.token,
         runs: opts.runs,
         workDir,
+        owner,
+        repoName,
+        user: opts.user,
+        publicFixtures: opts.publicFixtures,
       });
-      results.sizes[size] = { fixture: { ...fixture.manifest, repo: path.relative(repoRoot, fixture.repoPath) }, metrics, notes };
+      results.sizes[size] = {
+        fixture: { ...fixture.manifest, repo: path.relative(repoRoot, fixture.repoPath) },
+        ...(opts.user ? { remote_repo: `${owner}/${repoName}` } : {}),
+        metrics,
+        notes,
+      };
       const m = metrics;
       console.log(
         `  clone ${m.clone_wall_ms} ms (${m.clone_effective_mib_per_s} MiB/s)` +
@@ -631,11 +822,45 @@ function printCompare(results, { failures, checked, skipped }) {
   }
 }
 
+/** Flat metric table used by both the compare gate and the report-only
+ *  remote path. */
+function printMetrics(results) {
+  for (const size of Object.keys(results.sizes)) {
+    for (const [key, val] of Object.entries(flatten(results.sizes[size].metrics))) {
+      if (INFORMATIONAL.has(key)) continue;
+      console.log(`  ${`${size}.${key}`.padEnd(36)} ${FMT[key] ? FMT[key](val) : String(val)}`);
+    }
+  }
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+
+  // Remote cost guard, stage 2: parse-time validation already refused an
+  // unacknowledged non-local target; here an acknowledged (--remote) run
+  // prints its quota estimate and honors a 5s Ctrl-C grace unless --yes.
+  if (opts.remote && !opts.yes) {
+    const est = estimateFixtureBytes(opts.sizes, opts.fixturesDir);
+    console.error(`remote run against ${opts.baseUrl} — estimated fixture upload per size:`);
+    for (const [size, bytes] of est.per) {
+      console.error(`  ${size.padEnd(5)} ~${fmtMiB(bytes)} pack (push + clone + fresh-clone + fetch ≈ 3-4x on the wire)`);
+    }
+    console.error(
+      `  total fixture pack ~${fmtMiB(est.total)}; plus ${opts.runs + INFOREFS_WARMUPS} info/refs request(s) ` +
+      "per size and a DELETE per fixture repo. Repos are left behind on the target.",
+    );
+    console.error(`starting in ${REMOTE_GRACE_MS / 1000}s — Ctrl-C to abort (pass --yes to skip this grace)`);
+    for (let i = REMOTE_GRACE_MS / 1000; i >= 1; i--) {
+      console.error(`  ${i}...`);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+
   const baselinePath = path.join(opts.baselineDir, `${opts.milestone}.json`);
 
   if (opts.mode === "record") {
+    // Remote --record is refused at parse time (baselines are local-only);
+    // this overwrite guard only ever sees local targets.
     if (!opts.force && fs.existsSync(baselinePath)) {
       usageExit(`baseline ${baselinePath} already exists — pass --force to overwrite`);
     }
@@ -656,7 +881,20 @@ async function main() {
     return 0;
   }
 
-  // compare mode
+  // compare mode, remote target: report-only by construction. Remote numbers
+  // carry network variance, so the baseline file is never read, the gate
+  // never runs, and no baseline is ever written (see BASELINE POLICY).
+  if (opts.remote) {
+    console.log(
+      `\nNOT BASELINE-COMPARABLE: this run targeted the remote deployment ${opts.baseUrl}. ` +
+      "Remote numbers include network variance (RTT, TLS, CDN); baselines are recorded from local " +
+      "workerd runs only. Regression gate SKIPPED — report-only (exit 0), no baseline file read or written.",
+    );
+    printMetrics(results);
+    return 0;
+  }
+
+  // compare mode, local target
   if (!fs.existsSync(baselinePath)) {
     console.log(
       `\nNOTICE: no baseline at ${path.relative(repoRoot, baselinePath)} — ` +
