@@ -43,6 +43,14 @@ import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullReviewSignedInGolden from "./goldens/pull-review-signed-in.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
+// Pages wave 19: the creation pages — the new-repository form (the
+// org-bearing owner select) and the new-organization form.
+import orgCreateGolden from "./goldens/org-create.html?raw";
+import repoCreateGolden from "./goldens/repo-create.html?raw";
+import releaseDetailGolden from "./goldens/release-detail.html?raw";
+import releaseNewGolden from "./goldens/release-new.html?raw";
+import releasesGolden from "./goldens/releases.html?raw";
+import releasesWriterGolden from "./goldens/releases-writer.html?raw";
 import settingsBranchesGolden from "./goldens/settings-branches.html?raw";
 import settingsHookDetailGolden from "./goldens/settings-hook-detail.html?raw";
 import settingsMirrorGolden from "./goldens/settings-mirror.html?raw";
@@ -110,6 +118,17 @@ const goldens: Record<string, string> = {
   // arm) and the root commit (the no-parents arm, whole-tree diff).
   "commit-view.html": commitViewGolden,
   "commit-view-root.html": commitViewRootGolden,
+  // Pages wave 19: the creation forms (the signed-in renders — the
+  // anonymous arms 303 and have no golden).
+  "repo-create.html": repoCreateGolden,
+  "org-create.html": orgCreateGolden,
+  // Pages wave 20: the releases family — the anonymous list (the draft
+  // hidden), the writer list (the draft's Draft label + the New Release
+  // button), the v1 detail and the writer create form.
+  "releases.html": releasesGolden,
+  "releases-writer.html": releasesWriterGolden,
+  "release-detail.html": releaseDetailGolden,
+  "release-new.html": releaseNewGolden,
 };
 
 function classList(el: { attrs: Record<string, string> }): string[] {

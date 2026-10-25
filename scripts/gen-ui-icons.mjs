@@ -65,6 +65,13 @@ const repoRoot = path.resolve(scriptDir, '..');
 // page) adds the protection mark the list rows render when a first-match
 // rule governs the branch (list.tmpl's `{{if .IsProtected}}{{svg
 // "octicon-shield-lock"}}` — the render extras' consumer, SPEC-0013 §3.6).
+// Wave 20 (the releases family) adds the header.tmpl:158 tab glyph
+// (octicon-tag) and the release list/detail entry glyphs the survey's #4
+// family renders: the commit ShortSha mark (octicon-git-commit — the
+// wave-16 refusal is superseded: the release meta row's commit link is the
+// family's headline feature), the attachment row's package mark, the source
+// row's zip mark and the download-count tooltip's info mark (release/
+// list.tmpl:14,84,89,99,104).
 const ALLOWLIST = [
   'octicon-bell',
   'octicon-calendar',
@@ -72,7 +79,12 @@ const ALLOWLIST = [
   'octicon-checklist',
   'octicon-clock',
   'octicon-code',
+  'octicon-file-zip',
+  'octicon-git-commit',
+  'octicon-info',
+  'octicon-package',
   'octicon-search',
+  'octicon-tag',
   'octicon-dot-fill',
   'octicon-file',
   'octicon-file-directory-fill',

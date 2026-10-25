@@ -26,7 +26,17 @@ import { beforeAll } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { issues, protectedBranches, pullReviews, repositories, repoMirrors, teams, users } from "../../db/schema";
+import {
+  issues,
+  protectedBranches,
+  pullReviews,
+  releaseAssets,
+  releases,
+  repositories,
+  repoMirrors,
+  teams,
+  users,
+} from "../../db/schema";
 import { type UiManifest } from "../manifest";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import {
@@ -319,6 +329,23 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // (the same literals the commits.html/compare goldens carry).
   { file: "commit-view.html", path: "/alice/golden/commit/5bde6b37197b62bf146fa01ac0bb3f0ee78aa3c0", status: 200 },
   { file: "commit-view-root.html", path: "/alice/golden/commit/a31b4c65fd333561dd9c6ed9e437522f9047786b", status: 200 },
+  // The releases family (wave 20): the ANONYMOUS list over alice/golden (the
+  // published v1 with its in-git tag/commit links + the attachment row; the
+  // draft hidden), the SIGNED-IN writer list (the draft's yellow Draft label
+  // + the New Release button), the v1 detail (the notes through the markdown
+  // pipeline), and the writer create form.
+  { file: "releases.html", path: "/alice/golden/releases", status: 200 },
+  { file: "releases-writer.html", path: "/alice/golden/releases", status: 200, signedIn: true },
+  { file: "release-detail.html", path: "/alice/golden/releases/tag/v1", status: 200 },
+  { file: "release-new.html", path: "/alice/golden/releases/new", status: 200, signedIn: true },
+  // The creation pages (wave 19): the SIGNED-IN new-repository form (morgan —
+  // the org owner, so the owner select renders self + the two owned orgs;
+  // the private checkbox checked, the auto-init checkbox present) and the
+  // SIGNED-IN new-organization form (alice — the public/limited/private
+  // radios with public checked, the permission box checked). The anonymous
+  // arms 303 onto /login — no DOM to snapshot.
+  { file: "repo-create.html", path: "/repo/create", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "org-create.html", path: "/org/create", status: 200, signedIn: true },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
@@ -1012,6 +1039,73 @@ async function seedGoldenTeamWriter(): Promise<void> {
     .where(and(eq(repositories.ownerNamespace, "acme"), eq(repositories.slug, "anvil")));
 }
 
+/**
+ * The wave-20 release fixtures for alice/golden (the releases goldens):
+ * through the LANDED create arm (IssuesService.createRelease, fixed `now`) —
+ * the published `v1` (its tag IS the harness's pushed refs/tags/v1, so the
+ * meta row renders the /src/tag/ + /src/commit/ links) with one DIRECT
+ * release_assets row (fixed uuid/name/size/count — the attachment-list row),
+ * and the draft+prerelease `v2.0-rc1` (newest createdAt → the list's first
+ * row, the yellow Draft label, invisible to the anonymous golden). Runs
+ * AFTER the repo seeds (the tag must exist). Only the releases pages read
+ * `releases`/`release_assets`, so no other golden bytes shift. Idempotent by
+ * the repo's first release row.
+ */
+async function seedGoldenReleases(): Promise<void> {
+  const db = drizzle(env.DB);
+  const repo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "golden")))
+    .get();
+  if (repo === undefined) throw new Error("golden repo row missing before release seeding");
+  const existing = await db.select({ id: releases.id }).from(releases).where(eq(releases.repoId, repo.id)).limit(1).all();
+  if (existing.length > 0) return;
+  const owner = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "alice"))
+    .get();
+  if (owner === undefined) throw new Error("golden owner row missing before release seeding");
+
+  const svc = new IssuesService(env.DB);
+  const t = (offsetSeconds: number): Date => new Date((T0 + offsetSeconds) * 1000);
+  const v1 = await svc.createRelease({
+    repoId: repo.id,
+    publisherId: owner.id,
+    tagName: "v1",
+    target: "main",
+    title: "Golden v1",
+    note: "First golden release.\n\nShips the **seed** fixtures.",
+    isDraft: false,
+    isPrerelease: false,
+    now: t(90),
+  });
+  await svc.createRelease({
+    repoId: repo.id,
+    publisherId: owner.id,
+    tagName: "v2.0-rc1",
+    target: "main",
+    title: "Golden v2.0-rc1",
+    note: "Draft release notes.",
+    isDraft: true,
+    isPrerelease: true,
+    now: t(120),
+  });
+  await db.insert(releaseAssets).values({
+    uuid: "golden-asset-v1zip-0000-0000",
+    repoId: repo.id,
+    releaseId: v1.id,
+    uploaderId: owner.id,
+    name: "golden-v1.zip",
+    size: 1536,
+    downloadCount: 3,
+    r2Key: `repos/golden/release-assets/${v1.id}/golden-asset-v1zip-0000-0000-golden-v1.zip`,
+    checksumSha256: null,
+    createdAt: t(95),
+  });
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
@@ -1072,6 +1166,10 @@ export function setupGoldenFixtures(): void {
     // the settings page for morgan's Owners-bridge admin grant) — after the
     // org + team seeds that create the grants.
     await seedGoldenTeamWriter();
+    // Wave-20: alice/golden's release fixtures (the releases goldens — the
+    // list, the writer-inclusive list, the v1 detail, the create form) —
+    // after the repo seed that pushes refs/tags/v1.
+    await seedGoldenReleases();
     // Wave 7: the user-profile golden renders the shared/repo/list rows'
     // "Updated {TimeSince}" from `repositories.updated_at` — the issue and
     // milestone seeders above stamp it with wall-clock time (the counter-

@@ -136,10 +136,12 @@ function Head(props: { ctx: UiContext; title: string }) {
  * The navbar for both viewer kinds (SPEC-0010 §2.5 — the only component
  * change sessions make). Anonymous viewers keep the Sign in link (`/login`,
  * navbar-right) and the Help item; user viewers gain the upstream signed-in
- * chrome REDUCED to the username + a sign-out POST button (head_navbar.tmpl
- * at the pin, minus everything that needs services we have not built: no `+`
- * create menu, no notification bell, no avatar image — the avatar pipeline
- * does not exist). Wave 7 (the dead-link unlock): the username anchors the
+ * chrome REDUCED to the create links + the username + a sign-out POST button
+ * (head_navbar.tmpl at the pin, minus everything that needs services we have
+ * not built: no notification bell until wave 10 landed it, no avatar image —
+ * the avatar pipeline does not exist). Wave 19 (the creation unlock): the
+ * `+` dropdown renders as its two landed targets (Navbar's comment — the
+ * wave-19 block). Wave 7 (the dead-link unlock): the username anchors the
  * `/{username}` profile (head_navbar.tmpl:98's `HomeLink()` shape, via the
  * shared `userLink` helper) — before the profile page existed it was plain
  * text (§2.4.1: dead links are not emitted). Wave 9 (the explore unlock):
@@ -197,6 +199,21 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificat
           </a>
         ) : (
           <>
+            {/* The create menu (head_navbar.tmpl's signed-in `+` dropdown —
+                wave 19, the creation pages unlock it) reduced to its two
+                LANDED targets as plain items: the Fomantic dropdown needs the
+                client bundle's JS, and the Migration item has no landed
+                surface. Icon-only anchors keep the aria-labels (the
+                head_navbar_icons bell precedent); New Organization is
+                upstream-gated on SignedUser.CanCreateOrganization — always
+                true at the landed tier (no DISABLED surface exists, the
+                POST /orgs route header). */}
+            <a class="item" href="/repo/create" data-tooltip-content={createLocale.new_repo} aria-label={createLocale.new_repo}>
+              <Icon name="octicon-plus" />
+            </a>
+            <a class="item" href="/org/create" data-tooltip-content={createLocale.new_org} aria-label={createLocale.new_org}>
+              <Icon name="octicon-organization" />
+            </a>
             <a class="item" id="navbar-username" href={userLink(props.viewer.username)}>
               {props.viewer.username}
             </a>
@@ -217,16 +234,29 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificat
 // ---------------------------------------------------------------------------
 
 /** Tabs that back real pages this slice — the strip shows only these.
- *  Upstream order is Code → Issues → Pulls (header.tmpl); Commits is the
- *  cf-gitea addition (SPEC-0008 §2.4.1 — /commits is a slice-1 page) and
- *  keeps last so the upstream relative order stays intact. */
-export type RepoTab = "code" | "issues" | "pulls" | "commits";
+ *  Upstream order is Code → Issues → Pulls → Releases (header.tmpl:157, the
+ *  wave-20 addition — the releases family resolves the tab's 404); Commits
+ *  is the cf-gitea addition (SPEC-0008 §2.4.1 — /commits is a slice-1 page)
+ *  and keeps last so the upstream relative order stays intact. The upstream
+ *  `{{if .NumReleases}}` count label is unrendered: D1 keeps no maintained
+ *  num_releases counter and the shared shell would pay a COUNT on every
+ *  repo-scoped render for a label most repos never show (pages/releases.tsx
+ *  header) — the releases PAGES render the real count in their header menu. */
+export type RepoTab = "code" | "issues" | "pulls" | "releases" | "commits";
 
 /** Tab chrome text for the wave-3 tabs (the components/commit-list.tsx
  *  component-local pattern — locale.ts is shared and not this wave's file). */
 const tabLocale = {
   repo_issues: "Issues", // "repo.issues"
   repo_pulls: "Pull Requests", // "repo.pulls"
+  repo_releases: "Releases", // "repo.releases"
+} as const;
+
+/** Create-menu chrome text (the same component-local pattern — wave 19's
+ *  navbar `+` reduction; upstream head_navbar.tmpl's dropdown labels). */
+const createLocale = {
+  new_repo: "New Repository", // "new_repo"
+  new_org: "New Organization", // "new_org"
 } as const;
 
 /** Upstream shows `{{if .Repository.NumOpenIssues}}` count labels; D1 keeps
@@ -292,6 +322,11 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
             <a class={activeTab === "pulls" ? "active item" : "item"} href={`${repoLink}/pulls`} data-shortcut-keys="g p">
               <Icon name="octicon-git-pull-request" /> {tabLocale.repo_pulls}
               {openPulls > 0 ? <span class="ui small label">{openPulls}</span> : null}
+            </a>
+            {/* header.tmpl:157-161 — the releases tab (wave 20); the count
+                label is the documented reduction (RepoTab note). */}
+            <a class={activeTab === "releases" ? "active item" : "item"} href={`${repoLink}/releases`} data-shortcut-keys="g r">
+              <Icon name="octicon-tag" /> {tabLocale.repo_releases}
             </a>
             <a class={activeTab === "commits" ? "active item" : "item"} href={`${repoLink}/commits`}>
               <Icon name="octicon-history" /> {locale.repo_commits}

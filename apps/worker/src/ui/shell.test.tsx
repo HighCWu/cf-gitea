@@ -240,7 +240,7 @@ describe("Navbar", () => {
     expect(html).not.toContain('action="/logout"');
   });
 
-  it("renders the signed-in chrome reduced to username + sign-out POST button (SPEC-0010 §2.5)", () => {
+  it("renders the signed-in chrome reduced to the create links + username + sign-out POST button (SPEC-0010 §2.5)", () => {
     const viewer: Viewer = { kind: "user", id: 7, username: "octocat", isAdmin: false };
     const html = renderPage(
       <BaseLayout ctx={{ ...anonymousCtx, viewer }}>
@@ -252,9 +252,13 @@ describe("Navbar", () => {
     expect(html).toContain('<form class="item" method="post" action="/logout">');
     expect(html).toContain(">Sign Out</button>");
     expect(html).not.toContain('href="/logout"');
-    // No Sign in link, no dead upstream chrome (+ create menu, bell, avatar).
+    // No Sign in link, no dead upstream chrome (bell-less for a zero count,
+    // avatar-less). Wave 19: the `+` dropdown renders as its two landed
+    // targets (the creation pages unlock it — the Navbar comment).
     expect(html).not.toContain('href="/login"');
-    expect(html).not.toContain("octicon-plus");
+    expect(html).toContain('<a class="item" href="/repo/create" data-tooltip-content="New Repository" aria-label="New Repository">');
+    expect(html).toContain('<a class="item" href="/org/create" data-tooltip-content="New Organization" aria-label="New Organization">');
+    expect(html).toContain("octicon-plus");
     // Wave 9: the logo's aria-label is the dashboard label signed in
     // (head_navbar.tmpl:2) and the Explore item renders untracked by default.
     expect(html).toContain('id="navbar-logo" href="/" aria-label="Dashboard"');
@@ -278,27 +282,33 @@ describe("RepoHeader tab strip", () => {
     return html.slice(start, end);
   }
 
-  it("renders exactly the Code, Issues, Pulls, Commits tabs, in order, with active tracking", () => {
+  it("renders exactly the Code, Issues, Pulls, Releases, Commits tabs, in order, with active tracking", () => {
     const strip = tabStrip(page({ ctx: repoCtx }));
-    expect(strip.match(/<a class="(?:active )?item"/g)).toHaveLength(4);
+    expect(strip.match(/<a class="(?:active )?item"/g)).toHaveLength(5);
     expect(strip).toContain('<a class="active item" href="/octocat/hello" data-shortcut-keys="g c">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/issues" data-shortcut-keys="g i">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/pulls" data-shortcut-keys="g p">');
+    // Wave 20: the Releases tab (header.tmpl:157's shape) resolves — it was
+    // the dead-tab 404 this test previously refused to render.
+    expect(strip).toContain('<a class="item" href="/octocat/hello/releases" data-shortcut-keys="g r">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/commits">');
     // Inline octicon SVGs, upstream {{svg}} shape. The Issues tab degrades to
     // text: its octicon-issue-opened glyph is a 2-path octicon, which the
     // shell's single-path Icon contract cannot carry (gen-ui-icons.mjs).
     expect(strip).toContain('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" class="svg octicon-code"');
     expect(strip).toContain('class="svg octicon-git-pull-request"');
+    expect(strip).toContain('class="svg octicon-tag"');
     expect(strip).toContain('class="svg octicon-history"');
     expect(strip.indexOf("> Code</a>")).toBeGreaterThan(0);
     // The degraded Issues tab has no icon, so its text hugs the `>` directly.
     expect(strip.indexOf(">Issues</a>")).toBeGreaterThan(strip.indexOf("> Code</a>"));
     expect(strip.indexOf("> Pull Requests</a>")).toBeGreaterThan(strip.indexOf(">Issues</a>"));
+    expect(strip.indexOf("> Releases</a>")).toBeGreaterThan(strip.indexOf("> Pull Requests</a>"));
     expect(strip).toContain("> Commits</a>");
     expect(strip).not.toContain('class="svg octicon-issue-opened"');
-    // Only existing pages: no Releases/Wiki/Settings dead tabs.
-    for (const dead of ["Releases", "Wiki", "Settings"]) {
+    // Only existing pages: no Wiki/Settings dead tabs (Releases resolved in
+    // wave 20).
+    for (const dead of ["Wiki", "Settings"]) {
       expect(strip).not.toContain(dead);
     }
 

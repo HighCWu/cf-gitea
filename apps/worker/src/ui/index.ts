@@ -202,6 +202,31 @@
  *                                          reachable-full-oid rule — the
  *                                          7..64 prefix shapes 404-shell,
  *                                          the documented divergence)
+ *   /:owner/:repo/releases                 releases list, GET (pages/
+ *                                          releases.tsx — wave 20; the
+ *                                          parity survey's #4, upstream
+ *                                          web.go:1506 repo.Releases over
+ *                                          the landed api/services/releases
+ *                                          + release-assets reads; drafts
+ *                                          ride the write grant)
+ *   /:owner/:repo/releases/new             new-release form, GET + POST
+ *                                          (pages/releases.tsx — wave 20;
+ *                                          upstream web.go:1517-1518; the
+ *                                          writer gate; POST → the landed
+ *                                          IssuesService.createRelease +
+ *                                          the `release` webhook → 303 onto
+ *                                          the created detail page)
+ *   /:owner/:repo/releases/latest          303 onto the latest stable
+ *                                          release's detail (upstream
+ *                                          web.go:1510 LatestRelease —
+ *                                          Redirect(Link()))
+ *   /:owner/:repo/releases/tag/{tag}       release detail, GET (pages/
+ *                                          releases.tsx — wave 20; upstream
+ *                                          web.go:1509 SingleRelease — the
+ *                                          SAME list template over one
+ *                                          row; the decoded tail keeps
+ *                                          slashes, the API family's
+ *                                          html_url shape re-parses)
  *   /:owner/:repo/compare[/{base}...{head}]  compare view, GET + POST
  *                                          (pages/compare.tsx — wave 13;
  *                                          upstream web.go:1307-1315's
@@ -262,6 +287,24 @@
  *                                          303s onto /login; POST re-plays
  *                                          the landed PATCH route's service
  *                                          sequence → 303)
+ *   /repo/create                            new-repository form, GET + POST
+ *                                          (pages/repo-create.tsx — wave
+ *                                          19; upstream's reqSignIn
+ *                                          /repo/create group,
+ *                                          web.go:1094-1098; POST → the
+ *                                          landed create arms —
+ *                                          createUserRepository for the
+ *                                          doer, requireCanCreateOrgRepo +
+ *                                          RepoService.create for an org —
+ *                                          303 onto the new repo's home;
+ *                                          anonymous 303s onto /login)
+ *   /org/create                             new-organization form, GET +
+ *                                          POST (pages/org-create.tsx —
+ *                                          wave 19; upstream's reqSignIn
+ *                                          /org/create group, web.go:970-
+ *                                          974; POST → the landed
+ *                                          OrgService.createOrg → 303 onto
+ *                                          the org home)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -406,6 +449,18 @@ import {
   renderUserSettingsPage,
 } from "./pages/user-settings";
 import { loadUserProfileData, renderUserProfilePage, resolveUserProfile } from "./pages/user-profile";
+// Wave-19 creation pages (the authoring front door — the survey's #2).
+import {
+  createRepoFromForm,
+  loadRepoCreateData,
+  parseRepoCreateForm,
+  renderRepoCreatePage,
+} from "./pages/repo-create";
+import {
+  createOrgFromForm,
+  parseOrgCreateForm,
+  renderOrgCreatePage,
+} from "./pages/org-create";
 import { loadDashboardData, renderDashboardPage, renderLandingPage } from "./pages/dashboard";
 import {
   loadExploreReposData,
@@ -451,6 +506,19 @@ import {
   parseBranchDeleteForm,
   renderBranchesPage,
 } from "./pages/branches";
+import {
+  createReleaseFromForm,
+  loadNewReleaseData,
+  loadReleaseDetailData,
+  loadReleasesData,
+  latestReleaseTagOf,
+  parseNewReleaseForm,
+  renderNewReleasePage,
+  renderReleaseDetailPage,
+  renderReleasesPage,
+} from "./pages/releases";
+import { listReleases } from "../api/services/releases";
+import { loadRepoSettings } from "../api/services/repo-settings";
 import {
   applyBranchProtectionForm,
   deleteRuleById,
@@ -645,6 +713,50 @@ export interface CommitViewRoute {
   /** The decoded sha segment (validated at load time, not parse time). */
   sha: string;
 }
+
+/** The wave-20 releases family (pages/releases.tsx): upstream's releases
+ *  group (web.go:1505-1514 — the parity survey's #4; the whole data side is
+ *  landed, api/services/releases.ts + release-assets.ts + the SPEC-0005
+ *  create arm): the bare URL is the list (`repo.Releases`, web.go:1506),
+ *  `/releases/new` the create form + write (web.go:1517-1518, the writer
+ *  gate), `/releases/latest` the latest-release 303 (web.go:1510 —
+ *  `ctx.Redirect(release.Link())`), `/releases/tag/*` the single-release
+ *  page (web.go:1509 `repo.SingleRelease` — the SAME list template over one
+ *  row; the tail is the decoded tag name, slashes allowed, so the emitted
+ *  `/releases/tag/{tag}` links — the API family's html_url shape — re-parse
+ *  to the same route). The `.rss`/`.atom` feed tails (web.go:1507-1508),
+ *  the write tails this slice does not render (`/edit/*`, `/delete`,
+ *  `/generate-notes`, `/attachments*`, the `{id}/reactions` POST —
+ *  web.go:1511-1526) and every other tail stay unclaimed → the engine's
+ *  404, exactly upstream's unregistered-route answer for them. */
+export interface ReleasesRoute {
+  family: "releases" | "release-new" | "release-latest" | "release-detail";
+  owner: string;
+  repo: string;
+  /** The decoded tag tail after `/releases/tag/` (the detail family only;
+   *  may bear slashes — refnames do). */
+  tag?: string;
+}
+
+/** The wave-19 creation families (pages/repo-create.tsx + pages/
+ *  org-create.tsx): upstream's reqSignIn `/repo/create` and `/org/create`
+ *  groups (web.go:1094-1098 + 970-974 — the parity survey's #2, the
+ *  authoring front door) — GET the form, POST the landed create arms
+ *  (`POST /user/repos` / `POST /orgs/{org}/repos` user-repos + org-repos,
+ *  and `POST /orgs`), success 303 onto the created owner's page. Claimed as
+ *  EXACT literals before the owner/repo parse could read them as a
+ *  repository named "create" under an owner named "repo"/"org" (the
+ *  user-settings precedent; upstream's groups register ahead of the dynamic
+ *  pairs and shadow such a repository identically). Every other
+ *  `/repo|org/*` tail stays unclaimed → the engine's 404. */
+export interface RepoCreateRoute {
+  family: "repo-create";
+}
+
+export interface OrgCreateRoute {
+  family: "org-create";
+}
+
 
 /** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
  *  three web POSTs — the verdict form's
@@ -849,7 +961,10 @@ export type ParsedUiRoute =
   | OrgLabelsRoute
   | CompareRoute
   | BranchesRoute
-  | CommitViewRoute;
+  | CommitViewRoute
+  | ReleasesRoute
+  | RepoCreateRoute
+  | OrgCreateRoute;
 
 
 /**
@@ -910,6 +1025,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // settings tails stay unclaimed — no landed surfaces.
   if (raw.length === 3 && raw[1] === "user" && raw[2] === "settings") {
     return { family: "user-settings" };
+  }
+
+  // The wave-19 creation literals (pages/repo-create.tsx + pages/
+  // org-create.tsx — upstream's reqSignIn /repo/create + /org/create
+  // groups, web.go:1094-1098 + 970-974): the same exact-literal posture as
+  // user-settings above. Upstream's /repo and /org groups register ahead of
+  // the dynamic pairs too, so a repository named "create" under an owner
+  // named "repo" or "org" is shadowed identically (and both names are
+  // upstream-reserved at create time besides). Every other /repo|org/*
+  // tail stays unclaimed → the engine's 404 (upstream's unregistered-route
+  // answer for this slice).
+  if (raw.length === 3 && raw[1] === "repo" && raw[2] === "create") {
+    return { family: "repo-create" };
+  }
+  if (raw.length === 3 && raw[1] === "org" && raw[2] === "create") {
+    return { family: "org-create" };
   }
 
   let owner: string;
@@ -1131,6 +1262,33 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (head === "branches") {
     if (rest.length === 0) return { family: "branches", owner, repo };
     if (rest.length === 1 && rest[0] === "delete") return { family: "branch-delete", owner, repo };
+    return null;
+  }
+  // Wave-20 releases family (pages/releases.tsx — upstream web.go:1505-1514's
+  // group, the parity survey's #4): the bare URL is the list, `/new` the
+  // create form + write, `/latest` the redirect, `/tag/{tail}` the single-
+  // release page — the tail is the DECODED tag name with slashes preserved
+  // (chi's `*` param; refnames carry slashes, so the emitted
+  // `/releases/tag/v1.0/rc` links re-parse to the same route). The feed
+  // tails upstream registers (`.rss`/`.atom`) and the write tails this slice
+  // does not render (`/edit/*`, `/delete`, `/generate-notes`,
+  // `/attachments*`) stay unclaimed → the engine's 404.
+  if (head === "releases") {
+    if (rest.length === 0) return { family: "releases", owner, repo };
+    if (rest.length === 1 && rest[0] === "new") return { family: "release-new", owner, repo };
+    if (rest.length === 1 && rest[0] === "latest") return { family: "release-latest", owner, repo };
+    if (rest.length >= 2 && rest[0] === "tag") {
+      try {
+        return {
+          family: "release-detail",
+          owner,
+          repo,
+          tag: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
+        };
+      } catch {
+        return null;
+      }
+    }
     return null;
   }
   // Wave-18 commit view (pages/commit-view.tsx — upstream web.go:1739): the
@@ -2160,6 +2318,129 @@ async function userSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
 }
 
 // ---------------------------------------------------------------------------
+// The wave-19 creation pages (pages/repo-create.tsx + pages/org-create.tsx —
+// upstream's reqSignIn /repo/create + /org/create groups, the parity
+// survey's #2 authoring front door)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /repo/create (pages/repo-create.tsx — upstream repo.Create,
+ * routers/web/repo/repo.go:142): the session prologue WITHOUT the repo read,
+ * then the signed-in gate — an anonymous viewer 303s onto the login
+ * round-trip (upstream reqSignIn). A session doer without a D1 row
+ * 404-shells (the silent-auth-failure convention). `?org={id}` (upstream's
+ * checkContextUser arm — the dashboard widget's deep link) preselects an
+ * ALLOWED owner, anything else falls back to the doer.
+ */
+async function repoCreatePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const data = await loadRepoCreateData(c.env.DB, viewer);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  const orgParam = url.searchParams.get("org") ?? "";
+  const uid =
+    /^\d+$/.test(orgParam) && data.owners.some((owner) => owner.id === Number.parseInt(orgParam, 10))
+      ? Number.parseInt(orgParam, 10)
+      : null;
+  return respond(
+    c.html(
+      renderRepoCreatePage({
+        ctx,
+        data,
+        // The private checkbox defaults CHECKED (the DefaultPushCreatePrivate
+        // directive — pages/repo-create.tsx header); uid null = the doer.
+        form: { uid, name: "", description: "", isPrivate: true, autoInit: false },
+        error: null,
+      }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /repo/create (upstream repo.CreatePost, repo.go:202): the §2.8 Origin
+ * guard, the same session→gate order as the GET, then the landed create arms
+ * dispatched on the owner select (pages/repo-create.tsx's createRepoFromForm
+ * — createUserRepository for the doer, requireCanCreateOrgRepo +
+ * RepoService.create for an org, the `repository` created webhook riding
+ * both). Success 303s onto the new repo's home (upstream
+ * `ctx.Redirect(repo.Link())`, 303 per base.go:157); failures re-render the
+ * form at 200 with the message and the submitted values (the login failure
+ * convention).
+ */
+async function repoCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const data = await loadRepoCreateData(c.env.DB, viewer);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseRepoCreateForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createRepoFromForm(c.env, c.env.DB, viewer, data, form, { request: c, origin: ctx.origin });
+  if (result.outcome === "created") {
+    return respond(
+      new Response(null, { status: 303, headers: { location: `/${result.ownerNamespace}/${result.slug}` } }),
+    );
+  }
+  return respond(c.html(renderRepoCreatePage({ ctx, data, form, error: result.message }), 200));
+}
+
+/**
+ * GET /org/create (pages/org-create.tsx — upstream org.Create,
+ * routers/web/org/org.go:30): the same session→gate order; the
+ * CanCreateOrganization site-config gate is unreachable at the landed tier
+ * (the module header), so every signed-in viewer renders the form.
+ */
+async function orgCreatePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  return respond(
+    c.html(
+      renderOrgCreatePage({
+        ctx,
+        // The GET defaults: visibility public (upstream's
+        // DefaultOrgVisibilityMode default), the permission box CHECKED
+        // (upstream GET's repo_admin_change_team_access = true).
+        form: { name: "", fullName: "", email: "", visibility: "public", repoAdminChangeTeamAccess: true },
+        error: null,
+      }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /org/create (upstream org.CreatePost, org.go:44): the §2.8 Origin
+ * guard, the same session→gate order, then the landed `POST /orgs` service
+ * (`OrgService.createOrg` — the creator's owner membership rides the same
+ * batch). Success 303s onto the ORG HOME `/{org}` (upstream redirects onto
+ * DashboardLink — a surface this UI does not carry, the module header's
+ * divergence); the typed OrgError family re-renders inline with the kept
+ * submission (the login failure convention).
+ */
+async function orgCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // sessions are user-shaped
+  const form = parseOrgCreateForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createOrgFromForm(c.env.DB, viewer, form);
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${result.org.username}` } }));
+  }
+  return respond(c.html(renderOrgCreatePage({ ctx, form, error: result.message }), 200));
+}
+
+// ---------------------------------------------------------------------------
 // The wave-12 org teams family (pages/org-teams.tsx — upstream's
 // /{org}/teams group, web.go:993-1013)
 // ---------------------------------------------------------------------------
@@ -2971,6 +3252,175 @@ async function commitViewPage(c: Context<{ Bindings: Env }>): Promise<Response> 
   return respond(c.html(renderCommitViewPage({ ctx, data }), 200));
 }
 
+// ---------------------------------------------------------------------------
+// The wave-20 releases family (pages/releases.tsx — upstream's web.go:1505-
+// 1527 group at the landed api/services/releases.ts + release-assets.ts
+// reads and the SPEC-0005 create arm)
+// ---------------------------------------------------------------------------
+
+/**
+ * The releases family's read gate (upstream's group middleware verbatim):
+ * `repo.MustBeNotEmpty` — an empty repo 404-shells the whole family — and
+ * the releases unit gate (the API family's `mustEnableUnit` posture, the
+ * routes' runtime 412; a page answers the invisible §4.5 shell).
+ */
+async function releasesReadGate(db: D1Database, repo: RepoRow): Promise<boolean> {
+  if (repo.isEmpty) return false;
+  return (await loadRepoSettings(db, repo.id)).hasReleases;
+}
+
+/** The form routes' gate (upstream's write group): the read gate plus
+ *  `context.RepoMustNotBeArchived()` — archived repos 404-shell (the
+ *  file-editor reduction of upstream's 403) — and the release-write grant
+ *  (`reqRepoReleaseWriter` → canWriteRepo; anonymous already went to the
+ *  login 303 before this check). */
+async function releasesWriteGate(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+): Promise<Response | null> {
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (repo.isArchived || !(await releasesReadGate(c.env.DB, repo))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  if (!(await canWriteRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
+  return null;
+}
+
+/** GET /{owner}/{repo}/releases (pages/releases.tsx — upstream repo.Releases,
+ *  web.go:1506): the list for every viewer who can see the repo; drafts ride
+ *  the write grant (upstream IncludeDrafts: writeAccess) and the New Release
+ *  button the create grant (`CanCreateRelease` = write && !archived). */
+async function releasesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  if (!(await releasesReadGate(c.env.DB, repo))) return respond(c.html(renderNotFound(ctx), 404));
+  const canWrite = await canWriteRepo(c.env, repo, viewer);
+  const data = await loadReleasesData(c.env, c.env.DB, repo, canWrite, url.searchParams, url.origin);
+  data.canCreate = canWrite;
+  return respond(c.html(renderReleasesPage(ctx, data), 200));
+}
+
+/** GET /{owner}/{repo}/releases/new (pages/releases.tsx — upstream
+ *  repo.NewRelease, web.go:1517): the writer-gated create form. */
+async function releaseNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await releasesWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, respond, repo } = resolved;
+  const data = await loadNewReleaseData(c.env, repo);
+  return respond(
+    c.html(
+      renderNewReleasePage({
+        ctx,
+        data,
+        form: { tagName: "", tagTarget: "", title: "", content: "", draft: false, prerelease: false },
+        error: null,
+      }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/releases/new (upstream NewReleasePost, web.go:1518):
+ * the §2.8 Origin guard, then the same gate order as the GET, then the
+ * landed create arm through createReleaseFromForm (pages/releases.tsx — the
+ * API POST route's service call + webhook sequence). Success 303s onto the
+ * created release's DETAIL page (the task brief, the new-issue POST
+ * convention — upstream JSONRedirects onto the list, the module header's
+ * note); validation failures re-render the form at 200 with the message and
+ * the kept submission (the login failure convention).
+ */
+async function releaseNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await releasesWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the gate above admitted only users
+  const form = parseNewReleaseForm(await readUrlEncodedForm(c.req.raw));
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const doer = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (doer === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const data = await loadNewReleaseData(c.env, repo);
+  const result = await createReleaseFromForm({
+    env: c.env,
+    request: c,
+    repo,
+    pair,
+    doer,
+    form,
+    branches: data.branches,
+    origin: url.origin,
+  });
+  if (result.outcome === "created") {
+    return respond(
+      new Response(null, {
+        status: 303,
+        headers: {
+          location: `/${repo.ownerNamespace}/${repo.slug}/releases/tag/${pathEscapeSegments(result.tag)}`,
+        },
+      }),
+    );
+  }
+  return respond(c.html(renderNewReleasePage({ ctx, data, form, error: result.message }), 200));
+}
+
+/**
+ * GET /{owner}/{repo}/releases/latest (upstream repo.LatestRelease,
+ * web.go:1510): 303 onto the latest stable release's detail page
+ * (`ctx.Redirect(release.Link())` — the html_url shape); no stable release
+ * 404-shells (upstream NotFound).
+ */
+async function releaseLatestRedirect(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond, repo } = resolved;
+  if (!(await releasesReadGate(c.env.DB, repo))) return respond(c.html(renderNotFound(ctx), 404));
+  const tag = await latestReleaseTagOf(c.env.DB, repo.id);
+  if (tag === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    new Response(null, {
+      status: 303,
+      headers: { location: `/${repo.ownerNamespace}/${repo.slug}/releases/tag/${pathEscapeSegments(tag)}` },
+    }),
+  );
+}
+
+/**
+ * GET /{owner}/{repo}/releases/tag/{tag} (upstream repo.SingleRelease,
+ * web.go:1509): ONE release rendered through the same list entry — the
+ * landed read's exact visibility rules (tag-only records and foreign-eye
+ * drafts 404); the header menu shows the write-aware repo total (the
+ * `NumReleases` the shared template renders).
+ */
+async function releaseDetailPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  if (!(await releasesReadGate(c.env.DB, repo))) return respond(c.html(renderNotFound(ctx), 404));
+  const route = resolved.route;
+  if (route.family !== "release-detail" || route.tag === undefined) return respond(await c.notFound()); // drift guard
+  const canWrite = await canWriteRepo(c.env, repo, viewer);
+  const entry = await loadReleaseDetailData(c.env, c.env.DB, repo, route.tag, canWrite, url.origin);
+  if (entry === null) return respond(c.html(renderNotFound(ctx), 404));
+  const { total } = await listReleases(c.env.DB, repo.id, {
+    includeDrafts: canWrite,
+    isDraft: null,
+    isPrerelease: null,
+    tagFilter: "",
+    page: 1,
+    limit: 1,
+  });
+  return respond(c.html(renderReleaseDetailPage({ ctx, entry, total }), 200));
+}
+
 /**
  * One handler for every claimed GET page family: the parser re-reads the
  * pathname (the route registrations below exist so the sub-app never claims
@@ -3091,6 +3541,14 @@ uiRouter.get("/notifications/purge", () => methodNotAllowed("POST"));
 // the teams POSTs hang off the /new literal's own GET+POST pair.
 uiRouter.get("/user/settings", (c) => userSettingsPage(c));
 uiRouter.post("/user/settings", (c) => userSettingsSubmit(c));
+// Wave-19 creation pages (parseUiRoute claims exactly these literal shapes —
+// upstream's reqSignIn /repo/create + /org/create groups; registered with
+// the wave-9/12 statics so the literals beat the dynamic owner/repo pair —
+// the wave-9 RegExpRouter note). The POSTs run the §2.8 sameOriginGuard.
+uiRouter.get("/repo/create", (c) => repoCreatePage(c));
+uiRouter.post("/repo/create", (c) => repoCreateSubmit(c));
+uiRouter.get("/org/create", (c) => orgCreatePage(c));
+uiRouter.post("/org/create", (c) => orgCreateSubmit(c));
 uiRouter.get("/:owner/teams", (c) => orgTeamsPage(c));
 uiRouter.get("/:owner/teams/new", (c) => orgTeamNewPage(c));
 uiRouter.post("/:owner/teams/new", (c) => orgTeamNewSubmit(c));
@@ -3205,6 +3663,15 @@ uiRouter.get("/:owner/:repo/commit/:sha", (c) => commitViewPage(c));
 uiRouter.get("/:owner/:repo/milestones", (c) => milestonesPage(c));
 uiRouter.get("/:owner/:repo/milestones/new", (c) => milestoneNewPage(c));
 uiRouter.post("/:owner/:repo/milestones/new", (c) => milestoneNewSubmit(c));
+// Wave-20 releases families (parseUiRoute claims exactly these shapes —
+// upstream's web.go:1505-1514 group; the static literal tails register
+// before the `/tag/*` catch-all so the precedence is local and obvious; the
+// POST runs the §2.8 sameOriginGuard; the bare family carries GET only).
+uiRouter.get("/:owner/:repo/releases", (c) => releasesPage(c));
+uiRouter.get("/:owner/:repo/releases/new", (c) => releaseNewPage(c));
+uiRouter.post("/:owner/:repo/releases/new", (c) => releaseNewSubmit(c));
+uiRouter.get("/:owner/:repo/releases/latest", (c) => releaseLatestRedirect(c));
+uiRouter.get("/:owner/:repo/releases/tag/*", (c) => releaseDetailPage(c));
 // Wave-8 file editor families (parseUiRoute claims exactly these shapes; the
 // POSTs run the §2.8 sameOriginGuard first — session.ts's convention; the
 // `*` tail is the branch+path rest the handlers resolve against the branch
