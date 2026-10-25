@@ -21,7 +21,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import { GOLDEN_CASES, GOLDEN_MARKER_END, GOLDEN_MARKER_START, renderRoute, setupGoldenFixtures } from "./harness";
+import {
+  GOLDEN_CASES,
+  GOLDEN_MARKER_END,
+  GOLDEN_MARKER_START,
+  renderCase,
+  renderRoute,
+  setupGoldenFixtures,
+} from "./harness";
 
 /** Committed golden bytes, read through Vite's `?raw` transform (byte-exact;
  *  typing in raw-modules.d.ts). */
@@ -55,7 +62,7 @@ setupGoldenFixtures();
 describe("golden DOM snapshots (§5.2)", () => {
   for (const golden of GOLDEN_CASES) {
     it(`renders ${golden.file} byte-identical (${golden.status})`, async () => {
-      const { status, html } = await renderRoute(golden.path);
+      const { status, html } = await renderCase(golden);
       expect(status, golden.path).toBe(golden.status);
 
       const committed = goldenBody(golden.file);

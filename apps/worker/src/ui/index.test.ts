@@ -139,12 +139,16 @@ describe("handlesUiRoute", () => {
     "/octo", // wave-6 org home extended in wave 7 — the single-segment
     "/octo/", // owner-home family (the dispatcher never consults the gate
               // for it; the parser still owns it)
+    "/", // wave-9 site root (the dispatcher never consults the gate for it
+         // either — not repo-scoped; the parser still owns it)
+    "/explore", // the wave-9 explore group: the bare literal's 303 + the
+    "/explore/repos", // two search pages (claimed before the repo-scoped
+    "/explore/users", // owner/repo parse could read them as a repository)
   ])("claims UI family: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(true);
   });
 
   it.each([
-    "/", // root — Hono-land
     "/login", // the session router's literals (TOP_LEVEL_EXCLUDED — a
     "/LOGOUT", // dynamic /:owner registration would shadow them)
     "/healthz", // the dispatcher's own static route
@@ -169,6 +173,10 @@ describe("handlesUiRoute", () => {
     "/octo/hello/raw/branch/main/x", // upstream raw shape not in this slice
     "/octo/hello/commitsX", // family literals are exact
     "/octo/hello/commitsx/branch/main",
+    "/explore/organizations", // the wave-9 explore literals bind exactly —
+    "/explore/code", // every other tail stays engine/parent-owned
+    "/explore/repos/sitemap-1.xml",
+    "/explore/users/extra",
   ])("does not claim: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(false);
   });
@@ -216,6 +224,19 @@ describe("parseUiRoute", () => {
     // undecodable escapes are the engine's (parse.ts convention)
     ["/octo/hello%zz/src", null],
     ["/octo/hello/commits/branch/%zz", null],
+    // wave 9: the site root (upstream Home — dashboard signed in, landing
+    // anonymous) and the explore literals, claimed before the owner/repo
+    // parse could read `/explore/repos` as a repository.
+    ["/", { family: "site-home" }],
+    ["/explore", { family: "explore-root" }],
+    ["/explore/", { family: "explore-root" }], // trailing slash canonicalizes
+    ["/explore/repos", { family: "explore-repos" }],
+    ["/explore/users", { family: "explore-users" }],
+    ["/explore/organizations", null], // the literals bind exactly
+    ["/explore/repos/sitemap-1.xml", null],
+    ["/explore/users/extra", null],
+    ["/EXPLORE", { family: "owner-home", owner: "EXPLORE" }], // same-named
+    ["/Explore/repos", { family: "home", owner: "Explore", repo: "repos", refSuffix: null }], // namespaces keep their families (case-exact literals)
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {

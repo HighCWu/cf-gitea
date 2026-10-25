@@ -228,10 +228,13 @@ describe("Navbar", () => {
     expect(html).toContain('<img width="30" height="30" src="/assets/img/logo.svg"');
     expect(html).toContain('href="https://docs.gitea.com"');
     // SPEC-0010 §2.5: the anonymous chrome gains exactly the Sign in link
-    // (the /login route exists now); Explore stays unrendered (no page).
+    // (the /login route exists now); wave 9: the Explore item anchors the
+    // live /explore/repos page for BOTH viewer kinds (head_navbar.tmpl:31) —
+    // the logo's aria-label stays "Home" anonymous (head_navbar.tmpl:2).
     expect(html).toContain('<a class="item" href="/login">Sign In</a>');
+    expect(html).toContain('<a class="item" href="/explore/repos">Explore</a>');
+    expect(html).toContain('id="navbar-logo" href="/" aria-label="Home"');
     expect(html).not.toContain("/user/login");
-    expect(html).not.toContain("/explore/");
     // No signed-in chrome leaks for an anonymous viewer.
     expect(html).not.toContain('id="navbar-username"');
     expect(html).not.toContain('action="/logout"');
@@ -252,6 +255,18 @@ describe("Navbar", () => {
     // No Sign in link, no dead upstream chrome (+ create menu, bell, avatar).
     expect(html).not.toContain('href="/login"');
     expect(html).not.toContain("octicon-plus");
+    // Wave 9: the logo's aria-label is the dashboard label signed in
+    // (head_navbar.tmpl:2) and the Explore item renders untracked by default.
+    expect(html).toContain('id="navbar-logo" href="/" aria-label="Dashboard"');
+    expect(html).toContain('<a class="item" href="/explore/repos">Explore</a>');
+    // The active track renders only on the explore pages (BaseLayout's
+    // activeNav passthrough — upstream PageIsExplore).
+    const exploreHtml = renderPage(
+      <BaseLayout ctx={{ ...anonymousCtx, viewer }} activeNav="explore">
+        <p>explore</p>
+      </BaseLayout>,
+    );
+    expect(exploreHtml).toContain('<a class="active item" href="/explore/repos">Explore</a>');
   });
 });
 

@@ -63,6 +63,12 @@ export const locale = {
   login_error_invalid_token: "The token is not valid.",
   login_error_scope: "The token cannot sign in: it does not grant repository read access.",
   login_error_prohibited: "This account is prohibited from signing in.",
+
+  // --- pages wave 9 — the signed-in experience (navbar surface) --------------
+  dashboard: "Dashboard", // "dashboard" (the logo's aria-label when signed
+  //  in — head_navbar.tmpl:2's `{{if .IsSigned}}` switch)
+  explore: "Explore", // "explore_title" (the navbar Explore item, both
+  //  viewer kinds — head_navbar.tmpl:31)
 } as const;
 
 /** The complete client i18n surface: `window.config.i18n` carries exactly

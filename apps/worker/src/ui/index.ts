@@ -86,6 +86,21 @@
  *                                          anonymous GET+POST 303 onto
  *                                          /login, non-writers and archived
  *                                          repos 404-shell)
+ *   /                                      site root — dashboard (signed in)
+ *                                          or landing (anonymous), GET
+ *                                          (pages/dashboard.tsx — wave 9;
+ *                                          upstream Home,
+ *                                          routers/web/home.go:26-44)
+ *   /explore                               303 onto /explore/repos (wave 9)
+ *   /explore/repos                         repo search page, GET
+ *   /explore/users                         user search page, GET
+ *                                          (pages/explore.tsx — wave 9;
+ *                                          upstream web.go:549-556; the
+ *                                          landed search services via
+ *                                          api/services/search.ts; the
+ *                                          navbar Explore item anchors the
+ *                                          repos page for both viewer
+ *                                          kinds)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -180,6 +195,13 @@ import {
 } from "./pages/milestones";
 import { loadOrgHomeData, renderOrgHomePage, resolveOrgHome } from "./pages/org-home";
 import { loadUserProfileData, renderUserProfilePage, resolveUserProfile } from "./pages/user-profile";
+import { loadDashboardData, renderDashboardPage, renderLandingPage } from "./pages/dashboard";
+import {
+  loadExploreReposData,
+  loadExploreUsersData,
+  renderExploreReposPage,
+  renderExploreUsersPage,
+} from "./pages/explore";
 import {
   createIssueFromForm,
   loadNewIssueData,
@@ -368,6 +390,27 @@ export interface FileEditorRoute {
   refSuffix: string;
 }
 
+/** The wave-9 site root (pages/dashboard.tsx): upstream `Home`
+ *  (routers/web/home.go:26-44) — `/` serves the signed-in dashboard, the
+ *  anonymous landing. The dispatcher never consults `handlesUiRoute` for it
+ *  (the root is not repo-scoped; the uiRouter registration answers), but the
+ *  parser stays the single owner of the shape. */
+export interface SiteHomeRoute {
+  family: "site-home";
+}
+
+/** The wave-9 explore family (pages/explore.tsx): upstream's route group
+ *  `m.Group("/explore", …)` (web.go:549-556) — the bare `/explore` redirects
+ *  onto `/explore/repos`, which renders the repo search page;
+ *  `/explore/users` the user search page. Claimed by EXACT literal shapes
+ *  before the owner/repo parse could read `/explore/repos` as a
+ *  `{owner: "explore", repo: "repos"}` repository; every other `/explore/*`
+ *  tail (organizations/code/sitemap-*, deeper) stays unclaimed → the
+ *  engine/parent answer, exactly upstream's unregistered-route 404. */
+export interface ExploreRoute {
+  family: "explore-root" | "explore-repos" | "explore-users";
+}
+
 /** Top-level single-segment paths this router must never claim: the session
  *  router's literals (registered on the SAME parent app AFTER this sub-app,
  *  so a dynamic `/:owner` registration would shadow them — SPEC-0010 §2.1)
@@ -392,7 +435,9 @@ export type ParsedUiRoute =
   | MilestonesRoute
   | MilestoneNewRoute
   | OwnerHomeRoute
-  | FileEditorRoute;
+  | FileEditorRoute
+  | SiteHomeRoute
+  | ExploreRoute;
 
 
 /**
@@ -406,13 +451,31 @@ export type ParsedUiRoute =
  * including the never-emitted `//` tails) makes the path not ours.
  */
 export function parseUiRoute(pathname: string): ParsedUiRoute | null {
-  if (pathname === "/" || !pathname.startsWith("/")) return null;
+  if (!pathname.startsWith("/")) return null;
   // §4.13: the router 301s trailing-slash URLs to the canonical form; the
   // parser classifies the trimmed shape so the dispatcher admits them.
   const trimmed = pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
   const raw = trimmed.split("/");
+  // The wave-9 site root (pages/dashboard.tsx — upstream Home): the
+  // dashboard for a signed-in viewer, the landing page for anonymous. The
+  // trailing-slash form canonicalizes to this shape through the trim above.
+  if (raw.length === 1 && raw[0] === "") return { family: "site-home" };
   if (raw.length < 2) return null; // need at least /owner
   if (raw.slice(1).some((segment) => segment === "")) return null;
+
+  // The wave-9 explore family (pages/explore.tsx — upstream web.go:549-556):
+  // EXACT literal shapes claimed before the owner/repo parse could read
+  // `/explore/repos` as a repository. Any other tail (organizations, code,
+  // sitemap-*, deeper) stays unclaimed — the engine/parent 404s it, exactly
+  // like upstream's unregistered routes. A same-named user namespace
+  // (`/EXPLORE`, or `/e%78plore`'s decoded form) keeps the owner-home
+  // family — the literals bind case-sensitively, like the chi patterns.
+  if (raw[1] === "explore") {
+    if (raw.length === 2) return { family: "explore-root" };
+    if (raw.length === 3 && raw[2] === "repos") return { family: "explore-repos" };
+    if (raw.length === 3 && raw[2] === "users") return { family: "explore-users" };
+    return null;
+  }
 
   let owner: string;
   try {
@@ -1141,6 +1204,54 @@ async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEdito
 }
 
 /**
+ * GET / — the site root (pages/dashboard.tsx — upstream `Home`,
+ * routers/web/home.go:26-44): the session prologue WITHOUT the repo read,
+ * then the viewer-kind dispatch — a signed-in viewer gets the dashboard
+ * (pages wave 9: the derived-thread activity lines + the own/watched repo
+ * lists), an anonymous viewer the upstream landing page. Only the manifest
+ * half can fail here (the 503); the page reads degrade per their loaders.
+ */
+async function siteHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, respond } = resolved;
+  if (viewer.kind === "user") {
+    const data = await loadDashboardData(c.env.DB, viewer);
+    return respond(c.html(renderDashboardPage(ctx, data), 200));
+  }
+  return respond(c.html(renderLandingPage(ctx), 200));
+}
+
+/**
+ * GET /explore — upstream web.go:550-552: a plain redirect onto the repos
+ * page (upstream ctx.Redirect, 303 per base.go:157).
+ */
+function exploreRoot(): Response {
+  return new Response(null, { status: 303, headers: { location: "/explore/repos" } });
+}
+
+/** GET /explore/repos (pages/explore.tsx — the repo search page; anonymous
+ *  sees public rows, a session viewer gains their own private repos — the
+ *  upstream `Private: ctx.Doer != nil` scope in the search service seam). */
+async function exploreReposPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  const data = await loadExploreReposData(c.env.DB, viewer, url.searchParams);
+  return respond(c.html(renderExploreReposPage(ctx, data), 200));
+}
+
+/** GET /explore/users (pages/explore.tsx — the user search page; the
+ *  landed user-search predicate + the upstream Types/IsActive gates). */
+async function exploreUsersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, respond } = resolved;
+  const data = await loadExploreUsersData(c.env.DB, url.searchParams);
+  return respond(c.html(renderExploreUsersPage(ctx, data), 200));
+}
+
+/**
  * POST /{owner}/{repo}/{issues|pulls}/{index}/comments (pages/issue-detail.tsx
  * — upstream NewComment, routers/web/repo/issue_comment.go:37-118): the §2.8
  * Origin guard, the same repo→viewer order as the GET pages (invisible repos
@@ -1293,6 +1404,19 @@ uiRouter.use(trimTrailingSlash());
 // unregistered (GET-only surface, §2.1): a HEAD request misses into the
 // parent app's plain 404 — identical to today's engine answer for these
 // paths.
+//
+// Wave-9 site families register FIRST, physically before every dynamic
+// family: the explore literals (/explore, /explore/repos, /explore/users)
+// and the site root must win against /:owner/:repo and the owner regex —
+// registration order is what makes the static-before-dynamic precedence
+// local and obvious (the same rule the /issues/new literal follows below).
+// Verified against this Hono pin's RegExpRouter: a static registered after
+// the dynamic pair LOSES to it — /explore/repos would land in uiPage's
+// drift guard and 404.
+uiRouter.get("/", (c) => siteHomePage(c));
+uiRouter.get("/explore", () => exploreRoot());
+uiRouter.get("/explore/repos", (c) => exploreReposPage(c));
+uiRouter.get("/explore/users", (c) => exploreUsersPage(c));
 uiRouter.get("/:owner/:repo", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));

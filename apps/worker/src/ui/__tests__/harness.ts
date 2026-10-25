@@ -37,7 +37,9 @@ import {
 } from "../testing/seed-repo";
 import { IssuesService } from "../../issues/service";
 import { createRepoLabel } from "../../api/services/labels";
+import { isWatchingRepo, watchRepo } from "../../api/services/repo-watchers";
 import { saveRepoSettings } from "../../api/services/repo-settings";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { OrgService } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
 
@@ -123,9 +125,33 @@ const ALT_COMMITS: SeedCommit[] = [
 
 /** Route-level render through the mounted uiRouter — the real production
  *  path (parse → resolve → load → renderPage), with the synthetic manifest. */
-export async function renderRoute(path: string): Promise<{ status: number; html: string }> {
-  const res = await uiRouter.fetch(new Request(`https://test.local${path}`), uiEnv);
+export async function renderRoute(path: string, init?: RequestInit): Promise<{ status: number; html: string }> {
+  const res = await uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
   return { status: res.status, html: await res.text() };
+}
+
+/** A signed-in render of one golden case: the session cookie rides the
+ *  request when the case says so (the wave-9 dashboard golden; anonymous is
+ *  every pre-wave-9 case). */
+export async function renderCase(golden: GoldenCase): Promise<{ status: number; html: string }> {
+  if (golden.signedIn !== true) return renderRoute(golden.path);
+  return renderRoute(golden.path, { headers: { cookie: `${SESSION_COOKIE_NAME}=${await aliceSessionCookie()}` } });
+}
+
+/** Alice's session cookie, minted once per module (the wave-4 pattern; the
+ *  value is never rendered). */
+let aliceSession: string | null = null;
+export async function aliceSessionCookie(): Promise<string> {
+  if (aliceSession === null) {
+    const alice = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "alice"))
+      .get();
+    if (alice === undefined) throw new Error("golden owner row missing before the session mint");
+    aliceSession = await mintSession(env.DB, alice.id);
+  }
+  return aliceSession;
 }
 
 // --- the golden inventory (§5.2: three pages + 404 shell + bare shell) ---------
@@ -137,6 +163,11 @@ export interface GoldenCase {
   path: string;
   /** Expected HTTP status (404 shells are goldens too, §4.5). */
   status: number;
+  /** Render signed-in (pages wave 9 — the dashboard golden): the route
+   *  request carries alice's session cookie. The cookie value itself is
+   *  crypto-random per run and never rendered, so the bytes stay stable
+   *  (§5.2 determinism is a fixture property). */
+  signedIn?: boolean;
 }
 
 export const GOLDEN_CASES: GoldenCase[] = [
@@ -176,6 +207,14 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // closed-stamp line + the 100% milestone).
   { file: "milestones-open.html", path: "/alice/golden-ms/milestones", status: 200 },
   { file: "milestones-closed.html", path: "/alice/golden-ms/milestones?state=closed", status: 200 },
+  // Site root + explore (wave 9): the anonymous landing, the signed-in
+  // dashboard (alice — own repos + the watched anvil + the anvil activity
+  // line), and the two explore pages (anonymous — public rows, active
+  // individual users).
+  { file: "landing.html", path: "/", status: 200 },
+  { file: "dashboard.html", path: "/", status: 200, signedIn: true },
+  { file: "explore-repos.html", path: "/explore/repos", status: 200 },
+  { file: "explore-users.html", path: "/explore/users", status: 200 },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
@@ -460,6 +499,54 @@ async function seedGoldenMilestones(): Promise<void> {
   await svc.updateMilestone(v09.id, { state: "closed", now: t(70) });
 }
 
+/**
+ * The wave-9 dashboard fixtures (the signed-in `/` golden): alice watches
+ * the public `acme/anvil`, and morgan (the org owner) files one issue on it
+ * at a fixed time — the watcher-arm recipient with foreign activity behind
+ * the dashboard's single activity line. Both writes are idempotent, and
+ * NEITHER touches a committed golden: anvil has no repo-scoped golden (the
+ * org home renders the open-pulls counter only), so the new issue row and
+ * the watcher row change no existing bytes.
+ */
+async function seedGoldenDashboard(): Promise<void> {
+  const db = drizzle(env.DB);
+  const anvil = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "acme"), eq(repositories.slug, "anvil")))
+    .get();
+  const morgan = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "morgan"))
+    .get();
+  const alice = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "alice"))
+    .get();
+  if (anvil === undefined || morgan === undefined || alice === undefined) {
+    throw new Error("golden dashboard fixture rows missing (org seed must run first)");
+  }
+  if (!(await isWatchingRepo(env.DB, anvil.id, alice.id))) {
+    await watchRepo(env.DB, anvil.id, alice.id, new Date(T0 * 1000));
+  }
+  const existing = await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, anvil.id)).limit(1).all();
+  if (existing.length === 0) {
+    await new IssuesService(env.DB).createIssue({
+      repoId: anvil.id,
+      title: "anvil: orders bounce at the cliff edge",
+      content: "Every delivery so far has ended at the bottom of the mesa.",
+      posterId: morgan.id,
+      now: new Date((T0 + 200) * 1000),
+    });
+  }
+  // The explore-users golden renders "Joined on" from the users rows — pin
+  // morgan's like alice's (seedVerifiedUser stamps wall-clock time; §5.2
+  // determinism is a fixture property).
+  await drizzle(env.DB).update(users).set({ createdAt: new Date(T0 * 1000) }).where(eq(users.id, morgan.id));
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
@@ -496,6 +583,7 @@ export function setupGoldenFixtures(): void {
     await seedGoldenPullDiff();
     await seedGoldenOrg();
     await seedGoldenMilestones();
+    await seedGoldenDashboard();
     // Wave 7: the user-profile golden renders the shared/repo/list rows'
     // "Updated {TimeSince}" from `repositories.updated_at` — the issue and
     // milestone seeders above stamp it with wall-clock time (the counter-

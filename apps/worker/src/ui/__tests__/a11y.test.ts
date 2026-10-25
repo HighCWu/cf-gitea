@@ -10,11 +10,15 @@ import { describe, expect, it } from "vitest";
 import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } from "./a11y";
 import bareShellGolden from "./goldens/bare-shell.html?raw";
 import commitsGolden from "./goldens/commits.html?raw";
+import dashboardGolden from "./goldens/dashboard.html?raw";
+import exploreReposGolden from "./goldens/explore-repos.html?raw";
+import exploreUsersGolden from "./goldens/explore-users.html?raw";
 import fileViewCodeGolden from "./goldens/file-view-code.html?raw";
 import homeGolden from "./goldens/home.html?raw";
 import issueDetailGolden from "./goldens/issue-detail.html?raw";
 import issuesClosedGolden from "./goldens/issues-closed.html?raw";
 import issuesOpenGolden from "./goldens/issues-open.html?raw";
+import landingGolden from "./goldens/landing.html?raw";
 import milestonesClosedGolden from "./goldens/milestones-closed.html?raw";
 import milestonesOpenGolden from "./goldens/milestones-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
@@ -45,6 +49,10 @@ const goldens: Record<string, string> = {
   "milestones-closed.html": milestonesClosedGolden,
   "not-found-repo.html": notFoundRepoGolden,
   "bare-shell.html": bareShellGolden,
+  "landing.html": landingGolden,
+  "dashboard.html": dashboardGolden,
+  "explore-repos.html": exploreReposGolden,
+  "explore-users.html": exploreUsersGolden,
 };
 
 function classList(el: { attrs: Record<string, string> }): string[] {

@@ -134,27 +134,40 @@ function Head(props: { ctx: UiContext; title: string }) {
 
 /**
  * The navbar for both viewer kinds (SPEC-0010 §2.5 — the only component
- * change sessions make). Anonymous viewers gain the Sign in link (`/login` —
- * deliberately absent before SPEC-0010; Explore stays unrendered: no explore
- * page exists). User viewers gain the upstream signed-in chrome REDUCED to
- * the username + a sign-out POST button (head_navbar.tmpl at the pin, minus
- * everything that needs services we have not built: no `+` create menu, no
- * notification bell, no avatar image — the avatar pipeline does not exist).
- * Wave 7 (the dead-link unlock): the username anchors the `/{username}`
- * profile (head_navbar.tmpl:98's `HomeLink()` shape, via the shared
- * `userLink` helper) — before the profile page existed it was plain text
- * (§2.4.1: dead links are not emitted).
+ * change sessions make). Anonymous viewers keep the Sign in link (`/login`,
+ * navbar-right) and the Help item; user viewers gain the upstream signed-in
+ * chrome REDUCED to the username + a sign-out POST button (head_navbar.tmpl
+ * at the pin, minus everything that needs services we have not built: no `+`
+ * create menu, no notification bell, no avatar image — the avatar pipeline
+ * does not exist). Wave 7 (the dead-link unlock): the username anchors the
+ * `/{username}` profile (head_navbar.tmpl:98's `HomeLink()` shape, via the
+ * shared `userLink` helper) — before the profile page existed it was plain
+ * text (§2.4.1: dead links are not emitted). Wave 9 (the explore unlock):
+ * the Explore item anchors `/explore/repos` at the head of navbar-left for
+ * BOTH viewer kinds (head_navbar.tmpl:31 — upstream renders it for anonymous
+ * viewers too), active-tracked through `activeNav`; before the explore
+ * pages existed the link was unrendered (the same dead-link rule in
+ * reverse). The logo's aria-label follows upstream head_navbar.tmpl:2:
+ * "dashboard" signed in, "home_title" anonymous. The signed-in Issues/Pull
+ * Requests items (head_navbar.tmpl:11-18) stay unrendered — their dashboard
+ * pages do not exist. The Help item keeps its landed placement (navbar-left,
+ * both viewer kinds — upstream moves it into the signed-in user dropdown,
+ * which is degraded away).
  */
-export function Navbar(props: { viewer: Viewer }) {
+export function Navbar(props: { viewer: Viewer; activeNav?: "explore" }) {
+  const logoLabel = props.viewer.kind === "user" ? locale.dashboard : locale.home_title;
   return (
     <nav id="navbar" aria-label={locale.navbar_aria}>
-      <a class="item" id="navbar-logo" href="/" aria-label={locale.home_title}>
+      <a class="item" id="navbar-logo" href="/" aria-label={logoLabel}>
         <img width="30" height="30" src="/assets/img/logo.svg" alt={locale.logo} aria-hidden="true" />
       </a>
       <button type="button" class="item btn only-mobile" id="navbar-expand-toggle" aria-label={locale.nav_menu}>
         <Icon name="octicon-three-bars" />
       </button>
       <div class="navbar-list navbar-left">
+        <a class={props.activeNav === "explore" ? "active item" : "item"} href="/explore/repos">
+          {locale.explore}
+        </a>
         <a class="item" target="_blank" href="https://docs.gitea.com">
           {locale.help}
         </a>
@@ -316,6 +329,9 @@ export function BaseLayout(props: {
   pageClass?: string;
   /** Active repo tab when a repo header is rendered. */
   activeTab?: RepoTab;
+  /** Active navbar item (wave 9: the explore pages — upstream
+   *  `.PageIsExplore`). */
+  activeNav?: "explore";
   children?: Child;
 }) {
   const { ctx } = props;
@@ -327,7 +343,7 @@ export function BaseLayout(props: {
       <body>
         <div class="full height">
           <noscript>{locale.enable_javascript}</noscript>
-          <Navbar viewer={ctx.viewer} />
+          <Navbar viewer={ctx.viewer} activeNav={props.activeNav} />
           <div
             role="main"
             aria-label={props.title ?? pageTitle}
