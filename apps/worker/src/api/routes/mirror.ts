@@ -39,12 +39,15 @@ import { repositorySchema } from "../models/repository";
  *    OpenAPI document and scripts/check-openapi.mjs guards its response
  *    subset — unlike the repo-scoped family below).
  *
- *  - THE REPO-SCOPED FAMILY — NON-CONTRACT, plain Hono, exactly like the
- *    imports family: these paths are OUTSIDE the frozen SPEC-0004 swagger
- *    inventory (the into-empty attach has no upstream path key), so they must
- *    NOT enter the generated OpenAPI document and must stay engine-free in
- *    the route module graph (scripts/check-openapi.mjs bundles
+ *  - THE REPO-SCOPED FAMILY — mostly NON-CONTRACT, plain Hono, exactly like
+ *    the imports family: these paths were OUTSIDE the frozen SPEC-0004 swagger
+ *    inventory when they landed (the into-empty attach has no upstream path
+ *    key), so they must NOT enter the generated OpenAPI document and must stay
+ *    engine-free in the route module graph (scripts/check-openapi.mjs bundles
  *    src/api/openapi.ts — see api/services/mirror.ts for the boundary note).
+ *    EXCEPTION: POST /repos/{owner}/{repo}/mirror-sync IS a contract path
+ *    (upstream repoMirrorSync) and is DECLARED below (converted in place by
+ *    the wave-api-tokens-times-aggregates batch; behavior unchanged).
  *
  *    POST /repos/{owner}/{repo}/migrate       attach a pull mirror to an
  *                                             EXISTING EMPTY repo: validate
@@ -279,23 +282,50 @@ export function registerMirrorRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Midd
   // and a mirror row — upstream's exact `400 "Repository is not a mirror"`
   // otherwise (repo/mirror.go:29-77). 200 with an EMPTY body on enqueue,
   // like upstream; the sync itself runs on the queue consumer.
-  app.post("/repos/:owner/:repo/mirror-sync", requireAuth, async (c) => {
-    const { owner, repo } = c.req.param();
-    const viewer = viewerOf(c);
-    const found = await findRepositoryByPath(c.env.DB, owner, repo);
-    if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) throw new ApiError(404, "not found");
-    if (!repositoryPermissions(viewer, found.repo).push) {
-      throw new ApiError(403, "mirror sync requires write access to the repository");
-    }
-    if (found.repo.isArchived) {
-      throw new ApiError(409, "repository is archived");
-    }
-    if (!(await getMirrorStatus(c.env.DB, found.repo.id))) {
-      throw new ApiError(400, "Repository is not a mirror");
-    }
-    const queue = c.env.MIRROR_SYNC_QUEUE;
-    if (!queue) throw new ApiError(500, "MIRROR_SYNC_QUEUE binding missing");
-    await queue.send({ kind: "mirror-sync", repoId: found.repo.id });
-    return c.body(null, 200);
-  });
+  //
+  // DECLARED (upstream repoMirrorSync, responses {200,403,404} — the
+  // api-remaining-inventory batch wave-api-tokens-times-aggregates converted
+  // this plain route in place; behavior unchanged): the served 400/409 arms
+  // stay RUNTIME-ONLY-UNDECLARED per the landed convention (the contract
+  // documents neither "Repository is not a mirror" nor the archived 409).
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/repos/{owner}/{repo}/mirror-sync",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Sync a mirrored repository",
+      operationId: "repoMirrorSync",
+      request: {
+        params: z.object({
+          owner: z.string().min(1).openapi({ description: "owner of the repo" }),
+          repo: z.string().min(1).openapi({ description: "name of the repo" }),
+        }),
+      },
+      responses: {
+        200: { description: "empty" },
+        403: { description: "forbidden", content: { "application/json": { schema: apiErrorSchema } } },
+        404: { description: "notFound", content: { "application/json": { schema: apiErrorSchema } } },
+      },
+    }),
+    async (c) => {
+      const { owner, repo } = c.req.valid("param");
+      const viewer = viewerOf(c);
+      const found = await findRepositoryByPath(c.env.DB, owner, repo);
+      if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) throw new ApiError(404, "not found");
+      if (!repositoryPermissions(viewer, found.repo).push) {
+        throw new ApiError(403, "mirror sync requires write access to the repository");
+      }
+      if (found.repo.isArchived) {
+        throw new ApiError(409, "repository is archived");
+      }
+      if (!(await getMirrorStatus(c.env.DB, found.repo.id))) {
+        throw new ApiError(400, "Repository is not a mirror");
+      }
+      const queue = c.env.MIRROR_SYNC_QUEUE;
+      if (!queue) throw new ApiError(500, "MIRROR_SYNC_QUEUE binding missing");
+      await queue.send({ kind: "mirror-sync", repoId: found.repo.id });
+      return c.body(null, 200);
+    },
+  );
 }
