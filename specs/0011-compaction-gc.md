@@ -243,13 +243,34 @@ capability matrix **test-generated** (`AdvertisedFeature ⇒ ParsedAndHandled` �
 round 8's consistency gate; never hand-maintained); cheap differential testing
 vs a real Gitea instance (diffs explainable by declared compatibility rules).
 
-## 8. Engine schema evolution note
+## 8. Engine schema evolution — LANDED as M3.0 (commit eab5cf2)
 
-`SCHEMA_VERSION` (`store.ts:16`, currently `"0001a-step4"`) is a dev-scratch
-guard, not a migration mechanism (`store.ts:91` treats mismatch as scratch
-state). M3 needs the first REAL DO schema migration: add `pack_catalog.state`,
-lease payload v2, and a forward-only migration path with an upgrade txn.
-Designing that mechanism is milestone M3.0 — it precedes everything else.
+The mechanism (as built, replacing the original note below): a dedicated
+`schema_migrations (id, applied_at)` journal table — per-step records
+represent partially-upgraded databases exactly (an isolate death mid-upgrade
+resumes correctly), the journal doubles as the downgrade tripwire (an id the
+running build does not know = DB ahead of code → refuse; rollback past a
+step is unsupported by design), and steps run ordered, idempotent, each with
+its journal insert atomic under the caller's `transactionSync`. Baseline 0001
+keeps `meta.schema_version = "0001a-step4"` so a rollback deploy to the
+pre-M3.0 build (whose constructor wipes on marker mismatch) never wipes a
+migrated DB. Unrecognized pre-baseline states are **sealed stores**: the
+decision writes nothing, every data access raises a distinct
+`[schema sealed]` diagnostic, and exactly one request is served — the
+explicit DELETE (the sanctioned destroy channel), which wipes loudly and
+unseals; `rpcBind`/`alarm` stay sealed-aware so a sealed cell is never
+undeletable. Constructor-time auto-reset exists only under an explicit
+`allowUnknownSchemaReset` option, logging loudly first. Demonstrator 0002 is
+a real secondary index (`pack_objects(pack_key, oid)`) with the planner
+change pinned by EXPLAIN QUERY PLAN. All future schema changes land as
+ordered steps in `REPO_MIGRATIONS`/`REGISTRY_MIGRATIONS` — never another
+version-bump-and-wipe. Verified by `e2e/check-migrations.mjs` (17 checks).
+
+*Original note (superseded):* `SCHEMA_VERSION` (`store.ts:16`, currently
+`"0001a-step4"`) was a dev-scratch guard, not a migration mechanism
+(`store.ts:91` treated mismatch as scratch state). M3 needed the first REAL
+DO schema migration: `pack_catalog.state`, lease payload v2, and a
+forward-only migration path with an upgrade txn.
 
 ## 9. Milestones
 
