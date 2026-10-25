@@ -115,6 +115,16 @@ const RUNTIME_ONLY_RESPONSES = {
       404: "the /users/{username} subgroup's context.UserAssignmentAPI() answers 404 'user redirect does not exist [name: …]' for an unknown username at runtime (gitea/services/context/user.go userAssignment; emitted by routes/misc-t3.ts resolveAdminTargetRow); the contract documents {201,403,422} only",
     },
   },
+  "/admin/cron/{task}": {
+    post: {
+      403: "the /admin group's reqSiteAdmin 403s non-admins before the handler runs (gitea/routers/api/v1/api.go:1824-); upstream's own swagger comment for adminCronRun documents only {204,404} while its sibling adminCronList DOES declare the 403 (admin/cron.go) — a doc-comment gap upstream sends anyway; declared by routes/admin-degenerate.ts",
+    },
+  },
+  "/admin/unadopted/{owner}/{repo}": {
+    delete: {
+      404: "upstream's DeleteUnadoptedRepository answers APIErrorNotFound() at runtime for an unknown owner, an already-adopted repo and a repo absent from disk — every branch of the handler (gitea/routers/api/v1/admin/adopt.go) — though its swagger documents only {204,403}; in cf-gitea the absent-from-disk branch is EVERY call (no filesystem — routes/admin-degenerate.ts), so the 404 is the operation's one reachable outcome behind the gates",
+    },
+  },
 };
 
 /**
