@@ -1,0 +1,480 @@
+/**
+ * The issues list page, `/{owner}/{repo}/issues` — and the pulls list,
+ * `/{owner}/{repo}/pulls`, which reuses the same component over the same
+ * issue rows with `is_pull = 1` (a PR IS an issue row with a `pull_requests`
+ * extension, SPEC-0005 §3.2; the pull extension fields — branch pair, CI
+ * statuses — are not rendered v1). Pages wave 2 (SPEC-0008 U3 extension).
+ *
+ * ## DOM contract (templates/repo/issue/list.tmpl + shared/issuelist.tmpl +
+ *  shared/issueicon.tmpl + repo/issue/openclose.tmpl at the pin)
+ *
+ * `.page-content.repository.issue-list` (both lists share the upstream
+ * template), `div#issue-list.flex-divided-list.items-with-main` with one
+ * `.item` per row (`.item-main` > `.item-header` title + `.labels-list`
+ * badges, `.item-body` #index / event line / milestone), `.item-trailing`
+ * comment count, the `small-menu-items ui compact tiny menu` open/closed
+ * tabs, and the `tw-text-center tw-p-8` empty state.
+ *
+ * ## Documented v1 degradations (data that has no landed source, §6 method)
+ *
+ * - State glyphs (`shared/issueicon.tmpl`: octicon-issue-opened/closed,
+ *   octicon-git-pull-request): the icon allowlist is the generator's
+ *   committed constant (scripts/gen-ui-icons.mjs — outside this wave's file
+ *   ownership), so no issue-family octicons exist yet. The `.item-leading`
+ *   slot is omitted and state is carried textually: the Open/Closed tab
+ *   counts and the "opened/closed …" event line verbs. Restoring the glyphs
+ *   is one allowlist line + `pnpm gen:icons` + this template spot.
+ * - Milestone badge renders as plain text (upstream links
+ *   `/{repo}/milestone/{id}` — no milestone page exists; the §2.4.1 rule
+ *   "dead links are not emitted" wins over the upstream shape).
+ * - Poster names are plain text (upstream links the `/{username}` profile —
+ *   no profile page exists this slice).
+ * - Issue links are the upstream-shaped `/{owner}/{repo}/issues/{index}`;
+ *   the detail page is future work, so they land on the engine 404 — the
+ *   same sanctioned posture as the slice-1 commit links (open question 1).
+ * - Search box, label/milestone management buttons and the New button are
+ *   not rendered (no search route, write actions need auth §2.5, dead links
+ *   forbidden §2.4.1). The `?labels=` / `?milestone=` FILTERS are wired —
+ *   the label badges link into them (upstream QueryBuild parity, reduced to
+ *   the params this page actually honors).
+ * - Event line timestamp: `createdAt` for open issues, `closedAt` for
+ *   closed ones (upstream computes the full last-event timeline; the
+ *   denormalized columns carry the same facts for this render). Rendered
+ *   through the shared `<relative-time>` component — no timestamps-of-render.
+ *
+ * Data comes from the tier-1 service layer directly (§3.2: never a
+ * self-fetch): `listRepoIssues` + `issueLabelRows` +
+ * `milestoneIdsByRepoEntries` (src/api/services/issues.ts) plus two small
+ * batched D1 lookups (milestone names, poster names). Anonymous, public
+ * repos only — the router resolved the row before this loader runs (§2.5).
+ */
+
+import { inArray } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+
+import {
+  issueLabelRows,
+  listRepoIssues,
+  milestoneIdsByRepoEntries,
+  type IssueListFilters,
+} from "../../api/services/issues";
+import type { IssueRow, LabelRow, MilestoneRow } from "../../issues/service";
+import { milestones, users } from "../../db/schema";
+import { TimeSince } from "../components/file-list";
+import { parsePageNumber } from "../page-data";
+import { BaseLayout, renderPage } from "../shell";
+import type { UiContext } from "../ui-context";
+
+/** Page chrome text (component-local, the components/commit-list.tsx
+ *  pattern — locale.ts is shared and not this wave's file). */
+export const issuesLocale = {
+  issues: "Issues", // "repo.issues"
+  pulls: "Pull Requests", // "repo.pulls"
+  open_title: "Open", // "repo.issues.open_title"
+  closed_title: "Closed", // "repo.issues.closed_title"
+  noResults: "No results", // "repo.issues.filter_no_results"
+  noResultsPlaceholder: "Try adjusting your search filters.", // "repo.issues.filter_no_results_placeholder"
+} as const;
+
+/** Upstream `setting.UI.IssuePagingNum` (modules/setting/ui.go:89). */
+export const ISSUES_PAGE_SIZE = 20;
+
+// ---------------------------------------------------------------------------
+// Color helpers — upstream modules/util/color.go (RenderLabel text contrast)
+// ---------------------------------------------------------------------------
+
+/** `HexToRBGColor` (color.go:14-29): rgb/rrggbb(/+aa) only, else 0,0,0. */
+function hexChannels(color: string): [number, number, number] {
+  const hexString = color.startsWith("#") ? color.slice(1) : color;
+  let six = hexString;
+  if (six.length === 3 || six.length === 4) {
+    six = six
+      .slice(0, 3)
+      .split("")
+      .map((c) => `${c}${c}`)
+      .join("");
+  }
+  if (six.length === 8) six = six.slice(0, 6);
+  if (six.length !== 6) return [0, 0, 0];
+  const channel = (at: number): number => Number.parseInt(six.slice(at, at + 2), 16);
+  return [channel(0), channel(2), channel(4)];
+}
+
+/** `linearizeChannel` (color.go:42-48). */
+function linearizeChannel(channel: number): number {
+  const srgb = channel / 255;
+  if (srgb <= 0.04045) return srgb / 12.92;
+  return ((srgb + 0.055) / 1.055) ** 2.4;
+}
+
+/** `ContrastColor` (color.go:69-74 via getRelativeLuminance:64-66). */
+export function contrastColor(background: string): "#fff" | "#000" {
+  const [r, g, b] = hexChannels(background);
+  const luminance = 0.2126 * linearizeChannel(r) + 0.7152 * linearizeChannel(g) + 0.0722 * linearizeChannel(b);
+  return luminance < 0.36 ? "#fff" : "#000";
+}
+
+/** A renderable label color: only the stored `#RRGGBB` shape is trusted;
+ *  anything else renders the class-less badge (never break the page). */
+function labelColor(raw: string | null): string | null {
+  return raw !== null && /^#[0-9a-fA-F]{6}$/.test(raw) ? raw : null;
+}
+
+/** `RenderLabel`'s regular-label case (util_render.go:118-121, minus the
+ *  emoji pass and the archived variant): the inline-styles badge the Gitea
+ *  CSS shapes. Wrapped by the issuelist anchor in the row renderer. */
+export function LabelBadge(props: { label: LabelRow }) {
+  const color = labelColor(props.label.color);
+  return (
+    <span
+      class="ui label"
+      style={color === null ? undefined : `color: ${contrastColor(color)} !important; background-color: ${color} !important;`}
+      title={props.label.description ?? ""}
+    >
+      <span class="gt-ellipsis">{props.label.name}</span>
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Data loading (§3.2 direct service calls)
+// ---------------------------------------------------------------------------
+
+/** One rendered row's everything (the issue row + its joined badges). */
+export interface IssueListItem {
+  issue: IssueRow;
+  labels: LabelRow[];
+  milestone: MilestoneRow | null;
+  /** Display-cased poster username; `null` = no poster (mirrored imports). */
+  posterName: string | null;
+}
+
+/** The issues/pulls page render inputs, loaded by loadIssuesListData. */
+export interface IssuesListData {
+  listKind: "issues" | "pulls";
+  /** The state tab in force — upstream has no "all" tab on this page. */
+  state: "open" | "closed";
+  page: number;
+  items: IssueListItem[];
+  /** The filtered open/closed totals behind the tab counts (upstream
+   *  OpenCount/ClosedCount — computed over the same label/milestone filter). */
+  openCount: number;
+  closedCount: number;
+  more: boolean;
+  /** The active single filter facets, echoed into tab/pagination hrefs. */
+  labelIds: number[];
+  milestoneId: number | null;
+}
+
+/** `?labels=` — comma-separated label ids (upstream stringsToInts split);
+ *  non-numeric and non-positive entries are dropped. */
+export function parseLabelIds(raw: string | null): number[] {
+  if (raw === null) return [];
+  return raw
+    .split(",")
+    .map((entry) => Number.parseInt(entry, 10))
+    .filter((entry) => Number.isInteger(entry) && entry > 0);
+}
+
+/** `?state=` — anything but "closed" is open (upstream parseStateFilter's
+ *  default branch; no "all" tab is rendered, §2.4.1 dead-UI rule). */
+export function parseListState(raw: string | null): "open" | "closed" {
+  return raw === "closed" ? "closed" : "open";
+}
+
+function unixSeconds(date: Date): number {
+  return Math.floor(date.getTime() / 1000);
+}
+
+/**
+ * Load the list (§3.2): one filtered page read + two 1-row count reads (the
+ * tab totals) + per-row label joins (≤ 20, same-DB — the enrichTreeCommits
+ * fan-out pattern) + two batched name lookups (milestones, posters).
+ */
+export async function loadIssuesListData(
+  d1: D1Database,
+  repoId: string,
+  listKind: "issues" | "pulls",
+  params: URLSearchParams,
+): Promise<IssuesListData> {
+  const state = parseListState(params.get("state"));
+  const page = parsePageNumber(params.get("page"));
+  const labelIds = parseLabelIds(params.get("labels"));
+
+  let milestoneId: number | null = null;
+  const milestoneParam = params.get("milestone");
+  if (milestoneParam !== null && milestoneParam !== "") {
+    // Upstream ListIssues milestone filter: name first, numeric id fallback.
+    const ids = await milestoneIdsByRepoEntries(d1, repoId, [milestoneParam]);
+    milestoneId = ids[0] ?? null;
+  }
+
+  const filters: IssueListFilters = {
+    isClosed: state === "closed",
+    isPull: listKind === "pulls",
+    keyword: "",
+    labelIds,
+    milestoneIds: milestoneId === null ? [] : [milestoneId],
+    since: null,
+    before: null,
+    page,
+    limit: ISSUES_PAGE_SIZE,
+  };
+
+  const db = drizzle(d1);
+  const [listPage, openPage, closedPage] = await Promise.all([
+    listRepoIssues(d1, repoId, filters),
+    listRepoIssues(d1, repoId, { ...filters, isClosed: false, page: 1, limit: 1 }),
+    listRepoIssues(d1, repoId, { ...filters, isClosed: true, page: 1, limit: 1 }),
+  ]);
+
+  const items: IssueListItem[] = await Promise.all(
+    listPage.items.map(async (issue) => ({
+      issue,
+      labels: await issueLabelRows(d1, issue.id),
+      milestone: null,
+      posterName: null,
+    })),
+  );
+
+  // Batched milestone names (unique ids across the page).
+  const milestoneIds = [...new Set(items.map((item) => item.issue.milestoneId).filter((id): id is number => id !== null))];
+  if (milestoneIds.length > 0) {
+    const rows = await db.select().from(milestones).where(inArray(milestones.id, milestoneIds)).all();
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    for (const item of items) {
+      item.milestone = item.issue.milestoneId === null ? null : (byId.get(item.issue.milestoneId) ?? null);
+    }
+  }
+
+  // Batched poster display names.
+  const posterIds = [...new Set(items.map((item) => item.issue.posterId).filter((id): id is number => id !== null))];
+  if (posterIds.length > 0) {
+    const rows = await db.select({ id: users.id, username: users.username }).from(users).where(inArray(users.id, posterIds)).all();
+    const byId = new Map(rows.map((row) => [row.id, row.username]));
+    for (const item of items) {
+      item.posterName = item.issue.posterId === null ? null : (byId.get(item.issue.posterId) ?? null);
+    }
+  }
+
+  return {
+    listKind,
+    state,
+    page,
+    items,
+    openCount: openPage.total,
+    closedCount: closedPage.total,
+    more: page * ISSUES_PAGE_SIZE < listPage.total,
+    labelIds,
+    milestoneId,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Components
+// ---------------------------------------------------------------------------
+
+/** The canonical list URL for one state + filter set (state=open is the
+ *  default and never emitted; page resets — upstream QueryBuild tabs). */
+function listHref(basePath: string, state: "open" | "closed", labelIds: number[], milestoneId: number | null, page?: number): string {
+  const params = new URLSearchParams();
+  if (state === "closed") params.set("state", "closed");
+  if (labelIds.length > 0) params.set("labels", labelIds.join(","));
+  if (milestoneId !== null) params.set("milestone", String(milestoneId));
+  if (page !== undefined && page > 1) params.set("page", String(page));
+  const query = params.toString();
+  return query === "" ? basePath : `${basePath}?${query}`;
+}
+
+/** The open/closed tab menu (repo/issue/openclose.tmpl, minus the state
+ *  octicons — allowlist degradation, header comment). */
+export function OpenCloseTabs(props: {
+  basePath: string;
+  state: "open" | "closed";
+  openCount: number;
+  closedCount: number;
+  labelIds: number[];
+  milestoneId: number | null;
+  openTitle: string;
+  closedTitle: string;
+}) {
+  const tab = (count: number, title: string): string => {
+    return count === 1 ? `1 ${title}` : `${count} ${title}`;
+  };
+  return (
+    <div class="small-menu-items ui compact tiny menu">
+      <a
+        class={props.state === "open" ? "active item flex-text-inline" : "item flex-text-inline"}
+        href={listHref(props.basePath, "open", props.labelIds, props.milestoneId)}
+      >
+        {tab(props.openCount, props.openTitle)}
+      </a>
+      <a
+        class={props.state === "closed" ? "active item flex-text-inline" : "item flex-text-inline"}
+        href={listHref(props.basePath, "closed", props.labelIds, props.milestoneId)}
+      >
+        {tab(props.closedCount, props.closedTitle)}
+      </a>
+    </div>
+  );
+}
+
+/** The Older/Newer pagination — the commits page's DOM shape
+ *  (div.center.page.buttons), driven by `page * size < total`. */
+export function IssuesPagination(props: {
+  basePath: string;
+  state: "open" | "closed";
+  labelIds: number[];
+  milestoneId: number | null;
+  page: number;
+  more: boolean;
+}) {
+  if (props.page <= 1 && !props.more) return null;
+  return (
+    <div class="center page buttons">
+      <div class="ui borderless pagination menu">
+        {props.page > 1 ? (
+          <a
+            class="item navigation"
+            href={listHref(props.basePath, props.state, props.labelIds, props.milestoneId, props.page - 1)}
+          >
+            <span class="navigation_label">Newer</span>
+          </a>
+        ) : null}
+        {props.more ? (
+          <a
+            class="item navigation"
+            href={listHref(props.basePath, props.state, props.labelIds, props.milestoneId, props.page + 1)}
+          >
+            <span class="navigation_label">Older</span>
+          </a>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/** The event line: "opened {time} by {poster}" / "closed {time} …" — the
+ *  upstream GetLastEventLabel facts from the denormalized columns (header
+ *  comment). Poster is plain text: no profile page exists this slice. */
+function EventLine(props: { item: IssueListItem }) {
+  const { issue } = props.item;
+  const event = issue.isClosed
+    ? (issue.closedAt ?? issue.updatedAt ?? issue.createdAt)
+    : (issue.createdAt ?? issue.updatedAt);
+  return (
+    <div class="flex-text-inline">
+      {issue.isClosed ? "closed" : "opened"}{" "}
+      {event !== null ? <TimeSince unixSeconds={unixSeconds(event)} tz="+0000" /> : null}
+      {props.item.posterName !== null ? <> by {props.item.posterName}</> : null}
+    </div>
+  );
+}
+
+/** One `.item` row of shared/issuelist.tmpl (degradations: header comment). */
+function IssueListItemRow(props: { repoLink: string; item: IssueListItem }) {
+  const { item } = props;
+  const href = `${props.repoLink}/issues/${item.issue.index}`;
+  return (
+    <div class="item">
+      <div class="item-main">
+        <div class="item-header">
+          <div>
+            <a class="list-item-large-title" href={href}>
+              {item.issue.title}
+            </a>
+            {item.labels.length > 0 ? (
+              <span class="labels-list">
+                {item.labels.map((label) => (
+                  <a
+                    class="item"
+                    href={`?state=${item.issue.isClosed ? "closed" : "open"}&labels=${label.id}`}
+                  >
+                    <LabelBadge label={label} />
+                  </a>
+                ))}
+              </span>
+            ) : null}
+          </div>
+        </div>
+        <div class="item-body tw-gap-2">
+          <a class="index flex-text-inline" href={href}>
+            #{item.issue.index}
+          </a>
+          <EventLine item={item} />
+          {item.milestone !== null ? (
+            <span class="milestone flex-text-inline tw-max-w-[300px]">
+              <span class="gt-ellipsis">{item.milestone.name}</span>
+            </span>
+          ) : null}
+        </div>
+      </div>
+      {item.issue.numComments > 0 ? (
+        <div class="item-trailing">
+          <div class="tw-text-text-light">
+            <a class="tw-no-underline muted flex-text-block" href={href}>
+              {item.issue.numComments}
+            </a>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** The full-document render (the render.tsx pattern — `index.ts` stays a
+ *  pure-TS router module, so the JSX invocation lives beside the component). */
+export function renderIssuesListPage(ctx: UiContext, data: IssuesListData): string {
+  return renderPage(<IssuesListPage ctx={ctx} data={data} />);
+}
+
+/** The issues/pulls list page (§2.4.1 discriminator: `repository
+ *  issue-list` — upstream's shared list template serves both lists).
+ *  activeTab stays the shell default: the tab strip renders only landed
+ *  pages (Code/Commits) until the shell's owner extends RepoTab. */
+export function IssuesListPage(props: { ctx: UiContext; data: IssuesListData }) {
+  const { ctx, data } = props;
+  const repo = ctx.repo;
+  if (repo === undefined) throw new Error("IssuesListPage requires ctx.repo");
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  const basePath = data.listKind === "pulls" ? `${repoLink}/pulls` : `${repoLink}/issues`;
+  const title = data.listKind === "pulls" ? issuesLocale.pulls : issuesLocale.issues;
+  return (
+    <BaseLayout ctx={ctx} title={title} pageClass="repository issue-list">
+      <div class="ui container">
+        <div class="issue-list-toolbar-left">
+          <OpenCloseTabs
+            basePath={basePath}
+            state={data.state}
+            openCount={data.openCount}
+            closedCount={data.closedCount}
+            labelIds={data.labelIds}
+            milestoneId={data.milestoneId}
+            openTitle={issuesLocale.open_title}
+            closedTitle={issuesLocale.closed_title}
+          />
+        </div>
+        {data.items.length === 0 ? (
+          <div class="tw-text-center tw-p-8">
+            <h3 class="tw-my-4">{issuesLocale.noResults}</h3>
+            <p class="tw-text-placeholder-text">{issuesLocale.noResultsPlaceholder}</p>
+          </div>
+        ) : (
+          <div id="issue-list" class="flex-divided-list items-with-main">
+            {data.items.map((item) => (
+              <IssueListItemRow repoLink={repoLink} item={item} />
+            ))}
+          </div>
+        )}
+        <IssuesPagination
+          basePath={basePath}
+          state={data.state}
+          labelIds={data.labelIds}
+          milestoneId={data.milestoneId}
+          page={data.page}
+          more={data.more}
+        />
+      </div>
+    </BaseLayout>
+  );
+}

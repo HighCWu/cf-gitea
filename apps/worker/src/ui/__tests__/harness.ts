@@ -24,10 +24,13 @@ import { and, eq } from "drizzle-orm";
 import { beforeAll } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories } from "../../db/schema";
+import { repositories, users } from "../../db/schema";
 import { type UiManifest } from "../manifest";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
+import { IssuesService } from "../../issues/service";
+import { createRepoLabel } from "../../api/services/labels";
+import { issues } from "../../db/schema";
 
 // --- deterministic fixtures (mirrors pages.test.ts's seeding) -----------------
 
@@ -131,6 +134,14 @@ export const GOLDEN_CASES: GoldenCase[] = [
   { file: "home.html", path: "/alice/golden", status: 200 },
   { file: "commits.html", path: "/alice/golden/commits", status: 200 },
   { file: "file-view-code.html", path: "/alice/golden/src/branch/main/app.ts", status: 200 },
+  // The code-tree listing (wave 2): the DOM the /tree family redirects onto
+  // (pages/repo-home.tsx — a redirect itself has no DOM to snapshot).
+  { file: "tree-dir.html", path: "/alice/golden/src/branch/main/docs", status: 200 },
+  // Issues list (wave 2): open (the default), closed (the second tab), and
+  // the pulls list reusing the same component over is_pull rows.
+  { file: "issues-open.html", path: "/alice/golden/issues", status: 200 },
+  { file: "issues-closed.html", path: "/alice/golden/issues?state=closed", status: 200 },
+  { file: "pulls-open.html", path: "/alice/golden/pulls", status: 200 },
   // 404 shell WITH repo context (the repo resolved, the ref did not, §4.5).
   { file: "not-found-repo.html", path: "/alice/golden/commits/branch/nope", status: 404 },
   // Bare shell: 404 for an unknown owner/repo — navbar/main/footer, no repo
@@ -144,6 +155,90 @@ export const GOLDEN_MARKER_START = "@@GOLDEN:";
 export const GOLDEN_MARKER_END = "@@END-GOLDEN@@";
 
 let seeded = false;
+
+/**
+ * Deterministic issue-block fixtures for the wave-2 goldens (issues-open,
+ * issues-closed, pulls-open): two labels, one milestone, three issues (two
+ * open — one carrying both labels, the milestone and a comment — one closed
+ * via the landed transition), and one pull request (is_pull, so /pulls shows
+ * it while /issues hides it). Every write passes a fixed `now`, so the
+ * rendered event lines and counts are byte-stable (§5.2).
+ *
+ * Idempotent like ensureSeededRepo: the presence of ANY issue row for the
+ * golden repo skips the whole block (issue numbers draw from the per-repo
+ * monotonic counter — re-running would duplicate, not converge).
+ */
+async function seedGoldenIssues(): Promise<void> {
+  const db = drizzle(env.DB);
+  const repo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "golden")))
+    .get();
+  if (repo === undefined) throw new Error("golden repo row missing before issue seeding");
+  const existing = await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, repo.id)).limit(1).all();
+  if (existing.length > 0) return;
+
+  const owner = await db
+    .select({ id: users.id, username: users.username })
+    .from(users)
+    .where(eq(users.usernameLower, "alice"))
+    .get();
+  if (owner === undefined) throw new Error("golden owner row missing before issue seeding");
+
+  const svc = new IssuesService(env.DB);
+  const t = (offsetSeconds: number): Date => new Date((T0 + offsetSeconds) * 1000);
+  const bug = await createRepoLabel(env.DB, repo.id, {
+    name: "bug",
+    exclusive: false,
+    color: "#ee0701",
+    description: "Something is broken",
+    isArchived: false,
+    now: t(0),
+  });
+  const enhancement = await createRepoLabel(env.DB, repo.id, {
+    name: "enhancement",
+    exclusive: false,
+    color: "#84b6eb",
+    description: "New feature or request",
+    isArchived: false,
+    now: t(0),
+  });
+  const milestone = await svc.createMilestone({ repoId: repo.id, name: "v1.0", now: t(0) });
+
+  const labeled = await svc.createIssue({
+    repoId: repo.id,
+    title: "open: dark mode toggles twice",
+    content: "Toggling the theme flips it back.",
+    posterId: owner.id,
+    milestoneId: milestone.id,
+    labelIds: [bug.id, enhancement.id],
+    now: t(10),
+  });
+  await svc.createIssue({
+    repoId: repo.id,
+    title: "open: document the seed format",
+    posterId: owner.id,
+    now: t(20),
+  });
+  const closed = await svc.createIssue({
+    repoId: repo.id,
+    title: "closed: duplicate welcome banner",
+    posterId: owner.id,
+    now: t(30),
+  });
+  await svc.closeIssue(closed.id, { now: t(40) });
+  await svc.createPullRequest({
+    repoId: repo.id,
+    title: "pull: add seed format docs",
+    posterId: owner.id,
+    headRepoId: repo.id,
+    baseBranch: "main",
+    headBranch: "docs-seed",
+    now: t(50),
+  });
+  await svc.addComment({ issueId: labeled.id, posterId: owner.id, content: "Reproduced on two machines.", now: t(60) });
+}
 
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
@@ -167,5 +262,6 @@ export function setupGoldenFixtures(): void {
         .set({ createdAt: new Date(T0 * 1000) })
         .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, slug)));
     }
+    await seedGoldenIssues();
   });
 }

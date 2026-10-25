@@ -3,15 +3,27 @@
  * `handlesUiRoute` + the route parsers (ref-suffix resolution). This module
  * is the single owner of UI route knowledge (§2.2).
  *
- * UI route inventory (§2.1 — all GET, all rendered through the shell):
+ * UI route inventory (§2.1 + the wave-2 extension — all GET; the slice-1
+ * families render through the shell, /tree is upstream's redirect):
  *
  *   /:owner/:repo                          repo home (pages/home.tsx)
  *   /:owner/:repo/commits[/{ref-suffix}]   commit log (pages/commits.tsx)
  *   /:owner/:repo/src[/{ref-suffix}]       file view (pages/file-view.tsx;
  *                                          §3.3 requires the
  *                                          `branch|tag|commit` prefix)
+ *   /:owner/:repo/tree[/{raw-suffix}]      code-tree URL family
+ *                                          (pages/repo-home.tsx — upstream
+ *                                          RedirectRepoTreeToSrc: 303 onto
+ *                                          /src/{raw-suffix}, query kept)
+ *   /:owner/:repo/issues                   issues list (pages/issues-list.tsx)
+ *   /:owner/:repo/pulls                    pulls list (same component over
+ *                                          is_pull rows — issues-list.tsx)
  *
- * Every other repo-scoped path stays with the engine — the four git-protocol
+ * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
+ * page switch stays the slice-1 three — which is why they parse into the
+ * separate TreeRoute/IssuesListRoute types below instead of new UiFamily
+ * members. The suffixed /issues//pulls space (detail, new, …) and every
+ * other repo-scoped path stay with the engine — the four git-protocol
  * routes, the LFS family, and the engine JSON API/admin surface. The parser
  * claims families by shape and never protocol or engine paths, and the
  * reserved owner names (`api`, `assets` — SPEC-0003 §3) are refused outright,
@@ -60,6 +72,8 @@ import { isReservedOwnerName } from "../repos/service";
 import { AssetBuildError, loadManifest } from "./manifest";
 import { resolvePublicRepository } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
+import { treeRedirectResponse } from "./pages/repo-home";
+import { loadIssuesListData, renderIssuesListPage } from "./pages/issues-list";
 import { shellAssetsFromManifest, type UiContext } from "./ui-context";
 import { resolveViewer } from "./viewer";
 
@@ -85,6 +99,41 @@ export interface UiRoute {
   refSuffix: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Wave-2 families (SPEC-0008 U3 extension: the code-tree redirect + the
+// issues/pulls lists). A separate union, NOT extra members of `UiRoute`:
+// `render.tsx`'s page switch stays exhaustive over the slice-1 three (the
+// strictNullChecks fall-off-the-switch check), and the wave-2 dispatch lives
+// entirely in this router — render.tsx never sees these routes.
+// ---------------------------------------------------------------------------
+
+/** The `/tree` family (pages/repo-home.tsx): upstream RedirectRepoTreeToSrc —
+ *  the RAW (still-encoded) suffix swaps verbatim onto `/src/`. */
+export interface TreeRoute {
+  family: "tree";
+  owner: string;
+  repo: string;
+  /** The still-encoded path tail after `/tree`, "/"-joined segments
+   *  (`ctx.PathParamRaw("*")` parity); "" = the bare `/tree` (no upstream
+   *  route → the §4.5 404 shell). */
+  rawSuffix: string;
+}
+
+/** The `/issues` and `/pulls` list families (pages/issues-list.tsx): the
+ *  bare URLs only — the suffixed issue/PR-detail space (`/issues/{index}`,
+ *  `/issues/new`, …) is future-page territory and stays engine-owned, the
+ *  same posture as `/commit/{sha}` (§1.2, open question 1). */
+export interface IssuesListRoute {
+  family: "issues" | "pulls";
+  owner: string;
+  repo: string;
+}
+
+/** Everything `parseUiRoute` can return; `UiRoute` remains the slice-1 view
+ *  render.tsx consumes. */
+export type ParsedUiRoute = UiRoute | TreeRoute | IssuesListRoute;
+
+
 /**
  * Parse a repo-scoped pathname into a UI route, or `null` when the path is
  * not a UI family (→ the dispatcher keeps the engine/gate ownership).
@@ -95,7 +144,7 @@ export interface UiRoute {
  * structural pre-filter — an empty segment anywhere (double slashes,
  * including the never-emitted `//` tails) makes the path not ours.
  */
-export function parseUiRoute(pathname: string): UiRoute | null {
+export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (pathname === "/" || !pathname.startsWith("/")) return null;
   // §4.13: the router 301s trailing-slash URLs to the canonical form; the
   // parser classifies the trimmed shape so the dispatcher admits them.
@@ -124,6 +173,14 @@ export function parseUiRoute(pathname: string): UiRoute | null {
   // Family literals are lowercase-exact, like upstream's chi patterns
   // (`{type:branch|tag|commit}` routes; `gitea/routers/web/web.go:1749`).
   const [head, ...rest] = tail;
+  // Wave-2 families: /tree re-emits its suffix RAW (RedirectRepoTreeToSrc
+  // swaps the still-encoded text, view_home.go:521); /issues and /pulls
+  // claim the bare list URLs only (the detail space stays engine-owned).
+  if (head === "tree") return { family: "tree", owner, repo, rawSuffix: rest.join("/") };
+  if (head === "issues" || head === "pulls") {
+    if (rest.length > 0) return null;
+    return { family: head, owner, repo };
+  }
   let suffix: string;
   try {
     suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
@@ -296,6 +353,12 @@ export function assetsNotBuilt(error: AssetBuildError): Response {
 // uiRouter (§2.2 — the orchestrator mounts this at the dispatcher)
 // ---------------------------------------------------------------------------
 
+/** Narrow the parsed union back to the slice-1 route `renderUiPage` consumes
+ *  (the two wave-2 dispatch branches above returned for every other member). */
+function isSliceOneRoute(route: ParsedUiRoute): route is UiRoute {
+  return route.family === "home" || route.family === "commits" || route.family === "src";
+}
+
 /**
  * One handler for every claimed family: the parser re-reads the pathname
  * (the route registrations below exist so the sub-app never claims beyond
@@ -326,8 +389,25 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   if (repo === null) return c.html(renderNotFound(ctx), 404);
   ctx.repo = repo;
 
+  // Wave-2 dispatch (render.tsx never sees these families). The redirect
+  // and the list page run AFTER the same §2.5 repo resolution as the
+  // slice-1 pages: unknown/private repos 404-shell, never redirect.
+  if (route.family === "tree") {
+    // Bare /tree has no upstream route (chi needs the slash) → §4.5 shell.
+    if (route.rawSuffix === "") return c.html(renderNotFound(ctx), 404);
+    // The target prefix is the RESOLVED row's canonical link (upstream
+    // ctx.Repo.RepoLink); the suffix and query travel verbatim.
+    const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+    return treeRedirectResponse(repoLink, route.rawSuffix, url.search);
+  }
+  if (route.family === "issues" || route.family === "pulls") {
+    const data = await loadIssuesListData(c.env.DB, repo.id, route.family, url.searchParams);
+    return c.html(renderIssuesListPage(ctx, data), 200);
+  }
+
   // U3 page switch (render.tsx — home | commits | src), with the 404 shell
   // for unresolvable refs/paths (§4.5).
+  if (!isSliceOneRoute(route)) return c.notFound(); // registration/parser drift guard
   const { status, html } = await renderUiPage({ env: c.env, ctx, route, url });
   return c.html(html, status);
 }
@@ -349,3 +429,8 @@ uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/src", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/src/*", (c) => uiPage(c));
+// Wave-2 families (parseUiRoute claims exactly these shapes).
+uiRouter.get("/:owner/:repo/tree", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/tree/*", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/issues", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/pulls", (c) => uiPage(c));

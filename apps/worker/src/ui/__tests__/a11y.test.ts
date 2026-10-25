@@ -12,13 +12,21 @@ import bareShellGolden from "./goldens/bare-shell.html?raw";
 import commitsGolden from "./goldens/commits.html?raw";
 import fileViewCodeGolden from "./goldens/file-view-code.html?raw";
 import homeGolden from "./goldens/home.html?raw";
+import issuesClosedGolden from "./goldens/issues-closed.html?raw";
+import issuesOpenGolden from "./goldens/issues-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
+import pullsOpenGolden from "./goldens/pulls-open.html?raw";
+import treeDirGolden from "./goldens/tree-dir.html?raw";
 import { GOLDEN_CASES } from "./harness";
 
 const goldens: Record<string, string> = {
   "home.html": homeGolden,
   "commits.html": commitsGolden,
   "file-view-code.html": fileViewCodeGolden,
+  "tree-dir.html": treeDirGolden,
+  "issues-open.html": issuesOpenGolden,
+  "issues-closed.html": issuesClosedGolden,
+  "pulls-open.html": pullsOpenGolden,
   "not-found-repo.html": notFoundRepoGolden,
   "bare-shell.html": bareShellGolden,
 };
@@ -73,6 +81,37 @@ describe("§5.5 a11y smoke over the goldens", () => {
     expect(getElementById(root, "repo-files-table")).toBeNull();
     expect(getElementById(root, "commits-table")).toBeNull();
     expect(descendants(root).some((el) => el.attrs["data-global-init"] === "initRepoFileView")).toBe(true);
+  });
+
+  it("#issue-list is the upstream divided-list shape with header/body/trailing blocks", () => {
+    const root = parseHtmlTree(issuesOpenGolden);
+    const list = getElementById(root, "issue-list");
+    expect(list).not.toBeNull();
+    const items = descendants(list ?? root).filter((el) => el.tag === "div" && hasClass(el, "item"));
+    expect(items).toHaveLength(2); // two open issues; the closed one and the PR are filtered out
+    for (const item of items) {
+      const inner = descendants(item);
+      expect(inner.some((el) => hasClass(el, "item-main")), "item-main").toBe(true);
+      expect(inner.some((el) => hasClass(el, "item-header")), "item-header").toBe(true);
+      expect(inner.some((el) => hasClass(el, "item-body")), "item-body").toBe(true);
+    }
+    // The labeled row carries both badges with the upstream inline-contrast
+    // style; the milestone badge is the degraded plain-text span (no dead
+    // /milestone/{id} link, issues-list.tsx header comment).
+    const badges = descendants(list ?? root).filter((el) => hasClass(el, "labels-list"));
+    expect(badges).toHaveLength(1);
+    const labelSpans = descendants(badges[0] ?? root).filter((el) => hasClass(el, "ui") && hasClass(el, "label"));
+    expect(labelSpans).toHaveLength(2);
+    expect(labelSpans[0]?.attrs.style).toContain("background-color: #ee0701");
+    expect(labelSpans[0]?.attrs.style).toContain("color: #fff");
+    expect(descendants(list ?? root).some((el) => hasClass(el, "milestone"))).toBe(true);
+    // Tabs: open active with the filtered count; pulls are excluded.
+    const tabs = descendants(root).filter((el) => hasClass(el, "small-menu-items"));
+    expect(tabs).toHaveLength(1);
+    const tabItems = descendants(tabs[0] ?? root).filter((el) => el.tag === "a" && hasClass(el, "item"));
+    expect(tabItems.map((el) => hasClass(el, "active"))).toEqual([true, false]);
+    expect(tabItems[0] ? accessibleName(tabItems[0]) : "").toBe("2 Open");
+    expect(tabItems[1] ? accessibleName(tabItems[1]) : "").toBe("1 Closed");
   });
 });
 
