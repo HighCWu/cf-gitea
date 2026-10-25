@@ -10,6 +10,7 @@ import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
 import { registerAdminT2Routes } from "./routes/admin-t2";
 import { registerArchiveRoutes } from "./routes/archive";
+import { registerBranchProtectionRoutes } from "./routes/branch-protections";
 import { registerBranchRoutes } from "./routes/branches";
 import { registerCollaboratorRoutes } from "./routes/collaborators";
 import { registerCommitRoutes } from "./routes/commits";
@@ -156,6 +157,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // `/repos/{owner}/{repo}` metadata routes; the shared doer/optional split
   // matches upstream (reads optional, writes reqToken).
   registerBranchRoutes(app, requireAuth, optionalAuth);
+  // SPEC-0013 M3: the branch_protections API family over the landed rules
+  // (recompute instrument wired at create/replace/delete).
+  registerBranchProtectionRoutes(app, requireAuth);
   registerTagRoutes(app, requireAuth, optionalAuth);
   registerGitRoutes(app, requireAuth, optionalAuth);
   registerContentsRoutes(app, requireAuth, optionalAuth);
