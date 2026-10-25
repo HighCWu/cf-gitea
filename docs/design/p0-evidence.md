@@ -276,3 +276,18 @@ anon-read "leak" was proven a stale pre-lifecycle deploy artifact (current
 production 401s across the settle window; 7-test regression pin 961ea22) and
 the settle-window race is fixed in the smoke (authed ls-remote + anon-401
 assertion + retry, 562f257).
+
+## Risk taxonomy (final reviewer round, adopted verbatim)
+
+- **协议正确性问题**: 已报告修复（this document's full chain).
+- **资源消耗风险** (transfer volume, CPU, R2 reads, client storage from a
+  silently-widened fetch): mitigated by the fix — rejected requests transfer
+  nothing.
+- **跨权限数据泄漏**: 当前证据未发现 (none observed under the repo-granular
+  ACL; scoped per the addendum above — re-evaluate when hidden refs or
+  object-level permissions land).
+
+Operational note (2026-10-25): the redeploy wave's smoke PAT (prefix
+cfg_9be84293) was echoed into agent logs, then deleted from
+personal_access_tokens by the orchestrator (mint-per-run remains the
+standing rule for probe credentials).
