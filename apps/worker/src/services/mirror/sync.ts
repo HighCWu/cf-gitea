@@ -526,12 +526,19 @@ async function notifyMirrorSyncDelta(env: MirrorSyncEnv, repo: RepoRow, updates:
           continue;
         }
         const usernames = await usernamesByEmail(env.DB, walk.commits);
-        let commits = [...walk.commits].reverse().map((commit) => toPayloadCommit(commit, pair, usernames, origin));
+        // The generated payload model's id is optional; re-asserting it from
+        // the walk gives the enricher its required-id contract cast-free
+        // (same pattern as services/webhooks-push.ts).
+        let commits = [...walk.commits].reverse().map((commit) => ({
+          ...toPayloadCommit(commit, pair, usernames, origin),
+          id: commit.oid,
+        }));
         // Upstream's payload mapper fills added/removed/modified per commit
         // (ToAPIPayloadCommit's diff-tree); the shared enricher costs one
         // readDiff RPC per payload commit and degrades to the list-less
-        // shape on any failure (its documented deviation).
-        ({ commits } = await enrichCommitsWithFileLists(commits, (id) => cell.readDiff(id)));
+        // shape on any failure (its documented deviation). The spread makes
+        // the (possibly original, readonly) array mutable for the payload.
+        commits = [...(await enrichCommitsWithFileLists(commits, (id) => cell.readDiff(id))).commits];
         // head_commit — upstream renders the new tip from its own
         // GetCommit(newCommitID) read (:373-378), matched into the list by id
         // (ToAPIPayloadCommits). DEVIATION (documented, SPEC-0009 §2.7 wave):
@@ -552,7 +559,12 @@ async function notifyMirrorSyncDelta(env: MirrorSyncEnv, repo: RepoRow, updates:
           headCommit =
             tip === null
               ? null
-              : (await enrichCommitsWithFileLists([toPayloadCommit(tip, pair, usernames, origin)], (id) => cell.readDiff(id))).commits[0]!;
+              : [
+                  ...(await enrichCommitsWithFileLists(
+                    [{ ...toPayloadCommit(tip, pair, usernames, origin), id: tip.oid }],
+                    (id) => cell.readDiff(id),
+                  )).commits,
+                ][0]!;
         }
         const push: PushPayload = {
           ref: update.ref,

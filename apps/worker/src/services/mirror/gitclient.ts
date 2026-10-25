@@ -264,7 +264,7 @@ export function parseInfoRefsAdvert(bytes: Uint8Array): Advertisement {
     // The preamble precedes the v2 advert as well: re-detect.
     const afterPreamble = frameAt(bytes, pos);
     if (afterPreamble !== null && afterPreamble.frame.kind === "line" && frameText(afterPreamble.frame.payload).trimEnd() === "version 2") {
-      return parseV2Advert(bytes, pos, afterPreamble.next);
+      return parseV2Advert(bytes, afterPreamble.next);
     }
   }
 
