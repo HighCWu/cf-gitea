@@ -192,6 +192,16 @@
  *                                          exact POST segments, org.NewLabel
  *                                          /UpdateLabel/DeleteLabel; GET →
  *                                          405)
+ *   /:owner/:repo/commit/{sha}             commit view, GET (pages/
+ *                                          commit-view.tsx — wave 18; the
+ *                                          parity survey's #1 dead-end:
+ *                                          upstream web.go:1739's literal
+ *                                          `{sha}` route, the target of
+ *                                          every ShortSha link; full oids
+ *                                          resolve — the engine's
+ *                                          reachable-full-oid rule — the
+ *                                          7..64 prefix shapes 404-shell,
+ *                                          the documented divergence)
  *   /:owner/:repo/compare[/{base}...{head}]  compare view, GET + POST
  *                                          (pages/compare.tsx — wave 13;
  *                                          upstream web.go:1307-1315's
@@ -412,6 +422,7 @@ import {
 } from "./pages/new-issue";
 import { loadPullFilesData, renderPullFilesPage } from "./pages/pull-files";
 import { loadPullCommitsData, renderPullCommitsPage } from "./pages/pull-commits";
+import { loadCommitViewData, renderCommitViewPage } from "./pages/commit-view";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
 import {
   applyRepoBasics,
@@ -616,6 +627,25 @@ export interface BranchesRoute {
   repo: string;
 }
 
+/** The wave-18 commit-view family (pages/commit-view.tsx): upstream's
+ *  `m.Get("/commit/{sha:([a-f0-9]{7,64})$}", repo.Diff)` (web.go:1739) —
+ *  the parity survey's #1 dead-end, the target of every commits-log /
+ *  branches-list / PR-commits ShortSha link. The EXACT single-segment tail
+ *  claims for ANY segment value (the hex-shape gate is the loader's 404
+ *  arm — a non-hex segment, including the web.go:1760 `.{patch|diff}`
+ *  dotted forms, answers the §4.5 shell like upstream's pattern-miss 404
+ *  until the RawDiff slice lands); every DEEPER tail (`/load-branches-and-
+ *  tags`, junk) stays engine-owned (see the page module's divergence
+ *  notes). The bare `/commit` URL is unclaimed too (upstream has no such
+ *  route). */
+export interface CommitViewRoute {
+  family: "commit-view";
+  owner: string;
+  repo: string;
+  /** The decoded sha segment (validated at load time, not parse time). */
+  sha: string;
+}
+
 /** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
  *  three web POSTs — the verdict form's
  *  `/pulls/{index}/files/reviews/submit` (web.go:1678, the index rides the
@@ -818,7 +848,8 @@ export type ParsedUiRoute =
   | OrgTeamsRoute
   | OrgLabelsRoute
   | CompareRoute
-  | BranchesRoute;
+  | BranchesRoute
+  | CommitViewRoute;
 
 
 /**
@@ -1101,6 +1132,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 0) return { family: "branches", owner, repo };
     if (rest.length === 1 && rest[0] === "delete") return { family: "branch-delete", owner, repo };
     return null;
+  }
+  // Wave-18 commit view (pages/commit-view.tsx — upstream web.go:1739): the
+  // exact single-segment tail only, claimed for ANY segment value so a
+  // non-hex sha 404-shells through the loader (the brief's rule) instead of
+  // reaching the engine. Deeper tails (the `.{patch|diff}` suffix family,
+  // `/load-branches-and-tags`, junk) stay engine-owned, and the bare
+  // `/commit` falls through to the engine's 404 — upstream's own shape.
+  if (head === "commit") {
+    if (rest.length !== 1) return null;
+    let sha: string;
+    try {
+      sha = decodeURIComponent(rest[0] as string);
+    } catch {
+      return null;
+    }
+    return { family: "commit-view", owner, repo, sha };
   }
   // Wave-8 file editor: the `new`/`edit`/`delete` literals claim the
   // branch+path tail shape (FileEditorRoute). Bare literals fall through to
@@ -2904,6 +2951,26 @@ async function compareSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   );
 }
 
+// ---------------------------------------------------------------------------
+// The wave-18 commit-view family (pages/commit-view.tsx — upstream web.go
+// :1739 repo.Diff, the parity survey's #1 dead-end)
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/commit/{sha} (pages/commit-view.tsx): the commit
+ *  header (title, identities, parents) + the diff over the landed
+ *  `readCommit`/`readDiff` reads. Public anonymous like every read page;
+ *  non-hex segments and unresolvable full oids 404-shell (upstream Diff's
+ *  git.IsErrNotExist → ctx.NotFound arm). */
+async function commitViewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "commit-view") return respond(await c.notFound()); // registration/parser drift guard
+  const data = await loadCommitViewData(c.env, c.env.DB, repo, route.sha);
+  if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderCommitViewPage({ ctx, data }), 200));
+}
+
 /**
  * One handler for every claimed GET page family: the parser re-reads the
  * pathname (the route registrations below exist so the sub-app never claims
@@ -2962,6 +3029,14 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     const data = await loadPullCommitsData(c.env, repo, route.index, url.searchParams.get("page"));
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
     return respond(c.html(renderPullCommitsPage({ ctx, data }), 200));
+  }
+  // Wave-18 dispatch: the commit view (render.tsx never sees this family;
+  // non-hex segments and unresolvable full oids 404-shell — the page
+  // module's sha arms).
+  if (route.family === "commit-view") {
+    const data = await loadCommitViewData(c.env, c.env.DB, repo, route.sha);
+    if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(c.html(renderCommitViewPage({ ctx, data }), 200));
   }
 
   // U3 page switch (render.tsx — home | commits | src), with the 404 shell
@@ -3120,6 +3195,10 @@ uiRouter.get("/:owner/:repo/settings/branches/:id/delete", () => methodNotAllowe
 uiRouter.get("/:owner/:repo/branches", (c) => branchesPage(c));
 uiRouter.post("/:owner/:repo/branches/delete", (c) => branchDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/branches/delete", () => methodNotAllowed("POST"));
+// Wave-18 commit-view family (parseUiRoute claims exactly the
+// single-segment `{sha}` shape — upstream's web.go:1739 route; the
+// ShortSha links every landed list page emits resolve from here).
+uiRouter.get("/:owner/:repo/commit/:sha", (c) => commitViewPage(c));
 // Wave-6 milestones families (parseUiRoute claims exactly these shapes; the
 // static literal registers before any deeper dynamic tail could — there is
 // none this slice, the shape is kept for the reasons above).

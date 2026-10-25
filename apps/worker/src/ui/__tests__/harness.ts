@@ -311,6 +311,14 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // default) beside the Switch Default Branch link.
   { file: "branches.html", path: "/alice/golden/branches", status: 200 },
   { file: "branches-writer.html", path: "/alice/golden/branches", status: 200, signedIn: true },
+  // The commit view (wave 18): the ANONYMOUS header+diff over two fixed
+  // golden commits — main's tip (5bde6b3719…, "add app source and docs":
+  // one parent link, three files with the binary logo.png BIN arm) and the
+  // ROOT commit (a31b4c65fd…, "initial commit: add README": the no-parents
+  // arm, the whole-tree diff). The oids are the seeds' deterministic SHA-1s
+  // (the same literals the commits.html/compare goldens carry).
+  { file: "commit-view.html", path: "/alice/golden/commit/5bde6b37197b62bf146fa01ac0bb3f0ee78aa3c0", status: 200 },
+  { file: "commit-view-root.html", path: "/alice/golden/commit/a31b4c65fd333561dd9c6ed9e437522f9047786b", status: 200 },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single

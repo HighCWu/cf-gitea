@@ -226,8 +226,9 @@ export interface CompareNotFound {
 
 /** Upstream `MessageBody()` reduced: the full message minus the subject line
  *  and the blank-line separator, edge-trimmed (the engine's CommitJson keeps
- *  `message` as the WHOLE commit message, git/objects.ts). */
-function messageBodyOf(commit: CommitJson): string {
+ *  `message` as the WHOLE commit message, git/objects.ts). Exported for the
+ *  commit view's commit-body pre (pages/commit-view.tsx, pages wave 18). */
+export function messageBodyOf(commit: CommitJson): string {
   if (commit.message === commit.subject) return "";
   return commit.message.slice(commit.subject.length).replace(/^\n+/, "").replace(/\s+$/, "");
 }

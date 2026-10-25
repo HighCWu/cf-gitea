@@ -313,8 +313,10 @@ export async function loadPullFilesData(
 // ---------------------------------------------------------------------------
 
 /** stats.tmpl verbatim: the +A/-D counters and the proportional bar (the
- *  denominator carries upstream's `+ 0.0` float guard, stats.tmpl:13-14). */
-function DiffStats(props: { addition: number; deletion: number }) {
+ *  denominator carries upstream's `+ 0.0` float guard, stats.tmpl:13-14).
+ *  Exported for the commit view's short-stat segment (pages/commit-view.tsx,
+ *  pages wave 18 — the same stats.tmpl shape in the commit header). */
+export function DiffStats(props: { addition: number; deletion: number }) {
   if (props.addition === 0 && props.deletion === 0) return null;
   const pct = (100 * props.addition) / (props.addition + props.deletion + 0.0);
   return (

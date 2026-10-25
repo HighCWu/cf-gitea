@@ -10,6 +10,8 @@ import { describe, expect, it } from "vitest";
 import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } from "./a11y";
 import bareShellGolden from "./goldens/bare-shell.html?raw";
 import branchesGolden from "./goldens/branches.html?raw";
+import commitViewGolden from "./goldens/commit-view.html?raw";
+import commitViewRootGolden from "./goldens/commit-view-root.html?raw";
 import branchesWriterGolden from "./goldens/branches-writer.html?raw";
 import commitsGolden from "./goldens/commits.html?raw";
 import compareCommitsGolden from "./goldens/compare-commits.html?raw";
@@ -104,6 +106,10 @@ const goldens: Record<string, string> = {
   // signed-in owner view (the GOLDEN_CASES entries above).
   "branches.html": branchesGolden,
   "branches-writer.html": branchesWriterGolden,
+  // Pages wave 18: the commit view — main's tip (parents + the binary BIN
+  // arm) and the root commit (the no-parents arm, whole-tree diff).
+  "commit-view.html": commitViewGolden,
+  "commit-view-root.html": commitViewRootGolden,
 };
 
 function classList(el: { attrs: Record<string, string> }): string[] {

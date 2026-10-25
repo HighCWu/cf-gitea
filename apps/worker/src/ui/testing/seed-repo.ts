@@ -118,11 +118,22 @@ export interface SeedFile {
   content: string | Uint8Array;
 }
 
+/** One git identity (the default author/committer is the shared
+ *  Test User <test@example.com>). */
+export interface SeedIdentity {
+  name: string;
+  email: string;
+}
+
 export interface SeedCommit {
   message: string;
   files: SeedFile[];
   /** Committer/author unix seconds (fixed → deterministic rendering). */
   time: number;
+  /** Identity overrides — e.g. a committer distinct from the author (the
+   *  commit view's authored_committed_at arm). Absent = the Test User. */
+  author?: SeedIdentity;
+  committer?: SeedIdentity;
 }
 
 interface TreeNode {
@@ -171,16 +182,17 @@ async function writeTree(node: TreeNode, objects: Map<string, StoredObject>): Pr
   return storeObject(OBJ_TREE, concatArrays(entries.map((e) => e.bytes)));
 }
 
-function personLine(who: "author" | "committer", time: number): string {
-  return `${who} Test User <test@example.com> ${time} +0000`;
+function personLine(who: "author" | "committer", time: number, identity: SeedIdentity | undefined): string {
+  const person = identity ?? { name: "Test User", email: "test@example.com" };
+  return `${who} ${person.name} <${person.email}> ${time} +0000`;
 }
 
 async function writeCommit(treeOid: string, parent: string | null, commit: SeedCommit): Promise<StoredObject> {
   const body =
     `tree ${treeOid}\n` +
     (parent !== null ? `parent ${parent}\n` : "") +
-    `${personLine("author", commit.time)}\n` +
-    `${personLine("committer", commit.time)}\n\n` +
+    `${personLine("author", commit.time, commit.author)}\n` +
+    `${personLine("committer", commit.time, commit.committer)}\n\n` +
     `${commit.message}\n`;
   return storeObject(OBJ_COMMIT, ENCODER.encode(body));
 }
