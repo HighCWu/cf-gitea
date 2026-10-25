@@ -546,10 +546,16 @@ export class OrgService {
    * **no owner-visibility filter** — the mirrored upstream quirk. An
    * anonymous caller receives the public repos of a limited or private org
    * (200-shaped), unlike `GET /orgs/{org}` (404s via `HasOrgOrUserVisible`)
-   * and unlike git HTTP (401-challenges). Private rows are listed only when
-   * the doer holds "any unit access" — at tier 1 exactly the org
-   * `role='owner'` membership (§3.5) or a site admin; plain members see
-   * public rows only, as upstream (no team ⇒ zero repo access).
+   * and unlike git HTTP (401-challenges). Private rows are listed when the
+   * doer holds "any unit access" — the org `role='owner'` membership (the
+   * Owners-team bridge, §3.3), a covering team's grant (§3.5), or a site
+   * admin; members without a covering team see public rows only, as
+   * upstream (no team ⇒ zero repo access). Upstream resolves the same set
+   * row-wise: `ListOrgRepos` → `listUserRepos` keeps repos where
+   * `GetDoerRepoPermission(...).HasAnyUnitAccess()` (routers/api/v1/user/
+   * repo.go:41–45), whose team resolution is `GetUserRepoTeams`
+   * (models/perm/access/repo_permission.go:483) — so the list honors team
+   * access upstream, and this WHERE is not a divergence.
    */
   async listOrgRepos(
     orgId: number,
@@ -573,9 +579,45 @@ export class OrgService {
           )
           .get()) !== undefined);
 
+    // The §3.5 team arm of the "any unit access" filter — the SQL twin of
+    // the row-wise `teamRepoAccessMode` collapse above (and of api/services/
+    // repository.ts `teamGrantCondition`, d496ab8's /repos/search twin): a
+    // repo passes when a team of THIS org has the doer among its
+    // `team_members`, its EFFECTIVE mode is not 'none'
+    // (`max(authorize, units_map values)` — json_each(NULL) yields no rows,
+    // so plain-permission teams fall through to the `authorize` arm), and it
+    // covers the repo (`includes_all_repositories` or a `team_repo_access`
+    // row). Scoped to the bound `orgId` (the WHERE already pins
+    // `owner_id`), so the list never shows a repo the per-repo seam would
+    // 404, and never hides one it admits.
+    const teamArm =
+      doer.id === null || isOwner
+        ? []
+        : [
+            sql`EXISTS (
+              SELECT 1 FROM teams t
+              JOIN team_members tm ON tm.team_id = t.id
+              WHERE t.org_id = ${orgId}
+                AND tm.user_id = ${doer.id}
+                AND (
+                  t.authorize <> 'none'
+                  OR EXISTS (
+                    SELECT 1 FROM json_each(t.units_map) ju
+                    WHERE ju.value IN ('read', 'write', 'admin', 'owner')
+                  )
+                )
+                AND (
+                  t.includes_all_repositories = 1
+                  OR EXISTS (
+                    SELECT 1 FROM team_repo_access tra
+                    WHERE tra.team_id = t.id AND tra.repo_id = ${repositories.id}
+                  )
+                )
+            )`,
+          ];
     const where = isOwner
       ? eq(repositories.ownerId, orgId)
-      : and(eq(repositories.ownerId, orgId), eq(repositories.visibility, "public"));
+      : and(eq(repositories.ownerId, orgId), or(eq(repositories.visibility, "public"), ...teamArm));
     const rows = await this.db
       .select(REPO_SELECTION)
       .from(repositories)

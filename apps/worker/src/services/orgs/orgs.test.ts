@@ -388,6 +388,78 @@ describe("teamRepoAccessMode (§3.5 enforcement slice — the shared predicate)"
   });
 });
 
+describe("listOrgRepos — the §3.5 team-grant arm (the audit's flagged gap)", () => {
+  /** Team with one member, covering the given repo ids (the grant-helper
+   *  shape of the teamRepoAccessMode suite). */
+  const grant = async (
+    org: OrgRecord,
+    user: string,
+    mode: string,
+    repoIds: string[],
+    options: { unitsMap?: string; includesAll?: boolean } = {},
+  ): Promise<number> => {
+    const uid = (await seedVerifiedUser({ username: user })).id;
+    await service().addMember(org.id, uid);
+    const team = await env.DB.prepare(
+      "INSERT INTO teams (org_id, lower_name, name, authorize, units_map, includes_all_repositories) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+      .bind(org.id, user, user, mode, options.unitsMap ?? null, options.includesAll === true ? 1 : 0)
+      .first<{ id: number }>();
+    await env.DB.prepare("INSERT INTO team_members (org_id, team_id, user_id) VALUES (?, ?, ?)")
+      .bind(org.id, team!.id, uid)
+      .run();
+    for (const repoId of repoIds) {
+      await env.DB.prepare("INSERT INTO team_repo_access (org_id, team_id, repo_id) VALUES (?, ?, ?)")
+        .bind(org.id, team!.id, repoId)
+        .run();
+    }
+    return uid;
+  };
+
+  it("a team member sees the granted private repo; a stranger and anonymous stay public-only", async () => {
+    const org = await seedOrg("Depository");
+    const open = await seedOrgRepo(org, "open");
+    const hidden = await seedOrgRepo(org, "hidden", true);
+    const member = await grant(org, "mate", "read", [hidden]);
+
+    // The grant widens the member's listing to the covered private row.
+    const memberView = await service().listOrgRepos(org.id, { id: member });
+    expect(memberView.total).toBe(2);
+    expect(memberView.items.map((repo) => repo.id).sort()).toEqual([open, hidden].sort());
+
+    // A stranger (and anonymous) still see the public rows only.
+    const stranger = (await seedVerifiedUser({ username: "Outsider" })).id;
+    for (const doer of [{ id: stranger }, { id: null }]) {
+      const view = await service().listOrgRepos(org.id, doer);
+      expect(view.total).toBe(1);
+      expect(view.items.map((repo) => repo.id)).toEqual([open]);
+    }
+  });
+
+  it("covers includes-all teams and units-collapsed teams; a non-covering team grants nothing", async () => {
+    const org = await seedOrg("Wide");
+    const stash = await seedOrgRepo(org, "stash", true);
+    await seedOrgRepo(org, "open");
+
+    const allMate = await grant(org, "allmate", "read", [], { includesAll: true });
+    // authorize 'none' with a write unit override — effective write through
+    // the units_map collapse (the SQL twin's json_each arm).
+    const unitsMate = await grant(org, "unitsmate", "none", [stash], {
+      unitsMap: JSON.stringify({ "repo.code": "write" }),
+    });
+    // A write team that covers NOTHING grants no listing row.
+    const uncovered = await grant(org, "uncovered", "write", []);
+
+    for (const uid of [allMate, unitsMate]) {
+      const view = await service().listOrgRepos(org.id, { id: uid });
+      expect(view.items.map((repo) => repo.id)).toContain(stash);
+    }
+    const plain = await service().listOrgRepos(org.id, { id: uncovered });
+    expect(plain.total).toBe(1);
+    expect(plain.items.map((repo) => repo.id)).not.toContain(stash);
+  });
+});
+
 describe("membership guards (§4.3 last-owner, §4.5 states)", () => {
   it("refuses removing the only owner with the upstream 500-mapped error", async () => {
     const org = await seedOrg("Lone");
