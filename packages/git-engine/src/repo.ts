@@ -86,6 +86,15 @@ import {
 import { diffLines, toHunks, isBinary, Hunk, DiffOp } from "./git/diff";
 import { blame, BlameHistoryEntry } from "./git/blame";
 import { tarGz, zip, SnapshotFile } from "./git/snapshot";
+import {
+  planFetchInsideTransaction,
+  releaseReadLease,
+  renewAndAuthorizeRead,
+  type ByteRange,
+  type PlanCloneStreamResult,
+  type ReleaseReadResult,
+  type RenewReadResult,
+} from "./read-leases";
 import { esc, repoUrl, repoBase, age, fmtDate, fmtDate2822, layout, htmlResponse, errorPage, LayoutOpts } from "./ui/html";
 import { renderMarkdown } from "./ui/markdown";
 import { highlightLines } from "./ui/highlight";
@@ -130,7 +139,7 @@ interface LogFilter {
 }
 
 // The shapes returned by the cell's typed content surface (see the methods
-// below currentPackKey).
+// below planCloneStream).
 
 export interface RefsResult {
   head: string | null;
@@ -506,17 +515,68 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /**
-   * Cheap full-clone key probe for the Worker's R2 fast path: returns the
-   * versioned pack key iff `wants` is exactly the current ref tips (a true full
-   * clone). Reads ref state only — it never generates a pack. The key is the
-   * ref-version hash, so it can never name a stale/force-pushed pack.
+   * The Worker R2 fast path's plan+lease RPC (SPEC-0011 §3.1/§4.2, M3.1):
+   * the exact-full-clone probe (`wants` exactly the current ref tips) and the
+   * read lease over the versioned clone-cache pack register in ONE
+   * transaction — the probe's catalog read (refs state) and the lease INSERT
+   * are atomic, so a GC/compaction transition cannot land between "decide the
+   * key" and "protect the stream". The lease covers the ENTIRE stream
+   * duration (§4.2): the Worker renews it inline in the re-framing loop and
+   * releases it when the last R2 read completed. A miss (any other
+   * negotiation shape) takes no lease — the DO serve path plans its own.
+   *
+   * Replaces the pre-M3.1 `currentPackKey` bare probe: same hit predicate
+   * (wantsAreAllTips, strict set equality against ALL refs), plus the atomic
+   * lease registration.
    *
    * `repo` is advisory since the Step 3 key layout: the key's namespace comes
    * from the persisted storage key (meta.storage_key), not the request name.
    */
-  currentPackKey(repo: string, wants: string[]): string | null {
-    if (!wantsAreAllTips(this.store, wants)) return null;
-    return cloneCacheKey(this.storageKey(repo), this.store.reachableVersion());
+  async planCloneStream(repo: string, wants: string[]): Promise<PlanCloneStreamResult> {
+    this.rpcBind();
+    const storageKey = this.storageKey(repo);
+    let result: PlanCloneStreamResult = { tag: "miss" };
+    // ONE transaction: the ref-state read (the probe) + the lease insert.
+    // planFetchInsideTransaction: we are ALREADY inside store.tx — the DO's
+    // transactionSync must never nest.
+    this.store.tx(() => {
+      if (!wantsAreAllTips(this.store, wants)) return;
+      const key = cloneCacheKey(storageKey, this.store.reachableVersion());
+      const plan = planFetchInsideTransaction(this.store, {
+        generation: this.store.reachableVersion(),
+        packKeys: [key],
+        cache: true, // clone-cache keys have no pack_catalog row (§4.2)
+      });
+      if (plan.tag !== "leased") return;
+      result = { tag: "leased", key, planId: plan.planId, expiresAt: plan.expiresAt };
+    });
+    return result;
+  }
+
+  /**
+   * Inline read-lease renewal + per-segment authorization (SPEC-0011 §3.3):
+   * the Worker awaits this before every R2 GET segment of a leased stream.
+   * Rejection (expired lease, pack no longer readable — RECLAIMABLE is
+   * irreversible) is the terminate-and-retry posture; the Worker errors the
+   * stream, and git clients re-fetch. See src/read-leases.ts.
+   */
+  async renewAndAuthorizeRead(
+    planId: string,
+    packKey: string | null,
+    byteRange?: ByteRange | null
+  ): Promise<RenewReadResult> {
+    this.rpcBind();
+    return renewAndAuthorizeRead(this.store, planId, packKey, byteRange ?? null);
+  }
+
+  /**
+   * Release the read lease (SPEC-0011 §3.4): called when the last dependent
+   * R2 read completed — after the fast path's stream end or a
+   * terminate/cancel — NOT at the HTTP response lifetime. Idempotent.
+   */
+  async releaseReadLease(planId: string): Promise<ReleaseReadResult> {
+    this.rpcBind();
+    return releaseReadLease(this.store, planId);
   }
 
   // ---- receive control plane (SPEC-0001a §3 Steps 1-2) ---------------------

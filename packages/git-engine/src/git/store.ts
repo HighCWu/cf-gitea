@@ -22,8 +22,10 @@ import {
 export interface GitStoreOptions {
   /** Wraps each schema migration + its journal insert in ONE transaction —
    * pass `ctx.storage.transactionSync` at the DO construction site. Absent,
-   * the idempotent steps run autocommit. */
-  tx?: (fn: () => void) => void;
+   * the idempotent steps run autocommit. The SAME runner is kept on the store
+   * (see `tx()`) so read-lease plan/renew pairs run atomically too
+   * (SPEC-0011 §3). */
+  tx?: <T>(fn: () => T) => T;
   /**
    * LOUD dev-scratch escape hatch (default FALSE): an unrecognized
    * pre-baseline schema state (an older dev-scratch generation's
@@ -105,6 +107,10 @@ export class GitStore {
    * detected and the store refuses every data access until an explicit wipe
    * (the repo's DELETE endpoint) rebuilds it. */
   private sealed: boolean;
+  /** The caller's transaction wrapper (ctx.storage.transactionSync at the DO
+   * construction site; identity when absent). Multi-statement invariant pairs
+   * — read-lease plan+register, renew check+extend — run inside it. */
+  private readonly txRunner: <T>(fn: () => T) => T;
   /**
    * Whether the loose `objects` table holds anything. A pushed repo is
    * pack-native — loose objects only appear after a gc migration (see
@@ -116,6 +122,7 @@ export class GitStore {
   private hasLoose: boolean;
 
   constructor(private sql: SqlStorage, opts: GitStoreOptions = {}) {
+    this.txRunner = opts.tx ?? (<T>(fn: () => T): T => fn());
     // SPEC-0011 §8 (M3.0): the forward-only migration journal runs BEFORE any
     // store use. A fresh DO replays baseline + steps uniformly; an existing
     // `0001a-step4` DO (every pre-M3 database) adopts the journal in place
@@ -345,6 +352,31 @@ export class GitStore {
     return this.sql
       .exec<{ lease_token: string; kind: string; expires_at: number; payload: string }>(
         "SELECT lease_token, kind, expires_at, payload FROM leases WHERE expires_at <= ?",
+        now
+      )
+      .toArray()
+      .map((r) => this.toLeaseRow(r));
+  }
+
+  /**
+   * Run `fn` inside the caller's DO transaction (the constructor's `tx`
+   * runner — `ctx.storage.transactionSync` in the cell). The read-lease
+   * primitives (src/read-leases.ts) use this so their catalog-read +
+   * row-write pairs are ONE SQLite transaction: plan+lease are atomic
+   * (SPEC-0011 §3.1), and a renewal's liveness/state check cannot interleave
+   * with a GC transition.
+   */
+  tx<T>(fn: () => T): T {
+    return this.txRunner(fn);
+  }
+
+  /** Live read-lease rows (kind='read', unexpired), raw payload included —
+   * the payload JSON is parsed by src/read-leases.ts. */
+  readLeases(now: number): LeaseRow[] {
+    this.assertOpen();
+    return this.sql
+      .exec<{ lease_token: string; kind: string; expires_at: number; payload: string }>(
+        "SELECT lease_token, kind, expires_at, payload FROM leases WHERE kind = 'read' AND expires_at > ?",
         now
       )
       .toArray()

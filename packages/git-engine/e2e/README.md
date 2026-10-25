@@ -126,11 +126,35 @@ Notes on the oracles (see the scripts' headers for details):
 
 `check-cache-unreachable.mjs` — the P0 direct-evidence gate: drives the real
 serve fast path through `createDurableGit().fetch` with counting stubs and
-asserts the poisoned deepen-since request makes ZERO `currentPackKey` RPCs
-and zero R2 interactions (control: the legal full clone makes exactly one of
-each). Mutation-tested — see the script header and NOTICE.md.
+asserts the poisoned deepen-since request makes ZERO `planCloneStream` RPCs
+(the M3.1 plan+lease probe that replaced the bare `currentPackKey` —
+SPEC-0011 §3) and zero R2 interactions (control: the legal full clone makes
+exactly one plan RPC and one R2 get, with the lease renewed inline and
+released at the last read). Mutation-tested — see the script header and
+NOTICE.md.
 
 ```bash
 TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
-node "$TSX" packages/git-engine/e2e/check-cache-unreachable.mjs   # 10 checks
+node "$TSX" packages/git-engine/e2e/check-cache-unreachable.mjs   # 15 checks
+```
+
+## M3.1 read-lease check (tsx, no dev server)
+
+`check-read-leases.mjs` — the SPEC-0011 §3 gate over a real GitStore
+(node:sqlite, real transactions) plus the real serve-path pieces: atomic
+plan+lease (register-after-check window proven closed by rollback), the
+readable-catalog dependency set (active + retired, never reclaimable),
+renewal extension and every rejection posture (expired = fault A,
+reclaimable = fault C, foreign pack, unknown plan), release-on-last-read +
+idempotence + post-release read refusal, the GC-eligibility substrate,
+fault B (DO restart on a file-backed SQLite: unexpired leases survive and
+still block deletion), the expiry sweep, DO-arm integration (lease-before-
+first-byte, cancel/error release, never a false success), the fast-path
+re-framing loop (renew inline before segments, release at the last R2 read
+under a slow client, rejected renewal terminates without the success tail),
+and the real `RepoCell` RPC surface.
+
+```bash
+TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
+node "$TSX" packages/git-engine/e2e/check-read-leases.mjs   # 20 checks
 ```

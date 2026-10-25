@@ -6,6 +6,14 @@ import { OidSet } from "./oidset";
 import { MultipartCapture, MultipartPackUpload } from "./multipart";
 import { parseCommit, parseTag, parseTree, isGitlinkMode, isTreeMode, TYPE_NUM, NUM_TYPE, ObjType } from "./objects";
 import { cloneCacheKey } from "./r2keys";
+import {
+  planFetch,
+  renewAndAuthorizeRead,
+  releaseReadLease,
+  READ_RENEW_MARGIN_MS,
+  type PlanFetchResult,
+  type RenewReadResult,
+} from "../read-leases";
 
 /**
  * The agent capability exactly as it goes on the wire: key=value per git
@@ -139,6 +147,23 @@ export function sidebandFrames(band: number, payload: Uint8Array): Uint8Array[] 
 }
 
 /**
+ * The read-lease guard the fast path's re-framing loop holds (SPEC-0011 §3.3,
+ * §4.2): the whole-stream lease the Worker renews INLINE before each R2 read
+ * and releases when the last read completed. The Worker paces the stream —
+ * the renew() await back-pressures the client — and a rejected renewal
+ * errors the stream (terminate-and-retry; Property A: the FLUSH success tail
+ * is never emitted after a rejection).
+ */
+export interface CloneStreamLease {
+  planId: string;
+  /** the Worker-confirmed coverage; renewed once it nears the margin */
+  expiresAt: number;
+  renew(): Promise<RenewReadResult>;
+  /** best-effort release; a failed release only delays reclaim to expiry */
+  release(): Promise<unknown>;
+}
+
+/**
  * Serve a full clone by streaming the R2-cached raw pack straight from the
  * Worker: the protocol's pack preamble, the
  * optional band-2 progress line, then the pack re-chunked into band-1 side-band
@@ -146,11 +171,19 @@ export function sidebandFrames(band: number, payload: Uint8Array): Uint8Array[] 
  * and the pack bytes are the stored bytes, so the client receives a
  * byte-for-byte-equal pack. Memory is one R2 read chunk at a time — never
  * proportional to pack size — and the DO is never contacted for bytes.
+ *
+ * With `lease` (M3.1 fast path, §4.2): the ONE long-lived R2 GET is covered by
+ * a whole-stream read lease — renewed inline at chunk boundaries before the
+ * next segment is pulled (no R2 read starts without confirmed coverage;
+ * renewal rejection terminates the stream), released when the last R2 read
+ * completed — NOT when the HTTP response finishes draining (buffered bytes
+ * need no pack protection, §3.4).
  */
 export function streamingCloneResponse(
   body: ReadableStream<Uint8Array>,
   objects: number,
-  noProgress: boolean, v2 = false
+  noProgress: boolean, v2 = false,
+  lease?: CloneStreamLease,
 ): Response {
   const headers = {
     "content-type": "application/x-git-upload-pack-result",
@@ -163,6 +196,15 @@ export function streamingCloneResponse(
   const stream = new ReadableStream<Uint8Array>({
     pull: async (ctrl) => {
       try {
+        // §3.3: no R2 GET segment starts without a lease whose expiry the
+        // Worker has CONFIRMED covers it — renewed here, before the read.
+        if (lease && lease.planId && Date.now() >= lease.expiresAt - READ_RENEW_MARGIN_MS) {
+          const r = await lease.renew();
+          if (r.tag !== "authorized") {
+            throw new Error(`read lease rejected (${r.reason}); terminating — re-fetch`);
+          }
+          lease.expiresAt = r.expiresAt;
+        }
         if (!started) {
           started = true;
           ctrl.enqueue(pkt(v2 ? "packfile\n" : "NAK\n"));
@@ -174,6 +216,16 @@ export function streamingCloneResponse(
         if (rdone) {
           if (!done) {
             done = true;
+            // §3.4 release-on-last-read: the last dependent R2 read just
+            // completed. Best-effort — a failed release only delays reclaim
+            // to the expiry sweep; the transfer itself is already complete.
+            if (lease && lease.planId) {
+              try {
+                await lease.release();
+              } catch {
+                // the lease outlives the transfer until the sweep reclaims it
+              }
+            }
             ctrl.enqueue(FLUSH);
             ctrl.close();
           }
@@ -181,10 +233,28 @@ export function streamingCloneResponse(
         }
         for (const f of sidebandFrames(1, value)) ctrl.enqueue(f);
       } catch (err) {
+        // terminate-and-retry: error the stream BEFORE any FLUSH — an aborted
+        // stream can never carry a success-completing tail (§6.8)
+        if (lease && lease.planId) {
+          try {
+            await lease.release();
+          } catch {
+            // best effort; the sweep is the backstop
+          }
+        }
         ctrl.error(err);
       }
     },
-    cancel: () => reader.cancel(),
+    cancel: async () => {
+      if (lease && lease.planId) {
+        try {
+          await lease.release();
+        } catch {
+          // best effort
+        }
+      }
+      await reader.cancel();
+    },
   });
   return new Response(stream, { headers });
 }
@@ -610,6 +680,35 @@ async function collectPackOids(
   return walk;
 }
 
+/** The DO arm's in-process read-lease state (SPEC-0011 §3): planFetch's row
+ * guards emission; renewal is plan-level (packKey null: EVERY dependency must
+ * still be readable — one reclaim kills the whole plan) at pull-batch
+ * boundaries past the margin; release fires on finish, error and cancel —
+ * never on the HTTP response lifetime. Everything is synchronous here: the DO
+ * reads its own SQLite in its own serialized control domain. */
+interface PlanLeaseState {
+  planId: string;
+  expiresAt: number;
+}
+
+function openPlanLease(store: GitStore, plan: PlanFetchResult): PlanLeaseState | null {
+  if (plan.tag === "rejected") throw new Error(`fetch plan rejected: ${plan.reason}`);
+  return plan.planId ? { planId: plan.planId, expiresAt: plan.expiresAt } : null;
+}
+
+function renewPlanLease(store: GitStore, lease: PlanLeaseState | null): void {
+  if (!lease || Date.now() < lease.expiresAt - READ_RENEW_MARGIN_MS) return;
+  const r = renewAndAuthorizeRead(store, lease.planId, null);
+  if (r.tag !== "authorized") {
+    throw new Error(`read lease rejected (${r.reason}); terminating — re-fetch`);
+  }
+  lease.expiresAt = r.expiresAt;
+}
+
+function releasePlanLease(store: GitStore, lease: PlanLeaseState | null): void {
+  if (lease) releaseReadLease(store, lease.planId);
+}
+
 /**
  * POST /git-upload-pack — stateless protocol v0 with single-ack negotiation,
  * shallow (--depth) support, side-band-64k, and a streamed pack response.
@@ -802,6 +901,16 @@ export async function uploadPack(
       }
     }
   }
+
+  // SPEC-0011 §3.1 — plan+lease atomic: the negotiated-closure plan is final,
+  // so the read lease over its dependency set (the readable catalog: every
+  // pack emission could touch, send-set packs and cross-pack delta bases
+  // alike) registers in the SAME transaction that reads the catalog. From
+  // here on, GC can never reclaim a dependency of this in-flight plan; a
+  // compaction transition that lands before the txn excludes its pack from
+  // the set (never a new plan's dependency), one after it is blocked by the
+  // lease. A lease-less plan (empty catalog, loose-only) guards nothing.
+  const lease = openPlanLease(store, planFetch(store, { generation: store.refsVersion() }));
   // Emit objects in pack storage order — (packId, offset) — rather than the
   // DFS walk order they were collected in. Reused entries are copied straight
   // out of stored packs via readRaw, and the raw-chunk LRU only pays off when
@@ -953,6 +1062,10 @@ export async function uploadPack(
     },
     pull: async (ctrl) => {
       try {
+        // §3.3: plan-level inline renewal at the batch boundary — the batch's
+        // chunk reads start only under confirmed coverage; rejection aborts
+        // the response (terminate-and-retry) before another segment is read.
+        renewPlanLease(store, lease);
         for (let n = 0; n < 64 && i < total; n++, i++) {
           const idx = order ? order[i] : i;
           if (!eCode) {
@@ -1004,11 +1117,16 @@ export async function uploadPack(
           else await capture.drain();
         }
         if (finished) {
+          // §3.4 release-on-last-read: emission's last R2 chunk read has
+          // completed; buffered bytes still streaming to the client need no
+          // pack protection.
+          releasePlanLease(store, lease);
           ctrl.close();
           release(); // stream fully drained: this upload no longer holds a slot
         }
       } catch (err) {
         if (capture) await capture.abort();
+        releasePlanLease(store, lease);
         release();
         ctrl.error(err);
       }
@@ -1017,6 +1135,7 @@ export async function uploadPack(
       // client went away mid-transfer (e.g. negotiation round abort): abort the
       // half-built multipart upload so R2 keeps no partial object
       if (capture) await capture.abort();
+      releasePlanLease(store, lease);
       release();
     },
   });
@@ -1053,6 +1172,10 @@ async function warmFullClone(
   const { preamble, sideband, noProgress, r2Key, packCache, release, headers } = opts;
   const total = store.reachableCount();
   const PAGE = 1000;
+  // §3.1 plan+lease atomic: the warm path's dependency set is the readable
+  // catalog (every pack holding a reachable object), registered with the
+  // catalog read in one transaction. §3.3/§3.4 wiring matches the cold path.
+  const lease = openPlanLease(store, planFetch(store, { generation: store.refsVersion() }));
 
   // One emit-thunk per object, in storage order: every packed reachable object
   // (marching packs sequentially), then every loose reachable object by oid.
@@ -1134,6 +1257,9 @@ async function warmFullClone(
     },
     pull: async (ctrl) => {
       try {
+        // §3.3 plan-level inline renewal at the page boundary (before this
+        // batch's chunk reads); rejection terminates the response.
+        renewPlanLease(store, lease);
         let drained = false;
         for (let n = 0; n < 64; n++) {
           const next = await it.next();
@@ -1167,17 +1293,21 @@ async function warmFullClone(
           else await capture.drain();
         }
         if (finished) {
+          // §3.4 release-on-last-read (the last chunk read completed above).
+          releasePlanLease(store, lease);
           ctrl.close();
           release();
         }
       } catch (err) {
         if (capture) await capture.abort();
+        releasePlanLease(store, lease);
         release();
         ctrl.error(err);
       }
     },
     cancel: async () => {
       if (capture) await capture.abort();
+      releasePlanLease(store, lease);
       release();
     },
   });

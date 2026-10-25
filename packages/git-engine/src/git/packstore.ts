@@ -616,6 +616,26 @@ export class PackStore {
     );
   }
 
+  /**
+   * Pack keys servable to in-flight read plans (SPEC-0011 §2/§3): ACTIVE plus
+   * RETIRED — retired packs serve EXISTING readers, and a plan registered in
+   * the same instant a compaction retires its inputs is exactly such a reader.
+   * RECLAIMABLE and DELETED rows are excluded: a new plan must never depend on
+   * a pack whose bytes may already be (or become) gone. This is the dependency
+   * set `planFetch` protects and the gate `renewAndAuthorizeRead` re-checks —
+   * both in the same serialized control domain (one SELECT inside the
+   * caller's transaction).
+   */
+  readableCatalogKeys(): string[] {
+    this.assertOpen();
+    return this.sql
+      .exec<{ pack_key: string }>(
+        "SELECT pack_key FROM pack_catalog WHERE state IN ('active', 'retired') ORDER BY pack_key"
+      )
+      .toArray()
+      .map((r) => r.pack_key);
+  }
+
   /** One ACTIVE catalog row by exact key (listCatalogPage's split-pack
    * continuation fetches the row it is mid-way through). */
   activeCatalogRow(packKey: string): PackCatalogRow | null {

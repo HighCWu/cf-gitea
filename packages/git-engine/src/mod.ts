@@ -23,6 +23,7 @@ import {
   type FinalizedPack,
 } from "./control-plane";
 import type { RepoCell } from "./repo";
+import type { PlanCloneStreamResult } from "./read-leases";
 import { DeltaResolver } from "./receive/delta";
 import { walkPack } from "./receive/scan";
 import { writeIdx } from "./receive/idx";
@@ -94,6 +95,20 @@ export type {
 export type { MergeConflictPath, MergeObject, MergePlan, TreeChange } from "./merge/tree";
 export type { WalkAnswer, WalkOpts } from "./merge/graph";
 export { MERGE_BASE_MAX_VISITS } from "./merge/graph";
+// read leases (SPEC-0011 §3, M3.1): the DO-side substrate re-exported so the
+// typed boundary is complete — the Worker consumes the RepoCell RPCs
+// (planCloneStream/renewAndAuthorizeRead/releaseReadLease) through these types.
+export type {
+  ByteRange,
+  LiveReadLease,
+  PlanCloneStreamResult,
+  PlanFetchOptions,
+  PlanFetchResult,
+  ReadLeasePayload,
+  ReleaseReadResult,
+  RenewReadResult,
+} from "./read-leases";
+export { READ_LEASE_TTL_MS, READ_RENEW_MARGIN_MS } from "./read-leases";
 // fork catalog replication (SPEC-0001b §5.3): the four RepoCell RPCs plus the
 // Worker-side consumer loop the fork endpoint's queue consumer calls (the
 // streamed bucket.get → bucket.put copy — the R2 binding has no server-side
@@ -387,11 +402,17 @@ function pageCache(): Cache | null {
  * contacted for bytes (this is the read-offload that avoids the workerd
  * DO->response stall on large packs). Detects a true full clone from the tiny
  * negotiation body — wants, no haves, `done`, not shallow/deepen, side-band-64k
- * — then asks the DO only for the cheap versioned key (no pack generation) and
- * streams the stored raw pack from R2 with on-the-fly side-band framing. Returns
- * null (a miss, a partial/shallow fetch, or any failure) to fall through to the
- * normal DO clone path. Callers MUST invoke this only after the auth gate, so a
- * private repo never streams R2 bytes to an anonymous client.
+ * — then asks the DO for the versioned key WITH its read lease
+ * (`planCloneStream` — probe + lease registration are one DO transaction,
+ * SPEC-0011 §3.1) and streams the stored raw pack from R2 with on-the-fly
+ * side-band framing. The re-framing loop renews the lease INLINE before each
+ * R2 segment (§3.3: the Worker paces the stream, so a slow renewal
+ * back-pressures the client; a rejected/expired renewal terminates the
+ * response — never a false success) and releases it when the last R2 read
+ * completes (§3.4 — not the HTTP response lifetime). Returns null (a miss, a
+ * partial/shallow fetch, or any failure) to fall through to the normal DO
+ * clone path. Callers MUST invoke this only after the auth gate, so a private
+ * repo never streams R2 bytes to an anonymous client.
  */
 async function serveCloneFromR2(
   env: Env,
@@ -407,7 +428,7 @@ async function serveCloneFromR2(
   // G3 (cache unreachability): a request carrying unsupported-but-semantics-
   // changing fetch arguments (deepen-since/deepen-not/deepen-relative/filter,
   // unknowns) must never reach the full-clone cache probe — the parse verdict
-  // short-circuits BEFORE the fullClone predicate and the currentPackKey RPC,
+  // short-circuits BEFORE the fullClone predicate and the planCloneStream RPC,
   // and the DO's uploadPack renders the protocol-shaped ERR instead.
   if (req.badArgument) return null;
   const fullClone =
@@ -419,23 +440,42 @@ async function serveCloneFromR2(
     req.clientShallows.length === 0 &&
     (req.command === "fetch" || req.caps.has("side-band-64k"));
   if (!fullClone) return null;
-  let key: string | null;
+  let plan: PlanCloneStreamResult;
   try {
-    key = await stub.currentPackKey(repo, req.wants);
+    plan = await stub.planCloneStream(repo, req.wants);
   } catch {
     return null;
   }
-  if (!key) return null;
+  if (plan.tag !== "leased") return null;
+  // release best-effort: every no-stream exit below must not strand the lease
+  // past its TTL (the sweep is the backstop, but why wait)
+  const abandon = () => stub.releaseReadLease(plan.planId).catch(() => {});
   let obj: R2ObjectBody | null;
   try {
-    obj = await bucket.get(key);
+    obj = await bucket.get(plan.key);
   } catch {
+    await abandon();
     return null;
   }
-  if (!obj) return null;
+  if (!obj) {
+    await abandon();
+    return null;
+  }
   const objects = parseInt(obj.customMetadata?.objects ?? "", 10);
-  if (!Number.isFinite(objects)) return null;
-  return streamingCloneResponse(obj.body, objects, req.caps.has("no-progress"), req.command === "fetch");
+  if (!Number.isFinite(objects)) {
+    await abandon();
+    return null;
+  }
+  // §4.2 fast path: ONE long-lived GET under a whole-stream lease. The guard
+  // closure rides the re-framing loop (streamingCloneResponse): renew inline
+  // before each segment, release on last read / error / cancel. An RPC throw
+  // inside renew() is rejection-class — the loop errors the stream either way.
+  return streamingCloneResponse(obj.body, objects, req.caps.has("no-progress"), req.command === "fetch", {
+    planId: plan.planId,
+    expiresAt: plan.expiresAt,
+    renew: () => stub.renewAndAuthorizeRead(plan.planId, plan.key, null),
+    release: () => stub.releaseReadLease(plan.planId),
+  });
 }
 
 function withCors(res: Response, origin: string | undefined): Response {
