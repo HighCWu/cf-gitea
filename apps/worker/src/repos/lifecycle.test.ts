@@ -360,6 +360,44 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     expect(fin.tag).toBe("lease_mismatch");
   });
 
+  it("cascades the team_repo_access rows with the repo (SPEC-0007 §3.5 — repo_id declares no FK there)", async () => {
+    const orgOwner = await seedVerifiedUser({ username: "OrgOwner" });
+    const orgs = await env.DB.prepare(
+      "INSERT INTO users (username, username_lower, email, is_admin, status, visibility, type, num_members, created_at) VALUES ('acme', 'acme', NULL, 0, 'active', 'public', 'org', 1, ?) RETURNING id",
+    )
+      .bind(Math.floor(Date.now() / 1000))
+      .first<{ id: number }>();
+    const orgId = orgs!.id;
+    await env.DB.prepare(
+      "INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, 'owner', ?)",
+    )
+      .bind(orgId, orgOwner.id, Math.floor(Date.now() / 1000))
+      .run();
+
+    const svc = service();
+    const repo = await createRepo({ id: orgId, usernameLower: "acme" }, "granted", true);
+    const team = await env.DB.prepare(
+      "INSERT INTO teams (org_id, lower_name, name, authorize) VALUES (?, 'readers', 'readers', 'read') RETURNING id",
+    )
+      .bind(orgId)
+      .first<{ id: number }>();
+    await env.DB.prepare("INSERT INTO team_repo_access (org_id, team_id, repo_id) VALUES (?, ?, ?)")
+      .bind(orgId, team!.id, repo.id)
+      .run();
+    expect(
+      (await env.DB.prepare("SELECT COUNT(*) AS n FROM team_repo_access WHERE repo_id = ?").bind(repo.id).first<{ n: number }>())
+        ?.n,
+    ).toBe(1);
+
+    await svc.deleteRepository(repo.id);
+    // The grant rows died in the delete batch — a same-name re-create starts
+    // with NO stale team grants (schema.ts's documented cascade convention).
+    expect(
+      (await env.DB.prepare("SELECT COUNT(*) AS n FROM team_repo_access WHERE repo_id = ?").bind(repo.id).first<{ n: number }>())
+        ?.n,
+    ).toBe(0);
+  });
+
   it("§4.8: recreating at the same name gets a fresh id/storage_key and old URLs hit the new repo", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const svc = service();

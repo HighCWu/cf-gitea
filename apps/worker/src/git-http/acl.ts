@@ -34,7 +34,11 @@ import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpa
 import { ScopeSet } from "../auth/scopes";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
 import type { AuthUser } from "../auth/auth-context";
+import type { TeamAccessMode } from "../db/schema";
 import { repoUnits, repositories, users } from "../db/schema";
+// The gate consults the same repository-service predicates as the API
+// visibility layer (SPEC-0007 §3.5): one org/team grant resolution, no drift.
+import { doerRepoAccessMode } from "../api/services/repository";
 
 type RepositoryRow = typeof repositories.$inferSelect;
 
@@ -183,17 +187,25 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
         ? new TokenService(env.DB).touchLastUsed(verified.token.id, now)
         : Promise.resolve(),
     );
-    return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, verified.user, scope);
+    // SPEC-0007 §3.5: the doer's org/team grant over the repo (Owners-team
+    // bridge + covering teams) — the same repository-service predicate the
+    // API visibility layer resolves; 'none' when the repo is user-owned or
+    // the doer holds no grant.
+    const teamMode = await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: repo.ownerId }, verified.user.id);
+    return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, verified.user, scope, teamMode);
   }
 
-  return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, null, null);
+  return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, null, null, "none");
 }
 
 /**
  * The read-grant predicate shared by the git-HTTP matrix and the UI page
  * resolution (SPEC-0010 §2.6 — exactly one copy, so page visibility and
  * git-HTTP visibility cannot drift): the gate's own grant lines
- * (`publiclyVisible`, isOwner, isSiteAdmin, the limited-owner branch).
+ * (`publiclyVisible`, isOwner, isSiteAdmin, the limited-owner branch) plus
+ * the optional SPEC-0007 §3.5 org/team grant (`teamMode`, resolved via the
+ * repository-service `doerRepoAccessMode` — the UI seam passes it once the
+ * page resolution wires it; absent keeps the pre-teams behavior).
  * `doer === null` is the anonymous doer — matrix row 1's collapse verbatim.
  * Owner-account status is NOT part of this predicate: git-HTTP refuses a
  * prohibited owner separately (below, 403 shape) and pages treat a missing
@@ -205,23 +217,30 @@ export function readGrant(input: {
   owner: { id: number; status: "active" | "prohibited" } | null;
   ownerVisibility: "public" | "limited" | "private";
   doer: { id: number; isAdmin: boolean } | null;
+  teamMode?: TeamAccessMode | null;
 }): boolean {
   const ownerActive = input.owner !== null && input.owner.status === "active";
   const repoPublic = input.repoVisibility === "public";
   const publiclyVisible = repoPublic && ownerActive && input.ownerVisibility === "public";
   if (input.doer === null) return publiclyVisible;
-  // M1 grant model: no collaborator tables exist yet (SPEC-0005), so the
-  // grant set is exactly { repo owner, site admin } (see decide below).
   const isOwner = input.owner !== null && input.doer.id === input.owner.id;
   const isSiteAdmin = input.doer.isAdmin;
+  const teamGranted = input.teamMode !== undefined && input.teamMode !== null && input.teamMode !== "none";
   return (
-    publiclyVisible || isOwner || isSiteAdmin || (repoPublic && ownerActive && input.ownerVisibility === "limited")
+    publiclyVisible ||
+    isOwner ||
+    isSiteAdmin ||
+    teamGranted ||
+    (repoPublic && ownerActive && input.ownerVisibility === "limited")
   );
 }
 
 /**
  * The matrix. `doer === null` is the anonymous doer; `scope === null` only
- * alongside it. See the table in SPEC-0003 §2.4.
+ * alongside it. `teamMode` is the authenticated doer's org/team grant
+ * (SPEC-0007 §3.5, resolved by `authorizeGitHttp` from the shared
+ * repository-service predicate) — 'none' when anonymous. See the table in
+ * SPEC-0003 §2.4.
  */
 function decide(
   op: GitHttpOp,
@@ -231,6 +250,7 @@ function decide(
   unitAnonymousRead: boolean,
   doer: AuthUser | null,
   scope: ScopeSet | null,
+  teamMode: TeamAccessMode,
 ): Response | true {
   // Visibility model (§2.5.6): repo `visibility` × owner `users.visibility`.
   // Row 1: public repo + active PUBLIC owner. Row 2's limited/private-owner
@@ -268,8 +288,9 @@ function decide(
   // (githttp.go:117-119) — applies to every caller, owner included.
   if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
 
-  // M1 grant model: no collaborator tables exist yet (SPEC-0005), so the
-  // grant set is exactly { repo owner, site admin }. Rows 8's
+  // Grant lines: { repo owner, site admin } plus the SPEC-0007 §3.5 org
+  // grant (the Owners-team bridge + covering teams — read on any effective
+  // mode; `teamMode` flows through the shared readGrant predicate). Rows 8's
   // read-only-collaborator variant extends this when collaboration lands.
   const isOwner = owner !== null && doer.id === owner.id;
   const isSiteAdmin = doer.isAdmin;
@@ -283,9 +304,11 @@ function decide(
     owner: ownerShape,
     ownerVisibility,
     doer: { id: doer.id, isAdmin: doer.isAdmin },
+    teamMode,
   });
   // Public-only tokens (SPEC-0002 §4.1) see exactly what anonymous visitors
-  // could: a limited owner's public repo stays masked.
+  // could: a limited owner's public repo stays masked — and a team grant is
+  // masked with it (anonymous-equivalent tokens hold no org grants).
   const maskedByPublicOnly = scope.publicOnly && !publiclyVisible;
   if (!canRead || maskedByPublicOnly) return repositoryNotFound();
 
@@ -294,7 +317,10 @@ function decide(
     // clones keep working — the check only gates the write path.
     if (repo.isArchived) return repositoryArchived();
     // Row 8: visible but no write grant → 404 (write capability hidden).
-    if (!isOwner && !isSiteAdmin) return repositoryNotFound();
+    // A team grants write at write/admin/owner mode (access_mode.go:17–22
+    // ranking); a read-mode team stays read-only.
+    const teamWrites = teamMode === "write" || teamMode === "admin" || teamMode === "owner";
+    if (!isOwner && !isSiteAdmin && !teamWrites) return repositoryNotFound();
   }
 
   return true;

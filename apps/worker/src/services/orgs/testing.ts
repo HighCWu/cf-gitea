@@ -21,9 +21,12 @@ export async function applyOrgsDdl(): Promise<void> {
 
 /** Clear rows between tests (schema persists; only rows are per-test scratch).
  *  The seeded 'assets' reservation row (migration 0003) is preserved — it is
- *  load-bearing for the reserved-name tests. */
+ *  load-bearing for the reserved-name tests. `team_repo_access` is swept
+ *  explicitly (repo_id declares no FK); `teams`/`team_members` cascade with
+ *  the users rows. */
 export async function resetOrgTables(): Promise<void> {
   for (const table of [
+    "team_repo_access",
     "org_members",
     "user_redirects",
     "repo_units",

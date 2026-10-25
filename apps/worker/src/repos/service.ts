@@ -61,6 +61,7 @@ import {
   pullRequests,
   repositories,
   stars,
+  teamRepoAccess,
   users,
   webhookDeliveries,
   webhooks,
@@ -579,6 +580,12 @@ export class RepoService {
       this.db.delete(repoCollaborators).where(eq(repoCollaborators.repoId, repoId)),
       this.db.delete(repoSettings).where(eq(repoSettings.repoId, repoId)),
       this.db.delete(stars).where(eq(stars.repoId, repoId)),
+      // Team↔repo grants (migration 0015; SPEC-0007 §3.5) — `repo_id` is a
+      // plain column there (no declared FK), so the rows die HERE with the
+      // repo, exactly like the other repo-scoped stores above (the schema's
+      // documented convention; upstream deletes them via the team_repo
+      // cascade, services/repository/delete.go).
+      this.db.delete(teamRepoAccess).where(eq(teamRepoAccess.repoId, repoId)),
       // Mirror rows (migration 0010; SPEC-0009 §4.3.13) — the encrypted
       // credentials die with the repo that owned them.
       this.db.delete(repoMirrors).where(eq(repoMirrors.repoId, repoId)),

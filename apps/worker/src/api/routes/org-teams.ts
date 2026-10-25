@@ -822,34 +822,16 @@ export class TeamsService {
    * ENFORCEMENT SLICE (module header): whether the user holds ANY effective
    * team grant over the repo in the repo's org — a team they belong to with
    * a non-'none' effective mode (authorize, or any unit override) covering
-   * the repo (explicit row or includes-all). This is the reduced any-unit
-   * access arm of upstream's `HasAnyUnitAccessOrPublicAccess`
-   * (org/team.go:569–577); the gate-level integration is the orchestrator's.
+   * the repo (explicit row or includes-all). DELEGATE: the predicate lives
+   * on OrgService (`teamRepoAccessMode` — the shared home every enforcement
+   * seam reads: services/repository.ts visibility/permissions + git-HTTP);
+   * this wrapper keeps the module's boolean shape. Upstream: the reduced
+   * any-unit access arm of `HasAnyUnitAccessOrPublicAccess`
+   * (org/team.go:569–577). (Delegate diff landed by the enforcement wave
+   * under the orchestrator's extended grant — same query, one home.)
    */
   async doerHasTeamRepoAccess(repo: { id: string; ownerId: number | null }, userId: number): Promise<boolean> {
-    if (repo.ownerId === null) return false;
-    const rows = await this.db
-      .select({
-        id: teams.id,
-        authorize: teams.authorize,
-        unitsMap: teams.unitsMap,
-        includesAll: teams.includesAllRepositories,
-      })
-      .from(teams)
-      .innerJoin(teamMembers, eq(teamMembers.teamId, teams.id))
-      .where(and(eq(teams.orgId, repo.ownerId), eq(teamMembers.userId, userId)))
-      .all();
-    for (const team of rows) {
-      if (team.authorize === "none" && team.unitsMap === null) continue;
-      if (team.includesAll) return true;
-      const covered = await this.db
-        .select({ id: teamRepoAccess.id })
-        .from(teamRepoAccess)
-        .where(and(eq(teamRepoAccess.teamId, team.id), eq(teamRepoAccess.repoId, repo.id)))
-        .get();
-      if (covered !== undefined) return true;
-    }
-    return false;
+    return (await this.orgs.teamRepoAccessMode(repo, userId)) !== "none";
   }
 
   /**

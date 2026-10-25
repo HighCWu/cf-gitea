@@ -284,6 +284,108 @@ describe("canCreateOrgRepo (§3.4 role='owner' equivalence)", () => {
     expect(await service().canCreateOrgRepo(org.id, outsider)).toBe(false);
     // Site-admin bypass is caller-level (fork.go:97–108), not in the predicate.
   });
+
+  it("§3.4 tier-2 team arm: a can_create_org_repo (or authorize='owner') team member can create; plain teams cannot", async () => {
+    const org = await seedOrg("Creators");
+    const creator = (await rawUserRow("creators-owner"))!.id as number;
+    const granted = (await seedVerifiedUser({ username: "Shipper" })).id;
+    const plain = (await seedVerifiedUser({ username: "Intern" })).id;
+    await service().addMember(org.id, granted, { role: "member" });
+    await service().addMember(org.id, plain, { role: "member" });
+
+    const teamRow = async (name: string, authorize: string, canCreate: boolean) => {
+      const inserted = await env.DB.prepare(
+        "INSERT INTO teams (org_id, lower_name, name, authorize, can_create_org_repo) VALUES (?, ?, ?, ?, ?) RETURNING id",
+      )
+        .bind(org.id, name, name, authorize, canCreate ? 1 : 0)
+        .first<{ id: number }>();
+      return inserted!.id;
+    };
+    const creators = await teamRow("creators", "read", true);
+    await env.DB.prepare("INSERT INTO team_members (org_id, team_id, user_id) VALUES (?, ?, ?)")
+      .bind(org.id, creators, granted)
+      .run();
+    const readers = await teamRow("readers", "read", false);
+    await env.DB.prepare("INSERT INTO team_members (org_id, team_id, user_id) VALUES (?, ?, ?)")
+      .bind(org.id, readers, plain)
+      .run();
+
+    expect(await service().canCreateOrgRepo(org.id, granted)).toBe(true);
+    expect(await service().canCreateOrgRepo(org.id, plain)).toBe(false);
+    expect(await service().canCreateOrgRepo(org.id, creator)).toBe(true);
+  });
+
+  it("isOrgOwner stays narrower than the create grant (upstream IsOrganizationOwner vs CanCreateOrgRepo)", async () => {
+    const org = await seedOrg("Split");
+    const granted = (await seedVerifiedUser({ username: "Shipper" })).id;
+    await service().addMember(org.id, granted, { role: "member" });
+    const creators = await env.DB.prepare(
+      "INSERT INTO teams (org_id, lower_name, name, authorize, can_create_org_repo) VALUES (?, 'creators', 'creators', 'read', 1) RETURNING id",
+    )
+      .bind(org.id)
+      .first<{ id: number }>();
+    await env.DB.prepare("INSERT INTO team_members (org_id, team_id, user_id) VALUES (?, ?, ?)")
+      .bind(org.id, creators!.id, granted)
+      .run();
+
+    // The create-team arm grants repo creation but NOT ownership (org_user.go
+    // 66–77 vs 98–106) — the ownership guards belong on isOrgOwner.
+    expect(await service().canCreateOrgRepo(org.id, granted)).toBe(true);
+    expect(await service().isOrgOwner(org.id, granted)).toBe(false);
+  });
+});
+
+describe("teamRepoAccessMode (§3.5 enforcement slice — the shared predicate)", () => {
+  it("ranks the covering teams' effective modes; uncovered/private-owner repos read 'none'", async () => {
+    const org = await seedOrg("Vault");
+    const ownerId = (await rawUserRow("vault-owner"))!.id as number;
+    const repoService = new RepoService(env.DB);
+    const repo = await repoService.create({
+      owner: { id: org.id, usernameLower: org.usernameLower },
+      name: "hidden",
+      isPrivate: true,
+    });
+
+    const grant = async (user: string, mode: string, unitsMap: string | null, repoId: string) => {
+      const uid = (await seedVerifiedUser({ username: user })).id;
+      await service().addMember(org.id, uid);
+      const team = await env.DB.prepare(
+        "INSERT INTO teams (org_id, lower_name, name, authorize, units_map) VALUES (?, ?, ?, ?, ?) RETURNING id",
+      )
+        .bind(org.id, user, user, mode, unitsMap)
+        .first<{ id: number }>();
+      await env.DB.prepare("INSERT INTO team_members (org_id, team_id, user_id) VALUES (?, ?, ?)")
+        .bind(org.id, team!.id, uid)
+        .run();
+      if (repoId !== "") {
+        await env.DB.prepare("INSERT INTO team_repo_access (org_id, team_id, repo_id) VALUES (?, ?, ?)")
+          .bind(org.id, team!.id, repoId)
+          .run();
+      }
+      return uid;
+    };
+
+    const reader = await grant("reader", "read", null, repo.id);
+    const writer = await grant("writer", "none", JSON.stringify({ "repo.code": "write" }), repo.id);
+    const admin = await grant("adminer", "admin", null, repo.id);
+    const outsider = await grant("uncovered", "read", null, ""); // team covers nothing
+    const allMate = await grant("allmate", "read", null, ""); // includes-all below
+    await env.DB.prepare("UPDATE teams SET includes_all_repositories = 1 WHERE org_id = ? AND lower_name = 'allmate'").bind(org.id).run();
+
+    expect(await service().teamRepoAccessMode({ id: repo.id, ownerId: org.id }, reader)).toBe("read");
+    expect(await service().teamRepoAccessMode({ id: repo.id, ownerId: org.id }, writer)).toBe("write");
+    expect(await service().teamRepoAccessMode({ id: repo.id, ownerId: org.id }, admin)).toBe("admin");
+    expect(await service().teamRepoAccessMode({ id: repo.id, ownerId: org.id }, allMate)).toBe("read");
+    expect(await service().teamRepoAccessMode({ id: repo.id, ownerId: org.id }, outsider)).toBe("none");
+    // The org owner reads 'owner' only through the bridge arm (not this
+    // predicate — no owners team row exists to join through).
+    expect(await service().teamRepoAccessMode({ id: repo.id, ownerId: org.id }, ownerId)).toBe("none");
+    // User-owned repo / missing owner: no org to hold teams.
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const solo = await repoService.create({ owner: { id: alice.id, usernameLower: "alice" }, name: "solo", isPrivate: true });
+    expect(await service().teamRepoAccessMode({ id: solo.id, ownerId: alice.id }, reader)).toBe("none");
+    expect(await service().teamRepoAccessMode({ id: solo.id, ownerId: null }, reader)).toBe("none");
+  });
 });
 
 describe("membership guards (§4.3 last-owner, §4.5 states)", () => {

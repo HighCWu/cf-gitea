@@ -2,11 +2,12 @@ import { and, asc, desc, eq, like, or, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
-import { repositories, users } from "../../db/schema";
+import { repositories, users, type TeamAccessMode } from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
 import type { Permission, Repository } from "../models/repository";
 import type { User } from "../models/user";
+import { OrgService } from "../../services/orgs/orgs";
 import type { RepoSettings } from "./repo-settings";
 
 /**
@@ -20,6 +21,17 @@ import type { RepoSettings } from "./repo-settings";
  * The converter mirrors upstream `convert.innerToRepo`
  * (gitea/services/convert/repository.go) reduced to D1-only data, keeping the
  * vendored pin's runtime values for unit/PR-configuration defaults.
+ *
+ * Access model (SPEC-0007 §3.5 enforcement): the visibility/permission
+ * predicates take an optional resolved team/owner `TeamAccessMode` — the
+ * doer's org-repo grant (`doerRepoAccessMode` below, over the shared
+ * `OrgService.teamRepoAccessMode` predicate + the Owners-team bridge). The
+ * sync signatures stay back-compatible (callers that have not resolved a
+ * grant keep the reduced owner/admin matrix); the `*WithTeams` resolvers and
+ * the git-HTTP gate (git-http/acl.ts) pass the mode so a team-granted member
+ * sees a private org repo upstream-style (GetDoerRepoPermission,
+ * models/perm/access/repo_permission.go — read ⇒ pull, write/admin/owner ⇒
+ * push, admin/owner ⇒ admin; AccessMode ranks, access_mode.go:17–22).
  */
 
 /** D1 row of the `repositories` table (src/db/schema.ts). */
@@ -93,25 +105,96 @@ function isRepositoryOwner(viewer: Viewer, row: RepositoryRow): boolean {
  * Whether the viewer may see the repository at all. Private repositories are
  * invisible to everyone but the owner and site admins; the routes turn this
  * into the upstream anti-enumeration 404 (SPEC-0004 §2.4 gotcha).
+ *
+ * `teamMode` (optional, pre-resolved via `doerRepoAccessMode`): a non-'none'
+ * org grant — an org team's effective mode or the Owners-team bridge — makes
+ * the private repo visible to the grantee (upstream members read through
+ * their team's unit access). Absent/null keeps the reduced matrix, so
+ * callers that never resolved a grant behave exactly as before.
  */
-export function canViewRepository(viewer: Viewer, row: RepositoryRow): boolean {
+export function canViewRepository(viewer: Viewer, row: RepositoryRow, teamMode?: TeamAccessMode | null): boolean {
   if (row.visibility === "public") {
+    return true;
+  }
+  if (teamMode !== undefined && teamMode !== null && teamMode !== "none") {
     return true;
   }
   return viewer.requester !== null && (viewer.requester.is_admin === true || isRepositoryOwner(viewer, row));
 }
 
 /**
- * Embedded `permissions` block (upstream `api.Permission` from the doer's
- * access mode). TODO(SPEC-0005): collaborators and org teams — until those
- * tables exist the reduced matrix is owner/admin → full access, everyone
- * else pull on public and nothing on private.
+ * The doer's effective access mode over a repository from its ORG side —
+ * `max(org-owner bridge arm, team arm)`: an `org_members.role='owner'` row
+ * IS the upstream Owners team (authorize=owner, includes-all;
+ * SPEC-0007 §3.3) and any covering team's grant comes through the shared
+ * `OrgService.teamRepoAccessMode` predicate. 'none' for user-owned repos and
+ * unaffiliated doers. This is the single repository-service predicate the
+ * git-HTTP gate (git-http/acl.ts) consumes, so gate and API visibility
+ * cannot drift.
  */
-export function repositoryPermissions(viewer: Viewer, row: RepositoryRow): Permission {
+export async function doerRepoAccessMode(
+  d1: D1Database,
+  row: Pick<RepositoryRow, "id" | "ownerId">,
+  userId: number,
+): Promise<TeamAccessMode> {
+  const orgs = new OrgService(d1);
+  if (row.ownerId !== null && (await orgs.isOrgOwner(row.ownerId, userId))) {
+    return "owner";
+  }
+  return orgs.teamRepoAccessMode(row, userId);
+}
+
+/**
+ * `canViewRepository` with the org/team grant resolved from D1 — the
+ * async seam for callers that hold a db handle (the route guards evolve
+ * onto this; the sync overload above stays for callers that pass a
+ * pre-resolved mode or need the pure matrix).
+ */
+export async function canViewRepositoryWithTeams(
+  d1: D1Database,
+  viewer: Viewer,
+  row: RepositoryRow,
+): Promise<boolean> {
+  // The API `User.id` mirrors upstream's optional int64; a resolved doer
+  // always carries one (the auth middlewares project the D1 row).
+  const userId = viewer.requester?.id;
+  if (userId === undefined) return canViewRepository(viewer, row);
+  const mode = await doerRepoAccessMode(d1, row, userId);
+  return canViewRepository(viewer, row, mode);
+}
+
+/**
+ * Embedded `permissions` block (upstream `api.Permission` from the doer's
+ * access mode). `teamMode` (optional, `doerRepoAccessMode`) maps the org
+ * grant onto the block upstream-style: read ⇒ pull; write/admin/owner ⇒
+ * push (+pull); admin/owner ⇒ admin. TODO(SPEC-0005): collaborators are
+ * layered by the repo-access guards, not here.
+ */
+export function repositoryPermissions(
+  viewer: Viewer,
+  row: RepositoryRow,
+  teamMode?: TeamAccessMode | null,
+): Permission {
   if (viewer.requester !== null && (viewer.requester.is_admin === true || isRepositoryOwner(viewer, row))) {
     return { admin: true, push: true, pull: true };
   }
+  if (teamMode !== undefined && teamMode !== null && teamMode !== "none") {
+    const ranked = teamMode === "admin" || teamMode === "owner";
+    return { admin: ranked, push: ranked || teamMode === "write", pull: true };
+  }
   return { admin: false, push: false, pull: row.visibility === "public" };
+}
+
+/** `repositoryPermissions` with the org/team grant resolved from D1. */
+export async function repositoryPermissionsWithTeams(
+  d1: D1Database,
+  viewer: Viewer,
+  row: RepositoryRow,
+): Promise<Permission> {
+  const userId = viewer.requester?.id;
+  if (userId === undefined) return repositoryPermissions(viewer, row);
+  const mode = await doerRepoAccessMode(d1, row, userId);
+  return repositoryPermissions(viewer, row, mode);
 }
 
 /**
@@ -176,8 +259,16 @@ function repositoryIdNumber(id: string): number {
  * — description/website/has_*) when the caller loaded it; list/search paths
  * keep the upstream defaults (the settings row is the not-yet-swept column
  * store, same discipline as the TODO(SPEC-0005) zero-defaults below).
+ * `teamMode` (optional, `doerRepoAccessMode`) feeds the embedded
+ * `permissions` block — the sync converters without it render the reduced
+ * matrix.
  */
-export function toApiRepository(viewer: Viewer, pair: RepositoryWithOwner, settings?: RepoSettings): Repository {
+export function toApiRepository(
+  viewer: Viewer,
+  pair: RepositoryWithOwner,
+  settings?: RepoSettings,
+  teamMode?: TeamAccessMode | null,
+): Repository {
   const { repo: row, owner } = pair;
   const ownerNamespace = encodeURIComponent(row.ownerNamespace);
   const slug = encodeURIComponent(row.slug);
@@ -227,7 +318,7 @@ export function toApiRepository(viewer: Viewer, pair: RepositoryWithOwner, setti
     updated_at: createdIso, // TODO(SPEC-0005): updated_unix column (starts == created)
     archived: row.isArchived,
     archived_at: GO_ZERO_TIME,
-    permissions: repositoryPermissions(viewer, row),
+    permissions: repositoryPermissions(viewer, row, teamMode),
     has_code: true,
     has_issues: settings?.hasIssues ?? true,
     internal_tracker: {

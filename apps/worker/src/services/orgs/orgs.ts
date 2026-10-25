@@ -29,10 +29,19 @@
  * the driver error; see `isUniqueViolation`).
  */
 
-import { and, asc, eq, inArray, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql, type SQL } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
-import { orgMembers, repositories, userRedirects, users } from "../../db/schema";
+import {
+  orgMembers,
+  repositories,
+  teamMembers,
+  teamRepoAccess,
+  teams,
+  userRedirects,
+  users,
+  type TeamAccessMode,
+} from "../../db/schema";
 import {
   LastOrgOwnerError,
   MAX_ORG_NAME_LENGTH,
@@ -586,15 +595,50 @@ export class OrgService {
   }
 
   /**
-   * The SPEC-0003 row-19 grant (§3.4): at tier 1 `role='owner'` is *exactly
-   * equivalent* to upstream's `CanCreateOrgRepo` EXISTS
-   * (org_user.go:98–106, `can_create_org_repo OR authorize=owner` through
-   * team_user) — a fresh org has one team (Owners, can_create_org_repo) and
-   * no tier-1 path creates another. Both callers (POST /orgs/{org}/repos and
+   * The SPEC-0003 row-19 grant (§3.4), widened to the tier-2 team arm:
+   *
+   *   role='owner' (the Owners-team bridge, §3.3) OR EXISTS(team t
+   *     JOIN team_members tm … WHERE t.org_id=? AND tm.user_id=?
+   *     AND (t.can_create_org_repo OR t.authorize='owner'))
+   *
+   * — the verbatim port of upstream's EXISTS query (org_user.go:98–106,
+   * `can_create_org_repo OR authorize=owner` through team_user; our join
+   * table is `team_members`, SPEC-0007 §3.5). At tier 1 the role predicate
+   * was *exactly equivalent* to upstream's reachable state space (a fresh
+   * org has one team — Owners, can_create_org_repo — and no tier-1 path
+   * created another); with teams landed the team arm becomes reachable via
+   * POST /orgs/{org}/teams.
+   *
+   * CALLERS NOTE (upstream distinction this widening exposes): the org
+   * OWNERSHIP guards (`requireOrgOwnership`, `IsOrganizationOwner`) must
+   * stay on `isOrgOwner` below — upstream's CanCreateOrgRepo deliberately
+   * grants repo creation to non-owner teams without conferring ownership
+   * (org_user.go:66–77 vs 98–106). Both callers (POST /orgs/{org}/repos and
    * git push-create) share this predicate. Site-admin bypass is caller-level
    * (`prepareDoerCreateRepoInOrg`, fork.go:97–108), as upstream.
    */
   async canCreateOrgRepo(orgId: number, userId: number): Promise<boolean> {
+    if (await this.isOrgOwner(orgId, userId)) return true;
+    const row = await this.db
+      .select({ id: teams.id })
+      .from(teams)
+      .innerJoin(teamMembers, and(eq(teamMembers.teamId, teams.id), eq(teamMembers.userId, userId)))
+      .where(
+        and(eq(teams.orgId, orgId), or(eq(teams.canCreateOrgRepo, true), eq(teams.authorize, "owner"))),
+      )
+      .get();
+    return row !== undefined;
+  }
+
+  /**
+   * `IsOrganizationOwner` (org_user.go:66–77) under the Owners-team bridge:
+   * membership in the org's owner team ⟺ `org_members.role='owner'`
+   * (SPEC-0007 §3.3 — no owners team row exists to join through). This is
+   * the OWNERSHIP predicate the reqOrgOwnership-grade guards belong on —
+   * deliberately narrower than `canCreateOrgRepo`, whose team arm grants
+   * repo creation without ownership (org_user.go:98–106).
+   */
+  async isOrgOwner(orgId: number, userId: number): Promise<boolean> {
     const row = await this.db
       .select({ id: orgMembers.id })
       .from(orgMembers)
@@ -603,6 +647,64 @@ export class OrgService {
       )
       .get();
     return row !== undefined;
+  }
+
+  /**
+   * The teams-module enforcement slice (SPEC-0007 §3.5, extracted here so
+   * every seam reads one predicate — the routes/org-teams.ts module header's
+   * gate-level integration note): the doer's MAXIMUM effective access mode
+   * over the repo from org teams, upstream `perm.AccessMode`
+   * (perm/access_mode.go:17–22). A team grants when the doer is a
+   * `team_members` row of a team in the repo's org whose EFFECTIVE mode is
+   * not 'none' — `max(authorize, unitsMap values)`; the units collapse makes
+   * the map's strongest unit the team's blanket mode (no unit ACL exists to
+   * narrow it) — and covers the repo either through `includes_all_repositories`
+   * or an explicit `team_repo_access` row (the read-side union of the landed
+   * `doerHasTeamRepoAccess`, repo_team.go:253–255). 'none' when no team
+   * grants: org OWNERSHIP grants through `isOrgOwner`, not here (the bridge
+   * has no owners team row — callers compose the arms, see
+   * api/services/repository.ts `doerRepoAccessMode`).
+   */
+  async teamRepoAccessMode(repo: { id: string; ownerId: number | null }, userId: number): Promise<TeamAccessMode> {
+    if (repo.ownerId === null) return "none";
+    const rows = await this.db
+      .select({
+        id: teams.id,
+        authorize: teams.authorize,
+        unitsMap: teams.unitsMap,
+        includesAll: teams.includesAllRepositories,
+      })
+      .from(teams)
+      .innerJoin(teamMembers, eq(teamMembers.teamId, teams.id))
+      .where(and(eq(teams.orgId, repo.ownerId), eq(teamMembers.userId, userId)))
+      .all();
+    const rank: Record<TeamAccessMode, number> = { none: 0, read: 1, write: 2, admin: 3, owner: 4 };
+    let best: TeamAccessMode = "none";
+    for (const team of rows) {
+      // Effective mode = max(authorize, the unit overrides) — the units_map
+      // collapse of upstream's team_unit rows (team.go:204–219, schema.ts
+      // `teams.unitsMap`).
+      let effective = team.authorize;
+      if (team.unitsMap !== null) {
+        for (const mode of Object.values(JSON.parse(team.unitsMap) as Record<string, string>)) {
+          const parsed: TeamAccessMode =
+            mode === "read" || mode === "write" || mode === "admin" || mode === "owner" ? mode : "none";
+          if (rank[parsed] > rank[effective]) effective = parsed;
+        }
+      }
+      if (effective === "none" || rank[effective] <= rank[best]) continue;
+      const covered = team.includesAll
+        ? true
+        : (
+            await this.db
+              .select({ id: teamRepoAccess.id })
+              .from(teamRepoAccess)
+              .where(and(eq(teamRepoAccess.teamId, team.id), eq(teamRepoAccess.repoId, repo.id)))
+              .get()
+          ) !== undefined;
+      if (covered) best = effective;
+    }
+    return best;
   }
 
   /**
