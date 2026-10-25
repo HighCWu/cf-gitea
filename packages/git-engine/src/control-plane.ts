@@ -33,6 +33,7 @@
  */
 import {
   commitPush,
+  isAncestor,
   latestCommitTime,
   validatePush,
   validRefName,
@@ -161,6 +162,28 @@ export type BeginReceiveResult =
   | BeginReceiveBusy
   | BeginReceiveImporting
   | BeginReceiveRejected;
+
+/** What one receive-pack command is, policy-wise (SPEC-0013 M2). create and
+ * delete are wire facts; fast-forward vs force-push is ancestry, classified
+ * DO-side by {@link classifyReceive} over the lease-staged rows (the new
+ * tips are only readable after putIndexRows — the same posture finalize's
+ * validatePush walk uses). */
+export type PushCommandKind = "create" | "delete" | "fast-forward" | "force-push";
+
+/** Classify one push's command section for the Worker-side `validatePush`
+ * hook (ONE RPC per push, never per command — SPEC-0013 §3.5). */
+export interface ClassifyReceiveInput {
+  leaseToken: string;
+  /** index-aligned with the client's command section; only old/next matter */
+  commands: { old: string; next: string }[];
+}
+
+export type ClassifyReceiveOk = {
+  tag: "ok";
+  /** index-aligned with `input.commands` */
+  kinds: PushCommandKind[];
+};
+export type ClassifyReceiveResult = ClassifyReceiveOk | { tag: "lease_mismatch" };
 
 export interface FinalizedPack {
   /** final pack key: repos/<storage_key>/packs/<packName>.pack — the Worker has
@@ -550,6 +573,38 @@ export async function lookupObjects(host: LeaseHost, leaseToken: string, oids: s
   }
   const out = host.store.lookupObjectsForWorker(oids);
   return out;
+}
+
+/**
+ * Classify a push's command section for the Worker-side `validatePush` hook
+ * (SPEC-0013 M2, the per-ref protected-branch gate): create/delete are wire
+ * facts; fast-forward vs force-push is ancestry — `old` is an ancestor of
+ * (or equal to) `new` — walked by the same bounded `isAncestor` finalize's
+ * validatePush uses for its `forced` flag. The new tips resolve only after
+ * putIndexRows primed the lease's pack, so this RPC runs post-scan, and it
+ * re-primes first: the backend cache is in-memory and this DO instance may
+ * have been recycled since the rows landed. Pure reads (no ref state
+ * changes); the command CAS is still re-checked atomically at finalize.
+ */
+export async function classifyReceive(host: LeaseHost, input: ClassifyReceiveInput): Promise<ClassifyReceiveResult> {
+  const { store } = host;
+  const lease = store.getLease(input.leaseToken);
+  if (!lease || lease.kind !== "receive" || lease.expiresAt <= Date.now()) {
+    return { tag: "lease_mismatch" };
+  }
+  const payload = parseLeasePayload(lease.payload);
+  if (payload.packName && payload.stagingKey) store.packs.primePack(payload.packName, payload.stagingKey);
+  const kinds: PushCommandKind[] = [];
+  for (const cmd of input.commands) {
+    if (cmd.next === ZERO_OID) {
+      kinds.push("delete");
+    } else if (cmd.old === ZERO_OID) {
+      kinds.push("create");
+    } else {
+      kinds.push((await isAncestor(store, cmd.old, cmd.next)) ? "fast-forward" : "force-push");
+    }
+  }
+  return { tag: "ok", kinds };
 }
 
 /**

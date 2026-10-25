@@ -25,6 +25,7 @@ import {
   listCatalogPage,
   commitApiChange,
   checkMergeability,
+  classifyReceive,
   countDivergence,
   deleteApiRef,
   destroy,
@@ -50,6 +51,8 @@ import {
   type CatalogPage,
   type CheckMergeabilityInput,
   type CheckMergeabilityResult,
+  type ClassifyReceiveInput,
+  type ClassifyReceiveResult,
   type CommitApiChangeInput,
   type CommitApiChangeResult,
   type DeleteApiRefInput,
@@ -892,6 +895,13 @@ export class RepoCell extends DurableObject<Env> {
    * anti-checks (Step 2); the Worker R2-reads packed hits itself. */
   async lookupObjects(leaseToken: string, oids: string[]): Promise<LookupObjectResult[]> {
     return lookupObjects(this.leaseHost(), leaseToken, oids);
+  }
+
+  /** Per-command push classification for the Worker receive flow's
+   * `validatePush` hook (SPEC-0013 M2): create/delete/fast-forward/
+   * force-push, ancestry over the lease-staged rows — ONE RPC per push. */
+  async classifyReceive(input: ClassifyReceiveInput): Promise<ClassifyReceiveResult> {
+    return classifyReceive(this.leaseHost(), input);
   }
 
   // ---- API commit builder (SPEC-0001a §4) + merge surface (SPEC-0001b §4) --

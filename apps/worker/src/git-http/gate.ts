@@ -50,7 +50,7 @@
 
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import type { DurableGitHandler, PusherIdentity } from "@cf-gitea/git-engine";
+import type { ClassifiedPushCommand, DurableGitHandler, EngineCallOptions, PushValidator, PushVerdict, PusherIdentity } from "@cf-gitea/git-engine";
 
 import {
   authorizeGitHttp,
@@ -82,11 +82,23 @@ import {
   routeOp,
   scopeForbidden,
 } from "./respond";
-import { findRepositoryById } from "../api/services/repository";
+import { findRepositoryById, type RepositoryRow } from "../api/services/repository";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
+import {
+  canUserDelete,
+  canUserForcePush,
+  canUserPush,
+  compileRuleName,
+  listRepoRules,
+  parseRuleConfig,
+  principalAccessOfRow,
+  ruleMatches,
+  type ProtectedBranchConfig,
+  type ProtectedBranchRow,
+} from "../services/branch-protection";
 import { handleLfsGateBranch, parseLfsRoute } from "../lfs/router";
-import { repoCounters, repoUnits, repositories } from "../db/schema";
+import { repoCounters, repoUnits, repositories, users } from "../db/schema";
 import { deleteRepositoryViaEngineShape } from "../repos/purge";
 import { RepoNameCollisionError, RepoService, lookupRedirect } from "../repos/service";
 import { emitRepoEventInline, repositoryEventIdentity, repositoryEventPayload } from "../services/repo-events";
@@ -238,6 +250,7 @@ export async function gitHttpGate(
     engine,
     isPush ? resolved.repo.storageKey : undefined,
     isPush ? await resolvePushPusher(env, req) : undefined,
+    isPush ? protectedBranchValidator(env, resolved.repo) : undefined,
   );
 }
 
@@ -340,7 +353,7 @@ async function handleUnknownRepository(
     // §2.5.2 finalize handshake (scheduled AFTER the response below — the
     // async settle body starts at call time, so scheduling it before the
     // forward would race the receive's finalize with an empty-DO listRefs).
-    const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified));
+    const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified), protectedBranchValidator(env, raced.repo));
     ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`));
     return response;
   }
@@ -366,7 +379,7 @@ async function handleUnknownRepository(
   // race the finalize with an empty-DO listRefs). The forward carries the
   // fresh row's storage key: the very first receive already addresses R2 by
   // r_<id>, so no name-addressed prefix ever gets written for this repo.
-  const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey, verifiedPusher(verified));
+  const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey, verifiedPusher(verified), protectedBranchValidator(env, created));
   ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`));
   return response;
 }
@@ -525,7 +538,10 @@ async function resolvePushPusher(env: Env, req: Request): Promise<PusherIdentity
  *  receive-pack forwards; every other route passes it unset and keeps the
  *  byte-identical passthrough (the D1-missing e2e population depends on it).
  *  `pusher` rides the engine's in-process call-options argument on receive
- *  forwards only (resolvePushPusher) — the engine puts it on PushEvent. */
+ *  forwards only (resolvePushPusher) — the engine puts it on PushEvent.
+ *  `validatePush` (SPEC-0013 M2) rides the same in-process channel on
+ *  receive forwards only (protectedBranchValidator) — the engine enforces
+ *  its per-ref verdicts before finalize. */
 async function forwardToEngine(
   req: Request,
   url: URL,
@@ -534,6 +550,7 @@ async function forwardToEngine(
   engine: DurableGitHandler<Env>,
   storageKey?: string,
   pusher?: PusherIdentity | null,
+  validatePush?: PushValidator,
 ): Promise<Response> {
   let forwarded: Request;
   try {
@@ -544,7 +561,145 @@ async function forwardToEngine(
     return bareBadRequest();
   }
   gateCleared.add(forwarded);
-  return engine.fetch(forwarded, env, ctx, pusher ? { pusher } : undefined);
+  const callOptions: EngineCallOptions | undefined =
+    pusher || validatePush
+      ? {
+          ...(pusher ? { pusher } : {}),
+          ...(validatePush ? { validatePush } : {}),
+        }
+      : undefined;
+  return engine.fetch(forwarded, env, ctx, callOptions);
+}
+
+/**
+ * The SPEC-0013 M2 per-ref push policy, supplied to the engine as the
+ * receive forward's `validatePush` call option — the same in-process,
+ * not-wire-trustable channel as the pusher identity. The engine classifies
+ * each command (create/delete/fast-forward/force-push, ancestry engine-side)
+ * after the pack is indexed and calls this before finalize; a `reject`
+ * verdict renders as the command's report-status ng line and never applies.
+ *
+ * Enforcement boundary (stated honestly, same posture as the identity seam):
+ * only receives the gate forwards WITH a D1-resolved repo row carry the
+ * callback. The mirror/import engine composition
+ * (services/mirror/sync.ts, repos/imports/pipeline.ts) and the D1-missing
+ * transitional passthrough construct their receives without it — no rules
+ * load, nothing enforces.
+ */
+function protectedBranchValidator(env: Env, repo: RepositoryRow): PushValidator {
+  return async (commands, hookCtx) => {
+    try {
+      return await evaluateBranchProtection(env, repo, hookCtx.pusher ?? null, commands);
+    } catch (error) {
+      console.error(
+        `[branch-protection] ${repo.ownerNamespace}/${repo.slug}: push evaluation failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      // Fail closed: the error propagates to the engine's receive catch,
+      // which releases the lease with a sweep and answers 500 — never an
+      // unevaluated allow.
+      throw new Error("branch protection check temporarily unavailable", { cause: error });
+    }
+  };
+}
+
+/**
+ * The per-push evaluation (SPEC-0013 §3.5): rules load ONCE per push, the
+ * predicates are M1's service ports consumed read-only. Verdicts are
+ * index-aligned with the engine's classified commands (a crafted request
+ * can send two commands for one ref — join by position, never by name).
+ *
+ * Upstream arms, per command (hook_pre_receive.go preReceiveBranch,
+ * :123-313), ported at the v1 no-object-inspection scope (SPEC-0013 §6):
+ * default-branch deletion refused absolutely (:140-143, before the rule
+ * lookup), first-match rule (:149-158), the deletion predicate (:166-171),
+ * the force-push refusal (:176-191), then the direct-push predicate with
+ * the force variant of the refusal text (:229-267). Messages are upstream's
+ * exact texts; the engine renders them as report-status ng lines. The
+ * UI/API-merge escape hatch (:236-312) does not exist for us — merges never
+ * traverse receive-pack — so failure is uniformly "reject the command".
+ * Upstream's PR-target deletion arm (:144-147, same deletion text) is not
+ * ported: it needs the open-PR base-branch universe and is not one of the
+ * SPEC-0013 M2 arms.
+ */
+async function evaluateBranchProtection(
+  env: Env,
+  repo: RepositoryRow,
+  pusher: PusherIdentity | null,
+  commands: ClassifiedPushCommand[],
+): Promise<PushVerdict[]> {
+  const db = drizzle(env.DB);
+  // The pusher's principal access: the in-process identity resolved at the
+  // forward (resolvePushPusher) is re-read here for `is_admin` (a site
+  // admin holds write+admin — principalAccessOf's early return). A pusher
+  // whose user row vanished between the token verify and this read, and an
+  // unresolvable/absent identity, evaluate as anonymous: every predicate
+  // answers false — not whitelisted (upstream: no user, no allowlist hit).
+  const pusherRow = pusher
+    ? ((await db
+        .select({ id: users.id, username: users.username, isAdmin: users.isAdmin })
+        .from(users)
+        .where(eq(users.id, pusher.id))
+        .limit(1)
+        .all())[0] ?? null)
+    : null;
+  const access = await principalAccessOfRow(
+    env.DB,
+    repo,
+    pusherRow ? { id: pusherRow.id, username: pusherRow.username, isAdmin: pusherRow.isAdmin } : null,
+  );
+
+  // Rules load ONCE per push; names compile once (the §2.1 first-match
+  // order comes back from listRepoRules), configs parse per matched rule.
+  const rules = await listRepoRules(env.DB, repo.id);
+  const compiled = rules.map((row) => ({ row, name: compileRuleName(row.ruleName) }));
+  const configs = new Map<number, ProtectedBranchConfig>();
+  const configOf = (row: ProtectedBranchRow): ProtectedBranchConfig => {
+    let config = configs.get(row.id);
+    if (config === undefined) {
+      config = parseRuleConfig(row.rules);
+      configs.set(row.id, config);
+    }
+    return config;
+  };
+
+  return Promise.all(
+    commands.map(async (cmd): Promise<PushVerdict> => {
+      // Only branch refs carry protection (upstream: tags walk preReceiveTag,
+      // which has no protection arms).
+      if (!cmd.ref.startsWith("refs/heads/")) return {};
+      const branch = cmd.ref.slice("refs/heads/".length);
+      if (cmd.kind === "delete" && branch === repo.defaultBranch) {
+        return { reject: `Branch ${branch} is the default branch and cannot be deleted` };
+      }
+      const rule = compiled.find(({ name }) => ruleMatches(name, branch));
+      if (rule === undefined) return {}; // no matching rule → not per-ref-governed (protected_branch_list.go:92-98)
+      const config = configOf(rule.row);
+      switch (cmd.kind) {
+        case "delete":
+          if (!(await canUserDelete(env.DB, config, access))) {
+            return { reject: `Branch ${branch} is protected from deletion` };
+          }
+          return {};
+        case "force-push":
+          // A force push to a rule without can_force_push refuses outright
+          // (:176-191); with the flag the predicate decides and failure
+          // carries the force variant of the direct-push refusal (:267).
+          if (!config.canForcePush) {
+            return { reject: `Branch ${branch} is protected from force push` };
+          }
+          if (!(await canUserForcePush(env.DB, config, access))) {
+            return { reject: `Not allowed to force-push to protected branch ${branch}` };
+          }
+          return {};
+        default:
+          // create / fast-forward — the canPush arm (:229-267)
+          if (!(await canUserPush(env.DB, config, access))) {
+            return { reject: `Not allowed to push to protected branch ${branch}` };
+          }
+          return {};
+      }
+    }),
+  );
 }
 
 /**

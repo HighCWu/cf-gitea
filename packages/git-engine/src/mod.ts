@@ -11,7 +11,7 @@ import type { Env } from "./env";
 import type { Registry, RepoInfo } from "./registry";
 import { esc, repoUrl, age, layout, htmlResponse, errorPage } from "./ui/html";
 import { CSS } from "./ui/style";
-import { parseUploadRequest, parsePushCommands, renderStatus, sidebandFrames, streamingCloneResponse, type PushCommand } from "./git/protocol";
+import { parseUploadRequest, parsePushCommands, renderStatus, sidebandFrames, streamingCloneResponse, type CommandResult, type PushCommand } from "./git/protocol";
 import { isOid, concat, te, toHex, ZERO_OID, Sha1 } from "./git/util";
 import { gunzipLimited } from "./git/zlib";
 import { MultipartCapture, beginRawMultipart } from "./git/multipart";
@@ -21,6 +21,8 @@ import {
   asCommandResults,
   NO_PACK,
   type FinalizedPack,
+  type PushCommandKind,
+  type ReceiveCommandResult,
 } from "./control-plane";
 import type { RepoCell } from "./repo";
 import type { PlanCloneStreamResult } from "./read-leases";
@@ -57,6 +59,8 @@ export type {
   ApiObject,
   BeginReceiveInput,
   BeginReceiveResult,
+  ClassifyReceiveInput,
+  ClassifyReceiveResult,
   CommitApiChangeInput,
   CommitApiChangeResult,
   DestroyResult,
@@ -72,6 +76,7 @@ export type {
   PackCatalogEntry,
   PutApiObjectsResult,
   PutRebaseObjectsResult,
+  PushCommandKind,
   ReceiveCommandResult,
   ReleaseReceiveInput,
   ReleaseReceiveResult,
@@ -201,6 +206,59 @@ export interface PushEvent {
   pusherId?: number;
   pusherLogin?: string;
 }
+
+/**
+ * One receive-pack command as the `validatePush` hook sees it: the wire
+ * command plus the engine-side classification (SPEC-0013 M2). create/delete
+ * are wire facts; fast-forward vs force-push is ancestry, classified by the
+ * engine over the lease-staged rows (one batched `classifyReceive` RPC per
+ * push) — the hook never walks objects.
+ */
+export interface ClassifiedPushCommand {
+  ref: string;
+  /** all-zeros for a created ref */
+  old: string;
+  /** all-zeros for a deleted ref */
+  new: string;
+  kind: PushCommandKind;
+}
+
+/** One per-command verdict of the `validatePush` hook. */
+export interface PushVerdict {
+  /** report-status ng message when the command must not apply; absent = apply */
+  reject?: string;
+}
+
+/**
+ * The per-call context of a `validatePush` invocation. `pusher` is the
+ * embedding Worker's authenticated identity for this receive — the same
+ * in-process channel as `PushEvent.pusherId` (never derivable from client
+ * request data); absent when none was resolved, which the hook evaluates
+ * as not-whitelisted.
+ */
+export interface ValidatePushContext {
+  repo: string;
+  pusher?: PusherIdentity;
+}
+
+/**
+ * The SPEC-0013 M2 per-ref push-policy hook, supplied per receive-pack call
+ * (an in-process argument, never a wire-trustable input — the same channel
+ * discipline as `pusher`). Invoked after the pack is staged and indexed
+ * (classification needs the new tips' ancestry) and BEFORE finalize.
+ *
+ * Contract: returns one verdict per classified command, INDEX-ALIGNED — a
+ * crafted request can send two commands for one ref, so verdicts join by
+ * position, never by ref name. `undefined` allows everything; a malformed
+ * return (wrong length, non-string reject) fails closed for the whole
+ * section; a thrown error fails the whole request closed (500, lease
+ * released, staging swept). Rejected commands render as report-status ng
+ * with `reject` as the message and never apply; their siblings land.
+ */
+export type PushValidator = (
+  commands: ClassifiedPushCommand[],
+  ctx: ValidatePushContext,
+) => PushVerdict[] | undefined | Promise<PushVerdict[] | undefined>;
 
 export interface DurableGitOptions<E extends Env = Env> {
   /**
@@ -769,15 +827,105 @@ async function stagePack(
 // shared with src/fork/replicate.ts — imported at the top; see its doc there
 // for the FixedLengthStream contract and the buffered host fallback.
 
+/** The ng message every command carries when the validatePush hook returns
+ *  a malformed verdict array — an authorization seam fails closed, never
+ *  degrades into allow. */
+const VERDICT_CONTRACT_VIOLATION = "push rejected: validatePush contract violation";
+
+/**
+ * Normalize the hook's return into per-command reject messages (null =
+ * apply). The contract is strict — an index-aligned array of the same
+ * length; anything else (wrong length, non-object entries, a non-string
+ * reject) fails CLOSED with a fixed message.
+ */
+function verdictRejects(verdicts: PushVerdict[] | undefined, count: number): (string | null)[] {
+  if (verdicts === undefined) return new Array<string | null>(count).fill(null);
+  if (!Array.isArray(verdicts) || verdicts.length !== count) {
+    console.log(
+      `[receive] validatePush contract violation: expected ${count} verdicts, got ${Array.isArray(verdicts) ? verdicts.length : typeof verdicts}`
+    );
+    return new Array<string | null>(count).fill(VERDICT_CONTRACT_VIOLATION);
+  }
+  return verdicts.map((v) => {
+    if (v === null || v === undefined) return null;
+    if (typeof v !== "object") return VERDICT_CONTRACT_VIOLATION;
+    if (v.reject === undefined) return null;
+    return typeof v.reject === "string" && v.reject.length > 0 ? v.reject : VERDICT_CONTRACT_VIOLATION;
+  });
+}
+
+/**
+ * Build the classified command section the validatePush hook receives
+ * (SPEC-0013 §3.5, OQ-1 decided): create/delete are wire facts;
+ * fast-forward vs force-push is ancestry — the engine classifies DO-side
+ * over the lease-staged rows (ONE classifyReceive RPC per push, never per
+ * command) instead of handing the hook raw commands. A lost lease cannot be
+ * surfaced meaningfully here (finalize rejects the push regardless), so its
+ * update commands keep the conservative force-push kind.
+ */
+async function classifyForValidator(
+  stub: DurableObjectStub<RepoCell>,
+  leaseToken: string,
+  commands: PushCommand[]
+): Promise<ClassifiedPushCommand[]> {
+  const classified: ClassifiedPushCommand[] = commands.map((c) => ({
+    ref: c.ref,
+    old: c.old,
+    new: c.next,
+    kind: c.next === ZERO_OID ? "delete" : c.old === ZERO_OID ? "create" : "force-push",
+  }));
+  if (classified.some((c) => c.kind === "force-push")) {
+    const res = await stub.classifyReceive({
+      leaseToken,
+      commands: commands.map((c) => ({ old: c.old, next: c.next })),
+    });
+    if (res.tag === "ok") {
+      res.kinds.forEach((kind, i) => {
+        const c = classified[i];
+        if (c) c.kind = kind;
+      });
+    }
+  }
+  return classified;
+}
+
+/**
+ * Merge the receive section's per-command outcomes for report-status: the
+ * hook's rejections by position, finalize's results (index-aligned with the
+ * commands finalize was given) for the rest. With no hook this is the
+ * historical identity render.
+ */
+function statusOfCommands(
+  commands: PushCommand[],
+  hookRejects: (string | null)[] | null,
+  finResults: ReceiveCommandResult[] | null
+): CommandResult[] {
+  if (hookRejects === null) return asCommandResults(finResults ?? []);
+  const out: CommandResult[] = [];
+  let cursor = 0;
+  commands.forEach((cmd, i) => {
+    const reject = hookRejects[i];
+    if (reject !== null) {
+      out.push({ ref: cmd.ref, ok: false, msg: reject ?? VERDICT_CONTRACT_VIOLATION });
+      return;
+    }
+    const r = finResults?.[cursor++];
+    out.push(r ? { ref: r.ref, ok: r.ok, msg: r.message } : { ref: cmd.ref, ok: false, msg: "internal error" });
+  });
+  return out;
+}
+
 /**
  * POST /git-receive-pack — the Worker-side receive flow. Auth (write) has
  * already run. Wire behavior is unchanged end to end: 503 Retry-After when
  * another push holds the lease (T7), report-status with per-command ok/ng
  * lines otherwise, byte-identical to the pre-split DO rendering.
  *
- * `pusher` is the embedding Worker's authenticated identity for this receive
- * (the optional `internal.pusher` fetch argument) — surfaced verbatim on the
- * `onPush` event, never used for authorization.
+ * `internal` carries the embedding Worker's per-call options: `pusher`, the
+ * authenticated identity for this receive (surfaced verbatim on the onPush
+ * event, never used for authorization), and `validatePush`, the SPEC-0013
+ * M2 per-ref policy hook (invoked between the scan and finalize; absent →
+ * no enforcement).
  */
 async function receivePack<E extends Env>(
   req: Request,
@@ -786,8 +934,9 @@ async function receivePack<E extends Env>(
   ctx: ExecutionContext,
   registry: DurableObjectStub<Registry>,
   options: DurableGitOptions<E>,
-  pusher?: PusherIdentity,
+  internal?: EngineCallOptions,
 ): Promise<Response> {
+  const pusher = internal?.pusher;
   const bucket = env.REPO_PACKS;
   if (!bucket) {
     return new Response("error: git push requires an R2 bucket binding (REPO_PACKS)\n", { status: 500 });
@@ -992,13 +1141,48 @@ async function receivePack<E extends Env>(
       }
     }
 
+    // 4.5 Per-ref push policy (SPEC-0013 M2): the embedding Worker's
+    // validatePush call option decides per classified command. Runs after
+    // the scan (classification needs the new tips' ancestry — one batched
+    // classifyReceive RPC) and before finalize (rejected commands must
+    // never apply). A throwing hook propagates to the outer catch: the
+    // lease is released with a sweep and the request fails closed (500).
+    let hookRejects: (string | null)[] | null = null;
+    if (internal?.validatePush && unpackError === null) {
+      const classified = await classifyForValidator(stub, begin.leaseToken, push.commands);
+      const verdicts = await internal.validatePush(classified, {
+        repo,
+        ...(pusher !== undefined ? { pusher } : {}),
+      });
+      hookRejects = verdictRejects(verdicts, push.commands.length);
+    }
+
     // 5. finalize: the DO re-checks per-command CAS and commits refs +
-    // refs_version in one transaction (the pack is already indexed)
+    // refs_version in one transaction (the pack is already indexed). The
+    // hook-rejected commands are removed first, so a per-ref rejection
+    // never blocks its siblings (upstream rejects per-ref inside
+    // pre-receive); finalize's results stay index-aligned with the command
+    // list it receives, and the merge below re-aligns them to the section.
+    const finalizeCommands =
+      hookRejects === null ? push.commands : push.commands.filter((_, i) => hookRejects![i] === null);
+    if (finalizeCommands.length === 0) {
+      // every command rejected by policy: nothing to finalize — drop the
+      // lease with a sweep (staging object + index rows) so an all-rejected
+      // push leaves no debris, then render all-ng report-status
+      leaseToken = null;
+      try {
+        await stub.releaseReceive({ leaseToken: begin.leaseToken, sweep: true });
+      } catch {
+        // best effort: the lease-expiry sweep is the backstop
+      }
+      if (wantStatus) emit(renderStatus(statusOfCommands(push.commands, hookRejects, null), null, sideband));
+      return new Response(concat(chunks) as unknown as BodyInit, { headers: receiveHeaders() });
+    }
     const fin = await stub.finalizeReceive({
       leaseToken: begin.leaseToken,
       expectedRefsVersion: begin.refsVersion,
-      commands: push.commands,
-      newTips: push.commands.map((c) => (c.next === ZERO_OID ? null : c.next)),
+      commands: finalizeCommands,
+      newTips: finalizeCommands.map((c) => (c.next === ZERO_OID ? null : c.next)),
       pack,
       unpackError,
       packIncomplete,
@@ -1010,8 +1194,9 @@ async function receivePack<E extends Env>(
       });
     }
 
-    // 6. report-status — byte-identical to the pre-split DO rendering
-    if (wantStatus) emit(renderStatus(asCommandResults(fin.results), unpackError, sideband));
+    // 6. report-status — byte-identical to the pre-split DO rendering; with
+    // a hook, the per-ref rejections are merged back in by position
+    if (wantStatus) emit(renderStatus(statusOfCommands(push.commands, hookRejects, fin.results), unpackError, sideband));
 
     const doRpcs = 2 + metrics.rowRpcs + metrics.lookupRpcs;
     const subrequests =
@@ -1109,6 +1294,15 @@ export interface PusherIdentity {
 export interface EngineCallOptions {
   /** Attribution for a receive-pack apply, surfaced on `PushEvent`. */
   pusher?: PusherIdentity;
+  /**
+   * Per-ref push policy for a receive-pack (SPEC-0013 M2), enforced by the
+   * engine's receive flow: rejected commands render as report-status ng and
+   * never apply, their siblings land. An in-process call argument, never a
+   * wire-trustable input — receives that bypass the embedding Worker's gate
+   * (the mirror/import engine composition, the D1-missing transitional
+   * passthrough) pass no hook: no enforcement, byte-identical flow.
+   */
+  validatePush?: PushValidator;
 }
 
 /**
@@ -1291,7 +1485,7 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
       // invalidated on return: a create-by-push must be visible to the next
       // request on this isolate immediately.
       if (sub === "/git-receive-pack" && req.method === "POST") {
-        const received = await receivePack(req, env, repo, ctx, registry, options, internal?.pusher);
+        const received = await receivePack(req, env, repo, ctx, registry, options, internal);
         if (isReceive || isAdmin) infoMemo.delete(repo); // this isolate sees its own mutations
         return received;
       }
