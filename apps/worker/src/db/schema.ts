@@ -1581,3 +1581,146 @@ export const teamRepoAccess = sqliteTable(
     index("team_repo_access_repo_idx").on(t.repoId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0002 account families — user emails, SSH public keys, GPG keys
+// (migration 0016; the API write/read half lives in routes/misc-t3.ts).
+// Column-faithful ports of upstream `email_address`
+// (gitea/models/user/email_address.go:76-83), `public_key`
+// (gitea/models/asymkey/ssh_key.go:39-54) and `gpg_key`
+// (gitea/models/asymkey/gpg_key.go:23-39). Upstream's `gpg_key_import`
+// (gpg_key_import.go:14-19 — the raw armor kept for commit-signature
+// verification) is NOT modeled: cf-gitea verifies no commits yet; the
+// omission is documented in the route module header. Upstream checks
+// key/email uniqueness in code (no UNIQUE constraints on fingerprint/key_id);
+// the indexes below are plain mirrors of upstream's, same arbitration split.
+// ---------------------------------------------------------------------------
+
+/**
+ * A user email address (upstream `EmailAddress`,
+ * models/user/email_address.go:76-83: `UID INDEX NOT NULL`, `Email UNIQUE
+ * NOT NULL`, `LowerEmail UNIQUE NOT NULL`, `IsActivated`, `IsPrimary DEFAULT
+ * false NOT NULL` — no timestamp columns upstream). Upstream materializes
+ * the signup address as the is_primary row at user creation; cf-gitea keeps
+ * the primary on `users.email` (SPEC-0002 §3) and only secondary addresses
+ * get rows — the read side unions the primary back (the "synthesized
+ * primary" in routes/misc-t3.ts), so no write path here ever sets
+ * `is_primary` today.
+ */
+export const emailAddresses = sqliteTable(
+  "email_addresses",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Display-case address; globally UNIQUE (upstream `Email UNIQUE`). */
+    email: text("email").notNull(),
+    /** Case-folded lookup key; globally UNIQUE (upstream `LowerEmail UNIQUE`,
+     *  filled by the BeforeInsert hook, email_address.go:91-94). */
+    lowerEmail: text("lower_email").notNull(),
+    /** Upstream `IsActivated`; API-added addresses activate immediately
+     *  (upstream `!setting.Service.RegisterEmailConfirm`, default false). */
+    isActivated: integer("is_activated", { mode: "boolean" }).notNull().default(false),
+    isPrimary: integer("is_primary", { mode: "boolean" }).notNull().default(false),
+  },
+  (t) => [
+    uniqueIndex("email_addresses_email_uq").on(t.email),
+    uniqueIndex("email_addresses_lower_email_uq").on(t.lowerEmail),
+    index("email_addresses_user_idx").on(t.userId),
+  ],
+);
+
+/**
+ * SSH public keys (upstream `PublicKey`, models/asymkey/ssh_key.go:39-54).
+ * `mode` is upstream's raw `perm.AccessMode` integer (NOT NULL DEFAULT 2 =
+ * write; the API create path always writes 2, key.go AddPublicKey:151),
+ * `type` the raw `KeyType` (NOT NULL DEFAULT 1 = user; deploy keys live in a
+ * later family). `fingerprint` is `SHA256:<base64-nopad>` over the key blob
+ * (upstream `ssh.FingerprintSHA256`, ssh_key_fingerprint.go:42-48) — indexed,
+ * not UNIQUE: the global reuse check is the code path
+ * (checkKeyFingerprint, ssh_key_fingerprint.go:16-25). `created`/`updated`
+ * are upstream's xorm `created`/`updated` auto-columns (the latter doubles as
+ * last-used once usage tracking lands; AfterLoad, ssh_key.go:61-64).
+ */
+export const publicKeys = sqliteTable(
+  "public_keys",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    ownerId: integer("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Caller-chosen title; duplicate-per-owner rejected in code
+     *  (AddPublicKey:137-144), not by constraint — upstream form. */
+    name: text("name").notNull(),
+    fingerprint: text("fingerprint").notNull(),
+    /** The authorized_keys-form key line ("type base64 comment"). */
+    content: text("content").notNull(),
+    /** Raw perm.AccessMode integer; 2 = write (upstream DEFAULT 2). */
+    mode: integer("mode").notNull().default(2),
+    /** Raw KeyType integer; 1 = user, 2 = deploy, 3 = principal. */
+    type: integer("type").notNull().default(1),
+    /** Upstream `LoginSourceID NOT NULL DEFAULT 0` — external auth source;
+     *  always 0 until an LDAP/OAuth2 SPEC lands. */
+    loginSourceId: integer("login_source_id").notNull().default(0),
+    verified: integer("verified", { mode: "boolean" }).notNull().default(false),
+    /** Row creation (upstream `CreatedUnix xorm:"created"`). */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Upstream `UpdatedUnix xorm:"updated"` — last key use once usage
+     *  tracking lands; equals createdAt at insert (AfterLoad's HasUsed gate). */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    index("public_keys_owner_idx").on(t.ownerId),
+    index("public_keys_fingerprint_idx").on(t.fingerprint),
+  ],
+);
+
+/**
+ * GPG keys (upstream `GPGKey`, models/asymkey/gpg_key.go:23-39). Subkeys are
+ * rows in the SAME table with `primary_key_id` set to the parent's `key_id`
+ * (addGPGSubKey, gpg_key_add.go:47-55); top-level keys store ''. `content`
+ * is base64 of the serialized public-key packet (upstream
+ * `Base64EncPubKey` → `packet.Serialize`, gpg_key_common.go:52-58) — NOT the
+ * armored input (the armor goes to the unmodeled `gpg_key_import` upstream).
+ * `key_id` is the 16-hex-uppercase short id (low 64 bits of the v4
+ * fingerprint); the parser writes v4 keys only (route module header for the
+ * v5/v6 omission). `verified` exists upstream but is unreachable in
+ * cf-gitea: OpenPGP signature verification (the only true-setter) is not
+ * implemented.
+ */
+export const gpgKeys = sqliteTable(
+  "gpg_keys",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    ownerId: integer("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** 16 uppercase hex chars (upstream `KeyID INDEX CHAR(16) NOT NULL`). */
+    keyId: text("key_id", { length: 16 }).notNull(),
+    /** Parent's key_id for subkeys; '' for primaries (upstream
+     *  `PrimaryKeyID CHAR(16)` — FindGPGKeyOptions filters `= ''`). */
+    primaryKeyId: text("primary_key_id", { length: 16 }).notNull().default(""),
+    /** base64 of the public-key packet (see above). */
+    content: text("content").notNull(),
+    verified: integer("verified", { mode: "boolean" }).notNull().default(false),
+    canSign: integer("can_sign", { mode: "boolean" }).notNull().default(false),
+    canEncryptComms: integer("can_encrypt_comms", { mode: "boolean" }).notNull().default(false),
+    canEncryptStorage: integer("can_encrypt_storage", { mode: "boolean" }).notNull().default(false),
+    canCertify: integer("can_certify", { mode: "boolean" }).notNull().default(false),
+    /** Key-packet creation time (upstream `CreatedUnix = pubkey.CreationTime`,
+     *  gpg_key.go:197) — NOT the row time. */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Key expiry; null = never (upstream zero TimeStamp renders
+     *  0001-01-01T00:00:00Z through the API). */
+    expiresAt: integer("expired_unix", { mode: "timestamp" }),
+    /** Row insertion time (upstream `AddedUnix`, BeforeInsert
+     *  gpg_key.go:46-48). */
+    addedAt: integer("added_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    index("gpg_keys_owner_idx").on(t.ownerId),
+    index("gpg_keys_key_id_idx").on(t.keyId),
+    index("gpg_keys_primary_key_id_idx").on(t.primaryKeyId),
+  ],
+);
