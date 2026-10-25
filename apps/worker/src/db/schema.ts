@@ -1442,3 +1442,142 @@ export const issueAttachments = sqliteTable(
     index("issue_attachments_comment_idx").on(t.commentId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0007 §3.5 — org teams (the deferred core landed): `teams`,
+// `team_members`, `team_repo_access` over migration 0015. Ports of upstream
+// `team` (gitea/models/organization/team.go:76–96), `team_user`
+// (team_user.go:16–21) and `team_repo` (team_repo.go:17–22). Ownership stays
+// with `org_members.role` (the tier-1 Owners-team bridge, §3.3): NO owners
+// team row is created — a team named `owners` cannot exist (the create path
+// answers the bridge's duplicate) and org owners keep their grants without
+// team rows. `team_unit` (team_unit.go:15–21) is NOT modeled — per-unit
+// overrides collapse onto the team row (see `teams.unitsMap`).
+// ---------------------------------------------------------------------------
+
+/** Effective access mode of a team (upstream `perm.AccessMode`,
+ *  gitea/models/perm/access_mode.go:17–22, + the unit-mode union the team
+ *  carries). TEXT enum per the schema convention (`org_members.role`,
+ *  `repo_collaborators.mode`) — recorded deviation from upstream's INTEGER
+ *  `authorize` column, same class as the `users.visibility` deviation. */
+export type TeamAccessMode = "none" | "read" | "write" | "admin" | "owner";
+
+/**
+ * Org team (upstream `Team`, gitea/models/organization/team.go:76–96).
+ * `UNIQUE(org_id, lower_name)` is the race arbiter for the existence check
+ * `NewTeam` performs in-tx (services/org/team.go:60–70) — a real constraint
+ * where upstream relies on the check (deviation: constraint-first, the
+ * `org_members_org_user_uq` pattern). No `created` column: upstream's `Team`
+ * struct carries none and the API model never renders one. `num_repos` /
+ * `num_members` are maintained counters (upstream `NumRepos`/`NumMembers`,
+ * read by the members listing total header, routers/api/v1/org/team.go:392).
+ */
+export const teams = sqliteTable(
+  "teams",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    orgId: integer("org_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Case-folded team key — UNIQUE per org with `org_id`. */
+    lowerName: text("lower_name").notNull(),
+    /** Display case (upstream `Name`). */
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    /** Upstream `authorize` (AccessMode). 'owner' is unreachable from the API
+     *  (ParseAccessMode never parses owner from input, access_mode.go:46–62)
+     *  — only the value space stays closed. */
+    authorize: text("authorize", { enum: ["none", "read", "write", "admin", "owner"] })
+      .notNull()
+      .default("none"),
+    includesAllRepositories: integer("includes_all_repositories", { mode: "boolean" })
+      .notNull()
+      .default(false),
+    canCreateOrgRepo: integer("can_create_org_repo", { mode: "boolean" }).notNull().default(false),
+    /** Maintained count of team-scoped repositories (upstream `NumRepos`). */
+    numRepos: integer("num_repos").notNull().default(0),
+    /** Maintained member count (upstream `NumMembers`; the last-owner guard
+     *  and the members total header read it). */
+    numMembers: integer("num_members").notNull().default(0),
+    /** Team visibility within the org (upstream `Visibility`, DEFAULT 2 =
+     *  private, team.go:96). */
+    visibility: text("visibility", { enum: ["public", "limited", "private"] })
+      .notNull()
+      .default("private"),
+    /**
+     * DEVIATION (documented): upstream stores per-unit overrides in the
+     * `team_unit` table (team_unit.go:15–21) and drops `authorize` to none
+     * when units are set (services/org/team.go:156–186). cf-gitea has no unit
+     * ACL to enforce, so the overrides collapse onto this JSON column —
+     * `{"repo.code":"read",...}` — written exactly when the request supplied
+     * `units`/`units_map` (with `authorize` stored as 'none', upstream's
+     * observable state). Null = no unit overrides (plain-permission team).
+     */
+    unitsMap: text("units_map"),
+  },
+  (t) => [
+    uniqueIndex("teams_org_lower_uq").on(t.orgId, t.lowerName),
+    index("teams_org_idx").on(t.orgId),
+  ],
+);
+
+/**
+ * Team membership (upstream `TeamUser`, team_user.go:16–21 — upstream table
+ * `team_user`; renamed per the SPEC-0007 §3.4 sketch's `team_members`). The
+ * UNIQUE (team_id, user_id) pair is `IsTeamMember`'s lookup (team_user.go:26–33)
+ * and the add-path race arbiter. The (org_id, user_id) index covers
+ * `removeInvalidOrgUser`'s count-remaining-teams scan
+ * (services/org/team.go:366–382) — deviation from upstream's plain `org_id`
+ * index, covering the same scan without a filter.
+ */
+export const teamMembers = sqliteTable(
+  "team_members",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    orgId: integer("org_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    teamId: integer("team_id")
+      .notNull()
+      .references(() => teams.id, { onDelete: "cascade" }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+  },
+  (t) => [
+    uniqueIndex("team_members_team_user_uq").on(t.teamId, t.userId),
+    index("team_members_org_user_idx").on(t.orgId, t.userId),
+    index("team_members_user_idx").on(t.userId),
+  ],
+);
+
+/**
+ * Team↔repository grants (upstream `TeamRepo`, team_repo.go:17–22 — upstream
+ * table `team_repo`; renamed `team_repo_access` per the wave brief).
+ * `repo_id` keys the landed TEXT `repositories.id` and declares NO FK, per
+ * the repo-scoped-table convention (`repo_topics`, `stars`,
+ * `repo_collaborators`): rows die with the deleteRepository cascade.
+ * Upstream materializes one row per covered repo — including the
+ * `includes_all_repositories` fan-out at create/edit
+ * (services/repository/repo_team.go:72–100) — so the read path is a plain
+ * join; the cf-gitea write path materializes on team create/edit/repo-add and
+ * the teams route module's reads additionally union the includes-all coverage
+ * (repos created after the last fan-out are not materialized until then).
+ */
+export const teamRepoAccess = sqliteTable(
+  "team_repo_access",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    orgId: integer("org_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    teamId: integer("team_id")
+      .notNull()
+      .references(() => teams.id, { onDelete: "cascade" }),
+    repoId: text("repo_id").notNull(),
+  },
+  (t) => [
+    uniqueIndex("team_repo_access_team_repo_uq").on(t.teamId, t.repoId),
+    index("team_repo_access_repo_idx").on(t.repoId),
+  ],
+);
