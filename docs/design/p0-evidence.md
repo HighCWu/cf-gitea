@@ -468,3 +468,112 @@ probes, bench — rows 13, 14, 15 in `personal_access_tokens`, all minted via
 `bootstrap-admin.mjs p0probe --remote`), each captured to a 0600 temp file,
 never echoed to agent logs, and each DELETEd at the end of its use;
 `SELECT COUNT(*)` for the p0probe join afterwards: **0 rows remain**.
+
+## Redeploy verification — 2026-10-25 13:22 UTC (21:22 CST), same-deployment-state block
+
+Deploy: version `1d093940-7727-4688-9ed0-967eb9938f33` on
+https://cf-gitea.hecongw.workers.dev at commit `4cdf464` — the ACL batch ship:
+UI waves 14-15 (org labels, hook detail + test-fire, protected-branches
+settings panel — SPEC-0013's UI completion); the SPEC-0007 §3.5 tail closed
+end-to-end: repo-scoped reads resolve through the team-aware predicate at
+every seam (`d496ab8`), team WRITE/ADMIN grants + the org-listing twin
+(`5f6d798`); e2e allowlist made truth; auth posture + error-family spec
+notes. Assets rebuilt: **784 files, 13.9 MB**.
+
+Remote migrations immediately before deploy: **none to apply** (0018/0019
+shipped with the previous deployment); `d1_migrations` ledger verified
+**20/20 applied**, top `0019_mixed_raza.sql`.
+
+Deploy gates at `4cdf464` (clean tree, no siblings in flight): `pnpm
+typecheck` **0 errors** (types regenerated first); `pnpm lint` **0 errors**;
+`node scripts/check-openapi.mjs` **PASS** (declared **318** operations across
+203 paths, tier-1 **78/78 paths, 129/129 operations**; the same documented
+warns: GET /user 401, GET /signing-key.gpg/.pub 404); `node scripts/
+check-contract-frozen.mjs` **PASS** (sha256 `529a3314…` matches the frozen
+README and the pinned submodule swagger verbatim); `vitest run
+--maxWorkers=8`: **Tests 2512 passed | 5 skipped (2517)** — 107 files passed
++ 1 skipped (108, the bench-d1 harness, D1_BENCH-gated), 72.52 s, zero
+failures first try.
+
+`pnpm smoke` equivalent (`deploy-smoke.mjs`, fresh mint-per-run PAT,
+`--user p0probe`, with `--migrate-check`): **6 pass / 0 fail / 1 skip**
+(bench-report not requested), `ok: true`. Verbatim: `[pass] healthz —
+{"ok":true}`; `[pass] anon-git-surface — probe-bd1b4def/probe-f92454df.git:
+git-upload-pack 404 not-found, git-receive-pack 401 Basic challenge`;
+`[pass] receive-advert — advert ok (165 bytes)`; `[pass] push-lsremote —
+pushed b6f822e1c0…, authed ls-remote sees refs/heads/main, anonymous advert
+401 Basic challenge`; `[pass] cleanup — repo p0probe/smoke-2c76522d deleted`;
+`[pass] migrate-check — all 19 expected tables present (+33 system/aux …)`.
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`,
+results **unchanged** vs all prior tables):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1`; `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean (exit 0) |
+
+`p0probe/p0-shallow` remains live intentionally (reviewer re-run repo);
+anonymous GET answers 404 (private repo, ACL row #2 holds).
+
+**FIRST measurable bench-d1 team phase — production.** The §3.5 ship
+(`d496ab8`) makes the repoGet seam resolve team grants, so for the first time
+the remote run's team workload MEASURED instead of skipping: the bench's own
+untimed guard probe (member GET on the PRIVATE org repo) answered **200** —
+the non-admin member sees the org repo only through the write-team grant,
+which is exactly the team predicate read. Per-run fixtures: owner `p0probe`
+(admin, owner arm) + NON-admin member `d1meme9f236ca` (created via
+`POST /admin/users`, `is_admin=0` verified in D1, PAT via
+`bootstrap-admin --remote`; an admin member would ride the guard's site-admin
+arm); bench-created org `d1benchorgd13751e9` + private org repo + write team,
+member added. `node scripts/bench-d1.mjs --base-url <prod> --remote --yes
+--user p0probe --token <ownerPAT> --member-token <memberPAT>`, ops=200 per
+phase (defaults), Node fetch driver, **exit 0, report-only** (timing only;
+rows_* not observable over HTTP; NOT baseline-comparable):
+
+| workload | phase | ops/s | p50 ms | p95 ms | retried |
+|---|---|---|---|---|---|
+| settle | seq | 1.54 | 543 | 1091 | 0 |
+| settle | p8 | 7.95 | 561 | 1132 | 0 |
+| settle | p32 | 15.17 | 801 | 2440 | 0 |
+| issues | seq | 1.05 | 849 | 1403 | 0 |
+| issues | p8 | 2.74 | 1118 | 3615 | 0 |
+| issues | p32 | 7.68 | 1501 | 4398 | 0 |
+| token | seq | 3.47 | 240 | 527 | 0 |
+| token | p8 | 12.22 | 239 | 598 | 0 |
+| token | p32 | 24.58 | 292 | 1969 | 0 |
+| list | seq | 1.86 | 470 | 845 | 0 |
+| list | p8 | 7.60 | 667 | 1120 | 0 |
+| list | p32 | 10.31 | 1650 | 2961 | 0 |
+| **team** | **seq** | **2.76** | **314** | **679** | 0 |
+| **team** | **p8** | **9.09** | **417** | **1034** | 0 |
+| **team** | **p32** | **18.64** | **560** | **2834** | 0 |
+
+Results: `.bench-results/bench-d1-remote-2026-10-25T13-16-09-914Z.json`
+(member_token: true; transient_retries total 1 — one absorbed 500 on a
+settle-cleanup DELETE; list drain gate never tripped: the issues-list
+endpoint answered 200 immediately, none of last run's post-p32 500 bursts).
+Honest readings: team reads sit between token (pure auth) and settle (write)
+— seq 2.76 ops/s rides the same ~320-360ms RTT as the other single-request
+workloads; p32 18.6 ops/s with p50 560ms shows the teams ⋈ team_members +
+team_repo_access predicate parallelizes cleanly. This run's settle/issues
+seq/p8 are slower than the first production reference while token/list/team
+run faster or level — single-run network variance, NOT a trend; both runs are
+report-only.
+
+Cleanup proof (all verified in remote D1 + API): bench fixture repos/org
+deleted by the harness in its `finally` — GET-after: data repo **404**, org
+repo **404**, org **404**; `repositories WHERE slug LIKE 'd1b%'` = **0**;
+`users WHERE username_lower LIKE 'd1bench%' OR 'd1mem%'` = **0**; `teams` =
+**0** (team rows cascaded with the org). Per-run credentials: three PAT rows
+this run (owner mints ×2 — ids 16 `cfg_48c0a860`, 17 `cfg_b5b70f83` — plus
+member id 18 `cfg_b1f4b85f`); the member's row cascaded with its user
+(DELETE /admin/users → 204) and the owner rows were DELETEd by prefix-set;
+`personal_access_tokens` joined to p0probe/d1meme9f236ca afterwards:
+**0 rows**. Hygiene deviation, recorded honestly: this run's owner token
+plaintext transited shell command logs (the smoke invocation) before
+deletion — the standing rule is capture-to-0600-file; all rows are deleted
+and the exposure window is closed by the DELETE, but the next run should
+restore the temp-file pattern. The standing `p0probe` user survives (probe
+namespace, no PAT rows remain against it).
