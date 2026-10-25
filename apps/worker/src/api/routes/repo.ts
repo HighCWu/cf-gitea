@@ -14,6 +14,7 @@ import {
   RepoService,
 } from "../../repos/service";
 import { tombstoneRepoDO } from "../../repos/purge";
+import { carryRepoCell } from "../../repos/carry";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import {
@@ -428,14 +429,18 @@ export function registerRepoRoutes(
       const form = c.req.valid("json");
       // The engine deps ride the PATCH (REDEPLOY8's flagged tail — the delete
       // arm below threads the same registry): bare construction silently skips
-      // rename's syncRegistryMove, setVisibility's setConfig(priv), and
-      // setDefaultBranch's setHead — D1 moves while the engine keeps serving
-      // and indexing the old name/visibility/head. The setHead injection maps
-      // the RepoCell RPC's SetHeadResult tag straight through (the production
-      // shape repos/lifecycle.test.ts wires at the service seam).
+      // rename's cell carry + syncRegistryMove, setVisibility's
+      // setConfig(priv), and setDefaultBranch's setHead — D1 moves while the
+      // engine keeps serving and indexing the old name/visibility/head. The
+      // carry (registry-fix wave) moves the OLD name's cell content into the
+      // NEW name's cell so the renamed URL serves the same git data
+      // immediately (src/repos/carry.ts); setHead maps the RepoCell RPC's
+      // SetHeadResult tag straight through (the production shape
+      // repos/lifecycle.test.ts wires at the service seam).
       const service = new RepoService(c.env.DB, {
         registry: c.env.REGISTRY.getByName("registry"),
         setHead: async (name, branch) => (await c.env.REPO.getByName(name).setHead(branch)).tag,
+        carry: (fromEngine, toEngine, storageKey) => carryRepoCell(c.env, fromEngine, toEngine, storageKey),
       });
       const now = new Date();
 

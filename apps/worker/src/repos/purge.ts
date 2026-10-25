@@ -22,7 +22,9 @@
  * binds its name from the request path, while the storage key (meta.storage_key,
  * persisted from the gate's x-storage-key header on receives) names the R2
  * prefixes. `engineNames` covers every combined name the repo was known by
- * (current + redirected renames/transfers re-seed fresh cells).
+ * (current + redirected — the registry-fix wave's cell carry makes each
+ * rename leave a full copy at the successor name, so every listed cell holds
+ * purgable content).
  */
 
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";

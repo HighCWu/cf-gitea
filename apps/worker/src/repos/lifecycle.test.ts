@@ -22,6 +22,7 @@ import {
   isUsableRepoName,
   lookupRedirect,
 } from "./service";
+import { carryRepoCell } from "./carry";
 import { purgeRepoMessage, tombstoneRepoDO } from "./purge";
 import { settleCreatingRepo } from "../git-http/gate";
 import { protectedBranches, repoCounters, repoRedirects, repositories, repoTransfer, repoUnits, users } from "../db/schema";
@@ -40,12 +41,13 @@ beforeEach(async () => {
 });
 
 // Service with the real engine bindings (registry + the RepoCell markDeleted
-// RPC tombstone); the queue producer is not wired in vitest, so delete tests
-// drive purgeRepoMessage directly.
+// RPC tombstone + the cell carry); the queue producer is not wired in vitest,
+// so delete tests drive purgeRepoMessage directly.
 function service(): RepoService {
   return new RepoService(env.DB, {
     registry: env.REGISTRY.getByName("registry"),
     tombstone: (name) => tombstoneRepoDO(env, name),
+    carry: (from, to, storageKey) => carryRepoCell(env, from, to, storageKey),
   });
 }
 
@@ -534,6 +536,192 @@ describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => 
     await svc.setDefaultBranch(repo.id, "ghost");
     expect((await svc.get(repo.id))!.defaultBranch).toBe("ghost");
     expect((await env.REPO.getByName("alice/headed").listRefs()).head).toBe("refs/heads/feature");
+  });
+});
+
+describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", () => {
+  /** Push one ref at `oid` into an existing (ready) repo through the gate. */
+  async function pushRef(
+    token: string,
+    owner: string,
+    name: string,
+    ref: string,
+    oid: string,
+    pack: Uint8Array,
+  ): Promise<Response> {
+    return SELF.fetch(`https://example.com/${owner}/${name}.git/git-receive-pack`, {
+      method: "POST",
+      headers: {
+        authorization: basicTokenHeader(token),
+        "content-type": "application/x-git-receive-pack-request",
+      },
+      body: buildReceivePackBody([{ ref, oid }], pack),
+    });
+  }
+
+  /** Anonymous upload-pack advertisement fetch — the probe's repro surface. */
+  async function uploadAdvert(owner: string, name: string): Promise<Response> {
+    return SELF.fetch(`https://example.com/${owner}/${name}.git/info/refs?service=git-upload-pack`);
+  }
+
+  it("rename carries the cell: the NEW url's advertisement lists the pushed refs immediately", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "carry-push");
+    const { oid, pack } = await buildPack();
+    expect((await pushRef(token, "alice", "carry-push", "refs/heads/main", oid, pack)).status).toBe(200);
+
+    // Pre-rename the data cell answers under the creation name.
+    const before = await env.REPO.getByName("alice/carry-push").listRefs();
+    expect(before.refs.map((r) => [r.name, r.target])).toEqual([["refs/heads/main", oid]]);
+
+    await service().rename(repo.id, "carry-pushed");
+
+    // THE P1: the new name resolves the SAME content, immediately — the fresh
+    // empty cell here was the production probe's valid-yet-empty advert.
+    const after = await env.REPO.getByName("alice/carry-pushed").listRefs();
+    expect(after.refs.map((r) => [r.name, r.target])).toEqual([["refs/heads/main", oid]]);
+    expect(after.head).toBe("refs/heads/main");
+    const advert = await uploadAdvert("alice", "carry-pushed");
+    expect(advert.status).toBe(200);
+    expect(new TextDecoder().decode(await advert.arrayBuffer())).toContain(oid);
+
+    // The old name still 301s to the canonical path (row 13, unchanged).
+    const old = await SELF.fetch("https://example.com/alice/carry-push.git/info/refs?service=git-upload-pack", {
+      redirect: "manual",
+    });
+    expect(old.status).toBe(301);
+    expect(old.headers.get("location")).toBe("https://example.com/alice/carry-pushed.git/info/refs?service=git-upload-pack");
+  });
+
+  it("PATCH rename carries an auto_init repo's initial commit (the production probe repro)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const created = await SELF.fetch("https://example.com/api/v1/user/repos", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/json" },
+      body: JSON.stringify({ name: "carry-auto", private: false, auto_init: true, description: "probe" }),
+    });
+    expect(created.status).toBe(201);
+
+    // The auto-init commit is LOOSE (Worker-authored via putApiObjects) — the
+    // exact shape the probe renamed.
+    const before = await env.REPO.getByName("alice/carry-auto").listRefs();
+    expect(before.refs.map((r) => r.name)).toEqual(["refs/heads/main"]);
+
+    const patched = await SELF.fetch("https://example.com/api/v1/repos/alice/carry-auto", {
+      method: "PATCH",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/json" },
+      body: JSON.stringify({ name: "carry-auto2" }),
+    });
+    expect(patched.status).toBe(200);
+
+    // Refs AND objects follow: the commit log resolves on the new cell (the
+    // fsck arm — finalizeForkImport refuses unresolvable tips, and the loose
+    // walk reconstructs the objects the ref tips name).
+    const after = await env.REPO.getByName("alice/carry-auto2").listRefs();
+    expect(after.refs.map((r) => [r.name, r.target])).toEqual([["refs/heads/main", before.refs[0]!.target]]);
+    const log = await env.REPO.getByName("alice/carry-auto2").listLog("main");
+    expect(log.commits).toHaveLength(1);
+    expect(log.commits[0]!.message).toBe("Initial commit\n");
+    const readme = await env.REPO.getByName("alice/carry-auto2").readBlob("main", "README.md");
+    expect(readme === null ? "" : new TextDecoder().decode(readme.data)).toContain("# carry-auto");
+
+    const advert = await uploadAdvert("alice", "carry-auto2");
+    expect(advert.status).toBe(200);
+    expect(new TextDecoder().decode(await advert.arrayBuffer())).toContain(before.refs[0]!.target);
+  });
+
+  it("delete drops every registry entry SYNCHRONOUSLY — no anonymous read-after-delete on renamed aliases", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "doomed-alias");
+    const { oid, pack } = await buildPack();
+    expect((await pushRef(token, "alice", "doomed-alias", "refs/heads/heal", oid, pack)).status).toBe(200);
+    await service().rename(repo.id, "doomed-alias2");
+
+    // The delete's D1+tombstone+registry half only — the queue purge (which
+    // also removes registry rows) is deliberately NOT driven: the production
+    // probe observed anonymous ref serving in exactly this window.
+    await service().deleteRepository(repo.id);
+
+    // The renamed path's registry entry died with the D1 cascade — before any
+    // queue consumer runs. Pre-fix this row persisted and the tombstoned cell
+    // kept serving the pushed ref anonymously.
+    expect(await env.REGISTRY.getByName("registry").get("alice/doomed-alias2")).toBeNull();
+    expect(await env.REGISTRY.getByName("registry").get("alice/doomed-alias")).toBeNull();
+
+    // Both names answer the engine's registry-miss 404 immediately.
+    const newName = await uploadAdvert("alice", "doomed-alias2");
+    expect(newName.status).toBe(404);
+    const oldName = await uploadAdvert("alice", "doomed-alias");
+    expect(oldName.status).toBe(404);
+  });
+
+  it("the engine-shape DELETE resolves a renamed repo's old name (deletes the canonical repo)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "engine-del");
+    const { oid, pack } = await buildPack();
+    expect((await pushRef(token, "alice", "engine-del", "refs/heads/main", oid, pack)).status).toBe(200);
+    await service().rename(repo.id, "engine-del2");
+
+    // The smoke harness's cleanup shape: DELETE /{owner}/{repo} (no /api/v1)
+    // at the PRE-RENAME name. Pre-fix this 301'd (row 13) and redirect-blind
+    // clients stranded the repo.
+    const deleted = await SELF.fetch("https://example.com/alice/engine-del", {
+      method: "DELETE",
+      headers: { authorization: basicTokenHeader(token) },
+      redirect: "manual",
+    });
+    expect(deleted.status).toBe(200);
+    expect(await deleted.text()).toBe("deleted\n");
+
+    // The canonical repo is gone everywhere, both names included.
+    expect(await service().getBySlug("alice", "engine-del2")).toBeNull();
+    expect(await service().getBySlug("alice", "engine-del")).toBeNull();
+    expect((await uploadAdvert("alice", "engine-del2")).status).toBe(404);
+    expect((await uploadAdvert("alice", "engine-del")).status).toBe(404);
+    const apiGet = await SELF.fetch("https://example.com/api/v1/repos/alice/engine-del2");
+    expect(apiGet.status).toBe(404);
+  });
+
+  it("transfer carries the cell to the new owner namespace", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "movable");
+    const { oid, pack } = await buildPack();
+    expect((await pushRef(token, "alice", "movable", "refs/heads/main", oid, pack)).status).toBe(200);
+
+    const svc = service();
+    await svc.requestTransfer(repo.id, alice.id, bob.id);
+    await svc.acceptTransfer(repo.id, { id: alice.id, isAdmin: false });
+
+    // The same stale-fresh-cell class as rename, one namespace over.
+    const after = await env.REPO.getByName("bob/movable").listRefs();
+    expect(after.refs.map((r) => [r.name, r.target])).toEqual([["refs/heads/main", oid]]);
+    const advert = await uploadAdvert("bob", "movable");
+    expect(advert.status).toBe(200);
+    expect(new TextDecoder().decode(await advert.arrayBuffer())).toContain(oid);
+  });
+
+  it("rename-back (a -> b -> a) survives: the stale target cell is reset, not refused", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "yoyo");
+    const { oid, pack } = await buildPack();
+    expect((await pushRef(token, "alice", "yoyo", "refs/heads/main", oid, pack)).status).toBe(200);
+
+    const svc = service();
+    await svc.rename(repo.id, "yoyo-away");
+    await svc.rename(repo.id, "yoyo"); // back onto the stale original cell
+
+    // The carry reset the stale cell instead of beginForkImport refusing
+    // ("fork target is not empty") — the original content serves again.
+    const after = await env.REPO.getByName("alice/yoyo").listRefs();
+    expect(after.refs.map((r) => [r.name, r.target])).toEqual([["refs/heads/main", oid]]);
+    expect((await uploadAdvert("alice", "yoyo")).status).toBe(200);
   });
 });
 

@@ -24,12 +24,20 @@
  * exposes markDeleted/destroy/setHead RPCs (used by src/repos/purge.ts and
  * setDefaultBranch below). Still name-addressed: the RepoCell itself (DO id)
  * and every non-receive delegation (`env.REPO.getByName("owner/repo")`) key
- * on the combined name — a storage-move/adopt RPC for renames/transfers
- * remains the documented engine gap. Consequence, unchanged: rename/transfer
- * update D1 + redirects fully, but engine storage (DO SQLite + R2 prefixes)
- * stays under the pre-move name; pushes to the new URL re-seed a fresh empty
- * DO (git data written before the move is not migrated) while R2 addressing
- * follows the immutable storage_key either way.
+ * on the combined name — the storage-move/adopt RPC for renames/transfers
+ * remains the documented engine gap. Consequence: rename/transfer update D1 +
+ * redirects fully, and the CELL CONTENT is carried old → new synchronously
+ * (src/repos/carry.ts — the registry-fix wave's P1 fix: fork-import lease for
+ * packs, exact serialize reconstruction for the Worker-authored loose
+ * objects) before the registry entry moves, so the new URL serves the same
+ * git data immediately; R2 addressing follows the immutable storage_key
+ * either way. Upstream semantics citation: upstream renames the repository
+ * DIRECTORY in place (services/repository/transfer.go:391) so the new name
+ * serves the same storage at once, and files a repo_redirects row
+ * (models/repo/redirect.go NewRedirect via RenameRepository) so the OLD name
+ * keeps resolving — both live here (the carry + the redirect rows; the old
+ * name 301s to the canonical path rather than serving in place, the §2.5.3
+ * row-13 divergence already on record).
  */
 
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -220,6 +228,11 @@ export interface RepoEngineDeps {
   /** RepoCell setHead (§2.5.2 default-branch change): maps the engine's
    *  SetHeadResult tag. Best-effort; D1 is the metadata source of truth. */
   setHead?: (engineName: string, branch: string) => Promise<"ok" | "invalid" | "not_found">;
+  /** Engine-cell carry (the registry-fix wave): moves the OLD combined name's
+   *  cell content into the NEW name's cell at rename/transfer time, so the
+   *  new URL serves the same git data immediately (src/repos/carry.ts).
+   *  Best-effort: a carry failure is logged, the D1 mutation stands. */
+  carry?: (fromEngine: string, toEngine: string, storageKey: string) => Promise<void>;
 }
 
 export interface CreateRepoInput {
@@ -373,7 +386,7 @@ export class RepoService {
       if (isUniqueViolation(error)) throw new RepoNameCollisionError(repo.ownerNamespace, newLower);
       throw error;
     }
-    await this.syncRegistryMove(oldEngine, newEngine, repo.visibility === "private");
+    await this.moveEngineCell(oldEngine, newEngine, repo);
     const row = await this.get(repoId);
     if (row === null) throw new RepoNotExistError(repoId);
     return row;
@@ -455,7 +468,7 @@ export class RepoService {
       }),
       this.db.delete(repoTransfer).where(eq(repoTransfer.repoId, repoId)),
     ]);
-    await this.syncRegistryMove(oldEngine, newEngine, repo.visibility === "private");
+    await this.moveEngineCell(oldEngine, newEngine, repo);
     const row = await this.get(repoId);
     if (row === null) throw new RepoNotExistError(repoId);
     return row;
@@ -616,6 +629,23 @@ export class RepoService {
       }
     }
 
+    // Step 2b (registry-fix wave — the P1 probe's symptom 2): drop EVERY
+    // registry entry for the repo SYNCHRONOUSLY with the D1 delete. The queue
+    // purge removes them too, but the production probe observed a renamed
+    // repo's entry serving its refs ANONYMOUSLY 48 s+ in the window before
+    // the consumer ran: D1 was gone, the tombstoned cell kept answering
+    // reads, and the engine's registry hit authorized them. Best-effort like
+    // every registry sync; the purge's backstop sweep below is unchanged.
+    if (this.deps.registry) {
+      for (const name of engineNames) {
+        try {
+          await this.deps.registry.remove(name);
+        } catch (error) {
+          console.error(`[repos] registry remove failed for ${name}: ${errorMessage(error)}`);
+        }
+      }
+    }
+
     // Step 3: queue purge (storage-key R2 prefixes, then the final destroy).
     if (this.deps.queue) {
       try {
@@ -627,6 +657,49 @@ export class RepoService {
       }
     }
     return { engineNames };
+  }
+
+  /**
+   * The engine half of a rename/transfer, after the D1 batch won (registry-fix
+   * wave — the P1 probe's symptom 1): the engine's RepoCells are NAME-addressed,
+   * so the new combined name would otherwise resolve a FRESH, EMPTY cell while
+   * the content stayed under the old one. Three best-effort steps, in order:
+   *
+   *   1. tombstone the OLD cell (straggler receive leases abort cleanly §4.2;
+   *      reads keep answering for the carry below);
+   *   2. CARRY the cell content old → new (src/repos/carry.ts: the fork-import
+   *      lease for packs, exact serialize reconstruction for loose objects) —
+   *      upstream renames the repo DIRECTORY in place (transfer.go:391
+   *      git.RenameRepository), so the new name serves the same storage
+   *      immediately; the carry is that move on name-addressed cells. The
+   *      immutable storage_key means both cells share one R2 prefix — no byte
+   *      forks (ADR-0001 D3 holds);
+   *   3. move the registry entry (upsert new → remove old, the no-miss-window
+   *      order) — the engine 404s/serves off this index.
+   *
+   * Every step logs and continues on failure: D1 is the source of truth, the
+   * degraded floor is the pre-fix behavior, and receivePack upserts heal the
+   * registry (the module-docstring engine-sync contract).
+   */
+  private async moveEngineCell(oldEngine: string, newEngine: string, repo: RepoRow): Promise<void> {
+    if (oldEngine === newEngine) return;
+    if (this.deps.tombstone) {
+      try {
+        await this.deps.tombstone(oldEngine);
+      } catch (error) {
+        console.error(`[repos] tombstone failed for ${oldEngine}: ${errorMessage(error)}`);
+      }
+    }
+    if (this.deps.carry) {
+      try {
+        await this.deps.carry(oldEngine, newEngine, repo.storageKey);
+      } catch (error) {
+        console.error(
+          `[repos] cell carry failed ${oldEngine} -> ${newEngine} (repo ${repo.id}, new url serves empty until healed): ${errorMessage(error)}`,
+        );
+      }
+    }
+    await this.syncRegistryMove(oldEngine, newEngine, repo.visibility === "private");
   }
 
   /** Engine-registry move helper: upsert the new key BEFORE removing the old,
