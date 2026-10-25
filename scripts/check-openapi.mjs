@@ -99,6 +99,11 @@ const RUNTIME_ONLY_RESPONSES = {
       400: "due_on parse failure returns upstream's 'invalid date format' at runtime; undeclared in the vendored contract (same class as /user 401)",
     },
   },
+  "/signing-key.gpg": {
+    get: {
+      404: "cf-gitea has no signing-key configuration, so the format is blank and upstream's own handler answers APIErrorNotFound(\"no signing key\") at runtime (gitea/routers/api/v1/misc/signing.go:14-24); the contract documents only the 200 text/plain",
+    },
+  },
 };
 
 /**
