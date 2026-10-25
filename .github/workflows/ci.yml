@@ -289,3 +289,118 @@ jobs:
             /tmp/dev-server.log
             /tmp/cgit-lfs-e2e.*/**
           if-no-files-found: ignore
+
+  # Pull-mirror e2e suite (scripts/mirror-e2e.sh, SPEC-0009 §5 black-box
+  # layer): real git clients where the SOURCE side is a loopback smart-HTTP
+  # fixture (per-run throwaway CA + leaf, git upload-pack --stateless-rpc)
+  # and the TARGET side is the Worker's own git + API surface. Fully
+  # self-contained — NO GitHub secrets: the .dev.vars values are CI-local
+  # generated throwaways (recipe: scripts/mirror-e2e.README.md § "Dev
+  # environment contract"; the names are declared in wrangler.jsonc
+  # secrets.required and the suite preflights both sides of that contract).
+  # The suite starts AND kills its own dev server — with SSL_CERT_FILE
+  # pointed at the fixture CA so workerd's outbound fetch trusts the
+  # fixture's TLS — plus the fixture itself, and cleans up on a green run,
+  # so the job needs no wait-on step. db:migrate:local first because the
+  # suite introspects the local D1 `repo_mirrors` table (migration 0010)
+  # through the wrangler CLI, like the lfs-e2e job. The suite runs ~2.5-4
+  # min locally; the timeout is generous headroom, not a tuning knob.
+  mirror-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Same as e2e: the suite's dev server (pnpm dev, whose predev
+          # regenerates icons) loads the ui module graph from gitea/.
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate UI icons
+        run: pnpm gen:icons
+      - name: Apply local D1 migrations
+        run: pnpm db:migrate:local
+      # Values are per-run CI-local throwaways, NOT secrets: GIT_TOKEN only
+      # satisfies wrangler.jsonc's secrets.required, the allow entry is the
+      # fixture's loopback address (SRC_PORT default 8443), and the KEK is
+      # any 32 base64 bytes (AES-256-GCM) — README § "Suggested CI job"
+      # blesses `openssl rand -base64 32` fresh per CI run.
+      - name: Dev vars (CI-local generated values, per scripts/mirror-e2e.README.md)
+        run: |
+          cat > apps/worker/.dev.vars <<EOF
+          GIT_TOKEN=$(openssl rand -hex 32)
+          MIRROR_ALLOWED_HOST_LIST=127.0.0.1:8443
+          MIRROR_CREDENTIAL_KEY=$(openssl rand -base64 32)
+          EOF
+      - name: Run mirror e2e suite
+        run: |
+          rc=0
+          bash scripts/mirror-e2e.sh > /tmp/mirror-e2e.log 2>&1 || rc=$?
+          cat /tmp/mirror-e2e.log
+          exit $rc
+      # A red run deliberately leaves its fixtures in place for debugging
+      # (scripts/mirror-e2e.README.md): scratch dir /tmp/cgit-mirror-e2e.XXXXXX
+      # (named in the RESULT line) holds the fixture TLS identity and the
+      # suite's server log. Upload it so the failure is diagnosable — all
+      # values in the traces are CI-local generated throwaways.
+      - name: Upload suite scratch (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mirror-e2e-failure
+          path: |
+            /tmp/mirror-e2e.log
+            /tmp/cgit-mirror-e2e.*/**
+          if-no-files-found: ignore
+
+  # Differential battery, ours-only (scripts/diff-cases/README.md § Running):
+  # scripts/diff-test.mjs against the dev Worker ALONE — no --theirs (the
+  # README records the 2026-10-25 attempt: no egress to gitea.com and no
+  # token, so the theirs run stays a local, manual affair). The battery
+  # enforces its own declared rules (scripts/diff-cases/rules.mjs) and exits
+  # "0 iff every case outcome is in {ok, clean-reject, shallow-ok}" — the
+  # exit code is the whole gate, no allowlist (unlike the e2e job).
+  diff-battery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Same as e2e: the dev server loads the ui module graph (predev
+          # regenerates icons; the explicit step below keeps the e2e ordering).
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate UI icons
+        run: pnpm gen:icons
+      - name: Dev vars (CI-local generated GIT_TOKEN, exported for the battery)
+        run: |
+          GIT_TOKEN=$(openssl rand -hex 32)
+          printf 'GIT_TOKEN=%s\n' "$GIT_TOKEN" > apps/worker/.dev.vars
+          echo "GIT_TOKEN=$GIT_TOKEN" >> "$GITHUB_ENV"
+      - name: Start dev Worker (vite dev, workerd)
+        run: |
+          pnpm dev > /tmp/dev-server.log 2>&1 &
+          echo $! > /tmp/dev-server.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
+              echo "dev server up (attempt $i)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "dev server did not come up"; cat /tmp/dev-server.log; exit 1
+      - name: Run differential battery (ours-only; exit code is the gate)
+        run: node scripts/diff-test.mjs --ours http://127.0.0.1:5173 --token "$GIT_TOKEN"
+      - name: Stop dev Worker
+        if: always()
+        run: kill "$(cat /tmp/dev-server.pid)" 2>/dev/null || true
