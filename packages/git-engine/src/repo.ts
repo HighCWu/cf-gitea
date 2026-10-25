@@ -95,6 +95,13 @@ import {
   type ReleaseReadResult,
   type RenewReadResult,
 } from "./read-leases";
+import {
+  COMPACTION_ACTIVE_PACK_THRESHOLD,
+  COMPACTION_RETRY_MS,
+  runCompaction,
+  type CompactionHost,
+  type CompactionResult,
+} from "./compaction";
 import { esc, repoUrl, repoBase, age, fmtDate, fmtDate2822, layout, htmlResponse, errorPage, LayoutOpts } from "./ui/html";
 import { renderMarkdown } from "./ui/markdown";
 import { highlightLines } from "./ui/highlight";
@@ -373,29 +380,127 @@ export class RepoCell extends DurableObject<Env> {
     } catch (err) {
       console.log(`lease sweep failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    if (this.store.getMeta("gc-pending") !== "1") return;
-    // GC calls packs.reset(): running it while a clone is streaming or a push
-    // is ingesting corrupts both. Defer past any in-flight upload (leave
-    // gc-pending set so the re-armed alarm retries) rather than run now.
-    if (this.activeUploads > 0) {
-      try {
-        await this.ctx.storage.setAlarm(Date.now() + 30 * 1000);
-      } catch {
-        // alarm store may be busy under a burst; the next push re-arms it
+    // M2 gc consumer: migrate reachable objects to loose + drop the packs.
+    if (this.store.getMeta("gc-pending") === "1") {
+      // GC calls packs.reset(): running it while a clone is streaming or a push
+      // is ingesting corrupts both. Defer past any in-flight upload (leave
+      // gc-pending set so the re-armed alarm retries) rather than run now.
+      if (this.activeUploads > 0) {
+        try {
+          await this.ctx.storage.setAlarm(Date.now() + 30 * 1000);
+        } catch {
+          // alarm store may be busy under a burst; the next push re-arms it
+        }
+        return;
       }
+      // clear first: at-most-once, so a throwing sweep can't trigger a retry storm
+      this.store.setMeta("gc-pending", "0");
+      // no request here to carry x-repo: rebind R2 from the persisted repo name
+      // (meta.storage_key backfills from it) so the sweep can read R2-backed
+      // objects and drop their raw objects
+      this.bindR2(this.store.getMeta("repo") ?? "repo");
+      try {
+        await this.gc();
+      } catch (err) {
+        console.log("gc failed", String(err));
+      }
+    }
+    // M3.3 compaction consumer (SPEC-0011 §5.1) — the standing
+    // "crons enqueue, consumers work" pattern with NO Worker-cron entry:
+    // finalizeReceive stamps `compaction_wanted_at` (the enqueue) and this
+    // alarm is the DO consumer that works, gated by the pack-count threshold.
+    // Runs AFTER the gc branch (a gc round resets the pack tables wholesale;
+    // compacting first would be wasted work the gc un-does).
+    await this.maybeCompactFromAlarm();
+  }
+
+  /** The alarm-side compaction trigger (SPEC-0011 §5.1): threshold-gated,
+   * deferred rounds leave the stamp and re-arm; convergence across the bound
+   * window happens one alarm per round. */
+  private async maybeCompactFromAlarm(): Promise<void> {
+    if (!this.store.getMeta("compaction_wanted_at")) return;
+    const rearm = async (ms: number): Promise<void> => {
+      try {
+        await this.ctx.storage.setAlarm(Date.now() + ms);
+      } catch {
+        // alarm store busy: the next push's finalize re-arms instead
+      }
+    };
+    if (this.store.packs.activePackCount() <= COMPACTION_ACTIVE_PACK_THRESHOLD) {
+      // converged (or the push that stamped never crossed the threshold)
+      this.store.setMeta("compaction_wanted_at", "");
       return;
     }
-    // clear first: at-most-once, so a throwing sweep can't trigger a retry storm
-    this.store.setMeta("gc-pending", "0");
-    // no request here to carry x-repo: rebind R2 from the persisted repo name
-    // (meta.storage_key backfills from it) so the sweep can read R2-backed
-    // objects and drop their raw objects
-    this.bindR2(this.store.getMeta("repo") ?? "repo");
-    try {
-      await this.gc();
-    } catch (err) {
-      console.log("gc failed", String(err));
+    if (this.activeUploads > 0) {
+      await rearm(COMPACTION_RETRY_MS);
+      return;
     }
+    this.bindR2(this.store.getMeta("repo") ?? "repo");
+    let result: CompactionResult;
+    try {
+      result = await runCompaction(this.compactionHost());
+    } catch (err) {
+      console.log(`compaction failed: ${err instanceof Error ? err.message : String(err)}`);
+      await rearm(COMPACTION_RETRY_MS);
+      return;
+    }
+    if (result.tag === "compacted") {
+      if (this.store.packs.activePackCount() > COMPACTION_ACTIVE_PACK_THRESHOLD) {
+        // still above the trigger: keep the stamp, converge next round
+        this.store.setMeta("compaction_wanted_at", String(Date.now()));
+        await rearm(COMPACTION_RETRY_MS);
+      } else {
+        this.store.setMeta("compaction_wanted_at", "");
+      }
+    } else if (result.tag === "skipped") {
+      this.store.setMeta("compaction_wanted_at", "");
+    } else {
+      // deferred (live receive/compaction lease, lost lease): retry later
+      await rearm(COMPACTION_RETRY_MS);
+    }
+  }
+
+  /** The compaction host over this cell's DO storage + R2 binding. */
+  private compactionHost(): CompactionHost {
+    return {
+      store: this.store,
+      storage: this.ctx.storage,
+      putPackObject: async (r2Key, data) => {
+        const bucket = this.env.REPO_PACKS;
+        if (!bucket) throw new Error(`compaction: REPO_PACKS unbound, cannot write ${r2Key}`);
+        await bucket.put(r2Key, data);
+      },
+      deletePackObjects: async (keys) => {
+        const bucket = this.env.REPO_PACKS;
+        if (!bucket) return;
+        try {
+          await bucket.delete(keys);
+        } catch (err) {
+          // best effort: an unswept orphan is retried by the next expiry sweep
+          console.log(`[r2 ${this.store.getMeta("repo") ?? ""}] compaction sweep delete failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+    };
+  }
+
+  /**
+   * Manual compaction entry point (SPEC-0011 §5.1, M3.3) — the tests/benches
+   * (and admin) surface. `force` bypasses the pack-count threshold; every
+   * other gate (receive-lease exclusion, the compaction lease, the bounded
+   * window) still applies. Production triggers ride the alarm instead (see
+   * maybeCompactFromAlarm). Sweeps expired leases first so a crashed round's
+   * orphan converges before this one starts.
+   */
+  async compactNow(opts: { force?: boolean } = {}): Promise<CompactionResult> {
+    if (this.store.schemaState.refused !== null) return { tag: "skipped", reason: "sealed", activePacks: 0 };
+    this.rpcBind();
+    if (!this.env.REPO_PACKS) return { tag: "skipped", reason: "no_r2_backend", activePacks: this.store.packs.activePackCount() };
+    try {
+      await sweepExpiredLeases(this.leaseHost());
+    } catch {
+      // a failed sweep must not block the manual round; the next one converges
+    }
+    return runCompaction(this.compactionHost(), { force: opts.force === true });
   }
 
   /**

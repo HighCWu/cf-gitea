@@ -375,17 +375,54 @@ function resolveStorageKey(store: GitStore, explicit?: string | null): string {
   return chosen;
 }
 
-/** Sweep expired leases plus their staging objects and orphaned index rows.
- * Runs at every beginReceive (so a crashed holder never blocks past its TTL)
- * and from the alarm. */
+/**
+ * Sweep expired leases plus their staging objects and orphaned index rows.
+ * Runs at every beginReceive (so a crashed holder never blocks past its TTL),
+ * from the alarm, and at every manual compaction entry.
+ *
+ * Receive rows sweep the staging object + index rows keyed by the lease
+ * payload's pack name. Compaction rows (SPEC-0011 §5.3) converge by payload +
+ * catalog state, never by assumption: an output whose catalog row does not
+ * exist is a publish-crash ORPHAN — its pack + idx bytes are deleted; an
+ * output whose row EXISTS (crash after publish, before lease release) is live
+ * — only the stale lease row is dropped. Index rows for a compaction output
+ * can only exist under a catalog row (they are written by the publish
+ * transaction itself), so there is no row debris to sweep on this path.
+ */
 export async function sweepExpiredLeases(host: LeaseHost): Promise<void> {
   const expired = host.store.expiredLeases(Date.now());
   for (const lease of expired) {
     host.store.deleteLease(lease.leaseToken);
-    if (lease.kind !== "receive") continue;
-    const payload = parseLeasePayload(lease.payload);
-    if (payload.packName) host.store.packs.sweepPackRows(payload.packName);
-    if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
+    if (lease.kind === "receive") {
+      const payload = parseLeasePayload(lease.payload);
+      if (payload.packName) host.store.packs.sweepPackRows(payload.packName);
+      if (payload.stagingKey) await host.deletePackObjects([payload.stagingKey]);
+    } else if (lease.kind === "compaction") {
+      const payload = parseCompactionPayload(lease.payload);
+      if (payload.outputPackKey && host.store.packs.catalogStateOf(payload.outputPackKey) === null) {
+        const keys = [payload.outputPackR2Key, payload.outputIdxR2Key].filter((k): k is string => !!k);
+        if (keys.length) await host.deletePackObjects(keys);
+      }
+    }
+  }
+}
+
+/** Compaction lease payload JSON (src/compaction.ts writes it; parsed
+ * defensively here so a corrupt payload converges to "nothing to sweep"). */
+function parseCompactionPayload(payload: string): {
+  outputPackKey?: string;
+  outputPackR2Key?: string;
+  outputIdxR2Key?: string;
+} {
+  try {
+    const p = JSON.parse(payload) as {
+      outputPackKey?: string;
+      outputPackR2Key?: string;
+      outputIdxR2Key?: string;
+    } | null;
+    return p && typeof p === "object" ? p : {};
+  } catch {
+    return {};
   }
 }
 

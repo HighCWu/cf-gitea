@@ -102,8 +102,9 @@ export const LOOSE_LOOKUP_CAP = 64 * 1024 * 1024;
 const ROW_BATCH_ROWS = 8;
 
 /**
- * Pack lifecycle states (docs/design/m3-design-inputs.md). Only 'active' is
- * written today; the RETIRED/RECLAIMABLE machinery is M3 compaction.
+ * Pack lifecycle states (docs/design/m3-design-inputs.md, SPEC-0011 §2).
+ * Writers: receives record 'active'; compaction's publish flips inputs to
+ * 'retired' (M3.3); GC owns 'reclaimable'/'deleted' (M3.4).
  */
 export type PackState = "active" | "retired" | "reclaimable" | "deleted";
 
@@ -112,7 +113,9 @@ export type PackState = "active" | "retired" | "reclaimable" | "deleted";
  * Step 4 schema alignment — the shape diverged materially, and integer pack
  * ids leaked engine internals into keys). `packKey` is `pack-<sha1>` (the R2
  * object stem, deterministic); `seq` is the `next_pack_seq` catalog order
- * (never an R2 name); `state`/`superseded_by` are reserved for M3.
+ * (never an R2 name); `state`/`superseded_by` carry the SPEC-0011 §2
+ * lifecycle since M3.3 (writer: compaction's publish, migration 0003 marks
+ * the columns live).
  */
 export interface PackCatalogRow {
   packKey: string;
@@ -760,6 +763,133 @@ export class PackStore {
       .one().n;
   }
 
+  /** Lifecycle state of one catalog row — null when no row exists. The
+   * read-lease renewal gate and the compaction orphan sweep classify by state
+   * (SPEC-0011 §2: active/retired are readable, reclaimable/deleted are not). */
+  catalogStateOf(packKey: string): PackState | null {
+    this.assertOpen();
+    const rows = this.sql
+      .exec<{ state: PackState }>("SELECT state FROM pack_catalog WHERE pack_key = ?", packKey)
+      .toArray();
+    return rows[0]?.state ?? null;
+  }
+
+  /** Count of ACTIVE catalog rows — the compaction trigger's pack-count
+   * threshold input (SPEC-0011 §5.1; Q1's conservative start lives in
+   * src/compaction.ts). */
+  activePackCount(): number {
+    this.assertOpen();
+    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_catalog WHERE state = 'active'").one().n;
+  }
+
+  /**
+   * The compaction input window (SPEC-0011 §5.2 step 2): the OLDEST ACTIVE
+   * packs (catalog seq order — insertion order), bounded by pack count, total
+   * pack bytes and total indexed rows. A single compaction never touches every
+   * pack: whatever the catalog holds, the window is a subset, so one round's
+   * blast radius (merge working set + publish-txn statement count) is bounded
+   * by the constants in src/compaction.ts, not by repo size.
+   */
+  activeCatalogWindow(maxPacks: number, maxBytes: number, maxRows: number): PackCatalogRow[] {
+    this.assertOpen();
+    const out: PackCatalogRow[] = [];
+    let bytes = 0;
+    let rows = 0;
+    for (const r of this.sql
+      .exec<{ pack_key: string; seq: number; kind: string; state: string; location: string; object_count: number; pack_bytes: number; idx_bytes: number; created_at: number; superseded_by: string | null }>(
+        `SELECT pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by
+           FROM pack_catalog
+          WHERE state = 'active'
+          ORDER BY seq
+          LIMIT ?`,
+        maxPacks
+      )
+      .toArray()) {
+      if (out.length >= maxPacks || bytes + r.pack_bytes > maxBytes || rows + r.object_count > maxRows) break;
+      bytes += r.pack_bytes;
+      rows += r.object_count;
+      out.push({
+        packKey: r.pack_key,
+        seq: r.seq,
+        kind: r.kind,
+        state: r.state as PackState,
+        location: r.location === "sqlite" ? "sqlite" : "r2",
+        objectCount: r.object_count,
+        packBytes: r.pack_bytes,
+        idxBytes: r.idx_bytes,
+        createdAt: r.created_at,
+        supersededBy: r.superseded_by,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Compaction's catalog publish (SPEC-0011 §5.2 step 4, §5.3): the ONE
+   * transaction — caller wraps in `transactionSync` — that (a) inserts the
+   * successor pack's catalog row ACTIVE (kind='compact', location='r2', the
+   * count is the merge's own row set), (b) RE-POINTS every merged object's
+   * pack_objects row onto the successor (oid is the PRIMARY KEY, so a row
+   * exists exactly once and the guarded UPDATE moves it — inputs keep no
+   * rows; RETIRED packs serve existing readers THROUGH the successor's
+   * identical bytes), and (c) flips every input row RETIRED with
+   * `superseded_by` — the §2 ACTIVE→RETIRED transition. Atomic: a crash
+   * leaves either the whole pre-publish world (the R2 output is an orphan
+   * the lease sweep reclaims) or the whole post-publish world.
+   *
+   * The `srcPack` guard on each re-point ("this row still names the input I
+   * read it from") makes the invariant local: a row's pack_key only ever
+   * changes through this method (index inserts are INSERT OR IGNORE and never
+   * move rows), so a guard failure is a foreign-state error and aborts the
+   * transaction.
+   */
+  publishCompaction(
+    output: { packKey: string; packBytes: number; idxBytes: number },
+    rows: (IndexRow & { srcPack: string })[],
+    inputKeys: string[]
+  ): void {
+    this.assertOpen();
+    this.sql.exec(
+      `INSERT INTO pack_catalog (pack_key, seq, kind, state, location, object_count, pack_bytes, idx_bytes, created_at, superseded_by)
+       VALUES (?, ?, 'compact', 'active', 'r2', ?, ?, ?, ?, NULL)
+       ON CONFLICT(pack_key) DO NOTHING`,
+      output.packKey,
+      this.nextPackSeq(),
+      rows.length,
+      output.packBytes,
+      output.idxBytes,
+      Date.now()
+    );
+    for (const r of rows) {
+      this.sql.exec(
+        `UPDATE pack_objects
+            SET pack_key = ?, offset = ?, data_off = ?, data_len = ?, type = ?, size = ?, entry_size = ?, base_oid = ?, crc32 = ?
+          WHERE oid = ? AND pack_key = ?`,
+        output.packKey,
+        r.offset,
+        r.dataOff,
+        r.dataLen,
+        r.type,
+        r.size,
+        r.entrySize,
+        r.baseOid,
+        r.crc32,
+        r.oid,
+        r.srcPack
+      );
+    }
+    for (const key of inputKeys) {
+      this.sql.exec(
+        "UPDATE pack_catalog SET state = 'retired', superseded_by = ? WHERE pack_key = ? AND state = 'active'",
+        output.packKey,
+        key
+      );
+    }
+    this.backend.set(output.packKey, "r2");
+    // input rows moved to the successor; no row names an input any more, but
+    // their BYTES stay (RETIRED serves existing readers until M3.4 reclaims)
+  }
+
   // ---- fork import staging (SPEC-0001b §5.3 step 4) --------------------------
   // adoptForkPacks stages each completed pack here; finalizeForkImport turns
   // staging into pack_catalog rows in the ONE transaction that also writes
@@ -803,10 +933,10 @@ export class PackStore {
    * Record the pack_catalog row (finalize's commit transaction). The count is
    * the actual indexed-row count, not the pack header's declaration. The catalog
    * key IS the R2 object stem (`pack-<sha1>`); the sequence comes from
-   * the formal `next_pack_seq` meta key. kind='receive' (M3 adds 'compact',
-   * fork replication records 'fork'), state='active' (M3 adds the
-   * RETIRED/RECLAIMABLE transitions), location='r2' (the <16 MiB sqlite
-   * location is a later-milestone writer).
+   * the formal `next_pack_seq` meta key. kind='receive' (compaction publishes
+   * kind='compact' rows via publishCompaction; fork replication records
+   * 'fork'), state='active' (compaction owns the RETIRED transition — M3.3),
+   * location='r2' (the <16 MiB sqlite location is a later-milestone writer).
    */
   recordPack(packKey: string, packBytes: number, idxBytes: number, kind: string = "receive"): void {
     this.assertOpen();

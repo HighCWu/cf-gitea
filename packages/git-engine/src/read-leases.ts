@@ -222,10 +222,14 @@ export interface ByteRange {
  * - the plan's lease row exists, is kind='read', and is UNEXPIRED (an expired
  *   lease is dead: the expiry sweep may have reclaimed dependencies — reject;
  *   the reader terminates and re-fetches);
- * - when `packKey` is given, it is in the protected set, and (non-cache
- *   leases) its catalog row is still READABLE (active or retired). A
- *   RECLAIMABLE/DELETED/missing row rejects: RECLAIMABLE is irreversible in
- *   v1 (§2) — this is the late-renewal rejection posture of fault (A)/(C);
+ * - when `packKey` is given, its catalog row is still READABLE (active or
+ *   retired), and non-member packs must at least be ACTIVE (M3.3: a
+ *   compaction publish re-points a live plan's reads onto the successor pack,
+ *   which the payload predates — an ACTIVE row is authorized because active
+ *   packs are never reclaimable; retired/reclaimable/deleted/missing
+ *   non-members reject). A RECLAIMABLE/DELETED/missing row rejects:
+ *   RECLAIMABLE is irreversible in v1 (§2) — this is the late-renewal
+ *   rejection posture of fault (A)/(C);
  * - when `packKey` is null (plan-level renewal), EVERY non-cache pack in the
  *   protected set must still be readable — the whole plan is dead the moment
  *   any dependency left the readable set;
@@ -264,8 +268,23 @@ export function renewAndAuthorizeRead(
     const readable = payload.cache ? null : new Set(store.packs.readableCatalogKeys());
     if (packKey !== null) {
       if (!payload.packKeys.includes(packKey)) {
-        out = { tag: "rejected", reason: `pack not protected by plan ${planId}` };
-        return;
+        // Fencing, state-aware (SPEC-0011 §2 + §5.2, M3.3): a compaction
+        // publish RE-POINTS a live plan's dependencies onto the ACTIVE
+        // successor pack — an object resolved after the flip looks up in a
+        // pack this plan's payload has never named. A non-cache lease
+        // authorizes such a pack anyway when its row is ACTIVE: active packs
+        // are never reclaimable (GC has no active-state delete; the read
+        // cannot race a delete), so the §2 "RETIRED packs serve existing
+        // readers" invariant holds THROUGH the successor. Every other
+        // non-member state rejects as before — a RETIRED pack outside the
+        // payload was retired before this plan existed and may go
+        // RECLAIMABLE at any moment; a missing row names nothing real.
+        // Cache leases (§4.2) keep STRICT membership: clone-cache keys are
+        // never re-pointed and have no catalog row to consult.
+        if (payload.cache || store.packs.catalogStateOf(packKey) !== "active") {
+          out = { tag: "rejected", reason: `pack not protected by plan ${planId}` };
+          return;
+        }
       }
       if (!payload.cache && !readable!.has(packKey)) {
         // RECLAIMABLE is irreversible (§2): the dependency left the readable

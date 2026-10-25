@@ -109,6 +109,26 @@ export type {
   RenewReadResult,
 } from "./read-leases";
 export { READ_LEASE_TTL_MS, READ_RENEW_MARGIN_MS } from "./read-leases";
+// compaction (SPEC-0011 §5, M3.3): the DO-side round + its trigger constants,
+// re-exported so tests/benches and the typed boundary see one surface — the
+// entry point is the RepoCell.compactNow RPC, the production trigger the DO
+// alarm over `compaction_wanted_at`.
+export type {
+  CompactionHost,
+  CompactionLeasePayload,
+  CompactionResult,
+  CompactionRunOptions,
+} from "./compaction";
+export {
+  COMPACTION_ACTIVE_PACK_THRESHOLD,
+  COMPACTION_LEASE_TTL_MS,
+  COMPACTION_MIN_INPUT_PACKS,
+  COMPACTION_RETRY_MS,
+  COMPACTION_WINDOW_BYTES,
+  COMPACTION_WINDOW_OBJECTS,
+  COMPACTION_WINDOW_PACKS,
+  runCompaction,
+} from "./compaction";
 // fork catalog replication (SPEC-0001b §5.3): the four RepoCell RPCs plus the
 // Worker-side consumer loop the fork endpoint's queue consumer calls (the
 // streamed bucket.get → bucket.put copy — the R2 binding has no server-side

@@ -345,10 +345,16 @@ export class GitStore {
   }
 
   hasActiveReceiveLease(now: number): boolean {
+    return this.hasActiveLease("receive", now);
+  }
+
+  /** Whether any UNEXPIRED lease of `kind` exists — the mutual-exclusion
+   * probe. Receives block compaction (SPEC-0011 §5.1); a compaction lease
+   * blocks concurrent compactions (§5.2 step 1). */
+  hasActiveLease(kind: string, now: number): boolean {
     this.assertOpen();
     return (
-      this.sql.exec("SELECT 1 FROM leases WHERE kind = 'receive' AND expires_at > ? LIMIT 1", now).toArray().length >
-      0
+      this.sql.exec("SELECT 1 FROM leases WHERE kind = ? AND expires_at > ? LIMIT 1", kind, now).toArray().length > 0
     );
   }
 

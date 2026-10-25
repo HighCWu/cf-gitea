@@ -252,6 +252,19 @@ export function applyRepoBaseline(sql: SqlStorage): void {
  *        range/order. The check script pins the planner change
  *        (EXPLAIN QUERY PLAN): a pre-0002 database scans/sorts, a post-0002
  *        database seeks the index.
+ * 0003 — PACK LIFECYCLE GOES LIVE (SPEC-0011 §2/§5.2, M3.3): the pack_catalog
+ *        lifecycle columns are ACTIVATED for compaction's publish transition.
+ *        Honesty note: the Step-4 alignment RESERVED `state` (NOT NULL
+ *        DEFAULT 'active') and `superseded_by` on pack_catalog, so every
+ *        database the Step-4+ builds ever created already carries both
+ *        physically — this step makes their activation EXPLICIT and
+ *        journal-recorded (per the M3.0 contract: a schema change lands as a
+ *        step, never as another version bump), guards their presence with
+ *        idempotent ALTERs for any vintage that somehow predates them, and
+ *        backfills NULLs to 'active' (§2: every pre-compaction row is
+ *        implicitly ACTIVE). Compaction's single-transaction publish — new
+ *        row ACTIVE, superseded inputs → RETIRED with `superseded_by` — is
+ *        the first writer of a non-default state.
  */
 export const REPO_MIGRATIONS: SchemaMigrationStep[] = [
   { id: "0001-repo-baseline", up: applyRepoBaseline },
@@ -259,6 +272,22 @@ export const REPO_MIGRATIONS: SchemaMigrationStep[] = [
     id: "0002-pack-objects-pack-oid-index",
     up: (sql) => {
       sql.exec("CREATE INDEX IF NOT EXISTS idx_pack_objects_pack_oid ON pack_objects(pack_key, oid)");
+    },
+  },
+  {
+    id: "0003-pack-catalog-state-live",
+    up: (sql) => {
+      // the try/ALTER chain follows the registry baseline's precedent: a
+      // duplicate-column error is statement-local and leaves the transaction
+      // usable, so the step stays idempotent (journal-guarded anyway)
+      for (const col of ["state TEXT NOT NULL DEFAULT 'active'", "superseded_by TEXT"]) {
+        try {
+          sql.exec(`ALTER TABLE pack_catalog ADD COLUMN ${col}`);
+        } catch {
+          // column already exists (the common case — reserved at Step 4)
+        }
+      }
+      sql.exec("UPDATE pack_catalog SET state = 'active' WHERE state IS NULL");
     },
   },
 ];
