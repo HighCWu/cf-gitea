@@ -22,6 +22,7 @@ import { annotatedTagSchema, createTagOptionSchema, tagSchema } from "../models/
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { assertNotArchived, canWriteRepository, requireVisibleRepo } from "../services/repo-access";
 import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
+import { isTagControlAllowed, listProtectedTags } from "../../services/tag-protection";
 import { serializeTag } from "@cf-gitea/git-engine";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
@@ -347,6 +348,17 @@ export function registerTagRoutes(
         throw new ApiError(409, "tag already exists");
       }
 
+      // Protected-tag enforcement on the create arm (upstream CreateTag →
+      // release_service.CreateNewTag's IsUserAllowedToControlTag check,
+      // services/release/release.go:87-102, answered 422 "user not allowed
+      // to create protected tag", routers/api/v1/repo/tag.go:224-227 — the
+      // check runs after the duplicate arm, exactly here). An unresolvable
+      // viewer id evaluates as anonymous (0 — never allowlisted).
+      const doer = c.get("authUser");
+      if (!(await isTagControlAllowed(c.env.DB, await listProtectedTags(c.env.DB, pair.repo.id), name, doer?.id ?? 0))) {
+        throw new ApiError(422, "user not allowed to create protected tag");
+      }
+
       // A message creates the ANNOTATED tag object (serializeTag →
       // putApiObjects → ref CAS); without one the tag is lightweight.
       let newTarget = commitSha;
@@ -513,6 +525,15 @@ export function registerTagRoutes(
       const tip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(tagRef(tagName));
       if (tip === undefined) {
         throw new ApiError(404, "not found");
+      }
+      // Protected-tag enforcement on the delete arm (upstream DeleteTag →
+      // release_service.DeleteReleaseByID's IsUserAllowedToControlTag check,
+      // services/release/release.go:376-390, answered 422 "user not allowed
+      // to delete protected tag", routers/api/v1/repo/tag.go:282-285 — the
+      // check runs after the existence arms, exactly here).
+      const doer = c.get("authUser");
+      if (!(await isTagControlAllowed(c.env.DB, await listProtectedTags(c.env.DB, pair.repo.id), tagName, doer?.id ?? 0))) {
+        throw new ApiError(422, "user not allowed to delete protected tag");
       }
       const result = await engineCell(c.env, pair.repo).deleteApiRef({ ref: tagRef(tagName), expectedOid: tip.target });
       if (result.tag !== "deleted") {

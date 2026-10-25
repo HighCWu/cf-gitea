@@ -97,6 +97,7 @@ import {
   type ProtectedBranchConfig,
   type ProtectedBranchRow,
 } from "../services/branch-protection";
+import { isTagControlAllowed, listProtectedTags } from "../services/tag-protection";
 import { handleLfsGateBranch, parseLfsRoute } from "../lfs/router";
 import { repoCounters, repoUnits, repositories, users } from "../db/schema";
 import { deleteRepositoryViaEngineShape } from "../repos/purge";
@@ -398,7 +399,10 @@ async function handleUnknownRepository(
  * - D1 row MISSING: a redirect row 301s to the canonical path before any
  *   auth challenge (row 13, §2.5.3 — engine paths ride the same redirect
  *   fabric as git/LFS URLs); with no redirect the request passes through to
- *   the engine VERBATIM — the transitional population is unchanged.
+ *   the engine VERBATIM — the transitional population is unchanged. THE ONE
+ *   EXCEPTION is the engine-shape admin DELETE, which follows the redirect
+ *   internally (see the branch below) so redirect-blind cleanup clients
+ *   resolve renamed repos.
  *
  * The allow tail is the shared gate-cleared forward (no `storageKey`: only
  * receive-pack forwards carry the D1 storage key, §2.1 item 5), so the
@@ -419,7 +423,32 @@ async function handleEnginePathBranch(
 
   if (resolved === null) {
     const redirect = await lookupRedirect(env.DB, ownerLower, repoLower);
-    if (redirect !== null) return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug);
+    if (redirect !== null) {
+      // Engine-shape admin DELETE of a renamed repo's OLD name: follow the
+      // redirect INTERNALLY (resolve the canonical row, run the matrix WRITE
+      // rows against it, delete THERE) instead of 301ing. Registry-fix wave,
+      // probe symptom 3: the smoke harness's cleanup (`DELETE /{owner}/{repo}`,
+      // no /api/v1, redirect-blind clients) stranded renamed repos — the git
+      // and LFS families keep the plain 301 (row 13's before-auth semantics,
+      // which real git clients follow); the one-shot admin shape resolves.
+      if (route.kind === "admin" && req.method === "DELETE") {
+        const canonical = await resolveRepository(env.DB, redirect.ownerNamespace, redirect.slug);
+        if (canonical === null) return repositoryNotFound();
+        const decision = await authorizeGitHttp({
+          req,
+          env,
+          waitUntil: (p) => ctx.waitUntil(p),
+          op: "write",
+          repo: canonical.repo,
+          owner: canonical.owner,
+          ownerVisibility: canonical.ownerVisibility,
+          unitAnonymousRead: false,
+        });
+        if (decision !== true) return decision;
+        return deleteRepositoryViaEngineShape(env, canonical.repo);
+      }
+      return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug);
+    }
     return engine.fetch(req, env, ctx);
   }
 
@@ -614,8 +643,10 @@ function protectedBranchValidator(env: Env, repo: RepositoryRow): PushValidator 
  * lookup), first-match rule (:149-158), the deletion predicate (:166-171),
  * the force-push refusal (:176-191), then the direct-push predicate with
  * the force variant of the refusal text (:229-267). Messages are upstream's
- * exact texts; the engine renders them as report-status ng lines. The
- * UI/API-merge escape hatch (:236-312) does not exist for us — merges never
+ * exact texts; the engine renders them as report-status ng lines. Tag refs
+ * walk the protected-tag arm instead (preReceiveTag :308-339 — the batch-8
+ * wiring, see the tag branch below). The UI/API-merge escape hatch
+ * (:236-312) does not exist for us — merges never
  * traverse receive-pack — so failure is uniformly "reject the command".
  * Upstream's PR-target deletion arm (:144-147, same deletion text) is not
  * ported: it needs the open-PR base-branch universe and is not one of the
@@ -652,6 +683,9 @@ async function evaluateBranchProtection(
   // order comes back from listRepoRules), configs parse per matched rule.
   const rules = await listRepoRules(env.DB, repo.id);
   const compiled = rules.map((row) => ({ row, name: compileRuleName(row.ruleName) }));
+  // Protected-tag rules load once per push too (upstream preReceiveTag caches
+  // ctx.protectedTags the same way, hook_pre_receive.go:315-324).
+  const protectedTagRules = await listProtectedTags(env.DB, repo.id);
   const configs = new Map<number, ProtectedBranchConfig>();
   const configOf = (row: ProtectedBranchRow): ProtectedBranchConfig => {
     let config = configs.get(row.id);
@@ -664,8 +698,20 @@ async function evaluateBranchProtection(
 
   return Promise.all(
     commands.map(async (cmd): Promise<PushVerdict> => {
-      // Only branch refs carry protection (upstream: tags walk preReceiveTag,
-      // which has no protection arms).
+      // Tag refs walk the protected-tag check (upstream preReceiveTag,
+      // hook_pre_receive.go:308-339): EVERY tag create/update/delete must
+      // pass IsUserAllowedToControlTag — no pattern matches the name, or the
+      // pusher is allowlisted (user ids or teams, protected_tag.go:100-149).
+      // "Tag %s is protected" is upstream's exact refusal (:337). A compile
+      // error inside the check throws — the validator wrapper fails the
+      // whole push closed, upstream's "unable to check allowed tags" 500.
+      if (cmd.ref.startsWith("refs/tags/")) {
+        const tag = cmd.ref.slice("refs/tags/".length);
+        if (!(await isTagControlAllowed(env.DB, protectedTagRules, tag, access.userId))) {
+          return { reject: `Tag ${tag} is protected` };
+        }
+        return {};
+      }
       if (!cmd.ref.startsWith("refs/heads/")) return {};
       const branch = cmd.ref.slice("refs/heads/".length);
       if (cmd.kind === "delete" && branch === repo.defaultBranch) {
