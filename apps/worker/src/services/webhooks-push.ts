@@ -36,8 +36,9 @@
  * composes api/services converters (`compareUrl`, `toPayloadCommit`,
  * `usernamesByEmail`) and api/services/hooks.ts already imports
  * issues/webhooks.ts — putting api imports under it would close a module
- * cycle. sync.ts keeps its private copy until its owner swaps it for this
- * import (one-for-one: identity + walk seam are parameters).
+ * cycle. sync.ts's `notifyMirrorSyncDelta` now delegates here (one-for-one:
+ * identity + walk seam are parameters — the mirror path passes the owner
+ * identity and shares `engineWalk`).
  *
  * PUSHER IDENTITY — DEVIATION (documented, this wave): upstream sets
  * `pusher`/`sender` to the AUTHENTICATED user (services/repository/push.go
@@ -151,8 +152,10 @@ export interface WebhookPushWalk {
   readCommit(id: string): Promise<CommitJson | null>;
 }
 
-/** The real walk: the repo cell of the notification's repository. */
-function engineWalk(env: WebhookPushEnv, pair: RepositoryWithOwner): WebhookPushWalk {
+/** The real walk: the repo cell of the notification's repository. Shared by
+ *  the user-push wiring and the mirror path (sync.ts passes it as the walk
+ *  seam — same cell either way: pair.repo IS the notified repository). */
+export function engineWalk(env: WebhookPushEnv, pair: RepositoryWithOwner): WebhookPushWalk {
   const cell = env.REPO.getByName(engineName(pair.repo.ownerNamespace, pair.repo.slug));
   return {
     listCommitsRange: (base, head, limit) => cell.listCommitsRange(base, head, limit),
