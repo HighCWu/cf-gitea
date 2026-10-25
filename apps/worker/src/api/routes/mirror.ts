@@ -5,7 +5,7 @@ import { z } from "zod";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import {
-  canViewRepository,
+  canViewRepositoryWithTeams,
   findRepositoryByPath,
   findRepositoryById,
   repositoryPermissions,
@@ -121,7 +121,7 @@ const migrateRepoMigrateSchema = migrateOptionsSchema.extend({
 async function requireAdminRepo(c: Context<ApiEnv>, owner: string, repo: string): Promise<RepositoryWithOwner> {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, owner, repo);
-  if (found === null || !canViewRepository(viewer, found.repo)) throw new ApiError(404, "not found");
+  if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) throw new ApiError(404, "not found");
   if (!repositoryPermissions(viewer, found.repo).admin) {
     throw new ApiError(403, "only the repository owner or a site admin can manage the mirror");
   }
@@ -283,7 +283,7 @@ export function registerMirrorRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Midd
     const { owner, repo } = c.req.param();
     const viewer = viewerOf(c);
     const found = await findRepositoryByPath(c.env.DB, owner, repo);
-    if (found === null || !canViewRepository(viewer, found.repo)) throw new ApiError(404, "not found");
+    if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) throw new ApiError(404, "not found");
     if (!repositoryPermissions(viewer, found.repo).push) {
       throw new ApiError(403, "mirror sync requires write access to the repository");
     }

@@ -142,6 +142,8 @@ import {
 import {
   apiUserFromRow,
   canViewRepository,
+  canViewRepositoryWithTeams,
+  doerRepoAccessMode,
   findRepositoryByPath,
   repositoryPermissions,
   toApiRepository,
@@ -301,10 +303,12 @@ const bindValidationHook = ({ success }: { success: boolean }): undefined => {
 // ---------------------------------------------------------------------------
 
 /** Shared repo resolution — the anti-enumeration 404 (SPEC-0004 §2.4). */
+/** Repo resolution + visibility (the anti-enumeration 404; the review
+ *  family's local copy of the issues/pulls guard). */
 async function requireVisibleRepo(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
-  if (found === null || !canViewRepository(viewer, found.repo)) {
+  if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
   return { viewer, found };
@@ -1560,8 +1564,12 @@ export function registerPullReviewRoutes(
       }
       if (isAdd) {
         const reviewerViewer: Viewer = { origin: viewer.origin, requester: apiUserFromRow(reviewer, viewer) };
+        // The reviewer's read arm rides the same team-aware predicate
+        // (SPEC-0007 §3.5) — a team grant admits the reviewer upstream-style.
         const canRead =
-          canViewRepository(reviewerViewer, found.repo) || (await collaboratorModeOf(c.env.DB, found.repo.id, reviewer.id)) !== "none";
+          canViewRepository(reviewerViewer, found.repo) ||
+          (await doerRepoAccessMode(c.env.DB, found.repo, reviewer.id)) !== "none" ||
+          (await collaboratorModeOf(c.env.DB, found.repo.id, reviewer.id)) !== "none";
         if (!canRead) {
           throw new ApiError(422, `Reviewer can't read [user_id: ${doerId}, repo_id: ${found.repo.id}]`);
         }

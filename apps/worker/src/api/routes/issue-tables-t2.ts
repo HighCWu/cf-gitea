@@ -32,7 +32,7 @@ import { findCollaborator } from "../services/repo-collaborators";
 import {
   GO_ZERO_TIME,
   apiUserFromRow,
-  canViewRepository,
+  canViewRepositoryWithTeams,
   findRepositoryByPath,
   findRepositoryById,
   findUserByName,
@@ -644,7 +644,7 @@ function isoOrGoZero(date: Date | null): string {
 async function requireVisibleRepoPair(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
-  if (found === null || !canViewRepository(viewer, found.repo)) {
+  if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
   return { viewer, found };
@@ -989,7 +989,7 @@ async function dependencySideFromMeta(
   if (foreign === null) {
     throw new ApiError(404, `repository does not exist [id: 0, uid: 0, owner_name: ${form.owner ?? ""}, name: ${form.repo ?? ""}]`);
   }
-  if (!canViewRepository(viewer, foreign.repo)) {
+  if (!(await canViewRepositoryWithTeams(c.env.DB, viewer, foreign.repo))) {
     throw notFoundError();
   }
   const issue = await findIssueByRepoAndIndex(c.env.DB, foreign.repo.id, form.index ?? 0);
@@ -1119,7 +1119,7 @@ async function assertDependencyGates(c: Context<ApiEnv>, viewer: Viewer, target:
   if (!(await canWriteRepository(c, target.repo))) {
     throw notFoundError();
   }
-  if (dependency.repo.repo.id !== target.repo.repo.id && !canViewRepository(viewer, dependency.repo.repo)) {
+  if (dependency.repo.repo.id !== target.repo.repo.id && !(await canViewRepositoryWithTeams(c.env.DB, viewer, dependency.repo.repo))) {
     throw notFoundError();
   }
 }
@@ -1195,7 +1195,7 @@ async function renderBlocker(
   if (row.repo.id === found.repo.id) {
     return toApiIssue(c.env.DB, viewer, found, row.issue);
   }
-  if (canViewRepository(viewer, row.repo)) {
+  if (await canViewRepositoryWithTeams(c.env.DB, viewer, row.repo)) {
     const pair = await findRepositoryById(c.env.DB, row.repo.id);
     if (pair !== null) {
       return toApiIssue(c.env.DB, viewer, pair, row.issue);
@@ -1405,7 +1405,7 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     const rendered: Issue[] = [];
     for (const row of rows.slice((page - 1) * limit, page * limit)) {
       // Upstream SKIPS unreadable foreign blockers here (no redaction).
-      if (row.repo.id !== found.repo.id && !canViewRepository(viewer, row.repo)) {
+      if (row.repo.id !== found.repo.id && !(await canViewRepositoryWithTeams(c.env.DB, viewer, row.repo))) {
         continue;
       }
       const pair = row.repo.id === found.repo.id ? found : await findRepositoryById(c.env.DB, row.repo.id);

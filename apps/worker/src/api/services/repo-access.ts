@@ -2,7 +2,7 @@ import type { Context } from "hono";
 
 import { collaboratorModeOf } from "./repo-collaborators";
 import {
-  canViewRepository,
+  canViewRepositoryWithTeams,
   findRepositoryByPath,
   repositoryPermissions,
   viewerOf,
@@ -14,17 +14,22 @@ import type { ApiEnv } from "../env";
 /**
  * Shared repo-access guards for the batch-7 route families (topics,
  * subscription, collaborators/assignees, releases, repo-edit/transfer).
- * The landed route families (hooks/pulls/issues) carry their own copies of
- * `requireVisibleRepo`; this module is the shared seam going forward so the
- * collaborator-mode grants below read from exactly one table.
+ * `requireVisibleRepo` is THE repo-visibility seam: every route family that
+ * resolves a repo through it (and the families that still carry local
+ * copies of the same shape) reads the ONE team-aware predicate
+ * (`canViewRepositoryWithTeams` — SPEC-0007 §3.5), so a team-granted member
+ * sees a private org repo upstream-style everywhere, and the collaborator
+ * grants below read from exactly one table.
  *
  * Permission model (the reduced ACL matrix of services/repository.ts,
- * widened with the collaborator rows this batch stores):
- *  - visible  = public, or requester is owner/site admin (anti-enumeration
- *    404 for everything else — SPEC-0004 §2.4);
+ * widened with the collaborator rows this batch stores and the org/team
+ * grant in the visibility arm):
+ *  - visible  = public, or requester is owner/site admin, or an org team
+ *    grant covers the repo (anti-enumeration 404 for everything else —
+ *    SPEC-0004 §2.4);
  *  - admin    = owner / site admin, or a collaborator with the `admin` mode
- *    (upstream `reqAdmin`, api.go:383–390 — the full org-team grant lands
- *    with SPEC-0002/0007);
+ *    (upstream `reqAdmin`, api.go:383–390 — the org-team 403 arms are the
+ *    queued guard-narrowing follow-up);
  *  - write    = admin, or `push` on the reduced matrix, or a collaborator
  *    with the `write`/`admin` mode (upstream `reqRepoWriter`).
  */
@@ -36,7 +41,7 @@ export async function requireVisibleRepo(
 ): Promise<RepositoryWithOwner> {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
-  if (found === null || !canViewRepository(viewer, found.repo)) {
+  if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
   return found;

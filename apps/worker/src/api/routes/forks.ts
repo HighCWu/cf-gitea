@@ -11,7 +11,7 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { requireCanCreateOrgRepo } from "../services/org-repos";
 import { createFork, findForkByOwner, listForks, toForkRepository } from "../services/forks";
 import {
-  canViewRepository,
+  canViewRepositoryWithTeams,
   findRepositoryByPath,
   findUserByName,
   toApiRepository,
@@ -138,11 +138,11 @@ const createForkRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
   });
 
 /** Visible-source-or-404 (the reqRepoReader anti-enumeration shape both
- *  routes share; SPEC-0003's ACL matrix collapses to canViewRepository). */
+ *  routes share; SPEC-0003's ACL matrix + the SPEC-0007 §3.5 team grant). */
 async function requireVisibleSource(c: Context<ApiEnv>, owner: string, repo: string): Promise<RepositoryWithOwner> {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, owner, repo);
-  if (found === null || !canViewRepository(viewer, found.repo)) {
+  if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
   return found;

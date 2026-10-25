@@ -145,22 +145,46 @@ export async function doerRepoAccessMode(
 }
 
 /**
+ * Route-facing grant resolution: the doer's org/team access mode over the
+ * repo, or null when the sync matrix already decides (anonymous, site admin,
+ * the repo's own owner — arms checked without touching D1) or no team grant
+ * exists ('none'). The ONE resolution a route feeds to BOTH
+ * `canViewRepository` and `toApiRepository`, so the visibility check and the
+ * embedded permissions block cannot disagree (upstream renders `ToRepo` with
+ * the doer's resolved AccessMode, models/perm/access/repo_permission.go).
+ */
+export async function viewerTeamAccessMode(
+  d1: D1Database,
+  viewer: Viewer,
+  row: RepositoryRow,
+): Promise<TeamAccessMode | null> {
+  if (viewer.requester === null || viewer.requester.is_admin === true || isRepositoryOwner(viewer, row)) {
+    return null;
+  }
+  // The API `User.id` mirrors upstream's optional int64; a resolved doer
+  // always carries one (the auth middlewares project the D1 row).
+  const userId = viewer.requester.id;
+  if (userId === undefined) return null;
+  const mode = await doerRepoAccessMode(d1, row, userId);
+  return mode === "none" ? null : mode;
+}
+
+/**
  * `canViewRepository` with the org/team grant resolved from D1 — the
- * async seam for callers that hold a db handle (the route guards evolve
- * onto this; the sync overload above stays for callers that pass a
- * pre-resolved mode or need the pure matrix).
+ * async seam the route guards resolve through (SPEC-0007 §3.5). The pure
+ * matrix answers first, so the hot arms (public repos, the repo's own owner,
+ * site admins) cost no extra D1; only a first-pass miss pays the
+ * `doerRepoAccessMode` lookup. The sync overload above stays for callers
+ * that pass a pre-resolved mode or need the pure matrix.
  */
 export async function canViewRepositoryWithTeams(
   d1: D1Database,
   viewer: Viewer,
   row: RepositoryRow,
 ): Promise<boolean> {
-  // The API `User.id` mirrors upstream's optional int64; a resolved doer
-  // always carries one (the auth middlewares project the D1 row).
-  const userId = viewer.requester?.id;
-  if (userId === undefined) return canViewRepository(viewer, row);
-  const mode = await doerRepoAccessMode(d1, row, userId);
-  return canViewRepository(viewer, row, mode);
+  if (canViewRepository(viewer, row)) return true;
+  const teamMode = await viewerTeamAccessMode(d1, viewer, row);
+  return canViewRepository(viewer, row, teamMode);
 }
 
 /**
@@ -191,10 +215,8 @@ export async function repositoryPermissionsWithTeams(
   viewer: Viewer,
   row: RepositoryRow,
 ): Promise<Permission> {
-  const userId = viewer.requester?.id;
-  if (userId === undefined) return repositoryPermissions(viewer, row);
-  const mode = await doerRepoAccessMode(d1, row, userId);
-  return repositoryPermissions(viewer, row, mode);
+  const teamMode = await viewerTeamAccessMode(d1, viewer, row);
+  return repositoryPermissions(viewer, row, teamMode);
 }
 
 /**
@@ -503,8 +525,11 @@ function castIdNumber(): SQL {
 /**
  * WHERE conditions shared by the list routes: what the requester may see.
  * `includePrivate` false (anonymous or `private=false`) → public only;
- * otherwise public plus the requester's own private repositories (admins see
- * all). TODO(SPEC-0005): org/team/collaborator visibility.
+ * otherwise public plus the requester's own private repositories plus the
+ * org repos a team grant covers (SPEC-0007 §3.5 — the SQL twin of
+ * `doerRepoAccessMode !== 'none'`), and admins see all. TODO(SPEC-0005):
+ * collaborator visibility (the row-level seam resolves it; the list WHERE
+ * does not yet).
  */
 function visibilityConditions(viewer: Viewer, includePrivate: boolean): SQL[] {
   if (!includePrivate || viewer.requester === null) {
@@ -513,12 +538,47 @@ function visibilityConditions(viewer: Viewer, includePrivate: boolean): SQL[] {
   if (viewer.requester.is_admin === true) {
     return [];
   }
+  const teamArm = viewer.requester.id === undefined ? [] : [teamGrantCondition(viewer.requester.id)];
   return [
     or(
       eq(repositories.visibility, "public"),
       eq(repositories.ownerNamespace, requesterLoginLower(viewer) ?? ""),
+      ...teamArm,
     ) as SQL,
   ];
+}
+
+/**
+ * The list-side team-grant EXISTS — a repo passes when a team of the org
+ * owning it has the requester among its `team_members` AND covers the repo
+ * (`includes_all_repositories` or a `team_repo_access` row) AND its
+ * EFFECTIVE mode is not 'none' (`max(authorize, units_map values)` — the
+ * same units collapse `OrgService.teamRepoAccessMode` computes row-wise, so
+ * the list never shows a repo the per-repo seam would 404, and never hides
+ * one it admits). `json_each(NULL)` yields no rows, so plain-permission
+ * teams (units_map null) fall through to the `authorize` arm.
+ */
+function teamGrantCondition(userId: number): SQL {
+  return sql`EXISTS (
+    SELECT 1 FROM teams t
+    JOIN team_members tm ON tm.team_id = t.id
+    WHERE t.org_id = ${repositories.ownerId}
+      AND tm.user_id = ${userId}
+      AND (
+        t.authorize <> 'none'
+        OR EXISTS (
+          SELECT 1 FROM json_each(t.units_map) ju
+          WHERE ju.value IN ('read', 'write', 'admin', 'owner')
+        )
+      )
+      AND (
+        t.includes_all_repositories = 1
+        OR EXISTS (
+          SELECT 1 FROM team_repo_access tra
+          WHERE tra.team_id = t.id AND tra.repo_id = ${repositories.id}
+        )
+      )
+  )`;
 }
 
 export interface RepoSearchOptions extends RepositoryListOptions {  keyword: string;

@@ -15,7 +15,7 @@ import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { toApiPullRequest } from "../services/pulls";
 import { canWriteRepository } from "../services/repo-access";
-import { canViewRepository, findRepositoryByPath, viewerOf } from "../services/repository";
+import { canViewRepositoryWithTeams, findRepositoryByPath, viewerOf } from "../services/repository";
 import type { RepositoryWithOwner } from "../services/repository";
 
 /**
@@ -238,7 +238,7 @@ function pathInt(raw: string): number {
 async function requireVisibleRepoPair(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
-  if (found === null || !canViewRepository(viewer, found.repo)) {
+  if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
   return { viewer, found };

@@ -11,7 +11,7 @@ import {
   listHookDeliveries,
   toApiDelivery,
 } from "../services/hooks";
-import { canViewRepository, findRepositoryByPath, viewerOf } from "../services/repository";
+import { canViewRepositoryWithTeams, findRepositoryByPath, viewerOf } from "../services/repository";
 
 /**
  * Tier-2 webhook delivery item (SPEC-0004 appendix A row
@@ -68,7 +68,7 @@ function pathId(raw: string): number {
 async function requireVisibleRepoPair(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
-  if (found === null || !canViewRepository(viewer, found.repo)) {
+  if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
   return { viewer, found };

@@ -27,7 +27,7 @@ import {
 } from "../services/commit-status";
 import {
   apiRepositoryUrl,
-  canViewRepository,
+  canViewRepositoryWithTeams,
   findRepositoryByPath,
   toApiRepository,
   viewerOf,
@@ -226,7 +226,7 @@ const combinedStatusByRefRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
 async function requireVisibleRepo(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
-  if (found === null || !canViewRepository(viewer, found.repo)) {
+  if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
   return { viewer, found };

@@ -41,6 +41,7 @@ import {
   canViewRepository,
   searchRepositories,
   toApiRepository,
+  viewerTeamAccessMode,
   viewerOf,
   type Viewer,
 } from "../services/repository";
@@ -353,15 +354,22 @@ export function registerRepoRoutes(
     const { owner, repo } = c.req.valid("param");
     const viewer = viewerOf(c);
     const found = await findRepositoryByPath(c.env.DB, owner, repo);
-    if (found === null || !canViewRepository(viewer, found.repo)) {
+    if (found === null) {
       // Missing and invisible are the same 404 upstream (anti-enumeration).
+      throw new ApiError(404, "not found");
+    }
+    // One grant resolution feeds both the visibility check and the embedded
+    // permissions block (SPEC-0007 §3.5 — the resolved team grant admits a
+    // team member and renders their AccessMode, like upstream ToRepo).
+    const teamMode = await viewerTeamAccessMode(c.env.DB, viewer, found.repo);
+    if (!canViewRepository(viewer, found.repo, teamMode)) {
       throw new ApiError(404, "not found");
     }
     // Single-repo renders overlay the stored repo-edit subset (PATCH→GET
     // round trip); list/search paths keep the defaults (the settings row is
     // the not-yet-swept column store — see toApiRepository).
     const settings = await loadRepoSettings(c.env.DB, found.repo.id);
-    return c.json(toApiRepository(viewer, found, settings), 200);
+    return c.json(toApiRepository(viewer, found, settings, teamMode), 200);
   });
 
   app.openapi(searchReposRoute(optionalAuth), async (c) => {
@@ -397,11 +405,15 @@ export function registerRepoRoutes(
     const { id } = c.req.valid("param");
     const viewer = viewerOf(c);
     const found = await findRepositoryById(c.env.DB, id);
-    if (found === null || !canViewRepository(viewer, found.repo)) {
+    if (found === null) {
+      throw new ApiError(404, "not found");
+    }
+    const teamMode = await viewerTeamAccessMode(c.env.DB, viewer, found.repo);
+    if (!canViewRepository(viewer, found.repo, teamMode)) {
       throw new ApiError(404, "not found");
     }
     const settings = await loadRepoSettings(c.env.DB, found.repo.id);
-    return c.json(toApiRepository(viewer, found, settings), 200);
+    return c.json(toApiRepository(viewer, found, settings, teamMode), 200);
   });
 
   // -------------------------------------------------------------------------

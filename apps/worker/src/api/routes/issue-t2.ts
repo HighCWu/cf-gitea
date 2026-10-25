@@ -42,7 +42,7 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { canWriteRepository } from "../services/repo-access";
 import {
   apiRepositoryUrl,
-  canViewRepository,
+  canViewRepositoryWithTeams,
   findRepositoryByPath,
   findUserByName,
   viewerOf,
@@ -477,7 +477,7 @@ function pathId(raw: string): number {
 async function requireVisibleRepoPair(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
-  if (found === null || !canViewRepository(viewer, found.repo)) {
+  if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
   return { viewer, found };
