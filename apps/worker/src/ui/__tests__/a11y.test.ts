@@ -10,6 +10,10 @@ import { describe, expect, it } from "vitest";
 import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } from "./a11y";
 import bareShellGolden from "./goldens/bare-shell.html?raw";
 import commitsGolden from "./goldens/commits.html?raw";
+import compareCommitsGolden from "./goldens/compare-commits.html?raw";
+import compareFormGolden from "./goldens/compare-form.html?raw";
+import compareHasPrGolden from "./goldens/compare-has-pr.html?raw";
+import compareNothingGolden from "./goldens/compare-nothing.html?raw";
 import dashboardGolden from "./goldens/dashboard.html?raw";
 import exploreReposGolden from "./goldens/explore-repos.html?raw";
 import exploreUsersGolden from "./goldens/explore-users.html?raw";
@@ -69,6 +73,12 @@ const goldens: Record<string, string> = {
   "org-teams.html": orgTeamsGolden,
   "org-team-detail.html": orgTeamDetailGolden,
   "user-settings-profile.html": userSettingsProfileGolden,
+  // Pages wave 13: the compare family (the plain comparison, the writer's
+  // new-PR form view, the has-PR pair, the same-tip tag state).
+  "compare-commits.html": compareCommitsGolden,
+  "compare-form.html": compareFormGolden,
+  "compare-has-pr.html": compareHasPrGolden,
+  "compare-nothing.html": compareNothingGolden,
 };
 
 function classList(el: { attrs: Record<string, string> }): string[] {

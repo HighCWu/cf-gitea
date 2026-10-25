@@ -55,7 +55,11 @@ for (const match of output.matchAll(marker)) {
 }
 
 let failed = false;
-for (const name of goldenFiles.length > 0 ? goldenFiles : [...rendered.keys()]) {
+// The union: pre-existing files (emptied above — a case removed from
+// GOLDEN_CASES still fails loudly) PLUS newly rendered names (a case added
+// to GOLDEN_CASES has no file to enumerate before the run).
+const names = [...new Set([...goldenFiles, ...rendered.keys()])];
+for (const name of names) {
   const body = rendered.get(name);
   if (body === undefined) {
     console.error(`FAIL: no render captured for goldens/${name}`);

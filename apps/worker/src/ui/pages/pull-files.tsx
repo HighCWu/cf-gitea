@@ -209,6 +209,40 @@ function hunkView(hunk: DiffFileJson["hunks"][number]): DiffHunkView {
 }
 
 /**
+ * Map one engine diff's files into the render model (hashes, numbering,
+ * body branch) — the shared half of every diff page's loader. Exported for
+ * the compare view (pages/compare.tsx, pages wave 13), which renders the
+ * SAME boxes over a base...head range instead of a PR's refs/pull head.
+ */
+export async function diffFileViews(files: DiffFileJson[]): Promise<DiffFileView[]> {
+  return Promise.all(
+    files.map(async (file) => ({
+      file,
+      nameHash: await hashFilePathForWebUI(file.path),
+      modeLabel:
+        file.old === null && file.new !== null
+          ? fileModeName(file.new.mode)
+          : file.new === null && file.old !== null
+            ? fileModeName(file.old.mode)
+            : file.old !== null && file.new !== null && file.old.mode !== file.new.mode
+              ? `${fileModeName(file.old.mode)} → ${fileModeName(file.new.mode)}`
+              : null,
+      body:
+        file.kind === "binary"
+          ? "binary"
+          : file.kind === "toolarge"
+            ? "toolarge"
+            : file.old !== null && file.new !== null && file.old.mode !== file.new.mode
+              ? "mode"
+              : file.hunks.length === 0
+                ? "whitespace"
+                : "table",
+      hunks: file.hunks.map(hunkView),
+    })),
+  );
+}
+
+/**
  * Load the PR + its three-dot range diff. Returns `null` when the row
  * misses or is not a pull (the caller 404-shells); engine-side range
  * failures (missing base/head refs — the service's ApiError 404) collapse
@@ -243,31 +277,7 @@ export async function loadPullFilesData(
     files = [];
   }
 
-  const views: DiffFileView[] = await Promise.all(
-    files.map(async (file) => ({
-      file,
-      nameHash: await hashFilePathForWebUI(file.path),
-      modeLabel:
-        file.old === null && file.new !== null
-          ? fileModeName(file.new.mode)
-          : file.new === null && file.old !== null
-            ? fileModeName(file.old.mode)
-            : file.old !== null && file.new !== null && file.old.mode !== file.new.mode
-              ? `${fileModeName(file.old.mode)} → ${fileModeName(file.new.mode)}`
-              : null,
-      body:
-        file.kind === "binary"
-          ? "binary"
-          : file.kind === "toolarge"
-            ? "toolarge"
-            : file.old !== null && file.new !== null && file.old.mode !== file.new.mode
-              ? "mode"
-              : file.hunks.length === 0
-                ? "whitespace"
-                : "table",
-      hunks: file.hunks.map(hunkView),
-    })),
-  );
+  const views: DiffFileView[] = await diffFileViews(files);
 
   // The title bar's two names (the detail page's batched-name pattern).
   const personIds = new Set<number>();
@@ -360,8 +370,9 @@ function UnifiedHunkRows(props: { nameHash: string; hunk: DiffHunkView }) {
 
 /** One file box (box.tmpl:95-222 reduced): header (name anchor + entry-mode
  *  label + stats/BIN) and body (unified table, or the honest degraded
- *  branch). */
-function DiffFileBox(props: { view: DiffFileView }) {
+ *  branch). Exported for the compare view's diff half (pages/compare.tsx) —
+ *  one box vocabulary for every diff surface. */
+export function DiffFileBox(props: { view: DiffFileView }) {
   const { view } = props;
   return (
     <div

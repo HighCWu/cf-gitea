@@ -128,6 +128,16 @@
  *                                          admin viewer only; the Synchronize
  *                                          Now POST enqueues the landed
  *                                          mirror-sync message)
+ *   /:owner/:repo/compare[/{base}...{head}]  compare view, GET + POST
+ *                                          (pages/compare.tsx — wave 13;
+ *                                          upstream web.go:1307-1315's
+ *                                          /compare group — the bare URL and
+ *                                          the FIRST-`...` split, `..` and
+ *                                          fork-form heads unclaimed → the
+ *                                          engine's 404; the POST is the
+ *                                          new-PR write over the landed
+ *                                          create arms, writer-gated, 303
+ *                                          onto the created PR)
  *   /:owner/:repo/pulls/{index}/files/reviews/submit  review verdict write,
  *                                          POST (pages/pull-reviews.tsx —
  *                                          wave 11; upstream web.go:1678
@@ -325,6 +335,7 @@ import {
   renderNewIssuePage,
 } from "./pages/new-issue";
 import { loadPullFilesData, renderPullFilesPage } from "./pages/pull-files";
+import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
 import {
   applyRepoBasics,
   canAdminRepo,
@@ -594,6 +605,26 @@ export interface OrgTeamsRoute {
   id?: number;
 }
 
+/** The wave-13 compare family (pages/compare.tsx): upstream's
+ *  `m.Get("/compare")` + the `/compare/*` path group (web.go:1307-1315) —
+ *  the bare URL (both sides the default branch) and the `{base}...{head}`
+ *  tail (FIRST `...` splits; a missing separator makes the whole tail the
+ *  head — upstream's single-ref family; an empty side falls back to the
+ *  default branch at load). The `..` two-dot family (DirectComparison) and
+ *  the `{owner}/{repo}:{head}` fork forms stay UNCLAIMED → the engine's 404
+ *  (documented divergences: no landed direct-comparison surface, no forks).
+ *  The POST on the same tail is the new-PR write
+ *  (CompareAndPullRequestPost — the form lives INLINE on the compare page). */
+export interface CompareRoute {
+  family: "compare";
+  owner: string;
+  repo: string;
+  /** The base side; `null` = the bare/empty form → the default branch. */
+  base: string | null;
+  /** The head side; `null` = the bare/empty form → the default branch. */
+  head: string | null;
+}
+
 /** Top-level single-segment paths this router must never claim: the session
  *  router's literals (registered on the SAME parent app AFTER this sub-app,
  *  so a dynamic `/:owner` registration would shadow them — SPEC-0010 §2.1)
@@ -624,7 +655,8 @@ export type ParsedUiRoute =
   | ExploreRoute
   | NotificationsRoute
   | UserSettingsRoute
-  | OrgTeamsRoute;
+  | OrgTeamsRoute
+  | CompareRoute;
 
 
 /**
@@ -814,6 +846,42 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 0) return { family: "milestones", owner, repo };
     if (rest.length === 1 && rest[0] === "new") return { family: "milestone-new", owner, repo };
     return null;
+  }
+  // Wave-13: the compare family (pages/compare.tsx — upstream web.go:1307-
+  // 1315). The bare URL and the `{base}...{head}` tail (FIRST `...` splits
+  // the decoded suffix — strings.Cut parity; refnames can never carry `..`,
+  // so the separator is unambiguous and the emitted links always re-parse to
+  // the same pair). A missing separator makes the whole tail the HEAD
+  // (upstream's single-ref family); an empty side is the default-branch
+  // fallback (the loader's util.IfZero arm). The `..` two-dot family
+  // (DirectComparison — a different diff semantic, not a landed surface) and
+  // the `{owner}/{repo}:{head}` fork forms (colon-bearing sides; forks
+  // cannot exist yet, SPEC-0003) stay unclaimed → the engine's 404, exactly
+  // upstream's unregistered-route answer for this slice.
+  if (head === "compare") {
+    if (rest.length === 0) return { family: "compare", owner, repo, base: null, head: null };
+    let suffix: string;
+    try {
+      suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
+    } catch {
+      return null;
+    }
+    if (suffix === "") return { family: "compare", owner, repo, base: null, head: null };
+    const separator = suffix.indexOf("...");
+    if (separator < 0) {
+      if (suffix.includes("..") || suffix.includes(":")) return null;
+      return { family: "compare", owner, repo, base: null, head: suffix };
+    }
+    const base = suffix.slice(0, separator);
+    const headSide = suffix.slice(separator + 3);
+    if (base.includes("..") || base.includes(":") || headSide.includes("..") || headSide.includes(":")) return null;
+    return {
+      family: "compare",
+      owner,
+      repo,
+      base: base === "" ? null : base,
+      head: headSide === "" ? null : headSide,
+    };
   }
   // Wave-8 file editor: the `new`/`edit`/`delete` literals claim the
   // branch+path tail shape (FileEditorRoute). Bare literals fall through to
@@ -2050,6 +2118,119 @@ async function pullReviewDismissSubmit(c: Context<{ Bindings: Env }>): Promise<R
   }
 }
 
+// ---------------------------------------------------------------------------
+// The wave-13 compare family (pages/compare.tsx — upstream's /compare group,
+// web.go:1307-1315, CompareDiff + CompareAndPullRequestPost)
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/compare[/{base}...{head}] (pages/compare.tsx — the
+ *  comparison view; every viewer who can see the repo reads it; the create
+ *  form's writer gate rides along as `canCreate` — the branch-kinds arm
+ *  (upstream allowCreatePull's IsBranch pair) reads the loaded data, so the
+ *  gate computes AFTER the load). */
+async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "compare") return respond(await c.notFound()); // registration/parser drift guard
+  const page = parsePageNumber(url.searchParams.get("page"));
+  const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
+  if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  const canCreate =
+    !repo.isArchived &&
+    viewer.kind === "user" &&
+    data.baseKind === "branch" &&
+    data.headKind === "branch" &&
+    (await canWriteRepo(c.env.DB, repo, viewer));
+  return respond(
+    c.html(
+      renderComparePage({
+        ctx,
+        data,
+        form: { title: data.suggestedTitle, content: data.suggestedContent },
+        error: null,
+        canCreate,
+        page,
+      }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/compare/{base}...{head} (upstream
+ * CompareAndPullRequestPost, routers/web/repo/pull.go:1318, over the landed
+ * create route's arms): the §2.8 Origin guard, the repo→viewer order, the
+ * WRITER gate (`canWriteRepo` — the file-editor predicate; a signed-in
+ * non-writer 404-shells like the editor surfaces, anonymous 303s onto the
+ * login round-trip; upstream admits any pulls-reader, the pages/compare.tsx
+ * header documents the divergence), then the landed create arms in the API
+ * route's order (head === base, no common history, equal tips, duplicate,
+ * empty title) — every refusal re-renders the compare page at 200 with the
+ * message and the submitted values (the login failure convention). Success
+ * 303s onto the created PR's detail page (upstream JSONRedirect's
+ * pullIssue.Link() target).
+ */
+async function compareSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  // The bare URL carries no form (nothing to compare) — the registration
+  // answers it with chi's 405; a null-side tail POST is hand-crafted (404).
+  if (route.family !== "compare" || route.head === null) return respond(await c.notFound());
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (repo.isArchived || !(await canWriteRepo(c.env.DB, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const doerRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (doerRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const page = parsePageNumber(url.searchParams.get("page"));
+  const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
+  if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  const form = await readComparePullForm(c.req.raw);
+  const result = await createPullFromForm({
+    request: c,
+    raw: c.req.raw,
+    origin: url.origin,
+    pair,
+    repo,
+    doer: doerRow,
+    data,
+    form,
+  });
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLink}/pulls/${result.issue.index}` } }));
+  }
+  if (result.outcome === "failed") {
+    // The head-ref write failed after the D1 commit — the rows are rolled
+    // back, the retryable-unknown state answers the gate's plain-text 500.
+    return new Response(`${result.message}\n`, {
+      status: 500,
+      headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+    });
+  }
+  return respond(
+    c.html(
+      renderComparePage({
+        ctx,
+        data,
+        form,
+        error: result.message,
+        canCreate: data.baseKind === "branch" && data.headKind === "branch",
+        page,
+      }),
+      200,
+    ),
+  );
+}
+
 /**
  * One handler for every claimed GET page family: the parser re-reads the
  * pathname (the route registrations below exist so the sub-app never claims
@@ -2197,8 +2378,16 @@ uiRouter.get("/:owner/:repo/pulls/:index/comments", () => methodNotAllowed("POST
 uiRouter.get("/:owner/:repo/pulls/:index/files", (c) => uiPage(c));
 // Wave-11 verdict-form family (the deeper 4-segment tail under /files — no
 // shorter POST/GET pattern can absorb it; the GET answers chi's 405).
-uiRouter.post("/:owner/:repo/pulls/:index/files/reviews/submit", (c) => pullReviewSubmit(c));
-uiRouter.get("/:owner/:repo/pulls/:index/files/reviews/submit", () => methodNotAllowed("POST"));
+	uiRouter.post("/:owner/:repo/pulls/:index/files/reviews/submit", (c) => pullReviewSubmit(c));
+	uiRouter.get("/:owner/:repo/pulls/:index/files/reviews/submit", () => methodNotAllowed("POST"));
+	// Wave-13 compare family (parseUiRoute claims exactly these shapes; the
+	// bare URL is GET-only — upstream registers `m.Get("/compare")` outside
+	// the POST path group, so a POST answers chi's 405 — and the form always
+	// posts to the basehead URL). The POST runs the §2.8 sameOriginGuard.
+	uiRouter.get("/:owner/:repo/compare", (c) => comparePage(c));
+	uiRouter.post("/:owner/:repo/compare", () => methodNotAllowed("GET"));
+	uiRouter.get("/:owner/:repo/compare/*", (c) => comparePage(c));
+	uiRouter.post("/:owner/:repo/compare/*", (c) => compareSubmit(c));
 // Wave-4 write families (parseUiRoute claims exactly these shapes; the
 // POSTs run the §2.8 sameOriginGuard first — session.ts's convention).
 uiRouter.get("/:owner/:repo/settings", (c) => settingsPage(c));

@@ -220,6 +220,16 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // PR files diff view (wave 5): the PR #4 range diff (the seedGoldenPullDiff
   // fixture pushes docs-seed + refs/pull/4/head ahead of main).
   { file: "pull-files.html", path: "/alice/golden/pulls/4/files", status: 200 },
+  // Compare view (wave 13): the anonymous plain comparison (commits + diff,
+  // "Compare commits" head), the signed-in writer view carrying the new-PR
+  // form (feature/compare — ahead of main, NO PR between the pair), the
+  // signed-in view of the pair whose PR already exists (the has-PR segment
+  // over docs-seed), and the same-tip tag state (v1 sits at main's tip — the
+  // honest nothing-to-compare segment, no diff box).
+  { file: "compare-commits.html", path: "/alice/golden/compare/main...feature/compare", status: 200 },
+  { file: "compare-form.html", path: "/alice/golden/compare/main...feature/compare", status: 200, signedIn: true },
+  { file: "compare-has-pr.html", path: "/alice/golden/compare/main...docs-seed", status: 200, signedIn: true },
+  { file: "compare-nothing.html", path: "/alice/golden/compare/main...v1", status: 200 },
   // 404 shell WITH repo context (the repo resolved, the ref did not, §4.5).
   { file: "not-found-repo.html", path: "/alice/golden/commits/branch/nope", status: 404 },
   // Bare shell: 404 for an unknown owner/repo — navbar/main/footer, no repo
@@ -413,6 +423,67 @@ async function seedGoldenPullDiff(): Promise<void> {
   const body = response.status === 200 ? new TextDecoder().decode(await response.arrayBuffer()) : "";
   if (response.status !== 200 || body.includes("ng ")) {
     throw new Error(`golden PR-diff push failed: ${response.status} ${body.slice(0, 400)}`);
+  }
+}
+
+/**
+ * The wave-13 compare fixture for the compare goldens: a branch ahead of main
+ * with NO pull request between it and main — the compare page's creatable
+ * state (the new-PR form renders for the owner view; the anonymous view
+ * renders the plain commits+diff comparison). The first three commits are
+ * byte-identical to GOLDEN_DIFF_COMMITS (same fixed times/contents → the same
+ * oids, so main's tip IS the merge base), plus one commit editing app.ts and
+ * adding a file. The push is guarded on the branch's existence like
+ * seedGoldenPullDiff; no PR row is created for this pair.
+ */
+const GOLDEN_COMPARE_CHANGE_TS = [
+  "export function main(): void {",
+  '  console.log("hello cf-gitea");',
+  '  console.log("compare fixture line");',
+  "}",
+  "",
+].join("\n");
+const GOLDEN_COMPARE_README_TXT = "Compare fixture notes.\n";
+
+const GOLDEN_COMPARE_COMMITS: SeedCommit[] = [
+  ...GOLDEN_DIFF_COMMITS,
+  {
+    message: "compare: seed the form fixture branch\n\nOne body line for the prefill.",
+    time: T0 + 240,
+    files: [
+      { path: "README.md", content: README },
+      { path: "app.ts", content: GOLDEN_COMPARE_CHANGE_TS },
+      { path: "docs/guide.md", content: GUIDE_MD },
+      { path: "logo.png", content: LOGO_PNG },
+      { path: "notes/readme.txt", content: GOLDEN_COMPARE_README_TXT },
+    ],
+  },
+];
+
+async function seedGoldenCompare(): Promise<void> {
+  const db = drizzle(env.DB);
+  const refs = await env.REPO.getByName("alice/golden").listRefs();
+  const refNames = new Set((refs?.refs ?? []).map((ref) => ref.name));
+  if (refNames.has("refs/heads/feature/compare")) return;
+  const owner = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "alice"))
+    .get();
+  if (owner === undefined) throw new Error("golden owner row missing before the compare push");
+  await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?")
+    .bind(owner.id, "ui-page-seed-golden-compare")
+    .run();
+  const token = (await mintFor(owner.id, "ui-page-seed-golden-compare", "write:repository")).plaintext;
+  const { tips, pack } = await buildHistoryPack(GOLDEN_COMPARE_COMMITS);
+  const response = await SELF.fetch("https://test.local/alice/golden.git/git-receive-pack", {
+    method: "POST",
+    headers: { authorization: basicTokenHeader(token), "content-type": "application/x-git-receive-pack-request" },
+    body: buildReceivePackBody([{ ref: "refs/heads/feature/compare", oid: tips[3] as string }], pack),
+  });
+  const body = response.status === 200 ? new TextDecoder().decode(await response.arrayBuffer()) : "";
+  if (response.status !== 200 || body.includes("ng ")) {
+    throw new Error(`golden compare push failed: ${response.status} ${body.slice(0, 400)}`);
   }
 }
 
@@ -753,6 +824,9 @@ export function setupGoldenFixtures(): void {
     await drizzle(env.DB).update(users).set({ createdAt: new Date(T0 * 1000) }).where(eq(users.id, alice.id));
     await seedGoldenIssues();
     await seedGoldenPullDiff();
+    // Wave-13: the compare fixture branch (feature/compare, no PR between it
+    // and main) — after the PR-diff push it builds on.
+    await seedGoldenCompare();
     await seedGoldenOrg();
     await seedGoldenMilestones();
     await seedGoldenDashboard();
