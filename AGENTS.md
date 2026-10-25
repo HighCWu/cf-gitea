@@ -99,7 +99,14 @@ scripts/               # Repo-level tooling (contract checks, codegen)
   only your paths landed — a sibling's staged files swept into your commit
   (or your commit referencing their untracked file) means STOP and escalate
   to the orchestrator, never attempt history surgery yourself; (5) `tsc
-  --noEmit` is its own gate — vitest does not typecheck across files.
+  --noEmit` is its own gate — vitest does not typecheck across files; (6) a
+  path you legitimately own can still carry a sibling's uncommitted hunk
+  (the admin-org-extras arity fix folded into 9f92950, 2026-10-26): before
+  committing any file another agent may have touched, read
+  `git diff HEAD -- <file>` hunk-by-hunk — every hunk must be yours or a
+  disclosed integration; attribute an unknown hunk first (ask the pool /
+  read the wave log), then fold it in deliberately and say so in the commit
+  message, or re-edit to exclude it.
 - Generated artifacts stay out (see Structure Rules); `pnpm-lock.yaml` IS committed.
 - **Submodule hygiene**: `gitea/` stays pristine — never run installs or builds
   inside it (asset builds run in scratch dirs, `scripts/build-gitea-assets.mjs`);
