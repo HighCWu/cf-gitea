@@ -1,18 +1,19 @@
 import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
-import type { Context, MiddlewareHandler } from "hono";
-import { and, asc, eq, inArray, ne, sql } from "drizzle-orm";
+import type { MiddlewareHandler } from "hono";
+import { and, asc, eq, ne, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
 import { gpgKeys, publicKeys } from "../../db/schema";
+import { loadSubkeys, toApiGpgKey, toApiPublicKey } from "../services/account-keys";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { gpgKeyListSchema } from "../models/gpg-key";
 import { publicKeyListSchema } from "../models/public-key";
 import { userListSchema } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
-import { GO_ZERO_TIME, findUserByName, viewerOf, type UserRow } from "../services/repository";
+import { findUserByName, viewerOf } from "../services/repository";
 import { followUser, listFollowers, unfollowUser } from "../services/follows";
 import { toApiUser } from "../services/user";
 
@@ -31,11 +32,10 @@ import { toApiUser } from "../services/user";
  *     (userListKeys / userListGPGKeys) — REAL reads over the migration-0016
  *     `public_keys`/`gpg_keys` tables (upstream routers/api/v1/user/key.go
  *     listPublicKeys / user/gpg_key.go ListGPGKeys). The row→API mappers are
- *     routes/misc-t3.ts's (`toApiPublicKey` / `toApiGpgKey` / `loadSubkeys`),
- *     copied verbatim below — that module is outside this wave's ownership
- *     (the same precedent as misc-t3's verbatim copies of admin-t2.ts's
- *     private seams); extract to a shared mapper when the account family
- *     consolidates. Upstream visibility: the KEYS are public — the handlers
+ *     the shared account-family layer, services/account-keys.ts (`toApiPublicKey`
+ *     / `toApiGpgKey` / `loadSubkeys` — the consolidation of misc-t3.ts's
+ *     originals, formerly copied verbatim below). Upstream visibility: the
+ *     KEYS are public — the handlers
  *     apply no viewer filter, any authenticated caller lists any assigned
  *     user's keys (listPublicKeys(ctx, ctx.ContextUser), key.go:132-135;
  *     listGPGKeys(ctx, ctx.ContextUser.ID), gpg_key.go:46-72; the api.go
@@ -80,104 +80,9 @@ const listQuery = {
   }),
 } as const;
 
-// ---------------------------------------------------------------------------
-// Row→API mappers — VERBATIM copies of routes/misc-t3.ts's module privates
-// (`toApiPublicKey`/`publicKeyApiLink`, `toApiGpgKey`, `loadSubkeys`; the
-// misc-t3 cite is in each doc comment). misc-t3.ts is outside this wave's
-// ownership, so import is impossible today; the repo precedent for exactly
-// this situation is misc-t3's own verbatim copies of admin-t2.ts's private
-// seams. Extract to a shared mapper when the account family consolidates.
-// ---------------------------------------------------------------------------
-
 /** Upstream KeyTypePrincipal (models/asymkey/ssh_key.go:35; schema.ts
  *  carries the raw-integer mapping). */
 const KEY_TYPE_PRINCIPAL = 3;
-
-function publicKeyApiLink(origin: string): string {
-  return `${origin}/api/v1/user/keys/`;
-}
-
-/** convert.ToPublicKey (convert.go:840-851) + appendPrivateInformation
- *  (key.go:26-47) when the viewer is the owner or a site admin. */
-function toApiPublicKey(
-  c: Context<ApiEnv>,
-  row: typeof publicKeys.$inferSelect,
-  owner: UserRow | null,
-  includePrivate: boolean,
-) {
-  const base = {
-    id: row.id,
-    key: row.content,
-    url: `${publicKeyApiLink(new URL(c.req.url).origin)}${row.id}`,
-    title: row.name,
-    fingerprint: row.fingerprint,
-    created_at: row.createdAt.toISOString(),
-    last_used_at: row.updatedAt.toISOString(),
-  };
-  if (!includePrivate || owner === null) {
-    return base;
-  }
-  return {
-    ...base,
-    user: toApiUser(viewerOf(c), owner),
-    read_only: row.mode === 1,
-    key_type: "user",
-  };
-}
-
-/** convert.ToGPGKey (convert.go:853-890): emails always [] (the parse-time
- *  field is never loaded on reads — misc-t3 module header), expires renders
- *  Go's zero time when the key never expires. */
-function toApiGpgKey(row: typeof gpgKeys.$inferSelect, subkeyRows: typeof gpgKeys.$inferSelect[]) {
-  return {
-    id: row.id,
-    primary_key_id: row.primaryKeyId,
-    key_id: row.keyId,
-    public_key: row.content,
-    emails: [] as { email: string; verified: boolean }[],
-    subkeys: subkeyRows.map((subkey) => ({
-      id: subkey.id,
-      primary_key_id: subkey.primaryKeyId,
-      key_id: subkey.keyId,
-      public_key: subkey.content,
-      emails: [] as { email: string; verified: boolean }[],
-      subkeys: [] as unknown[],
-      can_sign: subkey.canSign,
-      can_encrypt_comms: subkey.canEncryptComms,
-      can_encrypt_storage: subkey.canEncryptStorage,
-      can_certify: subkey.canCertify,
-      verified: subkey.verified,
-      created_at: subkey.createdAt.toISOString(),
-      expires_at: subkey.expiresAt === null ? GO_ZERO_TIME : subkey.expiresAt.toISOString(),
-    })),
-    can_sign: row.canSign,
-    can_encrypt_comms: row.canEncryptComms,
-    can_encrypt_storage: row.canEncryptStorage,
-    can_certify: row.canCertify,
-    verified: row.verified,
-    created_at: row.createdAt.toISOString(),
-    expires_at: row.expiresAt === null ? GO_ZERO_TIME : row.expiresAt.toISOString(),
-  };
-}
-
-/** LoadSubKeys (gpg_key_list.go:22-40) — one IN query grouped by parent. */
-async function loadSubkeys(d1: D1Database, keyIds: string[]): Promise<Map<string, typeof gpgKeys.$inferSelect[]>> {
-  const grouped = new Map<string, typeof gpgKeys.$inferSelect[]>();
-  if (keyIds.length === 0) {
-    return grouped;
-  }
-  const rows = await drizzle(d1)
-    .select()
-    .from(gpgKeys)
-    .where(inArray(gpgKeys.primaryKeyId, keyIds))
-    .orderBy(asc(gpgKeys.id));
-  for (const row of rows) {
-    const list = grouped.get(row.primaryKeyId) ?? [];
-    list.push(row);
-    grouped.set(row.primaryKeyId, list);
-  }
-  return grouped;
-}
 
 const userCurrentListFollowersRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({

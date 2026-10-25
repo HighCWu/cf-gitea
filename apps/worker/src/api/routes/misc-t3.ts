@@ -2,27 +2,32 @@ import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { Context, MiddlewareHandler } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
 import { emailAddresses, gpgKeys, publicKeys, userRedirects, users } from "../../db/schema";
+import { loadSubkeys, toApiGpgKey, toApiPublicKey } from "../services/account-keys";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { gpgKeyListSchema, gpgKeySchema } from "../models/gpg-key";
 import { publicKeyListSchema, publicKeySchema } from "../models/public-key";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
-import { GO_ZERO_TIME, findUserByName, viewerOf } from "../services/repository";
-import { toApiUser } from "../services/user";
+import { findUserByName } from "../services/repository";
 
 /**
  * The user-account key/email family on REAL D1 storage (tables of migration
  * 0016: `email_addresses`, `public_keys`, `gpg_keys` — schema.ts column notes
  * carry the upstream citations). This module is the single home for the
- * account family (the wave brief's "pick one home" decision): the six ops the
- * misc-t3 wave landed as empty-storage stubs (GET/DELETE /user/keys[/{id}],
- * GET/DELETE /user/gpg_keys[/{id}]) are UPGRADED in place to real reads/
- * deletes, and the write half the tables unblock lands beside them:
+ * account-family ROUTES (the wave brief's "pick one home" decision): the six
+ * ops the misc-t3 wave landed as empty-storage stubs (GET/DELETE
+ * /user/keys[/{id}], GET/DELETE /user/gpg_keys[/{id}]) are UPGRADED in place
+ * to real reads/deletes, and the write half the tables unblock lands beside
+ * them. The shared
+ * key/gpg row→API mappers (`toApiPublicKey`/`toApiGpgKey`/`loadSubkeys`) now
+ * live in services/account-keys.ts — the consolidation this module's originals
+ * and identity.ts's verbatim copies converged on (the email row mapper
+ * `toApiEmail` stays here: this module is its only consumer):
  *
  *   - GET/POST/DELETE /user/emails          (userListEmails / userAddEmail /
  *                                             userDeleteEmail — routers/api/v1/
@@ -1335,40 +1340,10 @@ async function deleteEmailAddresses(d1: D1Database, user: UserRow, emailsToRemov
 
 // ---------------------------------------------------------------------------
 // Key service half (user/key.go CreateUserPublicKey + asymkey AddPublicKey,
-// user/gpg_key.go CreateUserGPGKey + asymkey AddGPGKey)
+// user/gpg_key.go CreateUserGPGKey + asymkey AddGPGKey). The row→API mappers
+// (toApiPublicKey/toApiGpgKey/loadSubkeys) live in services/account-keys.ts —
+// the shared account-family home this module's originals consolidated into.
 // ---------------------------------------------------------------------------
-
-function publicKeyApiLink(origin: string): string {
-  return `${origin}/api/v1/user/keys/`;
-}
-
-/** convert.ToPublicKey (convert.go:840-851) + appendPrivateInformation
- *  (key.go:26-47) when the viewer is the owner or a site admin. */
-function toApiPublicKey(
-  c: Context<ApiEnv>,
-  row: typeof publicKeys.$inferSelect,
-  owner: UserRow | null,
-  includePrivate: boolean,
-) {
-  const base = {
-    id: row.id,
-    key: row.content,
-    url: `${publicKeyApiLink(new URL(c.req.url).origin)}${row.id}`,
-    title: row.name,
-    fingerprint: row.fingerprint,
-    created_at: row.createdAt.toISOString(),
-    last_used_at: row.updatedAt.toISOString(),
-  };
-  if (!includePrivate || owner === null) {
-    return base;
-  }
-  return {
-    ...base,
-    user: toApiUser(viewerOf(c), owner),
-    read_only: row.mode === 1,
-    key_type: "user",
-  };
-}
 
 /**
  * asymkey_model.AddPublicKey (ssh_key.go:123-162) reduced to the API path:
@@ -1516,60 +1491,6 @@ async function addGpgKey(
   }
   const first = await db.select().from(gpgKeys).where(eq(gpgKeys.keyId, entities[0]!.keyId)).limit(1);
   return first[0]!;
-}
-
-/** convert.ToGPGKey (convert.go:853-890): emails always [] (the parse-time
- *  field is never loaded on reads — module header), expires renders Go's zero
- *  time when the key never expires. */
-function toApiGpgKey(row: typeof gpgKeys.$inferSelect, subkeyRows: typeof gpgKeys.$inferSelect[]) {
-  return {
-    id: row.id,
-    primary_key_id: row.primaryKeyId,
-    key_id: row.keyId,
-    public_key: row.content,
-    emails: [] as { email: string; verified: boolean }[],
-    subkeys: subkeyRows.map((subkey) => ({
-      id: subkey.id,
-      primary_key_id: subkey.primaryKeyId,
-      key_id: subkey.keyId,
-      public_key: subkey.content,
-      emails: [] as { email: string; verified: boolean }[],
-      subkeys: [] as unknown[],
-      can_sign: subkey.canSign,
-      can_encrypt_comms: subkey.canEncryptComms,
-      can_encrypt_storage: subkey.canEncryptStorage,
-      can_certify: subkey.canCertify,
-      verified: subkey.verified,
-      created_at: subkey.createdAt.toISOString(),
-      expires_at: subkey.expiresAt === null ? GO_ZERO_TIME : subkey.expiresAt.toISOString(),
-    })),
-    can_sign: row.canSign,
-    can_encrypt_comms: row.canEncryptComms,
-    can_encrypt_storage: row.canEncryptStorage,
-    can_certify: row.canCertify,
-    verified: row.verified,
-    created_at: row.createdAt.toISOString(),
-    expires_at: row.expiresAt === null ? GO_ZERO_TIME : row.expiresAt.toISOString(),
-  };
-}
-
-/** LoadSubKeys (gpg_key_list.go:22-40) — one IN query grouped by parent. */
-async function loadSubkeys(d1: D1Database, keyIds: string[]): Promise<Map<string, typeof gpgKeys.$inferSelect[]>> {
-  const grouped = new Map<string, typeof gpgKeys.$inferSelect[]>();
-  if (keyIds.length === 0) {
-    return grouped;
-  }
-  const rows = await drizzle(d1)
-    .select()
-    .from(gpgKeys)
-    .where(inArray(gpgKeys.primaryKeyId, keyIds))
-    .orderBy(asc(gpgKeys.id));
-  for (const row of rows) {
-    const list = grouped.get(row.primaryKeyId) ?? [];
-    list.push(row);
-    grouped.set(row.primaryKeyId, list);
-  }
-  return grouped;
 }
 
 // ---------------------------------------------------------------------------
