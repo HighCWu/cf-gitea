@@ -31,14 +31,28 @@
  *     --token <PAT>         the authenticated credential for all HTTP legs.
  *     --member-token <PAT>  HTTP mode, workload `team` only: a second PAT
  *                           whose user is (or will be made) a MEMBER of the
- *                           bench team on the bench org. The team-access
- *                           predicate only runs for a doer that is NOT the
- *                           org owner — an owner GET short-circuits on
- *                           isOrgOwner — so without this token the team
- *                           phase is SKIPPED with a notice rather than
- *                           measuring the wrong thing (bench-run's "an
+ *                           bench team on the bench org. With it the org
+ *                           repo fixture is seeded PRIVATE (the only state
+ *                           where a team grant matters — a public org repo
+ *                           would measure an anonymous-visible read, not
+ *                           the predicate) and the member is added to the
+ *                           write team. WITHOUT it the team phase is
+ *                           SKIPPED with a notice: the org creator is the
+ *                           bench org's OWNER, and the owner arm outranks
+ *                           the team predicate, so an owner-token leg would
+ *                           measure the wrong thing (bench-run's "an
  *                           anonymous read of a private repo is a 401, not
- *                           a number" rule, applied to predicates).
+ *                           a number" rule, applied to predicates). WITH
+ *                           it, the first untimed member GET doubles as a
+ *                           guard probe: while the repoGet guard resolves
+ *                           the reduced ACL (public/owner/site-admin) and
+ *                           does not consult the team predicate
+ *                           (canViewRepositoryWithTeams still has no route
+ *                           callers — SPEC-0007 §3.5 enforcement landing),
+ *                           the probe 404s and the phase is SKIPPED with
+ *                           that verified reason instead of faking a
+ *                           number; once the guard resolves team grants,
+ *                           this same command measures the real predicate.
  *     --results-dir <dir>   transient results dir (default .bench-results)
  *
  * WORKLOADS (mirroring the real schemas; local mode drives the REAL services
@@ -68,7 +82,9 @@
  *   team    the team-access predicate read (teams ⋈ team_members +
  *           team_repo_access probes). Local: OrgService.teamRepoAccessMode.
  *           Remote: GET /api/v1/repos/{org}/{repo} as the --member-token
- *           user (skipped without it — see above).
+ *           user against the PRIVATE org repo (skipped without the token,
+ *           or skipped with a notice when the repoGet guard still resolves
+ *           the reduced owner/admin ACL — see --member-token above).
  *
  * PHASES per workload: seq (p=1), p=8, p=32 — Promise.all batches.
  * METRICS: per-phase ops/s, p50/p95 latency; local mode additionally
@@ -113,6 +129,43 @@
  *   metering notes); phases are deterministic enough that both phase arms of
  *   a workload report identical totals.
  *
+ * PRODUCTION REFERENCE — first REMOTE run 2026-10-25 (post-hardening,
+ * completed EXIT=0), https://cf-gitea.hecongw.workers.dev, ops=200 per
+ * phase, Node fetch driver, per-run owner + NON-admin member PATs (deleted
+ * after; an admin member would ride the guard's site-admin arm). Timing
+ * only (rows_* not observable over HTTP); network variance — NOT
+ * baseline-comparable, NOT a CI gate.
+ *
+ *   workload  phase  ops/s     p50 ms   p95 ms  retried
+ *   settle    seq      2.00      484      690        0
+ *   settle    p8      10.13      598      811        0
+ *   settle    p32     17.63     1170     2304        0
+ *   issues    seq      1.20      786     1090        0
+ *   issues    p8       4.55     1046     2197        0
+ *   issues    p32     10.63     2033     3060        0
+ *   token     seq      3.75      238      522        0
+ *   token     p8      12.58      257      734        0
+ *   token     p32     16.37      417     3073        0
+ *   list      seq      1.74      535      897        0
+ *   list      p8       4.73     1060     1731        0
+ *   list      p32      5.02     3350     9891      185
+ *   team      —       SKIPPED: the repoGet guard resolves the reduced ACL
+ *                     (public/owner/site-admin) and does not consult the
+ *                     team predicate (see --member-token above) — the
+ *                     predicate is unmeasurable over HTTP today.
+ *
+ *   Honest readings: remote seq ops/s ride the ~450-500ms network RTT
+ *   (ops/s ≈ 1000/RTT per request); parallelism DOES buy write throughput
+ *   here (settle 2.0 → 17.6 ops/s), unlike local workerd's serialized
+ *   writers — production D1 queues concurrent writers. token p32's 3.1s
+ *   p95 and list p32's 9.9s p95 carry the 185 absorbed 500-retries (see
+ *   PRODUCTION MODE (4) for the tail-verified root cause: production D1
+ *   intermittently fails the auth middleware's unguarded failure-limiter
+ *   SELECT under this concurrency) — those tails are contention-shaped,
+ *   not query cost. The list page is the heavy read at both targets
+ *   (~1.7-5 ops/s remote vs ~8-10 ops/s local at the same 633-candidate
+ *   scale).
+ *
  * NO BASELINE GATE: unlike bench-run.mjs there is deliberately no
  * --record/--compare pair yet. The first numbers live in the header above
  * (and in every local run's output) so a follow-up can baseline the suite
@@ -129,10 +182,37 @@
  *         Fixture names are unique per run (d1bench-<hex>-*) so repeat runs
  *         never collide with leftovers.
  *     (3) Fixture cleanup: the created repos are DELETEd and the org is
- *         deleted at the end (best-effort; failures are reported, the run
- *         still exits 0). Team rows that cascaded from the org die with it;
- *         anything left after a mid-run crash carries the d1bench- prefix
- *         for manual cleanup.
+ *         deleted at the end — in a finally, so an aborted phase cleans up
+ *         after itself too (only a hard process kill leaves the d1bench-
+ *         prefix behind for manual cleanup). Team rows that cascaded from
+ *         the org die with it.
+ *     (4) Transient tolerance: connection-layer fetch failures (the request
+ *         never got an HTTP response — undici keep-alive socket races,
+ *         resets, DNS blips; the OBSERVED class live: "Client network socket
+ *         disconnected before secure TLS connection was established" — a
+ *         local TCP/TLS establishment blip, not production) and sporadic
+ *         server-side 5xx (500/502/503/522/524 — observed live: a one-off
+ *         bare 500 on the issues list immediately after a p32 burst, gone on
+ *         the next request) are retried up to 5 attempts with exponential
+ *         backoff (250ms -> 2s cap) and COUNTED per phase (`transientRetries`
+ *         in the log + results JSON); 4xx and expect-listed statuses are
+ *         never retried, so app-level behavior is measured as-is, and the
+ *         create drivers tolerate a retry racing its own dead-socket first
+ *         attempt (tag-unique names). A deterministic 5xx still aborts after
+ *         the 5th attempt. The first production attempt aborted TWICE on the
+ *         connection class — an unbending ~18k-request run is worth less
+ *         than the quota it burns, and a bare "fetch failed" without the
+ *         cause chain is undiagnosable (the fatal handler now prints
+ *         err.cause). ROOT CAUSE of the 500s, verified via `wrangler tail`
+ *         during the completed run: every 500-carrying invocation finishes
+ *         "Ok" (handled response) and renders OUR empty-message internal
+ *         error (api/errors.ts catch-all) — under list-p32 concurrency
+ *         production D1 intermittently fails the auth middleware's
+ *         failure-limiter SELECT (`limiter.check` in src/auth/middleware.ts
+ *         runs unguarded; the `(error) Failed query: select … from
+ *         "auth_failures"` tail lines cluster exactly in the 500 window).
+ *         An auth-robustness fix (catch/fail-open or retry) belongs to the
+ *         SPEC-0002 owners, not this harness; here the retries absorb it.
  *
  * OUTPUT
  *   Full results JSON -> <results-dir>/bench-d1-<local|remote>-<ts>.json
@@ -152,7 +232,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import process from "node:process";
-import { setTimeout as sleep } from "node:timers";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -282,10 +362,11 @@ async function runPhase(workload, phase, n, parallelism, op) {
 function printPhase(m) {
   const rows =
     m.rowsRead === null ? "" : ` rows_read=${m.rowsRead} rows_written=${m.rowsWritten}`;
+  const retried = m.transientRetries > 0 ? ` retried=${m.transientRetries}` : "";
   console.log(
     `[d1-bench] ${m.workload.padEnd(7)} ${m.phase.padEnd(4)} ` +
       `ops/s=${String(m.opsPerSec).padStart(8)} p50=${String(m.p50Ms).padStart(8)}ms ` +
-      `p95=${String(m.p95Ms).padStart(8)}ms wall=${m.wallMs}ms${rows}`,
+      `p95=${String(m.p95Ms).padStart(8)}ms wall=${m.wallMs}ms${rows}${retried}`,
   );
 }
 
@@ -371,31 +452,100 @@ async function runLocalHarness(opts) {
 
 // ---------- HTTP mode: remote/dev-server driver ----------
 
-function makeHttpClient(baseUrl, user, token) {
-  const basic = `Basic ${Buffer.from(`${user}:${token}`).toString("base64")}`;
-  return async function request(method, pathname, body, { auth = basic, expect = [200] } = {}) {
-    const res = await fetch(`${baseUrl}/api/v1${pathname}`, {
-      method,
-      headers: {
-        Authorization: auth,
-        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(60_000),
-    });
-    const text = await res.text();
-    if (!expect.includes(res.status)) {
-      let snippet = text.slice(0, 300);
-      try {
-        snippet = JSON.stringify(JSON.parse(text)).slice(0, 300);
-      } catch { /* raw text */ }
-      throw new Error(`${method} ${pathname} -> ${res.status}, expected ${expect.join("/")}: ${snippet}`);
-    }
-    return res.status === 204 ? null : (JSON.parse(text) ?? null);
-  };
+/** Connection-layer failure classes only — the request never produced an
+ *  HTTP response (undici keep-alive socket races / resets / mid-body socket
+ *  death / DNS blips surface as exactly these two TypeErrors). */
+const TRANSIENT_ATTEMPTS = 8;
+const TRANSIENT_MESSAGES = new Set(["fetch failed", "terminated"]);
+/** Sporadic server-side failures worth the same bounded retry wave: the
+ *  edge's 52x classes plus a bare Worker 500. Observed live (2026-10-25
+ *  production, twice): hitting the issues-list page right after a p32 burst
+ *  500s while D1 drains the burst's backlog — 500, 500, 200 per request for
+ *  ~28 consecutive requests (two different 500 bodies: our JSON
+ *  {"message":""} and a plaintext "Internal Server Error"), each retried
+ *  request succeeding once the drain window passed. A DETERMINISTIC 5xx
+ *  still fails after the 5th attempt; 4xx is never retried. */
+const RETRIABLE_STATUSES = new Set([500, 502, 503, 522, 524]);
+/** Exponential backoff between transient attempts (250ms -> 2s cap). */
+const transientWaitMs = (attempt) => Math.min(250 * 2 ** (attempt - 1), 2000);
+
+function causeChain(error) {
+  const chain = [];
+  let cause = error?.cause;
+  while (cause !== undefined && cause !== null && chain.length < 5) {
+    chain.push(cause instanceof Error ? cause.message : String(cause));
+    cause = cause.cause;
+  }
+  return chain.length === 0 ? "?" : chain.join(" <- ");
 }
 
-async function seedHttpFixtures(request, opts, tag) {
+function makeHttpClient(baseUrl, user, token) {
+  const basic = `Basic ${Buffer.from(`${user}:${token}`).toString("base64")}`;
+  const stats = { transientRetries: 0 };
+  async function request(method, pathname, body, { auth = basic, expect = [200] } = {}) {
+    const url = `${baseUrl}/api/v1${pathname}`;
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    for (let attempt = 1; attempt <= TRANSIENT_ATTEMPTS; attempt++) {
+      let res;
+      let text;
+      try {
+        // Fresh per-attempt init: a retried attempt gets its own full
+        // timeout budget (a shared AbortSignal would carry spent time over).
+        res = await fetch(url, {
+          method,
+          headers: {
+            Authorization: auth,
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          },
+          body: payload,
+          signal: AbortSignal.timeout(60_000),
+        });
+        text = await res.text();
+      } catch (error) {
+        const transient = error instanceof TypeError && TRANSIENT_MESSAGES.has(error.message);
+        if (!transient || attempt === TRANSIENT_ATTEMPTS) {
+          throw new Error(
+            `${method} ${pathname} failed after ${attempt} attempt(s): ${error.message} (cause: ${causeChain(error)})`,
+            { cause: error },
+          );
+        }
+        stats.transientRetries += 1;
+        const waitMs = transientWaitMs(attempt);
+        console.log(
+          `[d1-bench] transient ${error.message} (cause: ${causeChain(error)}) on ${method} ${pathname} — ` +
+            `attempt ${attempt}/${TRANSIENT_ATTEMPTS}, retrying in ${waitMs}ms`,
+        );
+        await sleep(waitMs);
+        continue;
+      }
+      if (!expect.includes(res.status)) {
+        if (RETRIABLE_STATUSES.has(res.status) && attempt < TRANSIENT_ATTEMPTS) {
+          stats.transientRetries += 1;
+          const waitMs = transientWaitMs(attempt);
+          console.log(
+            `[d1-bench] transient ${res.status} on ${method} ${pathname} — ` +
+              `attempt ${attempt}/${TRANSIENT_ATTEMPTS}, retrying in ${waitMs}ms`,
+          );
+          await sleep(waitMs);
+          continue;
+        }
+        let snippet = text.slice(0, 300);
+        try {
+          snippet = JSON.stringify(JSON.parse(text)).slice(0, 300);
+        } catch { /* raw text */ }
+        const error = new Error(`${method} ${pathname} -> ${res.status}, expected ${expect.join("/")}: ${snippet}`);
+        error.status = res.status;
+        throw error;
+      }
+      return res.status === 204 ? null : (JSON.parse(text) ?? null);
+    }
+    throw new Error(`${method} ${pathname}: retry loop exited without a response`);
+  }
+  request.stats = stats;
+  return request;
+}
+
+async function seedHttpFixtures(request, memberRequest, opts, tag) {
   const owner = opts.user;
   const dataRepo = `d1bench-${tag}-data`;
   const orgName = `d1benchorg${tag}`;
@@ -416,23 +566,39 @@ async function seedHttpFixtures(request, opts, tag) {
     await request("POST", `/repos/${owner}/${dataRepo}/issues/${i}/comments`, { body: `seed comment ${i}` }, { expect: [201] });
   }
   for (let i = 0; i < 3; i++) {
-    await request("POST", `/repos/${owner}/${dataRepo}/labels`, { name: `bench-${i}`, color: "#00aabb" }, { expect: [201] });
+    // 422: a retried create that raced its own dead-socket first attempt
+    // (duplicate label name). Names are tag-unique, so nothing else lands
+    // here; the response is unused, so the dup is harmless.
+    await request("POST", `/repos/${owner}/${dataRepo}/labels`, { name: `bench-${i}`, color: "#00aabb" }, { expect: [201, 422] });
   }
   await request("PUT", `/repos/${owner}/${dataRepo}/subscription`, {}, { expect: [200, 201] });
 
-  // Org + team + org repo (the team-access predicate's fixture).
-  await request("POST", "/orgs", { username: orgName }, { expect: [201] });
-  await request("POST", `/orgs/${orgName}/repos`, { name: orgRepo, private: false, auto_init: false }, { expect: [201, 409] });
-  const team = await request("POST", `/orgs/${orgName}/teams`, { name: "write", permission: "write" }, { expect: [201] });
+  // Org + team + org repo (the team-access predicate's fixture). The org is
+  // referenced by name afterwards, so a retried create racing its own first
+  // attempt (409/422 dup) is harmless — the org exists either way.
+  await request("POST", "/orgs", { username: orgName }, { expect: [201, 409, 422] });
+  // The org repo is PRIVATE whenever a member token is in play: the team
+  // grant only matters where public/owner/admin visibility doesn't already
+  // admit the doer (a public org repo would measure an anonymous-visible
+  // read, not the predicate).
+  const orgRepoPrivate = memberRequest !== null;
+  await request("POST", `/orgs/${orgName}/repos`, { name: orgRepo, private: orgRepoPrivate, auto_init: false }, { expect: [201, 409] });
+  let team = await request("POST", `/orgs/${orgName}/teams`, { name: "write", permission: "write" }, { expect: [201, 409, 422] });
+  if (team?.id === undefined) {
+    // A retried create raced its own first attempt (dup 409/422): resolve
+    // the existing team by name instead of failing the run.
+    const teams = await request("GET", `/orgs/${orgName}/teams`);
+    team = (Array.isArray(teams) ? teams : []).find((t) => t?.lower_name === "write" || t?.name === "write");
+  }
   if (team?.id === undefined) throw new Error("team create returned no id");
   await request("PUT", `/teams/${team.id}/repos/${orgName}/${orgRepo}`, undefined, { expect: [204] });
 
   let memberLogin = null;
-  if (opts.memberToken !== null) {
-    const member = await makeHttpClient(opts.baseUrl, opts.user, opts.memberToken)("GET", "/user");
+  if (memberRequest !== null) {
+    const member = await memberRequest("GET", "/user");
     memberLogin = member.login;
     await request("PUT", `/teams/${team.id}/members/${memberLogin}`, undefined, { expect: [204] });
-    console.log(`  fixtures: team member ${memberLogin} added (--member-token user)`);
+    console.log(`  fixtures: team member ${memberLogin} added (--member-token user; org repo private=${orgRepoPrivate})`);
   }
   return { owner, dataRepo, orgName, orgRepo, teamId: team.id, memberLogin };
 }
@@ -449,22 +615,39 @@ async function runHttpBench(opts) {
   const { ops } = opts;
   const tag = randomUUID().replaceAll("-", "").slice(0, 8);
   const request = makeHttpClient(opts.baseUrl, opts.user, opts.token);
+  // One member client for the whole run (seed + the team workload), so its
+  // retries land in the same accounting.
   const memberRequest =
     opts.memberToken !== null ? makeHttpClient(opts.baseUrl, opts.user, opts.memberToken) : null;
-  const fixtures = await seedHttpFixtures(request, opts, tag);
+  const retryTotal = () => request.stats.transientRetries + (memberRequest?.stats.transientRetries ?? 0);
+  const fixtures = await seedHttpFixtures(request, memberRequest, opts, tag);
   const phases = [];
   const settleNames = [];
   let issueCounter = 0;
+  /** Untimed D1-drain wait before the list phase (0 when none was needed). */
+  let listDrainMs = 0;
+
+  // Per-phase measured run with transient-retry accounting: a retried request
+  // stays inside its op's latency sample (honest), and the count travels with
+  // the phase so a retry-shaped tail is visible instead of silent.
+  const measure = async (workload, phase, parallelism, op) => {
+    const before = retryTotal();
+    const metric = await runPhase(workload, phase, ops, parallelism, op);
+    metric.transientRetries = retryTotal() - before;
+    phases.push(metric);
+  };
 
   // ---- workload drivers (one op each; every leg authenticated) ----
   const drivers = {
     // POST /user/repos: the repo-create write path (insert + storage_key
     // derivation + counters seed + engine registry mirror). The settle CAS
-    // UPDATE leg is push-create-only — LOCAL-ONLY (see header).
+    // UPDATE leg is push-create-only — LOCAL-ONLY (see header). 409 is the
+    // retried create racing its own dead-socket first attempt; the name is
+    // tracked below BEFORE the call, so a dup still cleans up.
     settle: async () => {
       const name = `d1b${tag}r${settleNames.length}`;
       settleNames.push(name);
-      await request("POST", "/user/repos", { name, private: false, auto_init: false }, { expect: [201] });
+      await request("POST", "/user/repos", { name, private: false, auto_init: false }, { expect: [201, 409] });
     },
     // POST issue + POST comment on it.
     issues: async () => {
@@ -494,45 +677,114 @@ async function runHttpBench(opts) {
       );
       if (!Array.isArray(page) || page.length > PAGE_LIMIT) throw new Error("list page shape broken");
     },
-    // GET the org repo as a TEAM MEMBER: the repo-GET guard resolves the
-    // doer's access through teamRepoAccessMode (an org owner would
-    // short-circuit on isOrgOwner — see --member-token in the header).
+    // GET the org repo as a TEAM MEMBER: the PRIVATE org repo is visible to
+    // the member only through the team grant, so this IS the team predicate
+    // read — IF the repoGet guard resolves team grants. The untimed probe in
+    // the loop below verifies that before any measured op; while the guard
+    // runs the reduced ACL (public/owner/site-admin) the phase skips instead
+    // of measuring a 404-shaped nothing.
     team: async () => {
-      if (memberRequest === null) return; // skipped; recorded as such
+      if (memberRequest === null) return; // unreachable: the loop skips first
       const repo = await memberRequest("GET", `/repos/${fixtures.orgName}/${fixtures.orgRepo}`);
       if (repo?.full_name === undefined) throw new Error("org repo GET broken");
     },
   };
 
-  for (const [workload, op] of Object.entries(drivers)) {
-    if (workload === "team" && memberRequest === null) {
-      console.log(
-        `[d1-bench] team    SKIP   — no --member-token: an owner/creator GET short-circuits on ` +
-          "isOrgOwner before the team predicate; a faked number is worse than a gap",
-      );
-      continue;
+  // ---- cleanup (untimed, best-effort) — also the abort path: a failed
+  // phase must not leave the fixture namespace behind for manual cleanup. ----
+  const cleanupFixtures = async () => {
+    console.log("cleanup: deleting fixture repos + org");
+    for (const name of settleNames.splice(0)) {
+      await deleteQuietly(request, "DELETE", `/repos/${fixtures.owner}/${name}`);
     }
-    // Warmup (untimed).
-    for (let i = 0; i < 3; i++) await op();
-    phases.push(await runPhase(workload, "seq", ops, 1, op));
-    for (const p of [8, 32]) {
-      phases.push(await runPhase(workload, `p${p}`, ops, p, op));
-    }
-    for (const m of phases.slice(-3)) printPhase(m);
-    // Settle cleanup, per workload (untimed): the created repos go away so
-    // the fixture namespace stays small and repeat phases start clean.
-    if (workload === "settle") {
-      for (const name of settleNames.splice(0)) {
-        await deleteQuietly(request, "DELETE", `/repos/${fixtures.owner}/${name}`);
+    await deleteQuietly(request, "DELETE", `/repos/${fixtures.owner}/${fixtures.dataRepo}`);
+    await deleteQuietly(request, "DELETE", `/repos/${fixtures.orgName}/${fixtures.orgRepo}`);
+    await deleteQuietly(request, "DELETE", `/orgs/${fixtures.orgName}`);
+  };
+
+  try {
+    for (const [workload, op] of Object.entries(drivers)) {
+      if (workload === "team") {
+        if (memberRequest === null) {
+          console.log(
+            `[d1-bench] team    SKIP   — no --member-token: the org creator is the bench org's OWNER and the ` +
+              "owner arm outranks the team predicate; a faked number is worse than a gap",
+          );
+          continue;
+        }
+        // Untimed guard probe: the member's first GET doubles as the check that
+        // the repoGet guard resolves the team grant at all. While it resolves
+        // the reduced ACL (public/owner/site-admin) and never consults the
+        // team predicate (canViewRepositoryWithTeams has no route callers
+        // yet), this 404s — skip with the verified reason instead of faking a
+        // number or aborting a ~15k-request run on fixture visibility.
+        try {
+          await memberRequest("GET", `/repos/${fixtures.orgName}/${fixtures.orgRepo}`);
+        } catch (error) {
+          if (error?.status === 404) {
+            console.log(
+              `[d1-bench] team    SKIP   — member GET on the private org repo -> 404: the repoGet guard ` +
+                "resolves the reduced ACL (public/owner/site-admin) and does not consult the team predicate " +
+                "(canViewRepositoryWithTeams has no route callers yet), so the team grant is invisible over " +
+                "HTTP — the predicate is unmeasurable in production today",
+            );
+            continue;
+          }
+          throw error;
+        }
+      }
+      // Production drain gate (untimed): the list page is the heaviest read
+      // in the bench, and on production D1 it 500s while the issues p32
+      // burst's write backlog drains (observed live 2026-10-25, three runs:
+      // 500,500,200-per-request stretches right after the token p32 phase —
+      // two different 500 bodies, our JSON {"message":""} and a plaintext
+      // "Internal Server Error" — while the same driver + fixture scale runs
+      // GREEN against local workerd/D1, so it is production-D1 contention,
+      // not an app-side size cliff). Probe the measured URL until it answers
+      // 200 (bounded), so the phase measures the query, not the drain.
+      if (workload === "list") {
+        const listUrl =
+          `/repos/${fixtures.owner}/${fixtures.dataRepo}/issues?state=open&type=issues` +
+          `&limit=${PAGE_LIMIT}&page=1`;
+        const drainStart = performance.now();
+        let sawError = false;
+        for (;;) {
+          try {
+            await request("GET", listUrl);
+            break;
+          } catch (error) {
+            const retriableInGate = error?.status === undefined || error?.status === 500;
+            if (!retriableInGate || performance.now() - drainStart > 180_000) throw error;
+            sawError = true;
+          }
+          await sleep(2_000);
+        }
+        if (sawError) {
+          listDrainMs = Math.round(performance.now() - drainStart);
+          console.log(
+            `[d1-bench] drain    — list endpoint healthy after ${listDrainMs}ms (untimed; D1 backlog ` +
+              "drain after the p32 burst, recorded as drain_ms)",
+          );
+        }
+      }
+      // Warmup (untimed).
+      for (let i = 0; i < 3; i++) await op();
+      await measure(workload, "seq", 1, op);
+      for (const p of [8, 32]) {
+        await measure(workload, `p${p}`, p, op);
+      }
+      for (const m of phases.slice(-3)) printPhase(m);
+      // Settle cleanup, per workload (untimed): the created repos go away so
+      // the fixture namespace stays small and repeat phases start clean.
+      if (workload === "settle") {
+        for (const name of settleNames.splice(0)) {
+          await deleteQuietly(request, "DELETE", `/repos/${fixtures.owner}/${name}`);
+        }
       }
     }
+  } finally {
+    await cleanupFixtures();
   }
-
-  // ---- cleanup (untimed, best-effort) ----
-  console.log("cleanup: deleting fixture repos + org");
-  await deleteQuietly(request, "DELETE", `/repos/${fixtures.owner}/${fixtures.dataRepo}`);
-  await deleteQuietly(request, "DELETE", `/repos/${fixtures.orgName}/${fixtures.orgRepo}`);
-  await deleteQuietly(request, "DELETE", `/orgs/${fixtures.orgName}`);
 
   return {
     schema_version: RESULTS_SCHEMA_VERSION,
@@ -541,6 +793,8 @@ async function runHttpBench(opts) {
     ops_per_phase: ops,
     fixtures: { data_repo: `${fixtures.owner}/${fixtures.dataRepo}`, org: fixtures.orgName },
     member_token: opts.memberToken !== null,
+    transient_retries: retryTotal(),
+    drain_ms: listDrainMs,
     runtime: `http ${new Date().toISOString()}`,
     phases: phases.map((m) => ({ ...m, rowsRead: null, rowsWritten: null })),
   };
@@ -593,6 +847,15 @@ if (isMain) {
     .then((code) => process.exit(code))
     .catch((err) => {
       console.error(`[fatal] ${err.message}`);
+      // The full cause chain: undici wraps socket-level failures in a bare
+      // TypeError ("fetch failed") whose .cause carries the actual class
+      // (ECONNRESET vs keep-alive "other side closed" vs DNS) — the first
+      // production aborts were undiagnosable without it.
+      let cause = err.cause;
+      while (cause !== undefined && cause !== null) {
+        console.error(`[fatal]   caused by: ${cause instanceof Error ? cause.message : String(cause)}`);
+        cause = cause.cause;
+      }
       process.exit(1);
     });
 }
