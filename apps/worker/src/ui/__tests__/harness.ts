@@ -224,6 +224,10 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // PR files diff view (wave 5): the PR #4 range diff (the seedGoldenPullDiff
   // fixture pushes docs-seed + refs/pull/4/head ahead of main).
   { file: "pull-files.html", path: "/alice/golden/pulls/4/files", status: 200 },
+  // PR commits tab (the three-tab menu completion): PR #4's merge-base..head
+  // commit list — one commit (docs-seed is main + 1) through the same
+  // listCommitsRange read the compare view's commits table is built on.
+  { file: "pull-commits.html", path: "/alice/golden/pulls/4/commits", status: 200 },
   // Compare view (wave 13): the anonymous plain comparison (commits + diff,
   // "Compare commits" head), the signed-in writer view carrying the new-PR
   // form (feature/compare — ahead of main, NO PR between the pair), the

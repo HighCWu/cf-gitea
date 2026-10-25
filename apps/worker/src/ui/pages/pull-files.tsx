@@ -71,6 +71,10 @@
  * - The tab/toolbar octicons (octicon-comment-discussion/git-commit/diff)
  *   are outside the generated icon allowlist (scripts/gen-ui-icons.mjs is
  *   not a ui/ file) — the tabs and the summary line render text only.
+ * - The Commits tab's count renders upstream's empty branch ("-") on this
+ *   page: the number would cost the commit-range read on every files view
+ *   (the commits page shows the real count — pull-commits.tsx's symmetric
+ *   note).
  * - `?style=split` and the whitespace query family are not honored (the
  *   upstream dropdowns are JS; the unified view is the only shape).
  */
@@ -458,7 +462,7 @@ export function PullFilesPage(props: { ctx: UiContext; data: PullFilesData }) {
     >
       <div class="ui container fluid padded">
         <IssueTitleBar data={titleData} />
-        <PullTabs repoLink={repoLink} issue={data.issue} active="files" filesCount={data.files.length} />
+        <PullTabs repoLink={repoLink} issue={data.issue} active="files" commitsCount={null} filesCount={data.files.length} />
         <div class="diff-detail-box">
           <div class="flex-text-block tw-flex-wrap tw-ml-0.5">
             {!empty ? (

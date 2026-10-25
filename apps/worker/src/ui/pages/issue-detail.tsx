@@ -12,8 +12,9 @@
  * discriminators unconditionally — mirrored verbatim), then inside one
  * `.ui.container`: the `.issue-title-header` (`h1` title + `.index` span,
  * `.issue-title-meta` state label + poster line), the PR tab menu
- * (templates/repo/pulls/tab_menu.tmpl — wave 5: Conversation + Files, the
- * Commits tab stays unrendered because that page does not exist), the
+ * (templates/repo/pulls/tab_menu.tmpl — Conversation + Commits + Files, the
+ * three members in the template's order; the Commits tab links the live
+ * commits page, pages/pull-commits.tsx), the
  * `.issue-content` two-column grid — `.issue-content-left > .comment-list`
  * holding the root issue comment (`#issue-{id}`), the timeline
  * (`.timeline-item.comment` cards for user comments,
@@ -73,12 +74,15 @@
  *   missing route is a dead link) — the timeline items keep the upstream
  *   content structure without the `.timeline-avatar` slots.
  * - The PR conversation tab menu (`repo/pulls/tab_menu.tmpl`) renders the
- *   live tabs only (wave 5): Conversation and Files (the files page exists —
- *   pages/pull-files.tsx); the Commits tab would be a dead link (no commits
- *   page) and is not rendered. The tab icons (octicon-comment-discussion /
- *   octicon-git-commit / octicon-diff) are outside the generated icon
- *   allowlist (scripts/gen-ui-icons.mjs is not a ui/ file) — the tabs render
- *   text + count labels only.
+ *   three tabs (Conversation + Commits + Files — the commits page exists,
+ *   pages/pull-commits.tsx). The engine-cost counts render upstream's empty
+ *   branch ("-"): the Commits count would cost the commit-range read on
+ *   every conversation view and the Files count the full diff read (the
+ *   commits/files pages show the real counts — the wave-5 posture, now
+ *   symmetric). The tab icons (octicon-comment-discussion / octicon-git-
+ *   commit / octicon-diff) are outside the generated icon allowlist
+ *   (scripts/gen-ui-icons.mjs is not a ui/ file) — the tabs render text +
+ *   count labels only.
  * - The PR files count on the tab menu renders upstream's empty branch ("-"):
  *   the number would cost the full engine diff read on every conversation
  *   view (the files page shows the real count).
@@ -201,8 +205,10 @@ export const issueDetailLocale = {
   archive_issue_nocomment: "This repo is archived. You cannot comment on issues.", // "repo.archive.issue.nocomment"
   archive_pull_nocomment: "This repo is archived. You cannot comment on pull requests.", // "repo.archive.pull.nocomment"
   sign_in_require: " to join this conversation.", // "repo.issues.sign_in_require_desc" tail (the <a> prefix renders separately)
-  // Tab menu ("repo.pulls.tab_conversation" / "repo.pulls.tab_files").
+  // Tab menu ("repo.pulls.tab_conversation" / "repo.pulls.tab_commits" /
+  // "repo.pulls.tab_files").
   tab_conversation: "Conversation",
+  tab_commits: "Commits",
   tab_files: "Files Changed",
   save: "Save", // "repo.issues.save" (the no-JS label form's submit)
   comment_placeholder: "", // "repo.diff.comment.placeholder" left empty: the plain-textarea reduction (new-issue pattern)
@@ -691,24 +697,33 @@ export function IssueTitleBar(props: { data: IssueTitleData }) {
   );
 }
 
-/** The PR conversation tab menu (`repo/pulls/tab_menu.tmpl` reduced to the
- *  live tabs: Conversation + Files — the Commits page does not exist and
- *  dead links are not emitted; the tab octicons are outside the generated
- *  allowlist, so the items render text + count only). The Files count on
- *  the conversation page renders upstream's empty branch "-" — the real
- *  count would cost the full engine diff read here (the files page shows
- *  it). */
-export function PullTabs(props: { repoLink: string; issue: IssueRow; active: "conversation" | "files"; filesCount: number | null }) {
-  const conversationHref = `${props.repoLink}/pulls/${props.issue.index}`;
-  const filesHref = `${props.repoLink}/pulls/${props.issue.index}/files`;
+/** The PR tab menu (`repo/pulls/tab_menu.tmpl`, the three members in the
+ *  template's order: Conversation + Commits + Files — the commits page is
+ *  live, pages/pull-commits.tsx). The engine-cost counts render upstream's
+ *  empty branch "-": the Commits count would cost the commit-range read on
+ *  every conversation view, the Files count the full diff read (each page
+ *  shows its own real count; the wave-5 posture, now symmetric). The tab
+ *  octicons are outside the generated allowlist — text + count only. */
+export function PullTabs(props: {
+  repoLink: string;
+  issue: IssueRow;
+  active: "conversation" | "commits" | "files";
+  commitsCount: number | null;
+  filesCount: number | null;
+}) {
+  const base = `${props.repoLink}/pulls/${props.issue.index}`;
   return (
     <div class="ui pull tabs container">
       <div class="ui top attached pull tabular menu">
-        <a class={props.active === "conversation" ? "active item" : "item"} href={conversationHref}>
+        <a class={props.active === "conversation" ? "active item" : "item"} href={base}>
           {issueDetailLocale.tab_conversation}
           <span class="ui small label">{props.issue.numComments}</span>
         </a>
-        <a class={props.active === "files" ? "active item" : "item"} href={filesHref}>
+        <a class={props.active === "commits" ? "active item" : "item"} href={`${base}/commits`}>
+          {issueDetailLocale.tab_commits}
+          <span class="ui small label">{props.commitsCount === null ? "-" : props.commitsCount}</span>
+        </a>
+        <a class={props.active === "files" ? "active item" : "item"} href={`${base}/files`}>
           {issueDetailLocale.tab_files}
           <span class="ui small label">{props.filesCount === null ? "-" : props.filesCount}</span>
         </a>
@@ -1147,7 +1162,7 @@ export function IssueDetailPage(props: {
       <div class="ui container">
         <IssueTitleBar data={data} />
         {data.issue.isPull ? (
-          <PullTabs repoLink={repoLink} issue={data.issue} active="conversation" filesCount={null} />
+          <PullTabs repoLink={repoLink} issue={data.issue} active="conversation" commitsCount={null} filesCount={null} />
         ) : null}
         <div class="issue-content">
           <div class="issue-content-left">

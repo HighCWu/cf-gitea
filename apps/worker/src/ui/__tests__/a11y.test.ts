@@ -34,6 +34,7 @@ import notificationsReadGolden from "./goldens/notifications-read.html?raw";
 import notificationsUnreadGolden from "./goldens/notifications-unread.html?raw";
 import orgHomeEmptyGolden from "./goldens/org-home-empty.html?raw";
 import orgHomeGolden from "./goldens/org-home.html?raw";
+import pullCommitsGolden from "./goldens/pull-commits.html?raw";
 import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullReviewSignedInGolden from "./goldens/pull-review-signed-in.html?raw";
@@ -59,6 +60,8 @@ const goldens: Record<string, string> = {
   "pull-detail.html": pullDetailGolden,
   "pull-review-signed-in.html": pullReviewSignedInGolden,
   "pull-files.html": pullFilesGolden,
+  // The PR commits tab (the three-tab menu completion).
+  "pull-commits.html": pullCommitsGolden,
   "org-home.html": orgHomeGolden,
   "org-home-empty.html": orgHomeEmptyGolden,
   "user-profile.html": userProfileGolden,

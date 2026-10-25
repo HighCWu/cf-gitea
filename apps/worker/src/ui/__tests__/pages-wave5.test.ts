@@ -571,10 +571,11 @@ describe("PR files page (/pulls/{index}/files)", () => {
     // Issue #2 addressed in the files family → 404 (the route is pulls-only;
     // the cross-family redirect stays the detail route's behavior).
     expect((await fetchUi("/alice/wave5/pulls/2/files")).status).toBe(404);
-    // The commits sub-page tail stays unclaimed (no commits page).
-    const commits = await fetchUi("/alice/wave5/pulls/1/commits");
-    expect(commits.status).toBe(404);
-    expect(await commits.text()).not.toContain("diff-file-box");
+    // The deeper commits sub-tails stay engine-owned (the bare
+    // /pulls/{index}/commits tab is its own family — pages-pull-commits.test.ts).
+    const deep = await fetchUi("/alice/wave5/pulls/1/commits/nope");
+    expect(deep.status).toBe(404);
+    expect(await deep.text()).not.toContain("diff-file-box");
   });
 });
 

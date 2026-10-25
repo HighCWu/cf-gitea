@@ -52,6 +52,11 @@
  *                                          (pages/pull-files.tsx — wave 5;
  *                                          the landed pullRequestDiff
  *                                          service)
+ *   /:owner/:repo/pulls/{index}/commits    PR commits tab, GET (pages/
+ *                                          pull-commits.tsx — the three-tab
+ *                                          menu completion; the landed
+ *                                          listCommitsRange over the PR's
+ *                                          merge base and refs/pull head)
  *   /:owner/:repo/milestones               milestones list, GET (pages/
  *                                          milestones.tsx — wave 6; the
  *                                          landed listRepoMilestones read;
@@ -392,6 +397,7 @@ import {
   renderNewIssuePage,
 } from "./pages/new-issue";
 import { loadPullFilesData, renderPullFilesPage } from "./pages/pull-files";
+import { loadPullCommitsData, renderPullCommitsPage } from "./pages/pull-commits";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
 import {
   applyRepoBasics,
@@ -563,6 +569,31 @@ export interface PullFilesRoute {
   owner: string;
   repo: string;
   index: number;
+}
+
+/** The PR commits tab family (pages/pull-commits.tsx): upstream's
+ *  `/{index}/commits` GET under the pulls group (web.go ViewPullCommits,
+ *  routers/web/repo/pull.go:631-668) — the tab menu's middle member. */
+export interface PullCommitsRoute {
+  family: "pull-commits";
+  owner: string;
+  repo: string;
+  index: number;
+}
+
+/** The wave-16 branches family (pages/branches.tsx): upstream's
+ *  `m.Get("/branches", repo.Branches)` list page plus the
+ *  `m.Post("/branches/delete", repo.DeleteBranchPost)` write (web.go:1478-
+ *  1482's group). The bare URL is the list (anonymous-capable); the delete
+ *  rides the literal `/delete` tail (upstream's exact shape; the branch
+ *  name rides the form field — Go's FormString reads upstream's
+ *  query-string carrier too). Every other tail (`/branches/abc`,
+ *  `/_new/*`, `/restore`) stays engine-owned — upstream's
+ *  unregistered-route 404. */
+export interface BranchesRoute {
+  family: "branches" | "branch-delete";
+  owner: string;
+  repo: string;
 }
 
 /** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
@@ -754,6 +785,7 @@ export type ParsedUiRoute =
   | IssueCommentRoute
   | IssueLabelsRoute
   | PullFilesRoute
+  | PullCommitsRoute
   | PullReviewRoute
   | MilestonesRoute
   | MilestoneNewRoute
@@ -765,7 +797,8 @@ export type ParsedUiRoute =
   | UserSettingsRoute
   | OrgTeamsRoute
   | OrgLabelsRoute
-  | CompareRoute;
+  | CompareRoute
+  | BranchesRoute;
 
 
 /**
@@ -940,6 +973,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       const index = Number.parseInt(rest[0] as string, 10);
       if (rest[1] === "comments") return { family: "issue-comment", owner, repo, urlKind: head, index };
       if (head === "pulls" && rest[1] === "files") return { family: "pull-files", owner, repo, index };
+      if (head === "pulls" && rest[1] === "commits") return { family: "pull-commits", owner, repo, index };
     }
     // Wave-11: the review verdict form POST (web.go:1678 — the
     // /pulls/{index}/files/reviews group's /submit tail; the GET new_comment
@@ -2809,6 +2843,14 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
     return respond(c.html(renderPullFilesPage({ ctx, data }), 200));
   }
+  // The PR commits tab (render.tsx never sees this family; non-pull rows and
+  // unresolvable base/head refs 404-shell — pull-commits.tsx header, the
+  // upstream ViewPullCommits NotFound arm).
+  if (route.family === "pull-commits") {
+    const data = await loadPullCommitsData(c.env, repo, route.index, url.searchParams.get("page"));
+    if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(c.html(renderPullCommitsPage({ ctx, data }), 200));
+  }
 
   // U3 page switch (render.tsx — home | commits | src), with the 404 shell
   // for unresolvable refs/paths (§4.5).
@@ -2914,6 +2956,9 @@ uiRouter.post("/:owner/:repo/pulls/:index/comments", (c) => issueCommentSubmit(c
 uiRouter.get("/:owner/:repo/issues/:index/comments", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/pulls/:index/comments", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/pulls/:index/files", (c) => uiPage(c));
+// The PR commits tab (parseUiRoute claims exactly this shape — GET only,
+// like every read page).
+uiRouter.get("/:owner/:repo/pulls/:index/commits", (c) => uiPage(c));
 // Wave-11 verdict-form family (the deeper 4-segment tail under /files — no
 // shorter POST/GET pattern can absorb it; the GET answers chi's 405).
 	uiRouter.post("/:owner/:repo/pulls/:index/files/reviews/submit", (c) => pullReviewSubmit(c));

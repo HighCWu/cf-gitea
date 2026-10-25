@@ -307,14 +307,15 @@ describe("pull request detail (/pulls/{index})", () => {
     expect(html).toContain('<a class="active item" href="/alice/wave3/pulls" data-shortcut-keys="g p">');
     // The PR body renders through the shared pipeline.
     expect(html).toContain("Implements the thing.");
-    // Wave 5: the reduced tab menu (Conversation + Files — the Commits page
-    // does not exist, its tab is not a dead link emitted; text-only items,
-    // the tab octicons are outside the generated allowlist).
+    // Wave 5: the reduced tab menu (text-only items — the tab octicons are
+    // outside the generated allowlist). The PR commits tab wave completes
+    // the three members: the Commits tab links the live commits page
+    // (pages/pull-commits.tsx), its count riding the "-" branch here (the
+    // engine read cost — the commits page shows the real count).
     expect(html).toContain('<div class="ui pull tabs container">');
     expect(html).toContain('<a class="active item" href="/alice/wave3/pulls/3">Conversation<span class="ui small label">0</span></a>');
+    expect(html).toContain('<a class="item" href="/alice/wave3/pulls/3/commits">Commits<span class="ui small label">-</span></a>');
     expect(html).toContain('<a class="item" href="/alice/wave3/pulls/3/files">Files Changed<span class="ui small label">-</span></a>');
-    // …and no Commits tab (that page does not exist — no dead links).
-    expect(html).not.toContain('/alice/wave3/pulls/3/commits');
   });
 
   it("renders the closed PR: closed state with the closed-PR glyph and no merge box", async () => {
