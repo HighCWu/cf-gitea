@@ -4,6 +4,10 @@
  *
  *   GET/POST /{owner}/{repo}/settings        the basics form (this module)
  *   GET/POST /{owner}/{repo}/settings/hooks  the webhooks list + add form
+ *   GET/POST /{owner}/{repo}/settings/mirror the mirror panel (wave 10 —
+ *                                            below; the brief's dedicated
+ *                                            sub-page for options.tmpl's
+ *                                            Mirror Settings section)
  *
  * ## DOM contract (templates/repo/settings/{layout_head,navbar,options}.tmpl
  *  + webhook/{base,base_list,settings,new}.tmpl + webhook/gitea.tmpl at the
@@ -64,6 +68,25 @@
  *   (push-only); the event radio/checkbox matrix is not rendered. Name,
  *   target URL, POST content type, secret and the active flag are the form's
  *   fields — the same field names the upstream gitea.tmpl posts.
+ *
+ * ## The mirror panel (wave 10 — options.tmpl's Mirror Settings section)
+ *
+ * The brief's dedicated `/settings/mirror` sub-page (upstream at this pin
+ * renders the section inside options.tmpl with no navbar item — the navbar
+ * item and the `repository settings mirror` discriminator are the documented
+ * divergence). Data is the landed `getMirrorStatus` (the exact arm GET
+ * /api/v1/repos/{owner}/{repo}/mirror serves — never a self-fetch); the
+ * Synchronize Now POST is upstream handleSettingsPostMirrorSync
+ * (setting.go:379-390) over the API's mirror-sync arm's queue enqueue
+ * (routes/mirror.ts:282-300 — inlined there is no service function; the
+ * same-origin guard rides the write families' posture). The API exposes NO
+ * settings-write arm (no PUT /repos/{owner}/{repo}/mirror landed — the
+ * registerMirror row comment "PATCH owns it" is aspirational), so the edit
+ * form (prune/interval/address/auth/LFS) renders as the honest absence note
+ * and the current interval/prune values as read-only lines; dead controls
+ * are forbidden (§2.4.1). `?sync=queued` renders the upstream
+ * pull_mirror_sync_in_progress flash text as an info message (the flash
+ * reduction — no session-flash plumbing exists; the param is display-only).
  */
 
 import { inArray, sql } from "drizzle-orm";
@@ -72,8 +95,11 @@ import { drizzle } from "drizzle-orm/d1";
 import { ApiError } from "../../api/errors";
 import { createRepoHook, hookEventsArray, listRepoHooks, type WebhookRow } from "../../api/services/hooks";
 import { collaboratorModeOf } from "../../api/services/repo-collaborators";
+import { getMirrorStatus, type MirrorStatus } from "../../api/services/mirror";
 import { loadRepoSettings, saveRepoSettings } from "../../api/services/repo-settings";
 import { RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
+import { timeSinceParts } from "../page-data";
+import { TimeSince } from "../components/file-list";
 import { webhookDeliveries } from "../../db/schema";
 import type { RepoRow, UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
@@ -201,8 +227,12 @@ export function renderRepoSettingsPage(options: {
 }
 
 /** The settings navbar (repo/settings/navbar.tmpl reduced to the live items
- *  — the header comment's dead-link rule). */
-function SettingsNav(props: { repoLink: string; active: "options" | "hooks" }) {
+ *  — the header comment's dead-link rule; wave 10 adds the Mirror item —
+ *  the brief's `/settings/mirror` sub-page; upstream at this pin renders
+ *  mirror settings as a SECTION of options.tmpl, no navbar item, so the
+ *  item text is the options section's own "Mirror Settings" header and the
+ *  placement (last) keeps the upstream relative order intact). */
+function SettingsNav(props: { repoLink: string; active: "options" | "hooks" | "mirror" }) {
   return (
     <div class="flex-container-nav">
       <div class="ui fluid vertical menu">
@@ -212,6 +242,9 @@ function SettingsNav(props: { repoLink: string; active: "options" | "hooks" }) {
         </a>
         <a class={props.active === "hooks" ? "active item" : "item"} href={`${props.repoLink}/settings/hooks`}>
           {settingsLocale.hooks}
+        </a>
+        <a class={props.active === "mirror" ? "active item" : "item"} href={`${props.repoLink}/settings/mirror`}>
+          {mirrorLocale.mirror_settings}
         </a>
       </div>
     </div>
@@ -435,6 +468,211 @@ export function HooksSettingsPage(props: { ctx: UiContext; data: HooksSettingsDa
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      </div>
+    </BaseLayout>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The mirror sub-page (GET/POST /settings/mirror — pages wave 10)
+// ---------------------------------------------------------------------------
+
+/** Page chrome text (options.tmpl's Mirror Settings section at the pin;
+ *  cf-gitea additions marked). */
+export const mirrorLocale = {
+  mirror_settings: "Mirror Settings", // "repo.settings.mirror_settings"
+  mirrored_repository: "Mirrored repository", // "repo.settings.mirror_settings.mirrored_repository"
+  direction: "Direction", // "repo.settings.mirror_settings.direction"
+  direction_pull: "Pull", // "repo.settings.mirror_settings.direction.pull"
+  last_update: "Last update", // "repo.settings.mirror_settings.last_update"
+  sync_mirror: "Synchronize Now", // "repo.settings.sync_mirror"
+  sync_in_progress: "Pulling changes from the remote %s at the moment.", // "repo.settings.pull_mirror_sync_in_progress"
+  mirror_interval: "Interval", // "repo.mirror_interval" (the label, %s-minimum tail dropped — no editable field)
+  mirror_prune: "Prune", // "repo.mirror_prune"
+  mirror_prune_desc: "Remove obsolete remote-tracking references", // "repo.mirror_prune_desc"
+  last_synced: "Last Synchronized", // "repo.mirror_last_synced"
+  not_a_mirror: "This repository is not a pull mirror.", // cf-gitea addition
+  not_a_mirror_attach: "Attach one through the API: POST /api/v1/repos/{owner}/{repo}/migrate with mirror=true on an empty repository.", // cf-gitea addition
+  archived_mirrors_unavailable: "Mirrors are not available if the repo is archived.", // "repo.settings.archive.mirrors_unavailable"
+  editing_unavailable:
+    "Editing the interval, prune or source address is not supported yet: the mirror API exposes no settings-write arm (no PUT /repos/{owner}/{repo}/mirror landed).", // cf-gitea addition (the honest absence)
+  sync_state: "Sync state", // cf-gitea addition
+  next_sync: "Next sync", // cf-gitea addition
+  not_scheduled: "Not scheduled", // cf-gitea addition
+  never_synced: "Never", // cf-gitea addition
+  last_error: "Last error", // cf-gitea addition
+  queue_missing: "The mirror sync queue is not configured on this deployment.", // cf-gitea addition
+} as const;
+
+/** The mirror page's render inputs: the sync_state row (or null = not a
+ *  mirror) and whether the POST queued a sync (the `?sync=queued` flash
+ *  reduction — no session-flash plumbing exists). */
+export interface MirrorSettingsData {
+  status: MirrorStatus | null;
+  syncQueued: boolean;
+}
+
+/** Load the mirror panel (§3.2 — the landed getMirrorStatus read; the same
+ *  arm GET /api/v1/repos/{owner}/{repo}/mirror serves). */
+export async function loadMirrorSettings(d1: D1Database, repoId: string, syncQueued = false): Promise<MirrorSettingsData> {
+  return { status: await getMirrorStatus(d1, repoId), syncQueued };
+}
+
+export type MirrorSyncResult =
+  | { outcome: "queued" }
+  | { outcome: "not-mirror" | "archived" } // upstream NotFound arms (setting.go:381)
+  | { outcome: "no-queue" | "enqueue-failed" }; // the 500 family
+
+/** Structural shape of the MIRROR_SYNC_QUEUE producer side (the generated
+ *  Env's Queue binding narrowed to the send half; the one message the sync
+ *  channel carries is sync.ts's `{kind: "mirror-sync", repoId}` literal). */
+export interface MirrorSyncQueue {
+  send(message: unknown): Promise<unknown>;
+}
+
+/**
+ * The Synchronize Now write (upstream handleSettingsPostMirrorSync —
+ * AddPullMirrorToQueue — over the landed channel): the exact guard order of
+ * the API's POST /repos/{owner}/{repo}/mirror-sync arm (routes/mirror.ts:282-300
+ * — push permission already held, the settings gate is strictly stronger),
+ * then the queue message `{kind: "mirror-sync", repoId}` on MIRROR_SYNC_QUEUE
+ * inlined from that arm (the consumer CAS re-guards every state). There is NO
+ * landed service function for the enqueue — the API route inlines it the
+ * same way.
+ */
+export async function syncMirrorNow(
+  d1: D1Database,
+  queue: MirrorSyncQueue | undefined,
+  repo: RepoRow,
+): Promise<MirrorSyncResult> {
+  if (repo.isArchived) return { outcome: "archived" };
+  if (!(await getMirrorStatus(d1, repo.id))) return { outcome: "not-mirror" };
+  if (!queue) return { outcome: "no-queue" };
+  try {
+    await queue.send({ kind: "mirror-sync", repoId: repo.id });
+  } catch {
+    return { outcome: "enqueue-failed" };
+  }
+  return { outcome: "queued" };
+}
+
+/** The mirror panel (§2.4.1 discriminator: `repository settings mirror` —
+ *  upstream renders the section on options.tmpl; the brief's dedicated
+ *  sub-page keeps the settings layout pair). The sync_state row renders the
+ *  upstream table (remote address | Pull | last update | Synchronize Now)
+ *  plus the status lines the API's MirrorStatus carries; the edit form
+ *  (prune/interval/address — options.tmpl's second row) renders as the
+ *  honest absence note: no settings-write arm exists. */
+export function renderMirrorSettingsPage(options: {
+  ctx: UiContext;
+  data: MirrorSettingsData;
+  error: string | null;
+}): string {
+  return renderPage(<MirrorSettingsPage ctx={options.ctx} data={options.data} error={options.error} />);
+}
+
+/** Absolute stamp for the table's Last update cell (DateUtils.FullTime's
+ *  shape at the TimeSince text format — the fixed-zone absolute the other
+ *  pages render). */
+function fullTime(iso: string): string {
+  return timeSinceParts(Math.floor(Date.parse(iso) / 1000), "+0000").text;
+}
+
+function MirrorSettingsPage(props: { ctx: UiContext; data: MirrorSettingsData; error: string | null }) {
+  const { ctx, data } = props;
+  const repo = ctx.repo;
+  if (repo === undefined) throw new Error("MirrorSettingsPage requires ctx.repo");
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  const status = data.status;
+  return (
+    <BaseLayout ctx={ctx} title={mirrorLocale.mirror_settings} pageClass="repository settings mirror">
+      <div class="ui container flex-container">
+        <SettingsNav repoLink={repoLink} active="mirror" />
+        <div class="flex-container-main">
+          <h4 class="ui top attached header">{mirrorLocale.mirror_settings}</h4>
+          <div class="ui attached segment">
+            {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
+            {data.syncQueued && status !== null ? (
+              <div class="ui info message">
+                {mirrorLocale.sync_in_progress.replace("%s", status.original_url)}
+              </div>
+            ) : null}
+            {repo.isArchived ? <div class="ui warning message tw-text-center">{mirrorLocale.archived_mirrors_unavailable}</div> : null}
+            {status === null ? (
+              <div>
+                <p>{mirrorLocale.not_a_mirror}</p>
+                <p class="tw-text-placeholder-text">{mirrorLocale.not_a_mirror_attach}</p>
+              </div>
+            ) : (
+              <>
+                {/* options.tmpl's pull-mirror table row (the working-mirror
+                    tbody): address | direction | last update | sync form. */}
+                <table class="ui table">
+                  <thead>
+                    <tr>
+                      <th class="tw-w-2/5" scope="col">{mirrorLocale.mirrored_repository}</th>
+                      <th scope="col">{mirrorLocale.direction}</th>
+                      <th scope="col">{mirrorLocale.last_update}</th>
+                      <th scope="col"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>{status.remote_address}</td>
+                      <td>{mirrorLocale.direction_pull}</td>
+                      <td>{fullTime(status.updated_at)}</td>
+                      <td class="tw-text-right">
+                        <form method="post" class="tw-inline-block" action={`${repoLink}/settings/mirror`}>
+                          <button type="submit" class="ui primary tiny button inline">
+                            {mirrorLocale.sync_mirror}
+                          </button>
+                        </form>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                {/* The sync status lines (the API MirrorStatus's operational
+                    half — sanitized: no credentials ever reach this row). */}
+                <div class="ui meta info message">
+                  <div class="tw-flex-1">
+                    {mirrorLocale.sync_state}: {status.sync_state}
+                  </div>
+                  <div class="tw-flex-1">
+                    {mirrorLocale.next_sync}:{" "}
+                    {status.next_sync_at === 0 ? (
+                      mirrorLocale.not_scheduled
+                    ) : (
+                      <TimeSince unixSeconds={status.next_sync_at} tz="+0000" />
+                    )}
+                  </div>
+                  <div class="tw-flex-1">
+                    {mirrorLocale.last_synced}:{" "}
+                    {status.last_sync_at === null ? (
+                      mirrorLocale.never_synced
+                    ) : (
+                      <TimeSince unixSeconds={status.last_sync_at} tz="+0000" />
+                    )}
+                  </div>
+                  <div class="tw-flex-1">
+                    {mirrorLocale.mirror_interval}: {status.mirror_interval}
+                  </div>
+                  <div class="tw-flex-1">
+                    {mirrorLocale.mirror_prune} ({mirrorLocale.mirror_prune_desc}): {status.enable_prune ? "✓" : "✗"}
+                  </div>
+                  {status.last_error !== null ? (
+                    <div class="tw-flex-1 tw-text-red">
+                      {mirrorLocale.last_error}: {status.last_error}
+                    </div>
+                  ) : null}
+                </div>
+                {/* The honest absence: options.tmpl's edit form (prune
+                    checkbox, interval, address, auth) has no landed write arm
+                    — rendered read-only, never dead controls (§2.4.1). */}
+                <p class="tw-text-placeholder-text">{mirrorLocale.editing_unavailable}</p>
+              </>
+            )}
           </div>
         </div>
       </div>

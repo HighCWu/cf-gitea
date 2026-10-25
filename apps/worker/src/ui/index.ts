@@ -101,6 +101,33 @@
  *                                          navbar Explore item anchors the
  *                                          repos page for both viewer
  *                                          kinds)
+ *   /notifications                         notifications mailbox, GET
+ *                                          (pages/notifications.tsx —
+ *                                          wave 10; upstream web.go:1784-
+ *                                          1791's reqSignIn group —
+ *                                          anonymous 303s onto /login;
+ *                                          `?div-only=1` answers the bare
+ *                                          #notification_div fragment the
+ *                                          official bundle's live refresh
+ *                                          fetches)
+ *   /notifications/new                     unread-count JSON, GET (`{new:
+ *                                          N}` — upstream NewAvailable,
+ *                                          notification.go:433-446; the
+ *                                          navbar bell's live-count hook)
+ *   /notifications/status                  per-row mark read/unread/pin,
+ *                                          POST (upstream
+ *                                          NotificationStatusPost — the
+ *                                          answer is the fresh div
+ *                                          fragment the bundle morphs in;
+ *                                          GET → 405)
+ *   /notifications/purge                   mark-all-read, POST (upstream
+ *                                          NotificationPurgePost — the
+ *                                          JSONRedirect shape; GET → 405)
+ *   /:owner/:repo/settings/mirror          mirror panel, GET + POST
+ *                                          (pages/settings.tsx — wave 10;
+ *                                          admin viewer only; the Synchronize
+ *                                          Now POST enqueues the landed
+ *                                          mirror-sync message)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -161,7 +188,7 @@ import { users } from "../db/schema";
 import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
 import { AssetBuildError, loadManifest } from "./manifest";
-import { pathEscapeSegments } from "./page-data";
+import { parsePageNumber, pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
 import { sameOriginGuard } from "./session";
@@ -184,6 +211,17 @@ import {
   renderIssueDetailPage,
   resolveIssueDetailAccess,
 } from "./pages/issue-detail";
+import {
+  countUnreadNotifications,
+  loadNotificationsData,
+  markNotificationThread,
+  parseFormBool,
+  parseNotificationPageType,
+  parseNotificationStatusForm,
+  purgeNotifications,
+  renderNotificationDiv,
+  renderNotificationsPage,
+} from "./pages/notifications";
 import { loadIssuesListData, renderIssuesListPage } from "./pages/issues-list";
 import {
   createMilestoneFromForm,
@@ -215,11 +253,15 @@ import {
   canAdminRepo,
   createHookFromForm,
   loadHooksSettings,
+  loadMirrorSettings,
   loadRepoBasics,
+  mirrorLocale,
   parseCreateHookForm,
   parseRepoBasicsForm,
   renderHooksSettingsPage,
+  renderMirrorSettingsPage,
   renderRepoSettingsPage,
+  syncMirrorNow,
 } from "./pages/settings";
 import { findIssueByRepoAndIndex } from "../api/services/issues";
 import { findPullRequestByIndex } from "../api/services/pulls";
@@ -298,10 +340,11 @@ export interface IssueNewRoute {
   repo: string;
 }
 
-/** The wave-4 settings families (pages/settings.tsx): the basics form and
- *  the webhooks sub-page, each GET + POST — admin-viewer-only surfaces. */
+/** The wave-4 settings families (pages/settings.tsx): the basics form, the
+ *  webhooks sub-page, and — wave 10 — the mirror panel, each GET + POST —
+ *  admin-viewer-only surfaces. */
 export interface SettingsRoute {
-  family: "settings" | "settings-hooks";
+  family: "settings" | "settings-hooks" | "settings-mirror";
   owner: string;
   repo: string;
 }
@@ -399,6 +442,23 @@ export interface SiteHomeRoute {
   family: "site-home";
 }
 
+/** The wave-10 notifications family (pages/notifications.tsx): upstream's
+ *  web notifications group (web.go:1784-1791, reqSignIn) at the literal
+ *  `/notifications` — the list page; `/notifications/new` the unread-count
+ *  JSON; `/notifications/status` + `/notifications/purge` the POST-only
+ *  writes. Claimed as EXACT literals before the owner-home parse could read
+ *  `/notifications` as a username (the explore precedent; the literals bind
+ *  case-sensitively, so `/Notifications` stays an owner home) and before the
+ *  repo-scoped parse could read `/notifications/status` as an
+ *  owner/repo pair — the dispatcher consults `handlesUiRoute` for those
+ *  two-segment shapes, so the claims keep the sub-app's reach equal to the
+ *  parser's. The deeper tails (`subscriptions`, `watching`) are not in this
+ *  slice and stay unclaimed → the engine answers, exactly upstream's
+ *  unregistered-route 404. */
+export interface NotificationsRoute {
+  family: "notifications" | "notification-new" | "notification-status" | "notification-purge";
+}
+
 /** The wave-9 explore family (pages/explore.tsx): upstream's route group
  *  `m.Group("/explore", …)` (web.go:549-556) — the bare `/explore` redirects
  *  onto `/explore/repos`, which renders the repo search page;
@@ -437,7 +497,8 @@ export type ParsedUiRoute =
   | OwnerHomeRoute
   | FileEditorRoute
   | SiteHomeRoute
-  | ExploreRoute;
+  | ExploreRoute
+  | NotificationsRoute;
 
 
 /**
@@ -474,6 +535,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 2) return { family: "explore-root" };
     if (raw.length === 3 && raw[2] === "repos") return { family: "explore-repos" };
     if (raw.length === 3 && raw[2] === "users") return { family: "explore-users" };
+    return null;
+  }
+
+  // The wave-10 notifications family (pages/notifications.tsx — upstream
+  // web.go:1784-1791): the same exact-literal posture as explore above. The
+  // two-segment POST tails MUST be claimed here — the dispatcher consults
+  // handlesUiRoute for two-segment paths, and the unclaimed shape would read
+  // as an owner/repo pair and fall to the git gate.
+  if (raw[1] === "notifications") {
+    if (raw.length === 2) return { family: "notifications" };
+    if (raw.length === 3 && raw[2] === "new") return { family: "notification-new" };
+    if (raw.length === 3 && raw[2] === "status") return { family: "notification-status" };
+    if (raw.length === 3 && raw[2] === "purge") return { family: "notification-purge" };
     return null;
   }
 
@@ -550,6 +624,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (head === "settings") {
     if (rest.length === 0) return { family: "settings", owner, repo };
     if (rest.length === 1 && rest[0] === "hooks") return { family: "settings-hooks", owner, repo };
+    // Wave 10: the mirror panel (the brief's literal URL; upstream renders
+    // the section on options.tmpl — pages/settings.tsx's divergence note).
+    if (rest.length === 1 && rest[0] === "mirror") return { family: "settings-mirror", owner, repo };
     return null;
   }
   // Wave-6: the milestones list (the bare URL, `?state=` carries the facet)
@@ -807,7 +884,25 @@ async function resolveUiSession(c: Context<{ Bindings: Env }>): Promise<Resolved
     const resolution = await resolveViewer(c.env, c.req.raw, { waitUntil });
     setCookie = resolution.setCookie;
     viewer = resolution.viewer;
-    ctx = { viewer: resolution.viewer, origin: url.origin, assets: shellAssetsFromManifest(manifest) };
+    // The wave-10 navbar bell's unread count (head_navbar_icons.tmpl's
+    // `.notification_count`): the derived-thread COUNT per signed-in request
+    // — the same one-query cost upstream's PageGlobalData carries
+    // (pages/notifications.tsx header). A failed read degrades to null (the
+    // badge renders hidden — upstream NewAvailable's {new: 0} error arm).
+    let notificationCount: number | null = null;
+    if (viewer.kind === "user") {
+      try {
+        notificationCount = await countUnreadNotifications(c.env.DB, viewer.id);
+      } catch {
+        notificationCount = null;
+      }
+    }
+    ctx = {
+      viewer: resolution.viewer,
+      origin: url.origin,
+      notificationCount,
+      assets: shellAssetsFromManifest(manifest),
+    };
   } catch (error) {
     if (error instanceof AssetBuildError) return { ok: false, response: assetsNotBuilt(error) };
     throw error;
@@ -990,6 +1085,53 @@ async function hooksSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   const data = await loadHooksSettings(c.env.DB, repo.id);
   data.form = { name: form.name, payloadUrl: form.payloadUrl, contentType: form.contentType };
   return respond(c.html(renderHooksSettingsPage({ ctx, data, error: result.message }), 200));
+}
+
+/** GET /{owner}/{repo}/settings/mirror (pages/settings.tsx — the wave-10
+ *  mirror panel; the settings gate + `?sync=queued` flash reduction). */
+async function mirrorSettingsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const syncQueued = resolved.url.searchParams.get("sync") === "queued";
+  const data = await loadMirrorSettings(c.env.DB, resolved.repo.id, syncQueued);
+  return resolved.respond(c.html(renderMirrorSettingsPage({ ctx: resolved.ctx, data, error: null }), 200));
+}
+
+/**
+ * POST /{owner}/{repo}/settings/mirror — Synchronize Now (upstream
+ * handleSettingsPostMirrorSync, setting.go:379-390): the mirror-sync enqueue
+ * through syncMirrorNow; success 303s back with the `?sync=queued` flash
+ * (upstream's Flash.Info + Redirect), the not-a-mirror/archived refusals
+ * 404-shell exactly upstream's NotFound arm, the queue-side failures answer
+ * the gate's 500 plain-text shape.
+ */
+async function mirrorSyncSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const result = await syncMirrorNow(c.env.DB, c.env.MIRROR_SYNC_QUEUE, repo);
+  if (result.outcome === "queued") {
+    return respond(
+      new Response(null, {
+        status: 303,
+        headers: { location: `/${repo.ownerNamespace}/${repo.slug}/settings/mirror?sync=queued` },
+      }),
+    );
+  }
+  if (result.outcome === "not-mirror" || result.outcome === "archived") {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const message = result.outcome === "no-queue" ? mirrorLocale.queue_missing : "mirror sync enqueue failed";
+  return new Response(`${message}\n`, {
+    status: 500,
+    headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+  });
 }
 
 /** GET on a POST-only family — upstream chi answers 405 for a registered
@@ -1251,6 +1393,95 @@ async function exploreUsersPage(c: Context<{ Bindings: Env }>): Promise<Response
   return respond(c.html(renderExploreUsersPage(ctx, data), 200));
 }
 
+// ---------------------------------------------------------------------------
+// The wave-10 notifications family (pages/notifications.tsx — upstream
+// web.go:1784-1791's reqSignIn group)
+// ---------------------------------------------------------------------------
+
+/** GET /notifications — upstream Notifications (user/notification.go:38-46):
+ *  the signed-in mailbox; anonymous 303s onto the login round-trip. The
+ *  `?div-only=1` arm answers the bare `#notification_div` fragment the
+ *  official bundle's live table refresh fetches (features/notification.ts). */
+async function notificationsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const pageType = parseNotificationPageType(url.searchParams.get("type"));
+  const page = parsePageNumber(url.searchParams.get("page"));
+  const sequenceNumber = url.searchParams.get("sequence-number") ?? "";
+  // The navbar resolution already computed the unread count for this
+  // request — one COUNT, not two (pages/notifications.tsx loader).
+  const data = await loadNotificationsData(c.env.DB, viewer.id, pageType, page, ctx.notificationCount ?? undefined);
+  if (parseFormBool(url.searchParams.get("div-only"))) {
+    return respond(c.html(renderNotificationDiv(data, sequenceNumber), 200));
+  }
+  return respond(c.html(renderNotificationsPage(ctx, data, sequenceNumber), 200));
+}
+
+/** GET /notifications/new — upstream NewAvailable (notification.go:433-446):
+ *  the unread count as `{new: N}` JSON for the bundle's live badge; a failed
+ *  read degrades `{new: 0}` exactly like upstream's error arm. */
+async function notificationsNew(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const count = await countUnreadNotifications(c.env.DB, viewer.id).catch(() => 0);
+  return respond(c.json({ new: count }, 200));
+}
+
+/**
+ * POST /notifications/status — upstream NotificationStatusPost
+ * (notification.go:167-189): the per-row status write (mark_as_read /
+ * mark_as_unread / pin through the landed SetNotificationStatus semantics),
+ * then the FRESH DIV FRAGMENT as the answer (upstream renders
+ * tplNotificationDiv; the bundle's fetch-action JS morphs it into the page
+ * via the form's `data-fetch-sync`). An id that is not the caller's mailbox
+ * thread 404-shells (the landed API PATCH's miss family — existence hidden;
+ * upstream answers ServerError here, the documented divergence), an unknown
+ * action is ignored with an empty 200 (upstream `default: return`).
+ */
+async function notificationStatusSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const { id, action } = parseNotificationStatusForm(await readUrlEncodedForm(c.req.raw));
+  if (action === null) {
+    // Unknown action — ignored with an empty 200 (upstream `default: return`).
+    return respond(new Response(null, { status: 200 }));
+  }
+  const marked = await markNotificationThread(c.env.DB, viewer.id, { id, action }, new Date());
+  if (!marked) return respond(c.html(renderNotFound(ctx), 404));
+  // The re-render keeps the current query's tab/page/sequence (upstream
+  // prepareUserNotificationsData over the posted PageQueryParams).
+  const pageType = parseNotificationPageType(url.searchParams.get("type"));
+  const page = parsePageNumber(url.searchParams.get("page"));
+  const sequenceNumber = url.searchParams.get("sequence-number") ?? "";
+  const data = await loadNotificationsData(c.env.DB, viewer.id, pageType, page);
+  return respond(c.html(renderNotificationDiv(data, sequenceNumber), 200));
+}
+
+/**
+ * POST /notifications/purge — upstream NotificationPurgePost
+ * (notification.go:191-199): every unread thread marked read, answered with
+ * the JSONRedirect shape (`{"redirect": …}`, context.go:239-241) the
+ * bundle's link-action JS follows.
+ */
+async function notificationPurgeSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  await purgeNotifications(c.env.DB, viewer.id, new Date());
+  return respond(c.json({ redirect: "/notifications" }, 200));
+}
+
 /**
  * POST /{owner}/{repo}/{issues|pulls}/{index}/comments (pages/issue-detail.tsx
  * — upstream NewComment, routers/web/repo/issue_comment.go:37-118): the §2.8
@@ -1417,6 +1648,17 @@ uiRouter.get("/", (c) => siteHomePage(c));
 uiRouter.get("/explore", () => exploreRoot());
 uiRouter.get("/explore/repos", (c) => exploreReposPage(c));
 uiRouter.get("/explore/users", (c) => exploreUsersPage(c));
+// Wave-10 notifications family (parseUiRoute claims exactly these literal
+// shapes; registered with the wave-9 statics so the literals beat the
+// dynamic owner/repo and owner regexes — the wave-9 RegExpRouter note). The
+// POST-only write tails answer GET with chi's 405 (the same convention the
+// comment/label write families carry).
+uiRouter.get("/notifications", (c) => notificationsPage(c));
+uiRouter.get("/notifications/new", (c) => notificationsNew(c));
+uiRouter.post("/notifications/status", (c) => notificationStatusSubmit(c));
+uiRouter.post("/notifications/purge", (c) => notificationPurgeSubmit(c));
+uiRouter.get("/notifications/status", () => methodNotAllowed("POST"));
+uiRouter.get("/notifications/purge", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));
@@ -1453,6 +1695,10 @@ uiRouter.get("/:owner/:repo/settings", (c) => settingsPage(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
+// Wave-10 mirror panel (parseUiRoute claims exactly this shape; the same
+// settings gate as the other two sub-pages).
+uiRouter.get("/:owner/:repo/settings/mirror", (c) => mirrorSettingsPage(c));
+uiRouter.post("/:owner/:repo/settings/mirror", (c) => mirrorSyncSubmit(c));
 // Wave-6 milestones families (parseUiRoute claims exactly these shapes; the
 // static literal registers before any deeper dynamic tail could — there is
 // none this slice, the shape is kept for the reasons above).

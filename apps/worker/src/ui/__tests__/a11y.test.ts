@@ -22,11 +22,14 @@ import landingGolden from "./goldens/landing.html?raw";
 import milestonesClosedGolden from "./goldens/milestones-closed.html?raw";
 import milestonesOpenGolden from "./goldens/milestones-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
+import notificationsReadGolden from "./goldens/notifications-read.html?raw";
+import notificationsUnreadGolden from "./goldens/notifications-unread.html?raw";
 import orgHomeEmptyGolden from "./goldens/org-home-empty.html?raw";
 import orgHomeGolden from "./goldens/org-home.html?raw";
 import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
+import settingsMirrorGolden from "./goldens/settings-mirror.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
 import userProfileGolden from "./goldens/user-profile.html?raw";
 import { GOLDEN_CASES } from "./harness";
@@ -53,6 +56,9 @@ const goldens: Record<string, string> = {
   "dashboard.html": dashboardGolden,
   "explore-repos.html": exploreReposGolden,
   "explore-users.html": exploreUsersGolden,
+  "notifications-unread.html": notificationsUnreadGolden,
+  "notifications-read.html": notificationsReadGolden,
+  "settings-mirror.html": settingsMirrorGolden,
 };
 
 function classList(el: { attrs: Record<string, string> }): string[] {

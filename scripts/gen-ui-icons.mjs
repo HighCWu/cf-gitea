@@ -56,10 +56,17 @@ const repoRoot = path.resolve(scriptDir, '..');
 // profile avatar placeholder glyph (octicon-person — the org placeholder's
 // user twin). Wave 8 (web file editor) adds the file-view write actions'
 // glyphs (view_file.tmpl:72-84 CanContentChange block): pencil (edit), trash
-// (delete) and the tree chrome's New File mark (plus).
+// (delete) and the tree chrome's New File mark (plus). Wave 10
+// (notifications page + mirror panel) adds the notifications family's
+// glyphs (the navbar bell, the mark-all checklist, the row pin mark, the
+// empty-tab inbox, the mark-as-unread bell reuse) and the mirror panel's
+// sync mark is the existing clock — the five additions below cover the
+// notifications grep under apps/worker/src/ui.
 const ALLOWLIST = [
+  'octicon-bell',
   'octicon-calendar',
   'octicon-check',
+  'octicon-checklist',
   'octicon-clock',
   'octicon-code',
   'octicon-dot-fill',
@@ -71,6 +78,7 @@ const ALLOWLIST = [
   'octicon-git-pull-request-draft',
   'octicon-globe',
   'octicon-history',
+  'octicon-inbox',
   'octicon-issue-closed',
   'octicon-issue-opened',
   'octicon-link',
@@ -80,6 +88,7 @@ const ALLOWLIST = [
   'octicon-organization',
   'octicon-pencil',
   'octicon-person',
+  'octicon-pin',
   'octicon-plus',
   'octicon-repo',
   'octicon-three-bars',

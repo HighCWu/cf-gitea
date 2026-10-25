@@ -52,5 +52,11 @@ export interface UiContext {
    *  header + tab strip, mirroring upstream's `{{if .IsRepo}}` in the 404
    *  and page templates. */
   repo?: RepoRow;
+  /** Signed-in viewers only: the unread-notification count for the navbar
+   *  bell (pages wave 10 — head_navbar_icons.tmpl's `.notification_count`
+   *  badge; upstream PageGlobalData.GetNotificationUnreadCount parity, one
+   *  COUNT per signed-in request). Absent/null = anonymous or a degraded
+   *  count — the badge renders hidden (upstream's tw-hidden-at-0 shape). */
+  notificationCount?: number | null;
   assets: ShellAssets;
 }

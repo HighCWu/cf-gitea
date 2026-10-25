@@ -69,6 +69,8 @@ export const locale = {
   //  in — head_navbar.tmpl:2's `{{if .IsSigned}}` switch)
   explore: "Explore", // "explore_title" (the navbar Explore item, both
   //  viewer kinds — head_navbar.tmpl:31)
+  notifications: "Notifications", // "notifications" (the wave-10 navbar
+  //  bell's tooltip/aria-label — head_navbar_icons.tmpl:44)
 } as const;
 
 /** The complete client i18n surface: `window.config.i18n` carries exactly

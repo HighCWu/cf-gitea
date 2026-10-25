@@ -26,7 +26,7 @@ import { beforeAll } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { issues, repositories, users } from "../../db/schema";
+import { issues, repositories, repoMirrors, users } from "../../db/schema";
 import { type UiManifest } from "../manifest";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import {
@@ -215,6 +215,15 @@ export const GOLDEN_CASES: GoldenCase[] = [
   { file: "dashboard.html", path: "/", status: 200, signedIn: true },
   { file: "explore-repos.html", path: "/explore/repos", status: 200 },
   { file: "explore-users.html", path: "/explore/users", status: 200 },
+  // Notifications (wave 10): the signed-in unread tab (alice's one anvil
+  // thread — the derived-thread read, the tab badge and the mark-all button)
+  // and the empty read tab (upstream's empty-placeholder branch). Both
+  // signed-in — the mailbox is per-user; the bell renders in the navbar.
+  { file: "notifications-unread.html", path: "/notifications?type=unread", status: 200, signedIn: true },
+  { file: "notifications-read.html", path: "/notifications?type=read", status: 200, signedIn: true },
+  // Mirror panel (wave 10): the signed-in admin view of alice/golden's
+  // mirror row (the table, the status lines, the honest-absence note).
+  { file: "settings-mirror.html", path: "/alice/golden/settings/mirror", status: 200, signedIn: true },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
@@ -547,6 +556,42 @@ async function seedGoldenDashboard(): Promise<void> {
   await drizzle(env.DB).update(users).set({ createdAt: new Date(T0 * 1000) }).where(eq(users.id, morgan.id));
 }
 
+/**
+ * The wave-10 mirror fixture: alice/golden carries a pull-mirror row with
+ * every timestamp pinned to T0-derived values (the settings/mirror page
+ * renders them verbatim — §5.2 determinism is a fixture property). The row
+ * is read only by the mirror panel and the sync sweep (never by another
+ * golden), so adding it changes no existing bytes. Idempotent by the
+ * repo_id UNIQUE.
+ */
+async function seedGoldenMirror(): Promise<void> {
+  const db = drizzle(env.DB);
+  const repo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "golden")))
+    .get();
+  if (repo === undefined) throw new Error("golden repo row missing before mirror seeding");
+  const existing = await db.select({ repoId: repoMirrors.repoId }).from(repoMirrors).where(eq(repoMirrors.repoId, repo.id)).get();
+  if (existing !== undefined) return;
+  await db.insert(repoMirrors).values({
+    repoId: repo.id,
+    intervalSeconds: 28800,
+    enablePrune: true,
+    lfsEnabled: false,
+    lfsEndpoint: null,
+    remoteAddress: "https://mirrors.example/golden.git",
+    credentialsUsername: null,
+    credentialsCiphertext: null,
+    syncState: "idle",
+    nextSyncAt: T0 + 28800,
+    lastSyncAt: T0,
+    lastError: null,
+    createdAt: new Date(T0 * 1000),
+    updatedAt: new Date((T0 + 60) * 1000),
+  });
+}
+
 /** Idempotent seeding for both files (goldens.test.ts + a11y.test.ts). */
 export function setupGoldenFixtures(): void {
   beforeAll(async () => {
@@ -584,6 +629,7 @@ export function setupGoldenFixtures(): void {
     await seedGoldenOrg();
     await seedGoldenMilestones();
     await seedGoldenDashboard();
+    await seedGoldenMirror();
     // Wave 7: the user-profile golden renders the shared/repo/list rows'
     // "Updated {TimeSince}" from `repositories.updated_at` — the issue and
     // milestone seeders above stamp it with wall-clock time (the counter-

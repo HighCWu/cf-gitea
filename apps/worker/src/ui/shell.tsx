@@ -152,9 +152,17 @@ function Head(props: { ctx: UiContext; title: string }) {
  * Requests items (head_navbar.tmpl:11-18) stay unrendered — their dashboard
  * pages do not exist. The Help item keeps its landed placement (navbar-left,
  * both viewer kinds — upstream moves it into the signed-in user dropdown,
- * which is degraded away).
+ * which is degraded away). Wave 10 (the notifications unlock): the
+ * notifications bell anchors `/notifications` at upstream's head_navbar_icons
+ * position (between the two navbar lists) for signed-in viewers —
+ * `octicon-bell` + the `.notification_count` badge, hidden at 0
+ * (head_navbar_icons.tmpl:41-48; the badge is the bundle's live-count hook —
+ * initNotificationCount targets `.notification_count`). The count comes in
+ * through UiContext (`notificationCount` — null/absent renders it hidden;
+ * the aria-label is additive, the upstream anchor's only name is its
+ * tooltip).
  */
-export function Navbar(props: { viewer: Viewer; activeNav?: "explore" }) {
+export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificationCount?: number | null }) {
   const logoLabel = props.viewer.kind === "user" ? locale.dashboard : locale.home_title;
   return (
     <nav id="navbar" aria-label={locale.navbar_aria}>
@@ -172,6 +180,16 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore" }) {
           {locale.help}
         </a>
       </div>
+      {props.viewer.kind === "user" ? (
+        <a class="item" href="/notifications" data-tooltip-content={locale.notifications} data-shortcut-keys="g n" aria-label={locale.notifications}>
+          <div class="tw-relative flex-text-block">
+            <Icon name="octicon-bell" />
+            <span class={props.notificationCount ? "notification_count" : "notification_count tw-hidden"}>
+              {props.notificationCount ?? 0}
+            </span>
+          </div>
+        </a>
+      ) : null}
       <div class="navbar-list navbar-right">
         {props.viewer.kind === "anonymous" ? (
           <a class="item" href="/login">
@@ -333,6 +351,14 @@ export function BaseLayout(props: {
    *  `.PageIsExplore`). */
   activeNav?: "explore";
   children?: Child;
+  /** Upstream `#notification_div` (wave 10 — the notifications page's
+   *  role=main div IS `notification_div`, notification.tmpl's root; the
+   *  bundle's live-update morph targets the id). Absent on every other
+   *  page — the attribute is omitted, byte-identical DOM. */
+  mainId?: string;
+  /** The div's `data-sequence-number` (upstream FormString
+   *  "sequence-number" passthrough — the JS discards stale fragments). */
+  mainDataSequence?: string;
 }) {
   const { ctx } = props;
   const pageTitle = ctx.repo ? `${ctx.repo.ownerNamespace}/${ctx.repo.slug}` : locale.app_name;
@@ -343,11 +369,13 @@ export function BaseLayout(props: {
       <body>
         <div class="full height">
           <noscript>{locale.enable_javascript}</noscript>
-          <Navbar viewer={ctx.viewer} activeNav={props.activeNav} />
+          <Navbar viewer={ctx.viewer} activeNav={props.activeNav} notificationCount={ctx.notificationCount} />
           <div
             role="main"
             aria-label={props.title ?? pageTitle}
             class={props.pageClass === undefined ? "page-content" : `page-content ${props.pageClass}`}
+            id={props.mainId}
+            data-sequence-number={props.mainDataSequence}
           >
             {ctx.repo ? <RepoHeader ctx={ctx} activeTab={props.activeTab} /> : null}
             {props.children}
