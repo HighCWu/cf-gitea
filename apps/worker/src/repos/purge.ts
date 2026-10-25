@@ -27,6 +27,7 @@
 
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
 import { handleImportTask, isImportMessage } from "./imports/pipeline";
+import { isForkMessage, runForkTask } from "./fork-task";
 import { RepoNotExistError, RepoService, type RepoRow } from "./service";
 
 /** Queue message (REPO_TASKS): what the delete pipeline must purge.
@@ -142,6 +143,15 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         console.error(`[repo-tasks] import task ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
         message.retry();
       }
+      continue;
+    }
+    if (isForkMessage(message.body)) {
+      // runForkTask owns its ack/retry policy (fork-task.ts) — a throw
+      // retries only this message. Without this arm the fork message fell
+      // through to the malformed-purge drop: POST /forks answered 202 and
+      // the replication NEVER ran (repo stuck 'creating') — found by the
+      // webhook-emissions wave's survey, 2026-10-25.
+      await runForkTask(env, message.body, message);
       continue;
     }
     if (isMirrorSyncMessage(message.body)) {
