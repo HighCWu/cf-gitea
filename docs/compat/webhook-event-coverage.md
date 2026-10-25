@@ -4,7 +4,8 @@ Audit refreshed 2026-10-25 (first edition 2026-10-24). Emission set current thro
 (release + label + status `705eb9c`; repository/fork/pull_request_sync `308fa21`; API branch/tag
 create/delete `c16f1e5`; comment edit/delete + tag push pairs + branch rename pair `1ea2b12`;
 milestone + assign events `812f999`/`7242825` — the wave that was in-flight when this refresh
-started landed mid-audit, so its rows are marked EMITTED, not "in-flight"). Upstream pin: `gitea`
+started landed mid-audit, so its rows are marked EMITTED, not "in-flight"; this refresh closes
+the `repository` migrate question by parity ANALYSIS — no emission needed, see the row). Upstream pin: `gitea`
 submodule at `fc4936884584a41931906553d96c2601d750e6ef` (v1.22.0-rc1-3919-gfc49368845) — unchanged
 since the first edition; every upstream and worker citation below was re-verified in-tree at HEAD.
 
@@ -54,7 +55,7 @@ since the first edition; every upstream and worker citation below was re-verifie
 | `pull_request_sync` | PullRequestSynchronized:835→:845 (fired by the push that updates a PR head branch; EventSource = the PR's BASE repo) | PullRequestPayload | **EMITTED** (was NOT-EMITTED, closed `308fa21`) — `webhooks-push.ts` `emitPullRequestSyncs:430`, emit `:479-489` (action `synchronized`, before/after oids, base-repo routing for fork heads, open github-flow PRs whose head is the pushed branch), invoked `:393-395` on branch updates inside `emitPushFamilyUpdates`; rides both trigger paths (`:546` user push, `mirror/sync.ts:390` mirror) | landed; tests: `webhooks-push.test.ts:800-831` | P2 |
 | `pull_request_review_request` | PullRequestReviewRequest:793→:815 | PullRequestPayload | **N/A** — no review-request feature | PR-review wave | P2 |
 | `wiki` | NewWikiPage:534→:536; EditWikiPage:547→:549; DeleteWikiPage:560→:562 (callers `routers/web/repo/wiki.go:683` etc.) | WikiPayload (`hook.go:535`) | **N/A** — no wiki feature (no wiki routes in `src/api/routes/`) | the future wiki wave (routes own the seam) | P2 |
-| `repository` | CreateRepository:114→:116; DeleteRepository:126→:127; RenameRepository:137→:138; MigrateRepository:149→:151 (fork case: :103) | RepositoryPayload (`hook.go:566`) | **EMITTED-PARTIAL** (was NOT-EMITTED; create/rename/delete closed `308fa21`/`9e23010`) — `services/repo-events.ts` (`emitRepoEvent:118`, `emitRepoEventInline:152`): created `api/routes/user-repos.ts:209` + `api/routes/org-repos.ts:225` + push-create settle `src/git-http/gate.ts:621`; renamed `api/routes/repo.ts:439` (`changes.name.from`); deleted `repo.ts:535`. Partial because the migrate route (`api/routes/imports.ts`) landed and emits nothing (0 emit calls); transfer stays silent upstream-faithfully (NullNotifier no-op, documented in the repo-events header) | tests: `api/repo-edit.test.ts:288`/`:376`, `git-http/gate.test.ts:540-580`; remaining seam: one `emitRepoEvent` in the migrate-completion path | P2 |
+| `repository` | CreateRepository:114→:116; DeleteRepository:126→:127; RenameRepository:137→:138; MigrateRepository:149→:151 (fork case: :103) | RepositoryPayload (`hook.go:566`) | **EMITTED** (was EMITTED-PARTIAL; the "migrate gap" closed by parity analysis, NOT emission — 2026-10-25 refresh) — `services/repo-events.ts` (`emitRepoEvent:118`, `emitRepoEventInline:152`): created `api/routes/user-repos.ts:209` + `api/routes/org-repos.ts:225` + push-create settle `src/git-http/gate.ts:621`; renamed `api/routes/repo.ts:439` (`changes.name.from`); deleted `repo.ts:535`; transfer stays silent upstream-faithfully (NullNotifier no-op, documented in the repo-events header). **Migrate analysis**: upstream fires MigrateRepository→`HookRepoCreated` exactly once, at task completion (`routers/api/v1/repo/migrate.go` → `services/task/task.go:60` → `services/task/migrate.go:57` → `services/notify/notify.go:377` → `notifier.go:149-151`); the migration's own repo row is created model-layer (`services/migrations/migrate.go`, no notifier call). Our migrated-repo journeys (client-chunked import `api/routes/imports.ts`; into-empty mirror attach `api/routes/mirror.ts:121`) create NO repo rows — the only `repositories` INSERT is `repos/service.ts:272`, whose callers (POST /repos user/org, push-create settle, fork) each announce their event — so the created event already fires exactly once per migration, at repo birth. Emitting again at import completion would double-fire a duplicate upstream never produces. **Documented divergence (timing, not presence)**: our created fires at birth (empty payload — itself upstream-shaped: plain POST /repos without auto_init fires created empty too), upstream's at completion (populated payload). The unlanded SPEC-0009 §2.2/§2.6 server-driven migrate creates the repo row itself, so ITS finalize step owns the single created (`emitRepoEvent`, per SPEC-0009 §2.6 step 4) | tests: `api/repo-edit.test.ts:288`/`:376`, `git-http/gate.test.ts:540-580`, `repos/imports/imports.test.ts` (migrate-surface silence guard: no deliveries from the import create/settle arms) | P2 |
 | `release` | sendReleaseHook:872→:879 (shared; NewRelease:889, UpdateRelease:893, DeleteRelease:897; callers `services/release/release.go:198`, `:363`, `:366`, `:437`) | ReleasePayload (`hook.go:332`) | **EMITTED** (was NOT-EMITTED, closed `705eb9c`) — `api/routes/releases.ts` `emitReleaseWebhook:191` (→ `:203`), `emitReleaseEvent:236` with the drafts-stay-silent guard `:241`: published `:459` (POST create), updated / draft→published flip `:545` (PATCH), deleted `:499` (by-tag) / `:558` (by-id) | landed; tests: `api/releases.test.ts` (`:464` published shape, `:488` ["updated","published"], `:527` ["deleted","deleted"]) | P1 |
 | `package` | PackageCreate:968 / PackageDelete:972 → shared notifyPackage:976→:993 (callers `routers/api/packages/container/manifest.go:95` and the debian/rpm/conan registries) | PackagePayload (`hook.go:595`) | **N/A** — no package-registry feature | the future package-registry wave | P2 |
 | `status` | CreateCommitStatus:925→:955 (caller `services/repository/commitstatus/commitstatus.go:104`) | CommitStatusPayload (`hook.go:647`) | **EMITTED** (was NOT-EMITTED, closed `705eb9c`) — `api/routes/statuses.ts:327` | landed; tests: `api/statuses.test.ts` | P2 |
@@ -66,12 +67,12 @@ since the first edition; every upstream and worker citation below was re-verifie
 
 Over the 26 wire event types of `AllEvents()` (`type.go:50-77`), at HEAD `7242825`:
 
-- **Fully emitted: 17/26** (`push`, `create`, `delete`, `fork`, `issues`, `issue_assign`,
+- **Fully emitted: 18/26** (`push`, `create`, `delete`, `fork`, `issues`, `issue_assign`,
   `issue_label`, `issue_milestone`, `issue_comment`, `pull_request`, `pull_request_assign`,
   `pull_request_label`, `pull_request_milestone`, `pull_request_comment`, `pull_request_sync`,
-  `release`, `status`) — **65%** (3/26 at the first edition, 7/26 partially).
-- **At least partially emitted: 18/26** — the above plus `repository` (created ×3 paths /
-  renamed / deleted emit; the migrate route is silent) — **69%**.
+  `release`, `status`, `repository`) — **69%** (3/26 at the first edition, 7/26 partially;
+  `repository` joined with this refresh — its migrate arm closed by parity analysis, not emission).
+- **At least partially emitted: 18/26 — 69%** (same set: no row remains partial).
 - **NOT-EMITTED with the triggering feature already present: 0/26** — the bucket the first
   edition filled with 9 types is empty; its last occupants (milestone/assign) closed with
   `812f999`/`7242825`.
@@ -83,10 +84,13 @@ Over the 26 wire event types of `AllEvents()` (`type.go:50-77`), at HEAD `724282
 The first edition's shortlist (release / labels / pull_request_sync / repository+fork / status)
 and the follow-up milestone+assign wave are all landed as of `7242825`. What remains, ranked:
 
-1. **`repository` migrate arm** — one `emitRepoEvent` call in the migrate-completion path
-   (`api/routes/imports.ts`) upgrades `repository` from EMITTED-PARTIAL to fully EMITTED
-   (upstream MigrateRepository:149→:151; the fork case :103 is already covered by the `fork`
-   event). After it, every feature-backed type emits.
+1. **Server-driven migrate wave (SPEC-0009 §2.2/§2.6, unlanded)** — the LANDED migrate surfaces
+   need no emission (the `repository` row's parity analysis: creation is announced by POST /repos
+   upstream of them; an import-completion emission would double-fire). When the global
+   `POST /api/v1/repos/migrate` lands, its handler creates the `repositories` row itself
+   (`status='migrating'`), so its finalize step must fire the ONE `repository` created
+   (`emitRepoEvent`) — SPEC-0009 §2.6 step 4's plan, mirroring upstream
+   `services/task/migrate.go:57` → `notifier.go:149`.
 2. **PR-review wave** (four N/A types) — needs the review routes themselves first; the
    subscription vocabulary (`pull_request_review` group flag) is already modeled.
 3. **Wiki / package-registry waves** — same shape: the triggering feature is the prerequisite;

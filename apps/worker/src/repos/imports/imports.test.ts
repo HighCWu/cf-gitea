@@ -16,7 +16,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { REPO_SETTINGS_DDL_STATEMENTS } from "../../api/services/repo-settings";
 import { mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { repoImports, repositories, users } from "../../db/schema";
+import { repoImports, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { RepoService } from "../service";
 import { handleRepoTasks } from "../purge";
 import { buildPack } from "../testing/git-pack";
@@ -50,6 +50,8 @@ beforeEach(async () => {
     "repo_transfer",
     "repo_redirects",
     "repo_counters",
+    "webhook_deliveries",
+    "webhooks",
     "repositories",
     "personal_access_tokens",
   ]) {
@@ -264,6 +266,10 @@ function parseStaged(row: typeof repoImports.$inferSelect): Record<string, { byt
   return JSON.parse(row.staged) as Record<string, { bytes: number; sha1: string }>;
 }
 
+/** The delivery log — the webhook-emission assertion surface (the
+ * repo-edit.test.ts pattern): rows only appear when an emit call fires. */
+const deliveries = () => drizzle(env.DB).select().from(webhookDeliveries).orderBy(webhookDeliveries.id).all();
+
 const API = "https://example.com/api/v1";
 
 async function createImportViaApi(
@@ -423,6 +429,43 @@ describe("import state machine (SPEC-0003 §2.6, §3.1)", () => {
     expect(repo.isEmpty).toBe(false);
     expect(repo.defaultBranch).toBe("trunk");
     expect((await service.get(row.id))?.state).toBe("done");
+  });
+
+  it("the migrate surface emits no repository webhook — creation was announced by POST /repos, and upstream fires MigrateRepository once per migrated repo", async () => {
+    // Parity guard (webhook audit, 2026-10-25). Upstream's migrate notifies
+    // HookRepoCreated exactly ONCE, at task completion (routers/api/v1/repo/
+    // migrate.go → services/task/task.go:60 → services/task/migrate.go:57 →
+    // notify/notify.go:377 → services/webhook/notifier.go:149-151); the
+    // migration's repo row is created model-layer (services/migrations/
+    // migrate.go), so there is no second event. Our journey splits that into
+    // POST /repos (which emits `repository` created — api/routes/user-repos.ts)
+    // plus this import channel, which creates no repo rows (the only
+    // `repositories` INSERT is repos/service.ts:272). An emission at either
+    // arm below would be the SECOND created event for one migration — a
+    // duplicate upstream never produces (docs/compat/webhook-event-coverage.md,
+    // the `repository` row). The SPEC-0009 §2.2/§2.6 server-driven migrate
+    // (unlanded) creates the row itself, so ITS finalize step owns the one
+    // created — not this surface.
+    const { repoId, ownerId } = await seedRepo("hook-silent");
+    await drizzle(env.DB).insert(webhooks).values({
+      repoId,
+      url: "https://hooks.example.com/migrate",
+      events: JSON.stringify({ send_everything: true }),
+      isActive: true,
+    });
+
+    // The create arm (route level): flips the repo to migrating, silent.
+    const token = await mintWriteToken(ownerId);
+    const created = await createImportViaApi("hook-silent", token);
+    expect(created.status).toBe(201);
+
+    // The completion arm (the settle the consumer runs): silent too.
+    const importId = created.body.import_id as number;
+    await env.DB.prepare("UPDATE repo_imports SET state = 'finalizing' WHERE id = ?").bind(importId).run();
+    await importService().settleDone(importId, "trunk");
+    expect((await new RepoService(env.DB).get(repoId))?.status).toBe("ready");
+
+    expect(await deliveries()).toEqual([]);
   });
 
   it("GET /repos/{owner}/{repo} reflects the settle both ways: empty:true before, empty:false after (refs_version stays 0)", async () => {
