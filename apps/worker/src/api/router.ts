@@ -25,6 +25,7 @@ import { registerIdentityRoutes } from "./routes/identity";
 import { registerImportRoutes } from "./routes/imports";
 import { registerIssueRoutes } from "./routes/issues";
 import { registerIssueTablesT2Routes } from "./routes/issue-tables-t2";
+import { registerIssueAttachmentRoutes } from "./routes/issue-attachments";
 import { registerIssueT2Routes } from "./routes/issue-t2";
 import { registerIssueWriteT2Routes } from "./routes/issue-write-t2";
 import { registerLabelRoutes } from "./routes/labels";
@@ -196,6 +197,9 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // times over migration 0012 — writes reqToken, reads ride optionalAuth
   // where the contract allows anonymous listing.
   registerIssueTablesT2Routes(app, requireAuth, optionalAuth);
+  // Tier-2 issue attachments: issue + comment asset families (inline
+  // multipart or relay PUT/GET pair), R2 under repos/<key>/attachments/.
+  registerIssueAttachmentRoutes(app, requireAuth, optionalAuth);
   // Tier-2 table-free misc reads: option templates (gitignore/label/license),
   // published settings, /markup, /token lifecycle. Anonymous except the
   // auth'd trio, mirroring upstream api.go routing.
