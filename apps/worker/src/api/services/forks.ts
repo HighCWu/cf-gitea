@@ -1,5 +1,6 @@
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
+import type { Registry } from "@cf-gitea/git-engine";
 
 import { repositories, users } from "../../db/schema";
 import { RepoService, type RepoRow } from "../../repos/service";
@@ -54,6 +55,11 @@ export interface ForkServiceDeps {
   /** REPO_TASKS producer — the one repo-fork fan-out. Optional so pure-D1
    *  tests (and direct consumer drives) run without a queue. */
   queue?: ForkQueueProducer;
+  /** Engine Registry DO stub — rides the fork row's create (REDEPLOY8: bare
+   *  RepoService construction skips seedRepoExtras' upsert, so the fork
+   *  404s on info/refs/clone until its replication push lands). Optional so
+   *  pure-D1 tests run standalone; the route passes the gate's shape. */
+  registry?: DurableObjectStub<Registry>;
 }
 
 /** One fork's creation record: the re-read fork row (status='creating'). */
@@ -104,7 +110,7 @@ export async function createFork(
   },
 ): Promise<{ fork: RepoRow; engineName: string }> {
   const source = input.source.repo;
-  const service = new RepoService(d1);
+  const service = new RepoService(d1, { registry: deps.registry });
   const created = await service.create({
     owner: input.targetOwner,
     name: input.name,

@@ -73,8 +73,11 @@ import { OrgService } from "./orgs/orgs";
  *  slice over the generated Env (whose MIRROR_SYNC_QUEUE binding is live;
  *  the enqueue below still runtime-guards it, so bare-test callers without
  *  the binding self-heal at the next cron tick — the row lands due at
- *  `now`). */
-export type MigrateEnv = MirrorSettingsEnv;
+ *  `now`) plus REGISTRY, which the birth write threads into RepoService so
+ *  the migrated repo's engine-registry upsert runs at create (REDEPLOY8: a
+ *  bare construction left the repo 404ing on info/refs/clone until the
+ *  population's first push). */
+export type MigrateEnv = MirrorSettingsEnv & Pick<Env, "REGISTRY">;
 
 /**
  * The server-driven arm's body: the shared MigrateOptions (the into-empty
@@ -207,7 +210,7 @@ export async function migrateRepository(
   }
 
   // -- the birth (the arm's own repositories INSERT; silent by design) ------
-  const service = new RepoService(db);
+  const service = new RepoService(db, { registry: env.REGISTRY.getByName("registry") });
   let repo: RepoRow;
   try {
     repo = await service.create({

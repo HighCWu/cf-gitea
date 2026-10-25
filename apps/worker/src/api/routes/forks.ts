@@ -217,7 +217,10 @@ export function registerForkRoutes(
 
     const { fork } = await createFork(
       c.env.DB,
-      { queue: c.env.REPO_TASKS },
+      // The engine registry rides the fork row's create (REDEPLOY8 — the
+      // gate's shape, git-http/gate.ts): without it the fork 404s on
+      // info/refs/clone until the replication push lands.
+      { queue: c.env.REPO_TASKS, registry: c.env.REGISTRY.getByName("registry") },
       { source, targetOwner, name },
     ).catch((error: unknown) => {
       if (error instanceof RepoNameCollisionError) {

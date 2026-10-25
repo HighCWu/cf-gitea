@@ -174,7 +174,10 @@ export async function createUserRepository(
   form: CreateRepoOption,
   now: Date,
 ): Promise<RepoRow> {
-  const service = new RepoService(d1);
+  // The engine registry rides the create (REDEPLOY8): bare construction
+  // skips seedRepoExtras' upsert, so the repo 404s on info/refs/clone until
+  // a push lands (the gate passes the same dep at its receive-pack arm).
+  const service = new RepoService(d1, { registry: env.REGISTRY.getByName("registry") });
   const repo = await service.create({
     owner: { id: owner.id, usernameLower: owner.usernameLower },
     name: form.name,

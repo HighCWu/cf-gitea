@@ -195,7 +195,10 @@ export function registerOrgRoutes(
     // Guard chain in upstream order: 404 (missing/invisible) → 403 (grant).
     const org = await requireCanCreateOrgRepo(c.env.DB, orgName, doer);
     const form = c.req.valid("json");
-    const service = new RepoService(c.env.DB);
+    // The engine registry rides the create (REDEPLOY8 — the user-repos note):
+    // bare construction skips seedRepoExtras' upsert and the org repo 404s on
+    // info/refs/clone until a push lands.
+    const service = new RepoService(c.env.DB, { registry: c.env.REGISTRY.getByName("registry") });
     let repo;
     try {
       repo = await service.create({
