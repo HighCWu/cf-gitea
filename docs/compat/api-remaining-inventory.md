@@ -27,6 +27,15 @@ battery `4ed277d`, wave-ui-parity-9 `1a7af64`, the projects board
 landing `9b49cd2`, a docs run) carries **zero
 new operations**; the checker re-run reports 490/298, `PASS` unchanged.
 The only ledger entry is the release-gate fix below.
+**Ticked 2026-10-26** a fourth time, at HEAD `2310623`: maintenance only
+again — the `9b49cd2..2310623` window (the tick-4 docs commit
+`48f873f`, the releases fixture isEmpty seeding `3b3a3ae`, the fileicon
+asset+lookup layer `cdf683a`, P0 deploy evidence `305ddc8`, the toolkit
+polish `5fdbc15`, the attachments serving seam `5e082cd` + its dispatch
+wiring `2b5b898`, wave-ui-parity-10 `fdaeaca`, the toolkit PAT
+preflight `2310623`) also carries **zero new operations**; the checker
+re-run at this HEAD reports 490/298, `PASS` unchanged. The window's
+landings join the post-490 ledger below.
 
 - **Sources / method**: frozen contract
   `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
@@ -34,7 +43,7 @@ The only ledger entry is the release-gate fix below.
   issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
   minus the declared set that `node scripts/check-openapi.mjs` reports
   (**490** operations across **298** paths, measured 2026-10-26 at HEAD
-  `9b49cd2`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
+  `2310623`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
   operations). Raw diff: **64 undeclared** = **64 remaining**, all
   FEATURE-ABSENT — no in-flight subtraction applies any more.
   Issue / notification / miscellaneous / settings families have **zero**
@@ -133,7 +142,7 @@ existing seams), engine-registry lifecycle fixes (`4f574e9`, `1da8f56`,
 ### After the 490 line — post-regen landings (zero new ops)
 
 Everything merged after REG `c9a7ef7` carries no new declarations — the
-checker stays at 490/298 (re-run at this tick's HEAD `9b49cd2`). The units,
+checker stays at 490/298 (re-run at this tick's HEAD `2310623`). The units,
 grouped:
 
 - **API parity**: blocks-enforcement-2 tail (`f2e1710` — the regen's
@@ -168,7 +177,8 @@ grouped:
   REDEPLOY14) + its fixtures correction (`4619c4f` — honest `isEmpty`
   seeding; discloses that `d24dc0f`'s own run was really 10-failed/25-passed
   behind a grep-masked exit code and brings the suite to the true 35/35;
-  the gate change stands verified).
+  the gate change stands verified). The `9b49cd2..2310623` window adds
+  nothing here — no spec-bearing landing.
 - **Migrations 0029–0032** landed with them (`size_kb`, `num_stars`/
   `num_watches`, `num_forks` + `users.num_stars`, push-mirror sync state) —
   still 64 tables; these are store work behind already-declared ops.
@@ -181,7 +191,14 @@ grouped:
   wave-ui-parity-6 (`1b41b60` — the archive download +
   `load-branches-and-tags` aux JSON) and wave-ui-parity-7 (`48101dc` —
   the tags delete write + `/tags/list` aux + the releases edit/delete
-  tail).
+  tail). The `7016ce9..9b49cd2` window adds wave-ui-parity-9 (`1a7af64`
+  — the `/blob/*` redirect + `tree-list` + `branches/list`) and the
+  projects board (`9b49cd2`); the `9b49cd2..2310623` window adds the
+  fileicon asset+lookup layer (`cdf683a` — the `/tree-view` gate's
+  prerequisite, now committed), the attachments serving seam + its
+  dispatch wiring (`5e082cd` + `2b5b898`), and wave-ui-parity-10
+  (`fdaeaca` — the releases download tail, the `/render/*` family, the
+  fetch-action 200-JSON arms on both redirect twins).
 - **Test/docs**: vitest contention config (`e4ebb9d`), release notes
   (`1c44086`), P0 deploy evidence (`d28d953`, `3d76cc6`), push-mirror SPEC
   (`998a4de`), schema-docstring catch-up (`e6ccf9c`). The
@@ -196,7 +213,17 @@ grouped:
   repro), the invariant fixture diet (`3169e33`), P0 deploy evidence
   (`bf8e56f`), the release-notes addendum (`b74b2d2`), and the SPEC-0001b
   §5.3 as-built redesign record (`640c202` — the Worker brokers the copy
-  pass, loose closure unconditional).
+  pass, loose closure unconditional). The `9b49cd2..2310623` window adds
+  the releases fixture isEmpty seeding (`3b3a3ae`), P0 deploy evidence
+  (`305ddc8` — the toolkit's debut: 7 scripted batteries, generate
+  strict-clone PASS, the first forkpr-e2e production evidence, the
+  release-gate CLOSED 201/422), and the tick-4 docs commit (`48f873f`).
+- **Tooling**: the `9b49cd2..2310623` window adds the toolkit polish
+  (`5fdbc15` — token optional for D1-only batteries, `MIRROR_SETTLE_MS`
+  10s→30s + `--mirror-settle-ms`, the generic failureTail with the
+  mirror sweep) and the toolkit PAT preflight (`2310623` — one
+  `GET /user` per invocation, three fast-fail arms, zero repo creation
+  on mismatch).
 
 ---
 
