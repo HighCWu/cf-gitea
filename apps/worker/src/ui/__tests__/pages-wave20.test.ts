@@ -293,8 +293,20 @@ describe("wave-20 parser family (parseUiRoute / handlesUiRoute)", () => {
   it("leaves the feed/write tails and the bare /tag with the engine", () => {
     expect(parseUiRoute("/octo/hello/releases/tag")).toBeNull();
     expect(parseUiRoute("/octo/hello/releases/.rss")).toBeNull();
-    expect(parseUiRoute("/octo/hello/releases/edit/v1")).toBeNull();
-    expect(parseUiRoute("/octo/hello/releases/delete")).toBeNull();
+    // The wave-33 write-group tails (the survey's top-5 #4) now claim their
+    // families — the edit wildcard (the URL-keyed tag) and the delete
+    // literal lifted out of the unclaimed set.
+    expect(parseUiRoute("/octo/hello/releases/edit/v1")).toEqual({
+      family: "release-edit",
+      owner: "octo",
+      repo: "hello",
+      tag: "v1",
+    });
+    expect(parseUiRoute("/octo/hello/releases/delete")).toEqual({
+      family: "release-delete",
+      owner: "octo",
+      repo: "hello",
+    });
     expect(parseUiRoute("/octo/hello/releases/generate-notes")).toBeNull();
     expect(parseUiRoute("/octo/hello/releases/attachments/abc")).toBeNull();
   });

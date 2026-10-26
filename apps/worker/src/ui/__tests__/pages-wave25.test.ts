@@ -223,12 +223,21 @@ describe("wave-25 parser claims", () => {
       owner: "wave25-owner",
       repo: "labeled",
     });
-    // The sibling shapes stay unclaimed (the engine's 404): the /tags/list
-    // aux JSON, the .rss feed tail, the /tags/delete write, the
-    // /labels/initialize template loader and any deeper label tail.
-    expect(parseUiRoute("/wave25-owner/labeled/tags/list")).toBeNull();
+    // The wave-33 tails (the survey's top-5 #2) now claim their families —
+    // the aux JSON and the delete write lifted out of the unclaimed set;
+    // the .rss feed tail, the /labels/initialize template loader and any
+    // deeper tail stay engine-owned.
+    expect(parseUiRoute("/wave25-owner/labeled/tags/list")).toEqual({
+      family: "tags-list-aux",
+      owner: "wave25-owner",
+      repo: "labeled",
+    });
+    expect(parseUiRoute("/wave25-owner/labeled/tags/delete")).toEqual({
+      family: "tags-delete",
+      owner: "wave25-owner",
+      repo: "labeled",
+    });
     expect(parseUiRoute("/wave25-owner/labeled/tags.rss")).toBeNull();
-    expect(parseUiRoute("/wave25-owner/labeled/tags/delete")).toBeNull();
     expect(parseUiRoute("/wave25-owner/labeled/labels/initialize")).toBeNull();
     expect(parseUiRoute("/wave25-owner/labeled/labels/other")).toBeNull();
     expect(parseUiRoute("/wave25-owner/labeled/tags/extra")).toBeNull();
@@ -236,7 +245,8 @@ describe("wave-25 parser claims", () => {
     expect(handlesUiRoute("/wave25-owner/labeled/tags")).toBe(true);
     expect(handlesUiRoute("/wave25-owner/labeled/labels")).toBe(true);
     expect(handlesUiRoute("/wave25-owner/labeled/labels/new")).toBe(true);
-    expect(handlesUiRoute("/wave25-owner/labeled/tags/list")).toBe(false);
+    expect(handlesUiRoute("/wave25-owner/labeled/tags/list")).toBe(true);
+    expect(handlesUiRoute("/wave25-owner/labeled/tags/extra")).toBe(false);
     // The wave-14 org literal keeps its second-segment claim: a TWO-segment
     // /{owner}/labels is the org page, never the repo page.
     expect(parseUiRoute("/wave25-owner/labels")).toEqual({ family: "org-labels", owner: "wave25-owner" });
@@ -321,7 +331,9 @@ describe("tags page /{owner}/{repo}/tags", () => {
       status: "ready",
     });
     expect((await fetchUi("/wave25-hollow/hollow/tags")).status).toBe(404);
-    expect((await fetchUi("/wave25-owner/labeled/tags/list")).status).toBe(404);
+    // The wave-33 aux JSON answers on the live repo (the MustBeNotEmpty gate
+    // only shells the empty repo); a deeper tail stays engine-owned.
+    expect((await fetchUi("/wave25-owner/labeled/tags/list")).status).toBe(200);
     expect((await fetchUi("/wave25-owner/labeled/tags/extra")).status).toBe(404);
   });
 });

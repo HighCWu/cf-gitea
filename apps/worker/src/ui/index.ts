@@ -227,6 +227,22 @@
  *                                          row; the decoded tail keeps
  *                                          slashes, the API family's
  *                                          html_url shape re-parses)
+ *   /:owner/:repo/releases/edit/{tag}      release edit form + write, GET +
+ *                                          POST (pages/releases.tsx — wave
+ *                                          33, the survey's top-5 #4;
+ *                                          upstream web.go:1519-1520
+ *                                          EditRelease/EditReleasePost —
+ *                                          new.tmpl under
+ *                                          PageIsEditRelease, the landed
+ *                                          editRelease arm, writer-gated;
+ *                                          POST 303s onto the list)
+ *   /:owner/:repo/releases/delete          release delete, POST (wave 33;
+ *                                          upstream web.go:1523
+ *                                          DeleteRelease — the edit page's
+ *                                          red button, the landed
+ *                                          deleteRelease cascade + the
+ *                                          `release` deleted webhook, drafts
+ *                                          silent; GET → 405)
  *   /:owner/:repo/compare[/{base}...{head}]  compare view, GET + POST
  *                                          (pages/compare.tsx — wave 13;
  *                                          upstream web.go:1307-1315's
@@ -358,6 +374,23 @@
  *                                          anonymous-capable; empty repos
  *                                          404 (the group's MustBeNotEmpty);
  *                                          `?q=` filter, `?page=` pager)
+ *   /:owner/:repo/tags/list                tags aux JSON, GET (pages/
+ *                                          tag-list-aux.ts — wave 33, the
+ *                                          survey's top-5 #2 tail; upstream
+ *                                          web.go:1499 GetTagList — the
+ *                                          branchTagSearchResponse shape
+ *                                          {"results":[names]}, no filter,
+ *                                          no query; the pin carries no
+ *                                          fetching consumer, shape parity)
+ *   /:owner/:repo/tags/delete              tag delete, POST (wave 33; the
+ *                                          survey's top-5 #2 tail, upstream
+ *                                          web.go:1501 DeleteTag — the tags
+ *                                          page's per-row control,
+ *                                          code-writer-gated over the
+ *                                          engine ref universe + the D1
+ *                                          tag-record drop, the 409
+ *                                          release-attached class; GET →
+ *                                          405)
  *   /:owner/:repo/labels                   labels management page, GET (pages/
  *                                          repo-labels.tsx — wave 25; the
  *                                          survey's TOP-2 row, upstream
@@ -635,7 +668,14 @@ import {
 // Wave-25 repo tags + labels pages (the parity survey's TOP-2 dispatchable
 // rows — the tags listing over the engine ref universe and the repo labels
 // management page over the landed repo-label family).
-import { loadTagsData, renderTagsPage } from "./pages/tags";
+import {
+  applyTagDelete,
+  loadTagsData,
+  parseTagDeleteForm,
+  renderTagsPage,
+  TAG_RELEASE_ATTACHED_MESSAGE,
+} from "./pages/tags";
+import { loadTagListAux, tagListResponse } from "./pages/tag-list-aux";
 import {
   createRepoLabelFromForm,
   deleteRepoLabelFromForm,
@@ -722,6 +762,9 @@ import {
 } from "./pages/branches";
 import {
   createReleaseFromForm,
+  deleteReleaseFromForm,
+  editReleaseFromForm,
+  loadEditReleaseData,
   loadNewReleaseData,
   loadReleaseDetailData,
   loadReleasesData,
@@ -729,6 +772,9 @@ import {
   parseNewReleaseForm,
   renderNewReleasePage,
   renderReleaseDetailPage,
+  parseEditReleaseForm,
+  parseReleaseDeleteForm,
+  renderEditReleasePage,
   renderReleasesPage,
 } from "./pages/releases";
 import { listReleases } from "../api/services/releases";
@@ -939,17 +985,22 @@ export interface CommitViewRoute {
  *  page (web.go:1509 `repo.SingleRelease` — the SAME list template over one
  *  row; the tail is the decoded tag name, slashes allowed, so the emitted
  *  `/releases/tag/{tag}` links — the API family's html_url shape — re-parse
- *  to the same route). The `.rss`/`.atom` feed tails (web.go:1507-1508),
- *  the write tails this slice does not render (`/edit/*`, `/delete`,
- *  `/generate-notes`, `/attachments*`, the `{id}/reactions` POST —
- *  web.go:1511-1526) and every other tail stay unclaimed → the engine's
+ *  to the same route). Wave 33 (the survey's top-5 #4) adds the write
+ *  group's edit/delete tails: `/releases/edit/*` the edit form + write
+ *  (web.go:1519-1520 EditRelease/EditReleasePost — the writer gate, the
+ *  decoded tail the URL-keyed tag, slashes allowed) and `/releases/delete`
+ *  the delete write (web.go:1523 DeleteRelease — the edit page's red
+ *  button). The `.rss`/`.atom` feed tails (web.go:1507-1508), the
+ *  `/generate-notes` and `/attachments*` write tails and the
+ *  `{id}/reactions` POST (web.go:1511-1526) stay unclaimed → the engine's
  *  404, exactly upstream's unregistered-route answer for them. */
 export interface ReleasesRoute {
-  family: "releases" | "release-new" | "release-latest" | "release-detail";
+  family: "releases" | "release-new" | "release-latest" | "release-detail" | "release-edit" | "release-delete";
   owner: string;
   repo: string;
   /** The decoded tag tail after `/releases/tag/` (the detail family only;
-   *  may bear slashes — refnames do). */
+   *  may bear slashes — refnames do) or after `/releases/edit/` (the edit
+   *  family — the URL-keyed tag the loader resolves). */
   tag?: string;
 }
 
@@ -1028,16 +1079,20 @@ export interface SettingsCollaborationRoute {
   repo: string;
 }
 
-/** The wave-25 tags family (pages/tags.tsx): upstream's repo tags group's
- *  list route (web.go:1493-1496 — `m.Get("", context.RepoRefByDefaultBranch(),
- *  repo.TagsList)` under the `/tags` group) — the parity survey's TOP-1
- *  row, the bare repo-scoped literal over the engine ref universe. GET-only
- *  (the page itself carries no write; the `/tags/delete` POST is
- *  web.go:1501's own survey row). The `/tags/list` aux JSON, the `.rss`/
- *  `.atom` feed tails and every deeper tail stay unclaimed → the engine's
- *  404, exactly upstream's unregistered-route answer. */
+/** The wave-25 tags family (pages/tags.tsx + pages/tag-list-aux.ts):
+ *  upstream's repo tags group's list route (web.go:1493-1496 —
+ *  `m.Get("", context.RepoRefByDefaultBranch(), repo.TagsList)` under the
+ *  `/tags` group) — the parity survey's TOP-1 row, the bare repo-scoped
+ *  literal over the engine ref universe. Wave 33 (the survey's top-5 #2)
+ *  adds the group's other two routes: `/tags/list` the aux JSON
+ *  (web.go:1499 GetTagList — the `{"results":[names]}` branchTagSearchResponse
+ *  shape, GET-only, pages/tag-list-aux.ts) and `/tags/delete` the delete
+ *  write (web.go:1501 — reqSignIn + reqRepoCodeWriter +
+ *  RepoMustNotBeArchived, POST-only, the tags page's per-row control). The
+ *  `.rss`/`.atom` feed tails and every deeper tail stay unclaimed → the
+ *  engine's 404, exactly upstream's unregistered-route answer. */
 export interface TagsRoute {
-  family: "tags";
+  family: "tags" | "tags-list-aux" | "tags-delete";
   owner: string;
   repo: string;
 }
@@ -1776,14 +1831,29 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // create form + write, `/latest` the redirect, `/tag/{tail}` the single-
   // release page — the tail is the DECODED tag name with slashes preserved
   // (chi's `*` param; refnames carry slashes, so the emitted
-  // `/releases/tag/v1.0/rc` links re-parse to the same route). The feed
-  // tails upstream registers (`.rss`/`.atom`) and the write tails this slice
-  // does not render (`/edit/*`, `/delete`, `/generate-notes`,
-  // `/attachments*`) stay unclaimed → the engine's 404.
+  // `/releases/tag/v1.0/rc` links re-parse to the same route). Wave 33 (the
+  // survey's top-5 #4) lifts the write group's `/edit/{tail}` (the same
+  // wildcard decode — the URL-keyed tag) and `/delete` literals out of the
+  // unclaimed set (web.go:1519-1520 + 1523). The feed tails upstream
+  // registers (`.rss`/`.atom`) and the `/generate-notes` + `/attachments*`
+  // tails stay unclaimed → the engine's 404.
   if (head === "releases") {
     if (rest.length === 0) return { family: "releases", owner, repo };
     if (rest.length === 1 && rest[0] === "new") return { family: "release-new", owner, repo };
     if (rest.length === 1 && rest[0] === "latest") return { family: "release-latest", owner, repo };
+    if (rest.length === 1 && rest[0] === "delete") return { family: "release-delete", owner, repo };
+    if (rest.length >= 2 && rest[0] === "edit") {
+      try {
+        return {
+          family: "release-edit",
+          owner,
+          repo,
+          tag: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
+        };
+      } catch {
+        return null;
+      }
+    }
     if (rest.length >= 2 && rest[0] === "tag") {
       try {
         return {
@@ -1820,12 +1890,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   // Wave-25 tags family (pages/tags.tsx — upstream web.go:1493-1496's
   // `/tags` group's list route, the survey's TOP-1 row): the exact bare
-  // literal, GET-only. The `/tags/list` aux JSON, the `.rss`/`.atom` feed
-  // tails and the `/tags/delete` write (web.go:1501, its own survey row)
-  // stay unclaimed → the engine's 404, exactly upstream's
+  // literal. Wave 33 (the survey's top-5 #2) lifts the group's other two
+  // routes out of the unclaimed set: `/tags/list` the aux JSON (web.go:1499,
+  // pages/tag-list-aux.ts) and `/tags/delete` the delete write (web.go:1501,
+  // POST-only — GET answers chi's 405). The `.rss`/`.atom` feed tails and
+  // every deeper tail stay unclaimed → the engine's 404, exactly upstream's
   // unregistered-route answer.
   if (head === "tags") {
     if (rest.length === 0) return { family: "tags", owner, repo };
+    if (rest.length === 1 && rest[0] === "list") return { family: "tags-list-aux", owner, repo };
+    if (rest.length === 1 && rest[0] === "delete") return { family: "tags-delete", owner, repo };
     return null;
   }
   // Wave-25 repo labels families (pages/repo-labels.tsx — upstream
@@ -3959,6 +4033,243 @@ async function commitContainedRefsJson(c: Context<{ Bindings: Env }>): Promise<R
 }
 
 // ---------------------------------------------------------------------------
+// The wave-33 tags tails (pages/tag-list-aux.ts + pages/tags.tsx's
+// applyTagDelete — the survey's top-5 #2: upstream web.go:1499 GetTagList +
+// web.go:1501 DeleteTag)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{owner}/{repo}/tags/list (pages/tag-list-aux.ts — upstream GetTagList,
+ * web.go:1499): the `{"results":[names]}` aux JSON for every viewer who can
+ * see the repo; the group's MustBeNotEmpty (web.go:1500) 404-shells empty
+ * repos before the load (the aux-JSON sibling of the wave-32 commit feed).
+ */
+async function tagListAuxJson(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "tags-list-aux") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1500's group gate)
+  return respond(tagListResponse(await loadTagListAux(c.env, repo)));
+}
+
+/** The wave-33 tag delete's refusal shape — ctx.HTTPError(409, …)'s
+ *  plain-text form (release.go:677-680 → base.go:105-113, the archive
+ *  family's established answer), stamped with the web middleware's
+ *  zero-option prod Cache-Control. */
+function tagDeleteConflictResponse(): Response {
+  return new Response(`${TAG_RELEASE_ATTACHED_MESSAGE}\n`, {
+    status: 409,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "x-content-type-options": "nosniff",
+      "cache-control": "max-age=0, private, must-revalidate",
+    },
+  });
+}
+
+/**
+ * POST /{owner}/{repo}/tags/delete (pages/tags.tsx applyTagDelete — upstream
+ * repo.DeleteTag → deleteReleaseOrTag(isDelTag=true), web.go:1501): the §2.8
+ * Origin guard, the tags group's gates in upstream's order (MustBeNotEmpty →
+ * RepoMustNotBeArchived → reqRepoCodeWriter; anonymous first — reqSignIn
+ * precedes the group's optSignIn posture), then the write over the dual
+ * carriers (the `id` D1-record key, the `tag` name arm for the rowless
+ * engine tags — the TagRowView note). Every refusal answers upstream's
+ * class: the release-attached 409 plain text, the missing id/tag the 404
+ * shell; the flash outcomes 303 back onto the list with the branches
+ * page's query-param convention (protected → tag_name_protected, failed →
+ * the server-side text).
+ */
+async function tagsDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  if (resolved.route.family !== "tags-delete") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname)); // reqSignIn
+  if (repo.isEmpty || repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty + RepoMustNotBeArchived
+  if (!(await canWriteRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404)); // reqRepoCodeWriter
+  const subject = parseTagDeleteForm(await readUrlEncodedForm(c.req.raw));
+  const doerRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (doerRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  let waitUntil: ((promise: Promise<unknown>) => void) | undefined;
+  try {
+    waitUntil = c.executionCtx.waitUntil.bind(c.executionCtx);
+  } catch {
+    waitUntil = undefined; // in-process test callers have no execution context
+  }
+  const result = await applyTagDelete(c.env, c.env.DB, repo, subject, {
+    pair,
+    doer: doerRow,
+    origin: url.origin,
+    waitUntil,
+  });
+  if (result.outcome === "release-attached") return respond(tagDeleteConflictResponse());
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const listPath = `/${repo.ownerNamespace}/${repo.slug}/tags`;
+  const location =
+    result.outcome === "deleted"
+      ? `${listPath}?deleted=${encodeURIComponent(result.name)}`
+      : `${listPath}?delete_error=${result.outcome === "refused-protected" ? "protected" : "failed"}&name=${encodeURIComponent(result.name)}`;
+  return respond(new Response(null, { status: 303, headers: { location } }));
+}
+
+// ---------------------------------------------------------------------------
+// The wave-33 releases edit/delete tails (pages/releases.tsx — the survey's
+// top-5 #4: upstream web.go:1519-1520 EditRelease/EditReleasePost +
+// web.go:1523 DeleteRelease under the write group)
+// ---------------------------------------------------------------------------
+
+/** The edit form's fixed meta (the stored row's tag pair + delete id) and
+ *  prefill (release.go:579-590 — the stored values, tag_target's
+ *  default-branch fallback). */
+function editReleaseMetaOf(repo: RepoRow, row: { tagName: string; target: string | null; id: number }): {
+  tagName: string;
+  target: string;
+  deleteId: number;
+} {
+  const storedTarget = row.target ?? "";
+  return { tagName: row.tagName, target: storedTarget === "" ? repo.defaultBranch : storedTarget, deleteId: row.id };
+}
+
+/**
+ * GET /{owner}/{repo}/releases/edit/{tag} (pages/releases.tsx — upstream
+ * repo.EditRelease, web.go:1519): the writer-gated form (the write group's
+ * releasesWriteGate), the stored values prefilled, the 404 arms first (a
+ * missing row, a TAG-ONLY record — release.go:573-576's "pure tag" arm).
+ */
+async function releaseEditPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await releasesWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, respond, repo } = resolved;
+  const route = resolved.route;
+  if (route.family !== "release-edit" || route.tag === undefined) return respond(await c.notFound()); // drift guard
+  const row = await loadEditReleaseData(c.env.DB, repo.id, route.tag);
+  if (row === null) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadNewReleaseData(c.env, repo);
+  return respond(
+    c.html(
+      renderEditReleasePage({
+        ctx,
+        data,
+        form: {
+          tagName: row.tagName,
+          tagTarget: row.target ?? "",
+          title: row.title,
+          content: row.note ?? "",
+          draft: row.isDraft,
+          prerelease: row.isPrerelease,
+        },
+        error: null,
+        edit: editReleaseMetaOf(repo, row),
+      }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/releases/edit/{tag} (upstream EditReleasePost,
+ * web.go:1520): the §2.8 Origin guard, the write gate, the row resolved by
+ * the URL's tag (the PathParam the form's hidden pair never overrides), then
+ * editReleaseFromForm — success 303s onto the LIST (upstream JSONRedirect's
+ * exact target), the failures re-render at 200 with the message and the
+ * kept submission (the login failure convention).
+ */
+async function releaseEditSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await releasesWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  const route = resolved.route;
+  if (route.family !== "release-edit" || route.tag === undefined) return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the gate above admitted only users
+  const row = await loadEditReleaseData(c.env.DB, repo.id, route.tag);
+  if (row === null) return respond(c.html(renderNotFound(ctx), 404));
+  const doerRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (doerRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseEditReleaseForm(await readUrlEncodedForm(c.req.raw));
+  const result = await editReleaseFromForm({
+    env: c.env,
+    request: c,
+    repo,
+    pair,
+    doer: doerRow,
+    row,
+    form,
+    origin: url.origin,
+  });
+  if (result.outcome === "updated") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/releases` } }));
+  }
+  const data = await loadNewReleaseData(c.env, repo);
+  return respond(
+    c.html(
+      renderEditReleasePage({
+        ctx,
+        data,
+        form: { tagName: row.tagName, tagTarget: row.target ?? "", ...form },
+        error: result.message,
+        edit: editReleaseMetaOf(repo, row),
+      }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/releases/delete (upstream DeleteRelease,
+ * web.go:1523): the write gate, then deleteReleaseFromForm over the form's
+ * `id` (the edit page's red button carrier) — success 303s onto the list
+ * with the ?deleted= flash (upstream JSONRedirect + deletion_success's
+ * flash), a missing id 404-shells (upstream NotFound).
+ */
+async function releaseDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await releasesWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  if (resolved.route.family !== "release-delete") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the gate above admitted only users
+  const id = parseReleaseDeleteForm(await readUrlEncodedForm(c.req.raw));
+  if (id === null) return respond(c.html(renderNotFound(ctx), 404));
+  const doerRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (doerRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const result = await deleteReleaseFromForm({
+    env: c.env,
+    request: c,
+    repo,
+    pair,
+    doer: doerRow,
+    id,
+    origin: url.origin,
+  });
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    new Response(null, {
+      status: 303,
+      headers: { location: `/${repo.ownerNamespace}/${repo.slug}/releases?deleted=${encodeURIComponent(result.name)}` },
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The wave-20 releases family (pages/releases.tsx — upstream's web.go:1505-
 // 1527 group at the landed api/services/releases.ts + release-assets.ts
 // reads and the SPEC-0005 create arm)
@@ -4005,7 +4316,18 @@ async function releasesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const canWrite = await canWriteRepo(c.env, repo, viewer);
   const data = await loadReleasesData(c.env, c.env.DB, repo, canWrite, url.searchParams, url.origin);
   data.canCreate = canWrite;
-  return respond(c.html(renderReleasesPage(ctx, data), 200));
+  // The wave-33 delete write's flash params (the tags page's wave-33
+  // convention — the POST 303s back with ?deleted=; display-only).
+  return respond(
+    c.html(
+      renderReleasesPage(ctx, data, {
+        deleted: url.searchParams.get("deleted"),
+        errorKind: url.searchParams.get("delete_error"),
+        errorName: url.searchParams.get("name") ?? "",
+      }),
+      200,
+    ),
+  );
 }
 
 /** GET /{owner}/{repo}/releases/new (pages/releases.tsx — upstream
@@ -4219,7 +4541,23 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     const page = parsePageNumber(url.searchParams.get("page"));
     const keyword = (url.searchParams.get("q") ?? "").slice(0, 255);
     const data = await loadTagsData(c.env, c.env.DB, repo, { page, keyword, viewer });
-    return respond(c.html(renderTagsPage({ ctx, data }), 200));
+    // The wave-33 delete write's flash params (the branches page's
+    // query-param convention — the POST 303s back with ?deleted=/
+    // ?delete_error=; display-only).
+    return respond(
+      c.html(
+        renderTagsPage({
+          ctx,
+          data,
+          flash: {
+            deleted: url.searchParams.get("deleted"),
+            errorKind: url.searchParams.get("delete_error"),
+            errorName: url.searchParams.get("name") ?? "",
+          },
+        }),
+        200,
+      ),
+    );
   }
 
   // U3 page switch (render.tsx — home | commits | src), with the 404 shell
@@ -4961,3 +5299,22 @@ uiRouter.post("/:owner/:repo/fork", (c) => repoForkSubmit(c));
 uiRouter.get("/:owner/:repo/archive/*", (c) => archiveFileDownload(c));
 uiRouter.get("/:owner/:repo/archive", (c) => archiveFileDownload(c));
 uiRouter.get("/:owner/:repo/commit/:lbsha/load-branches-and-tags", (c) => commitContainedRefsJson(c));
+// Wave-33 tags tails + releases edit/delete (parseUiRoute claims exactly
+// these shapes — upstream's web.go:1499 `/tags/list` aux literal, web.go:1501
+// `/tags/delete` POST, web.go:1519-1520 `/releases/edit/*` combo and
+// web.go:1523 `/releases/delete` POST; the POSTs run the §2.8
+// sameOriginGuard first and the POST-only tails answer GET with chi's 405 —
+// the hook test/delete convention; the edit combo carries GET + POST). No
+// earlier registration can absorb these: the "list"/"delete" tails under
+// /tags and /releases are literals no registered pattern carries (the
+// wave-20 /releases/tag/* catch-all matches only the "tag" head), the
+// 5-segment /releases/edit/* shape is deeper than every 4-segment releases
+// line, and unclaimed shapes never reach the sub-app — the dispatcher
+// consults handlesUiRoute first.
+uiRouter.get("/:owner/:repo/tags/list", (c) => tagListAuxJson(c));
+uiRouter.post("/:owner/:repo/tags/delete", (c) => tagsDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/tags/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/:owner/:repo/releases/edit/*", (c) => releaseEditPage(c));
+uiRouter.post("/:owner/:repo/releases/edit/*", (c) => releaseEditSubmit(c));
+uiRouter.post("/:owner/:repo/releases/delete", (c) => releaseDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/releases/delete", () => methodNotAllowed("POST"));
