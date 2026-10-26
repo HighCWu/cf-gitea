@@ -72,6 +72,9 @@ beforeEach(async () => {
     // the wave-36 stranger-arm slugs (their trailing suite's bases)
     "cf-gitea-stub/hpr-s1",
     "cf-gitea-stub/hpr-s2",
+    // the wave-38 live-create slugs (the opened-payload + merge tests below)
+    "cf-gitea-stub/hpr-open",
+    "cf-gitea-stub/hpr-mrg",
   ]) {
     const cell = env.REPO.getByName(cellName);
     const { refs } = await cell.listRefs();
@@ -722,5 +725,129 @@ describe("the payload emitters — every issue/assignee/review webhook family re
     }
     expectPayloadShowsHead(JSON.parse(approval.payloadContent) as FamilyPayload, "reviewed", fixture.forkId, "alice/hpr-rev");
     expectPayloadShowsHead(JSON.parse(request.payloadContent) as FamilyPayload, "review_requested", fixture.forkId, "alice/hpr-rev");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wave-38: the pulls.ts routes' OWN payload assemblies. Upstream converts TWICE
+// per mutation — the API body serializes convert.ToAPIPullRequest (the
+// doer-gated "single" render) while the notifier builds the payload with
+// ToPayloadPullRequest ("payload"; create: pull.go:558 vs notifier.go:368 —
+// the route's response and its notifier are separate conversions upstream
+// too). The three arms covered here: the POST create dual-use split, the merge
+// "closed"+merged payload (upstream's only PR render on that path — the route
+// answers a bare StatusOK, pull.go MergePullRequest → notifier.go:715), and
+// the PATCH edited/closed/reopened payloads (notifier.go:225/:397/:260).
+// Slugs hpr-open/hpr-mrg are LIVE creates — their refs/pull land on the base
+// cells, so both joined the beforeEach cleanup list (append-only).
+// ---------------------------------------------------------------------------
+
+describe("the pulls.ts payload assemblies — create dual-use, merge + PATCH payloads render the head repo (wave-38)", () => {
+  it("the create route converts TWICE — the 201 response keeps the single render and the opened payload gets its own (pull.go:558 vs notifier.go:368)", async () => {
+    // The stub creates a PR from its OWN private fork: the create route's
+    // anti-enumeration CanRead guard (a16f60e) means the creating doer always
+    // passes the head-read gate, so a live hide/show differential is
+    // unreachable at create — upstream has the same property (NewPullRequest
+    // renders with the poster). The assertion is the DUAL-USE split itself:
+    // both surfaces carry the fork, each from its own conversion.
+    const fixture = await seedForkWithFeature("hpr-open", { owner: "stub" });
+    await clearWebhookTables();
+    await seedRepoHook(fixture.baseId);
+    const created = await createForkPull("hpr-open", "cf-gitea-stub/hpr-open-fork:feature");
+    expect(created.status).toBe(201);
+
+    // API side (the "single" render — the creating doer OWNS the fork: owner block).
+    const body = await created.json<{ head: HeadBlock }>();
+    expect(body.head).toMatchObject({ label: "feature", repo_id: Number(fixture.forkId) });
+    expect(body.head.repo).toMatchObject({
+      full_name: "cf-gitea-stub/hpr-open-fork",
+      private: true,
+      permissions: { admin: true, push: true, pull: true },
+    });
+
+    // Payload side (the "payload" render): the opened delivery carries the
+    // fork block from its OWN render — not a borrowed API response object.
+    const rows = await deliveryRows();
+    const opened = rows.find((row) => row.eventType === "pull_request");
+    if (opened === undefined) {
+      throw new Error(`no pull_request delivery among: ${rows.map((row) => row.eventType).join(",")}`);
+    }
+    const payload = JSON.parse(opened.payloadContent) as FamilyPayload;
+    expect(payload.action).toBe("opened");
+    expect(payload.pull_request.head.repo_id).toBe(Number(fixture.forkId));
+    expect(payload.pull_request.head.repo).toMatchObject({
+      full_name: "cf-gitea-stub/hpr-open-fork",
+      private: true,
+      permissions: { admin: true, push: true, pull: true },
+    });
+  });
+
+  it("the merge payload shows the head repo the API hides — the visibility-flip differential (MergePullRequest, notifier.go:715)", async () => {
+    // Created LIVE (alice's PUBLIC fork — the stub passes the create gate and
+    // the fork objects carry into the base cell), then the fork flips PRIVATE:
+    // the legal row state the create route cannot produce live. The stub doer
+    // becomes a stranger on the head fork — the flip-back-sensitive shape:
+    // the pre-wave shared "single" render HID the fork in this payload.
+    const fixture = await seedForkWithFeature("hpr-mrg", { owner: "alice" });
+    const created = await createForkPull("hpr-mrg", "alice:feature");
+    expect(created.status).toBe(201);
+    await db().update(repositories).set({ visibility: "private" }).where(eq(repositories.id, fixture.forkId));
+    await expectApiHidesHead("hpr-mrg");
+
+    await clearWebhookTables();
+    await seedRepoHook(fixture.baseId);
+    const merged = await router()("/repos/cf-gitea-stub/hpr-mrg/pulls/1/merge", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "merge" }),
+    });
+    expect(merged.status).toBe(200);
+
+    const rows = await deliveryRows();
+    const closed = rows.find((row) => row.eventType === "pull_request");
+    if (closed === undefined) {
+      throw new Error(`no pull_request delivery among: ${rows.map((row) => row.eventType).join(",")}`);
+    }
+    const payload = JSON.parse(closed.payloadContent) as FamilyPayload & { pull_request: { merged: boolean } };
+    expect(payload.action).toBe("closed");
+    expect(payload.pull_request.merged).toBe(true);
+    expect(payload.pull_request.head.repo_id).toBe(Number(fixture.forkId));
+    expect(payload.pull_request.head.repo).toMatchObject({
+      full_name: "alice/hpr-mrg",
+      private: true,
+      // the stub stranger's block on the now-private fork (pull.go:186-190)
+      permissions: { admin: false, push: false, pull: false },
+    });
+  });
+
+  it("the PATCH payloads show the hidden head repo — edited (title+body), closed, reopened (notifier.go:225/:397/:260)", async () => {
+    const fixture = await seedPrivateForkPull("hpr-pat");
+    await expectApiHidesHead("hpr-pat");
+
+    await clearWebhookTables();
+    await seedRepoHook(fixture.baseId);
+    const patch = (json: Record<string, unknown>) =>
+      router()("/repos/cf-gitea-stub/hpr-pat/pulls/1", { method: "PATCH", headers: authHeaders, body: JSON.stringify(json) });
+    expect((await patch({ title: "renamed fork PR" })).status).toBe(201);
+    expect((await patch({ body: "new body" })).status).toBe(201);
+    expect((await patch({ state: "closed" })).status).toBe(201);
+    expect((await patch({ state: "open" })).status).toBe(201);
+
+    const rows = await deliveryRows();
+    const pulls = rows.filter((row) => row.eventType === "pull_request");
+    const parsed = pulls.map((row) => JSON.parse(row.payloadContent) as FamilyPayload & { changes?: Record<string, unknown> });
+    expect(parsed.map((payload) => payload.action)).toEqual(["edited", "edited", "closed", "reopened"]);
+    // the two edited deliveries carry their upstream `changes` halves
+    expect(parsed[0]?.changes).toMatchObject({ title: { from: "stranger fork PR" } });
+    expect(parsed[1]?.changes).toMatchObject({ body: { from: "" } });
+    // EVERY delivery renders the stranger-private fork for the receivers
+    for (const payload of parsed) {
+      expect(payload.pull_request.head.repo_id).toBe(Number(fixture.forkId));
+      expect(payload.pull_request.head.repo).toMatchObject({
+        full_name: "alice/hpr-pat",
+        private: true,
+        permissions: { admin: false, push: false, pull: false },
+      });
+    }
   });
 });

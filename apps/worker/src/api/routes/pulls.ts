@@ -1066,13 +1066,21 @@ export function registerPullRoutes(
         issue = updated[0] ?? issue;
       }
 
+      // Upstream converts TWICE at the create route: the 201 body serializes
+      // convert.ToAPIPullRequest (pull.go:558) while pull_service.NewPullRequest
+      // (pull.go:544) already fired webhookNotifier.NewPullRequest, whose opened
+      // payload is a SEPARATE conversion — ToPayloadPullRequest (notifier.go:368).
+      // The split mirrors that: the API response keeps the doer-gated "single"
+      // render, the opened payload gets its own "payload" render (head.repo
+      // reaches the receivers regardless of the doer, convert/pull.go:33-37).
       const rendered = await toApiPullRequest(c.env.DB, viewer, found, issue, pr, "single");
+      const payloadRendered = await toApiPullRequest(c.env.DB, viewer, found, issue, pr, "payload");
       // Webhook: pull_request opened.
       await emitPullWebhook(c, {
         repoId: found.repo.id,
         ownerId: found.repo.ownerId,
         eventType: "pull_request",
-        payload: pullRequestPayload("opened", rendered, issue.index, toApiRepository(viewerOf(c), found), c.get("authUser")),
+        payload: pullRequestPayload("opened", payloadRendered, issue.index, toApiRepository(viewerOf(c), found), c.get("authUser")),
       });
       return c.json(rendered, 201);
     },
@@ -1139,13 +1147,15 @@ export function registerPullRoutes(
         if (updated !== null) {
           issue = updated;
         }
+        // The edited payload is upstream's ToPayloadPullRequest render
+        // (IssueChangeTitle, webhook/notifier.go:225) — payload mode.
         await emitPullWebhook(c, {
           repoId: found.repo.id,
           ownerId: found.repo.ownerId,
           eventType: "pull_request",
           payload: pullRequestPayload(
             "edited",
-            await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "single"),
+            await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
             issue.index,
             toApiRepository(viewerOf(c), found),
             c.get("authUser"),
@@ -1163,13 +1173,14 @@ export function registerPullRoutes(
           throw new ApiError(409, "the issue is already changed");
         }
         issue = updated;
+        // IssueChangeContent's payload render (webhook/notifier.go:397).
         await emitPullWebhook(c, {
           repoId: found.repo.id,
           ownerId: found.repo.ownerId,
           eventType: "pull_request",
           payload: pullRequestPayload(
             "edited",
-            await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "single"),
+            await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
             issue.index,
             toApiRepository(viewerOf(c), found),
             c.get("authUser"),
@@ -1256,13 +1267,14 @@ export function registerPullRoutes(
             asApiError(error);
             throw error;
           }
+          // IssueChangeStatus's payload render (webhook/notifier.go:260).
           await emitPullWebhook(c, {
             repoId: found.repo.id,
             ownerId: found.repo.ownerId,
             eventType: "pull_request",
             payload: pullRequestPayload(
               "closed",
-              await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "single"),
+              await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
               issue.index,
               toApiRepository(viewerOf(c), found),
               c.get("authUser"),
@@ -1275,13 +1287,14 @@ export function registerPullRoutes(
             asApiError(error);
             throw error;
           }
+          // IssueChangeStatus's payload render (webhook/notifier.go:260).
           await emitPullWebhook(c, {
             repoId: found.repo.id,
             ownerId: found.repo.ownerId,
             eventType: "pull_request",
             payload: pullRequestPayload(
               "reopened",
-              await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "single"),
+              await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
               issue.index,
               toApiRepository(viewerOf(c), found),
               c.get("authUser"),
@@ -1555,10 +1568,14 @@ export function registerPullRoutes(
         now: new Date(),
       });
 
-      // Webhook: pull_request closed with merged=true (the merged trio set).
+      // Webhook: pull_request closed with merged=true (the merged trio set) —
+      // upstream's MergePullRequest notifier renders ToPayloadPullRequest
+      // (webhook/notifier.go:689-721, payload @715 with HookIssueClosed @718;
+      // services/pull Merge fires it and the route answers a bare StatusOK, so
+      // this payload is the path's ONLY PR render): payload mode.
       const merged = await findPullRequestByIndex(c.env.DB, found.repo.id, checked.index);
       if (merged !== null) {
-        const rendered = await toApiPullRequest(c.env.DB, viewerOf(c), found, merged.issue, merged.pullRequest, "single");
+        const rendered = await toApiPullRequest(c.env.DB, viewerOf(c), found, merged.issue, merged.pullRequest, "payload");
         await emitPullWebhook(c, {
           repoId: found.repo.id,
           ownerId: found.repo.ownerId,
