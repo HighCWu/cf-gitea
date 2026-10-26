@@ -615,7 +615,7 @@ materialized oid is a deterministic function of (name, peel), so rename-back and
 fork/generate cycles are stable; name and peeled commit always match the source, only
 the oid of a tag that originally carried a tagger line or message differs. Surfaces:
 fork and template-generate ride this §5.3 consumer (`src/repos/fork-task.ts`
-`completeLooseImport`), rename/transfer rides the same RPCs (`src/repos/carry.ts`
+`replicateRepoCopy`), rename/transfer rides the same RPCs (`src/repos/carry.ts`
 `carryRepoCell` — the module header holds the full fidelity note, and is the
 authoritative detail).
 
@@ -658,15 +658,20 @@ deliberately NOT taken: either is an engine deviation under the §8 NOTICE
 discipline, and 8828f43 is engine-untouched / NOTICE-free by design; the
 fidelity limit lifts when an engine wave takes that work. Supersession note
 for the §5.3.1 table below (recorded against the pre-8828f43 tree, half an
-hour before the redesign landed): the "Whole-catalog copy vs depth-1 clone"
-row's mechanism claim — whole catalog PLUS the loose closure via this §5.3
-pass — holds, but its `src/repos/fork-task.ts` cites (`:248-300` and
-`completeLooseImport :191-208`) name the pre-redesign shape; the as-built
+hour before the redesign landed): the table's `src/repos/fork-task.ts` /
+`src/repos/carry.ts` cites then named the pre-redesign shape — the
+"Whole-catalog copy vs depth-1 clone" row's `:248-300` and
+`completeLooseImport :191-208` among them (that row's mechanism claim — whole
+catalog PLUS the loose closure via this §5.3 pass — holds). The as-built
 symbols are `replicateRepoCopy` / `replicateCatalogAndLooseClosure` +
-`carryLooseRefs`, and the annotated-tag paragraph above's `completeLooseImport`
-mention is superseded the same way (that paragraph's two-class tag record, and
-the "Annotated-tag loose fidelity" row, are unaffected). Where those cites and
-this paragraph disagree, this paragraph is the as-built record.
+`carryLooseRefs`; the historical cites were refreshed in place at the
+2026-10-26 wave-37 cite refresh (every drifted table pin, plus the
+annotated-tag paragraph above's `completeLooseImport` mention →
+`replicateRepoCopy`), so the table now cites the current code. That
+paragraph's two-class tag record and the "Annotated-tag loose fidelity" row's
+record are unaffected by the redesign — only their pins moved. Where the
+original pre-redesign pins and this paragraph disagreed, this paragraph was
+the as-built record; the refreshed table agrees with it.
 
 #### 5.3.1 As-built divergence record — the repo-copy surface (fork / template-generate / rename carry)
 
@@ -674,26 +679,28 @@ Consolidated record of the intentional divergences from upstream
 ForkRepository/GenerateRepository/rename that previously lived only in the
 module documentation headers (`src/repos/fork-task.ts`,
 `src/api/services/generate-repo.ts`, `src/repos/carry.ts`, and the adjacent
-`src/api/services/forks.ts` service header). Recorded 2026-10-26; every cite
-below was verified against the current code and the pinned `gitea/` submodule
-on that date. This is a record only — no new decisions.
+`src/api/services/forks.ts` service header). Recorded 2026-10-26; the
+`src/repos/*` pins were refreshed in place to the as-built 8828f43 tree at the
+same date's wave-37 cite refresh; every cite below was verified against the
+current code and the pinned `gitea/` submodule on that date. This is a record
+only — no new decisions.
 
 | Divergence | Upstream behavior (pinned submodule) | This stack | Where implemented |
 |---|---|---|---|
-| Fork wire emptiness during creation | `ForkRepository` builds the row with `IsEmpty` copied from the base before the clone (`services/repository/fork.go:100`); the synchronous flow never serves a fork whose content flag is not settled | The fork row is minted `is_empty=true` (column default) and the wire serves `empty:true` for the whole `creating` window — nothing is servable before finalize — then the settle copies the source's emptiness | mint `src/repos/service.ts:296` + `src/db/schema.ts:42`; wire `src/api/services/repository.ts:317`; settle `src/repos/fork-task.ts:146,332` |
-| `num_forks` tally timing | `IncrementRepoForkNum` runs INSIDE `ForkRepository`'s creation transaction (`services/repository/fork.go:108-118`, call `:112`; `models/repo/fork.go:57-61`) — the tally moves at row mint; the template-generate copy never counts | The increment rides the settle's ONE D1 batch, guarded by the fork row still `creating` — the tally moves when the fork becomes SERVABLE, not at mint (a template-generated repo never counts, same as upstream). Fork-delete/child-reset counter arms keep it honest (`services/repository/delete.go:224-228` / `:282-285` ↔ `src/repos/service.ts:604-611,632-637`) | `src/repos/fork-task.ts:339-350` (`settleForkRow`); column = migration 0031, documented at `src/db/schema.ts:179-203` |
-| Orphaned fork shell | No equivalent — the fork is one synchronous transaction; the source cannot vanish mid-create | Source deleted while the message sits in the queue: the shell settles ready-empty (a visible empty repo beats a permanent `creating`), the tally arm matches nothing, no `fork` event | `src/repos/fork-task.ts:129-142` |
+| Fork wire emptiness during creation | `ForkRepository` builds the row with `IsEmpty` copied from the base before the clone (`services/repository/fork.go:100`); the synchronous flow never serves a fork whose content flag is not settled | The fork row is minted `is_empty=true` (column default) and the wire serves `empty:true` for the whole `creating` window — nothing is servable before finalize — then the settle copies the source's emptiness | mint `src/repos/service.ts:296` + `src/db/schema.ts:42`; wire `src/api/services/repository.ts:317`; settle `src/repos/fork-task.ts:144,330` |
+| `num_forks` tally timing | `IncrementRepoForkNum` runs INSIDE `ForkRepository`'s creation transaction (`services/repository/fork.go:108-118`, call `:112`; `models/repo/fork.go:57-61`) — the tally moves at row mint; the template-generate copy never counts | The increment rides the settle's ONE D1 batch, guarded by the fork row still `creating` — the tally moves when the fork becomes SERVABLE, not at mint (a template-generated repo never counts, same as upstream). Fork-delete/child-reset counter arms keep it honest (`services/repository/delete.go:224-228` / `:282-285` ↔ `src/repos/service.ts:604-611,632-637`) | `src/repos/fork-task.ts:344-357` (`settleForkRow`); column = migration 0031, documented at `src/db/schema.ts:179-203` |
+| Orphaned fork shell | No equivalent — the fork is one synchronous transaction; the source cannot vanish mid-create | Source deleted while the message sits in the queue: the shell settles ready-empty (a visible empty repo beats a permanent `creating`), the tally arm matches nothing, no `fork` event | `src/repos/fork-task.ts:127-140` |
 | Lost enqueue strands `creating` | Synchronous clone in-request; failure cleans up via the deferred `cleanupRepository` (`fork.go:125-132`) | A failed REPO_TASKS enqueue leaves the fork `creating`: logged admin-notice posture, the 202 stands | `src/api/services/forks.ts:134-145` |
 | `IsPrivate` copy rule | `IsPrivate: base.IsPrivate \|\| base.Owner.Visibility == private` (`fork.go:99`) — the base OWNER's visibility ORs in | Only the base repo's visibility flag copies (no org/user visibility columns yet) | `src/api/services/forks.ts:117` |
 | No LFS copy | `git_model.CopyLFS` after the copy on both paths (`fork.go:117`, `generate.go:299`; `models/git/lfs.go:256`) | No LFS arm on fork or generate — LFS objects are not copied | Absence verified across `src/repos/fork-task.ts` / `src/api/services/generate-repo.ts` (header claim, current) |
 | No repo-count limit | Generate: `CanCreateRepoIn` → `ErrReachLimitOfRepo` (`template.go:71-75`); fork: sibling `CanForkRepoIn` → same error (`fork.go:68-71`) | Neither copy path checks any repo-count limit | Absence verified repo-wide (no `CanCreateRepoIn`/`ReachLimit` in `apps/worker/src`) |
-| Size-settle failure posture | Fork path: `UpdateRepoSize` failure is logged and ignored ("even if below operations failed, it could be ignored", `fork.go:189-192`); generate path: the error FAILS the generate (`generate.go:295-297`) | The ignore posture applies to BOTH paths: size re-accounting failures log and keep the previous settled value, never fail the copy | `src/repos/fork-task.ts:292-299` (`syncRepoSizeFromStorage`) |
+| Size-settle failure posture | Fork path: `UpdateRepoSize` failure is logged and ignored ("even if below operations failed, it could be ignored", `fork.go:189-192`); generate path: the error FAILS the generate (`generate.go:295-297`) | The ignore posture applies to BOTH paths: size re-accounting failures log and keep the previous settled value, never fail the copy | `src/repos/fork-task.ts:228-235` (`syncRepoSizeFromStorage` inside `replicateRepoCopy`) |
 | No template variable substitution | `generateRepoCommit` expands `{YEAR}\|{MONTH_ENGLISH}\|{REPO_NAME}\|{TEMPLATE_NAME}\|{REPO_OWNER}\|{TEMPLATE_OWNER}\|…` transformers in `.gitea/template`-matched files (`generate.go:33-90` transformers + `generateExpansion`, `:154-168` `substGiteaTemplateFile`, driven from `:253-258`) | Byte-faithful catalog copy — no expansion pass exists | `src/api/services/generate-repo.ts:155-157` |
-| Whole-catalog copy vs depth-1 clone | `generateRepoCommit` clones the template at depth 1 on its default branch and re-inits with a fresh commit (`generate.go:233-239`) | The generate copy adopts the template's whole pack catalog plus the loose closure — a superset of the default branch — via the same §5.3 pass the fork consumer runs | `src/repos/fork-task.ts:248-300` (+ `completeLooseImport` `:191-208`) |
+| Whole-catalog copy vs depth-1 clone | `generateRepoCommit` clones the template at depth 1 on its default branch and re-inits with a fresh commit (`generate.go:233-239`) | The generate copy adopts the template's whole pack catalog plus the loose closure — a superset of the default branch — via the same §5.3 pass the fork consumer runs | `src/repos/fork-task.ts:210` (`replicateRepoCopy`; body `replicateCatalogAndLooseClosure` `:244-306`) + `carryLooseRefs` (`src/repos/carry.ts:438`) |
 | Inert template units | Topics, git hooks, webhooks, avatar, issue labels, protected branches each have a copy arm (`template.go:141`, `:148`, `:155`, `:162`, `:169`, `:175`) | The flags are accepted — satisfying IsValid's at-least-one rule (`generate.go:324-329`) — but only `git_content` copies; the rest are inert and the request succeeds with a bare copy | `src/api/services/generate-repo.ts:70-80` (parse) / `:155` (only `git_content` honored) |
-| No CreateRepository webhook on generate | `notify_service.CreateRepository` ends `GenerateRepository` (`template.go:191`) | The generate path emits no repo-create event yet; the fork path DOES emit `fork` (`services/webhook/notifier.go:86-91` ↔ `src/repos/fork-task.ts:149-176`, SPEC-0005 §3.5) | Absence verified in `src/api/services/generate-repo.ts` |
-| Annotated-tag loose fidelity | Upstream moves the `.git` storage content, so tag-object bytes survive fork/generate/rename | As recorded in the paragraph above: packed tips byte-identical; loose tips re-materialized `tagger=null`/`message=""` — oid may differ, name and peel identical | `src/repos/carry.ts:373-405` (`carryLooseRefs`); detail in the paragraph above |
-| Rename/transfer degraded carry floor | `ChangeRepositoryName` renames the git-repo storage itself (`git.RenameRepository`, `services/repository/transfer.go:369-397`) — content moves with the name | D1 lands first; the cell carry is best-effort synchronous — a carry failure is logged, the D1 mutation stands, and the new URL serves empty until a push heals it | `src/repos/carry.ts:140-249` via `src/repos/service.ts:749-756` (route wiring `src/api/routes/repo.ts:462`) |
+| No CreateRepository webhook on generate | `notify_service.CreateRepository` ends `GenerateRepository` (`template.go:191`) | The generate path emits no repo-create event yet; the fork path DOES emit `fork` (`services/webhook/notifier.go:86-91` ↔ `src/repos/fork-task.ts:147-174`, SPEC-0005 §3.5) | Absence verified in `src/api/services/generate-repo.ts` |
+| Annotated-tag loose fidelity | Upstream moves the `.git` storage content, so tag-object bytes survive fork/generate/rename | As recorded in the paragraph above: packed tips byte-identical; loose tips re-materialized `tagger=null`/`message=""` — oid may differ, name and peel identical | `src/repos/carry.ts:438-484` (`carryLooseRefs`); detail in the paragraph above |
+| Rename/transfer degraded carry floor | `ChangeRepositoryName` renames the git-repo storage itself (`git.RenameRepository`, `services/repository/transfer.go:369-397`) — content moves with the name | D1 lands first; the cell carry is best-effort synchronous — a carry failure is logged, the D1 mutation stands, and the new URL serves empty until a push heals it | `src/repos/carry.ts:181-299` (`carryRepoCell`) via `src/repos/service.ts:749-756` (route wiring `src/api/routes/repo.ts:462`) |
 
 Header cites corrected during this consolidation (the headers themselves belong
 to their module owners and were not edited): `src/api/services/forks.ts:39-41`
