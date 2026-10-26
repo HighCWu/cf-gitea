@@ -560,6 +560,12 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
       // wave-api-badges-licenses-template: the template flag (upstream
       // Repository.IsTemplate) — appended LAST like every ALTER sweep.
       ["is_template", "INTEGER", 1, 0],
+      // wave-repo-size (0029) + star/watch counters (0030): the R2-accounted
+      // KiB and the maintained edge counters — the ALTER sweep continues
+      // additive-only. (num_forks lands with its own wave's migration.)
+      ["size_kb", "INTEGER", 1, 0],
+      ["num_stars", "INTEGER", 1, 0],
+      ["num_watches", "INTEGER", 1, 0],
     ]);
     // The appended columns keep the ALTER ADD COLUMN constraints: is_mirror
     // is NOT NULL with the keyword-alias default (`false` = 0), original_url
