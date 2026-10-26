@@ -4,22 +4,29 @@
  * 9516bf1, the `?action=` form-value dispatch over web.go:1611-1626's two
  * combos).
  *
- * ## DISCLOSED RED — REAL BUG ESCALATED TO THE ORCHESTRATOR (2026-10-26)
+ * ## THE ESCALATED BUG — FIXED AT a58cad5 (was: DISCLOSED RED, 2026-10-26)
  *
- * The mounted wiki family is UNREACHABLE: `parseUiRoute`'s EARLY wave-46
- * `head === "wiki"` arm (the wiki-blob-excerpt twin, commit 67adfb7,
- * index.ts ~2881) hard-returns `null` for every non-blob_excerpt wiki
- * shape, and window-2e's wiki-family arm (commit 9516bf1, index.ts ~3093)
- * sits after it — dead code. Every `/{owner}/{repo}/wiki[/*]` URL parses
- * null (production: the engine's 404; direct uiRouter fetch: the drift
- * guard's plain "404 Not Found"). The mount commit's "dispatcher 56/56"
- * never exercised these four routes; the smoke drives loaders, not the
- * router. The RED pin below states the intended claim; every matrix arm
- * downstream fails on that single root cause and flips green with the
- * one-hunk parse fix in index.ts (shared/orchestrator-owned — not this
- * agent's file). Full detail in the RED describe's comment.
+ * This matrix caught the mounted wiki family UNREACHABLE: `parseUiRoute`'s
+ * EARLY wave-46 `head === "wiki"` arm (the wiki-blob-excerpt twin, commit
+ * 67adfb7) hard-returned `null` for every non-blob_excerpt wiki shape, and
+ * window-2e's wiki-family arm (commit 9516bf1) sat after it — dead code.
+ * The suite shipped DISCLOSED RED (23 failing on that single root cause)
+ * and the fix landed at a58cad5 in TWO layers, exactly the split the
+ * runtime proof exposed:
  *
- * The matrix body (otherwise final, written against the mounted behavior):
+ *   1. PARSE SHADOW: the early excerpt arm now claims ONLY its exact
+ *      5-segment shape (`wiki/blob_excerpt/{sha}`); every other wiki tail
+ *      falls through to the wiki-family arm (`family: "wiki"`, rawTail).
+ *   2. REGISTRATION ORDER: the `/:owner/:repo/wiki/*` wildcard had
+ *      registered BEFORE `/:owner/:repo/wiki/blob_excerpt/:sha`, so even
+ *      unshadowed the excerpt fetches died on the page handler's drift
+ *      guard — reordered specific-before-wildcard.
+ *
+ * The claim pins below keep guarding both layers (the family shapes, the
+ * excerpt twin's exact 5-segment claim, and a live 200 through the mounted
+ * route); the full matrix runs green over the real production path.
+ *
+ * The matrix body (per-arm notes as originally written):
  *
  * The committed smoke (repo-wiki.smoke.test.tsx) owns one happy
  * path per page through the LOADERS + renderers directly — it never drives
@@ -272,39 +279,33 @@ beforeAll(async () => {
   await seedWikiHistory(await pairFor("w107pager"));
 });
 
-// --- RED: the parser claim (the escalated REAL bug) ---------------------------------
+// --- the parser claim (the escalated bug's pin — fixed at a58cad5) -------------------
 //
-// REAL BUG, ESCALATED TO THE ORCHESTRATOR (matrix left RED on purpose):
-// `parseUiRoute` carries TWO `head === "wiki"` arms. The EARLIER one is
-// wave-46's wiki-blob-excerpt twin (index.ts ~2881, commit 67adfb7):
+// REAL BUG #11 of the polish program, caught by this matrix's first run and
+// now FIXED (a58cad5, two layers):
+// `parseUiRoute` carried TWO `head === "wiki"` arms. The EARLIER one was
+// wave-46's wiki-blob-excerpt twin (commit 67adfb7):
 //
 //   if (head === "wiki") {
 //     if (rest.length !== 2 || rest[0] !== "blob_excerpt") return null;
 //     return { family: "wiki-blob-excerpt", ... };
 //   }
 //
-// It answers `null` for EVERY other wiki shape — including the bare and
-// single-tail forms — and the window-2e wiki-family arm (index.ts ~3093,
-// commit 9516bf1: `return { family: "wiki", owner, repo, rawTail }`) sits
-// AFTER it, so it is unreachable dead code. The mounted wiki family
-// (GET+POST /{owner}/{repo}/wiki[/*]) therefore never parses: the dispatcher's
-// handlesUiRoute is false (production falls to the engine's 404) and a direct
-// uiRouter fetch dies on the prologue's drift guard (Hono's plain "404 Not
-// Found"). The smoke never saw this — it drives the loaders/renders directly,
-// not the router. The fix belongs in index.ts (shared file — NOT this agent's
-// ownership): fold the blob_excerpt shape into the wiki family arm, e.g.
-//
-//   if (head === "wiki") {
-//     if (rest.length === 2 && rest[0] === "blob_excerpt") {
-//       try { return { family: "wiki-blob-excerpt", owner, repo, sha: decodeURIComponent(rest[1] as string) }; } catch { return null; }
-//     }
-//     try { return { family: "wiki", owner, repo, rawTail: rest.map((s) => decodeURIComponent(s)).join("/") }; } catch { return null; }
-//   }
-//
-// This suite is DISCLOSED RED until that lands: the pin below states the
-// intended claim, and every route-level matrix arm downstream fails on the
-// same plain-404 root cause. Nothing else is asserted as broken.
-describe("RED: the window-2e wiki family claim (escalated — the wave-46 early arm preempts it)", () => {
+// It answered `null` for EVERY other wiki shape — including the bare and
+// single-tail forms — and the window-2e wiki-family arm (commit 9516bf1:
+// `return { family: "wiki", owner, repo, rawTail }`) sat AFTER it, so it
+// was unreachable dead code. The mounted wiki family
+// (GET+POST /{owner}/{repo}/wiki[/*]) therefore never parsed: the
+// dispatcher's handlesUiRoute was false (production fell to the engine's
+// 404) and a direct uiRouter fetch died on the prologue's drift guard
+// (Hono's plain "404 Not Found"). The smoke never saw this — it drives the
+// loaders/renders directly, not the router. LAYER 2 (the same runtime proof
+// exposed it during the fix): the `/:owner/:repo/wiki/*` wildcard had
+// registered BEFORE `/:owner/:repo/wiki/blob_excerpt/:sha`, so even
+// unshadowed the excerpt fetches 404'd on the page handler's drift guard —
+// a58cad5 reordered specific-before-wildcard. The pins below keep guarding
+// both layers.
+describe("the window-2e wiki family claim (the escalated bug's pin — green since a58cad5)", () => {
   it("claims the bare, deep-tail and raw-tail wiki shapes for family wiki", () => {
     expect(parseUiRoute("/w107gal/w107wik/wiki")).toMatchObject({ family: "wiki", owner: "w107gal", repo: "w107wik", rawTail: "" });
     expect(parseUiRoute("/w107gal/w107wik/wiki/Home")).toMatchObject({ family: "wiki", rawTail: "Home" });
