@@ -789,6 +789,28 @@ import {
   renderOrgHookDetailPage,
   renderOrgHooksSettingsPage,
 } from "./pages/org-settings-hooks";
+// Window-2b: the org blocked-users tab + the actions secrets/variables
+// sub-tabs (two-stage waves 55/59, mounted by this window).
+import {
+  applyOrgBlockedForm,
+  loadOrgBlockedUsers,
+  parseOrgBlockedForm,
+  renderOrgBlockedUsersPage,
+} from "./pages/org-settings-blocked";
+import {
+  applyOrgActionsSecretForm,
+  applyOrgActionsVariableCreate,
+  applyOrgActionsVariableUpdate,
+  deleteOrgActionsSecret,
+  deleteOrgActionsVariable,
+  loadOrgActionsSecretsPageData,
+  loadOrgActionsVariablesPageData,
+  parseOrgActionsSecretDeleteForm,
+  parseOrgActionsSecretForm,
+  parseOrgActionsVariableForm,
+  renderOrgActionsSecretsPage,
+  renderOrgActionsVariablesPage,
+} from "./pages/org-settings-actions";
 import {
   applyUserProfileForm,
   loadUserSettingsPageData,
@@ -1970,6 +1992,13 @@ export interface OrgSettingsRoute {
     | "org-settings-hooks" // GET+POST /{org}/settings/hooks (the webhooks list + add form — wave 53)
     | "org-settings-hook-detail" // GET+POST /{org}/settings/hooks/{id} (the edit page — wave 53)
     | "org-settings-hook-delete" // POST /{org}/settings/hooks/{id}/delete (wave 53)
+    | "org-settings-blocked" // GET+POST /{org}/settings/blocked_users (window-2b)
+    | "org-actions-secrets" // GET+POST /{org}/settings/actions/secrets (window-2b)
+    | "org-actions-secrets-delete" // POST .../secrets/delete (window-2b)
+    | "org-actions-variables" // GET /{org}/settings/actions/variables (window-2b)
+    | "org-actions-variables-new" // POST .../variables/new (window-2b)
+    | "org-actions-variables-edit" // POST .../variables/{id}/edit (window-2b)
+    | "org-actions-variables-delete" // POST .../variables/{id}/delete (window-2b)
     | "org-team-edit" // GET+POST /{org}/teams/{id}/edit
     | "org-team-delete" // POST /{org}/teams/{id}/delete
   ;
@@ -2326,6 +2355,27 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (raw[3] === "delete") return { family: "org-settings-delete", owner };
       if (raw[3] === "visibility") return { family: "org-settings-visibility", owner };
       if (raw[3] === "hooks") return { family: "org-settings-hooks", owner };
+      // Window-2b: the blocked_users tab (the committed two-stage module);
+      // the actions sub-tab tails are claimed below the length-4 block.
+      if (raw[3] === "blocked_users") return { family: "org-settings-blocked", owner };
+    }
+    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "secrets") {
+      return { family: "org-actions-secrets", owner };
+    }
+    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "secrets" && raw[5] === "delete") {
+      return { family: "org-actions-secrets-delete", owner };
+    }
+    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "variables") {
+      return { family: "org-actions-variables", owner };
+    }
+    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "variables" && raw[5] === "new") {
+      return { family: "org-actions-variables-new", owner };
+    }
+    if (raw.length === 7 && raw[3] === "actions" && raw[4] === "variables" && raw[6] === "edit" && /^-?\d+$/.test(raw[5] as string)) {
+      return { family: "org-actions-variables-edit", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    if (raw.length === 7 && raw[3] === "actions" && raw[4] === "variables" && raw[6] === "delete" && /^-?\d+$/.test(raw[5] as string)) {
+      return { family: "org-actions-variables-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
     }
     if (raw.length === 5 && raw[3] === "avatar" && raw[4] === "delete") {
       return { family: "org-settings-avatar-delete", owner };
@@ -4861,6 +4911,136 @@ async function orgHookDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   const deleted = await deleteOrgHook(c.env.DB, org, route.id);
   if (!deleted) return respond(c.html(renderNotFound(ctx), 404));
   return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/hooks` } }));
+}
+
+// ---------------------------------------------------------------------------
+// Window-2b: the org blocked-users tab + the actions secrets/variables
+// sub-tabs (the two-stage modules' handoff recipes — same prologue, drift
+// guards, sameOriginGuard-first POSTs).
+// ---------------------------------------------------------------------------
+
+async function orgBlockedUsersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond } = resolved;
+  if (resolved.route.family !== "org-settings-blocked") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgBlockedUsers(c.env.DB, resolved.org);
+  return respond(c.html(renderOrgBlockedUsersPage({ ctx, data, error: null }), 200));
+}
+
+async function orgBlockedUsersSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, viewer, respond } = resolved;
+  if (resolved.route.family !== "org-settings-blocked") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the prologue's silent-auth-failure convention
+  const form = parseOrgBlockedForm(await readUrlEncodedForm(c.req.raw));
+  const result = await applyOrgBlockedForm(c.env.DB, org, { id: viewer.id, isAdmin: viewer.isAdmin }, form);
+  if (result.outcome === "applied") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/blocked_users` } }));
+  }
+  const data = await loadOrgBlockedUsers(c.env.DB, org);
+  return respond(c.html(renderOrgBlockedUsersPage({ ctx, data, error: result.message }), 200));
+}
+
+async function orgActionsSecretsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond } = resolved;
+  if (resolved.route.family !== "org-actions-secrets") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgActionsSecretsPageData(c.env.DB, resolved.org);
+  return respond(c.html(renderOrgActionsSecretsPage(ctx, data), 200));
+}
+
+async function orgActionsSecretsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-secrets") return respond(await c.notFound()); // drift guard
+  const form = parseOrgActionsSecretForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyOrgActionsSecretForm(c.env.DB, org.id, form);
+  if (outcome.outcome === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/secrets` } }));
+  }
+  const data = await loadOrgActionsSecretsPageData(c.env.DB, org);
+  return respond(c.html(renderOrgActionsSecretsPage(ctx, data, outcome.message)));
+}
+
+async function orgActionsSecretsDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-secrets-delete") return respond(await c.notFound()); // drift guard
+  const form = parseOrgActionsSecretDeleteForm(await readUrlEncodedForm(c.req.raw));
+  await deleteOrgActionsSecret(c.env.DB, org.id, form);
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/secrets` } }));
+}
+
+async function orgActionsVariablesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond } = resolved;
+  if (resolved.route.family !== "org-actions-variables") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgActionsVariablesPageData(c.env.DB, resolved.org);
+  return respond(c.html(renderOrgActionsVariablesPage(ctx, data), 200));
+}
+
+async function orgActionsVariablesNew(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-variables-new") return respond(await c.notFound()); // drift guard
+  const form = parseOrgActionsVariableForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyOrgActionsVariableCreate(c.env.DB, org.id, form);
+  if (outcome.outcome === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/variables` } }));
+  }
+  const data = await loadOrgActionsVariablesPageData(c.env.DB, org);
+  if (outcome.outcome === "invalid") {
+    return respond(c.html(renderOrgActionsVariablesPage(ctx, data, outcome.message)));
+  }
+  return respond(c.html(renderNotFound(ctx), 404));
+}
+
+async function orgActionsVariablesEdit(c: Context<{ Bindings: Env }>, variableId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-variables-edit") return respond(await c.notFound()); // drift guard
+  const form = parseOrgActionsVariableForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyOrgActionsVariableUpdate(c.env.DB, org.id, variableId, form);
+  if (outcome.outcome === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/variables` } }));
+  }
+  if (outcome.outcome === "missing") {
+    // Upstream's findActionsVariable miss → ctx.NotFound(nil) — a genuine
+    // 404 (the module handoff's fidelity call).
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const data = await loadOrgActionsVariablesPageData(c.env.DB, org);
+  return respond(c.html(renderOrgActionsVariablesPage(ctx, data, outcome.message)));
+}
+
+async function orgActionsVariablesDelete(c: Context<{ Bindings: Env }>, variableId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-variables-delete") return respond(await c.notFound()); // drift guard
+  const outcome = await deleteOrgActionsVariable(c.env.DB, org.id, variableId);
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/variables` } }));
 }
 
 /**
@@ -7815,6 +7995,16 @@ uiRouter.post("/:owner/settings/hooks", (c) => orgHooksSettingsSubmit(c));
 uiRouter.get("/:owner/settings/hooks/:id", (c) => orgHookDetailPage(c));
 uiRouter.post("/:owner/settings/hooks/:id", (c) => orgHookDetailSubmit(c));
 uiRouter.post("/:owner/settings/hooks/:id/delete", (c) => orgHookDeleteSubmit(c));
+// Window-2b: the blocked_users tab + the actions sub-tabs.
+uiRouter.get("/:owner/settings/blocked_users", (c) => orgBlockedUsersPage(c));
+uiRouter.post("/:owner/settings/blocked_users", (c) => orgBlockedUsersSubmit(c));
+uiRouter.get("/:owner/settings/actions/secrets", (c) => orgActionsSecretsPage(c));
+uiRouter.post("/:owner/settings/actions/secrets", (c) => orgActionsSecretsSubmit(c));
+uiRouter.post("/:owner/settings/actions/secrets/delete", (c) => orgActionsSecretsDelete(c));
+uiRouter.get("/:owner/settings/actions/variables", (c) => orgActionsVariablesPage(c));
+uiRouter.post("/:owner/settings/actions/variables/new", (c) => orgActionsVariablesNew(c));
+uiRouter.post("/:owner/settings/actions/variables/:id/edit", (c) => orgActionsVariablesEdit(c, Number(c.req.param("id"))));
+uiRouter.post("/:owner/settings/actions/variables/:id/delete", (c) => orgActionsVariablesDelete(c, Number(c.req.param("id"))));
 uiRouter.get("/:owner/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
 // Wave-14 org labels family (parseUiRoute claims exactly these shapes; the
 // literal `labels` registers with the wave-9/12 statics so it beats the
