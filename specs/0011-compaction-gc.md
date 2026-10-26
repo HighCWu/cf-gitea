@@ -367,7 +367,10 @@ forward-only migration path with an upgrade txn.
   completed, §7.3's correctness-tier additions landed as engine checks, and
   the capability matrix made TEST-GENERATED (round 8's consistency gate).
   All 15 engine check scripts green, **260 checks total** (was 12 scripts /
-  223 checks at M3.4; +3 scripts, +37 checks).
+  223 checks at M3.4; +3 scripts, +37 checks). (Post-M3.5 growth: SPEC-0013's
+  `check-validate-push.mjs` makes 16 scripts / 269 checks on disk — the
+  2026-10-26 health sweep's verified count, docs/research/
+  engine-e2e-health-2026-10-26.md.)
 
   **§7.2 rows 1-5 — per-row audit and completion.**
   - Row 1 (fetch × compaction concurrency): WAS covered for
