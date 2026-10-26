@@ -49,7 +49,7 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { findRepositoryById } from "../api/services/repository";
 import { TeamsService } from "../api/routes/org-teams";
-import { users, webhookDeliveries, webhooks } from "../db/schema";
+import { repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { authorize } from "../git-http/authorize";
 import { gitHttpGate } from "../git-http/gate";
@@ -583,10 +583,40 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
     const { row, token } = await seedRepoWithToken("pushdelete");
     await seedHook({ repoId: row.id });
     const { tips, pack } = await buildChainPack(null, [
-      { message: "doomed", files: [{ path: "README.md", content: "bye\n" }], time: 1700000020 },
+      { message: "keeper", files: [{ path: "README.md", content: "stay\n" }], time: 1700000020 },
+      { message: "doomed", files: [{ path: "README.md", content: "bye\n" }], time: 1700000021 },
     ]);
-    const tip = tips[0]!;
-    expect((await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: tip, ref: "refs/heads/side" }], pack, token)).status).toBe(200);
+    const keeper = tips[0]!;
+    const tip = tips[1]!;
+    // One receive creating the ADOPTED default (main) and the branch the
+    // delete below removes. The first-pushed branch of an empty repo becomes
+    // the default branch (the gate's settle; upstream pushNewBranch,
+    // services/repository/push.go:255-270), and deleting the default branch
+    // is refused upstream-style (hook_pre_receive.go:140-143, pinned in the
+    // next case) — so the deletion target must not be the adopted default.
+    expect(
+      (
+        await pushThroughGate(
+          row,
+          wiredEngine,
+          [
+            { old: PUSH_ZERO_OID, oid: keeper, ref: "refs/heads/main" },
+            { old: PUSH_ZERO_OID, oid: tip, ref: "refs/heads/side" },
+          ],
+          pack,
+          token,
+        )
+      ).status,
+    ).toBe(200);
+    // The settle-is-empty flip rode push 1: the row left is_empty and adopted
+    // main — the D1 state every later delete verdict (and the delete payload's
+    // repository block) reads.
+    const settled = await drizzle(env.DB)
+      .select({ isEmpty: repositories.isEmpty, defaultBranch: repositories.defaultBranch })
+      .from(repositories)
+      .where(eq(repositories.id, row.id))
+      .get();
+    expect(settled).toMatchObject({ isEmpty: false, defaultBranch: "main" });
     await clearDeliveries();
 
     // A delete receive carries NO pack (the mirror prune-only shape).
@@ -606,6 +636,41 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
     expect(payload).toMatchObject({ ref: "side", ref_type: "branch", pusher_type: "user" });
     expect((payload.repository as { full_name: string }).full_name).toBe("alice/pushdelete");
     expect((payload.sender as { login: string }).login).toBe("Alice");
+  });
+
+  it("deleting the adopted default branch is refused upstream-style and emits nothing", async () => {
+    const { row, token } = await seedRepoWithToken("pushdeldef");
+    await seedHook({ repoId: row.id });
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "only", files: [{ path: "README.md", content: "one\n" }], time: 1700000022 },
+    ]);
+    const tip = tips[0]!;
+    // First push: the settle (upstream pushNewBranch, push.go:255-270) adopts
+    // refs/heads/main as the default branch.
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: tip, ref: "refs/heads/main" }], pack, token))
+        .status,
+    ).toBe(200);
+    await clearDeliveries();
+
+    // ...so deleting it is refused BEFORE finalize with upstream's exact ng
+    // text (hook_pre_receive.go:140-143): the engine never fires onPush, the
+    // push still answers 200 (report-status carries the refusal), and the ref
+    // stands. Pin of the settle-generalization interaction: the delete family
+    // must target a non-default branch, and a refused command must stay
+    // silent (no webhook row) while the receive itself succeeds.
+    const response = await pushThroughGate(
+      row,
+      wiredEngine,
+      [{ old: tip, oid: PUSH_ZERO_OID, ref: "refs/heads/main" }],
+      null,
+      token,
+    );
+    expect(response.status).toBe(200);
+    const report = new TextDecoder().decode(new Uint8Array(await response.arrayBuffer()));
+    expect(report).toContain("ng refs/heads/main Branch main is the default branch and cannot be deleted");
+    expect(await deliveries()).toHaveLength(0);
+    await expectRef(row.ownerNamespace, row.slug, "refs/heads/main", tip);
   });
 
   it("refs/pull/* deltas are never notified (mixed receive)", async () => {
