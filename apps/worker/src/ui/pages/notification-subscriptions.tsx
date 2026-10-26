@@ -868,7 +868,11 @@ function subscriptionsHref(
  *  carried by `has_merged`, issue.go:460-468). */
 function EventLine(props: { item: SubscriptionIssueItem }) {
   const { item } = props;
-  const verb = item.isClosed ? "closed" : item.isPull && item.hasMerged ? "merged" : "opened";
+  // GetLastEventLabel nests HasMerged INSIDE IsClosed (issue.go:460-468):
+  // merging closes the issue, so hasMerged must be tested FIRST or every
+  // merged PR renders "closed" and the merged arm is dead code (the
+  // subscriptions matrix's RED).
+  const verb = item.isPull && item.hasMerged ? "merged" : item.isClosed ? "closed" : "opened";
   return (
     <div class="flex-text-inline">
       {verb} {item.lastEventAt !== null ? <TimeSince unixSeconds={item.lastEventAt} tz="+0000" /> : null}
