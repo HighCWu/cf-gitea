@@ -8,6 +8,7 @@ import type { ReleaseRow } from "../../issues/service";
 import { IssuesService } from "../../issues/service";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
+import { ActionType, recordAction } from "../services/activity-feeds";
 import { issueErrorToApiError } from "../services/issues";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
@@ -72,6 +73,10 @@ import {
  * edit → "updated", EXCEPT the draft→published flip which upstream reaches
  * through UpdateRelease's tag creation (isTagCreated → NewRelease, release.go:
  * 363-366) and therefore maps to "published"; delete → "deleted".
+ *
+ * Activity feeds (specs/activity-feeds.md §3.3): the publish_release
+ * `action` row rides the same emitReleaseEvent seam — published only,
+ * act_user = the release publisher (see emitReleaseEvent).
  */
 
 const notFoundResponse = {
@@ -232,6 +237,15 @@ function releasePayload(
  * release state the payload renders (post-edit for PATCH, the deleted row for
  * DELETE); drafts stay silent per the upstream `!rel.IsDraft` gate
  * (release.go:198,358,435).
+ *
+ * Activity-feed leg (specs/activity-feeds.md §3.3): ONLY the "published"
+ * action records a row — upstream's actionNotifier has a NewRelease method
+ * and no UpdateRelease/DeleteRelease ones (services/feed/notifier.go:458-477:
+ * ActionPublishRelease, content = rel.Title, ref_name =
+ * git.RefNameFromTag(rel.TagName).String() = `refs/tags/<tag>`). act_user is
+ * the RELEASE PUBLISHER (rel.PublisherID), NOT the flipping doer — the
+ * draft→published PATCH keeps the original publisher. Same caught-and-logged
+ * posture as the webhook fan-out, awaited inline.
  */
 async function emitReleaseEvent(
   c: Context<ApiEnv>,
@@ -242,12 +256,28 @@ async function emitReleaseEvent(
   if (row.isDraft) {
     return; // upstream emits nothing for drafts (any action)
   }
+  const repository = toApiRepository(viewerOf(c), found);
   await emitReleaseWebhook(c, {
     repoId: found.repo.id,
     ownerId: found.repo.ownerId,
     eventType: "release",
-    payload: releasePayload(action, await toApiRelease(c.env.DB, viewerOf(c), found, row), toApiRepository(viewerOf(c), found), c.get("authUser")),
+    payload: releasePayload(action, await toApiRelease(c.env.DB, viewerOf(c), found, row), repository, c.get("authUser")),
   });
+  if (action !== "published") {
+    return; // updated/deleted write no action upstream (no notifier method)
+  }
+  try {
+    await recordAction(c.env.DB, {
+      actUserId: row.publisherId,
+      repoId: found.repo.id,
+      opType: ActionType.PublishRelease,
+      isPrivate: repository.private === true,
+      content: row.title,
+      refName: `refs/tags/${row.tagName}`,
+    });
+  } catch (error) {
+    console.error(`[releases] action row failed (${action}): ${errorMessage(error)}`);
+  }
 }
 
 const listReleasesRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>

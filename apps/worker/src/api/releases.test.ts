@@ -23,11 +23,12 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { releaseAssets, releases, repositories, webhookDeliveries, webhooks } from "../db/schema";
+import { releaseAssets, releases, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { createOptionalTokenAuthMiddleware, createStubAuthResolver, createTokenAuthMiddleware } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
+import { registerActivityFeedRoutes } from "./routes/activity-feeds";
 import { registerReleaseRoutes } from "./routes/releases";
 import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
 import { saveRepoSettings } from "./services/repo-settings";
@@ -100,7 +101,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await resetRepoExtrasTables();
-  for (const table of ["webhook_deliveries", "webhooks", "release_assets", "releases", "repositories", "users"]) {
+  for (const table of ["webhook_deliveries", "webhooks", "release_assets", "releases", "action", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare(
@@ -528,5 +529,117 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
     expect((JSON.parse(deliveries[0]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("v2");
     expect((JSON.parse(deliveries[1]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("v1");
     expect(await deliveriesFor(pushHook)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Activity feeds — the publish_release `action` row (specs/activity-feeds.md
+// §3.3): upstream's actionNotifier.NewRelease (services/feed/notifier.go
+// :458-477) writes it ONLY for the "published" action — content = rel.Title,
+// ref_name = refs/tags/<tag> (git.RefNameFromTag(rel.TagName).String()),
+// act_user = the RELEASE PUBLISHER (rel.PublisherID, not the flipping doer).
+// updated/deleted write none; drafts never reach the seam (the !IsDraft gate).
+// ---------------------------------------------------------------------------
+
+/** The releases family + the feeds read, one mount. */
+function feedsApp(): (path: string, init?: RequestInit) => Promise<Response> {
+  const app = new OpenAPIHono<ApiEnv>();
+  app.onError(giteaErrorHandler);
+  const auth = createTokenAuthMiddleware(createStubAuthResolver());
+  const optional = createOptionalTokenAuthMiddleware(createStubAuthResolver());
+  registerReleaseRoutes(app, auth, optional);
+  registerActivityFeedRoutes(app, auth, optional);
+  return (path, init) => Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), env));
+}
+
+describe("activity feeds — publish_release action rows", () => {
+  it("POST a non-draft release records publish_release with content=title and ref_name=refs/tags/<tag>", async () => {
+    const app = feedsApp();
+    const created = await app(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v1.0", name: "First release" }),
+    });
+    expect(created.status).toBe(201);
+    const feed = await app(`${REPO_PATH}/activities/feeds`);
+    expect(feed.status).toBe(200);
+    const body = await feed.json<Array<Record<string, unknown>>>();
+    expect(body).toHaveLength(1);
+    expect(body[0]).toMatchObject({
+      op_type: "publish_release",
+      content: "First release",
+      ref_name: "refs/tags/v1.0",
+      act_user_id: 1,
+      is_private: false,
+    });
+  });
+
+  it("drafts stay silent; the draft→published PATCH records the row with the RELEASE PUBLISHER as act_user (rel.PublisherID, not the flipping doer)", async () => {
+    await drizzle(env.DB).insert(users).values({
+      id: 2,
+      username: "publisher",
+      usernameLower: "publisher",
+      isAdmin: false,
+      status: "active",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    // The doer is the stub (id 1); the release is PUBLISHED BY user 2 — the
+    // action row must keep the publisher (upstream acts on rel.Publisher).
+    const row = await new IssuesService(env.DB).createRelease({
+      repoId: "7301",
+      publisherId: 2,
+      tagName: "v2.0",
+      target: "main",
+      title: "Publisher's release",
+      note: "",
+      isDraft: true,
+    });
+    const app = feedsApp();
+    expect((await (await app(`${REPO_PATH}/activities/feeds`)).json<unknown[]>()).length).toBe(0);
+
+    const patched = await app(`${REPO_PATH}/releases/${row.id}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ draft: false }),
+    });
+    expect(patched.status).toBe(200);
+
+    const body = (await (await app(`${REPO_PATH}/activities/feeds`)).json<Array<Record<string, unknown>>>());
+    expect(body).toHaveLength(1);
+    expect(body[0]).toMatchObject({
+      op_type: "publish_release",
+      content: "Publisher's release",
+      ref_name: "refs/tags/v2.0",
+      act_user_id: 2, // the publisher — NOT the doer (id 1) who flipped the draft
+    });
+  });
+
+  it("updated/deleted release actions record NO row", async () => {
+    const app = feedsApp();
+    const created = await app(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v3.0", name: "Third" }),
+    });
+    expect(created.status).toBe(201);
+    const releaseId = (await created.json<{ id: number }>()).id;
+
+    expect(
+      (
+        await app(`${REPO_PATH}/releases/${releaseId}`, {
+          method: "PATCH",
+          headers: jsonAuth,
+          body: JSON.stringify({ name: "Renamed" }),
+        })
+      ).status,
+    ).toBe(200);
+    expect((await app(`${REPO_PATH}/releases/${releaseId}`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
+
+    // Only the original publish — updated/deleted write none (notifier.go has
+    // no UpdateRelease/DeleteRelease action method).
+    const body = (await (await app(`${REPO_PATH}/activities/feeds`)).json<Array<Record<string, unknown>>>());
+    expect(body).toHaveLength(1);
+    expect(body[0]?.op_type).toBe("publish_release");
+    expect(body[0]?.content).toBe("Third");
   });
 });

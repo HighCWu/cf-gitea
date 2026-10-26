@@ -79,6 +79,7 @@ import {
 } from "../models/pull";
 import { changedFileListSchema, commitListSchema } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { ActionType, recordAction, type ActionDraft } from "../services/activity-feeds";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, changeIssueTitle, hasWorkInProgressPrefix, issueErrorToApiError } from "../services/issues";
 import { parseMilestoneDeadline } from "../services/milestones";
@@ -148,8 +149,8 @@ import { requestedReviewersOf } from "./pull-reviews";
  * pull.go:674-694) and the machinery rides the landed issue_assignees table
  * (replacePullAssignees below; the blocks-enforcement sweep wired
  * pull.go:687's ErrBlockedUser 403 arm and the create-side pull.go:64-65
- * arm here). The FEED events stay the tier-2 surfaces' — this file emits
- * the webhook family only.
+ * arm here). The label/-milestone WEBHOOK sub-events stay the tier-2
+ * surfaces'; this file emits the webhook family only.
  *
  * Webhook triggers (SPEC-0005 §3.5): pull_request opened (POST) / edited
  * (title, body, with `changes{title{from}, body{from}}`) / closed+reopened
@@ -157,6 +158,12 @@ import { requestedReviewersOf } from "./pull-reviews";
  * label/-milestone sub-events ride their tier-2 surfaces;
  * pull_request_assign is emitted HERE since the PATCH assignee replace went
  * live (emitPullAssignWebhook, one event per changed assignee).
+ *
+ * Activity feeds (specs/activity-feeds.md §3.3 tail): the PR-lifecycle
+ * `action` rows (create/close/reopen/merge_pull_request) ride the same
+ * emitPullWebhook seam through the shared recordAction fan-out — see the
+ * activity-feed hook below. Assignee changes write NO row (upstream has no
+ * assign ActionType).
  */
 
 const notFoundResponse = {
@@ -350,6 +357,83 @@ async function emitPullWebhook(
   } catch (error) {
     console.error(`[pulls] webhook fan-out failed (${input.eventType}): ${errorMessage(error)}`);
   }
+  await recordPullAction(c.env, input);
+}
+
+// ---------------------------------------------------------------------------
+// Activity-feed hook (specs/activity-feeds.md §3.3 tail): the PR-family
+// actions upstream's actionNotifier writes (services/feed/notifier.go), one
+// recordAction fan-out per emission, the landed emitters' pattern
+// (services/issue-events.ts / repo-events.ts — caught-and-logged, awaited
+// inline so tests and readers see the rows when the response lands).
+// NewPullRequest → create_pull_request "index|title" (:129-153);
+// IssueChangeStatus → close/reopen_pull_request "index|" (:69-95, the
+// `issue.IsPull` variants); MergePullRequest → merge_pull_request
+// "index|title" (:263-275). The merge reaches this seam as a pull_request
+// "closed" payload whose rendered PR carries merged=true — the
+// payload-derived merge discriminant (upstream's merge path fires the
+// MergePullRequest notifier ONLY, never IssueChangeStatus, so a merge must
+// not also write a close row). Everything else in this family — edited,
+// pull_request_assign — writes NO action upstream: the ActionType enum has
+// no assign type (action.go:38-65) and feed/notifier.go has no assignee
+// method (SPEC §3.3).
+// ---------------------------------------------------------------------------
+
+/** Structural read of one rendered §2.7 payload field (payload is `unknown`). */
+function payloadRecord(payload: unknown): Record<string, unknown> | null {
+  return typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : null;
+}
+
+function payloadNumber(record: Record<string, unknown> | null, key: string): number | undefined {
+  const value = record?.[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function payloadString(record: Record<string, unknown> | null, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+/** The PR-family action draft for one emission, or null when the event
+ *  carries no upstream action. Fields derive from the rendered payload
+ *  (SPEC §3.2): act_user = sender.id, is_private = repository.private,
+ *  index = the payload `number`, title = pull_request.title. */
+function pullActionDraft(input: { repoId: string; eventType: HookEventType; payload: unknown }): ActionDraft | null {
+  const payload = payloadRecord(input.payload);
+  if (payload === null) return null;
+  const actUserId = payloadNumber(payloadRecord(payload.sender), "id");
+  if (actUserId === undefined) return null;
+  const isPrivate = payloadRecord(payload.repository)?.private === true;
+  if (input.eventType !== "pull_request") return null;
+  const number = payloadNumber(payload, "number");
+  if (number === undefined) return null;
+  const pull = payloadRecord(payload.pull_request);
+  const title = payloadString(pull, "title") ?? "";
+  switch (payload.action) {
+    case "opened":
+      return { actUserId, repoId: input.repoId, opType: ActionType.CreatePullRequest, isPrivate, content: `${number}|${title}` };
+    case "closed":
+      if (pull?.merged === true) {
+        return { actUserId, repoId: input.repoId, opType: ActionType.MergePullRequest, isPrivate, content: `${number}|${title}` };
+      }
+      return { actUserId, repoId: input.repoId, opType: ActionType.ClosePullRequest, isPrivate, content: `${number}|` };
+    case "reopened":
+      return { actUserId, repoId: input.repoId, opType: ActionType.ReopenPullRequest, isPrivate, content: `${number}|` };
+    default:
+      return null;
+  }
+}
+
+/** Best-effort action-row write — caught, logged, never propagated (the
+ *  webhook fan-out posture; a lost insert is a feed gap, not an API error). */
+async function recordPullAction(env: ApiEnv["Bindings"], input: { repoId: string; eventType: HookEventType; payload: unknown }): Promise<void> {
+  const draft = pullActionDraft(input);
+  if (draft === null) return;
+  try {
+    await recordAction(env.DB, draft);
+  } catch (error) {
+    console.error(`[pulls] action row failed (${input.eventType}): ${errorMessage(error)}`);
+  }
 }
 
 /** The shared PullRequestPayload wrapper (§2.7, modules/structs/hook.go:484). */
@@ -377,8 +461,10 @@ function pullRequestPayload(
 // assignee.go:175-247; made live by the blocks-enforcement sweep so
 // EditPullRequest's blocked arm at pull.go:687 is reachable). The write
 // halves mirror the landed issue-tables-t2 machinery (the type-9 assignee
-// comment per toggle, the guarded insert); the FEED events stay the
-// tier-2 surfaces' (this file emits the webhook family only).
+// comment per toggle, the guarded insert); the label/-milestone WEBHOOK
+// sub-events stay the tier-2 surfaces'. Assignee changes emit
+// pull_request_assign webhooks only — NO `action` row exists upstream
+// (no assign ActionType; feed/notifier.go has no assignee method).
 // ---------------------------------------------------------------------------
 
 /** `GetDoerUserIDsByNames` reduced to the PATCH arm (user.go:1237): resolve

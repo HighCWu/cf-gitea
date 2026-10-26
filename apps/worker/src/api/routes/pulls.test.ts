@@ -46,6 +46,7 @@ beforeEach(async () => {
     "comments",
     "issue_assignees",
     "issues",
+    "action",
     "repo_counters",
     "user_blocking",
     "repositories",
@@ -362,5 +363,128 @@ describe("PATCH …/pulls/{index} assignees: the UpdateAssignees blocked arm", (
     // (the landed canEditPullRequest arm) precedes the assignee surface.
     expect(res.status).toBe(403);
     expect(await db().select().from(issueAssignees).all()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Activity feeds — the PR-lifecycle `action` rows (specs/activity-feeds.md
+// §3.3 tail): create/close/reopen/merge_pull_request ride the LOCAL
+// emitPullWebhook seam with the landed emitters' recordAction pattern; the
+// rows are read back through GET /repos/{owner}/{repo}/activities/feeds
+// (registered in router.ts). Upstream: services/feed/notifier.go.
+// ---------------------------------------------------------------------------
+
+/** `feature` = main + one commit (the pull-merge-protection.test.ts
+ *  ancestry shape) so the PR checks Mergeable and the merge RPC runs. */
+async function seedFeatureAhead(ownerLower: string, slug: string, baseTip: string): Promise<string> {
+  const cell = env.REPO.getByName(`${ownerLower}/${slug}`);
+  const readme = new TextEncoder().encode(`# ${slug}\n`);
+  const readmeOid = await gitObjectOid("blob", readme);
+  const extra = new TextEncoder().encode("feature work\n");
+  const extraOid = await gitObjectOid("blob", extra);
+  const tree = serializeTree([
+    { mode: "100644", name: "README.md", oid: readmeOid },
+    { mode: "100644", name: "feature.txt", oid: extraOid },
+  ]);
+  const person = { name: "seed", email: "seed@pulls.invalid", time: 1761000001, tz: "+0000" };
+  const commit = serializeCommit({ tree: tree.oid, parents: [baseTip], author: person, committer: person, message: "feature\n" });
+  const put = await cell.putApiObjects([
+    { oid: extraOid, type: "blob", data: extra },
+    { oid: tree.oid, type: "tree", data: tree.data },
+    { oid: commit.oid, type: "commit", data: commit.data },
+  ]);
+  if (put.tag !== "ok") throw new Error(`seed feature putApiObjects failed: ${put.tag}`);
+  const landed = await cell.commitApiChange({ ref: branchRef("feature"), expectedOldOid: ZERO_OID, newOid: commit.oid });
+  if (landed.tag !== "committed") throw new Error(`seed feature landing failed: ${landed.tag}`);
+  return commit.oid;
+}
+
+describe("activity feeds — PR-lifecycle action rows", () => {
+  const feeds = (owner: string, slug: string): Promise<Response> => router()(`/repos/${owner}/${slug}/activities/feeds`);
+
+  it("POST create records create_pull_request with index|title (feed/notifier.go NewPullRequest :129-153)", async () => {
+    await seedRepo(1, "cf-gitea-stub", "feed-create");
+    await seedEngineBranches("cf-gitea-stub", "feed-create", ["feature"]);
+    const res = await router()("/repos/cf-gitea-stub/feed-create/pulls", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "feed me", head: "feature", base: "main" }),
+    });
+    expect(res.status).toBe(201);
+    const feed = await feeds("cf-gitea-stub", "feed-create");
+    expect(feed.status).toBe(200);
+    const body = await feed.json<Array<Record<string, unknown>>>();
+    expect(body).toHaveLength(1);
+    expect(body[0]).toMatchObject({
+      op_type: "create_pull_request",
+      content: "1|feed me",
+      act_user_id: 1,
+      is_private: false,
+      ref_name: "",
+    });
+  });
+
+  it("PATCH close/reopen records close/reopen_pull_request with index| (IssueChangeStatus :69-95)", async () => {
+    const repoId = await seedRepo(1, "cf-gitea-stub", "feed-state");
+    const { index } = await seedPullRequest(repoId, 1);
+    const patch = (state: string): Promise<Response> =>
+      router()(`/repos/cf-gitea-stub/feed-state/pulls/${index}`, {
+        method: "PATCH",
+        headers: authHeaders,
+        body: JSON.stringify({ state }),
+      });
+    expect((await patch("closed")).status).toBe(201);
+    expect((await patch("open")).status).toBe(201);
+    const body = await (await feeds("cf-gitea-stub", "feed-state")).json<Array<Record<string, unknown>>>();
+    // created DESC: the reopen is newest. Content is the bare `index|`
+    // (upstream composes "%d|" with an empty half, :77).
+    expect(body.map((row) => [row.op_type, row.content])).toEqual([
+      ["reopen_pull_request", `${index}|`],
+      ["close_pull_request", `${index}|`],
+    ]);
+  });
+
+  it("POST merge records merge_pull_request with index|title — and NOT a second close row (MergePullRequest :263-275)", async () => {
+    const slug = "feed-merge";
+    await seedRepo(1, "cf-gitea-stub", slug);
+    await seedEngineBranches("cf-gitea-stub", slug, []);
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: "cf-gitea-stub", slug }).listRefs());
+    const mainTip = tips.get(branchRef("main"))?.target;
+    expect(mainTip).toBeDefined();
+    await seedFeatureAhead("cf-gitea-stub", slug, mainTip as string);
+    const create = await router()(`/repos/cf-gitea-stub/${slug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "merge me", head: "feature", base: "main" }),
+    });
+    expect(create.status).toBe(201);
+    const merge = await router()(`/repos/cf-gitea-stub/${slug}/pulls/1/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "merge" }),
+    });
+    expect(merge.status).toBe(200);
+    const body = await (await feeds("cf-gitea-stub", slug)).json<Array<Record<string, unknown>>>();
+    // created DESC: the merge row, then the POST's own create row. The merge
+    // path writes the MERGE action only — upstream fires
+    // NotifyMergePullRequest alone (the merge never goes through
+    // IssueChangeStatus), so a close row here would be a divergence.
+    expect(body.map((row) => [row.op_type, row.content])).toEqual([
+      ["merge_pull_request", "1|merge me"],
+      ["create_pull_request", "1|merge me"],
+    ]);
+  });
+
+  it("PATCH assignees records NO action row — upstream has none to write (no assign ActionType; feed/notifier.go has no assignee method, SPEC §3.3)", async () => {
+    const repoId = await seedRepo(1, "cf-gitea-stub", "feed-assign");
+    await seedUser("alice");
+    const { index } = await seedPullRequest(repoId, 1);
+    const res = await router()(`/repos/cf-gitea-stub/feed-assign/pulls/${index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: ["alice"] }),
+    });
+    expect(res.status).toBe(201); // the assignee change itself went through
+    expect((await env.DB.prepare("SELECT * FROM action").all()).results).toEqual([]);
   });
 });
