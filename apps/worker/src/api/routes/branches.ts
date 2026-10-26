@@ -667,8 +667,10 @@ export function registerBranchRoutes(
       }
       // Upstream CanDeleteBranchWithPermission (services/repository/branch.go
       // :561-581): a first-match rule gates the delete on its CanUserDelete —
-      // ErrBranchIsProtected ("branch is protected", models/git/
-      // protected_branch.go:27). This arm predated SPEC-0013 and carried no
+      // ErrBranchIsProtected, which the API handler maps to 403 "branch
+      // protected" (routers/api/v1/repo/branch.go:158-160; the models-layer
+      // text "branch is protected", models/git/protected_branch.go:27, never
+      // reaches the wire). This arm predated SPEC-0013 and carried no
       // rule check (the UI-16 wave's flagged bypass); the git-HTTP gate and
       // the UI arm already enforce. Admins ride canUserDelete's own arm.
       {
@@ -677,7 +679,7 @@ export function registerBranchRoutes(
         if (rule !== null) {
           const access = await principalAccessOf(c.env.DB, pair.repo, viewerOf(c).requester);
           if (!(await canUserDelete(c.env.DB, parseRuleConfig(rule.rules), access))) {
-            throw new ApiError(403, "branch is protected");
+            throw new ApiError(403, "branch protected");
           }
         }
       }
@@ -763,9 +765,37 @@ export function registerBranchRoutes(
         throw new ApiError(422, "Cannot rename a branch using the same name or rename to a branch that already exists.");
       }
 
+      // Upstream RenameBranch's protection gates (services/repository/
+      // branch.go:443-468), in order after the existence answers above:
+      //   :443-447  from == default branch && !perm.IsAdmin() →
+      //             ErrUserDoesNotHaveAccessToRepo
+      //   :451-459  GetProtectedBranchRuleByName(from) != nil && !IsAdmin()
+      //             → same (an EXACT rule-name lookup,
+      //             models/git/protected_branch.go:371-380)
+      //   :461-468  GetFirstMatchProtectedBranchRule(to) != nil &&
+      //             !rule.CanUserPush → ErrBranchIsProtected
+      // The API handler maps the pair to 403 "User must be a repo or site
+      // admin to rename default or protected branches." and the last to 403
+      // "Failed to rename branch due to branch protection rules."
+      // (routers/api/v1/repo/branch.go:518-524). This arm predated SPEC-0013
+      // §2.3(b)'s rename half and gated the default branch on plain write
+      // access — a writer could rename the default branch and onto a
+      // protected name (the UI-16-wave sibling of the DELETE bypass).
+      // principalAccessOf's `admin` is the perm.IsAdmin() port
+      // (repositoryPermissions admin + the collaborator-admin mode); the
+      // to-gate has no admin escape, matching CanUserPush.
       const isDefault = oldName === pair.repo.defaultBranch;
-      if (isDefault && !(await canWriteRepository(c, pair))) {
+      const [renameAccess, renameRules] = await Promise.all([
+        principalAccessOf(c.env.DB, pair.repo, viewerOf(c).requester),
+        listRepoRules(c.env.DB, pair.repo.id),
+      ]);
+      const fromNamedRule = renameRules.find((rule) => rule.ruleName === oldName);
+      if ((isDefault || fromNamedRule !== undefined) && !renameAccess.admin) {
         throw new ApiError(403, "User must be a repo or site admin to rename default or protected branches.");
+      }
+      const toRule = firstMatchRule(renameRules, newName);
+      if (toRule !== null && !(await canUserPush(c.env.DB, parseRuleConfig(toRule.rules), renameAccess))) {
+        throw new ApiError(403, "Failed to rename branch due to branch protection rules.");
       }
 
       // Create-then-delete (no engine rename primitive): land the new ref,

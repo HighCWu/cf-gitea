@@ -31,7 +31,7 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { repositories, protectedBranches, users, webhookDeliveries, webhooks } from "../db/schema";
+import { repositories, protectedBranches, repoCollaborators, users, webhookDeliveries, webhooks } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
@@ -962,13 +962,16 @@ describe("branch render extras (SPEC-0013 §3.6)", () => {
 
   it("DELETE: a protected branch refuses with the upstream text; an unprotected one deletes", async () => {
     // CanDeleteBranchWithPermission (branch.go:561-581): the first-match rule
-    // gates the delete on CanUserDelete → ErrBranchIsProtected ("branch is
-    // protected", protected_branch.go:27). The API arm predated SPEC-0013 and
-    // carried no rule check — the UI-16 wave's flagged bypass, now closed.
+    // gates the delete on CanUserDelete → ErrBranchIsProtected, which the API
+    // handler maps to 403 "branch protected" (routers/api/v1/repo/branch.go:
+    // 158-160 — the models-layer text "branch is protected",
+    // protected_branch.go:27, never reaches the wire). The API arm predated
+    // SPEC-0013 and carried no rule check — the UI-16 wave's flagged bypass,
+    // now closed.
     const guardedDelete = await send(`${REPO_PATH}/branches/${GUARDED}`, authed({ method: "DELETE" }));
     expect(guardedDelete.status).toBe(403);
     const guardedBody = await jsonBody(guardedDelete);
-    expect(guardedBody.message).toBe("branch is protected");
+    expect(guardedBody.message).toBe("branch protected");
     // GUARDED survives the refusal...
     expect((await send(`${REPO_PATH}/branches/${GUARDED}`, authed({ method: "GET" }))).status).toBe(200);
     // ...and an unprotected branch still deletes through the same arm (a
@@ -976,5 +979,99 @@ describe("branch render extras (SPEC-0013 §3.6)", () => {
     // protected, so the free arm needs its own branch).
     expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "free-to-delete" }))).status).toBe(201);
     expect((await send(`${REPO_PATH}/branches/free-to-delete`, authed({ method: "DELETE" }))).status).toBe(204);
+  });
+});
+
+describe("branch rename protection (upstream RenameBranch — services/repository/branch.go:443-468)", () => {
+  // Upstream's service gates, in order after the 422/404 existence answers:
+  //   :443-447  from == default branch && !perm.IsAdmin() → ErrUserDoesNotHaveAccessToRepo
+  //   :451-459  GetProtectedBranchRuleByName(from) != nil && !IsAdmin() → same
+  //             (an EXACT rule-name lookup — protected_branch.go:371-380)
+  //   :461-468  GetFirstMatchProtectedBranchRule(to) != nil && !CanUserPush →
+  //             ErrBranchIsProtected
+  // The API handler maps the first pair to 403 "User must be a repo or site
+  // admin to rename default or protected branches." and the last to 403
+  // "Failed to rename branch due to branch protection rules."
+  // (routers/api/v1/repo/branch.go:520-524). The route itself only demands
+  // reqRepoWriter (api.go:1321) — our front canWriteRepository gate — so a
+  // plain WRITER reaches these service gates.
+  let repoId = "";
+
+  beforeAll(async () => {
+    const row = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, SLUG)).get();
+    if (row === undefined) throw new Error("seed repo missing");
+    repoId = row.id;
+    // The outsider becomes a WRITE collaborator (not a repo admin): the front
+    // writer gate passes and the protection gates are what must refuse. Runs
+    // after the render-extras describe, whose non-writer assertions are done.
+    await drizzle(env.DB).insert(repoCollaborators).values({
+      repoId,
+      userId: OUTSIDER_ID,
+      mode: "write",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    // Exact-named rules for the from == rule name arm — one the writer may
+    // not rename, one the owner (repo admin) proves the admin escape on.
+    await drizzle(env.DB).insert(protectedBranches).values([
+      {
+        repoId,
+        ruleName: "solo-named",
+        priority: 3,
+        rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+      {
+        repoId,
+        ruleName: "admin-named",
+        priority: 4,
+        rules: serializeRuleConfig({ ...emptyRuleConfig(), canPush: true }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]);
+  });
+
+  /** The writer doer's JSON request (NOT authed() — that is the owner). */
+  const writerInit = (body: unknown): RequestInit => ({
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Authorization: `token ${OUTSIDER_TOKEN}` },
+    body: JSON.stringify(body),
+  });
+
+  it("writer renaming ONTO a protected name: 403 'Failed to rename branch due to branch protection rules.'", async () => {
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "wr-src" }))).status).toBe(201);
+    // "release-wr" matches the release-* rule (can_push off) → CanUserPush
+    // fails for the writer (branch.go:466-468) — the rename refuses and the
+    // source branch survives.
+    const res = await send(`${REPO_PATH}/branches/wr-src`, writerInit({ name: "release-wr" }));
+    expect(res.status).toBe(403);
+    expect((await jsonBody(res)).message).toBe("Failed to rename branch due to branch protection rules.");
+    expect((await send(`${REPO_PATH}/branches/wr-src`, authed({ method: "GET" }))).status).toBe(200);
+  });
+
+  it("writer renaming a branch whose name IS a rule name: 403 (admin-only, branch.go:451-459)", async () => {
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "solo-named" }))).status).toBe(201);
+    const res = await send(`${REPO_PATH}/branches/solo-named`, writerInit({ name: "solo-named-2" }));
+    expect(res.status).toBe(403);
+    expect((await jsonBody(res)).message).toBe("User must be a repo or site admin to rename default or protected branches.");
+    expect((await send(`${REPO_PATH}/branches/solo-named`, authed({ method: "GET" }))).status).toBe(200);
+  });
+
+  it("the repo admin (owner) still renames a rule-named branch (branch.go:451 'admins are allowed to modify them')", async () => {
+    expect((await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "admin-named" }))).status).toBe(201);
+    const res = await send(`${REPO_PATH}/branches/admin-named`, jsonInit("PATCH", { name: "admin-named-2" }));
+    expect(res.status).toBe(204);
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    expect(tips.has("refs/heads/admin-named")).toBe(false);
+    expect(tips.has("refs/heads/admin-named-2")).toBe(true);
+  });
+
+  it("writer renaming the DEFAULT branch: 403 (branch.go:443-447) — runs last: a regression mutates the repo", async () => {
+    const res = await send(`${REPO_PATH}/branches/main`, writerInit({ name: "wr-main" }));
+    expect(res.status).toBe(403);
+    expect((await jsonBody(res)).message).toBe("User must be a repo or site admin to rename default or protected branches.");
+    expect((await send(`${REPO_PATH}/branches/main`, authed({ method: "GET" }))).status).toBe(200);
   });
 });
