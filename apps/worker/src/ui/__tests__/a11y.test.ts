@@ -28,6 +28,8 @@ import issueDetailGolden from "./goldens/issue-detail.html?raw";
 import issuesClosedGolden from "./goldens/issues-closed.html?raw";
 import issuesOpenGolden from "./goldens/issues-open.html?raw";
 import landingGolden from "./goldens/landing.html?raw";
+import labelsGolden from "./goldens/labels.html?raw";
+import labelsWriterGolden from "./goldens/labels-writer.html?raw";
 import milestonesClosedGolden from "./goldens/milestones-closed.html?raw";
 import milestonesOpenGolden from "./goldens/milestones-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
@@ -82,6 +84,11 @@ const goldens: Record<string, string> = {
   "not-found-repo.html": notFoundRepoGolden,
   "bare-shell.html": bareShellGolden,
   "landing.html": landingGolden,
+  // Pages wave 25: the repo labels page — the anonymous list and the
+  // signed-in owner view (the GOLDEN_CASES entries above; the owner-arm
+  // bytes hardening).
+  "labels.html": labelsGolden,
+  "labels-writer.html": labelsWriterGolden,
   "dashboard.html": dashboardGolden,
   "explore-repos.html": exploreReposGolden,
   "explore-users.html": exploreUsersGolden,

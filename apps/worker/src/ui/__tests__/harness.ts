@@ -346,6 +346,18 @@ export const GOLDEN_CASES: GoldenCase[] = [
   // arms 303 onto /login — no DOM to snapshot.
   { file: "repo-create.html", path: "/repo/create", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "org-create.html", path: "/org/create", status: 200, signedIn: true },
+  // The repo labels page (wave 25's `/{owner}/{repo}/labels` — the b5facba
+  // finding's hardening): the ANONYMOUS list over alice/golden (the bug +
+  // enhancement fixture labels with their open-count anchors, no write
+  // controls) and the SIGNED-IN OWNER view — alice owns golden and the
+  // cookie is minted through the REAL session path (mintSession, the same
+  // call the login route makes), so the owner arm of the writer gate is
+  // pinned byte-exactly: the navbar New Label button, the per-row
+  // edit/delete disclosures and the #new-label create form (the production
+  // observation REDEPLOY12 open issue 3, previously covered only by the
+  // wave-25 session-path assertions).
+  { file: "labels.html", path: "/alice/golden/labels", status: 200 },
+  { file: "labels-writer.html", path: "/alice/golden/labels", status: 200, signedIn: true },
 ];
 
 /** Marker frame the update script extracts golden bodies from (a single
