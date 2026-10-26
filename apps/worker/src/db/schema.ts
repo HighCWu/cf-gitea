@@ -166,9 +166,9 @@ export const repositories = sqliteTable(
      *  no-op unwatch never moves the column), and by the block cascade's
      *  unwatch arm (block.go:183-214 → WatchRepoAuto(false) per repo).
      *  Upstream's ClearRepoWatches zeroes it when a repo goes private
-     *  (watch.go:327-333) — the repo-edit/private flow is a sibling wave's
-     *  seam (reported, not wired here). Backfill = the DEFAULT 0, same
-     *  settle posture as num_stars above. */
+     *  (watch.go:327-333) — wired via clearRepoWatches in the repo-edit
+     *  visibility arm (services/repo-watchers.ts). Backfill = the DEFAULT 0,
+     *  same settle posture as num_stars above. */
     numWatches: integer("num_watches").notNull().default(0),
     // -------------------------------------------------------------------------
     // Fork tally (wave-counters-2) — the social-counters block's third column.
@@ -385,8 +385,8 @@ export const users = sqliteTable(
      *  `num_stars ± 1` update inside StarRepo's WithTx, beside the
      *  repositories.num_stars bump), by the block cascade's unstar arm
      *  (block.go:172-175 → StarRepo(false) per repo), and on repo delete
-     *  (services/repository/delete.go:133 — each stargazer loses one; our
-     *  delete cascade arm is reported to the repos owner, not wired here).
+     *  (services/repository/delete.go:133 — each stargazer loses one; wired
+     *  in deleteRepository's batch, repos/service.ts).
      *  NOT NULL DEFAULT 0: the ALTER backfills existing rows to 0 beneath
      *  surviving star edges — un-star floors at 0 (the MAX(…,0) drift
      *  insurance, same posture as repositories.num_stars); the idempotent
