@@ -305,6 +305,20 @@
  *                                          974; POST → the landed
  *                                          OrgService.createOrg → 303 onto
  *                                          the org home)
+ *   /org/{org}/members                      org members list, GET (pages/
+ *                                          org-members.tsx — wave 23;
+ *                                          upstream's literal web.go:965;
+ *                                          anonymous-capable — the
+ *                                          FindOrgMembersOpts.PublicOnly
+ *                                          scope is the per-row gate; the
+ *                                          landed orgListMembers read)
+ *   /{org}/-/repositories                   org repositories view, GET
+ *                                          (pages/org-repos.tsx — wave 23;
+ *                                          upstream's web.go:1134 route in
+ *                                          the /{username}/- group; the
+ *                                          org-home DOM through the second
+ *                                          URL — tplOrgHome serves both
+ *                                          upstream; user names 404-shell)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -461,6 +475,19 @@ import {
   parseOrgCreateForm,
   renderOrgCreatePage,
 } from "./pages/org-create";
+// Wave-23 org families (the parity survey's next tier — the members page and
+// the /-/repositories repositories family).
+import {
+  isOrgOwnerViewer,
+  loadOrgMembersData,
+  renderOrgMembersPage,
+  resolveOrgMembersOrg,
+} from "./pages/org-members";
+import {
+  loadOrgRepositoriesData,
+  renderOrgRepositoriesPage,
+  resolveOrgRepositories,
+} from "./pages/org-repos";
 import { loadDashboardData, renderDashboardPage, renderLandingPage } from "./pages/dashboard";
 import {
   loadExploreReposData,
@@ -757,6 +784,33 @@ export interface OrgCreateRoute {
   family: "org-create";
 }
 
+/** The wave-23 org members family (pages/org-members.tsx): upstream's
+ *  `/org/{org}/members` literal (web.go:957-961, the `/org` group ahead of
+ *  the dynamic pairs — a repository path `/org/{repo}/members` is shadowed
+ *  identically, and the "org" owner name is create-time reserved besides,
+ *  the repo-create precedent). The owner segment is the {org} param;
+ *  anonymous-capable (the group's `optSignIn` is RequireSignInViewStrict,
+ *  off at the pin) — the members listing's PublicOnly scope is the per-row
+ *  gate. Every other `/org/*` tail stays unclaimed → the engine's 404. */
+export interface OrgMembersRoute {
+  family: "org-members";
+  /** Decoded org segment (the upstream {org} param). */
+  owner: string;
+}
+
+/** The wave-23 org repositories family (pages/org-repos.tsx): upstream's
+ *  `/{username}/-/repositories` (web.go:1107's `/{username}/-` group's
+ *  web.go:1134 repositories route) — the `-` pseudo-segment namespace claims
+ *  exactly the repositories tail; a plain USER name 404-shells at resolve
+ *  time (upstream org.Repositories' `org == nil` arm). Every other `/-*`
+ *  tail (heatmap, packages, projects, code) stays unclaimed → the engine's
+ *  404. */
+export interface OrgRepositoriesRoute {
+  family: "org-repositories";
+  /** Decoded owner segment (org rows only at resolve time). */
+  owner: string;
+}
+
 
 /** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
  *  three web POSTs — the verdict form's
@@ -964,7 +1018,9 @@ export type ParsedUiRoute =
   | CommitViewRoute
   | ReleasesRoute
   | RepoCreateRoute
-  | OrgCreateRoute;
+  | OrgCreateRoute
+  | OrgMembersRoute
+  | OrgRepositoriesRoute;
 
 
 /**
@@ -1043,6 +1099,24 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return { family: "org-create" };
   }
 
+  // The wave-23 org members family (pages/org-members.tsx — upstream's
+  // `/org/{org}/members` literal, web.go:957-961): the exact four-segment
+  // shape with the literal `org` first segment and the literal `members`
+  // third — the same exact-literal posture as org-create above (upstream's
+  // /org group registers ahead of the dynamic pairs, so a repository path
+  // /org/{repo}/members is shadowed identically; the "org" owner name is
+  // create-time reserved besides). Every other /org/* shape (deeper tails,
+  // /org/{org} alone) stays unclaimed → the engine's 404.
+  if (raw.length === 4 && raw[1] === "org" && raw[3] === "members") {
+    let orgName: string;
+    try {
+      orgName = decodeURIComponent(raw[2] as string);
+    } catch {
+      return null;
+    }
+    return { family: "org-members", owner: orgName };
+  }
+
   let owner: string;
   try {
     owner = decodeURIComponent(raw[1] as string);
@@ -1114,6 +1188,18 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (raw[3] === "delete") return { family: "org-label-delete", owner };
     }
     return null;
+  }
+
+  // The wave-23 org repositories family (pages/org-repos.tsx — upstream's
+  // `/{username}/-/repositories`, web.go:1107's `/{username}/-` group's
+  // web.go:1134 repositories route): the `-` pseudo-segment namespace claims
+  // exactly the repositories tail (a repo cannot be named "-" and no landed
+  // family reads the shape, so the claim shadows nothing). Every other
+  // `/-*` tail (`/-/heatmap`, `/-/packages*`, `/-/projects*`, `/-/code`,
+  // the bare `/-`) stays unclaimed → the engine's 404, exactly upstream's
+  // unregistered-route answer for slices that have not landed.
+  if (repo === "-" && raw.length === 4 && raw[3] === "repositories") {
+    return { family: "org-repositories", owner };
   }
 
   const tail = raw.slice(3);
@@ -3496,6 +3582,70 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   return respond(c.html(html, status));
 }
 
+// ---------------------------------------------------------------------------
+// The wave-23 org families (pages/org-members.tsx + pages/org-repos.tsx —
+// upstream's /org/{org}/members literal web.go:965 and the
+// /{username}/-/repositories route web.go:1134)
+// ---------------------------------------------------------------------------
+
+/** The org-family doer slice (the org-teams prologue's construction). */
+function orgFamilyDoer(viewer: Viewer): { id: number | null; isAdmin: boolean } {
+  return viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false };
+}
+
+/** The org-family query string (resolveOrgForRequest's rename-redirect
+ *  rewrite consumes it — the org-teams prologue's slice). */
+function orgFamilyQuery(url: URL): string {
+  return url.search.startsWith("?") ? url.search.slice(1) : url.search;
+}
+
+/**
+ * GET /org/{org}/members (pages/org-members.tsx — the members list).
+ * Anonymous-capable (upstream's group gate is RequireSignInViewStrict, off
+ * at the pin): the org resolves through the org-home ladder (a plain user
+ * name and an invisible org 404-shell, a rename 307s), the members
+ * listing's PublicOnly scope is the per-row gate, and the owner prompt row
+ * rides OrgAssignment's IsOwner composition (isOrgOwnerViewer).
+ */
+async function orgMembersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (resolved.route.family !== "org-members") return respond(await c.notFound()); // drift guard
+  const doer = orgFamilyDoer(viewer);
+  const org = await resolveOrgMembersOrg(c.env.DB, resolved.route.owner, doer, url.pathname, orgFamilyQuery(url));
+  if (org.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: org.location } }));
+  }
+  if (org.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const ownerPrompt = await isOrgOwnerViewer(c.env.DB, org.org, viewer);
+  const data = await loadOrgMembersData(c.env.DB, org.org, doer, url.searchParams);
+  return respond(c.html(renderOrgMembersPage(ctx, data, { ownerPrompt }), 200));
+}
+
+/**
+ * GET /{org}/-/repositories (pages/org-repos.tsx — the repositories family;
+ * the org-home DOM through upstream's second URL). The same ladder: a plain
+ * user name 404-shells (upstream org.Repositories' `org == nil` arm), a
+ * renamed org 307s, an invisible org shells behind the shared 404. The
+ * listing itself is the landed `listOrgRepositories` read (the §4.7
+ * owner/team visibility arms decide the rows).
+ */
+async function orgRepositoriesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (resolved.route.family !== "org-repositories") return respond(await c.notFound()); // drift guard
+  const doer = orgFamilyDoer(viewer);
+  const org = await resolveOrgRepositories(c.env.DB, resolved.route.owner, doer, url.pathname, orgFamilyQuery(url));
+  if (org.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: org.location } }));
+  }
+  if (org.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadOrgRepositoriesData(c.env.DB, org.org, doer, url.searchParams);
+  return respond(c.html(renderOrgRepositoriesPage(ctx, data), 200));
+}
+
 export const uiRouter = new Hono<{ Bindings: Env }>();
 
 // §4.13: trailing-slash URLs redirect to the canonical form (we never emit
@@ -3693,3 +3843,14 @@ uiRouter.post("/:owner/:repo/delete/*", (c) => fileEditorSubmit(c, "file-delete"
 // miss this sub-app to their own routers. The parser stays the source of
 // truth; the handler 404-shells any drift.
 uiRouter.get("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => ownerHomePage(c));
+// Wave-23 org families (parseUiRoute claims exactly these shapes —
+// upstream's /org/{org}/members literal web.go:965 and the /{username}/-
+// repositories route web.go:1134; appended at the physical tail because no
+// registered pattern above can match them: the 3-segment shapes need a
+// "members"/"repositories" tail no earlier family carries, the static
+// "org"/"-" segments beat every dynamic peer, and the single-segment owner
+// regex above is a different shape — so the tail registration keeps the
+// sub-app's reach equal to the parser's, the drift guards absorbing any
+// future collision loudly).
+uiRouter.get("/org/:owner/members", (c) => orgMembersPage(c));
+uiRouter.get("/:owner/-/repositories", (c) => orgRepositoriesPage(c));
