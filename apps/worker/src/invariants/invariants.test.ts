@@ -19,16 +19,27 @@
  * a 4-slot chunk LRU — deleting a tip's pack is invisible to READS within
  * the same DO instance. Trees, blobs, and commits that were never ref tips
  * read through to R2, and their pack chunks are evicted after ~4 subsequent
- * pushes. The fixtures exploit exactly that:
+ * pushes. The fixtures exploit exactly that — each walk fixture is the
+ * MINIMUM push count that still puts its deletion target's chunk outside
+ * the 4-slot LRU (4 pack uploads after the target, one chunk inserted per
+ * push):
  *
- *   evictRepo — 7 create-pushes so the early packs' chunks leave the LRU:
+ *   evictRepo — 6 create-pushes; pack1 needs 4 later inserts (pack2 + 3
+ *   fillers) to go cold:
  *     packR  = {blobR, treeR, commitR}                 → refs/heads/root
  *     pack1  = {commitA→R, commitB→A} (treeR reused)   → refs/heads/base
  *     pack2  = {blob2, tree2, commitC1→B}              → refs/heads/main
- *     pack3-6 = four filler root commits               → refs/heads/filler1-4
+ *     pack3-5 = three filler root commits              → refs/heads/filler1-3
  *   refs/heads/base is deleted afterwards (its tip B must not be walked —
  *   its TREE lives in the deleted pack and would add a tree-missing), and
  *   HEAD is re-pointed at main (the first-pushed branch is adopted as HEAD).
+ *
+ *   treeRepo — same chain, 6 create-pushes: the root and base closures ride
+ *   ONE pack (two create-updates), so the deletion target pack2 lands at
+ *   push 2 and the same four later inserts (f1-f4) evict it:
+ *     packRB = {blobR, treeR, root, A, B}              → refs/heads/root+base
+ *     pack2  = {blob2, tree2, commitC1→B}              → refs/heads/main
+ *     pack3-6 = four filler root commits               → refs/heads/filler1-4
  *
  *   - deleting pack1 ⇒ closure-broken at A (never a ref tip → cache-cold)
  *   - deleting pack2 ⇒ tree-missing at C1's tree2 (tree/blob reads are cold)
@@ -37,7 +48,7 @@
  *   below, and the real-world bound is documented in check.ts. The same mask
  *   applies to ANY object a push settle leg reads: default-branch settle legs
  *   (license sync) inflate the default branch's tree at push time, so
- *   evictRepo points D1's defaultBranch at the root push (see there).
+ *   both fixtures point D1's defaultBranch at the root push (see there).
  */
 
 import { SELF, env } from "cloudflare:test";
@@ -58,10 +69,12 @@ import {
   isInvariantCheckMessage,
 } from "./run-all";
 import {
+  blobObject,
   buildPushBody,
   commitObject,
   commitPack,
   packOf,
+  treeObject,
   type PushUpdate,
 } from "./testing/git-push";
 
@@ -203,10 +216,10 @@ interface EvictRepo {
   packs: { packRoot: string; pack1: string; pack2: string };
 }
 
-/** The seven-push fixture from the module docstring: pack1/pack2 chunks are
- *  LRU-evicted by the four filler pushes, so deleting either makes its
- *  non-tip content (never-advertised ancestor A, trees, blobs) read through
- *  to R2 and fail. Every push is a CREATE (old = ZERO_OID). */
+/** The six-push fixture from the module docstring: pack1's chunk is
+ *  LRU-evicted by the four later inserts (pack2 + three fillers), so deleting
+ *  it makes its non-tip content (never-advertised ancestor A, trees, blobs)
+ *  read through to R2 and fail. Every push is a CREATE (old = ZERO_OID). */
 async function evictRepo(slug: string): Promise<EvictRepo> {
   const { storageKey, token, repoId } = await createRepo(slug);
   // Keep the default-branch settle legs (the license sync rides the engine's
@@ -239,11 +252,13 @@ async function evictRepo(slug: string): Promise<EvictRepo> {
   await pushSlug(slug, token, [{ ref: "refs/heads/main", oid: c1.oid }], c1.pack);
   const pack2 = await addedPackKey(before, storageKey);
 
-  // Four filler pushes: their chunk reads push pack1/pack2 out of the DO's
-  // 4-slot chunk LRU (packRoot too), so deleted-pack reads cannot be served
-  // from memory.
+  // Three filler pushes: with pack2's upload that is the four later chunk
+  // inserts which push pack1 out of the DO's 4-slot chunk LRU (packR goes
+  // with it), so deleted-pack reads cannot be served from memory. pack2's
+  // chunk stays hot here — packR-side reads of the closure walk hit it, and
+  // the cold-pack2 case is treeRepo's (below) with its own four inserts.
   let parent: { oid: string } = c1;
-  for (let n = 1; n <= 4; n += 1) {
+  for (let n = 1; n <= 3; n += 1) {
     const f = await commitPack(`f${n}`, [parent.oid], [{ name: `f${n}.txt`, content: String(n) }], T0 + 3 + n);
     await pushSlug(slug, token, [{ ref: `refs/heads/filler${n}`, oid: f.oid }], f.pack);
     parent = f;
@@ -264,6 +279,71 @@ async function evictRepo(slug: string): Promise<EvictRepo> {
   };
 }
 
+/** The tree test's six-push fixture (module docstring): the same chain as
+ *  evictRepo but with the root and base closures riding ONE pack (two
+ *  create-updates in a single receive round-trip), so the deletion target
+ *  pack2 lands at push 2 and the four filler uploads evict its chunk. The
+ *  deletion-target geometry is identical to the old seven-push shape: C1 is
+ *  a cached tip whose tree2/blob2 are cache-cold, every surviving ancestor
+ *  (B/A/root, treeR, blobR) lives in the SURVIVING packRB, and the reachable
+ *  walks of the filler tips still read through the dead pack (their
+ *  closure-broken reports). The defaultBranch pin and the base/HEAD hygiene
+ *  are evictRepo's, for the same reasons (see there; the deleteApiRef seam
+ *  verdict is threePackRepo's comment). */
+async function treeRepo(slug: string): Promise<EvictRepo> {
+  const { storageKey, token, repoId } = await createRepo(slug);
+  await drizzle(env.DB).update(repositories).set({ defaultBranch: "root" }).where(eq(repositories.id, repoId));
+  const target = { engineName: `alice/${slug}`, storageKey };
+  const stub = env.REPO.getByName(target.engineName);
+  let before = new Set<string>();
+
+  // packRB: root's self-contained closure PLUS the never-advertised pair
+  // (A→root, B→A, both reusing treeR) — five objects, one pack, two refs.
+  const blobR = await blobObject("root");
+  const treeR = await treeObject([{ name: "root.txt", oid: blobR.oid }]);
+  const root = await commitObject(treeR.oid, [], "root", T0);
+  const a = await commitObject(treeR.oid, [root.oid], "a", T0 + 1);
+  const b = await commitObject(treeR.oid, [a.oid], "b", T0 + 2);
+  await pushSlug(
+    slug,
+    token,
+    [
+      { ref: "refs/heads/root", oid: root.oid },
+      { ref: "refs/heads/base", oid: b.oid },
+    ],
+    await packOf([blobR, treeR, root, a, b]),
+  );
+  const packRB = await addedPackKey(before, storageKey);
+  before = await packKeySet(storageKey);
+
+  const c1 = await commitPack("c1", [b.oid], [{ name: "c1.txt", content: "c1" }], T0 + 3);
+  await pushSlug(slug, token, [{ ref: "refs/heads/main", oid: c1.oid }], c1.pack);
+  const pack2 = await addedPackKey(before, storageKey);
+
+  // The four filler uploads are exactly the four later chunk inserts that
+  // push pack2 out of the DO's 4-slot chunk LRU (packRB goes with them).
+  let parent: { oid: string } = c1;
+  for (let n = 1; n <= 4; n += 1) {
+    const f = await commitPack(`f${n}`, [parent.oid], [{ name: `f${n}.txt`, content: String(n) }], T0 + 3 + n);
+    await pushSlug(slug, token, [{ ref: `refs/heads/filler${n}`, oid: f.oid }], f.pack);
+    parent = f;
+  }
+
+  // Same survivor hygiene as evictRepo: base's tip must not be advertised
+  // and HEAD must point at main (the surviving chain over the dead pack).
+  expect((await stub.deleteApiRef({ ref: "refs/heads/base", expectedOid: b.oid })).tag).toBe("deleted");
+  expect((await stub.setHead("main")).tag).toBe("ok");
+
+  return {
+    storageKey,
+    token,
+    target,
+    oids: { root: root.oid, a: a.oid, b: b.oid, c1: c1.oid },
+    treeC1: c1.treeOid,
+    packs: { packRoot: packRB, pack1: packRB, pack2 },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // 1. Healthy repos pass
 // ---------------------------------------------------------------------------
@@ -279,17 +359,17 @@ describe("checkRepoInvariants: healthy repos", () => {
     expect(report.checked).toEqual({ refs: 1, commits: 3, trees: 2, blobs: 2, packs: 3 });
   });
 
-  it("a seven-pack repo passes (walk crosses pack boundaries)", async () => {
+  it("a multi-pack repo passes (walk crosses pack boundaries)", async () => {
     const seeded = await evictRepo("inv-evict-healthy");
     const report = await checkRepoInvariants(env, seeded.target);
     expect(report.ok).toBe(true);
     expect(report.partial).toBe(false);
     expect(report.violations).toEqual([]);
-    // tips: main + root + 4 fillers; chain c1→B→A→root; trees: tree2,
-    // treeR (B and A and root dedup), 4 filler trees; one blob spot per tree.
-    expect(report.checked.refs).toBe(6);
-    expect(report.checked.commits).toBe(8);
-    expect(report.checked.trees).toBe(6);
+    // tips: main + root + 3 fillers; chain c1→B→A→root; trees: tree2,
+    // treeR (B and A and root dedup), 3 filler trees; one blob spot per tree.
+    expect(report.checked.refs).toBe(5);
+    expect(report.checked.commits).toBe(7);
+    expect(report.checked.trees).toBe(5);
   });
 
   it("an empty (never-pushed) repo passes trivially", async () => {
@@ -358,7 +438,7 @@ describe("checkRepoInvariants: injected violations", () => {
   });
 
   it("deleting a tree's pack ⇒ tree-missing under the readable tip", async () => {
-    const seeded = await evictRepo("inv-tree");
+    const seeded = await treeRepo("inv-tree");
     await env.REPO_PACKS.delete(seeded.packs.pack2);
     const report = await checkRepoInvariants(env, seeded.target);
     expect(report.ok).toBe(false);
