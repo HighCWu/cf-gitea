@@ -20,6 +20,13 @@ Declared still **490** across **298** paths; the raw diff is **64**, all
 FEATURE-ABSENT (the 64-op tables below are unchanged from the regen); the
 dispatchable pool is empty and the In-flight section is cleared. The
 window's landings are appended to the post-490 ledger below.
+**Ticked 2026-10-26** a third time, at HEAD `9b49cd2`: maintenance only —
+the `7016ce9..9b49cd2` window (the release create empty-gate fix
+`d24dc0f` + its fixtures correction `4619c4f`, the deploy-probes mirror
+battery `4ed277d`, wave-ui-parity-9 `1a7af64`, the projects board
+landing `9b49cd2`, a docs run) carries **zero
+new operations**; the checker re-run reports 490/298, `PASS` unchanged.
+The only ledger entry is the release-gate fix below.
 
 - **Sources / method**: frozen contract
   `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
@@ -27,7 +34,7 @@ window's landings are appended to the post-490 ledger below.
   issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
   minus the declared set that `node scripts/check-openapi.mjs` reports
   (**490** operations across **298** paths, measured 2026-10-26 at HEAD
-  `7016ce9`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
+  `9b49cd2`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
   operations). Raw diff: **64 undeclared** = **64 remaining**, all
   FEATURE-ABSENT — no in-flight subtraction applies any more.
   Issue / notification / miscellaneous / settings families have **zero**
@@ -126,7 +133,7 @@ existing seams), engine-registry lifecycle fixes (`4f574e9`, `1da8f56`,
 ### After the 490 line — post-regen landings (zero new ops)
 
 Everything merged after REG `c9a7ef7` carries no new declarations — the
-checker stays at 490/298 (re-run at this tick's HEAD `7016ce9`). The units,
+checker stays at 490/298 (re-run at this tick's HEAD `9b49cd2`). The units,
 grouped:
 
 - **API parity**: blocks-enforcement-2 tail (`f2e1710` — the regen's
@@ -154,7 +161,14 @@ grouped:
   review-request emitters), and the generate/fork git-wire fix
   (`8828f43` — replicateRepoCopy brokers the §5.3 copy with UNCONDITIONAL
   loose carry; closes the generated-repo wire residual `bf8e56f`
-  re-scoped OPEN).
+  re-scoped OPEN). The `7016ce9..9b49cd2` window adds the release create
+  empty-gate fix (`d24dc0f` — the gate switched from the never-synced
+  `refs_version` observability column, which reads 0 on every production
+  repo and 422'd every API release create, to `is_empty`; found by
+  REDEPLOY14) + its fixtures correction (`4619c4f` — honest `isEmpty`
+  seeding; discloses that `d24dc0f`'s own run was really 10-failed/25-passed
+  behind a grep-masked exit code and brings the suite to the true 35/35;
+  the gate change stands verified).
 - **Migrations 0029–0032** landed with them (`size_kb`, `num_stars`/
   `num_watches`, `num_forks` + `users.num_stars`, push-mirror sync state) —
   still 64 tables; these are store work behind already-declared ops.
