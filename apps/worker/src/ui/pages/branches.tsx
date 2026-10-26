@@ -1012,7 +1012,13 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
                           the header's reductions). */}
                       {writerControls ? <BranchCreateForm repoLink={repoLink} from={row.name} /> : null}
                       {writerControls ? <BranchRenameForm repoLink={repoLink} name={row.name} /> : null}
-                      {row.canDelete ? <BranchDeleteForm repoLink={repoLink} name={row.name} /> : null}
+                      {/* Delete folds the archived refusal into the render
+                          gate — upstream gates all three controls identically
+                          (list.tmpl:199's IsWriter + CanContentChange); the
+                          POST arm 404-shells archived repos, so rendering the
+                          button there was a dead control (the branches
+                          matrix's RED). */}
+                      {row.canDelete && !repo.isArchived ? <BranchDeleteForm repoLink={repoLink} name={row.name} /> : null}
                     </div>
                   </td>
                 </tr>
