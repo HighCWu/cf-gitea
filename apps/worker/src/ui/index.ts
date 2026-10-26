@@ -1261,6 +1261,13 @@ import {
   renderPullFilesSingleCommitPage,
 } from "./pages/pull-files-single-commit";
 import { activityAuthorDataResponse, loadActivityAuthorData } from "./pages/activity-author-data";
+// Window-2e C1: the global inbox.
+import {
+  loadDashboardMilestonesData,
+  loadOverviewIssuesData,
+  renderDashboardMilestonesPage,
+  renderOverviewIssuesPage,
+} from "./pages/global-inbox";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -1979,6 +1986,11 @@ export interface UserFeedRoute {
   owner: string;
 }
 
+/** Window-2e C1: the global inbox pages (pages/global-inbox.tsx). */
+export interface GlobalInboxRoute {
+  family: "global-issues" | "global-pulls" | "global-milestones";
+}
+
 /** The wave-8 file-editor family (pages/file-editor.tsx): upstream's
  *  `/{editor_action:_edit|_new|_delete}/*` Combos under
  *  `RepoRefByType(git.RefTypeBranch)` (web.go:1453-1461) at the wave brief's
@@ -2250,6 +2262,7 @@ export type ParsedUiRoute =
   | OwnerHomeRoute
   | UserFeedRoute
   | IssueAuxRoute
+  | GlobalInboxRoute
   | FileEditorRoute
   | SiteHomeRoute
   | ExploreRoute
@@ -2506,6 +2519,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // — those upstream routes are not in this slice, so the names stay
   // refused and fall to the parent app's 404).
   if (raw.length === 2) {
+    // Window-2e C1: the global inbox pages (pages/global-inbox.tsx —
+    // upstream web.go:567-573, reqSignIn): claimed before the owner-home
+    // arm could read them as single-segment profiles (upstream's literals
+    // register ahead of the dynamic user route; a user named "issues" is
+    // create-time reserved besides).
+    if (raw[1] === "issues" || raw[1] === "pulls" || raw[1] === "milestones") {
+      return { family: raw[1] === "issues" ? "global-issues" : raw[1] === "pulls" ? "global-pulls" : "global-milestones" };
+    }
     if (TOP_LEVEL_EXCLUDED.has(owner.toLowerCase())) return null;
     // Window-2e: the feed suffixes (pages/user-feed-xml.ts — upstream
     // UsernameSubRoute's .rss/.atom dispatch, web.go:910-912 → profile.go).
@@ -6563,11 +6584,12 @@ async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
       isEmpty: repo.isEmpty,
       defaultBranch: repo.defaultBranch,
     };
-    const result = await loadCompareFeed(c.env, repoFeed, route.segment, route.ext);
-    if (result.kind === "notFound") return respond(c.html(renderNotFound(ctx), 404));
-    if (result.kind === "noMergeBase") return respond(compareFeedServerErrorResponse());
-    return respond(compareFeedTextResponse(result.body));
-  }
+  const result = await loadCompareFeed(c.env, repoFeed, route.segment, route.ext);
+  if (result.kind === "notFound") return respond(c.html(renderNotFound(ctx), 404));
+  if (result.kind === "noMergeBase") return respond(compareFeedServerErrorResponse());
+  return respond(compareFeedTextResponse(result.body));
+}
+
   if (route.family !== "compare") return respond(await c.notFound()); // registration/parser drift guard
   const page = parsePageNumber(url.searchParams.get("page"));
   const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
@@ -6593,6 +6615,31 @@ async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Window-2e C1: the global inbox pages (pages/global-inbox.tsx) — reqSignIn
+// (web.go:567-573): anonymous 303s onto the login round-trip.
+// ---------------------------------------------------------------------------
+
+async function globalInboxIssuesPage(c: Context<{ Bindings: Env }>, listKind: "issues" | "pulls"): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, viewer, respond } = resolved;
+  const family = listKind === "issues" ? "global-issues" : "global-pulls";
+  if (resolved.route.family !== family) return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const data = await loadOverviewIssuesData(c.env.DB, viewer, listKind, url.searchParams);
+  return respond(c.html(renderOverviewIssuesPage(resolved.ctx, data), 200));
+}
+
+async function globalMilestonesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, viewer, respond } = resolved;
+  if (resolved.route.family !== "global-milestones") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const data = await loadDashboardMilestonesData(c.env.DB, viewer, url.searchParams);
+  return respond(c.html(renderDashboardMilestonesPage(resolved.ctx, data), 200));
+}
 /**
  * POST /{owner}/{repo}/compare/{base}...{head} (upstream
  * CompareAndPullRequestPost, routers/web/repo/pull.go:1318, over the landed
@@ -9067,6 +9114,10 @@ uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/files/:segment{^[a-f0-9]{7,64}(\\
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/commits/:sha{^[a-f0-9]{7,64}$}", (c) => pullCommitFilesRoute(c));
 uiRouter.get("/:owner/:repo/activity_author_data", (c) => activityAuthorDataRoute(c));
 uiRouter.get("/:owner/:repo/activity_author_data/:period", (c) => activityAuthorDataRoute(c));
+// Window-2e C1: the global inbox.
+uiRouter.get("/issues", (c) => globalInboxIssuesPage(c, "issues"));
+uiRouter.get("/pulls", (c) => globalInboxIssuesPage(c, "pulls"));
+uiRouter.get("/milestones", (c) => globalMilestonesPage(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
