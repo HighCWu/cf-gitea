@@ -219,9 +219,11 @@ Production closures this deploy, verbatim from the evidence block:
   `status='creating'` whole-table **0** — zero stranded rows. **One honest
   re-scoped residual (tracked open)**: the generated repo's git wire —
   `git fetch` 500s at the upload-pack fetch POST and `git push` is refused
-  `missing necessary objects`, while API reads serve the full closure. The
-  delta is the carry/adoption layout in the generated cell; owner:
-  repos/fork-task + the engine read path.
+`missing necessary objects`, while API reads serve the full closure. The
+delta is the carry/adoption layout in the generated cell; owner:
+repos/fork-task + the engine read path. *(Superseded: closed by `8828f43` —
+the Worker-brokered §5.3 copy pass with an unconditional loose carry; see
+Addendum 2.)*
 - **The labels production finding — a methodology artifact, closed**: the
   PAT header never logs a session in (anonymous on pages, upstream parity).
   Via `POST /login` + the `gitea_session` cookie the owner view renders the
@@ -277,7 +279,8 @@ load-branches-and-tags, releases edit/delete, `/-/projects`).
 
 Still in flight at this addendum's writing (uncommitted sibling units in
 the tree, unowned by these notes): **loose-tag-carry, fork-pr-creation,
-ui-parity-6, contract-import-mitigation, ws1009-repro**. Superseded body
+ui-parity-6, contract-import-mitigation, ws1009-repro** *(all five have
+since landed — see Addendum 2)*. Superseded body
 lines: §3's migration row for 0031 ("in flight, uncommitted") — committed
 with the counters wave and applied remote via REDEPLOY13; §4's counter-work
 bullet and action-rows limitation — shipped and production-verified as
@@ -379,5 +382,69 @@ miscellaneous and settings families have **zero** remaining — fully declared.
   tombstone oracle, first-push settle generalization, repo size, star/watch
   counters, the generate fixes, license detection, the feeds tail, ui-parity
   3/4, and the avatar serving chain. *(Superseded: REDEPLOY12/13 shipped and
-  verified these — see the §2 addendum; the one open residual is the
-  generated repo's git-wire fetch/push.)*
+  verified these — see the §2 addendum; the one open residual — the
+  generated repo's git-wire fetch/push — was fixed by `8828f43`, see
+  Addendum 2.)*
+
+### Addendum 2 — the git-wire residual closed; the in-flight list landed (appended 2026-10-26, wave-38)
+
+Addendum 1 closed with REDEPLOY13's headline residual — the generated
+repo's git wire — "tracked open", and with five sibling units in flight.
+Both statements are stale as of HEAD `5dc924d`; every hash below is
+`git cat-file -e` verified at that tree.
+
+**The git-wire residual — closed** (`8828f43`). Root cause: the copied
+cell's packs are NOT closure-complete (thin + loose-base) alongside its
+loose objects, and the engine's finalize validated ref tips only — so a
+push stacked on `auto_init` skipped the loose INTERIOR silently:
+upload-pack answered 500 at the fetch POST and receive-pack refused
+`ng missing necessary objects`. The fix keeps the engine untouched
+(NOTICE-free): `replicateRepoCopy` brokers §5.3 itself — paged R2→R2 copy →
+UNCONDITIONAL loose carry with budgeted packed-commit descent (≤64) →
+finalize; red→green verified verbatim in both directions. The as-built
+redesign record — the ≤64 budget/truncation fidelity limit and the
+deliberately-NOT-taken engine-side alternative — is SPEC-0001b §5.3
+(`640c202`), superseding the original catalog-replication text.
+
+**Addendum 1's in-flight list, landed**: loose-tag-carry `ab5d300`
+(packed-aware annotated-tag partition — fork/generate/rename drop zero
+tags; loose tips re-materialize with the documented fidelity limit);
+fork-pr-creation `a16f60e` (cross-repo heads end-to-end — fork PRs are
+API-reachable); contract-import-mitigation `8b0ce41` + `cc196d3` (one
+`?raw`+parse helper, `frozen-contract.ts`, replaces every direct
+contract-JSON import — the ws1009 runner-crash class eliminated full-suite,
+17 deaths → 0); ws1009-repro `aff64a6` (N=2 minimal repro; the true
+mechanism measured: the `fetchWarmModules` SNAPSHOT frame, whole
+transformed graph in one WS message, 32 MiB cap); ui-parity-6 `1b41b60`
+(archive download + commit load-branches-and-tags aux JSON).
+
+New infrastructure since Addendum 1:
+
+- **Identity rig** (`4588475`) — `seedIdentity` mints REAL tokens through
+  TokenService with row-projected identity (hand-rolled drift killed);
+  `identityAuthResolver` layers over the stock test stub with a
+  byte-identical default arm — unlocks stranger-arm and multi-identity
+  differentials.
+- **Payload mode** (`836f87a`, tail `7016ce9`) — upstream's
+  `ToPayloadPullRequest` ported (webhook/label/milestone payloads render
+  `head.repo` regardless of doer; hidden fork at `AccessModeNone`), then
+  the tail emitters (label-detach, assignee, review-submission,
+  review-request) switched; API serializers stay single/list.
+- **Deploy-probes toolkit** (`49de9e9`) — six canonical batteries
+  (p0/registry/generate-e2e/forkpr-e2e/ui-login/cleanup-audit) with
+  evidence-anchored expectations, 0600 token discipline + secret
+  scrubbing, `--dry-run`/`--json`; local self-test 45/45. REDEPLOY waves
+  are its first production consumers.
+
+Compat tick 3 (`5dc924d`, survey re-run at `7016ce9`): the CURRENT
+reproducible UI headline is **52 LANDED / 3 PARTIAL / 57 ABSENT + 1
+in-flight of 113** (row-by-row recount) — Addendum 1's 48/4/61 stands as
+that tick's time-correct snapshot. The declared API surface is unchanged
+at **490 ops / 298 paths** (ledger window `5d9122c..7016ce9`: zero new
+ops — the §4 pre-Actions/packages ceiling holds).
+
+**REDEPLOY14** — in flight at this addendum's writing (deploying),
+expected to carry the wave recorded above (`8828f43`→`5dc924d`); its
+evidence block lands in `docs/design/p0-evidence.md` after the run.
+
+### What production proved this window
