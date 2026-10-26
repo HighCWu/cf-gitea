@@ -39,8 +39,7 @@ import { registerBranchRoutes } from "./routes/branches";
 import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
 import { registerPullRoutes } from "./routes/pulls";
-import { engineCell, engineReads, refTipMap, ZERO_OID } from "./services/engine";
-import { IssuesService } from "../issues/service";
+import { engineReads, refTipMap } from "./services/engine";
 import { RepoService } from "../repos/service";
 import type { User } from "./models/user";
 
@@ -606,14 +605,23 @@ async function repoIdOf(owner: string, slug: string): Promise<string> {
 /**
  * Seed a fork-head PR (two repos): `forkOwner/forkSlug` carries the suite's
  * base history plus ONE feature commit — on the fork's default `main` when
- * `onDefaultBranch`, else on `refs/heads/${forkBranch}`. Forks are FULL
- * copies (SPEC-0001b §5.2 — no cross-repo pack sharing), and the merge runs
- * in the BASE cell, so the same deterministic pack is staged in the base too:
- * a scratch branch carries the objects through the receive flow, the
- * `refs/pull/N/head` CAS landing uses the same commitApiChange primitive the
- * creation route uses (routes/pulls.ts pins cross-repo heads to a null tip
- * today — fork PRs cannot be API-created yet), then the scratch branch is
- * CAS-deleted. The PR row is created through IssuesService directly.
+ * `onDefaultBranch`, else on `refs/heads/${forkBranch}`. Deterministic oids
+ * keep a re-run a no-op over the persistent DO cells.
+ *
+ * Since a16f60e the fork PR IS API-reachable, so the PR itself goes through
+ * the REAL POST /pulls fork path — head `owner/slug:branch` resolves the fork
+ * (the suite owner reads it; the forks are public seeds), the merge base
+ * computes IN THE FORK CELL (the FetchRemoteTempCommit base fetch included —
+ * the base main has usually advanced past the fork point by fork-test time),
+ * the head closure carries into the base cell, the row lands with its merge
+ * base, and the route writes `refs/pull/N/head`. The 2e3db28 bypass — the
+ * feature pack staged into the base cell behind a scratch `forkstage`
+ * branch, the row created through IssuesService directly — is gone: none of
+ * these tests constructs a state the API cannot produce (their subjects are
+ * the merge-time head guards, all reachable states). What REMAINS seeded is
+ * only the fork's content (repo rows + refs via the receive flow) — the pull
+ * API creates PRs, it does not author repo content, so the fork's commits
+ * must pre-exist for the same reason the suite's own branches do.
  */
 async function seedForkHeadPr(options: {
   forkOwner: string;
@@ -639,36 +647,19 @@ async function seedForkHeadPr(options: {
     await pushRefsIfAbsent(`${options.forkOwner}/${options.forkSlug}`, forkToken, [{ ref: `refs/heads/${options.forkBranch}`, oid: featureTip }], pack);
   }
 
-  // the PR row: fork head → base repo
-  const forkRepoId = await repoIdOf(options.forkOwner, options.forkSlug);
-  const baseRepoId = await repoIdOf(OWNER, SLUG);
-  const { pullRequest } = await new IssuesService(env.DB).createPullRequest({
-    repoId: baseRepoId,
-    headRepoId: forkRepoId,
-    baseBranch: "main",
-    headBranch,
+  // the PR: the real POST /pulls fork path (head `owner/slug:branch`) — the
+  // fork-edge create runs the whole choreography (merge base in the fork
+  // cell, head closure carried into the base cell, D1 row, refs/pull/N/head).
+  const created = await send(`${REPO}/pulls`, jsonInit("POST", {
     title: `Fork change: ${options.featurePath}`,
-    posterId: OWNER_ID,
-    allowMaintainerEdit: true,
-    headSha: featureTip,
-  });
+    head: `${options.forkOwner}/${options.forkSlug}:${headBranch}`,
+    base: "main",
+  }));
+  expect(created.status).toBe(201);
+  const pr: Record<string, unknown> = await created.json();
 
-  // the base cell: objects behind a scratch branch → refs/pull/N/head →
-  // the scratch branch goes away (the base keeps only the pull ref)
-  const pushToken = await mintPushToken(OWNER_ID, "pull-engine-fork-base-push");
-  await pushRefsIfAbsent(`${OWNER}/${SLUG}`, pushToken, [{ ref: "refs/heads/forkstage", oid: featureTip }], pack);
-  const baseCell = engineCell(env, { ownerNamespace: OWNER, slug: SLUG });
-  const known = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
-  const pullRef = `refs/pull/${pullRequest.index}/head`;
-  if (!known.has(pullRef)) {
-    const landed = await baseCell.commitApiChange({ ref: pullRef, expectedOldOid: ZERO_OID, newOid: featureTip });
-    if (landed.tag !== "committed") {
-      throw new Error(`refs/pull landing failed: ${landed.tag}`);
-    }
-  }
-  await baseCell.deleteApiRef({ ref: "refs/heads/forkstage", expectedOid: known.get("refs/heads/forkstage")?.target ?? featureTip });
-
-  return { index: pullRequest.index, forkRepoId, featureTip };
+  const forkRepoId = await repoIdOf(options.forkOwner, options.forkSlug);
+  return { index: pr.number as number, forkRepoId, featureTip };
 }
 
 describe("merge delete_branch_after_merge — the fork-head arms", () => {

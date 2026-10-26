@@ -23,7 +23,7 @@ import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
-import { carryLooseObjects, type CarrySource, type CarryTarget } from "../../repos/carry";
+import { carryLooseRefs, type CarrySource, type CarryTarget } from "../../repos/carry";
 import { canUserDelete, findRule, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
 import {
   branchRef,
@@ -442,19 +442,25 @@ export async function createPullHeadRef(
 // INTO the base cell — is ours alone: upstream does all compare work in the
 // head repo, while OUR PR machinery (refs/pull/N/head's landing, the lazy
 // mergeability check, the diff range, the merge execution) reads the BASE
-// cell exclusively (§10.8 composition; the seeded-fork tests stage the same
-// bytes into the base cell for the same reason).
+// cell exclusively (§10.8 composition; the fork-head tests create through
+// this same API path, so the carry is theirs to exercise too).
 // ---------------------------------------------------------------------------
 
 /** Structural CarrySource over one cell (the fork-task.ts wrapping style —
  *  plain adapter functions strip the RPC stub's `Promise & Pick`
- *  intersections so the structural assignment infers). */
+ *  intersections so the structural assignment infers). `peeled` rides through
+ *  like carry.ts's own adapter — the packed-aware partition in carryLooseRefs
+ *  keys on it, so a future tag-naming surface gets the packed/loose split for
+ *  free instead of a blind walk. */
 function carrySource(env: ApiEnv["Bindings"], pair: { ownerNamespace: string; slug: string }): CarrySource {
   const cell = engineCell(env, pair);
   return {
     listRefs: async () => {
       const refs = await cell.listRefs();
-      return { head: refs.head, refs: refs.refs.map((ref) => ({ name: ref.name, target: ref.target })) };
+      return {
+        head: refs.head,
+        refs: refs.refs.map((ref) => ({ name: ref.name, target: ref.target, ...(ref.peeled === undefined ? {} : { peeled: ref.peeled }) })),
+      };
     },
     listCatalogPage: (after, limit) => cell.listCatalogPage(after, limit),
     readCommit: (id) => cell.readCommit(id),
@@ -499,6 +505,14 @@ async function packedCatalogOids(source: CarrySource): Promise<Set<string>> {
  * computation retries once. Still no common ancestor → null: upstream's empty
  * `CompareBase` (compare.go:91-93 — GetCompareInfo "does its best"; the PR is
  * still created and diffs empty, never a "nothing to compare" refusal).
+ *
+ * The carry rides carryLooseRefs (the rename/fork carries' packed-aware
+ * partition) with a single synthetic base-branch ref and `head: null` — these
+ * carries land OBJECTS only, no ref (the FetchRemoteTempCommit posture), so
+ * the returned finalize input is discarded. Today's base is always a branch
+ * tip (the route resolved it through branchRef), so the partition is the
+ * identity; the adoption matters the day a head/base naming surface reaches a
+ * tag, where the pre-adoption blind walk would silently drop the tag tip.
  */
 export async function crossRepoCreateMergeBase(
   c: Context<ApiEnv>,
@@ -511,10 +525,11 @@ export async function crossRepoCreateMergeBase(
   const headReads = engineReads(c.env, headPair.repo);
   let result = await headReads.mergeBase(baseTip, headTip);
   if (result !== null && result.tag === "missing" && result.which === "a") {
-    await carryLooseObjects(
+    await carryLooseRefs(
       carrySource(c.env, basePair.repo),
       carryTarget(c.env, headPair.repo),
-      [{ name: branchRef(baseBranch), oid: baseTip }],
+      [{ name: branchRef(baseBranch), target: baseTip }],
+      null,
       await packedCatalogOids(carrySource(c.env, headPair.repo)),
       `${basePair.repo.ownerNamespace}/${basePair.repo.slug} -> ${headPair.repo.ownerNamespace}/${headPair.repo.slug} (pr-create base fetch)`,
     );
@@ -532,10 +547,16 @@ export async function crossRepoCreateMergeBase(
  * the base cell. Short-circuits when the base cell already holds the tip
  * (even branches: the shared history IS the base's own).
  *
- * The carryLooseObjects walk reconstructs objects from the read RPCs and
+ * The carry rides carryLooseRefs with a single synthetic head-branch ref and
+ * `head: null` — the walk reconstructs objects from the read RPCs and
  * lands them through putApiObjects — idempotent, so a retried or concurrent
  * create is safe, and a failure leaves nothing durable (the walk precedes the
- * D1 creation). Bounded walks: a divergent history beyond the walk budgets,
+ * D1 creation). No ref lands in the base cell here either: the only ref the
+ * create writes is `refs/pull/N/head` (the route's createPullHeadRef), so the
+ * returned finalize input is discarded. The partition is the identity for
+ * today's branch tips; a head that names a tag rides the packed/loose split
+ * instead of the pre-adoption blind walk that silently dropped the tag tip.
+ * Bounded walks: a divergent history beyond the walk budgets,
  * or a pushed commit carrying headers serializeCommit does not model (gpgsig
  * et al — the Worker-authored loose class round-trips byte-exact by
  * construction, pushed exotic-header commits do not), throws and fails the
@@ -553,10 +574,11 @@ export async function carryForkHeadIntoBase(
     return;
   }
   const baseSource = carrySource(c.env, basePair.repo);
-  await carryLooseObjects(
+  await carryLooseRefs(
     carrySource(c.env, headPair.repo),
     carryTarget(c.env, basePair.repo),
-    [{ name: branchRef(headBranch), oid: headTip }],
+    [{ name: branchRef(headBranch), target: headTip }],
+    null,
     await packedCatalogOids(baseSource),
     `${headPair.repo.ownerNamespace}/${headPair.repo.slug} -> ${basePair.repo.ownerNamespace}/${basePair.repo.slug} (pr-create head carry)`,
   );

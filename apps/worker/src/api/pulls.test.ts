@@ -27,7 +27,7 @@ import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
 import { createApiRouter } from "./router";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -83,8 +83,8 @@ beforeEach(async () => {
 const db = () => drizzle(env.DB);
 const service = () => new IssuesService(env.DB);
 
-const PULL_FIELDS = Object.keys(contract.definitions.PullRequest.properties).sort();
-const PULL_BRANCH_FIELDS = Object.keys(contract.definitions.PRBranchInfo.properties).sort();
+const PULL_FIELDS = Object.keys(contractModelProperties("PullRequest")).sort();
+const PULL_BRANCH_FIELDS = Object.keys(contractModelProperties("PRBranchInfo")).sort();
 
 const TOKEN = "stub-token";
 const authHeaders = { Authorization: `token ${TOKEN}`, "Content-Type": "application/json" };
