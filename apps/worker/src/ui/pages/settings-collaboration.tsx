@@ -287,6 +287,14 @@ export async function changeAccessModeFromForm(
   if (!Number.isInteger(uid) || uid <= 0 || mode === null) {
     return { outcome: "refused", message: collabLocale.err_user_not_exist };
   }
+  // Upstream ChangeCollaborationAccessMode runs GetUserByID(uid) FIRST and
+  // answers 400 — a positive uid naming no user must refuse, not silently
+  // upsert an orphan row (the table carries no FK; the collaboration
+  // matrix's RED).
+  const target = await drizzle(d1).select({ id: users.id }).from(users).where(eq(users.id, uid)).get();
+  if (target === undefined) {
+    return { outcome: "refused", message: collabLocale.err_user_not_exist };
+  }
   await addOrUpdateCollaborator(d1, repo.id, uid, mode, now);
   return { outcome: "applied" };
 }
