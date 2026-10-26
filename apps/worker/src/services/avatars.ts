@@ -442,8 +442,9 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 
 /**
  * DefaultAvatarLink (models/avatars/avatar.go:44-46) — the bundled PNG every
- * fallback arm ends at. The asset itself is served by the frontend's
- * /assets/* handler (the UI wave's concern — see the serving seam header).
+ * fallback arm ends at. The asset is served by the Workers Static Assets
+ * store (edge-served, `assets` binding in wrangler.jsonc; the build guards
+ * in scripts/build-gitea-assets.mjs pin its presence).
  */
 export function defaultAvatarLink(): string {
   return "/assets/img/avatar_default.png";
