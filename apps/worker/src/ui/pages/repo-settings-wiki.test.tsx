@@ -1,14 +1,20 @@
 /**
- * The repo settings wiki panel's tests (the bench-row UNMOUNTED module —
- * the activity-feeds.test.tsx harness): the toggle's parse/apply matrix over
- * real D1 (generated migrations in beforeAll; the write goes through the
- * landed `saveRepoSettings`, the same store the PATCH arm writes and the
- * wiki gate reads) and the DOM contract of the page render — hono/jsx
- * renderToString, the module driven directly (no route yet, the HANDOFF
- * NOTE in the module header).
+ * The repo settings wiki panel's tests (the module MOUNTED since window-2d
+ * 46e7e68 — GET+POST /{owner}/{repo}/settings/wiki at ui/index.ts): the
+ * toggle's parse/apply matrix over real D1 (generated migrations in
+ * beforeAll; the write goes through the landed `saveRepoSettings`, the same
+ * store the PATCH arm writes and the wiki gate reads), the DOM contract of
+ * the page render — hono/jsx renderToString — and the deferred matrix
+ * driving the real routes (the githooks matrix's minted-session pattern):
+ * the settingsGate posture (anonymous 303, signed-in non-admin 404 shell)
+ * on GET and POST, the admin GET reflecting the stored enable state, the
+ * POST→303 ?saved=1 round-trip with the flash + persisted state on the
+ * follow-up GET, the honest-absence read-only lines through the route (no
+ * dead inputs), the guard-first cross-origin 403, and the settings-family
+ * claim pin.
  */
 
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -16,9 +22,11 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { loadRepoSettings } from "../../api/services/repo-settings";
-import { repositories } from "../../db/schema";
+import { repositories, users } from "../../db/schema";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
+import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { Viewer } from "../viewer";
 import {
   applyRepoWikiSettings,
@@ -247,5 +255,216 @@ describe("the wiki panel DOM (options.tmpl:319-355 + 873-880 + 1046-1062 at the 
     expect(() => renderRepoWikiSettingsPage({ ctx, data, error: null, saved: false })).toThrow(
       "RepoWikiSettingsPage requires ctx.repo",
     );
+  });
+});
+
+// --- the mounted-route harness (window-2d 46e7e68; the githooks-matrix
+// --- minted-session pattern) ----------------------------------------------
+
+type RouteEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+const routeEnv: RouteEnv = {
+  ...env,
+  ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
+};
+
+/** The real production path: parse → resolveUiSession → resolveUiRequest →
+ *  the settingsGate → load → render, on the mounted uiRouter with the
+ *  synthetic manifest; the execution context is awaited so waitUntil
+ *  side-effects settle before assertions. */
+async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
+/** A minted session cookie header for the user id (the real mintSession
+ *  path, minted per request — the beforeEach users wipe cascades the
+ *  sessions table, so a cross-test cache would go stale; the value is never
+ *  rendered). */
+async function sessionHeader(userId: number): Promise<string> {
+  return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+}
+
+/** The seeded owner's minted session header — the repo-admin doer the
+ *  settingsGate's isRepositoryAdmin admits (ids are seed-assigned — never
+ *  hardcoded). */
+async function ownerSessionHeader(): Promise<string> {
+  const owner = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get();
+  if (owner === undefined) throw new Error("fixture owner missing");
+  return sessionHeader(owner.id);
+}
+
+/** A second plain user (the signed-in non-admin posture — the public repo
+ *  resolves for the read, the admin gate 404-shells the tab). */
+async function seedNonAdmin(username: string): Promise<{ id: number }> {
+  const rows = await drizzle(env.DB)
+    .insert(users)
+    .values({
+      username,
+      usernameLower: username.toLowerCase(),
+      status: "active",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    })
+    .returning()
+    .all();
+  const row = rows[0];
+  if (row === undefined) throw new Error("non-admin seed failed");
+  return { id: row.id };
+}
+
+/** The admin's GET of the tab through the real route (the optional `search`
+ *  carries the ?saved=1 flash param). */
+async function wikiGet(search = ""): Promise<Response> {
+  return fetchUi(`/alice/demo/settings/wiki${search}`, { headers: { cookie: await ownerSessionHeader() } });
+}
+
+/** The admin's urlencoded POST to the tab through the real route: the given
+ *  Origin header (the §2.8 guard's input) and the owner's minted session
+ *  cookie. An empty field set IS the disable post — the browser emits
+ *  nothing for an unchecked checkbox. */
+async function wikiPost(fields: Record<string, string> = {}, origin = ORIGIN): Promise<Response> {
+  return fetchUi("/alice/demo/settings/wiki", {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin,
+      cookie: await ownerSessionHeader(),
+    },
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
+// --- the mounted routes (window-2d: GET + POST /{owner}/{repo}/settings/wiki)
+
+describe("the mounted routes (GET + POST /{owner}/{repo}/settings/wiki)", () => {
+  it("303s an anonymous GET onto the login round-trip (the settingsGate)", async () => {
+    const res = await fetchUi("/alice/demo/settings/wiki");
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/alice/demo/settings/wiki")}`,
+    );
+  });
+
+  it("303s an anonymous same-origin POST onto the login round-trip too (guard passes, then the gate; nothing written)", async () => {
+    const res = await fetchUi("/alice/demo/settings/wiki", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ORIGIN,
+      },
+      body: new URLSearchParams({ enable_wiki: "on" }).toString(),
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/alice/demo/settings/wiki")}`,
+    );
+    expect((await loadRepoSettings(env.DB, repo.id)).hasWiki).toBe(true); // the absent-row default stands
+  });
+
+  it("404-shells a signed-in non-admin's GET (the settingsGate posture — the public repo resolves, the tab doesn't)", async () => {
+    const bob = await seedNonAdmin("bob");
+    const res = await fetchUi("/alice/demo/settings/wiki", { headers: { cookie: await sessionHeader(bob.id) } });
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain("status-page-error"); // the 404 shell
+    expect(html).not.toContain("repository settings wiki"); // never the tab's content
+  });
+
+  it("404-shells a signed-in non-admin's POST before any write (the gate fronts the write arm too)", async () => {
+    const bob = await seedNonAdmin("bob");
+    const res = await fetchUi("/alice/demo/settings/wiki", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ORIGIN,
+        cookie: await sessionHeader(bob.id),
+      },
+      body: "", // the disable post — must never be applied
+    });
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+    expect((await loadRepoSettings(env.DB, repo.id)).hasWiki).toBe(true); // nothing was written
+  });
+
+  it("renders the admin's GET at 200 with the discriminator, the active navbar item and the stored enable state", async () => {
+    const res = await wikiGet();
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("repository settings wiki"); // the §2.4.1 pageClass
+    expect(html).toContain('class="active item" href="/alice/demo/settings/wiki"');
+    expect(html).toContain('id="enable_wiki" name="enable_wiki" type="checkbox" checked=""'); // the absent-row default: enabled
+  });
+
+  it("a disable POST 303s onto ?saved=1, the flag lands in D1, and the follow-up GET shows the flash and the unchecked box", async () => {
+    const res = await wikiPost(); // no fields — the browser's unchecked-checkbox post
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/alice/demo/settings/wiki?saved=1");
+    expect((await loadRepoSettings(env.DB, repo.id)).hasWiki).toBe(false); // the read-back
+    const page = await wikiGet("?saved=1");
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain('class="ui info message"'); // the ?saved=1 flash
+    expect(html).toContain(wikiSettingsLocale.update_settings_success);
+    expect(html).toContain('id="enable_wiki" name="enable_wiki" type="checkbox"/>'); // the persisted state
+    expect(html).not.toContain("checked=");
+    expect(html).not.toContain("ui attached error danger segment"); // the disabled wiki has no danger segment
+  });
+
+  it("an enable POST round-trips the flag back on — the follow-up plain GET renders the checked box and no flash", async () => {
+    await applyRepoWikiSettings(env.DB, repo, { enableWiki: false });
+    const res = await wikiPost({ enable_wiki: "on" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/alice/demo/settings/wiki?saved=1");
+    expect((await loadRepoSettings(env.DB, repo.id)).hasWiki).toBe(true);
+    const page = await wikiGet(); // no ?saved=1 — the flash is param-gated
+    const html = await page.text();
+    expect(html).not.toContain('class="ui info message"');
+    expect(html).toContain('id="enable_wiki" name="enable_wiki" type="checkbox" checked=""');
+    expect(html).toContain("ui attached error danger segment"); // the danger segment is back with the wiki
+  });
+
+  it("renders the honest-absence read-only lines through the route and never a dead input", async () => {
+    const res = await wikiGet();
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // No radio pair, no external-URL input, no default-branch input, no
+    // delete modal — the landed arms they would bind to do not exist.
+    expect(html).not.toContain('name="enable_external_wiki"');
+    expect(html).not.toContain('name="external_wiki_url"');
+    expect(html).not.toContain('name="default_wiki_branch"');
+    expect(html).not.toContain('type="url"');
+    expect(html).not.toContain("show-modal");
+    expect(html).not.toContain("delete-wiki-modal");
+    // The read-only reductions render through the route.
+    expect(html).toContain(wikiSettingsLocale.use_internal_wiki);
+    expect(html).toContain(wikiSettingsLocale.flavor_note);
+    expect(html).toContain("<p>main</p>"); // the effective branch (the repo default)
+    expect(html).toContain(wikiSettingsLocale.default_wiki_branch_name);
+    expect(html).toContain(wikiSettingsLocale.branch_note);
+    expect(html).toContain(wikiSettingsLocale.delete_unavailable);
+  });
+
+  it("rejects a cross-origin POST with 403 before any write (sameOriginGuard first)", async () => {
+    const res = await wikiPost({ enable_wiki: "" }, "https://evil.example");
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("cross-origin request rejected");
+    expect((await loadRepoSettings(env.DB, repo.id)).hasWiki).toBe(true); // nothing was written
+  });
+});
+
+// --- the route claim pin (parse ↔ registration — the githooks-matrix pin) ---
+
+describe("the route claim pin (the settings family claims exactly the wiki tab)", () => {
+  it("parses the GET/POST shape; misspelled or deeper tails stay unclaimed", () => {
+    expect(parseUiRoute("/alice/demo/settings/wiki")).toEqual({
+      family: "settings-wiki",
+      owner: "alice",
+      repo: "demo",
+    });
+    expect(handlesUiRoute("/alice/demo/settings/wiki")).toBe(true);
+    expect(parseUiRoute("/alice/demo/settings/wikis")).toBeNull(); // the plural misspelling
+    expect(parseUiRoute("/alice/demo/settings/wiki/extra")).toBeNull();
+    expect(handlesUiRoute("/alice/demo/settings/wiki/extra")).toBe(false);
   });
 });
