@@ -1929,3 +1929,181 @@ create answers 200 where upstream answers 201 (cosmetic, untracked).
 
 *(REDEPLOY14, evidence appended by the redeploy-verification agent; all
 numbers verbatim from this run's commands.)*
+
+## Redeploy verification — 2026-10-26 09:50–10:45 UTC (17:50–18:45 CST), post-REDEPLOY14 fix block (REDEPLOY15)
+
+Deploy shipped as ONE version: **`b9b5c734-a90c-4a98-a04e-f985a5b0fb57`** (100%,
+Created 2026-10-26T10:16:12.698Z per `wrangler deployments list`), deployed from
+tree **`783ab96` CLEAN** (detached worktree `/tmp/rd15-go`), on
+https://cf-gitea.hecongw.workers.dev. Previous live version:
+`1c834f20-41bb-45f4-8a4a-2e1aaa62d6e6` (the REDEPLOY14 block's version).
+Content shipped — the post-REDEPLOY14 mass, `8828f43..783ab96`, 16 commits in
+order: 640c202 (SPEC-0001b §5.3 as-built redesign record), 7016ce9 (payload
+sites tail — label-detach/assignee/review-submission/review-request emitters to
+payload mode), 49de9e9+4ed277d (**the deploy-probes toolkit** — six batteries,
+then the mirror battery 6→7; local self-test 65/0/0/0), 5dc924d+d7b8213+5abfe49
+(compat survey ticks + SPEC cite refresh), 45bea22+1a7af64 (ui-parity 8/9 —
+`/-/projects` LIST, `/blob/*` 303 redirect, tree-list, branches/list), e72ae74
+(release-notes addendum 2), efeb2e (REDEPLOY14 evidence), 2bd5388+fa81b96
+(pulls payload sites final + the assignee webhook join), **d24dc0f+4619c4f (THE
+headline: release create empty-gate `is_empty`, not `refs_version` —
+REDEPLOY14's NEW medium closing — plus the honest fixtures correction)**,
+783ab96 (checklist item 1 doc). Behavior-bearing in production: the release
+gate (verified below), the payload-mode webhook emitters, the two UI waves; the
+rest is docs/SPEC/toolkit. Assets rebuilt: same pin `fc4936884584` (submodule
+verified unchanged, 0 dirty files).
+
+Deploy-tree methodology (REDEPLOY10–14 detached-worktree pattern): worktree
+created at exactly `783ab96`, warm `pnpm install --frozen-lockfile`, `git
+submodule update --init` (pin verified), `pnpm gen:icons`, the scratch-dir
+asset build (`build-gitea-assets.mjs --work /tmp/gitea-assets-build-rd15go
+--skip-install`) emitted into the worktree's `public/assets` BEFORE the vitest
+gate, `.dev.vars` copied in 0600. The main working tree was never modified by
+this agent (the board wave's in-flight hunks landed via the orchestrator
+mid-run; untouched here). Worktree + scratch asset dir + probe scratch removed
+after the run.
+
+Deploy gates — at `783ab96` (worktree): `pnpm typecheck` **0 errors**;
+`check:api` **PASS** (declared **490** ops/298 paths, tier-1 **78/78 paths,
+129/129 ops**); `check:contract` **PASS** (sha256 `529a3314…`, verbatim match —
+identical to REDEPLOY14's pin). Vitest run of record: **3418 passed | 4 failed
+| 28 skipped (3450) in 181.55 s**, files 4 failed | 156 passed | 1 skipped
+(161). **`Worker exited unexpectedly` attributions: 0.** The 4 failures,
+adjudicated by solo re-runs: (a) `src/api/compat/suite.test.ts >
+POST /repos/{owner}/{repo}/releases (repoCreateRelease) matches its tier-1
+fixture` — **DETERMINISTIC, test-only, solo-red too**: the scenario expects 201
+but got 422 `{"message":"repo is empty"}` — `suite.test.ts:414-415` seeds the
+release repo (id 9004) with `refs_version: 1` (the OLD gate column) but never
+`is_empty: false`; 4619c4f fixed `releases.test.ts` (`35 tests ✓` green in-run)
+but missed the compat seeding — the production gate is correct and is proven
+below; (b) `pull-engine.test.ts` fork-head arm, (c)+(d) `invariants.test.ts` ×2
+and `pages-wave6.test.ts` (golden-fixture beforeAll hook) — all three **SOLO
+GREEN** on immediate re-run (30 s suite-load timeouts, REDEPLOY14's adjudicated
+class).
+
+Remote migrations immediately before deploy: **ledger unchanged — 33 files in
+the tree, "✅ No migrations to apply!" (33/33)**; `8828f43..783ab96` touched
+zero migration files.
+
+`pnpm smoke` equivalent (deploy-smoke.mjs `--migrate-check`, the run PAT as
+Basic password): **6 pass / 0 fail / 1 skip, `ok: true`**. Verbatim key lines:
+`[pass] healthz (1993 ms) — {"ok":true}`; `[pass] anon-git-surface (4254 ms) —
+probe-9ae7cb34/probe-1e3e0393.git: git-upload-pack 404 not-found,
+git-receive-pack 401 Basic challenge`; `[pass] receive-advert (615 ms) — advert
+ok (165 bytes)`; `[pass] push-lsremote (8534 ms) — pushed c50beb5ba9…, authed
+ls-remote sees refs/heads/main, anonymous advert 401 Basic challenge`;
+`[pass] cleanup (561 ms) — repo p0probe/smoke-51394246 deleted`; `[pass]
+migrate-check (4087 ms) — all 19 expected tables present (+48 system/aux: …
+push_mirrors)`; bench-report skip (not requested).
+
+**THE DEPLOY-PROBES TOOLKIT'S PRODUCTION DEBUT** (`scripts/deploy-probes.mjs`
++ its README — REDEPLOY15 is the first production consumer; run from the deploy
+worktree, minted per-run PAT in a 0600 token file, base
+`https://cf-gitea.hecongw.workers.dev`, user `p0probe`). Battery-by-battery,
+verbatim `[pass]` lines:
+
+- **p0** (`--fixture-oid 502abd2d…`) — 4/4 pass, exit 0:
+  `[pass] p0-shallow-since (5062 ms) — exit 128 — unsupported fetch argument
+  'deepen-since' (only depth-limited shallow fetches are supported)`;
+  `[pass] p0-shallow-exclude (5353 ms) — exit 128 — same shape naming
+  'deepen-not'`; `[pass] p0-depth-1 (3047 ms) — exit 0 — .git/shallow =
+  502abd2d55… (identical tip); depth 1; fsck clean`; `[pass] p0-privacy-anon
+  (4911 ms) — anonymous API GET 404, info/refs 401 (Basic realm="Gitea"), web
+  page 404 — the fixture stays private`. The toolkit absorbed the brief's
+  anonymous-P0 hand-probes wholesale.
+- **registry** (`--trials 2`) — 14/14 pass, exit 0: both trials create 201 →
+  advert settle (HEAD, refs/heads/main) → rename 200 → IMMEDIATE anonymous
+  carry → DELETE 204 → `[pass] tN-tombstone-t0 — exit 128 at t+0 — remote:
+  repository not found` → old name dead on both paths (git 128, API 404).
+- **generate-e2e** (`--strict-generated-clone`) — 10/10 pass, exit 0:
+  template 201 → real push (LICENSE on main + `refs/heads/dev` at
+  `4657800679…`) → PATCH template 200 + persisted → generate **201 with
+  `"empty":false`** → `[pass] gen-generated-refs (2576 ms) — both carried refs
+  at the identical tip 4657800679…`; `[pass] gen-generated-contents (2650 ms) —
+  LICENSE round-trips verbatim; last_commit_sha = the carried tip`; **`[pass]
+  gen-generated-clone (2602 ms) — clone succeeded (exit 0)`** — the 8828f43
+  git-wire fix holds in production under the HARD assert; cleanup 204s.
+- **forkpr-e2e** — 8/8 pass, exit 0 (the battery's FIRST production evidence,
+  per the README's "no prior evidence block"): base 201 → org 201 → fork 202
+  (default slug kept) → settle → fork push (`prbr-bf995651` at `fcfe7c5df1…`) →
+  `[pass] forkpr-create-201 (4759 ms) — PR #1 created from head
+  prorg-47d0d06e:prbr-bf995651`; `[pass] forkpr-head-chain (1626 ms) — head
+  chain ok: prorg-47d0d06e/prbase-e1e3d9ea#prbr-bf995651@fcfe7c5df1… → base
+  main (mergeable true, head.ref refs/pull/1/head)`; cleanup deleted fork +
+  base + org (204s).
+- **ui-login** — 5/5 pass, exit 0: anonymous labels 200 with 0 "New Label";
+  `[pass] ui-login-303 (368 ms) — 303 + gitea_session cookie`; `[pass]
+  ui-labels-cookie-owner (377 ms) — 200 with 3 "New Label" occurrences +
+  small-menu-items — the owner arm renders`; cleanup 204.
+- **mirror** — FIRST RUN **4 pass / 1 FAIL** (`mir-sync-settle` 10940 ms —
+  "last_error never went non-empty within 10000 ms"), chain-skipping
+  row-settled/delete/cleanup. Adjudication, NOT a product regression: the row
+  settled at create+12 s — read by hand after the red: `last_error` = **the
+  canonical verbatim 530 shape** `mirror target responded 530 for info/refs
+  advertisement [https://pmir-85f4cc86.invalid/dummy-unreachable.git/info/refs?service=git-receive-pack]`,
+  and remote D1 shows `sync_state='idle'`, `next_sync_at=0` — both skipped
+  arms' substance verified true; this deploy range touches zero mirror-path
+  files; pure queue-latency variance against the battery's 10 s
+  `MIRROR_SETTLE_MS`. Hand-cleaned the leftovers (mirror DELETE 204, list [],
+  repo DELETE 204), then **RE-RUN GREEN: 8/8 pass, exit 0** —
+  `[pass] mir-ssrf-loopback-refused (2288 ms) — 401 "Permission denied" — the
+  loopback target refused at the door; list still empty`; `[pass]
+  mir-sync-settle (1265 ms) — last_error names the target — the REDEPLOY13
+  verbatim 530 shape`; `[pass] mir-row-settled (5885 ms) — sync_state='idle',
+  next_sync_at=0 (--remote)`; delete 204, list [], repo deleted. Settle
+  latency: 12 s (red run) vs 1.3 s (green run) — the budget is tight.
+- **cleanup-audit** — run last, all pass, exit 0 (with the scratch-PAT
+  deviation, see friction): `[pass] audit-query (2567 ms) — owner_repos=1
+  creating=0 action=0 stars=0 push_mirrors=0 protected_branches=0
+  repo_redirects=0 user_blocking=0 tokens=2`; every independent count green.
+
+Toolkit friction notes for the toolkit owner: (a) `cleanup-audit` is D1-only
+but the CLI unconditionally requires `--token-file` (exit 2 without one) — it
+forced minting a scratch PAT and running `--expect-tokens 2`, then deleting the
+scratch and re-proving the count by hand; (b) `MIRROR_SETTLE_MS` (10 s) is
+tight against real production queue latency (observed settle at 12 s once in
+two runs); (c) on a `mir-sync-settle` failure the chain-skip leaves the mirror
+row AND repo behind with only `[skip] — prior step failed` lines (the
+left-behind is the documented red-run convention and the audit catches it, but
+a settle-failure cleanup attempt would spare the operator the hand-clean).
+
+**Release-gate production proof (d24dc0f's headline — REDEPLOY14's NEW ISSUE 1
+CLOSED in production).** Repo `p0probe/rel-rd15-2285617593` created 201
+(auto_init) with a REAL push on top (tip `65341d7209db72149cd3b3691c18118d9881814f`);
+`POST /api/v1/repos/p0probe/rel-rd15-2285617593/releases
+{"tag_name":"v1-rd15",…}` → **201** (REDEPLOY14: 422
+`{"message":"repo is empty"}` on EVERY repo), body renders `id 2,
+target_commitish "main"`, and `GET /releases` lists it. Negative arm — the gate
+is a gate, not removed: an `auto_init:false` empty repo → POST /releases →
+**422 `{"message":"repo is empty"}`** verbatim. Both probe repos DELETEd 204.
+
+Cleanup proof: every battery self-cleaned (registry tombs through their own
+DELETE step; generate/forkpr/ui/mirror-run-2/smoke/released-proof/empty-gate
+repos all 204; mirror-run-1 leftovers hand-cleaned 204/[]/204 as disclosed).
+Per-run credentials: 3 PATs minted this run — id 34 (LOST TO AN OPERATOR SLIP:
+the extraction regex `[A-Z2-7]` forgot the base32 alphabet's 8/9, so the token
+never reached the file; deleted by id `changes: 1` before any use), id 35 (the
+run PAT, used for every battery + smoke + hand-probes; DELETEd by id
+`changes: 1`; file shredded), the audit scratch PAT (prefix `cfg_288e4112`;
+DELETEd by prefix `changes: 1`; file shredded). Final whole-table
+`personal_access_tokens` = **1** (the standing bootstrap PAT), re-verified by
+remote D1 count alongside `owner_repos=1` (p0-shallow), `action=0`,
+`push_mirrors=0`. Raw mint stdout shredded; worktree, scratch asset dir, and
+probe logs removed; `gitea/` pristine (0 dirty files, pin `fc4936884584`).
+
+**RESOLVED this deployment:** REDEPLOY14's NEW ISSUE 1 — API release creation
+is reachable in production (the `is_empty` gate: 201 on a pushed repo, 422 on
+a genuinely empty one). The ws1009 runner-death class stays at 0.
+
+**OPEN ISSUES carried:** NEW (test-only, medium-low — owner: releases/compat):
+the compat tier-1 golden fixture for `repoCreateRelease` 422s under the honest
+gate — `src/api/compat/suite.test.ts:414-415` seeds `refs_version: 1` but not
+`is_empty: false` for repo 9004; one-line seed fix, production unaffected
+(unit file 35/35 + the production proof above). Carried unchanged from
+REDEPLOY14: the repo payload's `fork`/`parent`/`mirror` fields remain the
+SPEC-0005 serializer stubs; the bare `owner:branch` PR head form with a renamed
+fork answers 404 (documented in-code divergence); API tag create answers 200
+where upstream answers 201 (cosmetic, untracked).
+
+*(REDEPLOY15, evidence appended by the redeploy-verification agent; all
+numbers verbatim from this run's commands.)*
