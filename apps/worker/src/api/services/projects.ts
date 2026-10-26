@@ -1693,3 +1693,45 @@ export async function canManageOrgProjectWorkflows(
   }
   return await new OrgService(d1).isOrgOwner(org.id, doer.id);
 }
+
+// ---------------------------------------------------------------------------
+// User scope (batch 6 stage 3 — routes/projects-user.ts). Same additive
+// appendix shape as the org scope above: the owner arm again, with the doer
+// (or a resolved /users/{username} target) as the owner.
+// ---------------------------------------------------------------------------
+
+/**
+ * The individual scope — project.Type 1, keyed on the owner's users.id. The
+ * `/user/projects` routes pass the authenticated doer's id (or null for an
+ * anonymous caller — the scope helpers' `?? 0` then resolves the zero owner,
+ * which no real project row carries).
+ */
+export function userProjectScope(ownerId: number | null): ProjectScope {
+  return { kind: "individual", repoId: null, ownerId };
+}
+
+/**
+ * The user arm's issue-visibility set — the SAME walk `orgVisibleRepos`
+ * performs (the owner's own repositories through the one landed visibility
+ * predicate, canViewRepositoryWithTeams); upstream's branch is
+ * owner-kind-agnostic too (shared/project.go:1685-1692 sets
+ * `issuesOpts.Owner = scope.Owner` whatever the owner kind, then the doer /
+ * AllPublic reduction of services/projects/issue.go:298-308).
+ */
+export async function userVisibleRepos(d1: D1Database, ownerId: number, viewer: Viewer): Promise<RepositoryWithOwner[]> {
+  return orgVisibleRepos(d1, ownerId, viewer);
+}
+
+/**
+ * `CanManageWorkflows`'s individual arm (services/projects/workflow.go:52):
+ * "being a user project's user" — plain owner equality, deliberately WITHOUT
+ * the org arm's site-admin short-circuit (workflow.go:44-49 is
+ * TypeOrganization-only). The DoerCanViewPrivate precondition collapses to
+ * "doer present" exactly as in the org arm.
+ */
+export function canManageUserProjectWorkflows(
+  project: { ownerId: number },
+  doer: { id: number },
+): boolean {
+  return doer.id === project.ownerId;
+}
