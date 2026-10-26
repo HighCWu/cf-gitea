@@ -44,6 +44,14 @@ credential walk `7cd1ce9`, the tree-view envelope `831709f`, the
 page-domain rotation Set-Cookie re-wrap `58c6cf0`) carries **zero new
 operations**; the checker re-run at this HEAD reports 490/298, `PASS`
 unchanged. The window's landings join the post-490 ledger below.
+**Ticked 2026-10-26** a sixth time, at HEAD `ae32b1a`: maintenance only
+again — the `58c6cf0..ae32b1a` window (7 commits: the tick-6 compat
+docs commit `7a5861e`, the RELEASE-NOTES-v1.1 Addendum 3 `4f59daa`, P0
+deploy evidence `96cb9d4`, the blob-excerpt machinery `0db7087`, the
+lastcommit fragment `3502ee4`, the toolkit tails `7d4c19a`, the
+repo-scoped projects UI row `ae32b1a`) carries **zero new
+operations**; the checker re-run at this HEAD reports 490/298, `PASS`
+unchanged. The window's landings join the post-490 ledger below.
 
 - **Sources / method**: frozen contract
   `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
@@ -51,7 +59,7 @@ unchanged. The window's landings join the post-490 ledger below.
   issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
   minus the declared set that `node scripts/check-openapi.mjs` reports
   (**490** operations across **298** paths, measured 2026-10-26 at HEAD
-  `58c6cf0`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
+  `ae32b1a`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
   operations). Raw diff: **64 undeclared** = **64 remaining**, all
   FEATURE-ABSENT — no in-flight subtraction applies any more.
   Issue / notification / miscellaneous / settings families have **zero**
@@ -117,10 +125,11 @@ that tick's measurement time were this doc plus the then-in-flight
 `/{username}/-/projects` wave's uncommitted files under
 `apps/worker/src/ui/` and a scratch script — none of them spec-bearing
 as measured (the checker still reports 490/298 in exactly this tree
-state). At this tick's measurement (`58c6cf0`) the tree is CLEAN apart
-from the two compat docs themselves; the repo-scoped projects UI wave
-now in flight is dispatch-ownership, not visible files, and is
-UI-only — no undeclared op rides it.
+state). At this tick's measurement (`ae32b1a`) the tree is CLEAN apart
+from the two compat docs themselves; the blob_excerpt/lastcommit
+route-mounting wave now in flight is dispatch-ownership, not visible
+files, and is UI-only — no undeclared op rides it (the previous tick's
+repo-scoped projects wave landed as `ae32b1a`, still zero ops).
 
 ---
 
@@ -154,7 +163,7 @@ existing seams), engine-registry lifecycle fixes (`4f574e9`, `1da8f56`,
 ### After the 490 line — post-regen landings (zero new ops)
 
 Everything merged after REG `c9a7ef7` carries no new declarations — the
-checker stays at 490/298 (re-run at this tick's HEAD `2310623`). The units,
+checker stays at 490/298 (re-run at this tick's HEAD `ae32b1a`). The units,
 grouped:
 
 - **API parity**: blocks-enforcement-2 tail (`f2e1710` — the regen's
@@ -191,7 +200,10 @@ grouped:
   behind a grep-masked exit code and brings the suite to the true 35/35;
   the gate change stands verified). The `9b49cd2..2310623` window adds
   nothing here — no spec-bearing landing; neither does the
-  `2310623..58c6cf0` window.
+  `2310623..58c6cf0` window; neither does the `58c6cf0..ae32b1a`
+  window — its two api-side landings (`0db7087` the blob-excerpt
+  machinery, `3502ee4` the lastcommit fragment) are UI-fragment
+  services over already-declared reads, spec-bearing zero.
 - **Migrations 0029–0032** landed with them (`size_kb`, `num_stars`/
   `num_watches`, `num_forks` + `users.num_stars`, push-mirror sync state) —
   still 64 tables; these are store work behind already-declared ops.
@@ -221,7 +233,16 @@ grouped:
   (`7cd1ce9` + `58c6cf0` — token-first/session-cookie-fall-through
   order per the pinned web group, rotation Set-Cookie re-wrapped on
   every response and again at the consumer, the browser_download_url
-  owner probe added).
+  owner probe added). The `58c6cf0..ae32b1a` window adds the
+  repo-scoped projects row (`ae32b1a` — list + board + writes +
+  workflows over the 64-op store; the `has_projects` toggle MODELED —
+  no divergence; the Hono `:repo{[^-].*}` constraint convention
+  discovered+applied and recorded), the blob-excerpt machinery
+  (`0db7087` — the full `BuildBlobExcerptDiffSection` port, services
+  only, route handoff documented) and the lastcommit fragment
+  (`3502ee4` — the batched per-path commit-info loader + the
+  `view_list.tmpl` DOM, route handoff documented; both fragments'
+  routes ride a sibling's `index.ts` window).
 - **Test/docs**: vitest contention config (`e4ebb9d`), release notes
   (`1c44086`), P0 deploy evidence (`d28d953`, `3d76cc6`), push-mirror SPEC
   (`998a4de`), schema-docstring catch-up (`e6ccf9c`). The
@@ -247,7 +268,12 @@ grouped:
   silent-pass preflight debut; its NEW medium-low finding — the
   attachments token-only walk, cookie-session owner 404s — is exactly
   what `7cd1ce9` then cured) and the tick-5 compat docs commit
-  (`64aa06a`).
+  (`64aa06a`). The `58c6cf0..ae32b1a` window adds the tick-6 compat
+  docs commit (`7a5861e`), the RELEASE-NOTES-v1.1 Addendum 3
+  (`4f59daa`), and P0 deploy evidence (`96cb9d4` — deploy b928537a @
+  `7cd1ce9`: the attachments cookie-fix proven, BOTH 16-OPENs closed
+  with production proof incl. the `--force-red` rehearsal shapes,
+  7/7 batteries first-try).
 - **Tooling**: the `9b49cd2..2310623` window adds the toolkit polish
   (`5fdbc15` — token optional for D1-only batteries, `MIRROR_SETTLE_MS`
   10s→30s + `--mirror-settle-ms`, the generic failureTail with the
@@ -258,7 +284,11 @@ grouped:
   fullName-tracked, green runs silent, plus the GENERIC
   `--force-red <check-id>` deterministic failure-shape knob; the
   REDEPLOY16 incident shape force-reproduced exactly, following audit
-  green).
+  green). The `58c6cf0..ae32b1a` window adds the toolkit tails
+  (`7d4c19a` — the registry battery's rename-aware fullName
+  re-pointing, the forkpr fork→base→org order, ui-login; all three
+  self-sweep on red; per-battery forced-red rehearsals with
+  following-audit-green proofs; p0 creates nothing, explicit).
 
 ---
 
