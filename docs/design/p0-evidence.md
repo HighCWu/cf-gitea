@@ -1694,3 +1694,238 @@ verbatim failure recording and clean state transitions.
 
 *(REDEPLOY13, evidence appended by the redeploy-verification agent; all
 numbers verbatim from this run's commands.)*
+
+## Redeploy verification — 2026-10-26 06:05–06:50 UTC (14:05–14:50 CST), same-deployment-state block (REDEPLOY14)
+
+Deploy shipped as ONE version: **`1c834f20-41bb-45f4-8a4a-2e1aaa62d6e6`** (100%,
+Created 2026-10-26T06:05:35.847Z per `wrangler deployments list`), deployed from
+tree **`8828f43` CLEAN** (detached worktree), on
+https://cf-gitea.hecongw.workers.dev. Previous live version:
+`64bee4f6-ccba-4f88-bf24-d0d26134dea4` (the REDEPLOY13 block's version).
+Content shipped — the post-REDEPLOY13 mass, `e4ebb9d..8828f43` in order:
+2e3db28 (fork-head after-merge delete ladder), 3169e33 (invariants fixture
+diet), ff4172a+aff64a6 (ws1009 research draft, then the built N=2 minimal
+repro — mechanism: the fetchWarmModules SNAPSHOT frame, 32 MiB cap measured),
+5d9122c+18dd272 (docs: miniflare beta pin hold; compat docs ticked 490/554),
+bf8e56f (REDEPLOY13 evidence), 1b41b60 (ui-parity-6 archive download + commit
+aux JSON), b74b2d2 (release-notes addendum), ab5d300 (annotated-tag carry,
+packed-aware partition + the rename packed-tag drop fix), 889b74a (archive ref
+convergence), 8b0ce41 (**the ws1009 contract-import mitigation — 17 runner
+deaths → 0**), a16f60e (fork PR creation end-to-end), 9f6b86a/eeb8270/aa95c90
+(SPEC/docs), 0466356 (PR head repo render, hidden-head gate port),
+945a47d (forks header), cc196d3 (pull-engine follow-ups — carryLooseRefs at
+both carry sites; last direct contract import converted; fork-head tests on
+the real POST /pulls path), 48101dc (ui-parity-7 — tags delete write +
+/tags/list aux + releases edit/delete tail), 4588475 (identity rig),
+836f87a (pull payload mode — ToPayloadPullRequest), **8828f43 (THE GO commit:
+generate/fork git-wire — replicateRepoCopy brokers §5.3 itself: paged copy →
+UNCONDITIONAL loose carry with budgeted packed-commit descent ≤64 →
+finalize; the thin-pack + loose-base interior that upload-pack 500'd)**.
+Assets rebuilt: same pin `fc4936884584`, identical bundle hashes
+`index.oLjWPtMl.js` / `iife.Cpk_pTor.js`.
+
+Deploy-tree methodology (REDEPLOY10–13 detached-worktree pattern reused): the
+coordinator's GO named `8828f43`; the worktree was created at exactly that
+commit at the re-gate moment (the tree at re-gate IS the deploy tree; no
+later commits were folded). Gates and deploy ran from detached `git worktree
+add --detach /tmp/rd14-go 8828f43` — warm `pnpm install --frozen-lockfile`,
+`git submodule update --init` (pin `fc4936884584` verified unchanged),
+`pnpm gen:icons`, the **scratch-dir asset build** (`build-gitea-assets.mjs
+--work /tmp/gitea-assets-build-rd14go --skip-install`) emitted into the
+worktree's `public/assets` BEFORE the vitest gate, `.dev.vars` copied in 0600.
+A pre-GO full gate run also executed at the then-HEAD `945a47d` in a separate
+worktree (same recipe) per the brief's "start gates NOW" protocol. Both
+worktrees (and their copied `.dev.vars`) were removed after the run; the main
+working tree was never modified by this agent; the sibling waves' uncommitted
+hunks were never touched.
+
+Deploy gates — at `8828f43` (worktree): `pnpm typecheck` **0 errors**;
+`check:api` **PASS** (declared **490** ops/298 paths, tier-1 **78/78 paths,
+129/129 ops**); `check:contract` **PASS** (sha256 `529a3314…`, verbatim
+match). Vitest run of record: **3413 passed | 1 failed | 5 skipped (3419) in
+173.27 s**, files 157 passed | 1 failed | 1 skipped (159).
+**`Worker exited unexpectedly` attributions: 0 — the ws1009 crash class is
+gone in production-config full-suite runs** (REDEPLOY13: 15–17 orphaned
+files per run; this run: none, no solo re-runs needed for crashes). The ONE
+failure, adjudicated: `src/api/pull-engine.test.ts > merge
+delete_branch_after_merge — the fork-head arms > deletes the FORK's head
+branch after the merge` — **30 s timeout under suite load (30004 ms), not
+code**: the same file re-ran SOLO **25/25 green, 0 runner deaths** minutes
+later; its three sibling fork-head arms passed in-run (22.7 s / 3.6 s /
+3.3 s). Pre-GO HEAD gates at `945a47d`: typecheck 0, check:api PASS 490/298
+(78/78+129/129), contract sha verbatim, vitest **3386 passed | 5 skipped,
+0 failed, 0 runner deaths** (156 files green; the 1 skipped file is
+`src/bench-d1.test.ts`, by design).
+
+Remote migrations immediately before deploy: **ledger unchanged — 33 files in
+the tree, "✅ No migrations to apply!" (33/33)**; no wave added one (0031/
+0032 already remote from REDEPLOY13).
+
+`pnpm smoke` equivalent (deploy-smoke.mjs, --migrate-check, fresh mint-per-run
+PATs — 2 this run, admin id 32 + p0probe id 33, raw mint stdout shredded
+before capture, 0600 token files; both DELETEd by id after): **6 pass /
+0 fail / 1 skip, `ok: true`** (run twice; the second with `--json` for the
+record). Verbatim key lines: `[pass] healthz — {"ok":true}`;
+`[pass] anon-git-surface — probe-9aa25ee7/probe-23e16a37.git: git-upload-pack
+404 not-found, git-receive-pack 401 Basic challenge`; `[pass] receive-advert —
+advert ok (165 bytes)`; `[pass] push-lsremote — pushed e1d1f1d647…, authed
+ls-remote sees refs/heads/main, anonymous advert 401 Basic challenge`;
+`[pass] cleanup — repo p0probe/smoke-ed403e14 deleted`; `[pass]
+migrate-check — all 19 expected tables present (+48 system/aux: …
+push_mirrors)`; bench-report skip (not requested).
+
+P0 probes re-run against THIS deployment (auth via `http.extraheader`; results
+**unchanged** vs all prior tables; disclosed probe fault: the first trio
+attempt ran UNAUTHENTICATED and exited 128 at the auth layer — re-run authed
+is the record):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1` (identical tip); `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean |
+
+`p0probe/p0-shallow` remains live intentionally; anonymous API GET **404**,
+anonymous `info/refs` **401 Basic challenge** (`www-authenticate: Basic
+realm="Gitea"`), anonymous web page **404** — re-verified after cleanup.
+
+**Generate git-wire probe (HEADLINE — 8828f43's production verification;
+REDEPLOY13's re-scoped OPEN ISSUE 1 is CLOSED, both halves).** Template
+`tmpl-rd14-140939`: `POST /user/repos` 201 (auto_init) → REAL PUSH content
+(LICENSE on main, second branch `dev`; ls-remote shows both refs, main tip
+`fce5f30ca7d6…`) → `PATCH {"template":true}` → **200, `"template":true` in
+the body** → `POST /repos/p0probe/tmpl-rd14-140939/generate
+{"name":"gen-rd14-140939","git_content":true}` → **201**, follow-up GET
+`"empty":false`. Then: **anonymous `git clone` of the GENERATED repo → exit
+0** (REDEPLOY13: HTTP 500 on the fetch command) — 2 commits, tip
+`fce5f30ca7d6…` IDENTICAL to the template's, LICENSE+README present.
+**Anonymous `git clone` of an admin FORK of the template → exit 0** — 2
+commits, same identical tip (the first clone attempt raced the async fork
+queue at poll 1 and got an empty cell — probe timing, disclosed; after refs
+appear the clone is byte-correct). **`PATCH` rename to `gen2-rd14-140939` →
+200 → anonymous clone of the RENAMED repo → exit 0** (2 commits) — and the
+**authed push-back to the renamed generated repo → exit 0**: a new commit on
+main landed, remote `refs/heads/main` = local new tip `754d59ea76ee…`
+(REDEPLOY13: push refused `missing necessary objects`). The generated cell is
+fully git-wire usable: clone serves the full carried history and receive
+accepts new work.
+
+**Fork PR end-to-end (a16f60e + 0466356 + 836f87a + 2e3db28, production
+product-path).** Base `p0probe/bp-rd14-140939` (public, auto_init, main tip
+`b0330573410c…`); fork to admin → **202** async → row `ready` with the D1
+edge verified (`fork_parent` = the base id, base `num_forks`=1; note: the
+repo PAYLOAD still renders the stub `fork:false, parent:null` — the known
+`TODO(SPEC-0005)` serializer stub, the edge itself is live). Divergent push
+to the fork's branch → `POST /repos/p0probe/bp-rd14-140939/pulls` with head
+`admin/bpfork-rd14-140939:feat3` (the `owner/name:branch` form) → **201**,
+`merge_base` = `b0330573410c…` persisted (computed IN the head cell); first
+GET `mergeable:null` (checking) → second GET **`mergeable:true`** (the lazy
+base-cell check CAS-writes Mergeable). **Head repo render**: authed GET
+renders `head.repo` = the fork (66 keys, `full_name:
+admin/bpfork-rd14-140939`, `head.sha` = the fork-side tip, `head.ref =
+refs/pull/2/head`); anonymous GET with the fork PUBLIC renders `head.repo`
+fully; **flip the fork private → anonymous GET renders `head.repo` null with
+`head.repo_id: -1`** — the 0466356 hidden-head sentinel verbatim — while the
+authed GET still renders. **Merge → 200** (state closed, merged true,
+`merge_commit_sha` `02fcf5cb88eb…`, base main advanced to it). **The
+2e3db28 ladder**: a second fork PR merged with
+`{"do":"merge","delete_branch_after_merge":true}` → **200 and the fork's
+head branch answers 404 after, the fork's `main` survives (200)**. Disclosed
+probe faults, product-correct outcomes: (a) my first fork clone raced the
+async copy and the branch I pushed was a ROOT commit (no shared history) —
+that PR got `merge_base:null`, status Empty(5), `mergeable:false`, and merge
+refused **405 `{"message":"Please try again later"}`** — the upstream posture
+for a non-mergeable PR, re-proved correct with a properly-parented branch;
+(b) the bare `owner:branch` form with a RENAMED fork answers 404 — the
+documented in-code divergence (upstream searches the fork edge and answers
+400 "does not have a fork"; ours resolves `owner/<base-slug>` by path, which
+coincides only for default-named forks; `owner/name:branch` is the exact
+production path).
+
+**Annotated-tag carry via fork (ab5d300's production verification; the
+materialized-oid divergence is expected and observed).** `POST
+/repos/p0probe/tmpl-rd14-140939/tags {"tag_name":"v1-rd14","message":…}`
+→ **200** (upstream answers 201 — minor, untracked), annotated object oid
+`383765e6cb92…` peeling to `fce5f30ca7d6…`; tag GET renders `message:""`
+per the documented toAnnotatedTag deviation. A fork created AFTER the tag
+(a first fork 409'd — upstream's one-fork-per-(owner,repo) rule; the stale
+pre-tag fork was deleted 204 first) lists **`v1-rd14` with the IDENTICAL
+peel `fce5f30ca7d6…`** and a **different tag oid `5c5440a072ea…`** —
+exactly the SPEC-0001b §5.3 record: name+peel must match (they do), oid may
+differ (it does, re-materialized).
+
+**Tags/releases UI spot — LOGIN-COOKIE methodology (ui-parity-7's production
+verification).** `POST /login` (form creds) → 303 + `gitea_session`. Tags
+page WITH cookie → **200**: the `v1-rd14` row, the
+`action="…/tags/delete"` delete form (the ui-parity-7 delete write), the
+`releases/new?tag=v1-rd14` link; ANONYMOUS → **200 with 0 delete forms**
+(differential `tags/delete`: owner 1, anon 0). **Release created via the
+WEB arm**: `POST …/releases/new` (form post) → **303**, then `GET
+/api/v1/releases` lists it (`tag_name v1-rd14`, name, draft:false) — and
+see NEW ISSUE 1: the API create arm refuses the same write. Releases LIST
+with cookie → 200 with the row + the edit pencil
+(`/releases/edit/v1-rd14`); the EDIT page renders the edit form AND the
+**`formaction="…/releases/delete"` formmethod=post delete button** (name=id)
+— the ui-parity-7 tail verbatim. Anonymous releases page: row readable,
+0 edit, 0 delete.
+
+**Registry sweep (one lifecycle).** `POST /user/repos` 201 (t+4.1 s) →
+create-settle GREEN on poll 1 (2 refs) → `PATCH` rename 200 → immediate
+anonymous ls-remote on the NEW name lists the refs (carry holds, tip
+`c6bee6ffeee8…`) → `DELETE` 204 → **T+0 anonymous ls-remote answers 128
+`remote: repository not found: p0probe/tomb2-rd14-140939`** (verdict 2.2 s
+after the DELETE, no sleep); old name 128 + anonymous API GET 404.
+
+**NEW ISSUE 1 (medium — API release creation is unreachable in production:
+the emptiness gate reads `refs_version`, which is never synced).** `POST
+/repos/{o}/{r}/releases` answers **422 `{"message":"repo is empty"}`** on a
+repo with full history. Root cause: `routes/releases.ts:465` gates on
+`found.repo.refsVersion === 0`, but `refs_version` is the observability-only
+column that is "deliberately never synced from the engine" — the
+codebase's own comment (`services/repository.ts:314-316`) and a
+whole-table check prove it: EVERY production repo carries `refs_version=0`
+(including push-created `p0-shallow`). So the API create arm 422s for every
+repo. The WEB arm (`POST /{o}/{r}/releases/new`) goes straight to
+`IssuesService.createRelease` without the gate and works (the 303 create
+above, listed via GET). Units pass because test fixtures seed
+`refs_version > 0`. Fix: gate on `is_empty` (the real transition column)
+or drop the gate. Owner: releases.
+
+**Cleanup proof (API-verified + remote D1).** Probe repos DELETEd → **204**
+across the board: `fork-rd14-140939` (the stale pre-tag fork), `tmpl-rd14-…`,
+`gen2-rd14-…`, `fork2-rd14-…`, `bp-rd14-…`, `bpfork-rd14-…` (the tomb
+lifecycle self-cleaned through its own DELETE step; the smoke repos
+self-cleaned). `repositories WHERE owner_namespace IN ('p0probe','admin')`
+minus `p0-shallow` = **0**; `status='creating'` whole-table = **0**;
+**`action` total = 0 with NO manual sweep** (389da18's delete sweep again
+performed in production); `stars` = 0; `repo_redirects` = 0;
+`push_mirrors` = 0; `protected_branches` = 0. Per-run credentials: 2 PATs
+minted (admin id 32, p0probe id 33; raw mint stdout shredded before capture,
+0600 token files); both DELETEd by id (`changes: 2`);
+`personal_access_tokens` whole-table = **1** (the standing bootstrap PAT).
+Probe scripts, token files, cookie jars, tail logs, clone dirs all shredded
+(`/tmp/rd14-probes` removed; `/tmp/gitea-assets-build-rd14` and
+`-rd14go` removed); both worktrees removed with their copied `.dev.vars`.
+`gitea/` submodule pristine (0 dirty files, pin `fc4936884584`);
+`wrangler deployments list` confirms `1c834f20…` at 100%.
+
+**RESOLVED this deployment (for the record):** (a) **generate git-wire
+residual — REDEPLOY13's OPEN ISSUE 1 CLOSED** (clone + push-back verified
+above, the 8828f43 headline); (b) fork PRs are API-reachable end-to-end in
+production (create → render → merge → head-delete ladder); (c) annotated-tag
+carry verified through the fork path (name+peel identical, oid divergence
+exactly as documented); (d) the ws1009 runner-death class: **0 in both full
+gates** (8b0ce41's mitigation holds; the one in-run failure was a load
+timeout, solo-green).
+
+**OPEN ISSUES carried:** NEW ISSUE 1 above (API release create 422 on the
+refs_version gate — the web arm works); the repo payload's
+`fork`/`parent`/`mirror` fields remain the SPEC-0005 serializer stubs
+(hardcoded TODO; the fork edge itself is live and verified through forks
+list, D1, and the PR path); the bare `owner:branch` PR head form with a
+renamed fork answers 404 (documented in-code divergence, upstream answers
+400 — cosmetic, the `owner/name:branch` form is the exact path); API tag
+create answers 200 where upstream answers 201 (cosmetic, untracked).
+
+*(REDEPLOY14, evidence appended by the redeploy-verification agent; all
+numbers verbatim from this run's commands.)*
