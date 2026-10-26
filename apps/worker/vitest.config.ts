@@ -22,5 +22,11 @@ export default defineConfig(async () => {
         },
       }),
     ],
+    // Full-suite runs spawn >100 isolated workerd workers on one box; under
+    // that contention the 5s default produced mass timeout flakes in
+    // engine/git-http/UI files that pass solo (observed 2026-10-26: 65-75
+    // failures across three full runs, zero real assertions). 20s keeps the
+    // bound meaningful while absorbing the contention spike.
+    test: { testTimeout: 20_000 },
   };
 });
