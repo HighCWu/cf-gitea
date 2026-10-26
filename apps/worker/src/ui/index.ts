@@ -9502,6 +9502,12 @@ uiRouter.post("/user/settings", (c) => userSettingsSubmit(c));
 // the wave-9/12 statics so the literals beat the dynamic owner/repo pair —
 // the wave-9 RegExpRouter note). The POSTs run the §2.8 sameOriginGuard.
 uiRouter.get("/repo/create", (c) => repoCreatePage(c));
+// Window-2e statics — MUST register ahead of the dynamic /:owner/:repo block
+// below (hono's RegExpRouter honors registration order; the late spot left
+// these GETs dead in uiPage's drift guard — the migrate-inbox matrix's RED,
+// the wiki #11 registration-order lesson repeated).
+uiRouter.get("/repo/search", (c) => repoSearchAuxRoute(c));
+uiRouter.get("/repo/migrate", (c) => repoMigratePage(c));
 uiRouter.post("/repo/create", (c) => repoCreateSubmit(c));
 uiRouter.get("/org/create", (c) => orgCreatePage(c));
 uiRouter.post("/org/create", (c) => orgCreateSubmit(c));
@@ -9669,8 +9675,6 @@ uiRouter.post("/:owner/:repo/settings/wiki", (c) => repoWikiSettingsSubmit(c));
 uiRouter.get("/sitemap.xml", (c) => sitemapRoute(c));
 uiRouter.get("/explore/repos/sitemap-:file", (c) => sitemapRoute(c));
 uiRouter.get("/explore/users/sitemap-:file", (c) => sitemapRoute(c));
-uiRouter.get("/repo/search", (c) => repoSearchAuxRoute(c));
-uiRouter.get("/repo/migrate", (c) => repoMigratePage(c));
 uiRouter.post("/repo/migrate", (c) => repoMigrateSubmit(c));
 uiRouter.get("/explore/topics/search", (c) => topicSearchAuxRoute(c));
 // The feed suffixes — one constrained registration (the owner-home
