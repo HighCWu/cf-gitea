@@ -173,6 +173,18 @@ describe("wiki WebPath codec (wiki_path.go port)", () => {
     expect(pathJoinRelX("a", "../b")).toBe("a/b");
     expect(goQuote('He said "hi"\n')).toBe('"He said \\"hi\\"\\n"');
   });
+
+  it("answers the empty join with the empty path (upstream's empty-input arm)", () => {
+    // gitea/modules/util/path.go: PathJoinRelX("") skips the empty element,
+    // PathJoinRel then path.Join()s nothing → `case "": return ""` — the bare
+    // `/wiki` tail must codec to "" (the routers' `len(pageName) == 0` arm),
+    // never ".". Only an all-dots join cleans to "/" and answers ".".
+    expect(pathJoinRelX("")).toBe("");
+    expect(pathJoinRelX("", "")).toBe("");
+    expect(webPathFromRequest("")).toBe("");
+    expect(pathJoinRelX(".")).toBe(".");
+    expect(pathJoinRelX("..")).toBe(".");
+  });
 });
 
 // ---------------------------------------------------------------------------

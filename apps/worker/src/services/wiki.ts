@@ -132,7 +132,10 @@ function pathClean(pathText: string): string {
 /**
  * Port of upstream `util.PathJoinRelX` (modules/util/path.go): backslashes
  * become slashes, each element is `Clean("/" + e)`, elements join and clean,
- * the leading `/` strips (`/` → `.`).
+ * the leading `/` strips (`/` → `.`). Empty-input arm: with NO non-empty
+ * element the join is Go's `path.Join()` of nothing → `""` (PathJoinRel's
+ * `case "": return ""`), so `pathJoinRelX("")` is `""`; only an all-dots
+ * join cleans to `/` and answers `.`.
  */
 export function pathJoinRelX(...elements: string[]): string {
   const cleaned: string[] = [];
@@ -140,6 +143,7 @@ export function pathJoinRelX(...elements: string[]): string {
     if (element === "") continue;
     cleaned.push(pathClean(`/${element.replaceAll("\\", "/")}`));
   }
+  if (cleaned.length === 0) return "";
   const joined = pathClean(cleaned.filter((part) => part !== "").join("/"));
   if (joined === "") return "";
   if (joined === "/") return ".";

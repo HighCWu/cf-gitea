@@ -479,14 +479,12 @@ export async function deleteWikiPageFromForm(env: Env, pair: RepositoryWithOwner
 /**
  * The wildcard tail → the wiki page name (upstream `WebPathFromRequest` +
  * the `len(pageName) == 0 → "Home"` arm, wiki.go:222-224/327-329/386-389).
- * Port note: `webPathFromRequest("")` answers `"."` (our pathJoinRelX maps
- * the empty join to "." where upstream Go's PathJoinRelX answers ""), so the
- * bare `/wiki` tail is normalized here — the guard every caller of the
- * codec's empty-tail form needs.
+ * `webPathFromRequest("")` is "" (pathJoinRelX's empty-input arm answers ""
+ * per upstream PathJoinRelX), so the bare `/wiki` tail lands here.
  */
 function wikiNameFromTail(rawTail: string): string {
   const raw = webPathFromRequest(rawTail);
-  return raw === "" || raw === "." ? wikiLocale.home : raw;
+  return raw === "" ? wikiLocale.home : raw;
 }
 
 export type WikiViewData =
