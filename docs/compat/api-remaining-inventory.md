@@ -8,14 +8,18 @@ equivalent. **Fully regenerated 2026-10-26** at HEAD `fec5c71` after the
 previous edition (written at declared=318, commit `c4577a7`) drove ~129
 declarations to completion — every batch it listed has since landed (the
 tick below closes the last two out).
-**Ticked 2026-10-26** at HEAD `5d9122c`: a maintenance pass, not a regen.
-Both batches the regen left live have landed — the in-flight org-project
-batch (REG `20512c0`, 447→468) and its one dispatchable batch,
-projects-user stage 3 (REG `c9a7ef7`, 468→490) — and everything merged
-after them carries zero new ops. Declared now **490** across **298** paths;
-the raw diff is **64**, all FEATURE-ABSENT (the 64-op tables below are
-unchanged from the regen); the dispatchable pool is empty and the In-flight
-section is cleared.
+**Ticked 2026-10-26** at HEAD `7016ce9`: a maintenance pass, not a regen —
+the second today (the previous one, at `5d9122c`, closed out the regen's
+last two batches: the org-projects stage 2, REG `20512c0`, 447→468, and
+projects-user stage 3, REG `c9a7ef7`, 468→490). The `5d9122c..7016ce9`
+window — 23 commits: two UI waves, the fork-PR / head-render / payload
+pull arc, the annotated-tag carry, the merge-delete ladder completion,
+the generate/fork git-wire fix, the ws1009 mitigation + sweep, a docs
+run — carries **zero new operations**.
+Declared still **490** across **298** paths; the raw diff is **64**, all
+FEATURE-ABSENT (the 64-op tables below are unchanged from the regen); the
+dispatchable pool is empty and the In-flight section is cleared. The
+window's landings are appended to the post-490 ledger below.
 
 - **Sources / method**: frozen contract
   `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
@@ -23,7 +27,7 @@ section is cleared.
   issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
   minus the declared set that `node scripts/check-openapi.mjs` reports
   (**490** operations across **298** paths, measured 2026-10-26 at HEAD
-  `5d9122c`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
+  `7016ce9`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
   operations). Raw diff: **64 undeclared** = **64 remaining**, all
   FEATURE-ABSENT — no in-flight subtraction applies any more.
   Issue / notification / miscellaneous / settings families have **zero**
@@ -84,8 +88,11 @@ work.
 Empty at this tick. The regen's three in-flight pools all landed: the
 org-projects 21 (REG `20512c0`), the blocks-enforcement tail (`f2e1710`)
 and license-detection (`03d5fe4`/`04a2903` — the family is complete, 5/5
-arms), and the ui-parity-3 rows (`ca81d5a`). The tree's only modification
-at measurement time was this doc.
+arms), and the ui-parity-3 rows (`ca81d5a`). The tree's modifications at
+measurement time were this doc plus the in-flight `/{username}/-/projects`
+wave's uncommitted files under `apps/worker/src/ui/` and a scratch script
+— none of them spec-bearing as measured (the checker still reports
+490/298 in exactly this tree state).
 
 ---
 
@@ -119,7 +126,7 @@ existing seams), engine-registry lifecycle fixes (`4f574e9`, `1da8f56`,
 ### After the 490 line — post-regen landings (zero new ops)
 
 Everything merged after REG `c9a7ef7` carries no new declarations — the
-checker stays at 490/298 (re-run at this tick's HEAD `5d9122c`). The units,
+checker stays at 490/298 (re-run at this tick's HEAD `7016ce9`). The units,
 grouped:
 
 - **API parity**: blocks-enforcement-2 tail (`f2e1710` — the regen's
@@ -131,7 +138,23 @@ grouped:
   first-push settle (`45631b7`), set-private-zero (`3163658`),
   star/watch counters (`528d369`), counters-2 (`3016c10`), delete-counters
   fold (`64e9b1b`), feeds-tail action rows (`64ade9f`), repo size
-  (`3c58cce`), registry tombstone oracle (`e30660d`).
+  (`3c58cce`), registry tombstone oracle (`e30660d`). The
+  `5d9122c..7016ce9` window adds: merge-delete ladder completion
+  (`2e3db28` — the fork-head after-merge delete; joins `faca961` +
+  `66f5977` above), fork PR creation (`a16f60e` — cross-repo heads
+  end-to-end: parseHead grammar + fork edge, anti-enumeration CanRead
+  404s, merge-base computed in the head cell), PR head repo render
+  (`0466356` — upstream's hidden-head gate, one visibility resolution
+  feeding gate + perms), pull payload mode (`836f87a` — the
+  ToPayloadPullRequest port: hidden forks render head.repo with
+  AccessModeNone perms), annotated-tag carry (`ab5d300` — packed-aware
+  partition; fixes both fork-generate and rename, which dropped even
+  packed tags), archive ref convergence (`889b74a`), the payload sites
+  tail (`7016ce9` — label-detach/assignee/review-submission/
+  review-request emitters), and the generate/fork git-wire fix
+  (`8828f43` — replicateRepoCopy brokers the §5.3 copy with UNCONDITIONAL
+  loose carry; closes the generated-repo wire residual `bf8e56f`
+  re-scoped OPEN).
 - **Migrations 0029–0032** landed with them (`size_kb`, `num_stars`/
   `num_watches`, `num_forks` + `users.num_stars`, push-mirror sync state) —
   still 64 tables; these are store work behind already-declared ops.
@@ -140,10 +163,26 @@ grouped:
   tags + labels pages), ui-parity-5 (`ca4eb58` — milestone detail/edit +
   fork form), the four diffpatch downloads (`79ef809`), the ui-parity-3
   rows landed (`ca81d5a`) — the row-level ledger is
-  `ui-parity-survey.md`.
+  `ui-parity-survey.md`. The `5d9122c..7016ce9` window adds
+  wave-ui-parity-6 (`1b41b60` — the archive download +
+  `load-branches-and-tags` aux JSON) and wave-ui-parity-7 (`48101dc` —
+  the tags delete write + `/tags/list` aux + the releases edit/delete
+  tail).
 - **Test/docs**: vitest contention config (`e4ebb9d`), release notes
   (`1c44086`), P0 deploy evidence (`d28d953`, `3d76cc6`), push-mirror SPEC
-  (`998a4de`), schema-docstring catch-up (`e6ccf9c`).
+  (`998a4de`), schema-docstring catch-up (`e6ccf9c`). The
+  `5d9122c..7016ce9` window adds: the ws1009 mitigation (`8b0ce41` — the
+  `?raw` frozen-contract helper eliminating the 17-runner-death crash
+  class) and its sweep completion (`cc196d3` — the last direct contract
+  import converted), the SPEC-0001b §5.3.1 as-built repo-copy divergence
+  record (`aa95c90` — 14 rows) + the §5.3 annotated-tag fidelity record
+  (`eeb8270`), the forks `num_forks` header fix (`945a47d`), the archive
+  service-doc convergence note (`9f6b86a`), the auth identity rig
+  (`4588475`), ws1009 research (`ff4172a` draft + `aff64a6` measured
+  repro), the invariant fixture diet (`3169e33`), P0 deploy evidence
+  (`bf8e56f`), the release-notes addendum (`b74b2d2`), and the SPEC-0001b
+  §5.3 as-built redesign record (`640c202` — the Worker brokers the copy
+  pass, loose closure unconditional).
 
 ---
 

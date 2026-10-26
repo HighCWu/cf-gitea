@@ -8,38 +8,46 @@ demand-per-effort instead of by route-table order. Companion to
 2026-10-26** at HEAD `99d21c5` after the previous edition (written at
 landed=28/partial=3/absent=82) drove waves 16-20 + ui-parity-2 to completion
 and ui-parity-3 into flight — every row it recommended has since landed.
-**Ticked 2026-10-26** at HEAD `5d9122c`: a maintenance pass, not a regen —
-the regen's four in-flight rows landed (`ca81d5a`) plus eight ABSENT rows
-its own top-5 and bench named (the tags page, the labels page, milestone
-detail + edit, the fork form, the two diffpatch-download rows, the avatar
-seam), draining IN-FLIGHT to zero and moving the headline to
-**48/4/61**; the dispatchable rows are re-ranked below.
+**Ticked 2026-10-26** at HEAD `7016ce9`: a maintenance pass, not a regen —
+the second today (the previous one, at `5d9122c`, recorded the regen's
+four in-flight rows plus eight ABSENT rows landing for 48/4/61). That
+tick's entire top-5 has now resolved: wave-ui-parity-6 (`1b41b60`) landed
+the archive download + `load-branches-and-tags`, wave-ui-parity-7
+(`48101dc`) landed the tags delete write + `/tags/list` aux + the
+releases edit/delete tail — the F family's one PARTIAL row flips LANDED —
+and the fifth, `/{username}/-/projects`, went IN-FLIGHT (a sibling wave
+owns it; excluded from the totals). Headline **52/3/57 + 1 in-flight**;
+the dispatchable rows are re-ranked below.
 
 - **Pin**: `fc4936884584a41931906553d96c2601d750e6ef` (v1.22.0-rc1-3919;
   verified `git -C gitea rev-parse HEAD`). Every `web.go:N` cite is
   `gitea/routers/web/web.go` at that commit unless another file is named.
 - **Our side**: the route table + parser families in
-  `apps/worker/src/ui/index.ts` at HEAD `5d9122c` — the header inventory
-  (the route-family comment block, `src/ui/index.ts:6-429`) and the
-  `ParsedUiRoute` union (line 1270) are the exhaustive family list (a family
-  exists iff a parse branch returns it); the pages under
-  `apps/worker/src/ui/pages/` (41 files: 39 page modules + 2 test modules)
-  and the session router (`src/ui/session.ts`) carry the renders, with the
-  `src/web/` seam routers (avatar serving) mounted in `src/index.ts`. The
-  WORKING TREE is clean of ui work at measurement time (`git status --short
-  -- apps/worker/src/ui/ apps/worker/src/web/` is empty) — no in-flight
-  exclusion applies.
+  `apps/worker/src/ui/index.ts` at HEAD `7016ce9` — the header inventory
+  (the route-family comment block) and the `ParsedUiRoute` union
+  (line 1397) are the exhaustive family list (a family exists iff a parse
+  branch returns it); the pages under `apps/worker/src/ui/pages/` (44
+  files committed: 42 page modules + 2 test modules) and the session
+  router (`src/ui/session.ts`) carry the renders, with the `src/web/`
+  seam routers (avatar serving) mounted in `src/index.ts`. The WORKING
+  TREE carries the IN-FLIGHT `/-/projects` wave's uncommitted files
+  under `apps/worker/src/ui/` at measurement time (at snapshot:
+  `pages/owner-projects.tsx`, `pages/org-home.tsx`, `index.ts`, its
+  test module), so the totals count the COMMITTED router/files only
+  (the exact commands below read HEAD, not the tree).
 - **Reproducing the counts** (exactly these walks):
   1. Upstream: walk the page-bearing GETs out of `gitea/routers/web/web.go`
      (`m.Get`/`m.Combo(...).Get` registrations, grouped into the same 6
      families and 113 rows as the original survey; aux surfaces excluded per
      the preamble) — the row set is pin-stable, unchanged since the last
      edition.
-  2. Ours: `grep -n "family:" apps/worker/src/ui/index.ts` (the parse
-     branches — 118 at this tick) + `ls apps/worker/src/ui/pages/` (the
-     renders — 41 files) at HEAD; `git status --short -- apps/worker/src/ui/
-     apps/worker/src/web/` must be empty for the totals to hold (it is at
-     `5d9122c`).
+  2. Ours (committed HEAD only — the in-flight wave's uncommitted ui
+     edits stay out): `git show HEAD:apps/worker/src/ui/index.ts | grep
+     -c "family:"` (the parse branches — 126 at this tick) +
+     `git ls-tree HEAD --name-only apps/worker/src/ui/pages/ | wc -l`
+     (the renders — 44 files) at `7016ce9`; `git status --short --
+     apps/worker/src/ui/` must show ONLY the in-flight wave's files for
+     that to be the right base (it does).
   3. API dependencies: `node scripts/check-openapi.mjs` (ends `PASS`) —
      `grep` its `[ok]` lines for the op named per row.
 - **Data prerequisites** are read from what is actually landed TODAY: the
@@ -83,31 +91,44 @@ model or a new engine-boundary RPC / whole subsystem).
 | Family | rows | LANDED | PARTIAL | ABSENT | IN-FLIGHT |
 |---|---|---|---|---|---|
 | A site-level + auth | 24 | 10 | 0 | 14 | 0 |
-| B owner pages | 16 | 6 | 1 | 9 | 0 |
-| C repo code browsing | 25 | 9 | 2 | 14 | 0 |
+| B owner pages | 16 | 6 | 1 | 8 | 1 |
+| C repo code browsing | 25 | 12 | 2 | 11 | 0 |
 | D issues + pulls | 22 | 13 | 0 | 9 | 0 |
 | E repo settings | 12 | 5 | 0 | 7 | 0 |
-| F repo sub-systems | 14 | 5 | 1 | 8 | 0 |
-| **total** | **113** | **48** | **4** | **61** | **0** |
+| F repo sub-systems | 14 | 6 | 0 | 8 | 0 |
+| **total** | **113** | **52** | **3** | **57** | **1** |
 
-(The regen's headline was 36/4/69 + 4 in-flight. This tick: the 4 in-flight
-rows landed (`ca81d5a`), and 8 ABSENT rows landed — avatar (`bb67087`,
-mounted `98d194d`), tags + labels pages (`0b61554`), milestone detail + edit
-+ fork form (`ca4eb58`), the two diffpatch rows (`79ef809`) — for
-48/4/61/0.)
+(The regen's headline was 36/4/69 + 4 in-flight; the `5d9122c` tick took
+it to 48/4/61 + 0. This tick: wave-ui-parity-6 lands 2 ABSENT rows
+(archive, `load-branches-and-tags` — `1b41b60`), wave-ui-parity-7 lands 1
+ABSENT row (`/tags/list`) and flips the F family's PARTIAL row
+(`48101dc`), and `/{username}/-/projects` goes IN-FLIGHT — for
+52/3/57 + 1.)
 
 ## In-flight (excluded from the totals — do not re-dispatch)
 
-Empty at this tick. The regen's in-flight rows — the social trio
-(`.../forks`, `.../stars`, `.../watchers`) and the collaboration panel —
-landed in `ca81d5a`, and every later UI wave (`bb67087`, `0b61554`,
-`ca4eb58`, `79ef809`) committed clean. The tree's only modification at
-measurement time was the twin inventory doc.
+- `GET /{username}/-/projects[/...]` (web.go:1137-1163) — an in-flight
+  wave owns the user-scope projects pages; its files were in the tree
+  uncommitted at measurement time (`pages/owner-projects.tsx`,
+  `pages/org-home.tsx`, `index.ts`, its test module). The data is fully
+  landed (projects store 0024 + all three API scopes declared — repo
+  `fc123b0`, org `20512c0`, user `c9a7ef7`), so it is pure page work.
+  The repo-scoped sibling row (F family, web.go:1544-1563) rides the
+  same store — coordinate with this wave's owner before dispatching it
+  separately.
+
+The regen's in-flight rows — the social trio (`.../forks`, `.../stars`,
+`.../watchers`) and the collaboration panel — landed in `ca81d5a`, and
+every later UI wave (`bb67087`, `0b61554`, `ca4eb58`, `79ef809`,
+`1b41b60`, `48101dc`) committed clean. Aside from the in-flight wave's
+files above, the tree's only modification at measurement time was the
+twin inventory doc.
 
 ## Landed since last regen
 
-The regen's entire recommendation tier landed, and this tick's window added
-five more UI commits. The deltas below sum 36+4-in-flight → 48 LANDED:
+The regen's entire recommendation tier landed, the `5d9122c` tick's window
+added five more UI commits, and this tick's window added two waves. The
+deltas below sum 36+4-in-flight → 48 LANDED → 52 LANDED + 1 IN-FLIGHT:
 
 | Slice | Rows landed | Commit |
 |---|---|---|
@@ -122,6 +143,8 @@ five more UI commits. The deltas below sum 36+4-in-flight → 48 LANDED:
 | ui-parity-4 — the regen's top-2 | `GET .../tags` (web.go:1496), `GET .../labels` (web.go:1338) | `0b61554` |
 | ui-parity-5 — the regen's top-3 + top-5 | `GET .../milestone/{id}` (web.go:1340), `.../milestones/{id}/edit` (web.go:1427), `GET .../fork` (web.go:1490) | `ca4eb58` |
 | wave-29 — the regen's top-4 | `GET .../commit/{sha}.{patch|diff}` (web.go:1760), `GET .../pulls/{index}.{diff|patch}` (web.go:1657-1658) | `79ef809` |
+| wave-ui-parity-6 — the old top-5's #1 + #3 | `GET .../archive/{ref}.{format}` (web.go:1689-1692), `GET .../commit/{sha}/load-branches-and-tags` (web.go:1740) | `1b41b60` |
+| wave-ui-parity-7 — the old top-5's #2 + #4 | `POST .../tags/delete` (web.go:1501) + the per-row delete control, `GET .../tags/list` (web.go:1499), `GET .../releases/edit/*` + `POST .../releases/delete` (web.go:1516-1520) | `48101dc` |
 
 Non-UI landings in the same window that moved Data columns below: the
 projects family completed all three API scopes (repo `0d5b480`/`fc123b0`,
@@ -171,7 +194,7 @@ org `cc6d73e`/REG `20512c0`, user `f38b218`/REG `c9a7ef7` — declared now
 | `GET /{username}/-/repositories` (org repo list) | web.go:1134 | LANDED (`pages/org-repos.tsx`, ui-parity-2) | landed | core | — |
 | `GET /{username}/-/heatmap` | web.go:1135 | ABSENT | none | admin | M |
 | `GET /{username}/-/packages[/...]` | web.go:1108-1128 | ABSENT | none (no packages system — FEATURE-ABSENT) | admin | L |
-| `GET /{username}/-/projects[/...]` | web.go:1137-1163 | ABSENT | landed (projects store 0024 + all three API scopes declared — repo `fc123b0`, org `20512c0`, user `c9a7ef7`; effort M) | authoring | M |
+| `GET /{username}/-/projects[/...]` | web.go:1137-1163 | IN-FLIGHT (owning wave dispatched — see In-flight; do not re-dispatch) | landed (projects store 0024 + all three API scopes declared) | authoring | M |
 | `GET /{username}/-/code` (global code search) | web.go:1166 | ABSENT | none (no grep RPC) | authoring | L |
 | `GET /org/{org}/members` | web.go:965 | LANDED (`pages/org-members.tsx`, ui-parity-2) | landed | core | — |
 | `GET /org/{org}/dashboard[/{team}]` (+heatmap) | web.go:982-985 | ABSENT | partial | authoring | M |
@@ -183,7 +206,7 @@ org `cc6d73e`/REG `20512c0`, user `f38b218`/REG `c9a7ef7` — declared now
 | `GET /{org}/settings` (+hooks, packages, blocked_users, applications) | web.go:1017-1092 | ABSENT (whole group except labels below; org hooks ops landed — the hooks tab is page work) | partial | authoring | M per tab |
 | `GET /org/{org}/settings/labels` | web.go:1043-1049 | LANDED at `/{org}/labels` (documented divergence; the three POST segments ride upstream's literals) | landed | authoring | — |
 
-**B: 16 rows — 6 LANDED, 1 PARTIAL, 9 ABSENT.**
+**B: 16 rows — 6 LANDED, 1 PARTIAL, 8 ABSENT, 1 IN-FLIGHT.**
 
 ## C. Repo code browsing
 
@@ -195,7 +218,7 @@ org `cc6d73e`/REG `20512c0`, user `f38b218`/REG `c9a7ef7` — declared now
 | `GET .../blob/*` (redirect to /src/commit) | web.go:1757 | ABSENT (redirect only) | landed | core | S |
 | `GET .../commits/{branch|tag|commit}[/*]` | web.go:1722-1727 | LANDED (`pages/commits.tsx`) | landed | core | — |
 | `GET .../commit/{sha}` (commit detail + diff) | web.go:1739 | LANDED (`pages/commit-view.tsx`, wave 18; full-oid resolve, short-prefix 404-shell divergence) | landed | core | — |
-| `GET .../commit/{sha}/load-branches-and-tags` | web.go:1740 | ABSENT (aux JSON) | landed | core | S |
+| `GET .../commit/{sha}/load-branches-and-tags` | web.go:1740 | LANDED (`pages/commit-contained-refs.ts`, wave-ui-parity-6 `1b41b60`; mergeBase containment in 8-wide batches, honest N+2 posture, name-sort divergence documented) | landed | core | — |
 | `GET .../commit/{sha}.{patch|diff}` | web.go:1760 | LANDED (`pages/diffpatch-files.ts`, wave-29; mail format without signature per upstream commit.go:430-460) | landed (`diffpatch.ts`) | authoring | — |
 | `GET .../blame/{branch|tag|commit}/*` | web.go:1729-1733 | ABSENT | none (blame is a private DO page, not a boundary RPC) | authoring | L |
 | `GET .../graph` | web.go:1738 | ABSENT | none | admin | L |
@@ -204,18 +227,18 @@ org `cc6d73e`/REG `20512c0`, user `f38b218`/REG `c9a7ef7` — declared now
 | `GET .../render/{branch|tag|commit|blob}/*` | web.go:1715-1720 | ABSENT | landed | authoring | S |
 | `GET .../blob_excerpt/{sha}` | web.go:1735 | ABSENT (aux fragment) | landed | core | S |
 | `GET .../tree-list/*`, `/tree-view/*` (directory-expansion fragments) | web.go:1297-1306 | ABSENT | landed (`listTree`) | core | S |
-| `GET .../archive/{ref}.{format}` | web.go:1689-1692 | ABSENT | landed (`services/archive.ts`) | core | S |
+| `GET .../archive/{ref}.{format}` | web.go:1689-1692 | LANDED (`pages/archive-files.ts`, wave-ui-parity-6 `1b41b60`; octet-stream + nosniff both formats, weak-ETag 304, immutable Link to the API route) | landed | core | — |
 | `GET .../branches` (list page) | web.go:1696 | LANDED (`pages/branches.tsx`, wave 16) | landed | core | — |
 | `GET .../branches/list` | web.go:1695 | ABSENT (aux JSON) | landed | core | S |
-| `GET .../tags` (list page) | web.go:1496 | LANDED (`pages/tags.tsx`, ui-parity-4; engine-authoritative over `listRefs`, release/tag link arms, `?tag=` prefill; the `/tags/delete` POST write + `/tags/list` aux JSON are unclaimed — re-ranked below) | landed | core | — |
-| `GET .../tags/list` | web.go:1499 | ABSENT (aux JSON) | landed | core | S |
+| `GET .../tags` (list page) | web.go:1496 | LANDED (`pages/tags.tsx`, ui-parity-4; engine-authoritative over `listRefs`, release/tag link arms, `?tag=` prefill; the per-row delete control + `/tags/delete` POST write — dual id/tag carrier, protected-refusal + 409 arms — landed wave-ui-parity-7 `48101dc`) | landed | core | — |
+| `GET .../tags/list` | web.go:1499 | LANDED (`pages/tag-list-aux.ts`, wave-ui-parity-7 `48101dc`; the byte-shape `{results: [...]}` feed — pin-finding: nothing upstream fetches it, a shape-parity surface) | landed | core | — |
 | `GET .../lastcommit/*` | web.go:1761 | ABSENT (aux fragment) | landed | core | S |
 | `GET .../search` (in-repo code search) | web.go:1768 | ABSENT | none (no grep RPC) | authoring | L |
 | `GET .../{_edit|_new|_delete}/*` (editor combos) | web.go:1453-1461 | LANDED at `/{new|edit|delete}/*` (documented divergence at the brief's literal names, `pages/file-editor.tsx`) | landed | authoring | — |
 | `GET .../_upload/*` | web.go:1462-1464 | ABSENT | partial | authoring | M |
 | `GET .../_diffpatch/*`, `_cherrypick/{sha}/*` | web.go:1465-1470 | ABSENT | landed (diffpatch + merge machinery) | authoring | M |
 
-**C: 25 rows — 9 LANDED, 2 PARTIAL, 14 ABSENT.**
+**C: 25 rows — 12 LANDED, 2 PARTIAL, 11 ABSENT.**
 
 ## D. Issues and pulls
 
@@ -270,7 +293,7 @@ org `cc6d73e`/REG `20512c0`, user `f38b218`/REG `c9a7ef7` — declared now
 | Upstream route | Cite | Status | Data | Demand | Effort |
 |---|---|---|---|---|---|
 | `GET .../releases` (+`/tag/*`, `/latest`, feeds) | web.go:1505-1514 | LANDED (`pages/releases.tsx`, wave 20) | landed | core | — |
-| `GET .../releases/new`, `/edit/*` | web.go:1516-1520 | PARTIAL — `/new` LANDED (wave 20); `/edit/*` + `/delete` unclaimed | landed (`createRelease` landed) | authoring | S |
+| `GET .../releases/new`, `/edit/*` | web.go:1516-1520 | LANDED (`pages/releases.tsx`; `/new` wave 20, the `/edit/*` form + write and the formaction `/releases/delete` button + list pencil wave-ui-parity-7 `48101dc` — unconditional web-form writes) | landed | authoring | — |
 | `GET .../releases/download/{tag}/{file}`, `/releases/attachments/{uuid}` | web.go:1513-1514 | ABSENT | landed (`release-assets.ts`) | core | S |
 | `GET .../fork` (fork form) | web.go:1490 | LANDED (`pages/repo-fork.tsx`, ui-parity-5; owner options over can-create orgs, `createFork` sequence replay; entry points on the forks page) | landed (`createFork` declared) | authoring | — |
 | `GET .../wiki[/...]` (+commit/raw/excerpt) | web.go:1611-1625 | ABSENT | landed (wiki 6 ops declared `d3362b1`, `services/wiki.ts` + the sibling engine cell — effort drops L→M) | authoring | M |
@@ -284,96 +307,106 @@ org `cc6d73e`/REG `20512c0`, user `f38b218`/REG `c9a7ef7` — declared now
 | `GET .../projects[/...]` | web.go:1544-1563 | ABSENT | landed (projects store 0024 + all three API scopes declared: repo `fc123b0`, org `20512c0`, user `c9a7ef7` — 64 project ops) | authoring | M |
 | `GET .../actions[/...]` | web.go:1566-1608 | ABSENT | none (no Actions — FEATURE-ABSENT) | admin | L |
 
-**F: 14 rows — 5 LANDED, 1 PARTIAL, 8 ABSENT.**
+**F: 14 rows — 6 LANDED, 0 PARTIAL, 8 ABSENT.**
 
 ## Totals
 
-**113 rows: 48 LANDED, 4 PARTIAL, 61 ABSENT — zero IN-FLIGHT.**
+**113 rows: 52 LANDED, 3 PARTIAL, 57 ABSENT, 1 IN-FLIGHT.**
 
-By family (landed/partial/absent): A 10/0/14, B 6/1/9, C 9/2/14, D 13/0/9,
-E 5/0/7, F 5/1/8. The landed set now covers every highest-traffic single
-page (repo home, file view, commits log, commit detail, branches, tags,
-issues/PRs lists + details + both PR side tabs, compare, releases browse +
-create, labels, milestone detail/edit, the fork form, the social lists, the
-collaboration panel, creation forms, org members/repositories, the avatar
-seam). The remaining absence mass concentrates in (a) small page slices and
-aux fragments over fully landed data (archive download, blob redirect, the
-tags delete write, `load-branches-and-tags`, tree/commit fragments, the
-releases edit/delete tail, the compare range + diff-patch shapes), (b)
-settings tabs whose APIs just landed (deploy keys, protected tags, git
-hooks, org hooks), (c) the owner `/-/` namespace tails whose APIs just
-completed (the projects pages; heatmap/packages stay gated), and (d) whole
-subsystems with no data model (actions, packages, audit logs) or no engine
-RPC (blame, graph, code search, heatmap) that are correctly out of the
-demand-driven phase's reach.
+By family (landed/partial/absent, +in-flight): A 10/0/14, B 6/1/8 +1, C
+12/2/11, D 13/0/9, E 5/0/7, F 6/0/8. The landed set now covers every
+highest-traffic single page (repo home, file view, commits log, commit
+detail, branches, tags — including the delete write, issues/PRs lists +
+details + both PR side tabs, compare, releases browse + create + edit +
+delete, labels, milestone detail/edit, the fork form, the social lists,
+the collaboration panel, creation forms, org members/repositories, the
+avatar seam, the archive download, `load-branches-and-tags`). The
+remaining absence mass concentrates in (a) small page slices and aux
+fragments over fully landed data (the blob redirect, the tree/commit
+fragments — `tree-list`/`tree-view`, `branches/list`, `lastcommit`,
+`blob_excerpt` —, `render/*`, the compare range + diff-patch shapes, the
+pulls/new redirect), (b) settings tabs whose APIs just landed (deploy
+keys, protected tags, git hooks, org hooks), (c) the owner `/-/`
+namespace tails (projects in flight; heatmap/packages stay gated), and
+(d) whole subsystems with no data model (actions, packages, audit logs)
+or no engine RPC (blame, graph, code search, heatmap) that are correctly
+out of the demand-driven phase's reach.
 
 ## Recommendation — top 5 by demand-per-effort
 
 Every row below is dispatchable now: its API surface is fully declared
-(`node scripts/check-openapi.mjs` PASS at HEAD `5d9122c` — greps shown per
-row) or needs no API at all. The regen's top 5 all landed; this is the
-re-ranked queue.
+(`node scripts/check-openapi.mjs` PASS at HEAD `7016ce9` — greps shown per
+row) or needs no API at all. The last tick's top 5 all resolved — four
+landed (`1b41b60`, `48101dc`) and `/-/projects` went in-flight — so this
+is a fresh queue.
 
-1. **`GET .../archive/{ref}.{format}`** (web.go:1689-1692, S, core) — the
-   code/releases browsing staple and the largest remaining core slice over
-   landed data. API dependency: **none** — `services/archive.ts` (landed)
-   produces the tarball/zip; the slice is a parse arm + Response streaming.
-2. **The tags row's write + aux tails**: `POST /tags/delete` +
-   delete-tag controls + `GET .../tags/list` (web.go:1501, 1499, S,
-   core/authoring) — the landed tags page (ui-parity-4) renders the list
-   but carries no write; upstream's per-tag delete rides
-   `reqRepoCodeWriter`. API dependency: `repoListTags`, `repoGetTag`,
-   `repoCreateTag`, `repoDeleteTag` — all declared `[ok]`.
-3. **`GET .../commit/{sha}/load-branches-and-tags`** (web.go:1740, S, core)
-   — the aux JSON the upstream compare/new-release/editor surfaces consume;
-   one handler over the landed ref reads. API dependency: **none** —
-   `listRefs` (engine boundary) is the data.
-4. **`GET .../releases/edit/*` + `POST /releases/delete`** (web.go:1516-1520,
-   S, authoring) — the F family's one PARTIAL row's tail (`/new` landed in
-   wave 20). API dependency: `repoEditRelease`, `repoDeleteRelease` (and
-   the landed `createRelease`) — all declared `[ok]`;
-   `pages/releases.tsx` extends.
-5. **`GET /{username}/-/projects[/...]`** (web.go:1137-1163, M, authoring) —
-   the biggest single remaining authoring surface, now unblocked: all three
-   projects API scopes are declared (repo `fc123b0`, org REG `20512c0`,
-   user REG `c9a7ef7` — 64 project ops, checker `[ok]`), the
-   `projects` store is migration 0024, and `src/api/services/projects.ts`
-   models every scope. The repo-scoped sibling (`.../projects`,
-   web.go:1544-1563) rides the same slice.
+1. **`GET .../blob/*` (redirect onto `/src`)** (web.go:1757, S, core) —
+   upstream redirects pasted blob URLs onto the `/src/commit` view; the
+   smallest core row left, and the redirect target (`pages/file-view.tsx`)
+   is landed. API dependency: **none** — a parse arm + 303.
+2. **The releases download tail**: `GET .../releases/download/{tag}/{file}`
+   + `/releases/attachments/{uuid}` (web.go:1513-1514, S, core) — the
+   release pages render today but their asset links 404; the last core
+   slice of the F family over landed data. API dependency:
+   `repoListReleaseAttachments`/`repoGetReleaseAttachment`, both declared
+   `[ok]`; the read lives in `api/services/release-assets.ts`.
+3. **`GET .../render/{branch|tag|commit|blob}/*`** (web.go:1715-1720, S,
+   authoring) — rendered blob views; the markup pipeline is landed and
+   already feeds `page-data.ts` (README) and `issue-detail.tsx`
+   (`api/services/markdown.ts`, `renderMarkdownToHtml`). API dependency:
+   **none**.
+4. **`GET /attachments/{uuid}`** (web.go:912, S, authoring) — serves issue
+   attachment binaries to the landed issue-detail page's upload rows. API
+   dependency: `issueGetIssueAttachment` declared `[ok]` (the full
+   issue + comment attachment op set is declared).
+5. **The aux-fragment batch**: `.../tree-list/*` + `.../tree-view/*`
+   (web.go:1297-1306), `.../branches/list` (web.go:1695),
+   `.../blob_excerpt/{sha}` (web.go:1735), `.../lastcommit/*`
+   (web.go:1761) — S each, core; one wave can take all four. The
+   directory-expansion + last-commit fragments upstream's tree UI
+   fetches. API dependency: **none** — `listTree`/`readCommit`/`listRefs`
+   (engine boundary) are the data.
 
 Bench (next tier — dispatch when the pool needs dependency-ready goals; all
-data-landed): `.../blob/*` redirect (web.go:1757, S, core — a 303 onto
-`/src`), `.../releases/download/{tag}/{file}` +
-`/releases/attachments/{uuid}` (web.go:1513-1514, S, core —
-`release-assets.ts`), `/{org}/teams/{team}/edit` (web.go:1011, S,
-authoring — `orgEditTeam` declared `[ok]`), `.../pulls/new/*` redirect
-(web.go:1314, S), the aux fragments `.../blob_excerpt`, `.../branches/list`,
-`.../tree-list|tree-view`, `.../lastcommit` (web.go:1735, 1695, 1297-1306,
-1761, S, core — `listTree`/`readCommit`), `.../render/*` (web.go:1715, S),
-`.../issues/search` + `.../issues/suggestions` aux (web.go:1359, 1341, S),
+data-landed unless noted): `/{org}/teams/{team}/edit` (web.go:1011, S,
+authoring — `orgEditTeam` declared `[ok]`; `pages/org-teams.tsx` extends),
+`.../pulls/new/*` redirect (web.go:1314, S),
+`.../pulls/{index}/merge_box` fragment (web.go:1659, S, data partial),
 `.../compare/*.{diff|patch}` + the files range shape (web.go:1309-1310,
-1672, S — `diffpatch.ts` + landed compare), `GET /attachments/{uuid}`
-(web.go:912, S — the issue-attachment API landed), `.../issues/new/choose`
-(web.go:1357, S, partial data), `/repo/search` + `/explore/topics/search`
-aux (web.go:1102, 564, S — `repoSearch` declared). M-tier page work over
-just-landed APIs, in demand order: the **wiki family** (web.go:1611-1625 —
+1672, S — `diffpatch.ts` + landed compare),
+`.../issues/search` + `.../issues/suggestions` aux (web.go:1359, 1341, S —
+`issueSearchIssues` declared `[ok]`), `/repo/search` +
+`/explore/topics/search` aux (web.go:1102, 564, S — `repoSearch` +
+`topicSearch` declared `[ok]`), `.../comments/{id}/attachments`
+(web.go:1337, S, data partial), `.../issues/new/choose` (web.go:1357, S,
+data partial), `.../settings/hooks/git` (web.go:1223-1227, S, admin —
+`repoListGitHooks`/`repoGetGitHook`/`repoEditGitHook`/`repoDeleteGitHook`
+all declared `[ok]`), `.../settings/public_access` (web.go:1191, S, data
+partial), `.../activity_author_data` (web.go:1683-1687, S, data partial).
+M-tier page work over just-landed APIs, in demand order: the **wiki
+family** (web.go:1611-1625 —
 `repoGetWikiPages`/`repoGetWikiPage`/`repoCreateWikiPage`/
 `repoEditWikiPage`/`repoDeleteWikiPage`/`repoGetWikiPageRevisions`, all
 declared `[ok]`), the **repo projects pages** (web.go:1544-1563 — rides
-top-5 #5's store), **settings/keys** (deploy keys), **settings/tags**
-(protected tags), **settings/hooks/git** (git hooks, S), the **org
-settings** group (org hooks ops landed), `/{username}.rss/.atom` (feeds
-declared), the global `/issues|/pulls|/milestones` inboxes (data partial —
-the cross-repo perm filter), the `/user/settings` tab group,
-`.../_upload/*` + `.../_diffpatch|_cherrypick` (web.go:1462-1470 — the
-machinery is landed), `/repo/migrate` (`services/migrate.ts`).
+the IN-FLIGHT `/-/projects` wave's store; coordinate with that owner
+first), **settings/keys** (deploy keys), **settings/tags**
+(protected tags), the **org settings** group (org hooks ops landed),
+`/{username}.rss/.atom` (feeds declared), the global
+`/issues|/pulls|/milestones` inboxes (data partial — the cross-repo perm
+filter), the `/user/settings` tab group, `.../_upload/*` +
+`.../_diffpatch|_cherrypick` (web.go:1462-1470 — the machinery is
+landed), `/repo/migrate` (`services/migrate.ts`).
 `/explore/organizations` (web.go:557) needs the missing visible-org search
 arm first — data partial, M.
 GATED rows (do not dispatch without the feature SPEC): everything
 actions/packages (`/-/admin` actions+packages tabs, `settings/actions`,
 `.../actions*`, `.../packages`, `/{username}/-/packages` — FEATURE-ABSENT
 APIs per the twin inventory's 64 remaining ops), plus the no-RPC pages
-(blame, graph, in-repo/explore/`/-/` code search, heatmap, audit_logs). The
+(blame, graph, in-repo/explore/`/-/` code search, the
+`/{username}/-/heatmap` tail, audit_logs) — heatmap specifically stays
+put: the contribution grid needs a heat aggregation that exists on neither
+the engine boundary nor a landed service, so it is no-RPC-gated like
+blame/graph, not a dispatchable S-row. The
 `.../raw` + `.../media` web shapes (web.go:1699-1713) stay
 PARTIAL-by-divergence — our SSR pages emit tier-1 API raw links
 (`links.ts:41`), so the gap only bites official-bundle references and pasted
