@@ -943,16 +943,16 @@ export function registerPullRoutes(
       //   - the branch existence read runs against the HEAD cell (upstream
       //     opens headGitRepo, pull.go:1078-1089),
       //   - the create compare runs cross-repo (below).
-      // Divergence (documented): upstream's bare `owner:branch` form searches
-      // the FORK edge (GetHeadOwnerAndRepo → FindHeadRepo → a missing fork
-      // answers 400 "the user %s does not have a fork of the base repository",
-      // routers/common/compare.go:152-192), while our landed resolveHeadRepo
-      // resolves the repo by path (owner, base slug) — the default fork name
-      // equals the source's slug (the forks API copies it), so the default
-      // shape coincides; `owner/name:branch` resolves any readable repo
-      // exactly like upstream's GetRepositoryByName arm. A non-fork head repo
-      // is therefore accepted where upstream's bare form would 400 — the same
-      // acceptance upstream's explicit `owner/name:branch` form already grants.
+      // Divergence (updated at 9ecb3e5): our bare `owner:branch` form now
+      // searches the FORK EDGE FIRST (the FindHeadRepo port in
+      // services/pulls.ts — name-free, rename-immune by construction), with
+      // the path acceptance (owner, base slug) as FALLBACK; upstream's
+      // missing-fork answer is 400 "the user %s does not have a fork of the
+      // base repository" (compare.go:152-192) — ours stays the flat 404 (the
+      // a16f60e anti-enumeration deviation). A non-fork head repo found by
+      // the fallback is accepted where upstream's bare form would 400 — the
+      // same acceptance upstream's explicit `owner/name:branch` form grants;
+      // the fork edge wins over a same-slug non-fork (upstream-true order).
       let baseBranch = form.base;
       if (baseBranch.includes(":")) {
         const colon = baseBranch.indexOf(":");
