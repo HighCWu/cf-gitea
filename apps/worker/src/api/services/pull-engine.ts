@@ -23,6 +23,7 @@ import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
+import { carryLooseObjects, type CarrySource, type CarryTarget } from "../../repos/carry";
 import { canUserDelete, findRule, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
 import {
   branchRef,
@@ -424,4 +425,139 @@ export async function createPullHeadRef(
   if (result.tag !== "committed") {
     throw new Error(`refs/pull/${index}/head write failed: ${result.tag}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-repo (fork head) PR creation — the create-compare seam the POST arm
+// runs for a `user:branch` head. Upstream computes the cross-repo compare in
+// the HEAD repository: GetCompareInfo fetches the base commit into the head
+// repo first ("we need to fetch the base commit into the head repository
+// because we will use headGitRepo in the following code") and merge-bases
+// THERE (services/git/compare.go:73-89). Our engine cells are per-repo object
+// stores with no cross-cell ancestry (mergeBase/countDivergence are same-cell
+// walks), so the identical trick applies natively: forks are FULL copies
+// (SPEC-0001b §5.2 — replicateForkCatalog lands the parent's whole catalog),
+// so the base's history is already in the fork's cell and the merge base
+// computes there. The mirror-image copy — the fork head's divergent closure
+// INTO the base cell — is ours alone: upstream does all compare work in the
+// head repo, while OUR PR machinery (refs/pull/N/head's landing, the lazy
+// mergeability check, the diff range, the merge execution) reads the BASE
+// cell exclusively (§10.8 composition; the seeded-fork tests stage the same
+// bytes into the base cell for the same reason).
+// ---------------------------------------------------------------------------
+
+/** Structural CarrySource over one cell (the fork-task.ts wrapping style —
+ *  plain adapter functions strip the RPC stub's `Promise & Pick`
+ *  intersections so the structural assignment infers). */
+function carrySource(env: ApiEnv["Bindings"], pair: { ownerNamespace: string; slug: string }): CarrySource {
+  const cell = engineCell(env, pair);
+  return {
+    listRefs: async () => {
+      const refs = await cell.listRefs();
+      return { head: refs.head, refs: refs.refs.map((ref) => ({ name: ref.name, target: ref.target })) };
+    },
+    listCatalogPage: (after, limit) => cell.listCatalogPage(after, limit),
+    readCommit: (id) => cell.readCommit(id),
+    listTree: (ref, path) => cell.listTree(ref, path),
+    readBlob: (ref, path) => cell.readBlob(ref, path),
+  };
+}
+
+/** putApiObjects adapter over a cell — the carry target's one-method slice. */
+function carryTarget(env: ApiEnv["Bindings"], pair: { ownerNamespace: string; slug: string }): Pick<CarryTarget, "putApiObjects"> {
+  const cell = engineCell(env, pair);
+  return { putApiObjects: (objects) => cell.putApiObjects(objects) };
+}
+
+/** The cell's ACTIVE pack catalog oids — the carry walk's skip set. A packed
+ *  oid's closure is self-contained in the cell (carry.ts's pack invariant),
+ *  so the walk stops there; base-cell loose objects outside the catalog are
+ *  re-put idempotently (putApiObjects no-ops on a known oid). */
+async function packedCatalogOids(source: CarrySource): Promise<Set<string>> {
+  const packed = new Set<string>();
+  let cursor = "";
+  for (;;) {
+    const page = await source.listCatalogPage(cursor, 8192);
+    for (const pack of page.packs) {
+      for (const row of pack.rows) packed.add(row.oid);
+    }
+    cursor = page.nextAfter;
+    if (!page.more) break;
+  }
+  return packed;
+}
+
+/**
+ * The create arm's merge base for a cross-repo head, computed IN THE HEAD
+ * CELL (the fork holds the base's full history — SPEC-0001b §5.2 — so both
+ * sides of the walk live there; upstream runs the same computation in the
+ * head repo, compare.go:83). When the base advanced past the fork point the
+ * base tip is absent from the fork cell (`{tag: "missing", which: "a"}`) and
+ * upstream's fetch is ported: the base tip's closure is carried into the fork
+ * cell — objects only, no ref, the FetchRemoteTempCommit posture
+ * (compare.go:73-80; our GC reclaims unreferenced loose objects) — and the
+ * computation retries once. Still no common ancestor → null: upstream's empty
+ * `CompareBase` (compare.go:91-93 — GetCompareInfo "does its best"; the PR is
+ * still created and diffs empty, never a "nothing to compare" refusal).
+ */
+export async function crossRepoCreateMergeBase(
+  c: Context<ApiEnv>,
+  basePair: RepositoryWithOwner,
+  headPair: RepositoryWithOwner,
+  baseBranch: string,
+  baseTip: string,
+  headTip: string,
+): Promise<string | null> {
+  const headReads = engineReads(c.env, headPair.repo);
+  let result = await headReads.mergeBase(baseTip, headTip);
+  if (result !== null && result.tag === "missing" && result.which === "a") {
+    await carryLooseObjects(
+      carrySource(c.env, basePair.repo),
+      carryTarget(c.env, headPair.repo),
+      [{ name: branchRef(baseBranch), oid: baseTip }],
+      await packedCatalogOids(carrySource(c.env, headPair.repo)),
+      `${basePair.repo.ownerNamespace}/${basePair.repo.slug} -> ${headPair.repo.ownerNamespace}/${headPair.repo.slug} (pr-create base fetch)`,
+    );
+    result = await headReads.mergeBase(baseTip, headTip);
+  }
+  return result !== null && result.tag === "ok" ? result.base : null;
+}
+
+/**
+ * The head-side counterpart of the base fetch: the fork head's divergent
+ * closure is carried INTO the base cell, because everything downstream reads
+ * it there — `refs/pull/N/head` cannot even land without it (commitApiChange
+ * presence-checks the commit and its root tree, control-plane.d.ts), and the
+ * lazy mergeability check, the diff range and the merge execution all walk
+ * the base cell. Short-circuits when the base cell already holds the tip
+ * (even branches: the shared history IS the base's own).
+ *
+ * The carryLooseObjects walk reconstructs objects from the read RPCs and
+ * lands them through putApiObjects — idempotent, so a retried or concurrent
+ * create is safe, and a failure leaves nothing durable (the walk precedes the
+ * D1 creation). Bounded walks: a divergent history beyond the walk budgets,
+ * or a pushed commit carrying headers serializeCommit does not model (gpgsig
+ * et al — the Worker-authored loose class round-trips byte-exact by
+ * construction, pushed exotic-header commits do not), throws and fails the
+ * create with the honest 500. Runs only for cross-repo heads — the same-repo
+ * arm's object store already holds the head branch.
+ */
+export async function carryForkHeadIntoBase(
+  c: Context<ApiEnv>,
+  basePair: RepositoryWithOwner,
+  headPair: RepositoryWithOwner,
+  headBranch: string,
+  headTip: string,
+): Promise<void> {
+  if ((await engineReads(c.env, basePair.repo).readCommit(headTip)) !== null) {
+    return;
+  }
+  const baseSource = carrySource(c.env, basePair.repo);
+  await carryLooseObjects(
+    carrySource(c.env, headPair.repo),
+    carryTarget(c.env, basePair.repo),
+    [{ name: branchRef(headBranch), oid: headTip }],
+    await packedCatalogOids(baseSource),
+    `${headPair.repo.ownerNamespace}/${headPair.repo.slug} -> ${basePair.repo.ownerNamespace}/${basePair.repo.slug} (pr-create head carry)`,
+  );
 }

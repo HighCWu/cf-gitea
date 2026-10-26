@@ -10,7 +10,12 @@
  * branch existence (engine reads) and writes `refs/pull/N/head` through the
  * receive-less commitApiChange (SPEC-0001b §4.4 mapping); a failed D1
  * creation after the ref landed deletes the row again (upstream cleanup
- * order, services/pull/pull.go:157). GET …/{index} runs the LAZY
+ * order, services/pull/pull.go:157). A CROSS-REPO head (`owner:branch` — the
+ * fork flow) gates the doer's READ of the head repo, computes the merge base
+ * in the HEAD cell (upstream GetCompareInfo runs the same computation in the
+ * head repo, services/git/compare.go:73-89) and carries the head's divergent
+ * closure into the base cell first — commitApiChange refuses an oid the cell
+ * lacks, and every downstream PR read walks the base cell. GET …/{index} runs the LAZY
  * mergeability check (a `checking` row fires checkMergeability and CAS-writes
  * the result), renders the real mergeability trio (mergeable/base.sha/
  * merge_base) and feeds PATCH's merged precondition. The diff/patch/commits/
@@ -96,6 +101,8 @@ import {
 } from "../services/pulls";
 import {
   createPullHeadRef,
+  carryForkHeadIntoBase,
+  crossRepoCreateMergeBase,
   ensurePullRequestChecked,
   mergePullRequest as mergePullRequestEngine,
   mergeableOfRow,
@@ -105,7 +112,17 @@ import {
 import { branchRef, engineReads } from "../services/engine";
 import { findCollaborator } from "../services/repo-collaborators";
 import { renderUnifiedDiff, renderPatch, toApiCommit, toChangedFiles, usernamesByEmail } from "../services/git-models";
-import { canViewRepositoryWithTeams, findRepositoryByPath, findUserByName, repositoryPermissions, toApiRepository, viewerOf, type RepositoryWithOwner, type UserRow } from "../services/repository";
+import {
+  canViewRepositoryWithTeams,
+  findRepositoryById,
+  findRepositoryByPath,
+  findUserByName,
+  repositoryPermissions,
+  toApiRepository,
+  viewerOf,
+  type RepositoryWithOwner,
+  type UserRow,
+} from "../services/repository";
 import { toApiUser } from "../services/user";
 import { canWriteRepository } from "../services/repo-access";
 import { canBypassBranchProtection, checkPullBranchProtections, findRule, isUserMergeWhitelisted, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
@@ -280,6 +297,21 @@ function assertNotArchived(found: RepositoryWithOwner): void {
   if (found.repo.isArchived) {
     throw new ApiError(423, "repo is archived");
   }
+}
+
+/**
+ * parseCompareInfo's head-repo READ gate (routers/api/v1/repo/pull.go:1063-1074):
+ * `GetDoerRepoPermission(ctx, headRepo, ctx.Doer).CanRead(unit.TypeCode)` — a
+ * head repo the doer cannot read answers APIErrorNotFound, the same
+ * anti-enumeration 404 as an absent row (both collapse here). The landed
+ * team-aware visibility predicate is the CanRead port.
+ */
+async function requireReadableHeadRepo(c: Context<ApiEnv>, headRepoId: string): Promise<RepositoryWithOwner> {
+  const headPair = await findRepositoryById(c.env.DB, headRepoId);
+  if (headPair === null || !(await canViewRepositoryWithTeams(c.env.DB, viewerOf(c), headPair.repo))) {
+    throw new ApiError(404, "not found");
+  }
+  return headPair;
 }
 
 /** PR-by-index lookup answering the upstream ErrPullRequestNotExist 404. */
@@ -898,9 +930,26 @@ export function registerPullRoutes(
       }
 
       // parseCompareInfo: the base resolves inside this repo (owner-qualified
-      // forms must name this repo — forks cannot exist yet), the head
-      // resolves through resolveHeadRepo (`owner:branch` fork form). Branch
-      // EXISTENCE is an engine read (SPEC-0005 §3.4 creation flow step 1).
+      // forms must name this repo), the head resolves through resolveHeadRepo
+      // — the plain form is a branch of this repo, the `owner:branch` /
+      // `owner/name:branch` fork forms name the head REPO. A cross-repo head
+      // (the fork flow) adds three arms over the same-repo shape:
+      //   - the doer must READ the head repo (requireReadableHeadRepo —
+      //     pull.go:1063-1074; the row-miss and the unreadable-repo arms share
+      //     the anti-enumeration 404),
+      //   - the branch existence read runs against the HEAD cell (upstream
+      //     opens headGitRepo, pull.go:1078-1089),
+      //   - the create compare runs cross-repo (below).
+      // Divergence (documented): upstream's bare `owner:branch` form searches
+      // the FORK edge (GetHeadOwnerAndRepo → FindHeadRepo → a missing fork
+      // answers 400 "the user %s does not have a fork of the base repository",
+      // routers/common/compare.go:152-192), while our landed resolveHeadRepo
+      // resolves the repo by path (owner, base slug) — the default fork name
+      // equals the source's slug (the forks API copies it), so the default
+      // shape coincides; `owner/name:branch` resolves any readable repo
+      // exactly like upstream's GetRepositoryByName arm. A non-fork head repo
+      // is therefore accepted where upstream's bare form would 400 — the same
+      // acceptance upstream's explicit `owner/name:branch` form already grants.
       let baseBranch = form.base;
       if (baseBranch.includes(":")) {
         const colon = baseBranch.indexOf(":");
@@ -911,10 +960,11 @@ export function registerPullRoutes(
         baseBranch = baseBranch.slice(colon + 1);
       }
       const head = await resolveHeadRepo(c.env.DB, found, form.head);
+      const headPair = head.headRepoId === found.repo.id ? found : await requireReadableHeadRepo(c, head.headRepoId);
 
       const reads = engineReads(c.env, found.repo);
       const baseTip = await reads.readCommit(branchRef(baseBranch));
-      const headTip = head.headRepoId === found.repo.id ? await reads.readCommit(branchRef(head.headBranch)) : null;
+      const headTip = await engineReads(c.env, headPair.repo).readCommit(branchRef(head.headBranch));
       if (baseTip === null) {
         // parseCompareInfo's base miss → APIErrorNotFound
         throw new ApiError(404, "not found");
@@ -958,6 +1008,22 @@ export function registerPullRoutes(
       if (await isUserBlockedBy(c.env.DB, { id: requester.id ?? 0, isAdmin: requester.is_admin === true }, found.repo.ownerId ?? -1)) {
         throw new ApiError(403, BLOCKED_USER_MESSAGE);
       }
+
+      // The cross-repo create compare (GetCompareInfo, upstream pull.go:520
+      // stores the result as pr.MergeBase): the merge base computes IN THE
+      // HEAD CELL — the fork holds the base's full history (SPEC-0001b §5.2;
+      // services/git/compare.go:73-89 runs the same computation in the head
+      // repo after fetching the base commit into it) — and the head closure
+      // is carried into the BASE cell so refs/pull/N/head's landing, the lazy
+      // mergeability check, the diff range and the merge execution all resolve
+      // there (commitApiChange refuses an oid the cell lacks). Runs only for
+      // cross-repo heads and after every validation: the carries are engine
+      // writes, so a 403/409/404 request moves no bytes.
+      let mergeBaseOid: string | null = null;
+      if (headPair.repo.id !== found.repo.id) {
+        mergeBaseOid = await crossRepoCreateMergeBase(c, found, headPair, baseBranch, baseTip.oid, headTip.oid);
+        await carryForkHeadIntoBase(c, found, headPair, head.headBranch, headTip.oid);
+      }
       try {
         ({ issue, pullRequest: pr } = await service.createPullRequest({
           repoId: found.repo.id,
@@ -971,6 +1037,7 @@ export function registerPullRoutes(
           labelIds,
           allowMaintainerEdit: form.allow_maintainer_edit ?? true, // DefaultAllowMaintainerEdit (repo_unit default)
           headSha: headTip.oid,
+          mergeBase: mergeBaseOid,
         }));
       } catch (error) {
         asApiError(error);
@@ -979,7 +1046,10 @@ export function registerPullRoutes(
 
       // The base-repo head ref: a receive-less CAS write (commitApiChange,
       // SPEC-0001b §4.4 mapping). Failure after the D1 commit deletes the row
-      // again (upstream's cleanup order, services/pull/pull.go:157).
+      // again (upstream's cleanup order, services/pull/pull.go:157). A fork
+      // head's already-carried objects stay behind unreferenced — the GC
+      // sweep reclaims them, the same posture as upstream's leftover
+      // temp-fetch objects.
       try {
         await createPullHeadRef(c, found, pr.index, headTip.oid);
       } catch (error) {
@@ -1541,7 +1611,8 @@ export function registerPullRoutes(
   // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/pulls/{base}/{head} (repoGetPullRequestByBaseHead)
   // — the pure D1 lookup on the base/head columns; the fork form
-  // `owner:branch` resolves the head repo (404 — forks cannot exist yet).
+  // `owner:branch` resolves the head repo through resolveHeadRepo (404 when
+  // the head repo row is absent).
   // -------------------------------------------------------------------------
   app.openapi(getPullByBaseHeadRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
