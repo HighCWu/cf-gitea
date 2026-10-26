@@ -58,3 +58,28 @@ export function treeRedirectResponse(repoLink: string, rawSuffix: string, search
     headers: { location: treeRedirectTarget(repoLink, rawSuffix, search) },
   });
 }
+
+/** Build the redirect target for one `/blob` request (pure — testable): the
+ *  wave-39 sibling of `treeRedirectTarget` — upstream `RedirectRepoBlobToCommit`
+ *  (view_home.go:528-536) swaps the RAW suffix onto `/src/commit/` verbatim
+ *  ("just like GitHub: browse files of a commit by
+ *  `https://github/owner/repo/blob/{CommitID}`"), query preserved. */
+export function blobRedirectTarget(repoLink: string, rawSuffix: string, search: string): string {
+  return `${repoLink}/src/commit/${rawSuffix}${search}`;
+}
+
+/** The 303 response for one resolved `/blob/...` route (upstream
+ *  `RedirectRepoBlobToCommit`, web.go:1757 — the `treeRedirectResponse`
+ *  sibling: raw suffix verbatim, ctx.Redirect's `http.StatusSeeOther`
+ *  default, post-resolution). Shared ctx.Redirect divergence, documented for
+ *  both siblings: upstream's fetch-action requests (a non-empty
+ *  `X-Gitea-Fetch-Action` header, `modules/httplib/server_request.go:246-248`)
+ *  get a 200 `{"redirect": …}` JSON body instead of the 303 — the landed
+ *  `/tree` port does not carry that arm either, and this port stays
+ *  consistent with it (no landed consumer sends the header). */
+export function blobRedirectResponse(repoLink: string, rawSuffix: string, search: string): Response {
+  return new Response(null, {
+    status: 303,
+    headers: { location: blobRedirectTarget(repoLink, rawSuffix, search) },
+  });
+}

@@ -483,6 +483,37 @@
  *                                          posture); short/unresolvable
  *                                          shas 404 — upstream's
  *                                          ServerError 500 divergence)
+ *   /:owner/:repo/blob[/*]                 the pasted-blob-URL redirect, GET
+ *                                          (pages/repo-home.tsx's
+ *                                          blobRedirectResponse — wave 39;
+ *                                          the survey's row 1, upstream
+ *                                          web.go:1757
+ *                                          repo.RedirectRepoBlobToCommit —
+ *                                          the tree-redirect twin: the RAW
+ *                                          suffix swaps verbatim onto
+ *                                          `/src/commit/`, query preserved,
+ *                                          303 See Other; the bare `/blob`
+ *                                          has no upstream route → the
+ *                                          §4.5 404 shell)
+ *   /:owner/:repo/tree-list/{branch|tag|commit}/*
+ *                                          the find-file dialog's aux JSON,
+ *                                          GET (pages/tree-list-aux.ts —
+ *                                          wave 39; the survey's row 5,
+ *                                          upstream web.go:1297-1306
+ *                                          repo.TreeList — the bare
+ *                                          recursive file-path array over a
+ *                                          batched listTree BFS walk, the
+ *                                          natural-sort port; the typed
+ *                                          ref-tail resolution rides the
+ *                                          landed resolveRefSuffix)
+ *   /:owner/:repo/branches/list            the branches aux JSON, GET
+ *                                          (pages/branches-list-aux.ts —
+ *                                          wave 39; the survey's row 5,
+ *                                          upstream web.go:1695
+ *                                          repo.GetBranchesList — the
+ *                                          {results:[names]} feed, default
+ *                                          branch hoisted, the tag-list-aux
+ *                                          twin)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -549,7 +580,7 @@ import { parsePageNumber, pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
 import { sameOriginGuard } from "./session";
-import { treeRedirectResponse } from "./pages/repo-home";
+import { blobRedirectResponse, treeRedirectResponse } from "./pages/repo-home";
 import {
   canWriteRepo,
   commitFileFromForm,
@@ -738,6 +769,11 @@ import {
   repoArchiveResponse,
 } from "./pages/archive-files";
 import { containedRefsResponse, loadCommitContainedRefs } from "./pages/commit-contained-refs";
+// Wave-39 aux fragments (the survey's row 5 — the tree-list find-file feed
+// and the branches/list name feed; loaders + Response builders in the
+// modules, the handlers here beside their sibling dispatchers).
+import { branchesListResponse, loadBranchesListAux } from "./pages/branches-list-aux";
+import { loadTreeListAux, treeListResponse } from "./pages/tree-list-aux";
 import { loadPullCommitsData, renderPullCommitsPage } from "./pages/pull-commits";
 import { loadCommitViewData, renderCommitViewPage } from "./pages/commit-view";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
@@ -1050,8 +1086,8 @@ export interface OrgMembersRoute {
  *  web.go:1134 repositories route) — the `-` pseudo-segment namespace claims
  *  exactly the repositories tail; a plain USER name 404-shells at resolve
  *  time (upstream org.Repositories' `org == nil` arm). Every other `/-*`
- *  tail (heatmap, packages, projects, code) stays unclaimed → the engine's
- *  404. */
+ *  tail (heatmap, packages, code) stays unclaimed → the engine's 404
+ *  (projects landed in wave 37 — pages/owner-projects.tsx). */
 export interface OrgRepositoriesRoute {
   family: "org-repositories";
   /** Decoded owner segment (org rows only at resolve time). */
@@ -1235,6 +1271,47 @@ export interface CommitContainedRefsRoute {
   repo: string;
   /** The commit sha segment (hex-shaped 7..64, case-folded). */
   sha: string;
+}
+
+/** The wave-39 pasted-blob-URL redirect family (pages/repo-home.tsx's
+ *  blobRedirectResponse): upstream web.go:1757's `m.Get("/blob/*",
+ *  repo.RedirectRepoBlobToCommit)` — the wave-2 tree-redirect twin, the RAW
+ *  (still-encoded) suffix swapped verbatim onto `/src/commit/`. */
+export interface BlobRedirectRoute {
+  family: "blob-redirect";
+  owner: string;
+  repo: string;
+  /** The still-encoded path tail after `/blob` (`ctx.PathParamRaw("*")`
+   *  parity); "" = the bare `/blob` (no upstream route → the §4.5 404
+   *  shell, the tree family's arm). */
+  rawSuffix: string;
+}
+
+/** The wave-39 find-file aux-JSON family (pages/tree-list-aux.ts): upstream
+ *  web.go:1297-1306's `/{branch|tag|commit}/*` sub-routes over
+ *  `repo.TreeList` — the ref-type literal is the route shape (the forced-type
+ *  middleware), the decoded tail is the ref+path suffix (the /src family's
+ *  shape; the handler walks the ROOT tree, the tail's path half is ignored —
+ *  the module doc). The response is JSON, not a page. */
+export interface TreeListAuxRoute {
+  family: "tree-list-aux";
+  owner: string;
+  repo: string;
+  /** The forced ref type (web.go:1298-1300's three sub-routes). */
+  refType: RefType;
+  /** The decoded ref+path tail after the type literal. */
+  refSuffix: string;
+}
+
+/** The wave-39 branches aux-JSON family (pages/branches-list-aux.ts):
+ *  upstream web.go:1695's `m.Get("/list", repo.GetBranchesList)` under the
+ *  `/branches` group — the `{"results":[names]}` feed (the wave-33
+ *  tags-list-aux twin; the group's MustBeNotEmpty 404-shells empty repos at
+ *  the handler). The response is JSON, not a page. */
+export interface BranchesListAuxRoute {
+  family: "branches-list-aux";
+  owner: string;
+  repo: string;
 }
 
 
@@ -1458,7 +1535,10 @@ export type ParsedUiRoute =
   | RepoForkRoute
   | DiffPatchRoute
   | RepoArchiveRoute
-  | CommitContainedRefsRoute;
+  | CommitContainedRefsRoute
+  | BlobRedirectRoute
+  | TreeListAuxRoute
+  | BranchesListAuxRoute;
 
 
 /**
@@ -1664,6 +1744,32 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // the bare basics URL and the `/settings/hooks` sub-page (wave 4); the
   // deeper settings space stays engine-owned.
   if (head === "tree") return { family: "tree", owner, repo, rawSuffix: rest.join("/") };
+  // Wave-39: the blob-redirect twin of the tree arm (upstream
+  // RedirectRepoBlobToCommit, view_home.go:528-536 — the still-encoded
+  // suffix re-emitted onto /src/commit/; the bare /blob claims the shape and
+  // 404-shells at the dispatcher, the tree family's arm).
+  if (head === "blob") return { family: "blob-redirect", owner, repo, rawSuffix: rest.join("/") };
+  // Wave-39: the find-file aux family (upstream web.go:1297-1306's three
+  // typed sub-routes over repo.TreeList). The type literal is the route
+  // shape — chi registers exactly branch/tag/commit, so any other segment
+  // and the bare/below-minimum tails (chi's `/*` needs the typed tail) stay
+  // engine-owned; the decoded tail is the /src family's ref+path shape (the
+  // handler resolves only the ref half — the module doc).
+  if (head === "tree-list") {
+    const typed = rest[0];
+    if (rest.length < 2 || (typed !== "branch" && typed !== "tag" && typed !== "commit")) return null;
+    try {
+      return {
+        family: "tree-list-aux",
+        owner,
+        repo,
+        refType: typed,
+        refSuffix: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
+      };
+    } catch {
+      return null;
+    }
+  }
   if (head === "issues" || head === "pulls") {
     if (rest.length === 0) return { family: head, owner, repo };
     if (rest.length === 1) {
@@ -1849,12 +1955,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   // Wave-16 branches family (pages/branches.tsx — upstream web.go:1478-1482's
   // group): the bare URL is the list; the `/delete` tail is the POST-only
-  // write (the branch name rides the form field). Every other tail
+  // write (the branch name rides the form field). Wave 39 lifts the group's
+  // sibling `/list` literal out of the unclaimed set (web.go:1695 — the
+  // branches aux JSON, pages/branches-list-aux.ts). Every other tail
   // (`/branches/abc`, upstream's `/_new/*` create + `/restore` writes, which
   // have no landed flows) stays engine-owned → the engine's 404.
   if (head === "branches") {
     if (rest.length === 0) return { family: "branches", owner, repo };
     if (rest.length === 1 && rest[0] === "delete") return { family: "branch-delete", owner, repo };
+    if (rest.length === 1 && rest[0] === "list") return { family: "branches-list-aux", owner, repo };
     return null;
   }
   // Wave-20 releases family (pages/releases.tsx — upstream web.go:1505-1514's
@@ -4084,6 +4193,45 @@ async function tagListAuxJson(c: Context<{ Bindings: Env }>): Promise<Response> 
   return respond(tagListResponse(await loadTagListAux(c.env, repo)));
 }
 
+// ---------------------------------------------------------------------------
+// The wave-39 aux fragments (pages/tree-list-aux.ts +
+// pages/branches-list-aux.ts — the survey's row 5: upstream web.go:1297-1306
+// repo.TreeList + web.go:1695 repo.GetBranchesList; the tree-view,
+// blob_excerpt and lastcommit fragments of the same row are documented
+// skips — the module docs and the wave test header carry the cites)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{owner}/{repo}/tree-list/{branch|tag|commit}/* (pages/tree-list-aux.ts
+ * — upstream TreeList, web.go:1297-1306): the recursive file-path array for
+ * every viewer who can see the repo; the 404 family (empty repo — the
+ * nil-Commit arm, unresolvable ref, failed walk) answers the §4.5 shell.
+ */
+async function treeListAuxJson(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "tree-list-aux") return respond(await c.notFound()); // drift guard
+  const files = await loadTreeListAux(c.env, repo, route.refType, route.refSuffix);
+  if (files === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(treeListResponse(files));
+}
+
+/**
+ * GET /{owner}/{repo}/branches/list (pages/branches-list-aux.ts — upstream
+ * GetBranchesList, web.go:1695): the `{"results":[names]}` aux JSON for every
+ * viewer who can see the repo; the group's MustBeNotEmpty (web.go:1696)
+ * 404-shells empty repos before the load (the wave-33 tags-list-aux twin).
+ */
+async function branchesListAuxJson(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "branches-list-aux") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1696's group gate)
+  return respond(branchesListResponse(await loadBranchesListAux(c.env, repo)));
+}
+
 /** The wave-33 tag delete's refusal shape — ctx.HTTPError(409, …)'s
  *  plain-text form (release.go:677-680 → base.go:105-113, the archive
  *  family's established answer), stamped with the web middleware's
@@ -4513,6 +4661,15 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     // ctx.Repo.RepoLink); the suffix and query travel verbatim.
     const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
     return respond(treeRedirectResponse(repoLink, route.rawSuffix, url.search));
+  }
+  // Wave-39: the blob-redirect twin (upstream RedirectRepoBlobToCommit —
+  // the redirect runs AFTER the repository resolves exactly like the tree
+  // family: unknown/private repos 404-shell, never redirect; the bare
+  // /blob has no upstream route → §4.5 shell).
+  if (route.family === "blob-redirect") {
+    if (route.rawSuffix === "") return respond(c.html(renderNotFound(ctx), 404));
+    const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+    return respond(blobRedirectResponse(repoLink, route.rawSuffix, url.search));
   }
   if (route.family === "issues" || route.family === "pulls") {
     const data = await loadIssuesListData(c.env.DB, repo.id, route.family, url.searchParams);
@@ -5381,3 +5538,19 @@ uiRouter.get("/:owner/:repo/releases/delete", () => methodNotAllowed("POST"));
 // the static "-" segment outranks every dynamic peer and no registered
 // pattern above carries a 4-segment /:owner/-/projects shape.
 uiRouter.get("/:owner/-/projects", (c) => ownerProjectsPage(c));
+// Wave-39 aux fragments + blob redirect (parseUiRoute claims exactly these
+// shapes — upstream web.go:1757's `/blob/*` redirect wildcard + its bare
+// literal (the dispatcher's 404-shell arm, the wave-2 /tree pair's posture),
+// web.go:1297-1306's three typed `/tree-list/*` sub-routes, and
+// web.go:1695's `/branches/list` aux literal; the JSON handlers run the
+// resolveUiRequest prologue like every GET page). No earlier registration
+// can absorb these: the "blob" and "tree-list" heads are literals no
+// registered pattern carries (the wave-2 /tree pair matches only the "tree"
+// head; the typed tail regex keeps the tree-list claim equal to the
+// parser's), the branches "list" tail is a distinct literal beside wave-16's
+// bare /branches + /branches/delete pair, and unclaimed shapes never reach
+// the sub-app — the dispatcher consults handlesUiRoute first.
+uiRouter.get("/:owner/:repo/blob/*", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/blob", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/tree-list/:tlref{branch|tag|commit}/*", (c) => treeListAuxJson(c));
+uiRouter.get("/:owner/:repo/branches/list", (c) => branchesListAuxJson(c));
