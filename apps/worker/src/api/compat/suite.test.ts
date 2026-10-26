@@ -2312,8 +2312,8 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   ],
   repoCreateTag: [
     {
-      // Upstream answers 200 (not 201) with the Tag — the contract quirk.
-      name: "create lightweight (200 quirk)",
+      // WE answer the contract-declared 200; upstream RUNTIME drifts to 201 (tag.go:230) against its own swagger — aaea049.
+      name: "create lightweight (contract-declared 200, aaea049)",
       status: 200,
       request: (ctx) => ({
         path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/tags`,

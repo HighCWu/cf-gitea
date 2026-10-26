@@ -11,7 +11,7 @@
  * which is exactly the seam the one-liner wires later.
  *
  * Pinned here: ref-CAS semantics (PUT 422 stale old_commit_id, the engine's
- * ref_conflict → 409 mapping, force-gate 422), tag create (200 quirk,
+ * ref_conflict → 409 mapping, force-gate 422), tag create (contract-declared 200 — upstream runtime drifts 201, aaea049,
  * annotated via the Worker-side serializeTag + putApiObjects + commitApiChange
  * chain) / delete (204, release-coupled 409, empty-repo 405), the contents
  * union shapes (object vs array), the write family through the commit builder
@@ -298,7 +298,7 @@ describe("tags (repoListTags / repoCreateTag / repoGetTag / repoDeleteTag / GetA
     expect((tags[0]?.commit as Record<string, unknown>).sha).toBe(TIP2);
   });
 
-  it("creates an ANNOTATED tag (200 quirk) whose object git/tags/{sha} serves", async () => {
+  it("creates an ANNOTATED tag (contract-declared 200; upstream runtime drifts 201 — aaea049) whose object git/tags/{sha} serves", async () => {
     const res = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: "v2.0.0-rc1", message: "release candidate\n", target: TIP1 }));
     expect(res.status).toBe(200);
     const tag: Record<string, unknown> = await res.json();
