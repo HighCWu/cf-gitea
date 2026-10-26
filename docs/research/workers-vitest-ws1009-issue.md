@@ -179,6 +179,75 @@ files where a large (>1 MB transformed, multi-MB with sourcemap) module sits in
 the startup import graph of a subset of them, run with enough files to get many
 runners spawning at once.
 
+#### Minimal public repro (BUILT — wave-32 update, 2026-10-26)
+
+Built and measured by `wave-ws1009-repro`; the repo is fileable now. Scratch
+project at `/tmp/ws1009-repro/` (documented `README.md`), archived (without
+`node_modules/`) as **`docs/research/ws1009-repro.tar.gz`** (71 KB). Stack
+pinned exactly: vitest 5.0.5, vite 8.3.5, @cloudflare/vitest-plugin 1.4.7,
+wrangler 4.152.0 (miniflare 5.20261019.2-beta, workerd 1.20261019.1), Node
+v25.9.0, pnpm 12.13.0 (`pnpm-workspace.yaml` with
+`allowBuilds: {esbuild: true, workerd: true}` for the postinstall scripts).
+
+Scaffold (all fixture content SYNTHETIC, public-safe):
+
+1. Minimal wrangler config (`name`/`main`/`compatibility_date` only, no
+   bindings) + trivial worker + `cloudflareTest({ wrangler: { configPath } })`.
+2. One synthetic swagger-shaped JSON, 983,587 B pretty-printed (the real one is
+   983,702 B) + a barrel importing it plus 2 synthetic 6.6 MB string-literal
+   modules — total shared source ≈ 14.2 MB.
+3. `tests/big-01..18.test.ts` — 18 identical files, each importing the barrel
+   directly (mirrors the repo's 18 direct importers).
+
+`npx vitest run --maxWorkers 1` — **3/3 identical runs**: exit 1, 51 ×
+`protocolError.statusCode = 1009` lines (= **17 events** × 3), **17** "Worker
+exited unexpectedly during started state" attributions, deterministic set:
+**17 of the 18 files die, ONE survives and passes** (`Test Files 1 passed
+(18)`, `Tests 1 passed (1)`). The survivor is the file the scheduler runs
+FIRST (stable non-alphabetical order here: big-16; identical across runs).
+With `--maxWorkers 8` (repo's setting): 2/2 identical, **10** deaths. The same
+crash reproduces with **N=2 test files** (one connector + one crasher sharing
+the graph) and even with a single 14 MB shared module + the JSON — the file
+count is NOT the trigger.
+
+Measured mechanism (instrumented the plugin's `CloudflarePoolWorker.send` on a
+private copy; exact message bytes logged):
+
+- The fatal message is the response to the runner's `fetchWarmModules` RPC: the
+  plugin inlines the transformed code of EVERY module in the file's import
+  graph that the shared Vite server has already transformed (each module under
+  both its `url` and `id` keys; cached code includes the inline sourcemap) and
+  ships it as ONE WebSocket message. Measured: 14-pad graph 23,634,553 B →
+  passes; 21-pad 33,445,845 B → passes; 22-pad 34,847,465 B → 1009.
+- The incoming-message cap of the local workerd on this socket is **32 MiB**
+  (33,554,432 B). Measured with a single oversized module fetch: 33,309,508 B
+  passes, 33,654,312 B dies. The production limit raised on 2025-10-31 IS in
+  the local runtime — item 3 of "Mechanism" below is wrong on this point.
+- The cloudflare pool sets `prewarmModules: false`, so a runner's snapshot is
+  non-empty only when an EARLIER test file already connected the same graph on
+  the shared Vite server. That — not spawn concurrency or suite size — is the
+  "full-suite context required" effect (draft open question 3): 2 files
+  suffice; a solo file never crashes; N=18 files with only the small JSON in
+  the graph never crash even with 100 filler files.
+- Per-module fetch responses (fresh transform = code + map in one message) are
+  capped at ~4 MB here and cannot crash a runner unless a single transformed
+  module nears 32 MiB — the repo's largest single-module fetch (swagger JSON,
+  657,304 B code + 2,752,623 B map) was never itself fatal. The draft's
+  item-2/mechanism narrative should be rebased on the snapshot message.
+- The crash files' tests do NOT pass in this repro: the file silently
+  disappears ("Test Files 1 passed (18)" — neither passed nor failed). The
+  draft's "Test files failed 0 / all green" is consistent with this (failed = 0
+  either way), but the filer should re-verify the repo's own `Test Files` line
+  and whether the 2959-test count still includes the 17 attributed files'
+  tests; both variants surface identically as unhandled errors + exit 1.
+- Open question 4 is resolved by the repro: the ONE surviving direct importer
+  is the file the scheduler runs FIRST (its snapshot request arrives before
+  the graph is connected — empty snapshot → per-module fetches, each under
+  the cap; it is the connector). In the 18-file repro the first-run file is
+  big-16 (scheduler order, stable across runs) and exactly it survives; in
+  the repo it was evidently `src/api/issues.test.ts`. The crash SET is
+  deterministic because the scheduler order is.
+
 ### Mechanism (what we can see from the installed plugin)
 
 1. Each test file gets its own runner; the Node pool connects to it over a
@@ -204,6 +273,19 @@ runners spawning at once.
    "disconnected: …" family as "not user actionable", the only trace that a
    runner died is the stray 1009 exception noise — easy to misread as an
    environment problem rather than a payload-size crash.
+
+**Correction (measured, wave-32, 2026-10-26 — see the repro section above):**
+item 3's cap estimate is wrong and item 2's "one message per module fetch" is
+incomplete. The local workerd enforces the raised **32 MiB** limit on this
+socket (measured boundary 33,309,508 B pass / 33,654,312 B die), so the repo's
+per-module fetches (≤ ~4 MB) were never fatal. The messages that die are the
+`fetchWarmModules` snapshot responses: the whole already-transformed import
+graph of the file, inlined by `inlineCachedModules` into one message (aliases
+duplicate each module under `url` and `id`), which crosses 32 MiB once the
+connected graph holds roughly ≥ ~13 MB of source. The snapshot is empty for
+the first file to touch a graph and full for every later file sharing it —
+which is what actually requires "full-suite context" and what makes the crash
+set deterministic (first-sorting file connects and survives).
 
 ### Why this matters
 
@@ -252,13 +334,12 @@ runners spawning at once.
   (2) link to a minimal reproduction — **not yet available**; see below;
   (3) description; (4) optional error logs — paste the verbatim 1009 trio and
   the "Worker exited unexpectedly during started state" wrapper.
-- **Minimal repro:** required by the template but not yet built. Recipe: fresh
-  repo with vitest 5 + the plugin (wrangler config with a trivial worker), one
-  generated JSON ≥ 900 KB imported normally by ~20 test files, ~100 small
-  filler test files, run the whole suite; expect 1009 unhandled errors on a
-  green suite. Until a repro repo is published, either file with the numbers
-  above and a note that a repro is forthcoming, or ask maintainers whether they
-  accept a detailed data report for a prerelease package first.
+- **Minimal repro:** **BUILT 2026-10-26** — `docs/research/ws1009-repro.tar.gz`
+  (71 KB, synthetic public-safe fixtures; recipe and counts in the
+  "Minimal public repro" section above; scratch at `/tmp/ws1009-repro/` with a
+  README). Link the tarball (or a published repo unfurled from it) in the
+  issue. Still re-verify (a) on the filer's machine and (b) the repo's own
+  `Test Files` line for the passed-vs-vanished distinction noted above.
 - **Labels:** the template assigns none automatically; leave label choice to
   triage (suggested in text: affects `packages/vitest-plugin`, prerelease).
 - **Title:** use the proposed title above.
@@ -310,6 +391,26 @@ runners spawning at once.
      shipping larger messages than the fresh-transform path?
   4. Why does `src/api/issues.test.ts` (direct normal importer, second-largest
      file) never crash?
+- **Wave-32 resolutions/reframing of the questions above (from the measured
+  repro — see the "Minimal public repro" section):**
+  1. Reframed: the fatal size is the file's WHOLE connected-graph snapshot
+     (fetchWarmModules response), not the single module's fetch response. The
+     `?raw` files' graphs simply stayed under 32 MiB; the normal-vs-raw
+     per-module size comparison was measuring the wrong message.
+  2. Same reframing: transitive importers' graphs (models-only) stayed under
+     the cap; additionally the snapshot only includes modules already
+     transformed on the shared Vite server when the runner's request arrives.
+  3. RESOLVED: not the fs-cache path and not load. The snapshot is non-empty
+     only because an earlier file connected the same graph on the SHARED Vite
+     server (the pool sets `prewarmModules: false`); 2 files suffice to
+     reproduce, solo runs can never crash, and `--isolate=false` (single
+     reused runner, stale memoized empty snapshot) does not crash either.
+  4. RESOLVED: the surviving direct importer is the file the scheduler runs
+     FIRST — its warm-snapshot request arrives before the shared graph is
+     connected (empty snapshot, per-module fetches under the cap), so it is
+     the connector; every later sharer gets the full over-cap snapshot. The
+     18-file repro reproduces exactly this shape (one stable survivor per
+     scheduling order; all other direct importers die).
 - Environment block: Node v25.9.0, pnpm 12.13.0, Ubuntu 24.04.2 LTS,
   kernel 6.14.0-37-generic x64, 32 cores / 31 GB RAM; vitest 5.0.5,
   vite 8.3.5, @cloudflare/vitest-plugin 1.4.7, miniflare 5.20261019.2-beta,
