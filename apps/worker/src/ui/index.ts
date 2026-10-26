@@ -9464,6 +9464,11 @@ uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/workflows", (c) => repoProject
 uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/workflows/:wid", (c) => repoProjectWorkflowsPage(c));
 uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/workflows/:wid", (c) => repoProjectWorkflowUpdateSubmit(c));
 uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/workflows/:wid/delete", (c) => repoProjectWorkflowDeleteSubmit(c));
+// The GET 405 twin — upstream mounts addProjectWorkflowRoutes (POST-only
+// delete tail) identically in BOTH groups (web.go:1140-1155 owner,
+// 1544-1563 repo); the owner twin has carried this since 9b49cd2, the
+// wave-45 repo block stopped at the POST line (the projects matrix's RED).
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/workflows/:wid/delete", () => methodNotAllowed("POST"));
 // Wave-26 milestone detail + edit + fork form (parseUiRoute claims exactly
 // these shapes — upstream web.go:1340's singular reader route,
 // web.go:1427-1428's `{id}/edit` writer combo (the shared labels-write gate
