@@ -1,10 +1,19 @@
 /**
- * The user settings ACTIONS SECRETS tab's tests (the bench-row UNMOUNTED
- * module — the repo-settings-wiki.test.tsx harness): the parse/apply/delete
- * matrix over real D1 through the LANDED secrets-variables service (generated
- * migrations in beforeAll; migration 0021's `secrets` store) and the DOM
- * contract of the page render — hono/jsx renderToString, the module driven
- * directly (no route yet, the HANDOFF NOTE in the module header).
+ * The user settings ACTIONS SECRETS tab's tests (the module is MOUNTED —
+ * GET/POST `/user/settings/actions/secrets` + POST `/delete` ride the
+ * ui/index.ts window; the repo-settings-wiki.test.tsx harness): the
+ * parse/apply/delete matrix over real D1 through the LANDED
+ * secrets-variables service (generated migrations in beforeAll; migration
+ * 0021's `secrets` store) and the DOM contract of the page render — hono/jsx
+ * renderToString. Both delete outcomes 303 back at the mounted handler and a
+ * saved POST 303s while an invalid one re-renders (ui/index.ts), so the
+ * module-level `saved`/`invalid`/`deleted`/`missing` outcomes below are the
+ * handler's full observable surface. The deferred-test matrix (the
+ * port-first/old-mode waves): name-pattern violations, the 65536-byte /
+ * 4096-rune maxlength boundaries, the WEB-path EOL normalization (the API
+ * path does NOT normalize — asserted), the id→row→name-keyed delete hop with
+ * stale/foreign ids, duplicate-name upsert semantics, the 10000-cap list
+ * posture, and the empty-form re-render arms.
  */
 
 import { env } from "cloudflare:test";
@@ -30,6 +39,7 @@ import {
   SECRET_DATA_MAXLENGTH,
   SECRET_DESCRIPTION_MAXLENGTH,
   SECRET_NAME_PATTERN,
+  SECRET_WEB_LIST_LIMIT,
   SecretRowItem,
   UserSettingsSecretsPage,
   userSettingsSecretsLocale,
@@ -99,6 +109,37 @@ describe("loadUserSettingsSecretsPageData (the 0021 store, owner scope)", () => 
     const data = await loadUserSettingsSecretsPageData(env.DB, 1);
     expect(data.secrets.map((row) => row.name)).toEqual(["ALPHA", "BETA"]); // ToOrders "name"
   });
+
+  it("pins SECRET_WEB_LIST_LIMIT at the documented 10000 cap (the unpaginated-web-list seam)", () => {
+    // Upstream's web list is db.Find — unpaginated (shared/secrets/secrets.go:25-28);
+    // the landed service paginates, so the loader passes a beyond-any-store page size.
+    expect(SECRET_WEB_LIST_LIMIT).toBe(10000);
+  });
+
+  it("the beyond-any-store page size answers every row on page 1 and nothing beyond it", async () => {
+    // Chunked: D1 caps bound variables per statement (a 40-row single insert
+    // overflows SQLITE_MAX_VARIABLE_NUMBER).
+    const rows40 = Array.from({ length: 40 }, (_, i) => ({
+      ownerId: 1,
+      repoId: "",
+      name: `LOAD_${String(i).padStart(2, "0")}`,
+      data: "v",
+      description: "",
+      createdAt: T0,
+    }));
+    for (let i = 0; i < rows40.length; i += 10) {
+      await drizzle(env.DB).insert(secrets).values(rows40.slice(i, i + 10));
+    }
+    const data = await loadUserSettingsSecretsPageData(env.DB, 1);
+    expect(data.secrets).toHaveLength(40);
+    expect(data.secrets.map((row) => row.name)).toEqual(
+      Array.from({ length: 40 }, (_, i) => `LOAD_${String(i).padStart(2, "0")}`),
+    );
+    // The cap's offset arithmetic: page 2 at the same limit is past the store.
+    const second = await listSecretRows(env.DB, ownerScope(1), 2, SECRET_WEB_LIST_LIMIT);
+    expect(second.rows).toEqual([]);
+    expect(second.total).toBe(40);
+  });
 });
 
 // --- the form parse ------------------------------------------------------------
@@ -166,6 +207,152 @@ describe("applyUserSettingsSecretForm (SecretsPost → PerformSecretsPost over c
     });
     expect((await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows).toHaveLength(0); // nothing partially written
   });
+
+  it("rejects the full name-pattern matrix — case-insensitive prefixes, leading digits, junk characters, empty", async () => {
+    // The pattern trio (services/secrets-variables.ts:94-95 — upstream's
+    // `(?i)^(GITEA_|GITHUB_)` is case-INSENSITIVE, validation.go:23):
+    const patternViolations = ["", "   ", "1ABC", "007B", "HAS-HYPHEN", "HAS SPACE", "HAS.DOT"];
+    const prefixViolations = ["GITEA_", "gitea_token", "GITHUB_X", "Github_Token", "github_"];
+    for (const name of [...patternViolations, ...prefixViolations]) {
+      const outcome = await applyUserSettingsSecretForm(env.DB, 1, { name, data: "v", description: "" });
+      expect(outcome.outcome).toBe("invalid");
+      if (outcome.outcome !== "invalid") continue; // narrows for the message assert below
+      expect(outcome.message).toBe(
+        prefixViolations.includes(name)
+          ? userSettingsSecretsLocale.invalid_name_prefix
+          : userSettingsSecretsLocale.invalid_name_pattern,
+      );
+    }
+    expect((await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows).toHaveLength(0); // nothing partially written
+  });
+
+  it("accepts underscore-leading and digit-bearing names, storing the UPPERCASE normalization", async () => {
+    expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "_under_score", data: "v1", description: "" })).toEqual({
+      outcome: "saved",
+    });
+    expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "A1_B2", data: "v2", description: "" })).toEqual({
+      outcome: "saved",
+    });
+    const rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    // strings.ToUpper at insert; digits sort before underscore (ToOrders "name").
+    expect(rows.map((row) => row.name)).toEqual(["A1_B2", "_UNDER_SCORE"]);
+  });
+
+  it("caps data at 65536 BYTES — the exact boundary saves and the cap counts bytes, not runes", async () => {
+    // The DOM maxlength IS the service cap (SECRET_DATA_MAXLENGTH = SecretDataMaxLength).
+    expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "BOUNDARY", data: "x".repeat(SECRET_DATA_MAXLENGTH), description: "" })).toEqual({
+      outcome: "saved",
+    });
+    let rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(new TextEncoder().encode(rows[0]!.data).length).toBe(65536);
+
+    // 32768 two-byte runes = exactly 65536 bytes: inside the byte cap.
+    expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "MULTIBYTE_OK", data: "é".repeat(32768), description: "" })).toEqual({
+      outcome: "saved",
+    });
+    // 32769 two-byte runes = 65538 bytes: over the cap though only ~33k runes.
+    expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "MULTIBYTE_OVER", data: "é".repeat(32769), description: "" })).toEqual({
+      outcome: "invalid",
+      message: userSettingsSecretsLocale.data_too_long,
+    });
+    rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows.map((row) => row.name)).toEqual(["BOUNDARY", "MULTIBYTE_OK"]); // the over-cap write left nothing
+  });
+
+  it("truncates the description at 4096 RUNES silently — the boundary is kept, over is trimmed, never invalid", async () => {
+    expect(
+      await applyUserSettingsSecretForm(env.DB, 1, { name: "DESC_BOUNDARY", data: "v", description: "d".repeat(SECRET_DESCRIPTION_MAXLENGTH) }),
+    ).toEqual({ outcome: "saved" });
+    // No invalid arm — the maxlength is client-side only; the service truncates (TruncateRunes).
+    expect(
+      await applyUserSettingsSecretForm(env.DB, 1, { name: "DESC_OVER", data: "v", description: "d".repeat(SECRET_DESCRIPTION_MAXLENGTH + 1) }),
+    ).toEqual({ outcome: "saved" });
+    // Rune counting, not bytes: 4096 two-byte runes (8192 bytes) survive verbatim.
+    expect(
+      await applyUserSettingsSecretForm(env.DB, 1, { name: "DESC_MULTIBYTE", data: "v", description: "é".repeat(SECRET_DESCRIPTION_MAXLENGTH) }),
+    ).toEqual({ outcome: "saved" });
+
+    const byName = new Map((await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows.map((row) => [row.name, row]));
+    expect(byName.get("DESC_BOUNDARY")!.description).toHaveLength(SECRET_DESCRIPTION_MAXLENGTH);
+    expect(byName.get("DESC_OVER")!.description).toHaveLength(SECRET_DESCRIPTION_MAXLENGTH); // trimmed to the cap
+    expect(byName.get("DESC_MULTIBYTE")!.description).toHaveLength(SECRET_DESCRIPTION_MAXLENGTH); // UTF-16 units
+    expect([...byName.get("DESC_MULTIBYTE")!.description]).toHaveLength(SECRET_DESCRIPTION_MAXLENGTH); // RUNES
+    expect(new TextEncoder().encode(byName.get("DESC_MULTIBYTE")!.description).length).toBe(8192); // bytes were not the unit
+  });
+
+  it("the API path (the bare service call) does NOT normalize EOLs — the CRLF fold is the WEB path's alone", async () => {
+    // services/secrets-variables.ts stores data verbatim (the header's
+    // length-units note: "secret data is not" normalized) — the API PUT arm.
+    await createOrUpdateSecret(env.DB, ownerScope(1), "API_RAW", "line1\r\nline2", "");
+    const rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows[0]!.data).toBe("line1\r\nline2");
+  });
+
+  it("the WEB path folds CRLF→LF in data only — a bare CR and the description pass through", async () => {
+    await applyUserSettingsSecretForm(env.DB, 1, {
+      name: "WEB_EOL",
+      data: "win\r\nold-mac\rend\r\n",
+      description: "desc\r\nkeeps\r\nCRLF",
+    });
+    let rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows[0]!.data).toBe("win\nold-mac\rend\n"); // util.NormalizeStringEOL folds only \r\n pairs (util.go:312)
+    expect(rows[0]!.description).toBe("desc\r\nkeeps\r\nCRLF"); // PerformSecretsPost normalizes form.Data only (secrets.go:42)
+    // The update arm folds too.
+    await applyUserSettingsSecretForm(env.DB, 1, { name: "WEB_EOL", data: "again\r\n", description: "" });
+    rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows[0]!.data).toBe("again\n");
+  });
+
+  it("the empty-form POST answers the pattern violation and writes nothing (the untouched-form no-JS submit)", async () => {
+    expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "", data: "", description: "" })).toEqual({
+      outcome: "invalid",
+      message: userSettingsSecretsLocale.invalid_name_pattern,
+    });
+    expect((await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows).toHaveLength(0);
+  });
+
+  it("empty data saves — the dialog's required attribute is client-side only (the no-JS reduction)", async () => {
+    expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "NO_VALUE", data: "", description: "" })).toEqual({
+      outcome: "saved",
+    });
+    const rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows[0]!.data).toBe("");
+  });
+
+  it("upsert matches case-insensitively on UPPER(name) — one row, data+description replaced, createdAt untouched", async () => {
+    expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "Prod_Key", data: "v1", description: "first" })).toEqual({
+      outcome: "saved",
+    });
+    let rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.name).toBe("PROD_KEY"); // strings.ToUpper at insert
+    await env.DB.prepare("UPDATE secrets SET created_unix = 1000000 WHERE owner_id = 1").run(); // backdate to prove the update arm skips it
+
+    expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "prod_key", data: "v2", description: "second" })).toEqual({
+      outcome: "saved",
+    });
+    rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows).toHaveLength(1); // the SAME row — the find-by-UPPER-name hit, no duplicate
+    expect(rows[0]!.name).toBe("PROD_KEY");
+    expect(rows[0]!.data).toBe("v2");
+    expect(rows[0]!.description).toBe("second");
+    expect(rows[0]!.createdAt.getTime()).toBe(1_000_000_000); // UpdateSecret touches data+description only (secret.go:132-152)
+  });
+
+  it("the same name coexists across scopes — another doer's save upserts its own row, not mine", async () => {
+    await applyUserSettingsSecretForm(env.DB, 1, { name: "SHARED_NAME", data: "mine", description: "user 1" });
+    await applyUserSettingsSecretForm(env.DB, 2, { name: "SHARED_NAME", data: "theirs", description: "user 2" });
+    let rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.data).toBe("mine");
+    rows = (await listSecretRows(env.DB, ownerScope(2), 1, 10)).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.data).toBe("theirs");
+    // The UNIQUE(owner_repo_name) triple is (owner, repo, name) — user 2's re-save stays in its scope.
+    await applyUserSettingsSecretForm(env.DB, 2, { name: "SHARED_NAME", data: "theirs-v2", description: "" });
+    rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows[0]!.data).toBe("mine"); // untouched by the foreign upsert
+  });
 });
 
 // --- the delete ------------------------------------------------------------------
@@ -199,6 +386,50 @@ describe("deleteUserSettingsSecret (SecretsDelete → PerformSecretsDelete)", ()
     const row = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows[0]!;
     expect(await deleteUserSettingsSecret(env.DB, 1, { id: row.id })).toBe("deleted");
     expect(await deleteUserSettingsSecret(env.DB, 1, { id: row.id })).toBe("missing");
+  });
+
+  it("a stale id stays missing even after the same name is recreated (the hop is id→row, not id→name)", async () => {
+    const first = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows[0]!;
+    expect(await deleteUserSettingsSecret(env.DB, 1, { id: first.id })).toBe("deleted");
+    await seedSecret("DOOMED", "recreated"); // same name, a NEW id
+    const rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.id).not.toBe(first.id);
+    expect(await deleteUserSettingsSecret(env.DB, 1, { id: first.id })).toBe("missing"); // the old id resolves to nothing
+    expect(await deleteUserSettingsSecret(env.DB, 1, { id: rows[0]!.id })).toBe("deleted"); // the new id deletes
+  });
+
+  it("the id→row→name hop is scope-guarded — deleting a same-named row in another doer's scope spares mine", async () => {
+    await seedSecret("TWINS", "mine", "", 1);
+    await seedSecret("TWINS", "theirs", "", 2);
+    const mine = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows.find((row) => row.name === "TWINS")!;
+    const theirs = (await listSecretRows(env.DB, ownerScope(2), 1, 10)).rows[0]!; // the describe's DOOMED seed belongs to user 1 only
+    expect(mine.id).not.toBe(theirs.id);
+    expect(await deleteUserSettingsSecret(env.DB, 2, { id: theirs.id })).toBe("deleted");
+    const after = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows.filter((row) => row.name === "TWINS");
+    expect(after).toHaveLength(1);
+    expect(after[0]!.data).toBe("mine"); // the name-keyed hop resolved within the deleting doer's scope only
+  });
+
+  it("a repo-scoped row's id is foreign to the user scope — the hop answers missing and deletes nothing", async () => {
+    await env.DB.prepare(
+      "INSERT INTO secrets (owner_id, repo_id, name, data, description, created_unix) VALUES (0, 'repo-1', 'REPO_ROW', 'x', '', 0)",
+    ).run();
+    const repoRow = await drizzle(env.DB).select().from(secrets).where(eq(secrets.name, "REPO_ROW")).get();
+    expect(await deleteUserSettingsSecret(env.DB, 1, { id: repoRow!.id })).toBe("missing");
+    expect(await drizzle(env.DB).select().from(secrets).where(eq(secrets.name, "REPO_ROW")).get()).toBeDefined(); // untouched
+  });
+
+  it("parses the id edge arms — zero-padded passes, signed/decimal/trailing-junk do not — and id 0 is missing", async () => {
+    expect(parseUserSettingsSecretDeleteForm(new URLSearchParams({ id: "007" }))).toEqual({ id: 7 });
+    expect(parseUserSettingsSecretDeleteForm(new URLSearchParams({ id: "0" }))).toEqual({ id: 0 });
+    expect(parseUserSettingsSecretDeleteForm(new URLSearchParams({ id: "-1" }))).toEqual({ id: null });
+    expect(parseUserSettingsSecretDeleteForm(new URLSearchParams({ id: "1.5" }))).toEqual({ id: null });
+    expect(parseUserSettingsSecretDeleteForm(new URLSearchParams({ id: " 1" }))).toEqual({ id: null });
+    expect(parseUserSettingsSecretDeleteForm(new URLSearchParams({ id: "12abc" }))).toEqual({ id: null });
+    // id 0 matches no row (autoincrement starts at 1) — "missing"; both delete
+    // outcomes 303 back at the mounted handler (ui/index.ts, the module header).
+    expect(await deleteUserSettingsSecret(env.DB, 1, { id: 0 })).toBe("missing");
   });
 });
 
@@ -304,5 +535,20 @@ describe("the secrets page DOM (actions.tmpl + shared/secrets/add_list.tmpl at t
     const row = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows[0]!;
     await deleteUserSettingsSecret(env.DB, 1, { id: row.id });
     expect(await drizzle(env.DB).select().from(secrets).where(eq(secrets.id, row.id)).get()).toBeUndefined();
+  });
+
+  it("pins the maxlength exports to upstream's caps (SecretDataMaxLength 65536 / SecretDescriptionMaxLength 4096)", () => {
+    // models/secret/secret.go:50-51 — the dialog's {{.DataMaxLength}} /
+    // {{.DescriptionMaxLength}} (add_list.tmpl:91, 101).
+    expect(SECRET_DATA_MAXLENGTH).toBe(65536);
+    expect(SECRET_DESCRIPTION_MAXLENGTH).toBe(4096);
+  });
+
+  it("the failed EMPTY-form POST re-renders the error line over the empty form arm", async () => {
+    const html = await pageHtml(userSettingsSecretsLocale.invalid_name_pattern, { name: "", data: "", description: "" });
+    expect(html).toContain('class="ui negative message"');
+    expect(html).toContain(userSettingsSecretsLocale.invalid_name_pattern);
+    expect(html).toContain('value=""'); // the add input re-renders the empty submitted name
+    expect(html).toContain(userSettingsSecretsLocale.none); // nothing was written, so the empty list line rides too
   });
 });
