@@ -3,6 +3,8 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { deployKeys, publicKeys, users } from "../../db/schema";
 import { DEPLOY_KEY_USER_ID } from "../../services/branch-protection";
+import { SshKeyParseError, parseSshPublicKey as parseSshPublicKeyDetail } from "../../services/ssh-gpg-keys";
+import type { ParsedSshKey } from "../../services/ssh-gpg-keys";
 import { ApiError } from "../errors";
 import type { Repository } from "../models/repository";
 import { apiRepositoryUrl, toApiRepository, type RepositoryWithOwner, type Viewer } from "./repository";
@@ -38,133 +40,34 @@ import { apiRepositoryUrl, toApiRepository, type RepositoryWithOwner, type Viewe
  * to every owner-scoped key listing exactly like upstream's ownerless row.
  *
  * THE PARSER SEAM — the SSH wire-shape validation reuses the landed
- * public_keys parser (routes/misc-t3.ts `parseSshPublicKey`, the provable
- * OpenSSH single-line subset). That function is module-private in
- * misc-t3.ts, which this batch does not own; per the admin-org-extras.ts
- * precedent ("the verbatim duplicate is the documented seam until a
- * consolidation wave") the parser and its binary helpers are copied
- * VERBATIM below, byte-for-byte, and this header is the divergence note.
- * A later consolidation should export the parser from one shared home and
- * delete this copy (misc-t3.test.ts already pins its semantics).
+ * public_keys parser, now consolidated into services/ssh-gpg-keys.ts (the
+ * provable OpenSSH single-line subset; misc-t3.ts and
+ * user-settings-keys.tsx import the same home — this module's former
+ * verbatim copy was the admin-org-extras.ts "documented seam until a
+ * consolidation wave" pattern, and that wave collapsed all three copies).
+ * The shared parser throws the detail-only SshKeyParseError; the single
+ * mapping below is this module's whole residue of the copy — the wired 422
+ * (HandleCheckKeyStringError's "Invalid key content: …" family) that
+ * misc-t3.test.ts and this module's suite pin.
  */
 
 // ---------------------------------------------------------------------------
-// The parser seam — verbatim from routes/misc-t3.ts (module header note).
+// The parser seam — now the shared home (services/ssh-gpg-keys.ts); this
+// module keeps only the API 422 mapping (the module header note).
 // ---------------------------------------------------------------------------
 
-function base64ToBytes(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
-}
-
-/** Go strings.SplitN: the last part carries the unsplit remainder. */
-function goSplitN(content: string, separator: string, n: number): string[] {
-  const parts = content.split(separator);
-  if (parts.length <= n) {
-    return parts;
-  }
-  return [...parts.slice(0, n - 1), parts.slice(n - 1).join(separator)];
-}
-
-/** SHA-256 fingerprint in ssh's rendering: "SHA256:" + unpadded std base64. */
-async function sshFingerprint(blob: Uint8Array): Promise<string> {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", blob));
-  return `SHA256:${bytesToBase64(digest).replace(/=+$/, "")}`;
-}
-
-/** Upstream maxKeyBinaryBytes (ssh_key_parse.go:36) → the base64 cap
- *  maxKeyContentBase64Bytes (4096 * 4 / 3). */
-const SSH_MAX_KEY_BASE64_BYTES = 5461;
-
-interface ParsedSshKey {
-  /** The normalized stored content: "type base64 [comment]" (upstream
-   *  parseKeyString's return, whitespace-trimmed). */
-  content: string;
-  fingerprint: string;
-}
-
-/**
- * Structural OpenSSH public key validation + SHA-256 fingerprint. Throws the
- * route-mapped 422 ApiError on any violation (HandleCheckKeyStringError's
- * "Invalid key content: …" family).
- */
+/** parseSshPublicKey with HandleCheckKeyStringError's route mapping: the
+ *  shared parser throws the detail-only SshKeyParseError; the wired 422
+ *  body prefixes "Invalid key content: ". */
 async function parseSshPublicKey(raw: string): Promise<ParsedSshKey> {
-  let content = raw.trim();
-  const invalid = (detail: string): ApiError => new ApiError(422, `Invalid key content: ${detail}`);
-  if (content.startsWith("---- BEGIN SSH2 PUBLIC KEY ----") || content.includes("-----BEGIN")) {
-    throw invalid("unsupported public key format (OpenSSH single-line only)");
-  }
-  // Upstream removes all newlines from the OpenSSH form before splitting.
-  content = content.replaceAll("\r\n", "").replaceAll("\n", "");
-  const parts = goSplitN(content, " ", 3);
-  if (parts.length === 0 || (parts[0] ?? "") === "") {
-    throw invalid("empty key");
-  }
-  const declaredType = parts.length === 1 ? "" : parts[0]!;
-  const base64Key = parts.length === 1 ? parts[0]! : parts[1]!;
-  const comment = parts.length === 3 ? parts[2]! : "";
-  if (base64Key.length > SSH_MAX_KEY_BASE64_BYTES) {
-    throw invalid("SSH public key base64 is too long");
-  }
-  let blob: Uint8Array;
   try {
-    blob = base64ToBytes(base64Key);
-  } catch {
-    throw invalid("invalid key format: illegal base64 data");
-  }
-  if (blob.length < 4) {
-    throw invalid("invalid key format");
-  }
-  // SSH wire walk: length-prefixed strings; the first names the key type.
-  const readString = (offset: number): [string, number] | null => {
-    if (offset + 4 > blob.length) {
-      return null;
+    return await parseSshPublicKeyDetail(raw);
+  } catch (error) {
+    if (error instanceof SshKeyParseError) {
+      throw new ApiError(422, `Invalid key content: ${error.message}`);
     }
-    const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
-    const length = view.getUint32(offset);
-    if (offset + 4 + length > blob.length) {
-      return null;
-    }
-    return [new TextDecoder().decode(blob.subarray(offset + 4, offset + 4 + length)), offset + 4 + length];
-  };
-  const first = readString(0);
-  if (first === null) {
-    throw invalid("invalid key format: not enough length");
+    throw error;
   }
-  const [wireType, afterType] = first;
-  if (declaredType !== "" && declaredType !== wireType) {
-    throw invalid(`key type and content does not match: ${declaredType} - ${wireType}`);
-  }
-  // The remaining fields must be a clean string sequence consuming the blob
-  // (a real key carries at least one material field).
-  let offset = afterType;
-  let fields = 0;
-  while (offset < blob.length) {
-    const next = readString(offset);
-    if (next === null) {
-      throw invalid("invalid ssh public key: malformed key blob");
-    }
-    offset = next[1];
-    fields += 1;
-  }
-  if (fields === 0) {
-    throw invalid("invalid ssh public key: empty key blob");
-  }
-  const stored = parts.length === 1 ? `${wireType} ${base64Key}` : [declaredType, base64Key, comment].filter((p) => p !== "").join(" ");
-  return { content: stored.trim(), fingerprint: await sshFingerprint(blob) };
 }
 
 // ---------------------------------------------------------------------------
