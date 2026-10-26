@@ -8,7 +8,8 @@
  *
  * One committed home for the RECURRING REDEPLOY verification probes, so every
  * redeploy wave runs the same probes with less drift instead of hand-rolling
- * them per deploy. Batteries (all take --base-url + a PAT file):
+ * them per deploy. Batteries (all take --base-url + a PAT file, except the
+ * D1-only cleanup-audit, which takes neither — REDEPLOY15 friction (a)):
  *
  *   p0             The P0 shallow trio + privacy tail against the standing
  *                  fixture repo (`<user>/p0-shallow` by default).
@@ -106,6 +107,12 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
 const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "cleanup-audit", "all"];
+/** Batteries that make NO HTTP calls (they read D1 via wrangler only):
+ *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
+ *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
+ *  delete dance). A missing token errors only when a selected battery
+ *  actually needs one; a SUPPLIED token file is still validated + scrubbed. */
+const D1_ONLY_BATTERIES = new Set(["cleanup-audit"]);
 
 /** Canonical fixture tip on the standing production repo (p0probe/p0-shallow). */
 const CANONICAL_FIXTURE_OID = "502abd2d5561536873088528a9f57f02cd1633e1";
@@ -118,6 +125,7 @@ const parseArgs = (argv) => {
     json: false, dryRun: false, help: false, timeoutMs: 20_000,
     trials: 3, fixtureRepo: "p0-shallow", fixtureOid: null, newLabelCount: 3,
     strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 1,
+    mirrorSettleMs: 30_000,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -134,6 +142,7 @@ const parseArgs = (argv) => {
     else if (a === "--new-label-count") opts.newLabelCount = Number(argv[++i]);
     else if (a === "--strict-generated-clone") opts.strictGeneratedClone = true;
     else if (a === "--d1-scope") opts.d1Scope = argv[++i];
+    else if (a === "--mirror-settle-ms") opts.mirrorSettleMs = Number(argv[++i]);
     else if (a === "--expect-owner-repos") opts.expectOwnerRepos = Number(argv[++i]);
     else if (a === "--expect-tokens") opts.expectTokens = Number(argv[++i]);
     else if (opts.battery === null && !a.startsWith("--")) {
@@ -144,15 +153,19 @@ const parseArgs = (argv) => {
   if (opts.help) return opts;
   if (opts.battery === null && opts.dryRun) opts.battery = "all"; // a bare --dry-run plans every battery
   if (opts.battery === null) throw new Error(`a battery is required (one of: ${BATTERY_NAMES.join(", ")})`);
-  if (!opts.dryRun) {
-    if (!opts.baseUrl) throw new Error("--base-url is required");
+  // REDEPLOY15 friction (a): the D1-only batteries take neither --base-url nor
+  // --token-file; a missing token errors only when the run makes HTTP calls.
+  const needsHttp = opts.battery === "all" || !D1_ONLY_BATTERIES.has(opts.battery);
+  if (!opts.dryRun && needsHttp) {
+    if (!opts.baseUrl) throw new Error("--base-url is required (the selected battery makes HTTP calls; the D1-only cleanup-audit takes none)");
     if (!/^https?:\/\//.test(opts.baseUrl)) throw new Error(`--base-url must be an http(s) URL: ${opts.baseUrl}`);
-    if (!opts.tokenFile) throw new Error("--token-file is required (mint a per-run PAT into a 0600 temp file)");
+    if (!opts.tokenFile) throw new Error("--token-file is required (mint a per-run PAT into a 0600 temp file; the D1-only cleanup-audit runs without one)");
   }
   if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(opts.user)) throw new Error("--user must be 1-64 chars of [a-zA-Z0-9_.-]");
   if (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs <= 0) throw new Error("--timeout-ms must be a positive number");
   if (!Number.isInteger(opts.trials) || opts.trials < 1 || opts.trials > 10) throw new Error("--trials must be 1-10");
   if (opts.d1Scope !== "remote" && opts.d1Scope !== "local") throw new Error("--d1-scope must be remote or local");
+  if (!Number.isFinite(opts.mirrorSettleMs) || opts.mirrorSettleMs <= 0) throw new Error("--mirror-settle-ms must be a positive number of milliseconds");
   opts.baseUrl = opts.baseUrl ? opts.baseUrl.replace(/\/+$/, "") : null;
   return opts;
 };
@@ -160,6 +173,7 @@ const parseArgs = (argv) => {
 const usage = () =>
   "usage: node scripts/deploy-probes.mjs <battery> --base-url <url> --token-file <path>\n" +
   "                                     [--user p0probe] [--timeout-ms <n>] [--json]\n" +
+  "                                     (D1-only cleanup-audit: --base-url/--token-file optional)\n" +
   "       node scripts/deploy-probes.mjs <battery> --dry-run   (prints every probe + its canonical expectation)\n" +
   "\n" +
   `batteries: ${BATTERY_NAMES.join(", ")}\n` +
@@ -168,13 +182,20 @@ const usage = () =>
   "  registry:      --trials <1-10>            (default 3, one tombstone lifecycle each)\n" +
   "  generate-e2e:  --strict-generated-clone   (promote the carried git-wire warn to a hard assert)\n" +
   "  forkpr-e2e:    (no extra options)\n" +
-  "  mirror:        (no extra options; the row-settle arm reuses --d1-scope)\n" +
+  "  mirror:        --mirror-settle-ms <ms>    (sync-settle budget, default 30000; the row-settle arm reuses --d1-scope)\n" +
   "  ui-login:      --new-label-count <n>      (canonical 3 writer-form occurrences)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)";
 
 // ---------- plumbing ----------
 
-const opts = parseArgs(process.argv.slice(2));
+let opts;
+try {
+  opts = parseArgs(process.argv.slice(2));
+} catch (err) {
+  // CLI errors exit 2 with a one-line message (no stack) — the documented shape.
+  console.error(`deploy-probes: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(2);
+}
 if (opts.help) {
   console.log(usage());
   process.exit(0);
@@ -323,8 +344,11 @@ const deleteRepo = async (owner, repo) => {
 const SETTLE_MS = 15_000;
 const FORK_SETTLE_MS = 30_000;
 /** The .invalid sync settle (the queue consumer's failed attempt — the
- *  evidence's first poll landed ~3 s; the mission budget is ~10 s). */
-const MIRROR_SETTLE_MS = 10_000;
+ *  evidence's first poll landed ~3 s). REDEPLOY15 observed a PRODUCTION settle
+ *  at 12 s (queue-latency variance; the re-run settled at 1.3 s), red-spinning
+ *  the debut 10 s budget — the default is now 30 s (~2.5x the observed worst);
+ *  tighten for quick local runs with --mirror-settle-ms. */
+const MIRROR_SETTLE_MS = opts.mirrorSettleMs;
 
 // ---------- battery: p0 (shallow trio + privacy tail) ----------
 
@@ -774,7 +798,13 @@ const MIRROR_LOOPBACK_TARGET = "https://127.0.0.1:9/dummy-unreachable.git";
  *  no real egress). */
 const mirrorInvalidTarget = () => `https://pmir-${hexId()}.invalid/dummy-unreachable.git`;
 
-const mirrorContext = () => ({ user: opts.user, repo: `pmir-${hexId()}`, remoteName: null, remoteAddress: null, tmp: null });
+/** `repoCreated`/`repoGone`/`repoFullName` drive the failure-cleanup tail (see
+ *  mirrorFailureCleanup): REDEPLOY15 friction (c) — a mid-battery red used to
+ *  strand the mirror row + repo behind [skip] lines for a hand-clean.
+ *  repoFullName is what the CREATE actually returned (the doer's namespace),
+ *  so the tail deletes the right owner/slug even when --user drifts from the
+ *  PAT's user. */
+const mirrorContext = () => ({ user: opts.user, repo: `pmir-${hexId()}`, remoteName: null, remoteAddress: null, repoCreated: false, repoGone: false, repoFullName: null, tmp: null });
 
 const mirrorSteps = (ctx) => [
   {
@@ -783,6 +813,8 @@ const mirrorSteps = (ctx) => [
     run: async () => {
       const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, private: true, auto_init: true } });
       expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      ctx.repoCreated = true; // the failure-cleanup tail deletes it if a later step reds
+      ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
       return `created ${res.json?.full_name} (private, auto_init)`;
     },
   },
@@ -886,15 +918,69 @@ const mirrorSteps = (ctx) => [
   },
   {
     id: "mir-cleanup",
-    expect: `probe repo DELETEd → 204 (a failed cleanup is documented, not fatal)`,
+    expect: `probe repo DELETEd → 204 (a failed cleanup is documented, not fatal; the failure-cleanup tail re-sweeps anything left)`,
     run: async () => {
       const out = await deleteRepo(ctx.user, ctx.repo);
+      if (typeof out === "string") ctx.repoGone = true; // the tail no-ops on a green sweep
       await rm(ctx.tmp, { recursive: true, force: true });
       if (typeof out === "string") return out;
       return { status: "warn", detail: out.detail };
     },
   },
 ];
+
+/** REDEPLOY15 friction (c): a mid-battery red (e.g. mir-sync-settle timing
+ *  out) used to chain-skip the delete/cleanup arms and strand the mirror row
+ *  AND repo behind [skip] lines — the row then breaks the audit battery's
+ *  push_mirrors==0 until a hand-clean. This finally-style tail runs after
+ *  EVERY mirror battery run (green ones no-op silently: the battery's own
+ *  delete arms emptied the list and removed the repo) and best-effort deletes
+ *  exactly what the run created and has not already deleted. Every action is
+ *  logged on one [tail] line; failures feed left_behind and are never fatal;
+ *  it never throws (main's finally depends on it). */
+const mirrorFailureCleanup = async (ctx) => {
+  const acts = [];
+  const noteLeftBehind = (what, why) => {
+    leftBehind.push(`${what} (failure-cleanup tail: ${why})`);
+    acts.push(`${what} LEFT BEHIND — ${why}`);
+  };
+  try {
+    if (ctx.repoCreated === true) {
+      const [owner, repo] = String(ctx.repoFullName ?? `${ctx.user}/${ctx.repo}`).split("/");
+      // Mirror rows first: the list sweep covers the named row AND the
+      // edge where the row exists but the creating check reded before
+      // ctx.remoteName was captured.
+      try {
+        const list = await api(`/repos/${owner}/${repo}/push_mirrors`);
+        const rows = Array.isArray(list.json) ? list.json : [];
+        for (const row of rows) {
+          const name = String(row?.remote_name ?? "");
+          if (!name) continue;
+          try {
+            const res = await api(`/repos/${owner}/${repo}/push_mirrors/${name}`, { method: "DELETE" });
+            if (res.status === 204) acts.push(`mirror row ${name} deleted (204)`);
+            else noteLeftBehind(`mirror row ${name}`, `DELETE returned ${res.status}`);
+          } catch (err) {
+            noteLeftBehind(`mirror row ${name}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      } catch (err) {
+        noteLeftBehind(`mirror rows of ${owner}/${repo}`, `list failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (ctx.repoGone !== true) {
+        try {
+          const out = await deleteRepo(owner, repo);
+          acts.push(typeof out === "string" ? out : out.detail);
+        } catch (err) {
+          noteLeftBehind(`repo ${owner}/${repo}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+  } catch (err) {
+    acts.push(`the sweep itself failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (acts.length) log(`  [tail] mir-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
 
 // ---------- battery: ui-login ----------
 
@@ -1050,7 +1136,7 @@ const BATTERIES = {
   "registry": { title: "registry tombstone sweep (carry + t+0 delete)", context: () => ({}), steps: () => Array.from({ length: opts.trials }, (_, i) => registryTrialSteps(i + 1)).flat() },
   "generate-e2e": { title: "template → generate → carried refs + contents", context: generateContext, steps: generateSteps },
   "forkpr-e2e": { title: "fork → owner:branch PR chain", context: forkprContext, steps: forkprSteps },
-  "mirror": { title: "push-mirror credential-free arms (SSRF gate + .invalid lifecycle)", context: mirrorContext, steps: mirrorSteps },
+  "mirror": { title: "push-mirror credential-free arms (SSRF gate + .invalid lifecycle)", context: mirrorContext, steps: mirrorSteps, failureTail: mirrorFailureCleanup },
   "ui-login": { title: "login-cookie labels owner view", context: uiContext, steps: uiSteps },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
@@ -1074,7 +1160,7 @@ const dryRun = () => {
     }
   }
   log(``);
-  log(`${batteryList.length} battery/batteries planned — run with --base-url <url> --token-file <0600 path> to execute.`);
+  log(`${batteryList.length} battery/batteries planned — run with --base-url <url> --token-file <0600 path> to execute (the D1-only cleanup-audit needs neither).`);
 };
 
 // ---------- main ----------
@@ -1084,7 +1170,9 @@ if (opts.dryRun) {
   process.exit(0);
 }
 
-/** Load the per-run PAT: 0600 file, mint-per-run shape, never echoed. */
+/** Load the per-run PAT: 0600 file, mint-per-run shape, never echoed. Only
+ *  invoked when a selected battery makes HTTP calls — or when the operator
+ *  supplied a token file anyway (it is validated + scrubbed regardless). */
 const loadToken = async () => {
   const st = await stat(opts.tokenFile);
   expect(st.isFile(), `--token-file is not a regular file: ${opts.tokenFile}`);
@@ -1100,8 +1188,12 @@ const loadToken = async () => {
 };
 
 const main = async () => {
-  TOKEN = await loadToken();
-  log(`cf-gitea deploy probes — ${batteryList.join(" + ")} — ${opts.baseUrl} (user ${opts.user})`);
+  // REDEPLOY15 friction (a): the D1-only cleanup-audit runs WITHOUT a PAT —
+  // loadToken fires only when the run actually makes HTTP calls.
+  if (batteryList.some((name) => !D1_ONLY_BATTERIES.has(name)) || opts.tokenFile) {
+    TOKEN = await loadToken();
+  }
+  log(`cf-gitea deploy probes — ${batteryList.join(" + ")} — ${opts.baseUrl ?? "(no --base-url: D1-only battery)"} (user ${opts.user})`);
   for (const name of batteryList) {
     const battery = BATTERIES[name];
     const ctx = battery.context();
@@ -1115,6 +1207,9 @@ const main = async () => {
         await chain(battery.steps(ctx));
       }
     } finally {
+      // REDEPLOY15 friction (c): a red run sweeps its own creations (the
+      // mirror battery's tail; best-effort, logged, never throws).
+      if (battery.failureTail) await battery.failureTail(ctx);
       await rm(ctx.tmp, { recursive: true, force: true });
     }
   }

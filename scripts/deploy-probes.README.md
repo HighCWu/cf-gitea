@@ -14,15 +14,22 @@ node scripts/deploy-probes.mjs <battery> --base-url https://<worker>.workers.dev
   --token-file /tmp/pat-0600            # mint-per-run, mode 0600
 node scripts/deploy-probes.mjs all --dry-run          # print every probe + its canonical expectation
 node scripts/deploy-probes.mjs p0 --dry-run           # single battery plan
+node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --expect-tokens 5
+                                                      # D1-only: --base-url/--token-file optional
 ```
 
 - Batteries: `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `cleanup-audit`, `all` (runs them in that order, audit last).
+- **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
+  takes neither `--base-url` nor `--token-file` — a missing token only errors
+  when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
+  audit used to demand a PAT, forcing a scratch-mint + delete dance). A
+  supplied token file is still validated (0600, mint shape) and scrubbed.
 - Against LOCAL dev: `--base-url http://127.0.0.1:5173 --d1-scope local` for
-  the audit and the mirror row-settle arm; mint the PAT with
-  `node scripts/bootstrap-admin.mjs <user>` on local D1. A local self-test
-  (all seven batteries) was run green from this tree;
-  see "Local self-test fixtures" below.
+  the HTTP batteries (the mirror row-settle arm reuses `--d1-scope`); mint the
+  PAT with `node scripts/bootstrap-admin.mjs <user>` on local D1, and pass the
+  matching `--user`. A local self-test (all seven batteries) was run green
+  from this tree; see "Local self-test fixtures" below.
 - `--json` puts only the final JSON summary on stdout (progress to stderr),
   same contract as deploy-smoke.
 
@@ -30,7 +37,8 @@ node scripts/deploy-probes.mjs p0 --dry-run           # single battery plan
 
 - The token is **minted per run** by the operator (e.g.
   `node scripts/bootstrap-admin.mjs p0probe --remote` on remote D1) and written
-  to a temp file; the raw mint stdout is shredded.
+  to a temp file; the raw mint stdout is shredded. (Exception: the D1-only
+  `cleanup-audit` battery reads no HTTP surface and runs without a PAT.)
 - `--token-file` enforces **mode 0600** (a looser file is refused before any
   request) and the mint shape `cfg_<8hex>_<32base32>`.
 - The token is **never echoed**: every progress line, detail, and the JSON
@@ -107,17 +115,28 @@ prints all of them verbatim.
   `https://pmir-<hex>.invalid/dummy-unreachable.git` registers **200** with
   the fresh-row wire (`last_error` "", `last_update` null, `interval`
   `8h0m0s`, `sync_on_commit` false, `remote_name` `remote_mirror_<10 alnum>`)
-  → `push_mirrors-sync` **200** (the enqueue) → poll the mirror (budget 10 s)
-  until the consumer's failed attempt settles: `last_error` non-empty and
-  naming the target advertisement URL `[<addr>/info/refs?service=
-  git-receive-pack]` (canonical production text: "mirror target responded 530
-  for info/refs advertisement …"; local dev's unresolvable-host fetch reads
-  "request failed" with the same bracketed URL — the settle writes
-  `last_error` and `sync_state='idle'` in the same update) → the row re-read
-  via wrangler d1 (`--d1-scope`): `sync_state='idle'` (no stuck state),
-  `next_sync_at=0` (the failure left the fresh row unscheduled) → DELETE
-  **204** and the list back to `[]`. Cleanup deletes the probe repo; the
-  audit battery's `push_mirrors` == 0 expectation stays true.
+  → `push_mirrors-sync` **200** (the enqueue) → poll the mirror (budget
+  `--mirror-settle-ms`, default 30 s) until the consumer's failed attempt
+  settles: `last_error` non-empty and naming the target advertisement URL
+  `[<addr>/info/refs?service=git-receive-pack]` (canonical production text:
+  "mirror target responded 530 for info/refs advertisement …"; local dev's
+  unresolvable-host fetch reads "request failed" with the same bracketed URL
+  — the settle writes `last_error` and `sync_state='idle'` in the same
+  update) → the row re-read via wrangler d1 (`--d1-scope`):
+  `sync_state='idle'` (no stuck state), `next_sync_at=0` (the failure left
+  the fresh row unscheduled) → DELETE **204** and the list back to `[]`.
+  Cleanup deletes the probe repo; the audit battery's `push_mirrors` == 0
+  expectation stays true. The settle budget: REDEPLOY15 observed a PRODUCTION
+  settle at 12 s once in two runs (pure queue-latency variance; the re-run
+  settled at 1.3 s) against the debut 10 s default — the default is now 30 s
+  (~2.5x the observed worst); tighten for quick local runs with
+  `--mirror-settle-ms`. **Failure cleanup (REDEPLOY15 friction):** a
+  mid-battery red used to chain-skip the delete arms and strand the mirror
+  row + repo behind `[skip]` lines; a finally-style tail now best-effort
+  sweeps exactly what the run created and has not already deleted (logged on
+  one `[tail] mir-leftover-sweep` line; failures feed `left_behind`, never
+  fatal, and a green run no-ops silently) — a red run no longer breaks the
+  next audit's `push_mirrors` == 0.
 - **ui-login** — the login-cookie methodology (b5facba's lesson; REDEPLOY12's
   OPEN ISSUE 3 closed): a PAT header never logs a session in. Anonymous labels
   page 200 with 0 "New Label" occurrences → `POST /login`
@@ -125,8 +144,9 @@ prints all of them verbatim.
   labels page WITH the cookie 200 with the writer form (canonical 3
   occurrences, `--new-label-count`) + `small-menu-items`.
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
-  default remote) runs the whole count shape; the checks are INDEPENDENT (one
-  red count never hides the rest): probe-user repositories == 1 (the standing
+  default remote) runs the whole count shape; **D1-only, so it runs without
+  `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
+  never hides the rest): probe-user repositories == 1 (the standing
   `p0-shallow`, `--expect-owner-repos`), `status='creating'` == 0, `action`
   == 0 (the 389da18 delete sweep — NO hand-sweep), `stars` == 0,
   `push_mirrors` == 0, `protected_branches` == 0, `repo_redirects` == 0,
@@ -141,10 +161,15 @@ prints all of them verbatim.
   as **[warn]** + `left_behind` in the summary (documented, never fatal), and
   the next run's `cleanup-audit` is what proves the ground back to the
   canonical shape.
-- A red run may leave its repos in place for debugging (the lfs-e2e
-  convention); the next run names fresh random repos (`reg-`, `tmpl-`/`gen-`,
-  `prbase-`/`prorg-`, `ui-` prefixes), so pre-cleanup is a `cleanup-audit`
-  away.
+- **The mirror battery additionally self-cleans on a red**: its finally-style
+  tail (above) best-effort deletes the mirror row + probe repo it created, so
+  a settle failure no longer strands rows for a hand-clean (REDEPLOY15
+  friction (c)); the `[tail] mir-leftover-sweep` line logs every action, and
+  the audit battery going green right after a red mirror run is the proof.
+- A red run of the OTHER batteries may leave its repos in place for debugging
+  (the lfs-e2e convention); the next run names fresh random repos (`reg-`,
+  `tmpl-`/`gen-`, `prbase-`/`prorg-`, `ui-` prefixes), so pre-cleanup is a
+  `cleanup-audit` away.
 - Scratch dirs live under `os.tmpdir()` and are removed per battery; the PAT
   file is the operator's to shred.
 
