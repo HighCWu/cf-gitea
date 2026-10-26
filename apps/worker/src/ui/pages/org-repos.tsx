@@ -36,7 +36,7 @@
  * The upstream-sibling tails of the `/-` namespace (`/-/heatmap`,
  * `/-/packages*`, `/-/projects*`, `/-/code`) stay unclaimed → the engine's
  * 404, exactly upstream's unregistered-route answer for slices that have not
- * landed (the survey's L-effort rows).
+ * landed (the survey's L-effort rows). (2026-10-26 update: the `/-/projects` LIST surface has since landed — wave-ui-parity-8 `45bea22` — leaving the projects board/write depth, heatmap, packages and code as the unclaimed tails.)
  */
 
 import type { OrgDoer } from "../../api/services/org-repos";
