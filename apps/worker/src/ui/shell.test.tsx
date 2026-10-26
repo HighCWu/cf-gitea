@@ -66,6 +66,7 @@ function makeRepoRow(overrides: Partial<RepoRow> = {}): RepoRow {
     sizeKb: 0,
     numStars: 0,
     numWatches: 0,
+    numForks: 0,
     ...overrides,
   };
 }

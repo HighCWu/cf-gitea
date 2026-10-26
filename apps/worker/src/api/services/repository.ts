@@ -254,7 +254,11 @@ export function apiUserFromRow(row: UserRow, viewer: Viewer): User {
     visibility: "public", // TODO(SPEC-0005): user visibility column
     followers_count: 0, // TODO(SPEC-0005): social counters
     following_count: 0,
-    starred_repos_count: 0,
+    // Upstream renders the maintained column (convert ToUser → StarredRepos,
+    // modules/structs/user.go:60; models/user/user.go:155), not a live count:
+    // the star/unstar batches bump it beside the edge (services/stars.ts,
+    // star.go:48/62), as does the block cascade (services/blocks.ts).
+    starred_repos_count: row.numStars,
   };
 }
 
@@ -337,15 +341,15 @@ export function toApiRepository(
     original_url: "",
     website: settings?.website ?? "", // TODO(SPEC-0005): website column (repo_settings until the sweep)
     // Upstream renders the maintained columns, not live counts:
-    // convert/repository.go:219-221 — `Stars: repo.NumStars` / `Watchers:
-    // repo.NumWatches` (models/repo/repo.go:168/167). The columns are kept
-    // in the same D1 batch as the star/watch edge writes (upstream
-    // star.go:45/59, watch.go:153; services/stars.ts + services/
-    // repo-watchers.ts) and by the block cascade (services/blocks.ts).
-    // forks_count stays the documented 0 — upstream's Repository.NumForks
-    // (repo.go:169 → convert/repository.go:220) has no landed column yet.
+    // convert/repository.go:219-221 — `Stars: repo.NumStars` / `Forks:
+    // repo.NumForks` / `Watchers: repo.NumWatches` (models/repo/repo.go:
+    // 168/169/167). The columns are kept in the same D1 batch as the
+    // star/watch edge writes (upstream star.go:45/59, watch.go:153;
+    // services/stars.ts + services/repo-watchers.ts) and by the block
+    // cascade (services/blocks.ts); num_forks is bumped at the fork settle
+    // (repos/fork-task.ts settleForkRow — upstream fork.go:110-113).
     stars_count: row.numStars,
-    forks_count: 0,
+    forks_count: row.numForks,
     watchers_count: row.numWatches,
     branch_count: 0, // TODO(SPEC-0001/0005): engine refs snapshot count
     // SPEC-0005 §3.2 maintained counters (updated by the issue/PR services).

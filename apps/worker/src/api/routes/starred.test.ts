@@ -24,6 +24,7 @@ import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { findRepositoryByPath, toApiRepository } from "../services/repository";
+import { toApiUser } from "../services/user";
 import { registerStarredRoutes } from "./starred";
 
 const ERROR_URL = "https://example.com/api/swagger";
@@ -275,5 +276,95 @@ describe("repositories.num_stars maintenance (migration 0030)", () => {
     const rendered = toApiRepository({ origin: "https://example.com", requester: null }, pair);
     expect(rendered.stars_count).toBe(1);
     expect(rendered.watchers_count).toBe(0); // untouched by the star arm
+  });
+});
+
+/**
+ * The maintained `users.num_stars` counter (migration 0031) — the per-USER
+ * twin of the block above, the star.go:48/62 UPDATEs inside StarRepo's
+ * WithTx, rendered as the payload `starred_repos_count`
+ * (modules/structs/user.go:60 `StarredRepos`; models/user/user.go:155).
+ */
+describe("users.num_stars maintenance (migration 0031)", () => {
+  /** The recluse-owned source repo (the seed shape of the blocks above). */
+  async function seedCounterRepo(): Promise<{ doerId: number }> {
+    const owner = await seedUser("recluse");
+    const doer = await seedUser("stargazer");
+    await drizzle(env.DB).insert(repositories).values({
+      id: "7302",
+      storageKey: "r_7302",
+      ownerNamespace: "recluse",
+      ownerId: owner.id,
+      slug: "source",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    return { doerId: doer.id };
+  }
+
+  const putStar = (doerId: number) =>
+    makeApp()("/user/starred/recluse/source", { method: "PUT", headers: { Authorization: `token u${doerId}` } });
+
+  const deleteStar = (doerId: number) =>
+    makeApp()("/user/starred/recluse/source", { method: "DELETE", headers: { Authorization: `token u${doerId}` } });
+
+  async function userStars(userId: number): Promise<number> {
+    const row = await drizzle(env.DB).select().from(users).where(eq(users.id, userId)).get();
+    if (row === undefined) throw new Error("user seed failed");
+    return row.numStars;
+  }
+
+  it("PUT star bumps the starrer's tally (star.go:48); the repeat PUT is the no-op arm and moves nothing", async () => {
+    const { doerId } = await seedCounterRepo();
+    expect(await userStars(doerId)).toBe(0);
+    await putStar(doerId);
+    expect(await userStars(doerId)).toBe(1);
+    await putStar(doerId);
+    expect(await userStars(doerId)).toBe(1);
+    expect(await drizzle(env.DB).select().from(stars).all()).toHaveLength(1);
+  });
+
+  it("DELETE unstar decrements (star.go:62); the repeat DELETE moves nothing and the column never crosses 0", async () => {
+    const { doerId } = await seedCounterRepo();
+    await putStar(doerId);
+    await deleteStar(doerId);
+    expect(await userStars(doerId)).toBe(0);
+    await deleteStar(doerId); // upstream's `if !staring { return nil }` arm
+    expect(await userStars(doerId)).toBe(0);
+    expect(await drizzle(env.DB).select().from(stars).all()).toHaveLength(0);
+  });
+
+  it("a pre-0031 edge (backfilled counter 0 beneath a seeded star) unstarring floors at 0, never negative", async () => {
+    const { doerId } = await seedCounterRepo();
+    // The migration-0031 backfill shape: an edge whose user counter is the
+    // ALTER default 0 (seeded directly, bypassing the route arm).
+    await drizzle(env.DB).insert(stars).values({ userId: doerId, repoId: "7302", createdAt: new Date() });
+    expect(await userStars(doerId)).toBe(0);
+    const res = await deleteStar(doerId);
+    expect(res.status).toBe(204);
+    expect(await userStars(doerId)).toBe(0); // MAX(num_stars - 1, 0), not -1
+  });
+
+  it("the blocked PUT (403) precedes any write — the starrer's tally stays 0", async () => {
+    const { doerId } = await seedCounterRepo();
+    const owner = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "recluse")).get();
+    if (owner === undefined) throw new Error("user seed failed");
+    await drizzle(env.DB)
+      .insert(userBlocking)
+      .values({ blockerId: owner.id, blockeeId: doerId, note: "", createdAt: new Date() });
+    const res = await putStar(doerId);
+    expect(res.status).toBe(403);
+    expect(await userStars(doerId)).toBe(0);
+  });
+
+  it("renders as starred_repos_count (structs/user.go:60 — StarredRepos, the maintained NumStars)", async () => {
+    const { doerId } = await seedCounterRepo();
+    await putStar(doerId);
+    const row = await drizzle(env.DB).select().from(users).where(eq(users.id, doerId)).get();
+    if (row === undefined) throw new Error("user seed failed");
+    const rendered = toApiUser({ origin: "https://example.com", requester: null }, row);
+    expect(rendered.starred_repos_count).toBe(1);
   });
 });

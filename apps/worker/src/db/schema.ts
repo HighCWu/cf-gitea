@@ -146,8 +146,8 @@ export const repositories = sqliteTable(
      *  edge write (upstream star.go:45/59 — insert/delete + the
      *  `num_stars ± 1` update inside one WithTx), and by the block cascade's
      *  unstar arm (services/user/block.go:150-181 → StarRepo(false) per
-     *  repo). The per-USER twin (`user.num_stars`, star.go:48/62) is not
-     *  modeled — the users table carries no column; a documented gap.
+     *  repo). The per-USER twin (`user.num_stars`, star.go:48/62) landed
+     *  alongside as migration 0031 (the users.num_stars column below).
      *  NOT NULL DEFAULT 0: the ALTER backfills pre-existing rows to 0 (the
      *  one-time settle for rows predating migration 0030 — existing star
      *  edges keep counting only via the next unstar/restar cycle; the
@@ -170,6 +170,37 @@ export const repositories = sqliteTable(
      *  seam (reported, not wired here). Backfill = the DEFAULT 0, same
      *  settle posture as num_stars above. */
     numWatches: integer("num_watches").notNull().default(0),
+    // -------------------------------------------------------------------------
+    // Fork tally (wave-counters-2) — the social-counters block's third column.
+    // Kept LAST like fork_parent/is_mirror/is_template/size_kb/num_stars/
+    // num_watches above — ALTER TABLE ADD COLUMN physically appends, so the
+    // table_info order stays the migration order.
+    // -------------------------------------------------------------------------
+    /** Upstream `Repository.NumForks` (models/repo/repo.go:169) — rendered as
+     *  the API `forks_count` (services/convert/repository.go:220
+     *  `Forks: repo.NumForks`). Upstream bumps it inside ForkRepository's
+     *  creation transaction (services/repository/fork.go:110-113 →
+     *  IncrementRepoForkNum, models/repo/fork.go:57-61 — the raw
+     *  `num_forks = num_forks + 1` UPDATE; the SOLE increment call site — the
+     *  template-generate copy, GenerateRepository, never touches it: a
+     *  generated repo has IsFork=false/ForkID=0) and decrements when a fork
+     *  is deleted (services/repository/delete.go:224-228) or converted back
+     *  to a normal repo (fork.go:221-227 → DecrementRepoForkNum,
+     *  models/repo/fork.go:63-66). Maintained HERE at the fork settle — the
+     *  CAS `creating → ready` flip in repos/fork-task.ts settleForkRow, the
+     *  exactly-once gate standing in for upstream's create-time bump (a
+     *  documented timing divergence: the tally moves when the fork becomes
+     *  servable, not when the row is minted) — guarded, inside the settle's
+     *  one D1 batch, by the fork row still being 'creating'. The fork-delete
+     *  / child-reset decrements (delete.go:224-228 / :282-285) live in the
+     *  delete cascade (repos/service.ts) — reported to that owner, not wired
+     *  here. NOT NULL DEFAULT 0: the ALTER backfills pre-existing rows to 0;
+     *  the idempotent operator sweep, if ever needed, is
+     *  `UPDATE repositories SET num_forks = (SELECT count(*) FROM
+     *  repositories f WHERE f.fork_parent = repositories.id)` via
+     *  `wrangler d1 execute` — deliberately NOT automated (dev D1 is scratch,
+     *  AGENTS.md; remote D1 has no production rows yet). */
+    numForks: integer("num_forks").notNull().default(0),
   },
   (t) => [
     // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point
@@ -341,6 +372,29 @@ export const users = sqliteTable(
       .notNull()
       .default(false),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+    // -------------------------------------------------------------------------
+    // Social counter (wave-counters-2) — the per-USER star tally. Kept LAST
+    // in this object because ALTER TABLE ADD COLUMN physically appends the
+    // column — the table_info order below is the migration order.
+    // -------------------------------------------------------------------------
+    /** Upstream `User.NumStars` (models/user/user.go:155) — rendered as the
+     *  API `starred_repos_count` (modules/structs/user.go:60
+     *  `StarredRepos`; also the GET /user/starred pagination total,
+     *  routers/api/v1/user/star.go:85-86/117-118). Maintained in the SAME
+     *  transaction as the star edge (upstream star.go:48/62 — the
+     *  `num_stars ± 1` update inside StarRepo's WithTx, beside the
+     *  repositories.num_stars bump), by the block cascade's unstar arm
+     *  (block.go:172-175 → StarRepo(false) per repo), and on repo delete
+     *  (services/repository/delete.go:133 — each stargazer loses one; our
+     *  delete cascade arm is reported to the repos owner, not wired here).
+     *  NOT NULL DEFAULT 0: the ALTER backfills existing rows to 0 beneath
+     *  surviving star edges — un-star floors at 0 (the MAX(…,0) drift
+     *  insurance, same posture as repositories.num_stars); the idempotent
+     *  operator sweep, if ever needed, is `UPDATE users SET num_stars =
+     *  (SELECT count(*) FROM stars WHERE stars.user_id = users.id)` via
+     *  `wrangler d1 execute` — deliberately NOT automated (dev D1 is
+     *  scratch, AGENTS.md; remote D1 has no production rows yet). */
+    numStars: integer("num_stars").notNull().default(0),
   },
   (t) => [
     uniqueIndex("users_username_lower_uq").on(t.usernameLower),

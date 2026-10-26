@@ -18,11 +18,11 @@ import type { RepositoryWithOwner } from "./repository";
  * `STARS_DDL_STATEMENTS` block was deleted with the sweep — the generated
  * migration is authoritative now.
  *
- * Residual gap: upstream ALSO maintains the per-USER `user.num_stars` twin
- * (star.go:48/62) — the users table carries no such column (documented in
- * src/db/schema.ts); the per-REPO `repositories.num_stars` half IS modeled
- * (migration 0030) and maintained below. countUserStars below is the ready
- * read for a `starred_repos_count` projection.
+ * Counters (migration 0030's `repositories.num_stars` + 0031's
+ * `users.num_stars` — the star.go:45/48/59/62 quartet): both tallies move in
+ * the SAME batch as the edge write below, mirroring upstream's single WithTx.
+ * Residual gap: upstream's ClearRepoStars zeroing (star.go:94–104, repo set
+ * private) is the repos wave's seam.
  */
 
 export interface StarListOptions {
@@ -49,25 +49,24 @@ export async function isStarring(d1: D1Database, userId: number, repoId: string)
  * `StarRepo(…, true)` (star.go:29–69) reduced to the modeled surface: the
  * already-starring arm is the upstream silent no-op (nil → the API's 204),
  * the insert is one guarded row — the `stars_user_repo_uq` pair is the
- * idempotence arbiter (ON CONFLICT DO NOTHING). Documented divergences:
- *   - the per-USER `user.num_stars` counter (star.go:48) is unreachable —
- *     no such column (see the header);
- *   - the `ClearRepoStars` zeroing (star.go:94–104, repo set private) is the
- *     repos wave's seam.
+ * idempotence arbiter (ON CONFLICT DO NOTHING). Remaining documented
+ * divergence: the `ClearRepoStars` zeroing (star.go:94–104, repo set
+ * private) is the repos wave's seam.
  *
- * Counter maintenance (the migration-0030 `repositories.num_stars` column):
- * upstream moves the counter and the edge inside ONE WithTx (star.go:42–50
- * — insert, then `num_stars = num_stars + 1`, rolling back together). The
- * same shape here is one D1 batch (= one implicit SQLite transaction) of a
- * counter UPDATE followed by the guarded INSERT:
- *   - the UPDATE is guarded by the edge's ABSENCE (`NOT EXISTS`), evaluated
+ * Counter maintenance (the migration-0030 `repositories.num_stars` + 0031
+ * `users.num_stars` columns): upstream moves BOTH counters and the edge
+ * inside ONE WithTx (star.go:42–50 — insert, then the repo bump at :45 and
+ * the doer bump at :48, rolling back together). The same shape here is one
+ * D1 batch (= one implicit SQLite transaction) of the two counter UPDATEs
+ * followed by the guarded INSERT:
+ *   - each UPDATE is guarded by the edge's ABSENCE (`NOT EXISTS`), evaluated
  *     before the insert lands — the upstream `if staring { return nil }`
- *     arm (star.go:38–40), made atomic: a repeat PUT's update sees the
- *     surviving edge inside its own serialized batch and moves nothing
+ *     arm (star.go:38–40), made atomic: a repeat PUT's updates see the
+ *     surviving edge inside their own serialized batch and move nothing
  *     (a concurrent double-star serializes on the write lock, so exactly
  *     one batch counts);
- *   - ordering UPDATE→INSERT keeps the whole increment+insert indivisible:
- *     a failed insert rolls the bump back, like upstream's transaction.
+ *   - ordering UPDATEs→INSERT keeps the whole increments+insert indivisible:
+ *     a failed insert rolls the bumps back, like upstream's transaction.
  */
 export async function starRepo(d1: D1Database, userId: number, repoId: string, now: Date): Promise<void> {
   const db = drizzle(d1);
@@ -82,6 +81,15 @@ export async function starRepo(d1: D1Database, userId: number, repoId: string, n
         ),
       ),
     db
+      .update(users)
+      .set({ numStars: sql`num_stars + 1` })
+      .where(
+        and(
+          eq(users.id, userId),
+          sql`NOT EXISTS (SELECT 1 FROM stars WHERE user_id = ${userId} AND repo_id = ${repoId})`,
+        ),
+      ),
+    db
       .insert(stars)
       .values({ userId, repoId, createdAt: now })
       .onConflictDoNothing({ target: [stars.userId, stars.repoId] }),
@@ -90,13 +98,15 @@ export async function starRepo(d1: D1Database, userId: number, repoId: string, n
 
 /**
  * `StarRepo(…, false)` (star.go:51–65) — idempotent unsubscribe. One D1
- * batch, counter first: the decrement is guarded by the edge's EXISTENCE
+ * batch, counters first: the decrements are guarded by the edge's EXISTENCE
  * (the upstream `if !staring { return nil }` arm, star.go:52–54 — a repeat
- * DELETE moves nothing), then the row delete lands. The MAX(…, 0) floor is
- * drift insurance, not semantics: upstream's ±1 arithmetic can never cross
- * zero (counter and edge move in one transaction, star.go:56–64), but rows
- * predating migration 0030 were backfilled to 0 beneath pre-existing star
- * edges — un-starring such an edge floors at 0 instead of going negative.
+ * DELETE moves nothing), then the row delete lands — upstream's
+ * repo decrement (star.go:59) and doer decrement (star.go:62) verbatim. The
+ * MAX(…, 0) floor is drift insurance, not semantics: upstream's ±1
+ * arithmetic can never cross zero (counters and edge move in one
+ * transaction, star.go:56–64), but rows predating the backfills (0030 /
+ * 0031) carry 0 beneath pre-existing star edges — un-starring such an edge
+ * floors at 0 instead of going negative.
  */
 export async function unstarRepo(d1: D1Database, userId: number, repoId: string): Promise<void> {
   const db = drizzle(d1);
@@ -107,6 +117,15 @@ export async function unstarRepo(d1: D1Database, userId: number, repoId: string)
       .where(
         and(
           eq(repositories.id, repoId),
+          sql`EXISTS (SELECT 1 FROM stars WHERE user_id = ${userId} AND repo_id = ${repoId})`,
+        ),
+      ),
+    db
+      .update(users)
+      .set({ numStars: sql`MAX(num_stars - 1, 0)` })
+      .where(
+        and(
+          eq(users.id, userId),
           sql`EXISTS (SELECT 1 FROM stars WHERE user_id = ${userId} AND repo_id = ${repoId})`,
         ),
       ),
@@ -125,10 +144,14 @@ export async function unstarRepo(d1: D1Database, userId: number, repoId: string)
  * AccessibleRepositoryCondition arm (star metadata does not leak).
  *
  * The total is the FILTERED count. Upstream sets the pagination headers from
- * `ctx.Doer.NumStars` — the RAW counter, so upstream's total can exceed the
- * listed page after an access revocation; cf-gitea has no counter column, and
- * the filtered count is the only honest number (documented divergence,
- * observable only in the revoked-access edge).
+ * `ctx.Doer.NumStars` — the RAW counter (star.go:85-86/117-118; now modeled
+ * as users.num_stars, migration 0031), so upstream's total can exceed the
+ * listed page after an access revocation. The filtered count stays the total
+ * here — with the column landed the raw counter would be available, but it
+ * drifts above the edge count wherever a cascade arm hasn't landed (repo
+ * delete's per-stargazer decrement, delete.go:133 — reported to the repos
+ * owner), and the filtered number is the honest page arithmetic
+ * (documented divergence, observable only in the revoked-access edge).
  */
 export async function listStarredRepositories(
   d1: D1Database,
@@ -169,9 +192,10 @@ export async function deleteRepoStars(d1: D1Database, repoId: string): Promise<v
   await drizzle(d1).delete(stars).where(eq(stars.repoId, repoId));
 }
 
-/** Star count of one user — the future `User.starred_repos_count` read
- *  (upstream `NumStars`); unused by the routes today (the projection renders
- *  the documented zero), kept next to its store like countRepoWatchers. */
+/** Star count of one user — the live-count read beside the MAINTAINED
+ *  `users.num_stars` column (migration 0031; the payload renders the column,
+ *  the way upstream renders `User.NumStars`); kept next to its store like
+ *  countRepoWatchers (an integrity probe, not a route read today). */
 export async function countUserStars(d1: D1Database, userId: number): Promise<number> {
   const row = await drizzle(d1)
     .select({ n: sql<number>`count(*)` })

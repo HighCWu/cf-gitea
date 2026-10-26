@@ -566,6 +566,7 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
       ["size_kb", "INTEGER", 1, 0],
       ["num_stars", "INTEGER", 1, 0],
       ["num_watches", "INTEGER", 1, 0],
+      ["num_forks", "INTEGER", 1, 0],
     ]);
     // The appended columns keep the ALTER ADD COLUMN constraints: is_mirror
     // is NOT NULL with the keyword-alias default (`false` = 0), original_url

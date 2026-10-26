@@ -32,6 +32,21 @@
  * wire state (documented divergence from upstream, which copies IsEmpty from
  * the base before the clone).
  *
+ * FORK TALLY (migration 0031 `repositories.num_forks`): the settle is also
+ * the parent's `num_forks` increment point (upstream bumps INSIDE
+ * ForkRepository's creation transaction, services/repository/fork.go:110-113
+ * → IncrementRepoForkNum, models/repo/fork.go:57-61 — the sole call site;
+ * the template-generate copy never counts, GenerateRepository has no
+ * IncrementRepoForkNum arm). The increment rides the SAME D1 batch as the
+ * CAS, guarded by the fork row still being 'creating' — evaluated before the
+ * CAS statement lands, so a redelivery (fork already 'ready') moves nothing,
+ * exactly-once with the settle itself. Documented timing divergence: the
+ * tally moves when the fork becomes SERVABLE (our settle), not at row mint
+ * (upstream's create tx) — a pre-settle fork is not a servable fork, so the
+ * parent's fork list/count stay consistent with what the API serves. The
+ * fork-delete / child-reset decrements (delete.go:224-228 / :282-285) live
+ * in the delete cascade — reported to the repos owner, not wired here.
+ *
  * WEBHOOK (SPEC-0005 §3.5): the settle's winning invocation emits the `fork`
  * event through services/repo-events.ts — upstream's ForkRepository
  * (services/webhook/notifier.go:86-91), routed through the SOURCE repository
@@ -39,7 +54,7 @@
  * degraded shell settles silently (nothing was replicated; no event).
  */
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import {
   replicateForkCatalog,
@@ -102,17 +117,22 @@ export async function handleForkMessage(env: Env, msg: RepoForkMessage): Promise
     // The source vanished after the 202: there is nothing to copy, and a
     // retry would not bring it back. Settle the orphaned shell to ready-empty
     // (a visible empty repo beats one stuck in 'creating' forever) and leave
-    // the admin notice.
+    // the admin notice. The tally arm still rides along: its UPDATE targets
+    // the vanished source row and matches nothing (an inert guard), the same
+    // end state as upstream's decrement-on-parent-delete never having had a
+    // counted fork to undo.
     console.error(
       `[repo-tasks] fork ${fork.id}: source ${msg.sourceRepoId} no longer exists; settling the fork empty`,
     );
-    await settleForkRow(db, fork, true);
+    await settleForkRow(db, fork, true, { countTowardSourceId: msg.sourceRepoId });
     return;
   }
 
   await replicateRepoCopy(env, source, fork);
 
-  const settled = await settleForkRow(db, fork, source.isEmpty);
+  const settled = await settleForkRow(db, fork, source.isEmpty, {
+    countTowardSourceId: source.id,
+  });
   if (settled) {
     // `fork` event (upstream ForkRepository, notifier.go:86-91): emitted once
     // the fork is servable, gated on the settle's CAS so an at-least-once
@@ -217,18 +237,48 @@ export async function replicateRepoCopy(env: Env, source: RepoRow, fork: RepoRow
  * event's exactly-once gate (and the generate route's settle; upstream
  * GenerateRepository flips RepositoryBeingMigrated → RepositoryReady at the
  * end of the same flow, template.go:181-187).
+ *
+ * `options.countTowardSourceId` opts the FORK TALLY in (migration 0031
+ * `repositories.num_forks`; the fork consumer passes the source's id, the
+ * template-generate callers pass nothing — upstream counts forks at
+ * ForkRepository only, services/repository/fork.go:110-113, never in
+ * GenerateRepository). The increment PRECEDES the CAS inside the same D1
+ * batch (one implicit transaction) and is guarded by the fork row still
+ * being 'creating' — the guard is evaluated against the pre-CAS state, so
+ * it rises and falls together with the CAS's own predicate: first delivery
+ * bumps exactly once, a redelivery (row already 'ready') matches zero rows
+ * on both statements, and a concurrently-vanished fork row leaves both
+ * inert. A vanished SOURCE row likewise matches nothing — the orphaned-shell
+ * settle rides through unchanged.
  */
 export async function settleForkRow(
   db: DrizzleD1Database,
   fork: RepoRow,
   sourceEmpty: boolean,
+  options?: { countTowardSourceId?: string },
 ): Promise<boolean> {
-  const settled = await db
+  const settle = db
     .update(repositories)
     .set({ status: "ready", isEmpty: sourceEmpty, updatedAt: new Date() })
-    .where(and(eq(repositories.id, fork.id), eq(repositories.status, "creating")))
-    .run();
-  return (settled.meta.changes ?? 0) > 0;
+    .where(and(eq(repositories.id, fork.id), eq(repositories.status, "creating")));
+  if (options?.countTowardSourceId === undefined) {
+    const settled = await settle.run();
+    return (settled.meta.changes ?? 0) > 0;
+  }
+  const sourceId = options.countTowardSourceId;
+  const results = await db.batch([
+    db
+      .update(repositories)
+      .set({ numForks: sql`num_forks + 1` })
+      .where(
+        and(
+          eq(repositories.id, sourceId),
+          sql`EXISTS (SELECT 1 FROM repositories WHERE id = ${fork.id} AND status = 'creating')`,
+        ),
+      ),
+    settle,
+  ]);
+  return (results[1]?.meta.changes ?? 0) > 0;
 }
 
 /**

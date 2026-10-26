@@ -471,6 +471,28 @@ describe("user blocks", () => {
     const row = await db().select().from(repositories).where(eq(repositories.id, aliceRepo.repoId)).get();
     expect(row).toMatchObject({ numStars: 0, numWatches: 0 }); // floored, never negative
   });
+
+  it("the cascade moves the per-USER tallies too — each starrer loses one num_stars (migration 0031: block.go:172-175 → star.go:62)", async () => {
+    const { alice, bob, carol } = await seedWorld();
+    const aliceRepo = await seedRepo(alice);
+    const bobRepo = await seedRepo(bob);
+    await db().insert(stars).values([
+      { userId: bob.id, repoId: aliceRepo.repoId, createdAt: new Date() }, // bob stars alice's repo
+      { userId: alice.id, repoId: bobRepo.repoId, createdAt: new Date() }, // alice stars bob's repo
+      { userId: carol.id, repoId: aliceRepo.repoId, createdAt: new Date() }, // unrelated pair — survives
+    ]);
+    // The maintained tallies mirror the live edges (what the route arms
+    // counted up to this block): one star each.
+    for (const id of [alice.id, bob.id, carol.id]) {
+      await db().update(users).set({ numStars: 1 }).where(eq(users.id, id));
+    }
+    const res = await put("/api/v1/user/blocks/bob", alice.id);
+    expect(res.status).toBe(204);
+    const rows = await db().select().from(users).all();
+    expect(rows.find((row) => row.id === alice.id)).toMatchObject({ numStars: 0 }); // her edge on bob's repo removed
+    expect(rows.find((row) => row.id === bob.id)).toMatchObject({ numStars: 0 }); // his edge on alice's repo removed
+    expect(rows.find((row) => row.id === carol.id)).toMatchObject({ numStars: 1 }); // untouched by the cascade
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -438,20 +438,22 @@ export async function unblockUser(
  *     repos/service.ts cancelTransfer convention).
  *
  * Counter maintenance (the migration-0030 `repositories.num_stars` /
- * `num_watches` columns): upstream's cascade decrements THROUGH the same
- * services the routes use — unstarRepos calls StarRepo(false) per repo
- * (block.go:172-175 → star.go:59's `num_stars = num_stars - 1`) and
- * unwatchRepos calls WatchRepoAuto(false) per repo (block.go:206-209 →
- * watch.go:153's repoWatchDelta) — so each removed edge moves its repo's
- * counter by exactly -1. The set-based port matches that arithmetic: each
- * edge delete is PRECEDED by one counter UPDATE in the same batch (one
- * implicit transaction) that subtracts the still-present edge count for its
- * own (starrer/watcher, owner) scope — update-before-delete, because the
- * count subquery must see the rows its delete is about to remove. The four
- * (party, owner) scopes are pairwise disjoint, so interleaving order is
- * immaterial. MAX(…, 0) floors the drift a pre-0030 backfill row could
- * carry (counter 0 beneath surviving edges — the same floor posture as the
- * route arms in services/stars.ts / services/repo-watchers.ts).
+ * `num_watches` + 0031 `users.num_stars` columns): upstream's cascade
+ * decrements THROUGH the same services the routes use — unstarRepos calls
+ * StarRepo(false) per repo (block.go:172-175 → star.go:59's repo decrement
+ * AND star.go:62's doer decrement — the per-USER twin moves with the same
+ * removed edge) and unwatchRepos calls WatchRepoAuto(false) per repo
+ * (block.go:206-209 → watch.go:153's repoWatchDelta) — so each removed edge
+ * moves its repo's counter by exactly -1 and the starrer's user counter by
+ * exactly -1. The set-based port matches that arithmetic: each edge delete
+ * is PRECEDED by one counter UPDATE in the same batch (one implicit
+ * transaction) that subtracts the still-present edge count for its own
+ * (starrer/watcher, owner) scope — update-before-delete, because the count
+ * subquery must see the rows its delete is about to remove. The (party,
+ * owner) scopes are pairwise disjoint, so interleaving order is immaterial.
+ * MAX(…, 0) floors the drift a pre-0030/0031 backfill row could carry
+ * (counter 0 beneath surviving edges — the same floor posture as the route
+ * arms in services/stars.ts / services/repo-watchers.ts).
  */
 function cleanupBlockRelations(
   db: DrizzleD1Database,
@@ -481,6 +483,21 @@ function cleanupBlockRelations(
         ), 0)`,
       })
       .where(inArray(repositories.id, reposOwnedBy(ownerId)));
+  /** The per-USER twin (migration 0031 `users.num_stars`): upstream's
+   *  unstarRepos → StarRepo(false) decrements the STARRER's tally with the
+   *  same removed edges (star.go:62). Same update-before-delete posture as
+   *  the repo arms; one row per party, disjoint from every other statement. */
+  const dropUserStarsFor = (party: number, ownerId: number) =>
+    db
+      .update(users)
+      .set({
+        numStars: sql`MAX(num_stars - (
+          SELECT COUNT(*) FROM stars
+          WHERE user_id = ${party}
+            AND repo_id IN (SELECT owned.id FROM repositories AS owned WHERE owned.owner_id = ${ownerId})
+        ), 0)`,
+      })
+      .where(eq(users.id, party));
   const dropWatchesFor = (party: number, ownerId: number) =>
     db
       .update(repositories)
@@ -501,8 +518,10 @@ function cleanupBlockRelations(
       ),
     ),
     dropStarsFor(a, b),
+    dropUserStarsFor(a, b),
     db.delete(stars).where(and(eq(stars.userId, a), inArray(stars.repoId, reposOwnedBy(b)))),
     dropStarsFor(b, a),
+    dropUserStarsFor(b, a),
     db.delete(stars).where(and(eq(stars.userId, b), inArray(stars.repoId, reposOwnedBy(a)))),
     dropWatchesFor(a, b),
     db.delete(repoWatchers).where(and(eq(repoWatchers.userId, a), inArray(repoWatchers.repoId, reposOwnedBy(b)))),

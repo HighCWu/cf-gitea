@@ -53,7 +53,12 @@ export function toApiUser(viewer: Viewer, row: UserRow): User {
     visibility: "public", // TODO(SPEC-0007): user visibility column
     followers_count: 0, // TODO(SPEC-0005): social counters
     following_count: 0,
-    starred_repos_count: 0,
+    // Upstream renders the maintained column (user.go:80-118 → StarredRepos,
+    // modules/structs/user.go:60; models/user/user.go:155), not a live
+    // count: the star/unstar batches bump it beside the edge
+    // (services/stars.ts, star.go:48/62), as does the block cascade
+    // (services/blocks.ts). Migration 0031's users.num_stars.
+    starred_repos_count: row.numStars,
   };
 }
 
