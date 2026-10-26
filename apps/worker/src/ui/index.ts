@@ -616,7 +616,7 @@ import { AssetBuildError, loadManifest } from "./manifest";
 import { parsePageNumber, pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
-import { sameOriginGuard } from "./session";
+import { sameOriginGuard, sessionSetCookie } from "./session";
 import { blobRedirectResponse, isFetchActionRequest, treeRedirectResponse } from "./pages/repo-home";
 import {
   loadReleaseDownload,
@@ -2688,7 +2688,11 @@ async function resolveUiSession(c: Context<{ Bindings: Env }>): Promise<Resolved
   try {
     const manifest = await loadManifest(assetsBinding(c.env), url.origin);
     const resolution = await resolveViewer(c.env, c.req.raw, { waitUntil });
-    setCookie = resolution.setCookie;
+    // resolveViewer's setCookie is the RAW session value (id:secret) on
+    // authenticated rotation — re-wrap it into the gitea_session directive
+    // before it reaches a response (the attachments seam's §2.4 posture;
+    // the raw append emitted a nameless cookie).
+    setCookie = resolution.setCookie === null ? null : sessionSetCookie(resolution.setCookie, false);
     viewer = resolution.viewer;
     // The wave-10 navbar bell's unread count (head_navbar_icons.tmpl's
     // `.notification_count`): the derived-thread COUNT per signed-in request
