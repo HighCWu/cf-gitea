@@ -1,15 +1,22 @@
 /**
- * The ADMIN MONITOR family's tests (the bench-row UNMOUNTED module — the
- * org-settings-blocked.test.tsx harness): the stats/queue loaders over real
- * D1 (generated migrations in beforeAll; the counts read the same tables the
- * API families write), the cron registry/parse/apply matrix (the run arm
- * drives the landed `enqueueDueMirrorSyncs` producer against a recording
- * queue — the sync.test.ts stub), and the DOM contract of the four page
- * renders — hono/jsx renderToString, the module driven directly (no route
- * yet: the HANDOFF NOTE in the module header).
+ * The ADMIN MONITOR family's tests (the bench-row module, MOUNTED since
+ * window-2c e31c0cf — GET /-/admin/monitor/{stats,cron,queue,stacktrace} +
+ * POST cron at ui/index.ts): the stats/queue loaders over real D1 (generated
+ * migrations in beforeAll; the counts read the same tables the API families
+ * write), the cron registry/parse/apply matrix (the run arm drives the landed
+ * `enqueueDueMirrorSyncs` producer against a recording queue — the
+ * sync.test.ts stub), and the DOM contract of the four page renders —
+ * hono/jsx renderToString, the module driven directly. The deferred-test
+ * matrix also drives the real routes (the org-blocked matrix's minted-session
+ * uiRouter pattern): the adminPagePrologue's anonymous-303 / non-admin-404-
+ * shell posture on GET and POST, the admin's four 200s with each pageClass
+ * discriminator, the cron run POST's no-JS re-render with the positive flash
+ * (op=update_mirrors) and the unknown-op negative flash, the guard-first
+ * cross-origin 403, and the route-claim pin (the bare monitor tail, junk
+ * page names and deeper tails unclaimed → the engine's 404).
  */
 
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
@@ -29,6 +36,8 @@ import {
   webhooks,
 } from "../../db/schema";
 import type { UiManifest } from "../manifest";
+import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { shellAssetsFromManifest } from "../ui-context";
 import type { UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
@@ -68,7 +77,9 @@ const ctx: UiContext = { viewer, origin: ORIGIN, assets: shellAssetsFromManifest
 
 const AT = new Date("2026-01-01T00:00:00Z");
 
-/** Tables the fixtures write (the blocked-users harness's cleanup list). */
+/** Tables the fixtures write (the blocked-users harness's cleanup list;
+ *  "sessions" explicit — the mounted-route matrix below mints session rows,
+ *  the applications-tab reset's posture). */
 const FIXTURE_TABLES = [
   "comments",
   "follows",
@@ -78,6 +89,7 @@ const FIXTURE_TABLES = [
   "releases",
   "repo_mirrors",
   "repositories",
+  "sessions",
   "users",
   "webhook_deliveries",
   "webhooks",
@@ -456,5 +468,251 @@ describe("the fixture store", () => {
       .run();
     const rows = await drizzle(env.DB).select().from(users).all();
     expect(rows).toHaveLength(1);
+  });
+});
+
+// --- the mounted-route harness (window-2c e31c0cf; the blocked-users-matrix pattern) --
+
+type RouteEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+
+/** MIRROR_SYNC_QUEUE stub — records sendBatch bodies (the sync.test.ts
+ *  shape, the describe above's local twin) so the cron run POST's producer
+ *  enqueue is observed hermetically, never the miniflare queue. */
+function routeRecordingQueue(): Queue & { batches: unknown[][] } {
+  const metadata = { metrics: { backlogCount: 0, backlogBytes: 0 } };
+  const batches: unknown[][] = [];
+  return {
+    batches,
+    send: () => Promise.resolve({ metadata }),
+    sendBatch: (messages: MessageSendRequest[]) => {
+      batches.push(messages.map((m) => m.body));
+      return Promise.resolve({ metadata });
+    },
+    metrics: () => Promise.resolve({ backlogCount: 0, backlogBytes: 0 }),
+  };
+}
+
+const routeQueue = routeRecordingQueue();
+const routeEnv: RouteEnv = {
+  ...env,
+  MIRROR_SYNC_QUEUE: routeQueue,
+  ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
+};
+
+/** The real production path: parse → resolveUiSession → the admin prologue →
+ *  load → render, on the mounted uiRouter with the synthetic manifest; the
+ *  execution context is awaited so waitUntil side-effects settle before
+ *  assertions. */
+async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
+/** A minted session cookie header for the user id (the real mintSession
+ *  path, minted per request — the beforeEach users wipe cascades the
+ *  sessions table, so a cross-test cache would go stale; the value is never
+ *  rendered). */
+async function sessionHeader(userId: number): Promise<string> {
+  return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+}
+
+/** A principal row (`isAdmin` decides the admin prologue's gate — the
+ *  flag is re-read from the users row per request, so it lives in the
+ *  seed); returns the fresh id (never hardcoded). */
+async function seedPrincipal(username: string, isAdmin: boolean): Promise<number> {
+  const rows = await drizzle(env.DB)
+    .insert(users)
+    .values({ username, usernameLower: username.toLowerCase(), isAdmin, createdAt: AT })
+    .returning({ id: users.id })
+    .all();
+  return rows[0]!.id;
+}
+
+async function adminSessionHeader(): Promise<string> {
+  return sessionHeader(await seedPrincipal("root", true));
+}
+
+/** The admin's GET of one monitor page through the real route. */
+async function monitorGet(path: string): Promise<Response> {
+  return fetchUi(path, { headers: { cookie: await adminSessionHeader() } });
+}
+
+/** A urlencoded POST to the cron page through the real route (default: the
+ *  browser's same-origin Origin header — the §2.8 guard's happy path — and
+ *  an admin cookie). */
+async function cronPost(fields: Record<string, string>, cookie?: string, origin: string = ORIGIN): Promise<Response> {
+  return fetchUi("/-/admin/monitor/cron", {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin,
+      ...(cookie === undefined ? {} : { cookie }),
+    },
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
+/** One seeded due pull mirror (idle + due a minute ago — the route's run arm
+ *  executes the producer on the real clock, unlike the apply describe's
+ *  injected `now`). */
+async function seedRouteDueMirror(): Promise<void> {
+  await drizzle(env.DB)
+    .insert(repoMirrors)
+    .values({
+      repoId: "7401",
+      remoteAddress: "https://src.test/owner/repo.git",
+      intervalSeconds: 600,
+      nextSyncAt: Math.floor(Date.now() / 1000) - 60,
+      syncState: "idle",
+    })
+    .run();
+}
+
+// --- the mounted routes (window-2c: GET monitor/{stats,cron,queue,stacktrace} + POST cron) ---
+
+describe("the mounted monitor routes (GET stats/cron/queue/stacktrace + POST cron)", () => {
+  beforeEach(() => {
+    routeQueue.batches.length = 0; // the recorder is a module const — reset per test
+  });
+
+  it("303s an anonymous GET onto the login round-trip (the admin prologue's SignInRequired arm)", async () => {
+    const res = await fetchUi("/-/admin/monitor/stats");
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent("/-/admin/monitor/stats")}`);
+  });
+
+  it("303s an anonymous same-origin cron POST onto the login round-trip too (guard passes, then the gate; nothing enqueued)", async () => {
+    await seedRouteDueMirror();
+    const res = await cronPost({ op: "update_mirrors", from: "monitor" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent("/-/admin/monitor/cron")}`);
+    expect(routeQueue.batches).toEqual([]);
+    const row = await drizzle(env.DB).select().from(repoMirrors).all();
+    expect(row[0]!.syncState).toBe("idle");
+  });
+
+  it("404-shells a signed-in non-admin's GET (the AdminRequired hidden-surface posture)", async () => {
+    const cookie = await sessionHeader(await seedPrincipal("bob", false));
+    const res = await fetchUi("/-/admin/monitor/stats", { headers: { cookie } });
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain("status-page-error"); // the 404 shell
+    expect(html).not.toContain("page-content admin monitor"); // never the monitor content
+  });
+
+  it("404-shells a signed-in non-admin's cron POST before any write (the gate fronts the write arm too)", async () => {
+    await seedRouteDueMirror();
+    const cookie = await sessionHeader(await seedPrincipal("bob", false));
+    const res = await cronPost({ op: "update_mirrors", from: "monitor" }, cookie);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+    expect(routeQueue.batches).toEqual([]);
+    const row = await drizzle(env.DB).select().from(repoMirrors).all();
+    expect(row[0]!.syncState).toBe("idle"); // untouched
+  });
+
+  it("renders the admin's stats GET at 200 with the monitor pageClass and the active nav item", async () => {
+    const res = await monitorGet("/-/admin/monitor/stats");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content admin monitor"'); // the §2.4.1 discriminator
+    expect(html).toContain('class="active item" href="/-/admin/monitor/stats"');
+    expect(html).toContain(`>${adminMonitorLocale.statistic}</h4>`); // the Summary header
+  });
+
+  it("renders the admin's cron GET at 200 with the run form and no flash", async () => {
+    const res = await monitorGet("/-/admin/monitor/cron");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content admin monitor"');
+    expect(html).toContain('class="active item" href="/-/admin/monitor/cron"');
+    expect(html).toContain('action="/-/admin/monitor/cron"'); // the POST-to-page-URL divergence
+    expect(html).toContain(`>${adminMonitorLocale.cron}</h4>`);
+    expect(html).not.toContain('class="ui positive message"'); // flash: null on GET
+    expect(html).not.toContain('class="ui negative message"');
+  });
+
+  it("renders the admin's queue GET at 200 with the landed queue rows", async () => {
+    const res = await monitorGet("/-/admin/monitor/queue");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content admin monitor"');
+    expect(html).toContain('class="active item" href="/-/admin/monitor/queue"');
+    expect(html).toContain(`>${adminMonitorLocale.queues}</h4>`);
+    expect(html).toContain("<td>webhook-delivery</td>");
+  });
+
+  it("renders the admin's stacktrace GET at 200 with the honest-absence note", async () => {
+    const res = await monitorGet("/-/admin/monitor/stacktrace");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content admin monitor"');
+    expect(html).toContain('class="active item" href="/-/admin/monitor/stacktrace"');
+    expect(html).toContain(adminMonitorLocale.traceUnavailable);
+  });
+
+  it("a known-op cron POST re-renders at 200 with the positive flash and enqueues (the mirror row flips queued)", async () => {
+    await seedRouteDueMirror();
+    const res = await cronPost({ op: "update_mirrors", from: "monitor" }, await adminSessionHeader());
+    expect(res.status).toBe(200); // the no-JS re-render (upstream redirects; no flash queue)
+    const html = await res.text();
+    expect(html).toContain('class="ui positive message"');
+    expect(html).toContain("Started Task: Update Mirrors"); // task.started over the locale name
+    expect(routeQueue.batches).toEqual([[{ kind: "mirror-sync", repoId: "7401" }]]);
+    const row = await drizzle(env.DB).select().from(repoMirrors).all();
+    expect(row[0]!.syncState).toBe("queued"); // run = enqueue + the CAS claim
+  });
+
+  it("an unknown-op cron POST re-renders at 200 with the negative flash and never enqueues", async () => {
+    await seedRouteDueMirror();
+    const res = await cronPost({ op: "destroy_old_packages", from: "monitor" }, await adminSessionHeader());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="ui negative message"');
+    expect(html).toContain("Unknown task: destroy_old_packages"); // task.unknown carries the raw op
+    expect(routeQueue.batches).toEqual([]);
+    const row = await drizzle(env.DB).select().from(repoMirrors).all();
+    expect(row[0]!.syncState).toBe("idle"); // untouched
+  });
+
+  it("rejects a cross-origin cron POST with 403 before any write (sameOriginGuard first)", async () => {
+    await seedRouteDueMirror();
+    const res = await cronPost(
+      { op: "update_mirrors", from: "monitor" },
+      await adminSessionHeader(),
+      "https://evil.example",
+    );
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("cross-origin request rejected");
+    expect(routeQueue.batches).toEqual([]);
+    const row = await drizzle(env.DB).select().from(repoMirrors).all();
+    expect(row[0]!.syncState).toBe("idle"); // nothing was written
+  });
+});
+
+// --- the route claim pin (parse ↔ registration — the blocked-users-matrix pin) ------
+
+describe("the route claim pin (the admin family claims the four monitor pages only)", () => {
+  it("parses the four page shapes with their page discriminators", () => {
+    expect(parseUiRoute("/-/admin/monitor/stats")).toEqual({ family: "admin-monitor", page: "stats" });
+    expect(parseUiRoute("/-/admin/monitor/cron")).toEqual({ family: "admin-monitor", page: "cron" });
+    expect(parseUiRoute("/-/admin/monitor/queue")).toEqual({ family: "admin-monitor", page: "queue" });
+    expect(parseUiRoute("/-/admin/monitor/stacktrace")).toEqual({ family: "admin-monitor", page: "trace" });
+    expect(handlesUiRoute("/-/admin/monitor/stats")).toBe(true);
+    expect(handlesUiRoute("/-/admin/monitor/cron")).toBe(true);
+    expect(handlesUiRoute("/-/admin/monitor/queue")).toBe(true);
+    expect(handlesUiRoute("/-/admin/monitor/stacktrace")).toBe(true);
+  });
+
+  it("the bare monitor tail, junk page names and deeper tails stay unclaimed — the engine's 404", async () => {
+    for (const path of ["/-/admin/monitor", "/-/admin/monitor/statz", "/-/admin/monitor/stats/extra"]) {
+      expect(parseUiRoute(path)).toBeNull();
+      expect(handlesUiRoute(path)).toBe(false); // the dispatcher passes it to the engine
+      const res = await fetchUi(path);
+      expect(res.status).toBe(404);
+      expect(await res.text()).not.toContain("page-content admin monitor");
+    }
   });
 });
