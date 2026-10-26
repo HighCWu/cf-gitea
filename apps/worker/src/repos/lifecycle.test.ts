@@ -695,6 +695,90 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
     return SELF.fetch(`https://example.com/${owner}/${name}.git/info/refs?service=git-upload-pack`);
   }
 
+  // --- packed-tag pack builder (local to this file: the shared
+  // src/repos/testing/git-pack.ts helper stays blob/tree/commit-only, and the
+  // OBJ_TAG entry class is only needed by the packed-tag arms below) ---
+
+  async function sha1hex(bytes: Uint8Array): Promise<string> {
+    return [...new Uint8Array(await crypto.subtle.digest("SHA-1", bytes))]
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  async function deflate(bytes: Uint8Array): Promise<Uint8Array> {
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  function objHeader(type: number, size: number): Uint8Array {
+    const bytes: number[] = [];
+    let first = (type << 4) | (size & 0x0f);
+    let rest = size >> 4;
+    while (rest > 0) {
+      bytes.push(first | 0x80);
+      first = rest & 0x7f;
+      rest >>= 7;
+    }
+    bytes.push(first);
+    return new Uint8Array(bytes);
+  }
+
+  function be32(value: number): Uint8Array {
+    return new Uint8Array([(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff]);
+  }
+
+  function concatParts(parts: Uint8Array[]): Uint8Array {
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) {
+      out.set(p, offset);
+      offset += p.length;
+    }
+    return out;
+  }
+
+  /** One self-contained push payload: blob→tree→commit→tag (a REAL annotated
+   *  tag object over the commit — the pushed, hence PACKED, tag shape the
+   *  tags API cannot produce) plus the pack that carries all four. */
+  async function buildTaggedPack(): Promise<{ commitOid: string; tagOid: string; pack: Uint8Array }> {
+    const blob = new TextEncoder().encode("hello packed tag\n");
+    const blobOid = await sha1hex(concatParts([new TextEncoder().encode(`blob ${blob.length}\0`), blob]));
+    const treeBody = concatParts([new TextEncoder().encode("100644 file.txt\0"), rawOidOf(blobOid)]);
+    const treeOid = await sha1hex(concatParts([new TextEncoder().encode(`tree ${treeBody.length}\0`), treeBody]));
+    const time = 1700000000;
+    const commitBody = new TextEncoder().encode(
+      `tree ${treeOid}\n` +
+        `author Packer <packer@example.com> ${time} +0000\n` +
+        `committer Packer <packer@example.com> ${time} +0000\n\n` +
+        "packed-tag root\n",
+    );
+    const commitOid = await sha1hex(concatParts([new TextEncoder().encode(`commit ${commitBody.length}\0`), commitBody]));
+    const tagBody = new TextEncoder().encode(
+      `object ${commitOid}\ntype commit\ntag v1\ntagger Packer <packer@example.com> ${time + 1} +0000\n\npacked release\n`,
+    );
+    const tagOid = await sha1hex(concatParts([new TextEncoder().encode(`tag ${tagBody.length}\0`), tagBody]));
+    const entries = [
+      { type: 3, body: blob }, // OBJ_BLOB
+      { type: 2, body: treeBody }, // OBJ_TREE
+      { type: 1, body: commitBody }, // OBJ_COMMIT
+      { type: 4, body: tagBody }, // OBJ_TAG
+    ];
+    const chunks: Uint8Array[] = [new TextEncoder().encode("PACK"), be32(2), be32(entries.length)];
+    for (const entry of entries) {
+      chunks.push(objHeader(entry.type, entry.body.length));
+      chunks.push(await deflate(entry.body));
+    }
+    chunks.push(new Uint8Array(await crypto.subtle.digest("SHA-1", concatParts(chunks))));
+    return { commitOid, tagOid, pack: concatParts(chunks) };
+  }
+
+  function rawOidOf(oidHex: string): Uint8Array {
+    const raw = new Uint8Array(20);
+    for (let i = 0; i < 20; i++) raw[i] = parseInt(oidHex.slice(i * 2, i * 2 + 2), 16);
+    return raw;
+  }
+
   it("rename carries the cell: the NEW url's advertisement lists the pushed refs immediately", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
@@ -923,6 +1007,95 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
     const after = await env.REPO.getByName("alice/yoyo").listRefs();
     expect(after.refs.map((r) => [r.name, r.target])).toEqual([["refs/heads/main", oid]]);
     expect((await uploadAdvert("alice", "yoyo")).status).toBe(200);
+  });
+
+  // The 6c54c1a corner, closed: an ANNOTATED tag created through the tags API
+  // lands its tag OBJECT loose (serializeTag → putApiObjects — the pack
+  // catalog never sees it), and the carry's ref partition used to exclude the
+  // ref outright (no raw-byte read RPC). The carry now re-materializes the
+  // tag object Worker-side; the fidelity limit (tagger/message unrecoverable,
+  // so the materialized oid differs) is carry.ts's module doc.
+  it("rename carries a LOOSE annotated tag (re-materialized: same peel, documented new oid)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const created = await SELF.fetch("https://example.com/api/v1/user/repos", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/json" },
+      body: JSON.stringify({ name: "carry-loosetag", private: false, auto_init: true }),
+    });
+    expect(created.status).toBe(201);
+    // The annotated tag through the REAL tags API (the only loose-tag writer).
+    const tagged = await SELF.fetch("https://example.com/api/v1/repos/alice/carry-loosetag/tags", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/json" },
+      body: JSON.stringify({ tag_name: "v1", message: "release one" }),
+    });
+    expect(tagged.status).toBe(200);
+
+    const before = await env.REPO.getByName("alice/carry-loosetag").listRefs();
+    const main = before.refs.find((r) => r.name === "refs/heads/main");
+    const tag = before.refs.find((r) => r.name === "refs/tags/v1");
+    expect(tag?.peeled).toBe(main?.target);
+    // producer sanity: the tag object is LOOSE — zero pack-catalog rows
+    expect((await env.REPO.getByName("alice/carry-loosetag").listCatalogPage("", 10)).packs).toEqual([]);
+
+    const repo = await service().getBySlug("alice", "carry-loosetag");
+    if (repo === null) throw new Error("repo missing");
+    await service().rename(repo.id, "carry-loosetag2");
+
+    // RED at HEAD: the tag ref was dropped from the carried set entirely.
+    const after = await env.REPO.getByName("alice/carry-loosetag2").listRefs();
+    const carriedTag = after.refs.find((r) => r.name === "refs/tags/v1");
+    expect(carriedTag).toBeDefined();
+    if (carriedTag === undefined || tag === undefined) throw new Error("unreachable");
+    // Fidelity limit (carry.ts module doc): the materialized oid differs from
+    // the source's tag oid (the original carried a tagger + message; no read
+    // RPC recovers them) — the NAME and the PEEL are identical.
+    expect(carriedTag.target).not.toBe(tag.target);
+    expect(carriedTag.peeled).toBe(tag.peeled);
+    // The peel resolves through a real object walk in the new cell (finalize's
+    // store.has bar + the engine's parse of the re-materialized bytes).
+    expect((await env.REPO.getByName("alice/carry-loosetag2").readCommit(carriedTag.target))?.oid).toBe(tag.peeled);
+    // HEAD still names the carried branch (not the tag).
+    expect(after.head).toBe("refs/heads/main");
+  });
+
+  // The partition's packed class: a PUSHED annotated tag rides the adopted
+  // packs byte-identically, and its ref must carry too — the pre-fix
+  // partition excluded every peeled ref from the finalize input, so even
+  // packed-tag refs (whose bytes the pack channel brought) vanished on rename.
+  it("rename carries a PACKED annotated tag ref byte-identically (the pack channel)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "carry-packedtag");
+    const { commitOid, tagOid, pack } = await buildTaggedPack();
+    const push = await SELF.fetch("https://example.com/alice/carry-packedtag.git/git-receive-pack", {
+      method: "POST",
+      headers: {
+        authorization: basicTokenHeader(token),
+        "content-type": "application/x-git-receive-pack-request",
+      },
+      body: buildReceivePackBody(
+        [
+          { ref: "refs/heads/main", oid: commitOid },
+          { ref: "refs/tags/v1", oid: tagOid },
+        ],
+        pack,
+      ),
+    });
+    expect(push.status).toBe(200);
+
+    const before = await env.REPO.getByName("alice/carry-packedtag").listRefs();
+    expect(before.refs.find((r) => r.name === "refs/tags/v1")).toEqual({ name: "refs/tags/v1", target: tagOid, peeled: commitOid });
+
+    await service().rename(repo.id, "carry-packedtag2");
+
+    // RED at HEAD: the peeled ref was excluded from the carried set even
+    // though its object bytes rode the adopted packs — finalize never
+    // re-created the ref. The new cell must list the SAME tag oid (no
+    // re-materialization for the packed class) and re-peel from the bytes.
+    const after = await env.REPO.getByName("alice/carry-packedtag2").listRefs();
+    expect(after.refs.find((r) => r.name === "refs/tags/v1")).toEqual({ name: "refs/tags/v1", target: tagOid, peeled: commitOid });
   });
 });
 

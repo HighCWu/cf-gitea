@@ -36,10 +36,11 @@ import { RepoService } from "../../repos/service";
 import { buildPack, buildReceivePackBody } from "../../repos/testing/git-pack";
 import { users } from "../../db/schema";
 import { createUserRepository } from "../services/user-repos";
-import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
+import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import type { ApiEnv } from "../env";
 import { giteaErrorHandler } from "../errors";
 import { registerGenerateRepoRoute } from "./generate-repo";
+import { registerTagRoutes } from "./tags";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -69,11 +70,13 @@ const CHIEF_TOKEN = "token-chief";
 let resolver: AuthResolver = { resolveToken: () => Promise.resolve(null) };
 
 /** Standalone mount (paths strip the /api/v1 prefix); the resolver is built
- *  per-test from the seeded users. */
+ *  per-test from the seeded users. The tags family rides along so the loose
+ *  annotated-tag arms can create tags through the REAL tags API. */
 function router() {
   const app = new OpenAPIHono<ApiEnv>();
   app.onError(giteaErrorHandler);
   registerGenerateRepoRoute(app, createTokenAuthMiddleware(resolver));
+  registerTagRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
   return async (path: string, init?: RequestInit): Promise<Response> =>
     app.fetch(new Request(`https://example.com${path.replace(/^\/api\/v1/, "")}`, init), env);
 }
@@ -451,5 +454,68 @@ describe("generateRepo content copy (the shared fork machinery)", () => {
     const refs = await env.REPO.getByName("alice/fork-init").listRefs();
     expect(refs.refs).toEqual([{ name: "refs/heads/main", target: commitOid }]);
     expect(await env.REPO.getByName("alice/fork-init").readCommit(commitOid)).not.toBeNull();
+  });
+
+  // The third loose class (the corner 6c54c1a documented): an ANNOTATED tag
+  // created through the tags API lands its tag OBJECT loose (serializeTag →
+  // putApiObjects — zero pack-catalog rows), and the copy's ref partition
+  // used to exclude the ref outright (no raw-byte read RPC for tag objects).
+  // The copy now re-materializes it Worker-side; the fidelity limit (the
+  // materialized oid differs — tagger/message unrecoverable) is carry.ts's
+  // module doc; the contract here: same name, SAME peel, resolves.
+  it("copies an auto_init template's LOOSE annotated tag (re-materialized; same peel)", { timeout: 120_000 }, async () => {
+    await seedIdentities();
+    const { commitOid } = await autoInitTemplate("alice", "tpl-loosetag");
+    const tagged = await router()(
+      "/api/v1/repos/alice/tpl-loosetag/tags",
+      aliceAuth({ method: "POST", body: JSON.stringify({ tag_name: "v1", message: "release one" }) }),
+    );
+    expect(tagged.status).toBe(200);
+    const sourceTag = (await env.REPO.getByName("alice/tpl-loosetag").listRefs()).refs.find((r) => r.name === "refs/tags/v1");
+    expect(sourceTag?.peeled).toBe(commitOid);
+    await markTemplate("alice", "tpl-loosetag");
+
+    const res = await router()(
+      "/api/v1/repos/alice/tpl-loosetag/generate",
+      aliceAuth({ method: "POST", body: JSON.stringify({ name: "copy-loosetag", git_content: true }) }),
+    );
+    expect(res.status).toBe(201);
+
+    const row = await new RepoService(env.DB).getBySlug("alice", "copy-loosetag");
+    expect(row?.status).toBe("ready");
+    expect(row?.isEmpty).toBe(false);
+    // RED at HEAD: the tag ref was excluded from completeLooseImport — the
+    // generated repo had no refs/tags/v1 at all.
+    const refs = await env.REPO.getByName("alice/copy-loosetag").listRefs();
+    const carriedTag = refs.refs.find((r) => r.name === "refs/tags/v1");
+    expect(carriedTag).toBeDefined();
+    if (carriedTag === undefined || sourceTag === undefined) throw new Error("unreachable");
+    expect(carriedTag.peeled).toBe(commitOid);
+    expect(carriedTag.target).not.toBe(sourceTag.target); // the materialized oid (fidelity limit)
+    expect((await env.REPO.getByName("alice/copy-loosetag").readCommit(carriedTag.target))?.oid).toBe(commitOid);
+  });
+
+  // The fork consumer arm of the same corner, driven at the service level
+  // like the auto_init fork test above.
+  it("replicateRepoCopy carries a loose annotated tag into a fork cell", { timeout: 120_000 }, async () => {
+    await seedIdentities();
+    const { commitOid } = await autoInitTemplate("alice", "tpl-forktag");
+    const tagged = await router()(
+      "/api/v1/repos/alice/tpl-forktag/tags",
+      aliceAuth({ method: "POST", body: JSON.stringify({ tag_name: "v1", message: "release one" }) }),
+    );
+    expect(tagged.status).toBe(200);
+    const service = new RepoService(env.DB);
+    const fork = await service.create({ owner: { id: (await userIdOf("alice"))!, usernameLower: "alice" }, name: "fork-tag", isPrivate: false });
+
+    await replicateRepoCopy(env, (await service.get((await service.getBySlug("alice", "tpl-forktag"))!.id))!, fork);
+
+    // RED at HEAD: the fork converged on every branch but dropped the tag.
+    const refs = await env.REPO.getByName("alice/fork-tag").listRefs();
+    const carriedTag = refs.refs.find((r) => r.name === "refs/tags/v1");
+    expect(carriedTag).toBeDefined();
+    if (carriedTag === undefined) throw new Error("unreachable");
+    expect(carriedTag.peeled).toBe(commitOid);
+    expect((await env.REPO.getByName("alice/fork-tag").readCommit(carriedTag.target))?.oid).toBe(commitOid);
   });
 });

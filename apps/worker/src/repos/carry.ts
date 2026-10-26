@@ -43,15 +43,32 @@
  * and the degraded floor is the pre-fix behavior (new name serves empty until
  * a push; receivePack upserts heal the registry).
  *
- * Known corner (documented divergence): ANNOTATED tag objects have no raw-byte
- * read RPC (readCommit peels to the commit), so a ref whose tip is a tag
- * OBJECT cannot be reconstructed. Such refs are excluded from the carried ref
- * set with a loud console.error — a corner of a corner, since tags normally
- * arrive by push (packed tags carry through the pack channel fine).
+ * Annotated-tag refs (the refs row's peel column set) carry in two classes:
+ *
+ *   - PACKED tag tips carry as plain refs — the adopted packs bring the tag
+ *     object's true bytes and finalize re-peels from them (byte-identical).
+ *   - LOOSE tag tips (Worker-authored: the tags API route is the ONLY loose
+ *     tag writer — serializeTag → putApiObjects, always `object <commit>
+ *     type commit`) are RE-MATERIALIZED Worker-side through the same
+ *     serializeTag: `tag` from the ref name, `object`/`type` from the
+ *     byte-true (peeled, commit) pair. `tagger`/`message` are unrecoverable —
+ *     no read RPC exposes tag-object bytes (readCommit peels past them;
+ *     listRefs carries targets + the peel cache) — so they materialize as
+ *     null/"" (canonical git allows both absent; the landed toAnnotatedTag
+ *     rendering already reports tagger null + message "" for every annotated
+ *     tag, services/git-models.ts). FIDELITY LIMIT: the materialized oid
+ *     differs from the source's tag oid whenever the original carried a
+ *     tagger line or message (the API path always does); the carried tag has
+ *     the same name and peels to the SAME commit, while pushed/packed tags
+ *     stay byte-identical. A loose tag→tag chain is not producible by any
+ *     current surface (the tags API resolves targets through the peel);
+ *     should one appear, the same materialization still peels to the same
+ *     final commit.
  */
 
 import {
   serializeCommit,
+  serializeTag,
   serializeTree,
   type ApiObject,
   type CatalogPage,
@@ -165,18 +182,6 @@ export async function carryRepoCell(
 
   try {
     const refs = await source.listRefs();
-    const carried: { name: string; oid: string }[] = [];
-    const excluded: string[] = [];
-    for (const ref of refs.refs) {
-      if (ref.peeled !== undefined && ref.peeled !== ref.target) {
-        // Annotated tag: the tag OBJECT's bytes have no read RPC. Excluding
-        // the ref keeps the all-or-nothing finalize intact for everything
-        // else; logged below (the pack channel carries pushed tags fine).
-        excluded.push(ref.name);
-        continue;
-      }
-      carried.push({ name: ref.name, oid: ref.target });
-    }
 
     // 1. Pack catalog: page the source, adopt on the target. Same storage key
     // on both sides ⇒ R2-backed packs are already at the target's keys.
@@ -211,23 +216,24 @@ export async function carryRepoCell(
       if (!page.more) break;
     }
 
-    // 2. Loose objects: reconstruct the Worker-authored content the pack
-    // catalog does not cover (exact serialize round trip; putApiObjects
-    // re-verifies every oid on landing).
-    await carryLooseObjects(source, target, carried, packed, `${fromEngine} -> ${toEngine}`);
+    // 2 + 3. Ref partition + the loose class: packed annotated-tag tips carry
+    // as plain refs, loose ones re-materialize (module doc's fidelity note),
+    // the loose-object completion walk lands the Worker-authored content, and
+    // HEAD is confined to a carried ref (the engine validates; an
+    // annotated-tag HEAD falls back to null — the unborn-HEAD convention).
+    const { carried, head } = await carryLooseRefs(
+      source,
+      target,
+      refs.refs,
+      refs.head,
+      packed,
+      `${fromEngine} -> ${toEngine}`,
+    );
 
-    // 3. One finalizing transaction: catalog rows landed during adopt; refs +
-    // HEAD + refs_version land now and the importing gate clears. HEAD must
-    // name a carried ref (the engine validates); an annotated-tag HEAD falls
-    // back to null (the engine's unborn-HEAD convention).
-    const head = refs.head !== null && carried.some((r) => r.name === refs.head) ? refs.head : null;
+    // 4. One finalizing transaction: catalog rows landed during adopt; refs +
+    // HEAD + refs_version land now and the importing gate clears.
     const fin = await target.finalizeForkImport({ refs: carried, head });
     if (fin.tag === "invalid") fail("finalize", fromEngine, toEngine, fin.reason);
-    if (excluded.length > 0) {
-      console.error(
-        `[repos] cell carry ${fromEngine} -> ${toEngine}: annotated-tag refs not carried (no raw-byte read RPC): ${excluded.join(", ")}`,
-      );
-    }
   } catch (error) {
     // Never leave the target importing-gated: beginForkImport only re-begins
     // while importing, so a half-carried cell would 503 every later push at
@@ -251,7 +257,10 @@ export async function carryRepoCell(
  * (src/repos/fork-task.ts), which must land the same Worker-authored loose
  * class (auto_init commits, API commits — REDEPLOY12's generate 500: the
  * template's ref tips live outside the pack catalog its loop replicates).
- * `label` names the from → to pair in error text.
+ * `label` names the from → to pair in error text. `extraRoots` are additional
+ * commit-oid walk roots (carryLooseRefs passes the loose annotated tags'
+ * peeled commits — a tag can reach a commit no branch names; packed roots
+ * return immediately, the walk dedupes the rest).
  */
 export async function carryLooseObjects(
   source: CarrySource,
@@ -259,6 +268,7 @@ export async function carryLooseObjects(
   carried: { name: string; oid: string }[],
   packed: Set<string>,
   label: string,
+  extraRoots: string[] = [],
 ): Promise<void> {
   let rpcs = 0;
   let objects = 0;
@@ -331,7 +341,68 @@ export async function carryLooseObjects(
   };
 
   for (const ref of carried) await walkCommit(ref.oid);
+  for (const root of extraRoots) await walkCommit(root);
   await flush();
+}
+
+/**
+ * The ref partition + loose-class landing for a copy pass, in one call —
+ * the shared shape behind the rename/transfer carry (carryRepoCell) and the
+ * fork/generate completion (fork-task.ts completeLooseImport). PACKED
+ * annotated-tag tips carry as plain refs (their bytes ride the adopted
+ * packs); LOOSE annotated tags re-materialize through serializeTag (the
+ * module doc's fidelity note — tagger/message unrecoverable, the materialized
+ * oid differs, the peel is identical) and land via putApiObjects before the
+ * walk; their peeled commits join the walk roots. Returns the finalize
+ * input: `carried` refs and the head confined to a carried ref (null
+ * otherwise — the engine's unborn-HEAD convention).
+ */
+export async function carryLooseRefs(
+  source: CarrySource,
+  target: Pick<CarryTarget, "putApiObjects">,
+  refs: { name: string; target: string; peeled?: string }[],
+  head: string | null,
+  packed: Set<string>,
+  label: string,
+): Promise<{ carried: { name: string; oid: string }[]; head: string | null }> {
+  const carried: { name: string; oid: string }[] = [];
+  const walkable: { name: string; oid: string }[] = [];
+  const tagObjects: ApiObject[] = [];
+  const tagPeels: string[] = [];
+  for (const ref of refs) {
+    if (ref.peeled !== undefined && ref.peeled !== ref.target && !packed.has(ref.target)) {
+      // Loose annotated tag: re-materialize (module doc). The name comes off
+      // the ref (git keeps tag ref and tag-object name identical); object +
+      // type are the byte-true (peeled, commit) pair — the tags API route is
+      // the only loose-tag writer and always lands that shape.
+      const tag = serializeTag({
+        object: ref.peeled,
+        type: "commit",
+        tag: ref.name.slice("refs/tags/".length),
+        tagger: null,
+        message: "",
+      });
+      tagObjects.push({ oid: tag.oid, type: tag.type, data: tag.data });
+      carried.push({ name: ref.name, oid: tag.oid });
+      tagPeels.push(ref.peeled);
+      continue;
+    }
+    carried.push({ name: ref.name, oid: ref.target });
+    walkable.push({ name: ref.name, oid: ref.target });
+  }
+  if (tagObjects.length > 0) {
+    // putApiObjects re-verifies every oid on landing (hashObject check) — the
+    // materialization's own correctness gate.
+    const put = await target.putApiObjects(tagObjects);
+    if (put.tag !== "ok") {
+      failWalk(
+        label,
+        `putApiObjects refused the tag materialization (${put.tag}): ${put.tag === "invalid" ? put.reason : `limit ${put.limitBytes}`}`,
+      );
+    }
+  }
+  await carryLooseObjects(source, target, walkable, packed, label, tagPeels);
+  return { carried, head: head !== null && carried.some((r) => r.name === head) ? head : null };
 }
 
 /** CommitJson → canonical commit bytes: the exact serializeCommit round trip
