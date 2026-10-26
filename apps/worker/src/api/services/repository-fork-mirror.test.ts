@@ -21,6 +21,11 @@
  * Also pins the `/repos/search` `mode` arms the landed columns un-stub
  * (upstream repo.go:163-176 → repo_list.go:500-513): fork / mirror /
  * source filter their columns; `collaborative` still matches nothing.
+ * The template/archived tri-state filters over the landed `is_template`/
+ * `is_archived` columns (repo.go:155-157/181-183 → repo_list.go:391-393/
+ * 520-522) and the `original_url` render (`SanitizedOriginalURL`,
+ * convert/repository.go:215 → models/repo/repo.go:227-234) are pinned the
+ * same way.
  */
 
 import { env } from "cloudflare:workers";
@@ -42,6 +47,7 @@ import { applyOrgsDdl, resetOrgTables } from "../../services/orgs/testing";
 import {
   GO_ZERO_TIME,
   findRepositoryByPath,
+  sanitizedOriginalUrl,
   searchRepositories,
   toApiRepository,
   toApiRepositoryFull,
@@ -64,6 +70,28 @@ beforeEach(async () => {
 const NOW = new Date("2026-01-01T00:00:00Z");
 
 const anonymous: Viewer = { origin: "https://example.com", requester: null };
+
+/** The `/repos/search` option base the filter suites spread over — every
+ * tri-state filter at its "unset" default, no visibility narrowing. */
+const searchOpts = {
+  page: 1,
+  limit: 50,
+  keyword: "",
+  topicOnly: false,
+  includeDesc: false,
+  uid: 0,
+  exclusive: false,
+  priorityOwnerId: 0,
+  teamId: 0,
+  starredBy: 0,
+  includePrivate: false,
+  isPrivate: null,
+  template: null,
+  archived: null,
+  mode: "",
+  sort: "",
+  order: "",
+} as const;
 
 async function seedRepo(
   ownerId: number,
@@ -315,25 +343,6 @@ describe("/repos/search mode arms over the landed fork/mirror columns", () => {
     await seedRepo(owner.id, "searchowner", "forkling", "public", { forkParent: baseId });
     await seedRepo(owner.id, "searchowner", "copycat", "public", { isMirror: true });
 
-    const searchOpts = {
-      page: 1,
-      limit: 50,
-      keyword: "",
-      topicOnly: false,
-      includeDesc: false,
-      uid: 0,
-      exclusive: false,
-      priorityOwnerId: 0,
-      teamId: 0,
-      starredBy: 0,
-      includePrivate: false,
-      isPrivate: null,
-      template: null,
-      archived: null,
-      sort: "",
-      order: "",
-    } as const;
-
     const forkMode = await searchRepositories(env.DB, anonymous, { ...searchOpts, mode: "fork" });
     expect(forkMode.total).toBe(1);
     expect(forkMode.items.map((p) => p.repo.slug)).toEqual(["forkling"]);
@@ -352,5 +361,112 @@ describe("/repos/search mode arms over the landed fork/mirror columns", () => {
       mode: "collaborative",
     });
     expect(collaborative.total).toBe(0);
+  });
+});
+
+describe("/repos/search template/archived arms over the landed columns", () => {
+  it("template tri-state: true matches only is_template rows, false excludes them, null all (repo.go:155-157 → repo_list.go:391-393)", async () => {
+    const owner = await seedVerifiedUser({ username: "TplOwner" });
+    await seedRepo(owner.id, "tplowner", "normal", "public");
+    await seedRepo(owner.id, "tplowner", "templated", "public", { isTemplate: true });
+
+    const tplTrue = await searchRepositories(env.DB, anonymous, { ...searchOpts, template: true });
+    expect(tplTrue.total).toBe(1);
+    expect(tplTrue.items.map((p) => p.repo.slug)).toEqual(["templated"]);
+
+    const tplFalse = await searchRepositories(env.DB, anonymous, { ...searchOpts, template: false });
+    expect(tplFalse.total).toBe(1);
+    expect(tplFalse.items.map((p) => p.repo.slug)).toEqual(["normal"]);
+
+    const tplAll = await searchRepositories(env.DB, anonymous, { ...searchOpts, template: null });
+    expect(tplAll.total).toBe(2);
+  });
+
+  it("archived tri-state: true matches only is_archived rows, false excludes them, null all (repo.go:181-183 → repo_list.go:520-522)", async () => {
+    const owner = await seedVerifiedUser({ username: "ArcOwner" });
+    await seedRepo(owner.id, "arcowner", "live", "public");
+    await seedRepo(owner.id, "arcowner", "frozen", "public", { isArchived: true });
+
+    const arcTrue = await searchRepositories(env.DB, anonymous, { ...searchOpts, archived: true });
+    expect(arcTrue.total).toBe(1);
+    expect(arcTrue.items.map((p) => p.repo.slug)).toEqual(["frozen"]);
+
+    const arcFalse = await searchRepositories(env.DB, anonymous, { ...searchOpts, archived: false });
+    expect(arcFalse.total).toBe(1);
+    expect(arcFalse.items.map((p) => p.repo.slug)).toEqual(["live"]);
+
+    // Both filters compose (independent AND arms, upstream builder.And).
+    const composed = await searchRepositories(env.DB, anonymous, {
+      ...searchOpts,
+      archived: false,
+      template: false,
+    });
+    expect(composed.total).toBe(1);
+    expect(composed.items.map((p) => p.repo.slug)).toEqual(["live"]);
+
+    const arcAll = await searchRepositories(env.DB, anonymous, { ...searchOpts, archived: null });
+    expect(arcAll.total).toBe(2);
+  });
+});
+
+describe("toApiRepository — original_url (convert/repository.go:215, SanitizedOriginalURL)", () => {
+  it("a null column renders \"\" (the empty-string arm, repo.go:229-231) — plain repos", async () => {
+    const owner = await seedVerifiedUser({ username: "PlainOwner" });
+    await seedRepo(owner.id, "plainowner", "plain", "public");
+    const plain = await findRepositoryByPath(env.DB, "plainowner", "plain");
+    if (plain === null) throw new Error("fixture repo missing");
+    expect(toApiRepository(anonymous, plain).original_url).toBe("");
+  });
+
+  it("userinfo is stripped at render time (repo.go:232 → util/url.go:21-28) and the stored value survives intact", async () => {
+    const owner = await seedVerifiedUser({ username: "CredOwner" });
+    await seedRepo(owner.id, "credowner", "cred", "public", {
+      originalUrl: "https://user:secret@example.invalid/repo.git",
+    });
+    const cred = await findRepositoryByPath(env.DB, "credowner", "cred");
+    if (cred === null) throw new Error("fixture repo missing");
+    // The credential NEVER reaches the wire (the same §4.2 rule the mirror
+    // suite pins) — SanitizedOriginalURL drops u.User before re-serializing.
+    expect(toApiRepository(anonymous, cred).original_url).toBe(
+      "https://example.invalid/repo.git",
+    );
+    // Idempotent over the already-sanitized values our stores write
+    // (services/migrate.ts / services/mirror.ts `source.sanitized`): a second
+    // pass over the stripped URL is a no-op.
+    expect(sanitizedOriginalUrl("https://example.invalid/repo.git")).toBe(
+      "https://example.invalid/repo.git",
+    );
+    expect(sanitizedOriginalUrl(toApiRepository(anonymous, cred).original_url)).toBe(
+      "https://example.invalid/repo.git",
+    );
+  });
+
+  it("an unparseable value degrades to \"\" (Go's swallowed parse error → nil URL, repo.go:232-233)", async () => {
+    const owner = await seedVerifiedUser({ username: "RawOwner" });
+    await seedRepo(owner.id, "rawowner", "scp", "public", {
+      originalUrl: "git@host:owner/repo.git",
+    });
+    const scp = await findRepositoryByPath(env.DB, "rawowner", "scp");
+    if (scp === null) throw new Error("fixture repo missing");
+    expect(toApiRepository(anonymous, scp).original_url).toBe("");
+  });
+
+  it("the mirror fixture's original_url renders from the row — NOT mirror-gated but honest for mirrors too", async () => {
+    const owner = await seedVerifiedUser({ username: "MirrorOwner" });
+    await seedRepo(owner.id, "mirrorowner", "upstream", "public", {
+      isMirror: true,
+      originalUrl: "https://src.example.invalid/upstream.git",
+    });
+    const mirror = await findRepositoryByPath(env.DB, "mirrorowner", "upstream");
+    if (mirror === null) throw new Error("fixture repo missing");
+    // Upstream renders the field for ANY repo with a non-empty column
+    // (convert/repository.go:215 has no IsMirror arm; migrations set it at
+    // create for plain imports too — services/repository/create.go:236).
+    expect(toApiRepository(anonymous, mirror).original_url).toBe(
+      "https://src.example.invalid/upstream.git",
+    );
+    expect((await toApiRepositoryFull(env.DB, anonymous, mirror)).original_url).toBe(
+      "https://src.example.invalid/upstream.git",
+    );
   });
 });

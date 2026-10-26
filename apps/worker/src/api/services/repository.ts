@@ -385,6 +385,35 @@ export async function toApiRepositoryFull(
 }
 
 /**
+ * Upstream `Repository.SanitizedOriginalURL` (models/repo/repo.go:227-234):
+ * "" when the column is empty (the API model's optional field folds
+ * `undefined` in), else the URL re-serialized with its userinfo
+ * stripped (`util.SanitizeURL`, modules/util/url.go:21-28 — `u.User = nil`).
+ * Go swallows the parse error into the nil-URL "" too, so any value WHATWG
+ * `new URL` rejects (e.g. scp-style `git@host:p`) degrades to "" — upstream's
+ * lenient `url.Parse` would pass such forms through unchanged (documented
+ * divergence; our writers store sanitized absolute URLs — services/migrate.ts
+ * / services/mirror.ts `source.sanitized` — making this render pass defensive
+ * and idempotent). NOT mirror-gated: upstream renders the field for any repo
+ * with a non-empty column — migrations set OriginalURL at create for plain
+ * imports too (services/repository/create.go:236, adopt.go:57;
+ * convert/repository.go:215 has no IsMirror arm).
+ */
+export function sanitizedOriginalUrl(raw: string | null | undefined): string {
+  if (raw === null || raw === undefined || raw === "") {
+    return "";
+  }
+  try {
+    const url = new URL(raw);
+    url.username = "";
+    url.password = "";
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+/**
  * D1 → wire converter mirroring `convert.innerToRepo` for a stock repository
  * with upstream's default unit configuration (code/issues/pulls/wiki/releases
  * enabled; projects/packages/actions disabled — upstream `DefaultUnits`).
@@ -478,7 +507,11 @@ export function toApiRepository(
     link: "",
     ssh_url: `git@${sshHost}:${ownerNamespace}/${slug}.git`,
     clone_url: `${htmlUrl}.git`,
-    original_url: "",
+    // Upstream `OriginalURL: repo.SanitizedOriginalURL()`
+    // (convert/repository.go:215 — userinfo-stripped render, see the helper
+    // above; rendered for every repo with a non-empty column, not just
+    // mirrors).
+    original_url: sanitizedOriginalUrl(row.originalUrl),
     website: settings?.website ?? "", // TODO(SPEC-0005): website column (repo_settings until the sweep)
     // Upstream renders the maintained columns, not live counts:
     // convert/repository.go:219-221 — `Stars: repo.NumStars` / `Forks:
@@ -792,7 +825,8 @@ export interface RepoSearchOptions extends RepositoryListOptions {  keyword: str
  *    `fork_parent IS NOT NULL`), `mirror` ≡ `is_mirror`, `source` ≡ neither.
  *    `collaborative` (`is_mirror=false` + the collaborator edge upstream)
  *    still matches nothing — no collaborator edges (TODO below).
- *  - `template`/`archived`: no columns — `true` matches nothing, `false` all.
+ *  - `template`/`archived`: the landed columns filter both directions —
+ *    upstream repo.go:155-157/181-183 → repo_list.go:391-393/520-522.
  *  - `priority_owner_id`: implemented as a CASE-WHEN ordering prefix.
  */
 export async function searchRepositories(
@@ -805,13 +839,18 @@ export async function searchRepositories(
   if (opts.isPrivate !== null) {
     conditions.push(eq(repositories.visibility, opts.isPrivate ? "private" : "public"));
   }
-  // No template/archived rows exist: `true` matches nothing, `false` is all.
+  // Tri-state column filters — exact equality when the query param was sent,
+  // no condition when absent (upstream optional.Option[bool]): `template` →
+  // `is_template = ?` (repo.go:155-157 → repo_list.go:391-393), `archived` →
+  // `is_archived = ?` (repo.go:181-183 → repo_list.go:520-522). Both columns
+  // landed (is_template/is_archived, migration 0027 batch), so both
+  // directions are real matches.
   const noMatch = sql`0 = 1`;
-  if (opts.template === true) {
-    conditions.push(noMatch);
+  if (opts.template !== null) {
+    conditions.push(eq(repositories.isTemplate, opts.template));
   }
-  if (opts.archived === true) {
-    conditions.push(noMatch);
+  if (opts.archived !== null) {
+    conditions.push(eq(repositories.isArchived, opts.archived));
   }
   switch (opts.mode) {
     case "fork":
