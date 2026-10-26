@@ -12,6 +12,11 @@
  * JSON writer drops the undefined key) while `label`/`ref`/`sha` stay set —
  * the branch name survives the hide, upstream pull.go:118-121.
  *
+ * The second block ports the payload escape hatch: `ToPayloadPullRequest`
+ * (pull.go:33-37, the :197 `isPayload` disjunct) — webhook payload emitters
+ * render the head repo REGARDLESS of the doer, proved differentially (the
+ * same private-fork PR hidden on the API GET, shown in the payload).
+ *
  * Colocated with the converter: the broader PR fixtures live in the
  * sibling-owned src/api/pulls.test.ts / src/api/routes/pulls.test.ts (the
  * wave-34 render split). Mounting convention = src/api/pulls.test.ts over the
@@ -19,18 +24,27 @@
  * (createStubAuthResolver), so the private-fork OWNER arm below uses a
  * stub-owned private fork — a stranger-authenticated doer is not reachable in
  * this rig (the real SPEC-0002 middleware replaces the stub resolver).
+ * Wave-36 amendment: the trailing suite mints a DISTINCT authenticated
+ * stranger through the test rig (src/auth/testing/identities.ts) and routes
+ * its token through the SAME resolver seam (`createApiRouter({ auth })`), so
+ * the identity-differentiated arms (stranger Read render on the public fork,
+ * stranger hide on the stub-owned private fork its owner still sees) are
+ * covered.
  */
 
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { repoCounters, repositories, users } from "../../db/schema";
+import { labels, repoCounters, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
+import { handleUserPushNotifications, type WebhookPushWalk } from "../../services/webhooks-push";
+import { IssuesService } from "../../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./engine";
 import { createApiRouter } from "../router";
+import { createIdentityAuthResolver, seedIdentity, tokenHeader } from "../../auth/testing/identities";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -50,7 +64,15 @@ beforeEach(async () => {
   // The DO cells persist across tests (only D1 is wiped) — drop the PR head
   // refs the create flow lands on the BASE cells so the next per-repo index
   // cannot CAS-conflict (the pulls.test.ts convention).
-  for (const cellName of ["cf-gitea-stub/hpr-base", "cf-gitea-stub/hpr-priv"]) {
+  for (const cellName of [
+    "cf-gitea-stub/hpr-base",
+    "cf-gitea-stub/hpr-priv",
+    "cf-gitea-stub/hpr-pay",
+    "cf-gitea-stub/hpr-lab",
+    // the wave-36 stranger-arm slugs (their trailing suite's bases)
+    "cf-gitea-stub/hpr-s1",
+    "cf-gitea-stub/hpr-s2",
+  ]) {
     const cell = env.REPO.getByName(cellName);
     const { refs } = await cell.listRefs();
     for (const ref of refs) {
@@ -165,10 +187,12 @@ interface ForkFixture {
 }
 
 /** The stub's public base + a fork with one divergent `feature` branch.
- *  `owner = "alice"` → a readable-by-everyone PUBLIC fork; `owner = "stub"` →
- *  the stub's own PRIVATE fork (the owner arm of the gate — the only
- *  authenticated doer the stub resolver can produce). */
-async function seedForkWithFeature(baseSlug: string, fork: { owner: "alice" | "stub" }): Promise<ForkFixture> {
+ *  `owner = "alice"` → a PUBLIC fork readable by everyone (private with the
+ *  `private` flag — the stranger-doer hide arm, reachable because the stub
+ *  doer is NOT alice); `owner = "stub"` → the stub's own PRIVATE fork (the
+ *  owner arm of the gate — the only authenticated doer the stub resolver can
+ *  produce). */
+async function seedForkWithFeature(baseSlug: string, fork: { owner: "alice" | "stub"; private?: boolean }): Promise<ForkFixture> {
   const baseId = await seedRepo(1, "cf-gitea-stub", baseSlug);
   let forkOwnerNamespace = "cf-gitea-stub";
   let forkOwnerId = 1;
@@ -184,6 +208,9 @@ async function seedForkWithFeature(baseSlug: string, fork: { owner: "alice" | "s
     if (alice === undefined) throw new Error("alice seed failed");
     forkOwnerNamespace = "alice";
     forkOwnerId = alice.id;
+    if (fork.private === true) {
+      visibility = "private";
+    }
   } else {
     forkSlug = `${baseSlug}-fork`;
     visibility = "private";
@@ -297,6 +324,252 @@ describe("PR converter head.repo — the cross-repo read-gate render (convert/pu
 
     // the list converter hides the same way
     const listed = await router()("/repos/cf-gitea-stub/hpr-priv/pulls", { headers: anonHeaders });
+    expect(listed.status).toBe(200);
+    const items = await listed.json<Array<{ head: HeadBlock }>>();
+    expect(items[0]?.head).toMatchObject({ label: "feature", repo_id: -1 });
+    expect(items[0]?.head.repo).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The payload mode — upstream `ToPayloadPullRequest` (convert/pull.go:33-37,
+// "keeps the head repository regardless of the doer, for webhook and Actions
+// payloads"): the :197 disjunction `isPayload || HeadRepoID == BaseRepoID ||
+// HasAnyUnitAccessOrPublicAccess()` bypasses the visibility gate for payload
+// emitters, because payloads go to CONFIGURED RECEIVERS, not the requesting
+// doer. The differential IS the proof: the SAME private-fork PR hides
+// `head.repo` on the API GET and shows it in the webhook payload.
+// ---------------------------------------------------------------------------
+
+/** Minimal walk stub — the sync arm is a pure D1 query; the push event's
+ *  commit-list fidelity is the webhooks-push suite's business. */
+const stubWalk: WebhookPushWalk = {
+  listCommitsRange: () => Promise.resolve({ commits: [], more: false }),
+  readDiff: () => Promise.resolve(null),
+  readCommit: () => Promise.resolve(null),
+};
+
+/** The webhook tables outlive the D1 wipe (beforeEach covers the PR family
+ *  only) — the payload tests clear them for a hermetic delivery log. */
+async function clearWebhookTables(): Promise<void> {
+  await env.DB.prepare("DELETE FROM webhook_deliveries").run();
+  await env.DB.prepare("DELETE FROM webhooks").run();
+}
+
+/** An active send-everything hook on one repo (the webhooks-push.test.ts
+ *  seedHook shape) — without a matching hook nothing is delivered. */
+async function seedRepoHook(repoId: string): Promise<number> {
+  const inserted = await db()
+    .insert(webhooks)
+    .values({
+      repoId,
+      ownerId: null,
+      url: "https://hooks.example.com/receive",
+      events: JSON.stringify({ send_everything: true }),
+      isActive: true,
+    })
+    .returning({ id: webhooks.id })
+    .all();
+  return inserted[0]!.id;
+}
+
+/** The delivery log, oldest first (the §3.6 assertion surface). */
+const deliveryRows = () => drizzle(env.DB).select().from(webhookDeliveries).orderBy(asc(webhookDeliveries.id)).all();
+
+describe("the payload mode — ToPayloadPullRequest renders the head repo regardless (convert/pull.go:33-37, :197)", () => {
+  it("the SAME private-fork PR: the anonymous API GET hides head.repo, the pull_request_sync payload shows it (webhooks-push emitPullRequestSyncs)", async () => {
+    const { forkId, featureTip } = await seedForkWithFeature("hpr-pay", { owner: "stub" });
+    const created = await createForkPull("hpr-pay", "cf-gitea-stub/hpr-pay-fork:feature");
+    expect(created.status).toBe(201);
+
+    // API side (the 0466356 case, re-anchored on this PR): the anonymous doer
+    // holds None on the private fork (repo_permission.go:442-446) — the
+    // -1/nil head.
+    const anon = await router()("/repos/cf-gitea-stub/hpr-pay/pulls/1", { headers: anonHeaders });
+    expect(anon.status).toBe(200);
+    const anonBody = await anon.json<{ head: HeadBlock }>();
+    expect(anonBody.head).toMatchObject({ label: "feature", repo_id: -1 });
+    expect(anonBody.head.repo).toBeUndefined();
+
+    // Payload side: an update to the fork's feature branch fans the
+    // pull_request_sync event out through the fork (the pushed pair); the
+    // fan-out's viewer is anonymous, and the isPayload arm must render the
+    // fork anyway.
+    await clearWebhookTables();
+    await seedRepoHook(forkId);
+    const forkRow = await db().select().from(repositories).where(eq(repositories.id, forkId)).get();
+    if (forkRow === undefined) throw new Error("fork row seed failed");
+    await handleUserPushNotifications(env, forkRow, [{ ref: "refs/heads/feature", old: "1".repeat(40), next: featureTip }], null, {
+      walk: stubWalk,
+    });
+
+    const rows = await deliveryRows();
+    const sync = rows.find((row) => row.eventType === "pull_request_sync");
+    if (sync === undefined) {
+      throw new Error(`no pull_request_sync delivery among: ${rows.map((row) => row.eventType).join(",")}`);
+    }
+    const payload = JSON.parse(sync.payloadContent) as {
+      action: string;
+      pull_request: { head: HeadBlock };
+      repository: { full_name: string };
+    };
+    expect(payload.action).toBe("synchronized");
+    expect(payload.pull_request.head.repo_id).toBe(Number(forkId));
+    expect(payload.pull_request.head.repo).toMatchObject({
+      full_name: "cf-gitea-stub/hpr-pay-fork",
+      private: true,
+      // the anonymous doer's view on the fork — upstream still feeds the
+      // doer's permission to ToRepo in payload mode (pull.go:186-190), here
+      // AccessModeNone: every arm false
+      permissions: { admin: false, push: false, pull: false },
+    });
+    // the event itself still routes through the BASE repository (notifier.go:843)
+    expect(payload.repository).toMatchObject({ full_name: "cf-gitea-stub/hpr-pay" });
+  });
+
+  it("the SAME stranger-private-fork PR: the pull_request_label payload shows head.repo where the API hides it (routes/issues.ts emitLabelEvent)", async () => {
+    const fixture = await seedForkWithFeature("hpr-lab", { owner: "alice", private: true });
+    // Seeded through the service, NOT the API: the POST /pulls create route's
+    // anti-enumeration CanRead guard (a16f60e) rightly 404s a head repo the
+    // doer cannot read, while the ROW itself is a legal state upstream's
+    // notifiers must still render (webhooks-push.test.ts's seedPull shape).
+    const service = new IssuesService(env.DB);
+    await service.ensureRepoCounters(fixture.baseId);
+    const seeded = await service.createPullRequest({
+      repoId: fixture.baseId,
+      title: "stranger fork PR",
+      posterId: null,
+      headRepoId: fixture.forkId,
+      baseBranch: "main",
+      headBranch: "feature",
+    });
+    expect(seeded.issue.index).toBe(1);
+
+    // API side — the authenticated stub doer is a STRANGER on alice's private
+    // fork (and anonymous is None): both renders hide it.
+    for (const headers of [authHeaders, anonHeaders]) {
+      const got = await router()("/repos/cf-gitea-stub/hpr-lab/pulls/1", { headers });
+      expect(got.status).toBe(200);
+      const body = await got.json<{ head: HeadBlock }>();
+      expect(body.head.repo_id).toBe(-1);
+      expect(body.head.repo).toBeUndefined();
+    }
+
+    // Payload side: the stub labels the PR on the BASE repo it owns — the
+    // pull_request_label emission renders ToPayloadPullRequest (notifier.go
+    // IssueChangeLabels:600), so alice's private fork shows to the receivers.
+    await clearWebhookTables();
+    await seedRepoHook(fixture.baseId);
+    const labelRows = await db()
+      .insert(labels)
+      .values({ repoId: fixture.baseId, name: "bug", color: "#00aabb", description: "", numIssues: 0, numClosedIssues: 0 })
+      .returning({ id: labels.id })
+      .all();
+    const labelId = labelRows[0]!.id;
+    const attached = await router()("/repos/cf-gitea-stub/hpr-lab/issues/1/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [labelId] }),
+    });
+    expect(attached.status).toBe(200);
+
+    const rows = await deliveryRows();
+    const label = rows.find((row) => row.eventType === "pull_request_label");
+    if (label === undefined) {
+      throw new Error(`no pull_request_label delivery among: ${rows.map((row) => row.eventType).join(",")}`);
+    }
+    const payload = JSON.parse(label.payloadContent) as { action: string; pull_request: { head: HeadBlock } };
+    expect(payload.action).toBe("label_updated");
+    expect(payload.pull_request.head.repo_id).toBe(Number(fixture.forkId));
+    expect(payload.pull_request.head.repo).toMatchObject({
+      full_name: "alice/hpr-lab",
+      private: true,
+      // the stub doer is a stranger on the private fork: AccessModeNone block
+      permissions: { admin: false, push: false, pull: false },
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The authenticated-stranger arms (wave-36 rig, src/auth/testing/identities.ts):
+// `createStubAuthResolver` maps ANY token to STUB_USER, so every doer above is
+// the same principal. The rig mints a DISTINCT seeded identity and resolves
+// its token through the SAME seam (`createApiRouter({ auth })` — header-parse
+// → middleware → resolveToken, nothing bypassed), giving the matrix its
+// second authenticated row: stranger vs owner on the SAME repo.
+// Slugs are per-test (hpr-s1/hpr-s2): the DO cells persist across tests and
+// this block stays append-only to the sibling-owned beforeEach cleanup list.
+// ---------------------------------------------------------------------------
+
+/** The default stub router PLUS one stranger identity on the same seam. */
+async function routerWithStranger() {
+  const stranger = await seedIdentity({ username: "stranger" });
+  const app = createApiRouter({ auth: createIdentityAuthResolver({ [stranger.token]: stranger.user }) });
+  return {
+    stranger,
+    get: async (path: string): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, { headers: tokenHeader(stranger) }), env),
+  };
+}
+
+describe("PR converter head.repo — the AUTHENTICATED-STRANGER arms (wave-36 multi-identity rig)", () => {
+  it("renders the public fork's Read block for an authenticated STRANGER — a distinct principal, not the stub (repo_permission.go:468-472 + access.go:53-54)", async () => {
+    // (stranger unused here — only `get`; lint: no-unused-vars)
+    const { get } = await routerWithStranger();
+    const { forkId, featureTip } = await seedForkWithFeature("hpr-s1", { owner: "alice" });
+    const created = await createForkPull("hpr-s1", "alice:feature");
+    expect(created.status).toBe(201);
+
+    const got = await get("/repos/cf-gitea-stub/hpr-s1/pulls/1");
+    expect(got.status).toBe(200);
+    const body = await got.json<{ user: { login: string }; head: HeadBlock; base: HeadBlock }>();
+    // the doer IS the minted stranger (id ≠ 1): the BASE repo is stub-owned,
+    // yet the rendered base permissions block is pull-only — the stub owner
+    // would render admin/push/pull there (repositoryPermissions' owner arm)
+    expect(body.user).toMatchObject({ login: "cf-gitea-stub" }); // the PR author stays the stub creator
+    expect(body.base.repo).toMatchObject({
+      full_name: "cf-gitea-stub/hpr-s1",
+      permissions: { admin: false, push: false, pull: true },
+    });
+    // the public head fork renders the Read block for the stranger too
+    expect(body.head).toMatchObject({ label: "feature", ref: "refs/pull/1/head", sha: featureTip, repo_id: Number(forkId) });
+    expect(body.head.repo).toMatchObject({
+      full_name: "alice/hpr-s1",
+      private: false,
+      owner: { login: "alice" },
+      permissions: { admin: false, push: false, pull: true },
+    });
+  });
+
+  it("hides the stub-owned PRIVATE fork from the authenticated stranger while its owner (a second identity) still sees it — the differential the single-stub rig could not express", async () => {
+    const { get } = await routerWithStranger();
+    const { forkId, featureTip } = await seedForkWithFeature("hpr-s2", { owner: "stub" });
+    const created = await createForkPull("hpr-s2", "cf-gitea-stub/hpr-s2-fork:feature");
+    expect(created.status).toBe(201);
+
+    // owner side (the stub token): the private head repo renders, admin block
+    const owned = await router()("/repos/cf-gitea-stub/hpr-s2/pulls/1", { headers: authHeaders });
+    expect(owned.status).toBe(200);
+    const ownedBody = await owned.json<{ head: HeadBlock }>();
+    expect(ownedBody.head).toMatchObject({ label: "feature", sha: featureTip, repo_id: Number(forkId) });
+    expect(ownedBody.head.repo).toMatchObject({
+      full_name: "cf-gitea-stub/hpr-s2-fork",
+      private: true,
+      permissions: { admin: true, push: true, pull: true },
+    });
+
+    // stranger side (the minted token): an authenticated doer with no access
+    // row on a private repo holds None (repo_permission.go:442-446) — the
+    // -1/nil head with the branch fields intact (pull.go:118-121), the SAME
+    // render anonymous gets while the owner render above stays.
+    const hidden = await get("/repos/cf-gitea-stub/hpr-s2/pulls/1");
+    expect(hidden.status).toBe(200); // the public BASE is readable — only the head hides
+    const hiddenBody = await hidden.json<{ head: HeadBlock }>();
+    expect(hiddenBody.head).toMatchObject({ label: "feature", ref: "refs/pull/1/head", sha: featureTip, repo_id: -1 });
+    expect(hiddenBody.head.repo).toBeUndefined();
+
+    // the list converter hides the same way for the stranger
+    const listed = await get("/repos/cf-gitea-stub/hpr-s2/pulls");
     expect(listed.status).toBe(200);
     const items = await listed.json<Array<{ head: HeadBlock }>>();
     expect(items[0]?.head).toMatchObject({ label: "feature", repo_id: -1 });

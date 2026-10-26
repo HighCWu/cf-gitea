@@ -364,9 +364,10 @@ async function emitCommentEvent(
  * notifier.go IssueChangeLabels:572-605 and IssueClearLabels:46-73). The
  * payload is the shared Issue/PullRequest wrapper with NO `changes` block —
  * upstream's label notifiers set none. The pull arm renders upstream's
- * ToPayloadPullRequest through toApiPullRequest; a missing PR row skips the
- * emission (upstream's LoadPullRequest failure logs and returns before
- * PrepareWebhooks).
+ * ToPayloadPullRequest through toApiPullRequest's "payload" mode (the head
+ * repo shows regardless of the doer — pull.go:33-37, :197); a missing PR row
+ * skips the emission (upstream's LoadPullRequest failure logs and returns
+ * before PrepareWebhooks).
  */
 async function emitLabelEvent(
   c: Context<ApiEnv>,
@@ -386,7 +387,7 @@ async function emitLabelEvent(
       eventType: "pull_request_label",
       payload: pullRequestEventPayload(
         action,
-        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "single"),
+        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
         issue.index,
         event.repository,
         event.sender,
@@ -409,8 +410,10 @@ async function emitLabelEvent(
  * now carries a milestone, demilestoned on the clear (structs/hook.go:422-425
  * — NOT entered/exited); the payload is the shared Issue/PullRequest wrapper
  * with NO `changes` block — upstream's milestone notifier sets none. The pull
- * arm renders ToPayloadPullRequest through toApiPullRequest; a missing PR row
- * skips the emission (the label events' LoadPullRequest degradation).
+ * arm renders ToPayloadPullRequest through toApiPullRequest's "payload" mode
+ * (the head repo shows regardless of the doer — pull.go:33-37, :197); a
+ * missing PR row skips the emission (the label events' LoadPullRequest
+ * degradation).
  */
 export async function emitMilestoneEvent(
   c: Context<ApiEnv>,
@@ -430,7 +433,7 @@ export async function emitMilestoneEvent(
       eventType: "pull_request_milestone",
       payload: pullRequestEventPayload(
         action,
-        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "single"),
+        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
         issue.index,
         event.repository,
         event.sender,

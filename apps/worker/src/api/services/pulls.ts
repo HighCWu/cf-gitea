@@ -310,19 +310,27 @@ function baseBranchInfo(viewer: Viewer, pair: RepositoryWithOwner, pr: PullReque
  * short-circuit like upstream's `HeadRepoID == BaseRepoID` arm (pull.go:197,
  * no permission read, the base pair renders).
  *
+ * `isPayload` ports upstream's `ToPayloadPullRequest` arm (pull.go:33-37 —
+ * "keeps the head repository regardless of the doer, for webhook and Actions
+ * payloads"; the disjunction at :197 `isPayload || HeadRepoID == BaseRepoID ||
+ * HasAnyUnitAccessOrPublicAccess()`): a payload emitter renders the fork
+ * UNCONDITIONALLY — receivers are configured destinations, not the requesting
+ * doer, so the visibility gate has no one to protect — while the permission
+ * resolution stays (upstream still feeds the doer's `p` to `ToRepo`, so the
+ * embedded repo object carries the doer's view; ours passes the resolved
+ * `teamMode` through unchanged).
+ *
  * Deviations: a deleted head-repo row hides like an unreadable one (upstream
  * `LoadHeadRepo` errors out the whole converter — impossible there, the row
  * is NOT NULL); the AGit-flow arm (pull.go:156-161: head = the base repo,
- * name = "") has no D1 producer (every row is Github flow); and the
- * `ToPayloadPullRequest` isPayload arm (webhooks render the head repo
- * regardless, pull.go:33-37) is not split out — payload emitters share this
- * API visibility rule until a payload mode is threaded through.
+ * name = "") has no D1 producer (every row is Github flow).
  */
 async function headBranchInfo(
   d1: D1Database,
   viewer: Viewer,
   pair: RepositoryWithOwner,
   pr: PullRequestRow,
+  isPayload: boolean,
 ): Promise<PRBranchInfo> {
   const sameRepo = pr.headRepoId === pair.repo.id;
   if (sameRepo) {
@@ -337,7 +345,9 @@ async function headBranchInfo(
   const headPair = await findRepositoryById(d1, pr.headRepoId);
   if (headPair !== null) {
     const teamMode = await viewerTeamAccessMode(d1, viewer, headPair.repo);
-    if (canViewRepository(viewer, headPair.repo, teamMode)) {
+    // Upstream's :197 disjunction minus the same-repo arm (handled above):
+    // payload mode renders the fork regardless of the doer's permission.
+    if (isPayload || canViewRepository(viewer, headPair.repo, teamMode)) {
       return {
         label: pr.headBranch,
         ref: pullHeadRefName(pr.index),
@@ -364,9 +374,14 @@ async function headBranchInfo(
  * `convert.toAPIPullRequest` → the contract `PullRequest`. Composes the
  * `ToAPIIssue` render (poster/labels/milestone/counts) exactly like upstream
  * and overrides the issue URLs with the pull ones (`Issue.HTMLURL` picks the
- * `pulls` path for `is_pull` rows). `mode` mirrors the single-vs-list
- * converter split: the single converter empties `assignees`
- * (`util.SliceNilAsEmpty`), the list one passes the raw null through.
+ * `pulls` path for `is_pull` rows). `mode` mirrors the upstream converter
+ * split: the single converter empties `assignees` (`util.SliceNilAsEmpty`),
+ * the list one passes the raw null through, and `"payload"` is
+ * `ToPayloadPullRequest` (pull.go:30-34 — the SINGLE converter with
+ * `isPayload=true`): single-shape `assignees` PLUS the unconditional head-repo
+ * render (`headBranchInfo`'s payload arm, pull.go:197) for the webhook and
+ * Actions emitters — payloads go to configured receivers, so the doer's
+ * visibility must not hide the head repo upstream shows.
  *
  * `extras` carries the engine-derived fields the routes resolve (the
  * mergeability wave, SPEC-0005 §3.4): `mergeable` renders from the row's
@@ -380,7 +395,7 @@ export async function toApiPullRequest(
   pair: RepositoryWithOwner,
   issue: IssueRow,
   pr: PullRequestRow,
-  mode: "single" | "list",
+  mode: "single" | "list" | "payload",
   extras?: { mergeable?: boolean | null; baseSha?: string },
 ): Promise<PullRequest> {
   const apiIssue = await toApiIssue(d1, viewer, pair, issue);
@@ -415,7 +430,10 @@ export async function toApiPullRequest(
     labels: apiIssue.labels ?? [],
     milestone: apiIssue.milestone,
     assignee: apiIssue.assignee,
-    assignees: mode === "single" ? apiIssue.assignees ?? [] : apiIssue.assignees,
+    // "payload" renders the single converter's shape (upstream's payload
+    // converter IS toAPIPullRequest — pull.go:31-34); only "list" keeps the
+    // raw null (ToAPIPullRequests vs SliceNilAsEmpty).
+    assignees: mode === "list" ? apiIssue.assignees : apiIssue.assignees ?? [],
     requested_reviewers: [],
     requested_reviewers_teams: [],
     state: issue.isClosed ? "closed" : "open",
@@ -436,7 +454,7 @@ export async function toApiPullRequest(
     merged_by: mergedBy,
     allow_maintainer_edit: pr.allowMaintainerEdit,
     base: { ...baseBranchInfo(viewer, pair, pr), ...(extras?.baseSha === undefined ? {} : { sha: extras.baseSha }) },
-    head: await headBranchInfo(d1, viewer, pair, pr),
+    head: await headBranchInfo(d1, viewer, pair, pr, mode === "payload"),
     merge_base: pr.mergeBase ?? "",
     due_date: apiIssue.due_date,
     created_at: apiIssue.created_at,

@@ -517,7 +517,10 @@ async function emitPullRequestSyncs(
           before: update.old,
           after: update.next,
           number: head.issue.index,
-          pull_request: await toApiPullRequest(env.DB, viewer, basePair, head.issue, head.pullRequest, "single"),
+          // Upstream's sync payload renders ToPayloadPullRequest (notifier.go:850)
+          // — the isPayload arm: the head repo shows regardless of the (here
+          // anonymous) doer, pulls.ts toApiPullRequest "payload" mode.
+          pull_request: await toApiPullRequest(env.DB, viewer, basePair, head.issue, head.pullRequest, "payload"),
           repository: toApiRepository(viewer, basePair),
           sender: identity.sender,
           commit_id: "",
