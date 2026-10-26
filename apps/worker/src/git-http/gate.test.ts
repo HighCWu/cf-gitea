@@ -892,3 +892,146 @@ describe("the receive-pack blocked-pusher arm", () => {
     expect(push.status).toBe(200);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The first-push settle generalizes to API-created empty repos
+// (wave-settle-is-empty): upstream pushNewBranch (services/repository/
+// push.go:255-270, the push-update queue handler) flips IsEmpty +
+// DefaultBranch on the first new-branch push of EVERY repo; the gate's
+// settle used to fire only for the push-create flow's status='creating'
+// rows, so an API-created (ready, is_empty) repo's first push never cleared
+// is_empty — generate took the settle-empty arm, renders lied, and the
+// license/size settle legs' unborn-tip guards read stale state.
+// ---------------------------------------------------------------------------
+
+describe("the first-push settle generalizes to API-created empty repos (wave-settle-is-empty)", () => {
+  it("an API-created (ready, is_empty) repo's first applied push clears is_empty and adopts the pushed branch — the gate's own settle, no manual call", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const service = repoService();
+    const created = await service.create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "latefirst",
+      isPrivate: true,
+    });
+    expect(created.status).toBe("ready");
+    expect(created.isEmpty).toBe(true); // the bug's premise: API rows are born ready+empty
+
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const push = await SELF.fetch("https://example.com/alice/latefirst.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/trunk", oid }], pack),
+    });
+    expect(push.status).toBe(200);
+
+    // The gate schedules the settle itself (ctx.waitUntil after the awaited
+    // receive forward) — the assertion waits on the flip, never on a manual
+    // settle call, so this pins the SCHEDULING too, not just the settle arm.
+    await vi.waitFor(
+      async () => {
+        const row = await service.get(created.id);
+        expect(row?.isEmpty).toBe(false);
+      },
+      { timeout: 10_000 },
+    );
+    const settled = (await service.get(created.id))!;
+    expect(settled.status).toBe("ready");
+    expect(settled.defaultBranch).toBe("trunk"); // upstream pushNewBranch adoption
+    expect(settled.storageKey).toBe(created.storageKey); // immutable across the settle
+    // The create's seeded dependents survive (the undo arm stays creating-only).
+    expect(
+      (await drizzle(env.DB).select().from(repoCounters).where(eq(repoCounters.repoId, created.id)).all()),
+    ).toHaveLength(1);
+
+    // The clone advert now serves the pushed content (the empty-repo advert
+    // arm is gone with the flip).
+    const advert = await SELF.fetch("https://example.com/alice/latefirst.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(advert.status).toBe(200);
+    expect(new TextDecoder().decode(await advert.arrayBuffer())).toContain(oid);
+  });
+
+  it("the settled ready repo never re-emits repository/created (the emission stays creating-only)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    // OWNER-level hook on the repository family (the settle test's fixture
+    // shape): the direct RepoService.create below emits nothing (the API
+    // route owns that emission), so ANY delivery here would be the settle
+    // re-emitting for a ready row.
+    const hook = await drizzle(env.DB)
+      .insert(webhooks)
+      .values({
+        repoId: null,
+        ownerId: alice.id,
+        url: "https://hooks.example.com/latefirst",
+        events: JSON.stringify({ choose_events: true, events: { repository: true } }),
+        isActive: true,
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const service = repoService();
+    const created = await service.create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "noresettle",
+      isPrivate: true,
+    });
+
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const push = await SELF.fetch("https://example.com/alice/noresettle.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack),
+    });
+    expect(push.status).toBe(200);
+
+    await vi.waitFor(
+      async () => {
+        const row = await service.get(created.id);
+        expect(row?.isEmpty).toBe(false);
+      },
+      { timeout: 10_000 },
+    );
+    // Idempotent replay on the settled row (deterministic no-op), then the
+    // delivery log must still be empty — the settle arm's emission is gated
+    // on the row having BEEN 'creating'.
+    await settleCreatingRepo(env, created.id, "alice/noresettle");
+    const deliveries = await drizzle(env.DB)
+      .select()
+      .from(webhookDeliveries)
+      .where(eq(webhookDeliveries.hookId, hook[0]!.id))
+      .all();
+    expect(deliveries).toEqual([]);
+  });
+
+  it("a ref-less receive on a ready empty repo settles nothing (the undo arm stays creating-only)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const service = repoService();
+    const created = await service.create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "emptyvoid",
+      isPrivate: true,
+    });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const push = await SELF.fetch("https://example.com/alice/emptyvoid.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: "0000",
+    });
+    expect(push.status).toBe(200);
+
+    // Deterministic replay of the scheduled settle: without the explicit
+    // creating-only guard this arm would sweep the seeded dependents of a
+    // LIVE repo (the batch's counters/units deletes are unconditional; only
+    // the repositories DELETE is CAS'd).
+    await settleCreatingRepo(env, created.id, "alice/emptyvoid");
+    const row = await service.get(created.id);
+    expect(row).not.toBeNull();
+    expect(row?.status).toBe("ready");
+    expect(row?.isEmpty).toBe(true);
+    expect(
+      (await drizzle(env.DB).select().from(repoCounters).where(eq(repoCounters.repoId, created.id)).all()),
+    ).toHaveLength(1);
+  });
+});

@@ -511,6 +511,53 @@ describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => 
     expect((await env.REPO.getByName("alice/branchy").listRefs()).head).toBe("refs/heads/develop");
   });
 
+  it("first push to an API-created (ready, is_empty) repo settles is_empty + default_branch via the same handshake (wave-settle-is-empty)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    // API create: status='ready' from birth, is_empty=1 — the population the
+    // push-create-scoped settle used to skip (upstream pushNewBranch,
+    // services/repository/push.go:255-270, flips IsEmpty for EVERY repo's
+    // first new-branch push).
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "latefirst");
+    expect(repo.status).toBe("ready");
+    expect(repo.isEmpty).toBe(true);
+
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const push = await SELF.fetch("https://example.com/alice/latefirst.git/git-receive-pack", {
+      method: "POST",
+      headers: {
+        authorization: basicTokenHeader(token),
+        "content-type": "application/x-git-receive-pack-request",
+      },
+      body: buildReceivePackBody([{ ref: "refs/heads/trunk", oid }], pack),
+    });
+    expect(push.status).toBe(200);
+
+    // Settle deterministically (the gate schedules this via waitUntil on the
+    // D1-resolved push path): the adoption writes default_branch=trunk, the
+    // status stays 'ready', and the undo arm must leave the row + seeds put.
+    await settleCreatingRepo(env, repo.id, "alice/latefirst");
+    const settled = (await service().get(repo.id))!;
+    expect(settled.isEmpty).toBe(false);
+    expect(settled.status).toBe("ready");
+    expect(settled.defaultBranch).toBe("trunk");
+    expect(settled.storageKey).toBe(repo.storageKey);
+    expect(
+      (await drizzle(env.DB).select().from(repoCounters).where(eq(repoCounters.repoId, repo.id)).all()),
+    ).toHaveLength(1);
+
+    // The DO head agrees with the adopted branch (the engine adopts the only
+    // pushed branch; the settle's setHead alignment covers divergent shapes).
+    expect((await env.REPO.getByName("alice/latefirst").listRefs()).head).toBe("refs/heads/trunk");
+
+    // The synthetic HEAD endpoint agrees too (no unborn fallback anymore).
+    const head = await SELF.fetch("https://example.com/alice/latefirst.git/HEAD", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("ref: refs/heads/trunk\n");
+  });
+
   it("setDefaultBranch updates D1 and the DO head; engine rejections never block the D1 truth", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const svc = serviceWithSetHead();

@@ -282,7 +282,7 @@ export async function gitHttpGate(
   // and the authenticated pusher (in-process, see resolvePushPusher), which
   // the engine surfaces on PushEvent so the push webhooks name the real
   // pusher instead of the owner fallback.
-  return forwardToEngine(
+  const response = await forwardToEngine(
     req,
     url,
     env,
@@ -292,6 +292,24 @@ export async function gitHttpGate(
     pusher,
     isPush ? protectedBranchValidator(env, resolved.repo) : undefined,
   );
+
+  // First-push settle on ANY empty D1-backed repo (the wave-settle-is-empty
+  // fix; upstream pushNewBranch, services/repository/push.go:255-270 — on
+  // `repo.IsEmpty` a new branch ref sets DefaultBranch + IsEmpty=false for
+  // EVERY repo, not just push-created ones). API-created rows are born
+  // 'ready' + is_empty, and until now a first push through THIS path never
+  // cleared is_empty: generate took the settle-empty arm (content dropped),
+  // repo-search/`empty` renders lied, and the license/size settle legs'
+  // unborn-tip guards read stale state. Scheduled AFTER the awaited forward
+  // (the engine commits refs before its response returns — the same
+  // settle-safety argument as the push-create handshake below); the settle
+  // re-verifies via listRefs and CAS-guards on is_empty, so a failed or
+  // rejected receive is a no-op and a probe/advert never schedules it (this
+  // arm runs only on the receive-pack RPC).
+  if (isPush && resolved.repo.isEmpty) {
+    ctx.waitUntil(settleCreatingRepo(env, resolved.repo.id, `${route.owner}/${route.repo}`));
+  }
+  return response;
 }
 
 /**
@@ -901,19 +919,32 @@ async function serveHead(env: Env, route: GitHttpRoute, defaultBranch: string): 
 }
 
 /**
- * §2.5.2 push-create finalize handshake. Runs after the receive response is
- * observable (the engine commits refs before returning it):
+ * First-push settle — the §2.5.2 push-create finalize handshake, generalized
+ * to EVERY empty repo (the wave-settle-is-empty fix; upstream
+ * pushNewBranch, services/repository/push.go:255-270, flips IsEmpty +
+ * DefaultBranch on the first new-branch push of ANY repo via the
+ * push-update queue — `updateRepositoryForPush`'s handler — not just
+ * push-created ones). Runs after a receive response is observable (the
+ * engine commits refs before returning it):
  *
- * - refs/heads/* present → the create becomes real: `status='ready'`,
+ * - refs/heads/* present → the row settles: `status='ready'`,
  *   `is_empty=false`, `default_branch=<first pushed branch>` — one
- *   conditional UPDATE (`status='creating' AND is_empty`), so a concurrent
- *   settle/undo can never double-apply. The DO's meta.head is aligned to the
- *   adopted branch via the engine's setHead RPC when it diverged (the
- *   engine's first-push adoption prefers main/master; see below); the
- *   synthetic HEAD endpoint falls back to D1 only for unborn repos.
+ *   conditional UPDATE (`is_empty`, status-agnostic), so a concurrent
+ *   settle can never double-apply. For API-created rows this is the first
+ *   is_empty transition; for push-created rows it completes the create.
+ *   The DO's meta.head is aligned to the adopted branch via the engine's
+ *   setHead RPC when it diverged (the engine's first-push adoption prefers
+ *   main/master; see below); the synthetic HEAD endpoint falls back to D1
+ *   only for unborn repos.
  * - no branch ref (receive failed, client vanished, worker crashed
- *   mid-receive) → the row is deleted again, conditional on
- *   `status='creating' AND is_empty` — a half-usable repo never lingers.
+ *   mid-receive) → UNDO, creating rows only: the row is deleted again,
+ *   conditional on `status='creating' AND is_empty` — a half-usable repo
+ *   never lingers. An established (ready/'migrating') empty repo that took
+ *   a ref-less receive stays put — deleting its seeded dependents would
+ *   corrupt a live repo.
+ *
+ * The `repository` action=created webhook stays creating-only: API-created
+ * repos emitted it at their create route; this settle must never re-emit.
  *
  * `refs_version` is deliberately not synced: the engine's finalize result
  * carries no version (engine gap), and the column is observability-only.
@@ -922,7 +953,7 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
   try {
     const db = drizzle(env.DB);
     const row = await db.select().from(repositories).where(eq(repositories.id, repoId)).get();
-    if (row === undefined || row.status !== "creating" || !row.isEmpty) return;
+    if (row === undefined || !row.isEmpty) return;
 
     let refNames: string[] | null = null;
     let doHead: string | null = null;
@@ -937,8 +968,11 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
 
     if (refNames === null || branches.length === 0) {
       // Undo the create (§2.5.2: "deleted again, D1 conditional on
-      // status='creating' AND is_empty"). The FK-bearing dependents the
-      // create seeded (counters, units) go first, in the same batch.
+      // status='creating' AND is_empty") — creating rows ONLY. The
+      // FK-bearing dependents the create seeded (counters, units) go first,
+      // in the same batch; the unconditional deletes make the explicit
+      // status guard here load-bearing for established repos.
+      if (row.status !== "creating") return;
       await db.batch([
         db.delete(repoCounters).where(eq(repoCounters.repoId, repoId)),
         db.delete(repoUnits).where(eq(repoUnits.repoId, repoId)),
@@ -957,30 +991,29 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
 
     // First non-empty branch push adopts the default branch (§2.5.2,
     // upstream pushNewBranch). listRefs orders by name, so a single-branch
-    // push — the dominant push-create shape — is exact; a multi-branch first
+    // push — the dominant first-push shape — is exact; a multi-branch first
     // push adopts the alphabetically first branch (upstream adopts the pushed
-    // branch; indistinguishable here without an engine hook).
+    // branch; indistinguishable here without an engine hook). The CAS is
+    // `is_empty` only: every empty row — 'creating', 'ready', 'migrating' —
+    // settles the same way, `status` re-asserting 'ready' for the push-create
+    // rows and a no-op value for the rest.
     const firstBranch = branches[0]?.slice("refs/heads/".length) ?? row.defaultBranch;
     const settled = await db
       .update(repositories)
       .set({ status: "ready", isEmpty: false, defaultBranch: firstBranch, updatedAt: new Date() })
-      .where(
-        and(
-          eq(repositories.id, repoId),
-          eq(repositories.status, "creating"),
-          eq(repositories.isEmpty, true),
-        ),
-      )
+      .where(and(eq(repositories.id, repoId), eq(repositories.isEmpty, true)))
       .run();
 
     // `repository` action=created — the create is real the moment the CAS
     // flip lands (upstream CreateRepository, notifier.go:114-116, fires at
     // once because its push-create row is never 'creating'; our §2.5.2
-    // crash-window settle is the honest equivalent). Gated on rows-changed so
-    // a concurrent/duplicate settle emits exactly once; the undo arm above
+    // crash-window settle is the honest equivalent). Gated on the row having
+    // BEEN 'creating' — API-created repos already emitted at their create
+    // route, so this settle must not re-emit — and on rows-changed so a
+    // concurrent/duplicate settle emits exactly once; the undo arm above
     // stays silent — the repo was never servable, so there is no deletion to
     // notify. Runs inside the caller's waitUntil, hence the inline enqueue.
-    if ((settled.meta.changes ?? 0) > 0) {
+    if ((settled.meta.changes ?? 0) > 0 && row.status === "creating") {
       const pair = await findRepositoryById(env.DB, repoId);
       if (pair !== null) {
         const identity = repositoryEventIdentity({ origin: appOrigin(env), requester: null }, pair);
@@ -1008,17 +1041,17 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
       try {
         const set = await env.REPO.getByName(engineRepo).setHead(firstBranch);
         if (set.tag !== "ok") {
-          console.error(`[push-create] settle ${repoId}: setHead ${firstBranch} rejected: ${set.tag}`);
+          console.error(`[push-settle] ${repoId}: setHead ${firstBranch} rejected: ${set.tag}`);
         }
       } catch (error) {
         console.error(
-          `[push-create] settle ${repoId}: setHead ${firstBranch} failed: ${error instanceof Error ? error.message : String(error)}`,
+          `[push-settle] ${repoId}: setHead ${firstBranch} failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
     }
   } catch (error) {
     console.error(
-      `[push-create] settle ${repoId} failed: ${error instanceof Error ? error.message : String(error)}`,
+      `[push-settle] ${repoId} failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
