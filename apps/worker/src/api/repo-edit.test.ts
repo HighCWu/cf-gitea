@@ -182,15 +182,40 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — stored settings subset", ()
     const res = await makeApp()(repoPath, {
       method: "PATCH",
       headers: jsonAuth,
-      body: JSON.stringify({ has_wiki: false, has_projects: true, template: true, mirror_interval: "8h" }),
+      body: JSON.stringify({ has_wiki: false, has_projects: true, mirror_interval: "8h" }),
     });
     expect(res.status).toBe(200);
     const body = await res.json<Record<string, unknown>>();
     expect(body.has_wiki).toBe(false);
     expect(body.has_projects).toBe(true);
     // Ignored remainder: no store — the render keeps the upstream defaults.
-    expect(body.template).toBe(false);
     expect(body.mirror_interval).toBe("");
+  });
+
+  it("writes the template flag (repo.go:699-701) — the API-reachable generate gate", async () => {
+    // REDEPLOY11 open issue 2: the edit schema accepted `template` but the
+    // handler never persisted it, making upstream's "mark a repo a template
+    // via API" flow (and so POST .../generate) unreachable.
+    const on = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ template: true }),
+    });
+    expect(on.status).toBe(200);
+    expect((await on.json<Record<string, unknown>>()).template).toBe(true);
+    expect(
+      (await drizzle(env.DB).select({ isTemplate: repositories.isTemplate }).from(repositories).where(eq(repositories.id, "7401")).all())[0]
+        ?.isTemplate,
+    ).toBe(true);
+
+    // And back off (upstream writes both directions — *opts.Template).
+    const off = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ template: false }),
+    });
+    expect(off.status).toBe(200);
+    expect((await off.json<Record<string, unknown>>()).template).toBe(false);
   });
 
   it("412-style gates flip with the flags: releases off turns GET /releases 412", async () => {

@@ -60,7 +60,9 @@ import {
  * repoEdit applies the meaningful EditRepoOption subset (the model file
  * documents the accepted-and-ignored remainder): rename via the landed
  * repos service, visibility flip, default branch (D1 + best-effort engine
- * setHead), archived flip, and the stored settings subset; upstream registers
+ * setHead), archived flip, the template flag (D1-only — upstream
+ * updateBasicProperties repo.go:699-701), and the stored settings subset;
+ * upstream registers
  * NO mustNotBeArchived on this PATCH, so 423 is never emitted here.
  * repoDelete runs the landed §2.5.5 pipeline (D1 cascade → DO tombstone →
  * queue purge) plus the raw-D1 housekeeping of this batch's tables.
@@ -494,6 +496,19 @@ export function registerRepoRoutes(
         await drizzle(c.env.DB)
           .update(repositories)
           .set({ isArchived: form.archived, updatedAt: now })
+          .where(eq(repositories.id, found.repo.id));
+      }
+
+      // Template flag (upstream updateBasicProperties, repo.go:699-701:
+      // `if opts.Template != nil { repo.IsTemplate = *opts.Template }`,
+      // persisted by UpdateRepository at repo.go:727). D1-only — the flag
+      // gates generateRepo's eligibility check (repo.go:349) and the render;
+      // there is no engine seam (REDEPLOY11 open issue 2: the silent drop
+      // made upstream's "mark a repo a template via API" flow unreachable).
+      if (form.template !== undefined && form.template !== found.repo.isTemplate) {
+        await drizzle(c.env.DB)
+          .update(repositories)
+          .set({ isTemplate: form.template, updatedAt: now })
           .where(eq(repositories.id, found.repo.id));
       }
 

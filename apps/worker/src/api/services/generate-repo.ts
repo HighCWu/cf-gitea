@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories } from "../../db/schema";
+import { tombstoneRepoDO } from "../../repos/purge";
 import { replicateRepoCopy, settleForkRow } from "../../repos/fork-task";
 import { RepoService, type RepoRow } from "../../repos/service";
 import { loadRepoSettings, saveRepoSettings } from "./repo-settings";
@@ -87,6 +88,24 @@ export interface GenerateRepoResult {
  * Steps 1-4 of the module header. `targetOwner` is resolved + authorized in
  * the route (the prepareDoerCreateRepoInOrg split). The template row rides
  * in as `templatePair.repo`; emptiness drives step 3.
+ *
+ * FAILURE CONTRACT (REDEPLOY11 open issue 1): the content copy rides the
+ * fork machinery's engine RPC chain synchronously, and the queue consumer's
+ * tolerance (at-least-once redelivery, runForkTask's catch → retry) has no
+ * request-path equivalent — one throw used to strand the created row at
+ * `status='creating'` forever behind a 500. Two upstream-parity arms close
+ * that class here:
+ *   - ONE immediate retry of the copy (replicateForkCatalog is idempotent by
+ *     its own contract — rows keyed, copies overwrite, and a committed
+ *     finalize reads as the already-done success — so a retry converges the
+ *     transient blip class the queue retries away);
+ *   - on a still-failing copy, upstream's cleanup: GenerateRepository's
+ *     `defer cleanupRepository(generateRepo)` (template.go:102-108) deletes
+ *     the half-made repo through DeleteRepositoryDirectly (create.go:448-455)
+ *     — the row must never linger. Ours deletes through the landed §2.5.5
+ *     pipeline (D1 cascade → DO tombstone → registry remove → queue purge),
+ *     then rethrows the original error; the route's declared codes are
+ *     unchanged (409/422 mappings, anything else 500).
  */
 export async function generateRepoFromTemplate(
   env: Env,
@@ -101,8 +120,10 @@ export async function generateRepoFromTemplate(
   const service = new RepoService(d1, {
     // The engine registry rides the row's create (REDEPLOY8, the forks.ts
     // convention): without the upsert the repo 404s on info/refs until a
-    // push lands.
+    // push lands. queue/tombstone arm the failure-cleanup delete below.
     registry: env.REGISTRY.getByName("registry"),
+    queue: env.REPO_TASKS,
+    tombstone: (engineName) => tombstoneRepoDO(env, engineName),
   });
 
   // Step 1 — the row (status='creating' guards git-HTTP pushes mid-copy).
@@ -113,28 +134,54 @@ export async function generateRepoFromTemplate(
     status: "creating",
   });
 
-  // Step 2 — the form metadata. default_branch: the form's or the
-  // template's; description: the form's only (side store, the forks.ts
-  // convention).
-  const defaultBranch = input.form.default_branch ?? template.defaultBranch;
-  await drizzle(d1)
-    .update(repositories)
-    .set({ defaultBranch, updatedAt: new Date() })
-    .where(eq(repositories.id, created.id));
-  const description = input.form.description ?? "";
-  if (description !== "") {
-    await saveRepoSettings(d1, created.id, { description }, new Date());
-  }
+  try {
+    // Step 2 — the form metadata. default_branch: the form's or the
+    // template's; description: the form's only (side store, the forks.ts
+    // convention).
+    const defaultBranch = input.form.default_branch ?? template.defaultBranch;
+    await drizzle(d1)
+      .update(repositories)
+      .set({ defaultBranch, updatedAt: new Date() })
+      .where(eq(repositories.id, created.id));
+    const description = input.form.description ?? "";
+    if (description !== "") {
+      await saveRepoSettings(d1, created.id, { description }, new Date());
+    }
 
-  // Steps 3-4 — the content copy rides the fork machinery; both arms end at
-  // `status='ready'` with an honest emptiness (the CAS settle is idempotent).
-  const fork = await service.get(created.id);
-  if (fork === null) throw new Error(`generate row vanished after creation: ${created.id}`);
-  if (input.form.git_content === true && !template.isEmpty) {
-    await replicateRepoCopy(env, template, fork);
-    await settleForkRow(drizzle(d1), fork, false);
-  } else {
-    await settleForkRow(drizzle(d1), fork, true);
+    // Steps 3-4 — the content copy rides the fork machinery; both arms end at
+    // `status='ready'` with an honest emptiness (the CAS settle is idempotent).
+    const fork = await service.get(created.id);
+    if (fork === null) throw new Error(`generate row vanished after creation: ${created.id}`);
+    if (input.form.git_content === true && !template.isEmpty) {
+      try {
+        await replicateRepoCopy(env, template, fork);
+      } catch (error) {
+        // The queue's redelivery tolerance, request-path sized: one
+        // idempotent re-run before the cleanup arm (module header).
+        console.error(
+          `[repos] generate ${created.id}: content copy failed, retrying once: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
+        await replicateRepoCopy(env, template, fork);
+      }
+      await settleForkRow(drizzle(d1), fork, false);
+    } else {
+      await settleForkRow(drizzle(d1), fork, true);
+    }
+  } catch (error) {
+    // Upstream's cleanupRepository contract (template.go:102-108): the
+    // half-made repo never lingers as a `creating` strand. Best-effort — a
+    // cleanup failure is logged loudly (create.go:451-453's notice posture),
+    // never a mask for the original error.
+    try {
+      await service.deleteRepository(created.id);
+    } catch (cleanupError) {
+      console.error(
+        `[repos] generate ${created.id}: cleanupRepository failed (row may be stranded): ` +
+          `${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+      );
+    }
+    throw error;
   }
 
   const repo = await service.get(created.id);

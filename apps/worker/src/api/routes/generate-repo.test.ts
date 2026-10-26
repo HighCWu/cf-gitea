@@ -10,8 +10,11 @@
  * by a site admin), and the content-copy integration: a non-empty template
  * with git_content=true settles the generated repo ready-non-empty with the
  * template's refs adopted into its own cell (the shared fork machinery —
- * replicateRepoCopy). The `.gitea/template` variable substitution is out of
- * slice (api/services/generate-repo.ts module header) and has no test arm.
+ * replicateRepoCopy), plus the REDEPLOY11 failure contract: a copy that
+ * cannot converge (storage bytes gone) 500s WITHOUT stranding the created
+ * row (upstream's cleanupRepository, template.go:102-108). The
+ * `.gitea/template` variable substitution is out of slice
+ * (api/services/generate-repo.ts module header) and has no test arm.
  */
 
 import { applyD1Migrations, SELF } from "cloudflare:test";
@@ -301,5 +304,42 @@ describe("generateRepo content copy (the shared fork machinery)", () => {
     expect(refs.refs.map((r) => ({ name: r.name, target: r.target }))).toEqual([
       { name: "refs/heads/trunk", target: oid },
     ]);
+  });
+
+  // REDEPLOY11 open issue 1: a failing content copy used to strand the
+  // created row at status='creating' behind the 500. Upstream's contract is
+  // GenerateRepository's `defer cleanupRepository(generateRepo)`
+  // (services/repository/template.go:102-108 → DeleteRepositoryDirectly,
+  // create.go:448-455): the half-made repo is DELETED, never left behind.
+  it("deletes the created row when the content copy fails (no 'creating' strand)", { timeout: 120_000 }, async () => {
+    await seedIdentities();
+    const service = new RepoService(env.DB);
+    // Fresh names: the engine DO cells and R2 objects persist across this
+    // file's tests (beforeEach clears D1 only), so reused names would let
+    // the copy read a prior test's surviving packs past the sabotage.
+    const template = await pushTemplateContent("alice", "tpl-strand", "trunk");
+    await markTemplate("alice", "tpl-strand");
+
+    // Sabotage the copy's input: wipe the template's stored pack bytes from
+    // R2 (catalog rows live in the DO, so listCatalogPage still serves the
+    // pack and copyObject's bucket.get misses — "fork copy: source object
+    // missing"). The retry re-throws; the cleanup arm then runs.
+    const row = await service.get(template.repoId);
+    const page = await env.REPO.getByName("alice/tpl-strand").listCatalogPage("", 10);
+    await env.REPO_PACKS.delete(
+      page.packs.flatMap((p) => [
+        `repos/${row!.storageKey}/packs/${p.packKey}.pack`,
+        `repos/${row!.storageKey}/packs/${p.packKey}.idx`,
+      ]),
+    );
+
+    const res = await router()(
+      "/api/v1/repos/alice/tpl-strand/generate",
+      aliceAuth({ method: "POST", body: JSON.stringify({ name: "copy-strand", git_content: true }) }),
+    );
+    expect(res.status).toBe(500);
+    // The strand is gone: no 'creating' row survives a failed generate (and
+    // the name is immediately reusable — a retry starts from a clean slate).
+    expect(await service.getBySlug("alice", "copy-strand")).toBeNull();
   });
 });
