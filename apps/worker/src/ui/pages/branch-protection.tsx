@@ -846,11 +846,15 @@ export interface BranchProtectionListData {
   savedRule: string | null;
 }
 
-function SettingsBranchesNav(props: { repoLink: string }) {
+function SettingsBranchesNav(props: { repoLink: string; repo: RepoRow }) {
   // The settings navbar is pages/settings.tsx's shared component (one
   // owner — imported at the top); this module renders it with `branches`
-  // active.
-  return <SettingsNavHost repoLink={props.repoLink} active="branches" />;
+  // active. The repo row arms the conditional Public Access item
+  // (navbar.tmpl:7-11 — the wave-settingsnav-fold's disclosed gap on this
+  // call site closed; like the five folded tabs the grant arm reduces to
+  // the visibility arm — this page loads no repo_units row, and
+  // loadRepoPublicAccess's read stays the public-access page's loader).
+  return <SettingsNavHost repoLink={props.repoLink} active="branches" repo={props.repo} />;
 }
 
 function BranchProtectionListPage(props: { ctx: UiContext; data: BranchProtectionListData }) {
@@ -863,7 +867,7 @@ function BranchProtectionListPage(props: { ctx: UiContext; data: BranchProtectio
   return (
     <BaseLayout ctx={ctx} title={branchProtectionLocale.protected_branch} pageClass="repository settings edit">
       <div class="ui container flex-container">
-        <SettingsBranchesNav repoLink={repoLink} />
+        <SettingsBranchesNav repoLink={repoLink} repo={repo} />
         <div class="flex-container-main">
           {archived ? (
             // branches.tmpl's IsArchived arm: the warning INSTEAD of the
@@ -1027,7 +1031,7 @@ function BranchProtectionEditPage(props: { ctx: UiContext; data: BranchProtectio
       pageClass="repository settings branches"
     >
       <div class="ui container flex-container">
-        <SettingsBranchesNav repoLink={repoLink} />
+        <SettingsBranchesNav repoLink={repoLink} repo={repo} />
         <div class="flex-container-main">
           {repo.isArchived ? (
             // The POST would 404 (RepoMustNotBeArchived) — the warning

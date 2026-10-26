@@ -508,7 +508,13 @@ export function CollaborationPage(props: {
   return (
     <BaseLayout ctx={ctx} title={collabLocale.collaborators} pageClass="repository settings collaboration">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="collaboration" />
+        {/* The repo row arms the conditional Public Access item
+            (navbar.tmpl:7-11 — the wave-settingsnav-fold's disclosed gap on
+            this call site closed; like the five folded tabs the grant arm
+            reduces to the visibility arm — this page loads no repo_units
+            row, and loadRepoPublicAccess's read stays the public-access
+            page's loader). */}
+        <SettingsNav repoLink={repoLink} active="collaboration" repo={repo} />
         <div class="flex-container-main">
           <div class="repo-setting-content">
             {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
