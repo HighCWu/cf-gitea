@@ -83,7 +83,7 @@ export const UPLOAD_PACK_ADVERTISEMENT_CT = "application/x-git-upload-pack-adver
 export const UPLOAD_PACK_RESULT_CT = "application/x-git-upload-pack-result";
 export const UPLOAD_PACK_REQUEST_CT = "application/x-git-upload-pack-request";
 
-const AGENT_CAP = "agent=cf-gitea-mirror/1";
+export const AGENT_CAP = "agent=cf-gitea-mirror/1";
 const GIT_PROTOCOL_V2 = "version=2";
 
 const OID_RE = /^[0-9a-f]{40}$/;
@@ -161,7 +161,7 @@ function pktStr(payload: string): string {
 const FLUSH = "0000";
 const DELIM = "0001";
 
-function concatBytes(a: Uint8Array<ArrayBufferLike>, b: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBuffer> {
+export function concatBytes(a: Uint8Array<ArrayBufferLike>, b: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);
   out.set(b, a.length);
@@ -683,7 +683,7 @@ export interface GitClientOptions {
 }
 
 /** Normalize a repo URL to its smart-HTTP base (no trailing slash). */
-function sourceBase(repoUrl: string): URL {
+export function sourceBase(repoUrl: string): URL {
   let url: URL;
   try {
     url = new URL(repoUrl);
@@ -699,22 +699,50 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 interface RunRequestOptions extends GitClientOptions {
   expectContentType: string;
   what: string;
+  /** Attribution prefix in runner error texts (default "source" — the pull
+   *  channel's wording; the push channel passes "mirror target"). */
+  peerLabel?: string;
 }
 
 /**
  * Issue one logical request with `redirect: "manual"`, re-validating every
  * hop (https + egress gate) and asserting the expected content type. The body
- * must be a replayable Uint8Array (a 307/308 retry re-sends it); POSTs carry
- * the smart-HTTP request content type (the SPEC-0003 §2.2 conventions, now on
- * the request side — git servers and our own gate both require it).
+ * must be a replayable Uint8Array (a 307/308 retry re-sends it) — a
+ * ReadableStream body is accepted for streaming POSTs (the outbound push's
+ * command+pack composition, SPEC push-mirror-outbound §2.2 step 4) and makes
+ * any redirect a hard refusal, because a consumed stream can never be
+ * replayed. POSTs carry the smart-HTTP request content type (the SPEC-0003
+ * §2.2 conventions, now asserted on the request side — git servers and our
+ * own gate both require it).
+ *
+ * Shared with pushclient.ts (the receive-pack runner is this same posture —
+ * pull-mirror-outbound SPEC §2.5 "reused, not duplicated").
  */
-async function runRequest(url: URL, init: { method: "GET" | "POST"; body?: Uint8Array; requestContentType?: string }, options: RunRequestOptions): Promise<Response> {
+export async function runRequest(
+  url: URL,
+  init: {
+    method: "GET" | "POST";
+    body?: Uint8Array | ReadableStream<Uint8Array>;
+    requestContentType?: string;
+    /** The Accept request header (the receive-pack POST advertises the
+     *  result type it can parse — gitprotocol-http.txt). */
+    accept?: string;
+    /** The `git-protocol` header, default `version=2` (the pull channel's
+     *  v2 offer). The push channel omits it: receive-pack is v0-only
+     *  (push-mirror-outbound §2.2 step 1). */
+    protocolHeader?: boolean;
+  },
+  options: RunRequestOptions,
+): Promise<Response> {
+  const peer = options.peerLabel ?? "source";
   const fetchImpl = options.fetchImpl ?? fetch;
   const maxHops = options.maxRedirects ?? MAX_REDIRECT_HOPS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   const policy = options.policy ?? defaultMirrorPolicy();
-  const headers: Record<string, string> = { "git-protocol": GIT_PROTOCOL_V2 };
+  const headers: Record<string, string> = {};
+  if (init.protocolHeader !== false) headers["git-protocol"] = GIT_PROTOCOL_V2;
   if (init.requestContentType !== undefined) headers["content-type"] = init.requestContentType;
+  if (init.accept !== undefined) headers.accept = init.accept;
   if (options.authHeader !== undefined) headers.authorization = options.authHeader;
 
   let current = url;
@@ -728,50 +756,56 @@ async function runRequest(url: URL, init: { method: "GET" | "POST"; body?: Uint8
         method: init.method,
         headers,
         ...(init.body === undefined ? {} : { body: init.body }),
+        ...(init.body instanceof ReadableStream ? { duplex: "half" as const } : {}),
         redirect: "manual",
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new SmartHttpError(`source request failed (${options.what}): ${message} [${sanitizeUrl(current)}]`);
+      throw new SmartHttpError(`${peer} request failed (${options.what}): ${message} [${sanitizeUrl(current)}]`);
     }
     if (REDIRECT_STATUSES.has(response.status)) {
       const location = response.headers.get("location");
-      if (location === null) throw new SmartHttpError(`source redirect ${response.status} without a Location header`);
+      if (location === null) throw new SmartHttpError(`${peer} redirect ${response.status} without a Location header`);
       const next = new URL(location, current);
       if (next.protocol !== "https:") {
-        throw new SmartHttpError(`source redirect left https (${next.protocol}) — refusing [${sanitizeUrl(next)}]`);
+        throw new SmartHttpError(`${peer} redirect left https (${next.protocol}) — refusing [${sanitizeUrl(next)}]`);
+      }
+      if (init.body instanceof ReadableStream) {
+        throw new SmartHttpError(
+          `${peer} redirected the ${options.what} POST with ${response.status} — a streamed body cannot be replayed, refusing`,
+        );
       }
       if (init.method === "POST" && response.status !== 307 && response.status !== 308) {
-        throw new SmartHttpError(`source redirected the fetch POST with ${response.status} (would downgrade to GET) — refusing`);
+        throw new SmartHttpError(`${peer} redirected the fetch POST with ${response.status} (would downgrade to GET) — refusing`);
       }
       current = next;
       continue;
     }
     if (response.status < 200 || response.status >= 300) {
-      throw new SmartHttpError(`source responded ${response.status} for ${options.what} [${sanitizeUrl(current)}]`);
+      throw new SmartHttpError(`${peer} responded ${response.status} for ${options.what} [${sanitizeUrl(current)}]`);
     }
     const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
     if (contentType !== options.expectContentType) {
       throw new SmartHttpError(
-        `source ${options.what} content-type is '${contentType ?? "none"}', expected '${options.expectContentType}' (dumb HTTP or a non-git server?) [${sanitizeUrl(current)}]`,
+        `${peer} ${options.what} content-type is '${contentType ?? "none"}', expected '${options.expectContentType}' (dumb HTTP or a non-git server?) [${sanitizeUrl(current)}]`,
       );
     }
     return response;
   }
-  throw new SmartHttpError(`source exceeded the ${maxHops}-redirect budget [${sanitizeUrl(current)}]`);
+  throw new SmartHttpError(`${peer} exceeded the ${maxHops}-redirect budget [${sanitizeUrl(current)}]`);
 }
 
 /** The runtime types `Response.body` as a loosely-parameterized stream; the
  *  wire carries Uint8Arrays — the same narrowing consumer.ts's
  *  readResponseCapped performs on its reader. */
-function responseBodyBytes(response: Response): ReadableStream<Uint8Array> {
+export function responseBodyBytes(response: Response): ReadableStream<Uint8Array> {
   if (response.body === null) throw new SmartHttpError("source response had no body");
   return response.body as ReadableStream<Uint8Array>;
 }
 
-/** Read a bounded response body fully (advertisement / ls-refs). */
-async function readCapped(body: ReadableStream<Uint8Array> | null, max: number, what: string): Promise<Uint8Array> {
+/** Read a bounded response body fully (advertisement / ls-refs / report). */
+export async function readCapped(body: ReadableStream<Uint8Array> | null, max: number, what: string): Promise<Uint8Array> {
   if (body === null) throw new SmartHttpError(`source ${what} had no body`);
   const reader = body.getReader();
   let out = new Uint8Array(0);

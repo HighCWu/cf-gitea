@@ -225,6 +225,13 @@
       "when": 1792979178462,
       "tag": "0031_conscious_snowbird",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1792983582913,
+      "tag": "0032_wealthy_siren",
+      "breakpoints": true
     }
   ]
 }

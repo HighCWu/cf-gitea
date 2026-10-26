@@ -12,23 +12,20 @@ import { parseHostPolicy } from "../../webhooks/ssrf";
  * repoDeletePushMirror, repoPushMirrorSync — upstream
  * routers/api/v1/repo/mirror.go:79-404 over models/repo/pushmirror.go).
  *
- * THE QUEUE SEMANTICS (honest, per the landed mirror-sync convention): the
- * sync trigger does NOT push inline — upstream's PushMirrorSync runs
- * runPushSync synchronously per mirror inside the request
+ * THE QUEUE SEMANTICS: the sync trigger does NOT push inline — upstream's
+ * PushMirrorSync runs runPushSync synchronously per mirror inside the request
  * (services/mirror/mirror_push.go:77-124, called from the API loop) — it
  * enqueues one `{kind: "push-mirror-sync", repoId, pushMirrorId}` message on
  * MIRROR_SYNC_QUEUE (queue `repo-tasks`) per mirror, the exact lane the
- * landed pull mirror-sync uses. The LANDED consumer (services/mirror/
- * sync.ts's queue arm) ACKs-and-drops any message whose kind is not
- * "mirror-sync", so a push-mirror-sync message is today a harmless no-op at
- * the consumer: the OUTBOUND push worker (upstream runPushSync — a
- * receive-pack against the remote, plus the last_update/last_error settle of
- * UpdatePushMirrorSyncStatus) is a declared FOLLOW-UP (SPEC-0009 territory).
- * Everything observable through THIS family is real: the rows, the wire
- * shapes, the enqueue, and the 422 arm when an enqueue fails (upstream's
- * failed-mirror collection, mirror.go:126-133). A cron/commit-triggered
- * producer for the landed rows is likewise follow-up scope — upstream's
- * PushMirrorsIterate scan has no landed counterpart yet.
+ * landed pull mirror-sync uses. The OUTBOUND push worker is now LANDED
+ * (specs/push-mirror-outbound.md): services/mirror/push-sync.ts
+ * (`handlePushMirrorSync`) consumes the kind and performs the real
+ * receive-pack push plus the last_update/last_error settle of
+ * UpdatePushMirrorSyncStatus; its consumer/producer arms (src/repos/purge.ts
+ * dispatch + src/index.ts cron/onPush) are the orchestrator wiring recorded
+ * in that module's header. Everything observable through THIS family is real:
+ * the rows, the wire shapes, the enqueue, and the 422 arm when an enqueue
+ * fails (upstream's failed-mirror collection, mirror.go:126-133).
  *
  * CREDENTIALS (upstream stores login/password INSIDE the git remote URL via
  * AddPushMirrorRemote — cf-gitea has no git-config layer): the structured
@@ -367,6 +364,8 @@ export async function addPushMirror(
       lastError: "",
       credentialsUsername,
       credentialsCiphertext: null, // sealed above when credentials exist
+      syncState: "idle", // the fresh row: never scheduled, first sync pending
+      nextSyncAt: 0,
     },
     repo.slug,
   );
@@ -420,8 +419,8 @@ export async function deletePushMirrorByName(db: D1Database, repoId: string, rem
 /**
  * PushMirrorSync (mirror.go:107-145): enqueue every mirror of the repo —
  * one `{kind: "push-mirror-sync", repoId, pushMirrorId}` message per row on
- * MIRROR_SYNC_QUEUE (the landed mirror-sync lane; see the module header for
- * the consumer follow-up). A repo with NO push mirrors enqueues nothing and
+ * MIRROR_SYNC_QUEUE (consumed by services/mirror/push-sync.ts). A repo with
+ * NO push mirrors enqueues nothing and
  * is upstream's 200 (the empty GetPushMirrorsByRepoID loop). Returns the
  * remote names whose enqueue FAILED — the caller renders upstream's
  * 422 "error occurred when syncing push mirrors: a, b" (mirror.go:126-133).

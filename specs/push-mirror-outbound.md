@@ -1,10 +1,12 @@
 # SPEC: Outbound Push Mirroring (the Worker as a git push client)
 
-Status: design of record for the outbound push-mirror sync — the follow-up that
-`apps/worker/src/api/services/push-mirrors.ts` (module header) and SPEC-0009 §6
-open question 5 both declare. Companion to SPEC-0009 (pull direction already
-landed: outbound fetch client, migrate, pull-mirror sync) and to the landed
-push-mirror CRUD + enqueue trigger (8f0aa90, `src/api/routes/push-mirrors.ts`).
+Status: **LANDED** (wave-28 `wave-pushmirror-outbound-impl`, 2026-10-26 — see
+§9 Resolutions). Design of record for the outbound push-mirror sync — the
+follow-up that `apps/worker/src/api/services/push-mirrors.ts` (module header)
+and SPEC-0009 §6 open question 5 both declare. Companion to SPEC-0009 (pull
+direction already landed: outbound fetch client, migrate, pull-mirror sync)
+and to the landed push-mirror CRUD + enqueue trigger (8f0aa90,
+`src/api/routes/push-mirrors.ts`).
 
 Upstream references are at the submodule pin `fc4936884584a41931906553d96c2601d750e6ef`.
 
@@ -368,6 +370,13 @@ the SPEC prefers the explicit state machine because it is the landed,
 queue-redelivery-proven pull pattern (claim `idle|queued → syncing`,
 `sync.ts:233-241`) and keeps "in-flight" observable.
 
+**RESOLVED (§9.3)**: the state-machine columns LANDED as migration
+`0032_wealthy_siren.sql` (`sync_state` text default 'idle' with the
+`push_mirrors_sync_state_check` CHECK, `next_sync_at` integer default 0, the
+`push_mirrors_next_sync_idx` index — SQLite requires the create/copy/drop
+table dance for the CHECK; all rows are preserved and the index set is
+rebuilt). Drizzle table `pushMirrors` carries both columns.
+
 ---
 
 ## 4. Scheduling and execution model
@@ -378,14 +387,20 @@ queue-redelivery-proven pull pattern (claim `idle|queued → syncing`,
   (`src/api/services/push-mirrors.ts:429-449`) → `{kind: "push-mirror-sync",
   repoId, pushMirrorId}` per row.
 - **Cron producer** (new arm in `scheduled`, `src/index.ts:133-135`):
-  `SELECT … FROM push_mirrors JOIN repositories ON … WHERE next_sync_at <= now
-  AND next_sync_at != 0 AND sync_state = 'idle' AND repositories.is_archived =
-  false ORDER BY coalesce(last_update_unix, 0) LIMIT 50` — upstream
-  `PushMirrorsIterate`'s WHERE/ORDER/LIMIT shape (`pushmirror.go:147-160`,
-  including the archived filter and `interval != 0` ⇔ `next_sync_at != 0`),
-  then CAS-claim each row `idle → queued` and `sendBatch` — the
-  `enqueueDueMirrorSyncs` pattern (`sync.ts:836-868`) over the push table. The
-  sub-hour cron's 30 s CPU budget (AGENTS.md) is safe: SELECT + enqueue only.
+  `SELECT … FROM push_mirrors JOIN repositories ON … WHERE interval_seconds !=
+  0 AND next_sync_at <= now AND sync_state = 'idle' AND
+  repositories.is_archived = false ORDER BY coalesce(last_update_unix, 0)
+  LIMIT 50` — upstream `PushMirrorsIterate`'s WHERE/ORDER/LIMIT shape
+  (`pushmirror.go:147-160`, including the archived filter and the
+  `interval != 0` scheduler switch). CORRECTION over the draft WHERE below
+  (§9.3): the draft's `next_sync_at != 0` conjunct contradicted §3.2's own
+  "0023-era rows wake up as idle/unscheduled and the first cron sweep
+  schedules them" — a never-synced row carries `next_sync_at = 0`, which must
+  be DUE (`0 <= now`), exactly upstream's arithmetic where `interval != 0`
+  (not the timestamp) is the on/off switch. Then CAS-claim each row
+  `idle → queued` and `sendBatch` — the `enqueueDueMirrorSyncs` pattern
+  (`sync.ts:836-868`) over the push table. The sub-hour cron's 30 s CPU
+  budget (AGENTS.md) is safe: SELECT + enqueue only.
 - **Commit hook** (new): in the entrypoint `onPush` path
   (`src/index.ts:39-44`), after the webhook fan-out, one SELECT
   `WHERE repo_id = ? AND sync_on_commit = true` (`pushmirror.go:140-145`
@@ -634,6 +649,9 @@ real-git leg validates server-text tolerance only.
 
 ## 8. Open questions for implementation
 
+> ALL RESOLVED — §9 records each decision as landed. §8 is kept verbatim as
+> the decision trail.
+
 1. **Refset**: keep v1 `refs/heads/*` + `refs/tags/*` (§2.3, recommended) or
    pursue literal `--mirror` `refs/*` parity (breaks GitHub-type targets for
    `refs/pull/*`)? Decision recorded in the SPEC header at implementation.
@@ -665,6 +683,69 @@ real-git leg validates server-text tolerance only.
 9. **`report-status-v2`**: v1 requests plain `report-status` (universal);
    `report-status-v2` adds option-rich ref results we do not consume. Revisit
    only if a major target stops advertising v0 report-status (none known).
+
+---
+
+## 9. Resolutions (as landed, 2026-10-26)
+
+The landing: `src/services/mirror/pushclient.ts` (the §2.5 client shell),
+`src/services/mirror/push-sync.ts` (`handlePushMirrorSync` + the two
+producers + the `isPushMirrorSyncMessage` queue guard), the shared-runner
+extensions in `gitclient.ts` (stream-body POSTs, the `Accept` header, the
+`git-protocol` offer made omittable — the pull channel's behavior is
+byte-identical), and migration 0032. Zero vendored-engine changes, as
+verdicted in §2.4.
+
+1. **Refset (§8.1)** — v1 `refs/heads/*` + `refs/tags/*` (the SPEC's own
+   recommendation, §2.3). `inPushRefset` gates BOTH the push side (creates)
+   and the prune side (deletes); HEAD and `refs/pull/*` are never planned and
+   never deleted. Out-of-refset advertised oids still ride the loopback
+   fetch's haves (the remote truly holds those objects).
+2. **Pack route (§8.2)** — the loopback `git-upload-pack` composition
+   shipped; the engine-native `packForPush` export stays deferred until a
+   measured cost justifies a NOTICE-recorded engine adaptation. The oracle
+   tests exercise the real sideband frame/deframe path end to end.
+3. **Scheduling (§8.3)** — the state-machine migration LANDED (0032, §3.2).
+   One correction to the draft WHERE: the scheduler's switch is
+   `interval_seconds != 0` (upstream's `interval != 0`); `next_sync_at = 0`
+   rows are DUE, not excluded (they are the never-synced 0023-era wake-up and
+   every fresh registration) — §4.1 as amended. The draft's
+   `next_sync_at != 0` conjunct would have starved exactly the rows §3.2
+   promised to schedule.
+4. **`last_error` shape (§8.4)** — single-line join (`describeReportFailure`:
+   first 5 failed refs + messages, then a counted tail), truncated to 2000 by
+   the failure settle. Upstream parity (one text column).
+5. **Sync-on-commit path (§8.5)** — the producer is LANDED as
+   `enqueuePushMirrorSyncsOnCommit(env, repoName)` (best-effort, catches its
+   own, never fails the push), but the entrypoint wiring is ORCHESTRATOR
+   scope: `src/index.ts` is a shared file outside this wave's ownership. The
+   exact three-line snippet rides `push-sync.ts`'s module header (the
+   `onPush` mount at the `handleUserPushEvent` call — `src/index.ts:43`, plus
+   the `scheduled` producer arm and the `purge.ts` consumer arm). Behavior
+   until wired: the sync API trigger and the cron producer (once wired) drive
+   the lane; commit hooks enqueue nothing.
+6. **Chunking (§8.6)** — deferred (the §1.3 default); the 1 GiB outbound cap
+   (`PACK_MAX_BYTES`) fails oversized syncs into `last_error`.
+7. **Rotation (§8.7)** — out of scope v1; no PATCH landed, upstream re-creates
+   the remote.
+8. **Wiki (§8.8)** — deferred (SPEC `wiki.md` lifecycle).
+9. **report-status-v2 (§8.9)** — plain `report-status` requested
+   (`RECEIVE_PACK_CAPS`), no side-band on the result (plain pkt-line report),
+   v0 advertisement only (the `git-protocol: version=2` offer header is
+   omitted on the receive legs — receive-pack is v0-only).
+
+**Testing as landed (§7)**: `pushclient.test.ts` (the decision tables, golden
+command-section bytes, shared report parser, advertisement refusals) and
+`push-sync.test.ts` (the §7 round-trip oracle — the fetchImpl seam rewrites
+`https://mirror.test/...` onto a real second engine mount, advertisement →
+loopback upload-pack → real receive into a second seeded repo, refs-match,
+no-op resync, prune delete with a deletes-only no-pack POST, force rewind via
+a 0-object pack — plus the mini in-test receive-pack server's failure arms:
+401, sealed-Basic auth, `ng non-fast-forward`, `unpack` error, diverged-remote
+command capture with `old := remote tip`, empty-local skip, busy/missing-row,
+egress denial — and the state battery: cron due-select + CAS claims with
+archived/interval-0/future exclusions, commit-hook eligibility, failure
+leaving `next_sync_at` due).
 
 ---
 

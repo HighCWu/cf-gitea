@@ -50,11 +50,12 @@
  *     the sync never fakes a sync.
  *   - `setHead` fixup on dangling HEAD (§4.3.8) is not driven yet.
  *   - The receive helpers below mirror pipeline.ts's private ones (command
- *     section, prepend, report-status parse, cell warm-up + the no-op
- *     execution-context stub — the R2-bind engine gap pipeline.ts documents).
- *     They collapse into imports from a shared module the moment pipeline.ts
- *     exports them; duplicated here now because this wave's file ownership is
- *     services/mirror/** only.
+ *     section, prepend, cell warm-up + the no-op execution-context stub — the
+ *     R2-bind engine gap pipeline.ts documents). The report-status parser
+ *     collapsed into pushclient.ts (shared with the outbound push channel);
+ *     the rest collapse into imports from a shared module the moment
+ *     pipeline.ts exports them; duplicated here now because the mirror wave's
+ *     file ownership is services/mirror/** only.
  *
  * WIRING (the cron + queue half — NOT registered in this wave; wrangler.jsonc
  * and src/index.ts are shared files owned by the orchestrator):
@@ -108,6 +109,7 @@ import {
   type Advertisement,
   type FetchImpl,
 } from "./gitclient";
+import { parseReportStatus } from "./pushclient";
 
 const TE = new TextEncoder();
 const TD = new TextDecoder();
@@ -432,17 +434,23 @@ async function syncMirrorLicenses(env: MirrorSyncEnv, repo: RepoRow): Promise<vo
 // ---------------------------------------------------------------------------
 
 /**
- * Decrypt `repo_mirrors.credentials_ciphertext` into the Authorization header
- * value. ENVELOPE CONTRACT (the PATCH/migrate wave that encrypts must adopt
- * this exact format — §4.2: AES-256-GCM keyed by the MIRROR_CREDENTIAL_KEY
- * KEK, AAD binding `(mirror_id, repo_id)` so a ciphertext cannot be moved
- * between rows):
+ * Decrypt a mirror row's `credentials_ciphertext` into the Authorization
+ * header value. The row shape is deliberately NARROW (the three envelope
+ * members) so both mirror directions' rows satisfy it structurally — the
+ * push channel's push_mirrors row decrypts through this exact function
+ * (push-mirror-outbound SPEC §5.1). ENVELOPE CONTRACT (the PATCH/migrate
+ * wave that encrypts must adopt this exact format — §4.2: AES-256-GCM keyed
+ * by the MIRROR_CREDENTIAL_KEY KEK, AAD binding `(mirror_id, repo_id)` so a
+ * ciphertext cannot be moved between rows):
  *
  *   ciphertext = base64( nonce[12] || AES-256-GCM(plaintext) )
  *   plaintext  = the full Authorization header value
  *              = "Basic base64(user:pass)" | "Bearer <token>"   (§2.2)
  */
-export async function mirrorAuthHeader(env: MirrorSyncEnv, mirror: MirrorRow): Promise<string | null> {
+export async function mirrorAuthHeader(
+  env: MirrorSyncEnv,
+  mirror: { id: number; repoId: string; credentialsCiphertext: string | null },
+): Promise<string | null> {
   if (mirror.credentialsCiphertext === null) return null;
   const kek = env.MIRROR_CREDENTIAL_KEY;
   if (kek === undefined || kek === "") {
@@ -482,9 +490,11 @@ function base64Decode(text: string): Uint8Array {
  * DurableGitHandler is a stateless function bundle over the shared bindings;
  * this second instance exists because src/index.ts does not export its one —
  * when the entrypoint ever exports it, this collapses to an import (same note
- * as the import channel's pipeline.ts).
+ * as the import channel's pipeline.ts). SHARED with push-sync.ts (the
+ * outbound push direction's loopback upload-pack call rides the same
+ * trusted-internal composition — push-mirror-outbound SPEC §2.4).
  */
-const engine = createDurableGit<Env>({ authorize, ui: false, namespaces: true });
+export const engine = createDurableGit<Env>({ authorize, ui: false, namespaces: true });
 
 const ZERO_OID = "0".repeat(40);
 const RECEIVE_CT = "application/x-git-receive-pack-request";
@@ -550,55 +560,10 @@ interface ReportStatus {
   results: { ref: string; ok: boolean; message?: string }[];
 }
 
-/** Strict 4-hex pkt-line length (the engine's PktParser rules; the import
- *  channel carries the same local copy). */
-function hex4(buf: Uint8Array, pos: number): number {
-  let n = 0;
-  for (let i = 0; i < 4; i++) {
-    const c = buf[pos + i];
-    if (c === undefined) throw new SmartHttpError("bad pkt-line length in report-status");
-    let d: number;
-    if (c >= 0x30 && c <= 0x39) d = c - 0x30;
-    else if (c >= 0x61 && c <= 0x66) d = c - 0x57;
-    else if (c >= 0x41 && c <= 0x5a) d = c - 0x37;
-    else throw new SmartHttpError("bad pkt-line length in report-status");
-    n = (n << 4) | d;
-  }
-  return n;
-}
-
-/** Parse the engine's report-status rendering — the receive verdict, i.e. the
- *  per-ref CAS outcome ("fetch first" = a concurrent writer won, §2.6 step 4).
- *  Mirrors pipeline.ts's private parser. */
-function parseReportStatus(body: ArrayBuffer): ReportStatus {
-  const bytes = new Uint8Array(body);
-  const out: ReportStatus = { unpackError: null, results: [] };
-  let pos = 0;
-  for (;;) {
-    if (pos + 4 > bytes.length) break;
-    const len = hex4(bytes, pos);
-    pos += 4;
-    if (len === 0) break; // flush: end of report
-    if (len < 4 || pos + len - 4 > bytes.length) throw new SmartHttpError("truncated report-status from the engine receive");
-    const line = TD.decode(bytes.subarray(pos, pos + len - 4)).trimEnd();
-    pos += len - 4;
-    if (line.startsWith("unpack ")) {
-      const messageText = line.slice("unpack ".length);
-      if (messageText !== "ok") out.unpackError = messageText;
-      continue;
-    }
-    if (line.startsWith("ok ")) {
-      out.results.push({ ref: line.slice(3), ok: true });
-    } else if (line.startsWith("ng ")) {
-      const rest = line.slice(3);
-      const sp = rest.indexOf(" ");
-      out.results.push(
-        sp === -1 ? { ref: rest, ok: false } : { ref: rest.slice(0, sp), ok: false, message: rest.slice(sp + 1) },
-      );
-    }
-  }
-  return out;
-}
+/** Shared with pushclient.ts (the outbound push direction parses the same
+ *  report-status shape — the SPEC §2.5 collapse note). */
+export { parseReportStatus };
+export type { ReportStatus };
 
 /**
  * Warm the repo cell with its advert (GET info/refs → the DO's fetch path) —
@@ -606,9 +571,10 @@ function parseReportStatus(body: ArrayBuffer): ReportStatus {
  * contact is a receive RPC never binds R2 (rpcBind derives from meta.repo,
  * set only by fetch), so a retry receive whose object lookups hit a recorded
  * pack needs the binding. Collapses into a shared import when pipeline.ts
- * exports its helper.
+ * exports its helper. SHARED with push-sync.ts (the outbound push direction's
+ * loopback upload-pack reads the same R2-backed packs through the same cell).
  */
-async function warmCell(env: MirrorSyncEnv, repo: RepoRow): Promise<void> {
+export async function warmCell(env: MirrorSyncEnv, repo: RepoRow): Promise<void> {
   const req = new Request(`https://mirror.internal/${engineName(repo.ownerNamespace, repo.slug)}.git/info/refs?service=git-receive-pack`);
   markGateCleared(req);
   await engine.fetch(req, env, NOOP_CTX);
@@ -672,7 +638,9 @@ class NoopSpan {
  *  deliberate assertion in place of fabricating a module namespace). */
 const EXPORTS_HOLE = undefined as never;
 
-const NOOP_CTX: ExecutionContext = {
+/** SHARED with push-sync.ts (the outbound push direction's loopback calls
+ *  need the same honest execution-context stub). */
+export const NOOP_CTX: ExecutionContext = {
   waitUntil: () => {},
   passThroughOnException: () => {},
   abort: () => {},
@@ -696,7 +664,9 @@ const NOOP_CTX: ExecutionContext = {
 // handleMirrorSync (§2.6) + the cron producer (§2.6 scheduling)
 // ---------------------------------------------------------------------------
 
-function mirrorEgressPolicy(env: MirrorSyncEnv): HostPolicy {
+/** SHARED with push-sync.ts (the push channel runs the same MIRROR_*
+ *  egress policy over its stored target URL — push-mirror-outbound §5.2). */
+export function mirrorEgressPolicy(env: MirrorSyncEnv): HostPolicy {
   const mode = env.MIRROR_EGRESS_MODE === "strict" ? "strict" : "lax";
   return parseHostPolicy(env.MIRROR_ALLOWED_HOST_LIST, mode);
 }

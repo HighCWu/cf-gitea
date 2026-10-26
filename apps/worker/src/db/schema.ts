@@ -2230,11 +2230,30 @@ export const pushMirrors = sqliteTable(
     /** AES-256-GCM over the full Authorization header value (§4.2), keyed by
      *  the MIRROR_CREDENTIAL_KEY KEK, AAD-bound to `(row.id, repo_id)`. */
     credentialsCiphertext: text("credentials_ciphertext"),
+    /** The enqueue/serialization guard (push-mirror-outbound SPEC §3.2/§4.1):
+     *  `idle → queued` (the cron producer), `queued|idle → syncing` (the
+     *  consumer claim), back to `idle` on settle — the landed, queue-
+     *  redelivery-proven pull pattern (repo_mirrors.sync_state). CHECK'd in
+     *  DDL exactly like the pull table's constraint. */
+    syncState: text("sync_state", { enum: ["idle", "queued", "syncing"] })
+      .notNull()
+      .default("idle"),
+    /** Next scheduled sync (unix seconds; push-mirror-outbound SPEC §3.2).
+     *  `0` = due-now-for-never-synced rows and the only state of
+     *  commit-triggered-only mirrors — the cron sweep's
+     *  `interval_seconds != 0` filter is the scheduler's on/off switch
+     *  (upstream PushMirrorsIterate's `interval != 0`), so a 0 here is due
+     *  arithmetic (`0 <= now`) for interval-carrying rows and inert for
+     *  interval-0 rows. */
+    nextSyncAt: integer("next_sync_at").notNull().default(0),
   },
   (t) => [
     // Upstream's xorm INDEX tags (pushmirror.go:20,27).
     index("push_mirrors_repo_id_idx").on(t.repoId),
     index("push_mirrors_last_update_idx").on(t.lastUpdateUnix),
+    // The cron producer's due scan (push-mirror-outbound SPEC §3.2/§4.1).
+    index("push_mirrors_next_sync_idx").on(t.nextSyncAt),
+    check("push_mirrors_sync_state_check", sql`${t.syncState} IN ('idle', 'queued', 'syncing')`),
   ],
 );
 

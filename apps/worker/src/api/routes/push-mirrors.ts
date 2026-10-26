@@ -44,10 +44,12 @@ import {
  *
  * ENQUEUE SEMANTICS — sync sends one
  * `{kind: "push-mirror-sync", repoId, pushMirrorId}` per mirror on
- * MIRROR_SYNC_QUEUE and 200s; the LANDED consumer ACKs unknown kinds, so the
- * outbound push worker is follow-up scope (services/push-mirrors.ts header).
- * The 422 arm ("error occurred when syncing push mirrors: a, b",
- * mirror.go:126-133) fires only when an enqueue itself fails.
+ * MIRROR_SYNC_QUEUE and 200s; the outbound push worker is LANDED
+ * (services/mirror/push-sync.ts, specs/push-mirror-outbound.md) — its queue
+ * dispatch arm (src/repos/purge.ts) and cron/onCommit producers (src/index.ts)
+ * are the orchestrator wiring that module's header records. The 422 arm
+ * ("error occurred when syncing push mirrors: a, b", mirror.go:126-133) fires
+ * only when an enqueue itself fails.
  *
  * DELETE is IDEMPOTENT like upstream: models.DeletePushMirrors never errors
  * on a zero-rows delete, so an unknown remote name STILL 204s — the
