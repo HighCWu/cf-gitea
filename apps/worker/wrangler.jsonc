@@ -12,16 +12,20 @@
     "cpu_ms": 300000
   },
   // Module rules: the fileicon layer (src/ui/fileicon/, cdf683a) imports its
-  // basic-theme SVGs as `*.svg?raw` strings — vite serves ?raw natively (so
-  // dev/tests never trip), but `wrangler deploy`'s esbuild needs an explicit
-  // Text loader, and rule globs match the path WITH the query suffix (the
-  // precise minimal form proven by REDEPLOY18's controlled variant test:
-  // plain **/*.svg does NOT match **/*.svg?raw; first observed at the
-  // tree-view edge, 831709f — the first entry-graph carrier).
+  // basic-theme SVGs and both material-icon JSON pools as `*.svg?raw` /
+  // *.json?raw strings — vite serves ?raw natively (so dev/tests never
+  // trip), but `wrangler deploy`'s esbuild IGNORES the query and applies its
+  // built-in loaders (the .json loader returns a PARSED OBJECT —
+  // JSON.parse(object) threw on every tree-view envelope request in
+  // production, 2026-10-26); rule globs must carry the query suffix
+  // themselves (REDEPLOY18's controlled tests: plain **/*.svg does NOT match
+  // **/*.svg?raw). LESSON: any NEW `?raw` import in the deploy entry graph
+  // needs a glob member here — the vite affordance is invisible to wrangler
+  // until an edge first carries it (svg at 831709f, json at this rule).
   "rules": [
     {
       "type": "Text",
-      "globs": ["**/*.svg?raw"]
+      "globs": ["**/*.svg?raw", "**/*.json?raw"]
     }
   ],
   // Webhook payload compare URLs (mirror sync + user push) — upstream's own
