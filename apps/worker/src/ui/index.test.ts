@@ -173,7 +173,6 @@ describe("handlesUiRoute", () => {
     "/octo/hello/git-receive-pack",
     "/octo/hello/HEAD",
     "/octo/hello/info/lfs/locks", // SPEC-0006 family
-    "/octo/hello/settings/keys", // the deeper settings space stays engine-owned (wave 4 claims /settings + /settings/hooks; wave 15 claims /settings/branches + its writes — keys/tags stay engine-owned)
     "/octo/hello/commit/abc1234/extra", // wave-18 claims the single {sha}
     "/octo/hello/commit", // segment only — deeper tails and the bare literal
                           // stay engine-owned (upstream web.go:1740/1760)
@@ -182,8 +181,11 @@ describe("handlesUiRoute", () => {
     "/octo/hello/commitsx/branch/main",
     "/explore/organizations", // the wave-9 explore literals bind exactly —
     "/explore/code", // every other tail stays engine/parent-owned
-    "/explore/repos/sitemap-1.xml",
     "/explore/users/extra",
+    // NOTE: /octo/hello/settings/keys and /explore/repos/sitemap-1.xml left
+    // this table — window-2d (b54f709) and window-2e-A (84996c6) claimed
+    // them; the claim pins live in the parse table below (the wiki
+    // matrix's escalation).
   ])("does not claim: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(false);
   });
@@ -243,7 +245,7 @@ describe("parseUiRoute", () => {
     ["/explore/repos", { family: "explore-repos" }],
     ["/explore/users", { family: "explore-users" }],
     ["/explore/organizations", null], // the literals bind exactly
-    ["/explore/repos/sitemap-1.xml", null],
+    ["/explore/repos/sitemap-1.xml", { family: "explore-repos-sitemap", idx: 1 }], // window-2e-A (84996c6)
     ["/explore/users/extra", null],
     ["/EXPLORE", { family: "owner-home", owner: "EXPLORE" }], // same-named
     ["/Explore/repos", { family: "home", owner: "Explore", repo: "repos", refSuffix: null }], // namespaces keep their families (case-exact literals)
