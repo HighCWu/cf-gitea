@@ -16,13 +16,22 @@
  *   anonymous challenges (row 15), a SPEC-0002-verifiable credential runs the
  *   rows 16-20 matrix (probe → dummy advertisement, POST → create via
  *   RepoService with status='creating'), and every other credential passes
- *   through to the engine untouched. Reads and the HEAD file also pass
- *   through. That residual passthrough is DELIBERATE and stays: the engine's
- *   own create-by-push (GIT_TOKEN auth) is the transitional population — the
- *   e2e suite's repositories live there (no D1 rows, `devtoken` auth) — and
- *   TODO(SPEC-0003 ENGINE-WAVE) removes it only when every engine repo is
- *   D1-backed (registry sync alone is not sufficient: engine-known-but-
- *   D1-unknown repos must keep working until their creation path owns rows).
+ *   through to the engine untouched. Reads pass through ONLY behind the
+ *   registry-existence oracle (engineKnownRead: one fresh Registry DO RPC —
+ *   the engine's own name resolution minus its per-isolate 20 s memo —
+ *   answering the engine's verbatim 404 on a miss), so a DELETED repository's
+ *   registry entry — removed synchronously by RepoService.deleteRepository —
+ *   makes every later read 404 at t+0 instead of the engine memo resurrecting
+ *   the tombstoned cell's refs for seconds (the REDEPLOY10/11 production
+ *   probe's read-after-delete window). The HEAD file also passes through
+ *   untouched (the headless engine 404s it pre-auth, no registry consult).
+ *   The residual engine passthrough is DELIBERATE and stays for
+ *   registry-known names: the engine's own create-by-push (GIT_TOKEN auth) is
+ *   the transitional population — the e2e suite's repositories live there
+ *   (no D1 rows, `devtoken` auth) — and TODO(SPEC-0003 ENGINE-WAVE) removes
+ *   it only when every engine repo is D1-backed (registry sync alone is not
+ *   sufficient: engine-known-but-D1-unknown repos must keep working until
+ *   their creation path owns rows).
  *
  * The gate's claim (SPEC-0003 §2.1, as widened by the defense-in-depth wave):
  * the four git-protocol routes ALWAYS, plus the repository-scoped ENGINE
@@ -75,6 +84,8 @@ import {
   bareBadRequest,
   basicChallenge,
   dummyAdvertisement,
+  engineJsonRepoNotFound,
+  engineRepoNotFound,
   goGetMeta,
   headFile,
   redirectPermanent,
@@ -284,6 +295,59 @@ export async function gitHttpGate(
 }
 
 /**
+ * The D1-missing read passthrough with an existence oracle in front of it
+ * (the registry-series residual, REDEPLOY10/11 production probes,
+ * docs/design/p0-evidence.md: after API DELETE of a renamed repo, the NEW
+ * name's registry entry kept serving refs ~5.4-6.4 s — every trial dirty at
+ * t+0 — while non-renamed deleted repos 404'd immediately).
+ *
+ * Root cause, precisely: NOT the Registry DO (packages/git-engine
+ * src/registry.ts is a synchronous SQLite store — `remove` in the delete path
+ * is awaited before the 204, and nothing there caches) and NOT a D1 replica
+ * (no read replicas are configured). The stale layer is the engine's
+ * PER-ISOLATE memo of registry lookups — `infoMemo` in packages/git-engine
+ * src/mod.ts (`repoInfo`, 20 s positive TTL): every read the engine serves
+ * seeds it, the delete path's awaited `registry.remove` cannot reach into
+ * other isolates' maps (the engine only deletes its OWN isolate's entry on a
+ * receive/admin response, mod.ts `infoMemo.delete`), and a read landing on a
+ * seeded isolate within the TTL sails past the `!info` 404 into the
+ * TOMBSTONED cell, which keeps answering reads until the queue purge's
+ * destroy (SPEC-0003 §2.5.5 step 4) heals it. The renamed probe hit this
+ * deterministically because its lifecycle ALWAYS reads the new name's advert
+ * seconds before the delete (the carry verification).
+ *
+ * Fix layer: the GATE. D1 is the existence authority (AGENTS.md), and the
+ * gate has already resolved the D1 row (miss) when it gets here — so before
+ * delegating a read to the engine, consult the Registry DO directly (one
+ * fresh RPC, the same combined name the engine's own `repoInfo` would look
+ * up — raw request casing, `.git` trimmed). Registry-miss ⇒ answer the
+ * engine's byte-identical 404 here; the engine — memo included — is never
+ * reached for a deleted repo, so the awaited registry remove in
+ * RepoService.deleteRepository (service.ts step 2b) takes effect t+0.
+ * Registry-hit ⇒ the verbatim passthrough continues for exactly the
+ * population it exists for (engine-known-but-D1-unknown repos: the e2e
+ * suite; every push upserts the registry, so a pushed transitional repo is
+ * always known). Performance shape: zero added work on the D1-resolved hot
+ * path (this branch only runs on a row miss, where the passthrough would
+ * have made the SAME registry lookup — via the memo or fresh — anyway); the
+ * DO RPC replaces, not adds to, the engine's own. HEAD is exempt: the
+ * headless engine 404s it pre-auth without consulting the registry, so
+ * nothing can leak there.
+ */
+async function engineKnownRead(
+  req: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  engine: DurableGitHandler<Env>,
+  route: GitHttpRoute,
+): Promise<Response> {
+  const name = `${route.owner}/${route.repo}`;
+  const known = await env.REGISTRY.getByName("registry").get(name);
+  if (known === null) return engineRepoNotFound(name);
+  return engine.fetch(req, env, ctx);
+}
+
+/**
  * Everything below runs only when the repositories row is missing (and no
  * redirect claims the name): the push-create surface (§2.4 rows 15-20) plus
  * the deliberate transitional passthrough.
@@ -299,21 +363,26 @@ async function handleUnknownRepository(
   repoLower: string,
 ): Promise<Response> {
   // Reads and the HEAD file pass through untouched (the engine's public-read
-  // behavior for legacy repos is unchanged; §4.13's HEAD probe 404s there).
+  // behavior for legacy repos is unchanged; §4.13's HEAD probe 404s there —
+  // headless, the engine 404s the HEAD shape pre-auth, before any registry
+  // consult, so it cannot leak and needs no oracle). The protocol reads ride
+  // the registry-existence oracle below.
   if (route.kind === "head") return engine.fetch(req, env, ctx);
   // The receive-pack advert probe (GET info/refs?service=git-receive-pack) is
   // the push-create probe; every other read (upload-pack, unknown/missing
-  // service) passes through — the engine answers its own 400 (§2.1 item 2).
+  // service) resolves through the oracle — a registry-known name passes
+  // through to the engine exactly as before, a registry-miss name gets the
+  // engine's own verbatim 404.
   let probe = false;
   if (route.kind === "info-refs") {
     const refsOp = infoRefsOp(url);
-    if (refsOp === null || refsOp === "read") return engine.fetch(req, env, ctx);
+    if (refsOp === null || refsOp === "read") return engineKnownRead(req, env, ctx, engine, route);
     probe = true;
   } else if (route.kind === "upload-pack") {
-    return engine.fetch(req, env, ctx);
+    return engineKnownRead(req, env, ctx, engine, route);
   }
   // Only receive-pack (advert probe or RPC) reaches the push-create surface.
-  if (route.kind !== "receive-pack" && !probe) return engine.fetch(req, env, ctx);
+  if (route.kind !== "receive-pack" && !probe) return engineKnownRead(req, env, ctx, engine, route);
 
   // Row 15: anonymous pushes never reach push-create logic — 401 + challenge.
   const credential = requestCredential(req);
@@ -476,6 +545,19 @@ async function handleEnginePathBranch(
         return deleteRepositoryViaEngineShape(env, canonical.repo);
       }
       return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug);
+    }
+    // D1-missing api reads get the same registry-existence oracle as the git
+    // reads (engineKnownRead's docstring): the engine's per-isolate memo would
+    // otherwise serve a deleted repo's JSON refs for up to its 20 s TTL. The
+    // miss answers the engine's JSON 404 verbatim; admin shapes keep the
+    // verbatim passthrough — the transitional population's engine wipe is
+    // idempotent and registry-independent (a second cleanup DELETE must stay
+    // a 200, not a 404).
+    if (route.kind === "api") {
+      const name = `${route.owner}/${route.repo}`;
+      if ((await env.REGISTRY.getByName("registry").get(name)) === null) {
+        return engineJsonRepoNotFound(name);
+      }
     }
     return engine.fetch(req, env, ctx);
   }

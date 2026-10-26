@@ -92,6 +92,35 @@ export function redirectPermanent(originalUrl: string, ownerNamespace: string, s
 }
 
 /**
+ * The vendored engine's registry-miss 404 for git-protocol reads
+ * (packages/git-engine `mod.ts`: `repository not found: ${repo}\n`, plain
+ * 404) — the exact not-found the D1-missing read passthrough has always
+ * surfaced for unknown names. The gate's registry-existence oracle
+ * (gitHttpGate's unknown-repository branch) answers this itself, byte-identical,
+ * so a deleted repository's read is decided WITHOUT reaching the engine —
+ * whose per-isolate registry memo (`infoMemo`, 20 s positive TTL) otherwise
+ * resurrects the deleted repo's refs on the isolate that served its last
+ * pre-delete read (the REDEPLOY10/11 production probe's ~5.4-6.4 s
+ * read-after-delete window on a renamed repo's new name).
+ */
+export function engineRepoNotFound(engineName: string): Response {
+  return new Response(`repository not found: ${engineName}\n`, { status: 404 });
+}
+
+/**
+ * The same registry miss in the engine's JSON API shape (`mod.ts` `/api/*`
+ * arm: `{ error: "repository not found: ${repo}" }`, 404,
+ * `x-content-type-options: nosniff`) for the engine-path branch's D1-missing
+ * api reads — the same memo-staleness leak class, one surface over.
+ */
+export function engineJsonRepoNotFound(engineName: string): Response {
+  return Response.json({ error: `repository not found: ${engineName}` }, {
+    status: 404,
+    headers: { "x-content-type-options": "nosniff" },
+  });
+}
+
+/**
  * Dummy empty advertisement for the push-create probe (§2.2/§2.4 rows 15-20,
  * upstream `dummyInfoRefs` githttp.go:268-300): the exact bytes a fresh empty
  * repository would advertise for receive-pack — `# service=` pkt-line, flush,

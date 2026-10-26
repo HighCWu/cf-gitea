@@ -658,6 +658,76 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
     expect(oldName.status).toBe(404);
   });
 
+  it("delete-after-rename answers not-found at t+0 even when the pre-delete advert seeded the engine's registry memo", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "tomb-ads");
+    const { oid, pack } = await buildPack();
+    expect((await pushRef(token, "alice", "tomb-ads", "refs/heads/main", oid, pack)).status).toBe(200);
+    await service().rename(repo.id, "tomb-ads2");
+
+    // The production lifecycle's carry verification: an anonymous advert on
+    // the NEW name seconds before the delete. This is the read that seeds the
+    // engine's per-isolate registry memo (packages/git-engine mod.ts infoMemo,
+    // 20 s positive TTL) — the delete's awaited registry.remove cannot reach
+    // into it, so pre-fix the next read on this isolate sailed past the
+    // engine's !info 404 into the TOMBSTONED cell and served the refs for
+    // seconds (the REDEPLOY10/11 probe's ~5.4-6.4 s window, dirty at t+0 in
+    // all three trials).
+    const carried = await uploadAdvert("alice", "tomb-ads2");
+    expect(carried.status).toBe(200);
+    expect(new TextDecoder().decode(await carried.arrayBuffer())).toContain(oid);
+    // The redirect-served OLD name stays the INTENTIONAL direction while the
+    // row lives (row 13: 301, and the followed canonical URL serves).
+    const old = await SELF.fetch("https://example.com/alice/tomb-ads.git/info/refs?service=git-upload-pack", {
+      redirect: "manual",
+    });
+    expect(old.status).toBe(301);
+    expect((await SELF.fetch(old.headers.get("location")!)).status).toBe(200);
+
+    // The DELETE 204's exact awaited half (D1 cascade + tombstone + registry
+    // remove) — no sleep, no poll: the NEXT request is t+0.
+    await service().deleteRepository(repo.id);
+
+    // t+0 on the renamed NEW name: the gate's fresh registry oracle answers
+    // the engine's byte-identical 404 — the tombstoned cell is never reached.
+    const after = await uploadAdvert("alice", "tomb-ads2");
+    expect(after.status).toBe(404);
+    expect(await after.text()).toBe("repository not found: alice/tomb-ads2\n");
+    // The upload-pack POST surface gets the same t+0 answer.
+    const post = await SELF.fetch("https://example.com/alice/tomb-ads2.git/git-upload-pack", {
+      method: "POST",
+      headers: { "content-type": "application/x-git-upload-pack-request" },
+      body: "0000",
+    });
+    expect(post.status).toBe(404);
+    expect(await post.text()).toBe("repository not found: alice/tomb-ads2\n");
+    // The old name (its redirect row cascaded with the repo) is dead too.
+    expect((await uploadAdvert("alice", "tomb-ads")).status).toBe(404);
+    // The engine JSON API surface: same oracle, the engine's JSON 404 shape.
+    const api = await SELF.fetch("https://example.com/alice/tomb-ads2/api/refs");
+    expect(api.status).toBe(404);
+    expect(await api.json()).toEqual({ error: "repository not found: alice/tomb-ads2" });
+  });
+
+  it("delete-without-rename also answers not-found at t+0 when a pre-delete read seeded the memo", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "tomb-plain");
+    const { oid, pack } = await buildPack();
+    expect((await pushRef(token, "alice", "tomb-plain", "refs/heads/main", oid, pack)).status).toBe(200);
+    // The non-renamed production trials measured clean only because their
+    // post-delete poll landed on a memo-cold isolate; the stale entry is
+    // name-agnostic — seed it the same way and assert the t+0 404.
+    expect((await uploadAdvert("alice", "tomb-plain")).status).toBe(200);
+
+    await service().deleteRepository(repo.id);
+
+    const after = await uploadAdvert("alice", "tomb-plain");
+    expect(after.status).toBe(404);
+    expect(await after.text()).toBe("repository not found: alice/tomb-plain\n");
+  });
+
   it("the engine-shape DELETE resolves a renamed repo's old name (deletes the canonical repo)", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
