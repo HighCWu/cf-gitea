@@ -7,7 +7,16 @@ import { ApiError } from "../errors";
 import type { PullRequest, PRBranchInfo } from "../models/pull";
 import { hasWorkInProgressPrefix, toApiIssue } from "./issues";
 import { mergeableOfRow } from "./pull-engine";
-import { apiUserFromRow, findRepositoryByPath, toApiRepository, type RepositoryWithOwner, type Viewer } from "./repository";
+import {
+  apiUserFromRow,
+  canViewRepository,
+  findRepositoryById,
+  findRepositoryByPath,
+  toApiRepository,
+  viewerTeamAccessMode,
+  type RepositoryWithOwner,
+  type Viewer,
+} from "./repository";
 
 /**
  * PR-block reads/converters backing the tier-1 `pull` routes (SPEC-0004 §2.4
@@ -55,7 +64,8 @@ import { apiUserFromRow, findRepositoryByPath, toApiRepository, type RepositoryW
  *     ErrPullRequestAlreadyExists.Error (issue_id carries the INDEX);
  *   - base/head lookup: routers/api/v1/repo/pull.go GetPullRequestByBaseHead
  *     (the `owner:branch` / `owner/name:branch` fork form resolves the head
- *     repo — forks cannot exist yet, so the fork form 404s);
+ *     repo by path — the anti-enumeration CanRead 404 is the route's guard,
+ *     landed with the a16f60e fork edge);
  *   - WIP draft: models/issues/pull.go HasWorkInProgressPrefix.
  */
 
@@ -281,19 +291,72 @@ function baseBranchInfo(viewer: Viewer, pair: RepositoryWithOwner, pr: PullReque
 /**
  * The HEAD side `PRBranchInfo`: `ref` is `refs/pull/{index}/head` — the exact
  * fallback upstream takes when the head branch no longer exists (branch
- * existence is an engine read, deferred with the mergeability wave);
- * `repo`/`repo_id` render only for same-repo PRs (forks cannot exist yet),
- * mirroring upstream's hidden-head-repo rule (services/convert/pull.go:197 —
- * a head repo the doer cannot see stays `repo_id: -1`, `repo: null`).
+ * existence is an engine read, deferred with the mergeability wave).
+ *
+ * The `repo`/`repo_id` pair ports upstream's hidden-head-repo rule
+ * (services/convert/pull.go:187-199 single, :435-450 list — both apply the
+ * same gate): for a Github-flow PR whose head repo differs from the base,
+ * the doer's permission is resolved ON THE HEAD REPO and the fork renders
+ * (`Head.RepoID` + `ToRepo(head, p)`) only when
+ * `p.HasAnyUnitAccessOrPublicAccess()` (models/perm/access/repo_permission.go:77)
+ * — a hidden head repo keeps the struct-literal defaults `repo_id: -1`,
+ * `repo: null` (pull.go:120) while `label`/`ref`/`sha` stay set. The gate
+ * folds onto the landed visibility matrix: upstream grants an anonymous doer
+ * AccessModeRead on a PUBLIC repo (repo_permission.go:468-472) and None on a
+ * private one (:442-446), so `canViewRepository` + the org/team grant
+ * (`viewerTeamAccessMode`) is the exact predicate — a public fork renders
+ * for everyone (anonymous included, pull-only permissions block), a private
+ * fork only for its owner / site admin / org-granted doers. Same-repo heads
+ * short-circuit like upstream's `HeadRepoID == BaseRepoID` arm (pull.go:197,
+ * no permission read, the base pair renders).
+ *
+ * Deviations: a deleted head-repo row hides like an unreadable one (upstream
+ * `LoadHeadRepo` errors out the whole converter — impossible there, the row
+ * is NOT NULL); the AGit-flow arm (pull.go:156-161: head = the base repo,
+ * name = "") has no D1 producer (every row is Github flow); and the
+ * `ToPayloadPullRequest` isPayload arm (webhooks render the head repo
+ * regardless, pull.go:33-37) is not split out — payload emitters share this
+ * API visibility rule until a payload mode is threaded through.
  */
-function headBranchInfo(viewer: Viewer, pair: RepositoryWithOwner, pr: PullRequestRow): PRBranchInfo {
+async function headBranchInfo(
+  d1: D1Database,
+  viewer: Viewer,
+  pair: RepositoryWithOwner,
+  pr: PullRequestRow,
+): Promise<PRBranchInfo> {
   const sameRepo = pr.headRepoId === pair.repo.id;
+  if (sameRepo) {
+    return {
+      label: pr.headBranch,
+      ref: pullHeadRefName(pr.index),
+      sha: pr.headSha ?? "",
+      repo_id: repoIdNumber(pr.headRepoId),
+      repo: toApiRepository(viewer, pair),
+    };
+  }
+  const headPair = await findRepositoryById(d1, pr.headRepoId);
+  if (headPair !== null) {
+    const teamMode = await viewerTeamAccessMode(d1, viewer, headPair.repo);
+    if (canViewRepository(viewer, headPair.repo, teamMode)) {
+      return {
+        label: pr.headBranch,
+        ref: pullHeadRefName(pr.index),
+        sha: pr.headSha ?? "",
+        repo_id: repoIdNumber(headPair.repo.id),
+        repo: toApiRepository(viewer, headPair, undefined, teamMode),
+      };
+    }
+  }
+  // Hidden head (unreadable fork, or the row vanished): the -1/nil defaults
+  // upstream starts from (pull.go:120), branch fields intact. The JSON writer
+  // drops `undefined`, so the emitted body omits `repo` where Go marshals a
+  // literal null — key-absence on the wire, the schema stays optional.
   return {
     label: pr.headBranch,
     ref: pullHeadRefName(pr.index),
     sha: pr.headSha ?? "",
-    repo_id: sameRepo ? repoIdNumber(pr.headRepoId) : -1,
-    repo: sameRepo ? toApiRepository(viewer, pair) : undefined,
+    repo_id: -1,
+    repo: undefined,
   };
 }
 
@@ -373,7 +436,7 @@ export async function toApiPullRequest(
     merged_by: mergedBy,
     allow_maintainer_edit: pr.allowMaintainerEdit,
     base: { ...baseBranchInfo(viewer, pair, pr), ...(extras?.baseSha === undefined ? {} : { sha: extras.baseSha }) },
-    head: headBranchInfo(viewer, pair, pr),
+    head: await headBranchInfo(d1, viewer, pair, pr),
     merge_base: pr.mergeBase ?? "",
     due_date: apiIssue.due_date,
     created_at: apiIssue.created_at,
@@ -391,8 +454,9 @@ export async function toApiPullRequest(
 
 /**
  * The `head` path parameter parse: `owner:branch` / `owner/name:branch` fork
- * forms resolve the head repo (404 when the repo does not exist — forks
- * cannot exist yet); the plain form is a branch of the base repo.
+ * forms resolve the head repo (404 when the repo does not exist; the doer's
+ * READ gate on it is the route's CanRead guard — parseCompareInfo
+ * pull.go:1063-1074); the plain form is a branch of the base repo.
  */
 export async function resolveHeadRepo(
   d1: D1Database,

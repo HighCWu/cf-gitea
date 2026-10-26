@@ -599,9 +599,13 @@ describe("POST /repos/{owner}/{repo}/pulls: the cross-repo (fork head) create ar
     expect(create.status).toBe(201);
     const rendered = await create.json<Record<string, unknown>>();
     expect(rendered.title).toBe("fork PR");
-    // head.sha is the fork tip cache; the head repo stays hidden per the
-    // converter's cross-repo rule (services/pulls.ts headBranchInfo)
-    expect(rendered.head).toMatchObject({ label: "feature", ref: "refs/pull/1/head", sha: featureTip, repo_id: -1 });
+    // head.sha is the fork tip cache; the fork is PUBLIC and the doer reads
+    // it, so the converter renders the head repo per upstream's gate
+    // (services/pulls.ts headBranchInfo — convert/pull.go:197-199
+    // HasAnyUnitAccessOrPublicAccess; the old hidden -1 shape was the
+    // pre-fork-render divergence, flipped by the wave-34 render port)
+    expect(rendered.head).toMatchObject({ label: "feature", ref: "refs/pull/1/head", sha: featureTip, repo_id: Number(forkId) });
+    expect(rendered.head).toHaveProperty("repo");
 
     const rows = await db().select().from(pullRequests).all();
     expect(rows).toHaveLength(1);
