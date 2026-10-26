@@ -27,7 +27,7 @@ import { toApiRepository, type RepositoryWithOwner, type Viewer } from "./reposi
  *     — the edge dies with the repositories row itself.
  *   - the git content is NOT copied here: the POST enqueues ONE
  *     `{kind: "repo-fork"}` REPO_TASKS message and answers 202; the consumer
- *     (src/repos/fork-task.ts) runs the engine's replicateForkCatalog and
+ *     (src/repos/fork-task.ts) runs the Worker-brokered §5.3 pass (replicateRepoCopy) and
  *     settles the row (`status='ready'`, `is_empty` copied) — the import
  *     channel's settle pattern.
  *

@@ -619,6 +619,55 @@ fork and template-generate ride this §5.3 consumer (`src/repos/fork-task.ts`
 `carryRepoCell` — the module header holds the full fidelity note, and is the
 authoritative detail).
 
+**As-built redesign — the Worker brokers §5.3 itself; the loose closure is
+UNCONDITIONAL (intentional, as-built 8828f43).** The original design above
+delegated the whole replication to the engine's one-shot `replicateForkCatalog`
+(`packages/git-engine/src/fork/replicate.ts:114`); the Worker carried loose
+content only in the failure arm, when the engine's finalize REFUSED. That shape
+was structurally blind below the tips: finalize's object validation checks each
+REF TIP against the adopted object set and nothing else
+(`control-plane.ts:1369` — `store.has(r.oid)` per ref, no closure walk), and
+this engine's packs are thin-pack + loose-base, NOT closure-complete — a push
+stacked on Worker-authored `auto_init` content legally names loose objects from
+inside the pack (parent lines, tree entries). So finalize succeeded while the
+loose INTERIOR — reachable only through the packed tips' parent lines — was
+silently skipped, and the copy served API reads (tip resolution only) while the
+git wire died: upload-pack's object walk threw `missing object` on the absent
+parent (the silent 500, `src/git/protocol.ts:686`), and a later push's
+anti-check rejected with `missing necessary objects`
+(`src/git/protocol.ts:1571`). 8828f43 redesigns the flow:
+`src/repos/fork-task.ts:210` `replicateRepoCopy` brokers §5.3 itself —
+`beginForkImport` (the not-empty refusal IS the already-done success) → the
+paged catalog copy/adopt loop (`listCatalogPage` at `fork-task.ts:261`,
+streamed R2→R2 pack copies, `adoptForkPacks` per page) → the UNCONDITIONAL
+loose carry inside the open lease (`carryLooseRefs`, `src/repos/carry.ts:438`
+— stages nothing for packed oids but descends THROUGH packed commits'
+cross-store parent/tree edges to reach the loose class, budgeted at
+`PACKED_WALK_MAX_COMMITS = 64` packed commits, `src/repos/carry.ts:150`) →
+ONE finalizing transaction (`fork-task.ts:304`). Template-generate rides the
+same pass synchronously (`src/api/services/generate-repo.ts`), rename/transfer
+through `carryRepoCell` (`src/repos/carry.ts:267-281`) — one descent, all
+three surfaces. The 64-commit budget is a documented FIDELITY LIMIT, not a
+correctness bar (`carry.ts` module doc): when the descent expires before
+proving the closure — histories deeper than the budget above their loose
+objects — the copy lands with the pre-8828f43 floor for that closure, flagged
+by the `truncated` return and logged loudly (`fork-task.ts:292-298`; the
+rename path's twin log `carry.ts:275-281`). The structural alternative —
+engine-side loose-store enumeration or a closure-validating finalize — was
+deliberately NOT taken: either is an engine deviation under the §8 NOTICE
+discipline, and 8828f43 is engine-untouched / NOTICE-free by design; the
+fidelity limit lifts when an engine wave takes that work. Supersession note
+for the §5.3.1 table below (recorded against the pre-8828f43 tree, half an
+hour before the redesign landed): the "Whole-catalog copy vs depth-1 clone"
+row's mechanism claim — whole catalog PLUS the loose closure via this §5.3
+pass — holds, but its `src/repos/fork-task.ts` cites (`:248-300` and
+`completeLooseImport :191-208`) name the pre-redesign shape; the as-built
+symbols are `replicateRepoCopy` / `replicateCatalogAndLooseClosure` +
+`carryLooseRefs`, and the annotated-tag paragraph above's `completeLooseImport`
+mention is superseded the same way (that paragraph's two-class tag record, and
+the "Annotated-tag loose fidelity" row, are unaffected). Where those cites and
+this paragraph disagree, this paragraph is the as-built record.
+
 #### 5.3.1 As-built divergence record — the repo-copy surface (fork / template-generate / rename carry)
 
 Consolidated record of the intentional divergences from upstream
