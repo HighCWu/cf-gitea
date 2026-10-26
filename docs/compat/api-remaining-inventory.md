@@ -1,4 +1,4 @@
-# Remaining API Inventory — the last 86 before the feature wall
+# Remaining API Inventory — the last 64: the feature wall itself
 
 Refill ammunition for the wave pool: every operation the frozen contract
 declares that our `/api/v1` spec does not, classified by what it would take to
@@ -6,35 +6,44 @@ declare it, then ranked into dispatchable batches. Companion to
 `ui-parity-survey.md` (the web-UI gap inventory) — this file is the API-side
 equivalent. **Fully regenerated 2026-10-26** at HEAD `fec5c71` after the
 previous edition (written at declared=318, commit `c4577a7`) drove ~129
-declarations to completion — every batch it listed has landed or is in flight.
+declarations to completion — every batch it listed has since landed (the
+tick below closes the last two out).
+**Ticked 2026-10-26** at HEAD `5d9122c`: a maintenance pass, not a regen.
+Both batches the regen left live have landed — the in-flight org-project
+batch (REG `20512c0`, 447→468) and its one dispatchable batch,
+projects-user stage 3 (REG `c9a7ef7`, 468→490) — and everything merged
+after them carries zero new ops. Declared now **490** across **298** paths;
+the raw diff is **64**, all FEATURE-ABSENT (the 64-op tables below are
+unchanged from the regen); the dispatchable pool is empty and the In-flight
+section is cleared.
 
 - **Sources / method**: frozen contract
   `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
   operations across 350 paths: repository 229, user 98, organization 88,
   issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
   minus the declared set that `node scripts/check-openapi.mjs` reports
-  (**447** operations across **275** paths, measured 2026-10-26 at HEAD
-  `fec5c71`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
-  operations). Raw diff: **107 undeclared**; minus the **21 in-flight**
-  org-project ops (see In-flight below) = **86 remaining**.
+  (**490** operations across **298** paths, measured 2026-10-26 at HEAD
+  `5d9122c`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
+  operations). Raw diff: **64 undeclared** = **64 remaining**, all
+  FEATURE-ABSENT — no in-flight subtraction applies any more.
   Issue / notification / miscellaneous / settings families have **zero**
   remaining — they are fully declared.
 - **Reproducing the diff** (the numbers above fall out of exactly these two
   commands, run from the repo root):
-  1. `node scripts/check-openapi.mjs` — prints `declared: 447 operation(s)
-     across 275 path(s)` and every declared op as `[ok] <METHOD> <path>
+  1. `node scripts/check-openapi.mjs` — prints `declared: 490 operation(s)
+     across 298 path(s)` and every declared op as `[ok] <METHOD> <path>
      (<operationId>)`. The checker hard-fails any declared op missing from the
      contract, so declared ⊆ contract and the diff is a plain set subtraction
-     on `METHOD path` (it is unambiguous: all 447 shared ops carry the
+     on `METHOD path` (it is unambiguous: all 490 shared ops carry the
      contract's own operationId).
   2. `node -e` walking `paths` of the contract JSON with the checker's HTTP
      method set (`get put post delete options head patch`), printing
      `<tag> | <METHOD> <path> | <operationId>` per op (554 rows); subtract the
-     checker's 447.
+     checker's 490.
 - **Upstream pin**: `fc4936884584a41931906553d96c2601d750e6ef`
   (v1.22.0-rc1-3919-gfc49368845); every `gitea/…` cite below is that commit.
 - **Landed-store references**: `apps/worker/src/db/schema.ts` (**64 tables**,
-  migrations 0000–0028), route modules under `apps/worker/src/api/routes/`,
+  migrations 0000–0032), route modules under `apps/worker/src/api/routes/`,
   services under `apps/worker/src/{services,api/services,repos,issues,webhooks}/`.
 
 ## Classification legend
@@ -43,8 +52,9 @@ declarations to completion — every batch it listed has landed or is in flight.
   batch only writes route/service code (plus spec declaration).
 - **TABLE-DEPENDENT** — needs new D1 table(s) (or a column). The missing store
   is named with its upstream model pointer; the batch owns one migration
-  (numbers below are **provisional** — migrations run 0000–0028 today, next
-  free is 0029; assign next-free at merge, drizzle journal regenerated then).
+  (numbers below are **provisional** — migrations run 0000–0032 today;
+  assign next-free at merge, drizzle journal regenerated then). The class is
+  empty at this tick.
 - **RUNTIME-ONLY** — declarable only with documented runtime-only response
   exceptions (the `RUNTIME_ONLY_RESPONSES` table in `scripts/check-openapi.mjs`,
   shared file — orchestrator applies or designates), typically because the
@@ -52,61 +62,40 @@ declarations to completion — every batch it listed has landed or is in flight.
 - **FEATURE-ABSENT** — gated on a whole feature (actions runtime, package
   registry) that needs its own SPEC; listed with the pointer, not batched.
 
-## Family summary (remaining — in-flight excluded)
+## Family summary (remaining)
 
 | Class | repository | organization | user | admin | package | **total** |
 |---|---|---|---|---|---|---|
-| IMPLEMENTABLE-NOW | 0 | 0 | 22 | 0 | 0 | **22** |
+| IMPLEMENTABLE-NOW | 0 | 0 | 0 | 0 | 0 | **0** |
 | TABLE-DEPENDENT | 0 | 0 | 0 | 0 | 0 | **0** |
 | RUNTIME-ONLY | 0 | 0 | 0 | 0 | 0 | **0** |
 | FEATURE-ABSENT | 33 | 7 | 7 | 8 | 9 | **64** |
-| **total** | **33** | **7** | **29** | **8** | **9** | **86** |
+| **total** | **33** | **7** | **7** | **8** | **9** | **64** |
 
-(Including the in-flight 21, the raw 107 organize as: repository 33,
-organization 28, user 29, admin 8, package 9.)
-
-The pool is nearly drained: **one** ready batch remains (projects stage 3,
-user scope). Everything after it is FEATURE-ABSENT — declaring the full
-surface short of actions/packages would put the ceiling at 490/554 ops.
+The pool is drained: declared **490/554** — exactly the ceiling short of the
+actions/packages features. Every non-FEATURE-ABSENT class is at zero; the
+64 below move only when an actions or package SPEC lands, never by route
+work.
 
 ---
 
-## In-flight (excluded from "remaining" — do not re-dispatch)
+## In-flight
 
-### projects-org stage 2 — 21 org project ops (uncommitted)
-
-`apps/worker/src/api/routes/projects-org.ts` (+ `projects-org.test.ts`) sits
-uncommitted in the tree: **21 route declarations** over the 11
-`/orgs/{org}/projects…` paths (4 DELETE, 7 GET, 3 PATCH, 7 POST — matches the
-contract's org-projects set exactly), riding the landed projects store
-(migration 0024) and `src/api/services/projects.ts` (`ProjectScope`, kind
-`"organization"`). Op ids are the `org*Project*` family: `orgListProjects`,
-`orgGetProject`, `orgCreateProject`, `orgEditProject`, `orgDeleteProject`,
-`orgListProjectColumns`, `orgGetProjectColumn`, `orgCreateProjectColumn`,
-`orgEditProjectColumn`, `orgDeleteProjectColumn`, `orgSetDefaultProjectColumn`,
-`orgMoveProjectColumns`, `orgListProjectColumnIssues`,
-`orgAddIssueToProjectColumn`, `orgRemoveIssueFromProjectColumn`,
-`orgMoveProjectIssue`, `orgListProjectWorkflows`, `orgGetProjectWorkflow`,
-`orgCreateProjectWorkflow`, `orgEditProjectWorkflow`, `orgDeleteProjectWorkflow`.
-
-### Other in-flight units — zero new ops
-
-- **blocks-enforcement tail** — arms `ErrBlockedUser` 403 on existing routes
-  (`identity.ts`, `issue-t2.ts`, `org-teams.ts`, `repo.ts`, `starred.ts`,
-  `subscription.ts` modified in the tree); the 8 block ops themselves landed
-  (`1934664`).
-- **license-detection** — populates the landed `repo_licenses` table behind the
-  already-declared `GET /repos/{owner}/{repo}/licenses`; no new op.
-- **ui waves** — web-UI surface, not `/api/v1`; tracked in
-  `ui-parity-survey.md`.
+Empty at this tick. The regen's three in-flight pools all landed: the
+org-projects 21 (REG `20512c0`), the blocks-enforcement tail (`f2e1710`)
+and license-detection (`03d5fe4`/`04a2903` — the family is complete, 5/5
+arms), and the ui-parity-3 rows (`ca81d5a`). The tree's only modification
+at measurement time was this doc.
 
 ---
 
 ## Landed since last regen
 
 The previous edition (commit `c4577a7`, declared=318) listed 11 numbered
-batches + 4 long-tail candidates. **All 15 landed.** REG deltas below are the
-committed `declared X→Y` jumps (they sum: 318 + 129 = 447):
+batches + 4 long-tail candidates. **All 15 landed**, and both batches the
+regen left live landed after it. REG deltas below are the committed
+`declared X→Y` jumps (they sum: 318 + 172 = 490; rows 1–9 are the previous
+edition's ledger, 10–11 landed after the `99d21c5` regen):
 
 | # | Batch | Ops | Store / migration | Feature commit(s) | REG commit (declared) |
 |---|---|---|---|---|---|
@@ -119,45 +108,51 @@ committed `declared X→Y` jumps (they sum: 318 + 129 = 447):
 | 7 | `wave-api-git-hooks` | 4 | table-free (R2-persisted edits) | `5b704c5` | `12ab90d` (409→413) |
 | 8 | `wave-api-projects-repo` **stage 1** (repo scope) | 21 | `projects`/`project_columns`/`project_issues`/`project_workflows` (0024) | `0d5b480` | `fc123b0` (413→434) |
 | 9 | `wave-api-oauth2-apps` (5, 0026) + `wave-api-badges-licenses-template` (5, 0027) + `wave-api-feeds` (3, 0028) | 13 | see left | `42ab6a5` / `f328d06` / `2ef9359` | `fec5c71` (434→447) |
+| 10 | `wave-api-projects-org` stage 2 (the regen's in-flight batch) | 21 | rides the stage-1 store (0024) — no migration | `cc6d73e` | `20512c0` (447→468) |
+| 11 | `wave-api-projects-user` stage 3 (the regen's one dispatchable batch) | 22 | rides the stage-1 store (0024) — no migration | `f38b218` | `c9a7ef7` (468→490) |
 
 Non-op landings in the same window: `wave-22 tables` (`640d805`), `wave-23
 tables` (`579e872`), `wave-blocks-enforcement` (`f5c0384` — 403 arms on 9
 existing seams), engine-registry lifecycle fixes (`4f574e9`, `1da8f56`,
 `5e2c418`), ui waves (`06eee50`), vitest timeout raise (`412facc`).
 
+### After the 490 line — post-regen landings (zero new ops)
+
+Everything merged after REG `c9a7ef7` carries no new declarations — the
+checker stays at 490/298 (re-run at this tick's HEAD `5d9122c`). The units,
+grouped:
+
+- **API parity**: blocks-enforcement-2 tail (`f2e1710` — the regen's
+  in-flight arm set), license arms (`03d5fe4` + `04a2903` — the regen's
+  in-flight license-detection), merge-delete guards (`faca961` +
+  `66f5977`), starred-totals render (`207b566`), repo-delete action sweep
+  (`389da18`), push-mirror outbound + orchestrator wiring (`b332e14` +
+  `9bda9eb`), generate loose-carry (`6c54c1a`) + cleanup (`7f0d5a6`),
+  first-push settle (`45631b7`), set-private-zero (`3163658`),
+  star/watch counters (`528d369`), counters-2 (`3016c10`), delete-counters
+  fold (`64e9b1b`), feeds-tail action rows (`64ade9f`), repo size
+  (`3c58cce`), registry tombstone oracle (`e30660d`).
+- **Migrations 0029–0032** landed with them (`size_kb`, `num_stars`/
+  `num_watches`, `num_forks` + `users.num_stars`, push-mirror sync state) —
+  still 64 tables; these are store work behind already-declared ops.
+- **UI parity + web seams**: avatar-byhash seam (`bb67087` + mount
+  `98d194d`, default-asset guards `239a4ac`), ui-parity-4 (`0b61554` —
+  tags + labels pages), ui-parity-5 (`ca4eb58` — milestone detail/edit +
+  fork form), the four diffpatch downloads (`79ef809`), the ui-parity-3
+  rows landed (`ca81d5a`) — the row-level ledger is
+  `ui-parity-survey.md`.
+- **Test/docs**: vitest contention config (`e4ebb9d`), release notes
+  (`1c44086`), P0 deploy evidence (`d28d953`, `3d76cc6`), push-mirror SPEC
+  (`998a4de`), schema-docstring catch-up (`e6ccf9c`).
+
 ---
 
 ## Dispatchable batches
 
-### Batch — `wave-api-projects-user` stage 3 (22 ops, NO migration — the last ready batch)
-
-The only dispatchable work left. Rides the stage-1 store verbatim:
-`projects` / `project_columns` / `project_issues` / `project_workflows`
-(schema.ts:2162/2213/2254/2286, migration 0024 — the table is owner-scoped
-with `owner_id` + `repo_id` + `type`, covering all three scopes) and the
-`ProjectScope` abstraction in `src/api/services/projects.ts` (kind
-`"individual"` is already modeled; `repoProjectScope()` shows the seam). Wire
-logic mirrors the landed repo scope (`routes/projects-repo.ts`) and the
-in-flight org scope (`routes/projects-org.ts`). Upstream pointers: the shared
-scope router `gitea/routers/api/v1/shared/project.go` and the mount groups
-`gitea/routers/api/v1/api.go:1102` (repo), `:1689` (org), `:1755`
-(user `/user/projects`).
-
-- 21 ops mirror the org scope 1:1 under `/user/projects…` with
-  `userCurrent*` op ids (create/get/list/edit/delete project, columns CRUD +
-  default/move, column-issue add/remove/list/move, workflows CRUD).
-- Plus the one extra op the user scope carries:
-  `GET /users/{username}/projects` (`userListProjects`) — visible-profile
-  listing on the `/users/{username}` group, distinct from the self-scoped
-  `/user/projects`.
-
-**Files to own**: new `src/api/routes/projects-user.ts` (+ test) — the file
-does not exist yet (verified); REG entry in `src/api/router.ts` (shared,
-orchestrator/designee). **No schema change, no migration.**
-
-### After this batch — nothing dispatchable without a feature SPEC
-
-Declaring the remaining 64 ops requires the feature, not just a route stub:
+**None.** The stage-3 batch the regen named as "the only dispatchable work
+left" landed (`f38b218`, REG `c9a7ef7`), and no undeclared op rides a landed
+store or a table-free service any more. Everything remaining is
+FEATURE-ABSENT — declaring it requires the feature, not just a route stub:
 
 - **Actions runtime, 54 ops** (repository 33, organization 7, user 7, admin 7):
   runners, runs, jobs, artifacts, tasks, workflow dispatch/enable,
@@ -167,7 +162,7 @@ Declaring the remaining 64 ops requires the feature, not just a route stub:
   exists in our schema** (grep of `apps/worker/src/db/schema.ts` for
   `action_run`/`action_runner`/`action_artifact`/`action_task`/runner-token
   tables: zero hits — the only `action` table there is the activity feed,
-  schema.ts:2530). A full SPEC is the precondition; note some list/read ops
+  schema.ts:2658). A full SPEC is the precondition; note some list/read ops
   (e.g. `ActionsListRepositoryWorkflows`) read `.gitea/workflows` from the git
   tree upstream and could ride engine tree reads — still gate them on the same
   SPEC so the family lands coherently.
@@ -234,39 +229,14 @@ All actions-runtime, same absent store.
 | `updateOrgRunner` | `PATCH /orgs/{org}/actions/runners/{runner_id}` | actions runtime — same absent store |
 | `orgCreateRunnerRegistrationToken` | `POST /orgs/{org}/actions/runners/registration-token` | actions runner tokens (gitea/models/actions/runner_token.go — absent) |
 
-(The org-projects 21 are **in-flight**, not here — see the In-flight section.)
+(The org-projects 21 landed — REG `20512c0` — so organization's remainder is
+actions-only.)
 
 ### user
 
-**IMPLEMENTABLE-NOW** (22) — the stage-3 batch above, itemized. Rides the
-landed projects store (migration 0024) + `ProjectScope` kind `"individual"`;
-template: `routes/projects-repo.ts` (landed) / `routes/projects-org.ts`
-(in-flight).
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `userCurrentDeleteProject` | `DELETE /user/projects/{id}` | LANDED projects store (schema.ts:2162, migration 0024) + services/projects.ts ProjectScope kind "individual" — mirror routes/projects-repo.ts (landed) and in-flight projects-org.ts |
-| `userCurrentDeleteProjectColumn` | `DELETE /user/projects/{id}/columns/{column_id}` | same landed store (project_columns schema.ts:2213) — stage-3 batch |
-| `userCurrentRemoveIssueFromProjectColumn` | `DELETE /user/projects/{id}/columns/{column_id}/issues/{issue_id}` | same landed store (project_issues schema.ts:2254), issue moves ride landed issues — stage-3 batch |
-| `userCurrentDeleteProjectWorkflow` | `DELETE /user/projects/{id}/workflows/{workflow_id}` | same landed store (project_workflows schema.ts:2286) — stage-3 batch |
-| `userCurrentListProjects` | `GET /user/projects` | same landed store — stage-3 batch |
-| `userCurrentGetProject` | `GET /user/projects/{id}` | same landed store — stage-3 batch |
-| `userCurrentListProjectColumns` | `GET /user/projects/{id}/columns` | same landed store — stage-3 batch |
-| `userCurrentGetProjectColumn` | `GET /user/projects/{id}/columns/{column_id}` | same landed store — stage-3 batch |
-| `userCurrentListProjectColumnIssues` | `GET /user/projects/{id}/columns/{column_id}/issues` | same landed store — stage-3 batch |
-| `userCurrentListProjectWorkflows` | `GET /user/projects/{id}/workflows` | same landed store — stage-3 batch |
-| `userCurrentGetProjectWorkflow` | `GET /user/projects/{id}/workflows/{workflow_id}` | same landed store — stage-3 batch |
-| `userListProjects` | `GET /users/{username}/projects` | the user scope's extra op — visible listing on the /users/{username} group, same landed store + profile-visibility gates — stage-3 batch |
-| `userCurrentEditProject` | `PATCH /user/projects/{id}` | same landed store — stage-3 batch |
-| `userCurrentEditProjectColumn` | `PATCH /user/projects/{id}/columns/{column_id}` | same landed store — stage-3 batch |
-| `userCurrentEditProjectWorkflow` | `PATCH /user/projects/{id}/workflows/{workflow_id}` | same landed store — stage-3 batch |
-| `userCurrentCreateProject` | `POST /user/projects` | same landed store — stage-3 batch |
-| `userCurrentCreateProjectColumn` | `POST /user/projects/{id}/columns` | same landed store — stage-3 batch |
-| `userCurrentMoveProjectColumns` | `POST /user/projects/{id}/columns/move` | same landed store — stage-3 batch |
-| `userCurrentSetDefaultProjectColumn` | `POST /user/projects/{id}/columns/{column_id}/default` | same landed store — stage-3 batch |
-| `userCurrentAddIssueToProjectColumn` | `POST /user/projects/{id}/columns/{column_id}/issues/{issue_id}` | same landed store — stage-3 batch |
-| `userCurrentMoveProjectIssue` | `POST /user/projects/{id}/issues/{issue_id}/move` | same landed store — stage-3 batch |
-| `userCurrentCreateProjectWorkflow` | `POST /user/projects/{id}/workflows` | same landed store — stage-3 batch |
+The user family's 22 IMPLEMENTABLE-NOW ops (the `/user/projects` +
+`/users/{username}/projects` stage-3 set) landed — REG `c9a7ef7` — so the
+remainder is actions-only.
 
 **FEATURE-ABSENT** (7) — actions-runtime, same absent store.
 
