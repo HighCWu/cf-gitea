@@ -85,7 +85,14 @@ prints all of them verbatim.
   ls-remote on the renamed name answers 128 `repository not found` (single-shot,
   NO sleep — the closed read-after-delete window stays closed) → the old name
   is dead on both paths (git 128, API 404). Doubles as the registry regression
-  sweep (create → rename carry → delete t+0).
+  sweep (create → rename carry → delete t+0). **Failure cleanup (the
+  consistency posture):** a mid-battery red used to leave the trial repo
+  behind `[skip]` lines for a hand-clean; a finally-style tail (the
+  generate-e2e shape) now best-effort deletes every created-and-not-yet-deleted
+  trial repo under the fullName the server last returned — re-pointed by the
+  rename, so a red before it sweeps the create name and a red after it the
+  renamed one (logged on one `[tail] reg-leftover-sweep` line; failures feed
+  `left_behind`, never fatal; a green run no-ops silently).
 - **generate-e2e** — template → REAL PUSH (LICENSE commit on the auto_init
   main + second ref `refs/heads/dev`) → `PATCH {"template":true}` (200 with
   `"template":true` in the body, persisted) → `POST …/generate
@@ -121,7 +128,13 @@ prints all of them verbatim.
   divergence note in `apps/worker/src/api/routes/pulls.ts`). No prior
   evidence block exists for this battery (the fork-PR create landed at
   a16f60e, post-REDEPLOY13) — the next REDEPLOY run is its first production
-  evidence.
+  evidence. **Failure cleanup (the consistency posture):** a mid-battery red
+  used to leave the base/org/fork behind `[skip]` lines for a hand-clean; a
+  finally-style tail (the generate-e2e shape, `*FullName`-tracked) now
+  best-effort deletes fork first (it hangs off the base and lives in the
+  org), then the base, then the org (logged on one
+  `[tail] forkpr-leftover-sweep` line; failures feed `left_behind`, never
+  fatal; a green run no-ops silently).
 - **mirror** — the push-mirror credential-free arms (REDEPLOY13's evidence,
   ~1600-1610; full e2e to a real external remote stays out of scope — no
   external credentials). A private auto_init source repo (201), then:
@@ -162,7 +175,13 @@ prints all of them verbatim.
   page 200 with 0 "New Label" occurrences → `POST /login`
   (form-urlencoded `user_name` + `password=<PAT>`) → 303 + `gitea_session` →
   labels page WITH the cookie 200 with the writer form (canonical 3
-  occurrences, `--new-label-count`) + `small-menu-items`.
+  occurrences, `--new-label-count`) + `small-menu-items`. **Failure cleanup
+  (the consistency posture):** the battery creates a fixture repo (any repo
+  has a labels page), so a mid-battery red no longer leaves it behind
+  `[skip]` lines — a finally-style tail (the mirror shape,
+  `repoFullName`-tracked) best-effort deletes it (logged on one
+  `[tail] ui-leftover-sweep` line; failures feed `left_behind`, never fatal;
+  a green run no-ops silently).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -181,19 +200,29 @@ prints all of them verbatim.
   as **[warn]** + `left_behind` in the summary (documented, never fatal), and
   the next run's `cleanup-audit` is what proves the ground back to the
   canonical shape.
-- **The mirror battery additionally self-cleans on a red**: its finally-style
-  tail (above) best-effort deletes the mirror row + probe repo it created, so
-  a settle failure no longer strands rows for a hand-clean (REDEPLOY15
-  friction (c)); the `[tail] mir-leftover-sweep` line logs every action, and
-  the audit battery going green right after a red mirror run is the proof.
-- **The generate-e2e battery self-cleans the same way** (REDEPLOY16
-  friction): its failureTail tracks both repo full names the run created and
-  sweep-deletes the survivors of a mid-battery red on one
-  `[tail] gen-leftover-sweep` line — no more hand-deleted `tmpl-*` leftovers.
-- A red run of the OTHER batteries may leave its repos in place for debugging
-  (the lfs-e2e convention); the next run names fresh random repos (`reg-`,
-  `prbase-`/`prorg-`, `ui-` prefixes), so pre-cleanup is a `cleanup-audit`
-  away.
+- **Every battery that creates server-side state self-cleans on a red** (the
+  consistency posture — the orchestrator's REDEPLOY16 decision: the
+  cleanup-audit battery exists precisely to prove zero leftovers, so red runs
+  self-sweeping beats the old lfs-e2e leave-for-debug convention). Each
+  state-creating battery carries a finally-style failureTail that
+  best-effort deletes exactly what the run created and has not already
+  deleted:
+  - `generate-e2e` — generated repo first (it hangs off the template), then
+    the template; `[tail] gen-leftover-sweep` (REDEPLOY16 friction).
+  - `mirror` — mirror rows first (covering the row whose name the creating
+    check never captured), then the probe repo; `[tail] mir-leftover-sweep`
+    (REDEPLOY15 friction (c)).
+  - `registry` — each trial's repo under the fullName the server last
+    returned (re-pointed by the rename); `[tail] reg-leftover-sweep`.
+  - `forkpr-e2e` — fork, then base, then org;
+    `[tail] forkpr-leftover-sweep`.
+  - `ui-login` — its fixture repo; `[tail] ui-leftover-sweep`.
+  One `[tail]` line logs every action; failures feed `left_behind`, never
+  fatal; a green run no-ops silently (the battery's own cleanup arms already
+  emptied everything, and the gone flags skip the rest). `p0` creates
+  nothing — it only reads the standing fixture — so it has no tail by
+  construction. The audit battery going green right after a red run is the
+  proof.
 - Scratch dirs live under `os.tmpdir()` and are removed per battery; the PAT
   file is the operator's to shred.
 
@@ -208,6 +237,19 @@ prints all of them verbatim.
   deletes; `--force-red gen-template-push` reds after only the template
   exists. An id that matches no check warns on stderr at summary time (the
   forced fail counts in the summary and fails the exit code, as any red).
+- The ported tails self-test the same way, one forced-red per battery:
+  - `registry --force-red t2-rename-200` — trial 1 completes green, trial 2
+    reds after its repo exists under the CREATE name (trial 3 never
+    creates), and the `[tail] reg-leftover-sweep` line must list exactly that
+    one delete; `--force-red t2-delete-204` reds after the rename instead, so
+    the tail sweeps the RENAMED name.
+  - `forkpr-e2e --force-red forkpr-fork-push` — reds after base + org + fork
+    all exist; the `[tail] forkpr-leftover-sweep` line must list all three
+    deletes in tail order (fork, base, org).
+  - `ui-login --force-red ui-labels-cookie-owner` — reds after the fixture
+    repo exists; the `[tail] ui-leftover-sweep` line must list its delete.
+  The rehearsal convention: each forced-red run is followed by a
+  `cleanup-audit` run, and the audit going green is the sweep's proof.
 - The mirror battery can also be forced honestly through its real budget
   flag: `--mirror-settle-ms 1` times the sync-settle poll out mid-battery
   (after the repo + mirror row exist) — the original 5fdbc15 self-test

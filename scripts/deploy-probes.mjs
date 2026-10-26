@@ -15,22 +15,27 @@
  *                  fixture repo (`<user>/p0-shallow` by default).
  *   registry       The tombstone / registry sweep: create -> immediate
  *                  anonymous advert -> rename -> carry -> delete -> the very
- *                  next anonymous ls-remote must be dead at t+0.
+ *                  next anonymous ls-remote must be dead at t+0. A red run
+ *                  sweeps the trial repos it created (the failureTail).
  *   generate-e2e   Template -> real push -> PATCH template -> generate -> 201
  *                  + empty:false -> refs carried at the identical tip ->
  *                  contents API round-trip. A red run sweeps the template +
  *                  generated repos it created (the failureTail; REDEPLOY16's
  *                  TLS flake stranded the template for a hand-clean).
  *   forkpr-e2e     Base -> fork (202) -> push a fork branch -> PR with the
- *                  cross-repo head `owner:branch` -> 201 + head chain.
+ *                  cross-repo head `owner:branch` -> 201 + head chain. A red
+ *                  run sweeps the fork + base + org it created (the
+ *                  failureTail).
  *   mirror         The push-mirror credential-free arms: the registration-time
  *                  SSRF egress gate refusing a loopback target at the door,
  *                  then the .invalid lifecycle — gate-passing unreachable
  *                  target -> 200 -> sync trigger -> the failed sync's settle
- *                  shape -> DELETE 204.
+ *                  shape -> DELETE 204. A red run sweeps the mirror rows +
+ *                  probe repo it created (the failureTail).
  *   ui-login       The login-cookie methodology probe: anonymous labels page
  *                  hides the writer form, POST /login 303 + gitea_session,
- *                  cookie view renders the owner form.
+ *                  cookie view renders the owner form. A red run sweeps its
+ *                  fixture repo (the failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -54,6 +59,13 @@
  *     naming the actual login, the requested --user, and both fixes); a match
  *     passes silently. One request per invocation (cached); the D1-only
  *     cleanup-audit has no HTTP surface and never triggers it.
+ *   - Red runs self-sweep (the consistency posture — REDEPLOY16's decision:
+ *     the cleanup-audit battery exists precisely to prove zero leftovers, so
+ *     deliberate red-run strays lost to the old lfs-e2e leave-for-debug
+ *     convention): every battery that creates server-side state carries a
+ *     finally-style failureTail (generate-e2e's shape — fullName-tracked
+ *     creations, one [tail] line, green runs silent); p0 creates nothing (it
+ *     only reads the standing fixture), so it has no tail by construction.
  *
  * Canonical expectations ported from the latest evidence block
  * (docs/design/p0-evidence.md, REDEPLOY13 2026-10-26, ~lines 1507-1697;
@@ -454,9 +466,19 @@ const p0Steps = (ctx) => [
 
 // ---------- battery: registry (tombstone sweep, carry + t+0) ----------
 
-const registryTrialSteps = (t) => {
+/** Each trial's `created`/`fullName`/`gone` state feeds the failure-cleanup
+ *  tail (see registryFailureCleanup): the red-runs-self-sweep posture.
+ *  fullName is what the CREATE actually returned (the doer's namespace) and
+ *  is re-pointed by rename-200, so the tail deletes each surviving repo under
+ *  whichever name it currently answers to — a red before the rename sweeps
+ *  the create name, a red after it the renamed one. */
+const registryContext = () => ({ trials: [], tmp: null });
+
+const registryTrialSteps = (ctx, t) => {
   const name = `reg-${hexId()}`;
   const renamed = `${name}-r2`;
+  const trial = { name, created: false, fullName: null, gone: false };
+  ctx.trials.push(trial);
   const oldUrl = gitUrl(opts.user, name);
   const newUrl = gitUrl(opts.user, renamed);
   return [
@@ -466,6 +488,8 @@ const registryTrialSteps = (t) => {
       run: async () => {
         const res = await api("/user/repos", { method: "POST", body: { name, private: false, auto_init: true } });
         expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+        trial.created = true; // the failure-cleanup tail deletes it if a later step reds
+        trial.fullName = String(res.json?.full_name ?? `${opts.user}/${name}`);
         return `created ${res.json?.full_name ?? `${opts.user}/${name}`} (public, auto_init)`;
       },
     },
@@ -488,6 +512,7 @@ const registryTrialSteps = (t) => {
         const res = await api(`/repos/${opts.user}/${name}`, { method: "PATCH", body: { name: renamed } });
         expect(res.status === 200, `status ${res.status} (expected 200): ${res.text.slice(0, 120)}`);
         expect(String(res.json?.full_name ?? "").endsWith(renamed), `full_name ${res.json?.full_name} (expected …/${renamed})`);
+        trial.fullName = String(res.json?.full_name ?? `${opts.user}/${renamed}`); // re-pointed for the tail
         return `renamed to ${res.json?.full_name}`;
       },
     },
@@ -507,6 +532,7 @@ const registryTrialSteps = (t) => {
       run: async () => {
         const res = await api(`/repos/${opts.user}/${renamed}`, { method: "DELETE" });
         expect(res.status === 204, `status ${res.status} (expected 204)`);
+        trial.gone = true; // the tail no-ops on a green sweep
         return "204";
       },
     },
@@ -534,6 +560,38 @@ const registryTrialSteps = (t) => {
       },
     },
   ];
+};
+
+/** The red-runs-self-sweep posture (the generate-e2e shape): a red registry
+ *  run sweeps its own trial repos instead of leaving them for a hand-clean.
+ *  This finally-style tail runs after EVERY registry battery run (green ones
+ *  no-op silently: each trial's delete-204 already emptied it, so the gone
+ *  flags skip them) and best-effort deletes exactly what the run created and
+ *  has not already deleted — under the fullName the server last returned, so
+ *  a red before the rename sweeps the create name and a red after it the
+ *  renamed one. One [tail] line logs every action; failures feed left_behind
+ *  and are never fatal; it never throws (main's finally depends on it). */
+const registryFailureCleanup = async (ctx) => {
+  const acts = [];
+  const noteLeftBehind = (what, why) => {
+    leftBehind.push(`${what} (failure-cleanup tail: ${why})`);
+    acts.push(`${what} LEFT BEHIND — ${why}`);
+  };
+  try {
+    for (const trial of ctx.trials) {
+      if (trial.created !== true || trial.gone === true) continue;
+      const [owner, repo] = String(trial.fullName ?? `${opts.user}/${trial.name}`).split("/");
+      try {
+        const out = await deleteRepo(owner, repo);
+        acts.push(typeof out === "string" ? out : out.detail);
+      } catch (err) {
+        noteLeftBehind(`repo ${owner}/${repo}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } catch (err) {
+    acts.push(`the sweep itself failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (acts.length) log(`  [tail] reg-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
 };
 
 // ---------- battery: generate-e2e ----------
@@ -745,7 +803,18 @@ const generateFailureCleanup = async (ctx) => {
 
 // ---------- battery: forkpr-e2e ----------
 
-const forkprContext = () => ({ user: opts.user, base: `prbase-${hexId()}`, org: `prorg-${hexId()}`, branch: `prbr-${hexId()}`, tip: null, number: null, tmp: null });
+/** `baseCreated`/`forkCreated`/`orgCreated` (+ the *FullName convention and
+ *  the *Gone flags forkpr-cleanup sets) drive the failure-cleanup tail (see
+ *  forkprFailureCleanup): the red-runs-self-sweep posture. FullName is what
+ *  the CREATE actually returned (the doer's namespace), so the tail deletes
+ *  the right owner/slug even when --user drifts from the PAT's user. */
+const forkprContext = () => ({
+  user: opts.user, base: `prbase-${hexId()}`, org: `prorg-${hexId()}`, branch: `prbr-${hexId()}`,
+  tip: null, number: null, tmp: null,
+  baseCreated: false, baseFullName: null, baseGone: false,
+  orgCreated: false, orgGone: false,
+  forkCreated: false, forkFullName: null, forkGone: false,
+});
 
 const forkprSteps = (ctx) => [
   {
@@ -754,6 +823,8 @@ const forkprSteps = (ctx) => [
     run: async () => {
       const res = await api("/user/repos", { method: "POST", body: { name: ctx.base, auto_init: true } });
       expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      ctx.baseCreated = true; // the failure-cleanup tail deletes it if a later step reds
+      ctx.baseFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.base}`);
       return `created ${res.json?.full_name}`;
     },
   },
@@ -763,6 +834,7 @@ const forkprSteps = (ctx) => [
     run: async () => {
       const res = await api("/orgs", { method: "POST", body: { username: ctx.org } });
       expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      ctx.orgCreated = true; // the failure-cleanup tail deletes it if a later step reds
       return `org ${ctx.org} created`;
     },
   },
@@ -774,6 +846,8 @@ const forkprSteps = (ctx) => [
       expect(res.status === 202, `status ${res.status} (expected 202): ${res.text.slice(0, 200)}`);
       expect(res.json?.full_name === `${ctx.org}/${ctx.base}`,
         `full_name ${res.json?.full_name} (expected ${ctx.org}/${ctx.base} — the default-slug fork shape)`);
+      ctx.forkCreated = true; // the failure-cleanup tail deletes it if a later step reds
+      ctx.forkFullName = String(res.json?.full_name ?? `${ctx.org}/${ctx.base}`);
       return `202 — fork ${res.json?.full_name} accepted (async copy)`;
     },
   },
@@ -850,11 +924,15 @@ const forkprSteps = (ctx) => [
     expect: `fork + base DELETEd (204 each) and the org DELETEd (204) — a failed cleanup is documented, not fatal`,
     run: async () => {
       const a = await deleteRepo(ctx.org, ctx.base);
+      if (typeof a === "string") ctx.forkGone = true; // the tail no-ops on a green sweep
       const b = await deleteRepo(ctx.user, ctx.base);
+      if (typeof b === "string") ctx.baseGone = true;
       const org = await api(`/orgs/${ctx.org}`, { method: "DELETE" });
       let orgOut;
-      if (org.status === 204) orgOut = `org ${ctx.org} deleted`;
-      else {
+      if (org.status === 204) {
+        ctx.orgGone = true;
+        orgOut = `org ${ctx.org} deleted`;
+      } else {
         leftBehind.push(`org ${ctx.org} (DELETE returned ${org.status})`);
         orgOut = { status: "warn", detail: `org ${ctx.org} LEFT BEHIND — DELETE returned ${org.status}` };
       }
@@ -865,6 +943,53 @@ const forkprSteps = (ctx) => [
     },
   },
 ];
+
+/** The red-runs-self-sweep posture (the generate-e2e shape): a red forkpr run
+ *  sweeps its own base/org/fork instead of leaving them for a hand-clean.
+ *  This finally-style tail runs after EVERY forkpr battery run (green ones
+ *  no-op silently: forkpr-cleanup already deleted all three, so the *Gone
+ *  flags skip them) and best-effort deletes exactly what the run created and
+ *  has not already deleted — fork first (it hangs off the base and lives in
+ *  the org), then the base, then the org (an org delete over surviving repos
+ *  would strand all three). One [tail] line logs every action; failures feed
+ *  left_behind and are never fatal; it never throws (main's finally depends
+ *  on it). */
+const forkprFailureCleanup = async (ctx) => {
+  const acts = [];
+  const noteLeftBehind = (what, why) => {
+    leftBehind.push(`${what} (failure-cleanup tail: ${why})`);
+    acts.push(`${what} LEFT BEHIND — ${why}`);
+  };
+  const tryDeleteRepo = async (what, full, fallback) => {
+    const [owner, repo] = String(full ?? fallback).split("/");
+    try {
+      const out = await deleteRepo(owner, repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      noteLeftBehind(`${what} ${owner}/${repo}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  try {
+    if (ctx.forkCreated === true && ctx.forkGone !== true) {
+      await tryDeleteRepo("fork", ctx.forkFullName, `${ctx.org}/${ctx.base}`);
+    }
+    if (ctx.baseCreated === true && ctx.baseGone !== true) {
+      await tryDeleteRepo("base repo", ctx.baseFullName, `${ctx.user}/${ctx.base}`);
+    }
+    if (ctx.orgCreated === true && ctx.orgGone !== true) {
+      try {
+        const res = await api(`/orgs/${ctx.org}`, { method: "DELETE" });
+        if (res.status === 204) acts.push(`org ${ctx.org} deleted (204)`);
+        else noteLeftBehind(`org ${ctx.org}`, `DELETE returned ${res.status}`);
+      } catch (err) {
+        noteLeftBehind(`org ${ctx.org}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } catch (err) {
+    acts.push(`the sweep itself failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (acts.length) log(`  [tail] forkpr-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
 
 // ---------- battery: mirror (push-mirror credential-free arms) ----------
 
@@ -1066,7 +1191,16 @@ const mirrorFailureCleanup = async (ctx) => {
 
 // ---------- battery: ui-login ----------
 
-const uiContext = () => ({ user: opts.user, repo: `ui-${hexId()}`, cookie: null, tmp: null });
+/** `repoCreated`/`repoGone`/`repoFullName` drive the failure-cleanup tail
+ *  (see uiFailureCleanup): the red-runs-self-sweep posture — the battery
+ *  creates a fixture repo (any repo has a labels page), so a red run sweeps
+ *  it. repoFullName is what the CREATE actually returned (the doer's
+ *  namespace), so the tail deletes the right owner/slug even when --user
+ *  drifts from the PAT's user. */
+const uiContext = () => ({
+  user: opts.user, repo: `ui-${hexId()}`, cookie: null, tmp: null,
+  repoCreated: false, repoFullName: null, repoGone: false,
+});
 
 const countOccurrences = (haystack, needle) => haystack.split(needle).length - 1;
 
@@ -1077,6 +1211,8 @@ const uiSteps = (ctx) => [
     run: async () => {
       const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, auto_init: true } });
       expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      ctx.repoCreated = true; // the failure-cleanup tail deletes it if a later step reds
+      ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
       return `created ${res.json?.full_name}`;
     },
   },
@@ -1129,11 +1265,41 @@ const uiSteps = (ctx) => [
     expect: `probe repo DELETEd → 204 (a failed cleanup is documented, not fatal)`,
     run: async () => {
       const out = await deleteRepo(ctx.user, ctx.repo);
+      if (typeof out === "string") ctx.repoGone = true; // the tail no-ops on a green sweep
       if (typeof out === "string") return out;
       return { status: "warn", detail: out.detail };
     },
   },
 ];
+
+/** The red-runs-self-sweep posture (the mirror shape): a red ui-login run
+ *  sweeps its own fixture repo instead of leaving it for a hand-clean. This
+ *  finally-style tail runs after EVERY ui-login battery run (green ones no-op
+ *  silently: ui-cleanup already deleted the repo, so the gone flag skips it)
+ *  and best-effort deletes exactly what the run created and has not already
+ *  deleted. One [tail] line logs every action; failures feed left_behind and
+ *  are never fatal; it never throws (main's finally depends on it). */
+const uiFailureCleanup = async (ctx) => {
+  const acts = [];
+  const noteLeftBehind = (what, why) => {
+    leftBehind.push(`${what} (failure-cleanup tail: ${why})`);
+    acts.push(`${what} LEFT BEHIND — ${why}`);
+  };
+  try {
+    if (ctx.repoCreated === true && ctx.repoGone !== true) {
+      const [owner, repo] = String(ctx.repoFullName ?? `${ctx.user}/${ctx.repo}`).split("/");
+      try {
+        const out = await deleteRepo(owner, repo);
+        acts.push(typeof out === "string" ? out : out.detail);
+      } catch (err) {
+        noteLeftBehind(`repo ${owner}/${repo}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } catch (err) {
+    acts.push(`the sweep itself failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (acts.length) log(`  [tail] ui-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
 
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
@@ -1215,11 +1381,11 @@ const auditSteps = (ctx) => [
 
 const BATTERIES = {
   "p0": { title: "P0 shallow trio + privacy tail", context: p0Context, steps: p0Steps },
-  "registry": { title: "registry tombstone sweep (carry + t+0 delete)", context: () => ({}), steps: () => Array.from({ length: opts.trials }, (_, i) => registryTrialSteps(i + 1)).flat() },
+  "registry": { title: "registry tombstone sweep (carry + t+0 delete)", context: registryContext, steps: (ctx) => Array.from({ length: opts.trials }, (_, i) => registryTrialSteps(ctx, i + 1)).flat(), failureTail: registryFailureCleanup },
   "generate-e2e": { title: "template → generate → carried refs + contents", context: generateContext, steps: generateSteps, failureTail: generateFailureCleanup },
-  "forkpr-e2e": { title: "fork → owner:branch PR chain", context: forkprContext, steps: forkprSteps },
+  "forkpr-e2e": { title: "fork → owner:branch PR chain", context: forkprContext, steps: forkprSteps, failureTail: forkprFailureCleanup },
   "mirror": { title: "push-mirror credential-free arms (SSRF gate + .invalid lifecycle)", context: mirrorContext, steps: mirrorSteps, failureTail: mirrorFailureCleanup },
-  "ui-login": { title: "login-cookie labels owner view", context: uiContext, steps: uiSteps },
+  "ui-login": { title: "login-cookie labels owner view", context: uiContext, steps: uiSteps, failureTail: uiFailureCleanup },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
@@ -1326,8 +1492,9 @@ const main = async () => {
         await chain(battery.steps(ctx));
       }
     } finally {
-      // REDEPLOY15 friction (c): a red run sweeps its own creations (the
-      // mirror battery's tail; best-effort, logged, never throws).
+      // The red-runs-self-sweep posture: every state-creating battery's tail
+      // sweeps its own creations (best-effort, logged, never throws; green
+      // runs no-op silently).
       if (battery.failureTail) await battery.failureTail(ctx);
       await rm(ctx.tmp, { recursive: true, force: true });
     }
