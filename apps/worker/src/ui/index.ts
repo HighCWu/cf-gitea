@@ -1203,6 +1203,28 @@ import {
   parseRepoWikiForm,
   renderRepoWikiSettingsPage,
 } from "./pages/repo-settings-wiki";
+// Window-2e C2b: the editor tails + cherrypick/patch modules.
+import {
+  loadEditorUploadData,
+  parseUploadForm,
+  renderEditorDeletePage,
+  renderEditorUploadPage,
+  uploadFormFromData,
+} from "./pages/repo-editor-tails";
+import {
+  cherryPickFormFromData,
+  commitCherryPickFromForm,
+  commitPatchFromForm,
+  loadEditorCherryPickData,
+  loadEditorPatchData,
+  patchFormFromData,
+  readCherryPickForm,
+  readPatchForm,
+  renderEditorCherryPickPage,
+  renderEditorPatchPage,
+  splitCherryPickSuffix,
+} from "./pages/repo-editor-cherrypick";
+import { commitUploadFromForm } from "../services/upload-staging";
 // Window-2e: the aux/byte-surface modules.
 import {
   loadHomeSitemapIndex,
@@ -2030,7 +2052,7 @@ export interface WikiRoute {
  *  prefix). The bare literals stay unclaimed: upstream chi's `/*` requires
  *  the tail too. */
 export interface FileEditorRoute {
-  family: "file-new" | "file-edit" | "file-delete";
+  family: "file-new" | "file-edit" | "file-delete" | "file-upload" | "editor-patch" | "editor-cherrypick";
   owner: string;
   repo: string;
   /** Decoded branch+path tail after the family literal (never claimed
@@ -3434,7 +3456,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // Wave-8 file editor: the `new`/`edit`/`delete` literals claim the
   // branch+path tail shape (FileEditorRoute). Bare literals fall through to
   // the engine (upstream chi requires the `/*` tail as well).
-  if (head === "new" || head === "edit" || head === "delete") {
+  if (head === "new" || head === "edit" || head === "delete" || head === "upload") {
     if (rest.length === 0) return null;
     let suffix: string;
     try {
@@ -3443,11 +3465,26 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return null;
     }
     return {
-      family: head === "new" ? "file-new" : head === "edit" ? "file-edit" : "file-delete",
+      family: head === "new" ? "file-new" : head === "edit" ? "file-edit" : head === "delete" ? "file-delete" : "file-upload",
       owner,
       repo,
       refSuffix: suffix,
     };
+  }
+  // Window-2e C2b: the cherrypick/patch pages (web.go:1465-1470 — the sha
+  // rides the cherrypick ROUTE between the literal and the branch tail;
+  // bare patch/{branch} is the patch family). Bare literals fall through.
+  if (head === "patch" || head === "cherrypick") {
+    if (rest.length === 0) return null;
+    let suffix: string;
+    try {
+      suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
+    } catch {
+      return null;
+    }
+    if (head === "patch") return { family: "editor-patch", owner, repo, refSuffix: suffix };
+    if (splitCherryPickSuffix(suffix) === null) return null;
+    return { family: "editor-cherrypick", owner, repo, refSuffix: suffix };
   }
   let suffix: string;
   try {
@@ -6147,7 +6184,11 @@ async function fileEditorGate(
  *  `?filename=` prefills the new-file name input — upstream 303s onto the
  *  path URL instead, editor.go:274-284, the header's documented
  *  simplification). */
-async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorRoute["family"]): Promise<Response> {
+/** The three families sharing the one-template loader (the upload and
+ * cherrypick/patch tails carry their own handlers below). */
+type FileEditorPageFamily = "file-new" | "file-edit" | "file-delete";
+
+async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorPageFamily): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, repo, respond } = resolved;
@@ -6159,6 +6200,13 @@ async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorR
   const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
   const data = await loadFileEditorData(engine, repo, mode, route.refSuffix, url.searchParams.get("filename"));
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  // Window-2e C2b: the delete family renders its DEDICATED confirm page
+  // (repo-editor-tails' parity render — the pageClass discriminator,
+  // ALL-links breadcrumb, PageIsDelete placeholder; the one-template render
+  // stays the other two families').
+  if (family === "file-delete") {
+    return respond(c.html(renderEditorDeletePage({ ctx, data, form: editorFormFromData(data), error: null }), 200));
+  }
   return respond(c.html(renderFileEditorPage({ ctx, data, form: editorFormFromData(data), error: null }), 200));
 }
 
@@ -6175,7 +6223,7 @@ async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorR
  * the containing tree); every service arm re-renders the form at 200 with
  * the message and the submitted values (the login failure convention).
  */
-async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEditorRoute["family"]): Promise<Response> {
+async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEditorPageFamily): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
   const resolved = await resolveUiRequest(c);
@@ -6196,6 +6244,10 @@ async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEdito
   if (data.notEditableReason !== null) {
     // The refusal stands on POST too (upstream's content-absent degenerate
     // arm — editor.go:345-357 — reduced to the page's own message).
+    const refusalRender = family === "file-delete" ? renderEditorDeletePage : null;
+    if (refusalRender !== null) {
+      return respond(c.html(refusalRender({ ctx, data, form: editorFormFromData(data), error: null }), 200));
+    }
     return respond(c.html(renderFileEditorPage({ ctx, data, form: editorFormFromData(data), error: null }), 200));
   }
   const result = await commitFileFromForm(c.env, c.req.raw, repo, userRow, mode, values);
@@ -6210,7 +6262,117 @@ async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEdito
         : `${branchPart}/${pathEscapeSegments(result.treePath)}`;
     return respond(new Response(null, { status: 303, headers: { location } }));
   }
+  if (family === "file-delete") {
+    return respond(c.html(renderEditorDeletePage({ ctx, data, form: values, error: result.message }), 200));
+  }
   return respond(c.html(renderFileEditorPage({ ctx, data, form: values, error: result.message }), 200));
+}
+
+// ---------------------------------------------------------------------------
+// Window-2e C2b: the upload page + the cherrypick/patch pages (the editor
+// family's gate and commit-identity conventions).
+// ---------------------------------------------------------------------------
+
+async function fileUploadPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "file-upload") return respond(await c.notFound()); // drift guard
+  const gate = await fileEditorGate(c, resolved);
+  if (gate !== null) return gate;
+  const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
+  const data = await loadEditorUploadData(engine, repo, resolved.route.refSuffix);
+  if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderEditorUploadPage({ ctx, data, form: uploadFormFromData(data), error: null }), 200));
+}
+
+async function fileUploadSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "file-upload") return respond(await c.notFound()); // drift guard
+  const gate = await fileEditorGate(c, resolved);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the gate above admitted only users
+  const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (userRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
+  const data = await loadEditorUploadData(engine, repo, resolved.route.refSuffix);
+  if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseUploadForm(await readUrlEncodedForm(c.req.raw));
+  const result = await commitUploadFromForm(c.env, c.req.raw, repo, userRow, form);
+  if (result.outcome === "committed") {
+    const branchPart = `/${repo.ownerNamespace}/${repo.slug}/src/branch/${pathEscapeSegments(result.branch)}`;
+    return respond(new Response(null, { status: 303, headers: { location: branchPart } }));
+  }
+  if (result.outcome === "noop") {
+    // Zero staged uuids — upstream answers nil (upload.go:78-80); the
+    // no-JS reduction redirects back (nothing to re-render).
+    return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/upload/${pathEscapeSegments(form.branch)}` } }));
+  }
+  return respond(c.html(renderEditorUploadPage({ ctx, data, form, error: result.message }), 200));
+}
+
+async function editorCherryPickPage(c: Context<{ Bindings: Env }>, isPost: boolean): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "editor-cherrypick") return respond(await c.notFound()); // drift guard
+  const gate = await fileEditorGate(c, resolved);
+  if (gate !== null) return gate;
+  const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
+  const data = await loadEditorCherryPickData(engine, repo, resolved.route.refSuffix, url.searchParams.get("cherry-pick-type"));
+  if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  if (!isPost) {
+    return respond(c.html(renderEditorCherryPickPage({ ctx, data, form: cherryPickFormFromData(data), error: null }), 200));
+  }
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404));
+  const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (userRow === undefined) return respond(c.html(renderNotFound(ctx), 404));
+  const split = splitCherryPickSuffix(resolved.route.refSuffix);
+  if (split === null) return respond(await c.notFound());
+  const form = await readCherryPickForm(c.req.raw);
+  const result = await commitCherryPickFromForm(c.env, c.req.raw, repo, userRow, split.sha, form);
+  if (result.outcome === "committed") {
+    return respond(
+      new Response(null, {
+        status: 303,
+        headers: { location: `/${repo.ownerNamespace}/${repo.slug}/src/branch/${pathEscapeSegments(result.branch)}` },
+      }),
+    );
+  }
+  return respond(c.html(renderEditorCherryPickPage({ ctx, data, form, error: result.message }), 200));
+}
+
+async function editorPatchPage(c: Context<{ Bindings: Env }>, isPost: boolean): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "editor-patch") return respond(await c.notFound()); // drift guard
+  const gate = await fileEditorGate(c, resolved);
+  if (gate !== null) return gate;
+  const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
+  const data = await loadEditorPatchData(engine, repo, resolved.route.refSuffix);
+  if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  if (!isPost) {
+    return respond(c.html(renderEditorPatchPage({ ctx, data, form: patchFormFromData(data), error: null }), 200));
+  }
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404));
+  const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (userRow === undefined) return respond(c.html(renderNotFound(ctx), 404));
+  const form = await readPatchForm(c.req.raw);
+  const result = await commitPatchFromForm(c.env, c.req.raw, repo, userRow, form);
+  if (result.outcome === "committed") {
+    return respond(
+      new Response(null, {
+        status: 303,
+        headers: { location: `/${repo.ownerNamespace}/${repo.slug}/src/branch/${pathEscapeSegments(result.branch)}` },
+      }),
+    );
+  }
+  return respond(c.html(renderEditorPatchPage({ ctx, data, form, error: result.message }), 200));
 }
 
 /**
@@ -9371,6 +9533,13 @@ uiRouter.get("/:owner/:repo/edit/*", (c) => fileEditorPage(c, "file-edit"));
 uiRouter.post("/:owner/:repo/edit/*", (c) => fileEditorSubmit(c, "file-edit"));
 uiRouter.get("/:owner/:repo/delete/*", (c) => fileEditorPage(c, "file-delete"));
 uiRouter.post("/:owner/:repo/delete/*", (c) => fileEditorSubmit(c, "file-delete"));
+// Window-2e C2b: the upload + cherrypick/patch tails.
+uiRouter.get("/:owner/:repo/upload/*", (c) => fileUploadPage(c));
+uiRouter.post("/:owner/:repo/upload/*", (c) => fileUploadSubmit(c));
+uiRouter.get("/:owner/:repo/patch/*", (c) => editorPatchPage(c, false));
+uiRouter.post("/:owner/:repo/patch/*", (c) => editorPatchPage(c, true));
+uiRouter.get("/:owner/:repo/cherrypick/*", (c) => editorCherryPickPage(c, false));
+uiRouter.post("/:owner/:repo/cherrypick/*", (c) => editorCherryPickPage(c, true));
 // Wave-6 single-segment family, wave-7-extended into the owner home (org
 // rows → the org home, user rows → the user profile — upstream's
 // OwnerProfile dispatch). The label regex is wave 6's VERBATIM (it already
