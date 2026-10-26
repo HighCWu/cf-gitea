@@ -20,15 +20,16 @@
  * module is registered verbatim with the same arguments the one-liner uses.
  */
 
-import { applyD1Migrations } from "cloudflare:test";
+import { SELF, applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
+import { ensureSeededRepo, buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
 import { users, protectedBranches, repositories } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
@@ -38,7 +39,8 @@ import { registerBranchRoutes } from "./routes/branches";
 import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
 import { registerPullRoutes } from "./routes/pulls";
-import { engineReads, refTipMap } from "./services/engine";
+import { engineCell, engineReads, refTipMap, ZERO_OID } from "./services/engine";
+import { IssuesService } from "../issues/service";
 import { RepoService } from "../repos/service";
 import type { User } from "./models/user";
 
@@ -535,5 +537,212 @@ describe("merge delete_branch_after_merge — the shared-head and protected-bran
     const ctlIndex = (await jsonBody(ctl)).number as number;
     expect((await send(`${REPO}/pulls/${ctlIndex}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }))).status).toBe(200);
     expect(refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/protctl")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// delete_branch_after_merge — the fork-head arms (upstream
+// DeleteBranchAfterMerge operates on pr.HeadRepo,
+// services/repository/branch.go:812-822 — the fork's own branch, guards
+// against the fork's state and the doer's permission THERE)
+// ---------------------------------------------------------------------------
+
+const RECEIVE_CT = "application/x-git-receive-pack-request";
+
+/**
+ * One deterministic feature commit on top of the suite's two-seed history
+ * (full tree per commit, fixed time → stable oid across calls, so the same
+ * pack can land in BOTH cells).
+ */
+function forkFeatureCommit(name: string, content: string, time: number): SeedCommit {
+  return {
+    message: `fork: ${name}`,
+    time,
+    files: [
+      { path: "README.md", content: "# pull engine suite\n" },
+      { path: "shared.txt", content: "shared base\n" },
+      { path: "docs/base.txt", content: "base doc\n" },
+      { path: name, content },
+    ],
+  };
+}
+
+/** Mint (delete-first, the ensureSeededRepo pattern) a push token for a user. */
+async function mintPushToken(userId: number, name: string): Promise<string> {
+  await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?").bind(userId, name).run();
+  return (await mintFor(userId, name, "write:repository")).plaintext;
+}
+
+/**
+ * Receive-push into a repo cell, creating only the refs that are absent —
+ * the deterministic oids make a re-run a no-op (the ensureSeededRepo guard
+ * pattern, kept because a create-over-existing ref command would be refused).
+ */
+async function pushRefsIfAbsent(engineRepo: string, token: string, updates: { ref: string; oid: string }[], pack: Uint8Array): Promise<void> {
+  const have = new Set((await env.REPO.getByName(engineRepo).listRefs()).refs.map((ref) => ref.name));
+  const missing = updates.filter((update) => !have.has(update.ref));
+  if (missing.length === 0) return;
+  const response = await SELF.fetch(`https://test.local/${engineRepo}.git/git-receive-pack`, {
+    method: "POST",
+    headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+    body: buildReceivePackBody(missing, pack),
+  });
+  const body = response.status === 200 ? new TextDecoder().decode(await response.arrayBuffer()) : "";
+  if (response.status !== 200 || body.includes("ng ")) {
+    throw new Error(`fork-seed push failed (${engineRepo}): ${response.status} ${body.slice(0, 400)}`);
+  }
+}
+
+async function repoIdOf(owner: string, slug: string): Promise<string> {
+  const row = await drizzle(env.DB)
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, owner.toLowerCase()), eq(repositories.slug, slug)))
+    .get();
+  if (row === undefined) throw new Error(`repo row missing: ${owner}/${slug}`);
+  return row.id;
+}
+
+/**
+ * Seed a fork-head PR (two repos): `forkOwner/forkSlug` carries the suite's
+ * base history plus ONE feature commit — on the fork's default `main` when
+ * `onDefaultBranch`, else on `refs/heads/${forkBranch}`. Forks are FULL
+ * copies (SPEC-0001b §5.2 — no cross-repo pack sharing), and the merge runs
+ * in the BASE cell, so the same deterministic pack is staged in the base too:
+ * a scratch branch carries the objects through the receive flow, the
+ * `refs/pull/N/head` CAS landing uses the same commitApiChange primitive the
+ * creation route uses (routes/pulls.ts pins cross-repo heads to a null tip
+ * today — fork PRs cannot be API-created yet), then the scratch branch is
+ * CAS-deleted. The PR row is created through IssuesService directly.
+ */
+async function seedForkHeadPr(options: {
+  forkOwner: string;
+  forkSlug: string;
+  forkBranch: string;
+  onDefaultBranch?: boolean;
+  featurePath: string;
+  featureContent: string;
+}): Promise<{ index: number; forkRepoId: string; featureTip: string }> {
+  const headBranch = options.onDefaultBranch === true ? "main" : options.forkBranch;
+  const feature = forkFeatureCommit(options.featurePath, options.featureContent, T0 + 100);
+  const { tips, pack } = await buildHistoryPack([...SEED_COMMITS, feature]);
+  const featureTip = tips[2] as string;
+
+  // the fork: base history + the feature ref (its default main carries the
+  // feature commit directly in the onDefaultBranch variant)
+  const forkCommits = options.onDefaultBranch === true ? [...SEED_COMMITS, feature] : SEED_COMMITS;
+  await ensureSeededRepo({ owner: options.forkOwner, slug: options.forkSlug, commits: forkCommits });
+  if (options.onDefaultBranch !== true) {
+    const ownerRow = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, options.forkOwner.toLowerCase())).get();
+    if (ownerRow === undefined) throw new Error("fork owner missing");
+    const forkToken = await mintPushToken(ownerRow.id, `pull-engine-fork-push-${options.forkSlug}`);
+    await pushRefsIfAbsent(`${options.forkOwner}/${options.forkSlug}`, forkToken, [{ ref: `refs/heads/${options.forkBranch}`, oid: featureTip }], pack);
+  }
+
+  // the PR row: fork head → base repo
+  const forkRepoId = await repoIdOf(options.forkOwner, options.forkSlug);
+  const baseRepoId = await repoIdOf(OWNER, SLUG);
+  const { pullRequest } = await new IssuesService(env.DB).createPullRequest({
+    repoId: baseRepoId,
+    headRepoId: forkRepoId,
+    baseBranch: "main",
+    headBranch,
+    title: `Fork change: ${options.featurePath}`,
+    posterId: OWNER_ID,
+    allowMaintainerEdit: true,
+    headSha: featureTip,
+  });
+
+  // the base cell: objects behind a scratch branch → refs/pull/N/head →
+  // the scratch branch goes away (the base keeps only the pull ref)
+  const pushToken = await mintPushToken(OWNER_ID, "pull-engine-fork-base-push");
+  await pushRefsIfAbsent(`${OWNER}/${SLUG}`, pushToken, [{ ref: "refs/heads/forkstage", oid: featureTip }], pack);
+  const baseCell = engineCell(env, { ownerNamespace: OWNER, slug: SLUG });
+  const known = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+  const pullRef = `refs/pull/${pullRequest.index}/head`;
+  if (!known.has(pullRef)) {
+    const landed = await baseCell.commitApiChange({ ref: pullRef, expectedOldOid: ZERO_OID, newOid: featureTip });
+    if (landed.tag !== "committed") {
+      throw new Error(`refs/pull landing failed: ${landed.tag}`);
+    }
+  }
+  await baseCell.deleteApiRef({ ref: "refs/heads/forkstage", expectedOid: known.get("refs/heads/forkstage")?.target ?? featureTip });
+
+  return { index: pullRequest.index, forkRepoId, featureTip };
+}
+
+describe("merge delete_branch_after_merge — the fork-head arms", () => {
+  it("deletes the FORK's head branch after the merge — the fork's default branch and the base survive", async () => {
+    const seeded = await seedForkHeadPr({ forkOwner: OWNER, forkSlug: "fork-delete", forkBranch: "forktopic", featurePath: "fork-delete.txt", featureContent: "from the fork\n" });
+    const mainTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/main")?.target as string;
+
+    const merge = await send(`${REPO}/pulls/${seeded.index}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }));
+    expect(merge.status).toBe(200);
+    expect((await jsonBody(await get(`${REPO}/pulls/${seeded.index}`))).merged).toBe(true);
+
+    // the fork's feature branch is GONE; the fork's own default branch stays
+    const forkTips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: "fork-delete" }).listRefs());
+    expect(forkTips.get("refs/heads/forktopic")).toBeUndefined();
+    expect(forkTips.get("refs/heads/main")).toBeDefined();
+
+    // the merge landed on the base (main advanced), which never loses a branch
+    const baseTips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    expect(baseTips.get("refs/heads/main")?.target).not.toBe(mainTip);
+    expect(baseTips.get(`refs/pull/${seeded.index}/head`)?.target).toBe(seeded.featureTip);
+  });
+
+  it("keeps the FORK's default branch as a fork PR head — the default arm reads the head repo's default", async () => {
+    // the fork's main is AHEAD of the base main (the feature descends from
+    // the shared base), so the PR is mergeable and head == fork default
+    const seeded = await seedForkHeadPr({ forkOwner: OWNER, forkSlug: "fork-default", forkBranch: "main", onDefaultBranch: true, featurePath: "fork-default.txt", featureContent: "ahead on fork main\n" });
+
+    const merge = await send(`${REPO}/pulls/${seeded.index}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }));
+    expect(merge.status).toBe(200);
+
+    // upstream CanDeleteBranchWithPermission evaluates
+    // branch == pr.HeadRepo.DefaultBranch (branch.go:562-564) — the fork's
+    // main SURVIVES; the merge still lands
+    const forkTips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: "fork-default" }).listRefs());
+    expect(forkTips.get("refs/heads/main")?.target).toBe(seeded.featureTip);
+    expect((await jsonBody(await get(`${REPO}/pulls/${seeded.index}`))).merged).toBe(true);
+  });
+
+  it("keeps a fork-side rule-protected head branch — the protected arm reads the head repo's rules", async () => {
+    const seeded = await seedForkHeadPr({ forkOwner: OWNER, forkSlug: "fork-protected", forkBranch: "protfork", featurePath: "fork-prot.txt", featureContent: "protected on the fork\n" });
+
+    // the ZERO config on the FORK's repo id: can_delete=false refuses every
+    // writer including the fork owner (CanUserDelete → ErrBranchIsProtected)
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId: seeded.forkRepoId,
+      ruleName: "protfork",
+      priority: 0,
+      rules: serializeRuleConfig(emptyRuleConfig()),
+      createdAt: new Date(T0 * 1000),
+      updatedAt: new Date(T0 * 1000),
+    });
+
+    const merge = await send(`${REPO}/pulls/${seeded.index}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }));
+    expect(merge.status).toBe(200);
+
+    // the fork-side rule (not any base rule) kept the branch; merged anyway
+    const forkTips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: "fork-protected" }).listRefs());
+    expect(forkTips.get("refs/heads/protfork")).toBeDefined();
+    expect((await jsonBody(await get(`${REPO}/pulls/${seeded.index}`))).merged).toBe(true);
+  });
+
+  it("keeps the fork's head branch when the doer holds no write on the fork — the write arm is the head repo's", async () => {
+    // a fork owned by a SECOND user; the suite owner (base maintainer) merges
+    const seeded = await seedForkHeadPr({ forkOwner: "forkkeeper", forkSlug: "outside", forkBranch: "outsidetopic", featurePath: "outside.txt", featureContent: "outside fork\n" });
+
+    const merge = await send(`${REPO}/pulls/${seeded.index}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }));
+    expect(merge.status).toBe(200);
+
+    // upstream CanDeleteBranch resolves GetDoerRepoPermission(pr.HeadRepo)
+    // (branch.go:551-557) and refuses without CanWrite(unit.TypeCode) there
+    // (branch.go:564-566) — the base maintainer holds no write on someone
+    // else's fork, so the branch SURVIVES (the merge lands regardless)
+    const forkTips = refTipMap(await engineReads(env, { ownerNamespace: "forkkeeper", slug: "outside" }).listRefs());
+    expect(forkTips.get("refs/heads/outsidetopic")).toBeDefined();
+    expect((await jsonBody(await get(`${REPO}/pulls/${seeded.index}`))).merged).toBe(true);
   });
 });

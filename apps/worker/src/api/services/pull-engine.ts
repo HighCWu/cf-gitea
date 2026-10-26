@@ -32,7 +32,7 @@ import {
   pullHeadRef,
   ZERO_OID,
 } from "./engine";
-import type { RepositoryWithOwner } from "./repository";
+import { findRepositoryById, type RepositoryWithOwner } from "./repository";
 import { canWriteRepository } from "./repo-access";
 
 /** `PullRequestStatus` mapping (§2.4; unrelated has no upstream row → Empty). */
@@ -314,6 +314,57 @@ export async function mergePullRequest(
         if (headTip !== undefined) {
           try {
             await cell.deleteApiRef({ ref: branchRef(pr.headBranch), expectedOid: headTip });
+          } catch (error) {
+            console.error(`[pull-engine] head-branch delete failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+    } else if (opts.deleteBranchAfterMerge) {
+      // FORK HEAD: upstream's DeleteBranchAfterMerge operates on pr.HeadRepo,
+      // not the base (services/repository/branch.go:812-822 — LoadHeadRepo →
+      // GetRepositoryByID, models/issues/pull.go:232-251; a nil head repo —
+      // "Forked repository has already been deleted" (:817-820) — fails the
+      // delete with repo.branch.deletion_failed and the merge caller ignores
+      // it). The SAME guard ladder runs against the HEAD repo's state and the
+      // doer's permission THERE: CanDeleteBranch (branch.go:551-557) resolves
+      // GetDoerRepoPermission(ctx, pr.HeadRepo, doer) — the fork's own
+      // repo-scoped permission (models/perm/access/repo_permission.go:413-418
+      // → GetIndividualUserRepoPermission: owner/admin/collaborator/org-team
+      // only; allow_maintainer_edit grants nothing here) — so the arms read:
+      //   - default/target arm: branch.go:562-564 against pr.HeadRepo
+      //     (GetPullRequestTargetBranch → DefaultBranch; no PR-unit config);
+      //   - shared-head arm: branch.go:844-849, keyed on pr.HeadRepoID —
+      //     the helper above is already head-repo keyed;
+      //   - write arm: branch.go:564-566 — permissionInRepo.CanWrite(
+      //     unit.TypeCode) IN THE HEAD REPO. The same-repo arm above omits it
+      //     because the merge route already required write on the one repo
+      //     involved; a fork head needs its own check (a base maintainer
+      //     merging an outside fork holds no write there and the delete
+      //     skips). principalAccessOf().write is the landed CanWrite port;
+      //   - protected arm: branch.go:568-583 — the HEAD repo's first-match
+      //     rule + CanUserDelete with the head-repo access pair
+      //     (headBranchDeleteRefusedByRule parameterized over the pair).
+      // The delete is a CAS on the FORK cell's branch ref (its own cell —
+      // forks are full copies, SPEC-0001b §5.2; the engineCell id is the
+      // repo's owner/slug identity, not the base's). Every refusal and miss
+      // skips — the same skip-not-error posture as the same-repo arm.
+      const headPair = await findRepositoryById(c.env.DB, pr.headRepoId);
+      if (headPair === null) {
+        console.info(`[pull-engine] head-branch delete skipped: head repository is gone [repo_id: ${pr.headRepoId}]`);
+      } else if (pr.headBranch === headPair.repo.defaultBranch) {
+        console.info(`[pull-engine] head-branch delete skipped: branch is default or pull request target [branch: ${pr.headBranch}]`);
+      } else if (await hasUnmergedPullRequestsByHeadInfo(c.env.DB, pr.headRepoId, pr.headBranch, issue.id)) {
+        console.info(`[pull-engine] head-branch delete skipped: another open pull request uses this branch as head [branch: ${pr.headBranch}]`);
+      } else if (!(await principalAccessOf(c.env.DB, headPair.repo, c.get("authUser"))).write) {
+        console.info(`[pull-engine] head-branch delete skipped: no write access to the head repository [repo: ${headPair.repo.ownerNamespace}/${headPair.repo.slug}]`);
+      } else if (await headBranchDeleteRefusedByRule(c, headPair, pr.headBranch)) {
+        console.info(`[pull-engine] head-branch delete skipped: branch is protected [branch: ${pr.headBranch}]`);
+      } else {
+        const headCell = engineCell(c.env, headPair.repo);
+        const headTip = ((await engineReads(c.env, headPair.repo).listRefs())?.refs ?? []).find((ref) => ref.name === branchRef(pr.headBranch))?.target;
+        if (headTip !== undefined) {
+          try {
+            await headCell.deleteApiRef({ ref: branchRef(pr.headBranch), expectedOid: headTip });
           } catch (error) {
             console.error(`[pull-engine] head-branch delete failed: ${error instanceof Error ? error.message : String(error)}`);
           }
