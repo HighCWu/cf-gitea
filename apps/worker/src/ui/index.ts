@@ -1225,6 +1225,12 @@ import {
   splitCherryPickSuffix,
 } from "./pages/repo-editor-cherrypick";
 import { commitUploadFromForm } from "../services/upload-staging";
+import {
+  loadRepoMigrateData,
+  migrateRepoFromForm,
+  parseRepoMigrateForm,
+  renderRepoMigratePage,
+} from "./pages/repo-migrate";
 // Window-2e: the aux/byte-surface modules.
 import {
   loadHomeSitemapIndex,
@@ -2110,7 +2116,7 @@ export interface SitemapRoute {
 /** Window-2e: the search aux feeds (pages/search-aux.ts — repo.SearchRepo
  *  web.go:1102 + explore.TopicSearch web.go:564). */
 export interface SearchAuxRoute {
-  family: "repo-search-aux" | "explore-topic-search-aux";
+  family: "repo-search-aux" | "explore-topic-search-aux" | "repo-migrate";
 }
 
 /** Window-2e B2: the repo-scoped aux feeds + fragments (issues-search-aux,
@@ -2510,6 +2516,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // beside repo-create.
   if (raw.length === 3 && raw[1] === "repo" && raw[2] === "search") {
     return { family: "repo-search-aux" };
+  }
+  // Window-2e C3: the migration page (pages/repo-migrate.tsx — upstream's
+  // reqSignIn /repo/migrate, web.go:1094).
+  if (raw.length === 3 && raw[1] === "repo" && raw[2] === "migrate") {
+    return { family: "repo-migrate" };
   }
   if (raw.length === 3 && raw[1] === "org" && raw[2] === "create") {
     return { family: "org-create" };
@@ -4225,6 +4236,40 @@ async function topicSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Respo
   const params = parseTopicSearchAuxQuery(url);
   const result = await loadTopicSearchAux(c.env, params);
   return respond(topicSearchAuxResponse(result.total, { topics: result.topics }));
+}
+
+/** Window-2e C3: GET+POST /repo/migrate (pages/repo-migrate.tsx — reqSignIn;
+ *  the mirror checkbox is the only offered arm; the population is the
+ *  enqueued mirror-sync, never in-request). */
+async function repoMigratePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (resolved.route.family !== "repo-migrate") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const data = await loadRepoMigrateData(c.env.DB, viewer);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderRepoMigratePage({ ctx, data, form: { uid: null, cloneAddr: "", authUsername: "", authPassword: "", repoName: "", description: "", isPrivate: false, mirror: true }, error: null }), 200));
+}
+
+async function repoMigrateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (resolved.route.family !== "repo-migrate") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const data = await loadRepoMigrateData(c.env.DB, viewer);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseRepoMigrateForm(await readUrlEncodedForm(c.req.raw));
+  const result = await migrateRepoFromForm(c.env, c.env.DB, viewer, data, form, { request: c, origin: ctx.origin });
+  if (result.outcome === "created") {
+    return respond(
+      new Response(null, { status: 303, headers: { location: `/${result.ownerNamespace}/${result.slug}` } }),
+    );
+  }
+  return respond(c.html(renderRepoMigratePage({ ctx, data, form, error: result.message }), 200));
 }
 
 /** Window-2e: the .rss/.atom envelopes — resolve the owner through the
@@ -9437,6 +9482,8 @@ uiRouter.get("/sitemap.xml", (c) => sitemapRoute(c));
 uiRouter.get("/explore/repos/sitemap-:file", (c) => sitemapRoute(c));
 uiRouter.get("/explore/users/sitemap-:file", (c) => sitemapRoute(c));
 uiRouter.get("/repo/search", (c) => repoSearchAuxRoute(c));
+uiRouter.get("/repo/migrate", (c) => repoMigratePage(c));
+uiRouter.post("/repo/migrate", (c) => repoMigrateSubmit(c));
 uiRouter.get("/explore/topics/search", (c) => topicSearchAuxRoute(c));
 // The feed suffixes — one constrained registration (the owner-home
 // precedent); the parser discriminates .rss vs .atom and strips.
