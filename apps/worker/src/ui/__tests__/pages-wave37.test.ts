@@ -220,17 +220,30 @@ beforeAll(async () => {
 describe("wave-37 parser claims", () => {
   it("claims exactly the bare /{owner}/-/projects tail", () => {
     expect(parseUiRoute("/wave37-user/-/projects")).toEqual({ family: "owner-projects", owner: "wave37-user" });
-    // The board depth + write group stay unclaimed (the engine's 404) — the
-    // follow-up row the page module documents, never a half-ported surface.
-    expect(parseUiRoute("/wave37-user/-/projects/7")).toBeNull();
-    expect(parseUiRoute("/wave37-user/-/projects/7/edit")).toBeNull();
-    expect(parseUiRoute("/wave37-user/-/projects/new")).toBeNull();
-    expect(parseUiRoute("/wave37-user/-/projects/7/workflows")).toBeNull();
+    // The board depth + write group were the follow-up row's — wave 40
+    // claimed them (pages/owner-project-board.tsx); the sibling `/-` tails
+    // stay unclaimed.
+    expect(parseUiRoute("/wave37-user/-/projects/7")).toEqual({
+      family: "owner-project-board",
+      owner: "wave37-user",
+      id: 7,
+    });
+    expect(parseUiRoute("/wave37-user/-/projects/7/edit")).toEqual({
+      family: "owner-project-edit",
+      owner: "wave37-user",
+      id: 7,
+    });
+    expect(parseUiRoute("/wave37-user/-/projects/new")).toEqual({ family: "owner-project-new", owner: "wave37-user" });
+    expect(parseUiRoute("/wave37-user/-/projects/7/workflows")).toEqual({
+      family: "owner-project-workflows",
+      owner: "wave37-user",
+      id: 7,
+    });
     // The `/-` namespace's sibling tails stay unclaimed.
     expect(parseUiRoute("/wave37-user/-/heatmap")).toBeNull();
     expect(parseUiRoute("/wave37-user/-/packages")).toBeNull();
     expect(handlesUiRoute("/wave37-user/-/projects")).toBe(true);
-    expect(handlesUiRoute("/wave37-user/-/projects/7")).toBe(false);
+    expect(handlesUiRoute("/wave37-user/-/projects/7")).toBe(true);
   });
 });
 
@@ -247,12 +260,12 @@ describe("user projects page /{user}/-/projects", () => {
     expect(html).toContain('class="page-content user profile"');
     expect(html).toContain("wave37-user");
     expect(html).toContain("Projects");
-    // The rows: titles are PLAIN TEXT (the board anchor is the follow-up
-    // row's — no dead links), the glyph + the visibility-filtered counts.
-    // The default facet is OPEN — the closed board lists on ?state=closed.
+    // The rows: the title anchors the /{id} board (live since wave 40), the
+    // glyph + the visibility-filtered counts. The default facet is OPEN —
+    // the closed board lists on ?state=closed.
     expect(html).toContain("Feature Board");
     expect(html).not.toContain("Retired Board");
-    expect(html).not.toContain('href="/wave37-user/-/projects/');
+    expect(html).toContain('href="/wave37-user/-/projects/');
     // The counts matrix: the public repo's 2 open + 1 closed count; the
     // private repo's 3 opens do NOT (anonymous = the AllPublic arm).
     expect(html).toContain("2 Open");

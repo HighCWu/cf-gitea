@@ -691,6 +691,44 @@ import {
   renderOwnerProjectsPage,
   resolveOwnerProjects,
 } from "./pages/owner-projects";
+// Wave-40 owner projects BOARD families (the survey's follow-up row — the
+// board view + write group + workflow tails over the landed service
+// predicates).
+import {
+  boardDoer,
+  createColumnFromForm,
+  createProjectFromForm,
+  createWorkflowFromForm,
+  deleteWorkflowFromForm,
+  findOwnerProject,
+  loadProjectBoardData,
+  loadProjectChromeCounts,
+  loadProjectWorkflowsData,
+  ownerProjectWriteAccess,
+  parseColumnForm,
+  parseProjectForm,
+  parseWorkflowForm,
+  projectLinkOf,
+  renderEditProjectPage,
+  renderNewProjectPage,
+  renderProjectBoardPage,
+  renderProjectWorkflowsPage,
+  setProjectDefaultColumnFromForm,
+  updateProjectFromForm,
+  updateWorkflowFromForm,
+  type ResolvedOwner,
+  type WorkflowForm,
+  WORKFLOW_EVENTS,
+} from "./pages/owner-project-board";
+import {
+  canManageOrgProjectWorkflows,
+  canManageUserProjectWorkflows,
+  cardTypeToString,
+  changeProjectStatus,
+  deleteProjectById,
+  findWorkflowByIdAndProject,
+  type ProjectRow,
+} from "../api/services/projects";
 // Wave-24 repo social lists + collaboration panel (the parity survey's bench
 // tier — the forks/stars/watchers trio and the settings/collaboration row).
 import { loadRepoSocialData, renderRepoSocialPage } from "./pages/repo-social";
@@ -1100,14 +1138,53 @@ export interface OrgRepositoriesRoute {
  *  the `/{id}` board tails) — the parity survey's regenerated top-5 row 5.
  *  The `-` pseudo-segment namespace claims EXACTLY the bare projects tail;
  *  the owner resolves user-or-org at load time (upstream's single handler
- *  branches on ContextUser.IsOrganization). The board depth (`/{id}`,
- *  `/{id}/workflows`) and the write group (`/new`, `/{id}/edit|delete|
- *  open|close`) stay unclaimed → the engine's 404 — the follow-up row the
- *  page module documents, no half-ported drill-down. */
+ *  branches on ContextUser.IsOrganization). Wave 40 (pages/
+ *  owner-project-board.tsx) claims the board depth and the write group —
+ *  the survey's follow-up row. */
 export interface OwnerProjectsRoute {
   family: "owner-projects";
   /** Decoded owner segment (user-or-org rows at resolve time). */
   owner: string;
+}
+
+/** The wave-40 owner projects BOARD families (pages/owner-project-board.tsx):
+ *  upstream's web.go:1140-1155 board view + write group (the survey's
+ *  follow-up row) over the `/-/projects` depth — `/{id}` the board view
+ *  (org.ViewProject), `/new` + `/{id}/edit` the GET+POST form combos,
+ *  `/{id}/delete` + `/{id}/open|close` the POST writes, `/{id}/columns/new`
+ *  + `/{id}/{columnID}/default` the form-compatible board-helper POSTs
+ *  (addProjectBoardRoutes, web.go:331-345), and the `/{id}/workflows[/{wid}
+ *  [/delete]]` workflow tails (addProjectWorkflowRoutes, web.go:327-331).
+ *  The `new` literal outranks the numeric `{id}` shapes (upstream registers
+ *  it first, chi tree order); the id shapes claim positive integers only —
+ *  a junk segment stays unclaimed → the engine's 404 (upstream's
+ *  PathParamInt64-zero ServerError 500 arm, the landed uniform not-found
+ *  answer). The board-helper arms whose upstream methods are PUT/DELETE
+ *  (`/{columnID}`) or whose controls are pure drag-drop JSON fetches
+ *  (`/move`, `/{columnID}/move`) stay unclaimed → the engine's 404 — the
+ *  page module documents the no-JS reductions, never dead controls. */
+export interface OwnerProjectBoardRoute {
+  family:
+    | "owner-project-board" // GET /{id}
+    | "owner-project-new" // GET+POST /new
+    | "owner-project-edit" // GET+POST /{id}/edit
+    | "owner-project-delete" // POST /{id}/delete
+    | "owner-project-status" // POST /{id}/open|close
+    | "owner-project-column-new" // POST /{id}/columns/new
+    | "owner-project-column-default" // POST /{id}/{columnID}/default
+    | "owner-project-workflows" // GET+POST /{id}/workflows[/{wid}]
+    | "owner-project-workflow-delete" // POST /{id}/workflows/{wid}/delete
+  ;
+  /** Decoded owner segment (user-or-org rows at resolve time). */
+  owner: string;
+  /** The parsed board id (the numeric families; "new" carries none). */
+  id?: number;
+  /** open|close (the status family only). */
+  action?: "open" | "close";
+  /** The column id (the column-default family only). */
+  columnId?: number;
+  /** The workflow id (the workflows-with-wid and workflow-delete families). */
+  workflowId?: number;
 }
 
 /** The wave-24 repo social list families (pages/repo-social.tsx): upstream's
@@ -1526,6 +1603,7 @@ export type ParsedUiRoute =
   | OrgMembersRoute
   | OrgRepositoriesRoute
   | OwnerProjectsRoute
+  | OwnerProjectBoardRoute
   | RepoSocialRoute
   | SettingsCollaborationRoute
   | TagsRoute
@@ -1714,16 +1792,71 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // exactly the repositories tail (a repo cannot be named "-" and no landed
   // family reads the shape, so the claim shadows nothing). Wave 37 adds the
   // sibling bare projects tail (web.go:1143's read group — pages/
-  // owner-projects.tsx). Every other `/-*` tail (`/-/heatmap`,
-  // `/-/packages*`, the projects board depth `/-/projects/{id}` + write
-  // group, `/-/code`, the bare `/-`) stays unclaimed → the engine's 404,
-  // exactly upstream's unregistered-route answer for slices that have not
-  // landed.
+  // owner-projects.tsx) and wave 40 the projects board depth + write group
+  // (web.go:1140-1155 — pages/owner-project-board.tsx, the board route
+  // interface's shape contract). Every other `/-*` tail (`/-/heatmap`,
+  // `/-/packages*`, `/-/code`, the bare `/-`) stays unclaimed → the engine's
+  // 404, exactly upstream's unregistered-route answer for slices that have
+  // not landed.
   if (repo === "-" && raw.length === 4 && raw[3] === "repositories") {
     return { family: "org-repositories", owner };
   }
-  if (repo === "-" && raw.length === 4 && raw[3] === "projects") {
-    return { family: "owner-projects", owner };
+  if (repo === "-" && raw.length >= 4 && raw[3] === "projects") {
+    if (raw.length === 4) return { family: "owner-projects", owner };
+    const tail = raw.slice(4);
+    const head = tail[0] as string;
+    // The write group's `/new` literal (registered ahead of the {id} param
+    // upstream — chi static-before-dynamic).
+    if (tail.length === 1 && head === "new") return { family: "owner-project-new", owner };
+    // The {id} shapes claim positive integers only (the org-teams detail
+    // precedent — "007" parses as 7; junk segments stay engine-owned where
+    // upstream's PathParamInt64-zero arm would ServerError).
+    if (/^\d+$/.test(head)) {
+      const id = Number.parseInt(head, 10);
+      if (tail.length === 1) return { family: "owner-project-board", owner, id };
+      if (tail.length === 2) {
+        if (tail[1] === "edit") return { family: "owner-project-edit", owner, id };
+        if (tail[1] === "delete") return { family: "owner-project-delete", owner, id };
+        if (tail[1] === "open") return { family: "owner-project-status", owner, id, action: "open" };
+        if (tail[1] === "close") return { family: "owner-project-status", owner, id, action: "close" };
+        if (tail[1] === "workflows") return { family: "owner-project-workflows", owner, id };
+      }
+      if (tail.length === 3) {
+        if (tail[1] === "columns" && tail[2] === "new") {
+          return { family: "owner-project-column-new", owner, id };
+        }
+        if (tail[1] === "workflows" && /^\d+$/.test(tail[2] as string)) {
+          return {
+            family: "owner-project-workflows",
+            owner,
+            id,
+            workflowId: Number.parseInt(tail[2] as string, 10),
+          };
+        }
+        if (/^\d+$/.test(tail[1] as string) && tail[2] === "default") {
+          return {
+            family: "owner-project-column-default",
+            owner,
+            id,
+            columnId: Number.parseInt(tail[1] as string, 10),
+          };
+        }
+      }
+      if (
+        tail.length === 4 &&
+        tail[1] === "workflows" &&
+        /^\d+$/.test(tail[2] as string) &&
+        tail[3] === "delete"
+      ) {
+        return {
+          family: "owner-project-workflow-delete",
+          owner,
+          id,
+          workflowId: Number.parseInt(tail[2] as string, 10),
+        };
+      }
+    }
+    return null;
   }
 
   const tail = raw.slice(3);
@@ -4845,6 +4978,437 @@ async function ownerProjectsPage(c: Context<{ Bindings: Env }>): Promise<Respons
 }
 
 // ---------------------------------------------------------------------------
+// The wave-40 owner projects BOARD families (pages/owner-project-board.tsx —
+// upstream's web.go:1140-1155 board view + write group + the web.go:327-345
+// board/workflow helper POSTs). Every handler rides the LIST page's
+// resolution (the read group gates), then the write group's ladder at the
+// shared depth prologue + ownerProjectWriteGate.
+// ---------------------------------------------------------------------------
+
+/** The wave-40 families' guard — the depth prologue accepts exactly these
+ *  (all carrying the board id). */
+function isOwnerProjectBoardRoute(route: ParsedUiRoute): route is OwnerProjectBoardRoute {
+  return (
+    route.family === "owner-project-board" ||
+    route.family === "owner-project-edit" ||
+    route.family === "owner-project-delete" ||
+    route.family === "owner-project-status" ||
+    route.family === "owner-project-column-new" ||
+    route.family === "owner-project-column-default" ||
+    route.family === "owner-project-workflows" ||
+    route.family === "owner-project-workflow-delete"
+  );
+}
+
+/** The resolved projects depth: the read-gated owner + the owner-scoped
+ *  project row + the parsed route (the `/-/projects/{id}` families only —
+ *  `/new` resolves its owner inline). */
+type ResolvedProjectDepth =
+  | {
+      ok: true;
+      url: URL;
+      ctx: UiContext;
+      viewer: Viewer;
+      respond: (res: Response) => Response;
+      route: OwnerProjectBoardRoute;
+      owner: ResolvedOwner;
+      /** The owner's `/-/projects` list base (the list-landing 303 target). */
+      ownerLink: string;
+      project: ProjectRow;
+    }
+  | { ok: false; response: Response };
+
+/** The owner's namespace segment (the list base's head). */
+function ownerBase(owner: ResolvedOwner): string {
+  return owner.kind === "org" ? owner.org.username : owner.user.username;
+}
+
+/**
+ * The projects depth's shared prologue: the LIST page's resolution (the read
+ * group — the org unit-access gate or the individualPermsChecker ladder, the
+ * rename-307 seam included), then the owner-scoped project read
+ * (GetProjectByIDAndOwner — another owner's id reads as not found). A
+ * missing owner or project 404-shells.
+ */
+async function resolveOwnerProjectDepth(c: Context<{ Bindings: Env }>): Promise<ResolvedProjectDepth> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved;
+  const { url, ctx, viewer, respond, route } = resolved;
+  if (!isOwnerProjectBoardRoute(route)) return { ok: false, response: await c.notFound() }; // drift guard
+  const owner = await resolveOwnerProjects(c.env.DB, route.owner, boardDoer(viewer), url.pathname, orgFamilyQuery(url));
+  if (owner.kind === "redirect") {
+    return {
+      ok: false,
+      response: respond(new Response(null, { status: 307, headers: { location: owner.location } })),
+    };
+  }
+  if (owner.kind === "missing") return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  const project = await findOwnerProject(c.env.DB, owner, route.id ?? 0);
+  if (project === null) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  return {
+    ok: true,
+    url,
+    ctx,
+    viewer,
+    respond,
+    route,
+    owner,
+    ownerLink: `/${ownerBase(owner)}/-/projects`,
+    project,
+  };
+}
+
+/**
+ * The write group's gate (web.go:1146-1155, mounted inside the read group):
+ * anonymous → the login 303 (reqSignIn), a signed-in non-writer → the 404
+ * shell (reqAnyRepoUnitAccess(write, true) + the web.go:1151-1155 individual
+ * check — canWriteProjects covers both, INCLUDING the site-admin-on-another-
+ * user's-project arm). Returns the Response to answer, or null to proceed.
+ */
+function ownerProjectWriteGate(
+  c: Context<{ Bindings: Env }>,
+  depth: Extract<ResolvedProjectDepth, { ok: true }>,
+): Promise<Response | null> {
+  return ownerProjectWriteGateAt(c, depth.owner, depth.viewer, depth.ctx, depth.respond, depth.url.pathname);
+}
+
+/** The write gate's free-variable form (the /new handlers' inline owner). */
+async function ownerProjectWriteGateAt(
+  c: Context<{ Bindings: Env }>,
+  owner: ResolvedOwner,
+  viewer: Viewer,
+  ctx: UiContext,
+  respond: (res: Response) => Response,
+  pathname: string,
+): Promise<Response | null> {
+  if (viewer.kind === "anonymous") return respond(loginRedirect(pathname));
+  if (!(await ownerProjectWriteAccess(c.env.DB, owner, boardDoer(viewer)))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  return null;
+}
+
+/** GET /{owner}/-/projects/{id} (org.ViewProject — the board). */
+async function ownerProjectBoardPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { url, ctx, viewer, respond, owner, project } = depth;
+  const data = await loadProjectBoardData(c.env.DB, owner, project, viewer, url.origin, url.searchParams);
+  return respond(c.html(renderProjectBoardPage({ ctx, data, columnForm: { title: "", color: "" }, columnError: null }), 200));
+}
+
+/** The /new handlers' shared prologue (no board id — the owner resolves
+ *  inline through the LIST page's seam). */
+type ResolvedOwnerEntry =
+  | (Extract<Awaited<ReturnType<typeof resolveUiSession>>, { ok: true }> & { owner: ResolvedOwner })
+  | { ok: false; response: Response };
+
+async function resolveOwnerEntry(c: Context<{ Bindings: Env }>): Promise<ResolvedOwnerEntry> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved;
+  const { url, viewer, respond } = resolved;
+  if (resolved.route.family !== "owner-project-new") return { ok: false, response: await c.notFound() }; // drift guard
+  const owner = await resolveOwnerProjects(c.env.DB, resolved.route.owner, boardDoer(viewer), url.pathname, orgFamilyQuery(url));
+  if (owner.kind === "redirect") {
+    return { ok: false, response: respond(new Response(null, { status: 307, headers: { location: owner.location } })) };
+  }
+  if (owner.kind === "missing") return { ok: false, response: respond(c.html(renderNotFound(resolved.ctx), 404)) };
+  return { ...resolved, owner };
+}
+
+/** GET /{owner}/-/projects/new (RenderNewProject — the write group's form;
+ *  the write gate is the route group's, run before any render). */
+async function ownerProjectNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const entry = await resolveOwnerEntry(c);
+  if (!entry.ok) return entry.response;
+  const { ctx, viewer, respond, owner } = entry;
+  const gate = await ownerProjectWriteGateAt(c, owner, viewer, ctx, respond, new URL(c.req.url).pathname);
+  if (gate !== null) return gate;
+  const counts = await loadProjectChromeCounts(c.env.DB, owner, viewer);
+  return respond(
+    c.html(
+      renderNewProjectPage({ ctx, owner, form: { title: "", content: "", templateType: "", cardType: "" }, error: null, counts }),
+      200,
+    ),
+  );
+}
+
+/** POST /{owner}/-/projects/new (NewProjectPost): success 303s onto the
+ *  LIST page, the binding failures re-render at 200 with the message and
+ *  the kept submission. */
+async function ownerProjectNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const entry = await resolveOwnerEntry(c);
+  if (!entry.ok) return entry.response;
+  const { ctx, viewer, respond, owner } = entry;
+  const gate = await ownerProjectWriteGateAt(c, owner, viewer, ctx, respond, new URL(c.req.url).pathname);
+  if (gate !== null) return gate;
+  const doer = boardDoer(viewer);
+  if (doer.id === null) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseProjectForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createProjectFromForm(c.env.DB, owner, doer.id, form, new Date());
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${ownerBase(owner)}/-/projects` } }));
+  }
+  const counts = await loadProjectChromeCounts(c.env.DB, owner, viewer);
+  return respond(c.html(renderNewProjectPage({ ctx, owner, form, error: result.message, counts }), 200));
+}
+
+/** GET /{owner}/-/projects/{id}/edit (RenderEditProject — the pre-filled
+ *  form; `?redirect=project` rides the hidden field to the POST). */
+async function ownerProjectEditPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { url, ctx, viewer, respond, owner, project } = depth;
+  const gate = await ownerProjectWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const data = await loadProjectBoardData(c.env.DB, owner, project, viewer, url.origin, new URLSearchParams());
+  return respond(
+    c.html(
+      renderEditProjectPage({
+        ctx,
+        data,
+        form: {
+          title: project.title,
+          content: project.description,
+          templateType: "",
+          cardType: cardTypeToString(project.cardType),
+        },
+        error: null,
+        redirect: url.searchParams.get("redirect") ?? "",
+      }),
+      200,
+    ),
+  );
+}
+
+/** POST /{owner}/-/projects/{id}/edit (EditProjectPost): success 303s onto
+ *  the board when the form's hidden `redirect=project` rode (upstream's
+ *  ctx.Redirect(p.Link())), else onto the LIST page; the binding failures
+ *  re-render at 200. */
+async function ownerProjectEditSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { url, ctx, viewer, respond, owner, project } = depth;
+  const gate = await ownerProjectWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const formParams = await readUrlEncodedForm(c.req.raw);
+  const form = parseProjectForm(formParams);
+  const result = await updateProjectFromForm(c.env.DB, project, form, new Date());
+  if (result.outcome === "updated") {
+    const target =
+      formParams.get("redirect") === "project" ? projectLinkOf(owner, project) : `/${ownerBase(owner)}/-/projects`;
+    return respond(new Response(null, { status: 303, headers: { location: target } }));
+  }
+  const data = await loadProjectBoardData(c.env.DB, owner, project, viewer, url.origin, new URLSearchParams());
+  return respond(
+    c.html(
+      renderEditProjectPage({
+        ctx,
+        data,
+        form,
+        error: result.message,
+        redirect: formParams.get("redirect") ?? "",
+      }),
+      200,
+    ),
+  );
+}
+
+/** POST /{owner}/-/projects/{id}/delete (DeleteProject): the cascade delete
+ *  then the 303 onto the LIST page (upstream's JSONRedirect target). */
+async function ownerProjectDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const gate = await ownerProjectWriteGate(c, depth);
+  if (gate !== null) return gate;
+  await deleteProjectById(c.env.DB, depth.project.id);
+  return depth.respond(new Response(null, { status: 303, headers: { location: `/${ownerBase(depth.owner)}/-/projects` } }));
+}
+
+/** POST /{owner}/-/projects/{id}/open|close (ChangeProjectStatus): the
+ *  guarded flip then the 303 onto the board (upstream's JSONRedirect →
+ *  ProjectLinkForOrg). */
+async function ownerProjectStatusSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const gate = await ownerProjectWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const action = depth.route.family === "owner-project-status" ? depth.route.action : undefined;
+  if (action !== "open" && action !== "close") return depth.respond(await c.notFound());
+  await changeProjectStatus(c.env.DB, depth.project, action === "close", new Date());
+  return depth.respond(new Response(null, { status: 303, headers: { location: projectLinkOf(depth.owner, depth.project) } }));
+}
+
+/** POST /{owner}/-/projects/{id}/columns/new (AddColumnToProjectPost): the
+ *  board re-renders at 200 with the message + the kept values on the
+ *  binding/validation arms, 303s onto the board on success (upstream's
+ *  JSONOK + JS reload). */
+async function ownerProjectColumnNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { url, ctx, viewer, respond, owner, project } = depth;
+  const gate = await ownerProjectWriteGate(c, depth);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseColumnForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createColumnFromForm(c.env.DB, project, viewer.id, form, new Date());
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: projectLinkOf(owner, project) } }));
+  }
+  const data = await loadProjectBoardData(c.env.DB, owner, project, viewer, url.origin, url.searchParams);
+  return respond(c.html(renderProjectBoardPage({ ctx, data, columnForm: form, columnError: result.message }), 200));
+}
+
+/** POST /{owner}/-/projects/{id}/{columnID}/default (SetDefaultProjectColumn):
+ *  a foreign column id 404-shells, success 303s onto the board. */
+async function ownerProjectColumnDefaultSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { ctx, respond, owner, project } = depth;
+  const gate = await ownerProjectWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const columnId = depth.route.family === "owner-project-column-default" ? depth.route.columnId : undefined;
+  if (columnId === undefined) return respond(await c.notFound());
+  const result = await setProjectDefaultColumnFromForm(c.env.DB, project, columnId, new Date());
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: projectLinkOf(owner, project) } }));
+}
+
+/** The workflows prologue's shared tail: the ?workflow_id focus (an unknown
+ *  id 404-shells — the slices.ContainsFunc arm), then the render (create
+ *  form / focused edit form + the re-render error arm). The ?event
+ *  validation is the GET handler's arm (the POST re-render must reach the
+ *  page with the service's 422 message, never the 404 shell). */
+async function workflowsReRender(
+  c: Context<{ Bindings: Env }>,
+  depth: Extract<ResolvedProjectDepth, { ok: true }>,
+  form: WorkflowForm,
+  error: string | null,
+): Promise<Response> {
+  const { url, ctx, viewer, respond, owner, project } = depth;
+  const data = await loadProjectWorkflowsData(c.env.DB, owner, project, viewer, url.origin, url.searchParams);
+  if (depth.route.workflowId !== undefined) {
+    const focused = await findWorkflowByIdAndProject(c.env.DB, depth.route.workflowId, project.id);
+    if (focused === null) return respond(c.html(renderNotFound(ctx), 404));
+    data.workflowId = depth.route.workflowId;
+  }
+  return respond(c.html(renderProjectWorkflowsPage({ ctx, data, form, error }), 200));
+}
+
+/** The workflows rule form's empty create state (the GET's fresh form). */
+function emptyWorkflowForm(event: string): WorkflowForm {
+  return {
+    event,
+    enabled: true,
+    enabledPresent: false,
+    hasRuleFields: false,
+    filters: { issue_type: "", source_column_id: 0, target_column_id: 0, label_ids: [] },
+    actions: { column_id: 0, add_label_ids: [], remove_label_ids: [], issue_state: "" },
+  };
+}
+
+/** GET /{owner}/-/projects/{id}/workflows[/{wid}] (org.ProjectWorkflows →
+ *  RenderWorkflows) — the read group gates it; the edit arms ride canManage
+ *  inside the render. An unknown `?event=` preselect 404-shells
+ *  (RenderWorkflows' workflow.go:48-52 arm). */
+async function ownerProjectWorkflowsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const event = depth.url.searchParams.get("event");
+  if (event !== null && event !== "" && !WORKFLOW_EVENTS.some((entry) => entry.event === event)) {
+    return depth.respond(c.html(renderNotFound(depth.ctx), 404));
+  }
+  return workflowsReRender(c, depth, emptyWorkflowForm(event ?? ""), null);
+}
+
+/** The workflows writes' second-layer gate (CanManageWorkflows —
+ *  workflow.go:27-48): a projects writer who is not the org owner / the
+ *  user owner 404-shells (upstream answers the service's JSONError 403; the
+ *  landed gate posture is the uniform not-found shell). */
+async function ownerProjectManageGate(
+  c: Context<{ Bindings: Env }>,
+  depth: Extract<ResolvedProjectDepth, { ok: true }>,
+): Promise<Response | null> {
+  const writeGate = await ownerProjectWriteGate(c, depth);
+  if (writeGate !== null) return writeGate;
+  const doer = boardDoer(depth.viewer);
+  const canManage =
+    depth.owner.kind === "org"
+      ? await canManageOrgProjectWorkflows(c.env.DB, depth.owner.org, { id: doer.id ?? 0, isAdmin: doer.isAdmin })
+      : canManageUserProjectWorkflows(depth.project, { id: doer.id ?? 0 });
+  if (!canManage) return depth.respond(c.html(renderNotFound(depth.ctx), 404));
+  return null;
+}
+
+/** POST /{owner}/-/projects/{id}/workflows (CreateWorkflow): the service
+ *  422s re-render at 200, success 303s onto the workflows page (upstream's
+ *  JSON body + JS reload). */
+async function ownerProjectWorkflowCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const manageGate = await ownerProjectManageGate(c, depth);
+  if (manageGate !== null) return manageGate;
+  const form = parseWorkflowForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createWorkflowFromForm(c.env.DB, depth.owner, depth.project, form, new Date());
+  if (result.outcome === "created") {
+    return depth.respond(new Response(null, { status: 303, headers: { location: `${depth.ownerLink}/workflows` } }));
+  }
+  return workflowsReRender(c, depth, form, result.message);
+}
+
+/** POST /{owner}/-/projects/{id}/workflows/{wid} (UpdateWorkflow): the same
+ *  ladder; the quick enable/disable toggle POSTs only `enabled` and keeps
+ *  the stored rules (the replace-vs-toggle contract). */
+async function ownerProjectWorkflowUpdateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const manageGate = await ownerProjectManageGate(c, depth);
+  if (manageGate !== null) return manageGate;
+  const workflowId = depth.route.family === "owner-project-workflows" ? depth.route.workflowId : undefined;
+  if (workflowId === undefined) return depth.respond(await c.notFound());
+  const workflow = await findWorkflowByIdAndProject(c.env.DB, workflowId, depth.project.id);
+  if (workflow === null) return depth.respond(c.html(renderNotFound(depth.ctx), 404));
+  const form = parseWorkflowForm(await readUrlEncodedForm(c.req.raw));
+  const result = await updateWorkflowFromForm(c.env.DB, depth.owner, depth.project, workflow, form, new Date());
+  if (result.outcome === "updated") {
+    return depth.respond(new Response(null, { status: 303, headers: { location: `${depth.ownerLink}/workflows` } }));
+  }
+  return workflowsReRender(c, depth, form, result.message);
+}
+
+/** POST /{owner}/-/projects/{id}/workflows/{wid}/delete (DeleteWorkflow):
+ *  the same ladder, then the 303 onto the workflows page. */
+async function ownerProjectWorkflowDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveOwnerProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const manageGate = await ownerProjectManageGate(c, depth);
+  if (manageGate !== null) return manageGate;
+  const workflowId = depth.route.family === "owner-project-workflow-delete" ? depth.route.workflowId : undefined;
+  if (workflowId === undefined) return depth.respond(await c.notFound());
+  const result = await deleteWorkflowFromForm(c.env.DB, depth.project, workflowId);
+  if (result.outcome === "missing") return depth.respond(c.html(renderNotFound(depth.ctx), 404));
+  return depth.respond(new Response(null, { status: 303, headers: { location: `${depth.ownerLink}/workflows` } }));
+}
+
+// ---------------------------------------------------------------------------
 // The wave-24 collaboration settings family (pages/settings-collaboration.tsx
 // — upstream's /settings/collaboration group, web.go:1194-1204): the panel
 // GET plus the five POST writes, every one behind the shared settingsGate
@@ -5554,3 +6118,35 @@ uiRouter.get("/:owner/:repo/blob/*", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/blob", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/tree-list/:tlref{branch|tag|commit}/*", (c) => treeListAuxJson(c));
 uiRouter.get("/:owner/:repo/branches/list", (c) => branchesListAuxJson(c));
+// Wave-40 owner projects board + write group (parseUiRoute claims exactly
+// these shapes — upstream web.go:1140-1155's board view/write group plus
+// web.go:327-345's board/workflow helper POSTs; the POST-only tails answer
+// GET with chi's 405 — the hook test/delete convention; the POSTs run the
+// §2.8 sameOriginGuard first). No earlier registration can absorb these:
+// the static "-" segment outranks every dynamic peer and no registered
+// pattern above carries a ≥5-segment /:owner/-/projects/* shape; within the
+// namespace the "new"
+// literal outranks the dynamic {id} pattern by REGISTRATION ORDER too (the
+// matcher's first-match answer decides the 5-segment collision — verified
+// by the /new renders; chi gives static segments precedence).
+uiRouter.get("/:owner/-/projects/new", (c) => ownerProjectNewPage(c));
+uiRouter.post("/:owner/-/projects/new", (c) => ownerProjectNewSubmit(c));
+uiRouter.get("/:owner/-/projects/:id", (c) => ownerProjectBoardPage(c));
+uiRouter.get("/:owner/-/projects/:id/edit", (c) => ownerProjectEditPage(c));
+uiRouter.post("/:owner/-/projects/:id/edit", (c) => ownerProjectEditSubmit(c));
+uiRouter.post("/:owner/-/projects/:id/delete", (c) => ownerProjectDeleteSubmit(c));
+uiRouter.get("/:owner/-/projects/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/-/projects/:id/open", (c) => ownerProjectStatusSubmit(c));
+uiRouter.get("/:owner/-/projects/:id/open", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/-/projects/:id/close", (c) => ownerProjectStatusSubmit(c));
+uiRouter.get("/:owner/-/projects/:id/close", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/-/projects/:id/columns/new", (c) => ownerProjectColumnNewSubmit(c));
+uiRouter.get("/:owner/-/projects/:id/columns/new", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/-/projects/:id/:columnId{\\d+}/default", (c) => ownerProjectColumnDefaultSubmit(c));
+uiRouter.get("/:owner/-/projects/:id/:columnId{\\d+}/default", () => methodNotAllowed("POST"));
+uiRouter.get("/:owner/-/projects/:id/workflows", (c) => ownerProjectWorkflowsPage(c));
+uiRouter.post("/:owner/-/projects/:id/workflows", (c) => ownerProjectWorkflowCreateSubmit(c));
+uiRouter.get("/:owner/-/projects/:id/workflows/:wid", (c) => ownerProjectWorkflowsPage(c));
+uiRouter.post("/:owner/-/projects/:id/workflows/:wid", (c) => ownerProjectWorkflowUpdateSubmit(c));
+uiRouter.post("/:owner/-/projects/:id/workflows/:wid/delete", (c) => ownerProjectWorkflowDeleteSubmit(c));
+uiRouter.get("/:owner/-/projects/:id/workflows/:wid/delete", () => methodNotAllowed("POST"));

@@ -37,15 +37,19 @@
  * description when the owner carries NO projects at all, "No projects match
  * your search." when the current facet narrows to zero) and both chrome
  * arms. The BOARD depth (`/{id}` view with columns+cards, the
- * `/{id}/workflows` pages, and the whole write group) is its own follow-up
- * row, NOT half-ported — so:
+ * `/{id}/workflows` pages, and the whole write group) was its own follow-up
+ * row — LANDED by wave 40 (pages/owner-project-board.tsx, the survey's
+ * follow-up row), so:
  *
  * - project titles render as PLAIN TEXT (their `/{id}` anchor would be a
- *   dead link, §2.4.1);
+ *   dead link, §2.4.1) — RETIRED in wave 40: the board page landed (pages/
+ *   owner-project-board.tsx) and the rows anchor `/{id}` live;
  * - the per-row edit/open-close/delete controls, the delete confirm dialog
  *   and the New Project button are unrendered (their routes are the write
  *   group's, unclaimed — the milestone-edit precedent of rendering no dead
- *   controls);
+ *   controls); wave 40 claims those routes — the controls stay unrendered
+ *   HERE (the rows are the LIST's surface; the board page carries the
+ *   writer controls), so this page still renders no dead controls;
  * - the `.list-header` search box (`q`) and sort dropdown are unrendered:
  *   no landed keyword/sort support over the scope (listProjects orders
  *   `id DESC` only) — the org-home search-facet reduction; upstream's sort
@@ -426,13 +430,15 @@ export function ProjectStateToggle(props: {
   );
 }
 
-/** One projects/list.tmpl `.item` row: the owner-project glyph + title (a
- *  plain-text span — the `/{id}` board anchor is the follow-up row's), the
+/** One projects/list.tmpl `.item` row: the owner-project glyph + title, the
  *  open/closed counts (the visibility-filtered numbers), the writer
  *  controls NOT rendered, and the markdown description (the handler's
  *  MarkdownToHtml render, projects.go:106-108 — context-less, origin
- *  irrelevant with no links to rewrite). */
-export function ProjectListItem(props: { item: OwnerProjectsItem }) {
+ *  irrelevant with no links to rewrite). Wave 40: the title anchors the
+ *  `/{id}` board (upstream list.tmpl's `href="{{.Link}}"` — the board page
+ *  landed, pages/owner-project-board.tsx, so the anchor is live; the wave-37
+ *  plain-text stand-in is retired). */
+export function ProjectListItem(props: { item: OwnerProjectsItem; href?: string }) {
   const { project, counts } = props.item;
   const descriptionHtml =
     project.description !== ""
@@ -441,7 +447,12 @@ export function ProjectListItem(props: { item: OwnerProjectsItem }) {
   return (
     <div class="item flex-relaxed-list">
       <span class="list-item-large-title">
-        <Icon name="octicon-project-symlink" size={16} /> <span class="muted">{project.title}</span>
+        <Icon name="octicon-project-symlink" size={16} />{" "}
+        {props.href !== undefined ? (
+          <a href={props.href}>{project.title}</a>
+        ) : (
+          <span class="muted">{project.title}</span>
+        )}
       </span>
       <div class="list-item-secondary-bar">
         <div class="flex-text-block tw-flex-wrap">
@@ -508,7 +519,7 @@ export function ProjectsListBlock(props: { basePath: string; data: OwnerProjects
         <>
           <div class="flex-divided-list milestone-list">
             {data.items.map((item) => (
-              <ProjectListItem item={item} />
+              <ProjectListItem item={item} href={`${props.basePath}/${item.project.id}`} />
             ))}
           </div>
           <ProjectsPager basePath={props.basePath} data={data} />
