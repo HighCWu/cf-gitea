@@ -12,17 +12,18 @@
  * re-running one is always safe.
  */
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 import type { MergeabilityStatus, MergeStyle, Person, RebaseOutcome } from "@cf-gitea/git-engine";
 
-import { PRStatus, pullRequests } from "../../db/schema";
+import { PRFlow, PRStatus, issues, pullRequests } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
+import { canUserDelete, findRule, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
 import {
   branchRef,
   engineCell,
@@ -137,6 +138,59 @@ export async function pullRequestDiff(
   return { files: diff?.files ?? [], mergeBase, head: headCommit.oid };
 }
 
+/**
+ * HasUnmergedPullRequestsByHeadInfo (models/issues/pull_list.go:140-147) —
+ * "checks if there are open and not merged pull request by given head
+ * information (repo and branch)": `head_repo_id = ? AND head_branch = ? AND
+ * has_merged = 0 AND issue.is_closed = 0 AND flow = Github` (INNER JOIN
+ * issue). DeleteBranchAfterMerge consults it before the delete ("Don't clean
+ * up when there are other PR's that use this branch as head branch",
+ * services/repository/branch.go:844-849) and skips with
+ * ErrUnprocessableContent when it answers true — the surviving PR keeps its
+ * head branch. Ordering divergence: upstream runs the check AFTER the merge
+ * marked this PR merged + closed, so the merged PR excludes itself; ours
+ * runs before the D1 landing, so this PR's row is excluded explicitly by
+ * issue id.
+ */
+async function hasUnmergedPullRequestsByHeadInfo(d1: D1Database, headRepoId: string, headBranch: string, excludeIssueId: number): Promise<boolean> {
+  const rows = await drizzle(d1)
+    .select({ id: pullRequests.id })
+    .from(pullRequests)
+    .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+    .where(
+      and(
+        eq(pullRequests.headRepoId, headRepoId),
+        eq(pullRequests.headBranch, headBranch),
+        eq(pullRequests.hasMerged, false),
+        eq(issues.isClosed, false),
+        eq(pullRequests.flow, PRFlow.Github),
+        ne(pullRequests.issueId, excludeIssueId),
+      ),
+    )
+    .limit(1)
+    .all();
+  return rows.length > 0;
+}
+
+/**
+ * CanDeleteBranchWithPermission's protected-branch arm
+ * (services/repository/branch.go:572-583): the first-match rule for the
+ * branch gates the delete on protectedBranch.CanUserDelete(doer,
+ * permissionInRepo) — ErrBranchIsProtected ("branch is protected",
+ * models/git/protected_branch.go:27). The doer's access pair
+ * (principalAccessOf) and the CanUserDelete predicate are the same ports the
+ * DELETE /repos/{owner}/{repo}/branches endpoint (repoDeleteBranch)
+ * enforces; the merge caller only skips.
+ */
+async function headBranchDeleteRefusedByRule(c: Context<ApiEnv>, pair: RepositoryWithOwner, headBranch: string): Promise<boolean> {
+  const rule = await findRule(c.env.DB, pair.repo.id, headBranch);
+  if (rule === null) {
+    return false;
+  }
+  const access = await principalAccessOf(c.env.DB, pair.repo, c.get("authUser"));
+  return !(await canUserDelete(c.env.DB, parseRuleConfig(rule.rules), access));
+}
+
 export interface MergePullOptions {
   style: "merge" | "rebase" | "rebase-merge" | "squash" | "fast-forward-only" | "manually-merged";
   title: string;
@@ -237,17 +291,24 @@ export async function mergePullRequest(
 
     if (opts.deleteBranchAfterMerge && pr.headRepoId === pair.repo.id) {
       // best-effort head-branch delete (upstream writes the delete_branch
-      // system comment too — deferred with the tier-2 surface). The repo's
-      // default branch is REFUSED like upstream CanDeleteBranchWithPermission
-      // (services/repository/branch.go: `branchName == repo.DefaultBranch` →
-      // ErrBranchIsDefault "branch is default or pull request target"; the
-      // target-branch variant is DefaultTargetBranch ?? DefaultBranch, and we
-      // carry no PR-unit config yet). The API merge caller logs Debug and
-      // ignores the error because the PR has already merged — the merge lands
-      // and the branch simply survives (pull.go: "no way to tell users that
-      // what error happens, and the PR has been merged, so ignore the error").
+      // system comment too — deferred with the tier-2 surface). The refusal
+      // arms mirror upstream DeleteBranchAfterMerge +
+      // CanDeleteBranchWithPermission (services/repository/branch.go
+      // :838-857, :561-584), in upstream order: the default/target arm
+      // (:562-564, ErrBranchIsDefault "branch is default or pull request
+      // target"; the target-branch variant is DefaultTargetBranch ??
+      // DefaultBranch, and we carry no PR-unit config yet), the shared-head
+      // arm (:844-849), the protected-branch arm (:572-583). EVERY refusal
+      // SKIPS: the API merge caller logs Debug and ignores the error because
+      // the PR has already merged — the merge lands and the branch simply
+      // survives (pull.go: "no way to tell users that what error happens,
+      // and the PR has been merged, so ignore the error").
       if (pr.headBranch === pair.repo.defaultBranch) {
         console.info(`[pull-engine] head-branch delete skipped: branch is default or pull request target [branch: ${pr.headBranch}]`);
+      } else if (await hasUnmergedPullRequestsByHeadInfo(c.env.DB, pr.headRepoId, pr.headBranch, issue.id)) {
+        console.info(`[pull-engine] head-branch delete skipped: another open pull request uses this branch as head [branch: ${pr.headBranch}]`);
+      } else if (await headBranchDeleteRefusedByRule(c, pair, pr.headBranch)) {
+        console.info(`[pull-engine] head-branch delete skipped: branch is protected [branch: ${pr.headBranch}]`);
       } else {
         const headTip = (tips?.refs ?? []).find((ref) => ref.name === branchRef(pr.headBranch))?.target;
         if (headTip !== undefined) {

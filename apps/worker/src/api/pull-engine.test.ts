@@ -29,7 +29,8 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { users } from "../db/schema";
+import { users, protectedBranches, repositories } from "../db/schema";
+import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
@@ -456,5 +457,83 @@ describe("merge delete_branch_after_merge — the default-branch head guard", ()
     expect(tips.get("refs/heads/delbranch")).toBeUndefined();
     // the pull head ref survives the branch delete
     expect(tips.get(`refs/pull/${index}/head`)?.target).toBe(headTip);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// delete_branch_after_merge — the shared-head and protected-branch guards
+// ---------------------------------------------------------------------------
+
+describe("merge delete_branch_after_merge — the shared-head and protected-branch guards", () => {
+  it("keeps the head branch while another open PR shares it; deletes once clear; a different-branch control still deletes", async () => {
+    const headTip = await seedBranchWithCommit("sharedhead", "sharedhead.txt", "shared head\n");
+    const first = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Shared head one", head: "sharedhead", base: "main" }));
+    expect(first.status).toBe(201);
+    const firstIndex = (await jsonBody(first)).number as number;
+
+    // a second OPEN PR from the same head onto a different base (the same
+    // head+base pair answers 409): upstream's shared-head guard
+    // (HasUnmergedPullRequestsByHeadInfo) matches by head repo+branch only,
+    // so the second PR keeps the branch alive
+    const rel = await send(`${REPO}/branches`, jsonInit("POST", { new_branch_name: "sharedrel" }));
+    expect(rel.status).toBe(201);
+    const second = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Shared head two", head: "sharedhead", base: "sharedrel" }));
+    expect(second.status).toBe(201);
+    const secondIndex = (await jsonBody(second)).number as number;
+
+    // merging the FIRST shared-head PR with the delete flag: the branch
+    // SURVIVES (the still-open second PR keeps it)…
+    expect((await send(`${REPO}/pulls/${firstIndex}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }))).status).toBe(200);
+    const tipsAfterFirst = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    expect(tipsAfterFirst.get("refs/heads/sharedhead")?.target).toBe(headTip);
+    expect((await jsonBody(await get(`${REPO}/pulls/${secondIndex}`))).state).toBe("open");
+
+    // …and merging the SECOND leaves no other open PR on the head: the
+    // delete now fires
+    expect((await send(`${REPO}/pulls/${secondIndex}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }))).status).toBe(200);
+    expect(refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/sharedhead")).toBeUndefined();
+
+    // control: a delete-branch merge on a DIFFERENT branch still deletes
+    await seedBranchWithCommit("sharedctl", "sharedctl.txt", "shared control\n");
+    const ctl = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Shared control", head: "sharedctl", base: "main" }));
+    expect(ctl.status).toBe(201);
+    const ctlIndex = (await jsonBody(ctl)).number as number;
+    expect((await send(`${REPO}/pulls/${ctlIndex}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }))).status).toBe(200);
+    expect(refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/sharedctl")).toBeUndefined();
+  });
+
+  it("keeps a rule-protected head branch the doer cannot delete; an unprotected control still deletes", async () => {
+    await seedBranchWithCommit("protbranch", "prot.txt", "protected head\n");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Protected head", head: "protbranch", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    // a first-match rule for the head branch carrying the ZERO config:
+    // can_delete=false refuses every writer including the repo owner
+    // (CanUserDelete → ErrBranchIsProtected); the branch+commit above landed
+    // BEFORE the rule, so the write paths never see it
+    const repoId = (await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, SLUG)).get())?.id;
+    expect(repoId).toBeDefined();
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId: repoId as string,
+      ruleName: "protbranch",
+      priority: 0,
+      rules: serializeRuleConfig(emptyRuleConfig()),
+      createdAt: new Date(T0 * 1000),
+      updatedAt: new Date(T0 * 1000),
+    });
+
+    // the merge lands 200 (skip-not-error) and the protected branch SURVIVES
+    expect((await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }))).status).toBe(200);
+    expect(refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/protbranch")).toBeDefined();
+    expect((await jsonBody(await get(`${REPO}/pulls/${index}`))).merged).toBe(true);
+
+    // control: an UNPROTECTED branch still deletes under the same rule repo
+    await seedBranchWithCommit("protctl", "protctl.txt", "protected control\n");
+    const ctl = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Protected control", head: "protctl", base: "main" }));
+    expect(ctl.status).toBe(201);
+    const ctlIndex = (await jsonBody(ctl)).number as number;
+    expect((await send(`${REPO}/pulls/${ctlIndex}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }))).status).toBe(200);
+    expect(refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/protctl")).toBeUndefined();
   });
 });
