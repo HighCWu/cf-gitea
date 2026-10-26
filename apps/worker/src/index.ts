@@ -10,6 +10,7 @@ import { enqueueDueMirrorSyncs } from "./services/mirror/sync";
 import { handleUserPushEvent } from "./services/webhooks-push";
 import { handlesUiRoute, uiRouter } from "./ui";
 import { sessionRouter } from "./ui/session";
+import { avatarServingRouter } from "./web/avatar-serving";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
 
@@ -55,6 +56,10 @@ app.use("/api/v1/*", resolveAuth());
 app.route("/api/v1", tokenRouter);
 app.route("/api/v1", createApiRouter());
 
+// Avatar serving (web mux at the pin — routers/web/base.go): mounted BEFORE
+// uiRouter so its literal /avatar, /avatars and /user/avatar routes always
+// win over the UI's /:owner/:repo parser shape.
+app.route("/", avatarServingRouter);
 // Tier-2 UI (SPEC-0008 §2.2): the sub-app claims only the page families its
 // parser owns (/:owner/:repo[/commits|/src]); the dispatcher consults
 // handlesUiRoute BEFORE Hono routes, so a miss here can never swallow an
@@ -86,8 +91,17 @@ export default {
     // engine admin DELETE, the JSON API's non-GET surfaces) and every
     // trailing-slash URL keeps its pre-UI owner — the engine passthrough the
     // e2e suite runs against stays byte-identical.
+    // Avatar serving carve-out (routers/web/base.go + web.go:265/760/775 at
+    // the pin): /avatar/{hash}, /avatars/* and /user/avatar/{username}/{size}
+    // are single-concern web routes — never repo-scoped, never the engine's.
+    // Without this the two-segment shapes fall into the repo-scoped branch
+    // and the headless engine 404s them.
+    const isAvatarServing =
+      segments[0] === "avatar" ||
+      segments[0] === "avatars" ||
+      (segments[0] === "user" && segments[1] === "avatar");
     const isRepoScoped =
-      segments.length >= 2 && segments[1] !== "" && segments[0] !== "api";
+      segments.length >= 2 && segments[1] !== "" && segments[0] !== "api" && !isAvatarServing;
     if (isRepoScoped) {
       // All methods for the UI's write families (new/edit/delete file,
       // new-issue, comments, settings, milestones — waves 4-8 are POSTs on
