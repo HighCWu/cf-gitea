@@ -1201,6 +1201,25 @@ import {
   parseRepoWikiForm,
   renderRepoWikiSettingsPage,
 } from "./pages/repo-settings-wiki";
+// Window-2e: the aux/byte-surface modules.
+import {
+  loadHomeSitemapIndex,
+  loadReposSitemap,
+  loadUsersSitemap,
+  parseSitemapIdx,
+  sitemapXmlResponse,
+} from "./pages/sitemap";
+import {
+  loadRepoSearchAux,
+  loadTopicSearchAux,
+  parseRepoSearchAuxQuery,
+  parseTopicSearchAuxQuery,
+  repoSearchAuxResponse,
+  repoSearchCountOnlyResponse,
+  SearchAuxParamError,
+  topicSearchAuxResponse,
+  type WebSearchAuxResults,
+} from "./pages/search-aux";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -1966,6 +1985,21 @@ export interface ExploreRoute {
   family: "explore-root" | "explore-repos" | "explore-users";
 }
 
+/** Window-2e: the sitemap families (pages/sitemap.ts — upstream web.go:530,
+ *  554, 556). */
+export interface SitemapRoute {
+  family: "home-sitemap" | "explore-repos-sitemap" | "explore-users-sitemap";
+  /** The parsed sub-sitemap index (chi's PathParamInt-0→page-1 cascade);
+   *  absent on the index family. */
+  idx?: number;
+}
+
+/** Window-2e: the search aux feeds (pages/search-aux.ts — repo.SearchRepo
+ *  web.go:1102 + explore.TopicSearch web.go:564). */
+export interface SearchAuxRoute {
+  family: "repo-search-aux" | "explore-topic-search-aux";
+}
+
 /** The wave-12 user settings family (pages/user-settings.tsx): upstream's
  *  literal `/user/settings` (routers/web/shared/user settings header +
  *  user/settings/profile.tmpl — web.go's /user group registers ahead of the
@@ -2142,6 +2176,8 @@ export type ParsedUiRoute =
   | UserSettingsRoute
   | UserSettingsTabRoute
   | AdminRoute
+  | SitemapRoute
+  | SearchAuxRoute
   | OrgTeamsRoute
   | OrgLabelsRoute
   | OrgSettingsRoute
@@ -2199,6 +2235,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (raw.length < 2) return null; // need at least /owner
   if (raw.slice(1).some((segment) => segment === "")) return null;
 
+  // Window-2e: the sitemap literals (pages/sitemap.ts) — EXACT shapes
+  // BEFORE the owner/repo parse (else /explore/repos/sitemap-1.xml parses
+  // owner=explore). Non-sitemap tails under explore/{repos,users}/ stay
+  // unclaimed → the engine's 404.
+  if (raw.length === 2 && raw[1] === "sitemap.xml") return { family: "home-sitemap" };
+  if (raw.length === 4 && raw[1] === "explore" && (raw[2] === "repos" || raw[2] === "users")) {
+    const idx = parseSitemapIdx(raw[3] as string);
+    if (idx !== null) {
+      return { family: raw[2] === "repos" ? "explore-repos-sitemap" : "explore-users-sitemap", idx };
+    }
+    return null;
+  }
+
   // The wave-9 explore family (pages/explore.tsx — upstream web.go:549-556):
   // EXACT literal shapes claimed before the owner/repo parse could read
   // `/explore/repos` as a repository. Any other tail (organizations, code,
@@ -2210,6 +2259,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 2) return { family: "explore-root" };
     if (raw.length === 3 && raw[2] === "repos") return { family: "explore-repos" };
     if (raw.length === 3 && raw[2] === "users") return { family: "explore-users" };
+    // Window-2e: the topic search aux feed (pages/search-aux.ts — upstream
+    // explore.TopicSearch, web.go:564, optSignIn).
+    if (raw.length === 4 && raw[2] === "topics" && raw[3] === "search") {
+      return { family: "explore-topic-search-aux" };
+    }
     return null;
   }
 
@@ -2304,6 +2358,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // answer for this slice).
   if (raw.length === 3 && raw[1] === "repo" && raw[2] === "create") {
     return { family: "repo-create" };
+  }
+  // Window-2e: the repo search aux feed (pages/search-aux.ts — upstream
+  // repo.SearchRepo, web.go:1102, reqSignIn): the exact-literal posture
+  // beside repo-create.
+  if (raw.length === 3 && raw[1] === "repo" && raw[2] === "search") {
+    return { family: "repo-search-aux" };
   }
   if (raw.length === 3 && raw[1] === "org" && raw[2] === "create") {
     return { family: "org-create" };
@@ -3837,6 +3897,68 @@ async function repoWikiSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   const form = parseRepoWikiForm(await readUrlEncodedForm(c.req.raw));
   await applyRepoWikiSettings(c.env.DB, repo, form);
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/wiki?saved=1` } }));
+}
+
+// ---------------------------------------------------------------------------
+// Window-2e (pass 1): the aux/byte surfaces — sitemap XML + the two search
+// JSON feeds (pages/sitemap.ts + pages/search-aux.ts).
+// ---------------------------------------------------------------------------
+
+async function sitemapRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, respond } = resolved;
+  const route = resolved.route;
+  // No session gate (optExploreSignIn could only inflate counts with
+  // signed-in privates; the anonymous count is the safe public ceiling —
+  // the module handoff).
+  if (route.family === "home-sitemap") {
+    return respond(sitemapXmlResponse(await loadHomeSitemapIndex(c.env.DB, url.origin)));
+  }
+  if (route.family === "explore-repos-sitemap") {
+    return respond(sitemapXmlResponse(await loadReposSitemap(c.env.DB, url.origin, route.idx)));
+  }
+  if (route.family === "explore-users-sitemap") {
+    return respond(sitemapXmlResponse(await loadUsersSitemap(c.env.DB, url.origin, route.idx)));
+  }
+  return respond(await c.notFound()); // drift guard
+}
+
+async function repoSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, viewer, respond } = resolved;
+  if (resolved.route.family !== "repo-search-aux") return respond(await c.notFound()); // drift guard
+  // reqSignIn (web.go:1097-1103).
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  let params: ReturnType<typeof parseRepoSearchAuxQuery>;
+  try {
+    params = parseRepoSearchAuxQuery(url, true);
+  } catch (error) {
+    if (error instanceof SearchAuxParamError) {
+      // Upstream ctx.HTTPError: the status + the plain message, HTML page —
+      // never JSON.
+      return respond(new Response(error.message, { status: 422, headers: { "content-type": "text/plain; charset=utf-8" } }));
+    }
+    throw error;
+  }
+  const result = await loadRepoSearchAux(c.env, resolved.viewer, params);
+  return respond(
+    params.countOnly
+      ? repoSearchCountOnlyResponse(result.total)
+      : repoSearchAuxResponse(result.total, { ok: true, data: result.data } satisfies WebSearchAuxResults),
+  );
+}
+
+async function topicSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, respond } = resolved;
+  if (resolved.route.family !== "explore-topic-search-aux") return respond(await c.notFound()); // drift guard
+  // optSignIn — no gate.
+  const params = parseTopicSearchAuxQuery(url);
+  const result = await loadTopicSearchAux(c.env, params);
+  return respond(topicSearchAuxResponse(result.total, { topics: result.topics }));
 }
 
 /** GET /{owner}/{repo}/settings/hooks (pages/settings.tsx — the webhooks
@@ -8569,6 +8691,12 @@ uiRouter.get("/:owner/:repo/settings/public_access", (c) => repoPublicAccessPage
 uiRouter.post("/:owner/:repo/settings/public_access", (c) => repoPublicAccessSubmit(c));
 uiRouter.get("/:owner/:repo/settings/wiki", (c) => repoWikiSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/wiki", (c) => repoWikiSettingsSubmit(c));
+// Window-2e pass 1: sitemap + search aux.
+uiRouter.get("/sitemap.xml", (c) => sitemapRoute(c));
+uiRouter.get("/explore/repos/sitemap-:file", (c) => sitemapRoute(c));
+uiRouter.get("/explore/users/sitemap-:file", (c) => sitemapRoute(c));
+uiRouter.get("/repo/search", (c) => repoSearchAuxRoute(c));
+uiRouter.get("/explore/topics/search", (c) => topicSearchAuxRoute(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
