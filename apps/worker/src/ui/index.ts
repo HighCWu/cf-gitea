@@ -1221,6 +1221,13 @@ import {
   topicSearchAuxResponse,
   type WebSearchAuxResults,
 } from "./pages/search-aux";
+import { resolveActivityFeeds } from "./pages/activity-feeds";
+import {
+  loadUserFeedData,
+  renderUserFeedAtom,
+  renderUserFeedRss,
+  USER_FEED_CONTENT_TYPES,
+} from "./pages/user-feed-xml";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -1930,6 +1937,15 @@ export interface OwnerHomeRoute {
   owner: string;
 }
 
+/** Window-2e: the user/org feed envelopes (pages/user-feed-xml.ts —
+ *  upstream UsernameSubRoute's .rss/.atom suffix dispatch serves ORGS too,
+ *  profile.go:33). */
+export interface UserFeedRoute {
+  family: "user-feed-rss" | "user-feed-atom";
+  /** The owner segment with the suffix stripped. */
+  owner: string;
+}
+
 /** The wave-8 file-editor family (pages/file-editor.tsx): upstream's
  *  `/{editor_action:_edit|_new|_delete}/*` Combos under
  *  `RepoRefByType(git.RefTypeBranch)` (web.go:1453-1461) at the wave brief's
@@ -2170,6 +2186,7 @@ export type ParsedUiRoute =
   | MilestonesRoute
   | MilestoneNewRoute
   | OwnerHomeRoute
+  | UserFeedRoute
   | FileEditorRoute
   | SiteHomeRoute
   | ExploreRoute
@@ -2427,7 +2444,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // refused and fall to the parent app's 404).
   if (raw.length === 2) {
     if (TOP_LEVEL_EXCLUDED.has(owner.toLowerCase())) return null;
-    if (owner.toLowerCase().endsWith(".keys") || owner.toLowerCase().endsWith(".gpg")) return null;
+    // Window-2e: the feed suffixes (pages/user-feed-xml.ts — upstream
+    // UsernameSubRoute's .rss/.atom dispatch, web.go:910-912 → profile.go).
+    // The lowercase rule matches the landed .keys/.gpg refusal convention.
+    const lowerOwner = owner.toLowerCase();
+    if (lowerOwner.endsWith(".rss")) return { family: "user-feed-rss", owner: owner.slice(0, -4) };
+    if (lowerOwner.endsWith(".atom")) return { family: "user-feed-atom", owner: owner.slice(0, -5) };
+    if (lowerOwner.endsWith(".keys") || lowerOwner.endsWith(".gpg")) return null;
     return { family: "owner-home", owner };
   }
 
@@ -3979,6 +4002,48 @@ async function topicSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Respo
   const params = parseTopicSearchAuxQuery(url);
   const result = await loadTopicSearchAux(c.env, params);
   return respond(topicSearchAuxResponse(result.total, { topics: result.topics }));
+}
+
+/** Window-2e: the .rss/.atom envelopes — resolve the owner through the
+ *  activity-feeds seam (org-then-user, visibility-gated), then the byte
+ *  render with the gorilla-parity content types. */
+async function userFeedRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "user-feed-rss" && route.family !== "user-feed-atom") return respond(await c.notFound()); // drift guard
+  const doer = orgFamilyDoer(viewer);
+  const resolution = await resolveActivityFeeds(c.env.DB, route.owner, doer, url.pathname, url.search);
+  if (resolution.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: resolution.location } }));
+  }
+  if (resolution.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const subject =
+    resolution.kind === "org"
+      ? {
+          kind: "org" as const,
+          id: resolution.org.id,
+          username: resolution.org.username,
+          fullName: resolution.org.fullName,
+          email: resolution.org.email,
+          description: resolution.org.description,
+        }
+      : {
+          kind: "user" as const,
+          id: resolution.user.id,
+          username: resolution.user.username,
+          fullName: resolution.user.fullName,
+          email: resolution.user.email,
+          description: resolution.user.description,
+        };
+  const data = await loadUserFeedData(c.env.DB, subject, viewer, url.origin, url.searchParams);
+  const body = route.family === "user-feed-rss" ? renderUserFeedRss(data) : renderUserFeedAtom(data);
+  return respond(
+    new Response(body, {
+      headers: { "content-type": route.family === "user-feed-rss" ? USER_FEED_CONTENT_TYPES.rss : USER_FEED_CONTENT_TYPES.atom },
+    }),
+  );
 }
 
 /** GET /{owner}/{repo}/settings/hooks (pages/settings.tsx — the webhooks
@@ -8717,6 +8782,9 @@ uiRouter.get("/explore/repos/sitemap-:file", (c) => sitemapRoute(c));
 uiRouter.get("/explore/users/sitemap-:file", (c) => sitemapRoute(c));
 uiRouter.get("/repo/search", (c) => repoSearchAuxRoute(c));
 uiRouter.get("/explore/topics/search", (c) => topicSearchAuxRoute(c));
+// The feed suffixes — one constrained registration (the owner-home
+// precedent); the parser discriminates .rss vs .atom and strips.
+uiRouter.get("/:owner{^[\\w-]+\\.(rss|atom)$}", (c) => userFeedRoute(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
