@@ -506,6 +506,19 @@
  *                                          natural-sort port; the typed
  *                                          ref-tail resolution rides the
  *                                          landed resolveRefSuffix)
+ *   /:owner/:repo/tree-view/{branch|tag|commit}/*
+ *                                          the code-tree envelope aux JSON,
+ *                                          GET (pages/tree-view-aux.ts —
+ *                                          wave 43; the survey's row 5
+ *                                          PARTIAL row's gated half,
+ *                                          upstream web.go:1302-1306
+ *                                          repo.TreeViewNodes — the
+ *                                          {fileTreeNodes, renderedIconPool}
+ *                                          envelope over the landed fileicon
+ *                                          layer, the Go-escape wire bytes;
+ *                                          the tail's path half roots the
+ *                                          listing, ?sub_path= names the
+ *                                          expansion chain)
  *   /:owner/:repo/branches/list            the branches aux JSON, GET
  *                                          (pages/branches-list-aux.ts —
  *                                          wave 39; the survey's row 5,
@@ -843,6 +856,10 @@ import { containedRefsResponse, loadCommitContainedRefs } from "./pages/commit-c
 // modules, the handlers here beside their sibling dispatchers).
 import { branchesListResponse, loadBranchesListAux } from "./pages/branches-list-aux";
 import { loadTreeListAux, treeListResponse } from "./pages/tree-list-aux";
+// Wave-43 tree-view envelope (the survey's PARTIAL row-5 gated half — the
+// fileicon-unlocked fragment; loader + Response builder in the module, the
+// handler here beside its sibling dispatchers).
+import { loadTreeViewNodes, treeViewResponse } from "./pages/tree-view-aux";
 import { loadPullCommitsData, renderPullCommitsPage } from "./pages/pull-commits";
 import { loadCommitViewData, renderCommitViewPage } from "./pages/commit-view";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
@@ -1460,6 +1477,24 @@ export interface BranchesListAuxRoute {
   repo: string;
 }
 
+/** The wave-43 tree-view envelope family (pages/tree-view-aux.ts): upstream
+ *  web.go:1302-1306's `/{branch|tag|commit}/*` sub-routes over
+ *  `repo.TreeViewNodes` (routers/web/repo/treelist.go:147-155) — the
+ *  tree-list twin's route shape (the ref-type literal is the route shape,
+ *  the decoded tail is the ref+path suffix, the /src family's shape), with
+ *  the tail's PATH half now MEANINGFUL (the listing roots at it) and the
+ *  `?sub_path=` query naming the expansion chain. The response is the
+ *  `{fileTreeNodes, renderedIconPool}` JSON envelope, not a page. */
+export interface TreeViewAuxRoute {
+  family: "tree-view-aux";
+  owner: string;
+  repo: string;
+  /** The forced ref type (web.go:1302-1306's three sub-routes). */
+  refType: RefType;
+  /** The decoded ref+path tail after the type literal. */
+  refSuffix: string;
+}
+
 
 /** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
  *  three web POSTs — the verdict form's
@@ -1685,6 +1720,7 @@ export type ParsedUiRoute =
   | CommitContainedRefsRoute
   | BlobRedirectRoute
   | TreeListAuxRoute
+  | TreeViewAuxRoute
   | BranchesListAuxRoute
   | ReleaseDownloadRoute
   | RenderFileRoute;
@@ -1965,6 +2001,28 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     try {
       return {
         family: "tree-list-aux",
+        owner,
+        repo,
+        refType: typed,
+        refSuffix: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
+      };
+    } catch {
+      return null;
+    }
+  }
+  // Wave-43: the tree-view envelope family (upstream web.go:1302-1306's
+  // three typed sub-routes over repo.TreeViewNodes — the tree-list twin's
+  // shape). The type literal is the route shape — chi registers exactly
+  // branch/tag/commit, so any other segment and the bare/below-minimum
+  // tails stay engine-owned; the decoded tail is the /src family's ref+path
+  // shape (both halves are load-bearing here — the walk roots at the path
+  // half; `?sub_path=` rides the query, the handler reads it).
+  if (head === "tree-view") {
+    const typed = rest[0];
+    if (rest.length < 2 || (typed !== "branch" && typed !== "tag" && typed !== "commit")) return null;
+    try {
+      return {
+        family: "tree-view-aux",
         owner,
         repo,
         refType: typed,
@@ -4481,6 +4539,25 @@ async function treeListAuxJson(c: Context<{ Bindings: Env }>): Promise<Response>
 }
 
 /**
+ * GET /{owner}/{repo}/tree-view/{branch|tag|commit}/* (pages/tree-view-aux.ts
+ * — upstream TreeViewNodes, web.go:1302-1306): the code-tree
+ * `{fileTreeNodes, renderedIconPool}` envelope for every viewer who can see
+ * the repo; the 404 family (empty repo — the nil-Commit arm, unresolvable
+ * ref, missing treePath, failed walk) answers the §4.5 shell like the
+ * tree-list twin. `?sub_path=` names the expansion chain (FormString at
+ * treelist.go:149).
+ */
+async function treeViewAuxJson(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "tree-view-aux") return respond(await c.notFound()); // drift guard
+  const envelope = await loadTreeViewNodes(c.env, repo, route.refType, route.refSuffix, c.req.query("sub_path") ?? "");
+  if (envelope === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(treeViewResponse(envelope));
+}
+
+/**
  * GET /{owner}/{repo}/branches/list (pages/branches-list-aux.ts — upstream
  * GetBranchesList, web.go:1695): the `{"results":[names]}` aux JSON for every
  * viewer who can see the repo; the group's MustBeNotEmpty (web.go:1696)
@@ -6324,6 +6401,15 @@ uiRouter.get("/:owner/-/projects", (c) => ownerProjectsPage(c));
 uiRouter.get("/:owner/:repo/blob/*", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/blob", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/tree-list/:tlref{branch|tag|commit}/*", (c) => treeListAuxJson(c));
+// Wave-43 tree-view envelope (parseUiRoute claims exactly this shape —
+// upstream web.go:1302-1306's three typed sub-routes, the tree-list twin's
+// wildcard form; the JSON handler runs the resolveUiRequest prologue like
+// every GET page). No earlier registration can absorb these: the "tree-view"
+// head is a literal no registered pattern carries (the wave-2 /tree pair
+// matches only the "tree" head; the typed tail regex keeps the claim equal
+// to the parser's), and unclaimed shapes never reach the sub-app — the
+// dispatcher consults handlesUiRoute first.
+uiRouter.get("/:owner/:repo/tree-view/:tvref{branch|tag|commit}/*", (c) => treeViewAuxJson(c));
 uiRouter.get("/:owner/:repo/branches/list", (c) => branchesListAuxJson(c));
 // Wave-40 owner projects board + write group (parseUiRoute claims exactly
 // these shapes — upstream web.go:1140-1155's board view/write group plus

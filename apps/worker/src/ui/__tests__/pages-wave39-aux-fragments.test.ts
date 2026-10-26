@@ -27,12 +27,13 @@
  *
  * Documented skips (in test form): the row-5 fragments whose upstream byte
  * shape rides machinery this codebase has not landed stay engine-owned —
- * `/tree-view/*` (the ViewFileTreeStore JSON carries the fileicon theme
- * pool: material-icon-rules.json + material-icon-svgs.json + the enry
- * classifier, gitea/modules/fileicon/), `/blob_excerpt/{sha}` (the
- * tplBlobExcerpt HTML fragment over BuildBlobExcerptDiffSection hunk
- * expansion + PR code comments), `/lastcommit/*` (the tplRepoViewList HTML
- * fragment over per-entry GetCommitsInfo). Nothing fakes their shapes.
+ * `/blob_excerpt/{sha}` (the tplBlobExcerpt HTML fragment over
+ * BuildBlobExcerptDiffSection hunk expansion + PR code comments) and
+ * `/lastcommit/*` (the tplRepoViewList HTML fragment over per-entry
+ * GetCommitsInfo). Nothing fakes their shapes. `/tree-view/*` was the third
+ * skip at wave 39 (the fileicon theme pool was unlanded); wave 43's
+ * pages/tree-view-aux.ts claims it now that cdf683a landed the fileicon
+ * layer, so its engine-owned assertion above moved to the wave-43 test.
  *
  * Same harness posture as pages-wave32: the router driven directly with the
  * synthetic ASSETS manifest; engine content seeds through the REAL receive
@@ -268,11 +269,9 @@ describe("wave-39 parser families (parseUiRoute / handlesUiRoute)", () => {
     expect(handlesUiRoute("/octo/hello/branches/list")).toBe(true);
   });
 
-  it("leaves the skipped row-5 fragments engine-owned (documented skips)", () => {
-    // tree-view — the ViewFileTreeStore JSON rides the fileicon theme pool
-    // (material icon rules/SVG assets + the enry classifier): not portable,
-    // not faked.
-    expect(handlesUiRoute("/octo/hello/tree-view/branch/main")).toBe(false);
+  it("leaves the remaining skipped row-5 fragments engine-owned (documented skips)", () => {
+    // tree-view — CLAIMED by wave 43 once the fileicon machinery landed
+    // (pages/tree-view-aux.ts; its own wave test owns the family asserts).
     // blob_excerpt — the tplBlobExcerpt HTML fragment over
     // BuildBlobExcerptDiffSection hunk expansion + PR code comments.
     expect(handlesUiRoute(`/octo/hello/blob_excerpt/${"a".repeat(40)}`)).toBe(false);
