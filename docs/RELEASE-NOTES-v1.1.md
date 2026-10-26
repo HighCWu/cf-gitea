@@ -156,12 +156,132 @@ at exactly the named commit — submodule untouched, worktree shredded after).
 | `193cecc7-2b58-…` (previous window's v2, this window's baseline) | 2026-10-25 18:38 | `9f92950` clean | secrets/variables (23 ops, declared 362→385), migrations 0020/0021 remote |
 | **REDEPLOY10** `5835d8ab-d65a-4824-a239-7d53c01f8627` | 2026-10-26 00:01 | `fc123b0` clean | declared **385→434**: blocks (0022), push-mirrors (0023), projects×4 (0024) + repo scope 21 ops, tag protections (0025), wiki, git-hooks, the registry P1 fix `5e2c418`; vitest 2951 passed / 5 skipped; smoke 6/0/1; migrations 0022–0025 remote (verified in `sqlite_master`) |
 | **REDEPLOY11** `8d91c71d-3695-4d5f-a981-74d261c46b53` | 2026-10-26 00:34 | `fec5c71` clean | declared **434→447**: oauth2-apps (0026), badges/licenses/generate (0027), feeds (0028), the blocks-enforcement 403 arms, ui-parity-2 pages; vitest **3053 passed / 5 skipped**, 137 files + 1 skipped, 0 failed; smoke 6/0/1; migrations 0026–0028 remote (verified); P0 probes unchanged |
-| REDEPLOY12 | **in flight at writing — not shipped** | post-`5ba6183` | will carry the tombstone oracle, star/watch counters, repo size, the generate fixes, license detection, the feeds tail, and ui-parity-3/4 (migrations 0029/0030 already applied remote ahead of it) |
+| REDEPLOY12 | **in flight at writing — not shipped** *(shipped after writing — `f9798804` @ `5ba6183`, see the addendum below)* | post-`5ba6183` | will carry the tombstone oracle, star/watch counters, repo size, the generate fixes, license detection, the feeds tail, and ui-parity-3/4 (migrations 0029/0030 already applied remote ahead of it) |
 
 Migrations 0022–0030 are applied remote (0022–0025 via REDEPLOY10 and
 0026–0028 via REDEPLOY11, both verified in the evidence blocks; 0029–0030
 applied after the last evidence block, per the session record — their
 evidence block ships with REDEPLOY12). 0031 is in flight, uncommitted (§4).
+*(Superseded: 0031 and 0032 are committed and applied remote — see the
+addendum below.)*
+
+### Addendum — REDEPLOY12/13 shipped; the post-490 wave (appended 2026-10-26, wave-32)
+
+The body of these notes was written mid-window and marked REDEPLOY12 "in
+flight"; it pre-dated the entire post-490 wave. Both remaining deploy windows
+have since shipped. This addendum brings the notes current without rewriting
+them; evidence is verbatim in `docs/design/p0-evidence.md` (the REDEPLOY12
+and REDEPLOY13 redeploy-verification blocks).
+
+**REDEPLOY12 shipped** — `f9798804-b916-408e-9249-93ac030a1269` (100%,
+2026-10-26 02:09 UTC) from tree `5ba6183` clean: the avatar serving chain,
+the generate robustness fixes, ui-parity-4, star/watch counters (migration
+0030), the invariants fixture fix, the license-detection family (5/5
+population arms), the feeds tail, and the first-push settle generalization.
+Production closed the **tombstone oracle** (read-after-delete at t+0, 3/3)
+and PATCH-template persistence; migrations 0029/0030 applied remote (ledger
+30/30). Two adjudicated file-level reds, neither code: the schema.test
+column pin (second-order staleness, caught up at `5ba6183`) and the webhooks
+delete-event scenario (RESOLVED-NOT-A-BUG — after settle generalization the
+first-pushed branch IS the default and its delete is refused
+upstream-identically; reshaped at `8207da9`). One finding carried forward:
+the labels page's "New Label" form did not render for the repo owner in
+production (resolved by REDEPLOY13, below).
+
+**REDEPLOY13 shipped** — `64bee4f6-ccba-4f88-bf24-d0d26134dea4` (100%,
+2026-10-26 04:25 UTC) from tree `e4ebb9d` clean: the post-REDEPLOY12 mass —
+`6c54c1a` (generate/fork loose-carry from auto_init templates), `b332e14` +
+`9bda9eb` (push-mirror outbound end-to-end, migration 0032), `389da18` (repo
+delete sweeps action rows), `faca961`/`66f5977` (merge-delete guards ×3),
+`7c7b683` (owner-view labels goldens), `79ef809` (diffpatch downloads),
+`e4ebb9d` (vitest contention config — test-infra only, no prod effect),
+`ca4eb58` (ui-parity-5), plus the counters wave (`3163658`, `3016c10`,
+`207b566`, `64e9b1b` — migration 0031). Gates at the deploy tree: typecheck
+0 errors; `check:api` PASS — declared surface **still 490 ops / 298 paths**
+(the post-490 wave adds zero declared ops; the surface sits at the
+pre-Actions/packages ceiling, §4); `check:contract` PASS (frozen sha
+verbatim). Migrations **0031_conscious_snowbird**
+(`repositories.num_forks`) and **0032_wealthy_siren**
+(`push_mirrors.sync_state`/`next_sync_at`/`last_error`) applied remote —
+ledger **33/33**, `pragma_table_info` verified. Smoke 5 pass / 0 fail /
+1 skip (with `--migrate-check`), a second run 4/0/0; P0 shallow probes 3/3
+unchanged. Vitest ran under heavy sibling load — two full runs (3044 passed/
+5 skipped/1 failed and 2910/5/2, plus 15 and 17 files orphaned by workerd
+pool crashes); every red or orphaned file re-ran SOLO all green — **18
+files, 464/464, 0 failed** — pool instability, not code.
+
+Production closures this deploy, verbatim from the evidence block:
+
+- **Generate at the API layer** (`6c54c1a` verified; REDEPLOY12's 500 on the
+  copy arm is closed): generate → **201** with `"empty":false` in the
+  response body; both refs carried at the identical tip; the contents API
+  serves LICENSE + README with `last_commit_sha` = the carried tip;
+  `status='creating'` whole-table **0** — zero stranded rows. **One honest
+  re-scoped residual (tracked open)**: the generated repo's git wire —
+  `git fetch` 500s at the upload-pack fetch POST and `git push` is refused
+  `missing necessary objects`, while API reads serve the full closure. The
+  delta is the carry/adoption layout in the generated cell; owner:
+  repos/fork-task + the engine read path.
+- **The labels production finding — a methodology artifact, closed**: the
+  PAT header never logs a session in (anonymous on pages, upstream parity).
+  Via `POST /login` + the `gitea_session` cookie the owner view renders the
+  writer form (0 vs 3 "New Label" occurrences, anonymous vs cookie), and the
+  arm is byte-pinned by goldens minted through the real session path
+  (`7c7b683`). **Login-cookie probes are the standard for page-level probes
+  from now on.**
+- **Push-mirror outbound lifecycle — first production verification**
+  (`b332e14` + `9bda9eb`): the registration-time SSRF gate refuses a
+  loopback target with 401 at the door; a gate-passing unreachable target
+  registers 200, and within **~3 s** of the sync trigger the queue consumer
+  ATTEMPTED it — `last_error` recorded verbatim ("mirror target responded
+  530 for info/refs advertisement …", full URL), `sync_state` back to
+  `idle`, `next_sync_at=0`; DELETE → 204, `push_mirrors` back to 0 rows.
+- **The action-row sweep — zero hand-sweeps** (`389da18`): after five probe
+  repo deletes, the `action` table totalled **0 with no manual sweep** — the
+  faithful upstream arm is hard-delete (`delete.go:155-157` DeleteBeans; no
+  `is_deleted=1` writer exists at the pin), closing REDEPLOY12's 21-row
+  hand-sweep class and the open issue behind it.
+- **Merge-delete guards ×3** (`faca961` default-branch head + `66f5977`
+  shared-head-open-PR and protected-branch arms): the production spot proved
+  the upstream skip-not-error differential — merging with
+  `delete_branch_after_merge` into a protected branch: merge 200, branch
+  still exists (200 after); unprotected branch: merge 200, branch deleted
+  (404 after). Both merges 200.
+- **Diffpatch downloads** (`79ef809`): `.diff`/`.patch` on commit and PR
+  answer 200 `text/plain` with upstream's byte shapes (commit =
+  mail-format-no-signature; PR = with-signature).
+
+Landed in code after the deploy (ride the next deploy, not production
+verified): **fork-head after-merge delete** (`2e3db28` — the full guard
+ladder runs against the HEAD repo; the fork's own cell CAS-deletes; 25/25);
+the **invariants fixture diet** (`3169e33` — sized to workerd's 4-chunk raw
+LRU so a deletion target provably goes cold: 21→18 pushes, walk-test
+outliers 2–3 s → ~0.5 s); the **WS-1009 investigation** (`ff4172a` — an
+upstream-ready DRAFT at `docs/research/workers-vitest-ws1009-issue.md`: the
+workerd pool-crash class is a deterministic 17-file set driven by direct
+imports of the 983 KB contract JSON rendering a ~3.4 MB SSR payload; `?raw`
+immune; four open questions; NOT filed — the dedicated repro unit is in
+flight, alongside the shipped local mitigation `e4ebb9d`); and the
+**miniflare-beta verdict** (`1970076` + `5d9122c`): the transitive
+`miniflare 5.20261019.2-beta` trio is upstream's coordinated exact pin
+(wrangler/vite-plugin/vitest-plugin all lock it; no stable 5.x exists;
+forcing 4.x mismatches our compatibility_date's workerd) — DO-NOTHING,
+recorded as an intentional hold in AGENTS.md, revisit at miniflare 5 GA
+(analysis in `docs/research/miniflare-beta-pin.md`).
+
+Compat tick at `18dd272` (survey re-run at `5d9122c`): the API inventory is
+unchanged at 64 remaining, all FEATURE-ABSENT (Actions 54 + package registry
+10 — the §4 ceiling); the UI survey moves to **48 LANDED / 4 PARTIAL /
+61 ABSENT of 113** with a new top-5 (archive, tags write tails,
+load-branches-and-tags, releases edit/delete, `/-/projects`).
+
+Still in flight at this addendum's writing (uncommitted sibling units in
+the tree, unowned by these notes): **loose-tag-carry, fork-pr-creation,
+ui-parity-6, contract-import-mitigation, ws1009-repro**. Superseded body
+lines: §3's migration row for 0031 ("in flight, uncommitted") — committed
+with the counters wave and applied remote via REDEPLOY13; §4's counter-work
+bullet and action-rows limitation — shipped and production-verified as
+above; §4's ride-REDEPLOY12 list — resolved by REDEPLOY12/13.
 
 ### What production proved this window
 
@@ -202,7 +322,7 @@ evidence block ships with REDEPLOY12). 0031 is in flight, uncommitted (§4).
 | 0028 `heavy_cardiac` | `action` (+3 indexes) | `579e872`/`2ef9359` | REDEPLOY11 ✅ |
 | 0029 `square_banshee` | `repositories.size_kb` | `3c58cce` | ✅ (session record) |
 | 0030 `curly_gressill` | `repositories.num_stars`, `repositories.num_watches` | `528d369` | ✅ (session record) |
-| 0031 `conscious_snowbird` | `repositories.num_forks`, `users.num_stars` | **in flight, uncommitted** | not applied |
+| 0031 `conscious_snowbird` | `repositories.num_forks`, `users.num_stars` | **in flight, uncommitted** *(committed + applied via REDEPLOY13 — see the §2 addendum)* | applied ✅ |
 
 Schema stands at **64 tables** (`apps/worker/src/db/schema.ts`,
 migrations 0000–0030; 0029–0031 are column-only). New SPECs this window:
@@ -241,6 +361,7 @@ miscellaneous and settings families have **zero** remaining — fully declared.
 - **Counter work in flight at writing (uncommitted)** — set-private counter
   zeroing + `repositories.num_forks` (migration 0031 sits untracked; the
   service/route hunks are in the tree). Not shipped, not counted above.
+  *(Superseded: shipped via REDEPLOY13 — see the §2 addendum.)*
 - **`email_hash` table** — `/avatar/{hash}` cannot resolve a hash back to an
   email until a schema wave adds the table; `getEmailForHash` resolves empty
   (the upstream `!has` arm) by design for now (`apps/worker/src/services/avatars.ts`).
@@ -250,9 +371,13 @@ miscellaneous and settings families have **zero** remaining — fully declared.
 - **Repo delete does not mark `action` rows `is_deleted`** (REDEPLOY11
   OPEN ISSUE 3, still open — the feeds read filters `is_deleted = 0` rows but
   nothing sets the flag on delete; upstream hides a deleted repo's actions).
+  *(Superseded: resolved by `389da18`'s hard-delete sweep, production-verified
+  at REDEPLOY13 — see the §2 addendum.)*
 - **Git over HTTPS only.** SSH is structurally out on Workers (ADR-0001) —
   carried from v1.0.
 - Not yet production-verified (landed after REDEPLOY11, ride REDEPLOY12): the
   tombstone oracle, first-push settle generalization, repo size, star/watch
   counters, the generate fixes, license detection, the feeds tail, ui-parity
-  3/4, and the avatar serving chain.
+  3/4, and the avatar serving chain. *(Superseded: REDEPLOY12/13 shipped and
+  verified these — see the §2 addendum; the one open residual is the
+  generated repo's git-wire fetch/push.)*
