@@ -1,10 +1,11 @@
 import { and, asc, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { issueLabels, labels, issues, pullRequests, users, PRFlow } from "../../db/schema";
+import { issueLabels, labels, issues, pullRequests, repositories, users, PRFlow } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { ApiError } from "../errors";
 import type { PullRequest, PRBranchInfo } from "../models/pull";
+import { findForkByOwner } from "./forks";
 import { hasWorkInProgressPrefix, toApiIssue } from "./issues";
 import { mergeableOfRow } from "./pull-engine";
 import {
@@ -12,6 +13,7 @@ import {
   canViewRepository,
   findRepositoryById,
   findRepositoryByPath,
+  findUserByName,
   toApiRepository,
   viewerTeamAccessMode,
   type RepositoryWithOwner,
@@ -63,9 +65,11 @@ import {
  *   - duplicate check: models/issues/pull.go GetUnmergedPullRequest +
  *     ErrPullRequestAlreadyExists.Error (issue_id carries the INDEX);
  *   - base/head lookup: routers/api/v1/repo/pull.go GetPullRequestByBaseHead
- *     (the `owner:branch` / `owner/name:branch` fork form resolves the head
- *     repo by path — the anti-enumeration CanRead 404 is the route's guard,
- *     landed with the a16f60e fork edge);
+ *     and parseCompareInfo's `GetHeadOwnerAndRepo` — the bare `owner:branch`
+ *     form resolves the head repo through the FORK EDGE (FindHeadRepo →
+ *     GetUserFork, rename-immune; resolveHeadRepo below), the full
+ *     `owner/name:branch` form by path — the anti-enumeration CanRead 404 is
+ *     the route's guard, landed with the a16f60e fork edge;
  *   - WIP draft: models/issues/pull.go HasWorkInProgressPrefix.
  */
 
@@ -471,10 +475,44 @@ export async function toApiPullRequest(
 // ---------------------------------------------------------------------------
 
 /**
- * The `head` path parameter parse: `owner:branch` / `owner/name:branch` fork
- * forms resolve the head repo (404 when the repo does not exist; the doer's
- * READ gate on it is the route's CanRead guard — parseCompareInfo
- * pull.go:1063-1074); the plain form is a branch of the base repo.
+ * The `head` path parameter parse. The plain form is a branch of the base
+ * repo; the fork forms resolve the head repo (the doer's READ gate on the
+ * result is the route's CanRead guard — parseCompareInfo pull.go:1063-1074).
+ *
+ * The bare `owner:branch` form ports `GetHeadOwnerAndRepo`'s no-repo-name arm
+ * (routers/common/compare.go:152-192): the base owner's own name IS the base
+ * repo (:161-163 + :170-171); any other owner resolves through the FORK EDGE
+ * — `FindHeadRepo` (compare.go:134-150) → `findHeadRepoFromRootBase`
+ * (:194-225) → `GetUserFork` (`fork_id = ? AND owner_id = ?`,
+ * models/repo/fork.go:45-55). The edge never touches the repo's NAME, so a
+ * RENAMED fork keeps resolving — the wave-renamed-fork-head fix (the old
+ * direct `(owner, base slug)` path lookup 404'd it). Upstream's
+ * `LookupRedirect` (models/repo/redirect.go:55-64) plays NO part in this
+ * resolution — the bare grammar carries no repo name to redirect; redirects
+ * serve repo-PATH lookups (routers/api/v1/api.go:185,
+ * services/context/repo.go:591). A head owner the fork edge cannot place
+ * falls back to the landed path acceptance — the head owner's repo at the
+ * base's slug (the documented acceptance of a NON-fork head, where upstream's
+ * bare form would refuse; the routes/pulls.ts divergence note) — checked
+ * AFTER the fork edge so a renamed fork wins over a coincidental same-named
+ * non-fork, the upstream-true winner. The full `owner/name:branch` form
+ * stays the direct path lookup, exactly upstream's `GetRepositoryByName` arm
+ * (compare.go:181-189).
+ *
+ * Misses answer the landed anti-enumeration 404 "not found" (a16f60e).
+ * Upstream splits them: an unknown head owner is 404 (GetUserByName →
+ * util.ErrNotExist → APIErrorNotFound, pull.go:1056-1058) while a KNOWN owner
+ * without a fork of the base is 400 "the user %s does not have a fork of the
+ * base repository" (compare.go:178 → pull.go:1053-1055 ErrInvalidArgument) —
+ * the flat 404 is a deliberate deviation (the 400 would enumerate fork
+ * existence per owner name).
+ *
+ * Deviation vs upstream's GET arm: repoGetPullRequestByBaseHead resolves the
+ * head repo through THIS shared resolver, so its bare form is fork-edge
+ * rename-immune too, where upstream's GET lookup is the name-only
+ * `GetRepositoryByOwnerAndName` (pull.go:263 — a renamed fork's old name 404s
+ * there); the POST arm (parseCompareInfo, pull.go:1051 → GetHeadOwnerAndRepo)
+ * is the upstream shape being ported.
  */
 export async function resolveHeadRepo(
   d1: D1Database,
@@ -489,12 +527,109 @@ export async function resolveHeadRepo(
   const headBranch = headParam.slice(colon + 1);
   const slash = repoPart.indexOf("/");
   const owner = slash > 0 ? repoPart.slice(0, slash) : repoPart;
-  const name = slash > 0 ? repoPart.slice(slash + 1) : baseRepo.repo.slug;
+  if (slash < 1) {
+    // Bare `owner:branch` — the fork-edge grammar (compare.go:161-180).
+    const ownerLower = owner.toLowerCase();
+    if (ownerLower === baseRepo.repo.ownerNamespace) {
+      return { headRepoId: baseRepo.repo.id, headBranch };
+    }
+    const headOwner = await findUserByName(d1, ownerLower);
+    if (headOwner !== null) {
+      const forkId = await findHeadRepoByForkEdge(d1, baseRepo, headOwner.id);
+      if (forkId !== null) {
+        return { headRepoId: forkId, headBranch };
+      }
+    }
+    // The landed path acceptance: the head owner's repo at the base's slug
+    // (non-fork heads; upstream's bare form would 400 them — see above).
+    const repo = await findRepositoryByPath(d1, ownerLower, baseRepo.repo.slug);
+    if (repo !== null) {
+      return { headRepoId: repo.repo.id, headBranch };
+    }
+    throw new ApiError(404, "not found");
+  }
+  const name = repoPart.slice(slash + 1);
   const repo = await findRepositoryByPath(d1, owner, name);
   if (repo === null) {
     throw new ApiError(404, "not found");
   }
   return { headRepoId: repo.repo.id, headBranch };
+}
+
+/** `maxForkTraverseLevel` (routers/common/compare.go:131) — the fork-graph
+ *  descent cap. */
+const MAX_FORK_TRAVERSE_LEVEL = 10;
+
+/** The columns the `FindHeadRepo` walk steps through. */
+interface ForkWalkRepo {
+  id: string;
+  ownerId: number | null;
+  forkParent: string | null;
+}
+
+/** One fork-edge row by id (`GetBaseRepo`'s read, compare.go:138). */
+async function forkWalkRow(d1: D1Database, repoId: string): Promise<ForkWalkRepo | null> {
+  const row = await drizzle(d1)
+    .select({ id: repositories.id, ownerId: repositories.ownerId, forkParent: repositories.forkParent })
+    .from(repositories)
+    .where(eq(repositories.id, repoId))
+    .limit(1)
+    .get();
+  return row ?? null;
+}
+
+/** `GetRepositoriesByForkID` (models/repo/fork.go:16-21) — the first-level
+ *  fork ids of one repo. */
+async function firstLevelForkIds(d1: D1Database, repoId: string): Promise<string[]> {
+  const rows = await drizzle(d1)
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(eq(repositories.forkParent, repoId))
+    .all();
+  return rows.map((row) => row.id);
+}
+
+/**
+ * `findHeadRepoFromRootBase` (routers/common/compare.go:194-225): the head
+ * user's direct fork of this repo (`GetUserFork` via findForkByOwner), else
+ * the same question over every first-level fork's own subtree (the "base and
+ * head are forks of the same root" arm, compare.go:69) with the depth cap.
+ */
+async function findHeadRepoFromRootBase(d1: D1Database, repoId: string, headUserId: number, level: number): Promise<string | null> {
+  if (level === 0) return null;
+  const direct = await findForkByOwner(d1, repoId, headUserId);
+  if (direct !== null) return direct.id;
+  for (const forkId of await firstLevelForkIds(d1, repoId)) {
+    const found = await findHeadRepoFromRootBase(d1, forkId, headUserId, level - 1);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/**
+ * `FindHeadRepo` (routers/common/compare.go:134-150): climb the fork_parent
+ * chain — an ancestor owned by the head user IS the head repo (the loop
+ * returns it, :146) — otherwise, when the chain tops out (the base is no
+ * fork, or its parent row is gone), descend from the topmost reached repo
+ * (:142). Returns the head repo's ID, null when no fork edge places the user.
+ */
+async function findHeadRepoByForkEdge(d1: D1Database, baseRepo: RepositoryWithOwner, headUserId: number): Promise<string | null> {
+  let cur: ForkWalkRepo = {
+    id: baseRepo.repo.id,
+    ownerId: baseRepo.repo.ownerId,
+    forkParent: baseRepo.repo.forkParent,
+  };
+  while (cur.ownerId !== headUserId) {
+    if (cur.forkParent === null) {
+      return findHeadRepoFromRootBase(d1, cur.id, headUserId, MAX_FORK_TRAVERSE_LEVEL);
+    }
+    const parent = await forkWalkRow(d1, cur.forkParent);
+    if (parent === null) {
+      return findHeadRepoFromRootBase(d1, cur.id, headUserId, MAX_FORK_TRAVERSE_LEVEL);
+    }
+    cur = parent;
+  }
+  return cur.id;
 }
 
 /**

@@ -26,6 +26,8 @@ import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
 import { comments, issueAssignees, issues, pullRequests, userBlocking, users, repositories } from "../../db/schema";
 import { IssuesService } from "../../issues/service";
+import { carryRepoCell } from "../../repos/carry";
+import { RepoService } from "../../repos/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "../services/engine";
 import { createApiRouter } from "../router";
 
@@ -62,15 +64,19 @@ beforeEach(async () => {
   // The DO cells persist across tests (only D1 is wiped above) — drop the
   // PR head refs the create flow lands on `recluse/blocked` so the next
   // per-repo index cannot CAS-conflict (the pulls.test.ts convention).
-  const cell = env.REPO.getByName("recluse/blocked");
-  const { refs } = await cell.listRefs();
-  for (const ref of refs) {
-    if (!ref.name.startsWith("refs/pull/")) {
-      continue;
-    }
-    const deleted = await cell.deleteApiRef({ ref: ref.name, expectedOid: ref.target });
-    if (deleted.tag === "invalid") {
-      throw new Error(`seed ref cleanup failed: ${ref.name} (${deleted.reason})`);
+  // The renamed-fork suite below adds its base cells (append-only).
+  const cleanupCells = ["recluse/blocked", "cf-gitea-stub/renfork", "cf-gitea-stub/renfork2", "cf-gitea-stub/chainchild"];
+  for (const cellName of cleanupCells) {
+    const cell = env.REPO.getByName(cellName);
+    const { refs } = await cell.listRefs();
+    for (const ref of refs) {
+      if (!ref.name.startsWith("refs/pull/")) {
+        continue;
+      }
+      const deleted = await cell.deleteApiRef({ ref: ref.name, expectedOid: ref.target });
+      if (deleted.tag === "invalid") {
+        throw new Error(`seed ref cleanup failed: ${ref.name} (${deleted.reason})`);
+      }
     }
   }
 });
@@ -688,5 +694,103 @@ describe("POST /repos/{owner}/{repo}/pulls: the cross-repo (fork head) create ar
     // The merge base is the SHARED fork point — not null: the base fetch made
     // the head-cell computation possible.
     expect(rows[0]).toMatchObject({ headSha: featureTip, mergeBase: sharedTip });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The bare `owner:branch` head grammar through a fork RENAME — the fork EDGE
+// (upstream FindHeadRepo, routers/common/compare.go:134-150 → GetUserFork,
+// models/repo/fork.go:45-55: `fork_id = ? AND owner_id = ?`) is name-free, so
+// a renamed fork keeps resolving. The pre-fix resolver looked the head up by
+// path (owner, base slug) and 404'd once the fork's slug moved. Upstream's
+// LookupRedirect (models/repo/redirect.go:55-64) plays no part in this
+// resolution — the bare grammar carries no repo name to redirect.
+// ---------------------------------------------------------------------------
+
+/** The real rename path (D1 rows + the RepoDO cell carry) — a raw slug
+ *  UPDATE would strand the branches under the old cell name. */
+const renamingRepoService = () =>
+  new RepoService(env.DB, { carry: (from, to, storageKey) => carryRepoCell(env, from, to, storageKey) });
+
+describe("POST /repos/{owner}/{repo}/pulls: the bare head grammar follows the fork edge through a fork rename", () => {
+  it("201s head 'alice:feature' after the fork is RENAMED (old slug gone) — the fork edge resolves the renamed fork and the PR carries its new identity", async () => {
+    const baseSlug = "renfork";
+    const { baseId, forkId, sharedTip, featureTip } = await seedForkWithFeature(baseSlug);
+    await renamingRepoService().rename(forkId, "renfork-moved");
+    // The (alice, base slug) path is now dead — nothing resolves there (the
+    // redirect row is invisible to resolveHeadRepo, like upstream).
+    const create = await router()(`/repos/cf-gitea-stub/${baseSlug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "renamed fork PR", head: "alice:feature", base: "main" }),
+    });
+    expect(create.status).toBe(201);
+    const rendered = await create.json<{ head: { label: string; sha: string; repo_id: number; repo?: { full_name: string } } }>();
+    expect(rendered.head).toMatchObject({ label: "feature", sha: featureTip, repo_id: Number(forkId) });
+    // the renamed identity renders (the converter reads the row, not the grammar)
+    expect(rendered.head.repo).toMatchObject({ full_name: "alice/renfork-moved" });
+    const rows = await db().select().from(pullRequests).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      headRepoId: forkId,
+      baseRepoId: baseId,
+      headBranch: "feature",
+      baseBranch: "main",
+      headSha: featureTip,
+      mergeBase: sharedTip,
+    });
+  });
+
+  it("prefers the fork edge over a same-named non-fork squatting the base's slug (fork-edge-before-path — the upstream-true winner, compare.go:173)", async () => {
+    const baseSlug = "renfork2";
+    const { forkId } = await seedForkWithFeature(baseSlug);
+    await renamingRepoService().rename(forkId, "renfork2-moved");
+    const forkRow = await db().select().from(repositories).where(eq(repositories.id, forkId)).get();
+    if (forkRow === undefined || forkRow.ownerId === null) throw new Error("fork row seed failed");
+    // The decoy: the same owner's NON-fork repo occupying the fork's old slug.
+    const decoyId = await seedRepo(forkRow.ownerId, "alice", baseSlug);
+    expect(Number(decoyId)).not.toBe(Number(forkId));
+    const create = await router()(`/repos/cf-gitea-stub/${baseSlug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "edge wins", head: "alice:feature", base: "main" }),
+    });
+    expect(create.status).toBe(201);
+    const rendered = await create.json<{ head: { repo_id: number } }>();
+    expect(rendered.head.repo_id).toBe(Number(forkId));
+  });
+
+  it("climbs the fork chain when the BASE is a fork — an ancestor owned by the head user IS the head repo (compare.go:135-147)", async () => {
+    const childSlug = "chainchild";
+    const baseId = await seedRepo(1, "cf-gitea-stub", childSlug);
+    const alice = await seedUser("alice");
+    const rootId = await seedRepo(alice.id, "alice", "chainroot");
+    await db().update(repositories).set({ forkParent: rootId }).where(eq(repositories.id, baseId));
+    const readme = "# chainroot\n";
+    const sharedTip = await seedSharedMain({ ownerNamespace: "cf-gitea-stub", slug: childSlug }, readme);
+    await seedSharedMain({ ownerNamespace: "alice", slug: "chainroot" }, readme);
+    const featureTip = await seedCommitOnBranch({ ownerNamespace: "alice", slug: "chainroot" }, "feature", sharedTip, "feature.txt", "from the root\n", 1761000005);
+    const create = await router()(`/repos/cf-gitea-stub/${childSlug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "chain PR", head: "alice:feature", base: "main" }),
+    });
+    expect(create.status).toBe(201);
+    const rendered = await create.json<{ head: { repo_id: number; sha: string } }>();
+    expect(rendered.head).toMatchObject({ repo_id: Number(rootId), sha: featureTip });
+  });
+
+  it("404s a KNOWN head owner with neither a fork of the base nor a same-slug repo — the flat anti-enumeration 404 (upstream's known-user arm is 400 'the user %s does not have a fork of the base repository', compare.go:178 — the deliberate status deviation)", async () => {
+    const baseSlug = "renfork-nofork";
+    await seedRepo(1, "cf-gitea-stub", baseSlug);
+    await seedUser("bob");
+    const res = await router()(`/repos/cf-gitea-stub/${baseSlug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "x", head: "bob:feature", base: "main" }),
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ message: "not found", url: ERROR_URL });
+    expect(await db().select().from(pullRequests).all()).toHaveLength(0);
   });
 });
