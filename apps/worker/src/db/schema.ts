@@ -105,6 +105,16 @@ export const repositories = sqliteTable(
      *  default (the ALTER ADD COLUMN constraint): null for non-mirrors and
      *  pre-existing rows. */
     originalUrl: text("original_url"),
+    // -------------------------------------------------------------------------
+    // Long-tail batch (wave-api-badges-licenses-template) — the template flag.
+    // Kept LAST like fork_parent/is_mirror above — ALTER TABLE ADD COLUMN
+    // physically appends, so the table_info order stays the migration order.
+    // -------------------------------------------------------------------------
+    /** Upstream `Repository.IsTemplate` (models/repo/repo.go:190): the repo
+     *  may seed `POST /repos/{template_owner}/{template_repo}/generate`
+     *  copies (api/routes/generate-repo.ts). NOT NULL DEFAULT FALSE per the
+     *  upstream column default; the ALTER backfills existing rows false. */
+    isTemplate: integer("is_template", { mode: "boolean" }).notNull().default(false),
   },
   (t) => [
     // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point
@@ -2345,5 +2355,209 @@ export const protectedTags = sqliteTable(
   (t) => [
     // Every read filters by repo_id (see the table comment).
     index("protected_tags_repo_idx").on(t.repoId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// OAuth2 applications (long-tail batch, wave-api-oauth2-apps — upstream
+// `OAuth2Application`, gitea/models/auth/oauth2.go:39-55).
+// ---------------------------------------------------------------------------
+
+/**
+ * OAuth2 applications (upstream `OAuth2Application`,
+ * models/auth/oauth2.go:39-55) — a user-owned OAuth2 client registration
+ * (RFC 6749 §2). The API family is /user/applications/oauth2[/{id}]
+ * (api/routes/oauth2-apps.ts); the authorize/token flow that CONSUMES these
+ * registrations is web-UI territory and stays out of this batch (no
+ * oauth2_grant / oauth2_authorization_code tables — oauth2.go:413+, :532+).
+ *
+ * - `client_id` is a UUID (crypto.randomUUID) for upstream's
+ *   uuid.New().String() (oauth2.go:298); UNIQUE per upstream
+ *   `xorm:"unique"` (oauth2.go:43).
+ * - `client_secret` stores a HASH, never the plaintext (upstream bcrypt,
+ *   oauth2.go:213-224; our PBKDF2-SHA256 encoding is documented in
+ *   api/services/oauth2-apps.ts). Plaintext exists only inside the
+ *   create/update response bodies — never on list/get.
+ * - `redirect_uris` carries upstream's `xorm:"redirect_uris JSON TEXT"`
+ *   encoding (oauth2.go:51) — a JSON array in a TEXT column.
+ */
+export const oauth2Applications = sqliteTable(
+  "oauth2_application",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Owning user id (upstream `UID xorm:"INDEX"`, oauth2.go:40). */
+    uid: integer("uid").notNull(),
+    name: text("name").notNull(),
+    /** Upstream `ClientID xorm:"unique"` (oauth2.go:43). */
+    clientId: text("client_id").notNull().unique(),
+    /** The HASH of the current secret — never the plaintext. */
+    clientSecret: text("client_secret").notNull(),
+    /** Upstream `NOT NULL DEFAULT TRUE` (oauth2.go:49). */
+    confidentialClient: integer("confidential_client", { mode: "boolean" }).notNull().default(true),
+    /** Upstream `NOT NULL DEFAULT FALSE` (oauth2.go:50). */
+    skipSecondaryAuthorization: integer("skip_secondary_authorization", { mode: "boolean" }).notNull().default(false),
+    /** JSON array of redirect URIs — upstream `redirect_uris JSON TEXT`. */
+    redirectUris: text("redirect_uris").notNull().default("[]"),
+    /** Upstream `CreatedUnix xorm:"INDEX created"`. */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Upstream `UpdatedUnix xorm:"INDEX updated"`. */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's `UID xorm:"INDEX"` — every list filters by uid
+    // (models/auth/oauth2_list.go ToConds).
+    index("oauth2_application_uid_idx").on(t.uid),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// User badges (long-tail batch, wave-api-badges-licenses-template — upstream
+// `Badge` + `UserBadge`, gitea/models/user/badge.go:16-25).
+// ---------------------------------------------------------------------------
+
+/**
+ * Badge catalog (upstream `Badge`, models/user/badge.go:16-21) — a slugged
+ * decoration an admin can pin on users. The API family is
+ * /admin/users/{username}/badges (api/routes/admin-badges.ts); the catalog's
+ * own CRUD is upstream WEB-UI territory (routers/web/admin/badges.go, no
+ * /api/v1 surface — the frozen contract declares none either), so rows come
+ * to exist out-of-band (seed/admin UI) and the API consumes existing slugs.
+ *
+ * - `slug` is UNIQUE per upstream `xorm:"UNIQUE"` (badge.go:18); it is the
+ *   API-facing key (UserBadgeOption.badge_slugs).
+ * - `description` / `image_url` are plain xorm strings — NULLable columns.
+ */
+export const badges = sqliteTable("badge", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  slug: text("slug").notNull().unique(),
+  description: text("description"),
+  imageUrl: text("image_url"),
+});
+
+/**
+ * The user <-> badge edge (upstream `UserBadge`, models/user/badge.go:23-25)
+ * with upstream's compound `unique_user_badge` index (badge.go:28-33, the
+ * v329 migration's dedup + resync) — a user holds a badge at most once. No
+ * FK per the schema conventions; edges die with their owner rows.
+ */
+export const userBadges = sqliteTable(
+  "user_badge",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    badgeId: integer("badge_id").notNull(),
+    userId: integer("user_id").notNull(),
+  },
+  (t) => [
+    // Upstream's TableIndices unique (badge.go:28-33).
+    uniqueIndex("unique_user_badge").on(t.userId, t.badgeId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Repo licenses (long-tail batch, wave-api-badges-licenses-template —
+// upstream `RepoLicense`, gitea/models/repo/license.go:15-24).
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-repo detected licenses (upstream `RepoLicense`,
+ * models/repo/license.go:15-24) — the PUSH-time detection product
+ * (services/repository/license.go resolveLicenses) that
+ * `GET /repos/{owner}/{repo}/licenses` reads (api/routes/repo-licenses.ts).
+ * In cf-gitea the detection glue lands with this table (services/
+ * repo-licenses.ts) but the push pipeline does NOT call it yet — rows are
+ * unpopulated and the endpoint answers [] (the documented honest state).
+ *
+ * - UNIQUE(path) is the upstream 3-column unique over (repo_id, license,
+ *   license_path) (license.go:19-21 + the v346 migration's re-created index;
+ *   xorm's physical name there is UQE_repo_license_path).
+ * - `commit_id` is the commit the detection ran at (license.go:18) — the
+ *   UpdateRepoLicenses diff deletes rows whose commit_id fell behind.
+ * - the created/updated unix pair carries upstream's `xorm:"INDEX CREATED"` /
+ *   `xorm:"INDEX UPDATED"` (license.go:22-23).
+ */
+export const repoLicenses = sqliteTable(
+  "repo_license",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Keys the landed TEXT repositories.id — the repo-scoped-table
+     *  convention (no FK; rows die with the deleteRepository cascade). */
+    repoId: text("repo_id").notNull(),
+    commitId: text("commit_id"),
+    /** SPDX ID the detector matched (upstream `License VARCHAR(255)`). */
+    license: text("license").notNull(),
+    /** Repo-relative path of the license file (upstream `license_path`
+     *  VARCHAR(255) NOT NULL DEFAULT 'LICENSE'). */
+    licensePath: text("license_path").notNull().default("LICENSE"),
+    /** Upstream `CreatedUnix xorm:"INDEX CREATED"`. */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Upstream `UpdatedUnix xorm:"INDEX UPDATED"`. */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's UNIQUE(path) trio (see the table comment).
+    uniqueIndex("repo_license_path_uq").on(t.repoId, t.license, t.licensePath),
+    // Upstream's two timestamp INDEXes (license.go:22-23).
+    index("repo_license_created_idx").on(t.createdAt),
+    index("repo_license_updated_idx").on(t.updatedAt),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Activity feeds (long-tail batch, wave-api-feeds — upstream `Action`,
+// gitea/models/activities/action.go:135-151; specs/activity-feeds.md).
+// ---------------------------------------------------------------------------
+
+/**
+ * The instance-wide activity log (upstream `Action`) — one row per RECEIVER
+ * per action (the NotifyWatchers fan-out, services/feed/feed.go:32-100: the
+ * original row `user_id = act_user_id`, an org row for org-owned repos, one
+ * row per repo watcher). Written by the additive hooks inside the landed
+ * event emitters (services/repo-events.ts + services/issue-events.ts); read
+ * by the three /activities/feeds endpoints (api/routes/activity-feeds.ts).
+ *
+ * Deviations from upstream (specs/activity-feeds.md §3.1/§3.3):
+ * - `repo_id` is the landed TEXT repositories.id (repo-scoped-table
+ *   convention, the repo_license precedent; upstream int64). No FK.
+ * - Only three of upstream's five composite indexes port (the ones the
+ *   endpoints use); the dashboard/heatmap-shaped two land with consumers.
+ * - `is_deleted` is schema-faithful and read-filtered, but nothing sets it
+ *   true at this tier (upstream has no writer either outside migrations);
+ *   repo deletion cascades rows away with the repo row.
+ * Rows exist only for action types the landed emitters produce (the wired
+ * matrix in the SPEC §3.3); the numeric op_type preserves upstream's
+ * ActionType iota (action.go:23-56).
+ */
+export const actions = sqliteTable(
+  "action",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Upstream `UserID xorm:"INDEX"` — the RECEIVER user id. */
+    userId: integer("user_id").notNull(),
+    /** Upstream `ActionType` int (1..27, action.go:23-56). */
+    opType: integer("op_type").notNull(),
+    /** Upstream `ActUserID` — the performer. */
+    actUserId: integer("act_user_id").notNull(),
+    /** TEXT repositories.id (the repo-scoped-table convention). */
+    repoId: text("repo_id").notNull(),
+    /** Upstream `CommentID xorm:"INDEX"` — 0 when the action has no comment. */
+    commentId: integer("comment_id").notNull().default(0),
+    /** Upstream `NOT NULL DEFAULT false`; never written true here (see above). */
+    isDeleted: integer("is_deleted", { mode: "boolean" }).notNull().default(false),
+    /** Upstream `RefName` — branch/tag of push/tag actions ('' so far). */
+    refName: text("ref_name").notNull().default(""),
+    /** Repo privacy at action time (upstream `IsPrivate NOT NULL DEFAULT false`). */
+    isPrivate: integer("is_private", { mode: "boolean" }).notNull().default(false),
+    /** Upstream `Content TEXT` — "index|excerpt" / old repo name / ... */
+    content: text("content").notNull().default(""),
+    /** Upstream `CreatedUnix xorm:"created"`. */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's `r_u_d` composite (action.go:159-160).
+    index("action_repo_user_deleted_idx").on(t.repoId, t.userId, t.isDeleted),
+    // Upstream's `cuIndex` shape (action.go:168-169).
+    index("action_user_deleted_created_idx").on(t.userId, t.isDeleted, t.createdAt),
+    // Upstream's `au_c_u` composite (action.go:171-172).
+    index("action_act_user_created_idx").on(t.actUserId, t.createdAt, t.userId),
   ],
 );

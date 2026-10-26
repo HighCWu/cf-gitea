@@ -62,6 +62,7 @@ function makeRepoRow(overrides: Partial<RepoRow> = {}): RepoRow {
     forkParent: null,
     isMirror: false,
     originalUrl: null,
+    isTemplate: false,
     ...overrides,
   };
 }

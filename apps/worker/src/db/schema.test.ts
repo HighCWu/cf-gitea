@@ -557,13 +557,18 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
       ["fork_parent", "TEXT", 0, 0],
       ["is_mirror", "INTEGER", 1, 0],
       ["original_url", "TEXT", 0, 0],
+      // wave-api-badges-licenses-template: the template flag (upstream
+      // Repository.IsTemplate) — appended LAST like every ALTER sweep.
+      ["is_template", "INTEGER", 1, 0],
     ]);
-    // Both appended columns keep the ALTER ADD COLUMN constraints: is_mirror
+    // The appended columns keep the ALTER ADD COLUMN constraints: is_mirror
     // is NOT NULL with the keyword-alias default (`false` = 0), original_url
     // nullable with NO default — the bare `ADD COLUMN original_url text`:
     // pre-existing rows read NULL (fork_parent above reads the same way).
-    expect(columns.at(-2)?.dflt_value).toBe("false");
-    expect(columns.at(-1)?.dflt_value).toBeNull();
+    // is_template (0027) is NOT NULL DEFAULT false like is_mirror.
+    expect(columns.at(-3)?.dflt_value).toBe("false");
+    expect(columns.at(-2)?.dflt_value).toBeNull();
+    expect(columns.at(-1)?.dflt_value).toBe("false");
     expect(await indexNames("repositories")).toContain("repositories_fork_parent_idx");
   });
 

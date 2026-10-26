@@ -57,6 +57,7 @@ const ctx: UiContext = {
     forkParent: null,
     isMirror: false,
     originalUrl: null,
+    isTemplate: false,
   } satisfies RepoRow,
 };
 
