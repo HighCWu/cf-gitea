@@ -28,7 +28,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { seedVerifiedUser } from "../../auth/testing/seeds";
+import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
 import { addOrUpdateCollaborator } from "../../api/services/repo-collaborators";
 import { createRepoLabel, listRepoLabels } from "../../api/services/labels";
 import { createOrgLabel } from "../../api/services/labels-t2";
@@ -386,6 +386,53 @@ describe("labels page /{owner}/{repo}/labels", () => {
     const html = await res.text();
     expect(html).not.toContain('action="/wave25-owner/labeled/labels/new"');
     expect(html).not.toContain("labels/edit");
+  });
+
+  it("the REPO OWNER via the session path sees the New Label form and the per-row controls (REDEPLOY12 open issue 3)", async () => {
+    // The production observation's exact shape: the signed-in repo owner
+    // mounting GET /{owner}/{repo}/labels through the REAL session →
+    // resolveViewer → sessionRepoGrant path (minted gitea_session cookie,
+    // uiRouter.fetch — nothing fixture-shaped). The writer-collaborator test
+    // below exercises the collaborator ROW arm of canWriteRepository; this
+    // pins the OWNER arm (repositoryPermissions' isRepositoryOwner
+    // short-circuit: session username folded vs repositories.owner_namespace)
+    // — the arm production's probe exercised and the suite never did.
+    const fixture = await ensureWave25Fixtures();
+    const res = await fetchUi("/wave25-owner/labeled/labels", withCookie("/wave25-owner/labeled/labels", fixture.ownerCookie));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The writer-only create arm: the navbar button anchor AND the inline
+    // two-field form with its default color.
+    expect(html).toContain('class="ui small primary new-label button"');
+    expect(html).toContain('id="new-label"');
+    expect(html).toContain('action="/wave25-owner/labeled/labels/new"');
+    expect(html).toContain('value="#70c24a"');
+    // The per-row edit/delete controls ride the same grant.
+    expect(html).toContain('action="/wave25-owner/labeled/labels/edit"');
+    expect(html).toContain('action="/wave25-owner/labeled/labels/delete"');
+  });
+
+  it("a PAT Authorization header is anonymous on the page surface (SPEC-0010 §2.9) — the probe's exact request shape", async () => {
+    // The REDEPLOY12 probe authenticated the production page GETs with the
+    // minted PAT as an Authorization header (the block's http.extraHeader
+    // pattern). The UI viewer seam reads ONLY the gitea_session cookie
+    // (upstream-accurate: tokens authorize /api/v1 + git-HTTP, never the web
+    // pages), so such a request resolves ANONYMOUS and the writer form
+    // correctly stays off a 200 page — the fixture-vs-production seam
+    // divergence behind the "form absent" observation. Pin the boundary.
+    await ensureWave25Fixtures();
+    const patHolder = await seedVerifiedUser({ username: "wave25-pat" });
+    const pat = (await mintFor(patHolder.id, "wave25-labels-page-probe-shape", "write:repository")).plaintext;
+    // `all`-scoped even: the header authorizes the API, never the pages —
+    // the surface split is structural (resolveViewer reads only the cookie),
+    // so the strongest token still renders the anonymous page.
+    const res = await fetchUi("/wave25-owner/labeled/labels", {
+      headers: { authorization: basicTokenHeader(pat) },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content repository labels"');
+    expect(html).not.toContain('action="/wave25-owner/labeled/labels/new"');
   });
 
   it("the writer sees the New Label form and the per-row edit/delete controls", async () => {
