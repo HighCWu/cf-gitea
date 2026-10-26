@@ -412,3 +412,49 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     expect((await get(`${REPO}/compare/main...ghost`)).status).toBe(404);
   });
 });
+
+// ---------------------------------------------------------------------------
+// delete_branch_after_merge — the default-branch head guard
+// ---------------------------------------------------------------------------
+
+describe("merge delete_branch_after_merge — the default-branch head guard", () => {
+  it("refuses to delete the repo's default branch as PR head — merge lands, branch survives", async () => {
+    // release starts at main's tip (POST /branches sources the default
+    // branch), then main advances one commit past it so the PR is mergeable
+    const branch = await send(`${REPO}/branches`, jsonInit("POST", { new_branch_name: "release" }));
+    expect(branch.status).toBe(201);
+    const advanced = await send(`${REPO}/contents/guard.txt`, jsonInit("POST", { content: btoa("guard\n"), branch: "main", message: "main: guard" }));
+    expect(advanced.status).toBe(201);
+    const mainTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/main")?.target as string;
+
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "main into release", head: "main", base: "release" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    const merge = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }));
+    expect(merge.status).toBe(200);
+
+    // the merge landed on the base (release moved to a two-parent commit)…
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    const release = await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).readCommit(tips.get("refs/heads/release")?.target);
+    expect(release?.parents).toHaveLength(2);
+    // …but the default-branch head SURVIVES (upstream CanDeleteBranchWithPermission
+    // → ErrBranchIsDefault; the merge caller logs Debug and ignores it)
+    expect(tips.get("refs/heads/main")?.target).toBe(mainTip);
+    expect((await jsonBody(await get(`${REPO}/pulls/${index}`))).merged).toBe(true);
+  });
+
+  it("still deletes an ordinary head branch when delete_branch_after_merge is set", async () => {
+    const headTip = await seedBranchWithCommit("delbranch", "del.txt", "del\n");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Delete my branch", head: "delbranch", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    expect((await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", delete_branch_after_merge: true }))).status).toBe(200);
+
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    expect(tips.get("refs/heads/delbranch")).toBeUndefined();
+    // the pull head ref survives the branch delete
+    expect(tips.get(`refs/pull/${index}/head`)?.target).toBe(headTip);
+  });
+});

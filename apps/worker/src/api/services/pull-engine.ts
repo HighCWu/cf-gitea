@@ -237,13 +237,25 @@ export async function mergePullRequest(
 
     if (opts.deleteBranchAfterMerge && pr.headRepoId === pair.repo.id) {
       // best-effort head-branch delete (upstream writes the delete_branch
-      // system comment too — deferred with the tier-2 surface)
-      const headTip = (tips?.refs ?? []).find((ref) => ref.name === branchRef(pr.headBranch))?.target;
-      if (headTip !== undefined) {
-        try {
-          await cell.deleteApiRef({ ref: branchRef(pr.headBranch), expectedOid: headTip });
-        } catch (error) {
-          console.error(`[pull-engine] head-branch delete failed: ${error instanceof Error ? error.message : String(error)}`);
+      // system comment too — deferred with the tier-2 surface). The repo's
+      // default branch is REFUSED like upstream CanDeleteBranchWithPermission
+      // (services/repository/branch.go: `branchName == repo.DefaultBranch` →
+      // ErrBranchIsDefault "branch is default or pull request target"; the
+      // target-branch variant is DefaultTargetBranch ?? DefaultBranch, and we
+      // carry no PR-unit config yet). The API merge caller logs Debug and
+      // ignores the error because the PR has already merged — the merge lands
+      // and the branch simply survives (pull.go: "no way to tell users that
+      // what error happens, and the PR has been merged, so ignore the error").
+      if (pr.headBranch === pair.repo.defaultBranch) {
+        console.info(`[pull-engine] head-branch delete skipped: branch is default or pull request target [branch: ${pr.headBranch}]`);
+      } else {
+        const headTip = (tips?.refs ?? []).find((ref) => ref.name === branchRef(pr.headBranch))?.target;
+        if (headTip !== undefined) {
+          try {
+            await cell.deleteApiRef({ ref: branchRef(pr.headBranch), expectedOid: headTip });
+          } catch (error) {
+            console.error(`[pull-engine] head-branch delete failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
         }
       }
     }
