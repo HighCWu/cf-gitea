@@ -89,7 +89,7 @@
 import { asGitHookName, GIT_HOOK_NAMES, GIT_HOOK_SAMPLES, type GitHookName } from "../../api/routes/git-hooks";
 import type { RepoRow, UiContext } from "../ui-context";
 import { BaseLayout, Icon, renderPage } from "../shell";
-import { mirrorLocale, settingsLocale } from "./settings";
+import { SettingsNav } from "./settings";
 
 /** Page chrome + notes text (component-local, the settingsLocale pattern —
  *  locale.ts is shared and not this wave's file; upstream locale keys cited). */
@@ -178,7 +178,7 @@ export function RepoGitHooksPage(props: { ctx: UiContext; data: RepoGitHooksData
   return (
     <BaseLayout ctx={ctx} title={gitHooksSettingsLocale.githooks} pageClass="repository settings githooks">
       <div class="ui container flex-container">
-        <GitHooksSettingsNav repoLink={repoLink} />
+        <SettingsNav repoLink={repoLink} active="githooks" repo={repo} />
         <div class="flex-container-main">
           <div class="repo-setting-content">
             <h4 class="ui top attached header">{gitHooksSettingsLocale.githooks}</h4>
@@ -296,7 +296,7 @@ export function RepoGitHookEditPage(props: { ctx: UiContext; data: GitHookEditDa
   return (
     <BaseLayout ctx={ctx} title={gitHooksSettingsLocale.githooks} pageClass="repository settings edit githook">
       <div class="ui container flex-container">
-        <GitHooksSettingsNav repoLink={repoLink} />
+        <SettingsNav repoLink={repoLink} active="githooks" repo={repo} />
         <div class="flex-container-main">
           <div class="repo-setting-content">
             <form class="ui form" action={hookLink} method="post">
@@ -321,53 +321,6 @@ export function RepoGitHookEditPage(props: { ctx: UiContext; data: GitHookEditDa
         </div>
       </div>
     </BaseLayout>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// The nav (mount scaffolding — the WikiSettingsNav pattern)
-// ---------------------------------------------------------------------------
-
-/**
- * The settings navbar with the Git Hooks item — MOUNT SCAFFOLDING ONLY (the
- * handoff note): the literal `SettingsNav` DOM (pages/settings.tsx) with the
- * Git Hooks item appended after Branches and active (upstream
- * navbar.tmpl:34-38 renders it after Tags, inside the code-unit block
- * before Keys — the upstream relative order keeps it behind Branches here;
- * our nav has no Tags/Keys items). The other items' texts import the
- * owner's locale objects; when the index.ts window folds this into
- * `SettingsNav` (the `active` union + the item), delete this component.
- * Upstream gates the item on `SignedUser.CanEditGitHook` — the landed gate
- * is repo-admin-only (routes/git-hooks.ts divergence note 4), so the item
- * renders unconditionally past the settingsGate.
- */
-export function GitHooksSettingsNav(props: { repoLink: string }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{settingsLocale.settings}</div>
-        <a class="item" href={`${props.repoLink}/settings`}>
-          {settingsLocale.options}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/collaboration`}>
-          {settingsLocale.collaboration}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/hooks`}>
-          {settingsLocale.hooks}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/branches`}>
-          {settingsLocale.branches}
-        </a>
-        {/* upstream navbar.tmpl:34-38 — the Git Hooks item (PageIsSettingsGitHooks
-            active), after Branches here (no Tags/Keys items in our reduced nav). */}
-        <a class="active item" href={`${props.repoLink}/settings/hooks/git`}>
-          {gitHooksSettingsLocale.githooks}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/mirror`}>
-          {mirrorLocale.mirror_settings}
-        </a>
-      </div>
-    </div>
   );
 }
 
@@ -409,10 +362,13 @@ export function GitHooksSettingsNav(props: { repoLink: string }) {
 // readability — hono serves the static `hooks/git` ahead of the param
 // `hooks/:id` regardless (static-wins matching).
 //
-// Nav fold: extend pages/settings.tsx `SettingsNav`'s `active` union with
-// `"githooks"`, insert the Git Hooks item between Branches and Mirror (the
-// module's GitHooksSettingsNav is the literal DOM), then delete
-// GitHooksSettingsNav. Survey rows to touch on landing:
+// Nav fold: DONE (wave-settingsnav-fold) — pages/settings.tsx `SettingsNav`'s
+// `active` union carries "githooks" and the Git Hooks item sits in the
+// upstream code-unit block (Branches → Tags → Git Hooks → Keys), between
+// Branches and Mirror; GitHooksSettingsNav is deleted and both pages render
+// `SettingsNav` with `active="githooks"` (upstream's CanEditGitHook item gate
+// stays dropped — routes/git-hooks.ts divergence note 4). Survey rows to
+// touch on landing:
 // docs/compat/ui-parity-survey.md — the repo-settings family's hooks row
 // (mark the `settings/hooks/git` list + edit pages rendered) and the
 // navbar-reduction note (the Git Hooks item exists upstream at

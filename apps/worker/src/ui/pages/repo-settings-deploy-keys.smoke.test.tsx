@@ -31,7 +31,6 @@ import {
   addDeployKeyFromForm,
   deleteDeployKeyFromForm,
   deployKeysSettingsLocale,
-  DeployKeysSettingsNav,
   loadRepoDeployKeys,
   parseDeployKeyDeleteForm,
   parseDeployKeyForm,
@@ -176,17 +175,19 @@ describe("the delete arm (deleteDeployKeyFromForm — DeleteDeployKey)", () => {
   });
 });
 
-// --- the nav scaffold ----------------------------------------------------------------
+// --- the nav (the fold) ---------------------------------------------------------------
 
-describe("the nav scaffold (DeployKeysSettingsNav)", () => {
-  it("renders the reduced settings items with Deploy Keys active", () => {
-    const html = renderToString(<DeployKeysSettingsNav repoLink="/alice/demo" />);
+describe("the nav (SettingsNav through the page — the DeployKeysSettingsNav scaffold is deleted)", () => {
+  it("renders the reduced settings items with Deploy Keys active (the nav fold — wave-settingsnav-fold)", async () => {
+    const data = await loadRepoDeployKeys(env.DB, repo);
+    const html = renderToString(<PageForTest data={data} />);
     expect(html).toContain('class="flex-container-nav"');
     expect(html).toContain('href="/alice/demo/settings"');
     expect(html).toContain('href="/alice/demo/settings/collaboration"');
     expect(html).toContain('href="/alice/demo/settings/hooks"');
     expect(html).toContain('href="/alice/demo/settings/branches"');
-    // upstream navbar.tmpl:32-34's item — after Branches, before Mirror, active.
+    // upstream navbar.tmpl:32-34's item — the code-unit block (Branches →
+    // Tags → Git Hooks → Keys), before Mirror, active.
     expect(html).toContain('class="active item" href="/alice/demo/settings/keys"');
     expect(html).toContain(`>${deployKeysSettingsLocale.deploy_keys}</a>`);
     expect(html).toContain('href="/alice/demo/settings/mirror"');

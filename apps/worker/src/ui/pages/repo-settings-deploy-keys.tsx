@@ -112,7 +112,7 @@ import type { IconName } from "../icons";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
 import { formatKeyDate } from "./user-settings-keys";
-import { mirrorLocale, settingsLocale } from "./settings";
+import { SettingsNav } from "./settings";
 
 // ---------------------------------------------------------------------------
 // Page chrome (the component-local locale pattern — locale.ts is shared and
@@ -313,7 +313,7 @@ export function RepoDeployKeysPage(props: { ctx: UiContext; data: RepoDeployKeys
   return (
     <BaseLayout ctx={ctx} title={deployKeysSettingsLocale.deploy_keys} pageClass="repository settings">
       <div class="ui container flex-container">
-        <DeployKeysSettingsNav repoLink={repoLink} />
+        <SettingsNav repoLink={repoLink} active="keys" repo={repo} />
         <div class="flex-container-main">
           <div class="repo-setting-content">
             <h4 class="ui top attached header">
@@ -432,51 +432,6 @@ export function RepoDeployKeysPage(props: { ctx: UiContext; data: RepoDeployKeys
 }
 
 // ---------------------------------------------------------------------------
-// The nav (mount scaffolding — the GitHooksSettingsNav pattern)
-// ---------------------------------------------------------------------------
-
-/**
- * The settings navbar with the Deploy Keys item — MOUNT SCAFFOLDING ONLY (the
- * handoff note): the literal `SettingsNav` DOM (pages/settings.tsx) with the
- * Deploy Keys item appended after Branches and active (upstream
- * navbar.tmpl:32-34 — inside the code-unit block after Git Hooks, before LFS;
- * our reduced nav has no Tags/Git Hooks items, so Keys lands after Branches,
- * before Mirror). The other items' texts import the owner's locale objects;
- * when the index.ts window folds this into `SettingsNav` (the `active` union
- * + the item), delete this component.
- */
-export function DeployKeysSettingsNav(props: { repoLink: string }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{settingsLocale.settings}</div>
-        <a class="item" href={`${props.repoLink}/settings`}>
-          {settingsLocale.options}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/collaboration`}>
-          {settingsLocale.collaboration}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/hooks`}>
-          {settingsLocale.hooks}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/branches`}>
-          {settingsLocale.branches}
-        </a>
-        {/* upstream navbar.tmpl:32-34 — the Deploy Keys item (PageIsSettingsKeys
-            active), after Branches here (no Tags/Git Hooks items in our
-            reduced nav), before Mirror. */}
-        <a class="active item" href={`${props.repoLink}/settings/keys`}>
-          {deployKeysSettingsLocale.deploy_keys}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/mirror`}>
-          {mirrorLocale.mirror_settings}
-        </a>
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // HANDOFF NOTE (for the `index.ts` window owner — this module has NO route)
 // ---------------------------------------------------------------------------
 //
@@ -520,10 +475,11 @@ export function DeployKeysSettingsNav(props: { repoLink: string }) {
 // hooks/git precedent). The key id rides the form field (upstream
 // FormInt64), so no id appears in any pattern.
 //
-// Nav fold: extend pages/settings.tsx `SettingsNav`'s `active` union with
-// `"keys"`, insert the Deploy Keys item between Branches and Mirror (the
-// module's DeployKeysSettingsNav is the literal DOM), then delete
-// DeployKeysSettingsNav. Survey rows to touch on landing:
+// Nav fold: DONE (wave-settingsnav-fold) — pages/settings.tsx `SettingsNav`'s
+// `active` union carries "keys" and the Deploy Keys item sits in the upstream
+// code-unit block (Branches → Tags → Git Hooks → Keys, navbar.tmpl:32-34),
+// between Branches and Mirror; DeployKeysSettingsNav is deleted and the page
+// renders `SettingsNav` with `active="keys"`. Survey rows to touch on landing:
 // docs/compat/ui-parity-survey.md — the repo-settings family's deploy-keys
 // row (mark `/settings/keys` rendered) and the navbar-reduction note (the
 // item exists upstream at navbar.tmpl:32-34, admin-gated like the group).

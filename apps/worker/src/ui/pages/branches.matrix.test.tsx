@@ -354,7 +354,9 @@ describe("w100 claim pin (the unmounted POST arms)", () => {
     // the wave-39 `/list` aux tail. Per the wave brief the resulting engine
     // 404s are DOCUMENTED, not pinned: the mount wave flips them
     // deliberately.
-    expect(parseUiRoute(`/${OWNER}/w100br/branches/rename`)).toBeNull();
+    // Window-2e folds (635ce2e) mounted the rename POST arm — the stale
+    // null updated to the claimed shape (the settingsnav-fold's disclosure).
+    expect(parseUiRoute(`/${OWNER}/w100br/branches/rename`)).toEqual({ family: "branch-rename", owner: OWNER, repo: "w100br" });
   });
 });
 

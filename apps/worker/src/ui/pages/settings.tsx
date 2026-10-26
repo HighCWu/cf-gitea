@@ -66,8 +66,9 @@
  *   a plain POST behind the Origin guard.
  * - Not rendered: avatar/template/website fields (no avatar pipeline; the
  *   template flag has no consumer; website is stored by saveRepoSettings but
- *   no page renders it yet), the mirror/archive-tint sections, and every
- *   other navbar item (collaboration/branches/keys/LFS/Actions — no pages).
+ *   no page renders it yet), the mirror/archive-tint sections, and the
+ *   navbar items with no landed pages (LFS/Actions/Audit — the SettingsNav
+ *   dead-link rule; the landed tabs' items folded in, wave-settingsnav-fold).
  * - The hooks list links every row onto its settings page (wave 14 —
  *   upstream base_list.tmpl's name + pencil anchors; before that page
  *   existed the rows rendered as text) and the per-hook LastStatus dot
@@ -190,6 +191,15 @@ import { sessionRepoGrant } from "../repo-grants";
 import type { RepoRow, UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
 import { BaseLayout, Icon, renderPage } from "../shell";
+// The tab modules' nav-item locales — the fold's one-copy rule: each item's
+// text stays owned by its page module (the cycles are reference-deferred:
+// these modules import this file's locales/SettingsNav only inside component
+// bodies, so module evaluation never dereferences across the cycle).
+import { deployKeysSettingsLocale } from "./repo-settings-deploy-keys";
+import { gitHooksSettingsLocale } from "./repo-settings-githooks";
+import { publicAccessLocale } from "./repo-settings-public-access";
+import { tagProtectionLocale } from "./repo-settings-tags";
+import { wikiSettingsLocale } from "./repo-settings-wiki";
 
 /** Page chrome text (component-local, the issuesLocale pattern — locale.ts
  *  is shared and not this wave's file). */
@@ -315,19 +325,63 @@ export function renderRepoSettingsPage(options: {
   return renderPage(<RepoSettingsPage ctx={options.ctx} data={options.data} error={options.error} />);
 }
 
-/** The settings navbar (repo/settings/navbar.tmpl reduced to the live items
- *  — the header comment's dead-link rule; wave 10 adds the Mirror item —
- *  the brief's `/settings/mirror` sub-page; upstream renders mirror settings
- *  as a SECTION of options.tmpl, no navbar item, so the item text is the
- *  options section's own "Mirror Settings" header and the placement (last)
- *  keeps the upstream relative order intact). Wave 15 adds the Branches
- *  item between Webhooks and Mirror — upstream's own order
- *  (navbar.tmpl:16-23 puts branches after hooks; mirror stays adjacent to
- *  its options-section origin at the tail). Exported for pages/
- *  branch-protection.tsx, which renders it with `branches` active. Wave 24
- *  adds the Collaboration item (navbar.tmpl:13) between Repository and
- *  Webhooks — pages/settings-collaboration.tsx renders it active. */
-export function SettingsNav(props: { repoLink: string; active: "options" | "collaboration" | "hooks" | "branches" | "mirror" }) {
+/** The settings navbar (repo/settings/navbar.tmpl reduced to the landed
+ *  items — the header comment's dead-link rule). Item order is navbar.tmpl's
+ *  exact order with the dead items dropped, plus the two documented
+ *  divergences at the tail:
+ *
+ *   Repository · [Public Access — CONDITIONAL] · Collaborators · Webhooks ·
+ *   Branches · Tags · Git Hooks · Deploy Keys · Mirror Settings · Wiki
+ *
+ *   - Public Access (navbar.tmpl:7-11) renders only under upstream's own
+ *     conditional `or .Repository.IsPrivate .Permission.HasAnyUnitPublicAccess`,
+ *     evaluated from the `repo` row + the `hasAnyPublicAccess` grant
+ *     (loadRepoPublicAccess's read). Callers that cannot evaluate the
+ *     conditional (not yet passing the repo row — the branch-protection and
+ *     collaboration call sites predate the fold) render the reduced nav
+ *     without the item; their owners pass `repo` when they next touch them.
+ *   - Tags (navbar.tmpl:21-26, immediately after Branches), Git Hooks
+ *     (navbar.tmpl:34-38 — upstream's `SignedUser.CanEditGitHook` gate is
+ *     dropped: the landed gate is repo-admin-only, routes/git-hooks.ts
+ *     divergence note 4) and Deploy Keys (navbar.tmpl:32-34) ride the
+ *     upstream code-unit block order.
+ *   - Mirror Settings is the wave-10 divergence: upstream renders mirror
+ *     settings as a SECTION of options.tmpl, no navbar item — the item stays
+ *     last-landed, adjacent to its options-section origin.
+ *   - Wiki is the wave-54 divergence: upstream has no wiki navbar item (the
+ *     block lives in options.tmpl) — placed after Mirror per the mirror
+ *     item's placement rule.
+ *
+ * The tab items' texts import the owning page modules' locale objects (the
+ * one-copy rule). Wave-settingsnav-fold deleted the five modules' scaffold
+ * navs (GitHooksSettingsNav, TagSettingsNav, DeployKeysSettingsNav,
+ * PublicAccessSettingsNav, WikiSettingsNav) onto this component. Exported
+ * for pages/branch-protection.tsx (`branches`), pages/
+ * settings-collaboration.tsx (`collaboration`) and the five tab modules. */
+export function SettingsNav(props: {
+  repoLink: string;
+  active:
+    | "options"
+    | "public_access"
+    | "collaboration"
+    | "hooks"
+    | "branches"
+    | "tags"
+    | "githooks"
+    | "keys"
+    | "mirror"
+    | "wiki";
+  /** The repo row, arming the conditional Public Access item (navbar.tmpl:
+   *  7-11). */
+  repo?: RepoRow;
+  /** The loaded grant arm — loadRepoPublicAccess's `hasAnyPublicAccess`
+   *  (the public-access page's loader; the store's only unit mode column is
+   *  the code unit's, so the other tabs reduce the conditional to the
+   *  visibility arm). */
+  hasAnyPublicAccess?: boolean;
+}) {
+  const showPublicAccess =
+    props.repo !== undefined && (props.repo.visibility === "private" || props.hasAnyPublicAccess === true);
   return (
     <div class="flex-container-nav">
       <div class="ui fluid vertical menu">
@@ -335,6 +389,16 @@ export function SettingsNav(props: { repoLink: string; active: "options" | "coll
         <a class={props.active === "options" ? "active item" : "item"} href={`${props.repoLink}/settings`}>
           {settingsLocale.options}
         </a>
+        {/* navbar.tmpl:7-11 — the conditional Public Access item, between
+            Repository and Collaboration. */}
+        {showPublicAccess ? (
+          <a
+            class={props.active === "public_access" ? "active item" : "item"}
+            href={`${props.repoLink}/settings/public_access`}
+          >
+            {publicAccessLocale.public_access}
+          </a>
+        ) : null}
         <a
           class={props.active === "collaboration" ? "active item" : "item"}
           href={`${props.repoLink}/settings/collaboration`}
@@ -347,8 +411,25 @@ export function SettingsNav(props: { repoLink: string; active: "options" | "coll
         <a class={props.active === "branches" ? "active item" : "item"} href={`${props.repoLink}/settings/branches`}>
           {settingsLocale.branches}
         </a>
+        {/* navbar.tmpl:21-26 — Tags, immediately after Branches. */}
+        <a class={props.active === "tags" ? "active item" : "item"} href={`${props.repoLink}/settings/tags`}>
+          {tagProtectionLocale.tags}
+        </a>
+        {/* navbar.tmpl:34-38 — Git Hooks. */}
+        <a class={props.active === "githooks" ? "active item" : "item"} href={`${props.repoLink}/settings/hooks/git`}>
+          {gitHooksSettingsLocale.githooks}
+        </a>
+        {/* navbar.tmpl:32-34 — Deploy Keys. */}
+        <a class={props.active === "keys" ? "active item" : "item"} href={`${props.repoLink}/settings/keys`}>
+          {deployKeysSettingsLocale.deploy_keys}
+        </a>
         <a class={props.active === "mirror" ? "active item" : "item"} href={`${props.repoLink}/settings/mirror`}>
           {mirrorLocale.mirror_settings}
+        </a>
+        {/* The wave-54 divergence: after Mirror, the mirror item's placement
+            rule (upstream renders no wiki navbar item). */}
+        <a class={props.active === "wiki" ? "active item" : "item"} href={`${props.repoLink}/settings/wiki`}>
+          {wikiSettingsLocale.wiki}
         </a>
       </div>
     </div>
@@ -364,7 +445,7 @@ export function RepoSettingsPage(props: { ctx: UiContext; data: RepoBasicsData; 
   return (
     <BaseLayout ctx={ctx} title={settingsLocale.settings} pageClass="repository settings options">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="options" />
+        <SettingsNav repoLink={repoLink} active="options" repo={repo} />
         <div class="flex-container-main">
           <h4 class="ui top attached header">{settingsLocale.basic_settings}</h4>
           <div class="ui attached segment">
@@ -502,7 +583,7 @@ export function HooksSettingsPage(props: { ctx: UiContext; data: HooksSettingsDa
   return (
     <BaseLayout ctx={ctx} title={settingsLocale.hooks} pageClass="repository settings webhooks">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="hooks" />
+        <SettingsNav repoLink={repoLink} active="hooks" repo={repo} />
         <div class="flex-container-main">
           {/* base_list.tmpl's header/segment pair, the provider dropdown
               menu replaced by the inline add form (header comment). */}
@@ -710,7 +791,7 @@ function MirrorSettingsPage(props: { ctx: UiContext; data: MirrorSettingsData; e
   return (
     <BaseLayout ctx={ctx} title={mirrorLocale.mirror_settings} pageClass="repository settings mirror">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="mirror" />
+        <SettingsNav repoLink={repoLink} active="mirror" repo={repo} />
         <div class="flex-container-main">
           <h4 class="ui top attached header">{mirrorLocale.mirror_settings}</h4>
           <div class="ui attached segment">
@@ -1074,7 +1155,7 @@ export function HookDetailPage(props: { ctx: UiContext; data: HookDetailData; er
   return (
     <BaseLayout ctx={ctx} title={hookDetailLocale.update_webhook} pageClass="repository settings new webhook">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="hooks" />
+        <SettingsNav repoLink={repoLink} active="hooks" repo={repo} />
         <div class="flex-container-main">
           {/* gitea.tmpl's form + settings.tmpl's fields (the module
               header's not-rendered notes for secret/auth-header/events). */}

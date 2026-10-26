@@ -108,8 +108,7 @@ import { codeUnitAnonymousRead } from "../../git-http/acl";
 import { repoUnits } from "../../db/schema";
 import { BaseLayout, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
-import { deployKeysSettingsLocale } from "./repo-settings-deploy-keys";
-import { mirrorLocale, settingsLocale } from "./settings";
+import { SettingsNav } from "./settings";
 
 // ---------------------------------------------------------------------------
 // Page chrome (the component-local locale pattern — locale.ts is shared and
@@ -233,7 +232,12 @@ export function RepoPublicAccessPage(props: { ctx: UiContext; data: RepoPublicAc
   return (
     <BaseLayout ctx={ctx} title={publicAccessLocale.public_access} pageClass="repository settings">
       <div class="ui container flex-container">
-        <PublicAccessSettingsNav repoLink={repoLink} showItem={repo.visibility === "private" || data.hasAnyPublicAccess} />
+        <SettingsNav
+          repoLink={repoLink}
+          active="public_access"
+          repo={repo}
+          hasAnyPublicAccess={data.hasAnyPublicAccess}
+        />
         <div class="flex-container-main">
           <div class="repo-setting-content">
             <h4 class="ui top attached header">{publicAccessLocale.public_access}</h4>
@@ -304,57 +308,6 @@ export function RepoPublicAccessPage(props: { ctx: UiContext; data: RepoPublicAc
 }
 
 // ---------------------------------------------------------------------------
-// The nav (mount scaffolding — the DeployKeysSettingsNav pattern)
-// ---------------------------------------------------------------------------
-
-/**
- * The settings navbar with the Public Access item — MOUNT SCAFFOLDING ONLY
- * (the handoff note): the literal `SettingsNav` DOM (pages/settings.tsx) with
- * the Public Access item inserted after Repository, ACTIVE, and rendered
- * under upstream's own conditional (navbar.tmpl:7-11 —
- * `or .Repository.IsPrivate .Permission.HasAnyUnitPublicAccess`, evaluated by
- * the page from `repo.visibility` + the loaded grant; a public repo with no
- * grants hides the item exactly as upstream's nav does, even mid-page). The
- * other items' texts import the owner modules' locale objects; when the
- * index.ts window folds this into `SettingsNav` (the `active` union + the
- * conditional item), delete this component.
- */
-export function PublicAccessSettingsNav(props: { repoLink: string; showItem: boolean }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{settingsLocale.settings}</div>
-        <a class="item" href={`${props.repoLink}/settings`}>
-          {settingsLocale.options}
-        </a>
-        {/* upstream navbar.tmpl:7-11 — the conditional Public Access item,
-            between Repository and Collaboration, active here. */}
-        {props.showItem ? (
-          <a class="active item" href={`${props.repoLink}/settings/public_access`}>
-            {publicAccessLocale.public_access}
-          </a>
-        ) : null}
-        <a class="item" href={`${props.repoLink}/settings/collaboration`}>
-          {settingsLocale.collaboration}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/hooks`}>
-          {settingsLocale.hooks}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/branches`}>
-          {settingsLocale.branches}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/keys`}>
-          {deployKeysSettingsLocale.deploy_keys}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/mirror`}>
-          {mirrorLocale.mirror_settings}
-        </a>
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // HANDOFF NOTE (for the `index.ts` window owner — this module has NO route)
 // ---------------------------------------------------------------------------
 //
@@ -383,14 +336,14 @@ export function PublicAccessSettingsNav(props: { repoLink: string; showItem: boo
 //   collaboration/hooks/branches/keys/mirror and beats any param family (the
 //   hooks/git precedent).
 //
-// Nav fold: extend pages/settings.tsx `SettingsNav`'s `active` union with
-// `"public_access"`, insert the Public Access item between Repository and
-// Collaboration under the conditional
-// `repo.visibility === "private" || hasAnyPublicAccess` (navbar.tmpl:7-11 —
-// SettingsNav would need the repo row + the grant passed in, or the
-// unconditional reduction if the group prefers the simpler fold; this
-// module's PublicAccessSettingsNav is the literal conditional DOM), then
-// delete PublicAccessSettingsNav. Survey rows to touch on landing:
+// Nav fold: DONE (wave-settingsnav-fold) — pages/settings.tsx `SettingsNav`'s
+// `active` union carries "public_access" and the item sits between Repository
+// and Collaboration under upstream's own conditional (navbar.tmpl:7-11 —
+// `repo.visibility === "private" || hasAnyPublicAccess`, the `repo` row +
+// `hasAnyPublicAccess` grant passed by this page; callers not passing the
+// repo row render the reduced nav without the item); PublicAccessSettingsNav
+// is deleted and the page renders `SettingsNav` with `active="public_access"`.
+// Survey rows to touch on landing:
 // docs/compat/ui-parity-survey.md — the repo-settings family's
 // public-access row (mark `/settings/public_access` rendered; NOTE the
 // survey's "collaborator/team access graph" guess was wrong — the page is

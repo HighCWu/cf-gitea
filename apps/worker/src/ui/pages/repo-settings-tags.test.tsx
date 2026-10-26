@@ -486,7 +486,7 @@ describe("the protected-tags panel DOM (tags.tmpl at the pin)", () => {
     expect(html).not.toContain("single line table");
   });
 
-  it("the nav scaffold renders the reduced menu with Tags active between Branches and Mirror", () => {
+  it("the page renders SettingsNav's reduced menu with Tags active between Branches and Mirror (the nav fold: the TagSettingsNav scaffold is deleted — wave-settingsnav-fold)", () => {
     const html = renderToString(<PageForTest />);
     expect(html).toContain('class="flex-container-nav"');
     expect(html).toContain('href="/alice/tagui9100/settings/branches"');

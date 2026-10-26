@@ -238,7 +238,9 @@ describe("wave-15 parser families (parseUiRoute / handlesUiRoute)", () => {
     expect(parseUiRoute("/octo/hello/settings/branches/42/edit")).toBeNull();
     expect(parseUiRoute("/octo/hello/settings/branches/edit/more")).toBeNull();
     expect(parseUiRoute("/octo/hello/settings/branches/priority/extra")).toBeNull();
-    expect(parseUiRoute("/octo/hello/settings/keys")).toBeNull();
+    // Window-2d (b54f709) mounted the deploy-keys tab — the stale null
+    // updated to the claimed shape (the settingsnav-fold's disclosure).
+    expect(parseUiRoute("/octo/hello/settings/keys")).toEqual({ family: "settings-keys", owner: "octo", repo: "hello" });
   });
 });
 

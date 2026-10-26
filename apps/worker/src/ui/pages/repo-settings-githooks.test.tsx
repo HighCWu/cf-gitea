@@ -28,7 +28,6 @@ import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { Viewer } from "../viewer";
 import {
   applyRepoGitHook,
-  GitHooksSettingsNav,
   gitHooksSettingsLocale,
   loadRepoGitHookEdit,
   loadRepoGitHooks,
@@ -280,18 +279,26 @@ describe("the edit page DOM (githook_edit.tmpl at the pin)", () => {
 
 // --- the DOM (nav + ctx contract) -------------------------------------------------------
 
-describe("the nav scaffold and the ctx.repo contract", () => {
-  it("the nav renders the reduced settings items with Git Hooks active (the mount scaffolding)", () => {
-    const html = renderToString(<GitHooksSettingsNav repoLink="/alice/demo" />);
+describe("the nav and the ctx.repo contract", () => {
+  it("the pages render SettingsNav's reduced settings items with Git Hooks active (the nav fold: the GitHooksSettingsNav scaffold is deleted — wave-settingsnav-fold)", async () => {
+    // The list page's nav carries the item set; the edit page renders the
+    // same component with the same active value.
+    const data = await loadRepoGitHooks(env.REPO_PACKS, repo);
+    const html = renderToString(<ListForTest data={data} />);
     expect(html).toContain('class="flex-container-nav"');
     expect(html).toContain('href="/alice/demo/settings"');
     expect(html).toContain('href="/alice/demo/settings/collaboration"');
     expect(html).toContain('href="/alice/demo/settings/hooks"');
     expect(html).toContain('href="/alice/demo/settings/branches"');
-    // Upstream navbar.tmpl:34-38's item — after Branches, before Mirror, active.
+    // Upstream navbar.tmpl:34-38's item — the code-unit block (Branches →
+    // Tags → Git Hooks → Keys), before Mirror, active.
     expect(html).toContain('class="active item" href="/alice/demo/settings/hooks/git"');
     expect(html).toContain(`>${gitHooksSettingsLocale.githooks}</a>`);
     expect(html).toContain('href="/alice/demo/settings/mirror"');
+    const edit = await loadRepoGitHookEdit(env.REPO_PACKS, repo, "pre-receive");
+    expect(edit).not.toBeNull();
+    const editHtml = renderToString(<EditForTest data={edit} />);
+    expect(editHtml).toContain('class="active item" href="/alice/demo/settings/hooks/git"');
   });
 
   it("throws without a resolved repo (the settings pages' ctx.repo contract)", async () => {

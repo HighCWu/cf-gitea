@@ -153,11 +153,11 @@
  *                                               saved → 303; missing → 404
  *                                               shell; invalid → re-render
  *
- * Nav fold: TagSettingsNav below is MOUNT SCAFFOLDING — fold it into
- * SettingsNav (pages/settings.tsx): extend the `active` union with `"tags"`
- * and insert the item between Branches and Mirror (upstream's exact
- * position: immediately after Branches, navbar.tmpl:21-26); delete this
- * component on landing.
+ * Nav fold: DONE (wave-settingsnav-fold) — SettingsNav (pages/settings.tsx)
+ * carries `"tags"` in its `active` union and the Tags item sits immediately
+ * after Branches (upstream's exact position, navbar.tmpl:21-26); the
+ * TagSettingsNav scaffold is deleted and the page renders `SettingsNav` with
+ * `active="tags"`.
  */
 
 import { and, eq, inArray, ne } from "drizzle-orm";
@@ -177,7 +177,7 @@ import {
 import type { RepoRow, UiContext } from "../ui-context";
 import { BaseLayout, renderPage } from "../shell";
 import { loadOwnerIsOrg } from "./branch-protection";
-import { mirrorLocale, settingsLocale } from "./settings";
+import { SettingsNav } from "./settings";
 
 /** Page chrome + notes text (component-local, the settingsLocale pattern;
  *  upstream locale keys cited, cf-gitea additions marked). */
@@ -551,42 +551,6 @@ export interface TagProtectionPageData {
   saved: boolean;
 }
 
-/**
- * The settings navbar with the Tags item — MOUNT SCAFFOLDING ONLY (the
- * handoff note): the literal `SettingsNav` DOM (pages/settings.tsx) with the
- * Tags item between Branches and Mirror (upstream's exact position,
- * navbar.tmpl:21-26) and active. The other items' texts import the owner's
- * locale objects; when the index.ts window folds this into `SettingsNav`
- * (the `active` union + the item), delete this component.
- */
-export function TagSettingsNav(props: { repoLink: string }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{settingsLocale.settings}</div>
-        <a class="item" href={`${props.repoLink}/settings`}>
-          {settingsLocale.options}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/collaboration`}>
-          {settingsLocale.collaboration}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/hooks`}>
-          {settingsLocale.hooks}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/branches`}>
-          {settingsLocale.branches}
-        </a>
-        <a class="active item" href={`${props.repoLink}/settings/tags`}>
-          {tagProtectionLocale.tags}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/mirror`}>
-          {mirrorLocale.mirror_settings}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /** One allowlist names field (the dropdown multiselect's no-JS replacement —
  *  the module header). */
 function NamesField(props: { id: string; name: string; label: string; value: string }) {
@@ -612,7 +576,7 @@ export function TagProtectionPage(props: { ctx: UiContext; data: TagProtectionPa
   return (
     <BaseLayout ctx={ctx} title={tagProtectionLocale.tags} pageClass="repository settings edit">
       <div class="ui container flex-container">
-        <TagSettingsNav repoLink={repoLink} />
+        <SettingsNav repoLink={repoLink} active="tags" repo={repo} />
         <div class="flex-container-main">
           {repo.isArchived ? (
             // tags.tmpl's IsArchived arm: the warning INSTEAD of the form

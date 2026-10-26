@@ -80,12 +80,11 @@
  *
  * Route-table entries ride the shared settingsGate (anonymous 303s onto the
  * login round-trip, a signed-in non-admin 404-shells — upstream's
- * admin-only settings posture). Mount also folds the local `WikiSettingsNav`
- * below into `SettingsNav` (pages/settings.tsx): extend the `active` union
- * with `"wiki"` and add the item after Mirror (upstream renders no wiki
- * navbar item — the divergence follows the mirror item's placement rule);
- * settings.tsx is not this wave's file, so the module carries the literal
- * nav DOM with the Wiki item active until that window. Survey rows to touch
+ * admin-only settings posture). The nav fold is DONE (wave-settingsnav-fold):
+ * the local `WikiSettingsNav` is deleted and `SettingsNav`
+ * (pages/settings.tsx) carries `"wiki"` in its `active` union with the item
+ * after Mirror (upstream renders no wiki navbar item — the divergence follows
+ * the mirror item's placement rule). Survey rows to touch
  * on landing: docs/compat/ui-parity-survey.md family E (the options row's
  * reduction note lists "the mirror/archive-tint sections" as not rendered —
  * add the wiki block's residue) and the F-family wiki row's page note.
@@ -94,7 +93,7 @@
 import { loadRepoSettings, saveRepoSettings } from "../../api/services/repo-settings";
 import type { RepoRow, UiContext } from "../ui-context";
 import { BaseLayout, renderPage } from "../shell";
-import { mirrorLocale, settingsLocale } from "./settings";
+import { SettingsNav } from "./settings";
 
 /** Page chrome + notes text (component-local, the settingsLocale pattern —
  *  locale.ts is shared and not this wave's file; upstream locale keys cited,
@@ -174,44 +173,6 @@ export function renderRepoWikiSettingsPage(options: {
 }
 
 /**
- * The settings navbar with the Wiki item — MOUNT SCAFFOLDING ONLY (the
- * handoff note): the literal `SettingsNav` DOM (pages/settings.tsx) with the
- * Wiki item appended after Mirror and active. The other items' texts import
- * the owner's locale objects; when the index.ts window folds this into
- * `SettingsNav` (the `active` union + the item), delete this component.
- */
-export function WikiSettingsNav(props: { repoLink: string }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{settingsLocale.settings}</div>
-        <a class="item" href={`${props.repoLink}/settings`}>
-          {settingsLocale.options}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/collaboration`}>
-          {settingsLocale.collaboration}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/hooks`}>
-          {settingsLocale.hooks}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/branches`}>
-          {settingsLocale.branches}
-        </a>
-        <a class="item" href={`${props.repoLink}/settings/mirror`}>
-          {mirrorLocale.mirror_settings}
-        </a>
-        {/* The documented divergence: upstream has no wiki navbar item (the
-            block lives in options.tmpl) — the placement after Mirror keeps
-            the upstream relative order intact (the mirror item's rule). */}
-        <a class="active item" href={`${props.repoLink}/settings/wiki`}>
-          {wikiSettingsLocale.wiki}
-        </a>
-      </div>
-    </div>
-  );
-}
-
-/**
  * The wiki panel (§2.4.1 discriminator: `repository settings wiki` — the
  * mirror-panel divergence; upstream renders these sections inside
  * options.tmpl, whose page is `repository settings options`).
@@ -229,7 +190,7 @@ export function RepoWikiSettingsPage(props: {
   return (
     <BaseLayout ctx={ctx} title={wikiSettingsLocale.wiki} pageClass="repository settings wiki">
       <div class="ui container flex-container">
-        <WikiSettingsNav repoLink={repoLink} />
+        <SettingsNav repoLink={repoLink} active="wiki" repo={repo} />
         <div class="flex-container-main">
           {/* options.tmpl's Advanced-section wiki block (options.tmpl:319-355)
               reduced to the landed write arm: the enable checkbox form. */}

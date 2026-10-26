@@ -35,7 +35,6 @@ import {
   renderRepoWikiSettingsPage,
   RepoWikiSettingsPage,
   wikiSettingsLocale,
-  WikiSettingsNav,
 } from "./repo-settings-wiki";
 
 // --- fixtures ----------------------------------------------------------------
@@ -232,8 +231,8 @@ describe("the wiki panel DOM (options.tmpl:319-355 + 873-880 + 1046-1062 at the 
     expect(errorHtml).toContain("boom");
   });
 
-  it("the nav renders the six items with Wiki active (the mount scaffolding)", () => {
-    const html = renderToString(<WikiSettingsNav repoLink="/alice/demo" />);
+  it("the page renders SettingsNav with the Wiki item active after Mirror (the nav fold: the WikiSettingsNav scaffold is deleted — wave-settingsnav-fold)", () => {
+    const html = renderToString(<PageForTest data={{ hasWiki: true, defaultWikiBranch: "main" }} error={null} saved={false} />);
     expect(html).toContain('class="flex-container-nav"');
     expect(html).toContain('href="/alice/demo/settings"');
     expect(html).toContain('href="/alice/demo/settings/collaboration"');
