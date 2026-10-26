@@ -28,6 +28,7 @@
  */
 
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
+import { handlePushMirrorSync, isPushMirrorSyncMessage } from "../services/mirror/push-sync";
 import { handleImportTask, isImportMessage } from "./imports/pipeline";
 import { isForkMessage, runForkTask } from "./fork-task";
 import { RepoNotExistError, RepoService, type RepoRow } from "./service";
@@ -162,6 +163,19 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] mirror-sync ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    // Push-mirror outbound sync (SPEC specs/push-mirror-outbound.md §4): one
+    // message = one mirror row = one HTTPS push to the remote — the
+    // pull direction's exact claim/retry discipline.
+    if (isPushMirrorSyncMessage(message.body)) {
+      try {
+        await handlePushMirrorSync(env, { repoId: message.body.repoId, pushMirrorId: message.body.pushMirrorId });
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] push-mirror-sync ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
         message.retry();
       }
       continue;

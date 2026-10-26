@@ -8,6 +8,7 @@ import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
 import { enqueueDueMirrorSyncs } from "./services/mirror/sync";
 import { handleUserPushEvent } from "./services/webhooks-push";
+import { enqueueDuePushMirrorSyncs, enqueuePushMirrorSyncsOnCommit } from "./services/mirror/push-sync";
 import { handlesUiRoute, uiRouter } from "./ui";
 import { sessionRouter } from "./ui/session";
 import { avatarServingRouter } from "./web/avatar-serving";
@@ -40,7 +41,13 @@ const gitHttp = createDurableGit<Env>({
   authorize,
   ui: false,
   namespaces: true,
-  onPush: (event, env) => handleUserPushEvent(env, event),
+  onPush: (event, env) => {
+    // Sync-on-commit producer (SPEC specs/push-mirror-outbound.md §4.1;
+    // upstream syncPushMirrorWithSyncOnCommit, mirror_push.go:250-260) —
+    // best-effort enqueue, never fails the push (the helper catches its own).
+    void enqueuePushMirrorSyncsOnCommit(env, event.repo);
+    return handleUserPushEvent(env, event);
+  },
 });
 
 const app = new Hono<{ Bindings: Env }>();
@@ -132,6 +139,9 @@ export default {
   // handleMirrorSync).
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
     await enqueueDueMirrorSyncs(env, {});
+    // Push-mirror cadence (SPEC §4): same 30 s cron CPU shape — SELECT +
+    // enqueue only; the REPO_TASKS consumer performs the pushes.
+    await enqueueDuePushMirrorSyncs(env, {});
   },
 
   // Queue consumers: REPO_TASKS = delete purge (SPEC-0003 §2.5.5), import
