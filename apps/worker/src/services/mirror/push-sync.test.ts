@@ -52,7 +52,7 @@ import {
   handlePushMirrorSync,
   isPushMirrorSyncMessage,
 } from "./push-sync";
-import { NOOP_CTX } from "./sync";
+import { NOOP_CTX, SYNCING_SWEEP_AFTER_SEC } from "./sync";
 
 // ---------------------------------------------------------------------------
 // Byte helpers (the sync.test.ts precedent — test-file copies)
@@ -674,7 +674,14 @@ describe("push-mirror state machine (cron producer, claims, commit hook)", () =>
     await seedPushMirror("9003", "https://dest.example.com/c.git", { intervalSeconds: 600, nextSyncAt: NOW_SEC + 9999 });
     await seedPushMirror("9004", "https://dest.example.com/d.git", { intervalSeconds: 0, nextSyncAt: 0 });
     await seedPushMirror("9005", "https://dest.example.com/e.git", { intervalSeconds: 600, nextSyncAt: 0 });
-    await seedPushMirror("9006", "https://dest.example.com/f.git", { intervalSeconds: 600, nextSyncAt: 0, syncState: "syncing" });
+    // A FRESH syncing claim (stamped 1 min ago) is busy — mid-flight, the
+    // sweep must not touch it (the 9006 arm of the sweep battery below).
+    await seedPushMirror("9006", "https://dest.example.com/f.git", {
+      intervalSeconds: 600,
+      nextSyncAt: 0,
+      syncState: "syncing",
+      lastUpdateUnix: new Date((NOW_SEC - 60) * 1000),
+    });
 
     const queue = recordingQueue();
     const enqueued = await enqueueDuePushMirrorSyncs(envWithQueue(queue), { now: NOW });
@@ -745,5 +752,95 @@ describe("push-mirror state machine (cron producer, claims, commit hook)", () =>
     expect(row!.nextSyncAt).toBe(0); // interval 0 → never cron-scheduled
     expect(row!.lastError).toBe("");
     expect(tips[1]).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The stuck-syncing sweep (the sqlite-locked-2026-10-26 §4/§5.3 fix brief,
+// push half): a settle-step error or a dead consumer used to wedge a row in
+// `syncing` forever. The producer reclaims stale claims; the claim itself
+// stamps `last_update_unix` so a post-claim death leaves an ageable stamp.
+// ---------------------------------------------------------------------------
+
+describe("stuck-syncing sweep (push cron producer)", () => {
+  /** D1-only repo — the §6.6 empty-local guard settles the retried sync
+   *  before any remote fetch (no engine cell needed). */
+  async function seedSweepRepo(id: string, slug: string): Promise<void> {
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO users (id, username, username_lower, is_admin, status, created_at) VALUES (8, 'sweepowner', 'sweepowner', 0, 'active', 0)",
+    ).run();
+    await drizzle(env.DB).insert(repositories).values({
+      id,
+      storageKey: `r_${id}`,
+      ownerNamespace: "sweepowner",
+      ownerId: 8,
+      slug,
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+    });
+  }
+
+  it("stale (beyond the timeout) and stamp-less (pre-fix wedge) syncing rows are reclaimed and re-enqueued; the retry settles", async () => {
+    await seedSweepRepo("9201", "sweep-stale");
+    const staleId = await seedPushMirror("9201", "https://dest.example.com/stale.git", {
+      intervalSeconds: 600,
+      nextSyncAt: NOW_SEC - 10,
+      syncState: "syncing",
+      lastUpdateUnix: new Date((NOW_SEC - SYNCING_SWEEP_AFTER_SEC - 60) * 1000), // 1 min beyond the budget
+    });
+    await seedSweepRepo("9202", "sweep-null");
+    const nullId = await seedPushMirror("9202", "https://dest.example.com/null.git", {
+      intervalSeconds: 600,
+      nextSyncAt: NOW_SEC - 10,
+      syncState: "syncing",
+      lastUpdateUnix: null, // a claim from before the claim-stamp — cannot be mid-flight
+    });
+
+    const queue = recordingQueue();
+    const enqueued = await enqueueDuePushMirrorSyncs(envWithQueue(queue), { now: NOW });
+    expect(enqueued).toBe(2);
+    // Due-SELECT order: coalesce(last_update_unix, 0) — the stamp-less row first.
+    expect(queue.batches[0]).toEqual([
+      { kind: "push-mirror-sync", repoId: "9202", pushMirrorId: nullId },
+      { kind: "push-mirror-sync", repoId: "9201", pushMirrorId: staleId },
+    ]);
+    expect((await mirrorRow(staleId))!.syncState).toBe("queued"); // swept idle, re-claimed
+    expect((await mirrorRow(nullId))!.syncState).toBe("queued");
+
+    // The retried sync settles the row (empty local → the §6.6 skip → idle).
+    const result = await handlePushMirrorSync(env, {
+      repoId: "9201",
+      pushMirrorId: staleId,
+      fetchImpl: () => Promise.reject(new Error("NO FETCH MAY HAPPEN")),
+      now: NOW,
+    });
+    expect(result).toEqual({ ok: true, skipped: "empty-local", created: 0, updated: 0, deleted: 0 });
+    const row = await mirrorRow(staleId);
+    expect(row!.syncState).toBe("idle");
+    expect(row!.nextSyncAt).toBe(NOW_SEC + 600); // schedule advanced by the settle
+  });
+
+  it("a FRESH syncing row (claim within the timeout) is not touched; a message acks busy", async () => {
+    await seedSweepRepo("9203", "sweep-fresh");
+    const freshId = await seedPushMirror("9203", "https://dest.example.com/fresh.git", {
+      intervalSeconds: 600,
+      nextSyncAt: NOW_SEC - 10,
+      syncState: "syncing",
+      lastUpdateUnix: new Date((NOW_SEC - 60) * 1000), // claimed 1 min ago — may be mid-sync
+    });
+
+    const queue = recordingQueue();
+    expect(await enqueueDuePushMirrorSyncs(envWithQueue(queue), { now: NOW })).toBe(0);
+    expect(queue.batches).toEqual([]);
+    expect((await mirrorRow(freshId))!.syncState).toBe("syncing"); // untouched
+
+    const result = await handlePushMirrorSync(env, {
+      repoId: "9203",
+      pushMirrorId: freshId,
+      fetchImpl: () => Promise.reject(new Error("NO FETCH MAY HAPPEN")),
+      now: NOW,
+    });
+    expect(result).toEqual({ ok: false, skipped: "busy" });
   });
 });

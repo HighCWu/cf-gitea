@@ -796,12 +796,53 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
 }
 
 /**
- * The cron producer (§2.6 scheduling): SELECT due mirrors
- * (`next_sync_at <= now AND next_sync_at != 0 AND sync_state = 'idle'`,
- * oldest-synced first, LIMIT 50 — upstream MirrorsIterate + PullLimit),
- * CAS each row `idle → queued`, then `sendBatch` (≤ 100 per call). Queue
- * redelivery is safe: handleMirrorSync re-checks every state.
- * Returns the number of syncs enqueued.
+ * The stuck-syncing sweep budget: a `syncing` mirror row is reclaimed once
+ * its claim is this old. The budget is the engine's receive-lease TTL
+ * (RECEIVE_LEASE_TTL_MS = 15 min, packages/git-engine/src/control-plane.ts:330)
+ * — a live sync's receive cannot outlive it (the engine's own hard backstop
+ * rejects an expired lease), and the consuming queue invocation cannot
+ * outlive its 15-min wall (AGENTS.md queue rules), so a claim older than
+ * this proves no sync is mid-flight; a claim WITHIN it may be one, and the
+ * sweep leaves those rows alone. Named by the availability-gap diagnosis
+ * (docs/research/sqlite-locked-2026-10-26.md §4/§5.3: "~15 min (the receive
+ * lease's own TTL)"). SHARED with push-sync.ts (symmetric sweep).
+ */
+export const SYNCING_SWEEP_AFTER_SEC = 15 * 60;
+
+/**
+ * The stuck-syncing sweep, pull half (the diagnosis's producer option — the
+ * cheapest correct seam): CAS every row whose `sync_state='syncing'` AND
+ * `updated_at <= now - SYNCING_SWEEP_AFTER_SEC` back to `idle`. The pull
+ * claim stamps `updated_at` (claimMirrorRow), so while a row is `syncing`
+ * that column IS the in-state age. This is the two-step claim discipline's
+ * first half (sync.ts's CAS shape): `syncing → idle` here, and the cron
+ * producer's existing due-SELECT + `idle → queued` CAS re-enqueues the row
+ * in the SAME tick — a claimed row always had `next_sync_at` due (the claim
+ * and the sync never advance it; only a settle does). A consumer that was in
+ * fact still dying settles against 0 rows (every settle is CAS'd on
+ * `sync_state='syncing'`), and a duplicate sync is idempotent — the posture
+ * queue redelivery already relies on. Returns the rows reclaimed.
+ */
+async function sweepStaleSyncingPullRows(db: D1Database, staleBefore: Date): Promise<number> {
+  const reclaimed = await drizzle(db)
+    .update(repoMirrors)
+    .set({ syncState: "idle", updatedAt: new Date() })
+    .where(and(eq(repoMirrors.syncState, "syncing"), lte(repoMirrors.updatedAt, staleBefore)))
+    .returning({ repoId: repoMirrors.repoId })
+    .all();
+  return reclaimed.length;
+}
+
+/**
+ * The cron producer (§2.6 scheduling): first the stuck-syncing sweep (a
+ * transient error at the settle step — or a dead consumer — used to wedge a
+ * row in `syncing` forever: the claim requires `idle|queued`, the retry acks
+ * `busy`, and the due-SELECT below takes `idle` only; the sweep is the
+ * self-heal), then SELECT due mirrors (`next_sync_at <= now AND
+ * next_sync_at != 0 AND sync_state = 'idle'`, oldest-synced first, LIMIT 50
+ * — upstream MirrorsIterate + PullLimit), CAS each row `idle → queued`, then
+ * `sendBatch` (≤ 100 per call). Queue redelivery is safe: handleMirrorSync
+ * re-checks every state. Returns the number of syncs enqueued.
  */
 export async function enqueueDueMirrorSyncs(env: MirrorSyncEnv, options: { now?: Date; limit?: number } = {}): Promise<number> {
   const now = Math.floor((options.now ?? new Date()).getTime() / 1000);
@@ -810,6 +851,10 @@ export async function enqueueDueMirrorSyncs(env: MirrorSyncEnv, options: { now?:
     throw new SmartHttpError("MIRROR_SYNC_QUEUE is not bound (wrangler.jsonc — SPEC-0009 §3.3); the cron producer cannot enqueue");
   }
   const db = drizzle(env.DB);
+  // The sweep runs FIRST so a reclaimed row is due-selected and re-enqueued
+  // in the same tick.
+  const swept = await sweepStaleSyncingPullRows(env.DB, new Date((now - SYNCING_SWEEP_AFTER_SEC) * 1000));
+  if (swept > 0) console.log(`[mirror-sync] syncing-timeout sweep reclaimed ${swept} stale syncing row(s) at ${now}`);
   const due = await db
     .select({ repoId: repoMirrors.repoId })
     .from(repoMirrors)

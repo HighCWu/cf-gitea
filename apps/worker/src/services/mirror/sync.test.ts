@@ -44,7 +44,7 @@ import { getRepoLicenses } from "../repo-licenses";
 import { LICENSE_CORPUS_TEXTS } from "../license-corpus";
 import { buildHistoryPack, ensureSeededRepo, type SeedCommit } from "../../ui/testing/seed-repo";
 import { UPLOAD_PACK_ADVERTISEMENT_CT, UPLOAD_PACK_RESULT_CT, type FetchImpl } from "./gitclient";
-import { handleMirrorSync } from "./sync";
+import { SYNCING_SWEEP_AFTER_SEC, enqueueDueMirrorSyncs, handleMirrorSync } from "./sync";
 
 // ---------------------------------------------------------------------------
 // Byte fixtures (the gitclient.test.ts local helpers — deliberately not
@@ -138,6 +138,7 @@ function stubFetch(responses: Response[]): { fetchImpl: FetchImpl } {
 const SOURCE_URL = "https://src.example.com/org/repo.git";
 /** Fixed settle clock (unix seconds → 1700000100). */
 const NOW = new Date(1700000100000);
+const NOW_SEC = 1700000100;
 
 const SEED_COMMITS: SeedCommit[] = [
   {
@@ -201,6 +202,24 @@ const clearDeliveries = () => env.DB.prepare("DELETE FROM webhook_deliveries").r
 
 const repoRow = () => drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "7401")).get();
 const mirrorRow = () => drizzle(env.DB).select().from(repoMirrors).where(eq(repoMirrors.repoId, "7401")).get();
+
+/** MIRROR_SYNC_QUEUE stub — records sendBatch bodies (the push-sync.test.ts
+ *  shape; test-file copies are the precedent). */
+function recordingQueue(): Queue & { batches: unknown[][] } {
+  const metadata = { metrics: { backlogCount: 0, backlogBytes: 0 } };
+  const batches: unknown[][] = [];
+  return {
+    batches,
+    send: () => Promise.resolve({ metadata }),
+    sendBatch: (messages: MessageSendRequest[]) => {
+      batches.push(messages.map((m) => m.body));
+      return Promise.resolve({ metadata });
+    },
+    metrics: () => Promise.resolve({ backlogCount: 0, backlogBytes: 0 }),
+  };
+}
+
+const envWithQueue = (queue: Queue): Parameters<typeof enqueueDueMirrorSyncs>[0] => ({ ...env, MIRROR_SYNC_QUEUE: queue });
 
 beforeAll(async () => {
   // The full generated migration ledger (0010 included) — repo_mirrors and
@@ -680,5 +699,78 @@ describe("handleMirrorSync license settle (mirror_pull.go:406-413)", () => {
     const result = await handleMirrorSync(env, { repoId: "7401", fetchImpl, now: NOW });
     expect(result).toEqual({ ok: true, skipped: "no-changes", created: 0, updated: 0, deleted: 0 });
     expect(await getRepoLicenses(env.DB, "7401")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The stuck-syncing sweep (the sqlite-locked-2026-10-26 §4/§5.3 fix brief):
+// a settle-step error or a dead consumer used to wedge a row in `syncing`
+// forever — the claim requires `idle|queued`, the retry acks `busy`, the
+// cron SELECT takes `idle` only. The producer now reclaims stale claims.
+// ---------------------------------------------------------------------------
+
+describe("stuck-syncing sweep (pull cron producer)", () => {
+  /** Force the harness mirror row into the wedge shape: a syncing claim with
+   *  a given claim stamp and schedule (seedMirrorTarget's row is idle). */
+  const setSyncing = async (claimedAtSec: number, nextSyncAt: number) => {
+    await drizzle(env.DB)
+      .update(repoMirrors)
+      .set({ syncState: "syncing", updatedAt: new Date(claimedAtSec * 1000), nextSyncAt })
+      .where(eq(repoMirrors.repoId, "7401"));
+  };
+
+  it("a syncing row older than the timeout is reclaimed and re-enqueued in the same tick; the retried sync settles", async () => {
+    await seedMirrorTarget("sweep-stale");
+    // The wedge: claimed 1 min beyond the budget, consumer died before any
+    // settle — next_sync_at still due (claims never advance it).
+    await setSyncing(NOW_SEC - SYNCING_SWEEP_AFTER_SEC - 60, NOW_SEC - 10);
+
+    const queue = recordingQueue();
+    const enqueued = await enqueueDueMirrorSyncs(envWithQueue(queue), { now: NOW });
+    expect(enqueued).toBe(1);
+    expect(queue.batches[0]).toEqual([{ kind: "mirror-sync", repoId: "7401" }]);
+    // The two-step discipline: swept `syncing → idle`, then the producer's
+    // own due-SELECT + CAS re-claimed it `idle → queued`.
+    expect((await mirrorRow())!.syncState).toBe("queued");
+
+    // The retried sync settles the row (empty source → no-changes → idle).
+    const { fetchImpl } = stubFetch([advertResponse(v0EmptyAdvertBytes())]);
+    const result = await handleMirrorSync(env, { repoId: "7401", fetchImpl, now: NOW });
+    expect(result).toEqual({ ok: true, skipped: "no-changes", created: 0, updated: 0, deleted: 0 });
+    const row = await mirrorRow();
+    expect(row!.syncState).toBe("idle");
+    expect(row!.lastError).toBeNull();
+    expect(row!.nextSyncAt).toBe(NOW_SEC + 28800); // schedule advanced by the settle
+  });
+
+  it("a FRESH syncing row (claim within the timeout) is not touched; the producer skips it and a message acks busy", async () => {
+    await seedMirrorTarget("sweep-fresh");
+    await setSyncing(NOW_SEC - 60, NOW_SEC - 10); // claimed 1 min ago — may be mid-sync
+
+    const queue = recordingQueue();
+    expect(await enqueueDueMirrorSyncs(envWithQueue(queue), { now: NOW })).toBe(0);
+    expect(queue.batches).toEqual([]);
+    expect((await mirrorRow())!.syncState).toBe("syncing"); // untouched
+
+    // The consumer-side proof: a (redelivered) message acks busy, it may own it.
+    const result = await handleMirrorSync(env, {
+      repoId: "7401",
+      fetchImpl: () => Promise.reject(new Error("NO FETCH MAY HAPPEN")),
+      now: NOW,
+    });
+    expect(result).toEqual({ ok: false, skipped: "busy" });
+  });
+
+  it("a due QUEUED row is left for its in-flight message (the sweep reclaims syncing only)", async () => {
+    await seedMirrorTarget("sweep-queued");
+    await drizzle(env.DB)
+      .update(repoMirrors)
+      .set({ syncState: "queued", nextSyncAt: NOW_SEC - 10 })
+      .where(eq(repoMirrors.repoId, "7401"));
+
+    const queue = recordingQueue();
+    expect(await enqueueDueMirrorSyncs(envWithQueue(queue), { now: NOW })).toBe(0);
+    expect(queue.batches).toEqual([]);
+    expect((await mirrorRow())!.syncState).toBe("queued");
   });
 });

@@ -72,7 +72,7 @@
  *   },
  */
 
-import { and, eq, lte, ne, sql } from "drizzle-orm";
+import { and, eq, isNull, lte, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import type { RefsResult } from "@cf-gitea/git-engine";
@@ -102,7 +102,7 @@ import {
   planPushSync,
   pushPack,
 } from "./pushclient";
-import { NOOP_CTX, engine, mirrorAuthHeader, mirrorEgressPolicy, warmCell, type MirrorSyncEnv } from "./sync";
+import { NOOP_CTX, SYNCING_SWEEP_AFTER_SEC, engine, mirrorAuthHeader, mirrorEgressPolicy, warmCell, type MirrorSyncEnv } from "./sync";
 
 // ---------------------------------------------------------------------------
 // Queue message + options + result
@@ -189,11 +189,16 @@ async function readPushMirrorRow(db: D1Database, repoId: string, pushMirrorId: n
 }
 
 /** §4.2 step 1 — CAS `idle|queued → syncing` (0 rows = another producer's
- *  message owns the mirror). The WHERE guard is the whole lock. */
-async function claimPushMirrorRow(db: D1Database, row: PushMirrorRow): Promise<boolean> {
+ *  message owns the mirror). The WHERE guard is the whole lock. The write
+ *  stamps `last_update_unix` with the attempt START — upstream records every
+ *  attempt (mirror_push.go:110) — and that stamp is the syncing-timeout
+ *  sweep's staleness clock (the pull claim's `updated_at` shape, sync.ts):
+ *  without it a consumer death after the claim would leave no in-state age
+ *  to sweep on. */
+async function claimPushMirrorRow(db: D1Database, row: PushMirrorRow, nowSec: number): Promise<boolean> {
   const claimed = await drizzle(db)
     .update(pushMirrors)
-    .set({ syncState: "syncing" })
+    .set({ syncState: "syncing", lastUpdateUnix: new Date(nowSec * 1000) })
     .where(and(eq(pushMirrors.id, row.id), eq(pushMirrors.repoId, row.repoId), ne(pushMirrors.syncState, "syncing")))
     .returning({ id: pushMirrors.id })
     .all();
@@ -308,7 +313,7 @@ export async function handlePushMirrorSync(
     };
   }
   if (mirror === null) return { ok: false, skipped: "missing-row" };
-  if (!(await claimPushMirrorRow(env.DB, mirror))) return { ok: false, skipped: "busy" };
+  if (!(await claimPushMirrorRow(env.DB, mirror, nowSec))) return { ok: false, skipped: "busy" };
 
   const fail = async (errorText: string): Promise<PushMirrorSyncResult> => {
     await settlePushMirrorFailure(env.DB, mirror, errorText, nowSec);
@@ -419,7 +424,40 @@ export async function handlePushMirrorSync(
 // ---------------------------------------------------------------------------
 
 /**
- * The cron producer: SELECT due mirrors — `interval_seconds != 0 AND
+ * The stuck-syncing sweep, push half — the pull direction's exact shape
+ * (sweepStaleSyncingPullRows, sync.ts; budget SYNCING_SWEEP_AFTER_SEC, the
+ * receive lease's own TTL): CAS every `sync_state='syncing'` row whose claim
+ * stamp is beyond the budget back to `idle`; the cron producer's
+ * due-SELECT + `idle → queued` CAS below re-enqueues cron-due rows in the
+ * SAME tick (a commit-hook-only row — interval 0, `next_sync_at` 0 — stays
+ * idle until its next trigger, which is that lane's producer). Rows claimed
+ * before the claim-stamp landed (a pre-deploy wedge: `syncing` with NULL
+ * `last_update_unix`) are reclaimed unconditionally — under claim-stamping
+ * code such a row cannot be mid-flight. The reclaim leaves
+ * `last_update_unix` alone: the dead attempt's stamp is the diagnostic, and
+ * a sweep is not an attempt (§4.4 settles stamp it). Returns the rows
+ * reclaimed.
+ */
+async function sweepStaleSyncingPushRows(db: D1Database, staleBefore: Date): Promise<number> {
+  const reclaimed = await drizzle(db)
+    .update(pushMirrors)
+    .set({ syncState: "idle" })
+    .where(
+      and(
+        eq(pushMirrors.syncState, "syncing"),
+        or(isNull(pushMirrors.lastUpdateUnix), lte(pushMirrors.lastUpdateUnix, staleBefore)),
+      ),
+    )
+    .returning({ id: pushMirrors.id })
+    .all();
+  return reclaimed.length;
+}
+
+/**
+ * The cron producer: first the stuck-syncing sweep (the availability-gap fix
+ * brief — docs/research/sqlite-locked-2026-10-26.md §4/§5.3: a settle-step
+ * error or a dead consumer used to wedge a row in `syncing` forever), then
+ * SELECT due mirrors — `interval_seconds != 0 AND
  * next_sync_at <= now AND sync_state = 'idle'`, archived repos excluded by
  * the join, oldest-synced first, LIMIT 50 — upstream PushMirrorsIterate's
  * WHERE/ORDER/LIMIT shape (pushmirror.go:147-160). Rows never synced yet
@@ -441,6 +479,10 @@ export async function enqueueDuePushMirrorSyncs(
     throw new SmartHttpError("MIRROR_SYNC_QUEUE is not bound (wrangler.jsonc); the push-mirror cron producer cannot enqueue");
   }
   const db = drizzle(env.DB);
+  // The sweep runs FIRST so a reclaimed row is due-selected and re-enqueued
+  // in the same tick.
+  const swept = await sweepStaleSyncingPushRows(env.DB, new Date((now - SYNCING_SWEEP_AFTER_SEC) * 1000));
+  if (swept > 0) console.log(`[push-mirror-sync] syncing-timeout sweep reclaimed ${swept} stale syncing row(s) at ${now}`);
   const due = await db
     .select({ id: pushMirrors.id, repoId: pushMirrors.repoId })
     .from(pushMirrors)
