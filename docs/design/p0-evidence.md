@@ -2539,3 +2539,200 @@ avoid minting twice.
 
 *(REDEPLOY17, evidence appended by the redeploy-verification agent; all
 numbers verbatim from this run's commands.)*
+
+## Redeploy verification — 2026-10-26 12:19–13:22 UTC (20:19–21:22 CST), tree-view's first production window + the repo-projects wave + the ?raw deploy incident (REDEPLOY18)
+
+THREE live versions this window — the GO deploy, a production incident it carried, and
+the fix-forward: previous live `b928537a-02e8-486a-8f4d-f3b2c25cb354` (REDEPLOY17) →
+**`a842cfd8-bf31-4396-8f45-350ddc83b226`** (100%, created 2026-10-26T13:01:30.338Z, at
+tree `52a1f52`) → **`abfbf291-355a-44ac-92f2-bac76bece1a1`** (100%, created
+2026-10-26T13:15:31.037Z, at tree `981c098` — CURRENT LIVE), on
+https://cf-gitea.hecongw.workers.dev. Content shipped, `7cd1ce9..981c098`, 13 commits:
+831709f (**tree-view envelope — its FIRST production window, and the window that found
+the deploy-path incident below**), 58c6cf0 (page-domain Set-Cookie re-wrap), 7a5861e +
+4f59daa + bff7fdc (docs ticks/notes), 96cb9d4 (the REDEPLOY17 evidence), 0db7087
+(**blob-excerpt machinery — mechanism-only, NO routes mounted this window; no
+production surface exists to probe, noted as such per the GO**) + 3502ee4
+(**lastcommit fragment — same mechanism-only posture**) + 7d4c19a (**the toolkit
+all-battery failure tails — armed, silent on green, below**), ae32b1a (**repo-scoped
+projects — the GO originally excluded it as in-flight; it landed mid-window and the
+re-GO carried it**), 4ed30cc + 52a1f52 + 981c098 (**the wrangler Text-rule arc — the
+deploy-path incident, below**). 4ed30cc NEVER deployed (its bundle failed at the
+loader — nothing uploaded, production stayed on a842cfd8); the live lineage is
+b928537a → a842cfd8 → abfbf291. Assets rebuilt both deploys: same pin `fc4936884584`
+(submodule verified unchanged, 0 dirty files).
+
+**THE INCIDENT — tree-view's first window found a deploy-tooling gap that four green
+vitest runs could never see.** The a842cfd8 GO deploy bundled clean (the 52a1f52 rule
+`{"type":"Text","globs":["**/*.svg?raw"]}` fixed 4ed30cc's loader error) but EVERY
+`GET /{owner}/{repo}/tree-view/…` answered **500 "Internal Server Error"** (text/plain,
+21 bytes) to the cookie-authenticated owner — on the full fixture tree AND on a
+minimal one-blob tree; anonymous correctly 404s (no existence leak). `wrangler tail`
+caught the exception on exactly the three probed envelope URLs:
+`SyntaxError: "[object Object]" is not valid JSON`. Root cause: `fileicon.ts:197-198`
+imports `material-icon-rules.json?raw` + `material-icon-svgs.json?raw` (461,498 +
+998,898 bytes — the ws1009 `?raw` workaround) and `JSON.parse`s them (:208-209). Vite's
+`?raw` returns the raw STRING (all 976 ui tests green in every run); wrangler's esbuild
+ignores the `?raw` query, its BUILT-IN `.json` loader returns the already-PARSED
+OBJECT, and `JSON.parse(object)` throws on every envelope request (the dynamic fileicon
+edge loads before assembly; the throw is caught upstream of the isolate — tail outcome
+"ok", HTTP 500). The `.svg?raw` family needed the explicit Text rule because esbuild
+has NO default svg loader; the `.json?raw` family slipped through bundling because the
+json loader EXISTS — with the wrong semantics for the `?raw` contract. **The lesson,
+now recorded in the stanza comment: vite-native affordances (`?raw`) are invisible to
+wrangler's esbuild — a `?raw` import needs an explicit `Text` rule whose glob carries
+the query, and `?json` + `?raw` silently inverts to parsed-object under esbuild's
+default loader.** The incident lived 13:01:30 → 13:15:31 UTC (~14 min). The fix
+(981c098): `"globs": ["**/*.svg?raw", "**/*.json?raw"]`.
+
+Deploy-tree methodology (REDEPLOY10–17 detached-worktree pattern): worktree at each
+GO commit (moved forward 96cb9d4 → 7d4c19a → 52a1f52 → 981c098 by checkout; one
+install, warm store), `git submodule update --init` (pin `fc4936884584` verified),
+`pnpm gen:icons` (39 icons, 15883 bytes), the scratch asset build
+(`build-gitea-assets.mjs --work /tmp/gitea-assets-build-rd18 --skip-install`, 17M)
+BEFORE the vitest gate, `.dev.vars` copied 0600. The main working tree was never
+modified by this agent (its sole write is this evidence block); worktree verified
+0-tracked-dirty immediately before each `wrangler deploy`. Scratch dry-run bundles
+(`--dry-run --outdir`, throwaway config copies, deleted after) proved every stanza
+variant BEFORE asking for the commit: `**/*.svg` + fallthrough does NOT match (the
+4ed30cc form failed from this worktree where the author's main-tree dry-run hadn't);
+`**/*.svg?raw`, `**/*.svg*`, `**/*.svg**` bundle clean; the landed `**/*.json?raw`
+extension bundles clean at 6996.25 KiB / gzip 1434.73 KiB (52a1f52 tree) — the
+proper-install worktree was the authority both times.
+
+Deploy gates — at 981c098 (final tree): `pnpm typecheck` **0 errors**; `check:api`
+**PASS** (declared **490** ops/298 paths, tier-1 **78/78 paths, 129/129 ops**);
+`check:contract` **PASS** (sha256 `529a3314…`, verbatim — identical to
+REDEPLOY14–17's pin). Same verdicts re-verified at 96cb9d4, 7d4c19a, 4ed30cc and
+52a1f52 along the way. Vitest: the box carried sibling-wave load the whole window
+(loadavg up to ~12, 27/31 GB used) and FOUR full runs hit the load-flake class —
+every failure a 30 s timeout (pull-engine fork-head arms = the documented class,
+invariants eviction, lifecycle rename-back, goldens/wave6/wave7/users/issue-events/
+webhooks/misc-t3 harness hooks) plus `vitest-pool: Worker cloudflare-pool emitted
+error` infra crashes that ATE 3 files' results in the best run. Disjoint failure sets
+every time; isolation adjudications all green: 89/89 + 114/114 + 76/76 + 79/79. The
+best single run (7d4c19a): **3537 passed | 5 skipped (3542), 0 failed, files 164
+passed | 1 skipped (168), 98.87 s** — exit 1 from 3 pool-crash victims only
+(users/issue-events/a11y), which then passed 76/76 in isolation. Composite: every
+suite file green somewhere, zero product-code failures, zero adjudications against
+the diff. The run of record is the composite (the suite never got a quiet box).
+
+Remote migrations: **ledger unchanged — zero diff `7cd1ce9..981c098` in
+`src/db/migrations/`** (verified per-GO); explicit `wrangler d1 migrations apply
+--remote` at a842cfd8: **"✅ No migrations to apply!" (33/33)**; smoke's
+migrate-check independently confirms the remote schema (below).
+
+`pnpm smoke` (deploy-smoke.mjs, run PAT as Basic password): at a842cfd8 with
+`--migrate-check` — **6 pass / 0 fail / 1 skip, exit 0** (`healthz {"ok":true}`;
+anon-git-surface 404/401 shapes; receive-advert 165 B; push-lsremote pushed `3eeb83c052…`
+with the anonymous advert 401; cleanup 204; migrate-check all 19 expected tables
++48 system/aux). Re-run at abfbf291 — **4 pass / 0 fail / 2 skip, exit 0** (schema
+unchanged by a config commit; migrate-check not re-requested).
+
+**THE TOOLKIT'S FOURTH PRODUCTION RUN — `all` (7 batteries) at a842cfd8: 65 checks,
+64 pass, the ONE red an order-of-operations artifact adjudicated below** (the final
+audit counted this run's still-alive PAT: `tokens=2 (expected 1)`). The PAT-identity
+preflight passed silently. Mint-per-run PAT in a 0600 file, extracted BEFORE the mint
+log was shredded (the REDEPLOY17 lesson, applied cleanly — `^\s+cfg_[0-9a-f]{8}_[A-Z2-7]{32}$`
+line anchor, 45-char shape verified). Battery-by-battery:
+
+- **p0** (`--fixture-oid 502abd2d…`) — 4/4: shallow-since/exclude exit 128 naming
+  'deepen-since'/'deepen-not'; depth-1 clone `.git/shallow = 502abd2d55…` fsck clean;
+  privacy-anon API 404 + info/refs 401 Basic + web 404.
+- **registry** (`--trials 3`) — 18/18: three full tombstone lifecycles, each rename
+  carry + **t+0 `repository not found`** + old name dead on both paths.
+- **generate-e2e** — 10/10 first-try: template push (main + dev at `8d235319b8…`) →
+  PATCH 200 persisted → generate 201 `"empty":false` → carried refs identical tip →
+  LICENSE round-trips; `[info] gen-generated-clone — clone SUCCEEDED` (run without
+  `--strict`, so informational; the issue stays fixed-shaped, as REDEPLOY17 saw).
+- **forkpr-e2e** — 8/8: org fork 202, fork push `prbr-094f5778` at `8060f36f1a…`,
+  PR #1 from `prorg-…:prbr-…`, head chain mergeable true with `head.ref refs/pull/1/head`;
+  fork→base→org cleanup all 204.
+- **mirror** — 8/8 first-try (fourth consecutive): loopback 401 "Permission denied"
+  at the door; `.invalid` row 200 fresh-wire; sync 200; settle **1293 ms** naming the
+  530 shape; `sync_state='idle'`, `next_sync_at=0`; delete 204, list [].
+- **ui-login** — 5/5: anon 0 "New Label" → 303 + cookie → owner renders 3 + small-menu-items.
+- **cleanup-audit** — 9/10 in-run (`tokens=2`), then **10/10 after the PAT delete**:
+  `owner_repos=1 creating=0 action=0 stars=0 push_mirrors=0 protected_branches=0
+  repo_redirects=0 user_blocking=0 tokens=1`.
+
+**THE 7d4c19a TAILS — armed, silent, and that is the honest first production posture.**
+All-battery self-sweeps (registry rename-aware re-pointing, forkpr fork→base→org
+order, ui-login) no-op'd on green runs — zero `[tail]` lines, zero `[skip]` chains,
+zero leftovers for the audit to find. No `--force-red` rehearsals this window (the
+incident consumed the rehearsal budget; the knob's production proof stands from
+REDEPLOY17 and the new tails carry its exact mechanism).
+
+**THE HAND SPOT — tree-view envelope's closing proof at abfbf291 (verbatim from the
+probe).** Private fixture `spot-rd18-b1be2f55` (auto_init) + pushed tree: directory
+`pkg/` containing `x&y.txt`, `top.txt`, gitlink `submod` (cacheinfo 160000, no
+.gitmodules), symlink `link-to-dir` → `pkg`. `POST /login` → 303 + `gitea_session`.
+`GET /{owner}/{repo}/tree-view/branch/main` with ONLY the cookie →
+- **200** (the 500s gone), **4027 bytes**, `content-type: application/json;charset=utf-8`,
+  `cache-control: max-age=0, private, must-revalidate`;
+- **sorted-key + escaped JSON byte-proven**: the envelope opens
+  `{"fileTreeNodes":[{"entryName":"pkg","entryMode":"tree","entryIcon":"\u003csvg
+  viewBox=\"0 0 16 16\" class=\"svg octicon-file-directory-fill\"…` — Go sorted-map key
+  order ('f' < 'r'), `<` as `\u003c`, `"` as `\"` (the goJsonString port, not
+  JSON.stringify);
+- **the svg-mfi pool**: full fixture `[svg-mfi-document, svg-mfi-folder-git,
+  svg-mfi-readme]` — 3 members, all `svg-mfi-*`, emitted in SORTED order; minimal repo
+  `[svg-mfi-readme]`; the basic octicons stay INLINE (never pool members), exactly the
+  module contract;
+- **node arms**: `pkg` tree with `entryIconOpen` set; `top.txt`/`README.md` blob;
+  `submod` entryMode **commit** with `submoduleUrl` omitted (unresolvable, upstream's
+  omitempty arm); `link-to-dir` symlink with NO open icon;
+- **`?sub_path=pkg` descends**: `children [x&y.txt]`;
+- **latency, honestly**: first request **891 ms** (the dynamic fileicon edge's first
+  production load in a cold isolate) vs warm **479 ms, byte-identical** — the dynamic
+  chunk cost lands on the first request only;
+- anonymous → **404** (the fixture stays private).
+
+**THE SECOND HAND SPOT — repo-projects (ae32b1a) first production traffic.** Probe
+repo → `PATCH {"has_projects":true}` → 200 (the fresh-repo default is DISABLED —
+the unit toggle's first production exercise) → anonymous `/{owner}/{repo}/projects`
+**404** (disabled-unit/no-leak) → API project create **201** → the projects TAB
+(cookie) **200 listing the board title** → board `/projects/{id}` (cookie) **200**.
+Column verdict, adjudicated against the submodule: a template-less API create renders
+an EMPTY board and that is UPSTREAM-EXACT (`models/project/column.go:95`
+createDefaultColumnsForProject returns nil for TemplateTypeNone — upstream seeds
+columns only for bug-triage/basic-kanban); the STRONGER arm then proved the seeding
+port: `template_type:"basic_kanban"` → board renders **To Do / In Progress / Done**
+(upstream `setting.Project.ProjectBoardBasicKanbanType`). The wave's writer pages
+(create/edit forms) and the workflow tails stay unprobed (time went to the incident).
+
+Cleanup proof: every battery self-cleaned (registry tombs through their own DELETEs;
+generate/forkpr/ui/mirror/smoke repos 204). Spot repos all deleted 204
+(`spot-rd18-*` ×3 fixture generations, `spot-rd18p-*` ×3, bisect `rd18a/b/c-*`,
+`spot-rd18k-*`, `spot-rd18v-*`). Per-run credential: ONE token minted (id 40,
+prefix-scrubbed from every log), deleted by id via Basic-auth token CRUD → **204**,
+survivor check **401**; final whole-table `personal_access_tokens` = **1** (the
+standing bootstrap PAT) proven by the closing audit alongside `owner_repos=1`
+(p0-shallow), `creating=0`, `action=0`, `stars=0`, `push_mirrors=0`. Worktree,
+scratch asset dir, dry-run outdir, probe scripts, and all logs shredded; `gitea/`
+pristine (0 dirty files, pin `fc4936884584`); main tree untouched except this block.
+
+**OPEN ISSUES carried + NEW:**
+
+1. **NEW (medium — observability, no probe impact observed): 16
+   `database table is locked: SQLITE_LOCKED` exception records** in this window's
+   wrangler tail, with NO request record attached (unattributed to any URL). Every
+   probed surface passed; suspects are cron (*/10) overlapping probe pushes or D1
+   write contention between concurrent requests. Needs a dedicated look: are these
+   surfacing as user-visible 5xx anywhere?
+2. **NEW (process, closed-by-convention): the ?raw deploy lesson** — recorded in the
+   wrangler.jsonc stanza comment and above; any future `?raw` import (or any new
+   module type riding the entry graph) needs its Text-rule glob and a WORKTREE
+   `wrangler deploy --dry-run` before the commit lands — main-tree dry-runs with a
+   divergent node_modules proved non-authoritative twice this window.
+3. Carried unchanged: the repo payload `fork`/`parent`/`mirror` serializer stubs; the
+   bare `owner:branch` PR head form with a renamed fork answers 404 (documented
+   divergence); API tag create answers 200 where upstream answers 201.
+4. Unprobed this window (in-flight, not regressions): repo-projects writer forms +
+   workflow tails; blob-excerpt/lastcommit route mounts (mechanism-only this window).
+
+The ws1009 runner-death class stayed at 0 in every full run (the pool errors were
+workerd socket deaths at the pool layer, not the 1009 graph-snapshot signature).
+
+*(REDEPLOY18, evidence appended by the redeploy-verification agent; all numbers
+verbatim from this run's commands.)*
