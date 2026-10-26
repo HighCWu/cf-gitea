@@ -114,7 +114,11 @@ beforeEach(async () => {
     ownerId: 1,
     slug: "rel",
     visibility: "public",
-    refsVersion: 1, // non-empty: the create gate is refs_version > 0
+    // Non-empty repo: the create gate is is_empty (the settle-maintained
+    // column — refs_version is observability-only and never synced, the
+    // REDEPLOY14 finding that closed d24dc0f).
+    refsVersion: 1,
+    isEmpty: false,
     backend: "self-hosted",
     createdAt: new Date("2026-02-03T04:05:06Z"),
   });
@@ -126,6 +130,7 @@ beforeEach(async () => {
     slug: "empty",
     visibility: "public",
     refsVersion: 0,
+    isEmpty: true,
     backend: "self-hosted",
     createdAt: new Date("2026-02-03T04:05:06Z"),
   });
@@ -357,6 +362,7 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
       slug: "other",
       visibility: "public",
       refsVersion: 1,
+      isEmpty: false,
       backend: "self-hosted",
       createdAt: new Date(),
     });
