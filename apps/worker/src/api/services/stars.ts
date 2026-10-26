@@ -169,30 +169,30 @@ export async function clearRepoStars(d1: D1Database, repoId: string): Promise<vo
 }
 
 /**
- * `GetStarredRepos` (models/repo/user_repo.go:34–66) for the doer-self list:
- * stars ⨝ repositories, upstream's `` `repository`.id `` ordering (our text id
- * sorts numerically via CAST — the listUserRepositories convention), with the
- * IncludePrivate visibility gate collapsed to the landed ACL matrix
+ * `GetStarredRepos` (models/repo/user_repo.go:34–66) for both starred lists
+ * (GET /user/starred and GET /users/{username}/starred): stars ⨝ repositories,
+ * upstream's `` `repository`.id `` ordering (our text id sorts numerically via
+ * CAST — the listUserRepositories convention), with the IncludePrivate
+ * visibility gate collapsed to the landed ACL matrix
  * (services/repository.ts visibilityConditions): a still-accessible private
  * repo is the doer's own (or the doer is an admin); everything else public.
  * Repos whose access was revoked after starring drop out — upstream's
  * AccessibleRepositoryCondition arm (star metadata does not leak).
  *
- * The total is the FILTERED count. Upstream sets the pagination headers from
- * `ctx.Doer.NumStars` — the RAW counter (star.go:85-86/117-118; now modeled
- * as users.num_stars, migration 0031), so upstream's total can exceed the
- * listed page after an access revocation. The filtered count stays the total
- * here — with the column landed the raw counter is available (and the repo
- * delete's per-stargazer decrement, delete.go:133, now lands in the same
- * batch as the edges' delete), but the filtered number is still the honest
- * page arithmetic (documented divergence, observable only in the
- * revoked-access edge).
+ * The pagination TOTAL is not computed here: upstream renders the loaded
+ * user's RAW counter — `ctx.Doer.NumStars` (star.go:117-118, GET
+ * /user/starred) / `ctx.ContextUser.NumStars` (star.go:85-86, GET
+ * /users/{username}/starred) — for BOTH the Link and X-Total-Count headers,
+ * so the route renders the user row it already resolved (`users.num_stars`,
+ * migration 0031 — kept in step by the star/unstar batches, the block
+ * cascade, the private-clear and the repo-delete decrement). The body stays
+ * visibility-filtered exactly like upstream's.
  */
 export async function listStarredRepositories(
   d1: D1Database,
   userId: number,
   options: { doerLoginLower: string; isAdmin: boolean } & StarListOptions,
-): Promise<{ items: RepositoryWithOwner[]; total: number }> {
+): Promise<RepositoryWithOwner[]> {
   const db = drizzle(d1);
   // Same predicate as visibilityConditions(viewer, includePrivate=true) for a
   // signed-in non-admin doer; the admin arm drops the filter entirely.
@@ -203,13 +203,7 @@ export async function listStarredRepositories(
         or(eq(repositories.visibility, "public"), eq(repositories.ownerNamespace, options.doerLoginLower)),
       );
 
-  const totalRow = await db
-    .select({ total: sql<number>`count(*)` })
-    .from(stars)
-    .innerJoin(repositories, eq(repositories.id, stars.repoId))
-    .where(where)
-    .get();
-  const items = await db
+  const rows = await db
     .select({ repo: repositories, owner: users })
     .from(stars)
     .innerJoin(repositories, eq(repositories.id, stars.repoId))
@@ -218,7 +212,7 @@ export async function listStarredRepositories(
     .orderBy(sql`CAST(${repositories.id} AS INTEGER) ASC`)
     .limit(options.pageSize)
     .offset((options.page - 1) * options.pageSize);
-  return { items, total: totalRow?.total ?? 0 };
+  return rows;
 }
 
 /** Repo-scoped star delete (the api repoDelete path's housekeeping; the

@@ -138,13 +138,19 @@ export function registerStarredRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     const doer = c.get("authUser");
     const row = await findStarredDoerRow(c.env.DB, doer.id);
     const listOptions = parseListOptions(new URL(c.req.url));
-    const { items, total } = await listStarredRepositories(c.env.DB, row.id, {
+    const items = await listStarredRepositories(c.env.DB, row.id, {
       doerLoginLower: row.usernameLower,
       isAdmin: row.isAdmin,
       page: listOptions.page,
       pageSize: listOptions.limit,
     });
-    setPaginationHeaders(c, total, listOptions);
+    // Upstream renders the loaded doer's RAW counter for BOTH pagination
+    // headers (star.go:117-118 — SetLinkHeader + SetTotalCountHeader over
+    // ctx.Doer.NumStars); our column is users.num_stars (migration 0031),
+    // kept in step by the star/unstar batches, the block cascade, the
+    // private-clear and the repo-delete decrement. The body stays
+    // visibility-filtered exactly like upstream's.
+    setPaginationHeaders(c, row.numStars, listOptions);
     const viewer = viewerOf(c);
     return c.json(items.map((pair) => toApiRepository(viewer, pair)), 200);
   });
@@ -185,17 +191,22 @@ export function registerStarredRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
 
 /** The stars store keys on the D1 user id — a resolved token without a row is
  *  the silent-auth-failure convention (the api middlewares' class). The admin
- *  flag comes from the row, not the projection. */
+ *  flag comes from the row, not the projection; numStars is the RAW
+ *  users.num_stars column (migration 0031) — the starred listing renders it
+ *  for both pagination headers, upstream's loaded `ctx.Doer.NumStars` field
+ *  (star.go:117-118). */
 async function findStarredDoerRow(d1: D1Database, doerId: number | undefined) {
   if (doerId === undefined) {
     throw new ApiError(401, "token is required");
   }
   const row = await d1
-    .prepare("SELECT id, username_lower AS usernameLower, is_admin AS isAdmin FROM users WHERE id = ?1")
+    .prepare(
+      "SELECT id, username_lower AS usernameLower, is_admin AS isAdmin, num_stars AS numStars FROM users WHERE id = ?1",
+    )
     .bind(doerId)
-    .first<{ id: number; usernameLower: string; isAdmin: number }>();
+    .first<{ id: number; usernameLower: string; isAdmin: number; numStars: number }>();
   if (row === null) {
     throw new ApiError(401, "token is required");
   }
-  return { id: row.id, usernameLower: row.usernameLower, isAdmin: row.isAdmin === 1 };
+  return { id: row.id, usernameLower: row.usernameLower, isAdmin: row.isAdmin === 1, numStars: row.numStars };
 }

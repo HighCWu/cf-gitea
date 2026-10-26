@@ -222,13 +222,18 @@ export function registerSocialT2Routes(
     }
     const doer = await requireDoerRow(c.env.DB, c.get("authUser"));
     const listOptions = parseListOptions(new URL(c.req.url));
-    const { items, total } = await listStarredRepositories(c.env.DB, target.id, {
+    const items = await listStarredRepositories(c.env.DB, target.id, {
       doerLoginLower: doer.usernameLower,
       isAdmin: doer.isAdmin,
       page: listOptions.page,
       pageSize: listOptions.limit,
     });
-    setPaginationHeaders(c, total, listOptions);
+    // Upstream renders the TARGET user's RAW counter for BOTH pagination
+    // headers (star.go:85-86 — SetLinkHeader + SetTotalCountHeader over
+    // ctx.ContextUser.NumStars, NOT the doer's and not a live count); the
+    // findUserByName row carries the same users.num_stars column (migration
+    // 0031). The body stays visibility-filtered exactly like upstream's.
+    setPaginationHeaders(c, target.numStars, listOptions);
     const viewer = viewerOf(c);
     return c.json(items.map((pair) => toApiRepository(viewer, pair)), 200);
   });

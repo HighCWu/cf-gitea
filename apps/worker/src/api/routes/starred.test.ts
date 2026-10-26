@@ -19,12 +19,13 @@ import { eq } from "drizzle-orm";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { repositories, stars, userBlocking, users } from "../../db/schema";
-import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
+import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { findRepositoryByPath, toApiRepository } from "../services/repository";
 import { toApiUser } from "../services/user";
+import { registerSocialT2Routes } from "./social-t2";
 import { registerStarredRoutes } from "./starred";
 
 const ERROR_URL = "https://example.com/api/swagger";
@@ -366,5 +367,129 @@ describe("users.num_stars maintenance (migration 0031)", () => {
     if (row === undefined) throw new Error("user seed failed");
     const rendered = toApiUser({ origin: "https://example.com", requester: null }, row);
     expect(rendered.starred_repos_count).toBe(1);
+  });
+});
+
+/**
+ * GET /user/starred's pagination TOTAL — upstream renders the loaded doer's
+ * RAW counter for BOTH headers (star.go:117-118 — SetLinkHeader +
+ * SetTotalCountHeader over `ctx.Doer.NumStars`), not a live count over the
+ * star table. Ours is the maintained `users.num_stars` column (migration
+ * 0031). Red→green: the pre-refactor total was the FILTERED count from
+ * listStarredRepositories, which diverges from the column exactly where an
+ * edge's counter sits at the pre-0031 backfill 0 — upstream renders the
+ * stored field there too (a total below the listed page).
+ */
+describe("GET /user/starred: the total is the raw users.num_stars (star.go:117-118)", () => {
+  /** The recluse-owned public pair the list paginates over. */
+  async function seedListFixture(): Promise<{ doerId: number }> {
+    const owner = await seedUser("recluse");
+    const doer = await seedUser("stargazer");
+    for (const id of ["7301", "7302"]) {
+      await drizzle(env.DB).insert(repositories).values({
+        id,
+        storageKey: `r_${id}`,
+        ownerNamespace: "recluse",
+        ownerId: owner.id,
+        slug: `source-${id}`,
+        visibility: "public",
+        refsVersion: 1,
+        backend: "self-hosted",
+        createdAt: new Date("2026-02-03T04:05:06Z"),
+      });
+    }
+    return { doerId: doer.id };
+  }
+
+  const putStar = (doerId: number, slug: string) =>
+    makeApp()(`/user/starred/recluse/${slug}`, { method: "PUT", headers: { Authorization: `token u${doerId}` } });
+
+  const listStarred = (doerId: number) =>
+    makeApp()("/user/starred", { headers: { Authorization: `token u${doerId}` } });
+
+  it("star 2 repos → unstar one → the header total follows the maintained column (2 → 1)", async () => {
+    const { doerId } = await seedListFixture();
+    await putStar(doerId, "source-7301");
+    await putStar(doerId, "source-7302");
+    const first = await listStarred(doerId);
+    expect(first.status).toBe(200);
+    expect(first.headers.get("X-Total-Count")).toBe("2");
+
+    await makeApp()("/user/starred/recluse/source-7301", {
+      method: "DELETE",
+      headers: { Authorization: `token u${doerId}` },
+    });
+    const res = await listStarred(doerId);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Total-Count")).toBe("1");
+    const body: Array<Record<string, unknown>> = await res.json();
+    expect(body.map((entry) => entry.name)).toEqual(["source-7302"]);
+  });
+
+  it("the header is the STORED column, not a live count — a seeded edge beneath the backfilled 0 counter renders total 0 beside a listed page (upstream renders the loaded NumStars field)", async () => {
+    const { doerId } = await seedListFixture();
+    // The migration-0031 backfill shape: the edge exists, the counter sits at
+    // the ALTER default 0 (seeded directly, bypassing the star route arms).
+    await drizzle(env.DB).insert(stars).values({ userId: doerId, repoId: "7302", createdAt: new Date() });
+    const res = await listStarred(doerId);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Total-Count")).toBe("0"); // the column, verbatim
+    const body: Array<Record<string, unknown>> = await res.json();
+    expect(body).toHaveLength(1); // the body stays the filtered page, like upstream's
+  });
+});
+
+/**
+ * GET /users/{username}/starred's pagination TOTAL — upstream anchors it on
+ * the TARGET user's RAW counter (star.go:85-86 over `ctx.ContextUser.NumStars`)
+ * while the body's visibility anchor stays the DOER. Ours renders the
+ * findUserByName row's `users.num_stars` column. Mounted here additively — the
+ * route lives in routes/social-t2.ts; its family harness (tier2-extras.test.ts)
+ * is sibling territory.
+ */
+describe("GET /users/{username}/starred: the total is the TARGET's raw users.num_stars (star.go:85-86)", () => {
+  const socialSend = (() => {
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerSocialT2Routes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    return async (path: string, init?: RequestInit): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, init), env);
+  })();
+
+  /** recluse owns the public repo; stargazer is the doer; neighbor the target. */
+  async function seedTargetFixture(): Promise<{ doerId: number }> {
+    const owner = await seedUser("recluse");
+    const doer = await seedUser("stargazer");
+    await seedUser("neighbor");
+    await drizzle(env.DB).insert(repositories).values({
+      id: "7302",
+      storageKey: "r_7302",
+      ownerNamespace: "recluse",
+      ownerId: owner.id,
+      slug: "source",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    return { doerId: doer.id };
+  }
+
+  it("the total is the named user's stored counter — not the doer's and not a live count (star.go:85-86 over ContextUser.NumStars)", async () => {
+    const { doerId } = await seedTargetFixture();
+    // The TARGET's edge is seeded beneath the backfilled 0 counter; the DOER
+    // separately stars the same repo through the route arm (doer counter → 1).
+    const neighbor = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "neighbor")).get();
+    if (neighbor === undefined) throw new Error("user seed failed");
+    await drizzle(env.DB).insert(stars).values({ userId: neighbor.id, repoId: "7302", createdAt: new Date() });
+    await makeApp()("/user/starred/recluse/source", { method: "PUT", headers: { Authorization: `token u${doerId}` } });
+
+    const res = await socialSend("/users/neighbor/starred", {
+      headers: { Authorization: `token u${doerId}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Total-Count")).toBe("0"); // neighbor's column, not the doer's 1
+    const body: Array<Record<string, unknown>> = await res.json();
+    expect(body.map((entry) => entry.name)).toEqual(["source"]); // the filtered page, doer visibility
   });
 });
