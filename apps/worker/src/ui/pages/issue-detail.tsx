@@ -1034,6 +1034,11 @@ function CommentFormBlock(props: {
   const family = issue.isPull ? "pulls" : "issues";
   const action = `${props.repoLink}/${family}/${issue.index}/comments`;
 
+  // view_content.tmpl:114-133: the ARCHIVE message serves BOTH viewer kinds
+  // (the sign-in warning is the non-archived arm) — archive checks first.
+  if (repo.isArchived) {
+    return <div class="ui warning message tw-text-center">{issue.isPull ? issueDetailLocale.archive_pull_nocomment : issueDetailLocale.archive_issue_nocomment}</div>;
+  }
   if (ctx.viewer.kind === "anonymous") {
     return (
       <div class="ui warning message">
@@ -1042,11 +1047,13 @@ function CommentFormBlock(props: {
       </div>
     );
   }
-  if (repo.isArchived) {
-    return <div class="ui warning message tw-text-center">{issue.isPull ? issueDetailLocale.archive_pull_nocomment : issueDetailLocale.archive_issue_nocomment}</div>;
-  }
   if (issue.isLocked && !access.canChangeState) {
-    return <div class="ui warning message">{issueDetailLocale.comment_on_locked}</div>;
+    // view_content.tmpl's else-if chain renders NOTHING for locked
+    // non-writers on the plain GET (parity); the locked POST refusal
+    // surfaces here as the re-rendered message (issue.go:80-92's flash —
+    // the issueCommentSubmit 200+message convention).
+    if (props.form.error === null) return null;
+    return <div class="ui warning message">{props.form.error}</div>;
   }
 
   // The status button branch order and icon/color pairs are view_content.tmpl:88-107
@@ -1146,8 +1153,11 @@ export function IssueDetailPage(props: {
   if (repo === undefined) throw new Error("IssueDetailPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const showMergeBox = data.pr !== null && !data.issue.isClosed && !data.pr.hasMerged;
-  const showForm =
-    ctx.viewer.kind === "user" && !repo.isArchived && (!data.issue.isLocked || props.access.canChangeState);
+  // The comment block renders for EVERY viewer kind — its own arms carry
+  // the archived/locked/anonymous refusals (view_content.tmpl's ladder);
+  // gating the whole block here made those arms unreachable dead UI (the
+  // issue-detail matrix's RED).
+  const showForm = true;
   // Wave-11: the review verdict form — signed-in, non-archived PRs only
   // (the header's auth posture; upstream's diff-page combobox reduced).
   const showReviewForm =
@@ -1177,7 +1187,7 @@ export function IssueDetailPage(props: {
               )}
               <div class="timeline-item tw-hidden" id="timeline-comments-end" />
               {showMergeBox ? <PullMergeBox data={data} /> : null}
-              {showForm || ctx.viewer.kind === "anonymous" ? (
+              {showForm ? (
                 <CommentFormBlock ctx={ctx} repoLink={repoLink} data={data} access={props.access} form={props.form} />
               ) : null}
               {showReviewForm ? (
