@@ -29,6 +29,12 @@
  * In-process callers without a queue binding leave the rows `pending` — the
  * durable source of truth.
  *
+ * ACTIVITY-FEED HOOK (specs/activity-feeds.md): both emitters additionally
+ * record the upstream `action` rows this family produces (create_repo for
+ * created/forked repos, rename_repo with the old name) through the shared
+ * recordAction fan-out — same caught-and-logged posture, awaited inline so
+ * tests and readers see the rows when the response lands.
+ *
  * Upstream shapes (submodule pin fc4936884584):
  *   - RepositoryPayload (modules/structs/hook.go:566): action
  *     created|deleted|renamed (HookRepoAction, :557-562 — there is NO
@@ -41,6 +47,7 @@
  */
 
 import { apiUserFromRow, toApiRepository, type RepositoryWithOwner, type Viewer } from "../api/services/repository";
+import { ActionType, recordAction, type ActionDraft } from "../api/services/activity-feeds";
 import type { WebhookDeliveryMessage } from "../webhooks/consumer";
 import { emitWebhookDeliveries, type HookEventType } from "../issues/webhooks";
 
@@ -88,6 +95,79 @@ function webhookDeliveryQueue(env: Env): {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+// ---------------------------------------------------------------------------
+// Activity-feed hook (specs/activity-feeds.md §3.2/§3.3): the repo-family
+// actions upstream's actionNotifier writes (services/feed/notifier.go).
+// CreateRepository/ForkRepository → ActionCreateRepo (:181-205 — a fork IS a
+// create_repo action upstream), RenameRepository → ActionRenameRepo with the
+// old name as content (:153-165). Deletion writes NO action upstream and
+// neither here; every other eventType in this family (push, create/delete
+// refs, release, ...) is DEFERRED — those emitters live outside this module
+// (git-http push path, releases.ts) and their matrix rows stay unwired.
+// ---------------------------------------------------------------------------
+
+/** Structural read of one rendered §2.7 payload field (payload is `unknown`). */
+function payloadRecord(payload: unknown): Record<string, unknown> | null {
+  return typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : null;
+}
+
+function payloadNumber(record: Record<string, unknown> | null, key: string): number | undefined {
+  const value = record?.[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function payloadString(record: Record<string, unknown> | null, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * The repo-family action draft for one emission, or null when the event
+ * carries no upstream action. Fields derive from the rendered payload:
+ * act_user = sender.id, is_private = repository.private, old name =
+ * changes.name.from (the renamed action's content, notifier.go:161).
+ */
+export function repoActionDraft(emission: RepoEventEmission): ActionDraft | null {
+  const payload = payloadRecord(emission.payload);
+  if (payload === null) return null;
+  const actUserId = payloadNumber(payloadRecord(payload.sender), "id");
+  if (actUserId === undefined) return null;
+  const isPrivate = payloadRecord(payload.repository)?.private === true;
+
+  if (emission.eventType === "fork") {
+    return { actUserId, repoId: emission.repoId, opType: ActionType.CreateRepo, isPrivate };
+  }
+  if (emission.eventType === "repository") {
+    if (payload.action === "created") {
+      return { actUserId, repoId: emission.repoId, opType: ActionType.CreateRepo, isPrivate };
+    }
+    if (payload.action === "renamed") {
+      return {
+        actUserId,
+        repoId: emission.repoId,
+        opType: ActionType.RenameRepo,
+        isPrivate,
+        // The old name (upstream content = oldRepoName, notifier.go:161;
+        // the webhook's changes.name.from carries it).
+        content: payloadString(payloadRecord(payloadRecord(payload.changes)?.name), "from"),
+      };
+    }
+  }
+  return null;
+}
+
+/** Best-effort action-row write — caught, logged, never propagated (the
+ *  webhook fan-out posture; a lost insert is a feed gap, not an API error). */
+async function recordRepoAction(env: Env, emission: RepoEventEmission): Promise<void> {
+  const draft = repoActionDraft(emission);
+  if (draft === null) return;
+  try {
+    await recordAction(env.DB, draft);
+  } catch (error) {
+    console.error(`[repo-events] action row failed (${emission.eventType}): ${errorMessage(error)}`);
+  }
 }
 
 async function fanOut(
@@ -141,6 +221,7 @@ export async function emitRepoEvent(request: RepoEventRequest, emission: RepoEve
       : undefined,
     "repo-events",
   );
+  await recordRepoAction(request.env, emission);
 }
 
 /**
@@ -159,6 +240,7 @@ export async function emitRepoEventInline(env: Env, emission: RepoEventEmission)
       : undefined,
     "repo-events",
   );
+  await recordRepoAction(env, emission);
 }
 
 /**

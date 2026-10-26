@@ -34,11 +34,20 @@
  * stays the low-level delivery-row writer (§3.5 mechanics over a bare
  * D1Database); this module is the issue-family payload + emission layer over
  * it.
+ *
+ * ACTIVITY-FEED HOOK (specs/activity-feeds.md): emitIssueEvent additionally
+ * records the upstream `action` rows this family produces (create_issue,
+ * close/reopen_issue, comment_issue/comment_pull,
+ * approve/reject_pull_request) through the shared recordAction fan-out —
+ * same caught-and-logged posture, awaited inline so tests and readers see
+ * the rows when the response lands. The UI session path rides along (it
+ * funnels through emitIssueEvent).
  */
 
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
+import { ActionType, recordAction, type ActionDraft } from "../api/services/activity-feeds";
 import { toApiIssue } from "../api/services/issues";
 import {
   apiUserFromRow,
@@ -99,6 +108,136 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// ---------------------------------------------------------------------------
+// Activity-feed hook (specs/activity-feeds.md §3.2/§3.3): the issue-family
+// actions upstream's actionNotifier writes (services/feed/notifier.go):
+// NewIssue → create_issue with "index|title" (:41-63), IssueChangeStatus →
+// close/reopen with "index|" (:66-97), CreateIssueComment → comment_issue /
+// comment_pull with "index|excerpt" (:99-124), a submitted review →
+// approve/reject_pull_request / comment_pull with "index|content"
+// (:207-275). Everything else in the family (label/milestone/assign/
+// review-request webhooks, comment edits/deletes) writes NO action upstream
+// and none here; the PR-lifecycle events (open/close/reopen/merge) flow
+// through routes/pulls.ts' LOCAL emitPullWebhook seam, outside this module —
+// those matrix rows stay DEFERRED (SPEC §3.3).
+// ---------------------------------------------------------------------------
+
+/** Structural read of one rendered §2.7 payload field (payload is `unknown`). */
+function payloadRecord(payload: unknown): Record<string, unknown> | null {
+  return typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : null;
+}
+
+function payloadNumber(record: Record<string, unknown> | null, key: string): number | undefined {
+  const value = record?.[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function payloadString(record: Record<string, unknown> | null, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * The issue-family action draft for one emission, or null when the event
+ * carries no upstream action. Issue-vs-PR discrimination follows the
+ * payload's `issue.pull_request` meta (the API Issue renders it for PRs
+ * only). Comment excerpts ship as the raw API body — upstream flattens
+ * through markdown.FeedExcerpt, the documented SPEC divergence.
+ */
+export function issueActionDraft(emission: IssueEventEmission): ActionDraft | null {
+  const payload = payloadRecord(emission.payload);
+  if (payload === null) return null;
+  const actUserId = payloadNumber(payloadRecord(payload.sender), "id");
+  if (actUserId === undefined) return null;
+  const isPrivate = payloadRecord(payload.repository)?.private === true;
+  const issue = payloadRecord(payload.issue);
+  const issueNumber = payloadNumber(issue, "number");
+
+  switch (emission.eventType) {
+    case "issues": {
+      if (issueNumber === undefined) return null;
+      const title = payloadString(issue, "title") ?? "";
+      const isPull = payloadRecord(issue?.pull_request) !== null;
+      switch (payload.action) {
+        case "opened":
+          return {
+            actUserId,
+            repoId: emission.repoId,
+            opType: isPull ? ActionType.CreatePullRequest : ActionType.CreateIssue,
+            isPrivate,
+            content: `${issueNumber}|${title}`,
+          };
+        case "closed":
+          return {
+            actUserId,
+            repoId: emission.repoId,
+            opType: isPull ? ActionType.ClosePullRequest : ActionType.CloseIssue,
+            isPrivate,
+            content: `${issueNumber}|`,
+          };
+        case "reopened":
+          return {
+            actUserId,
+            repoId: emission.repoId,
+            opType: isPull ? ActionType.ReopenPullRequest : ActionType.ReopenIssue,
+            isPrivate,
+            content: `${issueNumber}|`,
+          };
+        default:
+          return null;
+      }
+    }
+    case "issue_comment":
+    case "pull_request_comment": {
+      // Upstream actions fire on comment CREATE only (no notifier for
+      // edited/deleted).
+      if (payload.action !== "created" || issueNumber === undefined) return null;
+      const comment = payloadRecord(payload.comment);
+      const commentId = payloadNumber(comment, "id");
+      if (commentId === undefined) return null;
+      return {
+        actUserId,
+        repoId: emission.repoId,
+        opType: emission.eventType === "issue_comment" ? ActionType.CommentIssue : ActionType.CommentPull,
+        isPrivate,
+        content: `${issueNumber}|${payloadString(comment, "body") ?? ""}`,
+        commentId,
+      };
+    }
+    case "pull_request_review_approved":
+    case "pull_request_review_rejected":
+    case "pull_request_review_comment": {
+      const number = payloadNumber(payload, "number");
+      if (number === undefined) return null;
+      const body = payloadString(payloadRecord(payload.review), "content") ?? "";
+      // Upstream skips the comment-review action when the body is blank
+      // (notifier.go:244-246); approve/reject always fire.
+      if (emission.eventType === "pull_request_review_comment" && body.trim() === "") return null;
+      const opType =
+        emission.eventType === "pull_request_review_approved"
+          ? ActionType.ApprovePullRequest
+          : emission.eventType === "pull_request_review_rejected"
+            ? ActionType.RejectPullRequest
+            : ActionType.CommentPull;
+      return { actUserId, repoId: emission.repoId, opType, isPrivate, content: `${number}|${body}` };
+    }
+    default:
+      return null;
+  }
+}
+
+/** Best-effort action-row write — caught, logged, never propagated (the
+ *  webhook fan-out posture; a lost insert is a feed gap, not an API error). */
+async function recordIssueAction(env: Env, emission: IssueEventEmission): Promise<void> {
+  const draft = issueActionDraft(emission);
+  if (draft === null) return;
+  try {
+    await recordAction(env.DB, draft);
+  } catch (error) {
+    console.error(`[issues] action row failed (${emission.eventType}): ${errorMessage(error)}`);
+  }
+}
+
 /**
  * Fire one issue-family webhook event. The delivery-row insert is AWAITED
  * inline (request-visible, the hooks.ts fireTestDelivery precedent — upstream
@@ -134,6 +273,7 @@ export async function emitIssueEvent(request: IssueEventRequest, emission: Issue
   } catch (error) {
     console.error(`[issues] webhook fan-out failed (${emission.eventType}): ${errorMessage(error)}`);
   }
+  await recordIssueAction(request.env, emission);
 }
 
 /**
