@@ -905,3 +905,184 @@ production was unaffected (healthz 200 immediately on recovery) and the
 affected verifications were re-run to completion after recovery. One probe
 command's first push failed on a shell quoting bug (literal quotes in the
 URL → `remote: not found`); re-run with a clean URL — no production effect.
+
+## Redeploy verification — 2026-10-26 00:01 UTC (08:01 CST), same-deployment-state block (wave-22 series)
+
+Deploy shipped as ONE version: **`5835d8ab-d65a-4824-a239-7d53c01f8627`** (100%,
+Created 2026-10-26T00:01:29Z), deployed from tree **`fc123b0` CLEAN**, on
+https://cf-gitea.hecongw.workers.dev. Previous live version:
+`193cecc7-2b58-475a-9e90-0b28773b2159` (the 2026-10-25 block's v2). Content
+shipped (declared **385→434** ops / 267 paths): the wave-22 migrations series —
+blocks (0022 `user_blocking`, 8 ops), push-mirrors (0023 `push_mirrors`, 5 ops),
+projects×4 tables (0024 `projects`/`project_columns`/`project_issues`/
+`project_workflows`), tag-protections (0025 `protected_tags`, 5 ops) — the wiki
+family (6 ops, table-free, d3362b1), the **P1 registry rename/delete fix
+5e2c418**, git-hooks (4 ops, 12ab90d) and projects-repo stage 1 (21 ops,
+0d5b480+fc123b0). Assets rebuilt: **784 files, 14 MB** (same pin
+`fc4936884584`). Omissions (recorded honestly, per the window protocol): the
+oauth2-apps / badges / repo-licenses+generate-repo / blocks-enforcement waves
+were IN FLIGHT at GO time — their files were UNCOMMITTED and therefore NOT in
+the deploy tree.
+
+Deploy-tree methodology (new for this run, recorded for the landing review):
+the shared working tree at GO carried 4 in-flight siblings' uncommitted hunks
+(653 insertions across 13 tracked files + 17 untracked) which `vite build`
+would have bundled; since the GO named commit `fc123b0`, the deploy ran from a
+detached **`git worktree add`** at exactly that commit — warm
+`pnpm install --frozen-lockfile` (230 ms), the prebuilt asset dir copied in
+(pin unchanged), `git submodule update --init` inside the worktree (same pin;
+the main checkout's submodule untouched, verified pristine after), and
+`pnpm gen:icons` (gitignored generated file a fresh worktree lacks). The
+worktree (including its copied gitignored `.dev.vars`) was shredded and
+removed after the run; the main working tree was never modified by this agent.
+
+Deploy gates — at `fc123b0` (worktree): `pnpm typecheck` **0 errors**;
+`check-openapi` **PASS** (declared **434** ops/267 paths ⊆ contract 554 ops/350
+paths, tier-1 **78/78 paths, 129/129 ops**); `check-contract` **PASS**
+(sha256 `529a3314…`); vitest run of record `--maxWorkers=8`: **2951 passed |
+5 skipped (2956), 130 files passed + 1 skipped (131), 0 failed**. First full
+run at this tree had 7 fails in 4 files, adjudicated per file (none is a code
+regression): `invariants.test.ts` ×3 and `pages-wave7.test.ts` (beforeAll hook
+timeout) are the known 8-worker saturation load-flakes and pass solo;
+`index.test.ts` ×2 + `push-create.test.ts` ×1 asserted 401/200 but got 403 —
+traced to the FRESH WORKTREE lacking the gitignored `.dev.vars` (no
+`GIT_TOKEN` → the engine's static-token arm answers its fail-closed 403,
+`src/git-http/authorize.ts:51`); with `.dev.vars` present all 4 files pass
+solo (97/97) and the full suite re-ran green as recorded above. Gates at
+window-open HEAD `51d3c74` (with the projects sibling's untracked files
+present): typecheck 0, check-openapi PASS (409 ops/254 paths), contract PASS,
+vitest 2926 passed | 3 failed — all 3 in that sibling's own untracked
+`projects-repo.test.ts` (its known 3 reds, fixed at its landing 0d5b480,
+"26/26"); every committed file passed.
+
+Remote migrations immediately before deploy: **0022_panoramic_bloodstorm,
+0023_fresh_captain_america, 0024_past_gressill, 0025_young_nico_minoru** — all
+✅; ledger after: "✅ No migrations to apply!" (25/25); `user_blocking`,
+`push_mirrors`, `protected_tags`, `projects`, `project_columns`,
+`project_issues`, `project_workflows` all verified in remote `sqlite_master`.
+No seed rows in these migrations.
+
+`pnpm smoke` equivalent (deploy-smoke.mjs, fresh mint-per-run PAT via 0600
+temp file, `--user p0probe`, with `--migrate-check`): **6 pass / 0 fail /
+1 skip** (bench-report not requested), `ok: true`. Verbatim key lines:
+`[pass] healthz — {"ok":true}`; `[pass] anon-git-surface —
+probe-1a7d6632/probe-b3b6a034.git: git-upload-pack 404 not-found,
+git-receive-pack 401 Basic challenge`; `[pass] receive-advert — advert ok
+(165 bytes)`; `[pass] push-lsremote — pushed 8cccb109f8…, authed ls-remote
+sees refs/heads/main, anonymous advert 401 Basic challenge`; `[pass] cleanup —
+repo p0probe/smoke-102b5ba6 deleted`; `[pass] migrate-check — all 19 expected
+tables present (+43 system/aux: … deploy_keys, action_variables, secrets,
+user_blocking, push_mirrors, project_columns, project_issues,
+project_workflows, projects, protected_tags)` — the 0022-0025 tables verbatim.
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`; results
+**unchanged** vs all prior tables):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1`; `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean |
+
+`p0probe/p0-shallow` remains live intentionally; anonymous GET answers **404**
+and anonymous `info/refs` answers **401 Basic challenge**
+(`www-authenticate: Basic realm="Gitea"`), re-verified this run.
+
+**Registry rename/delete RE-PROBE (the headline — production proof of the P1
+fix 5e2c418).** Three full lifecycles (A/B/C), all repos PUBLIC, all
+ls-remotes anonymous:
+
+- **Repo A** (`reg10a-a94529`): `POST /api/v1/user/repos`
+  `{"private":false,"auto_init":true}` → **201** in 2.6 s (default `main`);
+  IMMEDIATE anonymous ls-remote → **exit 0, lists HEAD + refs/heads/main**
+  (`103a2ab2dc70…` — create half still holds). Pushed a second ref
+  `refs/heads/second` (`e9db9a604c3e…`). `PATCH` rename → **200**
+  (`full_name":"p0probe/reg10a-a94529-r2"`); **IMMEDIATE anonymous ls-remote
+  on the NEW name lists ALL THREE — HEAD, main, second: THE CARRY IS
+  VERIFIED** (pre-fix this advert was empty; REDEPLOY9's symptom 1 closed in
+  production). API `/branches` → `main` + `second` (non-empty).
+  **Old-name post-rename behavior, recorded verbatim**: `/api/v1/repos/
+  p0probe/reg10a-a94529` → **404**, web page → **404**, but anonymous
+  `ls-remote` on the OLD name → git prints `warning: 重定向到
+  …/p0probe/reg10a-a94529-r2.git/` and lists the same refs (exit 0) — the
+  `repo_redirects` row resolves the old name as an HTTP redirect on the git
+  path (the fix's documented choice: upstream files repo_redirects too and
+  renames the directory in place; cf-gitea redirects rather than serves in
+  place — the §2.5.3 row-13 divergence already on record; the API/web 404 on
+  the old name is the divergence to note for the registry owner). `DELETE
+  /api/v1/repos/p0probe/reg10a-a94529-r2` → **204**; IMMEDIATE anonymous
+  ls-remote on the OLD name → **128 `repository not found`** ✓, on the NEW
+  name → **still listed all three refs (exit 0)** — see open issue below;
+  API GET + page on the new name → **404/404**. Minutes later the new name
+  answers **128 not-found** — the queue consumer's backstop purge healed it.
+- **Repo B** (`reg10b-a94529`, engine-level DELETE on a renamed repo — the
+  REDEPLOY9 finding that the engine DELETE 404'd renamed repos): create 201 →
+  pushed `refs/heads/eng` → rename → **`DELETE /p0probe/reg10b-a94529-r2`
+  (no /api/v1, Basic auth) → 200 "deleted"** (renamed repo now resolves on
+  the engine cleanup path) → IMMEDIATE anonymous ls-remote on the new name
+  **128 not-found** ✓ AND on the old name **128 not-found** ✓ — both names
+  dead at t+0.
+- **Repo C** (`reg10c-cf0186`, reproduction with `wrangler tail` attached,
+  delete fired immediately after rename): create 201 → push `refs/heads/tail`
+  → rename 200 → API DELETE 204 → IMMEDIATE anonymous ls-remote on the new
+  name → **128 not-found** ✓. Tail shows the delete's Registry `remove` ×N,
+  RepoCell `markDeleted` ×N and later `destroy` ×N, every event
+  `"outcome":"ok"`, `"exceptions":[]`, no `[repos]` error lines.
+
+**New-surface spot probes (light, one pass each).** Blocks: `GET
+/user/blocks/{tgt}` → 404 (unblocked), `PUT` → **204**, `GET` → **204**
+(blocked), `GET /user/blocks` lists the target, `DELETE` → **204**, `GET` →
+**404** (unblocked) — exact upstream codes; the throwaway target user was
+created via `POST /admin/users` (201) and purged after (`DELETE
+/admin/users/{u}?purge=true` → 204). Tag protections: `POST
+…/tag_protections` `{"name_pattern":"v*","whitelist_usernames":["admin"]}` →
+created (`"id":1`), then `POST /tags {"tag_name":"v1"}` as the non-whitelisted
+owner → **422 `{"message":"user not allowed to create protected tag"}`**
+(verbatim upstream text); DELETE protection → 204. Push mirrors: `POST
+…/push_mirrors` → **200** (`remote_name":"remote_mirror_UIzTiGAEqM"`), LIST
+shows it, GET by name **200**, DELETE **204**, LIST after → 0. Wiki: `POST
+…/wiki/new` → **201** (WikiPage JSON with title/sub_url/content_base64), page
+read `…/wiki/page/Home` → **200** (also with `.md`), list `GET
+…/wiki/pages` → **200** with `last_commit` metadata, missing page → **404**
+(anon 404 arm holds); a first-probe read 404'd at t+0 and read fine at t+5 s
+(the §2.5.2 settle window, same class as pushes). Cosmetic observation, not
+investigated: a dash-heavy page title rendered an `html_url` slug with a
+trailing `.-` (`probe22-000df3.-`).
+
+Cleanup proof (API-verified + remote D1): probe/smoke/wiki repos DELETEd →
+**204** across the board (smoke repo by the harness); `repositories WHERE
+owner_namespace='p0probe'` = **1** (`p0-shallow`, intentionally live);
+`reg10%/spot22%/smoke-%/wikiprobe%` = **0**; `repo_redirects` total = **0**
+(every rename's redirect row cascaded with its repo); `users LIKE
+'p0blocktgt%'` = **0**. Per-run credential: PAT prefix `cfg_0552e6f2` DELETEd
+by prefix+user (changes = 1); `personal_access_tokens` joined to p0probe =
+**0 rows**; whole-table count = **1** (the standing `admin` bootstrap PAT,
+pre-existing). Credential temp files (0600 PAT file + mint stdout/stderr +
+probe clones + the worktree's copied `.dev.vars`, all shredded) removed; grep
+for the token shape after = no matches.
+
+Environment footnotes (recorded honestly): (1) the local SNI/DNS interference
+from the previous window recurred and FLAPPED — `workers.dev` resolved to
+non-Cloudflare IPs (`31.13.112.9`, `…face:b00c…`) in three windows
+00:02-00:06 UTC; production was unaffected (200s between windows; the deploy
+itself landed clean at 00:01) — smoke attempts 1-2 failed on local `fetch
+failed` and attempt 3 ran to full pass once three consecutive healthz 200s
+confirmed a stable window. (2) One probe-script bug (unquoted space in the
+`http.extraHeader` value → git usage exit 129) aborted the first P0 probe
+run locally before any request; fixed and re-run — no production effect.
+(3) The first wiki list probe used the wrong path (`/wiki` — the endpoint is
+`/wiki/pages`, matching upstream); probe bug, not product.
+
+**OPEN ISSUE (carried, narrowed — for the registry-series owner): the
+API-delete path still has a nonzero read-after-delete window on a RENAMED
+repo's NEW name.** Observed once (repo A): anonymous ls-remote seconds after
+the 204 still served all refs; the same lifecycle was clean at t+0 in two
+other runs (B engine-path, C API-path under `wrangler tail` with every
+registry/cell RPC `outcome:"ok"`), and A's stale entry self-healed via the
+queue consumer's backstop purge minutes later. Versus REDEPLOY9 (48 s+
+serving): narrowed to a transient, self-healing window. The tombstone
+(`markDeleted`) IS awaited before the 204, so a remaining suspect is a stale
+read replica on the advert path; suggested next fix: make reads treat a
+tombstoned cell as deleted (or double-check D1 existence) so no replica
+window can serve. The rename CARRY half and the engine-level DELETE path are
+closed in production (A step 5; B step 3).
