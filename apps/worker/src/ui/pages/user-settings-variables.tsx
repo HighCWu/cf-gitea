@@ -61,10 +61,10 @@
  * encoding), the same authorization shape as the landed user-scope API ops
  * (`/user/actions/variables/*`).
  *
- * Upstream's settings navbar (user/settings/navbar.tmpl) reduces to the
- * landed items — Profile, Security (the security module), Secrets (the
- * secrets sibling) and this tab under the Actions disclosure (navbar.tmpl
- * order: secrets before variables, :50-54) — the dead-link rule.
+ * Upstream's settings navbar (user/settings/navbar.tmpl) is the SHARED
+ * components/settings-nav UserSettingsNavbar (the wave-114 swap) with the
+ * Actions disclosure open and the Variables sub-item active (navbar.tmpl
+ * order: secrets before variables, :50-54).
  *
  * ## Data (§3.2 — the LANDED 0021 store + the secrets-variables service)
  *
@@ -178,6 +178,7 @@ import {
   type VariableRow,
 } from "../../api/services/secrets-variables";
 import { actionVariables } from "../../db/schema";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 
@@ -187,12 +188,7 @@ import type { UiContext } from "../ui-context";
 // ---------------------------------------------------------------------------
 
 export const userSettingsVariablesLocale = {
-  settings: "User Settings", // "user.settings" (the navbar header)
-  profile: "Profile", // "settings.profile"
-  security: "Security", // "settings.security"
-  actions: "Actions", // "actions.actions" (the navbar disclosure)
-  secrets: "Secrets", // "secrets.secrets" (the landed sibling tab)
-  variables: "Variables", // "actions.variables" (the Title — upstream ctx.Data["Title"], variables.go:84 — + the navbar sub-item)
+  variables: "Variables", // "actions.variables" (the Title — upstream ctx.Data["Title"], variables.go:84 — + the shared navbar's sub-item)
   variables_management: "Variables Management", // "actions.variables.management"
   add_variable: "Add Variable", // "actions.variables.creation"
   edit_variable: "Edit Variable", // "actions.variables.edit"
@@ -395,37 +391,11 @@ export function formatVariableDate(date: Date): string {
   return `${months[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()}`;
 }
 
-/** The settings navbar (user/settings/navbar.tmpl reduced to the landed
- *  items — the module header). `active` marks this tab; the Actions
- *  disclosure opens while the variables sub-item is active (navbar.tmpl:41's
- *  PageIsSharedSettingsVariables arm); the landed Secrets tab renders before
- *  it (navbar.tmpl order :50-54). */
-export function UserSettingsVariablesNav(props: { active: "profile" | "security" | "secrets" | "variables" }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{userSettingsVariablesLocale.settings}</div>
-        <a class={props.active === "profile" ? "active item" : "item"} href="/user/settings">
-          {userSettingsVariablesLocale.profile}
-        </a>
-        <a class={props.active === "security" ? "active item" : "item"} href="/user/settings/security">
-          {userSettingsVariablesLocale.security}
-        </a>
-        <details class="item" open={props.active === "secrets" || props.active === "variables" ? true : undefined}>
-          <summary>{userSettingsVariablesLocale.actions}</summary>
-          <div class="menu">
-            <a class={props.active === "secrets" ? "active item" : "item"} href="/user/settings/actions/secrets">
-              {userSettingsVariablesLocale.secrets}
-            </a>
-            <a class={props.active === "variables" ? "active item" : "item"} href="/user/settings/actions/variables">
-              {userSettingsVariablesLocale.variables}
-            </a>
-          </div>
-        </details>
-      </div>
-    </div>
-  );
-}
+/** The settings navbar: the SHARED components/settings-nav UserSettingsNavbar
+ *  (the wave-114 swap — the local Profile/Security/Actions copy deleted; the
+ *  disclosure opens while the variables sub-item is active, navbar.tmpl:41's
+ *  PageIsSharedSettingsVariables arm; the landed Secrets tab renders before
+ *  it). */
 
 /** The shared name/value/description fields (the upstream dialog's three
  *  field divs, variable_list.tmpl:74-102 — rendered twice: the inline add
@@ -541,7 +511,7 @@ export function UserSettingsVariablesPage(props: { ctx: UiContext; data: UserSet
   return (
     <BaseLayout ctx={props.ctx} title={userSettingsVariablesLocale.variables} pageClass="user settings actions">
       <div class="ui container flex-container">
-        <UserSettingsVariablesNav active="variables" />
+        <UserSettingsNavbar active="variables" />
         <div class="flex-container-main">
           <div class="user-setting-content">
             {/* shared/variables/variable_list.tmpl:1-64 */}

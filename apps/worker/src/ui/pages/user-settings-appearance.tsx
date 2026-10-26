@@ -129,6 +129,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { loadUserSettings, saveUserSettings } from "../../api/services/user-settings";
 import { users } from "../../db/schema";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 
@@ -138,14 +139,7 @@ import type { UiContext } from "../ui-context";
 // ---------------------------------------------------------------------------
 
 export const userSettingsAppearanceLocale = {
-  settings: "User Settings", // "user.settings" (the navbar header)
-  profile: "Profile", // "settings.profile"
-  appearance: "Appearance", // "settings.appearance" (the Title + navbar item)
-  security: "Security", // "settings.security"
-  applications: "Applications", // "settings.applications"
-  ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys"
-  actions: "Actions", // "actions.actions" (the navbar disclosure)
-  secrets: "Secrets", // "secrets.secrets" (the disclosure's live sub-item)
+  appearance: "Appearance", // "settings.appearance" (the Title + the shared navbar item)
   manage_themes: "Select default theme", // "settings.manage_themes"
   theme_desc: "This will be your default theme across the site.", // "settings.theme_desc"
   theme_colorblindness_prompt:
@@ -324,47 +318,9 @@ export async function applyUserSettingsAppearanceLanguageForm(d1: D1Database, us
  *  line (the keys-module `kind` convention). */
 export type AppearancePageError = { form: "theme" | "language"; message: string };
 
-/** The settings navbar (user/settings/navbar.tmpl reduced to the landed tab
- *  modules, in navbar.tmpl's order — the dead-link rule; every other
- *  upstream item — Account/Notifications/Blocked users/Audit/Actions
- *  sub-items/Packages/Hooks/Organization/Repos — has no landed module).
- *  Exported for the tests; the sibling settings modules carry their own
- *  copies (the private-Nav convention). */
-export function UserSettingsAppearanceNav(props: { active: "profile" | "appearance" | "security" | "applications" | "keys" | "secrets" }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{userSettingsAppearanceLocale.settings}</div>
-        <a class={props.active === "profile" ? "active item" : "item"} href="/user/settings">
-          {userSettingsAppearanceLocale.profile}
-        </a>
-        <a class={props.active === "appearance" ? "active item" : "item"} href="/user/settings/appearance">
-          {userSettingsAppearanceLocale.appearance}
-        </a>
-        <a class={props.active === "security" ? "active item" : "item"} href="/user/settings/security">
-          {userSettingsAppearanceLocale.security}
-        </a>
-        <a class={props.active === "applications" ? "active item" : "item"} href="/user/settings/applications">
-          {userSettingsAppearanceLocale.applications}
-        </a>
-        <a class={props.active === "keys" ? "active item" : "item"} href="/user/settings/keys">
-          {userSettingsAppearanceLocale.ssh_gpg_keys}
-        </a>
-        {/* navbar.tmpl's Actions <details class="item"> — open while one of
-            its sub-items is the active page; Secrets is the only landed
-            sub-item (the dead-link rule). */}
-        <details class="item" open={props.active === "secrets" ? true : undefined}>
-          <summary>{userSettingsAppearanceLocale.actions}</summary>
-          <div class="menu">
-            <a class={props.active === "secrets" ? "active item" : "item"} href="/user/settings/actions/secrets">
-              {userSettingsAppearanceLocale.secrets}
-            </a>
-          </div>
-        </details>
-      </div>
-    </div>
-  );
-}
+/** The settings navbar: the SHARED components/settings-nav UserSettingsNavbar
+ *  (the wave-114 swap — the local six-item copy deleted; the shared
+ *  component carries the whole landed family in navbar.tmpl's order). */
 
 /** The full-document render (the render.tsx pattern). `error` carries the
  *  failed POST's outcome (null on the plain GET). */
@@ -386,7 +342,7 @@ export function UserSettingsAppearancePage(props: { ctx: UiContext; data: UserSe
   return (
     <BaseLayout ctx={ctx} title={userSettingsAppearanceLocale.appearance} pageClass="user settings">
       <div class="ui container flex-container">
-        <UserSettingsAppearanceNav active="appearance" />
+        <UserSettingsNavbar active="appearance" />
         <div class="flex-container-main">
           <div class="user-setting-content">
             {/* ------------------------------------------------ Theme (appearance.tmpl:4-36) */}

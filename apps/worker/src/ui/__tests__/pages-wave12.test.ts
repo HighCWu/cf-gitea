@@ -441,10 +441,15 @@ describe("GET+POST /user/settings (the signed-in profile form)", () => {
     expect(html).toContain('id="keep_email_private" name="keep_email_private" type="checkbox"');
     expect(html).not.toContain('id="keep_email_private" name="keep_email_private" type="checkbox" checked');
     // NO credential surfaces (the module header): no password/token fields,
-    // no Account/Security/Applications navbar items.
+    // no security/applications write arms. STALE-PIN UPDATE (wave-114 nav
+    // swap): the page's single-Profile-item navbar was deleted for the
+    // shared UserSettingsNavbar, whose Security/Applications ITEMS are live
+    // links — the old label negatives inverted into the arms the page still
+    // must not carry (no credential form targets, only the navbar's hrefs).
     expect(html.toLowerCase()).not.toContain('type="password"');
-    expect(html).not.toContain("Security");
-    expect(html).not.toContain("Applications");
+    expect(html).not.toContain('action="/user/settings/security"');
+    expect(html).not.toContain('action="/user/settings/applications"');
+    expect(html).toContain('class="item" href="/user/settings/security"'); // the shared navbar's Security item
   });
 
   it("applies the PATCH route's two service halves and 303s back", async () => {

@@ -27,6 +27,7 @@ import { orgMembers, users } from "../../db/schema";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
+import { OrgSettingsNavbar } from "../components/settings-nav";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { Viewer } from "../viewer";
@@ -35,7 +36,6 @@ import {
   applyOrgBlockedForm,
   loadOrgBlockedUsers,
   OrgBlockedUsersPage,
-  OrgSettingsBlockedNav,
   orgSettingsBlockedLocale,
   parseOrgBlockedForm,
   renderOrgBlockedUsersPage,
@@ -359,8 +359,13 @@ describe("the blocked-users tab DOM (shared/user/blocked_users.tmpl at the pin)"
     expect(html).toContain("Failed to block user: cannot block the user");
   });
 
-  it("the nav scaffold renders the landed tabs plus the Blocked-users item active", () => {
-    const html = renderToString(<OrgSettingsBlockedNav orgLink="/acme" />);
+  // STALE-PIN UPDATE (wave-114 nav swap): the mount-scaffolding
+  // OrgSettingsBlockedNav was deleted for the shared
+  // components/settings-nav OrgSettingsNavbar rendered with active:
+  // "blocked" — the same pins hold against the shared component (which adds
+  // the Actions disclosure's Secrets/Variables sub-items).
+  it("the shared navbar renders the landed tabs plus the Blocked-users item active", () => {
+    const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="blocked" />);
     expect(html).toContain('class="flex-container-nav"');
     expect(html).toContain('href="/acme/settings"'); // Options
     expect(html).toContain('href="/acme/settings/hooks"'); // Hooks

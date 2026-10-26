@@ -21,6 +21,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { userSettings } from "../../db/schema";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import { uiRouter, type UiAssetsFetcher } from "../index";
@@ -35,7 +36,6 @@ import {
   parseUserSettingsAppearanceLanguageForm,
   parseUserSettingsAppearanceThemeForm,
   renderUserSettingsAppearancePage,
-  UserSettingsAppearanceNav,
   UserSettingsAppearancePage,
   userSettingsAppearanceLocale,
 } from "./user-settings-appearance";
@@ -343,17 +343,23 @@ describe("the appearance page DOM (appearance.tmpl + layout_head.tmpl at the pin
   });
 });
 
-// --- the nav (the mount scaffolding) ---------------------------------------------
+// --- the nav (the shared navbar riding the page) ---------------------------------
 
-describe("UserSettingsAppearanceNav", () => {
+// STALE-PIN UPDATE (wave-114 nav swap): the page's local six-item
+// UserSettingsAppearanceNav was deleted for the shared
+// components/settings-nav UserSettingsNavbar — the active-discrimination
+// pins re-aim at the shared component (its full matrix lives in
+// components/settings-nav.test.tsx; here only this page's tab + the
+// disclosure arm the old copy pinned).
+describe("the shared settings navbar on the appearance page", () => {
   it("renders the active discrimination for the family items", () => {
-    expect(renderToString(<UserSettingsAppearanceNav active="appearance" />)).toContain(
+    expect(renderToString(<UserSettingsNavbar active="appearance" />)).toContain(
       'class="active item" href="/user/settings/appearance"',
     );
-    expect(renderToString(<UserSettingsAppearanceNav active="profile" />)).toContain(
+    expect(renderToString(<UserSettingsNavbar active="profile" />)).toContain(
       'class="active item" href="/user/settings"',
     );
-    const secretsActive = renderToString(<UserSettingsAppearanceNav active="secrets" />);
+    const secretsActive = renderToString(<UserSettingsNavbar active="secrets" />);
     expect(secretsActive).toContain('class="active item" href="/user/settings/actions/secrets"');
     expect(secretsActive).toContain("open"); // navbar.tmpl's open arm
   });

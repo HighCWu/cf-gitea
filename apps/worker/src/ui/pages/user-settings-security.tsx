@@ -73,15 +73,14 @@
  *  security/security.tmpl + security/twofa.tmpl at the pin)
  *
  * layout_head's pageClass is the literal `user settings security`; the
- * settings navbar (flex-container-nav) reduces to the LANDED items — Profile
- * (/user/settings), Security (this tab, active), and the Actions disclosure
- * with Secrets (/user/settings/actions/secrets, the sibling secrets module) —
- * the dead-link rule (every other upstream navbar item is an unwired page).
- * The content is `.user-setting-content` carrying the twofa section:
- * `h4.ui.top.attached.header` (settings.twofa) over the `.ui.attached
- * segment` with the three posture paragraphs.
+ * settings navbar (flex-container-nav) is the SHARED components/settings-nav
+ * UserSettingsNavbar (the wave-114 swap — the local three-item copy deleted)
+ * with the Security item active. The content is `.user-setting-content`
+ * carrying the twofa section: `h4.ui.top.attached.header` (settings.twofa)
+ * over the `.ui.attached segment` with the three posture paragraphs.
  */
 
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 
@@ -91,11 +90,7 @@ import type { UiContext } from "../ui-context";
 // ---------------------------------------------------------------------------
 
 export const userSettingsSecurityLocale = {
-  settings: "User Settings", // "user.settings" (the navbar header)
-  profile: "Profile", // "settings.profile"
-  security: "Security", // "settings.security" (the title + navbar item)
-  actions: "Actions", // "actions.actions" (the navbar disclosure)
-  secrets: "Secrets", // "secrets.secrets" (the disclosure's live sub-item)
+  security: "Security", // "settings.security" (the title + the shared navbar item)
   twofa: "Two-Factor Authentication (TOTP)", // "settings.twofa"
   twofa_desc:
     'To protect your account against password theft, you can use a smartphone or another device for receiving time-based one-time passwords ("TOTP").', // "settings.twofa_desc"
@@ -127,39 +122,6 @@ export function loadUserSettingsSecurityPageData(_d1: D1Database, _userId: numbe
 }
 
 // ---------------------------------------------------------------------------
-// The settings navbar (user/settings/navbar.tmpl reduced to the landed items
-// — the module header). Exported for the tests; the sibling settings modules
-// carry their own copies (the private-Nav convention).
-// ---------------------------------------------------------------------------
-
-export function UserSettingsSecurityNav(props: { active: "profile" | "security" | "secrets" }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{userSettingsSecurityLocale.settings}</div>
-        <a class={props.active === "profile" ? "active item" : "item"} href="/user/settings">
-          {userSettingsSecurityLocale.profile}
-        </a>
-        <a class={props.active === "security" ? "active item" : "item"} href="/user/settings/security">
-          {userSettingsSecurityLocale.security}
-        </a>
-        {/* navbar.tmpl:39-60's Actions <details class="item"> — open while one
-            of its sub-items is the active page (navbar.tmpl:40's open arm);
-            Secrets is the only landed sub-item (the dead-link rule). */}
-        <details class="item" open={props.active === "secrets" ? true : undefined}>
-          <summary>{userSettingsSecurityLocale.actions}</summary>
-          <div class="menu">
-            <a class={props.active === "secrets" ? "active item" : "item"} href="/user/settings/actions/secrets">
-              {userSettingsSecurityLocale.secrets}
-            </a>
-          </div>
-        </details>
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // The render (templates/user/settings/security/security.tmpl +
 //  security/twofa.tmpl at the pin)
 // ---------------------------------------------------------------------------
@@ -176,7 +138,7 @@ export function UserSettingsSecurityPage(props: { ctx: UiContext; data: UserSett
   return (
     <BaseLayout ctx={props.ctx} title={userSettingsSecurityLocale.security} pageClass="user settings security">
       <div class="ui container flex-container">
-        <UserSettingsSecurityNav active="security" />
+        <UserSettingsNavbar active="security" />
         <div class="flex-container-main">
           <div class="user-setting-content">
             {/* security.tmpl:5-7's twofa include, not-enrolled arm

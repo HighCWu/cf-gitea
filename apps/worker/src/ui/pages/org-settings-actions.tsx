@@ -150,15 +150,12 @@
  *   `.../secrets/delete` with the hidden row id; variables to the row's
  *   `/{id}/delete` URL with the id in the path, labeled with the deletion
  *   tooltip's text ("Remove variable") over octicon-trash.
- * - The navbar's General / Runners / Scoped-workflows sub-items have no
- *   landed pages and render nothing (the dead-link rule; the org-settings
- *   module header). The other settings items ride the landed
- *   orgSettingsLocale vocabulary; this module's navbar is MOUNT SCAFFOLDING
- *   ONLY — the literal SettingsNavbar DOM (org-settings.tsx:569-587, whose
- *   `active` union this module cannot extend — the file is sibling-owned)
- *   plus the Actions disclosure; when the window wave folds the disclosure
- *   into `SettingsNavbar`, delete this component (the org-settings-blocked
- *   sibling's identical arrangement).
+ * - The navbar is the SHARED components/settings-nav OrgSettingsNavbar (the
+ *   wave-114 swap — this module's mount-scaffolding OrgSettingsActionsNav
+ *   copy is deleted) rendered with `active: "secrets"` / `"variables"`; the
+ *   Actions disclosure opens while either page renders, and the General /
+ *   Runners / Scoped-workflows sub-items render nothing (no landed pages —
+ *   the dead-link rule; the shared module's header).
  * - The row date renders upstream's `DateUtils.AbsoluteShort` ("Jan 2, 2006")
  *   in UTC (the hand-rolled-clock precedent, the twins' formatSecretDate).
  * - `GET /settings/actions`' general tab (upstream's runners-general +
@@ -188,8 +185,8 @@ import type { OrgRecord } from "../../services/orgs/orgs";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { IconName } from "../icons";
 import type { UiContext } from "../ui-context";
+import { OrgSettingsNavbar } from "../components/settings-nav";
 import { OrgHeader } from "./org-home";
-import { orgSettingsLocale } from "./org-settings";
 
 // ---------------------------------------------------------------------------
 // Page chrome (the component-local locale pattern — locale.ts is shared and
@@ -197,9 +194,8 @@ import { orgSettingsLocale } from "./org-settings";
 // ---------------------------------------------------------------------------
 
 export const orgSettingsActionsLocale = {
-  actions: "Actions", // "actions.actions" (the navbar disclosure + the secrets page Title, secrets.go:77)
-  secrets: "Secrets", // "secrets.secrets" (the navbar sub-item)
-  variables: "Variables", // "actions.variables" (the navbar sub-item + the variables page Title, variables.go:84)
+  actions: "Actions", // "actions.actions" (the secrets page Title, secrets.go:77; the shared navbar carries the disclosure)
+  variables: "Variables", // "actions.variables" (the variables page Title, variables.go:84; the shared navbar carries the sub-item)
   secrets_management: "Secrets Management", // "secrets.management"
   variables_management: "Variables Management", // "actions.variables.management"
   add_secret: "Add Secret", // "secrets.add_secret"
@@ -512,47 +508,6 @@ export function formatActionsDate(date: Date): string {
   return `${months[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()}`;
 }
 
-/** The settings navbar with the Actions disclosure — MOUNT SCAFFOLDING ONLY
- *  (the handoff note): the literal SettingsNavbar DOM (org-settings.tsx —
- *  sibling-owned, its `active` union cannot take the actions arms) plus
- *  navbar.tmpl:29-47's Actions disclosure with the two landed sub-items.
- *  The General / Runners / Scoped-workflows sub-items have no landed pages
- *  and render nothing (the dead-link rule). When the window wave folds the
- *  disclosure into `SettingsNavbar`, delete this component (the
- *  org-settings-blocked sibling's identical arrangement). */
-export function OrgSettingsActionsNav(props: { orgLink: string; active: "secrets" | "variables" }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{orgSettingsLocale.settings}</div>
-        <a class="item" href={`${props.orgLink}/settings`}>
-          {orgSettingsLocale.options}
-        </a>
-        <a class="item" href={`${props.orgLink}/settings/hooks`}>
-          {orgSettingsLocale.hooks}
-        </a>
-        <a class="item" href={`${props.orgLink}/labels`}>
-          {orgSettingsLocale.labels}
-        </a>
-        {/* navbar.tmpl:29-47 — open while a secrets/variables page renders
-            (the PageIsSharedSettingsSecrets/Variables flags); the landed
-            sub-items only. */}
-        <details class="item" open={true}>
-          <summary>{orgSettingsActionsLocale.actions}</summary>
-          <div class="menu">
-            <a class={props.active === "secrets" ? "active item" : "item"} href={`${props.orgLink}/settings/actions/secrets`}>
-              {orgSettingsActionsLocale.secrets}
-            </a>
-            <a class={props.active === "variables" ? "active item" : "item"} href={`${props.orgLink}/settings/actions/variables`}>
-              {orgSettingsActionsLocale.variables}
-            </a>
-          </div>
-        </details>
-      </div>
-    </div>
-  );
-}
-
 /** The shared name/value/description fields (the upstream dialogs' three
  *  field divs, add_list.tmpl:73-104 / variable_list.tmpl:74-102).
  *  `readOnlyName` is the secrets EDIT arm's shape (read-only name, EMPTY
@@ -745,7 +700,7 @@ export function OrgActionsSecretsPage(props: { ctx: UiContext; data: OrgActionsS
     <BaseLayout ctx={ctx} title={orgSettingsActionsLocale.actions} pageClass="organization settings actions">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsActionsNav orgLink={orgLink} active="secrets" />
+        <OrgSettingsNavbar orgLink={orgLink} active="secrets" />
         <div class="flex-container-main">
           <div class="org-setting-content">
             {/* shared/secrets/add_list.tmpl:1-16 */}
@@ -799,7 +754,7 @@ export function OrgActionsVariablesPage(props: { ctx: UiContext; data: OrgAction
     <BaseLayout ctx={ctx} title={orgSettingsActionsLocale.variables} pageClass="organization settings actions">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsActionsNav orgLink={orgLink} active="variables" />
+        <OrgSettingsNavbar orgLink={orgLink} active="variables" />
         <div class="flex-container-main">
           <div class="org-setting-content">
             {/* shared/variables/variable_list.tmpl:1-64 */}

@@ -80,13 +80,10 @@
  *                JSONRedirect target, webhooks.go:52; the flash texts do
  *                not render — the no-session-flash reduction).
  *
- * The navbar (user/settings/navbar.tmpl) reduces to the LANDED items in
- * upstream order — Profile, Security, Applications, SSH/GPG Keys (the wave
- * 54/56 sibling modules) and this tab, hooks active (navbar.tmpl's
- * PageIsSettingsHooks item, locale repo.settings.hooks); every other
- * upstream item is an unwired page — the dead-link rule. The profile page's
- * own reduced navbar (the private UserSettingsNav in user-settings.tsx)
- * shows only Profile until its owner extends it (the keys module's handoff).
+ * The navbar (user/settings/navbar.tmpl) is the SHARED
+ * components/settings-nav UserSettingsNavbar (the wave-114 swap) with this
+ * tab's Webhooks item active (navbar.tmpl's PageIsSettingsHooks item, locale
+ * repo.settings.hooks).
  *
  * ## Data (§3.2 — the landed user-hooks API family, never a self-fetch)
  *
@@ -178,6 +175,7 @@ import {
 } from "../../api/services/hooks";
 import { HookStatus, webhookDeliveries } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import type { IconName } from "../icons";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
@@ -202,12 +200,7 @@ import {
 // ---------------------------------------------------------------------------
 
 export const userSettingsWebhooksLocale = {
-  settings: "User Settings", // "user.settings" (the navbar header)
-  profile: "Profile", // "settings.profile"
-  security: "Security", // "settings.security"
-  applications: "Applications", // "settings.applications"
-  ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys"
-  hooks: "Webhooks", // "repo.settings.hooks" (the navbar item — the user tab reuses the repo key, navbar.tmpl)
+  hooks: "Webhooks", // "repo.settings.hooks" (the title + the shared navbar's item — the user tab reuses the repo key, navbar.tmpl)
   settings_title: "Settings", // "settings_title" (the list h4 — webhooks.go:23 sets .Title to it, the org arm's quirk twin)
   hooks_desc: "Add webhooks which will be triggered for all repositories that you own.", // "settings.hooks.desc" (strong stripped)
 } as const;
@@ -280,35 +273,6 @@ export async function createUserHookFromForm(d1: D1Database, userId: number, for
 // re-export posture for its parse pair).
 export { parseCreateHookForm, parseHookEditForm };
 
-/** The settings navbar (user/settings/navbar.tmpl reduced to the landed
- *  items in upstream order — the module header). `active` marks this tab. */
-function UserSettingsWebhooksNav(props: { active: "profile" | "security" | "applications" | "keys" | "hooks" }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{userSettingsWebhooksLocale.settings}</div>
-        <a class={props.active === "profile" ? "active item" : "item"} href="/user/settings">
-          {userSettingsWebhooksLocale.profile}
-        </a>
-        <a class={props.active === "security" ? "active item" : "item"} href="/user/settings/security">
-          {userSettingsWebhooksLocale.security}
-        </a>
-        <a class={props.active === "applications" ? "active item" : "item"} href="/user/settings/applications">
-          {userSettingsWebhooksLocale.applications}
-        </a>
-        <a class={props.active === "keys" ? "active item" : "item"} href="/user/settings/keys">
-          {userSettingsWebhooksLocale.ssh_gpg_keys}
-        </a>
-        {/* navbar.tmpl's PageIsSettingsHooks item — the user tab reuses the
-            repo.settings.hooks locale for its label. */}
-        <a class={props.active === "hooks" ? "active item" : "item"} href={USER_SETTINGS_HOOKS_LINK}>
-          {userSettingsWebhooksLocale.hooks}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /** The full-document render for the list page (the render.tsx pattern). */
 export function renderUserSettingsHooksPage(options: {
   ctx: UiContext;
@@ -329,7 +293,7 @@ export function UserHooksSettingsPage(props: { ctx: UiContext; data: UserHooksSe
   return (
     <BaseLayout ctx={ctx} title={userSettingsWebhooksLocale.hooks} pageClass="user settings webhooks">
       <div class="ui container flex-container">
-        <UserSettingsWebhooksNav active="hooks" />
+        <UserSettingsNavbar active="hooks" />
         <div class="user-setting-content">
           {/* base_list.tmpl's header/segment pair. The h4 renders upstream's
               literal .Title — webhooks.go:23 sets it to settings_title
@@ -560,7 +524,7 @@ export function UserHookDetailPage(props: { ctx: UiContext; data: UserHookDetail
   return (
     <BaseLayout ctx={ctx} title={hookDetailLocale.update_webhook} pageClass="user settings new webhook">
       <div class="ui container flex-container">
-        <UserSettingsWebhooksNav active="hooks" />
+        <UserSettingsNavbar active="hooks" />
         <div class="user-setting-content">
           {/* gitea.tmpl's form + settings.tmpl's fields (the repo page's
               not-rendered notes for secret/auth-header/events). */}

@@ -489,8 +489,14 @@ describe("the per-hook page DOM (hook_new.tmpl's edit arm + webhook/new.tmpl at 
 
 // --- the navbar -----------------------------------------------------------------
 
-describe("the settings navbar (user/settings/navbar.tmpl reduced to the landed items)", () => {
-  it("marks the hooks item active and lists only the landed sibling tabs", async () => {
+// STALE-PIN UPDATE (wave-114 nav swap): the page's local five-item
+// UserSettingsWebhooksNav was deleted for the shared
+// components/settings-nav UserSettingsNavbar, whose landed family includes
+// the Appearance item — the old "appearance stays absent" negative inverted
+// into a positive (the shared nav renders it), and the still-dead upstream
+// targets keep their negatives.
+describe("the settings navbar (the shared UserSettingsNavbar, hooks active)", () => {
+  it("marks the hooks item active and carries the shared family's landed tabs", async () => {
     const data = await loadUserSettingsHooksPageData(env.DB, alice.id);
     const html = renderToString(<ListPageForTest data={data} error={null} />);
     expect(html).toContain('class="active item" href="/user/settings/hooks"');
@@ -498,9 +504,9 @@ describe("the settings navbar (user/settings/navbar.tmpl reduced to the landed i
     expect(html).toContain('href="/user/settings/security"');
     expect(html).toContain('href="/user/settings/applications"');
     expect(html).toContain('href="/user/settings/keys"');
+    expect(html).toContain('href="/user/settings/appearance"'); // the shared nav's Appearance item (was a dead target pre-swap)
     expect(html).toContain(">Webhooks</a>"); // the navbar label — repo.settings.hooks reused
-    // The unlanded upstream items stay absent (the dead-link rule).
-    expect(html).not.toContain("/user/settings/appearance");
+    // The still-unlanded upstream items stay absent (the dead-link rule).
     expect(html).not.toContain("/user/settings/audit_logs");
     expect(html).not.toContain("/user/settings/repos");
   });

@@ -41,10 +41,9 @@
  *                ("GetAccessTokenByID: …", applications.go:170-173), which
  *                has no renderable analog.
  *
- * Upstream's settings navbar (user/settings/navbar.tmpl) reduces to the
- * landed items — Profile (/user/settings), this tab, SSH / GPG Keys
- * (/user/settings/keys, this wave's sibling module) — the dead-link rule;
- * upstream's order (…, applications, ssh_gpg_keys) is preserved.
+ * Upstream's settings navbar (user/settings/navbar.tmpl) is the SHARED
+ * components/settings-nav UserSettingsNavbar (the wave-114 swap) with this
+ * tab's Applications item active.
  *
  * ## Data (§3.2 — the landed tokens family, never a self-fetch)
  *
@@ -126,6 +125,7 @@ import { TokenService } from "../../auth/token-service";
 import type { AuthToken } from "../../auth/auth-context";
 import { InvalidScopeError, normalizeScope, SCOPE_CATEGORIES, ScopeSet, scopeStringSlice } from "../../auth/scopes";
 import { TokenNameExistsError, TokenNameTooLongError } from "../../auth/errors";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { IconName } from "../icons";
 import type { UiContext } from "../ui-context";
@@ -136,10 +136,7 @@ import type { UiContext } from "../ui-context";
 // ---------------------------------------------------------------------------
 
 export const userSettingsApplicationsLocale = {
-  settings: "User Settings", // "user.settings" (the navbar header)
-  profile: "Profile", // "settings.profile"
-  applications: "Applications", // "settings.applications" (the title + navbar item)
-  ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys" (the navbar item)
+  applications: "Applications", // "settings.applications" (the title + the shared navbar item)
   manage_access_token: "Manage Access Tokens", // "settings.manage_access_token"
   generate_token_success: "Your new token has been generated. Copy it now as it will not be shown again.", // "settings.generate_token_success"
   tokens_desc: "These tokens grant access to your account using the Gitea API.", // "settings.tokens_desc"
@@ -350,27 +347,6 @@ export function formatTokenDate(date: Date): string {
  *  one-line site). */
 const TOKEN_ICON: IconName = "octicon-mail";
 
-/** The settings navbar (user/settings/navbar.tmpl reduced to the landed
- *  items — the module header). */
-function UserSettingsApplicationsNav(props: { active: "profile" | "applications" | "keys" }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{userSettingsApplicationsLocale.settings}</div>
-        <a class={props.active === "profile" ? "active item" : "item"} href="/user/settings">
-          {userSettingsApplicationsLocale.profile}
-        </a>
-        <a class={props.active === "applications" ? "active item" : "item"} href="/user/settings/applications">
-          {userSettingsApplicationsLocale.applications}
-        </a>
-        <a class={props.active === "keys" ? "active item" : "item"} href="/user/settings/keys">
-          {userSettingsApplicationsLocale.ssh_gpg_keys}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /** The full-document render (the render.tsx pattern). `error` carries the
  *  failed create's message (null otherwise). */
 export function renderUserSettingsApplicationsPage(
@@ -388,7 +364,7 @@ export function UserSettingsApplicationsPage(props: { ctx: UiContext; data: User
   return (
     <BaseLayout ctx={ctx} title={userSettingsApplicationsLocale.applications} pageClass="user settings applications">
       <div class="ui container flex-container">
-        <UserSettingsApplicationsNav active="applications" />
+        <UserSettingsNavbar active="applications" />
         <div class="user-setting-content">
           <div id="access-token-panel">
             <h4 class="ui top attached header">{userSettingsApplicationsLocale.manage_access_token}</h4>

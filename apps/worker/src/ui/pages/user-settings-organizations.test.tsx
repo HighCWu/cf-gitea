@@ -30,6 +30,7 @@ import type { UiManifest } from "../manifest";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { Viewer } from "../viewer";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import {
   applyUserOrgsLeave,
   loadUserOrgsSettings,
@@ -37,7 +38,6 @@ import {
   renderUserOrgsSettingsPage,
   UserOrgsSettingsPage,
   userOrgsSettingsLocale,
-  UserOrgsSettingsNav,
   USER_ORGS_PAGE_SIZE,
 } from "./user-settings-organizations";
 
@@ -288,8 +288,12 @@ describe("the organizations settings DOM (organizations.tmpl at the pin)", () =>
     expect(plain).not.toContain("pagination menu");
   });
 
-  it("the nav scaffolding renders the Profile item plus Organizations active", () => {
-    const html = renderToString(<UserOrgsSettingsNav />);
+  // STALE-PIN UPDATE (wave-114 nav swap): the local Profile+Organizations
+  // UserOrgsSettingsNav scaffold was deleted for the shared
+  // components/settings-nav UserSettingsNavbar — the pins re-aim at the
+  // shared component with this page's tab active.
+  it("the shared navbar renders the Profile item plus Organizations active", () => {
+    const html = renderToString(<UserSettingsNavbar active="organization" />);
     expect(html).toContain('class="flex-container-nav"');
     expect(html).toContain('href="/user/settings"');
     expect(html).toContain('class="active item" href="/user/settings/organization"');

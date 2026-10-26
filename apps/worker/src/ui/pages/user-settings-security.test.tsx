@@ -11,13 +11,13 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
 import {
   loadUserSettingsSecurityPageData,
   renderUserSettingsSecurityPage,
-  UserSettingsSecurityNav,
   UserSettingsSecurityPage,
   userSettingsSecurityLocale,
 } from "./user-settings-security";
@@ -111,14 +111,19 @@ describe("the security page DOM (security.tmpl + twofa.tmpl at the pin)", () => 
     expect(html).toContain(userSettingsSecurityLocale.twofa_not_enrolled);
   });
 
-  it("the nav renders the active discrimination for all three items (the mount scaffolding)", () => {
-    expect(renderToString(<UserSettingsSecurityNav active="profile" />)).toContain(
+  // STALE-PIN UPDATE (wave-114 nav swap): the page's local three-item
+  // UserSettingsSecurityNav was deleted for the shared
+  // components/settings-nav UserSettingsNavbar — the active-discrimination
+  // pins re-aim at the shared component (its full matrix lives in
+  // components/settings-nav.test.tsx).
+  it("the shared navbar renders the active discrimination for all three items (the mount scaffolding)", () => {
+    expect(renderToString(<UserSettingsNavbar active="profile" />)).toContain(
       'class="active item" href="/user/settings"',
     );
-    expect(renderToString(<UserSettingsSecurityNav active="security" />)).toContain(
+    expect(renderToString(<UserSettingsNavbar active="security" />)).toContain(
       'class="active item" href="/user/settings/security"',
     );
-    const secretsActive = renderToString(<UserSettingsSecurityNav active="secrets" />);
+    const secretsActive = renderToString(<UserSettingsNavbar active="secrets" />);
     expect(secretsActive).toContain('class="active item" href="/user/settings/actions/secrets"');
     expect(secretsActive).toContain("open"); // navbar.tmpl:40's open arm
   });

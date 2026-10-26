@@ -31,12 +31,12 @@
  * diff_view_style) is upstream appearance.tmpl's field set, not
  * profile.tmpl's — not rendered here (the brief pins profile.tmpl).
  *
- * NO password or token management UI: upstream's Account (password change),
- * Security (2FA), Applications (tokens/OAuth2) and SSH/GPG Keys navbar
- * items have no landed surfaces — the settings navbar (user/settings/
- * layout_head.tmpl + navbar.tmpl) reduces to the header + the single live
- * Profile item (the dead-link rule), and nothing on this page touches
- * credentials (no password field is rendered at all).
+ * NO password or token management UI: upstream's Account (password change)
+ * and the Security 2FA arms have no landed surfaces — nothing on this page
+ * touches credentials (no password field is rendered at all). The settings
+ * navbar is the SHARED components/settings-nav UserSettingsNavbar (the
+ * wave-114 swap: the local single-Profile-item copy deleted; the shared
+ * component carries the whole landed family, the Profile item active here).
  *
  * ## DOM contract (templates/user/settings/{layout_head,navbar,profile}.tmpl
  *  at the pin)
@@ -83,14 +83,14 @@ import {
   type UserPreferenceSettings,
 } from "../../api/services/user-settings";
 import { users } from "../../db/schema";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 
 /** Page chrome text (component-local, the settingsLocale pattern — locale.ts
  *  is shared and not this wave's file). */
 export const userSettingsLocale = {
-  settings: "User Settings", // "user.settings" (the navbar header)
-  profile: "Profile", // "settings.profile"
+  settings: "User Settings", // "user.settings" (the page title; the shared navbar carries the header)
   public_profile: "Public Profile", // "settings.public_profile"
   profile_desc:
     "Control how your profile is shown to other users. Your primary email address will be used for notifications, password recovery and web-based Git operations.", // "settings.profile_desc"
@@ -181,22 +181,6 @@ export async function applyUserProfileForm(d1: D1Database, userId: number, form:
   });
 }
 
-/** The settings navbar (user/settings/navbar.tmpl reduced to the single live
- *  item — the dead-link rule; upstream's Account/Security/Applications/Keys/
- *  Appearance/Audit/Actions items have no landed pages). */
-function UserSettingsNav() {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{userSettingsLocale.settings}</div>
-        <a class="active item" href="/user/settings">
-          {userSettingsLocale.profile}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /** The visibility text under the read-only line (upstream's dropdown is the
  *  no-write-arm reduction). */
 function visibilityText(visibility: string): string {
@@ -218,7 +202,7 @@ export function UserSettingsPage(props: { ctx: UiContext; data: UserSettingsPage
   return (
     <BaseLayout ctx={ctx} title={userSettingsLocale.settings} pageClass="user settings profile">
       <div class="ui container flex-container">
-        <UserSettingsNav />
+        <UserSettingsNavbar active="profile" />
         <div class="flex-container-main">
           <h4 class="ui top attached header">{userSettingsLocale.public_profile}</h4>
           <div class="ui attached segment">

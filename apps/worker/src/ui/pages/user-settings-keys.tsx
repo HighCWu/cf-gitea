@@ -36,12 +36,9 @@
  *                ErrGPGKeyNotExist — the misc-t3 DELETE arm's note), so
  *                every GPG delete 303s.
  *
- * Upstream's settings navbar (user/settings/navbar.tmpl) reduces to the
- * landed items — Profile (/user/settings), Applications
- * (/user/settings/applications, this wave's sibling module) and this tab —
- * the dead-link rule; the profile page's own reduced navbar (the private
- * UserSettingsNav in pages/user-settings.tsx) shows only Profile until its
- * owner extends it (handoff).
+ * Upstream's settings navbar (user/settings/navbar.tmpl) is the SHARED
+ * components/settings-nav UserSettingsNavbar (the wave-114 swap) with this
+ * tab's SSH / GPG Keys item active.
  *
  * ## Data (§3.2 — the landed stores, never a self-fetch)
  *
@@ -146,6 +143,7 @@ import {
   parseSshPublicKey,
 } from "../../services/ssh-gpg-keys";
 import type { ParsedGpgEntity, ParsedSshKey } from "../../services/ssh-gpg-keys";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { IconName } from "../icons";
 import type { UiContext } from "../ui-context";
@@ -156,10 +154,7 @@ import type { UiContext } from "../ui-context";
 // ---------------------------------------------------------------------------
 
 export const userSettingsKeysLocale = {
-  settings: "User Settings", // "user.settings" (the navbar header)
-  profile: "Profile", // "settings.profile"
-  applications: "Applications", // "settings.applications"
-  ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys" (the title + navbar item)
+  ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys" (the title + the shared navbar item)
   manage_ssh_keys: "Manage SSH Keys", // "settings.manage_ssh_keys"
   manage_gpg_keys: "Manage GPG Keys", // "settings.manage_gpg_keys"
   add_key: "Add Key", // "settings.add_key"
@@ -546,27 +541,6 @@ const KEY_ICON: IconName = "octicon-shield-lock";
  *  octicon-verified is outside the allowlist — octicon-check stands in. */
 const VERIFIED_ICON: IconName = "octicon-check";
 
-/** The settings navbar (user/settings/navbar.tmpl reduced to the landed
- *  items — the module header). `active` marks this tab. */
-function UserSettingsKeysNav(props: { active: "profile" | "applications" | "keys" }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{userSettingsKeysLocale.settings}</div>
-        <a class={props.active === "profile" ? "active item" : "item"} href="/user/settings">
-          {userSettingsKeysLocale.profile}
-        </a>
-        <a class={props.active === "applications" ? "active item" : "item"} href="/user/settings/applications">
-          {userSettingsKeysLocale.applications}
-        </a>
-        <a class={props.active === "keys" ? "active item" : "item"} href="/user/settings/keys">
-          {userSettingsKeysLocale.ssh_gpg_keys}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /** The added-on / last-used line (keys_ssh.tmpl:54-56's `.item-body`). */
 function KeyUsageLine(props: { addedAt: Date; hasUsed: boolean; lastUsedAt: Date | null; hasRecentActivity: boolean }) {
   return (
@@ -621,7 +595,7 @@ export function UserSettingsKeysPage(props: { ctx: UiContext; data: UserSettings
   return (
     <BaseLayout ctx={ctx} title={userSettingsKeysLocale.ssh_gpg_keys} pageClass="user settings sshkeys">
       <div class="ui container flex-container">
-        <UserSettingsKeysNav active="keys" />
+        <UserSettingsNavbar active="keys" />
         <div class="user-setting-content">
           {/* ------------------------------------------------ SSH (keys_ssh.tmpl) */}
           <h4 class="ui top attached header">

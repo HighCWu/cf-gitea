@@ -91,11 +91,9 @@
  *                                     the `?error=` flash reduction — no
  *                                     session-flash plumbing exists).
  *
- * Mount also folds the local `UserOrgsSettingsNav` below into the settings
- * navbar the wave-12 page owns (and the keys/secrets/security/applications
- * siblings are scaffolding the same way): extend that nav with the
- * Organizations item keyed on the `user settings organization` discriminator
- * and delete this module's scaffold. Survey row to touch on landing:
+ * The settings navbar is the SHARED components/settings-nav
+ * UserSettingsNavbar (the wave-114 swap — the local Profile+Organizations
+ * scaffold deleted) with the Organizations item active. Survey row to touch on landing:
  * docs/compat/ui-parity-survey.md:383 (the
  * `/user/settings/{…,organization,…}` ABSENT row).
  */
@@ -105,7 +103,7 @@ import type { UiContext } from "../ui-context";
 import { parsePageNumber } from "../page-data";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { LastOrgOwnerError } from "../../services/orgs/errors";
-import { userSettingsLocale } from "./user-settings";
+import { UserSettingsNavbar } from "../components/settings-nav";
 
 /** Page chrome text (component-local, the settingsLocale pattern — locale.ts
  *  is shared and not this wave's file; upstream locale_en-US keys cited). */
@@ -208,29 +206,6 @@ export function renderUserOrgsSettingsPage(
   return renderPage(<UserOrgsSettingsPage ctx={ctx} data={data} error={state.error} />);
 }
 
-/**
- * The settings navbar with the Organizations item — MOUNT SCAFFOLDING ONLY
- * (the handoff note): the wave-12 settings nav DOM (pages/user-settings.tsx)
- * with the Organizations item appended and active. The header + Profile
- * texts import the owner's locale object; when the index.ts window folds the
- * settings siblings into one navbar, delete this component.
- */
-export function UserOrgsSettingsNav() {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{userSettingsLocale.settings}</div>
-        <a class="item" href="/user/settings">
-          {userSettingsLocale.profile}
-        </a>
-        <a class="active item" href="/user/settings/organization">
-          {userOrgsSettingsLocale.organization}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /** The leave confirm (organizations.tmpl:41-51's `#leave-organization`
  *  dialog reduced to a `<details>` disclosure wrapping the same form — the
  *  org-settings danger-row reduction; the org's display name renders inline
@@ -275,7 +250,7 @@ export function UserOrgsSettingsPage(props: { ctx: UiContext; data: UserOrgsSett
   return (
     <BaseLayout ctx={ctx} title={userOrgsSettingsLocale.organization} pageClass="user settings organization">
       <div class="ui container flex-container">
-        <UserOrgsSettingsNav />
+        <UserSettingsNavbar active="organization" />
         <div class="flex-container-main">
           {props.error === "last-owner" ? <div class="ui negative message">{userOrgsSettingsLocale.last_org_owner}</div> : null}
           <div class="user-setting-content">

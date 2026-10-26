@@ -40,8 +40,8 @@
  *
  * The list page is org/settings/hooks.tmpl: layout_head's `.page-content
  * .organization settings webhooks` → org/header.tmpl (the shared OrgHeader) →
- * the flex-container pair carrying org/settings/navbar.tmpl (SettingsNavbar,
- * hooks active) and base_list.tmpl's header/segment pair — the status dot
+ * the flex-container pair carrying org/settings/navbar.tmpl (the shared
+ * OrgSettingsNavbar, hooks active) and base_list.tmpl's header/segment pair — the status dot
  * (webhooks.last_status, the repo page's three-class mapping), the name/URL
  * row linking onto the per-hook page, the delivery-count chip and the pencil
  * anchor. Upstream's segment header renders `{{.Title}}`, and the org arm
@@ -105,7 +105,9 @@ import type { IconName } from "../icons";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import { OrgHeader } from "./org-home";
-import { orgSettingsLocale, SettingsNavbar } from "./org-settings";import {
+import { OrgSettingsNavbar } from "../components/settings-nav";
+import { orgSettingsLocale } from "./org-settings";
+import {
   hookBranchFilterOf,
   hookDetailLocale,
   hookEditFormOf,
@@ -207,7 +209,7 @@ export function OrgHooksSettingsPage(props: { ctx: UiContext; data: OrgHooksSett
     <BaseLayout ctx={ctx} title={orgSettingsLocale.settings} pageClass="organization settings webhooks">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <SettingsNavbar orgLink={orgLink} active="hooks" />
+        <OrgSettingsNavbar orgLink={orgLink} active="hooks" />
         <div class="flex-container-main">
           {/* base_list.tmpl's header/segment pair. The h4 renders upstream's
               literal .Title — org/setting.go:151 sets it to org.settings, not
@@ -431,7 +433,7 @@ export function OrgHookDetailPage(props: { ctx: UiContext; data: OrgHookDetailDa
     <BaseLayout ctx={ctx} title={hookDetailLocale.update_webhook} pageClass="organization settings new webhook">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <SettingsNavbar orgLink={orgLink} active="hooks" />
+        <OrgSettingsNavbar orgLink={orgLink} active="hooks" />
         <div class="flex-container-main">
           {/* gitea.tmpl's form + settings.tmpl's fields (the module header's
               not-rendered notes for secret/auth-header/events). */}

@@ -46,9 +46,9 @@
  * authorization shape as the landed user-scope API ops (`/user/actions/*`,
  * routes/secrets-variables.ts:875-877 — reqToken, no further gate).
  *
- * Upstream's settings navbar (user/settings/navbar.tmpl) reduces to the
- * landed items — Profile, Security (the sibling security module) and this
- * tab under the Actions disclosure — the dead-link rule.
+ * Upstream's settings navbar (user/settings/navbar.tmpl) is the SHARED
+ * components/settings-nav UserSettingsNavbar (the wave-114 swap) with the
+ * Actions disclosure open and the Secrets sub-item active.
  *
  * ## Data (§3.2 — the LANDED 0021 store + the secrets-variables service)
  *
@@ -136,6 +136,7 @@ import {
   type SecretRow,
 } from "../../api/services/secrets-variables";
 import { secrets } from "../../db/schema";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { IconName } from "../icons";
 import type { UiContext } from "../ui-context";
@@ -146,11 +147,7 @@ import type { UiContext } from "../ui-context";
 // ---------------------------------------------------------------------------
 
 export const userSettingsSecretsLocale = {
-  settings: "User Settings", // "user.settings" (the navbar header)
-  profile: "Profile", // "settings.profile"
-  security: "Security", // "settings.security"
-  actions: "Actions", // "actions.actions" (the title — upstream ctx.Data["Title"], secrets.go:77 — + the navbar disclosure)
-  secrets: "Secrets", // "secrets.secrets" (the navbar sub-item)
+  actions: "Actions", // "actions.actions" (the title — upstream ctx.Data["Title"], secrets.go:77 — + the shared navbar's disclosure)
   secrets_management: "Secrets Management", // "secrets.management"
   add_secret: "Add Secret", // "secrets.add_secret"
   edit_secret: "Edit secret", // "secrets.edit_secret"
@@ -319,32 +316,9 @@ export function formatSecretDate(date: Date): string {
  *  KEY_ICON convention). */
 const SECRET_ICON: IconName = "octicon-shield-lock";
 
-/** The settings navbar (user/settings/navbar.tmpl reduced to the landed
- *  items — the module header). `active` marks this tab; the Actions
- *  disclosure opens while the secrets sub-item is active (navbar.tmpl:40). */
-export function UserSettingsSecretsNav(props: { active: "profile" | "security" | "secrets" }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{userSettingsSecretsLocale.settings}</div>
-        <a class={props.active === "profile" ? "active item" : "item"} href="/user/settings">
-          {userSettingsSecretsLocale.profile}
-        </a>
-        <a class={props.active === "security" ? "active item" : "item"} href="/user/settings/security">
-          {userSettingsSecretsLocale.security}
-        </a>
-        <details class="item" open={props.active === "secrets" ? true : undefined}>
-          <summary>{userSettingsSecretsLocale.actions}</summary>
-          <div class="menu">
-            <a class={props.active === "secrets" ? "active item" : "item"} href="/user/settings/actions/secrets">
-              {userSettingsSecretsLocale.secrets}
-            </a>
-          </div>
-        </details>
-      </div>
-    </div>
-  );
-}
+/** The settings navbar: the SHARED components/settings-nav UserSettingsNavbar
+ *  (the wave-114 swap — the local Profile/Security/Actions copy deleted; the
+ *  disclosure opens while the secrets sub-item is active, navbar.tmpl:40). */
 
 /** The shared name/value/description fields (the upstream dialog's three
  *  field divs, add_list.tmpl:73-104 — rendered twice: the inline add form and
@@ -455,7 +429,7 @@ export function UserSettingsSecretsPage(props: { ctx: UiContext; data: UserSetti
   return (
     <BaseLayout ctx={props.ctx} title={userSettingsSecretsLocale.actions} pageClass="user settings actions">
       <div class="ui container flex-container">
-        <UserSettingsSecretsNav active="secrets" />
+        <UserSettingsNavbar active="secrets" />
         <div class="flex-container-main">
           <div class="user-setting-content">
             {/* shared/secrets/add_list.tmpl:1-16 */}

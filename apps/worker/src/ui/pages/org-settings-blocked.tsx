@@ -98,21 +98,12 @@
  *
  * ## HANDOFF NOTE (the tab seam + the route — this module has NO route)
  *
- * `org-settings.tsx` is sibling-held: its `SettingsNavbar` renders the LIVE
- * tabs only (Options + Hooks + Labels) and its header records
- * blocked_users among the dead items — this module EXPORTS the
- * tab-adjacent pieces for the window wave to wire:
- *
- *   - `orgSettingsBlockedLocale.blocked_users` ("user.block.list") is the
- *     navbar item's text AND the page Title (org/block.go:19 sets
- *     `ctx.Data["Title"]` to the same key) AND the list header.
- *   - `OrgSettingsBlockedNav` is MOUNT SCAFFOLDING ONLY: the literal
- *     SettingsNavbar DOM (org-settings.tsx:572-586) with the Blocked-users
- *     item appended after Labels (upstream order: Options, Hooks, Labels,
- *     Applications(dead), Blocked users — navbar.tmpl:20-22) and active.
- *     On landing: extend SettingsNavbar's `active` union with `"blocked"`,
- *     add the item (import this locale), and DELETE this component (the
- *     WikiSettingsNav precedent, pages/repo-settings-wiki.tsx).
+ * The settings navbar is the SHARED components/settings-nav
+ * OrgSettingsNavbar (the wave-114 swap — this module's mount-scaffolding
+ * OrgSettingsBlockedNav copy is deleted) rendered with `active: "blocked"`.
+ * `orgSettingsBlockedLocale.blocked_users` ("user.block.list") remains the
+ * page Title (org/block.go:19 sets `ctx.Data["Title"]` to the same key) AND
+ * the list header.
  *
  * Route table (`index.ts` — sibling-held): claim `raw[3] ===
  * "blocked_users"` in the settings family's `raw.length === 4` branch as
@@ -160,8 +151,8 @@ import { userBlocking } from "../../db/schema";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import { BaseLayout, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
+import { OrgSettingsNavbar } from "../components/settings-nav";
 import { OrgHeader } from "./org-home";
-import { orgSettingsLocale } from "./org-settings";
 
 /** Page chrome + copy text (component-local, the orgSettingsLocale pattern —
  *  locale.ts is shared and not this wave's file; upstream locale keys cited,
@@ -323,35 +314,6 @@ export function renderOrgBlockedUsersPage(options: {
   return renderPage(<OrgBlockedUsersPage ctx={options.ctx} data={options.data} error={options.error} />);
 }
 
-/** The settings navbar with the Blocked-users item — MOUNT SCAFFOLDING ONLY
- *  (the handoff note): the literal SettingsNavbar DOM (org-settings.tsx) with
- *  the Blocked-users item appended after Labels and active (upstream order —
- *  navbar.tmpl:20-22; the dead Applications item renders nothing on the
- *  landed navbar, the org-settings module header). When the window wave folds
- *  this into `SettingsNavbar` (the `active` union + the item), delete this
- *  component. */
-export function OrgSettingsBlockedNav(props: { orgLink: string }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{orgSettingsLocale.settings}</div>
-        <a class="item" href={`${props.orgLink}/settings`}>
-          {orgSettingsLocale.options}
-        </a>
-        <a class="item" href={`${props.orgLink}/settings/hooks`}>
-          {orgSettingsLocale.hooks}
-        </a>
-        <a class="item" href={`${props.orgLink}/labels`}>
-          {orgSettingsLocale.labels}
-        </a>
-        <a class="active item" href={`${props.orgLink}/settings/blocked_users`}>
-          {orgSettingsBlockedLocale.blocked_users}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /**
  * The org blocked-users page (§2.4.1 discriminator: `organization settings
  * blocked_users` — layout_head's pageClass dict): OrgHeader, the settings
@@ -366,7 +328,7 @@ export function OrgBlockedUsersPage(props: { ctx: UiContext; data: OrgBlockedUse
     <BaseLayout ctx={ctx} title={orgSettingsBlockedLocale.blocked_users} pageClass="organization settings blocked_users">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsBlockedNav orgLink={`/${org.username}`} />
+        <OrgSettingsNavbar orgLink={`/${org.username}`} active="blocked" />
         <div class="flex-container-main">
           {/* The invalid-POST re-render's banner (the org hooks-page
               convention — upstream's JSONError toast, the no-JS

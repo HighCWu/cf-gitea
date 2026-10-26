@@ -45,14 +45,12 @@
  * The settings page is layout_head.tmpl's `.page-content.organization
  * settings options` → org/header.tmpl (the shared OrgHeader) →
  * `.ui.container.flex-container` carrying org/settings/navbar.tmpl's
- * `.flex-container-nav` menu and the options form. The navbar reduces to the
- * LIVE tabs: Options (this page) + Hooks (wave 53 — the landed
- * `/{org}/settings/hooks` tab, pages/org-settings-hooks.tsx, upstream's
- * second navbar item) + Labels (our landed `/{org}/labels` page — upstream's
- * item targets `{.OrgLink}}/settings/labels`, the documented wave-14 URL
- * divergence; the target exists so the tab stays live); the applications/
- * blocked_users/packages/actions/audit_logs items have no landed pages and
- * render nothing (the dead-link rule). The org/menu strip the header
+ * `.flex-container-nav` menu and the options form. The navbar is the SHARED
+ * components/settings-nav OrgSettingsNavbar (the wave-114 swap — the local
+ * Options/Hooks/Labels copy deleted) with the Options item active; the
+ * Labels item keeps the landed `/{org}/labels` target (upstream's item
+ * targets `{.OrgLink}}/settings/labels`, the documented wave-14 URL
+ * divergence; the target exists so the tab stays live). The org/menu strip the header
  * template includes reduces away on the same convention as the landed org
  * members/teams/labels pages (their headers also drop it — the owner-only
  * Settings item is the menu's only unlanded entry).
@@ -142,6 +140,7 @@ import {
 } from "../../services/orgs/errors";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import type { Child } from "hono/jsx";
+import { OrgSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import { orgDisplayName, OrgHeader } from "./org-home";
@@ -149,10 +148,8 @@ import { orgDisplayName, OrgHeader } from "./org-home";
 /** Page chrome text (component-local, the orgTeamsLocale pattern — locale.ts
  *  is shared and not this wave's file). */
 export const orgSettingsLocale = {
-  settings: "Settings", // "org.settings" (the navbar header)
+  settings: "Settings", // "org.settings" (the hooks tab's Title + list h4; the shared navbar carries the header)
   options: "Organization", // "org.settings.options" (the Options tab + header)
-  hooks: "Webhooks", // "repo.settings.hooks" (wave 53 — the hooks tab, the landed /settings/hooks page)
-  labels: "Labels", // "repo.labels" (the one other live tab)
   full_name: "Organization Full Name", // "org.org_full_name_holder"
   email: "Contact Email Address", // "org.settings.email"
   description: "Description", // "org.org_desc"
@@ -560,31 +557,9 @@ export async function applyOrgTeamDelete(d1: D1Database, team: TeamRecord): Prom
 // Components
 // ---------------------------------------------------------------------------
 
-/** The settings navbar (org/settings/navbar.tmpl reduced to the live tabs —
- *  the module header's note; Options is the active item on this page, Hooks
- *  links the landed wave-53 `/{org}/settings/hooks` tab (upstream's second
- *  item, navbar.tmpl:8-10), Labels the landed `/{org}/labels` page). Exported
- *  for pages/org-settings-hooks.tsx, which renders it with `hooks` active
- *  (the repo family's SettingsNav-host convention). */
-export function SettingsNavbar(props: { orgLink: string; active?: "options" | "hooks" }) {
-  const active = props.active ?? "options";
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{orgSettingsLocale.settings}</div>
-        <a class={active === "options" ? "active item" : "item"} href={`${props.orgLink}/settings`}>
-          {orgSettingsLocale.options}
-        </a>
-        <a class={active === "hooks" ? "active item" : "item"} href={`${props.orgLink}/settings/hooks`}>
-          {orgSettingsLocale.hooks}
-        </a>
-        <a class="item" href={`${props.orgLink}/labels`}>
-          {orgSettingsLocale.labels}
-        </a>
-      </div>
-    </div>
-  );
-}
+// The settings navbar is the SHARED components/settings-nav OrgSettingsNavbar
+// (the wave-114 swap — the local Options/Hooks/Labels copy deleted); the org
+// hooks/blocked/actions pages render it with their own `active` tab.
 
 /** One danger-zone row (options_dangerzone.tmpl's
  *  `flex-divided-list items-with-main` item): the title/body pair and the
@@ -635,7 +610,7 @@ export function OrgSettingsPage(props: { ctx: UiContext; data: OrgSettingsData }
     <BaseLayout ctx={ctx} title={orgDisplayName(org)} pageClass="organization settings options">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <SettingsNavbar orgLink={orgLink} />
+        <OrgSettingsNavbar orgLink={orgLink} active="options" />
         <div class="flex-container-main">
           {data.error !== null ? <div class="ui negative message">{data.error}</div> : null}
           <div class="org-setting-content">
