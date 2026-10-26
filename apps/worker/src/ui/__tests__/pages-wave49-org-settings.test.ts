@@ -178,7 +178,10 @@ describe("wave-49 parser families (parseUiRoute / handlesUiRoute)", () => {
     expect(parseUiRoute("/acme/settings/hooks")).toEqual({ family: "org-settings-hooks", owner: "acme" });
     expect(parseUiRoute("/acme/settings/labels")).toBeNull();
     expect(parseUiRoute("/acme/settings/applications")).toBeNull();
-    expect(parseUiRoute("/acme/settings/blocked_users")).toBeNull();
+    // Window-2b (4f2805f) mounted the blocked-users tab — the stale
+    // toBeNull pin updated to the claimed shape (the org-settings matrix's
+    // escalation).
+    expect(parseUiRoute("/acme/settings/blocked_users")).toEqual({ family: "org-settings-blocked", owner: "acme" });
     expect(parseUiRoute("/acme/settings/audit_logs")).toBeNull();
     expect(parseUiRoute("/acme/settings/rename/extra")).toBeNull();
     expect(parseUiRoute("/acme/settings/")).toEqual({ family: "org-settings", owner: "acme" });
