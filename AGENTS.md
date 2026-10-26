@@ -70,6 +70,12 @@ scripts/               # Repo-level tooling (contract checks, codegen)
   - `@cloudflare/workers-types ^5.20261025.1` — daily-types package kept at latest
     stable; each fresh version is younger than pnpm's release-age gate, so the
     upgrade adds a `minimumReleaseAgeExclude` entry to pnpm-workspace.yaml.
+  - transitive `miniflare 5.20261019.2-beta` (+ `unenv 2.0.0-rc.24`,
+    `youch 4.1.0-beta.10`) — upstream's coordinated EXACT pin inside
+    wrangler/vite-plugin/vitest-plugin; no stable 5.x exists and forcing 4.x
+    mismatches our compatibility_date's workerd. Dev-only, outside the
+    no-prerelease rule's intent (our declared deps stay stable); revisit at
+    miniflare 5 GA — analysis in docs/research/miniflare-beta-pin.md.
 - pnpm 12 enforces a default release-age gate (`minimumReleaseAge`, unset in
   config) — a just-published version resolves as "already up to date" and a
   lockfile carrying it FAILS plain `pnpm install` (observed 2026-10-25: hono
