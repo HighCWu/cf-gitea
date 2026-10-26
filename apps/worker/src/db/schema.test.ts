@@ -572,10 +572,16 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
     // is NOT NULL with the keyword-alias default (`false` = 0), original_url
     // nullable with NO default — the bare `ADD COLUMN original_url text`:
     // pre-existing rows read NULL (fork_parent above reads the same way).
-    // is_template (0027) is NOT NULL DEFAULT false like is_mirror.
-    expect(columns.at(-3)?.dflt_value).toBe("false");
-    expect(columns.at(-2)?.dflt_value).toBeNull();
-    expect(columns.at(-1)?.dflt_value).toBe("false");
+    // is_template (0027) is NOT NULL DEFAULT false like is_mirror. Anchor by
+    // NAME — the tail keeps growing with every counter/size wave.
+    const byName = new Map(columns.map((c) => [c.name, c]));
+    expect(byName.get("is_mirror")?.dflt_value).toBe("false");
+    expect(byName.get("original_url")?.dflt_value).toBeNull();
+    expect(byName.get("is_template")?.dflt_value).toBe("false");
+    // 0029-0031 tails: NOT NULL DEFAULT 0 (the drizzle integer default).
+    for (const name of ["size_kb", "num_stars", "num_watches", "num_forks"]) {
+      expect(byName.get(name)?.dflt_value).toBe("0");
+    }
     expect(await indexNames("repositories")).toContain("repositories_fork_parent_idx");
   });
 
