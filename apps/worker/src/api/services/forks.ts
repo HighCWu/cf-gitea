@@ -36,9 +36,9 @@ import { toApiRepository, type RepositoryWithOwner, type Viewer } from "./reposi
  *     owner's own private visibility (no org/user visibility columns yet).
  *   - `IsEmpty` starts TRUE even for a non-empty source (nothing is servable
  *     before the queue finalize; upstream copies the flag before cloning).
- *   - the base-repo `num_forks` counter bump is skipped — the Repository
- *     projection still renders `forks_count: 0` (no maintained column;
- *     services/repository.ts TODO).
+ *   - the base-repo `num_forks` counter bumps in the settle's one D1 batch,
+ *     exactly-once with the CAS (fork-task.ts; migration 0031 — SPEC-0001b
+ *     §5.3.1 row 2), and `forks_count` renders the column.
  *   - LFS pointers are not copied (no LFS model on the fork path yet).
  *   - a lost queue enqueue strands the fork in 'creating' (logged admin
  *     notice, the delete-purge enqueue posture) — upstream clones
