@@ -1195,6 +1195,12 @@ import {
   renderRepoPublicAccessPage,
   updateCodeUnitPublicAccess,
 } from "./pages/repo-settings-public-access";
+import {
+  applyRepoWikiSettings,
+  loadRepoWikiSettings,
+  parseRepoWikiForm,
+  renderRepoWikiSettingsPage,
+} from "./pages/repo-settings-wiki";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -1297,7 +1303,8 @@ export interface SettingsRoute {
     | "settings-tag-detail" // GET+POST /settings/tags/{id}
     | "settings-keys" // GET+POST /settings/keys
     | "settings-keys-delete" // POST /settings/keys/delete
-    | "settings-public-access"; // GET+POST /settings/public_access
+    | "settings-public-access" // GET+POST /settings/public_access
+    | "settings-wiki"; // GET+POST /settings/wiki (window-2d pass 2)
   owner: string;
   repo: string;
   /** The hook id (the detail/test/delete families only) or the rule id (the
@@ -2743,6 +2750,8 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 1 && rest[0] === "public_access") {
       return { family: "settings-public-access", owner, repo };
     }
+    // Window-2d pass 2: the wiki-config arm (options.tmpl's pieces).
+    if (rest.length === 1 && rest[0] === "wiki") return { family: "settings-wiki", owner, repo };
     // Wave 10: the mirror panel (the brief's literal URL; upstream renders
     // the section on options.tmpl — pages/settings.tsx's divergence note).
     if (rest.length === 1 && rest[0] === "mirror") return { family: "settings-mirror", owner, repo };
@@ -3803,6 +3812,31 @@ async function repoPublicAccessSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   const form = parsePublicAccessForm(await readUrlEncodedForm(c.req.raw));
   await updateCodeUnitPublicAccess(c.env.DB, repo.id, form);
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/public_access` } }));
+}
+
+async function repoWikiSettingsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond, url } = resolved;
+  if (resolved.route.family !== "settings-wiki") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoWikiSettings(c.env.DB, repo);
+  return respond(c.html(renderRepoWikiSettingsPage({ ctx, data, error: null, saved: url.searchParams.get("saved") === "1" }), 200));
+}
+
+async function repoWikiSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { repo, respond } = resolved;
+  if (resolved.route.family !== "settings-wiki") return respond(await c.notFound()); // drift guard
+  const form = parseRepoWikiForm(await readUrlEncodedForm(c.req.raw));
+  await applyRepoWikiSettings(c.env.DB, repo, form);
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/wiki?saved=1` } }));
 }
 
 /** GET /{owner}/{repo}/settings/hooks (pages/settings.tsx — the webhooks
@@ -8533,6 +8567,8 @@ uiRouter.post("/:owner/:repo/settings/keys", (c) => repoDeployKeysSubmit(c));
 uiRouter.post("/:owner/:repo/settings/keys/delete", (c) => repoDeployKeysDelete(c));
 uiRouter.get("/:owner/:repo/settings/public_access", (c) => repoPublicAccessPage(c));
 uiRouter.post("/:owner/:repo/settings/public_access", (c) => repoPublicAccessSubmit(c));
+uiRouter.get("/:owner/:repo/settings/wiki", (c) => repoWikiSettingsPage(c));
+uiRouter.post("/:owner/:repo/settings/wiki", (c) => repoWikiSettingsSubmit(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
