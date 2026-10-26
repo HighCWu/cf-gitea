@@ -446,5 +446,177 @@ ops — the §4 pre-Actions/packages ceiling holds).
 **REDEPLOY14** — in flight at this addendum's writing (deploying),
 expected to carry the wave recorded above (`8828f43`→`5dc924d`); its
 evidence block lands in `docs/design/p0-evidence.md` after the run.
+*(Shipped: `1c834f20-41bb-45f4-8a4a-2e1aaa62d6e6` @ `8828f43` — see
+Addendum 3 below.)*
+
+### Addendum 3 — REDEPLOY15/16 shipped; the toolkit runs production; attachments, render and releases-download go live (appended 2026-10-26, wave-45)
+
+Addendum 2 closed with REDEPLOY14 "deploying". Both subsequent deploy
+windows have since shipped, with major closures. Every hash below is
+`git cat-file -e` verified; evidence is verbatim in
+`docs/design/p0-evidence.md` (the REDEPLOY14/15/16
+redeploy-verification blocks — `efebb2e`, `305ddc8`, `2d64de1`).
+
+**Deploy lineage (continuing §2's table):**
+
+- **REDEPLOY14 shipped** — `1c834f20-41bb-45f4-8a4a-2e1aaa62d6e6`
+  (100%, 2026-10-26 06:05 UTC) from tree `8828f43` clean: the git-wire
+  residual closed in production (clone + push-back), the fork-PR e2e
+  full chain, tag carry. Its NEW medium — API release create 422ing on
+  the never-synced `refs_version` empty-gate — is REDEPLOY15's
+  headline, below.
+- **REDEPLOY15** — `b9b5c734-a90c-4a98-a04e-f985a5b0fb57` (100%,
+  Created 2026-10-26T10:16:12Z) from tree `783ab96` clean; content
+  `8828f43..783ab96`, 16 commits: the payload-mode webhook emitters,
+  ui-parity 8/9, the deploy-probes toolkit (`49de9e9`+`4ed277d`), and
+  the headline `d24dc0f`+`4619c4f`. Migration ledger unchanged, 33/33.
+- **REDEPLOY16** — `941ce4d0-2134-4ec6-8228-8f4523013b22` (100%,
+  Created 2026-10-26T11:16:55Z) from tree `2310623` clean (the
+  in-flight tree-view/tick units excluded by worktree construction);
+  content `783ab96..2310623`, 10 commits: the projects board
+  (`9b49cd2`), the fileicon layer (`cdf683a`), the attachments seam +
+  dispatch wiring (`5e082cd`+`2b5b898`), wave-ui-parity-10 (`fdaeaca`),
+  toolkit polish + preflight (`5fdbc15`, `2310623`), the compat
+  fixture cure (`3b3a3ae`). Ledger unchanged, 33/33 — zero migration
+  files in both ranges.
+- **REDEPLOY17** — in flight at this addendum's writing (deploying);
+  expected to carry `2310623..58c6cf0` (the attachments credential
+  walk, the page-domain Set-Cookie re-wrap, the tree-view envelope);
+  its evidence block lands after the run.
+
+**The release-gate fix's production proof (REDEPLOY15)** — REDEPLOY14
+found every API release create answering 422 `{"message":"repo is
+empty"}`: the gate read `refs_version`, an observability-only column
+that reads 0 on every production repo; `d24dc0f` switched the gate to
+`is_empty`. In production: a pushed repo's `POST /releases` → **201**
+(body renders `id 2`, `target_commitish "main"`; `GET /releases` lists
+it), and the negative arm holds — an `auto_init:false` empty repo →
+**422 verbatim**: the gate is a gate, not removed. The fix's fixtures
+got an honesty pass in the same window: `4619c4f` disclosed that
+`d24dc0f`'s own run was really 10-failed/25-passed behind a
+grep-masked exit code (the checklist item 1 incident) and brought the
+suite to the true 35/35. REDEPLOY15's one deterministic vitest red was
+the compat tier-1 golden fixture still seeding `refs_version` —
+production unaffected, cured at `3b3a3ae` post-tree and proven by
+REDEPLOY16's **zero compat failures**; the gate itself ran healthy a
+third consecutive deploy there (the release-asset probe's create →
+201).
+
+**First production traffic (REDEPLOY16 spot probes):**
+
+- **Attachments** (`5e082cd`+`2b5b898` — the site-level
+  `/attachments/:uuid` route): multipart issue-asset create → **201**
+  rendering `uuid`/`size`/`browser_download_url`; `GET
+  /attachments/{uuid}` with a token → **200** with the full
+  ServeAttachment header matrix verbatim (Go-sniffed `content-type`,
+  `inline` content-disposition, sandbox CSP, nosniff), body
+  byte-exact; anonymous → **404** with no existence leak; bogus uuid →
+  **404**. NEW finding (medium-low): the seam's credential walk was
+  token-only — a logged-in owner's session cookie 404s on
+  private-repo assets (closed in code, below).
+- **Render** (`fdaeaca`): owner-session `GET
+  .../render/branch/main/README.md` → **200** `text/html` sandboxed
+  fragment; non-renderable → **400 "Unable to find renderer"**
+  verbatim; missing path → **404** (probe-shape note: the refType
+  literal is required — cite the family as
+  `/render/{branch|tag|commit}/{ref}/*`).
+- **Releases download** (`fdaeaca`): release create **201** → asset
+  **201** → `browser_download_url` → **200** byte-exact with the same
+  header matrix; the `release_assets` row verified in remote D1;
+  anonymous → **404** (private).
+
+**Landed after the deploy (ride REDEPLOY17, not production-verified):**
+the **attachments credential walk** (`7cd1ce9` — token first,
+session-cookie fall-through, error-fall-through per the pinned web
+group; the rotation Set-Cookie re-wrapped on every response; the
+`browser_download_url` owner probe; 32/32), closing REDEPLOY16's
+session-404 finding; the **page-domain Set-Cookie fix** (`58c6cf0` —
+the raw id:secret append, a nameless cookie, becomes the
+`gitea_session` directive at the consumer; `resolveViewer`'s raw-value
+contract unchanged, its pin stays); the **tree-view envelope**
+(`831709f` — the Go-faithful JSON assembler: the `goJsonString` port,
+sorted-map key order, empty-never-null, submodule/symlink arms, the
+path half load-bearing + `sub_path` chain; the **WS1009 regression
+caught+fixed**: fileicon rides a DYNAMIC import edge, ~12MB kept out
+of the startup snapshot — a static re-import re-kills the a11y worker,
+stash A/B proven; 38/38, ui 938/938); and the toolkit tail (`ee88c1b`,
+below).
+
+**Infrastructure:**
+
+- **The deploy-probes toolkit's full arc — the scripted engine
+  replacing hand-rolled probe choreography**: debut `49de9e9`
+  (Addendum 2) → **REDEPLOY15 production debut** (7 scripted batteries
+  verbatim: registry tombs at t+0, generate strict-clone PASS — the
+  `8828f43` git-wire fix holds under the HARD assert, forkpr-e2e's
+  first production evidence, the ui-login owner arm, the mirror 530
+  shape; 3 friction items recorded) → **polish `5fdbc15`** (token
+  optional for D1-only batteries; `MIRROR_SETTLE_MS` 10s→30s +
+  `--mirror-settle-ms`; generic failureTail) → **PAT preflight
+  `2310623`** (one `GET /user` per invocation, three fast-fail arms,
+  zero repo creation on mismatch) → **REDEPLOY16 second run, 7/7**
+  (the preflight's silent-pass debut — the fast-fail arms still have
+  no production trigger; the D1-only audit exercised twice with no
+  token file, friction (a) resolved in production; mirror 8/8 FIRST
+  TRY on the 30s budget — the 12s variance never recurred) →
+  **`ee88c1b`** generate-e2e failureTail (template+generated sweep on
+  red, fullName-tracked, green runs silent) + the GENERIC
+  `--force-red <check-id>` self-test knob (the REDEPLOY16 incident
+  shape force-reproduced exactly; closes the battery's leftover-sweep
+  issue).
+- **ws1009 posture**: runner deaths **0 across both deploy windows**
+  (runs of record: 3418 passed / 4 failed / 28 skipped at `783ab96` —
+  three solo-green suite-load flakes plus the cured fixture; 3536/2/5
+  at `2310623`, both solo-green 25/25; zero compat failures); the
+  dynamic-import edge pin extends the `?raw` posture to the tree-view
+  page.
+
+Compat ticks: the UI survey moved **53/3/58 + 0** → **59/3/51 + 1
+in-flight** across the window (mini-tick `5abfe49`'s honest recount to
+114 rows → tick-5 `64aa06a` at the REDEPLOY16 tree; tick-4 `48f873f`'s
+56/4/54 mid-window), and the counts are now **programmatic, not
+eyeballed**: upstream page-bearing GETs walked from
+`gitea/routers/web/web.go` at the pinned submodule; ours =
+`git show HEAD:apps/worker/src/ui/index.ts | grep -c "family:"` (154
+parse branches at tick-5) + `git ls-tree HEAD --name-only
+apps/worker/src/ui/pages/ | wc -l` (50 renders), in-flight rows
+excluded from the totals by dispatch ownership, API dependencies
+cross-checked with `node scripts/check-openapi.mjs`. The declared API
+surface is unchanged at **490 ops / 298 paths** (both windows zero new
+ops — the §4 pre-Actions/packages ceiling holds; 64 remaining, all
+FEATURE-ABSENT). *(Just landed as this addendum was written: tick-6
+`7a5861e` at `58c6cf0` — 60/3/50 + 1, 156 branches / 51 renders; the
+tree-view row LANDED fully with the dynamic-import POSTURE PIN,
+repo-projects flips IN-FLIGHT.)*
+
+Still in flight at this addendum's writing: **REDEPLOY17** (deploying
+— carries the landed-after-deploy bullets above), the **repo-projects
+UI wave** (tick-6's IN-FLIGHT F-family row), and the **two
+fragment-machinery waves** (`blob_excerpt` gated on the hunk
+machinery, `lastcommit` on the template port — the only remaining
+fragment gates). Superseded lines: Addendum 2's REDEPLOY14 "deploying"
+marker (shipped, above); tick-5's fragments-row IN-FLIGHT (landed as
+`831709f`, tick-6).
 
 ### What production proved this window
+
+- Deploy gates at both GO trees: `pnpm typecheck` 0 errors;
+  `check:api` PASS (490 ops / 298 paths, tier-1 78/78 paths, 129/129
+  ops); `check:contract` PASS (sha256 `529a3314…` verbatim — identical
+  across REDEPLOY14/15/16); smoke **6 pass / 0 fail / 1 skip** with
+  `--migrate-check` both runs; migration ledger **33/33**, "No
+  migrations to apply" both windows.
+- **Release gate**: 201 on a pushed repo / 422
+  `{"message":"repo is empty"}` on a genuinely empty one, verbatim
+  both arms (REDEPLOY15); healthy again at REDEPLOY16 — third
+  consecutive deploy.
+- **Toolkit**: 7 batteries verbatim at REDEPLOY15 and 7/7 at
+  REDEPLOY16 (mirror 8/8 first-try); cleanup-audit green both runs —
+  final whole-table `personal_access_tokens` = 1, `action=0`,
+  `push_mirrors=0`; every probe repo/PAT cleaned or disclosed
+  (REDEPLOY15's id-34 PAT, lost to a token-extraction regex slip, was
+  deleted before any use; REDEPLOY16's single run PAT deleted by
+  verified id); `gitea/` pristine at pin `fc4936884584`.
+- **New-surface probes**: the attachment / render / release-download
+  arms above with exact codes; ws1009 runner deaths 0 in both vitest
+  runs of record.
