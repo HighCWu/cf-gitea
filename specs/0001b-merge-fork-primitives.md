@@ -602,6 +602,23 @@ is reused verbatim so receive's Step 2 batches and fork replication share one ro
 shape.) `PUT /config`-style metadata (description, visibility) is D1-side and not
 copied by the engine.
 
+**Annotated-tag fidelity on copied repos (intentional divergence, as-built ab5d300).**
+Upstream preserves tag-object bytes across fork/generate/rename (it moves `.git`
+content on disk); this stack carries annotated tags through the §5.3 lease in two
+classes. **Packed/pushed** tips stay byte-identical — they carry as plain refs and the
+adopted packs bring the tag objects' true bytes (finalize re-peels from them).
+**Loose** tips (Worker-authored via the tags API) are re-materialized through the same
+`serializeTag` the writer used, with `tagger=null` / `message=""` — the read RPC
+surface cannot recover tag-object bytes (`readCommit` peels past them; `listRefs`
+carries only targets + the peel cache), so tagger/message are unrecoverable. The
+materialized oid is a deterministic function of (name, peel), so rename-back and
+fork/generate cycles are stable; name and peeled commit always match the source, only
+the oid of a tag that originally carried a tagger line or message differs. Surfaces:
+fork and template-generate ride this §5.3 consumer (`src/repos/fork-task.ts`
+`completeLooseImport`), rename/transfer rides the same RPCs (`src/repos/carry.ts`
+`carryIntoCell` — the module header holds the full fidelity note, and is the
+authoritative detail).
+
 ### 5.4 Fork→PR object relay (resolves SPEC-0005 §6.2's cost question)
 
 When a PR's head repo differs from its base repo, the base must contain the head
