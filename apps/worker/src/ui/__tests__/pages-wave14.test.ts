@@ -333,9 +333,11 @@ describe("wave-14 parser families (parseUiRoute / handlesUiRoute)", () => {
     expect(parseUiRoute("/octo/hello/settings/hooks/42/test/extra")).toBeNull();
     // Wave 15 claimed /settings/branches (pages/branch-protection.tsx); the
     // rest of the deeper settings space stays engine-owned (the wave-4 pin,
-    // narrowed by the wave-15 claim).
-    expect(parseUiRoute("/octo/hello/settings/keys")).toBeNull();
-    expect(parseUiRoute("/octo/hello/settings/tags")).toBeNull();
+    // narrowed by the wave-15 claim). Window-2d (b54f709) mounted the
+    // deploy-keys and protected-tags tabs — both stale nulls updated to the
+    // claimed shapes (the labels matrix's escalation).
+    expect(parseUiRoute("/octo/hello/settings/keys")).toEqual({ family: "settings-keys", owner: "octo", repo: "hello" });
+    expect(parseUiRoute("/octo/hello/settings/tags")).toEqual({ family: "settings-tags", owner: "octo", repo: "hello" });
   });
 });
 
