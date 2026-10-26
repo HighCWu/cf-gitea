@@ -21,6 +21,7 @@ import { registerWikiRoutes } from "./routes/wiki";
 import { registerGitHookRoutes } from "./routes/git-hooks";
 import { registerProjectsRepoRoutes } from "./routes/projects-repo";
 import { registerProjectsOrgRoutes } from "./routes/projects-org";
+import { registerProjectsUserRoutes } from "./routes/projects-user";
 import { registerOAuth2AppRoutes } from "./routes/oauth2-apps";
 import { registerAdminBadgeRoutes } from "./routes/admin-badges";
 import { registerRepoLicenseRoutes } from "./routes/repo-licenses";
@@ -294,6 +295,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // Batch 6 stage 2: the org scope over the same store — orgAssignment
   // 404/307 chain, unit-access 404-never-403, workflows owner-only.
   registerProjectsOrgRoutes(app, requireAuth, optionalAuth);
+  // Batch 6 stage 3 (FINAL): the user scope — doer-owned ids (reqToken-only
+  // writes, no unit-access chain), /users/{username} UserAssignmentAPI
+  // matrix. Batch 6 complete: 64 ops, three scopes, one store.
+  registerProjectsUserRoutes(app, requireAuth, optionalAuth);
   // Wave-23 long-tail: OAuth2 app CRUD (migration 0026; CRUD-only — the
   // authorize/token flow is web-UI territory), admin badges + repo licenses
   // + template generate (0027; license detection is glue-only until the
