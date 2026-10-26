@@ -36,6 +36,21 @@
  *                  hides the writer form, POST /login 303 + gitea_session,
  *                  cookie view renders the owner form. A red run sweeps its
  *                  fixture repo (the failureTail).
+ *   window2-mounts The window-2 mount sweep over the user-settings tab family
+ *                  (window-2a 0c2b151 — 8 modules / 19 routes; more
+ *                  sub-windows land before the deploy): anonymous tab GETs
+ *                  303 onto the login round-trip, cookie GETs answer 200
+ *                  text/html with each page's pageClass discriminator, then
+ *                  the mounted write arms — the secret create/delete
+ *                  round-trip (303-target asserts + the invalid-name
+ *                  re-render negative + the idempotent delete), the keys
+ *                  add-form negative (the exact 422 text, no row), and the
+ *                  last-owner leave flash (org create → leave →
+ *                  ?error=last-owner). Every tab arm reads the mount state
+ *                  AT RUN TIME: a 404 from a not-yet-mounted path is a
+ *                  documented [warn], anything mounted asserts hard. A red
+ *                  run sweeps the secret (by name, via the user API) + the
+ *                  org it created (the failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -129,7 +144,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -209,6 +224,7 @@ const usage = () =>
   "  forkpr-e2e:    (no extra options)\n" +
   "  mirror:        --mirror-settle-ms <ms>    (sync-settle budget, default 30000; the row-settle arm reuses --d1-scope)\n" +
   "  ui-login:      --new-label-count <n>      (canonical 3 writer-form occurrences)\n" +
+  "  window2-mounts: (no extra options)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -1301,6 +1317,325 @@ const uiFailureCleanup = async (ctx) => {
   if (acts.length) log(`  [tail] ui-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
 };
 
+// ---------- battery: window2-mounts (the window-2 user-settings tab family) ----------
+
+/**
+ * The window-2a mount (0c2b151 — the user-settings tab family, 8 modules /
+ * 19 routes) plus whatever sub-windows land before the deploy: every tab arm
+ * reads the mount state AT RUN TIME. A 404 from a tab path is the documented
+ * not-yet-mounted degradation ([warn] — the mount window is still landing);
+ * anything mounted asserts hard. The pageClass strings are the modules'
+ * BaseLayout discriminators (layout_head's §2.4.1 convention — asserted as
+ * the full class attribute, the shape the module tests pin). The login-cookie
+ * methodology (ui-login's lesson: a PAT header never reads a UI page) rides
+ * POST /login → gitea_session; the write arms send a same-origin `Origin`
+ * header so they exercise §2.8's sameOriginGuard PASS arm, not its
+ * absent-header tolerance.
+ */
+const WINDOW2_TABS = [
+  { slug: "appearance", path: "/user/settings/appearance", pageClass: "user settings" },
+  { slug: "security", path: "/user/settings/security", pageClass: "user settings security" },
+  { slug: "actions-secrets", path: "/user/settings/actions/secrets", pageClass: "user settings actions" },
+  { slug: "actions-variables", path: "/user/settings/actions/variables", pageClass: "user settings actions" },
+  { slug: "hooks", path: "/user/settings/hooks", pageClass: "user settings webhooks" },
+  { slug: "keys", path: "/user/settings/keys", pageClass: "user settings sshkeys" },
+  { slug: "applications", path: "/user/settings/applications", pageClass: "user settings applications" },
+  { slug: "organization", path: "/user/settings/organization", pageClass: "user settings organization" },
+];
+
+/** The login round-trip target an anonymous tab GET answers (the mounted
+ *  shape — upstream's /user/login form lives at /login here, uiRouter's
+ *  session note). */
+const window2LoginTarget = (tabPath) => `/login?redirect_to=${encodeURIComponent(tabPath)}`;
+
+/** `secretCreated`/`secretGone` (+ the row id the round-trip captures) and
+ *  `orgCreated`/`orgGone` drive the failure-cleanup tail (see
+ *  window2FailureCleanup): the red-runs-self-sweep posture. The secret tail
+ *  sweeps BY NAME via the user API (DELETE /user/actions/secrets/<name>), so
+ *  it covers the edge where a red landed before the web round-trip captured
+ *  the numeric row id. */
+const window2Context = () => ({
+  user: opts.user, cookie: null,
+  secretName: `W2SEC_${hexId()}`, secretDescription: `deploy-probes window2 ${hexId()}`,
+  secretCreated: false, secretGone: false, secretRowId: null,
+  keyTitle: `w2key-${hexId()}`,
+  org: `w2org-${hexId()}`, orgCreated: false, orgGone: false,
+});
+
+/** The window-2 web write: form-urlencoded POST with the session cookie and a
+ *  same-origin Origin header (§2.8). Redirects surface (fetchT), so every
+ *  303's Location lands in the caller's hands. */
+const window2PostForm = async (ctx, pathname, fields) => {
+  const form = new URLSearchParams(fields);
+  const res = await fetchT(`${opts.baseUrl}${pathname}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin: opts.baseUrl,
+      cookie: ctx.cookie,
+    },
+    body: form.toString(),
+  });
+  const body = await res.text();
+  return { status: res.status, location: res.headers.get("location"), body };
+};
+
+const window2Steps = (ctx) => [
+  {
+    id: "w2-login-303",
+    expect: `POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session cookie — the ui-login methodology (a PAT header never reads a UI page; the session value is scrubbed from all output)`,
+    run: async () => {
+      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const res = await fetchT(`${opts.baseUrl}/login`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      await res.text();
+      expect(res.status === 303, `status ${res.status} (expected 303 See Other)`);
+      const setCookie = res.headers.getSetCookie().find((c) => c.startsWith("gitea_session="));
+      expect(setCookie !== undefined, `no gitea_session cookie in Set-Cookie (got ${res.headers.getSetCookie().length} cookies)`);
+      ctx.cookie = setCookie.split(";")[0];
+      secrets.push(ctx.cookie.split("=")[1] ?? "");
+      return "303 + gitea_session cookie";
+    },
+  },
+  {
+    id: "w2-anon-tabs-303",
+    expect: `anonymous GET of each window-2 tab path → 303 onto the login round-trip, location EXACTLY /login?redirect_to=<encoded path> (mount-at-run-time: a 404 warns — not yet mounted; anything else fails)`,
+    run: async () => {
+      const unmounted = [];
+      let ok = 0;
+      for (const tab of WINDOW2_TABS) {
+        const res = await fetchT(`${opts.baseUrl}${tab.path}`);
+        await res.text();
+        if (res.status === 404) {
+          unmounted.push(tab.path);
+          continue;
+        }
+        expect(res.status === 303, `${tab.path} status ${res.status} (expected 303 or, unmounted, 404)`);
+        expect(res.headers.get("location") === window2LoginTarget(tab.path),
+          `${tab.path} location ${JSON.stringify(res.headers.get("location"))} (expected ${window2LoginTarget(tab.path)})`);
+        ok += 1;
+      }
+      if (unmounted.length > 0) {
+        return { status: "warn", detail: `${ok}/${WINDOW2_TABS.length} tabs 303'd onto the login round-trip; NOT MOUNTED at run time: ${unmounted.join(", ")}` };
+      }
+      return `all ${WINDOW2_TABS.length} tab paths 303 → /login?redirect_to=<encoded path>`;
+    },
+  },
+  ...WINDOW2_TABS.map((tab) => ({
+    id: `w2-${tab.slug}-page-200`,
+    expect: `cookie GET ${tab.path} → 200 text/html carrying the pageClass discriminator class="page-content ${tab.pageClass}" (mount-at-run-time: a 404 warns — not yet mounted)`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}${tab.path}`, { headers: { cookie: ctx.cookie } });
+      const body = await res.text();
+      if (res.status === 404) {
+        return { status: "warn", detail: `${tab.path} 404 — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+      }
+      expect(res.status === 200, `${tab.path} status ${res.status} (expected 200)`);
+      expect(String(res.headers.get("content-type")).includes("text/html"),
+        `${tab.path} content-type ${JSON.stringify(res.headers.get("content-type"))} (expected text/html)`);
+      expect(body.includes(`class="page-content ${tab.pageClass}"`),
+        `${tab.path} missing class="page-content ${tab.pageClass}" (the pageClass discriminator)`);
+      return `200 text/html — class="page-content ${tab.pageClass}"`;
+    },
+  })),
+  {
+    id: "w2-secret-invalid-name-rerender",
+    expect: `POST /user/settings/actions/secrets {"name":"bad-name!"} → 200 RE-RENDER (never a 303) with the exact ValidateName text in the negative banner: "name must start with a letter or underscore and contain only letters, numbers, and underscores" — no row written`,
+    run: async () => {
+      const r = await window2PostForm(ctx, "/user/settings/actions/secrets", { name: "bad-name!", data: "x", description: "" });
+      expect(r.status === 200, `status ${r.status} (expected 200 — the invalid re-render)`);
+      expect(r.body.includes("name must start with a letter or underscore and contain only letters, numbers, and underscores"),
+        `the re-render does not carry the exact ValidateName text: ${r.body.slice(0, 120)}`);
+      return "200 re-render with the exact ValidateName banner text";
+    },
+  },
+  {
+    id: "w2-secret-create-303",
+    expect: `POST /user/settings/actions/secrets {"name":"${ctx.secretName}","data":"line1\\r\\nline2","description":"${ctx.secretDescription}"} → 303 with location EXACTLY /user/settings/actions/secrets. The data carries CRLF through the web path's EOL-normalization arm (NormalizeStringEOL, shared/secrets/secrets.go:42) — NOT observable: secret values are write-only (the row renders ******, the edit form re-renders empty, the user API is PUT/DELETE-only), so the observable assertions are the 303 target + the row's name/description`,
+    run: async () => {
+      const r = await window2PostForm(ctx, "/user/settings/actions/secrets", {
+        name: ctx.secretName, data: "line1\r\nline2", description: ctx.secretDescription,
+      });
+      // Mark on the observable write (before the location assert) so a red
+      // HERE still sweeps the row the server just wrote.
+      if (r.status === 303) ctx.secretCreated = true;
+      expect(r.status === 303, `status ${r.status} (expected 303): ${r.body.slice(0, 120)}`);
+      expect(r.location === "/user/settings/actions/secrets",
+        `location ${JSON.stringify(r.location)} (expected /user/settings/actions/secrets)`);
+      return "303 → /user/settings/actions/secrets (CRLF data through the normalization arm)";
+    },
+  },
+  {
+    id: "w2-secret-row-visible",
+    expect: `cookie GET /user/settings/actions/secrets → 200 with the row (the name + its description) and the delete form's hidden id captured (name="id" value="N" after the row name)`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}/user/settings/actions/secrets`, { headers: { cookie: ctx.cookie } });
+      const body = await res.text();
+      expect(res.status === 200, `status ${res.status} (expected 200)`);
+      const nameAt = body.indexOf(ctx.secretName);
+      expect(nameAt !== -1, `the created secret ${ctx.secretName} is not on the page`);
+      expect(body.includes(ctx.secretDescription), `the description ${ctx.secretDescription} is not on the page`);
+      const m = /name="id" value="(\d+)"/.exec(body.slice(nameAt));
+      expect(m !== null, "no delete-form hidden id found after the row name");
+      ctx.secretRowId = m[1];
+      return `row present (name + description); delete-form id ${ctx.secretRowId}`;
+    },
+  },
+  {
+    id: "w2-secret-delete-303",
+    expect: `POST /user/settings/actions/secrets/delete {"id":${ctx.secretRowId ?? "<captured>"}} → 303 with location EXACTLY /user/settings/actions/secrets`,
+    run: async () => {
+      const r = await window2PostForm(ctx, "/user/settings/actions/secrets/delete", { id: ctx.secretRowId });
+      // Same mark-on-the-write convention as the create arm.
+      if (r.status === 303) ctx.secretGone = true;
+      expect(r.status === 303, `status ${r.status} (expected 303): ${r.body.slice(0, 120)}`);
+      expect(r.location === "/user/settings/actions/secrets",
+        `location ${JSON.stringify(r.location)} (expected /user/settings/actions/secrets)`);
+      return "303 → /user/settings/actions/secrets";
+    },
+  },
+  {
+    id: "w2-secret-gone",
+    expect: `cookie GET /user/settings/actions/secrets → the secret ${ctx.secretName} is GONE`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}/user/settings/actions/secrets`, { headers: { cookie: ctx.cookie } });
+      const body = await res.text();
+      expect(res.status === 200, `status ${res.status} (expected 200)`);
+      expect(!body.includes(ctx.secretName), `the secret ${ctx.secretName} still renders after the delete`);
+      return `gone — ${ctx.secretName} absent`;
+    },
+  },
+  {
+    id: "w2-secret-delete-idempotent-303",
+    expect: `re-POST /user/settings/actions/secrets/delete with the SAME id (the missing arm — a stale/foreign/absent id) → STILL 303 onto /user/settings/actions/secrets (upstream's every-arm-303s fidelity)`,
+    run: async () => {
+      const r = await window2PostForm(ctx, "/user/settings/actions/secrets/delete", { id: ctx.secretRowId });
+      expect(r.status === 303, `status ${r.status} (expected 303 on the missing arm): ${r.body.slice(0, 120)}`);
+      expect(r.location === "/user/settings/actions/secrets",
+        `location ${JSON.stringify(r.location)} (expected /user/settings/actions/secrets)`);
+      return "303 on the missing arm — the delete is idempotent";
+    },
+  },
+  {
+    id: "w2-key-invalid-content-rerender",
+    expect: `POST /user/settings/keys {"type":"ssh","title":"${ctx.keyTitle}","content":"not-a-key"} → 200 RE-RENDER (never a 303) with the exact 422 text "Cannot verify your SSH key: invalid key format: illegal base64 data" (form.invalid_ssh_key %s + the parse detail) and the keys pageClass — no row written`,
+    run: async () => {
+      const r = await window2PostForm(ctx, "/user/settings/keys", { type: "ssh", title: ctx.keyTitle, content: "not-a-key", signature: "" });
+      expect(r.status === 200, `status ${r.status} (expected 200 — the AddKeyOutcome re-render)`);
+      expect(r.body.includes("Cannot verify your SSH key: invalid key format: illegal base64 data"),
+        `the re-render does not carry the exact invalid-content 422 text`);
+      expect(r.body.includes(`class="page-content user settings sshkeys"`),
+        "the re-render lost the keys pageClass discriminator");
+      return "200 re-render with the exact 422 text";
+    },
+  },
+  {
+    id: "w2-key-no-row",
+    expect: `fresh cookie GET /user/settings/keys → the title ${ctx.keyTitle} is ABSENT (the invalid add created no row)`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}/user/settings/keys`, { headers: { cookie: ctx.cookie } });
+      const body = await res.text();
+      expect(res.status === 200, `status ${res.status} (expected 200)`);
+      expect(!body.includes(ctx.keyTitle), `the title ${ctx.keyTitle} renders on a fresh keys page — a row WAS created`);
+      return `no row — ${ctx.keyTitle} absent`;
+    },
+  },
+  {
+    id: "w2-org-create-201",
+    expect: `POST /api/v1/orgs {"username":"${ctx.org}"} → 201 (the forkpr-e2e pattern — the doer-owned org; the PAT user is its SOLE owner, the last-owner arm's precondition)`,
+    run: async () => {
+      const res = await api("/orgs", { method: "POST", body: { username: ctx.org } });
+      // Mark on the observable write (before the asserts) so a red HERE still
+      // sweeps the org the server just wrote.
+      if (res.status === 201) ctx.orgCreated = true;
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      return `org ${ctx.org} created (the PAT user is the sole owner)`;
+    },
+  },
+  {
+    id: "w2-org-leave-last-owner-303",
+    expect: `POST /user/settings/organization/leave {"uid":"0","org":"${ctx.org}"} → 303 with location EXACTLY /user/settings/organization?error=last-owner (the §4.3 last-owner guard; the form's uid is accepted-and-ignored)`,
+    run: async () => {
+      const r = await window2PostForm(ctx, "/user/settings/organization/leave", { uid: "0", org: ctx.org });
+      expect(r.status === 303, `status ${r.status} (expected 303): ${r.body.slice(0, 120)}`);
+      expect(r.location === "/user/settings/organization?error=last-owner",
+        `location ${JSON.stringify(r.location)} (expected /user/settings/organization?error=last-owner — a "/" here would mean the leave WENT THROUGH and took the sole owner out)`);
+      return "303 → /user/settings/organization?error=last-owner (the leave refused)";
+    },
+  },
+  {
+    id: "w2-org-last-owner-flash",
+    expect: `cookie GET /user/settings/organization?error=last-owner → 200 with the flash banner (ui negative message) rendering the form.last_org_owner text — asserted on the un-escaped tail ("must be at least one owner for an organization.") because renderToString HTML-escapes the locale's apostrophes`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}/user/settings/organization?error=last-owner`, { headers: { cookie: ctx.cookie } });
+      const body = await res.text();
+      expect(res.status === 200, `status ${res.status} (expected 200)`);
+      expect(body.includes(`class="ui negative message"`), "the ui negative message banner is missing");
+      expect(body.includes("must be at least one owner for an organization."),
+        `the flash does not carry the form.last_org_owner text`);
+      return `200 — the last-owner flash banner renders`;
+    },
+  },
+  {
+    id: "w2-org-cleanup-204",
+    expect: `DELETE /api/v1/orgs/${ctx.org} → 204 (a failed cleanup is documented, not fatal; the failure-cleanup tail re-sweeps)`,
+    run: async () => {
+      const res = await api(`/orgs/${ctx.org}`, { method: "DELETE" });
+      if (res.status === 204) ctx.orgGone = true; // the tail no-ops on a green sweep
+      if (res.status === 204) return `org ${ctx.org} deleted`;
+      return { status: "warn", detail: `org ${ctx.org} LEFT BEHIND — DELETE returned ${res.status}` };
+    },
+  },
+];
+
+/** The red-runs-self-sweep posture (the generate-e2e shape): a red window2
+ *  run sweeps its own secret + org instead of leaving them for a hand-clean.
+ *  This finally-style tail runs after EVERY window2-mounts battery run (green
+ *  ones no-op silently: the round-trip already deleted the secret and
+ *  w2-org-cleanup-204 the org, so the gone flags skip them) and best-effort
+ *  deletes exactly what the run created and has not already deleted — the
+ *  secret BY NAME via the user API (DELETE /user/actions/secrets/<name>), so
+ *  it covers the edge where the red landed before the web round-trip captured
+ *  the numeric row id, then the org (an org delete over nothing is harmless;
+ *  a surviving org would keep the audit's shapes honest anyway — orgs are not
+ *  audited — but the sweep leaves nothing regardless). One [tail] line logs
+ *  every action; failures feed left_behind and are never fatal; it never
+ *  throws (main's finally depends on it). */
+const window2FailureCleanup = async (ctx) => {
+  const acts = [];
+  const noteLeftBehind = (what, why) => {
+    leftBehind.push(`${what} (failure-cleanup tail: ${why})`);
+    acts.push(`${what} LEFT BEHIND — ${why}`);
+  };
+  try {
+    if (ctx.secretCreated === true && ctx.secretGone !== true) {
+      try {
+        const res = await api(`/user/actions/secrets/${ctx.secretName}`, { method: "DELETE" });
+        if (res.status === 204) acts.push(`secret ${ctx.secretName} deleted (204)`);
+        else if (res.status === 404) acts.push(`secret ${ctx.secretName} already absent (404)`);
+        else noteLeftBehind(`secret ${ctx.secretName}`, `DELETE returned ${res.status}`);
+      } catch (err) {
+        noteLeftBehind(`secret ${ctx.secretName}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (ctx.orgCreated === true && ctx.orgGone !== true) {
+      try {
+        const res = await api(`/orgs/${ctx.org}`, { method: "DELETE" });
+        if (res.status === 204) acts.push(`org ${ctx.org} deleted (204)`);
+        else noteLeftBehind(`org ${ctx.org}`, `DELETE returned ${res.status}`);
+      } catch (err) {
+        noteLeftBehind(`org ${ctx.org}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } catch (err) {
+    acts.push(`the sweep itself failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (acts.length) log(`  [tail] w2-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -1386,11 +1721,15 @@ const BATTERIES = {
   "forkpr-e2e": { title: "fork → owner:branch PR chain", context: forkprContext, steps: forkprSteps, failureTail: forkprFailureCleanup },
   "mirror": { title: "push-mirror credential-free arms (SSRF gate + .invalid lifecycle)", context: mirrorContext, steps: mirrorSteps, failureTail: mirrorFailureCleanup },
   "ui-login": { title: "login-cookie labels owner view", context: uiContext, steps: uiSteps, failureTail: uiFailureCleanup },
+  // Mount-at-run-time: tab 404s degrade to warns (the window-2 sub-wave is
+  // still landing); mounted surfaces assert hard. The write arms (window-2a,
+  // LIVE) are chain-hard.
+  "window2-mounts": { title: "window-2 mounts (user-settings tab family: anon 303s, pageClass 200s, secret round-trip, keys negative, last-owner flash)", context: window2Context, steps: window2Steps, failureTail: window2FailureCleanup },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 

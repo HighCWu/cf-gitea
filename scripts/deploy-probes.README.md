@@ -19,7 +19,8 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 ```
 
 - Batteries: `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
-  `ui-login`, `cleanup-audit`, `all` (runs them in that order, audit last).
+  `ui-login`, `window2-mounts`, `cleanup-audit`, `all` (runs them in that
+  order, audit last).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
@@ -39,7 +40,8 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 - Against LOCAL dev: `--base-url http://127.0.0.1:5173 --d1-scope local` for
   the HTTP batteries (the mirror row-settle arm reuses `--d1-scope`); mint the
   PAT with `node scripts/bootstrap-admin.mjs <user>` on local D1, and pass the
-  matching `--user`. A local self-test (all seven batteries) was run green
+  matching `--user`. A local self-test (the seven batteries committed at the
+  time — `window2-mounts` landed after) was run green
   from this tree; see "Local self-test fixtures" below.
 - `--json` puts only the final JSON summary on stdout (progress to stderr),
   same contract as deploy-smoke.
@@ -182,6 +184,44 @@ prints all of them verbatim.
   `repoFullName`-tracked) best-effort deletes it (logged on one
   `[tail] ui-leftover-sweep` line; failures feed `left_behind`, never fatal;
   a green run no-ops silently).
+- **window2-mounts** — the window-2 mount sweep over the user-settings tab
+  family (window-2a 0c2b151: 8 modules / 19 routes; more sub-windows land
+  before the deploy, so every tab arm reads the mount state **at run time** —
+  a 404 from a tab path is a documented `[warn]`, the not-yet-mounted
+  degradation, while anything mounted asserts hard). Login-cookie
+  methodology first (`POST /login` → `gitea_session`; a PAT header never
+  reads a UI page), then: anonymous GET of all 8 tab paths (appearance,
+  security, actions/secrets, actions/variables, hooks, keys, applications,
+  organization) → 303 with location **exactly**
+  `/login?redirect_to=<encoded path>` (the mounted login shape — upstream's
+  `/user/login` form lives at `/login` here); cookie GET of each tab → 200
+  text/html carrying that page's pageClass discriminator as the **full class
+  attribute** (`class="page-content user settings sshkeys"` etc. — the
+  modules' BaseLayout strings, the shape the module tests pin); then the
+  mounted write arms — the **secret round-trip** (invalid name → 200
+  re-render with the exact ValidateName text; create with CRLF-bearing data →
+  303 exactly `/user/settings/actions/secrets`; row + description visible and
+  the delete form's hidden numeric id captured; delete by id → the same exact
+  303; the name gone; re-delete of the same id → still 303, upstream's
+  every-arm-303s idempotency), the **keys add-form negative** (`type=ssh`
+  with garbage content → 200 re-render with the exact 422 text "Cannot verify
+  your SSH key: invalid key format: illegal base64 data" and a fresh GET
+  showing no row), and the **last-owner leave flash** (doer-owned org via
+  `POST /api/v1/orgs`, sole-owner leave → 303 exactly
+  `/user/settings/organization?error=last-owner`, then the flash page renders
+  the `ui negative message` — asserted on the un-escaped tail because
+  renderToString HTML-escapes the locale's apostrophes). The EOL note: the
+  web write path normalizes CRLF→LF (NormalizeStringEOL) but secret values
+  are write-only on every surface (the row renders `******`, the user API is
+  PUT/DELETE-only), so the normalization is **not observable** — the POST
+  carries CRLF to exercise the arm, the observable asserts are the 303
+  targets + the row's name/description. The write arms send a same-origin
+  `Origin` header so they exercise §2.8's sameOriginGuard PASS arm. **Failure
+  cleanup (the consistency posture):** a finally-style tail best-effort
+  deletes the secret **by name** via the user API
+  (`DELETE /user/actions/secrets/<name>` — covering the red-before-the-row-id
+  edge) and the org (logged on one `[tail] w2-leftover-sweep` line; failures
+  feed `left_behind`, never fatal; a green run no-ops silently).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -217,6 +257,8 @@ prints all of them verbatim.
   - `forkpr-e2e` — fork, then base, then org;
     `[tail] forkpr-leftover-sweep`.
   - `ui-login` — its fixture repo; `[tail] ui-leftover-sweep`.
+  - `window2-mounts` — its secret by name (the user API DELETE), then its
+    org; `[tail] w2-leftover-sweep`.
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
   emptied everything, and the gone flags skip the rest). `p0` creates
@@ -248,6 +290,12 @@ prints all of them verbatim.
     deletes in tail order (fork, base, org).
   - `ui-login --force-red ui-labels-cookie-owner` — reds after the fixture
     repo exists; the `[tail] ui-leftover-sweep` line must list its delete.
+  - `window2-mounts --force-red w2-secret-gone` — reds after the secret row
+    exists (create green, delete chain-skipped); the
+    `[tail] w2-leftover-sweep` line must list the by-name secret delete.
+    `--force-red w2-org-last-owner-flash` reds after the org exists; the tail
+    must list the org delete. Forcing an arm before the first creation (e.g.
+    `w2-login-303`) leaves nothing to sweep — the tail stays silent.
   The rehearsal convention: each forced-red run is followed by a
   `cleanup-audit` run, and the audit going green is the sweep's proof.
 - The mirror battery can also be forced honestly through its real budget
