@@ -546,7 +546,13 @@ The `notready` render path is identical either way.
 12. **Injection sinks**: JSX auto-escaping everywhere; the only raw-HTML sink is the
     markdown pipeline output (§3.4 posture); the config JSON tag escapes `<` (§2.4.1).
 13. **Trailing slashes**: the UI router applies Hono's `trimTrailingSlash`; we never
-    emit trailing-slash URLs.
+    emit trailing-slash URLs — ONE upstream-parity exception (the dispatcher's
+    lastcommit carve): the file-list loader URL keeps upstream's trailing slash for
+    root listings (view.go:277 appends `/` before `PathEscapeSegments(TreePath)`,
+    which is "" there; upstream's own `m.Get("/lastcommit/*")` wildcard serves that
+    shape, web.go:1761). The top-level dispatcher routes `/owner/repo/lastcommit/…/`
+    into the sub-app when the trimmed path is parser-claimed — every other
+    trailing-slash shape keeps its pre-UI engine owner.
 14. **No CSP** is emitted this slice (upstream uses per-request nonces — spike §8);
     the two inline head artifacts (error collector, config JSON) are the reason CSP
     needs its own pass (open question 6).

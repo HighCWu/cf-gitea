@@ -7,6 +7,7 @@ import { basicHeader, basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUs
 import { fnv1a32 } from "./auth/failure-limiter";
 import { authFailures, repositories } from "./db/schema";
 import { asByteStream, gunzipCapped, withVerifiedStart } from "./git-http/gzip";
+import { ensureSeededRepo } from "./ui/testing/seed-repo";
 
 // The git authorize hook verifies PATs against D1 (SPEC-0002), so the
 // top-level worker tests need the schema applied like the auth module's own.
@@ -721,5 +722,50 @@ describe("Tier-2 UI mount (dispatcher branch order: api → ui → gate)", () =>
     const post = await SELF.fetch("https://example.com/demo/absent", { method: "POST", body: "" });
     expect(post.status).toBe(404);
     expect(post.headers.get("www-authenticate")).toBeNull();
+  });
+
+  it("carves the lastcommit loader's trailing-slash form into the sub-app (root listings)", async () => {
+    // Upstream's LastCommitLoaderURL carries a trailing slash for ROOT
+    // listings (view.go:277 — RepoLink + "/lastcommit/" + PathEscape(commit) +
+    // "/" + PathEscapeSegments(TreePath), TreePath "" leaves the slash) and
+    // upstream's own route serves that shape through the wildcard
+    // (web.go:1761 m.Get("/lastcommit/*")); the wave-46 component emits the
+    // same bytes. The dispatcher's blanket trailing-slash rule hands every
+    // repo-scoped slash path to the engine (404) before the sub-app's own
+    // wildcard route — which matches the slash form and answers it in place —
+    // ever sees it (RD19's latent finding). The carve is NARROW: only the
+    // lastcommit head, and only when the trimmed path is one the parser
+    // claims; every other trailing-slash shape keeps its pre-UI engine owner.
+    const seeded = await ensureSeededRepo({
+      owner: "alice",
+      slug: "lastcommit-slash",
+      commits: [{ message: "seed the tree", time: 1_700_000_000, files: [{ path: "README.md", content: "# hi\n" }] }],
+    });
+    const tip = seeded.tips[seeded.tips.length - 1]!;
+    const refSubUrl = `?refSubUrl=${encodeURIComponent("branch/main")}`;
+
+    // The SLASH form (the component's exact root-listing bytes): the sub-app's
+    // wildcard answers it in place — a 200 fragment, never the engine's JSON
+    // 404.
+    const slashed = await SELF.fetch(`https://example.com/alice/lastcommit-slash/lastcommit/${tip}/${refSubUrl}`);
+    expect(slashed.status).toBe(200);
+    expect(slashed.headers.get("content-type")).toContain("text/html");
+    expect(await slashed.text()).toContain("repo-files-table");
+
+    // The canonical no-slash form beside it (the production-proven shape).
+    const canonical = await SELF.fetch(`https://example.com/alice/lastcommit-slash/lastcommit/${tip}${refSubUrl}`);
+    expect(canonical.status).toBe(200);
+
+    // A D1-absent repo's slash form reaches the sub-app too — its own 404
+    // answer, not the engine's JSON 404.
+    const absent = await SELF.fetch(`https://example.com/demo/absent/lastcommit/${"a".repeat(40)}/`);
+    expect(absent.status).toBe(404);
+    expect(absent.headers.get("content-type")).not.toContain("application/json");
+
+    // The boundary holds: a repo-root trailing slash is NOT carved — it keeps
+    // the engine passthrough (the pinned pre-UI ownership above).
+    const root = await SELF.fetch("https://example.com/demo/absent/");
+    expect(root.status).toBe(404);
+    expect(root.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
   });
 });

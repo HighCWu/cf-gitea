@@ -205,7 +205,16 @@ export function registerMirrorRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Midd
         });
       }
 
-      const body = toCreatedOrgRepository(viewer, { repo: outcome.repo, owner });
+      // The 201 renders the RE-READ pair when the emission's read resolved —
+      // the post-attach state. Upstream births the row with IsMirror already
+      // set (routers/api/v1/repo/migrate.go: CreateRepositoryDirectly receives
+      // IsMirror: opts.Mirror) and renders the post-migration repo in the 201,
+      // so a mirror=true request's born body carries mirror:true;
+      // outcome.repo is the pre-registerMirror snapshot and rendered
+      // mirror:false while the detail GET was honest (RD19's finding 1). The
+      // fallback keeps the arm's answer for a lost race (row gone before the
+      // re-read).
+      const body = toCreatedOrgRepository(viewer, pair ?? { repo: outcome.repo, owner });
       // The import arm's bootstrap rides as the documented extension field —
       // the declared schema stays the contract's Repository.
       return c.json(

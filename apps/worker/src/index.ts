@@ -101,7 +101,10 @@ export default {
     // slashes), so the UI claims exactly that shape: every other method (the
     // engine admin DELETE, the JSON API's non-GET surfaces) and every
     // trailing-slash URL keeps its pre-UI owner — the engine passthrough the
-    // e2e suite runs against stays byte-identical.
+    // e2e suite runs against stays byte-identical. ONE documented exception
+    // (the lastcommit carve in the repo-scoped branch below — RD19): upstream's
+    // LastCommitLoaderURL carries a trailing slash for root listings and its
+    // own wildcard route serves that shape, so the faithful emit is slashed.
     // Avatar serving carve-out (routers/web/base.go + web.go:265/760/775 at
     // the pin): /avatar/{hash}, /avatars/* and /user/avatar/{username}/{size}
     // are single-concern web routes — never repo-scoped, never the engine's.
@@ -125,9 +128,31 @@ export default {
       // D1-missing transitional population's only delete) — the gate's
       // engine-path branch owns it (D1-resolved repos get the §2.5.5
       // cascade there). The UI has no DELETE handlers, so the carve-out
-      // costs nothing. Trailing-slash rule keeps pre-UI ownership identical.
+      // costs nothing. Trailing-slash rule keeps pre-UI ownership identical —
+      // except the lastcommit carve directly below (RD19), the one family
+      // whose upstream-faithful emit is slashed.
       const engineAdminRootDelete = req.method === "DELETE" && segments.length === 2;
-      if (!engineAdminRootDelete && !pathname.endsWith("/") && handlesUiRoute(pathname)) {
+      // THE LASTCOMMIT CARVE (RD19): the wave-46 file-list component emits the
+      // loader URL exactly as upstream's view.go:277 builds it — RepoLink +
+      // "/lastcommit/" + PathEscape(CommitID) + "/" + PathEscapeSegments(
+      // TreePath) — and for ROOT listings TreePath is "", so the URL keeps the
+      // trailing slash; upstream serves that shape through its own wildcard
+      // (web.go:1761 m.Get("/lastcommit/*")), so the slashed emit IS the
+      // upstream-faithful bytes. The blanket rule above would hand every
+      // repo-scoped slash path to the engine (404) before the sub-app's
+      // `/:owner/:repo/lastcommit/*` route — which matches the slash form and
+      // answers it in place, upstream parity — ever saw it. The exception is
+      // deliberately NARROW: only the third-segment lastcommit head, only
+      // when the TRIMMED path is one the parser claims (handlesUiRoute stays
+      // the single source of route truth — the sub-app is never handed
+      // something its parser disowns), and the engine keeps every other
+      // trailing-slash shape (the pinned /:owner/:repo/ passthrough included).
+      const lastcommitTrailingSlash =
+        pathname.endsWith("/") && segments[2] === "lastcommit" && handlesUiRoute(pathname.slice(0, -1));
+      if (
+        !engineAdminRootDelete &&
+        (lastcommitTrailingSlash || (!pathname.endsWith("/") && handlesUiRoute(pathname)))
+      ) {
         return app.fetch(req, env, ctx);
       }
       return gitHttpGate(req, env, ctx, gitHttp);

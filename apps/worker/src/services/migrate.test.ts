@@ -321,6 +321,13 @@ describe("POST /repos/migrate — mirror arm (mirror=true)", () => {
     const body = await res.json<Record<string, unknown>>();
     expect(body.full_name).toBe("miller/mirrored");
     expect(body.empty).toBe(true);
+    // The born body renders the POST-ATTACH state (RD19's finding 1): upstream
+    // births the row with IsMirror already set (routers/api/v1/repo/migrate.go
+    // CreateRepositoryDirectly receives IsMirror: opts.Mirror) and renders the
+    // migrated repo in the 201, so a mirror=true request's born body carries
+    // mirror:true — the detail GET was already the honest arm; the route's
+    // pre-registerMirror snapshot rendered mirror:false.
+    expect(body.mirror).toBe(true);
     expect(JSON.stringify(body)).not.toContain("tok-123"); // credentials never echo (§4.2)
     expect(body.import).toBeUndefined(); // the bootstrap is the mirror=false arm's
 
