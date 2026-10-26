@@ -12,19 +12,30 @@
  * anti-enumeration 404 unknown-owner message, self-transfer 422, teams 422).
  */
 
+import { SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { repoRedirects, repoTransfer, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
-import { createOptionalTokenAuthMiddleware, createStubAuthResolver, createTokenAuthMiddleware, type AuthResolver } from "./auth";
+import {
+  createOptionalTokenAuthMiddleware,
+  createStubAuthResolver,
+  createTokenAuthMiddleware,
+  STUB_USER,
+  type AuthResolver,
+} from "./auth";
+import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import { registerRepoRoutes } from "./routes/repo";
+import { LICENSE_CORPUS_TEXTS } from "../services/license-corpus";
+import { getRepoLicenses } from "../services/repo-licenses";
 import { addOrUpdateCollaborator } from "./services/repo-collaborators";
 import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
+import { buildHistoryPack, buildReceivePackBody, ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
 
 const TOKEN = "stub-token"; // STUB_USER (id 1) — the repo owner
 const TOKEN_OTHER = "other-token"; // 'other' — a plain user
@@ -536,5 +547,165 @@ describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
       });
       expect(res.status).toBe(202);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The default-branch license arm (routers/api/v1/repo/repo.go:713-746): a
+// PATCH that lands default_branch on an EXISTING branch of a non-empty repo
+// runs SetDefaultBranch and enqueues the license updater (:739-746) — the
+// settled walk (services/repo-licenses.ts syncRepoLicensesForDefaultBranch)
+// over the engine cell. In-process requests carry no executionCtx, so the
+// arm's waitUntil deferral falls back to its inline arm and the rows are
+// readable right after the 200 (the branches-licenses.test.ts pattern).
+// ---------------------------------------------------------------------------
+
+const LIC_OWNER = "edit-lic";
+const LIC_SLUG = "arm";
+const LIC_ENGINE = `${LIC_OWNER}/${LIC_SLUG}`;
+const LIC_REPO_PATH = `/repos/${LIC_OWNER}/${LIC_SLUG}`;
+const LIC_TOKEN = "edit-lic-token";
+const T_LIC = 1_761_000_000;
+
+const MIT_TEXT = LICENSE_CORPUS_TEXTS.find(([id]) => id === "MIT")![1];
+const GPL_TEXT = LICENSE_CORPUS_TEXTS.find(([id]) => id === "GPL-3.0")![1];
+
+const LIC_MAIN_COMMIT: SeedCommit = {
+  message: "seed: MIT default branch",
+  time: T_LIC,
+  files: [
+    { path: "README.md", content: "# edit lic\n" },
+    { path: "LICENSE", content: MIT_TEXT },
+  ],
+};
+const LIC_GPL_COMMIT: SeedCommit = {
+  message: "seed: GPL side branch",
+  time: T_LIC + 60,
+  files: [
+    { path: "README.md", content: "# edit lic\n" },
+    { path: "LICENSE", content: GPL_TEXT },
+  ],
+};
+
+/** The repo_license rows for the seeded arm repo (license/path/tip only). */
+async function licenseRows(repoId: string): Promise<Array<{ license: string; licensePath: string; commitId: string | null }>> {
+  const rows = await getRepoLicenses(env.DB, repoId);
+  return rows.map((row) => ({ license: row.license, licensePath: row.licensePath, commitId: row.commitId }));
+}
+
+/**
+ * Idempotent seed (per-test: the file-level beforeEach wipes the users/
+ * repositories rows while the engine's DO content persists): ensure the
+ * owner + repo row exist, push `main` (MIT) and `gpl` (GPL-3.0) when their
+ * refs are missing, then — after any push — let the onPush license settle
+ * land (it writes MIT at the main tip, the default) and clear the table, so
+ * every test starts from a clean slate no background settle can re-write
+ * mid-test.
+ */
+async function seedLicenseArmRepo(): Promise<{ repoId: string; ownerId: number; gplTip: string }> {
+  const refsBefore = await env.REPO.getByName(LIC_ENGINE).listRefs();
+  await ensureSeededRepo({ owner: LIC_OWNER, slug: LIC_SLUG, commits: [LIC_MAIN_COMMIT] });
+  let pushed = refsBefore.head === null;
+
+  const owner = await drizzle(env.DB)
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, LIC_OWNER))
+    .get();
+  if (owner === undefined) throw new Error("seed owner missing");
+  const row = await drizzle(env.DB)
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, LIC_OWNER), eq(repositories.slug, LIC_SLUG)))
+    .get();
+  if (row === undefined) throw new Error("seed repo row missing");
+
+  let gplTip: string;
+  const refs = await env.REPO.getByName(LIC_ENGINE).listRefs();
+  const existingGpl = refs.refs.find((ref) => ref.name === "refs/heads/gpl");
+  if (existingGpl === undefined) {
+    const { tips, pack } = await buildHistoryPack([LIC_GPL_COMMIT]);
+    gplTip = tips[0] as string;
+    // Idempotent mint (TokenService rejects duplicate names).
+    await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?")
+      .bind(owner.id, "edit-lic-gpl")
+      .run();
+    const token = (await mintFor(owner.id, "edit-lic-gpl", "write:repository")).plaintext;
+    const response = await SELF.fetch(`https://test.local/${LIC_ENGINE}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/x-git-receive-pack-request" },
+      body: buildReceivePackBody([{ ref: "refs/heads/gpl", oid: gplTip }], pack),
+    });
+    const responseBody = response.status === 200 ? new TextDecoder().decode(await response.arrayBuffer()) : "";
+    if (response.status !== 200 || responseBody.includes("ng ")) {
+      throw new Error(`seed gpl push failed: ${response.status} ${responseBody.slice(0, 400)}`);
+    }
+    pushed = true;
+  } else {
+    gplTip = existingGpl.target;
+  }
+
+  if (pushed) {
+    for (let i = 0; i < 100 && (await licenseRows(row.id)).length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  await env.DB.prepare("DELETE FROM repo_license").run();
+
+  return { repoId: row.id, ownerId: owner.id, gplTip };
+}
+
+/** The PATCH app for the arm: the seeded owner is the repo admin. */
+function licenseArmApp(ownerId: number): (path: string, init?: RequestInit) => Promise<Response> {
+  const resolver: AuthResolver = {
+    resolveToken: (token) =>
+      Promise.resolve(
+        token === LIC_TOKEN
+          ? {
+              ...STUB_USER,
+              id: ownerId,
+              login: LIC_OWNER,
+              full_name: LIC_OWNER,
+              created: new Date(T_LIC * 1000).toISOString(),
+            }
+          : null,
+      ),
+  };
+  const app = new OpenAPIHono<ApiEnv>();
+  app.onError(giteaErrorHandler);
+  registerRepoRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+  return (path, init) => Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), env));
+}
+
+const licJsonInit = (body: unknown): RequestInit => ({
+  method: "PATCH",
+  headers: { Authorization: `token ${LIC_TOKEN}`, "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+describe("PATCH /repos/{owner}/{repo} — the default-branch license arm (repo.go:713-746)", () => {
+  it("re-scans the license rows at the new tip when the change lands on an existing branch (repo.go:739-746)", async () => {
+    const { repoId, ownerId, gplTip } = await seedLicenseArmRepo();
+    const app = licenseArmApp(ownerId);
+
+    const res = await app(LIC_REPO_PATH, licJsonInit({ default_branch: "gpl" }));
+    expect(res.status).toBe(200);
+    expect((await res.json<Record<string, unknown>>()).default_branch).toBe("gpl");
+    // The walk re-resolved the NEW default's tip: the GPL set replaced the
+    // MIT set (updateRepoLicenses' diff, license.go:206-208).
+    expect(await licenseRows(repoId)).toEqual([{ license: "GPL-3.0", licensePath: "LICENSE", commitId: gplTip }]);
+  });
+
+  it("leaves the license rows alone when the target branch does not exist (the IsBranchExist arm)", async () => {
+    const { repoId, ownerId } = await seedLicenseArmRepo();
+    const app = licenseArmApp(ownerId);
+
+    // Our PATCH applies the D1 metadata regardless (the documented deviation
+    // — the engine's setHead guard rejects the unborn branch engine-side);
+    // upstream's `git.IsBranchExist` conjunct means the enqueuer never fires
+    // for it, and the walk's unborn-tip skip ports that exactly.
+    const res = await app(LIC_REPO_PATH, licJsonInit({ default_branch: "ghost" }));
+    expect(res.status).toBe(200);
+    expect(await licenseRows(repoId)).toEqual([]);
   });
 });

@@ -31,6 +31,8 @@ import { deleteRepoSettings, loadRepoSettings, saveRepoSettings, type RepoSettin
 import { deleteRepoTopics } from "../services/repo-topics";
 import { deleteRepoWatchers } from "../services/repo-watchers";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
+import { syncRepoLicensesForDefaultBranch } from "../../services/repo-licenses";
+import { engineCell } from "../services/engine";
 import {
   findRepositoryById,
   findRepositoryByPath,
@@ -349,6 +351,10 @@ function resolveIncludePrivate(viewer: Viewer, rawPrivate: string): boolean {
   return viewer.requester !== null && (rawPrivate === "" || formBoolValue(rawPrivate));
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export function registerRepoRoutes(
   app: OpenAPIHono<ApiEnv>,
   requireAuth: MiddlewareHandler<ApiEnv>,
@@ -488,7 +494,39 @@ export function registerRepoRoutes(
       // applies and lets the engine's own setHead guard reject unknown
       // branches engine-side while D1 keeps the metadata.
       if (form.default_branch !== undefined && form.default_branch !== found.repo.defaultBranch) {
-        await service.setDefaultBranch(found.repo.id, form.default_branch);
+        const updated = await service.setDefaultBranch(found.repo.id, form.default_branch);
+        // The default-branch license arm (repo.go:713-746): upstream's
+        // enqueuer fires ONLY when the change LANDED — the target branch
+        // exists (or the repo is empty) and the repo is non-empty (the
+        // `!repo.IsEmpty` SetDefaultBranch leg feeding
+        // AddRepoToLicenseUpdaterQueue at :739-746). The settled walk ports
+        // both conditions authoritatively — a resolvable tip IS "existing
+        // branch on a non-empty repo", and an unborn tip answers null and
+        // skips (services/repo-licenses.ts's divergence note: the D1
+        // is_empty flag is stale for the API-created population). Same
+        // never-fail-the-write posture as the branch-create arm
+        // (routes/branches.ts): caught and logged; deferred to waitUntil
+        // when the runtime provides an execution context, inline for
+        // in-process callers (tests) so the leg stays observable.
+        const licenseScan = syncRepoLicensesForDefaultBranch(c.env.DB, engineCell(c.env, updated), updated).catch(
+          (error: unknown) => {
+            console.error(
+              `[repos] ${updated.ownerNamespace}/${updated.slug}: license sync failed (the default-branch change stands): ` +
+                `${errorMessage(error)}`,
+            );
+          },
+        );
+        let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+        try {
+          execCtx = c.executionCtx;
+        } catch {
+          execCtx = undefined; // in-process caller (tests): run inline
+        }
+        if (execCtx === undefined) {
+          await licenseScan;
+        } else {
+          execCtx.waitUntil(licenseScan);
+        }
       }
 
       // Archived flip (repositories.is_archived, SPEC-0003 §2.4 row 10).
