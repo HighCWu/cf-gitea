@@ -20,12 +20,14 @@ import { getRepoLicenses } from "../../services/repo-licenses";
  * anti-enumeration 404 — a public repo reads anonymously, an invisible one
  * 404s for strangers, SPEC-0003's ACL matrix).
  *
- * POPULATION HONESTY (the module contract): upstream populates the table at
- * PUSH time (services/repository/license.go — the licenseclassifier walk of
- * the default branch). cf-gitea's push pipeline does not call the detection
- * glue yet (services/repo-licenses.ts module header), so until that
- * follow-up lands the table is unpopulated and this endpoint honestly
- * answers `[]` — the same shape, never a fake list.
+ * POPULATION (the module contract): upstream populates the table at PUSH
+ * time (services/repository/license.go — the licenseclassifier walk of the
+ * default branch). cf-gitea's push pipeline now calls the detection glue —
+ * services/repo-licenses.ts `syncRepoLicensesFromCell`, wired into the
+ * engine's onPush settle seam (webhooks-push.ts `handleUserPushEvent`) — so
+ * repos whose default branch carries license files answer real rows, and
+ * never-created repos honestly answer `[]` (the same shape, never a fake
+ * list).
  *
  * Declared responses mirror the contract exactly: {200, 404}. The 401 arm
  * reqRepoReader can emit for anonymous readers of private repos is

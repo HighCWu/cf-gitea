@@ -72,9 +72,13 @@
  * silences the others), and a fan-out error (owner resolution, hook query)
  * logs with the already-written delivery rows standing.
  *
- * The notification family is not the only onPush consumer: `markStaleReviewsOnPush`
- * (SPEC-0013 §3.4) rides the same seam beside `emitPushFamilyUpdates` — the
- * head-push stale/dismiss maintenance for open PRs on the pushed branch.
+ * The notification family is not the only onPush consumer:
+ * `markStaleReviewsOnPush` (SPEC-0013 §3.4) rides the same seam beside
+ * `emitPushFamilyUpdates` — the head-push stale/dismiss maintenance for open
+ * PRs on the pushed branch — and so does the repo_license settle leg
+ * (`syncRepoLicensesFromCell`, services/repo-licenses.ts — upstream
+ * push.go:160-174's default-branch license updater, the same never-fail
+ * posture).
  */
 
 import type { CommitJson, DiffResult, PushEvent } from "@cf-gitea/git-engine";
@@ -102,6 +106,7 @@ import {
   type HookEventType,
 } from "../issues/webhooks";
 import { engineName, type RepoRow } from "../repos/service";
+import { syncRepoLicensesFromCell } from "./repo-licenses";
 import { findRule, parseRuleConfig } from "./branch-protection";
 
 /** DismissApprovalReviews' fixed comment text (services/pull/review.go:362). */
@@ -802,6 +807,26 @@ export async function handleUserPushEvent(env: WebhookPushEnv, event: PushEventL
   } catch (error) {
     console.error(
       `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: stale/dismiss legs failed (the applied push stands): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // The repo_license table rides the same settle seam (upstream
+  // services/repository/push.go:160-174: a default-branch create/update
+  // enqueues the license updater; deletes and every other ref don't; the
+  // per-entry continue-on-error and the unborn-tip guard live in the called
+  // port). Same never-fail-the-push posture: caught and logged, the applied
+  // push stands — runs inside the engine's onPush waitUntil like the legs
+  // above.
+  try {
+    await syncRepoLicensesFromCell(
+      env.DB,
+      env.REPO.getByName(engineName(pair.repo.ownerNamespace, pair.repo.slug)),
+      pair.repo,
+      updates,
+    );
+  } catch (error) {
+    console.error(
+      `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: license sync failed (the applied push stands): ` +
         `${error instanceof Error ? error.message : String(error)}`,
     );
   }

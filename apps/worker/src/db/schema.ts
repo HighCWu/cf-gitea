@@ -2463,9 +2463,9 @@ export const userBadges = sqliteTable(
  * models/repo/license.go:15-24) — the PUSH-time detection product
  * (services/repository/license.go resolveLicenses) that
  * `GET /repos/{owner}/{repo}/licenses` reads (api/routes/repo-licenses.ts).
- * In cf-gitea the detection glue lands with this table (services/
- * repo-licenses.ts) but the push pipeline does NOT call it yet — rows are
- * unpopulated and the endpoint answers [] (the documented honest state).
+ * The push pipeline populates it: the onPush settle leg (services/
+ * webhooks-push.ts → services/repo-licenses.ts) walks the default-branch
+ * tip on create/update and applies the corpus-detected diff.
  *
  * - UNIQUE(path) is the upstream 3-column unique over (repo_id, license,
  *   license_path) (license.go:19-21 + the v346 migration's re-created index;

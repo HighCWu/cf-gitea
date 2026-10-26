@@ -71,7 +71,7 @@ async function insertLicense(repoId: string, license: string, licensePath = "LIC
 }
 
 describe("GET /repos/{owner}/{repo}/licenses (repoGetLicenses)", () => {
-  it("answers [] while unpopulated (the push pipeline does not call the glue yet)", async () => {
+  it("answers [] while unpopulated (a repo never pushed / no license files)", async () => {
     await createRepo("plain");
     const res = await router()("/api/v1/repos/alice/plain/licenses");
     expect(res.status).toBe(200);
