@@ -462,7 +462,10 @@ export function registerReleaseRoutes(
       const form = c.req.valid("json");
 
       // Upstream fail-fast: an empty repo has no commitish to tag (422).
-      if (found.repo.refsVersion === 0) {
+      // Gate on is_empty — refs_version is observability-only and never
+      // synced from the engine (REDEPLOY14's finding: every production repo
+      // reads 0 there, so the old gate 422'd every API release create).
+      if (found.repo.isEmpty) {
         throw new ApiError(422, "repo is empty");
       }
 
