@@ -5,10 +5,14 @@ import {
   comments,
   issues,
   labels,
+  orgMembers,
   projectColumns,
   projectIssues,
   projectWorkflows,
   projects,
+  repositories,
+  teamMembers,
+  teams,
   users,
 } from "../../db/schema";
 import { ellipsisDisplayString } from "../../issues/service";
@@ -27,7 +31,8 @@ import type {
   ProjectWorkflowFilters,
 } from "../models/project";
 import type { User } from "../models/user";
-import { apiUserFromRow, type Viewer } from "./repository";
+import { OrgService } from "../../services/orgs/orgs";
+import { apiUserFromRow, canViewRepositoryWithTeams, type RepositoryWithOwner, type Viewer } from "./repository";
 
 /**
  * The shared project-board store backing the repo-scoped project API
@@ -1440,4 +1445,251 @@ export async function toApiProjectList(
     result.push(await toApiProject(d1, row, viewer, htmlUrlOf(row)));
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Org scope (batch 6 stage 2 — routes/projects-org.ts). Additive appendix:
+// everything here is the owner arm of a stage-1 function — the repo scope's
+// semantics are reused verbatim wherever the owner kind changes nothing.
+// ---------------------------------------------------------------------------
+
+/** The org scope — project.Type 3, keyed on the org's users.id. */
+export function orgProjectScope(ownerId: number): ProjectScope {
+  return { kind: "organization", repoId: null, ownerId };
+}
+
+/** perm.AccessMode's value space (perm/access_mode.go:17-22). */
+export type OrgAccessMode = "none" | "read" | "write" | "admin" | "owner";
+
+const ORG_ACCESS_RANK: Record<OrgAccessMode, number> = { none: 0, read: 1, write: 2, admin: 3, owner: 4 };
+
+/** The org project gates' comparison (api.go:754-768 `< accessMode`). */
+export function orgAccessAtLeast(access: OrgAccessMode, required: "read" | "write"): boolean {
+  return ORG_ACCESS_RANK[access] >= ORG_ACCESS_RANK[required];
+}
+
+/**
+ * `ownerVisibilitySatisfiesDoer` (models/organization/org.go:439-454) reduced
+ * to the modeled axes: anonymous is satisfied by a public org only; admin and
+ * the org itself are handled by callers; signed-in satisfies public AND
+ * limited (`RequireSignInViewStrict` is false upstream-by-default and
+ * unmodeled; `IsRestricted` has no column).
+ */
+function orgVisibilitySatisfiesDoer(
+  org: { id: number; visibility: "public" | "limited" | "private" },
+  doerId: number | null,
+): boolean {
+  if (doerId === null) {
+    return org.visibility === "public";
+  }
+  if (doerId === org.id) {
+    return true;
+  }
+  return org.visibility !== "private";
+}
+
+/**
+ * `Organization.AnyRepoUnitPermission` for unit.TypeProjects
+ * (models/organization/org.go:278-302) — the predicate behind BOTH org
+ * project gates (api.go:754-768 reqProjectsUnitAccess, the read group arm
+ * and the write per-route arm alike):
+ *  - the doer's `org_members.role='owner'` row IS the Owners team (SPEC-0007
+ *    §3.3 bridge) → "owner" (upstream IsOwnerTeam short-circuits
+ *    AccessModeOwner, team_list.go:33-36);
+ *  - else the MAXIMUM effective access over the doer's teams in THIS org —
+ *    `max(authorize, the unitsMap overrides)`, the landed units collapse —
+ *    deliberately WITHOUT a repository-coverage filter (upstream
+ *    GetUserOrgTeams + AnyRepoUnitMaxAccess: org-level boards are not
+ *    repo-scoped; org.go:279's FIXME acknowledges the breadth);
+ *  - with NO teams at all: the coarse `ownerVisibilitySatisfiesDoer`
+ *    fallback (org.go:297-301) — team-less org members of a private org
+ *    read as "none" (upstream's own blind spot, mirrored verbatim).
+ */
+export async function orgProjectsAccessMode(
+  d1: D1Database,
+  org: { id: number; visibility: "public" | "limited" | "private" },
+  doerId: number | null,
+): Promise<OrgAccessMode> {
+  if (doerId !== null) {
+    const ownerRow = await drizzle(d1)
+      .select({ id: orgMembers.id })
+      .from(orgMembers)
+      .where(and(eq(orgMembers.orgId, org.id), eq(orgMembers.userId, doerId), eq(orgMembers.role, "owner")))
+      .limit(1);
+    if (ownerRow.length > 0) {
+      return "owner";
+    }
+  }
+  const teamRows =
+    doerId === null
+      ? []
+      : await drizzle(d1)
+          .select({ authorize: teams.authorize, unitsMap: teams.unitsMap })
+          .from(teams)
+          .innerJoin(teamMembers, eq(teamMembers.teamId, teams.id))
+          .where(and(eq(teams.orgId, org.id), eq(teamMembers.userId, doerId)));
+  if (teamRows.length === 0) {
+    return orgVisibilitySatisfiesDoer(org, doerId) ? "read" : "none";
+  }
+  let best: OrgAccessMode = "none";
+  for (const team of teamRows) {
+    let effective: OrgAccessMode = team.authorize;
+    if (team.unitsMap !== null) {
+      for (const mode of Object.values(JSON.parse(team.unitsMap) as Record<string, string>)) {
+        const parsed: OrgAccessMode =
+          mode === "read" || mode === "write" || mode === "admin" || mode === "owner" ? mode : "none";
+        if (ORG_ACCESS_RANK[parsed] > ORG_ACCESS_RANK[effective]) {
+          effective = parsed;
+        }
+      }
+    }
+    if (ORG_ACCESS_RANK[effective] > ORG_ACCESS_RANK[best]) {
+      best = effective;
+    }
+  }
+  return best;
+}
+
+/**
+ * `GetIssueByID` (models/issues/issue.go:557-567) — the owner arms' GLOBAL
+ * issue lookup (shared/project.go:114-122): an owner-level board addresses
+ * any issue of any repository, gated afterward on read permission.
+ */
+export async function findIssueByIdGlobally(d1: D1Database, issueId: number): Promise<IssueRow | null> {
+  if (!Number.isSafeInteger(issueId) || issueId <= 0) {
+    return null;
+  }
+  const rows = await drizzle(d1).select().from(issues).where(eq(issues.id, issueId)).limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * The owner arm's issue-visibility set (shared/project.go:1685-1692 and
+ * services/projects/issue.go:298-308): the org's OWN repositories run
+ * through the ONE landed visibility predicate — the `IssuesOptions.Doer`
+ * arm for authenticated callers, `AllPublic` for anonymous (canViewRepository's
+ * public short-circuit).
+ */
+export async function orgVisibleRepos(d1: D1Database, orgId: number, viewer: Viewer): Promise<RepositoryWithOwner[]> {
+  const orgRows = await drizzle(d1).select().from(users).where(eq(users.id, orgId)).limit(1);
+  const owner = orgRows[0];
+  if (owner === undefined) {
+    return [];
+  }
+  const repoRows = await drizzle(d1).select().from(repositories).where(eq(repositories.ownerId, orgId));
+  const visible: RepositoryWithOwner[] = [];
+  for (const repo of repoRows) {
+    if (await canViewRepositoryWithTeams(d1, viewer, repo)) {
+      visible.push({ repo, owner });
+    }
+  }
+  return visible;
+}
+
+/**
+ * `LoadIssueNumbersForProject`'s owner branch (services/projects/issue.go:
+ * 291-330): the joined open/closed counts filtered to the doer-visible
+ * org repositories (unlike the repository branch's plain counts).
+ */
+export async function projectIssueCountsForOrg(
+  d1: D1Database,
+  projectId: number,
+  visibleRepoIds: string[],
+): Promise<{ open: number; closed: number; total: number }> {
+  if (visibleRepoIds.length === 0) {
+    return { open: 0, closed: 0, total: 0 };
+  }
+  const rows = await drizzle(d1)
+    .select({ closed: issues.isClosed, value: sql<number>`count(*)` })
+    .from(projectIssues)
+    .innerJoin(issues, eq(projectIssues.issueId, issues.id))
+    .where(and(eq(projectIssues.projectId, projectId), inArray(issues.repoId, visibleRepoIds)))
+    .groupBy(issues.isClosed);
+  let open = 0;
+  let closed = 0;
+  for (const row of rows) {
+    if (row.closed) {
+      closed = Number(row.value);
+    } else {
+      open = Number(row.value);
+    }
+  }
+  return { open, closed, total: open + closed };
+}
+
+/**
+ * `ToProject` with the owner arm's permission-filtered counts. toApiProject
+ * still computes the plain counts internally (kept untouched — the same
+ * "pure redundancy, not a second gate" trade the repo routes document);
+ * the org arm's numbers win on the wire.
+ */
+export async function toApiOrgProject(
+  d1: D1Database,
+  row: ProjectRow,
+  viewer: Viewer,
+  htmlUrl: string,
+  counts: { open: number; closed: number; total: number },
+): Promise<Project> {
+  const rendered = await toApiProject(d1, row, viewer, htmlUrl);
+  return { ...rendered, num_open_issues: counts.open, num_closed_issues: counts.closed, num_issues: counts.total };
+}
+
+/**
+ * `ListProjectColumnIssues`'s owner arm (shared/project.go:1685-1704): the
+ * column's claimed issues filtered to the doer-visible org repositories —
+ * issues added from repositories OUTSIDE the org stay assigned but never
+ * list (upstream `issuesOpts.Owner = scope.Owner`). Same join + ordering as
+ * the repository arm.
+ */
+export async function listColumnIssuesForOrg(
+  d1: D1Database,
+  projectId: number,
+  column: ProjectColumnRow,
+  visibleRepoIds: string[],
+  page: number,
+  limit: number,
+): Promise<{ items: IssueRow[]; total: number }> {
+  const claimedIssueIds = await columnIssueIds(d1, column);
+  if (claimedIssueIds.length === 0 || visibleRepoIds.length === 0) {
+    return { items: [], total: 0 };
+  }
+  const where = and(inArray(issues.id, claimedIssueIds), inArray(issues.repoId, visibleRepoIds)) as SQL;
+  const joinCondition = and(
+    eq(projectIssues.issueId, issues.id),
+    eq(projectIssues.projectId, projectId),
+  ) as SQL;
+  const db = drizzle(d1);
+  const totalRows = await db
+    .select({ value: sql<number>`count(*)` })
+    .from(issues)
+    .innerJoin(projectIssues, joinCondition)
+    .where(where);
+  const items = await db
+    .select({ issue: issues })
+    .from(issues)
+    .innerJoin(projectIssues, joinCondition)
+    .where(where)
+    .orderBy(asc(projectIssues.sorting), desc(issues.createdAt), desc(issues.id))
+    .limit(limit)
+    .offset((page - 1) * limit);
+  return { items: items.map((row) => row.issue), total: Number(totalRows[0]?.value ?? 0) };
+}
+
+/**
+ * `CanManageWorkflows`'s organization arm (services/projects/workflow.go:
+ * 33-39): owner-level projects hold the owner's private items too, so a
+ * present doer needs site admin or the org OWNER (`IsOrganizationOwner`) —
+ * merely holding the Projects-unit write gate is NOT enough. The
+ * `DoerCanViewPrivate` precondition collapses to "doer present" (every
+ * resolved doer is private-capable in the landed identity).
+ */
+export async function canManageOrgProjectWorkflows(
+  d1: D1Database,
+  org: { id: number },
+  doer: { id: number; isAdmin: boolean },
+): Promise<boolean> {
+  if (doer.isAdmin) {
+    return true;
+  }
+  return await new OrgService(d1).isOrgOwner(org.id, doer.id);
 }
