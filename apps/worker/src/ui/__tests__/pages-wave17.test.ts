@@ -322,7 +322,14 @@ describe("wave-17 parser families (parseUiRoute / handlesUiRoute)", () => {
 
   it("leaves the deeper tails with the engine (upstream's unregistered-route 404)", () => {
     expect(parseUiRoute("/octo/hello/branches/abc")).toBeNull();
-    expect(parseUiRoute("/octo/hello/branches/_new/branch/main")).toBeNull();
+    // Window-2e folds mounted the create form's POST arm — the stale null
+    // updated to the claimed shape (provenance: the folds commit).
+    expect(parseUiRoute("/octo/hello/branches/_new/branch/main")).toEqual({
+      family: "branch-create",
+      owner: "octo",
+      repo: "hello",
+      from: "main",
+    });
     expect(parseUiRoute("/octo/hello/branches/restore")).toBeNull();
     expect(parseUiRoute("/octo/hello/branches/delete/more")).toBeNull();
   });

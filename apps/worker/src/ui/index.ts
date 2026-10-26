@@ -1224,7 +1224,8 @@ import {
   renderEditorPatchPage,
   splitCherryPickSuffix,
 } from "./pages/repo-editor-cherrypick";
-import { commitUploadFromForm } from "../services/upload-staging";
+import { commitUploadFromForm, uploadFileToServer, uploadRemoveFromServer } from "../services/upload-staging";
+import { branchRef, commitApiChangeError, deleteApiRefError, engineCell, engineReads, refTipMap, resolveNamedRef, ZERO_OID } from "../api/services/engine";
 import {
   loadRepoMigrateData,
   migrateRepoFromForm,
@@ -1483,9 +1484,11 @@ export interface PullCommitsRoute {
  *  `/_new/*`, `/restore`) stays engine-owned — upstream's
  *  unregistered-route 404. */
 export interface BranchesRoute {
-  family: "branches" | "branch-delete";
+  family: "branches" | "branch-delete" | "branch-create" | "branch-rename";
   owner: string;
   repo: string;
+  /** The create form's source branch (the _new/{from} tail, decoded). */
+  from?: string;
 }
 
 /** The wave-18 commit-view family (pages/commit-view.tsx): upstream's
@@ -3203,6 +3206,21 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 0) return { family: "branches", owner, repo };
     if (rest.length === 1 && rest[0] === "delete") return { family: "branch-delete", owner, repo };
     if (rest.length === 1 && rest[0] === "list") return { family: "branches-list-aux", owner, repo };
+    // Window-2e folds: the writer forms' POST targets (the wave-63 module's
+    // handoff — upstream web.go:1477-1481/1486).
+    if (rest.length >= 2 && rest[0] === "_new") {
+      try {
+        return {
+          family: "branch-create",
+          owner,
+          repo,
+          from: rest.slice(2).map((segment) => decodeURIComponent(segment)).join("/"),
+        };
+      } catch {
+        return null;
+      }
+    }
+    if (rest.length === 1 && rest[0] === "rename") return { family: "branch-rename", owner, repo };
     return null;
   }
   // Wave-20 releases family (pages/releases.tsx — upstream web.go:1505-1514's
@@ -4176,6 +4194,130 @@ async function repoWikiSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   const form = parseRepoWikiForm(await readUrlEncodedForm(c.req.raw));
   await applyRepoWikiSettings(c.env.DB, repo, form);
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/wiki?saved=1` } }));
+}
+
+// ---------------------------------------------------------------------------
+// Window-2e folds: the branches writer forms' POST arms (the wave-63 module
+// handoff — upstream web.go:1477-1486's editor middlewares: writer grant +
+// RepoMustNotBeArchived + MustBeNotEmpty), replaying the API create/rename
+// ops; the pulls/new redirect; the upload staging endpoints.
+// ---------------------------------------------------------------------------
+
+async function branchCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "branch-create" || resolved.route.from === undefined) return respond(await c.notFound()); // drift guard
+  if (repo.isArchived || repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const form = await readUrlEncodedForm(c.req.raw);
+  const newName = (form.get("new_branch_name") ?? "").trim();
+  const from = resolved.route.from === "" ? repo.defaultBranch : resolved.route.from;
+  if (newName === "") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?create_error=empty&name=${encodeURIComponent(newName)}` } }));
+  }
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const reads = engineReads(c.env, pair.repo);
+  const tips = refTipMap(await reads.listRefs());
+  const source = resolveNamedRef(tips, from, repo.defaultBranch);
+  if (source === null) {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?create_error=missing&name=${encodeURIComponent(newName)}` } }));
+  }
+  if (tips.has(branchRef(newName))) {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?create_error=exists&name=${encodeURIComponent(newName)}` } }));
+  }
+  const result = await engineCell(c.env, pair.repo).commitApiChange({
+    ref: branchRef(newName),
+    expectedOldOid: ZERO_OID,
+    newOid: source.target,
+  });
+  if (result.tag !== "committed") {
+    const kind = result.tag === "invalid" ? "exists" : "error";
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?create_error=${kind}&name=${encodeURIComponent(newName)}` } }));
+  }
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?created=${encodeURIComponent(newName)}` } }));
+}
+
+async function branchRenameSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "branch-rename") return respond(await c.notFound()); // drift guard
+  if (repo.isArchived || repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const form = await readUrlEncodedForm(c.req.raw);
+  const from = (form.get("from") ?? "").trim();
+  const to = (form.get("to") ?? "").trim();
+  const fail = (kind: string): Response =>
+    respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?rename_error=${kind}&name=${encodeURIComponent(from)}` } }));
+  if (from === "" || to === "") return fail("empty");
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const reads = engineReads(c.env, pair.repo);
+  const tips = refTipMap(await reads.listRefs());
+  const tip = tips.get(branchRef(from));
+  if (tip === undefined) return fail("missing");
+  if (from === to || tips.has(branchRef(to))) return fail("exists");
+  if (from === repo.defaultBranch && !viewer.isAdmin) {
+    // Upstream RenameBranch's admin-only default arm (branch.go:443-447).
+    return fail("default");
+  }
+  const cell = engineCell(c.env, pair.repo);
+  const created = await cell.commitApiChange({ ref: branchRef(to), expectedOldOid: ZERO_OID, newOid: tip.target });
+  if (created.tag !== "committed") {
+    if (created.tag === "invalid") throw new ApiError(409, "The branch with the same name already exists.");
+    throw commitApiChangeError(created);
+  }
+  const removed = await cell.deleteApiRef({ ref: branchRef(from), expectedOid: tip.target });
+  if (removed.tag !== "deleted") {
+    const deleteError = deleteApiRefError(removed);
+    if (deleteError !== null) throw deleteError;
+    throw new ApiError(500, `rename cleanup failed: ${removed.tag}`);
+  }
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?renamed=${encodeURIComponent(to)}` } }));
+}
+
+/** The pulls/new redirect (web.go:1314 PullsNewRedirect — a pure redirect
+ *  onto /compare with the query preserved). */
+function pullsNewRedirect(c: Context<{ Bindings: Env }>): Response {
+  const url = new URL(c.req.url);
+  const tail = url.pathname.split("/").slice(4).join("/");
+  const location = `/${url.pathname.split("/")[1]}/${url.pathname.split("/")[2]}/compare/${tail}${url.search}`;
+  return new Response(null, { status: 307, headers: { location } });
+}
+
+/** The upload staging endpoints (editor_uploader.go:18-63 over the dc9ff97
+ *  family; the writer predicate is the entire authorization — upstream's
+ *  upload table has no repo column). */
+async function uploadFileEndpoint(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  return respond(await uploadFileToServer(c.env.REPO_PACKS, c.req.raw));
+}
+
+async function uploadRemoveEndpoint(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  return respond(await uploadRemoveFromServer(c.env.REPO_PACKS, c.req.raw));
 }
 
 // ---------------------------------------------------------------------------
@@ -9576,6 +9718,12 @@ uiRouter.get("/:owner/:repo/settings/branches/:id/delete", () => methodNotAllowe
 // test/delete convention).
 uiRouter.get("/:owner/:repo/branches", (c) => branchesPage(c));
 uiRouter.post("/:owner/:repo/branches/delete", (c) => branchDeleteSubmit(c));
+// Window-2e folds: the branch writer arms, the pulls/new redirect, the upload endpoints.
+uiRouter.post("/:owner/:repo/branches/_new/*", (c) => branchCreateSubmit(c));
+uiRouter.post("/:owner/:repo/branches/rename", (c) => branchRenameSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/new/*", (c) => pullsNewRedirect(c));
+uiRouter.post("/:owner/:repo/upload-file", (c) => uploadFileEndpoint(c));
+uiRouter.post("/:owner/:repo/upload-remove", (c) => uploadRemoveEndpoint(c));
 uiRouter.get("/:owner/:repo/branches/delete", () => methodNotAllowed("POST"));
 // Wave-29 diffpatch downloads (parseUiRoute claims exactly the dotted
 // hex `{sha}.{diff|patch}` tail — upstream web.go:1760's RawDiff route).
