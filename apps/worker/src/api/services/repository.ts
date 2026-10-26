@@ -1,13 +1,14 @@
-import { and, asc, desc, eq, like, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull, like, or, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
-import { repositories, users, type TeamAccessMode } from "../../db/schema";
+import { repoMirrors, repositories, users, type TeamAccessMode } from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
 import type { Permission, Repository } from "../models/repository";
 import type { User } from "../models/user";
 import { OrgService } from "../../services/orgs/orgs";
+import { renderGoDuration } from "./mirror";
 import type { RepoSettings } from "./repo-settings";
 
 /**
@@ -38,6 +39,10 @@ import type { RepoSettings } from "./repo-settings";
 export type RepositoryRow = typeof repositories.$inferSelect;
 /** D1 row of the `users` table (src/db/schema.ts). */
 export type UserRow = typeof users.$inferSelect;
+/** D1 row of the `repo_mirrors` table — the 1:1 pull-mirror schedule
+ * (src/db/schema.ts, SPEC-0009 §3.1; upstream `Mirror`,
+ * models/repo/mirror.go:23-38). */
+export type RepoMirrorRow = typeof repoMirrors.$inferSelect;
 
 /**
  * `{origin}/api/v1/repos/{owner}/{repo}` — upstream `Repository.APIURL`
@@ -274,12 +279,126 @@ function repositoryIdNumber(id: string): number {
 }
 
 /**
+ * The async arms of the converter, resolved by `toApiRepositoryFull` and
+ * folded in by `toApiRepository`'s optional `relations` parameter. Both are
+ * null-safe: an absent/unreadable base and a missing mirror row simply omit
+ * / zero-default, exactly like upstream's nil `parent` and zero mirror
+ * times.
+ */
+export interface RepositoryRenderRelations {
+  /** The fork base's RENDERED payload — already permission-gated by
+   * `resolveParentRepository` (do not pass an ungated pair). */
+  parent?: Repository | null;
+  /** The repo's 1:1 `repo_mirrors` row (`findMirrorByRepoId`), feeding the
+   * mirror_interval/mirror_updated/mirror_last_sync_at triple. */
+  mirrorRow?: RepoMirrorRow | null;
+}
+
+/**
+ * Upstream `innerToRepo`'s parent arm
+ * (gitea/services/convert/repository.go:46-57): `GetBaseRepo` loads the
+ * fork base by `repo.ForkID` UNCONDITIONALLY (models/repo/repo.go:541-552 —
+ * the only gate is base-row existence, no permission check) and renders it
+ * through the `isParent=true` recursion (repository.go:57), which never
+ * nests a grandparent. Upstream's own FIXME concedes the handling is wrong
+ * — the parent embeds the CURRENT repo's permission (:52-56, "Maybe the
+ * right way is setting the permission of the parent repo to nil, empty is
+ * better than wrong") — and a base that goes private after forking leaks
+ * through every fork payload.
+ *
+ * This resolver is the "empty is better than wrong" reading: the base
+ * renders only when the doer can READ it — the landed visibility helpers
+ * (`viewerTeamAccessMode` + `canViewRepository` resolved on the BASE row,
+ * so an org-team grant on the base admits the parent too). A reader gets
+ * the full base payload (its own `parent` stays omitted — the isParent
+ * shape, plus the base's honest permission block instead of upstream's
+ * current-repo one); a stranger on a private base gets the field omitted.
+ * A dangling edge (deleted base the cascade missed) also degrades to
+ * omitted, where upstream would nil the WHOLE payload
+ * (repository.go:47-50). null = omit.
+ */
+export async function resolveParentRepository(
+  d1: D1Database,
+  viewer: Viewer,
+  row: Pick<RepositoryRow, "forkParent">,
+): Promise<Repository | null> {
+  if (row.forkParent === null) {
+    return null;
+  }
+  const base = await findRepositoryById(d1, row.forkParent);
+  if (base === null) {
+    return null;
+  }
+  const baseTeamMode = await viewerTeamAccessMode(d1, viewer, base.repo);
+  if (!canViewRepository(viewer, base.repo, baseTeamMode)) {
+    return null;
+  }
+  // The isParent recursion: render the base WITHOUT its own parent arm
+  // (toApiRepository only nests when handed relations).
+  return toApiRepository(viewer, base, undefined, baseTeamMode);
+}
+
+/**
+ * The repo's 1:1 pull-mirror row (upstream `GetMirrorByRepoID`,
+ * models/repo/mirror.go:80-88 — the UNIQUE `repo_id` is the ≤1 assumption).
+ */
+export async function findMirrorByRepoId(
+  d1: D1Database,
+  repoId: string,
+): Promise<RepoMirrorRow | null> {
+  const rows = await drizzle(d1)
+    .select()
+    .from(repoMirrors)
+    .where(eq(repoMirrors.repoId, repoId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * `toApiRepository` with both async arms resolved (upstream `innerToRepo`'s
+ * GetBaseRepo + GetMirrorByRepoID passes): a fork renders `fork: true` plus
+ * the `parent` payload when the doer can read the base (omitted otherwise),
+ * and a mirror renders the real mirror_interval/mirror_updated/
+ * mirror_last_sync_at from its repo_mirrors row. The single-repo GETs
+ * (routes/repo.ts repoGet / repoGetByID) are the callers that SHOULD use
+ * this — the wiring is the route owner's one-line swap from
+ * `toApiRepository` (this module does not own the routes); until then the
+ * routes render the sync shape (booleans honest, `parent`/schedule at the
+ * zero-defaults). List/search paths keep the query-flat sync render
+ * (booleans still honest, schedule fields at the zero-defaults — see
+ * `toApiRepository`'s docstring). `mirrorRow` is only
+ * read when `row.isMirror` (upstream gates the read on IsMirror too,
+ * repository.go:160-170).
+ */
+export async function toApiRepositoryFull(
+  d1: D1Database,
+  viewer: Viewer,
+  pair: RepositoryWithOwner,
+  settings?: RepoSettings,
+  teamMode?: TeamAccessMode | null,
+): Promise<Repository> {
+  const [parent, mirrorRow] = await Promise.all([
+    resolveParentRepository(d1, viewer, pair.repo),
+    pair.repo.isMirror ? findMirrorByRepoId(d1, pair.repo.id) : Promise.resolve(null),
+  ]);
+  return toApiRepository(viewer, pair, settings, teamMode, { parent, mirrorRow });
+}
+
+/**
  * D1 → wire converter mirroring `convert.innerToRepo` for a stock repository
  * with upstream's default unit configuration (code/issues/pulls/wiki/releases
  * enabled; projects/packages/actions disabled — upstream `DefaultUnits`).
- * The four upstream-`omitempty` reference fields that stay nil for our data
- * (`parent`, `external_tracker`, `external_wiki`, `repo_transfer`) and
- * `default_target_branch` (empty string) are omitted, exactly like Go.
+ * The fork/mirror booleans render the landed columns (`fork_parent` /
+ * `is_mirror` — upstream `Fork: repo.IsFork` / `Mirror: repo.IsMirror`,
+ * services/convert/repository.go:208/210; our single nullable `fork_parent`
+ * column encodes both `IsFork` and `ForkID`, models/repo/repo.go:198-199).
+ * The upstream-`omitempty` reference fields that stay nil for our data
+ * (`external_tracker`, `external_wiki`, `repo_transfer`) and
+ * `default_target_branch` (empty string) are omitted, exactly like Go;
+ * `parent` renders only when the caller resolved a READABLE fork base
+ * (`resolveParentRepository` below — upstream renders it whenever
+ * `GetBaseRepo` loads the row, repository.go:46-57, with no permission
+ * check; ours gates, see there).
  *
  * `settings` overlays the repo-edit stored subset (services/repo-settings.ts
  * — description/website/has_*) when the caller loaded it; list/search paths
@@ -287,13 +406,20 @@ function repositoryIdNumber(id: string): number {
  * store, same discipline as the TODO(SPEC-0005) zero-defaults below).
  * `teamMode` (optional, `doerRepoAccessMode`) feeds the embedded
  * `permissions` block — the sync converters without it render the reduced
- * matrix.
+ * matrix. `relations` (optional) carries the async arms the single-repo
+ * resolver (`toApiRepositoryFull`) resolved: the rendered readable fork
+ * base and the 1:1 `repo_mirrors` row. Without it the mirror booleans are
+ * still honest (pure columns) but the mirror schedule fields render the
+ * upstream zero-defaults (`""` / Go-zero time) — the documented list-shape
+ * divergence (upstream runs the same arms on list entries; ours resolves
+ * them only for single-repo GETs to keep the lists query-flat).
  */
 export function toApiRepository(
   viewer: Viewer,
   pair: RepositoryWithOwner,
   settings?: RepoSettings,
   teamMode?: TeamAccessMode | null,
+  relations?: RepositoryRenderRelations,
 ): Repository {
   const { repo: row, owner } = pair;
   const ownerNamespace = encodeURIComponent(row.ownerNamespace);
@@ -302,6 +428,12 @@ export function toApiRepository(
   const apiUrl = `${viewer.origin}/api/v1/repos/${ownerNamespace}/${slug}`;
   const sshHost = new URL(viewer.origin).hostname;
   const createdIso = row.createdAt.toISOString();
+  // The async arms (`toApiRepositoryFull`): the pre-gated fork-base payload
+  // and the 1:1 pull-mirror row. `parent` is Go-omitempty — a null/unreadable
+  // base omits the field entirely (upstream `Parent: parent`, :209, nil when
+  // the base is missing).
+  const parent = relations?.parent ?? null;
+  const mirrorRow = relations?.mirrorRow ?? null;
   return {
     id: repositoryIdNumber(row.id),
     owner: apiUserFromRow(owner, viewer),
@@ -316,9 +448,17 @@ export function toApiRepository(
     // repo keeps refs_version 0 while holding a full history.
     empty: row.isEmpty,
     private: row.visibility === "private",
-    fork: false, // TODO(SPEC-0005): forks (SPEC-0003 fork primitives)
+    // Upstream `Fork: repo.IsFork` (convert/repository.go:208; models/repo/
+    // repo.go:198). Our fork edge is the single nullable `fork_parent` column
+    // (IsFork + ForkID folded together, schema.ts) — set by the fork settle
+    // (repos/fork-task.ts settleForkRow), cleared by the delete cascade's
+    // child reset (repos/service.ts), so non-null IS a fork.
+    fork: row.forkParent !== null,
+    ...(parent !== null ? { parent } : {}),
     template: row.isTemplate, // is_template (migration 0027) — templates + generate (routes/generate-repo.ts)
-    mirror: false, // TODO(SPEC-0005): mirrors
+    // Upstream `Mirror: repo.IsMirror` (convert/repository.go:210;
+    // models/repo/repo.go:189) — the pure `is_mirror` column.
+    mirror: row.isMirror,
     // Upstream renders `Size: int(repo.Size / 1024)` (convert/repository.go:207
     // — Go integer division = the KB integer). Upstream's stored Size folds
     // LFS in (models/repo/update.go:110 `Size: gitSize + lfsSize`); ours is
@@ -394,9 +534,25 @@ export function toApiRepository(
     default_allow_maintainer_edit: true,
     avatar_url: "",
     internal: false,
-    mirror_interval: "",
-    mirror_updated: GO_ZERO_TIME,
-    mirror_last_sync_at: GO_ZERO_TIME,
+    // The mirror schedule triple upstream gates on BOTH arms
+    // (convert/repository.go:161-170): only `if repo.IsMirror` AND a
+    // `GetMirrorByRepoID` row exists do the real values render, else the
+    // zero-defaults (`""` / Go-zero). Mapping onto repo_mirrors
+    // (SPEC-0009 §3.1): `Interval time.Duration` (mirror.go:27) →
+    // `interval_seconds` through the whole-second Go-duration renderer
+    // ("8h0m0s"); `UpdatedUnix` (mirror.go:30, bumped on every schedule
+    // update) → `updated_at`; `LastSyncUnix` (mirror.go:32, null until the
+    // first successful sync) → `last_sync_at`. Without the resolved row the
+    // zero-defaults stand (every non-mirror, mirrors before their first
+    // touch, and the query-flat list paths).
+    mirror_interval:
+      mirrorRow !== null ? renderGoDuration(mirrorRow.intervalSeconds) : "",
+    mirror_updated:
+      mirrorRow !== null ? mirrorRow.updatedAt.toISOString() : GO_ZERO_TIME,
+    mirror_last_sync_at:
+      mirrorRow !== null && mirrorRow.lastSyncAt !== null
+        ? new Date(mirrorRow.lastSyncAt * 1000).toISOString()
+        : GO_ZERO_TIME,
     topics: [], // TODO(SPEC-0005): topics table
     licenses: [], // TODO(SPEC-0005): licenses detection
     object_format_name: "sha1",
@@ -631,8 +787,11 @@ export interface RepoSearchOptions extends RepositoryListOptions {  keyword: str
  *  - `topic=true`: no topics table — keyword never matches, results empty.
  *  - `starredBy`: no stars table — always empty.
  *  - `team_id`: no teams — always empty.
- *  - `mode`: all registry rows are non-fork/non-mirror, so `source` matches
- *    everything and `fork`/`mirror`/`collaborative` match nothing.
+ *  - `mode`: fork/mirror/source filter the landed columns (upstream
+ *    repo.go:163-176 → repo_list.go:500-513): `fork` ≡ `is_fork` (our
+ *    `fork_parent IS NOT NULL`), `mirror` ≡ `is_mirror`, `source` ≡ neither.
+ *    `collaborative` (`is_mirror=false` + the collaborator edge upstream)
+ *    still matches nothing — no collaborator edges (TODO below).
  *  - `template`/`archived`: no columns — `true` matches nothing, `false` all.
  *  - `priority_owner_id`: implemented as a CASE-WHEN ordering prefix.
  */
@@ -656,12 +815,25 @@ export async function searchRepositories(
   }
   switch (opts.mode) {
     case "fork":
+      // Upstream: `is_fork = true` (repo_list.go:500-513 via opts.Fork);
+      // our fork edge is the single nullable column.
+      conditions.push(isNotNull(repositories.forkParent));
+      break;
     case "mirror":
-    case "collaborative":
-      conditions.push(noMatch);
+      // `is_mirror = true`.
+      conditions.push(eq(repositories.isMirror, true));
       break;
     case "source":
-      break; // every registry row is already non-fork, non-mirror
+      // `is_fork = false AND is_mirror = false` (repo.go:165-167).
+      conditions.push(
+        and(isNull(repositories.forkParent), eq(repositories.isMirror, false)) as SQL,
+      );
+      break;
+    case "collaborative":
+      // Upstream: is_mirror=false AND Collaborate=true (repo.go:172-174) —
+      // the collaborator edge the list WHERE does not model yet.
+      conditions.push(noMatch);
+      break;
     case "":
       break;
   }
