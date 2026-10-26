@@ -319,6 +319,34 @@
  *                                          org-home DOM through the second
  *                                          URL — tplOrgHome serves both
  *                                          upstream; user names 404-shell)
+ *   /:owner/:repo/forks                    forks list, GET (pages/
+ *                                          repo-social.tsx — wave 24; the
+ *                                          parity survey's bench trio,
+ *                                          web.go:1759; the landed
+ *                                          listForks read with the reduced
+ *                                          accessible-condition)
+ *   /:owner/:repo/stars                    stargazers cards, GET (same
+ *                                          module — web.go:1766; the
+ *                                          landed listRepoStargazers read;
+ *                                          upstream's tplWatchers serves
+ *                                          both social pages, so this
+ *                                          carries `repository watchers`)
+ *   /:owner/:repo/watchers                 watchers cards, GET (same
+ *                                          module — web.go:1767; the
+ *                                          landed listRepoSubscribers
+ *                                          read)
+ *   /:owner/:repo/settings/collaboration   collaborators + teams settings
+ *                                          panel, GET + POST (pages/
+ *                                          settings-collaboration.tsx —
+ *                                          wave 24; upstream web.go:1194's
+ *                                          group; the POSTs are the add
+ *                                          collaborator write plus the
+ *                                          literal /access_mode, /delete,
+ *                                          /team and /team/delete write
+ *                                          tails over the landed
+ *                                          repo-collaborators +
+ *                                          TeamsService arms; admin viewer
+ *                                          only — the settingsGate)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -488,6 +516,19 @@ import {
   renderOrgRepositoriesPage,
   resolveOrgRepositories,
 } from "./pages/org-repos";
+// Wave-24 repo social lists + collaboration panel (the parity survey's bench
+// tier — the forks/stars/watchers trio and the settings/collaboration row).
+import { loadRepoSocialData, renderRepoSocialPage } from "./pages/repo-social";
+import {
+  addCollaboratorFromForm,
+  addTeamFromForm,
+  canChangeRepoTeamAccess,
+  changeAccessModeFromForm,
+  loadCollaborationData,
+  removeCollaboratorFromForm,
+  removeTeamFromForm,
+  renderCollaborationPage,
+} from "./pages/settings-collaboration";
 import { loadDashboardData, renderDashboardPage, renderLandingPage } from "./pages/dashboard";
 import {
   loadExploreReposData,
@@ -811,6 +852,35 @@ export interface OrgRepositoriesRoute {
   owner: string;
 }
 
+/** The wave-24 repo social list families (pages/repo-social.tsx): upstream's
+ *  three bare repo-scoped literals — `/forks` (web.go:1759), `/stars`
+ *  (web.go:1766), `/watchers` (web.go:1767) — the parity survey's bench
+ *  trio, one `listRefs`-free read each over the landed social/fork services.
+ *  GET-only; every deeper tail stays unclaimed → the engine's 404. */
+export interface RepoSocialRoute {
+  family: "forks" | "stars" | "watchers";
+  owner: string;
+  repo: string;
+}
+
+/** The wave-24 collaboration settings family (pages/settings-collaboration.tsx):
+ *  upstream's `/settings/collaboration` group (web.go:1194-1204) — the
+ *  `m.Combo("")` panel (GET the render, POST the add-collaborator write)
+ *  plus the four POST-only write tails with upstream's exact literal names
+ *  (the JS dropdown's /access_mode, the /delete remove, the org team
+ *  /team add and /team/delete remove; the ids ride the form fields —
+ *  upstream's FormInt64 carriers). */
+export interface SettingsCollaborationRoute {
+  family:
+    | "settings-collaboration"
+    | "settings-collab-access-mode"
+    | "settings-collab-delete"
+    | "settings-collab-team-add"
+    | "settings-collab-team-delete";
+  owner: string;
+  repo: string;
+}
+
 
 /** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
  *  three web POSTs — the verdict form's
@@ -1020,7 +1090,9 @@ export type ParsedUiRoute =
   | RepoCreateRoute
   | OrgCreateRoute
   | OrgMembersRoute
-  | OrgRepositoriesRoute;
+  | OrgRepositoriesRoute
+  | RepoSocialRoute
+  | SettingsCollaborationRoute;
 
 
 /**
@@ -1293,6 +1365,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 3 && rest[0] === "branches" && /^-?\d+$/.test(rest[1] as string) && rest[2] === "delete") {
       return { family: "settings-branch-delete", owner, repo, id: Number.parseInt(rest[1] as string, 10) };
     }
+    // Wave 24: the collaboration panel + its four POST-only write tails
+    // (pages/settings-collaboration.tsx — upstream web.go:1194-1204's
+    // group): the `m.Combo("")` page (GET + POST the add-collaborator
+    // write) and upstream's exact literal tails — /access_mode, /delete,
+    // /team and /team/delete (the ids ride the form fields, upstream's
+    // FormInt64 carriers, so no id appears in any pattern). Every other
+    // /collaboration/* tail stays engine-owned.
+    if (rest.length === 1 && rest[0] === "collaboration") return { family: "settings-collaboration", owner, repo };
+    if (rest.length === 2 && rest[0] === "collaboration") {
+      if (rest[1] === "access_mode") return { family: "settings-collab-access-mode", owner, repo };
+      if (rest[1] === "delete") return { family: "settings-collab-delete", owner, repo };
+      if (rest[1] === "team") return { family: "settings-collab-team-add", owner, repo };
+    }
+    if (rest.length === 3 && rest[0] === "collaboration" && rest[1] === "team" && rest[2] === "delete") {
+      return { family: "settings-collab-team-delete", owner, repo };
+    }
     return null;
   }
   // Wave-6: the milestones list (the bare URL, `?state=` carries the facet)
@@ -1375,6 +1463,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
         return null;
       }
     }
+    return null;
+  }
+  // Wave-24 repo social lists (pages/repo-social.tsx — upstream's three bare
+  // repo-scoped literals, web.go:1759 /forks + web.go:1766 /stars +
+  // web.go:1767 /watchers, the survey bench's third-ranked row): exact
+  // single-literal shapes, GET-only. Any deeper tail stays unclaimed → the
+  // engine's 404, exactly upstream's unregistered-route answer.
+  if (head === "forks" || head === "stars" || head === "watchers") {
+    if (rest.length === 0) return { family: head, owner, repo };
     return null;
   }
   // Wave-18 commit view (pages/commit-view.tsx — upstream web.go:1739): the
@@ -3574,6 +3671,14 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
     return respond(c.html(renderCommitViewPage({ ctx, data }), 200));
   }
+  // Wave-24 dispatch: the repo social lists (render.tsx never sees these
+  // families; the loader's family switch picks the landed read — forks
+  // through the viewer's reduced accessible-condition, stars/watchers
+  // through the social lists).
+  if (route.family === "forks" || route.family === "stars" || route.family === "watchers") {
+    const data = await loadRepoSocialData(c.env.DB, repo, viewer, route.family, url.searchParams);
+    return respond(c.html(renderRepoSocialPage(ctx, data), 200));
+  }
 
   // U3 page switch (render.tsx — home | commits | src), with the 404 shell
   // for unresolvable refs/paths (§4.5).
@@ -3644,6 +3749,135 @@ async function orgRepositoriesPage(c: Context<{ Bindings: Env }>): Promise<Respo
   if (org.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
   const data = await loadOrgRepositoriesData(c.env.DB, org.org, doer, url.searchParams);
   return respond(c.html(renderOrgRepositoriesPage(ctx, data), 200));
+}
+
+// ---------------------------------------------------------------------------
+// The wave-24 collaboration settings family (pages/settings-collaboration.tsx
+// — upstream's /settings/collaboration group, web.go:1194-1204): the panel
+// GET plus the five POST writes, every one behind the shared settingsGate
+// and the §2.8 sameOriginGuard.
+// ---------------------------------------------------------------------------
+
+/** The collaboration re-render's shared tail: the fresh read, the failure
+ *  message and the kept `collaborator` submission (the hooks-settings
+ *  convention — validation failures re-render at 200). */
+async function collaborationReRender(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+  options: { error: string | null; collaborator: string },
+): Promise<Response> {
+  const { ctx, viewer, respond, repo } = resolved;
+  const data = await loadCollaborationData(c.env, c.env.DB, repo, viewer);
+  return respond(c.html(renderCollaborationPage(ctx, data, options), 200));
+}
+
+/** GET /{owner}/{repo}/settings/collaboration (the panel). */
+async function collaborationPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  return collaborationReRender(c, resolved, { error: null, collaborator: "" });
+}
+
+/**
+ * POST /{owner}/{repo}/settings/collaboration — the add-collaborator write
+ * (upstream CollaborationPost): success and the silent arms 303 back onto
+ * the panel, the refused arms re-render with upstream's exact flash text
+ * and the kept submission.
+ */
+async function collaborationAddSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { respond, repo } = resolved;
+  const name = (await readUrlEncodedForm(c.req.raw)).get("collaborator") ?? "";
+  const result = await addCollaboratorFromForm(c.env.DB, repo, name, new Date());
+  if (result.outcome !== "refused") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/collaboration` } }));
+  }
+  return collaborationReRender(c, resolved, { error: result.message, collaborator: name });
+}
+
+/** POST /{owner}/{repo}/settings/collaboration/access_mode — the access-mode
+ *  write (upstream ChangeCollaborationAccessMode). */
+async function collaborationAccessModeSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { respond, repo } = resolved;
+  const form = await readUrlEncodedForm(c.req.raw);
+  const result = await changeAccessModeFromForm(c.env.DB, repo, form, new Date());
+  if (result.outcome !== "refused") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/collaboration` } }));
+  }
+  return collaborationReRender(c, resolved, { error: result.message, collaborator: "" });
+}
+
+/** POST /{owner}/{repo}/settings/collaboration/delete — the remove write
+ *  (upstream DeleteCollaboration). */
+async function collaborationDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { respond, repo } = resolved;
+  const form = await readUrlEncodedForm(c.req.raw);
+  const result = await removeCollaboratorFromForm(c.env.DB, repo, form);
+  if (result.outcome !== "refused") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/collaboration` } }));
+  }
+  return collaborationReRender(c, resolved, { error: result.message, collaborator: "" });
+}
+
+/** POST /{owner}/{repo}/settings/collaboration/team — the add-team write
+ *  (upstream AddTeamPost, behind CanDoerManageOrgRepoCollaboratorTeam). */
+async function collaborationTeamAddSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, viewer, respond, repo } = resolved;
+  if (!(await canChangeRepoTeamAccess(c.env, c.env.DB, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const form = await readUrlEncodedForm(c.req.raw);
+  const result = await addTeamFromForm(c.env.DB, repo, form);
+  if (result.outcome !== "refused") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/collaboration` } }));
+  }
+  return collaborationReRender(c, resolved, { error: result.message, collaborator: "" });
+}
+
+/** POST /{owner}/{repo}/settings/collaboration/team/delete — the remove-team
+ *  write (upstream DeleteTeam, the same team gate). */
+async function collaborationTeamDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, viewer, respond, repo } = resolved;
+  if (!(await canChangeRepoTeamAccess(c.env, c.env.DB, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const form = await readUrlEncodedForm(c.req.raw);
+  const result = await removeTeamFromForm(c.env.DB, repo, form);
+  if (result.outcome !== "refused") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/collaboration` } }));
+  }
+  return collaborationReRender(c, resolved, { error: result.message, collaborator: "" });
 }
 
 export const uiRouter = new Hono<{ Bindings: Env }>();
@@ -3854,3 +4088,26 @@ uiRouter.get("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => ownerHomeP
 // future collision loudly).
 uiRouter.get("/org/:owner/members", (c) => orgMembersPage(c));
 uiRouter.get("/:owner/-/repositories", (c) => orgRepositoriesPage(c));
+// Wave-24 repo social lists (parseUiRoute claims exactly these shapes —
+// upstream's web.go:1759/1766/1767 bare literals; GET-only read pages
+// through the uiPage dispatch, the branches/releases convention).
+uiRouter.get("/:owner/:repo/forks", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/stars", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/watchers", (c) => uiPage(c));
+// Wave-24 collaboration panel (parseUiRoute claims exactly these shapes —
+// upstream web.go:1194-1204's group; the POSTs run the §2.8 sameOriginGuard
+// first and the four POST-only write tails answer GET with chi's 405 — the
+// hook test/delete convention. No earlier registration can absorb these:
+// /settings/collaboration/* is a deeper tail than every registered
+// /settings family, and the static "collaboration" segment outranks any
+// dynamic peer).
+uiRouter.get("/:owner/:repo/settings/collaboration", (c) => collaborationPage(c));
+uiRouter.post("/:owner/:repo/settings/collaboration", (c) => collaborationAddSubmit(c));
+uiRouter.post("/:owner/:repo/settings/collaboration/access_mode", (c) => collaborationAccessModeSubmit(c));
+uiRouter.get("/:owner/:repo/settings/collaboration/access_mode", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/collaboration/delete", (c) => collaborationDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/settings/collaboration/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/collaboration/team", (c) => collaborationTeamAddSubmit(c));
+uiRouter.get("/:owner/:repo/settings/collaboration/team", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/collaboration/team/delete", (c) => collaborationTeamDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/settings/collaboration/team/delete", () => methodNotAllowed("POST"));

@@ -196,6 +196,7 @@ import { BaseLayout, Icon, renderPage } from "../shell";
 export const settingsLocale = {
   settings: "Settings", // "repo.settings"
   options: "Repository", // "repo.settings.options" (the navbar's first item text)
+  collaboration: "Collaborators", // "repo.settings.collaboration" (wave 24's navbar item)
   hooks: "Webhooks", // "repo.settings.hooks"
   basic_settings: "Basic Settings", // "repo.settings.basic_settings"
   repo_name: "Repository Name", // "repo.repo_name"
@@ -323,14 +324,22 @@ export function renderRepoSettingsPage(options: {
  *  item between Webhooks and Mirror — upstream's own order
  *  (navbar.tmpl:16-23 puts branches after hooks; mirror stays adjacent to
  *  its options-section origin at the tail). Exported for pages/
- *  branch-protection.tsx, which renders it with `branches` active. */
-export function SettingsNav(props: { repoLink: string; active: "options" | "hooks" | "branches" | "mirror" }) {
+ *  branch-protection.tsx, which renders it with `branches` active. Wave 24
+ *  adds the Collaboration item (navbar.tmpl:13) between Repository and
+ *  Webhooks — pages/settings-collaboration.tsx renders it active. */
+export function SettingsNav(props: { repoLink: string; active: "options" | "collaboration" | "hooks" | "branches" | "mirror" }) {
   return (
     <div class="flex-container-nav">
       <div class="ui fluid vertical menu">
         <div class="header item">{settingsLocale.settings}</div>
         <a class={props.active === "options" ? "active item" : "item"} href={`${props.repoLink}/settings`}>
           {settingsLocale.options}
+        </a>
+        <a
+          class={props.active === "collaboration" ? "active item" : "item"}
+          href={`${props.repoLink}/settings/collaboration`}
+        >
+          {settingsLocale.collaboration}
         </a>
         <a class={props.active === "hooks" ? "active item" : "item"} href={`${props.repoLink}/settings/hooks`}>
           {settingsLocale.hooks}
