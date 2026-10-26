@@ -12,6 +12,7 @@ import { enqueueDuePushMirrorSyncs, enqueuePushMirrorSyncsOnCommit } from "./ser
 import { handlesUiRoute, uiRouter } from "./ui";
 import { sessionRouter } from "./ui/session";
 import { avatarServingRouter } from "./web/avatar-serving";
+import { attachmentsServingRouter } from "./web/attachments-serving";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
 
@@ -67,6 +68,9 @@ app.route("/api/v1", createApiRouter());
 // uiRouter so its literal /avatar, /avatars and /user/avatar routes always
 // win over the UI's /:owner/:repo parser shape.
 app.route("/", avatarServingRouter);
+// Attachments serving (web.go:912): plain Hono seam — mounted before uiRouter
+// so the literal /attachments/:uuid route wins over any page-parser shape.
+app.route("/", attachmentsServingRouter);
 // Tier-2 UI (SPEC-0008 §2.2): the sub-app claims only the page families its
 // parser owns (/:owner/:repo[/commits|/src]); the dispatcher consults
 // handlesUiRoute BEFORE Hono routes, so a miss here can never swallow an
@@ -107,8 +111,11 @@ export default {
       segments[0] === "avatar" ||
       segments[0] === "avatars" ||
       (segments[0] === "user" && segments[1] === "avatar");
+    // Attachments carve-out (web.go:912 — the site-level /attachments/:uuid
+    // download route): never repo-scoped, never the engine's.
+    const isAttachmentServing = segments[0] === "attachments";
     const isRepoScoped =
-      segments.length >= 2 && segments[1] !== "" && segments[0] !== "api" && !isAvatarServing;
+      segments.length >= 2 && segments[1] !== "" && segments[0] !== "api" && !isAvatarServing && !isAttachmentServing;
     if (isRepoScoped) {
       // All methods for the UI's write families (new/edit/delete file,
       // new-issue, comments, settings, milestones — waves 4-8 are POSTs on
