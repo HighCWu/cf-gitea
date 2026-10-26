@@ -315,7 +315,9 @@ async function emitLabelDetachEvent(c: Context<ApiEnv>, found: RepositoryWithOwn
         payload: {
           action: "label_updated",
           number: issue.index,
-          pull_request: await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "single"),
+          // ToPayloadPullRequest (pull.go:30-37) — the webhook payload renders
+          // the head repo regardless of the doer's visibility.
+          pull_request: await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
           repository: identity.repository,
           sender: identity.sender,
           commit_id: "",

@@ -576,3 +576,151 @@ describe("PR converter head.repo — the AUTHENTICATED-STRANGER arms (wave-36 mu
     expect(items[0]?.head.repo).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Wave-37 emitter sweep: the REMAINING issue-family webhook emitters must ride
+// toApiPullRequest's "payload" mode like emitLabelEvent above — the label
+// DETACH (routes/issue-write-t2.ts emitLabelDetachEvent), the assignee
+// add/remove (routes/issue-tables-t2.ts emitAssignEvent) and the review
+// submission + review-request pair (routes/pull-reviews.ts emitReviewSubmitted
+// / reviewRequestArm). One differential per family, the emitLabelEvent test's
+// shape: the SAME stranger-private-fork PR hides head.repo on the API GET and
+// shows it in THAT family's payload. Append-only slugs (hpr-det/hpr-asn/
+// hpr-rev); their PRs are service-seeded (no refs/pull land on the cells), so
+// the beforeEach cleanup list stays untouched.
+// ---------------------------------------------------------------------------
+
+/** The stranger-private-fork fixture + the service-seeded PR at index 1. */
+async function seedPrivateForkPull(baseSlug: string): Promise<ForkFixture> {
+  const fixture = await seedForkWithFeature(baseSlug, { owner: "alice", private: true });
+  const service = new IssuesService(env.DB);
+  await service.ensureRepoCounters(fixture.baseId);
+  const seeded = await service.createPullRequest({
+    repoId: fixture.baseId,
+    title: "stranger fork PR",
+    posterId: null,
+    headRepoId: fixture.forkId,
+    baseBranch: "main",
+    headBranch: "feature",
+  });
+  expect(seeded.issue.index).toBe(1);
+  return fixture;
+}
+
+/** The API-hide arm: both doers (the stub owner of the base — a stranger on
+ *  alice's private fork — and anonymous) see the -1/nil head. */
+async function expectApiHidesHead(baseSlug: string): Promise<void> {
+  for (const headers of [authHeaders, anonHeaders]) {
+    const got = await router()(`/repos/cf-gitea-stub/${baseSlug}/pulls/1`, { headers });
+    expect(got.status).toBe(200);
+    const body = await got.json<{ head: HeadBlock }>();
+    expect(body.head.repo_id).toBe(-1);
+    expect(body.head.repo).toBeUndefined();
+  }
+}
+
+/** The family payload assertion: the private fork renders to the receivers
+ *  with the stub stranger's AccessModeNone block (pull.go:186-190). */
+type FamilyPayload = { action: string; pull_request: { head: HeadBlock } };
+
+function expectPayloadShowsHead(payload: FamilyPayload, action: string, forkId: string, fullName: string): void {
+  expect(payload.action).toBe(action);
+  expect(payload.pull_request.head.repo_id).toBe(Number(forkId));
+  expect(payload.pull_request.head.repo).toMatchObject({
+    full_name: fullName,
+    private: true,
+    permissions: { admin: false, push: false, pull: false },
+  });
+}
+
+describe("the payload emitters — every issue/assignee/review webhook family renders the hidden head repo (wave-37)", () => {
+  it("the label DETACH payload shows head.repo where the API hides it (routes/issue-write-t2.ts emitLabelDetachEvent)", async () => {
+    const fixture = await seedPrivateForkPull("hpr-det");
+    await expectApiHidesHead("hpr-det");
+
+    // Attach first (hookless — the delivery log stays empty), then arm the
+    // hook and detach: exactly one pull_request_label delivery answers.
+    const labelRows = await db()
+      .insert(labels)
+      .values({ repoId: fixture.baseId, name: "bug", color: "#00aabb", description: "", numIssues: 0, numClosedIssues: 0 })
+      .returning({ id: labels.id })
+      .all();
+    const labelId = labelRows[0]!.id;
+    const attached = await router()("/repos/cf-gitea-stub/hpr-det/issues/1/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [labelId] }),
+    });
+    expect(attached.status).toBe(200);
+
+    await clearWebhookTables();
+    await seedRepoHook(fixture.baseId);
+    const detached = await router()(`/repos/cf-gitea-stub/hpr-det/issues/1/labels/${labelId}`, {
+      method: "DELETE",
+      headers: authHeaders,
+    });
+    expect(detached.status).toBe(204);
+
+    const rows = await deliveryRows();
+    const label = rows.find((row) => row.eventType === "pull_request_label");
+    if (label === undefined) {
+      throw new Error(`no pull_request_label delivery among: ${rows.map((row) => row.eventType).join(",")}`);
+    }
+    expectPayloadShowsHead(JSON.parse(label.payloadContent) as FamilyPayload, "label_updated", fixture.forkId, "alice/hpr-det");
+  });
+
+  it("the assignee payload shows head.repo where the API hides it (routes/issue-tables-t2.ts emitAssignEvent)", async () => {
+    const fixture = await seedPrivateForkPull("hpr-asn");
+    await expectApiHidesHead("hpr-asn");
+
+    await clearWebhookTables();
+    await seedRepoHook(fixture.baseId);
+    const assigned = await router()("/repos/cf-gitea-stub/hpr-asn/issues/1/assignees", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: ["alice"] }),
+    });
+    expect(assigned.status).toBe(201);
+
+    const rows = await deliveryRows();
+    const assign = rows.find((row) => row.eventType === "pull_request_assign");
+    if (assign === undefined) {
+      throw new Error(`no pull_request_assign delivery among: ${rows.map((row) => row.eventType).join(",")}`);
+    }
+    expectPayloadShowsHead(JSON.parse(assign.payloadContent) as FamilyPayload, "assigned", fixture.forkId, "alice/hpr-asn");
+  });
+
+  it("the review payloads show head.repo where the API hides it — submission AND review_request (routes/pull-reviews.ts)", async () => {
+    const fixture = await seedPrivateForkPull("hpr-rev");
+    await expectApiHidesHead("hpr-rev");
+
+    await clearWebhookTables();
+    await seedRepoHook(fixture.baseId);
+
+    // The submission emitter (emitReviewSubmitted).
+    const submitted = await router()("/repos/cf-gitea-stub/hpr-rev/pulls/1/reviews", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ event: "APPROVED", body: "lgtm" }),
+    });
+    expect(submitted.status).toBe(200);
+
+    // The review-request emitter (the user-add arm; its apiPullRequest render
+    // is shared with the team arm and the user-remove arm).
+    const requested = await router()("/repos/cf-gitea-stub/hpr-rev/pulls/1/requested_reviewers", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ reviewers: ["alice"] }),
+    });
+    expect(requested.status).toBe(201);
+
+    const rows = await deliveryRows();
+    const approval = rows.find((row) => row.eventType === "pull_request_review_approved");
+    const request = rows.find((row) => row.eventType === "pull_request_review_request");
+    if (approval === undefined || request === undefined) {
+      throw new Error(`missing review deliveries among: ${rows.map((row) => row.eventType).join(",")}`);
+    }
+    expectPayloadShowsHead(JSON.parse(approval.payloadContent) as FamilyPayload, "reviewed", fixture.forkId, "alice/hpr-rev");
+    expectPayloadShowsHead(JSON.parse(request.payloadContent) as FamilyPayload, "review_requested", fixture.forkId, "alice/hpr-rev");
+  });
+});

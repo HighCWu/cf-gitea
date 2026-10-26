@@ -928,7 +928,9 @@ async function emitAssignEvent(
         action,
         number: issue.index,
         changes,
-        pull_request: await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "single"),
+        // ToPayloadPullRequest (pull.go:30-37) — the webhook payload renders
+        // the head repo regardless of the doer's visibility.
+        pull_request: await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
         repository: event.repository,
         sender: event.sender,
         commit_id: "",

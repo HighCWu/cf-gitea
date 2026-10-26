@@ -632,7 +632,9 @@ async function emitReviewSubmitted(
     payload: reviewEventPayload({
       action: "reviewed",
       index: issue.index,
-      apiPullRequest: await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "single"),
+      // ToPayloadPullRequest (pull.go:30-37) — the webhook payload renders
+      // the head repo regardless of the doer's visibility.
+      apiPullRequest: await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
       repository: toApiRepository(viewer, found),
       sender: c.get("authUser"),
       requestedReviewer: c.get("authUser"),
@@ -1593,7 +1595,10 @@ export function registerPullReviewRoutes(
       }
     }
 
-    const apiPullRequest = await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "single");
+    // ToPayloadPullRequest (pull.go:30-37) — the review_request webhook
+    // payloads (add user/team, remove user) render the head repo regardless
+    // of the doer's visibility.
+    const apiPullRequest = await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload");
     const repository = toApiRepository(viewer, found);
 
     if (isAdd) {
