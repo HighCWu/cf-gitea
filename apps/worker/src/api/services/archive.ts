@@ -77,9 +77,9 @@ export const MAX_ARCHIVE_TOTAL_BYTES = 256 * 1024 * 1024;
  * oid. NO default-branch fallback: upstream GetCommit(refFromName) fails on
  * an unresolvable name; the default branch is never implicit here. Null =
  * the route's upstream `unrecognized repository reference` 404. Shared by
- * the API route and the wave-32 web archive download (the routes/archive.ts
- * private copy predates this export — a convergence TODO, not a second
- * semantic).
+ * the API route and the wave-32 web archive download (the route's former
+ * private copy converged onto this export at 889b74a — byte-identical, no
+ * drift).
  */
 export function resolveArchiveRef(tips: ReturnType<typeof refTipMap>, ref: string): string | null {
   const branch = tips.get(branchRef(ref));
