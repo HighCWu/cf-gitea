@@ -1,25 +1,41 @@
-# Remaining API Inventory — the undeclared 236
+# Remaining API Inventory — the last 86 before the feature wall
 
 Refill ammunition for the wave pool: every operation the frozen contract
 declares that our `/api/v1` spec does not, classified by what it would take to
 declare it, then ranked into dispatchable batches. Companion to
 `ui-parity-survey.md` (the web-UI gap inventory) — this file is the API-side
-equivalent.
+equivalent. **Fully regenerated 2026-10-26** at HEAD `fec5c71` after the
+previous edition (written at declared=318, commit `c4577a7`) drove ~129
+declarations to completion — every batch it listed has landed or is in flight.
 
 - **Sources / method**: frozen contract
-  `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554** operations:
-  repository 229, user 98, organization 88, issue 72, admin 33, miscellaneous 14,
-  package 9, notification 7, settings 4) minus the declared set that
-  `node scripts/check-openapi.mjs` reports (**318** operations across 203 paths,
-  measured 2026-10-25). Diff: **236 undeclared**. Tier-1 is complete
-  (78/78 paths, 129/129 ops) — everything here is tier-2/3 by construction.
+  `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
+  operations across 350 paths: repository 229, user 98, organization 88,
+  issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
+  minus the declared set that `node scripts/check-openapi.mjs` reports
+  (**447** operations across **275** paths, measured 2026-10-26 at HEAD
+  `fec5c71`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
+  operations). Raw diff: **107 undeclared**; minus the **21 in-flight**
+  org-project ops (see In-flight below) = **86 remaining**.
+  Issue / notification / miscellaneous / settings families have **zero**
+  remaining — they are fully declared.
+- **Reproducing the diff** (the numbers above fall out of exactly these two
+  commands, run from the repo root):
+  1. `node scripts/check-openapi.mjs` — prints `declared: 447 operation(s)
+     across 275 path(s)` and every declared op as `[ok] <METHOD> <path>
+     (<operationId>)`. The checker hard-fails any declared op missing from the
+     contract, so declared ⊆ contract and the diff is a plain set subtraction
+     on `METHOD path` (it is unambiguous: all 447 shared ops carry the
+     contract's own operationId).
+  2. `node -e` walking `paths` of the contract JSON with the checker's HTTP
+     method set (`get put post delete options head patch`), printing
+     `<tag> | <METHOD> <path> | <operationId>` per op (554 rows); subtract the
+     checker's 447.
 - **Upstream pin**: `fc4936884584a41931906553d96c2601d750e6ef`
   (v1.22.0-rc1-3919-gfc49368845); every `gitea/…` cite below is that commit.
-- **Landed-store references**: `apps/worker/src/db/schema.ts` (49 tables,
-  migrations 0000–0018), route modules under `apps/worker/src/api/routes/`,
-  services under `apps/worker/src/{services,repos,issues,webhooks}/`.
-- **Regenerating the diff**: `node scripts/check-openapi.mjs` prints every
-  declared op as `[ok] <METHOD> <path>`; diff against the contract paths object.
+- **Landed-store references**: `apps/worker/src/db/schema.ts` (**64 tables**,
+  migrations 0000–0028), route modules under `apps/worker/src/api/routes/`,
+  services under `apps/worker/src/{services,api/services,repos,issues,webhooks}/`.
 
 ## Classification legend
 
@@ -27,8 +43,8 @@ equivalent.
   batch only writes route/service code (plus spec declaration).
 - **TABLE-DEPENDENT** — needs new D1 table(s) (or a column). The missing store
   is named with its upstream model pointer; the batch owns one migration
-  (numbers below are **provisional** — migrations run 0000–0018 today, next
-  free is 0019; assign next-free at merge, drizzle journal regenerated then).
+  (numbers below are **provisional** — migrations run 0000–0028 today, next
+  free is 0029; assign next-free at merge, drizzle journal regenerated then).
 - **RUNTIME-ONLY** — declarable only with documented runtime-only response
   exceptions (the `RUNTIME_ONLY_RESPONSES` table in `scripts/check-openapi.mjs`,
   shared file — orchestrator applies or designates), typically because the
@@ -36,539 +52,257 @@ equivalent.
 - **FEATURE-ABSENT** — gated on a whole feature (actions runtime, package
   registry) that needs its own SPEC; listed with the pointer, not batched.
 
-## Family summary
+## Family summary (remaining — in-flight excluded)
 
 | Class | repository | organization | user | admin | package | **total** |
 |---|---|---|---|---|---|---|
-| IMPLEMENTABLE-NOW | 11 | 9 | 13 | 5 | 0 | **38** |
-| TABLE-DEPENDENT | 47 | 34 | 39 | 3 | 0 | **123** |
-| RUNTIME-ONLY | 6 | 0 | 0 | 5 | 0 | **11** |
+| IMPLEMENTABLE-NOW | 0 | 0 | 22 | 0 | 0 | **22** |
+| TABLE-DEPENDENT | 0 | 0 | 0 | 0 | 0 | **0** |
+| RUNTIME-ONLY | 0 | 0 | 0 | 0 | 0 | **0** |
 | FEATURE-ABSENT | 33 | 7 | 7 | 8 | 9 | **64** |
-| **total** | **97** | **50** | **59** | **21** | **9** | **236** |
+| **total** | **33** | **7** | **29** | **8** | **9** | **86** |
 
-Notable singletons: `POST /repos/{owner}/{repo}/mirror-sync` is **already
-implemented** (`routes/mirror.ts:282`, plain `app.post`) but undeclared — the
-only implemented-but-undeclared op in the contract; declaring it is free.
+(Including the in-flight 21, the raw 107 organize as: repository 33,
+organization 28, user 29, admin 8, package 9.)
+
+The pool is nearly drained: **one** ready batch remains (projects stage 3,
+user scope). Everything after it is FEATURE-ABSENT — declaring the full
+surface short of actions/packages would put the ceiling at 490/554 ops.
 
 ---
 
-## Dispatchable batches (ranked by demand signal)
+## In-flight (excluded from "remaining" — do not re-dispatch)
 
-Demand ranking favors client/tool-visible surface (token management, webhook
-scopes, CI-facing secrets) over admin-corner degeneracies. Shared-file note:
-every batch needs `src/api/router.ts` registration; schema batches touch
-`src/db/schema.ts`; runtime-only batches touch `scripts/check-openapi.mjs` —
-these three are shared files, designate an owner or apply at integration.
+### projects-org stage 2 — 21 org project ops (uncommitted)
 
-### Batch 1 — `wave-api-tokens-times-aggregates` (13 ops, table-free)
+`apps/worker/src/api/routes/projects-org.ts` (+ `projects-org.test.ts`) sits
+uncommitted in the tree: **21 route declarations** over the 11
+`/orgs/{org}/projects…` paths (4 DELETE, 7 GET, 3 PATCH, 7 POST — matches the
+contract's org-projects set exactly), riding the landed projects store
+(migration 0024) and `src/api/services/projects.ts` (`ProjectScope`, kind
+`"organization"`). Op ids are the `org*Project*` family: `orgListProjects`,
+`orgGetProject`, `orgCreateProject`, `orgEditProject`, `orgDeleteProject`,
+`orgListProjectColumns`, `orgGetProjectColumn`, `orgCreateProjectColumn`,
+`orgEditProjectColumn`, `orgDeleteProjectColumn`, `orgSetDefaultProjectColumn`,
+`orgMoveProjectColumns`, `orgListProjectColumnIssues`,
+`orgAddIssueToProjectColumn`, `orgRemoveIssueFromProjectColumn`,
+`orgMoveProjectIssue`, `orgListProjectWorkflows`, `orgGetProjectWorkflow`,
+`orgCreateProjectWorkflow`, `orgEditProjectWorkflow`, `orgDeleteProjectWorkflow`.
 
-Highest value-per-effort: everything rides landed stores; no migration.
+### Other in-flight units — zero new ops
 
-- `userGetTokens` / `userCreateToken` / `userDeleteAccessToken` — port upstream
-  `reqSelfOrAdmin()` + `reqBasicOrRevProxyAuth()` gates
-  (`gitea/routers/api/v1/api.go:1067-1072`) over landed
-  `personal_access_tokens` (schema.ts:294).
-- `repoTrackedTimes`, `userTrackedTimes`, `userCurrentTrackedTimes`,
-  `userGetStopWatches` — aggregate reads over landed `tracked_times`
-  (schema.ts:1308) + `issue_stopwatches` (schema.ts:1335); the issue-level ops
-  on the same tables are already declared.
-- `repoMirrorSync` — convert `routes/mirror.ts:282` to a zod-openapi
-  declaration (behavior unchanged; rides the landed mirror queue).
-- `createOrgRepoDeprecated` — alias path of the declared
-  `POST /orgs/{org}/repos` handler.
-- `orgDeleteRepos` — org-owner gate + loop over the landed purge machinery
-  (`src/repos/purge.ts`).
-- `repoSigningKey`, `repoSigningKeySSH` — degenerate 404 "no signing key"
-  (`gitea/routers/api/v1/misc/signing.go:14-24`), mirroring the landed global
-  pair; needs two `RUNTIME_ONLY_RESPONSES` entries.
-- `userVerifyGPGKey` — rides landed `gpg_keys` + the already-ported
-  VerificationToken formula (`routes/misc-t3.ts`); the OpenPGP signature
-  verification itself is the only real work — ship it last in the batch or
-  split it out if the crypto exceeds the slice.
+- **blocks-enforcement tail** — arms `ErrBlockedUser` 403 on existing routes
+  (`identity.ts`, `issue-t2.ts`, `org-teams.ts`, `repo.ts`, `starred.ts`,
+  `subscription.ts` modified in the tree); the 8 block ops themselves landed
+  (`1934664`).
+- **license-detection** — populates the landed `repo_licenses` table behind the
+  already-declared `GET /repos/{owner}/{repo}/licenses`; no new op.
+- **ui waves** — web-UI surface, not `/api/v1`; tracked in
+  `ui-parity-survey.md`.
 
-**Files to own**: new `src/api/routes/account-aggregates.ts` (tokens + times +
-stopwatches + gpg verify), edits to `src/api/routes/mirror.ts` (declaration
-only), new `src/api/routes/admin-org-extras.ts` (alias + orgDeleteRepos +
-repo signing keys), `scripts/check-openapi.mjs` (designated).
+---
 
-### Batch 2 — `wave-api-hooks-scopes` (15 ops, table-free)
+## Landed since last regen
 
-Org hooks (5) + user hooks (5) + admin system hooks (5). The landed `webhooks`
-table already carries all three scopes (`ownerId`, `isSystemWebhook`,
-schema.ts:695) and `webhook_deliveries` is scope-agnostic; the declared repo
-hooks module (`routes/hooks.ts`) is the template. Port the upstream scope
-routers (`gitea/routers/api/v1/org/hook.go`, `user/hook.go`,
-`admin/hooks.go`) — the wire payload (`Hook`) is identical across scopes; only
-the auth gates differ (org ownership, self, site-admin).
+The previous edition (commit `c4577a7`, declared=318) listed 11 numbered
+batches + 4 long-tail candidates. **All 15 landed.** REG deltas below are the
+committed `declared X→Y` jumps (they sum: 318 + 129 = 447):
 
-**Files to own**: new `src/api/routes/hooks-scopes.ts` (+ test), extraction of
-the shared hook CRUD from `routes/hooks.ts` into `src/api/services/hooks.ts`
-(keep `routes/hooks.ts` behavior identical — its tests must stay green).
+| # | Batch | Ops | Store / migration | Feature commit(s) | REG commit (declared) |
+|---|---|---|---|---|---|
+| 1 | `wave-api-hooks-scopes` (15) + `wave-api-admin-degenerate` (5) + the free `repoMirrorSync` declaration (1) | 21 | table-free; RUNTIME_ONLY gate entries ×9 | `5b704c5`-era modules (hooks-scopes, admin-degenerate) | `4e90180` (318→339) |
+| 2 | `wave-api-avatars` | 6 | R2 avatar store, table-free | `d7f5646` | `8afcfdd` (339→345) |
+| 3 | `wave-api-tokens-times-aggregates` + `admin-org-extras` (batch 1's remaining 12; `repoMirrorSync` went with #1) | 12 | table-free | `bfccc02` | `76e8ca4` (345→357) |
+| 4 | `wave-api-deploy-keys` | 5 | `deploy_keys` (0020) | `4af12a9` | `a01c464` (357→362) |
+| 5 | `wave-api-secrets-variables` | 23 | `secrets` + `action_variables` (0021) | `a5506d2` | `9f92950` (362→385) |
+| 6 | `wave-api-blocks` (8, 0022) + `wave-api-push-mirrors` (5, 0023) + `wave-api-tag-protections` (5, 0025) + `wave-api-wiki` (6, table-free) | 24 | see left | `1934664` / `8f0aa90` / `a80878c` / `d3362b1` | `51d3c74` (385→409) |
+| 7 | `wave-api-git-hooks` | 4 | table-free (R2-persisted edits) | `5b704c5` | `12ab90d` (409→413) |
+| 8 | `wave-api-projects-repo` **stage 1** (repo scope) | 21 | `projects`/`project_columns`/`project_issues`/`project_workflows` (0024) | `0d5b480` | `fc123b0` (413→434) |
+| 9 | `wave-api-oauth2-apps` (5, 0026) + `wave-api-badges-licenses-template` (5, 0027) + `wave-api-feeds` (3, 0028) | 13 | see left | `42ab6a5` / `f328d06` / `2ef9359` | `fec5c71` (434→447) |
 
-### Batch 3 — `wave-api-secrets-variables` (23 ops, migration 0019 provisional)
+Non-op landings in the same window: `wave-22 tables` (`640d805`), `wave-23
+tables` (`579e872`), `wave-blocks-enforcement` (`f5c0384` — 403 arms on 9
+existing seams), engine-registry lifecycle fixes (`4f574e9`, `1da8f56`,
+`5e2c418`), ui waves (`06eee50`), vitest timeout raise (`412facc`).
 
-Repo (8) + org (8) + user (7) actions secrets/variables CRUD. New tables
-`secrets` + `action_variables` (upstream `gitea/models/secret/secret.go`,
-`gitea/models/actions/variable.go` — owner-scoped KV with nullable repo_id).
-No runner required: this is the only actions-family surface that works without
-the actions runtime, and CI/tooling reads it. Rides landed permission gates.
-Payloads: upstream `ActionSecret`/`ActionVariable` list shapes.
+---
 
-**Files to own**: `src/db/schema.ts` + generated migration (designated), new
-`src/api/services/secrets-variables.ts`, new `src/api/routes/secrets-variables.ts`
-(+ test). Split option: repo+org first (16 ops), user follows (7) as a second
-slice over the same service.
+## Dispatchable batches
 
-### Batch 4 — `wave-api-avatars` (6 ops, table-free)
+### Batch — `wave-api-projects-user` stage 3 (22 ops, NO migration — the last ready batch)
 
-`POST/DELETE /user/avatar`, `/orgs/{org}/avatar`, `/repos/{owner}/{repo}/avatar`.
-R2 blob store (same bucket, `avatars/` key prefix, keyed by owner/repo id) per
-the storage-service boundary rule; `users.useCustomAvatar`/`avatar_email`
-already landed (schema.ts:265-266). Base64 image decode + upstream size caps
-(`gitea/routers/api/v1/user/avatar.go` analogs). Documented divergence:
-repo/org "custom avatar set" = R2 key existence (upstream keeps a column).
+The only dispatchable work left. Rides the stage-1 store verbatim:
+`projects` / `project_columns` / `project_issues` / `project_workflows`
+(schema.ts:2162/2213/2254/2286, migration 0024 — the table is owner-scoped
+with `owner_id` + `repo_id` + `type`, covering all three scopes) and the
+`ProjectScope` abstraction in `src/api/services/projects.ts` (kind
+`"individual"` is already modeled; `repoProjectScope()` shows the seam). Wire
+logic mirrors the landed repo scope (`routes/projects-repo.ts`) and the
+in-flight org scope (`routes/projects-org.ts`). Upstream pointers: the shared
+scope router `gitea/routers/api/v1/shared/project.go` and the mount groups
+`gitea/routers/api/v1/api.go:1102` (repo), `:1689` (org), `:1755`
+(user `/user/projects`).
 
-**Files to own**: new `src/services/avatars.ts`, new `src/api/routes/avatars.ts`
-(+ test).
+- 21 ops mirror the org scope 1:1 under `/user/projects…` with
+  `userCurrent*` op ids (create/get/list/edit/delete project, columns CRUD +
+  default/move, column-issue add/remove/list/move, workflows CRUD).
+- Plus the one extra op the user scope carries:
+  `GET /users/{username}/projects` (`userListProjects`) — visible-profile
+  listing on the `/users/{username}` group, distinct from the self-scoped
+  `/user/projects`.
 
-### Batch 5 — `wave-api-deploy-keys` (5 ops, migration 0020 provisional)
+**Files to own**: new `src/api/routes/projects-user.ts` (+ test) — the file
+does not exist yet (verified); REG entry in `src/api/router.ts` (shared,
+orchestrator/designee). **No schema change, no migration.**
 
-Repo deploy keys: `repoListKeys`, `repoGetKey`, `repoCreateKey`,
-`repoDeleteKey`, `repoCreateDeployToken`. New `deploy_keys` table (upstream
-`gitea/models/deploykey/deploykey.go:25-40`: `key_id`→`public_keys`, `repo_id`,
-`token_hash`, `mode`) — the parser/fingerprint helpers it needs are landed
-(`services/account-keys.ts`, `public_keys.type=2`, schema.ts:1652). High
-tooling demand (CI access without machine users).
+### After this batch — nothing dispatchable without a feature SPEC
 
-**Files to own**: `src/db/schema.ts` + migration (designated), new
-`src/api/services/deploy-keys.ts`, new `src/api/routes/deploy-keys.ts` (+ test).
+Declaring the remaining 64 ops requires the feature, not just a route stub:
 
-### Batch 6 — `wave-api-projects-repo` (21 ops, migration 0023 provisional — stage 1 of 3)
-
-Stage 1 lands the shared store + repo scope: `projects`, `project_columns`
-(upstream `project_board`), `project_issues`, plus `project_workflows` for the
-workflow endpoints (upstream `gitea/models/project/{project,column,issue,
-workflows}.go`). Column-issue moves ride landed `issues`. One service, three
-scopes — stages 2 (org, 21 ops) and 3 (user, 22 ops incl. the extra
-`GET /users/{username}/projects`) reuse it verbatim with different gates.
-
-**Files to own**: `src/db/schema.ts` + migration (designated), new
-`src/api/services/projects.ts`, new `src/api/routes/projects-repo.ts` (+ test);
-stages 2–3 add `routes/projects-org.ts` / `routes/projects-user.ts` (+ tests).
-
-### Batch 7 — `wave-api-push-mirrors` (5 ops, migration 0021 provisional)
-
-`repoListPushMirrors`, `repoGetPushMirrorByRemoteName`, `repoAddPushMirror`,
-`repoDeletePushMirror`, `repoPushMirrorSync`. New `push_mirrors` table
-(upstream `gitea/models/repo/pushmirror.go`); the sync trigger enqueues on the
-landed mirror queue lane and a new consumer performs the push (SPEC-0009
-territory — coordinate with that lane before dispatch).
-
-**Files to own**: `src/db/schema.ts` + migration (designated), extension of
-`src/services/mirror*` family, new `src/api/routes/push-mirrors.ts` (+ test).
-
-### Batch 8 — `wave-api-tag-protections` (5 ops, migration 0022 provisional)
-
-Tag protection CRUD. New `protected_tags` table (upstream
-`gitea/models/git/protected_tag.go`) — a structural mirror of the landed
-branch-protection service (`src/services/branch-protection.ts`) and its route
-family. Enforcement belongs to the push path (tag delete/create) — same hook
-point branch protection uses.
-
-**Files to own**: `src/db/schema.ts` + migration (designated), new
-`src/services/tag-protection.ts`, new `src/api/routes/tag-protections.ts`
-(+ test), touch point in the push/create-tag path (designate).
-
-### Batch 9 — `wave-api-blocks` (8 ops, migration 0024 provisional)
-
-User blocks (4) + org blocks (4). New `blocking` table (upstream
-`gitea/models/user/block.go:24-31` — `blocker_id`+`blockee_id` UNIQUE pair;
-blocker may be an org), ported from `gitea/routers/api/v1/user/block.go` +
-`org/block.go`.
-
-**Files to own**: `src/db/schema.ts` + migration (designated), new
-`src/api/services/blocks.ts`, new `src/api/routes/blocks.ts` (+ test).
-
-### Batch 10 — `wave-api-wiki` (6 ops, table-free engine work)
-
-`repoGetWikiPages`, `repoGetWikiPage`, `repoGetWikiPageRevisions`,
-`repoCreateWikiPage`, `repoEditWikiPage`, `repoDeleteWikiPage`. Upstream wiki
-is a sibling git repo (`gitea/services/wiki/wiki.go`) — no tables. Reads go
-through the engine boundary (blob/log/tree); writes reuse the landed
-contents-write machinery against the wiki repo. Needs a short SPEC first
-(`specs/wiki.md`) for the wiki-repo storage-key convention and default branch.
-
-**Files to own**: `specs/wiki.md`, new `src/services/wiki.ts`, new
-`src/api/routes/wiki.ts` (+ test).
-
-### Batch 11 — `wave-api-admin-degenerate` (5 ops, RUNTIME-ONLY)
-
-`adminCronList` / `adminCronRun` (static task registry — our maintenance task
-names; run = enqueue/no-op; upstream
-`gitea/routers/api/v1/admin/cron.go` returns in-code definitions) and the
-`adminUnadoptedList` / `adminAdoptRepository` / `adminDeleteUnadoptedRepository`
-trio (no filesystem → always-empty list, 404s; upstream
-`gitea/routers/api/v1/admin/adopt.go` scans disk). Follows the landed
-"honest-empty" convention (`orgListTeamActivityFeeds`, routes/org-teams.ts:1213).
-Admin-corner demand — dispatch when the pool runs dry, not before.
-
-**Files to own**: new `src/api/routes/admin-degenerate.ts` (+ test),
-`scripts/check-openapi.mjs` `RUNTIME_ONLY_RESPONSES` entries (designated).
-
-### Long-tail candidates (17 ops — dispatch as pool-fillers, not primaries)
-
-- **`wave-api-oauth2-apps`** (5, migration 0025 provisional):
-  `oauth2_application` table (`gitea/models/auth/oauth2.go`); CRUD only — the
-  authorize/token flow is web-UI territory and separate.
-- **`wave-api-badges-licenses-template`** (5, migrations 0026–0028
-  provisional): admin badges ×3 (`badge` + `user_badge`,
-  `gitea/models/user/badge.go`), `repoGetLicenses` (`repo_license` table
-  populated at push, `gitea/models/repo/license.go:46-52`), `generateRepo`
-  (`repositories.is_template` column + the landed fork/copy pass).
-- **`wave-api-git-hooks`** (4, RUNTIME-ONLY): upstream reads server-side hook
-  FILES from the repo git dir (`gitea/routers/api/v1/repo/hook.go`) — no fs on
-  Workers; a degenerate static-samples list (+ R2-persisted edits, table-free)
-  restores UI parity.
-- **`wave-api-feeds`** (3, migration 0029 provisional): `action` table
-  (`gitea/models/activities/action.go`); insert hooks ride the landed
-  `repo-events.ts`/`issue-events.ts` emitters; the heatmap deviation
-  (routes/user-read-t2.ts header) is the precedent for honest divergence.
-  Heaviest semantics per op in the TABLE-DEPENDENT set — SPEC advised.
-
-### Not batched — FEATURE-ABSENT (64 ops)
-
-- **Actions runtime, 54 ops** (repo 33, org 7, user 7, admin 7): runners,
-  runs, jobs, artifacts, tasks, workflow dispatch/enable, registration tokens —
-  `gitea/models/actions/`, `gitea/services/actions/`. A full SPEC is a
-  precondition; the KV subset (secrets/variables) is Batch 3 and deliberately
-  does not depend on it.
+- **Actions runtime, 54 ops** (repository 33, organization 7, user 7, admin 7):
+  runners, runs, jobs, artifacts, tasks, workflow dispatch/enable,
+  registration tokens — upstream `gitea/models/actions/` (`runner.go`,
+  `run.go`, `run_job.go`, `run_attempt.go`, `artifact.go`,
+  `runner_token.go`, …) + `gitea/services/actions/`. **No CI-runtime table
+  exists in our schema** (grep of `apps/worker/src/db/schema.ts` for
+  `action_run`/`action_runner`/`action_artifact`/`action_task`/runner-token
+  tables: zero hits — the only `action` table there is the activity feed,
+  schema.ts:2530). A full SPEC is the precondition; note some list/read ops
+  (e.g. `ActionsListRepositoryWorkflows`) read `.gitea/workflows` from the git
+  tree upstream and could ride engine tree reads — still gate them on the same
+  SPEC so the family lands coherently.
 - **Package registry, 10 ops** (9 `/packages/*` + `GET /admin/packages`):
-  `gitea/models/packages/`, `gitea/modules/packages/` — storage-heavy
-  (R2 candidate store per AGENTS); needs its own SPEC before adoption.
+  upstream `gitea/models/packages/`, `gitea/modules/packages/` — storage-heavy
+  (R2 candidate store per AGENTS; evaluate in a SPEC before adopting). **No
+  package table exists** in our schema (only the `repositories.has_packages`
+  flag column).
 
+---
 
-### repository
+### repository — FEATURE-ABSENT (33)
 
-**IMPLEMENTABLE-NOW** (11)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `repoDeleteAvatar` | `DELETE /repos/{owner}/{repo}/avatar` | R2 avatar blob store keyed by owner/repo id — table-free (users.useCustomAvatar/avatar_email already landed, schema.ts:265-266); storage-service layer per AGENTS blob rule |
-| `repoDeleteWikiPage` | `DELETE /repos/{owner}/{repo}/wiki/page/{pageName}` | git-engine — wiki is a sibling git repo upstream (services/wiki/wiki.go), table-free; rides landed git-engine write ops |
-| `repoTrackedTimes` | `GET /repos/{owner}/{repo}/times` | rides LANDED tracked_times (schema.ts:1308) + issue_stopwatches (schema.ts:1335) — issue-level times/stopwatch ops already declared; these are the aggregate reads |
-| `userTrackedTimes` | `GET /repos/{owner}/{repo}/times/{user}` | rides LANDED tracked_times (schema.ts:1308) + issue_stopwatches (schema.ts:1335) — issue-level times/stopwatch ops already declared; these are the aggregate reads |
-| `repoGetWikiPage` | `GET /repos/{owner}/{repo}/wiki/page/{pageName}` | git-engine — wiki is a sibling git repo upstream (services/wiki/wiki.go), table-free; rides landed git-engine write ops |
-| `repoGetWikiPages` | `GET /repos/{owner}/{repo}/wiki/pages` | git-engine — wiki is a sibling git repo upstream (services/wiki/wiki.go), table-free; rides landed git-engine write ops |
-| `repoGetWikiPageRevisions` | `GET /repos/{owner}/{repo}/wiki/revisions/{pageName}` | git-engine — wiki is a sibling git repo upstream (services/wiki/wiki.go), table-free; rides landed git-engine write ops |
-| `repoEditWikiPage` | `PATCH /repos/{owner}/{repo}/wiki/page/{pageName}` | git-engine — wiki is a sibling git repo upstream (services/wiki/wiki.go), table-free; rides landed git-engine write ops |
-| `repoUpdateAvatar` | `POST /repos/{owner}/{repo}/avatar` | R2 avatar blob store keyed by owner/repo id — table-free (users.useCustomAvatar/avatar_email already landed, schema.ts:265-266); storage-service layer per AGENTS blob rule |
-| `repoMirrorSync` | `POST /repos/{owner}/{repo}/mirror-sync` | ALREADY IMPLEMENTED (routes/mirror.ts:282 app.post) — convert to zod-openapi declaration; rides landed mirror service + MIRROR_SYNC_QUEUE |
-| `repoCreateWikiPage` | `POST /repos/{owner}/{repo}/wiki/new` | git-engine — wiki is a sibling git repo upstream (services/wiki/wiki.go), table-free; rides landed git-engine write ops |
-
-**TABLE-DEPENDENT** (47)
+All actions-runtime. Missing store: the upstream actions tables named above —
+none exist in `apps/worker/src/db/schema.ts` (verified by grep).
 
 | Operation | `METHOD path` | Rides / missing / pointer |
 |---|---|---|
-| `deleteRepoSecret` | `DELETE /repos/{owner}/{repo}/actions/secrets/{secretname}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `deleteRepoVariable` | `DELETE /repos/{owner}/{repo}/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `repoDeleteKey` | `DELETE /repos/{owner}/{repo}/keys/{id}` | deploy_key table (upstream models/deploykey/deploykey.go:25-40: key_id→public_keys, repo_id, token_hash, mode) — rides LANDED public_keys (type=2 deploy, schema.ts:1652) |
-| `repoDeleteProject` | `DELETE /repos/{owner}/{repo}/projects/{id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoDeleteProjectColumn` | `DELETE /repos/{owner}/{repo}/projects/{id}/columns/{column_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoRemoveIssueFromProjectColumn` | `DELETE /repos/{owner}/{repo}/projects/{id}/columns/{column_id}/issues/{issue_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoDeleteProjectWorkflow` | `DELETE /repos/{owner}/{repo}/projects/{id}/workflows/{workflow_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoDeletePushMirror` | `DELETE /repos/{owner}/{repo}/push_mirrors/{name}` | push_mirror table (upstream models/repo/pushmirror.go) — CRUD + sync trigger rides landed mirror queue/consumer lane (SPEC-0009) |
-| `repoDeleteTagProtection` | `DELETE /repos/{owner}/{repo}/tag_protections/{id}` | protected_tags table (upstream models/git/protected_tag.go) — mirror of landed protected_branches service (services/branch-protection.ts) |
-| `repoListActionsSecrets` | `GET /repos/{owner}/{repo}/actions/secrets` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `getRepoVariablesList` | `GET /repos/{owner}/{repo}/actions/variables` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `getRepoVariable` | `GET /repos/{owner}/{repo}/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `repoListActivityFeeds` | `GET /repos/{owner}/{repo}/activities/feeds` | action table (upstream models/activities/action.go) — insert hooks ride landed repo-events.ts / issue-events.ts emitters; heatmap already ships the documented deviation precedent |
-| `repoListKeys` | `GET /repos/{owner}/{repo}/keys` | deploy_key table (upstream models/deploykey/deploykey.go:25-40: key_id→public_keys, repo_id, token_hash, mode) — rides LANDED public_keys (type=2 deploy, schema.ts:1652) |
-| `repoGetKey` | `GET /repos/{owner}/{repo}/keys/{id}` | deploy_key table (upstream models/deploykey/deploykey.go:25-40: key_id→public_keys, repo_id, token_hash, mode) — rides LANDED public_keys (type=2 deploy, schema.ts:1652) |
-| `repoGetLicenses` | `GET /repos/{owner}/{repo}/licenses` | repo_license table populated at push (upstream models/repo/license.go:46-52 UpdateRepoLicenses) — detection rides landed engine tree reads |
-| `repoListProjects` | `GET /repos/{owner}/{repo}/projects` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoGetProject` | `GET /repos/{owner}/{repo}/projects/{id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoListProjectColumns` | `GET /repos/{owner}/{repo}/projects/{id}/columns` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoGetProjectColumn` | `GET /repos/{owner}/{repo}/projects/{id}/columns/{column_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoListProjectColumnIssues` | `GET /repos/{owner}/{repo}/projects/{id}/columns/{column_id}/issues` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoListProjectWorkflows` | `GET /repos/{owner}/{repo}/projects/{id}/workflows` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoGetProjectWorkflow` | `GET /repos/{owner}/{repo}/projects/{id}/workflows/{workflow_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoListPushMirrors` | `GET /repos/{owner}/{repo}/push_mirrors` | push_mirror table (upstream models/repo/pushmirror.go) — CRUD + sync trigger rides landed mirror queue/consumer lane (SPEC-0009) |
-| `repoGetPushMirrorByRemoteName` | `GET /repos/{owner}/{repo}/push_mirrors/{name}` | push_mirror table (upstream models/repo/pushmirror.go) — CRUD + sync trigger rides landed mirror queue/consumer lane (SPEC-0009) |
-| `repoListTagProtection` | `GET /repos/{owner}/{repo}/tag_protections` | protected_tags table (upstream models/git/protected_tag.go) — mirror of landed protected_branches service (services/branch-protection.ts) |
-| `repoGetTagProtection` | `GET /repos/{owner}/{repo}/tag_protections/{id}` | protected_tags table (upstream models/git/protected_tag.go) — mirror of landed protected_branches service (services/branch-protection.ts) |
-| `repoEditProject` | `PATCH /repos/{owner}/{repo}/projects/{id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoEditProjectColumn` | `PATCH /repos/{owner}/{repo}/projects/{id}/columns/{column_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoEditProjectWorkflow` | `PATCH /repos/{owner}/{repo}/projects/{id}/workflows/{workflow_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoEditTagProtection` | `PATCH /repos/{owner}/{repo}/tag_protections/{id}` | protected_tags table (upstream models/git/protected_tag.go) — mirror of landed protected_branches service (services/branch-protection.ts) |
-| `createRepoVariable` | `POST /repos/{owner}/{repo}/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `repoCreateKey` | `POST /repos/{owner}/{repo}/keys` | deploy_key table (upstream models/deploykey/deploykey.go:25-40: key_id→public_keys, repo_id, token_hash, mode) — rides LANDED public_keys (type=2 deploy, schema.ts:1652) |
-| `repoCreateDeployToken` | `POST /repos/{owner}/{repo}/keys/tokens` | deploy_key table (upstream models/deploykey/deploykey.go:25-40: key_id→public_keys, repo_id, token_hash, mode) — rides LANDED public_keys (type=2 deploy, schema.ts:1652) |
-| `repoCreateProject` | `POST /repos/{owner}/{repo}/projects` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoCreateProjectColumn` | `POST /repos/{owner}/{repo}/projects/{id}/columns` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoSetDefaultProjectColumn` | `POST /repos/{owner}/{repo}/projects/{id}/columns/{column_id}/default` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoAddIssueToProjectColumn` | `POST /repos/{owner}/{repo}/projects/{id}/columns/{column_id}/issues/{issue_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoMoveProjectColumns` | `POST /repos/{owner}/{repo}/projects/{id}/columns/move` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoMoveProjectIssue` | `POST /repos/{owner}/{repo}/projects/{id}/issues/{issue_id}/move` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoCreateProjectWorkflow` | `POST /repos/{owner}/{repo}/projects/{id}/workflows` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `repoAddPushMirror` | `POST /repos/{owner}/{repo}/push_mirrors` | push_mirror table (upstream models/repo/pushmirror.go) — CRUD + sync trigger rides landed mirror queue/consumer lane (SPEC-0009) |
-| `repoPushMirrorSync` | `POST /repos/{owner}/{repo}/push_mirrors-sync` | push_mirror table (upstream models/repo/pushmirror.go) — CRUD + sync trigger rides landed mirror queue/consumer lane (SPEC-0009) |
-| `repoCreateTagProtection` | `POST /repos/{owner}/{repo}/tag_protections` | protected_tags table (upstream models/git/protected_tag.go) — mirror of landed protected_branches service (services/branch-protection.ts) |
-| `generateRepo` | `POST /repos/{template_owner}/{template_repo}/generate` | repositories.is_template column (upstream repository.template) — generation itself rides landed fork/copy engine pass (src/repos/fork-task.ts) |
-| `updateRepoSecret` | `PUT /repos/{owner}/{repo}/actions/secrets/{secretname}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `updateRepoVariable` | `PUT /repos/{owner}/{repo}/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
+| `deleteArtifact` | `DELETE /repos/{owner}/{repo}/actions/artifacts/{artifact_id}` | actions runtime — absent upstream models/actions/ tables (action_run/action_run_job/action_artifact/…; verified absent in schema.ts) + gitea/services/actions/; SPEC first |
+| `deleteRepoRunner` | `DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}` | actions runtime — same absent store (gitea/models/actions/runner.go) |
+| `deleteActionRun` | `DELETE /repos/{owner}/{repo}/actions/runs/{run}` | actions runtime — same absent store (gitea/models/actions/run.go) |
+| `getArtifacts` | `GET /repos/{owner}/{repo}/actions/artifacts` | actions runtime — same absent store (artifact.go) |
+| `getArtifact` | `GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}` | actions runtime — same absent store (artifact.go) |
+| `downloadArtifact` | `GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip` | actions runtime — same absent store; artifact blobs are R2 territory per the storage-service boundary |
+| `listWorkflowJobs` | `GET /repos/{owner}/{repo}/actions/jobs` | actions runtime — same absent store (run_job.go) |
+| `getWorkflowJob` | `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` | actions runtime — same absent store (run_job.go) |
+| `downloadActionsRunJobLogs` | `GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs` | actions runtime — same absent store; logs land in R2 when specced |
+| `getRepoRunners` | `GET /repos/{owner}/{repo}/actions/runners` | actions runtime — same absent store (runner.go) |
+| `getRepoRunner` | `GET /repos/{owner}/{repo}/actions/runners/{runner_id}` | actions runtime — same absent store (runner.go) |
+| `getWorkflowRuns` | `GET /repos/{owner}/{repo}/actions/runs` | actions runtime — same absent store (run.go) |
+| `GetWorkflowRun` | `GET /repos/{owner}/{repo}/actions/runs/{run}` | actions runtime — same absent store (run.go) |
+| `getArtifactsOfRun` | `GET /repos/{owner}/{repo}/actions/runs/{run}/artifacts` | actions runtime — same absent store |
+| `getWorkflowRunAttempt` | `GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}` | actions runtime — same absent store (run_attempt.go) |
+| `listWorkflowRunAttemptJobs` | `GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}/jobs` | actions runtime — same absent store (run_attempt.go) |
+| `listWorkflowRunJobs` | `GET /repos/{owner}/{repo}/actions/runs/{run}/jobs` | actions runtime — same absent store (run_job.go) |
+| `getWorkflowRunLogs` | `GET /repos/{owner}/{repo}/actions/runs/{run}/logs` | actions runtime — same absent store |
+| `ListActionTasks` | `GET /repos/{owner}/{repo}/actions/tasks` | actions runtime — same absent store |
+| `ActionsListRepositoryWorkflows` | `GET /repos/{owner}/{repo}/actions/workflows` | actions runtime — reads .gitea/workflows from the git tree upstream; could ride engine tree reads, gated on the same SPEC |
+| `ActionsGetWorkflow` | `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}` | actions runtime — same family gate |
+| `ActionsListWorkflowRuns` | `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs` | actions runtime — same absent store |
+| `updateRepoRunner` | `PATCH /repos/{owner}/{repo}/actions/runners/{runner_id}` | actions runtime — same absent store (runner.go) |
+| `repoCreateRunnerRegistrationToken` | `POST /repos/{owner}/{repo}/actions/runners/registration-token` | actions runner tokens (gitea/models/actions/runner_token.go — absent) |
+| `approveWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/approve` | actions runtime (gitea/services/actions/approve.go — absent store) |
+| `cancelWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/cancel` | actions runtime — same absent store |
+| `forceCancelWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/force-cancel` | actions runtime — same absent store |
+| `rerunWorkflowJob` | `POST /repos/{owner}/{repo}/actions/runs/{run}/jobs/{job_id}/rerun` | actions runtime — same absent store |
+| `rerunWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/rerun` | actions runtime — same absent store |
+| `rerunFailedWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/rerun-failed-jobs` | actions runtime — same absent store |
+| `ActionsDispatchWorkflow` | `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches` | actions runtime — dispatch creates runs in the absent store |
+| `ActionsDisableWorkflow` | `PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/disable` | actions runtime — same family gate |
+| `ActionsEnableWorkflow` | `PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable` | actions runtime — same family gate |
 
-**RUNTIME-ONLY** (6)
+### organization — FEATURE-ABSENT (7)
+
+All actions-runtime, same absent store.
 
 | Operation | `METHOD path` | Rides / missing / pointer |
 |---|---|---|
-| `repoDeleteGitHook` | `DELETE /repos/{owner}/{repo}/hooks/git/{id}` | degenerate: upstream reads server-side hook FILES from the repo git dir (routers/api/v1/repo/hook.go) — no fs on Workers; static default-hook samples possible |
-| `repoListGitHooks` | `GET /repos/{owner}/{repo}/hooks/git` | degenerate: upstream reads server-side hook FILES from the repo git dir (routers/api/v1/repo/hook.go) — no fs on Workers; static default-hook samples possible |
-| `repoGetGitHook` | `GET /repos/{owner}/{repo}/hooks/git/{id}` | degenerate: upstream reads server-side hook FILES from the repo git dir (routers/api/v1/repo/hook.go) — no fs on Workers; static default-hook samples possible |
-| `repoSigningKey` | `GET /repos/{owner}/{repo}/signing-key.gpg` | degenerate 404 no-signing-key (routers/api/v1/misc/signing.go:14-24), same class as the landed global pair; needs a RUNTIME_ONLY_RESPONSES-style exception entry |
-| `repoSigningKeySSH` | `GET /repos/{owner}/{repo}/signing-key.pub` | degenerate 404 no-signing-key (routers/api/v1/misc/signing.go:14-24), same class as the landed global pair; needs a RUNTIME_ONLY_RESPONSES-style exception entry |
-| `repoEditGitHook` | `PATCH /repos/{owner}/{repo}/hooks/git/{id}` | degenerate: upstream reads server-side hook FILES from the repo git dir (routers/api/v1/repo/hook.go) — no fs on Workers; static default-hook samples possible |
+| `deleteOrgRunner` | `DELETE /orgs/{org}/actions/runners/{runner_id}` | actions runtime — absent gitea/models/actions/ runner store (verified absent in schema.ts) |
+| `getOrgWorkflowJobs` | `GET /orgs/{org}/actions/jobs` | actions runtime — same absent store |
+| `getOrgRunners` | `GET /orgs/{org}/actions/runners` | actions runtime — same absent store |
+| `getOrgRunner` | `GET /orgs/{org}/actions/runners/{runner_id}` | actions runtime — same absent store |
+| `getOrgWorkflowRuns` | `GET /orgs/{org}/actions/runs` | actions runtime — same absent store |
+| `updateOrgRunner` | `PATCH /orgs/{org}/actions/runners/{runner_id}` | actions runtime — same absent store |
+| `orgCreateRunnerRegistrationToken` | `POST /orgs/{org}/actions/runners/registration-token` | actions runner tokens (gitea/models/actions/runner_token.go — absent) |
 
-**FEATURE-ABSENT** (33)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deleteArtifact` | `DELETE /repos/{owner}/{repo}/actions/artifacts/{artifact_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `deleteRepoRunner` | `DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `deleteActionRun` | `DELETE /repos/{owner}/{repo}/actions/runs/{run}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getArtifacts` | `GET /repos/{owner}/{repo}/actions/artifacts` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getArtifact` | `GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `downloadArtifact` | `GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `listWorkflowJobs` | `GET /repos/{owner}/{repo}/actions/jobs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getWorkflowJob` | `GET /repos/{owner}/{repo}/actions/jobs/{job_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `downloadActionsRunJobLogs` | `GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getRepoRunners` | `GET /repos/{owner}/{repo}/actions/runners` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getRepoRunner` | `GET /repos/{owner}/{repo}/actions/runners/{runner_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getWorkflowRuns` | `GET /repos/{owner}/{repo}/actions/runs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `GetWorkflowRun` | `GET /repos/{owner}/{repo}/actions/runs/{run}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getArtifactsOfRun` | `GET /repos/{owner}/{repo}/actions/runs/{run}/artifacts` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getWorkflowRunAttempt` | `GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `listWorkflowRunAttemptJobs` | `GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}/jobs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `listWorkflowRunJobs` | `GET /repos/{owner}/{repo}/actions/runs/{run}/jobs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getWorkflowRunLogs` | `GET /repos/{owner}/{repo}/actions/runs/{run}/logs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `ListActionTasks` | `GET /repos/{owner}/{repo}/actions/tasks` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `ActionsListRepositoryWorkflows` | `GET /repos/{owner}/{repo}/actions/workflows` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `ActionsGetWorkflow` | `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `ActionsListWorkflowRuns` | `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `updateRepoRunner` | `PATCH /repos/{owner}/{repo}/actions/runners/{runner_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `repoCreateRunnerRegistrationToken` | `POST /repos/{owner}/{repo}/actions/runners/registration-token` | actions runner tokens (upstream models/actions/runner_token.go) |
-| `approveWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/approve` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `cancelWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/cancel` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `forceCancelWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/force-cancel` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `rerunWorkflowJob` | `POST /repos/{owner}/{repo}/actions/runs/{run}/jobs/{job_id}/rerun` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `rerunWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/rerun` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `rerunFailedWorkflowRun` | `POST /repos/{owner}/{repo}/actions/runs/{run}/rerun-failed-jobs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `ActionsDispatchWorkflow` | `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `ActionsDisableWorkflow` | `PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/disable` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `ActionsEnableWorkflow` | `PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-
-
-### organization
-
-**IMPLEMENTABLE-NOW** (9)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `orgDeleteAvatar` | `DELETE /orgs/{org}/avatar` | R2 avatar blob store keyed by owner/repo id — table-free (users.useCustomAvatar/avatar_email already landed, schema.ts:265-266); storage-service layer per AGENTS blob rule |
-| `orgDeleteHook` | `DELETE /orgs/{org}/hooks/{id}` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-| `orgDeleteRepos` | `DELETE /orgs/{org}/repos` | rides LANDED repositories + purge machinery (src/repos/purge.ts) — org-owner gate, loop deleteOrgRepo |
-| `orgListHooks` | `GET /orgs/{org}/hooks` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-| `orgGetHook` | `GET /orgs/{org}/hooks/{id}` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-| `orgEditHook` | `PATCH /orgs/{org}/hooks/{id}` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-| `createOrgRepoDeprecated` | `POST /org/{org}/repos` | deprecated alias of the DECLARED POST /orgs/{org}/repos (routes/org-repos.ts) — same handler, alternate path constant |
-| `orgUpdateAvatar` | `POST /orgs/{org}/avatar` | R2 avatar blob store keyed by owner/repo id — table-free (users.useCustomAvatar/avatar_email already landed, schema.ts:265-266); storage-service layer per AGENTS blob rule |
-| `orgCreateHook` | `POST /orgs/{org}/hooks` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-
-**TABLE-DEPENDENT** (34)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deleteOrgSecret` | `DELETE /orgs/{org}/actions/secrets/{secretname}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `deleteOrgVariable` | `DELETE /orgs/{org}/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `organizationUnblockUser` | `DELETE /orgs/{org}/blocks/{username}` | blocking table (upstream models/user/block.go:24-31 Blocking: blocker_id+blockee_id UNIQUE) — one migration covers user+org scopes; rides landed users/orgs |
-| `orgDeleteProject` | `DELETE /orgs/{org}/projects/{id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgDeleteProjectColumn` | `DELETE /orgs/{org}/projects/{id}/columns/{column_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgRemoveIssueFromProjectColumn` | `DELETE /orgs/{org}/projects/{id}/columns/{column_id}/issues/{issue_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgDeleteProjectWorkflow` | `DELETE /orgs/{org}/projects/{id}/workflows/{workflow_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgListActionsSecrets` | `GET /orgs/{org}/actions/secrets` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `getOrgVariablesList` | `GET /orgs/{org}/actions/variables` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `getOrgVariable` | `GET /orgs/{org}/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `orgListActivityFeeds` | `GET /orgs/{org}/activities/feeds` | action table (upstream models/activities/action.go) — insert hooks ride landed repo-events.ts / issue-events.ts emitters; heatmap already ships the documented deviation precedent |
-| `organizationListBlocks` | `GET /orgs/{org}/blocks` | blocking table (upstream models/user/block.go:24-31 Blocking: blocker_id+blockee_id UNIQUE) — one migration covers user+org scopes; rides landed users/orgs |
-| `organizationCheckUserBlock` | `GET /orgs/{org}/blocks/{username}` | blocking table (upstream models/user/block.go:24-31 Blocking: blocker_id+blockee_id UNIQUE) — one migration covers user+org scopes; rides landed users/orgs |
-| `orgListProjects` | `GET /orgs/{org}/projects` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgGetProject` | `GET /orgs/{org}/projects/{id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgListProjectColumns` | `GET /orgs/{org}/projects/{id}/columns` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgGetProjectColumn` | `GET /orgs/{org}/projects/{id}/columns/{column_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgListProjectColumnIssues` | `GET /orgs/{org}/projects/{id}/columns/{column_id}/issues` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgListProjectWorkflows` | `GET /orgs/{org}/projects/{id}/workflows` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgGetProjectWorkflow` | `GET /orgs/{org}/projects/{id}/workflows/{workflow_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgEditProject` | `PATCH /orgs/{org}/projects/{id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgEditProjectColumn` | `PATCH /orgs/{org}/projects/{id}/columns/{column_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgEditProjectWorkflow` | `PATCH /orgs/{org}/projects/{id}/workflows/{workflow_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `createOrgVariable` | `POST /orgs/{org}/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `orgCreateProject` | `POST /orgs/{org}/projects` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgCreateProjectColumn` | `POST /orgs/{org}/projects/{id}/columns` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgSetDefaultProjectColumn` | `POST /orgs/{org}/projects/{id}/columns/{column_id}/default` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgAddIssueToProjectColumn` | `POST /orgs/{org}/projects/{id}/columns/{column_id}/issues/{issue_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgMoveProjectColumns` | `POST /orgs/{org}/projects/{id}/columns/move` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgMoveProjectIssue` | `POST /orgs/{org}/projects/{id}/issues/{issue_id}/move` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `orgCreateProjectWorkflow` | `POST /orgs/{org}/projects/{id}/workflows` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `updateOrgSecret` | `PUT /orgs/{org}/actions/secrets/{secretname}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `updateOrgVariable` | `PUT /orgs/{org}/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `organizationBlockUser` | `PUT /orgs/{org}/blocks/{username}` | blocking table (upstream models/user/block.go:24-31 Blocking: blocker_id+blockee_id UNIQUE) — one migration covers user+org scopes; rides landed users/orgs |
-
-**FEATURE-ABSENT** (7)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deleteOrgRunner` | `DELETE /orgs/{org}/actions/runners/{runner_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getOrgWorkflowJobs` | `GET /orgs/{org}/actions/jobs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getOrgRunners` | `GET /orgs/{org}/actions/runners` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getOrgRunner` | `GET /orgs/{org}/actions/runners/{runner_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getOrgWorkflowRuns` | `GET /orgs/{org}/actions/runs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `updateOrgRunner` | `PATCH /orgs/{org}/actions/runners/{runner_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `orgCreateRunnerRegistrationToken` | `POST /orgs/{org}/actions/runners/registration-token` | actions runner tokens (upstream models/actions/runner_token.go) |
-
+(The org-projects 21 are **in-flight**, not here — see the In-flight section.)
 
 ### user
 
-**IMPLEMENTABLE-NOW** (13)
+**IMPLEMENTABLE-NOW** (22) — the stage-3 batch above, itemized. Rides the
+landed projects store (migration 0024) + `ProjectScope` kind `"individual"`;
+template: `routes/projects-repo.ts` (landed) / `routes/projects-org.ts`
+(in-flight).
 
 | Operation | `METHOD path` | Rides / missing / pointer |
 |---|---|---|
-| `userDeleteAvatar` | `DELETE /user/avatar` | R2 avatar blob store keyed by owner/repo id — table-free (users.useCustomAvatar/avatar_email already landed, schema.ts:265-266); storage-service layer per AGENTS blob rule |
-| `userDeleteHook` | `DELETE /user/hooks/{id}` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-| `userDeleteAccessToken` | `DELETE /users/{username}/tokens/{token}` | rides LANDED personal_access_tokens (schema.ts:294); upstream reqSelfOrAdmin + reqBasicOrRevProxyAuth (routers/api/v1/api.go:1067-1072) |
-| `userListHooks` | `GET /user/hooks` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-| `userGetHook` | `GET /user/hooks/{id}` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-| `userGetStopWatches` | `GET /user/stopwatches` | rides LANDED tracked_times (schema.ts:1308) + issue_stopwatches (schema.ts:1335) — issue-level times/stopwatch ops already declared; these are the aggregate reads |
-| `userCurrentTrackedTimes` | `GET /user/times` | rides LANDED tracked_times (schema.ts:1308) + issue_stopwatches (schema.ts:1335) — issue-level times/stopwatch ops already declared; these are the aggregate reads |
-| `userGetTokens` | `GET /users/{username}/tokens` | rides LANDED personal_access_tokens (schema.ts:294); upstream reqSelfOrAdmin + reqBasicOrRevProxyAuth (routers/api/v1/api.go:1067-1072) |
-| `userEditHook` | `PATCH /user/hooks/{id}` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-| `userUpdateAvatar` | `POST /user/avatar` | R2 avatar blob store keyed by owner/repo id — table-free (users.useCustomAvatar/avatar_email already landed, schema.ts:265-266); storage-service layer per AGENTS blob rule |
-| `userVerifyGPGKey` | `POST /user/gpg_key_verify` | rides LANDED gpg_keys (schema.ts:1698) + the ported VerificationToken formula (routes/misc-t3.ts) — needs OpenPGP signature verification (table-free, crypto-heavy) |
-| `userCreateHook` | `POST /user/hooks` | webhooks table ownerId scope (landed, schema.ts:695) — same shape as declared repo hooks (routes/hooks.ts); delivery rides webhook_deliveries |
-| `userCreateToken` | `POST /users/{username}/tokens` | rides LANDED personal_access_tokens (schema.ts:294); upstream reqSelfOrAdmin + reqBasicOrRevProxyAuth (routers/api/v1/api.go:1067-1072) |
+| `userCurrentDeleteProject` | `DELETE /user/projects/{id}` | LANDED projects store (schema.ts:2162, migration 0024) + services/projects.ts ProjectScope kind "individual" — mirror routes/projects-repo.ts (landed) and in-flight projects-org.ts |
+| `userCurrentDeleteProjectColumn` | `DELETE /user/projects/{id}/columns/{column_id}` | same landed store (project_columns schema.ts:2213) — stage-3 batch |
+| `userCurrentRemoveIssueFromProjectColumn` | `DELETE /user/projects/{id}/columns/{column_id}/issues/{issue_id}` | same landed store (project_issues schema.ts:2254), issue moves ride landed issues — stage-3 batch |
+| `userCurrentDeleteProjectWorkflow` | `DELETE /user/projects/{id}/workflows/{workflow_id}` | same landed store (project_workflows schema.ts:2286) — stage-3 batch |
+| `userCurrentListProjects` | `GET /user/projects` | same landed store — stage-3 batch |
+| `userCurrentGetProject` | `GET /user/projects/{id}` | same landed store — stage-3 batch |
+| `userCurrentListProjectColumns` | `GET /user/projects/{id}/columns` | same landed store — stage-3 batch |
+| `userCurrentGetProjectColumn` | `GET /user/projects/{id}/columns/{column_id}` | same landed store — stage-3 batch |
+| `userCurrentListProjectColumnIssues` | `GET /user/projects/{id}/columns/{column_id}/issues` | same landed store — stage-3 batch |
+| `userCurrentListProjectWorkflows` | `GET /user/projects/{id}/workflows` | same landed store — stage-3 batch |
+| `userCurrentGetProjectWorkflow` | `GET /user/projects/{id}/workflows/{workflow_id}` | same landed store — stage-3 batch |
+| `userListProjects` | `GET /users/{username}/projects` | the user scope's extra op — visible listing on the /users/{username} group, same landed store + profile-visibility gates — stage-3 batch |
+| `userCurrentEditProject` | `PATCH /user/projects/{id}` | same landed store — stage-3 batch |
+| `userCurrentEditProjectColumn` | `PATCH /user/projects/{id}/columns/{column_id}` | same landed store — stage-3 batch |
+| `userCurrentEditProjectWorkflow` | `PATCH /user/projects/{id}/workflows/{workflow_id}` | same landed store — stage-3 batch |
+| `userCurrentCreateProject` | `POST /user/projects` | same landed store — stage-3 batch |
+| `userCurrentCreateProjectColumn` | `POST /user/projects/{id}/columns` | same landed store — stage-3 batch |
+| `userCurrentMoveProjectColumns` | `POST /user/projects/{id}/columns/move` | same landed store — stage-3 batch |
+| `userCurrentSetDefaultProjectColumn` | `POST /user/projects/{id}/columns/{column_id}/default` | same landed store — stage-3 batch |
+| `userCurrentAddIssueToProjectColumn` | `POST /user/projects/{id}/columns/{column_id}/issues/{issue_id}` | same landed store — stage-3 batch |
+| `userCurrentMoveProjectIssue` | `POST /user/projects/{id}/issues/{issue_id}/move` | same landed store — stage-3 batch |
+| `userCurrentCreateProjectWorkflow` | `POST /user/projects/{id}/workflows` | same landed store — stage-3 batch |
 
-**TABLE-DEPENDENT** (39)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deleteUserSecret` | `DELETE /user/actions/secrets/{secretname}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `deleteUserVariable` | `DELETE /user/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `userDeleteOAuth2Application` | `DELETE /user/applications/oauth2/{id}` | oauth2_application table (upstream models/auth/oauth2.go) — CRUD only; full OAuth2 authorize flow is a separate feature (web UI, not /api/v1) |
-| `userUnblockUser` | `DELETE /user/blocks/{username}` | blocking table (upstream models/user/block.go:24-31 Blocking: blocker_id+blockee_id UNIQUE) — one migration covers user+org scopes; rides landed users/orgs |
-| `userCurrentDeleteProject` | `DELETE /user/projects/{id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentDeleteProjectColumn` | `DELETE /user/projects/{id}/columns/{column_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentRemoveIssueFromProjectColumn` | `DELETE /user/projects/{id}/columns/{column_id}/issues/{issue_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentDeleteProjectWorkflow` | `DELETE /user/projects/{id}/workflows/{workflow_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `getUserVariablesList` | `GET /user/actions/variables` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `getUserVariable` | `GET /user/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `userGetOauth2Application` | `GET /user/applications/oauth2` | oauth2_application table (upstream models/auth/oauth2.go) — CRUD only; full OAuth2 authorize flow is a separate feature (web UI, not /api/v1) |
-| `userGetOAuth2Application` | `GET /user/applications/oauth2/{id}` | oauth2_application table (upstream models/auth/oauth2.go) — CRUD only; full OAuth2 authorize flow is a separate feature (web UI, not /api/v1) |
-| `userListBlocks` | `GET /user/blocks` | blocking table (upstream models/user/block.go:24-31 Blocking: blocker_id+blockee_id UNIQUE) — one migration covers user+org scopes; rides landed users/orgs |
-| `userCheckUserBlock` | `GET /user/blocks/{username}` | blocking table (upstream models/user/block.go:24-31 Blocking: blocker_id+blockee_id UNIQUE) — one migration covers user+org scopes; rides landed users/orgs |
-| `userCurrentListProjects` | `GET /user/projects` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentGetProject` | `GET /user/projects/{id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentListProjectColumns` | `GET /user/projects/{id}/columns` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentGetProjectColumn` | `GET /user/projects/{id}/columns/{column_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentListProjectColumnIssues` | `GET /user/projects/{id}/columns/{column_id}/issues` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentListProjectWorkflows` | `GET /user/projects/{id}/workflows` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentGetProjectWorkflow` | `GET /user/projects/{id}/workflows/{workflow_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userListActivityFeeds` | `GET /users/{username}/activities/feeds` | action table (upstream models/activities/action.go) — insert hooks ride landed repo-events.ts / issue-events.ts emitters; heatmap already ships the documented deviation precedent |
-| `userListProjects` | `GET /users/{username}/projects` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userUpdateOAuth2Application` | `PATCH /user/applications/oauth2/{id}` | oauth2_application table (upstream models/auth/oauth2.go) — CRUD only; full OAuth2 authorize flow is a separate feature (web UI, not /api/v1) |
-| `userCurrentEditProject` | `PATCH /user/projects/{id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentEditProjectColumn` | `PATCH /user/projects/{id}/columns/{column_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentEditProjectWorkflow` | `PATCH /user/projects/{id}/workflows/{workflow_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `createUserVariable` | `POST /user/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `userCreateOAuth2Application` | `POST /user/applications/oauth2` | oauth2_application table (upstream models/auth/oauth2.go) — CRUD only; full OAuth2 authorize flow is a separate feature (web UI, not /api/v1) |
-| `userCurrentCreateProject` | `POST /user/projects` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentCreateProjectColumn` | `POST /user/projects/{id}/columns` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentSetDefaultProjectColumn` | `POST /user/projects/{id}/columns/{column_id}/default` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentAddIssueToProjectColumn` | `POST /user/projects/{id}/columns/{column_id}/issues/{issue_id}` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentMoveProjectColumns` | `POST /user/projects/{id}/columns/move` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentMoveProjectIssue` | `POST /user/projects/{id}/issues/{issue_id}/move` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `userCurrentCreateProjectWorkflow` | `POST /user/projects/{id}/workflows` | project + project_board + project_issue tables (upstream models/project/project.go, column.go, issue.go) — ONE shared migration covers user/org/repo scopes; rides landed issues for column-issue moves |
-| `updateUserSecret` | `PUT /user/actions/secrets/{secretname}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `updateUserVariable` | `PUT /user/actions/variables/{variablename}` | secret + action_variable KV tables (upstream models/secret/secret.go, models/actions/variable.go) — CRUD only, no runner needed; rides landed owner/repo visibility gates |
-| `userBlockUser` | `PUT /user/blocks/{username}` | blocking table (upstream models/user/block.go:24-31 Blocking: blocker_id+blockee_id UNIQUE) — one migration covers user+org scopes; rides landed users/orgs |
-
-**FEATURE-ABSENT** (7)
+**FEATURE-ABSENT** (7) — actions-runtime, same absent store.
 
 | Operation | `METHOD path` | Rides / missing / pointer |
 |---|---|---|
-| `deleteUserRunner` | `DELETE /user/actions/runners/{runner_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getUserWorkflowJobs` | `GET /user/actions/jobs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getUserRunners` | `GET /user/actions/runners` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getUserRunner` | `GET /user/actions/runners/{runner_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `getUserWorkflowRuns` | `GET /user/actions/runs` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `updateUserRunner` | `PATCH /user/actions/runners/{runner_id}` | actions runtime (upstream models/actions/ — runner/run/job/artifact/task tables + services/actions) |
-| `userCreateRunnerRegistrationToken` | `POST /user/actions/runners/registration-token` | actions runner tokens (upstream models/actions/runner_token.go) |
+| `deleteUserRunner` | `DELETE /user/actions/runners/{runner_id}` | actions runtime — absent gitea/models/actions/ runner store (verified absent in schema.ts) |
+| `getUserWorkflowJobs` | `GET /user/actions/jobs` | actions runtime — same absent store |
+| `getUserRunners` | `GET /user/actions/runners` | actions runtime — same absent store |
+| `getUserRunner` | `GET /user/actions/runners/{runner_id}` | actions runtime — same absent store |
+| `getUserWorkflowRuns` | `GET /user/actions/runs` | actions runtime — same absent store |
+| `updateUserRunner` | `PATCH /user/actions/runners/{runner_id}` | actions runtime — same absent store |
+| `userCreateRunnerRegistrationToken` | `POST /user/actions/runners/registration-token` | actions runner tokens (gitea/models/actions/runner_token.go — absent) |
 
-
-### admin
-
-**IMPLEMENTABLE-NOW** (5)
+### admin — FEATURE-ABSENT (8)
 
 | Operation | `METHOD path` | Rides / missing / pointer |
 |---|---|---|
-| `adminDeleteHook` | `DELETE /admin/hooks/{id}` | webhooks table isSystemWebhook=true + ownerId=0 (landed, schema.ts:695); delivery rides webhook_deliveries |
-| `adminListHooks` | `GET /admin/hooks` | webhooks table isSystemWebhook=true + ownerId=0 (landed, schema.ts:695); delivery rides webhook_deliveries |
-| `adminGetHook` | `GET /admin/hooks/{id}` | webhooks table isSystemWebhook=true + ownerId=0 (landed, schema.ts:695); delivery rides webhook_deliveries |
-| `adminEditHook` | `PATCH /admin/hooks/{id}` | webhooks table isSystemWebhook=true + ownerId=0 (landed, schema.ts:695); delivery rides webhook_deliveries |
-| `adminCreateHook` | `POST /admin/hooks` | webhooks table isSystemWebhook=true + ownerId=0 (landed, schema.ts:695); delivery rides webhook_deliveries |
+| `deleteAdminRunner` | `DELETE /admin/actions/runners/{runner_id}` | actions runtime — absent gitea/models/actions/ runner store (verified absent in schema.ts) |
+| `listAdminWorkflowJobs` | `GET /admin/actions/jobs` | actions runtime — same absent store |
+| `getAdminRunners` | `GET /admin/actions/runners` | actions runtime — same absent store |
+| `getAdminRunner` | `GET /admin/actions/runners/{runner_id}` | actions runtime — same absent store |
+| `listAdminWorkflowRuns` | `GET /admin/actions/runs` | actions runtime — same absent store |
+| `adminListPackages` | `GET /admin/packages` | package registry (upstream gitea/models/packages/, gitea/modules/packages/) — no package table in schema.ts (only repositories.has_packages); needs SPEC before adoption (R2 candidate store) |
+| `updateAdminRunner` | `PATCH /admin/actions/runners/{runner_id}` | actions runtime — same absent store |
+| `adminCreateRunnerRegistrationToken` | `POST /admin/actions/runners/registration-token` | actions runtime — same absent store |
 
-**TABLE-DEPENDENT** (3)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `adminDeleteUserBadges` | `DELETE /admin/users/{username}/badges` | badge + user_badge tables (upstream models/user/badge.go); rides landed users |
-| `adminListUserBadges` | `GET /admin/users/{username}/badges` | badge + user_badge tables (upstream models/user/badge.go); rides landed users |
-| `adminAddUserBadges` | `POST /admin/users/{username}/badges` | badge + user_badge tables (upstream models/user/badge.go); rides landed users |
-
-**RUNTIME-ONLY** (5)
+### package — FEATURE-ABSENT (9)
 
 | Operation | `METHOD path` | Rides / missing / pointer |
 |---|---|---|
-| `adminDeleteUnadoptedRepository` | `DELETE /admin/unadopted/{owner}/{repo}` | degenerate: no filesystem — list is always empty, adopt/delete 404 (upstream routers/api/v1/admin/adopt.go scans disk) |
-| `adminCronList` | `GET /admin/cron` | degenerate: static cron-task registry + enqueue no-op (upstream routers/api/v1/admin/cron.go returns in-code definitions) |
-| `adminUnadoptedList` | `GET /admin/unadopted` | degenerate: no filesystem — list is always empty, adopt/delete 404 (upstream routers/api/v1/admin/adopt.go scans disk) |
-| `adminCronRun` | `POST /admin/cron/{task}` | degenerate: static cron-task registry + enqueue no-op (upstream routers/api/v1/admin/cron.go returns in-code definitions) |
-| `adminAdoptRepository` | `POST /admin/unadopted/{owner}/{repo}` | degenerate: no filesystem — list is always empty, adopt/delete 404 (upstream routers/api/v1/admin/adopt.go scans disk) |
-
-**FEATURE-ABSENT** (8)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deleteAdminRunner` | `DELETE /admin/actions/runners/{runner_id}` | actions runtime (upstream models/actions/, services/actions/) |
-| `listAdminWorkflowJobs` | `GET /admin/actions/jobs` | actions runtime (upstream models/actions/, services/actions/) |
-| `getAdminRunners` | `GET /admin/actions/runners` | actions runtime (upstream models/actions/, services/actions/) |
-| `getAdminRunner` | `GET /admin/actions/runners/{runner_id}` | actions runtime (upstream models/actions/, services/actions/) |
-| `listAdminWorkflowRuns` | `GET /admin/actions/runs` | actions runtime (upstream models/actions/, services/actions/) |
-| `adminListPackages` | `GET /admin/packages` | packages (upstream models/packages/) |
-| `updateAdminRunner` | `PATCH /admin/actions/runners/{runner_id}` | actions runtime (upstream models/actions/, services/actions/) |
-| `adminCreateRunnerRegistrationToken` | `POST /admin/actions/runners/registration-token` | actions runtime (upstream models/actions/, services/actions/) |
-
-
-### package
-
-**FEATURE-ABSENT** (9)
-
-| Operation | `METHOD path` | Rides / missing / pointer |
-|---|---|---|
-| `deletePackage` | `DELETE /packages/{owner}/{type}/{name}` | package registry (upstream models/packages/, modules/packages/) — needs SPEC before adoption (R2 candidate store) |
-| `deletePackageVersion` | `DELETE /packages/{owner}/{type}/{name}/{version}` | package registry (upstream models/packages/, modules/packages/) — needs SPEC before adoption (R2 candidate store) |
-| `listPackages` | `GET /packages/{owner}` | package registry (upstream models/packages/, modules/packages/) — needs SPEC before adoption (R2 candidate store) |
-| `listPackageVersions` | `GET /packages/{owner}/{type}/{name}` | package registry (upstream models/packages/, modules/packages/) — needs SPEC before adoption (R2 candidate store) |
-| `getLatestPackageVersion` | `GET /packages/{owner}/{type}/{name}/-/latest` | package registry (upstream models/packages/, modules/packages/) — needs SPEC before adoption (R2 candidate store) |
-| `getPackage` | `GET /packages/{owner}/{type}/{name}/{version}` | package registry (upstream models/packages/, modules/packages/) — needs SPEC before adoption (R2 candidate store) |
-| `listPackageFiles` | `GET /packages/{owner}/{type}/{name}/{version}/files` | package registry (upstream models/packages/, modules/packages/) — needs SPEC before adoption (R2 candidate store) |
-| `linkPackage` | `POST /packages/{owner}/{type}/{name}/-/link/{repo_name}` | package registry (upstream models/packages/, modules/packages/) — needs SPEC before adoption (R2 candidate store) |
-| `unlinkPackage` | `POST /packages/{owner}/{type}/{name}/-/unlink` | package registry (upstream models/packages/, modules/packages/) — needs SPEC before adoption (R2 candidate store) |
-
+| `deletePackage` | `DELETE /packages/{owner}/{type}/{name}` | package registry (upstream gitea/models/packages/, gitea/modules/packages/) — no package table in schema.ts (only repositories.has_packages); needs SPEC before adoption (R2 candidate store) |
+| `deletePackageVersion` | `DELETE /packages/{owner}/{type}/{name}/{version}` | package registry — same absent store, same SPEC gate |
+| `listPackages` | `GET /packages/{owner}` | package registry — same absent store, same SPEC gate |
+| `listPackageVersions` | `GET /packages/{owner}/{type}/{name}` | package registry — same absent store, same SPEC gate |
+| `getLatestPackageVersion` | `GET /packages/{owner}/{type}/{name}/-/latest` | package registry — same absent store, same SPEC gate |
+| `getPackage` | `GET /packages/{owner}/{type}/{name}/{version}` | package registry — same absent store, same SPEC gate |
+| `listPackageFiles` | `GET /packages/{owner}/{type}/{name}/{version}/files` | package registry — same absent store, same SPEC gate |
+| `linkPackage` | `POST /packages/{owner}/{type}/{name}/-/link/{repo_name}` | package registry — same absent store, same SPEC gate |
+| `unlinkPackage` | `POST /packages/{owner}/{type}/{name}/-/unlink` | package registry — same absent store, same SPEC gate |
