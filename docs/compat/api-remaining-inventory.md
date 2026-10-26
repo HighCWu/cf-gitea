@@ -52,6 +52,30 @@ lastcommit fragment `3502ee4`, the toolkit tails `7d4c19a`, the
 repo-scoped projects UI row `ae32b1a`) carries **zero new
 operations**; the checker re-run at this HEAD reports 490/298, `PASS`
 unchanged. The window's landings join the post-490 ledger below.
+**Ticked 2026-10-26** a seventh time, at HEAD `67adfb7`: maintenance
+only again — the `ae32b1a..67adfb7` window (14 commits: the tick-7
+compat docs commit `bff7fdc`, the wrangler esbuild loader fixes
+`4ed30cc` + `52a1f52` (the svg `?raw` rule) + `981c098` (the json
+`?raw` join — the REDEPLOY18 arc), the tag-create carried note closure
+`aaea049` + its two phrasing alignments `42a88c8`, the engine e2e
+health sweep `ac3afd7`, the SPEC-0011 count annotation `84cf4c9`, P0
+deploy evidence `baf28bb`, the payload-stub arc (`3fcbe1a` the
+fork/mirror/parent/search stubs closed + `a55a725` the repo GET
+full-payload swaps), the renamed-fork PR head (`9ecb3e5` the
+FindHeadRepo port + `30995e2` the bare-head divergence comment
+refresh), and the UI index window `67adfb7` — both fragment routes
+mounted) carries **zero new operations**; the checker re-run at this
+HEAD reports 490/298, `PASS` unchanged. The window's landings join the
+post-490 ledger below. The window also emptied the surface's carried
+notes: tag-create CLOSED-WRONG (`aaea049` — the contract declares 200
+per upstream's own swagger, tag.go:185-197, while upstream's runtime
+drifts to 201 (:230); we follow the declaration), the
+payload/serializer stubs CLOSED (`3fcbe1a` + `a55a725`), the
+renamed-fork staleness CLOSED (`9ecb3e5`, its flagged comment
+refreshed `30995e2`) — **the carried-OPEN list is empty** (this
+doc's one ledgered residual, the generated-repo wire `bf8e56f`, was
+already closed by `8828f43`; the 16 SQLITE_LOCKED OPEN in `baf28bb`
+is P0-evidence scope, not an API carry).
 
 - **Sources / method**: frozen contract
   `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
@@ -59,7 +83,7 @@ unchanged. The window's landings join the post-490 ledger below.
   issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
   minus the declared set that `node scripts/check-openapi.mjs` reports
   (**490** operations across **298** paths, measured 2026-10-26 at HEAD
-  `ae32b1a`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
+  `67adfb7`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
   operations). Raw diff: **64 undeclared** = **64 remaining**, all
   FEATURE-ABSENT — no in-flight subtraction applies any more.
   Issue / notification / miscellaneous / settings families have **zero**
@@ -125,11 +149,13 @@ that tick's measurement time were this doc plus the then-in-flight
 `/{username}/-/projects` wave's uncommitted files under
 `apps/worker/src/ui/` and a scratch script — none of them spec-bearing
 as measured (the checker still reports 490/298 in exactly this tree
-state). At this tick's measurement (`ae32b1a`) the tree is CLEAN apart
-from the two compat docs themselves; the blob_excerpt/lastcommit
-route-mounting wave now in flight is dispatch-ownership, not visible
-files, and is UI-only — no undeclared op rides it (the previous tick's
-repo-scoped projects wave landed as `ae32b1a`, still zero ops).
+state). At this tick's measurement (`67adfb7`) the tree is CLEAN apart
+from the two compat docs themselves; the org-settings wave now in
+flight is dispatch-ownership, not visible files, and is UI-only — no
+undeclared op rides it (the previous tick's fragment-mounting wave
+landed as `67adfb7`, still zero ops; the carried-OPEN list —
+tag-create, serializer stubs, renamed-fork — is empty, closed as the
+seventh tick records).
 
 ---
 
@@ -203,7 +229,21 @@ grouped:
   `2310623..58c6cf0` window; neither does the `58c6cf0..ae32b1a`
   window — its two api-side landings (`0db7087` the blob-excerpt
   machinery, `3502ee4` the lastcommit fragment) are UI-fragment
-  services over already-declared reads, spec-bearing zero.
+  services over already-declared reads, spec-bearing zero. The
+  `ae32b1a..67adfb7` window adds the payload-stub arc (`3fcbe1a` —
+  fork/mirror rendered from the existing columns; parent under OUR
+  read-gate, the upstream FIXME's base-existence gate conceded to leak
+  private bases so our tightening is the documented intentional
+  divergence; mirror triple gated on row existence; search mode arms
+  fork/mirror/source + collaborative honest-noMatch) and the repo GET
+  full-payload swaps (`a55a725` — the two one-line `toApiRepositoryFull`
+  swaps; parent + mirror schedule live on the detail GETs, lists keep
+  the flat shape as the documented divergence), plus the renamed-fork
+  PR head (`9ecb3e5` — the FindHeadRepo port: the bare arm resolves
+  the FORK EDGE first, name-free and rename-immune by construction,
+  path acceptance as fallback, chain climb maxLevel 10, flat-404
+  anti-enumeration kept; the GET bare form rename-immune vs upstream's
+  name-only — intentional, documented).
 - **Migrations 0029–0032** landed with them (`size_kb`, `num_stars`/
   `num_watches`, `num_forks` + `users.num_stars`, push-mirror sync state) —
   still 64 tables; these are store work behind already-declared ops.
@@ -242,7 +282,15 @@ grouped:
   only, route handoff documented) and the lastcommit fragment
   (`3502ee4` — the batched per-path commit-info loader + the
   `view_list.tmpl` DOM, route handoff documented; both fragments'
-  routes ride a sibling's `index.ts` window).
+  routes ride a sibling's `index.ts` window). The
+  `ae32b1a..67adfb7` window adds the index window itself (`67adfb7` —
+  BOTH fragment routes mounted: blob-excerpt stage-3, fragment +
+  expand buttons + anchors, with the WIKI TWIN discovered at
+  web.go:1618 (`/{owner}/{repo}/wiki/blob_excerpt/{sha}`) mounted
+  beside it via the wiki-cell swap + `hasWiki` gate; lastcommit
+  HANDOFF-exact per the `3502ee4` mount plan; the file-list
+  fetch-attrs flip — four attrs verbatim, opt-in `loaderCommitOid`;
+  the survey's two IN-FLIGHT fragment rows flip LANDED there).
 - **Test/docs**: vitest contention config (`e4ebb9d`), release notes
   (`1c44086`), P0 deploy evidence (`d28d953`, `3d76cc6`), push-mirror SPEC
   (`998a4de`), schema-docstring catch-up (`e6ccf9c`). The
@@ -273,7 +321,18 @@ grouped:
   (`4f59daa`), and P0 deploy evidence (`96cb9d4` — deploy b928537a @
   `7cd1ce9`: the attachments cookie-fix proven, BOTH 16-OPENs closed
   with production proof incl. the `--force-red` rehearsal shapes,
-  7/7 batteries first-try).
+  7/7 batteries first-try). The `ae32b1a..67adfb7` window adds the
+  tick-7 compat docs commit (`bff7fdc`), the tag-create carried note
+  CLOSED WRONG (`aaea049` — the contract declares 200 per upstream's
+  own swagger, tag.go:185-197, while upstream's runtime drifts to 201
+  (:230); we follow the declaration, in-place citation so the note
+  can't regenerate) + its two phrasing alignments (`42a88c8`),
+  the bare-head divergence comment refresh (`30995e2` — the
+  fork-edge-first shape), the engine e2e health sweep (`ac3afd7` —
+  16/16 scripts, 269/269 checks), the SPEC-0011 M3.5 count annotation
+  (`84cf4c9`), and P0 deploy evidence (`baf28bb` — the RD18
+  ?raw-incident arc closed; its NEW OPEN, 16 SQLITE_LOCKED tail
+  exceptions, is P0-ledger scope, not an API carry).
 - **Tooling**: the `9b49cd2..2310623` window adds the toolkit polish
   (`5fdbc15` — token optional for D1-only batteries, `MIRROR_SETTLE_MS`
   10s→30s + `--mirror-settle-ms`, the generic failureTail with the
@@ -288,7 +347,13 @@ grouped:
   (`7d4c19a` — the registry battery's rename-aware fullName
   re-pointing, the forkpr fork→base→org order, ui-login; all three
   self-sweep on red; per-battery forced-red rehearsals with
-  following-audit-green proofs; p0 creates nothing, explicit).
+  following-audit-green proofs; p0 creates nothing, explicit). The
+  `ae32b1a..67adfb7` window adds the wrangler esbuild loader fixes
+  (`4ed30cc` + `52a1f52` — the `**/*.svg?raw` Text rule, proven
+  minimal; `981c098` — `**/*.json?raw` joins it after wrangler's
+  built-in .json loader PARSED the object and 500'd every tree-view
+  envelope in production; the ?raw-needs-a-glob lesson is the
+  REDEPLOY18 arc's record).
 
 ---
 
