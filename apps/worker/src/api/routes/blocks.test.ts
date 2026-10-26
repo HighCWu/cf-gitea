@@ -27,7 +27,7 @@ import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
-import contract from "../../compat/contract/v1-swagger.generated.json";
+import { contract, type Swagger2Method } from "../../compat/contract/frozen-contract";
 import { registerBlockRoutes } from "./blocks";
 
 /**
@@ -247,7 +247,7 @@ async function blockingRow(blockerId: number, blockeeId: number) {
 // Declared surface — the throwaway-app contract self-check (never router.ts)
 // ---------------------------------------------------------------------------
 
-const BLOCK_OPS: Array<[operationId: string, method: string, path: string]> = [
+const BLOCK_OPS: Array<[operationId: string, method: Swagger2Method, path: string]> = [
   ["userListBlocks", "get", "/user/blocks"],
   ["userCheckUserBlock", "get", "/user/blocks/{username}"],
   ["userBlockUser", "put", "/user/blocks/{username}"],
@@ -268,7 +268,7 @@ describe("blocks declared surface vs frozen contract", () => {
     }) as unknown as { paths: Record<string, Record<string, { operationId?: string; responses?: Record<string, unknown> }>> };
 
     for (const [operationId, method, path] of BLOCK_OPS) {
-      const contractOp = (contract.paths as Record<string, Record<string, { operationId: string; responses: Record<string, unknown> }>>)[path]?.[method];
+      const contractOp = contract.paths[path]?.[method];
       if (contractOp === undefined) {
         throw new Error(`contract missing ${method.toUpperCase()} ${path}`);
       }
@@ -280,7 +280,7 @@ describe("blocks declared surface vs frozen contract", () => {
       }
       expect(specOp.operationId).toBe(operationId);
 
-      const contractCodes = new Set(Object.keys(contractOp.responses));
+      const contractCodes = new Set(Object.keys(contractOp.responses ?? {}));
       for (const code of Object.keys(specOp.responses ?? {})) {
         expect(contractCodes.has(code), `${operationId} declares undeclared code ${code}`).toBe(true);
       }

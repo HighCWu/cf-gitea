@@ -47,7 +47,7 @@ import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { registerWikiRoutes } from "./wiki";
-import contract from "../../compat/contract/v1-swagger.generated.json";
+import { contract } from "../../compat/contract/frozen-contract";
 import {
   gitPathToWebPath,
   goQuote,
@@ -192,11 +192,10 @@ describe("contract declaration", () => {
 
   it("declares every arm with the contract's operationId and a response subset", () => {
     const doc = app().getOpenAPIDocument({ openapi: "3.0.3", info: { title: "Gitea API", version: "test" } });
-    type ContractOperation = { operationId: string; responses: Record<string, unknown> };
     for (const [method, path] of ARMS) {
       const declared = doc.paths?.[path]?.[method];
       expect(declared, `${method.toUpperCase()} ${path}`).toBeDefined();
-      const expected = (contract.paths as Record<string, Record<string, ContractOperation | undefined>>)[path]?.[method];
+      const expected = contract.paths[path]?.[method];
       expect(expected, `contract ${method.toUpperCase()} ${path}`).toBeDefined();
       expect(declared?.operationId).toBe(expected?.operationId);
       const contractCodes = Object.keys(expected?.responses ?? {});

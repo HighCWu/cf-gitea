@@ -14,7 +14,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { issueLabels, labels, repositories, users } from "../db/schema";
 import { createApiRouter } from "./router";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -31,7 +31,7 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const LABEL_FIELDS = Object.keys(contract.definitions.Label.properties).sort();
+const LABEL_FIELDS = Object.keys(contractModelProperties("Label")).sort();
 
 const TOKEN = "stub-token";
 const authHeaders = { Authorization: `token ${TOKEN}`, "Content-Type": "application/json" };

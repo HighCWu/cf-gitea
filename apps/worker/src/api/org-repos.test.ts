@@ -26,7 +26,7 @@ import { OrgService, type OrgRecord } from "../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../services/orgs/testing";
 import type { User } from "./models/user";
 import { createApiRouter } from "./router";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 beforeAll(applyOrgsDdl);
 
@@ -37,7 +37,7 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const ORGANIZATION_FIELDS = Object.keys(contract.definitions.Organization.properties).sort();
+const ORGANIZATION_FIELDS = Object.keys(contractModelProperties("Organization")).sort();
 /** Upstream-`omitempty` Repository fields absent for D1-only repos. */
 const OMITTED_REPOSITORY_FIELDS = new Set([
   "default_target_branch",
@@ -46,7 +46,7 @@ const OMITTED_REPOSITORY_FIELDS = new Set([
   "parent",
   "repo_transfer",
 ]);
-const REPOSITORY_FIELDS = Object.keys(contract.definitions.Repository.properties)
+const REPOSITORY_FIELDS = Object.keys(contractModelProperties("Repository"))
   .filter((name) => !OMITTED_REPOSITORY_FIELDS.has(name))
   .sort();
 

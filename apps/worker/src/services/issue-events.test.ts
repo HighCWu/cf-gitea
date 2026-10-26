@@ -22,14 +22,14 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 import { createApiRouter } from "../api/router";
 import { repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { uiRouter } from "../ui/index";
 import { uiEnv } from "../ui/__tests__/harness";
 import { mintSession, SESSION_COOKIE_NAME } from "../ui/session";
 
-const ISSUE_FIELDS = Object.keys(contract.definitions.Issue.properties).sort();
+const ISSUE_FIELDS = Object.keys(contractModelProperties("Issue")).sort();
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {

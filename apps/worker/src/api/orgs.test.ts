@@ -40,7 +40,7 @@ import { registerOrgProfileRoutes } from "./routes/orgs";
 import { RepoService } from "../repos/service";
 import { OrgService } from "../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../services/orgs/testing";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 beforeAll(applyOrgsDdl);
 
@@ -51,11 +51,11 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const ORGANIZATION_FIELDS = Object.keys(contract.definitions.Organization.properties).sort();
+const ORGANIZATION_FIELDS = Object.keys(contractModelProperties("Organization")).sort();
 const ORGANIZATION_PERMISSIONS_FIELDS = Object.keys(
-  contract.definitions.OrganizationPermissions.properties,
+  contractModelProperties("OrganizationPermissions"),
 ).sort();
-const USER_FIELDS = Object.keys(contract.definitions.User.properties);
+const USER_FIELDS = Object.keys(contractModelProperties("User"));
 const ERROR_URL = "https://example.com/api/swagger";
 
 /** Seeded D1 users the test resolver can authenticate as (`token u<id>`). */

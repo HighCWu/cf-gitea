@@ -33,7 +33,7 @@ import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import { registerStatusRoutes } from "./routes/statuses";
 import { createApiRouter } from "./router";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -65,8 +65,8 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const COMMIT_STATUS_FIELDS = Object.keys(contract.definitions.CommitStatus.properties).sort();
-const COMBINED_STATUS_FIELDS = Object.keys(contract.definitions.CombinedStatus.properties).sort();
+const COMMIT_STATUS_FIELDS = Object.keys(contractModelProperties("CommitStatus")).sort();
+const COMBINED_STATUS_FIELDS = Object.keys(contractModelProperties("CombinedStatus")).sort();
 /** Upstream-`omitempty` Repository fields absent for D1-only repos (same set
  * as repositories.test.ts: forks, external units, transfers, default target). */
 const OMITTED_REPOSITORY_FIELDS = new Set([
@@ -76,7 +76,7 @@ const OMITTED_REPOSITORY_FIELDS = new Set([
   "parent",
   "repo_transfer",
 ]);
-const REPOSITORY_FIELDS = Object.keys(contract.definitions.Repository.properties)
+const REPOSITORY_FIELDS = Object.keys(contractModelProperties("Repository"))
   .filter((name) => !OMITTED_REPOSITORY_FIELDS.has(name))
   .sort();
 

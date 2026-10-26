@@ -28,7 +28,7 @@ import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { registerHookScopeRoutes } from "./hooks-scopes";
 import { OrgService } from "../../services/orgs/orgs";
-import contract from "../../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -46,7 +46,7 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const HOOK_FIELDS = Object.keys(contract.definitions.Hook.properties).sort();
+const HOOK_FIELDS = Object.keys(contractModelProperties("Hook")).sort();
 const ERROR_URL = "https://example.com/api/swagger";
 
 // ---------------------------------------------------------------------------

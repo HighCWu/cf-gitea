@@ -22,7 +22,7 @@ import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -63,9 +63,9 @@ beforeEach(async () => {
 const db = () => drizzle(env.DB);
 const service = () => new IssuesService(env.DB);
 
-const ISSUE_FIELDS = Object.keys(contract.definitions.Issue.properties).sort();
-const COMMENT_FIELDS = Object.keys(contract.definitions.Comment.properties).sort();
-const TIMELINE_FIELDS = Object.keys(contract.definitions.TimelineComment.properties).sort();
+const ISSUE_FIELDS = Object.keys(contractModelProperties("Issue")).sort();
+const COMMENT_FIELDS = Object.keys(contractModelProperties("Comment")).sort();
+const TIMELINE_FIELDS = Object.keys(contractModelProperties("TimelineComment")).sort();
 
 const TOKEN = "stub-token";
 const authHeaders = { Authorization: `token ${TOKEN}`, "Content-Type": "application/json" };

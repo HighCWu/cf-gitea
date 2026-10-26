@@ -47,7 +47,7 @@ import {
   UPDATE_SAMPLE,
   registerGitHookRoutes,
 } from "./git-hooks";
-import contract from "../../compat/contract/v1-swagger.generated.json";
+import { contract, type Swagger2Operation } from "../../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -513,9 +513,7 @@ describe("gates", () => {
 // ---------------------------------------------------------------------------
 
 describe("contract declaration", () => {
-  /** The arms grouped per path item so the imported swagger JSON's precise
-   *  literal types index cleanly (the list path carries get only — a mixed
-   *  union would break the method lookup). */
+  /** The arms grouped per path item (the list path carries get only). */
   const LIST_ARMS = [["get", "/repos/{owner}/{repo}/hooks/git"]] as const;
   const ID_ARMS = [
     ["get", "/repos/{owner}/{repo}/hooks/git/{id}"],
@@ -528,14 +526,14 @@ describe("contract declaration", () => {
   function assertArm(
     label: string,
     declared: { operationId?: string; responses?: Record<string, unknown> } | undefined,
-    expected: { operationId: string; responses: Record<string, unknown> } | undefined,
+    expected: Swagger2Operation | undefined,
   ): void {
     expect(declared, label).toBeDefined();
     if (expected === undefined) {
       throw new Error(`contract is missing ${label}`);
     }
     expect(declared?.operationId).toBe(expected.operationId);
-    const contractCodes = Object.keys(expected.responses);
+    const contractCodes = Object.keys(expected.responses ?? {});
     for (const code of Object.keys(declared?.responses ?? {})) {
       expect(contractCodes, `${label} response ${code}`).toContain(code);
     }

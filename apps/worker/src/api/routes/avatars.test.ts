@@ -40,7 +40,7 @@ import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { registerAvatarRoutes } from "./avatars";
 import { OrgService } from "../../services/orgs/orgs";
-import contract from "../../compat/contract/v1-swagger.generated.json";
+import { contract } from "../../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -591,8 +591,8 @@ describe("contract declaration", () => {
       expect(declared, `${method.toUpperCase()} ${path}`).toBeDefined();
       const expected = contract.paths[path]?.[method];
       expect(expected, `contract ${method.toUpperCase()} ${path}`).toBeDefined();
-      expect(declared?.operationId).toBe(expected.operationId);
-      const contractCodes = Object.keys(expected.responses);
+      expect(declared?.operationId).toBe(expected?.operationId);
+      const contractCodes = Object.keys(expected?.responses ?? {});
       for (const code of Object.keys(declared?.responses ?? {})) {
         expect(contractCodes, `${method.toUpperCase()} ${path} response ${code}`).toContain(code);
       }

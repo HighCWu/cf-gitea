@@ -29,7 +29,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { gpgKeys, publicKeys, userBlocking, users } from "../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "./auth";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import type { User } from "./models/user";
@@ -56,7 +56,7 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const USER_FIELDS = Object.keys(contract.definitions.User.properties);
+const USER_FIELDS = Object.keys(contractModelProperties("User"));
 
 /** Seeded D1 users the test resolver can authenticate as (`token u<id>`). */
 const seededUsers = new Map<number, { id: number; username: string; isAdmin: boolean }>();

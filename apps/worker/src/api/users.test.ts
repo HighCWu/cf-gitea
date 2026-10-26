@@ -14,7 +14,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { users } from "../db/schema";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 // The vitest plugin's per-test storage isolation discards setupFiles-era D1
 // writes; schema from `beforeAll` migrations persists for the file (same
@@ -32,7 +32,7 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const SWAGGER_USER_FIELDS = Object.keys(contract.definitions.User.properties).sort();
+const SWAGGER_USER_FIELDS = Object.keys(contractModelProperties("User")).sort();
 
 /** Indexed access under noUncheckedIndexedAccess — explicit guard instead of `!`. */
 function firstOf<T>(items: T[]): T {

@@ -20,7 +20,7 @@ import { repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { STUB_USER } from "./auth";
 import { ZERO_OID } from "./services/hooks";
 import { createApiRouter } from "./router";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -37,8 +37,8 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const HOOK_FIELDS = Object.keys(contract.definitions.Hook.properties).sort();
-const DELIVERY_FIELDS = Object.keys(contract.definitions.HookDelivery.properties).sort();
+const HOOK_FIELDS = Object.keys(contractModelProperties("Hook")).sort();
+const DELIVERY_FIELDS = Object.keys(contractModelProperties("HookDelivery")).sort();
 /** Upstream-`omitempty` Repository fields absent for D1-only repos. */
 const OMITTED_REPOSITORY_FIELDS = new Set([
   "default_target_branch",
@@ -47,7 +47,7 @@ const OMITTED_REPOSITORY_FIELDS = new Set([
   "parent",
   "repo_transfer",
 ]);
-const REPOSITORY_FIELDS = Object.keys(contract.definitions.Repository.properties)
+const REPOSITORY_FIELDS = Object.keys(contractModelProperties("Repository"))
   .filter((name) => !OMITTED_REPOSITORY_FIELDS.has(name))
   .sort();
 

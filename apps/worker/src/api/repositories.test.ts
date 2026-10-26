@@ -16,7 +16,7 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
 import { REPO_SETTINGS_DDL_STATEMENTS } from "./services/repo-settings";
-import contract from "../compat/contract/v1-swagger.generated.json";
+import { contractModelProperties } from "../compat/contract/frozen-contract";
 
 // The vitest plugin's per-test storage isolation discards setupFiles-era D1
 // writes; schema from `beforeAll` migrations persists for the file (same
@@ -40,7 +40,7 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const SWAGGER_REPOSITORY_FIELDS = Object.keys(contract.definitions.Repository.properties).sort();
+const SWAGGER_REPOSITORY_FIELDS = Object.keys(contractModelProperties("Repository")).sort();
 
 /** Upstream-`omitempty` fields that stay nil/empty for D1-only repositories:
  * forks (parent), external tracker/wiki units, pending transfers, and the
