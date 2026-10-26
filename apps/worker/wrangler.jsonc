@@ -11,6 +11,19 @@
   "limits": {
     "cpu_ms": 300000
   },
+  // Module rules: the fileicon layer (src/ui/fileicon/, cdf683a) imports its
+  // basic-theme SVGs as `*.svg?raw` strings — vite serves ?raw natively (so
+  // dev/tests never trip), but `wrangler deploy`'s esbuild needs an explicit
+  // Text loader for the extension (first observed at the tree-view edge,
+  // 831709f — the first entry-graph carrier; fallthrough keeps any future
+  // non-raw svg use free to declare its own rule).
+  "rules": [
+    {
+      "type": "Text",
+      "globs": ["**/*.svg"],
+      "fallthrough": true
+    }
+  ],
   // Webhook payload compare URLs (mirror sync + user push) — upstream's own
   // AppURL equivalent. Local dev overrides via .dev.vars if needed.
   "vars": {
