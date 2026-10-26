@@ -25,6 +25,17 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
   audit used to demand a PAT, forcing a scratch-mint + delete dance). A
   supplied token file is still validated (0600, mint shape) and scrubbed.
+- **PAT-identity preflight**: before any HTTP battery runs, one
+  `GET /api/v1/user` with the PAT compares its `login` to `--user`. Repo
+  creation is doer-relative (`POST /user/repos` lands in the PAT's own
+  namespace) while every follow-up arm addresses `/repos/<--user>/…`, so a
+  `--user` that does not match the PAT's login used to create repos and then
+  404 every follow-up arm. The mismatch now exits 2 BEFORE anything is
+  created — one line naming the actual login, the requested `--user`, and
+  both fixes (mint the PAT as that user, or pass the matching `--user`); a
+  match passes silently. One request per invocation (cached); a refused PAT
+  (`/user` → 401) fails fast in the same shape. The D1-only `cleanup-audit`
+  has no HTTP surface and never triggers it.
 - Against LOCAL dev: `--base-url http://127.0.0.1:5173 --d1-scope local` for
   the HTTP batteries (the mirror row-settle arm reuses `--d1-scope`); mint the
   PAT with `node scripts/bootstrap-admin.mjs <user>` on local D1, and pass the

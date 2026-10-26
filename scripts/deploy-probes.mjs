@@ -43,6 +43,15 @@
  *   - Output: `  [pass] <id> (<ms> ms) — <detail>` progress lines (the same
  *     shape the evidence blocks quote) + a final JSON summary on stdout;
  *     exit code is non-zero iff any check FAILS (warn/skip never fail).
+ *   - PAT-identity preflight: before any HTTP battery runs, GET /api/v1/user
+ *     with the PAT and compare its `login` to --user. Repo creation is
+ *     DOER-relative (POST /user/repos lands in the PAT's own namespace) while
+ *     every follow-up arm addresses /repos/<--user>/…, so a --user that does
+ *     not match the PAT's login used to create repos and then 404 every
+ *     follow-up arm. Mismatch = exit 2 BEFORE anything is created (one line
+ *     naming the actual login, the requested --user, and both fixes); a match
+ *     passes silently. One request per invocation (cached); the D1-only
+ *     cleanup-audit has no HTTP surface and never triggers it.
  *
  * Canonical expectations ported from the latest evidence block
  * (docs/design/p0-evidence.md, REDEPLOY13 2026-10-26, ~lines 1507-1697;
@@ -1187,12 +1196,49 @@ const loadToken = async () => {
   return token;
 };
 
+/** PAT-identity preflight (the misaddressing class): repo creation is
+ *  doer-relative (POST /user/repos lands in the PAT's own namespace) while
+ *  every follow-up arm addresses /repos/<--user>/… — a --user that does not
+ *  match the PAT's login makes every follow-up arm 404 AFTER repos were
+ *  already created. One GET /api/v1/user BEFORE any battery step turns that
+ *  into a fast, pointed exit 2 (zero repo creation). One request per
+ *  invocation — the answer is cached; a match passes silently. */
+let patLogin = null; // the preflight's cached answer (null = not asked yet)
+const preflightIdentity = async () => {
+  if (patLogin !== null) return patLogin;
+  let res;
+  try {
+    res = await api("/user", { auth: true });
+  } catch (err) {
+    throw new Error(`identity preflight: GET /api/v1/user failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+  }
+  if (res.status === 401) {
+    throw new Error("identity preflight: the PAT was refused (GET /api/v1/user → 401) — mint a fresh PAT (scripts/bootstrap-admin.mjs) into a 0600 file");
+  }
+  expect(res.status === 200 && typeof res.json?.login === "string" && res.json.login.length > 0,
+    `identity preflight: GET /api/v1/user → ${res.status} without a login (body: ${res.text.slice(0, 120)})`);
+  patLogin = res.json.login;
+  if (patLogin !== opts.user) {
+    throw new Error(
+      `--user ${opts.user} does not match the PAT's login ${patLogin} — repo creation is doer-relative (POST /user/repos), ` +
+      `so every follow-up /repos/${opts.user}/… arm would 404; fix: mint the PAT as ${opts.user} or pass --user ${patLogin}`,
+    );
+  }
+  return patLogin;
+};
+
 const main = async () => {
   // REDEPLOY15 friction (a): the D1-only cleanup-audit runs WITHOUT a PAT —
   // loadToken fires only when the run actually makes HTTP calls.
-  if (batteryList.some((name) => !D1_ONLY_BATTERIES.has(name)) || opts.tokenFile) {
+  const httpBatteries = batteryList.some((name) => !D1_ONLY_BATTERIES.has(name));
+  if (httpBatteries || opts.tokenFile) {
     TOKEN = await loadToken();
   }
+  // The PAT-identity preflight runs BEFORE any battery step — a mismatched
+  // --user must fail fast, not after repos were created. The D1-only audit
+  // (cleanup-audit alone, even with a supplied token) makes no HTTP calls and
+  // has no /api/v1 surface to ask, so it never triggers the preflight.
+  if (httpBatteries) await preflightIdentity();
   log(`cf-gitea deploy probes — ${batteryList.join(" + ")} — ${opts.baseUrl ?? "(no --base-url: D1-only battery)"} (user ${opts.user})`);
   for (const name of batteryList) {
     const battery = BATTERIES[name];
