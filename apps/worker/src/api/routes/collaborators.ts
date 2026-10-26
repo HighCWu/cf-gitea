@@ -8,6 +8,7 @@ import type { ApiEnv } from "../env";
 import { addCollaboratorOptionSchema } from "../models/collaborator";
 import { userSchema } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { requireRepoAdmin, requireVisibleRepo } from "../services/repo-access";
 import {
   addOrUpdateCollaborator,
@@ -208,6 +209,18 @@ export function registerCollaboratorRoutes(app: OpenAPIHono<ApiEnv>, requireAuth
       // exists — anti-enumeration does not apply to admin callers).
       if (user.status !== "active") {
         throw new ApiError(500, "");
+      }
+      // AddOrUpdateCollaborator's blocked arms (services/repository/
+      // collaboration.go:35-37 via collaborators.go:188): the collaborator
+      // and the repo owner must not block EACH OTHER in either direction —
+      // 403 "user is blocked" (site admins are never blocked-by, the
+      // IsUserBlockedBy bypass). Runs after the inactive-account arm,
+      // exactly where upstream's LoadOwner probe sits inside the service.
+      if (
+        (await isUserBlockedBy(c.env.DB, user, found.repo.ownerId ?? -1)) ||
+        (await isUserBlockedBy(c.env.DB, found.owner, user.id))
+      ) {
+        throw new ApiError(403, BLOCKED_USER_MESSAGE);
       }
       const form = c.req.valid("json");
       // Nil permission defaults to write (AddOrUpdateCollaborator's

@@ -19,9 +19,11 @@ import {
   readableStreamFromGenerator,
 } from "../services/release-assets";
 import { findIssueByRepoAndIndex, findRepoCommentById, commentNotExistError, issueErrorToApiError } from "../services/issues";
+import { assertNotBlockedForIssueContent } from "../services/blocks";
 import {
   assertNotArchived,
   canWriteRepository,
+  isRepositoryAdmin,
   requireVisibleRepo,
 } from "../services/repo-access";
 import type { RepositoryWithOwner } from "../services/repository";
@@ -1058,6 +1060,19 @@ export function registerIssueAttachmentRoutes(
       assertNotArchived(found);
       const target = await requireComment(c, found, c.req.valid("param").id);
       const created = await prepareAttachmentCreate(c, found, target.issue, target.comment, c.req.valid("query").name ?? "");
+      // CreateIssueCommentAttachment's blocked arm (issue_comment_attachment.go:
+      // 218-227): the ErrBlockedUser check rides UpdateComment, i.e. AFTER the
+      // write-permission gate AND after the attachment row + bytes land — the
+      // blocked doer's 403 "user is blocked" leaves the row behind, upstream-
+      // faithful (repo admin bypasses, IsUserRepoAdmin).
+      const uploader = c.get("authUser");
+      await assertNotBlockedForIssueContent(
+        c.env.DB,
+        { id: uploader.id ?? 0, isAdmin: uploader.is_admin === true },
+        await isRepositoryAdmin(c, found),
+        target.issue.posterId,
+        found.repo.ownerId,
+      );
       const origin = new URL(c.req.url).origin;
       return c.json(toApiAttachment(origin, created.row), 201, created.location === null ? {} : { Location: created.location });
     },

@@ -24,6 +24,7 @@ import { emitIssueEvent, issueEventIdentity } from "../../services/issue-events"
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { issueListSchema, issueSchema } from "../models/issue";
 import type { Issue } from "../models/issue";
 import { toApiPullRequest } from "../services/pulls";
@@ -812,6 +813,15 @@ async function writeAssigneeComment(d1: D1Database, issue: IssueRow, assigneeId:
  * whole add back; we keep the committed prefix, see header deviations).
  * Returns the assignees actually added — upstream notifies per changed
  * assignee after the writes (assignee.go:236-247).
+ *
+ * `doerIsAdmin` feeds the validateAssignee blocked arm (assignee.go:169-170,
+ * wired by the blocks-enforcement batch): the doer blocked by a NEW
+ * assignee answers 403 "user is blocked". Upstream runs the arm inside
+ * validateAssignee — after AddAssignees' already-assigned skip
+ * (:216-222) and before CanBeAssigned; this loop validates assignability
+ * BEFORE the skip (the landed deviation), so the arm sits after the skip
+ * and its only precedence divergence is a blocked AND non-assignable name
+ * answering the access 403 instead of this one.
  */
 async function addIssueAssignees(
   d1: D1Database,
@@ -820,6 +830,7 @@ async function addIssueAssignees(
   found: RepositoryWithOwner,
   actorId: number,
   now: Date,
+  doerIsAdmin: boolean,
 ): Promise<UserRow[]> {
   const added: UserRow[] = [];
   for (const user of assignees) {
@@ -832,6 +843,9 @@ async function addIssueAssignees(
       .then((rows) => rows[0]);
     if (existing !== undefined) {
       continue; // AddAssigneeIfNotAssigned: already assigned, nothing to do
+    }
+    if (await isUserBlockedBy(d1, { id: actorId, isAdmin: doerIsAdmin }, user.id)) {
+      throw new ApiError(403, BLOCKED_USER_MESSAGE);
     }
     const inserted = await drizzle(d1)
       .insert(issueAssignees)
@@ -1298,7 +1312,7 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     await assertIssueWriter(c, found);
     const names = c.req.valid("json").assignees ?? [];
     const assignees = await resolveAssigneesByName(c.env.DB, names);
-    const added = await addIssueAssignees(c.env.DB, issue, assignees, found, requireDoerId(c), new Date());
+    const added = await addIssueAssignees(c.env.DB, issue, assignees, found, requireDoerId(c), new Date(), c.get("authUser")?.is_admin === true);
     const reloaded = (await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index)) ?? issue;
     for (const user of added) {
       await emitAssignEvent(c, found, reloaded, user, false);

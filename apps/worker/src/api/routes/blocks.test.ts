@@ -18,6 +18,11 @@ import {
   users,
   repositories,
 } from "../../db/schema";
+import {
+  assertNotBlockedForIssueContent,
+  assertNotBlockedForIssueCreate,
+  isUserBlockedBy,
+} from "../services/blocks";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -542,5 +547,64 @@ describe("org blocks", () => {
     await seedUser("bob");
     const res = await put("/api/v1/orgs/acme/blocks/bob", admin.id);
     expect(res.status).toBe(204);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The enforcement probes (the wave-blocks-enforcement service surface):
+// IsUserBlockedBy (models/user/block.go:41-45) and the two composed issue
+// arms the landed route families call.
+// ---------------------------------------------------------------------------
+
+describe("enforcement probes (services/blocks.ts)", () => {
+  it("isUserBlockedBy: multi-blocker probe with the site-admin blockee bypass (block.go:41-45)", async () => {
+    const { alice, bob, admin } = await seedWorld();
+    await put("/api/v1/user/blocks/bob", alice.id); // alice blocks bob
+
+    // bob (the blockee) is blocked by alice — any-order probe
+    expect(await isUserBlockedBy(env.DB, { id: bob.id, isAdmin: false }, alice.id, 999)).toBe(true);
+    expect(await isUserBlockedBy(env.DB, { id: bob.id, isAdmin: false }, 999, alice.id)).toBe(true);
+    // and by nobody else
+    expect(await isUserBlockedBy(env.DB, { id: bob.id, isAdmin: false }, 999)).toBe(false);
+    // a site-admin blockee is never blocked-by (the IsAdmin short-circuit)
+    expect(await isUserBlockedBy(env.DB, { id: admin.id, isAdmin: true }, alice.id)).toBe(false);
+    // no blocker ids → false
+    expect(await isUserBlockedBy(env.DB, { id: bob.id, isAdmin: false })).toBe(false);
+  });
+
+  it("assertNotBlockedForIssueCreate throws only when the doer is blocked by the repo owner (issue.go:33-34)", async () => {
+    const { alice, bob, admin } = await seedWorld();
+    await put("/api/v1/user/blocks/bob", alice.id); // alice blocks bob
+
+    await expect(assertNotBlockedForIssueCreate(env.DB, { id: bob.id, isAdmin: false }, alice.id)).rejects.toMatchObject({
+      status: 403,
+      message: "user is blocked",
+    });
+    // no repo owner → no probe
+    await expect(assertNotBlockedForIssueCreate(env.DB, { id: bob.id, isAdmin: false }, null)).resolves.toBeUndefined();
+    // the site-admin doer bypasses
+    await expect(assertNotBlockedForIssueCreate(env.DB, { id: admin.id, isAdmin: true }, alice.id)).resolves.toBeUndefined();
+  });
+
+  it("assertNotBlockedForIssueContent: 403 blocked-by-poster-or-owner, repo-admin bypass (comments.go:63-65/106-108, issue.go:104-106, content.go:21-23)", async () => {
+    const { alice, bob, carol } = await seedWorld();
+    await put("/api/v1/user/blocks/bob", alice.id); // alice blocks bob
+
+    // blocked by the issue poster → throws
+    await expect(
+      assertNotBlockedForIssueContent(env.DB, { id: bob.id, isAdmin: false }, false, alice.id, carol.id),
+    ).rejects.toMatchObject({ status: 403, message: "user is blocked" });
+    // blocked by the repo owner → throws
+    await expect(
+      assertNotBlockedForIssueContent(env.DB, { id: bob.id, isAdmin: false }, false, carol.id, alice.id),
+    ).rejects.toMatchObject({ status: 403, message: "user is blocked" });
+    // repo admin bypasses even while blocked
+    await expect(
+      assertNotBlockedForIssueContent(env.DB, { id: bob.id, isAdmin: false }, true, alice.id, alice.id),
+    ).resolves.toBeUndefined();
+    // clear path resolves
+    await expect(
+      assertNotBlockedForIssueContent(env.DB, { id: carol.id, isAdmin: false }, false, alice.id, alice.id),
+    ).resolves.toBeUndefined();
   });
 });

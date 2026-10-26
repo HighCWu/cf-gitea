@@ -17,7 +17,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repositories, users } from "../db/schema";
+import { repositories, userBlocking, users } from "../db/schema";
 import { createStubAuthResolver, createTokenAuthMiddleware, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
@@ -79,7 +79,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await resetRepoExtrasTables();
-  for (const table of ["repositories", "users"]) {
+  for (const table of ["user_blocking", "repo_collaborators", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   // STUB_USER (id 1) owns the repo; 'collab' and 'carol' are candidates.
@@ -277,5 +277,36 @@ describe("GET /repos/{owner}/{repo}/assignees (repoGetAssignees)", () => {
 
   it("401s an anonymous caller (reqToken)", async () => {
     expect((await makeApp()(`${repoPath}/assignees`)).status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The AddOrUpdateCollaborator blocked arms (services/repository/
+// collaboration.go:35-37 via collaborators.go:188) — the collaborator and
+// the repo owner must not block each other in either direction; the exact
+// 403 "user is blocked" (ErrBlockedUser via APIErrorAuto), after the
+// inactive-account arm.
+// ---------------------------------------------------------------------------
+
+describe("PUT collaborators: the AddOrUpdateCollaborator blocked arms", () => {
+  it("403s when the repo owner blocks the collaborator", async () => {
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: 1, blockeeId: collaboratorUserId, note: "", createdAt: new Date() });
+    const res = await makeApp()(`${repoPath}/collaborators/collab`, { method: "PUT", headers: jsonAuth, body: "{}" });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+  });
+
+  it("403s in the reverse direction (the collaborator blocks the repo owner)", async () => {
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: collaboratorUserId, blockeeId: 1, note: "", createdAt: new Date() });
+    const res = await makeApp()(`${repoPath}/collaborators/collab`, { method: "PUT", headers: jsonAuth, body: "{}" });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+  });
+
+  it("clears to 204 once no blocking row relates the pair", async () => {
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: 1, blockeeId: collaboratorUserId, note: "", createdAt: new Date() });
+    await drizzle(env.DB).delete(userBlocking).all();
+    const res = await makeApp()(`${repoPath}/collaborators/collab`, { method: "PUT", headers: jsonAuth, body: "{}" });
+    expect(res.status).toBe(204);
   });
 });

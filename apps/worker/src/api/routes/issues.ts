@@ -11,6 +11,7 @@ import { IssueError, IssueNotExistError, MilestoneNotExistError } from "../../is
 import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
 import type { HookEventType } from "../../issues/webhooks";
 import { emitIssueEvent, issueEventIdentity, issueEventPayload, type IssueEventIdentity } from "../../services/issue-events";
+import { isRepositoryAdmin } from "../services/repo-access";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import {
@@ -29,6 +30,7 @@ import {
 } from "../models/issue";
 import { issueLabelSchema } from "../models/issue";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { assertNotBlockedForIssueContent, assertNotBlockedForIssueCreate } from "../services/blocks";
 import { toApiLabel } from "../services/labels";
 import {
   changeIssueBody,
@@ -971,6 +973,17 @@ export function registerIssueRoutes(
       }
 
       let issue: IssueRow;
+      // NewIssue's blocked arm (services/issue/issue.go:33-34 via
+      // routers/api/v1/repo/issue.go:625): the poster must not be blocked
+      // by the repo owner — 403 "user is blocked". The assignee half of
+      // upstream's condition is unreachable: this route drops
+      // form.assignee(s) (the file-header deviation), so the sub-arm rides
+      // the create-assignee support when it lands.
+      await assertNotBlockedForIssueCreate(
+        c.env.DB,
+        { id: requester.id ?? 0, isAdmin: requester.is_admin === true },
+        found.repo.ownerId,
+      );
       try {
         issue = await service.createIssue({
           repoId: found.repo.id,
@@ -1090,6 +1103,19 @@ export function registerIssueRoutes(
     }
     const form = c.req.valid("json");
     if (form.body !== (row.comment.content ?? "")) {
+      // UpdateComment's blocked arm (services/issue/comments.go:106-108
+      // via routers/api/v1/repo/issue_comment.go:574): the doer blocked by
+      // the issue poster or the repo owner answers 403 "user is blocked"
+      // unless a repo admin — reached only on an actual content change,
+      // exactly where upstream calls UpdateComment.
+      const editor = c.get("authUser");
+      await assertNotBlockedForIssueContent(
+        c.env.DB,
+        { id: editor.id ?? 0, isAdmin: editor.is_admin === true },
+        await isRepositoryAdmin(c, found),
+        row.issue.posterId,
+        found.repo.ownerId,
+      );
       // Upstream editIssueComment (routers/api/v1/repo/issue_comment.go:569-577)
       // updates and notifies only on an actual content change, carrying the
       // pre-edit content into the notifier (UpdateComment:420-461's
@@ -1185,6 +1211,17 @@ export function registerIssueRoutes(
 
     const title = patchField(form.title);
     if (title !== undefined && title.length > 0 && title !== issue.title) {
+      // ChangeIssueTitle's blocked arm (services/issue/issue.go:104-106):
+      // a doer blocked by the issue poster or the repo owner answers
+      // 403 "user is blocked" unless they are a repo admin
+      // (access_model.IsUserRepoAdmin — the permission matrix's admin flag).
+      await assertNotBlockedForIssueContent(
+        c.env.DB,
+        { id: actorId, isAdmin: requester.is_admin === true },
+        await isRepositoryAdmin(c, found),
+        issue.posterId,
+        found.repo.ownerId,
+      );
       const oldTitle = issue.title;
       const updated = await changeIssueTitle(c.env.DB, issue, title, actorId, now);
       if (updated !== null) {
@@ -1202,6 +1239,16 @@ export function registerIssueRoutes(
 
     const body = patchField(form.body);
     if (body !== undefined && body !== (issue.content ?? "")) {
+      // ChangeContent's blocked arm (services/issue/content.go:21-23) —
+      // the same doer-blocked-by-poster-or-owner / repo-admin-bypass rule
+      // as the title arm above.
+      await assertNotBlockedForIssueContent(
+        c.env.DB,
+        { id: actorId, isAdmin: requester.is_admin === true },
+        await isRepositoryAdmin(c, found),
+        issue.posterId,
+        found.repo.ownerId,
+      );
       const oldContent = issue.content ?? "";
       const updated = await changeIssueBody(c.env.DB, issue, body, requestedVersion ?? issue.contentVersion, now);
       if (updated === null) {
@@ -1336,6 +1383,17 @@ export function registerIssueRoutes(
       const form = c.req.valid("json");
       const service = new IssuesService(c.env.DB);
       const requester = c.get("authUser");
+      // CreateIssueComment's blocked arm (services/issue/comments.go:63-65
+      // via routers/api/v1/repo/issue_comment.go:387): the doer blocked by
+      // the issue poster or the repo owner answers 403 "user is blocked"
+      // unless a repo admin (IsUserRepoAdmin).
+      await assertNotBlockedForIssueContent(
+        c.env.DB,
+        { id: requester.id ?? 0, isAdmin: requester.is_admin === true },
+        await isRepositoryAdmin(c, found),
+        issue.posterId,
+        found.repo.ownerId,
+      );
       const comment = await service.addComment({ issueId: issue.id, posterId: requester.id, content: form.body });
       const rendered = await toApiComment(c.env.DB, viewer, found, issue, comment);
       // Webhook: created (issue_comment; PR comments map to

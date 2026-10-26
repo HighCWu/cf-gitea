@@ -17,9 +17,10 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { comments, issues, labels, milestones, repoCounters, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { comments, issues, labels, milestones, repoCollaborators, repoCounters, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
+import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
 import contract from "../compat/contract/v1-swagger.generated.json";
 
@@ -44,6 +45,8 @@ beforeEach(async () => {
     "milestones",
     "labels",
     "repo_counters",
+    "repo_collaborators",
+    "user_blocking",
     "repositories",
     "users",
   ]) {
@@ -1751,5 +1754,156 @@ describe("GET /repos/issues/search (issueSearchIssues)", () => {
 
     const badTime = await router()("/repos/issues/search?since=bogus");
     expect(badTime.status).toBe(422);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Blocked-user enforcement (the wave-blocks-enforcement arms) — the upstream
+// 403 "user is blocked" writes (ErrBlockedUser, models/user/block.go:21,
+ // answered via APIErrorAuto's permission-denied unwrap). Cites per case.
+// ---------------------------------------------------------------------------
+
+describe("blocked-user enforcement (ErrBlockedUser arms)", () => {
+  /** A repo whose owner row exists and carries ownerId (the blocked arm
+   *  probes user_blocking against it). */
+  async function seedOwnedRepo(owner: { id: number; usernameLower: string }): Promise<string> {
+    const id = String(repoSeq++);
+    await db().insert(repositories).values({
+      id,
+      storageKey: `r_${id}`,
+      ownerNamespace: owner.usernameLower,
+      ownerId: owner.id,
+      slug: "blocked",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    await service().ensureRepoCounters(id);
+    return id;
+  }
+
+  async function seedBlock(blockerId: number, blockeeId: number): Promise<void> {
+    await db().insert(userBlocking).values({ blockerId, blockeeId, note: "", createdAt: new Date() });
+  }
+
+  /** The site-admin identity router (the bypass cases — STUB_USER is frozen
+   *  at is_admin: false, so the default router cannot reach the arm). */
+  const adminRouter = () => {
+    const app = createApiRouter({
+      auth: { resolveToken: () => Promise.resolve({ ...STUB_USER, is_admin: true }) },
+    });
+    return async (path: string, init?: RequestInit): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, init), env);
+  };
+
+  it("POST /issues: a doer blocked by the repo owner answers 403 user is blocked (issue.go:625 → services/issue/issue.go:33-34)", async () => {
+    const owner = await seedUser("Alice");
+    await seedOwnedRepo(owner);
+    await seedBlock(owner.id, 1); // the repo owner blocks the stub doer
+
+    const res = await router()(`/repos/Alice/blocked/issues`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "opened while blocked" }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+  });
+
+  it("POST /issues: a site-admin doer bypasses the block (IsUserBlockedBy's IsAdmin arm, block.go:42-44)", async () => {
+    const owner = await seedUser("Alice");
+    await seedOwnedRepo(owner);
+    await seedBlock(owner.id, 1);
+
+    const res = await adminRouter()(`/repos/Alice/blocked/issues`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "opened by the site admin" }),
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it("PATCH /issues/{index}: a blocked poster cannot change the title or body (issue.go:104-106, content.go:21-23 via issue.go:780's EditIssue)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedOwnedRepo(owner);
+    const issue = await seedIssue(repoId, "authored before the block", { posterId: 1, content: "original body" });
+    await seedBlock(owner.id, 1);
+
+    const title = await router()(`/repos/Alice/blocked/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "retitled while blocked" }),
+    });
+    expect(title.status).toBe(403);
+    expect(await title.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+
+    const body = await router()(`/repos/Alice/blocked/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "edited while blocked" }),
+    });
+    expect(body.status).toBe(403);
+    expect(await body.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+  });
+
+  it("PATCH /issues/{index}: an unchanged title skips the arm (upstream guards UpdateIssue on actual change)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedOwnedRepo(owner);
+    const issue = await seedIssue(repoId, "same title", { posterId: 1 });
+    await seedBlock(owner.id, 1);
+
+    const res = await router()(`/repos/Alice/blocked/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "same title" }),
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it("POST comments: a doer blocked by the repo owner answers 403 (issue_comment.go:387 → services/issue/comments.go:63-65)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedOwnedRepo(owner);
+    const issue = await seedIssue(repoId, "comment target", { posterId: owner.id });
+    await seedBlock(owner.id, 1);
+
+    const res = await router()(`/repos/Alice/blocked/issues/${issue.index}/comments`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "commenting while blocked" }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+  });
+
+  it("POST comments: a repo-admin doer bypasses (IsUserRepoAdmin, repo_permission.go:532)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedOwnedRepo(owner);
+    const issue = await seedIssue(repoId, "comment target", { posterId: owner.id });
+    await seedBlock(owner.id, 1);
+    await db().insert(repoCollaborators).values({ repoId, userId: 1, mode: "admin", createdAt: new Date() });
+
+    const res = await router()(`/repos/Alice/blocked/issues/${issue.index}/comments`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "repo admins comment through blocks" }),
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it("PATCH comments/{id}: a blocked doer cannot edit (issue_comment.go:574 → services/issue/comments.go:106-108)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedOwnedRepo(owner);
+    const issue = await seedIssue(repoId, "comment target", { posterId: owner.id });
+    const comment = await service().addComment({ issueId: issue.id, posterId: 1, content: "mine first" });
+    await seedBlock(owner.id, 1);
+
+    const res = await router()(`/repos/Alice/blocked/issues/comments/${comment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "edited while blocked" }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
   });
 });

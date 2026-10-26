@@ -8,6 +8,7 @@ import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { repositoryListSchema, repositorySchema } from "../models/repository";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { requireCanCreateOrgRepo } from "../services/org-repos";
 import { createFork, findForkByOwner, listForks, toForkRepository } from "../services/forks";
 import {
@@ -199,6 +200,18 @@ export function registerForkRoutes(
       targetOwner = { id: org.id, usernameLower: org.usernameLower };
     } else {
       targetOwner = { id: doerRow.id, usernameLower: doerRow.usernameLower };
+    }
+
+    // ForkRepository's blocked arm (services/repository/fork.go:64-66): a
+    // doer blocked by the SOURCE owner answers 403 "user is blocked" —
+    // upstream CreateFork surfaces it through APIErrorAuto's permission-
+    // denied unwrap. Runs before the already-forked probe, exactly where
+    // upstream's check sits ahead of GetUserFork (site admins are never
+    // blocked-by, the IsUserBlockedBy bypass — the doer's admin flag is the
+    // authenticated identity's, the same source requireCanCreateOrgRepo
+    // reads).
+    if (await isUserBlockedBy(c.env.DB, { id: doerRow.id, isAdmin: doer.is_admin === true }, source.repo.ownerId ?? -1)) {
+      throw new ApiError(403, BLOCKED_USER_MESSAGE);
     }
 
     // `optional.FromPtr(form.Name).ValueOrDefault(repo.Name)` — the source's

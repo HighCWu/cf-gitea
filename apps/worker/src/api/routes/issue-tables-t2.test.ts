@@ -31,6 +31,7 @@ import {
   issues,
   repositories,
   trackedTimes,
+  userBlocking,
   users,
   webhookDeliveries,
   webhooks,
@@ -50,6 +51,7 @@ import { applyRepoExtrasDdl } from "../testing/repo-ddl";
 const TOKEN = "stub-token"; // resolves to STUB_USER (id 1) — the repo owner
 const TOKEN_NEIGHBOR = "neighbor-token"; // resolves to the non-writer neighbor
 const NOW = new Date("2026-02-03T04:05:06Z");
+const ERROR_URL = "https://example.com/api/swagger";
 const REPO_ID = "8400";
 const OTHER_REPO_ID = "8401";
 const VAULT_REPO_ID = "8402"; // private, owner 1 — the assignability-403 arm
@@ -162,6 +164,7 @@ beforeEach(async () => {
     "repo_counters",
     "commit_statuses",
     "repo_units",
+    "user_blocking",
     "repositories",
     "users",
   ]) {
@@ -958,5 +961,47 @@ describe("GET /repos/{owner}/{repo}/new_pin_allowed (repoNewPinAllowed)", () => 
 
   it("404s an invisible repo", async () => {
     expect((await send("/repos/cf-gitea-stub/ghost/new_pin_allowed")).status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The validateAssignee blocked arm (services/issue/assignee.go:169-170 via
+// issue_assignee.go AddIssueAssignees) — a doer blocked by a NEW assignee
+// answers 403 "user is blocked" (ErrBlockedUser via APIErrorAuto); an
+// already-assigned name skips the arm (AddAssignees' isAssigned continue,
+// assignee.go:216-222), and the site-admin doer bypasses (IsUserBlockedBy's
+// IsAdmin short-circuit, models/user/block.go:42-44).
+// ---------------------------------------------------------------------------
+
+describe("POST assignees: the validateAssignee blocked arm", () => {
+  const post = (assignees: string[], token = TOKEN) =>
+    send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/assignees`, {
+      method: "POST",
+      body: JSON.stringify({ assignees }),
+      headers: { "content-type": "application/json", Authorization: `token ${token}` },
+    });
+
+  it("403s when the doer is blocked by the assignee", async () => {
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: neighborId, blockeeId: 1, note: "", createdAt: NOW });
+    const res = await post(["neighbor"]);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+    expect(await drizzle(env.DB).select().from(issueAssignees).all()).toEqual([]);
+  });
+
+  it("skips the arm for an already-assigned name (AddAssignees' isAssigned continue)", async () => {
+    await drizzle(env.DB).insert(issueAssignees).values({ issueId: issueA.id, assigneeId: neighborId });
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: neighborId, blockeeId: 1, note: "", createdAt: NOW });
+    const res = await post(["neighbor"]);
+    expect(res.status).toBe(201);
+    expect(await drizzle(env.DB).select().from(issueAssignees).all()).toHaveLength(1);
+  });
+
+  it("a site-admin doer bypasses the block", async () => {
+    ownerIsAdmin = true;
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: neighborId, blockeeId: 1, note: "", createdAt: NOW });
+    const res = await post(["neighbor"]);
+    expect(res.status).toBe(201);
+    expect(await drizzle(env.DB).select().from(issueAssignees).all()).toHaveLength(1);
   });
 });

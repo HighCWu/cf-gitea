@@ -67,22 +67,50 @@ import { ApiError } from "../errors";
  * the repos/service.ts cancelTransfer convention; nothing else to reset —
  * no repositories status column tracks a pending transfer).
  *
- * DOCUMENTED FOLLOW-UPS (deliberately out of this batch's scope decision):
- *   - blocked-user VISIBILITY enforcement is not wired into any read path
- *     yet. Upstream enforces blocks at (map for the follow-up —
- *     `git grep -n "IsBlocked\|ErrBlockedUser" gitea/routers gitea/services`):
- *     follows (routers/api/v1/user/follower.go:235), stars
- *     (user/star.go:179), watches (user/watch.go:174), issue create/comment
- *     (repo/issue.go:625,780; issue_comment.go:387,574), reactions
- *     (issue_reaction.go:202,417), attachments
- *     (issue_comment_attachment.go:221), dependencies
- *     (CreateIssueDependency), assignees (repo/issue.go), collaborators
- *     (repo/collaborators.go:188), transfers (repo/transfer.go:118), team
- *     add-member (org/team.go:470), pulls (repo/pull.go:547,687), and the
- *     git push path (routers/private/hook_proc_receive.go:35, via
- *     IsUserBlockedBy in the receive hook). Those 403 "user is blocked"
- *     arms (ErrBlockedUser, models/user/block.go:21) are unreachable until
- *     that wiring lands.
+ * ENFORCEMENT WIRING (the wave-23 follow-up batch): the upstream 403
+ * "user is blocked" arms (ErrBlockedUser, models/user/block.go:21 — a
+ * permission-denied error, unwrapped to 403 by APIErrorAuto) are ported
+ * where the landed route families own the seam:
+ *   - issue create — assertNotBlockedForIssueCreate (services/issue/
+ *     issue.go:33-34 via repo/issue.go:625), wired in routes/issues.ts;
+ *   - issue title/content + comment create/edit —
+ *     assertNotBlockedForIssueContent (issue.go:104-106, content.go:21-23,
+ *     comments.go:63-65, 106-108 via issue.go:780 + issue_comment.go:387,
+ *     574), wired in routes/issues.ts;
+ *   - issue assignees — isUserBlockedBy(doer, assignee) (assignee.go:
+ *     169-170 via issue_assignee.go:212), wired in routes/issue-tables-t2.ts;
+ *   - comment attachments — assertNotBlockedForIssueContent
+ *     (issue_comment_attachment.go:218-227 via UpdateComment), wired in
+ *     routes/issue-attachments.ts;
+ *   - collaborator add — the both-directions probe (collaboration.go:35-37
+ *     via collaborators.go:188), wired in routes/collaborators.ts;
+ *   - fork create — isUserBlockedBy(doer, source owner) (fork.go:64-66 via
+ *     APIErrorAuto), wired in routes/forks.ts.
+ *
+ * REMAINING DOCUMENTED FOLLOW-UPS (seams outside this batch's file
+ * ownership — each needs the named module's owner or the orchestrator):
+ *   - follows (models/user/follow.go:39-40 via follower.go:235) — the write
+ *     half PUT /user/following/{username} lives in routes/identity.ts;
+ *   - stars (models/repo/star.go:34-35 via star.go:179) — routes/starred.ts;
+ *   - watches (models/repo/watch.go:170-171 via watch.go:174) —
+ *     routes/subscription.ts;
+ *   - reactions (services/issue/reaction.go:20-21, 41-42 via
+ *     issue_reaction.go:202,417) — routes/issue-t2.ts;
+ *   - transfer create (services/repository/transfer.go:464-466 via
+ *     transfer.go:118) — routes/repo.ts; the accept/reject seams
+ *     (repo-extras-t2.ts) carry no upstream arm (transfer.go's accept
+ *     handler has no ErrBlockedUser case);
+ *   - pulls (services/pull/pull.go:64-65 via pull.go:547,687) —
+ *     routes/pulls.ts;
+ *   - team add-member (services/org/team.go:248-249 via org/team.go:470) —
+ *     routes/org-teams.ts;
+ *   - the git push path (routers/private/hook_proc_receive.go:35) — the
+ *     git-http gate layer;
+ *   - READ-side seams with no 403 arm: mention filtering skips users
+ *     blocked by the doer (models/issues/issue_update.go:561) and xref
+ *     resolution degrades to no-op (models/issues/issue_xref.go:225) — both
+ *     land with the mention/xref engine seams; upstream has NO
+ *     issue-list visibility filter for blocked users.
  *   - the org-scope list renders blockees with the CALLER as the conversion
  *     doer; upstream passes the org row (`convert.ToUser(ctx, b.Blockee,
  *     blocker)` with blocker = the AsUser() org, shared/block.go:35) — with
@@ -95,6 +123,14 @@ import { ApiError } from "../errors";
 export const CANNOT_BLOCK_ORG_MESSAGE = "cannot block an organization";
 export const CANNOT_BLOCK_MESSAGE = "cannot block the user";
 export const CANNOT_UNBLOCK_MESSAGE = "cannot unblock the user";
+
+/**
+ * The exact upstream 403 arm (ErrBlockedUser —
+ * `util.NewPermissionDeniedErrorf("user is blocked")`, models/user/block.go:
+ * 21; the permission-denied unwrap answers http.StatusForbidden through
+ * APIErrorAuto, services/context/api.go:163-169).
+ */
+export const BLOCKED_USER_MESSAGE = "user is blocked";
 
 /** The exact upstream unknown-user 404 body (models/user/error.go:45-46). */
 export function userDoesNotExistMessage(name: string): string {
@@ -145,6 +181,76 @@ export async function isBlockedBy(d1: D1Database, blockerId: number, blockeeId: 
     .where(and(eq(userBlocking.blockerId, blockerId), eq(userBlocking.blockeeId, blockeeId)))
     .get();
   return row !== undefined;
+}
+
+/**
+ * `IsUserBlockedBy` (models/user/block.go:41-45): is `blockee` blocked by
+ * ANY of `blockerIds` — the enforcement probe every upstream write arm
+ * runs. A site-admin blockee is never blocked-by (the `blockee.IsAdmin`
+ * short-circuit); `HasBlocking` below is the raw probe.
+ */
+export async function isUserBlockedBy(
+  d1: D1Database,
+  blockee: { id: number; isAdmin: boolean },
+  ...blockerIds: number[]
+): Promise<boolean> {
+  if (blockee.isAdmin || blockerIds.length === 0) {
+    return false;
+  }
+  const rows = await drizzle(d1)
+    .select({ id: userBlocking.id })
+    .from(userBlocking)
+    .where(and(eq(userBlocking.blockeeId, blockee.id), inArray(userBlocking.blockerId, blockerIds)))
+    .all();
+  return rows.length > 0;
+}
+
+/**
+ * The issue-content write arm shared by the issue title edit
+ * (services/issue/issue.go:104-106), the issue content edit
+ * (services/issue/content.go:21-23), the comment create (services/issue/
+ * comments.go:63-65) and edit (:106-108), and the comment-attachment
+ * create (issue_comment_attachment.go:218-227 — via UpdateComment): a doer
+ * blocked by the issue poster OR the repo owner answers 403 "user is
+ * blocked" UNLESS they are a repo admin (`access_model.IsUserRepoAdmin` —
+ * the site-admin case is already covered by isUserBlockedBy's bypass, the
+ * repo-admin flag is the caller's permission matrix). Throws; returns on
+ * the clear path.
+ */
+export async function assertNotBlockedForIssueContent(
+  d1: D1Database,
+  doer: BlockDoer,
+  isRepoAdmin: boolean,
+  issuePosterId: number | null,
+  repoOwnerId: number | null,
+): Promise<void> {
+  if (isRepoAdmin) {
+    return;
+  }
+  const blockedBy = [issuePosterId, repoOwnerId].filter((id): id is number => id !== null && id !== doer.id);
+  if (await isUserBlockedBy(d1, { id: doer.id, isAdmin: doer.isAdmin }, ...blockedBy)) {
+    throw new ApiError(403, BLOCKED_USER_MESSAGE);
+  }
+}
+
+/**
+ * The NewIssue arm (services/issue/issue.go:33-34 via routers/api/v1/repo/
+ * issue.go:625): the issue POSTER must not be blocked by the repo owner —
+ * no repo-admin bypass on this arm (a repo admin blocked by the owner
+ * cannot open issues either; only the site-admin short-circuit applies).
+ * The `IsUserBlockedBy(poster, assigneeIDs...)` half of upstream's
+ * condition rides the create-request assignee resolution, which the landed
+ * POST /issues route drops (the issues.ts file-header deviation) — it
+ * becomes reachable when that support lands.
+ */
+export async function assertNotBlockedForIssueCreate(
+  d1: D1Database,
+  doer: BlockDoer,
+  repoOwnerId: number | null,
+): Promise<void> {
+  if (await isUserBlockedBy(d1, { id: doer.id, isAdmin: doer.isAdmin }, ...(repoOwnerId === null ? [] : [repoOwnerId]))) {
+    throw new ApiError(403, BLOCKED_USER_MESSAGE);
+  }
 }
 
 /**

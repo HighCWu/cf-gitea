@@ -21,7 +21,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { issueAttachments, comments, issues, repositories } from "../../db/schema";
+import { issueAttachments, comments, issues, repositories, userBlocking } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import type { AuthResolver } from "../auth";
@@ -239,6 +239,7 @@ beforeEach(async () => {
     "repo_collaborators",
     "repo_settings",
     "repo_counters",
+    "user_blocking",
     "repositories",
     "users",
   ]) {
@@ -841,3 +842,45 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 }
+
+// ---------------------------------------------------------------------------
+// The CreateIssueCommentAttachment blocked arm (issue_comment_attachment.go:
+// 218-227 — ErrBlockedUser rides UpdateComment, AFTER the write-permission
+// gate and AFTER the attachment row + bytes land; the repo-admin bypass is
+// IsUserRepoAdmin, repo_permission.go:532).
+// ---------------------------------------------------------------------------
+
+describe("POST comment assets: the UpdateComment blocked arm", () => {
+  it("403s a doer blocked by the repo owner and leaves the row behind (upstream lands the attachment before the check)", async () => {
+    const issue = await seedIssue({ posterId: 3 });
+    const commentId = await seedComment(issue, 2); // the reader's own comment — the write gate passes
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: 1, blockeeId: 2, note: "", createdAt: new Date() });
+
+    const res = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=blocked.bin`, {
+      method: "POST",
+      headers: { ...readerAuth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
+      body: "no",
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+    // Upstream's NewAttachment precedes the UpdateComment probe — the 403
+    // does not roll the attachment back.
+    const rows = await drizzle(env.DB).select().from(issueAttachments).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.commentId).toBe(commentId);
+  });
+
+  it("a repo-admin doer bypasses the block (IsUserRepoAdmin)", async () => {
+    const issue = await seedIssue({ posterId: 3 });
+    const commentId = await seedComment(issue, 2);
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: 1, blockeeId: 2, note: "", createdAt: new Date() });
+    await addOrUpdateCollaborator(env.DB, REPO_ID, 2, "admin", new Date());
+
+    const res = await makeApp()(`${REPO_PATH}/issues/comments/${commentId}/assets?name=admin.bin`, {
+      method: "POST",
+      headers: { ...readerAuth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
+      body: "ok",
+    });
+    expect(res.status).toBe(201);
+  });
+});
