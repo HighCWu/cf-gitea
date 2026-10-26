@@ -242,13 +242,14 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificat
  *  num_releases counter and the shared shell would pay a COUNT on every
  *  repo-scoped render for a label most repos never show (pages/releases.tsx
  *  header) — the releases PAGES render the real count in their header menu. */
-export type RepoTab = "code" | "issues" | "pulls" | "releases" | "commits";
+export type RepoTab = "code" | "issues" | "pulls" | "projects" | "releases" | "commits";
 
 /** Tab chrome text for the wave-3 tabs (the components/commit-list.tsx
  *  component-local pattern — locale.ts is shared and not this wave's file). */
 const tabLocale = {
   repo_issues: "Issues", // "repo.issues"
   repo_pulls: "Pull Requests", // "repo.pulls"
+  repo_projects: "Projects", // "repo.projects" (wave 45 — the projects tab)
   repo_releases: "Releases", // "repo.releases"
 } as const;
 
@@ -323,6 +324,23 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
               <Icon name="octicon-git-pull-request" /> {tabLocale.repo_pulls}
               {openPulls > 0 ? <span class="ui small label">{openPulls}</span> : null}
             </a>
+            {/* header.tmpl:146-154 — the projects tab (wave 45), gated on the
+                SAME unit condition as upstream (MustEnableRepoProjects → the
+                loaded repoHasProjects toggle). The count label is the
+                documented reduction (the repositories table carries no
+                project counters — the projects store's DEVIATION note; the
+                releases tab's precedent), and the icon is the landed set's
+                octicon-project-symlink (the org tab precedent — upstream's
+                octicon-project is not in the generated set). */}
+            {props.ctx.repoHasProjects ? (
+              <a
+                class={activeTab === "projects" ? "active item" : "item"}
+                href={`${repoLink}/projects`}
+                data-shortcut-keys="g b"
+              >
+                <Icon name="octicon-project-symlink" /> {tabLocale.repo_projects}
+              </a>
+            ) : null}
             {/* header.tmpl:157-161 — the releases tab (wave 20); the count
                 label is the documented reduction (RepoTab note). */}
             <a class={activeTab === "releases" ? "active item" : "item"} href={`${repoLink}/releases`} data-shortcut-keys="g r">

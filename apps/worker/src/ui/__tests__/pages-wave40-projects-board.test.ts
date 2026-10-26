@@ -314,13 +314,25 @@ describe("wave-40 parser claims", () => {
     expect(parseUiRoute(`/${owner}/-/projects/new/more`)).toBeNull();
     expect(handlesUiRoute(`/${owner}/-/projects/7/move`)).toBe(false);
     // The REPO-scoped shape (`/:owner/:repo/projects*` — upstream's
-    // repo-level projects group, a separate unlanded surface) stays
-    // engine-owned: the `/-` pseudo-segment is the owner namespace's claim,
-    // the owner handlers must never answer a real repo path.
-    expect(parseUiRoute(`/${owner}/some-repo/projects`)).toBeNull();
-    expect(parseUiRoute(`/${owner}/some-repo/projects/7`)).toBeNull();
-    expect(parseUiRoute(`/${owner}/some-repo/projects/new`)).toBeNull();
-    expect(parseUiRoute(`/${owner}/some-repo/projects/7/edit`)).toBeNull();
+    // repo-level projects group, web.go:1544-1563) was held engine-owned by
+    // this wave's restored `repo === "-"` guard "until the row is
+    // dispatched" — wave 45 (pages/repo-projects.tsx) dispatched it, so the
+    // four shapes flip from the unclaimed pins to the repo-projects
+    // families (the wave-37 title-link flip's protocol).
+    expect(parseUiRoute(`/${owner}/some-repo/projects`)).toEqual({ family: "repo-projects", owner, repo: "some-repo" });
+    expect(parseUiRoute(`/${owner}/some-repo/projects/7`)).toEqual({
+      family: "repo-project-board",
+      owner,
+      repo: "some-repo",
+      id: 7,
+    });
+    expect(parseUiRoute(`/${owner}/some-repo/projects/new`)).toEqual({ family: "repo-project-new", owner, repo: "some-repo" });
+    expect(parseUiRoute(`/${owner}/some-repo/projects/7/edit`)).toEqual({
+      family: "repo-project-edit",
+      owner,
+      repo: "some-repo",
+      id: 7,
+    });
   });
 });
 

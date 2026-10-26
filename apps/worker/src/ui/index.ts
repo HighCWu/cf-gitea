@@ -764,13 +764,34 @@ import {
   type WorkflowForm,
   WORKFLOW_EVENTS,
 } from "./pages/owner-project-board";
+// Wave-45 repo projects surface (the parity survey's re-ranked #1 — the
+// repo scope over the landed projects family; the owner-board precedent's
+// owner-agnostic shapes imported, the owner-bound ones adapted beside the
+// repo resolution + the has_projects unit toggle).
+import {
+  createRepoProjectFromForm,
+  createRepoWorkflowFromForm,
+  loadRepoProjectBoardData,
+  loadRepoProjectWorkflowsData,
+  loadRepoProjectsData,
+  repoProjectLink,
+  renderRepoProjectBoardPage,
+  renderRepoProjectEditPage,
+  renderRepoProjectNewPage,
+  renderRepoProjectsPage,
+  renderRepoProjectWorkflowsPage,
+  updateRepoWorkflowFromForm,
+} from "./pages/repo-projects";
+import { loadRepoSettings } from "../api/services/repo-settings";
 import {
   canManageOrgProjectWorkflows,
   canManageUserProjectWorkflows,
   cardTypeToString,
   changeProjectStatus,
   deleteProjectById,
+  findProjectById,
   findWorkflowByIdAndProject,
+  repoProjectScope,
   type ProjectRow,
 } from "../api/services/projects";
 // Wave-24 repo social lists + collaboration panel (the parity survey's bench
@@ -908,7 +929,6 @@ import {
   renderReleasesPage,
 } from "./pages/releases";
 import { listReleases } from "../api/services/releases";
-import { loadRepoSettings } from "../api/services/repo-settings";
 import {
   applyBranchProtectionForm,
   deleteRuleById,
@@ -1263,6 +1283,52 @@ export interface OwnerProjectBoardRoute {
   ;
   /** Decoded owner segment (user-or-org rows at resolve time). */
   owner: string;
+  /** The parsed board id (the numeric families; "new" carries none). */
+  id?: number;
+  /** open|close (the status family only). */
+  action?: "open" | "close";
+  /** The column id (the column-default family only). */
+  columnId?: number;
+  /** The workflow id (the workflows-with-wid and workflow-delete families). */
+  workflowId?: number;
+}
+
+/** The wave-45 repo projects families (pages/repo-projects.tsx): upstream's
+ *  `/{username}/{reponame}/projects` group (web.go:1544-1563 — the survey's
+ *  re-ranked #1, the F-family row the restored `repo === "-"` guard held):
+ *  the bare literal the LIST (repo.Projects), `/new` the write group's
+ *  GET+POST form combo, `/{id}` the board view (repo.ViewProject), the
+ *  `/{id}/edit|delete|open|close` project writes, `/{id}/columns/new` +
+ *  `/{id}/{columnID}/default` the form-compatible board-helper POSTs
+ *  (addProjectBoardRoutes' live half), and the
+ *  `/{id}/workflows[/{wid}[/delete]]` workflow tails (addProjectWorkflowRoutes
+ *  — repo.ProjectWorkflows → RenderWorkflows). The `new` literal outranks
+ *  the numeric `{id}` shapes (upstream registers it first, chi tree order);
+ *  the id shapes claim positive integers only — a junk segment stays
+ *  unclaimed → the engine's 404 (upstream's PathParamInt64-zero ServerError
+ *  arm, the landed uniform not-found answer). The board-helper arms whose
+ *  upstream methods are PUT/DELETE (`/{columnID}`) or whose controls are
+ *  pure drag-drop JSON fetches (`/move`, `/{columnID}/move`) stay unclaimed
+ *  → the engine's 404 — the owner-board posture, page module documents the
+ *  no-JS reductions. The group's gates (MustEnableRepoProjects reduced to
+ *  the loaded `repoHasProjects` toggle; the write ladder =
+ *  reqRepoProjectsWriter + RepoMustNotBeArchived → the shared repo write
+ *  gate) run at the handlers. */
+export interface RepoProjectsRoute {
+  family:
+    | "repo-projects" // GET /projects
+    | "repo-project-new" // GET+POST /projects/new
+    | "repo-project-board" // GET /projects/{id}
+    | "repo-project-edit" // GET+POST /projects/{id}/edit
+    | "repo-project-delete" // POST /projects/{id}/delete
+    | "repo-project-status" // POST /projects/{id}/open|close
+    | "repo-project-column-new" // POST /projects/{id}/columns/new
+    | "repo-project-column-default" // POST /projects/{id}/{columnID}/default
+    | "repo-project-workflows" // GET+POST /projects/{id}/workflows[/{wid}]
+    | "repo-project-workflow-delete" // POST /projects/{id}/workflows/{wid}/delete
+  ;
+  owner: string;
+  repo: string;
   /** The parsed board id (the numeric families; "new" carries none). */
   id?: number;
   /** open|close (the status family only). */
@@ -1708,6 +1774,7 @@ export type ParsedUiRoute =
   | OrgRepositoriesRoute
   | OwnerProjectsRoute
   | OwnerProjectBoardRoute
+  | RepoProjectsRoute
   | RepoSocialRoute
   | SettingsCollaborationRoute
   | TagsRoute
@@ -2381,6 +2448,70 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     return null;
   }
+  // Wave-45 repo projects families (pages/repo-projects.tsx — upstream
+  // web.go:1544-1563's group, the survey's re-ranked #1; the wave-40 flip
+  // kept these repo-scoped shapes unclaimed until this wave): the bare
+  // literal is the list; `/new` the write group's form combo (registered
+  // ahead of the {id} param upstream — chi static-before-dynamic); the {id}
+  // shapes claim positive integers only (the owner-board families'
+  // PathParamInt64 parity — "007" parses as 7; junk segments stay
+  // engine-owned where upstream's PathParamInt64-zero arm would
+  // ServerError). The PUT/DELETE board-helper arms (`/{columnID}`) and the
+  // drag-drop JSON arms (`/move`, `/{columnID}/move`) stay unclaimed → the
+  // engine's 404; every deeper tail likewise.
+  if (head === "projects") {
+    if (rest.length === 0) return { family: "repo-projects", owner, repo };
+    if (rest.length === 1 && rest[0] === "new") return { family: "repo-project-new", owner, repo };
+    if (/^\d+$/.test(rest[0] as string)) {
+      const id = Number.parseInt(rest[0] as string, 10);
+      if (rest.length === 1) return { family: "repo-project-board", owner, repo, id };
+      if (rest.length === 2) {
+        if (rest[1] === "edit") return { family: "repo-project-edit", owner, repo, id };
+        if (rest[1] === "delete") return { family: "repo-project-delete", owner, repo, id };
+        if (rest[1] === "open") return { family: "repo-project-status", owner, repo, id, action: "open" };
+        if (rest[1] === "close") return { family: "repo-project-status", owner, repo, id, action: "close" };
+        if (rest[1] === "workflows") return { family: "repo-project-workflows", owner, repo, id };
+      }
+      if (rest.length === 3) {
+        if (rest[1] === "columns" && rest[2] === "new") {
+          return { family: "repo-project-column-new", owner, repo, id };
+        }
+        if (rest[1] === "workflows" && /^\d+$/.test(rest[2] as string)) {
+          return {
+            family: "repo-project-workflows",
+            owner,
+            repo,
+            id,
+            workflowId: Number.parseInt(rest[2] as string, 10),
+          };
+        }
+        if (/^\d+$/.test(rest[1] as string) && rest[2] === "default") {
+          return {
+            family: "repo-project-column-default",
+            owner,
+            repo,
+            id,
+            columnId: Number.parseInt(rest[1] as string, 10),
+          };
+        }
+      }
+      if (
+        rest.length === 4 &&
+        rest[1] === "workflows" &&
+        /^\d+$/.test(rest[2] as string) &&
+        rest[3] === "delete"
+      ) {
+        return {
+          family: "repo-project-workflow-delete",
+          owner,
+          repo,
+          id,
+          workflowId: Number.parseInt(rest[2] as string, 10),
+        };
+      }
+    }
+    return null;
+  }
   // Wave-18 commit view (pages/commit-view.tsx — upstream web.go:1739): the
   // exact single-segment tail only, claimed for ANY segment value so a
   // non-hex sha 404-shells through the loader (the brief's rule) instead of
@@ -2745,6 +2876,12 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
   const repo = await resolveRepositoryForViewer(c.env, resolved.viewer, route.owner, route.repo);
   if (repo === null) return { ok: false, response: resolved.respond(c.html(renderNotFound(resolved.ctx), 404)) };
   resolved.ctx.repo = repo;
+  // The Projects unit toggle (wave-45 — repo_settings.has_projects, the
+  // landed store's MustEnableRepoProjects reduction): one PK read per
+  // repo-scoped request. The shell's Projects tab (upstream repo/header.
+  // tmpl:146-154 gates the tab on the SAME unit condition) and the
+  // /projects group's handlers both read this flag.
+  resolved.ctx.repoHasProjects = (await loadRepoSettings(c.env.DB, repo.id)).hasProjects;
   return { ...resolved, repo };
 }
 
@@ -5947,6 +6084,386 @@ async function repoLabelDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Res
 }
 
 // ---------------------------------------------------------------------------
+// The wave-45 repo projects surface (pages/repo-projects.tsx — upstream's
+// /{username}/{reponame}/projects group, web.go:1544-1563, the survey's
+// re-ranked #1): the list + board + write group + workflow tails over the
+// landed repo-scope service arms. Every family rides resolveUiRequest (the
+// §2.5 repo read — the requireVisibleRepo family; the wave-24 collaboration
+// handlers' composition), then the unit toggle, then — writes only — the
+// shared repo write ladder.
+// ---------------------------------------------------------------------------
+
+/** The wave-45 families' guard — the prologue accepts exactly these. */
+function isRepoProjectsRoute(route: ParsedUiRoute): route is RepoProjectsRoute {
+  return (
+    route.family === "repo-projects" ||
+    route.family === "repo-project-new" ||
+    route.family === "repo-project-board" ||
+    route.family === "repo-project-edit" ||
+    route.family === "repo-project-delete" ||
+    route.family === "repo-project-status" ||
+    route.family === "repo-project-column-new" ||
+    route.family === "repo-project-column-default" ||
+    route.family === "repo-project-workflows" ||
+    route.family === "repo-project-workflow-delete"
+  );
+}
+
+type ResolvedRepoProjects = Extract<ResolvedUiRequest, { ok: true }> & { route: RepoProjectsRoute };
+
+/**
+ * The group's shared prologue: the repo resolution (invisible repo → the
+ * 404 shell), then `repo.MustEnableRepoProjects` (repo/projects.go:43-58)
+ * reduced to the loaded `repoHasProjects` toggle (the read group's last
+ * arm; a disabled unit is the NotFound shell — the tab rides the same flag).
+ */
+async function resolveRepoProjectsRequest(
+  c: Context<{ Bindings: Env }>,
+): Promise<ResolvedRepoProjects | { ok: false; response: Response }> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved;
+  if (!isRepoProjectsRoute(resolved.route)) return { ok: false, response: await c.notFound() }; // drift guard
+  if (resolved.ctx.repoHasProjects !== true) {
+    return { ok: false, response: resolved.respond(c.html(renderNotFound(resolved.ctx), 404)) };
+  }
+  return { ...resolved, route: resolved.route };
+}
+
+/**
+ * The write group's gate (web.go:1562's reqRepoProjectsWriter +
+ * RepoMustNotBeArchived): the same ladder the wave-25 labels writes run —
+ * anonymous → the login 303, an archived repo or a signed-in non-writer →
+ * the 404 shell — reused verbatim. CanManageWorkflows' repo arm (the
+ * workflows' second layer, workflow.go:24-31) collapses into the same
+ * repo-wide writer (routes/projects-repo.ts's requireWorkflowManager
+ * reduction), so this one gate covers the workflow writes too.
+ */
+const repoProjectsWriteGate = repoLabelsWriteGate;
+
+/**
+ * The {id} families' shared depth: the group prologue, then the repo-scoped
+ * project read (GetProjectByID over `repoProjectScope(repo.id)` — another
+ * repo's id reads as not found, the upstream handlers' RepoID-mismatch arm
+ * folded into the scope condition). `route.id ?? 0` — the list/new families
+ * never reach here, and id 0 matches no row.
+ */
+async function resolveRepoProjectDepth(
+  c: Context<{ Bindings: Env }>,
+): Promise<Extract<ResolvedRepoProjects, { ok: true }> & { project: ProjectRow } | { ok: false; response: Response }> {
+  const resolved = await resolveRepoProjectsRequest(c);
+  if (!resolved.ok) return resolved;
+  const project = await findProjectById(c.env.DB, repoProjectScope(resolved.repo.id), resolved.route.id ?? 0);
+  if (project === null) return { ok: false, response: resolved.respond(c.html(renderNotFound(resolved.ctx), 404)) };
+  return { ...resolved, project };
+}
+
+/** GET /{owner}/{repo}/projects (repo.Projects — the list; every viewer who
+ *  can see the repo with the unit enabled). */
+async function repoProjectsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveRepoProjectsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond, route } = resolved;
+  if (route.family !== "repo-projects") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoProjectsData(c.env, c.env.DB, repo, viewer, url.searchParams);
+  return respond(c.html(renderRepoProjectsPage(ctx, data), 200));
+}
+
+/** GET /{owner}/{repo}/projects/new (repo.RenderNewProject — the write
+ *  group's form; the gate is the route group's, run before any render). */
+async function repoProjectNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveRepoProjectsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond, route } = resolved;
+  if (route.family !== "repo-project-new") return respond(await c.notFound()); // drift guard
+  const gate = await repoProjectsWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  return respond(
+    c.html(
+      renderRepoProjectNewPage({ ctx, repo, form: { title: "", content: "", templateType: "", cardType: "" }, error: null }),
+      200,
+    ),
+  );
+}
+
+/** POST /{owner}/{repo}/projects/new (repo.NewProjectPost): success 303s
+ *  onto the LIST (upstream's RepoLink+/projects Redirect), the binding
+ *  failures re-render at 200 with the message and the kept submission. */
+async function repoProjectNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveRepoProjectsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond, route } = resolved;
+  if (route.family !== "repo-project-new") return respond(await c.notFound()); // drift guard
+  const gate = await repoProjectsWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseProjectForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createRepoProjectFromForm(c.env.DB, repo, viewer.id, form, new Date());
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/projects` } }));
+  }
+  return respond(c.html(renderRepoProjectNewPage({ ctx, repo, form, error: result.message }), 200));
+}
+
+/** GET /{owner}/{repo}/projects/{id} (repo.ViewProject — the board). */
+async function repoProjectBoardPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { url, ctx, viewer, repo, respond, route, project } = depth;
+  if (route.family !== "repo-project-board") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoProjectBoardData(c.env, c.env.DB, repo, project, viewer, url.searchParams);
+  return respond(
+    c.html(renderRepoProjectBoardPage({ ctx, data, columnForm: { title: "", color: "" }, columnError: null }), 200),
+  );
+}
+
+/** GET /{owner}/{repo}/projects/{id}/edit (repo.RenderEditProject — the
+ *  pre-filled shared form; `?redirect=project` rides the hidden field). */
+async function repoProjectEditPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { url, ctx, repo, respond, route, project } = depth;
+  if (route.family !== "repo-project-edit") return respond(await c.notFound()); // drift guard
+  const gate = await repoProjectsWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const data = await loadRepoProjectBoardData(c.env, c.env.DB, repo, project, depth.viewer, new URLSearchParams());
+  return respond(
+    c.html(
+      renderRepoProjectEditPage({
+        ctx,
+        data,
+        form: {
+          title: project.title,
+          content: project.description,
+          templateType: "",
+          cardType: cardTypeToString(project.cardType),
+        },
+        error: null,
+        redirect: url.searchParams.get("redirect") ?? "",
+      }),
+      200,
+    ),
+  );
+}
+
+/** POST /{owner}/{repo}/projects/{id}/edit (repo.EditProjectPost): success
+ *  303s onto the board when the hidden `redirect=project` rode (upstream's
+ *  p.Link() Redirect), else onto the LIST; failures re-render at 200. */
+async function repoProjectEditSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { ctx, viewer, repo, respond, route, project } = depth;
+  if (route.family !== "repo-project-edit") return respond(await c.notFound()); // drift guard
+  const gate = await repoProjectsWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const formParams = await readUrlEncodedForm(c.req.raw);
+  const form = parseProjectForm(formParams);
+  const result = await updateProjectFromForm(c.env.DB, project, form, new Date());
+  if (result.outcome === "updated") {
+    const target =
+      formParams.get("redirect") === "project" ? repoProjectLink(repo, project) : `${repoLinkOf(repo)}/projects`;
+    return respond(new Response(null, { status: 303, headers: { location: target } }));
+  }
+  const data = await loadRepoProjectBoardData(c.env, c.env.DB, repo, project, viewer, new URLSearchParams());
+  return respond(
+    c.html(
+      renderRepoProjectEditPage({
+        ctx,
+        data,
+        form,
+        error: result.message,
+        redirect: formParams.get("redirect") ?? "",
+      }),
+      200,
+    ),
+  );
+}
+
+/** POST /{owner}/{repo}/projects/{id}/delete (repo.DeleteProject): the
+ *  cascade delete then the 303 onto the LIST (upstream's JSONRedirect
+ *  target). */
+async function repoProjectDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { respond, route, project } = depth;
+  if (route.family !== "repo-project-delete") return respond(await c.notFound()); // drift guard
+  const gate = await repoProjectsWriteGate(c, depth);
+  if (gate !== null) return gate;
+  await deleteProjectById(c.env.DB, project.id);
+  return depth.respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(depth.repo)}/projects` } }));
+}
+
+/** POST /{owner}/{repo}/projects/{id}/open|close
+ *  (repo.ChangeProjectStatus): the guarded flip then the 303 onto the board
+ *  (upstream's JSONRedirect → ProjectLinkForRepo). */
+async function repoProjectStatusSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { respond, route, project } = depth;
+  if (route.family !== "repo-project-status") return respond(await c.notFound()); // drift guard
+  const gate = await repoProjectsWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const action = route.action;
+  if (action !== "open" && action !== "close") return depth.respond(await c.notFound());
+  await changeProjectStatus(c.env.DB, project, action === "close", new Date());
+  return depth.respond(new Response(null, { status: 303, headers: { location: repoProjectLink(depth.repo, project) } }));
+}
+
+/** POST /{owner}/{repo}/projects/{id}/columns/new
+ *  (repo.AddColumnToProjectPost via addProjectBoardRoutes): the board
+ *  re-renders at 200 with the message + kept values on the failure arms,
+ *  303s onto the board on success. */
+async function repoProjectColumnNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { url, ctx, viewer, repo, respond, route, project } = depth;
+  if (route.family !== "repo-project-column-new") return respond(await c.notFound()); // drift guard
+  const gate = await repoProjectsWriteGate(c, depth);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseColumnForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createColumnFromForm(c.env.DB, project, viewer.id, form, new Date());
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: repoProjectLink(repo, project) } }));
+  }
+  const data = await loadRepoProjectBoardData(c.env, c.env.DB, repo, project, viewer, url.searchParams);
+  return respond(c.html(renderRepoProjectBoardPage({ ctx, data, columnForm: form, columnError: result.message }), 200));
+}
+
+/** POST /{owner}/{repo}/projects/{id}/{columnID}/default
+ *  (repo.SetDefaultProjectColumn): a foreign column id 404-shells, success
+ *  303s onto the board. */
+async function repoProjectColumnDefaultSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { ctx, respond, route, project } = depth;
+  if (route.family !== "repo-project-column-default") return respond(await c.notFound()); // drift guard
+  const gate = await repoProjectsWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const columnId = route.columnId;
+  if (columnId === undefined) return respond(await c.notFound());
+  const result = await setProjectDefaultColumnFromForm(c.env.DB, project, columnId, new Date());
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return depth.respond(new Response(null, { status: 303, headers: { location: repoProjectLink(depth.repo, project) } }));
+}
+
+/** The workflows re-render's shared tail (the ?workflow_id focus — an
+ *  unknown id 404-shells, RenderWorkflows' slices.ContainsFunc arm — then
+ *  the page). The ?event validation is the GET handler's arm (the POST
+ *  re-render must reach the page with the service's 422 message). */
+async function repoProjectWorkflowsReRender(
+  c: Context<{ Bindings: Env }>,
+  depth: Extract<ResolvedRepoProjects, { ok: true }> & { project: ProjectRow },
+  form: WorkflowForm,
+  error: string | null,
+): Promise<Response> {
+  const { url, ctx, viewer, repo, respond } = depth;
+  const data = await loadRepoProjectWorkflowsData(c.env, c.env.DB, repo, depth.project, viewer, url.searchParams);
+  if (depth.route.workflowId !== undefined) {
+    const focused = await findWorkflowByIdAndProject(c.env.DB, depth.route.workflowId, depth.project.id);
+    if (focused === null) return respond(c.html(renderNotFound(ctx), 404));
+    data.workflowId = depth.route.workflowId;
+  }
+  return respond(c.html(renderRepoProjectWorkflowsPage({ ctx, data, form, error }), 200));
+}
+
+/** GET /{owner}/{repo}/projects/{id}/workflows[/{wid}]
+ *  (repo.ProjectWorkflows → RenderWorkflows) — the read group gates it; the
+ *  edit arms ride canManage inside the render (the repo arm's collapse into
+ *  the writer grant — the page module's gate note). An unknown `?event=`
+ *  preselect 404-shells. */
+async function repoProjectWorkflowsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { respond, route } = depth;
+  if (route.family !== "repo-project-workflows") return respond(await c.notFound()); // drift guard
+  const event = depth.url.searchParams.get("event");
+  if (event !== null && event !== "" && !WORKFLOW_EVENTS.some((entry) => entry.event === event)) {
+    return depth.respond(c.html(renderNotFound(depth.ctx), 404));
+  }
+  return repoProjectWorkflowsReRender(c, depth, emptyWorkflowForm(event ?? ""), null);
+}
+
+/** POST /{owner}/{repo}/projects/{id}/workflows (CreateWorkflow): the
+ *  service 422s re-render at 200, success 303s onto the workflows page. */
+async function repoProjectWorkflowCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { respond, route } = depth;
+  if (route.family !== "repo-project-workflows") return respond(await c.notFound()); // drift guard
+  const gate = await repoProjectsWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const form = parseWorkflowForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createRepoWorkflowFromForm(c.env.DB, depth.repo, depth.project, form, new Date());
+  if (result.outcome === "created") {
+    return depth.respond(
+      new Response(null, { status: 303, headers: { location: `${repoProjectLink(depth.repo, depth.project)}/workflows` } }),
+    );
+  }
+  return repoProjectWorkflowsReRender(c, depth, form, result.message);
+}
+
+/** POST /{owner}/{repo}/projects/{id}/workflows/{wid} (UpdateWorkflow): the
+ *  same ladder; the quick enable/disable toggle POSTs only `enabled` and
+ *  keeps the stored rules (the replace-vs-toggle contract). */
+async function repoProjectWorkflowUpdateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { respond, route } = depth;
+  if (route.family !== "repo-project-workflows" || route.workflowId === undefined) {
+    return respond(await c.notFound()); // drift guard
+  }
+  const gate = await repoProjectsWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const workflow = await findWorkflowByIdAndProject(c.env.DB, route.workflowId, depth.project.id);
+  if (workflow === null) return depth.respond(c.html(renderNotFound(depth.ctx), 404));
+  const form = parseWorkflowForm(await readUrlEncodedForm(c.req.raw));
+  const result = await updateRepoWorkflowFromForm(c.env.DB, depth.repo, depth.project, workflow, form, new Date());
+  if (result.outcome === "updated") {
+    return depth.respond(
+      new Response(null, { status: 303, headers: { location: `${repoProjectLink(depth.repo, depth.project)}/workflows` } }),
+    );
+  }
+  return repoProjectWorkflowsReRender(c, depth, form, result.message);
+}
+
+/** POST /{owner}/{repo}/projects/{id}/workflows/{wid}/delete
+ *  (DeleteWorkflow): the same ladder, then the 303 onto the workflows page;
+ *  a foreign/unknown id 404-shells. */
+async function repoProjectWorkflowDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const depth = await resolveRepoProjectDepth(c);
+  if (!depth.ok) return depth.response;
+  const { respond, route } = depth;
+  if (route.family !== "repo-project-workflow-delete" || route.workflowId === undefined) {
+    return respond(await c.notFound()); // drift guard
+  }
+  const gate = await repoProjectsWriteGate(c, depth);
+  if (gate !== null) return gate;
+  const result = await deleteWorkflowFromForm(c.env.DB, depth.project, route.workflowId);
+  if (result.outcome === "missing") return depth.respond(c.html(renderNotFound(depth.ctx), 404));
+  return depth.respond(
+    new Response(null, { status: 303, headers: { location: `${repoProjectLink(depth.repo, depth.project)}/workflows` } }),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The wave-26 milestone detail + edit (pages/milestone-detail.tsx —
 // upstream web.go:1340's reader route and web.go:1427-1428's writer combo)
 // and the fork form (pages/repo-fork.tsx — web.go:1490's combo over the
@@ -6336,6 +6853,37 @@ uiRouter.post("/:owner/:repo/labels/edit", (c) => repoLabelEditSubmit(c));
 uiRouter.get("/:owner/:repo/labels/edit", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/labels/delete", (c) => repoLabelDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/labels/delete", () => methodNotAllowed("POST"));
+// Wave-45 repo projects (web.go:1544-1563 — pages/repo-projects.tsx): the
+// literal list + the write group's /new combo + the numeric-{id} board,
+// write and workflow shapes (chi static-before-dynamic — the literals
+// register ahead of the params; the parser mirrors the order). The {repo}
+// param carries the `[^-].*` constraint: a leading-dash segment is the
+// owner namespace's (`/:owner/-/projects*`, the wave-37/40 families) and
+// Hono must never route it here — the router-level twin of the parser's
+// `repo === "-"` guard (upstream chi ranks the static `/-` group first; no
+// landed slug starts with a dash, so the constraint claims nothing new).
+// The PUT/DELETE/JSON board-helper arms stay unregistered, exactly upstream.
+uiRouter.get("/:owner/:repo{[^-].*}/projects", (c) => repoProjectsPage(c));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/new", (c) => repoProjectNewPage(c));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/new", (c) => repoProjectNewSubmit(c));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id", (c) => repoProjectBoardPage(c));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/edit", (c) => repoProjectEditPage(c));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/edit", (c) => repoProjectEditSubmit(c));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/delete", (c) => repoProjectDeleteSubmit(c));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/open", (c) => repoProjectStatusSubmit(c));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/open", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/close", (c) => repoProjectStatusSubmit(c));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/close", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/columns/new", (c) => repoProjectColumnNewSubmit(c));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/columns/new", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/:columnId{\\d+}/default", (c) => repoProjectColumnDefaultSubmit(c));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/:columnId{\\d+}/default", () => methodNotAllowed("POST"));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/workflows", (c) => repoProjectWorkflowsPage(c));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/workflows", (c) => repoProjectWorkflowCreateSubmit(c));
+uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/workflows/:wid", (c) => repoProjectWorkflowsPage(c));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/workflows/:wid", (c) => repoProjectWorkflowUpdateSubmit(c));
+uiRouter.post("/:owner/:repo{[^-].*}/projects/:id/workflows/:wid/delete", (c) => repoProjectWorkflowDeleteSubmit(c));
 // Wave-26 milestone detail + edit + fork form (parseUiRoute claims exactly
 // these shapes — upstream web.go:1340's singular reader route,
 // web.go:1427-1428's `{id}/edit` writer combo (the shared labels-write gate

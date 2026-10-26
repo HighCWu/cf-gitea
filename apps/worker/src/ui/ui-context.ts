@@ -52,6 +52,13 @@ export interface UiContext {
    *  header + tab strip, mirroring upstream's `{{if .IsRepo}}` in the 404
    *  and page templates. */
   repo?: RepoRow;
+  /** The repo's Projects unit toggle (wave 45 — `repo_settings.has_projects`,
+   *  the landed store's MustEnableRepoProjects reduction; upstream keeps the
+   *  flag on the repository row itself). Set by the repo-scoped prologue
+   *  alongside `repo`; the shell's Projects tab (repo/header.tmpl:146-154
+   *  gates the tab on the same unit condition) and the `/projects` group's
+   *  handlers both read it. Absent = not loaded (non-repo requests). */
+  repoHasProjects?: boolean;
   /** Signed-in viewers only: the unread-notification count for the navbar
    *  bell (pages wave 10 — head_navbar_icons.tmpl's `.notification_count`
    *  badge; upstream PageGlobalData.GetNotificationUnreadCount parity, one
