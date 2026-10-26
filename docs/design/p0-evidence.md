@@ -2324,3 +2324,218 @@ where upstream answers 201 (cosmetic, untracked).
 
 *(REDEPLOY16, evidence appended by the redeploy-verification agent; all
 numbers verbatim from this run's commands.)*
+
+## Redeploy verification — 2026-10-26 12:04–12:30 UTC (20:04–20:30 CST), post-REDEPLOY16 mass (REDEPLOY17)
+
+Deploy shipped as ONE version: **`b928537a-02e8-486a-8f4d-f3b2c25cb354`** (100%,
+Created 2026-10-26T12:04:19.433Z per `wrangler deployments list`), deployed from
+tree **`7cd1ce9` CLEAN** (detached worktree `/tmp/rd17-go`; the tree-view unit
+landed as `831709f` minutes AFTER the GO was issued and was excluded by the
+worktree by construction — the orchestrator's GO named `7cd1ce9` explicitly), on
+https://cf-gitea.hecongw.workers.dev. Previous live version:
+`941ce4d0-2134-4ec6-8228-8f4523013b22` (the REDEPLOY16 block's version).
+Content shipped — the post-REDEPLOY16 mass, `2310623..7cd1ce9`, 4 commits in
+order: 64aa06a (docs tick-5), 2d64de1 (the REDEPLOY16 evidence itself), ee88c1b
+(**the toolkit generate-e2e failureTail + the GENERIC `--force-red <check-id>`
+self-test knob — REDEPLOY16's toolkit OPEN closing, rehearsed in production
+below**), 7cd1ce9 (**the attachments credential walk — token-first,
+session-cookie fall-through, error-fall-through per the pinned web group, with
+the rotation Set-Cookie re-wrapped on the session arm's responses — REDEPLOY16's
+medium-low closing, production-proven below**). Behavior-bearing in production:
+ONLY the attachments credential walk; the rest is docs/test/toolkit. Assets
+rebuilt: same pin `fc4936884584` (submodule verified unchanged, 0 dirty files).
+
+Deploy-tree methodology (REDEPLOY10–16 detached-worktree pattern): worktree at
+exactly `7cd1ce9`, warm `pnpm install --frozen-lockfile`, `git submodule update
+--init` (pin verified `fc4936884584`), `pnpm gen:icons` (39 icons, 15883
+bytes), the scratch-dir asset build (`build-gitea-assets.mjs --work
+/tmp/gitea-assets-build-rd17 --skip-install`, 17M into the worktree's
+`public/assets`) BEFORE the vitest gate, `.dev.vars` copied 0600. The main
+working tree was never modified by this agent (its sole write is this evidence
+block). Gates ran at `7cd1ce9` pre-GO; the worktree re-verified CLEAN (HEAD
+`7cd1ce9`, 0 tracked changes) immediately before `wrangler deploy` from it.
+Worktree + scratch asset dir + probe scratch removed after the run.
+
+Deploy gates — at `7cd1ce9` (worktree): `pnpm typecheck` **0 errors** (exit 0);
+`check:api` **PASS** (declared **490** ops/298 paths, tier-1 **78/78 paths,
+129/129 ops**); `check:contract` **PASS** (sha256 `529a3314…`, verbatim match —
+identical to REDEPLOY14/15/16's pin). Vitest run of record: **3544 passed |
+5 skipped (3549), 0 failed**, files **164 passed | 1 skipped (165)**, 86.09 s.
+**Zero failures, zero adjudications** — REDEPLOY16's two 30 s suite-load flakes
+(merge fork-head arms) did not recur; the fork-head arms passed inline (18.5 s +
+13.8 s). Total grew 3543 → 3549 with the mass (7cd1ce9's 32/32 attachments
+arms, ee88c1b's toolkit self-tests).
+
+Remote migrations: **ledger unchanged — 33 files in the tree, zero diff
+`2310623..7cd1ce9` in `src/db/migrations/`** (verified by git diff pre-deploy).
+Methodology deviation, disclosed: the explicit `wrangler d1 migrations apply`
+no-op ran POST-deploy from the main tree (whose migrations dir is identical to
+`7cd1ce9`'s by the same zero-diff proof) instead of pre-deploy from the
+worktree — with zero diff the order is immaterial: **"✅ No migrations to
+apply!" (33/33)**, and the smoke's migrate-check (below) independently confirms
+the remote schema.
+
+`pnpm smoke` equivalent (deploy-smoke.mjs `--migrate-check`, the run PAT as
+Basic password): **6 pass / 0 fail / 1 skip, exit 0**. Verbatim key lines:
+`[pass] healthz (2016 ms) — {"ok":true}`; `[pass] anon-git-surface (1808 ms) —
+probe-bd670a5d/probe-8658cf38.git: git-upload-pack 404 not-found,
+git-receive-pack 401 Basic challenge`; `[pass] receive-advert (258 ms) — advert
+ok (165 bytes)`; `[pass] push-lsremote (9133 ms) — pushed 0601858e61…, authed
+ls-remote sees refs/heads/main, anonymous advert 401 Basic challenge`;
+`[pass] cleanup (610 ms) — repo p0probe/smoke-c8123aa0 deleted`;
+`[pass] migrate-check (4799 ms) — all 19 expected tables present (+48
+system/aux: … issue_attachments …)`; bench-report skip (not requested).
+
+**THE TOOLKIT'S THIRD PRODUCTION RUN — 7 batteries green, plus the ee88c1b
+`--force-red` knob's first PRODUCTION rehearsals (two shapes, below).** The
+2310623 PAT-identity preflight passed silently again (one `GET /user`, match,
+no output — the fast-fail arms remain production-untriggered). Run from the
+deploy worktree, minted per-run PAT in a 0600 token file, base
+`https://cf-gitea.hecongw.workers.dev`, user `p0probe`. Battery-by-battery:
+
+- **p0** (`--fixture-oid 502abd2d…`) — 4/4 pass, exit 0:
+  `[pass] p0-shallow-since (4139 ms) — exit 128 — unsupported fetch argument
+  'deepen-since' (only depth-limited shallow fetches are supported)`;
+  `[pass] p0-shallow-exclude (2644 ms) — exit 128 — same shape naming
+  'deepen-not'`; `[pass] p0-depth-1 (2664 ms) — exit 0 — .git/shallow =
+  502abd2d55… (identical tip); depth 1; fsck clean`; `[pass] p0-privacy-anon
+  (5464 ms) — anonymous API GET 404, info/refs 401 (Basic realm="Gitea"), web
+  page 404 — the fixture stays private`. The brief's P0 trio + anon arms are
+  absorbed here.
+- **registry** (`--trials 2`) — 14/14 pass, exit 0: both trials create 201 →
+  advert settle (HEAD, refs/heads/main) → rename 200 → IMMEDIATE anonymous
+  carry → DELETE 204 → `[pass] tN-tombstone-t0 — exit 128 at t+0 — remote:
+  repository not found` → old name dead on both paths (git 128, API 404).
+- **generate-e2e** (`--strict-generated-clone`) — **10/10 pass, exit 0, GREEN
+  ON THE FIRST TRY this time** (REDEPLOY16's TLS-flake red did not recur):
+  template 201 (`tmpl-d3e813d9`) → real push (LICENSE on main + `dev`, both at
+  `7b7eee2b0a…`) → PATCH 200 + persisted → generate **201 with
+  `"empty":false`** (`gen-9cf767f1`) → refs carried at the identical tip →
+  `[pass] gen-generated-contents (2518 ms) — LICENSE round-trips verbatim;
+  last_commit_sha = the carried tip`; `[pass] gen-generated-clone (5200 ms) —
+  clone succeeded (exit 0)` under the HARD assert; `[pass] gen-cleanup (9584
+  ms) — gen-9cf767f1 + tmpl-d3e813d9 deleted`. The green run's failureTail
+  no-oped silently, as designed.
+- **forkpr-e2e** — 8/8 pass, exit 0 (third production evidence): base 201 →
+  org 201 → fork 202 → settle → fork push (`prbr-9065286d` at `3ec825505d…`) →
+  `[pass] forkpr-create-201 (3039 ms) — PR #1 created from head
+  prorg-462be06a:prbr-9065286d`; `[pass] forkpr-head-chain (1712 ms) — head
+  chain ok: prorg-462be06a/prbase-ac3a31c5#prbr-9065286d@3ec825505d… → base
+  main (mergeable true, head.ref refs/pull/1/head)`; cleanup deleted fork +
+  base + org (204s).
+- **mirror** — 8/8 pass, exit 0, FIRST TRY (second consecutive): `[pass]
+  mir-ssrf-loopback-refused (2695 ms) — 401 "Permission denied" — the loopback
+  target refused at the door; list still empty`; `[pass] mir-sync-settle
+  (1108 ms) — last_error names the target — the REDEPLOY13 verbatim 530 shape:
+  mirror target responded 530 for info/refs advertisement
+  [https://pmir-30a45b1d.invalid/dummy-unreachable.git/info/refs?service=git-receive-p…`;
+  `[pass] mir-row-settled (3917 ms) — sync_state='idle', next_sync_at=0
+  (--remote)`; delete 204, list [], repo deleted. The 30 s budget never came
+  under pressure (settle 1.1 s, third consecutive sub-2 s settle).
+- **ui-login** — 5/5 pass, exit 0: anonymous labels 200 with 0 "New Label";
+  `[pass] ui-login-303 (621 ms) — 303 + gitea_session cookie`; `[pass]
+  ui-labels-cookie-owner (442 ms) — 200 with 3 "New Label" occurrences +
+  small-menu-items — the owner arm renders`; cleanup 204.
+- **cleanup-audit** — run TWICE, both D1-only without any token. Run 1
+  (`--expect-tokens 3` — both run PATs still alive, see cleanup), all 10 pass:
+  `[pass] audit-query (2859 ms) — owner_repos=1 creating=0 action=0 stars=0
+  push_mirrors=0 protected_branches=0 repo_redirects=0 user_blocking=0
+  tokens=3`. Run 2 (after both deletes, `--expect-tokens 1`), all 10 pass:
+  `[pass] audit-query (3512 ms) — owner_repos=1 creating=0 … tokens=1`.
+
+**THE HAND SPOT-PROBE — the attachments re-probe: the 7cd1ce9 credential
+walk's FIRST PRODUCTION TRAFFIC, and the direct re-test of the arm REDEPLOY16
+found 404ing.** One private probe repo `p0probe/spot-rd17-2275e15f`
+(auto_init, 201) + issue #1 + `POST …/issues/1/assets?name=hello-rd17.txt`
+(multipart) → **201**, `uuid a7c6024a-7d23-430e-bbc3-248df3b2487c`, `size 32`,
+`browser_download_url …/attachments/a7c6024a-…`. `POST /login` → **303** +
+`gitea_session`. Then, verbatim from the probe:
+
+- **THE FIX ARM — the cookie-only owner GET: 200.** `GET /attachments/a7c6024a-…`
+  with ONLY the session cookie → **200** with the full ServeAttachment header
+  matrix, verbatim: `content-type: text/plain; charset=utf-8` (the Go sniff
+  table), `content-disposition: inline; filename=hello-rd17.txt` (upstream's
+  INLINE default), `content-security-policy: sandbox allow-scripts
+  allow-modals allow-popups allow-downloads`,
+  `x-content-type-options: nosniff`,
+  `access-control-expose-headers: Content-Disposition`,
+  `etag: W/"a7c6024a-7d23-430e-bbc3-248df3b2487c"`; body round-tripped
+  BYTE-EXACT. **REDEPLOY16's window saw this exact arm answer 404 for the
+  logged-in owner — the fix is production-proven.**
+- **The literal browser click**: following the payload's `browser_download_url`
+  field value with the cookie only → **200**, body BYTE-EXACT (the
+  REDEPLOY16 OPEN text's exact scenario: "a logged-in browser following
+  `browser_download_url` on a PRIVATE repo's asset").
+- **Token+session both present → token wins**: the same GET with the token
+  header AND the live session cookie → **200**, body byte-exact, and
+  **`Set-Cookie` count 0 — no session re-wrap** (upstream skips Session.Verify
+  once a token authenticates; the rotation directive rides only the session
+  arm's responses, exactly as the landed walk documents).
+- Token-only control → **200** (unchanged); anonymous → **404 "Not Found"**
+  (no existence leak, private repo); bogus uuid → **404**; dead cookie
+  (`gitea_session=deadbeef…`) → **404 with the clear directive present** (the
+  error-fall-through arm). Probe repo deleted **204**.
+
+**THE `--force-red` REHEARSALS — the ee88c1b knob's first production exercise,
+closing REDEPLOY16's toolkit OPEN text.** Both shapes against production
+(real creations, deterministic forced fail, real tail sweeps):
+
+- **Late red** (`generate-e2e --force-red gen-generated-contents`): 7 checks
+  pass for real (template `tmpl-a5324edf` + generated `gen-44733ccb` both
+  exist), `[fail] gen-generated-contents (0 ms) — FORCED RED`, clone + cleanup
+  chain-skip, then **`[tail] gen-leftover-sweep (best-effort failure cleanup)
+  — repo p0probe/gen-44733ccb deleted; repo p0probe/tmpl-a5324edf deleted`** —
+  BOTH swept, generated-first order, summary `"ok": false` as any red.
+- **Early red — the exact REDEPLOY16 incident shape**
+  (`--force-red gen-template-push`): `[pass] gen-create-template-201 (2392 ms)
+  — created p0probe/tmpl-299fd3d4`, FORCED fail, 9 chain-skips, then
+  **`[tail] gen-leftover-sweep … — repo p0probe/tmpl-299fd3d4 deleted`** —
+  template-ONLY, **no phantom generated delete** (the incident's leftover
+  shape, now self-healing), node exit **1** (captured unmasked — not through a
+  grep pipe). The following audit run 1 (above) proves the ground clean:
+  `owner_repos=1`, zero `tmpl-*`/`gen-*` survivors.
+
+Cleanup proof: every battery self-cleaned (registry tombs through their own
+DELETE step; generate/forkpr/ui/mirror/smoke repos all 204). Force-red
+rehearsal repos swept by the tails (both, verbatim above). Spot repo
+`spot-rd17-2275e15f` deleted 204 after the
+probes. Per-run credentials: TWO tokens minted (ids 38, 39 — the mint log's
+"id 4" line is the USER id, not a token id); the first mint's stdout was
+shredded before extraction (a regex slip — token shape is `cfg_` + 40 chars,
+no `_` separator to anchor on), orphaning token 38 in D1; BOTH were deleted by
+id via Basic-auth token CRUD → **204, 204**, and the surviving token verified
+**401** after delete. Token + cookie scratch + probe scripts shredded; raw
+mint stdout shredded. Final whole-table `personal_access_tokens` = **1** (the
+standing bootstrap PAT), proven by cleanup-audit run 2 alongside
+`owner_repos=1` (p0-shallow), `creating=0`, `action=0`, `stars=0`,
+`push_mirrors=0`. Worktree, scratch asset dir, and probe logs removed;
+`gitea/` pristine (0 dirty files, pin `fc4936884584`).
+
+**RESOLVED this deployment — BOTH of REDEPLOY16's OPEN issues:**
+
+1. **(medium-low, the attachments token-only walk)** — closed by 7cd1ce9's
+   credential walk (token-first, session fall-through, error-fall-through,
+   rotation re-wrap on the session arm); production-proven by the re-probe
+   above: the cookie-only owner GET answers **200** with the full header
+   matrix and byte-exact body, the `browser_download_url` click **200**s, and
+   the both-present arm proves token-wins with zero session re-wrap.
+2. **(low, the toolkit generate-e2e leftover sweep)** — closed by ee88c1b's
+   `failureTail` + the generic `--force-red` knob; production-proven by both
+   rehearsals above (late red → both repos swept; the incident's early-red
+   shape → template-only sweep, no phantom, following audit green).
+
+The ws1009 runner-death class stays at 0 (no `Worker exited unexpectedly` in
+the run of record).
+
+**OPEN ISSUES carried unchanged:** the repo payload's `fork`/`parent`/`mirror`
+fields remain the SPEC-0005 serializer stubs; the bare `owner:branch` PR head
+form with a renamed fork answers 404 (documented in-code divergence); API tag
+create answers 200 where upstream answers 201 (cosmetic, untracked). NEW
+methodology friction (this agent only, no product impact): the bootstrap mint
+stdout is the ONLY copy of the token — extract the token BEFORE shredding, and
+anchor extraction on the line start (`^\s*cfg_`), not an internal shape
+regex; an orphaned mint is recoverable (delete by id via the tokens list), but
+avoid minting twice.
+
+*(REDEPLOY17, evidence appended by the redeploy-verification agent; all
+numbers verbatim from this run's commands.)*
