@@ -315,7 +315,16 @@ export function toApiRepository(
     fork: false, // TODO(SPEC-0005): forks (SPEC-0003 fork primitives)
     template: row.isTemplate, // is_template (migration 0027) — templates + generate (routes/generate-repo.ts)
     mirror: false, // TODO(SPEC-0005): mirrors
-    size: 0, // TODO(SPEC-0005): engine-computed size (KiB), persisted at rest
+    // Upstream renders `Size: int(repo.Size / 1024)` (convert/repository.go:207
+    // — Go integer division = the KB integer). Upstream's stored Size folds
+    // LFS in (models/repo/update.go:110 `Size: gitSize + lfsSize`); ours is
+    // the GIT footprint only — upstream CalRepositorySize's scope
+    // (modules/git/size.go:15-39, the git-dir walk) mapped onto the repo's R2
+    // `repos/<storage_key>/` prefix and settled into the column by
+    // services/repo-size.ts at upstream's recompute points (push/fork/
+    // generate). 0 = empty repo; the column backfills 0 until the next
+    // settle leg.
+    size: row.sizeKb,
     language: "", // TODO(SPEC-0005): engine language statistics
     languages_url: `${apiUrl}/languages`,
     html_url: htmlUrl,

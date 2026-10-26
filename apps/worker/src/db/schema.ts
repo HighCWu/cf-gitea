@@ -115,6 +115,25 @@ export const repositories = sqliteTable(
      *  copies (api/routes/generate-repo.ts). NOT NULL DEFAULT FALSE per the
      *  upstream column default; the ALTER backfills existing rows false. */
     isTemplate: integer("is_template", { mode: "boolean" }).notNull().default(false),
+    // -------------------------------------------------------------------------
+    // Settle-time repo size (wave-repo-size) — upstream's size accounting,
+    // Kept LAST like fork_parent/is_mirror/is_template above — ALTER TABLE
+    // ADD COLUMN physically appends, so the table_info order stays the
+    // migration order.
+    // -------------------------------------------------------------------------
+    /** Upstream `Repository.Size int64` (repo.go:203) rendered as the API
+     *  `size` KB integer (services/convert/repository.go:207
+     *  `Size: int(repo.Size / 1024)`). Upstream stores BYTES (git + LFS,
+     *  models/repo/update.go:110) and divides at render; we store the settled
+     *  KiB directly — the floored KB value the API serves. The byte source is
+     *  upstream's CalRepositorySize scope (modules/git/size.go:15-39 — the
+     *  git-directory walk) mapped onto our storage: the R2 `repos/<key>/`
+     *  prefix (packs + staging + clone cache, packages/git-engine
+     *  src/git/r2keys.ts), summed by services/repo-size.ts at the settle
+     *  points upstream recomputes (push.go:81, fork.go:190, generate.go:295).
+     *  NULL-free DEFAULT 0 = the empty repo (ALTER backfills existing rows
+     *  0; the next settle leg over the prefix re-accounts them). */
+    sizeKb: integer("size_kb").notNull().default(0),
   },
   (t) => [
     // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point

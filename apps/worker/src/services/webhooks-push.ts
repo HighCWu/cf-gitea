@@ -75,10 +75,12 @@
  * The notification family is not the only onPush consumer:
  * `markStaleReviewsOnPush` (SPEC-0013 §3.4) rides the same seam beside
  * `emitPushFamilyUpdates` — the head-push stale/dismiss maintenance for open
- * PRs on the pushed branch — and so does the repo_license settle leg
+ * PRs on the pushed branch — the repo_license settle leg
  * (`syncRepoLicensesFromCell`, services/repo-licenses.ts — upstream
  * push.go:160-174's default-branch license updater, the same never-fail
- * posture).
+ * posture) and the repo-size settle leg (`syncRepoSizeFromStorage`,
+ * services/repo-size.ts — upstream push.go:74-83's post-apply
+ * UpdateRepoSize, every applied delta, the same never-fail posture).
  */
 
 import type { CommitJson, DiffResult, PushEvent } from "@cf-gitea/git-engine";
@@ -107,6 +109,7 @@ import {
 } from "../issues/webhooks";
 import { engineName, type RepoRow } from "../repos/service";
 import { syncRepoLicensesFromCell } from "./repo-licenses";
+import { syncRepoSizeFromStorage } from "./repo-size";
 import { findRule, parseRuleConfig } from "./branch-protection";
 
 /** DismissApprovalReviews' fixed comment text (services/pull/review.go:362). */
@@ -122,7 +125,7 @@ export const DISMISS_STALE_MESSAGE =
  * producer probe below looks it up structurally so a binding gap degrades to
  * `pending` delivery rows instead of a type-level requirement.
  */
-export interface WebhookPushEnv extends Pick<Env, "DB" | "REPO"> {
+export interface WebhookPushEnv extends Pick<Env, "DB" | "REPO" | "REPO_PACKS"> {
   /** Upstream `setting.AppURL` — the instance origin the §2.7 payload URLs
    *  are built against. Optional IN THIS SLICE (the generated Env types the
    *  declared var as required): HTTP paths take the origin from the request,
@@ -827,6 +830,21 @@ export async function handleUserPushEvent(env: WebhookPushEnv, event: PushEventL
   } catch (error) {
     console.error(
       `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: license sync failed (the applied push stands): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // The repository size rides the same settle seam (upstream
+  // services/repository/push.go:74-83: UpdateRepoSize runs ONCE per applied
+  // receive, before the per-ref loop — no ref filter, unlike the license
+  // leg's default-branch gate). The R2 walk is metadata-only (list, no
+  // bodies); same never-fail-the-push posture: caught and logged, the
+  // applied push stands — runs inside the engine's onPush waitUntil like the
+  // legs above.
+  try {
+    await syncRepoSizeFromStorage(env.REPO_PACKS, env.DB, pair.repo);
+  } catch (error) {
+    console.error(
+      `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: size sync failed (the applied push stands): ` +
         `${error instanceof Error ? error.message : String(error)}`,
     );
   }

@@ -58,6 +58,7 @@ const ctx: UiContext = {
     isMirror: false,
     originalUrl: null,
     isTemplate: false,
+    sizeKb: 0,
   } satisfies RepoRow,
 };
 

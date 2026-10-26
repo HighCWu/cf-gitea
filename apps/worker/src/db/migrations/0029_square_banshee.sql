@@ -1,0 +1,1 @@
+ALTER TABLE `repositories` ADD `size_kb` integer DEFAULT 0 NOT NULL;

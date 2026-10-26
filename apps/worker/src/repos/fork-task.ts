@@ -52,6 +52,7 @@ import { apiUserFromRow, findRepositoryById, toApiRepository, type Viewer } from
 import { repositories } from "../db/schema";
 import { emitRepoEventInline, forkEventPayload } from "../services/repo-events";
 import { appOrigin } from "../services/webhooks-push";
+import { syncRepoSizeFromStorage } from "../services/repo-size";
 import type { RepoRow } from "./service";
 
 /** REPO_TASKS message of the fork family (the `{kind: "repo-fork", …}` shape
@@ -156,6 +157,19 @@ export async function handleForkMessage(env: Env, msg: RepoForkMessage): Promise
  * `beginForkImport` refuses with "fork target is not empty" — that exact
  * refusal is the documented already-done success. Every other failure
  * throws (the queue retry arm / the route's error mapping).
+ *
+ * SIZE SETTLE (upstream services/repository/fork.go:190 / generate.go:295 —
+ * UpdateRepoSize right after the copy): once the replication lands (or is
+ * found already-finalized), the copy's byte footprint is re-accounted from
+ * the FORK's own `repos/<fork.storage_key>/` prefix and persisted — the
+ * fork inherits the source's footprint because it just received a physical
+ * pack copy into that prefix (never copied from the source's column: the
+ * numbers must describe the fork's own storage). generate-repo.ts rides the
+ * same pass, so the generated repo settles its inherited footprint too.
+ * Accounting failures never fail the replication (upstream fork.go:189-192's
+ * "even if below operations failed, it could be ignored" posture — and a
+ * throw here would loop the queue redelivery past an already-committed
+ * copy): logged, size keeps its previous settled value until the next leg.
  */
 export async function replicateRepoCopy(env: Env, source: RepoRow, fork: RepoRow): Promise<void> {
   const parentCell = env.REPO.getByName(`${source.ownerNamespace}/${source.slug}`);
@@ -184,6 +198,15 @@ export async function replicateRepoCopy(env: Env, source: RepoRow, fork: RepoRow
     // A committed finalize is already in place: the replication is done.
   }
   void result; // counts are observability-only today (no D1 columns for them)
+
+  try {
+    await syncRepoSizeFromStorage(env.REPO_PACKS, env.DB, fork);
+  } catch (error) {
+    console.error(
+      `[repo-tasks] fork ${fork.id}: size settle failed (the copied fork stands): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 /**
