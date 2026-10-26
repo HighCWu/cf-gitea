@@ -254,7 +254,14 @@ describe("wave-8 parser families (parseUiRoute / handlesUiRoute)", () => {
       owner: "octo",
       repo: "hello",
     });
-    expect(parseUiRoute("/octo/hello/milestones/1/edit")).toBeNull(); // the wave-6 table row, unchanged
+    // Wave 26 claimed the shape (the survey's TOP-3 row) — the edit combo
+    // parses into MilestoneEditRoute now.
+    expect(parseUiRoute("/octo/hello/milestones/1/edit")).toEqual({
+      family: "milestone-edit",
+      owner: "octo",
+      repo: "hello",
+      id: "1",
+    });
     expect(handlesUiRoute("/octo/hello.git/git-receive-pack")).toBe(false); // protocol paths stay engine-owned
   });
 });

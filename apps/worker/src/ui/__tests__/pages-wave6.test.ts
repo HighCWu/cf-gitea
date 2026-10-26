@@ -338,9 +338,12 @@ describe("milestones list (/{owner}/{repo}/milestones)", () => {
     expect(closed.html).not.toContain("v1.0");
   });
 
-  it("deeper milestones tails stay unclaimed (the write routes are not in this slice)", async () => {
+  it("the {id}/edit tail is wave 26's edit page (anonymous 303s onto login); the other write tails stay engine-owned", async () => {
     const res = await fetchUi("/alice/golden-ms/milestones/1/edit");
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toContain("/login?redirect_to=");
+    expect((await fetchUi("/alice/golden-ms/milestones/1/close")).status).toBe(404);
+    expect((await fetchUi("/alice/golden-ms/milestones/delete")).status).toBe(404);
   });
 
   it("shows the New Milestone button to the admin viewer only (the form 404-shells non-admins)", async () => {

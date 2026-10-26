@@ -214,7 +214,10 @@ describe("parseUiRoute", () => {
     ["/octo/hello/milestones", { family: "milestones", owner: "octo", repo: "hello" }],
     ["/octo/hello/milestones/new", { family: "milestone-new", owner: "octo", repo: "hello" }],
     ["/octo/hello/milestones/1", null], // the deeper write tails stay engine-owned
-    ["/octo/hello/milestones/1/edit", null],
+    // Wave 26: the `{id}/edit` combo and the singular `/milestone/{id}`
+    // detail route claim their shapes (the survey's TOP-3 row).
+    ["/octo/hello/milestones/1/edit", { family: "milestone-edit", owner: "octo", repo: "hello", id: "1" }],
+    ["/octo/hello/milestone/1", { family: "milestone-detail", owner: "octo", repo: "hello", id: "1" }],
     [
       "/octo/hello/commits/branch/feature%20one/file.md",
       { family: "commits", owner: "octo", repo: "hello", refSuffix: "branch/feature one/file.md" },

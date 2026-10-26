@@ -52,17 +52,17 @@
  *
  * ## Documented v1 degradations (§6 method)
  *
- * - The milestone title renders as PLAIN TEXT: upstream links
- *   `/{repo}/milestone/{id}` — no milestone detail page exists; the §2.4.1
- *   "dead links are not emitted" rule wins (the issues list's milestone
- *   badge does the same).
+ * - The row's milestone description block is not rendered (upstream renders
+ *   it through the markdown pipeline; the create form still stores it) —
+ *   wave 26 renders it on the milestone DETAIL page instead
+ *   (pages/milestone-detail.tsx, which the row's title link and the
+ *   writer's per-row Edit link now target).
  * - The issue-navbar compact menu reduces to the single live item
  *   (Milestones): the Labels list page does not exist (dead-link rule).
- * - The row admin controls (edit / close / delete links + the delete
- *   confirm modal) are not rendered — none of those routes or pages exist
- *   in the UI inventory this slice.
- * - The row's milestone description block is not rendered (upstream renders
- *   it through the markdown pipeline; the create form still stores it).
+ * - The row's close/delete controls are not rendered — upstream's
+ *   `/{id}/{action}` and `/delete` write routes have no pages in this UI's
+ *   inventory (the §2.4.1 "dead links are not emitted" rule; the Edit link
+ *   is live — pages/milestone-detail.tsx's edit form).
  * - The search box and the `?sort=` / `?q=` facets are not wired (no search
  *   route); the state facet is.
  * - Total tracked time has no landed source (no timetracker) — the clock
@@ -149,6 +149,11 @@ export interface MilestonesData {
    *  the route handler after the load — the predicate needs the resolved
    *  repo row + viewer, which the loader deliberately never sees. */
   canWrite: boolean;
+  /** The ISSUES-writer grant (upstream `(or .CanWriteIssues .CanWritePulls)`
+   *  verbatim — the landed canWriteRepo port) behind the wave-26 per-row
+   *  Edit link (pages/milestone-detail.tsx's edit form). Also assigned by
+   *  the handler after the load. */
+  canWriteIssues: boolean;
 }
 
 /** `?state=` — anything but "closed" is open (upstream `isShowClosed :=
@@ -201,6 +206,7 @@ export async function loadMilestonesData(
     closedCount: closedPage.total,
     more: page * MILESTONES_PAGE_SIZE < listPage.total,
     canWrite: false, // the handler assigns the real predicate (see MilestonesData)
+    canWriteIssues: false, // ditto (the wave-26 Edit link's gate)
   };
 }
 
@@ -267,8 +273,9 @@ export async function createMilestoneFromForm(
 /** The issue-navbar compact menu (repo/issue/navbar.tmpl) — wave 25 adds
  *  the Labels item (the page exists now: pages/repo-labels.tsx); upstream's
  *  order renders Labels first, Milestones second, each active on its own
- *  page. */
-function MilestoneNavbar(props: { repoLink: string }) {
+ *  page. Wave 26 exports it for the milestone-detail module's edit form
+ *  (the template's PageIsEditMilestone arm renders the same navbar). */
+export function MilestoneNavbar(props: { repoLink: string }) {
   return (
     <h2 class="ui compact small menu small-menu-items issue-list-navbar">
       <a class="item" href={`${props.repoLink}/labels`}>
@@ -328,14 +335,21 @@ function MilestonesPagination(props: { basePath: string; state: "open" | "closed
 }
 
 /** One `.item.flex-relaxed-list` row of milestones.tmpl (reductions in the
- *  module header). */
-function MilestoneListItemRow(props: { item: MilestoneListItem }) {
+ *  module header). Wave 26: the title links onto the milestone DETAIL page
+ *  (upstream's `<a class="muted" href="{RepoLink}/milestone/{id}">`) and
+ *  the writer's per-row Edit link renders beside the counts (upstream's
+ *  admin-controls div reduced to the live link — the close/delete POSTs
+ *  stay unrendered). */
+function MilestoneListItemRow(props: { item: MilestoneListItem; repoLink: string; canWriteIssues: boolean }) {
   const { row, completeness } = props.item;
   return (
     <div class="item flex-relaxed-list">
       <div class="flex-left-right">
         <span class="list-item-large-title">
-          <Icon name="octicon-milestone" size={16} /> {row.name}
+          <Icon name="octicon-milestone" size={16} />{" "}
+          <a class="muted" href={`${props.repoLink}/milestone/${row.id}`}>
+            {row.name}
+          </a>
         </span>
         <div class="flex-text-inline">
           <span>{completeness}%</span>
@@ -378,6 +392,13 @@ function MilestoneListItemRow(props: { item: MilestoneListItem }) {
             )}
           </div>
         </div>
+        {props.canWriteIssues ? (
+          <div class="flex-text-block tw-flex-wrap">
+            <a class="flex-text-inline" href={`${props.repoLink}/milestones/${row.id}/edit`}>
+              <Icon name="octicon-pencil" size={14} /> Edit
+            </a>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -411,7 +432,11 @@ export function MilestonesPage(props: { ctx: UiContext; data: MilestonesData }) 
         <MilestoneTabs basePath={`${repoLink}/milestones`} state={data.state} openCount={data.openCount} closedCount={data.closedCount} />
         <div class="flex-divided-list milestone-list">
           {data.items.map((item) => (
-            <MilestoneListItemRow item={item} />
+            <MilestoneListItemRow
+              item={item}
+              repoLink={repoLink}
+              canWriteIssues={data.canWriteIssues && !repo.isArchived}
+            />
           ))}
         </div>
         <MilestonesPagination basePath={`${repoLink}/milestones`} state={data.state} page={data.page} more={data.more} />

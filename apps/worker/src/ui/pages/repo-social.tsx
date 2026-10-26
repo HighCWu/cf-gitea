@@ -107,6 +107,12 @@ export const repoSocialLocale = {
   pulls_aria: "Pull Requests", // "repo.pulls"
   stars_aria: "Stars", // "repo.stars"
   no_results: "No matching results found.", // "search.no_results"
+  /** Wave 26: the forks page's entry button onto the fork-create form
+   *  (pages/repo-fork.tsx — the repo header's fork button is the shell's
+   *  deliberately-empty right side, so the list page carries the family's
+   *  entry point; anonymous viewers land on `/login`, upstream
+   *  header/fork.tmpl's `forkHref` guest arm at our SPEC-0010 literal). */
+  fork: "Fork", // "repo.fork"
 } as const;
 
 /** Upstream `setting.ItemsPerPage` (modules/setting/repository.go:30) — the
@@ -335,7 +341,21 @@ export function RepoSocialPage(props: { ctx: UiContext; data: RepoSocialData }) 
       <div class="ui container">
         {data.family === "forks" ? (
           <div class="fork-list">
-            <h2 class="ui dividing header">{title}</h2>
+            <div class="flex-left-right">
+              <h2 class="ui dividing header">{title}</h2>
+              {/* The wave-26 fork-form entry button (header/fork.tmpl's
+                  shape, reduced to the text-only button — the octicon-
+                  repo-forked glyph is outside the generated allowlist this
+                  slice does not extend). The icon-less anchor carries the
+                  accessible name. */}
+              <a
+                role="button"
+                class="ui compact small basic button"
+                href={ctx.viewer.kind === "user" ? `${repoLink}/fork` : "/login"}
+              >
+                {repoSocialLocale.fork}
+              </a>
+            </div>
             {data.forks.length === 0 ? (
               <div>{repoSocialLocale.no_results}</div>
             ) : (

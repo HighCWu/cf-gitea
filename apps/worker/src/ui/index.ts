@@ -375,6 +375,32 @@
  *                                          shells; GET → 405;
  *                                          /labels/initialize stays
  *                                          unclaimed — no template catalog)
+ *   /:owner/:repo/milestone/{id}          milestone detail, GET (pages/
+ *                                          milestone-detail.tsx — wave 26;
+ *                                          the survey's TOP-3 row, upstream
+ *                                          web.go:1340's SINGULAR literal;
+ *                                          the milestone's issues+pulls list
+ *                                          with the open/closed tabs and the
+ *                                          writer's Edit button; anonymous-
+ *                                          capable; unknown/foreign ids 404)
+ *   /:owner/:repo/milestones/{id}/edit    milestone edit form, GET + POST
+ *                                          (pages/milestone-detail.tsx —
+ *                                          web.go:1427-1428's writer combo;
+ *                                          the labels-write gate; POST → the
+ *                                          landed editRepoMilestone → 303
+ *                                          onto the list; the close/open +
+ *                                          delete write tails stay
+ *                                          unclaimed)
+ *   /:owner/:repo/fork                    fork-create form, GET + POST
+ *                                          (pages/repo-fork.tsx — wave 26;
+ *                                          the survey's TOP-5 row, upstream
+ *                                          web.go:1490's combo; the owner
+ *                                          select over the doer + the
+ *                                          can-create orgs, POST → the
+ *                                          landed createFork sequence →
+ *                                          303 onto the fork's home;
+ *                                          anonymous 303s onto /login, an
+ *                                          empty source 404s)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -569,6 +595,23 @@ import {
   parseRepoLabelForm,
   renderRepoLabelsPage,
 } from "./pages/repo-labels";
+// Wave-26 milestone detail + edit and the fork form (the parity survey's
+// TOP-3 and TOP-5 rows — the milestone row's dead ends and the fork-create
+// form over the landed createFork machinery).
+import {
+  editMilestoneFromForm,
+  loadMilestoneDetailData,
+  loadMilestoneEditData,
+  milestoneEditFormOf,
+  renderMilestoneDetailPage,
+  renderMilestoneEditPage,
+} from "./pages/milestone-detail";
+import {
+  createForkFromForm,
+  loadRepoForkData,
+  parseRepoForkForm,
+  renderRepoForkPage,
+} from "./pages/repo-fork";
 import { loadDashboardData, renderDashboardPage, renderLandingPage } from "./pages/dashboard";
 import {
   loadExploreReposData,
@@ -952,6 +995,50 @@ export interface RepoLabelsRoute {
   repo: string;
 }
 
+/** The wave-26 milestone detail family (pages/milestone-detail.tsx):
+ *  upstream's SINGULAR `m.Get("/milestone/{id}", repo.MilestoneIssuesAndPulls)`
+ *  (web.go:1340 — the parity survey's TOP-3 row, the milestones LIST's
+ *  title-link target; the plural /milestones group never claimed this
+ *  shape). The exact single-segment tail is claimed for ANY segment value —
+ *  a non-numeric or foreign id 404-shells through the loader (upstream
+ *  PathParamInt64's zero + GetMilestoneByRepoID's NotFound), the
+ *  commit-view sha convention. Deeper tails (`/{id}/foo`) stay unclaimed →
+ *  the engine's 404 (upstream registers none here either). */
+export interface MilestoneDetailRoute {
+  family: "milestone-detail";
+  owner: string;
+  repo: string;
+  /** The decoded id segment (validated at load time, not parse time). */
+  id: string;
+}
+
+/** The wave-26 milestone edit family (pages/milestone-detail.tsx): the
+ *  `{id}/edit` combo under the plural /milestones group (web.go:1427-1428 —
+ *  `m.Get("/{id}/edit", repo.EditMilestone)` + the POST
+ *  EditMilestonePost), the write group's gate running at the handlers (the
+ *  labels-write convention). Upstream's sibling writes — `/{id}/{action}`
+ *  (ChangeMilestoneStatus close/open) and `/delete` — stay unclaimed → the
+ *  engine's 404: this slice renders no dead controls for them. */
+export interface MilestoneEditRoute {
+  family: "milestone-edit";
+  owner: string;
+  repo: string;
+  /** The decoded id segment (validated at load time, not parse time). */
+  id: string;
+}
+
+/** The wave-26 fork-form family (pages/repo-fork.tsx): upstream's
+ *  `m.Combo("/fork").Get(repo.Fork).Post(...)` (web.go:1490 — the survey's
+ *  TOP-5 row, DISTINCT from the landed forks LIST literal which claims the
+ *  bare `/forks`). The signed-in gate + the empty-source 404 run at the
+ *  handlers (upstream reqSignIn + getForkRepository's IsEmpty arm); the
+ *  deeper `/fork/*` tails stay unclaimed → the engine's 404. */
+export interface RepoForkRoute {
+  family: "repo-fork";
+  owner: string;
+  repo: string;
+}
+
 
 /** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
  *  three web POSTs — the verdict form's
@@ -969,8 +1056,9 @@ export interface PullReviewRoute {
 
 /** The wave-6 milestones list family (pages/milestones.tsx): upstream
  *  `m.Get("/milestones", repo.Milestones)` (web.go:1339) — GET, `?state=`
- *  facet. The deeper tails (`/{id}/edit`, `/{id}/{action}`, `/delete`) stay
- *  engine-owned — those write routes/pages are not in this slice. */
+ *  facet. Wave 26 moved the `{id}/edit` claim into MilestoneEditRoute and
+ *  the singular `/milestone/{id}` detail into MilestoneDetailRoute; the
+ *  remaining tails (`/{id}/{action}`, `/delete`) stay engine-owned. */
 export interface MilestonesRoute {
   family: "milestones";
   owner: string;
@@ -1165,7 +1253,10 @@ export type ParsedUiRoute =
   | RepoSocialRoute
   | SettingsCollaborationRoute
   | TagsRoute
-  | RepoLabelsRoute;
+  | RepoLabelsRoute
+  | MilestoneDetailRoute
+  | MilestoneEditRoute
+  | RepoForkRoute;
 
 
 /**
@@ -1457,13 +1548,42 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return null;
   }
   // Wave-6: the milestones list (the bare URL, `?state=` carries the facet)
-  // and the `/milestones/new` form (GET + POST). Every deeper tail
-  // (`/{id}/edit`, `/{id}/{action}`, `/delete`) stays engine-owned — those
-  // write routes and pages are not in this slice.
+  // and the `/milestones/new` form (GET + POST). Wave 26 adds the `{id}/edit`
+  // combo (upstream web.go:1427-1428 — the id segment decodes verbatim, the
+  // loader validates it). The remaining write tails (`/{id}/{action}` close/
+  // open, `/delete`) stay engine-owned — this slice renders no controls for
+  // them (the dead-link rule), exactly upstream's unregistered-route answer
+  // for shapes its router does claim but the slice does not.
   if (head === "milestones") {
     if (rest.length === 0) return { family: "milestones", owner, repo };
     if (rest.length === 1 && rest[0] === "new") return { family: "milestone-new", owner, repo };
+    if (rest.length === 2 && rest[1] === "edit") {
+      let id: string;
+      try {
+        id = decodeURIComponent(rest[0] as string);
+      } catch {
+        return null;
+      }
+      return { family: "milestone-edit", owner, repo, id };
+    }
     return null;
+  }
+  // Wave-26 milestone detail (pages/milestone-detail.tsx — upstream
+  // web.go:1340's SINGULAR `/milestone/{id}` route, the survey's TOP-3 row):
+  // the exact single-segment tail claimed for ANY segment value so a
+  // non-numeric id 404-shells through the loader (the commit-view sha
+  // convention) instead of reaching the engine. Deeper tails stay
+  // engine-owned; the bare `/milestone` falls through to the engine's 404 —
+  // upstream has no such route.
+  if (head === "milestone") {
+    if (rest.length !== 1) return null;
+    let id: string;
+    try {
+      id = decodeURIComponent(rest[0] as string);
+    } catch {
+      return null;
+    }
+    return { family: "milestone-detail", owner, repo, id };
   }
   // Wave-13: the compare family (pages/compare.tsx — upstream web.go:1307-
   // 1315). The bare URL and the `{base}...{head}` tail (FIRST `...` splits
@@ -1542,9 +1662,20 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // repo-scoped literals, web.go:1759 /forks + web.go:1766 /stars +
   // web.go:1767 /watchers, the survey bench's third-ranked row): exact
   // single-literal shapes, GET-only. Any deeper tail stays unclaimed → the
-  // engine's 404, exactly upstream's unregistered-route answer.
+  // engine's 404, exactly upstream's unregistered-route answer. (The
+  // singular `/fork` combo below is wave 26's — a distinct literal.)
   if (head === "forks" || head === "stars" || head === "watchers") {
     if (rest.length === 0) return { family: head, owner, repo };
+    return null;
+  }
+  // Wave-26 fork form (pages/repo-fork.tsx — upstream web.go:1490's
+  // `m.Combo("/fork").Get(repo.Fork).Post(...)`, the survey's TOP-5 row):
+  // the exact bare literal, GET the form + POST the landed createFork
+  // sequence (the signed-in gate and the empty-source 404 run at the
+  // handlers, upstream reqSignIn + getForkRepository's IsEmpty arm). Deeper
+  // tails stay unclaimed → the engine's 404.
+  if (head === "fork") {
+    if (rest.length === 0) return { family: "repo-fork", owner, repo };
     return null;
   }
   // Wave-25 tags family (pages/tags.tsx — upstream web.go:1493-1496's
@@ -1907,19 +2038,28 @@ function loginRedirect(pathname: string): Response {
 }
 
 /** GET /{owner}/{repo}/issues/new (pages/new-issue.tsx): the form for the
- *  signed-in viewer; anonymous 303s onto the login round-trip. */
+ *  signed-in viewer; anonymous 303s onto the login round-trip. Wave 26: the
+ *  milestone-detail page's New Issue link preselects its milestone
+ *  (`?milestone=` — upstream NewIssue's FormInt64("milestone"); a
+ *  non-numeric or unknown id falls through to none, the form's own
+ *  parsing). */
 async function issueNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, repo, respond } = resolved;
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
   const data = await loadNewIssueData(c.env.DB, repo.id);
+  const milestoneParam = (url.searchParams.get("milestone") ?? "").trim();
+  const milestoneId =
+    /^\d+$/.test(milestoneParam) && Number.parseInt(milestoneParam, 10) > 0
+      ? Number.parseInt(milestoneParam, 10)
+      : null;
   return respond(
     c.html(
       renderNewIssuePage({
         ctx,
         data,
-        form: { title: "", content: "", labelIds: [], milestoneId: null },
+        form: { title: "", content: "", labelIds: [], milestoneId },
         error: null,
       }),
       200,
@@ -2501,14 +2641,15 @@ async function ownerHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
 }
 
 /** GET /{owner}/{repo}/milestones (pages/milestones.tsx — the list; every
- *  viewer who can see the repo; the write predicate rides along for the New
- *  button's admin gate). */
+ *  viewer who can see the repo; the write predicates ride along for the New
+ *  button's admin gate and the wave-26 per-row Edit link's writer gate). */
 async function milestonesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond, repo } = resolved;
   const data = await loadMilestonesData(c.env.DB, repo.id, url.searchParams);
   data.canWrite = await canAdminRepo(c.env, repo, viewer);
+  data.canWriteIssues = await canWriteRepo(c.env, repo, viewer);
   return respond(c.html(renderMilestonesPage(ctx, data), 200));
 }
 
@@ -4121,6 +4262,133 @@ async function repoLabelDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Res
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/labels` } }));
 }
 
+// ---------------------------------------------------------------------------
+// The wave-26 milestone detail + edit (pages/milestone-detail.tsx —
+// upstream web.go:1340's reader route and web.go:1427-1428's writer combo)
+// and the fork form (pages/repo-fork.tsx — web.go:1490's combo over the
+// landed createFork machinery)
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/milestone/{id} (pages/milestone-detail.tsx — the
+ *  milestone's issues-and-pulls list; every viewer who can see the repo; the
+ *  write predicate rides along for the Edit button). */
+async function milestoneDetailPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  if (resolved.route.family !== "milestone-detail") return respond(await c.notFound()); // drift guard
+  const data = await loadMilestoneDetailData(c.env.DB, repo, resolved.route.id, url.searchParams, ctx.origin);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  // reqRepoIssuesOrPullsWriter's landed port (the wave-25 labels page's
+  // predicate — NOT the milestone-new module's older admin reduction); the
+  // page hides every control on archived repos itself (upstream's
+  // `if not .Repository.IsArchived` wrapper).
+  data.canWrite = await canWriteRepo(c.env, repo, viewer);
+  return respond(c.html(renderMilestoneDetailPage(ctx, data), 200));
+}
+
+/** The milestone edit gate — upstream's write group (reqSignIn +
+ *  RepoMustNotBeArchived + reqRepoIssuesOrPullsWriter) is EXACTLY the
+ *  labels-write gate's order, so the landed `repoLabelsWriteGate` runs
+ *  verbatim: anonymous → the login 303 (repo resolution FIRST), an archived
+ *  repo or a signed-in non-writer → the 404 shell. */
+
+/** GET /{owner}/{repo}/milestones/{id}/edit (pages/milestone-detail.tsx —
+ *  the form, the stored values prefilled). */
+async function milestoneEditPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoLabelsWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, respond, repo } = resolved;
+  if (resolved.route.family !== "milestone-edit") return respond(await c.notFound()); // drift guard
+  const data = await loadMilestoneEditData(c.env.DB, repo.id, resolved.route.id);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    c.html(
+      renderMilestoneEditPage({ ctx, milestone: data.milestone, form: milestoneEditFormOf(data.milestone), error: null }),
+      200,
+    ),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/milestones/{id}/edit (upstream EditMilestonePost):
+ * the §2.8 Origin guard, the write gate, the repo-scoped milestone lookup
+ * (missing/foreign id 404-shells — the handler's own GetMilestoneByRepoID
+ * order), then the landed `editRepoMilestone` — success 303s back onto the
+ * list (upstream's redirect), validation failures re-render at 200 with the
+ * message and the kept values (the login failure convention).
+ */
+async function milestoneEditSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoLabelsWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, respond, repo } = resolved;
+  if (resolved.route.family !== "milestone-edit") return respond(await c.notFound()); // drift guard
+  const data = await loadMilestoneEditData(c.env.DB, repo.id, resolved.route.id);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseMilestoneForm(await readUrlEncodedForm(c.req.raw));
+  const result = await editMilestoneFromForm(c.env.DB, data.milestone.id, form);
+  if (result.outcome === "applied") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/milestones` } }));
+  }
+  return respond(c.html(renderMilestoneEditPage({ ctx, milestone: data.milestone, form, error: result.message }), 200));
+}
+
+/** GET /{owner}/{repo}/fork (pages/repo-fork.tsx — the form). The combo's
+ *  gate order: repo resolution FIRST (invisible repos 404 before the
+ *  redirect could leak), then reqSignIn's login 303, then
+ *  getForkRepository's IsEmpty arm (an empty source has nothing to fork). */
+async function repoForkPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  if (resolved.route.family !== "repo-fork") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadRepoForkData(c.env, c.env.DB, repo, viewer);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    c.html(renderRepoForkPage({ ctx, data, form: { uid: data.selectedId, name: data.source.repo.slug }, error: null }), 200),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/fork (upstream ForkPost): the §2.8 Origin guard, the
+ * GET's gate order, then the landed POST /repos/{owner}/{repo}/forks
+ * route's exact service sequence through createForkFromForm — success 303s
+ * onto the fork's home (upstream's JSONRedirect target), an EXISTING fork
+ * 303s onto its home (the GetUserFork arm), validation failures re-render
+ * at 200 with the message and the kept values.
+ */
+async function repoForkSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, repo } = resolved;
+  if (resolved.route.family !== "repo-fork") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadRepoForkData(c.env, c.env.DB, repo, viewer);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseRepoForkForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createForkFromForm(c.env, c.env.DB, viewer, data, form);
+  if (result.outcome === "existing") {
+    return respond(new Response(null, { status: 303, headers: { location: result.location } }));
+  }
+  if (result.outcome === "created") {
+    return respond(
+      new Response(null, { status: 303, headers: { location: `/${result.ownerNamespace}/${result.slug}` } }),
+    );
+  }
+  return respond(c.html(renderRepoForkPage({ ctx, data, form, error: result.message }), 200));
+}
+
 export const uiRouter = new Hono<{ Bindings: Env }>();
 
 // §4.13: trailing-slash URLs redirect to the canonical form (we never emit
@@ -4370,3 +4638,18 @@ uiRouter.post("/:owner/:repo/labels/edit", (c) => repoLabelEditSubmit(c));
 uiRouter.get("/:owner/:repo/labels/edit", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/labels/delete", (c) => repoLabelDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/labels/delete", () => methodNotAllowed("POST"));
+// Wave-26 milestone detail + edit + fork form (parseUiRoute claims exactly
+// these shapes — upstream web.go:1340's singular reader route,
+// web.go:1427-1428's `{id}/edit` writer combo (the shared labels-write gate
+// runs at the handlers) and web.go:1490's fork combo (the signed-in gate +
+// the empty-source 404 run at the handlers; the POSTs run the §2.8
+// sameOriginGuard first). No earlier registration can absorb these: the
+// singular "milestone" head is a distinct literal, "new" under /milestones
+// registered long before the dynamic :id tail (a 5-segment shape no earlier
+// pattern carries), and the singular "fork" never collides with the landed
+// bare "forks" literal.
+uiRouter.get("/:owner/:repo/milestone/:id", (c) => milestoneDetailPage(c));
+uiRouter.get("/:owner/:repo/milestones/:id/edit", (c) => milestoneEditPage(c));
+uiRouter.post("/:owner/:repo/milestones/:id/edit", (c) => milestoneEditSubmit(c));
+uiRouter.get("/:owner/:repo/fork", (c) => repoForkPage(c));
+uiRouter.post("/:owner/:repo/fork", (c) => repoForkSubmit(c));
