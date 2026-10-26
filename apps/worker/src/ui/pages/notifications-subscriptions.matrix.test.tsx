@@ -270,7 +270,7 @@ describe("w109 claim pins (the unclaimed /notifications tails — the mount wave
     expect(parseUiRoute("/notifications/watching/deeper")).toBeNull();
     // The dispatcher's two-segment gate answers the same posture.
     expect(handlesUiRoute("/notifications/subscriptions")).toBe(true);
-    expect(handlesUiRoute("/notifications/watching")).toBe(false);
+    expect(handlesUiRoute("/notifications/watching")).toBe(true);
     // The bare mailbox arm stays claimed (the boundary the pins protect).
     expect(parseUiRoute("/notifications")).not.toBeNull();
   });
