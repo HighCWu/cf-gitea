@@ -1293,3 +1293,213 @@ t+5.4/5.7/6.4 s (plus ONE old-name stale read in trial c). Same
 seconds-scale, self-healing, tombstone-awaited-204 window as the REDEPLOY10
 note; the suggested fix (treat a tombstoned cell as deleted on the advert
 read path, or double-check D1 existence) still stands.
+
+## Redeploy verification — 2026-10-26 02:15–02:55 UTC (10:15–10:55 CST), same-deployment-state block (wave-24/25 series, REDEPLOY12)
+
+Deploy shipped as ONE version: **`f9798804-b916-408e-9249-93ac030a1269`** (100%,
+Created 2026-10-26T02:09:37.784Z per `wrangler deployments list`), deployed from
+tree **`5ba6183` CLEAN** (detached worktree), on
+https://cf-gitea.hecongw.workers.dev. Previous live version:
+`8d91c71d-3695-4d5f-a981-74d261c46b53` (the REDEPLOY11 block's version).
+Content shipped — the tree carries (in order): bb67087+98d194d (avatar-byhash
+web seam + mount carve-out), 7f0d5a6 (generate: PATCH template write + copy
+retry + failure cleanup), 0b61554 (ui-parity-4: tags + repo labels pages),
+528d369 (star/watch counters, migration 0030), fb8a0d1 (invariants fixture
+fix — engine red closed), 04a2903 (license repo-edit arm — family complete),
+64ade9f (feeds-tail action rows), **45631b7 (settle-is-empty — the coordinator's
+GO preference)**, 5ba6183 (schema column-pin first catch-up). Assets rebuilt:
+same pin `fc4936884584`, identical bundle hashes `index.oLjWPtMl.js` /
+`iife.Cpk_pTor.js`. **Deliberately NOT shipped** (landed after the coordinator's
+explicit "deploy 5ba6183 — do NOT hold" confirmation; REDEPLOY13's tree):
+3163658 (set-private-zero), 3016c10 (counters-2 num_forks + users.num_stars,
+migration 0031), 239a4ac (avatar_default build guards), 69d4927 (avatars docs),
+8207da9 (webhooks test reshape), 64e9b1b (delete-counters-fold), e6ccf9c (docs).
+
+Deploy-tree methodology (REDEPLOY10/11 detached-worktree pattern reused;
+REDEPLOY11's ordering lesson applied): gates and deploy ran from detached
+`git worktree add --detach` at exactly `5ba6183` — warm
+`pnpm install --frozen-lockfile`, `git submodule update --init` (pin
+`fc4936884584` verified unchanged; main checkout's submodule pristine after),
+`pnpm gen:icons`, the **scratch-dir asset build**
+(`build-gitea-assets.mjs --work /tmp/gitea-assets-build-rd12b --skip-install`)
+emitted into the worktree's `public/assets` **BEFORE the vitest gate** (the
+REDEPLOY11 lesson), `.dev.vars` copied in 0600. The worktree (and its copied
+`.dev.vars`) was removed after the run; the main working tree was never
+modified by this agent.
+
+Deploy gates — at `5ba6183` (worktree): `pnpm typecheck` **0 errors**;
+`check:api` **PASS** (declared **490** ops/298 paths, tier-1 **78/78 paths,
+129/129 ops**); `check:contract` **PASS** (sha256 `529a3314…`, verbatim match).
+Vitest run of record `--maxWorkers=8`: **2904 passed | 5 skipped, 2 failed in
+2 files**, plus 17 files orphaned by workerd pool crashes ("Worker exited
+unexpectedly") which re-ran SOLO **all green (338 passed | 5 skipped, 0
+failed)** — pool instability, not code. The 2 file-level fails, adjudicated:
+
+1. `src/db/schema.test.ts` — `repositories fork_parent parity` — **test-side
+   second-order staleness, code correct**: 5ba6183 caught the column LIST up
+   to 0029/0030 (size_kb/num_stars/num_watches appended) but the three
+   `dflt_value` assertions below still assume the old tail
+   (`expected '0' to be 'false'` — the new columns are `DEFAULT 0 NOT NULL`
+   per the landed migrations). Coordinator is fixing (their own commit).
+2. `src/services/webhooks-push.test.ts` — "a deleted ref emits the delete
+   event" — **RESOLVED-NOT-A-BUG (coordinator verdict, 8207da9)**. This run
+   bisected it deterministically (green at `e30660d`, `04a2903`, `64ade9f`;
+   red at `45631b7`, `5ba6183` — first-bad **45631b7**), which was the
+   diagnostic record the fix wave used. Mechanism (upstream-correct): after
+   the settle generalization the first-pushed branch IS the default
+   (push.go:255-270 pushNewBranch); deleting the default branch is refused
+   by pre-receive with upstream's byte-identical text
+   (hook_pre_receive.go:143), the engine reports all-ng at HTTP 200, and
+   onPush legitimately never fires. The test scenario had become
+   upstream-invalid; reshaped + interaction pinned at 8207da9 (19/19 + 93/93).
+
+**Invariants: GREEN at the deploy tree** (fb8a0d1's fixture fix verified in
+this run's solo gate too) — the stop condition from the brief was clear.
+
+Remote migrations immediately before deploy (both applied from the worktree at
+the deploy tree): **0029_square_banshee** (`repositories.size_kb integer
+DEFAULT 0 NOT NULL`) and **0030_curly_gressill** (`num_stars`/`num_watches`,
+same shape) — both ✅; ledger after: "✅ No migrations to apply!" (30/30);
+remote `pragma_table_info` verified **`size_kb`, `num_stars`, `num_watches`**
+present. No seed rows (the single pre-existing repo row p0-shallow carries the
+DEFAULT 0s). 0031 (num_forks wave) intentionally NOT applied — its commit
+ships with REDEPLOY13.
+
+`pnpm smoke` equivalent (deploy-smoke.mjs, fresh mint-per-run PAT via 0600
+temp file — 2 PATs this run, admin + p0probe, both DELETEd by prefix after —
+`--user p0probe`, with `--migrate-check`): **6 pass / 0 fail / 1 skip**
+(bench-report not requested), `ok: true`. Verbatim key lines:
+`[pass] healthz — {"ok":true}`; `[pass] anon-git-surface —
+probe-9665b85d/probe-46143794.git: git-upload-pack 404 not-found,
+git-receive-pack 401 Basic challenge`; `[pass] receive-advert — advert ok
+(165 bytes)`; `[pass] push-lsremote — pushed 91010d58c6…, authed ls-remote
+sees refs/heads/main, anonymous advert 401 Basic challenge`; `[pass] cleanup —
+repo p0probe/smoke-0899ceae deleted`; `[pass] migrate-check — all 19 expected
+tables present (+48 system/aux: … oauth2_application, badge, repo_license,
+user_badge, action)`.
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`;
+results **unchanged** vs all prior tables):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1`; `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean |
+
+`p0probe/p0-shallow` remains live intentionally; anonymous API GET **404**,
+anonymous `info/refs` **401 Basic challenge** (`www-authenticate: Basic
+realm="Gitea"`), anonymous web page **404** — re-verified this run and again
+after cleanup.
+
+**Tombstone t+0 production proof (HEADLINE — the e30660d oracle's first
+production verification; 3 full lifecycles, all PUBLIC, anonymous ls-remotes,
+p0probe-owned).** Per trial: `POST /user/repos` 201 (t+3.2–3.6 s) →
+create-settle poll GREEN on poll 1 (2.5–3.4 s later; HEAD +
+refs/heads/main) → `PATCH` rename 200 → immediate anonymous ls-remote on the
+NEW name lists ALL refs — **THE CARRY HOLDS in 3/3** (identical tip
+`c27f540f…`/`992ff7cb…`/`43c72717…`) — this read deliberately seeds the
+engine's per-isolate infoMemo (the production-user pattern: a read seconds
+before delete) → `DELETE` 204 (t+10.9–12.2 s) → **THE VERY NEXT anonymous
+ls-remote on the renamed name answers 128 `remote: repository not found` in
+3/3 trials — T+0 CLEAN IN ALL THREE, no sleep** (trial 1 verdict at t+14.2 s
+overall / 2.1 s after the DELETE; trial 2 at t+13.4 s; trial 3 at t+14.1 s;
+verbatim stderr `remote: repository not found: p0probe/tomb-rd12-rX-…-r`).
+Old (pre-rename) name post-delete: anonymous ls-remote **128** and anonymous
+API GET **404 `{"message":"not found"}`** in 3/3. **The REDEPLOY10/11
+5.4–6.4 s self-healing read-after-delete window is CLOSED in production.**
+Probe-script footnote (disclosed): this run's first trial batch (3 repos
+`tomb-rd12-{a,b,c}-…`) was wasted by the probe script itself — the
+ls-remote URLs omitted the `/p0probe/` owner segment so settle-polls 404'd
+forever; all three rows verified `ready` in D1 and were DELETEd 204 via the
+API; the corrected batch above is the record. (The evidence summary line
+`"create":204` in the probe stdout is a cosmetic script bug reporting the
+last response; the step lines carry create 201 / delete 204.)
+
+**Wave-24/25 spot probes (production, one pass each, exact codes).**
+Generate-fix: `PATCH /repos/p0probe/tmpl-rd12-… {"template":true}` → **200
+with `template:true` IN THE RESPONSE BODY**, and `GET` confirms **persisted**
+— REDEPLOY11's OPEN ISSUE 2 (silent drop of `template`) is FIXED in
+production. `POST /repos/{o}/{r}/generate {"name":…,"git_content":true}`
+from the NON-EMPTY template → **STILL 500** `{"message":"internal server
+error"}` (×2 + one tail-attached retry); `wrangler tail` captured the verbatim
+application error: `(error) [repos] generate c21de3ee…: content copy failed,
+retrying once: finalizeForkImport: object not imported: 02f68bc4ca0e…
+(refs/heads/main)` then `api: unhandled error … Error: finalizeForkImport:
+object not imported: 02f68bc4ca0e… (refs/heads/main)` — the copy arm's
+finalize finds the tip object absent from the adopted packs
+(`beginForkImport → listCatalogPage → adoptForkPacks → listRefs →
+finalizeForkImport`, ×2 for the retry). The 7f0d5a6 HALF of the fix IS
+visible: the tail shows `markDeleted`/`destroy` after the failure and remote
+D1 has **0 stranded `status='creating'` rows** (REDEPLOY11's baseline
+stranded 2). Counters (528d369): admin `PUT /user/starred/p0probe/cnt-rd12-…`
+→ 204, repo payload `stars_count` **0→1**; p0probe `PUT /user/blocks/admin`
+→ 204, `stars_count` **1→0** (block cascade); undo (unblock 204 + unstar
+204) → 0; watch arm: admin `PUT …/subscription` → 200, `watchers_count`
+**0→1**, `DELETE` → 204, **→0**. Avatar-byhash (bb67087+98d194d): `POST
+/user/avatar` (1×1 PNG base64) → **204**; `GET /avatars/u_4` → **200
+image/png** (the stored object); `GET /avatar/<sha256(email)>` → **303 →
+`/assets/img/avatar_default.png`** (the frozen-settings chain — no
+`email_hash` table ⇒ email "" ⇒ DefaultAvatarLink); `GET /avatars/<unknown>`
+→ **200 image/png** (the bundled fallback PNG arm, 604 bytes); `GET
+/user/avatar/p0probe/96` → **303 → `/avatars/u_4?size=96`**;
+`DELETE /user/avatar` → 204, after which `/avatars/u_4` serves the fallback
+PNG again. UI pages (0b61554): authenticated `GET /{owner}/{repo}/tags` →
+**200** with the `small-menu-items` menu + `/releases` link shells (tag rows
+absent on a 0-tag repo — correct), `GET /{owner}/{repo}/labels` → **200**
+with the `issue-list-navbar` + `small-menu` shells; honest observation: the
+writer's "New Label" form did NOT render for the repo owner in production
+(unit goldens cover it with a seeded writer grant — flagging for the
+ui-parity-4 owner to confirm the production grant arm, low severity: page +
+API label CRUD both fine). Registry regression sweep: covered by the 3
+tombstone lifecycles above (create→rename carry→delete t+0 all green).
+
+Cleanup proof (API-verified + remote D1): probe repos DELETEd → **204**
+across the board (3 broken-trial `tomb-rd12-{a,b,c}`, `tmpl-rd12-…`,
+`cnt-rd12-…`, `uir-rd12-…`, `uidom-rd12`, `uidom2-rd12`; the corrected tomb
+trials self-cleaned through their own DELETE step) — `repositories WHERE
+owner_namespace='p0probe'` = **1** (`p0-shallow`, intentionally live);
+`status='creating'` whole-table = **0**; `repo_redirects` = **0**; `stars` =
+**0**; `user_blocking` = **0**; **21 `action` rows** (15 op_type=1 create_repo
++ 6 op_type=2 — every one a this-run probe event on now-deleted repos, the
+same lingering class as REDEPLOY11's OPEN ISSUE 3) removed → `action` total
+**0**. Per-run credentials: 2 PATs minted (admin id 28, p0probe id 29; raw
+mint stdout shredded before capture, 0600 token files); both DELETEd by
+prefix (`changes = 2`); `personal_access_tokens` whole-table = **1** (the
+standing `cfg_23077afd` admin bootstrap PAT, pre-existing). Probe scripts,
+token files, tail logs, and scratch outputs all shredded with the worktree
+and scratch-dir removal (`/tmp/rd12-*` verified gone). `gitea/` submodule
+pristine (0 dirty files, pin `fc4936884584`); `wrangler deployments list`
+confirms `f9798804…` at 100%.
+
+**OPEN ISSUE 1 (carried, updated — generate 500 on the content-copy arm,
+now with the verbatim producer): unchanged in class, cleaner failure.**
+Non-empty-template generate still 500s (see the tail capture above —
+`finalizeForkImport: object not imported: <tip> (refs/heads/main)`, retry
+exhausted, caught by the handler as an unhandled-error 500). The
+cleanupRepository half of 7f0d5a6 works (no stranded rows, `markDeleted` in
+the trace); the copy ride itself still cannot see the template's tip object
+through `adoptForkPacks`/`listCatalogPage` — suspect the API-created
+template's pack lands under a staged/upload key the fork-import catalog
+doesn't adopt, vs push-created packs. Owner: generate-repo/queue; the fork
+queue's own async path remains the battle-tested alternative.
+
+**OPEN ISSUE 2 (carried from REDEPLOY11 — activity feeds): repo delete does
+not mark `action` rows `is_deleted`**; this run again had to sweep 21 probe
+rows by hand. Upstream marks a deleted repo's actions deleted so feeds hide
+them; the delete-cascade counters fold (64e9b1b, REDEPLOY13's tree) is the
+natural place to land it.
+
+**OPEN ISSUE 3 (new, low — ui-parity-4): the labels page's writer "New Label"
+form did not render for the repo owner in production** (page 200, shells
+correct, form absent). Unit goldens pass with a seeded writer grant, so the
+production grant-detection arm is the suspect. Confirm + fix or close as
+working-as-intended.
+
+**RESOLVED this deployment (for the record):** (a) tombstone read-after-delete
+window — CLOSED (headline, 3/3 t+0); (b) PATCH drops `template` — FIXED
+(200 + persists); (c) generate strands `creating` rows — FIXED (0 stranded);
+(d) invariants engine red — fixture-side, closed at fb8a0d1; (e) webhooks
+delete-event "regression" — RESOLVED-NOT-A-BUG (upstream default-branch
+protection; test reshaped at 8207da9); (f) schema.test column pin — caught up
+at 5ba6183, `dflt_value` assertions finishing with the coordinator (REDEPLOY13).
