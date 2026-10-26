@@ -1315,6 +1315,11 @@ import {
   renderDashboardMilestonesPage,
   renderOverviewIssuesPage,
 } from "./pages/global-inbox";
+import {
+  loadSubscriptionsData,
+  loadWatchingData,
+  renderNotificationSubscriptionsPage,
+} from "./pages/notification-subscriptions";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -2089,7 +2094,13 @@ export interface SiteHomeRoute {
  *  slice and stay unclaimed → the engine answers, exactly upstream's
  *  unregistered-route 404. */
 export interface NotificationsRoute {
-  family: "notifications" | "notification-new" | "notification-status" | "notification-purge";
+  family:
+    | "notifications"
+    | "notification-new"
+    | "notification-status"
+    | "notification-purge"
+    | "notification-subscriptions"
+    | "notification-watching";
 }
 
 /** The wave-9 explore family (pages/explore.tsx): upstream's route group
@@ -2429,6 +2440,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 3 && raw[2] === "new") return { family: "notification-new" };
     if (raw.length === 3 && raw[2] === "status") return { family: "notification-status" };
     if (raw.length === 3 && raw[2] === "purge") return { family: "notification-purge" };
+    // Window-2e C3b: the subscriptions tails (web.go:1786-1787, GET-only).
+    if (raw.length === 3 && raw[2] === "subscriptions") return { family: "notification-subscriptions" };
+    if (raw.length === 3 && raw[2] === "watching") return { family: "notification-watching" };
     return null;
   }
 
@@ -6893,6 +6907,21 @@ async function globalMilestonesPage(c: Context<{ Bindings: Env }>): Promise<Resp
   return respond(c.html(renderDashboardMilestonesPage(resolved.ctx, data), 200));
 }
 
+/** Window-2e C3b: the subscriptions/watching tails (GET-only, reqSignIn —
+ *  web.go:1786-1787; one upstream template dispatched on its Status key). */
+async function notificationSubscriptionsPage(c: Context<{ Bindings: Env }>, watching: boolean): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  const family = watching ? "notification-watching" : "notification-subscriptions";
+  if (resolved.route.family !== family) return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const data = watching
+    ? await loadWatchingData(c.env.DB, viewer, url.searchParams)
+    : await loadSubscriptionsData(c.env.DB, viewer, url.searchParams);
+  return respond(c.html(renderNotificationSubscriptionsPage(ctx, data), 200));
+}
+
 // ---------------------------------------------------------------------------
 // Window-2e C2: the WIKI family (pages/repo-wiki.tsx). The hasWiki gate
 // 404-shells disabled wikis (the module handoff); the ?action= form value
@@ -9269,6 +9298,8 @@ uiRouter.get("/explore/users", (c) => exploreUsersPage(c));
 // POST-only write tails answer GET with chi's 405 (the same convention the
 // comment/label write families carry).
 uiRouter.get("/notifications", (c) => notificationsPage(c));
+uiRouter.get("/notifications/subscriptions", (c) => notificationSubscriptionsPage(c, false));
+uiRouter.get("/notifications/watching", (c) => notificationSubscriptionsPage(c, true));
 uiRouter.get("/notifications/new", (c) => notificationsNew(c));
 uiRouter.post("/notifications/status", (c) => notificationStatusSubmit(c));
 uiRouter.post("/notifications/purge", (c) => notificationPurgeSubmit(c));

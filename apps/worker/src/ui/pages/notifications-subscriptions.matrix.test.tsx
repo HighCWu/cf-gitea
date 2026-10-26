@@ -260,14 +260,16 @@ describe("w109 claim pins (the unclaimed /notifications tails — the mount wave
     // 303-vs-clamp seam decision), THIS test flips to the mounted families:
     //   { family: "notification-subscriptions" } and
     //   { family: "notification-watching" } at the exact lowercase tails.
-    expect(parseUiRoute("/notifications/subscriptions")).toBeNull();
-    expect(parseUiRoute("/notifications/watching")).toBeNull();
+    // Window-2e C3b mounted both tails — the unclaimed pins updated to
+    // the claimed shapes exactly as the header's mount-wave note promised.
+    expect(parseUiRoute("/notifications/subscriptions")).toEqual({ family: "notification-subscriptions" });
+    expect(parseUiRoute("/notifications/watching")).toEqual({ family: "notification-watching" });
     // Deeper tails stay engine-owned too (no per-repo subscription route
     // exists upstream in this group — web.go:1786-1787 are GET-only).
     expect(parseUiRoute("/notifications/subscriptions/extra")).toBeNull();
     expect(parseUiRoute("/notifications/watching/deeper")).toBeNull();
     // The dispatcher's two-segment gate answers the same posture.
-    expect(handlesUiRoute("/notifications/subscriptions")).toBe(false);
+    expect(handlesUiRoute("/notifications/subscriptions")).toBe(true);
     expect(handlesUiRoute("/notifications/watching")).toBe(false);
     // The bare mailbox arm stays claimed (the boundary the pins protect).
     expect(parseUiRoute("/notifications")).not.toBeNull();
