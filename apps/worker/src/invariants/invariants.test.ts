@@ -176,6 +176,10 @@ async function threePackRepo(slug: string): Promise<ThreePackRepo> {
 
   // HEAD was adopted to the first-pushed branch (base); deleting base and
   // mid leaves main — re-point HEAD so the fixture itself stays invariant.
+  // Both deletes ride the engine seam (deleteApiRef), not the gate/API: the
+  // 8207da9 verdict's default-branch refusal (hook_pre_receive.go:141) lives
+  // in those policy layers only, so deleting the first-pushed branch here is
+  // not the upstream-invalid user path that verdict reshaped.
   expect((await stub.deleteApiRef({ ref: "refs/heads/base", expectedOid: a.oid })).tag).toBe("deleted");
   expect((await stub.deleteApiRef({ ref: "refs/heads/mid", expectedOid: b.oid })).tag).toBe("deleted");
   expect((await stub.setHead("main")).tag).toBe("ok");
