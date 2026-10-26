@@ -76,6 +76,24 @@ refreshed `30995e2`) — **the carried-OPEN list is empty** (this
 doc's one ledgered residual, the generated-repo wire `bf8e56f`, was
 already closed by `8828f43`; the 16 SQLITE_LOCKED OPEN in `baf28bb`
 is P0-evidence scope, not an API carry).
+**Ticked 2026-10-26** an eighth time, at HEAD `f696a21`: maintenance
+only again — the `67adfb7..f696a21` window (11 commits: the tick-8
+compat docs commit `075f916`, the SQLITE_LOCKED verdict docs
+`280d4ad`, the search filters `e39adad` — tri-state arms + the
+`SanitizedOriginalUrl` port over EXISTING search/list ops, zero
+declarations — the notifications WIP-draft glyph `8786651`, the
+stuck-syncing sweep `833961d` + its two SPEC records
+`2e11713`/`edf5da1`, and the four UI module commits
+`f26d65b`/`8380cf0`/`ec07fb6`/`f696a21` — the unmounted migrate +
+feeds modules (the latter's glyph allowlist exacted by the last),
+the org settings group + teams/edit page (the survey's
+FINAL numbered row), and the unmounted
+`notification-subscriptions` module + the org-settings-hooks
+follow-up still uncommitted in the tree at measurement, UI-only)
+carries **zero new
+operations**; the checker re-run at this HEAD reports 490/298,
+`PASS` unchanged. The window's landings join the post-490 ledger
+below.
 
 - **Sources / method**: frozen contract
   `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
@@ -83,7 +101,7 @@ is P0-evidence scope, not an API carry).
   issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
   minus the declared set that `node scripts/check-openapi.mjs` reports
   (**490** operations across **298** paths, measured 2026-10-26 at HEAD
-  `67adfb7`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
+  `f696a21`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
   operations). Raw diff: **64 undeclared** = **64 remaining**, all
   FEATURE-ABSENT — no in-flight subtraction applies any more.
   Issue / notification / miscellaneous / settings families have **zero**
@@ -149,11 +167,16 @@ that tick's measurement time were this doc plus the then-in-flight
 `/{username}/-/projects` wave's uncommitted files under
 `apps/worker/src/ui/` and a scratch script — none of them spec-bearing
 as measured (the checker still reports 490/298 in exactly this tree
-state). At this tick's measurement (`67adfb7`) the tree is CLEAN apart
-from the two compat docs themselves; the org-settings wave now in
-flight is dispatch-ownership, not visible files, and is UI-only — no
-undeclared op rides it (the previous tick's fragment-mounting wave
-landed as `67adfb7`, still zero ops; the carried-OPEN list —
+state). At this tick's measurement (`f696a21`) the tree additionally
+carries the machinery wave's OWN uncommitted files — the
+`notification-subscriptions` + `org-settings-hooks` page modules
+untracked and the hooks-tab follow-up modifications under
+`apps/worker/src/ui/` — all UI-only, none spec-bearing; the checker
+reports 490/298 in exactly this tree state (re-run at measurement).
+The org-settings wave LANDED as `8380cf0` (UI-only,
+zero ops — the survey's final numbered row), and the migrate/feeds
+modules (`f26d65b`/`ec07fb6`) are page modules over already-declared
+services, spec-bearing zero (the carried-OPEN list —
 tag-create, serializer stubs, renamed-fork — is empty, closed as the
 seventh tick records).
 
@@ -189,7 +212,7 @@ existing seams), engine-registry lifecycle fixes (`4f574e9`, `1da8f56`,
 ### After the 490 line — post-regen landings (zero new ops)
 
 Everything merged after REG `c9a7ef7` carries no new declarations — the
-checker stays at 490/298 (re-run at this tick's HEAD `ae32b1a`). The units,
+checker stays at 490/298 (re-run at this tick's HEAD `f696a21`). The units,
 grouped:
 
 - **API parity**: blocks-enforcement-2 tail (`f2e1710` — the regen's
@@ -243,7 +266,19 @@ grouped:
   the FORK EDGE first, name-free and rename-immune by construction,
   path acceptance as fallback, chain climb maxLevel 10, flat-404
   anti-enumeration kept; the GET bare form rename-immune vs upstream's
-  name-only — intentional, documented).
+  name-only — intentional, documented). The `67adfb7..f696a21` window
+  adds the search filters (`e39adad` — the template/archived tri-state
+  arms over the EXISTING repo search/list ops at upstream
+  exact-equality, repo_list.go:391/520; `original_url` rendered
+  NOT-mirror-gated — the plain-imports correction, create.go:236 — via
+  the `SanitizedOriginalUrl` port with the WHATWG parse-fail→""
+  divergence; zero new declarations) and the stuck-syncing sweep
+  (`833961d` — both cron producers CAS-reclaim syncing rows older than
+  the receive-lease TTL then re-enqueue same-tick via the landed
+  two-step claim; push claims stamp `last_update_unix`; the NULL arm
+  heals pre-deploy wedges on the first tick — behavior on the landed
+  mirror ops, zero declarations, recorded as SPEC-0009 §2.6 +
+  push-mirror-outbound §9.3 by `2e11713`/`edf5da1`).
 - **Migrations 0029–0032** landed with them (`size_kb`, `num_stars`/
   `num_watches`, `num_forks` + `users.num_stars`, push-mirror sync state) —
   still 64 tables; these are store work behind already-declared ops.
@@ -290,7 +325,21 @@ grouped:
   beside it via the wiki-cell swap + `hasWiki` gate; lastcommit
   HANDOFF-exact per the `3502ee4` mount plan; the file-list
   fetch-attrs flip — four attrs verbatim, opt-in `loaderCommitOid`;
-  the survey's two IN-FLIGHT fragment rows flip LANDED there).
+  the survey's two IN-FLIGHT fragment rows flip LANDED there). The
+  `67adfb7..f696a21` window adds the org settings group + teams/edit
+  (`8380cf0` — the survey's FINAL numbered row: the options combo +
+  avatar pair + danger-zone writes as three details-forms over the
+  landed org APIs, teams/edit over every landed `editTeam` field,
+  `max_repo_creation` honest-absent, `repo_access`
+  dead-control-unrendered; the settings tabs split off as their own
+  ABSENT survey row), the notifications WIP-draft glyph (`8786651` —
+  upstream's IsWorkInProgress is a pure title-prefix check and the
+  landed item carries title, so the draft arm renders), and the
+  UNMOUNTED page modules (`f26d65b` repo-migrate, `ec07fb6`
+  activity-feeds + its glyph allowlist exact `f696a21` — complete
+  modules whose mounts ride a window; the `notification-subscriptions`
+  module and the org-settings-hooks follow-up were still uncommitted
+  in the tree at measurement; all spec-bearing zero).
 - **Test/docs**: vitest contention config (`e4ebb9d`), release notes
   (`1c44086`), P0 deploy evidence (`d28d953`, `3d76cc6`), push-mirror SPEC
   (`998a4de`), schema-docstring catch-up (`e6ccf9c`). The
@@ -332,7 +381,13 @@ grouped:
   16/16 scripts, 269/269 checks), the SPEC-0011 M3.5 count annotation
   (`84cf4c9`), and P0 deploy evidence (`baf28bb` — the RD18
   ?raw-incident arc closed; its NEW OPEN, 16 SQLITE_LOCKED tail
-  exceptions, is P0-ledger scope, not an API carry).
+  exceptions, is P0-ledger scope, not an API carry). The
+  `67adfb7..f696a21` window adds the SQLITE_LOCKED verdict docs
+  (`280d4ad` — DO-SQLite in the workerd format, NOT D1's D1_ERROR;
+  request-less = RepoCell alarm events; benign-retry
+  stamp-and-reconverge, no lost write, the SPEC-0011 single-writer
+  HOLDING on thrown paths; the syncing-wedge fix brief that became
+  `833961d`) and the tick-8 compat docs commit (`075f916`).
 - **Tooling**: the `9b49cd2..2310623` window adds the toolkit polish
   (`5fdbc15` — token optional for D1-only batteries, `MIRROR_SETTLE_MS`
   10s→30s + `--mirror-settle-ms`, the generic failureTail with the
