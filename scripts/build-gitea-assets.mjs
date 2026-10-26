@@ -9,7 +9,7 @@
 //
 // Steps: copy inputs -> pnpm install --frozen-lockfile -> clean output entries ->
 // pnpm exec vite build (production, sourcemaps off) -> verify manifest -> emit into
-// the target directory -> print inventory.
+// the target directory -> verify the avatar fallback asset -> print inventory.
 //
 // Usage:
 //   node scripts/build-gitea-assets.mjs [options]
@@ -118,6 +118,13 @@ const requiredInputs = [
   'assets/codemirror-languages.json',
   'assets/go-licenses.json',
   'public/assets/emoji.json',
+  // The avatar fallback chain's terminal asset: src/services/avatars.ts
+  // defaultAvatarLink() emits /assets/img/avatar_default.png as the redirect
+  // target for EVERY by-hash avatar request at the frozen settings, and the
+  // Workers Static Assets store (wrangler.jsonc assets.directory ./public)
+  // serves it. If upstream stops committing it, the chain 404s at the edge —
+  // reported here, loudly, at build time.
+  'public/assets/img/avatar_default.png',
 ];
 for (const rel of requiredInputs) {
   if (!existsSync(path.join(gitea, rel))) fail(`missing required input in gitea submodule: ${path.join(gitea, rel)}`);
@@ -254,6 +261,14 @@ emit('img');
 emit('.vite');
 emit('licenses.txt');
 emit('emoji.json');
+
+// Emission-side guard (mirror of the requiredInputs check): the img/ tree is
+// copied recursively, so the file can only go missing if a future emit-list
+// change stops covering it — fail loudly instead of shipping a build whose
+// avatar fallback chain dead-ends in a 404.
+if (!existsSync(path.join(out, 'img', 'avatar_default.png'))) {
+  fail(`emitted tree is missing img/avatar_default.png — the avatar fallback chain's terminal asset (defaultAvatarLink -> /assets/img/avatar_default.png)`);
+}
 
 // Inventory of what was emitted (excluding maps, which are never emitted).
 const walk = (dir) => {

@@ -261,6 +261,53 @@ describe("GET /avatar/{hash} (AvatarByEmailHash port)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The chain's terminal leg — /assets/img/avatar_default.png over the Workers
+// Static Assets store
+// ---------------------------------------------------------------------------
+
+describe("the default-avatar terminal leg (Workers Static Assets store)", () => {
+  /**
+   * The by-hash chain ends at `/assets/img/avatar_default.png`
+   * (defaultAvatarLink, services/avatars.ts), which is NOT a worker route:
+   * the asset tree built into `apps/worker/public/assets/` is served by the
+   * wrangler.jsonc `assets` block (SPEC-0008 §2.3.2) under assets-first /
+   * worker-on-miss routing — a routed /assets/* request that matches a file
+   * never invokes the Worker, so the ASSETS binding IS the serving path and
+   * these tests exercise the store through `env.ASSETS` exactly as the edge
+   * does (verified live in production 2026-10-26: 200 image/png,
+   * `cache-control: public, max-age=3600`). Cache headers here come from the
+   * committed `public/_headers` rule for `/assets/img/*` (max-age 3600) — a
+   * different arm from the R2-served `/avatars/*` handler above, which stamps
+   * `CacheControlForPublicStatic` (`public, max-age=21600`) itself. Asset
+   * presence is enforced structurally by scripts/build-gitea-assets.mjs
+   * (requiredInputs + the post-emit guard), so a rebuild cannot silently drop
+   * the file this chain depends on.
+   */
+
+  it("serves the built default avatar with the public static cache headers", async () => {
+    const res = await env.ASSETS.fetch("https://assets.local/assets/img/avatar_default.png");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    expect(res.headers.get("cache-control")).toBe("public, max-age=3600"); // public/_headers /assets/img/*
+    const body = new Uint8Array(await res.arrayBuffer());
+    expect(body.length).toBeGreaterThan(0);
+    // A real PNG frame, not an error page wearing a cache header.
+    expect(Array.from(body.subarray(0, 8))).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  });
+
+  it("chains end-to-end: unknown email hash → 303 → the default avatar serves 200", async () => {
+    const redirect = await serve("/avatar/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    expect(redirect.status).toBe(303);
+    const location = redirect.headers.get("location");
+    expect(location).toBe("/assets/img/avatar_default.png");
+    const terminal = await env.ASSETS.fetch(`https://assets.local${location}`);
+    expect(terminal.status).toBe(200);
+    expect(terminal.headers.get("content-type")).toBe("image/png");
+    expect(terminal.headers.get("cache-control")).toBe("public, max-age=3600");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /user/avatar/{username}/{size} — the AvatarByUsernameSize port
 // ---------------------------------------------------------------------------
 
