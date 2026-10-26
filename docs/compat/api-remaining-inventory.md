@@ -36,6 +36,14 @@ wiring `2b5b898`, wave-ui-parity-10 `fdaeaca`, the toolkit PAT
 preflight `2310623`) also carries **zero new operations**; the checker
 re-run at this HEAD reports 490/298, `PASS` unchanged. The window's
 landings join the post-490 ledger below.
+**Ticked 2026-10-26** a fifth time, at HEAD `58c6cf0`: maintenance only
+again — the `2310623..58c6cf0` window (6 commits: the generate-e2e
+failureTail + `--force-red` knob `ee88c1b`, P0 deploy evidence
+`2d64de1`, the tick-5 compat docs commit `64aa06a`, the attachments
+credential walk `7cd1ce9`, the tree-view envelope `831709f`, the
+page-domain rotation Set-Cookie re-wrap `58c6cf0`) carries **zero new
+operations**; the checker re-run at this HEAD reports 490/298, `PASS`
+unchanged. The window's landings join the post-490 ledger below.
 
 - **Sources / method**: frozen contract
   `apps/worker/src/compat/contract/v1-swagger.generated.json` (**554**
@@ -43,7 +51,7 @@ landings join the post-490 ledger below.
   issue 72, admin 33, miscellaneous 14, package 9, notification 7, settings 4)
   minus the declared set that `node scripts/check-openapi.mjs` reports
   (**490** operations across **298** paths, measured 2026-10-26 at HEAD
-  `2310623`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
+  `58c6cf0`; checker ends `PASS`, tier-1 coverage 78/78 paths, 129/129
   operations). Raw diff: **64 undeclared** = **64 remaining**, all
   FEATURE-ABSENT — no in-flight subtraction applies any more.
   Issue / notification / miscellaneous / settings families have **zero**
@@ -105,10 +113,14 @@ Empty at this tick. The regen's three in-flight pools all landed: the
 org-projects 21 (REG `20512c0`), the blocks-enforcement tail (`f2e1710`)
 and license-detection (`03d5fe4`/`04a2903` — the family is complete, 5/5
 arms), and the ui-parity-3 rows (`ca81d5a`). The tree's modifications at
-measurement time were this doc plus the in-flight `/{username}/-/projects`
-wave's uncommitted files under `apps/worker/src/ui/` and a scratch script
-— none of them spec-bearing as measured (the checker still reports
-490/298 in exactly this tree state).
+that tick's measurement time were this doc plus the then-in-flight
+`/{username}/-/projects` wave's uncommitted files under
+`apps/worker/src/ui/` and a scratch script — none of them spec-bearing
+as measured (the checker still reports 490/298 in exactly this tree
+state). At this tick's measurement (`58c6cf0`) the tree is CLEAN apart
+from the two compat docs themselves; the repo-scoped projects UI wave
+now in flight is dispatch-ownership, not visible files, and is
+UI-only — no undeclared op rides it.
 
 ---
 
@@ -178,7 +190,8 @@ grouped:
   seeding; discloses that `d24dc0f`'s own run was really 10-failed/25-passed
   behind a grep-masked exit code and brings the suite to the true 35/35;
   the gate change stands verified). The `9b49cd2..2310623` window adds
-  nothing here — no spec-bearing landing.
+  nothing here — no spec-bearing landing; neither does the
+  `2310623..58c6cf0` window.
 - **Migrations 0029–0032** landed with them (`size_kb`, `num_stars`/
   `num_watches`, `num_forks` + `users.num_stars`, push-mirror sync state) —
   still 64 tables; these are store work behind already-declared ops.
@@ -198,7 +211,17 @@ grouped:
   prerequisite, now committed), the attachments serving seam + its
   dispatch wiring (`5e082cd` + `2b5b898`), and wave-ui-parity-10
   (`fdaeaca` — the releases download tail, the `/render/*` family, the
-  fetch-action 200-JSON arms on both redirect twins).
+  fetch-action 200-JSON arms on both redirect twins). The
+  `2310623..58c6cf0` window adds the tree-view envelope (`831709f` —
+  the C-family fragments row's final half: the Go-faithful assembler
+  with the `goJsonString` port, submodule/symlink arms; the ws1009
+  posture extended — fileicon rides a DYNAMIC import edge, ~12MB out
+  of the startup snapshot, static re-kills the a11y worker) and the
+  attachments credential walk + its page-domain consumer re-wrap
+  (`7cd1ce9` + `58c6cf0` — token-first/session-cookie-fall-through
+  order per the pinned web group, rotation Set-Cookie re-wrapped on
+  every response and again at the consumer, the browser_download_url
+  owner probe added).
 - **Test/docs**: vitest contention config (`e4ebb9d`), release notes
   (`1c44086`), P0 deploy evidence (`d28d953`, `3d76cc6`), push-mirror SPEC
   (`998a4de`), schema-docstring catch-up (`e6ccf9c`). The
@@ -218,12 +241,24 @@ grouped:
   (`305ddc8` — the toolkit's debut: 7 scripted batteries, generate
   strict-clone PASS, the first forkpr-e2e production evidence, the
   release-gate CLOSED 201/422), and the tick-4 docs commit (`48f873f`).
+  The `2310623..58c6cf0` window adds P0 deploy evidence (`2d64de1` —
+  deploy 941ce4d0 @ `2310623`: board+fileicon+attachments+render+
+  releases-download first production traffic, the toolkit 7/7 +
+  silent-pass preflight debut; its NEW medium-low finding — the
+  attachments token-only walk, cookie-session owner 404s — is exactly
+  what `7cd1ce9` then cured) and the tick-5 compat docs commit
+  (`64aa06a`).
 - **Tooling**: the `9b49cd2..2310623` window adds the toolkit polish
   (`5fdbc15` — token optional for D1-only batteries, `MIRROR_SETTLE_MS`
   10s→30s + `--mirror-settle-ms`, the generic failureTail with the
   mirror sweep) and the toolkit PAT preflight (`2310623` — one
   `GET /user` per invocation, three fast-fail arms, zero repo creation
-  on mismatch).
+  on mismatch). The `2310623..58c6cf0` window adds the generate-e2e
+  failureTail (`ee88c1b` — template+generated sweep on red,
+  fullName-tracked, green runs silent, plus the GENERIC
+  `--force-red <check-id>` deterministic failure-shape knob; the
+  REDEPLOY16 incident shape force-reproduced exactly, following audit
+  green).
 
 ---
 
