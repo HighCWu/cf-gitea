@@ -46,14 +46,16 @@
  * settings options` → org/header.tmpl (the shared OrgHeader) →
  * `.ui.container.flex-container` carrying org/settings/navbar.tmpl's
  * `.flex-container-nav` menu and the options form. The navbar reduces to the
- * LIVE tabs: Options (this page) + Labels (our landed `/{org}/labels` page —
- * upstream's item targets `{.OrgLink}}/settings/labels`, the documented
- * wave-14 URL divergence; the target exists so the tab stays live); the
- * hooks/applications/blocked_users/packages/actions/audit_logs items have no
- * landed pages and render nothing (the dead-link rule). The org/menu strip
- * the header template includes reduces away on the same convention as the
- * landed org members/teams/labels pages (their headers also drop it — the
- * owner-only Settings item is the menu's only unlanded entry).
+ * LIVE tabs: Options (this page) + Hooks (wave 53 — the landed
+ * `/{org}/settings/hooks` tab, pages/org-settings-hooks.tsx, upstream's
+ * second navbar item) + Labels (our landed `/{org}/labels` page — upstream's
+ * item targets `{.OrgLink}}/settings/labels`, the documented wave-14 URL
+ * divergence; the target exists so the tab stays live); the applications/
+ * blocked_users/packages/actions/audit_logs items have no landed pages and
+ * render nothing (the dead-link rule). The org/menu strip the header
+ * template includes reduces away on the same convention as the landed org
+ * members/teams/labels pages (their headers also drop it — the owner-only
+ * Settings item is the menu's only unlanded entry).
  *
  * options.tmpl: the Organization header + attached segment form (full_name
  * maxlength 100, email maxlength 255, description textarea rows=2
@@ -149,6 +151,7 @@ import { orgDisplayName, OrgHeader } from "./org-home";
 export const orgSettingsLocale = {
   settings: "Settings", // "org.settings" (the navbar header)
   options: "Organization", // "org.settings.options" (the Options tab + header)
+  hooks: "Webhooks", // "repo.settings.hooks" (wave 53 — the hooks tab, the landed /settings/hooks page)
   labels: "Labels", // "repo.labels" (the one other live tab)
   full_name: "Organization Full Name", // "org.org_full_name_holder"
   email: "Contact Email Address", // "org.settings.email"
@@ -557,16 +560,23 @@ export async function applyOrgTeamDelete(d1: D1Database, team: TeamRecord): Prom
 // Components
 // ---------------------------------------------------------------------------
 
-/** The settings navbar (org/settings/navbar.tmpl reduced to the two live
- *  tabs — the module header's note; Options is always the active item on
- *  this page, Labels links the landed `/{org}/labels` page). */
-function SettingsNavbar(props: { orgLink: string }) {
+/** The settings navbar (org/settings/navbar.tmpl reduced to the live tabs —
+ *  the module header's note; Options is the active item on this page, Hooks
+ *  links the landed wave-53 `/{org}/settings/hooks` tab (upstream's second
+ *  item, navbar.tmpl:8-10), Labels the landed `/{org}/labels` page). Exported
+ *  for pages/org-settings-hooks.tsx, which renders it with `hooks` active
+ *  (the repo family's SettingsNav-host convention). */
+export function SettingsNavbar(props: { orgLink: string; active?: "options" | "hooks" }) {
+  const active = props.active ?? "options";
   return (
     <div class="flex-container-nav">
       <div class="ui fluid vertical menu">
         <div class="header item">{orgSettingsLocale.settings}</div>
-        <a class="active item" href={`${props.orgLink}/settings`}>
+        <a class={active === "options" ? "active item" : "item"} href={`${props.orgLink}/settings`}>
           {orgSettingsLocale.options}
+        </a>
+        <a class={active === "hooks" ? "active item" : "item"} href={`${props.orgLink}/settings/hooks`}>
+          {orgSettingsLocale.hooks}
         </a>
         <a class="item" href={`${props.orgLink}/labels`}>
           {orgSettingsLocale.labels}

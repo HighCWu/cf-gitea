@@ -585,15 +585,29 @@
  *                                          org/settings/options.tmpl — the
  *                                          landed orgEdit/renameOrg/
  *                                          orgDelete/avatar ops; the
- *                                          hooks/applications/labels/
- *                                          packages/actions/blocked_users/
- *                                          audit_logs TABS are separate
- *                                          pages this wave does not claim,
- *                                          the navbar reduces to the two
- *                                          live items; the `settings`
- *                                          literal shadows a repository so
- *                                          named exactly like upstream's
- *                                          group order)
+ *                                          applications/labels/packages/
+ *                                          actions/blocked_users/audit_logs
+ *                                          TABS are separate pages this
+ *                                          wave does not claim; the
+ *                                          `settings` literal shadows a
+ *                                          repository so named exactly
+ *                                          like upstream's group order)
+ *   /{org}/settings/hooks                  the org webhooks list + add form,
+ *                                          GET + POST
+ *   /{org}/settings/hooks/{id}             the org per-hook page, GET + POST
+ *   /{org}/settings/hooks/{id}/delete      the org hook delete, POST
+ *                                          (pages/org-settings-hooks.tsx —
+ *                                          wave 53; upstream web.go:1033-1044's
+ *                                          /hooks group over org/settings/
+ *                                          {hooks,hook_new}.tmpl — the
+ *                                          landed owner-scoped hook arms
+ *                                          (listOwnerHooks/createOwnerHook/
+ *                                          getOwnerHook/deleteOwnerHook +
+ *                                          the scope-agnostic editRepoHook,
+ *                                          routes/hooks-scopes.ts's org
+ *                                          family); no test/replay arms —
+ *                                          the module header's reductions;
+ *                                          the same require-owner posture)
  *   /{org}/teams/{id}/edit                 the team edit form, GET + POST
  *   /{org}/teams/{id}/delete               the team delete, POST
  *                                          (same module — web.go:1011-1013
@@ -765,6 +779,16 @@ import {
   storeOrgAvatar,
   teamEditFormFromTeam,
 } from "./pages/org-settings";
+// Wave-53 org settings hooks tab (the org-settings module's named next
+// slice — the landed owner-scoped hook arms under the /settings subtree).
+import {
+  createOrgHookFromForm,
+  deleteOrgHook,
+  loadOrgHookDetailData,
+  loadOrgHooksSettings,
+  renderOrgHookDetailPage,
+  renderOrgHooksSettingsPage,
+} from "./pages/org-settings-hooks";
 import {
   applyUserProfileForm,
   loadUserSettingsPageData,
@@ -1027,7 +1051,7 @@ import {
   type BranchProtectionEditData,
 } from "./pages/branch-protection";
 import { findIssueByRepoAndIndex } from "../api/services/issues";
-import { deleteRepoHook, getRepoHook } from "../api/services/hooks";
+import { deleteRepoHook, getOwnerHook, getRepoHook } from "../api/services/hooks";
 import { findPullRequestByIndex } from "../api/services/pulls";
 import { findRepositoryById } from "../api/services/repository";
 import { IssuesService } from "../issues/service";
@@ -1849,12 +1873,16 @@ export interface OrgSettingsRoute {
     | "org-settings-rename" // POST /{org}/settings/rename
     | "org-settings-delete" // POST /{org}/settings/delete
     | "org-settings-visibility" // POST /{org}/settings/visibility
+    | "org-settings-hooks" // GET+POST /{org}/settings/hooks (the webhooks list + add form — wave 53)
+    | "org-settings-hook-detail" // GET+POST /{org}/settings/hooks/{id} (the edit page — wave 53)
+    | "org-settings-hook-delete" // POST /{org}/settings/hooks/{id}/delete (wave 53)
     | "org-team-edit" // GET+POST /{org}/teams/{id}/edit
     | "org-team-delete" // POST /{org}/teams/{id}/delete
   ;
   /** Decoded org segment. */
   owner: string;
-  /** The team id (the team-edit/delete families only). */
+  /** The team id (the team-edit/delete families) or hook id (the org
+   * hook-detail/delete families — wave 53). */
   id?: number;
 }
 
@@ -2128,9 +2156,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // literal's prefix — /user/settings/* stays the user family's shapes, not
   // an org named "user"). The bare URL is the options combo; the deeper
   // literals are exactly upstream's POST segments (the avatar pair, the
-  // danger-zone rename/delete/visibility arms). Every other tail (the hooks/
+  // danger-zone rename/delete/visibility arms). Wave 53 (pages/
+  // org-settings-hooks.tsx) adds the `/hooks` group's shapes — web.go:1033-1044:
+  // the bare webhooks list + add-form combo and the {id} edit page (the
+  // shared WebHooksEdit; integer-id claim, the repo hooks-family
+  // PathParamInt64 parity so "007" parses as 7 and a negative 404-shells on
+  // the lookup) + the {id}/delete write (the landed repo page's arm-scoped
+  // convention — upstream's shared /delete?id= target is the list trash
+  // buttons' form, which this UI does not render). Every other tail (the
   // applications/packages/actions/blocked_users/audit_logs tabs — separate
-  // pages this wave does not claim) stays unclaimed → the engine's 404.
+  // pages not landed) stays unclaimed → the engine's 404.
   if (repo === "settings" && owner.toLowerCase() !== "user") {
     if (raw.length === 3) return { family: "org-settings", owner };
     if (raw.length === 4) {
@@ -2138,9 +2173,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (raw[3] === "rename") return { family: "org-settings-rename", owner };
       if (raw[3] === "delete") return { family: "org-settings-delete", owner };
       if (raw[3] === "visibility") return { family: "org-settings-visibility", owner };
+      if (raw[3] === "hooks") return { family: "org-settings-hooks", owner };
     }
     if (raw.length === 5 && raw[3] === "avatar" && raw[4] === "delete") {
       return { family: "org-settings-avatar-delete", owner };
+    }
+    if (raw.length === 5 && raw[3] === "hooks" && /^-?\d+$/.test(raw[4] as string)) {
+      return { family: "org-settings-hook-detail", owner, id: Number.parseInt(raw[4] as string, 10) };
+    }
+    if (raw.length === 6 && raw[3] === "hooks" && /^-?\d+$/.test(raw[4] as string) && raw[5] === "delete") {
+      return { family: "org-settings-hook-delete", owner, id: Number.parseInt(raw[4] as string, 10) };
     }
     return null;
   }
@@ -4274,6 +4316,125 @@ async function orgSettingsVisibilitySubmit(c: Context<{ Bindings: Env }>): Promi
   const visibility = parseOrgVisibilityForm(await readUrlEncodedForm(c.req.raw));
   await applyOrgVisibilityForm(c.env.DB, org, visibility);
   return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings` } }));
+}
+
+// ---------------------------------------------------------------------------
+// The wave-53 org settings hooks tab (pages/org-settings-hooks.tsx —
+// upstream's web.go:1033-1044 /hooks group: org.Webhooks + org.DeleteWebhook
+// over the landed owner-scoped arms, and the shared WebHooksEdit /
+// GiteaHooksEditPost org-scope shapes)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{org}/settings/hooks (pages/org-settings-hooks.tsx — the webhooks
+ * list + add form over the landed `listOwnerHooks` arm). The org-teams
+ * prologue is family-agnostic and serves unchanged: anonymous 303s onto the
+ * login round-trip, a signed-in non-owner 404-shells (upstream's
+ * RequireOwner OrgAssignment NotFound), a renamed org 307s onto the new name.
+ */
+async function orgHooksSettingsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond } = resolved;
+  if (resolved.route.family !== "org-settings-hooks") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgHooksSettings(c.env.DB, resolved.org);
+  return respond(c.html(renderOrgHooksSettingsPage({ ctx, data, error: null }), 200));
+}
+
+/**
+ * POST /{org}/settings/hooks (upstream's addWebhookAddRoutes reduced to the
+ * single landed provider — pages/org-settings-hooks.tsx's header — over the
+ * landed `createOwnerHook`, the orgCreateHook API arm's service): the §2.8
+ * Origin guard, the shared prologue, then the write — the
+ * checkCreateHookOption 422s re-render the list at 200 with the message and
+ * the kept submission (the repo hooks-page convention), success 303s back
+ * onto the list (upstream's redirect arm).
+ */
+async function orgHooksSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-hooks") return respond(await c.notFound()); // drift guard
+  const form = parseCreateHookForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createOrgHookFromForm(c.env.DB, org, form);
+  if (result.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/hooks` } }));
+  }
+  const data = await loadOrgHooksSettings(c.env.DB, org);
+  data.form = { name: form.name, payloadUrl: form.payloadUrl, contentType: form.contentType };
+  return respond(c.html(renderOrgHooksSettingsPage({ ctx, data, error: result.message }), 200));
+}
+
+/**
+ * GET /{org}/settings/hooks/{id} (pages/org-settings-hooks.tsx — the edit
+ * page over the landed `getOwnerHook` arm): the shared prologue, the drift
+ * guard, then the org-scoped hook read — an unknown or foreign-org id
+ * 404-shells (the landed DELETE arm's 404, existence stays hidden).
+ */
+async function orgHookDetailPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-settings-hook-detail" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  const data = await loadOrgHookDetailData(c.env.DB, resolved.org, route.id);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderOrgHookDetailPage({ ctx, data, error: null }), 200));
+}
+
+/**
+ * POST /{org}/settings/hooks/{id} — the edit write (upstream
+ * GiteaHooksEditPost's org-scope shape over the landed PATCH arm's service —
+ * `editRepoHook` is scope-agnostic by construction and the org API arm calls
+ * the very same function, routes/hooks-scopes.ts:521): the §2.8 guard, the
+ * shared prologue, the org-scoped hook read, then the form write — the 422
+ * validations re-render at 200 with the message and the kept submission (the
+ * repo hooks-page convention), success 303s back onto the page (upstream
+ * editWebhook's redirect). The POST rides the page URL — upstream
+ * type-prefixes it (`/gitea/{id}`); the repo page's divergence note.
+ */
+async function orgHookDetailSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-settings-hook-detail" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  const hook = await getOwnerHook(c.env.DB, org.id, route.id);
+  if (hook === null) return respond(c.html(renderNotFound(ctx), 404));
+  const hookLink = `/${org.username}/settings/hooks/${hook.id}`;
+  const form = parseHookEditForm(await readUrlEncodedForm(c.req.raw));
+  const result = await editHookFromForm(c.env.DB, hook, form);
+  if (result.outcome === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: hookLink } }));
+  }
+  const data = await loadOrgHookDetailData(c.env.DB, org, hook.id);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  data.form = form;
+  return respond(c.html(renderOrgHookDetailPage({ ctx, data, error: result.message }), 200));
+}
+
+/**
+ * POST /{org}/settings/hooks/{id}/delete — upstream DeleteWebhook's org arm
+ * (org/setting.go:175-187) over the landed `deleteOwnerHook` (the arm-scoped
+ * tail — the repo hooks-page convention, the module header): success 303s
+ * onto the hooks list (upstream JSONRedirect's target); a miss 404-shells
+ * (the landed DELETE arm's 404 — existence stays hidden).
+ */
+async function orgHookDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-settings-hook-delete" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  const deleted = await deleteOrgHook(c.env.DB, org, route.id);
+  if (!deleted) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/hooks` } }));
 }
 
 /**
@@ -7190,6 +7351,19 @@ uiRouter.post("/:owner/settings/delete", (c) => orgSettingsDeleteSubmit(c));
 uiRouter.get("/:owner/settings/delete", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/settings/visibility", (c) => orgSettingsVisibilitySubmit(c));
 uiRouter.get("/:owner/settings/visibility", () => methodNotAllowed("POST"));
+// Wave-53 org settings hooks tab (parseUiRoute claims exactly these
+// shapes — web.go:1033-1044's /hooks group). No earlier registration can
+// absorb these: /:owner/settings/hooks is a 4-segment literal-second
+// shape (every /:owner/:repo/settings* line needs FIVE segments, and no
+// other 4-segment line carries a "settings" second segment), the {id}
+// tails are deeper still, and the GET on the POST-only delete tail
+// answers chi's 405 (the repo hooks-family convention).
+uiRouter.get("/:owner/settings/hooks", (c) => orgHooksSettingsPage(c));
+uiRouter.post("/:owner/settings/hooks", (c) => orgHooksSettingsSubmit(c));
+uiRouter.get("/:owner/settings/hooks/:id", (c) => orgHookDetailPage(c));
+uiRouter.post("/:owner/settings/hooks/:id", (c) => orgHookDetailSubmit(c));
+uiRouter.post("/:owner/settings/hooks/:id/delete", (c) => orgHookDeleteSubmit(c));
+uiRouter.get("/:owner/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
 // Wave-14 org labels family (parseUiRoute claims exactly these shapes; the
 // literal `labels` registers with the wave-9/12 statics so it beats the
 // dynamic /:owner/:repo pair — the wave-9 RegExpRouter note). The three

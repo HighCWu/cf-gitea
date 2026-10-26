@@ -171,9 +171,11 @@ describe("wave-49 parser families (parseUiRoute / handlesUiRoute)", () => {
   });
 
   it("leaves the unclaimed tabs and deeper junk with the engine", () => {
-    // The hooks/applications/labels/... tabs are separate upstream pages this
-    // wave does not claim; every other tail stays engine-owned.
-    expect(parseUiRoute("/acme/settings/hooks")).toBeNull();
+    // The applications/labels/... tabs are separate upstream pages still not
+    // claimed; every other tail stays engine-owned. (Wave 53 lifted the
+    // hooks tab out of this set — pages/org-settings-hooks.tsx — so
+    // /acme/settings/hooks now parses to its own family.)
+    expect(parseUiRoute("/acme/settings/hooks")).toEqual({ family: "org-settings-hooks", owner: "acme" });
     expect(parseUiRoute("/acme/settings/labels")).toBeNull();
     expect(parseUiRoute("/acme/settings/applications")).toBeNull();
     expect(parseUiRoute("/acme/settings/blocked_users")).toBeNull();
@@ -227,11 +229,11 @@ describe("GET /{org}/settings (the requireOrgOwnership posture)", () => {
       expect(html).toContain('name="full_name"');
       expect(html).toContain('name="repo_admin_change_team_access"');
       expect(html).toContain('action="/setorg/settings"');
-      // The two live navbar items (Options active; Labels onto the landed
-      // wave-14 page — the URL divergence).
+      // The live navbar items (Options active; Hooks onto the wave-53 page;
+      // Labels onto the landed wave-14 page — the URL divergence).
       expect(html).toContain('<a class="active item" href="/setorg/settings">');
+      expect(html).toContain('<a class="item" href="/setorg/settings/hooks">');
       expect(html).toContain('<a class="item" href="/setorg/labels">');
-      expect(html).not.toContain("/setorg/settings/hooks");
       // The danger zone's three rows, each a <details> form.
       expect(html).toContain("Danger Zone");
       expect(html).toContain('action="/setorg/settings/visibility"');
