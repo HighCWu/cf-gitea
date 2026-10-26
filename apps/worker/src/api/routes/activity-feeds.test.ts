@@ -420,3 +420,35 @@ describe("activity feeds — repo feeds read original rows only", () => {
     expect((await res.json<unknown[]>()).length).toBe(1);
   });
 });
+
+describe("activity feeds — the is_deleted read filter (GetFeeds parity pin)", () => {
+  // Upstream's feed reads filter is_deleted=false in BOTH branches of
+  // GetFeeds (models/activities/action_list.go:222-224 fast path,
+  // models/activities/action.go:539-541 ActivityQueryCondition; only the
+  // heatmap passes IncludeDeleted: true, user_heatmap.go:55). Nothing in
+  // upstream sets the flag (repo delete hard-deletes the rows,
+  // services/repository/delete.go:155-157), and ours likewise never writes
+  // it true — the filter is the parity arm, pinned here against regressions.
+
+  it("hides is_deleted rows from the repo and user feeds (total included)", async () => {
+    await emitIssueOpened({ repoId: REPO_ID, isPrivate: false, senderId: 1 });
+    await env.DB.prepare("UPDATE action SET is_deleted = 1 WHERE repo_id = ?").bind(REPO_ID).run();
+
+    const repoFeed = await feedsApp(`/repos/alice/repo/activities/feeds`);
+    expect(repoFeed.status).toBe(200);
+    expect(repoFeed.headers.get("X-Total-Count")).toBe("0");
+    expect(await repoFeed.json<unknown[]>()).toHaveLength(0);
+
+    const userFeed = await feedsApp(`/users/cf-gitea-stub/activities/feeds`, authed({}));
+    expect(userFeed.status).toBe(200);
+    expect(userFeed.headers.get("X-Total-Count")).toBe("0");
+    expect(await userFeed.json<unknown[]>()).toHaveLength(0);
+  });
+
+  it("keeps is_deleted=false rows visible (the filter is the only arm)", async () => {
+    await emitIssueOpened({ repoId: REPO_ID, isPrivate: false, senderId: 1 });
+    const res = await feedsApp(`/repos/alice/repo/activities/feeds`);
+    expect(res.headers.get("X-Total-Count")).toBe("1");
+    expect(await res.json<unknown[]>()).toHaveLength(1);
+  });
+});

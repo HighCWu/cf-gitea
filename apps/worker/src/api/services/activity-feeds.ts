@@ -331,10 +331,21 @@ function repoAccessCond(opts: FeedQueryOptions): SQL | undefined {
   )`;
 }
 
-/** The full WHERE predicate (§3.4 conditions 1-7). The fast path
- *  (action_list.go:215 — actor is the requested subject or a site admin)
- *  skips BOTH the act-user visibility filter and the repo-accessibility
- *  filter, exactly like upstream's short-circuited condition. */
+/**
+ * The full WHERE predicate (§3.4 conditions 1-7). The fast path
+ * (action_list.go:215 — actor is the requested subject or a site admin)
+ * skips BOTH the act-user visibility filter and the repo-accessibility
+ * filter, exactly like upstream's short-circuited condition.
+ *
+ * The is_deleted filter is UNCONDITIONAL here — unlike the visibility
+ * filters it also applies on the self/admin fast path, which is upstream's
+ * shape too (action_list.go:222-224 fast path + action.go:539-541 general
+ * path both add `is_deleted = false`). Nothing writes the flag true on
+ * either side (repo delete HARD-deletes the rows: upstream
+ * services/repository/delete.go:155-157 DeleteBeans; the ported arm is the
+ * repo_id-keyed DELETE in repos/service.ts) — the filter is the parity arm
+ * for any soft-deleted shape and is pinned by activity-feeds.test.ts.
+ */
 function feedCondition(opts: FeedQueryOptions): SQL | undefined {
   const parts: (SQL | undefined)[] = [eq(actions.isDeleted, false)];
 

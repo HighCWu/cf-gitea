@@ -46,6 +46,7 @@ import type { Registry } from "@cf-gitea/git-engine";
 
 import { IssuesService } from "../issues/service";
 import {
+  actions,
   comments,
   commitStatuses,
   issueLabels,
@@ -649,6 +650,20 @@ export class RepoService {
       // {RepoID: repoID}, services/repository/delete.go:171). The schema's
       // repo-scoped convention (no FK) already promised this sweep.
       this.db.delete(protectedBranches).where(eq(protectedBranches.repoId, repoId)),
+      // Activity rows die with the repo — the REDEPLOY11/12 carried issue
+      // (probe operators hand-swept orphan `action` rows twice). Upstream's
+      // DeleteBeans census carries `&activities_model.Action{RepoID:
+      // repo.ID}` (services/repository/delete.go:155-157): every
+      // NotifyWatchers receiver copy keys on repo_id, so one repo_id-keyed
+      // DELETE sweeps originals and fan-out copies alike. Upstream does NOT
+      // write is_deleted=1 — no production writer sets that flag at the pin
+      // (models/activities/action_list.go:222-224 + action.go:539-541 are
+      // read filters only) — the landed schema contract agrees (db/schema.ts
+      // actions docstring: "repo deletion cascades rows away with the repo
+      // row"); the feeds' `is_deleted=false` read filter
+      // (activity-feeds.ts feedCondition) stays the parity arm it already
+      // is.
+      this.db.delete(actions).where(eq(actions.repoId, repoId)),
       this.db.delete(repoRedirects).where(eq(repoRedirects.redirectRepoId, repoId)),
       this.db.delete(repoTransfer).where(eq(repoTransfer.repoId, repoId)),
       // The row is gone: git requests miss at repo resolution; the §4.1 race
