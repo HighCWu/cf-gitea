@@ -248,7 +248,10 @@ describe("GET /{owner}/{repo}/commit/{sha} (the commit view)", () => {
 
   it("404-shells the non-hex, unresolvable-hex and short-prefix shas", async () => {
     const tip = (await tips())[1] as string;
-    for (const sha of ["HEAD", "nothex", "z".repeat(40), "0".repeat(40), tip.slice(0, 7), `${tip}.patch`]) {
+    // (wave 29 lifted the dotted `${tip}.patch` shape into the diffpatch
+    // download family — its 200 contract lives in
+    // pages-wave29-diffpatch-files.test.ts.)
+    for (const sha of ["HEAD", "nothex", "z".repeat(40), "0".repeat(40), tip.slice(0, 7)]) {
       const res = await fetchUi(`/alice/wave18cv/commit/${sha}`);
       expect(res.status, sha).toBe(404);
     }

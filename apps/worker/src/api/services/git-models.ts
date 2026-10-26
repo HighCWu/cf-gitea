@@ -546,8 +546,15 @@ function rfc2822(person: Person): string {
   );
 }
 
-/** `git format-patch`-style rendering for the `.{diffType}` download family. */
-export function renderPatch(commit: CommitJson, files: DiffFileJson[]): string {
+/**
+ * `git format-patch`-style rendering for the `.{diffType}` download family.
+ * The trailing `-- \n{version}` signature is git's format-patch default (what
+ * the PR download serves — services/pull/patch.go GetPatch); the commit
+ * download passes `signature: null` for GetRawDiff's `--no-signature` flag
+ * (modules/git/diff.go:73, the web.go:1760 arm).
+ */
+export function renderPatch(commit: CommitJson, files: DiffFileJson[], options?: { signature?: string | null }): string {
+  const signature = options?.signature === undefined ? "2.47.0" : options.signature;
   const body = commit.message.split("\n");
   const subject = body[0] ?? "";
   const rest = body.slice(1).join("\n").replace(/^\n+/, "");
@@ -559,7 +566,8 @@ export function renderPatch(commit: CommitJson, files: DiffFileJson[]): string {
     "",
   ];
   if (rest !== "") out.push(rest, "");
-  out.push("---", renderUnifiedDiff(files), "-- ", "2.47.0", "");
+  out.push("---", renderUnifiedDiff(files));
+  if (signature !== null) out.push("-- ", signature, "");
   return out.join("\n");
 }
 

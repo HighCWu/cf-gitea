@@ -401,6 +401,23 @@
  *                                          303 onto the fork's home;
  *                                          anonymous 303s onto /login, an
  *                                          empty source 404s)
+ *   /:owner/:repo/commit/{sha}.{diff|patch}
+ *   /:owner/:repo/pulls/{index}.{diff|patch}
+ *                                          the diffpatch file downloads,
+ *                                          GET (pages/diffpatch-files.ts —
+ *                                          wave 29; the survey's row 4,
+ *                                          upstream web.go:1760 repo.RawDiff
+ *                                          + web.go:1657-1658
+ *                                          DownloadPullDiff/Patch — raw
+ *                                          text, not pages: the plain
+ *                                          unified diff or the git-am mail
+ *                                          shape over the landed
+ *                                          renderUnifiedDiff/renderPatch +
+ *                                          engineReads.readDiff /
+ *                                          pullRequestDiff; short-sha
+ *                                          prefixes 404 per the engine's
+ *                                          full-oid rule, the commit-view
+ *                                          divergence)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -627,6 +644,10 @@ import {
   renderNewIssuePage,
 } from "./pages/new-issue";
 import { loadPullFilesData, renderPullFilesPage } from "./pages/pull-files";
+// Wave-29 diffpatch downloads (the survey's row 4 — the four raw-text
+// .diff/.patch routes; the loaders + Response builder live in the module,
+// the handlers here beside their sibling dispatchers).
+import { diffPatchTextResponse, loadCommitDiffPatch, loadPullDiffPatch } from "./pages/diffpatch-files";
 import { loadPullCommitsData, renderPullCommitsPage } from "./pages/pull-commits";
 import { loadCommitViewData, renderCommitViewPage } from "./pages/commit-view";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
@@ -851,12 +872,14 @@ export interface BranchesRoute {
  *  the parity survey's #1 dead-end, the target of every commits-log /
  *  branches-list / PR-commits ShortSha link. The EXACT single-segment tail
  *  claims for ANY segment value (the hex-shape gate is the loader's 404
- *  arm — a non-hex segment, including the web.go:1760 `.{patch|diff}`
- *  dotted forms, answers the §4.5 shell like upstream's pattern-miss 404
- *  until the RawDiff slice lands); every DEEPER tail (`/load-branches-and-
- *  tags`, junk) stays engine-owned (see the page module's divergence
- *  notes). The bare `/commit` URL is unclaimed too (upstream has no such
- *  route). */
+ *  arm — a non-hex segment, including a non-hex `foo.diff` dotted form,
+ *  answers the §4.5 shell like upstream's pattern-miss 404); every DEEPER
+ *  tail (`/load-branches-and-tags`, junk) stays engine-owned (see the page
+ *  module's divergence notes). The bare `/commit` URL is unclaimed too
+ *  (upstream has no such route). Wave 29 lifted the HEX-shaped dotted
+ *  segments (`{sha}.{diff|patch}` — upstream web.go:1760) into the
+ *  DiffPatchRoute download family below; this arm keeps every other
+ *  segment. */
 export interface CommitViewRoute {
   family: "commit-view";
   owner: string;
@@ -1037,6 +1060,30 @@ export interface RepoForkRoute {
   family: "repo-fork";
   owner: string;
   repo: string;
+}
+
+/** The wave-29 diffpatch download family (pages/diffpatch-files.ts): the
+ *  four raw-text routes — upstream web.go:1760's
+ *  `/commit/{sha:([a-f0-9]{7,64})}.{ext:patch|diff}` (repo.RawDiff) and
+ *  web.go:1657-1658's `/{index}.diff` + `/{index}.patch` under the pulls
+ *  group (repo.DownloadPullDiff/Patch). The commit arm claims the DOTTED
+ *  hex-shaped segment (7..64, case-folded — the load-time shape gate) out of
+ *  wave-18's any-value single tail; every other segment keeps the commit-view
+ *  claim (a non-hex `foo.diff` 404-shells there, upstream's pattern miss).
+ *  The pull arm admits `\\d+.{diff|patch}` exactly (the landed API seam's
+ *  convention — a negative or junk index upstream-404s too, chi's
+ *  PathParamInt64 miss). The response is raw TEXT, not a page (the module
+ *  doc carries the contract). */
+export interface DiffPatchRoute {
+  family: "commit-diffpatch" | "pull-diffpatch";
+  owner: string;
+  repo: string;
+  /** The commit family: the sha segment before the `.ext` suffix. */
+  sha?: string;
+  /** The pull family: the numeric index. */
+  index?: number;
+  /** The raw format the `.ext` suffix picked. */
+  ext: "diff" | "patch";
 }
 
 
@@ -1256,7 +1303,8 @@ export type ParsedUiRoute =
   | RepoLabelsRoute
   | MilestoneDetailRoute
   | MilestoneEditRoute
-  | RepoForkRoute;
+  | RepoForkRoute
+  | DiffPatchRoute;
 
 
 /**
@@ -1492,6 +1540,24 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     ) {
       return { family: "pull-review-submit", owner, repo, index: Number.parseInt(rest[0] as string, 10) };
     }
+    // Wave-29 (the survey's row 4): the raw-text download tails
+    // `/{index}.{diff|patch}` — upstream web.go:1657-1658's pair under the
+    // pulls group. Positive integers exactly (the landed API seam's
+    // `^(\d+)\.(diff|patch)$` convention; a negative or junk index 404s in
+    // upstream too — chi's PathParamInt64 miss — and stays engine-owned
+    // here, the unregistered-route answer).
+    if (head === "pulls" && rest.length === 1) {
+      const dotted = /^(\d+)\.(diff|patch)$/.exec(rest[0] as string);
+      if (dotted !== null) {
+        return {
+          family: "pull-diffpatch",
+          owner,
+          repo,
+          index: Number.parseInt(dotted[1] as string, 10),
+          ext: dotted[2] as "diff" | "patch",
+        };
+      }
+    }
     return null;
   }
   if (head === "settings") {
@@ -1719,6 +1785,23 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       sha = decodeURIComponent(rest[0] as string);
     } catch {
       return null;
+    }
+    // Wave-29 (the survey's row 4): the raw-text download tails
+    // `{sha}.{diff|patch}` — upstream web.go:1760's
+    // `{sha:([a-f0-9]{7,64})}.{ext:patch|diff}` route lifts the hex-shaped
+    // dotted segment into the download family (the case folding is the
+    // landed COMMIT_SHA convention); every other segment keeps the wave-18
+    // commit-view claim (a non-hex `foo.diff` 404-shells there, upstream's
+    // pattern-miss answer).
+    const dotted = /^([0-9a-f]{7,64})\.(diff|patch)$/i.exec(sha);
+    if (dotted !== null) {
+      return {
+        family: "commit-diffpatch",
+        owner,
+        repo,
+        sha: dotted[1] as string,
+        ext: dotted[2] as "diff" | "patch",
+      };
     }
     return { family: "commit-view", owner, repo, sha };
   }
@@ -3678,6 +3761,42 @@ async function commitViewPage(c: Context<{ Bindings: Env }>): Promise<Response> 
 }
 
 // ---------------------------------------------------------------------------
+// The wave-29 diffpatch download family (pages/diffpatch-files.ts — the
+// survey's row 4: upstream web.go:1760 repo.RawDiff + web.go:1657-1658
+// DownloadPullDiff/Patch)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{owner}/{repo}/commit/{sha}.{diff|patch} +
+ * GET /{owner}/{repo}/pulls/{index}.{diff|patch}: the raw-text downloads.
+ * Upstream serves them from the web mux (no /api/v1 op): raw diff/patch
+ * text with the sniffed text/plain content type and the context middleware's
+ * zero-option prod Cache-Control (the module doc cites the arms). The
+ * answer is not a page — the router returns the plain Response (the
+ * tree-redirect precedent); the 404 family (missing/non-pull row, wrong-sha
+ * shape, unresolvable oid — the short-prefix divergence) answers the §4.5
+ * shell like upstream's ctx.NotFound.
+ */
+async function diffpatchFileDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family === "commit-diffpatch") {
+    if (route.sha === undefined) return respond(await c.notFound()); // drift guard
+    const body = await loadCommitDiffPatch(c.env, repo, route.sha, route.ext);
+    if (body === null) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(diffPatchTextResponse(body));
+  }
+  if (route.family === "pull-diffpatch") {
+    if (route.index === undefined) return respond(await c.notFound()); // drift guard
+    const body = await loadPullDiffPatch(c, repo.id, route.index, route.ext);
+    if (body === null) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(diffPatchTextResponse(body));
+  }
+  return respond(await c.notFound()); // drift guard
+}
+
+// ---------------------------------------------------------------------------
 // The wave-20 releases family (pages/releases.tsx — upstream's web.go:1505-
 // 1527 group at the landed api/services/releases.ts + release-assets.ts
 // reads and the SPEC-0005 create arm)
@@ -4484,6 +4603,13 @@ uiRouter.post("/:owner/:repo/issues/dismiss_review", (c) => pullReviewDismissSub
 uiRouter.get("/:owner/:repo/issues/dismiss_review", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/issues/:index", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls", (c) => uiPage(c));
+// Wave-29 diffpatch downloads (parseUiRoute claims exactly the dotted
+// `\\d+.{diff|patch}` tail — upstream web.go:1657-1658). The narrow dotted
+// pattern registers BEFORE the broad :index line so first-match-wins keeps
+// the undotted shapes with the page dispatch (verified against this Hono
+// pin's getPattern greedy-brace regex; unclaimed shapes never reach the
+// sub-app — the dispatcher consults handlesUiRoute first).
+uiRouter.get("/:owner/:repo/pulls/:dpindex{(\\d+)\\.(?:diff|patch)}", (c) => diffpatchFileDownload(c));
 uiRouter.get("/:owner/:repo/pulls/:index", (c) => uiPage(c));
 // Wave-5 write/read families (parseUiRoute claims exactly these shapes;
 // the POSTs run the §2.8 sameOriginGuard first — session.ts's convention).
@@ -4546,6 +4672,13 @@ uiRouter.get("/:owner/:repo/settings/branches/:id/delete", () => methodNotAllowe
 uiRouter.get("/:owner/:repo/branches", (c) => branchesPage(c));
 uiRouter.post("/:owner/:repo/branches/delete", (c) => branchDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/branches/delete", () => methodNotAllowed("POST"));
+// Wave-29 diffpatch downloads (parseUiRoute claims exactly the dotted
+// hex `{sha}.{diff|patch}` tail — upstream web.go:1760's RawDiff route).
+// The narrow dotted pattern registers BEFORE the wave-18 broad :sha line so
+// first-match-wins keeps the undotted shapes with the commit view (the
+// pulls-pair registration note; `ABC.diff` misses the hex shape and lands
+// in the commit view's 404-shell loader, upstream's pattern-miss answer).
+uiRouter.get("/:owner/:repo/commit/:dpsha{[0-9a-f]{7,64}\\.(?:diff|patch)}", (c) => diffpatchFileDownload(c));
 // Wave-18 commit-view family (parseUiRoute claims exactly the
 // single-segment `{sha}` shape — upstream's web.go:1739 route; the
 // ShortSha links every landed list page emits resolve from here).
