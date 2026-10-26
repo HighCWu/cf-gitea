@@ -1162,6 +1162,39 @@ import { findPullRequestByIndex } from "../api/services/pulls";
 import { findRepositoryById } from "../api/services/repository";
 import { IssuesService } from "../issues/service";
 import type { OrgRecord } from "../services/orgs/orgs";
+// Window-2d: the four repo-settings tab modules.
+import {
+  applyRepoGitHook,
+  loadRepoGitHookEdit,
+  loadRepoGitHooks,
+  parseRepoGitHookForm,
+  renderRepoGitHookEditPage,
+  renderRepoGitHooksListPage,
+} from "./pages/repo-settings-githooks";
+import {
+  applyTagProtectionForm,
+  deleteTagRuleById,
+  editFormOfTag,
+  emptyTagProtectionForm,
+  loadProtectedTagRules,
+  loadTagRuleById,
+  parseTagProtectionForm,
+  renderTagProtectionPage,
+} from "./pages/repo-settings-tags";
+import {
+  addDeployKeyFromForm,
+  deleteDeployKeyFromForm,
+  loadRepoDeployKeys,
+  parseDeployKeyDeleteForm,
+  parseDeployKeyForm,
+  renderRepoDeployKeysPage,
+} from "./pages/repo-settings-deploy-keys";
+import {
+  loadRepoPublicAccess,
+  parsePublicAccessForm,
+  renderRepoPublicAccessPage,
+  updateCodeUnitPublicAccess,
+} from "./pages/repo-settings-public-access";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -1255,12 +1288,23 @@ export interface SettingsRoute {
     | "settings-branches"
     | "settings-branch-edit"
     | "settings-branch-delete"
-    | "settings-branch-priority";
+    | "settings-branch-priority"
+    // Window-2d: the four settings-tab modules.
+    | "settings-githooks" // GET /settings/hooks/git
+    | "settings-githook" // GET+POST /settings/hooks/git/{name}
+    | "settings-tags" // GET+POST /settings/tags
+    | "settings-tags-delete" // POST /settings/tags/delete
+    | "settings-tag-detail" // GET+POST /settings/tags/{id}
+    | "settings-keys" // GET+POST /settings/keys
+    | "settings-keys-delete" // POST /settings/keys/delete
+    | "settings-public-access"; // GET+POST /settings/public_access
   owner: string;
   repo: string;
   /** The hook id (the detail/test/delete families only) or the rule id (the
-   *  branch-delete family). */
+   *  branch-delete family, the tag-detail family). */
   id?: number;
+  /** The Git hook name (the settings-githook family). */
+  name?: string;
 }
 
 /** The wave-5 comment-write family (pages/issue-detail.tsx): upstream
@@ -2676,6 +2720,29 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (head === "settings") {
     if (rest.length === 0) return { family: "settings", owner, repo };
     if (rest.length === 1 && rest[0] === "hooks") return { family: "settings-hooks", owner, repo };
+    // Window-2d: the four settings-tab modules. The githooks group claims
+    // BEFORE the numeric hooks/{id} block could matter ("git" fails the
+    // numeric guard — explicit claims keep both owners unambiguous).
+    if (rest.length === 2 && rest[0] === "hooks" && rest[1] === "git") {
+      return { family: "settings-githooks", owner, repo };
+    }
+    if (rest.length === 3 && rest[0] === "hooks" && rest[1] === "git" && rest[2] !== undefined && rest[2] !== "") {
+      return { family: "settings-githook", owner, repo, name: decodeURIComponent(rest[2]) };
+    }
+    if (rest.length === 1 && rest[0] === "tags") return { family: "settings-tags", owner, repo };
+    if (rest.length === 2 && rest[0] === "tags" && rest[1] === "delete") {
+      return { family: "settings-tags-delete", owner, repo };
+    }
+    if (rest.length === 2 && rest[0] === "tags" && /^-?\d+$/.test(rest[1] as string)) {
+      return { family: "settings-tag-detail", owner, repo, id: Number.parseInt(rest[1] as string, 10) };
+    }
+    if (rest.length === 1 && rest[0] === "keys") return { family: "settings-keys", owner, repo };
+    if (rest.length === 2 && rest[0] === "keys" && rest[1] === "delete") {
+      return { family: "settings-keys-delete", owner, repo };
+    }
+    if (rest.length === 1 && rest[0] === "public_access") {
+      return { family: "settings-public-access", owner, repo };
+    }
     // Wave 10: the mirror panel (the brief's literal URL; upstream renders
     // the section on options.tmpl — pages/settings.tsx's divergence note).
     if (rest.length === 1 && rest[0] === "mirror") return { family: "settings-mirror", owner, repo };
@@ -3526,6 +3593,216 @@ async function settingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
   const data = await loadRepoBasics(c.env.DB, repo);
   data.form = { name: form.name, description: form.description, isPrivate: form.isPrivate };
   return respond(c.html(renderRepoSettingsPage({ ctx, data, error: result.message }), 200));
+}
+
+// ---------------------------------------------------------------------------
+// Window-2d: the four settings-tab modules (githooks, protected tags,
+// deploy keys, public access) — the shared settingsGate posture, drift
+// guards per family, sameOriginGuard-first POSTs.
+// ---------------------------------------------------------------------------
+
+async function repoGitHooksPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { respond } = resolved;
+  if (resolved.route.family !== "settings-githooks") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoGitHooks(c.env.REPO_PACKS, resolved.repo);
+  return respond(c.html(renderRepoGitHooksListPage({ ctx: resolved.ctx, data }), 200));
+}
+
+async function repoGitHookEditPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-githook" || route.name === undefined) return respond(await c.notFound()); // drift guard
+  // ErrNotValidHook → the 404 shell (the module handoff).
+  const data = await loadRepoGitHookEdit(c.env.REPO_PACKS, resolved.repo, route.name);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderRepoGitHookEditPage({ ctx, data }), 200));
+}
+
+async function repoGitHookSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-githook" || route.name === undefined) return respond(await c.notFound()); // drift guard
+  const form = parseRepoGitHookForm(await readUrlEncodedForm(c.req.raw));
+  const data = await loadRepoGitHookEdit(c.env.REPO_PACKS, repo, route.name);
+  if (data === null) return respond(c.html(renderNotFound(resolved.ctx), 404));
+  await applyRepoGitHook(c.env.REPO_PACKS, repo, route.name, form);
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/hooks/git` } }));
+}
+
+async function repoTagsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond, url } = resolved;
+  if (resolved.route.family !== "settings-tags") return respond(await c.notFound()); // drift guard
+  const editParam = url.searchParams.get("id");
+  const editId = editParam !== null && /^\d+$/.test(editParam) ? Number.parseInt(editParam, 10) : null;
+  const row = editId === null ? null : await loadTagRuleById(c.env.DB, repo.id, editId);
+  const data = {
+    rules: await loadProtectedTagRules(c.env.DB, repo),
+    isOrg: await loadOwnerIsOrg(c.env.DB, repo),
+    form: row !== null ? await editFormOfTag(c.env.DB, row) : emptyTagProtectionForm(),
+    editing: row,
+    saved: url.searchParams.get("saved") === "1",
+  };
+  return respond(c.html(renderTagProtectionPage({ ctx, data, error: null }), 200));
+}
+
+async function repoTagsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-tags" && route.family !== "settings-tag-detail") return respond(await c.notFound()); // drift guard
+  if (route.family === "settings-tag-detail" && route.id === undefined) return respond(await c.notFound());
+  // RepoMustNotBeArchived rides the POSTs (web.go:1216-1220).
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404));
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parseTagProtectionForm(await readUrlEncodedForm(c.req.raw));
+  const result = await applyTagProtectionForm(c.env.DB, pair, form);
+  if (result.outcome === "created" || result.outcome === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/tags?saved=1` } }));
+  }
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const data = {
+    rules: await loadProtectedTagRules(c.env.DB, repo),
+    isOrg: await loadOwnerIsOrg(c.env.DB, repo),
+    form,
+    editing: null,
+    saved: false,
+  };
+  return respond(c.html(renderTagProtectionPage({ ctx, data, error: result.message }), 200));
+}
+
+async function repoTagDetailPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-tag-detail" || route.id === undefined) return respond(await c.notFound()); // drift guard
+  const row = await loadTagRuleById(c.env.DB, repo.id, route.id);
+  if (row === null) return respond(c.html(renderNotFound(ctx), 404));
+  const data = {
+    rules: await loadProtectedTagRules(c.env.DB, repo),
+    isOrg: await loadOwnerIsOrg(c.env.DB, repo),
+    form: await editFormOfTag(c.env.DB, row),
+    editing: row,
+    saved: false,
+  };
+  return respond(c.html(renderTagProtectionPage({ ctx, data, error: null }), 200));
+}
+
+async function repoTagDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-tags-delete") return respond(await c.notFound()); // drift guard
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404));
+  const params = await readUrlEncodedForm(c.req.raw);
+  const rawId = params.get("id") ?? "";
+  if (!/^\d+$/.test(rawId)) return respond(c.html(renderNotFound(ctx), 404));
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const deleted = await deleteTagRuleById(c.env.DB, pair, Number.parseInt(rawId, 10));
+  if (!deleted) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/tags` } }));
+}
+
+async function repoDeployKeysPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { respond } = resolved;
+  if (resolved.route.family !== "settings-keys") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoDeployKeys(c.env.DB, resolved.repo);
+  return respond(c.html(renderRepoDeployKeysPage({ ctx: resolved.ctx, data, error: null }), 200));
+}
+
+async function repoDeployKeysSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-keys") return respond(await c.notFound()); // drift guard
+  const form = parseDeployKeyForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await addDeployKeyFromForm(c.env.DB, repo, form);
+  const data = await loadRepoDeployKeys(c.env.DB, repo);
+  if (outcome.outcome === "created") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/keys` } }));
+  }
+  data.form = { title: form.title, content: form.content, isWritable: form.isWritable };
+  return respond(c.html(renderRepoDeployKeysPage({ ctx, data, error: { message: outcome.message, field: outcome.field } })));
+}
+
+async function repoDeployKeysDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { repo, respond } = resolved;
+  if (resolved.route.family !== "settings-keys-delete") return respond(await c.notFound()); // drift guard
+  const form = parseDeployKeyDeleteForm(await readUrlEncodedForm(c.req.raw));
+  // Idempotent (the module handoff: miss 204s API-side; the web twin 303s
+  // on both outcomes).
+  await deleteDeployKeyFromForm(c.env.DB, repo, form);
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/keys` } }));
+}
+
+async function repoPublicAccessPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { repo, respond } = resolved;
+  if (resolved.route.family !== "settings-public-access") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoPublicAccess(c.env.DB, repo.id);
+  return respond(c.html(renderRepoPublicAccessPage({ ctx: resolved.ctx, data }), 200));
+}
+
+async function repoPublicAccessSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { repo, respond } = resolved;
+  if (resolved.route.family !== "settings-public-access") return respond(await c.notFound()); // drift guard
+  const form = parsePublicAccessForm(await readUrlEncodedForm(c.req.raw));
+  await updateCodeUnitPublicAccess(c.env.DB, repo.id, form);
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/public_access` } }));
 }
 
 /** GET /{owner}/{repo}/settings/hooks (pages/settings.tsx — the webhooks
@@ -8242,6 +8519,20 @@ uiRouter.get("/:owner/:repo/pulls/:index/commits", (c) => uiPage(c));
 // Wave-4 write families (parseUiRoute claims exactly these shapes; the
 // POSTs run the §2.8 sameOriginGuard first — session.ts's convention).
 uiRouter.get("/:owner/:repo/settings", (c) => settingsPage(c));
+// Window-2d: the four settings tabs.
+uiRouter.get("/:owner/:repo/settings/hooks/git", (c) => repoGitHooksPage(c));
+uiRouter.get("/:owner/:repo/settings/hooks/git/:name", (c) => repoGitHookEditPage(c));
+uiRouter.post("/:owner/:repo/settings/hooks/git/:name", (c) => repoGitHookSubmit(c));
+uiRouter.get("/:owner/:repo/settings/tags", (c) => repoTagsPage(c));
+uiRouter.post("/:owner/:repo/settings/tags", (c) => repoTagsSubmit(c));
+uiRouter.post("/:owner/:repo/settings/tags/delete", (c) => repoTagDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/settings/tags/:id", (c) => repoTagDetailPage(c));
+uiRouter.post("/:owner/:repo/settings/tags/:id", (c) => repoTagsSubmit(c));
+uiRouter.get("/:owner/:repo/settings/keys", (c) => repoDeployKeysPage(c));
+uiRouter.post("/:owner/:repo/settings/keys", (c) => repoDeployKeysSubmit(c));
+uiRouter.post("/:owner/:repo/settings/keys/delete", (c) => repoDeployKeysDelete(c));
+uiRouter.get("/:owner/:repo/settings/public_access", (c) => repoPublicAccessPage(c));
+uiRouter.post("/:owner/:repo/settings/public_access", (c) => repoPublicAccessSubmit(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
