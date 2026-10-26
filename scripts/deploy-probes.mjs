@@ -18,7 +18,9 @@
  *                  next anonymous ls-remote must be dead at t+0.
  *   generate-e2e   Template -> real push -> PATCH template -> generate -> 201
  *                  + empty:false -> refs carried at the identical tip ->
- *                  contents API round-trip.
+ *                  contents API round-trip. A red run sweeps the template +
+ *                  generated repos it created (the failureTail; REDEPLOY16's
+ *                  TLS flake stranded the template for a hand-clean).
  *   forkpr-e2e     Base -> fork (202) -> push a fork branch -> PR with the
  *                  cross-repo head `owner:branch` -> 201 + head chain.
  *   mirror         The push-mirror credential-free arms: the registration-time
@@ -134,7 +136,7 @@ const parseArgs = (argv) => {
     json: false, dryRun: false, help: false, timeoutMs: 20_000,
     trials: 3, fixtureRepo: "p0-shallow", fixtureOid: null, newLabelCount: 3,
     strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 1,
-    mirrorSettleMs: 30_000,
+    mirrorSettleMs: 30_000, forceRed: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -154,6 +156,7 @@ const parseArgs = (argv) => {
     else if (a === "--mirror-settle-ms") opts.mirrorSettleMs = Number(argv[++i]);
     else if (a === "--expect-owner-repos") opts.expectOwnerRepos = Number(argv[++i]);
     else if (a === "--expect-tokens") opts.expectTokens = Number(argv[++i]);
+    else if (a === "--force-red") opts.forceRed = argv[++i];
     else if (opts.battery === null && !a.startsWith("--")) {
       if (!BATTERY_NAMES.includes(a)) throw new Error(`unknown battery: ${a} (known: ${BATTERY_NAMES.join(", ")})`);
       opts.battery = a;
@@ -175,6 +178,7 @@ const parseArgs = (argv) => {
   if (!Number.isInteger(opts.trials) || opts.trials < 1 || opts.trials > 10) throw new Error("--trials must be 1-10");
   if (opts.d1Scope !== "remote" && opts.d1Scope !== "local") throw new Error("--d1-scope must be remote or local");
   if (!Number.isFinite(opts.mirrorSettleMs) || opts.mirrorSettleMs <= 0) throw new Error("--mirror-settle-ms must be a positive number of milliseconds");
+  if (opts.forceRed !== null && (typeof opts.forceRed !== "string" || opts.forceRed.length === 0)) throw new Error("--force-red needs the exact check id to force red (e.g. gen-generated-contents)");
   opts.baseUrl = opts.baseUrl ? opts.baseUrl.replace(/\/+$/, "") : null;
   return opts;
 };
@@ -193,7 +197,8 @@ const usage = () =>
   "  forkpr-e2e:    (no extra options)\n" +
   "  mirror:        --mirror-settle-ms <ms>    (sync-settle budget, default 30000; the row-settle arm reuses --d1-scope)\n" +
   "  ui-login:      --new-label-count <n>      (canonical 3 writer-form occurrences)\n" +
-  "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)";
+  "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)\n" +
+  "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
 // ---------- plumbing ----------
 
@@ -293,6 +298,12 @@ const poll = async (budgetMs, fn) => {
 
 const hexId = (n = 8) => randomUUID().replaceAll("-", "").slice(0, n);
 
+/** Self-test knob (--force-red <id>): the matched check records a fail WITHOUT
+ *  running — the deterministic "deliberately-bogus step" that exercises a
+ *  battery's failure-tail sweep (and the [skip] chain after it) at zero cost.
+ *  An id that matches nothing warns on stderr at summary time. */
+let forceRedMatched = false;
+
 /**
  * Run one check, record {id, status, detail, ms}, print the evidence-block
  * progress line. The checked fn returns a detail string (pass) or
@@ -300,6 +311,13 @@ const hexId = (n = 8) => randomUUID().replaceAll("-", "").slice(0, n);
  * throwing = fail.
  */
 async function check(id, fn) {
+  if (opts.forceRed === id) {
+    forceRedMatched = true;
+    const detail = `FORCED RED (--force-red ${id}; nothing ran — the battery's failure tail must sweep the creations)`;
+    results.push({ id, status: "fail", detail, ms: 0 });
+    log(`  [fail] ${id} (0 ms) — ${detail}`);
+    return;
+  }
   const t0 = performance.now();
   let status = "pass";
   let detail;
@@ -527,7 +545,19 @@ const GENERATED_CLONE_CARRIED =
 
 const LICENSE_TEXT = "MIT License\n\ncf-gitea deploy-probes generate-e2e battery\n";
 
-const generateContext = () => ({ user: opts.user, tmpl: `tmpl-${hexId()}`, gen: `gen-${hexId()}`, tip: null, tmp: null });
+/** `tmplCreated`/`genCreated` (+ the repoFullName convention and the `*Gone`
+ *  flags gen-cleanup sets) drive the failure-cleanup tail (see
+ *  generateFailureCleanup): REDEPLOY16 friction — a mid-battery red (the TLS
+ *  flake) used to chain-skip gen-cleanup and strand the template (and,
+ *  once generate answered, the generated) repo behind [skip] lines for a
+ *  hand-clean. FullName is what the CREATE actually returned (the doer's
+ *  namespace), so the tail deletes the right owner/slug even when --user
+ *  drifts from the PAT's user. */
+const generateContext = () => ({
+  user: opts.user, tmpl: `tmpl-${hexId()}`, gen: `gen-${hexId()}`, tip: null, tmp: null,
+  tmplCreated: false, tmplFullName: null, tmplGone: false,
+  genCreated: false, genFullName: null, genGone: false,
+});
 
 const pushTemplateContent = async (ctx) => {
   const tmp = ctx.tmp; // main() owns the battery scratch dir (created + removed there)
@@ -563,6 +593,8 @@ const generateSteps = (ctx) => [
     run: async () => {
       const res = await api("/user/repos", { method: "POST", body: { name: ctx.tmpl, auto_init: true } });
       expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      ctx.tmplCreated = true; // the failure-cleanup tail deletes it if a later step reds
+      ctx.tmplFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.tmpl}`);
       return `created ${res.json?.full_name}`;
     },
   },
@@ -598,6 +630,8 @@ const generateSteps = (ctx) => [
       const res = await api(`/repos/${ctx.user}/${ctx.tmpl}/generate`, { method: "POST", body: { name: ctx.gen, git_content: true } });
       expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 200)}`);
       expect(res.json?.empty === false, `empty ${res.json?.empty} (expected false in the body)`);
+      ctx.genCreated = true; // the failure-cleanup tail deletes it if a later step reds
+      ctx.genFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.gen}`);
       return `201 with "empty":false (${res.json?.full_name})`;
     },
   },
@@ -664,11 +698,50 @@ const generateSteps = (ctx) => [
       const a = await deleteRepo(ctx.user, ctx.gen);
       const b = await deleteRepo(ctx.user, ctx.tmpl);
       await rm(ctx.tmp, { recursive: true, force: true });
+      if (typeof a === "string") ctx.genGone = true; // the tail no-ops on a green sweep
+      if (typeof b === "string") ctx.tmplGone = true;
       if (typeof a === "string" && typeof b === "string") return `${ctx.gen} + ${ctx.tmpl} deleted`;
       return { status: "warn", detail: `${a.detail ?? a}; ${b.detail ?? b}` };
     },
   },
 ];
+
+/** REDEPLOY16 friction (the TLS-flake red stranded tmpl-85c28975 in
+ *  production): a mid-battery red used to chain-skip gen-cleanup and leave the
+ *  template (and generated) repo behind [skip] lines for a hand-clean. This
+ *  finally-style tail runs after EVERY generate battery run (green ones no-op
+ *  silently: gen-cleanup already deleted both, so the *Gone flags skip them)
+ *  and best-effort deletes exactly what the run created and has not already
+ *  deleted — generated first (it hangs off the template), then the template,
+ *  the same order gen-cleanup sweeps. One [tail] line logs every action;
+ *  failures feed left_behind and are never fatal; it never throws (main's
+ *  finally depends on it). */
+const generateFailureCleanup = async (ctx) => {
+  const acts = [];
+  const noteLeftBehind = (what, why) => {
+    leftBehind.push(`${what} (failure-cleanup tail: ${why})`);
+    acts.push(`${what} LEFT BEHIND — ${why}`);
+  };
+  try {
+    const targets = [
+      { what: "generated repo", created: ctx.genCreated, gone: ctx.genGone, full: ctx.genFullName, name: ctx.gen },
+      { what: "template repo", created: ctx.tmplCreated, gone: ctx.tmplGone, full: ctx.tmplFullName, name: ctx.tmpl },
+    ];
+    for (const t of targets) {
+      if (t.created !== true || t.gone === true) continue;
+      const [owner, repo] = String(t.full ?? `${ctx.user}/${t.name}`).split("/");
+      try {
+        const out = await deleteRepo(owner, repo);
+        acts.push(typeof out === "string" ? out : out.detail);
+      } catch (err) {
+        noteLeftBehind(`${t.what} ${owner}/${repo}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } catch (err) {
+    acts.push(`the sweep itself failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (acts.length) log(`  [tail] gen-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
 
 // ---------- battery: forkpr-e2e ----------
 
@@ -1143,7 +1216,7 @@ const auditSteps = (ctx) => [
 const BATTERIES = {
   "p0": { title: "P0 shallow trio + privacy tail", context: p0Context, steps: p0Steps },
   "registry": { title: "registry tombstone sweep (carry + t+0 delete)", context: () => ({}), steps: () => Array.from({ length: opts.trials }, (_, i) => registryTrialSteps(i + 1)).flat() },
-  "generate-e2e": { title: "template → generate → carried refs + contents", context: generateContext, steps: generateSteps },
+  "generate-e2e": { title: "template → generate → carried refs + contents", context: generateContext, steps: generateSteps, failureTail: generateFailureCleanup },
   "forkpr-e2e": { title: "fork → owner:branch PR chain", context: forkprContext, steps: forkprSteps },
   "mirror": { title: "push-mirror credential-free arms (SSRF gate + .invalid lifecycle)", context: mirrorContext, steps: mirrorSteps, failureTail: mirrorFailureCleanup },
   "ui-login": { title: "login-cookie labels owner view", context: uiContext, steps: uiSteps },
@@ -1264,6 +1337,9 @@ const main = async () => {
 main()
   .then(() => {
     TOKEN = ""; // drop the plaintext before the summary prints
+    if (opts.forceRed && !forceRedMatched) {
+      console.error(`deploy-probes: warning: --force-red ${opts.forceRed} matched no check id — nothing was forced`);
+    }
     const counts = { pass: 0, fail: 0, warn: 0, skip: 0, info: 0 };
     for (const r of results) counts[r.status] = (counts[r.status] ?? 0) + 1;
     const summary = {

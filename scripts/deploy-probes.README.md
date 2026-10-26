@@ -97,7 +97,16 @@ prints all of them verbatim.
   generated cell serves API reads but not the git wire); it reports [info]
   when a clone succeeds (the issue is fixed — seen on the post-REDEPLOY13
   tree) and pass/fails hard under `--strict-generated-clone`. The
-  `status='creating'` == 0 arm lives in cleanup-audit.
+  `status='creating'` == 0 arm lives in cleanup-audit. **Failure cleanup
+  (REDEPLOY16 friction):** a mid-battery red (e.g. the TLS flake that
+  stranded `tmpl-85c28975` in production) used to chain-skip `gen-cleanup`
+  and leave the template — and, once generate answered, the generated — repo
+  behind `[skip]` lines for a hand-clean; a finally-style tail (the mirror
+  battery's shape, `repoFullName`-tracked) now best-effort deletes the
+  generated repo first, then the template (logged on one
+  `[tail] gen-leftover-sweep` line; failures feed `left_behind`, never
+  fatal; a green run no-ops silently because `gen-cleanup` already emptied
+  both).
 - **forkpr-e2e** — base repo (201) → doer-owned org (`POST /orgs`, 201) →
   fork INTO the org (202, upstream's CreateFork accepted code, the DEFAULT
   slug kept: `<org>/<base>`) → the fork's refs settle (async copy) → push a
@@ -177,12 +186,32 @@ prints all of them verbatim.
   a settle failure no longer strands rows for a hand-clean (REDEPLOY15
   friction (c)); the `[tail] mir-leftover-sweep` line logs every action, and
   the audit battery going green right after a red mirror run is the proof.
+- **The generate-e2e battery self-cleans the same way** (REDEPLOY16
+  friction): its failureTail tracks both repo full names the run created and
+  sweep-deletes the survivors of a mid-battery red on one
+  `[tail] gen-leftover-sweep` line — no more hand-deleted `tmpl-*` leftovers.
 - A red run of the OTHER batteries may leave its repos in place for debugging
   (the lfs-e2e convention); the next run names fresh random repos (`reg-`,
-  `tmpl-`/`gen-`, `prbase-`/`prorg-`, `ui-` prefixes), so pre-cleanup is a
-  `cleanup-audit` away.
+  `prbase-`/`prorg-`, `ui-` prefixes), so pre-cleanup is a `cleanup-audit`
+  away.
 - Scratch dirs live under `os.tmpdir()` and are removed per battery; the PAT
   file is the operator's to shred.
+
+## Self-testing the failure shapes
+
+- `--force-red <check-id>` forces the named check to record a fail WITHOUT
+  running it (the deliberately-bogus step; deterministic, zero cost): the
+  chain `[skip]`s the rest and the battery's failureTail sweeps what the run
+  created so far. The intended knob for verifying the failure-cleanup tails
+  locally — e.g. `generate-e2e --force-red gen-generated-contents` reds after
+  both repos exist, and the `[tail] gen-leftover-sweep` line must list both
+  deletes; `--force-red gen-template-push` reds after only the template
+  exists. An id that matches no check warns on stderr at summary time (the
+  forced fail counts in the summary and fails the exit code, as any red).
+- The mirror battery can also be forced honestly through its real budget
+  flag: `--mirror-settle-ms 1` times the sync-settle poll out mid-battery
+  (after the repo + mirror row exist) — the original 5fdbc15 self-test
+  convention.
 
 ## Deliberately not ported (yet)
 
