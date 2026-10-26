@@ -36,8 +36,8 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
-import { buildArchive, parseArchiveName } from "../services/archive";
-import { engineReads, refTipMap, branchRef, tagRef } from "../services/engine";
+import { buildArchive, parseArchiveName, resolveArchiveRef } from "../services/archive";
+import { engineReads, refTipMap } from "../services/engine";
 import { requireVisibleRepo } from "../services/repo-access";
 
 const notFoundResponse = {
@@ -63,21 +63,6 @@ const ownerRepoParams = {
   owner: z.string().min(1).openapi({ description: "owner of the repo" }),
   repo: z.string().min(1).openapi({ description: "name of the repo" }),
 } as const;
-
-/**
- * Strict ref resolution for the archive tail — branch, tag (peeled to the
- * commit, like upstream GetCommit through an annotated tag), then a 40-hex
- * oid. NO default-branch fallback: upstream GetCommit(refFromName) fails on
- * an unresolvable name; the default branch is never implicit here.
- */
-function resolveArchiveRef(tips: ReturnType<typeof refTipMap>, ref: string): string | null {
-  const branch = tips.get(branchRef(ref));
-  if (branch !== undefined) return branch.target;
-  const tag = tips.get(tagRef(ref));
-  if (tag !== undefined) return tag.peeled ?? tag.target;
-  if (/^[0-9a-f]{40}$/.test(ref)) return ref;
-  return null;
-}
 
 /** Shared handler for the openapi route and the multi-segment catchall. */
 async function serveArchive(c: Context<ApiEnv>, owner: string, repo: string, archive: string, subPaths: string[]): Promise<Response> {
