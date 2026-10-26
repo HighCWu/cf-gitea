@@ -74,6 +74,10 @@ const repoRoot = path.resolve(scriptDir, '..');
 // family's headline feature), the attachment row's package mark, the source
 // row's zip mark and the download-count tooltip's info mark (release/
 // list.tmpl:14,84,89,99,104).
+// Wave 37 (the /-/projects list family, pages/owner-projects.tsx) adds the
+// owner-project glyph the projects/list rows, the state toggle and the menu
+// tab render (project.go:161-166's IconName — every non-repository project
+// is octicon-project-symlink).
 const ALLOWLIST = [
   'octicon-bell',
   'octicon-calendar',
@@ -109,6 +113,7 @@ const ALLOWLIST = [
   'octicon-person',
   'octicon-pin',
   'octicon-plus',
+  'octicon-project-symlink',
   'octicon-repo',
   'octicon-shield-lock',
   'octicon-three-bars',

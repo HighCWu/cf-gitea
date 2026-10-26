@@ -652,6 +652,14 @@ import {
   renderOrgRepositoriesPage,
   resolveOrgRepositories,
 } from "./pages/org-repos";
+// Wave-37 owner projects list family (the parity survey's regenerated
+// top-5 row 5 — the `/-` namespace's projects listing over the landed
+// projects service).
+import {
+  loadOwnerProjectsData,
+  renderOwnerProjectsPage,
+  resolveOwnerProjects,
+} from "./pages/owner-projects";
 // Wave-24 repo social lists + collaboration panel (the parity survey's bench
 // tier — the forks/stars/watchers trio and the settings/collaboration row).
 import { loadRepoSocialData, renderRepoSocialPage } from "./pages/repo-social";
@@ -1050,6 +1058,22 @@ export interface OrgRepositoriesRoute {
   owner: string;
 }
 
+/** The wave-37 owner projects list family (pages/owner-projects.tsx):
+ *  upstream's `/{username}/-/projects` (web.go:1107's `/{username}/-`
+ *  group's read group, web.go:1143-1145 — `m.Get("", org.Projects)` plus
+ *  the `/{id}` board tails) — the parity survey's regenerated top-5 row 5.
+ *  The `-` pseudo-segment namespace claims EXACTLY the bare projects tail;
+ *  the owner resolves user-or-org at load time (upstream's single handler
+ *  branches on ContextUser.IsOrganization). The board depth (`/{id}`,
+ *  `/{id}/workflows`) and the write group (`/new`, `/{id}/edit|delete|
+ *  open|close`) stay unclaimed → the engine's 404 — the follow-up row the
+ *  page module documents, no half-ported drill-down. */
+export interface OwnerProjectsRoute {
+  family: "owner-projects";
+  /** Decoded owner segment (user-or-org rows at resolve time). */
+  owner: string;
+}
+
 /** The wave-24 repo social list families (pages/repo-social.tsx): upstream's
  *  three bare repo-scoped literals — `/forks` (web.go:1759), `/stars`
  *  (web.go:1766), `/watchers` (web.go:1767) — the parity survey's bench
@@ -1424,6 +1448,7 @@ export type ParsedUiRoute =
   | OrgCreateRoute
   | OrgMembersRoute
   | OrgRepositoriesRoute
+  | OwnerProjectsRoute
   | RepoSocialRoute
   | SettingsCollaborationRoute
   | TagsRoute
@@ -1607,12 +1632,18 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // `/{username}/-/repositories`, web.go:1107's `/{username}/-` group's
   // web.go:1134 repositories route): the `-` pseudo-segment namespace claims
   // exactly the repositories tail (a repo cannot be named "-" and no landed
-  // family reads the shape, so the claim shadows nothing). Every other
-  // `/-*` tail (`/-/heatmap`, `/-/packages*`, `/-/projects*`, `/-/code`,
-  // the bare `/-`) stays unclaimed → the engine's 404, exactly upstream's
-  // unregistered-route answer for slices that have not landed.
+  // family reads the shape, so the claim shadows nothing). Wave 37 adds the
+  // sibling bare projects tail (web.go:1143's read group — pages/
+  // owner-projects.tsx). Every other `/-*` tail (`/-/heatmap`,
+  // `/-/packages*`, the projects board depth `/-/projects/{id}` + write
+  // group, `/-/code`, the bare `/-`) stays unclaimed → the engine's 404,
+  // exactly upstream's unregistered-route answer for slices that have not
+  // landed.
   if (repo === "-" && raw.length === 4 && raw[3] === "repositories") {
     return { family: "org-repositories", owner };
+  }
+  if (repo === "-" && raw.length === 4 && raw[3] === "projects") {
+    return { family: "owner-projects", owner };
   }
 
   const tail = raw.slice(3);
@@ -4631,6 +4662,31 @@ async function orgRepositoriesPage(c: Context<{ Bindings: Env }>): Promise<Respo
   return respond(c.html(renderOrgRepositoriesPage(ctx, data), 200));
 }
 
+/**
+ * GET /{owner}/-/projects (pages/owner-projects.tsx — the wave-37 projects
+ * list; upstream's web.go:1143 read group over BOTH owner kinds). The
+ * ladder: the org half (renamed orgs 307, invisible orgs 404-shell) gated
+ * by orgProjectsAccessMode >= read (web.go:444-455), then the user half
+ * (renamed users 307) gated by the individualPermsChecker ladder
+ * (web.go:945-959 — private users answer to self or site admin only).
+ * The listing rides the landed projects service — the doer-visibility-
+ * filtered issue counts are the page's matrix.
+ */
+async function ownerProjectsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (resolved.route.family !== "owner-projects") return respond(await c.notFound()); // drift guard
+  const doer = orgFamilyDoer(viewer);
+  const owner = await resolveOwnerProjects(c.env.DB, resolved.route.owner, doer, url.pathname, orgFamilyQuery(url));
+  if (owner.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: owner.location } }));
+  }
+  if (owner.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadOwnerProjectsData(c.env.DB, owner, viewer, url.origin, url.searchParams);
+  return respond(c.html(renderOwnerProjectsPage(ctx, data), 200));
+}
+
 // ---------------------------------------------------------------------------
 // The wave-24 collaboration settings family (pages/settings-collaboration.tsx
 // — upstream's /settings/collaboration group, web.go:1194-1204): the panel
@@ -5318,3 +5374,10 @@ uiRouter.get("/:owner/:repo/releases/edit/*", (c) => releaseEditPage(c));
 uiRouter.post("/:owner/:repo/releases/edit/*", (c) => releaseEditSubmit(c));
 uiRouter.post("/:owner/:repo/releases/delete", (c) => releaseDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/releases/delete", () => methodNotAllowed("POST"));
+// Wave-37 owner projects list (parseUiRoute claims exactly this shape —
+// upstream web.go:1143's read group, `m.Get("", org.Projects)`; GET only,
+// the board depth and the write group stay unclaimed per the page module's
+// scoping note). Appended at the physical tail per the wave-23 convention:
+// the static "-" segment outranks every dynamic peer and no registered
+// pattern above carries a 4-segment /:owner/-/projects shape.
+uiRouter.get("/:owner/-/projects", (c) => ownerProjectsPage(c));

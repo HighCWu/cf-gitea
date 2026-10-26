@@ -83,6 +83,7 @@ import type { UiContext } from "../ui-context";
  *  is shared and not this wave's file). */
 export const orgHomeLocale = {
   repositories: "Repositories", // "user.repositories"
+  projects: "Projects", // "user.projects" (the wave-37 projectsTab item)
   repos_empty: "No repositories yet.", // "org.repos.empty"
   repos_empty_description: "Create a repository to share code with the organization.", // "org.repos.empty_description"
   repo_updated: "Updated", // "org.repo_updated"
@@ -218,17 +219,35 @@ export function OrgHeader(props: { org: OrgRecord; signedIn: boolean }) {
 /**
  * org/menu.tmpl reduced to the live tabs (the shell tab-strip rule): only
  * this page exists, so the strip carries the single active Repositories tab
- * with the repo count (`{{if .RepoCount}}`).
+ * with the repo count (`{{if .RepoCount}}`). Wave 37 (the `/-/projects`
+ * family, pages/owner-projects.tsx) adds the OPTIONAL projectsTab item —
+ * the menu's upstream Projects tab (menu.tmpl's `{{if .CanReadProjects}}`
+ * item, active on `PageIsViewProjects`), rendered only when the consumer
+ * passes it; absent keeps the byte-stable single-tab DOM this page and the
+ * user profile render.
  */
-export function OrgMenu(props: { orgLink: string; repoCount: number }) {
+export function OrgMenu(props: {
+  orgLink: string;
+  repoCount: number;
+  /** The upstream Projects tab (present only on a consumer that owns a
+   *  live `/-/projects` page; count = the open-projects total, the
+   *  `{{if .ProjectCount}}` label). */
+  projectsTab?: { active: boolean; count: number; href: string };
+}) {
   return (
     <div class="ui container">
       <overflow-menu class="ui secondary pointing tabular borderless menu tw-mb-4">
         <div class="overflow-menu-items">
-          <a class="active item" href={props.orgLink}>
+          <a class={props.projectsTab?.active ? "item" : "active item"} href={props.orgLink}>
             <Icon name="octicon-repo" /> {orgHomeLocale.repositories}
             {props.repoCount > 0 ? <div class="ui small label">{props.repoCount}</div> : null}
           </a>
+          {props.projectsTab ? (
+            <a class={props.projectsTab.active ? "active item" : "item"} href={props.projectsTab.href}>
+              <Icon name="octicon-project-symlink" /> {orgHomeLocale.projects}
+              {props.projectsTab.count > 0 ? <div class="ui small label">{props.projectsTab.count}</div> : null}
+            </a>
+          ) : null}
         </div>
       </overflow-menu>
     </div>
