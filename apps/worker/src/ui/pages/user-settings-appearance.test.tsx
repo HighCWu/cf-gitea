@@ -1,14 +1,19 @@
 /**
  * The user settings APPEARANCE tab module's tests (pages wave 57, the bench
- * row `wave-user-appearance-module` — the repo-settings-wiki /
- * user-settings-security UNMOUNTED harness): the write arms over the landed
+ * row `wave-user-appearance-module`): the write arms over the landed
  * `user_settings` side store with real D1 (generated migrations in
  * beforeAll), the theme catalog + language catalog membership checks, and
  * the DOM contract of the page render — hono/jsx renderToString, the module
- * driven directly (no route yet, the HANDOFF NOTE in the module header).
+ * driven directly. The module is MOUNTED since window-2a (0c2b151 — GET +
+ * the theme/language POSTs at ui/index.ts, saved → 303 / invalid → the
+ * full-page re-render), so the deferred-test matrix also drives the real
+ * routes: the anonymous login 303, the two exact 303-on-saved targets, the
+ * invalid re-render's per-form error routing (theme vs language arm), the
+ * theme catalog's exact-match case-sensitivity, and the guard-first POST
+ * posture (the pages-wave5 route-suite pattern).
  */
 
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -18,6 +23,8 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { userSettings } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
+import { uiRouter, type UiAssetsFetcher } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { Viewer } from "../viewer";
 import {
   applyUserSettingsAppearanceLanguageForm,
@@ -57,6 +64,58 @@ async function pageHtml(explicitData?: NonNullable<Awaited<ReturnType<typeof loa
 async function storedSettings(): Promise<{ theme: string; language: string }> {
   const row = await drizzle(env.DB).select().from(userSettings).where(eq(userSettings.userId, 1)).get();
   return { theme: row?.theme ?? "(no row)", language: row?.language ?? "(no row)" };
+}
+
+// --- the mounted-route harness (window-2a; the pages-wave5 pattern) --------------
+
+type RouteEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+const routeEnv: RouteEnv = {
+  ...env,
+  ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
+};
+
+/** The real production path: parse → resolveUiSession → load → render, on the
+ *  mounted uiRouter with the synthetic manifest; the execution context is
+ *  awaited so waitUntil side-effects settle before assertions. */
+async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
+/** Alice's minted session cookie header (the real mintSession path, minted
+ *  per request — the beforeEach users wipe cascades the sessions table, so
+ *  a cross-test cache would go stale; the value is never rendered). */
+async function aliceSessionHeader(): Promise<string> {
+  return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, 1)}`;
+}
+
+/** A urlencoded POST carrying the browser's Origin header (the §2.8 guard's
+ *  happy path) and alice's minted session cookie. */
+async function formPost(path: string, fields: Record<string, string>): Promise<Response> {
+  return fetchUi(path, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin: "https://test.local",
+      cookie: await aliceSessionHeader(),
+    },
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
+/** The theme form's source slice (from its action up to the language form's). */
+function themeFormSlice(html: string): string {
+  return html.slice(
+    html.indexOf('action="/user/settings/appearance/theme"'),
+    html.indexOf('action="/user/settings/appearance/language"'),
+  );
+}
+
+/** The language form's source slice (its action to the page end). */
+function languageFormSlice(html: string): string {
+  return html.slice(html.indexOf('action="/user/settings/appearance/language"'));
 }
 
 beforeAll(async () => {
@@ -123,6 +182,18 @@ describe("applyUserSettingsAppearanceThemeForm", () => {
     expect(await storedSettings()).toMatchObject({ theme: "(no row)" });
   });
 
+  it("matches the catalog exactly — a case-variant spelling is a non-member (upstream's exact-match semantics)", async () => {
+    expect(await applyUserSettingsAppearanceThemeForm(env.DB, 1, { theme: "Gitea-Dark" })).toEqual({
+      outcome: "invalid",
+      message: userSettingsAppearanceLocale.theme_update_error,
+    });
+    expect(await applyUserSettingsAppearanceThemeForm(env.DB, 1, { theme: "GITEA-LIGHT" })).toEqual({
+      outcome: "invalid",
+      message: userSettingsAppearanceLocale.theme_update_error,
+    });
+    expect(await storedSettings()).toMatchObject({ theme: "(no row)" });
+  });
+
   it("re-saving over an existing row keeps the rest of the side store (the upsert merge)", async () => {
     await applyUserSettingsAppearanceLanguageForm(env.DB, 1, { language: "ja-JP" });
     await applyUserSettingsAppearanceThemeForm(env.DB, 1, { theme: "gitea-light" });
@@ -171,6 +242,7 @@ describe("the catalogs (the pin's data, in webtheme.go / i18n.go order)", () => 
   it("carries upstream's default 28-language list in defaultI18nLangNames order", () => {
     expect(AVAILABLE_LANGUAGES.length).toBe(28);
     expect(AVAILABLE_LANGUAGES[0]).toEqual({ lang: "en-US", name: "English" });
+    expect(AVAILABLE_LANGUAGES[11]).toEqual({ lang: "ja-JP", name: "日本語" }); // a mid-list spot-check pair
     expect(AVAILABLE_LANGUAGES[AVAILABLE_LANGUAGES.length - 1]).toEqual({ lang: "ml-IN", name: "മലയാളം" });
   });
 });
@@ -284,5 +356,74 @@ describe("UserSettingsAppearanceNav", () => {
     const secretsActive = renderToString(<UserSettingsAppearanceNav active="secrets" />);
     expect(secretsActive).toContain('class="active item" href="/user/settings/actions/secrets"');
     expect(secretsActive).toContain("open"); // navbar.tmpl's open arm
+  });
+});
+
+// --- the mounted routes (window-2a at ui/index.ts) --------------------------------
+
+describe("the mounted routes (GET + the theme/language POSTs)", () => {
+  it("303s an anonymous GET onto the login round-trip", async () => {
+    const res = await fetchUi("/user/settings/appearance");
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/login?redirect_to=%2Fuser%2Fsettings%2Fappearance");
+  });
+
+  it("renders the signed-in GET at 200 over the stored prefs", async () => {
+    await applyUserSettingsAppearanceThemeForm(env.DB, 1, { theme: "gitea-dark" });
+    const res = await fetchUi("/user/settings/appearance", {
+      headers: { cookie: await aliceSessionHeader() },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content user settings"');
+    expect(html).toContain('<option value="gitea-dark" selected="">');
+  });
+
+  it("a saved theme POST 303s onto /user/settings/appearance and persists (the mounted target)", async () => {
+    const res = await formPost("/user/settings/appearance/theme", { theme: "gitea-light" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/user/settings/appearance");
+    expect(await storedSettings()).toMatchObject({ theme: "gitea-light" });
+  });
+
+  it("an invalid theme POST re-renders at 200 with the error inside the theme form only", async () => {
+    // "Gitea-Dark" rides the exact-match catalog arm through the real route.
+    const res = await formPost("/user/settings/appearance/theme", { theme: "Gitea-Dark" });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(themeFormSlice(html)).toContain(`ui negative message">${userSettingsAppearanceLocale.theme_update_error}`);
+    expect(languageFormSlice(html)).not.toContain(userSettingsAppearanceLocale.theme_update_error);
+    expect(await storedSettings()).toMatchObject({ theme: "(no row)" });
+  });
+
+  it("a saved language POST 303s onto /user/settings/appearance and persists (the mounted target)", async () => {
+    const res = await formPost("/user/settings/appearance/language", { language: "de-DE" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/user/settings/appearance");
+    expect(await storedSettings()).toMatchObject({ language: "de-DE" });
+  });
+
+  it("an invalid language POST re-renders at 200 with the quoted message inside the language form only", async () => {
+    const res = await formPost("/user/settings/appearance/language", { language: "xx-XX" });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(languageFormSlice(html)).toContain("Language &quot;xx-XX&quot; is not available.");
+    expect(themeFormSlice(html)).not.toContain("not available");
+    expect(await storedSettings()).toMatchObject({ language: "(no row)" });
+  });
+
+  it("rejects a cross-origin POST before any write (sameOriginGuard first)", async () => {
+    const res = await fetchUi("/user/settings/appearance/theme", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://evil.example",
+        cookie: await aliceSessionHeader(),
+      },
+      body: new URLSearchParams({ theme: "gitea-dark" }).toString(),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("cross-origin request rejected");
+    expect(await storedSettings()).toMatchObject({ theme: "(no row)" });
   });
 });
