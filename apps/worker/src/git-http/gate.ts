@@ -83,6 +83,7 @@ import {
   scopeForbidden,
 } from "./respond";
 import { findRepositoryById, type RepositoryRow } from "../api/services/repository";
+import { isUserBlockedBy } from "../api/services/blocks";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
 import {
@@ -234,6 +235,34 @@ export async function gitHttpGate(
     });
   }
 
+  // The blocked-pusher arm (routers/private/hook_proc_receive.go:35, fed by
+  // NewPullRequest's `IsUserBlockedBy(issue.Poster, repo.OwnerID)`,
+  // services/pull/pull.go:64-65): upstream surfaces the ErrBlockedUser
+  // through the private hook API as
+  // `PrivateUserErrorf(http.StatusUnauthorized, "Cannot create pull request
+  // because you are blocked by the repository owner.")` — the UserMsg the
+  // hook prints to the git client, i.e. the decline TEXT is the git-protocol
+  // error surface. cf-gitea has no agit proc-receive flow (upstream reaches
+  // this arm only on push-to-propose `refs/for/*` pushes); the receive-pack
+  // RPC is the single push seam, so the arm guards it wholesale — a pusher
+  // blocked by the repo owner is declined before the engine sees the pack.
+  // The status is the API family's permission-denied 403 (the private
+  // endpoint's 401 is the internal hook carrier, not a client-facing git
+  // status; 403 also avoids the credential re-prompt a 401 triggers in git
+  // clients) — the same plain-text style as the mirror arm above. The
+  // isUserBlockedBy site-admin short-circuit is upstream's
+  // `blockee.IsAdmin`.
+  const isPush = route.kind === "receive-pack";
+  const pusher = isPush ? await resolvePushPusher(env, req) : undefined;
+  if (isPush && pusher != null && resolved.repo.ownerId !== null) {
+    if (await isPusherBlockedByOwner(env, pusher.id, resolved.repo.ownerId)) {
+      return new Response("Cannot create pull request because you are blocked by the repository owner.\n", {
+        status: 403,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
+  }
+
   // §2.1 item 5: invoke the engine and stream its response. The engine hook
   // sees the gate-cleared mark and waves the request through. Receive-pack
   // forwards carry the D1-minted immutable storage key (SPEC-0001a §3 Step
@@ -242,7 +271,6 @@ export async function gitHttpGate(
   // and the authenticated pusher (in-process, see resolvePushPusher), which
   // the engine surfaces on PushEvent so the push webhooks name the real
   // pusher instead of the owner fallback.
-  const isPush = route.kind === "receive-pack";
   return forwardToEngine(
     req,
     url,
@@ -250,7 +278,7 @@ export async function gitHttpGate(
     ctx,
     engine,
     isPush ? resolved.repo.storageKey : undefined,
-    isPush ? await resolvePushPusher(env, req) : undefined,
+    pusher,
     isPush ? protectedBranchValidator(env, resolved.repo) : undefined,
   );
 }
@@ -560,6 +588,26 @@ async function resolvePushPusher(env: Env, req: Request): Promise<PusherIdentity
   if (credential === null) return null;
   const verified = await new TokenService(env.DB).verify(credential).catch(() => null);
   return verified === null ? null : verifiedPusher(verified);
+}
+
+/**
+ * The blocked-pusher probe behind the receive-pack decline (hook_proc_receive
+ * .go:35): re-reads the pusher row for `is_admin` — the PusherIdentity
+ * carries no admin flag, the same re-read evaluateBranchProtection does —
+ * then runs IsUserBlockedBy(pusher, ownerId). A pusher whose user row
+ * vanished between the token verify and this read evaluates as non-admin
+ * (the branch-protection convention).
+ */
+async function isPusherBlockedByOwner(env: Env, pusherId: number, ownerId: number): Promise<boolean> {
+  const row = (
+    await drizzle(env.DB)
+      .select({ isAdmin: users.isAdmin })
+      .from(users)
+      .where(eq(users.id, pusherId))
+      .limit(1)
+      .all()
+  )[0];
+  return isUserBlockedBy(env.DB, { id: pusherId, isAdmin: row?.isAdmin ?? false }, ownerId);
 }
 
 /** Gate-cleared engine invocation (the shared §2.1 item 5 tail). `storageKey`

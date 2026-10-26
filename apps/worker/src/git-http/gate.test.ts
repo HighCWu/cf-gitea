@@ -65,7 +65,7 @@ import { doerRepoAccessMode } from "../api/services/repository";
 import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
 import { settleCreatingRepo } from "./gate";
-import { repoCounters, repoRedirects, repositories, webhookDeliveries, webhooks } from "../db/schema";
+import { repoCounters, repoRedirects, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { purgeRepoMessage } from "../repos/purge";
 import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
@@ -804,5 +804,91 @@ describe("team grants decide the git-HTTP matrix (SPEC-0007 §3.5 via authorizeG
     expect(ownerClone.status).toBe(200);
     expect(ownerClone.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
     expect(new TextDecoder().decode(await ownerClone.arrayBuffer())).toContain(fx.oid);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The receive-pack blocked-pusher arm (the blocks-enforcement sweep —
+// routers/private/hook_proc_receive.go:35, fed by NewPullRequest's
+// `IsUserBlockedBy(issue.Poster, repo.OwnerID)`, services/pull/pull.go:64-65;
+// the decline TEXT is upstream's exact hook UserMsg)
+// ---------------------------------------------------------------------------
+
+describe("the receive-pack blocked-pusher arm", () => {
+  // A nested wipe — the shared beforeEach above owns the other tables, and
+  // the fixtures above mint pushes that the arm must not see stale rows for.
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM user_blocking").run();
+  });
+
+  /** The org row and the write-team member of seedTeamGrantFixture. */
+  async function orgAndWriter(): Promise<{ orgId: number; writerId: number }> {
+    const org = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "acme"))
+      .get();
+    const writer = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "teamwriter"))
+      .get();
+    if (org === undefined || writer === undefined) throw new Error("fixture lookup failed");
+    return { orgId: org.id, writerId: writer.id };
+  }
+
+  it("declines an authorized pusher blocked by the repo owner with upstream's hook decline text", async () => {
+    const fx = await seedTeamGrantFixture();
+    const { orgId, writerId } = await orgAndWriter();
+    // The defense window the arm exists for: upstream's own BlockUser
+    // cascade removes collaborations but NOT org team grants, and its
+    // CanBlockUser refuses an org blocking a CURRENT member — the raw row
+    // here is the stale-grant state the gate probe guards (upstream reaches
+    // the same decline through the agit proc-receive hook). Seeded raw.
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: orgId, blockeeId: writerId, note: "", createdAt: new Date() });
+
+    const { oid, pack } = await buildPack();
+    const push = await SELF.fetch("https://example.com/acme/vault.git/git-receive-pack", {
+      method: "POST",
+      headers: {
+        authorization: basicTokenHeader(fx.tokens.writerWrite),
+        "content-type": RECEIVE_CT,
+      },
+      body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
+    });
+    expect(push.status).toBe(403);
+    expect(new TextDecoder().decode(await push.arrayBuffer())).toBe(
+      "Cannot create pull request because you are blocked by the repository owner.\n",
+    );
+  });
+
+  it("leaves the push ADVERT and reads untouched (upstream's hook runs at RPC time)", async () => {
+    const fx = await seedTeamGrantFixture();
+    const { orgId, writerId } = await orgAndWriter();
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: orgId, blockeeId: writerId, note: "", createdAt: new Date() });
+
+    const advert = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-receive-pack", {
+      headers: { authorization: basicTokenHeader(fx.tokens.writerWrite) },
+    });
+    expect(advert.status).toBe(200);
+
+    const clone = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(fx.tokens.writerWrite) },
+    });
+    expect(clone.status).toBe(200);
+  });
+
+  it("pushes once the blocking row is gone (the arm lifts with the block)", async () => {
+    const fx = await seedTeamGrantFixture();
+    const { oid, pack } = await buildPack();
+    const push = await SELF.fetch("https://example.com/acme/vault.git/git-receive-pack", {
+      method: "POST",
+      headers: {
+        authorization: basicTokenHeader(fx.tokens.writerWrite),
+        "content-type": RECEIVE_CT,
+      },
+      body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
+    });
+    expect(push.status).toBe(200);
   });
 });

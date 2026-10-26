@@ -26,7 +26,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories, teamMembers, teamRepoAccess, teams, users,
+import { repositories, teamMembers, teamRepoAccess, teams, userBlocking, users,
   protectedBranches,
 } from "../../db/schema";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
@@ -966,5 +966,73 @@ describe("create-grant members are not owners (org-teams owner arms narrowed)", 
         })
       ).status,
     ).toBe(204);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PUT /teams/{id}/members/{username}: the AddTeamMember blocked arm (the
+// blocks-enforcement sweep — services/org/team.go:248-249 via org/team.go:
+// 470-474)
+// ---------------------------------------------------------------------------
+
+describe("PUT /teams/{id}/members/{username}: the AddTeamMember blocked arm", () => {
+  /** A nested wipe — the shared beforeEach above owns the team tables. */
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM user_blocking").run();
+  });
+
+  const block = (blockerId: number, blockeeId: number) =>
+    db().insert(userBlocking).values({ blockerId, blockeeId, note: "", createdAt: new Date() });
+
+  it("403s \"user is blocked\" when the ORG blocked the added user (team.go:248-249 via orgAddTeamMember)", async () => {
+    const s = await seedActors();
+    const docsId = await teamIdByName("docs");
+    await block(s.org.id, s.outsider.id);
+    const response = await router()(`/teams/${docsId}/members/${s.outsider.username}`, {
+      method: "PUT",
+      headers: authHeaders(s.owner.id),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ message: "user is blocked", url: "https://example.com/api/swagger" });
+    // No membership side effect.
+    expect(await new OrgService(env.DB).getMembership(s.org.id, s.outsider.id)).toBeNull();
+  });
+
+  it("the probe precedes the already-member no-op (upstream order: the block check is AddTeamMember's first statement)", async () => {
+    const s = await seedActors();
+    const docsId = await teamIdByName("docs");
+    const service = new TeamsService(env.DB);
+    const docs = await mustTeam(service, docsId);
+    await service.addTeamMember(docs, s.outsider.id);
+    await block(s.org.id, s.outsider.id);
+    const response = await router()(`/teams/${docsId}/members/${s.outsider.username}`, {
+      method: "PUT",
+      headers: authHeaders(s.owner.id),
+    });
+    expect(response.status).toBe(403);
+  });
+
+  it("a site-admin blockee bypasses the arm (IsUserBlockedBy's blockee.IsAdmin short-circuit)", async () => {
+    const s = await seedActors();
+    const docsId = await teamIdByName("docs");
+    await block(s.org.id, s.admin.id);
+    const response = await router()(`/teams/${docsId}/members/${s.admin.username}`, {
+      method: "PUT",
+      headers: authHeaders(s.owner.id),
+    });
+    expect(response.status).toBe(204);
+    expect(await new OrgService(env.DB).getMembership(s.org.id, s.admin.id)).not.toBeNull();
+  });
+
+  it("204s once no blocking row relates the org and the user (the arm lifts with the block)", async () => {
+    const s = await seedActors();
+    const docsId = await teamIdByName("docs");
+    await block(s.org.id, s.outsider.id);
+    await env.DB.prepare("DELETE FROM user_blocking").run();
+    const response = await router()(`/teams/${docsId}/members/${s.outsider.username}`, {
+      method: "PUT",
+      headers: authHeaders(s.owner.id),
+    });
+    expect(response.status).toBe(204);
   });
 });

@@ -7,6 +7,7 @@ import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import type { WatchInfo } from "../models/watch";
 import { watchInfoSchema } from "../models/watch";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { requireVisibleRepo } from "../services/repo-access";
 import { apiRepositoryUrl, type RepositoryWithOwner } from "../services/repository";
 import { isWatchingRepo, unwatchRepo, watchRepo } from "../services/repo-watchers";
@@ -20,12 +21,16 @@ import { isWatchingRepo, unwatchRepo, watchRepo } from "../services/repo-watcher
  * Auth: upstream wraps the whole group in `reqToken()` (api.go:1403–1407) —
  * every operation requires a token (anonymous → the 401 runtime-only body,
  * same class as the /user 401). Repo resolution follows the anti-enumeration
- * 404. Semantics: GET 404s when the caller is not watching (upstream
- * APIErrorNotFound), PUT is an idempotent subscribe returning the WatchInfo
- * with `subscribed: true` and the REPOSITORY's created timestamp (upstream
- * `ctx.Repo.Repository.CreatedUnix`), DELETE is the idempotent 204 unwatch.
- * `ignored` stays false (the ignore mode is a tier-2 notification setting)
- * and `reason` renders null like upstream's nil.
+ * 404. PUT's declared 403 is LIVE —
+ * upstream's ErrBlockedUser arm (models/repo/watch.go:170-171, unwrapped by
+ * Watch at watch.go:174) is wired in the handler below (the
+ * blocks-enforcement sweep). Semantics: GET 404s when the caller is not
+ * watching (upstream APIErrorNotFound), PUT is an idempotent subscribe
+ * returning the WatchInfo with `subscribed: true` and the REPOSITORY's
+ * created timestamp (upstream `ctx.Repo.Repository.CreatedUnix`), DELETE is
+ * the idempotent 204 unwatch. `ignored` stays false (the ignore mode is a
+ * tier-2 notification setting) and `reason` renders null like upstream's
+ * nil.
  */
 
 const notFoundResponse = {
@@ -125,6 +130,15 @@ export function registerSubscriptionRoutes(app: OpenAPIHono<ApiEnv>, requireAuth
   app.openapi(putSubscriptionRoute(requireAuth), async (c) => {
     const pair = await requireVisibleRepo(c, c.req.valid("param"));
     const requester = c.get("authUser");
+    // WatchRepoAuto's blocked arm (models/repo/watch.go:170-171): a doer
+    // blocked by the repo owner answers ErrBlockedUser on the doWatch=true
+    // path — AFTER the !doWatch arms (unwatch is never blocked) and BEFORE
+    // the custom-mode keep. Watch (watch.go:174) unwraps the error to the
+    // declared 403 `err.Error()`; the isUserBlockedBy site-admin
+    // short-circuit is upstream's `blockee.IsAdmin`.
+    if (await isUserBlockedBy(c.env.DB, { id: requester.id ?? 0, isAdmin: requester.is_admin === true }, pair.repo.ownerId ?? -1)) {
+      throw new ApiError(403, BLOCKED_USER_MESSAGE);
+    }
     await watchRepo(c.env.DB, pair.repo.id, requester.id ?? 0, new Date());
     return c.json(toWatchInfo(pair, new URL(c.req.url).origin), 200);
   });

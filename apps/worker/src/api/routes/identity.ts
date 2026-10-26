@@ -14,7 +14,8 @@ import { publicKeyListSchema } from "../models/public-key";
 import { userListSchema } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { findUserByName, viewerOf } from "../services/repository";
-import { followUser, listFollowers, unfollowUser } from "../services/follows";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
+import { followUser, isFollowing, listFollowers, unfollowUser } from "../services/follows";
 import { toApiUser } from "../services/user";
 
 /**
@@ -56,8 +57,11 @@ import { toApiUser } from "../services/user";
  *   - all five: 401 — upstream wires reqToken()/tokenRequiresScopes(User) at
  *     the groups (api.go /user group + the /users group at api.go:1077–1092);
  *     the swagger documents only 200/204/403/404.
- *   - PUT's declared 403 (ErrBlockedUser, follow.go:38–40) is UNREACHABLE —
- *     no user-blocks model exists yet.
+ *   - PUT's declared 403 (ErrBlockedUser, follow.go:38–40) is LIVE — the
+ *     user-blocks model landed (services/blocks.ts) and the FollowUser
+ *     blocked arm is wired in the handler below (the blocks-enforcement
+ *     sweep); the response body is the APIErrorAuto render of the
+ *     permission-denied error, 403 "user is blocked".
  *   - Follow/unfollow counter maintenance (`num_followers`/`num_following`,
  *     follow.go:45–51) is skipped — the `users` schema has no such columns
  *     (services/follows.ts header divergence note).
@@ -225,13 +229,31 @@ export function registerIdentityRoutes(
 
   // PUT /user/following/{username} — Follow (follower.go): the target miss is
   // the UserAssignmentAPI 404; self/repeat follows are the model's silent
-  // no-ops (204); the 403 arm (blocked users) has no model yet.
+  // no-ops (204); a blocked pair answers the model's 403 "user is blocked".
   app.openapi(userCurrentPutFollowRoute(requireAuth), async (c) => {
     const doer = followViewer(c);
     const { username } = c.req.valid("param");
     const target = await findUserByName(c.env.DB, username);
     if (target === null) {
       throw new ApiError(404, "not found");
+    }
+    // FollowUser's ordering (models/user/follow.go:33-40): the self and
+    // already-following no-ops return nil BEFORE the blocked probe — a
+    // blocked pair still 204s those — then BOTH directions answer
+    // ErrBlockedUser: the doer blocked by the target, or the target blocked
+    // by the doer. follower.go:235 unwraps the error to the declared 403
+    // `err.Error()`; the isUserBlockedBy site-admin short-circuit is
+    // upstream's `blockee.IsAdmin` (a site admin is never blocked-by).
+    if (doer.id !== target.id && !(await isFollowing(c.env.DB, doer.id, target.id))) {
+      const doerBlockedByTarget = await isUserBlockedBy(c.env.DB, { id: doer.id, isAdmin: doer.isAdmin }, target.id);
+      const targetBlockedByDoer = await isUserBlockedBy(
+        c.env.DB,
+        { id: target.id, isAdmin: target.isAdmin },
+        doer.id,
+      );
+      if (doerBlockedByTarget || targetBlockedByDoer) {
+        throw new ApiError(403, BLOCKED_USER_MESSAGE);
+      }
     }
     await followUser(c.env.DB, doer.id, target.id);
     return c.body(null, 204);

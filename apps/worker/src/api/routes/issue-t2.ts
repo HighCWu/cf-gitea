@@ -39,6 +39,7 @@ import { userListSchema } from "../models/user";
 import { watchInfoSchema } from "../models/watch";
 import type { WatchInfo } from "../models/watch";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { canWriteRepository } from "../services/repo-access";
 import {
   apiRepositoryUrl,
@@ -80,7 +81,12 @@ import { toApiUser } from "../services/user";
  *     ApplyAPIDeadlineTimestamp quirk routes/issues.ts documents).
  *
  * Divergences: reaction permission collapses CanSelfChangeOrAccessContent to
- * "signed-in + visible" (any reader may react); the lock reason is accepted
+ * "signed-in + visible" (any reader may react); the CREATE arms run upstream's
+ * ErrBlockedUser probe (services/issue/reaction.go:20-21 for the issue,
+ * :41-42 for the comment — wired by the blocks-enforcement sweep, 403 "user
+ * is blocked" via issue_reaction.go:202/417's ErrBlockedUser unwrap, placed
+ * ahead of the allowed-set check like upstream's probe-before-CreateReaction
+ * order); the lock reason is accepted
  * and not stored (no lock_reason column — services/issue-extras.ts header);
  * the nested comment pair enforces comment.IssueID == issue.ID (upstream
  * resolves the issue by index first); the archived-repo gate is NOT wired on
@@ -599,7 +605,12 @@ export function registerIssueT2Routes(
   app.openapi(postIssueReactionRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
     const issue = await requireIssue(c, found, c.req.valid("param").index);
-    const { status, body } = await reactionChange(c, issue, 0, c.req.valid("json"));
+    // CreateIssueReaction's blocked set (services/issue/reaction.go:20-21):
+    // the issue poster + the repo owner.
+    const { status, body } = await reactionChange(c, issue, 0, c.req.valid("json"), [
+      issue.posterId ?? null,
+      found.repo.ownerId,
+    ]);
     return c.json(body, status);
   });
 
@@ -639,7 +650,13 @@ export function registerIssueT2Routes(
     if (row === null) {
       throw new ApiError(404, "not found");
     }
-    const { status, body } = await reactionChange(c, row.issue, row.comment.id, c.req.valid("json"));
+    // CreateCommentReaction's blocked set (services/issue/reaction.go:41-42):
+    // the issue poster + the repo owner + the COMMENT poster.
+    const { status, body } = await reactionChange(c, row.issue, row.comment.id, c.req.valid("json"), [
+      row.issue.posterId ?? null,
+      found.repo.ownerId,
+      row.comment.posterId ?? null,
+    ]);
     return c.json(body, status);
   });
 
@@ -825,13 +842,28 @@ async function subscriptionTarget(c: Context<ApiEnv>, username: string): Promise
 }
 
 /** POST semantics: 201 created / 200 already-exists, both with the Reaction
- *  body rendered from the DOER (upstream renders ctx.Doer directly). */
+ *  body rendered from the DOER (upstream renders ctx.Doer directly).
+ *  `blockedByIds` is the CreateIssueReaction/CreateCommentReaction blocked
+ *  set (services/issue/reaction.go:20-21, 41-42): a doer blocked by any of
+ *  them answers ErrBlockedUser — changeIssueReaction/PostIssueReaction's
+ *  `errors.Is(err, user_model.ErrBlockedUser)` unwrap answers 403 "user is
+ *  blocked" (issue_reaction.go:202, 417). Upstream's probe runs BEFORE
+ *  CreateReaction's invalid-content check, so it precedes the allowed-set
+ *  403 here; the isUserBlockedBy site-admin short-circuit is upstream's
+ *  `blockee.IsAdmin`. The DELETE arms carry no upstream probe (the blocked
+ *  check lives in the create services only). */
 async function reactionChange(
   c: Context<ApiEnv>,
   issue: IssueRow,
   commentId: number,
   form: { content?: string },
+  blockedByIds: Array<number | null>,
 ): Promise<{ status: 200 | 201; body: { user: unknown; content: string; created_at: string } }> {
+  const doer = c.get("authUser");
+  const blockedBy = blockedByIds.filter((id): id is number => id !== null && id !== doer?.id);
+  if (await isUserBlockedBy(c.env.DB, { id: requireDoerId(c), isAdmin: doer?.is_admin === true }, ...blockedBy)) {
+    throw new ApiError(403, BLOCKED_USER_MESSAGE);
+  }
   const content = reactionContent(form);
   if (!ALLOWED_REACTIONS.has(content)) {
     throw new ApiError(403, "no permission to change reaction");

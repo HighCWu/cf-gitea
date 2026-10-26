@@ -18,7 +18,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repoRedirects, repoTransfer, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { repoRedirects, repoTransfer, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { createOptionalTokenAuthMiddleware, createStubAuthResolver, createTokenAuthMiddleware, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
@@ -29,10 +29,12 @@ import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
 const TOKEN = "stub-token"; // STUB_USER (id 1) — the repo owner
 const TOKEN_OTHER = "other-token"; // 'other' — a plain user
 const TOKEN_COLLAB_ADMIN = "collab-admin-token";
+const TOKEN_ADMIN = "admin-token";
 const ERROR_URL = "https://example.com/api/swagger";
 
 let otherUserId = 0;
 let collabAdminUserId = 0;
+let adminUserId = 0;
 
 function userIdentity(id: number, login: string) {
   return {
@@ -68,6 +70,7 @@ function makeApp(): (path: string, init?: RequestInit) => Promise<Response> {
       if (token === TOKEN) return createStubAuthResolver().resolveToken(token);
       if (token === TOKEN_OTHER) return Promise.resolve(userIdentity(otherUserId, "other"));
       if (token === TOKEN_COLLAB_ADMIN) return Promise.resolve(userIdentity(collabAdminUserId, "collab-admin"));
+      if (token === TOKEN_ADMIN) return Promise.resolve({ ...userIdentity(adminUserId, "root-admin"), is_admin: true });
       return Promise.resolve(null);
     },
   };
@@ -101,6 +104,12 @@ beforeEach(async () => {
     .returning({ id: users.id })
     .all();
   collabAdminUserId = collabAdmin[0]!.id;
+  const rootAdmin = await drizzle(env.DB)
+    .insert(users)
+    .values({ username: "root-admin", usernameLower: "root-admin", isAdmin: true, status: "active", createdAt: new Date() })
+    .returning({ id: users.id })
+    .all();
+  adminUserId = rootAdmin[0]!.id;
   await drizzle(env.DB).insert(repositories).values({
     id: "7401",
     storageKey: "r_7401",
@@ -443,5 +452,64 @@ describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
 
   it("401s an anonymous caller", async () => {
     expect((await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ new_owner: "other" }) })).status).toBe(401);
+  });
+
+  // ---------------------------------------------------------------------------
+  // The StartRepositoryTransfer blocked arm (the blocks-enforcement sweep —
+  // services/repository/transfer.go:464-466 via transfer.go:118)
+  // ---------------------------------------------------------------------------
+
+  describe("the StartRepositoryTransfer blocked arm", () => {
+    /** A nested wipe — the shared beforeEach above owns the other tables. */
+    beforeEach(async () => {
+      await env.DB.prepare("DELETE FROM user_blocking").run();
+    });
+
+    const block = (blockerId: number, blockeeId: number) =>
+      drizzle(env.DB).insert(userBlocking).values({ blockerId, blockeeId, note: "", createdAt: new Date() });
+
+    it("403s \"user is blocked\" when the doer is blocked by the NEW owner (transfer.go:465 first probe)", async () => {
+      await block(otherUserId, 1);
+      const res = await makeApp()(`${repoPath}/transfer`, {
+        method: "POST",
+        headers: jsonAuth,
+        body: JSON.stringify({ new_owner: "other" }),
+      });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+      expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
+    });
+
+    it("403s when the NEW owner is blocked by the CURRENT owner (transfer.go:465-466 second probe)", async () => {
+      await block(1, otherUserId);
+      const res = await makeApp()(`${repoPath}/transfer`, {
+        method: "POST",
+        headers: jsonAuth,
+        body: JSON.stringify({ new_owner: "other" }),
+      });
+      expect(res.status).toBe(403);
+      expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
+    });
+
+    it("a site-admin doer bypasses the arm (upstream's doer.IsAdmin direct arm precedes the probe)", async () => {
+      await block(otherUserId, adminUserId);
+      const res = await makeApp()(`${repoPath}/transfer`, {
+        method: "POST",
+        headers: { Authorization: `token ${TOKEN_ADMIN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ new_owner: "other" }),
+      });
+      expect(res.status).toBe(202);
+    });
+
+    it("202s once no blocking row relates the pair (the arm lifts with the block)", async () => {
+      await block(otherUserId, 1);
+      await env.DB.prepare("DELETE FROM user_blocking").run();
+      const res = await makeApp()(`${repoPath}/transfer`, {
+        method: "POST",
+        headers: jsonAuth,
+        body: JSON.stringify({ new_owner: "other" }),
+      });
+      expect(res.status).toBe(202);
+    });
   });
 });

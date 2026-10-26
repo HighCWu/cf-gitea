@@ -24,6 +24,7 @@ import {
   transferRepoOptionSchema,
 } from "../models/repository";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { requireRepoAdmin, requireRepoDangerZone, requireVisibleRepo } from "../services/repo-access";
 import { deleteRepoCollaborators } from "../services/repo-collaborators";
 import { deleteRepoSettings, loadRepoSettings, saveRepoSettings, type RepoSettings } from "../services/repo-settings";
@@ -591,7 +592,37 @@ export function registerRepoRoutes(
         throw new ApiError(422, `team ${form.team_ids[0]} not found`);
       }
 
+      // StartRepositoryTransfer's blocked arm (services/repository/transfer.go:
+      // 464-466 via repoTransfer's `errors.Is(err, user_model.ErrBlockedUser)`
+      // → 403 `err.Error()`, transfer.go:118): past the doer-admin and
+      // self-transfer direct arms, a doer blocked by the NEW owner — or a new
+      // owner blocked by the CURRENT owner — refuses. Upstream runs the probe
+      // inside StartRepositoryTransfer after `doer.IsAdmin || doer.ID ==
+      // newOwner.ID` short-circuits to a direct transfer; the route carries
+      // the equivalent ordering here (repos/service.ts is outside this
+      // file's ownership): the site-admin doer bypasses (upstream's
+      // IsAdmin direct arm), and a self-"transfer" keeps the landed
+      // OwnerNotAssignableError 422 below (upstream's direct arm would
+      // transfer back silently — the landed 202-handler divergence stands),
+      // so neither reaches the probe, exactly like upstream.
       const requester = c.get("authUser");
+      const doerIsAdmin = requester.is_admin === true;
+      if (!doerIsAdmin && found.repo.ownerId !== target.id) {
+        const doerBlockedByNewOwner = await isUserBlockedBy(
+          c.env.DB,
+          { id: requester.id ?? 0, isAdmin: doerIsAdmin },
+          target.id,
+        );
+        const newOwnerBlockedByCurrent = await isUserBlockedBy(
+          c.env.DB,
+          { id: target.id, isAdmin: target.isAdmin },
+          found.repo.ownerId ?? -1,
+        );
+        if (doerBlockedByNewOwner || newOwnerBlockedByCurrent) {
+          throw new ApiError(403, BLOCKED_USER_MESSAGE);
+        }
+      }
+
       try {
         await new RepoService(c.env.DB).requestTransfer(found.repo.id, requester.id ?? 0, target.id);
       } catch (error) {

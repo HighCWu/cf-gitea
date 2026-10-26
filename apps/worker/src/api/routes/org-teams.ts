@@ -17,6 +17,7 @@ import { teamSchema, type Team } from "../models/team";
 import { repositoryListSchema, repositorySchema } from "../models/repository";
 import { userSchema, userListSchema } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { orgDoerOf, orgVisibleToDoer, toApiOrganization } from "../services/org-repos";
 import { requireOrgMembership, requireOrgOwnership, resolveOrgForRequest, type OrgProfileDoer } from "../services/orgs";
 import { isRepositoryAdmin, requireRepoAdmin, requireVisibleRepo } from "../services/repo-access";
@@ -89,8 +90,9 @@ import { toApiUser } from "../services/user";
  *                               "only one of units or units_map can be set",
  *                               team.go:156–186 → APIErrorAuto 422)
  *   - orgAddTeamMember:         403 blocked-user (user_model.ErrBlockedUser,
- *                               team.go:469–471) is UNREACHABLE — no user
- *                               block model exists
+ *                               team.go:469–471) is LIVE — the user-blocks
+ *                               model landed; the arm is wired at the
+ *                               handler (the blocks-enforcement sweep)
  *
  * Enforced-in-this-module repo-access slice (the teams half of
  * GetDoerRepoPermission, models/perm/access/repo_permission.go): the
@@ -591,7 +593,9 @@ export class TeamsService {
    * silent no-op; else ensure the ORG membership first (`AddOrgUser` — the
    * "user will have membership to given organization automatically"), then
    * the team row + counter in one batch. The blocked-user 403
-   * (team.go:248–250, 469–471) is unreachable — no block model.
+   * (team.go:248–250, 469–471) is wired at the route handler above (the
+   * blocks-enforcement sweep) — the service keeps its test-fixture
+   * signature.
    */
   async addTeamMember(team: TeamRecord, userId: number): Promise<void> {
     if (await this.isTeamMember(team.id, userId)) return;
@@ -1642,6 +1646,15 @@ export function registerOrgTeamsRoutes(
     await requireOrgOwnership(service.orgService, org, doer);
     const user = await findUserByName(c.env.DB, c.req.valid("param").username);
     if (user === null) throw notFound();
+    // AddTeamMember's blocked arm (services/org/team.go:248-249): a user
+    // blocked by the ORG answers ErrBlockedUser BEFORE the already-member
+    // no-op — orgAddTeamMember (org/team.go:470-474) unwraps it to the
+    // declared 403 `err.Error()`. Carried in the handler (the service method
+    // keeps its test-fixture signature); the isUserBlockedBy site-admin
+    // short-circuit is upstream's `blockee.IsAdmin`.
+    if (await isUserBlockedBy(c.env.DB, { id: user.id, isAdmin: user.isAdmin }, team.orgId)) {
+      throw new ApiError(403, BLOCKED_USER_MESSAGE);
+    }
     await service.addTeamMember(team, user.id);
     return c.body(null, 204);
   });

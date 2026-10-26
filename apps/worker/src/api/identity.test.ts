@@ -27,7 +27,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { gpgKeys, publicKeys, users } from "../db/schema";
+import { gpgKeys, publicKeys, userBlocking, users } from "../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "./auth";
 import contract from "../compat/contract/v1-swagger.generated.json";
 import { giteaErrorHandler } from "./errors";
@@ -304,6 +304,85 @@ describe("PUT /user/following/{username} (userCurrentPutFollow)", () => {
     expect(missing.status).toBe(404);
     expect(await missing.json()).toEqual({ message: "not found", url: "https://example.com/api/swagger" });
     expect((await send("/user/following/ghost", { method: "PUT" })).status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PUT /user/following/{username}: the FollowUser blocked arm (the
+// blocks-enforcement sweep — models/user/follow.go:38-40 via follower.go:235)
+// ---------------------------------------------------------------------------
+
+describe("PUT /user/following/{username}: the FollowUser blocked arm", () => {
+  /** A nested wipe — the shared beforeEach above owns the other tables. */
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM user_blocking").run();
+  });
+
+  const block = (blockerId: number, blockeeId: number) =>
+    db().insert(userBlocking).values({ blockerId, blockeeId, note: "", createdAt: new Date() });
+
+  it("403s \"user is blocked\" when the doer is blocked by the target (follow.go:38-39 via follower.go:235)", async () => {
+    const seed = await seedFollowGraph();
+    await block(seed.alice.id, seed.carol.id);
+    const response = await router()(`/user/following/${seed.alice.username}`, {
+      method: "PUT",
+      headers: authHeaders(seed.carol.id),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ message: "user is blocked", url: "https://example.com/api/swagger" });
+    expect(await edgeCount(seed.carol.id, seed.alice.id)).toBe(0);
+  });
+
+  it("403s in the reverse direction too — the target blocked by the doer (follow.go:39-40)", async () => {
+    const seed = await seedFollowGraph();
+    await block(seed.carol.id, seed.alice.id);
+    const response = await router()(`/user/following/${seed.carol.username}`, {
+      method: "PUT",
+      headers: authHeaders(seed.alice.id),
+    });
+    expect(response.status).toBe(403);
+    expect(await edgeCount(seed.alice.id, seed.carol.id)).toBe(0);
+  });
+
+  it("self and repeat follows stay silent 204s even with a blocking row (follow.go:33-35 precedes the probe)", async () => {
+    const seed = await seedFollowGraph(); // bob already follows alice
+    await block(seed.alice.id, seed.bob.id);
+    const send = router();
+    const repeat = await send(`/user/following/${seed.alice.username}`, {
+      method: "PUT",
+      headers: authHeaders(seed.bob.id),
+    });
+    expect(repeat.status).toBe(204);
+    const self = await send(`/user/following/${seed.bob.username}`, {
+      method: "PUT",
+      headers: authHeaders(seed.bob.id),
+    });
+    expect(self.status).toBe(204);
+    expect(await edgeCount(seed.bob.id, seed.alice.id)).toBe(1);
+  });
+
+  it("a site-admin doer bypasses the block (IsUserBlockedBy's blockee.IsAdmin short-circuit)", async () => {
+    const seed = await seedFollowGraph();
+    const admin = await seedUser("root", { isAdmin: true });
+    await block(seed.alice.id, admin.id);
+    const response = await router()(`/user/following/${seed.alice.username}`, {
+      method: "PUT",
+      headers: authHeaders(admin.id),
+    });
+    expect(response.status).toBe(204);
+    expect(await edgeCount(admin.id, seed.alice.id)).toBe(1);
+  });
+
+  it("204s once no blocking row relates the pair (the arm lifts with the block)", async () => {
+    const seed = await seedFollowGraph();
+    await block(seed.alice.id, seed.carol.id);
+    await env.DB.prepare("DELETE FROM user_blocking").run();
+    const response = await router()(`/user/following/${seed.alice.username}`, {
+      method: "PUT",
+      headers: authHeaders(seed.carol.id),
+    });
+    expect(response.status).toBe(204);
+    expect(await edgeCount(seed.carol.id, seed.alice.id)).toBe(1);
   });
 });
 

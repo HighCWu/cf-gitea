@@ -7,6 +7,7 @@ import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { repositoryListSchema } from "../models/repository";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { requireVisibleRepo } from "../services/repo-access";
 import { toApiRepository, viewerOf } from "../services/repository";
 import { isStarring, listStarredRepositories, starRepo, unstarRepo } from "../services/stars";
@@ -24,9 +25,12 @@ import { isStarring, listStarredRepositories, starRepo, unstarRepo } from "../se
  * not declared: the vendored contract declares no 401 here). The stars feature
  * flag is always enabled on this instance and per-category token scopes land
  * with the SPEC-0002 API-layer gates. Repo resolution follows the
- * anti-enumeration 404 (requireVisibleRepo); the declared 403s are upstream's
- * ErrBlockedUser family — unreachable with no user-blocks model (documented
- * in services/stars.ts), kept in the declarations as the contract mirror.
+ * anti-enumeration 404 (requireVisibleRepo); PUT's declared 403 is LIVE —
+ * upstream's ErrBlockedUser arm (models/repo/star.go:34–35, unwrapped by
+ * Star at star.go:179) is wired in the handler below (the blocks-enforcement
+ * sweep). DELETE's declared 403 stays unreachable: upstream Unstar calls
+ * StarRepo with star=false, and the blocked probe lives INSIDE the star=true
+ * branch only (star.go:32-35).
  *
  * Semantics: GET 404s when the caller is not starring (upstream
  * APIErrorNotFound); PUT/DELETE are the idempotent 204 star/unstar (upstream
@@ -158,6 +162,15 @@ export function registerStarredRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
   app.openapi(putStarRoute(requireAuth), async (c) => {
     const pair = await requireVisibleRepo(c, c.req.valid("param"));
     const doer = await findStarredDoerRow(c.env.DB, c.get("authUser").id);
+    // StarRepo's blocked arm (models/repo/star.go:34-35): a doer blocked by
+    // the repo owner answers ErrBlockedUser BEFORE the already-starring
+    // no-op — upstream checks the block first inside the star=true branch,
+    // so even an existing star 403s on repeat. Star (star.go:179) unwraps
+    // the error to the declared 403 `err.Error()`; the isUserBlockedBy
+    // site-admin short-circuit is upstream's `blockee.IsAdmin`.
+    if (await isUserBlockedBy(c.env.DB, { id: doer.id, isAdmin: doer.isAdmin }, pair.repo.ownerId ?? -1)) {
+      throw new ApiError(403, BLOCKED_USER_MESSAGE);
+    }
     await starRepo(c.env.DB, doer.id, pair.repo.id, new Date());
     return c.body(null, 204);
   });
