@@ -214,7 +214,10 @@ describe("wave-9 parser families (parseUiRoute / handlesUiRoute)", () => {
 
   it("leaves every other /explore tail and the same-named namespaces alone", () => {
     expect(parseUiRoute("/explore/organizations")).toBeNull();
-    expect(parseUiRoute("/explore/repos/sitemap-1.xml")).toBeNull();
+    // Window-2e-A (84996c6) mounted the sitemap literals — the stale
+    // toBeNull pin updated to the claimed shape (the explore matrix's
+    // disclosure).
+    expect(parseUiRoute("/explore/repos/sitemap-1.xml")).toEqual({ family: "explore-repos-sitemap", idx: 1 });
     expect(parseUiRoute("/EXPLORE")).toEqual({ family: "owner-home", owner: "EXPLORE" });
   });
 });
