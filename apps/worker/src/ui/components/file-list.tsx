@@ -9,14 +9,30 @@
  * `name muted-links` / `message commit-summary` / `age` cell classes mirror
  * the template exactly. Slice 1 renders the table COMPLETE whenever the §3.5
  * enrichment resolves an entry's commit, and the muted `.notready` message
- * cell (without the `data-fetch` loader — no partial endpoint exists) when it
- * does not.
+ * cell when it does not.
+ *
+ * Wave-46 flip (the lastcommit machinery's open 2 — upstream's
+ * `{{if .HasFilesWithoutLatestCommit}}` arm, view_list.tmpl:3-8): when the
+ * caller supplies the listing commit (`loaderCommitOid`) and any row's commit
+ * stayed unresolved, the container emits the four `data-fetch-*` attributes —
+ * `data-fetch-url` = view.go:296-297's LastCommitLoaderURL
+ * (`{RepoLink}/lastcommit/{PathEscape(CommitID)}/{PathEscapeSegments(
+ * TreePath)}?refSubUrl={QueryEscape(RefTypeNameSubURL())}` — the trailing
+ * slash rides verbatim even for the root listing; the router's trailing-slash
+ * middleware rewrites it in place), `data-fetch-trigger="load"`,
+ * `data-fetch-sync="$morph"`, `data-fetch-indicator=".repo-file-cell.
+ * notready.message"` — so the official bundle fetches the /lastcommit
+ * fragment and morphs the resolved rows in. The QueryEscape-vs-
+ * encodeURIComponent space form (`+` vs `%20`) is the blobExcerptQuery
+ * module's documented server-equivalent divergence. Callers without the
+ * commit id render the pre-flip shape (no attributes — the wave-38 landed
+ * contract).
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
 
 import { commitLink, treeLink } from "../links";
-import { shortSha, timeSinceParts } from "../page-data";
+import { pathEscapeSegments, shortSha, timeSinceParts } from "../page-data";
 import { Icon } from "../shell";
 
 /** One rendered row's inputs. `commit === null` → the `.notready` cell. */
@@ -89,12 +105,35 @@ export function RepoFilesTable(props: {
   commits: ReadonlyMap<string, CommitJson | null>;
   /** The directory's own last commit (the top `.repo-file-last-commit` line). */
   latestCommit: CommitJson | null;
+  /** The commit the listing hangs off (upstream ctx.Repo.CommitID) — the
+   *  /lastcommit loader URL's id half. Present ⇒ the wave-46 data-fetch arm
+   *  is armed (it emits only when a row's commit stayed null). */
+  loaderCommitOid?: string;
 }) {
   const { repoLink, refType, ref, dirPath, entries, commits, latestCommit } = props;
   const parentPath = dirPath === "" ? null : dirPath.split("/").slice(0, -1).join("/");
   const entryPath = (entry: TreeEntryJson): string => (dirPath === "" ? entry.name : `${dirPath}/${entry.name}`);
+  // HasFilesWithoutLatestCommit (view.go:326-331) + LastCommitLoaderURL
+  // (view.go:296-297) — the flip note in the module header.
+  const hasFilesWithoutLatestCommit =
+    props.loaderCommitOid !== undefined && entries.some((entry) => (commits.get(entry.name) ?? null) === null);
+  const lastCommitLoaderUrl =
+    props.loaderCommitOid === undefined
+      ? null
+      : `${repoLink}/lastcommit/${encodeURIComponent(props.loaderCommitOid)}/${pathEscapeSegments(dirPath)}` +
+        `?refSubUrl=${encodeURIComponent(`${refType}/${pathEscapeSegments(ref)}`)}`;
   return (
-    <div id="repo-files-table">
+    <div
+      id="repo-files-table"
+      {...(hasFilesWithoutLatestCommit && lastCommitLoaderUrl !== null
+        ? {
+            "data-fetch-url": lastCommitLoaderUrl,
+            "data-fetch-trigger": "load",
+            "data-fetch-sync": "$morph",
+            "data-fetch-indicator": ".repo-file-cell.notready.message",
+          }
+        : {})}
+    >
       <div class="repo-file-line repo-file-last-commit">
         <LatestCommitBox repoLink={repoLink} commit={latestCommit} />
         <div>
@@ -139,7 +178,8 @@ export function RepoFilesTable(props: {
               {commit !== null ? (
                 <a href={commitLink(repoLink, commit.oid)}>{commit.subject}</a>
               ) : (
-                // §3.5 degradation: muted placeholder, no data-fetch loader.
+                // §3.5 degradation: the muted placeholder — the loader
+                // attributes ride the container (the wave-46 flip).
                 "…"
               )}
             </div>

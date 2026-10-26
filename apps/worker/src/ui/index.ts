@@ -527,6 +527,29 @@
  *                                          {results:[names]} feed, default
  *                                          branch hoisted, the tag-list-aux
  *                                          twin)
+ *   /:owner/:repo/blob_excerpt/{sha}       the PR-diff hunk-window expansion
+ *                                          fragment, GET (pages/repo-blob
+ *                                          -excerpt-fragment.tsx — wave 46,
+ *                                          the machinery's stage 3; upstream
+ *                                          web.go:1735 repo.ExcerptBlob —
+ *                                          the tplBlobExcerpt `<tr>` rows
+ *                                          over BuildBlobExcerptDiffSection,
+ *                                          the RenderBlobExcerptButtons
+ *                                          round-trip; the wiki twin below)
+ *   /:owner/:repo/wiki/blob_excerpt/{sha}  the excerpt's wiki-cell twin, GET
+ *                                          (web.go:1618 — the same builder
+ *                                          over the sibling `slug.wiki`
+ *                                          engine cell, the hasWiki gate,
+ *                                          BaseLink swapped)
+ *   /:owner/:repo/lastcommit/*             the file-list commit-info refresh
+ *                                          fragment, GET (pages/repo-lastcommit
+ *                                          -fragment.tsx — wave 46 mounts
+ *                                          the machinery wave's handoff;
+ *                                          upstream web.go:1761
+ *                                          repo.LastCommit — the
+ *                                          tplRepoViewList standalone
+ *                                          fragment the view_list loader
+ *                                          fetches)
  *   /:owner/:repo/releases/attachments/{uuid}
  *   /:owner/:repo/releases/download/{vTag}/{fileName}
  *                                          the releases download tail, GET
@@ -881,6 +904,19 @@ import { loadTreeListAux, treeListResponse } from "./pages/tree-list-aux";
 // fileicon-unlocked fragment; loader + Response builder in the module, the
 // handler here beside its sibling dispatchers).
 import { loadTreeViewNodes, treeViewResponse } from "./pages/tree-view-aux";
+// Wave-46 fragment mounts (the machinery waves' routes — the row-5 skips
+// landing): the lastcommit handoff's loader/builder and the blob-excerpt
+// stage-3 loader/builder (pages/repo-lastcommit-fragment.tsx +
+// pages/repo-blob-excerpt-fragment.tsx), the handlers here beside their
+// sibling dispatchers.
+import { loadLastCommitFragment, lastCommitFragmentHtml, lastCommitFragmentResponse, parseLastCommitTail } from "./pages/repo-lastcommit-fragment";
+import {
+  blobExcerptFragmentHtml,
+  blobExcerptFragmentResponse,
+  hashFilePathForWebUI,
+  loadBlobExcerptSection,
+  parseBlobExcerptForm,
+} from "./pages/repo-blob-excerpt-fragment";
 import { loadPullCommitsData, renderPullCommitsPage } from "./pages/pull-commits";
 import { loadCommitViewData, renderCommitViewPage } from "./pages/commit-view";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
@@ -1561,6 +1597,39 @@ export interface TreeViewAuxRoute {
   refSuffix: string;
 }
 
+/** The wave-46 lastcommit fragment family (pages/repo-lastcommit-fragment.tsx
+ *  — the machinery wave's route handoff): upstream web.go:1761's
+ *  `m.Get("/lastcommit/*", context.RepoRefByType(git.RefTypeCommit),
+ *  repo.LastCommit)` — the wildcard tail is the commit id + treePath
+ *  (repo.go:915-921: the first segment is the 7..64-hex-shaped object id, the
+ *  remainder the listed directory; the bare tail is upstream's default-branch
+ *  arm, the landed convention's 404-shell divergence — the module doc's HEAD
+ *  note). The response is the tplRepoViewList HTML fragment, not a page. */
+export interface LastCommitRoute {
+  family: "lastcommit";
+  owner: string;
+  repo: string;
+  /** The decoded `/lastcommit` tail (per-segment decode —
+   *  parseLastCommitTail's input contract; `""` = the bare URL). */
+  rawTail: string;
+}
+
+/** The wave-46 blob-excerpt fragment families (pages/repo-blob-excerpt-
+ *  fragment.tsx — the machinery's stage 3): upstream web.go:1735's
+ *  `m.Get("/blob_excerpt/{sha}", …)` repo twin and web.go:1618's wiki twin
+ *  (the `/{username}/{reponame}/wiki` group — PageIsWiki swaps the read onto
+ *  the sibling wiki storage repo and the buttons' BaseLink). `{sha}` is a
+ *  plain chi single-segment param (NO hex shape — any value; the handler's
+ *  GetCommit miss is the 404 family). The response is the tplBlobExcerpt
+ *  `<tr>` fragment, not a page. */
+export interface BlobExcerptRoute {
+  family: "blob-excerpt" | "wiki-blob-excerpt";
+  owner: string;
+  repo: string;
+  /** The decoded `{sha}` segment (the after-commit id, unvalidated). */
+  sha: string;
+}
+
 
 /** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
  *  three web POSTs — the verdict form's
@@ -1790,7 +1859,9 @@ export type ParsedUiRoute =
   | TreeViewAuxRoute
   | BranchesListAuxRoute
   | ReleaseDownloadRoute
-  | RenderFileRoute;
+  | RenderFileRoute
+  | LastCommitRoute
+  | BlobExcerptRoute;
 
 
 /**
@@ -2095,6 +2166,45 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
         refType: typed,
         refSuffix: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
       };
+    } catch {
+      return null;
+    }
+  }
+  // Wave-46: the lastcommit fragment family (upstream web.go:1761's
+  // `m.Get("/lastcommit/*", RepoRefByType(RefTypeCommit), repo.LastCommit)`).
+  // The wildcard claims the bare URL too (chi's `*` matches the empty tail —
+  // the archive family's precedent), which upstream answers with the DEFAULT
+  // BRANCH's root listing; the landed commit-arm convention declines that
+  // default-branch swap (the module doc's HEAD note), so the bare tail rides
+  // the family and 404-shells at the handler (parseLastCommitTail's miss).
+  // The tail decodes per segment (parseLastCommitTail's input contract); an
+  // undecodable segment is not ours (the parse prefilter's posture).
+  if (head === "lastcommit") {
+    try {
+      return { family: "lastcommit", owner, repo, rawTail: rest.map((segment) => decodeURIComponent(segment)).join("/") };
+    } catch {
+      return null;
+    }
+  }
+  // Wave-46: the blob-excerpt fragment families (upstream web.go:1735's
+  // repo twin + web.go:1618's wiki twin over repo.ExcerptBlob). The `{sha}`
+  // param is a plain chi single segment (no hex shape — the handler's
+  // GetCommit miss is the 404 family), so the claims are the exact
+  // 3-segment (repo) and 5-segment (wiki) shapes; deeper or shorter tails
+  // stay unclaimed → the engine's 404, exactly upstream's unregistered-route
+  // answer.
+  if (head === "blob_excerpt") {
+    if (rest.length !== 1) return null;
+    try {
+      return { family: "blob-excerpt", owner, repo, sha: decodeURIComponent(rest[0] as string) };
+    } catch {
+      return null;
+    }
+  }
+  if (head === "wiki") {
+    if (rest.length !== 2 || rest[0] !== "blob_excerpt") return null;
+    try {
+      return { family: "wiki-blob-excerpt", owner, repo, sha: decodeURIComponent(rest[1] as string) };
     } catch {
       return null;
     }
@@ -4786,6 +4896,76 @@ async function renderFileView(c: Context<{ Bindings: Env }>): Promise<Response> 
   return respond(renderFileResponse(load.html));
 }
 
+// ---------------------------------------------------------------------------
+// The wave-46 fragment mounts (the machinery waves' routes — the survey
+// row-5 skips landing: pages/repo-lastcommit-fragment.tsx's route handoff +
+// pages/repo-blob-excerpt-fragment.tsx's stage 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{owner}/{repo}/lastcommit/* (pages/repo-lastcommit-fragment.tsx —
+ * upstream web.go:1761's `RepoRefByType(RefTypeCommit)` + repo.LastCommit,
+ * view.go:233-250): the directory-listing commit-info refresh the
+ * `#repo-files-table` loader fetches. The handoff's arms, in order: the
+ * §2.5 prologue (the code-read group's posture — the visibility resolution
+ * covers reqUnitCodeReader, the render-file precedent); the tail parse
+ * (parseLastCommitTail — the pattern miss 404-shells, upstream's
+ * getRefNameFromPath ""); the loader's null family (the empty repo, an
+ * unresolvable sha, a missing treePath — upstream's NotFound/ServerError
+ * pair, both 404 here); then the standalone fragment Response with repoLink
+ * `/${repo.ownerNamespace}/${repo.slug}`.
+ */
+async function lastCommitFragment(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "lastcommit") return respond(await c.notFound()); // registration/parser drift guard
+  const tail = parseLastCommitTail(route.rawTail);
+  if (tail === null) return respond(c.html(renderNotFound(ctx), 404)); // the route pattern's miss
+  const data = await loadLastCommitFragment(c.env, repo, tail.commitRef, tail.treePath, c.req.query("refSubUrl") ?? "");
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404)); // the empty-repo/sha/treePath family
+  return respond(lastCommitFragmentResponse(lastCommitFragmentHtml(data, `/${repo.ownerNamespace}/${repo.slug}`)));
+}
+
+/**
+ * GET /{owner}/{repo}/blob_excerpt/{sha} and
+ * GET /{owner}/{repo}/wiki/blob_excerpt/{sha} (pages/repo-blob-excerpt-
+ * fragment.tsx — upstream web.go:1735 + web.go:1618's repo.ExcerptBlob,
+ * compare.go:706-795): the hunk-window expansion rows the diff view's
+ * expander buttons morph in. The group gates: the §2.5 prologue covers the
+ * code-read (web.go:1653-1762's closing args) and the wiki twin's
+ * reqUnitWikiReader; the wiki twin's MustEnableWiki (web.go:1614) reads the
+ * landed repo-settings `hasWiki` (the wave-45 hasProjects precedent) — a
+ * disabled wiki 404-shells. The rest rides the loader (the module doc
+ * carries the knob-by-knob mapping and the 404 family): form parse → the
+ * excerpt section → FileNameHash → the unified-arm fragment Response.
+ */
+async function blobExcerptFragment(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "blob-excerpt" && route.family !== "wiki-blob-excerpt") {
+    return respond(await c.notFound()); // registration/parser drift guard
+  }
+  const wiki = route.family === "wiki-blob-excerpt";
+  if (wiki) {
+    const settings = await loadRepoSettings(c.env.DB, repo.id);
+    if (!settings.hasWiki) return respond(c.html(renderNotFound(ctx), 404)); // MustEnableWiki (web.go:1614)
+  }
+  const form = parseBlobExcerptForm(resolved.url.searchParams);
+  const load = await loadBlobExcerptSection(c.env, repo, route.sha, wiki, form);
+  if (load === null) return respond(c.html(renderNotFound(ctx), 404)); // the empty/sha/path 404 family
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  const html = blobExcerptFragmentHtml({
+    section: load.section,
+    fileNameHash: await hashFilePathForWebUI(load.filePath), // compare.go:792's FileNameHash
+    baseLink: `${repoLink}${wiki ? "/wiki" : ""}/blob_excerpt`, // compare.go:719/729's BaseLink
+    afterCommitID: route.sha, // compare.go:718's AfterCommitID — the path param verbatim
+    style: form.style, // GetDiffViewStyle's resolved echo (middlewares.go:35-37)
+  });
+  return respond(blobExcerptFragmentResponse(html));
+}
+
 /** The wave-33 tag delete's refusal shape — ctx.HTTPError(409, …)'s
  *  plain-text form (release.go:677-680 → base.go:105-113, the archive
  *  family's established answer), stamped with the web middleware's
@@ -7013,3 +7193,23 @@ uiRouter.get("/:owner/:repo/render/branch/*", (c) => renderFileView(c));
 uiRouter.get("/:owner/:repo/render/tag/*", (c) => renderFileView(c));
 uiRouter.get("/:owner/:repo/render/commit/*", (c) => renderFileView(c));
 uiRouter.get("/:owner/:repo/render/blob/:sha", (c) => renderFileView(c));
+// Wave-46 fragment mounts (parseUiRoute claims exactly these shapes — the
+// machinery waves' routes: upstream web.go:1735's `/blob_excerpt/{sha}` repo
+// twin + web.go:1618's wiki twin over repo.ExcerptBlob, and web.go:1761's
+// `/lastcommit/*` wildcard (the bare URL included — chi's empty-tail match,
+// the archive family's precedent; the default-branch arm 404-shells at the
+// handler, the landed commit-arm convention). The HTML-fragment handlers run
+// the resolveUiRequest prologue like every GET page. No earlier registration
+// can absorb these: the "blob_excerpt", "wiki" and "lastcommit" heads are
+// literals no registered pattern carries, the exact-shape params keep the
+// claims equal to the parser's, and unclaimed shapes never reach the sub-app
+// — the dispatcher consults handlesUiRoute first. The {repo} params stay
+// PLAIN (no `[^-].*` constraint): the ae32b1a convention binds only when a
+// static-second-segment `/-` twin exists (the projects families' case), and
+// upstream's `/{username}/-` group (web.go:1107-1180) carries packages/
+// mentions-in-owner/repositories/heatmap/projects ONLY — no blob_excerpt,
+// no lastcommit, no wiki tail, so a leading-dash segment has no twin to
+// shadow and the constraint would claim nothing (the /commits,/tags posture).
+uiRouter.get("/:owner/:repo/blob_excerpt/:sha", (c) => blobExcerptFragment(c));
+uiRouter.get("/:owner/:repo/wiki/blob_excerpt/:sha", (c) => blobExcerptFragment(c));
+uiRouter.get("/:owner/:repo/lastcommit/*", (c) => lastCommitFragment(c));

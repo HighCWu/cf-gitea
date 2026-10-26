@@ -26,14 +26,15 @@
  * byte-order tail (the commit_time DESC divergence), MustBeNotEmpty.
  *
  * Documented skips (in test form): the row-5 fragments whose upstream byte
- * shape rides machinery this codebase has not landed stay engine-owned —
- * `/blob_excerpt/{sha}` (the tplBlobExcerpt HTML fragment over
- * BuildBlobExcerptDiffSection hunk expansion + PR code comments) and
- * `/lastcommit/*` (the tplRepoViewList HTML fragment over per-entry
- * GetCommitsInfo). Nothing fakes their shapes. `/tree-view/*` was the third
- * skip at wave 39 (the fileicon theme pool was unlanded); wave 43's
- * pages/tree-view-aux.ts claims it now that cdf683a landed the fileicon
- * layer, so its engine-owned assertion above moved to the wave-43 test.
+ * shape rides machinery this codebase had not landed stayed engine-owned —
+ * `/tree-view/*` was the third skip at wave 39 (the fileicon theme pool was
+ * unlanded); wave 43's pages/tree-view-aux.ts claimed it once cdf683a landed
+ * the fileicon layer. Wave 46 landed the remaining two with their machinery:
+ * `/blob_excerpt/{sha}` (pages/repo-blob-excerpt-fragment.tsx — the stage-3
+ * tplBlobExcerpt rows over BuildBlobExcerptDiffSection) and `/lastcommit/*`
+ * (the pages/repo-lastcommit-fragment.tsx route handoff) — their engine-owned
+ * assertions below retired with the mounts, the tree-view precedent.
+ * Nothing fakes their shapes.
  *
  * Same harness posture as pages-wave32: the router driven directly with the
  * synthetic ASSETS manifest; engine content seeds through the REAL receive
@@ -269,15 +270,14 @@ describe("wave-39 parser families (parseUiRoute / handlesUiRoute)", () => {
     expect(handlesUiRoute("/octo/hello/branches/list")).toBe(true);
   });
 
-  it("leaves the remaining skipped row-5 fragments engine-owned (documented skips)", () => {
+  it("the row-5 fragment skips landed in later waves (documented-skip retirement)", () => {
     // tree-view — CLAIMED by wave 43 once the fileicon machinery landed
     // (pages/tree-view-aux.ts; its own wave test owns the family asserts).
-    // blob_excerpt — the tplBlobExcerpt HTML fragment over
-    // BuildBlobExcerptDiffSection hunk expansion + PR code comments.
-    expect(handlesUiRoute(`/octo/hello/blob_excerpt/${"a".repeat(40)}`)).toBe(false);
-    // lastcommit — the tplRepoViewList HTML fragment over per-entry
-    // GetCommitsInfo.
-    expect(handlesUiRoute(`/octo/hello/lastcommit/${"a".repeat(40)}/src`)).toBe(false);
+    // blob_excerpt + lastcommit — CLAIMED by wave 46 (the machinery waves'
+    // routes: pages/repo-blob-excerpt-fragment.tsx's stage 3 — repo twin +
+    // wiki twin — and the pages/repo-lastcommit-fragment.tsx route handoff);
+    // the claim asserts moved to pages-wave46-fragment-mounts.test.ts with
+    // the mounts, the tree-view precedent.
   });
 });
 
