@@ -1161,6 +1161,7 @@ import { deleteRepoHook, getOwnerHook, getRepoHook } from "../api/services/hooks
 import { findPullRequestByIndex } from "../api/services/pulls";
 import { findRepositoryById } from "../api/services/repository";
 import { toApiUser } from "../api/auth";
+import { ApiError } from "../api/errors";
 import { IssuesService } from "../issues/service";
 import type { OrgRecord } from "../services/orgs/orgs";
 // Window-2d: the four repo-settings tab modules.
@@ -1261,6 +1262,24 @@ import {
   renderPullFilesSingleCommitPage,
 } from "./pages/pull-files-single-commit";
 import { activityAuthorDataResponse, loadActivityAuthorData } from "./pages/activity-author-data";
+// Window-2e C2: the wiki family.
+import {
+  createWikiPageFromForm,
+  deleteWikiPageFromForm,
+  editWikiPageFromForm,
+  loadWikiEditData,
+  loadWikiPagesData,
+  loadWikiRevisionData,
+  loadWikiViewData,
+  parseWikiPageForm,
+  renderWikiEditPage,
+  renderWikiNewPage,
+  renderWikiPagesPage,
+  renderWikiRevisionPage,
+  renderWikiStartPage,
+  renderWikiViewPage,
+} from "./pages/repo-wiki";
+import type { WikiDoer } from "../services/wiki";
 // Window-2e C1: the global inbox.
 import {
   loadDashboardMilestonesData,
@@ -1991,6 +2010,16 @@ export interface GlobalInboxRoute {
   family: "global-issues" | "global-pulls" | "global-milestones";
 }
 
+/** Window-2e C2: the wiki family (pages/repo-wiki.tsx — the ?action=
+ *  dispatch happens in the handler, per the module's verified grammar). */
+export interface WikiRoute {
+  family: "wiki";
+  owner: string;
+  repo: string;
+  /** The wildcard tail VERBATIM (decoded; "" → the Home page). */
+  rawTail: string;
+}
+
 /** The wave-8 file-editor family (pages/file-editor.tsx): upstream's
  *  `/{editor_action:_edit|_new|_delete}/*` Combos under
  *  `RepoRefByType(git.RefTypeBranch)` (web.go:1453-1461) at the wave brief's
@@ -2263,6 +2292,7 @@ export type ParsedUiRoute =
   | UserFeedRoute
   | IssueAuxRoute
   | GlobalInboxRoute
+  | WikiRoute
   | FileEditorRoute
   | SiteHomeRoute
   | ExploreRoute
@@ -3060,6 +3090,20 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // the `{owner}/{repo}:{head}` fork forms (colon-bearing sides; forks
   // cannot exist yet, SPEC-0003) stay unclaimed → the engine's 404, exactly
   // upstream's unregistered-route answer for this slice.
+  if (head === "wiki") {
+    // Window-2e C2: the WIKI family (pages/repo-wiki.tsx — upstream
+    // web.go:1611-1617's two combos; the SUB-PAGES dispatch on the
+    // ?action= FORM VALUE inside the handlers, not the path — the module's
+    // verified grammar). The raw/* byte arm stays unclaimed (the module
+    // ported the five template pages only) → the engine's 404.
+    let rawTail: string;
+    try {
+      rawTail = rest.map((segment) => decodeURIComponent(segment)).join("/");
+    } catch {
+      return null;
+    }
+    return { family: "wiki", owner, repo, rawTail };
+  }
   if (head === "compare") {
     if (rest.length === 0) return { family: "compare", owner, repo, base: null, head: null };
     let suffix: string;
@@ -6641,6 +6685,138 @@ async function globalMilestonesPage(c: Context<{ Bindings: Env }>): Promise<Resp
   const data = await loadDashboardMilestonesData(c.env.DB, viewer, url.searchParams);
   return respond(c.html(renderDashboardMilestonesPage(resolved.ctx, data), 200));
 }
+
+// ---------------------------------------------------------------------------
+// Window-2e C2: the WIKI family (pages/repo-wiki.tsx). The hasWiki gate
+// 404-shells disabled wikis (the module handoff); the ?action= form value
+// dispatches the sub-pages (the VERIFIED grammar — _pages/_revision are
+// FORM-VALUE case-arms in wiki.go, not routes); writes carry sameOriginGuard
+// + the writer gate + the archived refusal.
+// ---------------------------------------------------------------------------
+
+/** The wiki prologue: repo read, hasWiki gate, and the write-grant pair. */
+async function wikiPrologue(
+  c: Context<{ Bindings: Env }>,
+): Promise<
+  | {
+      ok: true;
+      ctx: UiContext;
+      pair: NonNullable<Awaited<ReturnType<typeof findRepositoryById>>>;
+      repo: RepoRow;
+      rawTail: string;
+      canWrite: boolean;
+      doer: WikiDoer;
+      respond: (r: Response, status?: number) => Response;
+    }
+  | { ok: false; response: Response }
+> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return { ok: false, response: resolved.response };
+  const { ctx, repo, viewer, respond } = resolved;
+  if (resolved.route.family !== "wiki") return { ok: false, response: respond(await c.notFound()) }; // drift guard
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasWiki) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  if (viewer.kind !== "user") {
+    return { ok: true, ctx, pair, repo, rawTail: resolved.route.rawTail, canWrite: false, doer: { name: "", email: "" }, respond };
+  }
+  // The commit identity (the editor family's convention: stored email or
+  // the noreply fallback).
+  const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (userRow === undefined) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  const email = userRow.email === null || userRow.email === "" ? `${userRow.username}@noreply.${new URL(c.req.url).hostname}` : userRow.email;
+  return {
+    ok: true,
+    ctx,
+    pair,
+    repo,
+    rawTail: resolved.route.rawTail,
+    canWrite: !repo.isArchived && (await canWriteRepo(c.env, repo, viewer)),
+    doer: { name: userRow.username, email },
+    respond,
+  };
+}
+
+async function wikiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await wikiPrologue(c);
+  if (!p.ok) return p.response;
+  const { ctx, pair, rawTail, canWrite, respond } = p;
+  const url = new URL(c.req.url);
+  const action = url.searchParams.get("action");
+  if (action === "_pages") {
+    const data = await loadWikiPagesData(c.env, pair);
+    if (data.outcome === "no-wiki") return respond(c.html(renderWikiStartPage({ ctx, canWrite }), 200));
+    return respond(c.html(renderWikiPagesPage({ ctx, data, canWrite }), 200));
+  }
+  if (action === "_revision") {
+    const data = await loadWikiRevisionData(c.env, pair, rawTail, url.searchParams.get("page"));
+    if (data.outcome === "start") return respond(c.html(renderWikiStartPage({ ctx, canWrite }), 200));
+    if (data.outcome === "missing") {
+      return respond(new Response(null, { status: 303, headers: { location: wikiPagesAction(p.repo) } }));
+    }
+    return respond(c.html(renderWikiRevisionPage({ ctx, data }), 200));
+  }
+  if (action === "_new") {
+    if (!canWrite) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(c.html(renderWikiNewPage({ ctx, initialTitle: "", error: null }), 200));
+  }
+  if (action === "_edit") {
+    if (!canWrite) return respond(c.html(renderNotFound(ctx), 404));
+    const data = await loadWikiEditData(c.env, pair, rawTail, url.origin);
+    if (data.outcome === "no-wiki") return respond(c.html(renderWikiStartPage({ ctx, canWrite }), 200));
+    if (data.outcome === "missing") {
+      return respond(new Response(null, { status: 303, headers: { location: wikiPagesAction(p.repo) } }));
+    }
+    return respond(c.html(renderWikiEditPage({ ctx, data, error: null }), 200));
+  }
+  const data = await loadWikiViewData(c.env, pair, rawTail, url.origin);
+  if (data.outcome === "start") return respond(c.html(renderWikiStartPage({ ctx, canWrite }), 200));
+  if (data.outcome === "missing") {
+    return respond(new Response(null, { status: 303, headers: { location: wikiPagesAction(p.repo) } }));
+  }
+  return respond(c.html(renderWikiViewPage({ ctx, data, canWrite }), 200));
+}
+
+function wikiPagesAction(repo: RepoRow): string {
+  return `${repoLinkOf(repo)}/wiki/?action=_pages`;
+}
+
+async function wikiSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await wikiPrologue(c);
+  if (!p.ok) return p.response;
+  const { ctx, pair, rawTail, canWrite, doer, repo, respond } = p;
+  if (!canWrite) return respond(c.html(renderNotFound(ctx), 404));
+  const url = new URL(c.req.url);
+  const form = parseWikiPageForm(await readUrlEncodedForm(c.req.raw));
+  const action = url.searchParams.get("action");
+  try {
+    if (action === "_new") {
+      const page = await createWikiPageFromForm(c.env, pair, doer, form, url.origin);
+      return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/wiki/${page.sub_url}` } }));
+    }
+    if (action === "_delete") {
+      await deleteWikiPageFromForm(c.env, pair, doer, rawTail);
+      return respond(new Response(null, { status: 303, headers: { location: wikiPagesAction(repo) } }));
+    }
+    const page = await editWikiPageFromForm(c.env, pair, doer, rawTail, form, url.origin);
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/wiki/${page.sub_url}` } }));
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    // The service's exact validation texts re-render the form (the family
+    // convention); the wiki's own edit/new arms.
+    if (action === "_new") {
+      return respond(c.html(renderWikiNewPage({ ctx, initialTitle: form.title, error: error.message }), 200));
+    }
+    const data = await loadWikiEditData(c.env, pair, rawTail, url.origin);
+    if (data.outcome !== "edit") {
+      return respond(new Response(null, { status: 303, headers: { location: wikiPagesAction(repo) } }));
+    }
+    return respond(c.html(renderWikiEditPage({ ctx, data, error: error.message }), 200));
+  }
+}
 /**
  * POST /{owner}/{repo}/compare/{base}...{head} (upstream
  * CompareAndPullRequestPost, routers/web/repo/pull.go:1318, over the landed
@@ -9119,6 +9295,11 @@ uiRouter.get("/:owner/:repo/activity_author_data/:period", (c) => activityAuthor
 uiRouter.get("/issues", (c) => globalInboxIssuesPage(c, "issues"));
 uiRouter.get("/pulls", (c) => globalInboxIssuesPage(c, "pulls"));
 uiRouter.get("/milestones", (c) => globalMilestonesPage(c));
+// Window-2e C2: the wiki family.
+uiRouter.get("/:owner/:repo/wiki", (c) => wikiPage(c));
+uiRouter.get("/:owner/:repo/wiki/*", (c) => wikiPage(c));
+uiRouter.post("/:owner/:repo/wiki", (c) => wikiSubmit(c));
+uiRouter.post("/:owner/:repo/wiki/*", (c) => wikiSubmit(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
