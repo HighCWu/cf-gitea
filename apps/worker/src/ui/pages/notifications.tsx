@@ -514,10 +514,17 @@ function threadUrl(item: NotificationListItem): string {
   return `/${item.ownerNamespace}/${item.slug}/${item.isPull ? "pulls" : "issues"}/${item.index}`;
 }
 
+/** Upstream's IsWorkInProgress is a pure title-prefix check (pull.go:652-673:
+ * ASCII case-fold against WorkInProgressPrefixes — defaults "WIP:"/"[WIP:]"
+ * … the landed item already carries `title`, so the draft branch renders). */
+function hasWorkInProgressPrefix(title: string): boolean {
+  const folded = title.toLowerCase();
+  return folded.startsWith("wip:") || folded.startsWith("[wip]");
+}
+
 /** The row's state glyph (shared/issueicon.tmpl — the pull state machine this
  *  projection carries: merged → git-merge purple, closed → PR-closed red,
- *  open → green; issues open/closed). The WIP-draft branch needs the WIP
- *  model (no landed source) — not rendered. */
+ *  open WIP → draft light-gray, open → green; issues open/closed). */
 function ThreadIcon(props: { item: NotificationListItem }) {
   const { item } = props;
   if (item.isPull) {
@@ -527,6 +534,9 @@ function ThreadIcon(props: { item: NotificationListItem }) {
       ) : (
         <Icon name="octicon-git-pull-request-closed" class="tw-text-red" />
       );
+    }
+    if (hasWorkInProgressPrefix(item.title)) {
+      return <Icon name="octicon-git-pull-request-draft" class="tw-text-text-light" />;
     }
     return <Icon name="octicon-git-pull-request" class="tw-text-green" />;
   }
