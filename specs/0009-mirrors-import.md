@@ -36,6 +36,10 @@ In scope:
   validation, mirror row creation when `mirror=true`.
 - Pull-mirror scheduled sync (§2.6): cron producer + Queue consumer, interval and
   prune honoring upstream semantics, force-updates, ref deletes, failure states.
+  As-built (833961d): the producer runs a stuck-syncing sweep BEFORE the
+  due-SELECT — CAS `syncing → idle` on claims older than the receive-lease TTL
+  (15 min), re-enqueued same-tick by the due pass; fresh claims stay busy-guarded
+  (motivation: docs/research/sqlite-locked-2026-10-26.md).
 - Read-only enforcement for mirror repos (extends the SPEC-0003 §2.4 ACL matrix).
 - Webhook `push`-family events per synced ref delta (§2.7).
 - SSRF egress policy for source URLs (§4.1) and credential storage (§4.2).
