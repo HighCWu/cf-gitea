@@ -4,11 +4,20 @@
  * over real D1 through the LANDED secrets-variables service at the ORG owner
  * scope (generated migrations in beforeAll; migration 0021's `secrets` +
  * `action_variables` stores) and the DOM contract of both page renders —
- * hono/jsx renderToString, the modules driven directly (no routes yet, the
- * HANDOFF NOTE in the module header).
+ * hono/jsx renderToString, the modules driven directly.
+ *
+ * The deferred matrix (the polish wave, after the window-2b mount 4f2805f):
+ * the MOUNTED route arms driven through `uiRouter.fetch()` with a minted
+ * session (the appearance/organizations minted-session pattern) — the
+ * anonymous 303s, the non-owner 404 shell, the owner's secret/variable
+ * create/edit/delete round-trips with the carried-form contract (invalid →
+ * re-render with name/description carried, the plaintext value empty), the
+ * cross-origin 403 before any write, the missing→404 fidelity on the
+ * variable path-id arms, and the cross-org scope isolation (another org's
+ * rows never visible/reachable).
  */
 
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -23,8 +32,11 @@ import {
   ownerScope,
   repoScope,
 } from "../../api/services/secrets-variables";
-import { actionVariables, secrets } from "../../db/schema";
+import { actionVariables, orgMembers, secrets, users } from "../../db/schema";
 import type { OrgRecord } from "../../services/orgs/orgs";
+import { locale } from "../locale";
+import { uiRouter, type UiAssetsFetcher } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -590,5 +602,351 @@ describe("the shared chrome", () => {
     const variables = await variablesHtml();
     expect(secrets).toContain("The Coalition");
     expect(variables).toContain("The Coalition");
+  });
+});
+
+// --- the mounted route arms (window-2b 4f2805f; the appearance/organizations
+//     minted-session pattern) ------------------------------------------------
+
+type RouteEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+
+const routeEnv: RouteEnv = {
+  ...env,
+  ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
+};
+
+/** The real production path: parse → resolveUiSession → the org gate → load →
+ *  render, on the mounted uiRouter with the synthetic manifest; the execution
+ *  context is awaited so waitUntil side-effects settle before assertions. */
+async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
+/** A viewer's minted session cookie header (the real mintSession path, minted
+ *  per request — the beforeEach users wipe cascades the sessions table, so a
+ *  cross-test cache would go stale; the value is never rendered). */
+async function sessionCookie(userId: number): Promise<string> {
+  return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+}
+
+/** A GET through the mount (`userId: null` is the anonymous arm). */
+async function getRoute(path: string, userId: number | null): Promise<Response> {
+  return fetchUi(path, { headers: userId === null ? {} : { cookie: await sessionCookie(userId) } });
+}
+
+/** A urlencoded POST through the mount (same-origin by default — the
+ *  sameOriginGuard's happy path; pass another origin for the 403 arms). */
+async function postRoute(path: string, userId: number, fields: Record<string, string>, origin = ORIGIN): Promise<Response> {
+  return fetchUi(path, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin,
+      cookie: await sessionCookie(userId),
+    },
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
+/** The 404 fidelity every missing arm shares: the shell answers (the
+ *  handler's renderNotFound HTML or the parse-guard's plain 404 — both carry
+ *  the upstream box title), never the re-rendered tab. */
+async function expectNotFoundShell(res: Response): Promise<void> {
+  expect(res.status).toBe(404);
+  const html = await res.text();
+  expect(html).toContain(locale.error404_box_title);
+  expect(html).not.toContain(orgSettingsActionsLocale.secrets_management);
+  expect(html).not.toContain(orgSettingsActionsLocale.variables_management);
+}
+
+describe("the mounted org actions routes (window-2b: the minted-session route-level matrix)", () => {
+  /** The route world's REAL users-table rows (the `org` fixture above is the
+   *  module-level render input; the routes resolve through OrgService): the
+   *  coalition org with alice (the file-level beforeEach's id-1 user) as
+   *  owner and bob as a plain member, plus the rival org (carol's) for the
+   *  scope-isolation arms. Ids are captured at seed time — never hardcoded. */
+  interface OrgWorld {
+    coalitionId: number;
+    rivalsId: number;
+    bobId: number;
+  }
+
+  let world: OrgWorld;
+
+  beforeEach(async () => {
+    // The file-level beforeEach has wiped users (cascading org_members and
+    // sessions) and re-seeded alice as id 1; this stage seeds the org rows.
+    const [coalition] = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "coalition", usernameLower: "coalition", type: "org", status: "active", createdAt: T0 })
+      .returning()
+      .all();
+    const [rivals] = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "rivals", usernameLower: "rivals", type: "org", status: "active", createdAt: T0 })
+      .returning()
+      .all();
+    const [bob] = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "bob", usernameLower: "bob", status: "active", createdAt: T0 })
+      .returning()
+      .all();
+    const [carol] = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "carol", usernameLower: "carol", status: "active", createdAt: T0 })
+      .returning()
+      .all();
+    if (coalition === undefined || rivals === undefined || bob === undefined || carol === undefined) {
+      throw new Error("org world seed failed");
+    }
+    await drizzle(env.DB)
+      .insert(orgMembers)
+      .values([
+        { orgId: coalition.id, userId: 1, role: "owner", createdAt: T0 }, // alice owns coalition
+        { orgId: coalition.id, userId: bob.id, role: "member", createdAt: T0 }, // inside, but no ownership
+        { orgId: rivals.id, userId: carol.id, role: "owner", createdAt: T0 },
+      ])
+      .run();
+    world = { coalitionId: coalition.id, rivalsId: rivals.id, bobId: bob.id };
+  });
+
+  // -- the gates ------------------------------------------------------------
+
+  it("303s an anonymous GET of both sub-tabs onto the login round-trip (the org resolved first)", async () => {
+    for (const path of ["/coalition/settings/actions/secrets", "/coalition/settings/actions/variables"]) {
+      const res = await getRoute(path, null);
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent(path)}`);
+    }
+  });
+
+  it("303s an anonymous same-origin POST onto the login round-trip too (the guard passes, then the signed-in gate)", async () => {
+    const res = await fetchUi("/coalition/settings/actions/secrets", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: ORIGIN },
+      body: new URLSearchParams({ name: "ANON_ROW", data: "v", description: "" }).toString(),
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/coalition/settings/actions/secrets")}`,
+    );
+    expect((await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0); // nothing written
+  });
+
+  it("404-shells a signed-in non-owner (a plain member) on GET and POST — nothing written", async () => {
+    await expectNotFoundShell(await getRoute("/coalition/settings/actions/secrets", world.bobId));
+    await expectNotFoundShell(await getRoute("/coalition/settings/actions/variables", world.bobId));
+    await expectNotFoundShell(
+      await postRoute("/coalition/settings/actions/secrets", world.bobId, { name: "BOB_ROW", data: "v", description: "" }),
+    );
+    await expectNotFoundShell(
+      await postRoute("/coalition/settings/actions/variables/new", world.bobId, { name: "BOB_VAR", data: "v", description: "" }),
+    );
+    expect((await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0);
+    expect((await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0);
+  });
+
+  // -- the owner's secrets sub-tab through the mount ------------------------
+
+  it("the owner's secret POST saves through the mount and the follow-up GET renders the row (the round-trip)", async () => {
+    const res = await postRoute("/coalition/settings/actions/secrets", 1, {
+      name: "ROUTE_SECRET",
+      data: "route-plaintext",
+      description: "route description",
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/coalition/settings/actions/secrets");
+    const rows = (await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows;
+    expect(rows.map((row) => row.name)).toEqual(["ROUTE_SECRET"]);
+
+    const page = await getRoute("/coalition/settings/actions/secrets", 1);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain("organization settings actions"); // the §2.4.1 pageClass
+    expect(html).toContain(">ROUTE_SECRET</div>");
+    expect(html).toContain("route description");
+    expect(html).not.toContain("route-plaintext"); // masked, even on the owner's own page
+  });
+
+  it("the owner's invalid secret POST re-renders with the carried form — name/description kept, the value EMPTY", async () => {
+    const res = await postRoute("/coalition/settings/actions/secrets", 1, {
+      name: "GITEA_TOKEN",
+      data: "route-plaintext",
+      description: "kept description",
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="ui negative message"');
+    // renderToString HTML-escapes the message's apostrophes (the DOM test's
+    // convention above).
+    expect(html).toContain("name cannot start with &#39;GITEA_&#39; or &#39;GITHUB_&#39;");
+    expect(html).toContain('value="GITEA_TOKEN"'); // the name carried
+    expect(html).toContain(">kept description</textarea>"); // the description carried
+    expect(html).not.toContain("route-plaintext"); // the plaintext never enters the DOM
+    expect((await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0); // nothing written
+  });
+
+  it("the owner's secret delete POST removes the row and 303s back; a stale id 303s idempotently", async () => {
+    await createOrUpdateSecret(env.DB, ownerScope(world.coalitionId), "DOOMED", "v", "");
+    const row = (await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows[0]!;
+    const hit = await postRoute("/coalition/settings/actions/secrets/delete", 1, { id: String(row.id) });
+    expect(hit.status).toBe(303);
+    expect(hit.headers.get("location")).toBe("/coalition/settings/actions/secrets");
+    expect((await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0);
+    // A repeated (now stale) id: the same 303, nothing else happens (the
+    // idempotent-303 reduction).
+    const stale = await postRoute("/coalition/settings/actions/secrets/delete", 1, { id: String(row.id) });
+    expect(stale.status).toBe(303);
+    expect(stale.headers.get("location")).toBe("/coalition/settings/actions/secrets");
+  });
+
+  // -- the owner's variables sub-tab through the mount ----------------------
+
+  it("renders the owner's variables GET at 200 with the discriminator and the new-form action", async () => {
+    const res = await getRoute("/coalition/settings/actions/variables", 1);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("organization settings actions");
+    expect(html).toContain('action="/coalition/settings/actions/variables/new"');
+    expect(html).toContain(orgSettingsActionsLocale.variables_none); // the fresh-store empty arm
+  });
+
+  it("the owner's variable POST new saves through the mount — 303 onto the list, the name stored UPPERCASE", async () => {
+    const res = await postRoute("/coalition/settings/actions/variables/new", 1, {
+      name: "route_var",
+      data: "route-open-value",
+      description: "route description",
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/coalition/settings/actions/variables");
+    const rows = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows;
+    expect(rows.map((row) => row.name)).toEqual(["ROUTE_VAR"]); // the service's UPPERCASE arm
+    expect(rows[0]!.data).toBe("route-open-value");
+  });
+
+  it("the owner's invalid variable POST re-renders with ALL THREE fields carried (the value rides along, unlike secrets)", async () => {
+    const res = await postRoute("/coalition/settings/actions/variables/new", 1, {
+      name: "BAD-NAME",
+      data: "carried-value",
+      description: "carried description",
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="ui negative message"');
+    expect(html).toContain(orgSettingsActionsLocale.invalid_name_pattern);
+    expect(html).toContain('value="BAD-NAME"');
+    expect(html).toContain(">carried-value</textarea>");
+    expect(html).toContain(">carried description</textarea>");
+    expect((await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0); // nothing written
+  });
+
+  it("the owner's variable edit POST saves through the mount (the row rewritten)", async () => {
+    await createVariableRow(env.DB, ownerScope(world.coalitionId), "EDITABLE", "old-value", "");
+    const row = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows[0]!;
+    const res = await postRoute(`/coalition/settings/actions/variables/${row.id}/edit`, 1, {
+      name: "EDITABLE",
+      data: "new-value",
+      description: "new description",
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/coalition/settings/actions/variables");
+    const after = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows[0]!;
+    expect(after.id).toBe(row.id);
+    expect(after.data).toBe("new-value");
+    expect(after.description).toBe("new description");
+  });
+
+  it("the variable edit and delete arms answer the 404 shell for a stale and a foreign-org id (the findActionsVariable NotFound fidelity)", async () => {
+    await createVariableRow(env.DB, ownerScope(world.coalitionId), "DOOMED", "v", "");
+    const row = (await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows[0]!;
+    await createVariableRow(env.DB, ownerScope(world.rivalsId), "FOREIGN_VAR", "f", "");
+    const foreignId = (await listVariableRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows[0]!.id;
+    await deleteOrgActionsVariable(env.DB, world.coalitionId, row.id); // stale the id
+
+    for (const id of [row.id, foreignId]) {
+      await expectNotFoundShell(
+        await postRoute(`/coalition/settings/actions/variables/${id}/edit`, 1, { name: "X", data: "v", description: "" }),
+      );
+      await expectNotFoundShell(await postRoute(`/coalition/settings/actions/variables/${id}/delete`, 1, {}));
+    }
+    // The junk path ids never reach the write (the parse guard's digits-only
+    // claim — "-3" parses to a rowid that misses, "junk"/"12.5" fail the
+    // parse itself; both answer the same 404).
+    for (const junk of ["junk", "-3", "12.5"]) {
+      await expectNotFoundShell(
+        await postRoute(`/coalition/settings/actions/variables/${junk}/edit`, 1, { name: "X", data: "v", description: "" }),
+      );
+      await expectNotFoundShell(await postRoute(`/coalition/settings/actions/variables/${junk}/delete`, 1, {}));
+    }
+    expect((await listVariableRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows).toHaveLength(1); // the foreign row survives
+  });
+
+  // -- the guard + the scope isolation ---------------------------------------
+
+  it("rejects a cross-origin POST with 403 before any write (sameOriginGuard first, both sub-tabs)", async () => {
+    for (const path of ["/coalition/settings/actions/secrets", "/coalition/settings/actions/variables/new"]) {
+      const res = await postRoute(path, 1, { name: "EVIL_ROW", data: "v", description: "" }, "https://evil.example");
+      expect(res.status).toBe(403);
+      expect(await res.text()).toContain("cross-origin request rejected");
+    }
+    expect((await listSecretRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0);
+    expect((await listVariableRows(env.DB, ownerScope(world.coalitionId), 1, 10)).rows).toHaveLength(0);
+  });
+
+  it("another org's rows are never visible on this org's pages (the scope-isolation read arm)", async () => {
+    await createOrUpdateSecret(env.DB, ownerScope(world.coalitionId), "OURS", "ours-plaintext", "ours description");
+    await createOrUpdateSecret(env.DB, ownerScope(world.rivalsId), "THEIRS", "theirs-plaintext", "theirs description");
+    await createVariableRow(env.DB, ownerScope(world.coalitionId), "OUR_VAR", "our-open-value", "");
+    await createVariableRow(env.DB, ownerScope(world.rivalsId), "THEIR_VAR", "their-open-value", "");
+    const rivalsSecretId = (await listSecretRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows[0]!.id;
+
+    const secretsPage = await getRoute("/coalition/settings/actions/secrets", 1);
+    expect(secretsPage.status).toBe(200);
+    const secretsText = await secretsPage.text();
+    expect(secretsText).toContain(">OURS</div>");
+    expect(secretsText).not.toContain("THEIRS");
+    expect(secretsText).not.toContain("theirs description");
+    expect(secretsText).not.toContain("theirs-plaintext");
+    expect(secretsText).not.toContain(`name="id" value="${String(rivalsSecretId)}"`); // no foreign delete form
+
+    const variablesPage = await getRoute("/coalition/settings/actions/variables", 1);
+    expect(variablesPage.status).toBe(200);
+    const variablesText = await variablesPage.text();
+    expect(variablesText).toContain(">OUR_VAR</div>");
+    expect(variablesText).toContain("our-open-value");
+    expect(variablesText).not.toContain("THEIR_VAR");
+    expect(variablesText).not.toContain("their-open-value");
+  });
+
+  it("another org's rows are unreachable through this org's write URLs (the scope-isolation write arms)", async () => {
+    await createOrUpdateSecret(env.DB, ownerScope(world.rivalsId), "THEIRS", "theirs-plaintext", "");
+    await createVariableRow(env.DB, ownerScope(world.rivalsId), "THEIR_VAR", "their-open-value", "");
+    const rivalsSecret = (await listSecretRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows[0]!;
+    const rivalsVariable = (await listVariableRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows[0]!;
+
+    // The secrets delete always 303s (the idempotent-303 reduction) — but a
+    // foreign id deletes nothing.
+    const del = await postRoute("/coalition/settings/actions/secrets/delete", 1, { id: String(rivalsSecret.id) });
+    expect(del.status).toBe(303);
+    const rivalSecrets = (await listSecretRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows;
+    expect(rivalSecrets).toHaveLength(1);
+    expect(rivalSecrets[0]!.data).toBe("theirs-plaintext");
+
+    // The variable edit/delete answer the genuine 404 shell — the row
+    // survives untouched.
+    await expectNotFoundShell(
+      await postRoute(`/coalition/settings/actions/variables/${rivalsVariable.id}/edit`, 1, {
+        name: "HIJACKED",
+        data: "hijacked-value",
+        description: "",
+      }),
+    );
+    await expectNotFoundShell(await postRoute(`/coalition/settings/actions/variables/${rivalsVariable.id}/delete`, 1, {}));
+    const after = (await listVariableRows(env.DB, ownerScope(world.rivalsId), 1, 10)).rows[0]!;
+    expect(after.name).toBe("THEIR_VAR");
+    expect(after.data).toBe("their-open-value");
   });
 });
