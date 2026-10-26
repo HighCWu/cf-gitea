@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { users } from "../db/schema";
+import { renderIdenticonPng } from "./avatar-identicon";
 
 /**
  * Custom avatars over the shared REPO_PACKS bucket (the remaining-API
@@ -384,4 +385,223 @@ export async function deleteAvatar(bucket: R2Bucket, d1: D1Database, target: Ava
  */
 export async function avatarExists(bucket: R2Bucket, target: AvatarTarget): Promise<boolean> {
   return (await bucket.head(avatarKey(target))) !== null;
+}
+
+// ---------------------------------------------------------------------------
+// The public by-hash serving chain (ui-parity survey row `GET /avatar/*`,
+// docs/compat/ui-parity-survey.md:160) — models/avatars/avatar.go +
+// models/user/avatar.go + routers/web/user/avatar.go over the frozen
+// picture settings. All functions here are storage/D1-parametric like the
+// write half above; the HTTP seam lives in src/web/avatar-serving.ts.
+// ---------------------------------------------------------------------------
+
+/**
+ * The frozen picture settings. cf-gitea has no system-settings model, so the
+ * DB-backed options stand at this fork's defaults:
+ *
+ *   - DISABLE_GRAVATAR default TRUE (modules/setting/config.go:74,
+ *     `WithDefaultSimple(true)`) — the deciding flag for every chain below;
+ *   - ENABLE_FEDERATED_AVATAR has NO default → false (config.go:75);
+ *   - GRAVATAR_SOURCE default "gravatar" → https://secure.gravatar.com/avatar/
+ *     (modules/setting/picture.go, loadAvatarsFrom).
+ */
+export const DISABLE_GRAVATAR = true;
+export const ENABLE_FEDERATED_AVATAR = false;
+export const GRAVATAR_SOURCE = "https://secure.gravatar.com/avatar/";
+
+/**
+ * HashEmail (models/avatars/avatar.go:49-51) — the gravatar-style address of
+ * an email: hex sha256 over the lowercased, space-trimmed email. Go's
+ * strings.ToLower/TrimSpace are byte-for-byte the JS forms for email ASCII.
+ */
+export async function hashEmail(email: string): Promise<string> {
+  return sha256Hex(new TextEncoder().encode(email.toLowerCase().trim()));
+}
+
+/**
+ * HashAvatar (modules/avatar/hash.go:14-20) — the stored avatar FILE name
+ * upstream: hex sha256 over `<uniqueID>-<data>` (the dash keeps the id and
+ * the data from blending). Upstream keeps the name in users.avatar /
+ * repositories.avatar; cf-gitea has neither column (the deterministic-key
+ * divergence, module header) — this port is used where upstream computes the
+ * name for the auto-generated random avatar (models/user/avatar.go:30),
+ * which has no column to land in either, so the name IS the R2 key.
+ */
+export async function hashAvatar(uniqueId: number, data: string): Promise<string> {
+  return sha256Hex(new TextEncoder().encode(`${String(uniqueId)}-${data}`));
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  let hex = "";
+  for (const byte of digest) {
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+/**
+ * DefaultAvatarLink (models/avatars/avatar.go:44-46) — the bundled PNG every
+ * fallback arm ends at. The asset itself is served by the frontend's
+ * /assets/* handler (the UI wave's concern — see the serving seam header).
+ */
+export function defaultAvatarLink(): string {
+  return "/assets/img/avatar_default.png";
+}
+
+/**
+ * GenerateUserAvatarImageLink (models/avatars/avatar.go:97-102) — the final
+ * link to a stored avatar object under the /avatars/* storage handler; a
+ * positive size rides the `?size=` query (the handlers ignore it, upstream
+ * keeps it for future scaling).
+ */
+export function generateUserAvatarImageLink(avatar: string, size: number): string {
+  const escaped = encodeURIComponent(avatar); // Go's url.PathEscape
+  return size > 0 ? `/avatars/${escaped}?size=${size}` : `/avatars/${escaped}`;
+}
+
+/**
+ * GenerateSourceAvatarURL (models/avatars/avatar.go:104-113) — the remote
+ * gravatar URL with the identicon fallback parameter. Only reachable when
+ * DISABLE_GRAVATAR is false (a setting cf-gitea cannot set today — kept for
+ * the frozen-constant chain shape).
+ */
+function generateSourceAvatarURL(source: URL, emailHash: string, size: number): string {
+  const base = source.pathname.endsWith("/") ? source.pathname : `${source.pathname}/`;
+  const url = new URL(`${base}${emailHash}`, source.origin);
+  url.searchParams.set("d", "identicon"); // the gravatar-side fallback (line 107)
+  if (size > 0) {
+    url.searchParams.set("s", String(size));
+  }
+  return url.toString();
+}
+
+/**
+ * generateEmailAvatarLink (models/avatars/avatar.go:116-146) with final=true
+ * — GenerateEmailAvatarFinalLink, the /avatar/{hash} handler's redirect
+ * target (routers/web/user/avatar.go:46). Ported arms, in upstream order:
+ *
+ *   1. TrimSpace(email); empty → DefaultAvatarLink (line 117-120);
+ *   2. the `federated && !final` fast-link arm is final-only (skipped — the
+ *      arm where saveEmailHash writes the email_hash table, line 122-130);
+ *   3. `!federated && DisableGravatar` → DefaultAvatarLink (line 131-133) —
+ *      the DEFAULT settings arm and the one every request takes on
+ *      cf-gitea (both constants frozen above);
+ *   4. otherwise the gravatar source URL with d=identicon (line 135-145).
+ *
+ * The email HASH table note: upstream reaches arm 3/4 with the email
+ * resolved from the hash via the `email_hash` table (GetEmailForHash,
+ * below) — cf-gitea's schema has no such table (owned by schema.ts +
+ * migrations, outside this wave), so the resolved email is always "" and
+ * arm 1 fires; at the frozen settings arms 3 and 4 converge on the same
+ * default link for ANY email, so the observable behavior is identical.
+ */
+export async function generateEmailAvatarFinalLink(email: string, size: number): Promise<string> {
+  const trimmed = email.trim();
+  if (trimmed === "") {
+    return defaultAvatarLink();
+  }
+  if (!ENABLE_FEDERATED_AVATAR && DISABLE_GRAVATAR) {
+    return defaultAvatarLink();
+  }
+  return generateSourceAvatarURL(new URL(GRAVATAR_SOURCE), await hashEmail(trimmed), size);
+}
+
+/**
+ * GetEmailForHash (models/avatars/avatar.go:58-69): normalize the hash the
+ * same way upstream does (ToLower + TrimSpace, line 59), then reverse it
+ * through the `email_hash` table (line 60-68). cf-gitea's schema has no
+ * email_hash table (see generateEmailAvatarFinalLink) — the lookup hits the
+ * "not has" arm (line 64-66) and returns "", the only reachable state until
+ * that table lands in a migration owned by the schema wave. The
+ * normalization is kept verbatim so the function is drop-in compatible when
+ * the table exists.
+ */
+export function getEmailForHash(hash: string): string {
+  const normalized = hash.toLowerCase().trim(); // line 59, verbatim
+  if (normalized !== "") {
+    // The email_hash read (line 60-68) plugs in HERE — cf-gitea has no
+    // email_hash table until a schema-wave migration adds one, so every
+    // lookup lands on the !has arm (line 64-66) and resolves empty.
+    return "";
+  }
+  return "";
+}
+
+/** The AvatarLinkWithSize user slice (the columns the chain reads). */
+export interface AvatarChainUser {
+  id: number;
+  username: string;
+  email: string | null;
+  avatarEmail: string | null;
+  useCustomAvatar: boolean;
+}
+
+/**
+ * GenerateRandomAvatar (models/user/avatar.go:28-46): seed = email (or the
+ * username when empty), file name = HashAvatar(id, seed), and a seeded
+ * 512x512 identicon stored under it (RandomImageDefaultSize =
+ * DefaultAvatarSize 256 x RenderedSizeFactor 2, modules/avatar/avatar.go:28,
+ * 40-42; picture.go RenderedSizeFactor default) — only when absent (the
+ * `if _, err := Stat; err != nil` guard, line 33-39). Upstream also updates
+ * the users.avatar column (line 41-43); cf-gitea has no such column (the
+ * module-header divergence), so the file name is recomputed per call — it is
+ * deterministic, so the R2 object IS the stable state.
+ */
+export async function generateRandomAvatar(bucket: R2Bucket, user: AvatarChainUser): Promise<string> {
+  const seed = (user.email !== null && user.email !== "") ? user.email : user.username;
+  const file = await hashAvatar(user.id, seed);
+  if ((await bucket.head(`avatars/${file}`)) === null) {
+    const png = await renderIdenticonPng(512, new TextEncoder().encode(seed));
+    await bucket.put(`avatars/${file}`, png.bytes, { httpMetadata: { contentType: "image/png" } });
+  }
+  return file;
+}
+
+/**
+ * AvatarLinkWithSize (models/user/avatar.go:49-79) — the link the
+ * /user/avatar/{username}/{size} handler redirects to, ported arm by arm:
+ *
+ *   - u.ID <= 0 → DefaultAvatarLink (line 50-52);
+ *   - UseCustomAvatar → the local stored avatar (line 60-61). Upstream links
+ *     `u.Avatar` (the content-hash column); cf-gitea's key layout makes the
+ *     object `avatars/u_<id>` with the marker⇒object invariant
+ *     (uploadAvatar above), so u_<id> IS the avatar path (documented
+ *     divergence — the storage handler's fallback renders it if the object
+ *     was lost, same UX as upstream's missing-file case);
+ *   - DisableGravatar (frozen true) → local + AUTO-GENERATE (line 62-65):
+ *     GenerateRandomAvatar then link the generated file name (line 67-76);
+ *   - otherwise the email fast link for AvatarEmail (line 78) — at the
+ *     frozen settings that collapses to the default link via
+ *     generateEmailAvatarLink's arms.
+ */
+export async function avatarLinkWithSize(bucket: R2Bucket, user: AvatarChainUser, size: number): Promise<string> {
+  if (user.id <= 0) {
+    return defaultAvatarLink();
+  }
+
+  let useLocalAvatar = false;
+  let autoGenerateAvatar = false;
+  if (user.useCustomAvatar) {
+    useLocalAvatar = true;
+  } else if (DISABLE_GRAVATAR) {
+    useLocalAvatar = true;
+    autoGenerateAvatar = true;
+  }
+
+  if (useLocalAvatar) {
+    if (user.useCustomAvatar) {
+      // upstream: GenerateUserAvatarImageLink(u.Avatar, size) — the u_<id>
+      // divergence documented above.
+      return generateUserAvatarImageLink(`u_${user.id}`, size);
+    }
+    if (autoGenerateAvatar) {
+      // upstream: GenerateRandomAvatar + link the stored file (the u.Avatar
+      // == "" guard always fires here — there is no column to pre-fill).
+      const file = await generateRandomAvatar(bucket, user);
+      return generateUserAvatarImageLink(file, size);
+    }
+    return defaultAvatarLink();
+  }
+  return generateEmailAvatarFinalLink(user.avatarEmail ?? "", size);
 }
