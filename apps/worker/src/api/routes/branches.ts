@@ -46,6 +46,7 @@ import {
   type ProtectedBranchRow,
 } from "../../services/branch-protection";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
+import { syncRepoLicensesFromCell } from "../../services/repo-licenses";
 import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
 import type { MiddlewareHandler } from "hono";
 
@@ -461,6 +462,45 @@ export function registerBranchRoutes(
         },
         branchRef(newName),
       );
+      // The default-branch license arm. Upstream's API CreateBranch lands its
+      // branch through CreateNewBranchFromCommit's internal push
+      // (services/repository/branch.go:391-412), which rides the shared push
+      // pipeline — its license enqueuer fires ONLY for the repo's default
+      // branch (services/repository/push.go:161-175, `branch ==
+      // repo.DefaultBranch` inside `!opts.IsDelRef()`); SetRepoDefaultBranch
+      // is the API-driven twin (services/repository/branch.go:731-737, a
+      // default-branch change enqueues the same updater under
+      // `if !repo.IsEmpty` — this handler's assertNotEmpty 404 holds that
+      // guard by construction). A POST creating `refs/heads/<defaultBranch>`
+      // moves the default tip without a push receive: the same delta the
+      // walk's gate matches. Never-fail-the-write posture (the webhook
+      // fan-out's): caught and logged; deferred to waitUntil when the
+      // runtime provides an execution context, inline for in-process callers
+      // (tests) so the leg stays observable.
+      if (newName === pair.repo.defaultBranch) {
+        const licenseScan = syncRepoLicensesFromCell(
+          c.env.DB,
+          engineCell(c.env, pair.repo),
+          pair.repo,
+          [{ ref: branchRef(newName), next: source.target }],
+        ).catch((error: unknown) => {
+          console.error(
+            `[branches] ${pair.repo.ownerNamespace}/${pair.repo.slug}: license sync failed (the created branch stands): ` +
+              `${errorMessage(error)}`,
+          );
+        });
+        let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+        try {
+          execCtx = c.executionCtx;
+        } catch {
+          execCtx = undefined; // in-process caller (tests): run inline
+        }
+        if (execCtx === undefined) {
+          await licenseScan;
+        } else {
+          execCtx.waitUntil(licenseScan);
+        }
+      }
       return c.json(branch, 201);
     },
     bindValidationHook,

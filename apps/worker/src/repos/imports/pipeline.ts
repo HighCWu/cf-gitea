@@ -62,6 +62,7 @@ import { createDurableGit, type RefsResult } from "@cf-gitea/git-engine";
 import { authorize } from "../../git-http/authorize";
 import { markGateCleared } from "../../git-http/gate";
 import { repositories } from "../../db/schema";
+import { syncRepoLicensesForDefaultBranch } from "../../services/repo-licenses";
 import type { RepoRow } from "../service";
 import {
   CHUNK_REORDER_DELAY_SECONDS,
@@ -581,6 +582,24 @@ export async function finalizeImport(env: Env, importId: number, repoId: string)
   console.log(
     `[imports] import ${importId} done: ${Object.keys(manifest.refs).length} refs, ${manifest.totalBytes} bytes from ${manifest.chunks.length} chunks`,
   );
+
+  // The migrate license arm (services/repository/migrate.go:171-174):
+  // upstream enqueues the license updater unconditionally once the migration
+  // has landed its refs (log-and-continue on the enqueue error) — the queue
+  // consumer (license.go:70-102) resolves the default branch and rescans.
+  // `syncRepoLicensesForDefaultBranch` is that consumer's port; the default
+  // branch is `manifest.head` (validated to name a declared branch, and the
+  // branch settleDone just recorded as the repositories row's
+  // default_branch). Queue-correct deferral: this runs inside the consumer
+  // message's own context (the message acks when handleImportTask returns) —
+  // inline, caught and logged, the settled import stands.
+  try {
+    await syncRepoLicensesForDefaultBranch(env.DB, stub, { id: repo.id, defaultBranch: manifest.head });
+  } catch (error) {
+    console.error(
+      `[imports] license sync failed for ${engineRepoName(repo)} (the settled import stands): ${errorMessage(error)}`,
+    );
+  }
   return true;
 }
 

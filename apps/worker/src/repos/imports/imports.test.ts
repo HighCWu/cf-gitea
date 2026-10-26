@@ -17,6 +17,8 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { REPO_SETTINGS_DDL_STATEMENTS } from "../../api/services/repo-settings";
 import { mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
 import { repoImports, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
+import { getRepoLicenses } from "../../services/repo-licenses";
+import { LICENSE_CORPUS_TEXTS } from "../../services/license-corpus";
 import { RepoService } from "../service";
 import { handleRepoTasks } from "../purge";
 import { buildPack } from "../testing/git-pack";
@@ -50,6 +52,7 @@ beforeEach(async () => {
     "repo_transfer",
     "repo_redirects",
     "repo_counters",
+    "repo_license",
     "webhook_deliveries",
     "webhooks",
     "repositories",
@@ -900,5 +903,59 @@ describe("import consumer pipeline (stage-as-receive, SPEC-0003 §2.6)", () => {
       .run();
     await handleImportTask(env, { kind: "import-sweep", importId: row.id, repoId });
     expect((await service.get(row.id))?.state).toBe("failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The license settle (services/repository/migrate.go:171-174) — upstream
+// enqueues the license updater unconditionally once a migration succeeds;
+// the consumer-shaped walk (services/repo-licenses.ts, license.go:70-102)
+// scans the settled default branch (manifest.head, the branch settleDone
+// just recorded) and diffs repo_license at its tip.
+// ---------------------------------------------------------------------------
+
+describe("import settle license arm (migrate.go:171-174)", () => {
+  it("a settled import populates repo_license from the imported default branch", async () => {
+    const { repoId, storageKey } = await seedRepo("licensed");
+    const MIT_TEXT = LICENSE_CORPUS_TEXTS.find(([id]) => id === "MIT")![1];
+    // Two files → the pack is assembled directly (commitPack carries a
+    // single blob — every existing fixture's shape).
+    const readme = await blobObject("imported\n");
+    const license = await blobObject(MIT_TEXT);
+    const tree = await treeObject([
+      { name: "README.md", oid: readme.oid },
+      { name: "LICENSE", oid: license.oid },
+    ]);
+    const commit = await commitObject(tree.oid, [], "licensed import\n", 1700000007);
+    const packed = await packOf([readme, license, tree, commit]);
+    const chunk: FixtureChunk = { oid: commit.oid, pack: packed.pack, sha1: packed.sha1 };
+
+    const service = importService();
+    const { row } = await service.create(repoId);
+    await stageChunk(row.id, storageKey, 0, chunk);
+    await service.start(row.id, manifestFor("main", { "refs/heads/main": chunk.oid }, [chunk]));
+
+    expect(await indexChunk(env, row.id, repoId, 0)).toBe(true);
+    expect((await service.get(row.id))?.state).toBe("done");
+
+    const rows = await getRepoLicenses(env.DB, repoId);
+    expect(rows.map((r) => ({ license: r.license, licensePath: r.licensePath, commitId: r.commitId }))).toEqual([
+      { license: "MIT", licensePath: "LICENSE", commitId: chunk.oid },
+    ]);
+  });
+
+  it("an import without a license file settles with an empty table", async () => {
+    const { repoId, storageKey } = await seedRepo("unlicensed");
+    const built = await buildPack(); // the single-commit fixture: README only
+    const chunk: FixtureChunk = { oid: built.oid, pack: built.pack, sha1: await trailerSha1(built.pack) };
+
+    const service = importService();
+    const { row } = await service.create(repoId);
+    await stageChunk(row.id, storageKey, 0, chunk);
+    await service.start(row.id, manifestFor("main", { "refs/heads/main": chunk.oid }, [chunk]));
+
+    expect(await indexChunk(env, row.id, repoId, 0)).toBe(true);
+    expect((await service.get(row.id))?.state).toBe("done");
+    expect(await getRepoLicenses(env.DB, repoId)).toEqual([]);
   });
 });

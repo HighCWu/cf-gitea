@@ -40,6 +40,8 @@ import { asc, eq } from "drizzle-orm";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { repoMirrors, repositories, webhookDeliveries, webhooks } from "../../db/schema";
+import { getRepoLicenses } from "../repo-licenses";
+import { LICENSE_CORPUS_TEXTS } from "../license-corpus";
 import { buildHistoryPack, ensureSeededRepo, type SeedCommit } from "../../ui/testing/seed-repo";
 import { UPLOAD_PACK_ADVERTISEMENT_CT, UPLOAD_PACK_RESULT_CT, type FetchImpl } from "./gitclient";
 import { handleMirrorSync } from "./sync";
@@ -207,7 +209,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["repo_mirrors", "repo_counters", "repositories", "personal_access_tokens", "webhook_deliveries", "webhooks"]) {
+  for (const table of ["repo_mirrors", "repo_counters", "repo_license", "repositories", "personal_access_tokens", "webhook_deliveries", "webhooks"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare("DELETE FROM users").run();
@@ -616,5 +618,67 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
       created_unix integer,
       delivered_unix integer
     )`).run();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The license settle (mirror_pull.go:406-413) — upstream enqueues the license
+// updater unconditionally on the SyncMirrors success path; the consumer-shaped
+// walk (services/repo-licenses.ts, license.go:70-102) scans the settled
+// default branch and diffs repo_license at its tip.
+// ---------------------------------------------------------------------------
+
+/** The corpus MIT text — a real detectable license for the settle scan. */
+const MIT_TEXT = LICENSE_CORPUS_TEXTS.find(([id]) => id === "MIT")![1];
+
+const LICENSE_SOURCE: SeedCommit[] = [
+  {
+    message: "licensed source\n",
+    files: [
+      { path: "README.md", content: "licensed mirror source\n" },
+      { path: "LICENSE", content: MIT_TEXT },
+    ],
+    time: 1700000000,
+  },
+];
+
+describe("handleMirrorSync license settle (mirror_pull.go:406-413)", () => {
+  it("a completed sync populates repo_license from the mirrored default branch", async () => {
+    // The source: real pushed content carrying an MIT LICENSE; the
+    // advertisement is built from its actual refs (the population-settle
+    // harness shape).
+    await ensureSeededRepo({ owner: "mirror-src", slug: "licensed", commits: LICENSE_SOURCE });
+    const sourceRefs = await env.REPO.getByName("mirror-src/licensed").listRefs();
+    const sourceTip = sourceRefs.refs.find((r) => r.name === "refs/heads/main")!.target;
+
+    await seedMirrorTarget("mirror-licensed");
+    const { fetchImpl } = stubFetch([
+      advertResponse(v0AdvertBytes(sourceRefs.refs, sourceRefs.head)),
+      resultResponse(packResponseBytes((await buildHistoryPack(LICENSE_SOURCE)).pack)),
+    ]);
+    const result = await handleMirrorSync(env, { repoId: "7401", fetchImpl, now: NOW });
+    expect(result).toEqual({ ok: true, created: 1, updated: 0, deleted: 0 });
+
+    const rendered = () =>
+      getRepoLicenses(env.DB, "7401").then((rows) =>
+        rows.map((r) => ({ license: r.license, licensePath: r.licensePath, commitId: r.commitId })),
+      );
+    expect(await rendered()).toEqual([{ license: "MIT", licensePath: "LICENSE", commitId: sourceTip }]);
+
+    // The no-changes resync — upstream's enqueue is unconditional on the
+    // success path — rescans and rewrites the same row in place; the table
+    // does not grow.
+    const again = stubFetch([advertResponse(v0AdvertBytes(sourceRefs.refs, sourceRefs.head))]);
+    const second = await handleMirrorSync(env, { repoId: "7401", fetchImpl: again.fetchImpl, now: NOW });
+    expect(second).toEqual({ ok: true, skipped: "no-changes", created: 0, updated: 0, deleted: 0 });
+    expect(await rendered()).toEqual([{ license: "MIT", licensePath: "LICENSE", commitId: sourceTip }]);
+  });
+
+  it("a sync whose source legitimately stays empty writes no rows (the unborn-default skip, license.go:79-81)", async () => {
+    await seedMirrorTarget("mirror-licensed-empty");
+    const { fetchImpl } = stubFetch([advertResponse(v0EmptyAdvertBytes())]);
+    const result = await handleMirrorSync(env, { repoId: "7401", fetchImpl, now: NOW });
+    expect(result).toEqual({ ok: true, skipped: "no-changes", created: 0, updated: 0, deleted: 0 });
+    expect(await getRepoLicenses(env.DB, "7401")).toEqual([]);
   });
 });

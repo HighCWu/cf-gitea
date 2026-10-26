@@ -96,6 +96,7 @@ import { authorize } from "../../git-http/authorize";
 import { markGateCleared } from "../../git-http/gate";
 import { parseHostPolicy, type HostPolicy } from "../../webhooks/ssrf";
 import { emitPushFamilyUpdates, engineWalk, type WebhookPushIdentity } from "../webhooks-push";
+import { syncRepoLicensesForDefaultBranch } from "../repo-licenses";
 import { engineName, type RepoRow } from "../../repos/service";
 import {
   checkMirrorSource,
@@ -392,6 +393,35 @@ async function notifyMirrorSyncDelta(env: MirrorSyncEnv, repo: RepoRow, updates:
     console.error(
       `[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: webhook fan-out failed (the settled sync stands): ` +
         `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/**
+ * The mirror license arm (mirror_pull.go:406-413): upstream enqueues the
+ * license updater UNCONDITIONALLY on the SyncMirrors success path (after the
+ * notification loop — the enqueue error is logged, `return false` at worst),
+ * and the queue consumer (services/repository/license.go:70-102) resolves
+ * the default branch's tip and rescans — `syncRepoLicensesForDefaultBranch`
+ * is that consumer's port. The repositories row is RE-READ here: the
+ * population settle above may have just flipped default_branch (the
+ * empty→populated transition), and the scan must see the settled branch.
+ * Queue-correct deferral: this runs inside the consumer message's own
+ * context (the message acks when handleMirrorSync returns), so the leg is
+ * inline — caught and logged, the settled sync stands.
+ */
+async function syncMirrorLicenses(env: MirrorSyncEnv, repo: RepoRow): Promise<void> {
+  try {
+    const fresh = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repo.id)).get();
+    if (fresh === undefined) return;
+    await syncRepoLicensesForDefaultBranch(
+      env.DB,
+      env.REPO.getByName(engineName(fresh.ownerNamespace, fresh.slug)),
+      { id: fresh.id, defaultBranch: fresh.defaultBranch },
+    );
+  } catch (error) {
+    console.error(
+      `[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: license sync failed (the settled sync stands): ${errorText(error)}`,
     );
   }
 }
@@ -752,6 +782,7 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
     if (plan.wants.length === 0) {
       if (commands.length === 0) {
         await settleMirrorSuccess(env, repo, mirror, nowSec);
+        await syncMirrorLicenses(env, repo); // mirror_pull.go:406-413 — unconditional on success
         return { ok: true, skipped: "no-changes", created: 0, updated: 0, deleted: 0 };
       }
       // Prune-only sync: a refs-only receive (deletes shape — no pack bytes),
@@ -787,6 +818,10 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
   // sync: notifyMirrorSyncDelta catches its own.
   await settleMirrorSuccess(env, repo, mirror, nowSec);
   await notifyMirrorSyncDelta(env, repo, commands);
+  // The license arm last, upstream's order (mirror_pull.go:347-413: the
+  // notification loop, THEN the license updater enqueue) — unconditional on
+  // the success path, caught and logged inside.
+  await syncMirrorLicenses(env, repo);
   return { ok: true, created: plan.creates.length, updated: plan.updates.length, deleted: plan.deletes.length };
 }
 

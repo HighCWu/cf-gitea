@@ -422,6 +422,30 @@ export async function syncRepoLicensesFromCell(
 }
 
 /**
+ * The QUEUE-CONSUMER-shaped walk (license.go:70-102, `repoLicenseUpdater`):
+ * resolve the default branch's tip, scan it, diff the rows — NO ref-delta
+ * gate. This is the shape upstream's mirror arm (mirror_pull.go:406-413)
+ * and migrate arm (services/repository/migrate.go:171-174) trigger: both
+ * enqueue UNCONDITIONALLY on their success paths and the consumer resolves
+ * `repo.DefaultBranch` itself. The unborn tip is the consumer's IsEmpty
+ * skip's subject (license.go:79-81) — the divergence statement on
+ * syncRepoLicensesFromCell applies verbatim. Callers pass a FRESH
+ * repositories row (the mirror population settle may have just flipped
+ * default_branch) and own the failure posture (both upstream arms
+ * log-and-continue).
+ */
+export async function syncRepoLicensesForDefaultBranch(
+  d1: D1Database,
+  cell: LicenseEngineCell,
+  repo: RepoLicenseSyncTarget,
+): Promise<void> {
+  const tip = await cell.readCommit(`refs/heads/${repo.defaultBranch}`);
+  if (tip === null) return; // license.go:79-81's subject — the unborn default
+  const detected = await resolveLicensesFromCell(cell, tip.oid);
+  await updateRepoLicenses(d1, repo.id, tip.oid, detected);
+}
+
+/**
  * resolveLicenses (license.go:156-198) over the engine's tree RPCs: the
  * REUSE LICENSES/ subtree claims the whole resolution when it exists
  * (listTree answers null for a missing path — the SubTree/IsErrNotExist
