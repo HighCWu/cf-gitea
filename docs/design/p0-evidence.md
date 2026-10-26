@@ -2736,3 +2736,236 @@ workerd socket deaths at the pool layer, not the 1009 graph-snapshot signature).
 
 *(REDEPLOY18, evidence appended by the redeploy-verification agent; all numbers
 verbatim from this run's commands.)*
+
+---
+
+## REDEPLOY19 — the post-18 mass: closures + index window @ `e39adad` (2026-10-26)
+
+GO named commit `e39adad` (the "closures window": the carried-OPEN closures —
+payload stubs + parent read-gate + route swaps `3fcbe1a`/`a55a725`, renamed-fork
+fork-edge `9ecb3e5`, tag-note `aaea049`; the index window routes `67adfb7`
+[blob-excerpt + wiki twin, lastcommit, fetch-attrs flip]; search filters
+`e39adad`; docs units). The in-flight org-settings / modules / sweep units were
+UNCOMMITTED at GO and excluded by construction (the worktree recipe's whole
+point) — they ride REDEPLOY20. Gates ran twice: at window-open HEAD `67adfb7`
+(main tree, typecheck 0 / lint 0 / four full-suite runs all adjudicated
+infrastructure) and per-GO at `e39adad` in the worktree (below).
+
+**Deploy: version `35e43cef-5b0f-4d28-bea2-1081c48c48ba`, Worker startup
+158 ms, at `https://cf-gitea.hecongw.workers.dev`** — from the detached
+`git worktree` at exactly `e39adad` (the main tree carried the siblings' 3
+dirty paths; the worktree had 0). Proper install (the RD18 standard):
+`pnpm install --frozen-lockfile` (185 ms warm store), prebuilt `public/assets`
+copied in, `.dev.vars` copied in, `git submodule update --init` inside the
+worktree (pin `fc4936884584a419` — identical, the main checkout's submodule
+verified pristine after), `pnpm gen:icons` (39 icons regenerated). Worktree,
+dry-run outdir, spot script and every log shredded after; the main working
+tree untouched by this agent except this block.
+
+**Deploy gates at `e39adad` (worktree):** `pnpm typecheck` **0 errors**;
+`check-openapi` **PASS** (declared **490 ops / 298 paths** ⊆ contract; tier-1
+**78/78 paths, 129/129 ops**); `check-contract` **PASS** (sha256 `529a3314…`,
+matches the README and the pinned submodule swagger verbatim). Vitest: TWO
+composites (`--maxWorkers=8` then `=4`) — **0 test failures** (2818 passed +
+5 skipped, then 2580 + 5) but 44 files POOL-KILLED in both runs (44–50
+`[vitest-pool]: Worker cloudflare-pool emitted error` per run); the 44-file
+dead-set ran SOLO: **855 passed + 5 skipped, exit 0**. Combined honest line:
+**170 files green + 1 skipped (171), 0 failed anywhere** — the
+composite-plus-solo-greens adjudication. Machine load 6.4+ throughout
+(in-flight sibling suites running concurrently).
+
+**THE ws1009 CLASS REAPPEARED — this time it IS the death mechanism.** Every
+pool death in every full run this window carries the
+`WebSocket protocol error; protocolError.statusCode = 1009;
+protocolError.description = "Message is too large"` signature (78 / 144 / 12 /
+138 hits across the four main-tree full runs; 132 / 150 in the worktree
+composites; **0 in the solo group run**). RD18 recorded the class at 0 with
+"workerd socket deaths at the pool layer, not the 1009 signature" — that
+conclusion does NOT hold for this window: the vitest-pool WebSocket frame cap
+is the thing dying, only under heavy machine load, and always solo-green.
+The composite+solo adjudication stands, but a runner-side look at the pool's
+frame size is now warranted (open issue below).
+
+Remote migrations: **ledger unchanged — zero diff `981c098..e39adad` in
+`src/db/migrations/` (33 on disk, verified at both HEADs)**; explicit
+`wrangler d1 migrations list --remote`: **"✅ No migrations to apply!"
+(33/33)**; smoke's migrate-check independently confirms the remote schema
+(below).
+
+**The worktree dry-run bundle verification (the RD18 standard) — clean, and
+the ?raw stanza needed nothing:** the `?raw` extension set in the deploy graph
+is unchanged since the `981c098` deploy (`*.svg?raw` / `*.json?raw` only; the
+one NEW file touching `?raw` since is test-only `suite.test.ts`).
+`wrangler deploy --dry-run` at `e39adad`: **index.js 5,726,209 B** + 9 raw
+chunks, every Text-rule chunk byte-exact — `material-icon-svgs.json` emitted
+at **998,898 B == the source file's size** (the raw-string treatment, not the
+parsed-object loader that killed RD18), all chunks referenced from index.js.
+
+**THE TOOLKIT'S FIFTH PRODUCTION RUN — `all` (7 batteries) at
+`35e43cef…`: 65 checks, 64 pass, the ONE red the RD18-identical
+order-of-operations artifact** (the closing audit counted the run's
+still-alive PAT: `tokens=2 (expected 1)`; 10/10 after teardown, below).
+Mint-per-run PAT in a 0600 file (two mint incidents — process lesson below),
+extracted and shape-verified BEFORE the mint log was shredded. Battery by
+battery:
+
+- **p0** (`--fixture-oid 502abd2d…`) — 4/4: shallow-since/exclude exit 128
+  naming 'deepen-since'/'deepen-not' (5400/3933 ms); depth-1 clone
+  `.git/shallow = 502abd2d55…` fsck clean (4084 ms); privacy-anon API 404 +
+  info/refs 401 Basic + web 404.
+- **registry** (`--trials 3`) — 18/18: three full tombstone lifecycles, each
+  rename carry + **t+0 `repository not found`** + old name dead on both paths.
+- **generate-e2e** — 10/10 first-try: template push main+dev at `531efb9367…`
+  → PATCH 200 persisted → generate 201 `"empty":false` → carried refs
+  identical tip → LICENSE round-trips; **`[info] gen-generated-clone — clone
+  SUCCEEDED`** (the carried git-wire issue stays fixed-shaped, third window).
+- **forkpr-e2e** — 8/8: org fork 202, fork push `prbr-f686c077` at
+  `4390f300c3…`, PR #1 from `prorg-…:prbr-…`, head chain mergeable true with
+  `head.ref refs/pull/1/head`; fork→base→org cleanup all 204.
+- **mirror** — 8/8 first-try (**fifth consecutive**): loopback 401
+  "Permission denied" at the door; `.invalid` row 200 fresh-wire; sync 200;
+  settle **1524 ms** naming the 530 shape; `sync_state='idle'`,
+  `next_sync_at=0`; delete 204, list [].
+- **ui-login** — 5/5: anon 0 "New Label" → 303 + cookie → owner renders 3 +
+  small-menu-items.
+- **cleanup-audit** — 9/10 in-run (`tokens=2` artifact), **10/10 after the PAT
+  teardown**: `owner_repos=1 creating=0 action=0 stars=0 push_mirrors=0
+  protected_branches=0 repo_redirects=0 user_blocking=0 tokens=1`.
+
+**THE HAND SPOTS — 34/34 on the final pass (throwaway script, shredded).**
+
+- **THE PAYLOAD SPOT (the `3fcbe1a`/`a55a725` closures, first production
+  traffic).** Private fixture `spotpl-d3fef8b3` (auto_init) → fork
+  `spotpl-f-d3fef8b3` (202, inherits private) → PATCH the fork
+  `{"private":false}` (200 — the fork now READABLE to strangers while the base
+  stays private, the exact shape the read-gate exists for) → **owner GET:
+  `fork:true` + `parent.full_name` = the base** (the reader arm) → **anonymous
+  GET: 200, `fork:true`, `parent` KEY ABSENT** (the stranger-on-private-base
+  arm — our "empty is better than wrong" tightening, upstream's FIXME
+  conceded). The mirror triple: `POST /repos/migrate` with a `.invalid`
+  clone_addr → 201; **detail GET `mirror:true` + `mirror_interval:"8h0m0s"` +
+  `mirror_updated` stamped** (the schedule arm live on the detail GETs). ONE
+  MINOR FINDING: the **201 born body renders `mirror:false`** — the route
+  renders `outcome.repo` (the pre-`registerMirror` snapshot) while the detail
+  GET is honest; suggested fix is rendering from the re-read pair the route
+  already fetches for the emission (open issue below).
+- **THE RENAMED-FORK SPOT (the `9ecb3e5` fork-edge, first production
+  traffic) — the cross-owner shape.** Base `sptrf-d3fef8b3` → org
+  `sprorg-d3fef8b3` → fork into the org (default slug) → refs settle →
+  **PATCH rename the fork** → `POST /repos/{base}/pulls` with the bare
+  `sprorg-d3fef8b3:main` head → **201**, and **`head.repo.full_name` = the
+  RENAMED fork** (`sprorg-d3fef8b3/sptrf-f2-d3fef8b3`). The pre-rename name
+  never existed as a live path at PR time, so this is the name-free fork-edge
+  resolution proven — upstream's name-only lookup would have 404'd here. A
+  same-owner probe arm (first design iteration) CORRECTLY found the base: the
+  bare `owner:branch` grammar short-circuits to the base when head owner ==
+  base owner (pulls.ts's same-owner arm) — for a same-owner
+  differently-named fork that matches upstream's own name-based lookup
+  outcome, so it is documented spot-design, not a bug.
+- **THE FRAGMENT SPOT (the `67adfb7` index-window routes, first production
+  traffic).** Fixture `spotbe-d3fef8b3` + contents-API commit `notes.txt`
+  (10 lines), tip `e936b21f3bf0…`. **blob_excerpt button arm** (gap
+  `right−last_right` = 39 > `BLOB_EXCERPT_CHUNK_SIZE` 20): **200, 1526 B,
+  `code-expander-button` + `data-fetch-url` + `data-expand-direction`** — the
+  expander machinery live. **blob_excerpt merged arm** (gap 4 ≤ 20): 200 with
+  the `same-code` rows and **NO buttons** — the fully-merged zeroed-hunk arm,
+  upstream-exact. Bogus sha → **404** (the loader's null family).
+  **lastcommit (canonical no-slash form): 200, 2663 B, `#repo-files-table`**
+  with per-row commit summaries (the `Initial commit`/`add notes` links + age
+  cells) — the exact standalone fragment the bundle's htmx morphs. **LATENT
+  FINDING: the root-listing SLASH form** (`/lastcommit/{oid}/` — the exact
+  bytes the wave-46 component emits for root listings, "the trailing slash
+  rides verbatim") **answers 404**: the top-level dispatcher's
+  `!pathname.endsWith("/")` gate (src/index.ts:130) routes EVERY repo-scoped
+  slash path to the engine before the sub-app's `trimTrailingSlash()` (which
+  does 301 correctly for non-repo-scoped paths — `/explore/` → 301) ever sees
+  it. Latent only — no page passes `loaderCommitOid` yet — but it must be
+  fixed BEFORE the page flip lands (open issue below). The **notready row**:
+  a pushed 31-file directory (`ENRICH_MAX` = 30) renders the
+  `repo-file-cell message commit-summary notready` cell on the tree page with
+  the `data-fetch-*` attrs ABSENT — the landed flip is component-level
+  (opt-in `loaderCommitOid`), no page caller passes it yet, exactly the
+  committed diff's own note ("callers without the commit id render the
+  pre-flip shape").
+- **THE WRITER-FORMS SPOT (RD18's unprobed repo-projects tail — closed).**
+  Login-cookie methodology end-to-end on `spotprj-d3fef8b3`:
+  `PATCH {"has_projects":true}` → 200 → **GET `/projects/new` 200** (the
+  writer form renders) → **POST create** (`title`/`template_type=basic_kanban`)
+  **303 → the projects tab**, which **lists the title** → the board renders
+  **the basic_kanban seed trio To Do / In Progress / Done through the FORM
+  path** (RD18 proved the API path + template seeding; the form arm was the
+  gap) → **POST `columns/new` 303** → the board renders the new column →
+  **POST `/projects/{id}/delete` 303** → the tab no longer lists it. Full
+  writer lifecycle 11/11.
+
+`pnpm smoke` (deploy-smoke.mjs, run PAT, `--migrate-check`) at `35e43cef…`:
+**6 pass / 0 fail / 1 skip, exit 0** (`healthz {"ok":true}`; anon-git-surface
+404/401 shapes; receive-advert 165 B; push-lsremote pushed `8785c6d02a…` with
+the anonymous advert 401; cleanup 204; migrate-check all 19 expected tables
++48 system/aux). The P0 trio rode the `p0` battery (4/4 above).
+
+Cleanup proof: every battery self-cleaned (zero `[tail]` lines in the `all`
+run; registry tombs through their own DELETEs; generate/forkpr/ui/mirror/smoke
+repos 204). Spot repos all deleted 204 (`spotpl-*` ×3, `sptrf-*`/org ×3, 
+`spotbe-*`, `spotprj-*`, plus the probe-debug fixture `be2-*`); the renamed
+fork's pre-rename slug answering 404 on cleanup is the rename itself proving
+the redirect tombstone. Per-run credential: the closing audit's
+`personal_access_tokens = 1` (the standing bootstrap PAT) alongside
+`owner_repos=1` (p0-shallow), `creating=0`, `action=0`, `stars=0`,
+`push_mirrors=0`. Worktree, dry-run outdir, spot script, probe-debug
+scratch, and all logs shredded; `gitea/` pristine (0 dirty files, pin
+`fc4936884584`); main tree untouched except this block.
+
+**OPEN ISSUES carried + NEW:**
+
+1. **NEW (minor, real — the migrate 201 born body): `mirror:false` on the
+   born repo's 201 body.** `routes/mirror.ts` renders the body from
+   `outcome.repo` — the `RepoService.create` snapshot BEFORE
+   `registerMirror` flips `is_mirror` — while the detail GET (the honest
+   arm, and the battery's fresh-wire shape) is correct. One-line-shaped fix:
+   render the 201 from the pair the route already re-reads for the emission.
+2. **NEW (latent, real — the lastcommit root-listing slash form 404s at the
+   dispatcher).** The wave-46 `RepoFilesTable` flip emits
+   `{repoLink}/lastcommit/{oid}/{pathEscapeSegments(dirPath)}` — for the ROOT
+   listing that is `/lastcommit/{oid}/` WITH a trailing slash
+   (view.go:296-297 verbatim). The top-level dispatcher's
+   `!pathname.endsWith("/")` gate (src/index.ts:130) hands every repo-scoped
+   slash path to the engine (404), so the sub-app's `trimTrailingSlash()`
+   (which redirects correctly — `/explore/` → 301) never sees it. NO shipped
+   page emits that URL yet (the flip is component-level), but the page flip
+   that passes `loaderCommitOid` will ship this 404 for every root listing's
+   loader fetch. Fix before that wave: let slash paths whose trimmed form
+   `handlesUiRoute` claims into the sub-app (its trim middleware already
+   guards laundering), or emit the loader URL slash-free for roots.
+3. **NEW (runner health): the ws1009 "Message is too large" class is the
+   pool-death mechanism this window** (counts above; RD18 recorded 0 with a
+   different signature). Always solo-green; suspected amplifier is machine
+   load 6.4+ from concurrent sibling suites. A vitest-pool frame-cap look
+   (or a load-adaptive worker count for full runs) is the suggested next
+   move for the runner owner.
+4. **NEW (process, closed-by-convention): the PAT mint-extraction regex in
+   RD18's block (`[A-Z2-7]{32}`) does NOT match the mint alphabet** —
+   `bootstrap-admin.mjs` uses `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (no
+   I/O/0/1); the toolkit's own `--token-file` validator has the correct
+   class. Two orphan rows resulted (my first mint shredded unextracted; the
+   smoke `--token` argv form + a failed Basic-auth list parse led to a shred
+   before the API delete) — both recovered by-id via D1 and both proven by
+   the closing audit's `tokens = 1`. Always copy the regex from
+   deploy-probes.mjs:1432, never from the evidence prose; extract, VERIFY
+   the 45-char shape, delete, THEN shred.
+5. Carried unchanged: the repo payload numeric-`id` render (`id:0` for the
+   text-id registry keys — `repositoryIdNumber`'s documented TODO(SPEC-0005);
+   re-confirmed on create/GET/fork bodies this window, not a regression);
+   RD18's SQLITE_LOCKED posture (verdict landed at `280d4ad` — platform-side
+   DO-SQLite benign-retry, ignore-with-filter; no new observation this
+   window, no tail attached). The carried-OPENs ledger is EMPTY per
+   `075f916` and this window PRODUCTION-PROVED the closures: the payload
+   stubs + parent read-gate (spot 1), the renamed-fork bare-head (spot 2),
+   the tag-note closure (docs-only `aaea049`, no runtime surface).
+6. Hygiene note (not this run's): `/tmp/leak-repro/*` — a 2026-10-25 scratch
+   from an earlier window — still holds an old-shaped token file; the audit
+   proves it revoked (`tokens = 1`), but its owning wave should shred the
+   directory.
+
+*(REDEPLOY19, evidence appended by the redeploy-verification agent; all
+numbers verbatim from this run's commands.)*
