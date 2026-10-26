@@ -667,7 +667,10 @@ async function emitPullAssignWebhook(
 ): Promise<void> {
   const pair = await findPullRequestByIndex(c.env.DB, found.repo.id, issue.index);
   if (pair === null) return;
-  const rendered = await toApiPullRequest(c.env.DB, viewerOf(c), found, pair.issue, pair.pullRequest, "single");
+  // The assignee webhook payload renders the head repo regardless of the
+  // doer (IssueChangeAssignee → ToPayloadPullRequest, notifier.go:182) —
+  // payload mode, not the API-response "single" render.
+  const rendered = await toApiPullRequest(c.env.DB, viewerOf(c), found, pair.issue, pair.pullRequest, "payload");
   await emitPullWebhook(c, {
     repoId: found.repo.id,
     ownerId: found.repo.ownerId,
