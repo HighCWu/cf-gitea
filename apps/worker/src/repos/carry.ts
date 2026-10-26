@@ -29,9 +29,34 @@
  *     from the read RPCs (readCommit → CommitJson, listTree → TreeEntryJson,
  *     readBlob → raw bytes) through the same serializers — a byte-exact round
  *     trip by construction, re-verified by putApiObjects' hashObject check on
- *     landing. The walk skips every oid the pack catalog already covers (a
- *     pack is self-contained, so a packed oid's closure needs nothing), so a
- *     fully-packed repo pays one RPC per ref and zero byte movement.
+ *     landing.
+ *
+ * CROSS-STORE EDGES (REDEPLOY13, the generated-repo git-wire residual): a
+ * stored pack is NOT closed under its objects' references. A push stacked on
+ * Worker-authored content sends only closure(new tips) − closure(advertised
+ * tips), so the pack's commit PARENT lines and tree ENTRIES legally name
+ * objects that stay LOOSE in the source (the delta-base column base_oid is
+ * the recorded third edge class, also resolvable loose). "A packed oid's
+ * closure needs nothing" is therefore FALSE, and a walk that skips packed
+ * oids outright strands the loose interior — the generated cell then serves
+ * API reads (tip-resolution only) while the wire dies: uploadPack's walk
+ * throws `missing object` on the absent parent, and a later push's
+ * anti-check cannot resolve advertised-closure objects. The walk below
+ * descends THROUGH packed commits (read-only: the fork already holds their
+ * bytes; the read exists only to follow parent edges) until the loose class
+ * is reached, bounded by PACKED_WALK_MAX_COMMITS. Two soundness notes:
+ *   - every loose object is authored by a LOOSE commit (the putApiObjects
+ *     writers always land one), so the loose class is fully reachable from
+ *     (loose commits' trees) ∪ (packed commits' loose trees); a packed
+ *     SUBTREE can be skipped because any loose object under it hangs just as
+ *     legally under its authoring loose commit's tree, which the parent-chain
+ *     descent reaches;
+ *   - the descent's budget is a documented fidelity limit, not a correctness
+ *     bar: a history deeper than PACKED_WALK_MAX_COMMITS above its loose
+ *     objects truncates the descent (flagged to the caller, which logs
+ *     loudly) and the copy lands with the pre-REDEPLOY13 floor for that
+ *     closure — while a fully packed history (no loose anywhere) pays the
+ *     small bounded read cost and truncates harmlessly.
  *
  * Ordering vs D1 (RepoService.rename/acceptTransfer): the D1 batch (slug/
  * owner flip + redirect rows) lands FIRST — its UNIQUE arbitration has decided
@@ -115,6 +140,14 @@ const PUT_BATCH_OBJECTS = 500;
  *  instead of hanging the mutation on an unbounded walk. */
 const WALK_MAX_RPC = 400;
 const WALK_MAX_OBJECTS = 2000;
+/** The cross-store descent's own budget (packed-commit readCommit RPCs — see
+ *  the module doc's CROSS-STORE EDGES note). Deliberately small: the wire
+ *  shapes this fixes are pushes stacked a few commits above Worker-authored
+ *  content, and exhaustion must stay cheap because the common fully-packed
+ *  history burns the whole budget finding that out. Exhaustion does NOT
+ *  throw — a deep packed history must keep forking; the caller gets the
+ *  `truncated` flag and logs. */
+const PACKED_WALK_MAX_COMMITS = 64;
 
 function fail(stage: string, from: string, to: string, detail: string): never {
   throw new Error(`cell carry ${from} -> ${to} (${stage}): ${detail}`);
@@ -127,9 +160,17 @@ function failWalk(label: string, detail: string): never {
 }
 
 /** `repos/<storage_key>/packs/<packKey>.pack` — git/r2keys.ts's packR2Key (the
- *  module is engine-internal; the layout is SPEC-0001 §3's committed contract). */
-function packR2Key(storageKey: string, packKey: string): string {
+ *  module is engine-internal; the layout is SPEC-0001 §3's committed contract).
+ *  Exported for the fork/generate copy pass (fork-task.ts), which streams pack
+ *  bytes across DIFFERENT storage keys and needs the same derivation. */
+export function packR2Key(storageKey: string, packKey: string): string {
   return `repos/${storageKey}/packs/${packKey}.pack`;
+}
+
+/** `repos/<storage_key>/packs/<packKey>.idx` — git/r2keys.ts's idxR2Key (the
+ *  same committed layout, idx sidecar). */
+export function idxR2Key(storageKey: string, packKey: string): string {
+  return `repos/${storageKey}/packs/${packKey}.idx`;
 }
 
 /**
@@ -218,10 +259,12 @@ export async function carryRepoCell(
 
     // 2 + 3. Ref partition + the loose class: packed annotated-tag tips carry
     // as plain refs, loose ones re-materialize (module doc's fidelity note),
-    // the loose-object completion walk lands the Worker-authored content, and
-    // HEAD is confined to a carried ref (the engine validates; an
-    // annotated-tag HEAD falls back to null — the unborn-HEAD convention).
-    const { carried, head } = await carryLooseRefs(
+    // the loose-object completion walk lands the Worker-authored content AND
+    // whatever hangs off the packed tips' cross-store edges (CROSS-STORE
+    // EDGES above), and HEAD is confined to a carried ref (the engine
+    // validates; an annotated-tag HEAD falls back to null — the unborn-HEAD
+    // convention).
+    const { carried, head, truncated } = await carryLooseRefs(
       source,
       target,
       refs.refs,
@@ -229,6 +272,13 @@ export async function carryRepoCell(
       packed,
       `${fromEngine} -> ${toEngine}`,
     );
+    if (truncated) {
+      // Documented floor (module doc): the descent died on the budget before
+      // proving the closure complete — loud here, the carry still lands.
+      console.error(
+        `[carry] ${fromEngine} -> ${toEngine}: loose-closure descent truncated after ${PACKED_WALK_MAX_COMMITS} packed commits; the git wire may be incomplete for this cell`,
+      );
+    }
 
     // 4. One finalizing transaction: catalog rows landed during adopt; refs +
     // HEAD + refs_version land now and the importing gate clears.
@@ -253,14 +303,23 @@ export async function carryRepoCell(
  * every object the pack catalog does not already cover. Commits walk by
  * parent chain; each unpacked commit's trees walk by path; blobs fetch once
  * per unique oid. Objects batch into putApiObjects under the engine's
- * per-call budget. Exported for the fork/generate copy pass
- * (src/repos/fork-task.ts), which must land the same Worker-authored loose
- * class (auto_init commits, API commits — REDEPLOY12's generate 500: the
- * template's ref tips live outside the pack catalog its loop replicates).
- * `label` names the from → to pair in error text. `extraRoots` are additional
- * commit-oid walk roots (carryLooseRefs passes the loose annotated tags'
- * peeled commits — a tag can reach a commit no branch names; packed roots
- * return immediately, the walk dedupes the rest).
+ * per-call budget.
+ *
+ * The walk descends THROUGH packed commits (the CROSS-STORE EDGES module
+ * note): a packed commit is read only to follow its parent/tree edges into
+ * the loose class — its own bytes are never re-staged (the adopted packs
+ * carry them), and its PACKED tree is skipped whole (packed subtrees' loose
+ * content hangs under the authoring loose commits the descent reaches).
+ * Returns `truncated` when the packed-descent budget expired before the
+ * walk's natural end — the caller decides how loudly that surfaces.
+ *
+ * Exported for the fork/generate copy pass (src/repos/fork-task.ts), which
+ * must land the same loose class (auto_init commits, API commits, and the
+ * push-stacked-on-auto_init shape — REDEPLOY13's generated-repo wire
+ * residual). `label` names the from → to pair in error text. `extraRoots`
+ * are additional commit-oid walk roots (carryLooseRefs passes the loose
+ * annotated tags' peeled commits — a tag can reach a commit no branch names;
+ * packed roots descend like any other).
  */
 export async function carryLooseObjects(
   source: CarrySource,
@@ -269,9 +328,11 @@ export async function carryLooseObjects(
   packed: Set<string>,
   label: string,
   extraRoots: string[] = [],
-): Promise<void> {
+): Promise<{ truncated: boolean }> {
   let rpcs = 0;
   let objects = 0;
+  let packedReads = 0;
+  let truncated = false;
   const spend = () => {
     if (++rpcs > WALK_MAX_RPC) failWalk(label, "RPC budget exceeded");
   };
@@ -322,14 +383,28 @@ export async function carryLooseObjects(
   };
 
   const walkCommit = async (oid: string): Promise<void> => {
-    if (commits.has(oid) || packed.has(oid)) return; // packed commit ⇒ packed closure
+    if (commits.has(oid)) return;
     commits.add(oid);
-    spend();
+    const isPacked = packed.has(oid);
+    if (isPacked) {
+      // Cross-store descent: the fork holds this commit's bytes already — the
+      // read exists only to follow its edges into the loose class. Budgeted
+      // and truncation-flagged, never thrown (module doc).
+      if (++packedReads > PACKED_WALK_MAX_COMMITS) {
+        truncated = true;
+        return;
+      }
+    } else {
+      spend();
+    }
     const commit = await source.readCommit(oid);
     if (commit === null) failWalk(label, `commit unreadable: ${oid}`);
-    await stage(commitObject(commit));
+    if (!isPacked) await stage(commitObject(commit));
     if (!packed.has(commit.tree)) {
-      // root packed ⇒ whole tree closure packed (walk nothing)
+      // A loose root tree: stage it (no-op when the oid is packed anyway) and
+      // walk its entries — this is the arm that reaches a packed commit's
+      // LOOSE tree (an empty commit stacked on auto_init) and every loose
+      // commit's full tree closure.
       trees.add(commit.tree);
       spend();
       const root = await source.listTree(oid, "");
@@ -343,19 +418,22 @@ export async function carryLooseObjects(
   for (const ref of carried) await walkCommit(ref.oid);
   for (const root of extraRoots) await walkCommit(root);
   await flush();
+  return { truncated };
 }
 
 /**
  * The ref partition + loose-class landing for a copy pass, in one call —
- * the shared shape behind the rename/transfer carry (carryRepoCell) and the
- * fork/generate completion (fork-task.ts completeLooseImport). PACKED
- * annotated-tag tips carry as plain refs (their bytes ride the adopted
- * packs); LOOSE annotated tags re-materialize through serializeTag (the
- * module doc's fidelity note — tagger/message unrecoverable, the materialized
- * oid differs, the peel is identical) and land via putApiObjects before the
- * walk; their peeled commits join the walk roots. Returns the finalize
- * input: `carried` refs and the head confined to a carried ref (null
- * otherwise — the engine's unborn-HEAD convention).
+ * the shared shape behind the rename/transfer carry (carryRepoCell), the
+ * fork/generate completion (fork-task.ts replicateRepoCopy) and the
+ * pull-engine cross-repo carries. PACKED annotated-tag tips carry as plain
+ * refs (their bytes ride the adopted packs); LOOSE annotated tags
+ * re-materialize through serializeTag (the module doc's fidelity note —
+ * tagger/message unrecoverable, the materialized oid differs, the peel is
+ * identical) and land via putApiObjects before the walk; their peeled
+ * commits join the walk roots. Returns the finalize input: `carried` refs,
+ * the head confined to a carried ref (null otherwise — the engine's
+ * unborn-HEAD convention), and `truncated` (the walk's packed-descent budget
+ * expired — callers log; the copy lands with the documented floor).
  */
 export async function carryLooseRefs(
   source: CarrySource,
@@ -364,7 +442,7 @@ export async function carryLooseRefs(
   head: string | null,
   packed: Set<string>,
   label: string,
-): Promise<{ carried: { name: string; oid: string }[]; head: string | null }> {
+): Promise<{ carried: { name: string; oid: string }[]; head: string | null; truncated: boolean }> {
   const carried: { name: string; oid: string }[] = [];
   const walkable: { name: string; oid: string }[] = [];
   const tagObjects: ApiObject[] = [];
@@ -401,8 +479,8 @@ export async function carryLooseRefs(
       );
     }
   }
-  await carryLooseObjects(source, target, walkable, packed, label, tagPeels);
-  return { carried, head: head !== null && carried.some((r) => r.name === head) ? head : null };
+  const { truncated } = await carryLooseObjects(source, target, walkable, packed, label, tagPeels);
+  return { carried, head: head !== null && carried.some((r) => r.name === head) ? head : null, truncated };
 }
 
 /** CommitJson → canonical commit bytes: the exact serializeCommit round trip

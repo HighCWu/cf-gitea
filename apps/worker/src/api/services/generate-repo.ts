@@ -21,13 +21,13 @@ import type { RepositoryWithOwner } from "./repository";
  *   2. copy the form metadata: description (the form's, NOT the template's —
  *      GenerateRepoOption.description is "Description of the repository to
  *      create"), default_branch = form's or the template's (the IfZero chain
- *      of generateRepoCommit, generate.go:254);
+ *      of generateRepoCommit, generate.go:233);
  *   3. git content — when git_content=true and the template is non-empty
  *      (the `IsEmpty: !opts.GitContent || templateRepo.IsEmpty` birth flag),
  *      replicate the template cell into the new cell via the SAME engine
  *      pass the fork consumer runs (fork-task.ts replicateRepoCopy), then
  *      settle `status='ready'` with the copied emptiness (settleForkRow —
- *      upstream's step-6 flip, template.go:181-187);
+ *      upstream's step-6 flip, template.go:185-189);
  *   4. otherwise settle ready-empty.
  *
  * DOCUMENTED DIVERGENCES from GenerateRepository/GenerateGitContent:
@@ -35,16 +35,17 @@ import type { RepositoryWithOwner } from "./repository";
  *     transformers in `.gitea/template`-matched files (generate.go:41-118);
  *     out of slice — the copy is byte-faithful.
  *   - FULL-ref copy vs upstream's depth-1 default-branch clone + fresh init
- *     commit (generateRepoCommit): ours adopts the template's whole catalog
- *     (the fork pass), which is a superset of the default branch.
+ *     commit (generateRepoCommit, the IfZero chain at generate.go:233): ours
+ *     adopts the template's whole catalog (the fork pass), which is a
+ *     superset of the default branch.
  *   - the remaining template units are accepted-but-inert: topics
  *     (GenerateTopics), git hooks, webhooks, avatar, issue labels
  *     (GenerateIssueLabels), protected branches (GenerateProtectedBranch)
  *     have no copy arms yet — they still satisfy IsValid()'s "at least one
  *     item" rule so the request succeeds honestly with a bare repo.
- *   - LFS copy (git_model.CopyLFR) and the repo-count limit
+ *   - LFS copy (git_model.CopyLFS) and the repo-count limit
  *     (CanCreateRepoIn → ErrReachLimitOfRepo) have no modeled counterpart.
- *   - upstream notifies CreateRepository at the end (template.go:190); the
+ *   - upstream notifies CreateRepository at the end (template.go:191); the
  *     webhook emission posture for API repo creates is not wired on this
  *     path yet (same as the landed fork path pre-SPEC-0005 §3.5).
  */
@@ -66,7 +67,7 @@ export interface GenerateRepoForm {
   protected_branch?: boolean;
 }
 
-/** IsValid (generate.go:311-315): at least one template item selected. */
+/** IsValid (generate.go:324-329): at least one template item selected. */
 export function generateOptionSelected(form: GenerateRepoForm): boolean {
   return (
     form.git_content === true ||
@@ -95,8 +96,8 @@ export interface GenerateRepoResult {
  * request-path equivalent — one throw used to strand the created row at
  * `status='creating'` forever behind a 500. Two upstream-parity arms close
  * that class here:
- *   - ONE immediate retry of the copy (replicateForkCatalog is idempotent by
- *     its own contract — rows keyed, copies overwrite, and a committed
+ *   - ONE immediate retry of the copy (replicateRepoCopy is idempotent by
+ *     contract — rows keyed, copies overwrite, and a committed
  *     finalize reads as the already-done success — so a retry converges the
  *     transient blip class the queue retries away);
  *   - on a still-failing copy, upstream's cleanup: GenerateRepository's

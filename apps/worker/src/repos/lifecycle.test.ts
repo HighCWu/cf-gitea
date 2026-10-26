@@ -28,7 +28,7 @@ import { settleCreatingRepo } from "../git-http/gate";
 import { protectedBranches, repoCounters, repoRedirects, repositories, repoTransfer, repoUnits, stars, users } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { starRepo } from "../api/services/stars";
-import { ZERO_OID, buildPack, buildReceivePackBody } from "./testing/git-pack";
+import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "./testing/git-pack";
 
 beforeAll(async () => {
   await applyAuthD1Migrations();
@@ -845,6 +845,92 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
     const advert = await uploadAdvert("alice", "carry-auto2");
     expect(advert.status).toBe(200);
     expect(new TextDecoder().decode(await advert.arrayBuffer())).toContain(before.refs[0]!.target);
+  });
+
+  // REDEPLOY13 OPEN ISSUE 1 through the RENAME carry (the second
+  // carryLooseRefs consumer, src/repos/carry.ts carryRepoCell): a real push
+  // stacked on the auto_init commit makes every ref tip PACKED while the
+  // auto_init commit hangs off the packed tip's parent line — a pack-catalog
+  // + loose-tips carry used to strand that interior in the old cell, and the
+  // renamed URL served API reads but died on the wire (upload-pack walk
+  // `missing object` → silent 500). The contract here mirrors the generate
+  // route's stacked arm (api/routes/generate-repo.test.ts): the new cell
+  // resolves the FULL closure and serves a fetch round.
+  it("rename carries a push STACKED on auto_init content (cross-store loose closure)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+
+    // The auto_init producer: the loose commit A (POST /user/repos shape).
+    const created = await SELF.fetch("https://example.com/api/v1/user/repos", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/json" },
+      body: JSON.stringify({ name: "carry-stack", private: false, auto_init: true }),
+    });
+    expect(created.status).toBe(201);
+    const before = await env.REPO.getByName("alice/carry-stack").listRefs();
+    expect(before.refs.map((r) => r.name)).toEqual(["refs/heads/main"]);
+    const looseParent = before.refs[0]!.target;
+
+    // The stacked push: commit B with parent A, fast-forward main A → B (the
+    // update carries the EXPLICIT old oid — buildReceivePackBody always sends
+    // zero and would CAS-reject). B's pack contains B's closure only; A stays
+    // loose and unreferenced by any tip.
+    const blob = new TextEncoder().encode("stacked license\n");
+    const blobOid = await sha1hex(concatParts([new TextEncoder().encode(`blob ${blob.length}\0`), blob]));
+    const treeBody = concatParts([new TextEncoder().encode("100644 LICENSE\0"), rawOidOf(blobOid)]);
+    const treeOid = await sha1hex(concatParts([new TextEncoder().encode(`tree ${treeBody.length}\0`), treeBody]));
+    const time = 1700000500;
+    const commitBody = new TextEncoder().encode(
+      `tree ${treeOid}\n` +
+        `parent ${looseParent}\n` +
+        `author Test User <test@example.com> ${time} +0000\n` +
+        `committer Test User <test@example.com> ${time} +0000\n\n` +
+        "stacked on auto_init\n",
+    );
+    const commitOid = await sha1hex(concatParts([new TextEncoder().encode(`commit ${commitBody.length}\0`), commitBody]));
+    const entries = [
+      { type: 3, body: blob }, // OBJ_BLOB
+      { type: 2, body: treeBody }, // OBJ_TREE
+      { type: 1, body: commitBody }, // OBJ_COMMIT
+    ];
+    const chunks: Uint8Array[] = [new TextEncoder().encode("PACK"), be32(2), be32(entries.length)];
+    for (const entry of entries) {
+      chunks.push(objHeader(entry.type, entry.body.length));
+      chunks.push(await deflate(entry.body));
+    }
+    chunks.push(new Uint8Array(await crypto.subtle.digest("SHA-1", concatParts(chunks))));
+    const section = `${pktLine(`${looseParent} ${commitOid} refs/heads/main\0report-status side-band-64k`)}0000`;
+    const push = await SELF.fetch("https://example.com/alice/carry-stack.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/x-git-receive-pack-request" },
+      body: concatParts([new TextEncoder().encode(section), concatParts(chunks)]),
+    });
+    expect(push.status).toBe(200);
+
+    // The rename moves only the D1 slug/owner; carryRepoCell rebuilds the
+    // new cell (packs adopted + the loose closure walked THROUGH the packed
+    // tip's parent edge).
+    const row = await service().getBySlug("alice", "carry-stack");
+    if (row === null) throw new Error("carry-stack row missing");
+    await service().rename(row.id, "carry-stack2");
+
+    const after = await env.REPO.getByName("alice/carry-stack2").listRefs();
+    expect(after.refs.map((r) => [r.name, r.target])).toEqual([["refs/heads/main", commitOid]]);
+    // The interior resolves in the NEW cell (the old walk skipped it: packed
+    // tip ⇒ "packed closure", the false assumption REDEPLOY13 retired).
+    expect(await env.REPO.getByName("alice/carry-stack2").readCommit(looseParent)).not.toBeNull();
+    const log = await env.REPO.getByName("alice/carry-stack2").listLog("main");
+    expect(log.commits.map((c) => c.oid)).toEqual([commitOid, looseParent]);
+
+    // The wire serves a fetch round on the renamed URL (the silent-500
+    // surface, red before the carry walk descended through packed commits).
+    const wireFetch = await SELF.fetch("https://example.com/alice/carry-stack2.git/git-upload-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/x-git-upload-pack-request" },
+      body: `${pktLine(`want ${commitOid}\n`)}0000${pktLine("done\n")}`,
+    });
+    expect(wireFetch.status).toBe(200);
+    expect((await wireFetch.arrayBuffer()).byteLength).toBeGreaterThan(0);
   });
 
   it("delete drops every registry entry SYNCHRONOUSLY — no anonymous read-after-delete on renamed aliases", async () => {

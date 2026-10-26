@@ -33,7 +33,7 @@ import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/
 import { settleCreatingRepo } from "../../git-http/gate";
 import { replicateRepoCopy } from "../../repos/fork-task";
 import { RepoService } from "../../repos/service";
-import { buildPack, buildReceivePackBody } from "../../repos/testing/git-pack";
+import { buildPack, buildReceivePackBody, pktLine, ZERO_OID } from "../../repos/testing/git-pack";
 import { users } from "../../db/schema";
 import { createUserRepository } from "../services/user-repos";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
@@ -148,6 +148,135 @@ async function pushTemplateContent(owner: string, slug: string, branch: string):
   expect(settled?.status).toBe("ready");
   expect(settled?.isEmpty).toBe(false);
   return { oid, repoId: settled!.id };
+}
+
+// ---- the STACKED-push shape (REDEPLOY13 OPEN ISSUE 1's producer) -----------
+//
+// The production template: `POST /user/repos` auto_init (the loose commit A)
+// followed by a REAL git push whose commit B descends from A. The client's
+// thin-pack negotiation excludes everything under the advertised tip A, so
+// the pushed pack contains B's closure only and B's PARENT line names A —
+// an object that stays LOOSE in the template, outside every pack, and is
+// referenced by no ref tip. The local builders below reproduce exactly that
+// pack shape (full entries, parent → the loose oid).
+
+const RECEIVE_CT = "application/x-git-receive-pack-request";
+const UPLOAD_CT = "application/x-git-upload-pack-request";
+
+async function sha1Hex(parts: Uint8Array[]): Promise<string> {
+  const total = parts.reduce((n, a) => n + a.length, 0);
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const a of parts) {
+    merged.set(a, off);
+    off += a.length;
+  }
+  const digest = await crypto.subtle.digest("SHA-1", merged);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function concatBytes(arrays: Uint8Array[]): Uint8Array {
+  const total = arrays.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrays) {
+    out.set(a, offset);
+    offset += a.length;
+  }
+  return out;
+}
+
+async function zlibDeflate(bytes: Uint8Array): Promise<Uint8Array> {
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function packObjectHeader(type: number, size: number): Uint8Array {
+  const bytes: number[] = [];
+  let first = (type << 4) | (size & 0x0f);
+  let rest = size >> 4;
+  while (rest > 0) {
+    bytes.push(first | 0x80);
+    first = rest & 0x7f;
+    rest >>= 7;
+  }
+  bytes.push(first);
+  return new Uint8Array(bytes);
+}
+
+/** One full-entry pack from raw git object bodies (blob → tree → commit). */
+async function buildStackedPack(objects: { type: number; body: Uint8Array }[]): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [new TextEncoder().encode("PACK"), new Uint8Array([0, 0, 0, 2]), new Uint8Array([0, 0, 0, objects.length])];
+  for (const entry of objects) {
+    chunks.push(packObjectHeader(entry.type, entry.body.length));
+    chunks.push(await zlibDeflate(entry.body));
+  }
+  chunks.push(new Uint8Array(await crypto.subtle.digest("SHA-1", concatBytes(chunks))));
+  return concatBytes(chunks);
+}
+
+/** A receive-pack request with EXPLICIT old/new oids (the fast-forward
+ *  update `buildReceivePackBody` cannot express — it always sends ZERO). */
+function buildUpdateBody(updates: { old: string; oid: string; ref: string }[], pack: Uint8Array): Uint8Array {
+  let section = "";
+  for (const update of updates) {
+    section += pktLine(`${update.old} ${update.oid} ${update.ref}\0report-status side-band-64k`);
+  }
+  section += "0000";
+  return concatBytes([new TextEncoder().encode(section), pack]);
+}
+
+/**
+ * Push commit B (parent = `parentOid`, tree = {LICENSE → new blob}) onto
+ * `owner/slug`'s `branch` at `oldOid` — the production stacked push. The
+ * pack deliberately contains ONLY B's closure: the parent stays loose, and
+ * B's parent line is the cross-store edge the copy pass must carry.
+ */
+async function pushStackedCommit(
+  owner: string,
+  slug: string,
+  branch: string,
+  oldOid: string,
+  parentOid: string,
+): Promise<string> {
+  const aliceId = (await userIdOf(owner))!;
+  const token = (await mintFor(aliceId, "push", "write:repository")).plaintext;
+  const blob = new TextEncoder().encode("MIT License\n\nCopyright (C) 2026\n");
+  const blobSha = await sha1Hex([new TextEncoder().encode(`blob ${blob.length}\0`), blob]);
+  const treeBody = concatBytes([new TextEncoder().encode("100644 LICENSE\0"), rawOidOf(blobSha)]);
+  const treeSha = await sha1Hex([new TextEncoder().encode(`tree ${treeBody.length}\0`), treeBody]);
+  const time = 1700000100;
+  const commitBody = new TextEncoder().encode(
+    `tree ${treeSha}\n` +
+      `parent ${parentOid}\n` +
+      `author Test User <test@example.com> ${time} +0000\n` +
+      `committer Test User <test@example.com> ${time} +0000\n\n` +
+      "stacked push on the auto_init commit\n",
+  );
+  const commitSha = await sha1Hex([new TextEncoder().encode(`commit ${commitBody.length}\0`), commitBody]);
+  const pack = await buildStackedPack([
+    { type: 3, body: blob },
+    { type: 2, body: treeBody },
+    { type: 1, body: commitBody },
+  ]);
+  const response = await SELF.fetch(`https://example.com/${owner}/${slug}.git/git-receive-pack`, {
+    method: "POST",
+    headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+    body: buildUpdateBody([{ old: oldOid, oid: commitSha, ref: `refs/heads/${branch}` }], pack),
+  });
+  expect(response.status).toBe(200);
+  return commitSha;
+}
+
+function rawOidOf(oidHex: string): Uint8Array {
+  const raw = new Uint8Array(20);
+  for (let i = 0; i < 20; i++) raw[i] = parseInt(oidHex.slice(i * 2, i * 2 + 2), 16);
+  return raw;
+}
+
+/** Full-clone fetch round: want `oid` + done (plain v0, no caps). */
+function buildFetchBody(want: string): string {
+  return `${pktLine(`want ${want}\n`)}0000${pktLine("done\n")}`;
 }
 
 /** The full `users` row behind a seeded identity (the auto-init producer's
@@ -493,6 +622,111 @@ describe("generateRepo content copy (the shared fork machinery)", () => {
     expect(carriedTag.peeled).toBe(commitOid);
     expect(carriedTag.target).not.toBe(sourceTag.target); // the materialized oid (fidelity limit)
     expect((await env.REPO.getByName("alice/copy-loosetag").readCommit(carriedTag.target))?.oid).toBe(commitOid);
+  });
+
+  // REDEPLOY13 OPEN ISSUE 1 (docs/design/p0-evidence.md ~1666): the mixed
+  // shape above has the loose tip still advertised, so finalize's TIP
+  // validation catches it and the loose completion runs. The production
+  // template is harder: a REAL push stacked on the auto_init commit — every
+  // ref tip is then PACKED, finalize succeeds, and the loose interior (the
+  // auto_init commit + its tree/blob, referenced only by B's parent line)
+  // is silently skipped. The generated cell's adopted pack carries legal
+  // external edges into that missing loose store: full clone's walk throws
+  // `missing object` (the silent upload-pack 500) and a later push's
+  // anti-check cannot resolve advertised-closure objects (`missing
+  // necessary objects`). The contract: the copy must carry the loose class
+  // through the packed tips' edges too, and the generated repo must serve
+  // BOTH wire directions.
+  it("copies a push STACKED on auto_init content and the generated repo serves the git wire", { timeout: 120_000 }, async () => {
+    await seedIdentities();
+    const { commitOid: looseParent } = await autoInitTemplate("alice", "tpl-stack");
+    // The production sequence: a real git push of commit B whose parent is
+    // the loose auto_init commit (fast-forward main A → B).
+    const stackedTip = await pushStackedCommit("alice", "tpl-stack", "main", looseParent, looseParent);
+    expect(stackedTip).not.toBe(looseParent);
+
+    // Control: the TEMPLATE is wire-healthy (its loose interior is local).
+    const aliceToken = basicTokenHeader((await mintFor((await userIdOf("alice"))!, "r", "read:repository")).plaintext);
+    const templateFetch = await SELF.fetch("https://example.com/alice/tpl-stack.git/git-upload-pack", {
+      method: "POST",
+      headers: { authorization: aliceToken, "content-type": UPLOAD_CT },
+      body: buildFetchBody(stackedTip),
+    });
+    expect(templateFetch.status).toBe(200);
+
+    await markTemplate("alice", "tpl-stack");
+    const res = await router()(
+      "/api/v1/repos/alice/tpl-stack/generate",
+      aliceAuth({ method: "POST", body: JSON.stringify({ name: "copy-stack", git_content: true }) }),
+    );
+    expect(res.status).toBe(201);
+    const row = await new RepoService(env.DB).getBySlug("alice", "copy-stack");
+    expect(row?.status).toBe("ready");
+    expect(row?.isEmpty).toBe(false);
+
+    // The cell-state diff that WAS the bug: the generated cell resolves the
+    // packed tip but not the loose parent its pack's parent lines name.
+    const genCell = env.REPO.getByName("alice/copy-stack");
+    expect((await genCell.readCommit(stackedTip))?.oid).toBe(stackedTip);
+    expect(await genCell.readCommit(looseParent)).not.toBeNull();
+    // ...and the full history walks (the clone's closure, not just tips).
+    const log = await genCell.listLog("main");
+    expect(log.commits.map((c) => c.oid)).toEqual([stackedTip, looseParent]);
+
+    // The wire, read direction: the full-clone fetch round that 500ed in
+    // production (info/refs 200, ls-refs 200, the fetch POST dying inside
+    // the DO's walk with no surfaced exception).
+    const wireFetch = await SELF.fetch("https://example.com/alice/copy-stack.git/git-upload-pack", {
+      method: "POST",
+      headers: { authorization: aliceToken, "content-type": UPLOAD_CT },
+      body: buildFetchBody(stackedTip),
+    });
+    expect(wireFetch.status).toBe(200);
+    expect((await wireFetch.arrayBuffer()).byteLength).toBeGreaterThan(0);
+
+    // The wire, write direction: a push onto the generated repo whose tree
+    // re-uses the carried loose README blob (the real client's thin-pack
+    // shape — unchanged content is assumed present under the advertised
+    // tips' closure). The receive anti-check must resolve it: report-status
+    // ok, never `ng … missing necessary objects`.
+    const autoTree = await env.REPO.getByName("alice/tpl-stack").listTree(looseParent, "");
+    if (autoTree === null) throw new Error("template auto_init tree unreadable");
+    const readmeEntry = autoTree.entries.find((e) => e.name === "README.md");
+    if (readmeEntry === undefined) throw new Error("template README entry missing");
+    const aliceId2 = (await userIdOf("alice"))!;
+    const token2 = (await mintFor(aliceId2, "probe-push", "write:repository")).plaintext;
+    const licenseBlob = new TextEncoder().encode("MIT License\n");
+    const licenseSha = await sha1Hex([new TextEncoder().encode(`blob ${licenseBlob.length}\0`), licenseBlob]);
+    const newTreeBody = concatBytes([
+      new TextEncoder().encode("100644 README.md\0"),
+      rawOidOf(readmeEntry.oid),
+      new TextEncoder().encode("100644 LICENSE\0"),
+      rawOidOf(licenseSha),
+    ]);
+    const newTreeSha = await sha1Hex([new TextEncoder().encode(`tree ${newTreeBody.length}\0`), newTreeBody]);
+    const time = 1700000200;
+    const probeCommitBody = new TextEncoder().encode(
+      `tree ${newTreeSha}\n` +
+        `parent ${stackedTip}\n` +
+        `author Test User <test@example.com> ${time} +0000\n` +
+        `committer Test User <test@example.com> ${time} +0000\n\n` +
+        "probe push onto the generated repo\n",
+    );
+    const probeSha = await sha1Hex([new TextEncoder().encode(`commit ${probeCommitBody.length}\0`), probeCommitBody]);
+    const probePack = await buildStackedPack([
+      { type: 3, body: licenseBlob },
+      { type: 2, body: newTreeBody },
+      { type: 1, body: probeCommitBody },
+    ]);
+    const probePush = await SELF.fetch("https://example.com/alice/copy-stack.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token2), "content-type": RECEIVE_CT },
+      body: buildUpdateBody([{ old: ZERO_OID, oid: probeSha, ref: "refs/heads/probe" }], probePack),
+    });
+    expect(probePush.status).toBe(200);
+    const report = new TextDecoder().decode(await probePush.arrayBuffer());
+    expect(report).toContain("ok refs/heads/probe");
+    expect(report).not.toContain("missing necessary objects");
   });
 
   // The fork consumer arm of the same corner, driven at the service level
