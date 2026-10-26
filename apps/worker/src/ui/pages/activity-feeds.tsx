@@ -206,22 +206,22 @@ export function feedIconName(opType: Activity["op_type"]): IconName {
       return "octicon-git-merge"; // :83-84
     case "close_issue":
       return "octicon-issue-closed"; // :87-88
-    case "reopen_issue": // :89-90 — upstream octicon-issue-reopened,
-    case "reopen_pull_request": // not generated (issue-detail.tsx:1054)
-      return "octicon-issue-opened";
-    case "comment_issue": // :85-86 — upstream octicon-comment-discussion,
-    case "comment_pull": // not generated (the pull-reviews stand-in)
-      return "octicon-pencil";
+    case "reopen_issue": // :89-90
+    case "reopen_pull_request":
+      return "octicon-issue-reopened"; // exact (allowlist +5, ec07fb6 follow-up)
+    case "comment_issue": // :85-86
+    case "comment_pull":
+      return "octicon-comment-discussion"; // exact
     case "close_pull_request":
       return "octicon-git-pull-request-closed"; // :79-80
     case "approve_pull_request":
       return "octicon-check"; // :91-92
-    case "reject_pull_request": // :93-94 — upstream octicon-file-diff, not
-      return "octicon-git-pull-request-closed"; // generated (the reject precedent)
+    case "reject_pull_request": // :93-94
+      return "octicon-file-diff"; // exact
     case "publish_release":
       return "octicon-tag"; // :95-96 (push_tag/delete_tag share it — unwired)
     default:
-      return "octicon-info"; // :107-108 — upstream octicon-question, not generated
+      return "octicon-question"; // :107-108 — exact
   }
 }
 
@@ -746,7 +746,7 @@ function OverviewTabs(props: { username: string; repoCount: number }) {
           {props.repoCount > 0 ? <div class="ui small label">{props.repoCount}</div> : null}
         </a>
         <a class="active item" href={`/${props.username}?tab=activity`}>
-          <Icon name="octicon-history" /> {activityFeedsLocale.activity}
+          <Icon name="octicon-rss" /> {activityFeedsLocale.activity}
         </a>
       </div>
     </overflow-menu>

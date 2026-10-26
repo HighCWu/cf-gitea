@@ -262,8 +262,8 @@ describe("the type→icon/message matrix (pure, per wired op type)", () => {
     });
   });
 
-  it("comment_issue — pencil (comment-discussion degradation), live-comment href + live title + excerpt", () => {
-    expect(feedIconName("comment_issue")).toBe("octicon-pencil"); // :85-86, the allowlist note
+  it("comment_issue — comment-discussion (now exact), live-comment href + live title + excerpt", () => {
+    expect(feedIconName("comment_issue")).toBe("octicon-comment-discussion"); // :85-86, the allowlist note
     expect(feedMessageSegments(withOp("comment_issue", { content: "7|A **comment** body" }))).toEqual([
       text("commented on issue "),
       link("/alice/demo/issues/7", "alice/demo#7"),
@@ -306,8 +306,8 @@ describe("the type→icon/message matrix (pure, per wired op type)", () => {
     });
   });
 
-  it("reopen_issue — issue-opened (issue-reopened degradation), live title span", () => {
-    expect(feedIconName("reopen_issue")).toBe("octicon-issue-opened"); // :89-90, the allowlist note
+  it("reopen_issue — issue-reopened (now exact), live title span", () => {
+    expect(feedIconName("reopen_issue")).toBe("octicon-issue-reopened"); // :89-90, the allowlist note
     expect(feedMessageSegments(withOp("reopen_issue", { content: "7|" }))).toEqual([
       text("reopened issue "),
       link("/alice/demo/issues/7", "alice/demo#7"),
@@ -331,7 +331,7 @@ describe("the type→icon/message matrix (pure, per wired op type)", () => {
   });
 
   it("reopen_pull_request — issue-opened (degradation), live PR title span", () => {
-    expect(feedIconName("reopen_pull_request")).toBe("octicon-issue-opened"); // :89-90
+    expect(feedIconName("reopen_pull_request")).toBe("octicon-issue-reopened"); // :89-90
     expect(feedMessageSegments(withOp("reopen_pull_request", { content: "9|" }))).toEqual([
       text("reopened pull request "),
       link("/alice/demo/pulls/9", "alice/demo#9"),
@@ -357,8 +357,8 @@ describe("the type→icon/message matrix (pure, per wired op type)", () => {
     expect(approveBody.excerptHtml).toContain("looks good");
   });
 
-  it("reject_pull_request — git-pull-request-closed (file-diff degradation), comment arm", () => {
-    expect(feedIconName("reject_pull_request")).toBe("octicon-git-pull-request-closed"); // :93-94, the allowlist note
+  it("reject_pull_request — file-diff (now exact), comment arm", () => {
+    expect(feedIconName("reject_pull_request")).toBe("octicon-file-diff"); // :93-94, exact (allowlist +5)
     expect(feedMessageSegments(withOp("reject_pull_request", { content: "9|please change" }))).toEqual([
       text("suggested changes for "),
       link("/alice/demo/pulls/9", "alice/demo#9"),
@@ -366,7 +366,7 @@ describe("the type→icon/message matrix (pure, per wired op type)", () => {
   });
 
   it("comment_pull — pencil, comment arm over the pulls fallback", () => {
-    expect(feedIconName("comment_pull")).toBe("octicon-pencil"); // :85-86
+    expect(feedIconName("comment_pull")).toBe("octicon-comment-discussion"); // :85-86
     expect(feedMessageSegments(withOp("comment_pull", { content: "9|PR remark" }))).toEqual([
       text("commented on pull request "),
       link("/alice/demo/pulls/9", "alice/demo#9"),
@@ -397,7 +397,7 @@ describe("the type→icon/message matrix (pure, per wired op type)", () => {
     // commit_repo is a known upstream type with NO landed producer — the
     // honest arm is the default icon and no message/body (feeds.tmpl's
     // if-chain has no default branch).
-    expect(feedIconName("commit_repo")).toBe("octicon-info"); // the octicon-question stand-in
+    expect(feedIconName("commit_repo")).toBe("octicon-question"); // :107-108, the exact default
     expect(feedMessageSegments(withOp("commit_repo"))).toBeNull();
     expect(feedBody(withOp("commit_repo"))).toBeNull();
   });
@@ -481,7 +481,7 @@ describe("loadActivityFeedsData (profile.go:162-190's arm)", () => {
     expect(html).toContain("octicon-issue-closed tw-text-text-light tw-mr-1");
     expect(html).toContain("octicon-check tw-text-text-light tw-mr-1");
     expect(html).toContain("octicon-tag tw-text-text-light tw-mr-1");
-    expect(html).toContain("octicon-pencil tw-text-text-light tw-mr-1");
+    expect(html).toContain("octicon-comment-discussion tw-text-text-light tw-mr-1");
     // TimeSince (DateUtils.TimeSince).
     expect(html).toContain("<relative-time");
   });
@@ -504,7 +504,7 @@ describe("loadActivityFeedsData (profile.go:162-190's arm)", () => {
       liveIssueTitle: "Live issue title",
     });
     expect(commentItem?.liveCommentUrl).toContain(`/issues/7#issuecomment-${comment7Id}`);
-    expect(commentItem?.icon).toBe("octicon-pencil");
+    expect(commentItem?.icon).toBe("octicon-comment-discussion");
     const closeItem = data.items.find((item) => item.opType === "close_issue");
     expect(closeItem?.liveIssueTitle).toBe("Live issue title");
   });
