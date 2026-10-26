@@ -1503,3 +1503,194 @@ window — CLOSED (headline, 3/3 t+0); (b) PATCH drops `template` — FIXED
 delete-event "regression" — RESOLVED-NOT-A-BUG (upstream default-branch
 protection; test reshaped at 8207da9); (f) schema.test column pin — caught up
 at 5ba6183, `dflt_value` assertions finishing with the coordinator (REDEPLOY13).
+
+## Redeploy verification — 2026-10-26 04:00–05:10 UTC (12:00–13:10 CST), same-deployment-state block (REDEPLOY13)
+
+Deploy shipped as ONE version: **`64bee4f6-ccba-4f88-bf24-d0d26134dea4`** (100%,
+Created 2026-10-26T04:25:43.886Z per `wrangler deployments list`), deployed from
+tree **`e4ebb9d` CLEAN** (detached worktree), on
+https://cf-gitea.hecongw.workers.dev. Previous live version:
+`f9798804-b916-408e-9249-93ac030a1269` (the REDEPLOY12 block's version).
+Content shipped — the post-REDEPLOY12 mass, in order: 6c54c1a (generate/fork
+loose-carry fix), b332e14 (push-mirror outbound, migration 0032), 389da18
+(repo delete sweeps action rows), 9bda9eb (push-sync orchestrator wiring),
+faca961/66f5977 (merge-delete guards), 7c7b683 (owner-labels goldens),
+79ef809 (diffpatch downloads), e4ebb9d (vitest contention config — no prod
+effect), plus the counters/doc/spec units between. Assets rebuilt: same pin
+`fc4936884584`, identical bundle hashes `index.oLjWPtMl.js` / `iife.Cpk_pTor.js`.
+
+Deploy-tree methodology (REDEPLOY10/11/12 detached-worktree pattern reused):
+gates and deploy ran from detached `git worktree add --detach` at exactly
+`e4ebb9d` — warm `pnpm install --frozen-lockfile`, `git submodule update
+--init` (pin `fc4936884584` verified unchanged), `pnpm gen:icons`, the
+**scratch-dir asset build** (`build-gitea-assets.mjs --work
+/tmp/gitea-assets-build-rd13 --skip-install`) emitted into the worktree's
+`public/assets` BEFORE the vitest gate, `.dev.vars` copied in 0600. The
+worktree (and its copied `.dev.vars`) was removed after the run; the main
+working tree was never modified by this agent. The three re-run units'
+uncommitted hunks in the main tree were never touched.
+
+Deploy gates — at `e4ebb9d` (worktree): `pnpm typecheck` **0 errors**;
+`check:api` **PASS** (declared **490** ops/298 paths, tier-1 **78/78 paths,
+129/129 ops**); `check:contract` **PASS** (sha256 `529a3314…`, verbatim
+match). Vitest — the new 30 s/8-worker config (e4ebb9d) ran as configured but
+the shared tree was under heavy sibling load (three re-run units in flight);
+two full runs: run 1 **3044 passed | 5 skipped, 1 failed** + 15 files orphaned
+by workerd pool crashes; run 2 **2910 passed | 5 skipped, 2 failed** + 17
+orphaned. Adjudication — every red/orphaned file re-ran SOLO **all green:
+18 files, 464/464 passed, 0 failed** (`invariants.test.ts` 17/17 in 7.1 s
+solo vs its 30 s timeouts under load; the crash sets differed run-to-run —
+pool instability, not code, the same class REDEPLOY12 adjudicated).
+
+Remote migrations immediately before deploy (both applied from the worktree at
+the deploy tree): **0031_conscious_snowbird** (`repositories.num_forks integer
+DEFAULT 0 NOT NULL`) and **0032_wealthy_siren** (`push_mirrors.sync_state` /
+`next_sync_at` / `last_error`) — both ✅. Ledger after: "✅ No migrations to
+apply!" — **33/33** (the tree carries 33 migration files; the brief's "32/32"
+undercounted by one — 0030 was already live, so this run added exactly 0031+
+0032). Remote `pragma_table_info` verified: `repositories` carries
+`size_kb, num_stars, num_watches, num_forks`; `push_mirrors` carries
+`last_error, sync_state, next_sync_at`.
+
+`pnpm smoke` equivalent (deploy-smoke.mjs, fresh mint-per-run PAT via 0600
+temp file — 2 PATs this run, admin id 30 + p0probe id 31, raw mint stdout
+shredded before capture; both DELETEd by id after, `changes: 2`,
+`personal_access_tokens` back to 1 = the standing admin bootstrap PAT):
+first run with `--migrate-check`: **5 pass / 0 fail / 1 skip** (bench-report
+not requested), `"ok": true`. Verbatim key lines: `[pass] healthz —
+{"ok":true}`; `[pass] anon-git-surface — probe-e23cd7aa/probe-22471cb0.git:
+git-upload-pack 404 not-found, git-receive-pack 401 Basic challenge`;
+`[pass] receive-advert — advert ok (165 bytes)`; `[pass] push-lsremote —
+pushed 94ceb16775…, authed ls-remote sees refs/heads/main, anonymous advert
+401 Basic challenge`; `[pass] cleanup — repo p0probe/smoke-7b094ce5 deleted`;
+`[pass] migrate-check — all 19 expected tables present (+48 system/aux: …
+oauth2_application, badge, repo_license, user_badge, action, push_mirrors)`.
+A second smoke run (same PAT, no migrate-check) re-verified 4 pass / 0 fail.
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`;
+results **unchanged** vs all prior tables):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1` (identical tip); `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean |
+
+`p0probe/p0-shallow` remains live intentionally; anonymous API GET **404**,
+anonymous `info/refs` **401 Basic challenge** (`www-authenticate: Basic
+realm="Gitea"`), anonymous web page **404** — re-verified again after cleanup.
+
+**Generate re-probe (HEADLINE — 6c54c1a's production verification; REDEPLOY12's
+500 is closed at the API layer).** `POST /user/repos` 201 (tmpl-rd13-13937,
+auto_init) → REAL PUSH content (LICENSE commit on main via git push, second
+ref `refs/heads/dev`; ls-remote shows both refs at tip `cf90b4a2d35f…`) →
+`PATCH {"template":true}` → **200 with `"template":true` in the body** →
+`POST /repos/p0probe/tmpl-rd13-13937/generate {"name":"gen-rd13-13937",
+"git_content":true}` → **201** with `"empty":false` IN THE RESPONSE BODY
+(REDEPLOY12: 500 `finalizeForkImport: object not imported`) → follow-up GET
+`"empty":false` → generated repo ls-remote lists `refs/heads/main` +
+`refs/heads/dev` at the **identical tip `cf90b4a2d35f…`** → contents API on
+the generated repo **200**: LICENSE (43 B, base64 content decodes verbatim) +
+README.md, `last_commit_sha` = the carried tip → remote D1:
+`status='creating'` whole-table **0** (the cleanup half stays clean); the
+generated row itself `ready / is_empty=0 / is_template=0`. **But one honest
+residual (NEW ISSUE, below): git fetch against the generated repo 500s and
+git push is refused `missing necessary objects` — the carried cell serves
+API reads but not yet the git wire for the carried objects.**
+
+**Push-mirror lifecycle probe (b332e14+9bda9eb production verification; full
+e2e to a real external remote stays OUT of probe scope — no external
+credentials).** `POST push_mirrors` with `remote_address=
+https://127.0.0.1:9/dummy-unreachable.git` → **401 "Permission denied"** —
+the registration-time egress screen refusing the loopback target at the door
+(SSRF gate working as designed; lax/strict `MIRROR_ALLOWED_HOST_LIST`). The
+gate-passing unreachable URL `https://p0mirror-dummy.invalid/dummy-unreachable.git`
+→ **200** (`remote_name=remote_mirror_tM4k0U0hpL`, `last_error=""`,
+`last_update=null`, `interval=8h0m0s`, `sync_on_commit=false`) → `POST
+push_mirrors-sync` → **200** → first API poll (~3 s): the consumer ATTEMPTED
+it, `last_error` = **"mirror target responded 530 for info/refs advertisement
+[https://p0mirror-dummy.invalid/dummy-unreachable.git/info/refs?service=
+git-receive-pack]"** (verbatim, full URL). Remote D1 after:
+`sync_state='idle'` (back from syncing, no stuck state), `next_sync_at=0`.
+`DELETE push_mirrors/{name}` → 204; `push_mirrors` table back to 0 rows.
+
+**Merge-guard spot (faca961/66f5977).** Repo mg-rd13-12369, branches
+`keeper` + `plain`, PRs 1 and 2 → main. `keeper` protected via POST
+branch_protections (201). Merge both with `{"do":"merge",
+"delete_branch_after_merge":true}` (first attempt with upstream's `"Do"` key
+422'd `invalid request body` — this schema takes lowercase `do`; probe-side
+fault, disclosed): protected `keeper` → **merge 200, branch still exists
+(200 after)** — the protected-branch arm skips the delete; unprotected
+`plain` → **merge 200, branch deleted (404 after)** — the normal
+delete-after-merge arm still fires. Exactly the upstream skip-not-error
+differential, both merges 200.
+
+**Diffpatch spot (79ef809, web surface).** On the merge commit
+`3ef545bcab…` of mg-rd13-12369: `GET /p0probe/mg-rd13-12369/commit/{sha}.diff`
+→ **200 `text/plain; charset=utf-8`**, raw git diff body (`diff --git
+a/plain.txt …`, no mail header); `GET …commit/{sha}.patch` → **200
+`text/plain; charset=utf-8`** with the mail-format header (`From 3ef545bcab…
+Mon Sep 17 00:00:00 2001` / `From:` / `Date:` / `Subject: [PATCH]`). Commit
+arms byte-shaped per upstream (mail-format-no-signature).
+
+**UI labels owner view — LOGIN-COOKIE methodology (b5facba's lesson applied;
+REDEPLOY12's OPEN ISSUE 3 is CLOSED).** Anonymous `GET
+/p0probe/tmpl-rd13-13937/labels` → 200 with **0** "New Label" occurrences
+(the anonymous render — what a PAT header measures). `POST /login`
+(form-urlencoded `user_name=p0probe` + `password=<PAT>`) → **303** +
+`gitea_session` cookie. Labels page with the cookie → **200 with 3 "New
+Label" occurrences** + `small-menu-items` — the writer-gate owner arm DOES
+render in production; REDEPLOY12's observation was the methodology artifact
+(the PAT header never logged the session in).
+
+Cleanup proof (API-verified + remote D1): the push mirror DELETEd (204) then
+all five probe repos DELETEd → **204** across the board (tmpl-rd13-28599 —
+the first aborted script's orphan, tmpl-rd13-13937, gen-rd13-13937 — one
+transient curl 000 retried to 204, mirror-rd13-14106, mg-rd13-12369); the
+smoke repos self-cleaned through their own DELETE steps.
+`repositories WHERE owner_namespace='p0probe'` = **1** (`p0-shallow`,
+intentionally live); `status='creating'` whole-table = **0**; **`action`
+total = 0 with NO manual sweep this run** — 389da18's repo-delete action
+sweep performed in production exactly as landed (REDEPLOY12 needed a
+hand-sweep of 21 rows; the open issue is closed); `stars` = **0**;
+`push_mirrors` = **0**; `protected_branches` = **0**. Per-run credentials:
+2 PATs minted (admin id 30, p0probe id 31; raw mint stdout shredded before
+capture, 0600 token files); both DELETEd by id (`changes: 2`);
+`personal_access_tokens` whole-table = **1** (the standing `cfg_23077afd`
+admin bootstrap PAT, pre-existing). Probe scripts, token files, cookie jars,
+tail logs, clone/scratch dirs all shredded (`/tmp/rd13-*` verified gone;
+`/tmp/gitea-assets-build-rd13` removed); worktree removed with its copied
+`.dev.vars`. `gitea/` submodule pristine (0 dirty files, pin `fc4936884584`);
+`wrangler deployments list` confirms `64bee4f6…` at 100%.
+
+**OPEN ISSUE 1 (carried, RE-SCOPED — generate carries refs + API-readable
+objects, but the generated cell is not yet git-wire usable).** The 6c54c1a
+fix closed REDEPLOY12's 500 at the copy layer (201 + empty:false + both refs
+carried at identical tips + 0 stranded rows — all verified above), and the
+generated repo's contents API serves the complete closure (LICENSE blob
+readable, `last_commit_sha` = the carried tip). But against the GENERATED
+repo only: `git clone` (full or `--depth=1`) fails at the upload-pack fetch
+command with **HTTP 500** (info/refs 200, ls-refs 200 — the fetch POST 500s,
+`wrangler tail` shows outcome ok, NO logs, NO exceptions — a silent
+app-level 500 in the DO's uploadPack walk), and `git push` to it is refused
+**`! [remote rejected] … (missing necessary objects)`** (the receive-side
+connectivity check finds advertised-but-unreadable objects). The TEMPLATE
+repo with the identical logical content (auto_init loose + pushed pack)
+clones and pushes fine, so the delta is the carry/adoption layout in the
+generated cell (adoptForkPacks' adopted packs + carryLooseObjects'
+putApiObjects-written loose class) vs what the pack-walk and the receive
+connectivity check can read. Owner: repos/fork-task + engine read path.
+REDEPLOY12's ISSUE 2 note (push-mirror full e2e needs external credentials)
+remains probe-scope-excluded, not an issue.
+
+**RESOLVED this deployment (for the record):** (a) generate 500 on
+non-empty-template copy — FIXED at the API layer (201 headline above);
+(b) labels "New Label" form absent for the owner in production —
+METHODOLOGY artifact, form renders via session login (closed);
+(c) repo delete leaves `action` rows for feeds — FIXED (389da18's sweep
+validated in production: 0 rows after 5 deletes, no hand-sweep);
+(d) push-mirror outbound — LIVE end-to-end through the queue consumer with
+verbatim failure recording and clean state transitions.
+
+*(REDEPLOY13, evidence appended by the redeploy-verification agent; all
+numbers verbatim from this run's commands.)*
