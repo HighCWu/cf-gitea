@@ -19,7 +19,7 @@ import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repoRedirects, repoTransfer, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { repoRedirects, repoTransfer, repoWatchers, repositories, stars, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import {
   createOptionalTokenAuthMiddleware,
   createStubAuthResolver,
@@ -34,6 +34,8 @@ import { registerRepoRoutes } from "./routes/repo";
 import { LICENSE_CORPUS_TEXTS } from "../services/license-corpus";
 import { getRepoLicenses } from "../services/repo-licenses";
 import { addOrUpdateCollaborator } from "./services/repo-collaborators";
+import { watchRepo } from "./services/repo-watchers";
+import { starRepo } from "./services/stars";
 import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
 import { buildHistoryPack, buildReceivePackBody, ensureSeededRepo, type SeedCommit } from "../ui/testing/seed-repo";
 
@@ -97,7 +99,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await resetRepoExtrasTables();
-  for (const table of ["repo_transfer", "repo_redirects", "repo_counters", "webhook_deliveries", "webhooks", "repositories", "users"]) {
+  for (const table of ["stars", "repo_transfer", "repo_redirects", "repo_counters", "webhook_deliveries", "webhooks", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare(
@@ -351,6 +353,77 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — rename, visibility, default
     expect((await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ name: "Edit-Me" }) })).status).toBe(200);
     expect((await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ name: "bad name!" }) })).status).toBe(422);
     expect(await deliveries()).toEqual([]);
+  });
+});
+
+describe("PATCH /repos/{owner}/{repo} — the private-flip zeroing (ClearRepoStars star.go:94-104 / ClearRepoWatches watch.go:327-333)", () => {
+  // Edges go in through the landed services so the pre-flip counters are the
+  // maintained ones (starRepo bumps num_stars in-batch, watchRepo num_watches).
+  const starAndWatch = async () => {
+    await starRepo(env.DB, otherUserId, "7401", new Date());
+    await watchRepo(env.DB, "7401", collabAdminUserId, new Date());
+  };
+  const edges = async () => ({
+    stars: (await drizzle(env.DB).select().from(stars).all()).length,
+    watches: (await drizzle(env.DB).select().from(repoWatchers).all()).length,
+    otherNumStars: (
+      await drizzle(env.DB)
+        .select({ n: users.numStars })
+        .from(users)
+        .where(eq(users.id, otherUserId))
+        .all()
+    )[0]?.n,
+  });
+  const patchPrivate = (value: boolean) =>
+    makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ private: value }) });
+
+  it("→private zeroes both counters and deletes the edges (repository.go:176-181)", async () => {
+    await starAndWatch();
+    const before = await makeApp()(repoPath, { headers: jsonAuth });
+    expect(await before.json<Record<string, unknown>>()).toMatchObject({ stars_count: 1, watchers_count: 1 });
+
+    const res = await patchPrivate(true);
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({ stars_count: 0, watchers_count: 0 });
+    // The owner still reads the now-private repo; the render keeps the zeroes.
+    const after = await makeApp()(repoPath, { headers: jsonAuth });
+    expect(await after.json<Record<string, unknown>>()).toMatchObject({ stars_count: 0, watchers_count: 0 });
+    // Edges gone; the stargazer's user counter dropped per the removed edge
+    // (star.go:96-98); watches adjust no user counter (watch.go:327-333).
+    expect(await edges()).toEqual({ stars: 0, watches: 0, otherNumStars: 0 });
+  });
+
+  it("→public restores nothing and a re-starred edge clears again (one-way clear)", async () => {
+    await starAndWatch();
+    await patchPrivate(true);
+    await patchPrivate(false);
+    // Upstream's clear is one-way (setRepoVisibility has no restore arm,
+    // repository.go:172-190): counters stay zeroed, edges stay gone.
+    const back = await makeApp()(repoPath, { headers: jsonAuth });
+    expect(await back.json<Record<string, unknown>>()).toMatchObject({ stars_count: 0, watchers_count: 0 });
+    expect(await edges()).toEqual({ stars: 0, watches: 0, otherNumStars: 0 });
+
+    // The edges are genuinely deletable state, not a render wedge: re-starring
+    // while public recounts, and a second →private flip zeroes again.
+    await starRepo(env.DB, otherUserId, "7401", new Date());
+    const restarred = await makeApp()(repoPath, { headers: jsonAuth });
+    expect(await restarred.json<Record<string, unknown>>()).toMatchObject({ stars_count: 1 });
+    await patchPrivate(true);
+    expect(await edges()).toEqual({ stars: 0, watches: 0, otherNumStars: 0 });
+  });
+
+  it("an already-private PATCH clears nothing (the flip guard) and →public never zeroes", async () => {
+    // Private first, edges seeded while private: a repeat private:true must
+    // not run the clear arm (upstream clears inside the changed-only
+    // setRepoVisibility flow, repository.go:176-181).
+    await patchPrivate(true);
+    await starAndWatch();
+    expect((await patchPrivate(true)).status).toBe(200);
+    expect(await edges()).toEqual({ stars: 1, watches: 1, otherNumStars: 1 });
+
+    // And the →public arm carries no zeroing of its own.
+    await patchPrivate(false);
+    expect(await edges()).toEqual({ stars: 1, watches: 1, otherNumStars: 1 });
   });
 });
 
