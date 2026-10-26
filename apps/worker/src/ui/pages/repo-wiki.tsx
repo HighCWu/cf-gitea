@@ -775,7 +775,10 @@ export function WikiViewPage(props: { ctx: UiContext; data: Extract<WikiViewData
       </div>
       {/* The delete confirm modal (view.tmpl:99-103 + modal_actions_confirm's
           default Yes/No arm; octicon-x/check are not in the allowlist — text
-          only). */}
+          only) — WRITER chrome: the modal is dead weight for non-writers
+          (the delete anchor renders only for writers above; the wiki
+          matrix's catch). */}
+      {writer ? (
       <dialog class="modal-dialog" id="repo-wiki-delete-page-modal">
         <div class="header">
           <Icon name="octicon-trash" /> {wikiLocale.delete_page_button}
@@ -792,6 +795,7 @@ export function WikiViewPage(props: { ctx: UiContext; data: Extract<WikiViewData
           </button>
         </div>
       </dialog>
+      ) : null}
     </BaseLayout>
   );
 }

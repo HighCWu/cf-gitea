@@ -2906,11 +2906,18 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
   }
   if (head === "wiki") {
-    if (rest.length !== 2 || rest[0] !== "blob_excerpt") return null;
-    try {
-      return { family: "wiki-blob-excerpt", owner, repo, sha: decodeURIComponent(rest[1] as string) };
-    } catch {
-      return null;
+    // The wiki-blob-excerpt twin claims ONLY its exact 5-segment shape
+    // (web.go:1618); every OTHER wiki tail falls through to the wiki
+    // family arm below (window-2e C2a). The early `return null` for
+    // non-excerpt shapes shadowed that arm entirely — the mounted wiki
+    // family was unreachable dead code (the wiki matrix's RED; the
+    // mount's dispatcher run never exercised these routes).
+    if (rest.length === 2 && rest[0] === "blob_excerpt") {
+      try {
+        return { family: "wiki-blob-excerpt", owner, repo, sha: decodeURIComponent(rest[1] as string) };
+      } catch {
+        return null;
+      }
     }
   }
   // Window-2e B2: the activity-author JSON feed (web.go:1683-1687 — the
@@ -9536,10 +9543,6 @@ uiRouter.get("/issues", (c) => globalInboxIssuesPage(c, "issues"));
 uiRouter.get("/pulls", (c) => globalInboxIssuesPage(c, "pulls"));
 uiRouter.get("/milestones", (c) => globalMilestonesPage(c));
 // Window-2e C2: the wiki family.
-uiRouter.get("/:owner/:repo/wiki", (c) => wikiPage(c));
-uiRouter.get("/:owner/:repo/wiki/*", (c) => wikiPage(c));
-uiRouter.post("/:owner/:repo/wiki", (c) => wikiSubmit(c));
-uiRouter.post("/:owner/:repo/wiki/*", (c) => wikiSubmit(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
@@ -9864,4 +9867,10 @@ uiRouter.get("/:owner/:repo/render/blob/:sha", (c) => renderFileView(c));
 // shadow and the constraint would claim nothing (the /commits,/tags posture).
 uiRouter.get("/:owner/:repo/blob_excerpt/:sha", (c) => blobExcerptFragment(c));
 uiRouter.get("/:owner/:repo/wiki/blob_excerpt/:sha", (c) => blobExcerptFragment(c));
+// Window-2e C2a wiki family — AFTER the excerpt twin (specific-before-
+// wildcard; hono answers the first match).
+uiRouter.get("/:owner/:repo/wiki", (c) => wikiPage(c));
+uiRouter.get("/:owner/:repo/wiki/*", (c) => wikiPage(c));
+uiRouter.post("/:owner/:repo/wiki", (c) => wikiSubmit(c));
+uiRouter.post("/:owner/:repo/wiki/*", (c) => wikiSubmit(c));
 uiRouter.get("/:owner/:repo/lastcommit/*", (c) => lastCommitFragment(c));

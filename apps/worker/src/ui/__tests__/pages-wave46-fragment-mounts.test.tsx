@@ -171,10 +171,14 @@ describe("parseUiRoute claims (wave-46 fragment mounts)", () => {
   it("leaves the space around the shapes engine-owned", () => {
     expect(parseUiRoute("/octo/hello/blob_excerpt")).toBeNull(); // bare → no sha param
     expect(parseUiRoute(`/octo/hello/blob_excerpt/${sha}/extra`)).toBeNull(); // deeper tail
-    expect(parseUiRoute("/octo/hello/wiki")).toBeNull(); // no /wiki family this slice
-    expect(parseUiRoute("/octo/hello/wiki/blob_excerpt")).toBeNull(); // the twin needs {sha}
-    expect(parseUiRoute("/octo/hello/wiki/other/x")).toBeNull(); // the twin claims only blob_excerpt
-    expect(parseUiRoute("/octo/hello/wiki/blob_excerpt/dead/beef")).toBeNull(); // single-segment sha
+    // Window-2e C2a mounted the wiki PAGES family on the other wiki tails
+    // (9516bf1; unshadowed per the wiki matrix's escalation) — the stale
+    // nulls updated to the family claims; the excerpt twin keeps its exact
+    // 5-segment shape.
+    expect(parseUiRoute("/octo/hello/wiki")).toEqual({ family: "wiki", owner: "octo", repo: "hello", rawTail: "" });
+    expect(parseUiRoute("/octo/hello/wiki/blob_excerpt")).toEqual({ family: "wiki", owner: "octo", repo: "hello", rawTail: "blob_excerpt" });
+    expect(parseUiRoute("/octo/hello/wiki/other/x")).toEqual({ family: "wiki", owner: "octo", repo: "hello", rawTail: "other/x" });
+    expect(parseUiRoute("/octo/hello/wiki/blob_excerpt/dead/beef")).toEqual({ family: "wiki", owner: "octo", repo: "hello", rawTail: "blob_excerpt/dead/beef" });
   });
 });
 
