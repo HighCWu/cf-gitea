@@ -4201,6 +4201,9 @@ async function userSettingsSecretsSubmit(c: Context<{ Bindings: Env }>): Promise
     return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/secrets" } }));
   }
   const data = await loadUserSettingsSecretsPageData(c.env.DB, p.viewer.id);
+  // Carried name/description only — the value textarea stays empty
+  // (plaintext never enters the DOM; the module's hard rule).
+  data.form = { name: form.name, data: "", description: form.description };
   return p.respond(c.html(renderUserSettingsSecretsPage(p.ctx, data, outcome.message)));
 }
 
@@ -4229,6 +4232,9 @@ async function userSettingsVariablesNew(c: Context<{ Bindings: Env }>): Promise<
   }
   const data = await loadUserSettingsVariablesPageData(c.env.DB, p.viewer.id);
   if (outcome.outcome === "invalid") {
+    // The handoff's carried add values (variables render plaintext —
+    // faithful to carry the triple).
+    data.form = { name: form.name, data: form.data, description: form.description };
     return p.respond(c.html(renderUserSettingsVariablesPage(p.ctx, data, outcome.message)));
   }
   return p.respond(c.html(renderNotFound(p.ctx), 404));
@@ -4248,6 +4254,7 @@ async function userSettingsVariablesEdit(c: Context<{ Bindings: Env }>, id: numb
     return p.respond(c.html(renderNotFound(p.ctx), 404));
   }
   const data = await loadUserSettingsVariablesPageData(c.env.DB, p.viewer.id);
+  data.form = { name: form.name, data: form.data, description: form.description };
   return p.respond(c.html(renderUserSettingsVariablesPage(p.ctx, data, outcome.message)));
 }
 
@@ -4275,6 +4282,8 @@ async function userSettingsHooksCreate(c: Context<{ Bindings: Env }>): Promise<R
     return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/hooks" } }));
   }
   const data = await loadUserSettingsHooksPageData(c.env.DB, p.viewer.id);
+  // The org twin's carried form (orgHooksSettingsSubmit precedent).
+  data.form = { name: form.name, payloadUrl: form.payloadUrl, contentType: form.contentType };
   return p.respond(c.html(renderUserSettingsHooksPage({ ctx: p.ctx, data, error: outcome.message })));
 }
 
@@ -4329,6 +4338,13 @@ async function userSettingsKeysSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   if (outcome.outcome === "created") {
     return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/keys" } }));
   }
+  // The handoff's carried form values (upstream's browser keeps them; the
+  // no-JS reduction re-renders them server-side).
+  data.form = {
+    title: form.title,
+    content: form.type === "ssh" ? form.content : "",
+    gpgContent: form.type === "gpg" ? form.content : "",
+  };
   return p.respond(c.html(renderUserSettingsKeysPage(p.ctx, data, { kind: outcome.kind, message: outcome.message, field: outcome.field })));
 }
 
@@ -4337,9 +4353,17 @@ async function userSettingsKeysDelete(c: Context<{ Bindings: Env }>): Promise<Re
   if (!p.ok) return p.response;
   const form = parseUserSettingsKeysDeleteForm(await readUrlEncodedForm(c.req.raw));
   if (form.type === "gpg") {
+    // Idempotent by the module's port (subkeys die with the primary; a
+    // miss is the stale-form arm).
     await deleteGpgKey(c.env.DB, p.viewer.id, form.id ?? 0);
-  } else {
-    await deleteSshKey(c.env.DB, p.viewer.id, form.id ?? 0);
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/keys" } }));
+  }
+  const outcome = await deleteSshKey(c.env.DB, p.viewer.id, form.id ?? 0);
+  if (outcome === "missing") {
+    // keys.go:301-303: JSONError("Failed to delete SSH key") with NO
+    // redirect — the no-JS reduction re-renders the page with the line.
+    const data = await loadUserSettingsKeysPageData(c.env.DB, p.viewer.id);
+    return p.respond(c.html(renderUserSettingsKeysPage(p.ctx, data, { kind: "ssh", message: "Failed to delete SSH key" })));
   }
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/keys" } }));
 }
@@ -4364,6 +4388,8 @@ async function userSettingsApplicationsSubmit(c: Context<{ Bindings: Env }>): Pr
     data.newToken = outcome.plaintext;
     return p.respond(c.html(renderUserSettingsApplicationsPage(p.ctx, data)));
   }
+  // The handoff's carried name (upstream's browser keeps it).
+  data.form = { name: form.name };
   return p.respond(c.html(renderUserSettingsApplicationsPage(p.ctx, data, outcome.message)));
 }
 
@@ -5017,6 +5043,8 @@ async function orgActionsSecretsSubmit(c: Context<{ Bindings: Env }>): Promise<R
     return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/secrets` } }));
   }
   const data = await loadOrgActionsSecretsPageData(c.env.DB, org);
+  // Carried name/description only — plaintext never enters the DOM.
+  data.form = { name: form.name, data: "", description: form.description };
   return respond(c.html(renderOrgActionsSecretsPage(ctx, data, outcome.message)));
 }
 
@@ -5055,6 +5083,7 @@ async function orgActionsVariablesNew(c: Context<{ Bindings: Env }>): Promise<Re
   }
   const data = await loadOrgActionsVariablesPageData(c.env.DB, org);
   if (outcome.outcome === "invalid") {
+    data.form = { name: form.name, data: form.data, description: form.description };
     return respond(c.html(renderOrgActionsVariablesPage(ctx, data, outcome.message)));
   }
   return respond(c.html(renderNotFound(ctx), 404));
@@ -5078,6 +5107,7 @@ async function orgActionsVariablesEdit(c: Context<{ Bindings: Env }>, variableId
     return respond(c.html(renderNotFound(ctx), 404));
   }
   const data = await loadOrgActionsVariablesPageData(c.env.DB, org);
+  data.form = { name: form.name, data: form.data, description: form.description };
   return respond(c.html(renderOrgActionsVariablesPage(ctx, data, outcome.message)));
 }
 
