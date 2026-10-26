@@ -12,7 +12,7 @@
  * only Authorization headers).
  */
 
-import { clearSessionSetCookie, sessionCookieValue, verifySession } from "./session";
+import { clearSessionSetCookie, sessionCookieValue, sessionSetCookie, verifySession } from "./session";
 
 /** The principal viewing a page. The `{ kind: "user" }` arm is the
  *  SPEC-0010 §2.5 extension; additive for every page component. */
@@ -74,6 +74,10 @@ export async function resolveViewer(
   const { id, username, isAdmin } = verification.user;
   return {
     viewer: { kind: "user", id, username, isAdmin },
-    setCookie: verification.setCookie,
+    // ALWAYS a full directive (§2.7): the rotation arm's raw id:secret is
+    // wrapped here so consumers attach setCookie as-is (the double-wrap the
+    // dashboard matrix caught — resolveUiSession re-wrapped the clear arm's
+    // already-complete directive).
+    setCookie: verification.setCookie === null ? null : sessionSetCookie(verification.setCookie, false),
   };
 }

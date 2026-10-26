@@ -680,7 +680,7 @@ import { AssetBuildError, loadManifest } from "./manifest";
 import { parsePageNumber, pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
-import { sameOriginGuard, sessionSetCookie } from "./session";
+import { sameOriginGuard } from "./session";
 import { blobRedirectResponse, isFetchActionRequest, treeRedirectResponse } from "./pages/repo-home";
 import {
   loadReleaseDownload,
@@ -3632,10 +3632,11 @@ async function resolveUiSession(c: Context<{ Bindings: Env }>): Promise<Resolved
     const manifest = await loadManifest(assetsBinding(c.env), url.origin);
     const resolution = await resolveViewer(c.env, c.req.raw, { waitUntil });
     // resolveViewer's setCookie is the RAW session value (id:secret) on
-    // authenticated rotation — re-wrap it into the gitea_session directive
-    // before it reaches a response (the attachments seam's §2.4 posture;
-    // the raw append emitted a nameless cookie).
-    setCookie = resolution.setCookie === null ? null : sessionSetCookie(resolution.setCookie, false);
+    // resolveViewer's setCookie is ALWAYS a full §2.7 directive now (the
+    // rotation arm wraps there) — attach as-is. The old unconditional
+    // re-wrap double-wrapped the clear arm's already-complete directive
+    // (the dashboard matrix's RED).
+    setCookie = resolution.setCookie;
     viewer = resolution.viewer;
     // The wave-10 navbar bell's unread count (head_navbar_icons.tmpl's
     // `.notification_count`): the derived-thread COUNT per signed-in request
