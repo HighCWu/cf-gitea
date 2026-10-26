@@ -2107,3 +2107,220 @@ where upstream answers 201 (cosmetic, untracked).
 
 *(REDEPLOY15, evidence appended by the redeploy-verification agent; all
 numbers verbatim from this run's commands.)*
+
+## Redeploy verification — 2026-10-26 11:05–11:40 UTC (19:05–19:40 CST), post-REDEPLOY15 mass (REDEPLOY16)
+
+Deploy shipped as ONE version: **`941ce4d0-2134-4ec6-8228-8f4523013b22`** (100%,
+Created 2026-10-26T11:16:55.606Z per `wrangler deployments list`), deployed from
+tree **`2310623` CLEAN** (detached worktree `/tmp/rd16-go`; the in-flight
+tree-view/tick units were uncommitted in the main tree and excluded by the
+worktree by construction — the orchestrator's GO named 2310623 explicitly), on
+https://cf-gitea.hecongw.workers.dev. Previous live version:
+`b9b5c734-a90c-4a98-a04e-f985a5b0fb57` (the REDEPLOY15 block's version).
+Content shipped — the post-REDEPLOY15 mass, `783ab96..2310623`, 10 commits in
+order: 9b49cd2 (projects board + write group + workflow tails), 48f873f
+(docs tick-4), cdf683a (fileicon asset+lookup layer, enry-premise correction),
+3b3a3ae (**the compat releases fixture `isEmpty` seed — REDEPLOY15's NEW
+test-only issue closing**), 305ddc8 (REDEPLOY15 evidence), 5fdbc15 (toolkit
+polish: D1-only token optional + mirror budget 30 s + failure tail), 5e082cd
++2b5b898 (**the attachments seam + dispatch wiring — the site-level
+`/attachments/:uuid` route goes live**, probed below), fdaeaca (wave-ui-parity-10:
+releases download tail + the `/render/*` family + fetch-action JSON arms,
+probed below), 2310623 (toolkit PAT preflight). Behavior-bearing in production:
+the attachments route, the render family, the projects board, the fileicon
+layer, the releases download tail; the rest is docs/test/toolkit. Assets
+rebuilt: same pin `fc4936884584` (submodule verified unchanged, 0 dirty files).
+
+Deploy-tree methodology (REDEPLOY10–15 detached-worktree pattern): worktree at
+exactly `2310623`, warm `pnpm install --frozen-lockfile`, `git submodule
+update --init` (pin verified), `pnpm gen:icons`, the scratch-dir asset build
+(`build-gitea-assets.mjs --work /tmp/gitea-assets-build-rd16 --skip-install`)
+emitted into the worktree's `public/assets` BEFORE the vitest gate, `.dev.vars`
+copied 0600. The main working tree was never modified by this agent. Gates ran
+at 2310623 pre-GO; the GO landed on the same commit, the worktree re-verified
+CLEAN (HEAD `2310623`, 0 tracked changes) and the deploy went straight from the
+gated tree. Worktree + scratch asset dir + probe scratch removed after the run.
+
+Deploy gates — at `2310623` (worktree): `pnpm typecheck` **0 errors** (exit 0);
+`check:api` **PASS** (declared **490** ops/298 paths, tier-1 **78/78 paths,
+129/129 ops**); `check:contract` **PASS** (sha256 `529a3314…`, verbatim match —
+identical to REDEPLOY14/15's pin). Vitest run of record: **3536 passed |
+2 failed | 5 skipped (3543) in 174.54 s**, files 1 failed | 163 passed |
+1 skipped (165). **`Worker exited unexpectedly` attributions: 0.** The 2
+failures, adjudicated by solo re-run: both `src/api/pull-engine.test.ts >
+merge delete_branch_after_merge — the fork-head arms` (deletes-the-FORK-head /
+keeps-the-FORK-default) **30 s test timeouts, SOLO GREEN 25/25 on immediate
+re-run** — the REDEPLOY14/15-adjudicated suite-load flake class, nothing new.
+Notably **zero compat failures**: REDEPLOY15's deterministic
+`repoCreateRelease` fixture red is GONE — 3b3a3ae cured it exactly as claimed.
+
+Remote migrations immediately before deploy: **ledger unchanged — 33 files in
+the tree, zero diff `783ab96..2310623` in `src/db/migrations/`, "✅ No
+migrations to apply!" (33/33)**.
+
+`pnpm smoke` equivalent (deploy-smoke.mjs `--migrate-check`, the run PAT as
+Basic password): **6 pass / 0 fail / 1 skip, exit 0**. Verbatim key lines:
+`[pass] healthz (1539 ms) — {"ok":true}`; `[pass] anon-git-surface (2855 ms) —
+probe-379aefdf/probe-759b1a2a.git: git-upload-pack 404 not-found,
+git-receive-pack 401 Basic challenge`; `[pass] receive-advert (260 ms) — advert
+ok (165 bytes)`; `[pass] push-lsremote (9109 ms) — pushed 63b85f4648…, authed
+ls-remote sees refs/heads/main, anonymous advert 401 Basic challenge`;
+`[pass] cleanup (701 ms) — repo p0probe/smoke-77f84f60 deleted`;
+`[pass] migrate-check (4089 ms) — all 19 expected tables present (+48
+system/aux: … issue_attachments …)`; bench-report skip (not requested).
+
+**THE TOOLKIT'S SECOND PRODUCTION RUN — 7 batteries, with two firsts: the
+2310623 PAT-identity preflight's first production appearance (one `GET /user`
+before the first HTTP battery; the match passed SILENTLY, by design — the
+fast-fail arms have no production trigger to this day) and the 5fdbc15
+D1-only-audit affordance's first production exercise (the audit ran TWICE with
+NO token file — REDEPLOY15's friction (a) is resolved in production).** The new
+`--mirror-settle-ms` default (30000 ms) was in effect. Run from the deploy
+worktree, minted per-run PAT in a 0600 token file, base
+`https://cf-gitea.hecongw.workers.dev`, user `p0probe`. Battery-by-battery,
+verbatim `[pass]` lines:
+
+- **p0** (`--fixture-oid 502abd2d…`) — 4/4 pass, exit 0:
+  `[pass] p0-shallow-since (4000 ms) — exit 128 — unsupported fetch argument
+  'deepen-since' (only depth-limited shallow fetches are supported)`;
+  `[pass] p0-shallow-exclude (2458 ms) — exit 128 — same shape naming
+  'deepen-not'`; `[pass] p0-depth-1 (10943 ms) — exit 0 — .git/shallow =
+  502abd2d55… (identical tip); depth 1; fsck clean`; `[pass] p0-privacy-anon
+  (4706 ms) — anonymous API GET 404, info/refs 401 (Basic realm="Gitea"), web
+  page 404 — the fixture stays private`. The brief's P0 trio + anon arms are
+  absorbed here.
+- **registry** (`--trials 2`) — 14/14 pass, exit 0: both trials create 201 →
+  advert settle (HEAD, refs/heads/main) → rename 200 → IMMEDIATE anonymous
+  carry → DELETE 204 → `[pass] tN-tombstone-t0 — exit 128 at t+0 — remote:
+  repository not found` → old name dead on both paths (git 128, API 404).
+- **generate-e2e** (`--strict-generated-clone`) — FIRST RUN **1 pass / 1 FAIL /
+  8 skip**: `gen-template-push` died at 5061 ms with
+  `gnutls_handshake() failed: The TLS connection was non-properly terminated` —
+  adjudicated CLIENT-side, not a product regression: the same local-network
+  window that 404'd `wrangler deployments list` minutes earlier (a manual
+  healthz loop in the same minute read `SSL_ERROR_SYSCALL` then 200);
+  p0's four clones had succeeded seconds before. The red left
+  `p0probe/tmpl-85c28975` behind (chain-skip convention; see friction) —
+  hand-deleted 204, then **RE-RUN GREEN: 10/10 pass, exit 0** — template 201 →
+  real push (LICENSE on main + `refs/heads/dev` at `5bc7d95d9e…`) → PATCH 200 +
+  persisted → generate **201 with `"empty":false`** →
+  `[pass] gen-generated-refs (2059 ms) — both carried refs at the identical tip
+  5bc7d95d9e…`; `[pass] gen-generated-contents (1812 ms) — LICENSE round-trips
+  verbatim; last_commit_sha = the carried tip`; **`[pass] gen-generated-clone
+  (2686 ms) — clone succeeded (exit 0)`** under the HARD assert (the
+  8828f43 git-wire fix holds); cleanup 204s.
+- **forkpr-e2e** — 8/8 pass, exit 0 (second production evidence): base 201 →
+  org 201 → fork 202 → settle → fork push (`prbr-7b306b60` at `67067b7fc4…`) →
+  `[pass] forkpr-create-201 (3333 ms) — PR #1 created from head
+  prorg-d2068b92:prbr-7b306b60`; `[pass] forkpr-head-chain (1755 ms) — head
+  chain ok: prorg-d2068b92/prbase-ff793ad1#prbr-7b306b60@67067b7fc4… → base
+  main (mergeable true, head.ref refs/pull/1/head)`; cleanup deleted fork +
+  base + org (204s).
+- **mirror** — 8/8 pass, exit 0, FIRST TRY (no red, no tail sweep needed):
+  `[pass] mir-ssrf-loopback-refused (2180 ms) — 401 "Permission denied" — the
+  loopback target refused at the door; list still empty`; `[pass]
+  mir-sync-settle (1065 ms) — last_error names the target — the REDEPLOY13
+  verbatim 530 shape: mirror target responded 530 for info/refs advertisement
+  [https://pmir-680a2ba5.invalid/dummy-unreachable.git/info/refs?service=git-receive-p…`;
+  `[pass] mir-row-settled (2803 ms) — sync_state='idle', next_sync_at=0
+  (--remote)`; delete 204, list [], repo deleted. The new 30 s budget never
+  came under pressure (settle 1.1 s; REDEPLOY15's 12 s variance did not recur).
+- **ui-login** — 5/5 pass, exit 0: anonymous labels 200 with 0 "New Label";
+  `[pass] ui-login-303 (288 ms) — 303 + gitea_session cookie`; `[pass]
+  ui-labels-cookie-owner (317 ms) — 200 with 3 "New Label" occurrences +
+  small-menu-items — the owner arm renders`; cleanup 204.
+- **cleanup-audit** — run TWICE, both D1-only WITHOUT any token (first
+  production exercise of the 5fdbc15 affordance). Run 1 (`--expect-tokens 2`,
+  run PAT still alive), all 10 pass: `[pass] audit-query (3832 ms) —
+  owner_repos=1 creating=0 action=0 stars=0 push_mirrors=0
+  protected_branches=0 repo_redirects=0 user_blocking=0 tokens=2`. Run 2
+  (after the PAT delete, `--expect-tokens 1`), all 10 pass: `[pass] audit-query
+  (4127 ms) — owner_repos=1 creating=0 … tokens=1`.
+
+**THE HAND SPOT-PROBES** (where the toolkit lacks arms; one private probe repo
+`p0probe/spot-rd16-4177` — auto_init — carried all three):
+
+- **attachments spot — the 2b5b898 route's first production traffic.**
+  `POST /api/v1/repos/p0probe/spot-rd16-4177/issues/1/assets?name=hello.txt`
+  (multipart) → **201**, body renders `uuid
+  a9a17796-df45-4d1b-82ca-5bc662f26a7d`, `size 36`, and the
+  `browser_download_url` field. Reader arm: `GET
+  /attachments/a9a17796-…` with the run PAT → **200** with the full
+  ServeAttachment header matrix, verbatim: `content-type: text/plain;
+  charset=utf-8` (the Go sniff table), `content-disposition: inline;
+  filename=hello.txt` (upstream's INLINE default), `content-security-policy:
+  sandbox allow-scripts allow-modals allow-popups allow-downloads`,
+  `x-content-type-options: nosniff`,
+  `access-control-expose-headers: Content-Disposition`; body round-tripped
+  byte-exact. 404 arms: anonymous GET on the private repo's attachment →
+  **404 "Not Found"** (no existence leak); a bogus uuid → **404**. NEW FINDING
+  (medium-low, see OPEN ISSUES): the same GET with the owner's **session
+  cookie** → 404 on BOTH attachment kinds — the seam's credential walk is
+  token-only (`resolveOptionalCredential`; Basic/bearer tokens), session doers
+  are invisible to it, so a logged-in browser following `browser_download_url`
+  on a PRIVATE repo's asset gets 404 where upstream's session-authenticated web
+  route serves the owner. API/token clients and public repos are unaffected.
+- **render spot — the fdaeaca family's first production traffic.** `GET
+  /p0probe/spot-rd16-4177/render/branch/main/README.md` with the owner session
+  → **200** `content-type: text/html; charset=utf-8` +
+  `content-security-policy: sandbox allow-scripts allow-forms allow-modals
+  allow-popups allow-downloads`, body a rendered fragment (`<h1
+  id="user-content-spot-rd16-4177">…`). Non-renderable arm: a `data.bin`
+  created via the contents API (201) → `GET …/render/branch/main/data.bin` →
+  **400 "Unable to find renderer"** verbatim. Missing path → **404**. Probe
+  methodology note for the next runner: the refType literal is REQUIRED —
+  `/render/main/README.md` (no `branch/`) is unclaimed by the landed parse and
+  falls to the engine 404 exactly as designed; cite the shape as
+  `/render/{branch|tag|commit}/{ref}/*`.
+- **releases download spot — the fdaeaca tail end-to-end.** `POST …/releases
+  {"tag_name":"v1-spot",…}` on the pushed repo → **201** (id 3 — the d24dc0f
+  `is_empty` gate stays healthy in production, third consecutive deploy);
+  `POST /releases/3/assets?name=rel-asset.txt` → **201** with
+  `browser_download_url` = `…/attachments/74be9325-3f2c-483e-a51d-07a2e8f22ed3`;
+  the `release_assets` row verified in remote D1 (`release_id 3`, `repo_id`
+  set); following the URL with the PAT → **200**, the same header matrix as the
+  issue attachment (`inline; filename=rel-asset.txt`, sandbox CSP, nosniff),
+  body byte-exact; anonymous → **404** (private).
+
+Cleanup proof: every battery self-cleaned (registry tombs through their own
+DELETE step; generate/forkpr/ui/mirror/smoke repos all 204). Spot-probe repos:
+`tmpl-85c28975` (the generate red's leftover) hand-deleted 204;
+`spot-rd16-4177` deleted 204 after the probes. Per-run credentials: ONE PAT
+minted (the mint log's "id 4" line was the STANDING bootstrap PAT's id — the
+run PAT was **id 37**, `created_at 11:19:21`; verify the id against
+`GET /users/{user}/tokens` before deleting, not the mint line). Deleted by
+`DELETE /api/v1/users/p0probe/tokens/37` → **204** (methodology note: token
+CRUD requires BASIC auth — the bearer form 401s "auth required"; matches the
+route tests). Token + cookie files shredded; raw mint stdout shredded. Final
+whole-table `personal_access_tokens` = **1** (the standing bootstrap PAT),
+proven by cleanup-audit run 2 alongside `owner_repos=1` (p0-shallow),
+`creating=0`, `action=0`, `stars=0`, `push_mirrors=0`. Worktree, scratch asset
+dir, and probe logs removed; `gitea/` pristine (0 dirty files, pin
+`fc4936884584`).
+
+**RESOLVED this deployment:** REDEPLOY15's OPEN issue (test-only, medium-low) —
+the compat tier-1 `repoCreateRelease` golden fixture seeds `isEmpty:false` as
+of 3b3a3ae; the gates run shows zero compat failures. REDEPLOY15's toolkit
+friction (a) — the audit demanding a PAT — is resolved in production
+(5fdbc15's D1-only affordance, exercised twice with no token file). The
+ws1009 runner-death class stays at 0.
+
+**OPEN ISSUES carried:** NEW (medium-low — owner: attachments seam):
+the site-level `/attachments/:uuid` route authenticates TOKENS only — the
+session-cookie doer is invisible to `resolveOptionalCredential`, so private-repo
+attachments 404 for the logged-in owner's BROWSER (every `browser_download_url`
+click) while API/token clients succeed; the module doc's "cf-gitea has no
+sessions" premise is inaccurate as stated (the ui tier demonstrably has
+sessions — the ui-login battery lives on them); fix shape: walk the session
+cookie in the seam's credential resolution, or route web downloads through the
+session tier. NEW (toolkit, low — owner: toolkit): the generate-e2e battery has
+no finally-style leftover sweep (only the mirror battery self-cleans) — this
+run's red stranded `tmpl-85c28975` behind `[skip]` lines for a hand-clean;
+porting the mirror battery's `failureTail` shape would close it. Carried
+unchanged: the repo payload's `fork`/`parent`/`mirror` fields remain the
+SPEC-0005 serializer stubs; the bare `owner:branch` PR head form with a renamed
+fork answers 404 (documented in-code divergence); API tag create answers 200
+where upstream answers 201 (cosmetic, untracked).
+
+*(REDEPLOY16, evidence appended by the redeploy-verification agent; all
+numbers verbatim from this run's commands.)*
