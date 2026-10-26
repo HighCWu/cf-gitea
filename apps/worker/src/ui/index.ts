@@ -6524,6 +6524,10 @@ async function fileUploadSubmit(c: Context<{ Bindings: Env }>): Promise<Response
 }
 
 async function editorCherryPickPage(c: Context<{ Bindings: Env }>, isPost: boolean): Promise<Response> {
+  if (isPost) {
+    const guard = sameOriginGuard(c.req.raw);
+    if (guard !== null) return guard;
+  }
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, repo, respond } = resolved;
@@ -6555,6 +6559,10 @@ async function editorCherryPickPage(c: Context<{ Bindings: Env }>, isPost: boole
 }
 
 async function editorPatchPage(c: Context<{ Bindings: Env }>, isPost: boolean): Promise<Response> {
+  if (isPost) {
+    const guard = sameOriginGuard(c.req.raw);
+    if (guard !== null) return guard;
+  }
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const { ctx, viewer, repo, respond } = resolved;
