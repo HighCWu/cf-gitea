@@ -1160,6 +1160,7 @@ import { findIssueByRepoAndIndex } from "../api/services/issues";
 import { deleteRepoHook, getOwnerHook, getRepoHook } from "../api/services/hooks";
 import { findPullRequestByIndex } from "../api/services/pulls";
 import { findRepositoryById } from "../api/services/repository";
+import { toApiUser } from "../api/auth";
 import { IssuesService } from "../issues/service";
 import type { OrgRecord } from "../services/orgs/orgs";
 // Window-2d: the four repo-settings tab modules.
@@ -3916,9 +3917,11 @@ async function sitemapRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
     return respond(sitemapXmlResponse(await loadHomeSitemapIndex(c.env.DB, url.origin)));
   }
   if (route.family === "explore-repos-sitemap") {
+    if (route.idx === undefined) return respond(await c.notFound()); // drift guard
     return respond(sitemapXmlResponse(await loadReposSitemap(c.env.DB, url.origin, route.idx)));
   }
   if (route.family === "explore-users-sitemap") {
+    if (route.idx === undefined) return respond(await c.notFound()); // drift guard
     return respond(sitemapXmlResponse(await loadUsersSitemap(c.env.DB, url.origin, route.idx)));
   }
   return respond(await c.notFound()); // drift guard
@@ -3929,8 +3932,25 @@ async function repoSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Respon
   if (!resolved.ok) return resolved.response;
   const { url, viewer, respond } = resolved;
   if (resolved.route.family !== "repo-search-aux") return respond(await c.notFound()); // drift guard
-  // reqSignIn (web.go:1097-1103).
+  // reqSignIn (web.go:1097-1103). The API-layer Viewer needs the contract
+  // User — built from the D1 row via the auth mapper (toApiUser, exported
+  // for this bridge).
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (userRow === undefined) return respond(c.html(renderNotFound(resolved.ctx), 404)); // the session doer vanished
+  const apiViewer = {
+    origin: url.origin,
+    requester: toApiUser({
+      id: userRow.id,
+      username: userRow.username,
+      usernameLower: userRow.usernameLower,
+      email: userRow.email,
+      displayName: userRow.displayName,
+      isAdmin: userRow.isAdmin,
+      status: userRow.status,
+      createdAt: userRow.createdAt,
+    }),
+  };
   let params: ReturnType<typeof parseRepoSearchAuxQuery>;
   try {
     params = parseRepoSearchAuxQuery(url, true);
@@ -3942,7 +3962,7 @@ async function repoSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Respon
     }
     throw error;
   }
-  const result = await loadRepoSearchAux(c.env, resolved.viewer, params);
+  const result = await loadRepoSearchAux(c.env, apiViewer, params);
   return respond(
     params.countOnly
       ? repoSearchCountOnlyResponse(result.total)

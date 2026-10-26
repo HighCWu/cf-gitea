@@ -47,7 +47,7 @@ export function extractTokenHeader(authorization: string | undefined): string | 
 /**
  * Convert a SPEC-0002 verified user (D1 row shape) into the contract `User`.
  */
-function toApiUser(u: AuthUser): User {
+export function toApiUser(u: AuthUser): User {
   return {
     id: u.id,
     login: u.username,
