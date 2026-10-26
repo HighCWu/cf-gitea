@@ -16,11 +16,12 @@ node scripts/deploy-probes.mjs all --dry-run          # print every probe + its 
 node scripts/deploy-probes.mjs p0 --dry-run           # single battery plan
 ```
 
-- Batteries: `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `ui-login`,
-  `cleanup-audit`, `all` (runs them in that order, audit last).
+- Batteries: `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
+  `ui-login`, `cleanup-audit`, `all` (runs them in that order, audit last).
 - Against LOCAL dev: `--base-url http://127.0.0.1:5173 --d1-scope local` for
-  the audit; mint the PAT with `node scripts/bootstrap-admin.mjs <user>` on
-  local D1. A local self-test (all six batteries) was run green from this tree;
+  the audit and the mirror row-settle arm; mint the PAT with
+  `node scripts/bootstrap-admin.mjs <user>` on local D1. A local self-test
+  (all seven batteries) was run green from this tree;
   see "Local self-test fixtures" below.
 - `--json` puts only the final JSON summary on stdout (progress to stderr),
   same contract as deploy-smoke.
@@ -43,7 +44,8 @@ node scripts/deploy-probes.mjs p0 --dry-run           # single battery plan
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
-and the cleanup shapes; the REDEPLOY12 tombstone t+0 proof (~1395-1417) and the
+the cleanup shapes, and the push-mirror credential-free arms (~1600-1610);
+the REDEPLOY12 tombstone t+0 proof (~1395-1417) and the
 REDEPLOY10 registry re-probe (~991-1030) for the registry sweep. `--dry-run`
 prints all of them verbatim.
 
@@ -92,6 +94,30 @@ prints all of them verbatim.
   evidence block exists for this battery (the fork-PR create landed at
   a16f60e, post-REDEPLOY13) — the next REDEPLOY run is its first production
   evidence.
+- **mirror** — the push-mirror credential-free arms (REDEPLOY13's evidence,
+  ~1600-1610; full e2e to a real external remote stays out of scope — no
+  external credentials). A private auto_init source repo (201), then:
+  **ARM 1, the SSRF egress gate at registration** — `POST push_mirrors` with
+  the loopback target `https://127.0.0.1:9/dummy-unreachable.git` → **401
+  "Permission denied"** and the list stays empty (nothing written; https is
+  required to reach the gate at all — plain `http://` lands in the 400
+  "Invalid mirror protocol" bucket first, and port 9 stays refused under both
+  the production lax default and local dev's explicit `127.0.0.1:8443` allow
+  entry). **ARM 2, the `.invalid` lifecycle** — the gate-passing unreachable
+  `https://pmir-<hex>.invalid/dummy-unreachable.git` registers **200** with
+  the fresh-row wire (`last_error` "", `last_update` null, `interval`
+  `8h0m0s`, `sync_on_commit` false, `remote_name` `remote_mirror_<10 alnum>`)
+  → `push_mirrors-sync` **200** (the enqueue) → poll the mirror (budget 10 s)
+  until the consumer's failed attempt settles: `last_error` non-empty and
+  naming the target advertisement URL `[<addr>/info/refs?service=
+  git-receive-pack]` (canonical production text: "mirror target responded 530
+  for info/refs advertisement …"; local dev's unresolvable-host fetch reads
+  "request failed" with the same bracketed URL — the settle writes
+  `last_error` and `sync_state='idle'` in the same update) → the row re-read
+  via wrangler d1 (`--d1-scope`): `sync_state='idle'` (no stuck state),
+  `next_sync_at=0` (the failure left the fresh row unscheduled) → DELETE
+  **204** and the list back to `[]`. Cleanup deletes the probe repo; the
+  audit battery's `push_mirrors` == 0 expectation stays true.
 - **ui-login** — the login-cookie methodology (b5facba's lesson; REDEPLOY12's
   OPEN ISSUE 3 closed): a PAT header never logs a session in. Anonymous labels
   page 200 with 0 "New Label" occurrences → `POST /login`
@@ -124,10 +150,10 @@ prints all of them verbatim.
 
 ## Deliberately not ported (yet)
 
-- The push-mirror lifecycle probe (REDEPLOY13): full e2e to a real external
-  remote stays out of probe scope (no external credentials); the
-  registration-time SSRF-gate arm (loopback 401 / `.invalid` 200 + sync
-  `last_error`) is a natural future subcommand.
+- The push-mirror FULL e2e to a real external remote (REDEPLOY13's opening
+  arm) — no external credentials in probe scope; the `mirror` battery carries
+  the credential-free halves (the SSRF egress gate + the `.invalid`
+  lifecycle) instead.
 - The wrangler-tail attachments (registry/tombstone traces) — the toolkit is
   HTTP/git-only; attach a tail manually when adjudicating a red.
 

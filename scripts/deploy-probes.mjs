@@ -20,6 +20,11 @@
  *                  contents API round-trip.
  *   forkpr-e2e     Base -> fork (202) -> push a fork branch -> PR with the
  *                  cross-repo head `owner:branch` -> 201 + head chain.
+ *   mirror         The push-mirror credential-free arms: the registration-time
+ *                  SSRF egress gate refusing a loopback target at the door,
+ *                  then the .invalid lifecycle — gate-passing unreachable
+ *                  target -> 200 -> sync trigger -> the failed sync's settle
+ *                  shape -> DELETE 204.
  *   ui-login       The login-cookie methodology probe: anonymous labels page
  *                  hides the writer form, POST /login 303 + gitea_session,
  *                  cookie view renders the owner form.
@@ -56,6 +61,20 @@
  *     push `missing necessary objects`): gen-generated-clone is reported as
  *     a warn until the engine read path lands — pass
  *     --strict-generated-clone to promote it to a hard assert.
+ *   - push mirror (REDEPLOY13 ~1600-1610, credential-free arms): registering
+ *     the loopback target https://127.0.0.1:9/dummy-unreachable.git answers
+ *     401 "Permission denied" AT THE DOOR (the egress screen; lax/strict
+ *     MIRROR_ALLOWED_HOST_LIST) and writes nothing; the gate-passing
+ *     https://pmir-<hex>.invalid target answers 200 with the fresh-row wire
+ *     (last_error "", last_update null, interval 8h0m0s, sync_on_commit
+ *     false, remote_name remote_mirror_<10 alnum>) -> push_mirrors-sync 200
+ *     enqueues -> the consumer's failed attempt settles last_error naming
+ *     the target's info/refs advertisement URL (canonical production text:
+ *     "mirror target responded 530 for info/refs advertisement
+ *     [<addr>/info/refs?service=git-receive-pack]"; local dev's fetch
+ *     failure reads "request failed" with the same bracketed URL) with
+ *     sync_state back to 'idle' and next_sync_at=0 (row re-read via wrangler
+ *     d1, --d1-scope) -> DELETE 204 and the list back to [].
  *   - login: POST /login form-urlencoded user_name + password=<PAT> answers
  *     303 with a gitea_session cookie; the labels page then shows the
  *     writer's "New Label" form (3 occurrences canonically, +the
@@ -86,7 +105,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "ui-login", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "cleanup-audit", "all"];
 
 /** Canonical fixture tip on the standing production repo (p0probe/p0-shallow). */
 const CANONICAL_FIXTURE_OID = "502abd2d5561536873088528a9f57f02cd1633e1";
@@ -149,6 +168,7 @@ const usage = () =>
   "  registry:      --trials <1-10>            (default 3, one tombstone lifecycle each)\n" +
   "  generate-e2e:  --strict-generated-clone   (promote the carried git-wire warn to a hard assert)\n" +
   "  forkpr-e2e:    (no extra options)\n" +
+  "  mirror:        (no extra options; the row-settle arm reuses --d1-scope)\n" +
   "  ui-login:      --new-label-count <n>      (canonical 3 writer-form occurrences)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)";
 
@@ -302,6 +322,9 @@ const deleteRepo = async (owner, repo) => {
  *  probes (rename carry, tombstone t+0) deliberately do NOT poll. */
 const SETTLE_MS = 15_000;
 const FORK_SETTLE_MS = 30_000;
+/** The .invalid sync settle (the queue consumer's failed attempt — the
+ *  evidence's first poll landed ~3 s; the mission budget is ~10 s). */
+const MIRROR_SETTLE_MS = 10_000;
 
 // ---------- battery: p0 (shallow trio + privacy tail) ----------
 
@@ -737,6 +760,142 @@ const forkprSteps = (ctx) => [
   },
 ];
 
+// ---------- battery: mirror (push-mirror credential-free arms) ----------
+
+/** REDEPLOY13's exact loopback probe target (docs/design/p0-evidence.md
+ *  ~1600-1610): HTTPS is required to reach the egress gate at all (a plain
+ *  http:// URL lands in the 400 "Invalid mirror protocol" bucket first), and
+ *  port 9 stays refused under BOTH postures — the production lax default and
+ *  local dev's explicit `127.0.0.1:8443` allow entry. */
+const MIRROR_LOOPBACK_TARGET = "https://127.0.0.1:9/dummy-unreachable.git";
+
+/** The gate-passing unreachable dummy host, random per run (the hygiene
+ *  convention; the RFC 2606 `.invalid` TLD never resolves — no credentials,
+ *  no real egress). */
+const mirrorInvalidTarget = () => `https://pmir-${hexId()}.invalid/dummy-unreachable.git`;
+
+const mirrorContext = () => ({ user: opts.user, repo: `pmir-${hexId()}`, remoteName: null, remoteAddress: null, tmp: null });
+
+const mirrorSteps = (ctx) => [
+  {
+    id: "mir-create-repo-201",
+    expect: `POST /api/v1/user/repos {"name":"${ctx.repo}","auto_init":true} → 201 (the mirror source — one auto_init commit to push)`,
+    run: async () => {
+      const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, private: true, auto_init: true } });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      return `created ${res.json?.full_name} (private, auto_init)`;
+    },
+  },
+  {
+    id: "mir-ssrf-loopback-refused",
+    expect: `ARM 1 — SSRF egress gate AT REGISTRATION: POST …/push_mirrors {"remote_address":"${MIRROR_LOOPBACK_TARGET}","interval":"8h"} → 401 "Permission denied" (the REDEPLOY13 refusal verbatim — the egress screen refusing the loopback target at the door; lax/strict MIRROR_ALLOWED_HOST_LIST) and the list stays empty (nothing written)`,
+    run: async () => {
+      // Settle-polled (SETTLE_MS): the create finalizes in waitUntil after
+      // the 201 (the §2.5.2 window), so the FIRST registration attempt can
+      // still 404 on requireVisibleRepo — poll the 404 arm out, then hold
+      // the 401 line (a 200 here would mean the SSRF gate is OPEN).
+      const res = await poll(SETTLE_MS, async () => {
+        const r = await api(`/repos/${ctx.user}/${ctx.repo}/push_mirrors`, {
+          method: "POST",
+          body: { remote_address: MIRROR_LOOPBACK_TARGET, interval: "8h" },
+        });
+        return r.status === 404 ? null : r;
+      });
+      expect(res !== null, `the probe repo never became visible within ${SETTLE_MS} ms (every registration attempt 404'd)`);
+      expect(res.status === 401, `status ${res.status} (expected 401 — a 200 here means the SSRF gate is OPEN): ${res.text.slice(0, 160)}`);
+      expect(res.json?.message === "Permission denied", `message ${JSON.stringify(res.json?.message)} (expected "Permission denied")`);
+      const list = await api(`/repos/${ctx.user}/${ctx.repo}/push_mirrors`);
+      expect(Array.isArray(list.json) && list.json.length === 0,
+        `list after the refusal: ${list.text.slice(0, 120)} (expected [] — the refusal wrote nothing)`);
+      return `401 "Permission denied" — the loopback target refused at the door; list still empty`;
+    },
+  },
+  {
+    id: "mir-create-200",
+    expect: `ARM 2 — the gate-passing unreachable target: POST …/push_mirrors {"remote_address":"<pmir-*.invalid>/dummy-unreachable.git","interval":"8h"} → 200 with the fresh-row wire: last_error "", last_update null, interval "8h0m0s", sync_on_commit false, remote_name remote_mirror_<10 alnum>`,
+    run: async () => {
+      ctx.remoteAddress = mirrorInvalidTarget();
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/push_mirrors`, {
+        method: "POST",
+        body: { remote_address: ctx.remoteAddress, interval: "8h" },
+      });
+      expect(res.status === 200, `status ${res.status} (expected 200): ${res.text.slice(0, 200)}`);
+      ctx.remoteName = String(res.json?.remote_name ?? "");
+      expect(/^remote_mirror_[A-Za-z0-9]{10}$/.test(ctx.remoteName), `remote_name ${ctx.remoteName} (expected remote_mirror_<10 alnum>)`);
+      expect(res.json?.last_error === "", `last_error ${JSON.stringify(res.json?.last_error)} (expected "" on the fresh row)`);
+      expect(res.json?.last_update === null, `last_update ${res.json?.last_update} (expected null until the first sync)`);
+      expect(res.json?.interval === "8h0m0s", `interval ${res.json?.interval} (expected "8h0m0s")`);
+      expect(res.json?.sync_on_commit === false, `sync_on_commit ${res.json?.sync_on_commit} (expected false)`);
+      expect(res.json?.remote_address === ctx.remoteAddress, `remote_address ${res.json?.remote_address} != the registered target`);
+      return `200 — ${ctx.remoteName} → ${ctx.remoteAddress} (fresh-row wire)`;
+    },
+  },
+  {
+    id: "mir-sync-trigger-200",
+    expect: `POST …/push_mirrors-sync → 200 (the enqueue; the outbound push runs on the MIRROR_SYNC_QUEUE consumer)`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/push_mirrors-sync`, { method: "POST" });
+      expect(res.status === 200, `status ${res.status} (expected 200): ${res.text.slice(0, 160)}`);
+      return "200 — sync enqueued";
+    },
+  },
+  {
+    id: "mir-sync-settle",
+    expect: `poll GET …/push_mirrors/${"{name}"} (budget ${MIRROR_SETTLE_MS / 1000}s) until the failed sync settles: last_error NON-EMPTY and naming the target advertisement URL — canonical production text "mirror target responded 530 for info/refs advertisement [<addr>/info/refs?service=git-receive-pack]" (REDEPLOY13 verbatim; local dev's fetch failure reads "request failed" with the same bracketed URL)`,
+    run: async () => {
+      const row = await poll(MIRROR_SETTLE_MS, async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.repo}/push_mirrors/${ctx.remoteName}`);
+        if (res.status !== 200) throw new Error(`GET push_mirrors/${ctx.remoteName} status ${res.status} (expected 200)`);
+        return res.json?.last_error ? res.json : null;
+      });
+      expect(row !== null, `last_error never went non-empty within ${MIRROR_SETTLE_MS} ms (the consumer never attempted the .invalid sync)`);
+      const errText = String(row.last_error);
+      expect(errText.includes("mirror target") && errText.includes("info/refs advertisement"),
+        `last_error does not name the info/refs advertisement attempt: ${errText.slice(0, 200)}`);
+      expect(errText.includes(`[${ctx.remoteAddress}/info/refs?service=git-receive-pack]`),
+        `last_error does not name the target advertisement URL: ${errText.slice(0, 200)}`);
+      const verbatim = errText.includes("mirror target responded 530 for info/refs advertisement");
+      // The failure settle (settlePushMirrorFailure) writes last_error and
+      // sync_state='idle' in the SAME update — observing last_error via the
+      // API already proves the row is out of 'syncing'; the next check reads
+      // the row directly.
+      return `last_error names the target${verbatim ? " — the REDEPLOY13 verbatim 530 shape" : " (local fetch-failure shape; production records 'responded 530')"}: ${errText.slice(0, 140)}`;
+    },
+  },
+  {
+    id: "mir-row-settled",
+    expect: `the mirror ROW settled clean (wrangler d1 execute, --${opts.d1Scope}): sync_state='idle' (back from syncing, no stuck state), next_sync_at=0 (the failure left the fresh row unscheduled)`,
+    run: async () => {
+      const row = await d1Row(`SELECT sync_state, next_sync_at FROM push_mirrors WHERE remote_name = '${ctx.remoteName}'`);
+      expect(row.sync_state === "idle", `sync_state ${JSON.stringify(row.sync_state)} (expected 'idle' — no stuck state)`);
+      expect(Number(row.next_sync_at) === 0, `next_sync_at ${row.next_sync_at} (expected 0 — the failure left it unscheduled)`);
+      return `sync_state='idle', next_sync_at=0 (--${opts.d1Scope})`;
+    },
+  },
+  {
+    id: "mir-delete-204",
+    expect: `DELETE …/push_mirrors/${"{name}"} → 204 and the very next GET …/push_mirrors → [] (the row and its sealed credentials are gone; the audit battery's push_mirrors==0 expectation stays true)`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/push_mirrors/${ctx.remoteName}`, { method: "DELETE" });
+      expect(res.status === 204, `status ${res.status} (expected 204)`);
+      const list = await api(`/repos/${ctx.user}/${ctx.repo}/push_mirrors`);
+      expect(Array.isArray(list.json) && list.json.length === 0,
+        `list after the delete: ${list.text.slice(0, 120)} (expected [])`);
+      return "204 — the row (and its sealed credentials) is gone; list back to []";
+    },
+  },
+  {
+    id: "mir-cleanup",
+    expect: `probe repo DELETEd → 204 (a failed cleanup is documented, not fatal)`,
+    run: async () => {
+      const out = await deleteRepo(ctx.user, ctx.repo);
+      await rm(ctx.tmp, { recursive: true, force: true });
+      if (typeof out === "string") return out;
+      return { status: "warn", detail: out.detail };
+    },
+  },
+];
+
 // ---------- battery: ui-login ----------
 
 const uiContext = () => ({ user: opts.user, repo: `ui-${hexId()}`, cookie: null, tmp: null });
@@ -820,10 +979,9 @@ const AUDIT_TABLES = [
   { key: "user_blocking", sql: `(SELECT COUNT(*) FROM "user_blocking")`, want: () => 0, label: `user_blocking` },
 ];
 
-const auditCounts = async () => {
-  const sql = `SELECT (SELECT COUNT(*) FROM "repositories" WHERE "owner_namespace" = '${opts.user}') AS owner_repos, ` +
-    AUDIT_TABLES.map((t) => `${t.sql} AS ${t.key}`).join(", ") +
-    `, (SELECT COUNT(*) FROM "personal_access_tokens") AS personal_access_tokens`;
+/** One wrangler d1 execute (--json, --${opts.d1Scope}) → the first row of
+ *  the last statement's results (the cleanup-audit + mirror row-settle reads). */
+const d1Row = async (sql) => {
   const r = await run("pnpm", ["exec", "wrangler", "d1", "execute", "cf-gitea", `--${opts.d1Scope}`, "--json", "--command", sql],
     { cwd: workerDir, timeoutMs: 120_000 });
   expect(r.ok, `wrangler d1 execute failed (code ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
@@ -834,8 +992,15 @@ const auditCounts = async () => {
     throw new Error(`wrangler --json output is not JSON: ${r.stdout.slice(0, 200)}`);
   }
   const row = parsed.at(-1)?.results?.[0];
-  expect(row !== undefined, `no result row from the audit query (raw: ${r.stdout.slice(0, 200)})`);
+  expect(row !== undefined, `no result row from the d1 query (raw: ${r.stdout.slice(0, 200)})`);
   return row;
+};
+
+const auditCounts = async () => {
+  const sql = `SELECT (SELECT COUNT(*) FROM "repositories" WHERE "owner_namespace" = '${opts.user}') AS owner_repos, ` +
+    AUDIT_TABLES.map((t) => `${t.sql} AS ${t.key}`).join(", ") +
+    `, (SELECT COUNT(*) FROM "personal_access_tokens") AS personal_access_tokens`;
+  return d1Row(sql);
 };
 
 const auditSteps = (ctx) => [
@@ -885,12 +1050,13 @@ const BATTERIES = {
   "registry": { title: "registry tombstone sweep (carry + t+0 delete)", context: () => ({}), steps: () => Array.from({ length: opts.trials }, (_, i) => registryTrialSteps(i + 1)).flat() },
   "generate-e2e": { title: "template → generate → carried refs + contents", context: generateContext, steps: generateSteps },
   "forkpr-e2e": { title: "fork → owner:branch PR chain", context: forkprContext, steps: forkprSteps },
+  "mirror": { title: "push-mirror credential-free arms (SSRF gate + .invalid lifecycle)", context: mirrorContext, steps: mirrorSteps },
   "ui-login": { title: "login-cookie labels owner view", context: uiContext, steps: uiSteps },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "ui-login", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 
