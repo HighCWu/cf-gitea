@@ -795,6 +795,70 @@ import {
   parseUserProfileForm,
   renderUserSettingsPage,
 } from "./pages/user-settings";
+// Window-2a: the user-settings tab modules (two-stage waves 54-58, mounted
+// by this window — each module's header carries its route recipe).
+import {
+  applyUserSettingsAppearanceLanguageForm,
+  applyUserSettingsAppearanceThemeForm,
+  loadUserSettingsAppearancePageData,
+  parseUserSettingsAppearanceLanguageForm,
+  parseUserSettingsAppearanceThemeForm,
+  renderUserSettingsAppearancePage,
+} from "./pages/user-settings-appearance";
+import {
+  loadUserSettingsSecurityPageData,
+  renderUserSettingsSecurityPage,
+} from "./pages/user-settings-security";
+import {
+  applyUserSettingsSecretForm,
+  deleteUserSettingsSecret,
+  loadUserSettingsSecretsPageData,
+  parseUserSettingsSecretDeleteForm,
+  parseUserSettingsSecretForm,
+  renderUserSettingsSecretsPage,
+} from "./pages/user-settings-secrets";
+import {
+  applyUserSettingsVariableCreate,
+  applyUserSettingsVariableUpdate,
+  deleteUserSettingsVariable,
+  loadUserSettingsVariablesPageData,
+  parseUserSettingsVariableForm,
+  renderUserSettingsVariablesPage,
+} from "./pages/user-settings-variables";
+import {
+  createUserHookFromForm,
+  deleteUserHook,
+  editUserHookFromForm,
+  loadUserHookDetailData,
+  loadUserSettingsHooksPageData,
+  renderUserHookDetailPage,
+  renderUserSettingsHooksPage,
+} from "./pages/user-settings-webhooks";
+import {
+  addGpgKeyFromForm,
+  addSshKeyFromForm,
+  deleteGpgKey,
+  deleteSshKey,
+  loadUserSettingsKeysOwner,
+  loadUserSettingsKeysPageData,
+  parseUserSettingsKeysDeleteForm,
+  parseUserSettingsKeysForm,
+  renderUserSettingsKeysPage,
+} from "./pages/user-settings-keys";
+import {
+  createTokenFromForm,
+  loadUserSettingsApplicationsPageData,
+  parseUserSettingsApplicationsDeleteForm,
+  parseUserSettingsApplicationsForm,
+  renderUserSettingsApplicationsPage,
+  revokeTokenFromForm,
+} from "./pages/user-settings-applications";
+import {
+  applyUserOrgsLeave,
+  loadUserOrgsSettings,
+  parseUserOrgsLeaveForm,
+  renderUserOrgsSettingsPage,
+} from "./pages/user-settings-organizations";
 import { loadUserProfileData, renderUserProfilePage, resolveUserProfile } from "./pages/user-profile";
 // Wave-19 creation pages (the authoring front door — the survey's #2).
 import {
@@ -1821,6 +1885,36 @@ export interface UserSettingsRoute {
   family: "user-settings";
 }
 
+/** Window-2a: the user-settings tab families (the two-stage module wave —
+ *  each tab module's header carries its route recipe; upstream's
+ *  reqSignIn /user/settings/* groups, web.go:646-746). Same literal posture
+ *  as the bare claim below: "user" is reserved and the /user group
+ *  registers ahead of the dynamic pairs. */
+export interface UserSettingsTabRoute {
+  family:
+    | "user-settings-appearance"
+    | "user-settings-appearance-theme"
+    | "user-settings-appearance-language"
+    | "user-settings-security"
+    | "user-settings-secrets"
+    | "user-settings-secrets-delete"
+    | "user-settings-variables"
+    | "user-settings-variables-new"
+    | "user-settings-variables-edit"
+    | "user-settings-variables-delete"
+    | "user-settings-hooks"
+    | "user-settings-hook-detail"
+    | "user-settings-hook-delete"
+    | "user-settings-keys"
+    | "user-settings-keys-delete"
+    | "user-settings-applications"
+    | "user-settings-applications-delete"
+    | "user-settings-organizations"
+    | "user-settings-organizations-leave";
+  /** The numeric path segment (hook/variable id), already parsed. */
+  id: number | null;
+}
+
 /** The wave-12 org teams families (pages/org-teams.tsx): upstream's
  *  `/{org}/teams` group (web.go:993-1013) at the landed API shapes — the
  *  list, the id-keyed detail slice (upstream links by team name; the slice
@@ -1937,6 +2031,7 @@ export type ParsedUiRoute =
   | ExploreRoute
   | NotificationsRoute
   | UserSettingsRoute
+  | UserSettingsTabRoute
   | OrgTeamsRoute
   | OrgLabelsRoute
   | OrgSettingsRoute
@@ -2025,10 +2120,67 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // reqSignIn /user/settings): claimed before the owner/repo parse could
   // read it as a repository named "settings" under a user named "user" (the
   // notifications precedent; upstream's /user group registers ahead of the
-  // dynamic pairs, and "user" is a reserved username besides). Deeper
-  // settings tails stay unclaimed — no landed surfaces.
-  if (raw.length === 3 && raw[1] === "user" && raw[2] === "settings") {
-    return { family: "user-settings" };
+  // dynamic pairs, and "user" is a reserved username besides). Window-2a
+  // extends the claim down the tab tails — each shape maps to a committed
+  // two-stage module's handoff recipe; every OTHER tail stays unclaimed →
+  // the engine's 404 (no landed surface).
+  if (raw[1] === "user" && raw[2] === "settings") {
+    const tail = raw.slice(3);
+    const numericId = (value: string | undefined): number | null =>
+      value !== undefined && /^\d+$/.test(value) ? Number.parseInt(value, 10) : null;
+    if (tail.length === 0) return { family: "user-settings" };
+    if (tail.length === 1 && tail[0] === "appearance") return { family: "user-settings-appearance", id: null };
+    if (tail.length === 2 && tail[0] === "appearance" && tail[1] === "theme") {
+      return { family: "user-settings-appearance-theme", id: null };
+    }
+    if (tail.length === 2 && tail[0] === "appearance" && tail[1] === "language") {
+      return { family: "user-settings-appearance-language", id: null };
+    }
+    if (tail.length === 1 && tail[0] === "security") return { family: "user-settings-security", id: null };
+    if (tail.length === 2 && tail[0] === "actions" && tail[1] === "secrets") {
+      return { family: "user-settings-secrets", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "secrets" && tail[2] === "delete") {
+      return { family: "user-settings-secrets-delete", id: null };
+    }
+    if (tail.length === 2 && tail[0] === "actions" && tail[1] === "variables") {
+      return { family: "user-settings-variables", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "variables" && tail[2] === "new") {
+      return { family: "user-settings-variables-new", id: null };
+    }
+    if (tail.length === 4 && tail[0] === "actions" && tail[1] === "variables" && tail[3] === "edit") {
+      const id = numericId(tail[2]);
+      return id === null ? null : { family: "user-settings-variables-edit", id };
+    }
+    if (tail.length === 4 && tail[0] === "actions" && tail[1] === "variables" && tail[3] === "delete") {
+      const id = numericId(tail[2]);
+      return id === null ? null : { family: "user-settings-variables-delete", id };
+    }
+    if (tail.length === 1 && tail[0] === "hooks") return { family: "user-settings-hooks", id: null };
+    if (tail.length === 2) {
+      const id = numericId(tail[1]);
+      if (id !== null) return { family: "user-settings-hook-detail", id };
+    }
+    if (tail.length === 3 && tail[2] === "delete") {
+      const id = numericId(tail[1]);
+      if (id !== null) return { family: "user-settings-hook-delete", id };
+    }
+    if (tail.length === 1 && tail[0] === "keys") return { family: "user-settings-keys", id: null };
+    if (tail.length === 2 && tail[0] === "keys" && tail[1] === "delete") {
+      return { family: "user-settings-keys-delete", id: null };
+    }
+    if (tail.length === 1 && tail[0] === "applications") return { family: "user-settings-applications", id: null };
+    if (tail.length === 2 && tail[0] === "applications" && tail[1] === "delete") {
+      return { family: "user-settings-applications-delete", id: null };
+    }
+    // The orgs tab is SINGULAR on the wire (web.go:740 m.Get("/organization",
+    // …) serves the plural template — the module's premise correction).
+    if (tail.length === 1 && tail[0] === "organization") return { family: "user-settings-organizations", id: null };
+    if (tail.length === 2 && tail[0] === "organization" && tail[1] === "leave") {
+      return { family: "user-settings-organizations-leave", id: null };
+    }
+    return null;
   }
 
   // The wave-19 creation literals (pages/repo-create.tsx + pages/
@@ -3869,6 +4021,280 @@ async function userSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   const form = parseUserProfileForm(await readUrlEncodedForm(c.req.raw));
   await applyUserProfileForm(c.env.DB, viewer.id, form);
   return respond(new Response(null, { status: 303, headers: { location: "/user/settings" } }));
+}
+
+// ---------------------------------------------------------------------------
+// Window-2a: the user-settings tab pages (the two-stage module wave, each
+// module's header recipe). Every handler follows the wave-12 prologue
+// (session → signed-in gate → doer-without-row 404 shell); POSTs take
+// sameOriginGuard FIRST (§2.8); invalid outcomes re-render with the
+// module's structured error; success 303s onto the canonical URL unless
+// the module's recipe says otherwise (applications' one-shot plaintext
+// banner re-renders instead).
+// ---------------------------------------------------------------------------
+
+/** The shared tab-page session prologue: guard → session → gates, answering
+ *  {viewer, respond} or a terminal Response. */
+async function userSettingsTabPrologue(c: Context<{ Bindings: Env }>, withOriginGuard: boolean): Promise<
+  { ok: true; url: URL; ctx: UiContext; viewer: Extract<Viewer, { kind: "user" }>; respond: (r: Response, status?: number) => Response } | { ok: false; response: Response }
+> {
+  if (withOriginGuard) {
+    const guard = sameOriginGuard(c.req.raw);
+    if (guard !== null) return { ok: false, response: guard };
+  }
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return { ok: false, response: resolved.response };
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname)) };
+  return { ok: true, url, ctx, viewer, respond };
+}
+
+async function userSettingsAppearancePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsAppearancePageData(c.env.DB, p.viewer.id);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsAppearancePage(p.ctx, data), 200));
+}
+
+async function userSettingsAppearanceSubmit(
+  c: Context<{ Bindings: Env }>,
+  arm: "theme" | "language",
+): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const params = await readUrlEncodedForm(c.req.raw);
+  let outcome: { outcome: "saved" } | { outcome: "invalid"; message: string };
+  if (arm === "theme") {
+    outcome = await applyUserSettingsAppearanceThemeForm(c.env.DB, p.viewer.id, parseUserSettingsAppearanceThemeForm(params));
+  } else {
+    outcome = await applyUserSettingsAppearanceLanguageForm(c.env.DB, p.viewer.id, parseUserSettingsAppearanceLanguageForm(params));
+  }
+  if (outcome.outcome === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/appearance" } }));
+  }
+  const data = await loadUserSettingsAppearancePageData(c.env.DB, p.viewer.id);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsAppearancePage(p.ctx, data, { form: arm, message: outcome.message })));
+}
+
+async function userSettingsSecurityPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsSecurityPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsSecurityPage(p.ctx, data), 200));
+}
+
+async function userSettingsSecretsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsSecretsPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsSecretsPage(p.ctx, data), 200));
+}
+
+async function userSettingsSecretsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsSecretForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyUserSettingsSecretForm(c.env.DB, p.viewer.id, form);
+  if (outcome.outcome === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/secrets" } }));
+  }
+  const data = await loadUserSettingsSecretsPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsSecretsPage(p.ctx, data, outcome.message)));
+}
+
+async function userSettingsSecretsDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsSecretDeleteForm(await readUrlEncodedForm(c.req.raw));
+  await deleteUserSettingsSecret(c.env.DB, p.viewer.id, form);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/secrets" } }));
+}
+
+async function userSettingsVariablesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsVariablesPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsVariablesPage(p.ctx, data), 200));
+}
+
+async function userSettingsVariablesNew(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsVariableForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyUserSettingsVariableCreate(c.env.DB, p.viewer.id, form);
+  if (outcome.outcome === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/variables" } }));
+  }
+  const data = await loadUserSettingsVariablesPageData(c.env.DB, p.viewer.id);
+  if (outcome.outcome === "invalid") {
+    return p.respond(c.html(renderUserSettingsVariablesPage(p.ctx, data, outcome.message)));
+  }
+  return p.respond(c.html(renderNotFound(p.ctx), 404));
+}
+
+async function userSettingsVariablesEdit(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsVariableForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyUserSettingsVariableUpdate(c.env.DB, p.viewer.id, id, form);
+  if (outcome.outcome === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/variables" } }));
+  }
+  if (outcome.outcome === "missing") {
+    // Upstream's findActionsVariable misses are ctx.NotFound(nil) — a
+    // genuine 404, not a flash (the module handoff's fidelity call).
+    return p.respond(c.html(renderNotFound(p.ctx), 404));
+  }
+  const data = await loadUserSettingsVariablesPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsVariablesPage(p.ctx, data, outcome.message)));
+}
+
+async function userSettingsVariablesDelete(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const outcome = await deleteUserSettingsVariable(c.env.DB, p.viewer.id, id);
+  if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/variables" } }));
+}
+
+async function userSettingsHooksPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsHooksPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsHooksPage({ ctx: p.ctx, data, error: null })));
+}
+
+async function userSettingsHooksCreate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseCreateHookForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await createUserHookFromForm(c.env.DB, p.viewer.id, form);
+  if (outcome.outcome === "created") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/hooks" } }));
+  }
+  const data = await loadUserSettingsHooksPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsHooksPage({ ctx: p.ctx, data, error: outcome.message })));
+}
+
+async function userHookDetailPage(c: Context<{ Bindings: Env }>, hookId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserHookDetailData(c.env.DB, p.viewer.id, hookId);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserHookDetailPage({ ctx: p.ctx, data, error: null })));
+}
+
+async function userHookDetailSubmit(c: Context<{ Bindings: Env }>, hookId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const data = await loadUserHookDetailData(c.env.DB, p.viewer.id, hookId);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const form = parseHookEditForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await editUserHookFromForm(c.env.DB, data.hook, form);
+  if (outcome.outcome === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: `/user/settings/hooks/${hookId}` } }));
+  }
+  return p.respond(c.html(renderUserHookDetailPage({ ctx: p.ctx, data, error: outcome.message })));
+}
+
+async function userHookDelete(c: Context<{ Bindings: Env }>, hookId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const deleted = await deleteUserHook(c.env.DB, p.viewer.id, hookId);
+  if (!deleted) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/hooks" } }));
+}
+
+async function userSettingsKeysPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const owner = await loadUserSettingsKeysOwner(c.env.DB, p.viewer.id);
+  if (owner === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const data = await loadUserSettingsKeysPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsKeysPage(p.ctx, data)));
+}
+
+async function userSettingsKeysSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const owner = await loadUserSettingsKeysOwner(c.env.DB, p.viewer.id);
+  if (owner === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const form = parseUserSettingsKeysForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = form.type === "gpg"
+    ? await addGpgKeyFromForm(c.env.DB, owner, form)
+    : await addSshKeyFromForm(c.env.DB, owner, form);
+  const data = await loadUserSettingsKeysPageData(c.env.DB, p.viewer.id);
+  if (outcome.outcome === "created") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/keys" } }));
+  }
+  return p.respond(c.html(renderUserSettingsKeysPage(p.ctx, data, { kind: outcome.kind, message: outcome.message, field: outcome.field })));
+}
+
+async function userSettingsKeysDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsKeysDeleteForm(await readUrlEncodedForm(c.req.raw));
+  if (form.type === "gpg") {
+    await deleteGpgKey(c.env.DB, p.viewer.id, form.id ?? 0);
+  } else {
+    await deleteSshKey(c.env.DB, p.viewer.id, form.id ?? 0);
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/keys" } }));
+}
+
+async function userSettingsApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsApplicationsPageData(c.env.DB, p.viewer.id, p.viewer.isAdmin);
+  return p.respond(c.html(renderUserSettingsApplicationsPage(p.ctx, data)));
+}
+
+async function userSettingsApplicationsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsApplicationsForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await createTokenFromForm(c.env.DB, p.viewer.id, form);
+  const data = await loadUserSettingsApplicationsPageData(c.env.DB, p.viewer.id, p.viewer.isAdmin);
+  if (outcome.outcome === "created") {
+    // The one-shot plaintext banner: a full-page re-render carrying the
+    // value exactly once (the no-fetch-action analog; no 303 — upstream's
+    // flash would drop the token).
+    data.newToken = outcome.plaintext;
+    return p.respond(c.html(renderUserSettingsApplicationsPage(p.ctx, data)));
+  }
+  return p.respond(c.html(renderUserSettingsApplicationsPage(p.ctx, data, outcome.message)));
+}
+
+async function userSettingsApplicationsDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsApplicationsDeleteForm(await readUrlEncodedForm(c.req.raw));
+  await revokeTokenFromForm(c.env.DB, p.viewer.id, form.id ?? 0);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
+}
+
+async function userSettingsOrganizationsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserOrgsSettings(c.env.DB, p.viewer.id, p.url.searchParams);
+  const error = p.url.searchParams.get("error") === "last-owner" ? "last-owner" : null;
+  return p.respond(c.html(renderUserOrgsSettingsPage(p.ctx, data, { error })));
+}
+
+async function userSettingsOrganizationsLeave(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserOrgsLeaveForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyUserOrgsLeave(c.env.DB, p.viewer.id, form);
+  const location =
+    outcome.outcome === "left"
+      ? "/"
+      : outcome.outcome === "last-owner"
+        ? "/user/settings/organization?error=last-owner"
+        : "/user/settings/organization";
+  return p.respond(new Response(null, { status: 303, headers: { location } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -7302,6 +7728,32 @@ uiRouter.get("/notifications/purge", () => methodNotAllowed("POST"));
 // not needed here: /user/settings POST carries the literal GET above, and
 // the teams POSTs hang off the /new literal's own GET+POST pair.
 uiRouter.get("/user/settings", (c) => userSettingsPage(c));
+// Window-2a: the tab families (each parse family's method arms — the
+// modules' handoff recipes).
+uiRouter.get("/user/settings/appearance", (c) => userSettingsAppearancePage(c));
+uiRouter.post("/user/settings/appearance/theme", (c) => userSettingsAppearanceSubmit(c, "theme"));
+uiRouter.post("/user/settings/appearance/language", (c) => userSettingsAppearanceSubmit(c, "language"));
+uiRouter.get("/user/settings/security", (c) => userSettingsSecurityPage(c));
+uiRouter.get("/user/settings/actions/secrets", (c) => userSettingsSecretsPage(c));
+uiRouter.post("/user/settings/actions/secrets", (c) => userSettingsSecretsSubmit(c));
+uiRouter.post("/user/settings/actions/secrets/delete", (c) => userSettingsSecretsDelete(c));
+uiRouter.get("/user/settings/actions/variables", (c) => userSettingsVariablesPage(c));
+uiRouter.post("/user/settings/actions/variables/new", (c) => userSettingsVariablesNew(c));
+uiRouter.post("/user/settings/actions/variables/:id/edit", (c) => userSettingsVariablesEdit(c, Number(c.req.param("id"))));
+uiRouter.post("/user/settings/actions/variables/:id/delete", (c) => userSettingsVariablesDelete(c, Number(c.req.param("id"))));
+uiRouter.get("/user/settings/hooks", (c) => userSettingsHooksPage(c));
+uiRouter.post("/user/settings/hooks", (c) => userSettingsHooksCreate(c));
+uiRouter.get("/user/settings/hooks/:id", (c) => userHookDetailPage(c, Number(c.req.param("id"))));
+uiRouter.post("/user/settings/hooks/:id", (c) => userHookDetailSubmit(c, Number(c.req.param("id"))));
+uiRouter.post("/user/settings/hooks/:id/delete", (c) => userHookDelete(c, Number(c.req.param("id"))));
+uiRouter.get("/user/settings/keys", (c) => userSettingsKeysPage(c));
+uiRouter.post("/user/settings/keys", (c) => userSettingsKeysSubmit(c));
+uiRouter.post("/user/settings/keys/delete", (c) => userSettingsKeysDelete(c));
+uiRouter.get("/user/settings/applications", (c) => userSettingsApplicationsPage(c));
+uiRouter.post("/user/settings/applications", (c) => userSettingsApplicationsSubmit(c));
+uiRouter.post("/user/settings/applications/delete", (c) => userSettingsApplicationsDelete(c));
+uiRouter.get("/user/settings/organization", (c) => userSettingsOrganizationsPage(c));
+uiRouter.post("/user/settings/organization/leave", (c) => userSettingsOrganizationsLeave(c));
 uiRouter.post("/user/settings", (c) => userSettingsSubmit(c));
 // Wave-19 creation pages (parseUiRoute claims exactly these literal shapes —
 // upstream's reqSignIn /repo/create + /org/create groups; registered with
