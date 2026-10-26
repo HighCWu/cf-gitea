@@ -93,7 +93,10 @@ scripts/               # Repo-level tooling (contract checks, codegen)
 - Never commit while a unit's agent is mid-flight (moving target); the landing
   review is the commit point. **Pre-commit checklist (hard-learned):** (1) see
   the actual `Tests ` line for the affected scope with your own eyes — never
-  pattern-match or trust the agent's claim; (2) `git status` the whole tree and
+  pattern-match or trust the agent's claim — and NEVER pipe the suite through
+  grep in the same `&&` chain as the commit (the pipe's exit code masks
+  vitest's failure; observed 2026-10-26: a 10-failed run committed under a
+  "35/35" message); (2) `git status` the whole tree and
   diff every path your change touched — `git add` by directory silently misses
   sibling paths (two escaped commits this session); (3) after ANY concurrent
   edit window, re-verify your own change landed (grep/json.load) before
