@@ -726,6 +726,13 @@ function MirrorSettingsPage(props: { ctx: UiContext; data: MirrorSettingsData; e
                 <p>{mirrorLocale.not_a_mirror}</p>
                 <p class="tw-text-placeholder-text">{mirrorLocale.not_a_mirror_attach}</p>
               </div>
+            ) : repo.isArchived ? (
+              // options.tmpl:66-69 — an ARCHIVED mirror renders the warning
+              // message ONLY; the table + Synchronize Now form live in the
+              // {{else}} branch (the POST arm 404-shells archived repos —
+              // rendering them was a dead control; the settings-mirror
+              // matrix's RED).
+              <p></p>
             ) : (
               <>
                 {/* options.tmpl's pull-mirror table row (the working-mirror
