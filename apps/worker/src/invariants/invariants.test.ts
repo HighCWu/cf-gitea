@@ -34,7 +34,10 @@
  *   - deleting pack2 ⇒ tree-missing at C1's tree2 (tree/blob reads are cold)
  *   Tip-level faults (ref-tip-missing on a pushed tip) stay masked by the
  *   object cache — that classification is covered by a stubbed-RPC unit test
- *   below, and the real-world bound is documented in check.ts.
+ *   below, and the real-world bound is documented in check.ts. The same mask
+ *   applies to ANY object a push settle leg reads: default-branch settle legs
+ *   (license sync) inflate the default branch's tree at push time, so
+ *   evictRepo points D1's defaultBranch at the root push (see there).
  */
 
 import { SELF, env } from "cloudflare:test";
@@ -201,7 +204,16 @@ interface EvictRepo {
  *  non-tip content (never-advertised ancestor A, trees, blobs) read through
  *  to R2 and fail. Every push is a CREATE (old = ZERO_OID). */
 async function evictRepo(slug: string): Promise<EvictRepo> {
-  const { storageKey, token } = await createRepo(slug);
+  const { storageKey, token, repoId } = await createRepo(slug);
+  // Keep the default-branch settle legs (the license sync rides the engine's
+  // onPush seam, services/webhooks-push.ts) off this fixture's deletion
+  // target: the leg reads the DEFAULT branch's tip tree after every push, and
+  // a main-push scan would inflate tree2 into the DO's GitStore-lifetime
+  // object cache — masking the injected tree-missing forever after (the
+  // chunk-LRU eviction below never touches the object cache). Point D1's
+  // default branch at the root push instead (packR — never a deletion
+  // target, and license-file-free so the leg reads no blobs).
+  await drizzle(env.DB).update(repositories).set({ defaultBranch: "root" }).where(eq(repositories.id, repoId));
   const target = { engineName: `alice/${slug}`, storageKey };
   const stub = env.REPO.getByName(target.engineName);
   let before = new Set<string>();
