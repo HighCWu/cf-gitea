@@ -118,6 +118,24 @@ export async function unwatchRepo(d1: D1Database, repoId: string, userId: number
   ]);
 }
 
+/**
+ * `ClearRepoWatches` (models/repo/watch.go:327-333) — the private-flip
+ * zeroing (repository.go:179-181: "watchers who lost access must not keep
+ * watching the now-private repo"). Upstream's body is exactly two statements
+ * and adjusts NO user counter (unlike the star port in services/stars.ts —
+ * star.go:96-98 decrements each stargazer, while the users table carries no
+ * watch tally): the repo counter is plain-zeroed (watch.go:329-331, `UPDATE
+ * repository SET num_watches = 0`, no timestamp touch) and every watch edge
+ * is deleted (watch.go:333, `db.DeleteBeans(ctx, Watch{RepoID: repoID})`).
+ */
+export async function clearRepoWatches(d1: D1Database, repoId: string): Promise<void> {
+  const db = drizzle(d1);
+  await db.batch([
+    db.update(repositories).set({ numWatches: 0 }).where(eq(repositories.id, repoId)),
+    db.delete(repoWatchers).where(eq(repoWatchers.repoId, repoId)),
+  ]);
+}
+
 /** Watcher EDGE count (a live COUNT over `repo_watchers` — the drift probe
  *  next to the maintained `repositories.num_watches` column, which is what
  *  `Repository.watchers_count` renders). */

@@ -1,4 +1,4 @@
-import { and, eq, or, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, stars, users } from "../../db/schema";
@@ -21,8 +21,8 @@ import type { RepositoryWithOwner } from "./repository";
  * Counters (migration 0030's `repositories.num_stars` + 0031's
  * `users.num_stars` — the star.go:45/48/59/62 quartet): both tallies move in
  * the SAME batch as the edge write below, mirroring upstream's single WithTx.
- * Residual gap: upstream's ClearRepoStars zeroing (star.go:94–104, repo set
- * private) is the repos wave's seam.
+ * Upstream's ClearRepoStars zeroing (star.go:94–104, repo set private) lives
+ * below as clearRepoStars.
  */
 
 export interface StarListOptions {
@@ -49,9 +49,8 @@ export async function isStarring(d1: D1Database, userId: number, repoId: string)
  * `StarRepo(…, true)` (star.go:29–69) reduced to the modeled surface: the
  * already-starring arm is the upstream silent no-op (nil → the API's 204),
  * the insert is one guarded row — the `stars_user_repo_uq` pair is the
- * idempotence arbiter (ON CONFLICT DO NOTHING). Remaining documented
- * divergence: the `ClearRepoStars` zeroing (star.go:94–104, repo set
- * private) is the repos wave's seam.
+ * idempotence arbiter (ON CONFLICT DO NOTHING). The set-private ClearRepoStars
+ * zeroing (star.go:94–104) is clearRepoStars below.
  *
  * Counter maintenance (the migration-0030 `repositories.num_stars` + 0031
  * `users.num_stars` columns): upstream moves BOTH counters and the edge
@@ -134,6 +133,42 @@ export async function unstarRepo(d1: D1Database, userId: number, repoId: string)
 }
 
 /**
+ * `ClearRepoStars` (models/repo/star.go:94-104) — the private-flip zeroing.
+ * Upstream calls it from setRepoVisibility's `if private` arm (services/
+ * repository/repository.go:176-178: "If repo has become private, we need to
+ * ... clear stars and watches"; the same pair arms UpdateRepository at
+ * :295-300 and org.go:130-133). Ported statement-for-statement, one D1 batch
+ * (= one implicit SQLite transaction) keeping rows + counters indivisible
+ * the way the starRepo/unstarRepo batches above do:
+ *   1. every starring user loses one `num_stars` (star.go:96-98, the
+ *      `UPDATE user SET num_stars=num_stars-1 WHERE id IN (SELECT uid FROM
+ *      star WHERE repo_id = ?)`) — the unique (uid, repo_id) pair makes it
+ *      exactly one decrement per removed edge; the MAX(…, 0) floor is the
+ *      same pre-backfill drift insurance as unstarRepo's, not new semantics;
+ *   2. the repo counter is PLAIN-ZEROED, not decremented (star.go:100-102,
+ *      `UPDATE repository SET num_stars = 0`), and the raw UPDATE touches no
+ *      timestamp — so neither does this one;
+ *   3. every star edge is deleted (star.go:104, `db.DeleteBeans(ctx,
+ *      Star{RepoID: repoID})`).
+ */
+export async function clearRepoStars(d1: D1Database, repoId: string): Promise<void> {
+  const db = drizzle(d1);
+  await db.batch([
+    db
+      .update(users)
+      .set({ numStars: sql`MAX(num_stars - 1, 0)` })
+      .where(
+        inArray(
+          users.id,
+          db.select({ uid: stars.userId }).from(stars).where(eq(stars.repoId, repoId)),
+        ),
+      ),
+    db.update(repositories).set({ numStars: 0 }).where(eq(repositories.id, repoId)),
+    db.delete(stars).where(eq(stars.repoId, repoId)),
+  ]);
+}
+
+/**
  * `GetStarredRepos` (models/repo/user_repo.go:34–66) for the doer-self list:
  * stars ⨝ repositories, upstream's `` `repository`.id `` ordering (our text id
  * sorts numerically via CAST — the listUserRepositories convention), with the
@@ -147,11 +182,11 @@ export async function unstarRepo(d1: D1Database, userId: number, repoId: string)
  * `ctx.Doer.NumStars` — the RAW counter (star.go:85-86/117-118; now modeled
  * as users.num_stars, migration 0031), so upstream's total can exceed the
  * listed page after an access revocation. The filtered count stays the total
- * here — with the column landed the raw counter would be available, but it
- * drifts above the edge count wherever a cascade arm hasn't landed (repo
- * delete's per-stargazer decrement, delete.go:133 — reported to the repos
- * owner), and the filtered number is the honest page arithmetic
- * (documented divergence, observable only in the revoked-access edge).
+ * here — with the column landed the raw counter is available (and the repo
+ * delete's per-stargazer decrement, delete.go:133, now lands in the same
+ * batch as the edges' delete), but the filtered number is still the honest
+ * page arithmetic (documented divergence, observable only in the
+ * revoked-access edge).
  */
 export async function listStarredRepositories(
   d1: D1Database,

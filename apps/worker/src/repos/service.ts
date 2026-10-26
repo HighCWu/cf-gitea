@@ -593,6 +593,47 @@ export class RepoService {
       this.db.delete(repoWatchers).where(eq(repoWatchers.repoId, repoId)),
       this.db.delete(repoCollaborators).where(eq(repoCollaborators.repoId, repoId)),
       this.db.delete(repoSettings).where(eq(repoSettings.repoId, repoId)),
+      // Delete-cascade counter arms (the counters-2 fold; upstream
+      // services/repository/delete.go), update-before-delete so each count
+      // subquery sees the rows its charge is computed from:
+      //   - :224-228 — a deleted fork decrements its parent's tally
+      //     (`UPDATE repository SET num_forks=num_forks-1 WHERE id=?`,
+      //     repo.ForkID); the MAX(…, 0) floor is the landed drift insurance
+      //     (same posture as the ±1 arms in services/stars.ts).
+      ...(repo.forkParent !== null
+        ? [
+            this.db
+              .update(repositories)
+              .set({ numForks: sql`MAX(num_forks - 1, 0)` })
+              .where(eq(repositories.id, repo.forkParent)),
+          ]
+        : []),
+      //   - :133 — every starrer's user tally drops with their edge
+      //     (`UPDATE user SET num_stars=num_stars-1 WHERE id IN (SELECT uid
+      //     FROM star WHERE repo_id = ?)`); the port subtracts each starrer's
+      //     own edge count on this repo (the unique pair makes it one —
+      //     blocks.ts's dropUserStarsFor posture), floored at 0 like every
+      //     other decrement arm.
+      this.db
+        .update(users)
+        .set({
+          numStars: sql`MAX(num_stars - (
+            SELECT COUNT(*) FROM stars
+            WHERE stars.user_id = users.id AND stars.repo_id = ${repoId}
+          ), 0)`,
+        })
+        .where(
+          inArray(
+            users.id,
+            this.db.select({ uid: stars.userId }).from(stars).where(eq(stars.repoId, repoId)),
+          ),
+        ),
+      //   - :282-285 — surviving forks keep no dangling edge: upstream resets
+      //     `fork_id=0,is_fork=false WHERE fork_id=?`; our column shape is the
+      //     single nullable fork_parent (no is_fork column), so the reset is
+      //     fork_parent = NULL. Upstream's `repo.NumForks > 0` gate is
+      //     subsumed by the WHERE (zero matching children = a no-op).
+      this.db.update(repositories).set({ forkParent: null }).where(eq(repositories.forkParent, repoId)),
       this.db.delete(stars).where(eq(stars.repoId, repoId)),
       // Team↔repo grants (migration 0015; SPEC-0007 §3.5) — `repo_id` is a
       // plain column there (no declared FK), so the rows die HERE with the

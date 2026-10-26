@@ -3,10 +3,10 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
-import { eq, inArray, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories, repoWatchers, stars, users } from "../../db/schema";
+import { repositories } from "../../db/schema";
 import {
   OwnerNotAssignableError,
   RepoNameCollisionError,
@@ -29,7 +29,8 @@ import { requireRepoAdmin, requireRepoDangerZone, requireVisibleRepo } from "../
 import { deleteRepoCollaborators } from "../services/repo-collaborators";
 import { deleteRepoSettings, loadRepoSettings, saveRepoSettings, type RepoSettings } from "../services/repo-settings";
 import { deleteRepoTopics } from "../services/repo-topics";
-import { deleteRepoWatchers } from "../services/repo-watchers";
+import { clearRepoWatches, deleteRepoWatchers } from "../services/repo-watchers";
+import { clearRepoStars } from "../services/stars";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { syncRepoLicensesForDefaultBranch } from "../../services/repo-licenses";
 import { engineCell } from "../services/engine";
@@ -62,8 +63,8 @@ import {
  * repoEdit applies the meaningful EditRepoOption subset (the model file
  * documents the accepted-and-ignored remainder): rename via the landed
  * repos service, visibility flip (with upstream's private-flip star/watch
- * zeroing — clearRepoStarsOnPrivate/clearRepoWatchesOnPrivate below),
- * default branch (D1 + best-effort engine
+ * zeroing — services/stars.ts clearRepoStars + services/repo-watchers.ts
+ * clearRepoWatches), default branch (D1 + best-effort engine
  * setHead), archived flip, the template flag (D1-only — upstream
  * updateBasicProperties repo.go:699-701), and the stored settings subset;
  * upstream registers
@@ -78,65 +79,11 @@ import {
  */
 
 /**
- * `ClearRepoStars` (models/repo/star.go:94-104) — the private-flip zeroing.
- * Upstream calls it from setRepoVisibility's `if private` arm (services/
- * repository/repository.go:176-178: "If repo has become private, we need to
- * ... clear stars and watches"; the same pair arms UpdateRepository at
- * :295-300 and org.go:130-133). Ported statement-for-statement, one D1 batch
- * (= one implicit SQLite transaction) keeping rows + counters indivisible
- * the way services/stars.ts's starRepo/unstarRepo batches do:
- *   1. every starring user loses one `num_stars` (star.go:96-98, the
- *      `UPDATE user SET num_stars=num_stars-1 WHERE id IN (SELECT uid FROM
- *      star WHERE repo_id = ?)`) — the unique (uid, repo_id) pair makes it
- *      exactly one decrement per removed edge; the MAX(…, 0) floor is the
- *      same pre-backfill drift insurance as unstarRepo's, not new semantics;
- *   2. the repo counter is PLAIN-ZEROED, not decremented (star.go:100-102,
- *      `UPDATE repository SET num_stars = 0`), and the raw UPDATE touches no
- *      timestamp — so neither does this one;
- *   3. every star edge is deleted (star.go:104, `db.DeleteBeans(ctx,
- *      Star{RepoID: repoID})`).
- *
- * Consolidation line: this lives in the route file because services/stars.ts
- * carries a sibling wave's uncommitted hunks (exclusive-ownership rule); once
- * that lands, fold it beside starRepo/unstarRepo as `clearRepoStars` and have
- * this call site import it.
+ * `ClearRepoStars` (models/repo/star.go:94-104) and `ClearRepoWatches`
+ * (models/repo/watch.go:327-333) — the private-flip zeroing — live beside
+ * their edge writers as services/stars.ts clearRepoStars and services/
+ * repo-watchers.ts clearRepoWatches; the `if private` arm below calls them.
  */
-async function clearRepoStarsOnPrivate(d1: D1Database, repoId: string): Promise<void> {
-  const db = drizzle(d1);
-  await db.batch([
-    db
-      .update(users)
-      .set({ numStars: sql`MAX(num_stars - 1, 0)` })
-      .where(
-        inArray(
-          users.id,
-          db.select({ uid: stars.userId }).from(stars).where(eq(stars.repoId, repoId)),
-        ),
-      ),
-    db.update(repositories).set({ numStars: 0 }).where(eq(repositories.id, repoId)),
-    db.delete(stars).where(eq(stars.repoId, repoId)),
-  ]);
-}
-
-/**
- * `ClearRepoWatches` (models/repo/watch.go:327-333) — the private-flip
- * zeroing (repository.go:179-181: "watchers who lost access must not keep
- * watching the now-private repo"). Upstream's body is exactly two statements
- * and adjusts NO user counter (unlike the star port above — star.go:96-98
- * decrements each stargazer, while the users table carries no watch tally):
- * the repo counter is plain-zeroed (watch.go:329-331, `UPDATE repository SET
- * num_watches = 0`, no timestamp touch) and every watch edge is deleted
- * (watch.go:333, `db.DeleteBeans(ctx, Watch{RepoID: repoID})`). Same
- * consolidation line as clearRepoStarsOnPrivate: fold beside watchRepo/
- * unwatchRepo in services/repo-watchers.ts when the sibling wave lands.
- */
-async function clearRepoWatchesOnPrivate(d1: D1Database, repoId: string): Promise<void> {
-  const db = drizzle(d1);
-  await db.batch([
-    db.update(repositories).set({ numWatches: 0 }).where(eq(repositories.id, repoId)),
-    db.delete(repoWatchers).where(eq(repoWatchers.repoId, repoId)),
-  ]);
-}
 
 const notFoundResponse = {
   description: "notFound",
@@ -555,8 +502,8 @@ export function registerRepoRoutes(
       if (form.private !== undefined && form.private !== (found.repo.visibility === "private")) {
         await service.setVisibility(found.repo.id, form.private);
         if (form.private) {
-          await clearRepoStarsOnPrivate(c.env.DB, found.repo.id);
-          await clearRepoWatchesOnPrivate(c.env.DB, found.repo.id);
+          await clearRepoStars(c.env.DB, found.repo.id);
+          await clearRepoWatches(c.env.DB, found.repo.id);
         }
       }
 

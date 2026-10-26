@@ -25,8 +25,9 @@ import {
 import { carryRepoCell } from "./carry";
 import { purgeRepoMessage, tombstoneRepoDO } from "./purge";
 import { settleCreatingRepo } from "../git-http/gate";
-import { protectedBranches, repoCounters, repoRedirects, repositories, repoTransfer, repoUnits, users } from "../db/schema";
+import { protectedBranches, repoCounters, repoRedirects, repositories, repoTransfer, repoUnits, stars, users } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
+import { starRepo } from "../api/services/stars";
 import { ZERO_OID, buildPack, buildReceivePackBody } from "./testing/git-pack";
 
 beforeAll(async () => {
@@ -34,7 +35,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["personal_access_tokens", "protected_branches", "repo_units", "repo_transfer", "repo_redirects", "repo_counters", "repositories"]) {
+  for (const table of ["personal_access_tokens", "protected_branches", "repo_units", "repo_transfer", "repo_redirects", "repo_counters", "stars", "repositories"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare("DELETE FROM users WHERE username_lower != 'assets'").run();
@@ -465,6 +466,89 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     const write = await SELF.fetch("https://example.com/alice/vanishing.git/info/refs?service=git-receive-pack");
     expect(write.status).toBe(401);
     expect(write.headers.get("www-authenticate")).toBe('Basic realm="Gitea"');
+  });
+});
+
+describe("delete-cascade counter arms (delete.go:133/:224-228/:282-285 — the counters-2 fold)", () => {
+  it("deleting a fork decrements the parent's num_forks (delete.go:224-228), floored at 0; a non-fork delete touches no parent", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const db = drizzle(env.DB);
+    const source = await createRepo({ id: alice.id, usernameLower: "alice" }, "fount");
+    // Two settled forks upstream of the delete (the fork settle's tallied
+    // parent — services/forks.ts:128's edge + the num_forks bump).
+    await db.update(repositories).set({ numForks: 2 }).where(eq(repositories.id, source.id));
+    const fork = await createRepo({ id: bob.id, usernameLower: "bob" }, "sprout");
+    await db.update(repositories).set({ forkParent: source.id }).where(eq(repositories.id, fork.id));
+    const forkCount = () =>
+      db
+        .select({ numForks: repositories.numForks })
+        .from(repositories)
+        .where(eq(repositories.id, source.id))
+        .get()
+        .then((row) => row?.numForks);
+    expect(await forkCount()).toBe(2);
+
+    await service().deleteRepository(fork.id);
+    // Upstream `num_forks=num_forks-1` (delete.go:224-228) — a DECREMENT,
+    // not a recount: the surviving second fork keeps its tally.
+    expect(await forkCount()).toBe(1);
+
+    // The arm is conditional on the deleted repo's own fork edge: deleting a
+    // non-fork moves nothing (upstream's `if repo.IsFork` guard).
+    const plain = await createRepo({ id: bob.id, usernameLower: "bob" }, "plain");
+    await service().deleteRepository(plain.id);
+    expect(await forkCount()).toBe(1);
+  });
+
+  it("deleting the source clears the surviving forks' fork_parent (delete.go:282-285 — fork_id=0,is_fork=false in our column shape)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const db = drizzle(env.DB);
+    const source = await createRepo({ id: alice.id, usernameLower: "alice" }, "origin");
+    const fork = await createRepo({ id: bob.id, usernameLower: "bob" }, "sprout");
+    await db.update(repositories).set({ forkParent: source.id }).where(eq(repositories.id, fork.id));
+
+    await service().deleteRepository(source.id);
+    // The child SURVIVES the source's delete — upstream only resets the edge
+    // (`fork_id=0,is_fork=false WHERE fork_id=?`; our single nullable
+    // fork_parent) — it does not cascade the fork row itself.
+    const survivor = await db
+      .select({ forkParent: repositories.forkParent })
+      .from(repositories)
+      .where(eq(repositories.id, fork.id))
+      .get();
+    expect(survivor?.forkParent).toBeNull();
+  });
+
+  it("every starrer's num_stars drops with the deleted repo's edges (delete.go:133), floored at 0", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const carol = await seedVerifiedUser({ username: "Carol" });
+    const db = drizzle(env.DB);
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "loved");
+    const other = await createRepo({ id: alice.id, usernameLower: "alice" }, "loved-too");
+    await starRepo(env.DB, bob.id, repo.id, new Date());
+    await starRepo(env.DB, bob.id, other.id, new Date());
+    await starRepo(env.DB, alice.id, repo.id, new Date());
+    await starRepo(env.DB, carol.id, repo.id, new Date());
+    // Pre-backfill drift shape: a counter at 0 beneath a surviving edge —
+    // the delete's decrement must FLOOR there, never go negative.
+    await db.update(users).set({ numStars: 0 }).where(eq(users.id, carol.id));
+    const numStarsOf = (id: number) =>
+      db.select({ numStars: users.numStars }).from(users).where(eq(users.id, id)).get().then((row) => row?.numStars);
+    expect(await numStarsOf(bob.id)).toBe(2);
+
+    await service().deleteRepository(repo.id);
+    // Exactly ONE of bob's two edges was charged (upstream's per-starrer
+    // `num_stars=num_stars-1`, delete.go:133) — alice's too — and carol's
+    // drifted 0 floors at 0.
+    expect(await numStarsOf(bob.id)).toBe(1);
+    expect(await numStarsOf(alice.id)).toBe(0);
+    expect(await numStarsOf(carol.id)).toBe(0);
+    // The surviving repo's edges and its starrers' tallies are untouched.
+    const left = await db.select({ userId: stars.userId, repoId: stars.repoId }).from(stars).all();
+    expect(left).toEqual([{ userId: bob.id, repoId: other.id }]);
   });
 });
 
