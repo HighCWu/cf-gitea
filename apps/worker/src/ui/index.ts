@@ -514,6 +514,30 @@
  *                                          {results:[names]} feed, default
  *                                          branch hoisted, the tag-list-aux
  *                                          twin)
+ *   /:owner/:repo/releases/attachments/{uuid}
+ *   /:owner/:repo/releases/download/{vTag}/{fileName}
+ *                                          the releases download tail, GET
+ *                                          (pages/release-downloads.ts —
+ *                                          wave 41; the survey's top-5 #1,
+ *                                          upstream web.go:1513
+ *                                          repo.GetAttachment + web.go:1514
+ *                                          repo.RedirectDownload — the
+ *                                          streamed asset serve over the
+ *                                          landed release-assets data, the
+ *                                          ServeAttachment header matrix +
+ *                                          the `latest` alias; the module
+ *                                          doc carries the ledger)
+ *   /:owner/:repo/render/{branch|tag|commit}/*
+ *   /:owner/:repo/render/blob/{sha}        the rendered blob views, GET
+ *                                          (pages/render-files.ts — wave
+ *                                          41; the survey's row 3,
+ *                                          upstream web.go:1715-1719's
+ *                                          /render group — standalone-page
+ *                                          renders over the landed
+ *                                          markdown pipeline, the
+ *                                          "Unable to find renderer" 400
+ *                                          class elsewhere; the module doc
+ *                                          carries the divergences)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -580,7 +604,14 @@ import { parsePageNumber, pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
 import { sameOriginGuard } from "./session";
-import { blobRedirectResponse, treeRedirectResponse } from "./pages/repo-home";
+import { blobRedirectResponse, isFetchActionRequest, treeRedirectResponse } from "./pages/repo-home";
+import {
+  loadReleaseDownload,
+  openReleaseAttachment,
+  releaseAttachmentResponse,
+  type ReleaseAttachmentServe,
+} from "./pages/release-downloads";
+import { loadRenderFile, renderFileResponse, renderNotAvailableResponse, type RenderFileTarget } from "./pages/render-files";
 import {
   canWriteRepo,
   commitFileFromForm,
@@ -1084,6 +1115,44 @@ export interface ReleasesRoute {
    *  may bear slashes — refnames do) or after `/releases/edit/` (the edit
    *  family — the URL-keyed tag the loader resolves). */
   tag?: string;
+}
+
+/** The wave-41 releases download tail (pages/release-downloads.ts): upstream
+ *  web.go:1513's `m.Get("/releases/attachments/{uuid}",
+ *  repo.GetAttachment)` and web.go:1514's
+ *  `m.Get("/releases/download/{vTag}/{fileName}", repo.RedirectDownload)` —
+ *  the parity survey's top-5 #1, the serving half of the landed
+ *  release-assets data (the download pages' links answer here). Both are
+ *  binary serves, not pages; the routes sit in the releases group's gates
+ *  (MustBeNotEmpty + reqRepoReleaseReader — the hasReleases unit gate). */
+export interface ReleaseDownloadRoute {
+  family: "release-attachment" | "release-download";
+  owner: string;
+  repo: string;
+  /** The decoded uuid segment (the attachments family). */
+  uuid?: string;
+  /** The decoded {vTag}/{fileName} pair (the download family — chi's
+   *  single-segment params, so a literal slash in either 404s upstream). */
+  vTag?: string;
+  fileName?: string;
+}
+
+/** The wave-41 rendered blob views (pages/render-files.ts): upstream
+ *  web.go:1715-1719's `/render` group — the three typed ref sub-routes over
+ *  `repo.RenderFile` and the `/render/blob/{sha}` arm — the standalone-page
+ *  renders the official bundle's external-render iframe fetches. Not a page
+ *  family: the answer is a bare HTML fragment (or the "Unable to find
+ *  renderer" 400 class — the module doc carries the pipeline mapping). */
+export interface RenderFileRoute {
+  family: "render-file";
+  owner: string;
+  repo: string;
+  /** The typed-ref arms: the ref-type literal + the decoded ref+path suffix
+   *  (the /src family's shape). */
+  refType?: RefType;
+  refSuffix?: string;
+  /** The blob arm's decoded sha segment. */
+  sha?: string;
 }
 
 /** The wave-19 creation families (pages/repo-create.tsx + pages/
@@ -1616,7 +1685,9 @@ export type ParsedUiRoute =
   | CommitContainedRefsRoute
   | BlobRedirectRoute
   | TreeListAuxRoute
-  | BranchesListAuxRoute;
+  | BranchesListAuxRoute
+  | ReleaseDownloadRoute
+  | RenderFileRoute;
 
 
 /**
@@ -2107,9 +2178,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // `/releases/tag/v1.0/rc` links re-parse to the same route). Wave 33 (the
   // survey's top-5 #4) lifts the write group's `/edit/{tail}` (the same
   // wildcard decode — the URL-keyed tag) and `/delete` literals out of the
-  // unclaimed set (web.go:1519-1520 + 1523). The feed tails upstream
-  // registers (`.rss`/`.atom`) and the `/generate-notes` + `/attachments*`
-  // tails stay unclaimed → the engine's 404.
+  // unclaimed set (web.go:1519-1520 + 1523). Wave 41 lifts the group's two
+  // GET download routes out of the unclaimed set (web.go:1513-1514 — the
+  // download-tail families below). The feed tails upstream registers
+  // (`.rss`/`.atom`), the `/generate-notes` and the `/attachments`+
+  // `/attachments/remove` POST write tails stay unclaimed → the engine's 404.
   if (head === "releases") {
     if (rest.length === 0) return { family: "releases", owner, repo };
     if (rest.length === 1 && rest[0] === "new") return { family: "release-new", owner, repo };
@@ -2134,6 +2207,63 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
           owner,
           repo,
           tag: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
+        };
+      } catch {
+        return null;
+      }
+    }
+    // Wave-41 download tail (pages/release-downloads.ts — upstream
+    // web.go:1513-1514's two GETs, the parity survey's top-5 #1): the
+    // `/attachments/{uuid}` serve and the `/download/{vTag}/{fileName}`
+    // redirect arm. BOTH are chi SINGLE-segment params (no wildcard — a
+    // literal slash in the file name 404s upstream), so the claims are the
+    // exact 3- and 4-segment shapes and every deeper tail stays unclaimed →
+    // the engine's 404.
+    if (rest.length === 2 && rest[0] === "attachments") {
+      try {
+        return { family: "release-attachment", owner, repo, uuid: decodeURIComponent(rest[1] as string) };
+      } catch {
+        return null;
+      }
+    }
+    if (rest.length === 3 && rest[0] === "download") {
+      try {
+        return {
+          family: "release-download",
+          owner,
+          repo,
+          vTag: decodeURIComponent(rest[1] as string),
+          fileName: decodeURIComponent(rest[2] as string),
+        };
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+  // Wave-41 rendered blob views (pages/render-files.ts — upstream
+  // web.go:1715-1719's `/render` group, the survey's row 3): the three typed
+  // ref sub-routes are the /src family's shape (the decoded ref+path suffix
+  // over the SAME resolveRefSuffix universes, RepoRefByType's arms), the
+  // `/blob/{sha}` arm is the exact 2-segment shape. A bare `/render`, an
+  // unknown type literal, or deeper tails stay unclaimed → the engine's 404,
+  // exactly upstream's unregistered-route answer.
+  if (head === "render") {
+    if (rest.length === 2 && rest[0] === "blob") {
+      try {
+        return { family: "render-file", owner, repo, sha: decodeURIComponent(rest[1] as string) };
+      } catch {
+        return null;
+      }
+    }
+    if (rest.length >= 2 && (rest[0] === "branch" || rest[0] === "tag" || rest[0] === "commit")) {
+      try {
+        return {
+          family: "render-file",
+          owner,
+          repo,
+          refType: rest[0],
+          refSuffix: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
         };
       } catch {
         return null;
@@ -4365,6 +4495,79 @@ async function branchesListAuxJson(c: Context<{ Bindings: Env }>): Promise<Respo
   return respond(branchesListResponse(await loadBranchesListAux(c.env, repo)));
 }
 
+// ---------------------------------------------------------------------------
+// The wave-41 releases download tail (pages/release-downloads.ts — the
+// survey's top-5 #1: upstream web.go:1513 repo.GetAttachment + web.go:1514
+// repo.RedirectDownload over the landed release-assets data)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{owner}/{repo}/releases/attachments/{uuid} and GET
+ * /{owner}/{repo}/releases/download/{vTag}/{fileName}: the release-asset
+ * binary serves (not pages). Upstream's group gates (web.go:1505-1514):
+ * the §2.5 prologue answers the visibility arm, `releasesReadGate` the
+ * MustBeNotEmpty + reqRepoReleaseReader pair (a disabled releases unit is
+ * upstream CanRead(TypeReleases) false → 404), the module doc carries the
+ * ServeAttachment/RedirectDownload ledger; the 404 family answers the §4.5
+ * shell like every ui download.
+ */
+async function releaseDownloadTail(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, viewer, repo } = resolved;
+  if (route.family !== "release-attachment" && route.family !== "release-download") {
+    return respond(await c.notFound()); // registration/parser drift guard
+  }
+  if (!(await releasesReadGate(c.env.DB, repo))) return respond(c.html(renderNotFound(ctx), 404));
+  // The draft gate's write arm (attachment.go:295-311's perm.CanWrite
+  // (TypeReleases) — the same grant the releases pages render controls by).
+  const canWriteReleases = await canWriteRepo(c.env, repo, viewer);
+  let serve: ReleaseAttachmentServe;
+  if (route.family === "release-download") {
+    if (route.vTag === undefined || route.fileName === undefined) return respond(await c.notFound()); // drift guard
+    serve = await loadReleaseDownload(c.env.REPO_PACKS, c.env.DB, repo, route.vTag, route.fileName, { canWriteReleases });
+  } else {
+    if (route.uuid === undefined) return respond(await c.notFound()); // drift guard
+    serve = await openReleaseAttachment(c.env.REPO_PACKS, c.env.DB, repo, route.uuid, { canWriteReleases });
+  }
+  if (serve.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    releaseAttachmentResponse(serve, {
+      ifNoneMatch: c.req.header("if-none-match") ?? null,
+      ifModifiedSince: c.req.header("if-modified-since") ?? null,
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The wave-41 rendered blob views (pages/render-files.ts — the survey's
+// row 3: upstream web.go:1715-1719's /render group over repo.RenderFile)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{owner}/{repo}/render/{branch|tag|commit}/* and
+ * GET /{owner}/{repo}/render/blob/{sha}: the standalone-page renders the
+ * official bundle's external-render iframe fetches. The group's gates
+ * (web.go:1653-1762's closing args + the subgroup's MustBeNotEmpty): the §2.5
+ * prologue + the empty-repo 404 (the module doc carries the pipeline mapping
+ * and the 400/404 family ledger).
+ */
+async function renderFileView(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo, url } = resolved;
+  if (route.family !== "render-file") return respond(await c.notFound()); // drift guard
+  let target: RenderFileTarget;
+  if (route.sha !== undefined) target = { kind: "blob", sha: route.sha };
+  else if (route.refType !== undefined && route.refSuffix !== undefined) {
+    target = { kind: "ref", refType: route.refType, refSuffix: route.refSuffix };
+  } else return respond(await c.notFound()); // drift guard
+  const load = await loadRenderFile(c.env, repo, target, url.origin);
+  if (load.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  if (load.kind === "no-renderer") return respond(renderNotAvailableResponse());
+  return respond(renderFileResponse(load.html));
+}
+
 /** The wave-33 tag delete's refusal shape — ctx.HTTPError(409, …)'s
  *  plain-text form (release.go:677-680 → base.go:105-113, the archive
  *  family's established answer), stamped with the web middleware's
@@ -4786,23 +4989,27 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
 
   // Wave-2 dispatch (render.tsx never sees these families). The redirect
   // and the list page run AFTER the same §2.5 repo resolution as the
-  // slice-1 pages: unknown/private repos 404-shell, never redirect.
+  // slice-1 pages: unknown/private repos 404-shell, never redirect. Wave 41
+  // adds ctx.Redirect's fetch-action arm to BOTH siblings (base.go:153-156 —
+  // a non-empty X-Gitea-Fetch-Action header answers 200 {"redirect": …}
+  // instead of the 303).
   if (route.family === "tree") {
     // Bare /tree has no upstream route (chi needs the slash) → §4.5 shell.
     if (route.rawSuffix === "") return respond(c.html(renderNotFound(ctx), 404));
     // The target prefix is the RESOLVED row's canonical link (upstream
     // ctx.Repo.RepoLink); the suffix and query travel verbatim.
     const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
-    return respond(treeRedirectResponse(repoLink, route.rawSuffix, url.search));
+    return respond(treeRedirectResponse(repoLink, route.rawSuffix, url.search, isFetchActionRequest(c.req.raw)));
   }
   // Wave-39: the blob-redirect twin (upstream RedirectRepoBlobToCommit —
   // the redirect runs AFTER the repository resolves exactly like the tree
   // family: unknown/private repos 404-shell, never redirect; the bare
-  // /blob has no upstream route → §4.5 shell).
+  // /blob has no upstream route → §4.5 shell; the wave-41 fetch-action arm
+  // rides the same header check).
   if (route.family === "blob-redirect") {
     if (route.rawSuffix === "") return respond(c.html(renderNotFound(ctx), 404));
     const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
-    return respond(blobRedirectResponse(repoLink, route.rawSuffix, url.search));
+    return respond(blobRedirectResponse(repoLink, route.rawSuffix, url.search, isFetchActionRequest(c.req.raw)));
   }
   if (route.family === "issues" || route.family === "pulls") {
     const data = await loadIssuesListData(c.env.DB, repo.id, route.family, url.searchParams);
@@ -6150,3 +6357,21 @@ uiRouter.get("/:owner/-/projects/:id/workflows/:wid", (c) => ownerProjectWorkflo
 uiRouter.post("/:owner/-/projects/:id/workflows/:wid", (c) => ownerProjectWorkflowUpdateSubmit(c));
 uiRouter.post("/:owner/-/projects/:id/workflows/:wid/delete", (c) => ownerProjectWorkflowDeleteSubmit(c));
 uiRouter.get("/:owner/-/projects/:id/workflows/:wid/delete", () => methodNotAllowed("POST"));
+// Wave-41 releases download tail + rendered blob views (parseUiRoute claims
+// exactly these shapes — upstream web.go:1513's `/releases/attachments/{uuid}`
+// + web.go:1514's `/releases/download/{vTag}/{fileName}` (both chi
+// single-segment params, so the claims are the exact 3-/4-segment shapes) and
+// web.go:1715-1719's `/render` group (the three typed sub-routes are the /src
+// family's wildcard shape, the `/blob/{sha}` arm the exact 2-segment one);
+// the JSON/binary handlers run the resolveUiRequest prologue like every GET
+// page). No earlier registration can absorb these: the "download" and
+// "attachments" literals under /releases match shapes the wave-20 lines do
+// not carry (`/releases/tag/*` matches only the "tag" head), the "render"
+// head is a literal no registered pattern carries, and unclaimed shapes
+// never reach the sub-app — the dispatcher consults handlesUiRoute first.
+uiRouter.get("/:owner/:repo/releases/attachments/:uuid", (c) => releaseDownloadTail(c));
+uiRouter.get("/:owner/:repo/releases/download/:vtag/:filename", (c) => releaseDownloadTail(c));
+uiRouter.get("/:owner/:repo/render/branch/*", (c) => renderFileView(c));
+uiRouter.get("/:owner/:repo/render/tag/*", (c) => renderFileView(c));
+uiRouter.get("/:owner/:repo/render/commit/*", (c) => renderFileView(c));
+uiRouter.get("/:owner/:repo/render/blob/:sha", (c) => renderFileView(c));

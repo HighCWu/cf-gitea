@@ -48,11 +48,35 @@ export function treeRedirectTarget(repoLink: string, rawSuffix: string, search: 
   return `${repoLink}/src/${rawSuffix}${search}`;
 }
 
+/** The wave-41 fetch-action arm of ctx.Redirect — upstream
+ *  `IsGiteaFetchActionRequest` (modules/httplib/server_request.go:246-248):
+ *  a non-empty `X-Gitea-Fetch-Action` header. The official bundle's
+ *  fetch-action module tags its own form/fetch submissions so a REDIRECT
+ *  answer can travel as JSON the JS follows itself ("otherwise, the JS fetch
+ *  will follow the redirection and read a login page, embed it to the
+ *  current page, which is not expected" — base.go:154-156's comment). */
+export function isFetchActionRequest(request: Request): boolean {
+  return (request.headers.get("x-gitea-fetch-action") ?? "") !== "";
+}
+
+/** The fetch-action answer of ctx.Redirect (services/context/base.go:153-156):
+ *  200 `{"redirect": …}` through ctx.JSON's
+ *  `application/json;charset=utf-8` (base.go:115-122). */
+export function fetchActionRedirectResponse(location: string): Response {
+  return new Response(JSON.stringify({ redirect: location }), {
+    status: 200,
+    headers: { "content-type": "application/json;charset=utf-8" },
+  });
+}
+
 /** The 303 response for one resolved `/tree/...` route (upstream
- *  `RedirectRepoTreeToSrc`). `rawSuffix` is the request's own still-encoded
- *  path tail (never decoded, never re-escaped — the swap is textual, exactly
- *  upstream); `search` is `URL.search` ("?…" or ""). */
-export function treeRedirectResponse(repoLink: string, rawSuffix: string, search: string): Response {
+ *  `RedirectRepoTreeToSrc` via ctx.Redirect). `rawSuffix` is the request's
+ *  own still-encoded path tail (never decoded, never re-escaped — the swap
+ *  is textual, exactly upstream); `search` is `URL.search` ("?…" or "");
+ *  `fetchAction` selects the 200 JSON arm over the 303 (the shared
+ *  ctx.Redirect divergence below). */
+export function treeRedirectResponse(repoLink: string, rawSuffix: string, search: string, fetchAction: boolean): Response {
+  if (fetchAction) return fetchActionRedirectResponse(treeRedirectTarget(repoLink, rawSuffix, search));
   return new Response(null, {
     status: 303,
     headers: { location: treeRedirectTarget(repoLink, rawSuffix, search) },
@@ -71,13 +95,13 @@ export function blobRedirectTarget(repoLink: string, rawSuffix: string, search: 
 /** The 303 response for one resolved `/blob/...` route (upstream
  *  `RedirectRepoBlobToCommit`, web.go:1757 — the `treeRedirectResponse`
  *  sibling: raw suffix verbatim, ctx.Redirect's `http.StatusSeeOther`
- *  default, post-resolution). Shared ctx.Redirect divergence, documented for
- *  both siblings: upstream's fetch-action requests (a non-empty
+ *  default, post-resolution). Shared ctx.Redirect divergence, ported in
+ *  wave 41 for BOTH siblings: upstream's fetch-action requests (a non-empty
  *  `X-Gitea-Fetch-Action` header, `modules/httplib/server_request.go:246-248`)
- *  get a 200 `{"redirect": …}` JSON body instead of the 303 — the landed
- *  `/tree` port does not carry that arm either, and this port stays
- *  consistent with it (no landed consumer sends the header). */
-export function blobRedirectResponse(repoLink: string, rawSuffix: string, search: string): Response {
+ *  get a 200 `{"redirect": …}` JSON body instead of the 303
+ *  (services/context/base.go:153-156) — `fetchAction` selects the arm. */
+export function blobRedirectResponse(repoLink: string, rawSuffix: string, search: string, fetchAction: boolean): Response {
+  if (fetchAction) return fetchActionRedirectResponse(blobRedirectTarget(repoLink, rawSuffix, search));
   return new Response(null, {
     status: 303,
     headers: { location: blobRedirectTarget(repoLink, rawSuffix, search) },
