@@ -20,6 +20,11 @@ import { registerTagProtectionRoutes } from "./routes/tag-protections";
 import { registerWikiRoutes } from "./routes/wiki";
 import { registerGitHookRoutes } from "./routes/git-hooks";
 import { registerProjectsRepoRoutes } from "./routes/projects-repo";
+import { registerOAuth2AppRoutes } from "./routes/oauth2-apps";
+import { registerAdminBadgeRoutes } from "./routes/admin-badges";
+import { registerRepoLicenseRoutes } from "./routes/repo-licenses";
+import { registerGenerateRepoRoute } from "./routes/generate-repo";
+import { registerActivityFeedRoutes } from "./routes/activity-feeds";
 import { registerAdminT2Routes } from "./routes/admin-t2";
 import { registerArchiveRoutes } from "./routes/archive";
 import { registerBranchProtectionRoutes } from "./routes/branch-protections";
@@ -285,6 +290,16 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // org/user scopes over the same service). Reads ride optionalAuth where
   // the contract allows; writes reqToken.
   registerProjectsRepoRoutes(app, requireAuth, optionalAuth);
+  // Wave-23 long-tail: OAuth2 app CRUD (migration 0026; CRUD-only — the
+  // authorize/token flow is web-UI territory), admin badges + repo licenses
+  // + template generate (0027; license detection is glue-only until the
+  // detector wave populates), and the activity feeds over the action table
+  // (0028, specs/activity-feeds.md — 10 action types wired at the emitters).
+  registerOAuth2AppRoutes(app, requireAuth);
+  registerAdminBadgeRoutes(app, requireAuth);
+  registerRepoLicenseRoutes(app, optionalAuth);
+  registerGenerateRepoRoute(app, requireAuth);
+  registerActivityFeedRoutes(app, requireAuth, optionalAuth);
 
   return app;
 }
