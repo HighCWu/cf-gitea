@@ -162,7 +162,8 @@ async function seedRepo(id: string, ownerNamespace: string, slug: string): Promi
     ownerNamespace,
     slug,
     visibility: "public",
-    refsVersion: 0, // repoTestHook's early-204 (no commits) and empty:true stay deterministic
+    // repoTestHook's early-204 (no commits) and empty:true stay deterministic.
+    refsVersion: 0,
     backend: "self-hosted",
     numIssues: 3,
     numPulls: 1,
@@ -415,7 +416,9 @@ beforeAll(async () => {
   await applyRepoExtrasDdl();
 
   await seedRepo("9004", OWNER.toLowerCase(), "rel"); // releases: needs a non-empty repo
-  await drizzle(env.DB).update(repositories).set({ refsVersion: 1 }).where(eq(repositories.id, "9004"));
+  // The release create's empty-gate is is_empty (d24dc0f — refs_version is
+  // observability-only and never synced); seed both honestly.
+  await drizzle(env.DB).update(repositories).set({ refsVersion: 1, isEmpty: false }).where(eq(repositories.id, "9004"));
   await seedRepo("9005", OWNER.toLowerCase(), "compat-edit"); // repoEdit victim
   await seedRepo("9006", OWNER.toLowerCase(), "compat-transfer"); // repoTransfer victim
   await seedRepo("9007", OWNER.toLowerCase(), "compat-del"); // repoDelete victim
