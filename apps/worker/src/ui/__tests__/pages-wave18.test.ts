@@ -180,7 +180,10 @@ describe("wave-18 parser family (parseUiRoute / handlesUiRoute)", () => {
 
   it("leaves every other tail with the engine (upstream's unregistered-route 404)", () => {
     expect(parseUiRoute("/octo/hello/commit")).toBeNull(); // the bare literal
-    expect(parseUiRoute("/octo/hello/commit/5bde6b37197b62bf146fa01ac0bb3f0ee78aa3c0/load-branches-and-tags")).toBeNull();
+    // (wave 32 lifted the hex-shaped `/load-branches-and-tags` tail into the
+    // commit-contained-refs family — its contract lives in
+    // pages-wave32-archive-commit-aux.test.ts.)
+    expect(parseUiRoute("/octo/hello/commit/5bde6b37197b62bf146fa01ac0bb3f0ee78aa3c0/extra")).toBeNull();
     expect(parseUiRoute("/octo/hello/commit/abc1234/extra")).toBeNull();
   });
 });
@@ -255,8 +258,11 @@ describe("GET /{owner}/{repo}/commit/{sha} (the commit view)", () => {
       const res = await fetchUi(`/alice/wave18cv/commit/${sha}`);
       expect(res.status, sha).toBe(404);
     }
-    // The engine-owned deeper tails still miss out of the UI entirely.
-    const aux = await fetchUi(`/alice/wave18cv/commit/${tip}/load-branches-and-tags`);
+    // (wave 32 lifted the hex-shaped `/load-branches-and-tags` tail into the
+    // commit-contained-refs family — its 200 contract lives in
+    // pages-wave32-archive-commit-aux.test.ts; a NON-hex sha with the tail
+    // keeps the engine-owned miss below.)
+    const aux = await fetchUi("/alice/wave18cv/commit/nothex/load-branches-and-tags");
     expect(aux.status).toBe(404);
   });
 

@@ -39,6 +39,7 @@
  */
 
 import type { EngineReads } from "./engine";
+import { branchRef, refTipMap, tagRef } from "./engine";
 import { ApiError } from "../errors";
 
 /** One file to archive: full tree path + entry metadata (blob bytes stream later). */
@@ -69,6 +70,25 @@ export const MAX_ARCHIVE_FILES = 20_000;
 export const MAX_ARCHIVE_DIRS = 2_000;
 /** Streaming total-bytes cap — oversized archives truncate mid-stream. */
 export const MAX_ARCHIVE_TOTAL_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Strict ref resolution for the archive tail — branch, tag (peeled to the
+ * commit, like upstream GetCommit through an annotated tag), then a 40-hex
+ * oid. NO default-branch fallback: upstream GetCommit(refFromName) fails on
+ * an unresolvable name; the default branch is never implicit here. Null =
+ * the route's upstream `unrecognized repository reference` 404. Shared by
+ * the API route and the wave-32 web archive download (the routes/archive.ts
+ * private copy predates this export — a convergence TODO, not a second
+ * semantic).
+ */
+export function resolveArchiveRef(tips: ReturnType<typeof refTipMap>, ref: string): string | null {
+  const branch = tips.get(branchRef(ref));
+  if (branch !== undefined) return branch.target;
+  const tag = tips.get(tagRef(ref));
+  if (tag !== undefined) return tag.peeled ?? tag.target;
+  if (/^[0-9a-f]{40}$/.test(ref)) return ref;
+  return null;
+}
 
 /**
  * Bounded depth-first flatten of the ref's tree through per-level listTree

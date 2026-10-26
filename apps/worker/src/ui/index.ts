@@ -418,6 +418,38 @@
  *                                          prefixes 404 per the engine's
  *                                          full-oid rule, the commit-view
  *                                          divergence)
+ *   /:owner/:repo/archive[/*]              the archive download, GET
+ *                                          (pages/archive-files.ts — wave
+ *                                          32; the survey's row 1, upstream
+ *                                          web.go:1689 repo.Download over
+ *                                          services/repository/archiver —
+ *                                          the {ref}.{zip|tar.gz} tail
+ *                                          streams the landed
+ *                                          api/services/archive.ts builder;
+ *                                          octet-stream + nosniff, the
+ *                                          weak ETag/304 pair, the Nix
+ *                                          immutable Link header; unknown
+ *                                          suffix and the bundle refusal
+ *                                          answer upstream's 400 class, the
+ *                                          bare `/archive` tail included;
+ *                                          the POST half —
+ *                                          InitiateDownload, web.go:1690 —
+ *                                          stays engine-owned)
+ *   /:owner/:repo/commit/{sha}/load-branches-and-tags
+ *                                          the commit view's aux JSON, GET
+ *                                          (pages/commit-contained-refs.ts —
+ *                                          wave 32; the survey's row 3,
+ *                                          upstream web.go:1740
+ *                                          repo.LoadBranchesAndTags — the
+ *                                          ContainedLinks shape
+ *                                          {branches,tags,default_branch}
+ *                                          with per-ref {name,web_link}
+ *                                          over the engine's listRefs +
+ *                                          mergeBase containment walk (the
+ *                                          module doc carries the cost
+ *                                          posture); short/unresolvable
+ *                                          shas 404 — upstream's
+ *                                          ServerError 500 divergence)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -648,6 +680,16 @@ import { loadPullFilesData, renderPullFilesPage } from "./pages/pull-files";
 // .diff/.patch routes; the loaders + Response builder live in the module,
 // the handlers here beside their sibling dispatchers).
 import { diffPatchTextResponse, loadCommitDiffPatch, loadPullDiffPatch } from "./pages/diffpatch-files";
+// Wave-32 archive download + commit aux JSON (the survey's rows 1 + 3 —
+// the streamed {ref}.{zip|tar.gz} tail and the load-branches-and-tags
+// ContainedLinks feed; loaders + Response builders in the modules, the
+// handlers here beside their sibling dispatchers).
+import {
+  archiveBadFormatResponse,
+  loadRepoArchive,
+  repoArchiveResponse,
+} from "./pages/archive-files";
+import { containedRefsResponse, loadCommitContainedRefs } from "./pages/commit-contained-refs";
 import { loadPullCommitsData, renderPullCommitsPage } from "./pages/pull-commits";
 import { loadCommitViewData, renderCommitViewPage } from "./pages/commit-view";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
@@ -873,13 +915,12 @@ export interface BranchesRoute {
  *  branches-list / PR-commits ShortSha link. The EXACT single-segment tail
  *  claims for ANY segment value (the hex-shape gate is the loader's 404
  *  arm — a non-hex segment, including a non-hex `foo.diff` dotted form,
- *  answers the §4.5 shell like upstream's pattern-miss 404); every DEEPER
- *  tail (`/load-branches-and-tags`, junk) stays engine-owned (see the page
- *  module's divergence notes). The bare `/commit` URL is unclaimed too
- *  (upstream has no such route). Wave 29 lifted the HEX-shaped dotted
- *  segments (`{sha}.{diff|patch}` — upstream web.go:1760) into the
- *  DiffPatchRoute download family below; this arm keeps every other
- *  segment. */
+ *  answers the §4.5 shell like upstream's pattern-miss 404); the DEEPER
+ *  tails are lifted by their own families below (wave 29's dotted
+ *  `{sha}.{diff|patch}` downloads — web.go:1760 — and wave 32's
+ *  `{sha}/load-branches-and-tags` aux JSON — web.go:1740); junk stays
+ *  engine-owned (see the page module's divergence notes). The bare
+ *  `/commit` URL is unclaimed too (upstream has no such route). */
 export interface CommitViewRoute {
   family: "commit-view";
   owner: string;
@@ -1084,6 +1125,37 @@ export interface DiffPatchRoute {
   index?: number;
   /** The raw format the `.ext` suffix picked. */
   ext: "diff" | "patch";
+}
+
+/** The wave-32 archive download family (pages/archive-files.ts): upstream
+ *  web.go:1689's `m.Get("/*", repo.Download)` under the /archive group —
+ *  the wildcard tail is `REF.zip` | `REF.tar.gz` (`.bundle` parses upstream
+ *  as a third format; the builder refuses, the 400 class), multi-segment
+ *  ref names included, the BARE `/archive` claimed too (chi's `/*` matches
+ *  the empty tail; `SplitArchiveNameType("")` is the same 400 arm). The
+ *  response is a streamed FILE, not a page (the module doc carries the
+ *  header matrix); the POST half (InitiateDownload, web.go:1690) stays
+ *  engine-owned. */
+export interface RepoArchiveRoute {
+  family: "repo-archive";
+  owner: string;
+  repo: string;
+  /** The wildcard tail verbatim ("" for the bare URL): `REF.{zip|tar.gz}`. */
+  refExt: string;
+}
+
+/** The wave-32 commit aux-JSON family (pages/commit-contained-refs.ts):
+ *  upstream web.go:1740's
+ *  `{sha:([a-f0-9]{7,64})}/load-branches-and-tags` — the HEX-shaped sha
+ *  lifts out of wave-18's single-tail view claim (a non-hex sha with the
+ *  literal tail is upstream's pattern miss → engine-owned). The response is
+ *  JSON, not a page (the module doc carries the shape + cost posture). */
+export interface CommitContainedRefsRoute {
+  family: "commit-contained-refs";
+  owner: string;
+  repo: string;
+  /** The commit sha segment (hex-shaped 7..64, case-folded). */
+  sha: string;
 }
 
 
@@ -1304,7 +1376,9 @@ export type ParsedUiRoute =
   | MilestoneDetailRoute
   | MilestoneEditRoute
   | RepoForkRoute
-  | DiffPatchRoute;
+  | DiffPatchRoute
+  | RepoArchiveRoute
+  | CommitContainedRefsRoute;
 
 
 /**
@@ -1775,16 +1849,28 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // Wave-18 commit view (pages/commit-view.tsx — upstream web.go:1739): the
   // exact single-segment tail only, claimed for ANY segment value so a
   // non-hex sha 404-shells through the loader (the brief's rule) instead of
-  // reaching the engine. Deeper tails (the `.{patch|diff}` suffix family,
-  // `/load-branches-and-tags`, junk) stay engine-owned, and the bare
-  // `/commit` falls through to the engine's 404 — upstream's own shape.
+  // reaching the engine. Deeper tails are lifted by their own wave families
+  // (the `.{patch|diff}` downloads below, wave-32's `/load-branches-and-
+  // tags` aux JSON); junk stays engine-owned, and the bare `/commit` falls
+  // through to the engine's 404 — upstream's own shape.
   if (head === "commit") {
-    if (rest.length !== 1) return null;
+    if (rest.length !== 1 && rest.length !== 2) return null;
     let sha: string;
     try {
       sha = decodeURIComponent(rest[0] as string);
     } catch {
       return null;
+    }
+    // Wave-32 (the survey's row 3): the aux-JSON tail `/load-branches-and-
+    // tags` — upstream web.go:1740's
+    // `{sha:([a-f0-9]{7,64})}/load-branches-and-tags` route lifts the
+    // HEX-shaped 5-segment shape out of the view family (the case folding
+    // is the landed COMMIT_SHA convention; a non-hex sha with the literal
+    // tail is upstream's pattern miss → engine-owned; the loader re-gates
+    // the shape).
+    if (rest.length === 2) {
+      if (rest[1] !== "load-branches-and-tags" || !/^[0-9a-f]{7,64}$/i.test(sha)) return null;
+      return { family: "commit-contained-refs", owner, repo, sha };
     }
     // Wave-29 (the survey's row 4): the raw-text download tails
     // `{sha}.{diff|patch}` — upstream web.go:1760's
@@ -1804,6 +1890,24 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       };
     }
     return { family: "commit-view", owner, repo, sha };
+  }
+  // Wave-32 archive download (pages/archive-files.ts — upstream web.go:1689):
+  // the `/archive/*` wildcard claims every tail INCLUDING the bare URL (chi's
+  // `/*` matches the empty tail and `SplitArchiveNameType("")` is the route's
+  // 400 arm — the loader's bad-format answer). The tail is the DECODED
+  // `{ref}.{zip|tar.gz}` with slashes preserved (multi-segment ref names
+  // re-parse to the same route, the release-detail tag convention); the
+  // format/ref gates run at the loader. The POST half (InitiateDownload,
+  // web.go:1690) stays engine-owned — GET only, the survey's page-bearing
+  // rule.
+  if (head === "archive") {
+    let refExt: string;
+    try {
+      refExt = rest.map((segment) => decodeURIComponent(segment)).join("/");
+    } catch {
+      return null;
+    }
+    return { family: "repo-archive", owner, repo, refExt };
   }
   // Wave-8 file editor: the `new`/`edit`/`delete` literals claim the
   // branch+path tail shape (FileEditorRoute). Bare literals fall through to
@@ -3797,6 +3901,64 @@ async function diffpatchFileDownload(c: Context<{ Bindings: Env }>): Promise<Res
 }
 
 // ---------------------------------------------------------------------------
+// The wave-32 archive download family (pages/archive-files.ts — the survey's
+// row 1: upstream web.go:1689 repo.Download over
+// services/repository/archiver)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{owner}/{repo}/archive/{ref}.{zip|tar.gz}: the streamed archive
+ * download over the landed api/services/archive.ts builder (the API route's
+ * composition). Upstream answers the octet-stream + nosniff pair, the weak
+ * ETag/304 pair and the Nix immutable Link header (the module doc carries
+ * the matrix); the 400 class (unknown suffix, the bundle refusal — the bare
+ * `/archive` tail included) is http.Error's plain text, the 404 family
+ * (empty repo, unresolvable ref) the §4.5 shell like every ui download.
+ */
+async function archiveFileDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo, url } = resolved;
+  if (route.family !== "repo-archive") return respond(await c.notFound()); // registration/parser drift guard
+  const subPaths = (c.req.queries("path") ?? []).map((p) => p.replace(/^\/+|\/+$/g, "")).filter((p) => p !== "");
+  const download = await loadRepoArchive(c.env, repo, route.refExt, subPaths);
+  if (download.kind === "bad-format") return respond(archiveBadFormatResponse(download.message));
+  if (download.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    repoArchiveResponse(download, {
+      origin: url.origin,
+      owner: repo.ownerNamespace,
+      repo: repo.slug,
+      ifNoneMatch: c.req.header("if-none-match") ?? null,
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The wave-32 commit aux-JSON family (pages/commit-contained-refs.ts — the
+// survey's row 3: upstream web.go:1740 repo.LoadBranchesAndTags)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{owner}/{repo}/commit/{sha}/load-branches-and-tags: the
+ * ContainedLinks feed the official bundle's commit page fetches (the
+ * branch/tag switcher dropdowns). Upstream answers ctx.JSON's
+ * `application/json;charset=utf-8` with the middleware's zero-option prod
+ * Cache-Control (the module doc cites the shape + the containment cost
+ * posture); the 404 family (empty repo, wrong-shape/unresolvable sha — the
+ * ServerError-500 divergence) answers the §4.5 shell.
+ */
+async function commitContainedRefsJson(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "commit-contained-refs") return respond(await c.notFound()); // drift guard
+  const data = await loadCommitContainedRefs(c.env, repo, route.sha);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(containedRefsResponse(data));
+}
+
+// ---------------------------------------------------------------------------
 // The wave-20 releases family (pages/releases.tsx — upstream's web.go:1505-
 // 1527 group at the landed api/services/releases.ts + release-assets.ts
 // reads and the SPEC-0005 create arm)
@@ -4786,3 +4948,16 @@ uiRouter.get("/:owner/:repo/milestones/:id/edit", (c) => milestoneEditPage(c));
 uiRouter.post("/:owner/:repo/milestones/:id/edit", (c) => milestoneEditSubmit(c));
 uiRouter.get("/:owner/:repo/fork", (c) => repoForkPage(c));
 uiRouter.post("/:owner/:repo/fork", (c) => repoForkSubmit(c));
+// Wave-32 archive download + commit aux JSON (parseUiRoute claims exactly
+// these shapes — upstream web.go:1689's `/archive/*` wildcard, its bare URL
+// included (the empty-tail 400 arm), and web.go:1740's
+// `{sha}/load-branches-and-tags` 5-segment route). No earlier registration
+// can absorb these: the "archive"/"load-branches-and-tags" literals are
+// distinct tails no registered pattern carries, the 5-segment shape is
+// deeper than every /commit family (the 4-segment :sha line cannot match
+// it), and unclaimed shapes never reach the sub-app — the dispatcher
+// consults handlesUiRoute first. GET only: the archive POST half
+// (InitiateDownload) stays engine-owned.
+uiRouter.get("/:owner/:repo/archive/*", (c) => archiveFileDownload(c));
+uiRouter.get("/:owner/:repo/archive", (c) => archiveFileDownload(c));
+uiRouter.get("/:owner/:repo/commit/:lbsha/load-branches-and-tags", (c) => commitContainedRefsJson(c));

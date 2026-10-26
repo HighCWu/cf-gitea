@@ -59,7 +59,11 @@
  * - The `.{patch|diff}` suffix family (web.go:1760 RawDiff) is LANDED —
  *   wave-29's `diffpatch-files.ts` claims the dotted shape before this
  *   view's `:sha` arm (first-match wins), serving the raw text; the
- *   `/load-branches-and-tags` aux JSON (web.go:1740) stays unlanded.
+ *   `/load-branches-and-tags` aux JSON (web.go:1740) is LANDED too —
+ *   wave-32's `commit-contained-refs.ts` claims the hex-shaped 5-segment
+ *   shape (this page renders no switcher affordance for it: upstream's
+ *   `...` button + fetch island is a JS surface the no-JS reduction omits,
+ *   reported, not built).
  * - Commit statuses (CI) and the sign badge have no backing data model —
  *   the template's `commit_statuses` + `commit_sign_badge` slots render
  *   nothing (the commit-list precedent).
