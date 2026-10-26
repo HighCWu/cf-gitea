@@ -10,11 +10,15 @@
  * by a site admin), and the content-copy integration: a non-empty template
  * with git_content=true settles the generated repo ready-non-empty with the
  * template's refs adopted into its own cell (the shared fork machinery —
- * replicateRepoCopy), plus the REDEPLOY11 failure contract: a copy that
- * cannot converge (storage bytes gone) 500s WITHOUT stranding the created
- * row (upstream's cleanupRepository, template.go:102-108). The
- * `.gitea/template` variable substitution is out of slice
- * (api/services/generate-repo.ts module header) and has no test arm.
+ * replicateRepoCopy). The copy arms cover BOTH content classes the shared
+ * pass must move: packed (the push template) and LOOSE — the auto_init
+ * producer (REDEPLOY12's captured 500: `finalizeForkImport: object not
+ * imported: <tip> (refs/heads/main)` — Worker-authored objects live outside
+ * the pack catalog), plus the mixed shape. Also the REDEPLOY11 failure
+ * contract: a copy that cannot converge (storage bytes gone) 500s WITHOUT
+ * stranding the created row (upstream's cleanupRepository,
+ * template.go:102-108). The `.gitea/template` variable substitution is out of
+ * slice (api/services/generate-repo.ts module header) and has no test arm.
  */
 
 import { applyD1Migrations, SELF } from "cloudflare:test";
@@ -22,10 +26,16 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
 import { settleCreatingRepo } from "../../git-http/gate";
+import { replicateRepoCopy } from "../../repos/fork-task";
 import { RepoService } from "../../repos/service";
 import { buildPack, buildReceivePackBody } from "../../repos/testing/git-pack";
+import { users } from "../../db/schema";
+import { createUserRepository } from "../services/user-repos";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import type { ApiEnv } from "../env";
 import { giteaErrorHandler } from "../errors";
@@ -135,6 +145,36 @@ async function pushTemplateContent(owner: string, slug: string, branch: string):
   expect(settled?.status).toBe("ready");
   expect(settled?.isEmpty).toBe(false);
   return { oid, repoId: settled!.id };
+}
+
+/** The full `users` row behind a seeded identity (the auto-init producer's
+ *  git-signature fields ride it). */
+async function userRowOf(username: string) {
+  const row = await drizzle(env.DB)
+    .select()
+    .from(users)
+    .where(eq(users.usernameLower, username))
+    .limit(1)
+    .then((rows) => rows[0]);
+  if (row === undefined) throw new Error(`seeded user ${username} not found`);
+  return row;
+}
+
+/** Create a repo through the REAL `POST /user/repos` service arm — the
+ *  auto_init commit lands through putApiObjects + commitApiChange, i.e. as
+ *  LOOSE objects with zero pack-catalog rows (the production producer shape
+ *  behind REDEPLOY12's captured generate 500). */
+async function autoInitTemplate(owner: string, slug: string): Promise<{ commitOid: string; repoId: string }> {
+  const row = await createUserRepository(env.DB, env, await userRowOf(owner), { name: slug, auto_init: true }, new Date());
+  const cell = env.REPO.getByName(`${owner}/${slug}`);
+  const refs = await cell.listRefs();
+  expect(refs.refs.map((r) => r.name)).toEqual(["refs/heads/main"]);
+  const mainTip = refs.refs.find((r) => r.name === "refs/heads/main");
+  if (mainTip === undefined) throw new Error("auto-init main ref missing");
+  // the producer sanity: the tip is loose — the pack catalog serves nothing
+  const page = await cell.listCatalogPage("", 10);
+  expect(page.packs).toEqual([]);
+  return { commitOid: mainTip.target, repoId: row.id };
 }
 
 describe("generateRepo guards (upstream order)", () => {
@@ -341,5 +381,75 @@ describe("generateRepo content copy (the shared fork machinery)", () => {
     // The strand is gone: no 'creating' row survives a failed generate (and
     // the name is immediately reusable — a retry starts from a clean slate).
     expect(await service.getBySlug("alice", "copy-strand")).toBeNull();
+  });
+
+  // REDEPLOY12's captured producer (docs/design/p0-evidence.md, OPEN ISSUE 1):
+  // `POST /user/repos` with auto_init lands refs/heads/main as a LOOSE commit
+  // (putApiObjects + commitApiChange — zero pack-catalog rows). The shared
+  // copy pass used to replicate the pack catalog only, so finalize's
+  // store.has found no `02f68bc4ca0e…` and the generate 500ed (verbatim:
+  // `finalizeForkImport: object not imported: <tip> (refs/heads/main)`). The
+  // contract here: the copy must carry the loose class too — 201, the
+  // template's tip adopted into the generated cell, ready-non-empty.
+  it("copies an auto_init template (loose-object content, the REDEPLOY12 producer)", { timeout: 120_000 }, async () => {
+    await seedIdentities();
+    const { commitOid } = await autoInitTemplate("alice", "tpl-init");
+    await markTemplate("alice", "tpl-init");
+
+    const res = await router()(
+      "/api/v1/repos/alice/tpl-init/generate",
+      aliceAuth({ method: "POST", body: JSON.stringify({ name: "copy-init", git_content: true }) }),
+    );
+    expect(res.status).toBe(201);
+
+    const service = new RepoService(env.DB);
+    const row = await service.getBySlug("alice", "copy-init");
+    expect(row?.status).toBe("ready");
+    expect(row?.isEmpty).toBe(false);
+    const refs = await env.REPO.getByName("alice/copy-init").listRefs();
+    expect(refs.refs).toEqual([{ name: "refs/heads/main", target: commitOid }]);
+    // the tip RESOLVES in the generated cell (finalize's own store.has bar)
+    expect(await env.REPO.getByName("alice/copy-init").readCommit(commitOid)).not.toBeNull();
+  });
+
+  // Both classes in one copy: auto_init's loose main + a pushed (packed)
+  // branch. The loose walk must skip the packed closure and finalize must
+  // accept both tips.
+  it("copies a mixed template (loose main + pushed branch)", { timeout: 120_000 }, async () => {
+    await seedIdentities();
+    const { commitOid } = await autoInitTemplate("alice", "tpl-mixed");
+    const pushed = await pushTemplateContent("alice", "tpl-mixed", "feature");
+    await markTemplate("alice", "tpl-mixed");
+
+    const res = await router()(
+      "/api/v1/repos/alice/tpl-mixed/generate",
+      aliceAuth({ method: "POST", body: JSON.stringify({ name: "copy-mixed", git_content: true }) }),
+    );
+    expect(res.status).toBe(201);
+    const row = await new RepoService(env.DB).getBySlug("alice", "copy-mixed");
+    expect(row?.status).toBe("ready");
+    expect(row?.isEmpty).toBe(false);
+    const refs = await env.REPO.getByName("alice/copy-mixed").listRefs();
+    expect([...refs.refs].sort((a, b) => a.name.localeCompare(b.name))).toEqual([
+      { name: "refs/heads/feature", target: pushed.oid },
+      { name: "refs/heads/main", target: commitOid },
+    ]);
+    expect(await env.REPO.getByName("alice/copy-mixed").readCommit(commitOid)).not.toBeNull();
+  });
+
+  // The shared pass itself (the fork queue consumer rides the same function —
+  // src/repos/fork-task.ts handleForkMessage), driven at the service level on
+  // the loose producer: the fork of an auto_init repo must converge too.
+  it("replicateRepoCopy carries an auto_init source into a fork cell", { timeout: 120_000 }, async () => {
+    await seedIdentities();
+    const { commitOid } = await autoInitTemplate("alice", "tpl-forksrc");
+    const service = new RepoService(env.DB);
+    const fork = await service.create({ owner: { id: (await userIdOf("alice"))!, usernameLower: "alice" }, name: "fork-init", isPrivate: false });
+
+    await replicateRepoCopy(env, (await service.get((await service.getBySlug("alice", "tpl-forksrc"))!.id))!, fork);
+
+    const refs = await env.REPO.getByName("alice/fork-init").listRefs();
+    expect(refs.refs).toEqual([{ name: "refs/heads/main", target: commitOid }]);
+    expect(await env.REPO.getByName("alice/fork-init").readCommit(commitOid)).not.toBeNull();
   });
 });

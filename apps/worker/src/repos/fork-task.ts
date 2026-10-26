@@ -68,7 +68,14 @@ import { repositories } from "../db/schema";
 import { emitRepoEventInline, forkEventPayload } from "../services/repo-events";
 import { appOrigin } from "../services/webhooks-push";
 import { syncRepoSizeFromStorage } from "../services/repo-size";
+import { carryLooseObjects } from "./carry";
 import type { RepoRow } from "./service";
+import type {
+  ApiObject,
+  CatalogPage,
+  CommitJson,
+  TreeEntryJson,
+} from "@cf-gitea/git-engine";
 
 /** REPO_TASKS message of the fork family (the `{kind: "repo-fork", …}` shape
  *  the forks API enqueues right after minting the fork row). */
@@ -97,6 +104,18 @@ function isAlreadyFinalized(error: unknown): boolean {
     error instanceof Error &&
     error.message.startsWith("beginForkImport:") &&
     error.message.includes("fork target is not empty")
+  );
+}
+
+/** The finalize refusal that means the parent's ref tips include content the
+ *  pack catalog cannot carry — LOOSE objects (Worker-authored API content:
+ *  auto_init commits, API file writes — putApiObjects/commitApiChange land
+ *  them outside every pack). Verbatim producer of REDEPLOY12's generate 500:
+ *  `finalizeForkImport: object not imported: <oid> (<ref>)`. */
+function isLooseIncomplete(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.startsWith("finalizeForkImport: object not imported:")
   );
 }
 
@@ -164,6 +183,71 @@ export async function handleForkMessage(env: Env, msg: RepoForkMessage): Promise
 }
 
 /**
+ * The loose-class completion for a fork import whose pack-only finalize
+ * refused with "object not imported" (REDEPLOY12): re-reads the parent's
+ * refs, collects the oids the adopted pack rows already cover, walks the
+ * Worker-authored loose closure (carry.ts's exported rename-carry walk) into
+ * the fork cell via putApiObjects (ungated during an import), and finalizes
+ * the still-open import lease in place. No pack byte is copied twice — the
+ * failed finalize committed nothing and its staging survives.
+ *
+ * Annotated-tag tips whose tag OBJECT is loose are excluded with a loud log
+ * (carry.ts's documented corner — no raw-byte read RPC for tag objects);
+ * packed tag tips stay carried (the pack channel brings the bytes and
+ * finalize peels from them).
+ */
+async function completeLooseImport(
+  parent: {
+    listRefs(): Promise<{ head: string | null; refs: { name: string; target: string; peeled?: string }[] }>;
+    listCatalogPage(after: string, limit: number): Promise<CatalogPage>;
+    readCommit(id?: string): Promise<CommitJson | null>;
+    listTree(ref?: string, path?: string): Promise<{ oid: string; entries: TreeEntryJson[] } | null>;
+    readBlob(ref: string | undefined, path: string): Promise<{ oid: string; mode: string; data: Uint8Array } | null>;
+  },
+  fork: {
+    putApiObjects(objects: ApiObject[]): Promise<
+      { tag: "ok"; stored: number } | { tag: "invalid"; reason: string } | { tag: "too_large"; limitBytes: number }
+    >;
+    finalizeForkImport(input: {
+      refs: { name: string; oid: string }[];
+      head: string | null;
+    }): Promise<{ tag: "ok"; refsVersion: string } | { tag: "invalid"; reason: string }>;
+  },
+  label: string,
+): Promise<void> {
+  const refs = await parent.listRefs();
+  const packed = new Set<string>();
+  let cursor = "";
+  for (;;) {
+    const page = await parent.listCatalogPage(cursor, 8192);
+    for (const p of page.packs) for (const row of p.rows) packed.add(row.oid);
+    cursor = page.nextAfter;
+    if (!page.more) break;
+  }
+  const carried: { name: string; oid: string }[] = [];
+  const excluded: string[] = [];
+  for (const ref of refs.refs) {
+    if (!packed.has(ref.target) && ref.peeled !== undefined && ref.peeled !== ref.target) {
+      excluded.push(ref.name);
+      continue;
+    }
+    carried.push({ name: ref.name, oid: ref.target });
+  }
+  await carryLooseObjects(parent, fork, carried, packed, label);
+  // HEAD must name a carried ref (the engine validates); an excluded-tag HEAD
+  // falls back to null (the engine's unborn-HEAD convention, carry.ts:217).
+  const head = refs.head !== null && carried.some((r) => r.name === refs.head) ? refs.head : null;
+  const fin = await fork.finalizeForkImport({ refs: carried, head });
+  if (fin.tag === "invalid") throw new Error(`finalizeForkImport: ${fin.reason}`);
+  if (excluded.length > 0) {
+    console.error(
+      `[repo-tasks] fork copy ${label}: loose annotated-tag refs not carried ` +
+        `(no raw-byte read RPC): ${excluded.join(", ")}`,
+    );
+  }
+}
+
+/**
  * The engine's replication pass, shared by the fork consumer and the
  * template-generate API (POST /repos/{owner}/{repo}/generate —
  * api/services/generate-repo.ts rides THIS pass synchronously instead of
@@ -177,6 +261,16 @@ export async function handleForkMessage(env: Env, msg: RepoForkMessage): Promise
  * `beginForkImport` refuses with "fork target is not empty" — that exact
  * refusal is the documented already-done success. Every other failure
  * throws (the queue retry arm / the route's error mapping).
+ *
+ * LOOSE COMPLETION (REDEPLOY12, the generate 500's producer): the engine's
+ * loop replicates the PACK catalog only, but Worker-authored API content
+ * (auto_init commits, API file writes) lands as LOOSE objects outside every
+ * pack — a template whose ref tips are loose (the `POST /user/repos`
+ * auto_init shape) used to fail finalize with `object not imported`. When
+ * the pass's finalize refuses that way, `completeLooseImport` lands the
+ * loose closure (carry.ts's walk) into the still-open import lease and
+ * finalizes in place; the fully-packed shape (the push corpus) never enters
+ * the arm.
  *
  * SIZE SETTLE (upstream services/repository/fork.go:190 / generate.go:295 —
  * UpdateRepoSize right after the copy): once the replication lands (or is
@@ -208,14 +302,30 @@ export async function replicateRepoCopy(env: Env, source: RepoRow, fork: RepoRow
   };
 
   let result: ReplicateForkResult | null = null;
+  let finalizeIncomplete = false;
   try {
     result = await replicateForkCatalog(parent, target, env.REPO_PACKS, {
       parentStorageKey: source.storageKey,
       forkStorageKey: fork.storageKey,
     });
   } catch (error) {
-    if (!isAlreadyFinalized(error)) throw error;
-    // A committed finalize is already in place: the replication is done.
+    if (isAlreadyFinalized(error)) {
+      // A committed finalize is already in place: the replication is done.
+    } else if (isLooseIncomplete(error)) {
+      // REDEPLOY12 (the generate 500's producer): the parent's ref tips
+      // include LOOSE objects the pack-catalog loop cannot carry. The failed
+      // finalize wrote NOTHING (its object validation precedes its one
+      // transaction) and the import lease is still open with the adopted
+      // staging intact — land the loose class (the rename-carry walk,
+      // carry.ts) and finalize the staged import directly, so no pack byte
+      // is ever copied twice.
+      finalizeIncomplete = true;
+    } else {
+      throw error;
+    }
+  }
+  if (finalizeIncomplete) {
+    await completeLooseImport(parentCell, forkCell, `${source.ownerNamespace}/${source.slug} -> ${fork.ownerNamespace}/${fork.slug}`);
   }
   void result; // counts are observability-only today (no D1 columns for them)
 

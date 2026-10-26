@@ -64,7 +64,7 @@ import { destroyRepoDO } from "./purge";
 
 /** Structural source surface (RepoCell RPCs, the fork-task.ts wrapping style
  *  that strips the stub's Promise-intersection types). */
-interface CarrySource {
+export interface CarrySource {
   listRefs(): Promise<{ head: string | null; refs: { name: string; target: string; peeled?: string }[] }>;
   listCatalogPage(afterPackKey: string, limit: number): Promise<CatalogPage>;
   readCommit(id?: string): Promise<CommitJson | null>;
@@ -73,7 +73,7 @@ interface CarrySource {
 }
 
 /** Structural target surface (the fork-import lease + the loose landing). */
-interface CarryTarget {
+export interface CarryTarget {
   beginForkImport(
     storageKey: string,
   ): Promise<{ tag: "ok"; storageKey: string } | { tag: "invalid"; reason: string }>;
@@ -101,6 +101,12 @@ const WALK_MAX_OBJECTS = 2000;
 
 function fail(stage: string, from: string, to: string, detail: string): never {
   throw new Error(`cell carry ${from} -> ${to} (${stage}): ${detail}`);
+}
+
+/** The exported walk's failure arm — `label` is the "fromEngine -> toEngine"
+ *  pair, so the text is byte-identical to fail("walk", …) at the carry site. */
+function failWalk(label: string, detail: string): never {
+  throw new Error(`cell carry ${label} (walk): ${detail}`);
 }
 
 /** `repos/<storage_key>/packs/<packKey>.pack` — git/r2keys.ts's packR2Key (the
@@ -208,7 +214,7 @@ export async function carryRepoCell(
     // 2. Loose objects: reconstruct the Worker-authored content the pack
     // catalog does not cover (exact serialize round trip; putApiObjects
     // re-verifies every oid on landing).
-    await carryLooseObjects(source, target, carried, packed, fromEngine, toEngine);
+    await carryLooseObjects(source, target, carried, packed, `${fromEngine} -> ${toEngine}`);
 
     // 3. One finalizing transaction: catalog rows landed during adopt; refs +
     // HEAD + refs_version land now and the importing gate clears. HEAD must
@@ -241,20 +247,23 @@ export async function carryRepoCell(
  * every object the pack catalog does not already cover. Commits walk by
  * parent chain; each unpacked commit's trees walk by path; blobs fetch once
  * per unique oid. Objects batch into putApiObjects under the engine's
- * per-call budget.
+ * per-call budget. Exported for the fork/generate copy pass
+ * (src/repos/fork-task.ts), which must land the same Worker-authored loose
+ * class (auto_init commits, API commits — REDEPLOY12's generate 500: the
+ * template's ref tips live outside the pack catalog its loop replicates).
+ * `label` names the from → to pair in error text.
  */
-async function carryLooseObjects(
+export async function carryLooseObjects(
   source: CarrySource,
-  target: CarryTarget,
+  target: Pick<CarryTarget, "putApiObjects">,
   carried: { name: string; oid: string }[],
   packed: Set<string>,
-  fromEngine: string,
-  toEngine: string,
+  label: string,
 ): Promise<void> {
   let rpcs = 0;
   let objects = 0;
   const spend = () => {
-    if (++rpcs > WALK_MAX_RPC) fail("walk", fromEngine, toEngine, "RPC budget exceeded");
+    if (++rpcs > WALK_MAX_RPC) failWalk(label, "RPC budget exceeded");
   };
   const pending = new Map<string, ApiObject>();
   let batchBytes = 0;
@@ -265,12 +274,12 @@ async function carryLooseObjects(
     batchBytes = 0;
     const put = await target.putApiObjects(batch);
     if (put.tag !== "ok") {
-      fail("walk", fromEngine, toEngine, `putApiObjects refused (${put.tag}): ${put.tag === "invalid" ? put.reason : `limit ${put.limitBytes}`}`);
+      failWalk(label, `putApiObjects refused (${put.tag}): ${put.tag === "invalid" ? put.reason : `limit ${put.limitBytes}`}`);
     }
   };
   const stage = async (object: ApiObject) => {
     if (packed.has(object.oid) || pending.has(object.oid)) return;
-    if (++objects > WALK_MAX_OBJECTS) fail("walk", fromEngine, toEngine, "object budget exceeded");
+    if (++objects > WALK_MAX_OBJECTS) failWalk(label, "object budget exceeded");
     pending.set(object.oid, object);
     batchBytes += object.data.byteLength;
     if (batchBytes >= PUT_BATCH_BYTES || pending.size >= PUT_BATCH_OBJECTS) await flush();
@@ -289,7 +298,7 @@ async function carryLooseObjects(
         trees.add(entry.oid);
         spend();
         const sub = await source.listTree(commitOid, childPath(path, entry.name));
-        if (sub === null) fail("walk", fromEngine, toEngine, `subtree unreadable: ${childPath(path, entry.name)}`);
+        if (sub === null) failWalk(label, `subtree unreadable: ${childPath(path, entry.name)}`);
         await stage({ oid: entry.oid, type: "tree", data: serializeTree(sub.entries.map(entrySpec)).data });
         await walkTree(commitOid, childPath(path, entry.name), sub.entries);
         continue;
@@ -297,7 +306,7 @@ async function carryLooseObjects(
       if (packed.has(entry.oid)) continue; // packed blob: the pack channel carries it
       spend();
       const blob = await source.readBlob(commitOid, childPath(path, entry.name));
-      if (blob === null) fail("walk", fromEngine, toEngine, `blob unreadable: ${childPath(path, entry.name)}`);
+      if (blob === null) failWalk(label, `blob unreadable: ${childPath(path, entry.name)}`);
       await stage({ oid: blob.oid, type: "blob", data: blob.data });
     }
   };
@@ -307,14 +316,14 @@ async function carryLooseObjects(
     commits.add(oid);
     spend();
     const commit = await source.readCommit(oid);
-    if (commit === null) fail("walk", fromEngine, toEngine, `commit unreadable: ${oid}`);
+    if (commit === null) failWalk(label, `commit unreadable: ${oid}`);
     await stage(commitObject(commit));
     if (!packed.has(commit.tree)) {
       // root packed ⇒ whole tree closure packed (walk nothing)
       trees.add(commit.tree);
       spend();
       const root = await source.listTree(oid, "");
-      if (root === null) fail("walk", fromEngine, toEngine, `root tree unreadable for ${oid}`);
+      if (root === null) failWalk(label, `root tree unreadable for ${oid}`);
       await stage({ oid: commit.tree, type: "tree", data: serializeTree(root.entries.map(entrySpec)).data });
       await walkTree(oid, "", root.entries);
     }
