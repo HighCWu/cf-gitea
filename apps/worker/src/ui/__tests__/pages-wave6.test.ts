@@ -296,7 +296,12 @@ describe("milestones list (/{owner}/{repo}/milestones)", () => {
     expect(html).toContain("<title>Milestones - alice/golden-ms</title>");
     expect(html).toContain("issue-list-navbar");
     expect(html).toContain(">Milestones</a>");
-    expect(html).not.toContain('href="/alice/golden-ms/labels"'); // dead links are not emitted
+    // Wave 25 landed the labels page (pages/repo-labels.tsx), so the
+    // issue-navbar renders upstream navbar.tmpl's BOTH items now — the
+    // wave-6 single-item reduction ("the Labels page does not exist") is
+    // retired; Milestones stays the active item here.
+    expect(html).toContain('href="/alice/golden-ms/labels"');
+    expect(html).toContain('>Milestones</a>');
     // Tab counts are the unfiltered totals: 2 open / 1 closed.
     expect(html).toContain("2 Open</a>");
     expect(html).toContain("1 Closed</a>");

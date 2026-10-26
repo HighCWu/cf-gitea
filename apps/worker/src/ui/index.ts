@@ -347,6 +347,34 @@
  *                                          repo-collaborators +
  *                                          TeamsService arms; admin viewer
  *                                          only — the settingsGate)
+ *   /:owner/:repo/tags                     tags list page, GET (pages/tags.tsx
+ *                                          — wave 25; the parity survey's
+ *                                          TOP-1 row, upstream web.go:1493-
+ *                                          1496's literal; the ENGINE ref
+ *                                          universe (the repoListTags API's
+ *                                          read) with the header menu's
+ *                                          Releases/Tags pair and the per-
+ *                                          tag Detail/New-Release links;
+ *                                          anonymous-capable; empty repos
+ *                                          404 (the group's MustBeNotEmpty);
+ *                                          `?q=` filter, `?page=` pager)
+ *   /:owner/:repo/labels                   labels management page, GET (pages/
+ *                                          repo-labels.tsx — wave 25; the
+ *                                          survey's TOP-2 row, upstream
+ *                                          web.go:1338's reader group —
+ *                                          anonymous-capable; the repo-label
+ *                                          family's list + the upstream
+ *                                          `.OrgLabels` org section)
+ *   /:owner/:repo/labels/{new|edit|delete} the label writes, POST (upstream's
+ *                                          exact POST segments, web.go:
+ *                                          1417-1422 — repo.NewLabel/
+ *                                          UpdateLabel/DeleteLabel over the
+ *                                          landed repo-label arms; the
+ *                                          writer gate: anonymous 303s onto
+ *                                          login, archived/non-writer 404-
+ *                                          shells; GET → 405;
+ *                                          /labels/initialize stays
+ *                                          unclaimed — no template catalog)
  *
  * The wave-2 families dispatch INSIDE this router (uiPage); render.tsx's
  * page switch stays the slice-1 three — which is why they parse into the
@@ -529,6 +557,18 @@ import {
   removeTeamFromForm,
   renderCollaborationPage,
 } from "./pages/settings-collaboration";
+// Wave-25 repo tags + labels pages (the parity survey's TOP-2 dispatchable
+// rows — the tags listing over the engine ref universe and the repo labels
+// management page over the landed repo-label family).
+import { loadTagsData, renderTagsPage } from "./pages/tags";
+import {
+  createRepoLabelFromForm,
+  deleteRepoLabelFromForm,
+  editRepoLabelFromForm,
+  loadRepoLabelsData,
+  parseRepoLabelForm,
+  renderRepoLabelsPage,
+} from "./pages/repo-labels";
 import { loadDashboardData, renderDashboardPage, renderLandingPage } from "./pages/dashboard";
 import {
   loadExploreReposData,
@@ -881,6 +921,37 @@ export interface SettingsCollaborationRoute {
   repo: string;
 }
 
+/** The wave-25 tags family (pages/tags.tsx): upstream's repo tags group's
+ *  list route (web.go:1493-1496 — `m.Get("", context.RepoRefByDefaultBranch(),
+ *  repo.TagsList)` under the `/tags` group) — the parity survey's TOP-1
+ *  row, the bare repo-scoped literal over the engine ref universe. GET-only
+ *  (the page itself carries no write; the `/tags/delete` POST is
+ *  web.go:1501's own survey row). The `/tags/list` aux JSON, the `.rss`/
+ *  `.atom` feed tails and every deeper tail stay unclaimed → the engine's
+ *  404, exactly upstream's unregistered-route answer. */
+export interface TagsRoute {
+  family: "tags";
+  owner: string;
+  repo: string;
+}
+
+/** The wave-25 repo labels families (pages/repo-labels.tsx): upstream's
+ *  labels page (web.go:1338 `repo.RetrieveLabelsForList, repo.Labels` in
+ *  the optSignIn + reqRepoIssuesOrPullsReader group — anonymous-capable)
+ *  plus the three POST write tails (`/labels/new`, `/labels/edit`,
+ *  `/labels/delete` — web.go:1417-1422 under reqSignIn +
+ *  RepoMustNotBeArchived + reqRepoIssuesOrPullsWriter; the survey's TOP-2
+ *  row). The repo-scoped `labels` THIRD segment never collides with the
+ *  wave-14 org literal (which claims `/{org}/labels` — `labels` as the
+ *  SECOND segment — upstream shadows that repo identically). The
+ *  `/labels/initialize` template loader and every deeper tail stay
+ *  unclaimed → the engine's 404. */
+export interface RepoLabelsRoute {
+  family: "repo-labels" | "repo-label-new" | "repo-label-edit" | "repo-label-delete";
+  owner: string;
+  repo: string;
+}
+
 
 /** The wave-11 review-write families (pages/pull-reviews.tsx): upstream's
  *  three web POSTs — the verdict form's
@@ -1092,7 +1163,9 @@ export type ParsedUiRoute =
   | OrgMembersRoute
   | OrgRepositoriesRoute
   | RepoSocialRoute
-  | SettingsCollaborationRoute;
+  | SettingsCollaborationRoute
+  | TagsRoute
+  | RepoLabelsRoute;
 
 
 /**
@@ -1472,6 +1545,34 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // engine's 404, exactly upstream's unregistered-route answer.
   if (head === "forks" || head === "stars" || head === "watchers") {
     if (rest.length === 0) return { family: head, owner, repo };
+    return null;
+  }
+  // Wave-25 tags family (pages/tags.tsx — upstream web.go:1493-1496's
+  // `/tags` group's list route, the survey's TOP-1 row): the exact bare
+  // literal, GET-only. The `/tags/list` aux JSON, the `.rss`/`.atom` feed
+  // tails and the `/tags/delete` write (web.go:1501, its own survey row)
+  // stay unclaimed → the engine's 404, exactly upstream's
+  // unregistered-route answer.
+  if (head === "tags") {
+    if (rest.length === 0) return { family: "tags", owner, repo };
+    return null;
+  }
+  // Wave-25 repo labels families (pages/repo-labels.tsx — upstream
+  // web.go:1338's page + web.go:1417-1422's three POST segments, the
+  // survey's TOP-2 row): the bare literal is the list; the write tails are
+  // upstream's exact segments (the write gate runs at the handlers). The
+  // third-segment position never collides with the wave-14 org literal
+  // (that one claims `labels` as the SECOND segment, shadowing a repository
+  // named "labels" exactly like upstream's own route order). The
+  // `/labels/initialize` template loader and every deeper tail stay
+  // unclaimed → the engine's 404.
+  if (head === "labels") {
+    if (rest.length === 0) return { family: "repo-labels", owner, repo };
+    if (rest.length === 1) {
+      if (rest[0] === "new") return { family: "repo-label-new", owner, repo };
+      if (rest[0] === "edit") return { family: "repo-label-edit", owner, repo };
+      if (rest[0] === "delete") return { family: "repo-label-delete", owner, repo };
+    }
     return null;
   }
   // Wave-18 commit view (pages/commit-view.tsx — upstream web.go:1739): the
@@ -3486,20 +3587,29 @@ async function releasesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
 }
 
 /** GET /{owner}/{repo}/releases/new (pages/releases.tsx — upstream
- *  repo.NewRelease, web.go:1517): the writer-gated create form. */
+ *  repo.NewRelease, web.go:1517): the writer-gated create form. The `?tag=`
+ *  query prefills the tag-name field (wave 25 — the tags page's per-row
+ *  "New Release" links carry it, upstream tags list.tmpl's exact shape). */
 async function releaseNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const gate = await releasesWriteGate(c, resolved);
   if (gate !== null) return gate;
-  const { ctx, respond, repo } = resolved;
+  const { url, ctx, respond, repo } = resolved;
   const data = await loadNewReleaseData(c.env, repo);
   return respond(
     c.html(
       renderNewReleasePage({
         ctx,
         data,
-        form: { tagName: "", tagTarget: "", title: "", content: "", draft: false, prerelease: false },
+        form: {
+          tagName: (url.searchParams.get("tag") ?? "").trim().slice(0, 255),
+          tagTarget: "",
+          title: "",
+          content: "",
+          draft: false,
+          prerelease: false,
+        },
         error: null,
       }),
       200,
@@ -3678,6 +3788,16 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   if (route.family === "forks" || route.family === "stars" || route.family === "watchers") {
     const data = await loadRepoSocialData(c.env.DB, repo, viewer, route.family, url.searchParams);
     return respond(c.html(renderRepoSocialPage(ctx, data), 200));
+  }
+  // Wave-25 dispatch: the tags listing (render.tsx never sees this family;
+  // the engine ref universe read — the group's MustBeNotEmpty gate answers
+  // the 404 shell for empty repos before the load).
+  if (route.family === "tags") {
+    if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1497's group gate)
+    const page = parsePageNumber(url.searchParams.get("page"));
+    const keyword = (url.searchParams.get("q") ?? "").slice(0, 255);
+    const data = await loadTagsData(c.env, c.env.DB, repo, { page, keyword, viewer });
+    return respond(c.html(renderTagsPage({ ctx, data }), 200));
   }
 
   // U3 page switch (render.tsx — home | commits | src), with the 404 shell
@@ -3878,6 +3998,127 @@ async function collaborationTeamDeleteSubmit(c: Context<{ Bindings: Env }>): Pro
     return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/collaboration` } }));
   }
   return collaborationReRender(c, resolved, { error: result.message, collaborator: "" });
+}
+
+// ---------------------------------------------------------------------------
+// The wave-25 repo labels writes (pages/repo-labels.tsx — upstream's
+// /labels group, web.go:1417-1422, over the landed repo-label family). The
+// shared gate is the module header's port of reqRepoIssuesOrPullsWriter:
+// anonymous → the login 303 (reqSignIn), an archived repo or a signed-in
+// non-writer → the 404 shell (RepoMustNotBeArchived + the writer arm —
+// `canWriteRepo`, the same predicate the page's render gate evaluates).
+// ---------------------------------------------------------------------------
+
+/** The labels write gate (the order above; `null` = proceed). */
+async function repoLabelsWriteGate(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+): Promise<Response | null> {
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (repo.isArchived || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  return null;
+}
+
+/** The create/edit failure re-render's shared tail: the fresh read, the
+ *  failure message and the kept create-form submission (the org-labels
+ *  handlers' convention — validation failures re-render at 200). */
+async function repoLabelsReRender(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+  options: { error: string | null; form: { title: string; color: string } },
+): Promise<Response> {
+  const { ctx, viewer, respond, repo } = resolved;
+  const data = await loadRepoLabelsData(c.env, c.env.DB, repo, viewer, new URLSearchParams());
+  return respond(c.html(renderRepoLabelsPage({ ctx, data, form: options.form, error: options.error }), 200));
+}
+
+/** GET /{owner}/{repo}/labels (pages/repo-labels.tsx — the management list;
+ *  anonymous-capable, upstream's optSignIn + reqRepoIssuesOrPullsReader
+ *  group). */
+async function repoLabelsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "repo-labels") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoLabelsData(c.env, c.env.DB, repo, viewer, url.searchParams);
+  return respond(
+    c.html(renderRepoLabelsPage({ ctx, data, form: { title: "", color: NEW_LABEL_DEFAULT_COLOR }, error: null }), 200),
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/labels/new (upstream repo.NewLabel over the landed
+ * create arm): the §2.8 Origin guard, the write gate, then the
+ * empty-title guard + `normalizeLabelColor` + `createRepoLabel` — success
+ * 303s back onto the list (upstream JSONRedirect's target), the failures
+ * re-render at 200 with the message and the kept submission (the org-labels
+ * convention).
+ */
+async function repoLabelNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoLabelsWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { respond, repo } = resolved;
+  if (resolved.route.family !== "repo-label-new") return respond(await c.notFound()); // drift guard
+  const form = parseRepoLabelForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createRepoLabelFromForm(c.env.DB, repo.id, form);
+  if (result.outcome === "applied") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/labels` } }));
+  }
+  return repoLabelsReRender(c, resolved, { error: result.message, form });
+}
+
+/**
+ * POST /{owner}/{repo}/labels/edit (upstream repo.UpdateLabel over the
+ * landed edit arm's order — the repo-scoped lookup before any color 422):
+ * success 303s back onto the list; a missing/foreign id 404-shells (the
+ * landed PATCH arm's plain "not found" — upstream's JSONErrorNotFound);
+ * the failures re-render with the error banner and the STORED row values
+ * (pages/repo-labels.tsx's re-render note).
+ */
+async function repoLabelEditSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoLabelsWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { respond, repo } = resolved;
+  if (resolved.route.family !== "repo-label-edit") return respond(await c.notFound()); // drift guard
+  const params = await readUrlEncodedForm(c.req.raw);
+  const form = parseRepoLabelForm(params);
+  const result = await editRepoLabelFromForm(c.env.DB, repo.id, formLabelId(params.get("id")), form);
+  if (result.outcome === "applied") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/labels` } }));
+  }
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(resolved.ctx), 404));
+  return repoLabelsReRender(c, resolved, { error: result.message, form: { title: "", color: NEW_LABEL_DEFAULT_COLOR } });
+}
+
+/**
+ * POST /{owner}/{repo}/labels/delete (upstream repo.DeleteLabel over the
+ * landed cascade arm): the repo-scoped lookup, the delete when the row
+ * exists, SUCCESS either way (the arm's zero-row 204 and upstream's
+ * unconditional JSONRedirect) — both arms 303 back onto the list.
+ */
+async function repoLabelDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoLabelsWriteGate(c, resolved);
+  if (gate !== null) return gate;
+  const { respond, repo } = resolved;
+  if (resolved.route.family !== "repo-label-delete") return respond(await c.notFound()); // drift guard
+  const params = await readUrlEncodedForm(c.req.raw);
+  await deleteRepoLabelFromForm(c.env.DB, repo.id, formLabelId(params.get("id")));
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/labels` } }));
 }
 
 export const uiRouter = new Hono<{ Bindings: Env }>();
@@ -4111,3 +4352,21 @@ uiRouter.post("/:owner/:repo/settings/collaboration/team", (c) => collaborationT
 uiRouter.get("/:owner/:repo/settings/collaboration/team", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/settings/collaboration/team/delete", (c) => collaborationTeamDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/settings/collaboration/team/delete", () => methodNotAllowed("POST"));
+// Wave-25 repo tags + labels families (parseUiRoute claims exactly these
+// shapes — upstream's web.go:1493-1496 `/tags` list literal and
+// web.go:1338's labels page + web.go:1417-1422's three POST write segments).
+// The tags page rides the uiPage dispatch (the social-trio convention); the
+// labels POSTs run the §2.8 sameOriginGuard first and the three POST-only
+// write tails answer GET with chi's 405 (the org-labels convention). No
+// earlier registration can absorb these: the bare "tags"/"labels" tails are
+// distinct single literals no registered pattern carries, and the org
+// /:owner/labels pair (SECOND-segment literal) never matches a three-segment
+// /:owner/:repo shape.
+uiRouter.get("/:owner/:repo/tags", (c) => uiPage(c));
+uiRouter.get("/:owner/:repo/labels", (c) => repoLabelsPage(c));
+uiRouter.post("/:owner/:repo/labels/new", (c) => repoLabelNewSubmit(c));
+uiRouter.get("/:owner/:repo/labels/new", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/labels/edit", (c) => repoLabelEditSubmit(c));
+uiRouter.get("/:owner/:repo/labels/edit", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/labels/delete", (c) => repoLabelDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/labels/delete", () => methodNotAllowed("POST"));

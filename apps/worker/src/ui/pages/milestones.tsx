@@ -87,6 +87,7 @@ import type { UiContext } from "../ui-context";
  *  cite upstream's locale keys). */
 export const milestonesLocale = {
   milestones: "Milestones", // "repo.milestones"
+  labels: "Labels", // "repo.labels" (wave 25's navbar item — navbar.tmpl's first entry)
   new_milestone: "New Milestone", // "repo.milestones.new"
   open_title: "Open", // "repo.issues.open_title"
   closed_title: "Closed", // "repo.issues.closed_title"
@@ -263,11 +264,16 @@ export async function createMilestoneFromForm(
 // Components
 // ---------------------------------------------------------------------------
 
-/** The issue-navbar compact menu (repo/issue/navbar.tmpl reduced to the one
- *  live item — the Labels page does not exist, dead-link rule). */
-function MilestoneNavbar() {
+/** The issue-navbar compact menu (repo/issue/navbar.tmpl) — wave 25 adds
+ *  the Labels item (the page exists now: pages/repo-labels.tsx); upstream's
+ *  order renders Labels first, Milestones second, each active on its own
+ *  page. */
+function MilestoneNavbar(props: { repoLink: string }) {
   return (
     <h2 class="ui compact small menu small-menu-items issue-list-navbar">
+      <a class="item" href={`${props.repoLink}/labels`}>
+        {milestonesLocale.labels}
+      </a>
       <a class="active item" href="?">
         {milestonesLocale.milestones}
       </a>
@@ -395,7 +401,7 @@ export function MilestonesPage(props: { ctx: UiContext; data: MilestonesData }) 
     <BaseLayout ctx={ctx} title={milestonesLocale.milestones} pageClass="repository milestones" activeTab="issues">
       <div class="ui container">
         <div class="list-header">
-          <MilestoneNavbar />
+          <MilestoneNavbar repoLink={repoLink} />
           {data.canWrite && !repo.isArchived ? (
             <a class="ui small primary button" href={`${repoLink}/milestones/new`}>
               {milestonesLocale.new_milestone}
@@ -440,7 +446,7 @@ export function NewMilestonePage(props: { ctx: UiContext; form: NewMilestoneForm
     <BaseLayout ctx={ctx} title={milestonesLocale.new_milestone} pageClass="repository new milestone" activeTab="issues">
       <div class="ui container">
         <div class="issue-navbar">
-          <MilestoneNavbar />
+          <MilestoneNavbar repoLink={repoLink} />
         </div>
         <div class="divider" />
         <h2 class="ui dividing header">

@@ -157,6 +157,7 @@ import type { RepoRow, UiContext } from "../ui-context";
  *  cite upstream's locale keys). */
 export const releasesLocale = {
   page_title: "Releases", // "repo.releases" / "repo.release.releases"
+  tags_label: "Tags", // "repo.release.tags" (wave 25's header-menu item)
   new_release: "New Release", // "repo.release.new_release"
   new_subheader: "Releases organize project versions.", // "repo.release.new_subheader"
   release: "Release", // "repo.release" (TrN singular)
@@ -201,8 +202,9 @@ export const releasesLocale = {
 export const RELEASES_PAGE_SIZE = 10;
 
 /** Upstream `ctx.Locale.PrettyNumber` (en-US grouping, ICU-free so the
- *  rendered bytes never depend on the runtime). */
-function prettyNumber(value: number): string {
+ *  rendered bytes never depend on the runtime). Exported for pages/tags.tsx
+ *  (wave 25 — the tags page's header menu shares the shape). */
+export function prettyNumber(value: number): string {
   return value.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
@@ -521,13 +523,32 @@ export async function createReleaseFromForm(input: {
  *  the counts menu (reduced to the single live item — the module header's
  *  Tags/RSS note) and the New Release button (CanCreateRelease's write &&
  *  !archived). */
-function ReleasesHeader(props: { basePath: string; total: number; canCreate: boolean; newHref: string | null }) {
+function ReleasesHeader(props: {
+  basePath: string;
+  total: number;
+  canCreate: boolean;
+  newHref: string | null;
+  /** Wave 25's additive Tags item (release_tag_header.tmpl's second menu
+   *  entry — `{{if $canReadCode}}`, the landed tags page
+   *  pages/tags.tsx): rendered only by the LIST page, where the loader's
+   *  `numTags` is already in hand (the DETAIL page keeps the wave-20
+   *  single-item menu — no listRefs just for a menu label, the same cost
+   *  note that landed the reduction). Upstream keeps Releases ACTIVE on
+   *  the list (`PageIsReleaseList`) and hands active to Tags only on the
+   *  tags page itself — the plain item here. */
+  tags?: { href: string; count: number };
+}) {
   return (
     <div class="flex-left-right">
       <h2 class="ui compact small menu small-menu-items">
         <a class="active item" href={props.basePath}>
           {prettyNumber(props.total)} {props.total === 1 ? releasesLocale.release : releasesLocale.page_title}
         </a>
+        {props.tags !== undefined ? (
+          <a class="item" href={props.tags.href}>
+            {prettyNumber(props.tags.count)} {props.tags.count === 1 ? releasesLocale.tag : releasesLocale.tags_label}
+          </a>
+        ) : null}
       </h2>
       {props.canCreate && props.newHref !== null ? (
         <div class="flex-text-block">
@@ -694,6 +715,7 @@ export function ReleasesPage(props: { ctx: UiContext; data: ReleasesData }) {
           total={data.total}
           canCreate={data.canCreate}
           newHref={data.canCreate && !repo.isArchived ? `${repoLink}/releases/new` : null}
+          tags={{ href: `${repoLink}/tags`, count: data.numTags }}
         />
         <div class="divider" />
         <ul id="release-list">
