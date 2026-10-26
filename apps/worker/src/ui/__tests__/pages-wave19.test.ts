@@ -119,7 +119,9 @@ describe("wave-19 parser families (parseUiRoute / handlesUiRoute)", () => {
     // its static groups. Both owner names are upstream-reserved at create
     // time (orgs.ts RESERVED_USERNAMES carries "repo" and "org"), so the
     // shadowed rows cannot exist.
-    expect(parseUiRoute("/repo/migrate")?.family).toBe("home");
+    // Window-2e C3a (62ef380) mounted /repo/migrate — the stale home
+    // shadow pin updated to the family claim (the sweep's finding).
+    expect(parseUiRoute("/repo/migrate")).toEqual({ family: "repo-migrate" });
     expect(parseUiRoute("/repo/create/more")).toBeNull();
     expect(parseUiRoute("/org/teams")?.family).toBe("org-teams"); // wave 12's literal, untouched
   });

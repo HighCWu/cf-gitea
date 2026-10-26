@@ -231,10 +231,11 @@ describe("wave-10 parser families (parseUiRoute / handlesUiRoute)", () => {
   });
 
   it("leaves the deeper notifications tails and the same-cased namespace alone", () => {
-    // subscriptions/watching have no page this slice — the engine answers,
-    // exactly upstream's unregistered-route 404.
-    expect(parseUiRoute("/notifications/subscriptions")).toBeNull();
-    expect(parseUiRoute("/notifications/watching")).toBeNull();
+    // Window-2e C3b (5ca1727) mounted the subscriptions/watching tails —
+    // the stale nulls updated to the claimed shapes (the sweep's finding;
+    // the sibling matrix carried the flip, this twin was missed).
+    expect(parseUiRoute("/notifications/subscriptions")).toEqual({ family: "notification-subscriptions" });
+    expect(parseUiRoute("/notifications/watching")).toEqual({ family: "notification-watching" });
     // The literals bind case-sensitively (the explore precedent).
     expect(parseUiRoute("/NOTIFICATIONS")).toEqual({ family: "owner-home", owner: "NOTIFICATIONS" });
   });
