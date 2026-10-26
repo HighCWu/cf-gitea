@@ -37,7 +37,13 @@ import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
  * SPEC-0004 §3.4 commit-builder mapping); deletion is deleteApiRef.
  *
  * Upstream behavior mirrored (routers/api/v1/repo/tag.go):
- *   - POST answers **200** (not 201) with the Tag — the contract quirk;
+ *   - POST answers **200** with the Tag — the DECLARED surface: upstream's own
+ *     swagger comment (tag.go:185-197) and the frozen contract
+ *     (v1-swagger/v1-openapi3.generated.json, both checked by
+ *     scripts/check-openapi.mjs) declare {200,404,405,409,422,423} — no 201.
+ *     Upstream's RUNTIME drifts from its own declaration with
+ *     http.StatusCreated (tag.go:230) — an upstream-internal divergence we do
+ *     not copy (contract compatibility is the goal);
  *   - POST on an empty repo → **405**; a missing `target` → 404
  *     "target not found: …"; a duplicate tag → 409 "tag already exists";
  *   - DELETE refuses a tag that has a release attached with 409 "a tag
@@ -287,7 +293,8 @@ export function registerTagRoutes(
   );
 
   // -------------------------------------------------------------------------
-  // POST /repos/{owner}/{repo}/tags (repoCreateTag) — 200 quirk
+  // POST /repos/{owner}/{repo}/tags (repoCreateTag) — contract 200 (see the
+  // header note: declared {200,...}, upstream runtime drifts to 201 tag.go:230)
   // -------------------------------------------------------------------------
   app.openapi(
     createRoute({
