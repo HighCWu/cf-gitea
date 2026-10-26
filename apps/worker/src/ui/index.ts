@@ -881,6 +881,26 @@ import {
   parseUserOrgsLeaveForm,
   renderUserOrgsSettingsPage,
 } from "./pages/user-settings-organizations";
+// Window-2c: the admin pages (two-stage waves 61/64, mounted by this
+// window — /-/admin group, web.go:779-813).
+import {
+  applyAdminDashboardForm,
+  loadAdminDashboardData,
+  parseAdminDashboardForm,
+  renderAdminDashboardPage,
+} from "./pages/admin-dashboard";
+import {
+  applyAdminMonitorCronForm,
+  loadAdminMonitorCron,
+  loadAdminMonitorQueues,
+  loadAdminMonitorStats,
+  parseAdminMonitorCronForm,
+  renderAdminMonitorCronPage,
+  renderAdminMonitorQueuePage,
+  renderAdminMonitorStatsPage,
+  renderAdminMonitorTracePage,
+} from "./pages/admin-monitor";
+import type { AdminMonitorPage } from "./pages/admin-monitor";
 import { loadUserProfileData, renderUserProfilePage, resolveUserProfile } from "./pages/user-profile";
 // Wave-19 creation pages (the authoring front door — the survey's #2).
 import {
@@ -1907,6 +1927,15 @@ export interface UserSettingsRoute {
   family: "user-settings";
 }
 
+/** Window-2c: the admin family (pages/admin-dashboard.tsx + pages/
+ *  admin-monitor.tsx — upstream's /-/admin group). */
+export interface AdminRoute {
+  family: "admin-dashboard" | "admin-monitor";
+  /** The monitor page (stats/cron/queue/stacktrace → the module's
+   *  AdminMonitorPage union); absent on the dashboard family. */
+  page?: "stats" | "cron" | "queue" | "trace";
+}
+
 /** Window-2a: the user-settings tab families (the two-stage module wave —
  *  each tab module's header carries its route recipe; upstream's
  *  reqSignIn /user/settings/* groups, web.go:646-746). Same literal posture
@@ -2061,6 +2090,7 @@ export type ParsedUiRoute =
   | NotificationsRoute
   | UserSettingsRoute
   | UserSettingsTabRoute
+  | AdminRoute
   | OrgTeamsRoute
   | OrgLabelsRoute
   | OrgSettingsRoute
@@ -2226,6 +2256,26 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   if (raw.length === 3 && raw[1] === "org" && raw[2] === "create") {
     return { family: "org-create" };
+  }
+
+  // Window-2c: the ADMIN literal family (pages/admin-dashboard.tsx +
+  // pages/admin-monitor.tsx — upstream's /-/admin group, web.go:779-813,
+  // behind verifyAuthWithOptionsWeb(SignInRequired+AdminRequired)): the
+  // top-level `/-` namespace is otherwise unclaimed (a repo cannot be named
+  // "-"), so the exact shapes claim ahead of the dynamic owner/repo parse.
+  // Only the landed pages claim: /-/admin (dashboard GET+POST) and the four
+  // monitor pages (+ cron run POST). Every other /-/* tail stays unclaimed
+  // → the engine's 404.
+  if (raw[1] === "-" && raw[2] === "admin") {
+    const tail = raw.slice(3);
+    if (tail.length === 0) return { family: "admin-dashboard" };
+    if (tail.length === 2 && tail[0] === "monitor") {
+      if (tail[1] === "stats") return { family: "admin-monitor", page: "stats" };
+      if (tail[1] === "cron") return { family: "admin-monitor", page: "cron" };
+      if (tail[1] === "queue") return { family: "admin-monitor", page: "queue" };
+      if (tail[1] === "stacktrace") return { family: "admin-monitor", page: "trace" };
+    }
+    return null;
   }
 
   // The wave-23 org members family (pages/org-members.tsx — upstream's
@@ -5041,6 +5091,81 @@ async function orgActionsVariablesDelete(c: Context<{ Bindings: Env }>, variable
   const outcome = await deleteOrgActionsVariable(c.env.DB, org.id, variableId);
   if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
   return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/variables` } }));
+}
+
+// ---------------------------------------------------------------------------
+// Window-2c: the admin pages (pages/admin-dashboard.tsx +
+// pages/admin-monitor.tsx — upstream's SignInRequired+AdminRequired gate,
+// web.go:779: anonymous 303s onto the login round-trip, a signed-in
+// non-admin 404-shells (upstream's NotFound posture for hidden admin
+// surfaces).
+// ---------------------------------------------------------------------------
+
+/** The shared admin prologue: session → gates, answering {ctx, respond}
+ *  or a terminal Response. */
+async function adminPagePrologue(c: Context<{ Bindings: Env }>): Promise<
+  { ok: true; ctx: UiContext; respond: (r: Response, status?: number) => Response } | { ok: false; response: Response }
+> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return { ok: false, response: resolved.response };
+  const { url, ctx, viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname)) };
+  if (!viewer.isAdmin) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  return { ok: true, ctx, respond };
+}
+
+async function adminDashboardPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminDashboardData(new Date());
+  return p.respond(c.html(renderAdminDashboardPage({ ctx: p.ctx, data, flash: null })));
+}
+
+async function adminDashboardSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminDashboardForm(await readUrlEncodedForm(c.req.raw));
+  const result = await applyAdminDashboardForm(c.env, form);
+  // Upstream redirects; with no flash queue the module's recipe re-renders
+  // fresh at 200 with the flash (the handoff's documented reduction).
+  const data = await loadAdminDashboardData(new Date());
+  const flash = { kind: result.outcome === "applied" ? "positive" as const : "negative" as const, text: result.message };
+  return p.respond(c.html(renderAdminDashboardPage({ ctx: p.ctx, data, flash })));
+}
+
+async function adminMonitorPage(c: Context<{ Bindings: Env }>, page: AdminMonitorPage): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  switch (page) {
+    case "stats": {
+      const data = await loadAdminMonitorStats(c.env.DB);
+      return p.respond(c.html(renderAdminMonitorStatsPage({ ctx: p.ctx, data })));
+    }
+    case "cron": {
+      const data = { entries: loadAdminMonitorCron(new Date()).entries };
+      return p.respond(c.html(renderAdminMonitorCronPage({ ctx: p.ctx, data, flash: null })));
+    }
+    case "queue": {
+      const data = await loadAdminMonitorQueues(c.env.DB);
+      return p.respond(c.html(renderAdminMonitorQueuePage({ ctx: p.ctx, data })));
+    }
+    case "trace":
+      return p.respond(c.html(renderAdminMonitorTracePage({ ctx: p.ctx })));
+  }
+}
+
+async function adminMonitorCronSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminMonitorCronForm(await readUrlEncodedForm(c.req.raw));
+  const result = await applyAdminMonitorCronForm(c.env, form);
+  const data = { entries: loadAdminMonitorCron(new Date()).entries };
+  const flash = { kind: result.outcome === "applied" ? "positive" as const : "negative" as const, text: result.message };
+  return p.respond(c.html(renderAdminMonitorCronPage({ ctx: p.ctx, data, flash })));
 }
 
 /**
@@ -8005,6 +8130,14 @@ uiRouter.get("/:owner/settings/actions/variables", (c) => orgActionsVariablesPag
 uiRouter.post("/:owner/settings/actions/variables/new", (c) => orgActionsVariablesNew(c));
 uiRouter.post("/:owner/settings/actions/variables/:id/edit", (c) => orgActionsVariablesEdit(c, Number(c.req.param("id"))));
 uiRouter.post("/:owner/settings/actions/variables/:id/delete", (c) => orgActionsVariablesDelete(c, Number(c.req.param("id"))));
+// Window-2c: the admin group.
+uiRouter.get("/-/admin", (c) => adminDashboardPage(c));
+uiRouter.post("/-/admin", (c) => adminDashboardSubmit(c));
+uiRouter.get("/-/admin/monitor/stats", (c) => adminMonitorPage(c, "stats"));
+uiRouter.get("/-/admin/monitor/cron", (c) => adminMonitorPage(c, "cron"));
+uiRouter.post("/-/admin/monitor/cron", (c) => adminMonitorCronSubmit(c));
+uiRouter.get("/-/admin/monitor/queue", (c) => adminMonitorPage(c, "queue"));
+uiRouter.get("/-/admin/monitor/stacktrace", (c) => adminMonitorPage(c, "trace"));
 uiRouter.get("/:owner/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
 // Wave-14 org labels family (parseUiRoute claims exactly these shapes; the
 // literal `labels` registers with the wave-9/12 statics so it beats the
