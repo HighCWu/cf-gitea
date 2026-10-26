@@ -65,8 +65,10 @@
  *   html/template would neutralize a javascript: href at emit time; the
  *   anchor-less fallback falls through to the location/joined arms.
  * - The fork rows carry the shared/repo/list trailing-count REDUCTION the
- *   landed OrgRepoListItem established: only the pulls count renders (the
- *   stars/forks counters and the watch-options gear are unrendered).
+ *   landed OrgRepoListItem established: the stars count (the maintained
+ *   `repositories.num_stars` column, migration 0030) and the pulls count
+ *   render; the forks counter (no `num_forks` column yet) and the
+ *   watch-options gear are unrendered.
  * - The `data-fetch-trigger` attribute on user_cards' root div (the bundle's
  *   star/watch action reload hook) is not reproduced — no such JS ships in
  *   this slice.
@@ -103,6 +105,7 @@ export const repoSocialLocale = {
   repo_private: "Private", // "repo.desc.private"
   repo_internal: "Internal", // "repo.desc.internal"
   pulls_aria: "Pull Requests", // "repo.pulls"
+  stars_aria: "Stars", // "repo.stars"
   no_results: "No matching results found.", // "search.no_results"
 } as const;
 
@@ -278,6 +281,17 @@ export function ForkListItem(props: { item: RepoSocialFork }) {
             </span>
           </div>
           <div class="item-trailing muted-links">
+            {/* The stars trailing count (list.tmpl:45-49 — rendered BEFORE
+                the pulls mark) reads the maintained `repositories.num_stars`
+                column (migration 0030), the same value the API serves as
+                `stars_count`. The CountFmt (1000+) abbreviation is reduced
+                to the raw number like the pulls count beside it. */}
+            <a class="flex-text-inline" href={`${repoLink}/stars`}>
+              <span class="tw-contents" aria-label={repoSocialLocale.stars_aria}>
+                <Icon name="octicon-star" size={16} />
+              </span>
+              <span>{repo.numStars}</span>
+            </a>
             <a class="flex-text-inline" href={`${repoLink}/pulls`}>
               <span class="tw-contents" aria-label={repoSocialLocale.pulls_aria}>
                 <Icon name="octicon-git-pull-request" size={16} />

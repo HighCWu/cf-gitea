@@ -134,6 +134,42 @@ export const repositories = sqliteTable(
      *  NULL-free DEFAULT 0 = the empty repo (ALTER backfills existing rows
      *  0; the next settle leg over the prefix re-accounts them). */
     sizeKb: integer("size_kb").notNull().default(0),
+    // -------------------------------------------------------------------------
+    // Social counters (wave-star-watch-counters) — upstream's star/watch
+    // tallies. Kept LAST like fork_parent/is_mirror/is_template/size_kb above
+    // — ALTER TABLE ADD COLUMN physically appends, so the table_info order
+    // stays the migration order.
+    // -------------------------------------------------------------------------
+    /** Upstream `Repository.NumStars` (models/repo/repo.go:168) — rendered
+     *  as the API `stars_count` (services/convert/repository.go:219
+     *  `Stars: repo.NumStars`). Maintained in the SAME D1 batch as the star
+     *  edge write (upstream star.go:45/59 — insert/delete + the
+     *  `num_stars ± 1` update inside one WithTx), and by the block cascade's
+     *  unstar arm (services/user/block.go:150-181 → StarRepo(false) per
+     *  repo). The per-USER twin (`user.num_stars`, star.go:48/62) is not
+     *  modeled — the users table carries no column; a documented gap.
+     *  NOT NULL DEFAULT 0: the ALTER backfills pre-existing rows to 0 (the
+     *  one-time settle for rows predating migration 0030 — existing star
+     *  edges keep counting only via the next unstar/restar cycle; the
+     *  idempotent operator sweep, if ever needed, is
+     *  `UPDATE repositories SET num_stars = (SELECT count(*) FROM stars
+     *  WHERE stars.repo_id = repositories.id)` (and the repo_watchers twin
+     *  for num_watches) via wrangler d1 execute — deliberately NOT
+     *  automated: dev D1 is scratch (AGENTS.md) and remote D1 has no
+     *  production rows yet (placeholder database_id). */
+    numStars: integer("num_stars").notNull().default(0),
+    /** Upstream `Repository.NumWatches` (repo.go:167) — rendered as the API
+     *  `watchers_count` (convert/repository.go:221 `Watchers:
+     *  repo.NumWatches`). Maintained in the SAME D1 batch as the watch edge
+     *  write, ONLY when watching-ness flips (upstream watchRepoByMode's
+     *  repoWatchDelta arithmetic, watch.go:128-154 — a repeat watch or a
+     *  no-op unwatch never moves the column), and by the block cascade's
+     *  unwatch arm (block.go:183-214 → WatchRepoAuto(false) per repo).
+     *  Upstream's ClearRepoWatches zeroes it when a repo goes private
+     *  (watch.go:327-333) — the repo-edit/private flow is a sibling wave's
+     *  seam (reported, not wired here). Backfill = the DEFAULT 0, same
+     *  settle posture as num_stars above. */
+    numWatches: integer("num_watches").notNull().default(0),
   },
   (t) => [
     // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point

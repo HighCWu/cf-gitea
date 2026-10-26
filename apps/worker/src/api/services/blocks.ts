@@ -65,7 +65,10 @@ import { ApiError } from "../errors";
  * direction scoped to repos owned by the other party, and cancel pending
  * repository transfers between the pair (delete the `repo_transfer` row —
  * the repos/service.ts cancelTransfer convention; nothing else to reset —
- * no repositories status column tracks a pending transfer).
+ * no repositories status column tracks a pending transfer). The star/watch
+ * removals also move the maintained `repositories.num_stars`/`num_watches`
+ * counters (the cascade unstar/unwatch arms go through StarRepo(false)/
+ * WatchRepoAuto(false) upstream — see cleanupBlockRelations).
  *
  * ENFORCEMENT WIRING (the wave-23 follow-up batch): the upstream 403
  * "user is blocked" arms (ErrBlockedUser, models/user/block.go:21 — a
@@ -433,6 +436,22 @@ export async function unblockUser(
  *     (cancelRepositoryTransfers ×2, block.go:216-222 — sender/recipient in
  *     both directions; the cancel IS the row delete here, the
  *     repos/service.ts cancelTransfer convention).
+ *
+ * Counter maintenance (the migration-0030 `repositories.num_stars` /
+ * `num_watches` columns): upstream's cascade decrements THROUGH the same
+ * services the routes use — unstarRepos calls StarRepo(false) per repo
+ * (block.go:172-175 → star.go:59's `num_stars = num_stars - 1`) and
+ * unwatchRepos calls WatchRepoAuto(false) per repo (block.go:206-209 →
+ * watch.go:153's repoWatchDelta) — so each removed edge moves its repo's
+ * counter by exactly -1. The set-based port matches that arithmetic: each
+ * edge delete is PRECEDED by one counter UPDATE in the same batch (one
+ * implicit transaction) that subtracts the still-present edge count for its
+ * own (starrer/watcher, owner) scope — update-before-delete, because the
+ * count subquery must see the rows its delete is about to remove. The four
+ * (party, owner) scopes are pairwise disjoint, so interleaving order is
+ * immaterial. MAX(…, 0) floors the drift a pre-0030 backfill row could
+ * carry (counter 0 beneath surviving edges — the same floor posture as the
+ * route arms in services/stars.ts / services/repo-watchers.ts).
  */
 function cleanupBlockRelations(
   db: DrizzleD1Database,
@@ -447,6 +466,32 @@ function cleanupBlockRelations(
       .from(issues)
       .innerJoin(repositories, eq(issues.repoId, repositories.id))
       .where(eq(repositories.ownerId, ownerId));
+  /** One counter UPDATE for a (party, repo-owner) scope: subtracts the
+   *  edges the FOLLOWING delete in the batch removes. The subquery's
+   *  `repositories AS owned` alias keeps the inner scan distinct from the
+   *  UPDATE target. */
+  const dropStarsFor = (party: number, ownerId: number) =>
+    db
+      .update(repositories)
+      .set({
+        numStars: sql`MAX(num_stars - (
+          SELECT COUNT(*) FROM stars
+          WHERE user_id = ${party}
+            AND repo_id IN (SELECT owned.id FROM repositories AS owned WHERE owned.owner_id = ${ownerId})
+        ), 0)`,
+      })
+      .where(inArray(repositories.id, reposOwnedBy(ownerId)));
+  const dropWatchesFor = (party: number, ownerId: number) =>
+    db
+      .update(repositories)
+      .set({
+        numWatches: sql`MAX(num_watches - (
+          SELECT COUNT(*) FROM repo_watchers
+          WHERE user_id = ${party}
+            AND repo_id IN (SELECT owned.id FROM repositories AS owned WHERE owned.owner_id = ${ownerId})
+        ), 0)`,
+      })
+      .where(inArray(repositories.id, reposOwnedBy(ownerId)));
 
   return [
     db.delete(follows).where(
@@ -455,9 +500,13 @@ function cleanupBlockRelations(
         and(eq(follows.userId, b), eq(follows.followId, a)),
       ),
     ),
+    dropStarsFor(a, b),
     db.delete(stars).where(and(eq(stars.userId, a), inArray(stars.repoId, reposOwnedBy(b)))),
+    dropStarsFor(b, a),
     db.delete(stars).where(and(eq(stars.userId, b), inArray(stars.repoId, reposOwnedBy(a)))),
+    dropWatchesFor(a, b),
     db.delete(repoWatchers).where(and(eq(repoWatchers.userId, a), inArray(repoWatchers.repoId, reposOwnedBy(b)))),
+    dropWatchesFor(b, a),
     db.delete(repoWatchers).where(and(eq(repoWatchers.userId, b), inArray(repoWatchers.repoId, reposOwnedBy(a)))),
     db.delete(issueAssignees).where(
       and(eq(issueAssignees.assigneeId, a), inArray(issueAssignees.issueId, issuesOnReposOf(b))),

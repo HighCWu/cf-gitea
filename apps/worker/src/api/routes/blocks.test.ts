@@ -417,6 +417,11 @@ describe("user blocks", () => {
       { userId: alice.id, repoId: bobRepo.repoId, createdAt: new Date() }, // alice stars bob's repo
     ]);
     await db().insert(repoWatchers).values({ repoId: aliceRepo.repoId, userId: bob.id, createdAt: new Date() });
+    // The maintained counters mirror the live edges (what the route arms
+    // counted up to this block): aliceRepo carries bob's + carol's stars and
+    // bob's watch, bobRepo alice's star.
+    await db().update(repositories).set({ numStars: 2, numWatches: 1 }).where(eq(repositories.id, aliceRepo.repoId));
+    await db().update(repositories).set({ numStars: 1 }).where(eq(repositories.id, bobRepo.repoId));
     await db().insert(repoCollaborators).values({ repoId: aliceRepo.repoId, userId: bob.id });
     const issue = await db()
       .insert(issues)
@@ -444,6 +449,27 @@ describe("user blocks", () => {
     expect(await db().select().from(issueAssignees).all()).toEqual([]);
     expect(await db().select().from(repoTransfer).all()).toEqual([]);
     expect(await blockingRow(alice.id, bob.id)).toBeDefined();
+
+    // The cascade moves the counters with the edges (upstream decrements
+    // THROUGH StarRepo(false)/WatchRepoAuto(false) per repo — block.go:
+    // 172-175 → star.go:59, block.go:206-209 → watch.go:153): aliceRepo
+    // keeps only carol's star and loses the watch, bobRepo drops to 0.
+    const repoRows = await db().select().from(repositories).all();
+    expect(repoRows.find((row) => row.id === aliceRepo.repoId)).toMatchObject({ numStars: 1, numWatches: 0 });
+    expect(repoRows.find((row) => row.id === bobRepo.repoId)).toMatchObject({ numStars: 0, numWatches: 0 });
+  });
+
+  it("the cascade floors the counters at 0 when edges predate the backfill (the migration-0030 drift insurance)", async () => {
+    const { alice, bob } = await seedWorld();
+    const aliceRepo = await seedRepo(alice);
+    // Edges seeded directly beneath the ALTER's backfilled 0 counters —
+    // exactly the pre-0030 row shape.
+    await db().insert(stars).values({ userId: bob.id, repoId: aliceRepo.repoId, createdAt: new Date() });
+    await db().insert(repoWatchers).values({ repoId: aliceRepo.repoId, userId: bob.id, createdAt: new Date() });
+    const res = await put("/api/v1/user/blocks/bob", alice.id);
+    expect(res.status).toBe(204);
+    const row = await db().select().from(repositories).where(eq(repositories.id, aliceRepo.repoId)).get();
+    expect(row).toMatchObject({ numStars: 0, numWatches: 0 }); // floored, never negative
   });
 });
 

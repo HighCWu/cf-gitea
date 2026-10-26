@@ -27,7 +27,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repoWatchers } from "../../db/schema";
+import { repositories, repoWatchers } from "../../db/schema";
 
 /**
  * SUPERSEDED by migration 0007 (`repoWatchers` in src/db/schema.ts) — kept
@@ -55,23 +55,72 @@ export async function isWatchingRepo(d1: D1Database, repoId: string, userId: num
   return row !== undefined;
 }
 
-/** `WatchRepo(…, true)` — idempotent subscribe (upsert; SQLite's INSERT ...
- *  DO NOTHING keeps the FIRST created_at on repeat watches). */
+/**
+ * `WatchRepoAuto(…, doWatch=true)` → `watchRepoByMode(Normal)` — idempotent
+ * subscribe (upsert; SQLite's INSERT ... DO NOTHING keeps the FIRST
+ * created_at on repeat watches).
+ *
+ * Counter maintenance (the migration-0030 `repositories.num_watches`
+ * column): upstream bumps `num_watches` inside the same transaction as the
+ * edge write, ONLY when watching-ness flips (watch.go:130-134's
+ * repoWatchDelta + watch.go:153's `num_watches = num_watches + ?` — a
+ * repeat watch never moves the column). The same shape here is one D1 batch
+ * (= one implicit SQLite transaction): the increment is guarded by the
+ * edge's ABSENCE, evaluated before the insert lands (watch.go:121-123's
+ * "don't auto watch if already watching" arm, made atomic — a concurrent
+ * double-watch serializes on the write lock so exactly one batch counts),
+ * then the guarded INSERT. Ordering UPDATE→INSERT keeps bump+insert
+ * indivisible, like upstream's WithTx.
+ */
 export async function watchRepo(d1: D1Database, repoId: string, userId: number, now: Date): Promise<void> {
-  await drizzle(d1)
-    .insert(repoWatchers)
-    .values({ repoId, userId, createdAt: now })
-    .onConflictDoNothing({ target: [repoWatchers.repoId, repoWatchers.userId] });
+  const db = drizzle(d1);
+  await db.batch([
+    db
+      .update(repositories)
+      .set({ numWatches: sql`num_watches + 1` })
+      .where(
+        and(
+          eq(repositories.id, repoId),
+          sql`NOT EXISTS (SELECT 1 FROM repo_watchers WHERE repo_id = ${repoId} AND user_id = ${userId})`,
+        ),
+      ),
+    db
+      .insert(repoWatchers)
+      .values({ repoId, userId, createdAt: now })
+      .onConflictDoNothing({ target: [repoWatchers.repoId, repoWatchers.userId] }),
+  ]);
 }
 
-/** `WatchRepo(…, false)` — idempotent unsubscribe (absent row = fine). */
+/**
+ * `WatchRepoAuto(…, doWatch=false)` → `watchRepoByMode(None/Dont)` —
+ * idempotent unsubscribe (absent row = fine). One D1 batch, counter first:
+ * the decrement is guarded by the edge's EXISTENCE (upstream's
+ * repoWatchDelta = -1 only when watching-ness flips, watch.go:130-134 — a
+ * repeat unwatch moves nothing), then the row delete lands. The MAX(…, 0)
+ * floor is drift insurance, not semantics: upstream's delta arithmetic can
+ * never cross zero (delta and edge move in one transaction), but rows
+ * predating migration 0030 were backfilled to 0 beneath pre-existing watch
+ * edges — un-watching such an edge floors at 0 instead of going negative.
+ */
 export async function unwatchRepo(d1: D1Database, repoId: string, userId: number): Promise<void> {
-  await drizzle(d1)
-    .delete(repoWatchers)
-    .where(and(eq(repoWatchers.repoId, repoId), eq(repoWatchers.userId, userId)));
+  const db = drizzle(d1);
+  await db.batch([
+    db
+      .update(repositories)
+      .set({ numWatches: sql`MAX(num_watches - 1, 0)` })
+      .where(
+        and(
+          eq(repositories.id, repoId),
+          sql`EXISTS (SELECT 1 FROM repo_watchers WHERE repo_id = ${repoId} AND user_id = ${userId})`,
+        ),
+      ),
+    db.delete(repoWatchers).where(and(eq(repoWatchers.repoId, repoId), eq(repoWatchers.userId, userId))),
+  ]);
 }
 
-/** Watcher count — the future `Repository.watchers_count` counter read. */
+/** Watcher EDGE count (a live COUNT over `repo_watchers` — the drift probe
+ *  next to the maintained `repositories.num_watches` column, which is what
+ *  `Repository.watchers_count` renders). */
 export async function countRepoWatchers(d1: D1Database, repoId: string): Promise<number> {
   const row = await drizzle(d1)
     .select({ n: sql<number>`count(*)` })

@@ -336,9 +336,17 @@ export function toApiRepository(
     clone_url: `${htmlUrl}.git`,
     original_url: "",
     website: settings?.website ?? "", // TODO(SPEC-0005): website column (repo_settings until the sweep)
-    stars_count: 0, // TODO(SPEC-0005): stars table (engine counters)
+    // Upstream renders the maintained columns, not live counts:
+    // convert/repository.go:219-221 — `Stars: repo.NumStars` / `Watchers:
+    // repo.NumWatches` (models/repo/repo.go:168/167). The columns are kept
+    // in the same D1 batch as the star/watch edge writes (upstream
+    // star.go:45/59, watch.go:153; services/stars.ts + services/
+    // repo-watchers.ts) and by the block cascade (services/blocks.ts).
+    // forks_count stays the documented 0 — upstream's Repository.NumForks
+    // (repo.go:169 → convert/repository.go:220) has no landed column yet.
+    stars_count: row.numStars,
     forks_count: 0,
-    watchers_count: 0,
+    watchers_count: row.numWatches,
     branch_count: 0, // TODO(SPEC-0001/0005): engine refs snapshot count
     // SPEC-0005 §3.2 maintained counters (updated by the issue/PR services).
     open_issues_count: row.numIssues,

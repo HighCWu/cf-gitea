@@ -18,10 +18,11 @@ import type { RepositoryWithOwner } from "./repository";
  * `STARS_DDL_STATEMENTS` block was deleted with the sweep — the generated
  * migration is authoritative now.
  *
- * Residual gap: `Repository.stars_count` (services/repository.ts) still
- * renders the documented zero — upstream maintains `repository.num_stars` +
- * `user.num_stars` counter columns we do not model; countUserStars below is
- * the ready read when a counter or live-count projection lands.
+ * Residual gap: upstream ALSO maintains the per-USER `user.num_stars` twin
+ * (star.go:48/62) — the users table carries no such column (documented in
+ * src/db/schema.ts); the per-REPO `repositories.num_stars` half IS modeled
+ * (migration 0030) and maintained below. countUserStars below is the ready
+ * read for a `starred_repos_count` projection.
  */
 
 export interface StarListOptions {
@@ -45,30 +46,72 @@ export async function isStarring(d1: D1Database, userId: number, repoId: string)
 }
 
 /**
- * `StarRepo(…, true)` (star.go:29–50) reduced to the modeled surface: the
+ * `StarRepo(…, true)` (star.go:29–69) reduced to the modeled surface: the
  * already-starring arm is the upstream silent no-op (nil → the API's 204),
  * the insert is one guarded row — the `stars_user_repo_uq` pair is the
  * idempotence arbiter (ON CONFLICT DO NOTHING). Documented divergences:
- *   - the `IsUserBlockedBy` arm (ErrBlockedUser → the declared 403) is
- *     unreachable — cf-gitea has no user-blocks model yet;
- *   - upstream maintains `repository.num_stars` + `user.num_stars` counters in
- *     the same transaction (star.go:45–50) — no such columns exist (the API
- *     renders zero counters, services/repository.ts), so the counter halves
- *     are skipped, not stubbed.
+ *   - the per-USER `user.num_stars` counter (star.go:48) is unreachable —
+ *     no such column (see the header);
+ *   - the `ClearRepoStars` zeroing (star.go:94–104, repo set private) is the
+ *     repos wave's seam.
+ *
+ * Counter maintenance (the migration-0030 `repositories.num_stars` column):
+ * upstream moves the counter and the edge inside ONE WithTx (star.go:42–50
+ * — insert, then `num_stars = num_stars + 1`, rolling back together). The
+ * same shape here is one D1 batch (= one implicit SQLite transaction) of a
+ * counter UPDATE followed by the guarded INSERT:
+ *   - the UPDATE is guarded by the edge's ABSENCE (`NOT EXISTS`), evaluated
+ *     before the insert lands — the upstream `if staring { return nil }`
+ *     arm (star.go:38–40), made atomic: a repeat PUT's update sees the
+ *     surviving edge inside its own serialized batch and moves nothing
+ *     (a concurrent double-star serializes on the write lock, so exactly
+ *     one batch counts);
+ *   - ordering UPDATE→INSERT keeps the whole increment+insert indivisible:
+ *     a failed insert rolls the bump back, like upstream's transaction.
  */
 export async function starRepo(d1: D1Database, userId: number, repoId: string, now: Date): Promise<void> {
-  await drizzle(d1)
-    .insert(stars)
-    .values({ userId, repoId, createdAt: now })
-    .onConflictDoNothing({ target: [stars.userId, stars.repoId] });
+  const db = drizzle(d1);
+  await db.batch([
+    db
+      .update(repositories)
+      .set({ numStars: sql`num_stars + 1` })
+      .where(
+        and(
+          eq(repositories.id, repoId),
+          sql`NOT EXISTS (SELECT 1 FROM stars WHERE user_id = ${userId} AND repo_id = ${repoId})`,
+        ),
+      ),
+    db
+      .insert(stars)
+      .values({ userId, repoId, createdAt: now })
+      .onConflictDoNothing({ target: [stars.userId, stars.repoId] }),
+  ]);
 }
 
 /**
- * `StarRepo(…, false)` — idempotent unsubscribe; the counter halves are
- * skipped (no columns).
+ * `StarRepo(…, false)` (star.go:51–65) — idempotent unsubscribe. One D1
+ * batch, counter first: the decrement is guarded by the edge's EXISTENCE
+ * (the upstream `if !staring { return nil }` arm, star.go:52–54 — a repeat
+ * DELETE moves nothing), then the row delete lands. The MAX(…, 0) floor is
+ * drift insurance, not semantics: upstream's ±1 arithmetic can never cross
+ * zero (counter and edge move in one transaction, star.go:56–64), but rows
+ * predating migration 0030 were backfilled to 0 beneath pre-existing star
+ * edges — un-starring such an edge floors at 0 instead of going negative.
  */
 export async function unstarRepo(d1: D1Database, userId: number, repoId: string): Promise<void> {
-  await drizzle(d1).delete(stars).where(and(eq(stars.userId, userId), eq(stars.repoId, repoId)));
+  const db = drizzle(d1);
+  await db.batch([
+    db
+      .update(repositories)
+      .set({ numStars: sql`MAX(num_stars - 1, 0)` })
+      .where(
+        and(
+          eq(repositories.id, repoId),
+          sql`EXISTS (SELECT 1 FROM stars WHERE user_id = ${userId} AND repo_id = ${repoId})`,
+        ),
+      ),
+    db.delete(stars).where(and(eq(stars.userId, userId), eq(stars.repoId, repoId))),
+  ]);
 }
 
 /**

@@ -15,10 +15,11 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repositories } from "../db/schema";
+import { repositories, repoWatchers } from "../db/schema";
 import { createStubAuthResolver, createTokenAuthMiddleware } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
+import { findRepositoryByPath, toApiRepository } from "./services/repository";
 import { registerSubscriptionRoutes } from "./routes/subscription";
 import { countRepoWatchers } from "./services/repo-watchers";
 import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
@@ -164,5 +165,55 @@ describe("watcher store", () => {
     expect(row).toBeDefined();
     expect(await countRepoWatchers(env.DB, "7101")).toBe(1);
     expect(await countRepoWatchers(env.DB, "7102")).toBe(0);
+  });
+});
+
+/**
+ * The maintained `repositories.num_watches` counter (migration 0030) — the
+ * watchRepoByMode delta arithmetic (models/repo/watch.go:128-154: the
+ * counter moves ONLY when watching-ness flips, `num_watches = num_watches
+ * + ?` in the same transaction as the edge write), rendered as the API
+ * `watchers_count` (services/convert/repository.go:221 `Watchers:
+ * repo.NumWatches`).
+ */
+describe("repositories.num_watches maintenance (migration 0030)", () => {
+  async function numWatches(repoId: string): Promise<number> {
+    const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get();
+    if (row === undefined) throw new Error("repo seed failed");
+    return row.numWatches;
+  }
+
+  it("PUT watch bumps the counter; the repeat PUT (watch.go:121-123's already-watching skip) moves nothing", async () => {
+    await makeApp()("/repos/someone-else/watched/subscription", { method: "PUT", headers: authHeaders });
+    expect(await numWatches("7101")).toBe(1);
+    await makeApp()("/repos/someone-else/watched/subscription", { method: "PUT", headers: authHeaders });
+    expect(await numWatches("7101")).toBe(1);
+    // The sibling repo never moves.
+    expect(await numWatches("7102")).toBe(0);
+  });
+
+  it("DELETE unwatch decrements; the repeat DELETE (watch.go's delta-0 arm) moves nothing and the column never crosses 0", async () => {
+    await makeApp()("/repos/someone-else/watched/subscription", { method: "PUT", headers: authHeaders });
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { method: "DELETE", headers: authHeaders })).status).toBe(204);
+    expect(await numWatches("7101")).toBe(0);
+    // The repeat DELETE: no edge → repoWatchDelta 0 (watch.go:130-134).
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { method: "DELETE", headers: authHeaders })).status).toBe(204);
+    expect(await numWatches("7101")).toBe(0);
+  });
+
+  it("a pre-0030 edge (backfilled counter 0 beneath a seeded watch) unwatching floors at 0, never negative", async () => {
+    await drizzle(env.DB).insert(repoWatchers).values({ repoId: "7101", userId: 1, createdAt: new Date() });
+    expect(await numWatches("7101")).toBe(0);
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { method: "DELETE", headers: authHeaders })).status).toBe(204);
+    expect(await numWatches("7101")).toBe(0); // MAX(num_watches - 1, 0), not -1
+  });
+
+  it("renders as watchers_count (convert/repository.go:221 — Watchers: repo.NumWatches)", async () => {
+    await makeApp()("/repos/someone-else/watched/subscription", { method: "PUT", headers: authHeaders });
+    const pair = await findRepositoryByPath(env.DB, "someone-else", "watched");
+    if (pair === null) throw new Error("repo seed failed");
+    const rendered = toApiRepository({ origin: "https://example.com", requester: null }, pair);
+    expect(rendered.watchers_count).toBe(1);
+    expect(rendered.stars_count).toBe(0); // untouched by the watch arm
   });
 });

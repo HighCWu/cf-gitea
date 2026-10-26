@@ -61,7 +61,9 @@ const repoRoot = path.resolve(scriptDir, '..');
 // glyphs (the navbar bell, the mark-all checklist, the row pin mark, the
 // empty-tab inbox, the mark-as-unread bell reuse) and the mirror panel's
 // sync mark is the existing clock — the five additions below cover the
-// notifications grep under apps/worker/src/ui. Wave 16 (the repo branches
+// notifications grep under apps/worker/src/ui. Wave-star-watch-counters
+// (the repo social fork rows) adds the shared/repo/list:45-46 trailing
+// stars mark (octicon-star). Wave 16 (the repo branches
 // page) adds the protection mark the list rows render when a first-match
 // rule governs the branch (list.tmpl's `{{if .IsProtected}}{{svg
 // "octicon-shield-lock"}}` — the render extras' consumer, SPEC-0013 §3.6).
@@ -84,6 +86,7 @@ const ALLOWLIST = [
   'octicon-info',
   'octicon-package',
   'octicon-search',
+  'octicon-star',
   'octicon-tag',
   'octicon-dot-fill',
   'octicon-file',

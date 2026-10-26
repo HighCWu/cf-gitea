@@ -15,6 +15,7 @@ import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
+import { eq } from "drizzle-orm";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { repositories, stars, userBlocking, users } from "../../db/schema";
@@ -22,6 +23,7 @@ import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
+import { findRepositoryByPath, toApiRepository } from "../services/repository";
 import { registerStarredRoutes } from "./starred";
 
 const ERROR_URL = "https://example.com/api/swagger";
@@ -180,5 +182,98 @@ describe("PUT /user/starred/{owner}/{repo}: the StarRepo blocked arm", () => {
     });
     expect(res.status).toBe(204);
     expect(await drizzle(env.DB).select().from(stars).all()).toHaveLength(0);
+  });
+});
+
+/**
+ * The maintained `repositories.num_stars` counter (migration 0030) — the
+ * StarRepo transactional halves (models/repo/star.go:42-50 insert + bump,
+ * :56-64 delete + decrement, one WithTx upstream / one D1 batch here),
+ * rendered as the API `stars_count` (services/convert/repository.go:219
+ * `Stars: repo.NumStars`).
+ */
+describe("repositories.num_stars maintenance (migration 0030)", () => {
+  /** The recluse-owned source repo (the first describe's seed, local to this
+   *  block — returns the pair of user ids). */
+  async function seedCounterRepo(): Promise<{ ownerId: number; doerId: number }> {
+    const owner = await seedUser("recluse");
+    const doer = await seedUser("stargazer");
+    await drizzle(env.DB).insert(repositories).values({
+      id: "7302",
+      storageKey: "r_7302",
+      ownerNamespace: "recluse",
+      ownerId: owner.id,
+      slug: "source",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    return { ownerId: owner.id, doerId: doer.id };
+  }
+
+  const block = (blockerId: number, blockeeId: number) =>
+    drizzle(env.DB).insert(userBlocking).values({ blockerId, blockeeId, note: "", createdAt: new Date() });
+
+  const putStar = (doerId: number) =>
+    makeApp()("/user/starred/recluse/source", { method: "PUT", headers: { Authorization: `token u${doerId}` } });
+
+  async function numStars(): Promise<number> {
+    const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "7302")).get();
+    if (row === undefined) throw new Error("repo seed failed");
+    return row.numStars;
+  }
+
+  it("PUT star bumps the counter; the repeat PUT is the star.go:38-40 no-op and moves nothing", async () => {
+    const { doerId } = await seedCounterRepo();
+    await putStar(doerId);
+    expect(await numStars()).toBe(1);
+    expect(await drizzle(env.DB).select().from(stars).all()).toHaveLength(1);
+    await putStar(doerId);
+    expect(await numStars()).toBe(1);
+    expect(await drizzle(env.DB).select().from(stars).all()).toHaveLength(1);
+  });
+
+  it("DELETE unstar decrements; the repeat DELETE (no edge) moves nothing and the column never crosses 0", async () => {
+    const { doerId } = await seedCounterRepo();
+    await putStar(doerId);
+    await makeApp()("/user/starred/recluse/source", { method: "DELETE", headers: { Authorization: `token u${doerId}` } });
+    expect(await numStars()).toBe(0);
+    // The repeat DELETE: upstream's `if !staring { return nil }` arm.
+    await makeApp()("/user/starred/recluse/source", { method: "DELETE", headers: { Authorization: `token u${doerId}` } });
+    expect(await numStars()).toBe(0);
+    expect(await drizzle(env.DB).select().from(stars).all()).toHaveLength(0);
+  });
+
+  it("the blocked PUT never counts (the 403 arm precedes any write) — red→green: num_stars stays 0", async () => {
+    const { ownerId, doerId } = await seedCounterRepo();
+    await block(ownerId, doerId);
+    const res = await putStar(doerId);
+    expect(res.status).toBe(403);
+    expect(await numStars()).toBe(0);
+  });
+
+  it("a pre-0030 edge (backfilled counter 0 beneath a seeded star) unstarring floors at 0, never negative", async () => {
+    const { doerId } = await seedCounterRepo();
+    // The migration-0030 backfill shape: an edge whose counter column is the
+    // ALTER default 0 (seeded directly, bypassing the route arm).
+    await drizzle(env.DB).insert(stars).values({ userId: doerId, repoId: "7302", createdAt: new Date() });
+    expect(await numStars()).toBe(0);
+    const res = await makeApp()("/user/starred/recluse/source", {
+      method: "DELETE",
+      headers: { Authorization: `token u${doerId}` },
+    });
+    expect(res.status).toBe(204);
+    expect(await numStars()).toBe(0); // MAX(num_stars - 1, 0), not -1
+  });
+
+  it("renders as stars_count (convert/repository.go:219 — Stars: repo.NumStars)", async () => {
+    const { doerId } = await seedCounterRepo();
+    await putStar(doerId);
+    const pair = await findRepositoryByPath(env.DB, "recluse", "source");
+    if (pair === null) throw new Error("repo seed failed");
+    const rendered = toApiRepository({ origin: "https://example.com", requester: null }, pair);
+    expect(rendered.stars_count).toBe(1);
+    expect(rendered.watchers_count).toBe(0); // untouched by the star arm
   });
 });
