@@ -109,36 +109,7 @@ export async function handleForkMessage(env: Env, msg: RepoForkMessage): Promise
     return;
   }
 
-  // Structural stubs over the two RepoCells (replicate.ts's ForkSourceRepo /
-  // ForkTargetRepo): the DO RPC surface already matches; the adapters only
-  // strip the tag-peel cache field the loop does not need.
-  const parentCell = env.REPO.getByName(`${source.ownerNamespace}/${source.slug}`);
-  const forkCell = env.REPO.getByName(`${fork.ownerNamespace}/${fork.slug}`);
-  const parent: ForkSourceRepo = {
-    listCatalogPage: (after, limit) => parentCell.listCatalogPage(after, limit),
-    listRefs: async () => {
-      const refs = await parentCell.listRefs();
-      return { head: refs.head, refs: refs.refs.map((r) => ({ name: r.name, target: r.target })) };
-    },
-  };
-  const target: ForkTargetRepo = {
-    beginForkImport: (storageKey) => forkCell.beginForkImport(storageKey),
-    adoptForkPacks: (page) => forkCell.adoptForkPacks(page),
-    finalizeForkImport: (input) => forkCell.finalizeForkImport(input),
-  };
-
-  let result: ReplicateForkResult | null = null;
-  try {
-    result = await replicateForkCatalog(parent, target, env.REPO_PACKS, {
-      parentStorageKey: source.storageKey,
-      forkStorageKey: fork.storageKey,
-    });
-  } catch (error) {
-    if (!isAlreadyFinalized(error)) throw error;
-    // Redelivery after a committed finalize: the replication is done, only
-    // the settle below still matters (it is CAS'd and idempotent).
-  }
-  void result; // counts are observability-only today (no D1 columns for them)
+  await replicateRepoCopy(env, source, fork);
 
   const settled = await settleForkRow(db, fork, source.isEmpty);
   if (settled) {
@@ -172,13 +143,59 @@ export async function handleForkMessage(env: Env, msg: RepoForkMessage): Promise
 }
 
 /**
+ * The engine's replication pass, shared by the fork consumer and the
+ * template-generate API (POST /repos/{owner}/{repo}/generate —
+ * api/services/generate-repo.ts rides THIS pass synchronously instead of
+ * through the queue, so the 201 body describes a real repo; upstream
+ * GenerateRepository is synchronous too). Structural stubs over the two
+ * RepoCells (replicate.ts's ForkSourceRepo / ForkTargetRepo): the DO RPC
+ * surface already matches; the adapters only strip the tag-peel cache field
+ * the loop does not need.
+ *
+ * Idempotent the same way the consumer is: after a committed finalize,
+ * `beginForkImport` refuses with "fork target is not empty" — that exact
+ * refusal is the documented already-done success. Every other failure
+ * throws (the queue retry arm / the route's error mapping).
+ */
+export async function replicateRepoCopy(env: Env, source: RepoRow, fork: RepoRow): Promise<void> {
+  const parentCell = env.REPO.getByName(`${source.ownerNamespace}/${source.slug}`);
+  const forkCell = env.REPO.getByName(`${fork.ownerNamespace}/${fork.slug}`);
+  const parent: ForkSourceRepo = {
+    listCatalogPage: (after, limit) => parentCell.listCatalogPage(after, limit),
+    listRefs: async () => {
+      const refs = await parentCell.listRefs();
+      return { head: refs.head, refs: refs.refs.map((r) => ({ name: r.name, target: r.target })) };
+    },
+  };
+  const target: ForkTargetRepo = {
+    beginForkImport: (storageKey) => forkCell.beginForkImport(storageKey),
+    adoptForkPacks: (page) => forkCell.adoptForkPacks(page),
+    finalizeForkImport: (input) => forkCell.finalizeForkImport(input),
+  };
+
+  let result: ReplicateForkResult | null = null;
+  try {
+    result = await replicateForkCatalog(parent, target, env.REPO_PACKS, {
+      parentStorageKey: source.storageKey,
+      forkStorageKey: fork.storageKey,
+    });
+  } catch (error) {
+    if (!isAlreadyFinalized(error)) throw error;
+    // A committed finalize is already in place: the replication is done.
+  }
+  void result; // counts are observability-only today (no D1 columns for them)
+}
+
+/**
  * The import-settle pattern (imports/service.ts settleDone): one CAS UPDATE,
  * `status='creating' → 'ready'`, emptiness copied from the source. 0 rows
  * changed on a redelivery (or after a concurrent delete) — a no-op, never a
  * resurrection. Returns whether THIS invocation flipped the row — the fork
- * event's exactly-once gate.
+ * event's exactly-once gate (and the generate route's settle; upstream
+ * GenerateRepository flips RepositoryBeingMigrated → RepositoryReady at the
+ * end of the same flow, template.go:181-187).
  */
-async function settleForkRow(
+export async function settleForkRow(
   db: DrizzleD1Database,
   fork: RepoRow,
   sourceEmpty: boolean,

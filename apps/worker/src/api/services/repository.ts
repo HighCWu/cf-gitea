@@ -313,7 +313,7 @@ export function toApiRepository(
     empty: row.isEmpty,
     private: row.visibility === "private",
     fork: false, // TODO(SPEC-0005): forks (SPEC-0003 fork primitives)
-    template: false, // TODO(SPEC-0005): is_template column
+    template: row.isTemplate, // is_template (migration 0027) — templates + generate (routes/generate-repo.ts)
     mirror: false, // TODO(SPEC-0005): mirrors
     size: 0, // TODO(SPEC-0005): engine-computed size (KiB), persisted at rest
     language: "", // TODO(SPEC-0005): engine language statistics
