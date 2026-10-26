@@ -213,7 +213,10 @@ describe("wave-53 parser families (parseUiRoute / handlesUiRoute)", () => {
 
   it("keeps the /user prefix exclusion and the repo family intact", () => {
     // Upstream's reqSignIn /user group owns the whole /user/* namespace.
-    expect(parseUiRoute("/user/settings/hooks")).toBeNull();
+    // Window-2a (0c2b151) mounted the USER hooks tab under it — the stale
+    // toBeNull pin updated to the claimed shape (the org-hooks matrix's
+    // escalation).
+    expect(parseUiRoute("/user/settings/hooks")).toEqual({ family: "user-settings-hooks", id: null });
     // The REPO webhooks family (wave 4/14) is a different shape — five
     // segments with a repo between.
     expect(parseUiRoute("/octo/hello/settings/hooks")).toEqual({ family: "settings-hooks", owner: "octo", repo: "hello" });
