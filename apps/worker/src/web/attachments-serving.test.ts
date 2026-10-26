@@ -10,8 +10,10 @@
  * INLINE-by-default disposition (upstream sandboxes instead of forcing
  * downloads — the SVG-disabled arm is the only download one and it is dead at
  * frozen settings), the CSP variants, the R2 streaming with the 1024-byte
- * sniff pre-read, and the Go ports' wire forms (http.Error bodies,
- * mime.FormatMediaType disposition encoding, net/http sniff table).
+ * sniff pre-read, the Go ports' wire forms (http.Error bodies,
+ * mime.FormatMediaType disposition encoding, net/http sniff table), and the
+ * session-cookie credential arms (SPEC-0010 §2.9 — token-first, session
+ * fallback, the upstream group order).
  */
 
 import { applyD1Migrations, env } from "cloudflare:test";
@@ -19,9 +21,10 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { issueAttachments, issues, releaseAssets, releases, repositories, users } from "../db/schema";
+import { issueAttachments, issues, releaseAssets, releases, repositories, sessions, users } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { mintFor } from "../auth/testing/seeds";
+import { mintSession, SESSION_COOKIE_NAME } from "../ui/session";
 import { uploadIssueAttachment } from "../api/routes/issue-attachments";
 import {
   attachmentsServingRouter,
@@ -56,6 +59,7 @@ beforeEach(async () => {
     "repo_settings",
     "personal_access_tokens",
     "auth_failures",
+    "sessions",
     "repositories",
     "users",
   ]) {
@@ -752,5 +756,146 @@ describe("GET /attachments/{uuid} — dangling-link 500 arm", () => {
     await db().delete(issues).where(eq(issues.id, issue.id));
     const res = await serve(`/attachments/${row.uuid}`);
     expect(res.status).toBe(500);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The session-cookie credential arms (SPEC-0010 §2.9): the route's upstream
+// auth group is built token-methods-then-Session (web.go:129-152, Group.Verify
+// first-match-wins with error fall-through) and this seam mirrors that order
+// — the logged-in browser clicking a `browser_download_url` holds a session,
+// not a token, and must not 404 on its own private-repo asset.
+// ---------------------------------------------------------------------------
+
+describe("GET /attachments/{uuid} — session-cookie credential arms", () => {
+  it("serves a private-repo attachment to the cookie-session owner (the browser_download_url probe)", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PRIVATE_REPO_ID, PRIVATE_STORAGE_KEY, owner, "private");
+    const issue = await seedIssue(PRIVATE_REPO_ID, owner.id);
+    const payload = new TextEncoder().encode("session-served bytes");
+    const row = await seedIssueAttachment({
+      repoId: PRIVATE_REPO_ID,
+      storageKey: PRIVATE_STORAGE_KEY,
+      issueId: issue.id,
+      name: "notes.txt",
+      content: payload,
+    });
+    const cookie = await mintSession(env.DB, owner.id);
+    const res = await serve(`/attachments/${row.uuid}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    });
+    expect(res.status).toBe(200);
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(payload);
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(1);
+  });
+
+  it("carries the rotation Set-Cookie on the asset response when the session is due (§2.4 step 5)", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PRIVATE_REPO_ID, PRIVATE_STORAGE_KEY, owner, "private");
+    const issue = await seedIssue(PRIVATE_REPO_ID, owner.id);
+    const row = await seedIssueAttachment({
+      repoId: PRIVATE_REPO_ID,
+      storageKey: PRIVATE_STORAGE_KEY,
+      issueId: issue.id,
+      name: "notes.txt",
+      content: new TextEncoder().encode("rotation bytes"),
+    });
+    const cookie = await mintSession(env.DB, owner.id);
+    // Backdate the rotation clock: rotated ≥ 24 h ago, still unexpired.
+    const sessionId = cookie.slice(0, cookie.indexOf(":"));
+    const past = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await db().update(sessions).set({ rotatedAt: past, lastSeenAt: past }).where(eq(sessions.id, sessionId));
+
+    const res = await serve(`/attachments/${row.uuid}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    });
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get("set-cookie");
+    expect(setCookie).not.toBeNull();
+    expect(setCookie?.startsWith(`${SESSION_COOKIE_NAME}=`)).toBe(true);
+    // the rotation form, NOT the clear form
+    expect(setCookie).not.toContain("Max-Age=0");
+    expect(setCookie).toContain("HttpOnly");
+  });
+
+  it("degrades a dead session cookie to anonymous (404) and clears it", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PRIVATE_REPO_ID, PRIVATE_STORAGE_KEY, owner, "private");
+    const issue = await seedIssue(PRIVATE_REPO_ID, owner.id);
+    const row = await seedIssueAttachment({
+      repoId: PRIVATE_REPO_ID,
+      storageKey: PRIVATE_STORAGE_KEY,
+      issueId: issue.id,
+      name: "notes.txt",
+      content: new TextEncoder().encode("private"),
+    });
+    const res = await serve(`/attachments/${row.uuid}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=dead:beef` },
+    });
+    expect(res.status).toBe(404);
+    expect(res.headers.get("set-cookie")).toBe(
+      `${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`,
+    );
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(0);
+  });
+
+  it("token wins over the session cookie when both are present (upstream group order → scope check fires)", async () => {
+    const owner = await seedUser("attach-owner");
+    const stranger = await seedUser("attach-stranger");
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public");
+    const issue = await seedIssue(PUBLIC_REPO_ID, owner.id);
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: issue.id,
+      name: "shot.png",
+      content: pngPayload(),
+    });
+    // A VALID session cookie AND a valid token without read:issue: the token
+    // arm matches first (web.go:129-152 builds OAuth2/Basic BEFORE Session),
+    // so the scope check fires → 403. A session-first walk would resolve a
+    // scope-less doer and serve 200.
+    const cookie = await mintSession(env.DB, stranger.id);
+    const token = (await mintFor(stranger.id, "repo-only", "read:repository")).plaintext;
+    const res = await serve(`/attachments/${row.uuid}`, {
+      headers: { authorization: `token ${token}`, cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    });
+    expect(res.status).toBe(403);
+    // first match stops the walk — the session was never read, no directive
+    expect(res.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("falls through an invalid token to a valid session (Group.Verify error fall-through)", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PRIVATE_REPO_ID, PRIVATE_STORAGE_KEY, owner, "private");
+    const issue = await seedIssue(PRIVATE_REPO_ID, owner.id);
+    const row = await seedIssueAttachment({
+      repoId: PRIVATE_REPO_ID,
+      storageKey: PRIVATE_STORAGE_KEY,
+      issueId: issue.id,
+      name: "notes.txt",
+      content: new TextEncoder().encode("fall-through bytes"),
+    });
+    const cookie = await mintSession(env.DB, owner.id);
+    const res = await serve(`/attachments/${row.uuid}`, {
+      headers: { authorization: "token not-a-real-token", cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("serves a draft-release asset to the cookie-session owner (the write grant reads the session doer)", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public");
+    const uuid = await seedReleaseAsset({
+      repoId: PUBLIC_REPO_ID,
+      isDraft: true,
+      name: "draft.bin",
+      content: new TextEncoder().encode("session draft bytes"),
+    });
+    const cookie = await mintSession(env.DB, owner.id);
+    const res = await serve(`/attachments/${uuid}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    });
+    expect(res.status).toBe(200);
   });
 });

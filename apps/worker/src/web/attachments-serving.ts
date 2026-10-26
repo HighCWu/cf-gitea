@@ -18,6 +18,15 @@ import { collaboratorModeOf } from "../api/services/repo-collaborators";
 // git-HTTP matrix and the UI page resolution; this web seam rides it too, so
 // page visibility, git-HTTP visibility, and attachment visibility cannot drift.
 import { readGrant } from "../git-http/acl";
+// The session-cookie credential (SPEC-0010 §2.9): this seam serves the
+// browser dereferencing `browser_download_url`, so the web session signs it
+// beside the token arm. `resolveViewer` (src/ui/viewer.ts) is the page-domain
+// precedent; this seam drives the same §2.4 verification one layer down
+// (verifySession — the public API resolveViewer itself calls) because the
+// RESPONSE here must carry the wire-form directive: the rotation value
+// re-wrapped via sessionSetCookie (the viewer's folded `setCookie` returns
+// the RAW `id:secret` value, a form only its page dispatcher consumes).
+import { clearSessionSetCookie, sessionCookieValue, sessionSetCookie, verifySession } from "../ui/session";
 
 /**
  * The site-level attachment-serving seam — the surveyed web family
@@ -72,8 +81,9 @@ import { readGrant } from "../git-http/acl";
  *      attachmentReadScope (attachment.go:25-34): issues/PRs require
  *      `read:issue`, releases `read:repository`; missing scope → 403 (AFTER
  *      the 404 arms). Only token-carrying doers are checked upstream
- *      (hasApiTokenScope); cf-gitea has no sessions, so every authenticated
- *      caller is a token caller and the check always runs for them.
+ *      (GetDoerTokenScope misses → early return, permission.go:19-22) — a
+ *      session-authenticated doer skips the check, and the AUTH arm below
+ *      mirrors that by resolving session doers with a null scope.
  *      Documented divergence: upstream's web route does NOT apply the token's
  *      public-only bit (that is an API-tier enforcement — GetDoerRepoPermission
  *      reads the user's grants), so the git-HTTP gate's maskedByPublicOnly arm
@@ -149,11 +159,30 @@ import { readGrant } from "../git-http/acl";
  * (CORS is disabled by default so optionsCorsHandler degenerates to re-running
  * the download — a preflight would double-count downloads).
  *
- * AUTH: token/Bearer/Basic-candidate credentials via the SPEC-0002 parsers
- * (webAuth.AllowBasic/AllowOAuth2); invalid credentials degrade to anonymous
- * (upstream's web chain does not abort on auth failure) and a limiter-blocked
- * IP likewise degrades (ef2c049 fail-open; upstream has no limiter on web
- * routes at all).
+ * AUTH — two credentials BESIDE each other, in the route's upstream group
+ * order (SPEC-0010 §2.9: an attachments BROWSER route is a web surface, so
+ * the session cookie signs it beside the token arm): upstream builds the
+ * route's auth group token-methods-then-session (web.go:912 mounts
+ * `webAuth.AllowBasic, webAuth.AllowOAuth2`; web.go:129-152 adds OAuth2 and
+ * Basic BEFORE the always-appended Session; services/auth/group.go
+ * Group.Verify is first-match-wins in list order and a failed method does
+ * not stop the next). The walk mirrors that order:
+ *   1. The token arm — token/Bearer/Basic-candidate via the SPEC-0002
+ *      parsers; invalid degrades to the NEXT arm (not straight to anonymous:
+ *      Group.Verify's fall-through), and the brute-force limiter rides the
+ *      credential-testing path fail-open (ef2c049) with a blocked IP
+ *      degrading the same way (upstream has no limiter on web routes).
+ *   2. The session arm — the `gitea_session` cookie through the §2.4
+ *      verification (SPEC-0010; src/ui/viewer.ts's resolveViewer is the
+ *      page-domain precedent): absent cookie → anonymous with ZERO D1
+ *      session reads; dead cookie → anonymous plus the clear directive;
+ *      live session → the doer, and the directive (rotation or clear) rides
+ *      every response the handler emits after resolution (drop a rotation
+ *      directive and the browser's stale cookie dies once the 60 s grace
+ *      lapses). A session doer carries no token scope, so step 7's check
+ *      skips it exactly like upstream.
+ * No merge: the doer comes entirely from the first arm that matches
+ * (upstream ctx.Doer is one user).
  *
  * INTEGRATION (orchestrator-owned — src/index.ts, untouched here): /attachments
  * is a two-segment path, so the fetch dispatcher's repo-scoped branch
@@ -760,39 +789,99 @@ function requestCredential(request: Request): string | null {
 export interface CredentialResult {
   doer: Doer | null;
   scope: ScopeSet | null;
+  /** The session-cookie directive the RESPONSE must carry, in wire form —
+   *  the rotation re-wrapped via sessionSetCookie, or clearSessionSetCookie
+   *  for a dead cookie. Non-null only when the session arm ran: the token
+   *  arm never touches the session (upstream skips Session.Verify once a
+   *  token method matched). */
+  setCookie: string | null;
+}
+
+export interface ResolveCredentialOptions {
+  /** Background-work sink for the session verification's side-effects (the
+   *  viewer seam's `ResolveViewerOptions.waitUntil` twin); omitted, the work
+   *  settles inline — never dropped. */
+  readonly waitUntil?: (promise: Promise<unknown>) => void;
 }
 
 /**
- * The optional web-auth walk (upstream webAuth: Basic/OAuth2 credentials,
- * session-equivalent absent — SPEC-0002 tokens only). Invalid credentials
- * degrade to anonymous (upstream's web chain does not abort); the
- * brute-force limiter rides the credential-testing path fail-open (ef2c049)
- * and a blocked IP degrades to anonymous too.
+ * The optional web-auth walk (upstream webAuth for this route, FIRST-MATCH
+ * in the pinned group order — web.go:129-152 builds OAuth2/Basic BEFORE the
+ * appended Session and services/auth/group.go Group.Verify stops at the
+ * first method returning a user, falling through on a method's error):
+ *
+ *   1. The token arm (the SPEC-0002 parsers over Authorization —
+ *      webAuth.AllowBasic/AllowOAuth2): a verified token resolves the doer
+ *      + scope and the walk STOPS (no session reads). An invalid token — or
+ *      a limiter-blocked IP (ef2c049 fail-open) — falls through to the next
+ *      arm, the way Group.Verify tries the next method after an error.
+ *   2. The session arm (`gitea_session` through verifySession — the §2.4
+ *      walk behind the viewer seam, SPEC-0010 §2.5): resolves the doer when
+ *      the cookie is present and valid; every other outcome is anonymous,
+ *      with the cookie directive (rotation re-wrapped via sessionSetCookie,
+ *      or the clear form) returned for the response. No cookie → anonymous
+ *      with ZERO D1 session reads. A D1 failure propagates (the viewer's
+ *      never-fail-open rule, §4.8).
+ *
+ * A session doer resolves with scope null: CheckTokenScopes no-ops for a
+ * doer without an API-token scope (permission.go:19-22), so step 7's check
+ * skips session doers exactly like upstream. No merge across arms.
  */
-export async function resolveOptionalCredential(request: Request, env: Env): Promise<CredentialResult> {
+export async function resolveOptionalCredential(
+  request: Request,
+  env: Env,
+  options?: ResolveCredentialOptions,
+): Promise<CredentialResult> {
   const credential = requestCredential(request);
-  if (credential === null) {
-    return { doer: null, scope: null };
+  if (credential !== null) {
+    const now = new Date();
+    const limiter = new D1FailureLimiter(env.DB);
+    const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+    const verdict = await limiterCheckFailOpen(limiter, ip, now);
+    if (!verdict.blocked) {
+      const verified = await new TokenService(env.DB).verify(credential, { now });
+      if (verified !== null) {
+        const scope = ScopeSet.parseLenient(verified.token.scopes);
+        await limiterResetFailOpen(limiter, ip);
+        const service = new TokenService(env.DB);
+        if (service.needsLastUsedTouch(verified.token, now)) {
+          await service.touchLastUsed(verified.token.id, now).catch(() => undefined);
+        }
+        // First match wins — upstream never runs Session.Verify past it.
+        return { doer: { id: verified.user.id, isAdmin: verified.user.isAdmin }, scope, setCookie: null };
+      }
+      await limiterRecordFailureFailOpen(limiter, ip, now);
+    }
+    // Invalid or blocked: fall through to the session arm (Group.Verify's
+    // error fall-through; upstream's web chain does not abort).
   }
-  const now = new Date();
-  const limiter = new D1FailureLimiter(env.DB);
-  const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
-  const verdict = await limiterCheckFailOpen(limiter, ip, now);
-  if (verdict.blocked) {
-    return { doer: null, scope: null };
+  // The session arm — the §2.4 walk behind resolveViewer (SPEC-0010 §2.5 is
+  // the page-domain precedent): no cookie → anonymous with ZERO D1 session
+  // reads; a dead/rotated cookie → anonymous plus the clear directive; a
+  // live one → the doer, with the rotation re-wrapped into the wire form
+  // (a session cookie — the remember bit belongs to the sign-in form only).
+  const value = sessionCookieValue(request);
+  if (value === null) {
+    return { doer: null, scope: null, setCookie: null };
   }
-  const verified = await new TokenService(env.DB).verify(credential, { now });
-  if (verified === null) {
-    await limiterRecordFailureFailOpen(limiter, ip, now);
-    return { doer: null, scope: null };
+  const verification = await verifySession(env.DB, value);
+  const settle = (promise: Promise<unknown>): void => {
+    if (options?.waitUntil === undefined) void promise.catch(() => {});
+    else options.waitUntil(promise);
+  };
+  for (const work of verification.background) settle(work);
+  if (verification.outcome !== "authenticated") {
+    return {
+      doer: null,
+      scope: null,
+      setCookie: verification.clearCookie ? clearSessionSetCookie() : null,
+    };
   }
-  const scope = ScopeSet.parseLenient(verified.token.scopes);
-  await limiterResetFailOpen(limiter, ip);
-  const service = new TokenService(env.DB);
-  if (service.needsLastUsedTouch(verified.token, now)) {
-    await service.touchLastUsed(verified.token.id, now).catch(() => undefined);
-  }
-  return { doer: { id: verified.user.id, isAdmin: verified.user.isAdmin }, scope };
+  return {
+    doer: { id: verification.user.id, isAdmin: verification.user.isAdmin },
+    scope: null,
+    setCookie: verification.setCookie === null ? null : sessionSetCookie(verification.setCookie, false),
+  };
 }
 
 /** attachmentReadScope (attachment.go:25-34) — the required token scope per
@@ -947,8 +1036,24 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
       .where(eq(users.usernameLower, repo.ownerNamespace))
       .limit(1)
   )[0];
-  const credential = await resolveOptionalCredential(request, c.env);
+  // `c.executionCtx` is unavailable under direct router.request() test
+  // invocations — the resolver then settles session background work inline
+  // (the ui/index.ts dispatch pattern).
+  let waitUntil: ((promise: Promise<unknown>) => void) | undefined;
+  try {
+    waitUntil = c.executionCtx.waitUntil.bind(c.executionCtx);
+  } catch {
+    waitUntil = undefined;
+  }
+  const credential = await resolveOptionalCredential(request, c.env, { waitUntil });
   const doer = credential.doer;
+  // The session arm's cookie directive (rotation / clear) rides EVERY
+  // response from here on — dropping a rotation directive would leave the
+  // browser's stale cookie to die once the 60 s in-grace window lapses.
+  const respond = (response: Response): Response => {
+    if (credential.setCookie !== null) response.headers.append("Set-Cookie", credential.setCookie);
+    return response;
+  };
   const teamMode =
     doer === null ? "none" : await doerRepoAccessMode(c.env.DB, { id: repo.id, ownerId: repo.ownerId }, doer.id);
   const canRead = readGrant({
@@ -959,7 +1064,7 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
     teamMode,
   });
   if (!canRead) {
-    return NOT_FOUND(); // perm.CanRead fail (:184-187)
+    return respond(NOT_FOUND()); // perm.CanRead fail (:184-187)
   }
 
   // 6. The draft-release arm (:193-203) — release_id is NOT NULL on
@@ -976,14 +1081,16 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
         teamMode,
       ));
     if (!canWrite) {
-      return NOT_FOUND();
+      return respond(NOT_FOUND());
     }
   }
 
   // 7. CheckTokenScopes + attachmentReadScope (:205-210) — AFTER the 404
-  // arms, matching upstream's order; only token doers are checked.
+  // arms, matching upstream's order; only token doers are checked (a
+  // session doer resolves with scope null — CheckTokenScopes no-ops for a
+  // doer without an API-token scope, permission.go:19-22).
   if (doer !== null && credential.scope !== null && !credential.scope.has(attachmentReadScope(unitType))) {
-    return FORBIDDEN();
+    return respond(FORBIDDEN());
   }
 
   // 8. IncreaseDownloadCount (:213-216) — before the bytes, upstream order.
@@ -1004,11 +1111,11 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
   if (r2Key === null) {
     // The relay's pending arm (row-first landing, never uploaded) — nothing
     // to open; the landed blob GET answers the same 404.
-    return NOT_FOUND();
+    return respond(NOT_FOUND());
   }
   const object = await c.env.REPO_PACKS.get(r2Key);
   if (object === null) {
-    return SERVER_ERROR(); // storage.Open ServerError (:233-237)
+    return respond(SERVER_ERROR()); // storage.Open ServerError (:233-237)
   }
 
   // 10. HandleGenericETagPrivateCache (:228-230) — ETag + CreatedUnix.
@@ -1016,7 +1123,7 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
   const created = resolved.row.createdAt ?? null;
   const cached = genericEtagTimeCache(request, etag, created);
   if (cached !== null) {
-    return cached;
+    return respond(cached);
   }
 
   // 11. ServeUserContentByFile (serve.go:232-240) — sniff, headers, stream.
@@ -1071,8 +1178,8 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
   }
 
   if (c.req.method === "HEAD") {
-    return new Response(null, { status: 200, headers });
+    return respond(new Response(null, { status: 200, headers }));
   }
   const body = rest === null ? streamOf(prefix) : prependPrefix(prefix, rest);
-  return new Response(body, { status: 200, headers });
+  return respond(new Response(body, { status: 200, headers }));
 });
