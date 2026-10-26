@@ -3,7 +3,9 @@
  * (SPEC-0008 U3 extension; upstream templates/repo/branch/list.tmpl at the
  * pin, routers/web/repo/branch.go Branches + DeleteBranchPost, and the
  * /branches/delete route shape web.go:1478-1482 `m.Post("/delete",
- * repo.DeleteBranchPost)`).
+ * repo.DeleteBranchPost)`). The wave-branches-reductions pass renders the
+ * now-renderable reductions the wave-61 audit flagged: the writer's
+ * create/rename forms, the PR column, and the info-line glyph (below).
  *
  * ## DOM contract (list.tmpl at the pin)
  *
@@ -14,9 +16,12 @@
  * `branches-default-branch-not-exist` segment) and the Branches section (the
  * h4 header, the shared/search/combo GET form, the branch table, base/
  * paginate). Per-row: the name link onto the `/src/branch/{name}` tree, the
- * `p.info` last-commit line (ShortSha link onto `/commit/{oid}` · subject ·
- * "Updated" TimeSince · author), and the `.commit-divergence` bar pair with
- * the commits_divergence_from / commits_no_divergence tooltips. The bars'
+ * `p.info` last-commit line (the octicon-git-commit mark · ShortSha link
+ * onto `/commit/{oid}` · subject · "Updated" TimeSince · author), the
+ * `.commit-divergence` bar pair with the commits_divergence_from /
+ * commits_no_divergence tooltips, the PR cell (its section below), and the
+ * actions cell (the writer's create/rename forms + the delete button — the
+ * section below). The bars'
  * widths use upstream's Eval formula (100·count/(behind+ahead)); the 0/0 NaN
  * the template knowingly renders is replaced with 0% (an honest
  * improvement, not a fidelity break — nothing reads the value).
@@ -83,29 +88,91 @@
  * `repo.branch.deletion_success` / `default_deletion_failed` /
  * `protected_deletion_failed` / `deletion_failed`.
  *
+ * ## The writer block — create + rename (two-stage, unmounted)
+ *
+ * Upstream's default-section and per-row actions render under `and $.IsWriter
+ * $.Repository.CanContentChange (not .IsDeleted)` (list.tmpl:34,56,163,185):
+ * reduced here to the loader's write grant (principalAccessOfRow's write —
+ * IsWriter's CanWrite(TypeCode)) plus `!repo.isArchived` (CanContentChange;
+ * no mirror column is landed) — deleted rows cannot exist (no
+ * `deleted_branches` table). Each modal button is reduced to an inline no-JS
+ * form carrying upstream's EXACT route and fields, so the mount wave can
+ * serve them verbatim:
+ *
+ * - create: POST `/{owner}/{repo}/branches/_new/branch/{from}` with the
+ *   required `new_branch_name` (web.go:1477-1481's `m.Group("/_new")` +
+ *   forms/repo_branch_form.go NewBranchForm; the octicon-git-branch glyph
+ *   — newly allowlisted — and the `repo.branch.new_branch_from` tooltip are
+ *   the template's, list.tmpl:35-42,164-171);
+ * - rename: POST `/{owner}/{repo}/branches/rename` with `from` (hidden) +
+ *   `to` (required; left empty like upstream's modal — web_src/js/features/
+ *   repo-branch.ts prefills only `from`) (web.go:1486 + RenameBranchForm).
+ *
+ * **HANDOFF — the POST arms are NOT mounted in `src/ui/index.ts`**
+ * (orchestrator-owned; this wave may not touch it, and the parser still
+ * hands `/branches/_new/*` to the engine — pages-wave17's parser test pins
+ * that): until the mount wave lands the two arms, a submitted form 404s.
+ * This is the sibling two-stage-unmounted convention (the settings modules,
+ * 46230c8..fbbc05b): render + upstream contract first, write arm second.
+ * The future arm must carry upstream's group middlewares' posture
+ * (RepoMustNotBeArchived + reqRepoCodeWriter + MustBeNotEmpty) and replay
+ * the landed API create/rename ops (routes/branches.ts POST/PATCH) the way
+ * applyBranchDelete replays repoDeleteBranch.
+ *
+ * ## The PR column (list.tmpl's third cell, `three wide tw-text-right`)
+ *
+ * loadOneBranch's pull-request shape (services/repository/branch.go:219-270)
+ * over the landed rows: `latestPr` is GetLatestPullRequestByHeadInfo's port
+ * (models/issues/pull.go:525-535 — head_repo_id + head_branch + github
+ * flow, latest by id; ONE joined D1 walk per request, not per branch)
+ * reduced to what the column renders — the shared issue index, hasMerged,
+ * the joined issue's isClosed, and MergeMovedOn (branch.go:240-252: the
+ * merged pull head's tip — `refs/pull/N/head` — exists and differs from the
+ * branch tip; pulled off the SAME listRefs snapshot the page already
+ * loaded, so the check costs one map lookup). The cell plays the template's
+ * four arms (list.tmpl:110-155): no PR + IsIncluded (ahead == 0 — the
+ * already-loaded divergence) → the orange Included label with the
+ * `repo.branch.included_desc` tooltip; no PR + AllowsPulls + ahead > 0 →
+ * the compare button (allowsPulls = `repoSettings.hasPullRequests`,
+ * DEFAULT_REPO_SETTINGS's default — upstream's Repository.AllowsPulls minus
+ * the mirror arm, no mirror column landed); merged + MergeMovedOn → the
+ * compare button; otherwise the `#N` link onto the landed
+ * `/{owner}/{repo}/pulls/{index}` page plus the Merged/Closed/Open state
+ * label (octicon-git-merge / -pull-request-closed / -pull-request, all
+ * allowlisted). The compare link is compareLink(default, branch) +
+ * `?expand=1` (MakeDefaultCompareLink's same-repo shape,
+ * services/context/repo.go:83-87); its label is CanPull's —
+ * CanWrite(TypeCode) || HasForkedRepo (routers/web/repo/branch.go:43-44),
+ * and forks cannot exist yet, so the loader's write grant answers it
+ * ("New Pull Request" vs "Compare").
+ *
  * ## Reads consumed vs degraded
  *
- * - `listRefs()` — the branch universe (the API LIST's filter + sort).
+ * - `listRefs()` — the branch universe (the API LIST's filter + sort) AND
+ *   the tip map the MergeMovedOn check reads.
  * - `readCommit(branch)` — the last-commit line per rendered row (page
  *   slice only); a failed read skips the line, never the row.
  * - `countDivergence(default, branch)` — the ahead/behind pair (SPEC-0001b
  *   §4.1's one-walk rev-list; upstream GetDivergingCommits' shape). A
  *   `missing`/failed read renders an empty divergence cell — upstream
- *   renders -1/-1 there; the honest absence beats a negative count.
+ *   renders -1/-1 there; the honest absence beats a negative count. The
+ *   same -1 posture answers the PR cell: a degraded divergence is never
+ *   "included" and never a compare button (upstream's -1 arms).
  * - D1: `listRepoRules` once + `principalAccessOfRow` once per request (the
- *   API LIST's loadBranchProtectionContext composition); per-branch
+ *   API LIST's loadBranchProtectionContext composition), `loadRepoSettings`
+ *   once (AllowsPulls), and the latest-PR walk once (headRepoId +
+ *   github-flow joined to its issue — GetLatestPullRequestByHeadInfo
+ *   reduced from per-branch queries to one ordered scan); per-branch
  *   predicates only for the rendered slice.
  *
  * ## Reductions (documented divergences)
  *
- * - The writer's create-branch / rename / download / RSS buttons (upstream's
- *   IsWriter block) are unrendered: no modal flow, archive endpoint, feed or
- *   rename POST exists to target (the dead-link rule), and their glyphs are
- *   outside the icon allowlist.
- * - The PR column (LatestPullRequest state labels, the Included badge, the
- *   compare-changes button) is unrendered — the wave brief's row shape ends
- *   at the divergence cell; the compare surface is reachable from the
- *   branches dropdown and the PR list.
+ * - The Download / RSS buttons (upstream's EnableFeed /
+ *   DisableDownloadSourceArchives block) stay unrendered: no archive
+ *   endpoint or feed surface exists to target (the dead-link rule).
+ * - The per-name copy-to-clipboard button (list.tmpl's octicon-copy
+ *   `data-clipboard-text` control) stays unrendered — a JS clipboard
+ *   control with no no-JS posture.
  * - The Switch Default Branch link renders for ADMIN viewers, not upstream's
  *   `IsWriter` — the settings page it targets is admin-gated here, and a
  *   link a writer follows into a 404 would break the dead-link rule.
@@ -115,23 +182,26 @@
  *   separate GetBranchExisting read.
  * - The last-commit line renders the commit AUTHOR as plain text (the
  *   commit-list reduction): refs carry no pusher tracking, and avatar
- *   pipelines do not exist.
- * - The `octicon-git-commit` leading glyph of the info line is outside the
- *   allowlist (not granted) — the line renders without it, the compare
- *   page's icon-reduction precedent.
+ *   pipelines do not exist. The line's leading `octicon-git-commit` glyph
+ *   IS rendered — the releases wave granted the glyph, superseding this
+ *   page's wave-16 refusal (the wave-61 audit's allowlist note was already
+ *   answered; the actually-missing glyph was the create button's
+ *   octicon-git-branch, allowlisted this pass).
+ * - The PR link carries no cross-repo prefix (upstream's
+ *   `{{if not .LatestPullRequest.IsSameRepo}}` FullName arm): forks cannot
+ *   exist yet, so every latest PR is same-repo.
  */
 
 import type { CommitJson } from "@cf-gitea/git-engine";
+import { and, asc, eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 
-import {
-  branchRef,
-  engineCell,
-  engineReads,
-  refTipMap,
-  type EngineDivergenceResult,
-} from "../../api/services/engine";
-import { emitWebhookDeliveries } from "../../issues/webhooks";
+import { branchRef, engineCell, engineReads, refTipMap, type EngineDivergenceResult } from "../../api/services/engine";
+import { pullHeadRefName } from "../../api/services/pulls";
+import { loadRepoSettings } from "../../api/services/repo-settings";
 import { apiUserFromRow, toApiRepository, type RepositoryWithOwner, type UserRow } from "../../api/services/repository";
+import { issues, PRFlow, pullRequests } from "../../db/schema";
+import { emitWebhookDeliveries } from "../../issues/webhooks";
 import {
   canUserDelete,
   canUserPush,
@@ -144,10 +214,11 @@ import {
   type ProtectedBranchRow,
 } from "../../services/branch-protection";
 import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
+import { compareLink } from "./compare";
 import { ExploreSearchForm } from "./explore";
 import { TimeSince } from "../components/file-list";
 import { commitLink, treeLink } from "../links";
-import { shortSha } from "../page-data";
+import { pathEscapeSegments, shortSha } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
@@ -163,6 +234,17 @@ export const branchesLocale = {
   switch_default_branch: "Switch Default Branch", // "repo.settings.branches.switch_default_branch" (the link renders as its title text — the icon-reduction precedent)
   protected_branch: "Branch Protection", // "repo.settings.protected_branch" (the shield's tooltip)
   updated: "Updated", // "org.repo_updated"
+  new_branch_from: (from: string): string => `Create new branch from "${from}"`, // "repo.branch.new_branch_from" (the create button's tooltip)
+  branch_name: "Branch Name", // "repo.branch.name" (the create form's input label)
+  rename_branch: (name: string): string => `Rename Branch "${name}"`, // "repo.branch.rename" (the rename button's tooltip)
+  rename_to: (name: string): string => `Rename "${name}" to:`, // "repo.branch.rename_branch_to" (the rename input's label)
+  included: "Included", // "repo.branch.included"
+  included_desc: "This branch is part of the default branch", // "repo.branch.included_desc" (the Included label's tooltip)
+  compare_changes: "New Pull Request", // "repo.pulls.compare_changes" (the compare button, CanPull viewers)
+  compare_branch: "Compare", // "action.compare_branch" (the compare button, everyone else)
+  merged: "Merged", // "repo.pulls.merged"
+  open_title: "Open", // "repo.issues.open_title"
+  closed_title: "Closed", // "repo.issues.closed_title"
   divergence_from: (behind: number, ahead: number, base: string): string =>
     `Commit divergence: ${behind} behind and ${ahead} ahead of ${base}`, // "repo.branch.commits_divergence_from"
   divergence_none: (base: string): string => `The same as branch ${base}`, // "repo.branch.commits_no_divergence"
@@ -181,6 +263,20 @@ export const BRANCHES_PAGE_SIZE = 20;
 // ---------------------------------------------------------------------------
 // Data loading (§3.2 — the landed reads, never a self-fetch)
 // ---------------------------------------------------------------------------
+
+/** The PR column's LatestPullRequest summary (loadOneBranch's shape reduced
+ *  to what the cell renders — the module header's PR-column section). */
+export interface BranchLatestPr {
+  /** The shared per-repo issue index (the `#N` link and the page target). */
+  index: number;
+  hasMerged: boolean;
+  /** The joined issue's state (upstream pr.Issue.IsClosed). */
+  isClosed: boolean;
+  /** upstream MergeMovedOn (branch.go:240-252): the merged pull head
+   *  (`refs/pull/N/head`) exists and differs from the branch tip — the
+   *  compare-button arm instead of the Merged label. */
+  mergeMovedOn: boolean;
+}
 
 /** One rendered branch row: the name, the SPEC-0013 §3.6 render extras this
  *  page consumes (the badge + the writer's gates), the last commit and the
@@ -203,6 +299,9 @@ export interface BranchRowView {
   commit: CommitJson | null;
   /** The divergence vs the default branch; null = degraded/missing read. */
   divergence: { ahead: number; behind: number } | null;
+  /** GetLatestPullRequestByHeadInfo's port (the header's PR-column
+   *  section); null = no PR heads here. */
+  latestPr: BranchLatestPr | null;
 }
 
 /** The page's render inputs, loaded by loadBranchesData. */
@@ -219,6 +318,14 @@ export interface BranchesData {
   defaultIsProtected: boolean;
   defaultRuleName: string;
   defaultCommit: CommitJson | null;
+  /** The viewer's write grant (principalAccessOfRow's write — upstream
+   *  IsWriter's CanWrite(TypeCode); also CanPull's answer, forks cannot
+   *  exist yet). Gates the writer create/rename forms and the compare
+   *  button's label. */
+  canWrite: boolean;
+  /** `repoSettings.hasPullRequests` (the DEFAULT_REPO_SETTINGS default when
+   *  no row exists) — upstream AllowsPulls minus the mirror arm. */
+  allowsPulls: boolean;
   /** The list table's rows (the default branch excluded — upstream
    *  ExcludeBranchNames), keyword-filtered, one page. */
   rows: BranchRowView[];
@@ -292,15 +399,45 @@ export async function loadBranchesData(
     .filter((ref) => ref.name.startsWith("refs/heads/"))
     .map((ref) => ref.name.slice("refs/heads/".length))
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  // The full-ref tip map off the SAME snapshot — the MergeMovedOn check
+  // reads `refs/pull/N/head` from it (the header's PR-column section).
+  const tips = refTipMap(refs);
 
   // The §4.9 default-branch fallbacks (the ref-suffix resolver's convention):
   // the D1 default branch when it exists, else the first branch, else null.
   const defaultBranch = branchNames.includes(repo.defaultBranch) ? repo.defaultBranch : (branchNames[0] ?? null);
 
   // The protection context (the API LIST's loadBranchProtectionContext
-  // composition): rules once, the doer's access pair once.
-  const rules = await listRepoRules(db, repo.id);
-  const access = await principalAccessOfRow(db, repo, protectionDoer(options.viewer));
+  // composition): rules once, the doer's access pair once — plus the
+  // AllowsPulls read and the latest-PR walk, also once per request.
+  const [rules, access, settings, prRows] = await Promise.all([
+    listRepoRules(db, repo.id),
+    principalAccessOfRow(db, repo, protectionDoer(options.viewer)),
+    loadRepoSettings(db, repo.id),
+    drizzle(db)
+      .select({ pr: pullRequests, isClosed: issues.isClosed })
+      .from(pullRequests)
+      .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+      .where(and(eq(pullRequests.headRepoId, repo.id), eq(pullRequests.flow, PRFlow.Github)))
+      .orderBy(asc(pullRequests.id)),
+  ]);
+
+  // GetLatestPullRequestByHeadInfo's reduction: the scan is id-ordered, so
+  // the LAST row per head branch is the latest (upstream's `OrderBy id DESC
+  // LIMIT 1` per branch — one walk instead of one query per branch).
+  const latestPrByBranch = new Map<string, BranchLatestPr>();
+  for (const { pr, isClosed } of prRows) {
+    const branchTip = tips.get(branchRef(pr.headBranch))?.target;
+    const pullHeadTip = pr.hasMerged ? tips.get(pullHeadRefName(pr.index))?.target : undefined;
+    latestPrByBranch.set(pr.headBranch, {
+      index: pr.index,
+      hasMerged: pr.hasMerged,
+      isClosed,
+      // MergeMovedOn's exact arms (branch.go:249-252): the pull head ref
+      // must EXIST and differ — a missing ref never moves on.
+      mergeMovedOn: pr.hasMerged && pullHeadTip !== undefined && pullHeadTip !== branchTip,
+    });
+  }
 
   const defaultExtras =
     defaultBranch !== null ? await rowExtras(db, rules, access, defaultBranch, true) : null;
@@ -326,7 +463,7 @@ export async function loadBranchesData(
         reads.readCommit(name),
         readDivergence(reads, defaultBranch, name),
       ]);
-      return { name, commit, divergence, ...extras };
+      return { name, commit, divergence, latestPr: latestPrByBranch.get(name) ?? null, ...extras };
     }),
   );
 
@@ -338,6 +475,8 @@ export async function loadBranchesData(
     defaultIsProtected: defaultExtras?.isProtected ?? false,
     defaultRuleName: defaultExtras?.ruleName ?? "",
     defaultCommit,
+    canWrite: access.write,
+    allowsPulls: settings.hasPullRequests,
     rows,
   };
 }
@@ -501,13 +640,14 @@ export function parseBranchDeleteForm(params: URLSearchParams): string {
 // Components (list.tmpl's DOM, the reductions documented in the header)
 // ---------------------------------------------------------------------------
 
-/** The `p.info` last-commit line (the template's shape minus the
- *  non-allowlisted leading glyph and the pusher namelink — the header's
- *  reductions): ShortSha link · subject · "Updated" TimeSince · author. */
+/** The `p.info` last-commit line (the template's shape minus the pusher
+ *  namelink — the header's reductions): the octicon-git-commit mark ·
+ *  ShortSha link · subject · "Updated" TimeSince · author. */
 function BranchCommitInfo(props: { repoLink: string; commit: CommitJson }) {
   const { commit } = props;
   return (
     <p class="info tw-flex tw-items-center tw-my-1">
+      <Icon name="octicon-git-commit" class="tw-mr-1" />
       <a href={commitLink(props.repoLink, commit.oid)}>{shortSha(commit.oid)}</a>
       <span class="tw-mx-1">·</span>
       <span class="commit-message">{commit.subject}</span>
@@ -553,6 +693,112 @@ function DivergenceCell(props: { divergence: { ahead: number; behind: number } |
         <div class="bar bar-ahead" style={`width: ${pct(divergence.ahead)}%`} />
       </div>
     </div>
+  );
+}
+
+/** The create-branch control (list.tmpl's `show-create-branch-modal` button
+ *  — the JS modal reduced to an inline no-JS form): a visible required
+ *  `new_branch_name` input posting upstream's EXACT route
+ *  POST `/branches/_new/branch/{from}` (web.go:1477-1481 +
+ *  NewBranchForm's single field). The POST arm is NOT mounted in
+ *  src/ui/index.ts yet — the module header's HANDOFF (two-stage). */
+function BranchCreateForm(props: { repoLink: string; from: string }) {
+  return (
+    <form
+      method="post"
+      action={`${props.repoLink}/branches/_new/branch/${pathEscapeSegments(props.from)}`}
+      class="tw-inline-flex tw-items-center"
+    >
+      <input type="text" name="new_branch_name" required aria-label={branchesLocale.branch_name} size={12} />
+      <button
+        type="submit"
+        class="btn interact-bg tw-p-2"
+        aria-label={branchesLocale.new_branch_from(props.from)}
+        title={branchesLocale.new_branch_from(props.from)}
+        data-tooltip-content={branchesLocale.new_branch_from(props.from)}
+      >
+        <Icon name="octicon-git-branch" />
+      </button>
+    </form>
+  );
+}
+
+/** The rename control (list.tmpl's `showRenameBranchModal` button — the JS
+ *  modal reduced to an inline no-JS form): hidden `from` + a required `to`
+ *  input (left empty like upstream's modal — repo-branch.ts prefills only
+ *  `from`), posting upstream's POST `/branches/rename` (web.go:1486 +
+ *  RenameBranchForm). The POST arm is NOT mounted — the header's HANDOFF. */
+function BranchRenameForm(props: { repoLink: string; name: string }) {
+  return (
+    <form
+      method="post"
+      action={`${props.repoLink}/branches/rename`}
+      class="tw-inline-flex tw-items-center"
+    >
+      <input type="hidden" name="from" value={props.name} />
+      <input type="text" name="to" required aria-label={branchesLocale.rename_to(props.name)} size={12} />
+      <button
+        type="submit"
+        class="btn interact-bg tw-p-2"
+        aria-label={branchesLocale.rename_branch(props.name)}
+        title={branchesLocale.rename_branch(props.name)}
+        data-tooltip-content={branchesLocale.rename_branch(props.name)}
+      >
+        <Icon name="octicon-pencil" />
+      </button>
+    </form>
+  );
+}
+
+/** The PR column's cell (list.tmpl's third cell — the header's PR-column
+ *  section cites the four arms). Renders nothing when the arms render
+ *  nothing upstream (e.g. merged + movedOn + ahead 0). */
+function BranchPrCell(props: { repoLink: string; row: BranchRowView; defaultBranch: string; allowsPulls: boolean; canPull: boolean }) {
+  const { row } = props;
+  // The degraded divergence reads as upstream's -1 error default: never
+  // "included", never a compare button.
+  const ahead = row.divergence?.ahead ?? -1;
+  const compare =
+    props.allowsPulls && ahead > 0 ? (
+      <a class="ui compact basic button tw-m-0 tw-max-w-full" href={`${compareLink(props.repoLink, props.defaultBranch, row.name)}?expand=1`}>
+        <span class="gt-ellipsis">{props.canPull ? branchesLocale.compare_changes : branchesLocale.compare_branch}</span>
+      </a>
+    ) : null;
+  const pr = row.latestPr;
+  if (pr === null) {
+    if (ahead === 0) {
+      return (
+        <span class="ui orange large label" data-tooltip-content={branchesLocale.included_desc}>
+          <Icon name="octicon-git-pull-request" /> {branchesLocale.included}
+        </span>
+      );
+    }
+    return compare;
+  }
+  if (pr.hasMerged && pr.mergeMovedOn) return compare;
+  const issueLink = `${props.repoLink}/pulls/${pr.index}`;
+  return (
+    <>
+      <a href={issueLink} class="tw-align-middle ref-issue">
+        #{pr.index}
+      </a>
+      {pr.hasMerged ? (
+        <a href={issueLink} class="ui purple large label">
+          <Icon name="octicon-git-merge" class="tw-mr-1" />
+          {branchesLocale.merged}
+        </a>
+      ) : pr.isClosed ? (
+        <a href={issueLink} class="ui red large label">
+          <Icon name="octicon-git-pull-request-closed" class="tw-mr-1" />
+          {branchesLocale.closed_title}
+        </a>
+      ) : (
+        <a href={issueLink} class="ui green large label">
+          <Icon name="octicon-git-pull-request" class="tw-mr-1" />
+          {branchesLocale.open_title}
+        </a>
+      )}
+    </>
   );
 }
 
@@ -638,6 +884,11 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("BranchesPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  // The writer block's gate (the header's writer-block section): the loader's
+  // write grant (IsWriter) + the archived refusal (CanContentChange — no
+  // mirror column is landed). Upstream's `(not .IsDeleted)` arm folds away:
+  // deleted-branch rows cannot exist here.
+  const writerControls = data.canWrite && !repo.isArchived;
   return (
     <BaseLayout ctx={ctx} title={branchesLocale.page_title} pageClass="ui repository branches" activeTab="code">
       <div class="ui container">
@@ -687,7 +938,19 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
                     </div>
                     {data.defaultCommit !== null ? <BranchCommitInfo repoLink={repoLink} commit={data.defaultCommit} /> : null}
                   </td>
-                  <td />
+                  <td>
+                    <div class="tw-flex tw-flex-wrap tw-justify-end">
+                      {writerControls ? (
+                        <>
+                          {/* list.tmpl:34-64's default-section writer pair — the
+                              create (from the default) + rename (is-default)
+                              buttons, modals reduced to inline forms. */}
+                          <BranchCreateForm repoLink={repoLink} from={data.defaultBranch} />
+                          <BranchRenameForm repoLink={repoLink} name={data.defaultBranch} />
+                        </>
+                      ) : null}
+                    </div>
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -703,8 +966,9 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
 
         <div class="ui attached table segment">
           <table class="ui very basic fixed table single line">
-            {/* thead additive (the default section's note); the empty third
-                th is the actions column (the mirror-table convention). */}
+            {/* thead additive (the default section's note); the two empty
+                th's are the PR cell and the actions column (the mirror-table
+                convention). */}
             <thead>
               <tr>
                 <th scope="col" class="eight wide">
@@ -713,6 +977,7 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
                 <th scope="col" class="two wide">
                   Commit divergence
                 </th>
+                <th scope="col" class="three wide" />
                 <th scope="col" class="three wide" />
               </tr>
             </thead>
@@ -731,8 +996,22 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
                   <td class="two wide">
                     <DivergenceCell divergence={row.divergence} defaultBranch={data.defaultBranch ?? repo.defaultBranch} />
                   </td>
+                  <td class="three wide tw-text-right">
+                    <BranchPrCell
+                      repoLink={repoLink}
+                      row={row}
+                      defaultBranch={data.defaultBranch ?? repo.defaultBranch}
+                      allowsPulls={data.allowsPulls}
+                      canPull={data.canWrite}
+                    />
+                  </td>
                   <td class="three wide">
                     <div class="tw-flex tw-flex-wrap tw-justify-end">
+                      {/* list.tmpl:163-200's per-row order: create, rename,
+                          then delete (the RSS/download arms stay unrendered —
+                          the header's reductions). */}
+                      {writerControls ? <BranchCreateForm repoLink={repoLink} from={row.name} /> : null}
+                      {writerControls ? <BranchRenameForm repoLink={repoLink} name={row.name} /> : null}
                       {row.canDelete ? <BranchDeleteForm repoLink={repoLink} name={row.name} /> : null}
                     </div>
                   </td>

@@ -78,8 +78,14 @@ const repoRoot = path.resolve(scriptDir, '..');
 // owner-project glyph the projects/list rows, the state toggle and the menu
 // tab render (project.go:161-166's IconName — every non-repository project
 // is octicon-project-symlink).
+// Wave-branches-reductions (the branches page's writer block) adds the
+// create-branch mark the list rows and the default section render
+// (list.tmpl's `{{svg "octicon-git-branch"}}` show-create-branch-modal
+// button, list.tmpl:41,170 — the info line's octicon-git-commit itself was
+// already granted by the releases wave above).
 const ALLOWLIST = [
   'octicon-bell',
+  'octicon-git-branch',
   'octicon-calendar',
   'octicon-check',
   'octicon-checklist',

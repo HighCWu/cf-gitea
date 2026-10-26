@@ -24,6 +24,12 @@
  * write's refusals (default / protected / missing / CAS-moved) flashing
  * upstream DeleteBranchPost's exact texts, and the M2 predicate the API
  * DELETE arm predates (the UI never offers a protection-defeating path).
+ * The wave-branches-reductions pass adds: the writer's create/rename inline
+ * forms (upstream's exact routes/fields — the POST arms are unmounted, the
+ * module header's HANDOFF; only the RENDER matrix is asserted here), the PR
+ * column's four arms (Included badge, compare button, the Open/Closed/
+ * Merged state labels, and MergeMovedOn emptying a merged-ahead-0 cell),
+ * and the info line's octicon-git-commit mark.
  */
 
 import { env, SELF } from "cloudflare:test";
@@ -34,9 +40,11 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
 import { settleCreatingRepo } from "../../git-http/gate";
-import { protectedBranches, repositories, users } from "../../db/schema";
+import { issues, protectedBranches, pullRequests, repositories, users } from "../../db/schema";
+import { ZERO_OID } from "../../api/services/engine";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
 import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
+import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { runA11y } from "./a11y";
@@ -166,7 +174,7 @@ async function ensureWave17Fixtures(): Promise<Wave17Fixture> {
   }
 
   // The matrix repo: main + docs-seed + stale + feature/one + release/1.
-  await ensureWave17Repo("wave17br", [
+  const { tips } = await ensureWave17Repo("wave17br", [
     { ref: "refs/heads/docs-seed", tipIndex: 2 },
     { ref: "refs/heads/stale", tipIndex: 0 },
     { ref: "refs/heads/feature/one", tipIndex: 3 },
@@ -211,6 +219,83 @@ async function ensureWave17Fixtures(): Promise<Wave17Fixture> {
         updatedAt: new Date((T0 + 2) * 1000),
       },
     ]);
+  }
+
+  // The PR-column fixtures (IssuesService.createPullRequest — the pure D1
+  // creation batch, no webhook fan-out; the pull head ref lands through the
+  // engine cell like any ref write). The arm matrix:
+  //   wave17br feature/one → OPEN (#1) — the green Open label arm
+  //   wave17br release/1   → MERGED (#2), pull head == its tip →
+  //                          MergeMovedOn FALSE — the purple Merged label arm
+  //   wave17br stale       → MERGED (#3), pull head moved past its tip →
+  //                          MergeMovedOn TRUE + ahead 0 — the template's
+  //                          empty-cell arm (asserted by purple's ABSENCE)
+  //   wave17br docs-seed   → no PR, ahead 1 — the compare-button arm
+  //                          (the no-PR half; the merged+movedOn half of the
+  //                          compare arm is stale's would-be render)
+  //   wave17many p-21      → CLOSED — the red Closed label arm (ahead 0
+  //                          renders arm C regardless)
+  //   wave17many p-01..p-20 → ahead 0, no PR — the Included badge arm.
+  if ((await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, repoRow.id)).limit(1).all()).length === 0) {
+    const pullRequestsService = new IssuesService(env.DB);
+    await pullRequestsService.createPullRequest({
+      repoId: repoRow.id,
+      title: "wave17: open pr",
+      posterId: alice.id,
+      headRepoId: repoRow.id,
+      baseBranch: "main",
+      headBranch: "feature/one",
+    });
+    const mergedIntact = await pullRequestsService.createPullRequest({
+      repoId: repoRow.id,
+      title: "wave17: merged pr",
+      posterId: alice.id,
+      headRepoId: repoRow.id,
+      baseBranch: "main",
+      headBranch: "release/1",
+    });
+    await db.update(pullRequests).set({ hasMerged: true }).where(eq(pullRequests.id, mergedIntact.pullRequest.id));
+    // The pull head EQUALS release/1's tip (tips[2]) — merged, not moved on.
+    const releaseTip = tips[2];
+    if (releaseTip === undefined) throw new Error("wave17 seed: tips[2] missing");
+    const releaseHead = await env.REPO.getByName("alice/wave17br").commitApiChange({
+      ref: `refs/pull/${mergedIntact.pullRequest.index}/head`,
+      expectedOldOid: ZERO_OID,
+      newOid: releaseTip,
+    });
+    if (releaseHead.tag !== "committed") throw new Error(`wave17 seed: refs/pull/${mergedIntact.pullRequest.index}/head create failed`);
+
+    const movedOn = await pullRequestsService.createPullRequest({
+      repoId: repoRow.id,
+      title: "wave17: moved-on pr",
+      posterId: alice.id,
+      headRepoId: repoRow.id,
+      baseBranch: "main",
+      headBranch: "stale",
+    });
+    await db.update(pullRequests).set({ hasMerged: true }).where(eq(pullRequests.id, movedOn.pullRequest.id));
+    // The pull head sits at main's tip (tips[1]) — PAST stale's tip (tips[0]):
+    // MergeMovedOn TRUE, and stale is 0 ahead so the cell renders nothing.
+    const mainTip = tips[1];
+    if (mainTip === undefined) throw new Error("wave17 seed: tips[1] missing");
+    const movedHead = await env.REPO.getByName("alice/wave17br").commitApiChange({
+      ref: `refs/pull/${movedOn.pullRequest.index}/head`,
+      expectedOldOid: ZERO_OID,
+      newOid: mainTip,
+    });
+    if (movedHead.tag !== "committed") throw new Error(`wave17 seed: refs/pull/${movedOn.pullRequest.index}/head create failed`);
+  }
+  const manyRow = (await db.select().from(repositories).where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave17many"))).get())!;
+  if (manyRow !== undefined && (await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, manyRow.id)).limit(1).all()).length === 0) {
+    const closedMany = await new IssuesService(env.DB).createPullRequest({
+      repoId: manyRow.id,
+      title: "wave17: closed pr",
+      posterId: alice.id,
+      headRepoId: manyRow.id,
+      baseBranch: "main",
+      headBranch: "p-21",
+    });
+    await db.update(issues).set({ isClosed: true }).where(eq(issues.id, closedMany.issue.id));
   }
 
   wave17Fixture = {
@@ -300,13 +385,96 @@ describe("GET /{owner}/{repo}/branches (the list)", () => {
     // Delete forms: the unprotected rows + the armed release/* rule (the
     // rule's canUserDelete passes for alice); NOT on docs-seed (its rule
     // disarms deletion — canUserDelete refuses) and never on the default.
+    // (The value probes pin the DELETE form's hidden field specifically —
+    // the rename forms' hidden `from` fields legitimately carry the same
+    // branch names.)
     expect(html).toContain('action="/alice/wave17br/branches/delete"');
     const forms = html.split('action="/alice/wave17br/branches/delete"').length - 1;
     expect(forms).toBe(3); // feature/one, release/1, stale
-    expect(html).toContain('value="release/1"');
-    expect(html).toContain('value="stale"');
-    expect(html).not.toContain('value="docs-seed"');
-    expect(html).not.toContain('value="main"');
+    expect(html).toContain('name="name" value="release/1"');
+    expect(html).toContain('name="name" value="stale"');
+    expect(html).not.toContain('name="name" value="docs-seed"');
+    expect(html).not.toContain('name="name" value="main"');
+  });
+
+  it("renders the writer's create/rename inline forms with upstream's routes and fields", async () => {
+    const fixture = await ensureWave17Fixtures();
+    const res = await fetchUi("/alice/wave17br/branches", withCookie(fixture.aliceCookie));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Create: upstream's POST /branches/_new/branch/{from} with the required
+    // new_branch_name input — the default section (from main) + every row.
+    expect(html).toContain('action="/alice/wave17br/branches/_new/branch/main"');
+    expect(html).toContain('action="/alice/wave17br/branches/_new/branch/feature/one"');
+    expect(html).toContain('action="/alice/wave17br/branches/_new/branch/docs-seed"');
+    expect(html.split('name="new_branch_name"').length - 1).toBe(5); // default + 4 rows
+    expect(html).toContain("octicon-git-branch");
+    expect(html).toContain('aria-label="Create new branch from &quot;main&quot;"');
+    // Rename: upstream's POST /branches/rename with hidden from + required to.
+    expect(html.split('action="/alice/wave17br/branches/rename"').length - 1).toBe(5);
+    expect(html).toContain('name="from" value="main"');
+    expect(html).toContain('name="from" value="docs-seed"');
+    expect(html).toContain('name="to"');
+    expect(html).toContain("octicon-pencil");
+    // The tooltips carry upstream's locale texts.
+    expect(html).toContain('aria-label="Rename Branch &quot;feature/one&quot;"');
+    // CanPull (the write grant — forks cannot exist): the compare button
+    // reads upstream's repo.pulls.compare_changes for the writer.
+    expect(html).toContain(">New Pull Request</span>");
+    expect(html).not.toContain(">Compare</span>");
+  });
+
+  it("renders the PR column's four arms (labels, compare, Included, moved-on empty)", async () => {
+    const res = await fetchUi("/alice/wave17br/branches");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The info line's octicon-git-commit mark (the wave-61 audit's glyph).
+    expect(html).toContain("svg octicon-git-commit");
+    // feature/one → OPEN: the #1 link + the green Open label.
+    expect(html).toContain('href="/alice/wave17br/pulls/1"');
+    expect(html).toContain(">#1</a>");
+    expect(html).toContain('class="ui green large label"');
+    expect(html).toContain(">Open</a>");
+    // release/1 → MERGED with the pull head AT its tip (MergeMovedOn false):
+    // the #2 link + the purple Merged label with the merge glyph.
+    expect(html).toContain(">#2</a>");
+    expect(html).toContain('class="ui purple large label"');
+    expect(html).toContain(">Merged</a>");
+    expect(html).toContain("octicon-git-merge");
+    // stale → MERGED with the pull head PAST its tip (MergeMovedOn true) and
+    // 0 ahead: the cell renders NOTHING — asserted by the absence of a
+    // second merged row's #3 (the link arm never fires for a moved-on PR).
+    expect(html).not.toContain(">#3</a>");
+    // docs-seed → no PR, 1 ahead, anonymous (CanPull false): the compare
+    // button reads upstream's action.compare_branch onto the default
+    // compare link with ?expand=1.
+    expect(html).toContain('href="/alice/wave17br/compare/main...docs-seed?expand=1"');
+    expect(html).toContain(">Compare</span>");
+    expect(html).not.toContain(">New Pull Request</span>");
+    // No Included badge in THIS repo (every no-PR row is either ahead>0 or
+    // moved-on): the Included arm shows in wave17many below.
+    expect(html).not.toContain("Included</span>");
+  });
+
+  it("renders the Included badge for ahead-0 no-PR rows and the Closed label arm", async () => {
+    const page1 = await fetchUi("/alice/wave17many/branches");
+    expect(page1.status).toBe(200);
+    const html = await page1.text();
+    // p-01..p-20 (ahead 0, no PR): the orange Included label with upstream's
+    // included_desc tooltip; p-21 carries the CLOSED PR instead (page 2).
+    expect(html).toContain('data-tooltip-content="This branch is part of the default branch"');
+    expect(html).toContain("Included</span>");
+    expect(html.split("Included</span>").length - 1).toBe(20);
+
+    const page2 = await fetchUi("/alice/wave17many/branches?page=2");
+    expect(page2.status).toBe(200);
+    const secondHtml = await page2.text();
+    expect(secondHtml).toContain(">p-21<");
+    expect(secondHtml).toContain('href="/alice/wave17many/pulls/1"');
+    expect(secondHtml).toContain('class="ui red large label"');
+    expect(secondHtml).toContain(">Closed</a>");
+    expect(secondHtml).toContain("octicon-git-pull-request-closed");
+    expect(secondHtml).not.toContain("Included</span>"); // p-21's PR takes the arm
   });
 
   it("renders no controls for a signed-in non-writer", async () => {
@@ -317,6 +485,12 @@ describe("GET /{owner}/{repo}/branches (the list)", () => {
     expect(html).toContain("Default Branch");
     expect(html).not.toContain('action="/alice/wave17br/branches/delete"');
     expect(html).not.toContain("Switch Default Branch");
+    // The writer block (create/rename) is equally absent for a non-writer —
+    // the PR column's reader labels still render.
+    expect(html).not.toContain('name="new_branch_name"');
+    expect(html).not.toContain('action="/alice/wave17br/branches/rename"');
+    expect(html).toContain('class="ui green large label"'); // feature/one's open PR
+    expect(html).toContain(">Compare</span>"); // docs-seed's compare arm, CanPull false
   });
 
   it("filters by the ?q= keyword and keeps the default section", async () => {
