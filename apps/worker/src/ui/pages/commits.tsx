@@ -71,6 +71,13 @@ export async function loadCommitsData(
 
   const path = suffixPath !== "" ? suffixPath : (options.path ?? "");
   const page = parsePageNumber(options.page);
+  // A commit-typed ref must name a real object — upstream's RepoRefByType
+  // GetCommit miss 404s (services/context/repo.go:1037-1040). The engine's
+  // listLog answers an empty page (never null) for an unresolvable ref, so
+  // the existence check must be explicit (the commits matrix's RED).
+  if (active.refType === "commit" && (await engine.readCommit(active.ref)) === null) {
+    return { notFound: true };
+  }
   const log = await engine.listLog(active.ref, {
     path: path === "" ? undefined : path,
     ofs: (page - 1) * COMMITS_PAGE_SIZE,
