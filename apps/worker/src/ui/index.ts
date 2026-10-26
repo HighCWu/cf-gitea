@@ -1228,6 +1228,39 @@ import {
   renderUserFeedRss,
   USER_FEED_CONTENT_TYPES,
 } from "./pages/user-feed-xml";
+// Window-2e B2: the repo-scoped aux/fragment modules.
+import {
+  issuesSearchResponse,
+  issuesSuggestionsResponse,
+  loadIssuesSearchAux,
+  loadIssuesSuggestionsAux,
+  suggestionsIsPullFilter,
+} from "./pages/issues-search-aux";
+import {
+  contentHistoryOverviewFragmentResponse,
+  issueAttachmentsFragmentResponse,
+  issueInfoFragmentResponse,
+  loadContentHistoryOverviewFragment,
+  loadIssueAttachmentsFragment,
+  loadIssueInfoFragment,
+  resolveFragmentIssue,
+} from "./pages/issue-content-fragments";
+import { loadPullMergeBoxData, pullMergeBoxFragmentHtml, pullMergeBoxFragmentResponse } from "./pages/pull-merge-box";
+import {
+  compareFeedServerErrorResponse,
+  compareFeedTextResponse,
+  loadCompareFeed,
+  loadPullFilesRange,
+  parsePullFilesRange,
+  renderPullFilesRangePage,
+  type CompareFeedRepo,
+} from "./pages/compare-feeds";
+import {
+  loadPullFilesSingleCommit,
+  parsePullFilesSingleCommit,
+  renderPullFilesSingleCommitPage,
+} from "./pages/pull-files-single-commit";
+import { activityAuthorDataResponse, loadActivityAuthorData } from "./pages/activity-author-data";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -2017,6 +2050,35 @@ export interface SearchAuxRoute {
   family: "repo-search-aux" | "explore-topic-search-aux";
 }
 
+/** Window-2e B2: the repo-scoped aux feeds + fragments (issues-search-aux,
+ *  issue-content-fragments, pull-merge-box, compare-feeds,
+ *  pull-files-single-commit, activity-author-data). */
+export interface IssueAuxRoute {
+  family:
+    | "issues-search-aux"
+    | "issues-suggestions-aux"
+    | "issue-info"
+    | "issue-attachments"
+    | "issue-content-overview"
+    | "issue-attachments-alias"
+    | "pull-merge-box"
+    | "pull-files-range"
+    | "pull-commit-files"
+    | "activity-author-data"
+    | "compare-feed";
+  owner: string;
+  repo: string;
+  /** The issue/PR index (the fragment families). */
+  index?: number;
+  /** issues vs pulls (the shared fragment arms). */
+  urlKind?: "issues" | "pulls";
+  /** The raw tail segment (files-range pair, single-commit sha,
+   *  attachments uuid, activity period). */
+  segment?: string;
+  /** The feed extension (the compare-feed family). */
+  ext?: "diff" | "patch";
+}
+
 /** The wave-12 user settings family (pages/user-settings.tsx): upstream's
  *  literal `/user/settings` (routers/web/shared/user settings header +
  *  user/settings/profile.tmpl — web.go's /user group registers ahead of the
@@ -2187,6 +2249,7 @@ export type ParsedUiRoute =
   | MilestoneNewRoute
   | OwnerHomeRoute
   | UserFeedRoute
+  | IssueAuxRoute
   | FileEditorRoute
   | SiteHomeRoute
   | ExploreRoute
@@ -2752,6 +2815,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return null;
     }
   }
+  // Window-2e B2: the activity-author JSON feed (web.go:1683-1687 — the
+  // optional period tail; unknown/bare segments hit the WEEKLY default).
+  if (head === "activity_author_data") {
+    if (rest.length === 0) return { family: "activity-author-data", owner, repo };
+    if (rest.length === 1) return { family: "activity-author-data", owner, repo, segment: rest[0] };
+  }
+
   if (head === "issues" || head === "pulls") {
     if (rest.length === 0) return { family: head, owner, repo };
     if (rest.length === 1) {
@@ -2762,6 +2832,10 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       // repo-scoped, the issue/review ids ride the form fields).
       if (head === "issues" && rest[0] === "request_review") return { family: "issue-request-review", owner, repo };
       if (head === "issues" && rest[0] === "dismiss_review") return { family: "issue-dismiss-review", owner, repo };
+      // Window-2e B2: the aux feeds (upstream web.go:1341/1359 — the
+      // suggestions route sits in the labels/milestones sibling group).
+      if (head === "issues" && rest[0] === "search") return { family: "issues-search-aux", owner, repo };
+      if (head === "issues" && rest[0] === "suggestions") return { family: "issues-suggestions-aux", owner, repo };
       if (/^-?\d+$/.test(rest[0] as string)) {
         return { family: "issue-detail", owner, repo, urlKind: head, index: Number.parseInt(rest[0] as string, 10) };
       }
@@ -2774,6 +2848,36 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest[1] === "comments") return { family: "issue-comment", owner, repo, urlKind: head, index };
       if (head === "pulls" && rest[1] === "files") return { family: "pull-files", owner, repo, index };
       if (head === "pulls" && rest[1] === "commits") return { family: "pull-commits", owner, repo, index };
+      // Window-2e B2: the info/attachments fragments (web.go:1321-1334,
+      // both families) + the merge box (web.go:1659, pulls).
+      if (rest[1] === "info") return { family: "issue-info", owner, repo, urlKind: head, index };
+      if (rest[1] === "attachments") return { family: "issue-attachments", owner, repo, urlKind: head, index };
+      if (head === "pulls" && rest[1] === "merge_box") return { family: "pull-merge-box", owner, repo, index };
+    }
+    if (rest.length === 3 && /^-?\d+$/.test(rest[0] as string)) {
+      const index = Number.parseInt(rest[0] as string, 10);
+      // The content-history overview fragment (list/detail stay unclaimed —
+      // no snapshot store).
+      if (rest[1] === "content-history" && rest[2] === "overview") {
+        return { family: "issue-content-overview", owner, repo, urlKind: head, index };
+      }
+      // The byte-serving alias: upstream mounts the uuid arm at
+      // /{index}/attachments/{uuid} (web.go:1337) driving the same seam as
+      // the site-level /attachments/{uuid} — a 302 onto it (the module's
+      // handoff).
+      if (rest[1] === "attachments" && rest[2] !== undefined && rest[2] !== "") {
+        return { family: "issue-attachments-alias", owner, repo, urlKind: head, index, segment: rest[2] };
+      }
+      // The committed-range files page (web.go:1672) and the single-commit
+      // page AT UPSTREAM'S PATH /pulls/{index}/commits/{sha} (web.go:1663 —
+      // the /files/{sha} tail is upstream's pattern miss; the b48757e
+      // divergence honored).
+      if (head === "pulls" && rest[1] === "files" && parsePullFilesRange(rest[2] as string) !== null) {
+        return { family: "pull-files-range", owner, repo, index, segment: rest[2] };
+      }
+      if (head === "pulls" && rest[1] === "commits" && parsePullFilesSingleCommit(rest[2] as string) !== null) {
+        return { family: "pull-commit-files", owner, repo, index, segment: rest[2] };
+      }
     }
     // Wave-11: the review verdict form POST (web.go:1678 — the
     // /pulls/{index}/files/reviews group's /submit tail; the GET new_comment
@@ -2944,6 +3048,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return null;
     }
     if (suffix === "") return { family: "compare", owner, repo, base: null, head: null };
+    // Window-2e B2: the .diff/.patch byte feeds (web.go:1309-1310) — claim
+    // the suffixed tails BEFORE the page family returns (they would
+    // otherwise fall into the single-ref family and 404 at resolution).
+    if (suffix.endsWith(".diff")) {
+      return { family: "compare-feed", owner, repo, ext: "diff", segment: suffix.slice(0, -5) };
+    }
+    if (suffix.endsWith(".patch")) {
+      return { family: "compare-feed", owner, repo, ext: "patch", segment: suffix.slice(0, -6) };
+    }
     const separator = suffix.indexOf("...");
     if (separator < 0) {
       if (suffix.includes("..") || suffix.includes(":")) return null;
@@ -4051,6 +4164,141 @@ async function userFeedRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
       headers: { "content-type": route.family === "user-feed-rss" ? USER_FEED_CONTENT_TYPES.rss : USER_FEED_CONTENT_TYPES.atom },
     }),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Window-2e B2: the repo-scoped aux feeds + fragments. All ride
+// resolveUiRequest (the repo read + visibility) with per-family drift
+// guards; the notFound arms re-render the §4.5 shell (renderNotFound).
+// ---------------------------------------------------------------------------
+
+async function issuesSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, viewer, respond } = resolved;
+  if (resolved.route.family !== "issues-search-aux") return respond(await c.notFound()); // drift guard
+  if (viewer.kind !== "user") return respond(loginRedirect(url.pathname)); // reqSignIn (web.go:1440)
+  const data = await loadIssuesSearchAux(
+    c.env,
+    { id: repo.id, isArchived: repo.isArchived },
+    { id: viewer.id, username: viewer.username, isAdmin: viewer.isAdmin },
+    url.origin,
+    url,
+  );
+  return respond(issuesSearchResponse(data, renderNotFound(ctx)));
+}
+
+async function issuesSuggestionsAuxRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { respond } = resolved;
+  if (resolved.route.family !== "issues-suggestions-aux") return respond(await c.notFound()); // drift guard
+  // optSignIn + the viewer's unit reads — both readable while actions/
+  // units are unlanded (the module's literal-true note); the raw q rides
+  // UNTRIMMED (upstream FormValue).
+  const suggestions = await loadIssuesSuggestionsAux(c.env, resolved.repo.id, suggestionsIsPullFilter(true, true), c.req.query("q") ?? "");
+  return respond(issuesSuggestionsResponse(suggestions));
+}
+
+async function issueInfoFragmentRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-info" || route.index === undefined || route.urlKind === undefined) return respond(await c.notFound()); // drift guard
+  const data = await loadIssueInfoFragment(c.env.DB, repo, route.urlKind, route.index, url.origin, viewer, repoLinkOf(repo));
+  return respond(issueInfoFragmentResponse(data, renderNotFound(ctx)));
+}
+
+async function issueAttachmentsFragmentRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-attachments" || route.index === undefined) return respond(await c.notFound()); // drift guard
+  const issue = await resolveFragmentIssue(c.env.DB, repo, route.index);
+  if (issue === null) return respond(c.html(renderNotFound(ctx), 404));
+  const rows = await loadIssueAttachmentsFragment(c.env.DB, issue.id);
+  return respond(issueAttachmentsFragmentResponse(url.origin, rows));
+}
+
+async function issueContentOverviewRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-content-overview" || route.index === undefined) return respond(await c.notFound()); // drift guard
+  const issue = await resolveFragmentIssue(c.env.DB, repo, route.index);
+  if (issue === null) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadContentHistoryOverviewFragment(c.env.DB, issue);
+  return respond(contentHistoryOverviewFragmentResponse(data));
+}
+
+async function issueAttachmentsAliasRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-attachments-alias" || route.segment === undefined) return respond(await c.notFound()); // drift guard
+  // The byte arm IS the landed site-level seam — hand off (the module's
+  // documented alias, no second handler).
+  return respond(new Response(null, { status: 302, headers: { location: `/attachments/${route.segment}` } }));
+}
+
+async function pullMergeBoxRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "pull-merge-box" || route.index === undefined) return respond(await c.notFound()); // drift guard
+  const found = await findPullRequestByIndex(c.env.DB, repo.id, route.index);
+  if (found === null) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadPullMergeBoxData(c.env.DB, { repo, issue: found.issue, pr: found.pullRequest, viewer, origin: url.origin });
+  // null → the EMPTY fragment (upstream's ShowMergeBox=false arm — the
+  // bundle's reload stop signal).
+  return respond(pullMergeBoxFragmentResponse(data === null ? "" : pullMergeBoxFragmentHtml(data)));
+}
+
+async function pullFilesRangeRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "pull-files-range" || route.index === undefined || route.segment === undefined) {
+    return respond(await c.notFound()); // drift guard
+  }
+  const data = await loadPullFilesRange(c, repo.id, route.index, route.segment);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderPullFilesRangePage({ ctx, data })));
+}
+
+async function pullCommitFilesRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "pull-commit-files" || route.index === undefined || route.segment === undefined) {
+    return respond(await c.notFound()); // drift guard
+  }
+  const data = await loadPullFilesSingleCommit(c, repo.id, route.index, route.segment);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderPullFilesSingleCommitPage({ ctx, data })));
+}
+
+async function activityAuthorDataRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "activity-author-data") return respond(await c.notFound()); // drift guard
+  const data = await loadActivityAuthorData(
+    c.env,
+    { ownerNamespace: repo.ownerNamespace, slug: repo.slug, isEmpty: repo.isEmpty },
+    route.segment ?? null,
+    { origin: url.origin },
+  );
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(activityAuthorDataResponse(data));
 }
 
 /** GET /{owner}/{repo}/settings/hooks (pages/settings.tsx — the webhooks
@@ -6305,6 +6553,21 @@ async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, repo, respond } = resolved;
   const route = resolved.route;
+  // Window-2e B2: the .diff/.patch byte feeds share the compare
+  // registration — the parser's compare-feed family branches here before
+  // the page drift guard (web.go:1309-1310 vs the page route).
+  if (route.family === "compare-feed" && route.segment !== undefined && route.ext !== undefined) {
+    const repoFeed: CompareFeedRepo = {
+      ownerNamespace: repo.ownerNamespace,
+      slug: repo.slug,
+      isEmpty: repo.isEmpty,
+      defaultBranch: repo.defaultBranch,
+    };
+    const result = await loadCompareFeed(c.env, repoFeed, route.segment, route.ext);
+    if (result.kind === "notFound") return respond(c.html(renderNotFound(ctx), 404));
+    if (result.kind === "noMergeBase") return respond(compareFeedServerErrorResponse());
+    return respond(compareFeedTextResponse(result.body));
+  }
   if (route.family !== "compare") return respond(await c.notFound()); // registration/parser drift guard
   const page = parsePageNumber(url.searchParams.get("page"));
   const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
@@ -8792,6 +9055,18 @@ uiRouter.get("/explore/topics/search", (c) => topicSearchAuxRoute(c));
 // The feed suffixes — one constrained registration (the owner-home
 // precedent); the parser discriminates .rss vs .atom and strips.
 uiRouter.get("/:owner{^[\\w-]+\\.(rss|atom)$}", (c) => userFeedRoute(c));
+// Window-2e B2: the repo-scoped aux/fragment routes.
+uiRouter.get("/:owner/:repo/issues/search", (c) => issuesSearchAuxRoute(c));
+uiRouter.get("/:owner/:repo/issues/suggestions", (c) => issuesSuggestionsAuxRoute(c));
+uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/info", (c) => issueInfoFragmentRoute(c));
+uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/attachments", (c) => issueAttachmentsFragmentRoute(c));
+uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/attachments/:uuid", (c) => issueAttachmentsAliasRoute(c));
+uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/overview", (c) => issueContentOverviewRoute(c));
+uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/merge_box", (c) => pullMergeBoxRoute(c));
+uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/files/:segment{^[a-f0-9]{7,64}(\\.\\.[a-f0-9]{7,64})?$}", (c) => pullFilesRangeRoute(c));
+uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/commits/:sha{^[a-f0-9]{7,64}$}", (c) => pullCommitFilesRoute(c));
+uiRouter.get("/:owner/:repo/activity_author_data", (c) => activityAuthorDataRoute(c));
+uiRouter.get("/:owner/:repo/activity_author_data/:period", (c) => activityAuthorDataRoute(c));
 uiRouter.post("/:owner/:repo/settings", (c) => settingsSubmit(c));
 uiRouter.get("/:owner/:repo/settings/hooks", (c) => hooksSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/hooks", (c) => hooksSettingsSubmit(c));
