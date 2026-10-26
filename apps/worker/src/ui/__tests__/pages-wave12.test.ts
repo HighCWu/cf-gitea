@@ -173,9 +173,13 @@ describe("wave-12 parser families (parseUiRoute / handlesUiRoute)", () => {
 
   it("leaves the deeper tails and junk ids with the engine", () => {
     expect(parseUiRoute("/acme/teams/42/repositories")).toBeNull();
-    expect(parseUiRoute("/acme/teams/42/edit")).toBeNull();
+    // {id}/edit flipped to the wave-49 team-edit family (pages/
+    // org-settings.tsx) — the assertion below is that wave's claim now.
+    expect(parseUiRoute("/acme/teams/42/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 42 });
+    expect(parseUiRoute("/acme/teams/42/delete")).toEqual({ family: "org-team-delete", owner: "acme", id: 42 });
     expect(parseUiRoute("/acme/teams/42/action/join")).toBeNull();
     expect(parseUiRoute("/acme/teams/not-a-number")).toBeNull();
+    expect(parseUiRoute("/acme/teams/42/edit/extra")).toBeNull();
     expect(parseUiRoute("/acme/teams/new/more")).toBeNull();
   });
 

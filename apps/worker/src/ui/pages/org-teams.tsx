@@ -44,10 +44,12 @@
  *   precedent). Upstream shadows a repo named "teams" identically: the org
  *   teams group registers at web.go:993, ahead of :1292's
  *   `/{username}/{reponame}`.
- * - The deeper tails (`/teams/{id}/repositories`, `/teams/{id}/edit`,
- *   `/teams/{id}/delete`, the `/action/*` writes) stay unclaimed → the
- *   engine's 404, exactly upstream's unregistered-route 404 for a slice that
- *   has not landed them.
+ * - The deeper tails beyond the wave-49 claims (`/teams/{id}/repositories`,
+ *   the `/action/*` writes) stay unclaimed → the engine's 404, exactly
+ *   upstream's unregistered-route 404 for a slice that has not landed them.
+ *   Wave 49 (pages/org-settings.tsx) claimed `/teams/{id}/edit` + `/delete` —
+ *   the detail sidebar's Settings button below is their entry link; this
+ *   module's own routes are unchanged.
  *
  * ## Documented v1 degradations (§6 method)
  *
@@ -134,6 +136,7 @@ export const orgTeamsLocale = {
   team_name: "Team Name", // "org.team_name"
   team_name_helper: "Team names should be short and memorable.", // "org.team_name_helper"
   create_team: "Create Team", // "org.create_team"
+  team_settings_button: "Settings", // "org.teams.settings" — the wave-49 entry-link hunk (sidebar.tmpl:90; octicon-gear not in the icon allowlist)
   search: "Search", // cf-gitea addition — the submit label; upstream renders an
   // icon-only button (octicon-search), which is not in the landed icon
   // allowlist (scripts/gen-ui-icons.mjs is outside this wave's ownership).
@@ -599,6 +602,13 @@ export function OrgTeamDetailPage(props: { ctx: UiContext; data: OrgTeamDetailDa
               <h3>{orgTeamsLocale.permission_desc}</h3>
               <TeamPermissionBody team={team} />
             </div>
+            {/* sidebar.tmpl:90's owner Settings button — the wave-49 team-edit
+                form's entry link (pages/org-settings.tsx). The upstream
+                control's octicon-gear is not in the landed icon allowlist
+                (the search-button rule), so the button renders text-only. */}
+            <a class="ui small button" href={`${orgLink}/teams/${team.id}/edit`}>
+              {orgTeamsLocale.team_settings_button}
+            </a>
           </div>
           {/* members.tmpl + repositories.tmpl — the merged ten-wide column. */}
           <div class="ui ten wide column">
