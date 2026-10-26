@@ -377,6 +377,22 @@ queue-redelivery-proven pull pattern (claim `idle|queued → syncing`,
 table dance for the CHECK; all rows are preserved and the index set is
 rebuilt). Drizzle table `pushMirrors` carries both columns.
 
+**Stuck-syncing sweep (as-built, 833961d)**: both cron producers
+(`enqueueDueMirrorSyncs` pull, `enqueueDuePushMirrorSyncs` push) run a
+reclaim BEFORE the due-SELECT — a CAS `syncing → idle` on rows whose claim
+age ≥ `SYNCING_SWEEP_AFTER_SEC` (15 min = the engine's receive-lease TTL,
+`control-plane.ts:330`: no live sync can outlive it; a queue consumer also
+cannot exceed its 15-min wall), then the same-tick due-SELECT re-enqueues
+them (a claimed row's `next_sync_at` is still due — only settles advance
+it). Push claims stamp `last_update_unix` at attempt start (upstream's
+records-every-attempt posture, `mirror_push.go:110`); the sweep's NULL arm
+reclaims stamp-less `syncing` rows unconditionally (pre-stamping wedges
+cannot be mid-flight), healing pre-deploy wedged rows on the first cron
+tick. Fresh claims (< TTL) are never touched — the busy-skip is their
+guard. Motivation + adjudication: `docs/research/sqlite-locked-2026-10-26.md`
+(the availability gap: a settle-step transient wedged the row forever —
+claim required `idle|queued`, retries acked `busy`, no sweeper existed).
+
 ---
 
 ## 4. Scheduling and execution model
