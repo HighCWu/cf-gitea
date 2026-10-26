@@ -74,9 +74,19 @@ export function issueHtmlUrl(pair: RepositoryWithOwner, origin: string, index: n
   return `${origin}/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}/issues/${index}`;
 }
 
-/** `Comment.HTMLURL` — the issue page anchor (`Comment.hashLink` + `HashTag`). */
-export function commentHtmlUrl(pair: RepositoryWithOwner, origin: string, issueIndex: number, commentId: number): string {
-  return `${issueHtmlUrl(pair, origin, issueIndex)}#issuecomment-${commentId}`;
+/** `Comment.HTMLURL` — the issue page anchor (`Comment.hashLink` + `HashTag`).
+ *  Upstream Issue.HTMLURL branches on IsPull (issue.go:386-394 — path
+ *  "pulls"); the callers pass the row's kind so a PR comment anchors under
+ *  /pulls/ (the activity matrix's escalated divergence). */
+export function commentHtmlUrl(
+  pair: RepositoryWithOwner,
+  origin: string,
+  issueIndex: number,
+  isPull: boolean,
+  commentId: number,
+): string {
+  const base = `${origin}/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}/${isPull ? "pulls" : "issues"}/${issueIndex}`;
+  return `${base}#issuecomment-${commentId}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +276,7 @@ export async function toApiComment(
   comment: CommentRow,
 ): Promise<Comment> {
   const poster = await toPoster(d1, viewer, comment.posterId);
-  const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, comment.id);
+  const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, issue.isPull, comment.id);
   const issuePageUrl = issueHtmlUrl(pair, viewer.origin, issue.index);
   return {
     id: comment.id,
@@ -363,7 +373,7 @@ export async function toTimelineComment(
 ): Promise<TimelineComment> {
   const poster = await toPoster(d1, viewer, comment.posterId);
   const issuePageUrl = issueHtmlUrl(pair, viewer.origin, issue.index);
-  const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, comment.id);
+  const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, issue.isPull, comment.id);
 
   const [oldMilestoneRow, milestoneRow, labelRow, assigneeRow] = await Promise.all([
     comment.oldMilestoneId === null || comment.oldMilestoneId === undefined
