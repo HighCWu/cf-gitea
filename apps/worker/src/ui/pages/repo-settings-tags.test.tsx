@@ -1,15 +1,22 @@
 /**
- * The repo settings protected-tags panel's tests (the bench-row UNMOUNTED
- * module — the repo-settings-wiki.test.tsx harness): the create/edit/delete
- * arms re-played over real D1 (generated migrations in beforeAll; the same
+ * The repo settings protected-tags panel's tests (the module MOUNTED since
+ * window-2d b54f709 — GET+POST /settings/tags, POST /settings/tags/delete,
+ * GET+POST /settings/tags/{id} at ui/index.ts): the create/edit/delete arms
+ * re-played over real D1 (generated migrations in beforeAll; the same
  * service primitives routes/tag-protections.ts's handlers use) with the
  * exact ApiError texts surfacing as `invalid` re-render lines, and the DOM
  * contract of the single list+form page (tags.tmpl) — hono/jsx
- * renderToString, the module driven directly (no route yet, the HANDOFF
- * NOTE in the module header).
+ * renderToString, the module driven directly. The deferred-test matrix also
+ * drives the real routes (the githooks/org-blocked matrices' minted-session
+ * pattern): the settingsGate posture (anonymous 303, signed-in non-admin
+ * 404 shell) on GET and POST, the create/edit/delete round-trips with the
+ * ?saved=1 flash and the ?id= edit prefill, the exact 400/403/422 texts as
+ * route re-renders, the RepoMustNotBeArchived 404s, the guard-first
+ * cross-origin 403, the junk/unknown/foreign path-id 404s, and the
+ * tags-group claim pin.
  */
 
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -20,6 +27,8 @@ import type { RepositoryWithOwner } from "../../api/services/repository";
 import { protectedTags, repositories, teams, users } from "../../db/schema";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
+import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { Viewer } from "../viewer";
 import {
   applyTagProtectionForm,
@@ -489,5 +498,452 @@ describe("the protected-tags panel DOM (tags.tmpl at the pin)", () => {
     expect(() =>
       renderToString(<TagProtectionPage ctx={ctx} data={{ rules: [], isOrg: false, form: emptyTagProtectionForm(), editing: null, saved: false }} error={null} />),
     ).toThrow("TagProtectionPage requires ctx.repo");
+  });
+});
+
+// --- the mounted-route harness (window-2d b54f709; the githooks/org-blocked
+// --- matrices' minted-session pattern) --------------------------------------
+
+type RouteEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+const routeEnv: RouteEnv = {
+  ...env,
+  ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
+};
+
+/** The real production path: parse → resolveUiSession → resolveUiRequest →
+ *  the settingsGate → load/apply → render/redirect, on the mounted uiRouter
+ *  with the synthetic manifest; the execution context is awaited so waitUntil
+ *  side-effects settle before assertions. */
+async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
+/** A minted session cookie header for the user id (the real mintSession
+ *  path, minted per request — the beforeEach users wipe cascades the
+ *  sessions table, so a cross-test cache would go stale; the value is never
+ *  rendered). */
+async function sessionHeader(userId: number): Promise<string> {
+  return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+}
+
+/** The seeded owner's minted session header — the repo-admin doer the
+ *  settingsGate's isRepositoryAdmin admits (looked up by name; the fixture
+ *  ids stay fixture-internal). */
+async function adminSessionHeader(): Promise<string> {
+  const owner = await db().select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get();
+  if (owner === undefined) throw new Error("fixture owner missing");
+  return sessionHeader(owner.id);
+}
+
+/** A plain user's minted session header (the signed-in non-admin posture —
+ *  the public repo resolves for the read, the admin gate 404-shells the
+ *  tab). */
+async function nonAdminSessionHeader(): Promise<string> {
+  const bob = await db().select({ id: users.id }).from(users).where(eq(users.usernameLower, "bob")).get();
+  if (bob === undefined) throw new Error("fixture non-admin missing");
+  return sessionHeader(bob.id);
+}
+
+/** The primary seeded repo's mount path (the beforeEach resets repoSeq, so
+ *  the slug stays stable for the route assertions). */
+const REPO_PATH = "/alice/tagui9100";
+
+/** An admin GET through the real route. */
+async function adminGet(path: string): Promise<Response> {
+  return fetchUi(path, { headers: { cookie: await adminSessionHeader() } });
+}
+
+/** A urlencoded POST through the real route: the given Origin header (the
+ *  §2.8 guard's input) and the given session cookie (the admin's when
+ *  omitted). */
+async function postForm(
+  path: string,
+  fields: Record<string, string>,
+  options: { origin?: string; cookie?: string } = {},
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    "content-type": "application/x-www-form-urlencoded",
+    origin: options.origin ?? ORIGIN,
+  };
+  if (options.cookie !== undefined) headers.cookie = options.cookie;
+  return fetchUi(path, { method: "POST", headers, body: new URLSearchParams(fields).toString() });
+}
+
+/** The stored-rule count for a repo (the nothing-written assertions —
+ *  storedRow assumes a row exists). */
+async function ruleCount(repoId: string): Promise<number> {
+  const rows = await db().select({ id: protectedTags.id }).from(protectedTags).where(eq(protectedTags.repoId, repoId)).all();
+  return rows.length;
+}
+
+// --- the mounted routes (window-2d: GET + POST /{owner}/{repo}/settings/tags) --
+
+describe("the mounted list route (GET+POST /{owner}/{repo}/settings/tags) — the settingsGate posture", () => {
+  it("303s an anonymous GET onto the login round-trip (the settingsGate)", async () => {
+    const res = await fetchUi(`${REPO_PATH}/settings/tags`);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent(`${REPO_PATH}/settings/tags`)}`);
+  });
+
+  it("303s an anonymous same-origin create POST onto the login round-trip too (guard passes, then the gate; nothing written)", async () => {
+    const res = await postForm(`${REPO_PATH}/settings/tags`, { name_pattern: "v*", allowlist_users: "bob" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent(`${REPO_PATH}/settings/tags`)}`);
+    expect(await ruleCount(repo.id)).toBe(0);
+  });
+
+  it("404-shells a signed-in non-admin's GET (the reqRepoAdmin posture — the public repo resolves, the tab doesn't)", async () => {
+    const res = await fetchUi(`${REPO_PATH}/settings/tags`, { headers: { cookie: await nonAdminSessionHeader() } });
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain("status-page-error"); // the 404 shell
+    expect(html).not.toContain("repository settings edit"); // never the tab's content
+  });
+
+  it("404-shells a signed-in non-admin's create POST before any write (the gate fronts the write arm too)", async () => {
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags`,
+      { name_pattern: "v*", allowlist_users: "bob" },
+      { cookie: await nonAdminSessionHeader() },
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+    expect(await ruleCount(repo.id)).toBe(0);
+  });
+
+  it("renders the admin's GET at 200 with the discriminator, the active Tags nav item and the create form", async () => {
+    const res = await adminGet(`${REPO_PATH}/settings/tags`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("repository settings edit"); // the §2.4.1 pageClass
+    expect(html).toContain(`class="active item" href="${REPO_PATH}/settings/tags"`);
+    expect(html).toContain('id="name_pattern" name="name_pattern"');
+    expect(html).toContain(`colspan="3">${tagProtectionLocale.none}</td>`); // the empty arm
+  });
+});
+
+describe("the create round-trip through the route (POST /settings/tags → ?saved=1)", () => {
+  it("a create POST 303s onto ?saved=1, the trimmed pattern lands with resolved user ids, and the follow-up GET renders the flash and the row", async () => {
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags`,
+      { name_pattern: "  v*  ", allowlist_users: "bob,carol" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`${REPO_PATH}/settings/tags?saved=1`);
+    expect(await storedRow(repo.id)).toEqual({ namePattern: "v*", users: [2, 5], teams: [] });
+    const page = await adminGet(`${REPO_PATH}/settings/tags?saved=1`);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain('class="ui info message"'); // the ?saved=1 flash
+    expect(html).toContain(tagProtectionLocale.update_settings_success);
+    expect(html).toContain("<pre>v*</pre>");
+    expect(html).toContain('href="/bob">bob</a>');
+    expect(html).toContain('href="/carol">Carol Display</a>');
+  });
+});
+
+describe("the edit prefill through the route (GET ?id= and GET /settings/tags/{id})", () => {
+  it("the list route's ?id= prefills the edit form onto the id-keyed action with Save + Cancel", async () => {
+    const id = await seedRule(repo.id, "v*", [2]);
+    const res = await adminGet(`${REPO_PATH}/settings/tags?id=${id}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`action="${REPO_PATH}/settings/tags/${id}"`); // {{.Link}}'s current-path semantics
+    expect(html).toContain('value="v*"');
+    expect(html).toContain('value="bob"');
+    expect(html).toContain(`>${tagProtectionLocale.save}</button>`);
+    expect(html).toContain(`href="${REPO_PATH}/settings/tags">${tagProtectionLocale.cancel}</a>`);
+  });
+
+  it("the detail GET renders the same prefill (the table's Edit anchor target)", async () => {
+    const id = await seedRule(repo.id, "v*", [2]);
+    const res = await adminGet(`${REPO_PATH}/settings/tags/${id}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`action="${REPO_PATH}/settings/tags/${id}"`);
+    expect(html).toContain('value="v*"');
+    expect(html).toContain('value="bob"');
+    expect(html).toContain(`>${tagProtectionLocale.save}</button>`);
+  });
+
+  it("an unknown detail id 404-shells (selectProtectedTagByContext's NotFound through the route)", async () => {
+    const res = await adminGet(`${REPO_PATH}/settings/tags/424242`);
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain("status-page-error");
+    expect(html).not.toContain("repository settings edit");
+  });
+
+  it("a foreign-repo detail id 404-shells too (the repo-scoped guard)", async () => {
+    const other = await seedRepo({ orgOwned: true });
+    const foreignId = await seedRule(other.id, "v*");
+    const res = await adminGet(`${REPO_PATH}/settings/tags/${foreignId}`);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+  });
+
+  it("a junk path id never claims — the plain drift 404 (never the shell, never the tab); a negative id claims and misses into the shell", async () => {
+    const junk = await adminGet(`${REPO_PATH}/settings/tags/abc`);
+    expect(junk.status).toBe(404);
+    const junkHtml = await junk.text();
+    expect(junkHtml).not.toContain("status-page-error"); // resolveUiSession: no shell for an unclaimed path
+    expect(junkHtml).not.toContain("repository settings edit");
+    const negative = await adminGet(`${REPO_PATH}/settings/tags/-5`);
+    expect(negative.status).toBe(404);
+    expect(await negative.text()).toContain("status-page-error"); // claimed + loadTagRuleById miss → the shell
+  });
+
+  it("an unknown or junk ?id= degrades to the create form (the handoff GET arm's documented miss reduction)", async () => {
+    for (const bad of ["424242", "abc"]) {
+      const res = await adminGet(`${REPO_PATH}/settings/tags?id=${bad}`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain(`action="${REPO_PATH}/settings/tags"`); // the create action
+      expect(html).toContain(`>${tagProtectionLocale.create}</button>`);
+      expect(html).not.toContain(`>${tagProtectionLocale.save}</button>`);
+    }
+  });
+});
+
+describe("the edit write through the route (POST /settings/tags/{id})", () => {
+  it("an edit POST carrying the form's id saves through the PATCH-shaped arm — 303 ?saved=1, the row replaced in place", async () => {
+    const id = await seedRule(repo.id, "v*", [2]);
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags/${id}`,
+      { id: String(id), name_pattern: "v1.*", allowlist_users: "carol" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`${REPO_PATH}/settings/tags?saved=1`);
+    expect(await ruleCount(repo.id)).toBe(1);
+    expect(await storedRow(repo.id)).toEqual({ namePattern: "v1.*", users: [5], teams: [] });
+  });
+
+  // REAL BUG (RED at this pin): the mounted repoTagsSubmit keys the arm off
+  // the FORM BODY's id (parseTagProtectionForm over the body — the route's
+  // path id is only existence-checked), but the rendered edit form carries NO
+  // hidden id field — tags.tmpl's form has none either, because upstream keys
+  // the edit by the URL PATH id (web.go `m.Post("/{id}")` →
+  // EditProtectedTagPost → selectProtectedTagByContext(ctx)). A
+  // browser-shaped POST (exactly the fields the rendered form emits) parses
+  // as id 0 = the CREATE arm: with the pattern changed it silently creates a
+  // SECOND rule and leaves the edit target untouched. This test pins the
+  // upstream contract — it is the RED witness, disclosed in the wave report;
+  // the fix belongs in ui/index.ts (not this file's ownership).
+  it("a browser-shaped edit POST (the fields the rendered form emits — no hidden id) edits the rule in place (upstream EditProtectedTagPost keys the edit by the path id)", async () => {
+    const id = await seedRule(repo.id, "v*", [2]);
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags/${id}`,
+      { name_pattern: "v1.*", allowlist_users: "carol" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`${REPO_PATH}/settings/tags?saved=1`);
+    expect(await ruleCount(repo.id)).toBe(1); // RED today: the create arm fired — a second rule exists
+    expect(await storedRow(repo.id)).toEqual({ namePattern: "v1.*", users: [5], teams: [] });
+  });
+
+  it("a same-pattern allowlist-only edit POST (the browser's other edit shape) edits too — not the create arm's already-exist 403", async () => {
+    const id = await seedRule(repo.id, "v*", [2]);
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags/${id}`,
+      { name_pattern: "v*", allowlist_users: "carol" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(303); // RED today: 200 + the collision re-render
+    expect(await storedRow(repo.id)).toEqual({ namePattern: "v*", users: [5], teams: [] });
+  });
+
+  it("an unknown edit id 404-shells before any write (the missing arm)", async () => {
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags/424242`,
+      { id: "424242", name_pattern: "v*", allowlist_users: "bob" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+    expect(await ruleCount(repo.id)).toBe(0);
+  });
+
+  it("an archived repo's edit POST 404-shells (RepoMustNotBeArchived, web.go:1220) and the rule survives", async () => {
+    const archived = await seedRepo({ archived: true });
+    const id = await seedRule(archived.id, "v*", [2]);
+    const res = await postForm(
+      `/${archived.ownerNamespace}/${archived.slug}/settings/tags/${id}`,
+      { id: String(id), name_pattern: "v2", allowlist_users: "bob" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+    expect((await storedRow(archived.id)).namePattern).toBe("v*");
+  });
+});
+
+describe("the exact invalid texts through the route (the create 400/403/422 re-renders)", () => {
+  it("the empty-pattern 400 re-renders the grammatical-quirk text, nothing written", async () => {
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags`,
+      { name_pattern: "   ", allowlist_users: "bob" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="ui negative message"');
+    expect(html).toContain("name_pattern are empty");
+    expect(await ruleCount(repo.id)).toBe(0);
+  });
+
+  it("the both-empty 400 on the RAW lists re-renders the exact upstream text", async () => {
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags`,
+      { name_pattern: "v*", allowlist_users: " , " },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("both whitelist_usernames and whitelist_teams are empty");
+    expect(await ruleCount(repo.id)).toBe(0);
+  });
+
+  it("the exact-pattern collision 403 re-renders the already-exist text, the seed rule untouched", async () => {
+    await seedRule(repo.id, "v*");
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags`,
+      { name_pattern: " v* ", allowlist_users: "bob" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="ui negative message"');
+    expect(html).toContain("Tag protection already exist");
+    expect(await ruleCount(repo.id)).toBe(1); // the seed only
+  });
+
+  it("the unknown-user 422 re-renders the LOWERCASED name and the KEPT submission", async () => {
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags`,
+      { name_pattern: "v*", allowlist_users: "NOBODY" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("user does not exist [uid: 0, name: nobody]");
+    expect(html).toContain('value="v*"'); // the kept form re-renders the submission
+    expect(await ruleCount(repo.id)).toBe(0);
+  });
+});
+
+describe("the delete write through the route (POST /settings/tags/delete)", () => {
+  it("the delete POST removes the row and lands back on the tab", async () => {
+    const id = await seedRule(repo.id, "v*");
+    const res = await postForm(`${REPO_PATH}/settings/tags/delete`, { id: String(id) }, { cookie: await adminSessionHeader() });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")?.startsWith(`${REPO_PATH}/settings/tags`)).toBe(true);
+    expect(await ruleCount(repo.id)).toBe(0);
+    const page = await adminGet(`${REPO_PATH}/settings/tags`);
+    expect(await page.text()).toContain(tagProtectionLocale.none);
+  });
+
+  // REAL BUG (RED at this pin): the mounted repoTagDeleteSubmit redirects to
+  // the bare /settings/tags — the module header's contract is "every write
+  // 303s onto /settings/tags?saved=1" (the flash reduction), and upstream
+  // DeleteProtectedTagPost flashes update_settings_success too
+  // (protected_tag.go:145-146), so today the delete success flash never
+  // renders. Disclosed in the wave report; the fix belongs in ui/index.ts.
+  it("the delete success redirect carries the ?saved=1 flash (the module header's every-write contract)", async () => {
+    const id = await seedRule(repo.id, "v*");
+    const res = await postForm(`${REPO_PATH}/settings/tags/delete`, { id: String(id) }, { cookie: await adminSessionHeader() });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`${REPO_PATH}/settings/tags?saved=1`);
+  });
+
+  it("a junk or absent delete id 404-shells before any write", async () => {
+    const res = await postForm(`${REPO_PATH}/settings/tags/delete`, { id: "abc" }, { cookie: await adminSessionHeader() });
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+    const absent = await postForm(`${REPO_PATH}/settings/tags/delete`, {}, { cookie: await adminSessionHeader() });
+    expect(absent.status).toBe(404);
+    expect(await ruleCount(repo.id)).toBe(0);
+  });
+
+  it("an unknown or foreign delete id 404-shells and the rows survive (the repo-scoped guard)", async () => {
+    const id = await seedRule(repo.id, "v*");
+    const other = await seedRepo({ orgOwned: true });
+    const foreignId = await seedRule(other.id, "release-*");
+    const unknown = await postForm(`${REPO_PATH}/settings/tags/delete`, { id: "424242" }, { cookie: await adminSessionHeader() });
+    expect(unknown.status).toBe(404);
+    const foreign = await postForm(`${REPO_PATH}/settings/tags/delete`, { id: String(foreignId) }, { cookie: await adminSessionHeader() });
+    expect(foreign.status).toBe(404);
+    expect(await ruleCount(repo.id)).toBe(1);
+    expect(await ruleCount(other.id)).toBe(1);
+    expect((await db().select({ id: protectedTags.id }).from(protectedTags).where(eq(protectedTags.id, id)).all()).length).toBe(1);
+  });
+
+  it("an archived repo's delete POST 404-shells (RepoMustNotBeArchived, web.go:1218) and the rule survives", async () => {
+    const archived = await seedRepo({ archived: true });
+    const id = await seedRule(archived.id, "v*");
+    const res = await postForm(
+      `/${archived.ownerNamespace}/${archived.slug}/settings/tags/delete`,
+      { id: String(id) },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+    expect(await ruleCount(archived.id)).toBe(1);
+  });
+});
+
+describe("the archived repo and the cross-origin guard through the route", () => {
+  it("the admin's GET of an archived repo renders at 200 with the warning INSTEAD of the form and the table", async () => {
+    const archived = await seedRepo({ archived: true });
+    const res = await adminGet(`/${archived.ownerNamespace}/${archived.slug}/settings/tags`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(tagProtectionLocale.archived_unavailable);
+    expect(html).not.toContain('name="name_pattern"');
+    expect(html).not.toContain("single line table");
+  });
+
+  it("the archived repo's create POST 404-shells, nothing written (RepoMustNotBeArchived, web.go:1216)", async () => {
+    const archived = await seedRepo({ archived: true });
+    const res = await postForm(
+      `/${archived.ownerNamespace}/${archived.slug}/settings/tags`,
+      { name_pattern: "v*", allowlist_users: "bob" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+    expect(await ruleCount(archived.id)).toBe(0);
+  });
+
+  it("rejects a cross-origin create POST with 403 before any write (sameOriginGuard first)", async () => {
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags`,
+      { name_pattern: "v*", allowlist_users: "bob" },
+      { origin: "https://evil.example", cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("cross-origin request rejected");
+    expect(await ruleCount(repo.id)).toBe(0);
+  });
+});
+
+// --- the route claim pin (parse ↔ registration — the settings family's tags group) ----
+
+describe("the route claim pin (the settings family claims exactly the tags group)", () => {
+  it("parses the three families; misspelled or deeper tails stay unclaimed", () => {
+    expect(parseUiRoute(`${REPO_PATH}/settings/tags`)).toEqual({ family: "settings-tags", owner: "alice", repo: "tagui9100" });
+    expect(handlesUiRoute(`${REPO_PATH}/settings/tags`)).toBe(true);
+    expect(parseUiRoute(`${REPO_PATH}/settings/tags/delete`)).toEqual({ family: "settings-tags-delete", owner: "alice", repo: "tagui9100" });
+    expect(handlesUiRoute(`${REPO_PATH}/settings/tags/delete`)).toBe(true);
+    expect(parseUiRoute(`${REPO_PATH}/settings/tags/7`)).toEqual({ family: "settings-tag-detail", owner: "alice", repo: "tagui9100", id: 7 });
+    expect(handlesUiRoute(`${REPO_PATH}/settings/tags/7`)).toBe(true);
+    expect(parseUiRoute(`${REPO_PATH}/settings/tag`)).toBeNull(); // the singular misspelling
+    expect(parseUiRoute(`${REPO_PATH}/settings/tags/abc`)).toBeNull(); // junk id
+    expect(parseUiRoute(`${REPO_PATH}/settings/tags/7/extra`)).toBeNull();
+    expect(handlesUiRoute(`${REPO_PATH}/settings/tags/7/extra`)).toBe(false);
   });
 });

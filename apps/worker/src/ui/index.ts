@@ -3772,6 +3772,11 @@ async function repoTagsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
   const pair = await findRepositoryById(c.env.DB, repo.id);
   if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
   const form = parseTagProtectionForm(await readUrlEncodedForm(c.req.raw));
+  // Upstream keys the EDIT by the URL path id (m.Post("/{id}") →
+  // selectProtectedTagByContext), not a hidden field — the rendered form
+  // carries none. Inject the route id (the module header's contract note;
+  // the tags matrix's RED witness).
+  if (route.family === "settings-tag-detail" && route.id !== undefined) form.id = route.id;
   const result = await applyTagProtectionForm(c.env.DB, pair, form);
   if (result.outcome === "created" || result.outcome === "saved") {
     return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/tags?saved=1` } }));
@@ -3824,7 +3829,9 @@ async function repoTagDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
   const deleted = await deleteTagRuleById(c.env.DB, pair, Number.parseInt(rawId, 10));
   if (!deleted) return respond(c.html(renderNotFound(ctx), 404));
-  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/tags` } }));
+  // DeleteProtectedTagPost flashes update_settings_success — the ?saved=1
+  // reduction (the module contract; the matrix's RED witness).
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/tags?saved=1` } }));
 }
 
 async function repoDeployKeysPage(c: Context<{ Bindings: Env }>): Promise<Response> {
