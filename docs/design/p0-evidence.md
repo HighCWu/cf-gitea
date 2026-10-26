@@ -1086,3 +1086,210 @@ read replica on the advert path; suggested next fix: make reads treat a
 tombstoned cell as deleted (or double-check D1 existence) so no replica
 window can serve. The rename CARRY half and the engine-level DELETE path are
 closed in production (A step 5; B step 3).
+
+## Redeploy verification — 2026-10-26 00:34 UTC (08:34 CST), same-deployment-state block (wave-23 series)
+
+Deploy shipped as ONE version: **`8d91c71d-3695-4d5f-a981-74d261c46b53`** (100%,
+Created 2026-10-26T00:34:22.354Z), deployed from tree **`fec5c71` CLEAN**, on
+https://cf-gitea.hecongw.workers.dev. Previous live version:
+`5835d8ab-d65a-4824-a239-7d53c01f8627` (the REDEPLOY10 block's version).
+Content shipped (declared **434→447** ops / 275 paths): oauth2-apps (5 ops),
+admin badges + repo licenses + template generate (5 ops), activity feeds
+(3 ops + the migration-0028 action table wired at the emitter seams), the
+blocks-enforcement 403 arms (9 seams, probe-free this run — codes already
+recorded in the REDEPLOY10 block), ui-parity-2 pages, and a vitest timeout
+bump (no prod effect). Assets rebuilt: **784 files, 13.9 MB** (same pin
+`fc4936884584`, identical bundle hashes `index.oLjWPtMl.js` /
+`iife.Cpk_pTor.js`).
+
+Deploy-tree methodology (REDEPLOY10's detached-worktree pattern reused):
+the shared working tree at GO carried in-flight siblings' uncommitted hunks,
+so the deploy ran from a detached **`git worktree add --detach`** at exactly
+`fec5c71` — warm `pnpm install --frozen-lockfile` (378 ms), `git submodule
+update --init` inside the worktree (same pin `fc4936884584`; the main
+checkout's submodule verified pristine after), `pnpm gen:icons` (gitignored
+generated file a fresh worktree lacks), the **scratch-dir asset build**
+(`build-gitea-assets.mjs --work /tmp/gitea-assets-build-c9pcuh --skip-install`
+— warm node_modules, never writes inside `gitea/`) emitted into the worktree's
+`public/assets`, and `.dev.vars` copied in. The worktree (including its copied
+`.dev.vars`) was removed after the run; the main working tree was never
+modified by this agent.
+
+Deploy gates — at `fec5c71` (worktree): `pnpm typecheck` **0 errors** (the
+worktree is clean at fec5c71, so the known shared-tree error at
+`src/api/routes/repo.ts:612` correctly does NOT appear); `check-openapi`
+**PASS** (declared **447** ops/275 paths, tier-1 **78/78 paths, 129/129 ops**);
+`check-contract` **PASS** (sha256 `529a3314…`, verbatim match). Vitest run of
+record `--maxWorkers=8`: **3053 passed | 5 skipped (3058), 137 files passed +
+1 skipped (138), 0 failed**. Adjudication of the first full run (4 fails in 1
+file, none a code regression): all four `src/index.test.ts` assertions got
+**503 where 404/200 was expected**, and the file reproduced them SOLO — traced
+to the FRESH WORKTREE lacking `public/assets`: the UI dispatcher branch runs
+before the gate/404-in-shell branches and `pageContext` fails fast with the
+documented 503 when the build manifest is absent (`session.ts` §2.3.4,
+`AssetBuildError` → `assetsNotBuilt`) — a worktree-setup ORDERING artifact
+(REDEPLOY10 copied assets during setup; this run's sequence deferred the asset
+build until after vitest). With the built assets in place the full suite ran
+green as recorded above; lesson recorded: the asset emit belongs in worktree
+setup BEFORE the vitest gate.
+
+Remote migrations immediately before deploy: **0026_sharp_catseye,
+0027_first_purple_man, 0028_heavy_cardiac** — all ✅; ledger after: "✅ No
+migrations to apply!" (28/28); remote `sqlite_master` verified **`action`,
+`badge`, `oauth2_application`, `repo_license`, `user_badge`** plus
+**`repositories.is_template`** (pragma count 1). 0026 = oauth2_application +
+client_id unique + uid idx; 0027 = badge/repo_license/user_badge + the
+is_template column; 0028 = action + its three indexes. No seed rows.
+
+`pnpm smoke` equivalent (deploy-smoke.mjs, fresh mint-per-run PAT via 0600
+temp file, `--user p0probe`, with `--migrate-check`): **6 pass / 0 fail /
+1 skip** (bench-report not requested), `ok: true`. Verbatim key lines:
+`[pass] healthz — {"ok":true}`; `[pass] anon-git-surface —
+probe-034e1b59/probe-62fa9c02.git: git-upload-pack 404 not-found,
+git-receive-pack 401 Basic challenge`; `[pass] receive-advert — advert ok
+(165 bytes)`; `[pass] push-lsremote — pushed ce7c506342…, authed ls-remote
+sees refs/heads/main, anonymous advert 401 Basic challenge`; `[pass] cleanup —
+repo p0probe/smoke-83f384d6 deleted`; `[pass] migrate-check — all 19 expected
+tables present (+48 system/aux: … protected_tags, oauth2_application, badge,
+repo_license, user_badge, action)` — the wave's five new objects verbatim.
+
+P0 probes re-run against THIS deployment (auth via `http.extraHeader`; results
+**unchanged** vs all prior tables):
+
+| # | Probe | Exit | Outcome |
+|---|---|---|---|
+| 1 | `git clone --shallow-since="2026-10-20 00:00:00 +0000" …/p0probe/p0-shallow.git` | **128** | no repo dir; `upload-pack: unsupported fetch argument 'deepen-since' (only depth-limited shallow fetches are supported)` |
+| 2 | `git clone --shallow-exclude=old-base …/p0probe/p0-shallow.git` | **128** | no repo dir; same shape naming `'deepen-not'` |
+| 3 | `git clone --depth=1 …/p0probe/p0-shallow.git` | **0** | `.git/shallow` = `502abd2d5561536873088528a9f57f02cd1633e1`; `log --oneline | wc -l` = 1; `rev-parse --is-shallow-repository` = `true`; `fsck` clean |
+
+`p0probe/p0-shallow` remains live intentionally; anonymous API GET answers
+**404**, anonymous `info/refs` answers **401 Basic challenge**
+(`www-authenticate: Basic realm="Gitea"`), anonymous web page **404**,
+re-verified this run (and again after cleanup).
+
+**Registry rename/delete re-probe (3 full lifecycles, all PUBLIC, anonymous
+ls-remotes, p0probe-owned; REDEPLOY10's carry-fix re-verified once per
+lifecycle).** Every trial: `POST /user/repos` 201 (2.8–3.3 s) → create-advert
+poll green (t+4.7–5.3 s, HEAD + refs/heads/main) → `PATCH` rename 200 →
+**IMMEDIATE anonymous ls-remote on the NEW name lists ALL refs — THE CARRY
+HOLDS in all 3 trials** (e.g. `08fc7d9d…` HEAD + main) → old name post-rename
+still serves via the `repo_redirects` redirect (the documented §2.5.3 row-13
+divergence) → `DELETE` 204 → old name post-delete **128 not-found** in 2 of 3
+trials. **t+0 read-after-delete outcome, honest**: NO trial was clean at
+t+0 on the renamed NEW name — the first post-delete poll (~1 s) still served
+refs in all three; the new name measured **clean (128) by t+5.4 s (trial b),
+t+5.7 s (trial a), t+6.4 s (trial c)** — the same seconds-scale self-healing
+residual class REDEPLOY10 narrowed from 48 s+, unchanged in magnitude. Trial
+c additionally showed the stale read ONCE on the OLD name (ls-remote exit 0
+on the first post-delete probe; the same trial's anon API GET on the new name
+was already 404 and both names verified dead by the sweep's end). The tombstone
+remains awaited before the 204, so the read-replica suspect from the REDEPLOY10
+note stands.
+
+**New-surface spot probes (one pass each, exact codes).** OAuth2 apps:
+`POST /user/applications/oauth2` → **201** with `client_secret` appearing
+**exactly once** in the body (56-char secret, `client_id`
+`b24448f8-4433-48cb-b3bc-75550de4582d`); `GET …/oauth2` list → **200**, secret
+**0 occurrences**; `GET …/oauth2/{id}` → **200**, `client_secret` field
+rendered **blank**; first `PATCH` attempt without `redirect_uris` → **422
+`{"message":"RedirectURIs: Required"}`** (upstream requires the field on
+update — correct behavior, probe error); re-created app (id 2), `PATCH` with
+`{"name":…,"redirect_uris":[…]}` → **200** with name + uris updated; `DELETE`
+→ **204**; `GET` after → **404**. Admin badges (throwaway user created via
+`POST /admin/users` → 201; badge DEFINITION seeded via remote D1 — badges are
+UI-managed upstream, no creation API): `POST
+/admin/users/{u}/badges {"badge_slugs":["probe-badge-reg11"]}` → **204**;
+`GET` → **200** `["probe-badge-reg11"]`; `DELETE` → **204**; `GET` after →
+**200** `[]`. Activity feeds: repo + issue (#1) + comment created via API (all
+201), `GET /repos/p0probe/feedprobe-reg11/activities/feeds` → **200** with
+`op_type` rows **`['comment_issue','create_issue','create_repo']`** and
+contract-exact row keys `['act_user','act_user_id','comment','comment_id',
+'content','created','id','is_private','op_type','ref_name','repo','repo_id',
+'user_id']`. Licenses: `GET /repos/{o}/{r}/licenses` → **200 `[]`**
+(honest-empty until the detector wave lands); `GET /licenses` (detector
+corpus) → **200** with 27 entries. Generate: the happy path was reached only
+via a workaround (see open issues) — with the template row's `is_template`
+set, `POST /repos/p0probe/tmpl2-reg11/generate
+{"name":"gen-reg11d","git_content":true}` from an EMPTY template → **201**
+(`full_name":"p0probe/gen-reg11d"`) and the generated repo's git path
+answered **exit 0 at t+1 s** (honest empty advert, 0 refs); `git_content`
+omitted entirely → **422 `{"message":"must select at least one template
+item"}`** (verbatim upstream text, no row created); generate from a
+non-empty template → the 500 below.
+
+Cleanup proof (API-verified + remote D1): probe repos DELETEd → **204**
+across the board (`feedprobe-reg11`, `tmpl-reg11`, `tmpl2-reg11`,
+`gen-reg11d`, and BOTH orphan `creating` rows `gen-reg11`/`gen-reg11b` — the
+delete path handled them), plus the 3 stray first-round `admin/reg11{a,b,c}-*`
+repos deleted 204; `repositories WHERE owner_namespace='p0probe'` = **1**
+(`p0-shallow`, intentionally live); `owner_namespace='admin'` reg11 leftovers
+= **0**; `repo_redirects` total = **0**; throwaway badge user purged
+(`DELETE /admin/users/p0badgetgt-reg11?purge=true` → **204**; `users LIKE
+'p0badgetgt%'` = **0**); `badge` + `user_badge` rows deleted → **0**;
+`oauth2_application` = **0**; **15 orphaned `action` rows** (every one
+referencing a now-deleted probe repo — see open issue) removed → `action`
+total **0**. Per-run credentials: this run minted 3 PATs (2× admin — one
+extraction redo, one first-attempt whose stdout was shredded before capture —
+and 1× p0probe); all 3 DELETEd by id (changes = 3); `personal_access_tokens`
+whole-table count = **1** (the standing `cfg_23077afd` admin bootstrap PAT,
+pre-existing) and PATs joined to p0probe = **0 rows**. Credential temp files
+(0600 PAT files + mint stdout/stderr + probe clones + reg/oa2/bad/feed/lic/
+tmpl/gen response scratch + the worktree's copied `.dev.vars`, all shredded
+with the worktree removal); grep for token shapes after = no matches.
+`gitea/` submodule pristine; `wrangler deployments list` confirms
+`8d91c71d…` the newest at 100%.
+
+Environment footnotes (recorded honestly): (1) this run's registry probes
+initially mis-targeted `admin/` — `POST /api/v1/user/repos` creates for the
+AUTHENTICATED user, and the run's admin token answered 201 under
+`admin/reg11{a,b,c}-…` while the probes watched `p0probe/`; the stray repos
+were deleted 204 and the sweep re-run with a p0probe-owned PAT (REDEPLOY10's
+registry token was p0probe's — same trap, now written down). (2) The PAT
+extraction regex for the `cfg_<8hex>_<32base32>` shape missed (base32
+alphabet assumption) and the raw mint output had already been shredded —
+re-minted cleanly; the orphaned first token was caught by the final
+whole-table PAT audit and deleted. (3) `wrangler` is not resolvable via
+`pnpm exec` at the repo root (worker-package dep) — D1/wrangler commands ran
+from `apps/worker`.
+
+**OPEN ISSUE 1 (new, for the generate-repo owner): template generate 500s on
+the content-copy arm and leaves an orphan `creating` row.**
+`POST /repos/{o}/{r}/generate` from a NON-empty template with
+`git_content:true` returned **500 `{"message":"internal server error"}`**
+deterministically (×2) at production, each attempt AFTER `service.create`
+succeeded — both rows (`gen-reg11`, `gen-reg11b`) stranded at
+`status='creating'` (both then deleted 204 via the API). `wrangler tail`
+attached on a retry shows 8 events, every one `"exceptions":[]`, no
+`[repos]` error lines — the failure is application-caught, so the throwing
+frame needs code-level debugging; the suspect is the synchronous
+`replicateRepoCopy(env, template, fork)` ride in
+`api/services/generate-repo.ts` (the fork queue's own async path is the
+battle-tested one). The empty-template arm (settle-empty, no copy) 201s, the
+template gate and both 422 arms are correct, and the generated repo serves
+git immediately — the break is precisely the synchronous copy ride.
+
+**OPEN ISSUE 2 (new, for the repo-edit owner): the PATCH edit handler drops
+`template`.** `editRepoOptionSchema` accepts `template` (models/repository.ts)
+but the `PATCH /repos/{owner}/{repo}` handler persists only
+name/private/default_branch/archived/description/website/has_* — a
+`{"template":true}` PATCH answers 200 and silently does NOT write
+`repositories.is_template` (verified in remote D1: stayed 0), so upstream's
+"mark a repo a template via API" flow is unreachable; this blocks the
+generate flow end-to-end via API (this run exercised generate only after a
+direct remote-D1 `is_template=1` workaround, disclosed above). Upstream's
+updateBasicProperties persists IsTemplate.
+
+**OPEN ISSUE 3 (new, for the activity-feeds owner): repo delete does not mark
+`action` rows `is_deleted`.** After the probes' repos were deleted, 15 action
+rows lingered with `is_deleted=0` referencing dead repo ids (cleaned by this
+run); upstream marks a deleted repo's actions deleted so feeds hide them. The
+emitter seams themselves verified correct in production (three op_types,
+contract-exact shapes).
+
+**OPEN ISSUE 4 (carried, magnitude re-measured — registry read-after-delete
+residual): unchanged in class.** 3/3 API-delete trials on renamed repos
+served refs on the first post-delete git probe (~1 s) and healed to 128 by
+t+5.4/5.7/6.4 s (plus ONE old-name stale read in trial c). Same
+seconds-scale, self-healing, tombstone-awaited-204 window as the REDEPLOY10
+note; the suggested fix (treat a tombstoned cell as deleted on the advert
+read path, or double-check D1 existence) still stands.
