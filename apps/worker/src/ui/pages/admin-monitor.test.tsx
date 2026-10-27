@@ -17,6 +17,7 @@
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
@@ -24,13 +25,23 @@ import { renderToString } from "hono/jsx/dom/server";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import {
   comments,
+  commitStatuses,
   follows,
   issueAttachments,
   issues,
+  labels,
+  milestones,
+  oauth2Applications,
+  projectColumns,
+  projects,
+  publicKeys,
   releaseAssets,
   releases,
   repoMirrors,
+  repoWatchers,
   repositories,
+  stars,
+  teams,
   users,
   webhookDeliveries,
   webhooks,
@@ -79,17 +90,29 @@ const AT = new Date("2026-01-01T00:00:00Z");
 
 /** Tables the fixtures write (the blocked-users harness's cleanup list;
  *  "sessions" explicit — the mounted-route matrix below mints session rows,
- *  the applications-tab reset's posture). */
+ *  the applications-tab reset's posture). Children first: the batch-12 arms
+ *  seed teams/projects/columns/stars/watchers/commit-statuses whose rows
+ *  reference the users/repositories rows the sweep also clears. */
 const FIXTURE_TABLES = [
   "comments",
+  "commit_statuses",
   "follows",
   "issue_attachments",
   "issues",
+  "labels",
+  "milestones",
+  "oauth2_application",
+  "project_columns",
+  "projects",
+  "public_keys",
   "release_assets",
   "releases",
   "repo_mirrors",
+  "repo_watchers",
   "repositories",
   "sessions",
+  "stars",
+  "teams",
   "users",
   "webhook_deliveries",
   "webhooks",
@@ -212,6 +235,104 @@ describe("loadAdminMonitorStats (GetStatistic's landed-table subset, sorted keys
     // The keys stay sorted (MonitorStats' sort.Strings, admin.go:287).
     const keys = stats.map(([key]) => key);
     expect(keys).toEqual([...keys].sort());
+  });
+
+  // wave-polish-matrix-12 — the MIGRATION-PLACEHOLDER fixture edge: the
+  // ledger seeds two permanently-prohibited principals (the un-takeable
+  // 'assets' reservation, 0003_glossy_turbo.sql, and the deploy-key system
+  // user id -3, 0020_mute_nocturne.sql). The beforeEach wipe removes them,
+  // so this arm restores the migrations' exact INSERTs and pins where the
+  // derivations file them: UsersNotActive (type user + status prohibited) —
+  // never UsersActive, never Org.
+  it("the migration-placeholder principals land in UsersNotActive — never UsersActive or Org", async () => {
+    await env.DB
+      .prepare(
+        "INSERT INTO users (id, username, username_lower, is_admin, status, created_at) VALUES (-3, 'gitea:deploy-key', 'gitea:deploy-key', 0, 'prohibited', 0)",
+      )
+      .run();
+    await env.DB
+      .prepare(
+        "INSERT INTO users (username, username_lower, is_admin, status, created_at) VALUES ('assets', 'assets', 0, 'prohibited', 0)",
+      )
+      .run();
+
+    const { stats } = await loadAdminMonitorStats(env.DB);
+    const byKey = new Map(stats);
+    expect(byKey.get("UsersNotActive")).toBe(2);
+    expect(byKey.get("UsersActive")).toBe(0);
+    expect(byKey.get("Org")).toBe(0);
+    expect(byKey.get("Repo")).toBe(0);
+    expect(byKey.get("Issue")).toBe(0);
+  });
+
+  // wave-polish-matrix-12 — the counters the first fixture pass never seeded:
+  // one row each for the ten remaining derivations (Label/Milestone/Team/
+  // Project/ProjectColumn/PublicKey/Oauth/Star/Watch/CommitStatus) plus the
+  // Mirror counter (repo_mirrors, unseeded until now) — each counter reads
+  // EXACTLY its own table (the org row is a user-table row of type org; the
+  // star and watcher are distinct tables; Oauth reads the landed
+  // oauth2_applications — upstream hardcodes 0, statistic.go:104).
+  it("counts each remaining derivation's own table — labels, milestones, teams, projects, keys, oauth, stars, watches, statuses, mirrors", async () => {
+    const db = drizzle(env.DB);
+    const userRows = await db
+      .insert(users)
+      .values([
+        { username: "alice", usernameLower: "alice", type: "user", status: "active", createdAt: AT },
+        { username: "acme", usernameLower: "acme", type: "org", status: "active", createdAt: AT },
+      ])
+      .returning({ id: users.id })
+      .all();
+    const alice = userRows[0]!.id;
+    const acme = userRows[1]!.id;
+    await db
+      .insert(repositories)
+      .values([{ id: "r1", storageKey: "r_r1", ownerNamespace: "alice", ownerId: alice, slug: "one", visibility: "public", createdAt: AT }])
+      .run();
+    await db.insert(teams).values({ orgId: acme, lowerName: "devs", name: "devs", authorize: "read" }).run();
+    await db.insert(labels).values({ repoId: "r1", name: "bug", color: "#ff0000" }).run();
+    await db.insert(milestones).values({ repoId: "r1", name: "v1" }).run();
+    const projectRows = await db
+      .insert(projects)
+      .values({ title: "Board", ownerId: alice, creatorId: alice, type: 1, createdAt: AT, updatedAt: AT })
+      .returning({ id: projects.id })
+      .all();
+    await db
+      .insert(projectColumns)
+      .values({ title: "Todo", projectId: projectRows[0]!.id, creatorId: alice, createdAt: AT, updatedAt: AT })
+      .run();
+    await db
+      .insert(publicKeys)
+      .values({ ownerId: alice, name: "laptop", fingerprint: "SHA256:abc", content: "ssh-ed25519 AAAA test", createdAt: AT, updatedAt: AT })
+      .run();
+    await db
+      .insert(oauth2Applications)
+      .values({ uid: alice, name: "cli", clientId: "client-1", clientSecret: "hashed", createdAt: AT, updatedAt: AT })
+      .run();
+    await db.insert(stars).values({ userId: alice, repoId: "r1", createdAt: AT }).run();
+    await db.insert(repoWatchers).values({ repoId: "r1", userId: alice, createdAt: AT }).run();
+    await db.insert(commitStatuses).values({ repoId: "r1", sha: "a".repeat(40), state: "success" }).run();
+    await db.insert(repoMirrors).values({ repoId: "m1", remoteAddress: "https://src.test/x.git", intervalSeconds: 600 }).run();
+
+    const { stats } = await loadAdminMonitorStats(env.DB);
+    const byKey = new Map(stats);
+    expect(byKey.get("Label")).toBe(1);
+    expect(byKey.get("Milestone")).toBe(1);
+    expect(byKey.get("Team")).toBe(1);
+    expect(byKey.get("Project")).toBe(1);
+    expect(byKey.get("ProjectColumn")).toBe(1);
+    expect(byKey.get("PublicKey")).toBe(1);
+    expect(byKey.get("Oauth")).toBe(1);
+    expect(byKey.get("Star")).toBe(1);
+    expect(byKey.get("Watch")).toBe(1);
+    expect(byKey.get("CommitStatus")).toBe(1);
+    expect(byKey.get("Mirror")).toBe(1);
+    // The user-table split again, with the org present: active users vs the
+    // Org counter never blend.
+    expect(byKey.get("UsersActive")).toBe(1);
+    expect(byKey.get("Org")).toBe(1);
+    // Nothing leaked into the attachment sum or the delivery log.
+    expect(byKey.get("Attachment")).toBe(0);
+    expect(byKey.get("HookTask")).toBe(0);
   });
 });
 
@@ -430,6 +551,59 @@ describe("the monitor family DOM (templates/admin/*.tmpl at the pin)", () => {
     const html = renderToString(<AdminMonitorQueuePage ctx={ctx} data={data} />);
     expect(html).toContain("<td>3</td>");
     expect(html).toContain("<td>2</td>");
+  });
+
+  // wave-polish-matrix-12 — the depths move with the STATE LIFECYCLE: the
+  // consumer-side transitions (a delivery pending→delivering→delivered; a
+  // mirror idle→queued→syncing→idle — the real drivers are the queue
+  // consumers' own suites) re-read through the loader as exact depth moves:
+  // in-flight leaves at the OUTCOME write, the repo-tasks depth counts the
+  // two in-process states and drops on the settle back to idle.
+  it("the depths track the lifecycle: delivery pending→delivering→delivered, mirror idle→queued→syncing→idle", async () => {
+    const db = drizzle(env.DB);
+    const hookRows = await db
+      .insert(webhooks)
+      .values([{ repoId: "r1", url: "https://hook.test", events: "{}", isActive: true, createdAt: AT }])
+      .returning({ id: webhooks.id })
+      .all();
+    const deliveryRows = await db
+      .insert(webhookDeliveries)
+      .values([
+        { hookId: hookRows[0]!.id, repoId: "r1", uuid: "u1", eventType: "issues", eventGroup: "issues", payloadContent: "{}", state: "pending", createdAt: AT },
+      ])
+      .returning({ id: webhookDeliveries.id })
+      .all();
+    const mirrorRows = await db
+      .insert(repoMirrors)
+      .values([{ repoId: "a", remoteAddress: "https://src.test/a.git", syncState: "idle", nextSyncAt: 1 }])
+      .returning({ id: repoMirrors.id })
+      .all();
+
+    const depthOf = async (name: string): Promise<number | null> =>
+      (await loadAdminMonitorQueues(env.DB)).queues.find((row) => row.name === name)?.inQueue ?? null;
+
+    // idle mirror + pending delivery: the delivery is in-flight, the idle
+    // mirror is not.
+    expect(await depthOf("webhook-delivery")).toBe(1);
+    expect(await depthOf("repo-tasks")).toBe(0);
+
+    // The cron producer's enqueue flips the mirror queued — repo-tasks gains it.
+    await db.update(repoMirrors).set({ syncState: "queued" }).where(eq(repoMirrors.id, mirrorRows[0]!.id));
+    expect(await depthOf("repo-tasks")).toBe(1);
+
+    // The consumer's claim: delivering/queued — both still in-flight.
+    await db.update(repoMirrors).set({ syncState: "syncing" }).where(eq(repoMirrors.id, mirrorRows[0]!.id));
+    await db.update(webhookDeliveries).set({ state: "delivering" }).where(eq(webhookDeliveries.id, deliveryRows[0]!.id));
+    expect(await depthOf("repo-tasks")).toBe(1);
+    expect(await depthOf("webhook-delivery")).toBe(1);
+
+    // The settle arms: the outcome write and the settle back to idle — both
+    // depths drain to zero, the DLQ counter stays uncountable.
+    await db.update(webhookDeliveries).set({ state: "delivered" }).where(eq(webhookDeliveries.id, deliveryRows[0]!.id));
+    await db.update(repoMirrors).set({ syncState: "idle" }).where(eq(repoMirrors.id, mirrorRows[0]!.id));
+    expect(await depthOf("webhook-delivery")).toBe(0);
+    expect(await depthOf("repo-tasks")).toBe(0);
+    expect(await depthOf("webhook-delivery-dlq")).toBeNull();
   });
 
   it("trace: the honest-absence note and NO dead controls (tabs, cancel, diagnosis)", () => {

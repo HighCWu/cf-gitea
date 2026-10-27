@@ -539,3 +539,75 @@ describe("the garbage-sort degrade's order (beyond wave 9's status-only pin)", (
     expect(early).toBeGreaterThan(late);
   });
 });
+
+// --- batch-12 (wave-polish-matrix-12): the users sort vocab's explicit
+// default arm, the case-insensitive q, and the unfiltered / beyond-end pager
+// grammar — the corners batch 5's combination sweep left open.
+
+describe("/explore/users — the explicit newest sort and the case-insensitive q", () => {
+  it("orders the EXPLICIT sort=newest by id DESC (the default arm driven directly, not via the degrade)", async () => {
+    // q=explore92-u0 matches u01..u09 — nine rows, one page; newest (id DESC)
+    // puts the last-inserted u09 at the head, u01 at the tail.
+    const res = await fetchUi("/explore/users?q=explore92-u0&sort=newest");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const a = html.indexOf('href="/explore92-u09"');
+    const b = html.indexOf('href="/explore92-u01"');
+    expect(a).toBeGreaterThan(-1);
+    expect(b).toBeGreaterThan(-1);
+    expect(a).toBeLessThan(b);
+  });
+
+  it("matches an UPPERCASE q against the lower-case rows (the instr predicate lowercases the keyword)", async () => {
+    // searchExploreUsers re-issues services/user.ts's keyword arm verbatim:
+    // instr(username_lower, q.toLowerCase()) — so EXPLORE92-U02 finds exactly
+    // the u02 row (the two-digit form never substring-matches its neighbors).
+    const res = await fetchUi("/explore/users?q=EXPLORE92-U02");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('href="/explore92-u02">explore92-u02</a>');
+    expect(countOf(html, 'href="/explore92-')).toBe(1);
+  });
+});
+
+describe("/explore/users — the unfiltered and beyond-end pager grammar", () => {
+  it("paginates the unfiltered listing 20-per-page with NO q on the pager hrefs (the keyword-omission arm)", async () => {
+    // This file's world holds 25 active users (owner/hidden/limited/admin +
+    // u01..u21 — the two migration-placeholder principals are prohibited and
+    // gated out), all named explore92*: page 1 carries the 20 highest ids
+    // (newest default) and spills five. ExplorePagination sets q only when
+    // non-empty — so the unfiltered Older href is the bare ?page= form.
+    const page1 = await fetchUi("/explore/users");
+    expect(page1.status).toBe(200);
+    const page1Html = await page1.text();
+    expect(countOf(page1Html, 'href="/explore92-u')).toBe(20); // u21..u02 by id DESC
+    expect(page1Html).toContain('href="/explore/users?page=2"');
+    expect(page1Html).not.toContain('href="/explore/users?q='); // q never rides when empty
+    expect(page1Html).toContain("<span class=\"navigation_label\">Older</span>");
+    expect(page1Html).not.toContain("<span class=\"navigation_label\">Newer</span>");
+
+    const page2 = await fetchUi("/explore/users?page=2");
+    expect(page2.status).toBe(200);
+    const page2Html = await page2.text();
+    expect(countOf(page2Html, 'href="/explore92-u')).toBe(1); // u01 alone spills of the block
+    // The named rows (inserted before the block, so lowest ids) land here too.
+    expect(page2Html).toContain('href="/explore92owner"');
+    expect(page2Html).toContain('href="/explore92hidden"');
+    expect(page2Html).toContain('href="/explore/users?page=1"');
+    expect(page2Html).toContain("<span class=\"navigation_label\">Newer</span>");
+    expect(page2Html).not.toContain("<span class=\"navigation_label\">Older</span>");
+  });
+
+  it("renders the beyond-the-end users page as no-results with a Newer-only pager that keeps q", async () => {
+    // The users-side twin of the repos page's ?page=99 arm: no upper clamp,
+    // the q still travels back through the Newer href.
+    const res = await fetchUi("/explore/users?q=explore92-u&page=99");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("No matching results found.");
+    expect(html).toContain('href="/explore/users?q=explore92-u&amp;page=98"');
+    expect(html).toContain("<span class=\"navigation_label\">Newer</span>");
+    expect(html).not.toContain("<span class=\"navigation_label\">Older</span>");
+    expect(html).not.toContain('href="/explore92-u01"');
+  });
+});

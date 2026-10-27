@@ -248,6 +248,44 @@ describe("POST /repos/{owner}/{repo}/migrate", () => {
     expect(header).toBe(`Basic ${btoa("user:pass")}`);
   });
 
+  // wave-polish-matrix-12 — the pull channel's remaining auth field shapes
+  // (deriveMirrorAuthHeader, api/services/mirror.ts:222-230): each half alone
+  // composes its Basic value; the empty pair derives NULL — anonymous, no KEK
+  // consulted, nothing sealed.
+  it("seals username-only and password-only credentials; the empty pair stays anonymous", async () => {
+    await seedRepo();
+    const app = makeApp(recordingQueue(), { MIRROR_CREDENTIAL_KEY: KEK });
+    const post = (extra: Record<string, unknown>) =>
+      app(`${repoBase}/migrate`, {
+        method: "POST",
+        headers: jsonAuth,
+        body: JSON.stringify(migrateBody(extra)),
+      });
+    const readRow = () => drizzle(env.DB).select().from(repoMirrors).where(eq(repoMirrors.repoId, "7401")).get();
+    const reset = () =>
+      Promise.all([
+        env.DB.prepare("DELETE FROM repo_mirrors").run(),
+        env.DB.prepare("UPDATE repositories SET is_mirror = 0, original_url = NULL").run(),
+      ]);
+
+    await post({ auth_username: "user" });
+    let row = await readRow();
+    expect(row!.credentialsUsername).toBe("user");
+    expect(await mirrorAuthHeader({ ...env, MIRROR_CREDENTIAL_KEY: KEK }, row!)).toBe(`Basic ${btoa("user:")}`);
+    await reset();
+
+    await post({ auth_password: "pass" });
+    row = await readRow();
+    expect(row!.credentialsUsername).toBeNull(); // only auth_username lands in the column
+    expect(await mirrorAuthHeader({ ...env, MIRROR_CREDENTIAL_KEY: KEK }, row!)).toBe(`Basic ${btoa(":pass")}`);
+    await reset();
+
+    // The empty pair: derives null — no ciphertext even with the KEK present.
+    await post({ auth_username: "", auth_password: "" });
+    row = await readRow();
+    expect(row!.credentialsCiphertext).toBeNull();
+  });
+
   it("prefers the bearer token when both auth forms arrive (documented divergence)", async () => {
     await seedRepo();
     const app = makeApp(recordingQueue(), { MIRROR_CREDENTIAL_KEY: KEK });
@@ -494,6 +532,77 @@ describe("GET /repos/{owner}/{repo}/mirror", () => {
     const app = makeApp(recordingQueue());
     const res = await app(repoBase + "/mirror", { headers: { Authorization: `token ${TOKEN_OTHER}` } });
     expect(res.status).toBe(403);
+  });
+
+  // wave-polish-matrix-12 — the settled row's display arms: the sync's
+  // UpdateMirrorSyncStatus columns (last_error verbatim, the unix last/next
+  // stamps) pass straight through getMirrorStatus, and the repository's
+  // original_url rides in from the repositories row so the response is
+  // self-contained (api/services/mirror.ts getMirrorStatus, §2.3).
+  it("renders the settled row: last_error, the sync stamps, and the repo's original_url", async () => {
+    await seedRepo();
+    await seedMirrorRow();
+    await drizzle(env.DB)
+      .update(repoMirrors)
+      .set({ lastError: "boom: fetch failed", lastSyncAt: 1_760_000_000, nextSyncAt: 1_760_000_600 })
+      .where(eq(repoMirrors.repoId, "7401"));
+    await drizzle(env.DB)
+      .update(repositories)
+      .set({ isMirror: true, originalUrl: SOURCE_URL })
+      .where(eq(repositories.id, "7401"));
+
+    const app = makeApp(recordingQueue());
+    const res = await app(repoBase + "/mirror", { headers: { Authorization: `token ${TOKEN}` } });
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.last_error).toBe("boom: fetch failed");
+    expect(body.last_sync_at).toBe(1_760_000_000);
+    expect(body.next_sync_at).toBe(1_760_000_600);
+    expect(body.original_url).toBe(SOURCE_URL);
+    expect(body.remote_address).toBe(SOURCE_URL);
+    expect(body.sync_state).toBe("idle");
+  });
+
+  // wave-polish-matrix-12 — the in-flight states render verbatim: the
+  // sync_state enum's queued/syncing arms (schema.ts's CHECK'd triple) are
+  // exactly what a consumer-claim cycle puts in the column.
+  it("renders the queued and syncing states verbatim", async () => {
+    await seedRepo();
+    await seedMirrorRow();
+    const app = makeApp(recordingQueue());
+    for (const state of ["queued", "syncing"] as const) {
+      await drizzle(env.DB).update(repoMirrors).set({ syncState: state }).where(eq(repoMirrors.repoId, "7401"));
+      const res = await app(repoBase + "/mirror", { headers: { Authorization: `token ${TOKEN}` } });
+      expect(res.status, state).toBe(200);
+      expect((await res.json<Record<string, unknown>>()).sync_state, state).toBe(state);
+    }
+  });
+
+  // wave-polish-matrix-12 — the disabled mirror (interval 0, next_sync_at 0,
+  // §2.6's "0 = disabled" form): the status renders the zero interval and the
+  // MANUAL sync trigger still enqueues — the POST only consults the row's
+  // existence, never the schedule (routes/mirror.ts's mirror-sync handler).
+  it("renders the disabled (interval 0) mirror; the manual trigger still enqueues", async () => {
+    await seedRepo();
+    await drizzle(env.DB).insert(repoMirrors).values({
+      repoId: "7401",
+      intervalSeconds: 0,
+      remoteAddress: SOURCE_URL,
+      syncState: "idle",
+      nextSyncAt: 0,
+    });
+    const app = makeApp(recordingQueue());
+    const status = await app(repoBase + "/mirror", { headers: { Authorization: `token ${TOKEN}` } });
+    expect(status.status).toBe(200);
+    const body = await status.json<Record<string, unknown>>();
+    expect(body.mirror_interval).toBe("0");
+    expect(body.interval_seconds).toBe(0);
+    expect(body.next_sync_at).toBe(0);
+
+    const queue = recordingQueue();
+    const synced = await makeApp(queue)(`${repoBase}/mirror-sync`, { method: "POST", headers: jsonAuth });
+    expect(synced.status).toBe(200);
+    expect(queue.sent).toEqual([{ kind: "mirror-sync", repoId: "7401" }]);
   });
 });
 

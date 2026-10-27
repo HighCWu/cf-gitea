@@ -46,17 +46,27 @@ const SEED_COMMITS: SeedCommit[] = [
 /** Plaintext tokens per role, minted in beforeAll. */
 const tokens = new Map<string, string>();
 
-/** Team with one member, covering the given repo ids. */
+/** Team with one member, covering the given repo ids. `unitsMap` seeds the
+ *  per-unit override JSON (the assignTeamPermission collapse shape —
+ *  authorize 'none' + the map — the unit-grant matrix arm). */
 async function seedTeam(
   org: OrgRecord,
   name: string,
   authorize: TeamAccessMode,
   userId: number,
   repoIds: string[],
+  unitsMap: Record<string, string> | null = null,
 ): Promise<void> {
   const inserted = await drizzle(env.DB)
     .insert(teams)
-    .values({ orgId: org.id, lowerName: name, name, authorize, visibility: "private" })
+    .values({
+      orgId: org.id,
+      lowerName: name,
+      name,
+      authorize,
+      visibility: "private",
+      unitsMap: unitsMap === null ? null : JSON.stringify(unitsMap),
+    })
     .returning({ id: teams.id })
     .all();
   const teamId = inserted[0]!.id;
@@ -92,6 +102,8 @@ beforeAll(async () => {
   const readMate = await seedVerifiedUser({ username: "ReadMate" });
   const adminMate = await seedVerifiedUser({ username: "AdminMate" });
   const stranger = await seedVerifiedUser({ username: "TwStranger" });
+  const unitWriteMate = await seedVerifiedUser({ username: "UnitWriteMate" });
+  const unitNoneMate = await seedVerifiedUser({ username: "UnitNoneMate" });
 
   const org = await new OrgService(env.DB).createOrg({ name: "tworg", ownerId: owner.id });
   const repo = await new RepoService(env.DB).create({
@@ -118,6 +130,11 @@ beforeAll(async () => {
   await seedTeam(org, "writers", "write", writeMate.id, [repo.id]);
   await seedTeam(org, "readers", "read", readMate.id, [repo.id]);
   await seedTeam(org, "admins", "admin", adminMate.id, [repo.id]);
+  // wave-polish-matrix-12 — the unit-grant matrix arms: the same two grant
+  // shapes as the plain teams, expressed as the assignTeamPermission collapse
+  // (authorize 'none' + the units_map values carrying the access level).
+  await seedTeam(org, "unit-writers", "none", unitWriteMate.id, [repo.id], { "repo.code": "write" });
+  await seedTeam(org, "unit-dormant", "none", unitNoneMate.id, [repo.id], { "repo.code": "none" });
 
   for (const [role, user] of [
     ["owner", owner],
@@ -125,6 +142,8 @@ beforeAll(async () => {
     ["read", readMate],
     ["admin", adminMate],
     ["stranger", stranger],
+    ["unit-write", unitWriteMate],
+    ["unit-none", unitNoneMate],
   ] as const) {
     tokens.set(role, (await mintFor(user.id, `tw-${role}`, "all")).plaintext);
   }
@@ -210,5 +229,46 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — the settings admin arm", ()
     expect(await res.json<{ message: string }>()).toMatchObject({
       message: "user should be an owner or a collaborator with admin write of a repository",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wave-polish-matrix-12 — the unit-grant matrix (per-unit access levels):
+// the SAME write/read/list seams above, driven by the assignTeamPermission
+// collapse shape (authorize 'none', the access level living in the
+// units_map values — max(authorize, units_map values) is the effective mode
+// every seam reads: OrgService.teamRepoAccessMode).
+// ---------------------------------------------------------------------------
+
+describe("the units_map matrix — the collapse feeds the same seams", () => {
+  it("a units_map write grant WRITES: the member lands a commit exactly like the plain write team", async () => {
+    const res = await api("/repos/tworg/vault/contents/unit-written.txt", token("unit-write"), {
+      method: "PUT",
+      body: JSON.stringify({ content: btoa("unit-granted write\n"), message: "units write" }),
+    });
+    expect(res.status).toBe(201);
+
+    const read = await api("/repos/tworg/vault/contents/unit-written.txt", token("owner"));
+    expect(read.status).toBe(200);
+    expect(atob((await read.json<{ content: string }>()).content)).toBe("unit-granted write\n");
+  });
+
+  it("a units_map write grant LISTS: the member's /orgs/{org}/repos twin shows the vault", async () => {
+    const res = await api("/orgs/tworg/repos", token("unit-write"));
+    expect(res.status).toBe(200);
+    expect((await res.json<Array<{ full_name: string }>>()).map((repo) => repo.full_name)).toEqual(["tworg/vault"]);
+  });
+
+  it("an all-none units_map grant admits NOTHING: the covered repo is invisible on every seam", async () => {
+    // The write seam: invisible repo → the anti-enumeration 404.
+    const put = await api("/repos/tworg/vault/contents/nope.txt", token("unit-none"), {
+      method: "PUT",
+      body: JSON.stringify({ content: btoa("nope\n"), message: "dormant" }),
+    });
+    expect(put.status).toBe(404);
+    // The listing twin: no effective mode → the vault never renders.
+    const list = await api("/orgs/tworg/repos", token("unit-none"));
+    expect(list.status).toBe(200);
+    expect(await list.json<unknown[]>()).toEqual([]);
   });
 });

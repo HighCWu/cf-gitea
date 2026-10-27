@@ -261,6 +261,152 @@ describe("repoAddPushMirror (POST /repos/{owner}/{repo}/push_mirrors)", () => {
     expect(row.credentialsCiphertext).toBeNull();
   });
 
+  // wave-polish-matrix-12 — the auth field shapes' remaining arms (upstream
+  // composes the Basic header whenever EITHER field is non-empty,
+  // modules/git/remote.go:84-87 → derivePushMirrorAuthHeader): each half alone
+  // seals, the empty pair is anonymous even with a KEK present, and the
+  // envelope round-trips non-ASCII through its UTF-8 bytes.
+  it("200: username-only and password-only each seal — the empty pair stays anonymous", async () => {
+    const app = makeApp(recordingQueue(), { MIRROR_CREDENTIAL_KEY: KEK });
+
+    // Username only: the header value is Basic base64("git:").
+    const userOnly = await seedRepo();
+    const resUser = await app(
+      `/api/v1/repos/alice/${userOnly.slug}/push_mirrors`,
+      authed(OWNER_TOKEN, { method: "POST", body: JSON.stringify(addBody({ remote_username: "git" })) }),
+    );
+    expect(resUser.status).toBe(200);
+    const rowUser = (await db().select().from(pushMirrors).where(eq(pushMirrors.repoId, userOnly.repoId)).all())[0]!;
+    expect(rowUser.credentialsUsername).toBe("git");
+    expect(
+      await decryptCredentials(KEK, { id: rowUser.id, repoId: userOnly.repoId, credentialsCiphertext: rowUser.credentialsCiphertext! }),
+    ).toBe("Basic " + btoa("git:"));
+
+    // Password only: no stored username, still a sealed envelope.
+    const passOnly = await seedRepo();
+    const resPass = await app(
+      `/api/v1/repos/alice/${passOnly.slug}/push_mirrors`,
+      authed(OWNER_TOKEN, { method: "POST", body: JSON.stringify(addBody({ remote_password: "s3cret" })) }),
+    );
+    expect(resPass.status).toBe(200);
+    const rowPass = (await db().select().from(pushMirrors).where(eq(pushMirrors.repoId, passOnly.repoId)).all())[0]!;
+    expect(rowPass.credentialsUsername).toBeNull();
+    expect(
+      await decryptCredentials(KEK, { id: rowPass.id, repoId: passOnly.repoId, credentialsCiphertext: rowPass.credentialsCiphertext! }),
+    ).toBe("Basic " + btoa(":s3cret"));
+
+    // The empty-string pair derives a NULL auth header — anonymous, no KEK
+    // consulted, nothing sealed even though a KEK IS configured. The landed
+    // username column keeps the EMPTY STRING verbatim (`?? null` guards only
+    // undefined — addPushMirror's credentialsUsername arm), the derive half's
+    // empty-meets-empty is the anonymous gate.
+    const empty = await seedRepo();
+    const resEmpty = await app(
+      `/api/v1/repos/alice/${empty.slug}/push_mirrors`,
+      authed(OWNER_TOKEN, {
+        method: "POST",
+        body: JSON.stringify(addBody({ remote_username: "", remote_password: "" })),
+      }),
+    );
+    expect(resEmpty.status).toBe(200);
+    const rowEmpty = (await db().select().from(pushMirrors).where(eq(pushMirrors.repoId, empty.repoId)).all())[0]!;
+    expect(rowEmpty.credentialsUsername).toBe("");
+    expect(rowEmpty.credentialsCiphertext).toBeNull();
+  });
+
+  // wave-polish-matrix-12 — non-ASCII credentials ride the RFC 7617 value's
+  // UTF-8 bytes (derivePushMirrorAuthHeader's TextEncoder step); the decrypt
+  // half must see exactly those bytes.
+  it("200: a unicode password seals through its UTF-8 bytes — the decrypt round-trips", async () => {
+    const { slug, repoId } = await seedRepo();
+    const app = makeApp(recordingQueue(), { MIRROR_CREDENTIAL_KEY: KEK });
+    const res = await app(
+      `/api/v1/repos/alice/${slug}/push_mirrors`,
+      authed(OWNER_TOKEN, { method: "POST", body: JSON.stringify(addBody({ remote_username: "git", remote_password: "pässwörd🔐" })) }),
+    );
+    expect(res.status).toBe(200);
+    const row = (await db().select().from(pushMirrors).where(eq(pushMirrors.repoId, repoId)).all())[0]!;
+    const utf8 = new TextEncoder().encode("git:pässwörd🔐");
+    expect(
+      await decryptCredentials(KEK, { id: row.id, repoId, credentialsCiphertext: row.credentialsCiphertext! }),
+    ).toBe(`Basic ${btoa(String.fromCharCode(...utf8))}`);
+  });
+
+  // wave-polish-matrix-12 — the interval grammar's remaining wire edges:
+  // exactly-at-the-floor passes, the negative and float forms PARSE (Go
+  // ParseDuration accepts both) and so fail the min check rather than the
+  // parse one, and the huge hour form renders upstream's Duration.String().
+  it("200/400: at-floor passes; negative and float forms parse then fail the floor; huge hours render", async () => {
+    const { slug } = await seedRepo();
+    const app = makeApp(recordingQueue());
+
+    const atFloor = await app(`/api/v1/repos/alice/${slug}/push_mirrors`, authed(OWNER_TOKEN, { method: "POST", body: JSON.stringify(addBody({ interval: "10m" })) }));
+    expect(atFloor.status).toBe(200);
+    expect((await jsonBody<MirrorWire>(atFloor)).interval).toBe("10m0s");
+
+    // "-5m" parses to -300 (parsePushMirrorInterval's sign arm) — nonzero
+    // below the floor, so the MINIMUM text, not the invalid-duration one.
+    const negative = await app(`/api/v1/repos/alice/${slug}/push_mirrors`, authed(OWNER_TOKEN, { method: "POST", body: JSON.stringify(addBody({ interval: "-5m" })) }));
+    expect(negative.status).toBe(400);
+    expect((await jsonBody<{ message: string }>(negative)).message).toBe("interval is shorter than minimum 10m0s");
+
+    // "1.5m" parses to 90 via the float component — the same minimum bucket.
+    const float = await app(`/api/v1/repos/alice/${slug}/push_mirrors`, authed(OWNER_TOKEN, { method: "POST", body: JSON.stringify(addBody({ interval: "1.5m" })) }));
+    expect(float.status).toBe(400);
+    expect((await jsonBody<{ message: string }>(float)).message).toBe("interval is shorter than minimum 10m0s");
+
+    // A huge hour count round-trips through goDurationString's h-only form.
+    const huge = await app(`/api/v1/repos/alice/${slug}/push_mirrors`, authed(OWNER_TOKEN, { method: "POST", body: JSON.stringify(addBody({ interval: "999999h" })) }));
+    expect(huge.status).toBe(200);
+    expect((await jsonBody<MirrorWire>(huge)).interval).toBe("999999h0m0s");
+  });
+
+  // wave-polish-matrix-12 — an entirely absent remote_address hits the same
+  // IsURLError bucket as an unparseable one (checkPushMirrorTarget's
+  // new URL("") throw, services/push-mirrors.ts:187-193).
+  it("400: an absent remote_address is the Invalid Url bucket", async () => {
+    const { slug } = await seedRepo();
+    const app = makeApp(recordingQueue());
+    const res = await app(
+      `/api/v1/repos/alice/${slug}/push_mirrors`,
+      authed(OWNER_TOKEN, { method: "POST", body: JSON.stringify(addBody({ remote_address: undefined })) }),
+    );
+    expect(res.status).toBe(400);
+    expect((await jsonBody<{ message: string }>(res)).message).toBe("Invalid Url ");
+  });
+
+  // wave-polish-matrix-12 — the 64 KiB declared-cap (routes/push-mirrors.ts
+  // PUSH_MIRROR_BODY_MAX_BYTES) dies BEFORE the zod parse — the migrate cap
+  // pattern's runtime-only 413, this family's first pin of it. The cap reads
+  // the DECLARED header (the shape real ingress always provides; workerd's
+  // Request only carries it when explicitly set — probed 2026-10-27).
+  it("413 (runtime-only): a declared oversized body dies at the cap, unwritten", async () => {
+    const { slug, repoId } = await seedRepo();
+    const app = makeApp(recordingQueue());
+    const res = await app(`/api/v1/repos/alice/${slug}/push_mirrors`, {
+      method: "POST",
+      headers: { Authorization: `token ${OWNER_TOKEN}`, "Content-Type": "application/json", "content-length": String(70 * 1024) },
+      body: JSON.stringify(addBody()),
+    });
+    expect(res.status).toBe(413);
+    expect((await jsonBody<{ message: string }>(res)).message).toContain(`push mirror options exceed the ${64 * 1024} byte cap`);
+    expect((await db().select().from(pushMirrors).where(eq(pushMirrors.repoId, repoId)).all()).length).toBe(0);
+  });
+
+  // wave-polish-matrix-12 — the pull channel's malformed-KEK arm
+  // (mirror.test.ts "rejects a malformed KEK") has a push twin: readyKek's
+  // 32-byte check fails closed before any row exists.
+  it("500 (runtime-only): a wrong-sized KEK fails closed before any write", async () => {
+    const { slug, repoId } = await seedRepo();
+    const app = makeApp(recordingQueue(), { MIRROR_CREDENTIAL_KEY: btoa("short") });
+    const res = await app(
+      `/api/v1/repos/alice/${slug}/push_mirrors`,
+      authed(OWNER_TOKEN, { method: "POST", body: JSON.stringify(addBody({ remote_username: "git", remote_password: "s3cret" })) }),
+    );
+    expect(res.status).toBe(500);
+    expect((await db().select().from(pushMirrors).where(eq(pushMirrors.repoId, repoId)).all()).length).toBe(0);
+  });
+
   it("200: the site admin can add, and names do not collide across mirrors of the same repo", async () => {
     const { slug } = await seedRepo();
     const app = makeApp(recordingQueue());
@@ -406,6 +552,32 @@ describe("repoListPushMirrors (GET /repos/{owner}/{repo}/push_mirrors)", () => {
     expect(await jsonBody(res)).toEqual([]);
   });
 
+  // wave-polish-matrix-12 — the pagination grammar's unproven arms: the
+  // ROUTE-level default page size is parseListOptions' DEFAULT_PAGING_NUM 30
+  // (api/pagination.ts — limit absent parses to 30, so the service's `?? 10`
+  // fallback is unreachable through this route), and a page past the end is
+  // an empty array with the total INTACT (the offset over-count arm — never
+  // a 400).
+  it("200: the default page size is 30; a beyond-the-end page is empty with the total intact", async () => {
+    const { slug, repoId } = await seedRepo();
+    for (let i = 1; i <= 12; i++) {
+      await seedMirrorRow(repoId, `remote_mirror_n${String(i).padStart(2, "0")}`);
+    }
+    const app = makeApp(recordingQueue());
+    const res = await app(`/api/v1/repos/alice/${slug}/push_mirrors`, authed(OWNER_TOKEN));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Total-Count")).toBe("12");
+    const body = await jsonBody<MirrorWire[]>(res);
+    expect(body.length).toBe(12); // the 30-default holds every row
+    expect(body[0]!.remote_name).toBe("remote_mirror_n01"); // id order — the first seeded name
+    expect(body[11]!.remote_name).toBe("remote_mirror_n12");
+
+    const past = await app(`/api/v1/repos/alice/${slug}/push_mirrors?page=5&limit=10`, authed(OWNER_TOKEN));
+    expect(past.status).toBe(200);
+    expect(await jsonBody<MirrorWire[]>(past)).toEqual([]);
+    expect(past.headers.get("X-Total-Count")).toBe("12");
+  });
+
   it("403/404: the reqAdmin and visibility gates", async () => {
     const { slug } = await seedRepo();
     const app = makeApp(recordingQueue());
@@ -447,6 +619,32 @@ describe("repoGetPushMirrorByRemoteName (GET /repos/{owner}/{repo}/push_mirrors/
     await seedMirrorRow(repoId, "remote_mirror_mine1");
     const app = makeApp(recordingQueue());
     expect((await app(`/api/v1/repos/alice/${slug}/push_mirrors/remote_mirror_mine1`, authed(DOER_TOKEN))).status).toBe(403);
+  });
+
+  // wave-polish-matrix-12 — the settled row's display arms: lastUpdateUnix
+  // renders as the RFC 3339 date-time, last_error rides verbatim, and the
+  // interval renders from the row's SECONDS (goDurationString — not the
+  // requested form). The fresh-row nulls are pinned by the POST tests; these
+  // are the post-sync shapes (UpdatePushMirrorSyncStatus's columns).
+  it("200: a settled row renders its last_update, last_error, and the row interval", async () => {
+    const { slug, repoId } = await seedRepo();
+    const id = await seedMirrorRow(repoId, "remote_mirror_settled");
+    await db()
+      .update(pushMirrors)
+      .set({
+        lastUpdateUnix: new Date("2026-02-04T05:06:07Z"),
+        lastError: "boom: push rejected",
+        intervalSeconds: 3600,
+      })
+      .where(eq(pushMirrors.id, id));
+
+    const app = makeApp(recordingQueue());
+    const res = await app(`/api/v1/repos/alice/${slug}/push_mirrors/remote_mirror_settled`, authed(OWNER_TOKEN));
+    expect(res.status).toBe(200);
+    const body = await jsonBody<MirrorWire>(res);
+    expect(body.last_update).toBe("2026-02-04T05:06:07.000Z");
+    expect(body.last_error).toBe("boom: push rejected");
+    expect(body.interval).toBe("1h0m0s");
   });
 });
 
@@ -537,6 +735,49 @@ describe("repoPushMirrorSync (POST /repos/{owner}/{repo}/push_mirrors-sync)", ()
     );
   });
 
+  // wave-polish-matrix-12 — the sync gate's PARTIAL-failure arm: the loop
+  // keeps sending after a rejection (enqueuePushMirrorSyncs, services/
+  // push-mirrors.ts:439-447), so the delivered send stays in the recorder and
+  // only the FAILED name enters upstream's collection.
+  it("422: a partial enqueue failure names only the failed mirror — the delivered send stays sent", async () => {
+    const { slug, repoId } = await seedRepo();
+    const id1 = await seedMirrorRow(repoId, "remote_mirror_okay1");
+    const id2 = await seedMirrorRow(repoId, "remote_mirror_fail2");
+    const metadata = { metrics: { backlogCount: 0, backlogBytes: 0 } };
+    const sent: unknown[] = [];
+    const queue = {
+      sent,
+      failSends: false,
+      send: (body: unknown) => {
+        const message = body as { pushMirrorId: number };
+        if (message.pushMirrorId === id2) return Promise.reject(new Error("queue unavailable"));
+        sent.push(body);
+        return Promise.resolve({ metadata });
+      },
+      sendBatch: () => Promise.resolve({ metadata }),
+      metrics: () => Promise.resolve({ backlogCount: 0, backlogBytes: 0 }),
+    } as unknown as RecordingQueue;
+
+    const app = makeApp(queue);
+    const res = await app(`/api/v1/repos/alice/${slug}/push_mirrors-sync`, authed(OWNER_TOKEN, { method: "POST" }));
+    expect(res.status).toBe(422);
+    expect((await jsonBody<{ message: string }>(res)).message).toBe(
+      "error occurred when syncing push mirrors: remote_mirror_fail2",
+    );
+    expect(queue.sent).toEqual([{ kind: "push-mirror-sync", repoId, pushMirrorId: id1 }]);
+  });
+
+  // wave-polish-matrix-12 — the trigger's missing-binding arm (routes/
+  // push-mirrors.ts:297-298): the runtime-only 500 the frozen contract omits.
+  it("500 (runtime-only): a missing MIRROR_SYNC_QUEUE binding fails the trigger", async () => {
+    const { slug, repoId } = await seedRepo();
+    await seedMirrorRow(repoId, "remote_mirror_noq");
+    const app = makeApp(recordingQueue(), { MIRROR_SYNC_QUEUE: undefined });
+    const res = await app(`/api/v1/repos/alice/${slug}/push_mirrors-sync`, authed(OWNER_TOKEN, { method: "POST" }));
+    expect(res.status).toBe(500);
+    expect((await jsonBody<{ message: string }>(res)).message).toBe("MIRROR_SYNC_QUEUE binding missing");
+  });
+
   it("403/404: the reqAdmin and visibility gates", async () => {
     const { slug } = await seedRepo();
     const app = makeApp(recordingQueue());
@@ -575,5 +816,16 @@ describe("push-mirror interval helpers", () => {
     expect(goDurationString(28800)).toBe("8h0m0s");
     expect(goDurationString(1800)).toBe("30m0s");
     expect(goDurationString(45)).toBe("45s");
+    // wave-polish-matrix-12 — the mixed-component render and the at-floor
+    // value (the wire form every GET of a 10 m mirror carries).
+    expect(goDurationString(3661)).toBe("1h1m1s");
+    expect(goDurationString(600)).toBe("10m0s");
+    // The sub-second units parse to a truncated 0 (the ns/us/µs arm of the
+    // switch — the comment's "far below the min floor either way").
+    expect(parsePushMirrorInterval("1µs")).toBe(0);
+    expect(parsePushMirrorInterval("500us")).toBe(0);
+    // A three-component compound and a trailing-space form.
+    expect(parsePushMirrorInterval("2h15m30s")).toBe(8130);
+    expect(parsePushMirrorInterval("8h ")).toBeNull();
   });
 });

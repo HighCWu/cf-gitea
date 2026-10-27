@@ -1211,3 +1211,206 @@ describe("PUT/DELETE /teams/{id}/members/{username} — the remaining edges", ()
     expect(await orgs.getMembership(s.org.id, s.member.id)).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// wave-polish-matrix-12 — the create/edit validation corners the first pass
+// left open, then the unit-grant matrix (per-unit access levels) through the
+// grant seams.
+// ---------------------------------------------------------------------------
+
+describe("orgCreateTeam/orgEditTeam — the batch-12 validation corners", () => {
+  it("400s the out-of-enum owner permission at the zod gate (ParseAccessMode never sees it) and 422s the empty name", async () => {
+    const s = await seedActors();
+    const send = router();
+    // The contract enum is read/write/admin — "owner" dies in the BODY BIND
+    // (routes/org-teams.ts header: the validator failure is the runtime-only
+    // 400), never reaching assignTeamPermission's none-collapse.
+    const ownerPerm = await send(`/orgs/${s.org.username}/teams`, {
+      method: "POST",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ name: "owner-team", permission: "owner" }),
+    });
+    expect(ownerPerm.status).toBe(400);
+    // A MISSING name dies in the body bind (z.string() Required), but the
+    // EXPLICIT empty string carries through — name Required is a Go binding
+    // tag, not zod — and TeamNameEmptyError maps to the contract 422.
+    const nameless = await send(`/orgs/${s.org.username}/teams`, {
+      method: "POST",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ permission: "read" }),
+    });
+    expect(nameless.status).toBe(400);
+    const blank = await send(`/orgs/${s.org.username}/teams`, {
+      method: "POST",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ name: "", permission: "read" }),
+    });
+    expect(blank.status).toBe(422);
+    expect((await blank.json<Record<string, unknown>>()).message).toBe("empty team name");
+  });
+
+  it("normalizes the units grammar's garbage — permission-less units collapse dormant, per-entry modes normalize, keys store verbatim, the empty map is plain", async () => {
+    const s = await seedActors();
+    const send = router();
+    const post = (body: Record<string, unknown>) =>
+      send(`/orgs/${s.org.username}/teams`, { method: "POST", headers: authHeaders(s.owner.id), body: JSON.stringify(body) });
+
+    // units WITHOUT a permission: parseAccessMode("") is none — the team is
+    // born DORMANT (authorize none, the map all-none), never a 422.
+    const dormant = await post({ name: "dormant", units: ["repo.code"] });
+    expect(dormant.status).toBe(201);
+    expect(await dormant.json<Record<string, unknown>>()).toMatchObject({
+      permission: "none",
+      units: ["repo.code"],
+      units_map: { "repo.code": "none" },
+    });
+
+    // units_map with a garbage VALUE: parseAccessMode normalizes per entry —
+    // the read survives, the garbage collapses to none (upstream stores the
+    // raw AccessMode enum; the collapse keeps the value space closed).
+    const mixed = await post({ name: "mixed", units_map: { "repo.code": "read", "repo.wiki": "banana" } });
+    expect(mixed.status).toBe(201);
+    expect(await mixed.json<Record<string, unknown>>()).toMatchObject({
+      permission: "none",
+      units_map: { "repo.code": "read", "repo.wiki": "none" },
+    });
+
+    // An unknown unit KEY stores verbatim — the landed collapse has no
+    // unit-key enum (the map IS the extension surface).
+    const odd = await post({ name: "odd-units", units_map: { "repo.banana": "read" } });
+    expect(odd.status).toBe(201);
+    expect((await odd.json<Record<string, unknown>>()).units_map).toEqual({ "repo.banana": "read" });
+
+    // The EMPTY units_map is hasMap-false — the plain-permission arm with no
+    // collapse at all.
+    const plain = await post({ name: "plain-map", permission: "admin", units_map: {} });
+    expect(plain.status).toBe(201);
+    expect(await plain.json<Record<string, unknown>>()).toMatchObject({
+      permission: "admin",
+      units: [],
+      units_map: {},
+    });
+  });
+
+  it("edit: permission-less units flip a plain team dormant, the conflict rides the edit path, an empty name is ignored, and the empty units_map patch changes nothing", async () => {
+    const s = await seedActors();
+    const send = router();
+    const docsId = await teamIdByName("docs"); // seeded write team (no map)
+
+    // units without permission on EDIT: the same dormant collapse (authorize
+    // none + the all-none map) — hasPermFields is the units length alone.
+    const flip = await send(`/teams/${docsId}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ units: ["repo.code"] }),
+    });
+    expect(flip.status).toBe(200);
+    expect(await flip.json<Record<string, unknown>>()).toMatchObject({
+      permission: "none",
+      units: ["repo.code"],
+      units_map: { "repo.code": "none" },
+    });
+
+    // The units/units_map conflict 422s on the edit path too (mapTeam422's
+    // shared family).
+    const conflict = await send(`/teams/${docsId}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ units: ["repo.code"], units_map: { "repo.code": "read" } }),
+    });
+    expect(conflict.status).toBe(422);
+    expect((await conflict.json<Record<string, unknown>>()).message).toBe("only one of units or units_map can be set");
+
+    // An empty name is IGNORED (editTeam's length > 0 guard) — not a rename.
+    const blank = await send(`/teams/${docsId}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ name: "" }),
+    });
+    expect(blank.status).toBe(200);
+    expect((await blank.json<Record<string, unknown>>()).name).toBe("docs");
+
+    // The empty units_map patch has hasPermFields FALSE — the dormant state
+    // above survives untouched (a no-op patch is not a permission reset).
+    const noOp = await send(`/teams/${docsId}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ units_map: {} }),
+    });
+    expect(noOp.status).toBe(200);
+    expect(await noOp.json<Record<string, unknown>>()).toMatchObject({
+      permission: "none",
+      units_map: { "repo.code": "none" },
+    });
+  });
+});
+
+describe("the unit-grant matrix (per-unit access levels through the grant seams)", () => {
+  /** One includes-all mixed-map team and one explicitly-covered all-none
+   *  team — the matrix's two grant halves (the actors arrive pre-seeded). */
+  async function seedMatrix(s: TeamsSeed): Promise<{ all: number; covered: number }> {
+    const send = router();
+    const create = async (body: Record<string, unknown>): Promise<number> => {
+      const res = await send(`/orgs/${s.org.username}/teams`, {
+        method: "POST",
+        headers: authHeaders(s.owner.id),
+        body: JSON.stringify(body),
+      });
+      expect(res.status, JSON.stringify(body)).toBe(201);
+      return (await res.json<Record<string, unknown>>()).id as number;
+    };
+    // includes-all + a mixed map (read on code, none on wiki — the
+    // per-unit ladder in one row).
+    const all = await create({
+      name: "matrix-all",
+      includes_all_repositories: true,
+      units_map: { "repo.code": "read", "repo.wiki": "none" },
+    });
+    // Explicit coverage of the vault only, all-none (the dormant grant).
+    const covered = await create({ name: "matrix-dormant", units_map: { "repo.code": "none" } });
+    const service = new TeamsService(env.DB);
+    await service.addTeamRepo(await mustTeam(service, covered), "t_vault");
+    return { all, covered };
+  }
+
+  it("a mixed-units grant admits: its member's covered private repo lists and serves; an all-none grant admits nothing", async () => {
+    const s = await seedActors();
+    const { all, covered } = await seedMatrix(s);
+    const send = router();
+    const service = new TeamsService(env.DB);
+    // Distinct members per team — the trim is the doer's ORG-WIDE max, so a
+    // shared member would leak the sibling's grant into both views (the next
+    // test pins exactly that).
+    await service.addTeamMember(await mustTeam(service, all), s.teammate.id);
+    await service.addTeamMember(await mustTeam(service, covered), s.member.id);
+
+    // The mixed map's effective mode is read (max over the per-unit values)
+    // — the grant unlocks the vault for its member's team view.
+    const allRepos = await send(`/teams/${all}/repos`, { headers: authHeaders(s.teammate.id) });
+    expect(allRepos.status).toBe(200);
+    expect((await allRepos.json<Array<Record<string, unknown>>>()).map((r) => r.name)).toContain("vault");
+    expect((await send(`/teams/${all}/repos/acme/vault`, { headers: authHeaders(s.teammate.id) })).status).toBe(200);
+
+    // The all-none map's effective mode is none — the same covered vault is
+    // the anti-enumeration 404 (doerHasTeamRepoAccess false; the coverage row
+    // alone grants nothing), and the team listing trims it.
+    const coveredRepos = await send(`/teams/${covered}/repos`, { headers: authHeaders(s.member.id) });
+    expect(coveredRepos.status).toBe(200);
+    expect((await coveredRepos.json<Array<Record<string, unknown>>>()).map((r) => r.name)).not.toContain("vault");
+    expect((await send(`/teams/${covered}/repos/acme/vault`, { headers: authHeaders(s.member.id) })).status).toBe(404);
+  });
+
+  it("the max-collapse is org-wide: a member of BOTH teams reads the vault through the dormant team's own URL", async () => {
+    const s = await seedActors();
+    const { all, covered } = await seedMatrix(s);
+    const send = router();
+    const service = new TeamsService(env.DB);
+    await service.addTeamMember(await mustTeam(service, all), s.member.id);
+    await service.addTeamMember(await mustTeam(service, covered), s.member.id);
+
+    // teamRepoAccessMode reduces over EVERY team of the doer in the org —
+    // the dormant team's covered repo serves because the SIBLING team's
+    // effective read carries the max (org/team.go:569-577's any-unit arm).
+    expect((await send(`/teams/${covered}/repos/acme/vault`, { headers: authHeaders(s.member.id) })).status).toBe(200);
+  });
+});
