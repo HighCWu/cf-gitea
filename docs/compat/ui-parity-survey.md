@@ -394,14 +394,15 @@ pin flips to the mount; 26/26, tsc zero; RD21 had shipped GO
 `cee057b` → version `fe6bcca1`, evidence `75bd33e`, so this rides the
 NEXT deploy). The closing brief's "no row flips expected" is
 CORRECTED by verification: the trio row's PARTIAL existed solely for
-that arm, so the row flips **LANDED** — headline **92/4/20** (116
-rows, zero in flight), programmatic walk A 21/0/3, B 11/2/5, C 21/2/3,
-D 20/0/2, E 9/0/3, F 10/0/4. The census's other two dispatchable S
+that arm, so the row flips **LANDED** — headline 92/4/20 at that tick, then
+**94/2/20** the same morning when the two staged D slices mounted
+(`fa4fd0d`); programmatic walk at tick time: A 21/0/3, B 11/2/5,
+C 21/2/3, D 20/0/2, E 9/0/3, F 10/0/4 (post-mount D 22/0/0). The census's other two dispatchable S
 tails — the `comments/{id}/attachments` fragment + the
-`issues/new/choose` redirect (`29b67cf`) — landed committed-UNMOUNTED
-(two-stage, HANDOFF recipes; their mounts ride a future index.ts
-window), so the D rows stay ABSENT per the convention, machinery-noted
-in In-flight. The terminal posture: the full-suite gate ran two
+`issues/new/choose` redirect (`29b67cf`) — MOUNTED the same morning
+(`fa4fd0d`, the wiring window executed both HANDOFF recipes; a
+post-mount full-suite pass 261/5,831/0), flipping their two D rows
+LANDED — terminal headline **94/2/20** at 116 rows. The terminal posture: the full-suite gate ran two
 perfect strip-mode single-passes at 261 files / 5,831 tests / 0 failed
 (the contention class formally retired — the per-file 90s budgets
 `382e337` + the GPG verify minute-boundary guard `50880b2`, a real
