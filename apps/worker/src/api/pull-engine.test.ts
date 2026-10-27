@@ -30,7 +30,8 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 import { ensureSeededRepo, buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
-import { users, protectedBranches, repositories } from "../db/schema";
+import { users, protectedBranches, repositories, comments, PRStatus, pullRequests } from "../db/schema";
+import { CommentType } from "../issues/comment-types";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
@@ -386,6 +387,11 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     expect((commits[0]?.stats as Record<string, unknown> | undefined)).toBeDefined();
     expect(((commits[0]?.commit as Record<string, unknown>).author as Record<string, unknown>).date).toBeDefined();
 
+    // STRICT sha resolution: upstream GetAllCommits answers the APIErrorAuto
+    // 404 for a non-empty sha GetCommit cannot resolve (commits.go:211-216) —
+    // never the default branch's history (the old fallback's 200-with-tip).
+    expect((await get(`${REPO}/commits?sha=zzz-ghost`)).status).toBe(404);
+
     await new RepoService(env.DB).create({
       owner: { id: OWNER_ID, usernameLower: OWNER },
       name: "empty-commits",
@@ -408,6 +414,9 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     expect(bySha.status).toBe(200);
     expect((await jsonBody(bySha)).sha).toBe(commit.sha);
     expect((await get(`${REPO}/git/commits/${"d".repeat(40)}`)).status).toBe(404);
+    // The non-hex unknown arm is upstream's getCommit 404 too
+    // ("commit doesn't exist", commits.go:78-84) — never the default tip.
+    expect((await get(`${REPO}/git/commits/zzz-ghost`)).status).toBe(404);
 
     const diff = await get(`${REPO}/git/commits/${String(commit.sha)}.diff`);
     expect(diff.status).toBe(200);
@@ -424,6 +433,8 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     expect(res.status).toBe(200);
     expect((await jsonBody(res)).number).toBe(1);
     expect((await get(`${REPO}/commits/${TIP1}/pull`)).status).toBe(404);
+    // An unresolvable non-hex sha 404s the same way (getCommit-style refusal).
+    expect((await get(`${REPO}/commits/zzz-ghost/pull`)).status).toBe(404);
   });
 
   it("compares base...head (JSON) and answers raw text for output=diff", async () => {
@@ -922,5 +933,230 @@ describe("PR .diff/.patch tails — the empty-range, binary and truncation-cap a
     expect(emptyFiles.status).toBe(200);
     expect(emptyFiles.headers.get("X-Total-Count")).toBe("0");
     expect(await emptyFiles.json<unknown[]>()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The PR-head SYNC round-trip (SPEC-0005 §3.4 "Sync pushes" — the engine
+// review's c1 fix): a second push to a PR's head branch must move
+// refs/pull/N/head (through the sync arm in services/webhooks-push.ts), the
+// head_sha cache, re-arm the check, land the type-29 comment — and the MERGE
+// must then consume the NEW tip. The pushes go through the REAL worker
+// (SELF — index.ts's onPush wiring), so the production sync path runs.
+// ---------------------------------------------------------------------------
+
+const SYNC_TE = new TextEncoder();
+
+function syncConcat(...parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+function syncHex(buffer: ArrayBuffer): string {
+  return [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function syncSha1(bytes: Uint8Array): Promise<string> {
+  return syncHex(await crypto.subtle.digest("SHA-1", bytes));
+}
+
+async function syncSha1Bytes(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-1", bytes));
+}
+
+async function zlibDeflate(bytes: Uint8Array): Promise<Uint8Array> {
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function be32(value: number): Uint8Array {
+  return new Uint8Array([(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff]);
+}
+
+function rawOid(oidHex: string): Uint8Array {
+  const raw = new Uint8Array(20);
+  for (let i = 0; i < 20; i++) raw[i] = Number.parseInt(oidHex.slice(i * 2, i * 2 + 2), 16);
+  return raw;
+}
+
+/** The type/size varint header of one packed object entry. */
+function objectHeader(type: number, size: number): Uint8Array {
+  const bytes: number[] = [];
+  let first = (type << 4) | (size & 0x0f);
+  let rest = size >> 4;
+  while (rest > 0) {
+    bytes.push(first | 0x80);
+    first = rest & 0x7f;
+    rest >>= 7;
+  }
+  bytes.push(first);
+  return new Uint8Array(bytes);
+}
+
+const SYNC_OBJ_COMMIT = 1;
+const SYNC_OBJ_TREE = 2;
+const SYNC_OBJ_BLOB = 3;
+
+/**
+ * Build ONE commit chained on top of `parent` (the incremental-append shape
+ * of a real branch update: the pack carries ONLY the new commit's objects —
+ * its parent resolves from the receiving cell). File-local copy of the
+ * webhooks-push suite's chain builder (seed-repo.ts keeps its byte helpers
+ * private and can only chain from a null parent).
+ */
+async function buildAppendPack(
+  parent: string,
+  commit: { message: string; files: { path: string; content: string }[]; time: number },
+): Promise<{ tip: string; pack: Uint8Array }> {
+  const objects = new Map<string, { type: number; body: Uint8Array }>();
+  const store = async (type: number, body: Uint8Array): Promise<string> => {
+    const typeName = type === SYNC_OBJ_COMMIT ? "commit" : type === SYNC_OBJ_TREE ? "tree" : "blob";
+    const raw = syncConcat(SYNC_TE.encode(`${typeName} ${body.length}\0`), body);
+    const oid = await syncSha1(raw);
+    objects.set(oid, { type, body });
+    return oid;
+  };
+  const entries: { sortKey: string; bytes: Uint8Array }[] = [];
+  for (const file of commit.files) {
+    const blobOid = await store(SYNC_OBJ_BLOB, SYNC_TE.encode(file.content));
+    entries.push({ sortKey: file.path, bytes: syncConcat(SYNC_TE.encode(`100644 ${file.path}\0`), rawOid(blobOid)) });
+  }
+  entries.sort((a, b) => (a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : 0));
+  const treeOid = await store(SYNC_OBJ_TREE, syncConcat(...entries.map((e) => e.bytes)));
+  const person = (who: "author" | "committer") => `${who} Sync User <sync@example.com> ${commit.time} +0000`;
+  const commitBody = `tree ${treeOid}\nparent ${parent}\n${person("author")}\n${person("committer")}\n\n${commit.message}\n`;
+  const tip = await store(SYNC_OBJ_COMMIT, SYNC_TE.encode(commitBody));
+  const chunks: Uint8Array[] = [SYNC_TE.encode("PACK"), be32(2), be32(objects.size)];
+  for (const obj of objects.values()) {
+    chunks.push(objectHeader(obj.type, obj.body.length));
+    chunks.push(await zlibDeflate(obj.body));
+  }
+  chunks.push(await syncSha1Bytes(syncConcat(...chunks)));
+  return { tip, pack: syncConcat(...chunks) };
+}
+
+/** A receive-pack body with EXPLICIT old oids (the update-command shape —
+ *  seed-repo.ts's buildReceivePackBody only writes create commands). */
+function buildUpdateReceiveBody(updates: { old: string; oid: string; ref: string }[], pack: Uint8Array): Uint8Array {
+  let section = "";
+  updates.forEach((update, i) => {
+    const line = i === 0 ? `${update.old} ${update.oid} ${update.ref}\0report-status side-band-64k` : `${update.old} ${update.oid} ${update.ref}`;
+    section += `${(line.length + 4).toString(16).padStart(4, "0")}${line}`;
+  });
+  section += "0000";
+  return syncConcat(SYNC_TE.encode(section), pack);
+}
+
+/** Push an UPDATE through the real worker (the production receive → onPush
+ *  path) and assert every command applied. */
+async function pushUpdate(engineRepo: string, token: string, updates: { old: string; oid: string; ref: string }[], pack: Uint8Array): Promise<void> {
+  const response = await SELF.fetch(`https://test.local/${engineRepo}.git/git-receive-pack`, {
+    method: "POST",
+    headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+    body: buildUpdateReceiveBody(updates, pack),
+  });
+  const body = response.status === 200 ? new TextDecoder().decode(await response.arrayBuffer()) : "";
+  if (response.status !== 200 || body.includes("ng ")) {
+    throw new Error(`update push failed (${engineRepo}): ${response.status} ${body.slice(0, 400)}`);
+  }
+}
+
+/** Bounded poll for the drained onPush continuation (the sync arms run inside
+ *  SELF's waitUntil — poll the durable effect instead of racing the drain). */
+async function waitFor(effect: () => Promise<boolean>, what: string): Promise<void> {
+  for (let round = 0; round < 40; round += 1) {
+    if (await effect()) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`sync effect not observed: ${what}`);
+}
+
+describe("the PR-head sync round-trip — a second push moves refs/pull/N/head and the merge eats the NEW tip", () => {
+  it("create PR → push again → ref/head_sha/checking/comment move → merge lands the SECOND commit", async () => {
+    // The topic branch through the API's own write path (the creation-tip
+    // contract: refs/pull/N/head lands there through createPullHeadRef).
+    const topicTip = await seedBranchWithCommit("sync-topic", "sync-a.txt", "sync a\n");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Sync round trip", head: "sync-topic", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    const refTips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    expect(refTips.get(`refs/pull/${index}/head`)?.target).toBe(topicTip);
+    let prRow = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.index, index)).get();
+    expect(prRow?.headSha).toBe(topicTip);
+
+    // The SECOND push — a real receive through SELF (the production onPush
+    // sync path), one appended commit on the API-authored tip.
+    const ownerRow = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, OWNER)).get();
+    const token = await mintPushToken(ownerRow!.id, "pull-engine-sync-push");
+    const append = await buildAppendPack(topicTip, {
+      message: "sync: second",
+      files: [{ path: "sync-second.txt", content: "second commit body\n" }],
+      time: T0 + 500,
+    });
+    const beforeTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/sync-topic")?.target as string;
+    await pushUpdate(`${OWNER}/${SLUG}`, token, [{ old: beforeTip, oid: append.tip, ref: "refs/heads/sync-topic" }], append.pack);
+
+    // The ref moved (the sync arm's CAS — the merge reads THIS ref), the D1
+    // arms landed (head_sha cache, status re-armed to checking), and the
+    // type-29 comment carries the pushed delta.
+    await waitFor(async () => refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get(`refs/pull/${index}/head`)?.target === append.tip, "head ref moved");
+    await waitFor(async () => (await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.index, index)).get())?.headSha === append.tip, "head_sha cache moved");
+    prRow = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.index, index)).get();
+    expect(prRow?.status).toBe(PRStatus.Checking);
+    const pushCommentRows = (await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, prRow!.issueId)).all()).filter(
+      (r) => r.type === CommentType.PullRequestPush,
+    );
+    expect(pushCommentRows).toHaveLength(1);
+    expect(JSON.parse(pushCommentRows[0]!.content ?? "{}")).toEqual({ is_force_push: false, commit_ids: [append.tip] });
+
+    // The re-arm fires: the GET observes checking, runs the read-only check,
+    // CASes mergeable — and the merge then consumes the moved ref.
+    const rendered = await jsonBody(await get(`${REPO}/pulls/${index}`));
+    expect(rendered.mergeable).toBe(true);
+    const merge = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_title_field: "Merge sync round trip" }));
+    expect(merge.status).toBe(200);
+
+    // GOLD: the merge commit's SECOND parent is the NEW tip, and the merged
+    // TREE carries the second commit's file — the merge executed against
+    // refs/pull/N/head at its moved value, not the creation tip.
+    const mainTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/main")?.target as string;
+    const merged = await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).readCommit(mainTip);
+    expect(merged?.parents[1]).toBe(append.tip);
+    const blob = await env.REPO.getByName(`${OWNER}/${SLUG}`).readBlob(mainTip, "sync-second.txt");
+    expect(blob === null ? null : new TextDecoder().decode(blob.data)).toBe("second commit body\n");
+    // And the pre-merge diff surface reflected the NEW tip too (its file is
+    // in the changed-files list).
+    const filesBody = JSON.parse(await (await get(`${REPO}/pulls/${index}/files`)).text()) as Array<Record<string, unknown>>;
+    expect(filesBody.some((f) => f.filename === "sync-second.txt")).toBe(true);
+  });
+
+  it("a fork-head push carries the new tip into the base cell and moves refs/pull/N/head there", async () => {
+    const seeded = await seedForkHeadPr({ forkOwner: OWNER, forkSlug: "fork-sync", forkBranch: "syncfork", featurePath: "fork-sync.txt", featureContent: "fork sync one\n" });
+
+    // A SECOND commit on the fork's branch — the deterministic chain gives
+    // the same oids as the seed, tips[3] descending from tips[2] (the PR head).
+    const featureA = forkFeatureCommit("fork-sync.txt", "fork sync one\n", T0 + 100);
+    const featureB = forkFeatureCommit("fork-sync-second.txt", "fork sync two\n", T0 + 101);
+    const { tips, pack } = await buildHistoryPack([...SEED_COMMITS, featureA, featureB]);
+    const secondTip = tips[3] as string;
+    expect(tips[2]).toBe(seeded.featureTip);
+
+    const token = await mintPushToken((await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, OWNER)).get())!.id, "pull-engine-fork-sync");
+    await pushUpdate(`${OWNER}/fork-sync`, token, [{ old: seeded.featureTip, oid: secondTip, ref: "refs/heads/syncfork" }], pack);
+
+    // The BASE cell's PR head ref moved to the fork's new tip — the sync arm's
+    // fork carry (upstream FetchRemoteTempCommit) landed the objects, then the
+    // CAS moved the ref; the head_sha cache followed.
+    await waitFor(async () => refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get(`refs/pull/${seeded.index}/head`)?.target === secondTip, "base-cell head ref moved");
+    const carried = await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).readCommit(secondTip);
+    expect(carried?.message).toContain("fork-sync-second");
+    const prRow = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.index, seeded.index)).get();
+    expect(prRow?.headSha).toBe(secondTip);
   });
 });

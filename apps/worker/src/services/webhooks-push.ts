@@ -81,16 +81,52 @@
  * posture) and the repo-size settle leg (`syncRepoSizeFromStorage`,
  * services/repo-size.ts — upstream push.go:74-83's post-apply
  * UpdateRepoSize, every applied delta, the same never-fail posture).
+ *
+ * THE PR-HEAD SYNC (SPEC-0005 §3.4 "Sync pushes" — upstream UpdatePullsRefs +
+ * CreatePushPullComment, wired from hook_post_receive.go:67 + push.go:292):
+ * an updated BRANCH ref that is an open github-flow PR's head branch also
+ * moves that PR's engine state, per PR, in the same drained hook —
+ *   1. fork-head object carry (upstream FetchRemoteTempCommit, pull.go:556),
+ *   2. CAS `refs/pull/N/head` old→new on the BASE cell (upstream git.UpdateRef,
+ *      pull.go:560) — the MECHANISM NOTE: upstream's own arm runs POST-receive
+ *      (hook_post_receive.go) as a separate fetch+UpdateRef transaction, so
+ *      the standalone `commitApiChange` CAS (the PR-creation ref write,
+ *      pull-engine.ts createPullHeadRef) is upstream's shape, not a deviation;
+ *      the engine's `extraRefUpdates` seam (control-plane.ts §4.7) would ride
+ *      the receive transaction but nothing can populate it from the Worker —
+ *      mod.ts's receive path has no provider hook, and the engine documents
+ *      the seam itself as best-effort housekeeping. CAS base = the live ref
+ *      tip (the engine ref is authoritative over the head_sha cache); a lost
+ *      race logs and skips the PR's remaining arms (the next push re-syncs),
+ *   3. the D1 row: `head_sha`, `status=checking` (re-arming the lazy
+ *      ensurePullRequestChecked) and the recomputed ahead/behind divergence,
+ *      CAS-guarded by has_merged=0 (upstream UpdateColsIfNotMerged),
+ *   4. the type-29 `pull_push` comment with the upstream PushActionContent
+ *      shape (normal push = the capped oldest-first commit list; force push =
+ *      the merge-base walk + the `{is_force_push, [old, new]}` comment + the
+ *      old-comment reconcile), via IssuesService.addComment,
+ * and then the pre-existing `pull_request_sync` webhook (last, like upstream
+ * notify.PullRequestSynchronized). A DELETED head branch takes upstream's
+ * AdjustPullsCausedByBranchDeleted arm instead (pull.go:622-655): the open
+ * PRs on it close, each with the type-11 delete-branch comment.
  */
 
-import type { CommitJson, DiffResult, PushEvent } from "@cf-gitea/git-engine";
-import { and, eq, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/d1";
+import type {
+  ApiObject,
+  CatalogPage,
+  CommitJson,
+  DiffResult,
+  PushEvent,
+  PutApiObjectsResult,
+  TreeEntryJson,
+} from "@cf-gitea/git-engine";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
 import { toApiPullRequest } from "../api/services/pulls";
 import { toPayloadCommit, usernamesByEmail } from "../api/services/git-models";
 import { compareUrl } from "../api/services/hooks";
-import { branchRef } from "../api/services/engine";
+import { branchRef, pullHeadRef } from "../api/services/engine";
 import {
   apiUserFromRow,
   findRepositoryById,
@@ -100,8 +136,10 @@ import {
   type UserRow,
   type Viewer,
 } from "../api/services/repository";
-import { comments, issues, PRFlow, pullRequests, pullReviews, ReviewType, users } from "../db/schema";
+import { comments, issues, PRFlow, PRStatus, pullRequests, pullReviews, ReviewType, users } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
+import { IssuesService } from "../issues/service";
+import { carryLooseRefs, type CarrySource, type CarryTarget } from "../repos/carry";
 import {
   enrichCommitsWithFileLists,
   emitWebhookDeliveries,
@@ -143,6 +181,20 @@ export const PUSH_ZERO_OID = "0".repeat(40);
 /** `setting.UI.FeedMaxCommitNum` (default 5, modules/setting/ui.go:92) — the
  *  push payload's commit cap (§2.5). */
 export const FEED_MAX_COMMIT_NUM = 5;
+
+/** `maxPushCommitsInCommentCount` (services/pull/comment.go:21) — the type-29
+ *  comment's commit cap; upstream keeps the NEWEST of a bigger delta
+ *  (`rev-list --reverse -n limit`). */
+export const MAX_PUSH_COMMITS_IN_COMMENT = 1000;
+
+/** Upstream `PushActionContent` (models/issues/comment.go:375-381) — the
+ *  type-29 comment's `content` JSON. */
+interface PushActionContent {
+  is_force_push: boolean;
+  /** is_force_push=true: the [old head, new head] pair; else the pushed
+   *  commits, oldest first. */
+  commit_ids: string[];
+}
 
 /** Upstream's default ROOT_URL (modules/setting/server.go:119-120); AppURL
  *  additionally always carries the trailing "/" (server.go:50-51) —
@@ -222,10 +274,15 @@ export interface WebhookPushIdentity {
 }
 
 export interface WebhookPushOptions {
-  /** Test clock for the delivery rows. */
+  /** Test clock for the delivery rows (and every sync-arm timestamp). */
   now?: Date;
   /** Log sink override (tests); default console.error. */
   log?: (message: string) => void;
+  /** The authenticated pusher's users-row id when the caller holds one —
+   *  the sync arms' comment attribution (upstream CreatePushPullComment's
+   *  Doer = the pusher, push.go:292). Undefined/null (the mirror path, an
+   *  identity-less receive, tests) attributes the rows to no poster. */
+  pusherId?: number | null;
 }
 
 /** The compat-frozen PushPayload field set (SPEC-0005 §2.7,
@@ -345,6 +402,12 @@ export async function emitPushFamilyUpdates(
             },
             update.ref,
           );
+          // The delete webhook first, then the PR cascade (upstream
+          // pushDeleteBranch order, push.go:296-311: notify DeleteRef, THEN
+          // AdjustPullsCausedByBranchDeleted).
+          if (update.ref.startsWith("refs/heads/")) {
+            await closePullRequestsOfDeletedBranch(env, pair, update, options, log);
+          }
           continue;
         }
 
@@ -427,7 +490,7 @@ export async function emitPushFamilyUpdates(
         // refs never sync, "the pull request hasn't been created yet when
         // creating a branch"; deletes close, they don't sync).
         if (update.ref.startsWith("refs/heads/")) {
-          await emitPullRequestSyncs(env, pair, identity, origin, emit, log, update);
+          await emitPullRequestSyncs(env, pair, identity, origin, emit, log, update, options);
         }
       } catch (error) {
         // Per-ref resilience — upstream logs and continues (:343-345,
@@ -450,16 +513,21 @@ export async function emitPushFamilyUpdates(
 
 /**
  * The `pull_request_sync` arm of an updated branch ref (upstream
- * PullRequestSynchronized, notifier.go:835-845): for every OPEN github-flow
- * PR whose head is the pushed branch of THIS repository (`GetUnmergedPullRequestsByHeadInfo`
- * semantics — head_repo_id = the pushed repo, head_branch = the pushed
- * branch, unmerged; agit-flow PRs are skipped upstream, pull.go:407-410), one
- * event with action="synchronized" and the push's before/after oids. Each
- * event routes through the PR's BASE repository (`EventSource{Repository:
- * pr.Issue.Repo}`, notifier.go:843) — fork-head PRs notify the base repo's
- * hooks, and the payload's `repository`/`pull_request` render against that
- * base — with the same per-PR resilience the ref loop has (one PR's failure
- * is logged, never silencing the others).
+ * PullRequestSynchronized, notifier.go:835-845) WITH the §3.4 head sync that
+ * precedes it (AddTestPullRequestTask's per-PR loop, pull.go:388-407): for
+ * every OPEN github-flow PR whose head is the pushed branch of THIS
+ * repository (`GetUnmergedPullRequestsByHeadInfo` semantics — head_repo_id =
+ * the pushed repo, head_branch = the pushed branch, unmerged; agit-flow PRs
+ * are skipped upstream, pull.go:407-410) — run the sync arms (fork carry, ref
+ * CAS, D1 row, type-29 comment), then one event with action="synchronized"
+ * and the push's before/after oids. Each event routes through the PR's BASE
+ * repository (`EventSource{Repository: pr.Issue.Repo}`, notifier.go:843) —
+ * fork-head PRs notify the base repo's hooks, and the payload's
+ * `repository`/`pull_request` render against that base — with the same
+ * per-PR resilience the ref loop has (one PR's failure is logged, never
+ * silencing the others). A failed sync arm skips THAT PR's remaining arms
+ * (upstream's `continue`, pull.go:394-399) but the sync event still fires —
+ * upstream's IsSync block re-iterates the full PR list regardless (:468).
  */
 async function emitPullRequestSyncs(
   env: WebhookPushEnv,
@@ -469,31 +537,10 @@ async function emitPullRequestSyncs(
   emit: (eventType: HookEventType, payload: unknown, refName: string) => Promise<unknown>,
   log: (message: string) => void,
   update: PushRefUpdate,
+  options: WebhookPushOptions = {},
 ): Promise<void> {
   const branch = update.ref.slice("refs/heads/".length);
-  let heads: Array<{ issue: typeof issues.$inferSelect; pullRequest: typeof pullRequests.$inferSelect }>;
-  try {
-    heads = await drizzle(env.DB)
-      .select({ issue: issues, pullRequest: pullRequests })
-      .from(pullRequests)
-      .innerJoin(issues, eq(issues.id, pullRequests.issueId))
-      .where(
-        and(
-          eq(pullRequests.headRepoId, pushedPair.repo.id),
-          eq(pullRequests.headBranch, branch),
-          eq(pullRequests.hasMerged, false),
-          eq(pullRequests.flow, PRFlow.Github),
-          eq(issues.isClosed, false),
-        ),
-      )
-      .all();
-  } catch (error) {
-    log(
-      `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR head lookup failed for ${update.ref}: ` +
-        `${error instanceof Error ? error.message : String(error)}`,
-    );
-    return;
-  }
+  const heads = await openPullRequestsByHeadInfo(env.DB, pushedPair.repo.id, branch, log, pushedPair);
   if (heads.length === 0) return;
   const viewer: Viewer = { origin, requester: null };
   for (const head of heads) {
@@ -510,6 +557,11 @@ async function emitPullRequestSyncs(
         );
         continue;
       }
+      // The §3.4 sync arms (upstream PushToBaseRepo → CreatePushPullComment →
+      // markPullRequestStatusAsChecking, pull.go:388-407) — a failure leaves
+      // `synced` null and only skips the arms (the event still fires, like
+      // upstream's independent IsSync loop).
+      const synced = await syncPullRequestHead(env, pushedPair, basePair, head, update, options, log);
       await emit(
         "pull_request_sync",
         {
@@ -519,8 +571,10 @@ async function emitPullRequestSyncs(
           number: head.issue.index,
           // Upstream's sync payload renders ToPayloadPullRequest (notifier.go:850)
           // — the isPayload arm: the head repo shows regardless of the (here
-          // anonymous) doer, pulls.ts toApiPullRequest "payload" mode.
-          pull_request: await toApiPullRequest(env.DB, viewer, basePair, head.issue, head.pullRequest, "payload"),
+          // anonymous) doer, pulls.ts toApiPullRequest "payload" mode. The
+          // synced row (head_sha/status already moved) renders when the arms
+          // landed; upstream's payload reads the same moved state.
+          pull_request: await toApiPullRequest(env.DB, viewer, basePair, head.issue, synced ?? head.pullRequest, "payload"),
           repository: toApiRepository(viewer, basePair),
           sender: identity.sender,
           commit_id: "",
@@ -534,6 +588,406 @@ async function emitPullRequestSyncs(
       );
     }
   }
+}
+
+/**
+ * `GetUnmergedPullRequestsByHeadInfo` (models/issues/pull_list.go:63-72) —
+ * the open, unmerged, github-flow PRs whose head is `(headRepoId, branch)`.
+ * The shared lookup of the sync arms (this file's three consumers: the sync
+ * event, the review legs, the delete cascade).
+ */
+async function openPullRequestsByHeadInfo(
+  db: D1Database,
+  headRepoId: string,
+  branch: string,
+  log: (message: string) => void,
+  pair: RepositoryWithOwner,
+): Promise<Array<{ issue: typeof issues.$inferSelect; pullRequest: typeof pullRequests.$inferSelect }>> {
+  try {
+    return await drizzle(db)
+      .select({ issue: issues, pullRequest: pullRequests })
+      .from(pullRequests)
+      .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+      .where(
+        and(
+          eq(pullRequests.headRepoId, headRepoId),
+          eq(pullRequests.headBranch, branch),
+          eq(pullRequests.hasMerged, false),
+          eq(pullRequests.flow, PRFlow.Github),
+          eq(issues.isClosed, false),
+        ),
+      )
+      .all();
+  } catch (error) {
+    log(
+      `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: PR head lookup failed for refs/heads/${branch}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return [];
+  }
+}
+
+/**
+ * Per-PR §3.4 sync arms, in upstream's AddTestPullRequestTask order
+ * (services/pull/pull.go:388-407 — PushToBaseRepo → CreatePushPullComment →
+ * StartPullRequestCheckImmediately; the divergence rides syncCommitDivergence,
+ * update.go:213-222). Returns the moved PR row for the webhook payload, or
+ * null when the arms failed/skipped (the row CAS-lost a merge, or the engine
+ * refused). Never throws — the caller's per-PR catch is the last resort.
+ */
+async function syncPullRequestHead(
+  env: WebhookPushEnv,
+  pushedPair: RepositoryWithOwner,
+  basePair: RepositoryWithOwner,
+  head: { issue: typeof issues.$inferSelect; pullRequest: typeof pullRequests.$inferSelect },
+  update: PushRefUpdate,
+  options: WebhookPushOptions,
+  log: (message: string) => void,
+): Promise<typeof pullRequests.$inferSelect | null> {
+  const { issue, pullRequest: pr } = head;
+  try {
+    const baseCell = env.REPO.getByName(engineName(basePair.repo.ownerNamespace, basePair.repo.slug));
+
+    // 1. Fork-head object carry — upstream's FetchRemoteTempCommit
+    // (pull.go:556-558) fetches the head commit into the base repo before the
+    // ref move; ours carries the new tip's divergent closure fork→base through
+    // carryLooseRefs (the PR-creation carry's exact posture, pull-engine.ts
+    // carryForkHeadIntoBase — same primitives, sync-time trigger). Same-repo
+    // heads need nothing: the pushed objects are already in the base cell.
+    if (pr.baseRepoId !== pr.headRepoId) {
+      const forkCell = env.REPO.getByName(engineName(pushedPair.repo.ownerNamespace, pushedPair.repo.slug));
+      const baseSource = syncCarrySource(baseCell);
+      await carryLooseRefs(
+        syncCarrySource(forkCell),
+        syncCarryTarget(baseCell),
+        [{ name: branchRef(pr.headBranch), target: update.next }],
+        null,
+        await packedCatalogOids(baseSource),
+        `${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug} -> ${basePair.repo.ownerNamespace}/${basePair.repo.slug} (pr-sync head carry)`,
+      );
+    }
+
+    // 2. CAS refs/pull/N/head old→new (upstream git.UpdateRef, pull.go:560).
+    // The CAS base is the LIVE ref tip — the engine ref is authoritative over
+    // the head_sha cache (schema note) and a missing ref (pre-lint creation
+    // rows) creates from the zero oid exactly like createPullHeadRef. An
+    // already-moved ref (idempotent re-sync — upstream's "Only update refs
+    // that actually changed?" FIXME) skips the write.
+    const headRef = pullHeadRef(pr.index);
+    const current = await baseCell.readCommit(headRef);
+    const currentTip = current === null ? PUSH_ZERO_OID : current.oid;
+    if (currentTip !== update.next) {
+      const moved = await baseCell.commitApiChange({ ref: headRef, expectedOldOid: currentTip, newOid: update.next });
+      if (moved.tag !== "committed") {
+        // ref_conflict (a concurrent write won — the next push re-syncs),
+        // invalid (unstored object — the carry above failed), importing
+        // (fork import in flight): upstream logs and moves on.
+        log(
+          `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR #${issue.index} head ref ` +
+            `${headRef} move refused (${moved.tag}) — sync arms skipped`,
+        );
+        return null;
+      }
+    }
+
+    // 3. The D1 row — head_sha cache, status=checking (re-arming the lazy
+    // ensurePullRequestChecked, §3.4's check-queue equivalent) and the
+    // recomputed ahead/behind (upstream syncCommitDivergence), CAS-guarded by
+    // has_merged=0 (upstream UpdateColsIfNotMerged — never overwrite a merged
+    // row). merge_base stays to the lazy check (upstream updates it from
+    // checkIfPRContentChanged; our GET-observed check CASes the same column).
+    const divergence = await baseCell.countDivergence(branchRef(pr.baseBranch), headRef);
+    const updated = await drizzle(env.DB)
+      .update(pullRequests)
+      .set({
+        headSha: update.next,
+        status: PRStatus.Checking,
+        ...(divergence !== null && divergence.tag === "ok" ? { commitsAhead: divergence.ahead, commitsBehind: divergence.behind } : {}),
+      })
+      .where(and(eq(pullRequests.id, pr.id), eq(pullRequests.hasMerged, false)))
+      .returning();
+
+    // 4. The type-29 push comment (CreatePushPullComment, pull.go before the
+    // check — "so the comment is already in database when the status is
+    // mergeable").
+    await createPushPullComment(env, basePair, issue, pr, update, options, log);
+    return updated[0] ?? null;
+  } catch (error) {
+    log(
+      `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR #${issue.index} head sync failed: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * `CreatePushPullComment` (services/pull/comment.go:68-136): the type-29
+ * `pull_push` comment of one head push. Normal push = one comment carrying
+ * the capped oldest-first pushed-commit list, ONLY when the list is non-empty
+ * (shouldCreate); force push = the merge-base walk comment (always created,
+ * errors logged-only) PLUS the `{is_force_push, [old, new]}` marker comment,
+ * with the old-comment reconcile folded in first (upstream's clean-up runs in
+ * the same transaction). Both walks read the BASE cell — upstream opens
+ * pr.BaseRepo after PushToBaseRepo fetched the tip (comment.go:78-80).
+ */
+async function createPushPullComment(
+  env: WebhookPushEnv,
+  basePair: RepositoryWithOwner,
+  issue: typeof issues.$inferSelect,
+  pr: typeof pullRequests.$inferSelect,
+  update: PushRefUpdate,
+  options: WebhookPushOptions,
+  log: (message: string) => void,
+): Promise<void> {
+  const baseCell = env.REPO.getByName(engineName(basePair.repo.ownerNamespace, basePair.repo.slug));
+  // Force detection — upstream push.go:286-291 IsForcePush (commit.go:126-141:
+  // old is NOT an ancestor of new; a read failure logs and defaults false).
+  let isForcePush = false;
+  if (update.old !== PUSH_ZERO_OID) {
+    const ancestry = await baseCell.mergeBase(update.old, update.next);
+    if (ancestry !== null && ancestry.tag === "ok") {
+      isForcePush = ancestry.base !== update.old;
+    }
+  }
+
+  let commitIds: string[];
+  if (isForcePush) {
+    // The force-push comment should always be created, so all walk errors are
+    // ignored and logged only (comment.go:24-39): the whole PR commit list
+    // merge_base..new, capped.
+    const mb = await baseCell.mergeBase(branchRef(pr.baseBranch), update.next);
+    commitIds =
+      mb !== null && mb.tag === "ok" && mb.base !== null
+        ? await newestLimitedCommitIds(baseCell, mb.base, update.next, log, basePair)
+        : [];
+  } else {
+    // Normal push: only a non-empty PR needs the comment (comment.go:43-45).
+    commitIds = await newestLimitedCommitIds(baseCell, update.old, update.next, log, basePair);
+  }
+
+  if (isForcePush) {
+    commitIds = await reconcileForcePushComments(env.DB, issue.id, commitIds);
+  }
+  if (!isForcePush && commitIds.length === 0) {
+    return; // upstream shouldCreate=false — nothing new was pushed
+  }
+
+  const service = new IssuesService(env.DB);
+  const now = options.now ?? new Date();
+  const posterId = options.pusherId ?? null;
+  if (commitIds.length > 0) {
+    await service.addComment({
+      issueId: issue.id,
+      type: CommentType.PullRequestPush,
+      posterId,
+      content: JSON.stringify({ is_force_push: false, commit_ids: commitIds } satisfies PushActionContent),
+      now,
+    });
+  }
+  if (isForcePush) {
+    // The force-push marker comment — CommitIDs is the [old head, new head]
+    // pair (models/issues/comment.go:376-381).
+    await service.addComment({
+      issueId: issue.id,
+      type: CommentType.PullRequestPush,
+      posterId,
+      content: JSON.stringify({ is_force_push: true, commit_ids: [update.old, update.next] } satisfies PushActionContent),
+      now,
+    });
+  }
+}
+
+/**
+ * The newest-capped `start..end` commit-id list, oldest-first — upstream
+ * `rev-list --reverse -n limit start..end` (comment.go:47-55 keeps the NEWEST
+ * `limit` of the range). The engine's listCommitsRange caps a page keeping the
+ * OLDEST (its page semantics), so the newest window is collected by paging;
+ * bounded at two pages of the cap (2×1000 walked) — a bigger single push
+ * degrades to the newest ~1000 of the first two pages, logged (the one
+ * documented deviation from upstream's exact window).
+ */
+async function newestLimitedCommitIds(
+  cell: { listCommitsRange(base: string, head: string, limit: number, page?: number): Promise<{ commits: Array<{ oid: string }>; more: boolean } | null> },
+  start: string,
+  end: string,
+  log: (message: string) => void,
+  pair: RepositoryWithOwner,
+): Promise<string[]> {
+  const collected: string[] = [];
+  for (let page = 0; page < 2; page += 1) {
+    const result = await cell.listCommitsRange(start, end, MAX_PUSH_COMMITS_IN_COMMENT, page);
+    if (result === null) {
+      // Unresolvable side — upstream's rev-list error path (comment.go:55-58)
+      // fails the comment; the sync's never-fail posture logs instead.
+      log(`[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: push-comment walk ${start.slice(0, 7)}..${end.slice(0, 7)} failed`);
+      return collected.length > 0 ? collected.slice(-MAX_PUSH_COMMITS_IN_COMMENT) : [];
+    }
+    for (const commit of result.commits) collected.push(commit.oid);
+    if (!result.more) break;
+    if (page === 1) {
+      log(`[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: push-comment walk truncated at ${collected.length} commits`);
+    }
+  }
+  return collected.slice(-MAX_PUSH_COMMITS_IN_COMMENT);
+}
+
+/**
+ * Upstream's force-push comment reconcile
+ * (comment.go:41-66 reconcileOldCommitCommentsForNewForcePush): every old
+ * NON-force type-29 comment of the issue keeps only commit ids still present
+ * in the new force list (emptied comments are deleted, others re-serialized),
+ * and ids covered by a surviving old comment are removed from the new list
+ * (the new comment carries only NEW ids). Old force-push comments are kept
+ * verbatim. Counter-neutral, like upstream's raw update/delete. Parse
+ * failures skip the comment (upstream `continue`).
+ */
+async function reconcileForcePushComments(db: D1Database, issueId: number, newCommitIds: string[]): Promise<string[]> {
+  const oldComments = await drizzle(db)
+    .select()
+    .from(comments)
+    .where(and(eq(comments.issueId, issueId), eq(comments.type, CommentType.PullRequestPush)))
+    .all();
+  const pending = new Set(newCommitIds);
+  const deleteIds: number[] = [];
+  const updates: Array<{ id: number; content: string }> = [];
+  for (const old of oldComments) {
+    let data: PushActionContent;
+    try {
+      data = JSON.parse(old.content ?? "") as PushActionContent;
+    } catch {
+      continue;
+    }
+    if (data.is_force_push === true) continue;
+    const kept = data.commit_ids.filter((id) => pending.has(id));
+    if (kept.length === 0) {
+      deleteIds.push(old.id);
+      continue;
+    }
+    for (const id of kept) pending.delete(id);
+    if (kept.length !== data.commit_ids.length) {
+      updates.push({ id: old.id, content: JSON.stringify({ is_force_push: false, commit_ids: kept }) });
+    }
+  }
+  const statements: Parameters<DrizzleD1Database["batch"]>[number][number][] = [];
+  if (deleteIds.length > 0) {
+    statements.push(drizzle(db).delete(comments).where(inArray(comments.id, deleteIds)));
+  }
+  for (const update of updates) {
+    statements.push(drizzle(db).update(comments).set({ content: update.content }).where(eq(comments.id, update.id)));
+  }
+  for (const statement of statements) {
+    await drizzle(db).batch([statement]);
+  }
+  return [...pending];
+}
+
+/**
+ * Upstream `AdjustPullsCausedByBranchDeleted` (services/pull/pull.go:622-655,
+ * fired from pushDeleteBranch, push.go:296-311) — a deleted BRANCH closes
+ * every open unmerged github-flow PR whose head it is, each with the type-11
+ * delete-branch comment (AddDeletePRBranchComment, issue_update.go:250-264 —
+ * `old_ref` carries the branch name). Already-closed PRs are tolerated
+ * (upstream skips IsErrIssueIsClosed). DEVIATION: the close webhook
+ * (upstream IssueChangeStatus) is deferred — the payload builder lives in the
+ * pulls route module; the close itself lands through IssuesService so every
+ * read renders closed. The engine's refs/pull/N/head survives, like upstream
+ * (only merged-PR cleanup deletes it).
+ */
+async function closePullRequestsOfDeletedBranch(
+  env: WebhookPushEnv,
+  pushedPair: RepositoryWithOwner,
+  update: PushRefUpdate,
+  options: WebhookPushOptions,
+  log: (message: string) => void,
+): Promise<void> {
+  const branch = update.ref.slice("refs/heads/".length);
+  const heads = await openPullRequestsByHeadInfo(env.DB, pushedPair.repo.id, branch, log, pushedPair);
+  const now = options.now ?? new Date();
+  for (const head of heads) {
+    try {
+      const service = new IssuesService(env.DB);
+      try {
+        await service.closeIssue(head.issue.id, { actorId: options.pusherId ?? null, now });
+      } catch {
+        // already closed — upstream tolerates IsErrIssueIsClosed (pull.go:646)
+      }
+      // The type-11 comment + the num_comments bump in one batch (the
+      // issue-tables discipline of the dismiss leg above; upstream's
+      // CreateComment folds the same two writes).
+      await drizzle(env.DB).batch([
+        drizzle(env.DB).insert(comments).values({
+          type: CommentType.DeleteBranch,
+          posterId: options.pusherId ?? null,
+          issueId: head.issue.id,
+          oldRef: branch,
+          createdAt: now,
+        }),
+        drizzle(env.DB)
+          .update(issues)
+          .set({ numComments: sql`num_comments + 1`, updatedAt: now })
+          .where(eq(issues.id, head.issue.id)),
+      ]);
+    } catch (error) {
+      log(
+        `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: branch-delete cascade failed for PR #${head.issue.index}: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The sync carry adapters — pull-engine.ts's carrySource/carryTarget take a
+// full ApiEnv Context, which the onPush seam does not have; these are the
+// same structural wrappers over the raw cell stub (the fork-task.ts
+// intersection-stripping style).
+// ---------------------------------------------------------------------------
+
+/** Structural CarrySource over one cell (see pull-engine.ts carrySource —
+ *  the async wrappers strip the RPC stub's `Promise & Pick` intersections so
+ *  the structural assignment infers). */
+function syncCarrySource(cell: {
+  listRefs(): Promise<{ head: string | null; refs: { name: string; target: string; peeled?: string }[] }>;
+  listCatalogPage(afterPackKey: string, limit: number): Promise<CatalogPage>;
+  readCommit(id?: string): Promise<CommitJson | null>;
+  listTree(ref?: string, path?: string): Promise<{ oid: string; entries: TreeEntryJson[] } | null>;
+  readBlob(ref: string | undefined, path: string): Promise<{ oid: string; mode: string; data: Uint8Array } | null>;
+}): CarrySource {
+  return {
+    listRefs: async () => {
+      const refs = await cell.listRefs();
+      return {
+        head: refs.head,
+        refs: refs.refs.map((ref) => ({ name: ref.name, target: ref.target, ...(ref.peeled === undefined ? {} : { peeled: ref.peeled }) })),
+      };
+    },
+    listCatalogPage: (after, limit) => cell.listCatalogPage(after, limit),
+    readCommit: (id) => cell.readCommit(id),
+    listTree: (ref, path) => cell.listTree(ref, path),
+    readBlob: (ref, path) => cell.readBlob(ref, path),
+  };
+}
+
+/** putApiObjects adapter over a cell (see pull-engine.ts carryTarget). */
+function syncCarryTarget(cell: { putApiObjects(objects: ApiObject[]): Promise<PutApiObjectsResult> }): Pick<CarryTarget, "putApiObjects"> {
+  return { putApiObjects: (objects) => cell.putApiObjects(objects) };
+}
+
+/** The cell's ACTIVE pack catalog oids — the carry walk's skip set
+ *  (pull-engine.ts packedCatalogOids). */
+async function packedCatalogOids(source: CarrySource): Promise<Set<string>> {
+  const packed = new Set<string>();
+  let cursor = "";
+  for (;;) {
+    const page = await source.listCatalogPage(cursor, 8192);
+    for (const pack of page.packs) {
+      for (const row of pack.rows) packed.add(row.oid);
+    }
+    cursor = page.nextAfter;
+    if (!page.more) break;
+  }
+  return packed;
 }
 
 export interface UserPushNotificationOptions {
@@ -583,6 +1037,9 @@ export async function handleUserPushNotifications(
     const walk = options.walk ?? engineWalk(env, pair);
     await emitPushFamilyUpdates(env, pair, identity, updates, walk, {
       ...(options.now !== undefined ? { now: options.now } : {}),
+      // The sync arms' comment attribution rides the authenticated pusher
+      // (upstream CreatePushPullComment's Doer); null attributes to no poster.
+      pusherId: pusher?.id ?? null,
     });
   } catch (error) {
     console.error(
@@ -643,29 +1100,8 @@ export async function markStaleReviewsOnPush(
     if (!update.ref.startsWith("refs/heads/")) continue;
     if (update.old === PUSH_ZERO_OID || update.next === PUSH_ZERO_OID) continue;
     const branch = update.ref.slice("refs/heads/".length);
-    let heads: Array<{ issue: typeof issues.$inferSelect; pullRequest: typeof pullRequests.$inferSelect }>;
-    try {
-      heads = await drizzle(env.DB)
-        .select({ issue: issues, pullRequest: pullRequests })
-        .from(pullRequests)
-        .innerJoin(issues, eq(issues.id, pullRequests.issueId))
-        .where(
-          and(
-            eq(pullRequests.headRepoId, pushedPair.repo.id),
-            eq(pullRequests.headBranch, branch),
-            eq(pullRequests.hasMerged, false),
-            eq(pullRequests.flow, PRFlow.Github),
-            eq(issues.isClosed, false),
-          ),
-        )
-        .all();
-    } catch (error) {
-      log(
-        `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR head lookup failed for ${update.ref}: ` +
-          `${error instanceof Error ? error.message : String(error)}`,
-      );
-      continue;
-    }
+    const heads = await openPullRequestsByHeadInfo(env.DB, pushedPair.repo.id, branch, log, pushedPair);
+    if (heads.length === 0) continue;
     for (const head of heads) {
       try {
         await applyPushReviewLegs(env, pushedPair, head, update, pusher, log, options);

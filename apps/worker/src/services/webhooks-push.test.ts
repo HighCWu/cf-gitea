@@ -54,7 +54,8 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { findRepositoryById } from "../api/services/repository";
 import { TeamsService } from "../api/routes/org-teams";
-import { repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { comments, issues, PRStatus, pullRequests, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { authorize } from "../git-http/authorize";
 import { gitHttpGate } from "../git-http/gate";
@@ -189,6 +190,7 @@ beforeEach(async () => {
     "repo_redirects",
     "repo_counters",
     "pull_requests",
+    "comments",
     "issues",
     "repositories",
     "webhook_deliveries",
@@ -1039,6 +1041,201 @@ describe("pull_request_sync — PR-head branch updates ride the push (notifier.g
       [pushOnly, "push"],
       [syncOnly, "pull_request_sync"],
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The PR-head sync arms (SPEC-0005 §3.4 "Sync pushes" — upstream
+// UpdatePullsRefs + CreatePushPullComment + AdjustPullsCausedByBranchDeleted)
+// ---------------------------------------------------------------------------
+
+/** The PR row by issue id. */
+const pullRow = (issueId: number) =>
+  drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.issueId, issueId)).get();
+
+/** The issue's type-29 push comments, oldest first. */
+const pushComments = (issueId: number) =>
+  drizzle(env.DB)
+    .select()
+    .from(comments)
+    .where(eq(comments.issueId, issueId))
+    .all()
+    .then((rows) => rows.filter((r) => r.type === CommentType.PullRequestPush).sort((a, b) => a.id - b.id));
+
+describe("the PR-head sync arms — ref CAS, head_sha, re-check, comment (SPEC-0005 §3.4)", () => {
+  /** The three-push fixture: main@seed, feature@head created, PR row seeded
+   *  (D1-only, like the production path's D1 half), then feature ADVANCED one
+   *  commit — the second push that must sync the PR. */
+  async function seedAdvancedPrHead(slug: string, title: string) {
+    const { row, token } = await seedRepoWithToken(slug);
+    const { issueId, index } = await seedPull(row.id, title, { headBranch: "feature", baseBranch: "main" });
+    const alice = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get();
+
+    // main lands FIRST in its own receive (the first-pushed branch of an
+    // empty repo becomes the D1 default — the gate's settle; the sync arms
+    // and the delete arm read that state), then feature.
+    const initial = await buildChainPack(null, [
+      { message: "seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000300 },
+      { message: "pr head", files: [{ path: "work.txt", content: "head\n" }], time: 1700000301 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/main" }], initial.pack, token)).status,
+    ).toBe(200);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[1]!, ref: "refs/heads/feature" }], initial.pack, token)).status,
+    ).toBe(200);
+
+    // The second push: one commit appended to feature (incremental pack —
+    // parents resolve from the cell).
+    const append = await buildChainPack(initial.tips[1]!, [
+      { message: "second", files: [{ path: "work.txt", content: "second\n" }], time: 1700000302 },
+    ]);
+    expect(
+      (
+        await pushThroughGate(
+          row,
+          wiredEngine,
+          [{ old: initial.tips[1]!, oid: append.tips[0]!, ref: "refs/heads/feature" }],
+          append.pack,
+          token,
+        )
+      ).status,
+    ).toBe(200);
+
+    return { row, token, aliceId: alice?.id ?? null, issueId, index, before: initial.tips[1]!, after: append.tips[0]! };
+  }
+
+  it("the second push moves refs/pull/N/head, head_sha, divergence and re-arms the check", async () => {
+    const { row, issueId, index, after } = await seedAdvancedPrHead("syncref", "sync ref");
+    // The engine ref moved (the merge/diff/commits surfaces all read THIS).
+    await expectRef(row.ownerNamespace, row.slug, `refs/pull/${index}/head`, after);
+    // The D1 cache: head_sha, status=checking (re-arming the lazy
+    // ensurePullRequestChecked) and the recomputed divergence (ahead 2, behind
+    // 0 against the untouched main seed).
+    const pr = await pullRow(issueId);
+    expect(pr?.headSha).toBe(after);
+    expect(pr?.status).toBe(PRStatus.Checking);
+    expect(pr?.commitsAhead).toBe(2);
+    expect(pr?.commitsBehind).toBe(0);
+  });
+
+  it("the second push lands the type-29 push comment with the pushed delta", async () => {
+    const { aliceId, issueId, after } = await seedAdvancedPrHead("synccomment", "sync comment");
+    const rows = await pushComments(issueId);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content ?? "{}")).toEqual({ is_force_push: false, commit_ids: [after] });
+    // Upstream CreatePushPullComment's Doer = the authenticated pusher.
+    expect(rows[0]!.posterId).toBe(aliceId);
+    // The num_comments bump rode the same write (IssuesService.addComment).
+    const issue = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
+    expect(issue?.numComments).toBe(1);
+  });
+
+  it("a force push moves the ref to the new tip and lands the is_force_push marker", async () => {
+    const { row, token, issueId, index, after } = await seedAdvancedPrHead("syncforce", "sync force");
+    // Force = a DIFFERENT ROOT pushed over the CURRENT tip (the engine accepts
+    // non-fast-forward receives; no protection rule in this fixture).
+    const forced = await buildChainPack(null, [
+      { message: "rewritten", files: [{ path: "work.txt", content: "rewritten\n" }], time: 1700000310 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: after, oid: forced.tips[0]!, ref: "refs/heads/feature" }], forced.pack, token)).status,
+    ).toBe(200);
+
+    await expectRef(row.ownerNamespace, row.slug, `refs/pull/${index}/head`, forced.tips[0]!);
+    const pr = await pullRow(issueId);
+    expect(pr?.headSha).toBe(forced.tips[0]!);
+    expect(pr?.status).toBe(PRStatus.Checking);
+    // The marker comment carries the [old head, new head] pair; the merge-base
+    // walk found nothing (unrelated history) so no commits comment rides
+    // along — one type-29 row total (comment.go:24-39 "always created").
+    const rows = await pushComments(issueId);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.content ?? "{}")).toEqual({ is_force_push: true, commit_ids: [after, forced.tips[0]!] });
+  });
+
+  it("a force push reconciles the old push comments (upstream clean-up)", async () => {
+    // The normal push first (a [tip2] comment lands), then force to a SIBLING
+    // of tip2 (descends from main's seed, not from tip2): the old comment's
+    // commit vanishes from the new list → deleted; the new list ([tipS]) and
+    // the marker comment land.
+    const { row, token, issueId, after } = await seedAdvancedPrHead("syncreconcile", "sync reconcile");
+    expect((await pushComments(issueId)).map((r) => JSON.parse(r.content ?? "{}") as Record<string, unknown>)).toEqual([
+      { is_force_push: false, commit_ids: [after] },
+    ]);
+
+    // The sibling descends from the SEED (main's tip), not from the old feature head.
+    const mainTip = (await env.REPO.getByName(`${row.ownerNamespace}/${row.slug}`).listRefs()).refs.find(
+      (r) => r.name === "refs/heads/main",
+    )!.target;
+    const sibling = await buildChainPack(mainTip, [
+      { message: "sibling", files: [{ path: "work.txt", content: "sibling\n" }], time: 1700000320 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: after, oid: sibling.tips[0]!, ref: "refs/heads/feature" }], sibling.pack, token)).status,
+    ).toBe(200);
+
+    const rows = await pushComments(issueId);
+    expect(rows.map((r) => JSON.parse(r.content ?? "{}") as Record<string, unknown>)).toEqual([
+      // The reconciled normal comment now carries the surviving sibling commit;
+      // the vanished [after] comment was DELETED (not rewritten into emptiness).
+      { is_force_push: false, commit_ids: [sibling.tips[0]!] },
+      { is_force_push: true, commit_ids: [after, sibling.tips[0]!] },
+    ]);
+  });
+
+  it("deleting the head branch closes the PR and writes the delete-branch comment", async () => {
+    const { row, token, aliceId, issueId, index, after } = await seedAdvancedPrHead("syncdelete", "sync delete");
+    // The delete push (old = the current feature tip, new = zero oid).
+    const featureTip = (await env.REPO.getByName(`${row.ownerNamespace}/${row.slug}`).listRefs()).refs.find(
+      (r) => r.name === "refs/heads/feature",
+    )!.target;
+    const deleteResponse = await pushThroughGate(row, wiredEngine, [{ old: featureTip, oid: PUSH_ZERO_OID, ref: "refs/heads/feature" }], null, token);
+    expect(deleteResponse.status).toBe(200);
+
+    // Upstream AdjustPullsCausedByBranchDeleted: the open PR closes...
+    const issue = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueId)).get();
+    expect(issue?.isClosed).toBe(true);
+    // ...with the type-11 delete-branch comment (old_ref = the branch):
+    const rows = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueId)).all();
+    const deleteComment = rows.find((r) => r.type === CommentType.DeleteBranch);
+    expect(deleteComment?.oldRef).toBe("feature");
+    expect(deleteComment?.posterId).toBe(aliceId);
+    // The close comment (type 2) rode IssuesService.closeIssue: close + type-11.
+    expect(rows.filter((r) => r.type === CommentType.Close)).toHaveLength(1);
+    // The engine PR head ref SURVIVES (upstream deletes it only on merged-PR
+    // cleanup) and the delete added NO type-29 sync comment — the one row
+    // present is the append push's normal comment (deletes don't sync).
+    await expectRef(row.ownerNamespace, row.slug, `refs/pull/${index}/head`, featureTip);
+    const pushRows = await pushComments(issueId);
+    expect(pushRows).toHaveLength(1);
+    expect(JSON.parse(pushRows[0]!.content ?? "{}")).toEqual({ is_force_push: false, commit_ids: [after] });
+  });
+
+  it("a non-PR branch push performs no sync arms", async () => {
+    const { row, token } = await seedRepoWithToken("syncnoop");
+    const { issueId } = await seedPull(row.id, "untouched pr", { headBranch: "feature", baseBranch: "main" });
+    const initial = await buildChainPack(null, [
+      { message: "seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000330 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/feature" }], initial.pack, token)).status,
+    ).toBe(200);
+    await clearDeliveries();
+
+    // Update an unrelated branch — no PR head refs move, no comments land.
+    const other = await buildChainPack(null, [
+      { message: "other", files: [{ path: "other.txt", content: "other\n" }], time: 1700000331 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: other.tips[0]!, ref: "refs/heads/other" }], other.pack, token)).status,
+    ).toBe(200);
+    expect((await pushComments(issueId))).toHaveLength(0);
+    const pr = await pullRow(issueId);
+    expect(pr?.headSha).toBeNull();
+    expect(pr?.status).toBe(PRStatus.Checking); // the creation default, untouched
+    const refs = await env.REPO.getByName(`${row.ownerNamespace}/${row.slug}`).listRefs();
+    expect(refs.refs.some((r) => r.name.startsWith("refs/pull/"))).toBe(false);
   });
 });
 
