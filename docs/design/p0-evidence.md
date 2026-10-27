@@ -3239,3 +3239,15 @@ version `fe6bcca1`; healthz 200 @2.3s; migrations: none pending —
   zero server-side exposure; local scratch shredded; the clean mint
   (node -e, stdout never touching the terminal) is the pattern of
   record.
+
+**REDEPLOY22 LIVE (2026-10-28 ~01:5x, GO `5f3c26f` → version `73158aa8`;
+healthz 200 @2.2s; no migrations):** cargo = the purge-page mount
+(`ea6a49d`), the two census-slice mounts (`fa4fd0d`), the tick-15
+terminal docs. Gate at GO: single-pass 261/5,831/0. Battery: 108/2 —
+the mirror cold-start settle (warm rerun green, the standing class) +
+the live run-PAT audit item (deleted at wrap). The deploy coincided
+with the wave-130 parity-review kickoff; the reviewers' SUSPECT
+findings (PR head-sync absence, org access revocation, the session
+rotation cookie, tag-only push-create deletion, issue cascade gaps +
+more) drive the fix wave that follows — this block is the review
+baseline's evidence of record.
