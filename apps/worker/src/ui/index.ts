@@ -4149,7 +4149,11 @@ async function settingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
     return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${result.slug}/settings` } }));
   }
   const data = await loadRepoBasics(c.env.DB, repo);
-  data.form = { name: form.name, description: form.description, isPrivate: form.isPrivate };
+  // The whole parsed form carries (88cbd17's hardening): the optional
+  // fields' stored-fallbacks in the module become dead code — the invalid
+  // re-render now shows exactly what was submitted (secrets-class fields
+  // never ride; this form has none).
+  data.form = form;
   return respond(c.html(renderRepoSettingsPage({ ctx, data, error: result.message }), 200));
 }
 

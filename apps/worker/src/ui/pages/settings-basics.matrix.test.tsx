@@ -638,7 +638,7 @@ describe("the options form's wave-settings-options field set (template/website/u
     expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("mirror still writes");
   });
 
-  it("the invalid-name re-render carries the legacy trio and falls back to the STORED wave-129 states (the no-recipe posture)", async () => {
+  it("the invalid-name re-render carries the legacy trio and carries the EXACT submission (the 88cbd17 hardening)", async () => {
     // The landed handler rebuilds the carried form with the legacy three
     // fields only (ui/index.ts, orchestrator-owned); the wave-129 fields are
     // optional on RepoBasicsForm precisely for this path — absent renders
@@ -657,13 +657,17 @@ describe("the options form's wave-settings-options field set (template/website/u
     expect(html).toContain('<div class="ui negative message">repository name is not allowed: demo.git</div>');
     expect(html).toContain(">carried body</textarea>"); // the legacy carry holds
     expect(html).toContain('<input id="private" name="private" type="checkbox" checked=""/>'); // legacy carry
-    // The wave-129 fields render the STORED states (hasProjects on; the
-    // posted enable_packages dropped; template/archived off the repo row).
-    expect(html).toContain('<input class="enable-system" name="enable_projects" type="checkbox" checked=""/>');
-    expect(html).toContain('<input class="enable-system" name="enable_packages" type="checkbox"/>');
-    expect(html).toContain('<input id="template" name="template" type="checkbox" checked=""/>');
-    expect(html).toContain('<input id="archived" name="archived" type="checkbox"/>');
-    expect(html).toContain('value="https://stored.test"/>');
+    // The 88cbd17 hardening (data.form = form): the carry is EXACT — the
+    // wave-129 fields render the SUBMITTED states, not the stored ones
+    // (hasProjects stored-on but posted absent → unchecked; the posted
+    // enable_packages → checked; template absent (stored-on) → unchecked;
+    // the posted archived → checked; the website carry is the parsed
+    // default — the POST's url-typed empty string).
+    expect(html).toContain('<input class="enable-system" name="enable_projects" type="checkbox"/>');
+    expect(html).toContain('<input class="enable-system" name="enable_packages" type="checkbox" checked=""/>');
+    expect(html).toContain('<input id="template" name="template" type="checkbox"/>');
+    expect(html).toContain('<input id="archived" name="archived" type="checkbox" checked=""/>');
+    expect(html).toContain('name="website" type="url" maxlength="1024" value=""');
     // Nothing was written (the pre-existing invalid-arm rule, now covering
     // the new write arms too): the stored row keeps its flags (hasProjects
     // on, the posted enable_packages dropped) and the repo row stands.
