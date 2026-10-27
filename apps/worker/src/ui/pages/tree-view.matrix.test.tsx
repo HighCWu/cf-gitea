@@ -1180,7 +1180,7 @@ describe("the ?display=source|rendered query is a no-op (w129 batch-14)", () => 
     // keep the render deterministic).
     expect(sourceHtml).toBe(bareHtml);
     expect(renderedHtml).toBe(bareHtml);
-    expect(bareHtml).toContain('class="render-content markup"'); // rendered, never the source view
+    expect(bareHtml).toContain('<div class="file-view markup markdown">'); // rendered, never the source view
     // Upstream's toggle pair (file-view-toggle-buttons wrapping the
     // ?display= anchors) never renders — a rendered toggle would be dead UI
     // (the §2.4.1 rule) until a display-mode channel exists.

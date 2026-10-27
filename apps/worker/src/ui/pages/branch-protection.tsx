@@ -89,11 +89,15 @@
  * precedent) and carries the current default even when the engine does not
  * know it (upstream's hidden input + `.default text` render it verbatim).
  *
- * **HANDOFF — the write arm is NOT mounted in `src/ui/index.ts`**
- * (orchestrator-owned): the GET handler does not yet pass `branchOptions`
- * (the select renders the current default alone until it does — the
- * two-stage-unmounted convention, branches.tsx's writer block) and the POST
- * is unregistered. The mount recipe (SetDefaultBranchPost's shape):
+ * **MOUNTED (w129 batch-14 sweep — this paragraph was the two-stage
+ * HANDOFF, kept verbatim below as the recipe record):** the default-branch
+ * write arm went live in `src/ui/index.ts` exactly per that recipe —
+ * `branchProtectionDefaultBranchSubmit` (the registered POST) and the GET
+ * passing `branchOptions` (ce52935's mount). The stale halves were "the GET
+ * handler does not yet pass `branchOptions` … and the POST is unregistered";
+ * both flipped with the mount.
+ *
+ * **The HANDOFF record (SetDefaultBranchPost's shape):**
  * sameOriginGuard → resolveUiRequest → settingsGate → the archived 404
  * (RepoMustNotBeArchived's posture), `action != "default_branch"` 404s
  * (upstream's switch default arm), then applyDefaultBranchForm(c.env, repo,
@@ -973,9 +977,11 @@ export interface BranchProtectionListData {
    *  protected_branch.go:337); display-only. */
   savedRule: string | null;
   /** The default-branch select's options (loadDefaultBranchOptions —
-   *  PrepareBranchList's port). Optional until the mount wave passes it (the
-   *  handler recipe in the module header) — the segment still renders with
-   *  the current default alone (the two-stage-unmounted convention). */
+   *  PrepareBranchList's port). Optional: w129 batch-14 sweep note — the
+   *  mount wave passes it since ce52935 (the module header's MOUNTED
+   *  record); the optionality is the two-stage-unmounted convention's
+   *  residue — the segment still renders with the current default alone
+   *  when the caller omits it. */
   branchOptions?: string[];
 }
 

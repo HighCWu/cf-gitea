@@ -699,8 +699,9 @@ function DivergenceCell(props: { divergence: { ahead: number; behind: number } |
  *  — the JS modal reduced to an inline no-JS form): a visible required
  *  `new_branch_name` input posting upstream's EXACT route
  *  POST `/branches/_new/branch/{from}` (web.go:1477-1481 +
- *  NewBranchForm's single field). The POST arm is NOT mounted in
- *  src/ui/index.ts yet — the module header's HANDOFF (two-stage). */
+ *  NewBranchForm's single field). The POST arm mounted with the window-2e
+ *  folds (635ce2e — w129 batch-14 sweep: was "NOT mounted in src/ui/index.ts
+ *  yet", the two-stage HANDOFF). */
 function BranchCreateForm(props: { repoLink: string; from: string }) {
   return (
     <form
@@ -726,7 +727,8 @@ function BranchCreateForm(props: { repoLink: string; from: string }) {
  *  modal reduced to an inline no-JS form): hidden `from` + a required `to`
  *  input (left empty like upstream's modal — repo-branch.ts prefills only
  *  `from`), posting upstream's POST `/branches/rename` (web.go:1486 +
- *  RenameBranchForm). The POST arm is NOT mounted — the header's HANDOFF. */
+ *  RenameBranchForm). The POST arm mounted with the window-2e folds
+ *  (635ce2e — w129 batch-14 sweep: was "NOT mounted", the HANDOFF). */
 function BranchRenameForm(props: { repoLink: string; name: string }) {
   return (
     <form
