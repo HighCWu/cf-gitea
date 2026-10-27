@@ -258,6 +258,7 @@ async function ensureFixtures(): Promise<void> {
 
   const BASE_REFS = [
     { ref: "refs/heads/main", tipIndex: MAIN_TIP },
+    { ref: "refs/heads/main-mirror", tipIndex: MAIN_TIP }, // EQUAL tips with main (the empty-PR create pair)
     { ref: "refs/heads/feature/docs", tipIndex: DOCS_TIP },
     { ref: "refs/heads/feature/deep", tipIndex: DEEP_TIP },
     { ref: "refs/tags/v1", tipIndex: MAIN_TIP }, // the tag sits AT main's tip
@@ -585,7 +586,86 @@ describe("w105 cross-branch edges (the empty range, the direction, the fork form
   });
 });
 
-// --- the form re-render + create round trip ------------------------------------------
+// --- the empty-PR create loop (the POST half of the AllowEmptyPr gate) -------------
+// wave-129 completes the compare-parity loop: the create side is tips-blind —
+// upstream's web POST (routers/web/repo/pull.go:1318 CompareAndPullRequestPost)
+// has NO empty-diff gate (the AllowEmptyPr render gate, compare.go:400-402, is
+// the only control) — so the equal-tips ACROSS-REF pair the render admits now
+// creates, and the SAME-ref pair keeps the landed refusal (the headName ===
+// baseName gate, upstream's IsSameRef reduction, services/git/compare.go:41-43).
+
+describe("w105 the empty-PR create loop (the POST half of AllowEmptyPr)", () => {
+  it("creates the across-ref equal-tips PR through the rendered AllowEmptyPr form: 303, rows at the shared tip, the head ref, the has-PR round trip", async () => {
+    // The render half (the 2c240fa-admitted arm): main...main-mirror holds
+    // equal tips with DIFFERING names — acrossRepoPr true, the form survives
+    // the fold beside the and_allow_empty_pr segment.
+    const pairPath = `/${OWNER}/w105priv/compare/main...main-mirror`;
+    const res = await get(pairPath, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("These branches are equal. This PR will be empty.");
+    expect(html).toContain(`action="${pairPath}" method="post"`);
+    // The POST: upstream's create side never asks the tips — the empty PR
+    // creates and 303s onto its detail page (JSONRedirect parity).
+    const mainTip = w105Tips[MAIN_TIP];
+    if (mainTip === undefined) throw new Error("w105 seed: main tip missing");
+    const post = await fetchUi(
+      pairPath,
+      formPost(pairPath, { title: "w105: the empty pr", content: "mirror promotion" }, await cookieFor(OWNER)),
+    );
+    expect(post.status).toBe(303);
+    expect(post.headers.get("location")).toBe(`/${OWNER}/w105priv/pulls/1`);
+    // The rows: zero-diff semantics — headSha IS the base's tip (the shared
+    // commit), mergeBase stays null (the form create carries none; the lazy
+    // mergeability check computes it).
+    const repoRow = (
+      await drizzle(env.DB)
+        .select({ id: repositories.id })
+        .from(repositories)
+        .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w105priv")))
+        .get()
+    )!;
+    const joined = await findPullRequestByIndex(env.DB, repoRow.id, 1);
+    expect(joined).not.toBeNull();
+    expect(joined?.issue.title).toBe("w105: the empty pr");
+    expect(joined?.issue.content).toBe("mirror promotion");
+    expect(joined?.pullRequest).toMatchObject({
+      headBranch: "main-mirror",
+      baseBranch: "main",
+      headSha: mainTip,
+      mergeBase: null,
+    });
+    // The refs/pull/1/head CAS write landed at the shared tip.
+    const refNames = (await env.REPO.getByName(`${OWNER}/w105priv`).listRefs()).refs.map((ref) => ref.name);
+    expect(refNames).toContain("refs/pull/1/head");
+    // The round trip: the same pair arms to the existing-PR segment — the
+    // form is gone (pullArms survives the fold at equal tips; the segment
+    // rides it + the existing row).
+    const after = await get(pairPath, OWNER);
+    expect(after.status).toBe(200);
+    const afterHtml = await after.text();
+    expect(afterHtml).toContain("w105: the empty pr");
+    expect(afterHtml).toContain("#1");
+    expect(afterHtml).toContain(`href="/${OWNER}/w105priv/pulls/1"`);
+    expect(afterHtml).toContain("View Pull Request");
+    expect(afterHtml).not.toContain("pullrequest-form");
+  });
+
+  it("keeps the same-ref refusal: the hand-crafted main...main POST re-renders the 422 message and writes nothing", async () => {
+    // IsSameRef holds (same repository, same resolved ref): the refusal is
+    // the headName === baseName gate's verbatim API-route message, rendered
+    // as the standalone negative message (the form is folded on this pair —
+    // the same-ref control above pins that render half). Upstream's web POST
+    // would create here (tips-blind, no gate at all) — the landed refusal is
+    // the disclosed divergence this arm PINS (the mission's kept arm).
+    const pairPath = `/${OWNER}/w105cmp/compare/main...main`;
+    const before = await prRowCount("w105cmp");
+    const post = await fetchUi(pairPath, formPost(pairPath, { title: "Nope" }, await cookieFor(OWNER)));
+    expect(post.status).toBe(200);
+    expect(await post.text()).toContain("Invalid PullRequest: There are no changes between the head and the base");
+    expect(await prRowCount("w105cmp")).toBe(before);
+  });
+});
 
 describe("w105 form re-render + PR-create round trip (carried values)", () => {
   it("re-renders the empty-title refusal with the submitted values carried and writes nothing", async () => {

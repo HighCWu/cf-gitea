@@ -52,9 +52,13 @@
  *     !IsSameRef → the resolved ref names differing (services/git/
  *     compare.go:41-43 — same repository && BaseRef == HeadRef; compares
  *     are always same-repository here, the fork family 404s at the parser).
- *     The POST keeps the landed equal-tips refusal (routes/pulls.ts:612-614)
- *     where upstream's AllowEmptyPr path would create — disclosed for the
- *     equal-TIPS shape only; the head-behind-base shape creates as upstream.
+ *     The POST completes the loop (the wave-129 compare-parity posture
+ *     flipped): upstream's create side has NO tips gate — the web handler
+ *     (pull.go:1318 CompareAndPullRequestPost) accepts the empty diff
+ *     unconditionally, the AllowEmptyPr render gate (compare.go:400-402) is
+ *     the only control — so the equal-tips ACROSS-REF pair creates; the
+ *     SAME-ref arm keeps the landed refusal (the headName === baseName gate,
+ *     upstream's IsSameRef reduction).
  *   - otherwise `listCommitsRange(base..head)` (oldest first — DISPLAYED
  *     reversed, newest first like upstream's commits_list) and
  *     `readDiff(head, mergeBase)` (id2..id = mergeBase...head — the three-dot
@@ -69,8 +73,10 @@
  * is a writer's artifact, and a non-writer's form would be a broken
  * submission), then the same fail-fast order routes/pulls.ts POST runs:
  * head === base → the 422 message, no common history → no_common_history,
- * equal tips → nothing_to_compare, duplicate open PR → the landed 409 message
- * (findUnmergedPullRequest), empty title → the title-required re-render. The
+ * duplicate open PR → the landed 409 message (findUnmergedPullRequest),
+ * empty title → the title-required re-render. Equal tips refuse NO arm here
+ * (upstream's create side is tips-blind): the across-ref pair creates the
+ * empty PR under AllowEmptyPr, the same-ref pair already refused above. The
  * create rides `IssuesService.createPullRequest` (the same fields the API POST
  * passes: poster = the session viewer, allow_maintainer_edit =
  * DefaultAllowMaintainerEdit, headSha = the head tip), the refs/pull/N/head
@@ -410,7 +416,12 @@ export interface ComparePullWriteInput {
  */
 export async function createPullFromForm(input: ComparePullWriteInput): Promise<ComparePullSubmitResult> {
   const { data, form } = input;
-  // Upstream fail-fast (routes/pulls.ts:612-614 verbatim message).
+  // Upstream fail-fast (routes/pulls.ts:612-614 verbatim message) — the
+  // SAME-ref arm only (IsSameRef, services/git/compare.go:41-43): the
+  // create side is tips-blind (pull.go:1318 has no empty-diff gate), so an
+  // equal-tips ACROSS-REF pair falls through and creates the empty PR under
+  // the page's AllowEmptyPr gate; the ref-folding control is the landed
+  // refusal upstream's IsSameRef arm backs.
   if (data.headName === data.baseName) {
     return { outcome: "invalid", message: "Invalid PullRequest: There are no changes between the head and the base" };
   }
@@ -421,9 +432,6 @@ export async function createPullFromForm(input: ComparePullWriteInput): Promise<
   }
   if (data.mergeBaseOid === null) {
     return { outcome: "invalid", message: compareLocale.no_common_history };
-  }
-  if (data.sameTip) {
-    return { outcome: "invalid", message: compareLocale.nothing_to_compare };
   }
   if (form.title === "") {
     return { outcome: "invalid", message: compareLocale.title_required };

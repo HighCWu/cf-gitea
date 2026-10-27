@@ -19,7 +19,7 @@
 
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
@@ -30,6 +30,14 @@ import { carryRepoCell } from "../../repos/carry";
 import { RepoService } from "../../repos/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "../services/engine";
 import { createApiRouter } from "../router";
+
+// wave-129 full-run contention budget: this file's heaviest closure measured
+// 6.01s of the 30s default IN a green 8-worker full run (the bare head-grammar
+// create walk; the suite's 260-isolate spawn storm spikes closures up to ~12x
+// their solo time). File-local 90s budgets; vitest.config.ts keeps 30s for
+// every other file. Membership: the measured >=4s in-run closure/hook set
+// (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -65,7 +73,7 @@ beforeEach(async () => {
   // PR head refs the create flow lands on `recluse/blocked` so the next
   // per-repo index cannot CAS-conflict (the pulls.test.ts convention).
   // The renamed-fork suite below adds its base cells (append-only).
-  const cleanupCells = ["recluse/blocked", "cf-gitea-stub/renfork", "cf-gitea-stub/renfork2", "cf-gitea-stub/chainchild"];
+  const cleanupCells = ["recluse/blocked", "cf-gitea-stub/emptypr", "cf-gitea-stub/renfork", "cf-gitea-stub/renfork2", "cf-gitea-stub/chainchild"];
   for (const cellName of cleanupCells) {
     const cell = env.REPO.getByName(cellName);
     const { refs } = await cell.listRefs();
@@ -244,6 +252,64 @@ describe("POST /repos/{owner}/{repo}/pulls: the NewPullRequest blocked arm", () 
     });
     expect(res.status).toBe(201);
     expect(await db().select().from(pullRequests).all()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /repos/{owner}/{repo}/pulls: the equal-tips arms (the API gate is the
+// upstream-verbatim STRING equality, routers/api/v1/repo/pull.go:395-399 —
+// raw form fields, checked before parseCompareInfo; the create side is
+// tips-blind, so the create accepts an empty diff exactly when the rendered
+// AllowEmptyPr gate would show the form: acrossRepoPr = !IsSameRef,
+// services/git/compare.go:41-43)
+// ---------------------------------------------------------------------------
+
+describe("POST /repos/{owner}/{repo}/pulls: the equal-tips arms (the string gate, upstream pull.go:395-399)", () => {
+  it("422s the SAME-ref pair with the verbatim message — the gate is string equality (IsSameRef's API arm), tips never consulted", async () => {
+    await seedRepo(1, "cf-gitea-stub", "emptypr");
+    await seedEngineBranches("cf-gitea-stub", "emptypr", []);
+    const res = await router()("/repos/cf-gitea-stub/emptypr/pulls", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "same ref", head: "main", base: "main" }),
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      message: "Invalid PullRequest: There are no changes between the head and the base",
+      url: ERROR_URL,
+    });
+    expect(await db().select().from(pullRequests).all()).toHaveLength(0);
+  });
+
+  it("201s the ACROSS-REF equal-tips pair — two branch names at one commit create the empty PR (pull.go:395 strings differ; the tips-blind create accepts the empty diff under AllowEmptyPr's reduction)", async () => {
+    const repoId = await seedRepo(1, "cf-gitea-stub", "emptypr");
+    // seedEngineBranches lands EVERY named branch at main's tip: main and
+    // main-mirror share one commit — the equal-tips, differing-names shape.
+    const tip = await seedEngineBranches("cf-gitea-stub", "emptypr", ["main-mirror"]);
+    const res = await router()("/repos/cf-gitea-stub/emptypr/pulls", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "the empty pr", head: "main-mirror", base: "main" }),
+    });
+    expect(res.status).toBe(201);
+    const rendered = await res.json<Record<string, unknown>>();
+    expect(rendered.title).toBe("the empty pr");
+    expect(rendered.head).toMatchObject({ label: "main-mirror", ref: "refs/pull/1/head", sha: tip });
+    // The row: zero-diff semantics — headSha IS the base tip, mergeBase
+    // stays null (same-repo creates carry none; the lazy check computes it).
+    const rows = await db().select().from(pullRequests).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      headRepoId: repoId,
+      baseRepoId: repoId,
+      headBranch: "main-mirror",
+      baseBranch: "main",
+      headSha: tip,
+      mergeBase: null,
+    });
+    // The refs/pull/1/head CAS write landed at the shared tip.
+    const refNames = (await env.REPO.getByName("cf-gitea-stub/emptypr").listRefs()).refs.map((ref) => ref.name);
+    expect(refNames).toContain("refs/pull/1/head");
   });
 });
 
