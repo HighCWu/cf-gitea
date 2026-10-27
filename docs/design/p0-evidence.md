@@ -3121,3 +3121,46 @@ agent; gates re-run verbatim at `03f9e82` — openapi + typecheck by
 this agent, the suite numbers from the window's closing gate run;
 live deploy numbers are TODO slots for the orchestrator's post-deploy
 paste.)*
+
+**REDEPLOY20 LIVE RESULTS — paste 1 (2026-10-27, deployment of
+`a486853`, version id `c4e8a373`, URL `https://cf-gitea.hecongw.workers.dev`;
+suites + deploy-prep gates ran in the detached worktree per the plan
+above):**
+
+- **Bug #19 found live and fixed in-flight**: UI HTML carried NO
+  `Cache-Control`, so the workers.dev edge heuristically cached
+  per-viewer pages for minutes — the creating browser saw a stale
+  secrets row list while a fresh cookie saw the truth. Fixed by the
+  zero-option middleware (`max-age=0, private, must-revalidate` on
+  every UI HTML response) inside `a486853` itself; window2-mounts
+  went **22/22 once post-fix**.
+- **Toolkit re-verify (post-fix, cleanup agent, JSON-captured
+  verbatim):** p0 `4/4`; registry `21/21`; generate-e2e
+  `9 pass + 1 info` (the known git-wire note); forkpr-e2e `8/8`;
+  ui-login `5/5`; mirror `8/8`; window2-mounts `12 pass / 9 skip /
+  1 fail` — **deterministic ×3 runs**; cleanup-audit `9 pass / 1
+  fail`.
+- **Bug #20 (NEW, filed from the deterministic window2 failure +
+  the cleanup agent's D1 cross-check): `POST
+  /user/settings/actions/secrets` returns the success-shape 303
+  while NO row lands in `secrets`** (`W2SEC%` count = 0 after three
+  303-confirmed creates; the API PUT path is perfectly consistent;
+  manually-created rows persist). NOT staleness — a write-path or
+  probe-assertion defect; diagnostic agent dispatched with the
+  evidence. The 9 skipped window2 checks are downstream of the
+  failing create.
+- Cleanup audit fail explained: `personal_access_tokens` = 2 (the
+  standing bootstrap + the **live RD20 run PAT, id 44** — minted per
+  the 0600-file rule, deletion deferred only because the in-flight
+  diagnosis agents still use it; delete + re-audit at wrap).
+  `secrets` is otherwise clean of W2* residue (10 battery rows
+  DELETEd via API 204 + one orphan `PROBE_SEC` via D1); two
+  `W2DBG_*` diagnosis rows persist pending the bug agent's cleanup.
+- **Slots re-captured at the WRAP redeploy** (after the bug-#20 fix
+  lands, the same battery set re-runs): worker startup ms, dry-run
+  bundle table, `pnpm smoke --migrate-check` paste, the hand-spot
+  outputs, `wrangler d1 migrations list --remote` paste (note: the
+  content-history wave adds migration `0033` — the wrap deploy will
+  apply it remotely), and the two force-red rehearsals (both ran
+  RED pre-fix at row-visible, as designed; re-run for the honest
+  post-fix verdict).
