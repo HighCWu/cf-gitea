@@ -149,6 +149,12 @@ if (work) {
 }
 const created = opts.work ? 'reused' : 'created';
 console.log(`build-gitea-assets: work dir ${created}: ${work}`);
+if (!opts.work) {
+  // The temp work dir is scratch — never leak it (the RD20 preflight wart):
+  // removed at exit on both the success and the uncaught-error path.
+  const scratch = work;
+  process.on('exit', () => rmSync(scratch, {recursive: true, force: true}));
+}
 
 // Copying web_src fresh on every run keeps the work dir correct even after a
 // submodule re-pin when reusing --work.
