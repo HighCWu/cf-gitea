@@ -16,6 +16,18 @@
  * LIVE routes (`uiRouter.fetch` + a minted session, the repo-editor-tails
  * harness), the delete arms' 303s (the GPG miss idempotent, the subkey
  * cascade), the AddKeyForm Title MaxSize(50) input cap, and the login gate.
+ *
+ * The batch-11 deepening: the key-type sniff's remaining PARSE arms — the
+ * bare-base64 form (no type prefix; the WIRE type names the stored content,
+ * services/ssh-gpg-keys.ts:143-144,193) and the newline strip (upstream
+ * removes all newlines from the OpenSSH form before splitting, :137-138) and
+ * the goSplitN n=3 spaced-comment form (:109-116,139-145) — plus the
+ * fingerprint dedupe's GLOBAL scope (the check carries no owner filter,
+ * user-settings-keys.tsx:284-291, so a second user's identical content is
+ * refused while the per-owner name check admits a shared title) and the GPG
+ * arms' CHECK ORDER (the global key_id 422 fires BEFORE the activated-email
+ * gate, user-settings-keys.tsx:367-374). The mounted route's §2.8 guard arms
+ * close the gate ladder (cross-origin add/delete 403 before any store write).
  */
 
 import { env } from "cloudflare:test";
@@ -561,6 +573,135 @@ describe("the deletes (upstream DeleteKey's type switch)", () => {
     expect(await deleteGpgKey(env.DB, aliceId, primary.id)).toBe("deleted");
     expect(await drizzle(env.DB).select().from(gpgKeys).all()).toHaveLength(0);
     expect(await deleteGpgKey(env.DB, aliceId, primary.id)).toBe("deleted");
+  });
+});
+
+// --- batch 11: the key-type sniff's remaining parse arms ------------------------
+
+describe("the key-type sniff's remaining parse arms (batch 11)", () => {
+  it("a BARE base64 blob (no type prefix) parses and the WIRE type names the stored content", async () => {
+    const owner = (await loadUserSettingsKeysOwner(env.DB, aliceId))!;
+    const bare = sshEd25519Key(3).split(" ")[1]!;
+    const result = await addSshKeyFromForm(env.DB, owner, sshForm({ title: "prefixless", content: bare }));
+    expect(result).toEqual({ outcome: "created", kind: "ssh", label: "prefixless" });
+    const row = (await drizzle(env.DB).select().from(publicKeys).all())[0]!;
+    // goSplitN's single-part branch: declaredType "" and the wire walk names
+    // the key — the stored content carries the reconstructed type prefix.
+    expect(row.content).toBe(`ssh-ed25519 ${bare}`);
+    // The blob is what's hashed: the bare form's fingerprint equals the
+    // prefixed twin's — the GLOBAL dedupe fires on it.
+    const prefixed = await addSshKeyFromForm(env.DB, owner, sshForm({ title: "prefixed", content: sshEd25519Key(3) }));
+    expect(prefixed).toEqual({
+      outcome: "invalid",
+      kind: "ssh",
+      message: userSettingsKeysLocale.ssh_key_been_used,
+      field: "content",
+    });
+  });
+
+  it("newlines inside the OpenSSH form are stripped before the walk (upstream's newline removal)", async () => {
+    const owner = (await loadUserSettingsKeysOwner(env.DB, aliceId))!;
+    const whole = sshEd25519Key(4);
+    const [type, b64, comment] = whole.split(" ") as [string, string, string];
+    const wrapped = `${type} ${b64.slice(0, 10)}\n${b64.slice(10)} ${comment}`;
+    const result = await addSshKeyFromForm(env.DB, owner, sshForm({ title: "wrapped", content: wrapped }));
+    expect(result).toEqual({ outcome: "created", kind: "ssh", label: "wrapped" });
+    const row = (await drizzle(env.DB).select().from(publicKeys).all())[0]!;
+    expect(row.content).toBe(whole); // the stored line never carries the newline
+    expect(row.fingerprint).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/);
+  });
+
+  it("a spaced comment survives whole (goSplitN's n=3 keeps the unsplit remainder)", async () => {
+    const owner = (await loadUserSettingsKeysOwner(env.DB, aliceId))!;
+    const b64 = sshEd25519Key(5).split(" ")[1]!;
+    const result = await addSshKeyFromForm(env.DB, owner, sshForm({ title: "commented", content: `ssh-ed25519 ${b64} alice's laptop, second floor` }));
+    expect(result).toEqual({ outcome: "created", kind: "ssh", label: "commented" });
+    const row = (await drizzle(env.DB).select().from(publicKeys).all())[0]!;
+    expect(row.content).toBe(`ssh-ed25519 ${b64} alice's laptop, second floor`);
+  });
+});
+
+// --- batch 11: the fingerprint dedupe's scope -------------------------------------
+
+describe("the fingerprint dedupe's scope (batch 11)", () => {
+  it("ANOTHER user's identical key content is refused — the fingerprint check carries no owner filter — while the title scope stays per-owner", async () => {
+    const aliceOwner = (await loadUserSettingsKeysOwner(env.DB, aliceId))!;
+    await addSshKeyFromForm(env.DB, aliceOwner, sshForm({ title: "laptop" }));
+    const bobId = await seedUser("bob", "bob@test.local");
+    const bobOwner = (await loadUserSettingsKeysOwner(env.DB, bobId))!;
+
+    // Bob's identical CONTENT: the global fingerprint 422 (not the per-owner
+    // name arm — that check comes later and never runs).
+    const stolen = await addSshKeyFromForm(env.DB, bobOwner, sshForm({ title: "my own name", content: sshEd25519Key(1) }));
+    expect(stolen).toEqual({
+      outcome: "invalid",
+      kind: "ssh",
+      message: userSettingsKeysLocale.ssh_key_been_used,
+      field: "content",
+    });
+
+    // Bob's own FRESH content under alice's existing TITLE: the name check
+    // is per-owner — created.
+    const fresh = await addSshKeyFromForm(env.DB, bobOwner, sshForm({ title: "laptop", content: sshEd25519Key(8) }));
+    expect(fresh).toEqual({ outcome: "created", kind: "ssh", label: "laptop" });
+    const rows = await drizzle(env.DB).select().from(publicKeys).all();
+    expect(rows).toHaveLength(2); // alice's + bob's
+    expect(rows.map((row) => row.ownerId).sort()).toEqual([aliceId, bobId]);
+  });
+});
+
+// --- batch 11: the GPG arms' check order --------------------------------------------
+
+describe("the GPG arms' check order (batch 11)", () => {
+  it("a second user adding the same armor hits the GLOBAL key_id 422 BEFORE the activated-email gate", async () => {
+    const aliceOwner = (await loadUserSettingsKeysOwner(env.DB, aliceId))!;
+    const fixture = await rsaV4Armor({ created: 1_600_000_000, email: "alice@test.local" });
+    await addGpgKeyFromForm(env.DB, aliceOwner, { type: "gpg", title: "none", content: fixture.armor, signature: "" });
+
+    // Bob owns NO activated address matching the key's identity — but the
+    // per-entity loop checks the key id FIRST (user-settings-keys.tsx
+    // :367-374), so the answer is the id 422, never the email gate.
+    const bobId = await seedUser("bob", "bob@test.local");
+    const bobOwner = (await loadUserSettingsKeysOwner(env.DB, bobId))!;
+    const result = await addGpgKeyFromForm(env.DB, bobOwner, { type: "gpg", title: "none", content: fixture.armor, signature: "" });
+    expect(result).toEqual({
+      outcome: "invalid",
+      kind: "gpg",
+      message: userSettingsKeysLocale.gpg_key_id_used,
+      field: "content",
+    });
+    // Bob's store stayed empty (nothing partially written).
+    expect(await drizzle(env.DB).select().from(gpgKeys).where(eq(gpgKeys.ownerId, bobId)).all()).toHaveLength(0);
+  });
+});
+
+describe("the mounted keys routes' §2.8 guard arms (batch 11)", () => {
+  /** A POST with a valid session cookie but a foreign origin. */
+  async function crossOriginPost(path: string, fields: Record<string, string>): Promise<Response> {
+    return uiRouter.fetch(
+      new Request(`https://test.local${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: "https://evil.example",
+          cookie: `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, aliceId)}`,
+        },
+        body: new URLSearchParams(fields).toString(),
+      }),
+      uiEnv,
+    );
+  }
+
+  it("a cross-origin add 403s with a valid cookie and writes nothing; the delete tail 403s before any delete", async () => {
+    const add = await crossOriginPost("/user/settings/keys", { type: "ssh", title: "evil key", content: sshEd25519Key(9), signature: "" });
+    expect(add.status).toBe(403);
+    expect(add.headers.get("content-type")).toContain("text/plain");
+    expect(await add.text()).toContain("cross-origin request rejected");
+    expect(await drizzle(env.DB).select().from(publicKeys).all()).toHaveLength(0);
+
+    const del = await crossOriginPost("/user/settings/keys/delete", { type: "ssh", id: "424242" });
+    expect(del.status).toBe(403);
+    expect(await del.text()).toContain("cross-origin request rejected");
   });
 });
 

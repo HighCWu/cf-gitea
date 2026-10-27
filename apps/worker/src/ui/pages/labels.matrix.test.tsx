@@ -40,7 +40,32 @@
  *   - the claim pins wave14/25 carry at parse level only, answered
  *     route-level here: the /labels/initialize template-loader tail stays
  *     engine-owned on BOTH scopes (404), and the ORG write tails answer GET
- *     with chi's 405 (the repo-side 405s are wave25's).
+ *     with chi's 405 (the repo-side 405s are wave25's);
+ *   - batch-11 deepening (the create/edit forms' remaining validation arms):
+ *     the color shapes the waves leave open — the trimmed-to-empty banner
+ *     ("invalid color: " prints the empty normalization), the hash-prefixed
+ *     3-digit "#F0A" expansion twin, the 4-digit and 7-digit and
+ *     double-hash refusals printing the raw normalized string (Go's %s —
+ *     the implicit '#' is prepended ONLY at length 3/6, so "f0ab" fails
+ *     UNhashed); the "exclusive-name" resolution — upstream NewLabel /
+ *     UpdateLabel carry NO name-dedupe (models/issues/label.go:232-249 are
+ *     plain inserts/updates, the modal's exclusive flag is the documented
+ *     no-JS reduction), so a duplicate create and an edit renamed onto an
+ *     existing name both 303 and the rows coexist — pinned as the
+ *     upstream-faithful NON-refusal;
+ *   - the edit round-trip's SUCCESS arm with the absent-field rule: a
+ *     label seeded with description + exclusive + an archived stamp keeps
+ *     all three through a name/color-only form POST (the PATCH arm's
+ *     untouched-fields rule end-to-end), the edit path runs its own 3→6
+ *     expansion, and the Archived marker re-renders on the row;
+ *   - the org-scoped arms on the repo page: an ORG label's id at the
+ *     repo-scoped edit 404s without touching the org row (the lookup
+ *     filters repo_id), the manage-link ladder's middle arm (a signed-in
+ *     repo WRITER who is not an org owner sees the org rows and their own
+ *     write controls but never the "(manage)" link), the org section
+ *     re-orders under the same silent `?sort=` (the shared sortParam), and
+ *     an org-owned repo whose org carries no labels renders NO section
+ *     (label_list.tmpl's `{{if .OrgLabels}}` guard).
  *
  * The scoped-label color math is NOT pinned anywhere in the landed pages —
  * LabelBadge is RenderLabel's regular-label case (issues-list.tsx; the
@@ -67,6 +92,7 @@ import {
   listRepoLabels,
 } from "../../api/services/labels";
 import { createOrgLabel, findOrgLabelById, listOrgLabels } from "../../api/services/labels-t2";
+import { addOrUpdateCollaborator } from "../../api/services/repo-collaborators";
 import { repositories, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
 import { OrgService } from "../../services/orgs/orgs";
@@ -112,6 +138,12 @@ const crossOriginPost = (fields: Record<string, string>, cookie?: string): Reque
 const ORG_NAME = "labelmxorg";
 const REPO_SLUG = "lx-repo";
 const ARCHIVED_SLUG = "lx-archived";
+// The batch-11 org-section arms' org-owned repo (the .OrgLabels section's
+// consuming repo) plus a second org with NO labels (the section's empty
+// guard arm).
+const ORG_REPO_SLUG = "lx-org-repo";
+const EMPTY_ORG_NAME = "labelmxempty";
+const EMPTY_ORG_REPO_SLUG = "lx-bare-repo";
 
 interface LabelsFixture {
   ownerCookie: string;
@@ -123,6 +155,8 @@ interface LabelsFixture {
   orgId: number;
   orgBlockedLabelId: number;
   orgLightLabelId: number;
+  orgRepoId: string;
+  emptyOrgRepoId: string;
 }
 
 let labelsFixture: LabelsFixture | null = null;
@@ -256,6 +290,54 @@ async function ensureLabelsFixtures(): Promise<LabelsFixture> {
     await db.update(repositories).set({ isArchived: true }).where(eq(repositories.id, row.id));
   }
 
+  // The ORG-OWNED repo (the .OrgLabels section's consumer) with pal as a
+  // WRITE collaborator — the manage-link ladder's middle arm: a repo writer
+  // who is NOT an org owner.
+  const existingOrgRepo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, ORG_NAME), eq(repositories.slug, ORG_REPO_SLUG)))
+    .get();
+  let orgRepoId: string;
+  if (existingOrgRepo === undefined) {
+    orgRepoId = (
+      await service.create({
+        owner: { id: org.id, usernameLower: ORG_NAME },
+        name: ORG_REPO_SLUG,
+        isPrivate: false,
+        status: "ready",
+      })
+    ).id;
+  } else {
+    orgRepoId = existingOrgRepo.id;
+  }
+  await addOrUpdateCollaborator(env.DB, orgRepoId, pal.id, "write", new Date());
+
+  // The label-LESS org with its org-owned repo: the section renders only
+  // when the org carries labels (label_list.tmpl's `{{if .OrgLabels}}`).
+  let emptyOrg = await orgs.getOrgByUsername(EMPTY_ORG_NAME);
+  if (emptyOrg === null) {
+    emptyOrg = await orgs.createOrg({ name: EMPTY_ORG_NAME, ownerId: owner.id, visibility: "public", now: new Date() });
+  }
+  const existingBareRepo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, EMPTY_ORG_NAME), eq(repositories.slug, EMPTY_ORG_REPO_SLUG)))
+    .get();
+  let emptyOrgRepoId: string;
+  if (existingBareRepo === undefined) {
+    emptyOrgRepoId = (
+      await service.create({
+        owner: { id: emptyOrg.id, usernameLower: EMPTY_ORG_NAME },
+        name: EMPTY_ORG_REPO_SLUG,
+        isPrivate: false,
+        status: "ready",
+      })
+    ).id;
+  } else {
+    emptyOrgRepoId = existingBareRepo.id;
+  }
+
   labelsFixture = {
     ownerCookie: await mintSession(env.DB, owner.id),
     adminCookie: await mintSession(env.DB, admin.id),
@@ -266,6 +348,8 @@ async function ensureLabelsFixtures(): Promise<LabelsFixture> {
     orgId: org.id,
     orgBlockedLabelId: orgBlocked.id,
     orgLightLabelId: orgLight.id,
+    orgRepoId,
+    emptyOrgRepoId,
   };
   return labelsFixture;
 }
@@ -609,5 +693,226 @@ describe("the delete arm's deferred org-side shape", () => {
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(`/${ORG_NAME}/labels`);
     expect((await listOrgLabels(env.DB, fixture.orgId, "", 1, 1)).total).toBe(2); // both rows intact
+  });
+});
+
+// --- batch 11: the create/edit forms' remaining color shapes + the name rules -------
+
+describe("the create/edit forms' remaining color shapes + the name rules (batch 11)", () => {
+  it("the empty color answers the trimmed-to-empty banner (the normalizer prints the empty string)", async () => {
+    const fixture = await ensureLabelsFixtures();
+    const before = await listRepoLabels(env.DB, fixture.repoId, "", 1, 50);
+    const res = await fetchUi(
+      `/labelmx/${REPO_SLUG}/labels/new`,
+      withCookie(formPost({ title: "shape-empty", color: "" }), fixture.ownerCookie),
+    );
+    expect(res.status).toBe(200);
+    // "" never reaches the 3/6 prepend branch — the message prints the bare
+    // normalization ("invalid color: " — the trailing space is the message's).
+    expect(await res.text()).toContain("invalid color: </div>");
+    expect((await listRepoLabels(env.DB, fixture.repoId, "", 1, 50)).total).toBe(before.total); // nothing written
+  });
+
+  it("the hash-prefixed 3-digit expands exactly like the bare twin (the form's pattern admits both shapes)", async () => {
+    const fixture = await ensureLabelsFixtures();
+    await purgeRepoLabelNamed(fixture.repoId, "lx-hash3");
+    const res = await fetchUi(
+      `/labelmx/${REPO_SLUG}/labels/new`,
+      withCookie(formPost({ title: "lx-hash3", color: "#F0A" }), fixture.ownerCookie),
+    );
+    expect(res.status).toBe(303);
+    const row = (await listRepoLabels(env.DB, fixture.repoId, "", 1, 50)).items.find(
+      (candidate) => candidate.name === "lx-hash3",
+    );
+    expect(row?.color).toBe("#ff00aa"); // #f0a duplicated per channel — same as the bare "F0A" arm
+  });
+
+  it("the off-length shapes print the RAW normalized string: a 4-digit stays unhashed, the 7-digit and double-hash keep their input", async () => {
+    const fixture = await ensureLabelsFixtures();
+    const before = await listRepoLabels(env.DB, fixture.repoId, "", 1, 50);
+    // 4 chars: NOT length 3/6 → no implicit '#' prepended → the message
+    // prints "f0ab" bare (the hash add happens ONLY on the prepend branch).
+    const four = await fetchUi(
+      `/labelmx/${REPO_SLUG}/labels/new`,
+      withCookie(formPost({ title: "shape-4", color: "f0ab" }), fixture.ownerCookie),
+    );
+    expect(four.status).toBe(200);
+    expect(await four.text()).toContain("invalid color: f0ab");
+
+    // 8 chars with the hash: length 7+ → no prepend either — the input rides
+    // the message verbatim (the form's HTML5 pattern is the client-side arm;
+    // the server answers every shape the POST can carry).
+    const seven = await fetchUi(
+      `/labelmx/${REPO_SLUG}/labels/new`,
+      withCookie(formPost({ title: "shape-7", color: "#aabbccd" }), fixture.ownerCookie),
+    );
+    expect(seven.status).toBe(200);
+    expect(await seven.text()).toContain("invalid color: #aabbccd");
+
+    const doubleHash = await fetchUi(
+      `/labelmx/${REPO_SLUG}/labels/new`,
+      withCookie(formPost({ title: "shape-dh", color: "##00aabb" }), fixture.ownerCookie),
+    );
+    expect(doubleHash.status).toBe(200);
+    expect(await doubleHash.text()).toContain("invalid color: ##00aabb");
+    // All three refusals wrote nothing.
+    expect((await listRepoLabels(env.DB, fixture.repoId, "", 1, 50)).total).toBe(before.total);
+  });
+
+  it("the name rules have NO exclusive arm: a duplicate create and an edit renamed onto an existing name both succeed (upstream NewLabel/UpdateLabel are plain writes)", async () => {
+    const fixture = await ensureLabelsFixtures();
+    const namedLxBug = async (): Promise<number> =>
+      (await listRepoLabels(env.DB, fixture.repoId, "", 1, 50)).items.filter(
+        (candidate) => candidate.name === "lx-bug",
+      ).length;
+    const before = await namedLxBug();
+
+    // The create: "lx-bug" already exists — upstream NewLabel
+    // (models/issues/label.go:232-241) is a plain insert with no name
+    // lookup, so the duplicate 303s and the rows coexist.
+    const dup = await fetchUi(
+      `/labelmx/${REPO_SLUG}/labels/new`,
+      withCookie(formPost({ title: "lx-bug", color: "#00aabb" }), fixture.ownerCookie),
+    );
+    expect(dup.status).toBe(303);
+    expect(await namedLxBug()).toBe(before + 1);
+    // The no-JS form never sends the modal's exclusive/is_archived fields —
+    // the duplicate row carries the two-field form's defaults verbatim.
+    const rows = (await listRepoLabels(env.DB, fixture.repoId, "", 1, 50)).items.filter(
+      (candidate) => candidate.name === "lx-bug",
+    );
+    const created = rows[rows.length - 1]!; // name ASC, id ASC — the new row sorts last
+    expect(created.exclusive).toBe(false);
+    expect(created.archivedAt).toBeNull();
+    expect(created.color).toBe("#00aabb");
+
+    // The edit renamed onto the sibling's name: UpdateLabel
+    // (models/issues/label.go:262-270) writes the posted columns only —
+    // no uniqueness arm exists to refuse it.
+    const renamed = await fetchUi(
+      `/labelmx/${REPO_SLUG}/labels/edit`,
+      withCookie(
+        formPost({ id: String(fixture.lightLabelId), title: "lx-bug", color: "#00aabb" }),
+        fixture.ownerCookie,
+      ),
+    );
+    expect(renamed.status).toBe(303);
+    expect(await namedLxBug()).toBe(before + 2); // the light row joined the name
+  });
+});
+
+// --- batch 11: the edit round-trip's success arm (the absent-field rule) -------------
+
+describe("the edit round-trip's success arm keeps the unposted fields (batch 11)", () => {
+  it("a name/color-only POST preserves description, exclusive and the archived stamp; the edit path runs its own 3→6 expansion and the Archived marker re-renders", async () => {
+    const fixture = await ensureLabelsFixtures();
+    // Seed the rich row directly through the landed service (the no-JS
+    // form cannot produce exclusive/archived rows on its own).
+    await createRepoLabel(env.DB, fixture.repoId, {
+      name: "lx-rich",
+      exclusive: true,
+      color: "#bb00cc",
+      description: "rich description",
+      isArchived: true,
+      now: new Date(),
+    });
+    const seeded = (await listRepoLabels(env.DB, fixture.repoId, "", 1, 50)).items.find(
+      (candidate) => candidate.name === "lx-rich",
+    );
+    if (seeded === undefined) throw new Error("lx-rich seed row missing");
+
+    const res = await fetchUi(
+      `/labelmx/${REPO_SLUG}/labels/edit`,
+      withCookie(
+        formPost({ id: String(seeded.id), title: "lx-rich-renamed", color: "#f0a" }),
+        fixture.ownerCookie,
+      ),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/labelmx/${REPO_SLUG}/labels`);
+
+    const row = await findRepoLabelById(env.DB, fixture.repoId, seeded.id);
+    expect(row?.name).toBe("lx-rich-renamed");
+    expect(row?.color).toBe("#ff00aa"); // the edit path normalizes too (normalizeLabelColor in editRepoLabelFromForm)
+    expect(row?.description).toBe("rich description"); // the absent-field rule
+    expect(row?.exclusive).toBe(true);
+    expect(row?.archivedAt).not.toBeNull();
+
+    // The re-rendered list carries the Archived marker on the edited row
+    // (label_archived.tmpl's `archivedAt !== null` arm survives the edit).
+    const list = await fetchUi(`/labelmx/${REPO_SLUG}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    const listHtml = await list.text();
+    expect(listHtml).toContain(">Archived</span>"); // the marker's exact element, not the tooltip's prose
+    expect(listHtml).toContain("rich description");
+  });
+});
+
+// --- batch 11: the org-scoped arms on the repo page -----------------------------------
+
+describe("the org-scoped arms on the repo page (batch 11)", () => {
+  it("an ORG label's id at the repo-scoped edit 404s and the org row survives (the lookup filters repo_id)", async () => {
+    const fixture = await ensureLabelsFixtures();
+    const res = await fetchUi(
+      `/labelmx/${REPO_SLUG}/labels/edit`,
+      withCookie(
+        formPost({ id: String(fixture.orgBlockedLabelId), title: "cross hijack", color: "#121212" }),
+        fixture.ownerCookie,
+      ),
+    );
+    expect(res.status).toBe(404);
+    const row = await findOrgLabelById(env.DB, fixture.orgId, fixture.orgBlockedLabelId);
+    expect(row?.name).toBe("lx-org-blocked"); // the org-scoped row untouched
+    expect(row?.color).toBe("#d73a4a");
+  });
+
+  it("the manage-link ladder's middle arm: a signed-in repo WRITER who is not an org owner sees the org rows and their own write controls, never the (manage) link", async () => {
+    const fixture = await ensureLabelsFixtures();
+    const res = await fetchUi(`/${ORG_NAME}/${ORG_REPO_SLUG}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.palCookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content repository labels"');
+    // The org section renders with its rows (the org carries labels)…
+    expect(html).toContain("Organization-level labels");
+    expect(html).toContain("lx-org-blocked");
+    expect(html).toContain("lx-org-light");
+    // …but pal is no org owner: the (manage) link never renders.
+    expect(html).not.toContain(`href="/${ORG_NAME}/labels"`);
+    // As a repo WRITER pal gets the repo-side controls (the create form)…
+    expect(html).toContain(`action="/${ORG_NAME}/${ORG_REPO_SLUG}/labels/new"`);
+    // …while the ORG rows never carry them (OrgLabelRowLine's bare cell) —
+    // the only /labels/edit actions on the page belong to repo rows, and
+    // this repo has none, so none render.
+    expect(html).not.toContain(`action="/${ORG_NAME}/${ORG_REPO_SLUG}/labels/edit"`);
+    expect(html).not.toContain(`action="/${ORG_NAME}/${ORG_REPO_SLUG}/labels/delete"`);
+  });
+
+  it("the org section re-orders under the same silent ?sort= (the shared sortParam reads both lists)", async () => {
+    await ensureLabelsFixtures();
+    const reversed = await fetchUi(`/${ORG_NAME}/${ORG_REPO_SLUG}/labels?sort=reversealphabetically`);
+    expect(reversed.status).toBe(200);
+    const html = await reversed.text();
+    // "lx-org-light" > "lx-org-blocked" alphabetically, so the reversed
+    // order shows the light row first; the default order shows blocked first.
+    expect(html.indexOf("lx-org-light")).toBeLessThan(html.indexOf("lx-org-blocked"));
+
+    const plain = await fetchUi(`/${ORG_NAME}/${ORG_REPO_SLUG}/labels`);
+    const plainHtml = await plain.text();
+    expect(plainHtml.indexOf("lx-org-blocked")).toBeLessThan(plainHtml.indexOf("lx-org-light"));
+  });
+
+  it("an org-owned repo whose org carries no labels renders NO org section (label_list.tmpl's {{if .OrgLabels}} guard)", async () => {
+    const fixture = await ensureLabelsFixtures();
+    const res = await fetchUi(`/labelmxempty/${EMPTY_ORG_REPO_SLUG}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content repository labels"');
+    expect(html).not.toContain("Organization-level labels");
+    expect(html).toContain("No labels yet."); // the bare empty arm — no intro row either
   });
 });

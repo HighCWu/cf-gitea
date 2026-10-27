@@ -12,6 +12,14 @@
  * — the keep-name fallback, the empty-form re-render, the duplicate-name
  * UNIQUE 500 and the findActionsVariable 404 shell, upstream's
  * NotFound(nil)/JSONErrorAuto fidelity).
+ *
+ * The batch-11 deepening — the CRUD gate ladder's remaining arms: the §2.8
+ * sameOriginGuard FRONTS all three POSTs (userSettingsTabPrologue's
+ * withOriginGuard=true — a valid session cookie still 403s and nothing is
+ * written; index.ts:5550-5553), the anonymous POSTs 303 onto the login
+ * round-trip on every tail (the prologue's anonymous arm — the GET twin was
+ * the only anonymous arm before), and the GET carries NO origin guard
+ * (withOriginGuard=false on the page arm — a cross-origin GET renders 200).
  */
 
 import { env } from "cloudflare:test";
@@ -480,6 +488,100 @@ describe("applyUserSettingsVariableUpdate — the deferred exact-boundary arm", 
       await applyUserSettingsVariableUpdate(env.DB, 1, row.id, { name: "BOUNDARY_EDIT", data: "v".repeat(65_536), description: "" }),
     ).toEqual({ outcome: "saved" });
     expect((await listVariableRows(env.DB, ownerScope(1), 1, 10)).rows[0]!.data).toHaveLength(65_536);
+  });
+});
+
+// --- batch 11: the CRUD gate ladder's remaining arms --------------------------------
+
+describe("the CRUD gate ladder's §2.8 + anonymous POST arms (batch 11)", () => {
+  /** A POST with a foreign origin (the guard's 403 arm). */
+  async function crossOriginPost(path: string, fields: Record<string, string>): Promise<Response> {
+    return uiRouter.fetch(
+      new Request(`${ORIGIN}${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: "https://evil.example",
+          cookie: `${SESSION_COOKIE_NAME}=${await mintDoerCookie()}`,
+        },
+        body: new URLSearchParams(fields).toString(),
+      }),
+      variablesUiEnv,
+    );
+  }
+
+  /** A cookie-less same-origin POST (the prologue's anonymous arm). */
+  async function anonymousPost(path: string, fields: Record<string, string>): Promise<Response> {
+    return uiRouter.fetch(
+      new Request(`${ORIGIN}${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: ORIGIN,
+        },
+        body: new URLSearchParams(fields).toString(),
+      }),
+      variablesUiEnv,
+    );
+  }
+
+  it("a cross-origin POST 403s with a VALID session cookie on all three tails — nothing written", async () => {
+    await seedVariable("SURVIVOR", "kept-value");
+    const row = (await listVariableRows(env.DB, ownerScope(1), 1, 10)).rows[0]!;
+
+    const create = await crossOriginPost("/user/settings/actions/variables/new", { name: "EVIL_VAR", data: "v", description: "" });
+    expect(create.status).toBe(403);
+    expect(create.headers.get("content-type")).toContain("text/plain");
+    expect(await create.text()).toContain("cross-origin request rejected");
+
+    const edit = await crossOriginPost(`/user/settings/actions/variables/${row.id}/edit`, { name: "EVIL_RENAME", data: "v", description: "" });
+    expect(edit.status).toBe(403);
+    expect(await edit.text()).toContain("cross-origin request rejected");
+
+    const del = await crossOriginPost(`/user/settings/actions/variables/${row.id}/delete`, {});
+    expect(del.status).toBe(403);
+    expect(await del.text()).toContain("cross-origin request rejected");
+
+    const rows = (await listVariableRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows).toHaveLength(1); // the seeded row survives all three
+    expect(rows[0]!.name).toBe("SURVIVOR");
+    expect(rows[0]!.data).toBe("kept-value");
+  });
+
+  it("the ANONYMOUS POSTs 303 onto the login round-trip on all three tails (the GET twin was the only anonymous arm)", async () => {
+    await seedVariable("SAFE", "v");
+    const row = (await listVariableRows(env.DB, ownerScope(1), 1, 10)).rows[0]!;
+
+    const create = await anonymousPost("/user/settings/actions/variables/new", { name: "ANON_VAR", data: "v", description: "" });
+    expect(create.status).toBe(303);
+    expect(create.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/user/settings/actions/variables/new")}`,
+    );
+
+    const edit = await anonymousPost(`/user/settings/actions/variables/${row.id}/edit`, { name: "ANON_RENAME", data: "v", description: "" });
+    expect(edit.status).toBe(303);
+    expect(edit.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent(`/user/settings/actions/variables/${row.id}/edit`)}`,
+    );
+
+    const del = await anonymousPost(`/user/settings/actions/variables/${row.id}/delete`, {});
+    expect(del.status).toBe(303);
+    expect(del.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent(`/user/settings/actions/variables/${row.id}/delete`)}`,
+    );
+
+    expect((await listVariableRows(env.DB, ownerScope(1), 1, 10)).rows[0]!.name).toBe("SAFE"); // nothing written
+  });
+
+  it("a cross-origin GET is ADMITTED — the page arm runs the prologue with withOriginGuard=false (the guard is POST-only)", async () => {
+    const res = await uiRouter.fetch(
+      new Request(`${ORIGIN}/user/settings/actions/variables`, {
+        headers: { origin: "https://evil.example", cookie: `${SESSION_COOKIE_NAME}=${await mintDoerCookie()}` },
+      }),
+      variablesUiEnv,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(userSettingsVariablesLocale.variables_management);
   });
 });
 

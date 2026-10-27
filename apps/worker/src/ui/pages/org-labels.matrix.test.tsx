@@ -48,12 +48,27 @@
  *     documented degradation), the row untouched in D1;
  *   - the cookie-less cross-origin POST edit/delete 403s (the guard
  *     fronts requireOrgOwnership's anonymous login 303 — pinned only on
- *     /new), with the row surviving both.
+ *     /new), with the row surviving both;
+ *   - batch-11 deepening — the visibility ladder COLLAPSES into the
+ *     ownership gate (resolveOrgTeamsOrg carries no separate visibility
+ *     arm, org-teams.tsx:162-167: an owner is a member and every non-owner
+ *     404s regardless): a PRIVATE org's labels page answers the owner 200,
+ *     the org's plain member 404, the site admin 200, and the anonymous
+ *     viewer the login 303 (no visibility leak ahead of the session arm);
+ *   - batch-11 deepening — the repo-consumption arms: a REPO label's id at
+ *     the org-scoped edit 404s (findOrgLabelById filters org_id — the
+ *     mirror of the repo page's org-id 404) while the idempotent delete
+ *     still 303s without touching the repo row; and deleting an org label
+ *     drops it from the CONSUMING repo's .OrgLabels section (the org-owned
+ *     repo's page re-renders without the row — the landed consumption
+ *     surface for org labels).
  *
  * Rerun posture: the fixtures are D1-only rows (the org labels pages never
  * read the engine), every create target is pre-purged through the landed
  * service arms before its POST, and no test deletes a seeded row — reruns
- * converge.
+ * converge. (The consumption arm's ol-consumed row and the cross-scope
+ * mirror's shadow-repo label are find-or-created per run; the consumption
+ * delete removes only its own target.)
  */
 
 import { env } from "cloudflare:test";
@@ -70,7 +85,7 @@ import {
   findOrgLabelByName,
   listOrgLabels,
 } from "../../api/services/labels-t2";
-import { deleteRepoLabel, listRepoLabels } from "../../api/services/labels";
+import { createRepoLabel, deleteRepoLabel, findRepoLabelById, listRepoLabels } from "../../api/services/labels";
 import { RepoService } from "../../repos/service";
 import { OrgService } from "../../services/orgs/orgs";
 import { uiRouter } from "../index";
@@ -115,6 +130,11 @@ const crossOriginPost = (fields: Record<string, string>, cookie?: string): Reque
 
 const ORG_NAME = "olblorg";
 const SHADOW_REPO_SLUG = "labels"; // the second-segment claim's live victim
+// The batch-11 arms: the PRIVATE org (the visibility-ladder collapse), the
+// org-owned repo (the .OrgLabels consumption surface), and the private
+// org's name.
+const PRIVATE_ORG_NAME = "olblsecret";
+const ORG_REPO_SLUG = "ol-org-repo";
 
 interface OrgLabelsFixture {
   ownerCookie: string;
@@ -123,6 +143,8 @@ interface OrgLabelsFixture {
   orgId: number;
   shadowRepoId: string;
   lightLabelId: number;
+  privateOrgId: number;
+  orgRepoId: string;
 }
 
 let orgLabelsFixture: OrgLabelsFixture | null = null;
@@ -197,6 +219,35 @@ async function ensureOrgLabelsFixtures(): Promise<OrgLabelsFixture> {
     shadowRepoId = existingShadow.id;
   }
 
+  // The batch-11 fixtures: the PRIVATE org (same owner, olblmember inside
+  // it — the visibility ladder proves a private org's MEMBER still 404s),
+  // and the org-OWNED repo (the .OrgLabels section's consumer).
+  let privateOrg = await orgs.getOrgByUsername(PRIVATE_ORG_NAME);
+  if (privateOrg === null) {
+    privateOrg = await orgs.createOrg({ name: PRIVATE_ORG_NAME, ownerId: owner.id, visibility: "private", now: new Date() });
+    await orgs.addMember(privateOrg.id, member.id, { now: new Date() });
+  }
+  privateOrg = (await orgs.getOrgByUsername(PRIVATE_ORG_NAME))!;
+
+  const existingOrgRepo = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, ORG_NAME), eq(repositories.slug, ORG_REPO_SLUG)))
+    .get();
+  let orgRepoId: string;
+  if (existingOrgRepo === undefined) {
+    orgRepoId = (
+      await service.create({
+        owner: { id: org.id, usernameLower: ORG_NAME },
+        name: ORG_REPO_SLUG,
+        isPrivate: false,
+        status: "ready",
+      })
+    ).id;
+  } else {
+    orgRepoId = existingOrgRepo.id;
+  }
+
   orgLabelsFixture = {
     ownerCookie: await mintSession(env.DB, owner.id),
     adminCookie: await mintSession(env.DB, admin.id),
@@ -204,6 +255,8 @@ async function ensureOrgLabelsFixtures(): Promise<OrgLabelsFixture> {
     orgId: org.id,
     shadowRepoId,
     lightLabelId: light.id,
+    privateOrgId: privateOrg.id,
+    orgRepoId,
   };
   return orgLabelsFixture;
 }
@@ -410,5 +463,134 @@ describe("cookie-less cross-origin POST edit/delete 403 before the anonymous 303
     const row = await findOrgLabelById(env.DB, fixture.orgId, fixture.lightLabelId);
     expect(row?.name).toBe("ol-light"); // neither evil arm touched the row
     expect(row?.color).toBe("#84b6eb");
+  });
+});
+
+// --- batch 11: the visibility ladder collapses into the ownership gate ---------------
+
+describe("the visibility ladder collapses into the ownership gate (batch 11 — a PRIVATE org)", () => {
+  it("the owner and the site admin still get the management page; the org's plain MEMBER and every other signed-in viewer 404; visibility never relaxes the gate", async () => {
+    const fixture = await ensureOrgLabelsFixtures();
+
+    // The owner: a private org's owner manages its labels exactly like a
+    // public org's (the resolveOrgTeamsOrg note — ownership implies every
+    // visibility answer).
+    const ownerRes = await fetchUi(`/${PRIVATE_ORG_NAME}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(ownerRes.status).toBe(200);
+    const ownerHtml = await ownerRes.text();
+    expect(ownerHtml).toContain('class="page-content organization settings labels"');
+    expect(ownerHtml).toContain(`action="/${PRIVATE_ORG_NAME}/labels/new" method="post"`);
+
+    // The site admin passes requireOrgOwnership on the private org too.
+    const adminRes = await fetchUi(`/${PRIVATE_ORG_NAME}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.adminCookie}` },
+    });
+    expect(adminRes.status).toBe(200);
+    expect(await adminRes.text()).toContain('class="page-content organization settings labels"');
+
+    // The private org's own MEMBER: not the owner — the 404 shell, exactly
+    // the public org's member arm (visibility grants no management).
+    const memberRes = await fetchUi(`/${PRIVATE_ORG_NAME}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.memberCookie}` },
+    });
+    expect(memberRes.status).toBe(404);
+    expect(await memberRes.text()).not.toContain("organization settings labels");
+  });
+
+  it("the anonymous viewer of a PRIVATE org 303s onto the login round-trip (no visibility leak ahead of the session arm)", async () => {
+    await ensureOrgLabelsFixtures();
+    const res = await fetchUi(`/${PRIVATE_ORG_NAME}/labels`);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent(`/${PRIVATE_ORG_NAME}/labels`)}`,
+    );
+  });
+});
+
+// --- batch 11: the repo-consumption arms ----------------------------------------------
+
+describe("the repo-consumption arms (batch 11 — the .OrgLabels section is the landed consumer)", () => {
+  it("a REPO label's id at the org-scoped edit 404s (findOrgLabelById filters org_id); the idempotent delete 303s and the repo row survives", async () => {
+    const fixture = await ensureOrgLabelsFixtures();
+    // Find-or-create the shadow repo's own label (rerun convergence).
+    let repoLabel = (await listRepoLabels(env.DB, fixture.shadowRepoId, "", 1, 50)).items.find(
+      (candidate) => candidate.name === "ol-shadow-label",
+    );
+    if (repoLabel === undefined) {
+      repoLabel = await createRepoLabel(env.DB, fixture.shadowRepoId, {
+        name: "ol-shadow-label",
+        exclusive: false,
+        color: "#5319e7",
+        description: "",
+        isArchived: false,
+        now: new Date(),
+      });
+    }
+
+    const edit = await fetchUi(
+      `/${ORG_NAME}/labels/edit`,
+      withCookie(
+        formPost({ id: String(repoLabel.id), title: "org hijack", color: "#121212" }),
+        fixture.ownerCookie,
+      ),
+    );
+    expect(edit.status).toBe(404);
+
+    // The delete's zero-row success is idempotent — but the REPO-scoped row
+    // it fails to match survives untouched.
+    const del = await fetchUi(
+      `/${ORG_NAME}/labels/delete`,
+      withCookie(formPost({ id: String(repoLabel.id) }), fixture.ownerCookie),
+    );
+    expect(del.status).toBe(303);
+    const surviving = await findRepoLabelById(env.DB, fixture.shadowRepoId, repoLabel.id);
+    expect(surviving?.name).toBe("ol-shadow-label");
+    expect(surviving?.color).toBe("#5319e7");
+  });
+
+  it("deleting an org label drops it from the CONSUMING repo's org section (the org-owned repo's page re-renders without the row)", async () => {
+    const fixture = await ensureOrgLabelsFixtures();
+    // Find-or-create the consumed label (the delete below removes it — the
+    // guard makes reruns converge).
+    let consumed = await findOrgLabelByName(env.DB, fixture.orgId, "ol-consumed");
+    if (consumed === null) {
+      consumed = await createOrgLabel(env.DB, fixture.orgId, {
+        name: "ol-consumed",
+        exclusive: false,
+        color: "#00aabb",
+        description: "consumed by the org repo",
+      });
+    }
+
+    // The org-owned repo's labels page carries the org section WITH the row.
+    const before = await fetchUi(`/${ORG_NAME}/${ORG_REPO_SLUG}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(before.status).toBe(200);
+    const beforeHtml = await before.text();
+    expect(beforeHtml).toContain("Organization-level labels");
+    expect(beforeHtml).toContain("ol-consumed");
+
+    // The org page's delete removes the org-scoped row…
+    const del = await fetchUi(
+      `/${ORG_NAME}/labels/delete`,
+      withCookie(formPost({ id: String(consumed.id) }), fixture.ownerCookie),
+    );
+    expect(del.status).toBe(303);
+    expect(del.headers.get("location")).toBe(`/${ORG_NAME}/labels`);
+    expect(await findOrgLabelById(env.DB, fixture.orgId, consumed.id)).toBeNull();
+
+    // …and the consuming repo's section re-renders WITHOUT it (ol-light —
+    // the other org label — still renders, proving it is the row not the
+    // section that followed the delete).
+    const after = await fetchUi(`/${ORG_NAME}/${ORG_REPO_SLUG}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    const afterHtml = await after.text();
+    expect(afterHtml).toContain("Organization-level labels");
+    expect(afterHtml).toContain("ol-light");
+    expect(afterHtml).not.toContain("ol-consumed");
   });
 });

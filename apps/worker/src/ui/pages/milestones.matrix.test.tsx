@@ -55,7 +55,26 @@
  *   - the claim pins: upstream's POST /milestones/{id}/delete (web.go:1430)
  *     and the bare-list POST stay engine-owned — unclaimed shapes answer the
  *     parent's 404 and the delete tail writes NOTHING (the milestone row
- *     survives in D1).
+ *     survives in D1);
+ *   - batch-11 deepening — the deadline parse shapes the waves leave open
+ *     (parseMilestoneDeadline's full formatAttempts family, api/services/
+ *     milestones.ts:42-62): the space-separated "yyyy-mm-dd HH:MM:SS" shape
+ *     and both RFC3339 zone forms (Z and ±HH:MM) all land END-OF-DAY UTC of
+ *     the DATE prefix (ApplyAPIDeadlineTimestamp), the zoneless RFC3339 and
+ *     the slash shape reject with the upstream message, the sub-2-day
+ *     deadlines CLEAR to null (upstream's "tolerate timezone difference"
+ *     arm — 1970-01-02 drops, 1970-01-03 lands), the whitespace-padded
+ *     value trims onto the date shape (parseMilestoneForm's trim), and the
+ *     EDIT path shares the same parser (the offset form through
+ *     /milestones/{id}/edit);
+ *   - batch-11 deepening — the closed-state toggles' downstream rendering:
+ *     a CLOSED milestone with a deadline renders the Closed stamp and never
+ *     the due-date line or the overdue red (the row component's isClosed
+ *     branch precedes the deadline arm; the overdue flag's !isClosed
+ *     guard), reopening (updateMilestone state open — closedDateAt nulled,
+ *     services/issues/service.ts) restores the red due-date line and drops
+ *     the stamp, and a closed row with a cleared closed_date_unix renders
+ *     the BARE Closed stamp (the closedDateAt !== null guard).
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
@@ -660,6 +679,161 @@ describe("the archived twins (the route-level arms beyond wave6's POST refusal)"
     expect(html).toContain("The description.");
     expect(html).not.toContain(`/alice/archrepo/milestones/${m.id}/edit`);
     expect(html).not.toContain(`/issues/new?milestone=${m.id}`);
+  });
+});
+
+// --- batch 11: the deadline parse shapes (the formatAttempts family) -----------------
+
+describe("the deadline parse shapes beyond the padded date (batch 11)", () => {
+  it("the space-separated datetime and the RFC3339-Z shape land END-OF-DAY UTC of the date prefix (ApplyAPIDeadlineTimestamp)", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "deadlines");
+    const cookie = await sessionHeader(alice.id);
+    const post = (title: string, deadline: string): Promise<Response> =>
+      fetchUi("/alice/deadlines/milestones/new", formPost("/alice/deadlines/milestones/new", { title, deadline }, cookie));
+
+    // The dateTime shape ("yyyy-mm-dd HH:MM:SS" — upstream's second format
+    // attempt): the time-of-day is DISCARDED, the date ends the day.
+    expect((await post("dt-space", "2031-02-03 10:20:30")).status).toBe(303);
+    // The RFC3339 shape with the Z zone (upstream's third attempt).
+    expect((await post("dt-z", "2031-02-04T05:06:07Z")).status).toBe(303);
+    // A whitespace-PADDED value trims onto the date shape first
+    // (parseMilestoneForm's trim — the <input type="date"> twin).
+    expect((await post("dt-padded", " 2031-03-09 ")).status).toBe(303);
+
+    const rows = await drizzle(env.DB).select().from(milestones).where(eq(milestones.repoId, repo.id)).all();
+    const byName = new Map(rows.map((row) => [row.name, row.deadlineAt?.toISOString()]));
+    expect(byName.get("dt-space")).toBe("2031-02-03T23:59:59.000Z");
+    expect(byName.get("dt-z")).toBe("2031-02-04T23:59:59.000Z");
+    expect(byName.get("dt-padded")).toBe("2031-03-09T23:59:59.000Z");
+  });
+
+  it("the zoneless RFC3339 shape and the slash shape reject with the upstream message, nothing stored", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "deadlines");
+    const cookie = await sessionHeader(alice.id);
+
+    // RFC3339 REQUIRES a zone (Z or ±HH:MM) — the zoneless form matches no
+    // format attempt (upstream time.Parse(RFC3339) fails the same way).
+    const zoneless = await fetchUi(
+      "/alice/deadlines/milestones/new",
+      formPost("/alice/deadlines/milestones/new", { title: "no-zone", deadline: "2031-02-06T05:06:07" }, cookie),
+    );
+    expect(zoneless.status).toBe(200);
+    expect(await zoneless.text()).toContain("Due date format must be &#39;yyyy-mm-dd&#39;.");
+
+    // The slash shape matches no attempt either (the prefix regex never
+    // captures — the failure precedes any Date construction).
+    const slashed = await fetchUi(
+      "/alice/deadlines/milestones/new",
+      formPost("/alice/deadlines/milestones/new", { title: "slashed", deadline: "2031/02/06" }, cookie),
+    );
+    expect(slashed.status).toBe(200);
+    expect(await slashed.text()).toContain("Due date format must be &#39;yyyy-mm-dd&#39;.");
+
+    expect(await drizzle(env.DB).select().from(milestones).where(eq(milestones.repoId, repo.id)).all()).toHaveLength(0);
+  });
+
+  it("the sub-2-day deadlines CLEAR to null (ApplyAPIDeadlineTimestamp's tolerate-timezone arm), day 3 lands", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "deadlines");
+    const cookie = await sessionHeader(alice.id);
+    const post = (title: string, deadline: string): Promise<Response> =>
+      fetchUi("/alice/deadlines/milestones/new", formPost("/alice/deadlines/milestones/new", { title, deadline }, cookie));
+
+    // 1970-01-02 end-of-day = unix 172799 < 172800 — upstream clears the
+    // value ("tolerate timezone difference between server and client"),
+    // answering a null deadline, NOT the invalid-format refusal.
+    expect((await post("epoch-day-2", "1970-01-02")).status).toBe(303);
+    // 1970-01-03 end-of-day = unix 259199 ≥ 172800 — kept verbatim.
+    expect((await post("epoch-day-3", "1970-01-03")).status).toBe(303);
+
+    const rows = await drizzle(env.DB).select().from(milestones).where(eq(milestones.repoId, repo.id)).all();
+    const byName = new Map(rows.map((row) => [row.name, row.deadlineAt?.toISOString() ?? null]));
+    expect(byName.get("epoch-day-2")).toBeNull();
+    expect(byName.get("epoch-day-3")).toBe("1970-01-03T23:59:59.000Z");
+  });
+
+  it("the EDIT path shares the parser: an RFC3339 offset value lands end-of-day UTC of the date prefix", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "deadlines");
+    const svc = new IssuesService(env.DB);
+    const m = await seedMilestone(svc, repo.id, "offset edit", 10);
+    const cookie = await sessionHeader(alice.id);
+    const editPath = `/alice/deadlines/milestones/${m.id}/edit`;
+
+    const res = await fetchUi(editPath, formPost(editPath, { title: "offset edit", deadline: "2031-02-05T05:06:07+05:00" }, cookie));
+    expect(res.status).toBe(303);
+    // The +05:00 zone never shifts the stored day: end-of-day UTC of the
+    // DATE prefix (the same ApplyAPIDeadlineTimestamp arm the create runs).
+    const row = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get();
+    expect(row?.deadlineAt?.toISOString()).toBe("2031-02-05T23:59:59.000Z");
+  });
+});
+
+// --- batch 11: the closed-state toggles' downstream rendering -------------------------
+
+describe("the closed-state toggles' downstream rendering (batch 11)", () => {
+  /** alice + one repo + one milestone with a fixed PAST deadline. */
+  async function seedDatedRepo(name: string): Promise<{ aliceId: number; mId: number; svc: IssuesService }> {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, name);
+    const svc = new IssuesService(env.DB);
+    const m = await seedMilestone(svc, repo.id, "dated m", 10, { deadlineAt: new Date("2020-01-01T23:59:59Z") });
+    return { aliceId: alice.id, mId: m.id, svc };
+  }
+
+  it("a CLOSED milestone with a deadline renders the Closed stamp — never the due-date line or the overdue red", async () => {
+    const { mId, svc } = await seedDatedRepo("closedstates");
+    await svc.updateMilestone(mId, { state: "closed", now: at(20) });
+
+    // The open tab drops the closed row entirely.
+    const open = await (await fetchUi("/alice/closedstates/milestones")).text();
+    expect(open).not.toContain(">dated m</a>");
+
+    // The closed tab renders the closed stamp; the isClosed branch PRECEDES
+    // the deadline arm, so "Jan 1, 2020" (formatDueDate of the stored
+    // deadline) and the overdue red never render.
+    const closed = await (await fetchUi("/alice/closedstates/milestones?state=closed")).text();
+    expect(closed).toContain(">dated m</a>");
+    // The stamp is the clock glyph DIRECTLY followed by "Closed" (the row's
+    // issue-count div renders "0 Closed" — the digit disambiguates).
+    expect(closed).toMatch(/<\/svg> Closed/);
+    expect(closed).toContain("Closed <relative-time");
+    expect(closed).not.toContain("Jan 1, 2020");
+    expect(closed).not.toContain("tw-text-red");
+  });
+
+  it("REOPENING restores the red due-date line and drops the closed stamp (updateMilestone's close→open arm clears closedDateAt)", async () => {
+    const { mId, svc } = await seedDatedRepo("closedstates");
+    await svc.updateMilestone(mId, { state: "closed", now: at(20) });
+    await svc.updateMilestone(mId, { state: "open", now: at(30) });
+
+    const html = await (await fetchUi("/alice/closedstates/milestones")).text();
+    expect(html).toContain(">dated m</a>");
+    // The past deadline renders again — red (the deadline is decades past).
+    expect(html).toContain("Jan 1, 2020");
+    expect(html).toContain("tw-text-red");
+    // The closed stamp is gone (the row's "0 Closed" issue-count div is the
+    // only remaining "Closed" text beside the tab count).
+    expect(html).not.toMatch(/<\/svg> Closed/);
+    expect(html).toContain("0 Closed</a>");
+  });
+
+  it("a closed row with a cleared closed_date_unix renders the BARE Closed stamp (the closedDateAt !== null guard)", async () => {
+    const { mId, svc } = await seedDatedRepo("closedstates");
+    await svc.updateMilestone(mId, { state: "closed", now: at(20) });
+    // Upstream's ClosedUnix nil arm — a closed milestone whose close stamp
+    // was never recorded (service-created rows always stamp it; the direct
+    // tweak is the only way to reach the guard).
+    await drizzle(env.DB).update(milestones).set({ closedDateAt: null }).where(eq(milestones.id, mId));
+
+    const closed = await (await fetchUi("/alice/closedstates/milestones?state=closed")).text();
+    expect(closed).toMatch(/<\/svg> Closed/);
+    // The stamp renders WITHOUT its relative-time twin (the Updated stamp's
+    // own <relative-time> still renders — the guard is per-branch).
+    expect(closed).not.toContain("Closed <relative-time");
+    expect(closed).toContain("Updated <relative-time");
   });
 });
 
