@@ -271,7 +271,10 @@ describe("user profile (/{username})", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('class="flex-divided-list items-with-main"');
-    expect(html).toContain('href="/wave7shy"'); // the live tab
+    // The live tab (b1bf73a's ProfileTabs re-shape: header.tmpl:12's exact
+    // `?tab=repositories` href, ACTIVE — no longer OrgMenu's canonical link)
+    expect(html).toContain('class="active item" href="/wave7shy?tab=repositories"');
+    expect(html).toContain('href="/wave7shy?tab=activity"'); // the strip's other live anchor
     expect(html).not.toContain("No repositories yet."); // that placeholder is the ORG page's
   });
 
