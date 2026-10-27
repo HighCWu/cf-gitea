@@ -657,6 +657,18 @@ describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => 
       body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
     });
 
+    // Drain the gate's waitUntil settle deterministically before any D1 write
+    // (the branchy/latefirst/heady idiom — settle-then-assert): this push to
+    // an EMPTY repo scheduled settleCreatingRepo via ctx.waitUntil, and under
+    // load it can land INSIDE the setDefaultBranch legs below — its
+    // is_empty-CAS rewrite (default_branch = adopted branch) then overwrites
+    // the 'ghost' write and the read-back sees 'feature' again. The settle's
+    // CAS is guarded on is_empty, so draining it once here makes every late
+    // duplicate a no-op and the ghost leg races nothing (a single-branch
+    // push's settle never setHeads — the engine already adopted the only
+    // branch — so the pending duplicate's only possible write is the CAS).
+    await settleCreatingRepo(env, repo.id, "alice/headed");
+
     // OK path: both stores move.
     await svc.setDefaultBranch(repo.id, "feature");
     expect((await svc.get(repo.id))!.defaultBranch).toBe("feature");
