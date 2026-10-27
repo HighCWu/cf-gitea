@@ -13,6 +13,7 @@ import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } f
 // through harness.ts's GOLDEN_CASES (that table feeds the smoke loop above
 // too; entries added there would silently grow this suite without review).
 import adminUsersGolden from "./goldens/admin-users.html?raw";
+import adminOrgsGolden from "./goldens/admin-orgs.html?raw";
 import bareShellGolden from "./goldens/bare-shell.html?raw";
 import branchesGolden from "./goldens/branches.html?raw";
 import commitViewGolden from "./goldens/commit-view.html?raw";
@@ -268,6 +269,11 @@ const EXPANSION_ARMS: ExpansionArm[] = [
   { file: "user-settings-account.html", golden: userSettingsAccountGolden, mainAriaLabel: "Account", mainClassTokens: ["user", "settings", "account"], thWithoutScope: 0 },
   { file: "profile-watching.html", golden: profileWatchingGolden, mainAriaLabel: "alice", mainClassTokens: ["user", "profile"], thWithoutScope: 0 },
   { file: "milestone-detail.html", golden: milestoneDetailGolden, mainAriaLabel: "v1.0", mainClassTokens: ["repository", "milestone-issue-list"], thWithoutScope: 0 },
+  // admin-orgs (the goldens-admin-tables wave): the R6 net's first sight of
+  // the org table found 2×R5 — the settings pencil's icon-only anchor lacked
+  // aria-label; fixed with the peer-icon-anchor precedent (releases.tsx:870),
+  // golden regenerated, landed clean.
+  { file: "admin-orgs.html", golden: adminOrgsGolden, mainAriaLabel: "Organizations", mainClassTokens: ["admin", "user"], thWithoutScope: 0 },
 ];
 
 describe("wave-129 expansion arms (explicit cases, not the shared table)", () => {

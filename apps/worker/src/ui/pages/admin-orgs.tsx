@@ -423,7 +423,7 @@ export function AdminOrgsPage(props: { ctx: UiContext; data: AdminOrgsData }) {
                   {/* The settings pencil (list.tmpl:70) — /org/{name}/settings
                       is a LANDED page (org-settings.tsx), so the link is live. */}
                   <td>
-                    <a href={`/org/${org.username}/settings`} data-tooltip-content={adminOrgsLocale.edit}>
+                    <a href={`/org/${org.username}/settings`} data-tooltip-content={adminOrgsLocale.edit} aria-label={adminOrgsLocale.edit}>
                       <Icon name="octicon-pencil" />
                     </a>
                   </td>

@@ -157,9 +157,50 @@ describe("golden DOM snapshots (§5.2)", () => {
  *     signed-in owner so canWrite pins the Edit button. Regression-prone:
  *     the detail is the milestones LIST goldens' title-link target and the
  *     id-resolution arm (repo-scoped, non-numeric → 404) is new.
+ *
+ * The audit's queued R6 gap (the a11y suite can only SEE tables embedded in
+ * goldens) added the admin listing pages below. Two of the three candidates
+ * are documented skips — the analyses live here so the next attempt starts
+ * from the mechanism, not from a fresh dead end:
+ *
+ *   - admin-orgs (TAKEN): `/-/admin/orgs`, the orgs list over the EXISTING
+ *     org fixtures (acme + emptyorg — no new seeds; the R6 sweep already
+ *     scoped its seven th cells). Deterministic: org rows are `users` rows
+ *     (seeded integer ids, createdAt pinned to T0, and the Teams/Members/
+ *     Repos cells are fixture-derived counts), so the bytes are stable.
+ *   - admin-repos (SKIPPED — no byte-deterministic fixture path): the table's
+ *     first column renders `repositories.id` verbatim, and repo ids are
+ *     `crypto.randomUUID()` at create (repos/service.ts:284) — per-run
+ *     random, PRIMARY KEY, referenced by every metadata table, and baked into
+ *     the immutable `storage_key = 'r_' || id` (repos/service.ts:303-306).
+ *     Pinning them would mean restructuring the harness seeds and every
+ *     referencing row (harness.ts is outside a goldens-only wave's scope;
+ *     "cheap" does not apply). The zero-row search arm (`?q=` no match) IS
+ *     deterministic but renders no table rows — it would fake the coverage
+ *     this gap is about. Proper fix lives with the harness/page owners: a
+ *     fixed-id seed arm in testing/seed-repo.ts (the webhookDeliveries
+ *     fixed-uuid precedent) or an id-projection decision in admin-repos.tsx.
+ *   - admin-monitor (SKIPPED — the cron/queue tables the audit names, per
+ *     page): cron renders wall-clock bytes — the route passes
+ *     `new Date()` (ui/index.ts loadAdminMonitorCron) and the Next Time
+ *     column formats it, so no fixture can pin the page. stats and queue DO
+ *     have existing deterministic fixture paths (stats is pure COUNT reads;
+ *     queue reads the hooks seed's webhook_deliveries — pending 1, delivered
+ *     2 — and the mirror seed's idle repo_mirrors row), but each renders a
+ *     THEAD-LESS table (stats.tmpl's key/count rows; the queue page's
+ *     delivery-states segment): the R6 walker's "has no thead" violation on
+ *     first sight — the stop condition, reported instead of pinned. Upstream's
+ *     stats.tmpl is itself thead-less, so the fix is a policy call for the
+ *     page owner (diverge with a thead, or exempt the upstream-shape
+ *     key/value table in a11y.ts), not a goldens-wave change.
  */
 const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "admin-users.html", path: "/-/admin/users", status: 200, signedIn: true, sessionUser: "morgan" },
+  // The R6-audit wave's addition: the orgs list rides morgan's promotion like
+  // admin-users (the shared admin gate) and the EXISTING org fixtures — no
+  // new seeds, so no committed byte moves. admin-repos/admin-monitor are
+  // documented skips (the block comment above).
+  { file: "admin-orgs.html", path: "/-/admin/orgs", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "user-settings-account.html", path: "/user/settings/account", status: 200, signedIn: true },
   { file: "profile-watching.html", path: "/alice?tab=watching", status: 200, signedIn: true },
   { file: "milestone-detail.html", path: "/alice/golden-ms/milestone/2", status: 200, signedIn: true },
