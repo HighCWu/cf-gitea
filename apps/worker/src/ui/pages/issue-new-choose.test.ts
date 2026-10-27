@@ -100,9 +100,9 @@ describe("the viewer-blind contract (the reqUnitIssuesReader posture)", () => {
 // dispatcher — anonymous public 303 with the query round-trip; anonymous or
 // stranger at a private repo, the 404 shell).
 describe("the claim state (two-stage HANDOFF — flipped by the wiring window)", () => {
-  it("the choose tail is UNCLAIMED: parseUiRoute null, handlesUiRoute false", () => {
-    expect(parseUiRoute(`/${OWNER}/${REPO}/issues/new/choose`)).toBeNull();
-    expect(handlesUiRoute(`/${OWNER}/${REPO}/issues/new/choose`)).toBe(false);
+  it("the choose tail is CLAIMED by the wiring window: parseUiRoute yields the family", () => {
+    expect(parseUiRoute(`/${OWNER}/${REPO}/issues/new/choose`)).toMatchObject({ family: "issue-new-choose" });
+    expect(handlesUiRoute(`/${OWNER}/${REPO}/issues/new/choose`)).toBe(true);
   });
 
   it("the recipe's guards overclaim nothing: the sibling shapes keep today's answers", () => {

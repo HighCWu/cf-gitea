@@ -1090,6 +1090,7 @@ import {
   readNewIssueForm,
   renderNewIssuePage,
 } from "./pages/new-issue";
+import { issueNewChooseRedirect } from "./pages/issue-new-choose";
 import { loadPullFilesData, renderPullFilesPage } from "./pages/pull-files";
 // Wave-29 diffpatch downloads (the survey's row 4 — the four raw-text
 // .diff/.patch routes; the loaders + Response builder live in the module,
@@ -1343,6 +1344,10 @@ import {
   renderPullFilesSingleCommitPage,
 } from "./pages/pull-files-single-commit";
 import { activityAuthorDataResponse, loadActivityAuthorData } from "./pages/activity-author-data";
+import {
+  commentAttachmentsFragmentResponse,
+  loadCommentAttachmentsFragment,
+} from "./pages/comment-attachments-fragment";
 // Window-2e C2: the wiki family.
 import {
   createWikiPageFromForm,
@@ -1487,7 +1492,7 @@ export interface IssueDetailRoute {
  *  write POST — upstream's `/issues/new` (routers/web/repo/issue.go
  *  NewIssue/NewIssuePost). */
 export interface IssueNewRoute {
-  family: "issue-new";
+  family: "issue-new" | "issue-new-choose";
   owner: string;
   repo: string;
 }
@@ -2289,6 +2294,7 @@ export interface IssueAuxRoute {
     | "pull-files-range"
     | "pull-commit-files"
     | "activity-author-data"
+    | "comment-attachments"
     | "compare-feed";
   owner: string;
   repo: string;
@@ -3132,6 +3138,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       }
     }
   }
+  // The comments/attachments fragment (web.go:1337 — the repo-level
+  // comments head, GET-only; the issue-level comment writes live under
+  // {type}/{index} — a different namespace).
+  if (head === "comments" && rest.length === 2 && rest[1] === "attachments") {
+    return { family: "comment-attachments", owner, repo, segment: rest[0] };
+  }
   // Window-2e B2: the activity-author JSON feed (web.go:1683-1687 — the
   // optional period tail; unknown/bare segments hit the WEEKLY default).
   if (head === "activity_author_data") {
@@ -3148,6 +3160,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return { family: "pulls-new-redirect", owner, repo };
     }
     if (rest.length === 0) return { family: head, owner, repo };
+    // The template chooser (web.go:1357 — the no-template 303 arm IS the
+    // page at our data gate): the length-2 tail claims OUTSIDE the length-1
+    // block below (the bare /issues/new literal lives inside it).
+    if (head === "issues" && rest.length === 2 && rest[0] === "new" && rest[1] === "choose") {
+      return { family: "issue-new-choose", owner, repo };
+    }
     if (rest.length === 1) {
       if (head === "issues" && rest[0] === "new") return { family: "issue-new", owner, repo };
       // Wave-5: the sidebar label-write POST (upstream data-update-url).
@@ -4100,6 +4118,13 @@ function loginRedirect(pathname: string): Response {
  *  (`?milestone=` — upstream NewIssue's FormInt64("milestone"); a
  *  non-numeric or unknown id falls through to none, the form's own
  *  parsing). */
+async function issueNewChoosePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { repo, url, respond } = resolved;
+  return respond(issueNewChooseRedirect(repo, url));
+}
+
 async function issueNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
@@ -4905,6 +4930,19 @@ async function activityAuthorDataRoute(c: Context<{ Bindings: Env }>): Promise<R
   );
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(activityAuthorDataResponse(data));
+}
+
+/** GET /{owner}/{repo}/comments/{id}/attachments (the fragment module's
+ *  HANDOFF, web.go:1337): the repo-level comments head, GET-only; the
+ *  404 shells and the type-gate 500 live in the module's outcome union. */
+async function commentAttachmentsRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "comment-attachments") return respond(await c.notFound()); // drift guard
+  const outcome = await loadCommentAttachmentsFragment(c.env.DB, repo, route.segment ?? "");
+  return respond(commentAttachmentsFragmentResponse(url.origin, outcome, renderNotFound(ctx)));
 }
 
 /** GET /{owner}/{repo}/settings/hooks (pages/settings.tsx — the webhooks
@@ -10237,6 +10275,7 @@ uiRouter.get("/:owner/:repo/issues", (c) => uiPage(c));
 // The static literal registers before the dynamic :index so handler choice
 // never depends on router precedence subtleties (Hono's RegExpRouter ranks
 // static segments first; this makes it local and obvious).
+uiRouter.get("/:owner/:repo/issues/new/choose", (c) => issueNewChoosePage(c));
 uiRouter.get("/:owner/:repo/issues/new", (c) => issueNewPage(c));
 uiRouter.post("/:owner/:repo/issues/new", (c) => issueNewSubmit(c));
 // Window-2e B2 statics — hoisted ABOVE the /:index catch (hono honors
@@ -10338,6 +10377,7 @@ uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/det
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/merge_box", (c) => pullMergeBoxRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/files/:segment{^[a-f0-9]{7,64}(\\.\\.[a-f0-9]{7,64})?$}", (c) => pullFilesRangeRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/commits/:sha{^[a-f0-9]{7,64}$}", (c) => pullCommitFilesRoute(c));
+uiRouter.get("/:owner/:repo/comments/:id/attachments", (c) => commentAttachmentsRoute(c));
 uiRouter.get("/:owner/:repo/activity_author_data", (c) => activityAuthorDataRoute(c));
 uiRouter.get("/:owner/:repo/activity_author_data/:period", (c) => activityAuthorDataRoute(c));
 // Window-2e C1: the global inbox.
