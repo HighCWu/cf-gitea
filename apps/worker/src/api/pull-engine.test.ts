@@ -22,7 +22,7 @@
 
 import { SELF, applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { and, eq } from "drizzle-orm";
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -42,6 +42,15 @@ import { registerPullRoutes } from "./routes/pulls";
 import { engineReads, refTipMap } from "./services/engine";
 import { RepoService } from "../repos/service";
 import type { User } from "./models/user";
+
+// wave-129 full-run contention budget: this file's heaviest closure measured
+// 26.64s of the 30s default IN a green 8-worker full run (the fork-head merge
+// arms — and it fired the stochastic one-file-per-run timeout class under load,
+// 2026-10-26). The suite's 260-isolate spawn storm spikes closures up to ~12x
+// their solo time; these file-local 90s budgets restore headroom while
+// vitest.config.ts keeps 30s for every other file. Membership: the measured
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 const ORIGIN = "https://apisuite.test";
 const TOKEN = "pull-engine-token";
@@ -219,6 +228,29 @@ describe("PR diff, patch, commits, files", () => {
     expect(files).toHaveLength(1);
     expect(files[0]?.filename).toBe("topic-a.txt");
     expect(files[0]?.status).toBe("added");
+  });
+
+  it("paginates the changed files: page 2 carries the last file, a past-the-end page is empty (the X-HasMore flip)", async () => {
+    // PR 1's range is topic-a.txt + topic-b.txt (2 files). The /files slice
+    // is page/limit over the ordered range diff (routes/pulls.ts handler);
+    // X-HasMore reads `files.length > page * limit` — exactly true on page 1
+    // (2 > 1) and false from page 2 on (2 > 2).
+    const page2 = await get(`${REPO}/pulls/1/files?limit=1&page=2`);
+    expect(page2.status).toBe(200);
+    expect(page2.headers.get("X-Page")).toBe("2");
+    // The SO-FAR approximation rides the FULL file count, not the slice:
+    // soFar = (page - 1) * limit + files.length = 1 + 2 (routes/pulls.ts
+    // handler, the setCommitListHeaders module doc) — an upper bound.
+    expect(page2.headers.get("X-Total-Count")).toBe("3");
+    expect(page2.headers.get("X-HasMore")).toBe("false");
+    const files: Array<Record<string, unknown>> = await page2.json();
+    expect(files).toHaveLength(1);
+    expect(files[0]?.filename).toBe("topic-b.txt");
+
+    const past = await get(`${REPO}/pulls/1/files?limit=1&page=3`);
+    expect(past.status).toBe(200);
+    expect(past.headers.get("X-HasMore")).toBe("false");
+    expect(await past.json<unknown[]>()).toEqual([]);
   });
 });
 
@@ -735,5 +767,160 @@ describe("merge delete_branch_after_merge — the fork-head arms", () => {
     const forkTips = refTipMap(await engineReads(env, { ownerNamespace: "forkkeeper", slug: "outside" }).listRefs());
     expect(forkTips.get("refs/heads/outsidetopic")).toBeDefined();
     expect((await jsonBody(await get(`${REPO}/pulls/${seeded.index}`))).merged).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wave-129 batch 9 — the .diff/.patch download tails' EDGE arms (SPEC-0004
+// §2.4 repoDownloadPullDiffOrPatch over services/pull-engine.ts's three-dot
+// range + git-models.ts renderUnifiedDiff/renderPatch) and the /files range
+// pagination + status arms (repoGetPullRequestFiles over toChangedFiles).
+// The engine's truncation caps are DOCUMENTED: SPEC-0001b §3 row "caps:
+// MAX_DIFF_FILES=100, MAX_DIFF_BLOB=512 KiB, truncated flag".
+// ---------------------------------------------------------------------------
+
+describe("PR .diff/.patch tails — the empty-range, binary and truncation-cap arms", () => {
+  it("renders an EMPTY range as an empty .diff body and a header-only .patch mail", async () => {
+    // Across-ref equal tips (the routes/pulls.test.ts empty-PR create arm):
+    // the branch sits at main's exact tip, so the range diff is
+    // renderUnifiedDiff([]) === "" — upstream `git diff base...head` with
+    // nothing to show.
+    const branch = await send(`${REPO}/branches`, jsonInit("POST", { new_branch_name: "empty-twin" }));
+    expect(branch.status).toBe(201);
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Empty range tail", head: "empty-twin", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    const diff = await get(`${REPO}/pulls/${index}.diff`);
+    expect(diff.status).toBe(200);
+    expect(diff.headers.get("content-type")).toContain("text/plain");
+    expect(await diff.text()).toBe("");
+
+    const patch = await get(`${REPO}/pulls/${index}.patch`);
+    expect(patch.status).toBe(200);
+    const patchText = await patch.text();
+    // The format-patch mail shape (git-models.ts renderPatch): the From-sep
+    // header line, the [PATCH] subject, the --- divider — and NO file
+    // sections.
+    expect(patchText.startsWith("From ")).toBe(true);
+    expect(patchText).toContain("Subject: [PATCH]");
+    expect(patchText).toContain("---");
+    expect(patchText).toContain("-- \n2.47.0"); // the format-patch signature tail
+    expect(patchText).not.toContain("diff --git");
+  });
+
+  it("renders a binary change as the 'Binary files … differ' line in both tails", async () => {
+    // A NUL byte inside the first 8000 bytes is the engine's isBinary probe
+    // (git-engine git/diff.ts:145); the byte-exact write rides the contents
+    // API's base64 decode. The PNG magic keeps the shape honest.
+    const pngMagic = String.fromCharCode(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x00, 0x1a);
+    const tip = await seedBranchWithCommit("bindiff", "logo.bin", `${pngMagic}binary tail arm\n`);
+    expect(tip).not.toBe("");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Binary tail", head: "bindiff", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    const diff = await get(`${REPO}/pulls/${index}.diff`);
+    expect(diff.status).toBe(200);
+    const text = await diff.text();
+    expect(text).toContain("diff --git a/logo.bin b/logo.bin");
+    // A CREATED binary: the old side is /dev/null on the differ line
+    // (renderUnifiedDiff's oldPath pick).
+    expect(text).toContain("Binary files /dev/null and b/logo.bin differ");
+    // No text section for the binary arm: no ---/+++ pair, no hunks.
+    expect(text).not.toContain("--- a/logo.bin");
+    expect(text).not.toContain("+++ b/logo.bin");
+    expect(text).not.toContain("@@ -");
+
+    const patch = await get(`${REPO}/pulls/${index}.patch`);
+    expect(patch.status).toBe(200);
+    const patchText = await patch.text();
+    // The patch mail anchors on the range HEAD commit (seedBranchWithCommit's
+    // `${branch}: ${path}` message) and carries the same binary line.
+    expect(patchText).toContain("Subject: [PATCH] bindiff: logo.bin");
+    expect(patchText).toContain("Binary files /dev/null and b/logo.bin differ");
+  });
+
+  it("caps one diff at the engine's documented MAX_DIFF_FILES=100 (SPEC-0001b §3)", async () => {
+    // A fresh deterministic cell: main at the suite's base tip, a topic
+    // branch changing 101 files in one commit. computeDiff walks the sorted
+    // path union and stops after the cap (git-engine repo.ts
+    // `if (files.length >= MAX_DIFF_FILES) truncated`), so the FIRST 100
+    // sorted paths render and the 101st truncates out of every tail.
+    const base = [SEED_COMMITS[0] as SeedCommit, SEED_COMMITS[1] as SeedCommit];
+    const capFiles = Array.from({ length: 101 }, (_, i) => ({
+      path: `cap/file-${String(i).padStart(3, "0")}.txt`,
+      content: `cap ${i}\n`,
+    }));
+    const feature: SeedCommit = { message: "cap: the truncation storm", time: T0 + 200, files: [...(base[1] as SeedCommit).files, ...capFiles] };
+    await ensureSeededRepo({ owner: OWNER, slug: "difftails", commits: base });
+    const { tips, pack } = await buildHistoryPack([...base, feature]);
+    const capTip = tips[2] as string;
+    const token = await mintPushToken(OWNER_ID, "pull-engine-cap-push");
+    await pushRefsIfAbsent(`${OWNER}/difftails`, token, [{ ref: "refs/heads/capstorm", oid: capTip }], pack);
+
+    const created = await send(`/repos/${OWNER}/difftails/pulls`, jsonInit("POST", { title: "Cap storm", head: "capstorm", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    const diff = await get(`/repos/${OWNER}/difftails/pulls/${index}.diff`);
+    expect(diff.status).toBe(200);
+    const text = await diff.text();
+    expect((text.match(/diff --git /g) ?? [])).toHaveLength(100);
+    expect(text).toContain("cap/file-000.txt");
+    expect(text).not.toContain("cap/file-100.txt"); // the 101st sorted path truncates
+
+    const patch = await get(`/repos/${OWNER}/difftails/pulls/${index}.patch`);
+    expect(patch.status).toBe(200);
+    const patchText = await patch.text();
+    expect(patchText).toContain("Subject: [PATCH] cap: the truncation storm");
+    expect((patchText.match(/diff --git /g) ?? [])).toHaveLength(100);
+  });
+
+  it("maps the /files range arms: empty range, binary added, file removed — previous_filename always null (no rename detection)", async () => {
+    // Find the two PR indexes from the list (the shared suite's counter is
+    // never hardcoded — the file's own convention).
+    const pulls = (await (await get(`${REPO}/pulls?state=all&limit=50`)).json<Array<Record<string, unknown>>>()).filter(
+      (pr) => pr.title === "Binary tail" || pr.title === "Empty range tail",
+    );
+    const byTitle = new Map(pulls.map((pr) => [pr.title as string, pr.number as number]));
+    const binaryIndex = byTitle.get("Binary tail");
+    const emptyIndex = byTitle.get("Empty range tail");
+    expect(binaryIndex).toBeDefined();
+    expect(emptyIndex).toBeDefined();
+
+    const binary = await get(`${REPO}/pulls/${binaryIndex}/files`);
+    expect(binary.status).toBe(200);
+    expect(binary.headers.get("X-Total-Count")).toBe("1");
+    const binaryFiles: Array<Record<string, unknown>> = await binary.json();
+    expect(binaryFiles[0]?.filename).toBe("logo.bin");
+    expect(binaryFiles[0]?.status).toBe("added");
+    expect(binaryFiles[0]?.previous_filename).toBeNull();
+
+    // The deletion arm: a branch that deletes a file (old side present, new
+    // side null → "removed").
+    const delBranch = await send(`${REPO}/branches`, jsonInit("POST", { new_branch_name: "taildelete" }));
+    expect(delBranch.status).toBe(201);
+    const readme = await get(`${REPO}/contents/README.md?ref=taildelete`);
+    expect(readme.status).toBe(200);
+    const readmeSha = ((await jsonBody(readme)).sha) as string;
+    const deleted = await send(`${REPO}/contents/README.md`, jsonInit("DELETE", { sha: readmeSha, branch: "taildelete", message: "taildelete: remove README" }));
+    expect(deleted.status).toBe(200);
+    const delPr = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Removal tail", head: "taildelete", base: "main" }));
+    expect(delPr.status).toBe(201);
+    const removalIndex = (await jsonBody(delPr)).number as number;
+
+    const removal = await get(`${REPO}/pulls/${removalIndex}/files`);
+    expect(removal.status).toBe(200);
+    const removalFiles: Array<Record<string, unknown>> = await removal.json();
+    expect(removalFiles[0]?.filename).toBe("README.md");
+    expect(removalFiles[0]?.status).toBe("removed");
+    expect(removalFiles[0]?.previous_filename).toBeNull();
+
+    // The empty range lists zero files with the zero totals.
+    const emptyFiles = await get(`${REPO}/pulls/${emptyIndex}/files`);
+    expect(emptyFiles.status).toBe(200);
+    expect(emptyFiles.headers.get("X-Total-Count")).toBe("0");
+    expect(await emptyFiles.json<unknown[]>()).toEqual([]);
   });
 });

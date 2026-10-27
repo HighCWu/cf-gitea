@@ -46,7 +46,7 @@
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
@@ -58,6 +58,14 @@ import { parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import type { UiManifest } from "../manifest";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
+
+// wave-129 full-run contention budget: this file's beforeAll seeding (the
+// receive-flow w111* fixture family) measured a 4.68s hook share of the 30s
+// default IN a green 8-worker full run (the suite's 260-isolate spawn storm
+// spikes closures up to ~12x their solo time). File-local 90s budgets;
+// vitest.config.ts keeps 30s for every other file. Membership: the measured
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 // --- the minted-session route harness (the compare.matrix pattern) ---------------
 
@@ -151,16 +159,39 @@ const LONELY_COMMITS: SeedCommit[] = [
   { message: "w111: lonely root", time: T0 + 240, files: [{ path: "lonely.txt", content: "w111 lonely\n" }] },
 ];
 
+/** The wave-129 batch-9 RENAME+BINARY arm's commit — tips[4] atop the linear
+ *  history (tips[0..3] stay byte-identical, so every existing oid holds): it
+ *  DELETES f2.txt and adds f2-renamed.txt with the same content (the engine
+ *  has no rename detection — git without -M — so the pair renders as a
+ *  removed+added pair under their own paths) and adds a BINARY file (a NUL
+ *  byte inside the first 8000 bytes is the engine's isBinary probe,
+ *  git-engine git/diff.ts:145). */
+const BINARM_COMMITS: SeedCommit[] = [
+  ...W111_COMMITS,
+  {
+    message: "w111: rename+binary arm",
+    time: T0 + 300,
+    files: [
+      { path: "f0.txt", content: "w111 root\n" },
+      { path: "f1.txt", content: "w111 one\n" },
+      { path: "f2-renamed.txt", content: "w111 two\n" },
+      { path: "f3.txt", content: "w111 three\n" },
+      { path: "bin/logo.bin", content: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x00, 0x1a, 0x00, 0x00]) },
+    ],
+  },
+];
+
 interface World {
-  /** tips[0], tips[MAIN_TIP], tips[MID], tips[TOPIC_TIP]. */
+  /** tips[0], tips[MAIN_TIP], tips[MID], tips[TOPIC_TIP] (BINARM's tips[4]). */
   root: string;
   mainTip: string;
   mid: string;
   topicTip: string;
   lonelyTip: string;
+  binTip: string;
   /** The per-repo index allocation (one shared issue/PR sequence), captured
    *  at creation — never hardcoded. */
-  pull: { topic: number; merged: number; closed: number; lonely: number; plainIssue: number };
+  pull: { topic: number; merged: number; closed: number; lonely: number; plainIssue: number; binarm: number };
   priv: number;
 }
 
@@ -239,7 +270,7 @@ async function seedPulls(ownerId: number): Promise<{ pull: World["pull"]; priv: 
 
   const pullId = await repoIdOf("w111pull");
   const fresh = (await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, pullId)).limit(1).get()) === undefined;
-  const pull: World["pull"] = { topic: 0, merged: 0, closed: 0, lonely: 0, plainIssue: 0 };
+  const pull: World["pull"] = { topic: 0, merged: 0, closed: 0, lonely: 0, plainIssue: 0, binarm: 0 };
   if (fresh) {
     const topic = await svc.createPullRequest({
       repoId: pullId,
@@ -301,6 +332,20 @@ async function seedPulls(ownerId: number): Promise<{ pull: World["pull"]; priv: 
 
     const plain = await svc.createIssue({ repoId: pullId, title: "w111: the plain issue", posterId: ownerId, now });
     pull.plainIssue = plain.index;
+
+    // The wave-129 batch-9 rename+binary pull: head at the BINARM tip
+    // (refs/heads/binarm — pushed below), base main.
+    const binarm = await svc.createPullRequest({
+      repoId: pullId,
+      title: "w111: the rename+binary pull",
+      content: "Deletes f2.txt under a new name and adds a binary file.",
+      posterId: ownerId,
+      headRepoId: pullId,
+      baseBranch: "main",
+      headBranch: "binarm",
+      now,
+    });
+    pull.binarm = binarm.issue.index;
   } else {
     // Re-run against a seeded world: re-read the allocated indexes by title.
     const rows = await db.select({ index: issues.index, title: issues.title }).from(issues).where(eq(issues.repoId, pullId)).all();
@@ -315,6 +360,7 @@ async function seedPulls(ownerId: number): Promise<{ pull: World["pull"]; priv: 
     pull.closed = idx("w111: the closed pull");
     pull.lonely = idx("w111: the lonely pull");
     pull.plainIssue = idx("w111: the plain issue");
+    pull.binarm = idx("w111: the rename+binary pull");
   }
 
   const privId = await repoIdOf("w111priv");
@@ -413,12 +459,29 @@ async function ensureFixtures(): Promise<void> {
     );
   }
 
+  // The wave-129 batch-9 rename+binary world: the BINARM pack's tips[0..3]
+  // are byte-identical to the linear pack's (the shared history), tips[4] is
+  // the rename+binary commit — the binarm PR's branch and head ref.
+  const binarm = await buildHistoryPack(BINARM_COMMITS);
+  if (!pullRefs.refs.some((ref) => ref.name === "refs/heads/binarm")) {
+    await pushRefs(
+      `${OWNER}/w111pull`,
+      [
+        { ref: "refs/heads/binarm", oid: binarm.tips[4] as string },
+        { ref: `refs/pull/${seeded.pull.binarm}/head`, oid: binarm.tips[4] as string },
+      ],
+      binarm.pack,
+      token,
+    );
+  }
+
   world = {
     root: tips[0] as string,
     mainTip: tips[MAIN_TIP] as string,
     mid: tips[MID] as string,
     topicTip: tips[TOPIC_TIP] as string,
     lonelyTip: lonely.tips[0] as string,
+    binTip: binarm.tips[4] as string,
     pull: seeded.pull,
     priv: seeded.priv,
   };
@@ -667,5 +730,63 @@ describe("w111 cross-origin n/a (GETs)", () => {
       const res = await fetchUi(path, { headers: { origin: "https://evil.example" } });
       expect(res.status, path).toBe(200); // reads carry no same-origin guard
     }
+  });
+});
+
+// --- the wave-129 batch-9 rename+binary arms ---------------------------------------
+
+describe("w111 rename+binary arms (the range and single-commit pages over the BINARM commit)", () => {
+  const binPr = (): string => `/${OWNER}/w111pull/pulls/${w().pull.binarm}`;
+
+  it("renders the deleted+renamed pair and the binary file on the RANGE page (no rename detection — the documented degradation)", async () => {
+    // mid (tips[2]) is in the PR's (base, head] list, binTip IS the head: the
+    // pair admits. The range diff tips[2]→tips[4]: f2.txt removed,
+    // f2-renamed.txt added, bin/logo.bin added (binary), and f3.txt added
+    // (tips[3]'s change rides the range) — 4 files.
+    const res = await get(`${binPr()}/files/${w().mid}..${w().binTip}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`#${w().pull.binarm} - w111: the rename+binary pull`);
+    expect(html).toContain("4 changed files");
+    // The removed side renders under its OWN path (del-code); the added side
+    // under the new path (add-code). The engine has no rename detection
+    // (git without -M — the pull-files.tsx module header's documented
+    // degradation), so no old→new pairing anywhere: each box's
+    // data-old-filename equals its data-new-filename equals its own path.
+    expect(html).toContain('data-old-filename="f2.txt"');
+    expect(html).toContain('data-new-filename="f2.txt"');
+    expect(html).toContain("del-code");
+    expect(html).toContain('data-new-filename="f2-renamed.txt"');
+    expect(html).toContain("add-code");
+    // The binary arm: the BIN mark replaces the +A/-D stats in the header
+    // actions and the body renders the degraded branch, never a chroma table.
+    expect(html).toContain('data-new-filename="bin/logo.bin"');
+    expect(html).toContain("Binary file not shown.");
+  });
+
+  it("renders the same three-file anatomy on the SINGLE-COMMIT page (the first-parent diff)", async () => {
+    // /commits/{binTip}: the parent diff tips[3]→tips[4] is the same
+    // removed+added+binary triple — exactly one commit's own changes.
+    const res = await get(`${binPr()}/commits/${w().binTip}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`#${w().pull.binarm} - w111: the rename+binary pull`);
+    expect(html).toContain('data-new-filename="f2.txt"');
+    expect(html).toContain("del-code");
+    expect(html).toContain('data-new-filename="f2-renamed.txt"');
+    expect(html).toContain("add-code");
+    expect(html).toContain("Binary file not shown.");
+    // The parent's own file (f3) is unchanged by this commit — never rendered.
+    expect(html).not.toContain('data-new-filename="f3.txt"');
+  });
+
+  it("keeps the binary file off the text-diff vocabulary (no hunk rows in the binary box)", async () => {
+    // The binary box renders the tw-p-3 degraded div; the unified table's
+    // line rows exist only for the text files of the same page.
+    const res = await get(`${binPr()}/files/${w().mid}..${w().binTip}`);
+    const html = await res.text();
+    expect(html).toContain("Binary file not shown.");
+    // The removed/added text files still render unified rows.
+    expect(html).toContain('class="chroma"');
   });
 });

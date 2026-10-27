@@ -1045,3 +1045,169 @@ describe("PUT /teams/{id}/members/{username}: the AddTeamMember blocked arm", ()
     expect(response.status).toBe(204);
   });
 });
+
+// ---------------------------------------------------------------------------
+// wave-129 batch 9 — the team-detail deep arms: the members page's role
+// ladder (requireTeamReadAccess × team visibility × doer class), the
+// single-member read, the repo list's access-level trim with its untrimmed
+// total header, and the add/remove member edges the earlier describes leave.
+// ---------------------------------------------------------------------------
+
+describe("GET /teams/{id}/members — the role ladder, the single-member read and pagination", () => {
+  it("admits the LIMITED tier on org membership alone; the outsider takes the anti-enumeration 404", async () => {
+    const s = await seedActors();
+    const send = router();
+    const service = new TeamsService(env.DB);
+    const limited = await service.createTeam(s.org, { name: "limited-team", permission: "read", visibility: "limited" });
+    // The org member (not a team member): visibleTeamVisibilities(member)
+    // admits 'limited' (team_list.go:101-110) — reqTeamReadAccess passes.
+    expect((await send(`/teams/${limited.id}/members`, { headers: authHeaders(s.member.id) })).status).toBe(200);
+    // The signed-in outsider: the tier denies → denyNonTeamMember → the
+    // not-an-org-member 404 (existence hidden).
+    expect((await send(`/teams/${limited.id}/members`, { headers: authHeaders(s.outsider.id) })).status).toBe(404);
+  });
+
+  it("site admin reads a private team; a member OF the private team reads it (the privileged arm + the team-member arm)", async () => {
+    const s = await seedActors();
+    const send = router();
+    const vaultId = await teamIdByName("vault-team");
+    // teamAccessPrivileged's isAdmin arm (api.go:474-496) — no membership.
+    const adminRes = await send(`/teams/${vaultId}/members`, { headers: authHeaders(s.admin.id) });
+    expect(adminRes.status).toBe(200);
+    // The org member joins the private team and now passes the read gate on
+    // their own membership (the teamAccessPrivileged team-member arm).
+    const service = new TeamsService(env.DB);
+    await service.addTeamMember(await mustTeam(service, vaultId), s.member.id);
+    const memberRes = await send(`/teams/${vaultId}/members`, { headers: authHeaders(s.member.id) });
+    expect(memberRes.status).toBe(200);
+    expect((await memberRes.json<Array<Record<string, unknown>>>()).map((u) => u.login)).toEqual(["org-member"]);
+  });
+
+  it("serves a single member and 404s non-members and unknown names behind the read gate", async () => {
+    const s = await seedActors();
+    const send = router();
+    const docsId = await teamIdByName("docs");
+    // The teammate IS a docs member (seedActors) → the User projection.
+    const found = await send(`/teams/${docsId}/members/${s.teammate.username}`, { headers: authHeaders(s.owner.id) });
+    expect(found.status).toBe(200);
+    expect((await found.json<Record<string, unknown>>()).login).toBe(s.teammate.username);
+    // An org user who is NOT on the team → the shared 404 (orgListTeamMember).
+    expect((await send(`/teams/${docsId}/members/${s.member.username}`, { headers: authHeaders(s.owner.id) })).status).toBe(404);
+    // An unknown username → 404 before the membership probe.
+    expect((await send(`/teams/${docsId}/members/ghost`, { headers: authHeaders(s.owner.id) })).status).toBe(404);
+    // The read gate runs first: the outsider on a private team 404s even for
+    // a name that is a member of no team.
+    const vaultId = await teamIdByName("vault-team");
+    expect((await send(`/teams/${vaultId}/members/${s.teammate.username}`, { headers: authHeaders(s.outsider.id) })).status).toBe(404);
+  });
+
+  it("paginates members with the maintained-counter total (the page slices, the header never drops)", async () => {
+    const s = await seedActors();
+    const send = router();
+    const docsId = await teamIdByName("docs");
+    const service = new TeamsService(env.DB);
+    await service.addTeamMember(await mustTeam(service, docsId), s.member.id); // org-member + team-mate
+    // display_name/username order: both display names empty → username order.
+    const page1 = await send(`/teams/${docsId}/members?limit=1&page=1`, { headers: authHeaders(s.owner.id) });
+    expect(page1.status).toBe(200);
+    expect(page1.headers.get("x-total-count")).toBe("2");
+    expect((await page1.json<Array<Record<string, unknown>>>()).map((u) => u.login)).toEqual(["org-member"]);
+    const page2 = await send(`/teams/${docsId}/members?limit=1&page=2`, { headers: authHeaders(s.owner.id) });
+    expect((await page2.json<Array<Record<string, unknown>>>()).map((u) => u.login)).toEqual(["team-mate"]);
+    expect(page2.headers.get("x-total-count")).toBe("2");
+    // A page past the end is an EMPTY body — but the total header carries the
+    // team's numMembers counter, "not the page" (team.go:392-393 via the
+    // route's setPaginationHeaders(c, team.numMembers, list)).
+    const page3 = await send(`/teams/${docsId}/members?limit=1&page=3`, { headers: authHeaders(s.owner.id) });
+    expect(await page3.json<unknown[]>()).toEqual([]);
+    expect(page3.headers.get("x-total-count")).toBe("2");
+  });
+});
+
+describe("GET /teams/{id}/repos — the access-level trim's header, the admin arm and pagination", () => {
+  it("keeps the UNTRIMMED covered count in x-total-count while the visible list trims", async () => {
+    const s = await seedActors();
+    const send = router();
+    const docsId = await teamIdByName("docs");
+    const service = new TeamsService(env.DB);
+    const docs = await mustTeam(service, docsId);
+    await service.addTeamRepo(docs, "t_public_repo");
+    await service.addTeamRepo(docs, "t_vault");
+    // The outsider (public team, no grants): the per-repo trim (team.go:569-577)
+    // leaves only the public repo in the body…
+    const res = await send(`/teams/${docsId}/repos`, { headers: authHeaders(s.outsider.id) });
+    expect(res.status).toBe(200);
+    expect((await res.json<Array<Record<string, unknown>>>()).map((r) => r.name)).toEqual(["public-repo"]);
+    // …but the total header stays the UNTRIMMED covered count (the upstream
+    // upper-bound note in the handler).
+    expect(res.headers.get("x-total-count")).toBe("2");
+  });
+
+  it("site admin sees the covered private repo with no grant; pagination slices in slug order", async () => {
+    const s = await seedActors();
+    const send = router();
+    const docsId = await teamIdByName("docs");
+    const service = new TeamsService(env.DB);
+    const docs = await mustTeam(service, docsId);
+    await service.addTeamRepo(docs, "t_public_repo");
+    await service.addTeamRepo(docs, "t_vault");
+    // baseRepoVisible's is_admin arm admits the private repo with zero grants.
+    const adminRes = await send(`/teams/${docsId}/repos`, { headers: authHeaders(s.admin.id) });
+    expect((await adminRes.json<Array<Record<string, unknown>>>()).map((r) => r.name).sort()).toEqual(["public-repo", "vault"]);
+    // The coverage read orders by slug (listTeamRepoPairs asc(slug)):
+    // "public-repo" < "vault" — page 2 of limit 1 carries vault alone.
+    const page2 = await send(`/teams/${docsId}/repos?limit=1&page=2`, { headers: authHeaders(s.owner.id) });
+    expect((await page2.json<Array<Record<string, unknown>>>()).map((r) => r.name)).toEqual(["vault"]);
+    expect(page2.headers.get("x-total-count")).toBe("2");
+    const page3 = await send(`/teams/${docsId}/repos?limit=1&page=3`, { headers: authHeaders(s.owner.id) });
+    expect(await page3.json<unknown[]>()).toEqual([]);
+  });
+});
+
+describe("PUT/DELETE /teams/{id}/members/{username} — the remaining edges", () => {
+  it("404s a missing team and 403s a read-admitted non-owner with the ownership message", async () => {
+    const s = await seedActors();
+    const send = router();
+    const docsId = await teamIdByName("docs");
+    // resolveTeamContext's shared 404 for an unknown team id.
+    expect(
+      (await send("/teams/999999/members/someone", { method: "PUT", headers: authHeaders(s.owner.id) })).status,
+    ).toBe(404);
+    // The public team's read tier admits the outsider, then reqOrgOwnership
+    // answers the exact upstream message — before any membership probe.
+    const res = await send(`/teams/${docsId}/members/${s.teammate.username}`, {
+      method: "PUT",
+      headers: authHeaders(s.outsider.id),
+    });
+    expect(res.status).toBe(403);
+    expect((await res.json<Record<string, unknown>>()).message).toBe("Must be an organization owner");
+  });
+
+  it("removing from one of two teams keeps the org membership; the LAST team's removal drops it", async () => {
+    const s = await seedActors();
+    const send = router();
+    const docsId = await teamIdByName("docs");
+    const vaultId = await teamIdByName("vault-team");
+    const service = new TeamsService(env.DB);
+    const orgs = new OrgService(env.DB);
+    await service.addTeamMember(await mustTeam(service, docsId), s.member.id);
+    await service.addTeamMember(await mustTeam(service, vaultId), s.member.id);
+    expect(await orgs.getMembership(s.org.id, s.member.id)).not.toBeNull();
+    // The docs removal: the guarded org-membership delete no-ops (a
+    // team_members row remains in vault) — the membership survives.
+    expect(
+      (await send(`/teams/${docsId}/members/${s.member.username}`, { method: "DELETE", headers: authHeaders(s.owner.id) }))
+        .status,
+    ).toBe(204);
+    expect((await mustTeam(service, docsId))?.numMembers).toBe(1);
+    expect(await orgs.getMembership(s.org.id, s.member.id)).not.toBeNull();
+    // The vault removal is the LAST team: removeInvalidOrgUser fires and the
+    // org membership goes with it.
+    expect(
+      (await send(`/teams/${vaultId}/members/${s.member.username}`, { method: "DELETE", headers: authHeaders(s.owner.id) }))
+        .status,
+    ).toBe(204);
+    expect((await mustTeam(service, vaultId))?.numMembers).toBe(0);
+    expect(await orgs.getMembership(s.org.id, s.member.id)).toBeNull();
+  });
+});

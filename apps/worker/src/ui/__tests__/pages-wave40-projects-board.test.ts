@@ -40,18 +40,22 @@
 
 import { env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import {
+  comments,
   follows,
   issueAssignees,
   issueLabels,
   issues,
   labels,
   milestones,
+  projectIssues,
+  repoCounters,
+  repositories,
   teamMembers,
   teams,
   users,
@@ -60,6 +64,7 @@ import {
   addIssueToColumn,
   createColumn,
   createProject,
+  findProjectById,
   listColumns,
   orgProjectScope,
   userProjectScope,
@@ -68,6 +73,7 @@ import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { runA11y } from "./a11y";
 import { uiEnv } from "./harness";
+import { IssuesService } from "../../issues/service";
 import { OrgService } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
 import type { OrgRecord } from "../../services/orgs/orgs";
@@ -818,5 +824,175 @@ describe("wave-40 a11y smoke", () => {
       const violations = runA11y(await res.text());
       expect(violations, `${path}: ${JSON.stringify(violations)}`).toEqual([]);
     }
+  });
+});
+
+// --- wave-129 batch 9: the owner board's ordering, card-anatomy and move-reduction arms ---
+
+/** The batch-9 owner-board fixtures: two appended columns, a task-list issue,
+ *  an open PR card and the PR cross-reference comment — each created only
+ *  when absent (the fixture cache reuses them across re-runs). */
+async function ensureOwnerBoardAnatomyFixtures(fixture: Wave40Fixture): Promise<{ prIndex: number }> {
+  const ownerId = fixture.ownerId;
+  const pubRows = await db().select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, fixture.pubRepoSlug)).all();
+  const pubId = pubRows[0]?.id;
+  if (pubId === undefined) throw new Error("wave40-pub repo row missing");
+
+  // The appended columns (createColumn sorts them after the template's —
+  // `min(max(sorting)+1, 127)`), id-tie-broken by `sorting, id` order.
+  const columnsNow = await listColumns(env.DB, fixture.boardId, 1, 100);
+  const have = new Set(columnsNow.items.map((column) => column.title));
+  if (!have.has("Owner Queue 129")) {
+    await createColumn(env.DB, fixture.boardId, { title: "Owner Queue 129", color: "", creatorId: ownerId, now: NOW });
+  }
+  if (!have.has("Owner Overflow 129")) {
+    await createColumn(env.DB, fixture.boardId, { title: "Owner Overflow 129", color: "", creatorId: ownerId, now: NOW });
+  }
+
+  const service = new IssuesService(env.DB);
+  const existing = await db()
+    .select({ id: issues.id, index: issues.index, title: issues.title })
+    .from(issues)
+    .where(eq(issues.repoId, pubId))
+    .all();
+  const byTitle = new Map(existing.map((row) => [row.title, row]));
+
+  // The task-counter issue: `- [x]`/`- [ ]` list items (issueTasksPat).
+  let tasks = byTitle.get("Owner board issue 9 (tasks)");
+  if (tasks === undefined) {
+    const rows = await db()
+      .insert(issues)
+      .values({
+        repoId: pubId,
+        index: 9,
+        title: "Owner board issue 9 (tasks)",
+        content: "- [x] shipped thing\n- [ ] open thing\n",
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .returning()
+      .all();
+    tasks = rows[0];
+  }
+  if (tasks === undefined) throw new Error("owner task issue seed failed");
+
+  // The shared per-repo index counter (repoCounters.issue_index — §3.1) sits
+  // below the fixture's DIRECT seedIssue inserts; pin it to their max before
+  // the PR create draws from it.
+  await db()
+    .insert(repoCounters)
+    .values({ repoId: pubId, issueIndex: 9 })
+    .onConflictDoUpdate({ target: repoCounters.repoId, set: { issueIndex: sql`max(issue_index, 9)` } });
+
+  // The open PR card: a real issues+pullRequests pair through the landed
+  // service (isPull flips the title link onto pulls/{index}).
+  let pr = byTitle.get("Owner board PR card");
+  if (pr === undefined) {
+    const created = await service.createPullRequest({
+      repoId: pubId,
+      headRepoId: pubId,
+      baseBranch: "main",
+      headBranch: "owner-pr-card-branch",
+      title: "Owner board PR card",
+      posterId: ownerId,
+      now: NOW,
+    });
+    pr = { id: created.issue.id, index: created.issue.index, title: created.issue.title };
+  }
+  if (pr === undefined) throw new Error("owner pr card seed failed");
+
+  // The linked-PR row: a type-3 cross-reference comment refIsPull onto the PR
+  // (ViewProject's linkedPrsMap walk reads comments.refIssueId+refIsPull).
+  const refRows = await db().select({ id: comments.id }).from(comments).where(eq(comments.refIssueId, pr.id)).all();
+  if (refRows.length === 0) {
+    await db().insert(comments).values({
+      type: 3, // the cross-reference comment family (§2.2's ref types)
+      posterId: ownerId,
+      issueId: tasks.id,
+      refRepoId: pubId,
+      refIssueId: pr.id,
+      refIsPull: true,
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+  }
+
+  // Both cards into the first appended column (the claim guard keeps the
+  // re-run a no-op — addIssueToColumn moves as well as adds).
+  const project = await findProjectById(env.DB, userProjectScope(ownerId), fixture.boardId);
+  if (project === null) throw new Error("owner board project row missing");
+  const claimedIds = new Set(
+    (await db().select({ issueId: projectIssues.issueId }).from(projectIssues).all()).map((row) => row.issueId),
+  );
+  const columnsAfter = await listColumns(env.DB, fixture.boardId, 1, 100);
+  const queue = columnsAfter.items.find((column) => column.title === "Owner Queue 129");
+  if (queue === undefined) throw new Error("Owner Queue 129 column missing");
+  const tasksRow = (await db().select().from(issues).where(eq(issues.id, tasks.id)).get())!;
+  const prRow = (await db().select().from(issues).where(eq(issues.id, pr.id)).get())!;
+  if (!claimedIds.has(tasksRow.id)) await addIssueToColumn(env.DB, project, tasksRow, queue, ownerId, NOW);
+  if (!claimedIds.has(prRow.id)) await addIssueToColumn(env.DB, project, prRow, queue, ownerId, NOW);
+
+  return { prIndex: prRow.index };
+}
+
+describe("owner board ordering + card anatomy (wave-129 batch 9)", () => {
+  it("orders columns by sorting then id — appended columns render after the template's four, the default star on Backlog", async () => {
+    const fixture = await ensureWave40Fixtures();
+    await ensureOwnerBoardAnatomyFixtures(fixture);
+    const path = `/wave40-user/-/projects/${fixture.boardId}`;
+    const html = await (await fetchUi(path, withCookie(path, fixture.ownerCookie))).text();
+    // The column walk is `sorting, id` (column_list.go:20): the template's
+    // four columns carry sorting 0 (insertion order), the appended two sort
+    // after them.
+    const order = ["Backlog", "To Do", "In Progress", "Done", "Owner Queue 129", "Owner Overflow 129"].map((title) => html.indexOf(title));
+    expect(order.every((position) => position >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // The default column's star glyph and its tooltip hint (view.tmpl's
+    // default_column arm).
+    expect(html).toContain("octicon-star");
+    expect(html).toContain("New issues added to this project will be added to this column");
+    // The cards keep the project-column-sorting insertion order within the
+    // appended column.
+    expect(html.indexOf("Owner board issue 9 (tasks)")).toBeLessThan(html.indexOf("Owner board PR card"));
+  });
+
+  it("renders the card anatomy: the PR title link + glyph, the task counter, the event labels, the assignee strip, the linked PR", async () => {
+    const fixture = await ensureWave40Fixtures();
+    const { prIndex } = await ensureOwnerBoardAnatomyFixtures(fixture);
+    const path = `/wave40-user/-/projects/${fixture.boardId}`;
+    const html = await (await fetchUi(path, withCookie(path, fixture.ownerCookie))).text();
+
+    // The PR card: the title link rides Issue.Link's pulls/{index} arm and
+    // the open-PR glyph (IssueStateIcon's green git-pull-request).
+    expect(html).toContain(`href="/wave40-user/${fixture.pubRepoSlug}/pulls/${prIndex}"`);
+    expect(html).toContain("octicon-git-pull-request");
+    // The task counter (issueTasksPat over `- [x] a` + `- [ ] b`).
+    expect(html).toContain("octicon-checklist");
+    expect(html).toContain("1 / 2");
+    // The event labels: the open cards' "opened … by" arm and the closed
+    // Done card's "was closed" arm (GetLastEventLabel's reduced pair).
+    expect(html).toContain("opened");
+    expect(html).toContain("was closed");
+    // The assignee bottom strip (octicon-person + the plain username;
+    // pubIssue1's assignee from the shared fixture).
+    expect(html).toContain("octicon-person");
+    expect(html).toContain("wave40-user");
+    // The linked-PR row: the cross-reference comment's PR renders under the
+    // ref with its state-colored git-merge glyph (green = open).
+    expect(html).toContain("octicon-git-merge");
+    expect(html).toContain("Owner board PR card");
+  });
+
+  it("keeps the drag-drop move writes unclaimed at the HTTP surface (the no-JS reduction)", async () => {
+    const fixture = await ensureWave40Fixtures();
+    // The module header's reduction: POST /move (MoveColumns) and
+    // POST /{columnID}/move (MoveIssues) are sortablejs JSON fetches with no
+    // no-JS control upstream either — the shapes stay unclaimed, so the
+    // mounted router answers the engine's plain 404.
+    const move = await fetchUi(`/wave40-user/-/projects/${fixture.boardId}/move`, { method: "POST" });
+    expect(move.status).toBe(404);
+    const cardMove = await fetchUi(`/wave40-user/-/projects/${fixture.boardId}/9/move`, { method: "POST" });
+    expect(cardMove.status).toBe(404);
+    expect(handlesUiRoute(`/wave40-user/-/projects/${fixture.boardId}/move`)).toBe(false);
   });
 });
