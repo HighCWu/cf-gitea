@@ -74,6 +74,7 @@ import { listOrgRepositories, orgVisibleToDoer, type OrgDoer } from "../../api/s
 import { resolveOrgForRequest, type ResolvedOrg } from "../../api/services/orgs";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { repoSettings, type repositories } from "../../db/schema";
+import { AdminEmbeddedSvg } from "./admin-users";
 import { TimeSince } from "../components/file-list";
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -256,10 +257,27 @@ export function OrgMenu(props: {
 
 /**
  * One shared/repo/list.tmpl `.item` row (reductions in the module header):
- * the repo/icon.tmpl fallback glyph (no avatar pipeline), the name link, the
- * archived/private/internal badges (internal = public repo under a private
- * owner, upstream `{{if .Owner.Visibility.IsPrivate}}`), the description,
- * the "Updated {TimeSince}" line, and the open-pulls counter chip.
+ * the repo/icon.tmpl row glyph, the name link, the archived/private/internal
+ * badges (internal = public repo under a private owner, upstream
+ * `{{if .Owner.Visibility.IsPrivate}}`), the description, the
+ * "Updated {TimeSince}" line, and the open-pulls counter chip.
+ *
+ * The row glyph is icon.tmpl's chain at the pin (avatar → mirror → fork →
+ * plain; the avatar arm needs a pipeline we lack — the documented §6
+ * degradation — so every row takes the glyph arms): `octicon-mirror` when
+ * `is_mirror`, else `octicon-repo-forked` when `fork_parent` is set
+ * ($.IsFork), else `octicon-repo` — mirror beats fork exactly upstream,
+ * since the arms are `{{else if}}` chained. The mirror/forked bytes ride
+ * admin-users.tsx's embedded seam (the user-settings-repos RepoKindIcon
+ * precedent) — not on the shared Icon allowlist — at the same 24px slot and
+ * the same `svg octicon-*` DOM as the plain arm. This component is the
+ * SHARED shared/repo/list.tmpl row: the fix covers every consumer
+ * (user-profile's repositories tab, explore, dashboard,
+ * notification-subscriptions) — their rows can be mirrors/forks too. The
+ * user-stars/user-watching tabs render their own reduced rows (their own
+ * glyph sites); user-settings-repos rides repos.tmpl's DIFFERENT chain
+ * (lock first, fork before mirror) in its own RepoKindIcon — not shared
+ * with this one.
  */
 export function OrgRepoListItem(props: { orgLink: string; item: OrgHomeRepoItem; orgPrivate: boolean }) {
   const { repo } = props.item;
@@ -268,7 +286,13 @@ export function OrgRepoListItem(props: { orgLink: string; item: OrgHomeRepoItem;
   return (
     <div class="item">
       <div class="item-leading">
-        <Icon name="octicon-repo" size={24} />
+        {repo.isMirror ? (
+          <AdminEmbeddedSvg name="octicon-mirror" size={24} />
+        ) : repo.forkParent !== null ? (
+          <AdminEmbeddedSvg name="octicon-repo-forked" size={24} />
+        ) : (
+          <Icon name="octicon-repo" size={24} />
+        )}
       </div>
       <div class="item-main">
         <div class="item-header">

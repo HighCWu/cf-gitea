@@ -602,29 +602,40 @@ describe("the fork/mirror glyphs, the private-org row-badge pair, and the empty 
     await drizzle(env.DB).update(repositories).set({ isMirror: true }).where(eq(repositories.id, mirror.id)).run();
   });
 
-  it("renders the plain repo glyph on fork AND mirror rows — the fallback-glyph characterization", async () => {
+  it("renders the mirror/fork/plain glyphs per icon.tmpl's chain — mirror row octicon-mirror, fork row octicon-repo-forked, plain row octicon-repo", async () => {
     const res = await getRoute("/ohmpub", world.ownerId);
     expect(res.status).toBe(200);
     const html = await res.text();
     // Each `<div class="item">` chunk carries its own row's item-leading
     // glyph (rendered BEFORE the name link) + its own link.
     const chunks = html.split('<div class="item">');
-    for (const slug of ["a-fork", "a-mirror"]) {
-      const row = chunks.find((chunk) => chunk.includes(`href="/ohmpub/${slug}"`));
-      expect(row, slug).toBeDefined();
-      expect(row, slug).toContain('class="svg octicon-repo"'); // the item-leading glyph
-      expect(row, slug).toContain('width="24"'); // repo/icon.tmpl's 24px slot
-      // CHARACTERIZATION + DIVERGENCE FLAG (reported to the orchestrator):
-      // upstream repo/icon.tmpl renders octicon-mirror for $.IsMirror and
-      // octicon-repo-forked for $.IsFork BEFORE the plain-repo else arm;
-      // this page's OrgRepoListItem renders the fallback glyph
-      // UNCONDITIONALLY (the module header's "repo/icon.tmpl fallback glyph"
-      // reduction taken past the fork/mirror arms). Pinned as-is so the
-      // component wave must consciously flip this arm if it ports the
-      // upstream branch.
-      expect(row, slug).not.toContain("octicon-mirror");
-      expect(row, slug).not.toContain("octicon-repo-forked");
-    }
+    // Mirror first (icon.tmpl's `{{else if $.IsMirror}}` arm precedes the
+    // fork arm — a hypothetical mirror+fork row would render the mirror
+    // glyph): the mirror row's chunk carries octicon-mirror only.
+    const mirrorRow = chunks.find((chunk) => chunk.includes('href="/ohmpub/a-mirror"'));
+    expect(mirrorRow, "a-mirror").toBeDefined();
+    expect(mirrorRow, "a-mirror").toContain('class="svg octicon-mirror"'); // the $.IsMirror arm
+    expect(mirrorRow, "a-mirror").toContain('width="24"'); // repo/icon.tmpl's 24px slot
+    expect(mirrorRow, "a-mirror").not.toContain("octicon-repo-forked");
+    expect(mirrorRow, "a-mirror").not.toContain('class="svg octicon-repo"');
+    // The fork row's chunk carries octicon-repo-forked only ($.IsFork).
+    const forkRow = chunks.find((chunk) => chunk.includes('href="/ohmpub/a-fork"'));
+    expect(forkRow, "a-fork").toBeDefined();
+    expect(forkRow, "a-fork").toContain('class="svg octicon-repo-forked"'); // the $.IsFork arm
+    expect(forkRow, "a-fork").toContain('width="24"'); // the same 24px slot
+    expect(forkRow, "a-fork").not.toContain("octicon-mirror");
+    expect(forkRow, "a-fork").not.toContain('class="svg octicon-repo"');
+    // The plain row keeps the else arm (FLIPPED 2026-10-27: the earlier
+    // characterization pinned the fallback glyph on fork/mirror rows and
+    // flagged the divergence — OrgRepoListItem now ports icon.tmpl's
+    // mirror → fork → plain branch, so the pins below hold the fixed
+    // shape).
+    const plainRow = chunks.find((chunk) => chunk.includes('href="/ohmpub/alpha"'));
+    expect(plainRow, "alpha").toBeDefined();
+    expect(plainRow, "alpha").toContain('class="svg octicon-repo"'); // the else arm
+    expect(plainRow, "alpha").toContain('width="24"'); // the same 24px slot
+    expect(plainRow, "alpha").not.toContain("octicon-mirror");
+    expect(plainRow, "alpha").not.toContain("octicon-repo-forked");
   });
 
   it("shows a private org's owner BOTH row badges — Private on the hidden row, Internal on the public row", async () => {
