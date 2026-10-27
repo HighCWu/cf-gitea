@@ -66,7 +66,7 @@
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
@@ -562,6 +562,116 @@ describe("the renamed-org seam through /{org}", () => {
     expect((await getRoute("/ohmoldsec", world.ownerId)).headers.get("location")).toBe("/ohmnewsec");
     // The new name itself keeps the private ladder: anonymous still misses.
     expect((await getRoute("/ohmnewsec", null)).status).toBe(404);
+  });
+});
+
+// --- the fork/mirror glyph interplay + the private-org row-badge pair + the empty private org ---
+
+/** The polish-wave block: the last unclaimed /{org} arms. The glyph arm
+ *  seeds real fork/mirror edges; the badge-pair arm walks the owner's view of
+ *  the private org; the posture arm stands up a repo-less private org. */
+describe("the fork/mirror glyphs, the private-org row-badge pair, and the empty private org (the polish wave)", () => {
+  let world: OrgHomeWorld;
+
+  beforeEach(async () => {
+    world = await seedOrgHomeWorld();
+    // The fork + mirror edges on ohmpub (public, so both rows land on page 1
+    // of the owner's slug-ASC list): fork_parent points at the source row,
+    // is_mirror is the pull-mirror flag — exactly the D1 state upstream's
+    // repo/icon.tmpl branches on ($.IsMirror / $.ForkID).
+    const repoService = new RepoService(env.DB);
+    const create = (name: string) =>
+      repoService.create({
+        owner: { id: world.ohmpub.id, usernameLower: "ohmpub" },
+        name,
+        isPrivate: false,
+        status: "ready",
+      });
+    const source = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, "ohmpub"), eq(repositories.slug, "alpha")))
+      .get();
+    const fork = await create("a-fork");
+    const mirror = await create("a-mirror");
+    await drizzle(env.DB)
+      .update(repositories)
+      .set({ forkParent: source?.id ?? fork.id })
+      .where(eq(repositories.id, fork.id))
+      .run();
+    await drizzle(env.DB).update(repositories).set({ isMirror: true }).where(eq(repositories.id, mirror.id)).run();
+  });
+
+  it("renders the plain repo glyph on fork AND mirror rows — the fallback-glyph characterization", async () => {
+    const res = await getRoute("/ohmpub", world.ownerId);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Each `<div class="item">` chunk carries its own row's item-leading
+    // glyph (rendered BEFORE the name link) + its own link.
+    const chunks = html.split('<div class="item">');
+    for (const slug of ["a-fork", "a-mirror"]) {
+      const row = chunks.find((chunk) => chunk.includes(`href="/ohmpub/${slug}"`));
+      expect(row, slug).toBeDefined();
+      expect(row, slug).toContain('class="svg octicon-repo"'); // the item-leading glyph
+      expect(row, slug).toContain('width="24"'); // repo/icon.tmpl's 24px slot
+      // CHARACTERIZATION + DIVERGENCE FLAG (reported to the orchestrator):
+      // upstream repo/icon.tmpl renders octicon-mirror for $.IsMirror and
+      // octicon-repo-forked for $.IsFork BEFORE the plain-repo else arm;
+      // this page's OrgRepoListItem renders the fallback glyph
+      // UNCONDITIONALLY (the module header's "repo/icon.tmpl fallback glyph"
+      // reduction taken past the fork/mirror arms). Pinned as-is so the
+      // component wave must consciously flip this arm if it ports the
+      // upstream branch.
+      expect(row, slug).not.toContain("octicon-mirror");
+      expect(row, slug).not.toContain("octicon-repo-forked");
+    }
+  });
+
+  it("shows a private org's owner BOTH row badges — Private on the hidden row, Internal on the public row", async () => {
+    // The secmember view (above) only admits open-work; the owner's ladder
+    // admits hidden-work too, exercising the badge branch order upstream's
+    // list.tmpl pins: a repo's own private badge wins over the
+    // Owner.Visibility.IsPrivate Internal arm.
+    const res = await getRoute("/ohmsec", world.ownerId);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const chunks = html.split('<div class="item">');
+    expect(chunks).toHaveLength(3); // the pre-row chrome + exactly two rows
+    const hiddenRow = chunks[1] ?? "";
+    const openRow = chunks[2] ?? "";
+    expect(hiddenRow).toContain('href="/ohmsec/hidden-work"');
+    expect(hiddenRow).toContain(">Private</span>"); // the row's own badge
+    expect(hiddenRow).not.toContain(">Internal</span>"); // ...which preempts the Internal arm
+    expect(openRow).toContain('href="/ohmsec/open-work"');
+    expect(openRow).toContain(">Internal</span>"); // the public row under the private org
+    expect(openRow).not.toContain(">Private</span>");
+    // The org-header Private badge rides along (the full-class arm).
+    expect(chunks[0]).toContain('class="ui large basic horizontal label">Private</span>');
+  });
+
+  it("postures the empty PRIVATE org: anonymous 404-shells it, the owner reads the empty placeholder", async () => {
+    const orgs = new OrgService(env.DB);
+    await orgs.createOrg({ name: "ohmvoid", ownerId: world.ownerId, visibility: "private", now: T0 });
+
+    // Anonymous: the same indistinguishable miss as any invisible org.
+    const anon = await getRoute("/ohmvoid", null);
+    expect(anon.status).toBe(404);
+    const shell = await anon.text();
+    expect(shell).toContain("status-page-error");
+    expect(shell).not.toContain("organization profile");
+
+    // The owner: the page renders with the header badge and the placeholder
+    // — the empty-org posture OhmCase pins for a PUBLIC org, held behind the
+    // private gate, with no rows, no pager, and no count label at zero.
+    const owner = await getRoute("/ohmvoid", world.ownerId);
+    expect(owner.status).toBe(200);
+    const html = await owner.text();
+    expect(html).toContain("organization profile");
+    expect(html).toContain('class="ui large basic horizontal label">Private</span>');
+    expect(html).toContain("No repositories yet.");
+    expect(html).not.toContain("flex-divided-list");
+    expect(html).not.toContain("navigation_label");
+    expect(html).not.toContain("ui small label");
   });
 });
 

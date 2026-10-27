@@ -222,6 +222,55 @@ describe("GET, HEAD /avatars/* (avatarStorageHandler port)", () => {
     expect((await serve(`/avatars/./u_${user.id}`)).status).toBe(200); // parser-folded, prefix intact
     expect((await serve(`/avatars/garbage/%2e%2e/u_${user.id}`)).status).toBe(200); // decoded, then cleaned
   });
+
+  it("serves the object's OWN content-type metadata (non-PNG stored verbatim)", async () => {
+    // The found arm's Content-Type read (base.go:80-92 → ServeContent
+    // semantics): `object.httpMetadata?.contentType` passes through — the
+    // write half is PNG-only today, but the storage contract is metadata
+    // pass-through, so a JPEG object serves as image/jpeg.
+    await env.REPO_PACKS.put("avatars/jpeg-stored", pngBytes(4, 4), {
+      httpMetadata: { contentType: "image/jpeg" },
+    });
+    const res = await serve("/avatars/jpeg-stored");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/jpeg");
+    expect(res.headers.get("cache-control")).toBe("public, max-age=21600");
+  });
+
+  it("defaults the content-type to application/octet-stream when the object carries no metadata", async () => {
+    // The found arm's `?? "application/octet-stream"` fallback (base.go:87's
+    // ServeContent sniff-free default — a bare R2 put has no httpMetadata).
+    await env.REPO_PACKS.put("avatars/bare-bytes", pngBytes(4, 4));
+    const res = await serve("/avatars/bare-bytes");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/octet-stream");
+    expect(res.headers.get("content-length")).toBeTruthy();
+  });
+
+  it("400s the bare /avatars form through the CutPrefix arm (the wildcard's zero-length remainder)", async () => {
+    // Hono's `/avatars/*` matches the bare namespace root too (empty
+    // remainder), so the handler's `!pathname.startsWith("/avatars/")`
+    // guard — base.go:57-59's CutPrefix arm — is the live answer: 400
+    // "invalid avatar path".
+    const res = await serve("/avatars");
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe("invalid avatar path\n");
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  it("matches a LIST-form If-None-Match against the fallback ETag and serves a non-matching one", async () => {
+    // httpcache.checkIfNoneMatchIsValid's list compare (httpcache.go:44-62):
+    // comma-split candidates, weak-prefix stripped per candidate.
+    const etag = '"avatar-cf-gitea-1"';
+    const list = await serve("/avatars/unknown-path", {
+      headers: { "If-None-Match": `"some-other-etag", ${etag}` },
+    });
+    expect(list.status).toBe(304);
+    const miss = await serve("/avatars/unknown-path", { headers: { "If-None-Match": '"different"' } });
+    expect(miss.status).toBe(200);
+    expect(pngHeader(await miss.arrayBuffer()).width).toBe(96); // the fallback body, not a bare 200
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -250,6 +299,17 @@ describe("GET /avatar/{hash} (AvatarByEmailHash port)", () => {
     const res = await serve("/avatar/abc?size=64");
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/assets/img/avatar_default.png");
+  });
+
+  it("folds hostile ?size values through the atoi port before the chain (non-numeric, negative, overflow → 0)", async () => {
+    // FormInt's strconv.Atoi port (base_form.go:50): an error → 0, overflow
+    // → 0 — every folded value lands on the SAME default link (size is
+    // unused at the frozen settings, so the arm pins the parse, not the link).
+    for (const size of ["abc", "-5", "+0", "99999999999999", "2147483648"]) {
+      const res = await serve(`/avatar/abc?size=${encodeURIComponent(size)}`);
+      expect(res.status, size).toBe(303);
+      expect(res.headers.get("location"), size).toBe("/assets/img/avatar_default.png");
+    }
   });
 
   it("HEAD stays bodyless", async () => {
@@ -359,6 +419,44 @@ describe("GET /user/avatar/{username}/{size} (AvatarByUsernameSize port)", () =>
   it("500s an unknown username (upstream's GetUserByName ServerError arm)", async () => {
     const res = await serve("/user/avatar/ghost/0");
     expect(res.status).toBe(500);
+    expect(await res.text()).toBe("server error\n"); // the module header's plain-text 500 divergence
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  it("folds hostile {size} path params through the atoi port (PathParamInt arms)", async () => {
+    // PathParamInt (base_path.go:40-43): non-numeric, signed, and
+    // over-int32 tails fold to 0 → the UNSIZED link (size > 0 gates the
+    // ?size= query); a "+7" tail parses through the optional sign.
+    const user = await seedUser("kate", null);
+    const base = `/avatars/${await hashAvatar(user.id, "kate")}`; // the username seed (email null)
+    for (const [tail, expected] of [
+      ["abc", base],
+      ["-5", base],
+      ["99999999999999", base],
+      ["%2B7", `${base}?size=7`],
+    ] as const) {
+      const res = await serve(`/user/avatar/kate/${tail}`);
+      expect(res.status, tail).toBe(303);
+      expect(res.headers.get("location"), tail).toBe(expected);
+    }
+  });
+
+  it("answers HEAD bodyless with the redirect cache headers on the user fast link", async () => {
+    const user = await seedUser("lena", null);
+    await uploadAvatar({
+      bucket: env.REPO_PACKS,
+      d1: env.DB,
+      target: { kind: "user", principalId: user.id },
+      data: pngBytes(8, 8),
+      contentType: "image/png",
+    });
+    const res = await serve(`/user/avatar/lena/32`, { method: "HEAD" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/avatars/u_${user.id}?size=32`);
+    expect(res.headers.get("cache-control")).toBe("private, max-age=300");
+    expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect((await res.arrayBuffer()).byteLength).toBe(0);
   });
 });
 

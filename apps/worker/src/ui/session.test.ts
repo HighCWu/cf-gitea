@@ -46,6 +46,7 @@ import {
   lookupValidSession,
   mintSession,
   rotateSession,
+  safeRedirectTarget,
   sessionRouter,
   sessionSetCookie,
   sweepExpiredSessions,
@@ -236,6 +237,22 @@ describe("POST /login — the happy path (§2.2)", () => {
     expect(named.status).toBe(303);
   });
 
+  it("parses `remember` by presence: empty value stays a session cookie, any non-empty value persists", async () => {
+    // parseLoginForm (§2.2): `(params.get("remember") ?? "") !== ""` — the
+    // checkbox's canonical "on" is covered above; here the parse rule's two
+    // edges: an explicitly empty field is absence, ANY other value persists.
+    const alice = await seedUser();
+    const pat = await seedToken(alice, "web");
+
+    const empty = await request("/login", form({ password: pat, remember: "" }));
+    expect(empty.status).toBe(303);
+    expect(cookieParts(cookieHeader(empty)).has("Max-Age")).toBe(false);
+
+    const anyValue = await request("/login", form({ password: pat, remember: "yes" }));
+    expect(anyValue.status).toBe(303);
+    expect(cookieParts(cookieHeader(anyValue)).get("Max-Age")).toBe(String(REMEMBER_MAX_AGE_SECONDS));
+  });
+
   it("honors a path-absolute ?redirect_to and rejects scheme-relative/scheme/control-char targets (§4.6)", async () => {
     const alice = await seedUser();
     const pat = await seedToken(alice, "web");
@@ -280,6 +297,37 @@ describe("POST /login — failure paths re-render at 200 and count one limiter f
 
     expect((await post({})).status).toBe(200); // no fields at all
     expect(await failureCount(ip)).toBe(2);
+  });
+
+  it("bad PAT shapes — sub-gate short, wrong-shape cfg_, and the imported 40-hex look-alike — fail like unknown credentials", async () => {
+    // tokenLookupPrefix's gates (token-format.ts): a value under the 8-char
+    // upstream gate never reaches a lookup; a `cfg_`-prefixed but malformed
+    // value and a 40-hex imported-shape value take the 12-char prefix lookup
+    // and miss the index — all render the same non-committal failure and
+    // count exactly one limiter failure each (§4.11's indistinguishability).
+    const short = await post({ password: "abc" });
+    expect(short.status).toBe(200);
+    expect(await short.text()).toContain("The token is not valid.");
+    expect(await failureCount(ip)).toBe(1);
+
+    const wrongShape = await post({ password: "cfg_zzzz_not-quite-a-token" });
+    expect(wrongShape.status).toBe(200);
+    expect(await wrongShape.text()).toContain("The token is not valid.");
+    expect(await failureCount(ip)).toBe(2);
+
+    const importedHex = await post({ password: "0123456789abcdef0123456789abcdef01234567" });
+    expect(importedHex.status).toBe(200);
+    expect(await importedHex.text()).toContain("The token is not valid.");
+    expect(await failureCount(ip)).toBe(3);
+  });
+
+  it("carries redirect_to through the failure re-render (the round-trip survives a bad credential)", async () => {
+    // The POST → failure → resubmit loop keeps the hidden field filled, so
+    // a user who mistypes their token does not lose their deep link (§2.2).
+    const res = await post({ password: "nope", redirect_to: "/alice/repo" });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('name="redirect_to" value="/alice/repo"');
+    expect(await failureCount(ip)).toBe(1);
   });
 
   it("a wrong user_name is a login failure that reveals nothing", async () => {
@@ -408,6 +456,15 @@ describe("GET /login (§2.1)", () => {
     expect(await res.text()).toContain('name="redirect_to" value="/alice/repo"');
   });
 
+  it("carries a hostile ?redirect_to RAW into the hidden field — the guard fires only at POST use time", async () => {
+    // safeRedirectTarget (§2.2 step 6) validates at SUBMISSION; the GET form
+    // is the round-trip carrier, so the unsanitized value rides verbatim and
+    // the open-redirect refusal happens when the form posts back.
+    const res = await request(`/login?redirect_to=${encodeURIComponent("//evil.example/x")}`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('name="redirect_to" value="//evil.example/x"');
+  });
+
   it("redirects a valid session to / and clears a garbage cookie", async () => {
     const alice = await seedUser();
     const cookieValue = await mintSession(env.DB, alice.id);
@@ -472,6 +529,48 @@ describe("POST /logout (§2.7)", () => {
     expect(await deleteSessionBySecret(env.DB, cookieValue)).toBe(true);
     const res = await request("/alice/private", { headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` } });
     expect(res.status).toBe(404); // back to anonymous: existence stays hidden
+  });
+
+  it("clears the cookie on EVERY arm — cookieless and forged logouts both carry the Max-Age=0 directive", async () => {
+    // §2.7: "either way the cookie is cleared" — the valid arm pins the exact
+    // directive above; here the no-row arms carry it too (a stale or forged
+    // cookie must not survive the POST /logout round-trip).
+    const alice = await seedUser();
+    const cookieValue = await mintSession(env.DB, alice.id);
+    const id = cookieValue.split(":")[0] ?? "";
+
+    const cookieless = await request("/logout", { method: "POST" });
+    expect(cookieless.status).toBe(303);
+    expect(cookieHeader(cookieless)).toBe(clearSessionSetCookie());
+
+    const forged = await request("/logout", {
+      method: "POST",
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${id}:${"f".repeat(64)}` },
+    });
+    expect(forged.status).toBe(303);
+    expect(cookieHeader(forged)).toBe(clearSessionSetCookie());
+    // The forged arm still leaves the row untouched (asserted above in the
+    // forged arm's own test) — the clear directive is response-side only.
+    expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(1);
+  });
+});
+
+describe("safeRedirectTarget — the §2.2 step 6 unit arms behind both /login arms", () => {
+  it("passes only path-absolute same-origin targets; everything else folds to /", () => {
+    expect(safeRedirectTarget(null)).toBe("/"); // absent field
+    expect(safeRedirectTarget(undefined)).toBe("/");
+    expect(safeRedirectTarget("")).toBe("/");
+    expect(safeRedirectTarget("/")).toBe("/"); // length < 2: nothing to redirect to
+    expect(safeRedirectTarget("/issues/7")).toBe("/issues/7"); // the pass-through shape
+    // The open-redirect refusals: scheme-relative, absolute-scheme, and
+    // relative targets all fold onto the origin root.
+    expect(safeRedirectTarget("//evil.example/x")).toBe("/");
+    expect(safeRedirectTarget("https://evil.example/x")).toBe("/");
+    expect(safeRedirectTarget("relative/path")).toBe("/");
+    // Control characters are refused outright (defence in depth behind the
+    // header API's CRLF rejection — module doc).
+    expect(safeRedirectTarget("/\nmeta")).toBe("/");
+    expect(safeRedirectTarget("/\tmeta")).toBe("/");
   });
 });
 

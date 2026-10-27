@@ -50,6 +50,24 @@ describe("cssLinks", () => {
   it("is stable across repeated keys", () => {
     expect(cssLinks(manifest, "web_src/js/index.ts", "web_src/js/index.ts")).toHaveLength(2);
   });
+
+  it("preserves ROOT-KEY argument order and dedupes a shared import chain across keys", () => {
+    // The determinism contract: the walk order is the caller's key order
+    // (secondary first here — the reverse of the single-key walk above), and
+    // a css already emitted through one key never re-emits through another.
+    expect(cssLinks(manifest, "web_src/js/secondary.ts", "web_src/js/index.ts")).toEqual([
+      "/assets/css/secondary.3333cccc.css",
+      "/assets/css/index.1111aaaa.css",
+    ]);
+  });
+
+  it("throws AssetBuildError when an IMPORTED key is missing (the walk's error arm)", () => {
+    const broken: UiManifest = {
+      ...manifest,
+      "web_src/js/secondary.ts": { file: "js/secondary.2222bbbb.js", imports: ["web_src/js/gone.ts"] },
+    };
+    expect(() => cssLinks(broken, "web_src/js/index.ts")).toThrow(AssetBuildError);
+  });
 });
 
 describe("loadManifest", () => {
@@ -80,6 +98,41 @@ describe("loadManifest", () => {
     resetManifestCache();
     const missing = { fetch: () => Promise.resolve(new Response("not found", { status: 404 })) };
     await expect(loadManifest(missing, "https://example.com/")).rejects.toThrow(/build:assets/);
+    resetManifestCache();
+  });
+
+  it("deterministically fetches /assets/.vite/manifest.json off the given base URL", async () => {
+    // The module's one URL rule: the base URL decides only the fetch target,
+    // never the parse result — the same manifest bytes answer from any origin.
+    resetManifestCache();
+    const seen: string[] = [];
+    const spy = {
+      fetch: (input: RequestInfo): Promise<Response> => {
+        seen.push(input instanceof Request ? input.url : String(input));
+        return Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 }));
+      },
+    };
+    const loaded = await loadManifest(spy, "https://example.com/");
+    expect(seen).toEqual(["https://example.com/assets/.vite/manifest.json"]);
+    expect(assetURI(loaded, "web_src/js/index.ts")).toBe("/assets/js/index.deadbeef.js");
+    resetManifestCache();
+  });
+
+  it("caches a FAILURE too: the poisoned promise rejects every later call until reset", async () => {
+    // `cached ??=` holds the PROMISE, so a failed load stays failed for the
+    // isolate's lifetime — later calls (even with a healthy ASSETS binding)
+    // get the SAME rejection until an explicit reset re-opens the cache.
+    resetManifestCache();
+    const missing = { fetch: () => Promise.resolve(new Response("not found", { status: 404 })) };
+    await expect(loadManifest(missing, "https://example.com/")).rejects.toBeInstanceOf(AssetBuildError);
+
+    const poisoned = loadManifest(okAssets, "https://example.com/");
+    await expect(poisoned).rejects.toThrow(/manifest 404/); // the ORIGINAL failure, not a refetch
+    resetManifestCache();
+
+    // After the reset the healthy binding answers again.
+    const fresh = await loadManifest(okAssets, "https://example.com/");
+    expect(assetURI(fresh, "web_src/js/iife.ts")).toBe("/assets/js/iife.abcd1234.js");
     resetManifestCache();
   });
 });
