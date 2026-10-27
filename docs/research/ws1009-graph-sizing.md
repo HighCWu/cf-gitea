@@ -179,7 +179,21 @@ structural (cut a mount), not cosmetic (shrink a file).**
 
 ## 4. Shrink plan (ranked by MB saved × risk; nothing implemented)
 
-### A. De-static the UI mount at the app entry — **−19.9 MB off every non-UI test's snapshot; sim: 231 deaths → 0**
+### A. De-static the UI mount at the app entry — **FALSIFIED 2026-10-27 (wave-ws1009-fix-a): implemented, behavior-preserving, all gates green — and the death count stayed 204 (195/204 doomed-set overlap). The static-edge model is wrong at this boundary.**
+
+`fetchWarmModules` BFS-walks `node.importedModules` with **dynamic edges
+included once executed**: the plugin's virtual `cloudflare:test` module
+imports `src/index` (the main module), so the lazy UI edge sits on that
+universal node and re-enters every later file's warm message the moment
+any file executes a UI request (measured: all-edges BFS from a SELF test
+= 344 modules, uiHit true, over cap on the wire). No within-ownership
+shape avoids this — the main-module edge is required by the deployed
+worker's import. The change was REVERTED at landing review (lazy-mount
+complexity in the entry carried for no ws1009 gain; its deploy
+code-splitting side benefit was unmeasured and does not justify the
+risk surface). Do not spend waves C/D/E expecting death reductions from
+graph shape alone; the surviving levers are B (sourcemaps, −26 MB) and
+the upstream fix.
 
 `src/index.ts` statically imports `./ui` (the 556 KB barrel), `./ui/session`,
 `./web/avatar-serving`, `./web/attachments-serving` only to mount them on the
