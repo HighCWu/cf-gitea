@@ -9445,6 +9445,22 @@ export const uiRouter = new Hono<{ Bindings: Env }>();
 // route (the response was a 404), so it cannot launder unclaimed paths.
 uiRouter.use(trimTrailingSlash());
 
+// The UI's HTML is PER-VIEWER state (settings tabs render the doer's own
+// rows). Upstream sets this globally via middleware (the web context's
+// zero-option prod form — httpcache.go); without it an intermediary
+// heuristically cached per-user pages and a create→reload rendered the row
+// MISSING (RD20's live probe: visible with a no-cache request header,
+// invisible for minutes without — real bug #19, caught only in production).
+uiRouter.use(async (c, next) => {
+  await next();
+  const res = c.res;
+  if (res !== undefined && (res.headers.get("cache-control") === null || res.headers.get("cache-control") === "")) {
+    const headers = new Headers(res.headers);
+    headers.set("cache-control", "max-age=0, private, must-revalidate");
+    c.res = new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  }
+});
+
 // The claimed families (§2.1), registered exactly as parseUiRoute classifies
 // them so the sub-app's reach equals handlesUiRoute's. HEAD is intentionally
 // unregistered (GET-only surface, §2.1): a HEAD request misses into the

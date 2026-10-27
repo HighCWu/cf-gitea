@@ -1472,11 +1472,23 @@ const window2Steps = (ctx) => [
     id: "w2-secret-row-visible",
     expect: `cookie GET /user/settings/actions/secrets → 200 with the row (the name + its description) and the delete form's hidden id captured (name="id" value="N" after the row name)`,
     run: async () => {
-      const res = await fetchT(`${opts.baseUrl}/user/settings/actions/secrets`, { headers: { cookie: ctx.cookie } });
-      const body = await res.text();
+      // D1 production replica lag: the write's 303 commits at the primary,
+      // but an immediate follow-up GET can hit a stale replica (observed
+      // RD20: create 303 → sweep-by-name 204 (committed!) → page read at
+      // +3s empty → page read at +60s rendered; local miniflare is
+      // synchronous, which is why the matrix never saw this). Retry to a
+      // 20s settle budget — the mirror battery's budget precedent.
+      let res = null;
+      let body = "";
+      let nameAt = -1;
+      for (let attempt = 0; attempt < 20 && nameAt === -1; attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, 1000));
+        res = await fetchT(`${opts.baseUrl}/user/settings/actions/secrets`, { headers: { cookie: ctx.cookie } });
+        body = await res.text();
+        nameAt = body.indexOf(ctx.secretName);
+      }
       expect(res.status === 200, `status ${res.status} (expected 200)`);
-      const nameAt = body.indexOf(ctx.secretName);
-      expect(nameAt !== -1, `the created secret ${ctx.secretName} is not on the page`);
+      expect(nameAt !== -1, `the created secret ${ctx.secretName} is not on the page (after a 20s D1 settle budget)`);
       expect(body.includes(ctx.secretDescription), `the description ${ctx.secretDescription} is not on the page`);
       const m = /name="id" value="(\d+)"/.exec(body.slice(nameAt));
       expect(m !== null, "no delete-form hidden id found after the row name");
