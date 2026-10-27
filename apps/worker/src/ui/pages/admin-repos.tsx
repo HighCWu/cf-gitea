@@ -482,7 +482,7 @@ export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) 
         <table class="ui very basic table selectable unstackable">
           <thead>
             <tr>
-              <th>
+              <th scope="col">
                 <SortHeader
                   label={adminReposLocale.col_id}
                   asc="oldest"
@@ -492,8 +492,8 @@ export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) 
                   buildHref={sortHref}
                 />
               </th>
-              <th>{adminReposLocale.col_owner}</th>
-              <th>
+              <th scope="col">{adminReposLocale.col_owner}</th>
+              <th scope="col">
                 <SortHeader
                   label={adminReposLocale.col_name}
                   asc="alphabetically"
@@ -503,8 +503,8 @@ export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) 
                   buildHref={sortHref}
                 />
               </th>
-              <th>{adminReposLocale.col_watchers}</th>
-              <th>
+              <th scope="col">{adminReposLocale.col_watchers}</th>
+              <th scope="col">
                 <SortHeader
                   label={adminReposLocale.col_stars}
                   asc="moststars"
@@ -514,7 +514,7 @@ export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) 
                   buildHref={sortHref}
                 />
               </th>
-              <th>
+              <th scope="col">
                 <SortHeader
                   label={adminReposLocale.col_forks}
                   asc="mostforks"
@@ -524,8 +524,8 @@ export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) 
                   buildHref={sortHref}
                 />
               </th>
-              <th>{adminReposLocale.col_issues}</th>
-              <th>
+              <th scope="col">{adminReposLocale.col_issues}</th>
+              <th scope="col">
                 <SortHeader
                   label={adminReposLocale.col_size}
                   asc="gitsize"
@@ -535,8 +535,8 @@ export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) 
                   buildHref={sortHref}
                 />
               </th>
-              <th>{adminReposLocale.col_updated}</th>
-              <th>{adminReposLocale.col_created}</th>
+              <th scope="col">{adminReposLocale.col_updated}</th>
+              <th scope="col">{adminReposLocale.col_created}</th>
             </tr>
           </thead>
           <tbody>

@@ -566,13 +566,13 @@ export function AdminMonitorCronPage(props: {
           <table class="ui very basic table unstackable tw-mb-0">
             <thead>
               <tr>
-                <th></th>
-                <th>{adminMonitorLocale.name}</th>
-                <th>{adminMonitorLocale.schedule}</th>
-                <th>{adminMonitorLocale.next}</th>
-                <th>{adminMonitorLocale.previous}</th>
-                <th>{adminMonitorLocale.executeTimes}</th>
-                <th>{adminMonitorLocale.lastResult}</th>
+                <th scope="col"></th>
+                <th scope="col">{adminMonitorLocale.name}</th>
+                <th scope="col">{adminMonitorLocale.schedule}</th>
+                <th scope="col">{adminMonitorLocale.next}</th>
+                <th scope="col">{adminMonitorLocale.previous}</th>
+                <th scope="col">{adminMonitorLocale.executeTimes}</th>
+                <th scope="col">{adminMonitorLocale.lastResult}</th>
               </tr>
             </thead>
             <tbody>
@@ -705,9 +705,9 @@ export function AdminMonitorQueuePage(props: { ctx: UiContext; data: AdminMonito
         <table class="ui very basic table unstackable">
           <thead>
             <tr>
-              <th>{adminMonitorLocale.queueName}</th>
-              <th>{adminMonitorLocale.queueType}</th>
-              <th>{adminMonitorLocale.queueNumberInQueue}</th>
+              <th scope="col">{adminMonitorLocale.queueName}</th>
+              <th scope="col">{adminMonitorLocale.queueType}</th>
+              <th scope="col">{adminMonitorLocale.queueNumberInQueue}</th>
             </tr>
           </thead>
           <tbody>

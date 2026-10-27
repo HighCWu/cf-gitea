@@ -357,7 +357,7 @@ export function AdminOrgsPage(props: { ctx: UiContext; data: AdminOrgsData }) {
         <table class="ui very basic table unstackable">
           <thead>
             <tr>
-              <th>
+              <th scope="col">
                 <SortHeader
                   label={adminOrgsLocale.col_id}
                   asc="oldest"
@@ -367,7 +367,7 @@ export function AdminOrgsPage(props: { ctx: UiContext; data: AdminOrgsData }) {
                   buildHref={sortHref}
                 />
               </th>
-              <th>
+              <th scope="col">
                 <SortHeader
                   label={adminOrgsLocale.col_name}
                   asc="alphabetically"
@@ -378,10 +378,10 @@ export function AdminOrgsPage(props: { ctx: UiContext; data: AdminOrgsData }) {
                   buildHref={sortHref}
                 />
               </th>
-              <th>{adminOrgsLocale.col_teams}</th>
-              <th>{adminOrgsLocale.col_members}</th>
-              <th>{adminOrgsLocale.col_repos}</th>
-              <th>
+              <th scope="col">{adminOrgsLocale.col_teams}</th>
+              <th scope="col">{adminOrgsLocale.col_members}</th>
+              <th scope="col">{adminOrgsLocale.col_repos}</th>
+              <th scope="col">
                 <SortHeader
                   label={adminOrgsLocale.col_created}
                   asc="recentupdate"
@@ -391,7 +391,7 @@ export function AdminOrgsPage(props: { ctx: UiContext; data: AdminOrgsData }) {
                   buildHref={sortHref}
                 />
               </th>
-              <th></th>
+              <th scope="col"></th>
             </tr>
           </thead>
           <tbody>
