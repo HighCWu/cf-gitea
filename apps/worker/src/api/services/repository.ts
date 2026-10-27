@@ -247,11 +247,28 @@ export async function repositoryPermissionsWithTeams(
 }
 
 /**
- * `Repository.owner` / embedded creators (upstream `ToUserWithAccessMode`,
- * which hardcodes `authed=false`: admin/active/login fields stay Go-zero even
- * for the owner). The primary email shows only to the user themself or a site
- * admin (upstream hides private emails behind a placeholder we do not render
- * yet). Exported for the converters that embed a `User` (commit-status
+ * Upstream `UserTypeToString` (gitea/services/convert/user.go:15–22): org
+ * rows render "Organization", everything else "User" (reserved variants and
+ * bots have no D1 enum members yet). Shared by BOTH user serializers
+ * (`toApiUser`, services/user.ts; `apiUserFromRow` below) so an org user row
+ * never renders the wire type "User" anywhere — the S5 serializer fix.
+ */
+export function userTypeToApiString(type: UserRow["type"]): "User" | "Organization" {
+  return type === "org" ? "Organization" : "User";
+}
+
+/**
+ * `Repository.owner` / embedded creators (upstream `ToUserWithAccessMode`'s
+ * projection, with the ToUser gating arms: `authed` = the requester is the
+ * row themself or a site admin — the gated is_admin/active/prohibit_login
+ * flags render the row's real values only for authed viewers, exactly like
+ * `toApiUser` (services/user.ts); the review-S11 flag alignment — upstream
+ * `ToUserWithAccessMode` hardcodes `authed=false` (convert/user.go:73–75),
+ * a divergence we deliberately do not copy so both landed serializers agree).
+ * `type`/`visibility` render the row's real columns (`userTypeToApiString`,
+ * `VisibilityString`). The primary email shows only to the user themself or a
+ * site admin (upstream hides private emails behind a placeholder we do not
+ * render yet). Exported for the converters that embed a `User` (commit-status
  * creator), matching upstream `convert.ToUser`.
  */
 export function apiUserFromRow(row: UserRow, viewer: Viewer): User {
@@ -261,7 +278,7 @@ export function apiUserFromRow(row: UserRow, viewer: Viewer): User {
   return {
     id: row.id,
     login: row.username,
-    type: "User",
+    type: userTypeToApiString(row.type),
     login_name: "",
     source_id: 0,
     full_name: row.displayName ?? "",
@@ -269,16 +286,16 @@ export function apiUserFromRow(row: UserRow, viewer: Viewer): User {
     avatar_url: `${viewer.origin}/avatars/${row.usernameLower}`, // TODO(SPEC-0005): avatar storage
     html_url: `${viewer.origin}/${row.username}`,
     language: "",
-    is_admin: false,
+    is_admin: authed ? row.isAdmin : false,
     last_login: GO_ZERO_TIME, // TODO(SPEC-0005): last-login tracking
     created: row.createdAt.toISOString(),
     restricted: false,
-    active: false,
-    prohibit_login: false,
+    active: authed ? row.status === "active" : false,
+    prohibit_login: authed ? row.status === "prohibited" : false,
     location: "",
     website: "",
     description: "",
-    visibility: "public", // TODO(SPEC-0005): user visibility column
+    visibility: row.visibility,
     followers_count: 0, // TODO(SPEC-0005): social counters
     following_count: 0,
     // Upstream renders the maintained column (convert ToUser → StarredRepos,

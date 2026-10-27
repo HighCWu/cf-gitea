@@ -179,8 +179,8 @@ each time.
 |---|---|---|---|---|
 | `GET /version` | config | none (anon) | none | Returns only `{version}`; the string we report is an open question (D5 pin). |
 | `GET /user` | D1 | `read:user` | none | Anonymous → 401; returns `User` with email visible only to self/admin. |
-| `GET /users/{username}` | D1 | none / `read:user` | none | 404 for absent **and** private-restricted users (indistinguishable). |
-| `GET /users/search` | D1 | none (anon) | none | Response is `{data: User[], ok: bool}` — `ok` is always `true`; total count only via `X-Total-Count` header. |
+| `GET /users/{username}` | D1 | none / `read:user` | none | 404 for absent **and** private-restricted users (indistinguishable). Landed: the `users.visibility` ladder (`IsUserVisibleToViewer` reduction, api/services/user.ts) gates every row — org rows included. |
+| `GET /users/search` | D1 | none (anon) | none | Response is `{data: User[], ok: bool}` — `ok` is always `true`; total count only via `X-Total-Count` header. Upstream gotchas landed: `Types: [UserTypeIndividual]` (orgs never answer) + `BuildCanSeeUserCondition` (anonymous → public rows only; signed-in → +limited+self; admin → all). |
 | `GET /users/{username}/repos` | D1 | `read:repository` | none | Only public repos unless self/token grants more; paginated. |
 | `GET /user/repos` | D1 | `read:repository` | none | Accepts `affiliation`-style filters upstream; paginated. |
 | `POST /user/repos` | both | `write:repository` | n/a | 201; `auto_init` triggers an initial commit through the engine; duplicate name → conflict per upstream handler. |

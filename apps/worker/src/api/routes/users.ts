@@ -8,13 +8,14 @@ import type { ApiEnv } from "../env";
 import { userSchema } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { findUserByName, formInt64, formTrim, viewerOf } from "../services/repository";
-import { searchUsers, toApiUser } from "../services/user";
+import { isUserVisibleToViewer, searchUsers, toApiUser, visibilityDoerOf } from "../services/user";
 
 /**
  * Tier-1 `user`-tagged directory reads (SPEC-0004 §2.4):
  * `GET /users/{username}` (userGet) and `GET /users/search` (userSearch).
  * Both are anonymous-capable upstream (`reqExploreSignIn`); a valid token
- * only widens the response (email visibility for self/admin).
+ * only widens the response (email visibility for self/admin, the visibility
+ * ladder's limited/private arms).
  */
 
 const notFoundResponse = {
@@ -29,9 +30,14 @@ const notFoundResponse = {
  *
  * SPEC-0004 §2.4 gotcha: 404 for missing AND restricted users —
  * indistinguishable (upstream fakes ErrUserNotExist for invisible users,
- * user.go:114–117). "restricted" is a user-visibility concept the D1 schema
- * does not have yet: every user is treated as public until then.
- * TODO(SPEC-0007 orgs): visibility column + the real visibility check.
+ * user.go:114–117). "Restricted" is the `users.visibility` ladder:
+ * `IsUserVisibleToViewer` (user.go:1504–1545) reduced to the landed columns
+ * (services/user.ts) — public rows always render; limited/private rows only
+ * for the row itself, a site admin, and (per the exact upstream arms) a
+ * signed-in doer for limited, a followed/co-member doer for private. Org
+ * rows answer too (type-blind `GetUserByName`, models/user/user.go:1132) and
+ * pass the SAME ladder — `GetInfo` gates every row, so a private org is as
+ * fake-404 here as on `/orgs/{org}`.
  */
 const userGetRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
@@ -113,25 +119,31 @@ export function registerUsersRoutes(
   app.openapi(userSearchRoute(optionalAuth), async (c) => {
     const url = new URL(c.req.url);
     const listOptions = parseListOptions(url);
+    const viewer = viewerOf(c);
     const { items, total } = await searchUsers(c.env.DB, {
       keyword: formTrim(url.searchParams, "q"),
       uid: formInt64(url.searchParams, "uid"),
       page: listOptions.page,
       limit: listOptions.limit,
+      viewer: visibilityDoerOf(viewer),
     });
     setPaginationHeaders(c, total, listOptions);
-    const viewer = viewerOf(c);
     return c.json({ ok: true, data: items.map((row) => toApiUser(viewer, row)) }, 200);
   });
 
   app.openapi(userGetRoute(optionalAuth), async (c) => {
     const { username } = c.req.valid("param");
+    const viewer = viewerOf(c);
     const user = await findUserByName(c.env.DB, username);
     if (user === null) {
-      // Missing and restricted are the same 404 upstream (anti-enumeration);
-      // every user is public until the visibility column exists (SPEC-0007).
+      // Missing and restricted are the same 404 upstream (anti-enumeration,
+      // user.go:114–117); the ladder below keeps the two indistinguishable.
       throw new ApiError(404, "not found");
     }
-    return c.json(toApiUser(viewerOf(c), user), 200);
+    if (!(await isUserVisibleToViewer(c.env.DB, user, visibilityDoerOf(viewer)))) {
+      // The fake not-exist: an invisible row answers the identical 404 body.
+      throw new ApiError(404, "not found");
+    }
+    return c.json(toApiUser(viewer, user), 200);
   });
 }

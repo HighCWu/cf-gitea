@@ -262,7 +262,7 @@ describe("GET /orgs/{org}/repos (orgListRepos)", () => {
       full_name: "acme/visible", // case-folded owner namespace (storage key), see above
       private: false,
       empty: true, // no pushes yet (refs_version 0)
-      owner: { login: "Acme", type: "User" }, // the org's users row keeps display case
+      owner: { login: "Acme", type: "Organization" }, // the S5 fix: org rows render their real type (upstream UserTypeToString); display case kept
       permissions: { admin: false, push: false, pull: true }, // anonymous viewer
     });
   });
