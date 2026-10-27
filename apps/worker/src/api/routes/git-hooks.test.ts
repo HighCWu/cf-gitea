@@ -392,6 +392,79 @@ describe("PATCH /repos/{owner}/{repo}/hooks/git/{id} (repoEditGitHook)", () => {
     expect(invalid.status).toBe(422);
     expect(await jsonBody(invalid)).toEqual({ message: "invalid request body", url: ERROR_URL });
   });
+
+  // --- the deferred-polish bind shapes (EditGitHookOption's wire boundary) ---
+
+  it("422s a null content field (the zod bind rejects null; upstream's Go bind would zero it)", async () => {
+    const alice = await seedUser("alice");
+    const repo = await seedRepo("alice", alice.id);
+    // structs/git_hook.go:20-23's Content is a PLAIN string — Go's
+    // encoding/json leaves a null field at its zero (""), which would ride
+    // the remove arm (hook.go:74-82). The landed bind is z.string().optional()
+    // (git-hooks.ts editGitHookOptionSchema): null is neither string nor
+    // absent, so bindValidationHook answers the 422 — the pinned landed
+    // posture at this wire shape.
+    const res = await router()(`/repos/alice/${repo.slug}/hooks/git/update`, {
+      method: "PATCH",
+      headers: authHeaders(alice.id),
+      body: JSON.stringify({ content: null }),
+    });
+    expect(res.status).toBe(422);
+    expect(await jsonBody(res)).toEqual({ message: "invalid request body", url: ERROR_URL });
+    // Nothing stored — the bind refused before the handler touched R2.
+    expect(await env.REPO_PACKS.head(`githooks/${repo.repoId}/update`)).toBeNull();
+  });
+
+  it("deactivates on the exact empty string (the trim arm's zero boundary)", async () => {
+    const alice = await seedUser("alice");
+    const repo = await seedRepo("alice", alice.id);
+    await env.REPO_PACKS.put(`githooks/${repo.repoId}/pre-receive`, "old");
+    const res = await router()(`/repos/alice/${repo.slug}/hooks/git/pre-receive`, {
+      method: "PATCH",
+      headers: authHeaders(alice.id),
+      body: JSON.stringify({ content: "" }),
+    });
+    expect(res.status).toBe(200);
+    // TrimSpace("") is empty — the same remove arm hook.go:74-82 rides for
+    // the whitespace-only twin above; the sample falls back (with content:
+    // pre-receive's sample is non-empty, unlike post-receive's).
+    expect(await jsonBody(res)).toEqual({ name: "pre-receive", is_active: false, content: PRE_RECEIVE_SAMPLE });
+    expect(await env.REPO_PACKS.head(`githooks/${repo.repoId}/pre-receive`)).toBeNull();
+  });
+
+  it("binds the body BEFORE the unknown-id 404 answers (upstream's router-level web.Bind order)", async () => {
+    const alice = await seedUser("alice");
+    const repo = await seedRepo("alice", alice.id);
+    // Upstream binds EditGitHookOption at the router (web.Bind runs before
+    // the handler body reaches GetHook's ErrNotValidHook): a schema-invalid
+    // body answers the bind 422 even against a non-vocabulary id.
+    const res = await router()(`/repos/alice/${repo.slug}/hooks/git/bogus`, {
+      method: "PATCH",
+      headers: authHeaders(alice.id),
+      body: JSON.stringify({ content: 42 }),
+    });
+    expect(res.status).toBe(422);
+    expect(await jsonBody(res)).toEqual({ message: "invalid request body", url: ERROR_URL });
+    expect((await env.REPO_PACKS.list({ prefix: "githooks/" })).objects).toHaveLength(0);
+  });
+
+  it("keys the edit per hook name — a pre-receive PATCH leaves update sample-backed", async () => {
+    const alice = await seedUser("alice");
+    const repo = await seedRepo("alice", alice.id);
+    const patched = await router()(`/repos/alice/${repo.slug}/hooks/git/pre-receive`, {
+      method: "PATCH",
+      headers: authHeaders(alice.id),
+      body: JSON.stringify({ content: "#!/bin/sh\nonly pre-receive\n" }),
+    });
+    expect(patched.status).toBe(200);
+    // The neighbor hook never saw the write (the githooks/<repo>/<name> keys
+    // are per name — the LIST renders exactly one active row).
+    const list = await router()(`/repos/alice/${repo.slug}/hooks/git`, { headers: authHeaders(alice.id) });
+    const body = await list.json<Array<Record<string, unknown>>>();
+    expect(body[0]).toEqual({ name: "pre-receive", is_active: true, content: "#!/bin/sh\nonly pre-receive\n" });
+    expect(body[1]).toEqual({ name: "update", is_active: false, content: UPDATE_SAMPLE });
+    expect(await env.REPO_PACKS.head(`githooks/${repo.repoId}/update`)).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import type { RepositoryWithOwner } from "../../api/services/repository";
-import { protectedTags, repositories, teams, users } from "../../db/schema";
+import { orgMembers, protectedTags, repositories, teams, users } from "../../db/schema";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
@@ -75,7 +75,7 @@ beforeAll(async () => {
 let repoSeq = 9100;
 
 beforeEach(async () => {
-  for (const table of ["protected_tags", "team_members", "teams", "repositories", "users"]) {
+  for (const table of ["protected_tags", "team_members", "teams", "org_members", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   repoSeq = 9100; // stable slugs for the DOM assertions
@@ -278,6 +278,20 @@ describe("applyTagProtectionForm create (routes/tag-protections.ts's POST body r
     await seedRule(repo.id, "v*");
     const result = await applyTagProtectionForm(env.DB, await pair(), form({ namePattern: " v* ", allowlistUsers: "bob" }));
     expect(result).toEqual({ outcome: "invalid", message: "Tag protection already exist" });
+  });
+
+  it("the collision pre-check is PER REPO — the same exact pattern lands in a sibling repo (tag.go:426-431's repo-scoped lookup)", async () => {
+    // The pattern exists in the primary repo…
+    await seedRule(repo.id, "release-*", [2]);
+    // …and the sibling repo's create never consults it (GetProtectedTagByNamePattern
+    // is an (repo_id, name_pattern) pair — the 0025 table's no-unique-index note).
+    const other = await seedRepo({ orgOwned: true });
+    const result = await applyTagProtectionForm(env.DB, await pair(other), form({ namePattern: "release-*", allowlistUsers: "carol" }));
+    expect(result).toEqual({ outcome: "created" });
+    expect(await storedRow(other.id)).toMatchObject({ namePattern: "release-*", users: [5] });
+    // The primary repo's rule stood untouched (still exactly one).
+    expect(await ruleCount(repo.id)).toBe(1);
+    expect(await ruleCount(other.id)).toBe(1);
   });
 
   it("an unknown user 422s with the LOWERCASED name in the exact text", async () => {
@@ -646,6 +660,62 @@ describe("the create round-trip through the route (POST /settings/tags → ?save
   });
 });
 
+describe("the org-owned repo through the route (the settingsGate's team arm — the Owners-team bridge)", () => {
+  /** The acme org repo + alice admitted as its admin through the §3.3
+   *  Owners-team bridge (org_members.role='owner' ⟺ owner-team membership —
+   *  OrgService.isOrgOwner, the doerRepoAccessMode 'owner' arm the
+   *  settingsGate's isRepositoryAdmin resolves). Upstream's whole
+   *  /settings group closes behind reqRepoAdmin (web.go:1286) and the ORG
+   *  owner is that admin (models/perm/access/repo_permission.go's team
+   *  resolution), so the family's write arms answer on the org repo too. */
+  async function seedOrgRepoWithOwnerBridge(): Promise<{ path: string; repoId: string }> {
+    const orgRepo = await seedRepo({ orgOwned: true });
+    await db().insert(orgMembers).values({ orgId: 20, userId: 4, role: "owner", createdAt: new Date("2026-02-03T04:05:06Z") });
+    return { path: `/acme/${orgRepo.slug}`, repoId: orgRepo.id };
+  }
+
+  it("the org owner's GET renders the tab with the team field (the isOrg render the user repo never shows)", async () => {
+    const { path } = await seedOrgRepoWithOwnerBridge();
+    const res = await fetchUi(`${path}/settings/tags`, { headers: { cookie: await adminSessionHeader() } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("repository settings edit");
+    expect(html).toContain('id="allowlist_teams" name="allowlist_teams"'); // the org-only field
+    expect(html).toContain(`colspan="3">${tagProtectionLocale.none}</td>`);
+  });
+
+  it("the create POST resolves the teams on the org repo — 303 ?saved=1, ids stored, the devs label in the Allowed cell", async () => {
+    const { path, repoId } = await seedOrgRepoWithOwnerBridge();
+    const teamId = await seedTeam("devs");
+    const res = await postForm(
+      `${path}/settings/tags`,
+      { name_pattern: " v* ", allowlist_users: "bob", allowlist_teams: "devs" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`${path}/settings/tags?saved=1`);
+    // The org repo resolves BOTH allowlists (tag.go:440-448's org arm).
+    expect(await storedRow(repoId)).toEqual({ namePattern: "v*", users: [2], teams: [teamId] });
+    const page = await adminGet(`${path}/settings/tags?saved=1`);
+    const html = await page.text();
+    expect(html).toContain('href="/bob">bob</a>');
+    expect(html).toContain('href="/org/acme/teams/devs">devs</a>'); // the OrganisationLink cell
+    expect(html).not.toContain(tagProtectionLocale.noone); // the Allowed cell is populated
+  });
+
+  it("a non-owner (bob) still 404-shells the org repo's write BEFORE anything resolves (the gate fronts the org repo too)", async () => {
+    const { path, repoId } = await seedOrgRepoWithOwnerBridge();
+    const res = await postForm(
+      `${path}/settings/tags`,
+      { name_pattern: "v*", allowlist_users: "bob", allowlist_teams: "devs" },
+      { cookie: await nonAdminSessionHeader() },
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("status-page-error");
+    expect(await ruleCount(repoId)).toBe(0);
+  });
+});
+
 describe("the edit prefill through the route (GET ?id= and GET /settings/tags/{id})", () => {
   it("the list route's ?id= prefills the edit form onto the id-keyed action with Save + Cancel", async () => {
     const id = await seedRule(repo.id, "v*", [2]);
@@ -780,6 +850,23 @@ describe("the edit write through the route (POST /settings/tags/{id})", () => {
     expect(res.status).toBe(404);
     expect(await res.text()).toContain("status-page-error");
     expect((await storedRow(archived.id)).namePattern).toBe("v*");
+  });
+
+  it("the edit POST's unknown-user 422 re-renders at 200 with the LOWERCASED name and the kept submission — the row untouched", async () => {
+    const id = await seedRule(repo.id, "v*", [2]);
+    const res = await postForm(
+      `${REPO_PATH}/settings/tags/${id}`,
+      { id: String(id), name_pattern: "v2", allowlist_users: "NOBODY" },
+      { cookie: await adminSessionHeader() },
+    );
+    expect(res.status).toBe(200); // the re-render, not a redirect
+    const html = await res.text();
+    expect(html).toContain('class="ui negative message"');
+    expect(html).toContain("user does not exist [uid: 0, name: nobody]"); // the PATCH arm's exact 422 text
+    expect(html).toContain('value="v2"'); // the kept form re-renders the submission
+    // Nothing wrote: the stored row kept its pattern and allowlist.
+    expect(await ruleCount(repo.id)).toBe(1);
+    expect(await storedRow(repo.id)).toEqual({ namePattern: "v*", users: [2], teams: [] });
   });
 });
 

@@ -21,7 +21,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { issueAttachments, issues, releaseAssets, releases, repositories, sessions, users } from "../db/schema";
+import { issueAttachments, issues, releaseAssets, releases, repositories, repoCollaborators, sessions, users } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { mintFor } from "../auth/testing/seeds";
 import { mintSession, SESSION_COOKIE_NAME } from "../ui/session";
@@ -897,5 +897,140 @@ describe("GET /attachments/{uuid} — session-cookie credential arms", () => {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
     });
     expect(res.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The boundary probes (the deferred polish): the 404 arms' precedence over
+// the scope check (ServeAttachment's arm order — routers/web/repo/
+// attachment.go:135-241 runs GetAttachmentByUUID + the readGrant 404s at
+// :164-187 BEFORE CheckTokenScopes at :205-210, permission.go:16-31), the
+// draft arm's write-grant walk (attachment.go:193-203 over the folded
+// canWriteRepository arms, api/services/repo-access.ts:101-119), and the
+// two-arm credential walk's END boundary (Group.Verify's error fall-through
+// lands the request in the session arm — web.go:129-152 — whose dead-cookie
+// outcome is anonymous plus the clear directive, SPEC-0010 §2.9).
+// ---------------------------------------------------------------------------
+
+describe("GET /attachments/{uuid} — boundary probes", () => {
+  it("answers 404 (never 403) when a scope-less token cannot even see the attachment — the 404 arms precede the scope check", async () => {
+    const owner = await seedUser("attach-owner");
+    const stranger = await seedUser("attach-stranger");
+    await seedRepo(PRIVATE_REPO_ID, PRIVATE_STORAGE_KEY, owner, "private");
+    const issue = await seedIssue(PRIVATE_REPO_ID, owner.id);
+    const row = await seedIssueAttachment({
+      repoId: PRIVATE_REPO_ID,
+      storageKey: PRIVATE_STORAGE_KEY,
+      issueId: issue.id,
+      name: "notes.txt",
+      content: new TextEncoder().encode("private"),
+    });
+    // read:user carries NEITHER read:issue nor read:repository — if the
+    // scope check ran before the visibility arms, every probe would 403.
+    const scopeless = (await mintFor(stranger.id, "scopeless", "read:user")).plaintext;
+    // The private attachment the stranger cannot see: the readGrant 404
+    // (:184-187) fires first.
+    const invisible = await serve(`/attachments/${row.uuid}`, {
+      headers: { authorization: `token ${scopeless}` },
+    });
+    expect(invisible.status).toBe(404);
+    expect(await invisible.text()).toBe("Not Found\n");
+    // A nonexistent uuid: the missing arm (attachment.go:138-140) fires
+    // before anything else.
+    const missing = await serve(`/attachments/${crypto.randomUUID()}`, {
+      headers: { authorization: `token ${scopeless}` },
+    });
+    expect(missing.status).toBe(404);
+    // The count never moved on either refusal (the bump sits after both).
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(0);
+  });
+
+  it("answers a scope-less token 404 (not 403) on a draft asset — the draft arm precedes the scope check, and the refusal never bumps", async () => {
+    const owner = await seedUser("attach-owner");
+    const stranger = await seedUser("attach-stranger");
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public");
+    const uuid = await seedReleaseAsset({
+      repoId: PUBLIC_REPO_ID,
+      isDraft: true,
+      name: "draft.bin",
+      content: new TextEncoder().encode("draft bytes"),
+    });
+    // The public repo is visible, but read:user lacks read:repository —
+    // a scope-first order would 403; upstream's draft arm (:193-203) sits
+    // BEFORE CheckTokenScopes (:205-210), so the refusal is the draft 404.
+    const scopeless = (await mintFor(stranger.id, "scopeless", "read:user")).plaintext;
+    const res = await serve(`/attachments/${uuid}`, {
+      headers: { authorization: `token ${scopeless}` },
+    });
+    expect(res.status).toBe(404);
+    // The draft refusal leaves the asset count at zero (the bump rides the
+    // served path only).
+    const assets = await db().select().from(releaseAssets).all();
+    expect(assets[0]?.downloadCount).toBe(0);
+  });
+
+  it("serves a draft asset to a write collaborator and a site admin, hides it from a read collaborator (the draft arm's folded write grants)", async () => {
+    const owner = await seedUser("attach-owner");
+    const writer = await seedUser("attach-writer");
+    const reader = await seedUser("attach-reader");
+    const admin = await seedUser("attach-admin", true);
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public");
+    const uuid = await seedReleaseAsset({
+      repoId: PUBLIC_REPO_ID,
+      isDraft: true,
+      name: "draft.bin",
+      content: new TextEncoder().encode("grant bytes"),
+    });
+    // canWriteReleases' collaborator arms (repo-access.ts:101-119 folded):
+    // a write-mode row grants the draft, a read-mode row does not.
+    await db().insert(repoCollaborators).values({ repoId: PUBLIC_REPO_ID, userId: writer.id, mode: "write" });
+    await db().insert(repoCollaborators).values({ repoId: PUBLIC_REPO_ID, userId: reader.id, mode: "read" });
+
+    const writerToken = (await mintFor(writer.id, "draft-writer", "read:repository")).plaintext;
+    const writerRes = await serve(`/attachments/${uuid}`, {
+      headers: { authorization: `token ${writerToken}` },
+    });
+    expect(writerRes.status).toBe(200);
+
+    const readerToken = (await mintFor(reader.id, "draft-reader", "read:repository")).plaintext;
+    const readerRes = await serve(`/attachments/${uuid}`, {
+      headers: { authorization: `token ${readerToken}` },
+    });
+    expect(readerRes.status).toBe(404);
+
+    // The site-admin arm of the same walk (canWriteReleases' isAdmin).
+    const adminToken = (await mintFor(admin.id, "draft-admin", "read:repository")).plaintext;
+    const adminRes = await serve(`/attachments/${uuid}`, {
+      headers: { authorization: `token ${adminToken}` },
+    });
+    expect(adminRes.status).toBe(200);
+  });
+
+  it("ends the walk anonymous when BOTH credential arms fail — an invalid token falls through to a dead session (404 + the clear directive)", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PRIVATE_REPO_ID, PRIVATE_STORAGE_KEY, owner, "private");
+    const issue = await seedIssue(PRIVATE_REPO_ID, owner.id);
+    const row = await seedIssueAttachment({
+      repoId: PRIVATE_REPO_ID,
+      storageKey: PRIVATE_STORAGE_KEY,
+      issueId: issue.id,
+      name: "notes.txt",
+      content: new TextEncoder().encode("private"),
+    });
+    // The token arm fails AND the session arm's cookie is dead: Group.Verify
+    // falls through on a method's error (web.go:129-152) into Session, whose
+    // dead-cookie outcome is anonymous plus the clear directive (SPEC-0010
+    // §2.9) — the response carries BOTH the 404 and the Set-Cookie.
+    const res = await serve(`/attachments/${row.uuid}`, {
+      headers: {
+        authorization: "token not-a-real-token",
+        cookie: `${SESSION_COOKIE_NAME}=dead:beef`,
+      },
+    });
+    expect(res.status).toBe(404);
+    expect(res.headers.get("set-cookie")).toBe(
+      `${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`,
+    );
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(0);
   });
 });

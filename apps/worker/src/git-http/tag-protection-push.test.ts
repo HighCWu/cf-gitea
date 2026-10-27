@@ -302,4 +302,27 @@ describe("batch-8: push-time protected-tag enforcement through the gate's valida
       { ref: "refs/tags/v2", ok: true },
     ]);
   });
+
+  it("an EXACT-name pattern is an anchored literal — the dot is not a wildcard (protected_tag.go:36-48 + glob.go)", async () => {
+    const fx = await seedRepo();
+    // The plain literal `v1.0` compiles to ^v1\.0$: fully anchored, the dot
+    // escaped — the exact-name arm between the glob and the regex arms.
+    await setProtectedTag(fx.repoId, "v1.0");
+
+    const report = await push(`https://example.com/${fx.engineName}.git/git-receive-pack`, fx.aliceToken, [
+      { ref: "refs/tags/v1.0", old: ZERO_OID, oid: fx.c1 }, // the exact match refuses
+      { ref: "refs/tags/v1x0", old: ZERO_OID, oid: fx.c1 }, // the regex-dot trap passes
+      { ref: "refs/tags/v10", old: ZERO_OID, oid: fx.c1 }, // the unanchored prefix trap passes
+      { ref: "refs/tags/v1/0", old: ZERO_OID, oid: fx.c1 }, // the slash sibling passes
+    ], null);
+    expect(report.lines).toEqual([
+      { ref: "refs/tags/v1.0", ok: false, msg: "Tag v1.0 is protected" },
+      { ref: "refs/tags/v1x0", ok: true },
+      { ref: "refs/tags/v10", ok: true },
+      { ref: "refs/tags/v1/0", ok: true },
+    ]);
+    const refs = await engineRefs(fx.engineName);
+    expect(refs.has("refs/tags/v1.0")).toBe(false);
+    expect(refs.get("refs/tags/v1/0")).toBe(fx.c1);
+  });
 });

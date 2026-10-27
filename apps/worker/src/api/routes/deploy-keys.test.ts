@@ -400,6 +400,29 @@ describe("repoListKeys (GET /repos/{owner}/{repo}/keys)", () => {
     expect(adminList[0]!).toHaveProperty("repository");
   });
 
+  it("200: the read-only flag ranks the embedded repository's permissions push:false (both key types)", async () => {
+    const { slug } = await seedRepo();
+    // mode 1 (read-only) on both carriers — the flag arm's render boundary:
+    // appendPrivateInformation (key.go:26-38) carries the KEY's access mode
+    // into the permissions block, ToDeployKey rendering push as mode==2
+    // (convert.go:908-925). The write-key push:true arm is the sibling test.
+    expect(
+      (await post(`/api/v1/repos/alice/${slug}/keys`, { title: "ro-key", key: ED25519_KEY, read_only: true })).status,
+    ).toBe(201);
+    expect((await post(`/api/v1/repos/alice/${slug}/keys/tokens`, { title: "ro-token", read_only: true })).status).toBe(201);
+    // A write ssh key beside them — the contrast arm on the same list.
+    expect((await post(`/api/v1/repos/alice/${slug}/keys`, { title: "rw-key", key: RSA_KEY })).status).toBe(201);
+
+    const list = (await (await get(`/api/v1/repos/alice/${slug}/keys`)).json<Record<string, unknown>[]>());
+    expect(list.map((k) => k.title)).toEqual(["ro-key", "ro-token", "rw-key"]); // ToOrders → name order
+    expect(list[0]!.read_only).toBe(true);
+    expect((list[0]!.repository as Record<string, unknown>).permissions).toEqual({ admin: false, push: false, pull: true });
+    expect(list[1]!.read_only).toBe(true);
+    expect((list[1]!.repository as Record<string, unknown>).permissions).toEqual({ admin: false, push: false, pull: true });
+    expect(list[2]!.read_only).toBe(false);
+    expect((list[2]!.repository as Record<string, unknown>).permissions).toEqual({ admin: false, push: true, pull: true });
+  });
+
   it("200: the key_id and fingerprint filters narrow the list", async () => {
     const { slug } = await seedRepo();
     const first = await jsonBody<CreatedKey>(await post(`/api/v1/repos/alice/${slug}/keys`, { title: "a-key", key: ED25519_KEY }));
@@ -455,6 +478,26 @@ describe("repoGetKey (GET /repos/{owner}/{repo}/keys/{id})", () => {
     expect(body.title).toBe("ci");
     expect(body.key).toBe(ED25519_KEY);
     expect(body).not.toHaveProperty("token");
+  });
+
+  it("200: a read-only key round-trips the flag on the single read (and explicit read_only:false stays write)", async () => {
+    const { slug } = await seedRepo();
+    const ro = await jsonBody<CreatedKey & { read_only: boolean }>(
+      await post(`/api/v1/repos/alice/${slug}/keys`, { title: "ro", key: ED25519_KEY, read_only: true }),
+    );
+    const rw = await jsonBody<CreatedKey & { read_only: boolean }>(
+      await post(`/api/v1/repos/alice/${slug}/keys`, { title: "rw", key: RSA_KEY, read_only: false }),
+    );
+    // Explicit false lands write mode exactly like the absent default (the
+    // handler's read_only === true arm — the flag's two-side boundary).
+    expect(rw.read_only).toBe(false);
+    // The single GET renders the flag off the stored row (convert.go:908-925)
+    // with the owner's embedded repository reflecting the key's mode.
+    const roGet = await get(`/api/v1/repos/alice/${slug}/keys/${ro.id}`);
+    expect(roGet.status).toBe(200);
+    const body = await jsonBody<{ read_only: boolean; repository: Record<string, unknown> }>(roGet);
+    expect(body.read_only).toBe(true);
+    expect(body.repository.permissions).toEqual({ admin: false, push: false, pull: true });
   });
 
   it("404: a foreign repo's key id is the same plain miss (repo-scoped lookup)", async () => {

@@ -382,6 +382,36 @@ describe("POST /{owner}/{repo}/tags/delete", () => {
     // GET answers chi's 405 (the hook test/delete convention).
     expect((await fetchUi("/wave33-owner/tagged/tags/delete")).status).toBe(405);
   });
+
+  it("completes the delete cascade when the git tag is already gone — a record without a ref drops through the id arm (release.go:385-393's `tag -d` not-found tolerance)", async () => {
+    const { repoId, ownerCookie } = await theFixture();
+    // A D1 tag-only record whose git ref was never pushed (the row-only
+    // half of the id carrier): the `tag -d` miss is upstream's tolerated
+    // "not found" (release.go:389) and the record drop continues
+    // (release.go:411-414).
+    const owner = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "wave33-owner")).get();
+    if (owner === undefined) throw new Error("wave33 owner missing");
+    const inserted = await drizzle(env.DB)
+      .insert(releases)
+      .values({
+        repoId,
+        publisherId: owner.id,
+        tagName: "late-record",
+        lowerTagName: "late-record",
+        isTag: true,
+        createdAt: new Date(1_700_000_000 * 1000),
+      })
+      .returning({ id: releases.id });
+    const recordId = inserted[0]!.id;
+
+    const res = await fetchUi("/wave33-owner/tagged/tags/delete", formPost("/x", { id: String(recordId) }, ownerCookie));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/wave33-owner/tagged/tags?deleted=late-record");
+    // The cascade's tail: the record is gone; nothing else moved.
+    expect(await findReleaseByTag(env.DB, repoId, "late-record")).toBeNull();
+    const refs = await env.REPO.getByName("wave33-owner/tagged").listRefs();
+    expect((refs.refs ?? []).some((ref) => ref.name === "refs/tags/late-record")).toBe(false);
+  });
 });
 
 // --- the releases edit page + write ----------------------------------------------
@@ -502,5 +532,22 @@ describe("POST /{owner}/{repo}/releases/delete + the list pencil", () => {
     ).text();
     expect(html).toContain("The release has been deleted.");
     expect(html).not.toContain('href="/wave33-owner/tagged/releases/edit/v1"');
+  });
+
+  it("the release delete does NOT cascade the git tag — the freed tag then deletes through the name arm (release.go:416-423's IsTag flip keeps the ref)", async () => {
+    const { ownerCookie } = await theFixture();
+    // Upstream's release-delete arm flips the row's IsTag and never touches
+    // the ref (release.go:416-423): the git tag v1 survives the release
+    // deletion above.
+    const before = await env.REPO.getByName("wave33-owner/tagged").listRefs();
+    expect((before.refs ?? []).some((ref) => ref.name === "refs/tags/v1")).toBe(true);
+    // The freed tag is now a plain rowless engine tag — the name arm's
+    // delete applies (no protected rule matches v1; the keep/* rule's
+    // anchored glob misses it).
+    const res = await fetchUi("/wave33-owner/tagged/tags/delete", formPost("/x", { tag: "v1" }, ownerCookie));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/wave33-owner/tagged/tags?deleted=v1");
+    const refs = await env.REPO.getByName("wave33-owner/tagged").listRefs();
+    expect((refs.refs ?? []).some((ref) => ref.name === "refs/tags/v1")).toBe(false);
   });
 });

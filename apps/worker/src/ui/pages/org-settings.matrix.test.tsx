@@ -427,6 +427,79 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
   });
 
+  // -- the avatar pair's ERROR arms (upstream SettingsAvatar's Flash.Error +
+  // -- unconditional redirect, routers/web/org/setting.go:106-116 — both arms
+  // -- redirect back, ours silently: the user-settings no-flash reduction) --
+
+  /** A multipart avatar POST carrying an arbitrary payload (the error arms'
+   *  inputs — postAvatarRoute only emits the valid 1x1 PNG). */
+  async function postAvatarBlob(path: string, userId: number, blob: Blob): Promise<Response> {
+    const form = new FormData();
+    form.set("avatar", blob, "avatar.png");
+    return fetchUi(path, {
+      method: "POST",
+      headers: { origin: ORIGIN, cookie: await sessionCookie(userId) },
+      body: form,
+    });
+  }
+
+  const avatarMarker = async (): Promise<boolean | undefined> =>
+    (await drizzle(env.DB).select({ useCustomAvatar: users.useCustomAvatar }).from(users).where(eq(users.id, world.orgUserId)).get())?.useCustomAvatar;
+
+  it("a non-image upload answers the silent-error redirect and stores NOTHING (uploaded_avatar_not_a_image's reduction)", async () => {
+    // Upstream: the sniffed type fails IsImage → Flash.Error + ctx.Redirect
+    // (user/setting/profile.go:153-156). Ours: processAvatarImage's
+    // decodeImageConfig null → the error outcome, the route 303s back
+    // without storing — the object and the marker stay untouched.
+    const res = await postAvatarBlob(
+      `/${OPTIONS_ORG}/settings/avatar`,
+      world.ownerId,
+      new Blob([new TextEncoder().encode("definitely not an image")], { type: "text/plain" }),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
+    expect(await avatarMarker()).toBe(false);
+  });
+
+  it("an oversized origin answers the silent-error redirect before any store (the no-resize 262144-byte cap)", async () => {
+    // A PNG-prefixed payload at-or-over MAX_AVATAR_ORIGIN_BYTES trips
+    // AvatarOriginTooLargeError (services/avatars.ts — upstream resizes;
+    // cf-gitea's cap answers profile.go:143-145's uploaded_avatar_is_too_big
+    // arm through the same silent redirect).
+    const oversized = new Uint8Array(262_144);
+    oversized.set(PNG_1X1, 0);
+    const res = await postAvatarBlob(`/${OPTIONS_ORG}/settings/avatar`, world.ownerId, new Blob([oversized], { type: "image/png" }));
+    expect(res.status).toBe(303);
+    expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
+    expect(await avatarMarker()).toBe(false);
+  });
+
+  it("a body over the 524288-byte wire cap answers before any byte is read (the pre-read declared-length arm)", async () => {
+    // readOrgAvatarUpload's declared Content-Length check bounds the request
+    // BEFORE the multipart parse — a ~600 KB upload answers the same silent
+    // redirect with nothing stored.
+    const big = new Uint8Array(600_000);
+    big.set(PNG_1X1, 0);
+    const res = await postAvatarBlob(`/${OPTIONS_ORG}/settings/avatar`, world.ownerId, new Blob([big], { type: "image/png" }));
+    expect(res.status).toBe(303);
+    expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
+    expect(await avatarMarker()).toBe(false);
+  });
+
+  it("the empty-input upload POST answers the none arm silently — nothing stored, the marker untouched (upstream's Avatar==nil arm reduced)", async () => {
+    // The multipart form with an EMPTY file input (the browser's
+    // Update-Avatar-with-nothing-chosen shape): upstream's UpdateAvatarSetting
+    // would still flip UseCustomAvatar and generate a random avatar
+    // (profile.go:157-163); the landed none arm stores and flips NOTHING —
+    // the documented reduction wave-49 pins only as a 303.
+    const res = await postAvatarRoute(`/${OPTIONS_ORG}/settings/avatar`, world.ownerId, false);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect(await avatarExists(env.REPO_PACKS, { kind: "org", principalId: world.orgUserId })).toBe(false);
+    expect(await avatarMarker()).toBe(false);
+  });
+
   // -- the rename 307/redirect semantics --------------------------------------
 
   it("the rename POST 303s onto the NEW name's settings page; the seam 307s the old name for the owner, anonymous viewers and a write POST", async () => {
@@ -533,6 +606,47 @@ describe("the mounted org settings routes (the minted-session route-level matrix
     const html = await page.text();
     expect(html).toContain('name="visibility" type="radio" value="limited" checked');
     expect(html).not.toContain('name="visibility" type="radio" value="public" checked');
+  });
+
+  it("the PRIVATE flip combo: lands in D1, the private radio re-renders (the modal's hidden field rides), and the flip back re-opens public", async () => {
+    // The third enum value's write (SettingsChangeVisibilityPost's success
+    // arm, routers/web/org/setting.go:258-265) — public → private.
+    const res = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "private" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OPTIONS_ORG}/settings`);
+    expect((await orgRow(OPTIONS_ORG)).visibility).toBe("private");
+    // The re-rendered modal: private checked, the other two radios off, and
+    // the hidden current_visibility field carrying the new state.
+    const page = await getRoute(`/${OPTIONS_ORG}/settings`, world.ownerId);
+    const html = await page.text();
+    expect(html).toContain('name="visibility" type="radio" value="private" checked');
+    expect(html).not.toContain('name="visibility" type="radio" value="public" checked');
+    expect(html).not.toContain('name="visibility" type="radio" value="limited" checked');
+    expect(html).toContain('name="current_visibility" value="private"');
+    // The re-open: private → public round-trips the same arms (the flip-back
+    // the wave-49 suite drives only from limited).
+    const back = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "public" });
+    expect(back.status).toBe(303);
+    expect((await orgRow(OPTIONS_ORG)).visibility).toBe("public");
+    const reopened = await (await getRoute(`/${OPTIONS_ORG}/settings`, world.ownerId)).text();
+    expect(reopened).toContain('name="visibility" type="radio" value="public" checked');
+    expect(reopened).not.toContain('name="visibility" type="radio" value="private" checked');
+  });
+
+  it("the unchanged and out-of-enum bodies answer the redirect arms and the PAGE keeps the stored radios (setting.go:246-255)", async () => {
+    // Start from limited so the stored state is distinguishable.
+    await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "limited" });
+    // The unchanged value (nothing_has_been_changed, :252-255)…
+    const same = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "limited" });
+    expect(same.status).toBe(303);
+    // …and the out-of-enum value (invalid_data, :246-249) both land back
+    // silently; the page's radios render the STORED state, never the junk.
+    const bogus = await postRoute(`/${OPTIONS_ORG}/settings/visibility`, world.ownerId, { visibility: "stealth" });
+    expect(bogus.status).toBe(303);
+    expect((await orgRow(OPTIONS_ORG)).visibility).toBe("limited");
+    const html = await (await getRoute(`/${OPTIONS_ORG}/settings`, world.ownerId)).text();
+    expect(html).toContain('name="visibility" type="radio" value="limited" checked');
+    expect(html).not.toContain('name="visibility" type="radio" value="stealth"');
   });
 
   // -- the §2.8 guard -----------------------------------------------------------
