@@ -36,15 +36,35 @@
  *   R6  table headers   — every real <table> has a <thead> whose <th> cells
  *                         each carry an explicit scope attribute (scope=col
  *                         added additively to the one real data table,
- *                         components/commit-list.tsx). Exemption: the
- *                         code-view line table (file-view.tsx mirrors
- *                         upstream view_file.tmpl's `<table>` of line
- *                         numbers/cells) and — pages wave 5 — the diff line
- *                         table (upstream section_unified.tmpl's `<table
- *                         class="chroma">` of line numbers/cells, the same
- *                         presentational shape) are exempt: no header
- *                         semantics to scope. #repo-files-table is
- *                         deliberately NOT an HTML table (§2.4.1 upstream
+ *                         components/commit-list.tsx). Exemptions:
+ *                         (a) the presentational line tables — the
+ *                         code-view blob table (file-view.tsx mirrors
+ *                         upstream view_file.tmpl) and the diff line table
+ *                         (upstream section_unified.tmpl's `<table
+ *                         class="chroma">`) — no header semantics to scope;
+ *                         (b) the DEFINITION-SHAPE table (the wave-theadless-
+ *                         policy refinement): a thead-less table whose every
+ *                         row is exactly one label cell + one value cell
+ *                         (two <td>, no <th> anywhere, at least one row).
+ *                         POLICY CALL (documented per the mission): the
+ *                         defect this rule targets is a header-less DATA
+ *                         table — a records×columns grid whose column
+ *                         dimension has no names to scope. Upstream renders
+ *                         key/value tables thead-less BY DESIGN at the pin —
+ *                         stats.tmpl's `<td width="200">{{$statsKey}}</td>
+ *                         <td>{{…}}</td>` rows and dashboard.tmpl's
+ *                         maintenance-operations rows (`<td>{label}</td>
+ *                         <td class="tw-text-right">{run button}</td>`) —
+ *                         because each row is self-describing (the label IS
+ *                         the row header; there is no column dimension), so
+ *                         forcing a thead would diverge from upstream for no
+ *                         a11y gain. The shape test is structural and total:
+ *                         any <th> anywhere, any row with ≠2 cells, or zero
+ *                         rows falls back to the data-table path (thead
+ *                         required) — the same shape also classifies the
+ *                         un-golden'd admin-dashboard task table and wiki
+ *                         pages list as upstream-faithful. #repo-files-table
+ *                         is deliberately NOT an HTML table (§2.4.1 upstream
  *                         div shape) — its row/cell structure is asserted
  *                         structurally in a11y.test.ts instead.
  */
@@ -260,6 +280,18 @@ function hasPresentationalTableAncestor(el: A11yElement): boolean {
   return false;
 }
 
+/** The R6 definition-shape test (the wave-theadless-policy exemption): every
+ *  row is exactly one label td + one value td, with no <th> anywhere and at
+ *  least one row — the vacuous empty-table match would silently exempt a
+ *  data table that lost BOTH its headers and its rows. Cites in the header
+ *  comment (stats.tmpl, dashboard.tmpl). */
+function isDefinitionShapeTable(table: A11yElement): boolean {
+  const rows = descendants(table).filter((el) => el.tag === "tr");
+  if (rows.length === 0) return false;
+  if (descendants(table).some((el) => el.tag === "th")) return false;
+  return rows.every((row) => row.children.length === 2 && row.children.every((cell) => cell.tag === "td"));
+}
+
 export function getElementById(root: A11yElement, id: string): A11yElement | null {
   return descendants(root).find((el) => el.attrs.id === id) ?? null;
 }
@@ -323,12 +355,17 @@ export function runA11y(html: string): A11yViolation[] {
 
   // R6 — real data tables: thead present, every th carries an explicit
   // scope. The code-view / code-diff line tables are presentational
-  // (upstream shapes).
+  // (upstream shapes); the definition-shape table (label/value rows, the
+  // upstream-faithful key/value idiom — the header comment's policy call)
+  // has no column dimension to scope, so it is exempt from the thead
+  // requirement while every other thead-less table still fires.
   for (const table of all.filter((el) => el.tag === "table")) {
     if (hasPresentationalTableAncestor(table)) continue;
     const thead = table.children.find((child) => child.tag === "thead");
     if (thead === undefined) {
-      add("R6-table-headers", `table#${table.attrs.id ?? "(no id)"} has no thead`);
+      if (!isDefinitionShapeTable(table)) {
+        add("R6-table-headers", `table#${table.attrs.id ?? "(no id)"} has no thead`);
+      }
       continue;
     }
     for (const th of descendants(thead).filter((el) => el.tag === "th")) {

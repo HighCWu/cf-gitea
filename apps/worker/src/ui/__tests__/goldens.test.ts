@@ -183,7 +183,9 @@ describe("golden DOM snapshots (§5.2)", () => {
  * The audit's queued R6 gap (the a11y suite can only SEE tables embedded in
  * goldens) added the admin listing pages below. admin-repos is TAKEN (the
  * wave-fixed-id-seed closure, via the positive-match search arm — the case
- * comment documents why the bare path stays unlandable); admin-monitor
+ * comment documents why the bare path stays unlandable); admin-monitor's
+ * stats + queue surfaces were closed by the wave-theadless-policy refinement
+ * of the R6 rule (the block comment below holds the policy call); cron
  * remains the one documented skip — the analysis lives here so the next
  * attempt starts from the mechanism, not from a fresh dead end:
  *
@@ -220,19 +222,40 @@ describe("golden DOM snapshots (§5.2)", () => {
  *     label, the null-Updated empty arm, the T0-pinned Created). Unlike the
  *     zero-row arm the original skip note rejected, this renders a real
  *     table row — the coverage the R6 gap asks for.
- *   - admin-monitor (SKIPPED — the cron/queue tables the audit names, per
- *     page): cron renders wall-clock bytes — the route passes
- *     `new Date()` (ui/index.ts loadAdminMonitorCron) and the Next Time
- *     column formats it, so no fixture can pin the page. stats and queue DO
- *     have existing deterministic fixture paths (stats is pure COUNT reads;
- *     queue reads the hooks seed's webhook_deliveries — pending 1, delivered
- *     2 — and the mirror seed's idle repo_mirrors row), but each renders a
- *     THEAD-LESS table (stats.tmpl's key/count rows; the queue page's
- *     delivery-states segment): the R6 walker's "has no thead" violation on
- *     first sight — the stop condition, reported instead of pinned. Upstream's
- *     stats.tmpl is itself thead-less, so the fix is a policy call for the
- *     page owner (diverge with a thead, or exempt the upstream-shape
- *     key/value table in a11y.ts), not a goldens-wave change.
+ *   - admin-monitor (PARTIALLY TAKEN — stats + queue, wave-theadless-policy;
+ *     cron STAYS skipped): the earlier skip's blocker was the R6 walker's
+ *     "has no thead" violation on each page's thead-less table — the
+ *     stop condition, reported instead of pinned. The policy call resolved
+ *     it WITHOUT diverging from upstream: the defect R6 targets is a
+ *     header-less DATA table (a records×columns grid with unnamed columns),
+ *     while upstream renders key/value tables thead-less BY DESIGN at the
+ *     pin (stats.tmpl's `<td width="200">{key}</td><td>{count}</td>` rows;
+ *     dashboard.tmpl's label/run-button rows) — a11y.ts now exempts the
+ *     definition-shape table (every row exactly one label td + one value td,
+ *     no th, ≥1 row) with those cites. That un-blocked:
+ *
+ *     - admin-monitor-stats (TAKEN): `/-/admin/monitor/stats` — the Summary
+ *       page over loadAdminMonitorStats's COUNT reads: every counter is a
+ *       fixed SELECT over the harness seed (users/repos/issues/…), whose
+ *       row sets the idempotent seeders pin — no wall clock, no randomUUID
+ *       reaches a counted cell (repo ids are random but only COUNT(*) reads
+ *       them). The 24 key/count rows render under upstream's exact sorted
+ *       key names; system-comment rows (IssuesService event comments) are
+ *       seeded with fixed `now`s, so the Comment count is fixture-derived
+ *       like every other cell.
+ *     - admin-monitor-queue (TAKEN): `/-/admin/monitor/queue` — the depth
+ *       columns read the hooks seed's webhook_deliveries (pending 1 +
+ *       delivered 2 → webhook-delivery inQueue 1) and the mirror seed's
+ *       idle repo_mirrors row (→ repo-tasks inQueue 0), with the DLQ's
+ *       countable-less `-` arm; the cf-gitea delivery-states segment
+ *       renders the five schema states 1/0/2/0/0, zeros included (the log's
+ *       full posture). The main queues table carries thead+scope (upstream
+ *       queue.tmpl's own shape); the delivery-states segment is the
+ *       definition shape the refined rule exempts.
+ *     - admin-monitor cron (STILL SKIPPED — unchanged): the route passes
+ *       `new Date()` (ui/index.ts loadAdminMonitorCron) and the Next Time
+ *       column formats it, so no fixture can pin the page — wall-clock
+ *       bytes, not a policy question.
  */
 const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "admin-users.html", path: "/-/admin/users", status: 200, signedIn: true, sessionUser: "morgan" },
@@ -252,6 +275,14 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "user-settings-account.html", path: "/user/settings/account", status: 200, signedIn: true },
   { file: "profile-watching.html", path: "/alice?tab=watching", status: 200, signedIn: true },
   { file: "milestone-detail.html", path: "/alice/golden-ms/milestone/2", status: 200, signedIn: true },
+  // The wave-theadless-policy closures (the block comment above): the two
+  // monitor surfaces the refined R6 rule un-blocked, riding morgan's
+  // promotion like the other admin goldens. stats: the sorted key/count
+  // definition-shape table over the harness seed's COUNT reads. queue: the
+  // hooks seed's delivery depths (inQueue 1 / 0 / `-`) + the five-state
+  // breakdown (1/0/2/0/0). cron stays skipped — wall-clock Next Time bytes.
+  { file: "admin-monitor-stats.html", path: "/-/admin/monitor/stats", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "admin-monitor-queue.html", path: "/-/admin/monitor/queue", status: 200, signedIn: true, sessionUser: "morgan" },
 ];
 
 describe("wave-129 expansion goldens", () => {

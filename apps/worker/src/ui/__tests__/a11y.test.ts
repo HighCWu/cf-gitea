@@ -12,6 +12,8 @@ import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } f
 // NEW_GOLDEN_CASES) — covered EXPLICITLY by the expansion arms below, never
 // through harness.ts's GOLDEN_CASES (that table feeds the smoke loop above
 // too; entries added there would silently grow this suite without review).
+import adminMonitorQueueGolden from "./goldens/admin-monitor-queue.html?raw";
+import adminMonitorStatsGolden from "./goldens/admin-monitor-stats.html?raw";
 import adminOrgsGolden from "./goldens/admin-orgs.html?raw";
 import adminReposGolden from "./goldens/admin-repos.html?raw";
 import adminUsersGolden from "./goldens/admin-users.html?raw";
@@ -283,6 +285,16 @@ const EXPANSION_ARMS: ExpansionArm[] = [
   // two icon-only navbar anchors carry aria-labels), and all ten th cells
   // carry scope (the admin-users gap-closed posture held here from birth).
   { file: "admin-repos.html", golden: adminReposGolden, mainAriaLabel: "Repositories", mainClassTokens: ["admin"], thWithoutScope: 0 },
+  // admin-monitor stats + queue (the wave-theadless-policy closure — the
+  // queued policy call): the R6 net's first sight of both pages is CLEAN
+  // under the REFINED rule — no rule needed a pre-fix. The pages' thead-less
+  // tables (the stats key/count rows; the queue page's delivery-states
+  // segment) are the definition shape the refined R6 exempts with upstream's
+  // stats.tmpl cite (each row = one label td + one value td, no th, no
+  // column dimension to scope — see a11y.ts's header comment); the queue
+  // page's main table carries thead+scope (upstream queue.tmpl's own shape).
+  { file: "admin-monitor-stats.html", golden: adminMonitorStatsGolden, mainAriaLabel: "Stats", mainClassTokens: ["admin", "monitor"], thWithoutScope: 0 },
+  { file: "admin-monitor-queue.html", golden: adminMonitorQueueGolden, mainAriaLabel: "Queues", mainClassTokens: ["admin", "monitor"], thWithoutScope: 0 },
 ];
 
 describe("wave-129 expansion arms (explicit cases, not the shared table)", () => {
@@ -430,6 +442,135 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     // The null-Updated arm renders the empty cell; Created is T0-pinned.
     expect(accessibleName(tds[8] ?? ({} as never))).toBe("");
     expect(accessibleName(tds[9] ?? ({} as never))).toBe("Nov 14, 2023");
+  });
+
+  it("admin-monitor-stats: the admin sidebar names every arm (Stats active) and the Summary table is the definition shape the refined R6 exempts", () => {
+    const root = parseHtmlTree(adminMonitorStatsGolden);
+    const nav = descendants(root).find((el) => hasClass(el, "flex-container-nav"));
+    expect(nav, "the admin sidebar nav").toBeDefined();
+    const items = descendants(nav ?? root).filter((el) => el.tag === "a");
+    expect(items.map((el) => accessibleName(el))).toEqual([
+      "Dashboard",
+      "Organizations",
+      "User Accounts",
+      "Repositories",
+      "Stats",
+      "Cron Tasks",
+      "Queues",
+      "Trace",
+    ]);
+    const active = items.filter((el) => hasClass(el, "active"));
+    expect(active.map((el) => accessibleName(el))).toEqual(["Stats"]);
+    expect(active[0]?.attrs.href).toBe("/-/admin/monitor/stats");
+    // The page's only heading is the Summary section header; a lone heading
+    // can neither skip a level (R2) nor double the h1 (R1).
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => accessibleName(el))).toEqual(["Summary"]);
+
+    // The stats table is the definition shape — every row one label td +
+    // one value td, no thead, no th — upstream stats.tmpl's thead-less
+    // render at the pin. The structural pins below keep the exemption
+    // honest: if any row ever grows a third cell (or a th appears), the
+    // shape test fails total and the refined rule fires again.
+    const tables = descendants(root).filter((el) => el.tag === "table");
+    expect(tables, "the Summary table is the page's only table").toHaveLength(1);
+    const table = tables[0] ?? root;
+    expect(table.children.some((el) => el.tag === "thead"), "no thead (the upstream shape)").toBe(false);
+    const rows = descendants(table).filter((el) => el.tag === "tr");
+    expect(rows, "the landed-counter key list, sorted (admin.go:287)").toHaveLength(24);
+    for (const row of rows) {
+      expect(row.children.map((el) => el.tag)).toEqual(["td", "td"]);
+    }
+    expect(rows.map((row) => accessibleName(row.children[0] ?? root))).toEqual([
+      "Attachment",
+      "Comment",
+      "CommitStatus",
+      "Follow",
+      "HookTask",
+      "Issue",
+      "IssueClosed",
+      "IssueOpen",
+      "Label",
+      "Milestone",
+      "Mirror",
+      "Oauth",
+      "Org",
+      "Project",
+      "ProjectColumn",
+      "PublicKey",
+      "Release",
+      "Repo",
+      "Star",
+      "Team",
+      "UsersActive",
+      "UsersNotActive",
+      "Watch",
+      "Webhook",
+    ]);
+  });
+
+  it("admin-monitor-queue: the queues table keeps thead+scope, the depths pin the seed states, and the delivery-states segment is the definition shape", () => {
+    const root = parseHtmlTree(adminMonitorQueueGolden);
+    const nav = descendants(root).find((el) => hasClass(el, "flex-container-nav"));
+    expect(nav, "the admin sidebar nav").toBeDefined();
+    const items = descendants(nav ?? root).filter((el) => el.tag === "a");
+    expect(items.map((el) => accessibleName(el))).toEqual([
+      "Dashboard",
+      "Organizations",
+      "User Accounts",
+      "Repositories",
+      "Stats",
+      "Cron Tasks",
+      "Queues",
+      "Trace",
+    ]);
+    const active = items.filter((el) => hasClass(el, "active"));
+    expect(active.map((el) => accessibleName(el))).toEqual(["Queues"]);
+    expect(active[0]?.attrs.href).toBe("/-/admin/monitor/queue");
+    // Two same-level section headers — the R2 walk stays flat.
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => accessibleName(el))).toEqual(["Queues", "Webhook delivery states"]);
+
+    // The main queues table: upstream queue.tmpl's own shape — thead with
+    // every th scoped, three landed-source rows. The depths pin the goldens
+    // fixture state (goldens.test.ts's case comment): the hooks seed's
+    // pending 1 → webhook-delivery inQueue 1, the mirror seed's idle row →
+    // repo-tasks 0, and the DLQ's countable-less `-` arm.
+    const tables = descendants(root).filter((el) => el.tag === "table");
+    expect(tables, "the queues table + the delivery-states segment").toHaveLength(2);
+    const queueTable = tables[0] ?? root;
+    const thead = queueTable.children.find((el) => el.tag === "thead");
+    expect(thead, "the queues table has a thead").toBeDefined();
+    const ths = descendants(thead ?? root).filter((el) => el.tag === "th");
+    expect(ths.map((el) => accessibleName(el))).toEqual(["Name", "Type", "Number in Queue"]);
+    expect(ths.every((el) => el.attrs.scope === "col"), "every th carries scope=col").toBe(true);
+    const queueRows = descendants(queueTable).filter((el) => el.tag === "tr" && el.children.some((c) => c.tag === "td"));
+    expect(
+      queueRows.map((row) => row.children.map((cell) => accessibleName(cell))),
+    ).toEqual([
+      ["webhook-delivery", "cloudflare-queue", "1"],
+      ["repo-tasks", "cloudflare-queue", "0"],
+      ["webhook-delivery-dlq", "cloudflare-queue", "-"],
+    ]);
+
+    // The cf-gitea delivery-states segment: the definition shape the refined
+    // R6 exempts (no thead, every row exactly label td + value td), over the
+    // hooks seed's log — all five schema states in lifecycle order, zeros
+    // included (the log's full posture).
+    const statesTable = tables[1] ?? root;
+    expect(statesTable.children.some((el) => el.tag === "thead"), "no thead (the stats.tmpl idiom)").toBe(false);
+    const stateRows = descendants(statesTable).filter((el) => el.tag === "tr");
+    expect(stateRows).toHaveLength(5);
+    for (const row of stateRows) {
+      expect(row.children.map((el) => el.tag)).toEqual(["td", "td"]);
+    }
+    expect(stateRows.map((row) => row.children.map((cell) => accessibleName(cell)))).toEqual([
+      ["pending", "1"],
+      ["delivering", "0"],
+      ["delivered", "2"],
+      ["skipped", "0"],
+      ["failed", "0"],
+    ]);
   });
 
   it("user-settings-account: the settings sidebar names every arm (Account active) and the three section headings hold level", () => {
@@ -594,6 +735,25 @@ describe("a11y walker pins", () => {
       '<html><body><div class="file-body file-code code-diff code-diff-unified"><table><tbody><tr class="add-code"><td class="lines-num"></td></tr></tbody></table></div></body></html>',
     );
     expect(codeDiff.filter((v) => v.rule === "R6-table-headers")).toEqual([]);
+    // The wave-theadless-policy refinement: the DEFINITION-SHAPE table (every
+    // row exactly one label td + one value td, no th, at least one row) is
+    // exempt — upstream renders key/value tables thead-less BY DESIGN at the
+    // pin (stats.tmpl's key/count rows; dashboard.tmpl's label/run-button
+    // rows; a11y.ts's header comment holds the policy call).
+    const definitionShape = runA11y(
+      "<html><body><table><tbody><tr><td>Attachment</td><td>1</td></tr><tr><td>Comment</td><td>4</td></tr></tbody></table></body></html>",
+    );
+    expect(definitionShape.filter((v) => v.rule === "R6-table-headers")).toEqual([]);
+    // The shape test is total — every OTHER thead-less shape still fires:
+    // a three-cell row is a records×columns grid without headers…
+    const threeCells = runA11y("<html><body><table><tbody><tr><td>a</td><td>b</td><td>c</td></tr></tbody></table></body></html>");
+    expect(threeCells.filter((v) => v.rule === "R6-table-headers")).toHaveLength(1);
+    // …a th anywhere means a scoppable header dimension that lost its thead…
+    const strayTh = runA11y("<html><body><table><tbody><tr><th>a</th><td>b</td></tr></tbody></table></body></html>");
+    expect(strayTh.filter((v) => v.rule === "R6-table-headers")).toHaveLength(1);
+    // …and the vacuous zero-row match must not exempt an empty broken table.
+    const zeroRows = runA11y("<html><body><table><tbody></tbody></table></body></html>");
+    expect(zeroRows.filter((v) => v.rule === "R6-table-headers")).toHaveLength(1);
   });
 
   it("counts h1 and tolerates entity-bearing text", () => {
