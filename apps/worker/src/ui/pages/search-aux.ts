@@ -163,7 +163,7 @@
  * not a page.
  */
 
-import { desc, like, sql } from "drizzle-orm";
+import { desc, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { MAX_RESPONSE_ITEMS, parseListOptions } from "../../api/pagination";
@@ -706,11 +706,15 @@ function topicId(name: string): number {
 }
 
 /**
- * Feed 2 loader — FindTopicOptions' keyword LIKE + repo_count DESC over
+ * Feed 2 loader — FindTopicOptions' keyword substring + repo_count DESC over
  * the landed GROUP-BY-repo_topics divergence (the API /topics/search
  * read, routes/repo-extras-t2.ts:884-910). Topics are stored lowercase
- * (services/repo-topics.ts:63), so the lowercased keyword LIKE is the
- * upstream ASCII-case-insensitive match. `repo_count DESC` first
+ * (services/repo-topics.ts:63), so the lowercased keyword against the bare
+ * column is the upstream ASCII-case-insensitive match. NOT LIKE: D1 caps
+ * LIKE patterns at 50 bytes, so a long `?q=` needle threw D1_ERROR and the
+ * feed answered a plain 500; the substring goes through instr() instead —
+ * the documented user-search precedent (services/user.ts:81-97, the
+ * org-members 943e1e9 shape). `repo_count DESC` first
  * (models/repo/topic.go:189), topic-name tiebreak (our determinism —
  * upstream leaves ties to the planner).
  */
@@ -719,8 +723,8 @@ export async function loadTopicSearchAux(
   params: TopicSearchAuxParams,
 ): Promise<{ total: number; topics: TopicSearchAuxTopic[] }> {
   const keyword = params.keyword.toLowerCase();
-  const filter = keyword === "" ? undefined : `%${keyword}%`;
-  const where = filter === undefined ? sql`1 = 1` : like(repoTopics.topic, filter);
+  const filter = keyword === "" ? undefined : sql`instr(${repoTopics.topic}, ${keyword}) > 0`;
+  const where = filter === undefined ? sql`1 = 1` : filter;
   const db = drizzle(env.DB);
   const grouped = db
     .select({ topic: repoTopics.topic })

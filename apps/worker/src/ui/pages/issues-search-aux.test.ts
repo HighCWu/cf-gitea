@@ -400,6 +400,12 @@ describe("loadIssuesSuggestionsAux — GetSuggestion", () => {
     // through untouched).
     const oneSpace = await loadIssuesSuggestionsAux(env, s.repoId, null, " ");
     expect(oneSpace.map((item) => item.number)).toEqual([6, 5, 4, 2, 1]);
+
+    // The keyword arm must not cap (the 943e1e9 org-members class — D1's
+    // 50-byte LIKE pattern limit): a 200-char needle passes the boundary
+    // as the clean no-match answer, not a D1_ERROR throw.
+    const longNeedle = await loadIssuesSuggestionsAux(env, s.repoId, null, "z".repeat(200));
+    expect(longNeedle).toEqual([]);
   });
 
   it("the exact-index hit is PREPENDED even when the title does not match and the pass ignores isPull", async () => {

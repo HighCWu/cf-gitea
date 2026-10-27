@@ -186,7 +186,7 @@
  *   description renders on the landed milestone-detail page).
  */
 
-import { and, asc, eq, inArray, like, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { hasWorkInProgressPrefix, issueLabelRows } from "../../api/services/issues";
@@ -466,14 +466,21 @@ function armLabel(arm: OverviewViewType): string {
 // Shared WHERE pieces: keyword, labels, poster/assignee, sorts
 // ---------------------------------------------------------------------------
 
-/** The keyword arm — services/issues.ts issueFilterConditions' LIKE pair
- *  (title ∨ content, case-insensitive; the landed search reduction). */
+/** The keyword arm — services/issues.ts issueFilterConditions' substring
+ *  pair (title ∨ content, case-insensitive; the landed search reduction).
+ *  NOT LIKE: D1 caps LIKE patterns at 50 bytes, so a long `q=` needle threw
+ *  D1_ERROR and the page answered a plain 500; the substring goes through
+ *  instr() instead — the documented user-search precedent
+ *  (services/user.ts:81-97, the org-members 943e1e9 shape), the exact pair
+ *  the services/issues.ts arm now carries. The needle pre-lowers for the
+ *  case-insensitive pair (the columns lower() in SQL, exactly what the
+ *  LIKE wrapped). */
 function keywordConditionSql(keyword: string): SQL | null {
   if (keyword === "") return null;
-  const needle = `%${keyword.toLowerCase()}%`;
+  const needle = keyword.toLowerCase();
   return or(
-    like(sql`lower(${issues.title})`, needle),
-    like(sql`lower(coalesce(${issues.content}, ''))`, needle),
+    sql`instr(lower(${issues.title}), ${needle}) > 0`,
+    sql`instr(lower(coalesce(${issues.content}, '')), ${needle}) > 0`,
   ) as SQL;
 }
 
@@ -947,7 +954,12 @@ export async function loadDashboardMilestonesData(
   // The sidebar repo menu: scope repos bearing ≥1 milestone in ANY state
   // (upstream HasMilestones: true), with the current state+keyword counts
   // (upstream CountMilestonesMap, home.go:211-219).
-  const nameFilter = keyword === "" ? null : like(milestones.name, `%${keyword}%`);
+  // NOT LIKE: D1 caps LIKE patterns at 50 bytes, so a long `q=` needle
+  // threw D1_ERROR and the page answered a plain 500 — the instr() shape
+  // (services/user.ts:81-97, the org-members 943e1e9 shape), mirroring the
+  // services/milestones.ts name arm. The needle pre-lowers and the name
+  // lower()s in SQL, exactly what the ASCII-case-insensitive LIKE wrapped.
+  const nameFilter = keyword === "" ? null : sql`instr(lower(${milestones.name}), ${keyword.toLowerCase()}) > 0`;
   const countRows =
     scopeIds.length === 0
       ? []

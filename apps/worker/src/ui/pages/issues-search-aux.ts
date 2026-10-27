@@ -106,7 +106,7 @@
  * index-owned). Not a page — the branches-list-aux sibling module.
  */
 
-import { and, desc, eq, inArray, like, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { issues, pullRequests } from "../../db/schema";
@@ -432,9 +432,15 @@ export async function loadIssuesSuggestionsAux(
       }
     }
     // FindIssuesSuggestionByKeyword (issue.go:526-546): title-only
-    // case-insensitive LIKE (BuildCaseInsensitiveLike, models/db/common.go:19-25),
-    // id != excluded, updated_unix DESC then index DESC.
-    const conditions = [...scope, like(sql`lower(${issues.title})`, `%${keyword.toLowerCase()}%`)];
+    // case-insensitive substring (upstream BuildCaseInsensitiveLike,
+    // models/db/common.go:19-25), id != excluded, updated_unix DESC then
+    // index DESC. NOT LIKE: D1 caps LIKE patterns at 50 bytes, so a long
+    // `?q=` needle threw D1_ERROR and the feed answered a plain 500; the
+    // substring goes through instr() instead — the documented user-search
+    // precedent (services/user.ts:81-97, the org-members 943e1e9 shape).
+    // The needle pre-lowers for the case-insensitive pair (the column
+    // lower()s in SQL, exactly what the LIKE wrapped).
+    const conditions = [...scope, sql`instr(lower(${issues.title}), ${keyword.toLowerCase()}) > 0`];
     if (byIndex !== undefined) conditions.push(ne(issues.id, byIndex.id));
     rows = await db
       .select()

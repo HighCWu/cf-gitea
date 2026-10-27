@@ -176,7 +176,7 @@
  *   shared/repo/list.tmpl:85-88's bare-div wrapper.
  */
 
-import { and, asc, desc, eq, inArray, isNotNull, isNull, like, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { hasWorkInProgressPrefix, issueLabelRows } from "../../api/services/issues";
@@ -698,20 +698,26 @@ function watchingSortOrder(sort: WatchingSortType): SQL[] {
   }
 }
 
-/** The landed repo-search keyword arm verbatim (services/repository.ts):
+/** The landed repo-search keyword arm's shape (services/repository.ts):
  *  comma-separated parts, case-insensitive slug substring, plus the
- *  one-slash `owner/name` pair match. */
+ *  one-slash `owner/name` pair match. NOT LIKE: D1 caps LIKE patterns at
+ *  50 bytes, so a long `q=` part threw D1_ERROR and the page answered a
+ *  plain 500; the substrings go through instr() instead — the documented
+ *  user-search precedent (services/user.ts:81-97, the org-members 943e1e9
+ *  shape), the exact pair the services/repository.ts arm now carries. The
+ *  needles pre-lower for the case-insensitive pair (owner_namespace/slug
+ *  are stored lowercase). */
 function keywordCondition(keyword: string): SQL | null {
   if (keyword === "") return null;
   const parts: SQL[] = [];
   for (const part of keyword.split(",")) {
-    parts.push(like(repositories.slug, `%${part.toLowerCase()}%`));
+    parts.push(sql`instr(${repositories.slug}, ${part.toLowerCase()}) > 0`);
     const slash = part.indexOf("/");
     if (slash > 0 && part.indexOf("/", slash + 1) === -1) {
       parts.push(
         and(
-          like(repositories.ownerNamespace, `%${part.slice(0, slash).toLowerCase()}%`),
-          like(repositories.slug, `%${part.slice(slash + 1).toLowerCase()}%`),
+          sql`instr(${repositories.ownerNamespace}, ${part.slice(0, slash).toLowerCase()}) > 0`,
+          sql`instr(${repositories.slug}, ${part.slice(slash + 1).toLowerCase()}) > 0`,
         ) as SQL,
       );
     }

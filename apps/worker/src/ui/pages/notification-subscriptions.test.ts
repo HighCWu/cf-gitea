@@ -476,6 +476,18 @@ describe("loadWatchingData — the WatchedByID read", () => {
     const none = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("q=nomatch"));
     expect(none.total).toBe(0);
 
+    // The keyword arms must not cap (the 943e1e9 org-members class — D1's
+    // 50-byte LIKE pattern limit): 200-char needles answer the clean empty
+    // result, not a D1_ERROR 500 — the bare needle and the owner/name pair.
+    const longNeedle = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams(`q=${"z".repeat(200)}`));
+    expect(longNeedle.total).toBe(0);
+    const longPair = await loadWatchingData(
+      env.DB,
+      s.viewerViewer,
+      new URLSearchParams(`q=origin/${"z".repeat(200)}`),
+    );
+    expect(longPair.total).toBe(0);
+
     const archived = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("archived=true"));
     expect(archived.total).toBe(0); // nothing archived in the fixture
     const notArchived = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("archived=false"));

@@ -293,6 +293,16 @@ describe("GET /repos/search (repoSearch)", () => {
     const body = await res.json<{ data: Array<{ full_name: string }> }>();
     expect(res.headers.get("X-Total-Count")).toBe("1");
     expect(body.data.map((r) => r.full_name)).toEqual(["bob/widgets"]);
+
+    // The keyword arms must not cap (the 943e1e9 org-members class — D1's
+    // 50-byte LIKE pattern limit): 200-char needles answer the clean empty
+    // result, not a D1_ERROR 500 — the bare needle and the owner/name pair.
+    const longQ = await router()(`/repos/search?q=${"z".repeat(200)}`);
+    expect(longQ.status).toBe(200);
+    expect(longQ.headers.get("X-Total-Count")).toBe("0");
+    const longPair = await router()(`/repos/search?q=bob/${"z".repeat(200)}`);
+    expect(longPair.status).toBe(200);
+    expect(longPair.headers.get("X-Total-Count")).toBe("0");
   });
 
   it("hides private repos from anonymous callers, shows own to the token owner", async () => {

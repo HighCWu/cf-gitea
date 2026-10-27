@@ -265,4 +265,27 @@ describe("GET /milestones (loadDashboardMilestonesData + renderDashboardMileston
     expect(html).not.toContain("s9");
     expect(html).not.toContain("bob/secret");
   });
+
+  it("a 200-char keyword answers the clean empty page on both keyword arms (no D1 LIKE-cap 500)", async () => {
+    // The keyword arms (the milestones nameFilter and the issues/pulls
+    // keywordConditionSql pair) must not cap (the 943e1e9 org-members
+    // class — D1's 50-byte LIKE pattern limit): long needles pass the
+    // boundary as the clean no-match answers.
+    const state = await seed();
+    const milestonesData = await loadDashboardMilestonesData(
+      env.DB,
+      state.aliceViewer,
+      new URLSearchParams(`q=${"z".repeat(200)}`),
+      at(100),
+    );
+    expect(milestonesData.total).toBe(0);
+    expect(milestonesData.items).toEqual([]);
+    const issuesData = await loadOverviewIssuesData(
+      env.DB,
+      state.aliceViewer,
+      "issues",
+      new URLSearchParams(`q=${"z".repeat(200)}`),
+    );
+    expect(issuesData.items).toEqual([]);
+  });
 });

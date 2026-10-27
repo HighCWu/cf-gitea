@@ -1,4 +1,4 @@
-import { and, asc, eq, like, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { milestones } from "../../db/schema";
@@ -135,8 +135,14 @@ export async function listRepoMilestones(
     conditions.push(eq(milestones.isClosed, opts.state === "closed"));
   }
   if (opts.name !== "") {
-    // db.BuildCaseInsensitiveLike — SQLite LIKE is already ASCII-case-insensitive.
-    conditions.push(like(milestones.name, `%${opts.name}%`));
+    // db.BuildCaseInsensitiveLike shape. NOT LIKE: D1 caps LIKE patterns at
+    // 50 bytes, so a long `?name=` needle threw D1_ERROR and the route
+    // answered a plain 500. The substring goes through instr() instead —
+    // the documented user-search precedent (services/user.ts:81-97, the
+    // org-members 943e1e9 shape). The needle pre-lowers for the
+    // case-insensitive pair (the name lower()s in SQL, exactly what the
+    // LIKE wrapped).
+    conditions.push(sql`instr(lower(${milestones.name}), ${opts.name.toLowerCase()}) > 0`);
   }
   const where = and(...conditions);
   const db = drizzle(d1);

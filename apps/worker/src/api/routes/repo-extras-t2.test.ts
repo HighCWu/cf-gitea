@@ -17,7 +17,7 @@
  */
 
 import { env } from "cloudflare:workers";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -51,6 +51,14 @@ import { ensureSeededRepo, type SeedCommit } from "../../ui/testing/seed-repo";
 import { releaseAssetKey } from "../services/release-assets";
 import { engineCell, ZERO_OID } from "../services/engine";
 import type { User } from "../models/user";
+
+// wave-129 full-run contention budget: this file's beforeAll seeding (the
+// receive-flow engine repo + the notes cell chain) measured a 4.86s hook share
+// of the 30s default IN a green 8-worker full run (the suite's 260-isolate
+// spawn storm spikes closures up to ~12x their solo time). File-local 90s
+// budgets; vitest.config.ts keeps 30s for every other file. Membership: the
+// measured >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 const OWNER = "extras";
 const SLUG = "engine";
@@ -344,6 +352,13 @@ describe("GET /topics/search (repo-extras-t2)", () => {
     expect(unfiltered.headers.get("X-Total-Count")).toBe("2"); // golang + testing
     const page2: { topics: Array<{ topic_name: string }> } = await unfiltered.json();
     expect(page2.topics.map((topic) => topic.topic_name)).toEqual(["testing"]); // name order, second page
+
+    // The keyword arm must not cap (the 943e1e9 org-members class — D1's
+    // 50-byte LIKE pattern limit): a 200-char needle answers the clean
+    // empty page, not a D1_ERROR 500.
+    const longQ = await send(`/topics/search?q=${"z".repeat(200)}`);
+    expect(longQ.status).toBe(200);
+    expect(longQ.headers.get("X-Total-Count")).toBe("0");
   });
 });
 

@@ -261,6 +261,13 @@ describe("GET /repos/{owner}/{repo}/milestones (issueGetMilestonesList)", () => 
     const byName = await router()("/repos/alice/visible/milestones?name=ALPH");
     expect(byName.headers.get("X-Total-Count")).toBe("1");
     expect((await byName.json<Array<{ title: string }>>())[0]?.title).toBe("alpha");
+
+    // The name arm must not cap (the 943e1e9 org-members class — D1's
+    // 50-byte LIKE pattern limit): a 200-char needle answers the clean
+    // empty list, not a D1_ERROR 500.
+    const longName = await router()(`/repos/alice/visible/milestones?name=${"z".repeat(200)}`);
+    expect(longName.status).toBe(200);
+    expect(longName.headers.get("X-Total-Count")).toBe("0");
   });
 
   it("paginates with the runtime headers and the exact contract field set", async () => {

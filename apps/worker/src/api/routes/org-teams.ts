@@ -2,7 +2,7 @@ import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { Context, MiddlewareHandler } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { and, asc, eq, inArray, like, ne, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, inArray, ne, or, sql, type SQL } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import { z } from "zod";
@@ -676,10 +676,16 @@ export class TeamsService {
     if (options.orgId !== undefined) conds.push(eq(teams.orgId, options.orgId));
     const keyword = options.keyword?.toLowerCase() ?? "";
     if (keyword.length > 0) {
-      const pattern = `%${keyword}%`;
-      const keywordConds: SQL[] = [like(teams.lowerName, pattern)];
+      // NOT LIKE: D1 caps LIKE patterns at 50 bytes, so a long keyword threw
+      // D1_ERROR and the route answered a plain 500. The substring goes
+      // through instr() instead — the documented user-search precedent
+      // (services/user.ts:81-97, the org-members 943e1e9 shape). The needle
+      // pre-lowers for the case-insensitive pair (lowerName is stored
+      // lowercase; description lower()s in SQL, exactly what the LIKE
+      // wrapped).
+      const keywordConds: SQL[] = [sql`instr(${teams.lowerName}, ${keyword}) > 0`];
       if (options.includeDesc !== false) {
-        keywordConds.push(like(sql`LOWER(${teams.description})`, pattern));
+        keywordConds.push(sql`instr(lower(${teams.description}), ${keyword}) > 0`);
       }
       conds.push(or(...keywordConds) as SQL);
     }

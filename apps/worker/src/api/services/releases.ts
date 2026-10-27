@@ -1,4 +1,4 @@
-import { and, desc, eq, like, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { releaseAssets, releases, users } from "../../db/schema";
@@ -68,9 +68,69 @@ export interface ReleaseListOptions {
   limit: number;
 }
 
-/** The `tag_filter` LIKE translation: `*` → `%`, everything else literal. */
-function tagFilterPattern(tagFilter: string): string {
-  return tagFilter.replaceAll("*", "%");
+/**
+ * The `tag_filter` glob, translated off LIKE. Upstream (models/repo/
+ * release.go:302-309) lowercases the filter, escapes `\`/`_`/`%` literal,
+ * turns `*` into `%`, and LIKEs `lower_tag_name` — only `*` is a wildcard.
+ * The landed shape (`*` → `%` into a raw parameterized LIKE) kept the glob
+ * but leaked `%`/`_` as wildcards AND hit D1's 50-byte LIKE pattern cap: a
+ * long `tag_filter` threw D1_ERROR and the route answered a plain 500. The
+ * translation keeps upstream's exact semantics on instr()/substr()
+ * primitives — no pattern, no cap (the documented user-search precedent,
+ * services/user.ts:81-97, the org-members 943e1e9 shape) — and `%`/`_`
+ * land literal the way upstream's escaping made them.
+ *
+ * Exactness: S matches `s0*s1*…*sn` iff S starts with s0, ends with sn,
+ * and the middles s1..s(n-1) embed in order without overlap. Greedy
+ * leftmost is exact — taking each middle's first occurrence in the
+ * remainder leaves the maximal tail, so the greedy embedding exists
+ * whenever any embedding does. The suffix is pinned to S's very end and
+ * must start past the consumed prefix+middles (glob embeddings never
+ * overlap: `*` may match empty but segments occupy disjoint ranges), which
+ * a plain endswith check would not enforce — the length inequality pins
+ * it. All SQL primitives (instr/substr/length) are character-based, so
+ * multi-byte tags translate consistently.
+ *
+ * Pragmatic bound (the only divergence from upstream): a filter with more
+ * than 64 non-empty `*` segments would build a WHERE expression past
+ * SQLite's expression-depth comfort (the chain nests per middle) — those
+ * match nothing (`0 = 1`), matching no result rather than a D1_ERROR 500.
+ * Upstream patterns (v1*, *beta, *rc*) use 0-2 stars.
+ */
+function tagFilterCondition(tagFilter: string): SQL {
+  const subject = sql`lower(${releases.tagName})`;
+  const segments = tagFilter.toLowerCase().split("*");
+  if (segments.length === 1) {
+    // No `*`: upstream's plain `%s%` substring.
+    return sql`instr(${subject}, ${segments[0]}) > 0`;
+  }
+  const first = segments[0]!;
+  const last = segments[segments.length - 1]!;
+  const middles = segments.slice(1, -1).filter((segment) => segment !== "");
+  if (middles.length > 64) return sql`0 = 1`;
+  const conds: SQL[] = [];
+  let pinned = first !== "";
+  if (first !== "") {
+    conds.push(sql`instr(${subject}, ${first}) = 1`);
+  }
+  // The greedy chain: `searchFrom` is the 1-based position the next segment
+  // must start at (one past everything already pinned).
+  let searchFrom: SQL = first === "" ? sql`1` : sql`length(${first}) + 1`;
+  for (const middle of middles) {
+    const found = sql`instr(substr(${subject}, ${searchFrom}), ${middle})`;
+    conds.push(sql`${found} > 0`);
+    searchFrom = sql`${searchFrom} + ${found} + length(${middle}) - 1`;
+    pinned = true;
+  }
+  if (last !== "") {
+    conds.push(sql`substr(${subject}, -length(${last})) = ${last}`);
+    if (pinned) {
+      // The endswith must not overlap the pinned segments.
+      conds.push(sql`length(${subject}) >= ${searchFrom} + length(${last}) - 1`);
+    }
+  }
+  if (conds.length === 0) return sql`1 = 1`; // the bare `*` glob matches all
+  return and(...conds) as SQL;
 }
 
 /**
@@ -103,7 +163,7 @@ export async function listReleases(
     conditions.push(eq(releases.isPrerelease, opts.isPrerelease));
   }
   if (opts.tagFilter !== "") {
-    conditions.push(like(releases.tagName, tagFilterPattern(opts.tagFilter)));
+    conditions.push(tagFilterCondition(opts.tagFilter));
   }
   const where = and(...conditions);
   const db = drizzle(d1);

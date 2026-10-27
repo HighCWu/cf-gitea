@@ -378,6 +378,15 @@ describe("GET /orgs/{org}/teams/search (teamSearch)", () => {
     });
     expect(await nameOnly.json<{ data: Array<unknown> }>().then((b) => b.data)).toEqual([]);
     expect(byName.headers.get("x-total-count")).toBe("1");
+
+    // The keyword arms must not cap (the 943e1e9 org-members class — D1's
+    // 50-byte LIKE pattern limit): a 200-char needle answers the clean
+    // empty result, not a D1_ERROR 500.
+    const longQ = await send(`/orgs/${s.org.username}/teams/search?q=${"z".repeat(200)}`, {
+      headers: authHeaders(s.owner.id),
+    });
+    expect(longQ.status).toBe(200);
+    expect(await longQ.json<{ data: Array<unknown> }>().then((b) => b.data)).toEqual([]);
   });
 });
 

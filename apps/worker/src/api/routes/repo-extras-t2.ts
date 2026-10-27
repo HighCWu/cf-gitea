@@ -1,7 +1,7 @@
 import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { Context, MiddlewareHandler } from "hono";
-import { and, eq, inArray, like, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
@@ -889,11 +889,17 @@ export function registerRepoExtrasT2Routes(
       const url = new URL(c.req.url);
       const options = parseListOptions(url);
       const keyword = (url.searchParams.get("q") ?? "").trim().toLowerCase();
-      const filter = keyword === "" ? undefined : `%${keyword}%`;
+      // NOT LIKE: D1 caps LIKE patterns at 50 bytes, so a long `?q=` needle
+      // threw D1_ERROR and the route answered a plain 500. The substring
+      // goes through instr() instead — the documented user-search precedent
+      // (services/user.ts:81-97, the org-members 943e1e9 shape). The needle
+      // pre-lowers and topics are stored lowercase (services/repo-topics.ts:
+      // 63), so the pair stays case-insensitive like the LIKE was.
+      const filter = keyword === "" ? undefined : sql`instr(${repoTopics.topic}, ${keyword}) > 0`;
       const groupedTotal = drizzle(c.env.DB)
         .select({ topic: repoTopics.topic })
         .from(repoTopics)
-        .where(filter === undefined ? sql`1 = 1` : like(repoTopics.topic, filter))
+        .where(filter === undefined ? sql`1 = 1` : filter)
         .groupBy(repoTopics.topic)
         .as("topics_total");
       const totalRow = await drizzle(c.env.DB)
@@ -903,7 +909,7 @@ export function registerRepoExtrasT2Routes(
       const rows = await drizzle(c.env.DB)
         .select({ topic: repoTopics.topic, repoCount: sql<number>`count(*)` })
         .from(repoTopics)
-        .where(filter === undefined ? sql`1 = 1` : like(repoTopics.topic, filter))
+        .where(filter === undefined ? sql`1 = 1` : filter)
         .groupBy(repoTopics.topic)
         .orderBy(repoTopics.topic)
         .limit(options.limit)

@@ -1,4 +1,4 @@
-import { and, asc, eq, gte, inArray, like, lt, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, lt, or, sql, type SQL } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
 import {
@@ -614,8 +614,19 @@ function issueFilterConditions(d1: D1Database, repoIds: string[], filters: Issue
     conditions.push(eq(issues.isPull, filters.isPull));
   }
   if (filters.keyword !== "") {
-    const needle = `%${filters.keyword.toLowerCase()}%`;
-    conditions.push(or(like(sql`lower(${issues.title})`, needle), like(sql`lower(coalesce(${issues.content}, ''))`, needle)) as SQL);
+    // NOT LIKE: D1 caps LIKE patterns at 50 bytes, so a long `?q=` needle
+    // threw D1_ERROR and the route answered a plain 500. The substring goes
+    // through instr() instead — the documented user-search precedent
+    // (services/user.ts:81-97, the org-members 943e1e9 shape). The needle
+    // pre-lowers for the case-insensitive pair (the columns lower() in SQL,
+    // exactly what the LIKE wrapped).
+    const needle = filters.keyword.toLowerCase();
+    conditions.push(
+      or(
+        sql`instr(lower(${issues.title}), ${needle}) > 0`,
+        sql`instr(lower(coalesce(${issues.content}, '')), ${needle}) > 0`,
+      ) as SQL,
+    );
   }
   if (filters.since !== null) {
     conditions.push(gte(issues.updatedAt, new Date(filters.since * 1000)));

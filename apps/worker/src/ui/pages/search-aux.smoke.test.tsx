@@ -211,4 +211,16 @@ describe("GET /explore/topics/search (explore.TopicSearch) — smoke", () => {
     expect(body.topics[0]?.created).toBe("0001-01-01T00:00:00Z");
     expect(body.topics[0]?.updated).toBe("0001-01-01T00:00:00Z");
   });
+
+  it("a 200-char keyword answers the clean empty envelope (no D1 LIKE-cap 500)", async () => {
+    // The keyword arm must not cap (the 943e1e9 org-members class — D1's
+    // 50-byte LIKE pattern limit): the long needle passes the boundary as
+    // the clean no-match envelope.
+    const params = parseTopicSearchAuxQuery(
+      new URL(`https://test.local/explore/topics/search?q=${"z".repeat(200)}&page=1&limit=10`),
+    );
+    const { total, topics } = await loadTopicSearchAux(env, params);
+    expect(total).toBe(0);
+    expect(topics).toEqual([]);
+  });
 });

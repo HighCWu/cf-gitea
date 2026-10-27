@@ -263,6 +263,29 @@ describe("GET /repos/{owner}/{repo}/releases (repoListReleases)", () => {
     expect((await pre.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v4-pre"]);
     const filtered = await makeApp()(`${REPO_PATH}/releases?tag_filter=v*`);
     expect((await filtered.json<Array<{ tag_name: string }>>()).length).toBeGreaterThanOrEqual(2);
+
+    // The glob translation pins (the arm is instr()-translated — the
+    // 943e1e9 org-members shape — so the upstream release.go:302-309
+    // semantics ride on explicit probes, not the LIKE engine): suffix,
+    // middle, plain substring, `%`/`_` literal (upstream escapes them),
+    // the no-overlap suffix rule, and the 50-byte-cap boundary — 200-char
+    // needles answer the clean empty list, not a D1_ERROR 500.
+    const suffixGlob = await makeApp()(`${REPO_PATH}/releases?tag_filter=*pre`);
+    expect((await suffixGlob.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v4-pre"]);
+    const middleGlob = await makeApp()(`${REPO_PATH}/releases?tag_filter=*2*`);
+    expect((await middleGlob.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v2"]);
+    const substring = await makeApp()(`${REPO_PATH}/releases?tag_filter=1`);
+    expect((await substring.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v1"]);
+    const literalUnderscore = await makeApp()(`${REPO_PATH}/releases?tag_filter=v_`);
+    expect((await literalUnderscore.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual([]);
+    const overlapRule = await makeApp()(`${REPO_PATH}/releases?tag_filter=v2*2`);
+    expect((await overlapRule.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual([]);
+    const longNeedle = await makeApp()(`${REPO_PATH}/releases?tag_filter=${"z".repeat(200)}`);
+    expect(longNeedle.status).toBe(200);
+    expect(await longNeedle.json()).toEqual([]);
+    const longGlob = await makeApp()(`${REPO_PATH}/releases?tag_filter=${"z".repeat(120)}*${"z".repeat(120)}`);
+    expect(longGlob.status).toBe(200);
+    expect(await longGlob.json()).toEqual([]);
   });
 
   it("paginates with the Link header", async () => {

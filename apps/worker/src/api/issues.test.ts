@@ -392,6 +392,13 @@ describe("GET /repos/{owner}/{repo}/issues (issueListIssues)", () => {
     const byQ = await router()("/repos/alice/visible/issues?q=PLAIN");
     expect((await byQ.json<Array<{ title: string }>>()).map((i) => i.title)).toEqual(["plain one"]);
 
+    // The keyword arm must not cap (the 943e1e9 org-members class — D1's
+    // 50-byte LIKE pattern limit): a 200-char needle answers the clean
+    // empty list, not a D1_ERROR 500.
+    const longQ = await router()(`/repos/alice/visible/issues?q=${"z".repeat(200)}`);
+    expect(longQ.status).toBe(200);
+    expect(longQ.headers.get("X-Total-Count")).toBe("0");
+
     const byMilestone = await router()("/repos/alice/visible/issues?milestones=v1,99");
     expect((await byMilestone.json<Array<{ title: string }>>()).map((i) => i.title)).toEqual(["labeled one"]);
   });
