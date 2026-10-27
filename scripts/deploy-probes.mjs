@@ -1948,7 +1948,7 @@ const window3Steps = (ctx) => [
   },
   {
     id: "w3-wiki-raw-304",
-    expect: `GET ${ctx.repo}/wiki/raw/Home with If-None-Match: <the captured ETag> → 304 carrying the ETag ONLY (no Cache-Control — httpcache.go:96-101 returns before the cache stamp; mount-at-run-time: the page family's degradation warns)`,
+    expect: `GET ${ctx.repo}/wiki/raw/Home with If-None-Match: <the captured ETag> → 304 carrying the ETag + the middleware's zero-option Cache-Control (the deployed truth since b1bf73a wraps every UI response; mount-at-run-time: the page family's degradation warns)`,
     run: async () => {
       if (ctx.wikiEtag === null) {
         return { status: "warn", detail: "no ETag captured (the coded probe did not reach a mounted surface) — the 304 arm is unverifiable" };
@@ -1960,8 +1960,13 @@ const window3Steps = (ctx) => [
       expect(probe.res.status === 304, `status ${probe.res.status} (expected 304)`);
       expect(probe.res.headers.get("etag") === ctx.wikiEtag,
         `the 304's etag ${JSON.stringify(probe.res.headers.get("etag"))} != ${ctx.wikiEtag}`);
-      expect(probe.res.headers.get("cache-control") === null,
-        `the 304 carries cache-control ${JSON.stringify(probe.res.headers.get("cache-control"))} (expected NONE — the ETag gate returns before the cache stamp)`);
+      // DEPLOYED TRUTH (the 2026-10-27 wrap found it): uiRouter's blanket
+      // zero-option Cache-Control middleware (b1bf73a, bug #19) wraps the 304
+      // too — httpcache's return-before-stamp quirk lives only inside the raw
+      // response the module builds; the route's 304 carries the middleware's
+      // conservative stamp. More cache-safe, not less: pin it.
+      expect(probe.res.headers.get("cache-control") === "max-age=0, private, must-revalidate",
+        `the 304's cache-control ${JSON.stringify(probe.res.headers.get("cache-control"))} (expected the middleware's zero-option stamp — the blanket b1bf73a wrap)`);
       return "304 with the ETag only — the If-None-Match pair holds";
     },
   },
