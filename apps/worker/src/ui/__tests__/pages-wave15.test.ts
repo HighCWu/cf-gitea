@@ -16,10 +16,12 @@
  * exception: they read ENGINE content, so `alice/wave15-defbranch` seeds a
  * multi-branch repo through the REAL receive flow (the wave-17 recipe) and
  * the select/apply arms run at the module seam (loadDefaultBranchOptions /
- * renderBranchProtectionListPage / applyDefaultBranchForm) — the route's
- * GET does not yet pass `branchOptions` and the POST is unregistered (the
- * handler recipe rides pages/branch-protection.tsx's module header; the
- * route-level arms pin the stable unborn-default bytes).
+ * renderBranchProtectionListPage / applyDefaultBranchForm). 21b91ce then
+ * mounted the family's route arms — the GET passes `branchOptions` and the
+ * POST (upstream SetDefaultBranchPost) runs the sameOriginGuard →
+ * settingsGate → archived-404 → action-switch → applyDefaultBranchForm
+ * ladder onto the bare 303 — and the route-level describe below pins that
+ * ladder over the engine-backed fixture.
  *
  * Gate postures under test: the settings pages' admin gate (anonymous 303,
  * signed-in non-admin 404) on every page and write; the archived refusals
@@ -30,7 +32,10 @@
  * 1-based renumber with the foreign-id no-op; the default-branch select's
  * PrepareBranchList option order, the marked default, the empty-repo
  * disabled arm and the service seam's arguments (same-name no-op, the
- * missing-branch refusal, the production wiring's D1+engine-head write).
+ * missing-branch refusal, the production wiring's D1+engine-head write),
+ * and the mounted POST's route ladder (the 303 write with both truths
+ * moved + the re-render, the gate trio, the switch-default and
+ * ghost-branch 404s, the same-name no-op over the wire).
  */
 
 import { env, SELF } from "cloudflare:test";
@@ -146,8 +151,15 @@ async function ensureWave15EngineRepo(): Promise<void> {
     await settleCreatingRepo(env, row.id, repoName);
     row = (await db.select().from(repositories).where(eq(repositories.id, row.id)).get()) ?? row;
   }
-  if (row.defaultBranch !== "main") {
-    await db.update(repositories).set({ defaultBranch: "main" }).where(eq(repositories.id, row.id));
+  if (row.defaultBranch !== "main" || row.visibility !== "public") {
+    // Both pins matter: the REAL receive flow PUSH-CREATES the row first
+    // (the gate's push-create defaults — isPrivate: true per upstream
+    // DefaultPushCreatePrivate, status 'creating' until the settle), so the
+    // create call below never runs and the row would stay private — the
+    // seam arms ride owner/admin cookies so only the gate ladder's
+    // anonymous-303 arm ever noticed. Pin the public repo the create call
+    // intended (the direct-D1 fixture convention — the archived toggle).
+    await db.update(repositories).set({ defaultBranch: "main", visibility: "public" }).where(eq(repositories.id, row.id));
   }
 }
 
@@ -943,6 +955,119 @@ describe("the default-branch select (branches.tmpl's SetDefaultBranchPost arm)",
     const after = await defBranchRow();
     expect((await applyDefaultBranchForm(env, after, "main")).outcome).toBe("applied");
     expect((await defBranchRow()).defaultBranch).toBe("main");
+    expect((await env.REPO.getByName("alice/wave15-defbranch").listRefs()).head).toBe("refs/heads/main");
+  });
+});
+
+// --- the mounted default-branch POST (route-level arms over the seam) ---------------
+
+describe("POST /{owner}/{repo}/settings/branches (the mounted default-branch write's route arms)", () => {
+  const defBranchRow = async (): Promise<RepoRow> =>
+    (await drizzle(env.DB).select().from(repositories).where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave15-defbranch"))).get())!;
+
+  /** The route POST on the engine-backed fixture (the select's own form
+   *  target; same-origin by default, cookie omitted for anonymous). */
+  const defBranchPost = (body: Record<string, string>, cookie?: string, origin = "https://test.local"): Promise<Response> =>
+    fetchUi("/alice/wave15-defbranch/settings/branches", formPost("/alice/wave15-defbranch/settings/branches", body, cookie, origin));
+
+  it("happy path: 303 onto the settings path with D1 + engine head moved and the GET re-render marking the new default", async () => {
+    const fixture = await ensureWave15Fixtures();
+    // Upstream's success arm: SetRepoDefaultBranch then ctx.Redirect onto
+    // the request path (default_branch.go:37-50; the update_settings_success
+    // flash is the bare-303 reduction — the delete/priority precedent).
+    const res = await defBranchPost({ action: "default_branch", branch: "feature/one" }, fixture.ownerCookie);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/alice/wave15-defbranch/settings/branches");
+    // The production wiring wrote BOTH truths: D1's metadata column (the
+    // source of truth) and the engine's HEAD via the wired setHead dep
+    // (RepoService.setDefaultBranch — the PATCH /api repos wiring shape).
+    expect((await defBranchRow()).defaultBranch).toBe("feature/one");
+    expect((await env.REPO.getByName("alice/wave15-defbranch").listRefs()).head).toBe("refs/heads/feature/one");
+    // The GET re-render: PrepareBranchList re-tops the new default and the
+    // select's selected mark moved with it (repo.go:598-618 + branches.tmpl's
+    // marked-selection arm).
+    const html = await (await fetchUi("/alice/wave15-defbranch/settings/branches", withCookie(fixture.ownerCookie))).text();
+    const featureIdx = html.indexOf('value="feature/one" selected=""');
+    expect(featureIdx).toBeGreaterThan(-1);
+    expect(featureIdx).toBeLessThan(html.indexOf('value="main"'));
+    // Restore through the same route (the seam test's restore convention —
+    // the later a11y render rides the pinned main default).
+    const back = await defBranchPost({ action: "default_branch", branch: "main" }, fixture.ownerCookie);
+    expect(back.status).toBe(303);
+    expect((await defBranchRow()).defaultBranch).toBe("main");
+    expect((await env.REPO.getByName("alice/wave15-defbranch").listRefs()).head).toBe("refs/heads/main");
+  });
+
+  it("gate ladder: cross-origin 403, anonymous login 303, signed-in non-writer 404 shell — nothing written", async () => {
+    const fixture = await ensureWave15Fixtures();
+    const body = { action: "default_branch", branch: "release/1" };
+    // The §2.8 sameOriginGuard runs FIRST: the cross-origin write 403s
+    // before identity resolution or any write (the edit POST's posture).
+    const crossOrigin = await defBranchPost(body, fixture.ownerCookie, "https://evil.example");
+    expect(crossOrigin.status).toBe(403);
+    // Anonymous: the settings gate's login round-trip, the GET list's exact
+    // redirect target (settingsGate's viewer.kind arm — the pathname rides
+    // ?redirect_to=).
+    const anon = await defBranchPost(body);
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toBe("/login?redirect_to=%2Falice%2Fwave15-defbranch%2Fsettings%2Fbranches");
+    // A signed-in non-writer (no collaborator row, no grant, not a site
+    // admin) 404-shells — existence hidden (settingsGate's canAdminRepo arm).
+    const pal = await defBranchPost(body, fixture.palCookie);
+    expect(pal.status).toBe(404);
+    // No gated arm reached the write.
+    expect((await defBranchRow()).defaultBranch).toBe("main");
+    expect((await env.REPO.getByName("alice/wave15-defbranch").listRefs()).head).toBe("refs/heads/main");
+  });
+
+  it("404s the archived repo's write (RepoMustNotBeArchived's posture)", async () => {
+    const fixture = await ensureWave15Fixtures();
+    const db = drizzle(env.DB);
+    const row = await defBranchRow();
+    await db.update(repositories).set({ isArchived: true }).where(eq(repositories.id, row.id));
+    try {
+      // The archived check runs BEFORE the form parse (the handler's ladder
+      // order) — a well-formed write still 404-shells and writes nothing.
+      const res = await defBranchPost({ action: "default_branch", branch: "feature/one" }, fixture.ownerCookie);
+      expect(res.status).toBe(404);
+      expect((await defBranchRow()).defaultBranch).toBe("main");
+    } finally {
+      await db.update(repositories).set({ isArchived: false }).where(eq(repositories.id, row.id));
+    }
+  });
+
+  it("404s a foreign action value (the switch's default arm, default_branch.go:51-53) — nothing written", async () => {
+    const fixture = await ensureWave15Fixtures();
+    const res = await defBranchPost({ action: "rename_repo", branch: "feature/one" }, fixture.ownerCookie);
+    expect(res.status).toBe(404);
+    expect((await defBranchRow()).defaultBranch).toBe("main");
+    expect((await env.REPO.getByName("alice/wave15-defbranch").listRefs()).head).toBe("refs/heads/main");
+  });
+
+  it("404-shells a branch the engine does not know (IsErrBranchNotExist's arm, default_branch.go:39-40) — nothing written", async () => {
+    const fixture = await ensureWave15Fixtures();
+    const before = await defBranchRow();
+    const res = await defBranchPost({ action: "default_branch", branch: "ghost" }, fixture.ownerCookie);
+    expect(res.status).toBe(404);
+    // The existence check reads the SAME engine branch list the select
+    // renders — the service never ran (updatedAt untouched, head unmoved).
+    const after = await defBranchRow();
+    expect(after.defaultBranch).toBe("main");
+    expect(after.updatedAt!.getTime()).toBe(before.updatedAt!.getTime());
+    expect((await env.REPO.getByName("alice/wave15-defbranch").listRefs()).head).toBe("refs/heads/main");
+  });
+
+  it("the same-name POST 303s bare with nothing written (SetRepoDefaultBranch's early return over the wire)", async () => {
+    const fixture = await ensureWave15Fixtures();
+    const before = await defBranchRow();
+    const res = await defBranchPost({ action: "default_branch", branch: "main" }, fixture.ownerCookie);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/alice/wave15-defbranch/settings/branches");
+    // branch.go:708-710's early no-op: still success, the service (and its
+    // updatedAt write + head move) never ran.
+    const after = await defBranchRow();
+    expect(after.defaultBranch).toBe("main");
+    expect(after.updatedAt!.getTime()).toBe(before.updatedAt!.getTime());
     expect((await env.REPO.getByName("alice/wave15-defbranch").listRefs()).head).toBe("refs/heads/main");
   });
 });
