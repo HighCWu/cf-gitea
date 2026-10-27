@@ -1362,10 +1362,20 @@ const window2LoginTarget = (tabPath) => `/login?redirect_to=${encodeURIComponent
  *  window2FailureCleanup): the red-runs-self-sweep posture. The secret tail
  *  sweeps BY NAME via the user API (DELETE /user/actions/secrets/<name>), so
  *  it covers the edge where a red landed before the web round-trip captured
- *  the numeric row id. */
+ *  the numeric row id.
+ *
+ *  The secret name is minted UPPERCASE on purpose: the landed service stores
+ *  normalizedName — strings.ToUpper at insert AND lookup
+ *  (services/secrets-variables.ts normalizedName; upstream InsertEncryptedSecret
+ *  secrets.go:31) — and the settings page renders the STORED spelling, so a
+ *  lowercase-hex name (`hexId()` is lowercase) renders back as uppercase and
+ *  the row-visible step's case-sensitive grep could never match it. That was
+ *  RD20 bug #20's real mechanism: three "write never landed" verdicts whose
+ *  rows were on the page all along (and whose failure-tail by-name API
+ *  deletes returned 204 — the lookup uppercases too, so it always matched). */
 const window2Context = () => ({
   user: opts.user, cookie: null,
-  secretName: `W2SEC_${hexId()}`, secretDescription: `deploy-probes window2 ${hexId()}`,
+  secretName: `W2SEC_${hexId()}`.toUpperCase(), secretDescription: `deploy-probes window2 ${hexId()}`,
   secretCreated: false, secretGone: false, secretRowId: null,
   keyTitle: `w2key-${hexId()}`,
   org: `w2org-${hexId()}`, orgCreated: false, orgGone: false,
@@ -1481,26 +1491,29 @@ const window2Steps = (ctx) => [
     id: "w2-secret-row-visible",
     expect: `cookie GET /user/settings/actions/secrets → 200 with the row (the name + its description) and the delete form's hidden id captured (name="id" value="N" after the row name)`,
     run: async () => {
-      // D1 production replica lag: the write's 303 commits at the primary,
-      // but an immediate follow-up GET can hit a stale replica (observed
-      // RD20: create 303 → sweep-by-name 204 (committed!) → page read at
-      // +3s empty → page read at +60s rendered; local miniflare is
-      // synchronous, which is why the matrix never saw this). Retry to a
-      // 20s settle budget — the mirror battery's budget precedent.
+      // The grep normalizes case on BOTH sides: the service stores the name
+      // UPPERCASED (normalizedName — the window2Context note) and the page
+      // renders the stored spelling. RD20's 20s "D1 settle" retries below
+      // were chasing the WRONG mechanism — a case-sensitive lowercase grep
+      // (bug #20's misdiagnosis: the rows were on the page the whole time;
+      // read replication is disabled on this database, so a stale read was
+      // never possible). The retry budget stays as cheap robustness only.
+      // Cache-buster query: a fresh cache key per poll — request no-cache
+      // is Enterprise-only on Cloudflare's edge, so a stale heuristic
+      // entry for the bare URL can still be served on this plan.
       let res = null;
       let body = "";
       let nameAt = -1;
+      const nameNeedle = ctx.secretName.toUpperCase();
       for (let attempt = 0; attempt < 20 && nameAt === -1; attempt++) {
-        if (attempt > 0) await new Promise((r) => setTimeout(r, 1000));
-        // Cache-buster query: a fresh cache key per poll — request no-cache
-        // is Enterprise-only on Cloudflare's edge, so a stale heuristic
-        // entry for the bare URL can still be served on this plan.
+        if (attempt > 0) await sleep(1000);
         res = await fetchT(`${opts.baseUrl}/user/settings/actions/secrets?_cb=${Date.now()}_${attempt}`, { headers: { cookie: ctx.cookie } });
         body = await res.text();
-        nameAt = body.indexOf(ctx.secretName);
+        nameAt = body.toUpperCase().indexOf(nameNeedle);
       }
       expect(res.status === 200, `status ${res.status} (expected 200)`);
-      expect(nameAt !== -1, `the created secret ${ctx.secretName} is not on the page (after a 20s D1 settle budget)`);
+      expect(nameAt !== -1,
+        `the created secret ${ctx.secretName} is not on the page (after a 20s settle budget) — if the [tail] sweep then logs "deleted (204)", the row EXISTS and this is a read/name-shape mismatch, not a write drop`);
       expect(body.includes(ctx.secretDescription), `the description ${ctx.secretDescription} is not on the page`);
       const m = /name="id" value="(\d+)"/.exec(body.slice(nameAt));
       expect(m !== null, "no delete-form hidden id found after the row name");

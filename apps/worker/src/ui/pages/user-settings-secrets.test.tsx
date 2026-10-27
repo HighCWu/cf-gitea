@@ -238,6 +238,37 @@ describe("applyUserSettingsSecretForm (SecretsPost → PerformSecretsPost over c
     expect(rows.map((row) => row.name)).toEqual(["A1_B2", "_UNDER_SCORE"]);
   });
 
+  it("a lowercase-hex name saves, lands, and renders UPPERCASE-only — a case-sensitive lowercase grep misses the landed row (the RD20 bug #20 pin)", async () => {
+    // The deploy-probes window2 battery minted `W2SEC_${lowercase-hex}` names
+    // and asserted row visibility with a case-sensitive `body.indexOf` of that
+    // spelling — three live "write never landed" verdicts whose rows were on
+    // the page the whole time (the name stores UPPERCASED: normalizedName,
+    // strings.ToUpper at insert AND lookup, upstream InsertEncryptedSecret
+    // secrets.go:31; the by-name API delete uppercases its lookup too, which
+    // is why the failure-tail sweeps returned 204 on the "missing" rows).
+    // Name is run1's live mint verbatim (W2SEC_91a6a9dd, 2026-10-27).
+    const probeSpelling = "W2SEC_91a6a9dd";
+    expect(
+      await applyUserSettingsSecretForm(env.DB, 1, {
+        name: probeSpelling,
+        data: "line1\r\nline2", // the battery's exact CRLF body
+        description: "deploy-probes window2 91a6a9dd",
+      }),
+    ).toEqual({ outcome: "saved" }); // the SUCCESS shape the battery observed
+    // The write LANDED — one row, stored uppercase (the D1-count=0 verdicts
+    // ran after the failure-tail's 204 sweeps had already deleted these).
+    const rows = (await listSecretRows(env.DB, ownerScope(1), 1, 10)).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.name).toBe("W2SEC_91A6A9DD");
+    // The page renders the STORED spelling: the probe's lowercase spelling is
+    // absent verbatim while the uppercase one (and a case-agnostic grep) is
+    // present — the exact local signature of the live 3× red.
+    const html = await pageHtml();
+    expect(html).not.toContain(probeSpelling); // lowercase spelling never renders…
+    expect(html).toContain("W2SEC_91A6A9DD"); // …the stored name does
+    expect(html.toUpperCase()).toContain(probeSpelling.toUpperCase()); // the normalized grep matches
+  });
+
   it("caps data at 65536 BYTES — the exact boundary saves and the cap counts bytes, not runes", async () => {
     // The DOM maxlength IS the service cap (SECRET_DATA_MAXLENGTH = SecretDataMaxLength).
     expect(await applyUserSettingsSecretForm(env.DB, 1, { name: "BOUNDARY", data: "x".repeat(SECRET_DATA_MAXLENGTH), description: "" })).toEqual({
