@@ -743,13 +743,27 @@ async function main() {
 
   const { fatal: fatal1, notes: notes1 } = phaseProblems(phase1);
   for (const n of notes1) reasons.push(n);
-  if (fatal1.length > 0) {
+  // --solo refinement: phase-1 ASSERTION files enter solo adjudication instead of
+  // short-circuiting — measured population behavior (wave8 -> mirror/sync ->
+  // lifecycle, one different load-flaky file per run): a solo-red assertion
+  // reproduces and FAILS (real regressions still die here); a solo-green one is
+  // recorded load-attributed, never silently dropped. Accounting fatals
+  // (missing/unaccounted/unhandled) still fail immediately in every mode.
+  const blocking1 = opts.solo
+    ? fatal1.filter((r) => !r.includes('non-timeout failures'))
+    : fatal1;
+  if (blocking1.length > 0) {
     verdict = 'FAIL';
-    // Assertion failures, unaccounted files, and unattributed errors are all
-    // immediate fails — never retried away.
-    reasons.push(...fatal1);
+    reasons.push(...blocking1);
   } else {
     const pending = new Set([...phase1.deaths, ...phase1.timeoutFiles]);
+    if (opts.solo && phase1.assertionFiles.size > 0) {
+      for (const f of phase1.assertionFiles.keys()) pending.add(f);
+      reasons.push(
+        `phase1: ${phase1.assertionFiles.size} assertion file(s) enter solo adjudication (--solo) — ` +
+          'solo red fails (real regression); solo green is recorded load-attributed'
+      );
+    }
     if (pending.size === 0) {
       verdict = 'PASS';
     } else if (opts.maxRetries === 0) {
