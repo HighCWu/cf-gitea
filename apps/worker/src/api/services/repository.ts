@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNotNull, isNull, like, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
@@ -712,8 +712,11 @@ export interface RepositoryListOptions {
  * only when `sort` is set, invalid values are 422s with Go-%q messages
  * (`JSON.stringify` matches %q for plain words). Sorts backed by columns the
  * D1 registry does not have yet (`updated`, `size`, `git_size`, `lfs_size`,
- * `stars`, `forks`) resolve to id order — every value is equal-zero, so this
- * mirrors the upstream ordering on empty data. TODO(SPEC-0005): real columns.
+ * `stars`, `forks`) resolve to id order — CORRECTED (the fixed-id-seed
+ * wave's CAST probe): `CAST(uuid AS INTEGER)` is NOT equal-zero (it parses
+ * the leading digits — '550e…'→550, '123e…'→123, letters→0), so the id
+ * stand-in is arbitrary BUT deterministic per stored set only with the
+ * tiebreak below. TODO(SPEC-0005): real columns.
  */
 export function repositoryOrderBy(sort: string, order: string): SQL[] {
   if (sort === "") {
@@ -735,15 +738,20 @@ export function repositoryOrderBy(sort: string, order: string): SQL[] {
     case "created":
       return [ascending ? asc(repositories.createdAt) : desc(repositories.createdAt)];
     case "id":
-      return [ascending ? asc(castIdNumber()) : desc(castIdNumber())];
+      return [ascending ? asc(castIdNumber()) : desc(castIdNumber()), ascending ? asc(repositories.id) : desc(repositories.id)];
     case "updated":
     case "size":
     case "git_size":
     case "lfs_size":
     case "stars":
     case "forks":
-      // No D1 column yet: all keys equal-zero → deterministic id order.
-      return [ascending ? asc(castIdNumber()) : desc(castIdNumber())];
+      // No D1 column yet: the CAST stand-in over uuid ids is arbitrary —
+      // the id tiebreak makes it DETERMINISTIC (equal CASTs break by the
+      // raw id; without it the row order shuffles per stored set).
+      return [
+        ascending ? asc(castIdNumber()) : desc(castIdNumber()),
+        ascending ? asc(repositories.id) : desc(repositories.id),
+      ];
     default:
       throw new ApiError(422, `Invalid sort mode: ${JSON.stringify(sort)}`);
   }
@@ -931,18 +939,21 @@ export async function searchRepositories(
   } else if (opts.keyword !== "") {
     // Comma-separated keywords, case-insensitive substring match on the repo
     // name; "owner/repo" (exactly one slash) also matches owner+name pairs.
-    // SQLite LIKE is case-insensitive for ASCII, matching upstream's
-    // lower_name LIKE. TODO(SPEC-0005): description column for includeDesc.
+    // TODO(SPEC-0005): description column for includeDesc. NOT LIKE: D1 caps
+    // LIKE patterns at 50 bytes, so a long `?q=` part threw D1_ERROR and the
+    // route answered a plain 500. The substrings go through instr() instead
+    // — the documented user-search precedent (services/user.ts:81-97, the
+    // org-members 943e1e9 shape). The needles pre-lower for the
+    // case-insensitive pair (owner_namespace/slug are stored lowercase).
     const keywordConditions: SQL[] = [];
     for (const part of opts.keyword.split(",")) {
-      const needle = `%${part.toLowerCase()}%`;
-      keywordConditions.push(like(repositories.slug, needle));
+      keywordConditions.push(sql`instr(${repositories.slug}, ${part.toLowerCase()}) > 0`);
       const slash = part.indexOf("/");
       if (slash > 0 && part.indexOf("/", slash + 1) === -1) {
         keywordConditions.push(
           and(
-            like(repositories.ownerNamespace, `%${part.slice(0, slash).toLowerCase()}%`),
-            like(repositories.slug, `%${part.slice(slash + 1).toLowerCase()}%`),
+            sql`instr(${repositories.ownerNamespace}, ${part.slice(0, slash).toLowerCase()}) > 0`,
+            sql`instr(${repositories.slug}, ${part.slice(slash + 1).toLowerCase()}) > 0`,
           ) as SQL,
         );
       }

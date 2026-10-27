@@ -109,7 +109,9 @@ async function insertRepo(insert: RepoInsert): Promise<void> {
 }
 
 /** The fixture set (NUMERIC text ids so the service's CAST id-order stand-ins
- *  are observable — real ids are UUIDs, where every CAST is 0 and the order
+ *  are observable — real ids are UUIDs; CAST parses leading digits (NOT
+*  always 0 — the fixed-id-seed wave's probe), so the order rides the
+*  id tiebreak (deterministic; corrected with the service comment)
  *  is the service's own documented degenerate posture):
  *   1 alice/pub    public            5 alice/arch      public  archived
  *   2 alice/priv   private           6 alice/tmpl      public  template
