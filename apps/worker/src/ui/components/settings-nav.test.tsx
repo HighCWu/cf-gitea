@@ -37,6 +37,8 @@ const ORIGIN = "https://test.local";
  *  needle cannot match a longer sibling href. */
 const USER_HREF_ORDER = [
   'href="/user/settings"',
+  'href="/user/settings/account"',
+  'href="/user/settings/notifications"',
   'href="/user/settings/appearance"',
   'href="/user/settings/security"',
   'href="/user/settings/applications"',
@@ -67,6 +69,8 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
     expect(html).toContain(`<div class="header item">${settingsNavLocale.user_settings}</div>`); // "user.settings"
     for (const text of [
       settingsNavLocale.profile, // "settings.profile"
+      settingsNavLocale.account, // "settings.account"
+      settingsNavLocale.notifications, // "notifications"
       settingsNavLocale.appearance, // "settings.appearance"
       settingsNavLocale.security, // "settings.security"
       settingsNavLocale.applications, // "settings.applications"
@@ -87,11 +91,10 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
 
   it("renders NO dead items — the unlanded upstream targets are omitted, never dead anchors", () => {
     const html = renderToString(<UserSettingsNavbar active="profile" />);
-    // Account (:7-11), Notifications (:12-16), Blocked users (:25-27),
-    // Audit (:36-38), Packages (:61-65), Repos (:74-76).
+    // Account (:7-11) and Notifications (:12-16) RENDER (their pages landed);
+    // Blocked users (:25-27), Audit (:36-38), Packages (:61-65), Repos
+    // (:74-76) stay omitted.
     for (const dead of [
-      'href="/user/settings/account"',
-      'href="/user/settings/notifications"',
       'href="/user/settings/blocked_users"',
       'href="/user/settings/audit_logs"',
       'href="/user/settings/packages"',
@@ -113,6 +116,8 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
   it("marks exactly the active tab's anchor (every union member)", () => {
     const expectations: Record<UserSettingsNavTab, string> = {
       profile: 'href="/user/settings"',
+      account: 'href="/user/settings/account"',
+      notifications: 'href="/user/settings/notifications"',
       appearance: 'href="/user/settings/appearance"',
       security: 'href="/user/settings/security"',
       applications: 'href="/user/settings/applications"',

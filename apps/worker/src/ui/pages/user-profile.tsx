@@ -99,6 +99,7 @@ import { OrgHomePagination, OrgRepoListItem, type OrgHomeRepoItem } from "./org-
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
+import { EyeIcon } from "./user-watching-tab";
 
 /** Page chrome text (component-local, the orgHomeLocale pattern — locale.ts
  *  is shared and not this wave's file). */
@@ -108,6 +109,8 @@ export const userProfileLocale = {
   following: "following", // "user.following"
   repositories: "Repositories", // "user.repositories" (header.tmpl:13)
   activity: "Public Activity", // "user.activity" (header.tmpl:34)
+  starred: "Starred Repositories", // "user.starred" (header.tmpl:38)
+  watched: "Watched Repositories", // "user.watched" (header.tmpl:45)
   visibility_limited: "Limited", // "org.settings.visibility.limited_shortname"
   visibility_private: "Private", // "org.settings.visibility.private_shortname"
 } as const;
@@ -333,8 +336,10 @@ function ProfileVisibilityBadge(props: { user: UserProfileRow }) {
 /**
  * shared/user/profile_big_avatar.tmpl reduced: the avatar placeholder circle,
  * the username (+ visibility badge — the divergence note) + display name
- * lines, the plain-text followers/following counts (the tab pages do not
- * exist), then the location / website / description / "Joined on" rows.
+ * lines, the followers/following counts as the two tab-page anchors
+ * (profile_big_avatar.tmpl:25 — `?tab=followers` carries the 18px
+ * octicon-person glyph, the following anchor is bare), then the location /
+ * website / description / "Joined on" rows.
  */
 export function ProfileAvatarCard(props: { user: UserProfileRow; followers: number; following: number }) {
   const { user } = props;
@@ -355,13 +360,14 @@ export function ProfileAvatarCard(props: { user: UserProfileRow; followers: numb
             <span class="tw-text-center">{user.fullName}</span>
           ) : null}
           <div class="tw-text-center">
-            <span>
+            <a href={`/${user.username}?tab=followers`}>
+              <Icon name="octicon-person" size={18} class="tw-mr-1" />
               {props.followers} {userProfileLocale.followers}
-            </span>{" "}
+            </a>{" "}
             ·{" "}
-            <span>
+            <a href={`/${user.username}?tab=following`}>
               {props.following} {userProfileLocale.following}
-            </span>
+            </a>
           </div>
         </div>
         {user.location !== null && user.location !== "" ? (
@@ -394,14 +400,18 @@ export function ProfileAvatarCard(props: { user: UserProfileRow; followers: numb
   );
 }
 
-/** The overview header (user/overview/header.tmpl:12-34 reduced to its two
- *  LIVE tabs): Repositories ACTIVE (header.tmpl:12's exact `?tab=repositories`
- *  href — the activity page's twin renders it inactive) and the Activity
- *  anchor (header.tmpl:33-34, the mounted `?tab=activity` page). Overview
- *  needs a profile-readme pipeline; Projects/Packages/Code/Stars need their
- *  owner-scoped pages (dead links forbidden, §2.4.1). Module-local, the
- *  activity module's OverviewTabs twin — OrgMenu carries no activity slot. */
-function ProfileTabs(props: { username: string; repoCount: number }) {
+/** The overview header (user/overview/header.tmpl:12-34 reduced to its live
+ *  tabs): Repositories ACTIVE (header.tmpl:12's exact `?tab=repositories`
+ *  href — the tab pages' twin renders it inactive), the Activity anchor
+ *  (header.tmpl:33-34), then the Stars anchor (header.tmpl:36-44) and the
+ *  watching anchor (header.tmpl:43-46). THE COLLAPSED-IF: upstream renders
+ *  Stars and watching as the two arms of `{{if not .DisableStars}}` —
+ *  DisableStars defaults FALSE at the pin, so Stars is the default anchor
+ *  and watching is direct-URL-only with NOTHING active. The landed
+ *  reduction cannot model a setting that does not exist, so BOTH anchors
+ *  render here INACTIVE (the repositories tab keeps the ACTIVE item) —
+ *  never watching instead of stars. */
+function ProfileTabs(props: { username: string; repoCount: number; starsCount: number }) {
   return (
     <overflow-menu class="ui secondary pointing tabular borderless menu tw-mb-4">
       <div class="overflow-menu-items">
@@ -411,6 +421,13 @@ function ProfileTabs(props: { username: string; repoCount: number }) {
         </a>
         <a class="item" href={`/${props.username}?tab=activity`}>
           <Icon name="octicon-rss" /> {userProfileLocale.activity}
+        </a>
+        <a class="item" href={`/${props.username}?tab=stars`}>
+          <Icon name="octicon-star" /> {userProfileLocale.starred}
+          {props.starsCount > 0 ? <div class="ui small label">{props.starsCount}</div> : null}
+        </a>
+        <a class="item" href={`/${props.username}?tab=watching`}>
+          <EyeIcon /> {userProfileLocale.watched}
         </a>
       </div>
     </overflow-menu>
@@ -437,7 +454,7 @@ export function UserProfilePage(props: { ctx: UiContext; data: UserProfileData }
             <ProfileAvatarCard user={data.user} followers={data.followers} following={data.following} />
           </div>
           <div class="ui twelve wide column tw-mb-4">
-            <ProfileTabs username={data.user.username} repoCount={data.total} />
+            <ProfileTabs username={data.user.username} repoCount={data.total} starsCount={data.user.numStars} />
             {/* shared/repo/list.tmpl: the wrapper renders unconditionally
                 (zero repos = an empty list, upstream's own shape — the org
                 home's empty-placeholder is home.tmpl's, not this template). */}

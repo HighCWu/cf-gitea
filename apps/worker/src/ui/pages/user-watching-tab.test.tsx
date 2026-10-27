@@ -350,8 +350,8 @@ describe("UserWatchingTabPage (the full-document render)", () => {
 
     expect(html).toContain('class="page-content user profile"'); // profile.tmpl:2's discriminator
     expect(html).toContain('id="profile-avatar-card"'); // the four-wide column's card
-    expect(html).toContain(">1 followers</span>"); // the REAL totals (profile_big_avatar.tmpl:25)
-    expect(html).toContain(">0 following</span>");
+    expect(html).toContain(">1 followers</a>"); // the REAL totals as the tab anchors (profile_big_avatar.tmpl:25 — the F2 fold)
+    expect(html).toContain(">0 following</a>");
     // The strip: repositories + activity INACTIVE, watching ACTIVE
     // (header.tmpl:44's DisableStars arm) with the eye glyph and NO count.
     expect(html).toContain('class="item" href="/gal?tab=repositories"');

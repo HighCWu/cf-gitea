@@ -360,8 +360,8 @@ describe("UserFollowTabsPage (the full-document render)", () => {
 
     expect(html).toContain('class="page-content user profile"'); // profile.tmpl:2's discriminator
     expect(html).toContain('id="profile-avatar-card"'); // the four-wide column's card
-    expect(html).toContain(">4 followers</span>"); // the REAL totals (profile_big_avatar.tmpl:25)
-    expect(html).toContain(">3 following</span>");
+    expect(html).toContain(">4 followers</a>"); // the REAL totals as the tab anchors (profile_big_avatar.tmpl:25 — the F2 fold)
+    expect(html).toContain(">3 following</a>");
     // The strip: both live tabs present, NEITHER active (header.tmpl's two
     // eq .TabName conditions fail for followers/following).
     expect(html).toContain('class="item" href="/gal?tab=repositories"');
@@ -379,7 +379,7 @@ describe("UserFollowTabsPage (the full-document render)", () => {
     await seedBaseFixtures();
     const anonData = await loadUserFollowTabsData(env.DB, await userRow("gal"), anon, new URLSearchParams());
     const anonHtml = renderToString(<UserFollowTabsPage ctx={ctx} data={anonData} />);
-    expect(anonHtml).toContain(">2 followers</span>");
+    expect(anonHtml).toContain(">2 followers</a>");
     expect(anonHtml).toContain('<a href="/pal">Pal Follower</a>');
     expect(anonHtml).not.toContain(">Priv Follower</a>");
     expect(anonHtml).toContain('<div class="ui small label">1</div>'); // the public repo only

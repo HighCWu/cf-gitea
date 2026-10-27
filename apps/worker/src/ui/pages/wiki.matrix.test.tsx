@@ -70,8 +70,9 @@
  *     and the writer's _edit all 303 onto `/wiki/?action=_pages`; the
  *     anonymous _edit 404s first (the gate precedes the load); a ghost
  *     delete folds through the ApiError(404) re-render arm onto the same
- *     303; the claimed-but-unimplemented raw tail reads as a page name and
- *     misses the same way;
+ *     303; the raw byte arm MOUNTED (the wave-126 window — existing page's
+ *     bytes at 200, missing page's 404 shell, the bare `/wiki/raw` tail
+ *     keeps the reserved-name 303);
  *   - the service's exact validation texts re-rendering the form with the
  *     carried title: the reserved-name refusal (`wiki title is reserved:
  *     _pages`) and the duplicate refusal (`wiki page already exists
@@ -331,6 +332,7 @@ describe("the hasWiki gate (MustEnableWiki) 404-shells every wiki arm", () => {
       "/w107gal/w107nowiki/wiki/Home",
       "/w107gal/w107nowiki/wiki?action=_pages",
       "/w107gal/w107nowiki/wiki/Home?action=_revision",
+      "/w107gal/w107nowiki/wiki/raw/Home.md", // the raw byte arm rides the SAME gate (web.go:1622)
     ]) {
       const anon = await get(path);
       expect(anon.status, path).toBe(404);
@@ -540,13 +542,25 @@ describe("the missing-page arms (the wiki.go:238/340/400 folds)", () => {
     expect(ghost.headers.get("location")).toBe(PAGES_ACTION);
   });
 
-  it("reads a claimed raw tail as a page name (the byte arm stays unimplemented)", async () => {
+  it("serves the raw byte arm (web.go:1621 — the mount window): an existing page's bytes, a missing page's 404 shell, the bare tail's page miss", async () => {
+    // An EXISTING page: the raw markdown source bytes (the wiki cell's blob)
+    // — the sniffed content class forces ANY text to text/plain.
     const raw = await get(`${REPO_LINK}/wiki/raw/Home.md`);
-    // The parser claims every wiki tail; "raw/…" is a reserved name that can
-    // never exist, so the view arm's missing fold answers — not the shell,
-    // not an engine 404.
-    expect(raw.status).toBe(303);
-    expect(raw.headers.get("location")).toBe(PAGES_ACTION);
+    expect(raw.status).toBe(200);
+    expect(await raw.text()).toBe("# Home base\n");
+    expect(raw.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(raw.headers.get("x-content-type-options")).toBe("nosniff");
+    // A MISSING page: the loader's not-exist class 404-shells (wiki.go:638's
+    // NotFound) — the §4.5 shell, not an engine 404, not the 303 fold.
+    const missing = await get(`${REPO_LINK}/wiki/raw/Never-Was.md`);
+    expect(missing.status).toBe(404);
+    expect(await missing.text()).toContain("Page Not Found");
+    // The BARE `/wiki/raw` tail stays with the PAGE family (chi's `/raw/*`
+    // wildcard does not match `/raw`) — the reserved-name 303 `?action=
+    // _pages` arm, upstream parity.
+    const bare = await get(`${REPO_LINK}/wiki/raw`);
+    expect(bare.status).toBe(303);
+    expect(bare.headers.get("location")).toBe(PAGES_ACTION);
   });
 });
 

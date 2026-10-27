@@ -288,6 +288,13 @@ Inside the same `rest.length === 3` arm of the route parser
   (ok → 200 JSON; `"notFound"` → 404 JSON `{"message": "Can not find the
   content history"}`; the empty-200 comment-miss quirk rides inside the
   loader's ok arm).
+
+  > **Errata (wave-126, landed):** the export's FIRST parameter is `env`,
+  > not bare `db` (issue-content-fragments.ts — the write-grant arm rides
+  > `sessionRepoGrant`), and the outcome literal is `"historyNotFound"`.
+  > The line cites drifted with sibling landings (the parser arm is now
+  > `ui/index.ts`'s `rest.length === 3` block, the overview handler its
+  > neighbor) — the shapes held and the mount followed them.
 - Optional follow-up (soft-delete wave): `POST .../soft-delete` → family
   `"issue-content-history-soft-delete"` driving a `softDeleteContentHistory`
   service export (permission math in §2's canSoftDelete).

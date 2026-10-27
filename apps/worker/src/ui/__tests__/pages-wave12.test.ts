@@ -186,7 +186,17 @@ describe("wave-12 parser families (parseUiRoute / handlesUiRoute)", () => {
   it("claims the user settings literal before the repo parse", () => {
     expect(parseUiRoute("/user/settings")).toEqual({ family: "user-settings" });
     expect(handlesUiRoute("/user/settings")).toBe(true);
-    expect(parseUiRoute("/user/settings/account")).toBeNull();
+    // The account tab landed (the mount window): the GET page + the three
+    // POST arms claim ahead of the repo parse; the deeper unlanded tails
+    // stay null.
+    expect(parseUiRoute("/user/settings/account")).toEqual({ family: "user-settings-account", id: null });
+    expect(parseUiRoute("/user/settings/account/email")).toEqual({ family: "user-settings-account-email", id: null });
+    expect(parseUiRoute("/user/settings/account/email/delete")).toEqual({
+      family: "user-settings-account-email-delete",
+      id: null,
+    });
+    expect(parseUiRoute("/user/settings/account/delete")).toEqual({ family: "user-settings-account-delete", id: null });
+    expect(parseUiRoute("/user/settings/account/other")).toBeNull();
     expect(parseUiRoute("/user/settings/avatar")).toBeNull();
   });
 

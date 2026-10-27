@@ -237,7 +237,11 @@ describe("wave-25 parser claims", () => {
       owner: "wave25-owner",
       repo: "labeled",
     });
-    expect(parseUiRoute("/wave25-owner/labeled/tags.rss")).toBeNull();
+    // The tags feed twins landed (the mount window): the dotted heads claim
+    // their own families; the deeper tails stay null.
+    expect(parseUiRoute("/wave25-owner/labeled/tags.rss")).toMatchObject({ family: "tags-feed-rss" });
+    expect(parseUiRoute("/wave25-owner/labeled/tags.atom")).toMatchObject({ family: "tags-feed-atom" });
+    expect(parseUiRoute("/wave25-owner/labeled/tags.rss/extra")).toBeNull();
     expect(parseUiRoute("/wave25-owner/labeled/labels/initialize")).toBeNull();
     expect(parseUiRoute("/wave25-owner/labeled/labels/other")).toBeNull();
     expect(parseUiRoute("/wave25-owner/labeled/tags/extra")).toBeNull();

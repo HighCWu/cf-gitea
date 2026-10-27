@@ -149,6 +149,7 @@ import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { Viewer } from "../viewer";
 import type { UiContext } from "../ui-context";
+import { EyeIcon } from "./user-watching-tab";
 import { resolveOrgHome } from "./org-home";
 import {
   ProfileAvatarCard,
@@ -163,6 +164,8 @@ import {
 export const activityFeedsLocale = {
   repositories: "Repositories", // "user.repositories"
   activity: "Public Activity", // "user.activity"
+  starred: "Starred Repositories", // "user.starred" (header.tmpl:38)
+  watched: "Watched Repositories", // "user.watched" (header.tmpl:45)
   disabled_public_activity: "This user has disabled the public visibility of the activity.", // "user.disabled_public_activity"
   newer: "Newer", // the base/paginate reduction's navigation_label (OrgHomePagination shape)
   older: "Older",
@@ -735,9 +738,13 @@ export function ActivityFeedList(props: { items: ActivityFeedItem[] }) {
   );
 }
 
-/** The overview header (user/overview/header.tmpl reduced to its two LIVE
+/** The overview header (user/overview/header.tmpl reduced to its live
  *  tabs — the header's degradation note; module-local because OrgMenu has
- *  no activity slot and org-home.tsx is not this wave's file). */
+ *  no activity slot and org-home.tsx is not this wave's file). The Activity
+ *  anchor is ACTIVE here; Stars (header.tmpl:36-44) and watching
+ *  (header.tmpl:43-46) render INACTIVE — the collapsed-if rule: upstream
+ *  swaps Stars→watching under DisableStars (default false), the landed
+ *  strips ship BOTH anchors and never mark either active on this page. */
 function OverviewTabs(props: { username: string; repoCount: number }) {
   return (
     <overflow-menu class="ui secondary pointing tabular borderless menu">
@@ -748,6 +755,12 @@ function OverviewTabs(props: { username: string; repoCount: number }) {
         </a>
         <a class="active item" href={`/${props.username}?tab=activity`}>
           <Icon name="octicon-rss" /> {activityFeedsLocale.activity}
+        </a>
+        <a class="item" href={`/${props.username}?tab=stars`}>
+          <Icon name="octicon-star" /> {activityFeedsLocale.starred}
+        </a>
+        <a class="item" href={`/${props.username}?tab=watching`}>
+          <EyeIcon /> {activityFeedsLocale.watched}
         </a>
       </div>
     </overflow-menu>

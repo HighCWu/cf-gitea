@@ -80,12 +80,11 @@
  *          </a>
  *
  *      with `settingsNavLocale` gaining `notifications: "Notifications"`
- *      (the "notifications" key — the item's Tr text). Until that lands,
- *      this module renders the module-local scaffolding nav below (the
- *      mount-scaffolding precedent — the shared nav's own swap list,
- *      entries 9/12/13); the wiring wave DELETES
- *      `UserSettingsNotificationsNav` and swaps the two call sites to
- *      `UserSettingsNavbar active="notifications"`.
+ *      (the "notifications" key — the item's Tr text). LANDED in the mount
+ *      window: the shared nav carries the item and this module renders
+ *      `UserSettingsNavbar active="notifications"` (the module-local
+ *      scaffolding nav was DELETED — the shared nav's own swap list,
+ *      entries 9/12/13).
  *
  *   3. The deferred route test matrix (the appearance/organizations
  *      pattern — this wave's test file is module-direct because the
@@ -152,7 +151,7 @@ import {
   type EmailNotificationsPreference,
 } from "../../api/services/user-notification-prefs";
 import { users } from "../../db/schema";
-import { settingsNavLocale } from "../components/settings-nav";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 
@@ -292,65 +291,6 @@ export async function applyUserSettingsNotificationsActionsForm(d1: D1Database, 
  *  line (the keys-module `kind` convention). */
 export type NotificationsPageError = { form: "email" | "actions"; message: string };
 
-/**
- * The module-local SCAFFOLDING nav — the shared
- * components/settings-nav UserSettingsNavbar's exact markup with the
- * Notifications item inserted (upstream navbar.tmpl:12-16, between Profile
- * and Appearance) and marked active. DISPOSABLE: the wiring wave applies
- * the HANDOFF's settings-nav.tsx diff (the union entry + the item) and
- * swaps both call sites to `UserSettingsNavbar active="notifications"`,
- * deleting this function (the mount-scaffolding precedent — the shared
- * nav's swap-list entries 9/12/13). Item texts come from the shared
- * settingsNavLocale so the swap changes no rendered string; this module's
- * item text is the locale's own "notifications" key.
- */
-export function UserSettingsNotificationsNav() {
-  const item = (active: boolean) => (active ? "active item" : "item");
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{settingsNavLocale.user_settings}</div>
-        <a class={item(false)} href="/user/settings">
-          {settingsNavLocale.profile}
-        </a>
-        {/* navbar.tmpl:12-16 — THIS tab */}
-        <a class={item(true)} href="/user/settings/notifications">
-          {userSettingsNotificationsLocale.notifications}
-        </a>
-        <a class={item(false)} href="/user/settings/appearance">
-          {settingsNavLocale.appearance}
-        </a>
-        <a class={item(false)} href="/user/settings/security">
-          {settingsNavLocale.security}
-        </a>
-        <a class={item(false)} href="/user/settings/applications">
-          {settingsNavLocale.applications}
-        </a>
-        <a class={item(false)} href="/user/settings/keys">
-          {settingsNavLocale.ssh_gpg_keys}
-        </a>
-        <details class="item">
-          <summary>{settingsNavLocale.actions}</summary>
-          <div class="menu">
-            <a class={item(false)} href="/user/settings/actions/secrets">
-              {settingsNavLocale.secrets}
-            </a>
-            <a class={item(false)} href="/user/settings/actions/variables">
-              {settingsNavLocale.variables}
-            </a>
-          </div>
-        </details>
-        <a class={item(false)} href="/user/settings/hooks">
-          {settingsNavLocale.hooks}
-        </a>
-        <a class={item(false)} href="/user/settings/organization">
-          {settingsNavLocale.organization}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /** The full-document render (the render.tsx pattern). `error` carries the
  *  failed POST's outcome (null on the plain GET). */
 export function renderUserSettingsNotificationsPage(ctx: UiContext, data: UserSettingsNotificationsPageData, error: NotificationsPageError | null = null): string {
@@ -371,7 +311,7 @@ export function UserSettingsNotificationsPage(props: { ctx: UiContext; data: Use
   return (
     <BaseLayout ctx={ctx} title={userSettingsNotificationsLocale.notifications} pageClass="user settings">
       <div class="ui container flex-container">
-        <UserSettingsNotificationsNav />
+        <UserSettingsNavbar active="notifications" />
         <div class="flex-container-main">
           <div class="user-setting-content">
             {/* ----------------------------------------- Email preference (notifications.tmpl:4-36) */}

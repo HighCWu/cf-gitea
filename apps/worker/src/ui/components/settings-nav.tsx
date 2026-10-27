@@ -32,9 +32,12 @@
  * are live links for the index.ts window to route.
  *
  * Per-template reductions applied:
- *   - user nav: Account, Notifications, Blocked users (no user-scope
- *     module), Audit, Packages, Repos, and the Actions General/Runners/
- *     Scoped-workflows sub-items are UNRENDERED (no landed pages).
+ *   - user nav: Blocked users (no user-scope module), Audit, Packages,
+ *     Repos, and the Actions General/Runners/Scoped-workflows sub-items are
+ *     UNRENDERED (no landed pages). Account and Notifications RENDER —
+ *     their pages landed (upstream gates them on disabled-features /
+ *     EnableNotifyMail; both settings pin FALSE/TRUE so the items always
+ *     render — the modules' SPEC §3 reduction).
  *   - org nav: Applications, Packages, Audit, and the Actions General/
  *     Runners/Scoped-workflows sub-items are UNRENDERED.
  *   - The Labels item keeps the landed href `{orgLink}/labels` — upstream's
@@ -109,6 +112,8 @@ export const settingsNavLocale = {
   // The user group (templates/user/settings/navbar.tmpl).
   user_settings: "User Settings", // "user.settings" (the header, :3)
   profile: "Profile", // "settings.profile" (:5)
+  account: "Account", // "settings.account" (:9)
+  notifications: "Notifications", // "notifications" (:14)
   appearance: "Appearance", // "settings.appearance" (:18)
   security: "Security", // "settings.security" (:22)
   applications: "Applications", // "settings.applications" (:29)
@@ -130,6 +135,8 @@ export const settingsNavLocale = {
  *  upstream PageIs* arm out). */
 export type UserSettingsNavTab =
   | "profile" // pages/user-settings.tsx
+  | "account" // pages/user-settings-account.tsx
+  | "notifications" // pages/user-settings-notifications.tsx
   | "appearance" // pages/user-settings-appearance.tsx
   | "security" // pages/user-settings-security.tsx
   | "applications" // pages/user-settings-applications.tsx
@@ -154,9 +161,9 @@ export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "blocked" | "se
  * The shared USER settings navbar. `active` marks the rendered page's tab;
  * the Actions <details> opens while a secrets/variables page renders
  * (navbar.tmpl:40's or-arm) and stays closed otherwise. Item order is
- * navbar.tmpl's exact order with the dead items dropped: Profile,
- * Appearance, Security, Applications, Keys, Actions▸(Secrets, Variables),
- * Hooks, Organizations.
+ * navbar.tmpl's exact order with the dead items dropped: Profile, Account,
+ * Notifications, Appearance, Security, Applications, Keys,
+ * Actions▸(Secrets, Variables), Hooks, Organizations.
  */
 export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
   const item = (tab: UserSettingsNavTab) => (props.active === tab ? "active item" : "item");
@@ -168,7 +175,15 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
         <a class={item("profile")} href="/user/settings">
           {settingsNavLocale.profile}
         </a>
-        {/* navbar.tmpl:17-19 (Account :7-11 + Notifications :12-16 dead) */}
+        {/* navbar.tmpl:7-11 */}
+        <a class={item("account")} href="/user/settings/account">
+          {settingsNavLocale.account}
+        </a>
+        {/* navbar.tmpl:12-16 */}
+        <a class={item("notifications")} href="/user/settings/notifications">
+          {settingsNavLocale.notifications}
+        </a>
+        {/* navbar.tmpl:17-19 (Blocked users :25-27 dead) */}
         <a class={item("appearance")} href="/user/settings/appearance">
           {settingsNavLocale.appearance}
         </a>

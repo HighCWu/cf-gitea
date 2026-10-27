@@ -121,10 +121,11 @@
  *                  the flash-queue lands)
  *
  * `GET /-/admin/system_status` is NOT mounted (the card-3 note). The navbar
- * is MOUNT SCAFFOLDING ONLY (the AdminMonitorNav precedent): when the admin
- * family lands its shared navbar, fold the Maintenance + Monitoring details
- * blocks into it and DELETE this component; the survey row to touch on
- * landing is docs/compat/ui-parity-survey.md:467.
+ * is the admin family's ONE shared navbar (the mount window's F7 fold —
+ * pages/admin-users.tsx AdminFamilyNav with `active="dashboard"`; the
+ * AdminDashboardNav scaffolding copy was DELETED — the AdminMonitorNav
+ * precedent). The survey row touched on landing is
+ * docs/compat/ui-parity-survey.md:467.
  */
 
 import type { Child } from "hono/jsx";
@@ -132,6 +133,7 @@ import type { Child } from "hono/jsx";
 import { enqueueDueMirrorSyncs } from "../../services/mirror/sync";
 import type { UiContext } from "../ui-context";
 import { BaseLayout, renderPage } from "../shell";
+import { AdminFamilyNav } from "./admin-users";
 import { loadAdminMonitorCron, type AdminMonitorCronEntry } from "./admin-monitor";
 
 // ---------------------------------------------------------------------------
@@ -240,47 +242,10 @@ export async function applyAdminDashboardForm(
 // MOUNT SCAFFOLDING ONLY, the module header's handoff note)
 // ---------------------------------------------------------------------------
 
-/** The layout's navbar reduced to the two groups with landed pages: the
- *  Maintenance details (open while this is the active page — navbar.tmpl:5's
- *  condition) with Dashboard active and self_check omitted (unlanded), and
- *  the Monitoring details with the sibling monitor family's four live items
- *  (navbar.tmpl:106-124, audit_logs omitted — no landed store). All other
- *  upstream groups are omitted — every item an unlanded page (the dead-link
- *  rule). */
-export function AdminDashboardNav() {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{adminDashboardLocale.settings}</div>
-        <details class="item" open>
-          <summary>{adminDashboardLocale.maintenance}</summary>
-          <div class="menu">
-            <a class="active item" href="/-/admin">
-              {adminDashboardLocale.dashboard}
-            </a>
-          </div>
-        </details>
-        <details class="item">
-          <summary>{adminDashboardLocale.monitoring}</summary>
-          <div class="menu">
-            <a class="item" href="/-/admin/monitor/stats">
-              {adminDashboardLocale.stats}
-            </a>
-            <a class="item" href="/-/admin/monitor/cron">
-              {adminDashboardLocale.cron}
-            </a>
-            <a class="item" href="/-/admin/monitor/queue">
-              {adminDashboardLocale.queues}
-            </a>
-            <a class="item" href="/-/admin/monitor/stacktrace">
-              {adminDashboardLocale.trace}
-            </a>
-          </div>
-        </details>
-      </div>
-    </div>
-  );
-}
+// The layout's navbar is the SHARED AdminFamilyNav (pages/admin-users.tsx —
+// the mount window's F7 fold; the module-local AdminDashboardNav copy was
+// deleted): the Maintenance group opens with Dashboard active on this page,
+// the other groups closed — navbar.tmpl's PageIsAdmin condition.
 
 /** The layout shell (layout_head.tmpl verbatim around the content block):
  *  the `admin dashboard` pageClass, the fluid padded flex container, the
@@ -290,7 +255,7 @@ function AdminDashboardShell(props: { ctx: UiContext; title: string; children: C
   return (
     <BaseLayout ctx={props.ctx} title={props.title} pageClass="admin dashboard">
       <div class="ui container fluid padded flex-container">
-        <AdminDashboardNav />
+        <AdminFamilyNav active="dashboard" />
         <div class="flex-container-main">
           <div class="admin-setting-content">{props.children}</div>
         </div>

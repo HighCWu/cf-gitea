@@ -144,6 +144,7 @@ import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import { activityFeedsLocale } from "./activity-feeds";
 import { formatDueDate } from "./milestones";
+import { EyeIcon } from "./user-watching-tab";
 import {
   ProfileAvatarCard,
   USER_PROFILE_PAGE_SIZE,
@@ -331,11 +332,14 @@ export function FollowCardsList(props: {
 }
 
 /**
- * The overview header (user/overview/header.tmpl reduced to its two LIVE
- * tabs) with NEITHER item active — both `eq .TabName` conditions
- * (header.tmpl:8, :33) fail for followers/following; the header has no
- * follower menu entries at this pin (the module header's strip section).
- * Module-local, the activity module's kept-local pattern.
+ * The overview header (user/overview/header.tmpl reduced to its live tabs)
+ * with NEITHER tab item active — the `eq .TabName` conditions (header.tmpl:8,
+ * :33) fail for followers/following, and the Stars/watching anchors
+ * (header.tmpl:36-46) never mark active here either (upstream renders the
+ * overview header with no active item for these pages — the collapsed-if
+ * rule: both anchors render, neither is active). Module-local, the activity
+ * module's kept-local pattern; labels reuse userProfileLocale (this module
+ * imports it).
  */
 function OverviewTabs(props: { username: string; repoCount: number }) {
   return (
@@ -347,6 +351,12 @@ function OverviewTabs(props: { username: string; repoCount: number }) {
         </a>
         <a class="item" href={`/${props.username}?tab=activity`}>
           <Icon name="octicon-rss" /> {userProfileLocale.activity}
+        </a>
+        <a class="item" href={`/${props.username}?tab=stars`}>
+          <Icon name="octicon-star" /> {userProfileLocale.starred}
+        </a>
+        <a class="item" href={`/${props.username}?tab=watching`}>
+          <EyeIcon /> {userProfileLocale.watched}
         </a>
       </div>
     </overflow-menu>

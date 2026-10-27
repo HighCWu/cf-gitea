@@ -876,6 +876,24 @@ import {
   revokeTokenFromForm,
 } from "./pages/user-settings-applications";
 import {
+  applyUserSettingsAccountDeleteForm,
+  applyUserSettingsAccountEmailForm,
+  deleteUserSettingsAccountEmail,
+  loadUserSettingsAccountPageData,
+  parseUserSettingsAccountDeleteForm,
+  parseUserSettingsAccountEmailDeleteForm,
+  parseUserSettingsAccountEmailForm,
+  renderUserSettingsAccountPage,
+} from "./pages/user-settings-account";
+import {
+  applyUserSettingsNotificationsActionsForm,
+  applyUserSettingsNotificationsEmailForm,
+  loadUserSettingsNotificationsPageData,
+  parseUserSettingsNotificationsActionsForm,
+  parseUserSettingsNotificationsEmailForm,
+  renderUserSettingsNotificationsPage,
+} from "./pages/user-settings-notifications";
+import {
   applyUserOrgsLeave,
   loadUserOrgsSettings,
   parseUserOrgsLeaveForm,
@@ -901,7 +919,16 @@ import {
   renderAdminMonitorTracePage,
 } from "./pages/admin-monitor";
 import type { AdminMonitorPage } from "./pages/admin-monitor";
+// The admin listing pages (the family prologue is shared adminPagePrologue).
+import { loadAdminUsersData, renderAdminUsersPage } from "./pages/admin-users";
+import { loadAdminOrgsData, renderAdminOrgsPage } from "./pages/admin-orgs";
+import { loadAdminReposData, renderAdminReposPage } from "./pages/admin-repos";
 import { loadUserProfileData, renderUserProfilePage, resolveUserProfile } from "./pages/user-profile";
+// The profile's sub-tab pages (the ownerHomePage ?tab= dispatch — the
+// activity-feeds precedent; each loader takes the doer, not the viewer).
+import { loadUserFollowTabsData, renderUserFollowTabsPage } from "./pages/user-follow-tabs";
+import { loadUserStarsTabData, renderUserStarsTabPage } from "./pages/user-stars-tab";
+import { loadUserWatchingTabData, renderUserWatchingTabPage } from "./pages/user-watching-tab";
 // Wave-19 creation pages (the authoring front door — the survey's #2).
 import {
   createRepoFromForm,
@@ -1262,6 +1289,14 @@ import {
   renderUserFeedRss,
   USER_FEED_CONTENT_TYPES,
 } from "./pages/user-feed-xml";
+// The repo feed twins (the .rss/.atom channel bytes behind the repo header).
+import {
+  loadReleasesFeedData,
+  RELEASES_FEED_CONTENT_TYPES,
+  renderReleasesFeedAtom,
+  renderReleasesFeedRss,
+} from "./pages/releases-feed-xml";
+import { loadTagsFeedData, TAGS_FEED_CONTENT_TYPES, renderTagsFeedAtom, renderTagsFeedRss } from "./pages/tags-feed-xml";
 // Window-2e B2: the repo-scoped aux/fragment modules.
 import {
   issuesSearchResponse,
@@ -1271,9 +1306,14 @@ import {
   suggestionsIsPullFilter,
 } from "./pages/issues-search-aux";
 import {
+  contentHistoryDetailFragmentResponse,
+  contentHistoryListFragmentResponse,
   contentHistoryOverviewFragmentResponse,
+  formInt64,
   issueAttachmentsFragmentResponse,
   issueInfoFragmentResponse,
+  loadContentHistoryDetailFragment,
+  loadContentHistoryListFragment,
   loadContentHistoryOverviewFragment,
   loadIssueAttachmentsFragment,
   loadIssueInfoFragment,
@@ -1313,6 +1353,8 @@ import {
   renderWikiViewPage,
 } from "./pages/repo-wiki";
 import type { WikiDoer } from "../services/wiki";
+// The wiki raw byte arm (the markdown pipeline's `/wiki/raw/…` targets).
+import { loadWikiRawBlob, wikiRawBlobResponse } from "./pages/wiki-raw";
 // Window-2e C1: the global inbox.
 import {
   loadDashboardMilestonesData,
@@ -1562,6 +1604,29 @@ export interface ReleaseDownloadRoute {
    *  single-segment params, so a literal slash in either 404s upstream). */
   vTag?: string;
   fileName?: string;
+}
+
+/** The wave-2e releases feed twins (pages/releases-feed-xml.ts): upstream
+ *  web.go:1506-1507's `/{owner}/{repo}/releases.rss|.atom` — the releases
+ *  channel bytes behind the repo header's feed links. Binary XML serves,
+ *  not pages; the routes sit in the releases group's gates (MustBeNotEmpty +
+ *  reqRepoReleaseReader — the `releasesReadGate` pair). */
+export interface ReleasesFeedRoute {
+  family: "release-feed-rss" | "release-feed-atom";
+  owner: string;
+  repo: string;
+}
+
+/** The tags feed twins (pages/tags-feed-xml.ts): upstream web.go:1495-1496's
+ *  `/{owner}/{repo}/tags.rss|.atom` — the tags channels (engine tag universe
+ *  ∪ D1 release rows). The group's gate is reqUnitCodeReader (web.go:1502 —
+ *  the §2.5 prologue IS that pair here) + MustBeNotEmpty; deliberately NO
+ *  releases-unit gate (the tags twin's documented divergence from the
+ *  releases feed above). */
+export interface TagsFeedRoute {
+  family: "tags-feed-rss" | "tags-feed-atom";
+  owner: string;
+  repo: string;
 }
 
 /** The wave-41 rendered blob views (pages/render-files.ts): upstream
@@ -2064,6 +2129,20 @@ export interface WikiRoute {
   rawTail: string;
 }
 
+/** The wiki raw byte arm (pages/wiki-raw.ts — web.go:1621's
+ *  `m.Get("/raw/*", repo.WikiRaw)`): the bytes behind the markdown
+ *  pipeline's `![img](/wiki/raw/…)` rewrites. GET-only. */
+export interface WikiRawRoute {
+  family: "wiki-raw";
+  owner: string;
+  repo: string;
+  /** The decoded `/raw` tail (per-segment decode + "/" join — the
+   *  wiki family's rawTail convention; "" never claims here: the
+   *  bare `/wiki/raw` tail stays with the page family, exactly
+   *  upstream's chi wildcard which does not match `/raw`). */
+  rawTail: string;
+}
+
 /** The wave-8 file-editor family (pages/file-editor.tsx): upstream's
  *  `/{editor_action:_edit|_new|_delete}/*` Combos under
  *  `RepoRefByType(git.RefTypeBranch)` (web.go:1453-1461) at the wave brief's
@@ -2151,6 +2230,8 @@ export interface IssueAuxRoute {
     | "issue-info"
     | "issue-attachments"
     | "issue-content-overview"
+    | "issue-content-history-list"
+    | "issue-content-history-detail"
     | "issue-attachments-alias"
     | "pull-merge-box"
     | "pull-files-range"
@@ -2182,12 +2263,14 @@ export interface UserSettingsRoute {
   family: "user-settings";
 }
 
-/** Window-2c: the admin family (pages/admin-dashboard.tsx + pages/
- *  admin-monitor.tsx — upstream's /-/admin group). */
+/** Window-2c: the admin family (pages/admin-dashboard.tsx +
+ *  pages/admin-monitor.tsx + the wave's users/orgs/repos pages — upstream's
+ *  /-/admin group). */
 export interface AdminRoute {
-  family: "admin-dashboard" | "admin-monitor";
+  family: "admin-dashboard" | "admin-monitor" | "admin-users" | "admin-orgs" | "admin-repos";
   /** The monitor page (stats/cron/queue/stacktrace → the module's
-   *  AdminMonitorPage union); absent on the dashboard family. */
+   *  AdminMonitorPage union); absent on the dashboard family and the three
+   *  listing families. */
   page?: "stats" | "cron" | "queue" | "trace";
 }
 
@@ -2215,6 +2298,13 @@ export interface UserSettingsTabRoute {
     | "user-settings-keys-delete"
     | "user-settings-applications"
     | "user-settings-applications-delete"
+    | "user-settings-account"
+    | "user-settings-account-email"
+    | "user-settings-account-email-delete"
+    | "user-settings-account-delete"
+    | "user-settings-notifications"
+    | "user-settings-notifications-email"
+    | "user-settings-notifications-actions"
     | "user-settings-organizations"
     | "user-settings-organizations-leave";
   /** The numeric path segment (hook/variable id), already parsed. */
@@ -2381,9 +2471,12 @@ export type ParsedUiRoute =
   | TreeViewAuxRoute
   | BranchesListAuxRoute
   | ReleaseDownloadRoute
+  | ReleasesFeedRoute
+  | TagsFeedRoute
   | RenderFileRoute
   | LastCommitRoute
-  | BlobExcerptRoute;
+  | BlobExcerptRoute
+  | WikiRawRoute;
 
 
 /**
@@ -2515,6 +2608,28 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 2 && tail[0] === "applications" && tail[1] === "delete") {
       return { family: "user-settings-applications-delete", id: null };
     }
+    // The account tab (navbar.tmpl:7-11; upstream EmailPost/DeleteEmail/
+    // DeleteAccount over the landed email + PAT stores).
+    if (tail.length === 1 && tail[0] === "account") return { family: "user-settings-account", id: null };
+    if (tail.length === 2 && tail[0] === "account" && tail[1] === "email") {
+      return { family: "user-settings-account-email", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "account" && tail[1] === "email" && tail[2] === "delete") {
+      return { family: "user-settings-account-email-delete", id: null };
+    }
+    if (tail.length === 2 && tail[0] === "account" && tail[1] === "delete") {
+      return { family: "user-settings-account-delete", id: null };
+    }
+    // The notifications tab (navbar.tmpl:12-16; the two preference POSTs —
+    // NO EnableNotifyMail/Actions-enabled 404 arms, both reduce to
+    // always-mounted, SPEC §3).
+    if (tail.length === 1 && tail[0] === "notifications") return { family: "user-settings-notifications", id: null };
+    if (tail.length === 2 && tail[0] === "notifications" && tail[1] === "email") {
+      return { family: "user-settings-notifications-email", id: null };
+    }
+    if (tail.length === 2 && tail[0] === "notifications" && tail[1] === "actions") {
+      return { family: "user-settings-notifications-actions", id: null };
+    }
     // The orgs tab is SINGULAR on the wire (web.go:740 m.Get("/organization",
     // …) serves the plural template — the module's premise correction).
     if (tail.length === 1 && tail[0] === "organization") return { family: "user-settings-organizations", id: null };
@@ -2552,16 +2667,23 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
 
   // Window-2c: the ADMIN literal family (pages/admin-dashboard.tsx +
-  // pages/admin-monitor.tsx — upstream's /-/admin group, web.go:779-813,
+  // pages/admin-monitor.tsx + the wave's users/orgs/repos pages —
+  // upstream's /-/admin group, web.go:779-813,
   // behind verifyAuthWithOptionsWeb(SignInRequired+AdminRequired)): the
   // top-level `/-` namespace is otherwise unclaimed (a repo cannot be named
   // "-"), so the exact shapes claim ahead of the dynamic owner/repo parse.
-  // Only the landed pages claim: /-/admin (dashboard GET+POST) and the four
-  // monitor pages (+ cron run POST). Every other /-/* tail stays unclaimed
+  // Only the landed pages claim: /-/admin (dashboard GET+POST), the four
+  // monitor pages (+ cron run POST), and the three listing literals
+  // (users/orgs/repos — static-before-dynamic: any future numeric
+  // `/-/admin/users/{id}` arm claims AFTER these; the tail-length guards
+  // keep them unambiguous). Every other /-/* tail stays unclaimed
   // → the engine's 404.
   if (raw[1] === "-" && raw[2] === "admin") {
     const tail = raw.slice(3);
     if (tail.length === 0) return { family: "admin-dashboard" };
+    if (tail.length === 1 && tail[0] === "users") return { family: "admin-users" };
+    if (tail.length === 1 && tail[0] === "orgs") return { family: "admin-orgs" };
+    if (tail.length === 1 && tail[0] === "repos") return { family: "admin-repos" };
     if (tail.length === 2 && tail[0] === "monitor") {
       if (tail[1] === "stats") return { family: "admin-monitor", page: "stats" };
       if (tail[1] === "cron") return { family: "admin-monitor", page: "cron" };
@@ -2930,6 +3052,26 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
         return null;
       }
     }
+    // The raw byte arm (pages/wiki-raw.ts — web.go:1621's
+    // `m.Get("/raw/*", repo.WikiRaw)`): EXACTLY the `raw/{tail}` shape;
+    // the bare `/wiki/raw` tail falls through to the wiki page family
+    // below (chi's `/raw/*` wildcard does not match `/raw`, which serves
+    // the reserved-name page miss there). Per-segment decode + "/" join
+    // (the wiki family's rawTail convention); a bad escape is the
+    // engine's 404. MUST claim HERE — the `family: "wiki"` catch-all
+    // below would otherwise swallow every raw tail.
+    if (rest.length >= 2 && rest[0] === "raw") {
+      try {
+        return {
+          family: "wiki-raw",
+          owner,
+          repo,
+          rawTail: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
+        };
+      } catch {
+        return null;
+      }
+    }
   }
   // Window-2e B2: the activity-author JSON feed (web.go:1683-1687 — the
   // optional period tail; unknown/bare segments hit the WEEKLY default).
@@ -2979,10 +3121,18 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (rest.length === 3 && /^-?\d+$/.test(rest[0] as string)) {
       const index = Number.parseInt(rest[0] as string, 10);
-      // The content-history overview fragment (list/detail stay unclaimed —
-      // no snapshot store).
+      // The content-history fragments (issue_content_history.go's arms over
+      // the landed snapshot store, cced424): the overview JSON, then the
+      // list/detail dropdown arms. The query params (comment_id/history_id)
+      // stay OUT of the route — the loader's FormInt64 reads them.
       if (rest[1] === "content-history" && rest[2] === "overview") {
         return { family: "issue-content-overview", owner, repo, urlKind: head, index };
+      }
+      if (rest[1] === "content-history" && rest[2] === "list") {
+        return { family: "issue-content-history-list", owner, repo, urlKind: head, index };
+      }
+      if (rest[1] === "content-history" && rest[2] === "detail") {
+        return { family: "issue-content-history-detail", owner, repo, urlKind: head, index };
       }
       // The byte-serving alias: upstream mounts the uuid arm at
       // /{index}/attachments/{uuid} (web.go:1337) driving the same seam as
@@ -3166,8 +3316,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // Window-2e C2: the WIKI family (pages/repo-wiki.tsx — upstream
     // web.go:1611-1617's two combos; the SUB-PAGES dispatch on the
     // ?action= FORM VALUE inside the handlers, not the path — the module's
-    // verified grammar). The raw/* byte arm stays unclaimed (the module
-    // ported the five template pages only) → the engine's 404.
+    // verified grammar). The raw/* byte arm claims in the EARLY `wiki`
+    // block above (pages/wiki-raw.ts, the mounted raw bytes) → this arm
+    // answers only the page shapes, the bare `/wiki/raw` included (chi's
+    // wildcard-miss: the reserved-name 303 `?action=_pages` arm — that
+    // behavior for the BARE tail is upstream parity and stays).
     let rawTail: string;
     try {
       rawTail = rest.map((segment) => decodeURIComponent(segment)).join("/");
@@ -3249,8 +3402,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // unclaimed set (web.go:1519-1520 + 1523). Wave 41 lifts the group's two
   // GET download routes out of the unclaimed set (web.go:1513-1514 — the
   // download-tail families below). The feed tails upstream registers
-  // (`.rss`/`.atom`), the `/generate-notes` and the `/attachments`+
-  // `/attachments/remove` POST write tails stay unclaimed → the engine's 404.
+  // (`.rss`/`.atom` — the dotted-head claims just above), the
+  // `/generate-notes` and the `/attachments`+`/attachments/remove` POST
+  // write tails stay unclaimed → the engine's 404.
+  // The releases feed twins (pages/releases-feed-xml.ts — upstream
+  // web.go:1506-1507's `/{owner}/{repo}/releases.rss|.atom`): the dotted
+  // head is a DISJOINT literal from the `releases` block below
+  // (case-sensitively exact — `releases.RSS` and a ref named `releases.rss`
+  // stay unclaimed → the engine's 404). Only the bare dotted head claims;
+  // every deeper tail stays unclaimed exactly like the unregistered
+  // upstream route.
+  if (head === "releases.rss" || head === "releases.atom") {
+    if (rest.length === 0) {
+      return { family: head === "releases.rss" ? "release-feed-rss" : "release-feed-atom", owner, repo };
+    }
+    return null;
+  }
   if (head === "releases") {
     if (rest.length === 0) return { family: "releases", owner, repo };
     if (rest.length === 1 && rest[0] === "new") return { family: "release-new", owner, repo };
@@ -3364,9 +3531,18 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // literal. Wave 33 (the survey's top-5 #2) lifts the group's other two
   // routes out of the unclaimed set: `/tags/list` the aux JSON (web.go:1499,
   // pages/tag-list-aux.ts) and `/tags/delete` the delete write (web.go:1501,
-  // POST-only — GET answers chi's 405). The `.rss`/`.atom` feed tails and
-  // every deeper tail stay unclaimed → the engine's 404, exactly upstream's
-  // unregistered-route answer.
+  // POST-only — GET answers chi's 405). The `.rss`/`.atom` feed tails are
+  // the dotted-head claims just above and every deeper tail stays unclaimed
+  // → the engine's 404, exactly upstream's unregistered-route answer.
+  // The tags feed twins (pages/tags-feed-xml.ts — upstream web.go:1495-1496's
+  // `/{owner}/{repo}/tags.rss|.atom`): the dotted head is a DISJOINT literal
+  // from the `tags` block below; only the bare dotted head claims.
+  if (head === "tags.rss" || head === "tags.atom") {
+    if (rest.length === 0) {
+      return { family: head === "tags.rss" ? "tags-feed-rss" : "tags-feed-atom", owner, repo };
+    }
+    return null;
+  }
   if (head === "tags") {
     if (rest.length === 0) return { family: "tags", owner, repo };
     if (rest.length === 1 && rest[0] === "list") return { family: "tags-list-aux", owner, repo };
@@ -4563,6 +4739,42 @@ async function issueContentOverviewRoute(c: Context<{ Bindings: Env }>): Promise
   return respond(contentHistoryOverviewFragmentResponse(data));
 }
 
+/** GET /{issues|pulls}/{index}/content-history/list (the dropdown JSON): the
+ *  overview handler's shape; `comment_id` is Go FormInt64 (missing/garbage
+ *  → 0 — the module's export). */
+async function issueContentHistoryListRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-content-history-list" || route.index === undefined) return respond(await c.notFound()); // drift guard
+  const issue = await resolveFragmentIssue(c.env.DB, repo, route.index);
+  if (issue === null) return respond(c.html(renderNotFound(ctx), 404));
+  const commentId = formInt64(resolved.url.searchParams.get("comment_id"));
+  const data = await loadContentHistoryListFragment(c.env.DB, issue, commentId);
+  return respond(contentHistoryListFragmentResponse(data));
+}
+
+/** GET /{issues|pulls}/{index}/content-history/detail (the diff JSON): the
+ *  detail loader takes env FIRST (its write-grant arm rides
+ *  sessionRepoGrant) and the resolved viewer. The "historyNotFound" outcome
+ *  IS the JSON 404 body — do NOT substitute the HTML shell (the module's
+ *  loud rule; the empty-200 comment-miss quirk rides inside the loader's
+ *  ok arm). */
+async function issueContentHistoryDetailRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond, viewer } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-content-history-detail" || route.index === undefined) return respond(await c.notFound()); // drift guard
+  const issue = await resolveFragmentIssue(c.env.DB, repo, route.index);
+  if (issue === null) return respond(c.html(renderNotFound(ctx), 404));
+  const commentId = formInt64(resolved.url.searchParams.get("comment_id"));
+  const historyId = formInt64(resolved.url.searchParams.get("history_id"));
+  const data = await loadContentHistoryDetailFragment(c.env, repo, issue, viewer, commentId, historyId);
+  return respond(contentHistoryDetailFragmentResponse(data));
+}
+
 async function issueAttachmentsAliasRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
@@ -5128,6 +5340,26 @@ async function ownerHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
     const data = await loadActivityFeedsData(c.env.DB, profile.user, viewer, url.origin, url.searchParams);
     return respond(c.html(renderActivityFeedsPage(ctx, data), 200));
   }
+  // The FOLLOW TABS (profile.go:121-161's followers/following arms — the
+  // same profile route's user half; org names never reach here, the org
+  // half above already ignored the query). Upstream renders the overview
+  // header with NO active item for these two.
+  if (url.searchParams.get("tab") === "followers" || url.searchParams.get("tab") === "following") {
+    const data = await loadUserFollowTabsData(c.env.DB, profile.user, doer, url.searchParams);
+    return respond(c.html(renderUserFollowTabsPage(ctx, data), 200));
+  }
+  // The STARS tab (profile.go:191-219).
+  if (url.searchParams.get("tab") === "stars") {
+    const data = await loadUserStarsTabData(c.env.DB, profile.user, doer, url.searchParams);
+    return respond(c.html(renderUserStarsTabPage(ctx, data), 200));
+  }
+  // The WATCHING tab (profile.go:220-246 — upstream's DisableStars {{else}}
+  // arm: by default reachable by DIRECT URL ONLY, nothing active in the
+  // header).
+  if (url.searchParams.get("tab") === "watching") {
+    const data = await loadUserWatchingTabData(c.env.DB, profile.user, doer, url.searchParams);
+    return respond(c.html(renderUserWatchingTabPage(ctx, data), 200));
+  }
   const data = await loadUserProfileData(c.env.DB, profile.user, doer, url.searchParams);
   return respond(c.html(renderUserProfilePage(ctx, data), 200));
 }
@@ -5324,6 +5556,107 @@ async function userSettingsSecretsDelete(c: Context<{ Bindings: Env }>): Promise
   const form = parseUserSettingsSecretDeleteForm(await readUrlEncodedForm(c.req.raw));
   await deleteUserSettingsSecret(c.env.DB, p.viewer.id, form);
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/secrets" } }));
+}
+
+// --- the account tab (pages/user-settings-account.tsx — upstream EmailPost /
+// DeleteEmail / DeleteAccount; navbar.tmpl:7-11) ----------------------------
+
+/** GET /user/settings/account: the prologue → the page load (the doer's
+ *  users ROW + the email_addresses side store — a vanished row 404-shells,
+ *  the prologue family's convention). */
+async function userSettingsAccountPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsAccountPageData(c.env.DB, p.viewer.id);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsAccountPage(p.ctx, data), 200));
+}
+
+/** POST /user/settings/account/email (upstream EmailPost's arms): the write
+ *  apply takes the users ROW (the loader's), so the handler resolves it
+ *  first; "added"/"primary"/"redirect" → 303 back, "invalid" → reload +
+ *  re-render 200 with the carried email (never the password). */
+async function userSettingsAccountEmailSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const loaded = await loadUserSettingsAccountPageData(c.env.DB, p.viewer.id);
+  if (loaded === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const form = parseUserSettingsAccountEmailForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyUserSettingsAccountEmailForm(c.env.DB, loaded.user, form);
+  if (outcome.outcome !== "invalid") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/account" } }));
+  }
+  const data = await loadUserSettingsAccountPageData(c.env.DB, p.viewer.id);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsAccountPage(p.ctx, data, outcome.message, form.email)));
+}
+
+/** POST /user/settings/account/email/delete (upstream DeleteEmail):
+ *  "deleted" AND "missing" both 303 back (the idempotent silent-303 — the
+ *  secrets-delete reduction; upstream's miss is an unreachable 500). */
+async function userSettingsAccountEmailDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsAccountEmailDeleteForm(await readUrlEncodedForm(c.req.raw));
+  await deleteUserSettingsAccountEmail(c.env.DB, p.viewer.id, form);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/account" } }));
+}
+
+/** POST /user/settings/account/delete (upstream DeleteAccount): the apply
+ *  takes the users ROW; "deleted" → 303 onto `/` (the signed-out home),
+ *  "invalid" → reload + re-render 200 with the message, password field
+ *  EMPTY (it never enters the DOM). */
+async function userSettingsAccountDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const loaded = await loadUserSettingsAccountPageData(c.env.DB, p.viewer.id);
+  if (loaded === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const form = parseUserSettingsAccountDeleteForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyUserSettingsAccountDeleteForm(c.env.DB, loaded.user, form);
+  if (outcome.outcome === "deleted") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/" } }));
+  }
+  const data = await loadUserSettingsAccountPageData(c.env.DB, p.viewer.id);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsAccountPage(p.ctx, data, outcome.message)));
+}
+
+// --- the notifications tab (pages/user-settings-notifications.tsx —
+// upstream NotificationsEmailPost / NotificationsActionsEmailPost;
+// navbar.tmpl:12-16) ---------------------------------------------------------
+
+/** GET /user/settings/notifications: the appearance handler's exact shape. */
+async function userSettingsNotificationsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsNotificationsPageData(c.env.DB, p.viewer.id);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsNotificationsPage(p.ctx, data), 200));
+}
+
+/** POST /user/settings/notifications/email|actions: one submit, the arm
+ *  picks the catalog (the appearance submit's arm shape); "saved" → 303
+ *  back, "invalid" → reload + full-page re-render 200 with the per-form
+ *  error routing (`{ form: arm, message }`). NO EnableNotifyMail /
+ *  Actions-enabled 404 arms (both reduce to always-mounted, SPEC §3). */
+async function userSettingsNotificationsSubmit(
+  c: Context<{ Bindings: Env }>,
+  arm: "email" | "actions",
+): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const params = await readUrlEncodedForm(c.req.raw);
+  const form = arm === "email" ? parseUserSettingsNotificationsEmailForm(params) : parseUserSettingsNotificationsActionsForm(params);
+  const outcome =
+    arm === "email"
+      ? await applyUserSettingsNotificationsEmailForm(c.env.DB, p.viewer.id, form)
+      : await applyUserSettingsNotificationsActionsForm(c.env.DB, p.viewer.id, form);
+  if (outcome.outcome === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/notifications" } }));
+  }
+  const data = await loadUserSettingsNotificationsPageData(c.env.DB, p.viewer.id);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsNotificationsPage(p.ctx, data, { form: arm, message: outcome.message })));
 }
 
 async function userSettingsVariablesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -6307,6 +6640,35 @@ async function adminMonitorCronSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   const data = { entries: loadAdminMonitorCron(new Date()).entries };
   const flash = { kind: result.outcome === "applied" ? "positive" as const : "negative" as const, text: result.message };
   return p.respond(c.html(renderAdminMonitorCronPage({ ctx: p.ctx, data, flash })));
+}
+
+// --- the admin listing pages (pages/admin-users.tsx / admin-orgs.tsx /
+// admin-repos.tsx — upstream's /-/admin/users, /-/admin/orgs, /-/admin/repos;
+// each rides the shared adminPagePrologue) -----------------------------------
+
+/** GET /-/admin/users: the prologue → the paged users listing. */
+async function adminUsersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminUsersData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminUsersPage(p.ctx, data)));
+}
+
+/** GET /-/admin/orgs: the prologue → the paged orgs listing. */
+async function adminOrgsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminOrgsData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminOrgsPage(p.ctx, data)));
+}
+
+/** GET /-/admin/repos: the prologue → the paged repos listing (the loader
+ *  takes the VIEWER — its visibility arm is doer-shaped, not admin-only). */
+async function adminReposPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminReposData(c.env.DB, p.ctx.viewer, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminReposPage(p.ctx, data)));
 }
 
 /**
@@ -7549,6 +7911,62 @@ async function releaseDownloadTail(c: Context<{ Bindings: Env }>): Promise<Respo
 }
 
 // ---------------------------------------------------------------------------
+// The releases/tags feed twins (pages/releases-feed-xml.ts +
+// pages/tags-feed-xml.ts — upstream web.go:1506-1507 + :1495-1496, the
+// .rss/.atom channel bytes behind the repo header's feed links)
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/releases.rss|.atom: the §2.5 prologue (visibility) →
+ *  `releasesReadGate` (MustBeNotEmpty + the releases unit — web.go:1504's
+ *  group gates; a disabled releases unit is upstream CanRead(TypeReleases)
+ *  false → 404) → the loader (drafts excluded unconditionally — no viewer
+ *  parameter, upstream's IncludeDrafts-unset) → the family's envelope.
+ *  NO EnableFeed arm (the setting pins TRUE). */
+async function releasesFeedRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo, url } = resolved;
+  if (route.family !== "release-feed-rss" && route.family !== "release-feed-atom") {
+    return respond(await c.notFound()); // registration/parser drift guard
+  }
+  if (!(await releasesReadGate(c.env.DB, repo))) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadReleasesFeedData(c.env.DB, repo, url.origin);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1504)
+  const body = route.family === "release-feed-rss" ? renderReleasesFeedRss(data) : renderReleasesFeedAtom(data);
+  return respond(
+    new Response(body, {
+      headers: {
+        "content-type": route.family === "release-feed-rss" ? RELEASES_FEED_CONTENT_TYPES.rss : RELEASES_FEED_CONTENT_TYPES.atom,
+      },
+    }),
+  );
+}
+
+/** GET /{owner}/{repo}/tags.rss|.atom: the §2.5 prologue answers the group's
+ *  reqUnitCodeReader (web.go:1502) — deliberately NO `releasesReadGate`
+ *  (the tags group gates the code reader, not the releases reader), so a
+ *  releases-disabled repo still serves tags.rss. The loader's only null arm
+ *  IS the empty repo = MustBeNotEmpty. */
+async function tagsFeedRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo, url } = resolved;
+  if (route.family !== "tags-feed-rss" && route.family !== "tags-feed-atom") {
+    return respond(await c.notFound()); // registration/parser drift guard
+  }
+  const data = await loadTagsFeedData(c.env, c.env.DB, repo, url.origin);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1502)
+  const body = route.family === "tags-feed-rss" ? renderTagsFeedRss(data) : renderTagsFeedAtom(data);
+  return respond(
+    new Response(body, {
+      headers: {
+        "content-type": route.family === "tags-feed-rss" ? TAGS_FEED_CONTENT_TYPES.rss : TAGS_FEED_CONTENT_TYPES.atom,
+      },
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The wave-41 rendered blob views (pages/render-files.ts — the survey's
 // row 3: upstream web.go:1715-1719's /render group over repo.RenderFile)
 // ---------------------------------------------------------------------------
@@ -7645,6 +8063,30 @@ async function blobExcerptFragment(c: Context<{ Bindings: Env }>): Promise<Respo
     style: form.style, // GetDiffViewStyle's resolved echo (middlewares.go:35-37)
   });
   return respond(blobExcerptFragmentResponse(html));
+}
+
+/** GET /{owner}/{repo}/wiki/raw/* (pages/wiki-raw.ts — web.go:1621's
+ *  `m.Get("/raw/*", repo.WikiRaw)`): the §2.5 prologue (the wiki-reader
+ *  visibility arm) → MustEnableWiki (web.go:1622 over the landed
+ *  repo-settings `hasWiki`) → the pair re-read (the wikiPrologue precedent)
+ *  → the loader (services/wiki's wiki cell) → the ServeBlob port. */
+async function wikiRawBlob(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "wiki-raw") return respond(await c.notFound()); // drift guard
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasWiki) return respond(c.html(renderNotFound(ctx), 404)); // MustEnableWiki (web.go:1622)
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const blob = await loadWikiRawBlob(c.env, pair, route.rawTail);
+  if (blob === null) return respond(c.html(renderNotFound(ctx), 404)); // wiki.go:638's NotFound
+  return respond(
+    wikiRawBlobResponse(blob, {
+      cacheIsPublic: repo.visibility === "public" && pair.owner.visibility === "public",
+      ifNoneMatch: c.req.header("if-none-match") ?? null,
+    }),
+  );
 }
 
 /** The wave-33 tag delete's refusal shape — ctx.HTTPError(409, …)'s
@@ -9537,6 +9979,16 @@ uiRouter.post("/user/settings/keys/delete", (c) => userSettingsKeysDelete(c));
 uiRouter.get("/user/settings/applications", (c) => userSettingsApplicationsPage(c));
 uiRouter.post("/user/settings/applications", (c) => userSettingsApplicationsSubmit(c));
 uiRouter.post("/user/settings/applications/delete", (c) => userSettingsApplicationsDelete(c));
+// The account tab (navbar.tmpl:7-11 — the GET page + the three POST arms).
+uiRouter.get("/user/settings/account", (c) => userSettingsAccountPage(c));
+uiRouter.post("/user/settings/account/email", (c) => userSettingsAccountEmailSubmit(c));
+uiRouter.post("/user/settings/account/email/delete", (c) => userSettingsAccountEmailDelete(c));
+uiRouter.post("/user/settings/account/delete", (c) => userSettingsAccountDelete(c));
+// The notifications tab (navbar.tmpl:12-16 — the GET page + the two
+// preference POSTs).
+uiRouter.get("/user/settings/notifications", (c) => userSettingsNotificationsPage(c));
+uiRouter.post("/user/settings/notifications/email", (c) => userSettingsNotificationsSubmit(c, "email"));
+uiRouter.post("/user/settings/notifications/actions", (c) => userSettingsNotificationsSubmit(c, "actions"));
 uiRouter.get("/user/settings/organization", (c) => userSettingsOrganizationsPage(c));
 uiRouter.post("/user/settings/organization/leave", (c) => userSettingsOrganizationsLeave(c));
 uiRouter.post("/user/settings", (c) => userSettingsSubmit(c));
@@ -9624,6 +10076,11 @@ uiRouter.get("/-/admin/monitor/cron", (c) => adminMonitorPage(c, "cron"));
 uiRouter.post("/-/admin/monitor/cron", (c) => adminMonitorCronSubmit(c));
 uiRouter.get("/-/admin/monitor/queue", (c) => adminMonitorPage(c, "queue"));
 uiRouter.get("/-/admin/monitor/stacktrace", (c) => adminMonitorPage(c, "trace"));
+// The admin listing pages (top-level static literals — nothing dynamic
+// shadows them; the parse claims carry the same literals).
+uiRouter.get("/-/admin/users", (c) => adminUsersPage(c));
+uiRouter.get("/-/admin/orgs", (c) => adminOrgsPage(c));
+uiRouter.get("/-/admin/repos", (c) => adminReposPage(c));
 uiRouter.get("/:owner/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
 // Wave-14 org labels family (parseUiRoute claims exactly these shapes; the
 // literal `labels` registers with the wave-9/12 statics so it beats the
@@ -9729,11 +10186,23 @@ uiRouter.get("/explore/topics/search", (c) => topicSearchAuxRoute(c));
 // The feed suffixes — one constrained registration (the owner-home
 // precedent); the parser discriminates .rss vs .atom and strips.
 uiRouter.get("/:owner{^[\\w-]+\\.(rss|atom)$}", (c) => userFeedRoute(c));
+// The repo feed twins — one constrained registration each (the user-feed
+// one-constrained-registration convention); the parser discriminates .rss
+// vs .atom by the dotted head. No existing 3-segment pattern matches a
+// `releases.rss`/`tags.rss` second segment.
+uiRouter.get("/:owner/:repo/:segment{^releases\\.(rss|atom)$}", (c) => releasesFeedRoute(c));
+uiRouter.get("/:owner/:repo/:segment{^tags\\.(rss|atom)$}", (c) => tagsFeedRoute(c));
 // Window-2e B2: the repo-scoped aux/fragment routes.
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/info", (c) => issueInfoFragmentRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/attachments", (c) => issueAttachmentsFragmentRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/attachments/:uuid", (c) => issueAttachmentsAliasRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/overview", (c) => issueContentOverviewRoute(c));
+// The content-history list/detail dropdown arms (the same constrained-param
+// form; the parser's numeric guard stays `-?\d+` — the registration's `\d+`
+// is the info/overview precedent, aux-fragments.matrix pins the plain-404
+// answer for `/issues/-1/...`).
+uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/list", (c) => issueContentHistoryListRoute(c));
+uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/detail", (c) => issueContentHistoryDetailRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/merge_box", (c) => pullMergeBoxRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/files/:segment{^[a-f0-9]{7,64}(\\.\\.[a-f0-9]{7,64})?$}", (c) => pullFilesRangeRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/commits/:sha{^[a-f0-9]{7,64}$}", (c) => pullCommitFilesRoute(c));
@@ -10074,6 +10543,17 @@ uiRouter.get("/:owner/:repo/render/blob/:sha", (c) => renderFileView(c));
 // shadow and the constraint would claim nothing (the /commits,/tags posture).
 uiRouter.get("/:owner/:repo/blob_excerpt/:sha", (c) => blobExcerptFragment(c));
 uiRouter.get("/:owner/:repo/wiki/blob_excerpt/:sha", (c) => blobExcerptFragment(c));
+// The wiki raw byte arm (pages/wiki-raw.ts — web.go:1621) — AFTER the
+// excerpt twin, BEFORE the wiki wildcard pair below (specific-before-
+// wildcard; hono answers the first match, or the family is dead — the
+// a58cad5 dead-wiki class). Plain {repo} param (no `[^-].*` constraint —
+// the :10068-10074 rule). The BARE `/wiki/raw` literal rides BESIDE the
+// wildcard: hono's `*` matches the empty tail (chi's does NOT — the
+// wildcard-miss), so without the literal the bare tail would land in the
+// byte handler's drift guard and 404 instead of the page family's
+// reserved-name 303 `?action=_pages` miss (upstream parity).
+uiRouter.get("/:owner/:repo/wiki/raw", (c) => wikiPage(c));
+uiRouter.get("/:owner/:repo/wiki/raw/*", (c) => wikiRawBlob(c));
 // Window-2e C2a wiki family — AFTER the excerpt twin (specific-before-
 // wildcard; hono answers the first match).
 uiRouter.get("/:owner/:repo/wiki", (c) => wikiPage(c));

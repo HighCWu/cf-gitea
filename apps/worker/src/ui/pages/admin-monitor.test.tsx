@@ -43,7 +43,6 @@ import type { UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
 import {
   AdminMonitorCronPage,
-  AdminMonitorNav,
   AdminMonitorQueuePage,
   AdminMonitorStatsPage,
   AdminMonitorTracePage,
@@ -56,6 +55,7 @@ import {
   parseAdminMonitorCronForm,
   renderAdminMonitorCronPage,
 } from "./admin-monitor";
+import { AdminFamilyNav } from "./admin-users";
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -444,10 +444,10 @@ describe("the monitor family DOM (templates/admin/*.tmpl at the pin)", () => {
     expect(html).not.toContain("cancel/");
   });
 
-  it("nav: the monitor submenu with the four live items, audit_logs omitted", () => {
-    const html = renderToString(<AdminMonitorNav active="stats" />);
+  it("nav: the shared family navbar with the monitor items active/open, audit_logs omitted (the F7 fold)", () => {
+    const html = renderToString(<AdminFamilyNav active="stats" />);
     expect(html).toContain('class="flex-container-nav"');
-    expect(html).toContain('<details class="item" open="">');
+    expect(html).toContain('<details class="item" open="">'); // the group containing the active page
     expect(html).toContain(`>${adminMonitorLocale.monitoring}</summary>`);
     expect(html).toContain('class="active item" href="/-/admin/monitor/stats"');
     expect(html).toContain('href="/-/admin/monitor/cron"');

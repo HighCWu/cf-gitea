@@ -162,15 +162,16 @@
  * the same way (web.go:806's group registers before web.go:1102's owner
  * routes; a user named "users" is create-time reserved besides).
  *
- * The family navbar below (AdminFamilyNav) is MOUNT SCAFFOLDING (the
- * AdminMonitorNav precedent): it renders upstream's navbar.tmpl reduced to
- * the LANDED pages — Maintenance (Dashboard), Identity & Access
- * (Organizations + Users — this family), Assets (Repositories — this
- * family), Monitoring (the four live monitor items; audit_logs omitted) —
- * and OMITS every group whose items are all unlanded (self_check, auths,
- * badges, emails, packages, integrations, actions, config, notices). When
- * the rest of the admin family lands, fold all five module navs into one
- * shared navbar and DELETE the copies. Survey row to flip on landing:
+ * The family navbar below (AdminFamilyNav) is the WHOLE admin family's ONE
+ * shared navbar (the mount window's F7 fold — the AdminDashboardNav +
+ * AdminMonitorNav scaffolding copies deleted): it renders upstream's
+ * navbar.tmpl reduced to the LANDED pages — Maintenance (Dashboard),
+ * Identity & Access (Organizations + Users), Assets (Repositories),
+ * Monitoring (the four live monitor items; audit_logs omitted) — with the
+ * details-open + active-item arms derived from the `active` prop (upstream's
+ * per-group PageIs* conditions), and OMITS every group whose items are all
+ * unlanded (self_check, auths, badges, emails, packages, integrations,
+ * actions, config, notices). Survey row flipped on landing:
  * docs/compat/ui-parity-survey.md:549 (the `/-/admin/*` row — users/orgs/
  * repos go PARTIAL→listed).
  */
@@ -259,8 +260,11 @@ export function AdminEmbeddedSvg(props: { name: string; size?: number; class?: s
   );
 }
 
-/** The admin navbar union — the pages this family's scaffolding links. */
-export type AdminFamilyNavActive = "users" | "orgs" | "repos";
+/** The admin navbar union — the pages this family's scaffolding links: the
+ *  three listing pages PLUS the dashboard and the four monitor pages (the
+ *  F7 fold — ONE shared navbar across the whole admin family; upstream's
+ *  navbar.tmpl marks the active page's item inside its open group). */
+export type AdminFamilyNavActive = "dashboard" | "users" | "orgs" | "repos" | "stats" | "cron" | "queue" | "trace";
 
 /** The family page chrome (component-local, the adminMonitorLocale pattern —
  *  locale.ts is shared and not this wave's file; upstream locale keys cited
@@ -281,45 +285,55 @@ export const adminFamilyLocale = {
   trace: "Trace", // "admin.monitor.trace"
 } as const;
 
-/** The admin layout's navbar reduced to the LANDED pages (navbar.tmpl at the
- *  pin; the module header's scaffolding note): the Maintenance details
- *  (Dashboard; self_check omitted), Identity & Access (Organizations + User
- *  Accounts — this family; auths/badges/emails omitted), Assets
- *  (Repositories — this family; packages omitted), Monitoring (the monitor
- *  family's four live items; audit_logs omitted). Every other upstream group
- *  is omitted — all its items are unlanded pages (the dead-link rule). */
+/** The admin layout's navbar (navbar.tmpl at the pin; the F7 fold — ONE
+ *  shared navbar across dashboard/monitor/users/orgs/repos, the
+ *  AdminDashboardNav + AdminMonitorNav scaffolding copies deleted): the
+ *  Maintenance details (Dashboard), Identity & Access (Organizations + User
+ *  Accounts), Assets (Repositories), Monitoring (the monitor family's four
+ *  live items). Upstream's per-group `PageIs*` conditions reduce to: the
+ *  group containing the active page renders `open`, the active item gets
+ *  the `active item` class. auths/badges/emails, packages, audit_logs,
+ *  self_check are omitted — all their upstream items are unlanded pages
+ *  (the dead-link rule). */
 export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
   const item = (href: string, label: string, active: boolean) => (
     <a class={active ? "active item" : "item"} href={href}>
       {label}
     </a>
   );
+  // navbar.tmpl's per-group PageIs* conditions — the details-open arm
+  // derived from the active page (upstream opens the group containing it).
+  const maintenanceOpen = props.active === "dashboard";
+  const identityOpen = props.active === "users" || props.active === "orgs";
+  const assetsOpen = props.active === "repos";
+  const monitorOpen = props.active === "stats" || props.active === "cron" || props.active === "queue" || props.active === "trace";
+  const openAttr = (open: boolean) => (open ? true : undefined);
   return (
     <div class="flex-container-nav">
       <div class="ui fluid vertical menu">
         <div class="header item">{adminFamilyLocale.settings}</div>
-        <details class="item">
+        <details class="item" open={openAttr(maintenanceOpen)}>
           <summary>{adminFamilyLocale.maintenance}</summary>
-          <div class="menu">{item("/-/admin", adminFamilyLocale.dashboard, false)}</div>
+          <div class="menu">{item("/-/admin", adminFamilyLocale.dashboard, props.active === "dashboard")}</div>
         </details>
-        <details class="item" open>
+        <details class="item" open={openAttr(identityOpen)}>
           <summary>{adminFamilyLocale.identityAccess}</summary>
           <div class="menu">
             {item("/-/admin/orgs", adminFamilyLocale.organizations, props.active === "orgs")}
             {item("/-/admin/users", adminFamilyLocale.userAccounts, props.active === "users")}
           </div>
         </details>
-        <details class="item">
+        <details class="item" open={openAttr(assetsOpen)}>
           <summary>{adminFamilyLocale.assets}</summary>
           <div class="menu">{item("/-/admin/repos", adminFamilyLocale.repositories, props.active === "repos")}</div>
         </details>
-        <details class="item">
+        <details class="item" open={openAttr(monitorOpen)}>
           <summary>{adminFamilyLocale.monitoring}</summary>
           <div class="menu">
-            {item("/-/admin/monitor/stats", adminFamilyLocale.stats, false)}
-            {item("/-/admin/monitor/cron", adminFamilyLocale.cron, false)}
-            {item("/-/admin/monitor/queue", adminFamilyLocale.queues, false)}
-            {item("/-/admin/monitor/stacktrace", adminFamilyLocale.trace, false)}
+            {item("/-/admin/monitor/stats", adminFamilyLocale.stats, props.active === "stats")}
+            {item("/-/admin/monitor/cron", adminFamilyLocale.cron, props.active === "cron")}
+            {item("/-/admin/monitor/queue", adminFamilyLocale.queues, props.active === "queue")}
+            {item("/-/admin/monitor/stacktrace", adminFamilyLocale.trace, props.active === "trace")}
           </div>
         </details>
       </div>

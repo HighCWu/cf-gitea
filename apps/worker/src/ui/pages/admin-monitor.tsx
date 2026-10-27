@@ -146,12 +146,11 @@
  *                                 renderAdminMonitorQueuePage
  *   GET /-/admin/monitor/stacktrace  gate → renderAdminMonitorTracePage
  *
- * The admin navbar belongs to the admin-family wave: AdminMonitorNav below is
- * MOUNT SCAFFOLDING ONLY (the OrgSettingsBlockedNav precedent) — the literal
- * navbar.tmpl DOM for the wrapper + header item + the monitor details block,
- * with the four live items. When the admin family lands its navbar, fold the
- * details block into it and DELETE this component. Survey row to touch on
- * landing: docs/compat/ui-parity-survey.md:386 (the `/-/admin/*` family row —
+ * The admin navbar is the admin family's ONE shared navbar (the mount
+ * window's F7 fold — pages/admin-users.tsx AdminFamilyNav with the monitor
+ * `active` values; the AdminMonitorNav scaffolding copy was DELETED — the
+ * OrgSettingsBlockedNav precedent). Survey row touched on landing:
+ * docs/compat/ui-parity-survey.md:386 (the `/-/admin/*` family row —
  * the monitor subset becomes PARTIAL).
  */
 
@@ -185,6 +184,7 @@ import {
 } from "../../db/schema";
 import type { UiContext } from "../ui-context";
 import { BaseLayout, Icon, renderPage } from "../shell";
+import { AdminFamilyNav } from "./admin-users";
 
 // ---------------------------------------------------------------------------
 // Page chrome + copy text (component-local, the orgSettingsBlockedLocale
@@ -229,51 +229,23 @@ export const adminMonitorLocale = {
   deliveryStates: "Webhook delivery states",
 } as const;
 
-/** The monitor submenu's live items (the AdminMonitorNav `active` union). */
+/** The monitor submenu's live items (the shared AdminFamilyNav's monitor
+ *  `active` union — the AdminMonitorPage values verbatim). */
 export type AdminMonitorPage = "stats" | "cron" | "queue" | "trace";
 
 // ---------------------------------------------------------------------------
-// The admin navbar scaffolding (navbar.tmpl:106-124 reduced — MOUNT
-// SCAFFOLDING ONLY, the module header's handoff note)
+// The admin navbar (navbar.tmpl:106-124 — the F7 fold: the family's ONE
+// shared navbar, pages/admin-users.tsx AdminFamilyNav; the module-local
+// AdminMonitorNav copy was deleted). Upstream keeps the Monitoring details
+// `open` only on monitor pages — which the `active` prop always is for this
+// module's four pages, so the shared nav's derived-open arm reproduces the
+// template here. The audit_logs item is OMITTED (no landed store — the
+// dead-link rule).
 // ---------------------------------------------------------------------------
-
-/** The layout's navbar reduced to the monitor block: the vertical-menu
- *  wrapper + the `admin.settings` header item are the admin-family wave's
- *  replaceable scaffolding; the `<details class="item" open>` monitor
- *  submenu is the piece to fold into the landed navbar (upstream keeps the
- *  details `open` only on monitor pages — navbar.tmpl:106's condition —
- *  which a mounted `active` always is for this module's four pages). The
- *  audit_logs item is OMITTED (no landed store — the dead-link rule). */
-export function AdminMonitorNav(props: { active: AdminMonitorPage }) {
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{adminMonitorLocale.settings}</div>
-        <details class="item" open>
-          <summary>{adminMonitorLocale.monitoring}</summary>
-          <div class="menu">
-            <a class={props.active === "stats" ? "active item" : "item"} href="/-/admin/monitor/stats">
-              {adminMonitorLocale.stats}
-            </a>
-            <a class={props.active === "cron" ? "active item" : "item"} href="/-/admin/monitor/cron">
-              {adminMonitorLocale.cron}
-            </a>
-            <a class={props.active === "queue" ? "active item" : "item"} href="/-/admin/monitor/queue">
-              {adminMonitorLocale.queues}
-            </a>
-            <a class={props.active === "trace" ? "active item" : "item"} href="/-/admin/monitor/stacktrace">
-              {adminMonitorLocale.trace}
-            </a>
-          </div>
-        </details>
-      </div>
-    </div>
-  );
-}
 
 /** The layout shell (layout_head.tmpl verbatim around the content block):
  *  the `admin monitor` pageClass, the fluid padded flex container, the
- *  monitor navbar, then `.flex-container-main` wrapping `.admin-setting-
+ *  family navbar, then `.flex-container-main` wrapping `.admin-setting-
  *  content` (every monitor template opens it, e.g. queue.tmpl:2). */
 function AdminMonitorShell(props: {
   ctx: UiContext;
@@ -284,7 +256,7 @@ function AdminMonitorShell(props: {
   return (
     <BaseLayout ctx={props.ctx} title={props.title} pageClass="admin monitor">
       <div class="ui container fluid padded flex-container">
-        <AdminMonitorNav active={props.active} />
+        <AdminFamilyNav active={props.active} />
         <div class="flex-container-main">
           <div class="admin-setting-content">{props.children}</div>
         </div>

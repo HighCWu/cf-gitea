@@ -36,6 +36,7 @@ import {
   parseAdminDashboardForm,
   renderAdminDashboardPage,
 } from "./admin-dashboard";
+import { adminFamilyLocale } from "./admin-users";
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -192,16 +193,26 @@ describe("the dashboard DOM (templates/admin/dashboard.tmpl at the pin)", () => 
     expect(html).not.toContain('value="sync_repo_tags"');
   });
 
-  it("renders the reduced admin navbar — Maintenance open with Dashboard active, the live monitor items, nothing unlanded", async () => {
+  it("renders the shared admin navbar — Maintenance open with Dashboard active, every landed family item, nothing unlanded (the F7 fold)", async () => {
     const html = await pageHtml();
     expect(html).toContain('class="active item" href="/-/admin"'); // the active page (navbar.tmpl:8's arm)
-    expect(html).toContain('href="/-/admin/monitor/stats"'); // the sibling family's live items
+    expect(html).toContain('href="/-/admin/monitor/stats"'); // the live monitor items
     expect(html).toContain('href="/-/admin/monitor/cron"');
     expect(html).toContain('href="/-/admin/monitor/queue"');
     expect(html).toContain('href="/-/admin/monitor/stacktrace"');
+    // The fold's new groups: Identity & Access (orgs/users) + Assets (repos).
+    // The `&` renders escaped (hono/jsx text escaping).
+    expect(html).toContain("Identity &amp; Access");
+    expect(html).toContain(adminFamilyLocale.assets);
+    expect(html).toContain('href="/-/admin/users"');
+    expect(html).toContain('href="/-/admin/orgs"');
+    expect(html).toContain('href="/-/admin/repos"');
+    // The OPEN group is the active page's (Maintenance); the sibling groups
+    // stay closed (navbar.tmpl's per-group PageIs* conditions).
+    expect(html).toContain(`<details class="item" open=""><summary>${adminFamilyLocale.maintenance}</summary>`);
+    expect(html).not.toContain(`<details class="item" open=""><summary>${adminFamilyLocale.monitoring}</summary>`);
+    expect(html).not.toContain(`<details class="item" open=""><summary>${adminFamilyLocale.identityAccess}</summary>`);
     expect(html).not.toContain("self_check"); // unlanded — the dead-link rule
-    expect(html).not.toContain('href="/-/admin/users"');
-    expect(html).not.toContain('href="/-/admin/repos"');
     expect(html).not.toContain('href="/-/admin/config"');
     expect(html).not.toContain('href="/-/admin/notices"');
   });

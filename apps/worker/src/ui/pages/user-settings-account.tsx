@@ -58,21 +58,16 @@
  *              the password input re-renders EMPTY — the re-auth credential
  *              is never carried back into the DOM (the secrets value rule).
  *
- * ## Nav diff (components/settings-nav.tsx — orchestrator-owned; this module
- *    ships the mount-scaffolding `AccountSettingsNav` copy until the swap)
+ * ## Nav (components/settings-nav.tsx — the swap LANDED in the mount window)
  *
- *   1. `UserSettingsNavTab` gains `"account"` (navbar.tmpl:7-11).
- *   2. `settingsNavLocale` gains `account: "Account"` (settings.account).
- *   3. The shared `UserSettingsNavbar` gains the item BETWEEN Profile and
- *      Appearance — navbar.tmpl's exact position:
- *        `<a class={item("account")} href="/user/settings/account">
- *           {settingsNavLocale.account}</a>`
- *      (the upstream `manage_credentials`/`deletion` disabled-features gate
- *      is unmodelled — upstream's default is enabled, the security module's
- *      wrapper-gate posture).
- *   4. The swap then DELETES this module's local `AccountSettingsNav` copy
- *      and the page renders `<UserSettingsNavbar active="account" />` (the
- *      wave-114 consolidation convention, the organizations precedent).
+ * The page renders the SHARED `UserSettingsNavbar active="account"` — the
+ * wave-114 consolidation convention (the organizations precedent): the
+ * mount window added `"account"` to `UserSettingsNavTab`, the
+ * `settingsNavLocale` key + item (between Profile and Appearance,
+ * navbar.tmpl:7-11's exact position — the upstream
+ * `manage_credentials`/`deletion` disabled-features gate is unmodelled:
+ * upstream's default is enabled, the security module's wrapper-gate
+ * posture), and deleted this module's local `AccountSettingsNav` copy.
  *
  * ## The password arm — UNMOUNTED (the standing no-password-model rule)
  *
@@ -195,7 +190,7 @@ import {
   repoWatchers,
   users,
 } from "../../db/schema";
-import { settingsNavLocale } from "../components/settings-nav";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 
@@ -557,61 +552,6 @@ export async function applyUserSettingsAccountDeleteForm(
 // The render (templates/user/settings/account.tmpl at the pin)
 // ---------------------------------------------------------------------------
 
-/** The settings navbar — the mount-scaffolding copy (the two-stage
- *  convention): the shared component's item list with the Account item
- *  inserted at navbar.tmpl:7-11's position (between Profile and Appearance),
- *  marked active. The orchestrator's nav diff (the module header) adds
- *  `"account"` to `UserSettingsNavTab` + the locale key + the shared item;
- *  the swap deletes this copy for `<UserSettingsNavbar active="account" />`
- *  (the wave-114 consolidation, the organizations precedent). Texts ride the
- *  SHARED module's locale so the vocabulary stays single-sourced. */
-function AccountSettingsNav() {
-  const item = (active: boolean) => (active ? "active item" : "item");
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{settingsNavLocale.user_settings}</div>
-        <a class={item(false)} href="/user/settings">
-          {settingsNavLocale.profile}
-        </a>
-        {/* navbar.tmpl:7-11 — the Account item this module lands. */}
-        <a class={item(true)} href="/user/settings/account">
-          {userSettingsAccountLocale.account}
-        </a>
-        <a class={item(false)} href="/user/settings/appearance">
-          {settingsNavLocale.appearance}
-        </a>
-        <a class={item(false)} href="/user/settings/security">
-          {settingsNavLocale.security}
-        </a>
-        <a class={item(false)} href="/user/settings/applications">
-          {settingsNavLocale.applications}
-        </a>
-        <a class={item(false)} href="/user/settings/keys">
-          {settingsNavLocale.ssh_gpg_keys}
-        </a>
-        <details class="item">
-          <summary>{settingsNavLocale.actions}</summary>
-          <div class="menu">
-            <a class={item(false)} href="/user/settings/actions/secrets">
-              {settingsNavLocale.secrets}
-            </a>
-            <a class={item(false)} href="/user/settings/actions/variables">
-              {settingsNavLocale.variables}
-            </a>
-          </div>
-        </details>
-        <a class={item(false)} href="/user/settings/hooks">
-          {settingsNavLocale.hooks}
-        </a>
-        <a class={item(false)} href="/user/settings/organization">
-          {settingsNavLocale.organization}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /** The full-document render (the render.tsx pattern). `error` carries the
  *  failed POST's message (null on the plain GET); `email` carries the failed
  *  add submission back into the input (the carried-form family — the email
@@ -623,13 +563,15 @@ export function renderUserSettingsAccountPage(ctx: UiContext, data: UserSettings
 /** The account page (§2.4.1 discriminator: `user settings account` —
  *  layout_head's pageClass, account.tmpl:1; upstream's Title on the GET is
  *  settings.account, account.go:38 — the POST re-renders upstream
- *  settings_title, a cosmetic divergence the fixed title folds away). */
+ *  settings_title, a cosmetic divergence the fixed title folds away). The
+ *  navbar is the SHARED UserSettingsNavbar (the wave-114 consolidation —
+ *  the module-local scaffolding copy deleted in the mount window). */
 export function UserSettingsAccountPage(props: { ctx: UiContext; data: UserSettingsAccountPageData; error: string | null; email: string }) {
   const { ctx, data } = props;
   return (
     <BaseLayout ctx={ctx} title={userSettingsAccountLocale.account} pageClass="user settings account">
       <div class="ui container flex-container">
-        <AccountSettingsNav />
+        <UserSettingsNavbar active="account" />
         <div class="flex-container-main">
           <div class="user-setting-content">
             {/* account.tmpl:3-35 — the password section's disabled arm (the

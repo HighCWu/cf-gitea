@@ -303,6 +303,54 @@ describe("the ?tab=activity arm's rendering (the module mounted — the tab disp
   });
 });
 
+// --- the profile sub-tab arms (the wave-126 mount — the stars/watching/
+// follow-tabs modules dispatch from the user half) ---------------------------
+
+describe("the profile sub-tab arms (the wave-126 mount — stars/watching/follow tabs)", () => {
+  it("renders the stars page (profile.go:191-219's arm) with Stars ACTIVE in its own strip", async () => {
+    const res = await get("/upgal?tab=stars");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content user profile"');
+    expect(html).toContain('<div class="stars">'); // profile.tmpl's stars branch wrapper
+    expect(html).toContain('class="active item" href="/upgal?tab=stars"'); // the page's own strip
+    expect(html).not.toContain('class="active item" href="/upgal?tab=repositories"');
+  });
+
+  it("renders the watching page (the DisableStars {{else}} arm — direct-URL-only by default) with watching ACTIVE", async () => {
+    const res = await get("/upgal?tab=watching");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content user profile"');
+    expect(html).not.toContain('<div class="stars">'); // profile.tmpl's {{else}} branch — no wrapper
+    expect(html).toContain('class="active item" href="/upgal?tab=watching"');
+  });
+
+  it("renders the followers/following card listings with NEITHER strip tab active", async () => {
+    for (const tab of ["followers", "following"]) {
+      const res = await get(`/upgal?tab=${tab}`);
+      expect(res.status, tab).toBe(200);
+      const html = await res.text();
+      expect(html, tab).toContain('class="page-content user profile"');
+      // NEITHER sub-tab item is active (upstream renders the overview header
+      // with no active item for these two — the collapsed-if rule).
+      expect(html, tab).not.toContain('class="active item" href="/upgal?tab=stars"');
+      expect(html, tab).not.toContain('class="active item" href="/upgal?tab=watching"');
+      expect(html, tab).not.toContain('class="active item" href="/upgal?tab=repositories"');
+    }
+  });
+
+  it("an org name with any sub-tab query still serves the ORG home (the org half ignores the query)", async () => {
+    for (const tab of ["stars", "watching", "followers", "following"]) {
+      const res = await get(`/uporg?tab=${tab}`);
+      expect(res.status, tab).toBe(200);
+      const html = await res.text();
+      expect(html, tab).toContain('class="page-content organization profile"');
+      expect(html, tab).not.toContain("page-content user profile");
+    }
+  });
+});
+
 // --- renamed users through the shared seam (beyond wave 7's public pair) ------
 
 describe("renamed users through the shared seam (the gated-target arms)", () => {

@@ -45,8 +45,8 @@
  *     resolveFragmentIssue miss — each rendering the real shell), the
  *     shared-index NO-cross-check pins (a plain issue answers under
  *     /pulls/ and a PR under /issues/, upstream's own FIXME), the
- *     unclaimed content-history list/detail tails (plain Hono 404 — no
- *     snapshot store, the documented unrendered arm) and the
+ *     content-history list/detail tails MOUNTED (the wave-126 window — the
+ *     empty-200 null quirk + the JSON 404 body) and the
  *     attachments-alias 302 (exact Location; UNCONDITIONAL — junk uuid
  *     and unknown index still hand off, the alias never resolves the
  *     issue);
@@ -481,13 +481,20 @@ describe("the aux feeds + fragments through the mounted route (D1 fixture)", () 
       expect(await missing.text()).toContain('<div class="status-page-error">');
     });
 
-    it("the content-history list/detail tails stay UNCLAIMED — plain Hono 404, the documented unrendered arm", async () => {
+    it("the content-history list/detail tails serve through the routes (the snapshot store landed, cced424 — the wave-126 mount)", async () => {
       await ensureAuxFixture();
-      for (const tail of ["list", "detail"]) {
-        const res = await fetchUi(`/aux-alice/gadget/issues/1/content-history/${tail}`);
-        expect(res.status, tail).toBe(404);
-        expect(await res.text(), tail).toContain("404 Not Found"); // plain — never the rendered shell
-      }
+      // The list with NO comment_id: FormInt64(0) → no rows → the empty-200
+      // `{"results":null}` quirk (upstream's nil marshal).
+      const list = await fetchUi("/aux-alice/gadget/issues/1/content-history/list");
+      expect(list.status).toBe(200);
+      expect(list.headers.get("content-type")).toContain("application/json");
+      expect(await list.json()).toEqual({ results: null });
+      // The detail with a FOREIGN history id → the JSON 404 body, never the
+      // HTML shell (the module's loud rule).
+      const detail = await fetchUi("/aux-alice/gadget/issues/1/content-history/detail?comment_id=0&history_id=424242");
+      expect(detail.status).toBe(404);
+      expect(detail.headers.get("content-type")).toContain("application/json");
+      expect(await detail.json()).toEqual({ message: "Can not find the content history" });
     });
 
     it("the read grant fronts EVERY fragment family: anonymous on a private repo 404-shells before any family logic", async () => {
@@ -537,9 +544,18 @@ describe("the aux feeds + fragments through the mounted route (D1 fixture)", () 
         segment: "abc",
       });
       expect(parseUiRoute("/o/r/issues/7/content-history/overview")).toMatchObject({ family: "issue-content-overview" });
-      // No snapshot store: the list/detail tails parse to NOTHING (unclaimed).
-      expect(parseUiRoute("/o/r/issues/7/content-history/list")).toBeNull();
-      expect(parseUiRoute("/o/r/issues/7/content-history/detail")).toBeNull();
+      // The list/detail dropdown arms landed (the mount window — the
+      // snapshot store shipped, cced424): both claim their families.
+      expect(parseUiRoute("/o/r/issues/7/content-history/list")).toMatchObject({
+        family: "issue-content-history-list",
+        urlKind: "issues",
+        index: 7,
+      });
+      expect(parseUiRoute("/o/r/issues/7/content-history/detail")).toMatchObject({
+        family: "issue-content-history-detail",
+        urlKind: "issues",
+        index: 7,
+      });
     });
 
     it("parseUiRoute claims activity_author_data's optional period tail and nothing deeper", async () => {
