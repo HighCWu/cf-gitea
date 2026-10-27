@@ -2969,3 +2969,155 @@ scratch, and all logs shredded; `gitea/` pristine (0 dirty files, pin
 
 *(REDEPLOY19, evidence appended by the redeploy-verification agent; all
 numbers verbatim from this run's commands.)*
+
+## REDEPLOY20 — the index window + the deferred-matrix polish: deploy-prep evidence @ `03f9e82` (2026-10-27)
+
+This is the PRE-DEPLOY evidence block: the cargo is fully committed and
+gate-verified at HEAD `03f9e82`; the live deploy numbers are marked
+**TODO (post-deploy)** below and will be pasted by the orchestrator
+after the run. The window since the RD19 deploy base `e39adad` is 126
+commits (24 to the tick-10 base `b396a41`, then the 102-commit tick-11
+window b396a41..`03f9e82`).
+
+**THE CARGO — the two-stage program completed its second stage.** The
+module waves (seventeen two-stage page modules across the pre-window
+commits — the user-settings tab family, the org blocked-users/actions
+tabs, the admin dashboard + monitor group, the four repo-settings
+tabs, the wiki family flagship, the sitemap family, the search aux
+feeds, the issues aux feeds, the compare byte feeds + files-for-range,
+the merge-box fragment, the issue info/attachments/content-history
+fragments, the global inbox pages, the .rss/.atom envelopes, the
+editor staging family `dc9ff97`, the cherrypick/patch pages, the
+branches writer arms, the upload tails) MOUNTED in **fourteen window
+commits, sub-waves 2a-2f, 92 routes**: window-2a the user-settings tab
+family (8 modules, 19 routes, `0c2b151`), window-2b the org
+blocked-users tab + actions secrets/variables (9, `4f2805f`),
+window-2c the admin group (7, `e31c0cf`), window-2d both passes (four
+repo-settings tabs 13, `b54f709`; the wiki-config arm 2, `46e7e68`),
+window-2e in eight slices (sitemap + search aux 6, `84996c6`; the
+global inbox 3, `a8818c6`; the .rss/.atom envelopes 1, `1a59af0`; the
+repo-scoped aux feeds + fragments 11, `22599e4`; the wiki family 4,
+`9516bf1`; editor tails + cherrypick/patch 8, `1d834d6`; the migration
+page 2, `62ef380`; the subscriptions/watching tails 2, `5ca1727`) plus
+the folds (branches writer arms + pulls/new + the upload endpoints 5,
+`635ce2e`); then window-2f — the 13-site shared-navbar swap
+(`94c6851`) and the SettingsNav fold (`d32db26`, the scaffold navs
+deleted). One deliberate non-mount: the profile `?tab=activity` page
+arm (`ec07fb6`) — its seam + rendering vocabulary landed into the
+.rss/.atom envelopes instead; the page render is the survey's last S
+bench row. Survey headline after the window: **88/7/20, zero rows in
+flight** (115 rows; the tick-11 survey edition).
+
+**THE POLISH — the deferred-matrix program walked every mounted page.**
+52 matrix/route-arm commits whose subjects tally **1,170 cases** (plus
+the appearance tab's route-arms matrix, unnumbered), catching **18
+real UI bugs**, all fixed in-window:
+
+- **The dead-route class (FOUR, one lesson):** the mounted wiki family
+  unreachable — parse + registration order unshadowed (`a58cad5`);
+  `/repo/search` + `/repo/migrate` shadowed by the dynamic owner/repo
+  block (`f60e5a8`); the pulls/new redirect dead behind its own parse
+  claim + a slice(5) mismatch (`3837c17`); issues/search + suggestions
+  under the `/:index` catch (`c4a1723`). Process note recorded in the
+  survey: module-green is not route-live — every mount proves its
+  routes through the live router, static literals register ahead of
+  any dynamic segment that could shadow them.
+- **The security pair:** the cherrypick/patch POST arms missing
+  sameOriginGuard — CSRF closed (`27aa538`); the session clear-cookie
+  directive double-wrapped on EVERY UI page (`dee8cf0`).
+- **The wire-format divergence:** PR comments anchored under /issues —
+  commentHtmlUrl's is_pull branch (`89589b3`).
+- **The rendering-ladder class:** merged PRs say merged —
+  GetLastEventLabel's nesting (`6ecb21c`); the comment block's
+  archived/locked ladder (`a12ecdf`); archived mirrors render the
+  warning ONLY (`cdde728`); archived branches hide the delete button
+  (`234ee49`); the conditional Public Access item on the branches +
+  collaboration tabs (`364bf92`).
+- **The gates/wiring class:** unknown-uid access-mode changes refuse
+  (`f8c84fc`); unknown commit-sha refs 404 on the commits page
+  (`188f33d`); the repo-scope workflow-delete GET 405 verb-twin
+  (`d23ad32`); tags path-keyed edit + delete flash (`01fae9e`); the
+  keys SSH delete-miss error line + carried form values (`18383fe`);
+  the sitemap idx guards + the repo-search API-Viewer bridge
+  (`c2925f2`).
+- **The stale-pin sweep (~18 sites):** the sweep doc
+  `docs/compat/stale-pin-sweep.md` (five pin lines across four files,
+  `04d80b3` — mechanical evaluation of 243 negative literals + 122
+  boolean pins against the live parser) plus thirteen more
+  pin/golden updates (`e2cade9`, `0c66990`, `5e26d76`, `ef23c5e`,
+  `f41237f`, `41bc9ab`, the four repo-settings goldens `2c7c05f`, the
+  wave-17 pin flip riding `635ce2e`).
+
+**Pre-deploy gates at HEAD `03f9e82`:**
+
+- `node scripts/check-openapi.mjs`: **PASS** — declared **490 ops /
+  298 paths** ⊆ contract; tier-1 **78/78 paths, 129/129 ops**
+  (re-run by this agent while writing this block).
+- `pnpm typecheck`: **0 errors** tree-wide (re-run by this agent).
+- `pnpm lint` (eslint): **0** (the window's closing gate).
+- **src/ui full suite: 997/997.** The broader run hit the documented
+  contention ceiling — 8 files 30s-timeout under concurrent sibling
+  load — and **ALL eight are solo-green**: engine-read 53/53,
+  migrate+tags 14/14, push-sync+pull-engine+imports 68/68. (The RD19
+  ws1009 pool-death class did not reappear as a failure source this
+  window — timeouts only, every one adjudicated solo.)
+
+**Remote migrations: ledger expected UNCHANGED — zero diff
+`e39adad..03f9e82` in `src/db/migrations/` (33 on disk, verified;
+the window added none).** Expected at deploy: `wrangler d1 migrations
+list --remote` → "No migrations to apply" (33/33).
+**TODO (post-deploy): paste the actual list output.**
+
+**DEPLOY PLAN (the RD18/RD19 standard) — live numbers TODO
+(post-deploy, orchestrator pastes):**
+
+- GO commit: **TODO** (expected `03f9e82` or its landing descendant;
+  gates re-run at GO in the detached worktree).
+- Detached `git worktree` at the GO commit, `pnpm install
+  --frozen-lockfile`, prebuilt `public/assets` copied in, `.dev.vars`
+  copied in, `git submodule update --init` (pin `fc4936884584`),
+  `pnpm gen:icons`. Worktree shredded after.
+- Deploy version id: **TODO**. Worker startup: **TODO ms**. URL:
+  **TODO** (`https://cf-gitea.hecongw.workers.dev`).
+- `wrangler deploy --dry-run` bundle: **TODO** (index.js bytes + the
+  raw-chunk table; the `?raw` extension set unchanged — `*.svg?raw` /
+  `*.json?raw` only — spot `material-icon-svgs.json` byte-exact).
+- **The NEW battery: `window2-mounts` (the toolkit's 8th, `684f834`,
+  22 checks)** — login round-trip via POST /login form (PAT as
+  password, the ui-login methodology) then the window's mounts
+  first-production-probed: **TODO (paste the 22-check result)**.
+- The full `all` toolkit run (8 batteries incl. window2-mounts):
+  **TODO (paste per-battery lines)**. Mint-per-run PAT in a 0600
+  file; extract, VERIFY the 45-char shape, delete, THEN shred (the
+  RD19 mint lesson — copy the regex from deploy-probes.mjs, never
+  from evidence prose).
+- `pnpm smoke` (--migrate-check): **TODO (paste)** — expected: the
+  19 expected tables +48 system/aux, "No migrations to apply".
+- Hand spots: **TODO** (suggested: the cherrypick/patch POST CSRF
+  guard — a cross-origin POST must now 403; the wiki family end-to-end
+  (the dead-route fix's first production traffic); /repo/search +
+  /repo/migrate reachability; the upload staging write path).
+- Cleanup audit: **TODO** (expected: every battery self-cleaned,
+  `personal_access_tokens = 1` standing bootstrap PAT).
+
+**OPEN ISSUES carried + status:**
+
+1. RD19 #1 (the migrate 201 born body rendering `mirror:false`) and
+   #2 (the lastcommit root-listing trailing-slash 404) — BOTH FIXED by
+   `8a1a03f` (post-RD19-deploy, in this cargo): the born-body
+   post-attach re-read + the route-matcher trailing-slash carve.
+   **They see first production traffic at REDEPLOY20** — the hand
+   spots should re-probe both shapes.
+2. RD19 #3 (the ws1009 pool-death class under load): no full-run
+   recurrence this window (timeouts only, all solo-green); the
+   runner-side vitest-pool frame-cap look remains open for the runner
+   owner.
+3. Carried unchanged: the repo payload numeric-`id` render
+   (TODO(SPEC-0005)); the SQLITE_LOCKED benign-retry posture (verdict
+   `280d4ad`); `/tmp/leak-repro/*` shredding (its owning wave).
+
+*(REDEPLOY20, deploy-prep evidence appended by the deploy-prep docs
+agent; gates re-run verbatim at `03f9e82` — openapi + typecheck by
+this agent, the suite numbers from the window's closing gate run;
+live deploy numbers are TODO slots for the orchestrator's post-deploy
+paste.)*

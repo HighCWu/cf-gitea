@@ -190,26 +190,84 @@ unmounted modules do not flip rows per the convention — for headline
 **65/4/46, zero rows in flight** (115 rows). The bench queue is
 re-ranked below with per-row template + handler premises verified at
 the pin.
+**Ticked 2026-10-27** an eleventh time, at HEAD `03f9e82`: the index
+window LANDED and the deferred-matrix polish program swept it. The
+whole committed-unmounted module wave MOUNTED — fourteen window
+commits, sub-waves 2a-2f, **92 routes**: window-2a the user-settings
+tab family (8 modules, 19 routes, `0c2b151`), window-2b the org
+blocked-users tab + actions secrets/variables (9 routes, `4f2805f`),
+window-2c the admin group — dashboard + 4 monitor pages + the cron run
+(7 routes, `e31c0cf`), window-2d both passes (four repo-settings tabs,
+13 routes, `b54f709`; the wiki-config arm, 2 routes, `46e7e68`), and
+window-2e in eight slices (sitemap + the two search aux feeds
+`84996c6`, 6 routes; the global inbox `a8818c6`, 3; the .rss/.atom
+envelopes `1a59af0`, 1; the repo-scoped aux feeds + fragments
+`22599e4`, 11; the wiki family `9516bf1`, 4; editor tails +
+cherrypick/patch `1d834d6`, 8, the delete-page swap; the migration
+page `62ef380`, 2; the subscriptions/watching tails `5ca1727`, 2) plus
+the folds (branches writer arms + the pulls/new redirect + the upload
+staging endpoints, `635ce2e`, 5); then window-2f — the 13-site
+shared-navbar swap (`94c6851`) and the SettingsNav fold (`d32db26`,
+five repo-settings items in, the scaffold navs deleted). ONE module
+deliberately did NOT mount: the profile `?tab=activity` page arm
+(`ec07fb6`) — its seam and rendering vocabulary landed into the
+.rss/.atom envelopes instead (`resolveActivityFeeds` at the user-feed
+route); the page render stays unmounted (see In-flight). The
+deferred-matrix polish program then walked every landed page: **52
+matrix/route-arm commits whose subjects tally 1,170 cases** (plus the
+appearance tab's route-arms matrix, unnumbered), catching **18 real
+UI bugs** — FOUR dead routes of ONE registration-order class (the
+mounted wiki family unreachable, `a58cad5`; `/repo/search` +
+`/repo/migrate` shadowed by the dynamic block, `f60e5a8`; the
+pulls/new redirect dead behind its own parse claim, `3837c17`;
+issues/search + suggestions under the `/:index` catch, `c4a1723`), a
+CSRF (the cherrypick/patch POST arms missing sameOriginGuard,
+`27aa538`), a global cookie-directive violation (the session
+clear-cookie double-wrapped on every UI page, `dee8cf0`), a
+wire-format divergence (PR comments anchoring under /issues —
+commentHtmlUrl's is_pull branch, `89589b3`), the merged-verb bug
+(`6ecb21c`), the comment archived/locked ladder (`a12ecdf`), archived
+mirrors rendering the full page (`cdde728`), unknown-uid access-mode
+changes accepted (`f8c84fc`), the workflow-delete GET verb-twin
+(`d23ad32`), and the long tail (unknown commit-sha refs `188f33d`,
+archived-branch delete buttons `234ee49`, tags wiring `01fae9e`, keys
+wiring `18383fe`, sitemap idx guards + the repo-search bridge
+`c2925f2`, the conditional Public Access item `364bf92`) — plus **~18
+stale pins/goldens swept** (the sweep doc
+`docs/compat/stale-pin-sweep.md`: five pin lines across four files,
+`04d80b3`; plus thirteen more pin/golden updates — `e2cade9`,
+`0c66990`, `5e26d76`, `ef23c5e`, `f41237f`, `41bc9ab`, the four
+repo-settings goldens `2c7c05f`, the wave-17 pin flip riding
+`635ce2e`). The mounted families flip LANDED — with three rows going
+PARTIAL instead, each for a stated remainder (the issue fragments:
+content-history list/detail unclaimed, no snapshot store; the admin
+group: ten-plus admin pages still absent; the user-settings tabs:
+account/repos/notifications arms still absent) — for headline
+**88/7/20, zero rows in flight** (115 rows). The tick-10 bench queue
+landed inside the window in its ENTIRETY (all eight bench rows, every
+one also on the bug list's dead-route/wiring classes where it bit) —
+the demand-driven dispatchable surface is down to ONE S row: the
+profile activity tab arm. The four-dead-route lesson is recorded as a
+process note below.
 
 - **Pin**: `fc4936884584a41931906553d96c2601d750e6ef` (v1.22.0-rc1-3919;
   verified `git -C gitea rev-parse HEAD`). Every `web.go:N` cite is
   `gitea/routers/web/web.go` at that commit unless another file is named.
 - **Our side**: the route table + parser families in
-  `apps/worker/src/ui/index.ts` at HEAD `b396a41` — the header inventory
+  `apps/worker/src/ui/index.ts` at HEAD `03f9e82` — the header inventory
   (the route-family comment block) and the `ParsedUiRoute` union
-  (line 1892) are the exhaustive family list (a family exists iff a parse
-  branch returns it); the pages under `apps/worker/src/ui/pages/` (87
-  files committed: 71 page modules + 16 test modules) and the session
-  router (`src/ui/session.ts`) carry the renders, with the `src/web/`
-  seam routers (avatar serving, attachments serving) mounted in
-  `src/index.ts`. The working tree at measurement time is CLEAN under
-  `apps/worker/src/ui/` (a sibling's transient hunk to
-  `pages/user-settings-keys.tsx` committed as the non-UI keys refactor
-  `b396a41` while this survey was written) — every count reads
-  committed HEAD (`git show` / `git ls-tree HEAD`), and the committed
-  tree at `b396a41` is what the numbers describe. The unmounted-module
-  wave added NO parse branches (186 before and after — the two-stage
-  convention holding under load).
+  (index.ts:2323 at this tick) are the exhaustive family list (a family
+  exists iff a parse branch returns it); the pages under
+  `apps/worker/src/ui/pages/` (160 files committed at this tick: 87 page
+  modules + 73 test modules, up from 87 files total at `b396a41`) and the
+  session router (`src/ui/session.ts`) carry the renders, with the
+  `src/web/` seam routers (avatar serving, attachments serving) mounted in
+  `src/index.ts`. The working tree at measurement time is CLEAN repo-wide
+  (`git status --short` empty) — every count reads committed HEAD
+  (`git show` / `git ls-tree HEAD`), and the committed tree at `03f9e82`
+  is what the numbers describe. The window grew the survey's
+  `grep -c "family:"` parse-branch count 186 → 263 and index.ts 7,752 →
+  10,054 lines.
 - **Reproducing the counts** (exactly these walks):
   1. Upstream: walk the page-bearing GETs out of `gitea/routers/web/web.go`
      (`m.Get`/`m.Combo(...).Get` registrations, grouped into the same 6
@@ -218,10 +276,10 @@ the pin.
      surfaces excluded per the preamble) — the row set is pin-stable
      apart from that split.
   2. Ours (committed HEAD only): `git show HEAD:apps/worker/src/ui/index.ts | grep
-     -c "family:"` (the parse branches — 186 at this tick) +
+     -c "family:"` (the parse branches — 263 at this tick) +
      `git ls-tree HEAD --name-only apps/worker/src/ui/pages/ | wc -l`
-     (the renders — 87 files) at `b396a41`; `git status --short --
-     apps/worker/src/ui/` at the measurement is CLEAN (see Our side) — anything
+     (the renders — 160 files) at `03f9e82`; `git status --short` at the
+     measurement is EMPTY repo-wide (see Our side) — anything
      spec-bearing or unfamiliar means HEAD is not the right base.
   3. API dependencies: `node scripts/check-openapi.mjs` (ends `PASS`) —
      `grep` its `[ok]` lines for the op named per row.
@@ -265,13 +323,13 @@ model or a new engine-boundary RPC / whole subsystem).
 
 | Family | rows | LANDED | PARTIAL | ABSENT | IN-FLIGHT |
 |---|---|---|---|---|---|
-| A site-level + auth | 24 | 11 | 0 | 13 | 0 |
-| B owner pages | 18 | 10 | 2 | 6 | 0 |
-| C repo code browsing | 25 | 18 | 2 | 5 | 0 |
-| D issues + pulls | 22 | 13 | 0 | 9 | 0 |
-| E repo settings | 12 | 5 | 0 | 7 | 0 |
-| F repo sub-systems | 14 | 8 | 0 | 6 | 0 |
-| **total** | **115** | **65** | **4** | **46** | **0** |
+| A site-level + auth | 24 | 19 | 2 | 3 | 0 |
+| B owner pages | 18 | 11 | 2 | 5 | 0 |
+| C repo code browsing | 25 | 20 | 2 | 3 | 0 |
+| D issues + pulls | 22 | 19 | 1 | 2 | 0 |
+| E repo settings | 12 | 9 | 0 | 3 | 0 |
+| F repo sub-systems | 14 | 10 | 0 | 4 | 0 |
+| **total** | **115** | **88** | **7** | **20** | **0** |
 
 (The regen's headline was 36/4/69 + 4 in-flight; the `5d9122c` tick took
 it to 48/4/61 + 0. The `7016ce9` tick: wave-ui-parity-6 lands 2 ABSENT rows
@@ -305,75 +363,84 @@ row LANDED as `8380cf0` (B −2 IN-FLIGHT, +2 LANDED) and the settings
 row's per-tab remainders split off as a fresh ABSENT row (B +1 row,
 +1 ABSENT) — for 65/3/47 + 0 (that tick also corrected the previous
 tick's "111 counted" arithmetic slip — its sums give 112).
-This tick: the org hooks tab lands MOUNTED (`54264ae`), flipping the B
-remainder row ABSENT → PARTIAL (B −1 ABSENT, +1 PARTIAL); the rest of
-the window is the UNMOUNTED module wave, which flips NO rows per the
-convention — for **65/4/46 + 0** at 115 rows.)
+This tick: the index window mounted the ENTIRE unmounted-module wave —
+92 routes across fourteen window commits (2a-2f, the slice ledger in
+the header paragraph) — plus window-2f's nav swap + SettingsNav fold,
+and the mounted families flipped: A +8 LANDED (topics/search, sitemap,
+the three global inboxes, subscriptions, migrate, repo/search) + 2
+PARTIAL (the settings-tabs row, the admin group), B +1 (the
+.rss/.atom envelopes), C +2 (_diffpatch/_cherrypick, _upload — the
+staging write landed with the page), D +6 LANDED (merge_box, the
+files range, the compare byte feeds, pulls/new, issues/search,
+suggestions) + 1 PARTIAL (the fragments row: content-history
+list/detail unclaimed), E +4 (protected tags, git hooks, deploy keys,
+public access), F +2 (the wiki family, activity_author_data) — for
+**88/7/20 + 0** at 115 rows.)
 
 ## In-flight (excluded from the totals — do not re-dispatch)
 
 **Zero rows and zero sibling-held untracked files are in flight.** The
-one row-state change this window is
-the B remainder row flipping PARTIAL on its hooks tab's MOUNTED
-landing (`54264ae` — counted, not in flight). The module wave's last
-two siblings — `org-settings-actions` (`fbbc05b`) and
-`user-settings-appearance` (`846a918`) — COMMITTED mid-tick while this
-survey was being written (the tick-9 precedent twice over), so the
-wave is fully in committed HEAD and nothing is excluded.
+post-window truth: the two-stage module wave is fully CONSUMED — the
+fourteen window commits (2a-2f, 92 routes) mounted every
+committed-unmounted module, and the polish matrices behind them are
+committed. The ONE deliberate survivor:
 
-What IS in flight is **machinery, not rows**: the large
-two-stage module wave — fifteen complete page modules across thirteen
-commits, COMMITTED unmounted,
-mounts riding an `index.ts` window wave (do not re-dispatch the
-module work):
+- **The profile `?tab=activity` page arm** — `pages/activity-feeds.tsx`
+  (`ec07fb6`, glyphs exacted `f696a21`) is complete and committed, but
+  the window did NOT mount the page arm: its seam
+  (`resolveActivityFeeds`) and rendering vocabulary landed into the
+  .rss/.atom envelopes instead (`1a59af0` imports the seam; the page
+  render `renderActivityFeedsPage` has no caller outside its module,
+  verified at HEAD). The landed `/{username}` row keeps LANDED with a
+  tab-arm note; the arm itself is the survey's last S-sized bench row
+  (wire the owner-home handler's tab dispatch onto the committed
+  renderer).
 
-- `repo-migrate` (`f26d65b`) — the `/repo/migrate` form; the row drops
-  to an S mount; the API arm gained the migrate-201 born-body
-  post-attach fix (`8a1a03f`).
-- `activity-feeds` (`ec07fb6`, glyphs exacted `f696a21`) — the landed
-  `/{username}` row's `?tab=activity` arm over the 14-type feed matrix.
-- `notification-subscriptions` (`486b9fc`) — the subscriptions tails
-  `/notifications/subscriptions`, `/watching`, `/purge-page`
-  (web.go:1786-1787,1790).
-- `repo-settings-wiki` (`5c2812f`) — the settings-side wiki-config arm
-  (enable/external/delete over `options.tmpl`'s three pieces; the
-  dedicated sub-page + nav item is the documented mirror-panel
-  divergence posture).
-- `repo-editor-tails` (`f4492b2`) — the editor delete-confirm page arm
-  and the `_upload` DOM (write documented-unrendered — the R2 uuid
-  staging family does not exist yet).
-- The user/org settings tab modules: `user-settings-security` +
-  `user-settings-secrets` (`e19c95a`), `-webhooks` (`aa9bd40`, premise
-  corrected to `hooks.tmpl`), `-keys` + `-applications` (`46230c5`),
-  `-organizations` (`11738a8`), `-variables` (`97dbbde`),
-  `-appearance` (`846a918`), `org-settings-blocked` (`25affaa`) and
-  `org-settings-actions` (secrets + variables, `fbbc05b`) — the A tabs
-  row and the B remainder row carry the notes.
-- `org-settings-hooks` (`54264ae`) — the EXCEPTION that mounted in its
-  own commit: the B remainder row's hooks tab is LIVE (the
-  `org-settings-hooks` parse family is in committed `index.ts`).
+The previous in-flight chain, for the record: the module wave
+(fifteen page modules across thirteen commits, tracked through ticks
+9-10) resolved INTO the window (`0c2b151`, `4f2805f`, `e31c0cf`,
+`b54f709`, `46e7e68`, `84996c6`, `a8818c6`, `1a59af0`, `22599e4`,
+`9516bf1`, `1d834d6`, `62ef380`, `5ca1727`, `635ce2e`); before it the
+org settings + teams/edit unit resolved as `8380cf0`, the two fragment
+rows as `67adfb7`, the repo-scoped projects row as `ae32b1a`, and the
+`tree-list`/`tree-view` fragments row as `831709f`. Every UI wave of
+the demand-driven phase (`bb67087`, `0b61554`, `ca4eb58`, `79ef809`,
+`1b41b60`, `48101dc`, `45bea22`, `1a7af64`, `9b49cd2`, `cdf683a`,
+`fdaeaca`, `831709f`, `ae32b1a`, `67adfb7`, `8380cf0`, `f26d65b`,
+`ec07fb6`, `486b9fc`, `5c2812f`, `f4492b2`, `e19c95a`, `aa9bd40`,
+`46230c5`, `11738a8`, `97dbbde`, `25affaa`, `54264ae`, `fbbc05b`,
+`846a918`, and the fourteen window commits) committed clean.
 
-The shared `index.ts` serializes every mount; the window waves are the
-orchestrator's. Until a mount lands, the affected rows keep their
-statuses per the convention: `/repo/migrate` and the subscriptions
-tails stay ABSENT-with-machinery-note, the tabs rows stay ABSENT (A)
-/ PARTIAL (B) with machinery notes, the landed `/{username}` row keeps
-LANDED with a tab-arm note.
+## Process note — the dead-route class (four occurrences, one lesson)
 
-The previous in-flight chain, for the record: the org settings +
-teams/edit unit resolved as `8380cf0`; the two fragment rows
-(`blob_excerpt`, `lastcommit`, both C family) resolved as `67adfb7`;
-before them the repo-scoped projects row resolved as `ae32b1a`
-(counted LANDED, F family), and before it the
-`tree-list`/`tree-view` fragments row resolved as `831709f` (counted
-LANDED, C family). The regen's in-flight rows — the social trio
-(`.../forks`, `.../stars`, `.../watchers`) and the collaboration
-panel — landed in `ca81d5a`, and every UI wave since (`bb67087`,
-`0b61554`, `ca4eb58`, `79ef809`, `1b41b60`, `48101dc`, `45bea22`,
-`1a7af64`, `9b49cd2`, `cdf683a`, `fdaeaca`, `831709f`, `ae32b1a`,
-`67adfb7`, `8380cf0`, `f26d65b`, `ec07fb6`, `486b9fc`, `5c2812f`,
-`f4492b2`, `e19c95a`, `aa9bd40`, `46230c5`, `11738a8`, `97dbbde`,
-`25affaa`, `54264ae`, `fbbc05b`, `846a918`) committed clean.
+The polish program's most valuable catch was not any single bug but a
+CLASS: **a mounted route can be dead on arrival when its registration
+or parse loses the ordering fight against a dynamic sibling**, and
+nothing about the module code or the mount diff reveals it — the page
+renders green in module-level tests that never traverse the live
+router. Four instances, all caught by route-level matrix arms hitting
+the real `uiRouter`:
+
+1. `a58cad5` — the whole wiki family (`9516bf1`) was unreachable: the
+   parse branch lost to an earlier claim and the registrations sat
+   after a catch-all. The flagship module of the wave, dead in
+   production shape until the matrix's first route-level arm 404'd.
+2. `f60e5a8` — `/repo/search` + `/repo/migrate` GETs registered after
+   the dynamic owner/repo block, which shadowed both (`/repo` parses
+   as an owner).
+3. `3837c17` — the pulls/new redirect: the registration order claim
+   plus a `slice(5)` parse mismatch, each invisible at module scope.
+4. `c4a1723` — issues/search + suggestions feeding under the
+   `/:index` catch instead of ahead of it.
+
+The rule going forward: **every mount commit must prove its routes
+through the live router with a request-level arm** (the matrices'
+route-level convention — dispatcher-suite plus at least one real
+request per registered shape), and **static literals register ahead of
+every dynamic segment that could shadow them** (the window commits'
+repeated "registered BEFORE the owner/repo parse" notes are this rule
+applied). Module-green is not route-live; only the second is done.
+
 
 ## Landed since last regen
 
@@ -387,9 +454,12 @@ deltas below sum 36+4-in-flight → 48 LANDED → 56 LANDED → 59 LANDED →
 in-flight (the fragment pair landed, the org-settings pair went
 in-flight) → 65 LANDED + 0 (the final numbered row
 landed; its tab remainders split off as a new row) → **65 LANDED + 0**
-at 115 rows (this window's mounted landing flips the B remainder row
-PARTIAL; everything else is unmounted module machinery, which flips no
-rows):
+at 115 rows (the org hooks tab flipped the B remainder row PARTIAL;
+everything else was unmounted module machinery, which flips no rows)
+→ **88 LANDED + 0** at 115 rows (the index window mounted the whole
+module wave — 92 routes across fourteen commits — flipping A +8
+LANDED +2 PARTIAL, B +1, C +2, D +6 LANDED +1 PARTIAL, E +4, F +2;
+the slice ledger below):
 
 | Slice | Rows landed | Commit |
 |---|---|---|
@@ -431,6 +501,21 @@ rows):
 | org settings blocked-users module (UNMOUNTED — committed mid-tick) | the B remainder row's blocked_users tab | `25affaa` |
 | org settings actions module (UNMOUNTED — committed mid-tick; secrets + variables) | the B remainder row's actions-tab surfaces (org-scope secrets + variables) | `fbbc05b` |
 | user settings appearance module (UNMOUNTED — committed mid-tick) | the A tabs row's appearance tab | `846a918` |
+| window-2a — the user-settings tab family MOUNTS | the appearance/security/secrets/actions-secrets+variables/hooks/keys/applications/organization tab tails (19 routes, 8 modules; the bare `/user/settings` claim extends down the tabs; shared `userSettingsTabPrologue`) — flips the A tabs row PARTIAL | `0c2b151` |
+| window-2b — the org blocked-users tab + actions secrets/variables MOUNT | the B remainder row's blocked_users tab + the org actions-tab secrets/variables surfaces (9 routes) | `4f2805f` |
+| window-2c — the admin group MOUNTS | `GET|POST /-/admin` (dashboard) + the stats/cron/queue/stacktrace monitor pages + the cron run (7 routes; shared adminPagePrologue, non-admin 404 shell) — flips the A admin row PARTIAL | `e31c0cf` |
+| window-2d pass 1 — four repo-settings tabs MOUNT | githooks (list + per-hook edit GET/POST), protected tags (list/create/edit/delete), deploy keys (add/delete), public access (GET+POST over the codeUnitAnonymousRead seam) — 13 routes; flips four E rows LANDED | `b54f709` |
+| window-2d pass 2 — the wiki-config settings arm MOUNTS | `GET|POST .../settings/wiki` (enable radios live, external-wiki/branch/delete honest-absence lines) — 2 routes; the E basics row's settings-side arm live | `46e7e68` |
+| window-2e (A) — sitemap + the search aux feeds MOUNT | `/sitemap.xml` + the explore repos/users sub-sitemaps (exact literals before the owner/repo parse) + `/repo/search` + `/explore/topics/search` (6 routes) — flips three A rows; idx guards + the API-Viewer bridge fixed forward `c2925f2` | `84996c6` |
+| window-2e (C1) — the global inbox MOUNTS | `/issues` + `/pulls` (shared overview loader) + `/milestones` (3 routes, top-level literals before the owner-home arm) — flips three A rows | `a8818c6` |
+| window-2e (B1) — the .rss/.atom envelopes MOUNT | `/{owner}.rss|.atom` (one regex-constrained registration over the activity-feeds seam; gorilla-parity content types) — flips the B row | `1a59af0` |
+| window-2e (B2) — the repo-scoped aux feeds + fragments MOUNT | issues/search + suggestions, the info/attachments fragments under BOTH families + the attachments uuid alias + content-history/overview, the merge_box fragment, the committed-range files page, the single-commit page at upstream's `/pulls/{index}/commits/{sha}`, activity_author_data + its period tail, the compare .diff/.patch byte feeds (11 routes) — flips five D rows LANDED + the fragments row PARTIAL + the F activity_author_data row | `22599e4` |
+| window-2e (C2a) — the wiki family MOUNTS | the `/{owner}/{repo}/wiki[/...]` page family (4 routes, action-dispatch) — flips the F wiki row; UNREACHABLE on arrival, unshadowed `a58cad5`; the pathJoinRelX empty-join service arm `8f766ac` | `9516bf1` |
+| window-2e (C2b) — editor tails + cherrypick/patch MOUNT | the delete-confirm page swap (dedicated page render on the delete family), `GET|POST /upload/*` over the dc9ff97 staging family (the write LIVE), `GET|POST /patch/*` + `/cherrypick/*` (8 routes) — flips two C rows; the cherrypick/patch POST arms gained sameOriginGuard `27aa538` | `1d834d6` |
+| window-2e (C3a) — the migration page MOUNTS | `GET|POST /repo/migrate` (2 routes; created → 303 the born repo) — flips the A row; the dead shadowing fixed `f60e5a8` | `62ef380` |
+| window-2e (C3b) — the subscriptions/watching tails MOUNT | `/notifications/subscriptions` + `/watching` (2 routes) — flips the A row (the POST purge-page arm documented-unrendered) | `5ca1727` |
+| window-2e folds — the branch writer arms + pulls/new + the upload endpoints | `POST /branches/_new/*` + `/branches/rename` (the API create + two-step CAS replay), the pulls/new redirect onto /compare, `POST /upload-file` + `/upload-remove` (5 routes; the wave-17 pin flipped) | `635ce2e` |
+| window-2f — the nav swap + the SettingsNav fold | the 13-site shared-navbar swap (every page renders the landed nav) + five repo-settings items folded into SettingsNav, the scaffold navs deleted (no row flips; the four repo-settings goldens re-baselined `2c7c05f`) | `94c6851` + `d32db26` |
 
 Non-UI landings in the same window that moved Data columns below: the
 projects family completed all three API scopes (repo `0d5b480`/`fc123b0`,
@@ -454,33 +539,33 @@ onto).
 | `GET /explore/users` | web.go:555 | LANDED | landed | core | — |
 | `GET /explore/organizations` | web.go:557 | ABSENT | partial (org rows + `adminGetAllOrgs` landed, admin-gated; no anonymous visible-org search arm — `OrgService` has no explore listing, verified) | core | M |
 | `GET /explore/code` | web.go:558-563 | ABSENT | none (no grep RPC) | authoring | L |
-| `GET /explore/topics/search` | web.go:564 | ABSENT (aux JSON) | landed (topics) | admin | S |
-| `GET /sitemap.xml` + explore sitemaps | web.go:530,554,556 | ABSENT | landed | admin | M |
-| `GET /issues` (global inbox) | web.go:568 | ABSENT | partial (cross-repo perm filter missing) | authoring | M |
-| `GET /pulls` (global) | web.go:572 | ABSENT | partial | authoring | M |
-| `GET /milestones` (global) | web.go:573 | ABSENT | partial | authoring | M |
+| `GET /explore/topics/search` | web.go:564 | LANDED (aux JSON feed, window-2e A `84996c6` — optSignIn, no gate; the topic-search aux over the landed topics) | landed (topics) | admin | — |
+| `GET /sitemap.xml` + explore sitemaps | web.go:530,554,556 | LANDED (window-2e A `84996c6` — exact literals BEFORE the owner/repo parse, else `/explore/repos/sitemap-1.xml` parses owner=explore; the idx guards + the repo-search API-Viewer bridge fixed forward `c2925f2`) | landed | admin | — |
+| `GET /issues` (global inbox) | web.go:568 | LANDED (window-2e C1 `a8818c6` — the shared overview loader with type-arm counts, reqSignIn 303, claimed as a top-level literal BEFORE the owner-home arm; the shadowing fixed `f60e5a8`) | landed | authoring | — |
+| `GET /pulls` (global) | web.go:572 | LANDED (same mount `a8818c6`) | landed | authoring | — |
+| `GET /milestones` (global) | web.go:573 | LANDED (same mount `a8818c6` — the dashboard milestones loader) | landed | authoring | — |
 | `GET /user/login` | web.go:577 | LANDED as `/login` (SPEC-0010 divergence) | landed | core | — |
 | `GET /user/sign_up` | web.go:595 | ABSENT | partial (no self-serve registration service verified) | core | M |
 | `GET /user/settings` (profile) | web.go:634 | LANDED (`pages/user-settings.tsx`) | landed | authoring | — |
-| `/user/settings/{account,appearance,security,applications,keys,organization,repos}` | web.go:641-735 | ABSENT — MACHINERY LANDED for most tabs: the two-stage tab modules are committed UNMOUNTED — security + secrets (`e19c95a`), webhooks (`aa9bd40`, premise corrected to hooks.tmpl), keys + applications (`46230c5`), organizations (`11738a8`), variables (`97dbbde`), appearance (`846a918`), and actions (secrets + variables, `fbbc05b`); NO module yet for the account/repos tabs or the settings-level notifications tab (the mount rides a window wave, see In-flight; keys via `account-keys.ts` and oauth2 apps via migration 0026 already landed on the data side) | partial | authoring | M each |
+| `/user/settings/{account,appearance,security,applications,keys,organization,repos}` | web.go:641-735 | PARTIAL — window-2a MOUNTED the tab family (`0c2b151`, 8 modules, 19 routes: appearance GET + theme/language POSTs, security, actions secrets+variables with full write arms, hooks list/detail/delete, keys, applications with the one-shot newToken banner, organization — SINGULAR wire path per web.go:740 — with leave; shared `userSettingsTabPrologue`, sameOriginGuard-first POSTs). STILL ABSENT: the account and repos tabs and the settings-level notifications tab (no modules) | partial | authoring | S each (the remaining tabs) |
 | `GET /notifications` + `/new` + `/status` + `/purge` | web.go:1785,1788-1789,1791 | LANDED (`pages/notifications.tsx`) | landed | authoring | — |
-| `/notifications/subscriptions`, `/watching`, `/purge-page` | web.go:1786-1787,1790 | ABSENT — MACHINERY LANDED: the two-stage page module is committed UNMOUNTED (`pages/notification-subscriptions.tsx`, `486b9fc` — both arms per notification_subscriptions.tmpl: the dashboard issuelist + the watching search/repo-list; 8 issue sorts verbatim, facet tri-states honored while JS dropdowns unrendered, the OPEN-case quirk ported; the mount rides a window wave, see In-flight) | partial | authoring | M |
-| `/-/admin/*` (dashboard, users, repos, orgs, config, monitor, notices, auths, emails, badges, packages, hooks, applications, actions) | web.go:780-906 | ABSENT (whole family) | partial (user/repo lists + most admin ops declared) | admin | L |
+| `/notifications/subscriptions`, `/watching`, `/purge-page` | web.go:1786-1787,1790 | LANDED (window-2e C3b `5ca1727` — the committed module's loaders + one-template render over both GET arms, 8 issue sorts verbatim, facet tri-states; the POST `/purge-page` write arm (web.go:1790) is the group's one unclaimed member, documented-unrendered like the notifications page's own mark_page_as_read) | partial (the purge-page write arm unclaimed) | authoring | — |
+| `/-/admin/*` (dashboard, users, repos, orgs, config, monitor, notices, auths, emails, badges, packages, hooks, applications, actions) | web.go:780-906 | PARTIAL — window-2c MOUNTED the admin group (`e31c0cf`, 7 routes: `GET|POST /-/admin` dashboard + the stats/cron/queue/stacktrace monitor pages + the cron run; shared adminPagePrologue — session → anonymous login-303 → non-admin 404 shell per upstream's hidden-surface posture, web.go:779). STILL ABSENT: the users/repos/orgs/config/notices/auths/emails/badges/packages/hooks/applications/actions pages (the actions+packages tabs stay FEATURE-ABSENT-gated) | partial (user/repo lists + most admin ops declared) | admin | M per page |
 | `GET /org/create` | web.go:972 | LANDED (`pages/org-create.tsx`, wave 19) | landed | authoring | — |
 | `GET /repo/create` | web.go:1098 | LANDED (`pages/repo-create.tsx`, wave 19) | landed | authoring | — |
-| `GET /repo/migrate` | web.go:1100 | ABSENT — MACHINERY LANDED: the two-stage page module is committed UNMOUNTED (`pages/repo-migrate.tsx`, `f26d65b` — the Git-variant field matrix, HANDOFF-exact; the mount rides a window wave, see In-flight; the API arm it rides gained the migrate-201 born-body post-attach fix, `8a1a03f`) | landed (`services/migrate.ts`) | authoring | S (the mount) |
-| `GET /repo/search` | web.go:1102 | ABSENT (aux JSON feed; `repoSearch` declared) | landed | authoring | S |
+| `GET /repo/migrate` | web.go:1100 | LANDED (window-2e C3a `62ef380` — GET+POST over the two-stage module: reqSignIn 303, owner-list load, the mirror-only form, POST → `migrateRepoFromForm`, created → 303 the born repo's home, invalid → inline re-render with the kept submission; the GETs initially dead behind the dynamic block, fixed `f60e5a8`; the API arm's migrate-201 born-body post-attach fix `8a1a03f`) | landed (`services/migrate.ts`) | authoring | — |
+| `GET /repo/search` | web.go:1102 | LANDED (aux JSON feed, window-2e A `84996c6` — reqSignIn 303, SearchAuxParamError → plain-text 422 per upstream ctx.HTTPError (never JSON), count_only fast path; registered ahead of the dynamic block `f60e5a8`; the API-Viewer bridge `c2925f2`) | landed | authoring | — |
 | `GET /attachments/{uuid}` | web.go:912 | LANDED (`src/web/attachments-serving.ts` mounted in `src/index.ts` before `uiRouter` with the `isAttachmentServing` carve-out — `5e082cd` + `2b5b898`; the full ServeAttachment walk: issue/PR/release linkage, draft arm, scope-check-after-404s, read:issue vs read:repository; Go sniff table + FormatMediaType + httpcache 304s; streaming. Premise corrected vs this row's old text: upstream defaults INLINE for all — the download arm is dead at frozen settings, the CSP sandbox + forced text/plain is the real mechanism. Credential walk corrected `7cd1ce9`: token first, session-cookie fall-through, error-fall-through (the two-arm order per the pinned web group), rotation Set-Cookie re-wrapped on every response, the browser_download_url owner probe added) | landed | authoring | — |
 | `GET /avatar/*`, `/user/avatar/*` | web.go:760,775 | LANDED (`src/web/avatar-serving.ts`, mounted `src/index.ts:69` — `/avatars/*` + `/avatar/{hash}` + `/user/avatar/{username}/{size}`; pixel-exact identicon port, default asset via Static Assets `239a4ac`) | landed | core | — |
 
-**A: 24 rows — 11 LANDED, 13 ABSENT.**
+**A: 24 rows — 19 LANDED, 2 PARTIAL, 3 ABSENT.**
 
 ## B. Owner pages (user / org)
 
 | Upstream route | Cite | Status | Data | Demand | Effort |
 |---|---|---|---|---|---|
-| `GET /{username}` (profile or org home, one handler) | web.go:911 | LANDED (`pages/user-profile.tsx` + `pages/org-home.tsx`; the `?tab=activity` arm's page module is landed-unmounted — `pages/activity-feeds.tsx`, `ec07fb6`, the mount rides a window wave, see In-flight) | landed | core | — |
-| `GET /{username}.rss` / `.atom` (handled inside the sub-route) | web.go:909-911 | ABSENT | landed (`repoListActivityFeeds` family declared `2ef9359`, `renderFeedItems` in `api/services/activity-feeds.ts`; the landed activity-feeds page module `ec07fb6` adds the rendering vocabulary; the XML envelopes are the work) | admin | M |
+| `GET /{username}` (profile or org home, one handler) | web.go:911 | LANDED (`pages/user-profile.tsx` + `pages/org-home.tsx`; the `?tab=activity` arm's page module is committed but UNMOUNTED — `pages/activity-feeds.tsx`, `ec07fb6`: the window consumed its seam + rendering vocabulary into the .rss/.atom envelopes (`1a59af0`), the page render has no caller; the arm is the survey's last S bench row, see In-flight) | landed | core | — |
+| `GET /{username}.rss` / `.atom` (handled inside the sub-route) | web.go:909-911 | LANDED (window-2e B1 `1a59af0` — one regex-constrained registration (the owner-home precedent); `resolveActivityFeeds` org-then-user, visibility-gated, renamed 307, missing 404 shell; gorilla-parity bytes with USER_FEED_CONTENT_TYPES) | landed (`repoListActivityFeeds` family declared `2ef9359`, `renderFeedItems` in `api/services/activity-feeds.ts`) | admin | — |
 | `GET /{username}/-/repositories` (org repo list) | web.go:1134 | LANDED (`pages/org-repos.tsx`, ui-parity-2) | landed | core | — |
 | `GET /{username}/-/heatmap` | web.go:1135 | ABSENT | none | admin | M |
 | `GET /{username}/-/packages[/...]` | web.go:1108-1128 | ABSENT | none (no packages system — FEATURE-ABSENT) | admin | L |
@@ -495,10 +580,10 @@ onto).
 | `GET /{org}/teams/new` | web.go:1009 | LANDED | landed | authoring | — |
 | `GET|POST /{org}/teams/{team}/edit` (+ the team delete write) | web.go:1011-1013 | LANDED (`pages/org-settings.tsx`'s edit arm, `8380cf0` — new.tmpl's edit form over every landed `editTeam` field: name, description, the visibility radio triple, permission radios checked by the team's `authorize` (blanket read/write/admin — the landed enum has no `none`), stored per-unit teams rendering their unit rows with `units_present=1` and form-convert semantics per upstream's ParseAccessMode-first order; the `repo_access` radios dead-control-unrendered — the landed arm ignores the field; the red Delete Team button a real form POST, the confirm dialog reduced) | landed (`orgEditTeam`/`orgDeleteTeam` declared) | authoring | — |
 | `GET|POST /{org}/settings` (options) + the avatar pair + the danger-zone writes | web.go:1017-1021,1065-1067 | LANDED (`pages/org-settings.tsx`, wave 49 `8380cf0` — the options combo over `orgEdit`: full_name/email/description/website/location + `repo_admin_change_team_access` + the visibility modal's write; the avatar pair multipart-bridged through the landed avatar pipeline (`processAvatarImage`/`uploadAvatar`); rename/delete/visibility as three `<details>` disclosure forms — the dialog reduction, every control live; `max_repo_creation` honest-absent, no landed key nor column; the navbar's unlanded tabs render nothing, the dead-link rule) | landed (`orgEdit`/`renameOrg`/`orgDelete`/`orgUpdateAvatar`/`orgDeleteAvatar` declared) | authoring | — |
-| `/{org}/settings/{hooks,applications,blocked_users}` (+ `audit_logs`; the `packages`/`actions` tabs FEATURE-ABSENT) | web.go:1022-1041,1063,1069-1089 | PARTIAL — the hooks tab LANDED MOUNTED (`pages/org-settings-hooks.tsx`, `54264ae` — list/create/edit/delete over the org-hooks family, scope-agnostic `editRepoHook` reused; the org list h4 'Settings' QUIRK kept verbatim :151; no test/replay arms — no upstream org route / no landed arm, documented); the blocked_users tab's module is committed UNMOUNTED (`pages/org-settings-blocked.tsx`, `25affaa`); the applications/audit_logs tails have no landed org-scope reads (needs-API-first); the `packages`/`actions` upstream surfaces stay FEATURE-ABSENT-gated per the twin inventory (the actions tab's module — secrets + variables — is committed-unmounted, `fbbc05b`) | partial (org hooks ops ALL declared — `orgListHooks`/`orgGetHook`/`orgCreateHook`/`orgEditHook`/`orgDeleteHook`; applications/blocked_users/audit tails have no landed org-scope reads) | authoring | M per remaining tab |
+| `/{org}/settings/{hooks,applications,blocked_users}` (+ `audit_logs`; the `packages`/`actions` tabs FEATURE-ABSENT) | web.go:1022-1041,1063,1069-1089 | PARTIAL — the hooks tab LANDED MOUNTED (`pages/org-settings-hooks.tsx`, `54264ae`); window-2b MOUNTED the blocked_users tab (`4f2805f` — block/unblock over `applyOrgBlockedForm`, upstream's exact banner texts) AND the actions-tab secrets/variables surfaces (the org twins of the user settings arms, full write sets). STILL ABSENT: the applications/audit_logs tails (no landed org-scope reads, needs-API-first); upstream's `packages`/`actions` management tabs stay FEATURE-ABSENT-gated (our actions-tab surfaces serve org secrets/variables only) | partial (org hooks ops ALL declared — `orgListHooks`/`orgGetHook`/`orgCreateHook`/`orgEditHook`/`orgDeleteHook`; applications/blocked_users/audit tails' org-scope reads: blocked_users LANDED, applications/audit still missing) | authoring | M per remaining tab |
 | `GET /org/{org}/settings/labels` | web.go:1043-1049 | LANDED at `/{org}/labels` (documented divergence; the three POST segments ride upstream's literals) | landed | authoring | — |
 
-**B: 18 rows — 10 LANDED, 2 PARTIAL, 6 ABSENT.**
+**B: 18 rows — 11 LANDED, 2 PARTIAL, 5 ABSENT.**
 
 ## C. Repo code browsing
 
@@ -527,10 +612,10 @@ onto).
 | `GET .../lastcommit/*` | web.go:1761 | LANDED (the `lastcommit` parse family mounted HANDOFF-exact per the `3502ee4` wave's documented plan, `67adfb7`; the loader posture carries over — batched per-path commit-info, 1+N `listLog` 8-wide vs upstream's one process, wall-free; merge/`-c` divergence + `PATH_LOG_SCAN` cap + no-cache documented; the file-list fetch-attrs flip — four attrs verbatim, opt-in `loaderCommitOid` — landed in the same commit so the listing page drives the same loader; the trailing-slash carve (`8a1a03f` — the LATENT trailing-slash 404 found by RD19 fixed in the route matcher) | landed | core | — |
 | `GET .../search` (in-repo code search) | web.go:1768 | ABSENT | none (no grep RPC) | authoring | L |
 | `GET .../{_edit|_new|_delete}/*` (editor combos) | web.go:1453-1461 | LANDED at `/{new|edit|delete}/*` (documented divergence at the brief's literal names, `pages/file-editor.tsx`) | landed | authoring | — |
-| `GET .../_upload/*` | web.go:1462-1464 | ABSENT — DOM MACHINERY LANDED: the editor-tails module renders the upload page (`pages/repo-editor-tails.tsx`, `f4492b2` — full dropzone data contract, max-file 5 / max-size 50 MB defaults, the common_breadcrumb PageIsUpload arm; the WRITE is documented-unrendered — no R2 uuid staging store, no `/upload-file`+`/upload-remove` arms, no `UploadRepoFiles` create-op); the mount gives DOM parity, the write needs-API-first | partial | authoring | M (the staging family) |
-| `GET .../_diffpatch/*`, `_cherrypick/{sha}/*` | web.go:1465-1470 | ABSENT | landed (diffpatch + merge machinery) | authoring | M |
+| `GET .../_upload/*` | web.go:1462-1464 | LANDED (window-2e C2b `1d834d6` — `GET|POST /upload/*`: `loadEditorUploadData` + the upload page render, the POST wiring `parseUploadForm` → `commitUploadFromForm` (the `dc9ff97` R2-uuid staging family's first consumer; committed → 303 src/branch/{b}, noop → 303 back, invalid → re-render with carried form) + the staging endpoints `POST /upload-file` + `/upload-remove` mounted `635ce2e` — the writer predicate is the entire authorization, upstream's upload store has no repo column) | landed (the `upload-staging` service + editor store) | authoring | — |
+| `GET .../_diffpatch/*`, `_cherrypick/{sha}/*` | web.go:1465-1470 | LANDED (window-2e C2b `1d834d6` — `GET|POST /patch/*` + `/cherrypick/*`: the sha-gated cherrypick suffix parse, the ?cherry-pick-type=revert arm, readCherryPickForm/readPatchForm → the commit fns, ApiError texts re-render with kept forms; the POST arms gained sameOriginGuard `27aa538` — the polish program's CSRF catch) | landed (diffpatch + merge machinery) | authoring | — |
 
-**C: 25 rows — 18 LANDED, 2 PARTIAL, 5 ABSENT.**
+**C: 25 rows — 20 LANDED, 2 PARTIAL, 3 ABSENT.**
 
 ## D. Issues and pulls
 
@@ -541,44 +626,44 @@ onto).
 | `GET .../issues/{index}` | web.go:1348 | LANDED (`pages/issue-detail.tsx`) | landed | core | — |
 | `GET .../pulls/{index}` | web.go:1656 | LANDED (same component; family-mismatch 303 parity) | landed | core | — |
 | `GET .../pulls/{index}.{diff|patch}` | web.go:1657-1658 | LANDED (`pages/diffpatch-files.ts`, wave-29; with-signature per upstream patch.go:26-45) | landed (`diffpatch.ts`) | authoring | — |
-| `GET .../pulls/{index}/merge_box` | web.go:1659 | ABSENT (fragment) | partial | authoring | S |
+| `GET .../pulls/{index}/merge_box` | web.go:1659 | LANDED (window-2e B2 `22599e4` — the committed fragment module `a9ceff3` mounted; null → EMPTY 200 = the bundle's reload stop signal; `findPullRequestByIndex`'s WithIssue pair decomposed) | landed (the merge machinery + PR model) | authoring | — |
 | `GET .../pulls/{index}/commits` | web.go:1661-1663 | LANDED (`pages/pull-commits.tsx`, slice `ec7da26`) | landed | authoring | — |
-| `GET .../pulls/{index}/files` | web.go:1671 | LANDED (`pages/pull-files.tsx`) | landed | authoring | — |
-| `GET .../pulls/{index}/files/{a}..{b}` (range) | web.go:1672 | ABSENT | landed | authoring | S |
+| `GET .../pulls/{index}/files` | web.go:1671 | LANDED (`pages/pull-files.tsx`; the single-commit page mounted at upstream's `/pulls/{index}/commits/{sha}` — `pull-commit-files`, `22599e4` honoring the `b48757e` mount divergence; `/files/{sha}` stays upstream's pattern miss) | landed | authoring | — |
+| `GET .../pulls/{index}/files/{a}..{b}` (range) | web.go:1672 | LANDED (window-2e B2 `22599e4` — the committed-range files page over the landed machinery) | landed | authoring | — |
 | `GET .../compare[/{base}...{head}]` | web.go:1307-1313 | LANDED (`pages/compare.tsx`; `..` two-dot and fork forms unclaimed — documented divergences) | landed | authoring | — |
-| `GET .../compare/*.{diff|patch}` | web.go:1309-1310 | ABSENT | landed | authoring | S |
-| `GET .../pulls/new/*` (redirect) | web.go:1314 | ABSENT | landed | authoring | S |
+| `GET .../compare/*.{diff|patch}` | web.go:1309-1310 | LANDED (window-2e B2 `22599e4` — the byte feeds branched INSIDE comparePage, the page family's registration owning the route; the parser's compare-feed family routes there before the page drift guard) | landed | authoring | — |
+| `GET .../pulls/new/*` (redirect) | web.go:1314 | LANDED (the window-2e folds `635ce2e` — the pure redirect onto /compare with query preserved; initially dead behind its own parse claim + a slice(5) mismatch, fixed `3837c17`) | landed | authoring | — |
 | `GET .../issues/new` | web.go:1355 | LANDED (`pages/new-issue.tsx`) | landed | authoring | — |
 | `GET .../issues/new/choose` (template chooser) | web.go:1357 | ABSENT | partial | authoring | S |
 | `GET .../labels` (list page) | web.go:1338 | LANDED (`pages/repo-labels.tsx`, ui-parity-4; live create/edit/delete writes, org section, issues-facet anchors) | landed | authoring | — |
 | `GET .../milestones` | web.go:1339 | LANDED (`pages/milestones.tsx`) | landed | authoring | — |
 | `GET .../milestone/{id}` (detail: issues+pulls) | web.go:1340 | LANDED (`pages/milestone-detail.tsx`, ui-parity-5; `?state`/`?labels` facets, progress bar, writer gates) | landed | authoring | — |
 | `GET .../milestones/{id}/edit` | web.go:1427 | LANDED (`pages/milestone-detail.tsx` edit form, ui-parity-5) | landed | authoring | — |
-| `GET .../issues/search` | web.go:1359 | ABSENT (aux JSON) | landed | authoring | S |
-| `GET .../{type}/{index}/info|attachments|content-history/*` | web.go:1321-1330 | ABSENT (fragments) | partial | authoring | M |
+| `GET .../issues/search` | web.go:1359 | LANDED (aux JSON feed, window-2e B2 `22599e4` — reqSignIn, param errors → plain 422; hoisted above the `/:index` catch `c4a1723` — the fourth dead-route fix) | landed | authoring | — |
+| `GET .../{type}/{index}/info|attachments|content-history/*` | web.go:1321-1330 | PARTIAL — window-2e B2 mounted the fragments under BOTH families (`22599e4`): `/info`, `/attachments`, the `/attachments/{uuid}` 302 alias onto the landed site-level seam, and `content-history/overview`. STILL UNCLAIMED: `content-history/list` + `/detail` (no snapshot store — needs-API-first) | partial | authoring | M (the snapshot store) |
 | `GET .../comments/{id}/attachments` | web.go:1337 | ABSENT (aux) | partial | authoring | S |
-| `GET .../issues/suggestions` | web.go:1341 | ABSENT (aux) | landed | authoring | S |
+| `GET .../issues/suggestions` | web.go:1341 | LANDED (aux JSON feed, window-2e B2 `22599e4` — optSignIn, raw q untrimmed; hoisted with the search feed `c4a1723`) | landed | authoring | — |
 
-**D: 22 rows — 13 LANDED, 9 ABSENT.**
+**D: 22 rows — 19 LANDED, 1 PARTIAL, 2 ABSENT.**
 
 ## E. Repo settings
 
 | Upstream route | Cite | Status | Data | Demand | Effort |
 |---|---|---|---|---|---|
-| `GET .../settings` (basics) | web.go:1185 | LANDED (`pages/settings.tsx`, admin viewer only; the settings-side WIKI-CONFIG arm is landed-unmounted — `pages/repo-settings-wiki.tsx`, `5c2812f`: enable_wiki live-writes hasWiki via the exact PATCH arm, external-wiki/branch-input/delete-modal documented-unrendered, the dedicated sub-page + nav item is the mirror-panel divergence posture; PREMISE CORRECTED at dispatch: no `wiki.tmpl` at the pin, the surface is `options.tmpl`'s three pieces) | landed | authoring | — |
+| `GET .../settings` (basics) | web.go:1185 | LANDED (`pages/settings.tsx`; window-2d pass 2 `46e7e68` mounted the settings-side WIKI-CONFIG arm at `/settings/wiki` — enable radios live-writes hasWiki via the exact PATCH arm, external-wiki/branch-input/delete-modal rendered as honest-absence lines, the dedicated sub-page + nav item is the mirror-panel divergence posture; PREMISE CORRECTED at dispatch: no `wiki.tmpl` at the pin, the surface is `options.tmpl`'s three pieces) | landed | authoring | — |
 | `GET .../settings/collaboration` (+write tails) | web.go:1194-1204 | LANDED (`pages/settings-collaboration.tsx`, ui-parity-3 `ca81d5a`; writes over landed services, upstream refusal order, `CanDoerManageOrgRepoCollaborator` port) | landed (`repo-collaborators.ts`) | authoring | — |
 | `GET .../settings/branches` (+`/edit`, `/priority`, `/{id}/delete`) | web.go:1207-1213 | LANDED (`pages/branch-protection.tsx`) | landed | authoring | — |
-| `GET .../settings/tags` (protected tags) | web.go:1215-1221 | ABSENT | landed (protected_tags 0025 + all 5 `repo*TagProtection` ops declared `a80878c` — effort re-checked M: list+form+enforcement-badge page work) | authoring | M |
-| `GET .../settings/hooks/git` | web.go:1223-1227 | ABSENT | landed (git hooks: `repoListGitHooks`/`repoGetGitHook`/`repoEditGitHook`/`repoDeleteGitHook` declared `5b704c5`) | admin | S |
+| `GET .../settings/tags` (protected tags) | web.go:1215-1221 | LANDED (window-2d `b54f709` — list with ?id= edit prefill + ?saved=1 flash, POST create, GET+POST /{id} edit, POST delete; RepoMustNotBeArchived rides the POSTs, missing → 404) | landed (protected_tags 0025 + all 5 `repo*TagProtection` ops declared `a80878c`) | authoring | — |
+| `GET .../settings/hooks/git` | web.go:1223-1227 | LANDED (window-2d `b54f709` — GET list, GET+POST edit per hook name; hooks/git claimed explicitly beside the numeric hooks/{id} block; ErrNotValidHook → 404 shell) | landed (git hooks: `repoListGitHooks`/`repoGetGitHook`/`repoEditGitHook`/`repoDeleteGitHook` declared `5b704c5`) | admin | — |
 | `GET .../settings/hooks` + `/{id}` + `/{type}/new` | web.go:1229-1239 | LANDED (list, generic add form, per-hook page + test/delete; upstream's per-provider `{type}/new` forms ride our generic form — divergence) | landed | authoring | — |
-| `GET .../settings/keys` (deploy keys) | web.go:1241-1247 | ABSENT | landed (deploy keys 0020; `repoListKeys`/`repoCreateKey`/`repoDeleteKey` declared `4af12a9`) | authoring | M |
+| `GET .../settings/keys` (deploy keys) | web.go:1241-1247 | LANDED (window-2d `b54f709` — GET+POST add with carried form on invalid, POST delete idempotent 303) | landed (deploy keys 0020; `repoListKeys`/`repoCreateKey`/`repoDeleteKey` declared `4af12a9`) | authoring | — |
 | `GET .../settings/lfs[/...]` (files, pointers, locks) | web.go:1249-1261 | ABSENT | partial (LFS server landed; pointer-scan queries missing) | authoring | M |
 | `GET .../settings/actions*` | web.go:1262-1278 | ABSENT | none (no Actions — FEATURE-ABSENT) | admin | L |
 | `GET .../settings/audit_logs` | web.go:1279 | ABSENT | none | admin | L |
 | `GET .../settings/mirror` | (upstream renders inside options.tmpl — divergence noted) | LANDED at the literal (`pages/settings.tsx`) | landed | authoring | — |
-| `GET .../settings/public_access` | web.go:1191 | ABSENT | partial | authoring | S |
+| `GET .../settings/public_access` | web.go:1191 | LANDED (window-2d `b54f709` — GET+POST over the `codeUnitAnonymousRead` seam: the page and the git-HTTP gate read the SAME value; the conditional Public Access nav item renders on the branches + collaboration tabs `364bf92`) | landed | authoring | — |
 
-**E: 12 rows — 5 LANDED, 7 ABSENT.**
+**E: 12 rows — 9 LANDED, 0 PARTIAL, 3 ABSENT.**
 
 ## F. Repo sub-systems (releases, wiki, activity, social, packages/projects/actions)
 
@@ -588,10 +673,10 @@ onto).
 | `GET .../releases/new`, `/edit/*` | web.go:1516-1520 | LANDED (`pages/releases.tsx`; `/new` wave 20, the `/edit/*` form + write and the formaction `/releases/delete` button + list pencil wave-ui-parity-7 `48101dc` — unconditional web-form writes) | landed | authoring | — |
 | `GET .../releases/download/{tag}/{file}`, `/releases/attachments/{uuid}` | web.go:1513-1514 | LANDED (`pages/release-downloads.ts`, wave-ui-parity-10 `fdaeaca`; ServeAttachment for the uuid shape + RedirectDownload for the download shape incl. the `latest` alias; sniff/draft/ETag-304/download-count ports) | landed (`release-assets.ts`) | core | — |
 | `GET .../fork` (fork form) | web.go:1490 | LANDED (`pages/repo-fork.tsx`, ui-parity-5; owner options over can-create orgs, `createFork` sequence replay; entry points on the forks page) | landed (`createFork` declared) | authoring | — |
-| `GET .../wiki[/...]` (+commit/raw/excerpt) | web.go:1611-1625 | ABSENT (the page family — two aux arms serve already: the excerpt fragment `/wiki/blob_excerpt/{sha}` mounted `67adfb7` beside the repo twin with the wiki-cell swap + `hasWiki` gate, see the C-family row; no wiki page surface yet. VERIFY-FIRST premise for dispatch — the wiki/webhooks lesson: the templates all exist at the pin (`templates/repo/wiki/{start,view,pages,new,revision}.tmpl`, verified) and the handlers are `repo.Wiki`/`WikiPost` (web.go:1611-1625), BUT the sub-pages (`_pages`, `_new`, `_revision`) are NOT web.go registrations — they are case-arms inside the wildcard combo's handler (wiki.go:445-462, `?action=_pages` redirects), so the brief must be re-derived from wiki.go at the pin, not from the route table; the settings twin's naive template premise was already corrected once (`5c2812f`)) | landed (wiki 6 ops declared `d3362b1`, `services/wiki.ts` + the sibling engine cell — effort drops L→M) | authoring | M |
+| `GET .../wiki[/...]` (+commit/raw/excerpt) | web.go:1611-1625 | LANDED (window-2e C2a `9516bf1` — the page family mounted, 4 routes, action-dispatch; the sub-pages (`_pages`, `_new`, `_revision`) are case-arms inside the wildcard combo's handler per wiki.go:445-462, exactly as this row's VERIFY-FIRST premise required. The family was UNREACHABLE on arrival — the polish program's first dead-route catch: parse + registration order unshadowed `a58cad5`, the wiki matrix 24/24 green after; the service-side pathJoinRelX empty-join arm fixed `8f766ac` (upstream's empty-input answer). The excerpt twin `wiki-blob-excerpt` was already mounted `67adfb7`) | landed (wiki 6 ops declared `d3362b1`, `services/wiki.ts` + the sibling engine cell) | authoring | — |
 | `GET .../activity[/{period}]` | web.go:1628-1631 | ABSENT | partial (feed rows landed `2ef9359`; the stats aggregation stays private on the DO) | core | M |
 | `GET .../activity/{contributors|code-frequency|recent-commits}[/data]` | web.go:1633-1646 | ABSENT | partial (aggregation private on the DO) | admin | M |
-| `GET .../activity_author_data` | web.go:1683-1687 | ABSENT (aux JSON) | partial | admin | S |
+| `GET .../activity_author_data` | web.go:1683-1687 | LANDED (aux JSON feed, window-2e B2 `22599e4` — both the bare and `/:period` shapes) | landed (the feed rows `2ef9359`) | admin | — |
 | `GET .../forks` | web.go:1759 | LANDED (`pages/repo-social.tsx`, ui-parity-3 `ca81d5a`) | landed (`listForks`) | core | — |
 | `GET .../stars` | web.go:1766 | LANDED (`pages/repo-social.tsx`, ui-parity-3 `ca81d5a`) | landed (`stars.ts`, `social-lists.ts`) | core | — |
 | `GET .../watchers` | web.go:1767 | LANDED (`pages/repo-social.tsx`, ui-parity-3 `ca81d5a`) | landed (`repo-watchers.ts`) | core | — |
@@ -599,207 +684,109 @@ onto).
 | `GET .../projects[/...]` | web.go:1544-1563 | LANDED (`ae32b1a` — the full repo-scoped surface: list + board + `/new` + `/{id}/edit` + the workflow tails over the landed store; the `has_projects` unit toggle MODELED — no divergence. Data-note convention: the Hono constraint `:owner/:repo{[^-].*}/projects` — a static second segment does NOT outrank a param in Hono, so the owner-scoped `/-/projects` shapes and these repo-scoped shapes coexist only via the negative-charset constraint; the landing wave discovered+applied it, recorded here so later route work reuses it) | landed (projects store 0024 + all three API scopes declared: repo `fc123b0`, org `20512c0`, user `c9a7ef7` — 64 project ops) | authoring | — |
 | `GET .../actions[/...]` | web.go:1566-1608 | ABSENT | none (no Actions — FEATURE-ABSENT) | admin | L |
 
-**F: 14 rows — 8 LANDED, 0 PARTIAL, 6 ABSENT.**
+**F: 14 rows — 10 LANDED, 0 PARTIAL, 4 ABSENT.**
 
 ## Totals
 
-**115 rows: 65 LANDED, 4 PARTIAL, 46 ABSENT — zero IN-FLIGHT; the
-counted sums cover all 115 rows.** (The module wave's last two
-siblings committed mid-tick — nothing is excluded; the tick-9
-correction of the
+**115 rows: 88 LANDED, 7 PARTIAL, 20 ABSENT — zero IN-FLIGHT; the
+counted sums cover all 115 rows.** (The window consumed the module
+wave — nothing is excluded; the tick-9 correction of the
 tick-8 "111 counted" arithmetic slip stands.)
 
-By family (landed/partial/absent): A 11/0/13, B 10/2/6, C 18/2/5, D
-13/0/9, E 5/0/7, F 8/0/6. The landed
+By family (landed/partial/absent): A 19/2/3, B 11/2/5, C 20/2/3, D
+19/1/2, E 9/0/3, F 10/0/4. The landed
 set now covers every
 highest-traffic single page (repo home, file view, commits log, commit
-detail, branches, tags — including the delete write, issues/PRs lists +
-details + both PR side tabs, compare, releases browse + create + edit +
+detail, branches — including the writer arms, tags — including the
+delete write, issues/PRs lists + details + both PR side tabs + the
+merge box + the files range + the single-commit page, compare with its
+byte feeds, the pulls/new redirect, releases browse + create + edit +
 delete + the download tail, labels, milestone detail/edit, the fork
-form, the social lists, the collaboration panel, creation forms, org
-members/repositories, the avatar seam, the attachments seam, the
-archive download, `load-branches-and-tags`, the `/-/projects` index AND
-its board + write group AND its repo-scoped twin, the `/blob/*` +
-`/tree/*` redirects with their
-fetch-action arms, `tree-list` AND `tree-view`, `branches/list`, the
-`/render/*`
-family, both code-view fragments — `blob_excerpt/{sha}` (with the
-wiki twin) and `lastcommit/*` — AND the org owner
-family's core: the org settings options+avatar+danger-zone arms, the
-team edit form, and — since this tick — the org settings HOOKS tab
-(`54264ae`, the B remainder row's first mounted arm). The remaining
+form, the social lists, the collaboration panel, creation forms AND
+the migration form, org members/repositories, the avatar seam, the
+attachments seam, the archive download, `load-branches-and-tags`, the
+`/-/projects` index AND its board + write group AND its repo-scoped
+twin, the `/blob/*` + `/tree/*` redirects with their fetch-action
+arms, `tree-list` AND `tree-view`, `branches/list`, the `/render/*`
+family, both code-view fragments, the global inboxes, the sitemap
+family, the search/topic/issues/suggestions aux feeds, the .rss/.atom
+envelopes, the subscriptions/watching tails, the wiki page family,
+the editor tails including the LIVE upload write, cherrypick/patch,
+all four new repo-settings tabs (protected tags, git hooks, deploy
+keys, public access), the settings wiki-config arm, the user-settings
+tab family (8 tabs), the org blocked-users + actions tabs, the org
+hooks tab, and the admin dashboard + monitor group. The remaining
 absence mass concentrates
 in (a) small
-page slices over fully landed data (the compare range +
-diff-patch shapes, the pulls/new redirect) — the two aux fragments left
-that bucket when their routes mounted (`67adfb7`),
-(b) settings tabs whose APIs just
-landed (deploy
-keys, protected tags, git hooks — repo- AND org-scope, the org hooks
-tab having landed this window),
+page slices over fully landed data (`issues/new/choose` template
+chooser, `comments/{id}/attachments`, the compare two-dot/fork form
+divergences),
+(b) needs-API-first tails (the content-history list/detail snapshot
+store, the org applications/audit_logs tabs, `settings/lfs` pointer
+scans, `/explore/organizations`'s anonymous search arm,
+`/user/sign_up`, the org dashboard/issues group),
 (c) the owner `/-/`
 namespace tails (heatmap/packages stay gated),
-(d) the committed-unmounted module mounts — thirteen commits carrying
-fifteen page modules: migrate, the profile
-activity tab, the subscriptions tails, the
-settings-wiki arm, the editor tails, and ten user/org settings tab
-modules — the machinery rides a window wave (see In-flight), and
-(e) whole subsystems with no data model (actions, packages, audit logs)
-or no engine RPC (blame, graph, code search, heatmap) that are correctly
-out of the demand-driven phase's reach.
+(d) the unmounted remainder of mounted groups — the profile
+`?tab=activity` page arm (module committed, the last S bench row),
+the admin pages beyond the dashboard/monitor group, the user-settings
+account/repos/notifications tabs — and
+(e) whole subsystems with no data model (actions, packages, audit
+logs) or no engine RPC (blame, graph, code search, heatmap) that are
+correctly out of the demand-driven phase's reach.
 
 ## Recommendation — re-ranked queue by demand-per-effort
 
-This tick the UNMOUNTED module wave landed (fifteen committed page
-modules across thirteen commits — see In-flight) and the org hooks tab
-mounted (`54264ae`, flipping the B
-remainder row PARTIAL): **the numbered queue stays EMPTY and fully
-LANDED — zero rows in flight; the dispatchable surface is the verified
-bench queue below plus the gated rows, nothing else.** The structural
-endpoint stands: every remaining mount edits
-`apps/worker/src/ui/index.ts` — the shared route-table file that, per
-the exclusive-ownership rule, only the orchestrator or a designated
-owner edits — so module dispatch stays TWO-STAGE (a page module
-committed unmounted + its mount riding a window wave), and the window
-itself is the orchestrator's.
+This tick the index window mounted the entire unmounted-module wave
+(92 routes, fourteen commits — see In-flight) and the polish program
+made every mounted page route-proven (52 matrix commits, 18 real bugs
+fixed, ~18 stale pins swept): **the tick-10 bench queue landed in its
+ENTIRETY — all eight rows — and the dispatchable surface is down to
+ONE S row**, with everything else needs-API-first or gated.
 `node scripts/check-openapi.mjs` PASS at
-HEAD `b396a41` — no row below needs an API that isn't declared.
+HEAD `03f9e82` (490 ops / 298 paths, tier-1 78/78 paths, 129/129 ops)
+— no row below needs an API that isn't declared.
 
-Machinery in flight (not a dispatch target — the module work is DONE
-or sibling-held, the mounts ride a window wave; do not re-dispatch):
+### The one dispatchable row
 
-- **The unmounted-module wave** (all committed — fifteen page modules
-  across thirteen commits): `repo-migrate`
-  (`f26d65b` — the `/repo/migrate` row drops to an S mount),
-  `activity-feeds` (`ec07fb6` + glyph exact `f696a21` — the profile
-  `?tab=activity` arm), `notification-subscriptions` (`486b9fc` — the
-  subscriptions tails, web.go:1786-1787,1790), `repo-settings-wiki`
-  (`5c2812f` — the settings wiki-config arm), `repo-editor-tails`
-  (`f4492b2` — delete confirm + upload DOM), `user-settings-security`
-  + `-secrets` (`e19c95a`), `-webhooks` (`aa9bd40`), `-keys` +
-  `-applications` (`46230c5`), `-organizations` (`11738a8`),
-  `-variables` (`97dbbde`), `org-settings-blocked` (`25affaa`),
-  `org-settings-actions` (`fbbc05b`), `-appearance` (`846a918`).
-  One `index.ts` window mounts the batch; the affected rows carry
-  their machinery notes (see In-flight).
-
-### The bench queue — genuinely dispatchable NOW
-
-Eight rows, re-verified at the pin this tick (template path + handler
-cite checked in the submodule; data ops declared per `check-openapi`
-PASS; no sibling holds the files). Dispatch order by demand-per-effort;
-each is two-stage module work (mount rides the window):
-
-1. **`GET .../pulls/new/*` redirect** (D, S) — handler
-   `repo.PullsNewRedirect` (web.go:1314, verified); no template (a
-   redirect onto `/compare` with the query preserved). Ready because
-   compare + pulls are landed and the upstream handler is a pure
-   redirect — the smallest dispatchable row on the board.
-2. **`GET .../compare/*.{diff|patch}` + `GET .../pulls/{index}/files/{a}..{b}`**
-   (D, S, one unit) — handlers `repo.DownloadCompareDiff`/
-   `repo.DownloadComparePatch` (web.go:1309-1310) +
-   `repo.ViewPullFilesForRange` (web.go:1672), verified; no templates
-   (byte feeds). Ready because `pages/diffpatch-files.ts` (the mail
-   format machinery) and both landing pages are landed — pure shape
-   work over landed machinery.
-3. **`GET .../issues/search` + `GET .../issues/suggestions` aux**
-   (D, S, one unit) — handlers `repo.SearchRepoIssuesJSON`
-   (web.go:1359) + `repo.IssueSuggestions` (web.go:1341), verified;
-   `issueSearchIssues` declared `[ok]`, suggestions over the landed
-   issue tables; both aux JSON feeds (template-free parity surfaces).
-4. **`GET .../pulls/{index}/merge_box` fragment** (D, S) — handler
-   `repo.ViewPullMergeBox` (web.go:1659 → issue_view.go:459);
-   template `gitea/templates/repo/issue/view_content/pull_merge_box.tmpl`
-   verified at the pin. Data partial-but-serviceable: the merge
-   machinery and PR model are landed; the fragment renders the box
-   alone — DOM parity over landed state.
-5. **`GET /repo/search` + `GET /explore/topics/search` aux**
-   (A, S, one unit) — handlers `repo.SearchRepo` (web.go:1102) +
-   `explore.TopicSearch` (web.go:564), verified; `repoSearch` +
-   `topicSearch` declared `[ok]`; aux JSON feeds.
-6. **`GET .../settings/hooks/git`** (E, S, admin) — handlers
-   `repo_setting.GitHooks`/`GitHooksEdit`/`GitHooksEditPost`
-   (web.go:1223-1227, verified); templates
-   `gitea/templates/repo/settings/githooks.tmpl` +
-   `githook_edit.tmpl` verified at the pin; all four git-hook ops
-   declared (`5b704c5`). Ready because the org twin JUST landed the
-   scope-agnostic pattern (`54264ae` — `editRepoHook` reuse, the
-   no-test/replay-arm posture documented).
-7. **`GET .../settings/tags` (protected tags)** (E, M) — handlers
-   `repo_setting.ProtectedTags` + new/edit/delete posts
-   (web.go:1215-1221, verified; the template constant is
-   `repo/settings/tags`, protected_tag.go:27); template
-   `gitea/templates/repo/settings/tags.tmpl` verified at the pin;
-   protected_tags 0025 + all five `repo*TagProtection` ops declared
-   (`a80878c`) — list + form + enforcement-badge page work over fully
+1. **The profile `?tab=activity` page arm** (B, S) — the module is
+   COMPLETE and committed (`pages/activity-feeds.tsx`, `ec07fb6`,
+   glyphs exacted `f696a21`); what remains is wiring the owner-home
+   handler's tab dispatch onto the committed
+   `renderActivityFeedsPage`/`loadActivityFeedsData` (the seam
+   `resolveActivityFeeds` is already imported for the .rss/.atom
+   envelopes, `1a59af0`). One registration + one handler arm + the
+   matrix's route-level arms per the process note — the smallest
+   dispatchable row on the board, and the survey's last one with
    landed data.
-8. **The wiki page family** (F, M) — **VERIFY-FIRST premise** (the
-   wiki/webhooks lesson): handlers `repo.Wiki`/`WikiPost` combos
-   (web.go:1611-1625, verified) and templates
-   `gitea/templates/repo/wiki/{start,view,pages,new,revision}.tmpl`
-   verified at the pin; all six wiki ops declared (`d3362b1`) +
-   `services/wiki.ts` + the engine cell. BUT the sub-pages
-   (`_pages`/`_new`/`_revision`) are case-arms inside the wildcard
-   combo's handler (wiki.go:445-462), not web.go registrations — the
-   dispatch brief MUST be re-derived from wiki.go at the pin before
-   writing (the settings twin's naive template premise was corrected
-   once already, `5c2812f`). Verify first, then it is plain M page
-   work over landed ops.
 
-M-tier remainder (dispatchable after the queue above, data landed
-unless noted): `.../_diffpatch|_cherrypick` (web.go:1465-1470 —
-templates `repo/editor/cherry_pick.tmpl` + `patch.tmpl` verified at
-the pin, diffpatch + merge machinery landed), **settings/keys** (deploy
-keys — `settings/keys.tmpl`+`deploy_keys.tmpl` verified, ops landed
-`4af12a9`), `/{username}.rss/.atom` (feeds declared + the
-activity-feeds module's rendering vocabulary; the XML envelopes are
-the work), `GET /sitemap.xml` + explore sitemaps (web.go:530,554,556 —
-XML over landed listings), the global `/issues|/pulls|/milestones`
-inboxes (data partial — the cross-repo perm filter),
-`.../comments/{id}/attachments` (web.go:1337, data partial),
-`.../issues/new/choose` (web.go:1357, data partial),
-`.../settings/public_access` (web.go:1191 — template
-`settings/public_access.tmpl` verified at the pin; data partial),
-`.../activity_author_data` (web.go:1683-1687, data partial),
-`.../{type}/{index}/info|attachments|content-history/*` fragments
-(web.go:1321-1330, data partial).
-NEEDS-API-FIRST rows (do not dispatch as UI work): 
+NEEDS-API-FIRST rows (do not dispatch as UI work): the
+`content-history/list` + `/detail` fragment arms (no snapshot store),
 `/explore/organizations` (web.go:557 — the anonymous visible-org
 search arm is missing), `GET /user/sign_up` (no self-serve
 registration service), the org dashboard + issues groups
 (web.go:982-991 — no org-scope cross-cut reads), `.../settings/lfs`
-(pointer-scan queries missing), `.../activity[/{period}]` + the
-stats family (the aggregations stay private on the DO), and the
-`_upload` WRITE (the R2 uuid staging family).
-The `/repo/migrate` MOUNT and the rest of the unmounted-module batch
-are NOT bench rows — they ride the machinery window above.
+(pointer-scan queries missing), `.../activity[/{period}]` + the stats
+family (the aggregations stay private on the DO), the org settings
+applications/audit_logs tabs (no landed org-scope reads), the
+user-settings account/repos/notifications tabs, the admin pages
+beyond the mounted dashboard/monitor group (users, repos, orgs,
+config, notices, auths, emails, badges, packages, hooks,
+applications, actions), and `.../comments/{id}/attachments`
+(web.go:1337, data partial).
 GATED rows (do not dispatch without the feature SPEC): everything
-actions/packages (`/-/admin` actions+packages tabs, `settings/actions`,
-`.../actions*`, `.../packages`, `/{username}/-/packages`, and the org
-settings `packages`/`actions` tabs of the remainder row —
-FEATURE-ABSENT
-APIs per the twin inventory's 64 remaining ops), plus the no-RPC pages
-(blame, graph, in-repo/explore/`/-/` code search, the
-`/{username}/-/heatmap` tail, audit_logs) — heatmap specifically stays
-put: the contribution grid needs a heat aggregation that exists on neither
-the engine boundary nor a landed service, so it is no-RPC-gated like
-blame/graph, not a dispatchable S-row.
-Fragment gates — CLOSED, all three; this section retires with the tick.
-The first gate, `/tree-view/*` (web.go:1297-1306), cleared when the
-fileicon asset+lookup layer landed (`cdf683a` — premise corrected: the
-pinned fileicon has NO enry dep) and closed when the envelope mounted
-(`831709f` — counted LANDED, its dynamic-import posture pinned in the
-row's data note). The second, `.../blob_excerpt/{sha}` (web.go:1735),
-cleared when `0db7087` ported the full `BuildBlobExcerptDiffSection`
-hunk expansion and closed when `67adfb7` mounted the route (stage-3:
-fragment + buttons + anchors, plus the wiki twin at web.go:1618). The
-third, `.../lastcommit/*` (web.go:1761), cleared when `3502ee4` landed
-the batched per-path loader + the `view_list.tmpl` DOM and closed when
-`67adfb7` mounted the route HANDOFF-exact. No gate — data, SPEC, or
-fragment — stands anywhere on the survey; what remains is the
-machinery window (the eleven-module batch), the verified bench queue
-above, and the
-gated/limited rows below.
+actions/packages (`settings/actions`, `.../actions*`, `.../packages`,
+`/{username}/-/packages`, the admin packages/actions tabs, and the org
+settings upstream `packages`/`actions` management tabs —
+FEATURE-ABSENT APIs per the twin inventory's 64 remaining ops), plus
+the no-RPC pages (blame, graph, in-repo/explore/`/-/` code search,
+`/{username}/-/heatmap`, audit_logs) — heatmap specifically stays
+put: the contribution grid needs a heat aggregation that exists on
+neither the engine boundary nor a landed service, so it is
+no-RPC-gated like blame/graph, not a dispatchable S-row.
+The fragment gates and the machinery window both RETIRE with this
+tick: all three fragment gates closed (`831709f`, `67adfb7` twice)
+and the module-wave machinery mounted (`0c2b151` through `635ce2e`).
 The
 `.../raw` + `.../media` web shapes (web.go:1699-1713) stay
 PARTIAL-by-divergence — our SSR pages emit tier-1 API raw links
