@@ -507,8 +507,13 @@ describe("the settings navbar (the shared UserSettingsNavbar, hooks active)", ()
     expect(html).toContain('href="/user/settings/appearance"'); // the shared nav's Appearance item (was a dead target pre-swap)
     expect(html).toContain(">Webhooks</a>"); // the navbar label — repo.settings.hooks reused
     // The still-unlanded upstream items stay absent (the dead-link rule).
+    // STALE-PIN FLIP (484eb92, the user-settings repos mini-mount): Repos
+    // LEFT the dead list — the repos tab mounted and the shared nav renders
+    // its navbar.tmpl:74-76 item on EVERY settings page, so the old absence
+    // negative inverted into the item's exact inactive-anchor pin (the
+    // wave-114 Appearance inversion precedent above).
     expect(html).not.toContain("/user/settings/audit_logs");
-    expect(html).not.toContain("/user/settings/repos");
+    expect(html).toContain('class="item" href="/user/settings/repos"');
   });
 });
 
