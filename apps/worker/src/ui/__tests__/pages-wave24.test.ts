@@ -16,10 +16,20 @@
  * services (no engine content — none of the pages read git data), identities
  * riding minted session cookies, POSTs carrying the same-origin Origin
  * header.
+ *
+ * w129 additions (wave-polish-matrix-6, 2026-10-27) — the social lists'
+ * batch-6 deepening, appended as the trailing w129 describes: the visibility
+ * ladder's COLLABORATOR rung on the private repo (wave24 pinned anon /
+ * stranger / owner; the trio matrix fsx-* pinned the admin rung — the
+ * readGrant collaborator arm was unpinned at the trio's page level), the
+ * watchers pager's exact pageSize boundary (total == 40 renders NO pager at
+ * page 1), the watchers past-the-end bare-empty arm, and the stargazers
+ * past-the-end arm — the user_cards template's no-else reduction rendering a
+ * bare empty ul where the forks family renders its no-results line.
  */
 
 import { env } from "cloudflare:test";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it } from "vitest";
 
@@ -481,5 +491,165 @@ describe("wave-24 a11y smoke", () => {
       const violations = runA11y(await res.text());
       expect(violations, `${path}: ${JSON.stringify(violations)}`).toEqual([]);
     }
+  });
+});
+
+// --- w129 additions (wave-polish-matrix-6, 2026-10-27) ---------------------------
+// The social lists' deepening: the collaborator rung of the visibility ladder,
+// the watchers pager's pageSize boundary and past-the-end arms. Provenance in
+// the file header. The w129 rows ride their own lazy-guarded repos (a private
+// vault + a 40-watcher bulk repo created below — wave24's fixture owns no
+// private repo, and the fsx names live in the other file), so nothing the
+// wave-24 arms assert is disturbed.
+
+let w129VaultReady = false;
+let w129BulkReady = false;
+
+/** The w129 private repo (wave24-owner/w129-vault) — the ladder's private rung
+ *  population; wave24-read is granted READ on it on first call. */
+async function ensureW129Vault(): Promise<void> {
+  if (w129VaultReady) return;
+  await ensureWave24Fixtures();
+  const owner = await drizzle(env.DB)
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "wave24-owner"))
+    .get();
+  const reader = await drizzle(env.DB)
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "wave24-read"))
+    .get();
+  if (owner === undefined || reader === undefined) throw new Error("w129 owner/reader rows missing");
+  const service = new RepoService(env.DB);
+  const vault = await service.create({
+    owner: { id: owner.id, usernameLower: "wave24-owner" },
+    name: "w129-vault",
+    isPrivate: true,
+    status: "ready",
+  });
+  await addOrUpdateCollaborator(env.DB, vault.id, reader.id, "read", new Date(1_700_000_000 * 1000));
+  w129VaultReady = true;
+}
+
+/** User-card count: the `li.item.ui.segment` roots (the same shape key the
+ *  forks matrix's cardRowCount uses — the shell emits no other li.ui.segment). */
+function cardCount(html: string): number {
+  return (html.match(/<li class="item ui segment">/g) ?? []).length;
+}
+
+/** Seed exactly pageSize (40) watchers onto the w129 bulk repo: the five
+ *  wave-24 users plus 35 fresh ones — the boundary population for the pager
+ *  arms. */
+async function ensureW129Bulk(): Promise<string> {
+  if (w129BulkReady) {
+    const existing = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, "wave24-owner"), eq(repositories.slug, "w129-bulk")))
+      .get();
+    if (existing === undefined) throw new Error("w129 bulk row missing on re-entry");
+    return existing.id;
+  }
+  await ensureWave24Fixtures();
+  const owner = await drizzle(env.DB)
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "wave24-owner"))
+    .get();
+  if (owner === undefined) throw new Error("w129 owner row missing");
+  const service = new RepoService(env.DB);
+  const bulk = await service.create({
+    owner: { id: owner.id, usernameLower: "wave24-owner" },
+    name: "w129-bulk",
+    isPrivate: false,
+    status: "ready",
+  });
+  const now = new Date(1_700_000_000 * 1000);
+  // The five existing users (owner, collab, read, out, orgowner)…
+  for (const name of ["wave24-owner", "wave24-collab", "wave24-read", "wave24-out", "wave24-orgowner"]) {
+    const row = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, name))
+      .get();
+    if (row !== undefined) await watchRepo(env.DB, bulk.id, row.id, now);
+  }
+  // …plus 35 fresh ones → exactly 40 watchers.
+  for (let i = 1; i <= 35; i++) {
+    const user = await seedVerifiedUser({ username: `wave129w-${String(i).padStart(2, "0")}` });
+    await watchRepo(env.DB, bulk.id, user.id, now);
+  }
+  w129BulkReady = true;
+  return bulk.id;
+}
+
+describe("w129 the trio's collaborator rung (the read grant's collaborator arm at the page level)", () => {
+  it("a READ collaborator renders the private repo's whole trio; the ladder stays anon < stranger < collaborator < owner/admin", async () => {
+    // Provenance: wave-polish-matrix-6. wave24's gates ran on a public trio,
+    // and the fsx matrix pinned anon/stranger/owner/admin — the COLLABORATOR
+    // rung (acl.ts readGrant's any-row-grants-read arm, the same grant the
+    // git-HTTP clone pins) was unpinned at the trio's page level.
+    await ensureW129Vault();
+    const fixture = await ensureWave24Fixtures();
+
+    for (const family of ["forks", "stars", "watchers"] as const) {
+      const res = await fetchUi(`/wave24-owner/w129-vault/${family}`, withCookie(`/x`, fixture.readCookie));
+      expect(res.status, family).toBe(200);
+      const html = await res.text();
+      expect(html, family).toContain(`class="page-content repository ${family === "forks" ? "forks" : "watchers"}"`);
+      // The private repo's own empty listings render (no MustBeNotEmpty gate).
+      expect(html, family).not.toContain("status-page-error");
+    }
+    // The ladder's floor holds one rung up: the anonymous viewer still 404s.
+    expect((await fetchUi("/wave24-owner/w129-vault/forks")).status).toBe(404);
+  });
+});
+
+describe("w129 the watchers pager's pageSize boundary and past-the-end arms", () => {
+  it("exactly 40 watchers fill page 1 with NO pager (total == page*ItemsPerPage → no Older), and ?page=2 renders the bare empty ul with the Newer link", async () => {
+    // Provenance: wave-polish-matrix-6. The forks pager's 41-row boundary is
+    // the fsx matrix's; the watchers page (the SAME SOCIAL_PAGE_SIZE pager
+    // over a different listing) never had a pager test at all — this pins
+    // the exact-boundary arm (a full page does NOT offer an Older link) and
+    // the org-home pagination's bare-canonical Newer href at page 2.
+    await ensureW129Bulk();
+    const first = await fetchUi("/wave24-owner/w129-bulk/watchers");
+    expect(first.status).toBe(200);
+    const firstHtml = await first.text();
+    expect(cardCount(firstHtml)).toBe(40);
+    expect(firstHtml).toContain("Watchers");
+    expect(firstHtml).not.toContain("<span class=\"navigation_label\">"); // page 1 + !more → no pager
+
+    const second = await fetchUi("/wave24-owner/w129-bulk/watchers?page=2");
+    expect(second.status).toBe(200);
+    const secondHtml = await second.text();
+    expect(cardCount(secondHtml)).toBe(0);
+    // The user_cards template has NO else arm upstream — the bare empty ul,
+    // NOT the forks family's no-results line.
+    expect(secondHtml).not.toContain("No matching results found.");
+    // Newer onto page 1 carries the bare canonical href (page 2 → page>2 is
+    // false, the org-home pager drops the param).
+    expect(secondHtml).toContain('<a class="item navigation" href="/wave24-owner/w129-bulk/watchers">');
+    expect(secondHtml).toContain("<span class=\"navigation_label\">Newer</span>");
+    expect(secondHtml).not.toContain(">Older</span>");
+  });
+
+  it("the stargazers' past-the-end arm: a bare empty ul beside the Newer pager, never the no-results line (the forks differential)", async () => {
+    // Provenance: wave-polish-matrix-6. The fsx matrix pins forks?page=99
+    // rendering "No matching results found." — this pins the stars twin:
+    // 45 stargazers, page 99, the same fork-list vs user-cards empty-shape
+    // divergence at the router level.
+    await ensureWave24Fixtures();
+    const far = await fetchUi("/wave24-owner/paint/stars?page=99");
+    expect(far.status).toBe(200);
+    const farHtml = await far.text();
+    expect(cardCount(farHtml)).toBe(0);
+    expect(farHtml).not.toContain("No matching results found.");
+    // Newer points one page back (99 → 98); no Older (page 99 still holds
+    // no rows beyond the 45).
+    expect(farHtml).toContain('<a class="item navigation" href="/wave24-owner/paint/stars?page=98">');
+    expect(farHtml).toContain("<span class=\"navigation_label\">Newer</span>");
+    expect(farHtml).not.toContain(">Older</span>");
   });
 });

@@ -31,6 +31,29 @@
  *   - the thread-link shapes: a pull thread anchors /pulls/N (wave10 only pins the
  *     /issues/N shape) and the shared/issueicon glyph machine over the pull state
  *     (open / WIP draft / closed / merged) plus the closed-issue glyph.
+ *
+ * w129 additions (wave-polish-matrix-6, 2026-10-27) — the batch-6 deepening of
+ * the notification surfaces, still arms wave10 does not carry:
+ *
+ *   - the tab chrome arms: the read tab never renders the mark-all (purge)
+ *     button even with a positive unread count (the badge stays the LIVE
+ *     unread count there), and the div-only fragment carries the same header
+ *     chrome the full page does (the bundle morphs the whole div);
+ *   - the ?type vocabulary: the brief's "?all state" — `?type=all` degrades
+ *     to the unread tab (upstream's page vocabulary is unread|read at the
+ *     pin, notification.go:70-71's Iif on "read"), and the legacy `?q=`
+ *     page-type param (upstream notification.go:69 `FormString("type",
+ *     FormString("q"))`) is NOT honored by the landed parse — a documented
+ *     divergence pinned at its current posture;
+ *   - the purge-page dead surface: upstream's NotificationPurgePagePost
+ *     (notification.go:207-218) / the mark_page_as_read button are reduced
+ *     away (the module header's degradation) — no purge-page chrome renders
+ *     on a populated unread tab and the POST tail is unclaimed end-to-end
+ *     (parse null, router 404, D1 untouched);
+ *   - the status polling seam's method shape: a stray POST onto the
+ *     GET-only /notifications/new channel falls through to the plain 404
+ *     (asymmetric with the POST tails' GET 405 — pinned as answered) and
+ *     mutates nothing.
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
@@ -44,7 +67,7 @@ import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
 import { notificationStates, pullRequests } from "../../db/schema";
 import type { UiManifest } from "../manifest";
-import { uiRouter, type UiAssetsFetcher } from "../index";
+import { uiRouter, handlesUiRoute, parseUiRoute, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { RepoRow } from "../ui-context";
 
@@ -581,5 +604,168 @@ describe("the thread-link and glyph shapes (pulls + the issueicon machine)", () 
     // Every row stays unread for alice (no state rows were written — closing
     // only adds a system comment): data-status 1 across the board.
     expect((html.match(/data-status="1"/g) ?? []).length).toBe(3);
+  });
+});
+
+// --- w129 additions (wave-polish-matrix-6, 2026-10-27) ----------------------------
+// The tab chrome arms, the ?type vocabulary, the purge-page dead surface and
+// the polling seam's method shape — provenance in the file header.
+
+describe("the tab chrome arms (the mark-all button and the live badge)", () => {
+  it("the read tab never carries the mark-all button even with a positive unread count, and the badge still shows that live count", async () => {
+    // Provenance: wave-polish-matrix-6. wave10 pins the button's PRESENCE on
+    // the unread tab and the read tab's placeholder only — the header's
+    // `!isRead && unreadCount > 0` gate has its read arm unpinned.
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    await seedThread(repo.id, bob.id, at(10));
+
+    const res = await fetchUi("/notifications?type=read", { headers: { cookie: await sessionHeader(alice.id) } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<a class="active item" href="/notifications?type=read">');
+    expect(html).toContain("No read notifications.");
+    // The purge entry is suppressed on the read tab…
+    expect(html).not.toContain('data-url="/notifications/purge"');
+    expect(html).not.toContain("Mark all as read");
+    // …while the unread tab's badge keeps the LIVE mailbox count (the tab
+    // menus' count is the navbar's per-request COUNT, not the tab's rows).
+    expect(html).toContain('<div class="notifications-unread-count ui label">1</div>');
+  });
+
+  it("the div-only fragment carries the same header chrome the page does (the mark-all button rides the morph)", async () => {
+    // Provenance: wave-polish-matrix-6. wave10 pins the fragment's div shell
+    // and sequence passthrough on an EMPTY mailbox (carol) — never the
+    // chrome a populated fragment must carry for the live-refresh parity.
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    await seedThread(repo.id, bob.id, at(10));
+
+    const res = await fetchUi("/notifications?div-only=1", { headers: { cookie: await sessionHeader(alice.id) } });
+    expect(res.status).toBe(200);
+    const fragment = await res.text();
+    expect(fragment.startsWith("<!DOCTYPE html>")).toBe(false);
+    expect(fragment).toContain('id="notification_div"');
+    // The unread tab is active inside the fragment and the mark-all button
+    // (with its purge data-url) is present — the whole flex-left-right
+    // header block is part of the morphed div.
+    expect(fragment).toContain('<a class="active item" href="/notifications?type=unread">');
+    expect(fragment).toContain('data-url="/notifications/purge"');
+    expect(fragment).toContain('data-status="1"');
+  });
+});
+
+describe("the ?type vocabulary (the ?all state and the legacy q param)", () => {
+  it("?type=all degrades to the unread tab — upstream's page vocabulary is unread|read at the pin, there is no third tab", async () => {
+    // Provenance: wave-polish-matrix-6 (the brief's "?all state"). upstream
+    // prepareUserNotificationsData (notification.go:70-71) folds every
+    // non-"read" value onto the unread status — parseNotificationPageType's
+    // default arm matches verbatim; the sibling junk arm in this file uses
+    // "past", this pins the alluring "all" value itself.
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    const thread = await seedThread(repo.id, bob.id, at(10));
+
+    const res = await fetchUi("/notifications?type=all", { headers: { cookie: await sessionHeader(alice.id) } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The unread tab is the active arm and its rows render (the degrade is
+    // silent — never an error, never an empty tab).
+    expect(html).toContain('<a class="active item" href="/notifications?type=unread">');
+    expect(html).toContain('<a class="item" href="/notifications?type=read">');
+    expect(html).toContain(`id="notification_${thread.id}"`);
+    expect(html).toContain('data-status="1"');
+    // No page anchor advertises an "all" tab.
+    expect(html).not.toContain("type=all");
+  });
+
+  it("the legacy ?q= page-type param is NOT honored (upstream notification.go:69 reads type, then q — the landed parse reads type only; divergence pinned at its current posture)", async () => {
+    // Provenance: wave-polish-matrix-6. Upstream's
+    // `pageType := ctx.FormString("type", ctx.FormString("q"))` treats q as
+    // the legacy alias for the tab; the landed handler passes
+    // searchParams.get("type") alone, so ?q=read answers the UNREAD tab
+    // with its rows. This pin makes the divergence visible to the wiring
+    // wave that may adopt the alias.
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    const thread = await seedThread(repo.id, bob.id, at(10));
+
+    const res = await fetchUi("/notifications?q=read", { headers: { cookie: await sessionHeader(alice.id) } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The unread tab (NOT q=read's read tab) is active with the unread row.
+    expect(html).toContain('<a class="active item" href="/notifications?type=unread">');
+    expect(html).toContain(`id="notification_${thread.id}"`);
+    expect(html).toContain('data-status="1"');
+    expect(html).not.toContain('<a class="active item" href="/notifications?type=read">');
+  });
+});
+
+describe("the purge-page dead surface (the mark_page_as_read reduction)", () => {
+  it("no purge-page chrome renders even on a populated unread tab (the CurUnreadNotificationIDs channel is unrendered)", async () => {
+    // Provenance: wave-polish-matrix-6. The module header documents
+    // mark_page_as_read (upstream NotificationPurgePagePost,
+    // notification.go:207-218, and its button in notification_div.tmpl's
+    // CurUnreadNotificationIDs arm) as a dead surface — this pins the
+    // absence against a mailbox that HAS unread rows for it.
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    await seedThread(repo.id, bob.id, at(10));
+
+    const res = await fetchUi("/notifications", { headers: { cookie: await sessionHeader(alice.id) } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The mark-all (purge) button IS the live control…
+    expect(html).toContain('data-url="/notifications/purge"');
+    // …and nothing of the purge-page twin exists: not its route tail, not
+    // its tooltip literal (notification.mark_page_as_read).
+    expect(html).not.toContain("purge-page");
+    expect(html).not.toContain("mark_page_as_read");
+    expect(html).not.toContain("Mark page as read");
+  });
+
+  it("POST /notifications/purge-page is unclaimed end-to-end and writes nothing", async () => {
+    // Provenance: wave-polish-matrix-6 — the route-level half of the dead
+    // surface: the UI family claims only new/status/purge, so the tail
+    // parses null and the POST falls through to the engine's 404.
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    await seedThread(repo.id, bob.id, at(10));
+    const cookie = await sessionHeader(alice.id);
+
+    expect(parseUiRoute("/notifications/purge-page")).toBeNull();
+    expect(handlesUiRoute("/notifications/purge-page")).toBe(false);
+
+    const res = await postArm("/notifications/purge-page", cookie, { ids: "1,2" });
+    expect(res.status).toBe(404);
+    // Nothing was marked: the mailbox keeps its unread thread.
+    expect(await stateRows(alice.id)).toEqual([]);
+    await expectUnreadCount(cookie, 1);
+  });
+});
+
+describe("the status polling seam's method shape (GET /notifications/new)", () => {
+  it("POST on the GET-only seam falls through to the plain 404 and mutates nothing (asymmetric with the POST tails' GET 405 — pinned as answered)", async () => {
+    // Provenance: wave-polish-matrix-6. wave10 pins 405 for GET on the two
+    // POST tails; the mirror probe (POST on this GET literal) answers the
+    // plain engine 404, not chi's method mismatch — the seam silently
+    // ignores stray form posts.
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    await seedThread(repo.id, bob.id, at(10));
+    const cookie = await sessionHeader(alice.id);
+
+    const res = await postArm("/notifications/new", cookie, null);
+    expect(res.status).toBe(404);
+    // The seam's read-back is unchanged: the badge channel still answers
+    // the count JSON for the polling loop.
+    await expectUnreadCount(cookie, 1);
   });
 });

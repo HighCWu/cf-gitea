@@ -6,6 +6,15 @@
  * budget, and the §4.4 home page without a README. Engine data comes from
  * synthetic EngineClient stubs; rendering via hono/jsx renderToString —
  * same harness as shell.test.tsx.
+ *
+ * w129 additions (wave-polish-matrix-6, 2026-10-27) — the repo home's
+ * quick-start/empty-state deepening, in the home describe + the new
+ * resolveHeadBranch describe (still stub-driven, the file's harness): the
+ * §4.1 empty-TREE arm (refs resolve, zero entries), the clone-command and
+ * create-by-push hint shapes (both <pre> blocks verbatim, the default-branch
+ * echo), and the §4.9 resolveHeadBranch fallback chain (head-wins, stale
+ * HEAD, non-branch HEAD, tags carried, no-branches null) plus the home
+ * README's 512KiB cap boundary (the file-view §4.3 cap's home twin).
  */
 
 import { describe, expect, it } from "vitest";
@@ -15,7 +24,7 @@ import type { EngineClient } from "../engine";
 import { ENRICH_MAX } from "../page-data";
 import type { RefsResult, TreeEntryJson, CommitJson } from "@cf-gitea/git-engine";
 import { loadFileViewData, FileViewPage } from "./file-view";
-import { loadHomeData, HomePage } from "./home";
+import { loadHomeData, HomePage, resolveHeadBranch } from "./home";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -148,6 +157,180 @@ describe("loadHomeData + HomePage degradation paths", () => {
     });
     const data = await loadHomeData(engine, repo, ctx.origin);
     expect(data.refs.headBranch).toBe("main");
+  });
+
+  it("degrades the empty TREE to the quick-start render with the refs intact (§4.1's zero-entries arm)", async () => {
+    // Provenance: wave-polish-matrix-6 — the sibling of the unborn-HEAD arm
+    // above: listRefs resolves a real HEAD but listTree answers zero entries
+    // (an initialized repo with no files), loadHomeData returns the empty
+    // shape WITH the resolved refs and the page renders the quick start.
+    let commitCalls = 0;
+    const engine = stubEngine({
+      listTree: () => Promise.resolve({ oid: "3".repeat(40), entries: [] }),
+      readCommit: () => {
+        commitCalls++;
+        return Promise.resolve(makeCommit("head subject", "a".repeat(40)));
+      },
+    });
+    const data = await loadHomeData(engine, repo, ctx.origin);
+    expect(data.isEmpty).toBe(true);
+    expect(data.refs.headBranch).toBe("main"); // the refs survive the empty tree
+    expect(data.entries).toEqual([]);
+    expect(data.latestCommit).toBeNull(); // the empty shape wins over the read commit
+    const html = renderToString(<HomePage ctx={ctx} data={data} />);
+    expect(html).toContain('class="page-content repository quickstart"');
+    expect(html).toContain("https://test.local/octocat/hello.git");
+    expect(html).not.toContain("repo-files-table");
+    // The read commit raced the tree read (Promise.all) but its subject
+    // never renders — the empty-repo page replaces the whole body.
+    expect(commitCalls).toBe(1);
+    expect(html).not.toContain("head subject");
+  });
+
+  it("renders both quick-start command blocks verbatim with the clone URL and the push hint (the §4.1 shapes)", async () => {
+    // Provenance: wave-polish-matrix-6 — the unborn arm above pins only the
+    // clone URL; the two command <pre> blocks' shapes (the create-from-
+    // scratch recipe and the push-existing hint) were unpinned.
+    const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
+    const data = await loadHomeData(engine, repo, ctx.origin);
+    const html = renderToString(<HomePage ctx={ctx} data={data} />);
+    // The headline + the two block headers (upstream repo/empty.tmpl's
+    // analog shapes).
+    expect(html).toContain("This repository is empty. Push to create it");
+    expect(html).toContain("Create a new repository on the command line");
+    expect(html).toContain("Push an existing repository");
+    // The create-from-scratch recipe: the full sequence with the origin
+    // clone URL and the default-branch push hint.
+    expect(html).toContain("touch README.md");
+    expect(html).toContain("git init");
+    expect(html).toContain("git add .");
+    // The commit subject's quotes are HTML-escaped in the pre text (hono/jsx).
+    expect(html).toContain("git commit -m &quot;first commit&quot;");
+    expect(html).toContain("git remote add origin https://test.local/octocat/hello.git");
+    expect(html).toContain("git push -u origin main");
+    // The push-existing hint is the remote+push pair only (no init recipe).
+    expect(html.match(/git remote add origin https:\/\/test\.local\/octocat\/hello\.git/g)?.length).toBe(2);
+    expect(html.match(/git push -u origin main/g)?.length).toBe(2);
+  });
+
+  it("echoes the repo's D1 default branch in the push hint, not a hardcoded main", async () => {
+    // Provenance: wave-polish-matrix-6 — the push hint's branch token rides
+    // repo.defaultBranch (EmptyRepoPage's template literal); pinned with a
+    // non-main default so a hardcoded "main" would fail.
+    const trunkCtx: UiContext = { ...ctx, repo: { ...repo, defaultBranch: "trunk" } };
+    const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
+    const data = await loadHomeData(engine, trunkCtx.repo as RepoRow, ctx.origin);
+    const html = renderToString(<HomePage ctx={trunkCtx} data={data} />);
+    expect(html).toContain("git push -u origin trunk");
+    expect(html).not.toContain("git push -u origin main");
+  });
+
+  it("skips the README when the entry exceeds the 512KiB cap and never calls readBlob (the home twin of §4.3)", async () => {
+    // Provenance: wave-polish-matrix-6 — loadHomeData's size gate
+    // (`(readmeEntry.size ?? 0) <= 512 * 1024`) decides BEFORE readBlob like
+    // file view's §4.3 prompt; the home arm was unpinned at both boundary
+    // sides.
+    let blobCalls = 0;
+    const engine = stubEngine({
+      listTree: () =>
+        Promise.resolve({ oid: "3".repeat(40), entries: [entry("README.md", { size: 512 * 1024 + 1 })] }),
+      readBlob: () => {
+        blobCalls++;
+        return Promise.resolve({ oid: "2".repeat(40), mode: "100644", data: new Uint8Array([1]) });
+      },
+    });
+    const data = await loadHomeData(engine, repo, ctx.origin);
+    expect(data.readme).toBeNull();
+    expect(blobCalls).toBe(0);
+    const html = renderToString(<HomePage ctx={ctx} data={data} />);
+    expect(html).toContain('id="repo-files-table"'); // the listing still renders
+    expect(html).not.toContain('id="readme"');
+  });
+
+  it("admits a README at exactly the 512KiB cap (the boundary's other side)", async () => {
+    const engine = stubEngine({
+      listTree: () => Promise.resolve({ oid: "3".repeat(40), entries: [entry("README.md", { size: 512 * 1024 })] }),
+    });
+    const data = await loadHomeData(engine, repo, ctx.origin);
+    expect(data.readme).not.toBeNull();
+    expect(data.readme?.variant).toBe("markup"); // the stub's markdown body renders
+  });
+});
+
+// --- §4.9 resolveHeadBranch (the default-branch fallback chain) -------------------
+
+describe("resolveHeadBranch (the §4.9 fallback chain, pure)", () => {
+  it("the DO's HEAD wins when it names an existing branch", () => {
+    // Provenance: wave-polish-matrix-6 — the chain's FIRST arm was only
+    // exercised transitively (refsResult's head=main + defaultBranch=main
+    // agree); the head-over-default precedence is pinned directly.
+    const resolved = resolveHeadBranch(
+      {
+        head: "refs/heads/develop",
+        refs: [
+          { name: "refs/heads/main", target: "a".repeat(40) },
+          { name: "refs/heads/develop", target: "b".repeat(40) },
+        ],
+      },
+      "main",
+    );
+    expect(resolved.headBranch).toBe("develop");
+    // branches split in the refs' own order (main first here).
+    expect(resolved.branches).toEqual(["main", "develop"]);
+  });
+
+  it("a STALE HEAD (naming a deleted branch) falls to the D1 default branch, then the first branch", () => {
+    // Provenance: wave-polish-matrix-6 — the stale-HEAD arm (head startsWith
+    // refs/heads/ but the branch is gone) and the default-branch-missing
+    // second fallback were unpinned.
+    const stale = resolveHeadBranch(
+      {
+        head: "refs/heads/gone",
+        refs: [
+          { name: "refs/heads/main", target: "a".repeat(40) },
+          { name: "refs/heads/develop", target: "b".repeat(40) },
+        ],
+      },
+      "main",
+    );
+    expect(stale.headBranch).toBe("main");
+    const noDefault = resolveHeadBranch(
+      {
+        head: "refs/heads/gone",
+        refs: [
+          { name: "refs/heads/topic", target: "c".repeat(40) },
+          { name: "refs/heads/develop", target: "b".repeat(40) },
+        ],
+      },
+      "trunk", // not among the branches → the first branch wins
+    );
+    expect(noDefault.headBranch).toBe("topic");
+  });
+
+  it("a non-branch HEAD (a tag) is ignored; branches and tags split correctly; no branches at all resolves null", () => {
+    // Provenance: wave-polish-matrix-6 — the non-refs/heads HEAD arm and the
+    // no-branches null (unborn) with tags-only refs were unpinned.
+    const tagged = resolveHeadBranch(
+      {
+        head: "refs/tags/v1",
+        refs: [
+          { name: "refs/heads/main", target: "a".repeat(40) },
+          { name: "refs/tags/v1", target: "d".repeat(40) },
+        ],
+      },
+      "main",
+    );
+    expect(tagged.headBranch).toBe("main");
+    expect(tagged.tags).toEqual(["v1"]);
+    expect(tagged.branches).toEqual(["main"]);
+
+    const unborn = resolveHeadBranch(
+      { head: "refs/heads/main", refs: [{ name: "refs/tags/v1", target: "d".repeat(40) }] },
+      "main",
+    );
+    expect(unborn.headBranch).toBeNull();
+    expect(unborn.tags).toEqual(["v1"]);
+    expect(unborn.branches).toEqual([]);
   });
 });
 

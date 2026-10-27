@@ -23,6 +23,17 @@
  * + one engine-seeded repo): milestones/issues/labels riding the landed
  * IssuesService + label arms, identities riding minted session cookies,
  * POSTs carrying the same-origin Origin header.
+ *
+ * w129 additions (wave-polish-matrix-6, 2026-10-27) — the fork form's
+ * owner-select arms, appended as the trailing w129 describe on self-contained
+ * wave129-* fixtures (the committed wave26 fixtures stay untouched): the
+ * strict load predicate's REFUSAL arms — the doer who already forked loses
+ * his option into the no-valid-owners render, the HasForkedRepo org filter
+ * dropping an org that holds a fork, the canCreateOrgRepo refusal hiding a
+ * grant-less member's org — and the write's re-gates the GET never shows:
+ * the blocked-by-source-owner arm (ForkRepository's blocked check), the
+ * target-owner name collision (IsErrRepoAlreadyExist's re-render), and the
+ * ContextUser fallback preselecting the first org for a source owner.
  */
 
 import { env } from "cloudflare:test";
@@ -33,6 +44,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { addOrUpdateCollaborator } from "../../api/services/repo-collaborators";
+import { BLOCKED_USER_MESSAGE, blockPartyFromUserRow, blockUser } from "../../api/services/blocks";
 import { createRepoLabel } from "../../api/services/labels";
 import { createRepoMilestone } from "../../api/services/milestones";
 import { milestones, repositories, users } from "../../db/schema";
@@ -637,5 +649,264 @@ describe("wave-26 a11y smoke", () => {
       const violations = runA11y(await res.text());
       expect(violations, `${path}: ${JSON.stringify(violations)}`).toEqual([]);
     }
+  });
+});
+
+// --- w129 additions (wave-polish-matrix-6, 2026-10-27) ---------------------------
+// The fork form's owner-select arms: the strict load predicate's refusals and
+// the write's re-gates. Provenance in the file header. Every arm below seeds
+// its own wave129-* users/orgs (the committed wave26 fixture is read, never
+// reshaped), so the block is order-independent.
+
+/** The users-table id of a fixture identity (orgs ARE user rows). */
+async function w129UserId(username: string): Promise<number> {
+  const row = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, username)).get();
+  if (row === undefined) throw new Error(`w129 identity missing: ${username}`);
+  return row.id;
+}
+
+describe("w129 the fork form's owner-select refusals (the strict predicate + the write's re-gates)", () => {
+  it("a doer who already forked loses his option into the no-valid-owners render (the CanForkToUser drop)", async () => {
+    // Provenance: wave-polish-matrix-6. wave26 pins the no-valid-owners arm
+    // only for the SOURCE OWNER (no orgs); the doer-fork drop of the same
+    // arm — findForkByOwner(d1, source, doer) in loadRepoForkData — was
+    // unpinned. Post: uid:"" + cookie (303) → GET shows the refusal.
+    const reforker = await seedVerifiedUser({ username: "wave129-refork" });
+    const created = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      formPost("/wave26-owner/tracked/fork", { uid: "", repo_name: "w129-refork-copy" }, await mintSession(env.DB, reforker.id)),
+    );
+    expect(created.status).toBe(303);
+    expect(created.headers.get("location")).toBe("/wave129-refork/w129-refork-copy");
+
+    const form = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      withCookie("/wave26-owner/tracked/fork", await mintSession(env.DB, reforker.id)),
+    );
+    expect(form.status).toBe(200);
+    const html = await form.text();
+    expect(html).toContain("This repository cannot be forked because there are no valid owners.");
+    expect(html).toContain("ui primary button disabled");
+    expect(html).not.toContain(">wave129-refork</option>"); // the doer option is gone
+  });
+
+  it("an org holding a fork of the source drops out of the org options (HasForkedRepo), the doer option stays", async () => {
+    // Provenance: wave-polish-matrix-6 — the fork-load predicate's third
+    // filter (upstream fork.go's HasForkedRepo arm, the module header's
+    // "MINUS … every org that already holds a fork"): wave26 pins the org
+    // fork WRITE but never the option's subsequent disappearance.
+    const orgForker = await seedVerifiedUser({ username: "wave129-orgfw" });
+    await new OrgService(env.DB).createOrg({
+      name: "wave129orgfw",
+      ownerId: orgForker.id,
+      visibility: "public",
+      fullName: "W129 HasForked Org",
+      now: new Date(1_700_000_000 * 1000),
+    });
+    const orgId = await w129UserId("wave129orgfw");
+
+    const before = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      withCookie("/wave26-owner/tracked/fork", await mintSession(env.DB, orgForker.id)),
+    );
+    expect(before.status).toBe(200);
+    expect(await before.text()).toContain(">wave129orgfw</option>"); // grantable org listed
+
+    const created = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      formPost("/wave26-owner/tracked/fork", { uid: String(orgId), repo_name: "w129-orgfw-copy" }, await mintSession(env.DB, orgForker.id)),
+    );
+    expect(created.status).toBe(303);
+    expect(created.headers.get("location")).toBe("/wave129orgfw/w129-orgfw-copy");
+
+    const after = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      withCookie("/wave26-owner/tracked/fork", await mintSession(env.DB, orgForker.id)),
+    );
+    expect(after.status).toBe(200);
+    const html = await after.text();
+    expect(html).not.toContain(">wave129orgfw</option>"); // the fork-holding org is dropped
+    expect(html).toContain(">wave129-orgfw</option>"); // the doer option survives (the fork is the ORG's)
+  });
+
+  it("a member without the create-repo grant never sees the org option, and the forged org uid POST re-gates with the 403 message", async () => {
+    // Provenance: wave-polish-matrix-6 — the canCreateOrgRepo refusal at the
+    // LOAD level (the option silently dropped) crossed with the WRITE's
+    // requireCanCreateOrgRepo re-gate (the ApiError 403 message rendered —
+    // wave26 pinned only the 404-shaped unknown-org message).
+    const orgOwner = await seedVerifiedUser({ username: "wave129-orgownern" });
+    const member = await seedVerifiedUser({ username: "wave129-membern" });
+    const org = await new OrgService(env.DB).createOrg({
+      name: "wave129orgn",
+      ownerId: orgOwner.id,
+      visibility: "public",
+      fullName: "W129 No-Grant Org",
+      now: new Date(1_700_000_000 * 1000),
+    });
+    await new OrgService(env.DB).addMember(org.id, member.id); // plain membership, no team grant
+
+    const form = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      withCookie("/wave26-owner/tracked/fork", await mintSession(env.DB, member.id)),
+    );
+    expect(form.status).toBe(200);
+    const html = await form.text();
+    expect(html).not.toContain(">wave129orgn</option>"); // the grant-less org is hidden
+    expect(html).toContain(">wave129-membern</option>"); // the doer option remains
+
+    const refused = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      formPost(
+        "/wave26-owner/tracked/fork",
+        { uid: String(org.id), repo_name: "w129-nope" },
+        await mintSession(env.DB, member.id),
+      ),
+    );
+    expect(refused.status).toBe(200); // re-render, not a redirect
+    expect(await refused.text()).toContain("User is not allowed to create repositories in this organization.");
+  });
+
+  it("a doer blocked by the source owner still renders the GET but the POST re-renders with the blocked message", async () => {
+    // Provenance: wave-polish-matrix-6 — ForkRepository's blocked arm
+    // (isUserBlockedBy in createForkFromForm, upstream fork.go's blocked
+    // check) was unpinned at the web-form level; the GET's asymmetry (the
+    // load predicate has no block check) is pinned with it.
+    const blocked = await seedVerifiedUser({ username: "wave129-blocked" });
+    const ownerRow = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "wave26-owner")).get();
+    const blockedRow = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "wave129-blocked")).get();
+    if (ownerRow === undefined || blockedRow === undefined) throw new Error("w129 block rows missing");
+    await blockUser(
+      env.DB,
+      { id: ownerRow.id, isAdmin: false },
+      blockPartyFromUserRow(ownerRow),
+      blockPartyFromUserRow(blockedRow),
+      "w129 fork-block",
+    );
+
+    // The GET renders (the block gates the WRITE, not the form).
+    const form = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      withCookie("/wave26-owner/tracked/fork", await mintSession(env.DB, blocked.id)),
+    );
+    expect(form.status).toBe(200);
+    expect(await form.text()).toContain(">wave129-blocked</option>");
+
+    const refused = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      formPost(
+        "/wave26-owner/tracked/fork",
+        { uid: "", repo_name: "w129-blocked-copy" },
+        await mintSession(env.DB, blocked.id),
+      ),
+    );
+    expect(refused.status).toBe(200);
+    expect(await refused.text()).toContain(BLOCKED_USER_MESSAGE);
+
+    // D1 read-back: no fork row landed.
+    const fork = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, "wave129-blocked"), eq(repositories.forkParent, wave26Fixture!.trackedId)))
+      .get();
+    expect(fork).toBeUndefined();
+  });
+
+  it("a name collision under the target owner re-renders with the same-name message (IsErrRepoAlreadyExist's web arm)", async () => {
+    // Provenance: wave-polish-matrix-6 — the RepoNameCollisionError →
+    // repoForkLocale.new_owner_has_same_repo re-render was unpinned (the API
+    // route pins its own 422 twin; the form's message arm did not exist in
+    // the wave26 matrix).
+    const orgOwner = await seedVerifiedUser({ username: "wave129-orgownerc" });
+    const org = await new OrgService(env.DB).createOrg({
+      name: "wave129orgc",
+      ownerId: orgOwner.id,
+      visibility: "public",
+      fullName: "W129 Collision Org",
+      now: new Date(1_700_000_000 * 1000),
+    });
+    // A NON-fork repo under the org: the collision source (a fork of tracked
+    // would trip the GetUserFork redirect first).
+    await new RepoService(env.DB).create({
+      owner: { id: org.id, usernameLower: "wave129orgc" },
+      name: "occupied",
+      isPrivate: false,
+      status: "ready",
+    });
+
+    const res = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      formPost(
+        "/wave26-owner/tracked/fork",
+        { uid: String(org.id), repo_name: "occupied" },
+        await mintSession(env.DB, orgOwner.id),
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("The new owner already has a repository with same name. Please choose another name.");
+
+    // D1 read-back: no fork row landed under the org.
+    const fork = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, "wave129orgc"), eq(repositories.forkParent, wave26Fixture!.trackedId)))
+      .get();
+    expect(fork).toBeUndefined();
+  });
+
+  it("a source owner WITH an org grant preselects the first org (the ContextUser fallback arm)", async () => {
+    // Provenance: wave-polish-matrix-6 — upstream ContextUser's else branch
+    // (fork.go: the doer when forkable, ELSE the first org) was unpinned:
+    // wave26's owner arm has no orgs (the no-valid-owners render) and every
+    // other arm has the doer option, so the org-preselected select never
+    // rendered in the committed matrix.
+    await ensureSeededRepo({
+      owner: "wave129-srcown",
+      slug: "w129-sourced",
+      commits: WAVE26_COMMITS,
+    });
+    const srcOwner = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "wave129-srcown"))
+      .get(); // ensureSeededRepo seeded the owner row — look it up, never re-seed
+    if (srcOwner === undefined) throw new Error("w129 source-owner row missing");
+    const org = await new OrgService(env.DB).createOrg({
+      name: "wave129srcorg",
+      ownerId: srcOwner.id,
+      visibility: "public",
+      fullName: "W129 Source Owner Org",
+      now: new Date(1_700_000_000 * 1000),
+    });
+
+    const form = await fetchUi(
+      "/wave129-srcown/w129-sourced/fork",
+      withCookie("/wave129-srcown/w129-sourced/fork", await mintSession(env.DB, srcOwner.id)),
+    );
+    expect(form.status).toBe(200);
+    const html = await form.text();
+    // No doer option (the source owner is dropped by the between-owners
+    // check) and the org option carries the SELECTED attribute (hono/jsx
+    // emits the boolean attribute in its `=""` form).
+    expect(html).not.toContain(">wave129-srcown</option>");
+    expect(html).toContain(`<option value="${org.id}" selected="">wave129srcorg</option>`);
+    expect(html).not.toContain(`value="${org.id}" >wave129srcorg</option>`); // never the unselected form
+  });
+
+  it("a junk uid parses to null and rides the doer target through the existing-fork redirect", async () => {
+    // Provenance: wave-polish-matrix-6 — parseRepoForkForm's numeric-or-null
+    // uid arm exercised at the route: the wave26 forker's fork exists (the
+    // committed matrix created it), so the doer-mapped junk uid answers the
+    // GetUserFork 303 instead of a write.
+    const forkerId = await w129UserId("wave26-forker"); // the committed fixture's identity — never re-seeded
+    const res = await fetchUi(
+      "/wave26-owner/tracked/fork",
+      formPost(
+        "/wave26-owner/tracked/fork",
+        { uid: "not-a-number", repo_name: "w129-junk-uid" },
+        await mintSession(env.DB, forkerId),
+      ),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/wave26-forker/tracked-copy");
   });
 });
