@@ -8,6 +8,11 @@
 import { describe, expect, it } from "vitest";
 
 import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } from "./a11y";
+// Pages wave 129: the four expansion goldens (goldens.test.ts's
+// NEW_GOLDEN_CASES) — covered EXPLICITLY by the expansion arms below, never
+// through harness.ts's GOLDEN_CASES (that table feeds the smoke loop above
+// too; entries added there would silently grow this suite without review).
+import adminUsersGolden from "./goldens/admin-users.html?raw";
 import bareShellGolden from "./goldens/bare-shell.html?raw";
 import branchesGolden from "./goldens/branches.html?raw";
 import commitViewGolden from "./goldens/commit-view.html?raw";
@@ -31,6 +36,7 @@ import landingGolden from "./goldens/landing.html?raw";
 import labelsGolden from "./goldens/labels.html?raw";
 import labelsWriterGolden from "./goldens/labels-writer.html?raw";
 import milestonesClosedGolden from "./goldens/milestones-closed.html?raw";
+import milestoneDetailGolden from "./goldens/milestone-detail.html?raw";
 import milestonesOpenGolden from "./goldens/milestones-open.html?raw";
 import notFoundRepoGolden from "./goldens/not-found-repo.html?raw";
 import orgLabelsGolden from "./goldens/org-labels.html?raw";
@@ -44,6 +50,7 @@ import pullCommitsGolden from "./goldens/pull-commits.html?raw";
 import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullReviewSignedInGolden from "./goldens/pull-review-signed-in.html?raw";
+import profileWatchingGolden from "./goldens/profile-watching.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
 // Pages wave 19: the creation pages — the new-repository form (the
 // org-bearing owner select) and the new-organization form.
@@ -59,6 +66,7 @@ import settingsMirrorGolden from "./goldens/settings-mirror.html?raw";
 import settingsTeamAdminGolden from "./goldens/settings-team-admin.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
 import userProfileGolden from "./goldens/user-profile.html?raw";
+import userSettingsAccountGolden from "./goldens/user-settings-account.html?raw";
 import userSettingsProfileGolden from "./goldens/user-settings-profile.html?raw";
 import { GOLDEN_CASES } from "./harness";
 
@@ -219,6 +227,217 @@ describe("§5.5 a11y smoke over the goldens", () => {
     expect(tabItems.map((el) => hasClass(el, "active"))).toEqual([true, false]);
     expect(tabItems[0] ? accessibleName(tabItems[0]) : "").toBe("2 Open");
     expect(tabItems[1] ? accessibleName(tabItems[1]) : "").toBe("1 Closed");
+  });
+});
+
+// --- the wave-129 expansion arms (explicit; deliberately not the shared table) ---
+
+/**
+ * The wave-129 expansion goldens (goldens.test.ts's NEW_GOLDEN_CASES — the
+ * four most regression-prone of the newly mounted surfaces) get a11y coverage
+ * HERE, as explicit local cases: they are deliberately absent from
+ * harness.ts's GOLDEN_CASES because the smoke loop above iterates that table
+ * too — entries added there would silently grow this suite without review.
+ * The same no-silent-growth rule, made deliberate: this arm table lands
+ * together with its assertions and is reviewed as one unit.
+ *
+ * Every case pins the shared §2.4.1 shell contract (nav#navbar's label,
+ * exactly one [role="main"] carrying its aria-label plus the page
+ * discriminator class tokens, the footer landmark) and the runA11y state of
+ * the committed bytes; the surface-specific arms (sidebar menus, repo/user
+ * header, tab-strip accessible-name shapes) follow the loop.
+ */
+
+interface ExpansionArm {
+  file: string;
+  golden: string;
+  /** The §2.4.1 discriminator: role=main's aria-label plus the class tokens
+   *  after the leading "page-content". */
+  mainAriaLabel: string;
+  mainClassTokens: string[];
+  /** Declared count of R6 "<th> without scope" violations in the committed
+   *  bytes — 9 for admin-users (the KNOWN GAP below), 0 elsewhere. */
+  thWithoutScope: number;
+}
+
+const EXPANSION_ARMS: ExpansionArm[] = [
+  // KNOWN GAP (wave-129, disclosed here rather than hidden): the sortable
+  // users table renders its nine <th> header cells without explicit scope
+  // attributes, so R6 fires once per cell — the ONLY rule violation across
+  // the four surfaces (everything else in the four goldens is clean). The
+  // honest fix is a component edit + a golden byte regeneration (the admin
+  // users page and goldens/admin-users.html sit outside this file's wave
+  // ownership), so the case pins the gap exactly: the count can neither grow
+  // silently nor disappear without this assertion demanding the flip to a
+  // clean-membership arm.
+  { file: "admin-users.html", golden: adminUsersGolden, mainAriaLabel: "User Account Management", mainClassTokens: ["admin", "user"], thWithoutScope: 9 },
+  { file: "user-settings-account.html", golden: userSettingsAccountGolden, mainAriaLabel: "Account", mainClassTokens: ["user", "settings", "account"], thWithoutScope: 0 },
+  { file: "profile-watching.html", golden: profileWatchingGolden, mainAriaLabel: "alice", mainClassTokens: ["user", "profile"], thWithoutScope: 0 },
+  { file: "milestone-detail.html", golden: milestoneDetailGolden, mainAriaLabel: "v1.0", mainClassTokens: ["repository", "milestone-issue-list"], thWithoutScope: 0 },
+];
+
+describe("wave-129 expansion arms (explicit cases, not the shared table)", () => {
+  /** The shared §2.4.1 shell contract every expansion surface inherits. */
+  function assertShellArms(golden: string, arm: ExpansionArm): void {
+    const root = parseHtmlTree(golden);
+    const all = descendants(root);
+    const navbar = all.find((el) => el.tag === "nav" && el.attrs.id === "navbar");
+    expect(navbar, "nav#navbar present").toBeDefined();
+    expect(navbar?.attrs["aria-label"]).toBe("Navigation Bar");
+    const mains = all.filter((el) => el.attrs.role === "main");
+    expect(mains, "exactly one [role=main]").toHaveLength(1);
+    const main = mains[0] ?? root;
+    expect(main.attrs["aria-label"]).toBe(arm.mainAriaLabel);
+    const tokens = classList(main);
+    expect(tokens[0], "the leading page-content token").toBe("page-content");
+    expect(tokens.slice(1), "the §2.4.1 page discriminator tokens").toEqual(arm.mainClassTokens);
+    const footer = all.find((el) => el.tag === "footer");
+    expect(footer, "footer landmark present").toBeDefined();
+    expect(footer?.attrs["aria-label"]).toBe("Footer");
+  }
+
+  for (const arm of EXPANSION_ARMS) {
+    it(`${arm.file}: shell landmarks, the §2.4.1 discriminator, and the declared runA11y state`, () => {
+      assertShellArms(arm.golden, arm);
+      const violations = runA11y(arm.golden);
+      expect(
+        violations.filter((v) => v.rule !== "R6-table-headers"),
+        `${arm.file}: every non-table rule must stay clean: ${JSON.stringify(violations)}`,
+      ).toEqual([]);
+      expect(violations.filter((v) => v.rule === "R6-table-headers")).toHaveLength(arm.thWithoutScope);
+    });
+  }
+
+  it("admin-users: the admin sidebar names every arm (User Accounts active) and the page heading is the Total line", () => {
+    const root = parseHtmlTree(adminUsersGolden);
+    const nav = descendants(root).find((el) => hasClass(el, "flex-container-nav"));
+    expect(nav, "the admin sidebar nav").toBeDefined();
+    const items = descendants(nav ?? root).filter((el) => el.tag === "a");
+    expect(items.map((el) => accessibleName(el))).toEqual([
+      "Dashboard",
+      "Organizations",
+      "User Accounts",
+      "Repositories",
+      "Stats",
+      "Cron Tasks",
+      "Queues",
+      "Trace",
+    ]);
+    const active = items.filter((el) => hasClass(el, "active"));
+    expect(active.map((el) => accessibleName(el))).toEqual(["User Accounts"]);
+    expect(active[0]?.attrs.href).toBe("/-/admin/users");
+    // The page's only heading is the section header carrying the total; a
+    // lone heading can neither skip a level (R2) nor double the h1 (R1).
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => accessibleName(el))).toEqual(["User Account Management (Total: 4)"]);
+  });
+
+  it("admin-users: the users table's header cells are named — and each of the nine is the pinned scope gap", () => {
+    const root = parseHtmlTree(adminUsersGolden);
+    const table = descendants(root).find((el) => el.tag === "table");
+    expect(table, "the users table").toBeDefined();
+    const thead = (table ?? root).children.find((el) => el.tag === "thead");
+    expect(thead, "the users table has a thead").toBeDefined();
+    const ths = descendants(thead ?? root).filter((el) => el.tag === "th");
+    expect(ths.map((el) => accessibleName(el))).toEqual([
+      "ID",
+      "Username",
+      "Email Address",
+      "Authentication Source",
+      "Activated",
+      "Restricted",
+      "2FA",
+      "Created",
+      "Last Sign-In",
+    ]);
+    // The element-level shape of the KNOWN GAP above: every header cell lacks
+    // scope, so the fix is exactly nine scope attributes on this thead.
+    expect(ths.every((el) => el.attrs.scope === undefined), "every th lacks scope (the pinned gap)").toBe(true);
+  });
+
+  it("user-settings-account: the settings sidebar names every arm (Account active) and the three section headings hold level", () => {
+    const root = parseHtmlTree(userSettingsAccountGolden);
+    const nav = descendants(root).find((el) => hasClass(el, "flex-container-nav"));
+    expect(nav, "the settings sidebar nav").toBeDefined();
+    const items = descendants(nav ?? root).filter((el) => el.tag === "a");
+    expect(items.map((el) => accessibleName(el))).toEqual([
+      "Profile",
+      "Account",
+      "Notifications",
+      "Appearance",
+      "Security",
+      "Applications",
+      "SSH / GPG Keys",
+      "Secrets",
+      "Variables",
+      "Webhooks",
+      "Organizations",
+      "Repositories",
+    ]);
+    const active = items.filter((el) => hasClass(el, "active"));
+    expect(active.map((el) => accessibleName(el))).toEqual(["Account"]);
+    expect(active[0]?.attrs.href).toBe("/user/settings/account");
+    // The Password / Email / Delete sections are same-level h4s — the R2
+    // walk stays flat (asserted element-level so a later h2/h3 mix is a
+    // deliberate review here, not a silent smoke pass).
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => [el.tag, accessibleName(el)])).toEqual([
+      ["h4", "Password"],
+      ["h4", "Manage Email Addresses"],
+      ["h4", "Delete Your Account"],
+    ]);
+  });
+
+  it("profile-watching: the profile tab strip marks Watched Repositories active, and the avatar card + the single watched-repo row render", () => {
+    const root = parseHtmlTree(profileWatchingGolden);
+    // The signed-in self-view strip: three arms (the anonymous Starred arm is
+    // not offered on the watching tab), the ?tab=watching arm active. Names
+    // are the walker's exact accessible names — the count label joins its
+    // anchor text with no separator ("Repositories3").
+    const strip = descendants(root).find((el) => el.tag === "overflow-menu");
+    expect(strip, "the profile tab strip").toBeDefined();
+    const tabs = descendants(strip ?? root).filter((el) => el.tag === "a");
+    expect(tabs.map((el) => [el.attrs.href, hasClass(el, "active"), accessibleName(el)])).toEqual([
+      ["/alice?tab=repositories", false, "Repositories3"],
+      ["/alice?tab=activity", false, "Public Activity"],
+      ["/alice?tab=watching", true, "Watched Repositories"],
+    ]);
+    // The user header: the avatar card renders (the profile page's identity
+    // block), and the shared repo list's single row names the one watched
+    // repo — the wave-9 dashboard fixture's cross-owner acme/anvil watch.
+    expect(getElementById(root, "profile-avatar-card")).not.toBeNull();
+    const titles = descendants(root).filter((el) => hasClass(el, "item-title"));
+    expect(
+      titles.flatMap((el) => descendants(el).filter((inner) => inner.tag === "a").map((a) => [a.attrs.href, accessibleName(a)])),
+    ).toEqual([["/acme/anvil", "anvil"]]);
+  });
+
+  it("milestone-detail: the repo header breadcrumb names owner and repo, the h1 is the milestone title, and the repo tab strip names every tab (Code active)", () => {
+    const root = parseHtmlTree(milestoneDetailGolden);
+    const header = descendants(root).find((el) => hasClass(el, "repo-header"));
+    expect(header, "the repo header").toBeDefined();
+    expect(descendants(header ?? root).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
+      ["/alice", "alice"],
+      ["/alice/golden-ms", "golden-ms"],
+    ]);
+    // The page's single heading is the milestone title (R1's exactly-one
+    // holds here like home's README h1).
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => accessibleName(el))).toEqual(["v1.0"]);
+    // The canWrite arm's controls are named (signed-in owner golden).
+    expect(descendants(root).filter((el) => el.tag === "a").filter((el) => hasClass(el, "button")).map((el) => accessibleName(el))).toEqual([
+      "Edit",
+      "New Issue",
+    ]);
+    const strip = descendants(root).find((el) => el.tag === "overflow-menu");
+    expect(strip, "the repo tab strip").toBeDefined();
+    expect(descendants(strip ?? root).filter((el) => el.tag === "a").map((el) => [hasClass(el, "active"), accessibleName(el)])).toEqual([
+      [true, "Code"],
+      [false, "Issues1"],
+      [false, "Pull Requests"],
+      [false, "Releases"],
+      [false, "Commits"],
+    ]);
   });
 });
 
