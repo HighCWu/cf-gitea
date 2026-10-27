@@ -360,3 +360,37 @@ still open: the compare equal-tips across-ref POST completion (in
 flight, sibling-owned — the landed `sameTip` refusal stands until it
 lands) and the admin-monitor thead-less golden policy call
 (`967a5d4`'s documented-skip).
+
+**Appended still 2026-10-27 (tick-14, HEAD `19d15a1`) — the second
+polish cluster, which RESOLVES both postures above.** The compare loop
+closed (`589debd`): upstream's web POST is tips-blind (pull.go:1318 →
+NewPullRequest unconditionally; the only control is the render gate),
+so equal-tips across-ref pairs now CREATE — the 303 onto pulls/1 with
+zero-diff semantics — and the refusal narrows to IsSameRef's
+name-equality only (main...main keeps the 422 as the disclosed
+divergence; the API string gate pinned 422 same-ref / 201 across-ref).
+The admin-monitor thead-less policy call made structurally (`ff3b4fb`,
+R6's definition-shape exemption): upstream renders key/value tables
+thead-less BY DESIGN (stats.tmpl/dashboard.tmpl's label rows) and the
+total structural test — ≥1 row, zero th, every row exactly two td —
+classifies them with real data tables' protection unchanged; the
+monitor stats+queue goldens landed in it and the cron golden + the
+ROUTE_CLOCK test seam (`df348c8`) close the wallclock audit — the LAST
+admin golden. The rest of the cluster: the repo settings options
+page's full field set + exact-carry hardening (`88cbd17`/`bacccf6` —
+the port-first mode's last documented module gap; `setRepoArchived`/
+`setRepoTemplate` service arms), the branches settings default-branch
+select (module `ce52935`, mount `21b91ce` with the GET branchOptions
+pass + SetDefaultBranchPost, route arms `862e9b3` incl. the
+silent-private fixture finding), the icon.tmpl glyph chain tree-wide
+(`65d07b6` OrgRepoListItem + `cb1fb3f` the stars/watching rows — the
+unconditional fallback repo glyph was an undocumented divergence
+matrix-8 flagged), the notifications legacy `?q=` alias (`e91f075`),
+and the LIKE→instr() class sweep (`c91f689` — 11 user-text sites + the
+releases tag glob translated exactly, closing the raw-LIKE `%`/`_`
+wildcard leak). Goldens reach **66** (the final HTML batch `86d2de7` +
+the three .rss XML envelopes `abd512f`; `19d15a1` teaches
+update-goldens the .rss enumeration), and matrix batches 6-8
+(`b61a5e8`, `3b24651`, `48b5f26`) add 77 test-only characterization
+arms. The survey headline is re-verified unchanged at 91/5/20
+(programmatically) — `docs/compat/ui-parity-survey.md` tick-14.
