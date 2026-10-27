@@ -3206,3 +3206,36 @@ healthz 200 @3.0s cold):**
   graph sizing + Plan-A falsification, the sanitized upstream issue
   draft, ADR-0006, and the CI gate wired to `pnpm test:full` with
   evidence artifacts. The B lever (sourcemap strip) is queued next.
+
+**REDEPLOY21 LIVE RESULTS (2026-10-28 00:4x, GO `cee057b` → deploy
+version `fe6bcca1`; healthz 200 @2.3s; migrations: none pending —
+0033/0034 applied at RD20):**
+
+- **The gate at GO**: single-pass strip-mode full suite in the worktree —
+  **261 files / 5,831 tests / 0 failed / exit 0** (the second perfect
+  single-pass of the night; the contention class formally RETIRED — the
+  per-file 90s budgets + the GPG minute-boundary guard were the last two
+  real members).
+- **The polish cargo deployed** (~60 commits): the settings options
+  field set + exact-carry, the branches default-branch select (module +
+  mount + route arms), the compare nothingToCompare parity + the
+  empty-PR creation loop, the icon.tmpl glyph chain tree-wide, the
+  `?q=` alias, the LIKE→instr sweep (11 sites), the R5/R6 a11y fixes
+  (scope sweeps + the pencil + the definition-shape rule), the route
+  clock + 67 goldens, the census's last slices (comments/attachments
+  JSON + issues/new/choose), matrix batches 1-14 (~360 arms total).
+- **Battery (9, PAT rd21-run)**: p0 4/4 · registry 21/21 · generate-e2e
+  10+1i · forkpr 8/8 · ui-login 5/5 · **mirror 8/8 on the WARM rerun**
+  (the first run's mir-sync-settle was the cold-consumer first-sync
+  latency — the RD20 cold class, warm-green) · window2 22/22 ·
+  window3-mounts green · cleanup-audit 9/1 (the 1 = the live rd21-run
+  PAT, deleted at wrap close below).
+- **Force-red ×2**: w2-secret-row-visible + w3-wiki-raw-coded-200 both
+  forced red cleanly (fail=1, siblings pass, tails swept).
+- **Minting incident, disclosed**: the RD21 PAT mint's first attempt
+  leaked a plaintext to the orchestrator's terminal (heredoc redirection
+  error — the RD20 lesson repeated at one remove). The leaked token was
+  NEVER inserted into D1 (the insert failed on wrong columns first) —
+  zero server-side exposure; local scratch shredded; the clean mint
+  (node -e, stdout never touching the terminal) is the pattern of
+  record.
