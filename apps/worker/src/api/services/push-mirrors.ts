@@ -373,20 +373,23 @@ export async function addPushMirror(
 
 /** ListPushMirrors (mirror.go:148-190): the repo's rows ordered by id
  *  (PushMirrorOptions.ToOrders → "id", pushmirror.go:36-38), paginated with
- *  the total count for the Link/total-count headers. */
+ *  the total count for the Link/total-count headers. `page`/`limit` are the
+ *  caller's ALREADY-CLAMPED options (api/pagination.ts parseListOptions) —
+ *  the 30-default lives there (upstream's setting.API.DefaultPagingNum via
+ *  convert.GetListOptions), so there is intentionally no service-level
+ *  fallback: callers must choose. */
 export async function listPushMirrors(
   db: D1Database,
   repoId: string,
-  page: number | undefined,
-  limit: number | undefined,
+  page: number,
+  limit: number,
 ): Promise<{ rows: PushMirrorRow[]; total: number }> {
   const dbd = drizzle(db);
   const where = eq(pushMirrors.repoId, repoId);
   const total = (await dbd.select({ n: count() }).from(pushMirrors).where(where).all())[0]?.n ?? 0;
   let query = dbd.select().from(pushMirrors).where(where).orderBy(asc(pushMirrors.id)).$dynamic();
-  const pageSize = limit ?? 10; // upstream's default page size (utils.GetListOptions)
-  query = query.limit(pageSize);
-  if (page !== undefined && page > 1) query = query.offset((page - 1) * pageSize);
+  query = query.limit(limit);
+  if (page > 1) query = query.offset((page - 1) * limit);
   return { rows: await query.all(), total };
 }
 

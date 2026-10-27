@@ -554,10 +554,11 @@ describe("repoListPushMirrors (GET /repos/{owner}/{repo}/push_mirrors)", () => {
 
   // wave-polish-matrix-12 — the pagination grammar's unproven arms: the
   // ROUTE-level default page size is parseListOptions' DEFAULT_PAGING_NUM 30
-  // (api/pagination.ts — limit absent parses to 30, so the service's `?? 10`
-  // fallback is unreachable through this route), and a page past the end is
-  // an empty array with the total INTACT (the offset over-count arm — never
-  // a 400).
+  // (api/pagination.ts — limit absent parses to 30; the service's former
+  // `?? 10` fallback was unreachable AND mislabeled upstream's default —
+  // removed with required params, upstream's setting.API.DefaultPagingNum
+  // is 30 too), and a page past the end is an empty array with the total
+  // INTACT (the offset over-count arm — never a 400).
   it("200: the default page size is 30; a beyond-the-end page is empty with the total intact", async () => {
     const { slug, repoId } = await seedRepo();
     for (let i = 1; i <= 12; i++) {
