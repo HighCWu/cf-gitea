@@ -286,6 +286,96 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
     expect(await service.getBySlug("alice", "void")).toBeNull();
   });
 
+  it("§2.5.2: a tag-only first push keeps the row — the create survives empty-unborn and the tag reads back", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+
+    const { oid, pack } = await buildPack();
+    const body = buildReceivePackBody([{ ref: "refs/tags/v1", oid }], pack);
+    const response = await SELF.fetch("https://example.com/alice/tagonly.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body,
+    });
+    expect(response.status).toBe(200);
+
+    // The gate schedules settleCreatingRepo via waitUntil (timing depends on
+    // the runner, so the assertions below hold whether settle already ran or
+    // runs here — the settle is idempotent on the settled row).
+    const service = new RepoService(env.DB);
+    const creating = await service.getBySlug("alice", "tagonly");
+    if (creating) await settleCreatingRepo(env, creating.id, "alice/tagonly");
+
+    // Upstream posture (services/repository/push.go): the tag arm (:100-139)
+    // records tags/notifications and nothing else — pushNewBranch (:255-270)
+    // is branch-only — so a tag-only push-create repo SURVIVES. The undo arm
+    // may only fire when NO ref of any namespace landed.
+    const settled = await service.getBySlug("alice", "tagonly");
+    expect(settled).not.toBeNull();
+    expect(settled?.status).toBe("ready"); // the create is real, not lingering 'creating'
+    // The empty-unborn posture stays coherent (upstream keeps IsEmpty=true;
+    // the unborn HEAD falls back to the unchanged default branch).
+    expect(settled?.isEmpty).toBe(true);
+    expect(settled?.defaultBranch).toBe("main");
+    expect(settled?.storageKey).toMatch(/^r_/);
+    expect(await drizzle(env.DB).select().from(repoCounters).all()).toHaveLength(1); // dependents intact
+
+    // The client's success is honest: the tag reads back through the advert.
+    const advert = await SELF.fetch("https://example.com/alice/tagonly.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(advert.status).toBe(200);
+    const advertBody = new TextDecoder().decode(await advert.arrayBuffer());
+    expect(advertBody).toContain("refs/tags/v1");
+    expect(advertBody).toContain(oid);
+
+    // ...and through the v1 API (repoListTags renders from the engine refs —
+    // the tag-only settled repo is a servable empty repo, not a vanished one).
+    const apiTags = await SELF.fetch("https://example.com/api/v1/repos/alice/tagonly/tags", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(apiTags.status).toBe(200);
+    expect(await apiTags.json()).toMatchObject([{ name: "v1", commit: { sha: oid } }]);
+  });
+
+  it("§2.5.2: a branch+tag first push settles on the branch (the tag rides along)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+
+    const { oid, pack } = await buildPack();
+    const body = buildReceivePackBody(
+      [
+        { ref: "refs/heads/dev", oid },
+        { ref: "refs/tags/v1", oid },
+      ],
+      pack,
+    );
+    const response = await SELF.fetch("https://example.com/alice/mixed.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body,
+    });
+    expect(response.status).toBe(200);
+
+    const service = new RepoService(env.DB);
+    const creating = await service.getBySlug("alice", "mixed");
+    if (creating) await settleCreatingRepo(env, creating.id, "alice/mixed");
+
+    // The branch arm is unchanged by a tag's presence in the ref list.
+    const settled = await service.getBySlug("alice", "mixed");
+    expect(settled?.status).toBe("ready");
+    expect(settled?.isEmpty).toBe(false);
+    expect(settled?.defaultBranch).toBe("dev"); // first-push adoption
+
+    const advert = await SELF.fetch("https://example.com/alice/mixed.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(advert.status).toBe(200);
+    const advertBody = new TextDecoder().decode(await advert.arrayBuffer());
+    expect(advertBody).toContain("refs/heads/dev");
+    expect(advertBody).toContain("refs/tags/v1");
+  });
+
   it("row 18/20: the 'push to create is not enabled' 403s have no live branch (documented divergence)", async () => {
     // cf-gitea defaults user push-create ON (SPEC-0003 §2.4 divergence) and
     // org push-create arrives with SPEC-0007 — asserted here as documentation:

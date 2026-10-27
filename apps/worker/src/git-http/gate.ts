@@ -489,8 +489,10 @@ async function handleUnknownRepository(
 
   // §2.5.2 finalize handshake: the engine's receivePack completes finalize
   // BEFORE its response returns, so once the response is observable the
-  // outcome is settled — flip status/is_empty/default_branch on a committed
-  // first push, or undo the create when no ref landed. Scheduled AFTER the
+  // outcome is settled — settle the create (branches: the full
+  // is_empty/default_branch flip; tags-only: status only, the row stays
+  // empty-unborn like upstream) or undo it when NO ref at all landed.
+  // Scheduled AFTER the
   // forward (the settle body starts at call time; scheduling it earlier would
   // race the finalize with an empty-DO listRefs). The forward carries the
   // fresh row's storage key: the very first receive already addresses R2 by
@@ -927,7 +929,8 @@ async function serveHead(env: Env, route: GitHttpRoute, defaultBranch: string): 
  * push-created ones). Runs after a receive response is observable (the
  * engine commits refs before returning it):
  *
- * - refs/heads/* present → the row settles: `status='ready'`,
+ * - ANY ref landed (heads ∪ tags ∪ anything else the engine reports) → the
+ *   create is real and the row survives. With branches: `status='ready'`,
  *   `is_empty=false`, `default_branch=<first pushed branch>` — one
  *   conditional UPDATE (`is_empty`, status-agnostic), so a concurrent
  *   settle can never double-apply. For API-created rows this is the first
@@ -936,7 +939,19 @@ async function serveHead(env: Env, route: GitHttpRoute, defaultBranch: string): 
  *   setHead RPC when it diverged (the engine's first-push adoption prefers
  *   main/master; see below); the synthetic HEAD endpoint falls back to D1
  *   only for unborn repos.
- * - no branch ref (receive failed, client vanished, worker crashed
+ * - Refs landed but NO branch among them (the tag-only first push):
+ *   upstream's tag arm (services/repository/push.go:100-139) records
+ *   tags/notifications and nothing else — pushNewBranch (:255-270) is
+ *   branch-only, so a tag-only push-create repo SURVIVES, keeping
+ *   `IsEmpty=true` and its unborn HEAD on the default branch. Match it:
+ *   creating rows flip `status='ready'` ONLY (the create must not linger
+ *   half-done), `is_empty`/`default_branch` keep their create values so the
+ *   empty-unborn posture stays coherent (serveHead falls back to the
+ *   unchanged default_branch; no setHead — the engine left meta.head
+ *   unborn, commitPush finds no branch to prefer), and a later branch push
+ *   re-settles through the `is_empty` CAS above. Established empty rows
+ *   have nothing to do.
+ * - NO ref at all (receive failed, client vanished, worker crashed
  *   mid-receive) → UNDO, creating rows only: the row is deleted again,
  *   conditional on `status='creating' AND is_empty` — a half-usable repo
  *   never lingers. An established (ready/'migrating') empty repo that took
@@ -964,14 +979,15 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
     } catch {
       refNames = null; // unreadable/unwarming DO: treat as no refs
     }
-    const branches = refNames?.filter((name) => name.startsWith("refs/heads/")) ?? [];
 
-    if (refNames === null || branches.length === 0) {
+    if (refNames === null || refNames.length === 0) {
       // Undo the create (§2.5.2: "deleted again, D1 conditional on
-      // status='creating' AND is_empty") — creating rows ONLY. The
-      // FK-bearing dependents the create seeded (counters, units) go first,
-      // in the same batch; the unconditional deletes make the explicit
-      // status guard here load-bearing for established repos.
+      // status='creating' AND is_empty") — fires ONLY when the receive
+      // committed no ref of ANY namespace (a tag landing is enough to keep
+      // the row, per upstream above). Creating rows ONLY: the FK-bearing
+      // dependents the create seeded (counters, units) go first, in the
+      // same batch; the unconditional deletes make the explicit status
+      // guard here load-bearing for established repos.
       if (row.status !== "creating") return;
       await db.batch([
         db.delete(repoCounters).where(eq(repoCounters.repoId, repoId)),
@@ -989,6 +1005,22 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
       return;
     }
 
+    const branches = refNames.filter((name) => name.startsWith("refs/heads/"));
+    if (branches.length === 0) {
+      // Tag-only first push — the create is still real (see docblock).
+      // The CAS on status='creating' doubles as the webhook gate: rows
+      // changed implies the row WAS creating, so the event emits exactly
+      // once, concurrent/duplicate settles included.
+      if (row.status !== "creating") return;
+      const settled = await db
+        .update(repositories)
+        .set({ status: "ready", updatedAt: new Date() })
+        .where(and(eq(repositories.id, repoId), eq(repositories.status, "creating")))
+        .run();
+      if ((settled.meta.changes ?? 0) > 0) await emitCreatedEvent(env, repoId);
+      return;
+    }
+
     // First non-empty branch push adopts the default branch (§2.5.2,
     // upstream pushNewBranch). listRefs orders by name, so a single-branch
     // push — the dominant first-push shape — is exact; a multi-branch first
@@ -997,7 +1029,7 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
     // `is_empty` only: every empty row — 'creating', 'ready', 'migrating' —
     // settles the same way, `status` re-asserting 'ready' for the push-create
     // rows and a no-op value for the rest.
-    const firstBranch = branches[0]?.slice("refs/heads/".length) ?? row.defaultBranch;
+    const firstBranch = branches[0]!.slice("refs/heads/".length);
     const settled = await db
       .update(repositories)
       .set({ status: "ready", isEmpty: false, defaultBranch: firstBranch, updatedAt: new Date() })
@@ -1012,23 +1044,9 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
     // route, so this settle must not re-emit — and on rows-changed so a
     // concurrent/duplicate settle emits exactly once; the undo arm above
     // stays silent — the repo was never servable, so there is no deletion to
-    // notify. Runs inside the caller's waitUntil, hence the inline enqueue.
+    // notify.
     if ((settled.meta.changes ?? 0) > 0 && row.status === "creating") {
-      const pair = await findRepositoryById(env.DB, repoId);
-      if (pair !== null) {
-        const identity = repositoryEventIdentity({ origin: appOrigin(env), requester: null }, pair);
-        // Sender: the owner-fallback pusher — the settle carries no pusher
-        // identity (the push family's documented deviation, webhooks-push.ts
-        // header), and upstream push-create only creates in the pusher's own
-        // namespace (site-admin overrides aside).
-        const sender = identity.organization;
-        await emitRepoEventInline(env, {
-          repoId: pair.repo.id,
-          ownerId: pair.owner.id,
-          eventType: "repository",
-          payload: repositoryEventPayload("created", identity.repository, identity.organization, sender),
-        });
-      }
+      await emitCreatedEvent(env, repoId);
     }
 
     // §2.5.2 (ENGINE-WAVE): the DO's meta.head must agree with the adopted
@@ -1054,4 +1072,25 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
       `[push-settle] ${repoId} failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+/**
+ * The `repository` action=created webhook for a settling push-create row —
+ * factored so the branch arm and the tag-only arm emit identically. The
+ * settle carries no pusher identity (the push family's documented deviation,
+ * webhooks-push.ts header), so the sender is the owner-fallback pusher:
+ * upstream push-create only creates in the pusher's own namespace (site-admin
+ * overrides aside).
+ */
+async function emitCreatedEvent(env: Env, repoId: string): Promise<void> {
+  const pair = await findRepositoryById(env.DB, repoId);
+  if (pair === null) return;
+  const identity = repositoryEventIdentity({ origin: appOrigin(env), requester: null }, pair);
+  const sender = identity.organization;
+  await emitRepoEventInline(env, {
+    repoId: pair.repo.id,
+    ownerId: pair.owner.id,
+    eventType: "repository",
+    payload: repositoryEventPayload("created", identity.repository, identity.organization, sender),
+  });
 }
