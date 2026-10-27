@@ -24,6 +24,7 @@ import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { findRepositoryByPath, toApiRepository } from "../services/repository";
+import { listReposStarredByUser } from "../services/stars";
 import { toApiUser } from "../services/user";
 import { registerSocialT2Routes } from "./social-t2";
 import { registerStarredRoutes } from "./starred";
@@ -491,5 +492,90 @@ describe("GET /users/{username}/starred: the total is the TARGET's raw users.num
     expect(res.headers.get("X-Total-Count")).toBe("0"); // neighbor's column, not the doer's 1
     const body: Array<Record<string, unknown>> = await res.json();
     expect(body.map((entry) => entry.name)).toEqual(["source"]); // the filtered page, doer visibility
+  });
+});
+
+/**
+ * listReposStarredByUser (services/stars.ts) — the profile STARS tab's
+ * loader (`GET /{username}?tab=stars`, routers/web/user/profile.go:191-219's
+ * `case "stars"`): upstream `SearchRepository{StarredByID, Collaborate:
+ * Some(false), Private: ctx.IsSigned, Actor: ctx.Doer}` collapsed to the
+ * repositories tab's doer-visible two-arm WHERE (the caller passes
+ * `seePrivate`). Service-level: the PAGE owner's id is the star direction,
+ * `seePrivate` the caller-computed self/admin arm.
+ */
+describe("listReposStarredByUser (profile.go:191-219's stars case)", () => {
+  /** carol owns the public pair + a private repo; bob stars all three. */
+  async function seedStarredFixture(): Promise<{ bobId: number }> {
+    const carol = await seedUser("carol");
+    const bob = await seedUser("bob");
+    for (const [id, slug, visibility] of [
+      ["9001", "alpha", "public"],
+      ["9002", "omega", "public"],
+      ["9003", "priv", "private"],
+    ] as const) {
+      await drizzle(env.DB).insert(repositories).values({
+        id,
+        storageKey: `r_${id}`,
+        ownerNamespace: "carol",
+        ownerId: carol.id,
+        slug,
+        visibility,
+        refsVersion: 1,
+        backend: "self-hosted",
+        createdAt: new Date("2026-02-03T04:05:06Z"),
+      });
+      await drizzle(env.DB).insert(stars).values({ userId: bob.id, repoId: id, createdAt: new Date() });
+    }
+    return { bobId: bob.id };
+  }
+
+  const load = (userId: number, seePrivate: boolean, page = 1, pageSize = 15) =>
+    listReposStarredByUser(env.DB, userId, { seePrivate, page, pageSize });
+
+  it("a stranger (seePrivate=false) sees public starred rows only — the private star drops out (Private: ctx.IsSigned), slug ASC order, the FILTERED total", async () => {
+    const { bobId } = await seedStarredFixture();
+    const listing = await load(bobId, false);
+    expect(listing.items.map((item) => item.repo.slug)).toEqual(["alpha", "omega"]);
+    expect(listing.total).toBe(2); // the filtered count — the tab pager's bound
+    expect(listing.items.every((item) => item.ownerVisibility === "public")).toBe(true);
+  });
+
+  it("the seePrivate arm (self or site admin, caller-computed) includes private starred rows", async () => {
+    const { bobId } = await seedStarredFixture();
+    const self = await load(bobId, true);
+    expect(self.items.map((item) => item.repo.slug)).toEqual(["alpha", "omega", "priv"]);
+    expect(self.total).toBe(3);
+  });
+
+  it("paginates on ListOptions and the total stays the whole filtered set", async () => {
+    const { bobId } = await seedStarredFixture();
+    const page1 = await load(bobId, true, 1, 2);
+    expect(page1.items.map((item) => item.repo.slug)).toEqual(["alpha", "omega"]);
+    expect(page1.total).toBe(3);
+    const page2 = await load(bobId, true, 2, 2);
+    expect(page2.items.map((item) => item.repo.slug)).toEqual(["priv"]);
+    expect(page2.total).toBe(3);
+  });
+
+  it("rows carry the OWNER's visibility — a public repo under a private-visibility owner flags internal (list.tmpl's Owner.Visibility.IsPrivate arm; upstream's public arm would exclude the row — the documented collapse)", async () => {
+    const carol = await seedUser("carol");
+    const bob = await seedUser("bob");
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, carol.id));
+    await drizzle(env.DB).insert(repositories).values({
+      id: "9004",
+      storageKey: "r_9004",
+      ownerNamespace: "carol",
+      ownerId: carol.id,
+      slug: "hidden",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    await drizzle(env.DB).insert(stars).values({ userId: bob.id, repoId: "9004", createdAt: new Date() });
+    const listing = await load(bob.id, false);
+    expect(listing.items).toHaveLength(1); // the landed collapse keeps the row
+    expect(listing.items[0]?.ownerVisibility).toBe("private");
   });
 });

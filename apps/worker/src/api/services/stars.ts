@@ -1,4 +1,4 @@
-import { and, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, stars, users } from "../../db/schema";
@@ -213,6 +213,71 @@ export async function listStarredRepositories(
     .limit(options.pageSize)
     .offset((options.page - 1) * options.pageSize);
   return rows;
+}
+
+/**
+ * The profile STARS tab's loader (`GET /{username}?tab=stars`,
+ * routers/web/user/profile.go:191-219's `case "stars"`): upstream
+ * `SearchRepository{StarredByID: ctx.ContextUser.ID, Collaborate:
+ * optional.Some(false), Private: ctx.IsSigned, Actor: ctx.Doer}` collapsed
+ * to the doer-visible TWO-ARM WHERE the repositories tab's page loader uses
+ * (pages/user-profile.tsx loadUserProfileData) — the caller passes
+ * `seePrivate` computed exactly that way: the profile user themself or a
+ * site admin sees every starred row, everyone else `visibility = 'public'`
+ * rows only.
+ *
+ * Upstream's arms, for the record (models/repo/repo_list.go:365-398): an
+ * anonymous doer is public-only (`SearchRepositoryCondition` forces
+ * `Private = false`); a signed-in NON-ADMIN stranger would additionally see
+ * private starred rows they hold unit/team access to
+ * (AccessibleRepositoryCondition's collaborator/team arms,
+ * repo_list.go:660-702), and upstream's public arm also excludes repos
+ * under limited/private-visibility owners (repo_list.go:383-389). The
+ * landed collapse keeps the two-arm shape (§3.2 — the loadUserProfileData /
+ * listUserRepositories convention; both divergences documented there).
+ * `Collaborate: Some(false)` is a no-op under the collapse: the stars join
+ * is repo-scoped and no org collaboration rows exist in the landed model.
+ *
+ * Order is `slug ASC` (the repositories-tab convention) — upstream sorts by
+ * the explore default (`OrderByFlatMap[sort]` → recentupdate,
+ * profile.go:118-124); the landed order wins (§3.2, the org-home note). The
+ * keyword/sort/archived/fork filters of the search are not landed (the
+ * profile page renders no search box — the org-home reduction). Rows carry
+ * the OWNER's visibility: `ShowRepoOwnerOnList` rows can belong to anyone,
+ * so the list.tmpl internal badge (`{{if .Owner.Visibility.IsPrivate}}`)
+ * is per-row here, not the page owner's.
+ */
+export interface StarredByUserItem {
+  repo: typeof repositories.$inferSelect;
+  /** The owning user's visibility — the list.tmpl internal-badge arm. */
+  ownerVisibility: "public" | "limited" | "private";
+}
+
+export async function listReposStarredByUser(
+  d1: D1Database,
+  userId: number,
+  options: { seePrivate: boolean } & StarListOptions,
+): Promise<{ items: StarredByUserItem[]; total: number }> {
+  const db = drizzle(d1);
+  const where = options.seePrivate
+    ? eq(stars.userId, userId)
+    : and(eq(stars.userId, userId), eq(repositories.visibility, "public"));
+  const totalRow = await db
+    .select({ total: sql<number>`count(*)` })
+    .from(stars)
+    .innerJoin(repositories, eq(repositories.id, stars.repoId))
+    .where(where)
+    .get();
+  const items = await db
+    .select({ repo: repositories, ownerVisibility: users.visibility })
+    .from(stars)
+    .innerJoin(repositories, eq(repositories.id, stars.repoId))
+    .innerJoin(users, eq(users.usernameLower, repositories.ownerNamespace))
+    .where(where)
+    .orderBy(asc(repositories.slug))
+    .limit(options.pageSize)
+    .offset((options.page - 1) * options.pageSize);
+  return { items, total: totalRow?.total ?? 0 };
 }
 
 /** Repo-scoped star delete (the api repoDelete path's housekeeping; the
