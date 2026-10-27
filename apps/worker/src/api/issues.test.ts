@@ -30,6 +30,7 @@ import {
   labels,
   milestones,
   notificationStates,
+  pullRequests,
   repoCollaborators,
   repoCounters,
   repositories,
@@ -646,6 +647,75 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
 
     const actions = (await deliveriesFor(hookId)).map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
     expect(actions).toEqual(["closed", "reopened"]);
+  });
+
+  it("412s ANY state arm on a merged PR through the issues route (upstream checks HasMerged before the value)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "merged via issues route",
+      posterId: 1,
+    });
+    await db().update(pullRequests).set({ hasMerged: true }).where(eq(pullRequests.id, pull.pullRequest.id));
+
+    // Upstream (repo/issue.go:810-817) loads the PR whenever form.State is
+    // set and answers 412 on HasMerged — the guard runs BEFORE the requested
+    // value is examined, so the close arm and the reopen arm both 412 with
+    // the same message as the pulls-surface twin (pull.go's EditPullRequest).
+    const close = await router()(`/repos/alice/visible/issues/${pull.issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "closed" }),
+    });
+    expect(close.status).toBe(412);
+    expect(await close.json()).toEqual({
+      message: "cannot change state of this pull request, it was already merged",
+      url: ERROR_URL,
+    });
+
+    const reopen = await router()(`/repos/alice/visible/issues/${pull.issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "open" }),
+    });
+    expect(reopen.status).toBe(412);
+    expect(await reopen.json()).toEqual({
+      message: "cannot change state of this pull request, it was already merged",
+      url: ERROR_URL,
+    });
+  });
+
+  it("keeps the unmerged-PR state arms working through the issues route", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "unmerged lifecycle",
+      posterId: 1,
+    });
+
+    const close = await router()(`/repos/alice/visible/issues/${pull.issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "closed" }),
+    });
+    expect(close.status).toBe(201);
+    expect((await close.json<{ state: string }>()).state).toBe("closed");
+
+    const reopen = await router()(`/repos/alice/visible/issues/${pull.issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "open" }),
+    });
+    expect(reopen.status).toBe(201);
+    expect((await reopen.json<{ state: string; closed_at: string | null }>()).closed_at).toBeNull();
   });
 
   it("moves the milestone with counter maintenance and a milestone comment", async () => {
