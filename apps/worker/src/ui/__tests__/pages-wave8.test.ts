@@ -546,8 +546,12 @@ describe("delete file page + POST (/delete/{branch}/{path})", () => {
     });
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain('<form class="ui edit form" method="post" action="/alice/wave8/delete/main/notes/editor.txt">');
-    expect(html).toContain("<h4>Delete &#39;notes/editor.txt&#39;</h4>");
+    // delete.tmpl:9 verbatim (the form re-shape: `ui form form-fetch-action`,
+    // no invented h4 header — the delete context rides the commit_summary
+    // placeholder + the Commit Changes header; pin flipped after the gate's
+    // assertion-fatal catch, 2026-10-27)
+    expect(html).toContain('<form class="ui form form-fetch-action" method="post" action="/alice/wave8/delete/main/notes/editor.txt">');
+    expect(html).toContain("<h3>Commit Changes</h3>");
     expect(html).toContain('<input name="commit_summary" maxlength="100" placeholder="Delete &#39;notes/editor.txt&#39;"');
     expect(html).not.toContain('id="edit_area"'); // no editor on the delete page
   });
