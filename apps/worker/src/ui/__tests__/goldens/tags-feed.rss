@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Tags for alice/golden</title>
+    <link>https://test.local/alice/golden/tags</link>
+    <description></description>
+    <pubDate>Tue, 14 Nov 2023 22:13:20 +0000</pubDate>
+    <item>
+      <title>Golden v1</title>
+      <link>https://test.local/alice/golden/releases/tag/v1</link>
+      <description></description>
+      <content:encoded><![CDATA[<p>First golden release.</p>
+<p>Ships the <strong>seed</strong> fixtures.</p>
+]]></content:encoded>
+      <author>alice</author>
+      <guid>1: https://test.local/alice/golden/releases/tag/v1</guid>
+      <pubDate>Tue, 14 Nov 2023 22:14:50 +0000</pubDate>
+    </item>
+  </channel>
+</rss>

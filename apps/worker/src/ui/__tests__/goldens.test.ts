@@ -31,7 +31,7 @@ import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { actions, users } from "../../db/schema";
-import { __setRouteClockForTests } from "../index";
+import { __setRouteClockForTests, uiRouter } from "../index";
 import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
 import {
   GOLDEN_CASES,
@@ -42,6 +42,7 @@ import {
   renderCase,
   renderRoute,
   setupGoldenFixtures,
+  uiEnv,
 } from "./harness";
 
 /**
@@ -55,12 +56,15 @@ import {
 export const ADMIN_GOLDEN_REPO_ID = "00000000-0000-4000-8000-000000000001";
 
 /** Committed golden bytes, read through Vite's `?raw` transform (byte-exact;
- *  typing in raw-modules.d.ts). */
-const goldenBodies: Record<string, string> = import.meta.glob("./goldens/*.html", {
-  query: "?raw",
-  import: "default",
-  eager: true,
-});
+ *  typing in raw-modules.d.ts). Two globs merged: the HTML page goldens AND
+ *  the wave-golden-feeds XML envelopes (goldens/*.rss — the .rss extension
+ *  is the content-honest label for the three feed goldens, and the glob arm
+ *  is the ONE harness adaptation their non-HTML content type needed: the
+ *  marker/update machinery itself is content-type-blind text extraction). */
+const goldenBodies: Record<string, string> = {
+  ...import.meta.glob("./goldens/*.html", { query: "?raw", import: "default", eager: true }),
+  ...import.meta.glob("./goldens/*.rss", { query: "?raw", import: "default", eager: true }),
+};
 
 /** Update mode = the regeneration script's sentinel file is present. The mjs
  *  removes it in a finally block; a stray copy flips this file into
@@ -476,6 +480,121 @@ describe("route-clock override arm (set/unset behavior)", () => {
 
     const liveRss = (await renderRoute("/alice/golden/releases.rss")).html;
     expect(liveRss).not.toContain(FEED_PINNED_CHANNEL_STAMP);
+  });
+});
+
+/**
+ * The wave-golden-feeds batch — the three feed surfaces' first goldens, the
+ * XML envelopes the route-clock closure (df348c8) made landable: every feed
+ * loader's channel-date hop now flows from `routeNow()`, so the channel
+ * stamps pin under the same seam the cron golden uses. All three render
+ * through the real route path over the EXISTING seed fixtures — zero new
+ * seeds, zero new pushes (the releases/tags twins anonymous, the user feed
+ * signed-in as alice — the arm its population needs, case comment below):
+ *
+ *   - user-feed-alice (TAKEN): `/alice.rss` SIGNED-IN AS ALICE — the user
+ *     ACTIVITY feed, the gorilla RSS envelope over the harness seed's
+ *     action rows. The population is the profile-activity golden's exact
+ *     three rows — the push-created create_repo actions for
+ *     golden/golden-alt/golden-ms (the git-http push-settle emitter; the
+ *     harness's IssuesService seeders record NO actions — that emitter
+ *     lives in the API routes the harness never drives). The SIGNED-IN
+ *     SELF arm is load-bearing, not cosmetic: push-created repos are born
+ *     PRIVATE (gate.ts's DefaultPushCreatePrivate) and the harness flips
+ *     only the repository ROW public after the push — the create_repo
+ *     action rows keep the honest is_private=true of the private-born
+ *     payload, so the ANONYMOUS feed over these fixtures is the empty
+ *     channel (is_private=false filter). includePrivate = self
+ *     (profile.go:43) is upstream's own arm for the principal's rows —
+ *     the same choice the profile-activity golden makes. Determinism:
+ *     the beforeAll actions-pin above stamps every act_user_id = alice
+ *     row to T0 (equal stamps fall to getFeedRows' id tiebreak;
+ *     autoincrement ids repeat identically every run), the absolute links
+ *     derive from the request origin (https://test.local), and every op
+ *     type is inside the wired 14-type set — the projection throws
+ *     outside it, so a new unwired emitter in the seed fails loudly
+ *     (500), never drifts silently. Channel stamp = the pinned clock →
+ *     FEED_PINNED_CHANNEL_STAMP.
+ *   - releases-feed (TAKEN): `/alice/golden/releases.rss` — the seeded
+ *     release rows' feed: exactly the published v1 (the draft v2.0-rc1 is
+ *     excluded UNCONDITIONALLY — upstream's IncludeDrafts-unset, no viewer
+ *     parameter), exercising the release-item gorilla deltas (the
+ *     always-empty <description>, the bare attribute-less <guid>, the
+ *     CDATA note render through the markdown pipeline, the publisher-join
+ *     author) and the channel's `/release`-singular link quirk. The item
+ *     stamp is the create-time fixture (publishedUnix = T0+90).
+ *   - tags-feed (TAKEN): `/alice/golden/tags.rss` — the engine tag universe
+ *     joined with the D1 rows. The engine cell REUSES the harness's only
+ *     tag-carrying repo (alice/golden's PUSHED refs/tags/v1 — ensureSeededRepo's
+ *     tags param) instead of seeding a new one: a fresh tag-carrying repo
+ *     would need another receive-pack push for one redundant arm. The join
+ *     hits the release-backed arm (engine tag v1 <-> the seeded release row;
+ *     release title/link under the default-true has_releases setting — the
+ *     canReadReleases arm), channel "Tags for alice/golden" over the
+ *     plural /tags link. The rowless-tag and releases-disabled arms stay
+ *     with the smokes (the envelope's one golden needs the seeded-join
+ *     posture to stay deterministic).
+ *
+ * XML-harness notes (the wave brief's non-HTML check):
+ *   - The committed files carry the content-honest `.rss` extension;
+ *     goldens.test.ts owns the `?raw` read, so the goldenBodies glob above
+ *     grew the `./goldens/*.rss` arm. Nothing else assumed HTML:
+ *     renderCase/renderRoute compare body TEXT (res.text()), and
+ *     update-goldens.mjs is marker-based text extraction — no HTML
+ *     parsing anywhere in the harness.
+ *   - Known caveat (update-goldens.mjs is OUTSIDE this wave's ownership):
+ *     the script enumerates/empties `goldens/*.html` only. `.rss` goldens
+ *     are written through the union with the rendered marker names, so
+ *     regeneration works, but a case REMOVED from FEED_GOLDEN_CASES leaves
+ *     its stale file behind without the loud no-render failure the .html
+ *     enumeration provides. The orchestrator should extend the script's
+ *     `.html` filter when convenient.
+ *   - Content-type determinism: the goldens assert the BODY (the envelope
+ *     bytes); the a11y EXPANSION_ARMS are NOT applicable to these three —
+ *     that suite parses goldens as HTML DOM trees (landmarks/headings/
+ *     table-header rules) and RSS envelopes carry none of those structures,
+ *     so no arms are declared for them in a11y.test.ts (the file is outside
+ *     this wave's ownership anyway; its per-file `?raw` imports never see
+ *     `.rss` names). The route's content-type header choice is pinned
+ *     separately below (the gorilla writeFeed strings).
+ */
+const FEED_GOLDEN_CASES: GoldenCase[] = [
+  { file: "user-feed-alice.rss", path: "/alice.rss", status: 200, signedIn: true },
+  { file: "releases-feed.rss", path: "/alice/golden/releases.rss", status: 200 },
+  { file: "tags-feed.rss", path: "/alice/golden/tags.rss", status: 200 },
+];
+
+describe("feed goldens (the wave-golden-feeds closures)", () => {
+  for (const golden of FEED_GOLDEN_CASES) {
+    it(`renders ${golden.file} byte-identical (200) under the pinned route clock`, async () => {
+      // The channel stamps (RSS pubDate) are routeNow() bytes — the pin
+      // must WRAP the render like the cron golden above (module-scope
+      // seam, not a per-request field), and the try/finally restores the
+      // wall clock even on failure so a broken golden cannot leak the pin
+      // into sibling suites.
+      __setRouteClockForTests(() => new Date(T0 * 1000));
+      try {
+        await renderGoldenCase(golden);
+      } finally {
+        __setRouteClockForTests(null);
+      }
+    });
+  }
+
+  it("serves the gorilla writeFeed content types on all three feed routes", async () => {
+    // The case table pins the envelope BYTES; this pins the ROUTE's
+    // content-type header choice (index.ts's per-family dispatch) — the
+    // one non-body byte the XML surfaces carry that a body golden cannot
+    // capture. The clock is irrelevant here (headers are clock-free), so
+    // no pin wraps this arm.
+    for (const [path, contentType] of [
+      ["/alice.rss", "application/rss+xml;charset=utf-8"],
+      ["/alice/golden/releases.rss", "application/rss+xml;charset=utf-8"],
+      ["/alice/golden/tags.rss", "application/rss+xml;charset=utf-8"],
+    ] as const) {
+      const res = await uiRouter.fetch(new Request(`https://test.local${path}`), uiEnv);
+      expect(res.headers.get("content-type"), path).toBe(contentType);
+    }
   });
 });
 

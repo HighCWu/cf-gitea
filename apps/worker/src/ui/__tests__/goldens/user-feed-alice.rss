@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Feed of &#34;alice&#34;</title>
+    <link>https://test.local/alice</link>
+    <description></description>
+    <pubDate>Tue, 14 Nov 2023 22:13:20 +0000</pubDate>
+    <item>
+      <title>alice created repository &lt;a href=&#34;https://test.local/alice/golden-ms&#34;&gt;alice/golden-ms&lt;/a&gt;</title>
+      <link>https://test.local/alice/golden-ms</link>
+      <description></description>
+      <author>alice</author>
+      <guid isPermaLink="false">3: https://test.local/alice/golden-ms</guid>
+      <pubDate>Tue, 14 Nov 2023 22:13:20 +0000</pubDate>
+    </item>
+    <item>
+      <title>alice created repository &lt;a href=&#34;https://test.local/alice/golden-alt&#34;&gt;alice/golden-alt&lt;/a&gt;</title>
+      <link>https://test.local/alice/golden-alt</link>
+      <description></description>
+      <author>alice</author>
+      <guid isPermaLink="false">2: https://test.local/alice/golden-alt</guid>
+      <pubDate>Tue, 14 Nov 2023 22:13:20 +0000</pubDate>
+    </item>
+    <item>
+      <title>alice created repository &lt;a href=&#34;https://test.local/alice/golden&#34;&gt;alice/golden&lt;/a&gt;</title>
+      <link>https://test.local/alice/golden</link>
+      <description></description>
+      <author>alice</author>
+      <guid isPermaLink="false">1: https://test.local/alice/golden</guid>
+      <pubDate>Tue, 14 Nov 2023 22:13:20 +0000</pubDate>
+    </item>
+  </channel>
+</rss>
