@@ -77,6 +77,7 @@ import userSettingsNotificationsGolden from "./goldens/user-settings-notificatio
 import userSettingsProfileGolden from "./goldens/user-settings-profile.html?raw";
 import userSettingsReposGolden from "./goldens/user-settings-repos.html?raw";
 import wikiStartGolden from "./goldens/wiki-start.html?raw";
+import wikiViewHomeGolden from "./goldens/wiki-view-home.html?raw";
 import { GOLDEN_CASES } from "./harness";
 
 const goldens: Record<string, string> = {
@@ -330,6 +331,17 @@ const EXPANSION_ARMS: ExpansionArm[] = [
   { file: "user-settings-notifications.html", golden: userSettingsNotificationsGolden, mainAriaLabel: "Notifications", mainClassTokens: ["user", "settings"], thWithoutScope: 0 },
   { file: "wiki-start.html", golden: wikiStartGolden, mainAriaLabel: "Wiki", mainClassTokens: ["repository", "wiki", "start"], thWithoutScope: 0 },
   { file: "profile-activity.html", golden: profileActivityGolden, mainAriaLabel: "alice", mainClassTokens: ["user", "profile"], thWithoutScope: 0 },
+  // wiki-view-home (the wave-wiki-fixedtime closure's a11y rider — the newest
+  // golden, a9fe3b6; goldens.test.ts's case comment declares its a11y arm
+  // NOT-auto-declared, this file's explicit-import posture): first sight is
+  // CLEAN, no pre-fix — every anchor is named (breadcrumb/tab-strip/navbar
+  // anchors are text or carry aria-labels; the family's icon-only sidebar/
+  // footer edit pencils carry aria-label="Edit" in repo-wiki.tsx but stay
+  // ABSENT from this golden — the fixture seeds no _Sidebar/_Footer), the
+  // history button names from its count text ("1"), the delete anchor is
+  // text, and the page renders NO table (R6 moot, thWithoutScope 0 by
+  // absence).
+  { file: "wiki-view-home.html", golden: wikiViewHomeGolden, mainAriaLabel: "Home", mainClassTokens: ["repository", "wiki"], thWithoutScope: 0 },
 ];
 
 describe("wave-129 expansion arms (explicit cases, not the shared table)", () => {
@@ -863,6 +875,102 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     for (const stamp of stamps) {
       expect(stamp.attrs.datetime).toBe("2023-11-14T22:13:20Z");
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // wiki-view-home surface arm (the wave-wiki-fixedtime closure's a11y
+  // rider): the wiki VIEW page's own chrome — the page-nav dropdown, the
+  // writer's three action buttons, the last-edited line's relative-time
+  // semantics, and the content-parts sidebar shape. The EXPANSION_ARMS
+  // verdict above holds the first-sight record (clean, no pre-fix).
+  // ---------------------------------------------------------------------------
+
+  it("wiki-view-home: the breadcrumb names owner and repo, the page-nav dropdown carries the single seeded page, the writer buttons are named, and the last-edited line pins the fixed-time relative-time", () => {
+    const root = parseHtmlTree(wikiViewHomeGolden);
+    // The repo header breadcrumb names owner and repo (golden-alt — the
+    // seeded sibling, not golden's empty-wiki start arm).
+    const header = descendants(root).find((el) => hasClass(el, "repo-header"));
+    expect(header, "the repo header").toBeDefined();
+    expect(descendants(header ?? root).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
+      ["/alice", "alice"],
+      ["/alice/golden-alt", "golden-alt"],
+    ]);
+    // The page's single heading is the CONTENT h1 (the markdown render's
+    // `# Home`); the page title beside it is a plain div (upstream-faithful,
+    // view.tmpl) — R1's at-most-one holds by that div choice, and a lone
+    // heading can neither skip a level (R2) nor double the h1.
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => [el.tag, accessibleName(el)])).toEqual([["h1", "Home"]]);
+
+    // The page-nav dropdown (view.tmpl:6-32's shape): the trigger names the
+    // page ("Page: Home"), the scrolling menu is the Pages link plus the
+    // seeded Home — the single-item menu with the `selected` class, no
+    // _Sidebar/_Footer arms (the fixture seeds neither).
+    const dropdown = descendants(root).find((el) => hasClass(el, "floating") && hasClass(el, "filter") && hasClass(el, "dropdown"));
+    expect(dropdown, "the page dropdown").toBeDefined();
+    expect(accessibleName(dropdown?.children.find((el) => hasClass(el, "button")) ?? ({} as never))).toBe("Page: Home");
+    const menuItems = descendants(dropdown ?? root).filter((el) => el.tag === "a" && hasClass(el, "item"));
+    expect(menuItems.map((el) => [el.attrs.href, hasClass(el, "selected"), accessibleName(el)])).toEqual([
+      ["/alice/golden-alt/wiki/?action=_pages", false, "Pages"],
+      ["/alice/golden-alt/wiki/Home", true, "Home"],
+    ]);
+
+    // The dividing header's history button: name-from-content "1" (the
+    // commit-count span; the walker consults aria-label or TEXT, never
+    // title — title="Page Revision" is a tooltip, upstream's own shape).
+    const revisionLink = descendants(root).find((el) => el.tag === "a" && (el.attrs.title ?? "") === "Page Revision");
+    expect(revisionLink, "the Page Revision anchor").toBeDefined();
+    expect(accessibleName(revisionLink ?? ({} as never))).toBe("1");
+    expect(revisionLink?.attrs.href).toBe("/alice/golden-alt/wiki/Home?action=_revision");
+
+    // The writer arm's three action buttons (view.tmpl:39-55's row), named
+    // by text: Edit, the primary New Page, and the red link-action Delete
+    // Page (href "#" — the JS POSTs data-url; no-JS the anchor is inert,
+    // upstream same).
+    const buttonRows = descendants(root).filter((el) => hasClass(el, "repo-button-row"));
+    expect(buttonRows, "the dropdown row + the actions row").toHaveLength(2);
+    const actionButtons = descendants(buttonRows[1] ?? root).filter((el) => el.tag === "a");
+    expect(actionButtons.map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
+      ["/alice/golden-alt/wiki/Home?action=_edit", "Edit"],
+      ["/alice/golden-alt/wiki?action=_new", "New Page"],
+      ["#", "Delete Page"],
+    ]);
+    expect(actionButtons[2]?.attrs["data-url"]).toBe("/alice/golden-alt/wiki/Home?action=_delete");
+    expect(actionButtons[2]?.attrs["data-modal-confirm"]).toBe("#repo-wiki-delete-page-modal");
+
+    // The last-edited line: the filled "%s edited this page " prefix with
+    // the TimeSince element completing it — the pinned seed stamp (T0+210),
+    // tense="past" (a 2023 stamp can never read future), prefix="" — the
+    // web component's own semantics, no explicit aria-label: the rendered
+    // text IS the human-readable stamp. The line's whole accessible text
+    // pins doer + stamp in one string.
+    const subHeader = descendants(root).find((el) => hasClass(el, "sub") && hasClass(el, "header"));
+    expect(subHeader, "the last-edited line").toBeDefined();
+    const stamp = (subHeader ?? root).children.find((el) => el.tag === "relative-time");
+    expect(stamp, "the relative-time element").toBeDefined();
+    expect(stamp?.attrs.datetime).toBe("2023-11-14T22:16:50Z");
+    expect(stamp?.attrs.tense).toBe("past");
+    expect(stamp?.attrs.prefix).toBe("");
+    expect(accessibleName(subHeader ?? ({} as never))).toBe("alice edited this page 2023-11-14 22:16:50 +00:00");
+
+    // The content-parts shape: main only — the sidebar/footer arms are empty
+    // (the with-sidebar class keys on the sidebar's presence), so the
+    // family's icon-only edit pencils (aria-label="Edit" in repo-wiki.tsx)
+    // render nowhere on this golden.
+    const parts = descendants(root).find((el) => hasClass(el, "wiki-content-parts"));
+    expect(parts, "the wiki-content-parts wrapper").toBeDefined();
+    expect(descendants(parts ?? root).some((el) => hasClass(el, "wiki-content-main")), "the main arm").toBe(true);
+    expect(descendants(parts ?? root).some((el) => hasClass(el, "wiki-content-sidebar")), "no sidebar arm").toBe(false);
+    expect(descendants(parts ?? root).some((el) => hasClass(el, "wiki-content-footer")), "no footer arm").toBe(false);
+    const mainArm = descendants(parts ?? root).find((el) => hasClass(el, "wiki-content-main"));
+    expect(hasClass(mainArm ?? root, "with-sidebar"), "with-sidebar stays off without sidebar content").toBe(false);
+
+    // The writer-gated delete confirm modal rendered for this signed-in
+    // owner golden — its buttons are named (modal_actions_confirm's default
+    // Yes/No arm).
+    const modal = getElementById(root, "repo-wiki-delete-page-modal");
+    expect(modal, "the delete confirm modal").not.toBeNull();
+    expect(descendants(modal ?? root).filter((el) => el.tag === "button").map((el) => accessibleName(el))).toEqual(["No", "Yes"]);
   });
 });
 
