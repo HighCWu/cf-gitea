@@ -834,7 +834,7 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
         <table class="ui very basic selectable table unstackable">
           <thead>
             <tr>
-              <th>
+              <th scope="col">
                 <SortHeader
                   label={adminUsersLocale.col_id}
                   asc="oldest"
@@ -844,7 +844,7 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
                   buildHref={sortHref}
                 />
               </th>
-              <th>
+              <th scope="col">
                 <SortHeader
                   label={adminUsersLocale.col_name}
                   asc="alphabetically"
@@ -855,13 +855,13 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
                   buildHref={sortHref}
                 />
               </th>
-              <th>{adminUsersLocale.col_email}</th>
-              <th>{adminUsersLocale.col_auth_source}</th>
-              <th>{adminUsersLocale.col_activated}</th>
-              <th>{adminUsersLocale.col_restricted}</th>
-              <th>{adminUsersLocale.col_2fa}</th>
-              <th>{adminUsersLocale.col_created}</th>
-              <th>{adminUsersLocale.col_last_login}</th>
+              <th scope="col">{adminUsersLocale.col_email}</th>
+              <th scope="col">{adminUsersLocale.col_auth_source}</th>
+              <th scope="col">{adminUsersLocale.col_activated}</th>
+              <th scope="col">{adminUsersLocale.col_restricted}</th>
+              <th scope="col">{adminUsersLocale.col_2fa}</th>
+              <th scope="col">{adminUsersLocale.col_created}</th>
+              <th scope="col">{adminUsersLocale.col_last_login}</th>
             </tr>
           </thead>
           <tbody>

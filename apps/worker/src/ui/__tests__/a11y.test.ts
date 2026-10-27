@@ -261,16 +261,10 @@ interface ExpansionArm {
 }
 
 const EXPANSION_ARMS: ExpansionArm[] = [
-  // KNOWN GAP (wave-129, disclosed here rather than hidden): the sortable
-  // users table renders its nine <th> header cells without explicit scope
-  // attributes, so R6 fires once per cell — the ONLY rule violation across
-  // the four surfaces (everything else in the four goldens is clean). The
-  // honest fix is a component edit + a golden byte regeneration (the admin
-  // users page and goldens/admin-users.html sit outside this file's wave
-  // ownership), so the case pins the gap exactly: the count can neither grow
-  // silently nor disappear without this assertion demanding the flip to a
-  // clean-membership arm.
-  { file: "admin-users.html", golden: adminUsersGolden, mainAriaLabel: "User Account Management", mainClassTokens: ["admin", "user"], thWithoutScope: 9 },
+  // GAP CLOSED (the orchestrator's fix landed same-day): admin-users' nine
+  // th cells carry scope="col" (the commit-list.tsx:47 precedent) and the
+  // golden regenerated — all four surfaces now assert FULLY clean runA11y.
+  { file: "admin-users.html", golden: adminUsersGolden, mainAriaLabel: "User Account Management", mainClassTokens: ["admin", "user"], thWithoutScope: 0 },
   { file: "user-settings-account.html", golden: userSettingsAccountGolden, mainAriaLabel: "Account", mainClassTokens: ["user", "settings", "account"], thWithoutScope: 0 },
   { file: "profile-watching.html", golden: profileWatchingGolden, mainAriaLabel: "alice", mainClassTokens: ["user", "profile"], thWithoutScope: 0 },
   { file: "milestone-detail.html", golden: milestoneDetailGolden, mainAriaLabel: "v1.0", mainClassTokens: ["repository", "milestone-issue-list"], thWithoutScope: 0 },
@@ -332,7 +326,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     expect(headings.map((el) => accessibleName(el))).toEqual(["User Account Management (Total: 4)"]);
   });
 
-  it("admin-users: the users table's header cells are named — and each of the nine is the pinned scope gap", () => {
+  it("admin-users: the users table's header cells are named — and all nine carry scope (the closed gap's membership arm)", () => {
     const root = parseHtmlTree(adminUsersGolden);
     const table = descendants(root).find((el) => el.tag === "table");
     expect(table, "the users table").toBeDefined();
@@ -350,9 +344,10 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Created",
       "Last Sign-In",
     ]);
-    // The element-level shape of the KNOWN GAP above: every header cell lacks
-    // scope, so the fix is exactly nine scope attributes on this thead.
-    expect(ths.every((el) => el.attrs.scope === undefined), "every th lacks scope (the pinned gap)").toBe(true);
+    // The gap's fix flipped to membership: every header cell now carries
+    // scope="col" (the fix landed with the golden regeneration — see the
+    // EXPANSION_ARMS note above).
+    expect(ths.every((el) => el.attrs.scope === "col"), "every th carries scope=col (the closed gap)").toBe(true);
   });
 
   it("user-settings-account: the settings sidebar names every arm (Account active) and the three section headings hold level", () => {
