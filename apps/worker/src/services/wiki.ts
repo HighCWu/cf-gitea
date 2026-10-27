@@ -536,6 +536,52 @@ export async function listWikiPageRevisions(
 }
 
 // ---------------------------------------------------------------------------
+// The web raw arm (routers/web/repo/wiki.go WikiRaw — the family's byte route)
+// ---------------------------------------------------------------------------
+
+/** One raw wiki blob: `oid` is the ETag's bytes, `data` the full body. */
+export interface WikiRawBlob {
+  oid: string;
+  data: Uint8Array;
+}
+
+/**
+ * `WikiRaw` payload (wiki.go:597-639): the default-branch tip
+ * (findWikiRepoCommit — an unborn wiki branch is its not-exist → NotFound
+ * class, wiki.go:600-604), then the four `findEntryForFile` candidates in
+ * upstream's probe order (wiki.go:609-628 over wiki.go:81-96): the coded git
+ * path, its QueryUnescaped form, the `.md`-trimmed path (the non-`.md` raw
+ * file round — the "image for example" arm), its QueryUnescaped form.
+ * `rawTail` is the route's wildcard tail in the family's decoded convention
+ * (`webPathFromRequest` re-encodes it). Null = the 404 family: no wiki
+ * branch, or no entry after every candidate.
+ */
+export async function readWikiRawBlob(
+  env: ApiEnv["Bindings"],
+  pair: RepositoryWithOwner,
+  rawTail: string,
+): Promise<WikiRawBlob | null> {
+  const { reads, tip } = await wikiTip(env, pair);
+  if (tip === undefined) return null;
+  const gitPath = webPathToGitPath(webPathFromRequest(rawTail));
+  // TrimSuffix(providedGitPath, ".md") (wiki.go:622) — WebPathToGitPath
+  // always yields a `.md` path, so the trim always fires.
+  const trimmed = gitPath.endsWith(".md") ? gitPath.slice(0, -3) : gitPath;
+  for (const target of [gitPath, trimmed]) {
+    // findEntryForFile (wiki.go:81-96): the target, then Go
+    // url.QueryUnescape(target) ("the shortest alternative"); the engine's
+    // null read is the not-exist class.
+    const unescaped = queryUnescape(target);
+    const candidates = unescaped !== null && unescaped !== target ? [target, unescaped] : [target];
+    for (const candidate of candidates) {
+      const blob = await reads.readBlob(tip.target, candidate);
+      if (blob !== null) return { oid: blob.oid, data: blob.data };
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Write operations (upstream updateWikiPage / DeleteWikiPage semantics)
 // ---------------------------------------------------------------------------
 
