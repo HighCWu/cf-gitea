@@ -23,10 +23,11 @@
  * `#protected-branches-list` divided list: each row the rule name in a
  * `.ui.basic.primary.label`, the Edit anchor onto `?rule_name=<name>` and
  * the red Delete button (the JS confirm modal is not reproduced — the same
- * reduction the hooks list recorded in wave 4). The default-branch selector
- * segment above it is upstream's SetDefaultBranchPost — NOT part of the
- * landed branch_protections family and unrendered here (documented
- * degradation). The form page is protected_branch.tmpl's shape: the
+ * reduction the hooks list recorded in wave 4). Above it the default-branch
+ * segment (branches.tmpl:8-30 — upstream's SetDefaultBranchPost arm, NOT
+ * part of the landed branch_protections family) renders over the landed
+ * §2.5.2 write (RepoService.setDefaultBranch): the section below. The form
+ * page is protected_branch.tmpl's shape: the
  * Patterns / Push / Force Push / Branch Deletion / Pull Request Approvals /
  * Pull Request Merge / Bypass sections with the exact upstream field names
  * (`rule_name`, `enable_push` none|all|whitelist radios,
@@ -71,6 +72,38 @@
  *   no-JS shape of the same op (repoUpdateBranchProtectionPriories —
  *   renumber 1-based in list order, foreign-repo ids no-op through the
  *   repo_id guard).
+ *
+ * ## The default-branch segment (branches.tmpl:8-30 + SetDefaultBranchPost)
+ *
+ * The list page's first segment is upstream's default-branch select: the h4
+ * `repo.default_branch` header, the form POSTing onto the page itself
+ * (`.Link` — the request path, context.go:59) with the hidden
+ * `action=default_branch` field, the option menu sourced from
+ * PrepareBranchList's port (routers/web/repo/repo.go:598-618 over the
+ * ENGINE branch list — refs/heads/ byte-sorted, the current default moved
+ * to the top when it exists) and the submit disabled while
+ * `.Repository.IsEmpty` (branches.tmpl:26). The Fomantic search dropdown
+ * reduces to a native select (the no-JS convention — the menu items ARE
+ * upstream's `data-value` items, the current default the marked selection;
+ * the triangle-down svg is the JS dropdown's chrome, the icon-reduction
+ * precedent) and carries the current default even when the engine does not
+ * know it (upstream's hidden input + `.default text` render it verbatim).
+ *
+ * **HANDOFF — the write arm is NOT mounted in `src/ui/index.ts`**
+ * (orchestrator-owned): the GET handler does not yet pass `branchOptions`
+ * (the select renders the current default alone until it does — the
+ * two-stage-unmounted convention, branches.tsx's writer block) and the POST
+ * is unregistered. The mount recipe (SetDefaultBranchPost's shape):
+ * sameOriginGuard → resolveUiRequest → settingsGate → the archived 404
+ * (RepoMustNotBeArchived's posture), `action != "default_branch"` 404s
+ * (upstream's switch default arm), then applyDefaultBranchForm(c.env, repo,
+ * form.get("branch") ?? "") — `missing` 404-shells (upstream's
+ * ErrBranchNotExist → ctx.Status(404)), success 303s onto
+ * `/{owner}/{repo}/settings/branches` (upstream's redirect to the request
+ * path; the update_settings_success flash is the display-only-param
+ * reduction dropped — the delete/priority bare-303 precedent), plus the
+ * GET passing `branchOptions: repo.isArchived ? [] : await
+ * loadDefaultBranchOptions(c.env, repo)` in the list data.
  *
  * ## Auth + CSRF + archived posture (the settings pages' convention)
  *
@@ -137,7 +170,9 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { ApiError } from "../../api/errors";
+import { engineReads } from "../../api/services/engine";
 import type { RepositoryWithOwner } from "../../api/services/repository";
+import { RepoService } from "../../repos/service";
 import { protectedBranches, teams, users } from "../../db/schema";
 import {
   ACTIONS_USER_ID,
@@ -223,6 +258,12 @@ export const branchProtectionLocale = {
   readonly_name_note: "Rule names cannot be renamed: the API edit arm keys the rule by its name.", // cf-gitea addition
   required_rule_name: "Rule name cannot be empty.", // cf-gitea addition (the HTML5 required backs this; upstream's flash key is protected_branch_required_rule_name)
   required_approvals_min: "Required approvals cannot be negative.", // "repo.settings.protected_branch_required_approvals_min"
+  default_branch: "Default Branch", // "repo.default_branch" (the segment header)
+  default_branch_desc: "Select a default branch for code commits.", // "repo.settings.default_branch_desc"
+  update_default_branch: "Update Default Branch", // "repo.settings.branches.update_default_branch" (the submit)
+  default_target_branch_desc:
+    "Pull requests can use different default target branch if it is set in the Pull Requests section of Repository Advance Settings.", // "repo.settings.default_target_branch_desc"
+  default_branch_select_aria: "Default branch", // cf-gitea addition — the native select's accessible name (upstream's dropdown has none)
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -255,6 +296,39 @@ export async function loadOwnerIsOrg(d1: D1Database, repo: RepoRow): Promise<boo
   if (repo.ownerId === null) return false;
   const row = await drizzle(d1).select({ type: users.type }).from(users).where(eq(users.id, repo.ownerId)).limit(1).get();
   return row?.type === "org";
+}
+
+// ---------------------------------------------------------------------------
+// The default-branch select (branches.tmpl:8-30 — upstream's SetDefaultBranchPost
+// arm; the option source and the write seam below, the module header carries
+// the mount recipe)
+// ---------------------------------------------------------------------------
+
+/** The engine's branch names (refs/heads/ filtered, byte-sorted — the API
+ *  LIST's universe and comparator, loadBranchesData's half): the write arm's
+ *  existence check AND (through loadDefaultBranchOptions) the select's
+ *  source, so the render gate and the write seam can never disagree (the
+ *  branches.tsx delete posture). A failed read degrades to an empty list
+ *  (§4.9) — the select renders the unborn default alone and the write arm
+ *  refuses changes (upstream's IsBranchExist arm reads the synced branch
+ *  table; a lookup failure reads as not-exist there too). */
+export async function loadEngineBranchNames(env: Env, repo: RepoRow): Promise<string[]> {
+  const refs = await engineReads(env, repo).listRefs();
+  return (refs?.refs ?? [])
+    .filter((ref) => ref.name.startsWith("refs/heads/"))
+    .map((ref) => ref.name.slice("refs/heads/".length))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/** PrepareBranchList's port (routers/web/repo/repo.go:598-618) over the
+ *  engine's branch list — the select's option menu, "always put default
+ *  branch on the top if it exists". */
+export async function loadDefaultBranchOptions(env: Env, repo: RepoRow): Promise<string[]> {
+  const names = await loadEngineBranchNames(env, repo);
+  if (names.includes(repo.defaultBranch)) {
+    return [repo.defaultBranch, ...names.filter((name) => name !== repo.defaultBranch)];
+  }
+  return names;
 }
 
 /** Singular/plural count word (the counts line's tiny grammar). */
@@ -823,6 +897,60 @@ export function parsePriorityIds(params: URLSearchParams): number[] {
 }
 
 // ---------------------------------------------------------------------------
+// The default-branch write (branches.tmpl's SetDefaultBranchPost arm over the
+// landed §2.5.2 service — the module header carries the mount recipe)
+// ---------------------------------------------------------------------------
+
+export type DefaultBranchResult =
+  | { outcome: "applied"; branch: string }
+  | { outcome: "missing"; branch: string }; // the engine does not know the branch — the 404 shell
+
+/** The production setDefaultBranch seam: RepoService with the engine's
+ *  setHead RPC wired (the api/routes/repo.ts PATCH wiring shape — bare
+ *  construction silently skips the DO head move; D1 is the metadata truth
+ *  either way, the service header). */
+function productionSetDefaultBranch(env: Env): (repoId: string, branch: string) => Promise<unknown> {
+  const service = new RepoService(env.DB, {
+    setHead: async (engineName, branch) => (await env.REPO.getByName(engineName).setHead(branch)).tag,
+  });
+  return (repoId, branch) => service.setDefaultBranch(repoId, branch);
+}
+
+/**
+ * The default-branch write, SetDefaultBranchPost's shape over the landed
+ * `RepoService.setDefaultBranch` (SPEC-0003 §2.5.2):
+ *
+ * 1. the same-name POST is the service's own early no-op
+ *    (SetRepoDefaultBranch, services/repository/branch.go:708-710) — still
+ *    success, nothing writes (updatedAt untouched);
+ * 2. any other name must exist in the SAME engine branch list the select
+ *    renders (SetRepoDefaultBranch's IsBranchExist arm :711-717); missing →
+ *    `missing` (the handler 404-shells — upstream's ErrBranchNotExist →
+ *    ctx.Status(404); an empty repo's hand-crafted POST lands here too, its
+ *    button is disabled upstream);
+ * 3. the landed service writes: D1 first (the metadata truth), the engine's
+ *    setHead best-effort (an "invalid"/"not_found" rejection logs, never
+ *    blocks — an empty repo may point at an unborn branch, the service
+ *    header).
+ *
+ * `setDefaultBranch` is injectable so the seam tests assert the call's
+ * arguments; the handler mounts the production wiring (the default).
+ */
+export async function applyDefaultBranchForm(
+  env: Env,
+  repo: RepoRow,
+  branch: string,
+  setDefaultBranch: (repoId: string, branch: string) => Promise<unknown> = productionSetDefaultBranch(env),
+): Promise<DefaultBranchResult> {
+  if (branch !== repo.defaultBranch) {
+    const names = await loadEngineBranchNames(env, repo);
+    if (!names.includes(branch)) return { outcome: "missing", branch };
+    await setDefaultBranch(repo.id, branch);
+  }
+  return { outcome: "applied", branch };
+}
+
+// ---------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------
 
@@ -844,6 +972,11 @@ export interface BranchProtectionListData {
    *  carries the saved rule's name (upstream's exact target,
    *  protected_branch.go:337); display-only. */
   savedRule: string | null;
+  /** The default-branch select's options (loadDefaultBranchOptions —
+   *  PrepareBranchList's port). Optional until the mount wave passes it (the
+   *  handler recipe in the module header) — the segment still renders with
+   *  the current default alone (the two-stage-unmounted convention). */
+  branchOptions?: string[];
 }
 
 function SettingsBranchesNav(props: { repoLink: string; repo: RepoRow }) {
@@ -855,6 +988,54 @@ function SettingsBranchesNav(props: { repoLink: string; repo: RepoRow }) {
   // the visibility arm — this page loads no repo_units row, and
   // loadRepoPublicAccess's read stays the public-access page's loader).
   return <SettingsNavHost repoLink={props.repoLink} active="branches" repo={props.repo} />;
+}
+
+/** The default-branch segment (branches.tmpl:8-30 — upstream's
+ *  SetDefaultBranchPost form): the h4 header, the attached segment with the
+ *  desc paragraph, the POST onto the page itself (`.Link` — the request
+ *  path, context.go:59) carrying the hidden `action=default_branch`, the
+ *  Fomantic search dropdown reduced to a native select (the option list IS
+ *  upstream's menu items, the current default the marked selection; the
+ *  current default rides the form even when the engine does not know it —
+ *  upstream's hidden input + `.default text` render it verbatim), the
+ *  submit disabled while the repo is empty (the template's IsEmpty arm) and
+ *  the target-branch help line at the form's tail. */
+function DefaultBranchSegment(props: { repoLink: string; repo: RepoRow; branchOptions: string[] }) {
+  const { repoLink, repo } = props;
+  // PrepareBranchList tops the list with the default when it exists; an
+  // unborn/unresolvable default still opens the menu (the hidden-input arm).
+  const options = props.branchOptions.includes(repo.defaultBranch)
+    ? props.branchOptions
+    : [repo.defaultBranch, ...props.branchOptions];
+  return (
+    <>
+      <h4 class="ui top attached header">{branchProtectionLocale.default_branch}</h4>
+      <div class="ui attached segment">
+        <p>{branchProtectionLocale.default_branch_desc}</p>
+        <form class="ui form" action={`${repoLink}/settings/branches`} method="post">
+          <input type="hidden" name="action" value="default_branch" />
+          <div class="flex-text-block">
+            <select
+              id="default_branch"
+              name="branch"
+              class="ui selection dropdown tw-flex-1 tw-mr-2 tw-max-w-96"
+              aria-label={branchProtectionLocale.default_branch_select_aria}
+            >
+              {options.map((name) => (
+                <option value={name} selected={name === repo.defaultBranch}>
+                  {name}
+                </option>
+              ))}
+            </select>
+            <button type="submit" class="ui primary button" disabled={repo.isEmpty || undefined}>
+              {branchProtectionLocale.update_default_branch}
+            </button>
+          </div>
+          <div class="help tw-mt-4 tw-p-0">{branchProtectionLocale.default_target_branch_desc}</div>
+        </form>
+      </div>
+    </>
+  );
 }
 
 function BranchProtectionListPage(props: { ctx: UiContext; data: BranchProtectionListData }) {
@@ -880,6 +1061,7 @@ function BranchProtectionListPage(props: { ctx: UiContext; data: BranchProtectio
             </>
           ) : (
             <>
+              <DefaultBranchSegment repoLink={repoLink} repo={repo} branchOptions={data.branchOptions ?? []} />
               <h4 class="ui top attached header flex-left-right">
                 <span>{branchProtectionLocale.protected_branch}</span>
                 <a class="ui primary tiny button" href={`${repoLink}/settings/branches/edit`}>

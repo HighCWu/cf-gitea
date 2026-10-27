@@ -9,9 +9,17 @@
  * citations).
  *
  * Same harness posture as pages-wave2..14: the router is driven directly
- * with the synthetic ASSETS manifest and D1-only fixtures (no page here
- * reads engine content), rules seeded through direct D1 inserts with fixed
- * values, identities riding minted session cookies.
+ * with the synthetic ASSETS manifest and D1-only fixtures; rules seeded
+ * through direct D1 inserts with fixed values, identities riding minted
+ * session cookies. The default-branch select's arms (branches.tmpl's
+ * SetDefaultBranchPost segment — the wave-branches-default pass) are the
+ * exception: they read ENGINE content, so `alice/wave15-defbranch` seeds a
+ * multi-branch repo through the REAL receive flow (the wave-17 recipe) and
+ * the select/apply arms run at the module seam (loadDefaultBranchOptions /
+ * renderBranchProtectionListPage / applyDefaultBranchForm) — the route's
+ * GET does not yet pass `branchOptions` and the POST is unregistered (the
+ * handler recipe rides pages/branch-protection.tsx's module header; the
+ * route-level arms pin the stable unborn-default bytes).
  *
  * Gate postures under test: the settings pages' admin gate (anonymous 303,
  * signed-in non-admin 404) on every page and write; the archived refusals
@@ -19,25 +27,32 @@
  * posture); the create arm's 403 duplicate text and the name/team
  * resolution 422 texts surfaced inline; the edit arm's stored-field
  * preservation for the unrendered arms (SPEC-0013 §6); the priority op's
- * 1-based renumber with the foreign-id no-op.
+ * 1-based renumber with the foreign-id no-op; the default-branch select's
+ * PrepareBranchList option order, the marked default, the empty-repo
+ * disabled arm and the service seam's arguments (same-name no-op, the
+ * missing-branch refusal, the production wiring's D1+engine-head write).
  */
 
-import { env } from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { seedVerifiedUser } from "../../auth/testing/seeds";
+import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
 import { protectedBranches, repositories, users } from "../../db/schema";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
 import { emptyRuleConfig, parseRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { OrgService } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
 import { TeamsService } from "../../api/routes/org-teams";
+import { settleCreatingRepo } from "../../git-http/gate";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { runA11y } from "./a11y";
-import { T0, uiEnv } from "./harness";
+import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
+import { T0, uiEnv, manifest } from "./harness";
+import { applyDefaultBranchForm, loadDefaultBranchOptions, renderBranchProtectionListPage } from "../pages/branch-protection";
+import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 
 async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
@@ -72,6 +87,69 @@ interface Wave15Fixture {
 }
 
 let wave15Fixture: Wave15Fixture | null = null;
+
+/** Three fixed commits for the engine-backed default-branch fixture repo:
+ *  main sits at tips[1], feature/one at tips[2], release/1 at tips[0]. */
+const WAVE15_DEFBRANCH_COMMITS: SeedCommit[] = [1, 2, 3].map((n, index) => ({
+  message: `wave15-defbranch: commit ${n}`,
+  time: T0 + index * 60,
+  files: [{ path: `f${n}.txt`, content: `content ${n}\n` }],
+}));
+
+/** Idempotent multi-branch engine seed for `alice/wave15-defbranch` (the
+ *  wave-17 recipe verbatim: one pack through the REAL receive flow —
+ *  ensureSeededRepo only ever lands main, and the default-branch select's
+ *  option arms need the multi-branch ref set; the multi-ref first push
+ *  lands HEAD on the alphabetically-first ref, so D1's default_branch is
+ *  pinned to "main" like every deterministic column). */
+async function ensureWave15EngineRepo(): Promise<void> {
+  const db = drizzle(env.DB);
+  const repoName = "alice/wave15-defbranch";
+  const alice = (await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get())!;
+  await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?")
+    .bind(alice.id, "ui-page-seed-wave15-defbranch")
+    .run();
+  const token = (await mintFor(alice.id, "ui-page-seed-wave15-defbranch", "write:repository")).plaintext;
+  const refs = await env.REPO.getByName(repoName).listRefs();
+  if (refs.head === null) {
+    const { tips, pack } = await buildHistoryPack(WAVE15_DEFBRANCH_COMMITS);
+    const response = await SELF.fetch(`https://test.local/${repoName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/x-git-receive-pack-request" },
+      body: buildReceivePackBody(
+        [
+          { ref: "refs/heads/main", oid: tips[1] as string },
+          { ref: "refs/heads/feature/one", oid: tips[2] as string },
+          { ref: "refs/heads/release/1", oid: tips[0] as string },
+        ],
+        pack,
+      ),
+    });
+    const responseBody = response.status === 200 ? new TextDecoder().decode(await response.arrayBuffer()) : "";
+    if (response.status !== 200 || responseBody.includes("ng ")) {
+      throw new Error(`wave15-defbranch seed push failed: ${response.status} ${responseBody.slice(0, 400)}`);
+    }
+  }
+  let row = await db
+    .select()
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave15-defbranch")))
+    .get();
+  if (row === undefined) {
+    row = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "wave15-defbranch",
+      isPrivate: false,
+      status: "ready",
+    });
+  } else {
+    await settleCreatingRepo(env, row.id, repoName);
+    row = (await db.select().from(repositories).where(eq(repositories.id, row.id)).get()) ?? row;
+  }
+  if (row.defaultBranch !== "main") {
+    await db.update(repositories).set({ defaultBranch: "main" }).where(eq(repositories.id, row.id));
+  }
+}
 
 async function ensureWave15Fixtures(): Promise<Wave15Fixture> {
   if (wave15Fixture !== null) return wave15Fixture;
@@ -190,6 +268,10 @@ async function ensureWave15Fixtures(): Promise<Wave15Fixture> {
   const editRule = await ruleOf("edit-me");
   const deleteRule = await ruleOf("delete-me");
 
+  // The engine-backed repo for the default-branch select's arms (after the
+  // rule seeds — the push may settle the row concurrently with nothing).
+  await ensureWave15EngineRepo();
+
   wave15Fixture = {
     ownerCookie: await mintSession(env.DB, alice.id),
     adminCookie: await mintSession(env.DB, (await db.select().from(users).where(eq(users.usernameLower, "wave15boss")).get())!.id),
@@ -268,8 +350,11 @@ describe("GET /{owner}/{repo}/settings/branches (the rules list)", () => {
       expect(html).toContain("Branch Protection");
       expect(html).toContain('href="/alice/wave15/settings/branches/edit"');
       // Priority order: main (plain) first, release/* second; the ranks and
-      // the glob badge (IsRuleNameSpecial).
-      expect(html.indexOf(">main<")).toBeLessThan(html.indexOf(">release/*<"));
+      // the glob badge (IsRuleNameSpecial). The order check slices from the
+      // list container — the default-branch select's menu (above the list)
+      // carries its own ">main<" option text.
+      const listHtml = html.slice(html.indexOf("protected-branches-list"));
+      expect(listHtml.indexOf(">main<")).toBeLessThan(listHtml.indexOf(">release/*<"));
       expect(html).toContain("<span class=\"ui tiny basic label\">#1</span>");
       expect(html).toContain("<span class=\"ui tiny basic label\">#2</span>");
       expect(html).toContain('<span class="ui tiny label">glob</span>');
@@ -305,7 +390,10 @@ describe("GET /{owner}/{repo}/settings/branches (the rules list)", () => {
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).toContain("Branch settings are not available if the repo is archived.");
+      // branches.tmpl's IsArchived arm hides BOTH segments (the template's
+      // whole content sits inside the else) — the default-branch select too.
       expect(html).not.toContain("protected-branches-list");
+      expect(html).not.toContain("Update Default Branch");
     } finally {
       await db.update(repositories).set({ isArchived: false }).where(eq(repositories.id, row.id));
     }
@@ -696,9 +784,11 @@ describe("POST /{owner}/{repo}/settings/branches/priority (the reorder write)", 
     expect(plain.priority).toBe(3);
     // The foreign id wrote nothing (the repo_id guard).
     expect(await db.select().from(protectedBranches).where(eq(protectedBranches.id, 424242)).get()).toBeUndefined();
-    // The list renders the new first-match order.
+    // The list renders the new first-match order (sliced to the list
+    // container — the select's own ">main<" option sits above it).
     const html = await (await fetchUi("/alice/wave15/settings/branches", withCookie(fixture.ownerCookie))).text();
-    expect(html.indexOf(">release/*<")).toBeLessThan(html.indexOf(">main<"));
+    const listHtml = html.slice(html.indexOf("protected-branches-list"));
+    expect(listHtml.indexOf(">release/*<")).toBeLessThan(listHtml.indexOf(">main<"));
     // Restore the seeded order for the later a11y renders.
     await fetchUi(
       "/alice/wave15/settings/branches/priority",
@@ -720,6 +810,143 @@ describe("POST /{owner}/{repo}/settings/branches/priority (the reorder write)", 
   });
 });
 
+// --- the default-branch select (branches.tmpl:8-30, SetDefaultBranchPost) -----------
+
+describe("the default-branch select (branches.tmpl's SetDefaultBranchPost arm)", () => {
+  const defBranchRow = async (): Promise<RepoRow> =>
+    (await drizzle(env.DB).select().from(repositories).where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave15-defbranch"))).get())!;
+
+  /** A minimal UiContext for the direct renderer calls — the same fields the
+   *  route's GET handler assembles (the renderers are pure; no DB reads). */
+  const directCtx = (repo: RepoRow): UiContext => ({
+    viewer: { kind: "user", id: 1, username: "alice", isAdmin: false },
+    origin: "https://test.local",
+    repo,
+    assets: shellAssetsFromManifest(manifest),
+  });
+
+  it("loads the options from the engine branch list, the current default topped (PrepareBranchList's port)", async () => {
+    await ensureWave15Fixtures();
+    const options = await loadDefaultBranchOptions(env, await defBranchRow());
+    // Byte-sorted engine names with the default moved to the top
+    // (repo.go:598-618's "always put default branch on the top").
+    expect(options).toEqual(["main", "feature/one", "release/1"]);
+  });
+
+  it("renders the segment: menu options in order, the marked default, enabled submit on a pushed repo", async () => {
+    await ensureWave15Fixtures();
+    const repo = await defBranchRow();
+    const html = renderBranchProtectionListPage({
+      ctx: directCtx(repo),
+      data: { rules: [], isOrg: false, savedRule: null, branchOptions: await loadDefaultBranchOptions(env, repo) },
+    });
+    // The segment's shape (branches.tmpl:8-30): the header, the desc, the
+    // POST onto the page itself with the hidden action field.
+    expect(html).toContain(">Default Branch</h4>");
+    expect(html).toContain("Select a default branch for code commits.");
+    expect(html).toContain('action="/alice/wave15-defbranch/settings/branches" method="post"');
+    expect(html).toContain('name="action" value="default_branch"');
+    // The menu: PrepareBranchList order — main first, then byte-sorted; the
+    // current default carries the selected mark (the dropdown's hidden input
+    // + `.default text` arm).
+    const mainIdx = html.indexOf('value="main" selected=""');
+    const featureIdx = html.indexOf('value="feature/one"');
+    const releaseIdx = html.indexOf('value="release/1"');
+    expect(mainIdx).toBeGreaterThan(-1);
+    expect(mainIdx).toBeLessThan(featureIdx);
+    expect(featureIdx).toBeLessThan(releaseIdx);
+    // Pushed repo: the submit enabled — no disabled attribute.
+    expect(html).toContain(">Update Default Branch</button>");
+    expect(html).not.toContain('class="ui primary button" disabled');
+    // The target-branch help line rides the form's tail.
+    expect(html).toContain("Pull requests can use different default target branch");
+  });
+
+  it("renders the empty-repo arm: the lone unborn default, disabled submit", async () => {
+    await ensureWave15Fixtures();
+    const repo = (await drizzle(env.DB).select().from(repositories).where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave15"))).get())!;
+    expect(repo.isEmpty).toBe(true);
+    const html = renderBranchProtectionListPage({
+      ctx: directCtx(repo),
+      data: { rules: [], isOrg: false, savedRule: null, branchOptions: [] },
+    });
+    // The unborn default still rides the form (upstream's hidden input +
+    // `.default text` render it verbatim), the menu carries no engine
+    // options, the button is disabled (branches.tmpl:26's IsEmpty arm).
+    expect(html).toContain('value="main" selected=""');
+    expect(html).not.toContain('value="feature/one"');
+    expect(html).toContain('class="ui primary button" disabled=""');
+  });
+
+  it("route-level: the mounted list renders the segment; the unborn default is the lone option", async () => {
+    const fixture = await ensureWave15Fixtures();
+    const res = await fetchUi("/alice/wave15/settings/branches", withCookie(fixture.ownerCookie));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(">Default Branch</h4>");
+    expect(html).toContain('name="action" value="default_branch"');
+    expect(html).toContain('name="branch"');
+    expect(html).toContain('class="ui primary button" disabled=""');
+    // The route-level menu stays the lone default on this D1-only repo — the
+    // same bytes before and after the mount wave passes branchOptions.
+    expect(html).toContain('value="main" selected=""');
+  });
+
+  it("same-name POST is the service's early no-op: applied, nothing written", async () => {
+    await ensureWave15Fixtures();
+    const repo = await defBranchRow();
+    const calls: Array<[string, string]> = [];
+    const before = repo.updatedAt;
+    const result = await applyDefaultBranchForm(env, repo, "main", (repoId, branch): Promise<unknown> => {
+      calls.push([repoId, branch]);
+      return Promise.resolve();
+    });
+    expect(result).toEqual({ outcome: "applied", branch: "main" });
+    expect(calls).toEqual([]); // SetRepoDefaultBranch's early return (branch.go:708-710)
+    expect((await defBranchRow()).updatedAt!.getTime()).toBe(before!.getTime());
+  });
+
+  it("passes the repo id and the chosen branch to the landed service (the seam's arguments)", async () => {
+    await ensureWave15Fixtures();
+    const repo = await defBranchRow();
+    const calls: Array<[string, string]> = [];
+    const result = await applyDefaultBranchForm(env, repo, "feature/one", (repoId, branch): Promise<unknown> => {
+      calls.push([repoId, branch]);
+      return Promise.resolve();
+    });
+    expect(result).toEqual({ outcome: "applied", branch: "feature/one" });
+    expect(calls).toEqual([[repo.id, "feature/one"]]);
+  });
+
+  it("a branch the engine does not know is `missing` and the service is not called", async () => {
+    await ensureWave15Fixtures();
+    const repo = await defBranchRow();
+    const calls: Array<[string, string]> = [];
+    const result = await applyDefaultBranchForm(env, repo, "ghost", (repoId, branch): Promise<unknown> => {
+      calls.push([repoId, branch]);
+      return Promise.resolve();
+    });
+    expect(result).toEqual({ outcome: "missing", branch: "ghost" });
+    expect(calls).toEqual([]); // IsBranchExist's not-exist arm — the handler 404-shells
+  });
+
+  it("the production wiring writes D1 and moves the engine head, then restores", async () => {
+    await ensureWave15Fixtures();
+    const repo = await defBranchRow();
+    // The default (production) seam: D1 first, the engine's setHead riding.
+    const applied = await applyDefaultBranchForm(env, repo, "release/1");
+    expect(applied).toEqual({ outcome: "applied", branch: "release/1" });
+    expect((await defBranchRow()).defaultBranch).toBe("release/1");
+    expect((await env.REPO.getByName("alice/wave15-defbranch").listRefs()).head).toBe("refs/heads/release/1");
+    // Restore the fixture (the priority test's own convention — later a11y
+    // renders ride the pinned default).
+    const after = await defBranchRow();
+    expect((await applyDefaultBranchForm(env, after, "main")).outcome).toBe("applied");
+    expect((await defBranchRow()).defaultBranch).toBe("main");
+    expect((await env.REPO.getByName("alice/wave15-defbranch").listRefs()).head).toBe("refs/heads/main");
+  });
+});
+
 // --- the §5.5 a11y smoke ---------------------------------------------------------
 
 describe("wave-15 a11y smoke", () => {
@@ -731,6 +958,9 @@ describe("wave-15 a11y smoke", () => {
       ["/alice/wave15/settings/branches/edit", withCookie(fixture.ownerCookie)],
       ["/alice/wave15/settings/branches/edit?rule_name=main", withCookie(fixture.adminCookie)],
       ["/bporg/wave15-org/settings/branches/edit", withCookie(fixture.adminCookie)],
+      // The engine-backed repo's list (the default-branch select's DOM over a
+      // pushed repo — the enabled submit arm).
+      ["/alice/wave15-defbranch/settings/branches", withCookie(fixture.ownerCookie)],
     ] as Array<[string, RequestInit]>) {
       const res = await fetchUi(path, init);
       expect(res.status, path).toBe(200);
