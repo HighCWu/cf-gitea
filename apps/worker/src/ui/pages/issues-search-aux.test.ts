@@ -242,6 +242,13 @@ describe("loadIssuesSearchAux — the web /issues/search grammar", () => {
     const trimmed = await search("?q=%20gamma%20");
     if (trimmed.kind !== "feed") throw new Error("trim arm");
     expect(trimmed.total).toBe(1);
+
+    // A WHITESPACE-ONLY q trims to the empty keyword → the UNFILTERED feed
+    // (issue_list.go:202 FormTrim — the trimmed arm collapses to the default
+    // read, never a no-match reply).
+    const blank = await search("?q=%20%20%20&state=all");
+    if (blank.kind !== "feed") throw new Error("blank arm");
+    expect(blank.total).toBe(6);
   });
 
   it("milestones: names first then numeric ids, repo-scoped, misses discarded (own repo — no pollution of the shared fixture)", async () => {
@@ -380,6 +387,19 @@ describe("loadIssuesSuggestionsAux — GetSuggestion", () => {
     // pull" has no "a". Five matches fill all five slots, updated DESC.
     const keyword = await loadIssuesSuggestionsAux(env, s.repoId, null, "A");
     expect(keyword.map((item) => item.number)).toEqual([6, 4, 3, 2, 1]);
+
+    // The query-shape arms (issue_suggestions.go:17 — FormValue, NEVER
+    // trimmed): a whitespace-ONLY q is a legal needle, not the empty one.
+    // Three spaces match no seeded title (none carries a triple space) and
+    // the numeric-index arm never fires on a non-`[+-]?\d+` needle.
+    const blank = await loadIssuesSuggestionsAux(env, s.repoId, null, "   ");
+    expect(blank).toEqual([]);
+    // A SINGLE space matches every space-bearing title — every seeded title
+    // but #3 "gamma" carries one — updated DESC, filling all five slots
+    // (issue.go:535's title-only BuildCaseInsensitiveLike passes the raw q
+    // through untouched).
+    const oneSpace = await loadIssuesSuggestionsAux(env, s.repoId, null, " ");
+    expect(oneSpace.map((item) => item.number)).toEqual([6, 5, 4, 2, 1]);
   });
 
   it("the exact-index hit is PREPENDED even when the title does not match and the pass ignores isPull", async () => {

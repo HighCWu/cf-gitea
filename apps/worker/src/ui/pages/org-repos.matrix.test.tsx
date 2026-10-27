@@ -46,6 +46,17 @@
  *     while a private rename's coarse RedirectToUser gate 404-shells the
  *     anonymous arm and 307s only the signed-in owner.
  *
+ * Batch-5 deepening (wave-polish-matrix-5) adds:
+ *
+ *   - the private-org ladder's CONTENT half: the owner's and the site
+ *     admin's admitted renders carry both rows — the Internal-badge public
+ *     row and the Private-badge hidden row beside the org-header Private
+ *     label (the earlier arms pinned admission status only);
+ *   - the search/filter interplay's other facet: `?sort=` is as inert as
+ *     `?q=` (the loader reads only `page`; the module header's
+ *     shared/repo/search reduction covers both facets) — the list stays
+ *     slug ASC and no sort control renders.
+ *
  * The fixture world is `reposmx` (petra owner; milan a plain member; greta a
  * member granted the Vault Crew read team over the private vault; vera an
  * outsider; adminmx the site admin; sana a plain member of the private
@@ -289,6 +300,25 @@ describe("the org-visibility gates through /{org}/-/repositories", () => {
     expect((await getRoute("/secretx/-/repositories", world.adminId)).status).toBe(200);
   });
 
+  it("the private org's SELF and ADMIN renders carry the full row content: the Internal public row and the Private hidden row beside the org-header Private label", async () => {
+    // The gates above pin status 200 only; this arm pins WHAT the admitted
+    // viewer reads (the §4.7 owner/admin listing arms' content side).
+    const ownerHtml = await (await getRoute("/secretx/-/repositories", world.ownerId)).text();
+    expect(ownerHtml).toContain('href="/secretx/open-work"'); // the public row
+    expect(ownerHtml).toContain('href="/secretx/hidden-work"'); // the owner's own private row
+    expect(ownerHtml).toContain(">Internal</span>"); // public-under-private-org badge
+    expect(ownerHtml).toContain(">Private</span>"); // the hidden row's badge
+    expect(ownerHtml).toContain('class="ui large basic horizontal label">Private</span>'); // the org header
+
+    // The site admin non-member reads the identical picture (isAdmin's
+    // readGrant bypass — content, not just status).
+    const adminHtml = await (await getRoute("/secretx/-/repositories", world.adminId)).text();
+    expect(adminHtml).toContain('href="/secretx/open-work"');
+    expect(adminHtml).toContain('href="/secretx/hidden-work"');
+    expect(adminHtml).toContain(">Internal</span>");
+    expect(adminHtml).toContain(">Private</span>");
+  });
+
   it("gates the limited org: anonymous 404, any signed-in viewer 200 with the Limited header badge", async () => {
     const anon = await getRoute("/laxorg/-/repositories", null);
     expect(anon.status).toBe(404);
@@ -457,6 +487,29 @@ describe("the keyword facet's documented non-landing", () => {
     const miss = await getRoute("/reposmx/-/repositories?q=zzz-not-a-repo", null);
     expect(miss.status).toBe(200);
     expect(await miss.text()).toContain('href="/reposmx/alpha"');
+  });
+
+  it("ignores ?sort= the same way: the list keeps the service's slug ASC and no sort control renders", async () => {
+    // The module header's reduction covers BOTH facets of upstream's
+    // shared/repo/search box ("the ?q=/sort search facets … stay
+    // unrendered — no landed repo-search over an org's rows"): the loader
+    // reads only `page` (org-home.tsx), so sort=oldest cannot reorder —
+    // alpha still precedes the bulk rows under the anonymous public scope.
+    await seedReposWorld();
+    const res = await getRoute("/reposmx/-/repositories?sort=oldest", null);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const alpha = html.indexOf('href="/reposmx/alpha"');
+    const bulk = html.indexOf('href="/reposmx/repo-00"');
+    const tail = html.indexOf('href="/reposmx/zeta-archive"');
+    expect(alpha).toBeGreaterThan(-1);
+    expect(bulk).toBeGreaterThan(alpha); // slug ASC — untouched by the param
+    expect(tail).toBeGreaterThan(bulk); // the archived zeta row still last
+    expect(html).not.toContain('name="sort"'); // no sort control anywhere
+    // The full 15-public-row page renders exactly as unparameterized (the
+    // exact cap → pager-less, the wave-owned shape under a junk param).
+    expect(html).toContain('<div class="ui small label">15</div>');
+    expect(html).not.toContain("navigation_label");
   });
 });
 

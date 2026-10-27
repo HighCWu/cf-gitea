@@ -30,6 +30,14 @@
  *     input echoes the TRIMMED keyword), and the public filter riding the
  *     keyword query (a private membership matching the needle stays hidden
  *     from anonymous viewers but renders under the owner's keyword arm);
+ *   - batch 5's query-shape arms: a WHITESPACE-ONLY q trims to the empty
+ *     keyword and falls to the landed service read (the full public roster,
+ *     never the no-results arm), and the keyword needle's WORKING boundary —
+ *     48 chars, the largest needle whose `%needle%` LIKE fits D1's
+ *     documented 50-byte pattern cap (services/user.ts:81) — renders 200
+ *     with the whole-needle echo. The loader's `.slice(0, 255)` sits beyond
+ *     that cap: needles of 49..255 chars throw inside D1 and 500 the route
+ *     (disclosed in the test, reported — a page-module fix, not a test one).
  *   - the row shape under the owner's full view: the person glyph is a
  *     non-link placeholder (the org-home avatar-slot rule), the second-owner
  *     membership renders a SECOND shield-lock (the addMember role primitive),
@@ -396,6 +404,48 @@ describe("the keyword grammar arms (the needle pair org.go:184-193)", () => {
     expect(ownerHtml).toContain('href="/c-skywalker"');
     expect(ownerHtml).toContain('href="/c-skyhidden"');
     expect(rowCount(ownerHtml)).toBe(2);
+  });
+
+  it("a WHITESPACE-ONLY q trims to the empty keyword — the unfiltered listing, never the no-results arm", async () => {
+    await seedKeywordOrg();
+    // loadOrgMembersData trims then branches: "" falls to the landed service
+    // read (listOrgMemberRows), so the anonymous viewer gets the full PUBLIC
+    // roster — the trim-before-match collapse, not a keyword LIKE of spaces.
+    const res = await fetchUi("/org/korg/members?q=%20%20%20");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('href="/c-skywalker"');
+    expect(html).toContain('href="/c-other"');
+    expect(html).not.toContain("No matching results found.");
+    // The public roster is the two explicitly-public memberships — the
+    // owner membership createOrg seeds is not public (the publicOnly where
+    // keeps it anonymous-side invisible, the same picture the ?q=sky arm
+    // above shows).
+    expect(rowCount(html)).toBe(2);
+    expect(html).not.toContain("navigation_label"); // 4 members < the 20 cap → no pager
+  });
+
+  it("the keyword needle works up to the D1 LIKE cap the loader documents nowhere: 48 chars render, the needle echoes whole", async () => {
+    await seedKeywordOrg();
+    // The keyword arm's twin read LIKEs `%needle%` — and D1 caps LIKE
+    // patterns at 50 bytes (services/user.ts:81's documented cap, the
+    // reason the /users search service uses instr()). A 48-char needle is
+    // the largest that fits (48 + the two % = 50): the page answers 200,
+    // the needle matches no member's name, and the input echoes the value
+    // whole (it is below the loader's 255 slice).
+    const needle = "a".repeat(48);
+    const res = await fetchUi(`/org/korg/members?q=${needle}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("No matching results found."); // no member name carries the needle
+    expect(html).toContain(`value="${needle}"`); // the echo is the untouched needle
+    // DISCLOSED LIMITATION (not pinned — a source-side candidate): needles
+    // of 49..255 chars throw inside D1 (the LIKE pattern crosses 50 bytes)
+    // and the route answers the plain 500 — the loader's `.slice(0, 255)`
+    // sits beyond the usable cap, so its truncation boundary is
+    // unreachable in effect. Upstream has no such cap (Go LIKE handles long
+    // patterns); the fix belongs to the page module (clamp to 48 or switch
+    // to the instr() shape) and is reported to the orchestrator.
   });
 });
 

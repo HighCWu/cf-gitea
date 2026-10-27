@@ -36,7 +36,15 @@
  *     divergence (a padded keyword matches nothing), the count_only
  *     builder swap (body exactly `{"ok":true}` under the full header
  *     quartet), the topics paging (X-Total-Count counts the matches, not
- *     the page) and the ASCII-case-insensitive keyword.
+ *     the page) and the ASCII-case-insensitive keyword;
+ *   - batch 5's query-shape arms: the ABSENT q on both feeds (the
+ *     unfiltered scope — feed 1 rides the keyword-less plainjane row and
+ *     stays visibility-collapsed for the outsider; feed 2 rides alphatopic),
+ *     the WHITESPACE-ONLY q split (feed 1's FormTrim collapses it to the
+ *     unfiltered scope; feed 2's FormString keeps it a legal no-match
+ *     needle). No truncation boundary exists to pin: neither feed's keyword
+ *     is length-capped upstream (repo.go:430 FormTrim, topic.go:22
+ *     FormString — no documented truncation at this pin).
  *
  * Fixture: the `auxjson` namespace is this file's private world (distinct
  * from every sibling fixture — the smoke's `search-aux-smoke` rows and the
@@ -121,9 +129,11 @@ interface AuxJsonFixture {
  *  `auxjson/searchmark-statuscarrying` (main at the root commit, a success
  *  commit status on the tip), the D1-only `auxjson/searchmark-plain` +
  *  private `auxjson/searchmark-vaulted` (no engine push — the null-status
- *  arm), and the topic rows zetatopic ×2 / zetaalpha ×1 / zetabetter ×1
- *  (repo_count DESC + the name tiebreak; "zeta" collides with no sibling
- *  fixture's keyword). */
+ *  arm) + keyword-less public `auxjson/plainjane` (the empty-q arm's proof
+ *  row: unfiltered scope exceeds every keyword count), and the topic rows
+ *  zetatopic ×2 / zetaalpha ×1 / zetabetter ×1 / alphatopic ×1 (repo_count
+ *  DESC + the name tiebreak; "zeta" collides with no sibling fixture's
+ *  keyword, and alphatopic is the topics feed's empty-q proof row). */
 async function ensureAuxJsonFixture(): Promise<AuxJsonFixture> {
   await applyAuthD1Migrations();
   const seeded = await ensureSeededRepo({
@@ -155,10 +165,12 @@ async function ensureAuxJsonFixture(): Promise<AuxJsonFixture> {
   if (statusRepo === undefined) throw new Error("seeded repo row missing");
 
   // The two D1-only rows (public + private — no engine cell, so the feed's
-  // listRefs read misses and the status renders null, the smoke's -b arm).
+  // listRefs read misses and the status renders null, the smoke's -b arm)
+  // plus the keyword-less plainjane (the empty-q proof row).
   for (const spec of [
     { name: "searchmark-plain", isPrivate: false },
     { name: "searchmark-vaulted", isPrivate: true },
+    { name: "plainjane", isPrivate: false },
   ] as const) {
     const existing = await db
       .select({ id: repositories.id })
@@ -207,6 +219,7 @@ async function ensureAuxJsonFixture(): Promise<AuxJsonFixture> {
     if (plain === undefined) throw new Error("D1-only plain row missing");
     await db.insert(repoTopics).values([
       { repoId: statusRepo.id, topic: "zetatopic" },
+      { repoId: statusRepo.id, topic: "alphatopic" },
       { repoId: plain.id, topic: "zetatopic" },
       { repoId: plain.id, topic: "zetaalpha" },
       { repoId: plain.id, topic: "zetabetter" },
@@ -341,6 +354,47 @@ describe("GET /repo/search through the mounted route", () => {
     expect(res.headers.get("x-total-count")).toBe("3");
   });
 
+  it("an ABSENT q is the unfiltered scope: the keyword-less plainjane row rides, the private row rides for its owner only", async () => {
+    // repo.go:430's FormTrim — an empty keyword feeds SearchRepository's
+    // no-keyword arm. plainjane (no `searchmark` in the slug) is what makes
+    // this arm distinguishable from every keyword-scoped count above.
+    const ownerRes = await fetchUi("/repo/search", {
+      headers: { cookie: await sessionHeader(fixture.owner.id) },
+    });
+    expect(ownerRes.status).toBe(200);
+    expect(ownerRes.headers.get("x-total-count")).toBe("4");
+    const ownerBody = await ownerRes.json<{ ok: boolean; data: WebSearchAuxItem[] }>();
+    // Default alpha order: the keyword-less row sorts FIRST.
+    expect(ownerBody.data.map((item) => item.repository.full_name)).toEqual([
+      "auxjson/plainjane",
+      "auxjson/searchmark-plain",
+      "auxjson/searchmark-statuscarrying",
+      "auxjson/searchmark-vaulted",
+    ]);
+
+    // The outsider's unfiltered scope stays visibility-collapsed: three
+    // public rows, the vaulted row never leaks (the signed-in default
+    // private=true does not bypass the grant).
+    const outsiderRes = await fetchUi("/repo/search", {
+      headers: { cookie: await sessionHeader(fixture.outsider.id) },
+    });
+    expect(outsiderRes.headers.get("x-total-count")).toBe("3");
+    const outsiderBody = await outsiderRes.json<{ data: WebSearchAuxItem[] }>();
+    expect(outsiderBody.data.map((item) => item.repository.full_name)).not.toContain("auxjson/searchmark-vaulted");
+  });
+
+  it("a WHITESPACE-ONLY q trims to the empty keyword — the same unfiltered scope, not a no-match reply", async () => {
+    // FormTrim collapses "%20%20" to "": the count equals the absent-q arm,
+    // never the padded-keyword arm's filter (repo.go:430).
+    const res = await fetchUi("/repo/search?q=%20%20", {
+      headers: { cookie: await sessionHeader(fixture.owner.id) },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-total-count")).toBe("4");
+    const body = await res.json<{ data: WebSearchAuxItem[] }>();
+    expect(body.data.map((item) => item.repository.full_name)).toContain("auxjson/plainjane");
+  });
+
   it("GET-only registration: POST misses into the plain 404; the §4.13 slash arm 301s onto the canonical literal", async () => {
     const cookie = { headers: { cookie: await sessionHeader(fixture.owner.id) } };
     expect((await fetchUi("/repo/search", { method: "POST", ...cookie })).status).toBe(404);
@@ -350,8 +404,10 @@ describe("GET /repo/search through the mounted route", () => {
     const slashed = await fetchUi("/repo/search/", cookie);
     expect(slashed.status).toBe(301);
     expect(slashed.headers.get("location")).toBe("https://test.local/repo/search");
-    // And the redirect target is the live feed (the canonical fetch).
-    expect((await fetchUi("/repo/search", cookie)).headers.get("x-total-count")).toBe("3");
+    // And the redirect target is the live feed (the canonical fetch) — the
+    // UNFILTERED count now that plainjane joined the fixture (batch 5's
+    // empty-q proof row): 4 in-scope rows for the owner.
+    expect((await fetchUi("/repo/search", cookie)).headers.get("x-total-count")).toBe("4");
   });
 });
 
@@ -391,6 +447,34 @@ describe("GET /explore/topics/search through the mounted route", () => {
 
   it("feed 2's q is FormString — UNTRIMMED, the documented feed-1 divergence: a padded keyword matches nothing", async () => {
     const res = await fetchUi("/explore/topics/search?q=%20zeta%20");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-total-count")).toBe("0");
+    expect(await res.json()).toEqual({ topics: [] });
+  });
+
+  it("an ABSENT q is the unfiltered topics feed — the keyword-less alphatopic row rides", async () => {
+    // topic.go:22's FormString with no param → the empty keyword →
+    // FindTopicOptions' no-filter arm. alphatopic (no "zeta") is the proof
+    // row: the unfiltered total exceeds every q=zeta count above.
+    const res = await fetchUi("/explore/topics/search");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-total-count")).toBe("4");
+    const body = await res.json<{ topics: Array<{ topic_name: string; repo_count: number }> }>();
+    // repo_count DESC first (zetatopic's 2), then the three 1-count rows in
+    // the name tiebreak's ASC — alphatopic leads them.
+    expect(body.topics.map((topic) => [topic.topic_name, topic.repo_count])).toEqual([
+      ["zetatopic", 2],
+      ["alphatopic", 1],
+      ["zetaalpha", 1],
+      ["zetabetter", 1],
+    ]);
+  });
+
+  it("a WHITESPACE-ONLY q is a legal untrimmed needle — it filters, it never collapses", async () => {
+    // The FormString no-trim divergence's other half: "%20" stays a one-space
+    // needle (no topic name carries a space) — a no-match reply, NOT the
+    // unfiltered feed feed 1's same input produces.
+    const res = await fetchUi("/explore/topics/search?q=%20");
     expect(res.status).toBe(200);
     expect(res.headers.get("x-total-count")).toBe("0");
     expect(await res.json()).toEqual({ topics: [] });

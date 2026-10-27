@@ -26,6 +26,28 @@
  *      the oldest/reversealphabetically sorts, and the page's viewer
  *      independence (a signed-in non-admin sees the same rows as anonymous).
  *
+ * Batch-5 deepening (wave-polish-matrix-5) adds the q+type+sort combination
+ * arms wave 9 and the file's first pass left open:
+ *
+ *   6. the repos scope's third tier — a PRIVATE repo under the q filter is
+ *      invisible anonymous AND to a signed-in non-owner non-admin, visible to
+ *      its owner, and visible to a SITE ADMIN who owns nothing here (upstream
+ *      Repos' `Private: ctx.Doer != nil` flows into SearchRepository, whose
+ *      visibility conditions let `is_admin` through everything —
+ *      services/repository.ts visibilityConditions' admin arm);
+ *   7. the pager's q+sort+page grammar: a sorted keyword page's Older link
+ *      carries `q=` and `page=` ONLY — the sort does NOT travel (the render's
+ *      documented param set, explore.tsx ExplorePagination — upstream's
+ *      base/paginate.tmpl would carry the full GetParams set; ours pins q
+ *      like the issues-list shape it reduces), so the spill page re-reads in
+ *      the default order;
+ *   8. the garbage-sort degrade's ORDER: `sort=banana` on both pages renders
+ *      the landed default (repos slug ASC — search.ts exploreRepoSort's
+ *      default arm, upstream falls back to recentupdate; users newest =
+ *      id DESC — search.ts parseExploreUserSort's default arm, upstream
+ *      404s unknowns, the documented divergence) — wave 9 pinned only the
+ *      200 status of the degrade.
+ *
  * Fixture isolation: the vitest plugin isolates storage per test file, so the
  * explore92-prefixed rows here are this file's private world — idempotent by
  * slug/username lookup like every wave's fixtures.
@@ -48,13 +70,15 @@ const PAGINATION_COUNT = 21; // page size 20 → exactly one row spills to page 
 
 interface Explore92Fixture {
   ownerCookie: string;
+  adminCookie: string;
 }
 
 let fixture: Explore92Fixture | null = null;
 
 /** A row-only repository (the wave-9 posture: the explore lists read D1
- *  only, no engine content), idempotent by slug. */
-async function ensureRowRepo(ownerId: number, slug: string): Promise<string> {
+ *  only, no engine content), idempotent by slug. `visibility` defaults to
+ *  public — the private variant feeds the scope ladder's admin arm. */
+async function ensureRowRepo(ownerId: number, slug: string, visibility: "public" | "private" = "public"): Promise<string> {
   const db = drizzle(env.DB);
   const existing = await db
     .select({ id: repositories.id })
@@ -69,7 +93,7 @@ async function ensureRowRepo(ownerId: number, slug: string): Promise<string> {
     ownerNamespace: "explore92owner",
     ownerId,
     slug,
-    visibility: "public",
+    visibility,
   });
   return id;
 }
@@ -80,17 +104,20 @@ async function ensureExplore92Fixtures(): Promise<Explore92Fixture> {
   await applyAuthD1Migrations();
 
   // The owner (mints the signed-in arms' session), a PRIVATE-visibility user
-  // (the badge + location + pinned "Joined on" row), and a LIMITED one (the
-  // badge's negative arm, no location).
+  // (the badge + location + pinned "Joined on" row), a LIMITED one (the
+  // badge's negative arm, no location), and a SITE ADMIN (the repos scope's
+  // admin tier — owns nothing here).
   for (const extra of [
-    { username: "explore92owner", visibility: "public" as const, location: null, createdAt: null },
+    { username: "explore92owner", visibility: "public" as const, location: null, createdAt: null, isAdmin: false },
     {
       username: "explore92hidden",
       visibility: "private" as const,
       location: "Hidden Harbor",
       createdAt: new Date(T0 * 1000), // 2023-11-14T22:13:20Z → the pinned stamp
+      isAdmin: false,
     },
-    { username: "explore92limited", visibility: "limited" as const, location: null, createdAt: null },
+    { username: "explore92limited", visibility: "limited" as const, location: null, createdAt: null, isAdmin: false },
+    { username: "explore92admin", visibility: "public" as const, location: null, createdAt: null, isAdmin: true },
   ]) {
     const existing = await db
       .select({ id: users.id })
@@ -101,7 +128,7 @@ async function ensureExplore92Fixtures(): Promise<Explore92Fixture> {
       await db.insert(users).values({
         username: extra.username,
         usernameLower: extra.username,
-        isAdmin: false,
+        isAdmin: extra.isAdmin,
         status: "active",
         visibility: extra.visibility,
         location: extra.location,
@@ -134,14 +161,24 @@ async function ensureExplore92Fixtures(): Promise<Explore92Fixture> {
     .where(eq(users.usernameLower, "explore92owner"))
     .get();
   if (owner === undefined) throw new Error("explore92 owner row missing");
+  const admin = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "explore92admin"))
+    .get();
+  if (admin === undefined) throw new Error("explore92 admin row missing");
+  const adminId = admin.id;
 
   // The repos: r01..r21 (the pager block; the r-prefix keeps them
   // slug-ordered ahead of solo) + the solo row whose repo_settings carries
-  // the description the batched loader read must surface.
+  // the description the batched loader read must surface, and the PRIVATE
+  // vault (the scope ladder's admin/owner tiers — invisible to the anonymous
+  // counts below, which is why every count stays exact).
   for (let i = 1; i <= PAGINATION_COUNT; i++) {
     await ensureRowRepo(owner.id, `explore92-r${String(i).padStart(2, "0")}`);
   }
   const soloId = await ensureRowRepo(owner.id, "explore92-solo");
+  await ensureRowRepo(owner.id, "explore92-vault", "private");
   const soloSettings = await db
     .select({ repoId: repoSettings.repoId })
     .from(repoSettings)
@@ -151,7 +188,10 @@ async function ensureExplore92Fixtures(): Promise<Explore92Fixture> {
     await db.insert(repoSettings).values({ repoId: soloId, description: "the solo settings description line" });
   }
 
-  fixture = { ownerCookie: await mintSession(env.DB, owner.id) };
+  fixture = {
+    ownerCookie: await mintSession(env.DB, owner.id),
+    adminCookie: await mintSession(env.DB, adminId),
+  };
   return fixture;
 }
 
@@ -408,5 +448,94 @@ describe("/explore/users — the visibility badge, the joined stamp, the pager, 
     const html = await res.text();
     expect(html).toContain('href="/explore92hidden">explore92hidden</a>');
     expect(countOf(html, ">Private</span>")).toBe(1); // the identical badge picture
+  });
+});
+
+// --- batch-5: the scope ladder's admin tier, the q+sort+page grammar, the degrade orders
+
+describe("/explore/repos — the private-repo scope ladder through the q filter", () => {
+  it("hides the private vault from anonymous and from a signed-in non-owner non-admin; shows it to its owner and to a site admin who owns nothing here", async () => {
+    const { ownerCookie, adminCookie } = await ensureExplore92Fixtures();
+
+    // Anonymous: the vault is out of scope entirely (Private: doer == nil).
+    const anon = await fetchUi("/explore/repos?q=explore92-vault");
+    expect(anon.status).toBe(200);
+    expect(await anon.text()).toContain("No matching results found.");
+
+    // A signed-in NON-owner NON-admin: includePrivate opens the doer's OWN
+    // privates only — the vault is someone else's, still out of scope.
+    const db = drizzle(env.DB);
+    const mate = await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, "explore92-u01")).get();
+    if (mate === undefined) throw new Error("explore92-u01 row missing");
+    const mateRes = await fetchUi("/explore/repos?q=explore92-vault", withCookie(await mintSession(env.DB, mate.id)));
+    expect(mateRes.status).toBe(200);
+    expect(await mateRes.text()).toContain("No matching results found.");
+
+    // The owner themself: their own private is exactly upstream's arm.
+    const ownerRes = await fetchUi("/explore/repos?q=explore92-vault", withCookie(ownerCookie));
+    expect(ownerRes.status).toBe(200);
+    expect(await ownerRes.text()).toContain('href="/explore92owner/explore92-vault"');
+
+    // The SITE ADMIN: upstream Private: ctx.Doer != nil hands every private
+    // row to an admin requester (search.ts visibilityConditions' is_admin
+    // arm) — the admin owns no explore92 repo, yet the vault lists.
+    const adminRes = await fetchUi("/explore/repos?q=explore92-vault", withCookie(adminCookie));
+    expect(adminRes.status).toBe(200);
+    expect(await adminRes.text()).toContain('href="/explore92owner/explore92-vault"');
+  });
+});
+
+describe("/explore/repos — the pager's q+sort+page grammar", () => {
+  it("keeps q and drops sort on the Older link; the spill page re-reads in the default order", async () => {
+    // q=explore92-r matches r01..r21 — 21 rows, one spill. Sorted
+    // reverse-alphabetically page 1 carries r21..r02; the single spill row
+    // is r01 — which the DEFAULT slug order also puts last. The pager href
+    // is the pin: q= travels, sort= does not (explore.tsx
+    // ExplorePagination's param set — upstream's base/paginate.tmpl would
+    // carry the full GetParams set; the issues-list reduction pins q only).
+    const page1 = await fetchUi("/explore/repos?q=explore92-r&sort=reversealphabetically");
+    expect(page1.status).toBe(200);
+    const page1Html = await page1.text();
+    const first = page1Html.indexOf('/explore92owner/explore92-r21"');
+    const last = page1Html.indexOf('/explore92owner/explore92-r02"');
+    expect(first).toBeGreaterThan(-1); // the reversed head row
+    expect(last).toBeGreaterThan(first); // the reversed tail row (r01 spills)
+    expect(page1Html).toContain('href="/explore/repos?q=explore92-r&amp;page=2"');
+    expect(page1Html).not.toContain("sort=reversealphabetically&amp;page=2"); // the sort never rides the pager
+
+    // Following the pinned href lands on the DEFAULT-ordered spill page:
+    // its sole row is r21 — the sorted page 1's HEAD row (slug ASC's 21st
+    // row) — while the sorted view's own spill row r01 never appears on it.
+    // The dropped sort is exactly why: only q and page travel.
+    const page2 = await fetchUi("/explore/repos?q=explore92-r&page=2");
+    expect(page2.status).toBe(200);
+    const page2Html = await page2.text();
+    expect(page2Html).toContain('href="/explore92owner/explore92-r21"');
+    expect(page2Html).not.toContain('href="/explore92owner/explore92-r01"'); // the sorted spill row is unreachable via the pager
+    expect(page2Html).toContain('href="/explore/repos?q=explore92-r&amp;page=1"'); // q still travels back
+  });
+});
+
+describe("the garbage-sort degrade's order (beyond wave 9's status-only pin)", () => {
+  it("renders the repos default slug order under sort=banana (exploreRepoSort's default arm)", async () => {
+    const res = await fetchUi("/explore/repos?q=explore92-r0&sort=banana");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const a = html.indexOf('/explore92owner/explore92-r01"');
+    const b = html.indexOf('/explore92owner/explore92-r09"');
+    expect(a).toBeGreaterThan(-1);
+    expect(b).toBeGreaterThan(a); // slug ASC — the landed default, never a 422
+  });
+
+  it("renders the users newest order under sort=banana (parseExploreUserSort's default arm)", async () => {
+    const res = await fetchUi("/explore/users?q=explore92-u&sort=banana");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // newest = id DESC (u21 inserted last): the unsorted page-1 head is u21,
+    // ahead of u20 — the documented degrade (upstream 404s unknown sorts).
+    const late = html.indexOf('href="/explore92-u21"');
+    const early = html.indexOf('href="/explore92-u20"');
+    expect(late).toBeGreaterThan(-1);
+    expect(early).toBeGreaterThan(late);
   });
 });
