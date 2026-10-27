@@ -43,9 +43,12 @@
  * Rows are shared/repo/list.tmpl's rows with the watching arm's gates:
  * title = the repo NAME only (`{{if and $.ShowRepoOwnerOnList .Owner}}` is
  * unset for watching) linking `/{owner}/{repo}` (repo.Link); the leading
- * slot renders the repo/icon fallback glyph (no avatar pipeline — the
- * org-home reduction); badges archived/private and the per-row internal
- * badge (`{{if .Owner.Visibility.IsPrivate}}` — owners ARE loaded,
+ * slot renders repo/icon.tmpl's glyph chain (mirror → fork → plain — the
+ * OrgRepoListItem fix this module inherits, FLIPPED 2026-10-27 from the
+ * unconditional fallback glyph; no avatar pipeline — the org-home
+ * degradation; the mirror/forked bytes ride admin-users.tsx's embedded
+ * seam at the same 24px slot); badges archived/private and the per-row
+ * internal badge (`{{if .Owner.Visibility.IsPrivate}}` — owners ARE loaded,
  * repo_list.go's `loadAttributes`); trailing chips star (`{{if not
  * $.DisableStars}}`, default false at the pin, modules/setting/
  * repository.go:155 → renders, linked to the LIVE /{owner}/{repo}/stars
@@ -171,6 +174,7 @@ import { TimeSince } from "../components/file-list";
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
+import { AdminEmbeddedSvg } from "./admin-users";
 import { ProfileAvatarCard, userDisplayName, type ProfileDoer, type UserProfileRow } from "./user-profile";
 
 /** Page chrome text (component-local, the userStarsTabLocale pattern —
@@ -376,7 +380,15 @@ function WatchingTabs(props: { username: string; repoCount: number }) {
  * `{{if .Owner.Visibility.IsPrivate}}`), and the trailing block renders the
  * star chip (DisableStars defaults false — linked to the live
  * /{owner}/{repo}/stars page) beside the open-pulls chip; the watch-gear
- * button's `$.Watches` is never set by profile.go → never renders.
+ * button's `$.Watches` is never set by profile.go → never renders. The
+ * leading glyph is repo/icon.tmpl's chain at the 24px slot — `octicon-mirror`
+ * when `is_mirror`, else `octicon-repo-forked` when `fork_parent` is set
+ * ($.IsFork), else `octicon-repo`; mirror beats fork exactly upstream, since
+ * the arms are `{{else if}}` chained. The watched row's full repositories
+ * row already carries both columns (the loader batched it), so the chain
+ * reads the row data directly; the mirror/forked bytes ride admin-users.tsx's
+ * embedded seam (not on the shared Icon allowlist), the same `svg octicon-*`
+ * DOM as the plain arm.
  */
 export function WatchingRepoListItem(props: { item: WatchingRepoItem }) {
   const { repo } = props.item;
@@ -385,7 +397,13 @@ export function WatchingRepoListItem(props: { item: WatchingRepoItem }) {
   return (
     <div class="item">
       <div class="item-leading">
-        <Icon name="octicon-repo" size={24} />
+        {repo.isMirror ? (
+          <AdminEmbeddedSvg name="octicon-mirror" size={24} />
+        ) : repo.forkParent !== null ? (
+          <AdminEmbeddedSvg name="octicon-repo-forked" size={24} />
+        ) : (
+          <Icon name="octicon-repo" size={24} />
+        )}
       </div>
       <div class="item-main">
         <div class="item-header">

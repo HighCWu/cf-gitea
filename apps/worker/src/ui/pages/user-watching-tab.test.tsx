@@ -312,7 +312,7 @@ describe("WatchingRepoListItem (list.tmpl's row under the watching gates)", () =
     expect(html).not.toContain("show-modal"); // the watch gear: $.Watches unset by profile.go
     expect(html).toContain("her open repo"); // the description body
     expect(html).toContain("Updated"); // the org.repo_updated line
-    expect(html).toContain("octicon-repo"); // the leading repo/icon fallback glyph
+    expect(html).toContain("octicon-repo"); // the leading row glyph (icon.tmpl's plain arm — this fixture row is neither fork nor mirror)
   });
 
   it("the badges: private rows badge Private; public rows under private owners badge Internal", async () => {
@@ -369,6 +369,61 @@ describe("UserWatchingTabPage (the full-document render)", () => {
     expect(html).toContain('class="flex-divided-list items-with-main"');
     expect(html).toContain('href="/gal/open">open</a>');
     expect(html).toContain('href="/ally/stash">stash</a>'); // admin sees every watched row
+  });
+
+  it("renders the mirror/fork/plain glyphs per icon.tmpl's chain — mirror row octicon-mirror, fork row octicon-repo-forked, plain row octicon-repo", async () => {
+    await seedBaseFixtures();
+    // The fork + mirror edges on two more gal-owned public rows (watched, so
+    // the rows land): fork_parent points at the source row, is_mirror is the
+    // pull-mirror flag — exactly the D1 state upstream's repo/icon.tmpl
+    // branches on ($.IsMirror / $.ForkID). Ids keep the numeric ordering
+    // convention (after the 1001-1006 fixtures).
+    const gal = await userRow("gal");
+    await seedRepo({ id: "1007", owner: "gal", slug: "afork", visibility: "public" });
+    await seedRepo({ id: "1008", owner: "gal", slug: "amirror", visibility: "public" });
+    await drizzle(env.DB)
+      .update(repositories)
+      .set({ forkParent: "1001" }) // forks gal/open (the first fixture row)
+      .where(eq(repositories.id, "1007"))
+      .run();
+    await drizzle(env.DB).update(repositories).set({ isMirror: true }).where(eq(repositories.id, "1008")).run();
+    for (const id of ["1007", "1008"]) {
+      await drizzle(env.DB).insert(repoWatchers).values({ repoId: id, userId: gal.id });
+    }
+
+    const data = await loadUserWatchingTabData(env.DB, await userRow("gal"), admin, new URLSearchParams());
+    const html = renderToString(<UserWatchingTabPage ctx={ctx} data={data} />);
+    // Each `<div class="item">` chunk carries its own row's item-leading
+    // glyph (rendered BEFORE the name link) + its own link — the org-home
+    // matrix shape; the avatar card's `div.item`s precede the rows and match
+    // none of the row hrefs (the followers/following anchors carry ?tab=).
+    const chunks = html.split('<div class="item">');
+    // Mirror first (icon.tmpl's `{{else if $.IsMirror}}` arm precedes the
+    // fork arm — a hypothetical mirror+fork row would render the mirror
+    // glyph): the mirror row's chunk carries octicon-mirror only.
+    const mirrorRow = chunks.find((chunk) => chunk.includes('href="/gal/amirror"'));
+    expect(mirrorRow, "amirror").toBeDefined();
+    expect(mirrorRow, "amirror").toContain('class="svg octicon-mirror"'); // the $.IsMirror arm
+    expect(mirrorRow, "amirror").toContain('width="24"'); // repo/icon.tmpl's 24px slot
+    expect(mirrorRow, "amirror").not.toContain("octicon-repo-forked");
+    expect(mirrorRow, "amirror").not.toContain('class="svg octicon-repo"');
+    // The fork row's chunk carries octicon-repo-forked only ($.IsFork).
+    const forkRow = chunks.find((chunk) => chunk.includes('href="/gal/afork"'));
+    expect(forkRow, "afork").toBeDefined();
+    expect(forkRow, "afork").toContain('class="svg octicon-repo-forked"'); // the $.IsFork arm
+    expect(forkRow, "afork").toContain('width="24"'); // the same 24px slot
+    expect(forkRow, "afork").not.toContain("octicon-mirror");
+    expect(forkRow, "afork").not.toContain('class="svg octicon-repo"');
+    // The plain row keeps the else arm (the ADDED pins: the earlier
+    // characterization had no fork/mirror glyph arm — the rows previously
+    // rendered the fallback glyph unconditionally, the divergence
+    // org-glyph flagged).
+    const plainRow = chunks.find((chunk) => chunk.includes('href="/gal/open"'));
+    expect(plainRow, "open").toBeDefined();
+    expect(plainRow, "open").toContain('class="svg octicon-repo"'); // the else arm
+    expect(plainRow, "open").toContain('width="24"'); // the same 24px slot
+    expect(plainRow, "open").not.toContain("octicon-mirror");
+    expect(plainRow, "open").not.toContain("octicon-repo-forked");
   });
 
   it("the empty state is the list's range-else arm; a single page renders no pager", async () => {

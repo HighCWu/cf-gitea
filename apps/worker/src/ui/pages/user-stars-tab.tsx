@@ -36,7 +36,9 @@
  * row reduction; forks have no D1 counter — §3.1). The landed
  * OrgRepoListItem (pages/org-home.tsx) cannot render the owner segment and
  * org-home.tsx is not this wave's file, so the row is module-local — same
- * DOM, plus the two stars-branch arms.
+ * DOM, plus the two stars-branch arms. The leading row glyph is icon.tmpl's
+ * chain (mirror → fork → plain — the OrgRepoListItem fix this module
+ * inherits; the mirror/forked bytes ride admin-users.tsx's embedded seam).
  *
  * ## Visibility (the landed predicates — never a local re-derivation)
  *
@@ -125,6 +127,7 @@ import { TimeSince } from "../components/file-list";
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
+import { AdminEmbeddedSvg } from "./admin-users";
 import { ProfileAvatarCard, userDisplayName, type ProfileDoer, type UserProfileRow } from "./user-profile";
 
 /** Page chrome text (component-local, the userProfileLocale pattern —
@@ -276,6 +279,18 @@ function StarsTabs(props: { username: string; repoCount: number; starsCount: num
  * the per-row star chip (`{{if not $.DisableStars}}`, list.tmpl:44-51 —
  * linked to the live /{owner}/{repo}/stars page). The internal badge reads
  * THIS row's owner visibility (list.tmpl's `{{if .Owner.Visibility.IsPrivate}}`).
+ *
+ * The leading glyph is repo/icon.tmpl's chain — the OrgRepoListItem
+ * reduction's mirror → fork → plain branch (FLIPPED 2026-10-27; the
+ * unconditional fallback glyph was the same divergence org-home's row
+ * carried): `octicon-mirror` when `is_mirror`, else `octicon-repo-forked`
+ * when `fork_parent` is set ($.IsFork), else `octicon-repo` — mirror beats
+ * fork exactly upstream, since the arms are `{{else if}}` chained. The
+ * starred row's full repositories row already carries both columns (the
+ * loader batched it), so the chain reads the row data directly; the
+ * mirror/forked bytes ride admin-users.tsx's embedded seam (not on the
+ * shared Icon allowlist) at the same 24px slot and the same
+ * `svg octicon-*` DOM as the plain arm.
  */
 export function StarsRepoListItem(props: { item: StarsRepoItem }) {
   const { repo } = props.item;
@@ -284,7 +299,13 @@ export function StarsRepoListItem(props: { item: StarsRepoItem }) {
   return (
     <div class="item">
       <div class="item-leading">
-        <Icon name="octicon-repo" size={24} />
+        {repo.isMirror ? (
+          <AdminEmbeddedSvg name="octicon-mirror" size={24} />
+        ) : repo.forkParent !== null ? (
+          <AdminEmbeddedSvg name="octicon-repo-forked" size={24} />
+        ) : (
+          <Icon name="octicon-repo" size={24} />
+        )}
       </div>
       <div class="item-main">
         <div class="item-header">

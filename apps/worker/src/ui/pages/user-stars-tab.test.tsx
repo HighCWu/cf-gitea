@@ -249,6 +249,75 @@ describe("the stars tab DOM (profile.tmpl's `tab == \"stars\"` branch)", () => {
     expect(html).not.toContain("navigation_label");
   });
 
+  it("renders the mirror/fork/plain glyphs per icon.tmpl's chain — mirror row octicon-mirror, fork row octicon-repo-forked, plain row octicon-repo", async () => {
+    await seedBaseFixtures();
+    // The fork + mirror edges on two more carol repos (public, so the rows
+    // land for any doer): fork_parent points at the source row, is_mirror is
+    // the pull-mirror flag — exactly the D1 state upstream's repo/icon.tmpl
+    // branches on ($.IsMirror / $.ForkID).
+    const carol = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "carol")).get();
+    if (carol === undefined) throw new Error("user seed failed");
+    await drizzle(env.DB).insert(repositories).values({
+      id: "repo-a-fork",
+      storageKey: "r_repo-a-fork",
+      ownerNamespace: "carol",
+      ownerId: carol.id,
+      slug: "a-fork",
+      forkParent: "repo-alpha", // forks carol/alpha (the fixture's source row)
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    await drizzle(env.DB).insert(repositories).values({
+      id: "repo-a-mirror",
+      storageKey: "r_repo-a-mirror",
+      ownerNamespace: "carol",
+      ownerId: carol.id,
+      slug: "a-mirror",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    await drizzle(env.DB).update(repositories).set({ isMirror: true }).where(eq(repositories.id, "repo-a-mirror")).run();
+    await drizzle(env.DB).insert(stars).values({ userId: bobId, repoId: "repo-a-fork", createdAt: new Date() });
+    await drizzle(env.DB).insert(stars).values({ userId: bobId, repoId: "repo-a-mirror", createdAt: new Date() });
+
+    const data = await loadUserStarsTabData(env.DB, await userRow("bob"), selfDoer(), new URLSearchParams());
+    const html = renderToString(<UserStarsTabPage ctx={ctx} data={data} />);
+    // Each `<div class="item">` chunk carries its own row's item-leading
+    // glyph (rendered BEFORE the name link) + its own link — the org-home
+    // matrix shape; the avatar card's `div.item`s precede the rows and match
+    // none of the row hrefs (the followers/following anchors carry ?tab=).
+    const chunks = html.split('<div class="item">');
+    // Mirror first (icon.tmpl's `{{else if $.IsMirror}}` arm precedes the
+    // fork arm — a hypothetical mirror+fork row would render the mirror
+    // glyph): the mirror row's chunk carries octicon-mirror only.
+    const mirrorRow = chunks.find((chunk) => chunk.includes('href="/carol/a-mirror"'));
+    expect(mirrorRow, "a-mirror").toBeDefined();
+    expect(mirrorRow, "a-mirror").toContain('class="svg octicon-mirror"'); // the $.IsMirror arm
+    expect(mirrorRow, "a-mirror").toContain('width="24"'); // repo/icon.tmpl's 24px slot
+    expect(mirrorRow, "a-mirror").not.toContain("octicon-repo-forked");
+    expect(mirrorRow, "a-mirror").not.toContain('class="svg octicon-repo"');
+    // The fork row's chunk carries octicon-repo-forked only ($.IsFork).
+    const forkRow = chunks.find((chunk) => chunk.includes('href="/carol/a-fork"'));
+    expect(forkRow, "a-fork").toBeDefined();
+    expect(forkRow, "a-fork").toContain('class="svg octicon-repo-forked"'); // the $.IsFork arm
+    expect(forkRow, "a-fork").toContain('width="24"'); // the same 24px slot
+    expect(forkRow, "a-fork").not.toContain("octicon-mirror");
+    expect(forkRow, "a-fork").not.toContain('class="svg octicon-repo"');
+    // The plain row keeps the else arm (the ADDED pins: this suite carried
+    // no fork/mirror glyph arm before — the rows previously rendered the
+    // fallback glyph unconditionally, the divergence org-glyph flagged).
+    const plainRow = chunks.find((chunk) => chunk.includes('href="/carol/alpha"'));
+    expect(plainRow, "alpha").toBeDefined();
+    expect(plainRow, "alpha").toContain('class="svg octicon-repo"'); // the else arm
+    expect(plainRow, "alpha").toContain('width="24"'); // the same 24px slot
+    expect(plainRow, "alpha").not.toContain("octicon-mirror");
+    expect(plainRow, "alpha").not.toContain("octicon-repo-forked");
+  });
+
   it("renders the list's range-else arm on zero visible stars (search.no_results) and no rows", async () => {
     await seedBaseFixtures();
     await env.DB.prepare("DELETE FROM stars").run();
