@@ -45,7 +45,7 @@
  *     always creates unarchived, so the archived twin is a direct D1 stamp);
  *   - the claim pin: the issues head's new/labels tails parse into their own
  *     families while the pulls head has NO such tails (unclaimed → engine
- *     404, upstream registers no /pulls/new or /pulls/labels).
+ *     404; upstream registers /pulls/new (claimed by the window-2e folds) but no /pulls/labels).
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
@@ -586,9 +586,11 @@ describe("the New Issue tail (the archived gate wave2's fixture cannot reach)", 
 
 describe("the claim pin (issues vs pulls heads, new/labels tails)", () => {
   it("the pulls head has NO new/labels tails — unclaimed, engine-owned (upstream registers none)", () => {
-    expect(handlesUiRoute("/octo/hello/pulls/new")).toBe(false);
+    // Window-2e folds claim the pulls/new redirect (web.go:1314 registers
+    // it — the issue-new agent's stale-comment catch).
+    expect(handlesUiRoute("/octo/hello/pulls/new")).toBe(true);
     expect(handlesUiRoute("/octo/hello/pulls/labels")).toBe(false);
-    expect(parseUiRoute("/octo/hello/pulls/new")).toBeNull();
+    expect(parseUiRoute("/octo/hello/pulls/new")).toEqual({ family: "pulls-new-redirect", owner: "octo", repo: "hello" });
     expect(parseUiRoute("/octo/hello/pulls/labels")).toBeNull();
   });
 

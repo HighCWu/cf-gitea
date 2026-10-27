@@ -1988,7 +1988,11 @@ export interface BlobExcerptRoute {
  *  dismiss_review` (web.go:1435-1436, the issue/review ids ride the form —
  *  exactly upstream's field-carried shapes). POST-only. */
 export interface PullReviewRoute {
-  family: "pull-review-submit" | "issue-request-review" | "issue-dismiss-review";
+  family:
+    | "pull-review-submit"
+    | "issue-request-review"
+    | "issue-dismiss-review"
+    | "pulls-new-redirect";
   owner: string;
   repo: string;
   /** The PR index (the submit family only). */
@@ -2931,6 +2935,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
 
   if (head === "issues" || head === "pulls") {
+    // Window-2e folds: the pulls/new redirect (web.go:1314) — MUST claim or
+    // the dispatcher's handlesUiRoute consult hands it to the engine before
+    // Hono ever routes it (the issue-new matrix's second RED; the third
+    // dead-route-class catch this session).
+    if (head === "pulls" && rest[0] === "new") {
+      return { family: "pulls-new-redirect", owner, repo };
+    }
     if (rest.length === 0) return { family: head, owner, repo };
     if (rest.length === 1) {
       if (head === "issues" && rest[0] === "new") return { family: "issue-new", owner, repo };
@@ -4290,7 +4301,10 @@ async function branchRenameSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
  *  onto /compare with the query preserved). */
 function pullsNewRedirect(c: Context<{ Bindings: Env }>): Response {
   const url = new URL(c.req.url);
-  const tail = url.pathname.split("/").slice(4).join("/");
+  // slice(5): index 0 is the leading empty segment — slice(4) kept the
+  // literal "new" (the issue-new matrix's RED; upstream's * param is
+  // everything AFTER /pulls/new/).
+  const tail = url.pathname.split("/").slice(5).join("/");
   const location = `/${url.pathname.split("/")[1]}/${url.pathname.split("/")[2]}/compare/${tail}${url.search}`;
   return new Response(null, { status: 307, headers: { location } });
 }
