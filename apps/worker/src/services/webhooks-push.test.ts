@@ -15,7 +15,12 @@
  * the only stub is the ExecutionContext's waitUntil, collected and drained
  * deterministically instead of relying on runner timing. Deliveries are
  * asserted over the webhook_deliveries D1 rows — the delivery log IS the
- * source of truth (§3.6); no queue consumer runs here.
+ * source of truth (§3.6). The wrangler.jsonc WEBHOOK_DELIVERY consumer IS
+ * live in the vitest workerd (index.ts exports the queue handler), so each
+ * row's delivery state flips asynchronously to the drained waitUntil: state
+ * assertions settle the consumer first (settleDeliveries) — they never race
+ * the pre-delivery instant (the suite-stability ledger's webhooks-push
+ * flake: under load the consumer's delivered landed before the read).
  *
  * Covered: the per-created-ref zero-commit push + create pair, the updated-ref
  * capped push payload (newest-first commit list, added/removed/modified
@@ -245,6 +250,24 @@ async function seedPull(
 /** The delivery log, oldest first — the assertion surface (§3.6). */
 const deliveries = () => drizzle(env.DB).select().from(webhookDeliveries).orderBy(asc(webhookDeliveries.id)).all();
 
+/** Poll every delivery row out of the consumer's in-flight states. The
+ * wrangler.jsonc WEBHOOK_DELIVERY queue consumer (index.ts's queue handler)
+ * is live in the vitest workerd: the enqueued `{deliveryId}` messages are
+ * consumed on miniflare's own scheduling, AFTER the push's waitUntil drain —
+ * awaiting them here is the deterministic alternative to racing the
+ * pre-delivery instant (the suite-stability ledger's flake). Bounded poll in
+ * repo-edit.test.ts's license-settle shape; a timeout simply returns, and
+ * the caller's state assertion reports the stuck values. `pending` and
+ * `delivering` are the only non-terminal states the consumer writes
+ * (schema.ts: `pending|delivering|delivered|skipped|failed`). */
+async function settleDeliveries(): Promise<void> {
+  for (let round = 0; round < 100; round += 1) {
+    const rows = await deliveries();
+    if (rows.length > 0 && rows.every((r) => r.state !== "pending" && r.state !== "delivering")) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 const clearDeliveries = () => env.DB.prepare("DELETE FROM webhook_deliveries").run();
 
 // ---------------------------------------------------------------------------
@@ -463,15 +486,26 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
     expect(response.status).toBe(200);
     await expectRef(row.ownerNamespace, row.slug, "refs/heads/main", tip);
 
+    // The rows are already durable here — the inserts were awaited inside the
+    // drained onPush waitUntil; only the queue consumer's state flip is
+    // asynchronous to it. Settle the consumer, THEN read once: the emission
+    // catalog (which rows, which order) and the delivery states both assert
+    // over the same settled snapshot, deterministically.
+    await settleDeliveries();
     const rows = await deliveries();
     // Upstream's emission order per ref: the zero-commit push event FIRST,
     // then the create event (mirror_pull.go:347, 352).
-    expect(rows.map((r) => [r.hookId, r.eventType, r.eventGroup, r.state])).toEqual([
-      [hookId, "push", "push", "pending"],
-      [hookId, "create", "create", "pending"],
-      [hookId, "push", "push", "pending"],
-      [hookId, "create", "create", "pending"],
+    expect(rows.map((r) => [r.hookId, r.eventType, r.eventGroup])).toEqual([
+      [hookId, "push", "push"],
+      [hookId, "create", "create"],
+      [hookId, "push", "push"],
+      [hookId, "create", "create"],
     ]);
+    // Every row drained through the REAL consumer to its terminal state —
+    // recordDeliveryOutcome records ANY fetch outcome as `delivered` (the
+    // hook URL is unroutable here; a failed attempt is still terminal);
+    // `skipped` is the missing/inactive-hook branch, not this fixture.
+    expect(rows.map((r) => r.state)).toEqual(["delivered", "delivered", "delivered", "delivered"]);
 
     // The branch's zero-commit push payload (§2.7 PushPayload field set;
     // APP_URL unset → upstream's default ROOT_URL origin).
