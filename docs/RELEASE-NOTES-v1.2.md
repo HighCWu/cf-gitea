@@ -339,3 +339,24 @@ are programmatic, not eyeballed (the tick-5 methodology carried forward).
   `personal_access_tokens = 2` because the run PAT (id 44) was still alive
   at audit time; it was deleted at wrap close — the paste-2 paragraph is the
   record, and the standing count is the bootstrap PAT only.
+
+### Addendum — the post-cut polish window (appended 2026-10-27, wave-129)
+
+These notes were cut at `640005b`; the polish window that followed landed
+REAL fixes the body never carried, so **nothing in §4 was retired** —
+re-checked line by line. The ws1009 residuals line above is correct as
+written: lever B (`9e70af5` + `2534ca1`) landed before the cut, and the
+filed issue (cloudflare/workers-sdk#16515, `640005b`) is the cut point
+itself. The post-cut fixes, all inside LANDED surfaces (the survey
+headline is unchanged at 91/5/20 — `docs/compat/ui-parity-survey.md`
+tick-13): the compare page's nothingToCompare fold + AllowEmptyPr
+(`2c240fa`), the org-members keyword arm's LIKE-cap 500 closed via
+instr() (`943e1e9` — the same class is being swept across the
+topics/issues keyword feeds, in flight at append time), the id-order
+sort stand-ins' tiebreak (`69068ac`), and the a11y sweeps (`132fec0`,
+`ec2dd70`, `dc7362c`, `967a5d4` — zero bare th left in real data
+tables; the admin-orgs listing's settings pencil named). Two postures disclosed and
+still open: the compare equal-tips across-ref POST completion (in
+flight, sibling-owned — the landed `sameTip` refusal stands until it
+lands) and the admin-monitor thead-less golden policy call
+(`967a5d4`'s documented-skip).
