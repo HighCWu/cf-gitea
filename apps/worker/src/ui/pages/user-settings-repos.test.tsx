@@ -23,10 +23,10 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { repositories, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import {
   loadUserSettingsReposPageData,
   renderUserSettingsReposPage,
-  UserSettingsReposNav,
   UserSettingsReposPage,
   userSettingsReposLocale,
   USER_SETTINGS_REPOS_PAGE_SIZE,
@@ -313,10 +313,9 @@ describe("the repos settings DOM (repos.tmpl:80-113, the else branch)", () => {
     // Exactly once on a single-page render (more=false — no pager hrefs to
     // double-count).
     expect(html.split('href="/user/settings/repos"').length - 1).toBe(1);
-    // The nav-only pin: the scaffolding component renders the full item set
-    // with the repos tail active — mirroring the in-tree shared navbar's
-    // items (the concurrent account/notifications wiring wave's included).
-    const nav = renderToString(<UserSettingsReposNav />);
+    // The nav-only pin: the SHARED navbar (the wiring wave's swap — the
+    // module-local scaffolding deleted) carries the repos tail.
+    const nav = renderToString(<UserSettingsNavbar active="repos" />);
     expect(nav).toContain('class="flex-container-nav"');
     expect(nav).toContain('href="/user/settings"');
     expect(nav).toContain('href="/user/settings/account"');

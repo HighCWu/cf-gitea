@@ -180,7 +180,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { repositories, users } from "../../db/schema";
 import { AdminEmbeddedSvg } from "./admin-users";
 import { formatByteSize, parsePageNumber } from "../page-data";
-import { settingsNavLocale } from "../components/settings-nav";
+import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 
@@ -355,72 +355,6 @@ function RepoKindIcon(props: { item: UserSettingsReposItem }) {
   return <Icon name="octicon-repo" />;
 }
 
-/**
- * The module-local SCAFFOLDING nav — the shared
- * components/settings-nav UserSettingsNavbar's exact markup AS OF THIS
- * WAVE'S TREE (the concurrent account/notifications wiring wave's items
- * included) with the Repos item appended after Organizations (upstream
- * navbar.tmpl:73-76 — the template's LAST item) and marked active.
- * DISPOSABLE: the wiring wave applies the HANDOFF's settings-nav.tsx diff
- * (the locale key, the union entry, the item) and swaps the page's call
- * site to `UserSettingsNavbar active="repos"`, deleting this function (the
- * notifications-module precedent). Item texts come from the shared
- * settingsNavLocale so the swap changes no rendered string; this module's
- * item text is the locale's own "settings.repos" key.
- */
-export function UserSettingsReposNav() {
-  const item = (active: boolean) => (active ? "active item" : "item");
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{settingsNavLocale.user_settings}</div>
-        <a class={item(false)} href="/user/settings">
-          {settingsNavLocale.profile}
-        </a>
-        <a class={item(false)} href="/user/settings/account">
-          {settingsNavLocale.account}
-        </a>
-        <a class={item(false)} href="/user/settings/notifications">
-          {settingsNavLocale.notifications}
-        </a>
-        <a class={item(false)} href="/user/settings/appearance">
-          {settingsNavLocale.appearance}
-        </a>
-        <a class={item(false)} href="/user/settings/security">
-          {settingsNavLocale.security}
-        </a>
-        <a class={item(false)} href="/user/settings/applications">
-          {settingsNavLocale.applications}
-        </a>
-        <a class={item(false)} href="/user/settings/keys">
-          {settingsNavLocale.ssh_gpg_keys}
-        </a>
-        <details class="item">
-          <summary>{settingsNavLocale.actions}</summary>
-          <div class="menu">
-            <a class={item(false)} href="/user/settings/actions/secrets">
-              {settingsNavLocale.secrets}
-            </a>
-            <a class={item(false)} href="/user/settings/actions/variables">
-              {settingsNavLocale.variables}
-            </a>
-          </div>
-        </details>
-        <a class={item(false)} href="/user/settings/hooks">
-          {settingsNavLocale.hooks}
-        </a>
-        <a class={item(false)} href="/user/settings/organization">
-          {settingsNavLocale.organization}
-        </a>
-        {/* navbar.tmpl:73-76 — THIS tab */}
-        <a class={item(true)} href="/user/settings/repos">
-          {userSettingsReposLocale.repos}
-        </a>
-      </div>
-    </div>
-  );
-}
-
 /** The full-document render (the render.tsx pattern — `index.ts` stays a
  *  pure-TS router module, so the JSX invocation lives beside the
  *  component). */
@@ -440,7 +374,7 @@ export function UserSettingsReposPage(props: { ctx: UiContext; data: UserSetting
   return (
     <BaseLayout ctx={ctx} title={userSettingsReposLocale.repos} pageClass="user settings repos">
       <div class="ui container flex-container">
-        <UserSettingsReposNav />
+        <UserSettingsNavbar active="repos" />
         <div class="flex-container-main">
           <div class="user-setting-content">
             {/* repos.tmpl:3-5 — the header. */}

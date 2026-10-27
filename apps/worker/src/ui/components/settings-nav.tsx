@@ -123,6 +123,7 @@ export const settingsNavLocale = {
   variables: "Variables", // "actions.variables" (:53)
   hooks: "Webhooks", // "repo.settings.hooks" (:68)
   organization: "Organizations", // "settings.organization" (:72)
+  repos: "Repositories", // "settings.repos" (repos.tmpl:649)
   // The org group (templates/org/settings/navbar.tmpl).
   org_settings: "Settings", // "org.settings" (the header, :3)
   org_options: "Organization", // "org.settings.options" (:5)
@@ -144,7 +145,8 @@ export type UserSettingsNavTab =
   | "secrets" // pages/user-settings-secrets.tsx
   | "variables" // pages/user-settings-variables.tsx
   | "hooks" // pages/user-settings-webhooks.tsx
-  | "organization"; // pages/user-settings-organizations.tsx
+  | "organization" // pages/user-settings-organizations.tsx
+  | "repos"; // pages/user-settings-repos.tsx
 
 /** The org settings tabs — options/hooks (landed), blocked (committed-
  *  unmounted), secrets/variables (landed via org-settings-actions), plus
@@ -219,9 +221,14 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
         <a class={item("hooks")} href="/user/settings/hooks">
           {settingsNavLocale.hooks}
         </a>
-        {/* navbar.tmpl:71-73 (Repos :74-76 dead) */}
+        {/* navbar.tmpl:71-73 */}
         <a class={item("organization")} href="/user/settings/organization">
           {settingsNavLocale.organization}
+        </a>
+        {/* navbar.tmpl:74-76 — the doer's own repo list (GET only; the
+            unadopted POST is structurally absent, the module header). */}
+        <a class={item("repos")} href="/user/settings/repos">
+          {settingsNavLocale.repos}
         </a>
       </div>
     </div>

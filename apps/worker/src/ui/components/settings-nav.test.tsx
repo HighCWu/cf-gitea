@@ -91,14 +91,13 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
 
   it("renders NO dead items — the unlanded upstream targets are omitted, never dead anchors", () => {
     const html = renderToString(<UserSettingsNavbar active="profile" />);
-    // Account (:7-11) and Notifications (:12-16) RENDER (their pages landed);
-    // Blocked users (:25-27), Audit (:36-38), Packages (:61-65), Repos
-    // (:74-76) stay omitted.
+    // Account (:7-11), Notifications (:12-16) and Repos (:74-76) RENDER
+    // (their pages landed); Blocked users (:25-27), Audit (:36-38),
+    // Packages (:61-65) stay omitted.
     for (const dead of [
       'href="/user/settings/blocked_users"',
       'href="/user/settings/audit_logs"',
       'href="/user/settings/packages"',
-      'href="/user/settings/repos"',
     ]) {
       expect(html).not.toContain(dead);
     }
@@ -126,6 +125,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
       variables: 'href="/user/settings/actions/variables"',
       hooks: 'href="/user/settings/hooks"',
       organization: 'href="/user/settings/organization"',
+      repos: 'href="/user/settings/repos"',
     };
     for (const [tab, href] of Object.entries(expectations)) {
       const html = renderToString(<UserSettingsNavbar active={tab as UserSettingsNavTab} />);

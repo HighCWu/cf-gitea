@@ -894,6 +894,10 @@ import {
   renderUserSettingsNotificationsPage,
 } from "./pages/user-settings-notifications";
 import {
+  loadUserSettingsReposPageData,
+  renderUserSettingsReposPage,
+} from "./pages/user-settings-repos";
+import {
   applyUserOrgsLeave,
   loadUserOrgsSettings,
   parseUserOrgsLeaveForm,
@@ -2306,7 +2310,8 @@ export interface UserSettingsTabRoute {
     | "user-settings-notifications-email"
     | "user-settings-notifications-actions"
     | "user-settings-organizations"
-    | "user-settings-organizations-leave";
+    | "user-settings-organizations-leave"
+    | "user-settings-repos";
   /** The numeric path segment (hook/variable id), already parsed. */
   id: number | null;
 }
@@ -2630,6 +2635,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 2 && tail[0] === "notifications" && tail[1] === "actions") {
       return { family: "user-settings-notifications-actions", id: null };
     }
+    // The repos tab (web.go:734 — GET only; the unadopted POST is
+    // structurally absent in the R2/DO-behind-D1 model, the module header).
+    if (tail.length === 1 && tail[0] === "repos") return { family: "user-settings-repos", id: null };
     // The orgs tab is SINGULAR on the wire (web.go:740 m.Get("/organization",
     // …) serves the plural template — the module's premise correction).
     if (tail.length === 1 && tail[0] === "organization") return { family: "user-settings-organizations", id: null };
@@ -5632,6 +5640,17 @@ async function userSettingsNotificationsPage(c: Context<{ Bindings: Env }>): Pro
   const data = await loadUserSettingsNotificationsPageData(c.env.DB, p.viewer.id);
   if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
   return p.respond(c.html(renderUserSettingsNotificationsPage(p.ctx, data), 200));
+}
+
+/** GET /user/settings/repos (web.go:734, profile.go:222-325's else arm —
+ *  ALWAYS the doer's own list; GET only, the unadopted POST stays
+ *  unclaimed). */
+async function userSettingsReposPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsReposPageData(c.env.DB, p.viewer.id, p.url.searchParams);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsReposPage(p.ctx, data), 200));
 }
 
 /** POST /user/settings/notifications/email|actions: one submit, the arm
@@ -9987,6 +10006,7 @@ uiRouter.post("/user/settings/account/delete", (c) => userSettingsAccountDelete(
 // The notifications tab (navbar.tmpl:12-16 — the GET page + the two
 // preference POSTs).
 uiRouter.get("/user/settings/notifications", (c) => userSettingsNotificationsPage(c));
+uiRouter.get("/user/settings/repos", (c) => userSettingsReposPage(c));
 uiRouter.post("/user/settings/notifications/email", (c) => userSettingsNotificationsSubmit(c, "email"));
 uiRouter.post("/user/settings/notifications/actions", (c) => userSettingsNotificationsSubmit(c, "actions"));
 uiRouter.get("/user/settings/organization", (c) => userSettingsOrganizationsPage(c));
