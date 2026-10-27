@@ -64,7 +64,7 @@
  *   (modules/setting/ui.go:91 — the org-teams list's constant).
  */
 
-import { and, asc, eq, like, or, sql } from "drizzle-orm";
+import { and, asc, eq, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -155,12 +155,17 @@ export async function loadOrgMembersData(
     total = listing.total;
   } else {
     // The keyword arm: the same join/filter/order the service read runs,
-    // plus the template keyword's LIKE pair (lower_name matches via the
-    // users.usernameLower column; full_name lowers in SQL — the upstream
-    // BuildCaseInsensitiveLike shape). The needle pre-lowers so the
-    // comparison stays a plain LIKE.
-    const needle = `%${keyword.toLowerCase()}%`;
-    const keywordCond = or(like(users.usernameLower, needle), like(sql`lower(${users.fullName})`, needle));
+    // plus the template keyword's substring pair. NOT LIKE: D1 caps LIKE
+    // patterns at 50 bytes, so a 49+-char needle threw D1_ERROR and the
+    // page answered a plain 500 (found by the matrix-5 probe); the
+    // substring goes through instr() instead — the documented user-search
+    // precedent (services/user.ts:81-97, the same reasoning). The needle
+    // pre-lowers for the case-insensitive pair.
+    const lowered = keyword.toLowerCase();
+    const keywordCond = or(
+      sql`instr(${users.usernameLower}, ${lowered}) > 0`,
+      sql`instr(lower(${users.fullName}), ${lowered}) > 0`,
+    );
     const where = publicOnly
       ? and(eq(orgMembers.orgId, org.id), eq(orgMembers.isPublic, true), keywordCond)
       : and(eq(orgMembers.orgId, org.id), keywordCond);

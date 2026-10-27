@@ -36,7 +36,8 @@
  *     48 chars, the largest needle whose `%needle%` LIKE fits D1's
  *     documented 50-byte pattern cap (services/user.ts:81) — renders 200
  *     with the whole-needle echo. The loader's `.slice(0, 255)` sits beyond
- *     that cap: needles of 49..255 chars throw inside D1 and 500 the route
+ *     that cap: needles of 49..255 chars threw inside D1 and 500ed the route
+ *     (FIXED same-day: the arm now instr()s — see the boundary test)
  *     (disclosed in the test, reported — a page-module fix, not a test one).
  *   - the row shape under the owner's full view: the person glyph is a
  *     non-link placeholder (the org-home avatar-slot rule), the second-owner
@@ -439,13 +440,14 @@ describe("the keyword grammar arms (the needle pair org.go:184-193)", () => {
     const html = await res.text();
     expect(html).toContain("No matching results found."); // no member name carries the needle
     expect(html).toContain(`value="${needle}"`); // the echo is the untouched needle
-    // DISCLOSED LIMITATION (not pinned — a source-side candidate): needles
-    // of 49..255 chars throw inside D1 (the LIKE pattern crosses 50 bytes)
-    // and the route answers the plain 500 — the loader's `.slice(0, 255)`
-    // sits beyond the usable cap, so its truncation boundary is
-    // unreachable in effect. Upstream has no such cap (Go LIKE handles long
-    // patterns); the fix belongs to the page module (clamp to 48 or switch
-    // to the instr() shape) and is reported to the orchestrator.
+    // FIXED (the orchestrator, same day): the keyword arm switched to the
+    // instr() substring shape (the user-search precedent, services/
+    // user.ts:81-97) — no LIKE pattern, no 50-byte cap. Long needles now
+    // answer the clean no-results page instead of the 500.
+    const longNeedle = "z".repeat(200);
+    const longRes = await fetchUi(`/org/korg/members?q=${longNeedle}`);
+    expect(longRes.status).toBe(200);
+    expect(await longRes.text()).toContain("No matching results found.");
   });
 });
 
