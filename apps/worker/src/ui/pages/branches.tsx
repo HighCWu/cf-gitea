@@ -88,7 +88,7 @@
  * `repo.branch.deletion_success` / `default_deletion_failed` /
  * `protected_deletion_failed` / `deletion_failed`.
  *
- * ## The writer block — create + rename (two-stage, unmounted)
+ * ## The writer block — create + rename (two-stage; POST arms mounted)
  *
  * Upstream's default-section and per-row actions render under `and $.IsWriter
  * $.Repository.CanContentChange (not .IsDeleted)` (list.tmpl:34,56,163,185):
@@ -108,16 +108,15 @@
  *   `to` (required; left empty like upstream's modal — web_src/js/features/
  *   repo-branch.ts prefills only `from`) (web.go:1486 + RenameBranchForm).
  *
- * **HANDOFF — the POST arms are NOT mounted in `src/ui/index.ts`**
- * (orchestrator-owned; this wave may not touch it, and the parser still
- * hands `/branches/_new/*` to the engine — pages-wave17's parser test pins
- * that): until the mount wave lands the two arms, a submitted form 404s.
- * This is the sibling two-stage-unmounted convention (the settings modules,
- * 46230c8..fbbc05b): render + upstream contract first, write arm second.
- * The future arm must carry upstream's group middlewares' posture
- * (RepoMustNotBeArchived + reqRepoCodeWriter + MustBeNotEmpty) and replay
- * the landed API create/rename ops (routes/branches.ts POST/PATCH) the way
- * applyBranchDelete replays repoDeleteBranch.
+ * **MOUNTED (w129 batch-14 sweep — this paragraph was the two-stage
+ * HANDOFF):** the two POST arms went live in `src/ui/index.ts` with the
+ * window-2e folds (635ce2e — "the branches writer forms' POST arms"), which
+ * carried the group middlewares' posture (writer grant +
+ * RepoMustNotBeArchived + MustBeNotEmpty) and replayed the landed API
+ * create/rename ops (routes/branches.ts POST/PATCH) the way applyBranchDelete
+ * replays repoDeleteBranch. The module kept the sibling two-stage-unmounted
+ * convention (the settings modules, 46230c8..fbbc05b) on its way there:
+ * render + upstream contract first, write arm second.
  *
  * ## The PR column (list.tmpl's third cell, `three wide tw-text-right`)
  *

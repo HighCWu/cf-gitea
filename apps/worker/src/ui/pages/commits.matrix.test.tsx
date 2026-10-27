@@ -44,6 +44,13 @@
  *     the param on that base, a zero-match filter renders the empty table
  *     with NO pagination block, and parsePageNumber's two clamp paths
  *     (non-digit vs digit-below-one) meet the filter.
+ *   - w129 batch-14 (wave-polish-matrix-14, the census's gap a3): the
+ *     never-pinned upstream chrome absences — the keyword-search box +
+ *     dropdown (commits_table.tmpl:29-40), the follow-rename checkbox
+ *     (:14-21) and the per-commit signature badges (commit_sign_badge.tmpl)
+ *     never render and a ?q= keyword is a no-op. The absences are
+ *     STRUCTURAL (engine listLog has no grep; CommitJson carries no
+ *     verification field), so the pins hold until an engine RPC lands.
  *
  * Fixture posture: a disjoint `cm*` family (the wave suites own alice/*),
  * seeded once in beforeAll via ensureSeededRepo (real pushed packs), extra
@@ -575,5 +582,66 @@ describe("the bare-URL ?path x pager interplay (w129 batch-10)", () => {
       expect(bodyRows(html), `page=${page}`).toBe(50); // page 1's window
       expect(html, `page=${page}`).toContain('href="/cmgal/bulk/commits?path=counter.txt&amp;page=2"');
     }
+  });
+});
+
+// --- w129 batch-14 additions (wave-polish-matrix-14): the never-pinned -----------
+// upstream chrome absences (the census's gap a3 — the dangerous
+// unrendered-AND-unpinned class). commits_table.tmpl carries three shapes
+// this family never rendered and no suite ever pinned: the keyword-search
+// box + dropdown (:29-40, the PageIsCommits arm), the follow-rename checkbox
+// (:14-21), and the per-commit signature badges (commit_sign_badge.tmpl via
+// commits_list.tmpl). The absences are STRUCTURAL — the engine's listLog has
+// no grep (dist-types/repo.d.ts: listRefs/readCommit/listLog/listTree/
+// readDiff/readBlob only) and CommitJson carries no verification field — so
+// these pins hold until an engine RPC lands, exactly the census's permanence
+// framing.
+
+describe("the upstream search/follow-rename/sign-badge chrome never renders (w129 batch-14)", () => {
+  it("no search form, no follow-rename checkbox on the log — and a ?q= keyword is a documented no-op", async () => {
+    // Provenance: wave-polish-matrix-14 (census gap a3). Upstream renders
+    // the search form (commits_table.tmpl:29-40 — form.ignore-dirty →
+    // {RepoLink}/commits/{RefTypeNameSubURL}/search, the q input +
+    // commits_search_dropdown) and the follow-rename checkbox (:14-21,
+    // initCommitHistoryFollowRename) in the header row; ours renders
+    // neither — listLog has no grep, so a rendered box would be dead UI
+    // (the §2.4.1 rule). The pin holds until an engine grep RPC exists; a
+    // refactor that starts emitting the form must land the RPC first and
+    // flip this arm deliberately.
+    const res = await get("/cmgal/log/commits?q=log%20second");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain("ignore-dirty"); // upstream's search form marker
+    expect(html).not.toContain("/search"); // no form action, no route link
+    expect(html).not.toContain("initCommitHistoryFollowRename");
+    expect(html).not.toContain("history_enable_follow_renames");
+    expect(html).toContain("commit-id-short"); // the sha label IS rendered…
+    expect(html).not.toContain("commit-is-signed"); // …never the sign badge's classes
+    expect(html).not.toContain("sign-trusted"); // (CommitJson has no verification field)
+    // ?q= (upstream's keyword param) is IGNORED: the unfiltered log renders.
+    expect(bodyRows(html)).toBe(3);
+    expect(html).toContain("log second app");
+  });
+
+  it("the upstream /search tail is treePath-owned, not a search route (no grep RPC to serve it)", async () => {
+    // Provenance: wave-polish-matrix-14. Upstream serves GET
+    // {RepoLink}/commits/{RefTypeNameSubURL}/search as the search results
+    // page; ours claims the same URL shape as ref main + treePath `search`
+    // (the §3.3 shortest-prefix walk) — the tail names no file, so the page
+    // renders the EMPTY table at 200, exactly the feat/one arm's posture.
+    // The route is therefore TAKEN (never a 404 to pin) but carries no
+    // search semantics; it gains them only with an engine grep RPC.
+    const res = await get("/cmgal/log/commits/branch/main/search");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('id="commits-table"');
+    expect(bodyRows(html)).toBe(0);
+    expect(html).toContain('<span class="text">main</span>'); // resolved ref main
+    expect(parseUiRoute("/cmgal/log/commits/branch/main/search")).toEqual({
+      family: "commits",
+      owner: "cmgal",
+      repo: "log",
+      refSuffix: "branch/main/search",
+    });
   });
 });

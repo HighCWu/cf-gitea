@@ -9,7 +9,8 @@
  *     and deeper-tail engine handoffs);
  *   - ui/__tests__/pages-wave3.test.ts owns the GET reads: title bar,
  *     markdown pipeline bodies, comment/close/reopen timeline, reduced
- *     sidebar (label badges into the live filters, plain-text milestone),
+ *     sidebar (label badges into the live filters, the milestone's live
+ *     `/milestone/{id}` link — w129 batch-14), the open/closed PR badges,
  *     the open/closed PR badges, the no-content variant, the mirrored-
  *     import poster, the cross-family redirects route-level and the 404
  *     shells;
@@ -734,20 +735,29 @@ describe("the sidebar combo divs (w129 batch-10: the ?div-only edit fragments)",
     expect(html).not.toContain("octicon-milestone"); // nothing bound → no icon arm
   });
 
-  it("the POPULATED milestone renders the octicon + plain-text name inside the single-mode combo — never a link (the §2.4.1 dead-link rule)", async () => {
-    // Provenance: wave-polish-matrix-10. No suite ever rendered a bound
-    // milestone on the detail page (the fixture block above seeds one); the
-    // module header's reduction ("milestone renders as plain text — no
-    // milestone page") was unpinned for the populated arm: the icon renders,
-    // the name does NOT anchor upstream's /milestone/{id} URL.
+  it("the POPULATED milestone renders the octicon + name inside the single-mode combo, anchored to the live milestone page", async () => {
+    // Provenance: wave-polish-matrix-10 (the populated arm itself) FLIPPED by
+    // w129 batch-14 (the census's gap a1 + ca4eb58): batch-10 pinned the
+    // no-link shape ("never a link — the §2.4.1 dead-link rule") while the
+    // milestone detail page was absent; the page landed ui-parity-5
+    // (ca4eb58) and pages/issue-detail.tsx now emits upstream's
+    // milestone_list.tmpl:49 anchor, so the pin flips to the link shape.
+    // The exact id is fixture-assigned (global autoincrement), so the href
+    // prefix + the integer tail are matched, and the name span must sit
+    // INSIDE the anchor.
     const fixture = await ensureIssueDetailFixtures();
     const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('<div class="issue-sidebar-combo" data-selection-mode="single" data-update-algo="all">');
     expect(html).toContain("octicon-milestone");
-    expect(html).toContain(`<span class="tw-flex-1 tw-break-anywhere">${SIDEBAR_MILESTONE_NAME}</span>`);
-    expect(html).not.toContain(`/${OWNER_NAME}/${REPO_SLUG}/milestone/`); // no dead link around the name
+    const href = new RegExp(`<a class="item" href="/${OWNER_NAME}/${REPO_SLUG}/milestone/\\d+">`).exec(html);
+    expect(href).not.toBeNull();
+    // The name span rides inside the anchored item (upstream's flex shape).
+    expect(html).toContain(
+      `>${SIDEBAR_MILESTONE_NAME}</span></a>`,
+    );
+    expect(html.indexOf(href![0])).toBeLessThan(html.indexOf(`>${SIDEBAR_MILESTONE_NAME}</span></a>`));
     expect(html).not.toContain('<span class="item empty-list">No Milestone</span>'); // the empty arm yielded
   });
 

@@ -71,6 +71,14 @@ import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
 import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "../repos/testing/git-pack";
 
+// wave-129 full-run contention budget: this file's heaviest closure measured
+// 4.02s of the 30s default IN a green 8-worker full run (the D1-resolved
+// admin-matrix write arms over real pushes; the suite's 260-isolate spawn
+// storm spikes closures up to ~12x their solo time). File-local 90s budgets;
+// vitest.config.ts keeps 30s for every other file. Membership: the measured
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
+
 beforeAll(async () => {
   await applyAuthD1Migrations();
 });

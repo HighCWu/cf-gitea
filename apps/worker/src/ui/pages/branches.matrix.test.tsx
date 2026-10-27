@@ -75,7 +75,13 @@
  *     the rename POST's round-trip (the ref swap verified through listRefs
  *     + `?renamed=`) with its refusal set (the plain owner's default-branch
  *     refusal — branch.go:443-447's site-admin arm — plus empty / missing /
- *     colliding / self pairs).
+ *     colliding / self pairs);
+ *   - w129 batch-14 (wave-polish-matrix-14, the census's gap a3): the
+ *     per-branch RSS-feed and download-source-archive buttons (list.tmpl's
+ *     EnableFeed / DisableDownloadSourceArchives block, :44-52/:173-181)
+ *     get their explicit absence arm — documented never-pinned before; the
+ *     absence is permanent while no archive endpoint or feed surface exists
+ *     to target (the module header's dead-link reduction).
  */
 
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
@@ -717,5 +723,33 @@ describe("w100 rename write (POST /branches/rename)", () => {
     for (const res of [empty, missing, collides, self]) expect(res.status).toBe(303);
     const names = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name).sort();
     expect(names).toEqual(["refs/heads/main", "refs/heads/side-two", "refs/heads/w100-fb", "refs/heads/w100-made"]);
+  });
+});
+
+// --- w129 batch-14 additions (wave-polish-matrix-14): the per-branch feed/archive -
+// absence pin (the census's gap a3 — "documented never-pinned"). Upstream's
+// list.tmpl renders a per-branch RSS button (EnableFeed, :44-45 default /
+// :173-174 per-branch) and a download-source-archive dropdown
+// (DisableDownloadSourceArchives, :47-52 / :176-181 — the ZIP/TAR.GZ
+// archive-link anchors) on every row; pages/branches.tsx renders neither
+// (the module header's Reductions block: no archive endpoint or feed surface
+// exists to target — the dead-link rule). The census classifies this as the
+// dangerous unrendered-AND-unpinned class, so the absence gets its explicit
+// arm; it holds until an archive/feed surface lands and flips it deliberately.
+
+describe("w100 feed/archive absence (w129 batch-14: the documented never-pinned pair)", () => {
+  it("no per-branch RSS button and no download-source-archive anchors render — on the default or any listed branch", async () => {
+    // Provenance: wave-polish-matrix-14 (census gap a3, branches.tsx's
+    // Reductions block). The render is exercised signed-in (the owner sees
+    // the full writer chrome) so the absence cannot be a gate artifact.
+    const res = await get(`/${OWNER}/w100br/branches`, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain("octicon-rss"); // the feed button's glyph
+    expect(html).not.toContain("rss/branch/"); // its href shape
+    expect(html).not.toContain("rss_feed"); // its tooltip literal
+    expect(html).not.toContain("archive-link"); // the ZIP/TAR.GZ anchor class
+    expect(html).not.toContain("/archive/"); // the archive href shape
+    expect(html).not.toContain("octicon-file-zip"); // the archive glyph
   });
 });

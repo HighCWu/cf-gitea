@@ -65,11 +65,14 @@
  *   (branch existence, the PR commit range) deferred with the mergeability
  *   wave. The merge-event sha renders as plain short text — the
  *   `/commit/{sha}` page stays engine-owned (open question 1).
- * - Milestone renders as plain text (upstream links `/{repo}/milestone/{id}` —
- *   no milestone page; the §2.4.1 dead-link rule wins). Label badges link into
- *   the LIVE list filters (`/{issues|pulls}?labels={id}` — wave-2 QueryBuild
- *   parity). The sidebar's edit dropdowns (label/milestone pickers) are write
- *   actions — not rendered (§2.5); the section headings stay.
+ * - Milestone links upstream's `/{repo}/milestone/{id}` (sidebar/
+ *   milestone_list.tmpl:49). w129 batch-14 flip: it rendered plain text while
+ *   the page was absent (the §2.4.1 dead-link rule won then) — the milestone
+ *   detail page landed ui-parity-5 (ca4eb58) and the link went live with it.
+ *   Label badges link into the LIVE list filters (`/{issues|pulls}?labels=
+ *   {id}` — wave-2 QueryBuild parity). The sidebar's edit dropdowns (label/
+ *   milestone pickers) are write actions — not rendered (§2.5); the section
+ *   headings stay.
  * - Avatar images are not rendered (no avatar route exists; an `<img>` to a
  *   missing route is a dead link) — the timeline items keep the upstream
  *   content structure without the `.timeline-avatar` slots.
@@ -116,9 +119,13 @@
  *   - The status button's reopen glyph degrades: upstream
  *     `octicon-issue-reopened` is outside the generated icon allowlist — the
  *     landed `octicon-issue-opened` stands in (same green).
- * - Reactions, context menus, attachments, content history and the rest of
- *   the comment-header chrome are write actions or signed-in JS features
- *   (§2.5) — not rendered.
+ * - Reactions, context menus, attachments and the rest of the comment-header
+ *   chrome are write actions or signed-in JS features (§2.5) — not rendered.
+ *   Content history no longer belongs in that list (w129 batch-14 sweep):
+ *   its read fragments landed (cced424 — SPEC-0009's snapshot store) and the
+ *   window-2e mount serves `/content-history/{overview,list,detail}` — what
+ *   stays unrendered is the comment-header dropdown island that fetches
+ *   them, still a signed-in JS feature per §2.5.
  * - Wave-11 (the review interactions, pages/pull-reviews.tsx): the sidebar
  *   leads with the Reviewers section for PRs (sidebar.tmpl:5-9), the
  *   comment form gains the review verdict form below it, and the two POST
@@ -907,11 +914,13 @@ function PullMergeBox(props: { data: IssueDetailData }) {
 /** The reduced sidebar (`view_content/sidebar.tmpl`): PRs lead with the
  *  wave-11 Reviewers section (sidebar.tmpl:5-9 mounts reviewer_list first
  *  for is_pull rows), then the labels list (badges linking into the live
- *  list filters) and the milestone (plain text — `/milestone/{id}` is a dead
- *  page). Wave 5: an admin viewer gets the no-JS label edit form above the
- *  badge list (the two-control reduction of sidebar/label_list.tmpl's JS
- *  dropdown — the upstream `issue_ids`/`label_ids` field names); everyone
- *  sees the badges re-rendered with ContrastColor as before. */
+ *  list filters) and the milestone (upstream's `/milestone/{id}` link —
+ *  w129 batch-14: the detail page landed at ca4eb58, so the name anchors it
+ *  like milestone_list.tmpl:49; plain text before that). Wave 5: an admin
+ *  viewer gets the no-JS label edit form above the badge list (the
+ *  two-control reduction of sidebar/label_list.tmpl's JS dropdown — the
+ *  upstream `issue_ids`/`label_ids` field names); everyone sees the badges
+ *  re-rendered with ContrastColor as before. */
 function IssueSidebar(props: {
   repoLink: string;
   data: IssueDetailData;
@@ -1001,10 +1010,13 @@ function IssueSidebar(props: {
           {milestone === null ? (
             <span class="item empty-list">{issueDetailLocale.no_milestone}</span>
           ) : (
-            <span class="item">
+            // milestone_list.tmpl:49 — the name anchors the milestone page
+            // (w129 batch-14: the page landed at ca4eb58, un-deadening the
+            // previously plain-text span).
+            <a class="item" href={`${props.repoLink}/milestone/${milestone.id}`}>
               <Icon name="octicon-milestone" size={18} class="tw-shrink-0" />
               <span class="tw-flex-1 tw-break-anywhere">{milestone.name}</span>
-            </span>
+            </a>
           )}
         </div>
       </div>

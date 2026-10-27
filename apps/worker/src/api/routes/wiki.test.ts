@@ -30,7 +30,7 @@
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
@@ -57,6 +57,15 @@ import {
   webPathToGitPath,
   webPathToUserTitle,
 } from "../../services/wiki";
+
+// wave-129 full-run contention budget: this file's beforeAll seeding (the
+// receive-flow wiki repo) measured a 4.59s hook share of the 30s default IN a
+// green 8-worker full run (its heaviest test measured 3.09s; the suite's
+// 260-isolate spawn storm spikes closures up to ~12x their solo time).
+// File-local 90s budgets; vitest.config.ts keeps 30s for every other file.
+// Membership: the measured >=4s in-run closure/hook set (full-suite junit
+// run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 const ORIGIN = "https://wikisuite.test";
 const TOKEN = "wiki-suite-owner";

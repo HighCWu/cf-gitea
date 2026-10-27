@@ -15,9 +15,19 @@
 
 import { serializeCommit, serializeTree, type ApiObject, type DiffFileJson } from "@cf-gitea/git-engine";
 import { env } from "cloudflare:workers";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { commitFileLists, enrichCommitsWithFileLists, type CommitDiffRead } from "./webhooks";
+
+// wave-129 full-run contention budget: the beforeAll enrichment chain (five
+// commits landed through the RepoCell write RPCs) measured a 16.07s hook share
+// of the 30s default IN a green 8-worker full run — and it fired the stochastic
+// one-file-per-run timeout class under load (2026-10-26). The suite's
+// 260-isolate spawn storm spikes closures up to ~12x their solo time; these
+// file-local 90s budgets restore headroom while vitest.config.ts keeps 30s for
+// every other file. Membership: the measured >=4s in-run closure/hook set
+// (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 // ---------------------------------------------------------------------------
 // commitFileLists — the classification port (pure, no engine)

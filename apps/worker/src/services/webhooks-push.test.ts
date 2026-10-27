@@ -46,7 +46,7 @@ import { env } from "cloudflare:workers";
 const EXPECTED_ORIGIN = ((env as { APP_URL?: string }).APP_URL ?? "http://localhost:3000").replace(/\/+$/, "");
 import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createDurableGit, type DurableGitHandler } from "@cf-gitea/git-engine";
 
@@ -67,6 +67,14 @@ import {
   PUSH_ZERO_OID,
   type WebhookPushWalk,
 } from "./webhooks-push";
+
+// wave-129 full-run contention budget: this file's heaviest closure measured
+// 6.45s of the 30s default IN a green 8-worker full run (the authenticated-
+// pusher gate thread over real receives; the suite's 260-isolate spawn storm
+// spikes closures up to ~12x their solo time). File-local 90s budgets;
+// vitest.config.ts keeps 30s for every other file. Membership: the measured
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 // ---------------------------------------------------------------------------
 // The engine under test — the entrypoint wiring's exact composition

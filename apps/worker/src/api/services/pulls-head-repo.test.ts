@@ -34,7 +34,7 @@
 
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
@@ -45,6 +45,14 @@ import { IssuesService } from "../../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./engine";
 import { createApiRouter } from "../router";
 import { createIdentityAuthResolver, seedIdentity, tokenHeader } from "../../auth/testing/identities";
+
+// wave-129 full-run contention budget: this file's heaviest closure measured
+// 4.01s of the 30s default IN a green 8-worker full run (the payload-emitter
+// walks over real fork PRs; the suite's 260-isolate spawn storm spikes
+// closures up to ~12x their solo time). File-local 90s budgets;
+// vitest.config.ts keeps 30s for every other file. Membership: the measured
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {

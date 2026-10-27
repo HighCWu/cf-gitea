@@ -23,7 +23,7 @@
 
 import { applyD1Migrations, SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { eq } from "drizzle-orm";
@@ -41,6 +41,14 @@ import type { ApiEnv } from "../env";
 import { giteaErrorHandler } from "../errors";
 import { registerGenerateRepoRoute } from "./generate-repo";
 import { registerTagRoutes } from "./tags";
+
+// wave-129 full-run contention budget: this file's heaviest closure measured
+// 4.72s of the 30s default IN a green 8-worker full run (the generateRepo
+// content-copy arms over the shared fork machinery; the suite's 260-isolate
+// spawn storm spikes closures up to ~12x their solo time). File-local 90s
+// budgets; vitest.config.ts keeps 30s for every other file. Membership: the
+// measured >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {

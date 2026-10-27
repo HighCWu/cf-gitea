@@ -239,7 +239,7 @@ describe("issue detail page (/issues/{index})", () => {
     expect(reopenAt).toBeGreaterThan(closeAt);
   });
 
-  it("renders the reduced sidebar: label badges into the live filters, plain-text milestone", async () => {
+  it("renders the reduced sidebar: label badges into the live filters, the milestone anchored to its page", async () => {
     const html = await (await fetchUi("/alice/wave3/issues/1")).text();
     expect(html).toContain('<div class="issue-content-right ui segment">');
     // The ContrastColor badge with the upstream inline styles…
@@ -247,11 +247,12 @@ describe("issue detail page (/issues/{index})", () => {
     expect(html).toContain("color: #fff");
     // …linking into the live list filter (wave-2 QueryBuild parity)…
     expect(html).toContain(`<a class="item" href="/alice/wave3/issues?labels=${fixture.bugLabelId}">`);
-    // …and the milestone as plain text (no /milestone/{id} dead link) with
-    // the single-path milestone glyph.
-    expect(html).toContain('<span class="item"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="18" height="18" class="svg octicon-milestone tw-shrink-0"');
-    expect(html).toContain(">v2.0</span>");
-    expect(html).not.toContain("/milestone/");
+    // …and the milestone anchored to the live /milestone/{id} page (w129
+    // batch-14 flip: plain text while the page was absent — the page landed
+    // ui-parity-5, ca4eb58) with the single-path milestone glyph.
+    expect(html).toContain('<a class="item" href="/alice/wave3/milestone/');
+    expect(html).toContain('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="18" height="18" class="svg octicon-milestone tw-shrink-0"');
+    expect(html).toContain(">v2.0</span></a>");
     // The edit dropdowns (write actions) are not rendered.
     expect(html).not.toContain('class="ui dropdown full-width');
   });

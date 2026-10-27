@@ -86,7 +86,12 @@
  *   - the claim pin for both heads: the `.git`-trimmed repo segment claims
  *     into `src` / `tree-view-aux` (parse + route level), and the bare
  *     `/src` tail 404-shells WITH the repo header (the §4.5 context rule —
- *     wave2 pins it for `/tree`, pages.test only the status for `/src`).
+ *     wave2 pins it for `/tree`, pages.test only the status for `/src`);
+ *   - w129 batch-14 (wave-polish-matrix-14, the census's gap a3): the
+ *     `?display=source|rendered` query (view_file.tmpl:41-44's toggle) is a
+ *     pinned no-op — the variant auto-classifies and the query never
+ *     reaches the loader, byte-identically across the three arms, and the
+ *     toggle chrome never renders.
  *
  * Fixtures (unique names — the matrix files share one storage scope):
  * `tvx-owner/tvx-pub` (4-commit main + `feature`, `feature/deep`,
@@ -1144,5 +1149,43 @@ describe("the claim pin (the .git-trimmed repo segment and the bare /src tail)",
     expect(html).toContain("repo-header");
     expect(html).toContain('<div class="status-page-error">');
     expect(html).not.toContain("repo-files-table");
+  });
+});
+
+// --- w129 batch-14 additions (wave-polish-matrix-14): the ?display= no-op --------
+// pin (the census's gap a3 — view_file.tmpl:41-44's source/rendered toggle is
+// unrendered AND the query was unpinned). Upstream renders the
+// file-view-toggle-buttons pair (?display=source / ?display=rendered anchors
+// with the active state) whenever the file is representable as text, and its
+// handler honors the query (IsDisplayingSource). Ours auto-classifies the
+// variant and the query never reaches the loader (loadFileViewData takes no
+// query input) — pin the no-op so a later refactor cannot silently
+// half-honor it.
+
+describe("the ?display=source|rendered query is a no-op (w129 batch-14)", () => {
+  it("a markup blob renders identically with, without, and flipped ?display= — and no toggle chrome ever renders", async () => {
+    // Provenance: wave-polish-matrix-14 (census gap a3, view_file.tmpl:41-44).
+    await seedPubRepo();
+    const bare = await fetchUi("/tvx-owner/tvx-pub/src/branch/main/README.md");
+    expect(bare.status).toBe(200);
+    const source = await fetchUi("/tvx-owner/tvx-pub/src/branch/main/README.md?display=source");
+    expect(source.status).toBe(200);
+    const rendered = await fetchUi("/tvx-owner/tvx-pub/src/branch/main/README.md?display=rendered");
+    expect(rendered.status).toBe(200);
+    const bareHtml = await bare.text();
+    const sourceHtml = await source.text();
+    const renderedHtml = await rendered.text();
+    // The auto-classified markup variant wins in ALL three renders — the
+    // query is dropped on the floor — byte-identically (the fixed-T0 seeds
+    // keep the render deterministic).
+    expect(sourceHtml).toBe(bareHtml);
+    expect(renderedHtml).toBe(bareHtml);
+    expect(bareHtml).toContain('class="render-content markup"'); // rendered, never the source view
+    // Upstream's toggle pair (file-view-toggle-buttons wrapping the
+    // ?display= anchors) never renders — a rendered toggle would be dead UI
+    // (the §2.4.1 rule) until a display-mode channel exists.
+    expect(bareHtml).not.toContain("file-view-toggle-buttons");
+    expect(bareHtml).not.toContain("file-view-toggle-source");
+    expect(bareHtml).not.toContain("file-view-toggle-rendered");
   });
 });

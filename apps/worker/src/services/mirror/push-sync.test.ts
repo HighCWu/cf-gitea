@@ -34,7 +34,7 @@
 
 import { env } from "cloudflare:workers";
 
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
@@ -53,6 +53,14 @@ import {
   isPushMirrorSyncMessage,
 } from "./push-sync";
 import { NOOP_CTX, SYNCING_SWEEP_AFTER_SEC } from "./sync";
+
+// wave-129 full-run contention budget: this file's heaviest closure measured
+// 4.74s of the 30s default IN a green 8-worker full run (the loopback
+// engine-to-engine sync oracle; the suite's 260-isolate spawn storm spikes
+// closures up to ~12x their solo time). File-local 90s budgets;
+// vitest.config.ts keeps 30s for every other file. Membership: the measured
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 // ---------------------------------------------------------------------------
 // Byte helpers (the sync.test.ts precedent — test-file copies)

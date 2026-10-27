@@ -8,9 +8,10 @@
  *   POST /notifications/status   per-row status write (NotificationStatusPost)
  *   POST /notifications/purge    mark-all-read (NotificationPurgePost)
  *
- * The `/notifications/subscriptions` and `/notifications/watching` pages are
- * not in this slice — their tails stay unclaimed (the engine answers, exactly
- * upstream's unregistered-route 404 for us).
+ * The `/notifications/subscriptions` and `/notifications/watching` pages were
+ * not in this slice — w129 batch-14 sweep note: window-2e C3b landed them
+ * since (pages/notification-subscriptions.tsx, both GET tails mounted); the
+ * route list above stays this module's owner set (new/status/purge).
  *
  * ## DOM contract (templates/user/notification/{notification,notification_div}.tmpl
  *  + base/head_navbar_icons.tmpl at the pin)
@@ -79,7 +80,12 @@
  * - `mark_page_as_read` (purge-page) is not rendered: it needs the
  *   CurUnreadNotificationIDs id-list channel for a page-wide mark the
  *   mark-all button already covers at this scale (dead surface avoided);
- *   the subscriptions/watching tabs are absent with their pages.
+ *   the POST tail stays unclaimed (notifications.test pins the 404).
+ *   w129 batch-14 sweep: the subscriptions/watching pages themselves
+ *   LANDED since this note was written (window-2e C3b — pages/
+ *   notification-subscriptions.tsx, both GET tails mounted); what stays
+ *   absent is the profile-dropdown entry that links them upstream
+ *   (head_navbar.tmpl:108 — shell chrome outside this module).
  * - The pager preserves `type` (the upstream pager keeps its query params).
  */
 
