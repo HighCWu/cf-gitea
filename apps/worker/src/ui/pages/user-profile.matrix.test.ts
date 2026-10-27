@@ -44,7 +44,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { followUser } from "../../api/services/follows";
 import { saveRepoSettings } from "../../api/services/repo-settings";
-import { userRedirects, users } from "../../db/schema";
+import { starRepo } from "../../api/services/stars";
+import { repoWatchers, repositories, userRedirects, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
 import { OrgService } from "../../services/orgs/orgs";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
@@ -170,6 +171,17 @@ async function ensureFixtures(): Promise<void> {
   for (let i = 0; i < 16; i++) {
     await service.create({ owner: { id: bulk.id, usernameLower: "upbulk" }, name: `upbulk-${String(i).padStart(2, "0")}`, isPrivate: false, status: "ready" });
   }
+
+  // The stars-tab relation (profile.go:191-219's SearchRepository seed):
+  // upgal stars uppriv's PUBLIC repo — a row whose per-row Internal badge
+  // differs from the page owner's own visibility. starRepo (not a raw
+  // insert) so the maintained users.num_stars label column moves too
+  // (migration 0031 — header.tmpl's `{{if .ContextUser.NumStars}}` gate).
+  const exposed = (await db.select().from(repositories).where(eq(repositories.slug, "upexposed")).get())!;
+  await starRepo(env.DB, gal.id, exposed.id, FIXED_DATE);
+  // The watching-tab relation (profile.go:220-246's seed): uppal watches
+  // upgal's open repo.
+  await db.insert(repoWatchers).values({ repoId: open.id, userId: pal.id, createdAt: FIXED_DATE });
 
   // The rename pairs: display-cased targets over lower-cased old names.
   for (const [oldName, newName, visibility] of [
@@ -348,6 +360,180 @@ describe("the profile sub-tab arms (the wave-126 mount — stars/watching/follow
       expect(html, tab).toContain('class="page-content organization profile"');
       expect(html, tab).not.toContain("page-content user profile");
     }
+  });
+});
+
+// --- the sub-tab visibility ladder (the deferred arms — the dispatch's gate
+// ordering: resolveUserProfile runs IsUserVisibleToViewer BEFORE any tab data,
+// profile.go:77-80, so every tab inherits the page ladder exactly) ----------
+
+const SUB_TABS = ["stars", "watching", "followers", "following"] as const;
+
+describe("the sub-tab visibility ladder (private/limited owner x stranger/self/admin)", () => {
+  it("a LIMITED owner: anonymous 404s every sub-tab; a signed-in stranger renders each (user.go:1515-1519)", async () => {
+    for (const tab of SUB_TABS) {
+      const anon = await get(`/upshy?tab=${tab}`);
+      expect(anon.status, tab).toBe(404); // limited needs ANY signed-in viewer
+      expect(await anon.text(), tab).toContain("Page Not Found"); // existence never leaks
+
+      const stranger = await get(`/upshy?tab=${tab}`, "uppal");
+      expect(stranger.status, tab).toBe(200);
+      expect(await stranger.text(), tab).toContain('class="page-content user profile"');
+    }
+  });
+
+  it("a PRIVATE owner: anonymous 404s every sub-tab; the followed viewer, self and the site admin render them (user.go:1525-1529)", async () => {
+    for (const tab of SUB_TABS) {
+      const anon = await get(`/uppriv?tab=${tab}`);
+      expect(anon.status, tab).toBe(404); // the follower gate — anonymous fails it
+      expect(await anon.text(), tab).toContain("Page Not Found");
+
+      for (const viewer of ["uppal", "uppriv", "upadmin"]) {
+        const res = await get(`/uppriv?tab=${tab}`, viewer);
+        expect(res.status, `${tab} as ${viewer}`).toBe(200);
+        expect(await res.text(), `${tab} as ${viewer}`).toContain('class="page-content user profile"');
+      }
+    }
+  });
+
+  it("each sub-tab renders ITS OWN body DOM — the tab dispatch's per-arm markers", async () => {
+    const stars = await get("/uppriv?tab=stars", "uppal");
+    const starsHtml = await stars.text();
+    expect(starsHtml).toContain('<div class="stars">'); // profile.tmpl's stars branch wrapper
+    expect(starsHtml).toContain('class="active item" href="/uppriv?tab=stars"');
+
+    const watching = await get("/uppriv?tab=watching", "uppal");
+    const watchingHtml = await watching.text();
+    expect(watchingHtml).not.toContain('<div class="stars">'); // the DisableStars {{else}} arm
+    expect(watchingHtml).toContain('class="active item" href="/uppriv?tab=watching"');
+    expect(watchingHtml).toContain("octicon-eye"); // the watching anchor's glyph
+
+    for (const tab of ["followers", "following"] as const) {
+      const res = await get(`/uppriv?tab=${tab}`, "uppal");
+      const html = await res.text();
+      expect(html, tab).toContain('id="user-cards-container"'); // user_cards.tmpl:2
+      expect(html, tab).toContain('data-fetch-trigger="fetch-reload"');
+      expect(html, tab).toContain('<ul class="list">');
+      // The collapsed-if rule (header.tmpl has no follower anchors): NOTHING
+      // in the strip is active on these two tabs.
+      expect(html, tab).not.toContain('class="active item" href=');
+    }
+  });
+});
+
+// --- the sub-tab content through the mounted route (the star/watch/follow
+// relations seeded above — the arms the per-tab module tests drive through
+// their loader seams, now through the REAL route + session) ------------------
+
+describe("the sub-tab content through the route (real relations)", () => {
+  it("the stars tab: the starred row carries the owner segment, the PER-ROW Internal badge and the star chip", async () => {
+    const res = await get("/upgal?tab=stars");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // ShowRepoOwnerOnList (profile.go:194, list.tmpl:9-12) — the JSX text
+    // node "/" glues the two anchors with no whitespace.
+    expect(html).toContain('<a class="tw-text-primary name" href="/uppriv">uppriv</a>/<a class="tw-text-primary name" href="/uppriv/upexposed">upexposed</a>');
+    // The internal badge reads THIS ROW's owner visibility (uppriv is
+    // private) — not the page owner's public visibility.
+    expect(html).toContain('<span class="ui basic label">Internal</span>');
+    expect(html).toContain('href="/uppriv/upexposed/stars"'); // the live stargazers chip
+    expect(html).not.toContain('href="/upgal/upopen"'); // the repositories rows never leak onto this tab
+  });
+
+  it("the stars tab's range-else arm: zero visible stars = the exact no-results node, no pager (list.tmpl's {{else}})", async () => {
+    const res = await get("/uppriv?tab=stars", "uppal");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("<div>No matching results found.</div>"); // search.no_results
+    expect(html).not.toContain('class="center page buttons"'); // page 1, no more → no pager
+  });
+
+  it("the stars strip carries the maintained numStars label (migration 0031) on the repositories page too", async () => {
+    const res = await get("/upgal");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('href="/upgal?tab=stars"');
+    expect(html).toContain('<div class="ui small label">1</div>'); // the starred-count label
+  });
+
+  it("the following tab renders the real card: uppriv follows uppal — DisplayName link and the avatar-card count", async () => {
+    const res = await get("/uppriv?tab=following", "uppal");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<li class="item ui segment">'); // user_cards.tmpl:10
+    expect(html).toContain('<h3 class="name flex-text-block"><a href="/uppal">uppal</a></h3>'); // :14 (JSX folds the newline)
+    expect(html).toContain("Joined on"); // the meta chain's joined-on arm (no website/location on uppal)
+    expect(html).toContain('href="/uppriv?tab=following"'); // profile_big_avatar.tmpl:25's live anchor
+    expect(html).toContain("1 following</a>"); // the REAL total feeds the card
+  });
+
+  it("the followers tab is the mirror direction: /uppal?tab=followers lists uppriv", async () => {
+    const res = await get("/uppal?tab=followers", "uppal");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<li class="item ui segment">');
+    expect(html).toContain('<a href="/uppriv">uppriv</a>');
+    // uppal follows nobody: the following anchor reads 0.
+    expect(html).toContain("0 following</a>");
+  });
+
+  it("the watching tab: the watched row renders through the route; a non-watcher's tab is the exact empty node", async () => {
+    const res = await get("/uppal?tab=watching");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="active item" href="/uppal?tab=watching"');
+    expect(html).toContain('href="/upgal/upopen"'); // the watched row (ShowRepoOwnerOnList unset — name only)
+
+    const empty = await get("/uppriv?tab=watching", "uppal");
+    expect(empty.status).toBe(200);
+    expect(await empty.text()).toContain("<div>No matching results found.</div>");
+  });
+});
+
+// --- the repositories pager's boundary pages (the deferred arms — the
+// shared parsePageNumber clamp + OrgHomePagination's Older/Newer ternary) ----
+
+describe("the repositories pager's boundary pages", () => {
+  it("page 2 of 16: exactly the 16th row, Newer links the BARE profile URL (not ?page=1), no Older", async () => {
+    const res = await get("/upbulk?page=2");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('href="/upbulk/upbulk-15"'); // the 16th row alone
+    expect(html).not.toContain('href="/upbulk/upbulk-00"'); // page 1's rows gone
+    // OrgHomePagination's page>2 ternary: page 2's Newer is the bare link.
+    expect(html).toContain('<a class="item navigation" href="/upbulk"><span class="navigation_label">Newer</span></a>');
+    expect(html).not.toContain(">Older<");
+  });
+
+  it("a page beyond the end: zero rows, Newer back to page 2, no Older", async () => {
+    const res = await get("/upbulk?page=3");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain('href="/upbulk/upbulk-00"'); // the offset past the total
+    expect(html).toContain('<a class="item navigation" href="/upbulk?page=2"><span class="navigation_label">Newer</span></a>');
+    expect(html).not.toContain(">Older<"); // more = 3*15 < 16 is false
+  });
+
+  it("junk and out-of-range pages fold onto page 1 (parsePageNumber's clamp)", async () => {
+    for (const query of ["page=abc", "page=0", "page=-3"]) {
+      const res = await get(`/upbulk?${query}`);
+      expect(res.status, query).toBe(200);
+      const html = await res.text();
+      expect(html, query).toContain('href="/upbulk/upbulk-00"'); // the first page's rows
+      expect(html, query).not.toContain('href="/upbulk/upbulk-15"');
+      expect(html, query).toContain('href="/upbulk?page=2"'); // Older offered again
+    }
+  });
+
+  it("a zero-repo profile: the empty list wrapper renders unconditionally, no count label, no pager", async () => {
+    const res = await get("/uppal");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // shared/repo/list.tmpl:1 — the wrapper renders even with zero rows
+    // (upstream's own shape; home.tmpl's empty-placeholder is NOT this template).
+    expect(html).toContain('<div class="flex-divided-list items-with-main"></div>');
+    expect(html).not.toContain("ui small label"); // repoCount 0 AND numStars 0 → both labels gated off
+    expect(html).not.toContain('class="center page buttons"'); // page <= 1 && !more → the pager is null
   });
 });
 

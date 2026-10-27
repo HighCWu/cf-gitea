@@ -398,3 +398,134 @@ describe("issue content fragments", () => {
     expect(await orphanResponse.text()).toBe("");
   });
 });
+
+// ---------------------------------------------------------------------------
+// The deferred arms (the polish wave): the 20-revision retention limiter's
+// boundary, the soft-delete row's read-side markers, and the canSoftDelete
+// gate's revision-poster family — each provenance-cited against the upstream
+// content-history model (models/issues/content_history.go at the pin).
+// ---------------------------------------------------------------------------
+
+/** All history rows of one namespace, oldest first (the limiter's SELECT
+ *  shape — content_history.go:74-79's ORDER BY edited_unix ASC read). */
+async function namespaceRows(commentId: number): Promise<Array<{ id: number; editedAt: Date; isFirstCreated: boolean }>> {
+  const rows = await drizzle(env.DB)
+    .select({ id: issueContentHistory.id, editedAt: issueContentHistory.editedAt, isFirstCreated: issueContentHistory.isFirstCreated })
+    .from(issueContentHistory)
+    .where(eq(issueContentHistory.commentId, commentId))
+    .all();
+  return rows.sort((a, b) => a.editedAt.getTime() - b.editedAt.getTime());
+}
+
+describe("the 20-revision retention limiter's boundary (content_history.go:56-106)", () => {
+  it("exactly 20 revisions: nothing is dropped — the cap is inclusive (KeepLimitedContentHistory's `<= limit` return)", async () => {
+    const s = await seed();
+    const svc = new IssuesService(env.DB);
+    const comment = await svc.addComment({ issueId: s.issue.id, posterId: s.ownerId, content: "limiter v0", now: at(100) });
+    // The lazy back-fill makes the first edit insert TWO rows (created + the
+    // edit); 19 edits total → exactly 20 revisions, one per second.
+    for (let i = 1; i <= 19; i++) {
+      await updateCommentBody(env.DB, comment.id, `limiter v${i}`, at(100 + i));
+    }
+    const rows = await namespaceRows(comment.id);
+    expect(rows).toHaveLength(20); // content_history.go:78's `if len <= limit return`
+    expect(rows[0]?.isFirstCreated).toBe(true); // the created revision survives
+    expect(rows[19]?.editedAt.getTime()).toBe(at(119).getTime()); // the newest survives
+  });
+
+  it("the 21st revision: ONE smallest-interval middle is hard-deleted — first and last are never deleted (:86-101)", async () => {
+    const s = await seed();
+    const svc = new IssuesService(env.DB);
+    const comment = await svc.addComment({ issueId: s.issue.id, posterId: s.ownerId, content: "limiter v0", now: at(100) });
+    for (let i = 1; i <= 20; i++) {
+      await updateCommentBody(env.DB, comment.id, `limiter v${i}`, at(100 + i));
+    }
+    const rows = await namespaceRows(comment.id);
+    expect(rows).toHaveLength(20); // 21 - 1 surplus (outDatedCount, :80)
+    // Uniform 1 s intervals → every middle interval ties, and the scan keeps
+    // the EARLIEST minimum (strict `<`, :90) — the second-oldest revision is
+    // the deleted one.
+    const times = rows.map((row) => row.editedAt.getTime());
+    expect(times).toEqual([
+      at(100).getTime(), // the first-created revision — NEVER deleted (:92-93)
+      ...Array.from({ length: 18 }, (_, i) => at(102 + i).getTime()), // @101 is gone
+      at(120).getTime(), // the newest revision — NEVER deleted (:94's last index)
+    ]);
+    expect(rows[0]?.isFirstCreated).toBe(true);
+  });
+
+  it("the overview count reads the SATURATED namespace: 20 (the map rides the same rows, issue_content_history.go:38-39)", async () => {
+    const s = await seed();
+    const svc = new IssuesService(env.DB);
+    const comment = await svc.addComment({ issueId: s.issue.id, posterId: s.ownerId, content: "limiter v0", now: at(100) });
+    for (let i = 1; i <= 20; i++) {
+      await updateCommentBody(env.DB, comment.id, `limiter v${i}`, at(100 + i));
+    }
+    const data = await loadContentHistoryOverviewFragment(env.DB, s.issue);
+    expect(data.editedHistoryCountMap[String(comment.id)]).toBe(20); // still > 1 — the dropdown badge
+  });
+});
+
+describe("the soft-deleted revision's read-side arms (the dropdown's deleted marker + the unfiltered count)", () => {
+  it("the list marks a deleted revision with the <i data-history-is-deleted> element (issue_content_history.go:56-63)", async () => {
+    const s = await seed();
+    const repo = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, s.repoId)).get())!;
+    const issue = await resolveFragmentIssue(env.DB, repo, s.issue.index);
+    expect(issue).not.toBeNull();
+    if (issue === null) return;
+    await drizzle(env.DB)
+      .insert(issueContentHistory)
+      .values({ issueId: issue.id, commentId: 0, posterId: s.ownerId, editedAt: at(60), contentText: "removed draft", isFirstCreated: false, isDeleted: true });
+
+    const list = await loadContentHistoryListFragment(env.DB, issue, 0);
+    expect(list.results).toHaveLength(3);
+    const names = list.results!.map((item) => item.name);
+    expect(names.filter((name) => name.includes('<i data-history-is-deleted="1">deleted</i>'))).toHaveLength(1);
+    // The live revisions keep the plain action arms.
+    expect(names.filter((name) => name.includes("created"))).toHaveLength(1);
+    expect(names.filter((name) => name.includes("edited"))).toHaveLength(1);
+  });
+
+  it("the overview counts deleted revisions (NO is_deleted filter — content_history.go:110-133's verbatim GROUP BY)", async () => {
+    const s = await seed();
+    const repo = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, s.repoId)).get())!;
+    const issue = await resolveFragmentIssue(env.DB, repo, s.issue.index);
+    expect(issue).not.toBeNull();
+    if (issue === null) return;
+    await drizzle(env.DB)
+      .insert(issueContentHistory)
+      .values({ issueId: issue.id, commentId: 0, posterId: s.ownerId, editedAt: at(60), contentText: "removed draft", isFirstCreated: false, isDeleted: true });
+
+    const data = await loadContentHistoryOverviewFragment(env.DB, s.issue);
+    expect(data.editedHistoryCountMap["0"]).toBe(3); // 2 live + 1 soft-deleted
+  });
+});
+
+describe("the canSoftDelete gate's revision-poster family (content_history.go:84-110)", () => {
+  it("a viewer who merely EDITED the comment (the revision's poster, neither issue- nor comment-poster) can soft-delete their revision; a stranger cannot", async () => {
+    const s = await seed();
+    const repo = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, s.repoId)).get())!;
+    const issue = await resolveFragmentIssue(env.DB, repo, s.issue.index);
+    expect(issue).not.toBeNull();
+    if (issue === null) return;
+    const svc = new IssuesService(env.DB);
+    const editor = await seedVerifiedUser({ username: "frageditor" });
+    const stranger = await seedVerifiedUser({ username: "fragstranger" });
+
+    // The owner posts; the EDITOR rewrites it via the actorId arm — the
+    // revision row's poster is the editor, not the comment poster.
+    const comment = await svc.addComment({ issueId: issue.id, posterId: s.ownerId, content: "owner wrote", now: at(110) });
+    await updateCommentBody(env.DB, comment.id, "editor rewrote", at(111), editor.id);
+    const rows = await namespaceRows(comment.id);
+    expect(rows).toHaveLength(2);
+    const editRevision = rows[1]!; // @111 — posterId = the editor (issues.ts:883 actorId ?? prior.posterId)
+
+    const editorViewer = { kind: "user", id: editor.id, username: "frageditor", isAdmin: false } as const;
+    const editorDetail = await loadContentHistoryDetailFragment(env, repo, issue, editorViewer, comment.id, editRevision.id);
+    expect(editorDetail).toMatchObject({ kind: "ok", canSoftDelete: true }); // :105's history.PosterID arm
+
+    const strangerViewer = { kind: "user", id: stranger.id, username: "fragstranger", isAdmin: false } as const;
+    const strangerDetail = await loadContentHistoryDetailFragment(env, repo, issue, strangerViewer, comment.id, editRevision.id);
+    expect(strangerDetail).toMatchObject({ kind: "ok", canSoftDelete: false }); // no grant, no poster match
+  });
+});

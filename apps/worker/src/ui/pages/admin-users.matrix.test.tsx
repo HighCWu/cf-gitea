@@ -338,3 +338,85 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(byOldest).toContain("octicon-triangle-up"); // the active asc direction
   });
 });
+
+// --- the deferred arms (the polish wave): the status_filter x q interplay,
+// the sort vocab's case-exact fold boundary, and the pager's exactly-at-50
+// boundary — cites against routers/web/admin/users.go:59-105 at the pin -----
+
+describe("loadAdminUsersData — the q x status_filter interplay (users.go:96-105's ANDed options)", () => {
+  it("the keyword ANDs with each status filter — a keyword match outside the filter's set is excluded", async () => {
+    await seedBaseFixtures();
+    // alice matches q but is not an admin: the intersection is empty.
+    expect((await load("q=alice&status_filter[is_admin]=1")).total).toBe(0);
+    // the email keyword matches ALL four users; the inactive filter narrows it to carol.
+    expect((await load("q=test.local&status_filter[is_active]=0")).items.map((row) => row.username)).toEqual(["carol"]);
+    // the full-name keyword with the active filter.
+    expect((await load("q=doe&status_filter[is_active]=1")).items.map((row) => row.username)).toEqual(["alice"]);
+    // the constant-false filters compose: truthy matches nothing even under a
+    // keyword; falsy filters nothing out of the keyword's matches.
+    expect((await load("q=alice&status_filter[is_restricted]=1")).total).toBe(0);
+    expect((await load("q=alice&status_filter[is_2fa_enabled]=0")).items.map((row) => row.username)).toEqual(["alice"]);
+    // the folded pair composes the same way (is_prohibit_login=0 == active).
+    expect((await load("q=test.local&status_filter[is_prohibit_login]=0")).total).toBe(3);
+  });
+
+  it("the keyword ANDs with user_type — root under Bot is empty, under User is root (users.go:75-79)", async () => {
+    await seedBaseFixtures();
+    expect((await load("q=root&user_type=Bot")).total).toBe(0);
+    expect((await load("q=root&user_type=User")).items.map((row) => row.username)).toEqual(["root"]);
+  });
+
+  it("the interplay carries through the pager query verbatim (the render's checked states included)", async () => {
+    await seedBaseFixtures();
+    const data = await load("q=test.local&status_filter[is_active]=0&status_filter[is_2fa_enabled]=0");
+    expect(data.query.get("q")).toBe("test.local");
+    expect(data.query.get("status_filter[is_active]")).toBe("0");
+    expect(data.query.get("status_filter[is_2fa_enabled]")).toBe("0");
+    const html = render(data);
+    expect(html).toContain('name="status_filter[is_active]" value="0" checked');
+    expect(html).toContain('name="q" value="test.local"');
+    expect(html).not.toContain("no-results-row"); // the interplay matched carol — no empty state
+  });
+});
+
+describe("loadAdminUsersData — the sort vocab's case-exact fold boundary", () => {
+  it("sort values are value-exact: casing does NOT match and folds onto the default, which never rides the pager query", async () => {
+    await insertUser({ username: "zack" });
+    await insertUser({ username: "abe" });
+
+    const folded = await load("sort=NEWEST");
+    expect(folded.params.sort).toBe("alphabetically"); // parseAdminUserSort's switch is exact
+    expect(folded.items.map((row) => row.username)).toEqual(["abe", "zack"]); // the default order
+    expect(folded.query.has("sort")).toBe(false); // the folded default never rides the URL
+    expect(folded.params.explicitSort).toBe(true); // the URL DID carry ?sort= — the SortArrow input stays honest
+  });
+});
+
+describe("the pager at exactly the boundary (Admin.UserPagingNum = 50)", () => {
+  it("exactly 50 users: one full page, more=false, NO pager at all; page=2 is empty", async () => {
+    for (let i = 0; i < ADMIN_USERS_PAGE_SIZE; i++) {
+      await insertUser({ username: `b${String(i).padStart(2, "0")}` });
+    }
+    const only = await load("");
+    expect(only.total).toBe(ADMIN_USERS_PAGE_SIZE);
+    expect(only.items).toHaveLength(ADMIN_USERS_PAGE_SIZE);
+    expect(only.more).toBe(false); // 1 * 50 < 50 is false — the boundary
+    const html = render(only);
+    expect(html).not.toContain('class="center page buttons"'); // page <= 1 && !more → the pager is null
+    expect(html).not.toContain(">Older<");
+    expect((await load("page=2")).items).toHaveLength(0);
+  });
+
+  it("page 2 of 51: Newer carries q + sort + page=1; the last page offers no Older", async () => {
+    for (let i = 0; i < ADMIN_USERS_PAGE_SIZE + 1; i++) {
+      await insertUser({ username: `b${String(i).padStart(2, "0")}` });
+    }
+    const html = render(await load("q=b&sort=newest&page=2"));
+    // AddParamFromRequest keeps every param but page (pagination.go:96-102);
+    // the reduction's href() re-adds page explicitly — page 1 included.
+    expect(html).toContain('href="/-/admin/users?q=b&amp;sort=newest&amp;page=1"');
+    expect(html).toContain(">Newer<");
+    expect(html).not.toContain(">Older<"); // 51 = 50 + 1 → page 2 is the last
+    expect(html).not.toContain('class="no-results-row"');
+  });
+});

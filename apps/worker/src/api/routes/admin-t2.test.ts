@@ -432,6 +432,168 @@ describe("GET /admin/users (adminSearchUsers)", () => {
     expect(page.headers.get("Link")).toContain('rel="next"');
     expect(page.headers.get("Link")).toContain('rel="first"');
   });
+
+  // --- the deferred arms (the polish wave) — cites: routers/api/v1/utils/
+  // sort.go:18-41 (ResolveHostSortOrder's order-first map), models/user/
+  // search.go:21-36 (AdminUserOrderByMap — 'updated' → updated_unix, the
+  // landed created_at stand-in, admin-t2 deviation 5), search.go:76-170
+  // (SearchUsers' ANDed filter row), services/convert/utils.go
+  // ToCorrectPageSize (the silent 50 cap). --------------------------------
+
+  it("sorts by 'updated' through the created_at stand-in in both directions (deviation 5)", async () => {
+    // The describe's beforeEach stamped distinct created_at values:
+    // stub 2024 < alpha 2025-01 < charlie 2025-02 < bravo 2025-03
+    // < root 2025-05 < neighbor 2026.
+    const updatedAsc = await adminSend("/admin/users?sort=updated", authed());
+    const asc: Array<Record<string, unknown>> = await updatedAsc.json();
+    expect(asc.map((entry) => entry.login)).toEqual([
+      "cf-gitea-stub",
+      "alpha",
+      "charlie",
+      "bravo",
+      "root",
+      "neighbor",
+    ]);
+
+    const updatedDesc = await adminSend("/admin/users?sort=updated&order=desc", authed());
+    const desc: Array<Record<string, unknown>> = await updatedDesc.json();
+    expect(desc.map((entry) => entry.login)).toEqual([
+      "neighbor",
+      "root",
+      "bravo",
+      "charlie",
+      "alpha",
+      "cf-gitea-stub",
+    ]);
+  });
+
+  it("order without sort is ignored; an explicit order=asc applies (utils/sort.go:18-41)", async () => {
+    // sortMode "" short-circuits BEFORE the order read: the default
+    // (alphabetically, asc) answers even with order=desc in the URL.
+    const orderOnly = await adminSend("/admin/users?order=desc", authed());
+    const orderedList: Array<Record<string, unknown>> = await orderOnly.json();
+    expect(orderedList.map((entry) => entry.login)).toEqual([
+      "alpha",
+      "bravo",
+      "cf-gitea-stub",
+      "charlie",
+      "neighbor",
+      "root",
+    ]);
+
+    const explicitAsc = await adminSend("/admin/users?sort=name&order=asc", authed());
+    expect(((await explicitAsc.json<Array<Record<string, unknown>>>())).map((entry) => entry.login)).toEqual([
+      "alpha",
+      "bravo",
+      "cf-gitea-stub",
+      "charlie",
+      "neighbor",
+      "root",
+    ]);
+  });
+
+  it("an unknown ORDER 422s before an unknown SORT — the map is keyed order-first (utils/sort.go:26-33)", async () => {
+    const both = await adminSend("/admin/users?sort=bogus&order=sideways", authed());
+    expect(both.status).toBe(422);
+    expect(((await both.json<Record<string, unknown>>())).message).toBe('Invalid sort order: "sideways"');
+  });
+
+  it("the q keyword ANDs with the boolean/visibility filters (search.go:76-170's conditions slice)", async () => {
+    // q hits bravo; the inactive filter keeps it.
+    const interplay = await adminSend("/admin/users?q=brav&is_active=false", authed());
+    expect(((await interplay.json<Array<Record<string, unknown>>>())).map((entry) => entry.login)).toEqual(["bravo"]);
+
+    // q hits alpha; the admin filter excludes it — empty intersection.
+    const conflict = await adminSend("/admin/users?q=alpha&is_admin=true", authed());
+    expect(conflict.headers.get("X-Total-Count")).toBe("0");
+
+    // the email-keyword arm composes with is_active=true.
+    const emailActive = await adminSend("/admin/users?q=alpha@example.com&is_active=true", authed());
+    expect(((await emailActive.json<Array<Record<string, unknown>>>())).map((entry) => entry.login)).toEqual(["alpha"]);
+
+    // the full-name arm composes with visibility.
+    const namePrivate = await adminSend("/admin/users?q=three&visibility=private", authed());
+    expect(((await namePrivate.json<Array<Record<string, unknown>>>())).map((entry) => entry.login)).toEqual(["charlie"]);
+
+    // the keyword is case-folded BEFORE the match (search.go:87-99's LOWER
+    // arm) — and "alph" hits TWO rows: alpha's username AND charlie's
+    // "Alpha Three" full name.
+    const folded = await adminSend("/admin/users?q=ALPH", authed());
+    expect(((await folded.json<Array<Record<string, unknown>>>())).map((entry) => entry.login)).toEqual([
+      "alpha",
+      "charlie",
+    ]);
+  });
+
+  it("the affirmative flag arms: is_active=true and is_prohibit_login=false both select the active five", async () => {
+    const active = await adminSend("/admin/users?is_active=true", authed());
+    const activeList = await active.json<Array<Record<string, unknown>>>();
+    expect(activeList.map((entry) => entry.login).sort()).toEqual([
+      "alpha",
+      "cf-gitea-stub",
+      "charlie",
+      "neighbor",
+      "root",
+    ]);
+
+    const allowed = await adminSend("/admin/users?is_prohibit_login=false", authed());
+    expect(((await allowed.json<Array<Record<string, unknown>>>())).map((entry) => entry.login).sort()).toEqual([
+      "alpha",
+      "cf-gitea-stub",
+      "charlie",
+      "neighbor",
+      "root",
+    ]);
+  });
+
+  it("the pager caps at exactly 50 (ToCorrectPageSize) with the true total in the headers", async () => {
+    // 6 fixture users + 49 seeded = 55: enough to observe the cap AND the
+    // 50-boundary second page. Single-row inserts — D1 caps a statement at
+    // 100 bound variables, and one users row carries 19.
+    for (let i = 0; i < 49; i++) {
+      await drizzle(env.DB).insert(users).values({
+        username: `bulk${String(i).padStart(2, "0")}`,
+        usernameLower: `bulk${String(i).padStart(2, "0")}`,
+        status: "active",
+        visibility: "public",
+        createdAt: new Date("2025-07-01T00:00:00Z"),
+      });
+    }
+
+    // The cap: limit=51 clamps to 50 rows; X-Total-Count stays the TRUE 55.
+    const capped = await adminSend("/admin/users?limit=51", authed());
+    expect(capped.headers.get("X-Total-Count")).toBe("55");
+    expect((await capped.json<Array<Record<string, unknown>>>())).toHaveLength(50);
+    expect(capped.headers.get("Link")).toContain('rel="next"');
+
+    // The absent limit rides the 30 default.
+    const defaulted = await adminSend("/admin/users", authed());
+    expect(defaulted.headers.get("X-Total-Count")).toBe("55");
+    expect((await defaulted.json<Array<Record<string, unknown>>>())).toHaveLength(30);
+
+    // Exactly 50 per page: page 1 carries no prev/first; page 2 the 5 leftovers.
+    const p1 = await adminSend("/admin/users?limit=50", authed());
+    expect((await p1.json<Array<Record<string, unknown>>>())).toHaveLength(50);
+    const p1Link = p1.headers.get("Link") ?? "";
+    expect(p1Link).toContain('rel="next"');
+    expect(p1Link).toContain('rel="last"');
+    expect(p1Link).not.toContain('rel="prev"');
+    expect(p1Link).not.toContain('rel="first"');
+
+    const p2 = await adminSend("/admin/users?limit=50&page=2", authed());
+    expect((await p2.json<Array<Record<string, unknown>>>())).toHaveLength(5);
+    const p2Link = p2.headers.get("Link") ?? "";
+    expect(p2Link).toContain('rel="prev"');
+    expect(p2Link).toContain('rel="first"');
+    expect(p2Link).not.toContain('rel="next"');
+
+    // Junk limits fold onto the default (never a 422 — the silent clamp).
+    for (const junk of ["abc", "-1", "0"]) {
+      const junked = await adminSend(`/admin/users?limit=${junk}`, authed());
+      expect(junked.status, junk).toBe(200);
+      expect((await junked.json<Array<Record<string, unknown>>>()), junk).toHaveLength(30);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
