@@ -51,6 +51,32 @@
  *                  documented [warn], anything mounted asserts hard. A red
  *                  run sweeps the secret (by name, via the user API) + the
  *                  org it created (the failureTail).
+ *   window3-mounts The window-3 mount sweep over the ~12 committed-unmounted
+ *                  UI surfaces (the RD20 wrap battery): the releases/tags
+ *                  feed tails (`releases.rss|.atom`, `tags.rss|.atom` — exact
+ *                  writeFeed content-types + channel titles + the
+ *                  MustBeNotEmpty empty-repo 404 arm), the wiki raw byte arm
+ *                  (`/wiki/raw/*` — a pushed page's coded + .md-tail probes,
+ *                  the ETag/304 pair, text/plain, the absent-wiki 404), the
+ *                  profile stars/watching/followers/following tabs (the
+ *                  mounted ?tab=activity arm rides along), the /-/admin
+ *                  users/orgs/repos lists (admin-cookie 200s with the
+ *                  pageClass + probe rows, the anonymous login-303 arm), the
+ *                  user-settings account/notifications tabs (read-only — the
+ *                  POST arms are NOT probed), the milestone list→detail
+ *                  round-trip, and the issue content-history list tail (the
+ *                  {"results":null} pre-edit empty arm). Like
+ *                  window2-mounts, every surface reads the mount state AT RUN
+ *                  TIME: a 404 (or, for the profile tabs, a 200 that is
+ *                  still the inert repositories view) is the documented
+ *                  not-yet-mounted degradation ([warn]); anything mounted
+ *                  asserts hard. Fixtures: one public auto_init probe repo
+ *                  (the feeds' non-empty gate, the wiki page, the issue, the
+ *                  milestone) + one empty public repo (the feeds' 404 arm) —
+ *                  both DELETEd on green (the issue/milestone/wiki-page rows
+ *                  cascade with the repo), so cleanup-audit needs no new
+ *                  residue expectations; a red run sweeps both (the
+ *                  failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -144,7 +170,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -225,6 +251,7 @@ const usage = () =>
   "  mirror:        --mirror-settle-ms <ms>    (sync-settle budget, default 30000; the row-settle arm reuses --d1-scope)\n" +
   "  ui-login:      --new-label-count <n>      (canonical 3 writer-form occurrences)\n" +
   "  window2-mounts: (no extra options)\n" +
+  "  window3-mounts: (no extra options)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -1673,6 +1700,518 @@ const window2FailureCleanup = async (ctx) => {
   if (acts.length) log(`  [tail] w2-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
 };
 
+// ---------- battery: window3-mounts (the window-3 UI mount family) ----------
+
+/**
+ * The window-3 mount sweep (the RD20 wrap battery — ~12 committed-unmounted
+ * UI surfaces in one index.ts window): the releases/tags feed tails
+ * (`releases.rss|.atom` + `tags.rss|.atom`), the wiki raw byte arm
+ * (`/wiki/raw/*`), the profile stars/watching/followers/following tabs (the
+ * already-mounted ?tab=activity arm rides along), the /-/admin
+ * users/orgs/repos lists, the user-settings account/notifications tabs, the
+ * milestone list→detail round-trip, and the issue content-history list tail.
+ *
+ * Like window2-mounts, every surface reads the mount state AT RUN TIME: a
+ * 404 from a not-yet-mounted path is the documented degradation ([warn] —
+ * the mount window is still landing / the deploy lags HEAD), for the profile
+ * tabs a 200 that is still the inert repositories view warns the same way
+ * (their pre-dispatch answer is a 200, not a 404), and for the wiki raw arm
+ * the LANDED page family's own answers warn (a 200 text/html start page
+ * pre-create, a 303 onto ?action=_pages post-create — the RD20 live smoke's
+ * discovery); anything mounted asserts hard. The login-cookie methodology
+ * (ui-login's lesson: a PAT header never reads a UI page) rides POST /login
+ * → gitea_session; the wiki write arm sends a same-origin `Origin` header so
+ * it exercises §2.8's sameOriginGuard PASS arm.
+ *
+ * Fixtures: ONE public auto_init probe repo (the feeds' non-empty gate, the
+ * wiki page, the issue, the milestone) + ONE empty public repo (the feeds'
+ * MustBeNotEmpty 404 arm). A green run deletes both repos — the
+ * issue/milestone/wiki-page rows cascade with the repo delete (services
+ * deleteRepository's batch) and the wiki cell follows the repo's engine
+ * cleanup — so the battery leaves NO D1 residue and cleanup-audit needs no
+ * new expectations. A red run sweeps both repos (the failureTail).
+ */
+
+/** The wiki page content pushed through the LANDED web writer
+ *  (POST …/wiki?action=_new) for the raw arm to serve. */
+const W3_WIKI_HOME_TEXT = "# window3 wiki raw probe\n";
+
+/** The profile follow tabs' container (user_cards.tmpl:2's verbatim div). */
+const W3_USER_CARDS = `class="user-cards" id="user-cards-container" data-fetch-trigger="fetch-reload"`;
+
+const window3Context = () => ({
+  user: opts.user, cookie: null,
+  repo: `w3-${hexId()}`, emptyRepo: `w3e-${hexId()}`,
+  issueNumber: null, milestoneId: null, milestoneTitle: `w3m-${hexId()}`,
+  wikiEtag: null,
+  repoCreated: false, repoFullName: null, repoGone: false,
+  emptyCreated: false, emptyFullName: null, emptyGone: false,
+});
+
+/** The mount-at-run-time GET: a 404 from a not-yet-mounted path returns null
+ *  (the caller renders the documented [warn]); anything else hands the
+ *  response + body to the caller's hard asserts. */
+const window3GetOrWarn = async (url, { cookie, headers } = {}) => {
+  const res = await fetchT(url, { headers: { ...(cookie ? { cookie } : {}), ...(headers ?? {}) } });
+  const body = await res.text();
+  if (res.status === 404) return null;
+  return { res, body };
+};
+
+/** The wiki-raw probe (mount-at-run-time): the LANDED wiki PAGE family still
+ *  claims the raw tails until the window mounts, and its answers here are a
+ *  200 text/html (the no-wiki start page, pre-create) or a 303 onto
+ *  …/wiki/?action=_pages (the page-miss redirect, post-create) — those two
+ *  shapes are the documented not-yet-mounted degradation ([warn]; RD20 live
+ *  smoke 2026-10-27 caught the 200 arm: the naive "expect 404" failed
+ *  against the standing page family). Anything else — the 404 shells, the
+ *  mounted arm's 200/304 — hands through to the caller's hard asserts. */
+const window3WikiRawProbe = async (ctx, tail, extraHeaders) => {
+  const res = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/wiki/raw/${tail}`,
+    { headers: { ...(ctx.cookie ? { cookie: ctx.cookie } : {}), ...(extraHeaders ?? {}) } });
+  const body = await res.text();
+  const contentType = String(res.headers.get("content-type") ?? "");
+  if (res.status === 303 && String(res.headers.get("location") ?? "").includes("action=_pages")) {
+    return { degraded: true, detail: `303 → ${JSON.stringify(res.headers.get("location"))} (the page family's page-miss redirect)` };
+  }
+  if (res.status === 200 && contentType.includes("text/html")) {
+    return { degraded: true, detail: "200 text/html (the page family's no-wiki start page)" };
+  }
+  return { degraded: false, res, body };
+};
+
+/** One profile-tab probe (mount-at-run-time): a 404 warns (not mounted); a
+ *  200 missing the tab's mounted markers is the inert pre-dispatch
+ *  repositories view → warn; the full marker set → pass. Any other status
+ *  throws (mounted-but-wrong fails hard). */
+const window3ProfileTab = async (ctx, tab, markers) => {
+  const res = await fetchT(`${opts.baseUrl}/${ctx.user}?tab=${tab}`, { headers: { cookie: ctx.cookie } });
+  const body = await res.text();
+  const label = `/${ctx.user}?tab=${tab}`;
+  if (res.status === 404) {
+    return { ok: false, text: `${label} 404 — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+  }
+  expect(res.status === 200, `${label} status ${res.status} (expected 200)`);
+  const missing = markers.filter((m) => !body.includes(m));
+  if (missing.length > 0) {
+    return { ok: false, text: `${label} rendered WITHOUT ${missing.length}/${markers.length} mounted markers — the tab did not dispatch (the inert repositories view rendered)` };
+  }
+  return { ok: true, text: `${label} 200 — all ${markers.length} mounted markers` };
+};
+
+const window3Steps = (ctx) => [
+  {
+    id: "w3-login-303",
+    expect: `POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session cookie — the ui-login methodology (a PAT header never reads a UI page; the session value is scrubbed from all output)`,
+    run: async () => {
+      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const res = await fetchT(`${opts.baseUrl}/login`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      await res.text();
+      expect(res.status === 303, `status ${res.status} (expected 303 See Other)`);
+      const setCookie = res.headers.getSetCookie().find((c) => c.startsWith("gitea_session="));
+      expect(setCookie !== undefined, `no gitea_session cookie in Set-Cookie (got ${res.headers.getSetCookie().length} cookies)`);
+      ctx.cookie = setCookie.split(";")[0];
+      secrets.push(ctx.cookie.split("=")[1] ?? "");
+      return "303 + gitea_session cookie";
+    },
+  },
+  {
+    id: "w3-create-repo-201",
+    expect: `POST /api/v1/user/repos {"name":"${ctx.repo}","private":false,"auto_init":true} → 201 (public — the feeds are anonymous-capable; auto_init — the feed groups' MustBeNotEmpty gate needs a non-empty repo)`,
+    run: async () => {
+      const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, private: false, auto_init: true } });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      ctx.repoCreated = true; // the failure-cleanup tail deletes it if a later step reds
+      ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
+      return `created ${res.json?.full_name} (public, auto_init)`;
+    },
+  },
+  {
+    id: "w3-create-empty-repo-201",
+    expect: `POST /api/v1/user/repos {"name":"${ctx.emptyRepo}","private":false,"auto_init":false} → 201 (the EMPTY repo — the feed groups' MustBeNotEmpty 404 arm)`,
+    run: async () => {
+      const res = await api("/user/repos", { method: "POST", body: { name: ctx.emptyRepo, private: false, auto_init: false } });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      ctx.emptyCreated = true; // the failure-cleanup tail deletes it if a later step reds
+      ctx.emptyFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.emptyRepo}`);
+      return `created ${res.json?.full_name} (public, empty)`;
+    },
+  },
+  {
+    id: "w3-feeds-anon-200",
+    expect: `anonymous GET of the four feed tails on ${ctx.repo} → 200 with the EXACT writeFeed content-types (application/rss+xml;charset=utf-8 / application/atom+xml;charset=utf-8) + root elements + channel titles "Releases for ${ctx.user}/${ctx.repo}" / "Tags for …" (mount-at-run-time: a 404 warns — not yet mounted)`,
+    run: async () => {
+      const titles = {
+        releases: `<title>Releases for ${ctx.user}/${ctx.repo}</title>`,
+        tags: `<title>Tags for ${ctx.user}/${ctx.repo}</title>`,
+      };
+      const tails = [
+        { path: `/${ctx.user}/${ctx.repo}/releases.rss`, ct: "application/rss+xml;charset=utf-8", root: `<rss version="2.0"`, title: titles.releases },
+        { path: `/${ctx.user}/${ctx.repo}/releases.atom`, ct: "application/atom+xml;charset=utf-8", root: `<feed xmlns="http://www.w3.org/2005/Atom">`, title: titles.releases },
+        { path: `/${ctx.user}/${ctx.repo}/tags.rss`, ct: "application/rss+xml;charset=utf-8", root: `<rss version="2.0"`, title: titles.tags },
+        { path: `/${ctx.user}/${ctx.repo}/tags.atom`, ct: "application/atom+xml;charset=utf-8", root: `<feed xmlns="http://www.w3.org/2005/Atom">`, title: titles.tags },
+      ];
+      const unmounted = [];
+      let ok = 0;
+      for (const t of tails) {
+        const probe = await window3GetOrWarn(`${opts.baseUrl}${t.path}`);
+        if (probe === null) {
+          unmounted.push(t.path);
+          continue;
+        }
+        expect(probe.res.status === 200, `${t.path} status ${probe.res.status} (expected 200)`);
+        expect(String(probe.res.headers.get("content-type")) === t.ct,
+          `${t.path} content-type ${JSON.stringify(probe.res.headers.get("content-type"))} (expected ${t.ct})`);
+        expect(probe.body.includes(t.root), `${t.path} missing the ${t.root.split(" ")[0]} root element`);
+        expect(probe.body.includes(t.title), `${t.path} missing the channel title ${t.title}`);
+        ok += 1;
+      }
+      if (unmounted.length > 0) {
+        return { status: "warn", detail: `${ok}/${tails.length} feed tails 200; NOT MOUNTED at run time: ${unmounted.join(", ")}` };
+      }
+      return `all 4 feed tails 200 — exact content-types + channel titles (Releases for / Tags for)`;
+    },
+  },
+  {
+    id: "w3-feeds-empty-repo-404",
+    expect: `anonymous GET releases.rss + tags.rss on the EMPTY repo ${ctx.emptyRepo} → 404 each (the group gate repo.MustBeNotEmpty — an empty repo never reaches the feed handler; pre-mount the engine's route-miss 404 is indistinguishable, post-mount this pins the gate)`,
+    run: async () => {
+      for (const tail of ["releases.rss", "tags.rss"]) {
+        const res = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.emptyRepo}/${tail}`);
+        await res.text();
+        expect(res.status === 404, `empty-repo ${tail} status ${res.status} (expected 404 — MustBeNotEmpty)`);
+      }
+      return "404 on both tails — the empty repo never reaches the feed handlers";
+    },
+  },
+  {
+    id: "w3-wiki-absent-raw-404",
+    expect: `GET ${ctx.repo}/wiki/raw/Home BEFORE any wiki write → 404 (the absent-wiki arm — the wiki cell has no branch yet, wiki.go:600-604's not-exist class; mount-at-run-time: the page family's 200-start-page/303 degradation warns — post-mount this probe must answer 404)`,
+    run: async () => {
+      const probe = await window3WikiRawProbe(ctx, "Home");
+      if (probe.degraded) {
+        return { status: "warn", detail: `wiki/raw/Home ${probe.detail} — the raw arm is NOT MOUNTED at run time; post-mount this probe must answer 404 (the absent-wiki gate)` };
+      }
+      expect(probe.res.status === 404, `absent-wiki raw probe status ${probe.res.status} (expected 404)`);
+      return "404 — the absent-wiki arm";
+    },
+  },
+  {
+    id: "w3-wiki-page-create-303",
+    expect: `POST ${ctx.repo}/wiki?action=_new {"title":"Home","content":"# window3 wiki raw probe\\n","message":""} with the session cookie + same-origin Origin → 303 onto /${ctx.user}/${ctx.repo}/wiki/Home (the LANDED wiki writer seeds the page the raw arm serves)`,
+    run: async () => {
+      const r = await window2PostForm(ctx, `/${ctx.user}/${ctx.repo}/wiki?action=_new`, {
+        title: "Home", content: W3_WIKI_HOME_TEXT, message: "",
+      });
+      expect(r.status === 303, `status ${r.status} (expected 303): ${r.body.slice(0, 120)}`);
+      expect(r.location === `/${ctx.user}/${ctx.repo}/wiki/Home`,
+        `location ${JSON.stringify(r.location)} (expected /${ctx.user}/${ctx.repo}/wiki/Home)`);
+      return `303 → ${r.location}`;
+    },
+  },
+  {
+    id: "w3-wiki-raw-coded-200",
+    expect: `GET ${ctx.repo}/wiki/raw/Home (the CODED probe — WebPathToGitPath "Home.md") → 200 text/plain; charset=utf-8 with the pushed bytes VERBATIM + a strong quoted-oid ETag (mount-at-run-time: the page family's degradation warns — not yet mounted)`,
+    run: async () => {
+      const probe = await window3WikiRawProbe(ctx, "Home");
+      if (probe.degraded) {
+        return { status: "warn", detail: `wiki/raw/Home ${probe.detail} — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+      }
+      expect(probe.res.status === 200, `status ${probe.res.status} (expected 200)`);
+      expect(String(probe.res.headers.get("content-type")) === "text/plain; charset=utf-8",
+        `content-type ${JSON.stringify(probe.res.headers.get("content-type"))} (expected text/plain; charset=utf-8 — any text is forced plain)`);
+      expect(probe.body === W3_WIKI_HOME_TEXT, `body ${JSON.stringify(probe.body.slice(0, 60))} != the pushed wiki bytes`);
+      const etag = String(probe.res.headers.get("etag") ?? "");
+      expect(/^"[0-9a-f]{40}"$/.test(etag), `etag ${JSON.stringify(etag)} (expected a strong quoted-oid ETag)`);
+      ctx.wikiEtag = etag;
+      return `200 text/plain — the pushed bytes round-trip; ETag ${etag.slice(0, 9)}…`;
+    },
+  },
+  {
+    id: "w3-wiki-raw-md-alias-200",
+    expect: `GET ${ctx.repo}/wiki/raw/Home.md (the .md-TAIL probe — WebPathToGitPath's pass-through arm, the SAME blob as the coded probe) → 200 with the IDENTICAL ETag + bytes (mount-at-run-time: the page family's degradation warns)`,
+    run: async () => {
+      const probe = await window3WikiRawProbe(ctx, "Home.md");
+      if (probe.degraded) {
+        return { status: "warn", detail: `wiki/raw/Home.md ${probe.detail} — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+      }
+      expect(probe.res.status === 200, `status ${probe.res.status} (expected 200)`);
+      expect(probe.body === W3_WIKI_HOME_TEXT, `body ${JSON.stringify(probe.body.slice(0, 60))} != the pushed wiki bytes`);
+      expect(String(probe.res.headers.get("etag") ?? "") === ctx.wikiEtag,
+        `etag ${JSON.stringify(probe.res.headers.get("etag"))} != the coded probe's ${ctx.wikiEtag} (the .md tail must resolve the same blob)`);
+      return `200 — the .md tail resolves the same blob (ETag match)`;
+    },
+  },
+  {
+    id: "w3-wiki-raw-304",
+    expect: `GET ${ctx.repo}/wiki/raw/Home with If-None-Match: <the captured ETag> → 304 carrying the ETag ONLY (no Cache-Control — httpcache.go:96-101 returns before the cache stamp; mount-at-run-time: the page family's degradation warns)`,
+    run: async () => {
+      if (ctx.wikiEtag === null) {
+        return { status: "warn", detail: "no ETag captured (the coded probe did not reach a mounted surface) — the 304 arm is unverifiable" };
+      }
+      const probe = await window3WikiRawProbe(ctx, "Home", { "if-none-match": ctx.wikiEtag });
+      if (probe.degraded) {
+        return { status: "warn", detail: `wiki/raw/Home ${probe.detail} — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+      }
+      expect(probe.res.status === 304, `status ${probe.res.status} (expected 304)`);
+      expect(probe.res.headers.get("etag") === ctx.wikiEtag,
+        `the 304's etag ${JSON.stringify(probe.res.headers.get("etag"))} != ${ctx.wikiEtag}`);
+      expect(probe.res.headers.get("cache-control") === null,
+        `the 304 carries cache-control ${JSON.stringify(probe.res.headers.get("cache-control"))} (expected NONE — the ETag gate returns before the cache stamp)`);
+      return "304 with the ETag only — the If-None-Match pair holds";
+    },
+  },
+  {
+    id: "w3-issue-create-201",
+    expect: `POST /api/v1/repos/${ctx.user}/${ctx.repo}/issues {"title":"w3i-…"} → 201 with the issue number (the content-history tail's row)`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/issues`, { method: "POST", body: { title: `w3i-${hexId()}` } });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      expect(Number.isInteger(res.json?.number) && res.json.number > 0, `no issue number in the body: ${res.text.slice(0, 120)}`);
+      ctx.issueNumber = res.json.number;
+      return `issue #${ctx.issueNumber} created`;
+    },
+  },
+  {
+    id: "w3-content-history-list-empty",
+    expect: `cookie GET ${ctx.repo}/issues/${"{index}"}/content-history/list?comment_id=0 → 200 JSON {"results":null} (the pre-edit empty arm — upstream's nil-slice marshal; mount-at-run-time: a 404 warns — not yet mounted)`,
+    run: async () => {
+      const probe = await window3GetOrWarn(
+        `${opts.baseUrl}/${ctx.user}/${ctx.repo}/issues/${ctx.issueNumber}/content-history/list?comment_id=0`,
+        { cookie: ctx.cookie },
+      );
+      if (probe === null) {
+        return { status: "warn", detail: `content-history/list 404 — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+      }
+      expect(probe.res.status === 200, `status ${probe.res.status} (expected 200)`);
+      let json = null;
+      try { json = JSON.parse(probe.body); } catch { /* the assert below reports the raw body */ }
+      expect(json !== null && typeof json === "object" && "results" in json && json.results === null,
+        `body ${probe.body.slice(0, 120)} (expected {"results":null} — the pre-edit empty arm)`);
+      return `200 {"results":null} — the empty-history arm`;
+    },
+  },
+  {
+    id: "w3-milestone-create-201",
+    expect: `POST /api/v1/repos/${ctx.user}/${ctx.repo}/milestones {"title":"${ctx.milestoneTitle}"} → 201 with an integer id (the list→detail round-trip's seed)`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/milestones`, { method: "POST", body: { title: ctx.milestoneTitle } });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      expect(Number.isInteger(res.json?.id), `no integer milestone id in the body: ${res.text.slice(0, 120)}`);
+      ctx.milestoneId = res.json.id;
+      return `milestone id ${ctx.milestoneId} created`;
+    },
+  },
+  {
+    id: "w3-milestones-list-200",
+    expect: `cookie GET ${ctx.repo}/milestones → 200 with class="page-content repository milestones" + the created milestone title (the LIST half of the round-trip; the list page is long-landed — hard assert)`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/milestones`, { headers: { cookie: ctx.cookie } });
+      const body = await res.text();
+      expect(res.status === 200, `status ${res.status} (expected 200)`);
+      expect(body.includes(`class="page-content repository milestones"`), "the milestones pageClass discriminator is missing");
+      expect(body.includes(ctx.milestoneTitle), `the created milestone ${ctx.milestoneTitle} is not on the list page`);
+      return `200 — the list carries milestone ${ctx.milestoneId}`;
+    },
+  },
+  {
+    id: "w3-milestone-detail-200",
+    expect: `cookie GET ${ctx.repo}/milestone/${"{id}"} → 200 with class="page-content repository milestone-issue-list" + the milestone title (the DETAIL half; mount-at-run-time: a 404 warns — HEAD mounts this page, so a live 404 is deploy lag, a mounted-but-wrong render fails)`,
+    run: async () => {
+      const probe = await window3GetOrWarn(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/milestone/${ctx.milestoneId}`, { cookie: ctx.cookie });
+      if (probe === null) {
+        return { status: "warn", detail: `milestone/${ctx.milestoneId} 404 — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+      }
+      expect(probe.res.status === 200, `status ${probe.res.status} (expected 200)`);
+      expect(probe.body.includes(`class="page-content repository milestone-issue-list"`),
+        "the milestone-issue-list pageClass discriminator is missing");
+      expect(probe.body.includes(ctx.milestoneTitle), `the milestone title ${ctx.milestoneTitle} is not on the detail page`);
+      return `200 — milestone-issue-list renders milestone ${ctx.milestoneId}`;
+    },
+  },
+  {
+    id: "w3-profile-activity-200",
+    expect: `cookie GET /${ctx.user}?tab=activity → 200 with id="activity-feed" (the feeds container) + the active strip anchor + the repositories anchor (b1bf73a's mounted arm; a marker-less 200 warns — the inert repositories view rendered)`,
+    run: async () => {
+      const r = await window3ProfileTab(ctx, "activity", [
+        `id="activity-feed"`,
+        `class="active item" href="/${ctx.user}?tab=activity"`,
+        `href="/${ctx.user}?tab=repositories"`,
+      ]);
+      return r.ok ? r.text : { status: "warn", detail: r.text };
+    },
+  },
+  {
+    id: "w3-profile-stars-empty-200",
+    expect: `cookie GET /${ctx.user}?tab=stars → 200 with <div class="stars"> + "No matching results found." (the range-else empty state — stars is empty) + the active stars anchor (mount-at-run-time; a marker-less 200 warns — the inert repositories view)`,
+    run: async () => {
+      const r = await window3ProfileTab(ctx, "stars", [
+        `<div class="stars">`,
+        "No matching results found.",
+        `class="active item" href="/${ctx.user}?tab=stars"`,
+      ]);
+      return r.ok ? r.text : { status: "warn", detail: r.text };
+    },
+  },
+  {
+    id: "w3-profile-watching-empty-200",
+    expect: `cookie GET /${ctx.user}?tab=watching → 200 with "No matching results found." (the range-else empty state) + the active watching anchor (mount-at-run-time; a marker-less 200 warns — the inert repositories view)`,
+    run: async () => {
+      const r = await window3ProfileTab(ctx, "watching", [
+        "No matching results found.",
+        `class="active item" href="/${ctx.user}?tab=watching"`,
+      ]);
+      return r.ok ? r.text : { status: "warn", detail: r.text };
+    },
+  },
+  {
+    id: "w3-profile-follow-tabs-200",
+    expect: `cookie GET /${ctx.user}?tab=followers + ?tab=following → 200 each with the user-cards container (class="user-cards" id="user-cards-container" data-fetch-trigger="fetch-reload"; mount-at-run-time: a 404 or a marker-less 200 warns)`,
+    run: async () => {
+      const out = [];
+      for (const tab of ["followers", "following"]) {
+        const r = await window3ProfileTab(ctx, tab, [W3_USER_CARDS]);
+        out.push({ tab, ...r });
+      }
+      if (out.every((p) => p.ok)) return `200 — both follow tabs render the user-cards container`;
+      return { status: "warn", detail: out.map((p) => `${p.tab}: ${p.text}`).join("; ") };
+    },
+  },
+  {
+    id: "w3-admin-anon-303",
+    expect: `anonymous GET of /-/admin/users|orgs|repos → 303 onto the login round-trip, location EXACTLY /login?redirect_to=<encoded path> (the SignInRequired+AdminRequired gate; mount-at-run-time: a 404 warns — not yet mounted)`,
+    run: async () => {
+      const unmounted = [];
+      let ok = 0;
+      for (const slug of ["users", "orgs", "repos"]) {
+        const path = `/-/admin/${slug}`;
+        const res = await fetchT(`${opts.baseUrl}${path}`);
+        await res.text();
+        if (res.status === 404) {
+          unmounted.push(path);
+          continue;
+        }
+        expect(res.status === 303, `${path} status ${res.status} (expected 303 or, unmounted, 404)`);
+        expect(res.headers.get("location") === `/login?redirect_to=${encodeURIComponent(path)}`,
+          `${path} location ${JSON.stringify(res.headers.get("location"))} (expected /login?redirect_to=${encodeURIComponent(path)})`);
+        ok += 1;
+      }
+      if (unmounted.length > 0) {
+        return { status: "warn", detail: `${ok}/3 admin pages 303'd onto the login round-trip; NOT MOUNTED at run time: ${unmounted.join(", ")}` };
+      }
+      return "all 3 admin pages 303 → /login?redirect_to=<encoded path> (anonymous)";
+    },
+  },
+  ...[
+    { slug: "users", pageClass: "admin user", row: () => `href="/${ctx.user}"`, rowNote: "the probe user's HomeLink row" },
+    { slug: "orgs", pageClass: "admin user", row: null, rowNote: "" },
+    { slug: "repos", pageClass: "admin", row: () => ctx.repo, rowNote: "the probe repo's row" },
+  ].map((page) => ({
+    id: `w3-admin-${page.slug}-200`,
+    expect: `cookie GET /-/admin/${page.slug} → 200 text/html carrying class="page-content ${page.pageClass}"${page.row ? ` + ${page.rowNote}` : " (the zero-org empty state is fine)"} (mount-at-run-time: a 404 warns — not yet mounted)`,
+    run: async () => {
+      const probe = await window3GetOrWarn(`${opts.baseUrl}/-/admin/${page.slug}`, { cookie: ctx.cookie });
+      if (probe === null) {
+        return { status: "warn", detail: `/-/admin/${page.slug} 404 — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+      }
+      expect(probe.res.status === 200, `status ${probe.res.status} (expected 200)`);
+      expect(String(probe.res.headers.get("content-type")).includes("text/html"),
+        `content-type ${JSON.stringify(probe.res.headers.get("content-type"))} (expected text/html)`);
+      expect(probe.body.includes(`class="page-content ${page.pageClass}"`),
+        `/-/admin/${page.slug} missing class="page-content ${page.pageClass}" (the pageClass discriminator)`);
+      if (page.row !== null) {
+        expect(probe.body.includes(page.row()), `/-/admin/${page.slug} missing ${page.rowNote}`);
+      }
+      return `200 text/html — class="page-content ${page.pageClass}"${page.row ? ` + ${page.rowNote}` : ""}`;
+    },
+  })),
+  {
+    id: "w3-settings-account-200",
+    expect: `cookie GET /user/settings/account → 200 text/html carrying class="page-content user settings account" + the no-password-model info ("Non-local users cannot update their password through the Gitea web interface.") + "Manage Email Addresses" (POST arms NOT probed — the read-only battery; mount-at-run-time: a 404 warns)`,
+    run: async () => {
+      const probe = await window3GetOrWarn(`${opts.baseUrl}/user/settings/account`, { cookie: ctx.cookie });
+      if (probe === null) {
+        return { status: "warn", detail: `/user/settings/account 404 — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+      }
+      expect(probe.res.status === 200, `status ${probe.res.status} (expected 200)`);
+      expect(probe.body.includes(`class="page-content user settings account"`),
+        "the account pageClass discriminator is missing");
+      expect(probe.body.includes("Non-local users cannot update their password through the Gitea web interface."),
+        "the settings.password_change_disabled info is missing");
+      expect(probe.body.includes("Manage Email Addresses"), "the manage_emails section is missing");
+      return `200 — the account tab renders (no-password arm + the email section)`;
+    },
+  },
+  {
+    id: "w3-settings-notifications-200",
+    expect: `cookie GET /user/settings/notifications → 200 text/html carrying class="page-content user settings" + "Set Email Preference" (the email preference form's submit; POST arms NOT probed — the read-only battery; mount-at-run-time: a 404 warns)`,
+    run: async () => {
+      const probe = await window3GetOrWarn(`${opts.baseUrl}/user/settings/notifications`, { cookie: ctx.cookie });
+      if (probe === null) {
+        return { status: "warn", detail: `/user/settings/notifications 404 — NOT MOUNTED at run time (the not-yet-mounted degradation)` };
+      }
+      expect(probe.res.status === 200, `status ${probe.res.status} (expected 200)`);
+      expect(probe.body.includes(`class="page-content user settings"`),
+        "the user settings pageClass discriminator is missing");
+      expect(probe.body.includes("Set Email Preference"), "the email preference form is missing");
+      return `200 — the notifications tab renders (the email preference form)`;
+    },
+  },
+  {
+    id: "w3-cleanup-204",
+    expect: `both probe repos DELETEd → 204 (the issue/milestone/wiki-page rows cascade with the repo delete; a failed cleanup is documented, not fatal; the failure-cleanup tail re-sweeps)`,
+    run: async () => {
+      const a = await deleteRepo(ctx.user, ctx.emptyRepo);
+      if (typeof a === "string") ctx.emptyGone = true; // the tail no-ops on a green sweep
+      const b = await deleteRepo(ctx.user, ctx.repo);
+      if (typeof b === "string") ctx.repoGone = true;
+      await rm(ctx.tmp, { recursive: true, force: true });
+      const parts = [a, b];
+      if (parts.every((p) => typeof p === "string")) return `${ctx.repo} + ${ctx.emptyRepo} deleted`;
+      return { status: "warn", detail: parts.map((p) => (typeof p === "string" ? p : p.detail)).join("; ") };
+    },
+  },
+];
+
+/** The red-runs-self-sweep posture (the generate-e2e shape): a red window3
+ *  run sweeps its own two probe repos instead of leaving them for a
+ *  hand-clean. This finally-style tail runs after EVERY window3-mounts
+ *  battery run (green ones no-op silently: w3-cleanup-204 already deleted
+ *  both, so the gone flags skip them) and best-effort deletes exactly what
+ *  the run created and has not already deleted. One [tail] line logs every
+ *  action; failures feed left_behind and are never fatal; it never throws
+ *  (main's finally depends on it). */
+const window3FailureCleanup = async (ctx) => {
+  const acts = [];
+  const noteLeftBehind = (what, why) => {
+    leftBehind.push(`${what} (failure-cleanup tail: ${why})`);
+    acts.push(`${what} LEFT BEHIND — ${why}`);
+  };
+  try {
+    const targets = [
+      { what: "content repo", created: ctx.repoCreated, gone: ctx.repoGone, full: ctx.repoFullName, name: ctx.repo },
+      { what: "empty repo", created: ctx.emptyCreated, gone: ctx.emptyGone, full: ctx.emptyFullName, name: ctx.emptyRepo },
+    ];
+    for (const t of targets) {
+      if (t.created !== true || t.gone === true) continue;
+      const [owner, repo] = String(t.full ?? `${opts.user}/${t.name}`).split("/");
+      try {
+        const out = await deleteRepo(owner, repo);
+        acts.push(typeof out === "string" ? out : out.detail);
+      } catch (err) {
+        noteLeftBehind(`${t.what} ${owner}/${repo}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } catch (err) {
+    acts.push(`the sweep itself failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (acts.length) log(`  [tail] w3-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -1762,11 +2301,16 @@ const BATTERIES = {
   // still landing); mounted surfaces assert hard. The write arms (window-2a,
   // LIVE) are chain-hard.
   "window2-mounts": { title: "window-2 mounts (user-settings tab family: anon 303s, pageClass 200s, secret round-trip, keys negative, last-owner flash)", context: window2Context, steps: window2Steps, failureTail: window2FailureCleanup },
+  // Mount-at-run-time: the window-3 surfaces (feed tails, wiki raw, profile
+  // tabs, admin lists, settings account/notifications) 404-degrade to warns
+  // until the mount window deploys; anything mounted asserts hard. The wiki
+  // page write + issue/milestone seeds ride LANDED routes (chain-hard).
+  "window3-mounts": { title: "window-3 mounts (feed tails, wiki raw, profile tabs, admin lists, settings account/notifications, milestone detail, content-history list)", context: window3Context, steps: window3Steps, failureTail: window3FailureCleanup },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 
