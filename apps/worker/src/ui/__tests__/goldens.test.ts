@@ -30,7 +30,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { users } from "../../db/schema";
+import { actions, users } from "../../db/schema";
 import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
 import {
   GOLDEN_CASES,
@@ -106,6 +106,30 @@ beforeAll(async () => {
     id: ADMIN_GOLDEN_REPO_ID,
     createdAt: new Date(T0 * 1000),
   });
+  // The wave-goldens-final profile-activity pin (the harness's createdAt-pin
+  // precedent): the seed flows record action rows WITHOUT a draft createdAt
+  // (services/issue-events.ts's drafts carry none; recordAction defaults to
+  // new Date()), so the wall-clock stamp lands in the feed rows that
+  // /alice?tab=activity renders through TimeSince. Pin ALICE'S PERFORMED rows
+  // to the fixed epoch — key act_user_id = alice (her rows only; every other
+  // principal's rows are inert for goldens). Inert for every pre-existing
+  // golden: no committed page reads the actions table (dashboard's activity
+  // line is the derived-thread projection over issues/comments; admin-monitor
+  // stats counts no Action key), so this UPDATE moves no existing bytes.
+  // Order stays deterministic without per-row timestamps: getFeedRows orders
+  // created_at DESC, id DESC — equal stamps fall to the id tiebreak, and
+  // autoincrement ids repeat identically every run (fresh DB, fixed seed
+  // order).
+  const aliceRow = await drizzle(env.DB)
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "alice"))
+    .get();
+  if (aliceRow === undefined) throw new Error("golden owner row missing before the actions-row pin");
+  await drizzle(env.DB)
+    .update(actions)
+    .set({ createdAt: new Date(T0 * 1000) })
+    .where(eq(actions.actUserId, aliceRow.id));
 });
 
 /** The one copy of the §5.2 assertion/marker protocol, shared by both case
@@ -283,6 +307,54 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   // breakdown (1/0/2/0/0). cron stays skipped — wall-clock Next Time bytes.
   { file: "admin-monitor-stats.html", path: "/-/admin/monitor/stats", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "admin-monitor-queue.html", path: "/-/admin/monitor/queue", status: 200, signedIn: true, sessionUser: "morgan" },
+  // ---------------------------------------------------------------------------
+  // The wave-goldens-final batch — the four most chrome-rich surfaces still
+  // without goldens, all through the real route path over the EXISTING seed
+  // fixtures (plus the actions-row pin above). Selection audit over the
+  // session's uncovered list:
+  //
+  //   - user-settings-repos (TAKEN): `/user/settings/repos`, the settings
+  //     REPOS tab — the shared 12-item settings sidebar (the Repos item is
+  //     the nav's newest) over the `.ui.list` of alice's three owned rows
+  //     (golden/golden-alt/golden-ms, slug ASC — the landed order), each row
+  //     the kind-icon chain + Owner/Name link + FormatByteSize size span.
+  //     Regression-prone: the always-self owner filter (`owner_id = doer`,
+  //     NO visibility filter) and the icon chain's arm selection.
+  //   - user-settings-notifications (TAKEN): `/user/settings/notifications`,
+  //     the preference page — the sidebar over TWO attached-segment forms
+  //     (email + actions), both selects rendering their default-selected
+  //     arms over the ABSENT user_settings rows (the creation defaults
+  //     'enabled'/'failure-only'), the external docs anchor, both submit
+  //     buttons. Deterministic: the page renders no timestamps at all.
+  //   - wiki-start (TAKEN): `/alice/golden/wiki`, the wiki family's FIRST
+  //     golden — the full repo chrome (breadcrumb header, tab strip with
+  //     Code active, sidebar) over tplWikiStart's no-wiki arm (the book
+  //     segment, the welcome lines, the writer-gated Create-the-First-Page
+  //     button — signed-in owner alice, so the canWrite arm renders). Zero
+  //     new seeds: no repo in the harness carries wiki pages, so the start
+  //     arm is the family's real default posture. The family's SEEDED page
+  //     render (the view page over a created page) is UNLANDABLE as a
+  //     golden: services/wiki.ts wikiPerson stamps Date.now() into the wiki
+  //     commit, so the view's last-edited TimeSince and the commit oid are
+  //     wall-clock bytes — the same class as the documented admin-monitor
+  //     cron skip; pinning would need raw fixed-time git objects written
+  //     around the landed service (not trivially file-local).
+  //   - profile-activity (TAKEN): `/alice?tab=activity`, the profile
+  //     ACTIVITY tab — the avatar card + the four-tab overview strip
+  //     (activity active) over the action-feed pipeline's full item anatomy
+  //     (actor anchor, per-type message segments, issue-title/comment
+  //     bodies, TimeSince, the trailing glyph). The ONLY profile tab with
+  //     real rows (the stars/followers tabs render the same profile chrome
+  //     as empty arms — the least chrome per byte of the group, skipped on
+  //     chrome-richness; the wave brief's "branches page" was stale —
+  //     branches.html + branches-writer.html have been GOLDEN_CASES since
+  //     wave 16). The feed rows are the seeds' action rows with the
+  //     createdAt pin above (wall-clock → T0).
+  // ---------------------------------------------------------------------------
+  { file: "user-settings-repos.html", path: "/user/settings/repos", status: 200, signedIn: true },
+  { file: "user-settings-notifications.html", path: "/user/settings/notifications", status: 200, signedIn: true },
+  { file: "wiki-start.html", path: "/alice/golden/wiki", status: 200, signedIn: true },
+  { file: "profile-activity.html", path: "/alice?tab=activity", status: 200, signedIn: true },
 ];
 
 describe("wave-129 expansion goldens", () => {

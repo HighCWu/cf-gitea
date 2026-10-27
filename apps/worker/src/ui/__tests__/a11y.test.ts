@@ -54,6 +54,7 @@ import pullCommitsGolden from "./goldens/pull-commits.html?raw";
 import pullDetailGolden from "./goldens/pull-detail.html?raw";
 import pullFilesGolden from "./goldens/pull-files.html?raw";
 import pullReviewSignedInGolden from "./goldens/pull-review-signed-in.html?raw";
+import profileActivityGolden from "./goldens/profile-activity.html?raw";
 import profileWatchingGolden from "./goldens/profile-watching.html?raw";
 import pullsOpenGolden from "./goldens/pulls-open.html?raw";
 // Pages wave 19: the creation pages — the new-repository form (the
@@ -71,7 +72,10 @@ import settingsTeamAdminGolden from "./goldens/settings-team-admin.html?raw";
 import treeDirGolden from "./goldens/tree-dir.html?raw";
 import userProfileGolden from "./goldens/user-profile.html?raw";
 import userSettingsAccountGolden from "./goldens/user-settings-account.html?raw";
+import userSettingsNotificationsGolden from "./goldens/user-settings-notifications.html?raw";
 import userSettingsProfileGolden from "./goldens/user-settings-profile.html?raw";
+import userSettingsReposGolden from "./goldens/user-settings-repos.html?raw";
+import wikiStartGolden from "./goldens/wiki-start.html?raw";
 import { GOLDEN_CASES } from "./harness";
 
 const goldens: Record<string, string> = {
@@ -295,6 +299,26 @@ const EXPANSION_ARMS: ExpansionArm[] = [
   // page's main table carries thead+scope (upstream queue.tmpl's own shape).
   { file: "admin-monitor-stats.html", golden: adminMonitorStatsGolden, mainAriaLabel: "Stats", mainClassTokens: ["admin", "monitor"], thWithoutScope: 0 },
   { file: "admin-monitor-queue.html", golden: adminMonitorQueueGolden, mainAriaLabel: "Queues", mainClassTokens: ["admin", "monitor"], thWithoutScope: 0 },
+  // wave-goldens-final (the batch's selection audit lives in goldens.test.ts's
+  // case comment): the four most chrome-rich surfaces still without goldens.
+  // First-sight verdicts, same protocol as the orgs/repos rows above:
+  //
+  //   - user-settings-repos + user-settings-notifications: NO violation to
+  //     pre-fix — every anchor carries text (the shared settings sidebar's
+  //     items, the row Owner/Name anchors, the docs link), and neither page
+  //     renders a table (R6 moot, thWithoutScope 0 by absence).
+  //   - wiki-start: NO violation to pre-fix — the repo chrome's icon-only
+  //     anchors (bell, New Repository/Organization, the view-page pencils on
+  //     the view arm — absent here) all carry aria-labels; the start segment
+  //     is text + the writer's text button. No tables.
+  //   - profile-activity: NO violation to pre-fix — the feed's actor/repo
+  //     anchors are text; every glyph (avatar, the trailing op icon, the
+  //     strip icons) is an aria-hidden svg OUTSIDE anchors; the navbar's
+  //     icon-only anchors carry aria-labels. No tables.
+  { file: "user-settings-repos.html", golden: userSettingsReposGolden, mainAriaLabel: "Repositories", mainClassTokens: ["user", "settings", "repos"], thWithoutScope: 0 },
+  { file: "user-settings-notifications.html", golden: userSettingsNotificationsGolden, mainAriaLabel: "Notifications", mainClassTokens: ["user", "settings"], thWithoutScope: 0 },
+  { file: "wiki-start.html", golden: wikiStartGolden, mainAriaLabel: "Wiki", mainClassTokens: ["repository", "wiki", "start"], thWithoutScope: 0 },
+  { file: "profile-activity.html", golden: profileActivityGolden, mainAriaLabel: "alice", mainClassTokens: ["user", "profile"], thWithoutScope: 0 },
 ];
 
 describe("wave-129 expansion arms (explicit cases, not the shared table)", () => {
@@ -656,6 +680,178 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       [false, "Releases"],
       [false, "Commits"],
     ]);
+  });
+
+  // ---------------------------------------------------------------------------
+  // wave-goldens-final surface arms (the EXPANSION_ARMS note above holds the
+  // first-sight verdicts; the selection audit lives in goldens.test.ts).
+  // ---------------------------------------------------------------------------
+
+  it("user-settings-repos: the settings sidebar names every arm (Repositories active) and the list pins alice's three rows with sizes", () => {
+    const root = parseHtmlTree(userSettingsReposGolden);
+    const nav = descendants(root).find((el) => hasClass(el, "flex-container-nav"));
+    expect(nav, "the settings sidebar nav").toBeDefined();
+    const items = descendants(nav ?? root).filter((el) => el.tag === "a");
+    expect(items.map((el) => accessibleName(el))).toEqual([
+      "Profile",
+      "Account",
+      "Notifications",
+      "Appearance",
+      "Security",
+      "Applications",
+      "SSH / GPG Keys",
+      "Secrets",
+      "Variables",
+      "Webhooks",
+      "Organizations",
+      "Repositories",
+    ]);
+    const active = items.filter((el) => hasClass(el, "active"));
+    expect(active.map((el) => accessibleName(el))).toEqual(["Repositories"]);
+    expect(active[0]?.attrs.href).toBe("/user/settings/repos");
+    // The page's only heading is the section header (a lone heading can
+    // neither skip a level (R2) nor double the h1 (R1)).
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => accessibleName(el))).toEqual(["Repositories"]);
+    // The list: alice's three owned rows, slug ASC (the landed order) —
+    // each the kind icon (public → octicon-repo, aria-hidden), the
+    // Owner/Name anchor and the FormatByteSize size span (the settled KiB
+    // column times 1024: golden 8 KiB, the two single-commit seeds 1 KiB).
+    const list = descendants(root).find((el) => hasClass(el, "ui") && hasClass(el, "list"));
+    expect(list, "the repos list").toBeDefined();
+    const rows = descendants(list ?? root).filter((el) => hasClass(el, "flex-text-block"));
+    expect(rows).toHaveLength(3);
+    expect(
+      rows.flatMap((row) => descendants(row).filter((el) => el.tag === "a" && hasClass(el, "name")).map((a) => [a.attrs.href, accessibleName(a)])),
+    ).toEqual([
+      ["/alice/golden", "alice/golden"],
+      ["/alice/golden-alt", "alice/golden-alt"],
+      ["/alice/golden-ms", "alice/golden-ms"],
+    ]);
+    expect(rows.flatMap((row) => descendants(row).filter((el) => el.tag === "span").map((s) => accessibleName(s)))).toEqual([
+      "8.0 kiB",
+      "1.0 kiB",
+      "1.0 kiB",
+    ]);
+    expect(rows.flatMap((row) => descendants(row).filter((el) => el.tag === "svg").map((s) => s.attrs.class))).toEqual([
+      "svg octicon-repo",
+      "svg octicon-repo",
+      "svg octicon-repo",
+    ]);
+  });
+
+  it("user-settings-notifications: the sidebar marks Notifications active, the two forms' selects pin the creation defaults, and both submit buttons are named", () => {
+    const root = parseHtmlTree(userSettingsNotificationsGolden);
+    const nav = descendants(root).find((el) => hasClass(el, "flex-container-nav"));
+    expect(nav, "the settings sidebar nav").toBeDefined();
+    const items = descendants(nav ?? root).filter((el) => el.tag === "a");
+    const active = items.filter((el) => hasClass(el, "active"));
+    expect(active.map((el) => accessibleName(el))).toEqual(["Notifications"]);
+    expect(active[0]?.attrs.href).toBe("/user/settings/notifications");
+    // Two same-level section headers — the R2 walk stays flat.
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => accessibleName(el))).toEqual(["Notifications", "Actions"]);
+    // The two forms (the navbar's /logout form exists too on signed-in
+    // pages — filtered out here): the email POST and the actions POST, each
+    // carrying one native select whose SELECTED option pins the absent-row
+    // creation defaults ('enabled' / 'failure-only' — the side store's
+    // defaults), plus one submit button each.
+    const forms = descendants(root).filter((el) => el.tag === "form" && (el.attrs.action ?? "").startsWith("/user/settings/notifications"));
+    expect(forms.map((f) => f.attrs.action)).toEqual(["/user/settings/notifications/email", "/user/settings/notifications/actions"]);
+    const selects = descendants(root).filter((el) => el.tag === "select" && el.attrs.name === "preference");
+    expect(selects).toHaveLength(2);
+    expect(
+      selects.map((sel) =>
+        descendants(sel)
+          .filter((el) => el.tag === "option" && el.attrs.selected !== undefined)
+          .map((o) => o.attrs.value),
+      ),
+    ).toEqual([["enabled"], ["failure-only"]]);
+    const submits = forms.flatMap((f) => descendants(f).filter((el) => el.tag === "button" && el.attrs.type === "submit"));
+    expect(submits.map((b) => accessibleName(b))).toEqual(["Set Email Preference", "Set Email Preference"]);
+    // The actions description's literal external docs anchor is named by its
+    // text (the appearance-module GitHub-link pattern).
+    const external = descendants(root).filter((el) => el.tag === "a" && (el.attrs.href ?? "").startsWith("https://docs.gitea.com/usage"));
+    expect(external.map((a) => accessibleName(a))).toEqual(["Gitea Actions"]);
+  });
+
+  it("wiki-start: the repo chrome renders the start arm — breadcrumb, tab strip (Code active), the welcome h2 and the writer's create button", () => {
+    const root = parseHtmlTree(wikiStartGolden);
+    // The repo header breadcrumb names owner and repo.
+    const header = descendants(root).find((el) => hasClass(el, "repo-header"));
+    expect(header, "the repo header").toBeDefined();
+    expect(descendants(header ?? root).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
+      ["/alice", "alice"],
+      ["/alice/golden", "golden"],
+    ]);
+    // The start segment: the single heading (h2, no h1 on the page — R1's
+    // at-most-one holds) plus the welcome line.
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => accessibleName(el))).toEqual(["Welcome to the Wiki."]);
+    // The signed-in owner arm: the writer-gated Create-the-First-Page button.
+    expect(
+      descendants(root)
+        .filter((el) => el.tag === "a" && hasClass(el, "button"))
+        .map((el) => [el.attrs.href, accessibleName(el)]),
+    ).toEqual([["/alice/golden/wiki?action=_new", "Create the First Page"]]);
+    // The repo tab strip names every tab with its count (Code active) —
+    // golden's counts (2 open issues, 1 PR) differ from milestone-detail's
+    // golden-ms strip.
+    const strip = descendants(root).find((el) => el.tag === "overflow-menu");
+    expect(strip, "the repo tab strip").toBeDefined();
+    expect(descendants(strip ?? root).filter((el) => el.tag === "a").map((el) => [hasClass(el, "active"), accessibleName(el)])).toEqual([
+      [true, "Code"],
+      [false, "Issues2"],
+      [false, "Pull Requests1"],
+      [false, "Releases"],
+      [false, "Commits"],
+    ]);
+  });
+
+  it("profile-activity: the overview strip marks Public Activity active, the avatar card renders, and the three create-repo rows carry the pinned epoch", () => {
+    const root = parseHtmlTree(profileActivityGolden);
+    // The signed-in self-view strip: four arms, the ?tab=activity arm active.
+    // Names are the walker's exact accessible names — the count label joins
+    // its anchor text with no separator ("Repositories3").
+    const strip = descendants(root).find((el) => el.tag === "overflow-menu");
+    expect(strip, "the profile tab strip").toBeDefined();
+    const tabs = descendants(strip ?? root).filter((el) => el.tag === "a");
+    expect(tabs.map((el) => [el.attrs.href, hasClass(el, "active"), accessibleName(el)])).toEqual([
+      ["/alice?tab=repositories", false, "Repositories3"],
+      ["/alice?tab=activity", true, "Public Activity"],
+      ["/alice?tab=stars", false, "Starred Repositories"],
+      ["/alice?tab=watching", false, "Watched Repositories"],
+    ]);
+    // The user header: the avatar card renders; the feed carries the seeds'
+    // three create-repo rows (the ONLY alice-performed action rows — the
+    // issue family records no actions), newest-id first under the equal
+    // pinned stamps.
+    expect(getElementById(root, "profile-avatar-card")).not.toBeNull();
+    const feed = getElementById(root, "activity-feed");
+    expect(feed, "the feed container").not.toBeNull();
+    const items = descendants(feed ?? root).filter((el) => hasClass(el, "item-main"));
+    expect(items).toHaveLength(3);
+    expect(
+      items.flatMap((item) =>
+        descendants(item)
+          .filter((el) => el.tag === "a" && (el.attrs.title ?? "") === "")
+          .map((a) => [a.attrs.href, accessibleName(a)]),
+      ),
+    ).toEqual([
+      ["/alice", "alice"],
+      ["/alice/golden-ms", "alice/golden-ms"],
+      ["/alice", "alice"],
+      ["/alice/golden-alt", "alice/golden-alt"],
+      ["/alice", "alice"],
+      ["/alice/golden", "alice/golden"],
+    ]);
+    // The createdAt pin (goldens.test.ts's beforeAll): every row's TimeSince
+    // renders the fixed epoch, not the seed run's wall clock.
+    const stamps = descendants(feed ?? root).filter((el) => el.tag === "relative-time");
+    expect(stamps).toHaveLength(3);
+    for (const stamp of stamps) {
+      expect(stamp.attrs.datetime).toBe("2023-11-14T22:13:20Z");
+    }
   });
 });
 
