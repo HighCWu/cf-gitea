@@ -3140,15 +3140,23 @@ above):**
   ui-login `5/5`; mirror `8/8`; window2-mounts `12 pass / 9 skip /
   1 fail` — **deterministic ×3 runs**; cleanup-audit `9 pass / 1
   fail`.
-- **Bug #20 (NEW, filed from the deterministic window2 failure +
-  the cleanup agent's D1 cross-check): `POST
-  /user/settings/actions/secrets` returns the success-shape 303
-  while NO row lands in `secrets`** (`W2SEC%` count = 0 after three
-  303-confirmed creates; the API PUT path is perfectly consistent;
-  manually-created rows persist). NOT staleness — a write-path or
-  probe-assertion defect; diagnostic agent dispatched with the
-  evidence. The 9 skipped window2 checks are downstream of the
-  failing create.
+- **Bug #20 — VERDICT REVERSED (root-caused as a PROBE bug, not a
+  product write drop): the window2 battery minted lowercase-hex secret
+  names while the service stores `normalizedName` (`strings.ToUpper` at
+  insert AND lookup — upstream `InsertEncryptedSecret` secrets.go:31) and
+  the page renders the stored spelling.** The row was on the page from
+  t+0 as `W2SEC_<UPPER>`; the case-sensitive grep hunted the lowercase
+  mint and could never match. Cross-evidence: the failure tail's by-name
+  API DELETE returned 204 on every red run (the DELETE lookup
+  uppercases too — 204 means the row existed); D1 read replication is
+  `disabled` (single primary — a stale read was never possible); no
+  `age`/`cf-cache-status` markers; manual case-safe probes rendered
+  instantly. The earlier "count = 0 after create" reading was measured
+  post-sweep. Fix `8a8d35f` (probe mints uppercase + normalizes both
+  sides + a pinning test); **no worker change — no redeploy needed for
+  this fix**. Both dispatched diagnostic agents independently converged
+  on the same root cause; the corrected battery should read 22/22 at
+  the wrap re-run.
 - Cleanup audit fail explained: `personal_access_tokens` = 2 (the
   standing bootstrap + the **live RD20 run PAT, id 44** — minted per
   the 0600-file rule, deletion deferred only because the in-flight
