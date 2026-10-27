@@ -415,7 +415,7 @@ type BatchStatements = [BatchStatement, ...BatchStatement[]];
  *  row (pin keeps the read marker; read/unread rewrite it and clear the
  *  pin). Returns the builder for the caller's batch (NOT awaited — an async
  *  wrap would resolve it into a D1Result). */
-function markThread(
+export function markThread(
   d1: D1Database,
   userId: number,
   issueId: number,
@@ -445,7 +445,7 @@ function markThread(
  *  three misses reduced to a boolean — the web POST answers the 404 shell for
  *  every one of them, existence hidden): the issue exists, the caller is a
  *  recipient, and foreign activity exists. */
-async function isOwnMailboxThread(d1: D1Database, userId: number, issueId: number): Promise<boolean> {
+export async function isOwnMailboxThread(d1: D1Database, userId: number, issueId: number): Promise<boolean> {
   if (issueId <= 0) return false;
   const lastActivity = lastActivityExpr(userId);
   const rows = await drizzle(d1)

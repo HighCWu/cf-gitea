@@ -720,7 +720,9 @@ import {
 import {
   countUnreadNotifications,
   loadNotificationsData,
+  isOwnMailboxThread,
   markNotificationThread,
+  markThread,
   parseFormBool,
   parseNotificationPageType,
   parseNotificationStatusForm,
@@ -2238,6 +2240,7 @@ export interface NotificationsRoute {
     | "notification-new"
     | "notification-status"
     | "notification-purge"
+    | "notification-purge-page"
     | "notification-subscriptions"
     | "notification-watching";
 }
@@ -2594,6 +2597,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 3 && raw[2] === "new") return { family: "notification-new" };
     if (raw.length === 3 && raw[2] === "status") return { family: "notification-status" };
     if (raw.length === 3 && raw[2] === "purge") return { family: "notification-purge" };
+    // The purge-page write (matrix-14's recipe, notification.go:207-218 —
+    // POST-only; the GET twin answers the methodNotAllowed arm).
+    if (raw.length === 3 && raw[2] === "purge-page") return { family: "notification-purge-page" };
     // Window-2e C3b: the subscriptions tails (web.go:1786-1787, GET-only).
     if (raw.length === 3 && raw[2] === "subscriptions") return { family: "notification-subscriptions" };
     if (raw.length === 3 && raw[2] === "watching") return { family: "notification-watching" };
@@ -7202,6 +7208,41 @@ async function notificationPurgeSubmit(c: Context<{ Bindings: Env }>): Promise<R
 }
 
 /**
+ * POST /notifications/purge-page — upstream NotificationPurgePagePost
+ * (notification.go:207-218): the posted id list filtered to the caller's
+ * mailbox (foreign/unknown ids silently drop — upstream FormInt64s then
+ * the same per-thread filter), each marked read, answered with the bare
+ * JSONRedirect (`{"redirect": ""}` — context.go:239-241 over an empty
+ * redirect; the fragment chrome stays unrendered, the dead-surface note).
+ * The matrix-6 interim 404 pin flips with this mount.
+ */
+async function notificationPurgePageSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { viewer, respond } = resolved;
+  if (viewer.kind === "anonymous") return respond(loginRedirect("/notifications"));
+  const form = await readUrlEncodedForm(c.req.raw);
+  const ids = (form.get("ids") ?? "")
+    .split(",")
+    .map((part) => Number.parseInt(part.trim(), 10))
+    .filter((id) => Number.isInteger(id) && id > 0);
+  const now = new Date();
+  const marks = [];
+  for (const id of new Set(ids)) {
+    if (await isOwnMailboxThread(c.env.DB, viewer.id, id)) {
+      marks.push(markThread(c.env.DB, viewer.id, id, "read", now));
+    }
+  }
+  if (marks.length > 0) {
+    const [first, ...rest] = marks;
+    await drizzle(c.env.DB).batch([first!, ...rest]);
+  }
+  return respond(c.json({ redirect: "" }, 200));
+}
+
+/**
  * POST /{owner}/{repo}/{issues|pulls}/{index}/comments (pages/issue-detail.tsx
  * — upstream NewComment, routers/web/repo/issue_comment.go:37-118): the §2.8
  * Origin guard, the same repo→viewer order as the GET pages (invisible repos
@@ -10033,6 +10074,8 @@ uiRouter.get("/notifications/watching", (c) => notificationSubscriptionsPage(c, 
 uiRouter.get("/notifications/new", (c) => notificationsNew(c));
 uiRouter.post("/notifications/status", (c) => notificationStatusSubmit(c));
 uiRouter.post("/notifications/purge", (c) => notificationPurgeSubmit(c));
+uiRouter.post("/notifications/purge-page", (c) => notificationPurgePageSubmit(c));
+uiRouter.get("/notifications/purge-page", () => methodNotAllowed("POST"));
 uiRouter.get("/notifications/status", () => methodNotAllowed("POST"));
 uiRouter.get("/notifications/purge", () => methodNotAllowed("POST"));
 // Wave-12 families (parseUiRoute claims exactly these shapes; registered

@@ -792,24 +792,23 @@ describe("the purge-page dead surface (the mark_page_as_read reduction)", () => 
     expect(html).not.toContain("Mark page as read");
   });
 
-  it("POST /notifications/purge-page is unclaimed end-to-end and writes nothing", async () => {
-    // Provenance: wave-polish-matrix-6 — the route-level half of the dead
-    // surface: the UI family claims only new/status/purge, so the tail
-    // parses null and the POST falls through to the engine's 404.
+  it("POST /notifications/purge-page marks the caller's threads read — the MOUNT (matrix-14's recipe, landed)", async () => {
+    // Provenance: wave-polish-matrix-6 pinned the interim 404; matrix-14's
+    // recipe landed the write (notification.go:207-218 — ids filtered to
+    // the caller's mailbox, foreign/unknown silently drop, the bare
+    // JSONRedirect answer). FLIPPED with the mount.
     const alice = await seedVerifiedUser({ username: "alice" });
     const bob = await seedVerifiedUser({ username: "bob" });
     const repo = await seedRepo(alice, "ntf");
-    await seedThread(repo.id, bob.id, at(10));
+    const thread = await seedThread(repo.id, bob.id, at(10));
     const cookie = await sessionHeader(alice.id);
 
-    expect(parseUiRoute("/notifications/purge-page")).toBeNull();
-    expect(handlesUiRoute("/notifications/purge-page")).toBe(false);
-
-    const res = await postArm("/notifications/purge-page", cookie, { ids: "1,2" });
-    expect(res.status).toBe(404);
-    // Nothing was marked: the mailbox keeps its unread thread.
-    expect(await stateRows(alice.id)).toEqual([]);
-    await expectUnreadCount(cookie, 1);
+    // The mailbox thread key is the issue ROW id (the status POST's
+    // notification_id twin); foreign id 9999 silently drops; the caller's thread marks read.
+    const res = await postArm("/notifications/purge-page", cookie, { ids: `${thread.id},9999` });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ redirect: "" });
+    await expectUnreadCount(cookie, 0);
   });
 });
 
