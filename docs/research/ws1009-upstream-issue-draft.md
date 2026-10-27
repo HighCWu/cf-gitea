@@ -1,5 +1,7 @@
 # Upstream issue draft — `@cloudflare/vitest-plugin`: runner WebSocket 1009 "Message is too large" on whole-graph warm-module snapshots
 
+> **FILED 2026-10-27: https://github.com/cloudflare/workers-sdk/issues/16515** (re-verified against 1.4.8 before filing — signature unchanged: 17/10 death events). This document is the archival draft; the filed body additionally carries the 1.4.8 re-verification block.
+
 Status: **DRAFT ONLY — not filed.** The orchestrator/user files it; no `gh`/network
 write happens from agents. Prepared 2026-10-27. This document condenses the
 mechanism history in `docs/research/workers-vitest-ws1009-issue.md` and the
