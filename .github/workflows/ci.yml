@@ -15,6 +15,15 @@ jobs:
   # (vitest in workerd with real bindings — @cloudflare/vitest-plugin).
   checks:
     runs-on: ubuntu-latest
+    # Wall budget driven by the full-suite composite gate (see the Test step):
+    # phase-1 full run ~5-6 min (locally measured 309-319s; CI is not faster —
+    # vitest.config.ts pins maxWorkers: 8, so the pool size matches local) +
+    # solo adjudication ≈ +10-15 min (up to ~210 death/timeout files, one
+    # vitest process each at the measured 5-20s, 4-way concurrency ≈ 11 min at
+    # the 2026-10-27 mix). Gate total ~15-25 min; install + wrangler types +
+    # icons + typecheck + lint add ~5 min. 45 min is ~1.5-2x headroom, not a
+    # tuning knob.
+    timeout-minutes: 45
     steps:
       # gitea/ submodule: gen:icons reads the committed octicon svg bodies
       # (SPEC-0008 §2.4.1) to emit the gitignored icons.generated.ts.
@@ -38,8 +47,36 @@ jobs:
         run: pnpm typecheck
       - name: Lint
         run: pnpm lint
-      - name: Test
-        run: pnpm test
+      # A plain `vitest run` (pnpm test) is not an honest gate at the ws1009
+      # scale: every file whose runner dies at startup to the workerd
+      # WebSocket-1009 "Message is too large" pool death never runs, vitest
+      # reports it only as unhandled errors and exits 1 — deterministic 204/258
+      # files at the 2026-10-27 measurement (mechanism + ledger:
+      # docs/testing/suite-stability.md). The deaths are structural, not
+      # load-based (the common import graph exceeds the warm-snapshot frame
+      # limit; maxWorkers: 8 is pinned in vitest.config.ts, so runner size
+      # does not change it), so CI sees the same class. pnpm test:full is the
+      # composite gate: phase 1 runs the FULL suite and attributes every file
+      # to {ran, died-at-startup, timeout}; the pending set is then adjudicated
+      # SOLO — each file in its own vitest process (a fresh process
+      # first-connects an empty warm snapshot, the only structural cure; a
+      # solo death is retried once, then fails honestly). Verdict PASS only
+      # when every file ran green across phases. Scope-identical to the old
+      # pnpm test: it covered only apps/worker (the one workspace package
+      # with a test script).
+      # Flag note: pnpm forwards extra args to the script VERBATIM — no
+      # npm-style `--` separator here; the gate's parser rejects a literal
+      # `--`. The gate writes its phase logs + raw vitest JSON next to the
+      # --baseline-json path (that dir is the artifact uploaded below).
+      - name: Test (full-suite composite gate — pnpm test:full, solo adjudication)
+        run: pnpm test:full --baseline-json .full-suite-gate/full-suite-gate.json
+      - name: Upload full-suite gate evidence (baseline JSON + phase logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-suite-gate-evidence
+          path: .full-suite-gate/
+          if-no-files-found: ignore
       - name: API contract check (declared routes vs frozen contract, SPEC-0004 §5.1)
         run: pnpm check:api
       - name: "Contract freeze guard (ADR-0002: frozen copy verbatim + sha256)"
