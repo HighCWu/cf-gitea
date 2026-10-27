@@ -1251,7 +1251,11 @@ import {
   topicSearchAuxResponse,
   type WebSearchAuxResults,
 } from "./pages/search-aux";
-import { resolveActivityFeeds } from "./pages/activity-feeds";
+import {
+  loadActivityFeedsData,
+  renderActivityFeedsPage,
+  resolveActivityFeeds,
+} from "./pages/activity-feeds";
 import {
   loadUserFeedData,
   renderUserFeedAtom,
@@ -5115,6 +5119,15 @@ async function ownerHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
     return respond(new Response(null, { status: 307, headers: { location: profile.location } }));
   }
   if (profile.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  // The ACTIVITY tab (profile.go:162-190): upstream hangs the tab inside
+  // the SAME profile route's user half — the org half above already ignored
+  // the query (org.Home has no activity arm), the user half renders the
+  // wave-50 feeds page instead of the repositories default (the module
+  // header's HANDOFF NOTE, this window's mount).
+  if (url.searchParams.get("tab") === "activity") {
+    const data = await loadActivityFeedsData(c.env.DB, profile.user, viewer, url.origin, url.searchParams);
+    return respond(c.html(renderActivityFeedsPage(ctx, data), 200));
+  }
   const data = await loadUserProfileData(c.env.DB, profile.user, doer, url.searchParams);
   return respond(c.html(renderUserProfilePage(ctx, data), 200));
 }

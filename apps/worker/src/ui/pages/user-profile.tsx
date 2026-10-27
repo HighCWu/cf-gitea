@@ -55,11 +55,11 @@
  * - The avatar slot renders a placeholder circle with the person octicon
  *   (no avatar pipeline — an `<img>` to a missing route is a dead link, the
  *   avatar-slot rule the org home set).
- * - The overview menu (user/overview/header.tmpl) reduces to the single
- *   live tab (Repositories — this page): Overview needs a profile-readme
- *   pipeline, Projects/Packages/Code/Activity/Stars need their pages (dead
- *   links forbidden, §2.4.1). The tab anchors the canonical `/{username}`
- *   (no `?tab=` — one live tab, the OrgMenu shape).
+ * - The overview menu (user/overview/header.tmpl) renders its two LIVE
+ *   tabs (Repositories — ACTIVE here; Activity — the mounted `?tab=activity`
+ *   page, both header.tmpl:12-34 hrefs): Overview needs a profile-readme
+ *   pipeline, Projects/Packages/Code/Stars need their pages (dead links
+ *   forbidden, §2.4.1).
  * - The followers/following counts render as plain text: the landed
  *   follows service supplies the totals (the counts are REAL data), but the
  *   `?tab=followers`/`?tab=following` pages do not exist (profile.tmpl:25's
@@ -95,7 +95,7 @@ import { isFollowing, listFollowers, listFollowing } from "../../api/services/fo
 import { orgMembers, repoSettings, repositories, users } from "../../db/schema";
 import { OrgService } from "../../services/orgs/orgs";
 import { formatDueDate } from "./milestones";
-import { OrgHomePagination, OrgMenu, OrgRepoListItem, type OrgHomeRepoItem } from "./org-home";
+import { OrgHomePagination, OrgRepoListItem, type OrgHomeRepoItem } from "./org-home";
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
@@ -106,6 +106,8 @@ export const userProfileLocale = {
   joined_on: "Joined on", // "user.joined_on"
   followers: "followers", // "user.followers"
   following: "following", // "user.following"
+  repositories: "Repositories", // "user.repositories" (header.tmpl:13)
+  activity: "Public Activity", // "user.activity" (header.tmpl:34)
   visibility_limited: "Limited", // "org.settings.visibility.limited_shortname"
   visibility_private: "Private", // "org.settings.visibility.private_shortname"
 } as const;
@@ -392,6 +394,29 @@ export function ProfileAvatarCard(props: { user: UserProfileRow; followers: numb
   );
 }
 
+/** The overview header (user/overview/header.tmpl:12-34 reduced to its two
+ *  LIVE tabs): Repositories ACTIVE (header.tmpl:12's exact `?tab=repositories`
+ *  href — the activity page's twin renders it inactive) and the Activity
+ *  anchor (header.tmpl:33-34, the mounted `?tab=activity` page). Overview
+ *  needs a profile-readme pipeline; Projects/Packages/Code/Stars need their
+ *  owner-scoped pages (dead links forbidden, §2.4.1). Module-local, the
+ *  activity module's OverviewTabs twin — OrgMenu carries no activity slot. */
+function ProfileTabs(props: { username: string; repoCount: number }) {
+  return (
+    <overflow-menu class="ui secondary pointing tabular borderless menu tw-mb-4">
+      <div class="overflow-menu-items">
+        <a class="active item" href={`/${props.username}?tab=repositories`}>
+          <Icon name="octicon-repo" /> {userProfileLocale.repositories}
+          {props.repoCount > 0 ? <div class="ui small label">{props.repoCount}</div> : null}
+        </a>
+        <a class="item" href={`/${props.username}?tab=activity`}>
+          <Icon name="octicon-rss" /> {userProfileLocale.activity}
+        </a>
+      </div>
+    </overflow-menu>
+  );
+}
+
 /** The full-document render (the render.tsx pattern — `index.ts` stays a
  *  pure-TS router module, so the JSX invocation lives beside the component). */
 export function renderUserProfilePage(ctx: UiContext, data: UserProfileData): string {
@@ -412,7 +437,7 @@ export function UserProfilePage(props: { ctx: UiContext; data: UserProfileData }
             <ProfileAvatarCard user={data.user} followers={data.followers} following={data.following} />
           </div>
           <div class="ui twelve wide column tw-mb-4">
-            <OrgMenu orgLink={link} repoCount={data.total} />
+            <ProfileTabs username={data.user.username} repoCount={data.total} />
             {/* shared/repo/list.tmpl: the wrapper renders unconditionally
                 (zero repos = an empty list, upstream's own shape — the org
                 home's empty-placeholder is home.tmpl's, not this template). */}

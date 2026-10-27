@@ -1,7 +1,8 @@
 /**
  * The user profile ACTIVITY tab, `/{username}?tab=activity` — pages wave 50
- * (bench row `wave-feeds-module`, UNMOUNTED — the route rides a later window;
- * `index.ts` is orchestrator/sibling-owned).
+ * (bench row `wave-feeds-module`; MOUNTED by the dispatch window —
+ * `ownerHomePage`'s user arm calls this module's load + render under the
+ * tab param, the HANDOFF NOTE's recipe verbatim).
  *
  * ## HANDOFF NOTE (for the wiring wave)
  *

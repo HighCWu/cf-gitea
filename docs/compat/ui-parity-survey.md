@@ -383,18 +383,14 @@ public access), F +2 (the wiki family, activity_author_data) — for
 post-window truth: the two-stage module wave is fully CONSUMED — the
 fourteen window commits (2a-2f, 92 routes) mounted every
 committed-unmounted module, and the polish matrices behind them are
-committed. The ONE deliberate survivor:
-
-- **The profile `?tab=activity` page arm** — `pages/activity-feeds.tsx`
-  (`ec07fb6`, glyphs exacted `f696a21`) is complete and committed, but
-  the window did NOT mount the page arm: its seam
-  (`resolveActivityFeeds`) and rendering vocabulary landed into the
-  .rss/.atom envelopes instead (`1a59af0` imports the seam; the page
-  render `renderActivityFeedsPage` has no caller outside its module,
-  verified at HEAD). The landed `/{username}` row keeps LANDED with a
-  tab-arm note; the arm itself is the survey's last S-sized bench row
-  (wire the owner-home handler's tab dispatch onto the committed
-  renderer).
+committed. The ONE deliberate survivor — **CLOSED**: the profile
+`?tab=activity` page arm is MOUNTED (`pages/activity-feeds.tsx`
+`ec07fb6`/`f696a21` complete; the dispatch window wired
+`ownerHomePage`'s user half onto `loadActivityFeedsData` +
+`renderActivityFeedsPage` under the tab param, the org half ignoring
+the query exactly upstream, and re-armed the user-profile matrix's
+inert-posture pins deliberately — the profile's own strip now carries
+the two live header.tmpl anchors). No S-sized bench rows remain.
 
 The previous in-flight chain, for the record: the module wave
 (fifteen page modules across thirteen commits, tracked through ticks
@@ -487,7 +483,7 @@ the slice ledger below):
 | the index window — both fragment routes + the wiki twin | `GET .../blob_excerpt/{sha}` (web.go:1735 — stage-3: the fragment render + expand buttons + anchors over the `0db7087` hunk machinery) + `GET .../wiki/blob_excerpt/{sha}` (web.go:1618 — the WIKI TWIN discovered mid-mount, the `wiki-blob-excerpt` family with the wiki-cell swap + `hasWiki` gate) + `GET .../lastcommit/*` (web.go:1761 — HANDOFF-exact per the `3502ee4` mount plan; the file-list fetch-attrs flip — four attrs verbatim, opt-in `loaderCommitOid` — rides the same commit) | `67adfb7` |
 | the org settings group + teams/edit (the FINAL numbered row) | `GET|POST /{org}/settings` (web.go:1018-1019 — the options combo over `orgEdit` incl. `repo_admin_change_team_access` + the visibility modal's write) + the avatar pair (web.go:1020-1021 — multipart bridged through `processAvatarImage`/`uploadAvatar`) + the danger-zone writes (web.go:1065-1067 — rename/delete/visibility as `<details>` disclosure forms, the dialog reduction; `max_repo_creation` honest-absent) + `GET|POST /{org}/teams/{team}/edit` + the team delete (web.go:1011-1013 — every landed `editTeam` field; the `repo_access` radios dead-control-unrendered, the landed arm ignores the field; per-unit teams render their stored units) — the settings TAB remainders split to the fresh ABSENT row below | `8380cf0` |
 | repo-migrate module (UNMOUNTED — the S mount rides a window wave) | `GET /repo/migrate` page module (`pages/repo-migrate.tsx` — the Git-variant field matrix, owner select on the write's own strict predicate, mirror-checked degradation, queue-birth semantics; HANDOFF-exact) | `f26d65b` |
-| activity-feeds module (UNMOUNTED — the `?tab=activity` arm) | the landed `/{username}` row's activity tab (the 14-type wired feed matrix per feeds.tmpl+util_misc+action.go, the fall-through degradation, private-visibility + pagination-20) | `ec07fb6` |
+| activity-feeds module (MOUNTED — the `?tab=activity` arm wired by the dispatch window) | the landed `/{username}` row's activity tab (the 14-type wired feed matrix per feeds.tmpl+util_misc+action.go, the fall-through degradation, private-visibility + pagination-20) | `ec07fb6` |
 | the feeds glyphs exacted | the five allowlist additions (issue-reopened/comment-discussion/file-diff/question/rss), the degradation stand-ins swapped per the module's structured sites | `f696a21` |
 | notification-subscriptions module (UNMOUNTED) | `/notifications/subscriptions` + `/watching` + `/purge-page` page module (both arms per notification_subscriptions.tmpl, 8 issue sorts verbatim, facet tri-states, the OPEN-case quirk) | `486b9fc` |
 | org settings hooks tab (MOUNTED — flips the B remainder row PARTIAL) | `GET|POST /{org}/settings/hooks[/{id}]` (web.go:1033-1044 — list/create/edit/delete over the org-hooks family, scope-agnostic `editRepoHook` reused; the org list h4 'Settings' QUIRK kept verbatim; no test/replay arms — no upstream org route; the wave-49 navbar + parser ripples committed with the unit) | `54264ae` |
@@ -564,7 +560,7 @@ onto).
 
 | Upstream route | Cite | Status | Data | Demand | Effort |
 |---|---|---|---|---|---|
-| `GET /{username}` (profile or org home, one handler) | web.go:911 | LANDED (`pages/user-profile.tsx` + `pages/org-home.tsx`; the `?tab=activity` arm's page module is committed but UNMOUNTED — `pages/activity-feeds.tsx`, `ec07fb6`: the window consumed its seam + rendering vocabulary into the .rss/.atom envelopes (`1a59af0`), the page render has no caller; the arm is the survey's last S bench row, see In-flight) | landed | core | — |
+| `GET /{username}` (profile or org home, one handler) | web.go:911 | LANDED (`pages/user-profile.tsx` + `pages/org-home.tsx`; the `?tab=activity` arm MOUNTED by the dispatch window — `ownerHomePage`'s user half renders `pages/activity-feeds.tsx` under the tab, profile.go:162-190's arm, the org half ignores the query; the profile strip carries both live header.tmpl anchors) | landed | core | — |
 | `GET /{username}.rss` / `.atom` (handled inside the sub-route) | web.go:909-911 | LANDED (window-2e B1 `1a59af0` — one regex-constrained registration (the owner-home precedent); `resolveActivityFeeds` org-then-user, visibility-gated, renamed 307, missing 404 shell; gorilla-parity bytes with USER_FEED_CONTENT_TYPES) | landed (`repoListActivityFeeds` family declared `2ef9359`, `renderFeedItems` in `api/services/activity-feeds.ts`) | admin | — |
 | `GET /{username}/-/repositories` (org repo list) | web.go:1134 | LANDED (`pages/org-repos.tsx`, ui-parity-2) | landed | core | — |
 | `GET /{username}/-/heatmap` | web.go:1135 | ABSENT | none | admin | M |
@@ -727,9 +723,8 @@ scans, `/explore/organizations`'s anonymous search arm,
 `/user/sign_up`, the org dashboard/issues group),
 (c) the owner `/-/`
 namespace tails (heatmap/packages stay gated),
-(d) the unmounted remainder of mounted groups — the profile
-`?tab=activity` page arm (module committed, the last S bench row),
-the admin pages beyond the dashboard/monitor group, the user-settings
+(d) the unmounted remainder of mounted groups — the admin
+pages beyond the dashboard/monitor group, the user-settings
 account/repos/notifications tabs — and
 (e) whole subsystems with no data model (actions, packages, audit
 logs) or no engine RPC (blame, graph, code search, heatmap) that are
@@ -747,18 +742,15 @@ ONE S row**, with everything else needs-API-first or gated.
 HEAD `03f9e82` (490 ops / 298 paths, tier-1 78/78 paths, 129/129 ops)
 — no row below needs an API that isn't declared.
 
-### The one dispatchable row
+### The one dispatchable row — CLOSED
 
-1. **The profile `?tab=activity` page arm** (B, S) — the module is
-   COMPLETE and committed (`pages/activity-feeds.tsx`, `ec07fb6`,
-   glyphs exacted `f696a21`); what remains is wiring the owner-home
-   handler's tab dispatch onto the committed
-   `renderActivityFeedsPage`/`loadActivityFeedsData` (the seam
-   `resolveActivityFeeds` is already imported for the .rss/.atom
-   envelopes, `1a59af0`). One registration + one handler arm + the
-   matrix's route-level arms per the process note — the smallest
-   dispatchable row on the board, and the survey's last one with
-   landed data.
+1. **The profile `?tab=activity` page arm** (B, S) — DONE by the
+   dispatch window: one handler arm in `ownerHomePage`'s user half
+   (the tab dispatch onto the committed renderer + loader), the
+   matrix's route-level arms re-armed per the process note, the
+   profile strip's two live anchors. The board now has no S-sized
+   dispatchable row; the admin-pages remainder (d above) is the next
+   natural family.
 
 NEEDS-API-FIRST rows (do not dispatch as UI work): the
 `content-history/list` + `/detail` fragment arms (no snapshot store),

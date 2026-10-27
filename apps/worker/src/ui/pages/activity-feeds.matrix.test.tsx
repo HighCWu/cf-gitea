@@ -3,21 +3,17 @@
  * module, committed ec07fb6) — driven through the page module's seams on the
  * module suite's real-D1 harness.
  *
- * ## MOUNT VERDICT (verified before writing a line)
+ * ## MOUNT VERDICT (verified before writing a line; updated by the mount
+ * window)
  *
- * The `?tab=activity` arm is NOT mounted at this pin. `src/ui/index.ts`'s
- * single-segment parse yields only `owner-home` / `user-feed-rss` /
- * `user-feed-atom`; `ownerHomePage`'s user arm goes straight to
- * `loadUserProfileData` + `renderUserProfilePage` (pages/user-profile.tsx —
- * the tab query is never read), and `loadActivityFeedsData` /
- * `renderActivityFeedsPage` have zero references in `index.ts`. The module
- * header's HANDOFF NOTE stands: the route rides a later window. Consequently
- * NEITHER mission branch applies — there are no route-level arms to extend
- * and the owner-home handler does not render the tab (the mounted route's
- * inert-tab behavior is already pinned by pages/user-profile.matrix.test.ts).
- * The matrix therefore targets the seams the future route arm will call
- * (the HANDOFF NOTE's resolve → load → render path), which is also the
- * module suite's driver.
+ * The `?tab=activity` arm is MOUNTED since this repo's dispatch window:
+ * `ownerHomePage`'s user arm reads the tab param and dispatches to
+ * `loadActivityFeedsData` + `renderActivityFeedsPage` (the HANDOFF NOTE's
+ * resolve → load → render path, exactly the seams this matrix drives); the
+ * route-level arms — org-half ignorance, the visibility ladder, the strip
+ * anchors on both pages — are pinned by pages/user-profile.matrix.test.ts
+ * (re-armed with the mount). This file therefore keeps targeting the module
+ * seams (the same calls the route arm makes).
  *
  * ## Scope — the arms the neighbors do NOT own
  *

@@ -13,13 +13,13 @@
  *     owner's private repo staying hidden from a signed-in stranger),
  *   - the org-home vs user-home discrimination (mixed-case resolve, an org
  *     name ignoring ?tab=activity exactly like upstream's org.Home),
- *   - the ?tab=activity arm's rendering: the activity page module
- *     (pages/activity-feeds.tsx) is UNMOUNTED at this pin — its header's
- *     HANDOFF NOTE leaves the route arm to a later window — so the query
- *     param is INERT: the repositories view renders, no activity DOM, the
- *     overview anchors stay canonical (no `?tab=` anywhere). These arms pin
- *     the documented intermediate posture; they must be re-armed when the
- *     dispatch wave mounts the page,
+ *   - the ?tab=activity arm's rendering: the wave-50 feeds module is
+ *     MOUNTED (this window — ownerHomePage dispatches the tab to
+ *     loadActivityFeedsData/renderActivityFeedsPage in the user half; the
+ *     org half above ignores the query), and the profile's own strip
+ *     carries the two live header.tmpl anchors. These arms pinned the
+ *     documented inert posture pre-mount and were re-armed with it (the
+ *     deliberate-flip rule),
  *   - the renamed-user redirect arms wave 7 lacks: the PRIVATE and LIMITED
  *     targets answering a signed-in doer with the 307 (the coarse
  *     RedirectToUser gate passes any authenticated principal — only the
@@ -267,27 +267,31 @@ describe("the org home vs user home discrimination at the shared route", () => {
   });
 });
 
-// --- the ?tab=activity arm (the module is unmounted at this pin — the param is inert)
+// --- the ?tab=activity arm (the wave-50 module MOUNTED — the user half dispatches)
 
-describe("the ?tab=activity arm's rendering (the activity module is unmounted — the param is inert)", () => {
-  it("the profile renders the repositories view with only the canonical tab anchor (no dead ?tab= link, no activity DOM)", async () => {
+describe("the ?tab=activity arm's rendering (the module mounted — the tab dispatches)", () => {
+  it("renders the feeds page, not the repositories view (profile.go:162-190's arm)", async () => {
     const res = await get("/upgal?tab=activity");
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('class="page-content user profile"');
-    expect(html).toContain('href="/upgal/upopen"'); // the repositories rows, not a feed
-    expect(html).not.toContain("data-ref-issue-container"); // feeds.tmpl's container — never leaks
-    expect(html).not.toContain("activity-feed");
-    expect(html).toContain('class="active item" href="/upgal"'); // the single live tab, canonical
-    expect(html).not.toContain("?tab="); // no dead anchor carries the tab
+    expect(html).toContain('id="activity-feed"'); // feeds.tmpl's container — the arm's DOM
+    expect(html).toContain('class="active item" href="/upgal?tab=activity"'); // the active tab
+    expect(html).toContain('href="/upgal?tab=repositories"'); // header.tmpl:12's other live tab
+    expect(html).not.toContain('href="/upgal/upopen"'); // the repositories rows never leak
   });
 
-  it("the pager anchors stay canonical under the tab query", async () => {
-    const res = await get("/upbulk?tab=activity");
+  it("the canonical repositories view keeps its pager tab-free while the strip carries both anchors", async () => {
+    const res = await get("/upbulk");
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('href="/upbulk?page=2"'); // Older — no tab carried
-    expect(html).not.toContain("?tab=");
+    expect(html).toContain('class="active item" href="/upbulk?tab=repositories"'); // ACTIVE here
+    expect(html).toContain('href="/upbulk?tab=activity"'); // header.tmpl:33's anchor
+    const tabbed = await get("/upbulk?tab=activity");
+    const tabHtml = await tabbed.text();
+    expect(tabHtml).toContain('id="activity-feed"'); // the feeds page
+    expect(tabHtml).not.toContain('href="/upbulk?page=2"'); // not the repo pager
   });
 
   it("the tab never bypasses the visibility ladder or the miss path", async () => {
