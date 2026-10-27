@@ -23,3 +23,5 @@ apps/worker/public/assets/
 **/worker-configuration.d.ts
 apps/worker/src/ui/icons.generated.ts
 scripts/diff-report-*.json
+# vitest-plugin run cache (multiple agents flagged the untracked dir)
+apps/worker/.vitest/
