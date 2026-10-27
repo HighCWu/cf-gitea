@@ -9,7 +9,11 @@
  * since window-2d b54f709 (GET+POST /settings/public_access at ui/index.ts),
  * and the deferred matrix below also drives the REAL routes (the org-blocked
  * 9125040 matrix's minted-session pattern): the settingsGate posture on both
- * methods, the signed-in non-admin's 404 before any write, the admin GET's
+ * methods, the signed-in non-admin collaborator's gate 404 before any write
+ * (SPEC-0005 flipped its LAYER, not the outcome: the collaborator resolves
+ * the private repo and is refused at the settingsGate — the recorded
+ * 'when collaboration lands' deferral in acl.ts's page-visibility seam),
+ * the admin GET's
  * armed radio reflecting the ACL read, the POST flip both ways → 303 with the
  * value re-read through BOTH the page loader and the landed
  * `codeUnitAnonymousRead` (the git-HTTP ACL seam — page and gate agree),
@@ -232,11 +236,14 @@ async function collaboratorSessionHeader(): Promise<string> {
 }
 
 /** Flip the seeded repo's visibility. readGrant (acl.ts — the SPEC-0010 §2.6
- *  one-copy visibility predicate) resolves a repo for anonymous/non-admin
- *  viewers ONLY when it is public, so the PUBLIC twin is what exposes the
- *  settingsGate's own 303/404 layers; on the private seed those viewers are
- *  answered by the resolver's invisible-repo 404 before the gate is reached
- *  (invisible ≡ missing — never a 401/403 for pages). */
+ *  one-copy visibility predicate) resolves a repo for grant-LESS viewers
+ *  (anonymous or a signed-in stranger) only when it is public, so the PUBLIC
+ *  twin is what exposes the settingsGate's own 303/404 layers for them; on
+ *  the private seed those viewers are answered by the resolver's
+ *  invisible-repo 404 before the gate is reached (invisible ≡ missing —
+ *  never a 401/403 for pages). Since SPEC-0005 the write collaborator
+ *  resolves the PRIVATE seed too (doerRepoAccessMode's collaborator fold),
+ *  reaching the gate on both twins. */
 async function setRepositoryVisibility(visibility: "public" | "private"): Promise<void> {
   await env.DB.prepare("UPDATE repositories SET visibility = ? WHERE id = ?").bind(visibility, repo.id).run();
 }
@@ -303,14 +310,23 @@ describe("the mounted GET route (GET /{owner}/{repo}/settings/public_access)", (
     );
   });
 
-  it("404-shells the signed-in non-admin's GET on the PRIVATE seed before any write (the resolver's invisible-repo 404 — no collaborator arm in page visibility, acl.ts's recorded 'when collaboration lands' deferral)", async () => {
+  it("404-shells the signed-in non-admin's GET on the PRIVATE seed before any write — the SPEC-0005 landing flips the LAYER: the write collaborator now RESOLVES the repo (readGrant's collaborator arm) and the settingsGate's reqRepoAdmin refusal answers the same 404", async () => {
+    // This arm was pinned on the pre-SPEC-0005 posture (acl.ts's recorded
+    // 'when collaboration lands' deferral): the write collaborator 404'd at
+    // the repo RESOLVER — invisible ≡ missing, no repo header. The landing
+    // folded the repo_collaborators row into doerRepoAccessMode, so bob
+    // (mode write ⇒ read) now resolves the private repo and the refusal
+    // moved DOWN to the settingsGate (isRepositoryAdmin ranks only the
+    // `admin` collaborator mode): same 404, but the shell keeps its repo
+    // header — the observable provenance flip, asserted below.
     const res = await fetchUi("/alice/demo/settings/public_access", {
       headers: { cookie: await collaboratorSessionHeader() },
     });
     expect(res.status).toBe(404);
     const html = await res.text();
     expect(html).toContain("status-page-error");
-    expect(html).not.toContain(`name="${CODE_UNIT_FORM_KEY}"`);
+    expect(html).toContain("repo-header"); // the gate's shell — the repo RESOLVED
+    expect(html).not.toContain(`name="${CODE_UNIT_FORM_KEY}"`); // never the tab's radios
     expect(await storedMode()).toBe("read"); // nothing was written
   });
 

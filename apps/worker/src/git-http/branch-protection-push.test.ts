@@ -238,9 +238,11 @@ interface Fixture {
 }
 
 /** alice's repo with one commit on main. Alice is the repo's writer (the
- *  git matrix's row-8 grant is owner/org-team only — repo_collaborators are
- *  an API-level surface), so the whitelist cases below discriminate on the
- *  RULE's whitelist, not on repo-level access. */
+ *  git matrix's row-8 grant is owner/org-team/collaborator since the
+ *  SPEC-0005 fold — `doerRepoAccessMode` ranks write/admin collaborator
+ *  rows; this fixture carries no collaborator rows, so the whitelist cases
+ *  below still discriminate on the RULE's whitelist, not on repo-level
+ *  access). */
 async function seedRepo(): Promise<Fixture> {
   const slug = `bp${++slugSeq}`;
   const alice = await seedVerifiedUser({ username: "Alice" });

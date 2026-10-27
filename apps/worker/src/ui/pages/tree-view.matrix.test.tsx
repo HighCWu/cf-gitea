@@ -23,15 +23,23 @@
  * uiRouter with the issues-list 88ac2ee / org-members f75316e minted-session
  * pattern:
  *
- *   - the PRIVATE-repo gates with a session roster (every landed private arm
- *     for these families is anonymous-only): the private repo 404-shells for
- *     the anonymous viewer, a signed-in non-collaborator AND a signed-in
- *     write COLLABORATOR (the landed visibility deferral — readGrant's
- *     session arms are owner/site-admin/org-team; the repo_collaborators
- *     edge is write-guard-only, repository.ts:199's SPEC-0005 TODO — pinned
- *     so a future landing must flip it deliberately), while the OWNER
- *     session renders the home page, the /src tree view AND the /tree-view
- *     aux envelope;
+ *   - the PRIVATE-repo gates with a session roster: the private repo
+ *     404-shells for the anonymous viewer and a signed-in NON-collaborator,
+ *     while the OWNER session renders the home page, the /src tree view AND
+ *     the /tree-view aux envelope. The signed-in write COLLABORATOR arm
+ *     began as the pinned visibility deferral (readGrant's session arms
+ *     were owner/site-admin/org-team; the repo_collaborators edge was
+ *     write-guard-only, repository.ts:199's SPEC-0005 TODO — pinned so a
+ *     SPEC-0005 landing must flip it deliberately) and the wave-123
+ *     SPEC-0005 landing FLIPPED it: the collaborator now renders all three
+ *     surfaces plus the write chrome (the doerRepoAccessMode collaborator
+ *     fold);
+ *   - the git-HTTP readGrant's collaborator arms over the same fixture
+ *     (SPEC-0005): a write collaborator clones the private repo AND pushes
+ *     a branch through the real receive-pack (mode write ranks write); a
+ *     READ collaborator clones but the push 404-masks (acl.ts's recorded
+ *     read-only-collaborator variant, landed with the fold); a
+ *     non-collaborator's clone stays 404 (existence hidden);
  *   - the /src ref-resolution arms made route-real (index.test owns the pure
  *     table): the branch/HEAD swap, a slash-bearing branch reached and
  *     rendered (`green/deep` — links, the raw-file `?ref=` form and the
@@ -74,9 +82,10 @@
  * Fixtures (unique names — the matrix files share one storage scope):
  * `tvx-owner/tvx-pub` (4-commit main + `feature`, `feature/deep`,
  * `green/deep` branches through the real receive flow), `tvx-owner/
- * tvx-secret` (private, collaborator granted via the landed
- * addOrUpdateCollaborator), `tvx-owner/tvx-sub` (typed-mode pack built
- * locally, wave-43's recipe trimmed — gitlinks emit no object).
+ * tvx-secret` (private, `tvx-collab` write + `tvx-reader` read collaborator
+ * rows via the landed addOrUpdateCollaborator), `tvx-owner/tvx-sub`
+ * (typed-mode pack built locally, wave-43's recipe trimmed — gitlinks emit
+ * no object).
  */
 
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
@@ -302,7 +311,8 @@ const seedPubRepo = once(async (): Promise<void> => {
 });
 
 /** `tvx-owner/tvx-secret`: one commit, PRIVATE, with `tvx-collab` holding a
- *  write grant and `tvx-out` holding nothing. */
+ *  write grant, `tvx-reader` a read grant (SPEC-0005's read-only-collaborator
+ *  arms) and `tvx-out` holding nothing. */
 const seedSecretRepo = once(async (): Promise<void> => {
   const db = drizzle(env.DB);
   const owner = await userIdOf("tvx-owner");
@@ -337,6 +347,8 @@ const seedSecretRepo = once(async (): Promise<void> => {
   }
   const collab = await userIdOf("tvx-collab");
   await addOrUpdateCollaborator(env.DB, row.id, collab, "write", new Date(T0 * 1000));
+  const reader = await userIdOf("tvx-reader");
+  await addOrUpdateCollaborator(env.DB, row.id, reader, "read", new Date(T0 * 1000));
 });
 // --- the typed-mode pack builder (wave-43's recipe, trimmed to this file's
 // --- needs: gitlinks emit no object, the rest is blobs + nested trees) ---------
@@ -526,6 +538,7 @@ beforeAll(async () => {
   await seedVerifiedUser({ username: "tvx-owner" });
   await seedVerifiedUser({ username: "tvx-collab" });
   await seedVerifiedUser({ username: "tvx-out" });
+  await seedVerifiedUser({ username: "tvx-reader" });
   await seedPubRepo();
   await seedSecretRepo();
   await seedSubRepo();
@@ -563,19 +576,36 @@ describe("the private-repo gates with a session roster (the arms the anon-only s
     }
   });
 
-  it("a signed-in WRITE COLLABORATOR stays 404 as well — the landed visibility deferral (repository.ts:199's SPEC-0005 TODO)", async () => {
+  it("a signed-in WRITE COLLABORATOR renders the private repo — the SPEC-0005 landing flips the pinned deferral arm", async () => {
     await seedSecretRepo();
-    // readGrant's session arms are owner / site-admin / org-team; the
-    // repo_collaborators edge is layered by the WRITE guards only
-    // (canWriteRepository), so a private repo's collaborator cannot SEE the
-    // pages yet. Landed posture — pinned so a future SPEC-0005 landing must
-    // flip this arm deliberately.
+    // This arm was PINNED as the landed deferral: readGrant's session arms
+    // were owner / site-admin / org-team and the repo_collaborators edge was
+    // write-guard-only (repository.ts:199's SPEC-0005 TODO — "a future
+    // SPEC-0005 landing must flip this arm deliberately"). The landing
+    // folded the collaborator row into doerRepoAccessMode, so the write
+    // collaborator's resolved grant (mode write ⇒ read + write) admits the
+    // pages — flipped deliberately, owner arm's shape asserted here.
     const collab = await userIdOf("tvx-collab");
-    const res = await fetchUi("/tvx-owner/tvx-secret/src/branch/main", {
-      headers: { cookie: await sessionHeader(collab) },
-    });
-    expect(res.status).toBe(404);
-    expect(await res.text()).not.toContain("repo-files-table");
+    const cookie = { headers: { cookie: await sessionHeader(collab) } };
+
+    const home = await fetchUi("/tvx-owner/tvx-secret", cookie);
+    expect(home.status).toBe(200);
+    expect(tableSlice(await home.text())).toContain("tvx secret: readme and docs");
+
+    const src = await fetchUi("/tvx-owner/tvx-secret/src/branch/main", cookie);
+    expect(src.status).toBe(200);
+    const srcHtml = await src.text();
+    expect(srcHtml).toContain('class="page-content repository file list"');
+    expect(tableSlice(srcHtml)).toContain('title="docs">docs</a>');
+    // Mode write also arms the write chrome on the private repo (the
+    // canWriteRepository grant arm — the same rule upstream ranks).
+    expect(srcHtml).toContain('<a class="ui mini primary button" href="/tvx-owner/tvx-secret/new/main">');
+
+    const aux = await fetchUi("/tvx-owner/tvx-secret/tree-view/branch/main", cookie);
+    expect(aux.status).toBe(200);
+    expect(aux.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    const parsed = await aux.json<{ fileTreeNodes: { entryName: string }[] }>();
+    expect(parsed.fileTreeNodes.map((n) => n.entryName)).toEqual(["docs", "README.md"]);
   });
 
   it("the OWNER session renders all three surfaces", async () => {
@@ -599,6 +629,83 @@ describe("the private-repo gates with a session roster (the arms the anon-only s
     expect(aux.headers.get("content-type")).toBe("application/json;charset=utf-8");
     const parsed = await aux.json<{ fileTreeNodes: { entryName: string }[] }>();
     expect(parsed.fileTreeNodes.map((n) => n.entryName)).toEqual(["docs", "README.md"]);
+  });
+});
+
+// --- the git-HTTP readGrant's collaborator arms (SPEC-0005) ------------------------
+
+describe("the git-HTTP readGrant's collaborator arms (acl.ts's recorded deferral, landed)", () => {
+  /** A fresh token for the fixture user (delete-then-mint, the seeders'
+   *  idempotent pattern — re-runs must not collide on the token name). */
+  async function tokenFor(username: string, name: string, scope: "read:repository" | "write:repository"): Promise<string> {
+    const id = await userIdOf(username);
+    await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?").bind(id, name).run();
+    return (await mintFor(id, name, scope)).plaintext;
+  }
+
+  it("a WRITE collaborator clones the private repo (the readGrant collaborator arm: any row grants read)", async () => {
+    await seedSecretRepo();
+    const token = await tokenFor("tvx-collab", "tvx-matrix-collab-clone", "read:repository");
+    const res = await SELF.fetch("https://test.local/tvx-owner/tvx-secret.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+  });
+
+  it("a NON-collaborator still can't clone it (existence hidden — 404 Repository not found)", async () => {
+    await seedSecretRepo();
+    const token = await tokenFor("tvx-out", "tvx-matrix-out-clone", "read:repository");
+    const res = await SELF.fetch("https://test.local/tvx-owner/tvx-secret.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(res.status).toBe(404);
+    expect(new TextDecoder().decode(await res.arrayBuffer())).toBe("Repository not found");
+  });
+
+  it("mode write grants write: the write collaborator pushes a branch through the real receive-pack", async () => {
+    await seedSecretRepo();
+    const token = await tokenFor("tvx-collab", "tvx-matrix-collab-push", "write:repository");
+    const { tips, pack } = await buildHistoryPack([
+      {
+        message: "tvx collab: pushed branch",
+        time: T0 + 300,
+        files: [{ path: "COLLAB.md", content: "pushed by the collaborator\n" }],
+      },
+    ]);
+    const res = await SELF.fetch("https://test.local/tvx-owner/tvx-secret.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVING_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/tvx-collab", oid: tips[0] as string }], pack),
+    });
+    expect(res.status).toBe(200);
+    expect(new TextDecoder().decode(await res.arrayBuffer())).not.toContain("ng ");
+  });
+
+  it("mode read stays read-only: the READ collaborator clones but the push 404-masks (acl.ts's read-only-collaborator variant)", async () => {
+    await seedSecretRepo();
+    // A WRITE-scoped token for a READ-mode row: the scope half passes, the
+    // repo grant half must not rank push (acl.ts's recorded "read-only
+    // collaborator variant" — landed with the SPEC-0005 fold, pinned here).
+    const token = await tokenFor("tvx-reader", "tvx-matrix-reader-push", "write:repository");
+    const advert = await SELF.fetch("https://test.local/tvx-owner/tvx-secret.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(advert.status).toBe(200); // read per mode
+    const { tips, pack } = await buildHistoryPack([
+      {
+        message: "tvx reader: refused branch",
+        time: T0 + 360,
+        files: [{ path: "READER.md", content: "must not land\n" }],
+      },
+    ]);
+    const res = await SELF.fetch("https://test.local/tvx-owner/tvx-secret.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVING_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/tvx-reader", oid: tips[0] as string }], pack),
+    });
+    expect(res.status).toBe(404); // write capability hidden (row 8's variant)
+    expect(new TextDecoder().decode(await res.arrayBuffer())).toBe("Repository not found");
   });
 });
 

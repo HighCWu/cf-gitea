@@ -42,7 +42,8 @@ import type { AuthUser } from "../auth/auth-context";
 import type { TeamAccessMode } from "../db/schema";
 import { repoUnits, repositories, users } from "../db/schema";
 // The gate consults the same repository-service predicates as the API
-// visibility layer (SPEC-0007 §3.5): one org/team grant resolution, no drift.
+// visibility layer (SPEC-0007 §3.5 + SPEC-0005): one grant resolution
+// (org/team arms + the collaborator row), no drift.
 import { doerRepoAccessMode } from "../api/services/repository";
 
 type RepositoryRow = typeof repositories.$inferSelect;
@@ -194,10 +195,11 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
         ? new TokenService(env.DB).touchLastUsed(verified.token.id, now)
         : Promise.resolve(),
     );
-    // SPEC-0007 §3.5: the doer's org/team grant over the repo (Owners-team
-    // bridge + covering teams) — the same repository-service predicate the
-    // API visibility layer resolves; 'none' when the repo is user-owned or
-    // the doer holds no grant.
+    // SPEC-0007 §3.5 + SPEC-0005: the doer's resolved grant over the repo
+    // (`max` of the Owners-team bridge + covering teams and the
+    // `repo_collaborators` row's mode — the same repository-service
+    // predicate the API visibility layer resolves; 'none' when the doer
+    // holds no grant).
     const teamMode = await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: repo.ownerId }, verified.user.id);
     return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, verified.user, scope, teamMode);
   }
@@ -210,9 +212,9 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
  * resolution (SPEC-0010 §2.6 — exactly one copy, so page visibility and
  * git-HTTP visibility cannot drift): the gate's own grant lines
  * (`publiclyVisible`, isOwner, isSiteAdmin, the limited-owner branch) plus
- * the optional SPEC-0007 §3.5 org/team grant (`teamMode`, resolved via the
- * repository-service `doerRepoAccessMode` — the UI seam passes it once the
- * page resolution wires it; absent keeps the pre-teams behavior).
+ * the resolved grant (`teamMode`, the repository-service
+ * `doerRepoAccessMode` fold — SPEC-0007 §3.5 org/team arms and, since
+ * SPEC-0005, the active collaborator row's mode: any row grants read).
  * `doer === null` is the anonymous doer — matrix row 1's collapse verbatim.
  * Owner-account status is NOT part of this predicate: git-HTTP refuses a
  * prohibited owner separately (below, 403 shape) and pages treat a missing
@@ -244,10 +246,10 @@ export function readGrant(input: {
 
 /**
  * The matrix. `doer === null` is the anonymous doer; `scope === null` only
- * alongside it. `teamMode` is the authenticated doer's org/team grant
- * (SPEC-0007 §3.5, resolved by `authorizeGitHttp` from the shared
- * repository-service predicate) — 'none' when anonymous. See the table in
- * SPEC-0003 §2.4.
+ * alongside it. `teamMode` is the authenticated doer's resolved grant
+ * (SPEC-0007 §3.5 org/team arms + SPEC-0005 collaborator row, resolved by
+ * `authorizeGitHttp` from the shared repository-service predicate) — 'none'
+ * when anonymous. See the table in SPEC-0003 §2.4.
  */
 function decide(
   op: GitHttpOp,
@@ -295,10 +297,12 @@ function decide(
   // (githttp.go:117-119) — applies to every caller, owner included.
   if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
 
-  // Grant lines: { repo owner, site admin } plus the SPEC-0007 §3.5 org
-  // grant (the Owners-team bridge + covering teams — read on any effective
-  // mode; `teamMode` flows through the shared readGrant predicate). Rows 8's
-  // read-only-collaborator variant extends this when collaboration lands.
+  // Grant lines: { repo owner, site admin } plus the resolved grant (the
+  // SPEC-0007 §3.5 org arms — the Owners-team bridge + covering teams — and,
+  // since SPEC-0005, the active `repo_collaborators` row: any mode grants
+  // read; `teamMode` flows through the shared readGrant predicate). Row 8's
+  // read-only-collaborator variant landed WITH the fold: a read-mode
+  // collaborator passes canRead but not the teamWrites rank below.
   const isOwner = owner !== null && doer.id === owner.id;
   const isSiteAdmin = doer.isAdmin;
 
@@ -324,8 +328,9 @@ function decide(
     // clones keep working — the check only gates the write path.
     if (repo.isArchived) return repositoryArchived();
     // Row 8: visible but no write grant → 404 (write capability hidden).
-    // A team grants write at write/admin/owner mode (access_mode.go:17–22
-    // ranking); a read-mode team stays read-only.
+    // Write ranks at write/admin/owner mode (access_mode.go:17–22 ranking)
+    // on the resolved grant — an org team OR the SPEC-0005 collaborator row
+    // (a read-mode collaborator stays read-only).
     const teamWrites = teamMode === "write" || teamMode === "admin" || teamMode === "owner";
     if (!isOwner && !isSiteAdmin && !teamWrites) return repositoryNotFound();
   }

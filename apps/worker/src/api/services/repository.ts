@@ -8,6 +8,7 @@ import { ApiError } from "../errors";
 import type { Permission, Repository } from "../models/repository";
 import type { User } from "../models/user";
 import { OrgService } from "../../services/orgs/orgs";
+import { collaboratorModeOf } from "./repo-collaborators";
 import { renderGoDuration } from "./mirror";
 import type { RepoSettings } from "./repo-settings";
 
@@ -23,14 +24,15 @@ import type { RepoSettings } from "./repo-settings";
  * (gitea/services/convert/repository.go) reduced to D1-only data, keeping the
  * vendored pin's runtime values for unit/PR-configuration defaults.
  *
- * Access model (SPEC-0007 §3.5 enforcement): the visibility/permission
- * predicates take an optional resolved team/owner `TeamAccessMode` — the
- * doer's org-repo grant (`doerRepoAccessMode` below, over the shared
- * `OrgService.teamRepoAccessMode` predicate + the Owners-team bridge). The
- * sync signatures stay back-compatible (callers that have not resolved a
- * grant keep the reduced owner/admin matrix); the `*WithTeams` resolvers and
- * the git-HTTP gate (git-http/acl.ts) pass the mode so a team-granted member
- * sees a private org repo upstream-style (GetDoerRepoPermission,
+ * Access model (SPEC-0007 §3.5 enforcement, widened by SPEC-0005): the
+ * visibility/permission predicates take an optional resolved team/collaborator
+ * `TeamAccessMode` — the doer's grant (`doerRepoAccessMode` below: `max` over
+ * the org-repo grant — `OrgService.teamRepoAccessMode` + the Owners-team
+ * bridge — and the active `repo_collaborators` row's mode). The sync
+ * signatures stay back-compatible (callers that have not resolved a grant
+ * keep the reduced owner/admin matrix); the `*WithTeams` resolvers and the
+ * git-HTTP gate (git-http/acl.ts) pass the mode so a team-granted member or
+ * a collaborator sees a private repo upstream-style (GetDoerRepoPermission,
  * models/perm/access/repo_permission.go — read ⇒ pull, write/admin/owner ⇒
  * push, admin/owner ⇒ admin; AccessMode ranks, access_mode.go:17–22).
  */
@@ -108,14 +110,17 @@ function isRepositoryOwner(viewer: Viewer, row: RepositoryRow): boolean {
 
 /**
  * Whether the viewer may see the repository at all. Private repositories are
- * invisible to everyone but the owner and site admins; the routes turn this
- * into the upstream anti-enumeration 404 (SPEC-0004 §2.4 gotcha).
+ * invisible to everyone but the owner, site admins, and holders of a
+ * resolved grant; the routes turn this into the upstream anti-enumeration
+ * 404 (SPEC-0004 §2.4 gotcha).
  *
  * `teamMode` (optional, pre-resolved via `doerRepoAccessMode`): a non-'none'
- * org grant — an org team's effective mode or the Owners-team bridge — makes
- * the private repo visible to the grantee (upstream members read through
- * their team's unit access). Absent/null keeps the reduced matrix, so
- * callers that never resolved a grant behave exactly as before.
+ * grant — an org team's effective mode, the Owners-team bridge, or the
+ * SPEC-0005 collaborator row — makes the private repo visible to the grantee
+ * (upstream members and collaborators read through their access mode;
+ * repo_permission.go:463 passes the private-owner/org wall for
+ * collaborators). Absent/null keeps the reduced matrix, so callers that
+ * never resolved a grant behave exactly as before.
  */
 export function canViewRepository(viewer: Viewer, row: RepositoryRow, teamMode?: TeamAccessMode | null): boolean {
   if (row.visibility === "public") {
@@ -128,14 +133,21 @@ export function canViewRepository(viewer: Viewer, row: RepositoryRow, teamMode?:
 }
 
 /**
- * The doer's effective access mode over a repository from its ORG side —
- * `max(org-owner bridge arm, team arm)`: an `org_members.role='owner'` row
- * IS the upstream Owners team (authorize=owner, includes-all;
- * SPEC-0007 §3.3) and any covering team's grant comes through the shared
- * `OrgService.teamRepoAccessMode` predicate. 'none' for user-owned repos and
- * unaffiliated doers. This is the single repository-service predicate the
- * git-HTTP gate (git-http/acl.ts) consumes, so gate and API visibility
- * cannot drift.
+ * The doer's effective access mode over a repository — `max(org-owner
+ * bridge arm, team arm, collaborator arm)`: an `org_members.role='owner'`
+ * row IS the upstream Owners team (authorize=owner, includes-all;
+ * SPEC-0007 §3.3), any covering team's grant comes through the shared
+ * `OrgService.teamRepoAccessMode` predicate, and — SPEC-0005 (upstream
+ * `modeByOwnerAndAccess`, models/perm/access/access.go:38-72, folded into
+ * GetDoerRepoPermission at repo_permission.go:448-508) — an active
+ * `repo_collaborators` row IS the plain user's access mode: any row grants
+ * read (the `!isCollaborator` visibility wall at repo_permission.go:463
+ * passes for collaborators of private-owner/org repos), `write` ranks
+ * write, `admin` ranks admin (AccessMode order, access_mode.go:17-22).
+ * 'none' for unaffiliated doers. This is the single repository-service
+ * predicate the git-HTTP gate (git-http/acl.ts) and the UI page resolution
+ * (ui/repo-view.ts) consume, so gate, pages, and API visibility cannot
+ * drift.
  */
 export async function doerRepoAccessMode(
   d1: D1Database,
@@ -146,17 +158,23 @@ export async function doerRepoAccessMode(
   if (row.ownerId !== null && (await orgs.isOrgOwner(row.ownerId, userId))) {
     return "owner";
   }
-  return orgs.teamRepoAccessMode(row, userId);
+  const [teamMode, collabMode] = await Promise.all([
+    orgs.teamRepoAccessMode(row, userId),
+    collaboratorModeOf(d1, row.id, userId),
+  ]);
+  const rank: Record<TeamAccessMode, number> = { none: 0, read: 1, write: 2, admin: 3, owner: 4 };
+  return rank[collabMode] > rank[teamMode] ? collabMode : teamMode;
 }
 
 /**
- * Route-facing grant resolution: the doer's org/team access mode over the
- * repo, or null when the sync matrix already decides (anonymous, site admin,
- * the repo's own owner — arms checked without touching D1) or no team grant
- * exists ('none'). The ONE resolution a route feeds to BOTH
- * `canViewRepository` and `toApiRepository`, so the visibility check and the
- * embedded permissions block cannot disagree (upstream renders `ToRepo` with
- * the doer's resolved AccessMode, models/perm/access/repo_permission.go).
+ * Route-facing grant resolution: the doer's access mode over the repo
+ * (`doerRepoAccessMode` — org/team grant + SPEC-0005 collaborator row), or
+ * null when the sync matrix already decides (anonymous, site admin, the
+ * repo's own owner — arms checked without touching D1) or no grant exists
+ * ('none'). The ONE resolution a route feeds to BOTH `canViewRepository`
+ * and `toApiRepository`, so the visibility check and the embedded
+ * permissions block cannot disagree (upstream renders `ToRepo` with the
+ * doer's resolved AccessMode, models/perm/access/repo_permission.go).
  */
 export async function viewerTeamAccessMode(
   d1: D1Database,
@@ -175,12 +193,13 @@ export async function viewerTeamAccessMode(
 }
 
 /**
- * `canViewRepository` with the org/team grant resolved from D1 — the
- * async seam the route guards resolve through (SPEC-0007 §3.5). The pure
- * matrix answers first, so the hot arms (public repos, the repo's own owner,
- * site admins) cost no extra D1; only a first-pass miss pays the
- * `doerRepoAccessMode` lookup. The sync overload above stays for callers
- * that pass a pre-resolved mode or need the pure matrix.
+ * `canViewRepository` with the resolved grant (org/team + SPEC-0005
+ * collaborator) from D1 — the async seam the route guards resolve through
+ * (SPEC-0007 §3.5). The pure matrix answers first, so the hot arms (public
+ * repos, the repo's own owner, site admins) cost no extra D1; only a
+ * first-pass miss pays the `doerRepoAccessMode` lookup. The sync overload
+ * above stays for callers that pass a pre-resolved mode or need the pure
+ * matrix.
  */
 export async function canViewRepositoryWithTeams(
   d1: D1Database,
@@ -194,10 +213,13 @@ export async function canViewRepositoryWithTeams(
 
 /**
  * Embedded `permissions` block (upstream `api.Permission` from the doer's
- * access mode). `teamMode` (optional, `doerRepoAccessMode`) maps the org
- * grant onto the block upstream-style: read ⇒ pull; write/admin/owner ⇒
- * push (+pull); admin/owner ⇒ admin. TODO(SPEC-0005): collaborators are
- * layered by the repo-access guards, not here.
+ * access mode). `teamMode` (optional, `doerRepoAccessMode`) maps the
+ * resolved grant onto the block upstream-style: read ⇒ pull;
+ * write/admin/owner ⇒ push (+pull); admin/owner ⇒ admin. Since SPEC-0005
+ * the resolved grant folds the `repo_collaborators` row's mode too
+ * (`doerRepoAccessMode`), so a write-mode collaborator renders push here —
+ * the same mode the repo-access guards layer (repo-access.ts keeps its own
+ * collaborator reads as the direct-route belt).
  */
 export function repositoryPermissions(
   viewer: Viewer,
@@ -736,10 +758,12 @@ function castIdNumber(): SQL {
  * WHERE conditions shared by the list routes: what the requester may see.
  * `includePrivate` false (anonymous or `private=false`) → public only;
  * otherwise public plus the requester's own private repositories plus the
- * org repos a team grant covers (SPEC-0007 §3.5 — the SQL twin of
- * `doerRepoAccessMode !== 'none'`), and admins see all. TODO(SPEC-0005):
- * collaborator visibility (the row-level seam resolves it; the list WHERE
- * does not yet).
+ * repos a resolved grant covers (SPEC-0007 §3.5 + SPEC-0005): the org repos
+ * a team grant covers (`teamGrantCondition` — the SQL twin of
+ * `doerRepoAccessMode !== 'none'`'s team arm) and the private repos the
+ * requester collaborates on (`collaboratorGrantCondition` — upstream
+ * `AccessibleRepositoryCondition`'s access-table arm,
+ * repo_list.go:661-700). Admins see all.
  */
 function visibilityConditions(viewer: Viewer, includePrivate: boolean): SQL[] {
   if (!includePrivate || viewer.requester === null) {
@@ -748,14 +772,29 @@ function visibilityConditions(viewer: Viewer, includePrivate: boolean): SQL[] {
   if (viewer.requester.is_admin === true) {
     return [];
   }
-  const teamArm = viewer.requester.id === undefined ? [] : [teamGrantCondition(viewer.requester.id)];
+  const userId = viewer.requester.id;
+  const grantArms = userId === undefined ? [] : [teamGrantCondition(userId), collaboratorGrantCondition(userId)];
   return [
     or(
       eq(repositories.visibility, "public"),
       eq(repositories.ownerNamespace, requesterLoginLower(viewer) ?? ""),
-      ...teamArm,
+      ...grantArms,
     ) as SQL,
   ];
+}
+
+/**
+ * The list-side SPEC-0005 collaborator arm: an active `repo_collaborators`
+ * row grants read of the private repo regardless of its owner's visibility
+ * (upstream `UserCollaborationRepoCond`, repo_list.go:272-282 via
+ * `AccessibleRepositoryCondition` arm 2 — the row IS the access mode; our
+ * rows always carry a read-or-better mode, deletion removes the row).
+ */
+function collaboratorGrantCondition(userId: number): SQL {
+  return sql`EXISTS (
+    SELECT 1 FROM repo_collaborators rc
+    WHERE rc.repo_id = ${repositories.id} AND rc.user_id = ${userId}
+  )`;
 }
 
 /**

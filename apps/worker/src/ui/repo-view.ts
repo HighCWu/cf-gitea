@@ -13,7 +13,13 @@
  * - `{ kind: "user" }` — `publiclyVisible || isOwner || isSiteAdmin ||
  *   (repoPublic && ownerActive && ownerVisibility === "limited")` (gate
  *   rows 2/7/8/9 minus row 7's scope half — sessions carry no scope
- *   bitmap; the mint-time gate moved that check, SPEC-0010 §2.2 step 3).
+ *   bitmap; the mint-time gate moved that check, SPEC-0010 §2.2 step 3),
+ *   then ONE resolved-grant lookup: `viewerTeamAccessMode` — the
+ *   repository-service `doerRepoAccessMode` fold admits an org/team grant
+ *   (SPEC-0007 §3.5) AND, since SPEC-0005, an active `repo_collaborators`
+ *   row (any mode grants read of a private repo; write ranks write for the
+ *   page chrome, admin ranks admin) — the collaborator-visibility deferral
+ *   the wave-123 tree-view/public-access matrices pinned is lifted.
  *
  * Either way anything else is `null`, and the caller answers the 404 shell
  * — invisible repos 404, never a 401 (§2.6; SPEC-0003 §2.4 semantics).
@@ -54,10 +60,12 @@ export async function resolveRepositoryForViewer(
     doer,
   });
   if (grant) return resolved.repo;
-  // The cheap arms missed: pay ONE team-mode lookup (the same composition the
-  // gate and the API ride — wave16's flagged gap: git-HTTP and the API admit
-  // team members to private org repos; the pages must too, or invisible ≢
-  // missing breaks across surfaces for the same principal).
+  // The cheap arms missed: pay ONE resolved-grant lookup (the same
+  // composition the gate and the API ride — wave16's flagged gap: git-HTTP
+  // and the API admit team members to private org repos; the pages must
+  // too, or invisible ≢ missing breaks across surfaces for the same
+  // principal). Since SPEC-0005 the folded mode also carries the active
+  // repo_collaborators row — a collaborator reads the private repo's pages.
   if (doer === null) return null;
   // Project onto the service Viewer's three read fields (the repo-grants.ts
   // bridge precedent — the wire type's rest is optional).
