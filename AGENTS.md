@@ -151,7 +151,11 @@ pnpm build                 # vite build
 pnpm deploy                # wrangler deploy
 pnpm typecheck             # tsc --noEmit
 pnpm lint                  # eslint
-pnpm test                  # vitest (@cloudflare/vitest-plugin; runs in workerd)
+pnpm test                  # vitest, single pass in workerd — fast local loop for a file/scope only;
+                           # NEVER cite it as "full suite green" (ADR-0006)
+pnpm test:full             # full-suite composite gate — the standing "suite is green" verdict:
+                           # attributes every file and solo re-runs the ws1009 startup deaths
+                           # (docs/decisions/0006-full-suite-composite-gate.md)
 pnpm db:generate           # drizzle-kit generate migrations from schema
 pnpm db:migrate:local      # apply migrations to local D1 (dev)
 pnpm db:migrate:remote     # apply migrations to remote D1 (production)
