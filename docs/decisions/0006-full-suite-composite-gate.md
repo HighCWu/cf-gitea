@@ -99,3 +99,17 @@ suite green". CI/landing verdicts use `pnpm test:full`.
 - **The gate is read-only** wrt the repo: it never edits `vitest.config.ts`,
   tests, or source (the suite-stability A/B discipline keeps the config
   untouched; every config-side "fix" above was measured and rejected).
+
+## Postscript (2026-10-27, later): revisit trigger #1 FIRED — lever B landed, single-pass green restored
+
+`CF_TEST_STRIP_SOURCEMAPS=1` (an `enforce: "post"` empty-mappings transform in
+`apps/worker/vitest.config.ts`) removes the 61.5% sourcemap byte family from the
+warm payload: **ws1009 deaths 204 → 0** (verified twice; measured −21.66 MB on a
+controlled A/B). `pnpm test:full` now exports the var, so the standing gate runs
+strip-mode end to end — phase 1 is single-pass again (≈174 s), and `--solo`
+adjudication remains as the safety net for the residual heavy-closure contention
+class (one file per run, a different one each time — hook timeouts, not deaths).
+Plain `pnpm test` and solo runs keep full sourcemaps. The upstream
+chunked-warm-modules fix remains desirable (revisit trigger #2) but is no longer
+blocking. Cache note: the strip era grows a parallel fs-cache tree; a one-time
+`rm -rf apps/worker/node_modules/.vitest-cache` reclaims the keep-era one.
