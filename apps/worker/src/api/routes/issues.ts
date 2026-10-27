@@ -1312,9 +1312,17 @@ export function registerIssueRoutes(
     // form.assignee(s): upstream replaces the assignee set — no
     // issue_assignees table yet; ignored (file-header deviation note).
 
-    // State: close/reopen through the CAS-guarded service (the merged-PR
-    // guard is a PR-surface concern; no PR rows are creatable yet).
+    // State: the merged precondition first — upstream (repo/issue.go:810-817)
+    // 412s ANY state arm on a merged PR (the guard runs before the requested
+    // value is examined, so both "closed" and "open" attempts answer 412),
+    // then the CAS-guarded close/reopen transitions.
     const state = patchField(form.state);
+    if (state !== undefined && issue.isPull) {
+      const pullRequest = await findPullRequestRowByIssueId(c.env.DB, issue.id);
+      if (pullRequest !== null && pullRequest.hasMerged) {
+        throw new ApiError(412, "cannot change state of this pull request, it was already merged");
+      }
+    }
     if (state === "closed" && !issue.isClosed) {
       try {
         issue = await service.closeIssue(issue.id, { actorId });
@@ -1354,7 +1362,9 @@ export function registerIssueRoutes(
     assertNotArchived(found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     // Upstream reqAdmin lands with the SPEC-0002 ACL matrix (header note).
-    await deleteIssueCascade(c.env.DB, issue);
+    // The bucket rides along: attachment objects go storage-first (see the
+    // cascade's doc comment).
+    await deleteIssueCascade(c.env.DB, c.env.REPO_PACKS, issue);
     return c.body(null, 204);
   });
 

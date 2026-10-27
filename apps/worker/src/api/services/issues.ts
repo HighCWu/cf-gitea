@@ -3,16 +3,22 @@ import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
 import {
   comments,
+  issueAssignees,
+  issueAttachments,
   issueContentHistory,
+  issueDependencies,
   issueLabels,
   issuePins,
+  issueStopwatches,
   issueSubscriptions,
   issues,
   labels,
   milestones,
+  notificationStates,
   pullRequests,
   reactions,
   repositories,
+  trackedTimes,
   users,
 } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
@@ -1129,21 +1135,58 @@ export async function changeIssueMilestone(
 
 /**
  * The §4.12 delete cascade in ONE D1 batch: comments (own rows + xref rows
- * pointing here + dependency rows), issue_labels, reactions, subscriptions,
- * pins, the PR row, the issue row, the label open-counter decrements, and
- * the repo open-counter decrements (`DecrRepoIssueNumbers`). The milestone
- * counters move like upstream's `UpdateMilestoneCounters`. The index counter
- * is NOT rewound (§2.2). DEVIATION: upstream also removes
+ * pointing here + dependency rows), issue_labels, the tier-2 children
+ * (content history, assignees, dependencies in BOTH directions, notification
+ * states, stopwatches, tracked times, attachments), reactions,
+ * subscriptions, pins, the PR row, the issue row, the label open-counter
+ * decrements, and the repo open-counter decrements (`DecrRepoIssueNumbers`).
+ * The milestone counters move like upstream's `UpdateMilestoneCounters`. The
+ * index counter is NOT rewound (§2.2).
+ *
+ * The tier-2 arms are the upstream `db.DeleteBeans` set
+ * (services/issue/issue.go:234–252) minus two accepted deltas: upstream's
+ * `IssueUser` bean is not modeled (the derived read-state design — schema's
+ * notification_states comment) and the `ProjectIssue` detach stays with the
+ * projects owner (same upstream transaction, issue.go:246 — not part of this
+ * sweep's seven modeled families). DEVIATION (kept): upstream also removes
  * `refs/pull/N/head` from the engine (services/issue/issue.go:174–181) — the
  * engine ref write lands with the PR routes (SPEC-0005 §3.4) and is
  * deferred with them.
+ *
+ * Attachment STORAGE is deleted first (the landed single-attachment delete's
+ * storage-first contract — routes/issue-attachments.ts:986-991: a failed R2
+ * delete leaves the D1 rows intact and the request retryable; upstream's
+ * cascade removes the files after commit, services/issue/issue.go:166–172).
+ * The row sweep rides the batch; a NULL `r2_key` (row-first landing, upload
+ * not completed) has no object to delete. R2 delete of a missing key is a
+ * no-op, so a retry after a partial storage pass is safe.
  */
-export async function deleteIssueCascade(d1: D1Database, issue: IssueRow): Promise<void> {
+export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue: IssueRow): Promise<void> {
+  const attachmentKeys = (
+    await drizzle(d1)
+      .select({ r2Key: issueAttachments.r2Key })
+      .from(issueAttachments)
+      .where(eq(issueAttachments.issueId, issue.id))
+      .all()
+  ).map((row) => row.r2Key);
+  for (const key of attachmentKeys) {
+    if (key !== null) await bucket.delete(key);
+  }
+
   const statements: [BatchStatement, ...BatchStatement[]] = [
     drizzle(d1).delete(comments).where(eq(comments.issueId, issue.id)),
     drizzle(d1).delete(comments).where(eq(comments.refIssueId, issue.id)),
     drizzle(d1).delete(comments).where(eq(comments.dependentIssueId, issue.id)),
     drizzle(d1).delete(issueLabels).where(eq(issueLabels.issueId, issue.id)),
+    // Tier-2 children — the upstream DeleteBeans sweep (issue.go:234–252).
+    drizzle(d1).delete(issueContentHistory).where(eq(issueContentHistory.issueId, issue.id)),
+    drizzle(d1).delete(issueAssignees).where(eq(issueAssignees.issueId, issue.id)),
+    drizzle(d1).delete(issueDependencies).where(eq(issueDependencies.issueId, issue.id)),
+    drizzle(d1).delete(issueDependencies).where(eq(issueDependencies.dependencyId, issue.id)),
+    drizzle(d1).delete(notificationStates).where(eq(notificationStates.issueId, issue.id)),
+    drizzle(d1).delete(issueStopwatches).where(eq(issueStopwatches.issueId, issue.id)),
+    drizzle(d1).delete(trackedTimes).where(eq(trackedTimes.issueId, issue.id)),
+    drizzle(d1).delete(issueAttachments).where(eq(issueAttachments.issueId, issue.id)),
     drizzle(d1).delete(reactions).where(eq(reactions.issueId, issue.id)),
     drizzle(d1).delete(issueSubscriptions).where(eq(issueSubscriptions.issueId, issue.id)),
     drizzle(d1).delete(issuePins).where(eq(issuePins.issueId, issue.id)),

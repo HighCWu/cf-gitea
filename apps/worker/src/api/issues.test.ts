@@ -5,7 +5,9 @@
  * id id spaces, the 204-on-system-comment GET, the labels verb semantics
  * (POST=add / PUT=replace / DELETE=clear), the mixed-type timeline stream,
  * the RFC3339 since/before 422s, the CAS 409 on stale content_version, the
- * §4.12 delete cascade (index never reused), and the webhook triggers
+ * §4.12 delete cascade (index never reused; the tier-2 child sweep —
+ * assignees/dependencies/stopwatches/tracked times/attachments+R2/content
+ * history/notification states), and the webhook triggers
  * (issues opened/edited/closed/reopened + issue_comment created via
  * emitWebhookDeliveries — rows land inline, the Queue enqueue is the
  * executionCtx-guarded no-op under app.request).
@@ -17,7 +19,26 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { comments, issues, labels, milestones, repoCollaborators, repoCounters, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import {
+  comments,
+  issueAssignees,
+  issueAttachments,
+  issueContentHistory,
+  issueDependencies,
+  issueStopwatches,
+  issues,
+  labels,
+  milestones,
+  notificationStates,
+  repoCollaborators,
+  repoCounters,
+  repositories,
+  trackedTimes,
+  userBlocking,
+  users,
+  webhookDeliveries,
+  webhooks,
+} from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { STUB_USER } from "./auth";
@@ -38,6 +59,14 @@ beforeEach(async () => {
     "reactions",
     "issue_subscriptions",
     "issue_pins",
+    // The §4.12 tier-2 children (the delete-cascade arm seeds every shape).
+    "issue_assignees",
+    "issue_dependency",
+    "tracked_time",
+    "stopwatch",
+    "issue_attachments",
+    "issue_content_history",
+    "notification_states",
     "pull_requests",
     "comments",
     "issue_labels",
@@ -751,6 +780,102 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index} (issueDelete)", () => {
     expect(next.index).toBe(second.index + 1);
     const counters = await db().select().from(repoCounters).all();
     expect(counters[0]?.issueIndex).toBe(3);
+  });
+
+  it("sweeps every tier-2 child with the issue: assignees, dependencies (both directions), stopwatch, tracked times, attachments (+ R2 objects), content history, notification states", async () => {
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("Bob");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const doomed = await seedIssue(repoId, "doomed", { posterId: owner.id, content: "original body" });
+    const survivor = await seedIssue(repoId, "survivor", { posterId: owner.id });
+    const keeper = await seedIssue(repoId, "keeper", { posterId: owner.id });
+    const otherRepoId = await seedRepo(owner.usernameLower, "other");
+    const foreign = await seedIssue(otherRepoId, "foreign", { posterId: owner.id });
+    const now = new Date("2026-02-03T04:05:06Z");
+
+    // Every child shape on `doomed` (upstream DeleteBeans,
+    // services/issue/issue.go:234-252), plus same-shape controls on the
+    // survivor issues — including a cross-repo dependency INTO `doomed` —
+    // that the sweep must leave alone.
+    await db().insert(issueAssignees).values([
+      { issueId: doomed.id, assigneeId: neighbor.id },
+      { issueId: survivor.id, assigneeId: neighbor.id }, // control
+    ]);
+    await db().insert(issueDependencies).values([
+      { userId: owner.id, issueId: doomed.id, dependencyId: survivor.id, createdAt: now }, // doomed is blocked by survivor
+      { userId: owner.id, issueId: foreign.id, dependencyId: doomed.id, createdAt: now }, // foreign is blocked by doomed (reverse direction)
+      { userId: owner.id, issueId: survivor.id, dependencyId: keeper.id, createdAt: now }, // control
+    ]);
+    await db().insert(issueStopwatches).values([
+      { issueId: doomed.id, userId: owner.id, createdAt: now },
+      { issueId: survivor.id, userId: owner.id, createdAt: now }, // control
+    ]);
+    await db().insert(trackedTimes).values([
+      { issueId: doomed.id, userId: owner.id, seconds: 90, createdAt: now },
+      { issueId: survivor.id, userId: owner.id, seconds: 60, createdAt: now }, // control
+    ]);
+    await db().insert(issueContentHistory).values([
+      { posterId: owner.id, issueId: doomed.id, commentId: 0, editedAt: now, contentText: "original body", isFirstCreated: true },
+      { posterId: owner.id, issueId: survivor.id, commentId: 0, editedAt: now, contentText: "kept body", isFirstCreated: true }, // control
+    ]);
+    await db().insert(notificationStates).values([
+      { userId: owner.id, issueId: doomed.id, readAtUnix: 42, pinned: true, updatedAt: now },
+      { userId: owner.id, issueId: survivor.id, readAtUnix: 42, pinned: true, updatedAt: now }, // control
+    ]);
+    // Attachments: one completed (row + R2 object), one row-first-pending
+    // (r2_key still NULL — the relay upload never completed) on the doomed
+    // issue; a completed control on the survivor.
+    const [doomedAsset] = await db()
+      .insert(issueAttachments)
+      .values({ uuid: "u-doomed", issueId: doomed.id, commentId: 0, uploaderId: owner.id, name: "doomed.txt", size: 5, createdAt: now })
+      .returning()
+      .all();
+    if (doomedAsset === undefined) throw new Error("attachment seed failed");
+    const doomedKey = `repos/r_${repoId}/attachments/${doomedAsset.id}/doomed.txt`;
+    await env.REPO_PACKS.put(doomedKey, "bytes");
+    await db().update(issueAttachments).set({ r2Key: doomedKey }).where(eq(issueAttachments.id, doomedAsset.id));
+    const [pendingAsset] = await db()
+      .insert(issueAttachments)
+      .values({ uuid: "u-pending", issueId: doomed.id, commentId: 0, uploaderId: owner.id, name: "pending.txt", createdAt: now })
+      .returning()
+      .all();
+    if (pendingAsset === undefined) throw new Error("attachment seed failed");
+    const [keptAsset] = await db()
+      .insert(issueAttachments)
+      .values({ uuid: "u-kept", issueId: survivor.id, commentId: 0, uploaderId: owner.id, name: "kept.txt", createdAt: now })
+      .returning()
+      .all();
+    if (keptAsset === undefined) throw new Error("attachment seed failed");
+    const keptKey = `repos/r_${repoId}/attachments/${keptAsset.id}/kept.txt`;
+    await env.REPO_PACKS.put(keptKey, "kept-bytes");
+    await db().update(issueAttachments).set({ r2Key: keptKey }).where(eq(issueAttachments.id, keptAsset.id));
+
+    const res = await router()(`/repos/alice/visible/issues/${doomed.index}`, { method: "DELETE", headers: authHeaders });
+    expect(res.status).toBe(204);
+
+    // D1 read-backs: every doomed-child row is gone; every control row (and
+    // the cross-repo dependency edge INTO doomed is checked from BOTH sides).
+    expect(await db().select().from(issueAssignees).where(eq(issueAssignees.issueId, doomed.id)).all()).toHaveLength(0);
+    expect(await db().select().from(issueAssignees).where(eq(issueAssignees.issueId, survivor.id)).all()).toHaveLength(1);
+    expect(await db().select().from(issueDependencies).where(eq(issueDependencies.issueId, doomed.id)).all()).toHaveLength(0);
+    expect(await db().select().from(issueDependencies).where(eq(issueDependencies.dependencyId, doomed.id)).all()).toHaveLength(0);
+    expect(await db().select().from(issueDependencies).where(eq(issueDependencies.issueId, survivor.id)).all()).toHaveLength(1);
+    expect(await db().select().from(issueStopwatches).where(eq(issueStopwatches.issueId, doomed.id)).all()).toHaveLength(0);
+    expect(await db().select().from(issueStopwatches).where(eq(issueStopwatches.issueId, survivor.id)).all()).toHaveLength(1);
+    expect(await db().select().from(trackedTimes).where(eq(trackedTimes.issueId, doomed.id)).all()).toHaveLength(0);
+    expect(await db().select().from(trackedTimes).where(eq(trackedTimes.issueId, survivor.id)).all()).toHaveLength(1);
+    expect(await db().select().from(issueContentHistory).where(eq(issueContentHistory.issueId, doomed.id)).all()).toHaveLength(0);
+    expect(await db().select().from(issueContentHistory).where(eq(issueContentHistory.issueId, survivor.id)).all()).toHaveLength(1);
+    expect(await db().select().from(notificationStates).where(eq(notificationStates.issueId, doomed.id)).all()).toHaveLength(0);
+    expect(await db().select().from(notificationStates).where(eq(notificationStates.issueId, survivor.id)).all()).toHaveLength(1);
+    expect(await db().select().from(issueAttachments).where(eq(issueAttachments.issueId, doomed.id)).all()).toHaveLength(0);
+    expect(await db().select().from(issueAttachments).where(eq(issueAttachments.issueId, survivor.id)).all()).toHaveLength(1);
+
+    // R2 read-backs: the completed doomed object is gone; the survivor's
+    // object stays (the pending row had no object to delete).
+    expect(await env.REPO_PACKS.head(doomedKey)).toBeNull();
+    expect((await env.REPO_PACKS.head(keptKey))?.size).toBe("kept-bytes".length);
+    expect(await db().select().from(issues).where(eq(issues.id, survivor.id)).all()).toHaveLength(1);
   });
 
   it("404s missing issues and 423s archived repos", async () => {
