@@ -181,17 +181,54 @@ const BINARM_COMMITS: SeedCommit[] = [
   },
 ];
 
+/** The wave-129 batch-13 EDIT arm — tips[4]+tips[5] atop the linear history
+ *  (tips[0..3] stay byte-identical, so every existing oid holds): tips[4]
+ *  grows f1.txt from the one-line seed to nine lines, tips[5] then flips its
+ *  FIRST and LAST lines while the middle seven stay put. tips[5]'s parent
+ *  diff is the op stream del,add, eq×7, del,add — the two change clusters sit
+ *  8 ops apart, past toHunks' 2×context(3) merge rule (git/diff.ts:105), so
+ *  the commit page renders TWO hunks with real eq context — the shape the
+ *  unified numbering grammar needs (left counts eq+del, right counts eq+add).
+ *  (Two commits because the grammar needs a MODIFIED file with shared middle
+ *  lines: the PR range page's merge-base diff against the one-line seed has
+ *  none — it collapses to the single del+add hunk wave 5's family owns.) */
+const EDITARM_COMMITS: SeedCommit[] = [
+  ...W111_COMMITS,
+  {
+    message: "w111: grow f1 to nine lines",
+    time: T0 + 360,
+    files: [
+      { path: "f0.txt", content: "w111 root\n" },
+      { path: "f1.txt", content: "one-1\none-2\none-3\none-4\none-5\none-6\none-7\none-8\none-9\n" },
+      { path: "f2.txt", content: "w111 two\n" },
+      { path: "f3.txt", content: "w111 three\n" },
+    ],
+  },
+  {
+    message: "w111: edit f1 both ends",
+    time: T0 + 420,
+    files: [
+      { path: "f0.txt", content: "w111 root\n" },
+      { path: "f1.txt", content: "edit-1\none-2\none-3\none-4\none-5\none-6\none-7\none-8\nedit-9\n" },
+      { path: "f2.txt", content: "w111 two\n" },
+      { path: "f3.txt", content: "w111 three\n" },
+    ],
+  },
+];
+
 interface World {
-  /** tips[0], tips[MAIN_TIP], tips[MID], tips[TOPIC_TIP] (BINARM's tips[4]). */
+  /** tips[0], tips[MAIN_TIP], tips[MID], tips[TOPIC_TIP] (BINARM's tips[4],
+   *  EDITARM's tips[5] — distinct commits over the shared prefix). */
   root: string;
   mainTip: string;
   mid: string;
   topicTip: string;
   lonelyTip: string;
   binTip: string;
+  editTip: string;
   /** The per-repo index allocation (one shared issue/PR sequence), captured
    *  at creation — never hardcoded. */
-  pull: { topic: number; merged: number; closed: number; lonely: number; plainIssue: number; binarm: number };
+  pull: { topic: number; merged: number; closed: number; lonely: number; plainIssue: number; binarm: number; editarm: number };
   priv: number;
 }
 
@@ -270,7 +307,7 @@ async function seedPulls(ownerId: number): Promise<{ pull: World["pull"]; priv: 
 
   const pullId = await repoIdOf("w111pull");
   const fresh = (await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, pullId)).limit(1).get()) === undefined;
-  const pull: World["pull"] = { topic: 0, merged: 0, closed: 0, lonely: 0, plainIssue: 0, binarm: 0 };
+  const pull: World["pull"] = { topic: 0, merged: 0, closed: 0, lonely: 0, plainIssue: 0, binarm: 0, editarm: 0 };
   if (fresh) {
     const topic = await svc.createPullRequest({
       repoId: pullId,
@@ -346,6 +383,25 @@ async function seedPulls(ownerId: number): Promise<{ pull: World["pull"]; priv: 
       now,
     });
     pull.binarm = binarm.issue.index;
+
+    // The wave-129 batch-13 edit pull: head at the EDITARM tip
+    // (refs/heads/editarm — pushed below), base main; its diff is the
+    // single modified f1.txt (two hunks).
+    const editarm = await svc.createPullRequest({
+      repoId: pullId,
+      title: "w111: the edit pull",
+      content: "Edits both ends of f1.txt.",
+      posterId: ownerId,
+      headRepoId: pullId,
+      baseBranch: "main",
+      headBranch: "editarm",
+      now,
+    });
+    pull.editarm = editarm.issue.index;
+    await db
+      .update(pullRequests)
+      .set({ status: PRStatus.Mergeable })
+      .where(eq(pullRequests.id, editarm.pullRequest.id));
   } else {
     // Re-run against a seeded world: re-read the allocated indexes by title.
     const rows = await db.select({ index: issues.index, title: issues.title }).from(issues).where(eq(issues.repoId, pullId)).all();
@@ -361,6 +417,7 @@ async function seedPulls(ownerId: number): Promise<{ pull: World["pull"]; priv: 
     pull.lonely = idx("w111: the lonely pull");
     pull.plainIssue = idx("w111: the plain issue");
     pull.binarm = idx("w111: the rename+binary pull");
+    pull.editarm = idx("w111: the edit pull");
   }
 
   const privId = await repoIdOf("w111priv");
@@ -475,6 +532,22 @@ async function ensureFixtures(): Promise<void> {
     );
   }
 
+  // The wave-129 batch-13 edit world: the EDITARM pack's tips[0..3] are
+  // byte-identical to the linear pack's (the shared history), tips[5] is the
+  // f1.txt edit commit — the editarm PR's branch and head ref.
+  const editarmPack = await buildHistoryPack(EDITARM_COMMITS);
+  if (!pullRefs.refs.some((ref) => ref.name === "refs/heads/editarm")) {
+    await pushRefs(
+      `${OWNER}/w111pull`,
+      [
+        { ref: "refs/heads/editarm", oid: editarmPack.tips[5] as string },
+        { ref: `refs/pull/${seeded.pull.editarm}/head`, oid: editarmPack.tips[5] as string },
+      ],
+      editarmPack.pack,
+      token,
+    );
+  }
+
   world = {
     root: tips[0] as string,
     mainTip: tips[MAIN_TIP] as string,
@@ -482,6 +555,7 @@ async function ensureFixtures(): Promise<void> {
     topicTip: tips[TOPIC_TIP] as string,
     lonelyTip: lonely.tips[0] as string,
     binTip: binarm.tips[4] as string,
+    editTip: editarmPack.tips[5] as string,
     pull: seeded.pull,
     priv: seeded.priv,
   };
@@ -788,5 +862,160 @@ describe("w111 rename+binary arms (the range and single-commit pages over the BI
     expect(html).toContain("Binary file not shown.");
     // The removed/added text files still render unified rows.
     expect(html).toContain('class="chroma"');
+  });
+});
+
+// --- w129 batch-13 additions (wave-polish-matrix-13): the unified diff's -------
+// render edges. The suites above exercise the ROUTE arms over add/delete-only
+// diffs (every seeded change creates or removes whole files), so the
+// hunk-header grammar and the unified line-number grammar stayed unpinned:
+// wave 5 pins only the created-file R-side anchors (pages-wave5.test.ts:556-
+// 565), the batch-9 rename+binary world pins the box/degraded halves. The
+// EDITARM pull gives the grammar its first route-level proof: its HEAD
+// commit edits the EXISTING nine-line f1.txt at both ends (del,add, eq×7,
+// del,add — two hunks with real eq context), so the SINGLE-COMMIT page (the
+// parent diff tips[4]→tips[5]; the /files range page's merge-base diff has no
+// shared lines and collapses to the single del+add hunk wave 5's family owns)
+// carries the hunk-header and line-number grammar. Plus the documented reductions:
+// the ?style=split / whitespace query family is not honored (the header's
+// documented reduction), the static page renders no collapse/expander chrome
+// (the blob_excerpt fragment owns expansion — pages-wave46), and no
+// intra-line word-diff emphasis (the header's documented degrade: the plain
+// text shape, no highlighting spans).
+
+/** HashFilePathForWebUI (modules/git/utils.go:42-46) — sha1 hex of the path,
+ *  the diff-{hash}L/R{n} anchor namespace (the wave-46 helper's shape). */
+async function pathHash(path: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(path));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+describe("w129-13 hunk grammar (the modified file's @@ headers and the unified numbering)", () => {
+  // The single-commit page's parent diff (tips[3]→tips[4]) — one f1.txt box,
+  // two hunks: exactly the modified-file anatomy the grammar needs.
+  const editPage = () => `/${OWNER}/w111pull/pulls/${w().pull.editarm}/commits/${w().editTip}`;
+
+  it("renders the two hunks' @@ header grammar with the upstream cell DOM (tag-code + blob-hunk)", async () => {
+    // Provenance: wave-polish-matrix-13. The op stream (del,add, eq×7,
+    // del,add) splits past toHunks' merge rule (git/diff.ts:105's
+    // `i - end <= context * 2` with context 3): hunk 1 covers ops 0..4 →
+    // aStart 1, aLen del+3eq = 4, bStart 1, bLen add+3eq = 4; hunk 2 covers
+    // ops 6..10 → aStart 6, bStart 6, both len 4. The header text is the
+    // loader's `@@ -a,aLen +b,bLen @@` shape (pull-files.tsx hunkView) in the
+    // section_unified.tmpl:15-21 cell.
+    const res = await get(editPage());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<tr class="tag-code" data-line-type="tag">');
+    expect(html).toContain('<code class="code-inner">@@ -1,4 +1,4 @@</code>');
+    expect(html).toContain('<code class="code-inner">@@ -6,4 +6,4 @@</code>');
+  });
+
+  it("numbers the rows the unified way: left counts eq+del, right counts eq+add, and the count continues ACROSS hunks", async () => {
+    // Provenance: wave-polish-matrix-13. The numbering grammar (pull-files
+    // .tsx hunkView: `left` advances on eq+del, `right` on eq+add, the blank
+    // half carrying the falsy "" attribute like the template's branch) was
+    // never pinned past wave 5's created-file R1 anchor. The exact cells:
+    // hunk 1's del row (left 1, right ""), its add row (left "", right 1),
+    // then hunk 2's first eq row (6, 6) — the continuation proves the
+    // counters did NOT restart per hunk.
+    const hash = await pathHash("f1.txt");
+    const res = await get(editPage());
+    const html = await res.text();
+    // hunk 1: the del row — left 1, the right half blank, rel="" like the
+    // template's falsy branches.
+    expect(html).toContain(
+      `<td class="lines-num lines-num-old" data-line-num="1"><span rel="diff-${hash}L1"></span></td>` +
+        `<td class="lines-num lines-num-new" data-line-num=""><span rel=""></span></td>`,
+    );
+    // hunk 1: the add row — the mirror image.
+    expect(html).toContain(
+      `<td class="lines-num lines-num-old" data-line-num=""><span rel=""></span></td>` +
+        `<td class="lines-num lines-num-new" data-line-num="1"><span rel="diff-${hash}R1"></span></td>`,
+    );
+    // hunk 2: its FIRST row (the eq context after the gap) continues the
+    // count at 6/6 — the cross-hunk continuity.
+    expect(html).toContain(
+      `<td class="lines-num lines-num-old" data-line-num="6"><span rel="diff-${hash}L6"></span></td>` +
+        `<td class="lines-num lines-num-new" data-line-num="6"><span rel="diff-${hash}R6"></span></td>`,
+    );
+    // hunk 2's tail: del at left 9 (right blank), add at right 9.
+    expect(html).toContain(
+      `<td class="lines-num lines-num-old" data-line-num="9"><span rel="diff-${hash}L9"></span></td>` +
+        `<td class="lines-num lines-num-new" data-line-num=""><span rel=""></span></td>`,
+    );
+    expect(html).toContain(
+      `<td class="lines-num lines-num-old" data-line-num=""><span rel=""></span></td>` +
+        `<td class="lines-num lines-num-new" data-line-num="9"><span rel="diff-${hash}R9"></span></td>`,
+    );
+  });
+
+  it("marks the del half rows lines-code-old and renders every line as one plain code-inner (no intra-line emphasis spans)", async () => {
+    // Provenance: wave-polish-matrix-13. section_unified.tmpl's lines-code
+    // arm carries `lines-code-old` on the old-half rows (the module's
+    // `row.right === null` branch) — unpinned; and the header's documented
+    // degrade holds: the content renders as the single plain text node (the
+    // exact-equality matches leave no room for word-diff/highlight spans).
+    const res = await get(editPage());
+    const html = await res.text();
+    // The del half's code cell carries the old-half class; the add half's
+    // does not (right is set).
+    expect(html).toContain(
+      `<td class="chroma lines-code lines-code-old"><code class="code-inner">one-1</code></td>`,
+    );
+    expect(html).toContain(
+      `<td class="chroma lines-code lines-code-old"><code class="code-inner">one-9</code></td>`,
+    );
+    expect(html).toContain(`<td class="chroma lines-code"><code class="code-inner">edit-1</code></td>`);
+    // The eq rows render their shared content once.
+    expect(html).toContain(`<td class="chroma lines-code"><code class="code-inner">one-2</code></td>`);
+    // No emphasis vocabulary anywhere on the page.
+    expect(html).not.toContain("diff-word-");
+    expect(html).not.toContain("added-code");
+    expect(html).not.toContain("deleted-code");
+  });
+
+  it("the query family (?style=split, ?whitespace=...) renders the identical unified shape — the dropdowns' reduction", async () => {
+    // Provenance: wave-polish-matrix-13. The header documents the reduction
+    // (pull-files.tsx: "the whitespace query family are not honored ... the
+    // unified view is the only shape") — unpinned until now: the SPLIT query
+    // must not produce a split table, and the whitespace values must not
+    // change the row content.
+    const base = editPage();
+    const plain = await (await get(base)).text();
+    const split = await (await get(`${base}?style=split`)).text();
+    const ws = await (await get(`${base}?style=unified&whitespace=ignore-change&skip-to=1`)).text();
+    for (const variant of [split, ws]) {
+      expect(variant).toContain('class="file-body file-code unicode-escaped code-diff code-diff-unified"');
+      expect(variant).not.toContain("code-diff-split");
+      expect(variant).toContain('<code class="code-inner">@@ -1,4 +1,4 @@</code>');
+      expect(variant).toContain('<code class="code-inner">@@ -6,4 +6,4 @@</code>');
+      expect(variant).toContain('<code class="code-inner">one-2</code>');
+    }
+    expect(plain).toContain("code-diff-unified");
+  });
+
+  it("the static page renders no collapse/expander chrome — the blob_excerpt fragment owns expansion", async () => {
+    // Provenance: wave-polish-matrix-13. The file-collapse interaction is
+    // the JS island upstream folds through; the landed page renders every
+    // hunk's rows expanded (the unified table fully materialized) and the
+    // expander vocabulary exists only on the blob_excerpt fragment
+    // (pages-wave46-fragment-mounts pins the fragment side).
+    const res = await get(editPage());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain("code-expander-button");
+    expect(html).not.toContain("code-expander-buttons");
+    expect(html).not.toContain("line-expanded");
+    // All of the modified file's rendered lines are materialized: the two
+    // changed ends plus the context rows each hunk carries (hunk 1's window
+    // is ops 0..4 → one-1/edit-1/one-2/one-3/one-4, hunk 2's is ops 6..10 →
+    // one-6/one-7/one-8/one-9/edit-9; the gap line one-5 sits outside BOTH
+    // windows and renders nowhere — upstream's 3-line context shape).
+    for (const line of ["edit-1", "one-2", "one-3", "one-4", "one-6", "one-7", "one-8", "edit-9"]) {
+      expect(html).toContain(`<code class="code-inner">${line}</code>`);
+    }
+    expect(html).not.toContain('<code class="code-inner">one-5</code>');
+    expect(html).not.toContain('<code class="code-inner">w111 one</code>');
   });
 });

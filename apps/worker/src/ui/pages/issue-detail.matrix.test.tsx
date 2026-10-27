@@ -123,7 +123,7 @@ import {
   repositories,
   users,
 } from "../../db/schema";
-import { CommentType } from "../../issues/comment-types";
+import { CommentType, type CommentTypeValue } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
 import { uiRouter } from "../index";
@@ -938,3 +938,209 @@ async function dbIssueId(index: number): Promise<number> {
   if (row === undefined) throw new Error(`issue #${index} not seeded`);
   return row.id;
 }
+
+// --- w129 batch-13 additions (wave-polish-matrix-13): the timeline's event arms ------
+// The loader renders exactly four comment types as timeline entries (Comment
+// 0, Reopen 1, Close 2, MergePull 28 — loadIssueDetailData's filter); every
+// other system-event row "stays unrendered" (the module header's documented
+// posture, upstream comments.tmpl's unported arms). The suites above never
+// SEED any of those rows, so the unrendered arms had no proof, and the
+// reopened-PULL verb variant (`repo.pulls.reopened_at` — wave 3 pinned
+// "reopened this issue" and "closed this pull request" only) plus the merge
+// event's time-anchor anatomy rode unpinned. The arms below seed the rows
+// directly (the addComment posture the merge event uses) and pin the render.
+
+interface TimelineEventRows {
+  lock: number;
+  unlock: number;
+  issueRef: number;
+  commitRef: number;
+  commentRef: number;
+  pullRef: number;
+  /** The reopen row ON THE WIP PR — the `reopened_pull` verb arm. */
+  reopenPull: number;
+  /** The PR-side review-event rows (22/27/32) — the review events render
+   *  through the wave-11 SIDEBAR, never the timeline. */
+  review: number;
+  reviewRequest: number;
+  dismissReview: number;
+}
+
+let timelineEventRows: TimelineEventRows | null = null;
+
+/** Seed (once, per-type existence-checked so reruns converge) the unrendered
+ *  system-event rows on the closed issue and the reopen row on the WIP PR. */
+async function ensureTimelineEventRows(): Promise<TimelineEventRows> {
+  if (timelineEventRows !== null) return timelineEventRows;
+  const fixture = await ensureIssueDetailFixtures();
+  const db = drizzle(env.DB);
+  const svc = new IssuesService(env.DB);
+  const closedId = await dbIssueId(fixture.closedIssueIndex);
+  const wipId = await dbIssueId(fixture.wipPrIndex);
+  const owner = await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, OWNER_NAME)).get();
+  if (owner === undefined) throw new Error("timeline-event seed: owner row missing");
+  const plan: Array<{
+    key: keyof TimelineEventRows;
+    issueId: number;
+    type: CommentTypeValue;
+    /** Upstream CrossReference rows carry the base64 references payload
+     *  (models/issues/comments.go) — the render never reads it; kept
+     *  realistic anyway. */
+    content: string;
+    offset: number;
+  }> = [
+    { key: "lock", issueId: closedId, type: CommentType.Lock, content: "", offset: 120 },
+    { key: "unlock", issueId: closedId, type: CommentType.Unlock, content: "", offset: 130 },
+    { key: "issueRef", issueId: closedId, type: CommentType.IssueRef, content: "b64:eyJSZWYiOiIxIiwiQWN0aW9uIjoxfQ==", offset: 140 },
+    { key: "commitRef", issueId: closedId, type: CommentType.CommitRef, content: "b64: commit-ref payload", offset: 150 },
+    { key: "commentRef", issueId: closedId, type: CommentType.CommentRef, content: "b64: comment-ref payload", offset: 160 },
+    { key: "pullRef", issueId: closedId, type: CommentType.PullRef, content: "b64: pull-ref payload", offset: 170 },
+    { key: "reopenPull", issueId: wipId, type: CommentType.Reopen, content: "", offset: 180 },
+    { key: "review", issueId: wipId, type: CommentType.Review, content: "review body", offset: 190 },
+    { key: "reviewRequest", issueId: wipId, type: CommentType.ReviewRequest, content: "b64: reviewer payload", offset: 200 },
+    { key: "dismissReview", issueId: wipId, type: CommentType.DismissReview, content: "b64: dismissal payload", offset: 210 },
+  ];
+  const rows = {} as TimelineEventRows;
+  for (const entry of plan) {
+    const existing = await db
+      .select({ id: comments.id })
+      .from(comments)
+      .where(and(eq(comments.issueId, entry.issueId), eq(comments.type, entry.type)))
+      .get();
+    if (existing !== undefined) {
+      rows[entry.key] = existing.id;
+      continue;
+    }
+    const created = await svc.addComment({
+      issueId: entry.issueId,
+      posterId: owner.id,
+      content: entry.content,
+      type: entry.type,
+      now: t(entry.offset),
+    });
+    rows[entry.key] = created.id;
+  }
+  timelineEventRows = rows;
+  return rows;
+}
+
+describe("the timeline's unrendered system-event arms (w129 batch-13)", () => {
+  it("lock/unlock rows stay off the timeline (the unrendered reduction) while numComments still folds them into the meta count", async () => {
+    // Provenance: wave-polish-matrix-13. loadIssueDetailData renders types
+    // 0/1/2/28 only (the module header: "Every other system-event type stays
+    // unrendered this wave"); no earlier suite SEEDS a Lock/Unlock row, so
+    // the omission was unproven. The fold half pins the wave-3 note
+    // ("numComments folds every system comment in") at the meta line: the
+    // closed issue holds the close event (1) + lock + unlock + four refs = 7.
+    const fixture = await ensureIssueDetailFixtures();
+    const events = await ensureTimelineEventRows();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    for (const id of [events.lock, events.unlock]) {
+      expect(html).not.toContain(`id="event-${id}"`); // neither the event div nor its anchor
+      expect(html).not.toContain(`id="issuecomment-${id}"`);
+    }
+    // The would-be verbs (upstream's repo.issues.lock/unlock list shapes)
+    // render nowhere on the page.
+    expect(html).not.toContain("locked this issue");
+    expect(html).not.toContain("unlocked this issue");
+    // The fold: 1 (the close event) + 2 (lock/unlock) + 4 (the refs) = 7.
+    expect(html).toContain("· 7 comments");
+  });
+
+  it("cross-referenced rows (issue/commit/comment/pull refs) render no timeline items either", async () => {
+    // Provenance: wave-polish-matrix-13. The four reference families
+    // (CommentType 3/4/5/6 — the §2.2 cross-reference arms) are the other
+    // landed-row-shape the suites never seed; the same unrendered posture
+    // applies, pinned by row id and by the absence of upstream's verb.
+    const fixture = await ensureIssueDetailFixtures();
+    const events = await ensureTimelineEventRows();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    for (const id of [events.issueRef, events.commitRef, events.commentRef, events.pullRef]) {
+      expect(html).not.toContain(`id="event-${id}"`);
+      expect(html).not.toContain(`id="issuecomment-${id}"`);
+    }
+    expect(html).not.toContain("referenced this issue");
+    expect(html).not.toContain("mentioned this issue");
+  });
+
+  it("a PR's reopen event renders the reopened-PULL verb variant with the green badge and the dot glyph (the twin wave 3 never pinned)", async () => {
+    // Provenance: wave-polish-matrix-13. Wave 3 pinned "reopened this
+    // issue" (the issues variant) and "closed this pull request"; the
+    // `reopened_pull` verb (`repo.pulls.reopened_at`) had no seeded row
+    // anywhere. TimelineEvent's isPull branch picks it, with the
+    // tw-bg-green badge and the octicon-dot-fill glyph (the reopen pair).
+    const fixture = await ensureIssueDetailFixtures();
+    const events = await ensureTimelineEventRows();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.wipPrIndex}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(
+      `reopened this pull request <a id="event-${events.reopenPull}" href="#event-${events.reopenPull}"`,
+    );
+    expect(html).toContain(`href="/${OWNER_NAME}">${OWNER_NAME}</a> reopened this pull request`);
+    expect(html).toContain('<div id="event-' + events.reopenPull + '" class="timeline-item event">');
+    expect(html).toContain('<span class="badge tw-bg-green tw-text-white">');
+    expect(html).toContain('class="svg octicon-dot-fill"');
+    // The issues-variant verb must NOT render on the pulls page.
+    expect(html).not.toContain("reopened this issue");
+  });
+
+  it("the review-event rows (review 22, review-request 27, dismiss 32) stay off the timeline — reviews render in the wave-11 sidebar instead", async () => {
+    // Provenance: wave-polish-matrix-13. The landed review WRITE paths
+    // (pages/pull-reviews.tsx) emit exactly these system comments (its
+    // header: the type-22 review, the type-27 request pair, the type-32
+    // dismissal) — but the timeline renders none of them: upstream's
+    // comments.tmpl review-event arms are unported, and the visible review
+    // anatomy lives in the Reviewers sidebar (wave 11's matrix). No suite
+    // had seeded the rows, so the omission was unproven; the same row-id
+    // proof as the lock/unlock and xref arms.
+    const fixture = await ensureIssueDetailFixtures();
+    const events = await ensureTimelineEventRows();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.wipPrIndex}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    for (const id of [events.review, events.reviewRequest, events.dismissReview]) {
+      expect(html).not.toContain(`id="event-${id}"`);
+      expect(html).not.toContain(`id="issuecomment-${id}"`);
+    }
+    // The would-be verbs (upstream's comments.tmpl review arms) render nowhere.
+    expect(html).not.toContain("requested review from");
+    expect(html).not.toContain("dismissed review");
+    // The sidebar's review anatomy is unaffected by the stray rows (it
+    // reads pull_reviews, not comments).
+    expect(html).toContain("Reviewers");
+  });
+
+  it("the merge event's line carries the upstream #event time anchor (the anatomy the purple-badge pin left open)", async () => {
+    // Provenance: wave-polish-matrix-13. The merged-PR arm above pins the
+    // badge, the short sha and the merger link; the event line's time
+    // anchor — comments.tmpl's `#event-{id}` + relative-time pair, the same
+    // shape wave 3 pinned for close/reopen — was unpinned for the merge arm.
+    const fixture = await ensureIssueDetailFixtures();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.mergedPrIndex}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const anchored = new RegExp(
+      `merged commit <b>${MERGE_SHA.slice(0, 10)}</b> into <b>main</b> ` +
+        `<a id="event-\\d+" href="#event-\\d+"><relative-time`,
+    );
+    expect(html).toMatch(anchored);
+    // The event card keeps the id'd div + the purple badge.
+    expect(html).toMatch(/<div id="event-\d+" class="timeline-item event"><span class="badge tw-bg-purple tw-text-white">/);
+  });
+
+  it("the pulls family's unknown-index miss 404-shells with the repo context kept (the wave-3 negative-path twin)", async () => {
+    // Provenance: wave-polish-matrix-13. Wave 3 pinned the 404 shell on the
+    // issues family only; the pulls family answers the same row-lookup-first
+    // shell (the loadIssueDetailData null arm — §4.5), never a redirect.
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/pulls/999`);
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain('<div class="status-page-error">');
+    expect(html).toContain("repo-header");
+  });
+});
