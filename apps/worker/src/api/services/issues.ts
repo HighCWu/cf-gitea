@@ -3,6 +3,7 @@ import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
 import {
   comments,
+  issueContentHistory,
   issueLabels,
   issuePins,
   issueSubscriptions,
@@ -774,19 +775,142 @@ export function commentHasContentSupport(type: number): boolean {
   return type === CommentType.Comment || type === CommentType.Code || type === CommentType.Review || type === CommentType.DismissReview;
 }
 
-/** PATCH comment: body + content_version bump + updated stamp. */
-export async function updateCommentBody(d1: D1Database, commentId: number, body: string, now: Date): Promise<CommentRow | null> {
+// ---------------------------------------------------------------------------
+// Issue content history write paths (specs/issue-content-history.md —
+// upstream models/issues/content_history.go SaveIssueContentHistory /
+// KeepLimitedContentHistory, consumed by the edit hooks above/below)
+// ---------------------------------------------------------------------------
+
+/** `HasIssueContentHistory` (content_history.go:174-180) — the lazy
+ *  back-fill gate. */
+async function hasIssueContentHistory(d1: D1Database, issueId: number, commentId: number): Promise<boolean> {
   const rows = await drizzle(d1)
+    .select({ id: issueContentHistory.id })
+    .from(issueContentHistory)
+    .where(and(eq(issueContentHistory.issueId, issueId), eq(issueContentHistory.commentId, commentId)))
+    .limit(1)
+    .all();
+  return rows.length > 0;
+}
+
+/** `SaveIssueContentHistory`'s INSERT arm — a batch statement, so a snapshot
+ *  commits or rolls back together with the edit that produced it. */
+function insertIssueContentHistory(
+  d1: D1Database,
+  issueId: number,
+  commentId: number,
+  revision: { posterId: number | null; editedAt: Date; contentText: string; isFirstCreated: boolean },
+) {
+  return drizzle(d1).insert(issueContentHistory).values({
+    issueId,
+    commentId,
+    posterId: revision.posterId,
+    editedAt: revision.editedAt,
+    contentText: revision.contentText,
+    isFirstCreated: revision.isFirstCreated,
+  });
+}
+
+/** The per-revision retention cap (upstream keeps at most 20). */
+export const ISSUE_CONTENT_HISTORY_LIMIT = 20;
+
+/**
+ * `KeepLimitedContentHistory` (content_history.go:56-106): keep at most
+ * `limit` revisions of (issueId, commentId), hard-deleting surplus MIDDLE
+ * revisions — the first and the last are never deleted, and each pass
+ * deletes the revision with the smallest interval to its predecessor
+ * (preserves the sparsest edit history). Errors here never fail the edit
+ * (upstream only logs).
+ */
+export async function keepLimitedIssueContentHistory(d1: D1Database, issueId: number, commentId: number): Promise<void> {
+  try {
+    const ordered = await drizzle(d1)
+      .select({ id: issueContentHistory.id, editedAt: issueContentHistory.editedAt })
+      .from(issueContentHistory)
+      .where(and(eq(issueContentHistory.issueId, issueId), eq(issueContentHistory.commentId, commentId)))
+      .orderBy(asc(issueContentHistory.editedAt))
+      .all();
+    if (ordered.length <= 2 || ordered.length <= ISSUE_CONTENT_HISTORY_LIMIT) return;
+
+    let outDatedCount = ordered.length - ISSUE_CONTENT_HISTORY_LIMIT;
+    const res = ordered.slice();
+    while (outDatedCount > 0) {
+      let indexToDelete = -1;
+      let minEditedInterval = -1;
+      for (let i = 1; i < res.length - 1; i++) {
+        const current = res[i];
+        const predecessor = res[i - 1];
+        if (current === undefined || predecessor === undefined) break;
+        const editedInterval = current.editedAt.getTime() - predecessor.editedAt.getTime();
+        if (minEditedInterval === -1 || editedInterval < minEditedInterval) {
+          minEditedInterval = editedInterval;
+          indexToDelete = i;
+        }
+      }
+      if (indexToDelete <= 0) break;
+      const doomed = res[indexToDelete];
+      if (doomed === undefined) break;
+      await drizzle(d1).delete(issueContentHistory).where(eq(issueContentHistory.id, doomed.id));
+      res.splice(indexToDelete, 1);
+      outDatedCount--;
+    }
+  } catch {
+    // upstream logs and continues (content_history.go:61 "we can ignore all
+    // errors in this function") — a missed retention pass is invisible.
+  }
+}
+
+/** PATCH comment: body + content_version bump + updated stamp, riding the
+ *  content-history write hook (specs/issue-content-history.md §3 — upstream
+ *  services/issue/comments.go UpdateComment). */
+export async function updateCommentBody(d1: D1Database, commentId: number, body: string, now: Date, actorId?: number | null): Promise<CommentRow | null> {
+  // The gate reads the PRIOR row (old content, poster, created stamp, type)
+  // — upstream's c.Content != oldContent && c.Type.HasContentSupport()
+  // (comments.go:112).
+  const priorRows = await drizzle(d1).select().from(comments).where(eq(comments.id, commentId)).limit(1).all();
+  const prior = priorRows[0];
+  if (prior === undefined) return null;
+  const needsHistory = prior.content !== body && commentHasContentSupport(prior.type);
+  const backfill = needsHistory && !(await hasIssueContentHistory(d1, prior.issueId, commentId))
+    ? { posterId: prior.posterId, editedAt: prior.createdAt ?? now, contentText: prior.content ?? "" }
+    : null;
+
+  const updateStatement = drizzle(d1)
     .update(comments)
     .set({ content: body, contentVersion: sql`content_version + 1`, updatedAt: now })
     .where(eq(comments.id, commentId))
     .returning();
-  return rows[0] ?? null;
+  const newRevision = { posterId: actorId ?? prior.posterId, editedAt: now, contentText: body };
+
+  if (backfill !== null) {
+    // The lazy first-revision back-fill rides the same batch as the update
+    // (upstream's tx; a failed update rolls the snapshot back with it).
+    const results = await drizzle(d1).batch([
+      insertIssueContentHistory(d1, prior.issueId, commentId, { ...backfill, isFirstCreated: true }),
+      updateStatement,
+      insertIssueContentHistory(d1, prior.issueId, commentId, { ...newRevision, isFirstCreated: false }),
+    ] as const);
+    await keepLimitedIssueContentHistory(d1, prior.issueId, commentId);
+    return results[1][0] ?? null;
+  }
+  if (!needsHistory) {
+    const rows = await updateStatement;
+    return rows[0] ?? null;
+  }
+  const results = await drizzle(d1).batch([
+    updateStatement,
+    insertIssueContentHistory(d1, prior.issueId, commentId, { ...newRevision, isFirstCreated: false }),
+  ] as const);
+  await keepLimitedIssueContentHistory(d1, prior.issueId, commentId);
+  return results[0][0] ?? null;
 }
 
 /**
  * DELETE comment (`issue_service.DeleteComment` reduced): unlink + the
- * num_comments decrement in one batch. False when the row is already gone.
+ * num_comments decrement + the content-history hard-delete in one batch
+ * (upstream models/issues/comment.go:1215-1219 deletes the comment's
+ * ContentHistory rows in the same tx — a comment's revisions never outlive
+ * it). False when the row is already gone.
  */
 export async function deleteComment(d1: D1Database, comment: CommentRow, now: Date): Promise<boolean> {
   const results = await drizzle(d1).batch([
@@ -795,6 +919,7 @@ export async function deleteComment(d1: D1Database, comment: CommentRow, now: Da
       .update(issues)
       .set({ numComments: sql`MAX(num_comments - 1, 0)`, updatedAt: now })
       .where(eq(issues.id, comment.issueId)),
+    drizzle(d1).delete(issueContentHistory).where(eq(issueContentHistory.commentId, comment.id)),
   ] as const);
   const removed = results[0] as Array<{ id: number }>;
   return removed.length > 0;
@@ -840,15 +965,41 @@ export async function changeIssueTitle(d1: D1Database, issue: IssueRow, title: s
 /**
  * `issue_service.ChangeContent` — body update with the optimistic
  * content_version CAS (WHERE content_version = expected): 0 rows ⇒ the
- * stale-version 409 (upstream ErrIssueAlreadyChanged).
+ * stale-version 409 (upstream ErrIssueAlreadyChanged) with NOTHING written.
+ * Rides the content-history write hook (specs/issue-content-history.md §3 —
+ * upstream models/issues/issue_update.go ChangeIssueContent): the lazy
+ * first-revision back-fill, the edited-revision snapshot, and the retention
+ * limiter. The CAS UPDATE runs FIRST because a D1 batch has no
+ * conditional-abort — history rows follow the successful update (upstream
+ * keeps all four statements in one tx; the crash-window divergence is SPEC
+ * §4). `actorId` attributes the edited revision (upstream doer.ID); omitted
+ * → the issue poster (§5.1 of the SPEC, route threading follow-up).
  */
-export async function changeIssueBody(d1: D1Database, issue: IssueRow, body: string, expectedVersion: number, now: Date): Promise<IssueRow | null> {
-  const rows = await drizzle(d1)
+export async function changeIssueBody(d1: D1Database, issue: IssueRow, body: string, expectedVersion: number, now: Date, actorId?: number | null): Promise<IssueRow | null> {
+  const updated = await drizzle(d1)
     .update(issues)
     .set({ content: body, contentVersion: sql`content_version + 1`, updatedAt: now })
     .where(and(eq(issues.id, issue.id), eq(issues.contentVersion, expectedVersion)))
     .returning();
-  return rows[0] ?? null;
+  const row = updated[0] ?? null;
+  if (row === null) return null;
+
+  const backfill = (await hasIssueContentHistory(d1, issue.id, 0))
+    ? null
+    : { posterId: issue.posterId, editedAt: issue.createdAt ?? now, contentText: issue.content ?? "" };
+  const newRevision = { posterId: actorId ?? issue.posterId, editedAt: now, contentText: body };
+  if (backfill !== null) {
+    // The lazy first-revision back-fill + the edited revision commit as one
+    // atomic batch (ordering by edited_unix puts the back-fill first).
+    await drizzle(d1).batch([
+      insertIssueContentHistory(d1, issue.id, 0, { ...backfill, isFirstCreated: true }),
+      insertIssueContentHistory(d1, issue.id, 0, { ...newRevision, isFirstCreated: false }),
+    ] as const);
+  } else {
+    await insertIssueContentHistory(d1, issue.id, 0, { ...newRevision, isFirstCreated: false });
+  }
+  await keepLimitedIssueContentHistory(d1, issue.id, 0);
+  return row;
 }
 
 /** `issue_service.ChangeIssueRef` — ref update + change_issue_ref (33) comment. */

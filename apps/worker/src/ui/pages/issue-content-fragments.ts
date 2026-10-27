@@ -69,41 +69,59 @@
  *   truthiness-checked). Upstream's map is
  *   `SELECT comment_id, COUNT(1) … GROUP BY comment_id HAVING count(1) > 1`
  *   over the `issue_content_history` snapshot table (models/issues/
- *   content_history.go:104-125) — a table cf-gitea DOES NOT have (no
- *   snapshot rows anywhere in the schema). What the landed store keeps is
- *   the edit COUNTER: `issues.content_version` / `comments.content_version`
- *   (0 = never edited, +1 per body edit — api/services/issues.ts:767-771,
- *   832-839), which reconstructs the map exactly for the only consumer
- *   semantics: upstream counts 1 first-created revision + N edits per key
- *   and drops keys with count ≤ 1, so counter N > 0 ⟺ upstream key present,
- *   and this port emits `N + 1` (the revision count) to keep the value
- *   semantics honest. Documented divergences: upstream's 20-revision
- *   retention limiter (KeepLimitedContentHistory, content_history.go:56-98)
- *   hard-deletes MIDDLE revisions so a heavily-edited thread's count can
- *   DECREASE below the true edit count (capped at 20) while our counter
- *   keeps the true count; upstream's soft-deleted revisions (is_deleted)
- *   still count (the query has no filter) and have no counter counterpart.
- *   The i18n block carries the four strings verbatim from the pin's
+ *   content_history.go:104-125) — and the snapshot table EXISTS since
+ *   specs/issue-content-history.md (the write-path hooks fill it from the
+ *   landed edit services), so the loader now runs the upstream query
+ *   verbatim. History: before the table landed the map was reconstructed
+ *   from the `content_version` edit counters (0 = never edited, +1 per
+ *   body edit), which matches the table exactly until the 20-revision
+ *   retention limiter saturates (upstream's count then DECREASES below the
+ *   true edit count; the counter reconstruction kept the true count) and
+ *   until soft-deleted revisions enter (they still count upstream — no
+ *   filter in the query); the switch trades those divergences away. The
+ *   i18n block carries the four strings verbatim from the pin's
  *   locale_en-US.json (`repo.issues.content_history.*` — edited /
  *   delete_from_history / delete_from_history_confirm / options); the
  *   locale.ts owner extends it there when the keys land in the shell map.
- * - CONTENT-HISTORY LIST — SKIPPED, ZERO SOURCE
- *   (issue_content_history.go:42-88 GetContentHistoryList): the dropdown
- *   needs per-revision rows (editor user row, edited_unix, is_first_created,
- *   is_deleted) to build the `avatar + userName + action + timeSince` name
- *   HTML. The landed store has no snapshot rows and no edit journal — only
- *   the counters above. No dead endpoint is mounted: the dispatcher leaves
- *   the `content-history/list` tail unclaimed (the official bundle's fetch
- *   404s; upstream renders the menu only when the overview map has the key,
- *   so with the overview answered from counters the menu would only render
- *   for edited bodies and then fail its list fetch — the documented
- *   unrendered arm until a history table lands, which needs the write-path
- *   SPEC first).
- * - CONTENT-HISTORY DETAIL — SKIPPED, ZERO SOURCE
- *   (issue_content_history.go:141-180 GetContentHistoryDetail): the
- *   diff-HTML payload (`diffContentHistory`, :107-138 — diffmatchpatch over
- *   the stored ContentText pair) needs two stored snapshots; there is
- *   nothing to diff. Same posture as list: no endpoint, documented.
+ * - CONTENT-HISTORY LIST — IMPLEMENTED (issue_content_history.go:42-88
+ *   GetContentHistoryList; specs/issue-content-history.md): the dropdown
+ *   payload `{"results": [{"name": <item HTML>, "value": <historyId>}…]}` —
+ *   one entry per revision of (issue, comment_id), `edited_unix DESC`
+ *   (FetchIssueContentHistoryList, content_history.go:149-171, LEFT JOIN
+ *   the poster user row). `name` is the pre-rendered
+ *   "avatar + <strong>userName</strong> + (fullName) + action + timeSince"
+ *   HTML (AvatarHTML 24px + `/user/avatar/{name}/0` fast link or the
+ *   default-avatar asset, the fullName segment only when non-empty, the
+ *   deleted/created/edited action arms with upstream's
+ *   `data-history-is-deleted` marker, and the `relative-time` stamp — all
+ *   rendered module-locally, the attachments-twin re-declaration
+ *   convention). An empty history marshals the nil slice as
+ *   `{"results": null}` (upstream's []map[string]any zero value; fomantic
+ *   treats it as no items).
+ * - CONTENT-HISTORY DETAIL — IMPLEMENTED (issue_content_history.go:141-180
+ *   GetContentHistoryDetail; specs/issue-content-history.md): the diff
+ *   payload `{"canSoftDelete": <bool>, "historyId": <n>, "prevHistoryId":
+ *   <n>, "diffHtml": <HTML>}`. `GetIssueContentHistoryAndPrev`
+ *   (content_history.go:221-246) resolves the revision
+ *   (`id AND issue_id` — a foreign id is the JSON 404
+ *   `{"message": "Can not find the content history"}`) plus the newest
+ *   non-deleted same-namespace revision strictly older by edited_unix;
+ *   `diffHtml` is the diffContentHistory renderer (:112-138) —
+ *   NormalizeStringEOL, diffmatchpatch DiffMain(checklines=false) +
+ *   DiffCleanupEfficiency, wrapped in `<pre class="chroma">` with
+ *   `<span class="gi">`/`<span class="gd">` around insertions/deletions,
+ *   every text run HTML-escaped (the HTMLBuilder's WriteString arm). The
+ *   dmp core (prefix/suffix trim, contains fast path, half-match, Myers
+ *   bisect, cleanup-merge) plus the efficiency cleanup are ported
+ *   module-locally; span boundaries may differ from go-diff in rare
+ *   equal-cost cases and oversized inputs (combined > 200k chars) degrade
+ *   to a single delete+insert — presentation-only divergences, SPEC §2.
+ *   `canSoftDelete` is canSoftDeleteContentHistory (:84-110) through the
+ *   landed `sessionRepoGrant` bridge (repo write) OR the poster-family arms
+ *   (issue poster / comment poster / revision poster, scope-checked). The
+ *   revision's comment row cannot be missing (the comment-delete hook
+ *   removes its history rows), but the upstream miss arm (log + EMPTY 200
+ *   body, :160-163) is mirrored as the `orphanedComment` outcome.
  *
  * ## The mount recipes (HANDOFF — this module is UNMOUNTED, index-owned)
  *
@@ -123,8 +141,17 @@
  *   `"issue-content-history-overview"`: resolve the issue, then
  *   `loadContentHistoryOverviewFragment(d1, issue)` +
  *   `contentHistoryOverviewFragmentResponse(data)`.
- * - `rest = [<index>, "content-history", "list"|"detail"]` → UNCLAIMED (the
- *   skipped arms — falls through to the 404 shell).
+ * - `rest = [<index>, "content-history", "list"|"detail"]` → HANDOFF (the
+ *   arms are EXPORTED but unmounted): extend the `IssueAuxRoute` family
+ *   union, claim the two tails beside the overview parse (the
+ *   `rest.length === 3` arm), and drive
+ *   `loadContentHistoryListFragment(d1, issue, commentId)` +
+ *   `contentHistoryListFragmentResponse(data)` (commentId = FormInt64 of
+ *   the `comment_id` query param, 0 on a missing/garbage value) and
+ *   `loadContentHistoryDetailFragment(env, repo, issue, viewer, commentId,
+ *   historyId)` + `contentHistoryDetailFragmentResponse(data)` (the
+ *   historyNotFound outcome IS the JSON 404 body — do not substitute the
+ *   HTML shell). The exact recipes are in specs/issue-content-history.md §6.
  * - `rest = [<index>, "attachments", <uuid>]` → the per-issue alias of the
  *   landed site-level serving seam; simplest parity mount is a 302 onto
  *   `/attachments/{uuid}` (the canonical `browser_download_url`), or the
@@ -136,7 +163,7 @@
  * above), repo assignment → the dispatcher's resolved `RepoRow`.
  */
 
-import { and, asc, eq, gt } from "drizzle-orm";
+import { and, asc, desc, eq, lt, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import type { Issue } from "../../api/models/issue";
@@ -145,12 +172,15 @@ import {
   issueLabelRows,
   toApiIssue,
 } from "../../api/services/issues";
+import { canWriteRepository } from "../../api/services/repo-access";
 import {
   findRepositoryById,
   type Viewer as ApiViewer,
 } from "../../api/services/repository";
-import { comments, issueAttachments } from "../../db/schema";
+import { comments, issueAttachments, issueContentHistory, users } from "../../db/schema";
 import type { IssueRow, LabelRow } from "../../issues/service";
+import { timeSinceParts } from "../page-data";
+import { sessionRepoGrant } from "../repo-grants";
 import type { RepoRow } from "../ui-context";
 import type { Viewer } from "../viewer";
 
@@ -438,24 +468,27 @@ export const CONTENT_HISTORY_I18N = {
 } as const;
 
 /**
- * The edited-count map, reconstructed from the landed edit counters (the
- * module doc carries the full parity analysis): key "0" = the issue body,
- * otherwise the comment id — present exactly when the counter is > 0
- * (upstream's HAVING count(1) > 1), valued at counter + 1 (upstream counts
- * the first-created revision beside the edits).
+ * The edited-count map — `QueryIssueContentHistoryEditedCountMap`
+ * (content_history.go:110-133) verbatim now that the snapshot table exists:
+ * `SELECT comment_id, COUNT(1) … WHERE issue_id = ? GROUP BY comment_id
+ * HAVING count(1) > 1`. Key "0" = the issue body, otherwise the comment id.
+ * The 20-revision retention limiter and the is_deleted counting behavior
+ * (soft-deleted revisions still count — no filter, like upstream) ride the
+ * same rows the list/detail arms read, so the three arms cannot disagree.
  */
 export async function loadContentHistoryOverviewFragment(
   d1: D1Database,
   issue: IssueRow,
 ): Promise<{ i18n: typeof CONTENT_HISTORY_I18N; editedHistoryCountMap: Record<string, number> }> {
-  const editedHistoryCountMap: Record<string, number> = {};
-  if (issue.contentVersion > 0) editedHistoryCountMap["0"] = issue.contentVersion + 1;
-  const editedComments = await drizzle(d1)
-    .select({ id: comments.id, contentVersion: comments.contentVersion })
-    .from(comments)
-    .where(and(eq(comments.issueId, issue.id), gt(comments.contentVersion, 0)))
+  const rows = await drizzle(d1)
+    .select({ commentId: issueContentHistory.commentId, historyCount: sql<number>`count(1)` })
+    .from(issueContentHistory)
+    .where(eq(issueContentHistory.issueId, issue.id))
+    .groupBy(issueContentHistory.commentId)
+    .having(sql`count(1) > 1`)
     .all();
-  for (const row of editedComments) editedHistoryCountMap[String(row.id)] = row.contentVersion + 1;
+  const editedHistoryCountMap: Record<string, number> = {};
+  for (const row of rows) editedHistoryCountMap[String(row.commentId)] = Number(row.historyCount);
   return { i18n: CONTENT_HISTORY_I18N, editedHistoryCountMap };
 }
 
@@ -475,4 +508,692 @@ export function contentHistoryOverviewFragmentResponse(data: {
  */
 export async function resolveFragmentIssue(d1: D1Database, repo: RepoRow, index: number): Promise<IssueRow | null> {
   return findIssueByRepoAndIndex(d1, repo.id, index);
+}
+
+// ---------------------------------------------------------------------------
+// Arm 4 — GET /{type}/{index}/content-history/list (issue_content_history.go:42-82)
+// ---------------------------------------------------------------------------
+
+/** `avatars.DefaultAvatarClass` (models/avatars/avatar.go:25) + the call
+ *  site's " tw-mr-2" (issue_content_history.go:71). */
+const AVATAR_CLASS = "ui avatar tw-align-middle tw-mr-2";
+
+/** `avatars.DefaultAvatarLink()` — AppSubURL "" at the pin. */
+const DEFAULT_AVATAR_LINK = "/assets/img/avatar_default.png";
+
+/** The list-side locale strings (locale_en-US.json
+ *  `repo.issues.content_history.{created,edited,deleted}` at the pin — the
+ *  overview i18n block's siblings; same locale.ts-owner caveat). */
+const CONTENT_HISTORY_ACTIONS = { created: "created", edited: "edited", deleted: "deleted" } as const;
+
+/** `templates.AvatarHTML` (modules/templates/util_avatar.go:31-36): the
+ *  empty alt keeps a failed image load from sizing to the alt text; an
+ *  empty name degrades to "avatar" (util.IfZero). */
+function avatarHtml(src: string, size: number, cssClass: string, name: string): string {
+  const sizeStr = String(size);
+  const title = name === "" ? "avatar" : name;
+  return (
+    `<img loading="lazy" alt class="${escapeHtml(cssClass)}" src="${escapeHtml(src)}"` +
+    ` title="${escapeHtml(title)}" width="${sizeStr}" height="${sizeStr}">`
+  );
+}
+
+/** `timeSinceTo` (modules/templates/util_date.go:106-125) at the server's
+ *  zone — Workers run UTC, so the friendly stamp is the "+0000" convention
+ *  (page-data.timeSinceParts). */
+function timeSinceHtml(editedAt: Date): string {
+  const parts = timeSinceParts(Math.floor(editedAt.getTime() / 1000), "+0000");
+  return (
+    `<relative-time prefix="" tense="${parts.tense}" datetime="${parts.datetime}"` +
+    ` data-tooltip-content data-tooltip-interactive="true">${escapeHtml(parts.text)}</relative-time>`
+  );
+}
+
+/** One dropdown entry: `name` is the item HTML, `value` the historyId
+ *  (issue_content_history.go:73-76). */
+export interface ContentHistoryListItem {
+  readonly name: string;
+  readonly value: number;
+}
+
+/** The fetched row shape (FetchIssueContentHistoryList's SELECT list,
+ *  content_history.go:151-155 — LEFT JOIN the poster user row). */
+interface ContentHistoryRow {
+  readonly userId: number | null;
+  readonly userName: string | null;
+  readonly userFullName: string | null;
+  readonly historyId: number;
+  readonly posterId: number | null;
+  readonly editedAt: Date;
+  readonly isFirstCreated: boolean;
+  readonly isDeleted: boolean;
+}
+
+async function fetchContentHistoryRows(d1: D1Database, issueId: number, commentId: number): Promise<ContentHistoryRow[]> {
+  return drizzle(d1)
+    .select({
+      userId: users.id,
+      userName: users.username,
+      userFullName: users.fullName,
+      historyId: issueContentHistory.id,
+      posterId: issueContentHistory.posterId,
+      editedAt: issueContentHistory.editedAt,
+      isFirstCreated: issueContentHistory.isFirstCreated,
+      isDeleted: issueContentHistory.isDeleted,
+    })
+    .from(issueContentHistory)
+    .leftJoin(users, eq(users.id, issueContentHistory.posterId))
+    .where(and(eq(issueContentHistory.issueId, issueId), eq(issueContentHistory.commentId, commentId)))
+    // Upstream's single ORDER BY edited_unix DESC (content_history.go:156).
+    .orderBy(desc(issueContentHistory.editedAt))
+    .all();
+}
+
+/** The list payload builder: `{"results": null}` when empty (upstream's nil
+ *  []map[string]any marshals to null, issue_content_history.go:54/79-81). */
+export async function loadContentHistoryListFragment(
+  d1: D1Database,
+  issue: IssueRow,
+  commentId: number,
+): Promise<{ results: ContentHistoryListItem[] | null }> {
+  const rows = await fetchContentHistoryRows(d1, issue.id, commentId);
+  if (rows.length === 0) return { results: null };
+
+  const results = rows.map((item) => {
+    // The action arm (:56-63): the deleted marker rides an <i> the dropdown
+    // checks by attribute (repo-issue-content.ts:121) before opening detail.
+    const actionHtml = item.isDeleted
+      ? `<i data-history-is-deleted="1">${CONTENT_HISTORY_ACTIONS.deleted}</i>`
+      : item.isFirstCreated
+        ? CONTENT_HISTORY_ACTIONS.created
+        : CONTENT_HISTORY_ACTIONS.edited;
+
+    // The fullName segment (:65-69), only when the trimmed name is non-empty.
+    const fullName = (item.userFullName ?? "").trim();
+    const fullNameHtml =
+      fullName === ""
+        ? ""
+        : ` (<span class="tw-inline-flex tw-max-w-[160px]"><span class="gt-ellipsis">${escapeHtml(fullName)}</span></span>)`;
+
+    // The avatar (:71 + content_history.go:163-169): a joined user row gets
+    // the /user/avatar/{name}/0 fast link, everything else the default asset.
+    const userName = item.userName ?? "";
+    const avatarLink = item.userId !== null && item.userId > 0
+      ? `/user/avatar/${encodeURIComponent(userName)}/0`
+      : DEFAULT_AVATAR_LINK;
+    const avatar = avatarHtml(avatarLink, 24, AVATAR_CLASS, userName);
+
+    // HTMLFormat("%s <strong>%s</strong>%s %s %s", avatar, userName,
+    // fullNameHTML, actionHTML, timeSinceHTML) (:74) — the string arg
+    // escapes, the HTML args pass through.
+    const name = `${avatar} <strong>${escapeHtml(userName)}</strong>${fullNameHtml} ${actionHtml} ${timeSinceHtml(item.editedAt)}`;
+    return { name, value: item.historyId };
+  });
+  return { results };
+}
+
+/** `ctx.JSON(http.StatusOK, map[string]any{"results": …})` (:79-81). */
+export function contentHistoryListFragmentResponse(data: { results: ContentHistoryListItem[] | null }): Response {
+  return new Response(JSON.stringify(data), { status: 200, headers: jsonHeaders() });
+}
+
+/** Go FormInt64 (services/context/form.go): missing/garbage parses to 0 —
+ *  the issue-body namespace. */
+export function formInt64(value: string | null): number {
+  if (value === null || !/^-?\d+$/.test(value)) return 0;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Arm 5 — GET /{type}/{index}/content-history/detail (issue_content_history.go:141-180)
+// ---------------------------------------------------------------------------
+
+/** The detail loader's outcomes: `historyNotFound` is upstream's JSON 404
+ *  (`ctx.JSON(404, {"message": …})`, :150-153 — NOT the HTML shell);
+ *  `orphanedComment` mirrors the impossible-in-practice comment-miss arm
+ *  (:160-163 — log + return, an EMPTY 200 body). */
+export type ContentHistoryDetailOutcome =
+  | {
+      readonly kind: "ok";
+      readonly canSoftDelete: boolean;
+      readonly historyId: number;
+      readonly prevHistoryId: number;
+      readonly diffHtml: string;
+    }
+  | { readonly kind: "historyNotFound" }
+  | { readonly kind: "orphanedComment" };
+
+/** `canSoftDeleteContentHistory` (:84-110): repo write (IsOwner or
+ *  CanWriteIssuesOrPulls — the landed `canWriteRepository` through the
+ *  sessionRepoGrant bridge, the file-editor convention) OR a signed-in
+ *  viewer who posted the issue/comment/the revision, scope-checked. */
+async function canSoftDeleteContentHistory(
+  env: Env,
+  repo: RepoRow,
+  issue: IssueRow,
+  viewer: Viewer,
+  comment: typeof comments.$inferSelect | null,
+  history: typeof issueContentHistory.$inferSelect,
+): Promise<boolean> {
+  if (await sessionRepoGrant(env, repo, viewer, canWriteRepository)) return true;
+  if (viewer.kind !== "user") return false;
+  if (comment === null) {
+    return (viewer.id === issue.posterId || viewer.id === history.posterId) && history.issueId === issue.id;
+  }
+  return (
+    (viewer.id === comment.posterId || viewer.id === history.posterId) &&
+    history.issueId === issue.id &&
+    history.commentId === comment.id
+  );
+}
+
+/**
+ * The detail loader: `GetIssueContentHistoryAndPrev`
+ * (content_history.go:221-246) — the revision scoped to this issue, plus
+ * the newest NON-DELETED same-namespace revision strictly older by
+ * edited_unix (absent → prevHistoryId 0, diff against ""); then the
+ * canSoftDelete grant and the diffHtml render. `env` (not bare d1) because
+ * the write-grant arm rides sessionRepoGrant.
+ */
+export async function loadContentHistoryDetailFragment(
+  env: Env,
+  repo: RepoRow,
+  issue: IssueRow,
+  viewer: Viewer,
+  commentId: number,
+  historyId: number,
+): Promise<ContentHistoryDetailOutcome> {
+  // The `AND issue_id = ?` scope (:223) makes a foreign history id the 404.
+  const historyRows = await drizzle(d1Of(env))
+    .select()
+    .from(issueContentHistory)
+    .where(and(eq(issueContentHistory.id, historyId), eq(issueContentHistory.issueId, issue.id)))
+    .limit(1)
+    .all();
+  const history = historyRows[0];
+  if (history === undefined) return { kind: "historyNotFound" };
+
+  // The comment read (:157-164) — only for comment-scoped revisions; the
+  // delete hook guarantees the row exists, the miss arm mirrors upstream's
+  // empty-200 quirk anyway.
+  let comment: typeof comments.$inferSelect | null = null;
+  if (history.commentId !== 0) {
+    const found = await drizzle(d1Of(env)).select().from(comments).where(eq(comments.id, history.commentId)).limit(1).all();
+    comment = found[0] ?? null;
+    if (comment === null) return { kind: "orphanedComment" };
+  }
+
+  const prevRows = await drizzle(d1Of(env))
+    .select({ id: issueContentHistory.id, contentText: issueContentHistory.contentText })
+    .from(issueContentHistory)
+    .where(
+      and(
+        eq(issueContentHistory.issueId, history.issueId),
+        eq(issueContentHistory.commentId, history.commentId),
+        eq(issueContentHistory.isDeleted, false),
+        lt(issueContentHistory.editedAt, history.editedAt),
+      ),
+    )
+    .orderBy(desc(issueContentHistory.editedAt))
+    .limit(1)
+    .all();
+  const prev = prevRows[0] ?? null;
+
+  return {
+    kind: "ok",
+    canSoftDelete: await canSoftDeleteContentHistory(env, repo, issue, viewer, comment, history),
+    historyId: history.id,
+    prevHistoryId: prev?.id ?? 0,
+    diffHtml: diffContentHistoryHtml(prev?.contentText ?? "", history.contentText),
+  };
+}
+
+/** `ctx.JSON` per outcome (:150-153 the 404, :174-179 the payload). */
+export function contentHistoryDetailFragmentResponse(data: ContentHistoryDetailOutcome): Response {
+  if (data.kind === "historyNotFound") {
+    return new Response(JSON.stringify({ message: "Can not find the content history" }), {
+      status: 404,
+      headers: jsonHeaders(),
+    });
+  }
+  if (data.kind === "orphanedComment") {
+    return new Response(null, { status: 200 }); // upstream's unwritten-body quirk
+  }
+  return new Response(
+    JSON.stringify({
+      canSoftDelete: data.canSoftDelete,
+      historyId: data.historyId,
+      prevHistoryId: data.prevHistoryId,
+      diffHtml: data.diffHtml,
+    }),
+    { status: 200, headers: jsonHeaders() },
+  );
+}
+
+/** The fragment loaders take D1Database; the detail's grant bridge takes
+ *  Env — the single-field projection keeps both call shapes honest. */
+function d1Of(env: Env): D1Database {
+  return env.DB;
+}
+
+// ---------------------------------------------------------------------------
+// diffContentHistory — the diffmatchpatch core port (:112-138)
+// ---------------------------------------------------------------------------
+
+/** Diff_EditCost's default (4) — cleanupEfficiency's merge threshold. */
+const DMP_EDIT_COST = 4;
+
+type DmpOp = { tag: -1 | 0 | 1; text: string }; // -1 delete, 0 equal, 1 insert
+
+function dmpCommonPrefixLength(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i++;
+  return i;
+}
+
+function dmpCommonSuffixLength(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[a.length - 1 - i] === b[b.length - 1 - i]) i++;
+  return i;
+}
+
+/**
+ * `NormalizeStringEOL` (modules/util/util.go:308-317): textarea line
+ * endings are \r\n; the diff compares \n only.
+ */
+function normalizeStringEol(input: string): string {
+  return input.replaceAll("\r\n", "\n");
+}
+
+/** `DiffMain` (checklines=false): trim prefix/suffix, compute, restore,
+ *  cleanup-merge — the go-diff diffMainRunes shape. */
+function dmpDiffMain(text1: string, text2: string): DmpOp[] {
+  if (text1 === text2) return text1 === "" ? [] : [{ tag: 0, text: text1 }];
+
+  let body1 = text1;
+  let body2 = text2;
+  const prefix = body1.slice(0, dmpCommonPrefixLength(body1, body2));
+  body1 = body1.slice(prefix.length);
+  body2 = body2.slice(prefix.length);
+  const suffix = body1.slice(body1.length - dmpCommonSuffixLength(body1, body2));
+  body1 = body1.slice(0, body1.length - suffix.length);
+  body2 = body2.slice(0, body2.length - suffix.length);
+
+  const diffs = dmpDiffCompute(body1, body2);
+  if (prefix !== "") diffs.unshift({ tag: 0, text: prefix });
+  if (suffix !== "") diffs.push({ tag: 0, text: suffix });
+  return dmpCleanupMerge(diffs);
+}
+
+/** `diffCompute` (go-diff): the empty arms, the contains fast path, the
+ *  short-input arm, the half-match split, and the Myers bisect fallback. */
+function dmpDiffCompute(text1: string, text2: string): DmpOp[] {
+  if (text1 === "") return [{ tag: 1, text: text2 }];
+  if (text2 === "") return [{ tag: -1, text: text1 }];
+
+  const longtext = text1.length > text2.length ? text1 : text2;
+  const shorttext = text1.length > text2.length ? text2 : text1;
+
+  const i = longtext.indexOf(shorttext);
+  if (i !== -1) {
+    // The shorter text sits whole inside the longer: the surrounding
+    // longtext is one pure op around the common middle.
+    const op: -1 | 1 = text1.length > text2.length ? -1 : 1;
+    const diffs: DmpOp[] = [];
+    if (i !== 0) diffs.push({ tag: op, text: longtext.slice(0, i) });
+    diffs.push({ tag: 0, text: shorttext });
+    if (i + shorttext.length !== longtext.length) diffs.push({ tag: op, text: longtext.slice(i + shorttext.length) });
+    return diffs;
+  }
+  if (shorttext.length < 2) {
+    // No contains match with a 1-char short text: pure delete+insert.
+    return [
+      { tag: -1, text: text1 },
+      { tag: 1, text: text2 },
+    ];
+  }
+
+  const half = dmpHalfMatch(text1, text2);
+  if (half !== null) {
+    const diffsA = dmpDiffMain(half.text1A, half.text2A);
+    const diffsB = dmpDiffMain(half.text1B, half.text2B);
+    return [...diffsA, { tag: 0, text: half.midCommon }, ...diffsB];
+  }
+  return dmpBisect(text1, text2);
+}
+
+/** `diffHalfMatchI` (JS dmp): the seed at `i` matched anywhere in the
+ *  short text, keeping the longest expansion. */
+function dmpHalfMatchI(longtext: string, shorttext: string, i: number) {
+  const seed = longtext.slice(i, Math.round(i + longtext.length / 4));
+  let j = -1;
+  let bestCommon = "";
+  let bestLongtextA = "";
+  let bestLongtextB = "";
+  let bestShorttextA = "";
+  let bestShorttextB = "";
+  while ((j = shorttext.indexOf(seed, j + 1)) !== -1) {
+    const prefixLength = dmpCommonPrefixLength(longtext.slice(i), shorttext.slice(j));
+    const suffixLength = dmpCommonSuffixLength(longtext.slice(0, i), shorttext.slice(0, j));
+    if (bestCommon.length < suffixLength + prefixLength) {
+      bestCommon = shorttext.slice(j - suffixLength, j) + shorttext.slice(j, j + prefixLength);
+      bestLongtextA = longtext.slice(0, i - suffixLength);
+      bestLongtextB = longtext.slice(i + prefixLength);
+      bestShorttextA = shorttext.slice(0, j - suffixLength);
+      bestShorttextB = shorttext.slice(j + prefixLength);
+    }
+  }
+  if (bestCommon.length * 2 >= longtext.length) {
+    return { bestLongtextA, bestLongtextB, bestShorttextA, bestShorttextB, bestCommon };
+  }
+  return null;
+}
+
+/** `diffHalfMatch_`: split the problem around a common middle at least
+ *  half the long text's length (seeded at the 1/4 and 1/2 marks). */
+function dmpHalfMatch(text1: string, text2: string) {
+  const longtext = text1.length > text2.length ? text1 : text2;
+  const shorttext = text1.length > text2.length ? text2 : text1;
+  if (longtext.length < 4 || shorttext.length * 2 < longtext.length) return null;
+
+  const hm1 = dmpHalfMatchI(longtext, shorttext, Math.ceil(longtext.length / 4));
+  const hm2 = dmpHalfMatchI(longtext, shorttext, Math.ceil(longtext.length / 2));
+  const hm = hm1 === null ? hm2 : hm2 === null || hm1.bestCommon.length > hm2.bestCommon.length ? hm1 : hm2;
+  if (hm === null) return null;
+
+  const midCommon = hm.bestCommon;
+  if (longtext === text1) {
+    return { text1A: hm.bestLongtextA, text1B: hm.bestLongtextB, text2A: hm.bestShorttextA, text2B: hm.bestShorttextB, midCommon };
+  }
+  return { text1A: hm.bestShorttextA, text1B: hm.bestShorttextB, text2A: hm.bestLongtextA, text2B: hm.bestLongtextB, midCommon };
+}
+
+/** `diffBisect_`: the Myers O(ND) middle-snake meet, front and back
+ *  traces advancing in lockstep (UTF-16 units, no deadline — the size
+ *  guard lives at the renderer). */
+function dmpBisect(text1: string, text2: string): DmpOp[] {
+  const text1Length = text1.length;
+  const text2Length = text2.length;
+  const maxD = Math.ceil((text1Length + text2Length) / 2);
+  const vOffset = maxD;
+  const vLength = 2 * maxD;
+  // +2: the JS reference relies on array growth for the v[kOffset+1]
+  // sentinel at the top k — the Int32Array keeps that slot allocated.
+  const v1 = new Int32Array(vLength + 2).fill(-1);
+  const v2 = new Int32Array(vLength + 2).fill(-1);
+  v1[vOffset + 1] = 0;
+  v2[vOffset + 1] = 0;
+  const delta = text1Length - text2Length;
+  const front = delta % 2 !== 0;
+  let k1start = 0;
+  let k1end = 0;
+  let k2start = 0;
+  let k2end = 0;
+  // Every algorithmic read lands in-bounds by construction (|k| ≤ maxD);
+  // the fallback -1 keeps the type honest for the strict index reads.
+  const vAt = (v: Int32Array, i: number): number => v[i] ?? -1;
+  for (let d = 0; d < maxD; d++) {
+    for (let k1 = -d + k1start; k1 <= d - k1end; k1 += 2) {
+      const k1Offset = vOffset + k1;
+      let x1: number;
+      if (k1 === -d || (k1 !== d && vAt(v1, k1Offset - 1) < vAt(v1, k1Offset + 1))) {
+        x1 = vAt(v1, k1Offset + 1);
+      } else {
+        x1 = vAt(v1, k1Offset - 1) + 1;
+      }
+      let y1 = x1 - k1;
+      while (x1 < text1Length && y1 < text2Length && text1[x1] === text2[y1]) {
+        x1++;
+        y1++;
+      }
+      v1[k1Offset] = x1;
+      if (x1 > text1Length) {
+        k1end += 2;
+      } else if (y1 > text2Length) {
+        k1start += 2;
+      } else if (front) {
+        const k2Offset = vOffset + delta - k1;
+        const v2At = k2Offset >= 0 ? vAt(v2, k2Offset) : -1;
+        if (k2Offset >= 0 && k2Offset < vLength && v2At !== -1) {
+          const x2 = text1Length - v2At;
+          if (x1 >= x2) return dmpBisectSplit(text1, text2, x1, y1);
+        }
+      }
+    }
+    for (let k2 = -d + k2start; k2 <= d - k2end; k2 += 2) {
+      const k2Offset = vOffset + k2;
+      let x2: number;
+      if (k2 === -d || (k2 !== d && vAt(v2, k2Offset - 1) < vAt(v2, k2Offset + 1))) {
+        x2 = vAt(v2, k2Offset + 1);
+      } else {
+        x2 = vAt(v2, k2Offset - 1) + 1;
+      }
+      let y2 = x2 - k2;
+      while (x2 < text1Length && y2 < text2Length && text1[text1Length - x2 - 1] === text2[text2Length - y2 - 1]) {
+        x2++;
+        y2++;
+      }
+      v2[k2Offset] = x2;
+      if (x2 > text1Length) {
+        k2end += 2;
+      } else if (y2 > text2Length) {
+        k2start += 2;
+      } else if (!front) {
+        const k1Offset = vOffset + delta - k2;
+        const v1At = k1Offset >= 0 ? vAt(v1, k1Offset) : -1;
+        if (k1Offset >= 0 && k1Offset < vLength && v1At !== -1) {
+          const x1 = v1At;
+          const y1 = vOffset + x1 - k1Offset;
+          if (x1 >= text1Length - x2) return dmpBisectSplit(text1, text2, x1, y1);
+        }
+      }
+    }
+  }
+  // Timeout-equivalent: no commonality at all — pure delete+insert.
+  return [
+    { tag: -1, text: text1 },
+    { tag: 1, text: text2 },
+  ];
+}
+
+/** `diffBisectSplit_`: recurse on both sides of the found middle. */
+function dmpBisectSplit(text1: string, text2: string, x: number, y: number): DmpOp[] {
+  return [...dmpDiffMain(text1.slice(0, x), text2.slice(0, y)), ...dmpDiffMain(text1.slice(x), text2.slice(y))];
+}
+
+/** `diffCleanupMerge` (JS dmp, both passes): merge same-type runs, factor
+ *  equalities out of delete/insert pairs, then shift single edits
+ *  surrounded by equalities sideways. */
+function dmpCleanupMerge(diffs: DmpOp[]): DmpOp[] {
+  diffs.push({ tag: 0, text: "" });
+  let pointer = 0;
+  let countDelete = 0;
+  let countInsert = 0;
+  let textDelete = "";
+  let textInsert = "";
+  while (pointer < diffs.length) {
+    const op = diffs[pointer];
+    if (op === undefined) break;
+    if (op.tag === 1) {
+      countInsert++;
+      textInsert += op.text;
+      pointer++;
+    } else if (op.tag === -1) {
+      countDelete++;
+      textDelete += op.text;
+      pointer++;
+    } else {
+      if (countDelete + countInsert > 1) {
+        if (countDelete !== 0 && countInsert !== 0) {
+          // Factor out any common prefix.
+          let commonLength = dmpCommonPrefixLength(textInsert, textDelete);
+          if (commonLength !== 0) {
+            const before = diffs[pointer - countDelete - countInsert - 1];
+            if ((pointer - countDelete - countInsert) > 0 && before !== undefined && before.tag === 0) {
+              before.text += textInsert.slice(0, commonLength);
+            } else {
+              diffs.unshift({ tag: 0, text: textInsert.slice(0, commonLength) });
+              pointer++;
+            }
+            textInsert = textInsert.slice(commonLength);
+            textDelete = textDelete.slice(commonLength);
+          }
+          // Factor out any common suffix.
+          commonLength = dmpCommonSuffixLength(textInsert, textDelete);
+          if (commonLength !== 0) {
+            const at = diffs[pointer];
+            if (at !== undefined) at.text = textInsert.slice(textInsert.length - commonLength) + at.text;
+            textInsert = textInsert.slice(0, textInsert.length - commonLength);
+            textDelete = textDelete.slice(0, textDelete.length - commonLength);
+          }
+        }
+        pointer -= countDelete + countInsert;
+        diffs.splice(pointer, countDelete + countInsert);
+        if (countDelete !== 0) {
+          diffs.splice(pointer, 0, { tag: -1, text: textDelete });
+          pointer++;
+        }
+        if (countInsert !== 0) {
+          diffs.splice(pointer, 0, { tag: 1, text: textInsert });
+          pointer++;
+        }
+      } else if (pointer !== 0 && diffs[pointer - 1]?.tag === 0) {
+        const prev = diffs[pointer - 1];
+        if (prev !== undefined) prev.text += op.text;
+        diffs.splice(pointer, 1);
+      } else {
+        pointer++;
+      }
+      countInsert = 0;
+      countDelete = 0;
+      textDelete = "";
+      textInsert = "";
+    }
+  }
+  const last = diffs[diffs.length - 1];
+  if (last !== undefined && last.text === "") diffs.pop();
+
+  // Second pass: shift a single edit surrounded by equalities sideways
+  // (A<ins>BA</ins>C → <ins>AB</ins>AC).
+  let changes = false;
+  pointer = 1;
+  while (pointer < diffs.length - 1) {
+    const prev = diffs[pointer - 1];
+    const cur = diffs[pointer];
+    const next = diffs[pointer + 1];
+    if (prev?.tag === 0 && next?.tag === 0 && cur !== undefined) {
+      if (cur.text.slice(cur.text.length - prev.text.length) === prev.text) {
+        cur.text = prev.text + cur.text.slice(0, cur.text.length - prev.text.length);
+        next.text = prev.text + next.text;
+        diffs.splice(pointer - 1, 1);
+        changes = true;
+      } else if (cur.text.slice(0, next.text.length) === next.text) {
+        prev.text += next.text;
+        cur.text = cur.text.slice(next.text.length) + next.text;
+        diffs.splice(pointer + 1, 1);
+        changes = true;
+      }
+    }
+    pointer++;
+  }
+  return changes ? dmpCleanupMerge(diffs) : diffs;
+}
+
+/** `DiffCleanupEfficiency` (go-diff): eliminate equalities shorter than
+ *  Diff_EditCost that sandwich delete/insert pairs, when merging them
+ *  shortens the edit script. */
+function dmpCleanupEfficiency(diffs: DmpOp[]): void {
+  const equalities: number[] = [];
+  let lastequality: string | null = null;
+  let pointer = 0;
+  let preIns = false;
+  let preDel = false;
+  let postIns = false;
+  let postDel = false;
+  let changes = false;
+  while (pointer < diffs.length) {
+    const op = diffs[pointer];
+    if (op === undefined) break;
+    if (op.tag === 0) {
+      if (op.text.length < DMP_EDIT_COST && (postIns || postDel)) {
+        equalities.push(pointer);
+        preIns = postIns;
+        preDel = postDel;
+        lastequality = op.text;
+      } else {
+        equalities.length = 0;
+        lastequality = null;
+      }
+      postIns = false;
+      postDel = false;
+    } else {
+      if (op.tag === -1) postDel = true;
+      else postIns = true;
+      if (
+        lastequality !== null &&
+        ((preIns && preDel && postIns && postDel) ||
+          (lastequality.length < DMP_EDIT_COST / 2 && Number(preIns) + Number(preDel) + Number(postIns) + Number(postDel) === 3))
+      ) {
+        const insertionIndex = equalities.pop() ?? -1;
+        if (insertionIndex >= 0) {
+          diffs.splice(insertionIndex, 0, { tag: -1, text: lastequality });
+          const twin = diffs[insertionIndex + 1];
+          if (twin !== undefined) twin.tag = 1;
+          lastequality = null;
+          if (preIns && preDel) {
+            postIns = true;
+            postDel = true;
+            equalities.length = 0;
+          } else {
+            const top = equalities[equalities.length - 1];
+            pointer = top ?? -1;
+            postIns = false;
+            postDel = false;
+          }
+          changes = true;
+        }
+      }
+    }
+    pointer++;
+  }
+  if (changes) dmpCleanupMerge(diffs);
+}
+
+/**
+ * `diffContentHistory` (issue_content_history.go:112-138): NormalizeEOL
+ * both sides, DiffMain(checklines=false) + DiffCleanupEfficiency, then the
+ * `<pre class="chroma">` render — insertions in `<span class="gi">`,
+ * deletions in `<span class="gd">`, equal text bare, every text run
+ * HTML-escaped (the HTMLBuilder's WriteString arm). Inputs beyond 200k
+ * UTF-16 units combined skip the bisect and render as one delete+insert
+ * pair (upstream bounds the same work with a 1 s deadline).
+ */
+export function diffContentHistoryHtml(oldContent: string, newContent: string): string {
+  const oldText = normalizeStringEol(oldContent);
+  const newText = normalizeStringEol(newContent);
+  let diffs: DmpOp[];
+  if (oldText.length + newText.length > 200_000) {
+    diffs = [
+      { tag: -1, text: oldText },
+      { tag: 1, text: newText },
+    ];
+  } else {
+    diffs = dmpDiffMain(oldText, newText);
+    dmpCleanupEfficiency(diffs);
+  }
+
+  let html = `<pre class="chroma">`;
+  for (const diff of diffs) {
+    if (diff.tag === 1) {
+      html += `<span class="gi">${escapeHtml(diff.text)}</span>`;
+    } else if (diff.tag === -1) {
+      html += `<span class="gd">${escapeHtml(diff.text)}</span>`;
+    } else {
+      html += escapeHtml(diff.text);
+    }
+  }
+  return `${html}</pre>`;
 }

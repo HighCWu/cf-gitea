@@ -2689,3 +2689,46 @@ export const actions = sqliteTable(
     index("action_act_user_created_idx").on(t.actUserId, t.createdAt, t.userId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// Issue content history (specs/issue-content-history.md — upstream
+// `ContentHistory`, gitea/models/issues/content_history.go:19-34).
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-revision snapshots of issue bodies and comment contents — one row per
+ * stored revision, filled by the edit-path hooks (specs/issue-content-history.md
+ * §3): the FIRST edit lazily back-fills the original content as
+ * `is_first_created` (attributed to the row's poster at its creation
+ * timestamp), every edit stores the new content, and the 20-revision
+ * retention limiter hard-deletes middle rows. `comment_id = 0` is the issue
+ * body's namespace (upstream's convention); a comment delete hard-deletes
+ * its rows (upstream DeleteComment, comment.go:1215-1219).
+ */
+export const issueContentHistory = sqliteTable(
+  "issue_content_history",
+  {
+    /** `HistoryID` on the content-history wire payloads. */
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Who the revision is attributed to (nullable like issues.poster_id —
+     *  imported rows have no poster user). */
+    posterId: integer("poster_id"),
+    issueId: integer("issue_id").notNull(),
+    /** 0 = the issue body; otherwise the owning comment's id. */
+    commentId: integer("comment_id").notNull().default(0),
+    /** `EditedUnix xorm:"INDEX"` — the revision's timestamp. */
+    editedAt: integer("edited_unix", { mode: "timestamp" }).notNull(),
+    /** The snapshot body; emptied (not nulled) by soft-delete. */
+    contentText: text("content_text").notNull(),
+    /** The lazily back-filled ORIGINAL revision (first-edit hook). */
+    isFirstCreated: integer("is_first_created", { mode: "boolean" }).notNull().default(false),
+    /** Soft-delete flag; nothing sets it true until the soft-delete arm lands. */
+    isDeleted: integer("is_deleted", { mode: "boolean" }).notNull().default(false),
+  },
+  (t) => [
+    // Upstream's three scalar INDEXes (content_history.go:22-26).
+    index("issue_content_history_issue_idx").on(t.issueId),
+    index("issue_content_history_comment_idx").on(t.commentId),
+    index("issue_content_history_edited_idx").on(t.editedAt),
+  ],
+);

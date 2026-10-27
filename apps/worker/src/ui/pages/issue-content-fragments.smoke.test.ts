@@ -7,7 +7,8 @@
  * recipes carry the mapping) — so the tests drive the loaders and Response
  * builders DIRECTLY on real D1 (workerd, @cloudflare/vitest-plugin) over a
  * seeded user/repo/issue with labels, comment edits (the landed body-edit
- * services bump the content_version counters the overview reconstructs)
+ * services carry the content-history write hooks — specs/
+ * issue-content-history.md §3 — so the seed produces real snapshot rows)
  * and attachment rows.
  *
  * - info: the converted-issue envelope + the rendered-labels HTML across
@@ -15,9 +16,16 @@
  *   with order) and the missing-index 404 outcome.
  * - attachments: the comment_id = 0 predicate (a comment attachment must
  *   NOT ride the issue list) + the structs.Attachment wire shape.
- * - content-history/overview: the counter-based editedHistoryCountMap —
- *   the edited issue body, the twice-edited comment, the never-edited
- *   comment absent (upstream's HAVING count(1) > 1).
+ * - content-history/overview: the editedHistoryCountMap queried from the
+ *   snapshot table (upstream's HAVING count(1) > 1) — the edited issue
+ *   body, the twice-edited comment, the never-edited comment absent.
+ * - content-history/list: the dropdown payload across the edited/created
+ *   action arms, edited_unix DESC, the user-row join, the empty namespace
+ *   `{"results": null}` arm, and FormInt64 parse semantics.
+ * - content-history/detail: the diffHtml render (exact dmp spans),
+ *   prevHistoryId chaining, the canSoftDelete arms (anonymous/owner/
+ *   comment-poster), the JSON 404 on a foreign history id, and the
+ *   orphaned-comment empty-200 quirk.
  */
 
 import { env } from "cloudflare:test";
@@ -29,12 +37,17 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
-import { issueAttachments, issueLabels, labels, repositories } from "../../db/schema";
+import { issueAttachments, issueContentHistory, issueLabels, labels, repositories, users } from "../../db/schema";
 import { changeIssueBody, updateCommentBody } from "../../api/services/issues";
 import {
+  contentHistoryDetailFragmentResponse,
+  contentHistoryListFragmentResponse,
   contentHistoryOverviewFragmentResponse,
+  formInt64,
   issueAttachmentsFragmentResponse,
   issueInfoFragmentResponse,
+  loadContentHistoryDetailFragment,
+  loadContentHistoryListFragment,
   loadContentHistoryOverviewFragment,
   loadIssueAttachmentsFragment,
   loadIssueInfoFragment,
@@ -87,11 +100,13 @@ async function seed(): Promise<Seeded> {
     .returning();
   await drizzle(env.DB).insert(issueLabels).values(inserted.map((row) => ({ issueId: issue.id, labelId: row.id })));
 
-  // Two comments: one edited twice (content_version 2), one never edited.
-  const edited = await svc.addComment({ issueId: issue.id, posterId: owner.id, content: "v0" });
+  // Two comments: one edited twice (content_version 2), one never edited —
+  // with explicit stamps so the snapshot revisions' edited_unix order is
+  // deterministic (created < edit1 < edit2).
+  const edited = await svc.addComment({ issueId: issue.id, posterId: owner.id, content: "v0", now: at(25) });
   await updateCommentBody(env.DB, edited.id, "v1", at(30));
   await updateCommentBody(env.DB, edited.id, "v2", at(40));
-  await svc.addComment({ issueId: issue.id, posterId: owner.id, content: "never edited" });
+  await svc.addComment({ issueId: issue.id, posterId: owner.id, content: "never edited", now: at(26) });
 
   // The issue body edited once (content_version 1).
   await changeIssueBody(env.DB, issue, "the edited body", 0, at(50));
@@ -114,6 +129,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   for (const table of [
+    "issue_content_history",
     "issue_attachments",
     "issue_labels",
     "labels",
@@ -201,7 +217,7 @@ describe("issue content fragments", () => {
     });
   });
 
-  it("content-history overview: the counter map keys the edited bodies only, valued at revision count", async () => {
+  it("content-history overview: the snapshot-table map keys the edited bodies only, valued at revision count", async () => {
     const s = await seed();
     const repo = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, s.repoId)).get())!;
     const issue = await resolveFragmentIssue(env.DB, repo, s.issue.index);
@@ -227,5 +243,158 @@ describe("issue content fragments", () => {
     expect(response.status).toBe(200);
     const payload = await response.json<typeof data>();
     expect(payload.editedHistoryCountMap).toEqual(data.editedHistoryCountMap);
+  });
+
+  it("content-history list: the dropdown payload per revision, edited_unix DESC, null when empty", async () => {
+    const s = await seed();
+    const repo = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, s.repoId)).get())!;
+    const issue = await resolveFragmentIssue(env.DB, repo, s.issue.index);
+    expect(issue).not.toBeNull();
+    if (issue === null) return;
+
+    // The fullName segment arm needs a non-empty full name.
+    await drizzle(env.DB).update(users).set({ fullName: "Frag Owner" }).where(eq(users.id, s.ownerId));
+
+    // The issue-body namespace (comment_id = 0): edited@50 first (DESC),
+    // created@10 second with the `created` action.
+    const bodyList = await loadContentHistoryListFragment(env.DB, issue, 0);
+    expect(bodyList.results).toHaveLength(2);
+    const bodyResults = bodyList.results!;
+    expect(bodyResults[1]?.name).toContain("created");
+    expect(bodyResults[0]?.name).toContain("edited");
+    // The item HTML: avatar fast-link + strong userName (no fullName on the
+    // created revision's segment? both rows join the same user row, so the
+    // segment rides both) + the relative-time stamp.
+    expect(bodyResults[0]?.name).toContain(`<img loading="lazy" alt class="ui avatar tw-align-middle tw-mr-2" src="/user/avatar/fragowner/0" title="fragowner" width="24" height="24">`);
+    expect(bodyResults[0]?.name).toContain("<strong>fragowner</strong>");
+    expect(bodyResults[0]?.name).toContain(`(<span class="tw-inline-flex tw-max-w-[160px]"><span class="gt-ellipsis">Frag Owner</span></span>)`);
+    expect(bodyResults[0]?.name).toMatch(/<relative-time prefix="" tense="past" datetime="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z" data-tooltip-content data-tooltip-interactive="true">/);
+    // The values are the history ids, newest first (the detail test chains
+    // on them).
+    const historyRows = await drizzle(env.DB)
+      .select({ id: issueContentHistory.id, editedAt: issueContentHistory.editedAt })
+      .from(issueContentHistory)
+      .all();
+    expect(historyRows).toHaveLength(5); // 2 body + 3 comment revisions
+
+    // The comment namespace: v2@40, v1@30, created@25 — the created arm last.
+    const commentList = await loadContentHistoryListFragment(env.DB, issue, s.editedCommentId);
+    expect(commentList.results).toHaveLength(3);
+    const commentNames = commentList.results!.map((item) => item.name);
+    expect(commentNames[2]).toContain("created");
+    expect(commentNames[0]).toContain("edited");
+    expect(commentNames[0]).toContain("<strong>fragowner</strong>");
+
+    // The never-edited comment's namespace is empty → upstream's nil slice.
+    const emptyNamespace = await loadContentHistoryListFragment(env.DB, issue, 999999);
+    expect(emptyNamespace).toEqual({ results: null });
+    const response = contentHistoryListFragmentResponse(emptyNamespace);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(JSON.stringify({ results: null }));
+
+    // FormInt64 parse semantics (Go FormInt64: garbage → 0).
+    expect(formInt64(null)).toBe(0);
+    expect(formInt64("abc")).toBe(0);
+    expect(formInt64("-7")).toBe(-7);
+    expect(formInt64(String(s.editedCommentId))).toBe(s.editedCommentId);
+  });
+
+  it("content-history detail: the diff payload, canSoftDelete arms, the JSON 404 and the orphan quirk", async () => {
+    const s = await seed();
+    const repo = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, s.repoId)).get())!;
+    const issue = await resolveFragmentIssue(env.DB, repo, s.issue.index);
+    expect(issue).not.toBeNull();
+    if (issue === null) return;
+    const ownerViewer = { kind: "user", id: s.ownerId, username: "fragowner", isAdmin: false } as const;
+
+    // The body namespace revisions, oldest first: "the body"@10, "the edited body"@50.
+    const bodyRevisions = await drizzle(env.DB)
+      .select({ id: issueContentHistory.id, contentText: issueContentHistory.contentText, editedAt: issueContentHistory.editedAt })
+      .from(issueContentHistory)
+      .all();
+    const body = bodyRevisions
+      .filter((row) => row.contentText.startsWith("the "))
+      .sort((a, b) => a.editedAt.getTime() - b.editedAt.getTime());
+    expect(body.map((row) => row.contentText)).toEqual(["the body", "the edited body"]);
+    const createdId = body[0]?.id;
+    const editedId = body[1]?.id;
+    expect(createdId).toBeDefined();
+    expect(editedId).toBeDefined();
+    if (createdId === undefined || editedId === undefined) return;
+
+    // The latest revision diffs against its predecessor: "the body" →
+    // "the edited body" renders as equal("the ") + insert("edited ") +
+    // equal("body") — the dmp port's exact spans.
+    const detail = await loadContentHistoryDetailFragment(env, repo, issue, ownerViewer, 0, editedId);
+    expect(detail).toMatchObject({
+      kind: "ok",
+      canSoftDelete: true, // the repo owner's write grant
+      historyId: editedId,
+      prevHistoryId: createdId,
+    });
+    if (detail.kind !== "ok") return;
+    expect(detail.diffHtml).toBe(`<pre class="chroma">the <span class="gi">edited </span>body</pre>`);
+    const response = contentHistoryDetailFragmentResponse(detail);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    const payload = await response.json<{ canSoftDelete: boolean; historyId: number; prevHistoryId: number; diffHtml: string }>();
+    expect(payload.diffHtml).toBe(detail.diffHtml);
+
+    // The first-created revision has NO predecessor: prevHistoryId 0, diff
+    // against "" (whole insert).
+    const first = await loadContentHistoryDetailFragment(env, repo, issue, ownerViewer, 0, createdId);
+    expect(first).toMatchObject({ kind: "ok", prevHistoryId: 0 });
+    if (first.kind === "ok") expect(first.diffHtml).toBe(`<pre class="chroma"><span class="gi">the body</span></pre>`);
+
+    // Anonymous non-writer → canSoftDelete false.
+    const anonymous = await loadContentHistoryDetailFragment(env, repo, issue, ANONYMOUS, 0, editedId);
+    expect(anonymous).toMatchObject({ kind: "ok", canSoftDelete: false });
+
+    // The comment-poster arm: a non-owner poster can soft-delete their own
+    // comment's revisions.
+    const poster = await seedVerifiedUser({ username: "fragposter" });
+    const svc = new IssuesService(env.DB);
+    const posterComment = await svc.addComment({ issueId: issue.id, posterId: poster.id, content: "poster v0", now: at(70) });
+    await updateCommentBody(env.DB, posterComment.id, "poster v1", at(80));
+    const posterRevisions = await drizzle(env.DB)
+      .select({ id: issueContentHistory.id, editedAt: issueContentHistory.editedAt })
+      .from(issueContentHistory)
+      .all();
+    const posterLatest = posterRevisions
+      .filter((row) => row.editedAt.getTime() === at(80).getTime())
+      .map((row) => row.id)[0];
+    expect(posterLatest).toBeDefined();
+    if (posterLatest === undefined) return;
+    const posterViewer = { kind: "user", id: poster.id, username: "fragposter", isAdmin: false } as const;
+    const posterDetail = await loadContentHistoryDetailFragment(env, repo, issue, posterViewer, posterComment.id, posterLatest);
+    expect(posterDetail).toMatchObject({ kind: "ok", canSoftDelete: true });
+    // The comment namespace diff: "poster v1" → v0? the LATEST revision is
+    // "poster v1" against prev "poster v0" — the whole "0"→"1" char swap.
+    if (posterDetail.kind === "ok") {
+      expect(posterDetail.diffHtml).toBe(`<pre class="chroma">poster v<span class="gd">0</span><span class="gi">1</span></pre>`);
+    }
+
+    // A foreign history id → the JSON 404 (NOT the HTML shell).
+    const missing = await loadContentHistoryDetailFragment(env, repo, issue, ownerViewer, 0, 999999);
+    expect(missing).toEqual({ kind: "historyNotFound" });
+    const missingResponse = contentHistoryDetailFragmentResponse(missing);
+    expect(missingResponse.status).toBe(404);
+    expect(await missingResponse.text()).toBe(JSON.stringify({ message: "Can not find the content history" }));
+
+    // The orphaned-comment quirk (upstream logs and returns an EMPTY 200):
+    // only reachable by fabricating a history row with no comment row.
+    const orphanDate = at(90);
+    const inserted = await drizzle(env.DB)
+      .insert(issueContentHistory)
+      .values({ issueId: issue.id, commentId: 424242, posterId: s.ownerId, editedAt: orphanDate, contentText: "orphan", isFirstCreated: false })
+      .returning({ id: issueContentHistory.id });
+    const orphanId = inserted[0]?.id;
+    expect(orphanId).toBeDefined();
+    if (orphanId === undefined) return;
+    const orphan = await loadContentHistoryDetailFragment(env, repo, issue, ownerViewer, 424242, orphanId);
+    expect(orphan).toEqual({ kind: "orphanedComment" });
+    const orphanResponse = contentHistoryDetailFragmentResponse(orphan);
+    expect(orphanResponse.status).toBe(200);
+    expect(await orphanResponse.text()).toBe("");
   });
 });

@@ -232,6 +232,13 @@
       "when": 1792983582913,
       "tag": "0032_wealthy_siren",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1793075332305,
+      "tag": "0033_sleepy_mandrill",
+      "breakpoints": true
     }
   ]
 }
