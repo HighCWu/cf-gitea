@@ -354,3 +354,76 @@ export async function ensureSeededRepo(options: {
     tips,
   };
 }
+
+// ---------------------------------------------------------------------------
+// The fixed-id D1-only fixture repo (the admin-repos golden's seed)
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert the repository row DIRECTLY with a FIXED id — the webhookDeliveries
+ * fixed-uuid precedent applied to a repositories row. RepoService.create
+ * mints `crypto.randomUUID()` at insert (repos/service.ts:284) and derives
+ * the immutable `storage_key = 'r_' || id` in the same transaction
+ * (service.ts:303-306), so a byte-deterministic ID cell needs the row
+ * inserted directly with BOTH columns pinned — the same service-bypass the
+ * harness's seedGoldenHooks uses for its delivery uuids.
+ *
+ * D1-ONLY by construction: the consuming golden reads the registry tables,
+ * never the engine, and a receive-pack against this row could not be
+ * deterministic anyway — a missing row push-creates a random id (the gate's
+ * RepoService.create arm), a present row gets wall-clock updatedAt stamped
+ * at settle. The row is born ready: no token, no pack, no engine contact.
+ * The engine-side counterpart (a fixed-id repo WITH pushed content) stays
+ * with the harness owners.
+ *
+ * Private by default: anonymous listing goldens (explore/landing) render
+ * public rows only, so a private fixture shifts zero committed bytes —
+ * while the admin scope it exists for sees every row (upstream's
+ * `Private: true`, repos.go:35 — the service's is_admin short-circuit).
+ *
+ * Idempotent like ensureSeededRepo: the (owner, slug) lookup gates the
+ * insert (storage_key is UNIQUE, so a re-insert would throw, not converge).
+ */
+export async function ensureSeededFixedIdRepo(options: {
+  owner: string;
+  slug: string;
+  /** The fixed PRIMARY KEY — also the storage_key suffix (`r_${id}`). */
+  id: string;
+  /** The pinned Created cell (§5.2: determinism is a fixture property; the
+   *  column default is unixepoch(), i.e. wall clock). */
+  createdAt: Date;
+  /** Default private (the anonymous-listing guard above). */
+  isPrivate?: boolean;
+}): Promise<void> {
+  const db = drizzle(env.DB);
+  const existing = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(
+      and(
+        eq(repositories.ownerNamespace, options.owner.toLowerCase()),
+        eq(repositories.slug, options.slug.toLowerCase()),
+      ),
+    )
+    .get();
+  if (existing !== undefined) return;
+  const ownerRow = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, options.owner.toLowerCase()))
+    .get();
+  const ownerId =
+    ownerRow !== undefined ? ownerRow.id : (await seedVerifiedUser({ username: options.owner })).id;
+  await db.insert(repositories).values({
+    id: options.id,
+    storageKey: `r_${options.id}`,
+    ownerNamespace: options.owner.toLowerCase(),
+    ownerId,
+    slug: options.slug.toLowerCase(),
+    visibility: options.isPrivate === false ? "public" : "private",
+    defaultBranch: "main",
+    isEmpty: true,
+    status: "ready",
+    createdAt: options.createdAt,
+  });
+}

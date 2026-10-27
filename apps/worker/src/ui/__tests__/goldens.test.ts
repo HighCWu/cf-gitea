@@ -31,15 +31,27 @@ import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { users } from "../../db/schema";
+import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
 import {
   GOLDEN_CASES,
   GOLDEN_MARKER_END,
   GOLDEN_MARKER_START,
   type GoldenCase,
+  T0,
   renderCase,
   renderRoute,
   setupGoldenFixtures,
 } from "./harness";
+
+/**
+ * The admin-repos golden's fixture row id (morgan/admin-golden — seeded via
+ * ensureSeededFixedIdRepo below). The ID cell renders it verbatim, so the
+ * literal IS the determinism (the a11y arm re-derives it from the committed
+ * bytes; this export documents the single source). Valid v4 shape, all-zero
+ * digit prefix — CAST(id AS INTEGER) = 0, inert under the service's id-order
+ * sort stand-ins.
+ */
+export const ADMIN_GOLDEN_REPO_ID = "00000000-0000-4000-8000-000000000001";
 
 /** Committed golden bytes, read through Vite's `?raw` transform (byte-exact;
  *  typing in raw-modules.d.ts). */
@@ -84,6 +96,16 @@ setupGoldenFixtures();
  */
 beforeAll(async () => {
   await drizzle(env.DB).update(users).set({ isAdmin: true }).where(eq(users.usernameLower, "morgan"));
+  // The admin-repos golden's fixture row (the case comment below): a PRIVATE
+  // D1-only repo with the FIXED id — the ID cell the R6 gap is about renders
+  // deterministically. Runs after the harness seeding (declaration order:
+  // setupGoldenFixtures above registered first), so morgan's row exists.
+  await ensureSeededFixedIdRepo({
+    owner: "morgan",
+    slug: "admin-golden",
+    id: ADMIN_GOLDEN_REPO_ID,
+    createdAt: new Date(T0 * 1000),
+  });
 });
 
 /** The one copy of the §5.2 assertion/marker protocol, shared by both case
@@ -159,27 +181,45 @@ describe("golden DOM snapshots (§5.2)", () => {
  *     id-resolution arm (repo-scoped, non-numeric → 404) is new.
  *
  * The audit's queued R6 gap (the a11y suite can only SEE tables embedded in
- * goldens) added the admin listing pages below. Two of the three candidates
- * are documented skips — the analyses live here so the next attempt starts
- * from the mechanism, not from a fresh dead end:
+ * goldens) added the admin listing pages below. admin-repos is TAKEN (the
+ * wave-fixed-id-seed closure, via the positive-match search arm — the case
+ * comment documents why the bare path stays unlandable); admin-monitor
+ * remains the one documented skip — the analysis lives here so the next
+ * attempt starts from the mechanism, not from a fresh dead end:
  *
  *   - admin-orgs (TAKEN): `/-/admin/orgs`, the orgs list over the EXISTING
  *     org fixtures (acme + emptyorg — no new seeds; the R6 sweep already
  *     scoped its seven th cells). Deterministic: org rows are `users` rows
  *     (seeded integer ids, createdAt pinned to T0, and the Teams/Members/
  *     Repos cells are fixture-derived counts), so the bytes are stable.
- *   - admin-repos (SKIPPED — no byte-deterministic fixture path): the table's
- *     first column renders `repositories.id` verbatim, and repo ids are
- *     `crypto.randomUUID()` at create (repos/service.ts:284) — per-run
- *     random, PRIMARY KEY, referenced by every metadata table, and baked into
- *     the immutable `storage_key = 'r_' || id` (repos/service.ts:303-306).
- *     Pinning them would mean restructuring the harness seeds and every
- *     referencing row (harness.ts is outside a goldens-only wave's scope;
- *     "cheap" does not apply). The zero-row search arm (`?q=` no match) IS
- *     deterministic but renders no table rows — it would fake the coverage
- *     this gap is about. Proper fix lives with the harness/page owners: a
- *     fixed-id seed arm in testing/seed-repo.ts (the webhookDeliveries
- *     fixed-uuid precedent) or an id-projection decision in admin-repos.tsx.
+ *   - admin-repos (TAKEN — wave-fixed-id-seed, through `?q=admin-golden`):
+ *     the table's first column renders `repositories.id` verbatim and repo
+ *     ids are `crypto.randomUUID()` at create (repos/service.ts:284) —
+ *     per-run random, PRIMARY KEY, referenced by every metadata table, and
+ *     baked into the immutable `storage_key = 'r_' || id`
+ *     (repos/service.ts:303-306). The admin scope renders EVERY repositories
+ *     row (services/repository.ts's is_admin short-circuit — upstream's
+ *     `Private: true`), so the six harness repos' random ids leak into the
+ *     bare `/-/admin/repos` bytes no matter what a new fixture pins — and
+ *     the default sort's stand-in (`ORDER BY CAST(id AS INTEGER) DESC`,
+ *     repository.ts:739-746, no tiebreaker) randomizes the row ORDER too:
+ *     digit-leading UUIDs cast non-zero (verified: '550e8400-…' → 550,
+ *     '123e4567-…' → 123; letter-leading → 0 — the admin-repos.matrix
+ *     comment's "every CAST is 0" premise is wrong). Pinning the default
+ *     view therefore needs EVERY harness repo id pinned — the three
+ *     ensureSeededRepo call sites plus seedGoldenOrg's three
+ *     RepoService.create calls, all in harness.ts, outside this wave's
+ *     exclusive ownership (the original skip's "restructuring the harness
+ *     seeds" caveat, unchanged). What THIS wave lands: the documented
+ *     proper-fix seed arm — ensureSeededFixedIdRepo in testing/seed-repo.ts
+ *     (the webhookDeliveries fixed-uuid precedent applied to a repositories
+ *     row: direct insert with id + storage_key pinned) — feeding a PRIVATE
+ *     morgan/admin-golden fixture consumed through the KEYWORD arm
+ *     `?q=admin-golden`: the full admin chrome and the real 10-column table
+ *     with exactly ONE deterministic row (the fixed ID cell, the Private
+ *     label, the null-Updated empty arm, the T0-pinned Created). Unlike the
+ *     zero-row arm the original skip note rejected, this renders a real
+ *     table row — the coverage the R6 gap asks for.
  *   - admin-monitor (SKIPPED — the cron/queue tables the audit names, per
  *     page): cron renders wall-clock bytes — the route passes
  *     `new Date()` (ui/index.ts loadAdminMonitorCron) and the Next Time
@@ -198,9 +238,17 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "admin-users.html", path: "/-/admin/users", status: 200, signedIn: true, sessionUser: "morgan" },
   // The R6-audit wave's addition: the orgs list rides morgan's promotion like
   // admin-users (the shared admin gate) and the EXISTING org fixtures — no
-  // new seeds, so no committed byte moves. admin-repos/admin-monitor are
-  // documented skips (the block comment above).
+  // new seeds, so no committed byte moves. admin-monitor is a documented
+  // skip (the block comment above).
   { file: "admin-orgs.html", path: "/-/admin/orgs", status: 200, signedIn: true, sessionUser: "morgan" },
+  // The wave-fixed-id-seed closure of the admin-repos skip (the block
+  // comment above): the POSITIVE-MATCH keyword arm over the fixed-id
+  // fixture row seeded in the beforeAll above — the full admin chrome and
+  // the real 10-column table with exactly one deterministic row. The bare
+  // `/-/admin/repos` path stays unlandable until every harness repo id is
+  // pinned (six randomUUID() rows render + the CAST id-order stand-in
+  // randomizes row order — the block comment above holds the mechanism).
+  { file: "admin-repos.html", path: "/-/admin/repos?q=admin-golden", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "user-settings-account.html", path: "/user/settings/account", status: 200, signedIn: true },
   { file: "profile-watching.html", path: "/alice?tab=watching", status: 200, signedIn: true },
   { file: "milestone-detail.html", path: "/alice/golden-ms/milestone/2", status: 200, signedIn: true },

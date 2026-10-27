@@ -12,8 +12,9 @@ import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } f
 // NEW_GOLDEN_CASES) — covered EXPLICITLY by the expansion arms below, never
 // through harness.ts's GOLDEN_CASES (that table feeds the smoke loop above
 // too; entries added there would silently grow this suite without review).
-import adminUsersGolden from "./goldens/admin-users.html?raw";
 import adminOrgsGolden from "./goldens/admin-orgs.html?raw";
+import adminReposGolden from "./goldens/admin-repos.html?raw";
+import adminUsersGolden from "./goldens/admin-users.html?raw";
 import bareShellGolden from "./goldens/bare-shell.html?raw";
 import branchesGolden from "./goldens/branches.html?raw";
 import commitViewGolden from "./goldens/commit-view.html?raw";
@@ -274,6 +275,14 @@ const EXPANSION_ARMS: ExpansionArm[] = [
   // aria-label; fixed with the peer-icon-anchor precedent (releases.tsx:870),
   // golden regenerated, landed clean.
   { file: "admin-orgs.html", golden: adminOrgsGolden, mainAriaLabel: "Organizations", mainClassTokens: ["admin", "user"], thWithoutScope: 0 },
+  // admin-repos (the wave-fixed-id-seed closure — the positive-match `?q=`
+  // arm over the fixed-id fixture repo, goldens.test.ts's block comment):
+  // the R6 net's first sight of the repos table found NO violation to
+  // pre-fix — every anchor on the page carries a name (the row's Owner/Name
+  // anchors are text; the SortHeader anchors are text + aria-hidden svg; the
+  // two icon-only navbar anchors carry aria-labels), and all ten th cells
+  // carry scope (the admin-users gap-closed posture held here from birth).
+  { file: "admin-repos.html", golden: adminReposGolden, mainAriaLabel: "Repositories", mainClassTokens: ["admin"], thWithoutScope: 0 },
 ];
 
 describe("wave-129 expansion arms (explicit cases, not the shared table)", () => {
@@ -354,6 +363,73 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     // scope="col" (the fix landed with the golden regeneration — see the
     // EXPANSION_ARMS note above).
     expect(ths.every((el) => el.attrs.scope === "col"), "every th carries scope=col (the closed gap)").toBe(true);
+  });
+
+  it("admin-repos: the admin sidebar names every arm (Repositories active), the ten headers are named and scoped, and the fixture row pins the fixed id", () => {
+    const root = parseHtmlTree(adminReposGolden);
+    const nav = descendants(root).find((el) => hasClass(el, "flex-container-nav"));
+    expect(nav, "the admin sidebar nav").toBeDefined();
+    const items = descendants(nav ?? root).filter((el) => el.tag === "a");
+    expect(items.map((el) => accessibleName(el))).toEqual([
+      "Dashboard",
+      "Organizations",
+      "User Accounts",
+      "Repositories",
+      "Stats",
+      "Cron Tasks",
+      "Queues",
+      "Trace",
+    ]);
+    const active = items.filter((el) => hasClass(el, "active"));
+    expect(active.map((el) => accessibleName(el))).toEqual(["Repositories"]);
+    expect(active[0]?.attrs.href).toBe("/-/admin/repos");
+    // The page's only heading is the section header carrying the FILTERED
+    // total (the keyword arm's one matching row — the wave-fixed-id-seed
+    // design, goldens.test.ts's block comment).
+    const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
+    expect(headings.map((el) => accessibleName(el))).toEqual(["Repository Management (Total: 1)"]);
+
+    // The repos table: ten header cells, every one named and scope-carrying
+    // (five via the text + aria-hidden-svg SortHeader anchors, five plain).
+    const table = descendants(root).find((el) => el.tag === "table");
+    expect(table, "the repos table").toBeDefined();
+    const thead = (table ?? root).children.find((el) => el.tag === "thead");
+    expect(thead, "the repos table has a thead").toBeDefined();
+    const ths = descendants(thead ?? root).filter((el) => el.tag === "th");
+    expect(ths.map((el) => accessibleName(el))).toEqual([
+      "ID",
+      "Owner",
+      "Name",
+      "Watchers",
+      "Stars",
+      "Forks",
+      "Issues",
+      "Size",
+      "Updated",
+      "Created",
+    ]);
+    expect(ths.every((el) => el.attrs.scope === "col"), "every th carries scope=col").toBe(true);
+
+    // The single fixture row (goldens.test.ts's ensureSeededFixedIdRepo
+    // seed): the ID cell renders the FIXED uuid verbatim — the R6 gap's
+    // whole point — beside the text anchors and the Private label (the
+    // fixture is private, so no anonymous-listing golden ever moved).
+    const bodyRow = descendants(table ?? root).find((el) => el.tag === "tr" && descendants(el).some((c) => c.tag === "td"));
+    expect(bodyRow, "the tbody row").toBeDefined();
+    const tds = descendants(bodyRow ?? root).filter((el) => el.tag === "td");
+    expect(tds).toHaveLength(10);
+    expect(accessibleName(tds[0] ?? ({} as never))).toBe("00000000-0000-4000-8000-000000000001");
+    expect(
+      tds[1] ? descendants(tds[1]).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)]) : [],
+    ).toEqual([["/morgan", "morgan"]]);
+    expect(
+      tds[2] ? descendants(tds[2]).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)]) : [],
+    ).toEqual([["/morgan/admin-golden", "admin-golden"]]);
+    const labels = tds[2] ? descendants(tds[2]).filter((el) => hasClass(el, "ui") && hasClass(el, "label")) : [];
+    expect(labels.map((el) => accessibleName(el))).toEqual(["Private"]);
+    // The null-Updated arm renders the empty cell; Created is T0-pinned.
+    expect(accessibleName(tds[8] ?? ({} as never))).toBe("");
+    expect(accessibleName(tds[9] ?? ({} as never))).toBe("Nov 14, 2023");
   });
 
   it("user-settings-account: the settings sidebar names every arm (Account active) and the three section headings hold level", () => {
