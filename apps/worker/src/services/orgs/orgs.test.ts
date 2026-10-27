@@ -14,6 +14,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
+import { canViewRepositoryWithTeams, doerRepoAccessMode, type Viewer } from "../../api/services/repository";
 import { RepoService } from "../../repos/service";
 import {
   LastOrgOwnerError,
@@ -63,6 +64,69 @@ const rawMemberships = async (orgId: number): Promise<{ user_id: number; role: s
       .bind(orgId)
       .all<{ user_id: number; role: string; is_public: number }>()
   ).results;
+
+/** Viewer fixture for the repository-service predicates (the
+ *  repository.test.ts `viewerFor` shape — requester resolved, not admin). */
+const viewerFor = (user: { id: number; username: string }): Viewer => ({
+  origin: "https://example.com",
+  requester: {
+    id: user.id,
+    login: user.username,
+    email: "",
+    full_name: "",
+    avatar_url: "",
+    html_url: "",
+    language: "",
+    location: "",
+    website: "",
+    description: "",
+    active: true,
+    is_admin: false,
+    prohibit_login: false,
+    restricted: false,
+    login_name: "",
+    source_id: 0,
+    followers_count: 0,
+    following_count: 0,
+    starred_repos_count: 0,
+    created: "2026-01-01T00:00:00Z",
+    last_login: "0001-01-01T00:00:00Z",
+    type: "User",
+    visibility: "public",
+  },
+});
+
+/** Team + membership + repo grants seeded raw, with `num_members` kept the
+ *  way the landed TeamsService maintains it (one row ⇒ 1) — so a counter
+ *  assertion reads the maintenance, not a seed artifact. */
+async function seedTeamWithMember(
+  org: OrgRecord,
+  name: string,
+  authorize: string,
+  userId: number,
+  repoIds: string[],
+): Promise<number> {
+  const team = await env.DB.prepare(
+    "INSERT INTO teams (org_id, lower_name, name, authorize, num_members) VALUES (?, ?, ?, ?, 1) RETURNING id",
+  )
+    .bind(org.id, name, name, authorize)
+    .first<{ id: number }>();
+  const teamId = team!.id;
+  await env.DB.prepare("INSERT INTO team_members (org_id, team_id, user_id) VALUES (?, ?, ?)")
+    .bind(org.id, teamId, userId)
+    .run();
+  for (const repoId of repoIds) {
+    await env.DB.prepare("INSERT INTO team_repo_access (org_id, team_id, repo_id) VALUES (?, ?, ?)")
+      .bind(org.id, teamId, repoId)
+      .run();
+  }
+  return teamId;
+}
+
+const teamCounter = (teamId: number): Promise<number | undefined> =>
+  env.DB.prepare("SELECT num_members FROM teams WHERE id = ?").bind(teamId).first<{ num_members: number }>().then(
+    (row) => row?.num_members,
+  );
 
 beforeAll(async () => {
   await applyAuthD1Migrations();
@@ -533,6 +597,151 @@ describe("membership guards (§4.3 last-owner, §4.5 states)", () => {
     const missingOrg = await service().addMember(424242, user).catch((e: unknown) => e);
     expect(missingOrg).toBeInstanceOf(OrgNotExistError);
     expect(await service().removeMember(org.id, 424242)).toBe(false); // non-member: silent no-op
+  });
+});
+
+describe("removeMember revokes the team grants (the S2 sweep)", () => {
+  // Every grant predicate — teamRepoAccessMode, the org-repos team arm, the
+  // feeds cond, the git push gate via doerRepoAccessMode — joins team_members
+  // WITHOUT re-checking org membership, so the membership delete alone leaves
+  // a removed member reading and pushing. The round-trip below drives the
+  // real predicates, not row counts.
+
+  it("a member on TWO teams loses git push + API visibility on BOTH org repos immediately", async () => {
+    const org = await seedOrg("Revoke");
+    const mate = await seedVerifiedUser({ username: "Mate" });
+    await service().addMember(org.id, mate.id);
+    const alpha = await seedOrgRepo(org, "alpha", true);
+    const beta = await seedOrgRepo(org, "beta", true);
+    // One write-mode team per repo, the mate on both.
+    await seedTeamWithMember(org, "alpha-crew", "write", mate.id, [alpha]);
+    await seedTeamWithMember(org, "beta-crew", "write", mate.id, [beta]);
+    const alphaRow = (await repoService().get(alpha))!;
+    const betaRow = (await repoService().get(beta))!;
+
+    // Precondition — the grants are live through the real predicates: the
+    // git push gate (doerRepoAccessMode — git-http/acl.ts consults exactly
+    // this) resolves write, and the API visibility resolver admits the
+    // private rows.
+    expect(await doerRepoAccessMode(env.DB, alphaRow, mate.id)).toBe("write");
+    expect(await doerRepoAccessMode(env.DB, betaRow, mate.id)).toBe("write");
+    expect(await canViewRepositoryWithTeams(env.DB, viewerFor(mate), alphaRow)).toBe(true);
+    expect(await canViewRepositoryWithTeams(env.DB, viewerFor(mate), betaRow)).toBe(true);
+
+    expect(await service().removeMember(org.id, mate.id)).toBe(true);
+
+    // Revocation is immediate on BOTH repos: write mode (push) and the
+    // private-repo view are both gone with the swept team rows.
+    expect(await doerRepoAccessMode(env.DB, alphaRow, mate.id)).toBe("none");
+    expect(await doerRepoAccessMode(env.DB, betaRow, mate.id)).toBe("none");
+    expect(await canViewRepositoryWithTeams(env.DB, viewerFor(mate), alphaRow)).toBe(false);
+    expect(await canViewRepositoryWithTeams(env.DB, viewerFor(mate), betaRow)).toBe(false);
+
+    // The rows behind the predicates: BOTH team_members rows are gone (the
+    // S2 bug left them standing), and num_members held on both sides —
+    // org counter back to the creator alone, each swept team back to 0.
+    const leftovers = await env.DB
+      .prepare("SELECT team_id FROM team_members WHERE org_id = ? AND user_id = ?")
+      .bind(org.id, mate.id)
+      .all<{ team_id: number }>();
+    expect(leftovers.results).toHaveLength(0);
+    expect((await rawUserRow("revoke"))?.num_members).toBe(1);
+    const counters = await env.DB
+      .prepare("SELECT lower_name, num_members FROM teams WHERE org_id = ? ORDER BY lower_name")
+      .bind(org.id)
+      .all<{ lower_name: string; num_members: number }>();
+    expect(counters.results).toEqual([
+      { lower_name: "alpha-crew", num_members: 0 },
+      { lower_name: "beta-crew", num_members: 0 },
+    ]);
+  });
+
+  it("the last-owner guard holds the WHOLE sweep: an owner on a team keeps the team row and every counter", async () => {
+    const org = await seedOrg("Loyal");
+    const ownerId = (await rawUserRow("loyal-owner"))!.id as number;
+    const teamId = await seedTeamWithMember(org, "owners-crew", "read", ownerId, []);
+
+    const err = await service().removeMember(org.id, ownerId).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LastOrgOwnerError);
+
+    // Upstream's whole-tx rollback shape: the sweep is chained to the
+    // membership delete (the same guarded-batch pattern), so a held delete
+    // keeps the team row AND both counters in place.
+    expect(
+      await env.DB
+        .prepare("SELECT COUNT(*) AS n FROM team_members WHERE team_id = ?")
+        .bind(teamId)
+        .first<{ n: number }>(),
+    ).toMatchObject({ n: 1 });
+    expect(await teamCounter(teamId)).toBe(1);
+    expect((await rawUserRow("loyal"))?.num_members).toBe(1);
+    expect(await rawMemberships(org.id)).toHaveLength(1);
+  });
+
+  it("a member on NO team: the sweep is a no-op and a team they never joined keeps its counter", async () => {
+    const org = await seedOrg("Plain");
+    const loner = await seedVerifiedUser({ username: "Loner" });
+    const mate = await seedVerifiedUser({ username: "Mate" });
+    await service().addMember(org.id, loner.id);
+    await service().addMember(org.id, mate.id);
+    const othersId = await seedTeamWithMember(org, "others", "read", mate.id, []);
+    expect((await rawUserRow("plain"))?.num_members).toBe(3);
+
+    expect(await service().removeMember(org.id, loner.id)).toBe(true);
+    // The org counter moves (3 → 2); the counter decrement is per SWEPT
+    // team, never org-wide — `others` keeps counting its own member.
+    expect((await rawUserRow("plain"))?.num_members).toBe(2);
+    expect(await teamCounter(othersId)).toBe(1);
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM team_members WHERE org_id = ?").bind(org.id).first<{ n: number }>()).toMatchObject({ n: 1 });
+
+    // Repeat removal stays the silent no-op (the pre-check arm).
+    expect(await service().removeMember(org.id, loner.id)).toBe(false);
+    expect((await rawUserRow("plain"))?.num_members).toBe(2);
+  });
+});
+
+describe("deleteOrg (the org-lifecycle sweep)", () => {
+  it("sweeps teams, team_members and team_repo_access with the org (migration 0015 rows)", async () => {
+    const org = await seedOrg("Doomed");
+    const mate = await seedVerifiedUser({ username: "Mate" });
+    await service().addMember(org.id, mate.id);
+    await seedTeamWithMember(org, "crew", "read", mate.id, ["t_ghost"]);
+    // A memberless team carrying a grant row too (org_id-swept, not
+    // member-swept — team_repo_access.repo_id declares no FK).
+    const empty = await env.DB
+      .prepare("INSERT INTO teams (org_id, lower_name, name) VALUES (?, 'empty', 'empty') RETURNING id")
+      .bind(org.id)
+      .first<{ id: number }>();
+    await env.DB.prepare("INSERT INTO team_repo_access (org_id, team_id, repo_id) VALUES (?, ?, 't_ghost2')")
+      .bind(org.id, empty!.id)
+      .run();
+
+    expect(await service().deleteOrg(org.id)).toBe(true);
+    for (const table of ["teams", "team_members", "team_repo_access", "org_members"]) {
+      const row = await env.DB
+        .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE org_id = ?`)
+        .bind(org.id)
+        .first<{ n: number }>();
+      expect(row, table).toMatchObject({ n: 0 });
+    }
+    expect(await rawUserRow("doomed")).toBeNull();
+    // Already-gone org: false no-op.
+    expect(await service().deleteOrg(org.id)).toBe(false);
+  });
+
+  it("still refuses when the org owns repositories — and the refusal sweeps nothing", async () => {
+    const org = await seedOrg("Holding");
+    const mate = await seedVerifiedUser({ username: "Mate" });
+    await service().addMember(org.id, mate.id);
+    const teamId = await seedTeamWithMember(org, "crew", "read", mate.id, []);
+    await seedOrgRepo(org, "kept", true);
+
+    const err = await service().deleteOrg(org.id).catch((e: unknown) => e);
+    // Upstream ErrUserOwnRepos, deliberately untyped (the 500-shaped guard).
+    expect((err as Error).message).toBe(`organization owns repositories [uid: ${org.id}]`);
+    expect(await teamCounter(teamId)).toBe(1);
+    expect(await rawMemberships(org.id)).toHaveLength(2);
+    expect(await rawUserRow("holding")).not.toBeNull();
   });
 });
 

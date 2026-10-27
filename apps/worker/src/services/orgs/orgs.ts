@@ -799,7 +799,7 @@ export class OrgService {
 
   /**
    * Remove a member — port of upstream `RemoveOrgUser`
-   * (services/org/user.go:22–52): a non-member is a silent no-op (false) via
+   * (services/org/user.go:22–104): a non-member is a silent no-op (false) via
    * the pre-batch membership check (upstream's `!has → return nil`,
    * user.go:31–35). That check is load-bearing for the counter: the batch's
    * `(SELECT COUNT(*) …) = 0` decrement guard is ALSO true for a row that
@@ -811,9 +811,33 @@ export class OrgService {
    * guard race-proof, and for a real last owner the row survives so the
    * count guard skips the decrement. Raises `LastOrgOwnerError` (upstream
    * `ErrLastOrgOwner` → API 500, §4.3).
+   *
+   * The §3.5 team sweep (upstream's "Delete member in their teams" loop,
+   * user.go:88–96 via `removeTeamMember`, team.go:312–352): EVERY
+   * `team_members` row of this org goes with the membership, each swept
+   * team's `num_members` decremented by its own guarded statement (the
+   * org-teams.ts `removeTeamMember` batch shape, minus the org_members arm).
+   * This is security-load-bearing, not bookkeeping: every grant predicate
+   * (`teamRepoAccessMode`, the org-repos team arm, the feeds cond, the git
+   * push gate via `doerRepoAccessMode`) reads `team_members` WITHOUT
+   * re-checking org membership, so a row surviving here leaves a removed
+   * member reading and pushing until separately removed from each team.
+   * Statement order chains the guards: the sweep's delete carries the same
+   * membership-gone guard as the counter, so the last-owner guard holding
+   * the first delete keeps every team row AND counter in place (upstream's
+   * whole-tx rollback shape). The swept-team id list is read before the
+   * batch (upstream `GetUserOrgTeams`); a team-add racing the batch loses
+   * its row (the delete is org+user-scoped) but keeps that team's counter
+   * at +1 — the maintained counter is advisory, the grants are not.
    */
   async removeMember(orgId: number, userId: number): Promise<boolean> {
     if ((await this.findMembership(orgId, userId)) === null) return false;
+    const sweptTeams = await this.db
+      .select({ id: teams.id })
+      .from(teams)
+      .innerJoin(teamMembers, and(eq(teamMembers.teamId, teams.id), eq(teamMembers.userId, userId)))
+      .where(eq(teams.orgId, orgId))
+      .all();
     const results = await this.db.batch([
       this.db
         .delete(orgMembers)
@@ -834,11 +858,33 @@ export class OrgService {
             sql`(select count(*) from org_members where org_id = ${orgId} and user_id = ${userId}) = 0`,
           ),
         ),
+      // The sweep — runs only when the membership delete above landed (the
+      // same `… = 0` guard, evaluated after that delete in this transaction).
+      this.db.delete(teamMembers).where(
+        and(
+          eq(teamMembers.orgId, orgId),
+          eq(teamMembers.userId, userId),
+          sql`(select count(*) from org_members where org_id = ${orgId} and user_id = ${userId}) = 0`,
+        ),
+      ),
+      // One guarded counter per swept team (org-teams.ts:635-643's shape).
+      ...sweptTeams.map((team) =>
+        this.db
+          .update(teams)
+          .set({ numMembers: sql`${teams.numMembers} - 1` })
+          .where(
+            and(
+              eq(teams.id, team.id),
+              sql`(select count(*) from team_members where team_id = ${team.id} and user_id = ${userId}) = 0`,
+            ),
+          ),
+      ),
     ]);
     if (results[0].length > 0) return true;
     // The guard held the delete: the last owner (typed 500, upstream
     // message) — or, only in a race, the row vanished between the pre-check
-    // and the batch, which stays a silent no-op.
+    // and the batch, which stays a silent no-op. The sweep above is chained
+    // to the same guard, so nothing team-scoped moved either.
     const member = await this.findMembership(orgId, userId);
     if (member === null) return false;
     throw new LastOrgOwnerError(userId);
@@ -951,14 +997,19 @@ export class OrgService {
    * 29–52): the caller-level repository guard first (upstream answers the
    * count>0 case with `ErrUserOwnRepos` INSIDE the tx — the API route maps
    * every error through `APIErrorInternal`, so the message never surfaces),
-   * then ONE D1 batch: the membership rows (`OrgUser`), any redirect rows
-   * pointing at or squatting the org's names (upstream relies on the
-   * `user_redirect.redirect_user_id` FK cascade; deleting by the lower_name
-   * too keeps the namespace immediately reusable), and the `users` row
-   * itself (`type='org'`-guarded). Teams/TeamUsers are the tier-1
-   * `role` collapse (SPEC-0007 §3.3) — no separate rows exist to delete;
-   * unmodeled upstream beans (secrets, actions runners, packages) have no
-   * tables yet. Returns false when the org row is already gone.
+   * then ONE D1 batch: the membership rows (`OrgUser`), the §3.5 team rows
+   * (`teams`/`team_members`/`team_repo_access`, migration 0015 — swept
+   * explicitly, child tables first; upstream deletes the team beans in the
+   * same cascade, org.go:29–52), any redirect rows pointing at or squatting
+   * the org's names (upstream relies on the `user_redirect.redirect_user_id`
+   * FK cascade; deleting by the lower_name too keeps the namespace
+   * immediately reusable), and the `users` row itself (`type='org'`-guarded;
+   * the team tables also carry `ON DELETE CASCADE` FKs to it — the explicit
+   * sweep keeps the deletion visible in the batch, not implicit in the
+   * cascade). `team_repo_access.repo_id` declares no FK, so its rows are
+   * swept first and only by `org_id`. Unmodeled upstream beans (secrets,
+   * actions runners, packages) have no tables yet. Returns false when the
+   * org row is already gone.
    */
   async deleteOrg(orgId: number): Promise<boolean> {
     const org = await this.getOrgById(orgId);
@@ -975,6 +1026,9 @@ export class OrgService {
       throw new Error(`organization owns repositories [uid: ${orgId}]`);
     }
     await this.db.batch([
+      this.db.delete(teamRepoAccess).where(eq(teamRepoAccess.orgId, orgId)),
+      this.db.delete(teamMembers).where(eq(teamMembers.orgId, orgId)),
+      this.db.delete(teams).where(eq(teams.orgId, orgId)),
       this.db.delete(orgMembers).where(eq(orgMembers.orgId, orgId)),
       this.db.delete(userRedirects).where(eq(userRedirects.redirectUserId, orgId)),
       this.db.delete(userRedirects).where(eq(userRedirects.lowerName, org.usernameLower)),

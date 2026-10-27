@@ -813,6 +813,51 @@ describe("team grants decide the git-HTTP matrix (SPEC-0007 §3.5 via authorizeG
     expect(ownerClone.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
     expect(new TextDecoder().decode(await ownerClone.arrayBuffer())).toContain(fx.oid);
   });
+
+  it("removeMember revokes a TWO-team member's fetch and push adverts immediately (the services sweep)", async () => {
+    const fx = await seedTeamGrantFixture();
+    const orgs = new OrgService(env.DB);
+    const teams = new TeamsService(env.DB);
+    const orgRow = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "acme")).get();
+    if (orgRow === undefined) throw new Error("fixture org missing");
+    const writer = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "teamwriter")).get();
+    if (writer === undefined) throw new Error("fixture writer missing");
+
+    // The writer joins a SECOND write-mode team covering vault — revocation
+    // must sweep every team with the membership, not one at a time.
+    const second = await teams.createTeam((await orgs.getOrgById(orgRow.id))!, {
+      name: "second-crew",
+      permission: "write",
+    });
+    const vault = (await repoService().getBySlug("acme", "vault"))!;
+    await teams.addTeamRepo(second, vault.id);
+    await teams.addTeamMember(second, writer.id);
+
+    const auth = { authorization: basicTokenHeader(fx.tokens.writerWrite) };
+    // Precondition through the real gate: the push advert is allowed while
+    // the team rows stand.
+    const pushBefore = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-receive-pack", {
+      headers: auth,
+    });
+    expect(pushBefore.status).toBe(200);
+
+    expect(await orgs.removeMember(orgRow.id, writer.id)).toBe(true);
+
+    // Both adverts collapse to the row-9 404 mask (plain "Repository not
+    // found", no re-challenge) — doerRepoAccessMode re-reads the swept
+    // team_members per request, so no credential or cache window remains.
+    const fetchAfter = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-upload-pack", {
+      headers: auth,
+    });
+    expect(fetchAfter.status).toBe(404);
+    expect(new TextDecoder().decode(await fetchAfter.arrayBuffer())).toBe("Repository not found");
+    const pushAfter = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-receive-pack", {
+      headers: auth,
+    });
+    expect(pushAfter.status).toBe(404);
+    expect(new TextDecoder().decode(await pushAfter.arrayBuffer())).toBe("Repository not found");
+    expect(pushAfter.headers.get("www-authenticate")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
