@@ -63,6 +63,8 @@
 // modifies vitest.config.ts, tests, or any source; it only runs vitest and
 // parses its output.
 
+import console from "node:console";
+import process from "node:process";
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
