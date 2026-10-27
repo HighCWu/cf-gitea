@@ -186,7 +186,14 @@ const CANONICAL_FIXTURE_OID = "502abd2d5561536873088528a9f57f02cd1633e1";
 const parseArgs = (argv) => {
   const opts = {
     battery: null, baseUrl: null, tokenFile: null, user: DEFAULT_USER,
-    json: false, dryRun: false, help: false, timeoutMs: 20_000,
+    json: false, dryRun: false, help: false,
+    // 60s default (the 2026-10-27 wrap's live finding): the heavy flows
+    // (generate --strict-generated-clone, mirror create, t2 rename) LEGITIMATELY
+    // exceed 20s on a fresh deployment — every run-1/run-2 "timeout" left its
+    // repo created server-side (the operation succeeded; only the response
+    // wait aborted), leaking residue into the cleanup audit. 20s was calibrated
+    // when the flows were smaller; AbortSignal only bites when actually slow.
+    timeoutMs: 60_000,
     trials: 3, fixtureRepo: "p0-shallow", fixtureOid: null, newLabelCount: 3,
     strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 1,
     mirrorSettleMs: 30_000, forceRed: null,
