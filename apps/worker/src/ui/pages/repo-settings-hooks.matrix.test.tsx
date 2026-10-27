@@ -25,6 +25,18 @@
  *     each with zero side-effects,
  *   - the site-admin's list GET (the gate's other admit — the wave-4 block
  *     rides the owner only; the wave-14 block rides the detail page only).
+ *
+ * Wave-129 additions (the forms' validation/round-trip arms the blocks above
+ * leave open): the create form's EMPTY-payload-url 422 (the config key is
+ * always presented by the parse, so the service's "Missing config option"
+ * arm is unreachable here — the empty string fails IsValidURL, the same
+ * "Invalid url" text over a distinct input) with the carried name +
+ * content_type=form selection and no row written; the inactive-create
+ * round-trip (content_type form + active absent → the id-2 content type,
+ * isActive false, the listed row); and the edit POST's UNCONDITIONAL
+ * subscription rewrite over a no-events body (push-only collapse + the
+ * branch filter + the unchecked-active deactivation, read back through the
+ * page's binding).
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
@@ -284,5 +296,89 @@ describe("the delete write's open gates (POST /{owner}/{repo}/settings/hooks/{id
     expect(res.status).toBe(403);
     expect(await res.text()).toContain("cross-origin request rejected");
     expect(await storedHooks()).toEqual([{ name: "seeded hook", url: "https://hooks.example.com/still-here", isActive: true }]);
+  });
+});
+
+// --- the wave-129 validation shapes (the forms' deepest arms) ----------------------
+
+describe("the create form's validation shapes (POST /{owner}/{repo}/settings/hooks)", () => {
+  it("re-renders the empty-url 422 with the carried submission; no row lands", async () => {
+    // wave4 pins the scheme-miss ("Invalid url" for ftp://); the EMPTY url
+    // is the OTHER 422 input: parseCreateHookForm always PRESENTS the url
+    // config key (so checkCreateHookOption's "Missing config option" arm is
+    // unreachable through this form) and the empty string fails IsValidURL —
+    // the same "Invalid url" text over a distinct input, with the form
+    // choice carried back through HooksSettingsData.form.
+    const res = await postAs(
+      "/alice/demo/settings/hooks",
+      { name: "kept name", payload_url: "", content_type: "form" },
+      await ownerSessionHeader(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="ui negative message">Invalid url</div>');
+    // The carried submission: the name input and the content_type select
+    // (the form choice rides back through HooksSettingsData.form).
+    expect(html).toContain('id="hook_name" name="name" type="text" maxlength="255" value="kept name"');
+    expect(html).toContain('<option value="form" selected="">');
+    // Nothing was written.
+    expect(await storedHooks()).toEqual([]);
+  });
+
+  it("stores the form content type with active absent: the inactive-create round-trip lists the row", async () => {
+    const res = await postAs(
+      "/alice/demo/settings/hooks",
+      { name: "inactive hook", payload_url: "https://hooks.example.com/inactive", content_type: "form" },
+      await ownerSessionHeader(),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/alice/demo/settings/hooks");
+    // The stored row: contentType id 2 (form) and isActive FALSE — the
+    // unchecked checkbox is a legitimate create posture, not an error.
+    const rows = await drizzle(env.DB).select().from(webhooks).where(eq(webhooks.repoId, repo.id)).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.name).toBe("inactive hook");
+    expect(rows[0]?.contentType).toBe(2);
+    expect(rows[0]?.isActive).toBe(false);
+    // The list renders the row (its edit anchor + URL span).
+    const list = await fetchUi("/alice/demo/settings/hooks", { headers: { cookie: await ownerSessionHeader() } });
+    const html = await list.text();
+    expect(html).toContain(">inactive hook</a>");
+    expect(html).toContain('<span class="tw-ml-2 tw-text-grey-light">https://hooks.example.com/inactive</span>');
+  });
+});
+
+describe("the edit form's subscription rewrite (POST /{owner}/{repo}/settings/hooks/{id})", () => {
+  it("a POST without the events field rewrites push-only and carries the branch filter; the active checkbox deactivates", async () => {
+    // The events hidden preserves ride the rendered form; a POST lacking
+    // them (the no-JS-plain form) exercises the PATCH arm's UNCONDITIONAL
+    // rewrite — updateHookEvents([]) collapses to push-only (the service's
+    // documented "empty form.Events ⇒ push-only"), the posted branch filter
+    // lands, and the absent checkbox deactivates the row (the form's own
+    // contract: unchecked = off).
+    const hookId = await seedHook("https://hooks.example.com/rewritten");
+    const res = await postAs(
+      `/alice/demo/settings/hooks/${hookId}`,
+      { name: "rewritten hook", payload_url: "https://hooks.example.com/rewritten-v2", content_type: "json", branch_filter: "{main}" },
+      await ownerSessionHeader(),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/alice/demo/settings/hooks/${hookId}`);
+    const row = (await drizzle(env.DB).select().from(webhooks).where(eq(webhooks.id, hookId)).get())!;
+    expect(row.isActive).toBe(false);
+    const stored = JSON.parse(row.events) as { choose_events: boolean; branch_filter: string; events: Record<string, boolean> };
+    expect(stored.choose_events).toBe(true);
+    expect(stored.branch_filter).toBe("{main}");
+    expect(stored.events.push).toBe(true);
+    expect(stored.events.create).toBe(false);
+    // The re-read binds the new state: the filter input, the UNCHECKED
+    // active box, and the push-only Trigger On line.
+    const page = await fetchUi(`/alice/demo/settings/hooks/${hookId}`, { headers: { cookie: await ownerSessionHeader() } });
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain('id="branch_filter" name="branch_filter" type="text" value="{main}"');
+    expect(html).toContain('id="hook_active" name="active" type="checkbox"/>');
+    expect(html).toContain("Trigger On: push");
+    expect(html).toContain('type="hidden" name="events" value="push"');
   });
 });

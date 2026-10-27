@@ -62,13 +62,26 @@
  *     mount wave lands the two POST arms. Per the wave brief, the
  *     unmounted POSTs' 404s are DOCUMENTED here (pages/branches.tsx's
  *     HANDOFF — render + upstream contract first, write arm second), never
- *     pinned: the mount wave flips them deliberately.
+ *     pinned: the mount wave flips them deliberately. Window-2e folds
+ *     (635ce2e) mounted BOTH POST arms and the pin moved to the claimed
+ *     shape;
+ *   - the wave-129 write arms over a dedicated `w100wr` fixture (main +
+ *     side, unarchived — the arms mutate refs, so the read-pinned repos
+ *     above stand alone): the quick-create POST's success round-trip
+ *     (`?created=` + the ref AT THE SOURCE TIP + the list row), the
+ *     unknown-source DEFAULT-BRANCH FALLBACK (resolveNamedRef's documented
+ *     "or the default branch" posture — ghost is not a refusal), the
+ *     empty/colliding refusals and the archived + anonymous 404 shells, and
+ *     the rename POST's round-trip (the ref swap verified through listRefs
+ *     + `?renamed=`) with its refusal set (the plain owner's default-branch
+ *     refusal — branch.go:443-447's site-admin arm — plus empty / missing /
+ *     colliding / self pairs).
  */
 
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { ZERO_OID } from "../../api/services/engine";
 import { saveRepoSettings } from "../../api/services/repo-settings";
@@ -82,6 +95,14 @@ import { parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import type { UiManifest } from "../manifest";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
+
+// wave-129 full-run contention budget: this file's beforeAll seeding (the
+// receive-flow w100* fixture family) measured a 6.26s hook share of the 30s
+// default IN a green 8-worker full run (the suite's 260-isolate spawn storm
+// spikes closures up to ~12x their solo time). File-local 90s budgets;
+// vitest.config.ts keeps 30s for every other file. Membership: the measured
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 // --- the minted-session route harness (the commits.matrix pattern) --------------
 
@@ -306,6 +327,20 @@ async function ensureFixtures(): Promise<void> {
     tips,
     pack,
     { defaultBranch: "main", isArchived: true },
+  );
+
+  // The write-arms repo (wave-129): main + side, unarchived — the mounted
+  // _new/rename POST arms mutate its refs, so it stands alone from the
+  // read-pinned repos above.
+  await ensureRepo(
+    "w100wr",
+    [
+      { name: "main", tipIndex: MAIN_TIP },
+      { name: "side", tipIndex: AHEAD_TIP },
+    ],
+    tips,
+    pack,
+    { defaultBranch: "main" },
   );
 
   // The moved-on PR over w100br's `moved` branch (the wave-17 PR-column
@@ -546,5 +581,141 @@ describe("w100 display-only degrades", () => {
       expect(html).toContain(`href="/${OWNER}/w100br/src/branch/stale"`);
       expect(html, page).not.toContain("Newer");
     }
+  });
+});
+
+// --- the mounted writer POST arms (Window-2e folds, 635ce2e) -----------------------
+
+describe("w100 quick-create write (POST /branches/_new/branch/{from})", () => {
+  it("creates the branch at the source tip, 303s ?created=, and the list renders the row", async () => {
+    // upstream web.go:1477-1481 NewBranchPost (the writer forms' POST arm
+    // the module header's HANDOFF deferred; the Window-2e fold mounted it).
+    // w100wr: main@tips[1], side@tips[2] — the create hangs off main.
+    const res = await fetchUi(
+      `/${OWNER}/w100wr/branches/_new/branch/main`,
+      formPost(`/${OWNER}/w100wr/branches/_new/branch/main`, { new_branch_name: "w100-made" }, await cookieFor(OWNER)),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?created=w100-made`);
+    // The engine half: the ref exists AT THE SOURCE TIP (RefsResult carries
+    // `target`, the refTipMap's field).
+    const tips = (await buildHistoryPack(W100_COMMITS)).tips;
+    const made = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.find(
+      (ref) => ref.name === "refs/heads/w100-made",
+    );
+    expect(made?.target).toBe(tips[MAIN_TIP]);
+    // The display half: the new row joins the list.
+    const list = await get(`/${OWNER}/w100wr/branches`);
+    expect(list.status).toBe(200);
+    expect(await list.text()).toContain(`href="/${OWNER}/w100wr/src/branch/w100-made"`);
+  });
+
+  it("refuses the empty name, falls back to the default for an unknown source, refuses the colliding name (flash redirects)", async () => {
+    const cookie = await cookieFor(OWNER);
+    const empty = await fetchUi(
+      `/${OWNER}/w100wr/branches/_new/branch/main`,
+      formPost(`/${OWNER}/w100wr/branches/_new/branch/main`, { new_branch_name: "   " }, cookie),
+    );
+    expect(empty.status).toBe(303);
+    expect(empty.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?create_error=empty&name=`);
+    // An UNKNOWN source is not a refusal: resolveNamedRef's documented
+    // posture falls back to the DEFAULT branch (engine.ts's "or the default
+    // branch" — the API's ?ref= default), so ghost→w100-fb lands at main.
+    const tips = (await buildHistoryPack(W100_COMMITS)).tips;
+    const fallback = await fetchUi(
+      `/${OWNER}/w100wr/branches/_new/branch/ghost`,
+      formPost(`/${OWNER}/w100wr/branches/_new/branch/ghost`, { new_branch_name: "w100-fb" }, cookie),
+    );
+    expect(fallback.status).toBe(303);
+    expect(fallback.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?created=w100-fb`);
+    const fbRef = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.find(
+      (ref) => ref.name === "refs/heads/w100-fb",
+    );
+    expect(fbRef?.target).toBe(tips[MAIN_TIP]);
+    const exists = await fetchUi(
+      `/${OWNER}/w100wr/branches/_new/branch/main`,
+      formPost(`/${OWNER}/w100wr/branches/_new/branch/main`, { new_branch_name: "side" }, cookie),
+    );
+    expect(exists.status).toBe(303);
+    expect(exists.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?create_error=exists&name=side`);
+    // Nothing extra landed: exactly the seeded pair + the two created arms.
+    const names = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name).sort();
+    expect(names).toEqual(["refs/heads/main", "refs/heads/side", "refs/heads/w100-fb", "refs/heads/w100-made"]);
+  });
+
+  it("404-shells the archived repo's create and the anonymous writer (the write seam's gates)", async () => {
+    // The archived half: writerControls hides the form (the archived-arms
+    // describe) AND the write seam refuses with the 404 shell.
+    const archived = await fetchUi(
+      `/${OWNER}/w100arch/branches/_new/branch/main`,
+      formPost(`/${OWNER}/w100arch/branches/_new/branch/main`, { new_branch_name: "w100-arch" }, await cookieFor(OWNER)),
+    );
+    expect(archived.status).toBe(404);
+    // The anonymous half: no write grant on the public repo → the 404 shell
+    // (no login redirect — the write seam's posture differs from the delete
+    // route's anonymous 303).
+    const anon = await fetchUi(
+      `/${OWNER}/w100wr/branches/_new/branch/main`,
+      formPost(`/${OWNER}/w100wr/branches/_new/branch/main`, { new_branch_name: "w100-anon" }),
+    );
+    expect(anon.status).toBe(404);
+    const names = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name);
+    expect(names).not.toContain("refs/heads/w100-arch");
+    expect(names).not.toContain("refs/heads/w100-anon");
+  });
+});
+
+describe("w100 rename write (POST /branches/rename)", () => {
+  it("renames side onto side-two: the ref swaps at the old tip and the list renders the new name", async () => {
+    // upstream branch.go RenameBranchPost (web.go:1486) — create-at-tip then
+    // delete, the exact engine pair the Window-2e fold replays.
+    const tips = (await buildHistoryPack(W100_COMMITS)).tips;
+    const res = await fetchUi(
+      `/${OWNER}/w100wr/branches/rename`,
+      formPost(`/${OWNER}/w100wr/branches/rename`, { from: "side", to: "side-two" }, await cookieFor(OWNER)),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?renamed=side-two`);
+    const refs = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs;
+    expect(refs.find((ref) => ref.name === "refs/heads/side")).toBeUndefined();
+    expect(refs.find((ref) => ref.name === "refs/heads/side-two")?.target).toBe(tips[AHEAD_TIP]);
+    const list = await get(`/${OWNER}/w100wr/branches`);
+    expect(await list.text()).toContain(`href="/${OWNER}/w100wr/src/branch/side-two"`);
+  });
+
+  it("refuses the default branch for the plain owner (branch.go:443-447's admin-only arm)", async () => {
+    // The OWNER session is a repo admin but NOT a site admin — upstream
+    // RenameBranch keys the default-branch rename on the SITE admin flag,
+    // so the owner's rename of `main` flashes the refusal and the refs stand.
+    const res = await fetchUi(
+      `/${OWNER}/w100wr/branches/rename`,
+      formPost(`/${OWNER}/w100wr/branches/rename`, { from: "main", to: "main-two" }, await cookieFor(OWNER)),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?rename_error=default&name=main`);
+    const names = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name);
+    expect(names).toContain("refs/heads/main");
+    expect(names).not.toContain("refs/heads/main-two");
+  });
+
+  it("refuses the empty, missing, colliding and self pairs with the flash redirects (refs untouched)", async () => {
+    const post = async (from: string, to: string): Promise<Response> =>
+      fetchUi(
+        `/${OWNER}/w100wr/branches/rename`,
+        formPost(`/${OWNER}/w100wr/branches/rename`, { from, to }, await cookieFor(OWNER)),
+      );
+    const empty = await post("", "whatever");
+    expect(empty.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?rename_error=empty&name=`);
+    const missing = await post("ghost", "ghost-two");
+    expect(missing.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?rename_error=missing&name=ghost`);
+    const collides = await post("side-two", "main");
+    expect(collides.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?rename_error=exists&name=side-two`);
+    const self = await post("side-two", "side-two");
+    expect(self.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?rename_error=exists&name=side-two`);
+    // Every response stays a redirect onto the list (never a shell) and the
+    // ref set is unchanged by the whole quartet.
+    for (const res of [empty, missing, collides, self]) expect(res.status).toBe(303);
+    const names = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name).sort();
+    expect(names).toEqual(["refs/heads/main", "refs/heads/side-two", "refs/heads/w100-fb", "refs/heads/w100-made"]);
   });
 });

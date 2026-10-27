@@ -74,6 +74,15 @@
  *     rows render the plain file-row link, and an ampersand entry name
  *     round-trips percent-encoded in the href and HTML-escaped in the
  *     title/text attributes;
+ *   - the wave-129 depth-3 + raw/view arms: the depth-3 blob view's
+ *     cumulative breadcrumb chain (repo → docs → deep links, the file
+ *     active — the depth-2 arm pins only the two-segment split), the
+ *     file-level latest-commit seam (handbook.md stays c1 while the tip is
+ *     c3 and its directory c2), the file header's Raw/History pair with the
+ *     escaped deep path, and the §4.2 binary sniff's two arms over a
+ *     dedicated `tvx-owner/tvx-media` fixture (a media-extension binary
+ *     embeds the raw route as the img src; a binary without one renders the
+ *     View Raw prompt);
  *   - the claim pin for both heads: the `.git`-trimmed repo segment claims
  *     into `src` / `tree-view-aux` (parse + route level), and the bare
  *     `/src` tail 404-shells WITH the repo header (the §4.5 context rule —
@@ -498,6 +507,51 @@ async function buildTypedPack(files: TypedFile[]): Promise<{ tip: string; pack: 
   return { tip, pack: concatArrays(chunks) };
 }
 
+/** The wave-129 view-raw pair fixture: two §4.2 binary blobs (a null byte
+ *  inside the first 8 KiB is the whole sniff — the bytes are otherwise
+ *  arbitrary). `logo.png` carries a media extension → the `<img>` embed;
+ *  `payload.bin` has none → the View Raw prompt. */
+const MEDIA_FILES: TypedFile[] = [
+  { path: "logo.png", content: "\u0000PNG\r\n\u001a\ntvx-fake-image-bytes", mode: "100644" },
+  { path: "payload.bin", content: "\u0000\u0001\u0002tvx-fake-binary", mode: "100644" },
+];
+
+/** `tvx-owner/tvx-media`: the view-raw fixture, public (unique name — the
+ *  matrix files share one storage scope). */
+const seedMediaRepo = once(async (): Promise<void> => {
+  const db = drizzle(env.DB);
+  const owner = await userIdOf("tvx-owner");
+  await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?")
+    .bind(owner, "tvx-matrix-media")
+    .run();
+  const token = (await mintFor(owner, "tvx-matrix-media", "write:repository")).plaintext;
+  const repoName = "tvx-owner/tvx-media";
+  const refs = await env.REPO.getByName(repoName).listRefs();
+  if (refs.head === null) {
+    const { tip, pack } = await buildTypedPack(MEDIA_FILES);
+    await pushRefs(repoName, [{ ref: "refs/heads/main", oid: tip }], pack, token);
+  }
+  let row = await db
+    .select()
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "tvx-owner"), eq(repositories.slug, "tvx-media")))
+    .get();
+  if (row === undefined) {
+    row = await new RepoService(env.DB).create({
+      owner: { id: owner, usernameLower: "tvx-owner" },
+      name: "tvx-media",
+      isPrivate: false,
+      status: "ready",
+    });
+  } else {
+    await settleCreatingRepo(env, row.id, repoName);
+    row = (await db.select().from(repositories).where(eq(repositories.id, row.id)).get()) ?? row;
+  }
+  if (row.visibility !== "public") {
+    await db.update(repositories).set({ visibility: "public" }).where(eq(repositories.id, row.id));
+  }
+});
+
 /** `tvx-owner/tvx-sub`: the typed-mode fixture, public. */
 const seedSubRepo = once(async (): Promise<void> => {
   const db = drizzle(env.DB);
@@ -542,6 +596,7 @@ beforeAll(async () => {
   await seedPubRepo();
   await seedSecretRepo();
   await seedSubRepo();
+  await seedMediaRepo();
 });
 
 // --- the private-repo gates (anon / outsider / collaborator) ----------------------
@@ -832,6 +887,80 @@ describe("the sub-directory navigation (the dir bar is the dir's own commit, not
     expect(table).toContain(
       '<a class="entry-name" href="/tvx-owner/tvx-pub/src/branch/main/docs/deep/handbook.md" title="handbook.md">handbook.md</a>',
     );
+  });
+});
+
+// --- the depth-3 path edges (the breadcrumb chain + the raw/view pair) ------------
+
+describe("the depth-3 blob view (the cumulative breadcrumb chain + the raw/view pair)", () => {
+  it("the deep file view: repo→docs→deep link chain, handbook.md active, the Raw/History pair carries the escaped deep path", async () => {
+    await seedPubRepo();
+    const res = await fetchUi("/tvx-owner/tvx-pub/src/branch/main/docs/deep/handbook.md");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content repository file list view file"');
+    // The breadcrumb's cumulative chain (view_content.tmpl's `.breadcrumb`):
+    // the repo section links the ref root, docs and deep stay cumulative
+    // LINKS at depth 3, and handbook.md is the ACTIVE plain text. The
+    // depth-2 arm pins the two-segment split; this pins the chain's middle.
+    expect(html).toContain('<a class="section" href="/tvx-owner/tvx-pub/src/branch/main" title="tvx-pub">tvx-pub</a>');
+    expect(html).toContain('<span class="section"><a href="/tvx-owner/tvx-pub/src/branch/main/docs" title="docs">docs</a></span>');
+    expect(html).toContain('<span class="section"><a href="/tvx-owner/tvx-pub/src/branch/main/docs/deep" title="deep">deep</a></span>');
+    expect(html).toContain('<span class="active section" title="handbook.md">handbook.md</span>');
+    expect(html).toContain('<span class="breadcrumb-divider">/</span>');
+    // The raw/view pair (file header actions): Raw targets the tier-1 API
+    // raw route with the ref query, History the commits page's path filter —
+    // both carrying the slash-bearing deep path (encoded per component).
+    expect(html).toContain(
+      '<a class="ui mini basic button" href="/api/v1/repos/tvx-owner/tvx-pub/raw/docs/deep/handbook.md?ref=main">Raw</a>',
+    );
+    expect(html).toContain(
+      '<a class="ui mini basic button" href="/tvx-owner/tvx-pub/commits?path=docs%2Fdeep%2Fhandbook.md">History</a>',
+    );
+    // The enhancement registry root (the copy button's data source) carries
+    // the same raw link, and the sidebar keeps the active sibling split.
+    expect(html).toContain('data-raw-file-link="/api/v1/repos/tvx-owner/tvx-pub/raw/docs/deep/handbook.md?ref=main"');
+    expect(html).toContain('<a class="active" href="/tvx-owner/tvx-pub/src/branch/main/docs/deep/handbook.md">handbook.md</a>');
+    expect(html).toContain('<a href="/tvx-owner/tvx-pub/src/branch/main/docs/deep/extra.md">extra.md</a>');
+    // The file-level latest-commit seam: handbook.md was born at c1 and
+    // untouched since — the box shows c1, NOT the tip (c3) and NOT the
+    // directory's c2.
+    expect(html).toContain('title="tvx c1: docs born"');
+    expect(html).toContain(`<a href="/tvx-owner/tvx-pub/commit/${pubTips[1] as string}">tvx c1: docs born</a>`);
+    expect(html).not.toContain("tvx c3: readme final");
+  });
+});
+
+describe("the §4.2 view-raw pair (the binary sniff's two arms)", () => {
+  it("a media-extension binary embeds the raw route as the img src", async () => {
+    await seedMediaRepo();
+    const res = await fetchUi("/tvx-owner/tvx-media/src/branch/main/logo.png");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content repository file list view file"');
+    // The null byte in the first 8 KiB → isBinaryData → `.view-raw`; the
+    // .png extension → the image embed whose alt/src are BOTH the raw URL.
+    expect(html).toContain('<div class="view-raw">');
+    expect(html).toContain(
+      '<img alt="/api/v1/repos/tvx-owner/tvx-media/raw/logo.png?ref=main" src="/api/v1/repos/tvx-owner/tvx-media/raw/logo.png?ref=main"/>',
+    );
+    // The registry root still carries the raw link (the copy button's data
+    // source) even on the media arm.
+    expect(html).toContain('data-raw-file-link="/api/v1/repos/tvx-owner/tvx-media/raw/logo.png?ref=main"');
+  });
+
+  it("a binary WITHOUT a media extension renders the View Raw prompt instead", async () => {
+    await seedMediaRepo();
+    const res = await fetchUi("/tvx-owner/tvx-media/src/branch/main/payload.bin");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Same binary sniff, no media kind → the render-refusal prompt with the
+    // View Raw anchor (view_file.tmpl's else branch — rel="nofollow" rides).
+    expect(html).toContain('<div class="file-view-raw-prompt tw-p-4">');
+    expect(html).toContain(
+      '<a href="/api/v1/repos/tvx-owner/tvx-media/raw/payload.bin?ref=main" rel="nofollow">View Raw</a>',
+    );
+    expect(html).not.toContain('<img alt='); // no media embed on the prompt arm
   });
 });
 

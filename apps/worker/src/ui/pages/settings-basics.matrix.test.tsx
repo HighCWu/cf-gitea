@@ -22,6 +22,23 @@
  *   - the visibility flip both ways with the D1 read-back,
  *   - the guard-first cross-origin 403 (nothing written),
  *   - and the settings-family claim pin for the bare /settings tail.
+ *
+ * Wave-129 additions (the basics family's two deepest reachable arms; the
+ * brief's other combos are NOT LANDED on this page and are disclosed, not
+ * pinned: upstream options.tmpl's features-unit toggles (enable issues/
+ * wiki/pulls), the default-branch select and the template/archived toggles
+ * have no render here — the page carries only name/description/private
+ * (the wiki feature toggle's family lives at /settings/wiki, owned by
+ * repo-settings-wiki.test.tsx; the archived toggle has no settings surface —
+ * the archived posture rides the repos that seed it directly)):
+ *
+ *   - the stale-alias consumption: renaming ONTO a name carrying another
+ *     repo's redirect row consumes the alias and files the reverse pair
+ *     (RepoService.rename's batch delete — without it the unique insert
+ *     would collide against a repo that no longer lives under the slug),
+ *   - the private toggle's downstream settings-nav visibility (the
+ *     conditional Public Access item arms for a private repo and disarms
+ *     on the flip back — SettingsNav's navbar.tmpl:7-11 conditional).
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
@@ -355,6 +372,62 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(await res.text()).toContain("cross-origin request rejected");
     expect(await storedSlug()).toBe("demo"); // nothing was written
     expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("");
+  });
+
+  it("renaming ONTO a stale redirect row consumes it: the alias flips to the renaming repo (RepoService.rename's batch swap)", async () => {
+    // The deepest redirect-row seam: rename's batch DELETES any redirect row
+    // for the NEW name before filing the OLD one — without that delete the
+    // insert would unique-collide and the rename would report a name
+    // collision against a repo that no longer exists under that slug. So
+    // gamma's rename-filed alias must let demo take the gamma name over.
+    await seedSiblingRepo("gamma");
+    // gamma → gamma2: files the row gamma → repo-2.
+    const move = await fetchUi("/alice/gamma/settings", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: ORIGIN, cookie: await ownerSessionHeader() },
+      body: new URLSearchParams({ repo_name: "gamma2" }).toString(),
+    });
+    expect(move.status).toBe(303);
+    expect(await redirectFor("alice", "gamma")).toEqual({ redirectRepoId: "repo-2" });
+    // demo → gamma: the UI route resolves the LIVE demo repo (the settings
+    // route consults no redirect), the write consumes repo-2's stale alias
+    // and files the reverse pair.
+    const take = await basicsPost({ repo_name: "gamma", description: "" });
+    expect(take.status).toBe(303);
+    expect(take.headers.get("location")).toBe("/alice/gamma/settings");
+    expect(await storedSlug()).toBe("gamma");
+    // The swap: the stale alias is CONSUMED (the live repo needs none) and
+    // the reverse pair is filed for the vacated slug. repo-2's vacated-name
+    // alias WAS the consumed gamma row — the takeover leaves it alias-less
+    // too (each rename files exactly one row; chains never accumulate).
+    expect(await redirectFor("alice", "gamma")).toBeUndefined();
+    expect(await redirectFor("alice", "demo")).toEqual({ redirectRepoId: repo.id });
+    expect(await redirectFor("alice", "gamma2")).toBeUndefined();
+  });
+
+  it("the private flip arms the conditional Public Access nav item, and flipping back disarms it", async () => {
+    // SettingsNav's navbar.tmpl:7-11 conditional: the item renders only for
+    // a PRIVATE repo (or a public-access grant) — the options page's own
+    // downstream visibility effect of the private toggle.
+    const publicPage = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(await publicPage.text()).not.toContain('href="/alice/demo/settings/public_access"');
+
+    const privatize = await basicsPost({ repo_name: "demo", private: "on" });
+    expect(privatize.headers.get("location")).toBe("/alice/demo/settings");
+    expect(await storedVisibility()).toBe("private");
+    const privatePage = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    const privateHtml = await privatePage.text();
+    expect(privateHtml).toContain('<a class="item" href="/alice/demo/settings/public_access">Public Access</a>');
+    // The private checkbox stays consistent on the re-read (the flip's
+    // round-trip half is the earlier arm's pin — here only the nav effect).
+    expect(privateHtml).toContain('<input id="private" name="private" type="checkbox" checked=""/>');
+
+    const publish = await basicsPost({ repo_name: "demo" });
+    expect(publish.status).toBe(303);
+    expect(publish.headers.get("location")).toBe("/alice/demo/settings");
+    expect(await storedVisibility()).toBe("public");
+    const backPage = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(await backPage.text()).not.toContain('href="/alice/demo/settings/public_access"');
   });
 });
 
