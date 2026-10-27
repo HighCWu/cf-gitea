@@ -625,9 +625,9 @@ export function TagProtectionPage(props: { ctx: UiContext; data: TagProtectionPa
                     <table class="ui single line table">
                       <thead>
                         <tr>
-                          <th>{tagProtectionLocale.pattern}</th>
-                          <th>{tagProtectionLocale.allowed}</th>
-                          <th />
+                          <th scope="col">{tagProtectionLocale.pattern}</th>
+                          <th scope="col">{tagProtectionLocale.allowed}</th>
+                          <th scope="col" />
                         </tr>
                       </thead>
                       <tbody>
