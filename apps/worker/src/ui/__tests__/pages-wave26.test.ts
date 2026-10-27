@@ -34,6 +34,15 @@
  * the blocked-by-source-owner arm (ForkRepository's blocked check), the
  * target-owner name collision (IsErrRepoAlreadyExist's re-render), and the
  * ContextUser fallback preselecting the first org for a source owner.
+ *
+ * w129 batch-10 additions (wave-polish-matrix-10, 2026-10-27) — the fork
+ * POST's outer GATE arms, the header/nav family's landed write seam (the
+ * shell's star/watch/fork right side is deliberately empty and the mirror
+ * tabs are settings-owned, so /fork is the one header-adjacent POST): the
+ * §2.8 cross-origin 403 (cookie and cookie-less — the guard fronts
+ * reqSignIn) and the anonymous same-origin POST's login 303 carrying the
+ * POSTed path. wave26 + batch 6 pinned the write's happy paths and inner
+ * re-gates; none of them pinned the outer gates.
  */
 
 import { env } from "cloudflare:test";
@@ -908,5 +917,93 @@ describe("w129 the fork form's owner-select refusals (the strict predicate + the
     );
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/wave26-forker/tracked-copy");
+  });
+});
+
+// --- w129 batch-10 additions (wave-polish-matrix-10, 2026-10-27) ------------------
+// The fork POST's outer gates — the §2.8 Origin guard and the anonymous login
+// seam. The repo header/nav family's landed write seam is /fork (the shell's
+// star/watch/fork right side is deliberately empty, shell.tsx; the mirror
+// watch/star POSTs web.go:1770-1771 stay unlanded with their 404 negative
+// pinned in pages/forks.matrix.test.tsx). Every arm below reuses the
+// committed wave26 fixture read-only or self-contained wave129-b10 rows.
+
+describe("w129-b10 the fork POST's gate arms (the §2.8 guard + the anonymous seam)", () => {
+  /** Fork-row count for the wave26 source (the write-nothing read-backs). */
+  async function forkCount(): Promise<number> {
+    const rows = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(eq(repositories.forkParent, wave26Fixture!.trackedId))
+      .all();
+    return rows.length;
+  }
+
+  it("a cross-origin POST with a VALID cookie 403s guard-first and writes nothing", async () => {
+    // Provenance: wave-polish-matrix-10. The releases/issues families pin
+    // their write POSTs' 403s; the fork form's POST never had the guard arm.
+    // sameOriginGuard runs before the session read (session.ts resolveUi
+    // Session), so the valid wave129-b10 cookie does not reach the gates.
+    const forker = await seedVerifiedUser({ username: "wave129-b10gate" });
+    const before = await forkCount();
+    const res = await fetchUi("/wave26-owner/tracked/fork", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://evil.example",
+        cookie: `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, forker.id)}`,
+      },
+      body: new URLSearchParams({ uid: "", repo_name: "w129-b10-evil" }).toString(),
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers.get("content-type")).toContain("text/plain");
+    expect(await res.text()).toContain("cross-origin request rejected");
+    // D1 read-back: no fork row, and the forker's namespace is untouched.
+    expect(await forkCount()).toBe(before);
+    const evil = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(eq(repositories.ownerNamespace, "wave129-b10gate"))
+      .all();
+    expect(evil).toEqual([]);
+  });
+
+  it("a cookie-less cross-origin POST 403s BEFORE the anonymous login 303", async () => {
+    // Provenance: wave-polish-matrix-10 — the guard-vs-reqSignIn ordering
+    // (403 must beat the 303 on the fork combo too; wave 5 pinned the shape
+    // for /issues/{n}/comments only).
+    const before = await forkCount();
+    const res = await fetchUi("/wave26-owner/tracked/fork", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://evil.example",
+      },
+      body: new URLSearchParams({ uid: "", repo_name: "w129-b10-anon-evil" }).toString(),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("cross-origin request rejected");
+    expect(res.headers.get("location")).toBeNull(); // never the login round-trip
+    expect(await forkCount()).toBe(before);
+  });
+
+  it("an anonymous same-origin POST 303s onto the login round-trip carrying the POSTed path, nothing written", async () => {
+    // Provenance: wave-polish-matrix-10 — wave26 pinned the GET's anonymous
+    // 303 only; the POST rides the same reqSignIn gate and the redirect_to
+    // carries the POSTed /fork path (not a GET-shaped fallback).
+    const before = await forkCount();
+    const res = await fetchUi("/wave26-owner/tracked/fork", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://test.local", // same-origin: the guard passes
+      },
+      body: new URLSearchParams({ uid: "", repo_name: "w129-b10-anon" }).toString(),
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/wave26-owner/tracked/fork")}`,
+    );
+    expect(await forkCount()).toBe(before);
   });
 });

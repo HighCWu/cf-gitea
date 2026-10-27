@@ -113,8 +113,11 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { createRepoLabel } from "../../api/services/labels";
 import {
   comments,
+  issueAssignees,
   issueLabels,
+  issueSubscriptions,
   issues,
+  milestones,
   pullRequests,
   pullReviews,
   repositories,
@@ -168,6 +171,9 @@ const REPO_SLUG = "mxissue-lab";
 const ARCHIVED_SLUG = "mxissue-arch";
 /** The seeded merge event's sha (the event line pins its 10-char short form). */
 const MERGE_SHA = "3bf1c8e2a0d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9";
+/** w129 batch-10: the sidebar populate arm's milestone name (the fixture
+ *  converges on it by repo+name, so the constant is the lookup key). */
+const SIDEBAR_MILESTONE_NAME = "mx: sidebar milestone";
 
 interface IssueDetailFixture {
   ownerCookie: string;
@@ -334,6 +340,20 @@ async function ensureIssueDetailFixtures(): Promise<IssueDetailFixture> {
     });
     closedIssueIndex = closed.index;
     await svc.closeIssue(closed.id, { actorId: owner.id, now: t(60) });
+
+    // w129 batch-10 (wave-polish-matrix-10): the sidebar's MILESTONE
+    // populate arm and the assignee-absence differential need rows no suite
+    // had seeded on this repo — one milestone bound to the closed issue and
+    // one issue_assignees edge on the open PR (the direct-update posture the
+    // locked flag above uses; the upstream sidebar writes that would attach
+    // these stay unclaimed, the 404 pin in "the sidebar write arms").
+    const sidebarMilestone = await svc.createMilestone({
+      repoId: labRepoId,
+      name: SIDEBAR_MILESTONE_NAME,
+      now: t(55),
+    });
+    await db.update(issues).set({ milestoneId: sidebarMilestone.id }).where(eq(issues.id, closed.id));
+    await db.insert(issueAssignees).values({ issueId: openPr.issue.id, assigneeId: bob.id }).onConflictDoNothing();
   } else {
     // Rehydrate (the seeded block never mutates after landing except the
     // converging labels diff below): the label id rides the first
@@ -366,6 +386,34 @@ async function ensureIssueDetailFixtures(): Promise<IssueDetailFixture> {
     mergedPrIndex = merged.index;
     wipPrIndex = wip.index;
     closedIssueIndex = closed.index;
+
+    // w129 batch-10 convergence: the sidebar milestone + assignee rows (a
+    // pre-batch tree rehydrates without them — converge, never duplicate).
+    const existingMilestone = await db
+      .select({ id: milestones.id })
+      .from(milestones)
+      .where(and(eq(milestones.repoId, labRepoId), eq(milestones.name, SIDEBAR_MILESTONE_NAME)))
+      .get();
+    const sidebarMilestoneId =
+      existingMilestone?.id ??
+      (await svc.createMilestone({ repoId: labRepoId, name: SIDEBAR_MILESTONE_NAME, now: t(55) })).id;
+    const closedRowFull = await db
+      .select({ id: issues.id, milestoneId: issues.milestoneId })
+      .from(issues)
+      .where(and(eq(issues.repoId, labRepoId), eq(issues.title, "mx: closed issue")))
+      .get();
+    if (closedRowFull === undefined) throw new Error("issue-detail matrix closed issue missing on rehydrate");
+    if (closedRowFull.milestoneId === null) {
+      await db.update(issues).set({ milestoneId: sidebarMilestoneId }).where(eq(issues.id, closedRowFull.id));
+    }
+    const assigneeEdge = await db
+      .select({ id: issueAssignees.id })
+      .from(issueAssignees)
+      .where(and(eq(issueAssignees.issueId, open.issueId), eq(issueAssignees.assigneeId, bob.id)))
+      .get();
+    if (assigneeEdge === undefined) {
+      await db.insert(issueAssignees).values({ issueId: open.issueId, assigneeId: bob.id }).onConflictDoNothing();
+    }
   }
 
   // The archived twin: one issue + one PR so both nocomment message arms
@@ -637,6 +685,125 @@ describe("the sidebar write arms", () => {
       expect(res.status, `POST /issues/${tail}`).toBe(404);
       expect(await res.text(), `POST /issues/${tail}`).not.toContain("page-content");
     }
+  });
+});
+
+// --- w129 batch-10 additions (wave-polish-matrix-10): the sidebar's ?div-only ------
+// shapes and the unlanded seams. The upstream sidebar's edit dropdowns are JS
+// islands; the landed reduction keeps only the combo DIVS with their upstream
+// data attributes (sidebar.tmpl's #label-list/#milestone-list shapes) — the
+// arms below pin those shells, the milestone POPULATE arm (the suites had no
+// bound milestone), and the three sections/upstream POST tails that stay
+// unlanded (assignee, participants, the subscribe button's watch POST).
+
+describe("the sidebar combo divs (w129 batch-10: the ?div-only edit fragments)", () => {
+  it("the labels combo carries upstream's multiple/diff data shape on BOTH families, form or not", async () => {
+    // Provenance: wave-polish-matrix-10. Wave 5 pinned the admin edit FORM's
+    // internals; the combo DIV shell itself — sidebar.tmpl's
+    // `data-selection-mode="multiple" data-update-algo="diff"` — was
+    // unpinned, as was its presence on the PR twin and for a non-admin
+    // viewer (labelOptions === null renders the div, never the form).
+    const fixture = await ensureIssueDetailFixtures();
+    for (const [path, family] of [
+      [`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`, "issues"],
+      [`/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.wipPrIndex}`, "pulls"],
+    ] as const) {
+      const res = await fetchUi(path);
+      expect(res.status, family).toBe(200);
+      const html = await res.text();
+      expect(html, family).toContain('<div class="issue-sidebar-combo" data-selection-mode="multiple" data-update-algo="diff">');
+      // The combo outlives the admin grant: the anonymous viewer gets the
+      // badge list inside the same div (and no edit form).
+      expect(html, family).toContain('<div class="ui list labels-list">');
+      expect(html, family).not.toContain('name="label_ids"');
+    }
+  });
+
+  it("the milestone combo carries upstream's single/all data shape; the unbound arm renders the empty-list span", async () => {
+    // Provenance: wave-polish-matrix-10 — wave 3 pinned "plain-text
+    // milestone" prose but never the combo div's
+    // `data-selection-mode="single" data-update-algo="all"` shell nor the
+    // No-Milestone empty arm's exact span shape (sidebar.tmpl's
+    // #milestone-list reduction).
+    const fixture = await ensureIssueDetailFixtures();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.lockedIssueIndex}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="issue-sidebar-combo" data-selection-mode="single" data-update-algo="all">');
+    expect(html).toContain('<span class="item empty-list">No Milestone</span>');
+    expect(html).not.toContain("octicon-milestone"); // nothing bound → no icon arm
+  });
+
+  it("the POPULATED milestone renders the octicon + plain-text name inside the single-mode combo — never a link (the §2.4.1 dead-link rule)", async () => {
+    // Provenance: wave-polish-matrix-10. No suite ever rendered a bound
+    // milestone on the detail page (the fixture block above seeds one); the
+    // module header's reduction ("milestone renders as plain text — no
+    // milestone page") was unpinned for the populated arm: the icon renders,
+    // the name does NOT anchor upstream's /milestone/{id} URL.
+    const fixture = await ensureIssueDetailFixtures();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="issue-sidebar-combo" data-selection-mode="single" data-update-algo="all">');
+    expect(html).toContain("octicon-milestone");
+    expect(html).toContain(`<span class="tw-flex-1 tw-break-anywhere">${SIDEBAR_MILESTONE_NAME}</span>`);
+    expect(html).not.toContain(`/${OWNER_NAME}/${REPO_SLUG}/milestone/`); // no dead link around the name
+    expect(html).not.toContain('<span class="item empty-list">No Milestone</span>'); // the empty arm yielded
+  });
+
+  it("the assignee/participant/subscribe sections render nothing — even with an assignee row bound (the unlanded seam, reported)", async () => {
+    // Provenance: wave-polish-matrix-10. Upstream's sidebar carries
+    // Assignees + Participants + a Subscribe button (sidebar.tmpl's
+    // assignee_list/participant_list/watch block); this repo lands none of
+    // them — and the arm proves the absence is the RENDER's posture, not
+    // missing data: the fixture above binds a real issue_assignees edge to
+    // the open PR, and the page still renders no assignee section. The
+    // sections (and the subscribe button) are REPORTED unlanded, not built.
+    const fixture = await ensureIssueDetailFixtures();
+    for (const path of [
+      `/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.wipPrIndex}`, // same repo, live PR render
+      `/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`,
+    ]) {
+      const res = await fetchUi(path);
+      expect(res.status, path).toBe(200);
+      const html = await res.text();
+      expect(html, path).not.toContain("Assignees");
+      expect(html, path).not.toContain("Participants");
+      expect(html, path).not.toContain(">Subscribe<");
+      expect(html, path).not.toContain(">Unsubscribe<");
+    }
+    // The bound edge exists (the differential's data half).
+    const prIssueId = fixture.openPrIssueId;
+    const edge = await drizzle(env.DB)
+      .select({ id: issueAssignees.id })
+      .from(issueAssignees)
+      .where(eq(issueAssignees.issueId, prIssueId))
+      .all();
+    expect(edge.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("the subscribe seam's upstream POST tails stay unclaimed: /{issues,pulls}/{n}/watch 404 (web.go:1368) and issue_subscriptions is untouched", async () => {
+    // Provenance: wave-polish-matrix-10. The subscribe button's write —
+    // upstream `m.Post("/watch", repo.IssueWatch)` under BOTH the issues and
+    // pulls groups (web.go:1368) — never landed; the sidebar-write 404 pin
+    // above covers only the /issues/{tail} literal shapes. A valid
+    // same-origin POST writes no issue_subscriptions row.
+    const fixture = await ensureIssueDetailFixtures();
+    for (const path of [
+      `/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.openPrIssueId}/watch`,
+      `/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.openPrIssueId}/watch`,
+    ]) {
+      const res = await fetchUi(path, withCookie(formPost({}), fixture.ownerCookie));
+      expect(res.status, `POST ${path}`).toBe(404);
+      expect(await res.text(), `POST ${path}`).not.toContain("page-content");
+    }
+    expect(
+      await drizzle(env.DB)
+        .select({ id: issueSubscriptions.id })
+        .from(issueSubscriptions)
+        .where(eq(issueSubscriptions.issueId, fixture.openPrIssueId))
+        .all(),
+    ).toEqual([]);
   });
 });
 

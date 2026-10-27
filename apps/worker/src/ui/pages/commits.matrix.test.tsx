@@ -22,13 +22,10 @@
  *     or short prefix): upstream answers 404 (RepoRefByType's GetCommit
  *     miss → ctx.NotFound, services/context/repo.go:1037-1040) and the
  *     sibling commit-view page pins the same 404 for identical shas
- *     (pages-wave18 "unresolvable-hex and short-prefix shas"). AT THIS PIN
- *     THE COMMITS PAGE FAILS THAT PIN — the engine's listLog answers an
- *     unresolvable ref with an EMPTY log, never null, so loadCommitsData's
- *     `log === null` notFound guard cannot fire and the page renders 200
- *     with a zero-row table. The two its pinning the 404 are LEFT RED
- *     deliberately: they are the escalation artifact (tests-only wave —
- *     no production edits; see the report to the orchestrator).
+ *     (pages-wave18 "unresolvable-hex and short-prefix shas"). RESOLVED since
+ *     (the production fix landed — the page now 404s the unresolvable
+ *     family and the two former RED-witness its pass; the escalation
+ *     artifact's prose is retired by this note).
  *   - the pager + ?path shape on the SUFFIXED basePaths pages.test's bare
  *     URL block doesn't cover: the head-branch canonical collapse (the
  *     /commits/branch/main URL pages onto the bare /commits), the non-head
@@ -39,7 +36,14 @@
  *   - and the commits family's claim pin (parse ↔ registration: the bare
  *     refSuffix-null tuple, any-depth decoded tails, the commitsy miss,
  *     and a junk deep tail 404-shelling through the loader, not the
- *     engine).
+ *     engine),
+ *   - w129 batch-10 (wave-polish-matrix-10): the ?path filter × pager
+ *     interplay on the BARE canonical base (the suffixed block above pages
+ *     /commits/branch/dev only): the head-branch collapse pages the bare
+ *     path with the filter kept (path before page), page 2's Newer drops
+ *     the param on that base, a zero-match filter renders the empty table
+ *     with NO pagination block, and parsePageNumber's two clamp paths
+ *     (non-digit vs digit-below-one) meet the filter.
  *
  * Fixture posture: a disjoint `cm*` family (the wave suites own alice/*),
  * seeded once in beforeAll via ensureSeededRepo (real pushed packs), extra
@@ -51,7 +55,7 @@
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
@@ -60,6 +64,14 @@ import { buildHistoryPack, buildReceivePackBody, ensureSeededRepo, type SeedComm
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { UiManifest } from "../manifest";
+
+// wave-129 full-run contention budget: this file's beforeAll seeding (the
+// receive-flow cm* fixture family) measured a 5.99s hook share of the 30s
+// default IN a green 8-worker full run (the suite's 260-isolate spawn storm
+// spikes closures up to ~12x their solo time). File-local 90s budgets;
+// vitest.config.ts keeps 30s for every other file. Membership: the measured
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -501,5 +513,67 @@ describe("the commits family's claim pin", () => {
     const res = await get("/cmgal/log/commits/x/y/z");
     expect(res.status).toBe(404);
     expect(await res.text()).toContain("status-page-error");
+  });
+});
+
+// --- w129 batch-10 additions (wave-polish-matrix-10): the bare-URL ?path x pager ----
+// interplay. The suffixed block above exercises the pager with the filter on
+// /commits/branch/dev; the bare /commits base (the head-branch collapse in
+// CommitsPage's basePath pick) pages with the filter too — and the clamp and
+// zero-match arms only behave distinctively there.
+
+describe("the bare-URL ?path x pager interplay (w129 batch-10)", () => {
+  it("the bare base pages with the filter kept, path before page (the head-branch collapse)", async () => {
+    // Provenance: wave-polish-matrix-10. The suffixed arms pin
+    // `/commits/branch/dev?path=...&page=2`; the collapsed BARE base emits
+    // the same two-param shape off `/commits` — the base pick's second half
+    // (`refType === "branch" && ref === headBranch` → the bare repoLink)
+    // was unpinned with a filter attached.
+    const res = await get("/cmgal/bulk/commits?path=counter.txt");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(bodyRows(html)).toBe(50); // all 51 bulk commits touch counter.txt; page 1 caps at 50
+    expect(html).toContain('<a class="item navigation" href="/cmgal/bulk/commits?path=counter.txt&amp;page=2">');
+    expect(html).not.toContain("/commits/branch/main?"); // the collapse holds under a filter
+  });
+
+  it("page 2 on the bare base hides Older and its Newer drops only the page param", async () => {
+    // Provenance: wave-polish-matrix-10 — the tail page's link pair on the
+    // bare base (the dev arms cover the suffixed twin): more === false
+    // hides Older; the Newer href keeps the filter, drops ?page.
+    const res = await get("/cmgal/bulk/commits?path=counter.txt&page=2");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(bodyRows(html)).toBe(1); // the 51st commit
+    expect(html).not.toContain("Older");
+    expect(html).toContain('<a class="item navigation" href="/cmgal/bulk/commits?path=counter.txt">');
+    expect(html).not.toContain("path=counter.txt&amp;path=counter.txt"); // no filter accumulation
+  });
+
+  it("a zero-match filter renders the empty table with NO pagination block at all", async () => {
+    // Provenance: wave-polish-matrix-10 — listLog's empty filtered page
+    // (the path names no file) drives CommitsPagination's null arm
+    // (page <= 1 && !more): the suffixed shortest-prefix arm pins the
+    // zero-row TABLE, never the absent pager.
+    const res = await get("/cmgal/bulk/commits?path=absent-file.txt");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(bodyRows(html)).toBe(0);
+    expect(html).toContain('id="commits-table"'); // the page shell renders
+    expect(html).not.toContain('class="center page buttons"'); // the pager is null, not empty
+  });
+
+  it("both clamp paths meet the filter: a non-digit and a digit-below-one page ride page 1", async () => {
+    // Provenance: wave-polish-matrix-10 — parsePageNumber's two regex
+    // arms (`!^\d+$` for junk/negatives, `parsed < 1` for zero): the
+    // non-numeric arm was pinned filter-less (page=frog), zero and
+    // negative were unpinned entirely.
+    for (const page of ["0", "-3", "frog"]) {
+      const res = await get(`/cmgal/bulk/commits?path=counter.txt&page=${page}`);
+      expect(res.status, `page=${page}`).toBe(200);
+      const html = await res.text();
+      expect(bodyRows(html), `page=${page}`).toBe(50); // page 1's window
+      expect(html, `page=${page}`).toContain('href="/cmgal/bulk/commits?path=counter.txt&amp;page=2"');
+    }
   });
 });

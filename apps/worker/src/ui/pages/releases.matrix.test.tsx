@@ -39,7 +39,15 @@
  *     arm — the tags page's query-param convention);
  *   - the attachment arm's route gate wave41 could not pin: the disabled
  *     releases unit 404-shells BOTH download tails over an otherwise-servable
- *     asset (the differential the empty-repo arm cannot isolate).
+ *     asset (the differential the empty-repo arm cannot isolate);
+ *   - w129 batch-10 (wave-polish-matrix-10): the DETAIL page's render shapes
+ *     the write-route matrixes never pinned — the meta row's tag-link arms
+ *     (in-git tag → the /src/tag + /src/commit links, a ghost tag → the plain
+ *     span, a slash tag's per-segment escaping on the title link), the
+ *     attachment ROW shapes (the anchor's attrs, the byte-size text, the
+ *     download-count tooltip, the empty list arm, the details-firstOpen pair
+ *     across list entries), and the notes' MARKDOWN posture (relative links
+ *     rewritten onto the default-branch /src path, the empty-note div).
  *
  * Verified upstream contracts carry the module-doc cites from the page module;
  * the fixture repo is `relmx-owner/rel` (main + the in-git tag v1, one
@@ -724,5 +732,207 @@ describe("the query-param flash and the attachment route gates", () => {
     await saveRepoSettings(env.DB, repo.id, { hasReleases: true }, at(111));
     expect((await fetchUi(attachmentPath)).status).toBe(200);
     expect((await fetchUi(downloadPath)).status).toBe(200);
+  });
+});
+
+// --- w129 batch-10 additions (wave-polish-matrix-10): the DETAIL page's render -----
+// shapes. The write-route suites above own status codes and webhook payloads;
+// these arms pin the bytes ReleaseEntryItem emits — the meta row's tag links,
+// the attachment rows, and the notes' markdown posture.
+
+/** Seed one release with an explicit timestamp (the fixed-`now` seedRelease
+ *  above cannot order two rows for the firstOpen pair). */
+async function seedRelAt(input: {
+  repoId: string;
+  publisherId: number;
+  tagName: string;
+  title: string;
+  note?: string;
+  now: Date;
+}): Promise<ReleaseRow> {
+  return new IssuesService(env.DB).createRelease({
+    repoId: input.repoId,
+    publisherId: input.publisherId,
+    tagName: input.tagName,
+    target: "main",
+    title: input.title,
+    note: input.note ?? "",
+    isDraft: false,
+    isPrerelease: false,
+    now: input.now,
+  });
+}
+
+/** The in-git oid a tag name resolves to (tagTipsOf's peeled-or-target rule,
+ *  read straight off the engine binding). */
+async function gitTagOid(tagName: string): Promise<string | null> {
+  const refs = await env.REPO.getByName("relmx-owner/rel").listRefs();
+  const ref = refs.refs.find((entry) => entry.name === `refs/tags/${tagName}`);
+  return ref === undefined ? null : (ref.peeled ?? ref.target);
+}
+
+describe("the release-detail render shapes (w129 batch-10: tag links, attachments, notes)", () => {
+  it("an in-git tag renders the meta row's /src/tag link and the /src/commit ShortSha link", async () => {
+    // Provenance: wave-polish-matrix-10. Every landed release fixture used a
+    // tag that exists in git (v1), but no arm pinned the LINKED meta shape:
+    // ReleaseEntryItem's tagOid branch (releases.tsx's meta row) — the
+    // nofollow tag anchor and the mono commit anchor onto the tag's tip.
+    const { repo } = await theFixture();
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Linked tag" });
+    const oid = await gitTagOid("v1");
+    if (oid === null) throw new Error("fixture tag v1 missing from the engine refs");
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/v1");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<a class="muted" href="/relmx-owner/rel/src/tag/v1" rel="nofollow">');
+    expect(html).toContain('<a class="muted tw-font-mono" href="/relmx-owner/rel/src/commit/');
+    expect(html).toContain(`href="/relmx-owner/rel/src/commit/${oid}"`);
+    expect(html).toContain(`>${oid.slice(0, 10)}</a>`); // the ShortSha label
+  });
+
+  it("a ghost tag (no engine ref) renders the plain-span meta arm: no /src links at all", async () => {
+    // Provenance: wave-polish-matrix-10 — tagTipsOf's miss branch (`tags.get
+    // (tagName) ?? null`) was never rendered by a suite: a release whose tag
+    // was never pushed keeps its title link but loses BOTH meta anchors.
+    const { repo } = await theFixture();
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "ghost", title: "Unlinked" });
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/ghost");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<span class="muted">'); // the unlinked tag arm
+    expect(html).toContain("octicon-tag");
+    expect(html).not.toContain('href="/relmx-owner/rel/src/tag/ghost"');
+    expect(html).not.toContain("/src/commit/"); // no commit anchor without an oid
+    // The title link survives (the detail route is the release's own).
+    expect(html).toContain('href="/relmx-owner/rel/releases/tag/ghost"');
+  });
+
+  it("a slash-carrying tag escapes per segment on the detail's own title link", async () => {
+    // Provenance: wave-polish-matrix-10. release-tails pins the slash-tag
+    // latest REDIRECT; the detail page's emitted hrefs for the same shape
+    // (pathEscapeSegments keeps the separator, encodes each segment) stayed
+    // unpinned — the title anchor re-emits the raw-slash URL.
+    const { repo } = await theFixture();
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "plan/9", title: "Plan nine" });
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/plan/9");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<h3 class="release-list-title tw-break-anywhere">');
+    expect(html).toContain('href="/relmx-owner/rel/releases/tag/plan/9"');
+    expect(html).toContain("Plan nine");
+    expect(html).not.toContain("releases/tag/plan%2F9"); // separators stay separators
+  });
+
+  it("an attachment row carries the download anchor's attrs, the byte size, and the download-count tooltip", async () => {
+    // Provenance: wave-polish-matrix-10 — wave41 owns the asset SERVE
+    // matrix; the rendered ROW (list.tmpl:82-94's shape: target/rel/download
+    // anchor, the FormatByteSize text, the Downloads tooltip prefix, the
+    // created stamp) had no byte-level pin.
+    const { repo, ownerCookie } = await theFixture();
+    const seeded = await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Asset host" });
+    const bytes = new TextEncoder().encode("relmx asset body\n"); // 17 bytes → "17 B"
+    const asset = await uploadReleaseAsset({
+      bucket: env.REPO_PACKS,
+      d1: env.DB,
+      repoId: repo.id,
+      storageKey: repo.storageKey,
+      releaseId: seeded.id,
+      uploaderId: await ownerId(),
+      name: "notes.txt",
+      content: new Blob([bytes]).stream() as ReadableStream<Uint8Array>,
+      multipart: false,
+      declaredLength: bytes.byteLength,
+      now: at(105),
+    });
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/v1", { headers: { cookie: ownerCookie } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<li class="item">');
+    expect(html).toMatch(
+      new RegExp(
+        `<a target="_blank" class="tw-flex-1 gt-ellipsis" rel="nofollow" download="" href="https://test\\.local/attachments/${asset.uuid}">`,
+      ),
+    );
+    expect(html).toContain("octicon-package");
+    expect(html).toContain('<span class="gt-ellipsis">notes.txt</span>');
+    expect(html).toContain('<span class="tw-pl-5">17 B</span>'); // formatByteSize's humanize.IBytes posture
+    expect(html).toContain('data-tooltip-content="Downloads: 0"'); // download_count prefix + count
+    expect(html).toContain("<relative-time"); // the created stamp
+  });
+
+  it("an asset-less release renders the open details block with the EMPTY attachment ul", async () => {
+    // Provenance: wave-polish-matrix-10 — the empty attachment-list arm (the
+    // ul renders, zero li rows) and the detail page's always-open details
+    // (firstOpen === true unconditionally there) were unpinned together.
+    const { repo } = await theFixture();
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Bare release" });
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/v1");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<details class="download" open="">'); // firstOpen on the detail page (hono's boolean form)
+    expect(html).toContain("<summary>Downloads</summary>");
+    expect(html).toContain('<ul class="ui divided list attachment-list">');
+    expect(html).not.toContain('<li class="item">'); // zero attachment rows
+  });
+
+  it("the LIST page opens only the first entry's details (the idx==0 arm the detail page cannot show)", async () => {
+    // Provenance: wave-polish-matrix-10 — `{{if eq $idx 0}}open{{end}}` was
+    // pinned nowhere: two entries render exactly one open and one closed
+    // details block (newest first, so the newest carries the open attr).
+    const { repo } = await theFixture();
+    await seedRelAt({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "First-born", now: at(100) });
+    await seedRelAt({ repoId: repo.id, publisherId: await ownerId(), tagName: "v2", title: "Second-born", now: at(200) });
+
+    const res = await fetchUi("/relmx-owner/rel/releases");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html.split('<details class="download" open="">').length - 1).toBe(1);
+    expect(html.split('<details class="download">').length - 1).toBe(1);
+    // Newest first: the open block belongs to v2.
+    expect(html.indexOf("Second-born")).toBeLessThan(html.indexOf('<details class="download" open="">'));
+  });
+
+  it("the notes render through the shared markdown pipeline: relative links rewrite onto the default-branch /src path", async () => {
+    // Provenance: wave-polish-matrix-10 — the noteHtml posture (renderIssue
+    // Markdown in comment mode, the module header's §3.4 note) had no render
+    // pin: a relative link rewrites against /{ns}/{slug} + the
+    // branch/main fallback (markdown.ts's DEFAULT_RENDER_BRANCH), inline
+    // emphasis survives.
+    const { repo } = await theFixture();
+    await seedRelease({
+      repoId: repo.id,
+      publisherId: await ownerId(),
+      tagName: "v1",
+      title: "Noted",
+      note: "See [the guide](docs/guide.md) and **bold**.",
+    });
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/v1");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="render-content markup">');
+    expect(html).toContain('href="https://test.local/relmx-owner/rel/src/branch/main/docs/guide.md"');
+    expect(html).toContain("<strong>bold</strong>");
+    expect(html).toContain("See <a"); // the anchor sits inside the prose
+  });
+
+  it("an empty note renders the bare render-content div (the no-content variant, never placeholder text)", async () => {
+    // Provenance: wave-polish-matrix-10 — ReleaseEntryItem's noteHtml "" arm
+    // (renderIssueMarkdown's early return) emits an empty markup div; no
+    // suite pinned the absence of a no-content placeholder on releases
+    // (upstream list.tmpl renders the note slot verbatim, empty included).
+    const { repo } = await theFixture();
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Silent notes" });
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/v1");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="render-content markup"></div>');
+    expect(html).not.toContain("No description provided."); // the issue page's placeholder never leaks here
   });
 });

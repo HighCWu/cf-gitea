@@ -280,6 +280,34 @@ describe("GET /{owner}/{repo}/commit/{sha} (the commit view)", () => {
     expect(res.status).toBe(404);
     await db.update(repositories).set({ visibility: "public" }).where(eq(repositories.id, row.id));
   });
+
+  it("w129-b10: the verify and CI-status template slots render nothing (the no-backing-data degradation, byte-pinned)", async () => {
+    // Provenance: wave-polish-matrix-10 (2026-10-27). commit-view.tsx's
+    // module header documents the two unrendered upstream slots —
+    // `commit_statuses` (CI) and `commit_sign_badge` (the verification
+    // badge) — "no backing data model … the commit-list precedent"; the
+    // parent shapes beside them are pinned above, these two absences were
+    // not. Also pins the header-buttons reduction: exactly ONE button
+    // (Browse Source) renders — the revert/cherry-pick/tag dropdown is a
+    // writer JS island (the same header's documented omission).
+    const tip = (await tips())[1] as string;
+    const res = await fetchUi(`/alice/wave18cv/commit/${tip}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The sign-badge slot: no verification chrome of any shape.
+    expect(html).not.toContain("commit-sign-badge");
+    expect(html).not.toContain(">Verified<");
+    expect(html).not.toContain("commit-signature");
+    // The CI-status slot: no status box between the identity bar and the
+    // diff boxes.
+    expect(html).not.toContain("commit-statuses");
+    expect(html).not.toContain("ci-status");
+    // The header buttons: one anchor only.
+    expect(html.split('class="ui tiny button"').length - 1).toBe(1);
+    expect(html).toContain("Browse Source");
+    expect(html).not.toContain("Revert"); // the operations island stays dead
+    expect(html).not.toContain("Cherry-pick");
+  });
 });
 
 // --- the §5.5 a11y smoke ---------------------------------------------------------
