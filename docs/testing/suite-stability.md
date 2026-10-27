@@ -157,3 +157,30 @@ grep -c "protocolError.statusCode = 1009" <log>    # ÷3 = death events
 
 Baseline logs (scratch, not committed): `/tmp/wave126/run{1,2}.log`,
 `run3-isolfalse.log`, `ab-subset-isolfalse.log`, `probe12.log`, `solo-*.log`.
+
+## Appendix (2026-10-27, wave-composite-gate + the wrap wiring): the gate tool + two parser traps
+
+`scripts/full-suite-gate.mjs` (run as `pnpm test:full`) implements the composite
+gate with `--solo` adjudication:
+
+- **Death signature (text reporter)**: `Worker exited unexpectedly during
+  started state while running test file <abs-path>` — exactly one line per
+  death (3× `protocolError.statusCode = 1009` lines each); validated against
+  the baseline logs at exactly 204/258.
+- **JSON reporter trap 1 — stubs**: vitest 5.0.5 emits a `testResults` entry
+  (`status: "passed"`, zero `assertionResults`) for every discovered file that
+  never ran — counting JSON entries as "ran" silently absorbs ALL deaths.
+  Death lines always win over JSON presence.
+- **JSON reporter trap 2 — lossy failed suites**: a `beforeAll` timeout marks
+  tests "skipped" with NO failure message in the JSON; the text log's FAIL
+  blocks are the only message source. Timeout-class only if EVERY message
+  matches `(Test|Hook) timed out in \d+ms`.
+- **Death-on-rebatch does NOT converge** (measured, 4 real invocations):
+  batch re-runs shrink 169 → 138 → 115 but never reach 0 — every batch
+  re-ships the same ~cap-sized common core. The batch-mode guard therefore
+  FAILS honestly; the structural cure is `--solo`: each pending file runs as
+  its OWN vitest process (a fresh process first-connects an EMPTY warm
+  snapshot — solo runs are immune by construction). A solo death is retried
+  once, then fails; solo assertion/timeout failures fail immediately.
+  Consistent with the falsified Plan A in `docs/research/ws1009-graph-sizing.md`
+  §4.A: no graph-shape trick escapes the executed-edge BFS.

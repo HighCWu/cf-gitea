@@ -13,6 +13,7 @@
     "typecheck": "pnpm -r typecheck",
     "lint": "eslint .",
     "test": "pnpm -r test",
+    "test:full": "node scripts/full-suite-gate.mjs --solo",
     "test:lfs": "bash scripts/lfs-e2e.sh",
     "test:mirror": "bash scripts/mirror-e2e.sh",
     "check:api": "node scripts/check-openapi.mjs",
