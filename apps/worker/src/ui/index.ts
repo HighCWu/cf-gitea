@@ -9621,6 +9621,12 @@ uiRouter.get("/:owner/:repo/issues", (c) => uiPage(c));
 // static segments first; this makes it local and obvious).
 uiRouter.get("/:owner/:repo/issues/new", (c) => issueNewPage(c));
 uiRouter.post("/:owner/:repo/issues/new", (c) => issueNewSubmit(c));
+// Window-2e B2 statics — hoisted ABOVE the /:index catch (hono honors
+// registration order; the late spot left both feeds dead in uiPage's drift
+// guard — the aux-fragments matrix's RED; the FOURTH registration-order
+// catch: wiki #11, repo/search #15, pulls/new #17, these).
+uiRouter.get("/:owner/:repo/issues/search", (c) => issuesSearchAuxRoute(c));
+uiRouter.get("/:owner/:repo/issues/suggestions", (c) => issuesSuggestionsAuxRoute(c));
 // Wave-5 label-write family — same static-before-dynamic rule (the bare
 // /issues/labels shape would otherwise be absorbed by issues/:index).
 uiRouter.post("/:owner/:repo/issues/labels", (c) => issueLabelsSubmit(c));
@@ -9695,8 +9701,6 @@ uiRouter.get("/explore/topics/search", (c) => topicSearchAuxRoute(c));
 // precedent); the parser discriminates .rss vs .atom and strips.
 uiRouter.get("/:owner{^[\\w-]+\\.(rss|atom)$}", (c) => userFeedRoute(c));
 // Window-2e B2: the repo-scoped aux/fragment routes.
-uiRouter.get("/:owner/:repo/issues/search", (c) => issuesSearchAuxRoute(c));
-uiRouter.get("/:owner/:repo/issues/suggestions", (c) => issuesSuggestionsAuxRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/info", (c) => issueInfoFragmentRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/attachments", (c) => issueAttachmentsFragmentRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/attachments/:uuid", (c) => issueAttachmentsAliasRoute(c));
