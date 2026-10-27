@@ -40,7 +40,10 @@
  * edit `Update %q(newWikiName)` (router defaults) / delete
  * `Delete page %q(wikiName)` (service-side). Commit identity: author ==
  * committer == the doer (upstream `CommitTree(ctx, doer.NewGitSig(),
- * doer.NewGitSig(), …)`); timestamps are now.
+ * doer.NewGitSig(), …)`); timestamps are now — pinnable at write time via
+ * `WikiWriteOptions.now` (the render-wallclock audit's fixed-time seam: the
+ * stamps land in STORED git objects, so no render-site fixture can pin the
+ * view's last-edited bytes; only the write path can).
  *
  * The landed contents-write orchestrator (`api/services/contents.ts
  * applyFileChanges`) is NOT reusable here — it addresses the REPO cell, hard
@@ -591,8 +594,21 @@ export interface WikiDoer {
   email: string;
 }
 
-function wikiPerson(doer: WikiDoer): Person {
-  return { name: doer.name, email: doer.email, time: Math.floor(Date.now() / 1000), tz: "+0000" };
+/**
+ * Fixed-time write seam (render-wallclock-audit follow-up 2, the (c) class):
+ * `wikiPerson` stamps the commit's author/committer time into STORED git
+ * objects, so no render-site fixture can pin a view's last-edited bytes —
+ * the pin has to happen at write time. `now` is unix seconds; absent = the
+ * wall clock (every existing caller is byte-identical). The test-only
+ * consumer is ui/testing/seed-wiki.ts (the golden view page's writer).
+ */
+export interface WikiWriteOptions {
+  /** author/committer unix-seconds stamp for the landed commit. */
+  now?: number;
+}
+
+function wikiPerson(doer: WikiDoer, now?: number): Person {
+  return { name: doer.name, email: doer.email, time: now ?? Math.floor(Date.now() / 1000), tz: "+0000" };
 }
 
 /**
@@ -607,9 +623,10 @@ async function applyWikiChanges(
   changes: FileChange[],
   message: string,
   doer: WikiDoer,
+  options?: WikiWriteOptions,
 ): Promise<string> {
   const { reads, tip } = await wikiTip(env, pair);
-  const person = wikiPerson(doer);
+  const person = wikiPerson(doer, options?.now);
   const cell = wikiCell(env, pair);
   const ref = branchRef(wikiBranch(pair));
 
@@ -696,6 +713,7 @@ export async function createWikiPage(
   doer: WikiDoer,
   input: CreateWikiPageInput,
   origin: string,
+  options?: WikiWriteOptions,
 ): Promise<WikiPageJson> {
   const wikiName = userTitleToWebPath("", input.title);
   const reserved = validateWebPath(wikiName);
@@ -714,6 +732,7 @@ export async function createWikiPage(
     [{ operation: "create", path: existing.gitPath, content: input.content }],
     message,
     doer,
+    options,
   );
   const page = await readWikiPage(env, pair, wikiName, origin);
   if (page === null) {
@@ -745,6 +764,7 @@ export async function editWikiPage(
   oldWikiName: string,
   input: EditWikiPageInput,
   origin: string,
+  options?: WikiWriteOptions,
 ): Promise<WikiPageJson> {
   const newWikiName = input.title.trim() === "" ? oldWikiName : userTitleToWebPath("", input.title);
   if (validateWebPath(newWikiName) !== null) {
@@ -769,7 +789,7 @@ export async function editWikiPage(
     changes.push({ operation: "update", path: newGitPath, content: input.content });
   }
   const message = input.message === "" ? `Update ${goQuote(newWikiName)}` : input.message;
-  await applyWikiChanges(env, pair, changes, message, doer);
+  await applyWikiChanges(env, pair, changes, message, doer, options);
   const page = await readWikiPage(env, pair, newWikiName, origin);
   if (page === null) {
     throw new ApiError(500, "wiki page vanished after edit");
@@ -787,6 +807,7 @@ export async function deleteWikiPage(
   pair: RepositoryWithOwner,
   doer: WikiDoer,
   wikiName: string,
+  options?: WikiWriteOptions,
 ): Promise<void> {
   const { reads, tip } = await wikiTip(env, pair);
   const prepared = await prepareWikiGitPath(reads, tip?.target, wikiName);
@@ -799,6 +820,7 @@ export async function deleteWikiPage(
     [{ operation: "delete", path: prepared.foundPath }],
     `Delete page ${goQuote(wikiName)}`,
     doer,
+    options,
   );
 }
 

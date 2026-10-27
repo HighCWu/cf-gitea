@@ -33,6 +33,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { actions, users } from "../../db/schema";
 import { __setRouteClockForTests, uiRouter } from "../index";
 import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
+import { seedWikiPage } from "../testing/seed-wiki";
 import {
   GOLDEN_CASES,
   GOLDEN_MARKER_END,
@@ -88,6 +89,22 @@ function diffWindow(html: string, committed: string): string {
 setupGoldenFixtures();
 
 /**
+ * The wiki-view-home golden's fixture content (the seed below). Plain fixed
+ * markdown — no links, no dates — so the markdown pipeline's render is a
+ * pure function of these bytes (its wiki-mode link rewrites would otherwise
+ * fold the request origin into the output; still deterministic, but the
+ * plain form keeps the golden's determinism argument one line long).
+ */
+const WIKI_GOLDEN_HOME_CONTENT = [
+  "# Home",
+  "",
+  "Welcome to the **golden-alt** wiki.",
+  "",
+  "Plain fixture paragraph for the view golden.",
+  "",
+].join("\n");
+
+/**
  * The wave-129 expansion's admin principal: morgan promoted to site admin so
  * `/-/admin/users` renders its table. Runs AFTER the harness's seeding
  * beforeAll (declaration order), so the row exists. MORGAN, not alice:
@@ -135,6 +152,25 @@ beforeAll(async () => {
     .update(actions)
     .set({ createdAt: new Date(T0 * 1000) })
     .where(eq(actions.actUserId, aliceRow.id));
+  // The wiki-view-home golden's seed (the wave-wiki-fixedtime closure of the
+  // wiki-start case comment's "UNLANDABLE" view arm, below): the FIXED-TIME
+  // writer (ui/testing/seed-wiki.ts) lands golden-alt's Home page through the
+  // LANDED createWikiPage op with the commit's author/committer stamps pinned
+  // at write time (services/wiki.ts WikiWriteOptions.now — the wall clock
+  // lived in the STORED git commit, so no render-site fixture could pin the
+  // view's last-edited bytes). The stamp: T0 + 210 = 2023-11-14T22:16:50Z, an
+  // unused fixture slot (the PR-diff commit sits at +180, the compare commit
+  // at +240, the anvil issue at +200). golden-alt, not golden: the wiki-start
+  // golden renders golden's EMPTY-wiki arm, and no repo-home/shell byte reads
+  // the wiki cell (grep clean), so the seeded sibling moves zero committed
+  // bytes.
+  await seedWikiPage({
+    owner: "alice",
+    slug: "golden-alt",
+    title: "Home",
+    content: WIKI_GOLDEN_HOME_CONTENT,
+    now: T0 + 210,
+  });
 });
 
 /** The one copy of the §5.2 assertion/marker protocol, shared by both case
@@ -346,14 +382,18 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   //     Code active, sidebar) over tplWikiStart's no-wiki arm (the book
   //     segment, the welcome lines, the writer-gated Create-the-First-Page
   //     button — signed-in owner alice, so the canWrite arm renders). Zero
-  //     new seeds: no repo in the harness carries wiki pages, so the start
-  //     arm is the family's real default posture. The family's SEEDED page
-  //     render (the view page over a created page) is UNLANDABLE as a
-  //     golden: services/wiki.ts wikiPerson stamps Date.now() into the wiki
-  //     commit, so the view's last-edited TimeSince and the commit oid are
-  //     wall-clock bytes — the same class as the documented admin-monitor
-  //     cron skip; pinning would need raw fixed-time git objects written
-  //     around the landed service (not trivially file-local).
+  //     new seeds on golden: no OTHER repo in the harness carried wiki pages
+  //     at this case's landing, so the start arm was the family's real
+  //     default posture. The family's SEEDED page render (the view page over
+  //     a created page) was UNLANDABLE at landing: services/wiki.ts
+  //     wikiPerson stamped Date.now() into the wiki commit, so the view's
+  //     last-edited TimeSince and the commit oid were wall-clock bytes — the
+  //     same class as the admin-monitor cron skip. CLOSED by the follow-up
+  //     wave-wiki-fixedtime: the write-path now seam (WikiWriteOptions.now)
+  //     + the fixed-time writer (ui/testing/seed-wiki.ts) seeded golden-alt's
+  //     Home page with pinned stamps — the wiki-view-home case below. golden
+  //     itself keeps its empty-wiki cell, so this start arm's bytes are
+  //     unchanged.
   //   - profile-activity (TAKEN): `/alice?tab=activity`, the profile
   //     ACTIVITY tab — the avatar card + the four-tab overview strip
   //     (activity active) over the action-feed pipeline's full item anatomy
@@ -370,6 +410,38 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "user-settings-notifications.html", path: "/user/settings/notifications", status: 200, signedIn: true },
   { file: "wiki-start.html", path: "/alice/golden/wiki", status: 200, signedIn: true },
   { file: "profile-activity.html", path: "/alice?tab=activity", status: 200, signedIn: true },
+  // ---------------------------------------------------------------------------
+  // The wave-wiki-fixedtime closure — the wiki family's seeded VIEW page, the
+  // arm the wiki-start comment above documented as UNLANDABLE. The fixed-time
+  // writer (ui/testing/seed-wiki.ts through the beforeAll's seed above) lands
+  // golden-alt's Home page with the commit stamps pinned at write time, so
+  // the last-edited relative-time bytes are fixtures: datetime = the pinned
+  // ISO literal, text = the pinned tz-formatted literal, tense = "past"
+  // (the 2023 stamp can never read future — stable for the fixtures'
+  // lifetime), and the commit oid itself is deterministic (same tree bytes +
+  // same person lines → same SHA-1). The render:
+  //
+  //   - `/alice/golden-alt/wiki` (rawTail "" → "Home") — the view arm over
+  //     the ROOT commit the unborn-branch create lands (upstream's
+  //     hasDefaultBranch == false posture): the page-dropdown row with the
+  //     single-item menu (the seeded Home, the `selected` class), the
+  //     dividing header with the commit-count history button (1) and the
+  //     last-edited line ("alice edited this page" + the pinned
+  //     relative-time — the doer is the route derivation of alice's row:
+  //     username + the @noreply fallback), and the markdown content through
+  //     the shared pipeline. SIGNED-IN OWNER (alice): the writer chrome
+  //     renders — Edit/New/Delete buttons, the delete confirm modal, and the
+  //     sidebar/footer edit pencil arms stay absent (no _Sidebar/_Footer
+  //     seeded; the with-sidebar class keys on their presence).
+  //   - Determinism riders: the sidebar/footer are "" (the empty arms), the
+  //     commit_count is the fixture's 1 (countCommitsForPath over the root
+  //     commit), and the metadata html_url/sub_url projections derive from
+  //     the request origin but render nowhere in the view bytes.
+  //   - Its a11y coverage: NOT auto-declared (a11y.test.ts arms are explicit
+  //     per-file imports outside this wave's ownership — the same posture as
+  //     wiki-start's landing).
+  // ---------------------------------------------------------------------------
+  { file: "wiki-view-home.html", path: "/alice/golden-alt/wiki", status: 200, signedIn: true },
 ];
 
 describe("wave-129 expansion goldens", () => {
@@ -595,6 +667,50 @@ describe("feed goldens (the wave-golden-feeds closures)", () => {
       const res = await uiRouter.fetch(new Request(`https://test.local${path}`), uiEnv);
       expect(res.headers.get("content-type"), path).toBe(contentType);
     }
+  });
+});
+
+/**
+ * The fixed-time writer's proof arm (the wave-wiki-fixedtime determinism
+ * evidence — the write-path analogue of the route-clock override arm above):
+ * the wiki view's last-edited bytes must be the SEEDED commit's pinned
+ * stamps, not wall-clock bytes. timeSinceParts' datetime/text are pure
+ * functions of the unix stamp, so the 2023 literals render exactly on every
+ * machine and can never collide with a live render (the stamps predate every
+ * run). The arm runs WITHOUT a route-clock pin on purpose: the wiki view's
+ * TimeSince has no loader-level clock to pin (the stamp lives in the STORED
+ * commit), which is precisely why the pin had to happen at write time.
+ */
+const WIKI_PINNED_DATETIME = "2023-11-14T22:16:50Z"; // T0 + 210 — the seed's now
+const WIKI_PINNED_TEXT = "2023-11-14 22:16:50 +00:00"; // the +0000 tz form
+
+const WIKI_VIEW_GOLDEN_CASE: GoldenCase = {
+  file: "wiki-view-home.html",
+  path: "/alice/golden-alt/wiki",
+  status: 200,
+  signedIn: true,
+};
+
+describe("wiki-view-home golden determinism (the fixed-time writer's proof)", () => {
+  it("renders the seeded commit's pinned stamp, not wall-clock bytes", async () => {
+    const { status, html } = await renderCase(WIKI_VIEW_GOLDEN_CASE);
+    expect(status).toBe(200);
+    // The datetime attribute and the tz-shifted text are the pinned stamp.
+    expect(html).toContain(`datetime="${WIKI_PINNED_DATETIME}"`);
+    expect(html).toContain(WIKI_PINNED_TEXT);
+    // tense="past": the 2023 stamp sits before every run's wall clock, so
+    // the one clock-reading attribute is stable for the fixtures' lifetime.
+    expect(html).toContain('tense="past"');
+    // The doer line carries the route derivation's identity (the "alice
+    // edited this page" prefix completing the relative-time element).
+    expect(html).toContain("alice edited this page");
+  });
+
+  it("renders identical bytes twice within one run (the stored pin needs no clock)", async () => {
+    const first = await renderCase(WIKI_VIEW_GOLDEN_CASE);
+    const second = await renderCase(WIKI_VIEW_GOLDEN_CASE);
+    expect(second.status).toBe(first.status);
+    expect(second.html).toBe(first.html);
   });
 });
 
