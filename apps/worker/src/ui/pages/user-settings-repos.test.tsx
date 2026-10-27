@@ -93,6 +93,17 @@ async function seedRepo(spec: RepoSpec): Promise<void> {
   });
 }
 
+/** Slice one `.item` row out of the rendered list — from the row's opening
+ *  div before `href` to the next row's opening div (the rowChunk idiom for
+ *  chunk-scoped DOM pins). Throws when the href is absent. */
+function rowChunk(html: string, href: string): string {
+  const at = html.indexOf(href);
+  if (at < 0) throw new Error(`row missing: ${href}`);
+  const start = html.lastIndexOf('<div class="item">', at);
+  const next = html.indexOf('<div class="item">', at);
+  return html.slice(start, next === -1 ? html.length : next);
+}
+
 /** The standard world: alice owns five differently-shaped repos + one
  *  dangling fork; bob owns the fork source and one repo of his own. */
 async function seedWorld(): Promise<{ aliceId: number; bobId: number; ctx: UiContext }> {
@@ -188,6 +199,77 @@ describe("loadUserSettingsReposPageData (profile.go:302-320's else arm)", () => 
     expect(dangling?.forkedFrom).toBeNull();
   });
 
+  it("a fork parent whose OWNER row is gone falls back to the case-folded namespace (the loader's ?? ownerNamespace arm — ownerId is a plain column, no FK)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27) — the module header's
+    // data note: "the parent owner's display-case username comes from its
+    // users row (org rows included), falling back to the case-folded
+    // namespace when the owner row is gone" (profile.go:310-317's
+    // GetBaseRepo batch; a dead link is forbidden, upstream's ServerError
+    // arm is not reproducible).
+    const alice = await seedUser("alice");
+    const bob = await seedUser("Bob"); // display case lives on the users row
+    await seedRepo({ id: "2101", ownerId: bob.id, ownerNamespace: "bob", slug: "source" });
+    await seedRepo({ id: "2005", ownerId: alice.id, ownerNamespace: "alice", slug: "zoofork", forkParent: "2101" });
+    await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(bob.id).run(); // the owner row purges; the repo row survives
+
+    const data = await loadUserSettingsReposPageData(env.DB, alice.id, new URLSearchParams());
+    if (data === null) throw new Error("loader returned null");
+    const fork = data.repos.find((item) => item.name === "zoofork");
+    expect(fork?.forkedFrom).toEqual({ ownerName: "bob", name: "source", href: "/bob/source" }); // the folded namespace, not "Bob"
+    // The DOM line renders the fallback too — never a dead link.
+    const html = renderToString(<UserSettingsReposPage ctx={{ viewer: { kind: "user", id: alice.id, username: "alice", isAdmin: false }, origin: ORIGIN, assets: shellAssetsFromManifest(manifest) }} data={data} />);
+    expect(html).toContain('<a href="/bob/source">bob/source</a>');
+  });
+
+  it("a fork parent with a NULL ownerId falls back to the namespace as well (the org-less shape)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27) — the loader's
+    // `parent.ownerId !== null ? … : undefined ?? ownerNamespace` arm;
+    // repositories.owner_id is a plain nullable column (schema.ts), so the
+    // shape is directly producible.
+    const alice = await seedUser("alice");
+    const bob = await seedUser("Bob");
+    await seedRepo({ id: "2101", ownerId: bob.id, ownerNamespace: "ghostnet", slug: "source" });
+    await seedRepo({ id: "2005", ownerId: alice.id, ownerNamespace: "alice", slug: "zoofork", forkParent: "2101" });
+    await drizzle(env.DB).update(repositories).set({ ownerId: null }).where(eq(repositories.id, "2101"));
+
+    const data = await loadUserSettingsReposPageData(env.DB, alice.id, new URLSearchParams());
+    const fork = data?.repos.find((item) => item.name === "zoofork");
+    expect(fork?.forkedFrom).toEqual({ ownerName: "ghostnet", name: "source", href: "/ghostnet/source" });
+  });
+
+  it("the pager sits exactly ON the 50 boundary: 50 repos fill page 1 with NO pager, and page 2 renders the PER-PAGE empty arm", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27) — profile.go:230's
+    // UserPagingNum=50 ListOptions over repos.tmpl:107's base/paginate
+    // (more = page*size < total → 50 < 50 is false) and repos.tmpl:108-112's
+    // `{{else}}` arm, which is per PAGE: a page past the end renders the
+    // bare repos_none item even though rows exist overall.
+    const alice = await seedUser("alice");
+    for (let i = 0; i < USER_SETTINGS_REPOS_PAGE_SIZE; i++) {
+      await seedRepo({ id: String(4000 + i), ownerId: alice.id, ownerNamespace: "alice", slug: `b${String(i).padStart(2, "0")}` });
+    }
+    const page1 = await loadUserSettingsReposPageData(env.DB, alice.id, new URLSearchParams());
+    if (page1 === null) throw new Error("loader returned null");
+    expect(page1.repos).toHaveLength(USER_SETTINGS_REPOS_PAGE_SIZE);
+    expect(page1.more).toBe(false); // exactly 50 → no Older
+    const ctx: UiContext = {
+      viewer: { kind: "user", id: alice.id, username: "alice", isAdmin: false },
+      origin: ORIGIN,
+      assets: shellAssetsFromManifest(manifest),
+    };
+    const html1 = renderToString(<UserSettingsReposPage ctx={ctx} data={page1} />);
+    expect(html1).not.toContain("pagination menu"); // page 1 of exactly 50 renders no pager at all
+    expect(html1).not.toContain("Older");
+
+    const page2 = await loadUserSettingsReposPageData(env.DB, alice.id, new URLSearchParams("page=2"));
+    if (page2 === null) throw new Error("loader returned null");
+    expect(page2.repos).toEqual([]);
+    expect(page2.more).toBe(false);
+    const html2 = renderToString(<UserSettingsReposPage ctx={ctx} data={page2} />);
+    expect(html2).toContain(userSettingsReposLocale.repos_none); // the {{else}} arm is per page
+    expect(html2).not.toContain('class="ui list"');
+    expect(html2).not.toContain("pagination menu");
+  });
+
   it("a userId with no users row loads null (the silent-auth-failure 404 input)", async () => {
     expect(await loadUserSettingsReposPageData(env.DB, 424242, new URLSearchParams())).toBeNull();
   });
@@ -253,6 +335,44 @@ describe("the repos settings DOM (repos.tmpl:80-113, the else branch)", () => {
     const html = renderToString(<UserSettingsReposPage ctx={ctx} data={data} />);
     expect(html).toContain("forked from");
     expect(html).toContain('<a href="/bob/source">Bob/source</a>');
+  });
+
+  it("the DANGLING fork row renders the fork glyph but NO forked-from line, beside its resolved sibling (repos.tmpl:99-102's conjunctive gate)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27) — the line renders only
+    // when isFork AND forkedFrom !== null (the module header: "a dangling
+    // edge renders … no forked-from line"); the ICON chain stays
+    // independent of the line (octicon-repo-forked still renders — the
+    // glyph reads .IsFork, not the resolved parent).
+    const { aliceId, ctx } = await seedWorld();
+    const data = await loadUserSettingsReposPageData(env.DB, aliceId, new URLSearchParams());
+    if (data === null) throw new Error("loader returned null");
+    const html = renderToString(<UserSettingsReposPage ctx={ctx} data={data} />);
+
+    const dangling = rowChunk(html, "/alice/aardfork");
+    expect(dangling).toContain("octicon-repo-forked"); // the glyph survives the dangling edge
+    expect(dangling).not.toContain("forked from"); // the line does not
+    const resolved = rowChunk(html, "/alice/zoofork");
+    expect(resolved).toContain("octicon-repo-forked");
+    expect(resolved).toContain("forked from");
+    expect(resolved).toContain('href="/bob/source"');
+    // Exactly one forked-from line on the page — only the resolved fork.
+    expect(html.split(userSettingsReposLocale.forked_from).length - 1).toBe(1);
+  });
+
+  it("the LAST page renders the Newer arm only — no Older (base/paginate's end arm off more=false)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27) — the pager renders
+    // Newer whenever page > 1 and Older whenever more (repos.tmpl:107's
+    // paginate reduction); a last page with rows shows Newer alone.
+    const { aliceId, ctx } = await seedWorld();
+    const data = await loadUserSettingsReposPageData(env.DB, aliceId, new URLSearchParams());
+    if (data === null || data.repos[0] === undefined) throw new Error("fixture repos missing");
+    const lastPage = renderToString(
+      <UserSettingsReposPage ctx={ctx} data={{ ownerName: data.ownerName, repos: [data.repos[0]], page: 2, more: false }} />,
+    );
+    expect(lastPage).toContain("ui borderless pagination menu");
+    expect(lastPage).toContain('href="/user/settings/repos?page=1"');
+    expect(lastPage).toContain(">Newer</span>");
+    expect(lastPage).not.toContain(">Older</span>");
   });
 
   it("renders the empty state — the bare repos_none item, no list, no pager, no adopt shapes", async () => {

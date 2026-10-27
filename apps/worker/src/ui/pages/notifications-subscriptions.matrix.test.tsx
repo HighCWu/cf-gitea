@@ -55,7 +55,7 @@
  *
  * ## DISCLOSED RED (real bug found — STOP + escalate, per the wave brief)
  *
- * ONE test below is RED against the landed module:
+ * ONE test below was RED against the landed module at disclosure time:
  * `EventLine`'s verb ternary (notification-subscriptions.tsx:871) checks
  * `isClosed` FIRST, so a merged PR — always closed: upstream merging runs
  * `issue_service.CloseIssue` (services/pull/pull.go:642/682/714) — renders
@@ -68,9 +68,14 @@
  * merged arm … whose merged branch the landed row data already carries via
  * `pull_requests.has_merged`"). The state GLYPH orders it correctly
  * (`isClosed → hasMerged ? git-merge-purple : …`), underlining that the
- * verb ordering is the slip. The test pins the upstream-correct contract
- * and stays RED until the module fix lands (one-line reorder; the module
- * is NOT this file's ownership). Everything else in the file is green.
+ * verb ordering is the slip.
+ *
+ * UPDATE (wave-polish-matrix-2, 2026-10-27, own-eyes verified): the module
+ * fix LANDED — EventLine now tests `isPull && hasMerged` first
+ * (notification-subscriptions.tsx:875) — and the formerly-RED merged-arm
+ * test passes GREEN (file run 20/20 before this batch's additions). The
+ * disclosure note above is kept as provenance; the test's own comment
+ * still describes the RED state it pinned.
  */
 
 import { env } from "cloudflare:test";
@@ -454,7 +459,7 @@ describe("w109 render — the PR state machine extensions over loaded rows", () 
     expect(html).toContain('<div class="flex-text-inline">closed ');
   });
 
-  it("RED (escalated real bug): a merged PR's event line reads 'merged {time} by {poster}'", async () => {
+  it("a merged PR's event line reads 'merged {time} by {poster}' (GREEN — the escalated verb-order fix landed)", async () => {
     const s = await seed();
     const svc = new IssuesService(env.DB);
     const db = drizzle(env.DB);
@@ -469,13 +474,12 @@ describe("w109 render — the PR state machine extensions over loaded rows", () 
     const html = renderNotificationSubscriptionsPage(ctxFor(s.viewerViewer), data);
     // The glyph already orders correctly (merged-inside-closed → purple).
     expect(html).toContain('class="svg octicon-git-merge tw-text-purple"');
-    // THE RED ASSERTION — upstream GetLastEventLabel (issue.go:460-468)
-    // nests HasMerged inside IsClosed and emits repo.pulls.merged_by for
-    // every merged PR; the landed EventLine checks isClosed first, so this
-    // renders the "closed" verb today and the merged branch is dead code
-    // (merge ⇒ closed — services/pull/pull.go's CloseIssue). Anchored to
-    // the EventLine div so the fixture title cannot satisfy it. Disclosed
-    // to the orchestrator; the module fix is a one-line verb reorder.
+    // Upstream GetLastEventLabel (issue.go:460-468) nests HasMerged inside
+    // IsClosed and emits repo.pulls.merged_by for every merged PR (merge ⇒
+    // closed — services/pull/pull.go's CloseIssue). This was RED while
+    // EventLine checked isClosed first (the disclosure in the file header);
+    // the module's one-line verb reorder landed and the assertion passes —
+    // anchored to the EventLine div so the fixture title cannot satisfy it.
     expect(html).toContain('<div class="flex-text-inline">merged ');
   });
 
@@ -642,5 +646,139 @@ describe("w109 render — the watching row's orgPrivate label", () => {
 
     const html = renderNotificationSubscriptionsPage(ctxFor(s.viewerViewer), data);
     expect(html).toContain("Internal"); // orgHomeLocale.repo_internal
+  });
+});
+
+// --- w129 additions (wave-polish-matrix-2, 2026-10-27) ------------------------------
+//
+// The batch-2 deepening: the facet tri-states' COMBINATION arms (upstream's
+// conjunctive repo_list.go:385-523 equality arms over FormOptionalBool,
+// notification.go:374-408) and the subscriptions sort VOCABULARY boundary —
+// the module header documents the 8 issue sorts verbatim
+// (issue_search.go:86-127's applySorts vocabulary), so the parse arm pins
+// exactly that set and nothing else.
+
+describe("w129 the 8 issue sorts verbatim — the parse boundary", () => {
+  it("accepts exactly the eight upstream values (latest via the default arm) and falls everything else to latest", () => {
+    // The module header's verbatim list (issue_search.go:86-118):
+    // latest/oldest/recentupdate/leastupdate/mostcomment/leastcomment/
+    // nearduedate/farduedate. "latest" is the DEFAULT arm — it is in the
+    // type union but has no switch case, so it round-trips through the
+    // default (parseIssueSort's switch, notification-subscriptions.tsx).
+    const eight: Array<"latest" | "oldest" | "recentupdate" | "leastupdate" | "mostcomment" | "leastcomment" | "nearduedate" | "farduedate"> = [
+      "latest",
+      "oldest",
+      "recentupdate",
+      "leastupdate",
+      "mostcomment",
+      "leastcomment",
+      "nearduedate",
+      "farduedate",
+    ];
+    for (const sort of eight) expect(parseIssueSort(sort)).toBe(sort);
+    // The boundary: casings (upstream FormString is case-sensitive),
+    // whitespace, emptiness, and the WATCHING family's values never leak
+    // into the issue vocabulary.
+    for (const junk of ["Latest", "NEARDUEDATE", "mostcomment ", " new", "newest", "alphabetically", "reversealphabetically", "moststars", ""]) {
+      expect(parseIssueSort(junk)).toBe("latest");
+    }
+    expect(parseIssueSort(null)).toBe("latest");
+  });
+
+  it("the watching vocabulary rejects the ISSUE family's values the other way (the two sort unions are disjoint but recentupdate/leastupdate/oldest)", () => {
+    // notification.go:347-373's switch — no issue-only value has a case, so
+    // each falls into the default's recentupdate (plus the stars/forks
+    // family's recorded counter-less degradation, the exploreRepoSort
+    // divergence).
+    expect(parseWatchingSort("mostcomment")).toBe("recentupdate");
+    expect(parseWatchingSort("nearduedate")).toBe("recentupdate");
+    expect(parseWatchingSort("farduedate")).toBe("recentupdate");
+    expect(parseWatchingSort("latest")).toBe("recentupdate");
+    expect(parseWatchingSort("recentupdate")).toBe("recentupdate"); // the explicit default
+    expect(parseWatchingSort("leastupdate")).toBe("leastupdate"); // the shared case
+    expect(parseWatchingSort("oldest")).toBe("oldest"); // the shared case
+  });
+});
+
+describe("w129 loadSubscriptionsData — sort=latest explicit and the id tie-break", () => {
+  it("an explicit sort=latest rides the default arm: same-second creations order id DESC, and oldest inverts the tie-break (issue_search.go:86-89's created DESC, id DESC / ASC, ASC)", async () => {
+    // Provenance: wave-polish-matrix-2. The committed file asserts latest's
+    // created DESC over DISTINCT stamps; this pins the verbatim tie-break
+    // (identical created → id DESC) that makes the order total.
+    const s = await seed();
+    const svc = new IssuesService(env.DB);
+    const first = await svc.createIssue({ repoId: s.publicRepoId, title: "tie first", posterId: s.origin.id, now: at(10) });
+    const second = await svc.createIssue({ repoId: s.publicRepoId, title: "tie second", posterId: s.origin.id, now: at(10) }); // same second
+    await subscribe(first.id, true);
+    await subscribe(second.id, true);
+
+    const latest = await loadSubscriptionsData(env.DB, s.viewerViewer, new URLSearchParams("sort=latest"));
+    expect(latest.sort).toBe("latest");
+    expect(latest.items.map((item) => item.title)).toEqual(["tie second", "tie first"]); // id DESC under equal created
+    const oldest = await loadSubscriptionsData(env.DB, s.viewerViewer, new URLSearchParams("sort=oldest"));
+    expect(oldest.items.map((item) => item.title)).toEqual(["tie first", "tie second"]); // the ASC, ASC mirror
+  });
+});
+
+describe("w129 loadWatchingData — the facet tri-states in COMBINATION", () => {
+  /** Reshape the fixture: mine becomes a FORK of visible; visible becomes a
+   *  MIRROR. Both stay public, unarchived, non-templates. */
+  async function seedForkMirrorWorld(): Promise<Seeded> {
+    const s = await seed();
+    const db = drizzle(env.DB);
+    await watchRepo(s.publicRepoId);
+    await watchRepo(s.ownRepoId);
+    await db.update(repositories).set({ forkParent: s.publicRepoId }).where(eq(repositories.id, s.ownRepoId)); // wisher/mine forks origin/visible
+    await db.update(repositories).set({ isMirror: true }).where(eq(repositories.id, s.publicRepoId)); // origin/visible is a mirror
+    return s;
+  }
+
+  it("a REAL fork edge splits the set both ways — fork=true keeps only the fork, fork=false only the plain repo (repo_list.go's fork_parent edge mapping)", async () => {
+    // Provenance: wave-polish-matrix-2. The committed arms run fork=true
+    // against a fork-less fixture (total 0); this pins the positive and the
+    // exclusion against a real fork_parent IS NOT NULL edge.
+    const s = await seedForkMirrorWorld();
+    const forks = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("fork=true"));
+    expect(forks.items.map((item) => item.repo.slug)).toEqual(["mine"]);
+    const plain = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("fork=false"));
+    expect(plain.items.map((item) => item.repo.slug)).toEqual(["visible"]);
+    expect(forks.total).toBe(1);
+    expect(plain.total).toBe(1);
+  });
+
+  it("junk tri-state values filter nothing at the LOADER level (FormOptionalBool's null arm — only strconv's bool set binds)", async () => {
+    // Provenance: wave-polish-matrix-2. parseOptionalBoolParam's junk→null
+    // is parser-pinned; this executes the loader with junk params so the
+    // `if (x !== null)` gates verifiably skip.
+    const s = await seedForkMirrorWorld();
+    for (const junk of ["fork=on", "fork=", "fork=junk", "archived=on", "private=yes", "mirror=2"]) {
+      const data = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams(junk));
+      expect(data.total, junk).toBe(2); // both watched repos, unfiltered
+    }
+    // topic=false does NOT engage the noMatch arm — only topic=true matches
+    // nothing (the search service's posture, module header).
+    const topicFalse = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("topic=false"));
+    expect(topicFalse.total).toBe(2);
+    const topicTrue = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("topic=true"));
+    expect(topicTrue.total).toBe(0);
+  });
+
+  it("combined facets CONJUNCT: fork=true&mirror=false isolates the fork, fork=false&mirror=true the mirror, fork=true&mirror=true empties (repo_list.go's ANDed equality arms)", async () => {
+    // Provenance: wave-polish-matrix-2 — the combination arms the committed
+    // single-facet posture cannot reach: every facet push ANDs into the
+    // shared WHERE, so contradictory pairs must answer the empty set
+    // without dropping the readGrant scope.
+    const s = await seedForkMirrorWorld();
+    const forkOnly = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("fork=true&mirror=false"));
+    expect(forkOnly.items.map((item) => item.repo.slug)).toEqual(["mine"]);
+    const mirrorOnly = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("fork=false&mirror=true"));
+    expect(mirrorOnly.items.map((item) => item.repo.slug)).toEqual(["visible"]);
+    const contradictory = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("fork=true&mirror=true"));
+    expect(contradictory.total).toBe(0); // conjunctive — no row is both
+    const contradictoryPrivate = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("fork=true&mirror=true&private=true"));
+    expect(contradictoryPrivate.total).toBe(0); // still conjunctive under a third facet
+    // A total facet set partitions without loss.
+    const everything = await loadWatchingData(env.DB, s.viewerViewer, new URLSearchParams("archived=false&template=false&private=false"));
+    expect(everything.total).toBe(2);
   });
 });

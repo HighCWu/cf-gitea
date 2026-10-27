@@ -328,6 +328,29 @@ describe("applyUserSettingsAccountEmailForm — the PRIMARY arm (MakeActiveEmail
     expect((await drizzle(env.DB).select().from(emailAddresses)).length).toBe(2);
   });
 
+  it("answers the silent redirect for the doer's own UNACTIVATED row (the is_activated gate — nothing written)", async () => {
+    // Direct insert — no landed write path produces an unactivated row (the
+    // no-mail convention), but upstream makeEmailPrimaryInternal queries
+    // `is_activated = isActive` (email_address.go:255-258), so this shape
+    // resolves as ErrEmailAddressNotExist → account.go:67-70's flash-error
+    // arm → the module's silent 303 (the module header's activated-gate
+    // port). Provenance: wave-polish-matrix-2 (2026-10-27).
+    const inserted = await drizzle(env.DB)
+      .insert(emailAddresses)
+      .values({ userId: 1, email: "pending@example.com", lowerEmail: "pending@example.com", isActivated: false, isPrimary: false })
+      .returning({ id: emailAddresses.id })
+      .all();
+    const outcome = await applyUserSettingsAccountEmailForm(env.DB, await loadUserRow(), {
+      method: "PRIMARY",
+      id: inserted[0]!.id,
+      email: "",
+    });
+    expect(outcome).toEqual({ outcome: "redirect" });
+    expect(await userEmail()).toBe("alice@example.com"); // no flip
+    const row = await drizzle(env.DB).select().from(emailAddresses).where(eq(emailAddresses.id, inserted[0]!.id)).get();
+    expect(row!.isActivated).toBe(false); // the row is untouched — no demotion write either
+  });
+
   it("SENDACTIVATION answers the already-activated silent arm and changes nothing", async () => {
     const id = await seedSecondary(1, "secondary@example.com");
     expect(await applyUserSettingsAccountEmailForm(env.DB, await loadUserRow(), { method: "SENDACTIVATION", id, email: "" })).toEqual({
@@ -409,6 +432,46 @@ describe("applyUserSettingsAccountDeleteForm (DeleteAccount over the PAT-as-pass
       message: userSettingsAccountLocale.still_own_repo,
     });
     expect(await loadUserRow()).toBeDefined();
+  });
+
+  it("checks the repo guard BEFORE the org guard — an account holding both answers form.still_own_repo (account.go's DeleteUser switch order, services/user/user.go:238-251's in-tx sequence)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27). Upstream DeleteAccount
+    // switches IsErrUserOwnRepos first and IsErrUserHasOrgs second
+    // (account.go:262-267), so the repo message wins when both guards trip.
+    const plaintext = await mintFor(1);
+    await drizzle(env.DB).insert(repositories).values({ id: "r2", storageKey: "r_r2", ownerNamespace: "alice", ownerId: 1, slug: "two", visibility: "public" });
+    await seedUser(2, "theorg", null);
+    await drizzle(env.DB).insert(orgMembers).values({ orgId: 2, userId: 1, role: "member", createdAt: new Date() });
+    expect(await applyUserSettingsAccountDeleteForm(env.DB, await loadUserRow(), { password: plaintext })).toEqual({
+      outcome: "invalid",
+      message: userSettingsAccountLocale.still_own_repo,
+    });
+    expect(await loadUserRow()).toBeDefined();
+  });
+
+  it("the cascade sweeps only the DOER's rows — another user's census rows survive (delete.go:74-103's doer-scoped DeleteBeans census)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27). The batch deletes BY
+    // the doer's id; bob's email row, watcher row, and session must all
+    // outlive alice's deletion.
+    const plaintext = await mintFor(1);
+    await seedUser(2, "bob", "bob@example.com");
+    await seedSecondary(2, "bob-second@example.com");
+    await drizzle(env.DB).insert(repoWatchers).values({ repoId: "r8", userId: 2 });
+    await drizzle(env.DB).insert(sessions).values({
+      id: "sess000002",
+      userId: 2,
+      sha256Digest: "b".repeat(64),
+      rotatedAt: new Date(),
+      expiresAt: new Date(Date.now() + 60_000),
+      lastSeenAt: new Date(),
+    });
+
+    expect(await applyUserSettingsAccountDeleteForm(env.DB, await loadUserRow(), { password: plaintext })).toEqual({ outcome: "deleted" });
+    expect(await drizzle(env.DB).select().from(users).where(eq(users.id, 1)).get()).toBeUndefined();
+    expect(await drizzle(env.DB).select().from(users).where(eq(users.id, 2)).get()).toBeDefined();
+    expect(await drizzle(env.DB).select().from(emailAddresses).where(eq(emailAddresses.userId, 2))).toHaveLength(1);
+    expect(await drizzle(env.DB).select().from(repoWatchers).where(eq(repoWatchers.userId, 2))).toHaveLength(1);
+    expect(await drizzle(env.DB).select().from(sessions).where(eq(sessions.userId, 2))).toHaveLength(1);
   });
 
   it("refuses while the account holds org memberships (form.still_has_org)", async () => {
@@ -588,6 +651,63 @@ describe("the account page DOM (user/settings/account.tmpl at the pin)", () => {
     expect(html).not.toContain('name="password" value=');
     // The UserDeleteWithComments arm never renders (the setting defaults 0).
     expect(html).not.toContain("ghost comments");
+  });
+
+  it("an UNACTIVATED row renders the Requires-activation label, Make-Primary-less but Remove-ful (account.tmpl:44-68's CanBePrimary = IsActivated gate)", async () => {
+    // Direct insert — no write path produces this shape (the no-mail
+    // convention, the module header); the template arm must hold anyway.
+    // Provenance: wave-polish-matrix-2 (2026-10-27).
+    await drizzle(env.DB).insert(emailAddresses).values({ userId: 1, email: "pending@example.com", lowerEmail: "pending@example.com", isActivated: false, isPrimary: false });
+    const html = await pageHtml();
+    expect(html).toContain(userSettingsAccountLocale.requires_activation); // the settings.requires_activation label renders
+    const chunk = html.slice(html.indexOf("<strong>pending@example.com</strong>"), html.indexOf('class="ui bottom attached segment"'));
+    expect(chunk).toContain('action="/user/settings/account/email/delete"'); // Remove stays buttoned
+    expect(chunk).not.toContain(userSettingsAccountLocale.primary_email); // canBePrimary=false → no Make Primary (account.tmpl:62-68)
+    expect(chunk).not.toContain('name="_method" value="PRIMARY"');
+  });
+
+  it("after a PRIMARY flip the render complements: the new primary is button-less, the DEMOTED old primary is buttoned with its materialized id", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27) — the DOM half of the
+    // demotion-materialization arm (account.tmpl's `not .IsPrimary` gates
+    // over the loader's derived flags; the materialized row id carries the
+    // Remove/Make-Primary forms, account.tmpl:58-68).
+    const id = await seedSecondary(1, "secondary@example.com");
+    await applyUserSettingsAccountEmailForm(env.DB, await loadUserRow(), { method: "PRIMARY", id, email: "" });
+    const data = await loadUserSettingsAccountPageData(env.DB, 1);
+    if (data === null) throw new Error("page data missing");
+    const html = renderToString(<UserSettingsAccountPage ctx={ctx} data={data} error={null} email="" />);
+    const demoted = data.emails.find((entry) => entry.email === "alice@example.com");
+    expect(demoted).toBeDefined();
+    expect(typeof demoted!.id).toBe("number");
+    // The new primary's chunk: no forms at all.
+    const primaryChunk = html.slice(html.indexOf("<strong>secondary@example.com</strong>"), html.indexOf("<strong>alice@example.com</strong>"));
+    expect(primaryChunk).not.toContain("email/delete");
+    expect(primaryChunk).not.toContain("PRIMARY");
+    // The demoted row's chunk: Remove + Make Primary carry its row id.
+    const demotedChunk = html.slice(html.indexOf("<strong>alice@example.com</strong>"), html.indexOf('class="ui bottom attached segment"'));
+    expect(demotedChunk).toContain('action="/user/settings/account/email/delete"');
+    expect(demotedChunk).toContain(`name="id" value="${String(demoted!.id)}"`);
+    expect(demotedChunk).toContain('name="_method" value="PRIMARY"');
+  });
+
+  it("the invalid re-render carries the email HTML-ESCAPED (no attribute breakout) and the password field stays valueless — carried email never credential", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27) — the HANDOFF's
+    // re-render shape `{ error, email }` crossed with the secrets value
+    // rule (account.tmpl:55's value="{{.Email}}" carries upstream-side too;
+    // the deletion form's password input never does, account.tmpl:122).
+    const nasty = 'odd"onmouseover="x@b.co';
+    const html = await pageHtml(userSettingsAccountLocale.email_been_used, nasty);
+    expect(html).toContain('class="ui negative message"');
+    expect(html).toContain(userSettingsAccountLocale.email_been_used);
+    expect(html).toContain('value="odd&quot;onmouseover=&quot;x@b.co"'); // hono/jsx escaping
+    expect(html).not.toContain('onmouseover="'); // no unescaped attribute breakout
+    expect(html).not.toContain('name="password" value='); // the credential never carries back
+  });
+
+  it("the plain GET renders no negative message (the error slot is POST-only)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27).
+    const html = await pageHtml();
+    expect(html).not.toContain("ui negative message");
   });
 
   it("the full-document render path matches the component path", async () => {

@@ -355,10 +355,87 @@ describe("the notifications page DOM (notifications.tmpl + layout_head.tmpl at t
   });
 });
 
+// --- the saved/invalid re-render shapes (the HANDOFF's render map) -------------------
+
+describe("the saved/invalid re-render shapes (the HANDOFF NOTE's render map)", () => {
+  /** Slice helper — the email form's chunk of the document. */
+  function emailSliceOf(html: string): string {
+    return html.slice(html.indexOf('action="/user/settings/notifications/email"'), html.indexOf('action="/user/settings/notifications/actions"'));
+  }
+
+  it("a SAVED email POST's re-render — the GET the 303 lands on — shows the new value selected (notifications.go:54/65's redirect target)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27). The saved outcome is a
+    // bare 303 onto USER_SETTINGS_NOTIFICATIONS_REDIRECT; what that GET
+    // renders is the loader's re-read of the store.
+    expect(await applyUserSettingsNotificationsEmailForm(env.DB, 1, { preference: "onmention" })).toEqual({ outcome: "saved" });
+    const html = await pageHtml();
+    const emailSlice = emailSliceOf(html);
+    expect(emailSlice).toContain('<option value="onmention" selected="">');
+    expect(emailSlice.match(/selected=""/g)?.length).toBe(1); // exactly the stored one
+    expect(html).not.toContain("ui negative message"); // the flash never renders — the no-flash reduction
+  });
+
+  it("a SAVED actions POST re-renders the actions form on the new value while the email form keeps its own stored value (notifications.go:81/88)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27).
+    expect(await applyUserSettingsNotificationsActionsForm(env.DB, 1, { preference: "all" })).toEqual({ outcome: "saved" });
+    const html = await pageHtml();
+    const actionsSlice = html.slice(html.indexOf('action="/user/settings/notifications/actions"'));
+    expect(actionsSlice).toContain('<option value="all" selected="">');
+    expect(emailSliceOf(html)).toContain('<option value="enabled" selected="">'); // the sibling form unaffected
+  });
+
+  it("an INVALID POST's 200 re-render shows the STORED preference selected — never the submitted junk (the upstream flash+redirect arm loses the submitted value, notifications.go:53-54)", async () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27). Upstream answers
+    // invalid with Flash.Error + redirect, so the re-rendered page carries
+    // the STORED preference; the landed reduction re-renders in place with
+    // the per-form message and the same stored-state contract.
+    expect(await applyUserSettingsNotificationsEmailForm(env.DB, 1, { preference: "disabled" })).toEqual({ outcome: "saved" });
+    const outcome = await applyUserSettingsNotificationsEmailForm(env.DB, 1, { preference: "junk-value" });
+    if (outcome.outcome !== "invalid") throw new Error("expected the invalid arm"); // narrow the union (no casts)
+    expect(outcome.message).toBe("Invalid data: junk-value");
+    expect(await storedRow()).toMatchObject({ emailNotificationsPreference: "disabled" }); // nothing stored for the junk
+    const data = await loadUserSettingsNotificationsPageData(env.DB, 1);
+    if (data === null) throw new Error("page data missing");
+    const html = renderToString(<UserSettingsNotificationsPage ctx={ctx} data={data} error={{ form: "email", message: outcome.message }} />);
+    const emailSlice = emailSliceOf(html);
+    expect(emailSlice).toContain('<option value="disabled" selected="">'); // the STORED value stays selected
+    expect(emailSlice).not.toContain('value="junk-value"'); // the submitted junk never leaks into the select
+    expect(emailSlice).toContain('<div class="ui negative message">Invalid data: junk-value</div>');
+  });
+
+  it("the per-form routing is EXCLUSIVE — exactly one negative message renders even when the two message texts collide", () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27). One POST re-renders
+    // one error; the { form } tag routes it, so the identical message under
+    // the other tag must not double-render.
+    const data = { emailNotificationsPreference: "enabled", actionsEmailNotificationsPreference: "failure-only" } as const;
+    const message = invalidDataMessage("shared-junk");
+    const emailRouted = renderToString(<UserSettingsNotificationsPage ctx={ctx} data={{ ...data }} error={{ form: "email", message }} />);
+    expect(emailRouted.match(/ui negative message/g)?.length).toBe(1);
+    expect(emailSliceOf(emailRouted)).toContain("<div class=\"ui negative message\">Invalid data: shared-junk</div>");
+    const actionsRouted = renderToString(<UserSettingsNotificationsPage ctx={ctx} data={{ ...data }} error={{ form: "actions", message }} />);
+    expect(actionsRouted.match(/ui negative message/g)?.length).toBe(1);
+    expect(actionsRouted.slice(actionsRouted.indexOf('action="/user/settings/notifications/actions"'))).toContain(
+      "<div class=\"ui negative message\">Invalid data: shared-junk</div>",
+    );
+  });
+});
+
 // --- the wiring contract -----------------------------------------------------------
 
 describe("the wiring contract (the HANDOFF NOTE's constant — the route matrix is deferred to the index.ts window)", () => {
   it("pins the saved outcome's 303 target (upstream's redirect, notifications.go:65/88)", () => {
     expect(USER_SETTINGS_NOTIFICATIONS_REDIRECT).toBe("/user/settings/notifications");
+  });
+
+  it("BOTH write arms' saved outcome shares that one 303 target (notifications.go:54/65 and :81/88 redirect to the same settings URL)", () => {
+    // Provenance: wave-polish-matrix-2 (2026-10-27). Upstream's two POST
+    // handlers each redirect onto /user/settings/notifications — the same
+    // GET re-reads the store whichever form saved (the two saved round-trip
+    // arms above execute each landing).
+    const arms = [parseUserSettingsNotificationsEmailForm(new URLSearchParams("preference=disabled")), parseUserSettingsNotificationsActionsForm(new URLSearchParams("preference=all"))];
+    expect(arms).toHaveLength(2); // both parsers produce the POST bodies whose `saved` answers 303 onto the constant
+    expect(USER_SETTINGS_NOTIFICATIONS_REDIRECT).toBe("/user/settings/notifications");
+    expect("/user/settings/notifications/email".startsWith(`${USER_SETTINGS_NOTIFICATIONS_REDIRECT}/`)).toBe(true);
+    expect("/user/settings/notifications/actions".startsWith(`${USER_SETTINGS_NOTIFICATIONS_REDIRECT}/`)).toBe(true);
   });
 });
