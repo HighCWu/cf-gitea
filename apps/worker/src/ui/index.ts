@@ -1375,6 +1375,49 @@ import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-cont
 import { resolveViewer, type Viewer } from "./viewer";
 
 // ---------------------------------------------------------------------------
+// The route clock (docs/research/render-wallclock-audit.md's follow-up 1).
+// The wallclock audit made every loader/emitter clock-injectable, but the
+// route call sites in THIS module were the one remaining hop: they hardcoded
+// `new Date()` (or relied on the loaders' internal default), so no fixture
+// could pin the rendered bytes one hop up — the blocker behind the
+// admin-monitor-cron golden skip and route-driven feed determinism. The
+// rendered-byte loader calls below consult `routeNow()`; with the override
+// unset (production) the expression is exactly the wall clock, so every
+// response is byte-identical to the pre-seam behavior — no request-visible
+// surface change. Write-path `new Date()` stamps in this module (stored
+// rows: notifications, project/workflow form writes) deliberately do NOT
+// consult it — they are not rendered bytes at these call sites (the audit's
+// (a-via-seeds) class: goldens pin stored rows directly).
+//
+// No request state: one module-scope variable, read at handler-call time,
+// written ONLY by the test hook below (module-level pure — the audit's
+// "no request-visible surface change" care).
+// ---------------------------------------------------------------------------
+
+/** The test-only route clock: returns the pinned Date, or null to fall back
+ *  to the wall clock. */
+type RouteClock = () => Date | null;
+
+let ROUTE_CLOCK: RouteClock | null = null;
+
+/**
+ * TEST-ONLY (the name marks it): pin or clear the route clock that this
+ * module's rendered-byte loader calls consult. `null` restores the wall
+ * clock. Never call from production code — the golden harness
+ * (`__tests__/goldens.test.ts`) is the only intended caller.
+ */
+export function __setRouteClockForTests(clock: RouteClock | null): void {
+  ROUTE_CLOCK = clock;
+}
+
+/** The clock the rendered-byte loaders run on: the pinned override when the
+ *  test harness set one, the wall clock otherwise (`ROUTE_CLOCK?.() ??
+ *  new Date()`). */
+function routeNow(): Date {
+  return ROUTE_CLOCK?.() ?? new Date();
+}
+
+// ---------------------------------------------------------------------------
 // Route parsers (the single source of truth — handlesUiRoute and uiRouter
 // both read them; §2.2 "route knowledge has exactly one owner")
 // ---------------------------------------------------------------------------
@@ -4674,7 +4717,9 @@ async function userFeedRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
           email: resolution.user.email,
           description: resolution.user.description,
         };
-  const data = await loadUserFeedData(c.env.DB, subject, viewer, url.origin, url.searchParams);
+  // The route clock (the seam at the top) flows into the channel Created
+  // stamp — the loader's trailing `now` seam from the wallclock audit.
+  const data = await loadUserFeedData(c.env.DB, subject, viewer, url.origin, url.searchParams, routeNow());
   const body = route.family === "user-feed-rss" ? renderUserFeedRss(data) : renderUserFeedAtom(data);
   return respond(
     new Response(body, {
@@ -6614,7 +6659,7 @@ async function adminPagePrologue(c: Context<{ Bindings: Env }>): Promise<
 async function adminDashboardPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminDashboardData(new Date());
+  const data = await loadAdminDashboardData(routeNow());
   return p.respond(c.html(renderAdminDashboardPage({ ctx: p.ctx, data, flash: null })));
 }
 
@@ -6627,7 +6672,7 @@ async function adminDashboardSubmit(c: Context<{ Bindings: Env }>): Promise<Resp
   const result = await applyAdminDashboardForm(c.env, form);
   // Upstream redirects; with no flash queue the module's recipe re-renders
   // fresh at 200 with the flash (the handoff's documented reduction).
-  const data = await loadAdminDashboardData(new Date());
+  const data = await loadAdminDashboardData(routeNow());
   const flash = { kind: result.outcome === "applied" ? "positive" as const : "negative" as const, text: result.message };
   return p.respond(c.html(renderAdminDashboardPage({ ctx: p.ctx, data, flash })));
 }
@@ -6641,7 +6686,7 @@ async function adminMonitorPage(c: Context<{ Bindings: Env }>, page: AdminMonito
       return p.respond(c.html(renderAdminMonitorStatsPage({ ctx: p.ctx, data })));
     }
     case "cron": {
-      const data = { entries: loadAdminMonitorCron(new Date()).entries };
+      const data = { entries: loadAdminMonitorCron(routeNow()).entries };
       return p.respond(c.html(renderAdminMonitorCronPage({ ctx: p.ctx, data, flash: null })));
     }
     case "queue": {
@@ -6660,7 +6705,7 @@ async function adminMonitorCronSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   if (!p.ok) return p.response;
   const form = parseAdminMonitorCronForm(await readUrlEncodedForm(c.req.raw));
   const result = await applyAdminMonitorCronForm(c.env, form);
-  const data = { entries: loadAdminMonitorCron(new Date()).entries };
+  const data = { entries: loadAdminMonitorCron(routeNow()).entries };
   const flash = { kind: result.outcome === "applied" ? "positive" as const : "negative" as const, text: result.message };
   return p.respond(c.html(renderAdminMonitorCronPage({ ctx: p.ctx, data, flash })));
 }
@@ -7960,7 +8005,9 @@ async function releasesFeedRoute(c: Context<{ Bindings: Env }>): Promise<Respons
     return respond(await c.notFound()); // registration/parser drift guard
   }
   if (!(await releasesReadGate(c.env.DB, repo))) return respond(c.html(renderNotFound(ctx), 404));
-  const data = await loadReleasesFeedData(c.env.DB, repo, url.origin);
+  // The route clock (the seam at the top) flows into the channel Created
+  // stamp — the loader's trailing `now` seam from the wallclock audit.
+  const data = await loadReleasesFeedData(c.env.DB, repo, url.origin, routeNow());
   if (data === null) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1504)
   const body = route.family === "release-feed-rss" ? renderReleasesFeedRss(data) : renderReleasesFeedAtom(data);
   return respond(
@@ -7984,7 +8031,9 @@ async function tagsFeedRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
   if (route.family !== "tags-feed-rss" && route.family !== "tags-feed-atom") {
     return respond(await c.notFound()); // registration/parser drift guard
   }
-  const data = await loadTagsFeedData(c.env, c.env.DB, repo, url.origin);
+  // The route clock (the seam at the top) flows into the channel Created
+  // stamp — the loader's trailing `now` seam from the wallclock audit.
+  const data = await loadTagsFeedData(c.env, c.env.DB, repo, url.origin, routeNow());
   if (data === null) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1502)
   const body = route.family === "tags-feed-rss" ? renderTagsFeedRss(data) : renderTagsFeedAtom(data);
   return respond(

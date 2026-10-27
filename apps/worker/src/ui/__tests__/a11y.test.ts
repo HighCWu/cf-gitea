@@ -12,6 +12,7 @@ import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } f
 // NEW_GOLDEN_CASES) — covered EXPLICITLY by the expansion arms below, never
 // through harness.ts's GOLDEN_CASES (that table feeds the smoke loop above
 // too; entries added there would silently grow this suite without review).
+import adminMonitorCronGolden from "./goldens/admin-monitor-cron.html?raw";
 import adminMonitorQueueGolden from "./goldens/admin-monitor-queue.html?raw";
 import adminMonitorStatsGolden from "./goldens/admin-monitor-stats.html?raw";
 import adminOrgsGolden from "./goldens/admin-orgs.html?raw";
@@ -299,6 +300,16 @@ const EXPANSION_ARMS: ExpansionArm[] = [
   // page's main table carries thead+scope (upstream queue.tmpl's own shape).
   { file: "admin-monitor-stats.html", golden: adminMonitorStatsGolden, mainAriaLabel: "Stats", mainClassTokens: ["admin", "monitor"], thWithoutScope: 0 },
   { file: "admin-monitor-queue.html", golden: adminMonitorQueueGolden, mainAriaLabel: "Queues", mainClassTokens: ["admin", "monitor"], thWithoutScope: 0 },
+  // admin-monitor-cron (the wave-route-clock closure — goldens.test.ts's own
+  // describe holds the mechanism): the R6 net's first sight of the cron page
+  // is CLEAN with no pre-fix needed — the table has carried thead + scope=col
+  // on every header cell since the module landed (cron.tmpl:12-17's shape),
+  // the icon-only run button carries its accessible name via title="Run"
+  // (the queue page's `-` arm precedent: name-from-title on a form control),
+  // and the hidden `from=monitor` input renders no label surface. The page
+  // needed NO a11y pre-fix — the skip was purely the wall-clock Next Time
+  // column, which the route-clock pin removed.
+  { file: "admin-monitor-cron.html", golden: adminMonitorCronGolden, mainAriaLabel: "Cron Tasks", mainClassTokens: ["admin", "monitor"], thWithoutScope: 0 },
   // wave-goldens-final (the batch's selection audit lives in goldens.test.ts's
   // case comment): the four most chrome-rich surfaces still without goldens.
   // First-sight verdicts, same protocol as the orgs/repos rows above:

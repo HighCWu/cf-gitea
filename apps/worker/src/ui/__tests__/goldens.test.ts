@@ -31,6 +31,7 @@ import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { actions, users } from "../../db/schema";
+import { __setRouteClockForTests } from "../index";
 import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
 import {
   GOLDEN_CASES,
@@ -209,9 +210,9 @@ describe("golden DOM snapshots (§5.2)", () => {
  * wave-fixed-id-seed closure, via the positive-match search arm — the case
  * comment documents why the bare path stays unlandable); admin-monitor's
  * stats + queue surfaces were closed by the wave-theadless-policy refinement
- * of the R6 rule (the block comment below holds the policy call); cron
- * remains the one documented skip — the analysis lives here so the next
- * attempt starts from the mechanism, not from a fresh dead end:
+ * of the R6 rule (the block comment below holds the policy call); cron was
+ * the one remaining skip until the wave-route-clock closure (the block
+ * comment below holds both the policy call and the cron mechanism):
  *
  *   - admin-orgs (TAKEN): `/-/admin/orgs`, the orgs list over the EXISTING
  *     org fixtures (acme + emptyorg — no new seeds; the R6 sweep already
@@ -276,10 +277,19 @@ describe("golden DOM snapshots (§5.2)", () => {
  *       full posture). The main queues table carries thead+scope (upstream
  *       queue.tmpl's own shape); the delivery-states segment is the
  *       definition shape the refined rule exempts.
- *     - admin-monitor cron (STILL SKIPPED — unchanged): the route passes
- *       `new Date()` (ui/index.ts loadAdminMonitorCron) and the Next Time
- *       column formats it, so no fixture can pin the page — wall-clock
- *       bytes, not a policy question.
+ *     - admin-monitor cron (TAKEN — the wave-route-clock closure): the
+ *       skip's blocker was wall-clock bytes — the route hardcoded
+ *       `new Date()` into loadAdminMonitorCron (ui/index.ts) and the Next
+ *       Time column formats it, so no fixture could pin the page (not a
+ *       policy question). The render-wallclock audit's follow-up 1 closed
+ *       it: index.ts's module-scope route clock (`routeNow()` consulted at
+ *       every rendered-byte loader call) + the test-only
+ *       `__setRouteClockForTests` pin. The LAST admin golden — stats/queue
+ *       landed in ff3b4fb. The case renders in its own describe below (the
+ *       pin must WRAP the render — the seam is module-scope, not a
+ *       per-request field, and harness.ts's GoldenCase stays outside this
+ *       wave's exclusive ownership); its a11y coverage rides the
+ *       EXPANSION_ARMS arm in a11y.test.ts like every expansion golden.
  */
 const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "admin-users.html", path: "/-/admin/users", status: 200, signedIn: true, sessionUser: "morgan" },
@@ -304,7 +314,8 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   // promotion like the other admin goldens. stats: the sorted key/count
   // definition-shape table over the harness seed's COUNT reads. queue: the
   // hooks seed's delivery depths (inQueue 1 / 0 / `-`) + the five-state
-  // breakdown (1/0/2/0/0). cron stays skipped — wall-clock Next Time bytes.
+  // breakdown (1/0/2/0/0). cron rides the wave-route-clock closure in its
+  // own describe below (the block comment above holds the mechanism).
   { file: "admin-monitor-stats.html", path: "/-/admin/monitor/stats", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "admin-monitor-queue.html", path: "/-/admin/monitor/queue", status: 200, signedIn: true, sessionUser: "morgan" },
   // ---------------------------------------------------------------------------
@@ -363,6 +374,109 @@ describe("wave-129 expansion goldens", () => {
       await renderGoldenCase(golden);
     });
   }
+});
+
+/**
+ * The admin-monitor-cron golden — the LAST admin golden (stats/queue landed
+ * in ff3b4fb; this closes the family's documented skip, the block comment
+ * above holds the mechanism). The skip's blocker was one hop above the
+ * already-clock-injectable loader: the route hardcoded `new Date()` into
+ * loadAdminMonitorCron, so the Next Time column was wall-clock bytes. The
+ * wave-route-clock seam (index.ts's `routeNow()` + the test-only
+ * `__setRouteClockForTests`) unlocks it: the render below runs under the
+ * pinned clock, making the Next Time column a fixture —
+ * T0 = 2023-11-14T22:13:20Z → the next 10-minute boundary of the
+ * update_mirrors minute-step spec is 22:20:00 (formatMonitorFullTime's
+ * UTC: "Nov 14, 2023 22:20:00").
+ *
+ * This lives in its OWN describe, not NEW_GOLDEN_CASES: the pin must wrap
+ * the render (the seam is a module-scope override, not a per-request field),
+ * and expressing that through the shared case loops would need a GoldenCase
+ * clock field — harness.ts is outside this wave's exclusive ownership. The
+ * try/finally restores the wall clock even on failure, so a broken golden
+ * cannot leak the pin into sibling suites (module-level state, one file's
+ * worker).
+ */
+const CRON_GOLDEN_CASE: GoldenCase = {
+  file: "admin-monitor-cron.html",
+  path: "/-/admin/monitor/cron",
+  status: 200,
+  signedIn: true,
+  sessionUser: "morgan",
+};
+
+/** The Next Time literal the pinned clock renders (the derivation lives in
+ *  the CRON_GOLDEN_CASE comment above) — the override arm asserts it. */
+const CRON_PINNED_NEXT_TIME = "Nov 14, 2023 22:20:00";
+
+/** The T0 channel stamp the pinned clock renders into the feed routes'
+ *  `<pubDate>` (formatRfc1123z(T0) — 2023-11-14 was a Tuesday). */
+const FEED_PINNED_CHANNEL_STAMP = "Tue, 14 Nov 2023 22:13:20 +0000";
+
+describe("admin-monitor-cron golden (the wave-route-clock closure)", () => {
+  it("renders admin-monitor-cron.html byte-identical (200) under the pinned route clock", async () => {
+    __setRouteClockForTests(() => new Date(T0 * 1000));
+    try {
+      await renderGoldenCase(CRON_GOLDEN_CASE);
+    } finally {
+      __setRouteClockForTests(null);
+    }
+  });
+});
+
+/**
+ * The route-clock override's own arm (the wave brief's set/unset behavior):
+ * the seam is production-invisible only if the pin BOTH moves the rendered
+ * bytes AND unset restores the wall clock. The 2023 literals can never
+ * collide with a live render (the stamps predate every run), so `toContain`
+ * / `not.toContain` are the robust discriminators — no timing flakes.
+ */
+describe("route-clock override arm (set/unset behavior)", () => {
+  it("the pin fixes the cron page's Next Time; unsetting restores the wall clock; re-pinning is exact", async () => {
+    __setRouteClockForTests(() => new Date(T0 * 1000));
+    let pinned: string;
+    try {
+      pinned = (await renderCase(CRON_GOLDEN_CASE)).html;
+    } finally {
+      __setRouteClockForTests(null);
+    }
+    expect(pinned).toContain(CRON_PINNED_NEXT_TIME);
+
+    // Unset = the wall clock: the 2023 stamp is gone, proving the override
+    // actually gates these bytes (the golden above could not pass without
+    // the pin reaching the route).
+    const live = (await renderCase(CRON_GOLDEN_CASE)).html;
+    expect(live).not.toContain(CRON_PINNED_NEXT_TIME);
+    expect(live).not.toBe(pinned);
+
+    // Re-pinning reproduces the pinned bytes exactly — no state bleed from
+    // the wall-clock render through the module-scope variable.
+    __setRouteClockForTests(() => new Date(T0 * 1000));
+    let repinned: string;
+    try {
+      repinned = (await renderCase(CRON_GOLDEN_CASE)).html;
+    } finally {
+      __setRouteClockForTests(null);
+    }
+    expect(repinned).toBe(pinned);
+  });
+
+  it("the pin reaches the feed routes' channel stamps (the loader-default hop closed)", async () => {
+    // The feed loaders defaulted `now` internally; the route call sites now
+    // forward the route clock, so the CHANNEL stamp (not the seeded item
+    // stamps) pins: releases.rss under T0 renders the fixed RFC-1123 literal.
+    __setRouteClockForTests(() => new Date(T0 * 1000));
+    let rss: string;
+    try {
+      rss = (await renderRoute("/alice/golden/releases.rss")).html;
+    } finally {
+      __setRouteClockForTests(null);
+    }
+    expect(rss).toContain(FEED_PINNED_CHANNEL_STAMP);
+
+    const liveRss = (await renderRoute("/alice/golden/releases.rss")).html;
+    expect(liveRss).not.toContain(FEED_PINNED_CHANNEL_STAMP);
+  });
 });
 
 describe("determinism (§5.2)", () => {
