@@ -1,7 +1,7 @@
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
-import { repoSettings } from "../../db/schema";
+import { repoSettings, repositories } from "../../db/schema";
 
 /**
  * Repo-edit stored subset (SPEC-0004 §2.4 row: `PATCH /repos/{owner}/{repo}`
@@ -119,4 +119,35 @@ export async function saveRepoSettings(
  *  deleteRepository cascade covers the same rows through the schema table). */
 export async function deleteRepoSettings(d1: D1Database, repoId: string): Promise<void> {
   await drizzle(d1).delete(repoSettings).where(eq(repoSettings.repoId, repoId));
+}
+
+/**
+ * The archived flip (upstream SetArchiveRepo — the settings danger zone's
+ * archive/unarchive POST, routers/web/repo/setting/setting.go:1005-1064, and
+ * the API PATCH arm's `form.archived` update). The `repositories.is_archived`
+ * column is the whole stored state at this pin (no archived_unix column
+ * landed); the caller owns upstream's mirror refusal
+ * (`repo.settings.archive.error_ismirror` — handleSettingsPostArchive:1009)
+ * because it needs the mirror read, so this arm is the unconditional write.
+ */
+export async function setRepoArchived(d1: D1Database, repoId: string, archived: boolean, now: Date): Promise<void> {
+  await drizzle(d1)
+    .update(repositories)
+    .set({ isArchived: archived, updatedAt: now })
+    .where(eq(repositories.id, repoId));
+}
+
+/**
+ * The template flag flip (upstream updateBasicProperties —
+ * routers/api/v1/repo/repo.go:699-701 `if opts.Template != nil { repo.IsTemplate
+ * = *opts.Template }`, persisted by UpdateRepository; the web settings basic
+ * form's `template` checkbox posts it). The `repositories.is_template` column
+ * gates generate-repo's eligibility check and the template badge render —
+ * D1-only, no engine seam.
+ */
+export async function setRepoTemplate(d1: D1Database, repoId: string, isTemplate: boolean, now: Date): Promise<void> {
+  await drizzle(d1)
+    .update(repositories)
+    .set({ isTemplate, updatedAt: now })
+    .where(eq(repositories.id, repoId));
 }

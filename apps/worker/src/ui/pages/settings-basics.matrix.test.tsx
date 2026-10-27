@@ -23,22 +23,29 @@
  *   - the guard-first cross-origin 403 (nothing written),
  *   - and the settings-family claim pin for the bare /settings tail.
  *
- * Wave-129 additions (the basics family's two deepest reachable arms; the
- * brief's other combos are NOT LANDED on this page and are disclosed, not
- * pinned: upstream options.tmpl's features-unit toggles (enable issues/
- * wiki/pulls), the default-branch select and the template/archived toggles
- * have no render here — the page carries only name/description/private
- * (the wiki feature toggle's family lives at /settings/wiki, owned by
- * repo-settings-wiki.test.tsx; the archived toggle has no settings surface —
- * the archived posture rides the repos that seed it directly)):
+ * Wave-129 additions (the basics family's two deepest reachable arms):
+ * the stale-alias consumption (renaming ONTO a name carrying another repo's
+ * redirect row consumes the alias and files the reverse pair —
+ * RepoService.rename's batch delete) and the private toggle's downstream
+ * settings-nav visibility (the conditional Public Access item arms for a
+ * private repo and disarms on the flip back).
  *
- *   - the stale-alias consumption: renaming ONTO a name carrying another
- *     repo's redirect row consumes the alias and files the reverse pair
- *     (RepoService.rename's batch delete — without it the unique insert
- *     would collide against a repo that no longer lives under the slug),
- *   - the private toggle's downstream settings-nav visibility (the
- *     conditional Public Access item arms for a private repo and disarms
- *     on the flip back — SettingsNav's navbar.tmpl:7-11 conditional).
+ * Wave-settings-options additions (the options form's full upstream field
+ * set at the pin): the basic form's `template`/`website` fields, the
+ * advanced form's unit checkboxes (`enable_internal_tracker` /
+ * `enable_projects` / `enable_releases` / `enable_packages` /
+ * `enable_pulls`, plus `enable_actions` relocated from actions_general.tmpl)
+ * and the merged `archived` danger-zone flip — each toggle round-trips
+ * through D1 (the repo_settings row / repositories.is_template /
+ * repositories.is_archived) and re-renders its stored state on the GET;
+ * the archive arm's upstream mirror refusal ("You cannot archive a mirrored
+ * repo.") re-renders at 200 with nothing written. Disclosed, NOT pinned
+ * here: `enable_code` (no landed repo_settings column), `enable_wiki` (the
+ * wave-54 split owns it at /settings/wiki — repo-settings-wiki.test.tsx),
+ * the default-branch select (NOT on options.tmpl at this pin — upstream's
+ * branches.tmpl `action=default_branch` block, the branch-protection
+ * module's page), and the invalid re-render's wave-129-field carry (the
+ * handler rebuild pins below that the fallback renders the STORED states).
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
@@ -73,7 +80,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["repo_redirects", "repo_settings", "repositories", "users"]) {
+  for (const table of ["repo_redirects", "repo_settings", "repo_mirrors", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   repo = await seedRepo("demo", "public");
@@ -212,6 +219,44 @@ describe("parseRepoBasicsForm (repo_name/description/private)", () => {
     expect(parseRepoBasicsForm(new URLSearchParams({ private: "on" })).isPrivate).toBe(true);
     expect(parseRepoBasicsForm(new URLSearchParams({ private: "" })).isPrivate).toBe(false);
     expect(parseRepoBasicsForm(new URLSearchParams()).isPrivate).toBe(false);
+  });
+});
+
+describe("parseRepoBasicsForm (the wave-settings-options field set)", () => {
+  it("the unit checkboxes carry upstream's field names; present = on, absent = off", () => {
+    const on = parseRepoBasicsForm(
+      new URLSearchParams({
+        enable_internal_tracker: "on",
+        enable_pulls: "on",
+        enable_releases: "on",
+        enable_projects: "on",
+        enable_packages: "on",
+        enable_actions: "on",
+      }),
+    );
+    expect(on.units).toEqual({ hasIssues: true, hasPullRequests: true, hasReleases: true, hasProjects: true, hasPackages: true, hasActions: true });
+    // The unchecked-checkbox post: every unit field absent from the body.
+    expect(parseRepoBasicsForm(new URLSearchParams({ repo_name: "demo" })).units).toEqual({
+      hasIssues: false,
+      hasPullRequests: false,
+      hasReleases: false,
+      hasProjects: false,
+      hasPackages: false,
+      hasActions: false,
+    });
+  });
+
+  it("website/template/archived parse with the checkbox semantics; the parser always fills the wave fields", () => {
+    const full = parseRepoBasicsForm(
+      new URLSearchParams({ repo_name: "demo", website: "https://demo.test", template: "on", archived: "on" }),
+    );
+    expect(full.website).toBe("https://demo.test");
+    expect(full.isTemplate).toBe(true);
+    expect(full.isArchived).toBe(true);
+    const bare = parseRepoBasicsForm(new URLSearchParams({ repo_name: "demo" }));
+    expect(bare.website).toBe("");
+    expect(bare.isTemplate).toBe(false);
+    expect(bare.isArchived).toBe(false);
   });
 });
 
@@ -428,6 +473,224 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings)", () => {
     expect(await storedVisibility()).toBe("public");
     const backPage = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
     expect(await backPage.text()).not.toContain('href="/alice/demo/settings/public_access"');
+  });
+});
+
+// --- the wave-settings-options toggle matrix (the options form's field set) -----
+
+/** The raw persisted unit row (the repo_settings columns as stored — the
+ *  integers behind the service's boolean mode). */
+async function storedUnitRow(): Promise<{ has_issues: number; has_pull_requests: number; has_releases: number; has_projects: number; has_packages: number; has_actions: number } | undefined> {
+  const res = await env.DB.prepare(
+    "SELECT has_issues, has_pull_requests, has_releases, has_projects, has_packages, has_actions FROM repo_settings WHERE repo_id = 'repo-1'",
+  ).first<Record<string, number>>();
+  return res as undefined | { has_issues: number; has_pull_requests: number; has_releases: number; has_projects: number; has_packages: number; has_actions: number };
+}
+
+/** The repositories row's template/archived/website columns (the flip arms'
+ *  read-back). */
+async function storedRepoColumns(): Promise<{ is_template: number; is_archived: number }> {
+  const res = await env.DB.prepare("SELECT is_template, is_archived FROM repositories WHERE id = 'repo-1'").first<{
+    is_template?: number;
+    is_archived?: number;
+  }>();
+  if (res === null || res.is_template === undefined || res.is_archived === undefined) throw new Error("fixture repository missing");
+  return { is_template: res.is_template, is_archived: res.is_archived };
+}
+
+describe("the options form's wave-settings-options field set (template/website/units/archived)", () => {
+  it("the plain GET renders the upstream-default unit states (issues/pulls/releases on, projects/packages/actions off) and no stored website", async () => {
+    const res = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The advanced-form section label + the unit checkboxes at the defaults
+    // (loadRepoSettings' DefaultRepoUnits minus wiki, which lives at
+    // /settings/wiki, minus code, which has no landed column).
+    expect(html).toContain('<h4 class="ui dividing header">Advanced Settings</h4>');
+    expect(html).toContain('<input class="enable-system" name="enable_internal_tracker" type="checkbox" checked=""/>');
+    expect(html).toContain('<input class="enable-system" name="enable_pulls" type="checkbox" checked=""/>');
+    expect(html).toContain('<input class="enable-system" name="enable_releases" type="checkbox" checked=""/>');
+    expect(html).toContain('<input class="enable-system" name="enable_projects" type="checkbox"/>');
+    expect(html).toContain('<input class="enable-system" name="enable_packages" type="checkbox"/>');
+    expect(html).toContain('<input class="enable-system" name="enable_actions" type="checkbox"/>');
+    // The basic-form additions: the template/archived toggles unchecked (the
+    // repo row's flags) and the website input empty (no stored value).
+    expect(html).toContain('<input id="template" name="template" type="checkbox"/>');
+    expect(html).toContain('<input id="archived" name="archived" type="checkbox"/>');
+    expect(html).toContain('<input id="website" name="website" type="url" maxlength="1024" value=""/>');
+  });
+
+  it("the GET renders the STORED unit/website/template/archived states (saveRepoSettings' row + the repo row's flags)", async () => {
+    await saveRepoSettings(
+      env.DB,
+      repo.id,
+      { website: "https://demo.test", hasIssues: false, hasPullRequests: false, hasProjects: true, hasActions: true },
+      new Date(),
+    );
+    await env.DB.prepare("UPDATE repositories SET is_template = 1 WHERE id = 'repo-1'").run();
+    const res = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    const html = await res.text();
+    expect(html).toContain('<input id="website" name="website" type="url" maxlength="1024" value="https://demo.test"/>');
+    expect(html).toContain('<input class="enable-system" name="enable_internal_tracker" type="checkbox"/>'); // stored off
+    expect(html).toContain('<input class="enable-system" name="enable_pulls" type="checkbox"/>'); // stored off
+    expect(html).toContain('<input class="enable-system" name="enable_projects" type="checkbox" checked=""/>'); // stored on
+    expect(html).toContain('<input class="enable-system" name="enable_actions" type="checkbox" checked=""/>'); // stored on
+    expect(html).toContain('<input id="template" name="template" type="checkbox" checked=""/>'); // the repo row's flag
+    expect(html).toContain('<input id="archived" name="archived" type="checkbox"/>'); // still unarchived
+  });
+
+  it("the units round-trip both ways: the POST lands every flag in D1 and the GET re-renders it", async () => {
+    const on = await basicsPost({
+      repo_name: "demo",
+      description: "",
+      enable_internal_tracker: "on",
+      enable_pulls: "on",
+      enable_releases: "on",
+      enable_projects: "on",
+      enable_packages: "on",
+      enable_actions: "on",
+    });
+    expect(on.status).toBe(303);
+    expect(on.headers.get("location")).toBe("/alice/demo/settings");
+    // The persisted shape: the raw repo_settings integers (1/0) AND the
+    // service read (the boolean mode the API PATCH + wiki gates consume).
+    expect(await storedUnitRow()).toEqual({ has_issues: 1, has_pull_requests: 1, has_releases: 1, has_projects: 1, has_packages: 1, has_actions: 1 });
+    const settings = await loadRepoSettings(env.DB, repo.id);
+    expect(settings.hasIssues).toBe(true);
+    expect(settings.hasPullRequests).toBe(true);
+    expect(settings.hasReleases).toBe(true);
+    expect(settings.hasProjects).toBe(true);
+    expect(settings.hasPackages).toBe(true);
+    expect(settings.hasActions).toBe(true);
+    const page = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    const html = await page.text();
+    expect(html).toContain('<input class="enable-system" name="enable_packages" type="checkbox" checked=""/>');
+    expect(html).toContain('<input class="enable-system" name="enable_actions" type="checkbox" checked=""/>');
+
+    // The unchecked-checkbox post flips every unit off (HTML semantics: an
+    // absent field is an unchecked box — the same rule `private` pinned).
+    const off = await basicsPost({ repo_name: "demo", description: "" });
+    expect(off.status).toBe(303);
+    expect(await storedUnitRow()).toEqual({ has_issues: 0, has_pull_requests: 0, has_releases: 0, has_projects: 0, has_packages: 0, has_actions: 0 });
+    const offPage = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(await offPage.text()).toContain('<input class="enable-system" name="enable_internal_tracker" type="checkbox"/>');
+  });
+
+  it("the template flag round-trips both ways through repositories.is_template and the GET reflects it", async () => {
+    const mark = await basicsPost({ repo_name: "demo", description: "", template: "on" });
+    expect(mark.status).toBe(303);
+    expect(await storedRepoColumns()).toEqual({ is_template: 1, is_archived: 0 });
+    expect(await (await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } })).text()).toContain(
+      '<input id="template" name="template" type="checkbox" checked=""/>',
+    );
+    const unmark = await basicsPost({ repo_name: "demo", description: "" });
+    expect(unmark.status).toBe(303);
+    expect(await storedRepoColumns()).toEqual({ is_template: 0, is_archived: 0 });
+    expect(await (await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } })).text()).toContain(
+      '<input id="template" name="template" type="checkbox"/>',
+    );
+  });
+
+  it("the website field round-trips: stored verbatim (including empty), re-rendered as the input value", async () => {
+    const set = await basicsPost({ repo_name: "demo", description: "", website: "https://demo.example/pages" });
+    expect(set.status).toBe(303);
+    expect((await loadRepoSettings(env.DB, repo.id)).website).toBe("https://demo.example/pages");
+    expect(await (await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } })).text()).toContain(
+      'value="https://demo.example/pages"/>',
+    );
+    const clear = await basicsPost({ repo_name: "demo", description: "" }); // the empty input clears
+    expect(clear.status).toBe(303);
+    expect((await loadRepoSettings(env.DB, repo.id)).website).toBe("");
+  });
+
+  it("the archived flip round-trips both ways through repositories.is_archived and the GET reflects it", async () => {
+    const archive = await basicsPost({ repo_name: "demo", description: "", archived: "on" });
+    expect(archive.status).toBe(303);
+    expect(archive.headers.get("location")).toBe("/alice/demo/settings");
+    expect(await storedRepoColumns()).toEqual({ is_template: 0, is_archived: 1 });
+    const page = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(await page.text()).toContain('<input id="archived" name="archived" type="checkbox" checked=""/>');
+
+    const unarchive = await basicsPost({ repo_name: "demo", description: "" }); // the unchecked post
+    expect(unarchive.status).toBe(303);
+    expect(await storedRepoColumns()).toEqual({ is_template: 0, is_archived: 0 });
+    const backPage = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(await backPage.text()).toContain('<input id="archived" name="archived" type="checkbox"/>');
+  });
+
+  it("the archive arm refuses a MIRROR with upstream's exact text and writes nothing (setting.go:1009)", async () => {
+    await env.DB.prepare(
+      "INSERT INTO repo_mirrors (repo_id, remote_address) VALUES ('repo-1', 'https://upstream.test/demo.git')",
+    ).run();
+    await saveRepoSettings(env.DB, repo.id, { description: "untouched" }, new Date());
+    const res = await basicsPost({ repo_name: "demo", description: "carried", archived: "on" });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="ui negative message">You cannot archive a mirrored repo.</div>');
+    // Nothing was written: the flag stands down AND the post's other fields
+    // (the description) never landed — the guard fronts the whole POST.
+    expect(await storedRepoColumns()).toEqual({ is_template: 0, is_archived: 0 });
+    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("untouched");
+    // Unarchiving (or an already-archived flip) does not hit the guard: the
+    // mirror may post the form WITHOUT the archived field and still write.
+    const plain = await basicsPost({ repo_name: "demo", description: "mirror still writes" });
+    expect(plain.status).toBe(303);
+    expect((await loadRepoSettings(env.DB, repo.id)).description).toBe("mirror still writes");
+  });
+
+  it("the invalid-name re-render carries the legacy trio and falls back to the STORED wave-129 states (the no-recipe posture)", async () => {
+    // The landed handler rebuilds the carried form with the legacy three
+    // fields only (ui/index.ts, orchestrator-owned); the wave-129 fields are
+    // optional on RepoBasicsForm precisely for this path — absent renders
+    // the STORED state, never a false state the user did not submit.
+    await saveRepoSettings(env.DB, repo.id, { hasProjects: true, website: "https://stored.test" }, new Date());
+    await env.DB.prepare("UPDATE repositories SET is_template = 1 WHERE id = 'repo-1'").run();
+    const res = await basicsPost({
+      repo_name: "demo.git", // invalid → the invalid outcome
+      description: "carried body",
+      private: "on",
+      archived: "on", // the carried-but-dropped submission
+      enable_packages: "on",
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="ui negative message">repository name is not allowed: demo.git</div>');
+    expect(html).toContain(">carried body</textarea>"); // the legacy carry holds
+    expect(html).toContain('<input id="private" name="private" type="checkbox" checked=""/>'); // legacy carry
+    // The wave-129 fields render the STORED states (hasProjects on; the
+    // posted enable_packages dropped; template/archived off the repo row).
+    expect(html).toContain('<input class="enable-system" name="enable_projects" type="checkbox" checked=""/>');
+    expect(html).toContain('<input class="enable-system" name="enable_packages" type="checkbox"/>');
+    expect(html).toContain('<input id="template" name="template" type="checkbox" checked=""/>');
+    expect(html).toContain('<input id="archived" name="archived" type="checkbox"/>');
+    expect(html).toContain('value="https://stored.test"/>');
+    // Nothing was written (the pre-existing invalid-arm rule, now covering
+    // the new write arms too): the stored row keeps its flags (hasProjects
+    // on, the posted enable_packages dropped) and the repo row stands.
+    expect(await storedRepoColumns()).toEqual({ is_template: 1, is_archived: 0 });
+    expect(await storedUnitRow()).toEqual({ has_issues: 1, has_pull_requests: 1, has_releases: 1, has_projects: 1, has_packages: 0, has_actions: 0 });
+  });
+
+  it("the merged single POST applies the whole field set in one round-trip (upstream's two-form split reduced)", async () => {
+    const res = await basicsPost({
+      repo_name: "demo",
+      description: "one post",
+      website: "https://one.test",
+      template: "on",
+      enable_internal_tracker: "on",
+      enable_packages: "on",
+      enable_pulls: "on",
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/alice/demo/settings");
+    const settings = await loadRepoSettings(env.DB, repo.id);
+    expect(settings.description).toBe("one post");
+    expect(settings.website).toBe("https://one.test");
+    expect(settings.hasIssues).toBe(true);
+    expect(settings.hasPackages).toBe(true);
+    expect(settings.hasPullRequests).toBe(true);
+    expect(settings.hasProjects).toBe(false); // the unchecked box posts off
+    expect(await storedRepoColumns()).toEqual({ is_template: 1, is_archived: 0 });
   });
 });
 
