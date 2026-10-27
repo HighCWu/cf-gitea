@@ -227,12 +227,15 @@ export function issueActionDraft(emission: IssueEventEmission): ActionDraft | nu
 }
 
 /** Best-effort action-row write — caught, logged, never propagated (the
- *  webhook fan-out posture; a lost insert is a feed gap, not an API error). */
-async function recordIssueAction(env: Env, emission: IssueEventEmission): Promise<void> {
+ *  webhook fan-out posture; a lost insert is a feed gap, not an API error).
+ *  `now` is the wall-clock seam (render-wallclock-audit): the drafts carry
+ *  no createdAt of their own, so without it recordAction stamps new Date()
+ *  into the feed rows the profile-activity/user feeds render as TimeSince. */
+async function recordIssueAction(env: Env, emission: IssueEventEmission, now?: Date): Promise<void> {
   const draft = issueActionDraft(emission);
   if (draft === null) return;
   try {
-    await recordAction(env.DB, draft);
+    await recordAction(env.DB, now === undefined ? draft : { ...draft, createdAt: now });
   } catch (error) {
     console.error(`[issues] action row failed (${emission.eventType}): ${errorMessage(error)}`);
   }
@@ -249,7 +252,15 @@ async function recordIssueAction(env: Env, emission: IssueEventEmission): Promis
  * skip the enqueue, and leave the rows `pending` (the durable source of
  * truth; the consumer's idempotent CAS makes a later enqueue a safe replay).
  */
-export async function emitIssueEvent(request: IssueEventRequest, emission: IssueEventEmission): Promise<void> {
+export async function emitIssueEvent(
+  request: IssueEventRequest,
+  emission: IssueEventEmission,
+  // Wall-clock seam (render-wallclock-audit): one clock for the whole
+  // emission — the delivery rows' createdAt (emitWebhookDeliveries'
+  // options.now) and the action draft's createdAt. Omitted → new Date(),
+  // byte-identical to the previous behavior; every caller is unchanged.
+  options?: { now?: Date },
+): Promise<void> {
   let execCtx: IssueEventExecution | undefined;
   try {
     execCtx = request.executionCtx;
@@ -259,6 +270,7 @@ export async function emitIssueEvent(request: IssueEventRequest, emission: Issue
   const queue = webhookDeliveryQueue(request.env);
   try {
     await emitWebhookDeliveries(request.env.DB, { ...emission, refName: null }, {
+      now: options?.now,
       enqueue:
         queue !== null && execCtx !== undefined
           ? (deliveryIds) => {
@@ -273,7 +285,7 @@ export async function emitIssueEvent(request: IssueEventRequest, emission: Issue
   } catch (error) {
     console.error(`[issues] webhook fan-out failed (${emission.eventType}): ${errorMessage(error)}`);
   }
-  await recordIssueAction(request.env, emission);
+  await recordIssueAction(request.env, emission, options?.now);
 }
 
 /**

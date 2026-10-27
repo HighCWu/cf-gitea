@@ -475,6 +475,10 @@ export async function loadTagsFeedData(
   d1: D1Database,
   repo: RepoRow,
   origin: string,
+  // Wall-clock seam (render-wallclock-audit): the channel Created stamp
+  // (generatedUnix → RSS pubDate / Atom updated). Default keeps every
+  // caller unchanged; tests pin it for byte-stable feeds.
+  now: Date = new Date(),
 ): Promise<TagsFeedEnvelopeInput | null> {
   if (repo.isEmpty) return null; // MustBeNotEmpty (web.go:1502)
 
@@ -542,7 +546,7 @@ export async function loadTagsFeedData(
     title: TAGS_FOR.replace("%s", `${repo.ownerNamespace}/${repo.slug}`),
     link: `${repoHref}/tags`,
     description: settings.description,
-    generatedUnix: Math.floor(Date.now() / 1000),
+    generatedUnix: Math.floor(now.getTime() / 1000),
     items,
   };
 }

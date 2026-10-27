@@ -646,6 +646,10 @@ export async function loadUserFeedData(
   viewer: Viewer,
   origin: string,
   params: URLSearchParams,
+  // Wall-clock seam (render-wallclock-audit): the channel Created stamp
+  // (generatedUnix → RSS pubDate / Atom updated). Default keeps every
+  // caller unchanged; tests pin it for byte-stable feeds.
+  now: Date = new Date(),
 ): Promise<UserFeedData> {
   const viewerId = viewer.kind === "user" ? viewer.id : null;
   const viewerIsAdmin = viewer.kind === "user" ? viewer.isAdmin : false;
@@ -752,7 +756,7 @@ export async function loadUserFeedData(
       wiki: false,
       origin: "",
     }),
-    generatedUnix: Math.floor(Date.now() / 1000),
+    generatedUnix: Math.floor(now.getTime() / 1000),
     items,
     total,
   };

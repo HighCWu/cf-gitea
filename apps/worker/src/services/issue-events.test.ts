@@ -23,8 +23,10 @@ import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { contractModelProperties } from "../compat/contract/frozen-contract";
+import { ActionType } from "../api/services/activity-feeds";
 import { createApiRouter } from "../api/router";
-import { repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { actions, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { emitIssueEvent, type IssueEventExecution } from "./issue-events";
 import { uiRouter } from "../ui/index";
 import { uiEnv } from "../ui/__tests__/harness";
 import { mintSession, SESSION_COOKIE_NAME } from "../ui/session";
@@ -232,5 +234,52 @@ describe("issue-family webhook emission — both write paths through the shared 
     );
     expect(res.status).toBe(200); // the re-render convention — no write, no event
     expect(await deliveriesFor(hookId)).toHaveLength(0);
+  });
+
+  // The wall-clock seam's now-arm (docs/research/render-wallclock-audit.md):
+  // the issue-family action drafts carry no createdAt of their own, so the
+  // feed rows the profile-activity/user feeds render as TimeSince used to
+  // take recordAction's new Date() default — unreachable by fixtures (the
+  // golden had to UPDATE the rows post-hoc). One injected clock now pins
+  // BOTH the delivery rows and the action rows.
+  it("the injected now lands in the delivery rows AND the action rows (drafts carry none of their own)", async () => {
+    const alice = await seedUser("Alice");
+    const repoId = await seedRepo(alice, "pinned");
+    const hookId = await seedHook(repoId, ["issues"]);
+    const fixed = new Date(Date.UTC(2026, 0, 1, 12, 0, 0));
+
+    await emitIssueEvent(
+      {
+        env,
+        // hono's getter throws for in-process callers — mimic it exactly.
+        get executionCtx(): IssueEventExecution {
+          throw new Error("no execution context (in-process caller)");
+        },
+      },
+      {
+        repoId,
+        ownerId: alice.id,
+        eventType: "issues",
+        payload: {
+          action: "opened",
+          number: 1,
+          issue: { number: 1, title: "pinned" },
+          repository: { private: false },
+          sender: { id: alice.id },
+        },
+      },
+      { now: fixed },
+    );
+
+    const [delivery] = await deliveriesFor(hookId);
+    expect(delivery).toBeDefined();
+    expect(delivery!.createdAt?.getTime()).toBe(fixed.getTime());
+
+    const actionRows = await db().select().from(actions).where(eq(actions.repoId, repoId)).all();
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]!.opType).toBe(ActionType.CreateIssue);
+    expect(actionRows[0]!.actUserId).toBe(alice.id);
+    expect(actionRows[0]!.createdAt.getTime()).toBe(fixed.getTime());
+    expect(actionRows[0]!.content).toBe("1|pinned");
   });
 });

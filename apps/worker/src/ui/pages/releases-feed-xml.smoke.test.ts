@@ -19,6 +19,13 @@
  *   3. The `repo.MustBeNotEmpty` arm: an empty repo → `null` (the route
  *      404-shells); plus the ghost-publisher arm (a release whose
  *      publisher has no user row → Author "Ghost" with no email).
+ *   4. (The polish wave) The MOUNTED route arms (ui/index.ts's
+ *      releasesFeedRoute, upstream web.go:1505-1510): the family content
+ *      types over the real router, the releases-unit-disabled 404
+ *      (`reqRepoReleaseReader` — web.go:1504's group gate), the empty-repo
+ *      gate arm, and the case-exact dotted literal (`releases.RSS` stays
+ *      unclaimed → the engine's 404). The tags twin's SERVES-anyway arm
+ *      lives in tags-feed-xml.smoke.test.ts — the gate divergence pair.
  *
  * Harness posture: the module functions driven DIRECTLY (the repo-
  * lastcommit-fragment test's convention — the route arm is index-owned;
@@ -28,12 +35,14 @@
 
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { repositories } from "../../db/schema";
 import type { RepoRow } from "../ui-context";
+import { uiRouter, type UiAssetsFetcher } from "../index";
+import type { UiManifest } from "../manifest";
 import {
   RELEASES_FEED_CONTENT_TYPES,
   loadReleasesFeedData,
@@ -49,6 +58,30 @@ const ORIGIN = "https://feed.test";
 const REPO_ID = "repo-demo";
 const EMPTY_REPO_ID = "repo-empty";
 const GHOSTY_REPO_ID = "repo-ghosty";
+
+/** The real production router (the user-profile.matrix pattern): parse →
+ *  resolveUiSession → the mounted releasesFeedRoute with the synthetic
+ *  manifest for the 404 shell's assets. */
+const manifest: UiManifest = {
+  "web_src/js/iife.ts": { file: "js/iife.abcd1234.js" },
+  "web_src/js/index.ts": { file: "js/index.deadbeef.js", css: ["css/index.1111aaaa.css"] },
+  "web_src/css/themes/theme-gitea-light.css": { file: "css/theme-gitea-light.4444dddd.css" },
+  "web_src/js/user-events.sharedworker.ts": { file: "js/user-events.5555eeee.js" },
+};
+
+type RouteEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+const routeEnv: RouteEnv = {
+  ...env,
+  ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
+};
+
+async function fetchRoute(path: string): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await uiRouter.fetch(new Request(`https://feed.test${path}`), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
 
 /** The seeded repositories row (a real `$inferSelect` — no hand-built
  *  literal over the long-tail columns). */
@@ -324,5 +357,52 @@ describe("releases feed xml envelopes (the /{owner}/{repo}/releases.rss + .atom 
     // The empty note renders no content element on either envelope.
     expect(ghostRss).not.toContain("<content:encoded>");
     expect(ghostAtom).not.toContain(`<content type="html">`);
+  });
+});
+
+// --- the mounted route arms (web.go:1505-1510's gates over the REAL router) ----
+
+describe("the mounted /{owner}/{repo}/releases.rss|.atom route arms", () => {
+  it("the public repo's channel answers with the family content type and the loader's body", async () => {
+    await seedHappyPath();
+
+    const rss = await fetchRoute("/alice/demo/releases.rss");
+    expect(rss.status).toBe(200);
+    expect(rss.headers.get("content-type")).toBe(RELEASES_FEED_CONTENT_TYPES.rss);
+    const body = await rss.text();
+    expect(body).toContain("<title>Releases for alice/demo</title>");
+    expect(body).toContain(`<guid>${rcId}: https://feed.test/alice/demo/releases/tag/v2.0.0-rc1</guid>`);
+    expect(body).not.toContain("Sneaky draft"); // the route serves the same draft-free projection
+
+    const atom = await fetchRoute("/alice/demo/releases.atom");
+    expect(atom.status).toBe(200);
+    expect(atom.headers.get("content-type")).toBe(RELEASES_FEED_CONTENT_TYPES.atom);
+    expect(await atom.text()).toContain("<entry>");
+  });
+
+  it("the releases unit disabled → the route 404-shells (reqRepoReleaseReader, web.go:1504's group gate)", async () => {
+    await seedBaseFixtures();
+    await env.DB.prepare("UPDATE repo_settings SET has_releases = 0 WHERE repo_id = ?").bind(REPO_ID).run();
+
+    for (const tail of ["releases.rss", "releases.atom"]) {
+      const res = await fetchRoute(`/alice/demo/${tail}`);
+      expect(res.status, tail).toBe(404); // upstream CanRead(TypeReleases) false — the invisible shell
+      expect(await res.text(), tail).toContain("Page Not Found");
+    }
+  });
+
+  it("the empty repo → the gate's MustBeNotEmpty arm 404s before any handler body", async () => {
+    await seedBaseFixtures(); // 'hollow' is the is_empty=1 row
+    const res = await fetchRoute("/alice/hollow/releases.rss");
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("Page Not Found");
+  });
+
+  it("the dotted literal is case-exact: releases.RSS stays unclaimed (the engine's 404, upstream's pattern miss)", async () => {
+    await seedBaseFixtures();
+    for (const tail of ["releases.RSS", "releases.Atom", "releases.rss.txt"]) {
+      const res = await fetchRoute(`/alice/demo/${tail}`);
+      expect(res.status, tail).toBe(404);
+    }
   });
 });

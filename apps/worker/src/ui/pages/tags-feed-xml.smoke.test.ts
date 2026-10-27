@@ -26,6 +26,11 @@
  *      every item reverts to the TagName title + the `/src/tag` link with
  *      no content, authors still render (convert.go sets them outside the
  *      branch).
+ *   5. (The polish wave) The MOUNTED route arms over the real router: THE
+ *      GATE DIVERGENCE — a releases-disabled repo still serves tags.rss
+ *      (the group gates reqUnitCodeReader only) while the releases twin
+ *      404s — plus the empty-repo MustBeNotEmpty arm and the case-exact
+ *      dotted literal.
  *
  * Harness posture: the module functions driven DIRECTLY (the releases
  * twin's convention — the route arm is index-owned; the module doc's
@@ -36,13 +41,15 @@
 
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { repositories, users } from "../../db/schema";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
 import type { RepoRow } from "../ui-context";
+import { uiRouter, type UiAssetsFetcher } from "../index";
+import type { UiManifest } from "../manifest";
 import {
   TAGS_FEED_CONTENT_TYPES,
   loadTagsFeedData,
@@ -59,6 +66,28 @@ const ORIGIN = "https://feed.test";
 const OWNER = "alice";
 const SLUG = "tagsfeed";
 const EMPTY_REPO_ID = "repo-empty";
+
+/** The real production router (the releases twin's route-arm pattern): the
+ *  mounted tagsFeedRoute with the synthetic manifest for the 404 shell. */
+const manifest: UiManifest = {
+  "web_src/js/iife.ts": { file: "js/iife.abcd1234.js" },
+  "web_src/js/index.ts": { file: "js/index.deadbeef.js", css: ["css/index.1111aaaa.css"] },
+  "web_src/css/themes/theme-gitea-light.css": { file: "css/theme-gitea-light.4444dddd.css" },
+  "web_src/js/user-events.sharedworker.ts": { file: "js/user-events.5555eeee.js" },
+};
+
+type RouteEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+const routeEnv: RouteEnv = {
+  ...env,
+  ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
+};
+
+async function fetchRoute(path: string): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await uiRouter.fetch(new Request(`${ORIGIN}${path}`), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
 
 const SEED_COMMITS: SeedCommit[] = [
   {
@@ -385,5 +414,45 @@ describe("tags feed xml envelopes (the /{owner}/{repo}/tags.rss + .atom byte sur
     expect(rss).not.toContain("<content:encoded>");
     expect(rss).toContain(`      <guid>${fixture.releaseRowId}: ${ORIGIN}/alice/tagsfeed/src/tag/v1.0.0</guid>`);
     expect(rss).toContain(`      <author>alice</author>`);
+  });
+});
+
+// --- the mounted route arms + THE GATE DIVERGENCE (web.go:1495-1502 over the
+// REAL router — the releases twin's 404 arms live in releases-feed-xml.smoke) --
+
+describe("the mounted /{owner}/{repo}/tags.rss|.atom route arms", () => {
+  it("THE GATE DIVERGENCE: a releases-disabled repo still SERVES tags.rss — the tags group gates reqUnitCodeReader, NOT the releases reader (web.go:1502)", async () => {
+    await env.DB.prepare("UPDATE repo_settings SET has_releases = 0 WHERE repo_id = ?")
+      .bind(fixture.repo.id)
+      .run();
+
+    for (const [tail, type] of [
+      ["tags.rss", TAGS_FEED_CONTENT_TYPES.rss],
+      ["tags.atom", TAGS_FEED_CONTENT_TYPES.atom],
+    ] as const) {
+      const res = await fetchRoute(`/alice/tagsfeed/${tail}`);
+      expect(res.status, tail).toBe(200); // NO releasesReadGate on this group — the divergence
+      expect(res.headers.get("content-type"), tail).toBe(type);
+      const body = await res.text();
+      expect(body, tail).toContain("<title>Tags for alice/tagsfeed</title>");
+      expect(body, tail).not.toContain("Sneaky draft"); // the same draft-free projection
+    }
+    // The releases twin on the SAME repo 404s (releases-feed-xml.smoke's
+    // disabled-unit arm pins the mirror side; asserted there).
+  });
+
+  it("the empty repo → MustBeNotEmpty 404-shells the route (web.go:1502's group gate)", async () => {
+    const res = await fetchRoute("/alice/hollow/tags.rss");
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("Page Not Found");
+  });
+
+  it("the dotted literal is case-exact: junk dotted tails stay unclaimed (the engine's 404, upstream's pattern miss)", async () => {
+    // NOTE: the BARE `tags` tail is the tags LIST page (m.Get("", TagsList))
+    // — a 200, deliberately not in this loop.
+    for (const tail of ["tags.ATOM", "tags.rss.txt"]) {
+      const res = await fetchRoute(`/alice/tagsfeed/${tail}`);
+      expect(res.status, tail).toBe(404);
+    }
   });
 });

@@ -413,6 +413,10 @@ export async function loadReleasesFeedData(
   d1: D1Database,
   repo: RepoRow,
   origin: string,
+  // Wall-clock seam (render-wallclock-audit): the channel Created stamp
+  // (generatedUnix → RSS pubDate / Atom updated). Default keeps every
+  // caller unchanged; tests pin it for byte-stable feeds.
+  now: Date = new Date(),
 ): Promise<ReleasesFeedEnvelopeInput | null> {
   if (repo.isEmpty) return null; // MustBeNotEmpty (web.go:1504)
 
@@ -458,7 +462,7 @@ export async function loadReleasesFeedData(
     title: RELEASES_FOR.replace("%s", `${repo.ownerNamespace}/${repo.slug}`),
     link: `${repoHref}/release`,
     description: (await loadRepoSettings(d1, repo.id)).description,
-    generatedUnix: Math.floor(Date.now() / 1000),
+    generatedUnix: Math.floor(now.getTime() / 1000),
     items,
   };
 }

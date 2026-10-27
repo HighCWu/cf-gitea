@@ -229,13 +229,19 @@ export function formatByteSize(size: number): string {
  * offset. The parts are returned for JSX rendering (the component supplies
  * the element shape, escaping and the `data-*` attribute pair).
  */
-export function timeSinceParts(unixSeconds: number, tz: string): {
+export function timeSinceParts(
+  unixSeconds: number,
+  tz: string,
+  // Wall-clock seam (render-wallclock-audit): only `tense` reads the clock —
+  // datetime/text are pure. Default keeps every caller unchanged; tests pin
+  // it for deterministic `tense="past|future"` bytes.
+  now: number = Date.now(),
+): {
   datetime: string;
   tense: "past" | "future";
   text: string;
 } {
   const then = new Date(unixSeconds * 1000);
-  const now = Date.now();
   const sign = tz.startsWith("-") ? -1 : 1;
   const hours = Number.parseInt(tz.replace(/^[-+]/, "").slice(0, 2) || "0", 10);
   const minutes = Number.parseInt(tz.replace(/^[-+]/, "").slice(2) || "0", 10);
