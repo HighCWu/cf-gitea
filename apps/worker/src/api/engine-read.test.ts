@@ -206,6 +206,11 @@ describe("POST /repos/{owner}/{repo}/branches (repoCreateBranch)", () => {
     expect(tagCollision.status).toBe(409);
     const missingOld = await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "x", old_branch_name: "ghost" }));
     expect(missingOld.status).toBe(404);
+    // old_ref_name is STRICT (upstream GetCommit(OldRefName) failing is the
+    // APIErrorInternal 500, routers/api/v1/repo/branch.go:51-54): an unknown
+    // non-hex source never silently resolves to the default branch's tip.
+    const missingRef = await send(`${REPO_PATH}/branches`, jsonInit("POST", { new_branch_name: "x", old_ref_name: "zzz-ghost" }));
+    expect(missingRef.status).toBe(500);
   });
 });
 
@@ -404,6 +409,11 @@ describe("git/trees/{sha} (GetTree)", () => {
 
   it("400s an unresolvable sha", async () => {
     expect((await get(`${REPO_PATH}/git/trees/${"b".repeat(40)}`)).status).toBe(400);
+    // The non-hex arm is upstream's InvalidArgument 400 too (GetTreeBySHA →
+    // "sha not found [sha]", services/repository/files/tree.go:31-35): the
+    // STRICT resolver keeps it reachable on a repo that HAS a default branch —
+    // the old default-branch fallback answered its tree with 200 here.
+    expect((await get(`${REPO_PATH}/git/trees/zzz-ghost`)).status).toBe(400);
   });
 });
 
@@ -473,6 +483,10 @@ describe("contents reads (repoGetContentsList / repoGetContents) — the union s
     expect(tagged.status).toBe(200);
     // the tag pins commit 2, but README's last TOUCHING commit is still the first
     expect((await jsonBody(tagged)).last_commit_sha).toBe(TIP1);
+    // An unknown non-hex ref is the upstream 404 (resolveRefCommit →
+    // APIErrorAuto on git.ErrNotExist) — not the default branch's copy of the
+    // file (the strict resolver; upstream file.go:695-700).
+    expect((await get(`${REPO_PATH}/contents/README.md?ref=zzz-ghost`)).status).toBe(404);
   });
 });
 

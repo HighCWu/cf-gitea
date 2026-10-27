@@ -211,8 +211,11 @@ export function registerGitRoutes(
       }
       const reads = engineReads(c.env, pair.repo);
       // GetTreeBySHA resolves refs AND commits; listTree peels the ref target
-      // to its commit and renders the REAL tree id in the response.
-      const resolved = resolveNamedRef(refTipMap(await reads.listRefs()), sha, pair.repo.defaultBranch);
+      // to its commit and renders the REAL tree id in the response. STRICT
+      // resolution (no default-branch fallback): upstream GetTreeBySHA maps
+      // an unresolvable sha to the InvalidArgument 400 "sha not found"
+      // (files/tree.go:31-35), never the default branch's tree.
+      const resolved = resolveNamedRef(refTipMap(await reads.listRefs()), sha);
       const commit = resolved === null ? await reads.readCommit(sha) : await reads.readCommit(resolved.target);
       if (commit === null) {
         throw new ApiError(400, `sha not found [${sha}]`);
@@ -282,7 +285,9 @@ export function registerGitRoutes(
       if (refs === null || refs.head === null) {
         throw new ApiError(404, "not found");
       }
-      const headRef = resolveNamedRef(refTipMap(refs), refs.head, pair.repo.defaultBranch);
+      // The repo's own HEAD ref (never user input) — strict resolution; an
+      // unborn/broken HEAD is the honest 404, not a default-branch guess.
+      const headRef = resolveNamedRef(refTipMap(refs), refs.head);
       if (headRef === null) {
         throw new ApiError(404, "not found");
       }

@@ -405,10 +405,13 @@ export function registerBranchRoutes(
       const tips = refTipMap(await reads.listRefs());
 
       // Source resolution: old_ref_name (any ref/oid) > old_branch_name >
-      // default branch (CreateBranch handler order).
+      // default branch (CreateBranch handler order). STRICT old_ref_name
+      // resolution: upstream GetCommit(OldRefName) failing is the
+      // APIErrorInternal 500 (routers/api/v1/repo/branch.go:51-54) — never a
+      // silent default-branch source.
       let source: { target: string };
       if (form.old_ref_name !== undefined && form.old_ref_name !== "") {
-        const resolved = resolveNamedRef(tips, form.old_ref_name, pair.repo.defaultBranch);
+        const resolved = resolveNamedRef(tips, form.old_ref_name);
         if (resolved === null) throw new ApiError(500, `GetCommit: ${form.old_ref_name} does not exist`);
         source = resolved;
       } else {

@@ -97,13 +97,16 @@ const bindValidationHook = ({ success }: { success: boolean }): undefined => {
 
 type RepoPair = Awaited<ReturnType<typeof requireVisibleRepo>>;
 
-/** Resolve the effective ref target (`ref` param or the default branch). */
+/** Resolve the effective ref target (`ref` param or the default branch).
+ *  Upstream file.go resolveRefCommit: the default branch applies ONLY to the
+ *  absent param (util.IfZero); a non-empty ref that fails ResolveRefCommit's
+ *  branch→tag→oid check is the APIErrorAuto 404. */
 async function refTargetOf(c: Context<ApiEnv>, pair: RepoPair, refParam: string | null): Promise<string> {
   const tips = refTipMap(await engineReads(c.env, pair.repo).listRefs());
   const target =
     refParam === null || refParam === ""
       ? tips.get(branchRef(pair.repo.defaultBranch))?.target
-      : resolveNamedRef(tips, refParam, pair.repo.defaultBranch)?.target;
+      : resolveNamedRef(tips, refParam)?.target;
   if (target === undefined) {
     throw new ApiError(404, "The target couldn't be found.");
   }

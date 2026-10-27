@@ -142,16 +142,24 @@ export function refTipMap(refs: RefsResult | null): Map<string, RefTip> {
 }
 
 /**
- * Resolve the `ref` query param (or the default branch) to a full ref name:
- * an exact branch, then an exact tag, then a full ref as given, then a
- * 40-char oid (immutable — passable to readCommit directly). Null when the
- * ref does not resolve.
+ * Resolve the `ref` query param to a full ref name: an exact branch, then an
+ * exact tag, then a full ref as given, then a 40-char oid (immutable —
+ * passable to readCommit directly). STRICTLY null when the ref does not
+ * resolve — there is NO default-branch fallback.
+ *
+ * Upstream posture (routers/api/v1/utils/git.go ResolveRefCommit + modules/git
+ * GetCommit/GetTree): a non-empty ref either resolves (branch → tag → oid) or
+ * the caller answers its family's not-found code — 404 (getCommit,
+ * GetAllCommits, contents via APIErrorAuto on git.ErrNotExist), 400
+ * (GetTreeBySHA's InvalidArgument "sha not found"), 500 (CreateBranch's
+ * APIErrorInternal), or the web forms' refusal. The default branch applies
+ * ONLY when the param is ABSENT (upstream util.IfZero before ResolveRefCommit)
+ * — every consumer here implements that absent arm explicitly at its call
+ * site, so none passes a default into this resolver. The former fallback made
+ * /commits?sha=bogus answer the default tip with 200 and left every
+ * not-found arm dead for non-hex input (engine review c2).
  */
-export function resolveNamedRef(
-  tips: Map<string, RefTip>,
-  ref: string,
-  defaultBranch: string,
-): { ref: string; target: string; peeled?: string } | null {
+export function resolveNamedRef(tips: Map<string, RefTip>, ref: string): { ref: string; target: string; peeled?: string } | null {
   for (const candidate of [branchRef(ref), tagRef(ref), ref]) {
     const tip = tips.get(candidate);
     if (tip !== undefined) {
@@ -161,8 +169,7 @@ export function resolveNamedRef(
   if (/^[0-9a-f]{40}$/.test(ref)) {
     return { ref, target: ref };
   }
-  const fallback = tips.get(branchRef(defaultBranch));
-  return fallback === undefined ? null : { ref: branchRef(defaultBranch), target: fallback.target };
+  return null;
 }
 
 // ---------------------------------------------------------------------------

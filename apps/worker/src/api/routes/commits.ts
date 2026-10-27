@@ -90,7 +90,10 @@ function setCommitListHeaders(c: Context<ApiEnv>, opts: { page: number; limit: n
 async function resolveCommit(c: Context<ApiEnv>, owner: string, repo: string, sha: string) {
   const pair = await requireVisibleRepo(c, { owner, repo });
   const reads = engineReads(c.env, pair.repo);
-  const resolved = resolveNamedRef(refTipMap(await reads.listRefs()), sha, pair.repo.defaultBranch);
+  // STRICT ref resolution (no default-branch fallback): upstream getCommit
+  // 404s an unresolvable identifier (commits.go:78-84), and the fallback
+  // below would fabricate the default tip for /commits?sha=bogus.
+  const resolved = resolveNamedRef(refTipMap(await reads.listRefs()), sha);
   const commit = resolved === null ? await reads.readCommit(sha) : await reads.readCommit(resolved.target);
   return { pair, reads, commit };
 }
@@ -197,7 +200,11 @@ export function registerCommitRoutes(
 
       const reads = engineReads(c.env, pair.repo);
       const shaParam = url.searchParams.get("sha") ?? "";
-      const startRef = resolveNamedRef(refTipMap(await reads.listRefs()), shaParam, pair.repo.defaultBranch);
+      // Upstream GetAllCommits: a non-empty sha that GetCommit cannot resolve
+      // is the APIErrorAuto 404 (commits.go:211-216) — never the default
+      // branch's tip. The absent-sha arm (start = undefined) is the only
+      // default-branch walk.
+      const startRef = resolveNamedRef(refTipMap(await reads.listRefs()), shaParam);
       if (startRef === null && shaParam !== "") {
         throw new ApiError(404, "not found");
       }

@@ -4503,7 +4503,12 @@ async function branchCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
   const reads = engineReads(c.env, pair.repo);
   const tips = refTipMap(await reads.listRefs());
-  const source = resolveNamedRef(tips, from, repo.defaultBranch);
+  // STRICT source resolution (no default-branch fallback): upstream's
+  // RepoRefByType(RefTypeBranch) 404s an unknown {from} branch in the
+  // middleware (services/context/repo.go) and CreateNewBranch's
+  // GetBranchExisting errors to ServerError — an unknown source is a
+  // refusal, not a create at the default tip.
+  const source = resolveNamedRef(tips, from);
   if (source === null) {
     return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/branches?create_error=missing&name=${encodeURIComponent(newName)}` } }));
   }

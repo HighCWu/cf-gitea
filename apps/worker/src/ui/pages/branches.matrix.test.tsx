@@ -69,8 +69,9 @@
  *     side, unarchived — the arms mutate refs, so the read-pinned repos
  *     above stand alone): the quick-create POST's success round-trip
  *     (`?created=` + the ref AT THE SOURCE TIP + the list row), the
- *     unknown-source DEFAULT-BRANCH FALLBACK (resolveNamedRef's documented
- *     "or the default branch" posture — ghost is not a refusal), the
+ *     unknown-source REFUSAL (the strict resolveNamedRef — upstream's
+ *     RepoRefByType 404s the unknown {from} branch in the middleware, so
+ *     ghost redirects with create_error=missing and no ref lands), the
  *     empty/colliding refusals and the archived + anonymous 404 shells, and
  *     the rename POST's round-trip (the ref swap verified through listRefs
  *     + `?renamed=`) with its refusal set (the plain owner's default-branch
@@ -616,7 +617,7 @@ describe("w100 quick-create write (POST /branches/_new/branch/{from})", () => {
     expect(await list.text()).toContain(`href="/${OWNER}/w100wr/src/branch/w100-made"`);
   });
 
-  it("refuses the empty name, falls back to the default for an unknown source, refuses the colliding name (flash redirects)", async () => {
+  it("refuses the empty name, the unknown source, and the colliding name (flash redirects)", async () => {
     const cookie = await cookieFor(OWNER);
     const empty = await fetchUi(
       `/${OWNER}/w100wr/branches/_new/branch/main`,
@@ -624,29 +625,27 @@ describe("w100 quick-create write (POST /branches/_new/branch/{from})", () => {
     );
     expect(empty.status).toBe(303);
     expect(empty.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?create_error=empty&name=`);
-    // An UNKNOWN source is not a refusal: resolveNamedRef's documented
-    // posture falls back to the DEFAULT branch (engine.ts's "or the default
-    // branch" — the API's ?ref= default), so ghost→w100-fb lands at main.
-    const tips = (await buildHistoryPack(W100_COMMITS)).tips;
+    // An UNKNOWN source IS a refusal: upstream's RepoRefByType(RefTypeBranch)
+    // 404s the unknown {from} branch in the middleware
+    // (services/context/repo.go) and CreateNewBranch's GetBranchExisting
+    // errors to ServerError (routers/web/repo/branch.go:219) — no
+    // default-branch fallback. The STRICT resolveNamedRef returns null and
+    // the handler redirects with create_error=missing; no ref lands.
     const fallback = await fetchUi(
       `/${OWNER}/w100wr/branches/_new/branch/ghost`,
       formPost(`/${OWNER}/w100wr/branches/_new/branch/ghost`, { new_branch_name: "w100-fb" }, cookie),
     );
     expect(fallback.status).toBe(303);
-    expect(fallback.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?created=w100-fb`);
-    const fbRef = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.find(
-      (ref) => ref.name === "refs/heads/w100-fb",
-    );
-    expect(fbRef?.target).toBe(tips[MAIN_TIP]);
+    expect(fallback.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?create_error=missing&name=w100-fb`);
     const exists = await fetchUi(
       `/${OWNER}/w100wr/branches/_new/branch/main`,
       formPost(`/${OWNER}/w100wr/branches/_new/branch/main`, { new_branch_name: "side" }, cookie),
     );
     expect(exists.status).toBe(303);
     expect(exists.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?create_error=exists&name=side`);
-    // Nothing extra landed: exactly the seeded pair + the two created arms.
+    // Nothing extra landed: exactly the seeded pair + the created arm.
     const names = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name).sort();
-    expect(names).toEqual(["refs/heads/main", "refs/heads/side", "refs/heads/w100-fb", "refs/heads/w100-made"]);
+    expect(names).toEqual(["refs/heads/main", "refs/heads/side", "refs/heads/w100-made"]);
   });
 
   it("404-shells the archived repo's create and the anonymous writer (the write seam's gates)", async () => {
@@ -719,10 +718,11 @@ describe("w100 rename write (POST /branches/rename)", () => {
     const self = await post("side-two", "side-two");
     expect(self.headers.get("location")).toBe(`/${OWNER}/w100wr/branches?rename_error=exists&name=side-two`);
     // Every response stays a redirect onto the list (never a shell) and the
-    // ref set is unchanged by the whole quartet.
+    // ref set is unchanged by the whole quartet (the ghost create arm above
+    // lands NOTHING since the strict-resolver refusal — no w100-fb here).
     for (const res of [empty, missing, collides, self]) expect(res.status).toBe(303);
     const names = (await env.REPO.getByName(`${OWNER}/w100wr`).listRefs()).refs.map((ref) => ref.name).sort();
-    expect(names).toEqual(["refs/heads/main", "refs/heads/side-two", "refs/heads/w100-fb", "refs/heads/w100-made"]);
+    expect(names).toEqual(["refs/heads/main", "refs/heads/side-two", "refs/heads/w100-made"]);
   });
 });
 

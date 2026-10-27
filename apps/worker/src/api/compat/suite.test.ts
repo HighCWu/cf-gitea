@@ -1346,6 +1346,17 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       status: 409,
       request: (ctx) => ({ path: `${repoPath(ctx)}/commits` }),
     },
+    {
+      // Upstream GetAllCommits: a non-empty sha GetCommit cannot resolve is
+      // the APIErrorAuto 404 (commits.go:211-216) — the strict resolver keeps
+      // this arm reachable for NON-HEX input (the old default-branch fallback
+      // answered the default tip with 200 here).
+      name: "unknown non-hex sha → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/commits?sha=zzz-missing`,
+      }),
+    },
   ],
   repoGetSingleCommit: [
     {
@@ -1360,6 +1371,15 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       status: 404,
       request: (ctx) => ({
         path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/commits/${"f".repeat(40)}`,
+      }),
+    },
+    {
+      // Upstream getCommit: an unresolvable identifier is the APIErrorNotFound
+      // 404 "commit doesn't exist" (commits.go:78-84) — never the default tip.
+      name: "unknown non-hex ref → runtime-body 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/commits/zzz-missing`,
       }),
     },
   ],
@@ -2261,13 +2281,23 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
     // — path `/repos/{owner}/{repo}/git/trees/<seeds.gitCommit>` — when the
     // module owner lands that fix.
     {
-      // resolveNamedRef falls back to the default-branch tip, so the
-      // "sha not found" 400 is only reachable on a tip-less repo — the
-      // shared fixture repo (no refs at all), not compat-git.
+      // Upstream GetTreeBySHA maps an unresolvable sha to the InvalidArgument
+      // 400 "sha not found [sha]" (files/tree.go:31-35). The STRICT resolver
+      // makes this reachable on ANY repo — compat-git included (the old
+      // default-branch fallback only let a tip-less repo reach the 400).
       name: "unknown sha → declared 400",
       status: 400,
       request: (ctx) => ({
         path: `${repoPath(ctx)}/git/trees/zzz-missing`,
+      }),
+    },
+    {
+      // The non-hex arm over a repo WITH a default branch: the fallback used
+      // to answer the default tree with 200 here.
+      name: "unknown non-hex sha on a referenced repo → declared 400",
+      status: 400,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/git/trees/zzz-missing`,
       }),
     },
   ],
@@ -2529,6 +2559,16 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       status: 404,
       request: (ctx) => ({
         path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents/ghost.txt`,
+      }),
+    },
+    {
+      // Upstream resolveRefCommit (file.go:695-700 → utils/git.go:60-62): a
+      // non-empty ref failing the branch→tag→oid check is the APIErrorAuto
+      // 404 — the default branch only applies to the ABSENT ref param.
+      name: "unknown non-hex ref → declared 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/contents/compat.txt?ref=zzz-missing`,
       }),
     },
   ],

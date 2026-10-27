@@ -719,13 +719,15 @@ async function updatePullRequestBranch(
 // contents-ext / file-contents read helpers (routers/api/v1/repo/file.go)
 // ---------------------------------------------------------------------------
 
-/** Resolve the `ref` param (default branch fallback); null → the 404 arm. */
+/** Resolve the `ref` param (default branch fallback); null → the 404 arm.
+ *  The default applies ONLY to the absent param (upstream file.go
+ *  resolveRefCommit's util.IfZero); a non-empty unknown ref stays null. */
 async function refTargetOrNull(c: Context<ApiEnv>, pair: RepoPair, refParam: string | null): Promise<string | null> {
   const tips = refTipMap(await engineReads(c.env, pair.repo).listRefs());
   if (refParam === null || refParam === "") {
     return tips.get(branchRef(pair.repo.defaultBranch))?.target ?? null;
   }
-  return resolveNamedRef(tips, refParam, pair.repo.defaultBranch)?.target ?? null;
+  return resolveNamedRef(tips, refParam)?.target ?? null;
 }
 
 /** Directory-entry render (the contents.ts list projection). */

@@ -819,6 +819,11 @@ describe("GET .../contents-ext/{filepath} (repo-extras-t2)", () => {
     expect(old.status).toBe(200);
     const oldBody: { file_contents?: { content: string | null } } = await old.json();
     expect(atob(oldBody.file_contents?.content ?? "")).toBe("lib v1\n");
+
+    // An unknown non-hex ref is the upstream 404 (resolveRefCommit →
+    // APIErrorAuto on git.ErrNotExist, file.go:695-700) — the default branch
+    // only applies to the ABSENT ref param, never as a fallback.
+    expect((await send(`${REPO_PATH}/contents-ext/README.md?ref=zzz-ghost`)).status).toBe(404);
   });
 });
 
