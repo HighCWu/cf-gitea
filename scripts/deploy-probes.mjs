@@ -259,8 +259,17 @@ const scrub = (text) => {
 };
 
 /** Every fetch is timeout-guarded (AbortSignal); redirects are surfaced, not followed. */
+// Probes test the APPLICATION, not the CDN: send no-cache so a stale edge
+// entry for the URL (possible from before the RD20 Cache-Control fix —
+// response `private` prevents NEW entries but old heuristic ones persist
+// until they age out) can't mask the app's true state.
 const fetchT = (url, init = {}) =>
-  fetch(url, { redirect: "manual", ...init, signal: AbortSignal.timeout(opts.timeoutMs) });
+  fetch(url, {
+    ...init,
+    redirect: "manual",
+    headers: { "cache-control": "no-cache", ...(init.headers ?? {}) },
+    signal: AbortSignal.timeout(opts.timeoutMs),
+  });
 
 /** Authenticated JSON call against the /api/v1 surface (`Authorization: token <PAT>`). */
 const api = async (apiPath, { method = "GET", body, auth = true, cookie } = {}) => {
@@ -1483,7 +1492,10 @@ const window2Steps = (ctx) => [
       let nameAt = -1;
       for (let attempt = 0; attempt < 20 && nameAt === -1; attempt++) {
         if (attempt > 0) await new Promise((r) => setTimeout(r, 1000));
-        res = await fetchT(`${opts.baseUrl}/user/settings/actions/secrets`, { headers: { cookie: ctx.cookie } });
+        // Cache-buster query: a fresh cache key per poll — request no-cache
+        // is Enterprise-only on Cloudflare's edge, so a stale heuristic
+        // entry for the bare URL can still be served on this plan.
+        res = await fetchT(`${opts.baseUrl}/user/settings/actions/secrets?_cb=${Date.now()}_${attempt}`, { headers: { cookie: ctx.cookie } });
         body = await res.text();
         nameAt = body.indexOf(ctx.secretName);
       }
