@@ -112,10 +112,21 @@ interface StoredObject {
 // Trees + commits
 // ---------------------------------------------------------------------------
 
-/** One file at a path: text or bytes. */
+/** One file at a path: text or bytes. `mode` is the tree entry's mode —
+ *  regular 100644 (the default every historical fixture keeps, byte-identical
+ *  to before the field existed) or executable 100755 (the mode-change arms:
+ *  a 100644→100755 flip renders the diff family's mode-change degraded body).
+ *  The plumbing stops here BY DESIGN: this builder serializes the tree entry
+ *  bytes itself (`${mode} ${name}\0` in writeTree), the engine's receive path
+ *  stores trees verbatim (parseTree is mode-agnostic — git/objects.ts), and
+ *  the engine's public read seam already resolves the pushed mode into
+ *  DiffFileJson's old/new pair (repo.ts flattenTree → computeDiff), so no
+ *  engine-side change was needed. */
 export interface SeedFile {
   path: string;
   content: string | Uint8Array;
+  /** Tree-entry mode: 0o100644 (default) or 0o100755. */
+  mode?: 0o100644 | 0o100755;
 }
 
 /** One git identity (the default author/committer is the shared
@@ -214,7 +225,7 @@ export async function buildHistoryPack(
       const content = typeof file.content === "string" ? ENCODER.encode(file.content) : file.content;
       const blob = await storeObject(OBJ_BLOB, content);
       store(blob);
-      insertPath(root, file.path, "100644", blob.oid);
+      insertPath(root, file.path, file.mode === 0o100755 ? "100755" : "100644", blob.oid);
     }
     const tree = await writeTree(root, objects);
     store(tree);

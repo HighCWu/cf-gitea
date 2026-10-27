@@ -216,6 +216,42 @@ const EDITARM_COMMITS: SeedCommit[] = [
   },
 ];
 
+/** The wave-129 mode arm (agent wave-seed-mode) — tips[6]+tips[7] atop the
+ *  EDITARM history (tips[0..5] stay byte-identical, so every existing oid
+ *  holds): tips[6] flips f1.txt's tree mode 100644→100755 with the CONTENT
+ *  byte-identical to tips[5]'s (the blob oid is unchanged — the mode-only
+ *  diff whose box renders the degraded body with NO hunk section), tips[7]
+ *  edits f2.txt's content AND flips its mode (the mode+content pair the
+ *  landed body precedence renders as the same degraded body). SeedFile.mode
+ *  (seed-repo.ts) carries the tree-entry mode into the builder's
+ *  `100755 name\0` entry bytes; the engine's receive path stores trees
+ *  verbatim (parseTree is mode-agnostic) and readDiff's flattened-tree pair
+ *  resolves both sides' modes into DiffFileJson old/new — no engine-side
+ *  plumbing needed. */
+const MODEARM_COMMITS: SeedCommit[] = [
+  ...EDITARM_COMMITS,
+  {
+    message: "w111: chmod f1 executable",
+    time: T0 + 480,
+    files: [
+      { path: "f0.txt", content: "w111 root\n" },
+      { path: "f1.txt", content: "edit-1\none-2\none-3\none-4\none-5\none-6\none-7\none-8\nedit-9\n", mode: 0o100755 },
+      { path: "f2.txt", content: "w111 two\n" },
+      { path: "f3.txt", content: "w111 three\n" },
+    ],
+  },
+  {
+    message: "w111: edit and chmod f2",
+    time: T0 + 540,
+    files: [
+      { path: "f0.txt", content: "w111 root\n" },
+      { path: "f1.txt", content: "edit-1\none-2\none-3\none-4\none-5\none-6\none-7\none-8\nedit-9\n", mode: 0o100755 },
+      { path: "f2.txt", content: "w111 two v2\n", mode: 0o100755 },
+      { path: "f3.txt", content: "w111 three\n" },
+    ],
+  },
+];
+
 interface World {
   /** tips[0], tips[MAIN_TIP], tips[MID], tips[TOPIC_TIP] (BINARM's tips[4],
    *  EDITARM's tips[5] — distinct commits over the shared prefix). */
@@ -228,8 +264,12 @@ interface World {
   editTip: string;
   /** The per-repo index allocation (one shared issue/PR sequence), captured
    *  at creation — never hardcoded. */
-  pull: { topic: number; merged: number; closed: number; lonely: number; plainIssue: number; binarm: number; editarm: number };
+  pull: { topic: number; merged: number; closed: number; lonely: number; plainIssue: number; binarm: number; editarm: number; modearm: number };
   priv: number;
+  /** The mode arm's two tips: modeOnlyTip = tips[6] (the content-identical
+   *  644→755 flip), modeEditTip = tips[7] (the mode+content pair). */
+  modeOnlyTip: string;
+  modeEditTip: string;
 }
 
 let world: World | null = null;
@@ -307,7 +347,7 @@ async function seedPulls(ownerId: number): Promise<{ pull: World["pull"]; priv: 
 
   const pullId = await repoIdOf("w111pull");
   const fresh = (await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, pullId)).limit(1).get()) === undefined;
-  const pull: World["pull"] = { topic: 0, merged: 0, closed: 0, lonely: 0, plainIssue: 0, binarm: 0, editarm: 0 };
+  const pull: World["pull"] = { topic: 0, merged: 0, closed: 0, lonely: 0, plainIssue: 0, binarm: 0, editarm: 0, modearm: 0 };
   if (fresh) {
     const topic = await svc.createPullRequest({
       repoId: pullId,
@@ -402,6 +442,25 @@ async function seedPulls(ownerId: number): Promise<{ pull: World["pull"]; priv: 
       .update(pullRequests)
       .set({ status: PRStatus.Mergeable })
       .where(eq(pullRequests.id, editarm.pullRequest.id));
+
+    // The wave-129 mode pull: head at the MODEARM tip (refs/heads/modearm —
+    // pushed below), base main; its head commit's parent diff is the single
+    // mode+content f2.txt box.
+    const modearm = await svc.createPullRequest({
+      repoId: pullId,
+      title: "w111: the mode pull",
+      content: "Flips f1's mode and edits+flips f2's.",
+      posterId: ownerId,
+      headRepoId: pullId,
+      baseBranch: "main",
+      headBranch: "modearm",
+      now,
+    });
+    pull.modearm = modearm.issue.index;
+    await db
+      .update(pullRequests)
+      .set({ status: PRStatus.Mergeable })
+      .where(eq(pullRequests.id, modearm.pullRequest.id));
   } else {
     // Re-run against a seeded world: re-read the allocated indexes by title.
     const rows = await db.select({ index: issues.index, title: issues.title }).from(issues).where(eq(issues.repoId, pullId)).all();
@@ -418,6 +477,7 @@ async function seedPulls(ownerId: number): Promise<{ pull: World["pull"]; priv: 
     pull.plainIssue = idx("w111: the plain issue");
     pull.binarm = idx("w111: the rename+binary pull");
     pull.editarm = idx("w111: the edit pull");
+    pull.modearm = idx("w111: the mode pull");
   }
 
   const privId = await repoIdOf("w111priv");
@@ -548,6 +608,22 @@ async function ensureFixtures(): Promise<void> {
     );
   }
 
+  // The wave-129 mode world: the MODEARM pack's tips[0..5] are byte-identical
+  // to the editarm pack's (the shared history), tips[6]/tips[7] are the
+  // mode-only and mode+content commits — the modearm PR's branch and head ref.
+  const modearmPack = await buildHistoryPack(MODEARM_COMMITS);
+  if (!pullRefs.refs.some((ref) => ref.name === "refs/heads/modearm")) {
+    await pushRefs(
+      `${OWNER}/w111pull`,
+      [
+        { ref: "refs/heads/modearm", oid: modearmPack.tips[7] as string },
+        { ref: `refs/pull/${seeded.pull.modearm}/head`, oid: modearmPack.tips[7] as string },
+      ],
+      modearmPack.pack,
+      token,
+    );
+  }
+
   world = {
     root: tips[0] as string,
     mainTip: tips[MAIN_TIP] as string,
@@ -556,6 +632,8 @@ async function ensureFixtures(): Promise<void> {
     lonelyTip: lonely.tips[0] as string,
     binTip: binarm.tips[4] as string,
     editTip: editarmPack.tips[5] as string,
+    modeOnlyTip: modearmPack.tips[6] as string,
+    modeEditTip: modearmPack.tips[7] as string,
     pull: seeded.pull,
     priv: seeded.priv,
   };
@@ -1017,5 +1095,84 @@ describe("w129-13 hunk grammar (the modified file's @@ headers and the unified n
     }
     expect(html).not.toContain('<code class="code-inner">one-5</code>');
     expect(html).not.toContain('<code class="code-inner">w111 one</code>');
+  });
+});
+
+// --- w129 mode-change arms (agent wave-seed-mode): the mode-change degraded ---
+// body. SeedFile.mode (seed-repo.ts) makes the 100644→100755 pair route-
+// pinnable — the arm matrix-13 flagged unpinnable. The diff modules' mode
+// shape: git/diff.ts itself is mode-blind (pure Myers line ops); the mode
+// semantics live in the engine's computeDiff (repo.ts — a file whose
+// old.mode !== new.mode stays in the DiffResult even when the blob oid is
+// identical, so a mode-only flip yields a hunk-less FileDiff) and in
+// pull-files.tsx's diffFileViews (the `mode` body branch + the
+// TranslateDiffEntryMode label). Upstream's box.tmpl orders the body
+// branches Sections-first (a mode+content change renders the hunks table;
+// the mode body only for the hunk-less pair); the LANDED diffFileViews
+// checks `mode` BEFORE the table branch, so BOTH pairs render the degraded
+// body and the content-changed pair's hunks are dropped — the landed
+// divergence pinned as landed below. The literal upstream raw-diff shape
+// (`old mode 100644` / `new mode 100755`) belongs to the engine's PRIVATE
+// renderRawDiff (repo.ts), never a worker surface — what IS pinnable here is
+// the box vocabulary's degraded body + the entry-mode label.
+
+const MODE_LABEL = '<span class="ui label">Regular → Executable</span>';
+
+describe("w129 mode-change arms (the degraded body over the mode-only and mode+content pairs)", () => {
+  const modeSingle = (sha: string): string => `/${OWNER}/w111pull/pulls/${w().pull.modearm}/commits/${sha}`;
+
+  it("renders the content-identical 644→755 flip as the degraded body with NO hunk section (blob oid unchanged)", async () => {
+    // Provenance: wave-polish-matrix-13's unpinnable arm. tips[6]'s parent
+    // diff (tips[5]→tips[6]) touches ONLY f1.txt — same blob oid, tree mode
+    // 100644→100755. computeDiff keeps the file (its skip needs BOTH oid and
+    // mode equal), diffLines over the identical text yields zero hunks, and
+    // the box renders "File mode changed." + the Regular → Executable label.
+    const res = await get(modeSingle(w().modeOnlyTip));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`#${w().pull.modearm} - w111: the mode pull`);
+    expect(html).toContain('data-new-filename="f1.txt"');
+    expect(html).toContain("File mode changed.");
+    expect(html).toContain(MODE_LABEL);
+    // No hunk section anywhere: the single box IS the mode-only pair — no
+    // @@ header, no unified rows, no ± marks.
+    expect(html).not.toContain('data-line-type=');
+    expect(html).not.toContain("@@ -");
+    expect(html).not.toContain("add-code");
+    expect(html).not.toContain("del-code");
+    // The zero-delta shape: the toolbar counts the file with no line churn,
+    // and the per-box DiffStats is null (0/0 hides the stats bar entirely).
+    expect(html).toContain("1 changed files");
+    expect(html).toContain("0 additions");
+    expect(html).not.toContain("diff-stats-bar");
+  });
+
+  it("renders the mode+content pair as the SAME degraded body — the landed body precedence drops the hunks (documented divergence)", async () => {
+    // tips[7]'s parent diff: f2.txt's content changed AND its mode flipped.
+    // The engine's FileDiff carries real hunks, but diffFileViews' body
+    // branch checks the mode flip BEFORE the table branch — the box renders
+    // the degraded body and the changed line never appears. Upstream's
+    // box.tmpl orders Sections first and would render the hunks table for
+    // this pair; the landed order is the divergence, pinned as landed.
+    const res = await get(modeSingle(w().modeEditTip));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-new-filename="f2.txt"');
+    expect(html).toContain("File mode changed.");
+    expect(html).toContain(MODE_LABEL);
+    expect(html).not.toContain("w111 two v2"); // the changed line, dropped with the table
+    expect(html).not.toContain("@@ -");
+  });
+
+  it("renders the same degraded body on the range page over the two mode tips", async () => {
+    // The range tips[6]..tips[7] (both in the PR's (main, head] list) is the
+    // same single mode+content f2.txt pair — one box, the degraded body.
+    const res = await get(`/${OWNER}/w111pull/pulls/${w().pull.modearm}/files/${w().modeOnlyTip}..${w().modeEditTip}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("1 changed files");
+    expect(html).toContain('data-new-filename="f2.txt"');
+    expect(html).toContain("File mode changed.");
+    expect(html).toContain(MODE_LABEL);
   });
 });
