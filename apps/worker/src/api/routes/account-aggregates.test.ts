@@ -540,6 +540,19 @@ async function keyIdentity(material: RsaKeyMaterial): Promise<{ keyId: string; c
   return { keyId: hex.slice(-16).toUpperCase(), content: btoa(binary) };
 }
 
+/** The minute-boundary race guard: the route's token is a SINGLE-minute
+ *  window over its own Date.now() (verificationToken at :682 — one token,
+ *  exact compare). The test's token must be computed in the SAME wall-clock
+ *  minute as the route's verify, so a token computed at :59.x dies when the
+ *  RSA sign + fetch crosses the boundary (observed: 2-of-4 full runs, and
+ *  once solo). Sleep past the boundary when <5s remain — the whole
+ *  keygen-signed-fetch chain then has >=55s of slack. Deterministic, no
+ *  product change (the route is upstream-faithful, gpg_key_verify.go:74-86). */
+async function avoidMinuteBoundary(): Promise<void> {
+  const intoMinute = Date.now() % 60_000;
+  if (intoMinute > 55_000) await new Promise((r) => setTimeout(r, 60_000 - intoMinute + 100));
+}
+
 /** asymkey_model.VerificationToken (gpg_key_verify.go:74-86) — the same
  *  formula the route computes, replicated for the signature builder. */
 function verificationToken(user: { id: number; username: string; email: string | null; createdAt: Date }, minutes: number): Promise<string> {
@@ -649,6 +662,7 @@ describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
     }
     await seedGpgKey(owner.id, material);
     const row = (await drizzle(env.DB).select().from(gpgKeys).where(eq(gpgKeys.keyId, keyId)).all())[0]!;
+    await avoidMinuteBoundary();
     const candidate = await tokenFor(owner);
 
     const res = await router()(
@@ -673,6 +687,7 @@ describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
     const sub = await generateRsa();
     await seedGpgKey(owner.id, primary);
     const subKeyId = await seedGpgKey(owner.id, sub, { primaryKeyId: keyId });
+    await avoidMinuteBoundary();
     const candidate = await tokenFor(owner);
 
     const res = await router()(
@@ -711,6 +726,7 @@ describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
     const impostor = await generateRsa();
     const keyId = await seedGpgKey(owner.id, material);
     const unsigned = await seedGpgKey(owner.id, impostor, { canSign: false });
+    await avoidMinuteBoundary();
     const candidate = await tokenFor(owner);
     const send = router();
     const wrongKey = await send(
@@ -752,6 +768,7 @@ describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
     const material = await generateRsa();
     await seedGpgKey(recluse.id, material);
     const send = router();
+    await avoidMinuteBoundary();
     const candidate = await tokenFor(owner);
     const signature = await armoredSignature(material, candidate);
     expect((await send("/user/gpg_key_verify", jsonAuth(token(owner), { key_id: "DEADBEEFDEADBEEF", armored_signature: signature }))).status).toBe(404);
