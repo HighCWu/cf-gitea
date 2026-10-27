@@ -1,0 +1,2 @@
+ALTER TABLE `user_settings` ADD `email_notifications_preference` text DEFAULT 'enabled' NOT NULL;--> statement-breakpoint
+ALTER TABLE `user_settings` ADD `actions_email_notifications_preference` text DEFAULT 'failure-only' NOT NULL;

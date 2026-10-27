@@ -472,6 +472,11 @@ describe("user_settings parity (superseded USER_SETTINGS_DDL_STATEMENTS)", () =>
       ["diff_view_style", "TEXT", 1, 0],
       ["hide_email", "INTEGER", 1, 0],
       ["hide_activity", "INTEGER", 1, 0],
+      // The notifications tab's two preference columns (migration 0034 —
+      // specs/user-notification-settings.md; the wave-settings-notifications
+      // additive extension of this parity list).
+      ["email_notifications_preference", "TEXT", 1, 0],
+      ["actions_email_notifications_preference", "TEXT", 1, 0],
     ]);
     const byName = new Map(columns.map((c) => [c.name, c]));
     expect(byName.get("theme")?.dflt_value).toBe("'gitea-auto'");
@@ -482,6 +487,11 @@ describe("user_settings parity (superseded USER_SETTINGS_DDL_STATEMENTS)", () =>
     // the insert-omitting-columns test below).
     expect(byName.get("hide_email")?.dflt_value).toBe("false");
     expect(byName.get("hide_activity")?.dflt_value).toBe("false");
+    // The two creation defaults are upstream's own: DEFAULT_EMAIL_NOTIFICATIONS
+    // 'enabled' (admin.go:32) and the actions KV default 'failure-only'
+    // (setting_options.go:23) — proven by the notifications tab's tests.
+    expect(byName.get("email_notifications_preference")?.dflt_value).toBe("'enabled'");
+    expect(byName.get("actions_email_notifications_preference")?.dflt_value).toBe("'failure-only'");
   });
 
   it("defaults inserts like the raw DDL, upserts on the user PK, cascades on the user", async () => {

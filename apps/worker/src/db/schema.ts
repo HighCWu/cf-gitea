@@ -1229,6 +1229,29 @@ export const userSettings = sqliteTable("user_settings", {
   diffViewStyle: text("diff_view_style").notNull().default(""),
   hideEmail: integer("hide_email", { mode: "boolean" }).notNull().default(false),
   hideActivity: integer("hide_activity", { mode: "boolean" }).notNull().default(false),
+  // The user settings NOTIFICATIONS tab's two preference columns
+  // (specs/user-notification-settings.md — upstream split across the
+  // `users.email_notifications_preference` column, user.go:103, and the
+  // `user_setting` KV `email_notification.gitea_actions`,
+  // setting_options.go:21-24; both halves collapsed into this side store,
+  // the theme/language precedent). Defaults are upstream's creation
+  // values (DEFAULT_EMAIL_NOTIFICATIONS 'enabled', admin.go:32; the
+  // actions KV default 'failure-only', setting_options.go:23). Enum sets
+  // are upstream's exact Go constants — the POST arms validate against
+  // these same catalogs (services/user-notification-prefs.ts). Written
+  // ONLY by that service's targeted upserts: loadUserSettings/
+  // saveUserSettings map explicit columns, so neither side's write can
+  // clobber the other's.
+  emailNotificationsPreference: text("email_notifications_preference", {
+    enum: ["enabled", "andyourown", "onmention", "disabled"],
+  })
+    .notNull()
+    .default("enabled"),
+  actionsEmailNotificationsPreference: text("actions_email_notifications_preference", {
+    enum: ["all", "failure-only", "disabled"],
+  })
+    .notNull()
+    .default("failure-only"),
 });
 
 // ---------------------------------------------------------------------------
