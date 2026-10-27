@@ -41,10 +41,12 @@
  *     chrome the full page does (the bundle morphs the whole div);
  *   - the ?type vocabulary: the brief's "?all state" — `?type=all` degrades
  *     to the unread tab (upstream's page vocabulary is unread|read at the
- *     pin, notification.go:70-71's Iif on "read"), and the legacy `?q=`
- *     page-type param (upstream notification.go:69 `FormString("type",
- *     FormString("q"))`) is NOT honored by the landed parse — a documented
- *     divergence pinned at its current posture;
+ *     pin, notification.go:70-71's Iif on "read"). The legacy `?q=` alias
+ *     (upstream notification.go:69 `FormString("type", FormString("q"))`)
+ *     was first pinned as a refusal (matrix-6's divergence posture) and has
+ *     since been FLIPPED TO ADOPTION by wave-notif-q-alias (w129): the
+ *     handler reads `type ?? q` at both the GET page and the status
+ *     re-render, with its own arm family below;
  *   - the purge-page dead surface: upstream's NotificationPurgePagePost
  *     (notification.go:207-218) / the mark_page_as_read button are reduced
  *     away (the module header's degradation) — no purge-page chrome renders
@@ -657,7 +659,7 @@ describe("the tab chrome arms (the mark-all button and the live badge)", () => {
   });
 });
 
-describe("the ?type vocabulary (the ?all state and the legacy q param)", () => {
+describe("the ?type vocabulary (the ?all state)", () => {
   it("?type=all degrades to the unread tab — upstream's page vocabulary is unread|read at the pin, there is no third tab", async () => {
     // Provenance: wave-polish-matrix-6 (the brief's "?all state"). upstream
     // prepareUserNotificationsData (notification.go:70-71) folds every
@@ -681,14 +683,16 @@ describe("the ?type vocabulary (the ?all state and the legacy q param)", () => {
     // No page anchor advertises an "all" tab.
     expect(html).not.toContain("type=all");
   });
+});
 
-  it("the legacy ?q= page-type param is NOT honored (upstream notification.go:69 reads type, then q — the landed parse reads type only; divergence pinned at its current posture)", async () => {
-    // Provenance: wave-polish-matrix-6. Upstream's
+describe("the legacy ?q= alias (upstream FormString 'type' defaulting to 'q' — the matrix-6 flip)", () => {
+  it("the legacy ?q= page-type alias feeds the same tab select as ?type= (upstream notification.go:69 — the matrix-6 refusal pin, flipped to adoption by wave-notif-q-alias)", async () => {
+    // Provenance: wave-polish-matrix-6 pinned the refusal; wave-notif-q-alias
+    // (w129) adopted the alias. Upstream's
     // `pageType := ctx.FormString("type", ctx.FormString("q"))` treats q as
-    // the legacy alias for the tab; the landed handler passes
-    // searchParams.get("type") alone, so ?q=read answers the UNREAD tab
-    // with its rows. This pin makes the divergence visible to the wiring
-    // wave that may adopt the alias.
+    // the legacy alias for the tab, and the landed handler now reads
+    // `searchParams.get("type") ?? searchParams.get("q")` — so ?q=read
+    // answers the READ tab exactly like ?type=read would.
     const alice = await seedVerifiedUser({ username: "alice" });
     const bob = await seedVerifiedUser({ username: "bob" });
     const repo = await seedRepo(alice, "ntf");
@@ -697,11 +701,70 @@ describe("the ?type vocabulary (the ?all state and the legacy q param)", () => {
     const res = await fetchUi("/notifications?q=read", { headers: { cookie: await sessionHeader(alice.id) } });
     expect(res.status).toBe(200);
     const html = await res.text();
-    // The unread tab (NOT q=read's read tab) is active with the unread row.
+    // The read tab (q=read's tab) is active; the unread row does NOT render
+    // there and the empty-tab placeholder shows.
+    expect(html).toContain('<a class="active item" href="/notifications?type=read">');
+    expect(html).toContain("No read notifications.");
+    expect(html).not.toContain(`id="notification_${thread.id}"`);
+    expect(html).not.toContain('<a class="active item" href="/notifications?type=unread">');
+  });
+
+  it("?q=unread explicitly selects the unread tab and its rows render", async () => {
+    // Provenance: wave-notif-q-alias. The alias is a VALUE channel, not just
+    // a silent fallback: the explicit unread spelling lands on the unread tab
+    // with the mailbox rows, mirroring the ?q=read arm's read-tab answer.
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    const thread = await seedThread(repo.id, bob.id, at(10));
+
+    const res = await fetchUi("/notifications?q=unread", { headers: { cookie: await sessionHeader(alice.id) } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
     expect(html).toContain('<a class="active item" href="/notifications?type=unread">');
     expect(html).toContain(`id="notification_${thread.id}"`);
     expect(html).toContain('data-status="1"');
     expect(html).not.toContain('<a class="active item" href="/notifications?type=read">');
+  });
+
+  it("?q=<junk> folds to the unread tab like junk ?type= does (notification.go:70-71's Iif on \"read\")", async () => {
+    // Provenance: wave-notif-q-alias. The alias value rides the same parse
+    // as ?type=, so a junk spelling through q folds onto the unread status —
+    // the sibling junk arms use "all"/"past" through type; this pins the
+    // fold through the alias itself.
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    const thread = await seedThread(repo.id, bob.id, at(10));
+
+    const res = await fetchUi("/notifications?q=past", { headers: { cookie: await sessionHeader(alice.id) } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<a class="active item" href="/notifications?type=unread">');
+    expect(html).toContain(`id="notification_${thread.id}"`);
+    expect(html).toContain('data-status="1"');
+    expect(html).not.toContain('<a class="active item" href="/notifications?type=read">');
+  });
+
+  it("a present ?type= outranks q (the two-arg default shape: the alias is only the fallback)", async () => {
+    // Provenance: wave-notif-q-alias. Go's FormString("type", FormString("q"))
+    // returns type's value whenever type is PRESENT — q is consulted only in
+    // its absence. `?type=read&q=unread` must therefore answer the read tab
+    // (a `q ?? type` misreading would answer unread with the row instead).
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const repo = await seedRepo(alice, "ntf");
+    const thread = await seedThread(repo.id, bob.id, at(10));
+
+    const res = await fetchUi("/notifications?type=read&q=unread", {
+      headers: { cookie: await sessionHeader(alice.id) },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<a class="active item" href="/notifications?type=read">');
+    expect(html).toContain("No read notifications.");
+    expect(html).not.toContain(`id="notification_${thread.id}"`);
+    expect(html).not.toContain('<a class="active item" href="/notifications?type=unread">');
   });
 });
 

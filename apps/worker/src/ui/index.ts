@@ -7061,7 +7061,12 @@ async function notificationsPage(c: Context<{ Bindings: Env }>): Promise<Respons
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
-  const pageType = parseNotificationPageType(url.searchParams.get("type"));
+  // The tab param is upstream's two-arg FormString default shape —
+  // `FormString("type", FormString("q"))` (notification.go:69): the legacy
+  // `?q=` alias feeds the same tab select when `type` is absent (the `??`
+  // null-shape matches Go's only-when-absent default; a present-but-empty
+  // `type` keeps its junk and folds to unread exactly like upstream).
+  const pageType = parseNotificationPageType(url.searchParams.get("type") ?? url.searchParams.get("q"));
   const page = parsePageNumber(url.searchParams.get("page"));
   const sequenceNumber = url.searchParams.get("sequence-number") ?? "";
   // The navbar resolution already computed the unread count for this
@@ -7111,8 +7116,10 @@ async function notificationStatusSubmit(c: Context<{ Bindings: Env }>): Promise<
   const marked = await markNotificationThread(c.env.DB, viewer.id, { id, action }, new Date());
   if (!marked) return respond(c.html(renderNotFound(ctx), 404));
   // The re-render keeps the current query's tab/page/sequence (upstream
-  // prepareUserNotificationsData over the posted PageQueryParams).
-  const pageType = parseNotificationPageType(url.searchParams.get("type"));
+  // prepareUserNotificationsData over the posted PageQueryParams — the same
+  // notification.go:69 read, so the legacy `?q=` alias rides the re-render
+  // the same way it rides the GET page above).
+  const pageType = parseNotificationPageType(url.searchParams.get("type") ?? url.searchParams.get("q"));
   const page = parsePageNumber(url.searchParams.get("page"));
   const sequenceNumber = url.searchParams.get("sequence-number") ?? "";
   const data = await loadNotificationsData(c.env.DB, viewer.id, pageType, page);
