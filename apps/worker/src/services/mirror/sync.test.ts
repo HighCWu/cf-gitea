@@ -200,6 +200,18 @@ const deliveries = () =>
 /** Wipe the delivery log between two syncs of one test. */
 const clearDeliveries = () => env.DB.prepare("DELETE FROM webhook_deliveries").run();
 
+/** The delivery-id floor — capture before a sync, then read only rows the
+ *  sync itself emitted. The queue consumer DOES run in tests (the binding
+ *  landed 647f7f9 — the header's old "no consumer" assumption was stale,
+ *  same class as the webhooks-push race): under load a PRIOR test's emit
+ *  can land after its clearDeliveries, and an unfiltered read mixes it in
+ *  (observed: a stray 'delete' in the updated-ref catalog, gate run 2). */
+const lastDeliveryId = async (): Promise<number> => {
+  const row = await env.DB.prepare("SELECT MAX(id) AS m FROM webhook_deliveries").first<{ m: number | null }>();
+  return row?.m ?? 0;
+};
+const deliveriesSince = async (floor: number) => (await deliveries()).filter((r) => r.id > floor);
+
 const repoRow = () => drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "7401")).get();
 const mirrorRow = () => drizzle(env.DB).select().from(repoMirrors).where(eq(repoMirrors.repoId, "7401")).get();
 
@@ -422,12 +434,13 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
       advertResponse(v0AdvertBytes(refs, "refs/heads/main")),
       resultResponse(packResponseBytes(pack)),
     ]);
+    const deliveryFloor = await lastDeliveryId();
     const result = await handleMirrorSync(env, { repoId: "7401", fetchImpl, now: NOW });
     expect(result).toEqual({ ok: true, created: 2, updated: 0, deleted: 0 });
 
     // Two refs × (push + create), in command order (branch first — the
     // advertisement's order), each pair push-then-create (upstream :347/:352).
-    const rows = await deliveries();
+    const rows = await deliveriesSince(deliveryFloor);
     expect(rows.map((r) => r.eventType)).toEqual(["push", "create", "push", "create"]);
 
     // Sender identity: upstream passes m.Repo.MustOwner(ctx) as the pusher of
@@ -466,6 +479,7 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
       deleted: 0,
     });
     await clearDeliveries();
+    const deliveryFloor = await lastDeliveryId();
 
     // Sync 2: the source moved main tips[0] → tips[6]; the same deterministic
     // pack carries every object (the receive is real, the delta is real).
@@ -480,7 +494,7 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
       deleted: 0,
     });
 
-    const rows = await deliveries();
+    const rows = await deliveriesSince(deliveryFloor);
     expect(rows.map((r) => r.eventType)).toEqual(["push"]); // no create/delete for an update
     const push = parsePush(rows[0]!.payloadContent);
     expect(push.ref).toBe("refs/heads/main");
@@ -537,6 +551,7 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
       deleted: 0,
     });
     await clearDeliveries();
+    const deliveryFloor = await lastDeliveryId();
 
     // Sync 2: the source no longer advertises legacy; prune deletes it. No
     // missing tips → the prune-only refs-only receive (no fetch POST — the
@@ -549,7 +564,7 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
       deleted: 1,
     });
 
-    const rows = await deliveries();
+    const rows = await deliveriesSince(deliveryFloor);
     expect(rows.map((r) => r.eventType)).toEqual(["delete"]);
     const payload = parseDelete(rows[0]!.payloadContent);
     // Upstream DeleteRef (notifier.go:858-870): short ref name, ref_type,
@@ -578,6 +593,7 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
       advertResponse(v0AdvertBytes(refs, "refs/heads/main")),
       resultResponse(packResponseBytes(pack)),
     ]);
+    const deliveryFloor = await lastDeliveryId();
     const result = await handleMirrorSync(env, { repoId: "7401", fetchImpl, now: NOW });
     expect(result).toEqual({ ok: true, created: 2, updated: 0, deleted: 0 });
 
@@ -586,7 +602,7 @@ describe("handleMirrorSync webhook notifications (§2.7)", () => {
     expect(mirrored.refs.find((r) => r.name === "refs/pull/7/head")?.target).toBe(tips[0]);
 
     // Only the branch's pair was notified; no payload names a refs/pull/* ref.
-    const rows = await deliveries();
+    const rows = await deliveriesSince(deliveryFloor);
     expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
     expect(parsePush(rows[0]!.payloadContent).ref).toBe("refs/heads/main");
     for (const row of rows) {
