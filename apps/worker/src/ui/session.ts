@@ -214,8 +214,13 @@ export type SessionVerification =
       /** The rotation's fresh `id:secret` for the response, or `null` (not
        *  due, or a concurrent request rotated first — changes == 0, §2.4
        *  step 5: send nothing, the old cookie stays valid for this
-       *  response). */
+       *  response). RAW value — consumers wrap it with `sessionSetCookie`
+       *  (§2.3); the persistence comes from `remember`. */
       setCookie: string | null;
+      /** The login's `remember` decision (§2.3), persisted on the row:
+       *  rotation re-sets the cookie with this persistence (upstream
+       *  re-sets the remember cookie, auth.go:127). */
+      remember: boolean;
       /** Background work: the throttled `last_seen_at` touch when due (§3). */
       background: Promise<unknown>[];
     };
@@ -301,6 +306,7 @@ export async function verifySession(
     outcome: "authenticated",
     user: { id: row.user.id, username: row.user.username, isAdmin: row.user.isAdmin },
     setCookie,
+    remember: row.session.remember,
     background,
   };
 }
@@ -340,8 +346,15 @@ export async function rotateSession(
  * Mint a session row for `userId` and return the cookie value
  * (`id:secret`, §2.2 step 5). The row starts unrotated
  * (`previous_sha256_digest` NULL, `rotated_at` = now) with the 24 h TTL.
+ * `remember` persists the login form's persistence decision on the row
+ * (§2.3): every later rotation re-sets the cookie with it, so a remembered
+ * login never degrades to a session cookie at the first 24 h rotation.
  */
-export async function mintSession(d1: D1Database, userId: number, options?: { now?: Date }): Promise<string> {
+export async function mintSession(
+  d1: D1Database,
+  userId: number,
+  options?: { now?: Date; remember?: boolean },
+): Promise<string> {
   const now = options?.now ?? new Date();
   const id = cryptoRandomId(SESSION_ID_LENGTH);
   const secret = generateSessionSecret();
@@ -355,6 +368,7 @@ export async function mintSession(d1: D1Database, userId: number, options?: { no
       rotatedAt: now,
       expiresAt: new Date(now.getTime() + SESSION_TTL_MS),
       lastSeenAt: now,
+      remember: options?.remember ?? false,
     })
     .run();
   return `${id}:${secret}`;
@@ -589,7 +603,18 @@ async function loginPage(c: RouteContext): Promise<Response> {
     const verification = await verifySession(c.env.DB, value);
     for (const work of verification.background) sink(work);
     if (verification.outcome === "authenticated") {
-      return seeOther("/", verification.setCookie ?? undefined);
+      // The rotation value is a RAW id:secret — ALWAYS wrap it into the full
+      // gitea_session directive (§2.3 flags + the row's remember persistence)
+      // so the browser actually adopts the rotated secret. The raw value
+      // here was the forced-logout bug: past the 60 s grace the browser kept
+      // the OLD cookie, reuse detection read the mismatch and DELETED the
+      // row (§2.4 step 3) — visiting /login while signed in after 24 h
+      // logged the user out.
+      const directive =
+        verification.setCookie === null
+          ? undefined
+          : sessionSetCookie(verification.setCookie, verification.remember);
+      return seeOther("/", directive);
     }
     if (verification.clearCookie) setCookie = clearSessionSetCookie();
   }
@@ -692,8 +717,10 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   }
 
   // Step 5: mint row + cookie in one response; limiter reset + expired-row
-  // sweep in waitUntil (§2.2 step 5).
-  const cookieValue = await mintSession(c.env.DB, verified.user.id, { now });
+  // sweep in waitUntil (§2.2 step 5). The form's `remember` rides the row:
+  // rotations re-read it (§2.3 — upstream re-sets the remember cookie on
+  // rotation, auth.go:127).
+  const cookieValue = await mintSession(c.env.DB, verified.user.id, { now, remember: form.remember });
   sink(limiterResetFailOpen(limiter, ip));
   sink(sweepExpiredSessions(c.env.DB, now));
 

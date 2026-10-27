@@ -858,8 +858,9 @@ export async function resolveOptionalCredential(
   // The session arm — the §2.4 walk behind resolveViewer (SPEC-0010 §2.5 is
   // the page-domain precedent): no cookie → anonymous with ZERO D1 session
   // reads; a dead/rotated cookie → anonymous plus the clear directive; a
-  // live one → the doer, with the rotation re-wrapped into the wire form
-  // (a session cookie — the remember bit belongs to the sign-in form only).
+  // live one → the doer, with the rotation re-wrapped into the wire form —
+  // persistence rides the row's remember bit (§2.3), the same decision the
+  // login minted the row with.
   const value = sessionCookieValue(request);
   if (value === null) {
     return { doer: null, scope: null, setCookie: null };
@@ -880,7 +881,7 @@ export async function resolveOptionalCredential(
   return {
     doer: { id: verification.user.id, isAdmin: verification.user.isAdmin },
     scope: null,
-    setCookie: verification.setCookie === null ? null : sessionSetCookie(verification.setCookie, false),
+    setCookie: verification.setCookie === null ? null : sessionSetCookie(verification.setCookie, verification.remember),
   };
 }
 

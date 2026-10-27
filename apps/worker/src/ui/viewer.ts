@@ -77,7 +77,9 @@ export async function resolveViewer(
     // ALWAYS a full directive (§2.7): the rotation arm's raw id:secret is
     // wrapped here so consumers attach setCookie as-is (the double-wrap the
     // dashboard matrix caught — resolveUiSession re-wrapped the clear arm's
-    // already-complete directive).
-    setCookie: verification.setCookie === null ? null : sessionSetCookie(verification.setCookie, false),
+    // already-complete directive). Persistence rides the row's remember bit
+    // (§2.3): a remembered login keeps Max-Age=2678400 across rotations
+    // (upstream re-sets the remember cookie, auth.go:127).
+    setCookie: verification.setCookie === null ? null : sessionSetCookie(verification.setCookie, verification.remember),
   };
 }

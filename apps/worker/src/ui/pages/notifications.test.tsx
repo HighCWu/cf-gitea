@@ -69,7 +69,7 @@ import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
 import { notificationStates, pullRequests } from "../../db/schema";
 import type { UiManifest } from "../manifest";
-import { uiRouter, handlesUiRoute, parseUiRoute, type UiAssetsFetcher } from "../index";
+import { uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { RepoRow } from "../ui-context";
 

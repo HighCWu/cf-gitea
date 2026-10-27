@@ -1532,6 +1532,13 @@ export const sessions = sqliteTable(
     expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
     /** Throttled write: at most once per hour per session (§3). */
     lastSeenAt: integer("last_seen_at", { mode: "timestamp" }).notNull(),
+    /** The login's `remember` decision (§2.3): rotation re-sets the cookie
+     *  with this persistence — `Max-Age=2678400` vs session-scope — so a
+     *  remembered login never degrades at its first 24 h rotation
+     *  (upstream re-sets the remember cookie on rotation,
+     *  routers/web/auth/auth.go:127). DEFAULT false: pre-0035 rows were
+     *  minted session-scope. */
+    remember: integer("remember", { mode: "boolean" }).notNull().default(false),
   },
   (t) => [
     index("sessions_user_idx").on(t.userId),

@@ -24,7 +24,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { issueAttachments, issues, releaseAssets, releases, repositories, repoCollaborators, sessions, users } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { mintFor } from "../auth/testing/seeds";
-import { mintSession, SESSION_COOKIE_NAME } from "../ui/session";
+import { mintSession, REMEMBER_MAX_AGE_SECONDS, SESSION_COOKIE_NAME } from "../ui/session";
 import { uploadIssueAttachment } from "../api/routes/issue-attachments";
 import {
   attachmentsServingRouter,
@@ -815,6 +815,33 @@ describe("GET /attachments/{uuid} — session-cookie credential arms", () => {
     expect(setCookie?.startsWith(`${SESSION_COOKIE_NAME}=`)).toBe(true);
     // the rotation form, NOT the clear form
     expect(setCookie).not.toContain("Max-Age=0");
+    expect(setCookie).toContain("HttpOnly");
+  });
+
+  it("a remembered session's rotation keeps Max-Age=2678400 on the asset response (§2.3)", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PRIVATE_REPO_ID, PRIVATE_STORAGE_KEY, owner, "private");
+    const issue = await seedIssue(PRIVATE_REPO_ID, owner.id);
+    const row = await seedIssueAttachment({
+      repoId: PRIVATE_REPO_ID,
+      storageKey: PRIVATE_STORAGE_KEY,
+      issueId: issue.id,
+      name: "kept.txt",
+      content: new TextEncoder().encode("remembered"),
+    });
+    const cookie = await mintSession(env.DB, owner.id, { remember: true });
+    const sessionId = cookie.slice(0, cookie.indexOf(":"));
+    const past = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await db().update(sessions).set({ rotatedAt: past, lastSeenAt: past }).where(eq(sessions.id, sessionId));
+
+    const res = await serve(`/attachments/${row.uuid}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    });
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get("set-cookie");
+    expect(setCookie).not.toBeNull();
+    expect(setCookie?.startsWith(`${SESSION_COOKIE_NAME}=`)).toBe(true);
+    expect(setCookie).toContain(`Max-Age=${REMEMBER_MAX_AGE_SECONDS}`); // persistence survives rotation
     expect(setCookie).toContain("HttpOnly");
   });
 

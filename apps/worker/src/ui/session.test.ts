@@ -210,6 +210,7 @@ describe("POST /login — the happy path (§2.2)", () => {
     expect(row?.userId).toBe(alice.id);
     expect(row?.sha256Digest).toBe(await sha256Hex(value.split(":")[1] ?? ""));
     expect(row?.previousSha256Digest).toBeNull();
+    expect(row?.remember).toBe(false); // session-scope login → rotations stay session-scope
     const ttl = (row?.expiresAt.getTime() ?? 0) - before;
     expect(ttl).toBeGreaterThan(24 * 60 * 60 * 1000 - 5000);
     expect(ttl).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
@@ -224,6 +225,9 @@ describe("POST /login — the happy path (§2.2)", () => {
     expect(cookieParts(cookieHeader(res)).get("Max-Age")).toBe(String(REMEMBER_MAX_AGE_SECONDS));
     expect(sessionSetCookie("a:b", true)).toContain(`Max-Age=${REMEMBER_MAX_AGE_SECONDS}`);
     expect(sessionSetCookie("a:b", false)).not.toContain("Max-Age");
+    // The decision persists on the row: rotations re-read it (§2.3).
+    const row = (await drizzle(env.DB).select().from(sessions).all())[0];
+    expect(row?.remember).toBe(true);
   });
 
   it("accepts `token` as the field alias and an optional case-insensitive matching user_name", async () => {
@@ -478,6 +482,88 @@ describe("GET /login (§2.1)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------------
+// §2.4 step 5 at route level — the GET /login rotation round-trip
+// ---------------------------------------------------------------------------------
+
+describe("GET /login — the rotation round-trip", () => {
+  /** Backdate the rotation clock on a live row: rotated ≥ 24 h ago, unexpired. */
+  async function backdateRotation(cookieValue: string, when: Date): Promise<void> {
+    const id = cookieValue.slice(0, cookieValue.indexOf(":"));
+    await drizzle(env.DB)
+      .update(sessions)
+      .set({ rotatedAt: when, lastSeenAt: when })
+      .where(eq(sessions.id, id))
+      .run();
+  }
+
+  it("a rotation-due visit answers the FULL wrapped directive and the adopted cookie authenticates the next request", async () => {
+    const alice = await seedUser();
+    const oldCookie = await mintSession(env.DB, alice.id);
+    const oldSecret = oldCookie.split(":")[1] ?? "";
+    const id = oldCookie.split(":")[0] ?? "";
+    await backdateRotation(oldCookie, new Date(Date.now() - 25 * 60 * 60 * 1000));
+
+    const res = await request("/login", { headers: { cookie: `${SESSION_COOKIE_NAME}=${oldCookie}` } });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+
+    // The full gitea_session directive — the review's HIGH #1: the raw
+    // id:secret here had no name/flags, so the browser never adopted the
+    // rotated secret and past the 60 s grace reuse detection DELETED the
+    // row (forced logout on the next visit after 24 h).
+    const parts = cookieParts(cookieHeader(res));
+    const adoptedSecret = parts.get(SESSION_COOKIE_NAME) ?? "";
+    expect(adoptedSecret).toMatch(new RegExp(`^${id}:[0-9a-f]{64}$`)); // same id, fresh secret
+    expect(parts.get("Path")).toBe("/");
+    expect(parts.get("HttpOnly")).toBe("");
+    expect(parts.get("Secure")).toBe("");
+    expect(parts.get("SameSite")).toBe("Lax");
+    expect(parts.has("Max-Age")).toBe(false); // non-remembered: stays session-scope
+
+    // The row was rewritten with the CAS shape, and the cookie a browser
+    // would now present authenticates the next request.
+    const row = await drizzle(env.DB).select().from(sessions).where(eq(sessions.id, id)).get();
+    expect(row?.sha256Digest).toBe(await sha256Hex(adoptedSecret.split(":")[1] ?? ""));
+    expect(row?.previousSha256Digest).toBe(await sha256Hex(oldSecret));
+    expect(row?.rotatedAt.getTime()).toBe(row?.lastSeenAt.getTime()); // rotation clock reset
+
+    const next = await request("/login", { headers: { cookie: `${SESSION_COOKIE_NAME}=${adoptedSecret}` } });
+    expect(next.status).toBe(303); // the rotated secret is live
+    expect(cookieHeader(next)).toBe(""); // rotation no longer due — no Set-Cookie races it
+  });
+
+  it("a remembered session's rotation keeps Max-Age=2678400 (upstream re-sets the remember cookie, auth.go:127)", async () => {
+    const alice = await seedUser();
+    const login = await request("/login", form({ password: await seedToken(alice, "web"), remember: "on" }));
+    expect(login.status).toBe(303);
+    const remembered = cookieParts(cookieHeader(login)).get(SESSION_COOKIE_NAME) ?? "";
+    await backdateRotation(remembered, new Date(Date.now() - 25 * 60 * 60 * 1000));
+
+    const res = await request("/login", { headers: { cookie: `${SESSION_COOKIE_NAME}=${remembered}` } });
+    expect(res.status).toBe(303);
+    expect(cookieParts(cookieHeader(res)).get("Max-Age")).toBe(String(REMEMBER_MAX_AGE_SECONDS)); // stays persistent
+  });
+
+  it("verifySession surfaces the row's remember bit for the wrap (service level)", async () => {
+    const alice = await seedUser();
+    const remembered = await mintSession(env.DB, alice.id, { remember: true });
+    await backdateRotation(remembered, new Date(Date.now() - 25 * 60 * 60 * 1000));
+    const yes = await verifySession(env.DB, remembered);
+    expect(yes.outcome).toBe("authenticated");
+    if (yes.outcome === "authenticated") {
+      expect(yes.remember).toBe(true);
+      expect(yes.setCookie).not.toBeNull();
+    }
+
+    const plain = await mintSession(env.DB, alice.id);
+    await backdateRotation(plain, new Date(Date.now() - 25 * 60 * 60 * 1000));
+    const no = await verifySession(env.DB, plain);
+    expect(no.outcome).toBe("authenticated");
+    if (no.outcome === "authenticated") expect(no.remember).toBe(false);
+  });
+});
+
 describe("POST /logout (§2.7)", () => {
   it("deletes the row (id AND digest), clears the cookie, redirects — idempotent", async () => {
     const alice = await seedUser();
@@ -657,6 +743,7 @@ async function insertSession(input: {
   expiresAt: Date;
   lastSeenAt: Date;
   previous?: string;
+  remember?: boolean;
 }): Promise<string> {
   await drizzle(env.DB)
     .insert(sessions)
@@ -668,6 +755,7 @@ async function insertSession(input: {
       rotatedAt: input.rotatedAt,
       expiresAt: input.expiresAt,
       lastSeenAt: input.lastSeenAt,
+      remember: input.remember ?? false,
     })
     .run();
   return `${input.id}:${input.secret}`;
@@ -719,6 +807,26 @@ describe("§2.4 verification, rotation, reuse detection", () => {
     expect(row?.previousSha256Digest).toBe(await sha256Hex(secret));
     expect(row?.rotatedAt.getTime()).toBe(T);
     expect(row?.expiresAt.getTime()).toBe(T + 24 * 60 * 60 * 1000); // TTL extended
+  });
+
+  it("rotation preserves the row's remember bit (the CAS rewrite leaves persistence alone, §2.3)", async () => {
+    const alice = await seedUser();
+    const cookieValue = await insertSession({
+      id: "rememb1234",
+      userId: alice.id,
+      secret: "5".repeat(64),
+      rotatedAt: new Date(T - 25 * 60 * 60 * 1000),
+      expiresAt: new Date(T + 60 * 60 * 1000),
+      lastSeenAt: new Date(T - 25 * 60 * 60 * 1000),
+      remember: true,
+    });
+    const result = await verifySession(env.DB, cookieValue, { now: new Date(T) });
+    expect(result.outcome).toBe("authenticated");
+    if (result.outcome !== "authenticated") return;
+    expect(result.remember).toBe(true); // the wrap source survives rotation
+    expect(result.setCookie).not.toBeNull();
+    const row = (await drizzle(env.DB).select().from(sessions).all())[0];
+    expect(row?.remember).toBe(true);
   });
 
   it("the previous secret inside the 60 s grace must not authenticate but the row SURVIVES (§2.4 step 3)", async () => {
