@@ -298,12 +298,16 @@ gates) all read **490 ops / 298 paths** — the pre-Actions/packages ceiling
 holds, 64 remaining ops all FEATURE-ABSENT (Actions 54 + package registry 10,
 per `docs/compat/api-remaining-inventory.md`).
 
-### UI parity ticks (the cut point's tick-6 → tick-12)
+### UI parity ticks (the cut point's tick-6 → tick-15)
 
 tick-6 60/3/50+1 (v1.1's close, `7a5861e`) → tick-7 61/3/48+2 (`bff7fdc`)
 → tick-8 63/3/46+2 (`075f916`) → tick-9 65/3/47 zero-in-flight (`f6ce45f`)
 → tick-10 65/4/46 (`c95d44d`) → tick-11 88/7/20 (the stage-1 window
-accounted, `58ec303`) → **tick-12 91/5/20, board EMPTY** (`b12bd95`). Counts
+accounted, `58ec303`) → **tick-12 91/5/20, board EMPTY** (`b12bd95`) → tick-13 91/5/20,
+zero flips (`69068ac`) → tick-14 91/5/20, zero flips (`19d15a1`) →
+**tick-15 92/4/20** (`ea6a49d` — the purge-page POST claims the A
+trio row's one unclaimed member; the first headline move since the
+board emptied). Counts
 are programmatic, not eyeballed (the tick-5 methodology carried forward).
 
 ---
@@ -394,3 +398,59 @@ update-goldens the .rss enumeration), and matrix batches 6-8
 (`b61a5e8`, `3b24651`, `48b5f26`) add 77 test-only characterization
 arms. The survey headline is re-verified unchanged at 91/5/20
 (programmatically) — `docs/compat/ui-parity-survey.md` tick-14.
+
+**Appended 2026-10-28 (HEAD `ea6a49d`) — the third cluster, the
+session's closing pass.** The matrix program ran its saturation
+census first (`419bfb1`, `docs/testing/matrix-coverage-census.md`):
+the deferred-arm denominator (the 25 non-LANDED survey rows,
+classified needs-API-first / feature-gated / no-RPC-gated), the
+numerator (260 committed test files, 5,175 `it(`-level arms at census
+time), and the yield curve — zero real bugs across the last 159
+committed arms vs ~1 per 65 at tick-11 — verdict: **ONE more batch,
+then SATURATED**. Batches 9-10 landed in the same window (`3d8b941`
+31 arms, `97a638b` 28), batch 1 (`55b982b`) was recovered complete
+after its agent died silent, and batch 14 executed the census's gap
+list (`cee057b`: the milestone sidebar link + its stale no-page notes
+flipped with `ca4eb58` provenance, the 4-module degradation-note
+sweep, the four absence-pin arms, the issue-detail golden
+re-baselined) beside batches 11-13 (`ac3f92d` 29, `8d48a18` 44,
+`ac38040` 14) — batches 1-14 total ~360 arms by their own subjects
+(the RD21 evidence's tally). The census's two new-surface S tails
+landed committed-UNMOUNTED (`29b67cf`: the `comments/{id}/attachments`
+JSON fragment + the `issues/new/choose` 303 — upstream's chooser IS
+the redirect when no template pipeline exists; the mounts ride a
+future index.ts window, the D rows stay ABSENT until then), and the
+census's third tail — the notifications `purge-page` POST — MOUNTED
+`ea6a49d` (NotificationPurgePagePost per notification.go:207-218; the
+survey's A trio row flips LANDED — tick-15 re-walked the headline to
+**92/4/20**, one PARTIAL retired). Between them: the push-mirror
+lister's dead `??10` removed (`1bd7020`), `SeedFile.mode` + the
+mode-change arms (`ad7e654`, zero engine changes), the wiki view
+golden's net a11y arm (`e1c41f3`), the contention wave's per-file 90s
+budgets (`382e337`, 11 carriers, recovered from the dead agent), and
+the GPG verify minute-boundary race guarded (`50880b2` — a REAL
+time-bomb, not a load flake: the route's single-minute token dies
+when the RSA sign + fetch crosses the boundary, observed 2-of-4 full
+runs plus once solo; `avoidMinuteBoundary` gives the chain ≥55 s of
+slack; zero product change). **REDEPLOY21** shipped the polish cargo
+(GO `cee057b` → version `fe6bcca1`, evidence `75bd33e`): the gate ran
+**two perfect strip-mode single-passes at 261 files / 5,831 tests /
+0 failed** — the contention class formally RETIRED (the budgets + the
+GPG guard were its last two real members; the epilogue in
+`docs/testing/suite-stability.md`); 9 batteries green (mirror 8/8 on
+the warm rerun — the cold-consumer first-sync latency, the RD20 cold
+class), force-red ×2 clean, and the PAT-mint plaintext incident
+disclosed (the leaked token was never inserted into D1 — zero
+server-side exposure; the `node -e` mint is the pattern of record).
+`ea6a49d` landed AFTER that deploy and rides the NEXT one. Upstream,
+the filed ws1009 issue (cloudflare/workers-sdk#16515) drew a community
+PR — **#16523** proposes the chunked warm-module-frames fix (16 MiB
+frame budget, ordered envelopes, reassembly before devalue parse);
+bot-closed under the unvouched-collaborator policy 2026-10-27,
+pending maintainer triage — ADR-0006's revisit trigger #2 stays
+armed. §4 re-check: no line retired — the ws1009 residuals line and
+the 64-op FEATURE-ABSENT ceiling stand as written (no API work in
+this cluster). Re-measured at `ea6a49d` (not copied): goldens **67**
+in `src/ui/__tests__/goldens/` (64 HTML + 3 RSS, plus the session
+`login.html`), committed test files **262**, **5,209** `it(`/`test(`
+call sites (the census method).

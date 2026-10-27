@@ -184,3 +184,35 @@ gate with `--solo` adjudication:
   once, then fails; solo assertion/timeout failures fail immediately.
   Consistent with the falsified Plan A in `docs/research/ws1009-graph-sizing.md`
   §4.A: no graph-shape trick escapes the executed-edge BFS.
+
+## Epilogue (2026-10-28, the closing pass): the B-lever era verdict
+
+Everything above is the ledger of the UNSTRIPPED era — its 204/258
+death counts describe that era only. Lever B landed
+(`9e70af5` + `2534ca1`: `CF_TEST_STRIP_SOURCEMAPS=1`, the
+`enforce:"post"` empty-mappings transform in `vitest.config.ts` —
+mechanism and measured −21.66 MB A/B in
+`docs/research/ws1009-graph-sizing.md` §4.B, ADR-0006's postscript
+records trigger #1 as fired): the sourcemap byte family left the warm
+payload, ws1009 deaths went 204 → 0, and the single-pass full run was
+restored — phase 1 of `pnpm test:full` is single-pass again, with
+`--solo` retained purely as the safety net. The residual real-flake
+class (the heavy-closure contention six plus their kin) was then
+finished off rather than papered over: per-file 90 s budgets on the 11
+contention carriers (`382e337`) and the GPG verify minute-boundary
+guard (`50880b2`) — the FINAL member found, and a genuine time-bomb
+rather than a load flake: the route's single-minute verify token dies
+whenever the RSA sign + fetch chain crosses the boundary (observed
+2-of-4 full runs AND once solo), `avoidMinuteBoundary` sleeps past it
+so the chain gets ≥55 s of slack. The terminal verdict, per the RD21
+deploy gate (GO `cee057b` → `fe6bcca1`, evidence
+`docs/design/p0-evidence.md` @ `75bd33e`): **two perfect strip-mode
+single-passes at 261 files / 5,831 tests / 0 failed — the contention
+class is retired.** The one open thread is deliberately upstream:
+ADR-0006's revisit trigger #2 (the structural cure — chunked
+warm-module transport — keeps the failure-frame sourcemaps the strip
+trades away) remains desirable; it is filed as
+cloudflare/workers-sdk#16515, and community PR #16523 proposes exactly
+that chunked-frames fix (16 MiB frame budget, ordered envelopes;
+bot-closed under the unvouched-collaborator policy 2026-10-27,
+pending maintainer triage).
