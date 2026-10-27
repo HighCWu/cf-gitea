@@ -46,6 +46,12 @@
  *   - the claim pin: the issues head's new/labels tails parse into their own
  *     families while the pulls head has NO such tails (unclaimed → engine
  *     404; upstream registers /pulls/new (claimed by the window-2e folds) but no /pulls/labels).
+ *   - (wave-129 matrix-4) the typed query combinations: labels×milestone
+ *     intersect (AND), a missed milestone inside a composition degrades to
+ *     the labels-only list, both facets ride the pager in listHref's emit
+ *     order, duplicate ?state= takes the first value, case-mismatched
+ *     ?state= degrades to open, and the upstream poster/assignee params are
+ *     inert on this surface.
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
@@ -556,7 +562,160 @@ describe("the pulls family (the row state machine + the /issues link family)", (
   });
 });
 
-// --- the New Issue tail ----------------------------------------------------------------
+// --- the typed query combinations ------------------------------------------------
+// wave-129 matrix-4: the landed query surface (issues-list.tsx's loader —
+// `?state=`/`?page=`/`?labels=`/`?milestone=` ONLY, "reduced to the params
+// this page actually honors") composed: the label AND milestone facets must
+// intersect (upstream ListIssues applies both to one query —
+// routers/api/v1/repo/issue.go's LabelIDs + MilestoneIDs over the same
+// issue list), a missed milestone inside a composition degrades to the
+// LABEL-filtered list (not the unfiltered one), both facets ride the pager
+// in listHref's emit order, duplicate ?state= takes the FIRST value (Go
+// FormString parity), and the upstream poster/assignee params are inert
+// here (no QueryBuild on this surface — the documented reduction).
+
+describe("the typed query combinations (facets compose AND, degrade together)", () => {
+  /** alice + one public repo: 21 OPEN issues labeled bug AND sitting in the
+   *  milestone v3.1, 1 CLOSED issue with the same pair, plus 1 open issue
+   *  labeled enh WITHOUT the milestone — every combination arm's mirror. */
+  async function seedComboRepo(): Promise<{ bugId: number; enhId: number; milestoneId: number }> {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "combos");
+    const svc = new IssuesService(env.DB);
+    const bug = await createRepoLabel(env.DB, repo.id, {
+      name: "bug",
+      exclusive: false,
+      color: "#ee0701",
+      description: "Something is broken",
+      isArchived: false,
+      now: at(0),
+    });
+    const enh = await createRepoLabel(env.DB, repo.id, {
+      name: "enhancement",
+      exclusive: false,
+      color: "#84b6eb",
+      description: "New feature or request",
+      isArchived: false,
+      now: at(0),
+    });
+    const milestone = await svc.createMilestone({ repoId: repo.id, name: "v3.1", now: at(0) });
+    for (let i = 1; i <= 21; i += 1) {
+      await seedIssue(svc, repo.id, alice.id, `combo issue ${i}`, i, { labelIds: [bug.id], milestoneId: milestone.id });
+    }
+    const closed = await seedIssue(svc, repo.id, alice.id, "combo closed issue", 500, { labelIds: [bug.id], milestoneId: milestone.id });
+    await svc.closeIssue(closed.id, { now: at(510) });
+    await seedIssue(svc, repo.id, alice.id, "loose enh issue", 600, { labelIds: [enh.id] });
+    return { bugId: bug.id, enhId: enh.id, milestoneId: milestone.id };
+  }
+
+  it("the label AND milestone facets intersect; the tabs echo both in listHref order with the id", async () => {
+    const { bugId, milestoneId } = await seedComboRepo();
+    const res = await fetchUi(`/alice/combos/issues?labels=${bugId}&milestone=v3.1`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The AND answer: 21 open + 1 closed — the loose enh issue (label but no
+    // milestone) is excluded by the milestone half.
+    expect(html).toContain("21 Open</a>");
+    expect(html).toContain("1 Closed</a>");
+    expect((html.match(/<div class="item">/g) ?? []).length).toBe(20);
+    expect(html).not.toContain(">loose enh issue</a>");
+    // The milestone resolved BY NAME echoes as the numeric id (listHref's
+    // shape), labels first, milestone second.
+    expect(tabsSlice(html)).toContain(`href="/alice/combos/issues?labels=${bugId}&amp;milestone=${milestoneId}"`);
+    // The numeric-id form of the SAME composition answers identically.
+    const byId = await (await fetchUi(`/alice/combos/issues?labels=${bugId}&milestone=${milestoneId}`)).text();
+    expect(byId).toContain("21 Open</a>");
+    // The row's label badge echoes ONLY state+labels — the badge anchor's
+    // exact bytes never carry the milestone facet (the row renderer's href).
+    expect(html).toContain(`<a class="item" href="?state=open&amp;labels=${bugId}">`);
+    expect(html).not.toContain(`?state=open&amp;labels=${bugId}&amp;milestone=`);
+  });
+
+  it("a missed milestone inside a composition degrades to the LABEL-filtered list, not the unfiltered one", async () => {
+    const { bugId } = await seedComboRepo();
+    // milestoneIdsByRepoEntries' miss is discarded → the milestone half
+    // drops but the labels half STILL applies: 21 open bug rows, not the 22
+    // unfiltered, not zero.
+    const res = await fetchUi(`/alice/combos/issues?labels=${bugId}&milestone=no-such-milestone`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("21 Open</a>");
+    expect(html).toContain("1 Closed</a>");
+    expect((html.match(/<div class="item">/g) ?? []).length).toBe(20);
+    // And the echo drops the discarded half: the tabs carry labels only.
+    expect(tabsSlice(html)).toContain(`href="/alice/combos/issues?labels=${bugId}"`);
+    expect(tabsSlice(html)).not.toContain("milestone=");
+  });
+
+  it("both facets ride the pager in listHref's emit order (labels, milestone, page)", async () => {
+    const { bugId, milestoneId } = await seedComboRepo();
+    const page1 = await (await fetchUi(`/alice/combos/issues?labels=${bugId}&milestone=${milestoneId}`)).text();
+    // Older keeps BOTH facets with page last.
+    expect(page1).toContain(`href="/alice/combos/issues?labels=${bugId}&amp;milestone=${milestoneId}&amp;page=2"`);
+    const page2 = await (await fetchUi(`/alice/combos/issues?labels=${bugId}&milestone=${milestoneId}&page=2`)).text();
+    expect((page2.match(/<div class="item">/g) ?? []).length).toBe(1);
+    // Newer resets the canonical page (page-1 = 1 is never emitted).
+    expect(page2).toContain(`<a class="item navigation" href="/alice/combos/issues?labels=${bugId}&amp;milestone=${milestoneId}"`);
+    expect(page2).toContain('<span class="navigation_label">Newer</span>');
+    expect(page2).not.toContain('<span class="navigation_label">Older</span>');
+    // The closed tab under BOTH facets + page 2 echoes state first, pageless.
+    expect(tabsSlice(page2)).toContain(
+      `href="/alice/combos/issues?state=closed&amp;labels=${bugId}&amp;milestone=${milestoneId}"`,
+    );
+  });
+
+  it("duplicate ?state= params take the FIRST value (Go FormString parity)", async () => {
+    await seedComboRepo();
+    const res = await fetchUi("/alice/combos/issues?state=closed&state=open");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The CLOSED tab is the active one (URLSearchParams.get returns the
+    // first occurrence — upstream's ctx.FormString reads the same one)…
+    const tabs = tabsSlice(html);
+    const active = tabs.indexOf('class="active item flex-text-inline"');
+    const plain = tabs.indexOf('class="item flex-text-inline"');
+    expect(active).toBeGreaterThanOrEqual(0);
+    expect(active).toBeGreaterThan(plain); // the closed tab sits second in the DOM
+    // …and the rows are the closed page (the single closed combo issue).
+    expect((html.match(/<div class="item">/g) ?? []).length).toBe(1);
+    expect(html).toContain(">combo closed issue</a>");
+  });
+
+  it("a non-lowercase ?state= degrades to the open tab (the exact-match parse)", async () => {
+    await seedComboRepo();
+    const res = await fetchUi("/alice/combos/issues?state=Closed");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const tabs = tabsSlice(html);
+    const active = tabs.indexOf('class="active item flex-text-inline"');
+    const plain = tabs.indexOf('class="item flex-text-inline"');
+    expect(active).toBeGreaterThanOrEqual(0);
+    expect(active).toBeLessThan(plain); // the OPEN tab (first in the DOM) is active
+    expect((html.match(/<div class="item">/g) ?? []).length).toBe(20);
+    expect(html).not.toContain(">combo closed issue</a>");
+  });
+
+  it("the upstream poster/assignee params are inert: no filter, no facet echo", async () => {
+    await seedComboRepo();
+    // Upstream's ViewIssues honors poster and assigned poster through the
+    // QueryBuild (routers/web/repo/issue ViewIssues' PosterID/AssignedID
+    // params); the landed surface honors labels+milestone only — the params
+    // must neither filter nor echo.
+    const res = await fetchUi("/alice/combos/issues?poster=alice&assignee=alice");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The UNFILTERED open set: 22 rows worth (21 combo + the loose enh), so
+    // the pager shows Older and the tabs echo no facet at all.
+    expect(html).toContain("22 Open</a>");
+    expect(html).toContain("1 Closed</a>");
+    expect(tabsSlice(html)).toContain('href="/alice/combos/issues"');
+    expect(tabsSlice(html)).not.toContain("labels=");
+    expect(tabsSlice(html)).not.toContain("poster=");
+    expect(tabsSlice(html)).not.toContain("assignee=");
+  });
+});
+
+
 
 describe("the New Issue tail (the archived gate wave2's fixture cannot reach)", () => {
   it("the issues list renders the New Issue button; the archived twin hides it but keeps the list", async () => {

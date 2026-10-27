@@ -34,6 +34,10 @@
  *   - the claim pin: the new-family dir tail parses into the refSuffix walk
  *     and upstream's underscored literals (_edit/_new/_delete) stay
  *     unclaimed (the brief pins the bare names).
+ *   - (wave-129 matrix-4) the commit-form validation arms: the edit-mode
+ *     ghost-branch re-render (content AND summary carried, nothing written)
+ *     and GetCommitMessage's default-summary + body assembly on the landed
+ *     edit commit ("Update '{path}'" + the appended body).
  *
  * Rerun posture (wave8's): every POST-mutated path pre-cleans through the
  * editor's own delete POST (tolerating an already-absent file), the edit
@@ -529,5 +533,77 @@ describe("the delete arm's deferred pieces (nested target + carried re-render)",
     expect(html).toContain("branch does not exist [name: ghost]");
     expect(html).toContain('value="matrix keep"'); // the submission survives the re-render
     expect(await blobOid("notes/editor.txt")).not.toBeNull(); // nothing deleted
+  });
+});
+
+// --- the commit-form validation arms (wave-129 matrix-4) ---------------------------
+// The deferred commit-form edges: the ghost-branch service arm on the EDIT
+// mode (wave8 pinned it on /new, the delete matrix twin pinned it on
+// /delete — the edit re-render must carry the submitted content too), and
+// GetCommitMessage's default-summary + body assembly on the EDIT arm
+// (editor.go:106-111 — IfZero(TrimSpace(summary), default) + "\n\n" + body;
+// the default itself is repo.editor.update = "Update '%s'",
+// editor.go:339; wave8 pinned the create twin and the push-payload echo,
+// never the landed edit commit's log).
+
+describe("the commit-form validation arms (the edit-mode ghost branch, the default+body assembly)", () => {
+  it("a ghost target branch on EDIT re-renders the service arm with the content AND summary carried", async () => {
+    const fixture = await ensureFeditorFixtures();
+    const tipBefore = await mainTip();
+    const bytesBefore = await blobText("notes/editor.txt"); // earlier batches rewrite the file — pin "unchanged", not the seed bytes
+    const res = await fetchUi(
+      "/alice/feditor/edit/main/notes/editor.txt",
+      withCookie(
+        formPost({
+          tree_path: "notes/editor.txt",
+          content: "ghost-branch draft\n",
+          branch: "ghost",
+          blob_sha: (await blobOid("notes/editor.txt")) ?? "",
+          commit_summary: "matrix ghost summary",
+        }),
+        fixture.ownerCookie,
+      ),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // ErrBranchDoesNotExist's format (services/repository/files — upstream
+    // "branch does not exist [name: %s]"), re-rendered inline.
+    expect(html).toContain("branch does not exist [name: ghost]");
+    // The submission survives: the content in the textarea (the submitted
+    // bytes, trailing newline included), the summary in the input (the
+    // login-failure convention on the edit twin).
+    expect(html).toContain(">ghost-branch draft");
+    expect(html).toContain('value="matrix ghost summary"');
+    // Nothing was written: the tip is unmoved and the blob keeps its bytes.
+    expect(await mainTip()).toBe(tipBefore);
+    expect(await blobText("notes/editor.txt")).toBe(bytesBefore);
+  });
+
+  it("an empty summary with a body-only message lands the Update default + the appended body", async () => {
+    const fixture = await ensureFeditorFixtures();
+    // Deterministic rewrite (the rerun posture): every run lands the same
+    // bytes through a FRESH blob sha, so reruns converge.
+    const res = await fetchUi(
+      "/alice/feditor/edit/main/notes/editor.txt",
+      withCookie(
+        formPost({
+          tree_path: "notes/editor.txt",
+          content: "matrix default-summary body\n",
+          branch: "main",
+          blob_sha: (await blobOid("notes/editor.txt")) ?? "",
+          commit_summary: "",
+          commit_message: "matrix body-only note",
+        }),
+        fixture.ownerCookie,
+      ),
+    );
+    expect(res.status).toBe(303);
+    expect(await blobText("notes/editor.txt")).toBe("matrix default-summary body\n");
+    // GetCommitMessage (editor.go:106-111): the EMPTY trimmed summary falls
+    // to the mode default — repo.editor.update over the CLEANED path — and
+    // the trimmed body appends after a blank line (the engine's canonical
+    // serializer terminates with \n).
+    const log = await env.REPO.getByName("alice/feditor").listLog("main", { path: "notes/editor.txt", ofs: 0, n: 1 });
+    expect(log?.commits[0]?.message.replace(/\n$/, "")).toBe("Update 'notes/editor.txt'\n\nmatrix body-only note");
   });
 });

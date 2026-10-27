@@ -74,6 +74,10 @@ async function seedPr(
     headRepoId?: string;
     flow?: (typeof PRFlow)[keyof typeof PRFlow];
     posterId?: number;
+    /** matrix-4: a non-default base targets a DIFFERENT protection rule
+     *  (findRule(d1, repoId, pr.baseBranch)); the loader reads the row, never
+     *  the engine, so the branch need not exist in git. */
+    baseBranch?: string;
   },
   state: Partial<{ status: number; conflictedFiles: string | null; commitsBehind: number; headSha: string | null }>,
   repoId: string = plainRepoId,
@@ -84,7 +88,7 @@ async function seedPr(
     title: input.title,
     posterId: input.posterId ?? bob.id,
     headRepoId: input.headRepoId ?? repoId,
-    baseBranch: "main",
+    baseBranch: input.baseBranch ?? "main",
     headBranch: input.headBranch,
     flow: input.flow,
     now: new Date((T0 + 60) * 1000),
@@ -575,3 +579,238 @@ describe("pullMergeBoxFragmentResponse + shellEscape", () => {
     expect(shellEscape("~we ird")).toBe('"~we ird"'); // ~ section unclean (no /) → fully quoted
   });
 });
+
+// --- the protection interplay (the deferred rule-config arms) --------------------
+// wave-129 matrix-4: the rule-config knobs the base fixture family does not
+// carry — blockOnOutdatedBranch (issue_view.go:1102-1105, the
+// MergeBlockedByOutdatedBranch arm), the bypass prompt's two forms
+// (pull_merge_box.go:167-175: canBypassProtectionAsAdmin = isRepoAdmin &&
+// !BlockAdminMergeOverride, issue_view.go:993), the whitelisted approvals
+// text (issue_view.go:1082), the required-check FAILURE blocker (vs the
+// taken missing/pending arm), the statuses-free and empty-sha rule arms, and
+// the conflictedFiles tolerant decode's empty arm. Each new rule lives on its
+// OWN base-branch name so the shared "main" rule and the "statuses" fixture
+// stay untouched.
+
+describe("the protection interplay (the deferred rule-config arms)", () => {
+  /** Two additional rules on the gated repo, keyed by base-branch name:
+   *  "release" — the bypass-allowlist pair WITH BlockAdminMergeOverride (the
+   *  admin flips to the allowlist prompt form); "lock" — BlockAdminMergeOverride
+   *  + block_on_outdated_branch + required status checks, NO bypass list (the
+   *  admin is locked out of the bypass entirely). */
+  beforeAll(async () => {
+    await d1().insert(protectedBranches).values([
+      {
+        repoId: gatedRepoId,
+        ruleName: "release",
+        priority: 1,
+        rules: serializeRuleConfig({
+          ...emptyRuleConfig(),
+          requiredApprovals: 1,
+          enableBypassAllowlist: true,
+          bypassAllowlistUserIds: [alice.id, bob.id],
+          blockAdminMergeOverride: true,
+        }),
+        createdAt: new Date(T0 * 1000),
+        updatedAt: new Date(T0 * 1000),
+      },
+      {
+        repoId: gatedRepoId,
+        ruleName: "lock",
+        priority: 2,
+        rules: serializeRuleConfig({
+          ...emptyRuleConfig(),
+          requiredApprovals: 1,
+          blockAdminMergeOverride: true,
+          enableStatusCheck: true,
+          statusCheckContexts: ["ci/gate", "ci/second"],
+          blockOnOutdatedBranch: true,
+        }),
+        createdAt: new Date(T0 * 1000),
+        updatedAt: new Date(T0 * 1000),
+      },
+    ]);
+    // The fixtures, in rule order:
+    //  release: alice+bob bypass the approvals shortfall (the allowlist prompt form).
+    await seedPr("bypassrelease", { title: "ci: release bypass", headBranch: "rel/a", baseBranch: "release" }, {}, gatedRepoId);
+    //  lock/outdated: commitsBehind>0 under block_on_outdated_branch, no sha
+    //  (the status block is skipped — only the outdated blocker answers).
+    await seedPr(
+      "outdated",
+      { title: "ci: outdated lock", headBranch: "lock/a", baseBranch: "lock" },
+      { commitsBehind: 5, headSha: null },
+      gatedRepoId,
+    );
+    //  lock/ci: a MATCHED required check FAILED (one of two contexts stored,
+    //  failing) — the matched-failure arm of MergeRequiredContextsCommitStatus
+    //  (services/pull/commit_status.go:26-68: a partial match never pending-
+    //  masks a failure).
+    await seedPr(
+      "lockci",
+      { title: "ci: lock failing check", headBranch: "lock/b", baseBranch: "lock" },
+      { headSha: "c".repeat(40) },
+      gatedRepoId,
+    );
+    await createCommitStatus(env.DB, {
+      repoId: gatedRepoId,
+      sha: "c".repeat(40),
+      state: "failure",
+      targetUrl: "",
+      description: "gate red",
+      context: "ci/gate",
+      creatorId: alice.id,
+    });
+    //  main/behind: commits_behind 5 under the MAIN rule (no
+    //  block_on_outdated_branch) — the outdated blocker must NOT fire.
+    await seedPr("behind", { title: "ci: behind unblocked", headBranch: "ci-behind" }, { commitsBehind: 5 }, gatedRepoId);
+    //  main/no-status: rule contexts exist, NO status rows — every context
+    //  lands missingRequired (status_items.tmpl's MissingRequiredChecks).
+    await seedPr("nostatus", { title: "ci: no statuses", headBranch: "ci-bare" }, { headSha: "d".repeat(40) }, gatedRepoId);
+    //  main/empty-sha: the headCommitID=="" early return — the whole status
+    //  block (and its blockers) never evaluate.
+    await seedPr("nulsha", { title: "ci: empty sha", headBranch: "ci-nulsha" }, { headSha: "" }, gatedRepoId);
+    //  main/closed: the closed early-return precedes the rule's evaluation.
+    await seedPr("gatedclosed", { title: "ci: closed on gated", headBranch: "ci-closed" }, {}, gatedRepoId);
+    await new IssuesService(env.DB).closeIssue(issueIds.gatedclosed!, { actorId: alice.id, now: new Date((T0 + 130) * 1000) });
+    //  plain-repo dirty arm: the conflictedFiles decode's tolerant halves.
+    await seedPr("badjson", { title: "fix: bad json conflicts", headBranch: "bad-json" }, { status: PRStatus.Conflict, conflictedFiles: "{not json" });
+    await seedPr(
+      "mixedjson",
+      { title: "fix: mixed json conflicts", headBranch: "mixed-json" },
+      { status: PRStatus.Conflict, conflictedFiles: '["kept.ts", 42, null]' },
+    );
+  });
+
+  it("flips the admin's bypass prompt to the allowlist form under BlockAdminMergeOverride", async () => {
+    // Alice owns the repo (access.admin) and sits on the bypass allowlist:
+    // canBypassProtection still answers true, but canBypassProtectionAsAdmin
+    // = isRepoAdmin && !BlockAdminMergeOverride = FALSE — the prompt takes
+    // the allowlist form, not the administrator form (issue_view.go:993).
+    const asAlice = await load("bypassrelease");
+    const alicePrompts = sectionOf(asAlice!, 1).map((item) => item.info);
+    expect(alicePrompts).toContain("You are allowed to bypass branch protection rules for this merge.");
+    expect(alicePrompts).not.toContain("As an administrator, you may still merge this pull request.");
+    // The shortfall itself still renders (granted 0 of required 1).
+    expect(sectionOf(asAlice!, 0).map((item) => item.info)).toContain(
+      "This pull request doesn't have enough required approvals yet. 0 of 1 official approvals granted.",
+    );
+    // Bob bypasses the same rule through the same list (no admin claim — the
+    // plain allowlist arm).
+    const asBob = await load("bypassrelease", bob);
+    expect(sectionOf(asBob!, 1).map((item) => item.info)).toContain(
+      "You are allowed to bypass branch protection rules for this merge.",
+    );
+  });
+
+  it("blocks the outdated branch only when the rule carries block_on_outdated_branch", async () => {
+    // Under the "lock" rule (block_on_outdated_branch: true) the stale head
+    // lands its own protection blocker…
+    const locked = await load("outdated");
+    const lockedInfos = sectionOf(locked!, 0).map((item) => item.info);
+    expect(lockedInfos).toContain("This pull request is blocked because it's outdated.");
+    // …and with the override set and no bypass list, alice gets NO prompt at
+    // all (canMergeNow folds — pull_merge_box.go:167's outer if).
+    expect(sectionOf(locked!, 1)).toEqual([]);
+    // The negative twin: the SAME divergence (commits_behind 5) under the
+    // "main" rule (no block_on_outdated_branch) stays unblocked-by-outdated —
+    // its blockers are the approvals pair only.
+    const behind = await load("behind");
+    expect(sectionOf(behind!, 0).map((item) => item.info)).not.toContain(
+      "This pull request is blocked because it's outdated.",
+    );
+    expect(sectionOf(behind!, 0).map((item) => item.info)).toContain(
+      "This pull request doesn't have enough required approvals yet. 0 of 2 official approvals granted.",
+    );
+  });
+
+  it("lands the outdated blocker WITHOUT the required-check pair when the head sha is empty", async () => {
+    // The empty headSha skips the whole status block (pull.go's
+    // headCommitID=="" early return), so enableStatusCheck stays false and
+    // the required-check blockers never evaluate — the rule's OTHER arms
+    // (outdated here) still answer.
+    const data = await load("outdated");
+    const infos = sectionOf(data!, 0).map((item) => item.info);
+    expect(infos).not.toContain("Required status checks did not pass");
+    expect(infos).not.toContain("Required status checks are missing or pending");
+    expect(data!.statusChecks).toBeNull();
+  });
+
+  it("projects the MATCHED-failure required check: failure prompt, blocker, missing twin, red icon", async () => {
+    // One of two contexts stored, failing: MergeRequiredContextsCommitStatus
+    // refuses to pending-mask the failure (the partial-match arm), so the
+    // prompt takes the failure form and the FAILED-context blocker lands
+    // (pull.go:487-493's error items), with ci/second riding missingRequired.
+    const data = await load("lockci");
+    const checks = data!.statusChecks!;
+    expect(checks.prompt).toBe("Some required checks failed");
+    expect(checks.items).toHaveLength(1);
+    expect(checks.items[0]).toMatchObject({ context: "ci/gate", state: "failure", required: true });
+    expect(checks.missingRequired).toEqual(["ci/second"]);
+    const infos = sectionOf(data!, 0).map((item) => item.info);
+    expect(infos).toContain("Required status checks did not pass");
+    expect(infos).not.toContain("Required status checks are missing or pending");
+    expect(data!.timelineIconClass).toBe("tw-text-red");
+    // Override set, no bypass list: the failing rule shows no bypass prompt.
+    expect(sectionOf(data!, 1)).toEqual([]);
+  });
+
+  it("renders the rule's full missing list when the head sha has no stored statuses", async () => {
+    const data = await load("nostatus");
+    const checks = data!.statusChecks!;
+    expect(checks.items).toEqual([]);
+    expect(checks.missingRequired).toEqual(["ci/build", "ci/deploy", "deploy/*"]);
+    expect(checks.prompt).toBe("Some checks are pending"); // empty statuses → pending
+    expect(sectionOf(data!, 0).map((item) => item.info)).toContain("Required status checks are missing or pending");
+    // The icon: no stored statuses → null combined state, and the icon walk
+    // consults the status states only when they exist — so the warning arm
+    // never fires and the hasBlockers red wins (mergeBoxIconClass's guard).
+    expect(data!.timelineIconClass).toBe("tw-text-red");
+  });
+
+  it("skips the status section entirely for an empty-string head sha under a status-checking rule", async () => {
+    const data = await load("nulsha");
+    expect(data!.statusChecks).toBeNull();
+    const infos = sectionOf(data!, 0).map((item) => item.info);
+    expect(infos).not.toContain("Required status checks did not pass");
+    expect(infos).not.toContain("Required status checks are missing or pending");
+    // The rule's approvals arm still evaluated (0 of 2 on the main rule).
+    expect(infos).toContain("This pull request doesn't have enough required approvals yet. 0 of 2 official approvals granted.");
+  });
+
+  it("the closed arm wins on a RULED repo: no status section, no blockers, no commands", async () => {
+    // prepareMergeBoxInfoItems' closed early-return precedes every blocker
+    // computation — even under the main rule (approvals + status checks) the
+    // closed box carries ONLY the ClosedInfo pair (issue_view.go:1071-1076).
+    const data = await load("gatedclosed");
+    expect(data!.closedInfo).toEqual({
+      title: "Pull request closed",
+      body: "Please reopen this pull request to perform a merge.",
+    });
+    expect(data!.statusChecks).toBeNull();
+    expect(data!.infoSections.filter((entries) => entries.length > 0)).toEqual([]);
+    expect(data!.commands).toBeNull();
+    expect(data!.timelineIconClass).toBe("tw-text-text-light");
+  });
+
+  it("degrades undecodable and non-string conflictedFiles lists to the no-listed-files arm", async () => {
+    // prepareMergeBoxInfoItems' conflicted branch over a garbage JSON blob:
+    // the tolerant decode yields [] → the locale's literal no-listed item
+    // (pull_merge_box.go:110).
+    const bad = await load("badjson");
+    const badBlockers = sectionOf(bad!, 0);
+    expect(badBlockers).toHaveLength(1);
+    expect(badBlockers[0]!.info).toBe("This pull request has changes conflicting with the target branch.");
+    expect(badBlockers[0]!.listItems).toEqual(["(No conflicting files listed)"]);
+    expect(bad!.timelineIconClass).toBe("tw-text-text-light");
+    // A decodable array drops the non-string entries (the typed filter).
+    const mixed = await load("mixedjson");
+    expect(sectionOf(mixed!, 0)[0]!.listItems).toEqual(["kept.ts"]);
+    expect(htmlConflictedList(pullMergeBoxFragmentHtml(await load("badjson")))).toBe("(No conflicting files listed)");
+  });
+});
+
+/** The single rendered conflict-detail <li> (the DOM half of the empty arm). */
+function htmlConflictedList(html: string): string {
+  const match = /<ul class="tw-pl-\[36px\]"><li>([^<]*)<\/li><\/ul>/.exec(html);
+  return match === null ? "" : match[1]!;
+}

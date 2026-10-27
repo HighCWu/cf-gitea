@@ -50,11 +50,17 @@
  *     default message, the custom summary/body assembly, the content-absent
  *     degenerate arm, and the unapplicable-patch re-render keeping the
  *     submitted content.
+ *   - (wave-129 matrix-4) the carried-form edges: the PATCH ghost-branch
+ *     twin (the submitted content kept), and the header-default message
+ *     fallbacks — an empty summary/body pair lands "Cherry-pick: {sha}" /
+ *     "Revert: {sha}" (editor_cherry_pick.go:50's locale headers).
  *
  * Rerun posture (the family's): fixed-name uploads re-apply as create-or-
  * update, patch targets are unique per run, the revert heals a previously
  * reverted main through the landed new-file arm before re-reverting, and
- * every write arm read-backs live engine state.
+ * every write arm read-backs live engine state; the matrix-4 header-default
+ * arms ride that posture (forward re-adds feature.txt on main, revert
+ * re-removes it).
  */
 
 import { env, SELF } from "cloudflare:test";
@@ -917,5 +923,89 @@ describe("patch POST (CRLF→LF, the default message, the failure arms)", () => 
     expect(html).toContain("patch does not apply"); // the APPLY_FAILURE_MESSAGE family
     expect(html).toContain(`${marker}.txt`); // the submitted content survives the re-render
     expect(await branchTip(engine, "main")).toBe(tipBefore); // nothing committed
+  });
+});
+
+// --- the carried-form edges (wave-129 matrix-4) -------------------------------------
+// The tails' commit-form edges the describes above do not take: the PATCH
+// ghost-branch twin (the cherrypick twin at the cherrypick-POST describe
+// carries its form; the patch twin must carry the submitted CONTENT), and
+// the header-default message fallbacks — an empty summary/body pair on
+// either tail falls to CherryPickPost's locale headers
+// (editor_cherry_pick.go:50: repo.commit.cherry-pick-header /
+// repo.commit.revert-header = "Cherry-pick: {sha}" / "Revert: {sha}", the
+// landed fallback in commitCherryPickFromForm). Rerun posture: the
+// revert-POST describe above always leaves main WITHOUT feature.txt (it
+// heals, then reverts), so the forward arm re-adds and the revert arm
+// re-removes — both apply cleanly on every run.
+
+describe("the carried-form edges (the patch ghost twin, the header-default fallbacks)", () => {
+  it("a ghost target branch on PATCH re-renders the ApiError text with the submitted content kept", async () => {
+    const { ownerCookie } = await ensureFixtures();
+    const engine = pickEngine();
+    const tipBefore = await branchTip(engine, "main");
+    const res = await fetchUi(
+      "/alice/edittailspick/patch/main",
+      withCookie(
+        formPost({
+          content: createPatch("ghost-target.txt", ["never applied"]),
+          commit_summary: "matrix patch ghost",
+          commit_message: "",
+          branch: "ghost",
+        }),
+        ownerCookie,
+      ),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("branch does not exist [name: ghost]"); // ErrBranchDoesNotExist's format
+    expect(html).toContain("never applied"); // the submitted content survives the re-render
+    expect(html).toContain('value="matrix patch ghost"');
+    expect(await branchTip(engine, "main")).toBe(tipBefore); // nothing committed
+  });
+
+  it("an empty summary/body cherry-pick lands the Cherry-pick header default", async () => {
+    const { ownerCookie, sha2 } = await ensureFixtures();
+    const engine = pickEngine();
+    const res = await fetchUi(
+      `/alice/edittailspick/cherrypick/${sha2}/main`,
+      withCookie(
+        formPost({
+          revert: "false",
+          commit_summary: "",
+          commit_message: "",
+          branch: "main",
+        }),
+        ownerCookie,
+      ),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/alice/edittailspick/src/branch/main");
+    expect(await blobText(engine, "main", "feature.txt")).toBe("feature\n");
+    expect((await lastMessageFor(engine, "main", "feature.txt")).trim()).toBe(`Cherry-pick: ${sha2}`);
+  });
+
+  it("an empty summary/body revert lands the Revert header default", async () => {
+    const { ownerCookie, sha2 } = await ensureFixtures();
+    const engine = pickEngine();
+    // The forward arm above re-added feature.txt; the reverse arm removes it
+    // again (converging every run onto the pre-existing posture).
+    expect(await blobOid(engine, "main", "feature.txt")).not.toBeNull();
+    const res = await fetchUi(
+      `/alice/edittailspick/cherrypick/${sha2}/main`,
+      withCookie(
+        formPost({
+          revert: "true",
+          commit_summary: "",
+          commit_message: "",
+          branch: "main",
+        }),
+        ownerCookie,
+      ),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/alice/edittailspick/src/branch/main");
+    expect(await blobOid(engine, "main", "feature.txt")).toBeNull();
+    expect((await lastMessageFor(engine, "main", "feature.txt")).trim()).toBe(`Revert: ${sha2}`);
   });
 });

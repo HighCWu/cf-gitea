@@ -53,12 +53,19 @@
  *     `{owner}/{repo}:{head}` fork forms stay engine-owned — wave-13 pins
  *     the parser nulls; this pins the mounted consequence (the 404 shells
  *     on GET and POST) so the documented divergence cannot silently flip.
+ *   - (wave-129 matrix-4) the cross-branch edges: the EMPTY-DIFF arm (a
+ *     head-behind-base pair folds the diff box — compare.tmpl:171's
+ *     `$showDiffBox` gate — while the landed comparable gate keeps the
+ *     writer form, the upstream nothingToCompare contrast disclosed), the
+ *     ELLIPSIS direction (base...head diffs the head side, pinned through
+ *     the sha pair's order + the hunk headers), and the across-fork colon
+ *     form staying engine-owned even with both repos and branches present.
  */
 
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { findPullRequestByIndex } from "../../api/services/pulls";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
@@ -70,6 +77,14 @@ import { parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import type { UiManifest } from "../manifest";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
+
+// wave-129 full-run contention budget: this file's beforeAll seeding (the
+// receive-flow w105* fixture family) measured a 4.51s hook share of the 30s
+// default IN a green 8-worker full run (the suite's 260-isolate spawn storm
+// spikes closures up to ~12x their solo time). File-local 90s budgets;
+// vitest.config.ts keeps 30s for every other file. Membership: the measured
+// >=4s in-run closure/hook set (full-suite junit run, 2026-10-27).
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 // --- the minted-session route harness (the branches.matrix pattern) --------------
 
@@ -435,6 +450,98 @@ describe("w105 ?page clamp (parsePageNumber on this route)", () => {
     expect(pagedHtml).not.toContain("w105: deep change</a>");
     expect(pagedHtml).toContain(`class="item navigation" href="/${OWNER}/w105cmp/compare/main...feature/deep"`);
     expect(pagedHtml).toContain(">Newer</span>");
+  });
+});
+
+// --- the cross-branch edges (wave-129 matrix-4) --------------------------------------
+// The range direction + empty-range arms over the deep pair (feature/deep is
+// TWO commits ahead of main, so its reverse is the empty range):
+//
+//   - the EMPTY-DIFF arm: a comparable pair whose head sits BEHIND the base
+//     (head == merge-base). Upstream folds the whole comparison into
+//     nothingToCompare at that shape (compare.go:397-405 — headCommitID ==
+//     ci.CompareBase, the merge base per services/git/compare.go:83-88) and
+//     the create form with it (compare.tmpl:173's not-IsNothingToCompare);
+//     OUR loader folds only at same tip, so the shared arm is the diff-box
+//     gate — compare.tmpl:171's `$showDiffBox := or .CommitCount
+//     .DiffShortStat.NumFiles` — while the writer form STAYS. This pins the
+//     landed shape (divergence disclosed, not hidden).
+//   - the ELLIPSIS direction: base...head diffs the HEAD side —
+//     readDiff(headTip, mergeBase) (the three-dot composition,
+//     prepareCompareDiff's BeforeCommitID = ci.CompareBase / AfterCommitID =
+//     headCommitID, compare.go:405-407) — pinned through the sha pair's
+//     order and the head-side file boxes.
+//   - the ACROSS-FORK colon form: `{owner}/{repo}:{ref}` sides stay
+//     unclaimed even when both repos and branches exist (w105cmp and the
+//     public w105ghost carry IDENTICAL branch universes — a 404 here is
+//     structural, not fixture-missing).
+
+describe("w105 cross-branch edges (the empty range, the direction, the fork form)", () => {
+  it("the empty-diff arm: a head-behind-base pair folds the diff box but keeps the writer form", async () => {
+    // feature/deep...main: the merge base IS main's tip and the head adds
+    // nothing — the range read is empty and the diff is base-vs-itself.
+    const res = await get(`/${OWNER}/w105cmp/compare/feature/deep...main`, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The state arms stay silent (comparable — NOT the nothing message).
+    expect(html).not.toContain("There are no differences to show");
+    // The diff box folds: no commits table, no file boxes, no stats.
+    expect(html).not.toContain('id="diff-file-boxes"');
+    expect(html).not.toContain('class="ui top attached header flex-left-right"');
+    expect(html).not.toContain("changed files");
+    // The writer form survives the empty range (the landed comparable gate
+    // folds only at same tip — the disclosed upstream divergence above).
+    expect(html).toContain(`action="/${OWNER}/w105cmp/compare/feature/deep...main" method="post"`);
+    expect(html).toContain("New Pull Request");
+  });
+
+  it("the ellipsis direction: base...head shows the HEAD side's commits and additions", async () => {
+    const mainTip = w105Tips[MAIN_TIP];
+    const deepTip = w105Tips[DEEP_TIP];
+    if (mainTip === undefined || deepTip === undefined) throw new Error("w105 seed: tips missing");
+    const res = await get(`/${OWNER}/w105cmp/compare/main...feature/deep`, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The header's sha pair runs base (main) → separator → head (deep): the
+    // main-tip link exists ONLY in that pair. The choose-branch segment
+    // carries its own separator earlier in the page, so the separator
+    // ORDER is asserted from the base link onward (the commits-table pair).
+    const baseAt = html.indexOf(`href="/${OWNER}/w105cmp/commit/${mainTip}"`);
+    const separatorAt = html.indexOf('<div class="compare-separator">...</div>', baseAt);
+    const headAt = html.indexOf(`href="/${OWNER}/w105cmp/commit/${deepTip}"`);
+    expect(baseAt).toBeGreaterThanOrEqual(0);
+    expect(baseAt).toBeLessThan(separatorAt);
+    expect(separatorAt).toBeLessThan(headAt);
+    // The range's file boxes are the HEAD side's delta going base→head:
+    // f1.txt (on base, not on head) DELETES with the -1,1 +0,0 hunk; f3.txt
+    // ADDS with the -0,0 +1,1 hunk. An inverted (base-side) diff would carry
+    // the mirrored hunks.
+    expect(html).toContain('data-new-filename="f3.txt"');
+    expect(html).toContain('data-old-filename="f1.txt"');
+    expect(html).toContain("<code class=\"code-inner\">@@ -1,1 +0,0 @@</code>");
+    expect(html).toContain("<code class=\"code-inner\">@@ -0,0 +1,1 @@</code>");
+    expect(html).toContain("1 additions");
+    expect(html).toContain("1 deletions");
+    expect(html).toContain("2 changed files");
+    // The switch link carries the reversed pair (the emitted URL re-parses
+    // to the swapped comparison — compareLink's invariant).
+    expect(html).toContain(`href="/${OWNER}/w105cmp/compare/feature/deep...main"`);
+    expect(html).toContain("Switch head and base");
+    expect(html).not.toContain("View Pull Request"); // no PR on this pair
+  });
+
+  it("the across-fork colon form stays engine-owned even with both repos and branches present", async () => {
+    // w105ghost is public and carries the SAME branch universe — the colon
+    // side cannot fall back to "the fixture does not exist": the parse
+    // nulls the fork form (wave-13's claim), the router hands the tail to
+    // the engine, and the engine answers its plain-text 404 (never a UI
+    // render).
+    const headSide = await get(`/${OWNER}/w105cmp/compare/main...${OWNER}/w105ghost:feature/docs`);
+    expect(headSide.status).toBe(404);
+    expect(await headSide.text()).toContain("404 Not Found");
+    const baseSide = await get(`/${OWNER}/w105cmp/compare/${OWNER}/w105ghost:main...feature/docs`);
+    expect(baseSide.status).toBe(404);
+    expect(await baseSide.text()).toContain("404 Not Found");
   });
 });
 
