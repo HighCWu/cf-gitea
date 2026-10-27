@@ -94,7 +94,6 @@ import {
   scopeForbidden,
 } from "./respond";
 import { findRepositoryById, type RepositoryRow } from "../api/services/repository";
-import { isUserBlockedBy } from "../api/services/blocks";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
 import {
@@ -110,6 +109,7 @@ import {
   type ProtectedBranchRow,
 } from "../services/branch-protection";
 import { isTagControlAllowed, listProtectedTags } from "../services/tag-protection";
+import { OrgService } from "../services/orgs/orgs";
 import { handleLfsGateBranch, parseLfsRoute } from "../lfs/router";
 import { repoCounters, repoUnits, repositories, users } from "../db/schema";
 import { deleteRepositoryViaEngineShape } from "../repos/purge";
@@ -246,33 +246,23 @@ export async function gitHttpGate(
     });
   }
 
-  // The blocked-pusher arm (routers/private/hook_proc_receive.go:35, fed by
-  // NewPullRequest's `IsUserBlockedBy(issue.Poster, repo.OwnerID)`,
-  // services/pull/pull.go:64-65): upstream surfaces the ErrBlockedUser
-  // through the private hook API as
-  // `PrivateUserErrorf(http.StatusUnauthorized, "Cannot create pull request
-  // because you are blocked by the repository owner.")` — the UserMsg the
-  // hook prints to the git client, i.e. the decline TEXT is the git-protocol
-  // error surface. cf-gitea has no agit proc-receive flow (upstream reaches
-  // this arm only on push-to-propose `refs/for/*` pushes); the receive-pack
-  // RPC is the single push seam, so the arm guards it wholesale — a pusher
-  // blocked by the repo owner is declined before the engine sees the pack.
-  // The status is the API family's permission-denied 403 (the private
-  // endpoint's 401 is the internal hook carrier, not a client-facing git
-  // status; 403 also avoids the credential re-prompt a 401 triggers in git
-  // clients) — the same plain-text style as the mirror arm above. The
-  // isUserBlockedBy site-admin short-circuit is upstream's
-  // `blockee.IsAdmin`.
+  // Upstream parity (SPEC-0003 §2.4 — the blocked-pusher relation is NOT a
+  // receive-pack gate): the blocked decline lives ONLY in upstream's agit
+  // proc-receive hook (routers/private/hook_proc_receive.go:29-39), reached
+  // solely by push-to-propose `refs/for/*` pushes — `hook_pre_receive` has
+  // no blocked check at all, so a blocked user holding a write grant pushes
+  // directly with parity. cf-gitea has no agit flow, so this seam used to
+  // decline EVERY receive-pack from a user blocked by the repo owner —
+  // narrower than upstream, not a defense (the stale-grant state it guarded
+  // is reachable upstream too, and upstream still lets the direct push
+  // through). Removed to parity: direct receives are untouched by the block
+  // relation. When agit lands (the SPEC-0005 push-to-propose surface), the
+  // decline comes back at THAT seam — the proc-receive validator this gate
+  // forwards — surfacing upstream's exact hook UserMsg ("Cannot create pull
+  // request because you are blocked by the repository owner."), not as a
+  // wholesale receive-pack guard.
   const isPush = route.kind === "receive-pack";
   const pusher = isPush ? await resolvePushPusher(env, req) : undefined;
-  if (isPush && pusher != null && resolved.repo.ownerId !== null) {
-    if (await isPusherBlockedByOwner(env, pusher.id, resolved.repo.ownerId)) {
-      return new Response("Cannot create pull request because you are blocked by the repository owner.\n", {
-        status: 403,
-        headers: { "content-type": "text/plain; charset=utf-8" },
-      });
-    }
-  }
 
   // §2.1 item 5: invoke the engine and stream its response. The engine hook
   // sees the gate-cleared mark and waves the request through. Receive-pack
@@ -420,24 +410,41 @@ async function handleUnknownRepository(
   if (verified.user.status === "prohibited") return accountDisabled();
 
   // Upstream ordering quirk (§2.4 note): the enable-flag checks run BEFORE
-  // the dummy advertisement. cf-gitea defaults user push-create ON (§2.4
-  // documented divergence — a headless forge's primary create path) and org
-  // push-create awaits SPEC-0007, so the upstream "Push to create is not
-  // enabled …" 403s (rows 18/20) have no live branch: the probe serves the
-  // dummy empty advertisement (§2.2) and POST decides.
+  // the dummy advertisement. cf-gitea defaults user push-create ON and org
+  // push-create ON for holders of the org repo-create grant (§2.4 documented
+  // divergence — a headless forge's primary create path), so the upstream
+  // "Push to create is not enabled …" 403s (rows 18/20) have no live branch:
+  // the probe serves the dummy empty advertisement (§2.2) and POST decides.
   if (probe) return dummyAdvertisement();
 
-  // POST-time create. Own namespace by default; another namespace is site
-  // admin only (upstream PushCreateRepo, services/repository/repository.go:
-  // 87-96) and only when that owner exists and is active — everything else
-  // 404s (rows 16/20; the org-grant allow branch of row 19 lands with
-  // SPEC-0007 orgs).
+  // POST-time create, the PushCreateRepo decision (services/repository/
+  // repository.go:83-108). Own namespace by default (row 17). Another
+  // namespace is either the site-admin bypass (upstream skips the ownership
+  // check for IsAdmin — row 19's admin arm, into an existing ACTIVE user's
+  // namespace) or the row-19 org-grant branch (upstream's
+  // `owner.IsOrganization()` arm, repository.go:88-93): a non-admin pusher
+  // holding the org repo-create grant — org_members role='owner' or a
+  // can_create_org_repo / authorize='owner' team, via
+  // OrgService.canCreateOrgRepo, the same predicate POST /orgs/{org}/repos
+  // guards with — creates into that ORG's namespace. Everything else 404s
+  // (rows 16/20: upstream maps every PushCreateRepo error to the bare 404,
+  // githttp.go:235-240).
   let owner = { id: verified.user.id, usernameLower: verified.user.usernameLower };
   if (ownerLower !== owner.usernameLower) {
-    if (!verified.user.isAdmin) return repositoryNotFound();
-    const ownerUser = await userByUsernameLower(env.DB, ownerLower);
-    if (ownerUser === null || ownerUser.status !== "active") return repositoryNotFound();
-    owner = { id: ownerUser.id, usernameLower: ownerUser.usernameLower };
+    if (verified.user.isAdmin) {
+      const ownerUser = await userByUsernameLower(env.DB, ownerLower);
+      if (ownerUser === null || ownerUser.status !== "active") return repositoryNotFound();
+      owner = { id: ownerUser.id, usernameLower: ownerUser.usernameLower };
+    } else {
+      // §4.11: getOrgByUsername reads a plain user (or a miss) as null —
+      // the "cannot push-create repository for another user" 404 of row 16.
+      const orgs = new OrgService(env.DB);
+      const org = await orgs.getOrgByUsername(ownerLower);
+      if (org === null || !(await orgs.canCreateOrgRepo(org.id, verified.user.id))) {
+        return repositoryNotFound();
+      }
+      owner = { id: org.id, usernameLower: org.usernameLower };
+    }
   }
 
   const service = new RepoService(env.DB, { registry: env.REGISTRY.getByName("registry"), queue: env.REPO_TASKS });
@@ -448,30 +455,42 @@ async function handleUnknownRepository(
     // push-created repos default private (upstream DefaultPushCreatePrivate).
     created = await service.create({ owner, name: route.repo, isPrivate: true, status: "creating" });
   } catch (error) {
-    if (!(error instanceof RepoNameCollisionError)) throw error;
-    // §4.1 concurrent create-by-push: the UNIQUE(owner, slug) insert decided;
-    // the loser re-reads and proceeds with a normal receive against the
-    // now-existing repo (its commands are zero-id creates; the DO lease
-    // serializes the two finalizes).
-    const raced = await resolveRepository(env.DB, ownerLower, repoLower);
-    if (raced === null) return repositoryNotFound();
-    const decision = await authorizeGitHttp({
-      req,
-      env,
-      waitUntil: (p) => ctx.waitUntil(p),
-      op: "write",
-      repo: raced.repo,
-      owner: raced.owner,
-      ownerVisibility: raced.ownerVisibility,
-      unitAnonymousRead: false,
-    });
-    if (decision !== true) return decision;
-    // §2.5.2 finalize handshake (scheduled AFTER the response below — the
-    // async settle body starts at call time, so scheduling it before the
-    // forward would race the receive's finalize with an empty-DO listRefs).
-    const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified), protectedBranchValidator(env, raced.repo));
-    ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`));
-    return response;
+    if (error instanceof RepoNameCollisionError) {
+      // §4.1 concurrent create-by-push: the UNIQUE(owner, slug) insert decided;
+      // the loser re-reads and proceeds with a normal receive against the
+      // now-existing repo (its commands are zero-id creates; the DO lease
+      // serializes the two finalizes).
+      const raced = await resolveRepository(env.DB, ownerLower, repoLower);
+      if (raced === null) return repositoryNotFound();
+      const decision = await authorizeGitHttp({
+        req,
+        env,
+        waitUntil: (p) => ctx.waitUntil(p),
+        op: "write",
+        repo: raced.repo,
+        owner: raced.owner,
+        ownerVisibility: raced.ownerVisibility,
+        unitAnonymousRead: false,
+      });
+      if (decision !== true) return decision;
+      // §2.5.2 finalize handshake (scheduled AFTER the response below — the
+      // async settle body starts at call time, so scheduling it before the
+      // forward would race the receive's finalize with an empty-DO listRefs).
+      const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified), protectedBranchValidator(env, raced.repo));
+      ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`));
+      return response;
+    }
+    // Upstream masks EVERY PushCreateRepo error as a bare 404 (githttp.go:
+    // 235-240 — "TODO: need to refactor PushCreateRepo and its returned
+    // errors"): the git surface carries no error taxonomy. The live member
+    // of that family beyond the collision above is the routeable-but-unusable
+    // name (`a..b` passes the gate's alphabet pre-filter, fails
+    // isUsableRepoName → RepoNameInvalidError): logged for observability and
+    // answered with the masked 404 — never an uncaught 500.
+    console.error(
+      `[push-create] ${ownerLower}/${route.repo}: create failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return repositoryNotFound();
   }
 
   // The dummy advertisement bypassed the engine, so this POST is the repo
@@ -690,26 +709,6 @@ async function resolvePushPusher(env: Env, req: Request): Promise<PusherIdentity
   if (credential === null) return null;
   const verified = await new TokenService(env.DB).verify(credential).catch(() => null);
   return verified === null ? null : verifiedPusher(verified);
-}
-
-/**
- * The blocked-pusher probe behind the receive-pack decline (hook_proc_receive
- * .go:35): re-reads the pusher row for `is_admin` — the PusherIdentity
- * carries no admin flag, the same re-read evaluateBranchProtection does —
- * then runs IsUserBlockedBy(pusher, ownerId). A pusher whose user row
- * vanished between the token verify and this read evaluates as non-admin
- * (the branch-protection convention).
- */
-async function isPusherBlockedByOwner(env: Env, pusherId: number, ownerId: number): Promise<boolean> {
-  const row = (
-    await drizzle(env.DB)
-      .select({ isAdmin: users.isAdmin })
-      .from(users)
-      .where(eq(users.id, pusherId))
-      .limit(1)
-      .all()
-  )[0];
-  return isUserBlockedBy(env.DB, { id: pusherId, isAdmin: row?.isAdmin ?? false }, ownerId);
 }
 
 /** Gate-cleared engine invocation (the shared §2.1 item 5 tail). `storageKey`

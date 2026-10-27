@@ -11,10 +11,14 @@
  *                             (status='creating' → settle) then receive
  *   18 push-create disabled → no live branch: cf-gitea defaults user
  *                             push-create ON (§2.4 divergence)
- *   19 org grant            → orgs land in SPEC-0007; site admin into an
- *                             existing user's namespace is the upstream
- *                             PushCreateRepo admin branch
- *   20 org without grant    → 404 (the row's 404 branch; no orgs exist yet)
+ *   19 org grant            → org-namespace create for holders of the org
+ *                             repo-create grant (OrgService.canCreateOrgRepo:
+ *                             role='owner' membership or a can_create_org_repo
+ *                             team); site admin into an existing user's
+ *                             namespace is the upstream PushCreateRepo admin
+ *                             branch
+ *   20 org without grant    → 404 (upstream maps EVERY PushCreateRepo error
+ *                             to the bare 404, githttp.go:235-240)
  */
 
 import { SELF, env } from "cloudflare:test";
@@ -24,6 +28,8 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { settleCreatingRepo } from "../git-http/gate";
+import { TeamsService } from "../api/routes/org-teams";
+import { OrgService } from "../services/orgs/orgs";
 import { repositories, repoCounters } from "../db/schema";
 import { RepoService } from "./service";
 import { buildPack, buildReceivePackBody } from "./testing/git-pack";
@@ -164,6 +170,21 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
       auth: (t) => basicTokenHeader(t.admin),
       expectStatus: 200,
       expectRow: { owner: "bob", slug: "admin-made" },
+    },
+    // Upstream masks EVERY PushCreateRepo error as a bare 404 (githttp.go:
+    // 235-240 — "TODO: need to refactor PushCreateRepo and its returned
+    // errors"). A routeable-but-unusable name passes the gate's alphabet
+    // pre-filter (parse.ts REPO_NAME) but fails isUsableRepoName (no
+    // consecutive dots) — RepoNameInvalidError used to escape this seam as
+    // an uncaught 500; it now joins the masked-404 family beside the
+    // collision arm above.
+    {
+      label: "masked 404: POST of a routeable-but-invalid name (a..b) is not a 500",
+      path: "alice/a..b",
+      kind: "post",
+      auth: (t) => basicTokenHeader(t.alice),
+      expectStatus: 404,
+      expectBody: "Repository not found",
     },
   ];
 
@@ -378,7 +399,7 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
 
   it("row 18/20: the 'push to create is not enabled' 403s have no live branch (documented divergence)", async () => {
     // cf-gitea defaults user push-create ON (SPEC-0003 §2.4 divergence) and
-    // org push-create arrives with SPEC-0007 — asserted here as documentation:
+    // org push-create ON for grant holders — asserted here as documentation:
     // an authenticated own-namespace probe never 403s.
     const alice = await seedVerifiedUser({ username: "Alice" });
     const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
@@ -387,6 +408,68 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
       { headers: { authorization: basicTokenHeader(token) } },
     );
     expect(response.status).toBe(200);
+  });
+
+  it("row 19: an org member holding the repo-create grant push-creates into the org's namespace", async () => {
+    const owner = await seedVerifiedUser({ username: "OrgOwner" });
+    const member = await seedVerifiedUser({ username: "OrgScribe" });
+    const orgs = new OrgService(env.DB);
+    const teams = new TeamsService(env.DB);
+    const org = await orgs.createOrg({ name: "acme", ownerId: owner.id });
+    // The §3.4 tier-2 grant arm: a can_create_org_repo team; addTeamMember
+    // adds the org membership (role='member') alongside the team row.
+    const creators = await teams.createTeam(org, { name: "creators", permission: "read", can_create_org_repo: true });
+    await teams.addTeamMember(creators, member.id);
+    expect(await orgs.canCreateOrgRepo(org.id, member.id)).toBe(true);
+
+    const token = (await mintFor(member.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const response = await SELF.fetch("https://example.com/acme/fresh.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/trunk", oid }], pack),
+    });
+    expect(response.status).toBe(200);
+
+    // The row lands under the ORG (owner namespace 'acme', ownerId = the org
+    // row), private by DefaultPushCreatePrivate; §2.5.2 settle runs on the
+    // runner here (production: ctx.waitUntil), and re-running it is
+    // idempotent — both timing windows settle the row.
+    const service = new RepoService(env.DB);
+    const creating = await service.getBySlug("acme", "fresh");
+    expect(creating).not.toBeNull();
+    expect(creating?.ownerId).toBe(org.id);
+    if (creating) await settleCreatingRepo(env, creating.id, "acme/fresh");
+    const settled = await service.getBySlug("acme", "fresh");
+    expect(settled?.ownerNamespace).toBe("acme");
+    expect(settled?.ownerId).toBe(org.id);
+    expect(settled?.status).toBe("ready");
+    expect(settled?.isEmpty).toBe(false);
+    expect(settled?.defaultBranch).toBe("trunk"); // first-push adoption
+    expect(settled?.visibility).toBe("private");
+    expect(await drizzle(env.DB).select().from(repoCounters).all()).toHaveLength(1);
+  });
+
+  it("row 20: an org member WITHOUT the repo-create grant POSTing into the org's namespace 404s (no row)", async () => {
+    const owner = await seedVerifiedUser({ username: "OrgOwner" });
+    const member = await seedVerifiedUser({ username: "OrgReader" });
+    const orgs = new OrgService(env.DB);
+    const org = await orgs.createOrg({ name: "acme", ownerId: owner.id });
+    await orgs.addMember(org.id, member.id, { role: "member" });
+    expect(await orgs.canCreateOrgRepo(org.id, member.id)).toBe(false);
+
+    const token = (await mintFor(member.id, "w", "write:repository")).plaintext;
+    const response = await SELF.fetch("https://example.com/acme/nope.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: "0000",
+    });
+    // Upstream's masked shape (githttp.go:235-240): plain "Repository not
+    // found", no challenge — and nothing created.
+    expect(response.status).toBe(404);
+    expect(new TextDecoder().decode(await response.arrayBuffer())).toBe("Repository not found");
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    expect(await new RepoService(env.DB).getBySlug("acme", "nope")).toBeNull();
   });
 
   it("§4.1: a push-create racing an existing row re-reads and receives normally (unique-violation loser)", async () => {

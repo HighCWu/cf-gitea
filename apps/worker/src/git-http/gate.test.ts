@@ -861,15 +861,21 @@ describe("team grants decide the git-HTTP matrix (SPEC-0007 §3.5 via authorizeG
 });
 
 // ---------------------------------------------------------------------------
-// The receive-pack blocked-pusher arm (the blocks-enforcement sweep —
-// routers/private/hook_proc_receive.go:35, fed by NewPullRequest's
-// `IsUserBlockedBy(issue.Poster, repo.OwnerID)`, services/pull/pull.go:64-65;
-// the decline TEXT is upstream's exact hook UserMsg)
+// The blocked-pusher relation over git-HTTP (upstream parity posture):
+// upstream's blocked decline is agit-ONLY — it lives in the private
+// proc-receive hook (routers/private/hook_proc_receive.go:29-39, surfacing
+// ErrBlockedUser as the "Cannot create pull request …" UserMsg) and is
+// reached solely by push-to-propose `refs/for/*` pushes; hook_pre_receive
+// has NO blocked check, so a blocked user holding a write grant pushes
+// directly. cf-gitea has no agit flow, so receive-pack carries no blocked
+// decline either (the wholesale 403 this seam used to answer was narrower
+// than upstream — wrongly pinned, removed; when the SPEC-0005 agit surface
+// lands, the decline reappears at THAT seam with upstream's exact text).
 // ---------------------------------------------------------------------------
 
-describe("the receive-pack blocked-pusher arm", () => {
+describe("the blocked-pusher relation does not gate receive-pack (upstream parity)", () => {
   // A nested wipe — the shared beforeEach above owns the other tables, and
-  // the fixtures above mint pushes that the arm must not see stale rows for.
+  // the fixtures above mint pushes that the arms must not see stale rows for.
   beforeEach(async () => {
     await env.DB.prepare("DELETE FROM user_blocking").run();
   });
@@ -890,14 +896,15 @@ describe("the receive-pack blocked-pusher arm", () => {
     return { orgId: org.id, writerId: writer.id };
   }
 
-  it("declines an authorized pusher blocked by the repo owner with upstream's hook decline text", async () => {
+  it("a pusher blocked by the repo owner WITH a write grant pushes fine (upstream's hook_pre_receive has no blocked check)", async () => {
     const fx = await seedTeamGrantFixture();
     const { orgId, writerId } = await orgAndWriter();
-    // The defense window the arm exists for: upstream's own BlockUser
+    // The raw blocking row is the stale-grant state: upstream's own BlockUser
     // cascade removes collaborations but NOT org team grants, and its
-    // CanBlockUser refuses an org blocking a CURRENT member — the raw row
-    // here is the stale-grant state the gate probe guards (upstream reaches
-    // the same decline through the agit proc-receive hook). Seeded raw.
+    // CanBlockUser refuses an org blocking a CURRENT member — and upstream
+    // still lets the direct push through (only the agit proc-receive hook
+    // consults IsUserBlockedBy, hook_proc_receive.go:29-39). Seeded raw; the
+    // receive must succeed at parity.
     await drizzle(env.DB).insert(userBlocking).values({ blockerId: orgId, blockeeId: writerId, note: "", createdAt: new Date() });
 
     const { oid, pack } = await buildPack();
@@ -909,13 +916,18 @@ describe("the receive-pack blocked-pusher arm", () => {
       },
       body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
     });
-    expect(push.status).toBe(403);
-    expect(new TextDecoder().decode(await push.arrayBuffer())).toBe(
-      "Cannot create pull request because you are blocked by the repository owner.\n",
-    );
+    expect(push.status).toBe(200);
+
+    // The success is honest: the pushed ref reads back through the advert
+    // (the engine commits refs before its response returns).
+    const advert = await SELF.fetch("https://example.com/acme/vault.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(fx.tokens.writerWrite) },
+    });
+    expect(advert.status).toBe(200);
+    expect(new TextDecoder().decode(await advert.arrayBuffer())).toContain(oid);
   });
 
-  it("leaves the push ADVERT and reads untouched (upstream's hook runs at RPC time)", async () => {
+  it("the blocking row leaves the push ADVERT and reads untouched", async () => {
     const fx = await seedTeamGrantFixture();
     const { orgId, writerId } = await orgAndWriter();
     await drizzle(env.DB).insert(userBlocking).values({ blockerId: orgId, blockeeId: writerId, note: "", createdAt: new Date() });
@@ -931,7 +943,7 @@ describe("the receive-pack blocked-pusher arm", () => {
     expect(clone.status).toBe(200);
   });
 
-  it("pushes once the blocking row is gone (the arm lifts with the block)", async () => {
+  it("pushes with no blocking row present (the parity baseline)", async () => {
     const fx = await seedTeamGrantFixture();
     const { oid, pack } = await buildPack();
     const push = await SELF.fetch("https://example.com/acme/vault.git/git-receive-pack", {
