@@ -54,12 +54,16 @@
  *     the parser nulls; this pins the mounted consequence (the 404 shells
  *     on GET and POST) so the documented divergence cannot silently flip.
  *   - (wave-129 matrix-4) the cross-branch edges: the EMPTY-DIFF arm (a
- *     head-behind-base pair folds the diff box — compare.tmpl:171's
- *     `$showDiffBox` gate — while the landed comparable gate keeps the
- *     writer form, the upstream nothingToCompare contrast disclosed), the
- *     ELLIPSIS direction (base...head diffs the head side, pinned through
- *     the sha pair's order + the hunk headers), and the across-fork colon
- *     form staying engine-owned even with both repos and branches present.
+ *     head-at-merge-base pair folds into upstream's nothingToCompare state —
+ *     compare.go:397-405 headCommitID == ci.CompareBase — the segment plus
+ *     the folded diff box rendering, the create form surviving through the
+ *     AllowEmptyPr gate (compare.tmpl:173) with the same-ref control arm
+ *     folding it; the ORIGINALLY pinned landed shape folded only at same-tip
+ *     and rendered the bare empty diff beside the live form — the divergence
+ *     this arm's flip ported), the ELLIPSIS direction (base...head diffs the
+ *     head side, pinned through the sha pair's order + the hunk headers),
+ *     and the across-fork colon form staying engine-owned even with both
+ *     repos and branches present.
  */
 
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
@@ -454,18 +458,25 @@ describe("w105 ?page clamp (parsePageNumber on this route)", () => {
 });
 
 // --- the cross-branch edges (wave-129 matrix-4) --------------------------------------
-// The range direction + empty-range arms over the deep pair (feature/deep is
-// TWO commits ahead of main, so its reverse is the empty range):
+// The range direction + the nothingToCompare fold over the deep pair
+// (feature/deep is TWO commits ahead of main, so its reverse is the fold
+// shape):
 //
-//   - the EMPTY-DIFF arm: a comparable pair whose head sits BEHIND the base
-//     (head == merge-base). Upstream folds the whole comparison into
-//     nothingToCompare at that shape (compare.go:397-405 — headCommitID ==
-//     ci.CompareBase, the merge base per services/git/compare.go:83-88) and
-//     the create form with it (compare.tmpl:173's not-IsNothingToCompare);
-//     OUR loader folds only at same tip, so the shared arm is the diff-box
-//     gate — compare.tmpl:171's `$showDiffBox := or .CommitCount
-//     .DiffShortStat.NumFiles` — while the writer form STAYS. This pins the
-//     landed shape (divergence disclosed, not hidden).
+//   - the EMPTY-DIFF arm (FIX-provenance): a pair whose head sits BEHIND the
+//     base (head == merge-base) folds the whole comparison into upstream's
+//     nothingToCompare state (compare.go:397-405 — headCommitID ==
+//     ci.CompareBase, the merge base per services/git/compare.go:83-88; the
+//     equal-tips case subsumes — the merge-base of equal tips is that tip):
+//     the segment renders (the and_allow_empty_pr text — AllowEmptyPr holds:
+//     supportEmptyPr = !AutodetectManualMerge is unlanded config → true,
+//     acrossRepoPr = !IsSameRef → the resolved names differ) and the diff
+//     box stays folded (compare.tmpl:171's `$showDiffBox`), while the
+//     create form SURVIVES through the AllowEmptyPr gate (compare.tmpl:173's
+//     `or $.AllowEmptyPr`). The same-ref CONTROL (main...main — IsSameRef
+//     holds) keeps the plain text and folds the form. The ORIGINALLY pinned
+//     landed shape folded only at same tip and rendered the bare empty diff
+//     beside the live form with no segment — the divergence this flip
+//     ported.
 //   - the ELLIPSIS direction: base...head diffs the HEAD side —
 //     readDiff(headTip, mergeBase) (the three-dot composition,
 //     prepareCompareDiff's BeforeCommitID = ci.CompareBase / AfterCommitID =
@@ -477,22 +488,51 @@ describe("w105 ?page clamp (parsePageNumber on this route)", () => {
 //     structural, not fixture-missing).
 
 describe("w105 cross-branch edges (the empty range, the direction, the fork form)", () => {
-  it("the empty-diff arm: a head-behind-base pair folds the diff box but keeps the writer form", async () => {
+  it("the empty-diff arm: a head-at-merge-base pair folds into the nothing segment, the form surviving via AllowEmptyPr", async () => {
     // feature/deep...main: the merge base IS main's tip and the head adds
-    // nothing — the range read is empty and the diff is base-vs-itself.
+    // nothing — upstream's nothingToCompare fold (compare.go:397-405,
+    // headCommitID == ci.CompareBase), ported at wave-129 (the originally
+    // pinned landed shape folded only at same tip and rendered the bare
+    // empty diff beside the live form with no segment — the disclosed
+    // divergence above).
     const res = await get(`/${OWNER}/w105cmp/compare/feature/deep...main`, OWNER);
     expect(res.status).toBe(200);
     const html = await res.text();
-    // The state arms stay silent (comparable — NOT the nothing message).
+    // The pull-flavored head stays: upstream's allowCreatePull folds only at
+    // CompareBase == "" (compare.go:305-306) and ours adds only the
+    // equal-tips case (wave-13 pins that shape code-flavored).
+    expect(html).toContain("Comparing changes");
+    // The nothing segment renders — the AllowEmptyPr arm's text: the
+    // resolved ref names differ, so acrossRepoPr holds (supportEmptyPr rides
+    // the unlanded autodetect-manual-merge config as true).
+    expect(html).toContain("These branches are equal. This PR will be empty.");
     expect(html).not.toContain("There are no differences to show");
     // The diff box folds: no commits table, no file boxes, no stats.
     expect(html).not.toContain('id="diff-file-boxes"');
     expect(html).not.toContain('class="ui top attached header flex-left-right"');
     expect(html).not.toContain("changed files");
-    // The writer form survives the empty range (the landed comparable gate
-    // folds only at same tip — the disclosed upstream divergence above).
+    // The writer form survives the fold through AllowEmptyPr (compare.tmpl:
+    // 173's `or $.AllowEmptyPr` — upstream renders the form on this shape
+    // exactly when AllowEmptyPr holds).
     expect(html).toContain(`action="/${OWNER}/w105cmp/compare/feature/deep...main" method="post"`);
     expect(html).toContain("New Pull Request");
+  });
+
+  it("the AllowEmptyPr same-ref control: main...main keeps the plain text and folds the form", async () => {
+    // IsSameRef (services/git/compare.go:41-43 — same repository AND the
+    // same resolved ref) folds acrossRepoPr, so AllowEmptyPr is false and
+    // compare.tmpl:173's or-arm fails: the plain nothing_to_compare text,
+    // NO form. (The default-fallback arm above drives this shape through the
+    // parser's empty-head default; this pins it spelled out as the
+    // AllowEmptyPr-false half of the fold.)
+    const res = await get(`/${OWNER}/w105cmp/compare/main...main`, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("There are no differences to show. There is no need to create a pull request.");
+    expect(html).not.toContain("These branches are equal");
+    expect(html).not.toContain('id="new-issue"');
+    expect(html).not.toContain("New Pull Request");
+    expect(html).not.toContain('id="diff-file-boxes"');
   });
 
   it("the ellipsis direction: base...head shows the HEAD side's commits and additions", async () => {

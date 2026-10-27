@@ -39,9 +39,22 @@
  *     (`repo.pulls.nothing_to_compare*`), no commits table, no diff; the POST
  *     refuses with upstream's no_common_history message (the API create
  *     route's parseCompareInfo arm).
- *   - base tip === head tip → same tip: the same segment, creation blocked
- *     (upstream AllowEmptyPr is across-repo-only — compare.go:452-456 — and
- *     same-repo empty PRs are refused).
+ *   - head tip === merge base → the nothing-to-compare fold (upstream
+ *     compare.go:397-405 headCommitID == ci.CompareBase — the head is
+ *     already on the base, nothing to bring; same-tip is subsumed — the
+ *     merge-base of equal tips is that tip, the engine graph's
+ *     `oa === ob` fast path): the same segment (compare.tmpl:174-183 — the
+ *     and_allow_empty_pr text when the form survives it, the plain/have-tag
+ *     text otherwise), no commits table, no diff. The create form survives
+ *     the fold only through AllowEmptyPr (compare.go:400-402), reduced:
+ *     supportEmptyPr = !AutodetectManualMerge → true (the
+ *     autodetect-manual-merge unit config is unlanded); acrossRepoPr =
+ *     !IsSameRef → the resolved ref names differing (services/git/
+ *     compare.go:41-43 — same repository && BaseRef == HeadRef; compares
+ *     are always same-repository here, the fork family 404s at the parser).
+ *     The POST keeps the landed equal-tips refusal (routes/pulls.ts:612-614)
+ *     where upstream's AllowEmptyPr path would create — disclosed for the
+ *     equal-TIPS shape only; the head-behind-base shape creates as upstream.
  *   - otherwise `listCommitsRange(base..head)` (oldest first — DISPLAYED
  *     reversed, newest first like upstream's commits_list) and
  *     `readDiff(head, mergeBase)` (id2..id = mergeBase...head — the three-dot
@@ -152,6 +165,8 @@ export const compareLocale = {
   nothing_to_compare: "There are no differences to show. There is no need to create a pull request.", // "repo.pulls.nothing_to_compare"
   nothing_to_compare_have_tag:
     "There are no differences to show between the selected branches or tags.", // "repo.pulls.nothing_to_compare_have_tag"
+  nothing_to_compare_and_allow_empty_pr:
+    "These branches are equal. This PR will be empty.", // "repo.pulls.nothing_to_compare_and_allow_empty_pr"
   no_common_history:
     "These branches do not share a common merge base. Select a different base or compare branch.", // "repo.pulls.no_common_history"
   archived:
@@ -200,8 +215,12 @@ export interface CompareData {
   /** The merge base oid; `null` = no common history (the POST's
    *  no_common_history arm keys on this too). */
   mergeBaseOid: string | null;
-  /** baseTip === headTip (the nothing-to-compare arm). */
+  /** baseTip === headTip (the POST's landed equal-tips refusal arm). */
   sameTip: boolean;
+  /** Upstream nothingToCompare (compare.go:376-378 + 397-405): no common
+   *  history OR the head IS the merge base (subsuming same-tip) — the
+   *  segment state; the commits table + the diff box fold with it. */
+  nothingToCompare: boolean;
   /** The range's commits in DISPLAY order (newest first — the engine returns
    *  base..head oldest first; commits_list.tmpl renders newest first). */
   commits: CommitJson[];
@@ -277,14 +296,22 @@ export async function loadCompareData(
   // engine.ts null-merge-base rule).
   const merged = await reads.mergeBase(baseTip.oid, headTip.oid);
   const mergeBaseOid = merged !== null && merged.tag === "ok" ? merged.base : null;
+  // Upstream nothingToCompare (compare.go:376-378 the CompareBase == "" arm;
+  // 397-405 the head == CompareBase arm — the head is already on the base,
+  // nothing to bring; equal tips subsume, the merge-base of equal tips being
+  // that tip). The range + diff reads fold with it (prepareCompareDiff
+  // returns before computing either).
+  const nothingToCompare = mergeBaseOid === null || headTip.oid === mergeBaseOid;
 
   // The range + the diff (only for a comparable pair — the nothing states
-  // carry empty lists and the page skips both tables). The range read is
-  // paginated 0-based (the API list route's own convention, pull.go:975).
+  // carry empty lists and the page skips both tables; an empty commits list
+  // also leaves the form prefill empty, upstream's `if !cpi.nothingToCompare`
+  // skip of the title/content setup, prepareCreatePullRequestPage). The range
+  // read is paginated 0-based (the API list route's own convention, pull.go:975).
   const commits: CommitJson[] = [];
   let more = false;
   let files: DiffFileView[] = [];
-  if (mergeBaseOid !== null && !sameTip) {
+  if (mergeBaseOid !== null && !nothingToCompare) {
     const range = await reads.listCommitsRange(baseTip.oid, headTip.oid, COMPARE_PAGE_SIZE, options.page - 1);
     if (range !== null) {
       // Engine order is oldest first; display reverses (commits_list order).
@@ -318,6 +345,7 @@ export async function loadCompareData(
     headTipOid: headTip.oid,
     mergeBaseOid,
     sameTip,
+    nothingToCompare,
     commits,
     more,
     files,
@@ -567,7 +595,8 @@ export function renderComparePage(options: {
 
 /** The compare page (§2.4.1 discriminator: `repository diff[ compare pull]` —
  *  compare.tmpl:2, the `compare pull` tail only when the viewer is signed in
- *  over a comparable branch pair, upstream's PageIsComparePull shape). */
+ *  over a PR-able branch pair (a merge base, tips unequal — the head flavor's
+ *  own fold), upstream's PageIsComparePull shape). */
 export function ComparePage(props: {
   ctx: UiContext;
   data: CompareData;
@@ -582,15 +611,44 @@ export function ComparePage(props: {
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const repoFullName = `${repo.ownerNamespace}/${repo.slug}`;
 
-  const comparable = data.mergeBaseOid !== null && !data.sameTip;
-  // Upstream allowCreatePull: both sides branches AND a merge base (the
-  // CompareBase != "" arm); the create FORM additionally rides the caller's
-  // writer gate (the module header's divergence note).
-  const comparePull = data.baseKind === "branch" && data.headKind === "branch" && comparable;
+  // Upstream comparable = NOT nothingToCompare (compare.go:376-378 +
+  // 397-405): no common history, or the head IS the merge base (subsuming
+  // same-tip).
+  const comparable = !data.nothingToCompare;
+  const branchPair = data.baseKind === "branch" && data.headKind === "branch";
+  // AllowEmptyPr (compare.go:400-402), set ONLY in the head == CompareBase
+  // arm — never for no-common-history, where upstream returns before it —
+  // reduced: supportEmptyPr = !AutodetectManualMerge → true (the
+  // autodetect-manual-merge unit config is unlanded); acrossRepoPr =
+  // !IsSameRef → the resolved ref names differing (services/git/compare.go:
+  // 41-43 — same repository && BaseRef == HeadRef; compares are always
+  // same-repository here, the fork family 404s at the parser).
+  const allowEmptyPr = data.headTipOid === data.mergeBaseOid && data.baseName !== data.headName;
+  // Upstream $allowCreatePR (compare.tmpl:173): the IsBranch pair, not
+  // DirectComparison (the `..` family is an unlanded surface — the parser
+  // 404s it), and the form folds with the nothing state unless AllowEmptyPr.
+  const allowCreatePR = branchPair && (comparable || allowEmptyPr);
+  // The state arms' gate — upstream's router-level allowCreatePull back
+  // PageIsComparePull (compare.go:305-306: IsBranch pair && CompareBase !=
+  // ""): no-common-history folds it, the head==mergeBase state does NOT —
+  // the existing-PR segment and the archived warning survive the fold there
+  // (anonymous renders them with the page, the landed honest-state posture).
+  const pullArms = branchPair && data.mergeBaseOid !== null;
+  // The head flavor: upstream folds ONLY at no common history; ours also
+  // folds at equal tips (wave-13 pins the same-tip shape code-flavored — the
+  // landed divergence), so the head==mergeBase arm keeps the upstream pull
+  // flavor.
+  const comparePull = pullArms && !data.sameTip;
   const pageIsComparePull = comparePull && ctx.viewer.kind === "user" && !repo.isArchived;
   const showDiffBox = comparable && (data.commits.length > 0 || data.files.length > 0);
-  const nothingMessage =
-    data.baseKind === "branch" && data.headKind === "branch"
+  // The nothing segment's three-way message (compare.tmpl:174-183): the
+  // allow-empty-pr text when the form survives the fold, the plain text for
+  // a branch pair, the have-tag text otherwise (a tag side folds
+  // $allowCreatePR upstream too). The no-common-history arm never holds
+  // AllowEmptyPr, so its branch-pair message stays the plain text.
+  const nothingMessage = allowCreatePR
+    ? compareLocale.nothing_to_compare_and_allow_empty_pr
+    : branchPair
       ? compareLocale.nothing_to_compare
       : compareLocale.nothing_to_compare_have_tag;
   const basePath = compareLink(repoLink, data.baseName, data.headName);
@@ -645,9 +703,11 @@ export function ComparePage(props: {
           />
         </div>
 
-        {/* The state arms (compare.tmpl:171-217 order). */}
+        {/* The state arms (compare.tmpl:171-217 order): the nothing segment,
+            then the existing-PR segment, the archived warning, and the form —
+            the latter three riding upstream's PageIsComparePull gate. */}
         {!comparable ? <div class="ui segment">{nothingMessage}</div> : null}
-        {comparable && data.existing !== null ? (
+        {pullArms && data.existing !== null ? (
           <div class="ui segment flex-text-block tw-gap-4">
             <div class="issue-title tw-break-anywhere">
               {data.existing.title}
@@ -658,10 +718,12 @@ export function ComparePage(props: {
             </a>
           </div>
         ) : null}
-        {comparable && data.existing === null && repo.isArchived ? (
+        {pullArms && data.existing === null && repo.isArchived ? (
           <div class="ui warning message">{compareLocale.archived}</div>
         ) : null}
-        {comparable && data.existing === null && !repo.isArchived && props.canCreate ? (
+        {/* The form rides $allowCreatePR (compare.tmpl:204) and additionally
+            the caller's writer gate (the module header's divergence note). */}
+        {allowCreatePR && data.existing === null && !repo.isArchived && props.canCreate ? (
           <>
             <div class="ui info message flex-text-block">
               <span class="tw-flex-1">{compareLocale.new_description}</span>
