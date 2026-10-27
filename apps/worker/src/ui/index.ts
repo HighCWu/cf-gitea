@@ -1175,6 +1175,8 @@ import {
 import { listReleases } from "../api/services/releases";
 import {
   applyBranchProtectionForm,
+  applyDefaultBranchForm,
+  loadDefaultBranchOptions,
   deleteRuleById,
   editFormOfRule,
   emptyBranchProtectionForm,
@@ -5147,7 +5149,14 @@ async function branchProtectionListPage(c: Context<{ Bindings: Env }>): Promise<
     c.html(
       renderBranchProtectionListPage({
         ctx,
-        data: { rules, isOrg: await loadOwnerIsOrg(c.env.DB, repo), savedRule: savedRule ?? null },
+        data: {
+          rules,
+          isOrg: await loadOwnerIsOrg(c.env.DB, repo),
+          savedRule: savedRule ?? null,
+          // The default-branch select's options (ce52935's mount — the
+          // archived arm renders neither segment, branches.tmpl's wrap).
+          branchOptions: repo.isArchived ? [] : await loadDefaultBranchOptions(c.env, repo),
+        },
       }),
       200,
     ),
@@ -10313,7 +10322,29 @@ uiRouter.post("/:owner/:repo/settings/mirror", (c) => mirrorSyncSubmit(c));
 // shapes — upstream's web.go:1206-1212 group; the POSTs run the §2.8
 // sameOriginGuard first; the POST-only write tails answer GET with chi's
 // 405 — the hook test/delete convention).
+/** POST /{owner}/{repo}/settings/branches — the default-branch write
+ *  (upstream SetDefaultBranchPost over the landed RepoService.setDefaultBranch;
+ *  pages/branch-protection.tsx's module header carries the arm citations). */
+async function branchProtectionDefaultBranchSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived posture
+  const form = await readUrlEncodedForm(c.req.raw);
+  if (form.get("action") !== "default_branch") return respond(c.html(renderNotFound(ctx), 404)); // the switch's default arm
+  const result = await applyDefaultBranchForm(c.env, repo, form.get("branch") ?? "");
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404)); // ErrBranchNotExist's 404
+  return respond(
+    new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/settings/branches` } }),
+  );
+}
+
 uiRouter.get("/:owner/:repo/settings/branches", (c) => branchProtectionListPage(c));
+uiRouter.post("/:owner/:repo/settings/branches", (c) => branchProtectionDefaultBranchSubmit(c));
 uiRouter.get("/:owner/:repo/settings/branches/edit", (c) => branchProtectionEditPage(c));
 uiRouter.post("/:owner/:repo/settings/branches/edit", (c) => branchProtectionEditSubmit(c));
 uiRouter.post("/:owner/:repo/settings/branches/priority", (c) => branchProtectionPrioritySubmit(c));
