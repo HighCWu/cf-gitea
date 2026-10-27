@@ -3172,3 +3172,37 @@ above):**
   apply it remotely), and the two force-red rehearsals (both ran
   RED pre-fix at row-visible, as designed; re-run for the honest
   post-fix verdict).
+
+**REDEPLOY20 LIVE RESULTS — paste 2, FINAL (2026-10-27 late: GO `50479cb`
+→ deploy version `d18e6002`; migrations `0033`+`0034` applied remote ✅;
+healthz 200 @3.0s cold):**
+
+- **The standing gate passed at GO**: full-suite composite gate (ADR-0006,
+  `pnpm test:full`) — phase-1 full run (58 ran / 47 pass / 202 ws1009
+  deaths / 0 assertion) + `--solo` adjudication **213 files, 0 fails**;
+  total wall 13.7 min, clean tree. Two determinism debts the gate's
+  assertion-fatal path caught en route were fixed before GO (wave8's
+  stale delete-form pin `4b86214`; mirror/sync's delivery-bleed floors
+  `c50fb52` — both the stale "no queue consumer" assumption class).
+- **Battery verdict (9 batteries, 60s probe budgets)**: p0 4/4 ·
+  registry 21/21 · generate-e2e 9+1i · forkpr-e2e 8/8 · ui-login 5/5 ·
+  mirror 8/8 · window2-mounts 22/22 · **window3-mounts green on its
+  first mounted run** (the 25-check battery written against the
+  pre-mount shapes) · cleanup-audit 9/1. The ONE audit fail is
+  `personal_access_tokens = 2` — the run PAT deleted at wrap close
+  (this paragraph is the record; the standing bootstrap = 1).
+- **Two live findings folded back**: (1) the heavy flows
+  (generate --strict, mirror create, t2 rename) legitimately exceed a
+  20s probe budget on a fresh deployment — every "timeout" had left its
+  repo server-side; budgets now 60s (`run's probe commit`); (2) the
+  wiki-raw 304 carries the blanket zero-option Cache-Control (b1bf73a
+  wraps every UI response — httpcache's return-before-stamp quirk lives
+  only in the module's raw response); the probe pins the deployed truth
+  (`ba820b6`).
+- **Force-red ×2 rehearsed post-fix**: w2-secret-row-visible and
+  w3-wiki-raw-coded-200 both forced red cleanly (fail=1, siblings pass,
+  tails swept, zero left_behind).
+- ws1009 knowledge closed out this window: the structural ledger, the
+  graph sizing + Plan-A falsification, the sanitized upstream issue
+  draft, ADR-0006, and the CI gate wired to `pnpm test:full` with
+  evidence artifacts. The B lever (sourcemap strip) is queued next.
