@@ -130,8 +130,10 @@ const PATH_LOG_SCAN = 2000;
 export const TREE_COMMITS_MAX_PATHS = 100;
 const MAX_STATS_SCAN = 2000;
 /** whole-file blame is memory-bound: cap the tip blob and the history bytes */
-const MAX_BLAME_BYTES = 1024 * 1024;
+export const MAX_BLAME_BYTES = 1024 * 1024;
 const MAX_BLAME_HISTORY_BYTES = 16 * 1024 * 1024;
+/** blame's first-parent walk holds at most this many changed revisions */
+const MAX_BLAME_REVISIONS = 200;
 // full streaming is a separate follow-up; until then this must fit the isolate
 const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 /** the DO SQLite storage ceiling gc must not cross while duplicating objects */
@@ -208,6 +210,49 @@ export interface TreeEntryJson {
 export interface TreeResult {
   oid: string;
   entries: TreeEntryJson[];
+}
+
+/**
+ * One blame run (upstream `git.BlamePart` — Sha/PreviousSha/Lines; the blame
+ * page renders one `blame-info` sidebar on each run's first line,
+ * routers/web/repo/blame.go renderBlame): consecutive lines of the tip blob
+ * introduced (last touched) by the same commit.
+ */
+export interface BlamePartJson {
+  /** the commit that last touched this run (full 40-hex) */
+  oid: string;
+  /** the commit whose tree first carried the file BEFORE this change — the
+   *  immediate first parent when its tree contains the path (git blame's
+   *  `previous` header, upstream's "view blame prior" link); absent at the
+   *  file's creation commit */
+  previousOid?: string;
+  /** the run's lines, file order, newline-free */
+  lines: string[];
+}
+
+/**
+ * The per-line blame answer (`GET .../blame/{branch|tag|commit}/*`, the
+ * census R08 RPC): the file's lines grouped into same-commit runs plus the
+ * per-oid commit metadata the sidebar renders (upstream processBlameParts'
+ * commitNames map). `truncated` flags a budget-bounded walk (upstream always
+ * walks to the root; ours answers with the partial attribution flagged
+ * instead of lying complete).
+ */
+export interface BlameResult {
+  /** 1-based absolute line number of `parts[0].lines[0]` (a full-file
+   *  answer starts at 1; a line-windowed answer carries its window's
+   *  offset so renderers number absolutely, upstream's row-number rule) */
+  firstLine: number;
+  parts: BlamePartJson[];
+  /** one entry per distinct part oid — subject/message/author/time */
+  commits: Record<string, CommitJson>;
+  /** full line count of the blamed tip blob (a line-windowed answer's
+   *  context, upstream's NumLines) */
+  totalLines: number;
+  /** the first-parent walk ended before the file's creation commit (a
+   *  budget exit — revisions/bytes/steps): lines past the boundary carry
+   *  the oldest examined commit */
+  truncated: boolean;
 }
 
 export interface BlobResult {
@@ -1265,6 +1310,65 @@ export class RepoCell extends DurableObject<Env> {
     });
   }
 
+  /**
+   * Per-line blame, `blame(ref, path)` (the census R08 boundary RPC —
+   * upstream's `GET .../blame/{branch|tag|commit}/*` page data). The SAME
+   * machinery the DO's own cgit blame page runs, exposed at the boundary:
+   * the budgeted first-parent walk (pathHistory) + git/blame.ts's
+   * diff-based attribution, grouped into same-commit runs (upstream
+   * git.BlamePart) with per-oid commit metadata (upstream processBlameParts)
+   * and the per-run `previousOid` "view blame prior" link (git's `previous`
+   * porcelain header). Availability ladder mirrors blamePage — `null` on an
+   * unresolvable ref, missing path, non-blob, binary tip, an over
+   * MAX_BLAME_BYTES tip, or an over MAX_BLAME_LINES file (the readBlob
+   * not-found posture; the page 404-shells). A budget-bounded WALK is not
+   * `null` — it answers with `truncated` so the page can flag the partial
+   * attribution instead of presenting it complete. `opts.lineOfs/lineLimit`
+   * window the ANSWER's lines (upstream's huge-file part-streaming analog):
+   * line numbers stay absolute via `totalLines`, runs never straddle the
+   * window edge.
+   */
+  async blame(ref?: string, path = "", opts: { lineOfs?: number; lineLimit?: number } = {}): Promise<BlameResult | null> {
+    this.rpcBind();
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(ref, gate);
+      if (!rr) return null;
+      const segs = decodePath("/" + path);
+      if (segs.length === 0) return null;
+      const tip = await this.peelToCommit(rr.oid, gate);
+      if (!tip) return null;
+      const tipOid = await this.pathOid(tip.commit, segs, gate);
+      const meta = tipOid ? this.store.typeAndSize(tipOid) : null;
+      if (!meta || meta.type !== "blob") return null;
+      if (meta.size > MAX_BLAME_BYTES) return null;
+      const { entries: history, truncated } = await this.pathHistory(rr.oid, segs, MAX_BLAME_REVISIONS, MAX_BLAME_HISTORY_BYTES, gate);
+      if (!history.length || !history[0].blob) return null;
+      if (isBinary(history[0].blob)) return null;
+      const result = blame(history);
+      if (!result) return null;
+      // Sidebar metadata straight off the walk (every run oid IS a history
+      // entry; upstream loads each part's commit to build commitNames).
+      const commits: Record<string, CommitJson> = {};
+      for (const entry of history) {
+        if (commits[entry.oid] === undefined) commits[entry.oid] = commitJson(entry.oid, entry.commit);
+      }
+      const previousOf = new Map(history.map((e) => [e.oid, e.previousOid]));
+      // Window the flat lines, then group consecutive same-oid lines into
+      // runs (renderBlame's part loop; the window clips a straddling run).
+      const ofs = Math.min(Math.max(opts.lineOfs ?? 0, 0), result.length);
+      const end = Math.min(ofs + Math.max(opts.lineLimit ?? result.length, 1), result.length);
+      const parts: BlamePartJson[] = [];
+      for (let i = ofs; i < end; ) {
+        const oid = result[i].oid;
+        const lines: string[] = [];
+        while (i < end && result[i].oid === oid) lines.push(result[i++].line);
+        const prev = previousOf.get(oid);
+        parts.push(prev === undefined ? { oid, lines } : { oid, previousOid: prev, lines });
+      }
+      return { firstLine: ofs + 1, parts, commits, totalLines: result.length, truncated };
+    });
+  }
+
   /** The content methods over HTTP. GET-only; routed from ui(). */
   private async api(path: string, q: URLSearchParams): Promise<Response> {
     const h = q.get("h") ?? undefined;
@@ -1675,13 +1779,30 @@ export class RepoCell extends DurableObject<Env> {
     return answers;
   }
 
-  /** First-parent history of a path (for blame), newest first, with blobs. */
-  private async pathHistory(tip: string, path: string[], cap: number, maxBytes: number, gate?: ReadGate): Promise<BlameHistoryEntry[]> {
-    const out: BlameHistoryEntry[] = [];
+  /**
+   * First-parent history of a path (for blame), newest first, with blobs.
+   * Each pushed entry also carries `previousOid` — the immediate first
+   * parent when its tree still contains the path (git blame's `previous`
+   * header; the parent commit and its path oid are in hand mid-walk, so the
+   * attribution is free). `truncated` is true whenever the walk ended
+   * WITHOUT the file's creation entry — a budget exit (changed-revision
+   * cap, byte budget, scan-step cap). A file introduced by a merge's second
+   * parent is NOT truncation: its first entry is the merge commit itself
+   * (the first-parent chain's own creation answer).
+   */
+  private async pathHistory(
+    tip: string,
+    path: string[],
+    cap: number,
+    maxBytes: number,
+    gate?: ReadGate
+  ): Promise<{ entries: BlameHistoryEntry[]; truncated: boolean }> {
+    const entries: BlameHistoryEntry[] = [];
     let cur = await this.peelToCommit(tip, gate);
     let steps = 0;
     let bytes = 0;
-    while (cur && steps++ < MAX_LOG_SCAN && out.length < cap) {
+    let created = false;
+    while (cur && steps++ < MAX_LOG_SCAN && entries.length < cap) {
       const myOid = await this.pathOid(cur.commit, path, gate);
       const parent = cur.commit.parents[0] ? await this.peelToCommit(cur.commit.parents[0], gate) : null;
       const parentOid = parent ? await this.pathOid(parent.commit, path, gate) : null;
@@ -1690,14 +1811,24 @@ export class RepoCell extends DurableObject<Env> {
         const data = blob?.type === "blob" ? blob.data : null;
         if (data) {
           bytes += data.length;
-          if (bytes > maxBytes && out.length) break; // bound total blobs held in memory
+          if (bytes > maxBytes && entries.length) {
+            break; // bound total blobs held in memory
+          }
         }
-        out.push({ oid: cur.oid, commit: cur.commit, blob: data });
-        if (!parentOid) break; // file created here
+        entries.push({
+          oid: cur.oid,
+          commit: cur.commit,
+          blob: data,
+          ...(parent !== null && parentOid !== null ? { previousOid: parent.oid } : {}),
+        });
+        if (!parentOid) {
+          created = true; // file created here — the walk's natural end
+          break;
+        }
       }
       cur = parent;
     }
-    return out;
+    return { entries, truncated: !created };
   }
 
   /** Map oid -> decorations (branch/tag pointing at it). */
@@ -2180,7 +2311,7 @@ ${rows}
     const meta = tipOid ? this.store.typeAndSize(tipOid) : null;
     if (!meta || meta.type !== "blob") return errorPage(withPath, `no such file: ${path.join("/")}`);
     if (meta.size > MAX_BLAME_BYTES) return errorPage(withPath, "blame skipped: file too large");
-    const history = await this.pathHistory(rr.oid, path, 200, MAX_BLAME_HISTORY_BYTES, gate);
+    const { entries: history } = await this.pathHistory(rr.oid, path, MAX_BLAME_REVISIONS, MAX_BLAME_HISTORY_BYTES, gate);
     if (!history.length || !history[0].blob) return errorPage(withPath, `no such file: ${path.join("/")}`);
     if (isBinary(history[0].blob)) return errorPage(withPath, "cannot blame a binary file");
     const result = blame(history);

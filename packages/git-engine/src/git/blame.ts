@@ -14,9 +14,19 @@ export interface BlameHistoryEntry {
   commit: Commit;
   /** blob content of the target path at this commit, null if absent */
   blob: Uint8Array | null;
+  /**
+   * The immediate first parent of this commit when its tree still contains
+   * the target path — git blame's `previous` porcelain header (upstream
+   * BlamePart.PreviousSha, the blame page's "view blame prior" link target).
+   * Absent at the file's creation commit (and wherever the parent lacks the
+   * path). Populated by repo.ts pathHistory, which has the parent commit and
+   * its path oid in hand during the walk.
+   */
+  previousOid?: string;
 }
 
-const MAX_BLAME_LINES = 5000;
+/** whole-file blame is memory-bound: a tip blob over this many lines bails */
+export const MAX_BLAME_LINES = 5000;
 
 /**
  * Line attribution over first-parent history. `history` is the path-limited
