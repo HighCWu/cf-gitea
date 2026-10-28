@@ -985,6 +985,10 @@ describe("§2.9 boundary (the real dispatcher via SELF)", () => {
 
 describe("login page golden (deterministic render)", () => {
   it("renders byte-identical to the committed golden and passes the a11y smoke", async () => {
+    // The golden pins the WINDOW-CLOSED render (SPEC-0010 §6): a user exists,
+    // so the first-run admin-init panel is absent and the page is byte-stable.
+    // The window-open variant (the panel present) is pinned in first-run.test.
+    await seedUser({ username: "GoldenAnchor" });
     const res = await request("/login");
     expect(res.status).toBe(200);
     const html = await res.text();
@@ -1002,6 +1006,7 @@ describe("login page golden (deterministic render)", () => {
   });
 
   it("renders identical bytes twice (no request-state bleed)", async () => {
+    await seedUser({ username: "GoldenAnchor" });
     const first = await request("/login");
     const second = await request("/login");
     expect(await second.text()).toBe(await first.text());

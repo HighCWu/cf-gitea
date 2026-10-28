@@ -47,6 +47,7 @@ import {
 } from "../auth/middleware";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
+import { allowSignup, initWindowOpen } from "../services/user-accounts";
 import { sessions, users } from "../db/schema";
 import { assetsBinding, assetsNotBuilt } from "./index";
 import { locale } from "./locale";
@@ -621,7 +622,13 @@ async function loginPage(c: RouteContext): Promise<Response> {
   const assembled = await pageContext(c, { kind: "anonymous" });
   if ("response" in assembled) return assembled.response;
   const redirectTo = new URL(c.req.url).searchParams.get("redirect_to");
-  const html = renderLoginPage({ ctx: assembled.ctx, redirectTo, error: null });
+  const html = renderLoginPage({
+    ctx: assembled.ctx,
+    redirectTo,
+    error: null,
+    adminInit: (await initWindowOpen(c.env.DB)) ? { open: true, error: null } : undefined,
+    signUpLink: allowSignup(c.env),
+  });
   if (setCookie === null) return c.html(html, 200);
   return c.html(html, 200, { "set-cookie": setCookie });
 }

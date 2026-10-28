@@ -16,6 +16,7 @@ import { handleUserPushEvent } from "./services/webhooks-push";
 import { enqueueDuePushMirrorSyncs, enqueuePushMirrorSyncsOnCommit } from "./services/mirror/push-sync";
 import { handlesUiRoute, uiRouter } from "./ui";
 import { sessionRouter } from "./ui/session";
+import { firstRunRouter } from "./ui/first-run";
 import { avatarServingRouter } from "./web/avatar-serving";
 import { attachmentsServingRouter } from "./web/attachments-serving";
 import { webhookDlqHandler } from "./webhooks/dlq";
@@ -145,6 +146,10 @@ app.route("/", uiRouter);
 // SPEC-0010: /login + /logout are single-segment top-level routes (§2.1) —
 // never repo-scoped, so the dispatcher and the engine never see them.
 app.route("/", sessionRouter);
+// SPEC-0010 §6 first-run amendment: the zero-user install window (/install)
+// and the ALLOW_SIGNUP-gated /user/sign_up — no path overlap with the
+// session/ui routers (order immaterial, per the HANDOFF recipe).
+app.route("/", firstRunRouter);
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
