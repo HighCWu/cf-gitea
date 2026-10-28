@@ -1,10 +1,12 @@
-# SPEC-0013: Protected branches & approval-gated merges — draft, gated
+# SPEC-0013: Protected branches & approval-gated merges
 
 Status: **accepted — ratified 2026-10-25** (the §1.1 entry criterion "the
 landed-but-idle reviews family pulling" is met: the reviews wave landed with
 merge-blocking explicitly deferred for want of this surface — the gap is
-live in the product. Implementation begins at M1; M2's engine hook requires
-the vendored-deviation ledger discipline) ·
+live in the product) · **M1–M4 landed same day, SPEC COMPLETE** (0c33d07 →
+5906a95, 2026-10-25 — the As-built sections at the end of this document are
+the record; M2's engine hook landed under the vendored-deviation ledger
+discipline, `packages/git-engine/NOTICE.md`) ·
 Date: 2026-10-25 · Fills the deferred item the reviews wave recorded twice: the
 `isOfficialReviewer` protected-branch whitelist arm ("the protected-branch whitelist
 arm has no cf-gitea surface",
@@ -96,7 +98,12 @@ reviewed, ratified to `accepted`, and implemented milestone by milestone (§5).
   it with the declared 409 (`pulls.ts:1102-1105`) and
   `src/api/routes/pull-automerge.ts` mirrors upstream's not-scheduled 404 — that
   stance stands until demand.
-- Tier-2 settings UI (upstream `routers/web/repo/setting/protected_branch.go`).
+- Tier-2 settings UI (upstream `routers/web/repo/setting/protected_branch.go`) —
+  planned out of scope, but **landed anyway as an accepted scope growth**
+  (4cdf464, 2026-10-25: `apps/worker/src/ui/pages/branch-protection.tsx`, the
+  1,296-line rule-editor panel, with the 738-line `pages-wave15.test.ts` and
+  the `settings-branches.html` golden) — additive UI over the landed 6-op API
+  family; recorded here so the scope statement matches the tree.
 
 ## 2. Surface inventory at the pin
 
@@ -335,7 +342,14 @@ Pure-D1 module, consumed by the merge RPC, the push hook, and the API family:
 
 Insertion point in `POST /repos/{owner}/{repo}/pulls/{index}/merge`
 (`src/api/routes/pulls.ts:1087-1151`): after the write check (`:1090`) and before
-the mergeable precondition (`:1114-1123`), porting `CheckPullMergeable`'s ordering:
+the mergeable precondition (`:1114-1123`), porting `CheckPullMergeable`'s ordering.
+
+**As-built (M1, 0c33d07): the planned placement was corrected on landing — the
+merge-whitelist 403 (arm 1) stays right after the write check, but the 405
+protection family (arm 2 + the `force_merge` escape) runs AFTER the mergeable
+precondition, not before it, so the commits-behind count the outdated-branch
+block needs is already surfaced by the lazy check; the landed ordering is
+recorded in "As-built — M1".**
 
 1. `isUserAllowedToMerge` port (§2.3(d)) — no rule + write (already checked), or
    rule + merge whitelist; failure stays the existing 403 "User not allowed to
