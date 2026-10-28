@@ -75,9 +75,9 @@
  *                         an existing baseline without --force.
  *   --compare <milestone> runs the suite and compares every recorded metric
  *                         against the baseline; exits 1 if any metric regressed
- *                         by more than 10% (direction-aware: wall times/latencies
- *                        /byte counts are lower-is-better, clone MB/s is
- *                         higher-is-better). A missing baseline file is NOT an
+ *                         past its tolerance class (direction-aware: wall
+ *                         times/latencies/byte counts are lower-is-better,
+ *                         clone MB/s is higher-is-better). A missing baseline file is NOT an
  *                         error: the run is report-only and exits 0 with a clear
  *                         notice — this is the intended state until the first
  *                         real baseline records when SPEC-0001a M2 Step 2 lands
@@ -102,10 +102,43 @@
  *       the world).
  *   push_wall_ms
  *       fresh clone -> fixed-content commit -> `git push`, timed on the push
- *       only; push_bytes is the exact request-body byte count sent.
+ *       only; push_bytes is the exact request-body byte count sent. Both
+ *       push_wall_ms and fetch_incremental_wall_ms are MEDIANS over 3
+ *       independent push->fetch cycles (see TOLERANCE CLASSES — single-shot
+ *       wall times at the ~100 ms scale are fixed-overhead noise); bytes and
+ *       ratio come from the median-wall sample so reported numbers stay a
+ *       coherent pair.
  *   inforefs_p50_ms / inforefs_p95_ms (N = --runs, 3 warmups)
  *       GET /<owner>/<repo>.git/info/refs?service=git-upload-pack (protocol v2
  *       advertisement) latency, sequential direct requests (no proxy hop).
+ *
+ * TOLERANCE CLASSES (why the gate has two bands, added 2026-10-28)
+ *   On identical code, wall times of sub-second fixed-overhead operations
+ *   swing far beyond the 10% band across hosts. Recorded evidence, same
+ *   commit, one day: CI run 40710895496 (compare on a different 2-core runner
+ *   instance than the one that recorded the ci.json baseline ~1 h earlier)
+ *   moved inforefs p50 14.52 -> 48.04 ms (+231%) and p95 16.75 -> 148 ms
+ *   (+784%); a local dev-box run of the same commit moved
+ *   fetch_incremental 96.18 -> 201.98 ms (+110%) and push 109.81 -> 179.2 ms
+ *   (+63%) — while clone, the one metric with real work (a 5.7 MiB transfer),
+ *   stayed in band everywhere (783 -> 731 ms on CI, 783 -> 411 ms local).
+ *   Within a single dev-box run clone was 2x FASTER than baseline while fetch
+ *   was 2x SLOWER — a machine-speed level shift moves everything one way;
+ *   these micro wall times just jitter, because they are dominated by fixed
+ *   overhead (process spawn, a handful of HTTP round trips, workerd
+ *   event-loop state, host scheduling) that does not scale with the code
+ *   under test. Class "overhead" (push_wall_ms, fetch_incremental_wall_ms,
+ *   inforefs_p50_ms, inforefs_p95_ms) therefore fails only when the
+ *   worse-delta exceeds BOTH the 10% band AND 150 ms absolute (calibrated:
+ *   the largest observed identical-code noise delta was 131 ms — CI p95).
+ *   Everything else keeps the percentage-only default class. The byte metrics
+ *   stay percentage-only on purpose: they are byte-exact across hosts
+ *   (identical 5,694,904-byte clones) and carry the gate's real teeth — a
+ *   thin-negotiation collapse shows up as fetch_incremental_bytes/ratio
+ *   exploding, not as its wall time. Methodology pairing: the overhead wall
+ *   metrics are medians over 3 independent push->fetch cycles — median kills
+ *   the within-host per-attempt outliers; the absolute floor absorbs the
+ *   cross-host level shift that no amount of sampling can remove.
  *   internal.*
  *       push/clone cpu_ms, peak memory, subrequest counts — NOT observable
  *       from outside the worker. Present as null placeholders so the baseline
@@ -148,6 +181,22 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 
 const SCHEMA_VERSION = 1;
 const REGRESSION_THRESHOLD = 0.1; // >10% delta counts as a regression (SPEC-0001 §9)
+// Overhead-class metrics fail only when the worse-delta exceeds BOTH the
+// percentage band AND this absolute floor (see TOLERANCE CLASSES in the
+// header; calibrated above the 131 ms largest observed identical-code noise
+// delta — CI run 40710895496, inforefs p95).
+const OVERHEAD_ABS_FLOOR_MS = 150;
+// Sub-second fixed-overhead wall metrics (< ~250 ms ops): percentage-only
+// gating false-fires on cross-host jitter (2-8x swings on identical code).
+const OVERHEAD_METRICS = new Set([
+  "push_wall_ms",
+  "fetch_incremental_wall_ms",
+  "inforefs_p50_ms",
+  "inforefs_p95_ms",
+]);
+// Independent push->fetch cycles behind the median for the two overhead wall
+// metrics (single-shot samples at the ~100 ms scale swing 2x within a host).
+const PUSH_FETCH_SAMPLES = 3;
 const INFOREFS_WARMUPS = 3;
 const SERVER_WAIT_MS = 90_000;
 const OWNER = "bench"; // LOCAL-dev namespace only (engine GIT_TOKEN path — no D1 user needed); production requires --user (see PRODUCTION MODE)
@@ -407,6 +456,12 @@ function percentile(sorted, p) {
   return sorted[idx];
 }
 
+/** Median of an odd-length array of { wallMs, ... } samples, by wallMs.
+ *  Only ever called with PUSH_FETCH_SAMPLES (odd) — exact middle element. */
+function medianSample(samples) {
+  return [...samples].sort((a, b) => a.wallMs - b.wallMs)[Math.floor(samples.length / 2)];
+}
+
 // ---------- dev server (default mode) ----------
 
 /** Spawns `pnpm dev` (vite serves the Worker on 127.0.0.1:5173 — see
@@ -608,27 +663,49 @@ async function benchSize({ size, manifest, repoPath }, ctx) {
   const inforefsAuth = ctx.publicFixtures ? null : (ctx.token ? basicHeader : null);
   Object.assign(metrics, await measureInfoRefs(inforefsUrl, inforefsAuth, ctx.runs));
 
-  // 3. Push wall time: fresh clone -> fixed-content commit -> push.
-  //    Fixed file name/content/message keep the pushed pack byte-stable.
+  // 3. Push + incremental fetch, median over PUSH_FETCH_SAMPLES independent
+  //    cycles. Fixed marker file names/content keep each pushed pack
+  //    byte-stable across runs. Cycle 0 is the historical metric shape:
+  //    fresh clone -> fixed-content commit -> timed push, then a timed fetch
+  //    of that commit in the stale step-1 clone (thin negotiation). Cycles 1+
+  //    add one marker commit each (untimed) and time the same push->fetch
+  //    pair; every cycle pushes exactly one new commit and fetches exactly
+  //    that commit, so all samples measure the same server operation.
+  //    Deviation from single-shot: cycles 1+ push from the warmed workdir
+  //    (not a fresh clone) — the timed push moves the same one-commit pack
+  //    through the same receive path; what differs is untimed client-side
+  //    setup, which the median deliberately smooths out (see TOLERANCE
+  //    CLASSES in the header).
   const pushDir = path.join(ctx.workDir, `push-${size}`);
-  console.log("  measuring push (fresh clone -> commit -> push)");
+  console.log(`  measuring push + incremental fetch (median of ${PUSH_FETCH_SAMPLES} cycles)`);
   await cloneMeasured([...GITC, "clone", cloneUrl, pushDir], ctx.workDir, pushDir);
-  await fsp.writeFile(path.join(pushDir, "bench-push.txt"), `bench push marker for ${name}\n`);
   const ident = ["-c", "user.name=Bench Runner", "-c", "user.email=bench@example.invalid"];
-  await git(["add", "bench-push.txt"], { cwd: pushDir });
-  await git([...ident, "commit", "-qm", `bench: push sample (${name})`], { cwd: pushDir });
-  ctx.proxy.reset();
-  const push = await timeGit([...GITC, ...ident, "push", proxyPushUrl, "main"], pushDir);
-  metrics.push_wall_ms = push.wallMs;
-  metrics.push_bytes = ctx.proxy.read().sent;
-
-  // 4. Incremental fetch from the now-stale first clone (thin negotiation).
-  console.log("  measuring incremental fetch (stale clone)");
-  ctx.proxy.reset();
-  const inc = await timeGit([...GITC, "fetch", "origin"], cloneDir);
-  metrics.fetch_incremental_wall_ms = inc.wallMs;
-  metrics.fetch_incremental_bytes = ctx.proxy.read().recv;
+  const pushSamples = [];
+  const fetchSamples = [];
+  for (let i = 0; i < PUSH_FETCH_SAMPLES; i++) {
+    const marker = i === 0 ? "bench-push.txt" : `bench-push-${i}.txt`;
+    await fsp.writeFile(path.join(pushDir, marker), i === 0 ? `bench push marker for ${name}\n` : `bench push marker ${i} for ${name}\n`);
+    await git(["add", marker], { cwd: pushDir });
+    await git([...ident, "commit", "-qm", `bench: push sample ${i} (${name})`], { cwd: pushDir });
+    ctx.proxy.reset();
+    const push = await timeGit([...GITC, ...ident, "push", proxyPushUrl, "main"], pushDir);
+    const pushBytes = ctx.proxy.read().sent;
+    ctx.proxy.reset();
+    const inc = await timeGit([...GITC, "fetch", "origin"], cloneDir);
+    pushSamples.push({ wallMs: push.wallMs, bytes: pushBytes });
+    fetchSamples.push({ wallMs: inc.wallMs, bytes: ctx.proxy.read().recv });
+  }
+  const pushMid = medianSample(pushSamples);
+  const fetchMid = medianSample(fetchSamples);
+  metrics.push_wall_ms = pushMid.wallMs;
+  metrics.push_bytes = pushMid.bytes;
+  metrics.fetch_incremental_wall_ms = fetchMid.wallMs;
+  metrics.fetch_incremental_bytes = fetchMid.bytes;
   metrics.fetch_incremental_ratio = r6(metrics.fetch_incremental_bytes / metrics.clone_received_bytes);
+  notes.push(
+    `push_wall_ms/fetch_incremental_wall_ms are medians of ${PUSH_FETCH_SAMPLES} cycles ` +
+    `(push [${pushSamples.map((s) => s.wallMs).join(", ")}] ms, fetch [${fetchSamples.map((s) => s.wallMs).join(", ")}] ms)`,
+  );
   if (metrics.fetch_incremental_ratio > 0.5) {
     notes.push(`incremental fetch received ${metrics.fetch_incremental_bytes} B of ${metrics.clone_received_bytes} B — thin negotiation looks broken (ratio ${metrics.fetch_incremental_ratio}); the gate will flag this at compare time`);
   }
@@ -783,11 +860,19 @@ function compareAgainstBaseline(results, baseline, sizes) {
       // worse = bigger for lower-is-better metrics, smaller for higher-is-better
       const worseDelta = higher ? baseVal - curVal : curVal - baseVal;
       const pct = baseVal === 0 ? (worseDelta > 0 ? Infinity : 0) : worseDelta / Math.abs(baseVal);
-      if (pct > REGRESSION_THRESHOLD) {
+      // Tolerance class (see TOLERANCE CLASSES in the header): overhead wall
+      // metrics must exceed BOTH the percentage band and the absolute floor;
+      // the default class is percentage-only.
+      const cls = OVERHEAD_METRICS.has(key) ? "overhead" : "default";
+      const absFloor = cls === "overhead" ? OVERHEAD_ABS_FLOOR_MS : 0;
+      const absWorse = Math.max(0, worseDelta);
+      if (pct > REGRESSION_THRESHOLD && (absFloor === 0 || absWorse > absFloor)) {
         const fmt = FMT[key] ?? String;
+        const absUnit = key.endsWith("_ms") ? " ms" : "";
         failures.push(
           `${size}.${key}: baseline ${fmt(baseVal)} -> now ${fmt(curVal)} ` +
-          `(${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}% vs allowed -${REGRESSION_THRESHOLD * 100}%)`,
+          `(${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}% worse, ${r2(absWorse)}${absUnit} absolute worse; ` +
+          `${cls} class: fail needs >${REGRESSION_THRESHOLD * 100}% AND >${absFloor}${absFloor === 0 ? "" : " ms"} absolute)`,
         );
       }
     }
@@ -807,7 +892,11 @@ function flatten(metrics, prefix = "") {
 }
 
 function printCompare(results, { failures, checked, skipped }) {
-  console.log("\ncomparison vs baseline (gate: >10% worse on any recorded metric):");
+  console.log(
+    `\ncomparison vs baseline (gate: >${REGRESSION_THRESHOLD * 100}% worse on any recorded metric; ` +
+    `overhead wall metrics — push/fetch/inforefs — must ALSO exceed ${OVERHEAD_ABS_FLOOR_MS} ms absolute worse: ` +
+    "sub-second fixed-overhead ops swing 2-8x across hosts on identical code, see TOLERANCE CLASSES in scripts/bench-run.mjs):",
+  );
   for (const size of Object.keys(results.sizes)) {
     for (const [key, val] of Object.entries(flatten(results.sizes[size].metrics))) {
       if (INFORMATIONAL.has(key)) continue;
@@ -911,7 +1000,7 @@ async function main() {
   const cmp = compareAgainstBaseline(results, baseline, opts.sizes);
   printCompare(results, cmp);
   if (cmp.failures.length > 0) {
-    console.error(`\nbenchmark regression gate FAILED (${cmp.failures.length} metric(s) worse than +${REGRESSION_THRESHOLD * 100}%)`);
+    console.error(`\nbenchmark regression gate FAILED (${cmp.failures.length} metric(s) over tolerance: >${REGRESSION_THRESHOLD * 100}%, overhead wall metrics also >${OVERHEAD_ABS_FLOOR_MS} ms absolute)`);
     return 1;
   }
   console.log("benchmark regression gate PASSED");
