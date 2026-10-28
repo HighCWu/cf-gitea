@@ -454,3 +454,44 @@ this cluster). Re-measured at `ea6a49d` (not copied): goldens **67**
 in `src/ui/__tests__/goldens/` (64 HTML + 3 RSS, plus the session
 `login.html`), committed test files **262**, **5,209** `it(`/`test(`
 call sites (the census method).
+
+**Appended 2026-10-28 (HEAD `bd6d257`) — the fourth addendum: the wave-130
+parity-review wave and its fix wave.** REDEPLOY22 shipped the third cluster's
+last cargo (GO `5f3c26f` → version `73158aa8`, evidence `7bec99e`: healthz
+200 @2.2 s, no migrations, gate single-pass 261 files / 5,831 tests / 0
+failed, battery 108/2 — the mirror cold-start settle green on the warm
+rerun plus the live run-PAT audit item deleted at wrap) and **coincided with
+the wave-130 parity-review kickoff**: five parallel reviewers (auth, api,
+engine, services, git-http) swept the landed surface for upstream-parity
+defects. Their verdicts drove the fix wave that followed — **15 commits,
+`28df818` → `bd6d257`, landing 30 findings with 7 deliberate keeps** (each
+kept item verified against upstream source and documented, e.g. migrate's
+422, the POST-issues label/milestone validation vs upstream's silent drop,
+the webhook `skipped`/`failed` → `is_delivered=false` mapping, the token
+name>255 client-error arm). The full scoreboard — the five reviews' summary
+tables, the 30-landed list with commit hashes, the 7 keeps with rationales,
+and the credits — is `docs/reviews/wave-130-parity-review.md`. The gold the
+reviews caught, one line each: **PR-sync** (`140fc0b` — pushes never moved
+`refs/pull/N/head`; merges after a second push merged the WRONG tree),
+**tag-only deletion** (`0626ced` — pushing only a tag to a nonexistent repo
+deleted the just-created repo row), **org revocation** (`84da8f8` — removing
+a member left their team grants live through the real gate), the **session
+cookie** (`28df818` — visiting `/login` signed-in after 24 h silently logged
+the user out), and the **GPG time-bomb** (`50880b2` — the verify chain's
+single-minute token, guarded by the verdict runs). Schema grew by one
+additive migration — **0035 `spooky_galactus`** (`sessions.remember`, the
+login's persistence decision surviving rotations per upstream
+`auth.go:127`'s posture) — which rides the NEXT deploy window (REDEPLOY22
+carried none). The SPEC ledger caught up in the same pass: SPEC-0010
+§2.3/§2.4 amended to say what rotation IS (the persisted remember decision +
+the full cookie directive at every rotation site; the old "always
+session-scope" implication retired), SPEC-0002 §4.6 gains the auth review's
+(b) items #13–15 (documented divergences), and SPEC-0004 §2.4 records the
+api review's S2 policy decision as an intentional as-built divergence. §4
+re-check: no line retired — the 64-op FEATURE-ABSENT ceiling stands (the
+wave touched zero undeclared surface; `check-openapi` PASS per commit), the
+UI remainder is unchanged (fix wave, no survey flips; tick-15's 92/4/20
+headline stands), and the ws1009 residuals stand as written — the gate ran
+clean at REDEPLOY22's tree, and the fix wave's own landing gate surfaced
+exactly three ripples (`bd6d257`: the migrate format's two stale pins + the
+date-rolled admin golden).

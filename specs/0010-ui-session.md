@@ -169,12 +169,12 @@ work with JS disabled — it is plain HTML).
 | Property | Value | Upstream cite |
 |---|---|---|
 | Name | `gitea_session` | `modules/setting/session.go:36,61` (default `COOKIE_NAME`) |
-| Value | `<id>:<secret>` — 10-char random id, 64-hex secret (§3) | `routers/web/auth/auth.go:128` (`nt.ID+":"+token`), `services/auth/auth_token.go:100,113-121` |
+| Value | `<id>:<secret>` — 10-char random id, 64-hex secret (§3) | `routers/web/auth/auth.go:127` (`nt.ID+":"+token`), `services/auth/auth_token.go:100,113-121` |
 | `HttpOnly` | always | `modules/web/middleware/cookie.go:57-78` (`SetSiteCookie` hardcodes it) |
 | `Secure` | always (our origins are https; upstream derives `COOKIE_SECURE` from an https `AppURL`) | `setting/session.go` (`COOKIE_SECURE`) |
 | `SameSite` | `Lax` | `setting/session.go:39` default |
 | `Path` | `/` | `setting/session.go` (`CookiePath` default) |
-| `Max-Age` | `remember` → 31 days (`LOGIN_REMEMBER_DAYS` default 31, `setting/security.go:146`); no `remember` → **session cookie** (no `Max-Age`; dies with the browser) | `auth.go:128` (`SetSiteCookie(…, LogInRememberDays*Day)`) |
+| `Max-Age` | `remember` → 31 days (`LOGIN_REMEMBER_DAYS` default 31, `setting/security.go:146`); no `remember` → **session cookie** (no `Max-Age`; dies with the browser). The login's decision is **persisted on the row** (`sessions.remember`, migration 0035) and **every rotation re-sets the cookie with it** (§2.4 step 5) — a remembered login keeps `Max-Age=2678400` across rotations, an unremembered one's rotated cookie stays session-scope | `auth.go:127` (`SetSiteCookie(…, LogInRememberDays*Day)` inside `autoSignIn` — upstream re-issues the remember cookie with the remember TTL after every token regeneration) |
 | Row TTL | 24 h at mint; **extended by 24 h on every rotation** (§2.4) — an actively used session keeps living, an idle one dies after 24 h regardless of the cookie's persistence | `setting/session.go` store `Maxlifetime` default 86400 |
 
 The `remember` distinction is exactly upstream's: *cookie* persistence. Upstream splits
@@ -186,6 +186,23 @@ role verbatim — sha256 at rest, `previous_token_hash` + `rotated_unix` rotatio
 columns, expiry), and a second cookie would buy nothing. This is a documented
 divergence from upstream's cookie *layout* with byte-compatible *name*; the
 `gitea_remember` name is never emitted.
+
+**Amendment (2026-10-28, the wave-130 parity review's fix — `28df818` + migration 0035
+`spooky_galactus`, additive).** Earlier text implied rotation always re-sets a
+session-scope cookie; that implication is gone from code and from this SPEC. The landed
+posture is upstream's own at `auth.go:127`: the login's `remember` decision persists on
+the row (`sessions.remember`, integer default false NOT NULL — mint threads the form
+checkbox into it via `createSession`, and the rotation CAS below never touches the
+column, so the decision survives rotations for the row's life), and every rotation
+`Set-Cookie` is wrapped through `sessionSetCookie(value, row.remember)`. A remembered
+user's rotated cookie keeps `Max-Age=2678400`; an unremembered user's rotated cookie
+stays session-scope. The wrap runs at all three rotation sites (`src/ui/viewer.ts` page
+context, the `/login` GET arm in `src/ui/session.ts`, `src/web/attachments-serving.ts`)
+— a bare `id:secret` Set-Cookie (no name/attrs) is silently ignored by the browser and,
+past the 60 s grace, turns the next request into a step-3 mismatch that deletes the
+row: merely visiting `/login` signed-in after 24 h logged the user out (the review's
+HIGH finding, fixed `28df818`; route-level round-trips pin that the *adopted* cookie
+authenticates the next request).
 
 ### 2.4 Verification, rotation, reuse detection (the upstream auth-token mechanics, ported)
 
@@ -220,7 +237,11 @@ on `id`):
    `services/auth/auth_token.go:71-92`). `changes == 0` (a concurrent request rotated
    first) → skip, send nothing; the old cookie stays valid for that response and the
    60 s grace covers any true in-flight window. On success the response carries
-   `Set-Cookie` with the new `id:secret`. Rotation runs in `waitUntil` where the
+   `Set-Cookie` with the new `id:secret`, wrapped in the full `gitea_session` directive
+   (§2.3) **with the row's persisted `remember` decision** — a remembered login keeps
+   `Max-Age=2678400` across rotations, an unremembered one stays session-scope
+   (migration 0035; upstream's posture at `auth.go:127`, §2.3 amendment). Rotation runs
+   in `waitUntil` where the
    handler's response is already committed to rendering as authenticated; the one
    user-visible cost (a concurrent request inside the grace window renders anonymous
    once) is accepted upstream-verbatim — open question 3.
@@ -361,6 +382,9 @@ export const sessions = sqliteTable('sessions', {
   expiresAt: integer('expires_at', { mode: 'timestamp' }).notNull(),
   /** Throttled write: at most once per hour per session (§ below). */
   lastSeenAt: integer('last_seen_at', { mode: 'timestamp' }).notNull(),
+  /** The login form's remember decision (§2.3's amendment — migration 0035);
+   *  rotation re-sets the cookie with Max-Age=2678400 iff true. */
+  remember: integer('remember', { mode: 'boolean' }).notNull().default(false),
 }, (t) => [
   index('sessions_user_idx').on(t.userId),
   index('sessions_expires_idx').on(t.expiresAt),
