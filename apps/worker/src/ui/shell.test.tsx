@@ -13,8 +13,16 @@ import { assetURI, type UiManifest } from "./manifest";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import type { Viewer } from "./viewer";
 import { configI18n } from "./locale";
-import { BaseLayout, buildWindowConfig, renderPage, serializeWindowConfig } from "./shell";
+import {
+  BaseLayout,
+  DEMO_BANNER_DISMISS_SCRIPT,
+  DEMO_BANNER_STORAGE_KEY,
+  buildWindowConfig,
+  renderPage,
+  serializeWindowConfig,
+} from "./shell";
 import { NotFoundPage } from "./pages/not-found";
+import { runA11y } from "./__tests__/a11y";
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -372,6 +380,99 @@ describe("Footer", () => {
     expect(html).toContain('aria-label="About Software"');
     expect(html).toContain('aria-label="Links"');
     expect(html).toContain('<a href="/assets/licenses.txt">Licenses</a>');
+  });
+});
+
+// --- 404 page ----------------------------------------------------------------
+
+// --- demo banner (SPEC-0014 §4.4, M2) -----------------------------------------
+
+/**
+ * The banner arm battery. The gate-off arm is the §2 invariant in its UI
+ * form: NO DOM NODE AT ALL — the page is byte-identical to the pre-M2 shell,
+ * which is what keeps the committed goldens (session-goldens/, rendered with
+ * no demoMode in ctx) the unchanged byte-proof. The gate-on arm is the
+ * golden: the banner node + the dismissal script, inserted between </nav>
+ * and the role="main" div, everything else byte-identical.
+ */
+describe("the demo banner (SPEC-0014 §4.4)", () => {
+  const armedCtx: UiContext = { ...anonymousCtx, demoMode: true };
+  const armedPage = (props: { title?: string } = {}): string =>
+    renderPage(
+      <BaseLayout ctx={armedCtx} title={props.title}>
+        <p>page body</p>
+      </BaseLayout>,
+    );
+
+  it("gate OFF (§2 invariant): no DOM node at all — no banner id, no dismissal script, byte-identical shell", () => {
+    // Absent flag (every default deployment and every committed golden) AND
+    // an explicit false: both arms render nothing.
+    for (const ctx of [anonymousCtx, { ...anonymousCtx, demoMode: false }]) {
+      const html = renderPage(
+        <BaseLayout ctx={ctx}>
+          <p>page body</p>
+        </BaseLayout>,
+      );
+      expect(html).not.toContain("demo-banner");
+      expect(html).not.toContain("sessionStorage");
+      expect(html).not.toContain("flash-info");
+    }
+    // The page structurally unchanged: role="main" follows the navbar
+    // directly — no interstitial node between them.
+    expect(page()).toContain('</nav><div role="main"');
+  });
+
+  it("gate ON: exactly the banner node + dismissal script inserted above role=main, everything else byte-identical", () => {
+    const on = armedPage();
+    const off = page();
+    // Split both renders at the navbar close: head and tail must be
+    // byte-identical; the ONLY difference is the insertion between them.
+    const marker = "</nav>";
+    expect(on.startsWith(off.slice(0, off.indexOf(marker)) + marker)).toBe(true);
+    const tailOf = (html: string): string => html.slice(html.indexOf('<div role="main"'));
+    expect(tailOf(on)).toBe(tailOf(off));
+    const inserted = on.slice(off.indexOf(marker) + marker.length, on.indexOf('<div role="main"'));
+    // The node: upstream's flash-message bar at the pin (RenderFlashMessage,
+    // util_render.go:263-292) with Fomantic's close shape and a11y semantics.
+    expect(inserted.startsWith('<div class="ui info message flash-message flash-info" id="demo-banner" role="note">')).toBe(true);
+    expect(inserted).toContain(
+      '<i class="close icon" id="demo-banner-dismiss" role="button" tabindex="0" aria-label="Dismiss notice"></i>',
+    );
+    expect(inserted).toContain(
+      "<div class=\"tw-text-center\">This is a demo instance: data on this instance is periodically cleaned.</div>",
+    );
+    // The dismissal script rides verbatim, right after the node.
+    expect(inserted).toContain(`<script>${DEMO_BANNER_DISMISS_SCRIPT}</script>`);
+    expect(inserted.endsWith("</script>")).toBe(true);
+    // The armed page still passes the a11y smoke (the note + labelled,
+    // focusable close control).
+    expect(runA11y(on)).toEqual([]);
+  });
+
+  it("dismissal is per-SESSION (sessionStorage, never localStorage) and never round-trips the server", () => {
+    // The script's whole storage surface is sessionStorage under the one
+    // exported key — the §4.4 semantic (dies with the browser session, so a
+    // fresh session sees the banner again; a navigation within the session
+    // stays dismissed). No endpoint, no D1 — the script is static bytes and
+    // the node re-renders on every armed request.
+    expect(DEMO_BANNER_DISMISS_SCRIPT).toContain(`sessionStorage.getItem("${DEMO_BANNER_STORAGE_KEY}")==="1"`);
+    expect(DEMO_BANNER_DISMISS_SCRIPT).toContain(`sessionStorage.setItem("${DEMO_BANNER_STORAGE_KEY}","1")`);
+    expect(DEMO_BANNER_DISMISS_SCRIPT).not.toContain("localStorage");
+    expect(DEMO_BANNER_DISMISS_SCRIPT).not.toContain("fetch(");
+    // Already-dismissed: hide before anything else (first-paint suppression).
+    const hideIndex = DEMO_BANNER_DISMISS_SCRIPT.indexOf('b.style.display="none"');
+    expect(hideIndex).toBeGreaterThan(0);
+    expect(DEMO_BANNER_DISMISS_SCRIPT.indexOf("getItem")).toBeLessThan(DEMO_BANNER_DISMISS_SCRIPT.indexOf("setItem"));
+    // Both storage touches are try/caught (private-mode throws degrade the
+    // dismissal to per-pageload, never break the page).
+    expect(DEMO_BANNER_DISMISS_SCRIPT).toMatch(/try\{if\(sessionStorage\.getItem/);
+    expect(DEMO_BANNER_DISMISS_SCRIPT).toMatch(/try\{sessionStorage\.setItem/);
+    // Dismiss arms: click AND keyboard (Enter/Space — the control is a
+    // focusable role=button).
+    expect(DEMO_BANNER_DISMISS_SCRIPT).toContain('x.addEventListener("click",dismiss)');
+    expect(DEMO_BANNER_DISMISS_SCRIPT).toContain('if(ev.key==="Enter"||ev.key===" ")');
+    // Renders are deterministic (no request-state bleed into the script).
+    expect(armedPage()).toBe(armedPage());
   });
 });
 

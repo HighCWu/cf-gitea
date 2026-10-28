@@ -4,6 +4,7 @@ import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
 import { RepoNameCollisionError, RepoNameInvalidError } from "../../repos/service";
+import { assertDemoRepoQuota, DemoRepoQuotaError } from "../../services/demo-quota";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
@@ -183,6 +184,24 @@ export function registerUserReposRoutes(
     const owner = await findDoerRow(c.env.DB, doer);
     if (owner === null) {
       throw new ApiError(401, "token is required");
+    }
+    // SPEC-0014 §4.3 — the gated demo repo-count quota (M2): upstream rides
+    // the limit check inside the create service (doer.CanCreateRepoIn,
+    // user.go:285-295 — the admin doer bypass included — refusing with
+    // ErrReachLimitOfRepo); cf-gitea's check rides THIS route (the create
+    // call site the SPEC names) because RepoService carries no env, and the
+    // owner row IS the doer row here. Gate off → zero reads, zero checks
+    // (the §2 invariant). Upstream maps the limit refusal through its
+    // ErrPermissionDenied unwrap to 403 + err.Error()
+    // (routers/api/v1/repo/repo.go:256-258) — the exact status + message
+    // below.
+    try {
+      await assertDemoRepoQuota(c.env, c.env.DB, owner, owner.id);
+    } catch (error) {
+      if (error instanceof DemoRepoQuotaError) {
+        throw new ApiError(403, error.message);
+      }
+      throw error;
     }
     let repo;
     try {

@@ -65,5 +65,12 @@ export interface UiContext {
    *  COUNT per signed-in request). Absent/null = anonymous or a degraded
    *  count — the badge renders hidden (upstream's tw-hidden-at-0 shape). */
   notificationCount?: number | null;
+  /** SPEC-0014 §4.4 (M2 demo wave): the DEMO_MODE render gate for the
+   *  shell's dismissible demo banner (shell.tsx). Set per-request from the
+   *  env by the context assemblers — `demoModeEnabled(c.env)`
+   *  (services/demo-sweep.ts, the ONE §2 gate function). Absent/false =
+   *  gate off: the banner branch renders NO DOM node and pages stay
+   *  byte-identical (the §2 invariant — the goldens pin it). */
+  demoMode?: boolean;
   assets: ShellAssets;
 }

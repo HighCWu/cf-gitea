@@ -114,6 +114,7 @@ import { handleLfsGateBranch, parseLfsRoute } from "../lfs/router";
 import { repoCounters, repoUnits, repositories, users } from "../db/schema";
 import { deleteRepositoryViaEngineShape } from "../repos/purge";
 import { RepoNameCollisionError, RepoService, lookupRedirect } from "../repos/service";
+import { assertDemoRepoQuota } from "../services/demo-quota";
 import { emitRepoEventInline, repositoryEventIdentity, repositoryEventPayload } from "../services/repo-events";
 import { appOrigin } from "../services/webhooks-push";
 
@@ -457,6 +458,18 @@ async function handleUnknownRepository(
   const service = new RepoService(env.DB, { registry: env.REGISTRY.getByName("registry"), queue: env.REPO_TASKS });
   let created: Awaited<ReturnType<RepoService["create"]>>;
   try {
+    // SPEC-0014 §4.3 — the gated demo repo-count quota (M2), the push-create
+    // call site the SPEC names. Upstream's limit check rides PushCreateRepo
+    // too (doer.CanCreateRepoIn over the resolved owner — the admin bypass
+    // included — user.go:285-295; refusal = ErrReachLimitOfRepo,
+    // services/repository/create.go:206); the doer here is the verified
+    // pusher, the owner the namespace resolved above (own / admin-into-user /
+    // org-grant). Gate OFF → the check returns before its first read: a
+    // default deployment's push-create performs ZERO extra queries (the §2
+    // invariant). A refusal throws into the catch below, which is ALREADY
+    // upstream's mapping: every PushCreateRepo error masks to the bare 404 +
+    // debug log (githttp.go:235-238) — no new response shape here.
+    await assertDemoRepoQuota(env, env.DB, verified.user, owner.id);
     // §2.5.2: create BEFORE reading the pack, status='creating' guards the
     // crash window (a half-usable repo must never look empty-but-ready);
     // push-created repos default private (upstream DefaultPushCreatePrivate).

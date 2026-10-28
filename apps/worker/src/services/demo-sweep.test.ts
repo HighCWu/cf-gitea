@@ -118,7 +118,9 @@ async function seedUser(id: number, username: string, opts: { isAdmin?: boolean;
 
 async function seedRepo(
   id: string,
-  opts: { ownerId?: number | null; ownerNamespace?: string; slug?: string; createdAt: Date } = { createdAt: new Date(0) },
+  opts: { ownerId?: number | null; ownerNamespace?: string; slug?: string; createdAt: Date; sizeKb?: number } = {
+    createdAt: new Date(0),
+  },
 ): Promise<void> {
   await drizzle(env.DB).insert(repositories).values({
     id,
@@ -130,6 +132,9 @@ async function seedRepo(
     refsVersion: 1,
     backend: "self-hosted",
     createdAt: opts.createdAt,
+    // §4.3: the observe-only size report reads this column (settle-time
+    // accounting maintains it; the seed plays its role).
+    sizeKb: opts.sizeKb ?? 0,
   });
 }
 
@@ -348,25 +353,57 @@ describe("the armed producer (§3.1 candidate selection)", () => {
     expect(queue.bodies).toEqual([[{ kind: "demo-sweep", repoId: "oldest" }, { kind: "demo-sweep", repoId: "older" }]]);
   });
 
-  it("logs the batch counts on EVERY armed tick — including the 0-eligible compact one-liner (§3.1 step 4)", async () => {
+  it("logs the batch counts + the §4.3 size roll-up on EVERY armed tick — including the 0-eligible compact one-liner (§3.1 step 4)", async () => {
     const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
     const queue = spyQueue();
 
-    // 0-eligible tick: the one-liner proves the sweep ran.
+    // 0-eligible tick: the one-liner proves the sweep ran (zero-size roll-up).
     const none = await enqueueDueDemoSweeps(armedEnv(queue, "true"), { now: NOW });
     expect(none).toBe(0);
     const cutIso = new Date(CUT_SEC * 1000).toISOString();
     expect(consoleLog).toHaveBeenCalledTimes(1);
-    expect(consoleLog).toHaveBeenCalledWith(`[demo-sweep] enqueued 0 of 0 eligible (cut ${cutIso})`);
+    expect(consoleLog).toHaveBeenCalledWith(
+      `[demo-sweep] enqueued 0 of 0 eligible (cut ${cutIso}) size total=0 KiB largest=0 KiB (-)`,
+    );
 
-    // An eligible tick: N of M with the same cut timestamp.
+    // An eligible tick: N of M with the same cut timestamp; these seeds carry
+    // the DEFAULT size 0 — the roll-up is honest at zero (the named largest
+    // is the oldest candidate at 0 KiB; only the EMPTY batch prints "-").
     await seedUser(70, "plain");
     await seedRepo("past-1", { ownerId: 70, createdAt: new Date(0) });
     await seedRepo("past-2", { ownerId: 70, createdAt: new Date(CUT_MS - 500) });
     consoleLog.mockClear();
     const two = await enqueueDueDemoSweeps(armedEnv(queue, "true"), { now: NOW });
     expect(two).toBe(2);
-    expect(consoleLog).toHaveBeenCalledWith(`[demo-sweep] enqueued 2 of 2 eligible (cut ${cutIso})`);
+    expect(consoleLog).toHaveBeenCalledWith(
+      `[demo-sweep] enqueued 2 of 2 eligible (cut ${cutIso}) size total=0 KiB largest=0 KiB (owner-past-1/repo-past-1)`,
+    );
+  });
+
+  it("the §4.3 size roll-up rides the same one-line log: batch total + the named largest (observe-only — OQ-4)", async () => {
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    const queue = spyQueue();
+    await seedUser(70, "plain");
+    await seedRepo("tiny", { ownerId: 70, createdAt: new Date(0), sizeKb: 12 });
+    await seedRepo("hog", { ownerId: 70, createdAt: new Date(CUT_MS - 1000), sizeKb: 1500 });
+    await seedRepo("mid", { ownerId: 70, createdAt: new Date(CUT_MS - 2000), sizeKb: 188 });
+
+    const enqueued = await enqueueDueDemoSweeps(armedEnv(queue, "true"), { now: NOW });
+    expect(enqueued).toBe(3);
+    const cutIso = new Date(CUT_SEC * 1000).toISOString();
+    // total = 12 + 1500 + 188; largest names owner/slug (the runbook's aim).
+    expect(consoleLog).toHaveBeenCalledWith(
+      `[demo-sweep] enqueued 3 of 3 eligible (cut ${cutIso}) size total=1700 KiB largest=1500 KiB (owner-hog/repo-hog)`,
+    );
+    // The rows are NOT consumed by a producer tick (row deletion is the
+    // consumer's claim, §3.1) — the next tick re-reads and re-reports the
+    // full aging set, roll-up included.
+    consoleLog.mockClear();
+    await seedRepo("extra", { ownerId: 70, createdAt: new Date(CUT_MS - 3000), sizeKb: 500 });
+    await enqueueDueDemoSweeps(armedEnv(queue, "true"), { now: NOW });
+    expect(consoleLog).toHaveBeenCalledWith(
+      `[demo-sweep] enqueued 4 of 4 eligible (cut ${cutIso}) size total=2200 KiB largest=1500 KiB (owner-hog/repo-hog)`,
+    );
   });
 
   it("the real config's shipped DEMO_MODE keeps the producer silent (the default deployment's posture)", async () => {

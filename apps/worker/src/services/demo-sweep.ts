@@ -183,7 +183,16 @@ export async function enqueueDueDemoSweeps(
   }
   const cut = new Date((now - DEMO_RETENTION_HOURS * 60 * 60) * 1000);
   const due = await drizzle(db)
-    .select({ id: repositories.id })
+    .select({
+      id: repositories.id,
+      // §4.3 (M2): the observe-only size report rides THIS select — settle-time
+      // accounting already maintains size_kb (services/repo-size.ts), so the
+      // roll-up is three free columns on an existing query, never a second
+      // read. The name rides along to aim the runbook at the largest repo.
+      sizeKb: repositories.sizeKb,
+      ownerNamespace: repositories.ownerNamespace,
+      slug: repositories.slug,
+    })
     .from(repositories)
     .leftJoin(users, eq(repositories.ownerId, users.id))
     .where(and(lt(repositories.createdAt, cut), or(isNull(repositories.ownerId), eq(users.isAdmin, false))))
@@ -197,8 +206,19 @@ export async function enqueueDueDemoSweeps(
   // EVERY sweep batch logs counts (§3.1 step 4) — including 0-eligible
   // ticks, whose compact one-liner proves the sweep ran. Gate-off ticks log
   // NOTHING (the early return above) — the default deployment's log stays
-  // sweep-silent.
-  console.log(`[demo-sweep] enqueued ${messages.length} of ${due.length} eligible (cut ${cut.toISOString()})`);
+  // sweep-silent. The §4.3 size roll-up rides the same line (observe-only —
+  // OQ-4 kept the pre-push refusal OUT of the hot path): the batch's total
+  // KiB and the largest repo (named) leave the log.
+  const totalKb = due.reduce((sum, row) => sum + row.sizeKb, 0);
+  let largest: { sizeKb: number; name: string } | null = null;
+  for (const row of due) {
+    if (largest === null || row.sizeKb > largest.sizeKb) {
+      largest = { sizeKb: row.sizeKb, name: `${row.ownerNamespace}/${row.slug}` };
+    }
+  }
+  const sizeReport =
+    largest === null ? "size total=0 KiB largest=0 KiB (-)" : `size total=${totalKb} KiB largest=${largest.sizeKb} KiB (${largest.name})`;
+  console.log(`[demo-sweep] enqueued ${messages.length} of ${due.length} eligible (cut ${cut.toISOString()}) ${sizeReport}`);
   return messages.length;
 }
 

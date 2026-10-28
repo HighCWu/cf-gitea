@@ -4,6 +4,8 @@
  * DOM the unmodified official Gitea bundles enhance. Verified against the
  * pinned upstream templates: base/head.tmpl, head_script.tmpl, head_style.tmpl,
  * head_navbar.tmpl, repo/header.tmpl, base/footer.tmpl, status/404.tmpl.
+ * SPEC-0014 §4.4 (M2): the DEMO_MODE-gated demo banner rides BaseLayout —
+ * gate off it renders no DOM node at all (§2 invariant).
  */
 
 import { renderToString } from "hono/jsx/dom/server";
@@ -379,6 +381,77 @@ export function Footer() {
 }
 
 // ---------------------------------------------------------------------------
+// The demo banner (SPEC-0014 §4.4, M2)
+// ---------------------------------------------------------------------------
+
+/** Chrome text for the demo banner — the component-local pattern (the
+ *  tabLocale/createLocale precedent above; locale.ts is shared and not this
+ *  wave's file). cf-gitea addition: upstream has NO in-tree demo banner at
+ *  the pin — the practice is an ops convention (SPEC-0014 §1: Gitea's own
+ *  demo at demo.gitea.com carries a "test instance, data is cleaned" notice
+ *  injected outside the tree), so there is no upstream locale key to cite.
+ *  The text is the approved parameter's ("data on this instance is
+ *  periodically cleaned") with the minimal demo context prefix. */
+const demoBannerLocale = {
+  text: "This is a demo instance: data on this instance is periodically cleaned.",
+  dismiss_aria: "Dismiss notice",
+} as const;
+
+/** The per-session dismissal key (sessionStorage — §4.4: the dismissal
+ *  never round-trips the server: no endpoint, no D1, and it dies with the
+ *  browser session, which is the "per session" semantic). */
+export const DEMO_BANNER_STORAGE_KEY = "cf-gitea-demo-banner-dismissed";
+
+/**
+ * The dismissal script (§4.4 — "an inline script flips a sessionStorage key
+ * and hides the node"). Static bytes, evaluated in place right after the
+ * banner node (parser order, the ERROR_COLLECTOR/FRONTEND_INITED_CANARY
+ * convention): already-dismissed sessions hide the node before first paint;
+ * otherwise the close control gets click + keyboard (Enter/Space) arms that
+ * set the key, then hide. Every storage touch is try/caught — private-mode
+ * sessionStorage throws must never break the page (the dismissal simply
+ * degrades to per-pageload). The node keeps rendering server-side on every
+ * armed request; only the client hides it, so a fresh session sees the
+ * banner again (dismissable-per-SESSION, not forever).
+ */
+export const DEMO_BANNER_DISMISS_SCRIPT = [
+  `(function(){`,
+  `var b=document.getElementById("demo-banner");`,
+  `if(!b)return;`,
+  `var hide=function(){b.style.display="none"};`,
+  `try{if(sessionStorage.getItem("${DEMO_BANNER_STORAGE_KEY}")==="1"){hide();return}}catch(e){}`,
+  `var x=document.getElementById("demo-banner-dismiss");`,
+  `if(!x)return;`,
+  `var dismiss=function(){try{sessionStorage.setItem("${DEMO_BANNER_STORAGE_KEY}","1")}catch(e){}hide()};`,
+  `x.addEventListener("click",dismiss);`,
+  `x.addEventListener("keydown",function(ev){if(ev.key==="Enter"||ev.key===" "){ev.preventDefault();dismiss()}});`,
+  `})();`,
+].join("");
+
+/**
+ * The banner node (§4.4): "a fixed-height notice above the role="main" div".
+ * The markup is upstream's flash-message bar at the pin — RenderFlashMessage
+ * emits `<div class="ui {cls} message flash-message flash-{typ}">` wrapping a
+ * `tw-text-center` line (gitea/modules/templates/util_render.go:263-292,
+ * base/alert.tmpl), so the vendored bundle styles this notice with zero
+ * custom CSS; the close control is Fomantic's message-close shape
+ * (`i.close.icon`, a direct child of the message). `role="note"` + the
+ * labelled, focusable close (upstream's `<i>` has no semantics of its own)
+ * keep the a11y smoke honest.
+ */
+function DemoBanner() {
+  return (
+    <>
+      <div class="ui info message flash-message flash-info" id="demo-banner" role="note">
+        <i class="close icon" id="demo-banner-dismiss" role="button" tabindex={0} aria-label={demoBannerLocale.dismiss_aria} />
+        <div class="tw-text-center">{demoBannerLocale.text}</div>
+      </div>
+      <script dangerouslySetInnerHTML={{ __html: DEMO_BANNER_DISMISS_SCRIPT }} />
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // BaseLayout
 // ---------------------------------------------------------------------------
 
@@ -423,6 +496,24 @@ export function BaseLayout(props: {
         <div class="full height">
           <noscript>{locale.enable_javascript}</noscript>
           <Navbar viewer={ctx.viewer} activeNav={props.activeNav} notificationCount={ctx.notificationCount} />
+          {/* SPEC-0014 §4.4 (M2): the demo banner rides the ctx flag — armed
+              ONLY when the assembler set `demoMode` from the §2 gate. Gate
+              off (absent/false — every default deployment) this branch emits
+              NOTHING: no node, no script, byte-identical pages (the goldens
+              pin it).
+              HANDOFF NOTE (the assembler one-liner, orchestrator-owned —
+              landed unmounted per the two-phase discipline; first-run.ts's
+              mount-recipe precedent):
+                1. src/ui/index.ts `resolveUiSession` — add to the ctx
+                   literal:  demoMode: demoModeEnabled(c.env),
+                2. src/ui/session.ts pageContext (the /login render) — same
+                   key in the returned ctx literal,
+                3. src/ui/first-run.ts pageContext (/install, /user/sign_up)
+                   — same key in the returned ctx literal,
+              each importing `demoModeEnabled` from ../services/demo-sweep.
+              Until it lands the banner is test-covered but never armed —
+              exactly the M1 scheduled-dispatch staging. */}
+          {ctx.demoMode === true ? <DemoBanner /> : null}
           <div
             role="main"
             aria-label={props.title ?? pageTitle}
