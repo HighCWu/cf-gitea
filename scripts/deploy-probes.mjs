@@ -93,6 +93,27 @@
  *                  families legitimately red; the post-deploy run is the
  *                  verdict). A red run sweeps its repos + org + member user +
  *                  session row (the failureTail).
+ *   branch-protection The SPEC-0013 protection flows over one scratch repo
+ *                  (the gate-assessment gap 2 closure — the M1-M4 surface is
+ *                  deployed; this verifies the FLOWS, not just the table):
+ *                  the rule CRUD round-trip (create → field-faithful echo at
+ *                  priority 1 → GET + list → missing-404 → edit → delete →
+ *                  404-after-delete → list []), the priority swap (ids via
+ *                  wrangler d1 — neither render exposes an addressable rule
+ *                  id), the push-time per-ref rejection (ONE real push
+ *                  carrying a protected ref + an unprotected sibling: git
+ *                  exit 1, "! [remote rejected] … (Not allowed to push to
+ *                  protected branch main)", main unmoved, sibling landed),
+ *                  the merge approval gate (PR into the protected branch →
+ *                  405 "Does not have enough approvals" → an ADMIN-minted
+ *                  write collaborator's official APPROVED review → merge 200,
+ *                  main advanced), and the whitelist/enforce-admins flag set
+ *                  round-tripping the serializer (glob name → branch_name "",
+ *                  the M4 sanitizer keeps the owner, the enable_push=false
+ *                  cascade). CHAINED (shared fixtures). Needs an ADMIN PAT +
+ *                  wrangler auth for the priority id lookup (--d1-scope). A
+ *                  red run sweeps the rules + repo + member user + its token
+ *                  (the failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -186,7 +207,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -276,6 +297,7 @@ const usage = () =>
   "  window2-mounts: (no extra options)\n" +
   "  window3-mounts: (no extra options)\n" +
   "  fixwave-parity: (no extra options — needs an ADMIN PAT + wrangler auth for the d1 arms; --d1-scope rides the rotation backdate)\n" +
+  "  branch-protection: (no extra options — needs an ADMIN PAT for the member arm + wrangler auth for the priority id lookup; --d1-scope rides it)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -2828,6 +2850,517 @@ const fixwaveFailureCleanup = async (ctx) => {
   if (acts.length) log(`  [tail] fw-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
 };
 
+// ---------- battery: branch-protection (the SPEC-0013 protection flows) ----------
+
+/**
+ * The SPEC-0013 protection flows (the gate-assessment gap 2 closure — the
+ * full M1-M4 surface is deployed; this battery verifies the FLOWS, not just
+ * the table's existence, per redeploy). One scratch repo carries four arms:
+ *
+ *   1. Rule CRUD (branch.go:652-1195 via /branch_protections): a throwaway
+ *      rule's create → 201 field-faithful echo (priority MAX+1 = 1 on the
+ *      empty repo, the zero config), GET + LIST faithful, GET of a missing
+ *      rule → the plain shared 404 (the EXACT-name lookup — no glob
+ *      fall-through), PATCH {required_approvals, block_on_outdated_branch} →
+ *      200 with both echoed, DELETE → 204 then GET → 404 (404-after-delete)
+ *      and the list back to [].
+ *   2. Priority (repoUpdateBranchProtectionPriories): a second rule, then the
+ *      ids POST {ids:[…]} → 204 and the list order follows the renumber. The
+ *      ids come from wrangler d1 (--d1-scope): NEITHER the BranchProtection
+ *      render (structs/repo_branch.go has no id field) nor the repo render
+ *      (repositoryIdNumber parses the TEXT uuid → 0) exposes an addressable
+ *      rule id — the D1 lookup is the probe's only lever, and the gap is
+ *      recorded here rather than invented around.
+ *   3. Push-time per-ref rejection (the M2 gate): ONE real `git push` carrying
+ *      TWO refs — a fast-forward to the protected main plus a create of an
+ *      unprotected sibling. The protected ref answers upstream's per-ref
+ *      report rejection (`! [remote rejected] … (Not allowed to push to
+ *      protected branch main)`, git exit 1 — a door-403 would exit 128) while
+ *      the sibling LANDS; ls-remote shows main unmoved at the pre-push tip.
+ *   4. The merge approval gate (checkPullBranchProtections, merge.go:694-742):
+ *      a PR into the protected branch (required_approvals 1) merges → 405
+ *      with the verbatim ErrNotReadyToMerge text "Does not have enough
+ *      approvals"; then an ADMIN-minted second user (the fixwave member
+ *      methodology) added as a write collaborator submits an APPROVED review
+ *      — official:true without the approvals whitelist is upstream's
+ *      write-access arm (protected_branch.go:264-289) — and the SAME merge
+ *      answers 200 (has-merged 204; main advanced past the pre-push tip).
+ *   5. The whitelist/enforce-admins flag round-trip (M4): a GLOB rule (v*) —
+ *      whose deprecated branch_name renders EMPTY per isRuleNameSpecial —
+ *      carrying the enforceable flag set (push/force-push/deletion
+ *      whitelists, merge whitelist, bypass allowlist, approvals whitelist +
+ *      required_approvals 2, block_on_outdated_branch,
+ *      block_admin_merge_override, status-check contexts, protected-file
+ *      patterns) round-trips the serializer field-faithfully (the M4
+ *      sanitizer keeps the owner — write/any-access — in every list), then a
+ *      PATCH {enable_push:false} shows the landed pointer semantics: the
+ *      push master flips its flags off and the canDelete re-conjunction
+ *      clears the deletion pair, while the stored id lists survive their
+ *      disabled flags (upstream keeps WhitelistUserIDs; the render maps
+ *      ids→names regardless) and the ABSENT arms keep their stored values
+ *      (branch.go:894-936).
+ *
+ * CHAINED (the shared-fixture shape — a red in the setup skips the arms that
+ * need it, like registry/generate; NOT independent like fixwave-parity: the
+ * arms share one repo and the merge gate's verdict reads arms built earlier).
+ * Needs an ADMIN PAT (the member-user arm) and wrangler auth for the priority
+ * arm's rule-id lookup (--d1-scope picks the database, remote by default —
+ * keep it in step with --base-url). A red run sweeps the rules (best-effort
+ * explicit deletes, so a failed repo delete still lands the audit back at
+ * protected_branches == 0), then the repo (its delete cascades the rest),
+ * then the member's token + the member user (the fixwave tail's shape).
+ */
+
+const branchProtectionContext = () => ({
+  user: opts.user,
+  repo: `bp-${hexId()}`,
+  featureBranch: `bpfe-${hexId()}`,
+  scratchRule: `bps-${hexId(6)}`,
+  devRule: `bpd-${hexId(6)}`,
+  globRule: "v*",
+  missingRule: `bp-missing-${hexId(6)}`,
+  prNumber: null,
+  c1: null, // the pre-push main tip (the rejection's must-not-move pin)
+  c2: null, // the push-arm commit (the sibling's tip, the merged PR's head)
+  member: `bpmb-${hexId()}`, memberToken: null, memberTokenId: null,
+  // The rules this battery created, in order — { name, created, gone }. The
+  // green cleanup + the red tail both iterate it (explicit deletes so the
+  // audit's protected_branches == 0 holds even when the repo delete fails).
+  rules: [],
+  repoCreated: false, repoFullName: null, repoGone: false,
+  memberCreated: false, memberGone: false,
+  tmp: null,
+});
+
+/** POST one rule on the battery's repo; marks it created for the failure-tail
+ *  sweep and returns the raw response. */
+const createRule = async (ctx, body) => {
+  const res = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections`, { method: "POST", body });
+  const track = ctx.rules.find((r) => r.name === body.rule_name);
+  if (res.status === 201 && track) track.created = true;
+  return res;
+};
+
+/** The create/read echo assertions shared by the CRUD and flags arms. */
+const expectRuleFields = (got, checks, where) => {
+  const drifted = checks.filter(([k, v]) => JSON.stringify(got?.[k]) !== JSON.stringify(v));
+  expect(drifted.length === 0, `${where}: fields drifted — ${drifted.map(([k, v]) => `${k}=${JSON.stringify(got?.[k])} (expected ${JSON.stringify(v)})`).join("; ")}`);
+};
+
+/** DELETE one rule by name (204 expected); marks it gone for the sweep. */
+const deleteRule = async (ctx, name) => {
+  const res = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections/${encodeURIComponent(name)}`, { method: "DELETE" });
+  const track = ctx.rules.find((r) => r.name === name);
+  if (res.status === 204 && track) track.gone = true;
+  return res.status;
+};
+
+const branchProtectionSteps = (ctx) => [
+  {
+    id: "bp-repo-create-201",
+    expect: `POST /api/v1/user/repos {"name":"${ctx.repo}","auto_init":true} → 201 (the branch-protection battery's scratch repo)`,
+    run: async () => {
+      const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, auto_init: true } });
+      if (res.status === 201) ctx.repoCreated = true; // mark on the observable write
+      ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      return `created ${res.json?.full_name}`;
+    },
+  },
+  {
+    id: "bp-rule-create-201",
+    expect: `POST …/branch_protections {"rule_name":"${ctx.scratchRule}"} → 201 field-faithful: rule_name + branch_name echo the plain name, priority 1 (MAX+1 on the empty repo — protected_branch.go:502-513), the zero config (enable_push false, required_approvals 0)`,
+    run: async () => {
+      ctx.rules.push({ name: ctx.scratchRule, created: false, gone: false });
+      const res = await createRule(ctx, { rule_name: ctx.scratchRule });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 160)}`);
+      expectRuleFields(res.json, [
+        ["rule_name", ctx.scratchRule], ["branch_name", ctx.scratchRule], ["priority", 1],
+        ["enable_push", false], ["required_approvals", 0], ["enable_push_whitelist", false],
+      ], "the create echo");
+      return `rule ${ctx.scratchRule} created (priority 1, the zero config echoed)`;
+    },
+  },
+  {
+    id: "bp-rule-read-faithful",
+    expect: `GET …/branch_protections/${ctx.scratchRule} → 200 echoing the create render; GET …/branch_protections → 200 listing exactly it (the priority-sorted list, one row)`,
+    run: async () => {
+      const one = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections/${ctx.scratchRule}`);
+      expect(one.status === 200, `GET status ${one.status} (expected 200): ${one.text.slice(0, 160)}`);
+      expectRuleFields(one.json, [
+        ["rule_name", ctx.scratchRule], ["branch_name", ctx.scratchRule], ["priority", 1], ["enable_push", false],
+      ], "the GET render");
+      const list = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections`);
+      expect(list.status === 200 && Array.isArray(list.json), `list status ${list.status} (expected 200 + an array): ${list.text.slice(0, 120)}`);
+      expect(list.json.length === 1 && list.json[0]?.rule_name === ctx.scratchRule,
+        `the list should carry exactly the one rule (got ${JSON.stringify(list.json?.map((r) => r.rule_name))})`);
+      return `GET echoes the row; the list carries exactly it`;
+    },
+  },
+  {
+    id: "bp-rule-missing-404",
+    expect: `GET …/branch_protections/${ctx.missingRule} → 404 "not found" (the EXACT-name rule lookup — an unknown name is the plain shared 404, never a glob fall-through or a 400)`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections/${ctx.missingRule}`);
+      expect(res.status === 404, `status ${res.status} (expected 404): ${res.text.slice(0, 160)}`);
+      expect(res.json?.message === "not found", `message ${JSON.stringify(res.json?.message)} (expected the plain not-found report)`);
+      return `404 — the unknown rule name answers the plain shared not-found`;
+    },
+  },
+  {
+    id: "bp-rule-edit-200",
+    expect: `PATCH …/branch_protections/${ctx.scratchRule} {"required_approvals":1,"block_on_outdated_branch":true} → 200 with BOTH echoed (the pointer semantics: only the fields the body carries change)`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections/${ctx.scratchRule}`, {
+        method: "PATCH", body: { required_approvals: 1, block_on_outdated_branch: true },
+      });
+      expect(res.status === 200, `status ${res.status} (expected 200): ${res.text.slice(0, 160)}`);
+      expectRuleFields(res.json, [
+        ["rule_name", ctx.scratchRule], ["required_approvals", 1], ["block_on_outdated_branch", true],
+        ["enable_push", false], // the absent arm kept its stored false
+      ], "the edit echo");
+      return `PATCH echoed both new values (enable_push untouched by its absence)`;
+    },
+  },
+  {
+    id: "bp-rule-delete-404-after",
+    expect: `DELETE …/branch_protections/${ctx.scratchRule} → 204; the SAME GET → 404 (404-after-delete); GET …/branch_protections → [] (the list back to empty)`,
+    run: async () => {
+      const status = await deleteRule(ctx, ctx.scratchRule);
+      expect(status === 204, `DELETE status ${status} (expected 204)`);
+      const gone = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections/${ctx.scratchRule}`);
+      expect(gone.status === 404, `post-delete GET status ${gone.status} (expected 404)`);
+      const list = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections`);
+      expect(list.status === 200 && Array.isArray(list.json) && list.json.length === 0,
+        `the list should be empty after the delete (got ${JSON.stringify(list.json)})`);
+      return `deleted (204) → GET 404 → list [] — the CRUD round-trip closed`;
+    },
+  },
+  {
+    id: "bp-rule-main-create-201",
+    expect: `POST …/branch_protections {"rule_name":"main","required_approvals":1} → 201 (the WORKING rule for the push/merge arms: main protected, one approval required, enable_push still false — everyone rejected at the push gate)`,
+    run: async () => {
+      ctx.rules.push({ name: "main", created: false, gone: false });
+      const res = await createRule(ctx, { rule_name: "main", required_approvals: 1 });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 160)}`);
+      expectRuleFields(res.json, [
+        ["rule_name", "main"], ["branch_name", "main"], ["priority", 1], ["required_approvals", 1], ["enable_push", false],
+      ], "the working-rule echo");
+      return `rule main created (priority 1, required_approvals 1, push closed)`;
+    },
+  },
+  {
+    id: "bp-rule-priority-204",
+    expect: `THE PRIORITY OP: POST a second rule (priority 2) → 201; rule ids read via wrangler d1 (--${opts.d1Scope} — the render carries none: BranchProtection has no id field and the repo render's id parses the TEXT uuid to 0); POST …/branch_protections/priority {"ids":[<dev>,<main>]} → 204; the list order follows the renumber [dev(1), main(2)]`,
+    run: async () => {
+      ctx.rules.push({ name: ctx.devRule, created: false, gone: false });
+      const dev = await createRule(ctx, { rule_name: ctx.devRule });
+      expect(dev.status === 201, `second-rule status ${dev.status} (expected 201): ${dev.text.slice(0, 160)}`);
+      expect(dev.json?.priority === 2, `second-rule priority ${dev.json?.priority} (expected 2 — MAX+1)`);
+      const repoRow = await d1Exec(`SELECT id FROM repositories WHERE owner_namespace = '${ctx.user}' AND slug = '${ctx.repo}'`);
+      const repoId = repoRow.at(-1)?.results?.[0]?.id;
+      expect(typeof repoId === "string" && repoId.length > 0, `no D1 repositories row for ${ctx.user}/${ctx.repo} (the probe addresses rules by id; the API render carries none)`);
+      const ruleRows = await d1Exec(`SELECT id, rule_name FROM protected_branches WHERE repo_id = '${repoId}'`);
+      const rows = ruleRows.at(-1)?.results ?? [];
+      const idOf = (name) => rows.find((r) => r.rule_name === name)?.id;
+      const ids = [idOf(ctx.devRule), idOf("main")];
+      expect(ids.every((v) => Number.isInteger(v)), `rule ids from D1 are not integers: ${JSON.stringify(rows)}`);
+      const prio = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections/priority`, { method: "POST", body: { ids } });
+      expect(prio.status === 204, `priority status ${prio.status} (expected 204): ${prio.text.slice(0, 160)}`);
+      const list = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections`);
+      const order = (list.json ?? []).map((r) => `${r.rule_name}(${r.priority})`);
+      expect(list.json?.length === 2 && list.json[0]?.rule_name === ctx.devRule && list.json[0]?.priority === 1 &&
+          list.json[1]?.rule_name === "main" && list.json[1]?.priority === 2,
+        `the list did not follow the swap: [${order.join(", ")}] (expected [${ctx.devRule}(1), main(2)])`);
+      return `priority swap 204 — the list renumbered to [${order.join(", ")}] (ids via d1)`;
+    },
+  },
+  {
+    id: "bp-push-protected-rejected",
+    expect: `THE PUSH GATE: one REAL push carrying TWO refs — a fast-forward to the protected main + a create of the unprotected ${ctx.featureBranch} — answers the per-ref report rejection for main (git exit 1, "! [remote rejected] … (Not allowed to push to protected branch main)") while the sibling LANDS; ls-remote pins main at the pre-push tip`,
+    run: async () => {
+      const work = path.join(ctx.tmp, "work");
+      let r = await git(["clone", gitUrl(ctx.user, ctx.repo), "work"], ctx.tmp, { auth: true });
+      expect(r.ok, `clone failed: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+      r = await git(["rev-parse", "HEAD"], work);
+      expect(r.ok, `rev-parse HEAD failed: ${r.stderr.trim()}`);
+      ctx.c1 = r.stdout.trim();
+      await writeFile(path.join(work, "bp.txt"), `deploy-probes branch-protection ${ctx.featureBranch}\n`);
+      r = await git(["add", "-A"], work);
+      expect(r.ok, `git add failed: ${r.stderr.trim()}`);
+      r = await git(["-c", "user.name=cf-gitea-probes", "-c", "user.email=probes@cf-gitea.invalid",
+        "commit", "-m", "deploy-probes: branch-protection push-arm commit"], work);
+      expect(r.ok, `git commit failed: ${r.stderr.trim()}`);
+      r = await git(["rev-parse", "HEAD"], work);
+      expect(r.ok, `rev-parse HEAD failed: ${r.stderr.trim()}`);
+      ctx.c2 = r.stdout.trim();
+      // ONE command, TWO refspecs (the landed unit test's per-ref shape —
+      // branch-protection-push.test.ts's "sibling lands" arm over the wire).
+      r = await git(["push", "origin", "main:refs/heads/main", `main:refs/heads/${ctx.featureBranch}`], work, { auth: true });
+      expect(!r.ok, `the protected push was ACCEPTED (exit 0) — the rule on main (enable_push false) did not bite`);
+      expect(r.code === 1, `push exit ${r.code} (expected 1 — a report rejection; 128 would mean the gate refused at the DOOR instead of per-ref): ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+      expect(r.stderr.includes("remote rejected") && r.stderr.includes("Not allowed to push to protected branch main"),
+        `stderr does not carry the upstream per-ref text: ${r.stderr.trim().slice(0, 240)}`);
+      const done = await poll(SETTLE_MS, async () => {
+        const lr = await lsRemote(gitUrl(ctx.user, ctx.repo), { auth: true });
+        return lr.ok && lr.refs.has(`refs/heads/${ctx.featureBranch}`) ? lr : null;
+      });
+      expect(done !== null, `the unprotected sibling never landed within ${SETTLE_MS} ms (the rejection took the whole push?)`);
+      expect(done.refs.get("refs/heads/main") === ctx.c1,
+        `main MOVED to ${done.refs.get("refs/heads/main")} despite the rejection (per-ref isolation lost)`);
+      expect(done.refs.get(`refs/heads/${ctx.featureBranch}`) === ctx.c2,
+        `the sibling tip ${done.refs.get(`refs/heads/${ctx.featureBranch}`)} != the pushed commit ${ctx.c2}`);
+      return `main rejected ("Not allowed to push to protected branch main", exit 1, still at ${ctx.c1.slice(0, 10)}…); sibling landed at ${ctx.c2.slice(0, 10)}…`;
+    },
+  },
+  {
+    id: "bp-pr-open-201",
+    expect: `POST /repos/${ctx.user}/${ctx.repo}/pulls {"head":"${ctx.featureBranch}","base":"main"} → 201 (the PR into the protected branch — protection never gates PR creation) + settle-polled GET until mergeable leaves null (budget 15s), head.sha = the push-arm commit`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/pulls`, {
+        method: "POST",
+        body: { title: `deploy-probes branch-protection ${ctx.featureBranch}`, head: ctx.featureBranch, base: "main" },
+      });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 200)}`);
+      expect(Number.isInteger(res.json?.number) && res.json.number > 0, `no PR number in the body: ${res.text.slice(0, 120)}`);
+      ctx.prNumber = res.json.number;
+      const pr = await poll(15_000, async () => {
+        const get = await api(`/repos/${ctx.user}/${ctx.repo}/pulls/${ctx.prNumber}`);
+        return get.status === 200 && get.json?.mergeable !== null && get.json?.mergeable !== undefined ? get.json : null;
+      });
+      expect(pr !== null, `PR #${ctx.prNumber} never resolved with a non-null mergeable within 15 s`);
+      expect(pr.head?.sha === ctx.c2, `head.sha ${pr.head?.sha} != the push-arm commit ${ctx.c2}`);
+      return `PR #${ctx.prNumber} open into the protected main, mergeable ${pr.mergeable}`;
+    },
+  },
+  {
+    id: "bp-merge-blocked-405",
+    expect: `THE MERGE GATE (blocked arm): POST …/pulls/${"{N}"}/merge {"do":"merge"} with 0 approvals on a required_approvals-1 rule → 405 with the verbatim ErrNotReadyToMerge text "Does not have enough approvals" (checkPullBranchProtections, merge.go:694-742)`,
+    run: async () => {
+      expect(Number.isInteger(ctx.prNumber), "no open PR from the prior arms (fixture missing)");
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/pulls/${ctx.prNumber}/merge`, { method: "POST", body: { do: "merge" } });
+      expect(res.status === 405, `status ${res.status} (expected 405 — the protection verdict family): ${res.text.slice(0, 160)}`);
+      expect(res.json?.message === "Does not have enough approvals",
+        `message ${JSON.stringify(res.json?.message)} (expected the verbatim upstream text)`);
+      return `405 verbatim: ${res.json?.message}`;
+    },
+  },
+  {
+    id: "bp-member-setup-204s",
+    expect: `the approval fixtures via the API (the fixwave member methodology): POST /admin/users → 201; POST /users/${"{name}"}/tokens {"scopes":["all"]} → 201 over HTTP BASIC (upstream's reqBasicAuth gate; the one-time plaintext scrubbed); PUT /repos/${"{owner}/{repo}"}/collaborators/${"{name}"} {"permission":"write"} → 204 (write access = official reviewer without the approvals whitelist)`,
+    run: async () => {
+      const user = await api("/admin/users", {
+        method: "POST",
+        body: { username: ctx.member, email: `${ctx.member}@probes.cf-gitea.invalid`, visibility: "private", must_change_password: false },
+      });
+      if (user.status === 201) ctx.memberCreated = true; // mark on the observable write
+      expect(user.status === 201, `user status ${user.status} (expected 201 — an ADMIN PAT is required): ${user.text.slice(0, 160)}`);
+      const tok = await api(`/users/${ctx.member}/tokens`, {
+        method: "POST", basic: { user: ctx.user, pass: TOKEN }, body: { name: `bp-${hexId()}`, scopes: ["all"] },
+      });
+      expect(tok.status === 201, `token status ${tok.status} (expected 201 — the mint rides HTTP BASIC, upstream's token-CRUD gate): ${tok.text.slice(0, 160)}`);
+      const plaintext = String(tok.json?.sha1 ?? "");
+      secrets.push(plaintext); // scrub BEFORE any assert detail could carry it
+      expect(plaintext.length > 0, `no one-time plaintext in the mint body: ${scrub(tok.text.slice(0, 120))}`);
+      ctx.memberToken = plaintext;
+      ctx.memberTokenId = tok.json?.id;
+      const collab = await api(`/repos/${ctx.user}/${ctx.repo}/collaborators/${ctx.member}`, {
+        method: "PUT", body: { permission: "write" },
+      });
+      expect(collab.status === 204, `collaborator status ${collab.status} (expected 204): ${collab.text.slice(0, 120)}`);
+      return `member ${ctx.member} + write collaborator + minted token id ${ctx.memberTokenId}`;
+    },
+  },
+  {
+    id: "bp-approval-official-200",
+    expect: `the collaborator approves: POST …/pulls/${"{N}"}/reviews {"event":"APPROVED"} AS THE MEMBER → 200 with state APPROVED and official:true (protected_branch.go:264-289's write-access arm — an unofficial approval would not count toward required_approvals)`,
+    run: async () => {
+      expect(ctx.memberToken !== null && Number.isInteger(ctx.prNumber), "no member token / PR from the prior arms (fixture missing)");
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/pulls/${ctx.prNumber}/reviews`, {
+        method: "POST", asToken: ctx.memberToken, body: { event: "APPROVED", body: "deploy-probes branch-protection approval" },
+      });
+      expect(res.status === 200, `status ${res.status} (expected 200): ${res.text.slice(0, 160)}`);
+      expect(res.json?.state === "APPROVED", `state ${res.json?.state} (expected APPROVED): ${res.text.slice(0, 160)}`);
+      expect(res.json?.official === true, `official ${res.json?.official} (expected true — write access is official without the approvals whitelist)`);
+      return `official approval landed (state APPROVED, official true)`;
+    },
+  },
+  {
+    id: "bp-merge-satisfied-200",
+    expect: `THE MERGE GATE (satisfied arm): the SAME merge → 200 (required_approvals now met; has-merged GET → 204), and main advanced past the pre-push tip ${ctx.c1 ?? "<the pre-push tip>"} (the merge commit landed on the protected branch)`,
+    run: async () => {
+      expect(Number.isInteger(ctx.prNumber), "no open PR from the prior arms (fixture missing)");
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/pulls/${ctx.prNumber}/merge`, { method: "POST", body: { do: "merge" } });
+      expect(res.status === 200, `merge status ${res.status} (expected 200 once the approval is in): ${res.text.slice(0, 160)}`);
+      const check = await api(`/repos/${ctx.user}/${ctx.repo}/pulls/${ctx.prNumber}/merge`);
+      expect(check.status === 204, `has-merged GET status ${check.status} (expected 204)`);
+      const lr = await lsRemote(gitUrl(ctx.user, ctx.repo), { auth: true });
+      expect(lr.ok && lr.refs.get("refs/heads/main") !== ctx.c1,
+        `main is still at the pre-push tip ${ctx.c1} — the merge commit never landed on the protected branch`);
+      return `PR #${ctx.prNumber} merged (200 + has-merged 204); main advanced to ${lr.refs.get("refs/heads/main")?.slice(0, 10)}…`;
+    },
+  },
+  {
+    id: "bp-flags-roundtrip",
+    expect: `THE WHITELIST/ENFORCE-ADMINS ROUND-TRIP (M4): POST a GLOB rule "${ctx.globRule}" carrying the enforceable flag set (push/force-push/deletion whitelists + merge whitelist + bypass allowlist + approvals whitelist, all [<owner>]; required_approvals 2; block_on_outdated_branch, block_admin_merge_override; status-check contexts; protected-file patterns) → 201 echoing EVERY field (branch_name "" — the glob name is special; the M4 sanitizer keeps the owner, who holds write/any-access, in every list) and the GET echoes it again`,
+    run: async () => {
+      ctx.rules.push({ name: ctx.globRule, created: false, gone: false });
+      const ownerList = [ctx.user];
+      const res = await createRule(ctx, {
+        rule_name: ctx.globRule,
+        enable_push: true, enable_push_whitelist: true, push_whitelist_usernames: ownerList,
+        enable_force_push: true, enable_force_push_allowlist: true, force_push_allowlist_usernames: ownerList,
+        enable_deletion: true, enable_deletion_allowlist: true, deletion_allowlist_usernames: ownerList,
+        enable_merge_whitelist: true, merge_whitelist_usernames: ownerList,
+        enable_bypass_allowlist: true, bypass_allowlist_usernames: ownerList,
+        required_approvals: 2, enable_approvals_whitelist: true, approvals_whitelist_username: ownerList,
+        block_on_outdated_branch: true, dismiss_stale_approvals: true, block_admin_merge_override: true,
+        enable_status_check: true, status_check_contexts: ["ci/bp-probe"],
+        protected_file_patterns: "docs/**",
+      });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 200)}`);
+      expectRuleFields(res.json, [
+        ["rule_name", ctx.globRule], ["branch_name", ""], // isRuleNameSpecial — the deprecated field renders EMPTY for a glob
+        ["enable_push", true], ["enable_push_whitelist", true], ["push_whitelist_usernames", ownerList],
+        ["enable_force_push", true], ["enable_force_push_allowlist", true], ["force_push_allowlist_usernames", ownerList],
+        ["enable_deletion", true], ["enable_deletion_allowlist", true], ["deletion_allowlist_usernames", ownerList],
+        ["enable_merge_whitelist", true], ["merge_whitelist_usernames", ownerList],
+        ["enable_bypass_allowlist", true], ["bypass_allowlist_usernames", ownerList],
+        ["required_approvals", 2], ["enable_approvals_whitelist", true], ["approvals_whitelist_username", ownerList],
+        ["block_on_outdated_branch", true], ["dismiss_stale_approvals", true], ["block_admin_merge_override", true],
+        ["enable_status_check", true], ["status_check_contexts", ["ci/bp-probe"]],
+        ["protected_file_patterns", "docs/**"],
+      ], "the create echo");
+      const read = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections/${encodeURIComponent(ctx.globRule)}`);
+      expect(read.status === 200, `GET status ${read.status} (expected 200): ${read.text.slice(0, 160)}`);
+      expectRuleFields(read.json, [
+        ["rule_name", ctx.globRule], ["branch_name", ""], ["merge_whitelist_usernames", ownerList],
+        ["approvals_whitelist_username", ownerList], ["block_admin_merge_override", true],
+      ], "the GET render");
+      return `the flag set round-trips field-faithfully (glob → branch_name ""; the owner survived every whitelist filter)`;
+    },
+  },
+  {
+    id: "bp-flags-cascade-edit",
+    expect: `THE CASCADE (branch.go:894-936): PATCH "${ctx.globRule}" {"enable_push":false} → 200 where the push master flips its flags off and the re-conjunction clears the deletion pair (enable_push + enable_push_whitelist false, enable_deletion + enable_deletion_allowlist false, deletion_allowlist_usernames [] — the disabled arm's array scrub) while the stored id lists SURVIVE their disabled flags (upstream keeps WhitelistUserIDs on a flag-off edit and the render maps ids→names regardless: push/force-push/merge/bypass/approvals lists stay [<owner>]) and the other absent arms keep theirs (required_approvals 2, status-check, block_admin_merge_override)`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections/${encodeURIComponent(ctx.globRule)}`, {
+        method: "PATCH", body: { enable_push: false },
+      });
+      expect(res.status === 200, `status ${res.status} (expected 200): ${res.text.slice(0, 160)}`);
+      expectRuleFields(res.json, [
+        ["enable_push", false], ["enable_push_whitelist", false],
+        ["enable_deletion", false], ["enable_deletion_allowlist", false], ["deletion_allowlist_usernames", []],
+        // The flag-off edit KEEPS the stored id lists (upstream branch.go: only
+        // the enable flags flip; the render maps ids→names regardless), and
+        // every absent arm keeps its stored value (the pointer semantics).
+        ["push_whitelist_usernames", [ctx.user]],
+        ["enable_force_push", true], ["enable_force_push_allowlist", true],
+        ["force_push_allowlist_usernames", [ctx.user]],
+        ["enable_merge_whitelist", true], ["merge_whitelist_usernames", [ctx.user]],
+        ["enable_bypass_allowlist", true], ["bypass_allowlist_usernames", [ctx.user]],
+        ["required_approvals", 2], ["enable_approvals_whitelist", true], ["approvals_whitelist_username", [ctx.user]],
+        ["enable_status_check", true], ["status_check_contexts", ["ci/bp-probe"]],
+        ["block_admin_merge_override", true],
+      ], "the cascade echo");
+      return `the flags flipped off + the deletion pair scrubbed; the id lists and absent arms kept (upstream branch.go:894-936)`;
+    },
+  },
+  {
+    id: "bp-cleanup",
+    expect: `everything DELETEd: every created rule (204 each; the list back to []), the repo (204 — its delete cascades any surviving rule rows), the member's token (204, HTTP BASIC) + the member user (204) — a failed cleanup is documented, not fatal (the failure-tail re-sweeps)`,
+    run: async () => {
+      const parts = [];
+      for (const rule of ctx.rules) {
+        if (!rule.created || rule.gone) continue;
+        const status = await deleteRule(ctx, rule.name);
+        parts.push(status === 204 ? `rule ${rule.name} deleted` : `rule ${rule.name} LEFT BEHIND — DELETE returned ${status}`);
+      }
+      const list = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections`);
+      expect(list.status === 200 && Array.isArray(list.json) && list.json.length === 0,
+        `the rule list should be empty after the deletes (got ${JSON.stringify(list.json?.map((r) => r.rule_name))})`);
+      parts.push("the rule list is empty");
+      const repo = await deleteRepo(ctx.user, ctx.repo);
+      if (typeof repo === "string") ctx.repoGone = true;
+      parts.push(typeof repo === "string" ? repo : repo.detail);
+      if (ctx.memberCreated) {
+        if (ctx.memberTokenId !== null && ctx.memberTokenId !== undefined) {
+          // Token CRUD is HTTP-BASIC-gated (the mint arm's live finding): the
+          // revoke rides the same Basic credential, never the token header.
+          const tok = await api(`/users/${ctx.member}/tokens/${ctx.memberTokenId}`, {
+            method: "DELETE", basic: { user: ctx.user, pass: TOKEN },
+          });
+          parts.push(tok.status === 204 ? `member token ${ctx.memberTokenId} revoked` : `member token revoke returned ${tok.status}`);
+        }
+        const user = await api(`/admin/users/${ctx.member}`, { method: "DELETE" });
+        if (user.status === 204) { ctx.memberGone = true; parts.push(`user ${ctx.member} deleted`); }
+        else parts.push(`user ${ctx.member} LEFT BEHIND — DELETE returned ${user.status}`);
+      }
+      const bad = parts.filter((p) => p.includes("LEFT BEHIND") || p.includes("returned"));
+      if (bad.length === 0) return `${parts.length} cleanups — all 204`;
+      return { status: "warn", detail: bad.join("; ") };
+    },
+  },
+];
+
+/** The red-runs-self-sweep posture (the fixwave shape) for the chained
+ *  branch-protection battery: rules FIRST (best-effort explicit deletes, so a
+ *  failed repo delete still lands the audit back at protected_branches == 0),
+ *  then the repo (its delete cascades the rest — repos/service.ts:652), then
+ *  the member's token + the member user (the PAT rows are FK cascades). One
+ *  [tail] line logs every action; failures feed left_behind and are never
+ *  fatal; it never throws (main's finally depends on it). */
+const branchProtectionFailureCleanup = async (ctx) => {
+  const acts = [];
+  const noteLeftBehind = (what, why) => {
+    leftBehind.push(`${what} (failure-cleanup tail: ${why})`);
+    acts.push(`${what} LEFT BEHIND — ${why}`);
+  };
+  try {
+    for (const rule of ctx.rules) {
+      if (rule.created !== true || rule.gone === true) continue;
+      try {
+        const status = await deleteRule(ctx, rule.name);
+        if (status === 204) acts.push(`rule ${rule.name} deleted (204)`);
+        else noteLeftBehind(`rule ${rule.name}`, `DELETE returned ${status}`);
+      } catch (err) {
+        noteLeftBehind(`rule ${rule.name}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (ctx.repoCreated === true && ctx.repoGone !== true) {
+      try {
+        const out = await deleteRepo(ctx.user, ctx.repo);
+        acts.push(typeof out === "string" ? out : out.detail);
+      } catch (err) {
+        noteLeftBehind(`repo ${ctx.repoFullName ?? `${ctx.user}/${ctx.repo}`}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (ctx.memberCreated === true && ctx.memberGone !== true) {
+      if (ctx.memberTokenId !== null && ctx.memberTokenId !== undefined) {
+        try {
+          const tok = await api(`/users/${ctx.member}/tokens/${ctx.memberTokenId}`, {
+            method: "DELETE", basic: { user: ctx.user, pass: TOKEN },
+          });
+          if (tok.status === 204) acts.push(`member token ${ctx.memberTokenId} revoked (204)`);
+          else acts.push(`member token revoke returned ${tok.status}`);
+        } catch (err) {
+          noteLeftBehind(`member token ${ctx.memberTokenId}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      try {
+        const res = await api(`/admin/users/${ctx.member}`, { method: "DELETE" });
+        if (res.status === 204) acts.push(`user ${ctx.member} deleted (204)`);
+        else noteLeftBehind(`user ${ctx.member}`, `DELETE returned ${res.status}`);
+      } catch (err) {
+        noteLeftBehind(`user ${ctx.member}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } catch (err) {
+    acts.push(`the sweep itself failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (acts.length) log(`  [tail] bp-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -2939,11 +3472,16 @@ const BATTERIES = {
   // wrangler auth for the d1 arms (the rotation backdate + the session-row
   // sweep; --d1-scope picks the database).
   "fixwave-parity": { title: "fix-wave parity (PR head-sync → merged-PR 412 → ghost-404, tag-only push-create, org revoke mask, private-user ladder, sudo pair, session-rotation directive)", context: fixwaveContext, steps: fixwaveSteps, failureTail: fixwaveFailureCleanup, independent: true },
+  // Chained (the shared-fixture shape — a red in the setup skips the arms
+  // that need it, like registry/generate; NOT independent like fixwave).
+  // Needs an ADMIN PAT (the member-user arm) and wrangler auth for the
+  // priority arm's rule-id lookup (--d1-scope picks the database).
+  "branch-protection": { title: "branch-protection flows (SPEC-0013: rule CRUD + priority, push-time per-ref rejection, merge approval gate 405→200, whitelist flag round-trip)", context: branchProtectionContext, steps: branchProtectionSteps, failureTail: branchProtectionFailureCleanup },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 

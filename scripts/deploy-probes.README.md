@@ -20,7 +20,8 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 - Batteries: `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
-  `cleanup-audit`, `all` (runs them in that order, audit last).
+  `branch-protection`, `cleanup-audit`, `all` (runs them in that order, audit
+  last).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
@@ -277,6 +278,57 @@ prints all of them verbatim.
   tag-only repo), then the org, the member user (its PAT rows cascade), and
   the session row via D1 (logged on one `[tail] fw-leftover-sweep` line;
   failures feed `left_behind`, never fatal; a green run no-ops silently).
+- **branch-protection** — the SPEC-0013 protection flows over one scratch
+  auto_init repo (the gate-assessment gap 2 closure: the M1–M4 surface is
+  deployed, so every redeploy verifies the FLOWS, not just the table's
+  `protected_branches == 0` existence). All four arms ride ONE repo:
+  **(a) rule CRUD** through `/repos/{owner}/{repo}/branch_protections` — a
+  throwaway rule's POST 201 field-faithful echo (priority 1 = MAX+1 on the
+  empty repo, the zero config), GET + the priority-sorted LIST, GET of a
+  missing rule → the plain shared 404 (the exact-name lookup, no glob
+  fall-through), PATCH `{required_approvals, block_on_outdated_branch}` → 200
+  echoing both (absent = keep), DELETE 204 → GET 404 (404-after-delete) →
+  list `[]`; then **the priority op** — a second rule, POST
+  `/branch_protections/priority {"ids":[…]}` → 204, the list order/priorities
+  follow the renumber. **(b) push-time per-ref rejection** — ONE real `git
+  push` carrying TWO refs (a fast-forward to the protected main + a create of
+  an unprotected sibling): the protected ref answers upstream's per-ref report
+  rejection (git exit 1, `! [remote rejected] … (Not allowed to push to
+  protected branch main)`; exit 128 would mean a door refusal instead) while
+  the sibling LANDS, and ls-remote pins main at the pre-push tip. **(c) the
+  merge approval gate** — a PR into the protected branch (`required_approvals:
+  1`) merges → **405** with the verbatim ErrNotReadyToMerge text "Does not
+  have enough approvals"; an ADMIN-minted second user (the fixwave member
+  methodology: `POST /admin/users` → token mint over HTTP BASIC →
+  `PUT …/collaborators {"permission":"write"}` → 204) submits an APPROVED
+  review that lands `official:true` (write access is official without the
+  approvals whitelist — protected_branch.go:264-289), and the SAME merge
+  answers **200** (has-merged 204; main advanced past the pre-push tip).
+  **(d) the whitelist/enforce-admins round-trip** — a GLOB rule `v*`
+  (deprecated `branch_name` renders `""` per isRuleNameSpecial) carrying the
+  enforceable flag set (push/force-push/deletion whitelists + merge whitelist
+  + bypass allowlist + approvals whitelist, all `[<owner>]`; required_approvals
+  2; block_on_outdated_branch, dismiss_stale_approvals,
+  block_admin_merge_override; status-check contexts; protected-file patterns)
+  → 201 + GET echoing EVERY field (the M4 sanitizer keeps the owner —
+  write/any-access — in every list), then PATCH `{"enable_push":false}` shows
+  the landed cascade: the push master flips its flags off and the re-conjunction
+  clears the deletion pair (enable_deletion + its allowlist + the deletion
+  array), while the stored id lists SURVIVE their disabled flags (upstream
+  keeps WhitelistUserIDs on a flag-off edit; the render maps ids→names
+  regardless — branch.go:894-936) and every absent arm keeps its stored value.
+  **Auth: an ADMIN PAT** (`--user` must be the site admin — the member arm)
+  and **wrangler auth for the priority arm** (`--d1-scope`): NEITHER render
+  exposes an addressable rule id (`BranchProtection` has no id field and the
+  repo render's `id` parses the TEXT uuid to 0), so the probe reads the rule
+  ids via `wrangler d1 execute` — keep `--d1-scope` in step with
+  `--base-url`. **Failure cleanup (the consistency posture):** a finally-style
+  tail deletes the created rules first (best-effort explicit deletes, so a
+  failed repo delete still lands the audit back at `protected_branches == 0`),
+  then the repo (its delete cascades the rest), then the member's token
+  (HTTP BASIC) + the member user (logged on one `[tail] bp-leftover-sweep`
+  line; failures feed `left_behind`, never fatal; a green run no-ops
+  silently).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -319,6 +371,11 @@ prints all of them verbatim.
   - `fixwave-parity` — its repos, then the org, the member user (its PAT
     rows cascade), and the session row (the D1 delete);
     `[tail] fw-leftover-sweep`.
+  - `branch-protection` — its created rules (best-effort explicit deletes
+    first, so a failed repo delete still lands the audit back at
+    `protected_branches == 0`), then the repo (its delete cascades the rest),
+    then the member's token + the member user;
+    `[tail] bp-leftover-sweep`.
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
   emptied everything, and the gone flags skip the rest). `p0` creates
@@ -348,6 +405,15 @@ prints all of them verbatim.
   - `forkpr-e2e --force-red forkpr-fork-push` — reds after base + org + fork
     all exist; the `[tail] forkpr-leftover-sweep` line must list all three
     deletes in tail order (fork, base, org).
+  - `branch-protection --force-red bp-merge-blocked-405` — reds after the
+    repo + the two rules (main + the priority rule) + the PR exist (the
+    member arm has not run); the `[tail] bp-leftover-sweep` line must list
+    both rule deletes then the repo delete.
+    `--force-red bp-approval-official-200` reds after the member + its token
+    + the collaborator row exist; the tail must list the rule deletes, the
+    repo delete, the token revoke (HTTP BASIC), and the member-user delete.
+    Forcing an arm before the first creation (e.g. `bp-repo-create-201`)
+    leaves nothing to sweep — the tail stays silent.
   - `ui-login --force-red ui-labels-cookie-owner` — reds after the fixture
     repo exists; the `[tail] ui-leftover-sweep` line must list its delete.
   - `window2-mounts --force-red w2-secret-gone` — reds after the secret row
