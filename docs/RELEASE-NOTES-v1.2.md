@@ -906,3 +906,104 @@ ABSENT by tick-16's honest count), the 64-op FEATURE-ABSENT ceiling and
 the ws1009 residuals stand as written.
 
 **Same-day rider**: the DDL defect is FILED upstream as [cloudflare/workers-sdk#16548](https://github.com/cloudflare/workers-sdk/issues/16548) — the four-run-confirmed LEAKY/CLEAN standalone repro (the un-drained-cursor trigger; our engine fixed its own leak at `29b966f`, the runtime defect persists upstream). Watch item joined.
+
+**Appended 2026-10-29 (append-time HEAD `4e3c5ba`) — the seventh addendum:
+RD25, the dep-bump window.** The sixth addendum's day-record closed the
+post-RD24b waves; the window that followed landed whole and was the record's
+last gap before tagging — **11 commits, `f0eda84`→`60c65e1`, 2026-10-28
+22:52 – 2026-10-29 00:27 +0800** (the delta after the CI engine-gates
+commit `f0eda84`; the tagging dossier's open issue 1). Every hash below was
+re-verified against `git cat-file` at append time; every number is quoted
+from the REDEPLOY25 evidence block (the template's slots closed at
+`60c65e1` in `docs/design/p0-evidence.md` — the LIVE record) or from the
+commit that landed it, never re-derived.
+
+**The pre-bump tail** (the window's quiet opening; PRE_BUMP at `a27ca47`):
+**`deleteUserCascade`** (`a27ca47` — the purge-grade user deletion,
+upstream's shape: purge flips the 422 guards (byte-identical messages
+without it), a re-paging LIMIT-50 loop walks every owned repo through the
+EXISTING `RepoService.deleteRepository` — the same registry/queue/tombstone
+deps the repoDelete route and the sweep consumer ride — then the
+membership loop where a last-owner org is deleted WITH its repos, then ONE
+census batch with num_stars/num_watches decrements first and the users row
+whose FK cascade carries the rest; issues/comments stay ghosts per
+upstream user.go:139-141; SPEC-0004 gains the tier-3 as-built note);
+**the sweep's orphan fix** (`ada3b73` — the demo day-one finding's
+mechanism made precise: for a dangling owner the LEFT JOIN null-extends,
+so the old arm tested the WRONG NULL (the column holds the id) and
+`users.isAdmin = false` evaluated UNKNOWN — three-valued logic filtered
+the row on every tick, forever; the fix tests the JOIN-side `users.id`
+NULL, which subsumes ownerless AND dangling and aligns producer with
+consumer, zero consumer change; the FK verdict: no FK on owner_id BY
+DESIGN — 'cascade missed' was a misnomer); **the bench calibration**
+(`f7abaa8` — the armed gate's first compares fired on NOISE, direction
+disagreement inside one run the smoking gun; push/fetch walls become
+median-of-3 overhead legs, and the four overhead metrics fail only on
+>10% AND >150ms absolute — calibrated above the 131ms largest observed
+identical-code noise delta — while bytes keep pct-only, the teeth); and
+**SPEC-0001 §9's tolerance classes** (`d5f8b65` — the as-built wording of
+that calibration, recorded with the REDEPLOY25 evidence template). Around
+them, one clause each: the day-record close plus the CI-hardware baseline
+ARMING the bench gate (`f33860e`, baseline committed from run
+40699376701's artifact), the RD25 runbook (`c40f8b8`, 589 lines
+tree-verified), the tokens-audit close (`ad1107e` — the '7500 window'
+named as a misdiagnosis: the audit queried a nonexistent table; tokens
+stand at 1), the goldens 'flake' root-fixed as the demo banner with
+fixture pins (`b51e7ce`), and the demo day-one review HEALTHY with one
+real product finding (`19c7acc` — the finding IS `ada3b73`).
+
+**The window itself.** The bump (`873da29`, the GO tree — the window's ONE
+pre-agreed code commit): **five exact-version bumps** — hono 4.13.14,
+wrangler 4.153.0, @cloudflare/vitest-plugin 1.4.8, @cloudflare/workers-types
+5.20261027.1 (its pnpm-workspace exclude entry moved with it),
+typescript-eslint 8.72.1 — exact-pinned per the runbook's release-gate
+hazard note (4.154.0/1.4.9 released that night and would overshoot), plus
+**the coordinated override** — miniflare 5.20261019.2-beta →
+5.20261023.0-beta, the version wrangler 4.153.0 itself pairs — and **both
+compat dates** → 2026-10-23 (the example committed; the real config rides
+the deploy). The **quiet-window gate at the BUMPED runtime: PASS — 268
+files, 268 direct (zero solo adjudications), 0 deaths, 127.7s**; tsc 0,
+lint exit 0, delete-husk 6/6. **Deploy `fb654a8b`** (build-then-deploy per
+the stale-dist discipline; a wrangler version id, not a git object — the
+RD23 lineage convention); **migrations NONE pending** (0036+0037 stand — a
+schema-silent window, the 65-table count stands); healthz 200 on both
+surfaces — **the custom domain SURVIVED the bump**. **The batteries**:
+standing nine **113/0** (the wave-131 census held) · branch-protection
+**18/0** (one TLS-blip 128 first pass — tonight's network class — retried
+clean) · fixwave-parity **22/0** (the `fw-org-member-preaccess`
+discriminator held from RD24b) · demo **on the DOMAIN 2 pass / 1
+by-design posture red / 1 info** (banner + signup green where they
+matter). The sweep's new arm observed honestly pending: the fixed
+predicate's target set = 1 (the `dp3t/p0-shallow` dangling row), which
+enqueues at the first tick past 72 h retention (~Oct 31) — a recorded
+watch item, not a gate (dossier open issue 3). And the window's own
+cleanup was `deleteUserCascade`'s **first production use**: rd25probe
+purged 204 through the real cascade pipeline; the wrap-up chain then hit
+the last-admin/self-delete guards THREE times (the guard works) and
+finished via D1 (4 rows); tokens = 1; every battery's own cleanup green.
+**Evidence complete at `60c65e1`** — the template's slots closed, the
+LIVE record in `docs/design/p0-evidence.md`.
+
+**The milestone: the first fully green CI run.** Run **40726243702** on
+`60c65e1` is **completed success** (10m43s; a GitHub run id, not a git
+object) — **all seven jobs** (checks 10m40s; benchmark 1m16s on the
+calibrated gate at workerd 1.20261023.1; e2e/mirror/lfs/diff/assets) —
+the calibrated bench gate's **first armed pass** at the bumped runtime.
+(The bump commit's own run failed ONLY the benchmark job — the first run
+against the newly-committed CI-hardware baseline; the identical tree
+content went green on `60c65e1`'s docs-only delta. On record, not a
+blocker — dossier §3.) The README's Status line carries the run and the
+deployed reality (`63e439d`, post-window).
+
+**Close.** The tagging dossier (`docs/ops/tag-v1.2-dossier.md`, `5a97009`)
+listed RD25 as the notes doc's one gap — the doc was complete through the
+sixth addendum's day-record, RD25's record lived only in the evidence and
+commit messages. This addendum closes it: the tagged tree now holds the
+complete v1.2 record through RD25's LIVE deploy. Per the dossier's own
+caveat (its open issue 1), appending moves the cut point one commit past
+`60c65e1` — tag this addendum's landing commit and re-run the dossier's
+§3 checks there; the §3 gate evidence itself was measured at `60c65e1`
+and stands. §4 re-check: no line retired — RD25 is schema-silent (the
+65-table count stands), zero API surface change keeps the 64-op
+FEATURE-ABSENT ceiling intact, and the ws1009 residuals stand as written
+(the strip gate ran clean at the bumped runtime: 268 direct, zero solo).
