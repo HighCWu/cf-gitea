@@ -1,9 +1,10 @@
 /**
- * The user settings SECURITY tab's tests (the bench-row UNMOUNTED module —
- * the repo-settings-wiki.test.tsx harness): the derived-posture loader over
- * real D1 (generated migrations in beforeAll) and the DOM contract of the
- * page render — hono/jsx renderToString, the module driven directly (no route
- * yet, the HANDOFF NOTE in the module header).
+ * The user settings SECURITY tab's tests (the bench-row module, MOUNTED at
+ * 0c2b151 — the repo-settings-wiki.test.tsx harness): the derived-posture
+ * loader over real D1 (generated migrations in beforeAll) and the DOM
+ * contract of the page render — hono/jsx renderToString, the module driven
+ * directly (the GET arm's route is the module header's mount record; the
+ * write arms stay unmounted).
  */
 
 import { env } from "cloudflare:test";

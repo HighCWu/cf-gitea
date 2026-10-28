@@ -861,7 +861,7 @@ describe("the global inbox routes /issues /pulls /milestones (window-2e a8818c6)
     expect(pastEndHtml).toContain("No results"); // upstream renders blank; the documented cf-gitea addition
     // The render keeps the Newer navigation whenever page > 1 (upstream
     // paginate.tmpl's own shape; `more` only gates the Older link). NOTE:
-    // the global-inbox module header's HANDOFF claim ("a past-end ?page=
+    // the global-inbox module header's mount record ("a past-end ?page=
     // renders the empty-list line under an ABSENT pager") does not match
     // the landed InboxPager — header drift, not a route bug.
     expect(pastEndHtml).toContain('<a class="item navigation" href="/issues?page=98">');

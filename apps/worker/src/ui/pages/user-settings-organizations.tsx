@@ -1,7 +1,8 @@
 /**
- * The user settings ORGANIZATIONS page — the bench-row UNMOUNTED module
- * (pages wave 58; a sibling owns `index.ts`, this module ships without a
- * route): upstream `templates/user/settings/organizations.tmpl` at the pin,
+ * The user settings ORGANIZATIONS page — the bench-row module (pages wave
+ * 58; MOUNTED at 0c2b151, window-2a — the routes live in `index.ts`; the
+ * retired wiring HANDOFF is the mount record below): upstream
+ * `templates/user/settings/organizations.tmpl` at the pin,
  * served by `user_setting.Organization` (routers/web/user/setting/
  * profile.go:194–224) behind `m.Get("/organization", …)` (web.go:740 — the
  * PATH is singular, the template filename plural).
@@ -56,9 +57,9 @@
  *   same semantics server-side) and the `data-modal-organization-name` span
  *   fill (the name is rendered into the disclosure text directly).
  *
- * ## Handoff note (for the `index.ts` window owner — this module has NO
- *    route; the wave-12 userSettingsPage/userSettingsSubmit pair,
- *    ui/index.ts:3838–3873, is the handler template)
+ * ## Mount record (MOUNTED at 0c2b151, window-2a — the wiring HANDOFF,
+ *    retired; kept as the landed-shape record — the wave-12
+ *    userSettingsPage/userSettingsSubmit pair was the handler template)
  *
  *   GET  /user/settings/organization  resolveUiSession → anonymous
  *                                     loginRedirect (upstream reqSignIn,
@@ -93,7 +94,7 @@
  *
  * The settings navbar is the SHARED components/settings-nav
  * UserSettingsNavbar (the wave-114 swap — the local Profile+Organizations
- * scaffold deleted) with the Organizations item active. Survey row to touch on landing:
+ * scaffold deleted) with the Organizations item active. Survey row touched on landing:
  * docs/compat/ui-parity-survey.md:383 (the
  * `/user/settings/{…,organization,…}` ABSENT row).
  */

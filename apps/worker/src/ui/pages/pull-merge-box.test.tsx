@@ -1,13 +1,14 @@
 /**
  * The pull merge box fragment module's tests (bench tick-10 row 4, the
- * UNMOUNTED `GET /{owner}/{repo}/pulls/{index}/merge_box` module): the
+ * `GET /{owner}/{repo}/pulls/{index}/merge_box` module, MOUNTED at
+ * 22599e4, window-2e B2): the
  * loader's state→projection matrix over REAL D1 rows (the landed merge
  * state — `pull_requests` status/conflicts/divergence, the
  * branch-protection rule config, stored commit statuses, official review
  * rows) and the fragment's DOM contract against the pinned
  * pull_merge_box.tmpl arm-for-arm. Real D1 via the vitest plugin (generated
  * migrations in beforeAll); the loader + builder driven DIRECTLY (the route
- * arm is index-owned — the HANDOFF NOTE in the module header).
+ * arm is index-owned — the mount record in the module header).
  */
 
 import { env } from "cloudflare:test";

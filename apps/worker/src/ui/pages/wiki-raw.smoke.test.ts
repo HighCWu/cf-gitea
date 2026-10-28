@@ -2,8 +2,8 @@
  * The wiki RAW byte arm's smoke tests (PORT-FIRST MODE: one happy path per
  * arm — the four-candidate probe order, the sniffed content types, the ETag
  * 304, and both 404 arms; the module doc + services/wiki.ts carry the
- * knob-by-knob mapping — no route exists yet, the HANDOFF RECIPE in
- * pages/wiki-raw.ts is the mount wave's). Real engine content: the repo
+ * knob-by-knob mapping — the route arm is the mount record in
+ * pages/wiki-raw.ts, MOUNTED at 2f7afe9). Real engine content: the repo
  * seeds through the landed receive flow (testing/seed-repo.ts), the wiki
  * PAGE lands through the landed service op (createWikiPage), and the
  * non-`.md` raw files (the "image for example" arm + the QueryUnescape

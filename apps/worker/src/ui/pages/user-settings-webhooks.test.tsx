@@ -1,11 +1,11 @@
 /**
- * The user settings WEBHOOKS tab's tests (the bench-row UNMOUNTED module —
- * the repo-settings-wiki.test.tsx harness): the list/read/create/edit/delete
+ * The user settings WEBHOOKS tab's tests (the bench-row module, MOUNTED at
+ * 0c2b151 — the repo-settings-wiki.test.tsx harness): the list/read/create/edit/delete
  * arms over real D1 (generated migrations in beforeAll; the writes go
  * through the landed owner-scoped service arms, the same calls the
  * hooks-scopes wave's /user/hooks routes make) and the DOM contract of the
  * two page renders — hono/jsx renderToString, the modules driven directly
- * (no route yet, the HANDOFF NOTE in the module header).
+ * (the route arms are the mount record in the module header).
  *
  * ## The deferred matrix (wave-83 — the module is MOUNTED at ui/index.ts)
  *
@@ -604,7 +604,7 @@ describe("the mounted routes (window-2a: GET+POST /user/settings/hooks, GET+POST
     // submitted name carried over (RenderWithErrDeprecated's re-render arm:
     // upstream binds the form into the re-render via
     // middleware.AssignForm — context_response.go:117-125; the module
-    // header's HANDOFF NOTE "+ the `form` values carried over";
+    // header's mount record "+ the `form` values carried over";
     // UserHooksSettingsData.form's doc comment; the org twin
     // orgHooksSettingsSubmit assigns data.form verbatim and the wave-53
     // test pins it).

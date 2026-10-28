@@ -1,13 +1,13 @@
 /**
- * The user settings ACCOUNT tab's tests (the module is TWO-STAGE UNMOUNTED —
- * the routes ride the index.ts window, so the CSRF guard and the 303 arms
+ * The user settings ACCOUNT tab's tests (the module is MOUNTED at 2f7afe9 —
+ * the routes live in `index.ts`, so the CSRF guard and the 303 arms
  * live at the mounted handlers; the repo-settings-wiki /
  * user-settings-secrets harness): the parse/apply/delete matrix over real
  * D1 through the LANDED stores (generated migrations in beforeAll; migration
  * 0016's `email_addresses` + the SPEC-0010 token/session stores) and the DOM
  * contract of the page render — hono/jsx renderToString. The module-level
- * outcomes below are the handler's full observable surface (the HANDOFF's
- * render map: "added"/"primary"/"redirect" 303, "invalid" re-renders at 200,
+ * outcomes below are the handler's full observable surface (the mount
+ * record's render map: "added"/"primary"/"redirect" 303, "invalid" re-renders at 200,
  * the deletion's "deleted" 303s onto `/`). Covered: the synthesized-primary
  * read rule and its derivation after a PRIMARY flip, the add arm's
  * validation matrix (syntax, the 254 binding cap, the global used-check
@@ -691,7 +691,7 @@ describe("the account page DOM (user/settings/account.tmpl at the pin)", () => {
   });
 
   it("the invalid re-render carries the email HTML-ESCAPED (no attribute breakout) and the password field stays valueless — carried email never credential", async () => {
-    // Provenance: wave-polish-matrix-2 (2026-10-27) — the HANDOFF's
+    // Provenance: wave-polish-matrix-2 (2026-10-27) — the mount record's
     // re-render shape `{ error, email }` crossed with the secrets value
     // rule (account.tmpl:55's value="{{.Email}}" carries upstream-side too;
     // the deletion form's password input never does, account.tmpl:122).

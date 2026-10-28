@@ -1,13 +1,14 @@
 /**
  * The user settings SSH/GPG keys page module's tests (pages wave 54, the
- * UNMOUNTED `/user/settings/keys` module): the write arms over the landed
+ * `/user/settings/keys` module, MOUNTED at 0c2b151): the write arms over
+ * the landed
  * stores with real D1 via the vitest plugin (generated migrations in
  * beforeAll) — the SSH add's parse/fingerprint/name sequence, the GPG add's
  * parse/email-gate/key-id sequence over a built-from-bytes v4 armor, the
  * deletes, the loader's type/primary filters and the render's DOM contract.
  * The render runs through hono/jsx renderToString (the render.test.tsx
- * harness); the module has no route yet (the HANDOFF NOTE in the module
- * header).
+ * harness); the route arms are the module header's mount record (MOUNTED
+ * at 0c2b151, window-2a — the deferred matrix below drives them live).
  *
  * The wave-81 deferred matrix (the tab is NOW MOUNTED — window-2a, 0c2b151):
  * the parsers' full rejection surfaces through the form arms with the exact
@@ -851,7 +852,7 @@ describe("the mounted /user/settings/keys routes (index.ts window-2a over the mo
     expect(await drizzle(env.DB).select().from(gpgKeys).all()).toHaveLength(0);
   });
 
-  it("POST delete ssh miss renders the HANDOFF NOTE's error line (keys.go:301-303)", async () => {
+  it("POST delete ssh miss renders the mount record's error line (keys.go:301-303)", async () => {
     // The module recipe: "An outcome: 'missing' SSH delete renders the error
     // line ('Failed to delete SSH key')" — upstream JSONErrors without the
     // redirect. Pinned as written; a silent 303 here is the wiring wave's bug.

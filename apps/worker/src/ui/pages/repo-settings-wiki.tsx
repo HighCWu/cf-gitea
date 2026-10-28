@@ -1,6 +1,7 @@
 /**
- * The repo settings WIKI panel — the bench-row UNMOUNTED module (pages wave
- * 54; a sibling owns `index.ts`, this module ships without a route).
+ * The repo settings WIKI panel — the bench-row module (pages wave 54;
+ * MOUNTED at 46e7e68, window-2d — the route lives in `index.ts`; the
+ * retired wiring HANDOFF is the mount record below).
  *
  * ## Brief-premise correction (verify-at-the-pin)
  *
@@ -60,11 +61,11 @@
  *     the modal only when the unit is enabled; a disabled wiki has nothing
  *     to delete.
  *
- * ## Handoff note (for the `index.ts` window owner — this module has NO
- *    route)
+ * ## Mount record (MOUNTED at 46e7e68, window-2d — the wiring HANDOFF,
+ *    retired; kept as the landed-shape record)
  *
- * Mount over the landed settings family's exact posture (the mirror panel's
- * handlers, src/index.ts:3313-3358, are the template):
+ * Mounted over the landed settings family's exact posture (the mirror
+ * panel's handlers were the template):
  *
  *   GET  /{owner}/{repo}/settings/wiki   resolveUiRequest → settingsGate →
  *                                        loadRepoWikiSettings →
@@ -84,7 +85,7 @@
  * the local `WikiSettingsNav` is deleted and `SettingsNav`
  * (pages/settings.tsx) carries `"wiki"` in its `active` union with the item
  * after Mirror (upstream renders no wiki navbar item — the divergence follows
- * the mirror item's placement rule). Survey rows to touch
+ * the mirror item's placement rule). Survey rows touched
  * on landing: docs/compat/ui-parity-survey.md family E (the options row's
  * reduction note lists "the mirror/archive-tint sections" as not rendered —
  * add the wiki block's residue) and the F-family wiki row's page note.

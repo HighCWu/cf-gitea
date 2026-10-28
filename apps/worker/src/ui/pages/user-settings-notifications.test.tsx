@@ -8,12 +8,12 @@
  * executed against the landed saveUserSettings), and the DOM contract of
  * the page render — hono/jsx renderToString, the module driven directly.
  *
- * The module is TWO-STAGE UNMOUNTED at this wave's gates (the route rides
- * the index.ts window; the module's HANDOFF NOTE carries the deferred
- * route matrix — the anonymous 303s, the two saved 303 targets, the
- * guard-first cross-origin 403, the nav-swap assertion — the
+ * The module is MOUNTED at 2f7afe9 (the route matrix the module header's
+ * mount record carried — the anonymous 303s, the two saved 303 targets,
+ * the guard-first cross-origin 403, the nav-swap assertion — landed in
+ * mount-window-wave126.matrix.test.tsx's settings block, the
  * appearance/organizations mounted matrices' pattern). The saved outcome
- * is asserted against the wiring wave's 303 target constant,
+ * is asserted against the mount's 303 target constant,
  * USER_SETTINGS_NOTIFICATIONS_REDIRECT below.
  */
 
@@ -47,8 +47,8 @@ import type { UiManifest } from "../manifest";
 
 /** The saved outcome's 303 Location — upstream's
  *  `ctx.Redirect(setting.AppSubURL + "/user/settings/notifications")`
- *  (notifications.go:54,65,81,88); the wiring wave's handlers must answer
- *  exactly this (the HANDOFF NOTE's recipes). */
+ *  (notifications.go:54,65,81,88); the mounted handlers answer
+ *  exactly this (the mount record's recipes). */
 const USER_SETTINGS_NOTIFICATIONS_REDIRECT = "/user/settings/notifications";
 
 const manifest: UiManifest = {
@@ -355,9 +355,9 @@ describe("the notifications page DOM (notifications.tmpl + layout_head.tmpl at t
   });
 });
 
-// --- the saved/invalid re-render shapes (the HANDOFF's render map) -------------------
+// --- the saved/invalid re-render shapes (the mount record's render map) -------------------
 
-describe("the saved/invalid re-render shapes (the HANDOFF NOTE's render map)", () => {
+describe("the saved/invalid re-render shapes (the mount record's render map)", () => {
   /** Slice helper — the email form's chunk of the document. */
   function emailSliceOf(html: string): string {
     return html.slice(html.indexOf('action="/user/settings/notifications/email"'), html.indexOf('action="/user/settings/notifications/actions"'));
@@ -422,7 +422,7 @@ describe("the saved/invalid re-render shapes (the HANDOFF NOTE's render map)", (
 
 // --- the wiring contract -----------------------------------------------------------
 
-describe("the wiring contract (the HANDOFF NOTE's constant — the route matrix is deferred to the index.ts window)", () => {
+describe("the wiring contract (the mount record's constant — the route matrix is mounted in index.ts)", () => {
   it("pins the saved outcome's 303 target (upstream's redirect, notifications.go:65/88)", () => {
     expect(USER_SETTINGS_NOTIFICATIONS_REDIRECT).toBe("/user/settings/notifications");
   });

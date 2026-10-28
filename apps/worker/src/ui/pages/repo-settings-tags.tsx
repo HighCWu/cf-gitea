@@ -1,7 +1,7 @@
 /**
- * The repo settings PROTECTED TAGS panel — the bench-row UNMOUNTED module
- * (the repo-settings-wiki precedent: a sibling owns `index.ts`, this module
- * ships without a route — the handoff note at the bottom of this header).
+ * The repo settings PROTECTED TAGS panel — the bench-row module (MOUNTED at
+ * b54f709, window-2d — the routes live in `index.ts`; the retired wiring
+ * HANDOFF is the mount record at the bottom of this header).
  * The `/settings/tags` surface over the LANDED
  * `/repos/{owner}/{repo}/tag_protections` API arms (routes/tag-protections.ts
  * — the 5 frozen operations repoListTagProtection / repoGetTagProtection /
@@ -106,11 +106,12 @@
  * `repo.settings.update_settings_success`; the `?saved=1` param carries the
  * flash (the wiki module's reduction), display-only.
  *
- * ## Handoff note (for the `index.ts` window owner — this module has NO route)
+ * ## Mount record (MOUNTED at b54f709, window-2d — the wiring HANDOFF, kept
+ *    as the landed-shape record)
  *
- * Mount over the landed settings posture (pages/ui index.ts's
- * branchProtection* handlers are the template — settingsGate order,
- * sameOriginGuard FIRST on every POST, archived POSTs 404-shell):
+ * Mounted over the landed settings posture (the branchProtection* handlers
+ * were the template — settingsGate order, sameOriginGuard FIRST on every
+ * POST, archived POSTs 404-shell):
  *
  *   GET  /{owner}/{repo}/settings/tags          resolveUiRequest →
  *                                               settingsGate →

@@ -1,10 +1,10 @@
 /**
- * The user settings REPOS tab module's tests (the bench-row UNMOUNTED
- * module — the user-watching-tab.test.tsx harness: real D1 via the vitest
- * plugin, generated migrations in beforeAll, the loader driven directly,
- * hono/jsx renderToString for the DOM; NO route-level arms — the route is
- * unmounted at these gates, the deferred matrix rides the wiring wave per
- * the module header's HANDOFF): the self-list loader (profile.go:302-320's
+ * The user settings REPOS tab module's tests (the bench-row module,
+ * MOUNTED at 484eb92 — the user-watching-tab.test.tsx harness: real D1 via
+ * the vitest plugin, generated migrations in beforeAll, the loader driven
+ * directly, hono/jsx renderToString for the DOM; NO route-level arms in
+ * this file — the route arms are the module header's mount record): the
+ * self-list loader (profile.go:302-320's
  * else arm — owner_id-scoped, private included, slug ASC, paged at 50),
  * the forked-from projection (the batched parent reads, the dangling-edge
  * posture), and the repos.tmpl:80-113 DOM — the kind-icon chain, the size

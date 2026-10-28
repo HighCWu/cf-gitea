@@ -60,10 +60,6 @@
  *   page, both header.tmpl:12-34 hrefs): Overview needs a profile-readme
  *   pipeline, Projects/Packages/Code/Stars need their pages (dead links
  *   forbidden, §2.4.1).
- * - The followers/following counts render as plain text: the landed
- *   follows service supplies the totals (the counts are REAL data), but the
- *   `?tab=followers`/`?tab=following` pages do not exist (profile.tmpl:25's
- *   anchors would be dead links).
  * - The visibility badge next to the username follows the task brief and
  *   the org-header badge DOM (`ui large basic horizontal label`) — upstream
  *   badges org profiles only at this pin (org_profile_avatar.tmpl:9-10); an

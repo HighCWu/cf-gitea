@@ -1,6 +1,6 @@
 /**
- * The profile WATCHING tab module's tests (the UNMOUNTED
- * `/{username}?tab=watching` page — pages/user-watching-tab.tsx): the
+ * The profile WATCHING tab module's tests (the `/{username}?tab=watching`
+ * page — pages/user-watching-tab.tsx, MOUNTED at 2f7afe9): the
  * loader's lister contract (profile.go:220-246's arm over the landed
  * listWatchedRepositories — the reduced-ACL visibility arms incl. the
  * owned-by-doer arm the stranger resolves, the paging clamp, the
@@ -9,10 +9,9 @@
  * badge, the star+pulls chips), the tab-carrying pager and the empty state.
  * Real D1 via the vitest plugin (generated migrations in beforeAll); the
  * render runs through hono/jsx renderToString — the user-follow-tabs.test
- * harness — with the loader driven directly (the module has no route arm
- * yet, the HANDOFF NOTE in the module header: the route-level dispatch arm
- * rides the wiring window's own matrix, user-profile.matrix.test.ts's
- * pattern).
+ * harness — with the loader driven directly (the route-level dispatch arm
+ * is the module header's mount record — it rides the wave-126 mount's
+ * matrix, user-profile.matrix.test.ts's pattern).
  */
 
 import { env } from "cloudflare:test";

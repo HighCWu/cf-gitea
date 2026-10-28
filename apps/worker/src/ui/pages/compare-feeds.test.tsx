@@ -1,6 +1,7 @@
 /**
- * The compare-feeds module's tests (the tick-10 bench row 2, the UNMOUNTED
- * bench pair): the two compare download arms (`/{basehead}.diff|.patch` —
+ * The compare-feeds module's tests (the tick-10 bench row 2, the bench
+ * pair — MOUNTED at 22599e4, window-2e B2): the two compare download arms
+ * (`/{basehead}.diff|.patch` —
  * upstream compare.go:570-603) and the pull-files range surface
  * (`/pulls/{index}/files/{a}..{b}` — web.go:1672, pull.go:680-950) over REAL
  * seeded engine content (the wave-29 receive-flow recipe; D1 from the
@@ -15,8 +16,9 @@
  * "(base, head]" commit list, short-prefix 404s, same-ref and reversed
  * ranges, the broken-PR and unrelated-history 404s).
  *
- * HANDOFF NOTE (the mount recipe per surface — the module is UNMOUNTED, the
- * routes are index-owned):
+ * MOUNT RECORD (the per-surface recipe — MOUNTED at 22599e4, window-2e B2,
+ * the routes live in `index.ts`; the module header keeps this text as the
+ * landed-shape recipe record):
  *   (a)/(b) — in the compare arm of the route discriminator, BEFORE the
  *   `family: "compare"` returns: decode the joined suffix (the arm's own
  *   convention), `parseCompareFeedTail(suffix)`; non-null → the new
@@ -25,8 +27,8 @@
  *   `notFound` → the §4.5 shell (renderNotFound, 404), `noMergeBase` →
  *   `compareFeedServerErrorResponse()`, `body` →
  *   `compareFeedTextResponse(body)` (the diffpatch sibling's exact header
- *   pair). MUST mount before the compare page family (the suffixed tail
- *   currently falls into the page's 404-at-resolution).
+ *   pair). Mounted before the compare page family (the pre-mount
+ *   suffixed-tail fall-through into the page's 404-at-resolution is gone).
  *   (c) — in the pulls arm, `rest.length === 3 && rest[1] === "files"`:
  *   `parsePullFilesRange(rest[2])` non-null → the `pull-files-range` family
  *   (the bare and single-commit `/files/{sha}` tails stay unclaimed — the
