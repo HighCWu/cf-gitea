@@ -289,3 +289,59 @@ node "$TSX" packages/git-engine/e2e/check-fault-matrix.mjs      # 6 checks
 node "$TSX" packages/git-engine/e2e/check-correctness-tier.mjs  # 7 checks
 node "$TSX" packages/git-engine/e2e/check-capability-matrix.mjs # 18 checks (test-generated at run time)
 ```
+
+## Cursor-drain discipline tripwire (tsx, no dev server, static)
+
+`check-drain-discipline.mjs` — the static tripwire for the workerd defect the
+cursor-drain fix (29b966f) closed at the product seam: on a sqlite-backed
+Durable Object, ONE un-drained `SqlStorage` SELECT cursor bricks every
+subsequent `DROP TABLE` of an existing table for the whole runtime session
+(`SQLITE_LOCKED`; `docs/research/workerd-ddl-cross-session-locked.md` — the
+DDL distillation; workerd#959 — the defect persists upstream, so only the
+discipline prevents a future `.exec(<SELECT>)` from re-bricking DDL
+cross-session). EVERY `sql.exec(<SELECT>)` cursor must drain; only DDL/DML
+may discard.
+
+The script scans every `.exec(` site under `packages/git-engine/src/**` and
+prints the full site table + census each run:
+
+- Sites are found on a comment- AND string-blanked view of each file
+  (character-granularity — a comment that merely mentions `sql.exec(` cannot
+  become a phantom site), with balanced-generic calls like `.exec<Row>(`
+  included (a bare `.exec(` grep misses those).
+- Receivers: `sql`-ending (this.sql, this.ctx.storage.sql, the migrations
+  `sql: SqlStorage` param) are SqlStorage sites; regex-literal receivers and
+  the mod.ts URLPattern `pattern` are the excluded RegExp family; ANY other
+  receiver fails closed so a new unknown receiver is looked at.
+- Statement-head classification (the census's taxonomy): SELECT family =
+  SELECT/WITH/VALUES (any statement of a multi-statement literal); DDL/DML =
+  CREATE/ALTER/DROP/INSERT/UPDATE/DELETE/REPLACE/transaction/PRAGMA-family.
+  Interpolated templates classify by the STATIC text before the first `${`
+  (`SELECT 1 FROM ${name}` → SELECT; `DROP TABLE IF EXISTS ${t}` → DDL); an
+  interpolated head fragment naming no keyword FAILS CLOSED — never guessed.
+  Bare-identifier arguments resolve through the src const map (the baseline
+  SQL constants) before classifying.
+- Every SELECT-bearing site must prove a full drain in the same statement
+  (across lines/comments): `.toArray()` (the engine idiom), `.one()` (the
+  guaranteed single-row aggregate shape), or full iteration
+  (`[...exec()]` / a direct for..of with no break/return). `.next()` (one
+  row), `.raw()` (its own cursor needs its own drain), and a bare discard
+  FAIL naming file:line. Fail-closed is the contract: an unprovable shape is
+  a failure, and the remedy is the `.toArray()` idiom (or a deliberate,
+  documented extension of the rule set).
+
+Every run self-tests the tripwire itself: the exact mutation class (a bare
+`sql.exec(`SELECT 1`)` discard), the fail-closed interpolation arm and the
+`.next()` arm must FAIL; a DDL discard and a drained SELECT must stay green.
+Scanner-sanity floors keep the census from regressing vacuously (a parse
+change that silently drops sites fails the floors). CI-able: exits 0/1 under
+the tsx runner — to wire later, append the invocation below to the CI step
+that runs the other tsx checks (left to the maintainers; `.github/` is not
+this unit's file). An external mutation is witnessed by passing a scratch
+file as an extra argv path: extra files are scanned in addition to src/** and
+any failing site in them fails the run naming file:line (never commit one).
+
+```bash
+TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
+node "$TSX" packages/git-engine/e2e/check-drain-discipline.mjs   # 4 checks (tree) + selftest; prints the site census
+```
