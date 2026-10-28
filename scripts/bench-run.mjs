@@ -101,18 +101,23 @@
  *       must stay tiny — a jump towards 1.0 means the serve path re-sends
  *       the world).
  *   push_wall_ms
- *       fresh clone -> fixed-content commit -> `git push`, timed on the push
+ *       fresh clone -> fixed-shape commit -> `git push`, timed on the push
  *       only; push_bytes is the exact request-body byte count sent. Both
  *       push_wall_ms and fetch_incremental_wall_ms are MEDIANS over 3
  *       independent push->fetch cycles (see TOLERANCE CLASSES — single-shot
  *       wall times at the ~100 ms scale are fixed-overhead noise); bytes and
  *       ratio come from the median-wall sample so reported numbers stay a
- *       coherent pair.
+ *       coherent pair. The cycles are byte-pinned: every cycle commits the
+ *       same-named marker file with a same-length body and a same-length
+ *       message, so each pushed pack has the same object shape and the
+ *       median-sample byte selection cannot swing the metric (pre-pin it
+ *       did: 458-506 B purely by which cycle won the median wall time).
  *   inforefs_p50_ms / inforefs_p95_ms (N = --runs, 3 warmups)
  *       GET /<owner>/<repo>.git/info/refs?service=git-upload-pack (protocol v2
  *       advertisement) latency, sequential direct requests (no proxy hop).
  *
- * TOLERANCE CLASSES (why the gate has two bands, added 2026-10-28)
+ * TOLERANCE CLASSES (why the gate has three bands: overhead wall metrics
+ *   2026-10-28, byte-overhead push_bytes 2026-10-29)
  *   On identical code, wall times of sub-second fixed-overhead operations
  *   swing far beyond the 10% band across hosts. Recorded evidence, same
  *   commit, one day: CI run 40710895496 (compare on a different 2-core runner
@@ -131,11 +136,39 @@
  *   inforefs_p50_ms, inforefs_p95_ms) therefore fails only when the
  *   worse-delta exceeds BOTH the 10% band AND 150 ms absolute (calibrated:
  *   the largest observed identical-code noise delta was 131 ms — CI p95).
- *   Everything else keeps the percentage-only default class. The byte metrics
- *   stay percentage-only on purpose: they are byte-exact across hosts
- *   (identical 5,694,904-byte clones) and carry the gate's real teeth — a
- *   thin-negotiation collapse shows up as fetch_incremental_bytes/ratio
- *   exploding, not as its wall time. Methodology pairing: the overhead wall
+ *   Byte metrics: clone_received_bytes and fetch_incremental_bytes stay
+ *   percentage-only on purpose — they are byte-exact across hosts for a fixed
+ *   fixture (identical 5,694,904-byte clones) and carry the gate's real teeth
+ *   — a thin-negotiation collapse shows up as fetch_incremental_bytes/ratio
+ *   exploding, not as its wall time.
+ *   push_bytes used to sit in that class and was the loaded trigger the
+ *   calibration unit flagged (drift 459-511 across runs on identical code,
+ *   pct-gated lower-is-better). Measured 2026-10-29 through a body-dumping
+ *   forward proxy (scratch dissect run): the receive-pack request splits into
+ *   a pkt-line command section and the pack stream — the command section was
+ *   CONSTANT at 151 B (a single capability echo string, so protocol framing
+ *   was NOT the drift), while the pushed pack itself differed per marker
+ *   cycle: the old cycles were content-asymmetric (cycle 0 added a new file
+ *   on the fixture tip; cycles 1-2 stacked commits whose root trees
+ *   accumulated differently-named marker entries), packing 354-355 B vs
+ *   307-313 B respectively — the whole 458-506 B observed spread was the
+ *   pushed pack, and which of those bytes got reported was decided by which
+ *   cycle won the median WALL time. Fix, same date, two halves: (1) pin the
+ *   cycles — every cycle commits the same-named marker file with a
+ *   same-length body and a same-length message, and never interpolates the
+ *   repo name (the production name carries a per-run hex tag), collapsing the
+ *   spread to 3 B over 9 pinned pushes (zlib's compressed-length wobble on
+ *   the commit timestamp digits); (2) move push_bytes to the "byte-overhead"
+ *   class — fails only when the worse-delta exceeds BOTH the 10% band AND
+ *   OVERHEAD_ABS_FLOOR_BYTES (64 B) absolute — so that residual wobble and
+ *   git-version framing drift (capability echoes grow with agent=git/x.y.z
+ *   version digits) can never false-fire, while any real receive-path
+ *   regression still moves pack-sized counts that clear it easily.
+ *   BASELINE NOTE: ci.json (511) was recorded pre-pin with the asymmetric
+ *   shape; the pinned shape sits lower by construction, which the
+ *   direction-aware gate reads as an improvement, not a failure — no
+ *   re-record needed, the metric schema is unchanged.
+ *   Methodology pairing: the overhead wall
  *   metrics are medians over 3 independent push->fetch cycles — median kills
  *   the within-host per-attempt outliers; the absolute floor absorbs the
  *   cross-host level shift that no amount of sampling can remove.
@@ -186,6 +219,19 @@ const REGRESSION_THRESHOLD = 0.1; // >10% delta counts as a regression (SPEC-000
 // header; calibrated above the 131 ms largest observed identical-code noise
 // delta — CI run 40710895496, inforefs p95).
 const OVERHEAD_ABS_FLOOR_MS = 150;
+// Byte-overhead class: push_bytes' residual variance is framing-level, not
+// content-level. The pinned cycles (see benchSize) make every pushed pack
+// structurally identical, leaving only zlib's compressed-length wobble on the
+// commit timestamp digits (measured 2026-10-29: 3 B spread over 9 pinned
+// pushes) plus client-side framing drift across
+// git versions (the echoed capability list grows with agent=git/x.y.z version
+// digits). A percentage-only gate on a ~0.5 kB metric false-fires on those
+// (pre-pin the median-wall sample selection alone swung push_bytes 458-506 B
+// across cycles), so push_bytes fails only when the worse-delta exceeds BOTH
+// the 10% band AND this absolute floor — calibrated far above the 3 B wobble,
+// far below any real receive-path regression (which moves pack-sized counts).
+const OVERHEAD_BYTES = new Set(["push_bytes"]);
+const OVERHEAD_ABS_FLOOR_BYTES = 64;
 // Sub-second fixed-overhead wall metrics (< ~250 ms ops): percentage-only
 // gating false-fires on cross-host jitter (2-8x swings on identical code).
 const OVERHEAD_METRICS = new Set([
@@ -664,11 +710,17 @@ async function benchSize({ size, manifest, repoPath }, ctx) {
   Object.assign(metrics, await measureInfoRefs(inforefsUrl, inforefsAuth, ctx.runs));
 
   // 3. Push + incremental fetch, median over PUSH_FETCH_SAMPLES independent
-  //    cycles. Fixed marker file names/content keep each pushed pack
-  //    byte-stable across runs. Cycle 0 is the historical metric shape:
-  //    fresh clone -> fixed-content commit -> timed push, then a timed fetch
-  //    of that commit in the stale step-1 clone (thin negotiation). Cycles 1+
-  //    add one marker commit each (untimed) and time the same push->fetch
+  //    cycles. The cycle content is BYTE-PINNED (see TOLERANCE CLASSES in the
+  //    header): every cycle modifies the same-named marker file with a
+  //    same-length body and a same-length message, so each pushed pack has the
+  //    same object shape and the bytes reported with the median wall sample
+  //    cannot swing across cycles (pre-pin: 458-506 B, purely median-sample
+  //    selection). Never interpolate ${name} into the pinned strings — the
+  //    production repo name carries a per-run hex tag and would re-introduce
+  //    cross-run variance. Cycle 0 is the historical metric shape: fresh
+  //    clone -> pinned commit -> timed push, then a timed fetch of that
+  //    commit in the stale step-1 clone (thin negotiation). Cycles 1+ add one
+  //    pinned marker commit each (untimed) and time the same push->fetch
   //    pair; every cycle pushes exactly one new commit and fetches exactly
   //    that commit, so all samples measure the same server operation.
   //    Deviation from single-shot: cycles 1+ push from the warmed workdir
@@ -683,10 +735,9 @@ async function benchSize({ size, manifest, repoPath }, ctx) {
   const pushSamples = [];
   const fetchSamples = [];
   for (let i = 0; i < PUSH_FETCH_SAMPLES; i++) {
-    const marker = i === 0 ? "bench-push.txt" : `bench-push-${i}.txt`;
-    await fsp.writeFile(path.join(pushDir, marker), i === 0 ? `bench push marker for ${name}\n` : `bench push marker ${i} for ${name}\n`);
-    await git(["add", marker], { cwd: pushDir });
-    await git([...ident, "commit", "-qm", `bench: push sample ${i} (${name})`], { cwd: pushDir });
+    await fsp.writeFile(path.join(pushDir, "bench-push.txt"), `bench push marker ${i}\n`);
+    await git(["add", "bench-push.txt"], { cwd: pushDir });
+    await git([...ident, "commit", "-qm", `bench: push sample ${i}`], { cwd: pushDir });
     ctx.proxy.reset();
     const push = await timeGit([...GITC, ...ident, "push", proxyPushUrl, "main"], pushDir);
     const pushBytes = ctx.proxy.read().sent;
@@ -861,18 +912,19 @@ function compareAgainstBaseline(results, baseline, sizes) {
       const worseDelta = higher ? baseVal - curVal : curVal - baseVal;
       const pct = baseVal === 0 ? (worseDelta > 0 ? Infinity : 0) : worseDelta / Math.abs(baseVal);
       // Tolerance class (see TOLERANCE CLASSES in the header): overhead wall
-      // metrics must exceed BOTH the percentage band and the absolute floor;
+      // metrics must exceed BOTH the percentage band and the ms floor;
+      // byte-overhead metrics (push_bytes) BOTH the band and the byte floor;
       // the default class is percentage-only.
-      const cls = OVERHEAD_METRICS.has(key) ? "overhead" : "default";
-      const absFloor = cls === "overhead" ? OVERHEAD_ABS_FLOOR_MS : 0;
+      const cls = OVERHEAD_METRICS.has(key) ? "overhead" : OVERHEAD_BYTES.has(key) ? "byte-overhead" : "default";
+      const absFloor = cls === "overhead" ? OVERHEAD_ABS_FLOOR_MS : cls === "byte-overhead" ? OVERHEAD_ABS_FLOOR_BYTES : 0;
+      const absUnit = key.endsWith("_ms") ? " ms" : key.endsWith("_bytes") ? " B" : "";
       const absWorse = Math.max(0, worseDelta);
       if (pct > REGRESSION_THRESHOLD && (absFloor === 0 || absWorse > absFloor)) {
         const fmt = FMT[key] ?? String;
-        const absUnit = key.endsWith("_ms") ? " ms" : "";
         failures.push(
           `${size}.${key}: baseline ${fmt(baseVal)} -> now ${fmt(curVal)} ` +
           `(${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}% worse, ${r2(absWorse)}${absUnit} absolute worse; ` +
-          `${cls} class: fail needs >${REGRESSION_THRESHOLD * 100}% AND >${absFloor}${absFloor === 0 ? "" : " ms"} absolute)`,
+          `${cls} class: fail needs >${REGRESSION_THRESHOLD * 100}% AND >${absFloor}${absFloor === 0 ? "" : absUnit} absolute)`,
         );
       }
     }
@@ -894,8 +946,9 @@ function flatten(metrics, prefix = "") {
 function printCompare(results, { failures, checked, skipped }) {
   console.log(
     `\ncomparison vs baseline (gate: >${REGRESSION_THRESHOLD * 100}% worse on any recorded metric; ` +
-    `overhead wall metrics — push/fetch/inforefs — must ALSO exceed ${OVERHEAD_ABS_FLOOR_MS} ms absolute worse: ` +
-    "sub-second fixed-overhead ops swing 2-8x across hosts on identical code, see TOLERANCE CLASSES in scripts/bench-run.mjs):",
+    `overhead wall metrics — push/fetch/inforefs — must ALSO exceed ${OVERHEAD_ABS_FLOOR_MS} ms absolute worse, ` +
+    `and push_bytes must exceed ${OVERHEAD_ABS_FLOOR_BYTES} B absolute worse: ` +
+    "sub-second fixed-overhead ops swing 2-8x across hosts on identical code and pinned push bytes still wobble a few B, see TOLERANCE CLASSES in scripts/bench-run.mjs):",
   );
   for (const size of Object.keys(results.sizes)) {
     for (const [key, val] of Object.entries(flatten(results.sizes[size].metrics))) {
@@ -1000,7 +1053,7 @@ async function main() {
   const cmp = compareAgainstBaseline(results, baseline, opts.sizes);
   printCompare(results, cmp);
   if (cmp.failures.length > 0) {
-    console.error(`\nbenchmark regression gate FAILED (${cmp.failures.length} metric(s) over tolerance: >${REGRESSION_THRESHOLD * 100}%, overhead wall metrics also >${OVERHEAD_ABS_FLOOR_MS} ms absolute)`);
+    console.error(`\nbenchmark regression gate FAILED (${cmp.failures.length} metric(s) over tolerance: >${REGRESSION_THRESHOLD * 100}%, wall overhead also >${OVERHEAD_ABS_FLOOR_MS} ms / push_bytes also >${OVERHEAD_ABS_FLOOR_BYTES} B absolute)`);
     return 1;
   }
   console.log("benchmark regression gate PASSED");
