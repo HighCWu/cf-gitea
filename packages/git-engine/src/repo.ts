@@ -343,9 +343,34 @@ export class RepoCell extends DurableObject<Env> {
         return this.handleConfig(JSON.stringify({ description: (await req.text()).trim() }));
       }
       if ((path === "/" || path === "") && req.method === "DELETE") {
+        // A content-less cell is a no-op delete, not a wipe (husk semantics,
+        // 2026-10-28): SPEC-0003 §2.5.5's destroy (the pipeline's real cell
+        // wipe) leaves the cell file behind as an empty husk — schema at head,
+        // no refs / objects / pack rows — and the git-http gate's D1-missing
+        // admin passthrough answers every later engine-shape DELETE of that
+        // name VERBATIM (a second cleanup DELETE must stay a 200, never a
+        // 404 or a 500). Wiping a husk is pointless SQLite churn — and on the
+        // pinned dev runtime it fails outright: workerd answers every
+        // DROP TABLE on a database reopened by a newer runtime session with
+        // SQLITE_LOCKED (CREATE and DML are unaffected), so the wipe turned
+        // the routine cleanup DELETE into a deterministic 500 across
+        // restarts. `deleted\n` is the truthful answer for a cell that holds
+        // nothing: the requested end state (the repo gone) already holds, and
+        // the idempotent side effects below still run. A cell that still
+        // carries ANY content wipes as before. Sealed stores skip the probe
+        // (every data access throws) — the wipe stays their recovery path.
+        if (this.store.schemaState.refused === null && !this.store.hasAnyContent()) {
+          try {
+            await this.ctx.storage.deleteAlarm();
+          } catch {
+            // best effort: an un-cleared alarm fires on an empty schema and no-ops
+          }
+          await this.purgePackCache();
+          return new Response("deleted\n");
+        }
         // the whole wipe is ONE transactionSync: drop + re-create the schema
         // atomically, so a concurrent request can never land between the table
-        // drop and the re-init (SPEC-0001a §3 Step 4 — Rule 3: the last
+        // drop and the re-init (SPEC-0011 §8 — Rule 3: the last
         // blockConcurrencyWhile on this path is gone)
         this.ctx.storage.transactionSync(() => {
           this.store.wipe();

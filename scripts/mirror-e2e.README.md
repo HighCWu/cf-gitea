@@ -260,14 +260,26 @@ to be 32 base64 bytes for the AES-256-GCM KEK.)
 **None on the current tree** — the suite runs fully green against it (the
 run-hygiene layer self-heals the environmental state below harness-side).
 The two product gaps the suite found on its first run were both fixed since
-(the suite is what surfaced them, so they are kept here for the record), and
-one new product-side finding was surfaced by the hardening and REPORTED, not
-fixed here (product source is out of the harness unit's scope):
+(the suite is what surfaced them, so they are kept here for the record); the
+third finding below was RESOLVED engine-side on 2026-10-28 (root cause
+deeper than the husk shape — see the resolution note):
 
-3. **Engine DELETE 500s (`SQLITE_LOCKED`) on a purged cell's husk file** —
-   after a successful engine DELETE + async purge completes, the cell's
-   sqlite file remains as an empty husk, and EVERY later engine DELETE of
-   that name answers `HTTP 500 — database table is locked: SQLITE_LOCKED`,
+3. ~~**Engine DELETE 500s (`SQLITE_LOCKED`) on a purged cell's husk file**~~
+   **RESOLVED 2026-10-28 (engine fix, `packages/git-engine/src/repo.ts` +
+   `e2e/check-delete-husk.mjs`; NOTICE rows same date)** — the root cause
+   turned out to be a pinned-dev-runtime defect, not husk-specific: on the
+   pinned miniflare-beta/workerd, every `DROP TABLE` against a sqlite-DO
+   database created by a PREVIOUS runtime session fails `SQLITE_LOCKED`
+   forever (healthy cells merely escape by living and dying in one session).
+   The fix makes a content-less cell's DELETE a no-op success — the truthful
+   idempotent-delete semantic. The harness's pre-server cell-file sweep stays
+   as harmless hygiene; the residual runtime defect (a CONTENT-bearing
+   cell's first DELETE after a dev restart still 500s locally) is recorded
+   in the NOTICE as an upstream-runtime issue, production behavior
+   unverified. Original finding kept below for the record: after a
+   successful engine DELETE + async purge completes, the cell's
+   sqlite file remained as an empty husk, and EVERY later engine DELETE of
+   that name answered `HTTP 500 — database table is locked: SQLITE_LOCKED`,
    deterministically and across dev-server restarts (reproduced 2026-10-28
    on a quiet fresh server for all four `mirrore2e` names). Before the
    run-hygiene hardening this 500 was invisible (the setup discarded the
