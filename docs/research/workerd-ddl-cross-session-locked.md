@@ -353,17 +353,23 @@ that doubles as the out-of-band recovery the issue body mentions).
   needed), description, optional logs (paste the `SQLITE_LOCKED` rows).
 - **Re-verify before filing (mandatory — this draft did not re-execute the
   script):**
-  1. Extract the inline script to a scratch dir, `npm i
+  1. ~~Extract the inline script to a scratch dir, `npm i
      miniflare@<the version then pinned by wrangler/vite-plugin/vitest-plugin>`,
-     run it, and confirm the outcome pattern: all of session A and every
-     SELECT/INSERT/CREATE in B/C ok; every DROP in B/C failing with
-     `SQLITE_LOCKED`.
-  2. Re-run `pnpm test`-style check `packages/git-engine/e2e/check-delete-husk.mjs`
-     on this repo's then-current tree to confirm the consumer-side signature is
-     unchanged.
-  3. Search workers-sdk/workerd issues for the exact signature
-     (`SQLITE_LOCKED` + `DROP TABLE` + sqlite DO + restart) before filing; no
-     duplicate search has been run from here.
+     run it, and confirm the outcome pattern~~ **DONE 2026-10-28 (filing-prep
+     unit) — outcome CONTRADICTS the predicted table: with the one required
+     fix (`await` on `getDurableObjectNamespace`) applied, session B's DROPs
+     SUCCEED. See "Filing verification (executed) 2026-10-28" §1.**
+  2. ~~Re-run `pnpm test`-style check `packages/git-engine/e2e/check-delete-husk.mjs`
+     on this repo's then-current tree~~ **COVERED VIA THE FROZEN ENGINE BUNDLE
+     instead 2026-10-28: `check-delete-husk.mjs` itself was not run because the
+     working tree carries a sibling wave's uncommitted hunks in
+     `packages/git-engine/src/repo.ts`/`mod.ts` (result would not attribute
+     cleanly); the husk unit's original drivers (drive5/6/7 against the frozen
+     patched bundle in `/tmp/husk-repro`) re-verified the identical
+     cross-session `SQLITE_LOCKED` signature on the pinned runtime. See §1.**
+  3. ~~Search workers-sdk/workerd issues for the exact signature~~ **DONE
+     2026-10-28 — NO duplicate exists; closest relatives and why-not-duplicate
+     table in §2. File as a new issue (after resolving the §1 repro blocker).**
 - **Labels:** the workers-sdk template assigns none automatically; mention in
   the text that this concerns miniflare's dev runtime / the pinned workerd
   binary (prerelease miniflare pin).
@@ -410,3 +416,187 @@ gh issue create --repo cloudflare/workers-sdk \
    down.
 7. **Duplicate upstream reports:** none searched from here (see checklist step
    3).
+
+---
+
+## Filing verification (executed) — 2026-10-28 (filing-prep unit)
+
+Executed the filing checklist against the CURRENT tree/lockfile. Headline:
+**the defect itself re-verified on the pinned runtime today, but the draft's
+paste-ready inline repro script does NOT reproduce it** — the issue body must
+not be filed as-is. Details below; the body above is left untouched.
+
+### 1. Inline repro execution — DOES NOT REPRODUCE (filing blocker)
+
+Setup: script extracted verbatim from the body to `/tmp/ddl-repro-verify/`;
+run with node v25.9.0 against the repo's pinned miniflare from the pnpm store
+(`node_modules/miniflare` symlinked to
+`.pnpm/miniflare@5.20261019.2-beta_@types+node@26.6.5/.../miniflare`; miniflare
+is a transitive dep, not hoisted). `node --check` passes.
+
+- **Script bug (hard failure before any SQL):** in miniflare
+  5.20261019.2-beta, `mf.getDurableObjectNamespace("DB")` returns a lazy
+  thenable proxy; without `await`, `ns.getByName` is `undefined` →
+  `TypeError: ns.getByName is not a function` at the first `sql()` call.
+  Verified `await mf.getDurableObjectNamespace(...)` yields a namespace whose
+  `getByName` is a function. One-word fix (`await`), applied in the scratch
+  copy only.
+
+- **With the `await` applied, actual output (verbatim, fresh state dir):**
+
+  ```
+  --- session A: the session that CREATES the database file
+  A: CREATE TABLE t  (DDL)                     {"ok":true,"rows":[]}
+  A: INSERT INTO t   (DML)                     {"ok":true,"rows":[]}
+  --- session B: a fresh runtime over the SAME database file
+  B: SELECT * FROM t  (DML read)               {"ok":true,"rows":[{"a":1}]}
+  B: INSERT INTO t    (DML write)              {"ok":true,"rows":[]}
+  B: CREATE TABLE t2  (DDL)                    {"ok":true,"rows":[]}
+  B: DROP TABLE t     (DDL)                    {"ok":true,"rows":[]}
+  B: DROP TABLE t2    (DDL, created this session) {"ok":true,"rows":[]}
+  --- session C: restart again; the FIRST and only statement is the DROP
+  C: DROP TABLE t2    (DDL, sole statement)    {"ok":false,"error":"no such table: t2: SQLITE_ERROR"}
+  ```
+
+- **Verdict against the body's predicted table:** session A ok/ok (matches);
+  B's SELECT/INSERT/CREATE ok (matches); **B's two DROP cells are WRONG — they
+  succeed** instead of `SQLITE_LOCKED`; session C's failure is **not** the
+  predicted lock but `SQLITE_ERROR`/"no such table" — a downstream artifact of
+  B's DROPs having succeeded. Cross-session persistence itself worked (B read
+  A's inserted row), so the harness shape is sound; the script simply does not
+  trigger the defect.
+
+- **Discriminator hunt (why the script misses what the drivers hit).** All of
+  these single-factor variants were run 3-sessions-identically and each still
+  produced a SUCCESSFUL cross-session DROP: in-worker binding access via
+  `env.DB.getByName().fetch()` + `dispatchFetch` (the gate's access path);
+  `class Db extends DurableObject` (gate's class shape); DO-RPC method access
+  (`stub.sqlq(q)` on an `extends DurableObject` class — the gate's
+  `__debugSql` shape); KV-layer touch (`storage.put`); pending alarm +
+  `alarm()` handler; `ctx.storage.transactionSync` wrapping SQL (the engine's
+  actual transaction mechanism, `repo.ts:260`); engine-like 15-table schema +
+  index; in-session `DROP` as session A's last statement; multiple wakes in
+  session A; larger WAL (50 inserts). **Conclusion: the trigger is a composite
+  only the full engine hits; a true standalone minimal repro was NOT distilled
+  in this pass.** This is the gating work item before filing.
+
+- **The defect re-verified via the husk unit's original drivers** (still on
+  disk in the ephemeral `/tmp/husk-repro`; run today against the frozen
+  patched bundle `worker-debug.mjs` [2026-10-28 12:59] on the same pinned
+  runtime, fresh state dirs). Condensed but verbatim-faithful transcripts:
+
+  `drive7.mjs` (cleanest control pair — never-wiped AND wiped cells):
+
+  ```
+  --- session B: reopen BOTH; drop-probe each
+  [sql B c-plain create tmp] {"rows":[]}
+  [sql B c-plain drop tmp (NEVER-WIPED, reopened)] {"error":"database table is locked: SQLITE_LOCKED"}
+  [sql B c-wiped create tmp] {"rows":[]}
+  [sql B c-wiped drop tmp (WIPED, reopened)] {"error":"database table is locked: SQLITE_LOCKED"}
+  [sql B c-plain create t3] {"rows":[]}
+  [sql B c-plain drop t3 (same reopened session, 2nd try)] {"error":"database table is locked: SQLITE_LOCKED"}
+  --- session C: reopen AGAIN — does a once-failed drop clear?
+  [sql C c-plain create t4] {"rows":[]}
+  [sql C c-plain drop t4] {"error":"database table is locked: SQLITE_LOCKED"}
+  ```
+
+  `drive5.mjs` (per-statement probes on a reopened cell — resolves
+  could-not-verify ledger item 2):
+
+  ```
+  [sql journal_mode] {"error":"not authorized: SQLITE_AUTH"}
+  [sql drop nonexistent] {"rows":[]}
+  [sql create tmp] {"rows":[]}
+  [sql drop tmp] {"error":"database table is locked: SQLITE_LOCKED"}
+  [sql drop reachable] {"error":"database table is locked: SQLITE_LOCKED"}
+  [sql select objects] {"rows":[{"n":0}]}
+  [sql delete objects] {"rows":[]}
+  ```
+
+  `drive6.mjs` (in-session vs cross-session DDL boundary):
+
+  ```
+  [sql A: create+drop same stmt] {"rows":[]}
+  [sql A: create tmp] {"rows":[]}
+  [sql A: drop tmp same session] {"rows":[]}
+  [A: DELETE c1 (same session)] status=200 body="deleted\n"
+  --- session B: REOPENED cells, new process
+  [sql B: create tmp on reopened c1] {"rows":[]}
+  [sql B: drop tmp on reopened c1] {"error":"database table is locked: SQLITE_LOCKED"}
+  [B: DELETE c1 (reopened)] status=500 body="error: database table is locked: SQLITE_LOCKED\n"
+  ```
+
+  **Contradictions/nuances against the body's claims, flagged for the
+  orchestrator (body NOT edited):**
+  1. Controls-table row "…`PRAGMA journal_mode` … | all succeed" is wrong in
+     detail: `PRAGMA journal_mode` via `state.storage.sql.exec` is REFUSED by
+     workerd with `not authorized: SQLITE_AUTH` (workerd's PRAGMA allowlist) —
+     an independent restriction, not a success and not the defect. The row
+     should say the PRAGMA probe is refused (`SQLITE_AUTH`) and the
+     SELECT/INSERT/DELETE/CREATE probes succeed.
+  2. Ledger item 2 resolved by drive5: `DROP TABLE IF EXISTS <nonexistent>` on
+     a reopened database **succeeds** — the lock bites only when dropping a
+     table that actually exists. The body never claimed otherwise (safe), and
+     now the fact is pinned.
+  3. The Reproduction section's predicted-output block does not match the
+     inline script's real behavior (see above) — the body's repro must be
+     replaced or re-based on a working script before filing.
+
+### 2. Duplicate search — no duplicate; file as a new issue
+
+Method: GitHub issue search over `cloudflare/workers-sdk` and
+`cloudflare/workerd` (API `search/issues`: `SQLITE_LOCKED`,
+`"database table is locked"`, `"DROP TABLE"+sqlite/DO`, `useSQLite+locked`,
+`SQLITE_AUTH`, DDL angles) plus web search. Closest hits:
+
+| Issue | Status | Why not a duplicate |
+|---|---|---|
+| [workerd#959](https://github.com/cloudflare/workerd/issues/959) — "unused SQL cursors lead to strange errors" | open (2023-08) | Only public issue naming "database table is locked" in DO SQL. Its locks come from an OPEN CURSOR in the SAME session and clear when the cursor drains; ours needs NO prior statement in the session (session C's sole statement is the DROP) and re-forms in every new session. Adjacent mechanism family (statement/cursor lifetime vs DDL) — cross-reference it when filing. |
+| [workerd#7783](https://github.com/cloudflare/workerd/issues/7783) — cached EXPLAIN re-run after drop+recreate segfaults | closed fixed (2026-10) | DDL + cached-statement interaction, but in-session, crash (segfault) not persistent lock, fixed. Evidence the statement-cache/DDL area is live upstream — useful context. |
+| [workers-sdk#15162](https://github.com/cloudflare/workers-sdk/issues/15162) — `wrangler d1 migrations apply --local` SQLITE_LOCKED | closed | D1 simulator (miniflare's D1 path), not sqlite-DO storage; migration-parsing cause. Different subsystem. |
+| [workers-sdk#16071](https://github.com/cloudflare/workers-sdk/issues/16071) — D1 deferred-FK reset rejects concurrent batch | closed | D1 semantics bug with a Miniflare reproducer; no DDL-lock-across-sessions claim. |
+| [workers-sdk#16227](https://github.com/cloudflare/workers-sdk/issues/16227) — Miniflare D1: unknown sqlite files + SQLITE_AUTH on integrity_check | open | D1 files/SQLITE_AUTH surface only; unrelated to DO DDL. |
+
+**Verdict: no genuine duplicate — the draft proceeds as a NEW issue (after the
+§1 repro blocker is resolved), with a one-line cross-reference to workerd#959
+and optionally workerd#7783 as related.**
+
+### 3. Versions re-check — no delta; census bumps have NOT landed
+
+Every value in the body's environment table re-verified against the current
+lockfile/store/working tree:
+
+| Component | Body claims | Found now | Delta |
+|---|---|---|---|
+| miniflare | 5.20261019.2-beta (exact pin declared by wrangler 4.152.0 / vite-plugin / vitest-plugin) | same — lockfile + wrangler's own `package.json` declares the exact string; `pnpm-workspace.yaml` additionally carries `overrides: miniflare: 5.20261019.2-beta` (pins ALL consumers, e.g. vitest-pool-workers' older alpha, to the same version — consistent with, and noted by, the body's phrasing) | none |
+| workerd | 1.20261019.1 (shipped by the miniflare pin) | same — miniflare's dep is exactly `workerd: 1.20261019.1` | none |
+| wrangler | 4.152.0 | `^4.152.0` declared, 4.152.0 resolved | none |
+| @cloudflare/vite-plugin / vitest-plugin | 1.65.0 / 1.4.7 | `^1.65.0` / `^1.4.7` declared, same resolved | none |
+| @cloudflare/workers-types | — | `^5.20261025.1` (with the `minimumReleaseAgeExclude` entry) | none |
+| compatibility_date | 2026-10-19 | 2026-10-19 (wrangler.jsonc) | none |
+| Node / OS | v25.9.0 / Ubuntu 24.04.2, kernel 6.14.0-37-generic | same machine, same values | none |
+
+The dep-freshness census's proposed move (`miniflare → 5.20261023.0-beta`,
+`workerd → 1.20261023.1`, `compatibility_date → 2026-10-23`) has **NOT**
+landed — the tree is still on the 20261019 train, so the body's versions
+table remains accurate as written.
+
+### 4. Net filing recommendation (for the orchestrator)
+
+**Do NOT file the current body.** Steps 1-3 of the checklist are now executed
+(repro: contradiction; gate-equivalent signature: re-verified via frozen
+bundle; duplicates: none), and the residual blocker is single: the body's
+self-contained repro does not reproduce. Options, in order of preference:
+
+1. **Distill a working minimal repro** — budget real time; nine single-factor
+   bisections failed (§1), so the trigger is a composite of the engine's
+   storage behavior. If it resists, fall back to 2.
+2. **Re-base the Reproduction section on the committed,
+   mutation-checked reproducer** (`packages/git-engine/e2e/check-delete-husk.mjs`
+   + the drive-script shape: engine worker with `RepoCell`/`Registry` +
+   `dispatchFetch`), stating plainly that the reproducer is product-coupled.
+   Slower triage, but the claim is then backed by something that actually
+   reproduces.
+3. Either way, apply the three body corrections flagged in §1 (PRAGMA row,
+   ledger item 2 note, predicted-output block) — and the `await` fix if the
+   inline script is kept in any form.
