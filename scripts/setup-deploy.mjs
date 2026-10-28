@@ -4,9 +4,10 @@
  *   1. verify wrangler login;
  *   2. ensure D1 `cf-gitea` exists (create if missing) and read its database_id;
  *   3. ensure R2 bucket `cf-gitea-packs` exists (create if missing);
- *   4. fill the real database_id into apps/worker/wrangler.jsonc (comment-preserving
- *      single-line swap of the placeholder — wrangler.jsonc is committed and is the
- *      single source of truth; only the account-specific id is patched);
+ *   4. ensure apps/worker/wrangler.jsonc exists (copy wrangler.jsonc.example on
+ *      first run) and fill the real database_id into it (comment-preserving
+ *      single-line swap of the placeholder — the file is gitignored and
+ *      account-local; wrangler.jsonc.example stays the committed template);
  *   5. apply remote D1 migrations.
  *
  * Idempotent: safe to re-run; existing resources are reused, an already-filled
@@ -14,13 +15,13 @@
  * resource detection + placeholder presence) and exits non-zero on drift — used
  * by CI/orchestration. Run via the root script: `pnpm setup:deploy`.
  *
- * Design note (AGENTS.md Structure Rules): wrangler.jsonc stays COMMITTED with a
- * placeholder id until self-hosting ships; the example-file model (wrangler.jsonc
- * gitignored + deterministic installer) is the planned graduation, per gitorange.
+ * Design note (AGENTS.md Structure Rules): the example-file model (this script)
+ * IS the graduated state, adopted when self-hosting by third parties became a
+ * product goal — wrangler.jsonc is gitignored, the .example is the template.
  */
 import { execFileSync } from "node:child_process";
 import console from "node:console";
-import { readFile, writeFile } from "node:fs/promises";
+import { copyFile, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -28,6 +29,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const WRANGLER_CONFIG = path.join(workerDir, "wrangler.jsonc");
+const WRANGLER_EXAMPLE = path.join(workerDir, "wrangler.jsonc.example");
 const D1_NAME = "cf-gitea";
 const R2_NAME = "cf-gitea-packs";
 const PLACEHOLDER = "00000000-0000-0000-0000-000000000000";
@@ -87,8 +89,17 @@ if (!buckets.includes(R2_NAME)) {
 }
 console.log(`[ok] R2 ${R2_NAME}`);
 
-// 4. patch wrangler.jsonc (single-line swap, comments preserved)
-const config = await readFile(WRANGLER_CONFIG, "utf8");
+// 4. ensure the local config, then patch it (single-line swap, comments preserved)
+let config;
+try {
+  config = await readFile(WRANGLER_CONFIG, "utf8");
+} catch {
+  if (CHECK) fail("wrangler.jsonc missing (check mode) — run without --check to create it from the example");
+  console.log("wrangler.jsonc missing — copying wrangler.jsonc.example ...");
+  await copyFile(WRANGLER_EXAMPLE, WRANGLER_CONFIG);
+  config = await readFile(WRANGLER_CONFIG, "utf8");
+  console.log("[ok] wrangler.jsonc created from the example template");
+}
 if (config.includes(`"database_id": "${databaseId}"`)) {
   console.log("[ok] wrangler.jsonc already carries the real database_id");
 } else {

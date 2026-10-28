@@ -25,3 +25,7 @@ apps/worker/src/ui/icons.generated.ts
 scripts/diff-report-*.json
 # vitest-plugin run cache (multiple agents flagged the untracked dir)
 apps/worker/.vitest/
+
+# Real wrangler config (from .example via pnpm setup:deploy or the deploy
+# button; carries the account's real resource ids)
+apps/worker/wrangler.jsonc

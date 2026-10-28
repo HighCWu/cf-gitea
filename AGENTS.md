@@ -46,12 +46,14 @@ scripts/               # Repo-level tooling (contract checks, codegen)
   consumers see the engine through its generated declarations (`dist-types/`).
   Editing engine sources? `pnpm typecheck` regenerates the boundary automatically
   (pnpm -r runs the engine before the worker via the workspace dependency order).
-- `wrangler.jsonc` is COMMITTED with a placeholder `database_id` (not secret — account
-  auth is required to use it); `pnpm setup:deploy` provisions D1/R2 if missing and
+- `wrangler.jsonc` is GITIGNORED and account-local (it carries the real resource
+  ids); the COMMITTED `wrangler.jsonc.example` is the template. `pnpm
+  setup:deploy` copies the example on first run, provisions D1/R2 if missing,
   fills the real id (comment-preserving single-line swap), then applies remote
-  migrations. The gitignored-example-file model (gitorange's installer pattern) is
-  the planned graduation, adopted only when self-hosting by third parties becomes a
-  product goal — do not switch opportunistically.
+  migrations; CI restores the file from the example right after checkout. This
+  is the GRADUATED example-file model (gitorange's installer pattern), adopted
+  2026-10-28 when the repo went public for third-party self-hosting — the
+  earlier committed-placeholder state is history, do not revert it.
 - Generated artifacts are never committed: `dist/`, `dist-types/`, `.wrangler/`,
   `worker-configuration.d.ts` (regenerate with `wrangler types`).
 

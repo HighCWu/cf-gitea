@@ -1,9 +1,11 @@
 # cf-gitea
 
-A Gitea-compatible, headless git forge backend running entirely on Cloudflare Workers.
-Stock git clients (`clone`/`push`), Gitea API tooling (SDKs, `tea`, release automation,
-terraform providers) work against it unmodified; the official Gitea web UI is the
-long-term frontend (asset-reuse strategy, SPEC-0008+).
+The official Gitea web UI on a from-scratch TypeScript backend — Cloudflare
+Workers (Hono) + D1 + R2 + Durable Objects, git smart-HTTP protocol included.
+Gitea-API compatible: stock git clients (`clone`/`push`), Gitea tooling (SDKs,
+`tea`, release automation, terraform providers) work against it unmodified;
+the official Gitea web UI is served via the asset-reuse strategy (SPEC-0008+).
+Not affiliated with the Gitea project — see [NOTICE.md](NOTICE.md).
 
 Release notes — what shipped, how it was verified, known limitations:
 [v1.0](docs/RELEASE-NOTES-v1.0.md) · [v1.1](docs/RELEASE-NOTES-v1.1.md) (the
@@ -71,11 +73,21 @@ curl -H "Authorization: token <PAT>" http://127.0.0.1:5173/api/v1/user
 
 ### Deploy it
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/HighCWu/cf-gitea)
+
+The button clones this repo into your GitHub account, provisions the D1
+database and R2 bucket automatically (ids are filled into the wrangler config
+for you), builds and deploys via Workers Builds — works on the free plan.
+Two manual bits after it finishes: set the three secrets below, and set
+`APP_URL` in your copied `wrangler.jsonc` to your Worker's public origin.
+Prefer the terminal? The same result, explicitly:
+
 ```bash
 pnpm exec wrangler login
-pnpm setup:deploy          # idempotent: ensures D1 cf-gitea + R2 cf-gitea-packs,
-                           # fills database_id into wrangler.jsonc, applies remote migrations
-                           # (read-only drift check: pnpm setup:deploy -- --check)
+pnpm setup:deploy          # idempotent: copies wrangler.jsonc.example → wrangler.jsonc
+                           # (gitignored, account-local) on first run, ensures D1 cf-gitea
+                           # + R2 cf-gitea-packs, fills the real database_id, applies
+                           # remote migrations (read-only drift check: pnpm setup:deploy -- --check)
 cd apps/worker
 pnpm exec wrangler secret put GIT_TOKEN                    # dev-fallback credential
 pnpm exec wrangler secret put MIRROR_ALLOWED_HOST_LIST     # mirror egress allow-list
@@ -87,6 +99,11 @@ pnpm build && pnpm deploy  # build REQUIRED before deploy: wrangler deploys dist
                            # generated config — a stale dist carries stale wrangler state
 pnpm smoke --base-url https://<your-worker>.workers.dev [--token <PAT>] [--migrate-check]
 ```
+
+Self-hosted deployments are YOURS: nothing in this repo schedules cleanup,
+deletes user data, or rate-limits beyond your own Cloudflare plan's limits —
+the periodic-cleanup demo posture is a configuration of the reference
+instance only, never of the code you deploy.
 
 `pnpm smoke` (scripts/deploy-smoke.mjs, `--base-url` required) asserts `/healthz`,
 that the anonymous git surface answers 401/404 (never an advert), and with `--token`
