@@ -18,7 +18,7 @@ import {
   ZERO_OID,
 } from "../services/engine";
 import { toAnnotatedTag, toTag } from "../services/git-models";
-import { annotatedTagSchema, createTagOptionSchema, tagSchema } from "../models/git";
+import { annotatedTagSchema, createTagOptionSchema, tagSchema, type Tag } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { assertNotArchived, canWriteRepository, requireVisibleRepo } from "../services/repo-access";
 import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
@@ -57,6 +57,23 @@ import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
  * message and tagger render "" / null — annotated-tag object bytes are
  * engine-resident and the landed public RPC surface exposes targets + the
  * peel cache only.
+ *
+ * WILDCARD ADDRESSABILITY — upstream DECLARES `{tag}` single-segment in its
+ * swagger but registers the two name-addressed ops under chi catch-alls
+ * (`m.Get("/*", repo.GetTag)` / `m.Delete("/*", ...)` —
+ * routers/api/v1/api.go:1333-1338) reading the name with
+ * `ctx.PathParam("*")` (tag.go:153/:269) — so tag names git allows that
+ * contain slashes (`release/v1.2`) address correctly on upstream's wire.
+ * Ours mirrors that runtime shape: the declared `{tag}` routes stay verbatim
+ * (the frozen contract's shape — upstream's swagger text is identical), and
+ * each has a plain-Hono `/repos/:owner/:repo/tags/*` sibling sharing the same
+ * handler core. Slash-free names match the declared route (hono's param route
+ * wins the shared prefix — probed on the branch-protections twin), so the two
+ * arms never disagree. POST /tags (create) is body-addressed, not
+ * path-addressed — a slash `tag_name` needs no wildcard. The sibling's tag
+ * name cuts the path tail anchored on the `repos/{owner}/{repo}/tags` shape
+ * scanned from the LEFT (mount-depth immune — hono keeps c.req.path
+ * unstripped inside a .route()-mounted sub-app).
  *
  * Webhook fan-out (the `create`/`delete` ref events): the CREATE and DELETE
  * handlers emit through the landed emitWebhookDeliveries pipeline — the
@@ -141,6 +158,127 @@ async function hasRelease(d1: D1Database, repoId: string, tagName: string): Prom
     .limit(1)
     .then((rows) => rows[0]);
   return row !== undefined;
+}
+
+/** The wildcard siblings' Hono pattern — the runtime catch-all under the
+ *  same prefix the declared `{tag}` route serves (module-header note). */
+const WILDCARD_ROUTE = "/repos/:owner/:repo/tags/*";
+
+// ---------------------------------------------------------------------------
+// The name-addressed handler cores — shared by the declared {tag} routes and
+// their wildcard siblings so the two addressability arms can never disagree
+// (the branch-protections module's pattern). The repo gates stay in the
+// wrappers (requireVisibleRepo in each — the wildcard's owner/repo decode
+// exactly like the declared route's); the delete core carries the
+// archived/empty/write gates so every arm gates identically.
+// ---------------------------------------------------------------------------
+
+/** repoGetTag's body — the refs-table lookup + the shared Tag render. */
+async function getTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, tagName: string): Promise<Tag> {
+  const tip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(tagRef(tagName));
+  if (tip === undefined) {
+    throw new ApiError(404, "tag doesn't exist: " + tagName);
+  }
+  const sha = await tagCommitSha(c, pair.repo, { name: tagName, target: tip.target, ...(tip.peeled === undefined ? {} : { peeled: tip.peeled }) });
+  if (sha === null) {
+    throw new ApiError(404, "tag doesn't exist: " + tagName);
+  }
+  return toTag(tagName, tip, sha, pair, viewerOf(c).origin);
+}
+
+/** repoDeleteTag's body — gates, the release coupling, the CAS delete, and
+ *  the push/delete webhook pair. */
+async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, tagName: string): Promise<void> {
+  assertNotArchived(pair);
+  if (pair.repo.isEmpty) {
+    throw new ApiError(405, "Git Repository is empty.");
+  }
+  if (!(await canWriteRepository(c, pair))) {
+    throw new ApiError(403, "user should have a permission to write to the target branch");
+  }
+  if ((await hasRelease(c.env.DB, pair.repo.id, tagName))) {
+    throw new ApiError(409, "a tag attached to a release cannot be deleted directly");
+  }
+  const tip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(tagRef(tagName));
+  if (tip === undefined) {
+    throw new ApiError(404, "not found");
+  }
+  // Protected-tag enforcement on the delete arm (upstream DeleteTag →
+  // release_service.DeleteReleaseByID's IsUserAllowedToControlTag check,
+  // services/release/release.go:376-390, answered 422 "user not allowed
+  // to delete protected tag", routers/api/v1/repo/tag.go:282-285 — the
+  // check runs after the existence arms, exactly here).
+  const doer = c.get("authUser");
+  if (!(await isTagControlAllowed(c.env.DB, await listProtectedTags(c.env.DB, pair.repo.id), tagName, doer?.id ?? 0))) {
+    throw new ApiError(422, "user not allowed to delete protected tag");
+  }
+  const result = await engineCell(c.env, pair.repo).deleteApiRef({ ref: tagRef(tagName), expectedOid: tip.target });
+  if (result.tag !== "deleted") {
+    const error = deleteApiRefError(result);
+    if (error !== null) throw error;
+  }
+  // Upstream's API tag delete fires the zero-commit `push` event too
+  // (services/release/release.go:396-403 — PushCommits with
+  // OldCommitID = the tag's sha and the empty NewCommitID, then
+  // DeleteRef :403): before = the pre-delete ref tip, after = the zero
+  // oid. Emission order push → delete matches upstream.
+  if (result.tag === "deleted") {
+    await emitRefWebhook(c, pair, "push", zeroCommitPushPayload(c, pair, tagRef(tagName), tip.target, ZERO_OID), tagRef(tagName));
+  }
+  // Upstream DeleteRef (notifier.go:858→:870): pusher_type is always
+  // "user" (api.PusherTypeUser). The idempotent already-absent arm
+  // (deleteApiRefError's null) removed nothing — no event for it.
+  if (result.tag === "deleted") {
+    await emitRefWebhook(
+      c,
+      pair,
+      "delete",
+      {
+        ref: tagName,
+        ref_type: "tag",
+        pusher_type: "user",
+        repository: toApiRepository(viewerOf(c), pair),
+        sender: c.get("authUser") ?? null,
+      },
+      tagRef(tagName),
+    );
+  }
+}
+
+/**
+ * The wildcard sibling's tag name — the decoded RAW tail after the canonical
+ * prefix (hono's catch-all carries no param; upstream reads
+ * ctx.PathParam("*"), tag.go:153/:269). The handler may see the FULL request
+ * path (the worker mounts the api router at /api/v1 — hono keeps c.req.path
+ * unstripped inside the sub-app), so the cut anchors on the
+ * `repos/{owner}/{repo}/tags` shape found scanning from the LEFT: the real
+ * family prefix always precedes the tag name, so the first match wins
+ * whatever the mount depth (and a tag containing "repos"/"tags" as later
+ * segments cannot hijack it). Decode mirrors hono's own param decode: one
+ * decodeURIComponent pass, a malformed escape keeps the raw text.
+ */
+function tagNameOfTail(c: Context<ApiEnv>): string {
+  const segments = c.req.path.split("/");
+  let cut = -1;
+  for (let i = 0; i + 3 < segments.length; i++) {
+    if (segments[i] === "repos" && segments[i + 3] === "tags") {
+      cut = i + 4;
+      break;
+    }
+  }
+  const tail = cut === -1 ? "" : segments.slice(cut).join("/");
+  try {
+    return decodeURIComponent(tail);
+  } catch {
+    return tail;
+  }
+}
+
+/** The wildcard sibling's repo path — the labeled params (owner/repo decode
+ *  exactly like the declared route's). */
+function wildcardRepoPath(c: Context<ApiEnv, typeof WILDCARD_ROUTE>): { owner: string; repo: string } {
+  const { owner, repo } = c.req.param();
+  return { owner, repo };
 }
 
 // ---------------------------------------------------------------------------
@@ -476,16 +614,7 @@ export function registerTagRoutes(
     }),
     async (c) => {
       const pair = await requireVisibleRepo(c, c.req.valid("param"));
-      const tagName = c.req.valid("param").tag;
-      const tip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(tagRef(tagName));
-      if (tip === undefined) {
-        throw new ApiError(404, "tag doesn't exist: " + tagName);
-      }
-      const sha = await tagCommitSha(c, pair.repo, { name: tagName, target: tip.target, ...(tip.peeled === undefined ? {} : { peeled: tip.peeled }) });
-      if (sha === null) {
-        throw new ApiError(404, "tag doesn't exist: " + tagName);
-      }
-      return c.json(toTag(tagName, tip, sha, pair, viewerOf(c).origin), 200);
+      return c.json(await getTagByName(c, pair, c.req.valid("param").tag), 200);
     },
   );
 
@@ -518,64 +647,33 @@ export function registerTagRoutes(
     }),
     async (c) => {
       const pair = await requireVisibleRepo(c, c.req.valid("param"));
-      assertNotArchived(pair);
-      if (pair.repo.isEmpty) {
-        throw new ApiError(405, "Git Repository is empty.");
-      }
-      if (!(await canWriteRepository(c, pair))) {
-        throw new ApiError(403, "user should have a permission to write to the target branch");
-      }
-      const tagName = c.req.valid("param").tag;
-      if ((await hasRelease(c.env.DB, pair.repo.id, tagName))) {
-        throw new ApiError(409, "a tag attached to a release cannot be deleted directly");
-      }
-      const tip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(tagRef(tagName));
-      if (tip === undefined) {
-        throw new ApiError(404, "not found");
-      }
-      // Protected-tag enforcement on the delete arm (upstream DeleteTag →
-      // release_service.DeleteReleaseByID's IsUserAllowedToControlTag check,
-      // services/release/release.go:376-390, answered 422 "user not allowed
-      // to delete protected tag", routers/api/v1/repo/tag.go:282-285 — the
-      // check runs after the existence arms, exactly here).
-      const doer = c.get("authUser");
-      if (!(await isTagControlAllowed(c.env.DB, await listProtectedTags(c.env.DB, pair.repo.id), tagName, doer?.id ?? 0))) {
-        throw new ApiError(422, "user not allowed to delete protected tag");
-      }
-      const result = await engineCell(c.env, pair.repo).deleteApiRef({ ref: tagRef(tagName), expectedOid: tip.target });
-      if (result.tag !== "deleted") {
-        const error = deleteApiRefError(result);
-        if (error !== null) throw error;
-      }
-      // Upstream's API tag delete fires the zero-commit `push` event too
-      // (services/release/release.go:396-403 — PushCommits with
-      // OldCommitID = the tag's sha and the empty NewCommitID, then
-      // DeleteRef :403): before = the pre-delete ref tip, after = the zero
-      // oid. Emission order push → delete matches upstream.
-      if (result.tag === "deleted") {
-        await emitRefWebhook(c, pair, "push", zeroCommitPushPayload(c, pair, tagRef(tagName), tip.target, ZERO_OID), tagRef(tagName));
-      }
-      // Upstream DeleteRef (notifier.go:858→:870): pusher_type is always
-      // "user" (api.PusherTypeUser). The idempotent already-absent arm
-      // (deleteApiRefError's null) removed nothing — no event for it.
-      if (result.tag === "deleted") {
-        await emitRefWebhook(
-          c,
-          pair,
-          "delete",
-          {
-            ref: tagName,
-            ref_type: "tag",
-            pusher_type: "user",
-            repository: toApiRepository(viewerOf(c), pair),
-            sender: c.get("authUser") ?? null,
-          },
-          tagRef(tagName),
-        );
-      }
+      await deleteTagByName(c, pair, c.req.valid("param").tag);
       return c.body(null, 204);
     },
   );
+
+  // -------------------------------------------------------------------------
+  // The wildcard siblings — GET/DELETE …/tags/* (the multi-segment tag names
+  // git allows: `release/v1.2`). Upstream DECLARES {tag} in its swagger but
+  // registers these two under chi catch-alls (`m.Get("/*", repo.GetTag)` /
+  // `m.Delete("/*", ...)` — api.go:1333-1338) reading `ctx.PathParam("*")`
+  // (tag.go:153/:269); ours mirrors the runtime shape with plain Hono routes
+  // sharing the declared ops' cores. Plain routes (never app.openapi): they
+  // must NOT appear in the generated spec — the frozen contract keeps the
+  // single-segment {tag} declaration, which is upstream's own swagger text.
+  // Registered AFTER the {tag} family: slash-free names match the declared
+  // route (hono's param route wins the shared prefix — probed), so the two
+  // arms never disagree.
+  // -------------------------------------------------------------------------
+  app.get(WILDCARD_ROUTE, optionalAuth, async (c) => {
+    const pair = await requireVisibleRepo(c, wildcardRepoPath(c));
+    return c.json(await getTagByName(c, pair, tagNameOfTail(c)), 200);
+  });
+  app.delete(WILDCARD_ROUTE, requireAuth, async (c) => {
+    const pair = await requireVisibleRepo(c, wildcardRepoPath(c));
+    await deleteTagByName(c, pair, tagNameOfTail(c));
+    return c.body(null, 204);
+  });
 
   // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/git/tags/{sha} (GetAnnotatedTag) — annotated
