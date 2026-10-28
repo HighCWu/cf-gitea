@@ -205,6 +205,16 @@ export interface PushEvent {
    */
   pusherId?: number;
   pusherLogin?: string;
+  /**
+   * The origin (scheme + authority, e.g. "https://git.example.com") the
+   * receive-pack request arrived on — the base for absolute webhook payload
+   * URLs. Populated by the engine's own receive path from the live request
+   * (`requestOrigin`); absent if a receive path without a parsable http(s)
+   * request URL ever fires the hook. The literal request origin, never
+   * proxy-header-rewritten; consumers must treat it as client-visible data,
+   * not an authenticated value.
+   */
+  origin?: string;
 }
 
 /**
@@ -1226,16 +1236,27 @@ async function receivePack<E extends Env>(
         // registry deferred
       }
       if (options.onPush) {
+        const origin = requestOrigin(req);
+        const onPush = options.onPush; // narrowed local: property narrowing does not survive the .then closure
         const event: PushEvent = {
           repo,
           updates: fin.updates,
           commitTime: idle,
           ...(pusher !== undefined ? { pusherId: pusher.id, pusherLogin: pusher.login } : {}),
+          ...(origin !== undefined ? { origin } : {}),
         };
+        // The hook call runs INSIDE the promise chain: `Promise.resolve(
+        // options.onPush(...))` evaluates the hook BEFORE wrapping it, so a
+        // synchronous throw escaped the waitUntil argument and — via the
+        // outer catch — turned an already-applied push into a 500, against
+        // this hook's documented contract (a throwing hook never fails the
+        // push). Sync and async throws both land in the catch below now.
         ctx.waitUntil(
-          Promise.resolve(options.onPush(event, env)).catch((err) => {
-            console.log(`[onPush ${repo}] hook failed: ${err instanceof Error ? err.message : String(err)}`);
-          })
+          Promise.resolve()
+            .then(() => onPush(event, env))
+            .catch((err) => {
+              console.log(`[onPush ${repo}] hook failed: ${err instanceof Error ? err.message : String(err)}`);
+            })
         );
       }
     }
@@ -1262,6 +1283,22 @@ function receiveHeaders(): Record<string, string> {
     "content-type": "application/x-git-receive-pack-result",
     "cache-control": "no-cache",
   };
+}
+
+/**
+ * The origin (`PushEvent.origin`) a receive-pack request arrived on. Only
+ * http(s) URLs carry a real origin (`URL.origin` is "null" for exotic
+ * schemes). Defensive by contract: the only call site runs POST-finalize on
+ * an already-applied push, so a parse failure degrades to `undefined` — it
+ * must never turn an applied push into a 500.
+ */
+function requestOrigin(req: Request): string | undefined {
+  try {
+    const u = new URL(req.url);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.origin : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The returned handler: a valid Worker default export, with `fetch` non-optional
