@@ -50,7 +50,7 @@ row is implicitly ACTIVE. Transitions:
 | Transition | Actor | Preconditions | Crash semantics |
 |---|---|---|---|
 | ACTIVE→RETIRED | compaction's catalog publish (single DO SQLite txn) | successor pack written to R2 and verified in the SAME txn that flips both rows | txn is atomic: publish either happened or not; old pack never deletable before successor publish |
-| RETIRED→RECLAIMABLE | GC scan (DO txn) | zero live read leases reference the pack AND receive-finalize premise check cannot need it (§6) | idempotent re-scan; sweeper converges by catalog state, never by assumption |
+| RETIRED→RECLAIMABLE | GC scan (DO txn) | zero live read leases reference the pack AND the supersession premise verifies: `superseded_by` followed TRANSITIVELY until it reaches an ACTIVE row (bounded, cycle-safe; an unverifiable chain stays RETIRED and is retried — as built, §8 M3.4. This replaces the original "receive-finalize premise check cannot need it (§6)" wording: §6 defines no such check — the finalize premise is finalize's own in-transaction availability probe and needs no GC-side coordination) | idempotent re-scan; sweeper converges by catalog state, never by assumption |
 | RECLAIMABLE→DELETED | GC delete (after R2 DELETE ack) | RETIRED ∧ zero leases ∧ RECLAIMABLE recorded | R2 DELETE retried idempotently; partial multipart aborts must be recoverable; catalog row removed only after ack |
 
 Invariants (m3-design-inputs §"Pack lifecycle", adopted):
@@ -148,8 +148,12 @@ post-push-N heuristic, or manual RPC. Cron enqueues; the DO consumer works
    R2 (`repos/<key>/packs/pack-<sha1>.pack` layout unchanged), build its index
    rows.
 4. **Publish** in ONE DO SQLite transaction: new pack row ACTIVE, superseded
-   inputs RETIRED, `reachable`/`peeled` untouched (object-level truth does not
-   move).
+   inputs RETIRED, `reachable`/`peeled` untouched. As built (§8 M3.3),
+   object-level CONTENT does not move but index-row ATTRIBUTION does: every
+   merged `pack_objects` row is re-pointed onto the successor (a guarded
+   per-oid UPDATE, `packstore.ts` `publishCompaction`) so identical bytes
+   are re-served THROUGH the successor — that re-point is what makes §2's
+   RETIRED premise walk and its RECLAIMABLE index-row cleanup true.
 5. GC later reclaims (§2) once leases drain.
 
 ### 5.3 Publish ordering & crash windows (normative)
@@ -158,7 +162,13 @@ write new pack to R2 → single-txn catalog publish → lease-gated delete of
 RETIRED. Crash windows:
 
 - New pack written, catalog unpublished = **orphan** — sweepable, safe (prefix +
-  catalog state converge; never assumed).
+  catalog state converge; never assumed). As built, the compaction lease row is
+  the orphan's only sweeper pointer (the sweep acts on an expired compaction
+  lease's payload + catalog state), so a round that fails GRACEFULLY after the
+  bytes are written (`lease_lost`, a failed R2 PUT) KEEPS the lease row and the
+  same sweep converges it — only the success path releases the lease (the
+  original text left the round's own release behavior unspecified; graceful
+  failure now converges identically to a crash mid-publish).
 - Old pack is NEVER deletable before its successor's catalog publish.
 - Partial R2 delete (multipart abort) must be idempotent-recoverable; the
   sweeper converges by prefix + catalog state, not by assumption (adopted).

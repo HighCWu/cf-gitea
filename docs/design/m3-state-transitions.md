@@ -23,6 +23,10 @@ Every `file:line` below is from the current tree. Writers cited:
   transition consults (`hasLiveReadLeaseFor`, `read-leases.ts:120-126`;
   NOTICE.md:112).
 
+Amended same-day by the D3 engine-fix unit (compaction.ts touched — the T1
+row's compaction.ts/check-compaction.mjs line cites were refreshed to the
+post-fix tree; D3 marked FIXED; §6 item 1 resolved).
+
 ## 1. The states as the code holds them
 
 State lives in `pack_catalog.state` (`src/git/packstore.ts:109` —
@@ -85,10 +89,10 @@ row's behavior regresses. Check ids are the scripts' own §-labeled titles.
 
 | | As built |
 |---|---|
-| **Actor** | `runCompaction` (`src/compaction.ts:170-260`), triggered by the DO alarm threshold consumer (`maybeCompactFromAlarm`, `src/repo.ts:437-481`, `activePackCount() > 8` — `compaction.ts:62`) or the manual `RepoCell.compactNow` (`repo.ts:514-530`). The flip itself is `publishCompaction` (`packstore.ts:964-970`: `UPDATE … SET state='retired', superseded_by=? WHERE pack_key=? AND state='active'`) inside the ONE `transactionSync` at `compaction.ts:230-239`. |
-| **Preconditions** | (a) no live `receive` lease and no live `compaction` lease (`compaction.ts:175-180`, `hasActiveLease`, `src/git/store.ts`; pinned: check-compaction §5.1 exclusion, `e2e/check-compaction.mjs:779`); (b) threshold exceeded unless `force` (`compaction.ts:183-186`); (c) bounded input window of ≥2 oldest ACTIVE packs (`compaction.ts:189-196`, `packstore.ts:876-908`); (d) the compaction lease still live **inside the publish transaction** — `compaction.ts:230-232` re-reads the lease row in the same txn and refuses to publish otherwise (`lease_lost`). Every precondition re-evaluates under DO serialization: there is no check-then-act window against leases. |
-| **Crash semantics** | The publish is atomic (`transactionSync` = one SQLite txn): crash leaves the whole pre-publish world or the whole post-publish world. Ordering: lease payload names the output R2 keys BEFORE the R2 write (`compaction.ts:215-226`) → write pack+idx to R2 (`:225-226`) → publish (`:230-239`). **Window W1 — crash before/during the publish txn** (isolate death; the `finally` at `:257-259` never runs): catalog unchanged; successor bytes exist in R2 unpublished (an ORPHAN); an unexpired compaction lease whose payload names the output keys survives. Recovery: the lease-expiry sweep deletes the orphan **by payload + catalog state** — an output whose catalog row does not exist is deleted, never assumed (`sweepExpiredLeases`, `src/control-plane.ts:423-429`) — and drops the stale lease row. Pinned: check-compaction §5.3 crash-before-publish, `e2e/check-compaction.mjs:558` (catalog byte-unchanged, payload names keys, orphan swept, next round succeeds) + the §7.2 row-4 append ("fetches unaffected": post-crash full clone completes with its flush tail, catalog byte-unchanged — `check-compaction.mjs:606-614`). **Window W2 — crash after the publish, before the lease release**: successor ACTIVE, inputs RETIRED, stale compaction lease expires → sweep keeps the output (row exists) and deletes only the lease row (`control-plane.ts:423-429`; pinned: check-compaction §5.3 crash-after-publish, `e2e/check-compaction.mjs:620`). **Window W3 — lease expires mid-round, no crash** (`lease_lost`, `compaction.ts:240-245`): see divergence D3 — this graceful path is NOT equivalent to W1 and strands the orphan bytes. |
-| **Invariant carried** | Retired inputs keep their bytes and serve existing readers THROUGH the successor's identical content: the publish re-points every merged `pack_objects` row onto the successor (guarded per-oid UPDATE, `packstore.ts:946-963`) and flips inputs RETIRED in the same txn, so no index row ever names a retired input and `store.has(tip)` at receive finalize resolves through the successor at every instant (§5.4 premise; finalize check `control-plane.ts:711-716`). Renewal is state-aware: a live plan re-directed onto the successor (a pack its payload never named) is authorized because the successor is ACTIVE (`read-leases.ts:270-287`). Pinned: check-compaction §5.2 publish rows (`e2e/check-compaction.mjs:439`), determinism (`:532`), §2/§5.4 plan-before-compaction mixed-generation clone (`:666`); check-segmented-serve mixed generations (`e2e/check-segmented-serve.mjs:399`). |
+| **Actor** | `runCompaction` (`src/compaction.ts:178-279`), triggered by the DO alarm threshold consumer (`maybeCompactFromAlarm`, `src/repo.ts:437-481`, `activePackCount() > 8` — `compaction.ts:62`) or the manual `RepoCell.compactNow` (`repo.ts:514-530`). The flip itself is `publishCompaction` (`packstore.ts:964-970`: `UPDATE … SET state='retired', superseded_by=? WHERE pack_key=? AND state='active'`) inside the ONE `transactionSync` at `compaction.ts:242-251`. |
+| **Preconditions** | (a) no live `receive` lease and no live `compaction` lease (`compaction.ts:183-188`, `hasActiveLease`, `src/git/store.ts`; pinned: check-compaction §5.1 exclusion, `e2e/check-compaction.mjs:885`); (b) threshold exceeded unless `force` (`compaction.ts:191-194`); (c) bounded input window of ≥2 oldest ACTIVE packs (`compaction.ts:197-204`, `packstore.ts:876-908`); (d) the compaction lease still live **inside the publish transaction** — `compaction.ts:243-245` re-reads the lease row in the same txn and refuses to publish otherwise (`lease_lost`). Every precondition re-evaluates under DO serialization: there is no check-then-act window against leases. |
+| **Crash semantics** | The publish is atomic (`transactionSync` = one SQLite txn): crash leaves the whole pre-publish world or the whole post-publish world. Ordering: lease payload names the output R2 keys BEFORE the R2 write (`compaction.ts:227-235`) → write pack+idx to R2 (`:237-238`) → publish (`:242-251`). **Window W1 — crash before/during the publish txn** (isolate death; the `finally` at `:275-279` never runs): catalog unchanged; successor bytes exist in R2 unpublished (an ORPHAN); an unexpired compaction lease whose payload names the output keys survives. Recovery: the lease-expiry sweep deletes the orphan **by payload + catalog state** — an output whose catalog row does not exist is deleted, never assumed (`sweepExpiredLeases`, `src/control-plane.ts:423-429`) — and drops the stale lease row. Pinned: check-compaction §5.3 crash-before-publish, `e2e/check-compaction.mjs:562` (catalog byte-unchanged, payload names keys, orphan swept, next round succeeds) + the §7.2 row-4 append ("fetches unaffected": post-crash full clone completes with its flush tail, catalog byte-unchanged — `check-compaction.mjs:610-618`). **Window W2 — crash after the publish, before the lease release**: successor ACTIVE, inputs RETIRED, stale compaction lease expires → sweep keeps the output (row exists) and deletes only the lease row (`control-plane.ts:423-429`; pinned: check-compaction §5.3 crash-after-publish, `e2e/check-compaction.mjs:624`). **Window W3 — lease expires mid-round, no crash** (`lease_lost`, `compaction.ts:252-257`): the GRACEFUL failure exit — and since D3's fix it is equivalent to W1: the `finally` releases the lease only when the publish landed (`compaction.ts:277`, the `published` flag), so the failed round KEEPS the row and the same sweep converges the orphan within the TTL (pinned: check-compaction §5.3 graceful failure exits, `e2e/check-compaction.mjs:674,723` — see D3). |
+| **Invariant carried** | Retired inputs keep their bytes and serve existing readers THROUGH the successor's identical content: the publish re-points every merged `pack_objects` row onto the successor (guarded per-oid UPDATE, `packstore.ts:946-963`) and flips inputs RETIRED in the same txn, so no index row ever names a retired input and `store.has(tip)` at receive finalize resolves through the successor at every instant (§5.4 premise; finalize check `control-plane.ts:711-716`). Renewal is state-aware: a live plan re-directed onto the successor (a pack its payload never named) is authorized because the successor is ACTIVE (`read-leases.ts:270-287`). Pinned: check-compaction §5.2 publish rows (`e2e/check-compaction.mjs:443`), determinism (`:536`), §2/§5.4 plan-before-compaction mixed-generation clone (`:772`); check-segmented-serve mixed generations (`e2e/check-segmented-serve.mjs:399`). |
 | **Pin** | check-compaction §5.2/§5.3 rows above; check-fault-matrix §7.2 row 1 (`e2e/check-fault-matrix.mjs:489` — a REAL publish lands MID-STREAM between segment GETs, both succeed, seam guard holds, closure byte-identical). |
 
 ### T2 — RETIRED→RECLAIMABLE (GC scan)
@@ -146,9 +150,9 @@ The substrate all three transitions consult, with its own lifecycle
 
 This section is the review-facing point of the document. Items D1, D2, D6 are
 already recorded in the spec's §8 as-built records (the §2/§5 normative text
-was simply never updated to match); D3 is a genuine crash-semantics gap not
-recorded anywhere; D4/D5 are spec-wording mismatches with no code
-counterpart.
+was simply never updated to match); D3 WAS a genuine crash-semantics gap —
+FIXED 2026-10-28 (keep-lease-row-on-failed-publish; see its entry); D4/D5 are
+spec-wording mismatches with no code counterpart.
 
 ### D1 — §2's RETIRED→RECLAIMABLE precondition (b) cites a check that §6 does not define
 
@@ -183,47 +187,48 @@ guarded re-points (`specs/0011-compaction-gc.md:330-334`; NOTICE.md:126);
 the §5.2 parenthetical reads as if index rows were copied rather than moved
 and should be re-worded (recommendation only).
 
-### D3 — GAP: graceful error exits of T1 strand written-but-unpublished output bytes (unrecorded, unpinned)
+### D3 — FIXED: graceful error exits of T1 now keep the lease row so the sweep converges the orphan (was: stranding)
 
-The orphan convergence of §5.3 ("prefix + catalog state converge; never
-assumed") is implemented as **payload + catalog state**: the only sweeper
-that can delete an unpublished compaction output is the compaction branch of
-`sweepExpiredLeases`, which acts solely on an EXPIRED COMPACTION LEASE ROW's
-payload (`control-plane.ts:423-429`). There is no prefix-scan sweeper for
-`repos/<key>/packs/` (the only prefix purge is repo destroy,
-`repo.ts:1273-1276`; GC's listing covers only the clone-cache prefix,
-`gc.ts:231`). That makes the lease row the orphan's single pointer — and
-`runCompaction` deletes that pointer itself on the graceful exits: the
-`finally { store.deleteLease(leaseToken) }` (`compaction.ts:257-259`) runs
-unconditionally, including when the publish was REFUSED (`lease_lost`,
-`compaction.ts:240-245`) or when a PUT threw after the pack bytes landed
-(the pack PUT at `:225` succeeding and the idx PUT at `:226` failing leaves
-partial output bytes with the lease deleted by the unwound `finally`). In
-both cases the catalog has no row and the sweep later finds no lease — the
-bytes are unreachable by any sweeper until repo destroy.
+**Status: FIXED (2026-10-28).** The original gap: the orphan convergence of
+§5.3 ("prefix + catalog state converge; never assumed") is implemented as
+**payload + catalog state** — the only sweeper that can delete an unpublished
+compaction output is the compaction branch of `sweepExpiredLeases`, which acts
+solely on an EXPIRED COMPACTION LEASE ROW's payload
+(`control-plane.ts:415-431`, compaction branch `:423-429`: an output whose
+catalog row does not exist has its pack + idx R2 keys deleted and the lease
+row dropped; there is no prefix-scan sweeper for `repos/<key>/packs/` — the
+only prefix purge is repo destroy). `runCompaction`'s
+`finally { store.deleteLease(leaseToken) }` ran UNCONDITIONALLY, including on
+the graceful failure exits: the publish's in-transaction lease-liveness
+re-read refusing (`lease_lost`) and a failed/thrown R2 PUT after the pack
+bytes landed. In both cases the catalog had no row, the sweep later found no
+lease, and the bytes were unreachable by any sweeper until repo destroy. The
+pinned crash window (isolate death — `deleteLease` stubbed to a no-op "so the
+crashed state is faithful", `e2e/check-compaction.mjs` §5.3
+crash-before-publish) was already the SAFE half of this posture.
 
-The pinned crash window is the SAFE half of this: check-compaction §5.3
-simulates ISOLATE DEATH inside the publish txn (`e2e/check-compaction.mjs:569-574`
-— `deleteLease` stubbed to a no-op "so the crashed state is faithful"), where
-the `finally` never runs, the lease survives, and the sweep converges. No
-check exercises `lease_lost` or a mid-write R2 failure at all (grep for
-`lease_lost` across `packages/git-engine/e2e/` is empty). Reachability is
-narrow (the compaction lease TTL is 10 minutes for a bounded one-invocation
-round — `compaction.ts:90-98` — so expiry needs a long isolate pause or
-clock movement across the two awaits, and an R2 PUT failure is a
-transport-class event), but the residue is permanent storage leak, and the
-code comment at `compaction.ts:243-245` ("the sweep owns it now") is only
-true if the lease row survives, which on this path it does not.
+**The fix** (orchestrator decision: keep-lease-row-on-failed-publish; NOTICE.md
+2026-10-28): a `published` flag — set ONLY when the publish transaction
+commits (`compaction.ts:216`, `:242`) — gates the release
+(`compaction.ts:277`): the SUCCESS path deletes the lease exactly as before;
+a FAILED round (lease_lost, a failed idx PUT after the landed pack PUT, a
+thrown publish txn) KEEPS the row, whose payload is the orphan's only sweeper
+pointer, so the existing expired-lease sweep removes the staged bytes + the
+row within the TTL (`COMPACTION_LEASE_TTL_MS`, 10 min) — graceful failure is
+now semantically identical to the already-pinned crash window. Until expiry
+the live row defers later rounds (`compaction_in_flight`), exactly like a
+crashed holder's.
 
-Recommendations (not applied — this unit is read-only): (a) on the
-`lease_lost`/error exits, LEAVE the lease row in place (skip the `finally`
-deletion when the publish did not land) so the existing sweep converges the
-orphan exactly as in the crash window — the smallest change; or (b) add a
-prefix+catalog-state orphan sweep (list `repos/<key>/packs/`, delete objects
-whose `pack-<sha1>` has no catalog row) to the GC pass; and in either case
-pin it with a fault-matrix check that fails the idx PUT after the pack PUT,
-then sweeps and asserts byte convergence — that check would FAIL against
-today's tree, which is the point.
+**Pinned** (check-compaction §5.3 graceful failure exits,
+`e2e/check-compaction.mjs:674` and `:723`): a graceful `lease_lost` round
+(lease expired mid-round, NO crash — the publish refuses and RETURNS) and a
+graceful mid-write failure (idx PUT throws after the pack PUT) each assert
+the lease row SURVIVES with its payload naming the output keys and the
+catalog + index rows byte-unchanged, then a sweep pass removes the staged
+bytes + the row (idx absent in the partial-output case deletes fine) and the
+next round succeeds. Mutation-tested: both checks FAIL against the pre-fix
+unconditional `deleteLease`. The SPEC's §5.3 orphan bullet records the
+as-built posture (`specs/0011-compaction-gc.md`, amended in the same change).
 
 ### D4 — "Partial multipart aborts" has no counterpart in the transition code
 
@@ -258,9 +263,9 @@ implicitly here.
 ### D6 — Elaborations the spec table does not name (all recorded in §8, listed for completeness)
 
 - The T1 publish re-guards compaction-lease liveness INSIDE the publish
-  transaction (`compaction.ts:230-232`) — the spec's T1 cell does not
-  mention the lease-loss window (its orphan window covers it incidentally,
-  except for D3's graceful path).
+  transaction (`compaction.ts:243-245`) — the spec's T1 cell does not
+  mention the lease-loss window (its orphan window covers it incidentally;
+  D3's graceful path now converges identically — see the D3 entry).
 - The defensive zero-live-lease re-check before the T3 delete (`gc.ts:198`)
   — §7.2 fault C's never-grant-both made structural (NOTICE.md:132; §8 M3.4
   record `specs/0011-compaction-gc.md:349-351`).
@@ -327,10 +332,11 @@ rejection is the contract" with client validation as defense-in-depth.
 
 ## 6. Open issues for the next wave
 
-1. **D3 (highest value)**: the T1 graceful-error orphan-stranding gap —
-   recommend the engine-side fix decision (keep the lease row on failed
-   publishes vs prefix-scan sweep) plus the fault-matrix pin. This is the
-   only item found where a crash/ERROR window's residue does NOT converge.
+1. **D3 — RESOLVED (2026-10-28)**: the T1 graceful-error orphan-stranding gap
+   is fixed (keep-lease-row-on-failed-publish; `compaction.ts:216,242,277`) and
+   pinned by the two §5.3 graceful-failure checks
+   (`e2e/check-compaction.mjs:674,723`, mutation-tested) + the NOTICE.md
+   deviation rows and the SPEC-0011 §5.3 as-built amendment. Nothing open.
 2. **D1/D2**: §2/§5 normative-text amendments (spec edit; owner: the spec).
 3. **Row 10/11 pins** (§5 above): two appends to
    `e2e/check-fault-matrix.mjs`; also the assessment's §6 item 3 housekeeping

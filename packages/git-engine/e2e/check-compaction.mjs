@@ -25,6 +25,10 @@
 //         payload + catalog state and the catalog is byte-unchanged) and
 //         crash-after-publish (the published successor is KEPT; only the
 //         stale lease row dies). The old packs are never deleted (M3.4's).
+//         Graceful failure exits (D3): lease_lost and a failed idx PUT keep
+//         the lease row — the orphan's only sweeper pointer — so the sweep
+//         converges the written-but-unpublished bytes exactly as in the
+//         crash window; the success path still releases the lease.
 //   §5.4/§2 RETIRED serves existing readers: a plan taken BEFORE the
 //         compaction keeps reading — successor renewals authorized
 //         (non-member ACTIVE), member RETIRED renewals authorized, raw
@@ -660,8 +664,110 @@ await check("§5.3 crash after publish: the published successor is KEPT — only
 });
 
 // ---------------------------------------------------------------------------
-// §2 / §5.4 RETIRED serves existing readers
+// §5.3 graceful failure exits (divergence D3): the lease row is the orphan's
+// ONLY sweeper pointer — a failed round KEEPS it so the expiry sweep
+// converges the written-but-unpublished output exactly like the crash
+// windows above (where the finally never runs). The success path still
+// releases the lease (§5.2 checks pin that).
 // ---------------------------------------------------------------------------
+
+await check("§5.3 graceful lease_lost: the failed round KEEPS its lease row — the sweep, not the round, converges the orphan", async () => {
+  const t = makeT();
+  const objects = new Map();
+  t.store.setR2(fakeBucket(objects), STORAGE); // bound before any packed read
+  seedRepo(t.store, objects);
+  const preCatalog = JSON.parse(JSON.stringify(catalogRows(t)));
+  const preRows = t.sql.exec("SELECT COUNT(*) AS n FROM pack_objects").one().n;
+  const host = hostOf(t, objects);
+
+  // the lease expires mid-round with NO crash (W3: an isolate pause past the
+  // TTL between the R2 PUTs and the publish): the publish transaction's
+  // liveness re-read refuses gracefully — runCompaction RETURNS lease_lost,
+  // nothing throws, and (unlike the crash window above) the finally RUNS
+  const realTx = host.storage.transactionSync;
+  host.storage.transactionSync = (fn) => {
+    t.sql.exec("UPDATE leases SET expires_at = 1 WHERE kind = 'compaction'");
+    return realTx(fn);
+  };
+  const result = await runCompaction(host, { force: true });
+  host.storage.transactionSync = realTx;
+  assertEq(result.tag, "deferred", "the refused publish defers (graceful, no throw)");
+  assertEq(result.reason, "lease_lost", "the deferral names the lost lease");
+
+  // THE D3 ASSERTION: the graceful failure leaves the lease row in place —
+  // its payload is the written output's only sweeper pointer
+  const lease = t.sql.exec("SELECT lease_token, payload FROM leases WHERE kind = 'compaction'").toArray()[0];
+  assert(lease, "the failed round's lease row SURVIVES the graceful failure");
+  const payload = JSON.parse(lease.payload);
+  assert(payload.outputPackKey && payload.outputPackR2Key && payload.outputIdxR2Key, "the payload names the output keys");
+  assert(objects.get(payload.outputPackR2Key), "the orphan pack bytes exist pre-sweep");
+  assert(objects.get(payload.outputIdxR2Key), "the orphan idx bytes exist pre-sweep");
+  assertEq(JSON.parse(JSON.stringify(catalogRows(t))), preCatalog, "catalog byte-unchanged by the refused publish");
+  assertEq(t.sql.exec("SELECT COUNT(*) AS n FROM pack_objects").one().n, preRows, "index rows untouched");
+
+  // the sweep (the lease is already past its expires_at) converges BY payload
+  // + catalog state: staged bytes deleted, row dropped, catalog untouched
+  await sweepExpiredLeases(host);
+  assertEq(objects.get(payload.outputPackR2Key), undefined, "orphan pack bytes swept");
+  assertEq(objects.get(payload.outputIdxR2Key), undefined, "orphan idx bytes swept");
+  assertEq(t.sql.exec("SELECT COUNT(*) AS n FROM leases").one().n, 0, "the kept lease row is gone after the sweep");
+  assertEq(JSON.parse(JSON.stringify(catalogRows(t))), preCatalog, "catalog still byte-unchanged after the sweep");
+
+  // and the repo is compactable again once the sweep has run (converged, not
+  // wedged — while the kept lease was still LIVE, rounds defer exactly as
+  // they would for a crashed holder)
+  const retry = await runCompaction(host, { force: true });
+  assertEq(retry.tag, "compacted", "the next round succeeds after the sweep");
+});
+
+await check("§5.3 graceful mid-write failure (idx PUT throws after the pack PUT): the lease row survives so the sweep converges the partial output", async () => {
+  const t = makeT();
+  const objects = new Map();
+  t.store.setR2(fakeBucket(objects), STORAGE); // bound before any packed read
+  seedRepo(t.store, objects);
+  const preCatalog = JSON.parse(JSON.stringify(catalogRows(t)));
+  const host = hostOf(t, objects);
+
+  // the second R2 PUT (the idx sidecar) fails after the pack bytes landed —
+  // a transport-class event, so runCompaction THROWS (a throw is a
+  // transport/engine bug per its contract) and the finally unwinds
+  const realPut = host.putPackObject;
+  let puts = 0;
+  host.putPackObject = async (key, data) => {
+    if (++puts === 2) throw new Error("simulated R2 transport failure on the idx PUT");
+    await realPut(key, data);
+  };
+  let threw = null;
+  try {
+    await runCompaction(host, { force: true });
+  } catch (err) {
+    threw = err;
+  }
+  host.putPackObject = realPut;
+  assert(threw, "the R2 failure surfaced as a throw (transport class)");
+
+  // THE D3 ASSERTION: the error exit keeps the lease row — the partial
+  // output's only sweeper pointer survives the unwound finally
+  const lease = t.sql.exec("SELECT lease_token, payload FROM leases WHERE kind = 'compaction'").toArray()[0];
+  assert(lease, "the failed round's lease row SURVIVES the error exit");
+  const payload = JSON.parse(lease.payload);
+  assert(payload.outputPackKey && payload.outputPackR2Key && payload.outputIdxR2Key, "the payload names the output keys");
+  assert(objects.get(payload.outputPackR2Key), "the landed pack bytes exist pre-sweep");
+  assertEq(objects.get(payload.outputIdxR2Key), undefined, "the idx sidecar never landed (partial output)");
+  assertEq(JSON.parse(JSON.stringify(catalogRows(t))), preCatalog, "catalog byte-unchanged by the failed round");
+
+  // the sweep reclaims both keys (a missing object deletes fine) + the row
+  t.sql.exec("UPDATE leases SET expires_at = 1 WHERE kind = 'compaction'");
+  await sweepExpiredLeases(host);
+  assertEq(objects.get(payload.outputPackR2Key), undefined, "the landed pack bytes swept");
+  assertEq(t.sql.exec("SELECT COUNT(*) AS n FROM leases").one().n, 0, "the kept lease row is gone after the sweep");
+  assertEq(JSON.parse(JSON.stringify(catalogRows(t))), preCatalog, "catalog still byte-unchanged after the sweep");
+
+  const retry = await runCompaction(host, { force: true });
+  assertEq(retry.tag, "compacted", "the next round succeeds after the sweep");
+});
+
+
 
 await check("§2/§5.4 a plan taken BEFORE compaction keeps reading — through the successor — and mixed-generation clones complete", async () => {
   const t = makeT();

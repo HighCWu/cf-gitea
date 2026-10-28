@@ -165,7 +165,15 @@ export type CompactionResult =
 /**
  * Run ONE compaction round (SPEC-0011 §5.2). Never throws for application
  * outcomes (tagged unions, per the control-plane RPC discipline); a throw is
- * a transport/engine bug. The lease is released on every exit path.
+ * a transport/engine bug. The lease is released on the success path; a FAILED
+ * round (lease_lost, a failed R2 PUT, a thrown publish) KEEPS the row: once
+ * the payload names the output keys it is the orphan's ONLY sweeper pointer
+ * (§5.3 convergence is payload + catalog state — there is no prefix scan),
+ * so deleting it here would strand the written bytes until repo destroy.
+ * The expiry sweep removes the staged bytes and the row within the TTL —
+ * the same convergence as an isolate death mid-publish, whose finally never
+ * runs. Until expiry the live row keeps later rounds deferred, exactly as a
+ * crashed holder's would.
  */
 export async function runCompaction(host: CompactionHost, opts: CompactionRunOptions = {}): Promise<CompactionResult> {
   const { store } = host;
@@ -202,6 +210,10 @@ export async function runCompaction(host: CompactionHost, opts: CompactionRunOpt
   const expiresAt = Date.now() + COMPACTION_LEASE_TTL_MS;
   store.createLease(leaseToken, "compaction", expiresAt, JSON.stringify(payload));
 
+  // Set ONLY when the publish transaction committed — the finally's signal
+  // that the lease has done its job (see the docstring: a failed round keeps
+  // the row so the sweep can converge its written-but-unpublished output).
+  let published = false;
   try {
     // --- §5.2 step 3: merge (dedupe by OID; deltas kept where their base
     // ships earlier in the successor), write the pack + its idx to R2 ------
@@ -227,7 +239,7 @@ export async function runCompaction(host: CompactionHost, opts: CompactionRunOpt
 
     // --- §5.2 step 4: publish in ONE transaction (new row ACTIVE, inputs →
     // RETIRED, index rows re-pointed); the lease must still be ours --------
-    const published = host.storage.transactionSync(() => {
+    published = host.storage.transactionSync(() => {
       const lease = store.getLease(leaseToken);
       if (!lease || lease.kind !== "compaction" || lease.expiresAt <= Date.now()) return false;
       store.packs.publishCompaction(
@@ -240,7 +252,8 @@ export async function runCompaction(host: CompactionHost, opts: CompactionRunOpt
     if (!published) {
       // the lease was swept/expired mid-merge (an isolate pause past the
       // TTL): publish nothing — an unpublished output is an orphan by
-      // definition and the sweep owns it now
+      // definition and the sweep owns it now. The row STAYS (see the
+      // docstring): it carries the orphan's only sweeper pointer.
       return { tag: "deferred", reason: "lease_lost" };
     }
 
@@ -255,7 +268,13 @@ export async function runCompaction(host: CompactionHost, opts: CompactionRunOpt
       reInflated: merge.reInflated,
     };
   } finally {
-    store.deleteLease(leaseToken);
+    // Success: the successor is catalog-pointed, the lease has done its job.
+    // Failure (lease_lost, a failed/thrown R2 PUT, a thrown publish): keep
+    // the row — the payload names the written bytes and is their ONLY
+    // sweeper pointer (control-plane.ts deletes the staged objects + the
+    // row once it expires), exactly like the pinned crash window where this
+    // finally never runs.
+    if (published) store.deleteLease(leaseToken);
   }
 }
 
