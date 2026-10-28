@@ -8,6 +8,8 @@
  * The goldens use the SYNTHETIC manifest (fixed pseudo-hashes), so they stay
  * stable across asset rebuilds — §5.2's hash normalization is unnecessary
  * here and intentionally absent: any byte difference is real DOM drift.
+ * The SPEC-0014 demo render gate is pinned OFF below for the same reason:
+ * the bytes must not depend on the operator's local config surface.
  *
  * Regeneration: workerd tests have no filesystem and no shell env vars, so
  * the env-var pattern is not available. Run instead:
@@ -31,6 +33,7 @@ import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { actions, users } from "../../db/schema";
+import { demoModeEnabled } from "../../services/demo-sweep";
 import { __setRouteClockForTests, uiRouter } from "../index";
 import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
 import { seedWikiPage } from "../testing/seed-wiki";
@@ -75,6 +78,50 @@ const updateMode =
 
 function goldenBody(file: string): string | undefined {
   return goldenBodies[`./goldens/${file}`];
+}
+
+/**
+ * The demo render gate's harness pin (the 2026-10-28 "order/load flake"
+ * diagnosis): BaseLayout renders the SPEC-0014 demo banner (+850 bytes on
+ * EVERY page — shell.tsx's DemoBanner under `ctx.demoMode === true`) from
+ * `demoModeEnabled(c.env)`, and `c.env` here is the harness uiEnv spread of
+ * the vitest-plugin env — which carries the operator-local, UNCOMMITTED
+ * config surface (wrangler.jsonc vars, per-name overridden by .dev.vars).
+ * With the live-demo deployment's posture (DEMO_MODE "true" in the local
+ * wrangler.jsonc) and no override line yet, every render carried the banner
+ * bytes and ALL 64 committed-golden comparisons failed with a constant
+ * +850 delta — reproduced exactly (probe config arming the binding: 64
+ * failed | 10 passed). That was the gate-resilience unit's "order/load
+ * flake": a local-config flip, not suite ordering — the solo run three
+ * minutes later was green because the .dev.vars override had landed, not
+ * because solo adjudicates a flake class. The goldens' subject is the
+ * DEFAULT deployment's bytes (the committed example ships DEMO_MODE
+ * "false"; §6.8's strict polarity keeps anything but the exact "true" OFF —
+ * the banner wave's own "gate-off = zero DOM" invariant), so the gate is
+ * pinned to the ABSENT arm: the goldens' bytes must not depend on the
+ * operator's local config surface — the same fixture discipline as the
+ * synthetic manifest above and the T0 pins in harness.ts (which stays
+ * untouched: outside this file's ownership). The pin rides the harness's
+ * exported uiEnv (the one object renderRoute/renderCase/the direct fetch
+ * below hand to every render in this file), is set once at module scope,
+ * and is self-checked through the REAL gate function: a polarity change
+ * fails this setup loudly instead of failing 64 goldens with byte noise.
+ * The cast is the demo tests' own env-copy shape (demo-sweep.test.ts's
+ * `(copy as { DEMO_MODE: string })` + the `{ DEMO_MODE: undefined }`
+ * absent arm) — the generated Env pins the deployed literal, the test must
+ * express the absent arm. Byte-equality discipline untouched: no golden was
+ * regenerated (gate-off renders are byte-stable — solo 74/74 before this
+ * pin), ALLOW_SIGNUP stays unpinned (every one of the 64 failures was
+ * exactly +850, so no other env-conditional byte family reaches committed
+ * goldens), and a11y.test.ts parses the committed bytes, not live renders —
+ * this file is the goldens/ directory's only live-render site (the
+ * session-goldens/ login family has its own byte-compare render, outside
+ * this file's ownership, with the same armed-gate exposure to fix
+ * separately).
+ */
+(uiEnv as { DEMO_MODE?: string }).DEMO_MODE = undefined;
+if (demoModeEnabled(uiEnv)) {
+  throw new Error("goldens: the demo render gate pin failed — demoModeEnabled(uiEnv) must be false");
 }
 
 /** First differing byte offset, with a small window of both sides for the

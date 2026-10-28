@@ -80,6 +80,15 @@ const fakeAssets: UiAssetsFetcher = {
 };
 
 type UiTestEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+// The demo render gate pinned to the ABSENT arm — the login golden's bytes
+// must not depend on the operator's local config surface (an armed local
+// DEMO_MODE shifts every BaseLayout render +850 bytes; the goldens unit's
+// diagnosis, 2026-10-28). Self-checked through the REAL gate function.
+import { demoModeEnabled } from "../services/demo-sweep";
+(env as { DEMO_MODE?: string }).DEMO_MODE = undefined;
+if (demoModeEnabled(env)) {
+  throw new Error("session goldens: the demo render gate pin failed — demoModeEnabled(env) must be false");
+}
 const testEnv: UiTestEnv = { ...env, ASSETS: fakeAssets };
 
 /** Route-level request with a REAL execution context from the vitest

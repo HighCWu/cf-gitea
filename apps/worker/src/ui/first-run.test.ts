@@ -21,6 +21,17 @@
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+
+// The demo render gate pinned to the ABSENT arm (the goldens unit's
+// diagnosis: an armed local DEMO_MODE shifts every BaseLayout render
+// +850 bytes; the sign-up page's chrome must not depend on the
+// operator's local config surface). Self-checked through the REAL gate.
+import { demoModeEnabled } from "../services/demo-sweep";
+(env as { DEMO_MODE?: string }).DEMO_MODE = undefined;
+if (demoModeEnabled(env)) {
+  throw new Error("first-run: the demo render gate pin failed — demoModeEnabled(env) must be false");
+}
+
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";

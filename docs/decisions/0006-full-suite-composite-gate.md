@@ -130,3 +130,5 @@ for a measured-empty population). The one landing: `main()` now forces
 `CF_TEST_STRIP_SOURCEMAPS=1` when unset (explicit `=0` honored with a warning),
 so direct `node scripts/full-suite-gate.mjs` invocations get the same immunity
 `pnpm test:full` already had. Verdict semantics above are unchanged.
+
+**Correction (2026-10-28, the goldens unit's diagnosis)**: the "goldens order/load flake" cited in the strip-mode addendum was neither order- nor load-dependent — it was the operator-local `DEMO_MODE: "true"` (the demo go-live window) arming the banner in every BaseLayout render (+850 bytes exactly, 64×). The byte-compare suites now pin the demo render gate to the absent arm (goldens/session/first-run), self-checked through the real `demoModeEnabled` — goldens are NOT inherently load-flaky; the attribution above is retained as history with this correction beside it.
