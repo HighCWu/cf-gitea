@@ -131,18 +131,20 @@
  * coordinates → TEXT repo id (the Activity payload renders `repo_id`
  * NUMERIC — crypto.randomUUID TEXT keys render 0 — so the issue-title join
  * goes through repositories.ownerNamespace/slug), and the live issue titles
- * for the GetIssueTitle arms.
+ * for the GetIssueTitle arms (the service's `feedIssueTitles` — both the
+ * repo and index filters ride the (repo_id, index) unique index, the
+ * query-shape audit's C2).
  */
 
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { getFeedRows, renderFeedItems, type Activity } from "../../api/services/activity-feeds";
+import { feedIssueTitles, getFeedRows, renderFeedItems, type Activity } from "../../api/services/activity-feeds";
 import { listFollowers, listFollowing } from "../../api/services/follows";
 import { renderMarkdownToHtml } from "../../api/services/markdown";
 import type { Viewer as ApiViewer } from "../../api/services/repository";
 import type { OrgRecord } from "../../services/orgs/orgs";
-import { issues, repositories } from "../../db/schema";
+import { repositories } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import type { IconName } from "../icons";
 import { parsePageNumber } from "../page-data";
@@ -505,7 +507,8 @@ function feedsApiUser(viewer: Viewer, origin: string): ApiViewer {
  * then the two batched lookups the template helpers need: TEXT repo ids by
  * owner/slug coordinates (the Activity payload's `repo_id` renders numeric
  * — TEXT keys render 0) and the live issue titles for the GetIssueTitle
- * arms; finally the avatar-card + tab counts.
+ * arms through the service's `feedIssueTitles` (the C2 consolidation — the
+ * page's own select is gone); finally the avatar-card + tab counts.
  */
 export async function loadActivityFeedsData(
   d1: D1Database,
@@ -553,8 +556,12 @@ export async function loadActivityFeedsData(
     }
   }
 
-  // The GetIssueTitle arms: one batched issues read over the page's
-  // (repoId, index) pairs (≤ page size pairs — the D1 bind cap is far).
+  // The GetIssueTitle arms: the service's batched title read over the
+  // page's (repoId, index) pairs (≤ page size pairs — the D1 bind cap is
+  // far). The page-local select this replaced read EVERY issue of the
+  // referenced repos and post-filtered (the query-shape audit's C2); the
+  // consolidated shape filters both columns through the (repo_id, index)
+  // unique index.
   const titleKeys = new Map<string, { repoId: string; index: number }>();
   for (const activity of activities) {
     if (!LIVE_TITLE_OP_TYPES.has(activity.op_type)) continue;
@@ -562,18 +569,7 @@ export async function loadActivityFeedsData(
     const index = issueIndexOf(activity.content);
     if (repoId !== undefined && index > 0) titleKeys.set(`${repoId}#${index}`, { repoId, index });
   }
-  const titles = new Map<string, string>();
-  if (titleKeys.size > 0) {
-    const issueRows = await drizzle(d1)
-      .select({ repoId: issues.repoId, index: issues.index, title: issues.title })
-      .from(issues)
-      .where(inArray(issues.repoId, [...new Set([...titleKeys.values()].map((pair) => pair.repoId))]))
-      .all();
-    for (const row of issueRows) {
-      const key = `${row.repoId}#${row.index}`;
-      if (titleKeys.has(key)) titles.set(key, row.title);
-    }
-  }
+  const titles = await feedIssueTitles(d1, titleKeys.values());
 
   const items: ActivityFeedItem[] = activities.map((activity) => {
     const ownerLogin = activity.repo?.owner?.login ?? "";

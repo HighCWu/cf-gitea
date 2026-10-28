@@ -617,6 +617,130 @@ describe("loadActivityFeedsData (profile.go:162-190's arm)", () => {
   });
 });
 
+// --- the query-shape witness (query-shape-audit C2) ------------------------------
+
+// The loader's live-title read used to select EVERY issue of the referenced
+// repos (`inArray(issues.repoId, ...)`, post-filtered in memory) — hundreds
+// of rows read to title ≤ page size on a grown corpus. It now consolidates
+// onto the service's `feedIssueTitles`, whose select filters BOTH columns
+// through the (repo_id, index) unique index. Metered the
+// api/routes/activity-feeds.test.ts A8 witness way (prepare-counting
+// wrapper), extended with bench-d1.test.ts's rows_read protocol: drizzle's
+// mapped SELECT path executes through raw(), which drops the D1Result meta,
+// so raw()-routed statements are recorded and replayed untimed after the
+// load — the loader is read-only, so the replay reports the same rows_read.
+
+/** Corpus size the witness grows repo-alpha to (indexes 1..45; the base
+ *  fixtures' 7 and 9 ride inside the range). The pre-fix read drew all of
+ *  these rows to title 2 indexes. */
+const C2_CORPUS_ISSUES = 45;
+
+interface CountedD1 {
+  db: D1Database;
+  /** prepare() calls — every drizzle statement enters through one. */
+  count: () => number;
+  /** The SQL strings seen at prepare() (the actual statements the loader
+   *  issued). */
+  queries: () => string[];
+  /** Summed rows_read of the raw()-routed statements matching `match`,
+   *  via the untimed replay (see the block comment). */
+  rowsReadOf: (match: (sql: string) => boolean) => Promise<number>;
+}
+
+function countedD1(): CountedD1 {
+  let statements = 0;
+  const seen: string[] = [];
+  const pendingRaw: { sql: string; stmt: D1PreparedStatement }[] = [];
+  const wrapStmt = (stmt: D1PreparedStatement, sql: string): D1PreparedStatement => {
+    const proxy = new Proxy(stmt, {
+      get(target, prop) {
+        if (prop === "bind") {
+          return (...args: unknown[]) => wrapStmt(target.bind(...args), sql);
+        }
+        if (prop === "raw") {
+          return () => {
+            pendingRaw.push({ sql, stmt: target });
+            return target.raw();
+          };
+        }
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    return proxy;
+  };
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    seen.push(query);
+    return wrapStmt(env.DB.prepare(query), query);
+  };
+  return {
+    db: wrapper,
+    count: () => statements,
+    queries: () => seen,
+    rowsReadOf: async (match) => {
+      let rows = 0;
+      for (const pending of pendingRaw.splice(0)) {
+        if (!match(pending.sql)) continue;
+        const result = await pending.stmt.all();
+        rows += result.meta?.rows_read ?? 0;
+      }
+      return rows;
+    },
+  };
+}
+
+describe("activity feeds query-shape witness (query-shape-audit C2)", () => {
+  it("the live-title read probes the referenced pairs, not every issue of the referenced repos", async () => {
+    await seedBaseFixtures();
+    // Grow repo-alpha's corpus around the fixtures' issues 7 and 9.
+    for (const index of Array.from({ length: C2_CORPUS_ISSUES }, (_, i) => i + 1)) {
+      if (index === 7 || index === 9) continue;
+      await env.DB.prepare(
+        "INSERT INTO issues (repo_id, `index`, poster_id, title, is_pull, created_unix) VALUES (?, ?, 2, ?, 0, unixepoch())",
+      )
+        .bind(REPO_ID, index, `Corpus issue ${index}`)
+        .run();
+    }
+    // The page's live-title arms reference exactly two (repoId, index) pairs.
+    await insertAction({ opType: ActionType.CloseIssue, content: "7|" });
+    await insertAction({ opType: ActionType.ClosePullRequest, content: "9|" });
+
+    const meter = countedD1();
+    const data = await loadActivityFeedsData(meter.db, await userRow("alice"), selfViewer, ORIGIN, new URLSearchParams());
+    // Contract unchanged: both live titles still resolve through the
+    // coordinates join, every unreferenced corpus row stays unread.
+    expect(data.items.map((item) => item.liveIssueTitle).sort()).toEqual(["Live issue title", "The Pull"]);
+
+    // (a) Statement count fixed at the documented arms — 2 (page + count)
+    // + 2 (act users + repo pairs) + 1 (coordinates) + 1 (titles) + 1
+    // (badge count) + 4 (follow count+page ×2) = 11, corpus-independent.
+    expect(meter.count()).toBeLessThanOrEqual(11);
+
+    // (b) The loader's ACTUAL title statement carries BOTH filters — a
+    // revert to the repo-only select fails this pin (and no other loader
+    // statement filters on repo_id: this match is unique to the title read).
+    const titleSql = meter.queries().find((sql) => sql.includes('"repo_id" in'));
+    expect(titleSql, "the loader must issue the batched title read").toBeDefined();
+    expect(titleSql).toMatch(/"index" in/);
+
+    // (c) The cost anchor, side by side on the same corpus: the loader's
+    // replayed title statement reads the referenced pairs only — strictly
+    // under the corpus — while the pre-fix repo-only shape (raw statement,
+    // meta carried directly) reads every corpus row.
+    const fixedRead = await meter.rowsReadOf((sql) => sql.includes('"repo_id" in'));
+    expect(fixedRead).toBeGreaterThan(0);
+    expect(fixedRead).toBeLessThan(C2_CORPUS_ISSUES);
+    const preFix = await env.DB.prepare('SELECT "repo_id", "index", "title" FROM "issues" WHERE "repo_id" IN (?)')
+      .bind(REPO_ID)
+      .all();
+    const preFixRead = preFix.meta?.rows_read ?? 0;
+    expect(preFixRead).toBeGreaterThanOrEqual(C2_CORPUS_ISSUES);
+    expect(fixedRead).toBeLessThan(preFixRead);
+  });
+});
+
 // --- the resolution seam ---------------------------------------------------------
 
 describe("resolveActivityFeeds (the OwnerProfile dispatch seam)", () => {

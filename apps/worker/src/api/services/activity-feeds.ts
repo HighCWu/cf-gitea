@@ -571,3 +571,57 @@ function numericRepoId(id: string): number {
   const parsed = Number(id);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
 }
+
+// ---------------------------------------------------------------------------
+// The page loaders' live-issue-title lookup (GetIssueTitle).
+// ---------------------------------------------------------------------------
+
+/** One referenced (repoId, index) pair the live-title arms need. */
+export interface FeedIssueKey {
+  /** TEXT repositories.id. */
+  repoId: string;
+  /** The repo-local issue index (GetIssueInfos[0]). */
+  index: number;
+}
+
+/**
+ * The batched live-issue-title read behind feeds.tmpl's GetIssueTitle arms
+ * (models/activities/action.go:386-403) — the shared shape the feed page
+ * loaders' title lookups consolidate onto (the UI activity page's loader
+ * rides it since the query-shape audit's C2). ONE issues select over the
+ * page's (repoId, index) pairs with BOTH columns filtered: the audit's C2 —
+ * a repo-only `inArray(issues.repoId, ...)` read fetched EVERY issue of the
+ * referenced repos and post-filtered (hundreds of rows to title ≤ page size
+ * on a grown corpus); the added `inArray(issues.index, ...)` rides the
+ * (repo_id, index) unique index as exact probes instead. The in-memory pair
+ * filter still runs — repo × index cross products can over-match rows — so
+ * exactness is unchanged.
+ *
+ * Returns `"repoId#index"` → title (the loaders' join key); a referenced
+ * pair with no row is simply absent — the caller renders the upstream
+ * load-error literal.
+ */
+export async function feedIssueTitles(
+  db: D1Database,
+  keys: Iterable<FeedIssueKey>,
+): Promise<Map<string, string>> {
+  const pairs = [...new Map([...keys].map((key) => [`${key.repoId}#${key.index}`, key] as const)).values()];
+  const titles = new Map<string, string>();
+  if (pairs.length === 0) return titles;
+  const wanted = new Set(pairs.map((pair) => `${pair.repoId}#${pair.index}`));
+  const rows = await drizzle(db)
+    .select({ repoId: issues.repoId, index: issues.index, title: issues.title })
+    .from(issues)
+    .where(
+      and(
+        inArray(issues.repoId, [...new Set(pairs.map((pair) => pair.repoId))]),
+        inArray(issues.index, [...new Set(pairs.map((pair) => pair.index))]),
+      ),
+    )
+    .all();
+  for (const row of rows) {
+    const key = `${row.repoId}#${row.index}`;
+    if (wanted.has(key)) titles.set(key, row.title);
+  }
+  return titles;
+}
