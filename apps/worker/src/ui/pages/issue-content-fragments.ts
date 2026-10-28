@@ -123,11 +123,13 @@
  *   removes its history rows), but the upstream miss arm (log + EMPTY 200
  *   body, :160-163) is mirrored as the `orphanedComment` outcome.
  *
- * ## The mount recipes (HANDOFF — this module is UNMOUNTED, index-owned)
+ * ## Mount record (MOUNTED at 22599e4, window-2e B2 — the wiring HANDOFF
+ * is retired)
  *
  * Inside the issues/pulls arm of the route discriminator (where the
  * issue-detail family claims `/{type}/{index}` exact), for
- * `rest.length >= 2` with `rest[0]` parsing as the issue index:
+ * `rest.length >= 2` with `rest[0]` parsing as the issue index, the
+ * mounted arms are:
  *
  * - `rest = [<index>, "info"]` → family `"issue-info"`:
  *   `loadIssueInfoFragment(d1, repo, urlKind, index, origin, viewer,
@@ -141,21 +143,20 @@
  *   `"issue-content-history-overview"`: resolve the issue, then
  *   `loadContentHistoryOverviewFragment(d1, issue)` +
  *   `contentHistoryOverviewFragmentResponse(data)`.
- * - `rest = [<index>, "content-history", "list"|"detail"]` → HANDOFF (the
- *   arms are EXPORTED but unmounted): extend the `IssueAuxRoute` family
- *   union, claim the two tails beside the overview parse (the
- *   `rest.length === 3` arm), and drive
+ * - `rest = [<index>, "content-history", "list"|"detail"]` → families
+ *   `"issue-content-history-list"|"issue-content-history-detail"`
+ *   (claimed beside the overview parse, the `rest.length === 3` arm):
  *   `loadContentHistoryListFragment(d1, issue, commentId)` +
  *   `contentHistoryListFragmentResponse(data)` (commentId = FormInt64 of
  *   the `comment_id` query param, 0 on a missing/garbage value) and
  *   `loadContentHistoryDetailFragment(env, repo, issue, viewer, commentId,
  *   historyId)` + `contentHistoryDetailFragmentResponse(data)` (the
- *   historyNotFound outcome IS the JSON 404 body — do not substitute the
- *   HTML shell). The exact recipes are in specs/issue-content-history.md §6.
+ *   historyNotFound outcome IS the JSON 404 body — never the HTML shell).
+ *   specs/issue-content-history.md §6 records the designs.
  * - `rest = [<index>, "attachments", <uuid>]` → the per-issue alias of the
- *   landed site-level serving seam; simplest parity mount is a 302 onto
- *   `/attachments/{uuid}` (the canonical `browser_download_url`), or the
- *   index owner can re-drive the seam's handler — NOT this module's export.
+ *   landed site-level serving seam (`"issue-attachments-alias"` — a 302
+ *   onto `/attachments/{uuid}`, the canonical `browser_download_url`;
+ *   no second handler).
  *
  * Group gates ride the mount (the aux convention): `optSignIn` → the mount's
  * anonymous-allowed visibility grant (resolveUiRequest's), the issues/

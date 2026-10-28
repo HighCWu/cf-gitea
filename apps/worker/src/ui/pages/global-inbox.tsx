@@ -1,8 +1,9 @@
 /**
  * The GLOBAL INBOX pages — the signed-in user's cross-repo issue views:
- * `/issues`, `/pulls` and `/milestones` (pages wave 75, module only,
- * UNMOUNTED — `index.ts` is orchestrator-owned; the HANDOFF NOTE below
- * carries the mount recipe). Upstream `user.Issues` / `user.Pulls` /
+ * `/issues`, `/pulls` and `/milestones` (pages wave 75; MOUNTED at
+ * a8818c6, window-2e C1 — the routes live in `index.ts`; the retired
+ * wiring HANDOFF is the mount record below). Upstream `user.Issues` /
+ * `user.Pulls` /
  * `user.Milestones` (routers/web/user/home.go:329-348, 139-327), registered
  * in the reqSignIn top-level group (routers/web/web.go:567-573:
  * `m.Group("/issues", func() { m.Get("", user.Issues) … })` at :567-570,
@@ -16,7 +17,7 @@
  * template with `.PageIsPulls` set); milestones render
  * "user/dashboard/milestones" (home.go:325).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at a8818c6 — the wiring HANDOFF is retired)
  *
  * - The module is complete end-to-end: `loadOverviewIssuesData` (BOTH the
  *   /issues and /pulls arms — dispatch on `listKind`),
@@ -28,8 +29,8 @@
  *   mount) → call the loader with the request's `URLSearchParams` →
  *   `respond(c.html(render…(ctx, data), 200))`. No route-side projection.
  * - The top-level literal heads `issues`, `pulls`, `milestones` are
- *   UNCLAIMED in the landed route table (ui/index.ts has only the
- *   repo-scoped `/:owner/:repo/issues|pulls|milestones` families — a
+ *   claimed by this mount (distinct from the repo-scoped
+ *   `/:owner/:repo/issues|pulls|milestones` families — a
  *   different literal family, no collision); the session gate 303s
  *   anonymous requests onto the login round-trip before any loader runs.
  * - Upstream has no past-the-end redirect on any of the three pages (the

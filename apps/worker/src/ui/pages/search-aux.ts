@@ -129,7 +129,10 @@
  * (base.go:74-78 — `X-Total-Count` plus the Access-Control-Expose-Headers
  * append). Feed 1's count_only body is exactly `{"ok":true}`.
  *
- * ## HANDOFF — mount recipe (index.ts is orchestrator-owned)
+ * ## Mount record (MOUNTED at 84996c6, window-2e A — the wiring HANDOFF
+ * is retired)
+ *
+ * The landed arms, per the recipe:
  *
  * 1. `parseUiRoute` literals, beside the wave-19 creation literals in
  *    the same `raw[1] === "repo"` chain (upstream's /repo group,

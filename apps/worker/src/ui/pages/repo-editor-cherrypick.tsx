@@ -1,7 +1,7 @@
 /**
  * The editor family's two REMAINING tails — the cherry-pick + apply-patch
- * pages — as an UNMOUNTED bench module (pages wave 72; `index.ts` is
- * orchestrator/sibling-owned), one module because the two tails share the
+ * pages (pages wave 72; MOUNTED at 1d834d6, window-2e C2b — the routes live
+ * in `index.ts`), one module because the two tails share the
  * editor family's whole commit-form vocabulary (the wave-55 tails
  * precedent, pages/repo-editor-tails.tsx):
  *
@@ -64,13 +64,15 @@
  * own "patch does not apply …" / "branch does not exist …" texts serve
  * here, the wave-8 mapping).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 1d834d6, window-2e C2b — the wiring HANDOFF
+ * is retired)
  *
- * Mount beside the wave-8 family, following ITS grammar exactly
+ * Mounted beside the wave-8 family, following its grammar exactly
  * (index.ts parseUiRoute: the literal head claims the decoded branch+path
- * rest; bare non-literal heads fall through to the engine):
+ * rest; bare non-literal heads fall through to the engine) — the landed
+ * arms:
  *
- *  1. parseUiRoute — extend the wave-8 literal block with `patch` and
+ *  1. parseUiRoute — the wave-8 literal block claims `patch` and
  *     `cherrypick` (rest non-empty, decodeURIComponent per segment, joined
  *     into the suffix):
  *       - `patch` → `{ family: "editor-patch", owner, repo, refSuffix }`.
@@ -84,7 +86,7 @@
  *  2. Registration beside the wave-8 uiRouter block:
  *       uiRouter.get|post("/:owner/:repo/patch/*", …)
  *       uiRouter.get|post("/:owner/:repo/cherrypick/*", …)
- *  3. Handlers mirror fileEditorPage/fileEditorSubmit verbatim (the
+ *  3. Handlers mirror fileEditorPage/fileEditorSubmit (the
  *     fileEditorGate prologue: §2.8 Origin guard on POST → resolveUiRequest
  *     → anonymous login 303 → archived/write-predicate 404-shell), with
  *     `loadEditorPatchData`/`loadEditorCherryPickData` (this module) in

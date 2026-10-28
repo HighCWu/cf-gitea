@@ -1,7 +1,7 @@
 /**
  * The user settings SECURITY tab, `/user/settings/security` — pages wave 56
- * (bench row `wave-settings-security-module`, TWO-STAGE UNMOUNTED — the route
- * rides the index.ts window; `index.ts` is orchestrator/sibling-owned).
+ * (bench row `wave-settings-security-module`, MOUNTED at 0c2b151 — the route
+ * lives in `index.ts`).
  *
  * Upstream pin: `templates/user/settings/security/security.tmpl` over its four
  * section templates (`security/twofa.tmpl`, `security/webauthn.tmpl`,
@@ -9,7 +9,7 @@
  * `security.Security` handler
  * (gitea/routers/web/user/setting/security/security.go:29-47).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 0c2b151 — the wiring HANDOFF is retired)
  *
  * Upstream's route group is web.go:662-677 (the `/user/settings/security`
  * subtree inside the reqSignIn `/user/settings` group). Only the GET mounts:

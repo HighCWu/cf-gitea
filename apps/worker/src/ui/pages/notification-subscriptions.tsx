@@ -1,8 +1,8 @@
 /**
  * The notifications subscriptions pages — `/notifications/subscriptions` and
- * `/notifications/watching` — pages wave 52 (module only, UNMOUNTED — the
- * route arms ride the notifications route window; `index.ts` is
- * orchestrator/sibling-owned). Upstream `user.NotificationSubscriptions`
+ * `/notifications/watching` — pages wave 52 (MOUNTED at 5ca1727, window-2e
+ * C3b — the route arms live in `index.ts`; the retired wiring HANDOFF is
+ * the mount record below). Upstream `user.NotificationSubscriptions`
  * (routers/web/user/notification.go:222-338) + `user.NotificationWatching`
  * (notification.go:341-431), registered inside the reqSignIn
  * `/notifications` group (routers/web/web.go:1784-1792: `/subscriptions`
@@ -10,7 +10,7 @@
  * `templates/user/notification/notification_subscriptions.tmpl`, dispatched
  * on its `.Status` data key (1 = subscriptions arm, 2 = watching arm).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 5ca1727 — the wiring HANDOFF is retired)
  *
  * - The page module is complete end-to-end: `loadSubscriptionsData` /
  *   `loadWatchingData` (the data seams) and
@@ -544,7 +544,7 @@ function unixOrNull(date: Date | null): number | null {
  * SubscriberID read): the state/type/label filters, the upstream sort, the
  * 20-row page and the filtered total for the pager. Requested pages past
  * the end clamp onto the last page and RE-QUERY (the landed notifications
- * page's posture — upstream 303s instead; the header's HANDOFF records the
+ * page's posture — upstream 303s instead; the header's mount record documents the
  * seam). Enrichment is the issues-list loader's batching: per-row label
  * joins, then one milestones read and one posters read for the page.
  */

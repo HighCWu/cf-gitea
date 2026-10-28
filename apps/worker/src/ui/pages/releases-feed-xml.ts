@@ -1,8 +1,8 @@
 /**
  * The `/{owner}/{repo}/releases.rss` + `/{owner}/{repo}/releases.atom`
- * releases-feed envelopes — pages wave-releases-feeds (PORT-FIRST,
- * UNMOUNTED — `index.ts` is orchestrator/sibling-owned; the HANDOFF NOTE
- * below carries the mount recipe). Byte surfaces over the landed releases
+ * releases-feed envelopes — pages wave-releases-feeds (PORT-FIRST;
+ * MOUNTED at 2f7afe9 — the retired wiring HANDOFF is the mount record
+ * below). Byte surfaces over the landed releases
  * data (never a self-fetch): no JSX, the two XML documents are composed as
  * strings with the exact Go serializer semantics upstream ships — the
  * gorilla v1.2.0 envelope helpers are imported VERBATIM from the landed
@@ -116,10 +116,10 @@
  *   `rel.Note`, and the sanitizer arm (convert.go:242-244) lives in the
  *   ACTION projection, not `releasesToFeedItems`.
  *
- * ## HANDOFF NOTE (for the wiring wave — the wave-41 download-tail
- *    precedent; index.ts is orchestrator/sibling-owned)
+ * ## Mount record (MOUNTED at 2f7afe9 — the wiring HANDOFF, kept as the
+ *    landed-shape record; the wave-41 download-tail precedent)
  *
- * 1. Route type (beside `ReleaseDownloadRoute`, ui/index.ts:1543-1561):
+ * 1. Route type (beside `ReleaseDownloadRoute`):
  *
  *      /** The releases feed tails (pages/releases-feed-xml.ts): upstream
  *       *  web.go:1507-1508's `m.Get(".rss"/".atom", …, repo.ReleasesFeed{RSS,Atom})`

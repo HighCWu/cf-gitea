@@ -18,23 +18,43 @@
  * archived warning | the info message + the form), then the commits table and
  * the diff box (`{{if $showDiffBox}}`).
  *
- * ## URL parse (routers/common/compare.go ParseCompareRouterParam, reduced)
+ * ## URL parse (routers/common/compare.go ParseCompareRouterParam, full grammar)
  *
- * The decoded tail splits on the FIRST `...` (strings.Cut parity; refnames can
- * never carry `..`, so the separator is unambiguous); a missing separator makes
- * the whole tail the HEAD (upstream's single-ref family), and an empty side
- * falls back to the default branch (util.IfZero over GetPullRequestTargetBranch/
- * DefaultBranch) — the bare `/compare` renders the default...default comparison.
- * NOT claimed (→ the engine's 404, the documented divergences): the two-dot
- * `..` family (DirectComparison — a different diff semantic, not a landed
- * surface) and the `{owner}/{repo}:{head}` fork forms (forks cannot exist yet,
- * SPEC-0003).
+ * The decoded tail splits on the FIRST `...` (strings.Cut parity), else on
+ * the first `..` — the two-dot DirectComparison arm (the separator is
+ * CompareInfo.CompareSeparator and picks the diff semantic below); failing
+ * both, the whole tail is the HEAD (upstream's single-ref family); an empty
+ * side falls back to the default branch (util.IfZero over
+ * GetPullRequestTargetBranch/DefaultBranch) — the bare `/compare` renders
+ * the default...default comparison. The HEAD part carries the fork forms
+ * (parseHead, grammar forms 2/3/5/6): `{owner}:{ref}` names the owner's fork
+ * of the base, `{owner}/{repo}:{ref}` names an explicit head repo; the BASE
+ * part never carries a fork form upstream (a colon there is an unresolvable
+ * refname → the 404 shell, parity with upstream's resolution miss).
+ *
+ * ## The cross-repo arm (GetHeadOwnerAndRepo + GetCompareInfo over forks)
+ *
+ * A fork-form head resolves through the landed fork-edge port
+ * (services/pulls.ts `resolveHeadRepo` — the API POST's own grammar: the
+ * same-owner fold back onto the base repo, the fork-edge walk for the bare
+ * `{owner}:{ref}` form, the explicit owner/name lookup; upstream
+ * compare.go:152-192). The doer must READ the head repo's code
+ * (compare.go:182-189 — permHead.CanRead; the miss 404-shells) — the §2.5
+ * page-visibility grant. Every compare read then runs in the HEAD cell:
+ * upstream opens headGitRepo and fetches the base commit INTO it before the
+ * merge base, the commit range and the diff (services/git/compare.go:70-89,
+ * GetDiffForRender on ci.HeadGitRepo); forks are full copies
+ * (SPEC-0001b §5.2) so the landed `crossRepoCreateMergeBase` port supplies
+ * the fetch (its carry) + the head-cell walk — for the `..` form the walk's
+ * answer is computed-and-ignored (upstream skips the merge base for the
+ * direct form but still fetches, compare.go:73-80 vs 83-89).
  *
  * ## Semantics over the landed engine reads (SPEC-0001b §4.1/§10.8)
  *
- * Both sides resolve against listRefs (branch → tag → 7..64-hex oid —
- * ResolveRefWithSuffix reduced; an unresolvable side 404-shells exactly
- * upstream's NotFound), then `mergeBase(baseTip, headTip)`:
+ * Both sides resolve against their repo's listRefs (branch → tag → 7..64-hex
+ * oid — ResolveRefWithSuffix reduced; an unresolvable side 404-shells exactly
+ * upstream's NotFound), then — for the three-dot form —
+ * `mergeBase(baseTip, headTip)` in the HEAD cell:
  *   - null base → no common history: the nothing-to-compare segment
  *     (`repo.pulls.nothing_to_compare*`), no commits table, no diff; the POST
  *     refuses with upstream's no_common_history message (the API create
@@ -49,41 +69,71 @@
  *     the fold only through AllowEmptyPr (compare.go:400-402), reduced:
  *     supportEmptyPr = !AutodetectManualMerge → true (the
  *     autodetect-manual-merge unit config is unlanded); acrossRepoPr =
- *     !IsSameRef → the resolved ref names differing (services/git/
- *     compare.go:41-43 — same repository && BaseRef == HeadRef; compares
- *     are always same-repository here, the fork family 404s at the parser).
- *     The POST completes the loop (the wave-129 compare-parity posture
- *     flipped): upstream's create side has NO tips gate — the web handler
- *     (pull.go:1318 CompareAndPullRequestPost) accepts the empty diff
- *     unconditionally, the AllowEmptyPr render gate (compare.go:400-402) is
- *     the only control — so the equal-tips ACROSS-REF pair creates; the
- *     SAME-ref arm keeps the landed refusal (the headName === baseName gate,
- *     upstream's IsSameRef reduction).
- *   - otherwise `listCommitsRange(base..head)` (oldest first — DISPLAYED
- *     reversed, newest first like upstream's commits_list) and
- *     `readDiff(head, mergeBase)` (id2..id = mergeBase...head — the three-dot
- *     diff; a null merge base renders the empty range, pull-engine.ts's own
- *     composition rule) rendered through pull-files' DiffFileBox components.
+ *     !IsSameRef (services/git/compare.go:41-43 — same repository && the
+ *     same resolved ref; cross-repo pairs never hold it, whatever the
+ *     names). The POST completes the loop (the wave-129 compare-parity
+ *     posture flipped): upstream's create side has NO tips gate — the web
+ *     handler (pull.go:1318 CompareAndPullRequestPost) accepts the empty
+ *     diff unconditionally, the AllowEmptyPr render gate (compare.go:400-402)
+ *     is the only control — so the equal-tips ACROSS-REF pair creates; the
+ *     SAME-ref arm keeps the landed refusal (the IsSameRef name-equality
+ *     gate, for the same-repo head only).
+ *   - otherwise `listCommitsRange(CompareBase..headTip)` (oldest first —
+ *     DISPLAYED reversed, newest first like upstream's commits_list;
+ *     upstream's ShowPrettyFormatLogToList(ci.CompareBase+".."+head),
+ *     services/git/compare.go:96-103 — the merge base for `...`, the base
+ *     tip itself for `..`, so base-only commits never leak into the range)
+ *     and `readDiff(headTip, CompareBase)` (upstream's BeforeCommitID =
+ *     ci.CompareBase / AfterCommitID = headCommitID — mergeBase...head for
+ *     `...`, the direct two-tip diff for `..`; a null merge base renders the
+ *     empty range, pull-engine.ts's own composition rule) rendered through
+ *     pull-files' DiffFileBox components. Both reads run in the HEAD cell
+ *     (the cross-repo arm above).
+ *
+ * ## The `..` two-dot arm (DirectComparison)
+ *
+ * Upstream sets CompareInfo.CompareBase = BaseCommitID directly for the
+ * direct form (services/git/compare.go:83-89) — never empty, so the
+ * no-common-history fold is structurally unreachable and the page renders
+ * the direct two-tip diff even when the head sits BEHIND the base (the
+ * reverse delta) while the commit list runs baseTip..headTip (empty for a
+ * behind head — commits_table renders the 0 count beside the diff box, the
+ * `$showDiffBox := or .CommitCount .DiffShortStat.NumFiles` shape). The
+ * create form folds for `..` pairs (compare.tmpl:173's
+ * `(not $.CompareInfo.DirectComparison)`) — the POST itself stays
+ * tips-blind AND separator-blind upstream (no DirectComparison gate in
+ * pull.go:1318), so a hand-crafted `..` POST creates like its `...` twin
+ * (the same-ref arm keeps the landed refusal for main..main). The separator
+ * switch link (compare.tmpl:99 — repo.pulls.switch_comparison_type, the
+ * `..`↔`...` toggle) rides the now-landed target: the no-JS render keeps
+ * the icon-out reduction but emits the LIVE link carrying the OTHER
+ * separator.
  *
  * ## The new-PR write (the landed create route's arms, CompareAndPullRequestPost)
  *
  * The §2.8 Origin guard, the repo resolution, the anonymous login 303, then the
  * WRITER gate (`canWriteRepo` — the file-editor predicate; a divergence from
- * upstream's reqUnitPullsReader, documented below: without forks a head branch
- * is a writer's artifact, and a non-writer's form would be a broken
- * submission), then the same fail-fast order routes/pulls.ts POST runs:
- * head === base → the 422 message, no common history → no_common_history,
- * duplicate open PR → the landed 409 message (findUnmergedPullRequest),
+ * upstream's reqUnitPullsReader, documented below — it predates the fork flow,
+ * whose head branches are not the writer's artifacts; the flip is the recorded
+ * follow-up), then the same fail-fast order routes/pulls.ts POST runs:
+ * head === base (IsSameRef — the same-repo head only; cross-repo pairs never
+ * hold it) → the 422 message, no common history (CompareBase === "" —
+ * structurally unreachable for `..`) → no_common_history, duplicate open PR →
+ * the landed 409 message (findUnmergedPullRequest keyed on the HEAD repo),
  * empty title → the title-required re-render. Equal tips refuse NO arm here
  * (upstream's create side is tips-blind): the across-ref pair creates the
  * empty PR under AllowEmptyPr, the same-ref pair already refused above. The
  * create rides `IssuesService.createPullRequest` (the same fields the API POST
  * passes: poster = the session viewer, allow_maintainer_edit =
- * DefaultAllowMaintainerEdit, headSha = the head tip), the refs/pull/N/head
- * CAS write follows (`createPullHeadRef`, the API route's cleanup order on
- * failure: the D1 rows delete again, the gate's plain-text 500 answered), the
- * `pull_request opened` webhook fans out through emitIssueEvent (the wave-4/11
- * UI-emission convention), and success 303s onto
+ * DefaultAllowMaintainerEdit, headSha = the head tip, headRepoId = the head
+ * repo), the CROSS-REPO arm runs the landed create-compare seam first —
+ * `crossRepoCreateMergeBase` (pr.MergeBase, pull.go:520) +
+ * `carryForkHeadIntoBase` (the head closure into the base cell so
+ * refs/pull/N/head can land — the API POST's exact order, routes/pulls.ts:
+ * 947-951) — the refs/pull/N/head CAS write follows (`createPullHeadRef`, the
+ * API route's cleanup order on failure: the D1 rows delete again, the gate's
+ * plain-text 500 answered), the `pull_request opened` webhook fans out through
+ * emitIssueEvent (the wave-4/11 UI-emission convention), and success 303s onto
  * `/{owner}/{repo}/pulls/{index}` (upstream's `ctx.JSONRedirect(pullIssue.
  * Link())` reduced to the no-JS 303).
  *
@@ -103,24 +153,35 @@
  * ## Documented v1 degradations (§6 method)
  *
  * - The dropdowns' search input and the branches/tags tab buttons are
- *   Fomantic/JS features — the flat branch-then-tag item list of
- *   components/branch-selector.tsx is the no-JS shape.
+ *   Fomantic/JS features — the flat branch-then-tag item list is the no-JS
+ *   shape (the per-repo groups of compare.tmpl's menus render in the
+ *   upstream order, one flat menu).
  * - The icon-only switch controls (octicon-git-compare head/base swap,
  *   octicon-arrow-left separator type switch, octicon-triangle-down dropdown
  *   carets) are outside the generated icon allowlist (the pull-files tabs
- *   degradation): the head/base swap renders as its title text, the `...`
- *   separator renders as plain text (the `..` switch target is not a landed
- *   surface — a live link would 404, the dead-link rule).
+ *   degradation): the head/base swap renders as its title text; the
+ *   separator switch (compare.tmpl:99) is now the LIVE toggle link (the `..`
+ *   target landed) minus its icon.
  * - `?expand=1`/`quick_pull` (the form's prefill-expand query family) and the
  *   PR templates are not honored — the form renders expanded with the
  *   commit-derived prefill only.
- * - The `.diff`/`.patch` download suffixes on the compare family
- *   (DownloadCompareDiff/Patch) stay engine-owned (404) — not in this slice.
+ * - The `.diff`/`.patch` download suffixes keep the compare-feeds module's
+ *   own grammar: its `..` arm is landed there, its fork forms stay unclaimed
+ *   (the feed loader's parseCompareBaseHead nulls colon-bearing sides).
  * - Anonymous no-common-history renders the nothing-to-compare segment
  *   (upstream leaves that page bare for anonymous viewers — the honest-state
  *   reduction).
  * - The commits count in the table header is the FETCHED page count (upstream
  *   shows the whole range's count before pagination).
+ * - The new_form maintainer-edit checkbox (the cross-repo +
+ *   CanWriteToHeadRepo arm, new_form.tmpl:64-68) rides the landed sidebar
+ *   reduction (allow_maintainer_edit defaults true at create; the checkbox
+ *   never rendered).
+ * - The WRITER gate above keeps the POST to base-repo writers (upstream's
+ *   reqUnitPullsReader admits any pulls reader — the fork flow's natural
+ *   author) — the recorded gate-flip follow-up; the cross-repo machinery
+ *   (headRepoId rows, the object carries, refs/pull/N/head) is the API
+ *   fork-PR path's own, so the flip is mechanical when sanctioned.
  */
 
 import { Context } from "hono";
@@ -130,15 +191,24 @@ import type { CommitJson } from "@cf-gitea/git-engine";
 
 import type { ApiEnv } from "../../api/env";
 import { engineReads } from "../../api/services/engine";
-import { createPullHeadRef } from "../../api/services/pull-engine";
-import { findUnmergedPullRequest, pullRequestAlreadyExistsError, toApiPullRequest } from "../../api/services/pulls";
+import { carryForkHeadIntoBase, createPullHeadRef, crossRepoCreateMergeBase } from "../../api/services/pull-engine";
+import { findForkByOwner } from "../../api/services/forks";
+import {
+  findUnmergedPullRequest,
+  pullRequestAlreadyExistsError,
+  resolveHeadRepo,
+  toApiPullRequest,
+} from "../../api/services/pulls";
 import {
   apiUserFromRow,
+  findRepositoryById,
   toApiRepository,
   type RepositoryWithOwner,
   type UserRow,
 } from "../../api/services/repository";
 import type { Viewer as ApiViewer } from "../../api/services/repository";
+import { resolveRepositoryForViewer } from "../repo-view";
+import type { Viewer } from "../viewer";
 import { issues, pullRequests } from "../../db/schema";
 import { IssuesService } from "../../issues/service";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
@@ -165,6 +235,7 @@ export const compareLocale = {
   base: "base", // "repo.compare.compare_base"
   compare: "compare", // "repo.compare.compare_head"
   switch_head_and_base: "Switch head and base", // "repo.pulls.switch_head_and_base"
+  switch_comparison_type: "Switch comparison type", // "repo.pulls.switch_comparison_type"
   new_pull_request: "New Pull Request", // "repo.pulls.new"
   new_description: "Discuss and review the changes in this comparison with others.", // "repo.pulls.new.description"
   view_pull_request: "View Pull Request", // "repo.pulls.view"
@@ -199,6 +270,20 @@ export function compareLink(repoLink: string, base: string, head: string): strin
   return `${repoLink}/compare/${pathEscapeSegments(base)}...${pathEscapeSegments(head)}`;
 }
 
+/** The fork-form compare URL (`{base}...{owner}[/{repo}]:{head}` — grammar
+ *  forms 2/3): the same escaping with the head side's owner/repo prefix, the
+ *  colon literal (re-parses through parseHead). */
+export function compareForkLink(
+  repoLink: string,
+  base: string,
+  headOwner: string,
+  headRepoName: string | null,
+  head: string,
+): string {
+  const repoPart = headRepoName === null ? pathEscapeSegments(headOwner) : `${pathEscapeSegments(headOwner)}/${pathEscapeSegments(headRepoName)}`;
+  return `${repoLink}/compare/${pathEscapeSegments(base)}...${repoPart}:${pathEscapeSegments(head)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Data loading (§3.2 — the landed engine reads, never a self-fetch)
 // ---------------------------------------------------------------------------
@@ -209,26 +294,41 @@ export type CompareRefKind = "branch" | "tag" | "commit";
 
 /** The compare page render inputs, loaded by loadCompareData. */
 export interface CompareData {
-  /** The repo's full branch/tag universes (the two dropdowns). */
+  /** The BASE repo's full branch/tag universes (the base dropdown's own
+   *  group; the head repo's universe rides headRefs). */
   refs: ResolvedRefs;
-  /** The RESOLVED short names (a URL side may be the default-branch fallback). */
+  /** The head repo's universes — the same object as `refs` for a same-repo
+   *  head, the resolved fork/head-repo universe otherwise. */
+  headRefs: ResolvedRefs;
+  /** The RESOLVED short names (a URL side may be the default-branch fallback;
+   *  the head side falls back to the HEAD repo's default, upstream
+   *  compare.go:194 util.IfZero(headOriRef, headRepo.DefaultBranch)). */
   baseName: string;
   headName: string;
   baseKind: CompareRefKind;
   headKind: CompareRefKind;
   baseTipOid: string;
   headTipOid: string;
-  /** The merge base oid; `null` = no common history (the POST's
-   *  no_common_history arm keys on this too). */
+  /** The URL's separator (CompareInfo.CompareSeparator). */
+  separator: "..." | "..";
+  /** `separator === ".."` (CompareInfo.DirectComparison — the direct diff
+   *  semantic; the create form folds for these pairs). */
+  directComparison: boolean;
+  /** The `...` merge base oid; `null` = no common history or the `..` form
+   *  (never computed for the direct arm — upstream skips the walk,
+   *  services/git/compare.go:83-89). */
   mergeBaseOid: string | null;
-  /** baseTip === headTip (the POST's landed equal-tips refusal arm). */
+  /** Upstream CompareInfo.CompareBase — the range/diff read's left side: the
+   *  merge base for `...` (null when no common history), the base tip itself
+   *  for `..` (never null). The POST's no_common_history arm keys on this. */
+  compareBaseOid: string | null;
+  /** baseTip === headTip (the head-flavor fold arm). */
   sameTip: boolean;
-  /** Upstream nothingToCompare (compare.go:376-378 + 397-405): no common
-   *  history OR the head IS the merge base (subsuming same-tip) — the
-   *  segment state; the commits table + the diff box fold with it. */
+  /** Upstream nothingToCompare (compare.go:376-378 CompareBase == "" + 397-405
+   *  head == CompareBase): for `..` only the equal-tips arm is reachable. */
   nothingToCompare: boolean;
   /** The range's commits in DISPLAY order (newest first — the engine returns
-   *  base..head oldest first; commits_list.tmpl renders newest first). */
+   *  CompareBase..head oldest first; commits_list.tmpl renders newest first). */
   commits: CommitJson[];
   /** The range log's more flag (the Older link). */
   more: boolean;
@@ -236,13 +336,30 @@ export interface CompareData {
   totalAddition: number;
   totalDeletion: number;
   /** The open PR between the two branches (branch pairs only —
-   *  findUnmergedPullRequest's exact targets), `null` = none. */
+   *  findUnmergedPullRequest's exact targets, keyed on the HEAD repo),
+   *  `null` = none. */
   existing: { index: number; title: string } | null;
   /** The form prefill: the range's FIRST (oldest) commit subject, and — for a
    *  one-commit range — that commit's message body (upstream's
    *  prepareNewPullRequestTitleContent arms). */
   suggestedTitle: string;
   suggestedContent: string;
+  /** The head repo when the compare is CROSS-REPO (ci.HeadRepo); `null` =
+   *  same-repo (IsSameRepository). */
+  headRepo: { id: string; ownerNamespace: string; slug: string; defaultBranch: string } | null;
+  /** The head repo id (== the base's for a same-repo head) — the duplicate
+   *  check + the create row's headRepoId. */
+  headRepoId: string;
+  /** OwnForkRepo (compare.go:243-250 + 281-297): the viewer's fork of the
+   *  BASE repo when the viewer is neither its owner nor already the head,
+   *  readable, and distinct from the root — the dropdown's third group;
+   *  `null` = absent (anonymous, owner viewer, no fork, unreadable). */
+  ownFork: { owner: string; name: string; link: string; refs: ResolvedRefs } | null;
+  /** RootRepo (compare.go:229-274): the base's fork parent when distinct
+   *  from base and head and readable — the dropdown's fourth group; `null` =
+   *  the base is not a fork (or absent/unreadable). The template's
+   *  `.RootRepo.AllowsPulls` gate rides the always-on pulls unit. */
+  rootRepo: { owner: string; name: string; link: string; refs: ResolvedRefs } | null;
 }
 
 export interface CompareNotFound {
@@ -270,71 +387,206 @@ export function compareRefKindOf(name: string, refs: ResolvedRefs): CompareRefKi
 
 /**
  * Load the comparison. `notFound` covers the §4.5 404 family: an unborn repo,
- * a side that resolves to no branch/tag/oid, or an engine read that cannot
- * return either tip (upstream ResolveRefWithSuffix's not-found arm).
+ * a side that resolves to no branch/tag/oid, an engine read that cannot
+ * return either tip (upstream ResolveRefWithSuffix's not-found arm), an
+ * unresolvable fork-form head (GetHeadOwnerAndRepo's invalid-argument /
+ * missing-fork arms — the landed anti-enumeration 404), or an unreadable
+ * head repo (compare.go:182-189's permHead.CanRead miss → the not-exist
+ * shell).
  */
 export async function loadCompareData(
   env: Env,
   db: D1Database,
-  repo: { id: string; ownerNamespace: string; slug: string; defaultBranch: string },
-  options: { base: string | null; head: string | null; page: number },
+  repo: {
+    id: string;
+    ownerNamespace: string;
+    slug: string;
+    defaultBranch: string;
+    forkParent: string | null;
+    ownerId: number | null;
+  },
+  options: {
+    base: string | null;
+    head: string | null;
+    headOwner: string | null;
+    headRepoName: string | null;
+    separator: "..." | "..";
+    viewer: Viewer;
+    page: number;
+  },
 ): Promise<CompareData | CompareNotFound> {
   const reads = engineReads(env, repo);
   const refs = resolveHeadBranch(await reads.listRefs(), repo.defaultBranch);
   if (refs.headBranch === null) return { notFound: true }; // unborn repo
 
-  // The sides (util.IfZero fallbacks — the parser's nulls are the default
-  // branch upstream's GetPullRequestTargetBranch/DefaultBranch answer).
+  // The base side (util.IfZero — the parser's null is the default branch,
+  // upstream GetPullRequestTargetBranch/DefaultBranch answer).
   const baseName = options.base ?? repo.defaultBranch;
-  const headName = options.head ?? repo.defaultBranch;
   const baseKind = compareRefKindOf(baseName, refs);
-  const headKind = compareRefKindOf(headName, refs);
-  if (baseKind === null || headKind === null) return { notFound: true }; // unresolvable side
-
-  // readCommit accepts branch/tag/oid uniformly; a null is the unreachable tip.
+  if (baseKind === null) return { notFound: true }; // unresolvable side
   const baseTip = await reads.readCommit(baseName);
-  const headTip = await reads.readCommit(headName);
-  if (baseTip === null || headTip === null) return { notFound: true };
+  if (baseTip === null) return { notFound: true };
 
+  // The head repo (GetHeadOwnerAndRepo, compare.go:152-192): no fork form →
+  // the base repo itself; the same owner/name folds back onto it too
+  // (compare.go:161-163 + 169-171); anything else resolves through the
+  // landed grammar port (the fork edge / the explicit owner+name lookup) and
+  // must be readable by the viewer (permHead.CanRead → the §2.5 grant).
+  let headRepoRow: typeof repo = repo;
+  let headRepo: CompareData["headRepo"] = null;
+  if (options.headOwner !== null) {
+    const sameOwner = options.headOwner.toLowerCase() === repo.ownerNamespace.toLowerCase();
+    const sameName =
+      options.headRepoName === null || options.headRepoName.toLowerCase() === repo.slug.toLowerCase();
+    if (!(sameOwner && sameName)) {
+      // resolveHeadRepo parses the same `owner[/repo]:ref` grammar (the API
+      // POST's head port). The branch it returns is discarded — the null-side
+      // fallback uses the HEAD repo's default below; the placeholder keeps
+      // the parse well-formed for the null-head call.
+      const headParam = `${options.headOwner}${options.headRepoName !== null ? `/${options.headRepoName}` : ""}:${options.head ?? "_"}`;
+      let headRepoId: string;
+      try {
+        const resolved = await resolveHeadRepo(db, await basePairOf(db, repo), headParam);
+        headRepoId = resolved.headRepoId;
+      } catch {
+        return { notFound: true }; // the fork-edge / path-resolution miss (the 404 class)
+      }
+      const resolvedPair = await findRepositoryById(db, headRepoId);
+      const resolvedRow = resolvedPair?.repo;
+      if (resolvedRow === undefined) return { notFound: true };
+      if (
+        (await resolveRepositoryForViewer(env, options.viewer, resolvedRow.ownerNamespace, resolvedRow.slug)) ===
+        null
+      ) {
+        return { notFound: true }; // the head repo's code-read miss (compare.go:186-188)
+      }
+      headRepoRow = resolvedRow;
+      headRepo = {
+        id: resolvedRow.id,
+        ownerNamespace: resolvedRow.ownerNamespace,
+        slug: resolvedRow.slug,
+        defaultBranch: resolvedRow.defaultBranch,
+      };
+    }
+  }
+
+  const headReads = headRepo === null ? reads : engineReads(env, headRepoRow);
+  const headRefs =
+    headRepo === null ? refs : resolveHeadBranch(await headReads.listRefs(), headRepoRow.defaultBranch);
+  if (headRefs.headBranch === null) return { notFound: true }; // unborn head repo
+  const headName = options.head ?? headRepoRow.defaultBranch;
+  const headKind = compareRefKindOf(headName, headRefs);
+  if (headKind === null) return { notFound: true }; // unresolvable head side
+
+  const headTip = await headReads.readCommit(headName);
+  if (headTip === null) return { notFound: true };
+
+  const directComparison = options.separator === "..";
   const sameTip = baseTip.oid === headTip.oid;
-  // mergeBase(base, head) → the three-dot composition's base; a missing/failed
-  // walk is the no-common-history state (the same honest render, the pull-
-  // engine.ts null-merge-base rule).
-  const merged = await reads.mergeBase(baseTip.oid, headTip.oid);
-  const mergeBaseOid = merged !== null && merged.tag === "ok" ? merged.base : null;
-  // Upstream nothingToCompare (compare.go:376-378 the CompareBase == "" arm;
-  // 397-405 the head == CompareBase arm — the head is already on the base,
-  // nothing to bring; equal tips subsume, the merge-base of equal tips being
-  // that tip). The range + diff reads fold with it (prepareCompareDiff
-  // returns before computing either).
-  const nothingToCompare = mergeBaseOid === null || headTip.oid === mergeBaseOid;
+  // The compare prologue in the HEAD cell (services/git/compare.go:70-89):
+  // `...` walks the merge base there; a cross-repo pair first fetches the
+  // base commit into the head repo — the landed crossRepoCreateMergeBase
+  // port (the carry + the head-cell walk). The `..` form skips the walk but
+  // still fetches (the diff below reads both tips in the head cell), so the
+  // port runs for it too with the answer computed-and-ignored.
+  let mergeBaseOid: string | null = null;
+  if (headRepo !== null) {
+    const headPair = await findRepositoryById(db, headRepoRow.id);
+    if (headPair === null) return { notFound: true };
+    const apiCtx = new Context<ApiEnv>(new Request("http://compare.local/"), { env });
+    const merged = await crossRepoCreateMergeBase(apiCtx, await basePairOf(db, repo), headPair, baseName, baseTip.oid, headTip.oid);
+    if (!directComparison) mergeBaseOid = merged;
+  } else if (!directComparison) {
+    // Same-repo: a missing/failed walk is the no-common-history state (the
+    // same honest render, the pull-engine.ts null-merge-base rule).
+    const merged = await reads.mergeBase(baseTip.oid, headTip.oid);
+    mergeBaseOid = merged !== null && merged.tag === "ok" ? merged.base : null;
+  }
+  // Upstream CompareInfo.CompareBase: the merge base for `...`, the base tip
+  // itself for `..` (never null — the no-common-history fold is structurally
+  // unreachable for the direct form). nothingToCompare = CompareBase == ""
+  // (compare.go:376-378) OR the head IS the CompareBase (397-405). The range
+  // + diff reads fold with it (prepareCompareDiff returns before either).
+  const compareBaseOid = directComparison ? baseTip.oid : mergeBaseOid;
+  const nothingToCompare = compareBaseOid === null || headTip.oid === compareBaseOid;
 
   // The range + the diff (only for a comparable pair — the nothing states
   // carry empty lists and the page skips both tables; an empty commits list
   // also leaves the form prefill empty, upstream's `if !cpi.nothingToCompare`
-  // skip of the title/content setup, prepareCreatePullRequestPage). The range
-  // read is paginated 0-based (the API list route's own convention, pull.go:975).
+  // skip of the title/content setup, prepareCreatePullRequestPage). Both
+  // reads run in the HEAD cell over CompareBase..head (ShowPrettyFormatLogToList
+  // + GetDiffForRender's Before/AfterCommitID pair, services/git/compare.go:
+  // 96-103). The range read is paginated 0-based (the API list route's own
+  // convention, pull.go:975).
   const commits: CommitJson[] = [];
   let more = false;
   let files: DiffFileView[] = [];
-  if (mergeBaseOid !== null && !nothingToCompare) {
-    const range = await reads.listCommitsRange(baseTip.oid, headTip.oid, COMPARE_PAGE_SIZE, options.page - 1);
+  if (compareBaseOid !== null && !nothingToCompare) {
+    const range = await headReads.listCommitsRange(compareBaseOid, headTip.oid, COMPARE_PAGE_SIZE, options.page - 1);
     if (range !== null) {
       // Engine order is oldest first; display reverses (commits_list order).
       commits.push(...[...range.commits].reverse());
       more = range.more;
     }
-    const diff = await reads.readDiff(headTip.oid, mergeBaseOid);
+    const diff = await headReads.readDiff(headTip.oid, compareBaseOid);
     files = await diffFileViews(diff?.files ?? []);
   }
 
   // The existing open PR between the branches (upstream
   // prepareCreatePullRequestPage's GetUnmergedPullRequest arm) — branch pairs
-  // only, the same targets the create route checks.
+  // only, keyed on the HEAD repo (ci.HeadRepo.ID, pull.go:1355).
   let existing: CompareData["existing"] = null;
   if (baseKind === "branch" && headKind === "branch") {
-    const found = await findUnmergedPullRequest(db, repo.id, repo.id, headName, baseName);
+    const found = await findUnmergedPullRequest(db, headRepoRow.id, repo.id, headName, baseName);
     if (found !== null) existing = { index: found.pullRequest.index, title: found.issue.title };
+  }
+
+  // OwnForkRepo (compare.go:243-250 + the 281-297 dropdown group): the
+  // signed-in non-owner viewer's own fork of the BASE repo, readable, and
+  // distinct from the head repo and the root.
+  let ownFork: CompareData["ownFork"] = null;
+  if (options.viewer.kind === "user" && (repo.ownerId ?? -1) !== options.viewer.id) {
+    const forkRow = await findForkByOwner(db, repo.id, options.viewer.id);
+    const rootPair = repo.forkParent !== null ? await findRepositoryById(db, repo.forkParent) : null;
+    if (
+      forkRow !== null &&
+      forkRow.id !== headRepoRow.id &&
+      (rootPair === null || forkRow.id !== rootPair.repo.id) &&
+      (await resolveRepositoryForViewer(env, options.viewer, forkRow.ownerNamespace, forkRow.slug)) !== null
+    ) {
+      const forkRefs = resolveHeadBranch(await engineReads(env, forkRow).listRefs(), forkRow.defaultBranch);
+      if (forkRefs.headBranch !== null) {
+        ownFork = {
+          owner: forkRow.ownerNamespace,
+          name: forkRow.slug,
+          link: `/${forkRow.ownerNamespace}/${forkRow.slug}`,
+          refs: forkRefs,
+        };
+      }
+    }
+  }
+
+  // RootRepo (compare.go:229-274): the base's fork parent when distinct from
+  // both the base and the head repo and readable (CheckRepoUnitUser's code
+  // read → the §2.5 grant).
+  let rootRepo: CompareData["rootRepo"] = null;
+  if (repo.forkParent !== null && repo.forkParent !== headRepoRow.id) {
+    const rootPair = await findRepositoryById(db, repo.forkParent);
+    if (
+      rootPair !== null &&
+      rootPair.repo.id !== repo.id &&
+      (await resolveRepositoryForViewer(env, options.viewer, rootPair.repo.ownerNamespace, rootPair.repo.slug)) !== null
+    ) {
+      const rootRefs = resolveHeadBranch(await engineReads(env, rootPair.repo).listRefs(), rootPair.repo.defaultBranch);
+      if (rootRefs.headBranch !== null) {
+        rootRepo = {
+          owner: rootPair.repo.ownerNamespace,
+          name: rootPair.repo.slug,
+          link: `/${rootPair.repo.ownerNamespace}/${rootPair.repo.slug}`,
+          refs: rootRefs,
+        };
+      }
+    }
   }
 
   // The range's FIRST (oldest) commit — the engine returns oldest first, so
@@ -343,13 +595,17 @@ export async function loadCompareData(
 
   return {
     refs,
+    headRefs,
     baseName,
     headName,
     baseKind,
     headKind,
     baseTipOid: baseTip.oid,
     headTipOid: headTip.oid,
+    separator: options.separator,
+    directComparison,
     mergeBaseOid,
+    compareBaseOid,
     sameTip,
     nothingToCompare,
     commits,
@@ -361,7 +617,18 @@ export async function loadCompareData(
     suggestedTitle: rangeFirstCommit !== null ? rangeFirstCommit.subject : "",
     suggestedContent:
       commits.length === 1 && rangeFirstCommit !== null ? messageBodyOf(rangeFirstCommit) : "",
+    headRepo,
+    headRepoId: headRepoRow.id,
+    ownFork,
+    rootRepo,
   };
+}
+
+/** The base repo's `RepositoryWithOwner` pair (the carries' source shape). */
+async function basePairOf(db: D1Database, repo: { id: string }): Promise<RepositoryWithOwner> {
+  const pair = await findRepositoryById(db, repo.id);
+  if (pair === null) throw new Error(`compare: base repo row vanished [id: ${repo.id}]`);
+  return pair;
 }
 
 // ---------------------------------------------------------------------------
@@ -417,12 +684,14 @@ export interface ComparePullWriteInput {
 export async function createPullFromForm(input: ComparePullWriteInput): Promise<ComparePullSubmitResult> {
   const { data, form } = input;
   // Upstream fail-fast (routes/pulls.ts:612-614 verbatim message) — the
-  // SAME-ref arm only (IsSameRef, services/git/compare.go:41-43): the
-  // create side is tips-blind (pull.go:1318 has no empty-diff gate), so an
-  // equal-tips ACROSS-REF pair falls through and creates the empty PR under
-  // the page's AllowEmptyPr gate; the ref-folding control is the landed
-  // refusal upstream's IsSameRef arm backs.
-  if (data.headName === data.baseName) {
+  // SAME-ref arm only (IsSameRef, services/git/compare.go:41-43 — same
+  // repository AND the same resolved ref; a cross-repo head never holds it,
+  // whatever the names): the create side is tips-blind (pull.go:1318 has no
+  // empty-diff gate) AND separator-blind (no DirectComparison gate), so an
+  // equal-tips ACROSS-REF pair — and a hand-crafted `..` POST — falls
+  // through and creates the empty PR under the page's AllowEmptyPr gate; the
+  // ref-folding control is the landed refusal upstream's IsSameRef arm backs.
+  if (data.headRepo === null && data.headName === data.baseName) {
     return { outcome: "invalid", message: "Invalid PullRequest: There are no changes between the head and the base" };
   }
   // parseCompareInfo's allowCreatePull arm: BOTH sides must be branches —
@@ -430,16 +699,35 @@ export async function createPullFromForm(input: ComparePullWriteInput): Promise<
   if (data.baseKind !== "branch" || data.headKind !== "branch") {
     return { outcome: "invalid", message: compareLocale.nothing_to_compare_have_tag };
   }
-  if (data.mergeBaseOid === null) {
+  // ci.CompareBase == "" (pull.go:1321-1324) — the merge-base miss; the `..`
+  // form's CompareBase is the base tip itself, never empty.
+  if (data.compareBaseOid === null) {
     return { outcome: "invalid", message: compareLocale.no_common_history };
   }
   if (form.title === "") {
     return { outcome: "invalid", message: compareLocale.title_required };
   }
-  // GetUnmergedPullRequest duplicate check → the landed 409 message.
-  const existing = await findUnmergedPullRequest(input.request.env.DB, input.repo.id, input.repo.id, data.headName, data.baseName);
+  // GetUnmergedPullRequest duplicate check (ci.HeadRepo.ID keyed) → the
+  // landed 409 message.
+  const existing = await findUnmergedPullRequest(input.request.env.DB, data.headRepoId, input.repo.id, data.headName, data.baseName);
   if (existing !== null) {
     return { outcome: "invalid", message: pullRequestAlreadyExistsError(existing).message };
+  }
+
+  // The cross-repo create-compare seam (the API POST's exact order,
+  // routes/pulls.ts:947-951): pr.MergeBase computes IN THE HEAD CELL
+  // (crossRepoCreateMergeBase — the base-fetch carry ported with it), then
+  // the head closure carries INTO the base cell so refs/pull/N/head can
+  // land. Engine writes: a refusal above moved no bytes (upstream-true
+  // order); a carry failure propagates (the honest 500, the API route's
+  // posture).
+  let mergeBase: string | null = null;
+  if (data.headRepo !== null) {
+    const headPair = await findRepositoryById(input.request.env.DB, data.headRepoId);
+    if (headPair === null) return { outcome: "failed", message: "the head repository is gone" };
+    const apiContext = new Context<ApiEnv>(input.raw, { env: input.request.env });
+    mergeBase = await crossRepoCreateMergeBase(apiContext, input.pair, headPair, data.baseName, data.baseTipOid, data.headTipOid);
+    await carryForkHeadIntoBase(apiContext, input.pair, headPair, data.headName, data.headTipOid);
   }
 
   let issue: IssueRow;
@@ -447,7 +735,7 @@ export async function createPullFromForm(input: ComparePullWriteInput): Promise<
   try {
     const created = await new IssuesService(input.request.env.DB).createPullRequest({
       repoId: input.repo.id,
-      headRepoId: input.repo.id,
+      headRepoId: data.headRepoId,
       baseBranch: data.baseName,
       headBranch: data.headName,
       title: form.title,
@@ -455,6 +743,10 @@ export async function createPullFromForm(input: ComparePullWriteInput): Promise<
       posterId: input.doer.id,
       allowMaintainerEdit: true, // DefaultAllowMaintainerEdit (the API route's repo_unit default)
       headSha: data.headTipOid,
+      // The cross-repo arm passes the computed merge base (the API POST's
+      // `mergeBase: mergeBaseOid`); the same-repo form create keeps the
+      // landed null shape (the lazy mergeability check computes it).
+      ...(data.headRepo !== null ? { mergeBase } : {}),
     });
     issue = created.issue;
     pr = created.pullRequest;
@@ -512,49 +804,59 @@ export async function createPullFromForm(input: ComparePullWriteInput): Promise<
 // Components (repo/diff/compare.tmpl + commits_table.tmpl)
 // ---------------------------------------------------------------------------
 
-/** One base/head dropdown (compare.tmpl:30-97 reduced to the no-JS shape —
- *  the flat branch-then-tag item list; the search input and the branches/tags
- *  tab buttons are Fomantic/JS features). */
-function CompareSelector(props: {
-  side: "base" | "head";
-  label: string;
+/** One dropdown group (compare.tmpl's per-repo menus: the page repo's own
+ *  universes ride first; a cross-repo compare appends the head repo's, the
+ *  viewer's OwnForkRepo's, and the RootRepo's — each with ITS OWN link
+ *  shape, the upstream hrefs verbatim). */
+interface CompareSelectorGroup {
   repoFullName: string;
-  refs: ResolvedRefs;
+  refs: string[];
+  /** The group's item href (the per-group shapes of compare.tmpl:56-95 /
+   *  127-166). */
+  href: (ref: string) => string;
+  /** Upstream marks `selected` only on the page repo's own groups. */
+  marksActive: boolean;
+}
+
+/** One base/head dropdown (compare.tmpl:30-97 reduced to the no-JS shape —
+ *  the flat branch-then-tag item list over the group sequence; the search
+ *  input and the branches/tags tab buttons are Fomantic/JS features). */
+function CompareSelector(props: {
+  label: string;
+  /** The active side's resolved ref name + its repo's display name (the
+   *  button's `{label}: {fullName}:{active}` pair). */
   active: string;
-  /** The comparison's OTHER side, kept across the switch. */
-  other: string;
-  repoLink: string;
+  activeRepoFullName: string;
+  groups: CompareSelectorGroup[];
 }) {
-  const item = (name: string) => {
-    const href =
-      props.side === "base" ? compareLink(props.repoLink, name, props.other) : compareLink(props.repoLink, props.other, name);
-    const isActive = name === props.active;
-    return (
-      <a class={isActive ? "active item" : "item"} href={href}>
-        {props.repoFullName}:{name}
-      </a>
-    );
-  };
   return (
     <div class="ui dropdown jump select-branch">
       <div class="ui basic small button">
         <span class="text">
           {props.label}:{" "}
           <strong>
-            {props.repoFullName}:{props.active}
+            {props.activeRepoFullName}:{props.active}
           </strong>
         </span>
       </div>
       <div class="menu">
-        {props.refs.branches.map(item)}
-        {props.refs.tags.map(item)}
+        {props.groups.flatMap((group) =>
+          group.refs.map((name) => (
+            <a class={group.marksActive && name === props.active ? "active item" : "item"} href={group.href(name)}>
+              {group.repoFullName}:{name}
+            </a>
+          )),
+        )}
       </div>
     </div>
   );
 }
 
 /** The commits_table block over the range (commits_table.tmpl: the count +
- *  sha pair header, the commits list, the pagination). */
+ *  sha pair header, the commits list, the pagination). The sha links ride
+ *  CommitRepoLink = ci.HeadRepo.Link() (compare.go:383 — both sides link
+ *  into the head repo) and the separator is the URL's own
+ *  (CompareInfo.CompareSeparator). */
 function CompareCommitsTable(props: { repoLink: string; data: CompareData; page: number; basePath: string }) {
   const { data } = props;
   return (
@@ -567,7 +869,7 @@ function CompareCommitsTable(props: { repoLink: string; data: CompareData; page:
           <a href={commitLink(props.repoLink, data.baseTipOid)} class="ui green sha label tw-mx-0">
             {shortSha(data.baseTipOid)}
           </a>
-          <div class="compare-separator">...</div>
+          <div class="compare-separator">{data.separator}</div>
           <a href={commitLink(props.repoLink, data.headTipOid)} class="ui green sha label tw-mx-0">
             {shortSha(data.headTipOid)}
           </a>
@@ -618,33 +920,46 @@ export function ComparePage(props: {
   if (repo === undefined) throw new Error("ComparePage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const repoFullName = `${repo.ownerNamespace}/${repo.slug}`;
+  const es = pathEscapeSegments;
+  // The cross-repo arm (PullRequestCtx.SameRepo false upstream): the head
+  // repo's link/name and the fork prefix carried on every head side
+  // (compare.tmpl's `{{if not SameRepo}}{{HeadUser}}/{{HeadRepo.Name}}:{{end}}`).
+  const crossRepo = data.headRepo !== null;
+  const headRepoLink = data.headRepo === null ? repoLink : `/${data.headRepo.ownerNamespace}/${data.headRepo.slug}`;
+  const headRepoFullName = data.headRepo === null ? repoFullName : `${data.headRepo.ownerNamespace}/${data.headRepo.slug}`;
+  const headPrefix = data.headRepo === null ? "" : `${es(data.headRepo.ownerNamespace)}/${es(data.headRepo.slug)}:`;
+  const basePrefix = `${es(repo.ownerNamespace)}/${es(repo.slug)}:`;
 
   // Upstream comparable = NOT nothingToCompare (compare.go:376-378 +
-  // 397-405): no common history, or the head IS the merge base (subsuming
-  // same-tip).
+  // 397-405): no common history, or the head IS the CompareBase (subsuming
+  // same-tip; for `..` only the equal-tips arm is reachable).
   const comparable = !data.nothingToCompare;
   const branchPair = data.baseKind === "branch" && data.headKind === "branch";
+  // IsSameRef (services/git/compare.go:41-43 — same repository && the same
+  // resolved ref): cross-repo pairs never hold it, whatever the names.
+  const sameRef = data.headRepo === null && data.baseName === data.headName;
   // AllowEmptyPr (compare.go:400-402), set ONLY in the head == CompareBase
   // arm — never for no-common-history, where upstream returns before it —
   // reduced: supportEmptyPr = !AutodetectManualMerge → true (the
   // autodetect-manual-merge unit config is unlanded); acrossRepoPr =
-  // !IsSameRef → the resolved ref names differing (services/git/compare.go:
-  // 41-43 — same repository && BaseRef == HeadRef; compares are always
-  // same-repository here, the fork family 404s at the parser).
-  const allowEmptyPr = data.headTipOid === data.mergeBaseOid && data.baseName !== data.headName;
-  // Upstream $allowCreatePR (compare.tmpl:173): the IsBranch pair, not
-  // DirectComparison (the `..` family is an unlanded surface — the parser
-  // 404s it), and the form folds with the nothing state unless AllowEmptyPr.
-  const allowCreatePR = branchPair && (comparable || allowEmptyPr);
+  // !IsSameRef.
+  const allowEmptyPr = data.compareBaseOid !== null && data.headTipOid === data.compareBaseOid && !sameRef;
+  // Upstream $allowCreatePR (compare.tmpl:173): the IsBranch pair, NOT
+  // DirectComparison (the `..` pairs never offer the form), and the form
+  // folds with the nothing state unless AllowEmptyPr.
+  const allowCreatePR = branchPair && !data.directComparison && (comparable || allowEmptyPr);
   // The state arms' gate — upstream's router-level allowCreatePull back
   // PageIsComparePull (compare.go:305-306: IsBranch pair && CompareBase !=
-  // ""): no-common-history folds it, the head==mergeBase state does NOT —
+  // ""): no-common-history folds it, the head==CompareBase state does NOT —
   // the existing-PR segment and the archived warning survive the fold there
   // (anonymous renders them with the page, the landed honest-state posture).
-  const pullArms = branchPair && data.mergeBaseOid !== null;
+  // A `..` branch pair keeps it (its CompareBase is the base tip, never
+  // empty) — the pull-flavored header with the form folded by the gate
+  // above, exactly upstream's render.
+  const pullArms = branchPair && data.compareBaseOid !== null;
   // The head flavor: upstream folds ONLY at no common history; ours also
   // folds at equal tips (wave-13 pins the same-tip shape code-flavored — the
-  // landed divergence), so the head==mergeBase arm keeps the upstream pull
+  // landed divergence), so the head==CompareBase arm keeps the upstream pull
   // flavor.
   const comparePull = pullArms && !data.sameTip;
   const pageIsComparePull = comparePull && ctx.viewer.kind === "user" && !repo.isArchived;
@@ -652,14 +967,92 @@ export function ComparePage(props: {
   // The nothing segment's three-way message (compare.tmpl:174-183): the
   // allow-empty-pr text when the form survives the fold, the plain text for
   // a branch pair, the have-tag text otherwise (a tag side folds
-  // $allowCreatePR upstream too). The no-common-history arm never holds
-  // AllowEmptyPr, so its branch-pair message stays the plain text.
+  // $allowCreatePR upstream too — as does every `..` pair). The
+  // no-common-history arm never holds AllowEmptyPr, so its branch-pair
+  // message stays the plain text.
   const nothingMessage = allowCreatePR
     ? compareLocale.nothing_to_compare_and_allow_empty_pr
     : branchPair
       ? compareLocale.nothing_to_compare
       : compareLocale.nothing_to_compare_have_tag;
-  const basePath = compareLink(repoLink, data.baseName, data.headName);
+  const basePath = crossRepo
+    ? compareForkLink(repoLink, data.baseName, data.headRepo.ownerNamespace, data.headRepo.slug, data.headName)
+    : compareLink(repoLink, data.baseName, data.headName);
+
+  // The dropdown groups (compare.tmpl:56-95 base side / 127-166 head side,
+  // in the template's order: the page repo's own universes, then — for a
+  // cross-repo compare — the head repo's, then OwnForkRepo's, then
+  // RootRepo's).
+  // The dropdown groups (compare.tmpl:56-95 base side / 127-166 head side,
+  // in the template's order: the page repo's own universes, then — for a
+  // cross-repo compare — the head repo's, then OwnForkRepo's, then
+  // RootRepo's). The head side of every BASE-side href carries the fork
+  // prefix only when cross-repo (the `{{if not SameRepo}}` guards).
+  const baseSideHref = (link: string, ref: string): string =>
+    data.headRepo === null
+      ? `${link}/compare/${es(ref)}...${es(data.headName)}`
+      : compareForkLink(link, ref, data.headRepo.ownerNamespace, data.headRepo.slug, data.headName);
+  const headSideHref = (prefix: string, ref: string): string =>
+    `${repoLink}/compare/${es(data.baseName)}${data.separator}${prefix}${es(ref)}`;
+  const baseGroups: CompareSelectorGroup[] = [
+    { repoFullName, refs: data.refs.branches, marksActive: true, href: (ref) => baseSideHref(repoLink, ref) },
+    { repoFullName, refs: data.refs.tags, marksActive: true, href: (ref) => baseSideHref(repoLink, ref) },
+  ];
+  const headGroups: CompareSelectorGroup[] = [
+    {
+      repoFullName: headRepoFullName,
+      refs: data.headRefs.branches,
+      marksActive: true,
+      href: (ref) => headSideHref(headPrefix, ref),
+    },
+    {
+      repoFullName: headRepoFullName,
+      refs: data.headRefs.tags,
+      marksActive: true,
+      href: (ref) => headSideHref(headPrefix, ref),
+    },
+  ];
+  if (crossRepo && data.headRepo !== null) {
+    // The head repo's branches as BASE candidates (onto the head repo's own
+    // compare page, compare.tmpl:60-64/80-84) and the base repo's as HEAD
+    // candidates (the base repo prefix, compare.tmpl:131-135/151-155).
+    baseGroups.push(
+      { repoFullName: headRepoFullName, refs: data.headRefs.branches, marksActive: false, href: (ref) => baseSideHref(headRepoLink, ref) },
+      { repoFullName: headRepoFullName, refs: data.headRefs.tags, marksActive: false, href: (ref) => baseSideHref(headRepoLink, ref) },
+    );
+    headGroups.push(
+      { repoFullName, refs: data.refs.branches, marksActive: false, href: (ref) => headSideHref(basePrefix, ref) },
+      { repoFullName, refs: data.refs.tags, marksActive: false, href: (ref) => headSideHref(basePrefix, ref) },
+    );
+  }
+  if (data.ownFork !== null) {
+    const ownFork = data.ownFork;
+    const ownPrefix = `${es(ownFork.owner)}/${es(ownFork.name)}:`;
+    baseGroups.push(
+      { repoFullName: `${ownFork.owner}/${ownFork.name}`, refs: ownFork.refs.branches, marksActive: false, href: (ref) => baseSideHref(ownFork.link, ref) },
+      { repoFullName: `${ownFork.owner}/${ownFork.name}`, refs: ownFork.refs.tags, marksActive: false, href: (ref) => baseSideHref(ownFork.link, ref) },
+    );
+    headGroups.push(
+      { repoFullName: `${ownFork.owner}/${ownFork.name}`, refs: ownFork.refs.branches, marksActive: false, href: (ref) => headSideHref(ownPrefix, ref) },
+      { repoFullName: `${ownFork.owner}/${ownFork.name}`, refs: ownFork.refs.tags, marksActive: false, href: (ref) => headSideHref(ownPrefix, ref) },
+    );
+  }
+  if (data.rootRepo !== null) {
+    const rootRepo = data.rootRepo;
+    const rootPrefix = `${es(rootRepo.owner)}/${es(rootRepo.name)}:`;
+    baseGroups.push(
+      { repoFullName: `${rootRepo.owner}/${rootRepo.name}`, refs: rootRepo.refs.branches, marksActive: false, href: (ref) => baseSideHref(rootRepo.link, ref) },
+      { repoFullName: `${rootRepo.owner}/${rootRepo.name}`, refs: rootRepo.refs.tags, marksActive: false, href: (ref) => baseSideHref(rootRepo.link, ref) },
+    );
+    headGroups.push(
+      { repoFullName: `${rootRepo.owner}/${rootRepo.name}`, refs: rootRepo.refs.branches, marksActive: false, href: (ref) => headSideHref(rootPrefix, ref) },
+      { repoFullName: `${rootRepo.owner}/${rootRepo.name}`, refs: rootRepo.refs.tags, marksActive: false, href: (ref) => headSideHref(rootPrefix, ref) },
+    );
+  }
+  // The separator switch (compare.tmpl:99): the href carries the OTHER
+  // separator ($compareSeparatorSwitch), the visible text the current one;
+  // the head side carries the fork prefix when cross-repo.
+  const switchSeparator = data.directComparison ? "..." : "..";
 
   return (
     <BaseLayout
@@ -684,30 +1077,30 @@ export function ComparePage(props: {
         <div class="ui segment choose branch">
           <a
             class="tw-mr-2"
-            href={compareLink(repoLink, data.headName, data.baseName)}
+            href={crossRepo ? compareForkLink(headRepoLink, data.headName, repo.ownerNamespace, repo.slug, data.baseName) : compareLink(repoLink, data.headName, data.baseName)}
             title={compareLocale.switch_head_and_base}
             aria-label={compareLocale.switch_head_and_base}
           >
             {compareLocale.switch_head_and_base}
           </a>
           <CompareSelector
-            side="base"
             label={pageIsComparePull ? compareLocale.merge_into : compareLocale.base}
-            repoFullName={repoFullName}
-            refs={data.refs}
             active={data.baseName}
-            other={data.headName}
-            repoLink={repoLink}
+            activeRepoFullName={repoFullName}
+            groups={baseGroups}
           />
-          <div class="compare-separator">...</div>
+          <a
+            href={`${repoLink}/compare/${es(data.baseName)}${switchSeparator}${headPrefix}${es(data.headName)}`}
+            title={compareLocale.switch_comparison_type}
+            aria-label={compareLocale.switch_comparison_type}
+          >
+            <div class="compare-separator">{data.separator}</div>
+          </a>
           <CompareSelector
-            side="head"
             label={pageIsComparePull ? compareLocale.pull_from : compareLocale.compare}
-            repoFullName={repoFullName}
-            refs={data.refs}
             active={data.headName}
-            other={data.baseName}
-            repoLink={repoLink}
+            activeRepoFullName={headRepoFullName}
+            groups={headGroups}
           />
         </div>
 
@@ -784,7 +1177,7 @@ export function ComparePage(props: {
                       <strong>{compareLocale.pull_from}</strong>
                     </div>
                     <span class="item">
-                      {repoFullName}:{data.headName}
+                      {headRepoFullName}:{data.headName}
                     </span>
                   </div>
                 </div>
@@ -796,7 +1189,7 @@ export function ComparePage(props: {
 
       {showDiffBox ? (
         <div class="ui container fluid padded tw-my-4">
-          <CompareCommitsTable repoLink={repoLink} data={data} page={props.page} basePath={basePath} />
+          <CompareCommitsTable repoLink={headRepoLink} data={data} page={props.page} basePath={basePath} />
           <div class="diff-detail-box">
             <div class="flex-text-block tw-flex-wrap tw-ml-0.5">
               {data.files.length > 0 ? (

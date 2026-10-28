@@ -1,7 +1,8 @@
 /**
- * The web editor's UPLOAD staging family (pages wave 70 wiring) — the three
- * pieces the committed upload-confirm page (ui/pages/repo-editor-tails.tsx,
- * f4492b2's HANDOFF NOTE) needs before its confirm POST can write:
+ * The web editor's UPLOAD staging family (pages wave 70 wiring; MOUNTED at
+ * 1d834d6 — the three pieces the upload-confirm page,
+ * ui/pages/repo-editor-tails.tsx, needed before its confirm POST could
+ * write):
  *
  *   1. the uuid staging store — upstream's `upload` table
  *      (models/repo/upload.go:30-33: `Upload{ID, UUID, Name}`) ported onto
@@ -11,13 +12,13 @@
  *      (routers/web/repo/editor_uploader.go:18-60): multipart `file` POST →
  *      `verifyUploadFileType` (services/context/upload/upload.go:52-103) →
  *      `cleanGitTreePath` (services/repository/files/file.go:143-155) →
- *      JSON `{"uuid"}`; remove POST (`file` = uuid) → 204. Exported as
- *      UNMOUNTED handlers — the orchestrator's index.ts mounts them at
+ *      JSON `{"uuid"}`; remove POST (`file` = uuid) → 204. MOUNTED handlers —
+ *      index.ts serves them at
  *      `/{owner}/{repo}/upload-file` + `/{owner}/{repo}/upload-remove`
  *      (web.go:1471-1475) behind the standard write gates (upstream wraps the
  *      pair in `MustBeAbleToUpload` + `reqRepoCodeWriter`, web.go:1475 — the
- *      upload.Enabled toggle does not exist here yet, so the mount gates with
- *      the family's `canWriteRepo` per the repo-editor-tails handoff).
+ *      upload.Enabled toggle does not exist here, so the mount gates with
+ *      the family's `canWriteRepo`).
  *   3. the commit arm — `commitUploadFromForm` over `uploadRepoFiles`
  *      (services/repository/files/upload.go:76-113): resolve the staged
  *      uuids, ONE multi-file create-or-update commit under the target dir
@@ -276,7 +277,8 @@ export function verifyUploadFileType(buf: Uint8Array, fileName: string, allowedT
 }
 
 // ---------------------------------------------------------------------------
-// The endpoints (routers/web/repo/editor_uploader.go:18-60) — UNMOUNTED
+// The endpoints (routers/web/repo/editor_uploader.go:18-60) — MOUNTED at
+// 1d834d6
 // ---------------------------------------------------------------------------
 
 /** `setting.Repository.Upload.FileMaxSize` in MB (repository.go:177) — the
@@ -326,8 +328,8 @@ async function readUploadFilePart(request: Request): Promise<UploadFilePart> {
  * (editor_uploader.go:46). A malformed body answers upstream's ServerError
  * 500 (editor_uploader.go:20-22); an over-cap body answers the size FIXME
  * (editor_uploader.go:41) with a 400 — the dropzone's own
- * `data-max-size` contract, answered server-side. UNMOUNTED: the
- * orchestrator's route adds the §2.8 Origin guard, the repo prologue and the
+ * `data-max-size` contract, answered server-side. MOUNTED: the
+ * route arm adds the §2.8 Origin guard (the remove endpoint), the repo prologue and the
  * writer gate (upstream web.go:1471-1475's `MustBeAbleToUpload` +
  * `reqRepoCodeWriter`).
  */

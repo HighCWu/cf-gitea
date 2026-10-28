@@ -1,8 +1,7 @@
 /**
  * The user settings ACTIONS VARIABLES tab, `/user/settings/actions/variables`
- * — pages wave 58 (bench row `wave-user-variables-module`, TWO-STAGE
- * UNMOUNTED — the route rides the index.ts window; `index.ts` is
- * orchestrator/sibling-owned).
+ * — pages wave 58 (bench row `wave-user-variables-module`, MOUNTED at
+ * 0c2b151 — the route lives in `index.ts`).
  *
  * Upstream pin: the PageType "variables" arm of `user/settings/actions.tmpl`
  * (actions.tmpl:7-8, pageClass `user settings actions` from line 1) rendering
@@ -16,7 +15,7 @@
  * `/actions` group of the reqSignIn `/user/settings` group (behind
  * `actions.MustEnableActions`).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 0c2b151 — the wiring HANDOFF is retired)
  *
  * Upstream's route group is web.go:489-497 shared across the four scopes; the
  * user scope mounts inside web.go:707-731's `/actions` group. Four routes:

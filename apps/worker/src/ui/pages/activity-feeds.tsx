@@ -1,10 +1,10 @@
 /**
  * The user profile ACTIVITY tab, `/{username}?tab=activity` — pages wave 50
- * (bench row `wave-feeds-module`; MOUNTED by the dispatch window —
+ * (bench row `wave-feeds-module`; MOUNTED at b1bf73a —
  * `ownerHomePage`'s user arm calls this module's load + render under the
- * tab param, the HANDOFF NOTE's recipe verbatim).
+ * tab param, the mount record's recipe verbatim).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at b1bf73a — the wiring HANDOFF is retired)
  *
  * - The page module is complete end-to-end: `resolveActivityFeeds` (the
  *   owner seam), `loadActivityFeedsData` (the data seam) and
@@ -450,7 +450,7 @@ export type ActivityFeedsResolution =
  * OrgAssignment seam), then the user half (`resolveUserProfile` — the
  * userAssignment + RedirectToUser + IsUserVisibleToViewer ladder, the
  * landed profile page's exact seam). The route dispatches on the union
- * (the header's HANDOFF NOTE).
+ * (the header's mount record).
  */
 export async function resolveActivityFeeds(
   d1: D1Database,

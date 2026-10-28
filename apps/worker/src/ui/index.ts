@@ -2445,12 +2445,19 @@ export interface OrgSettingsRoute {
 
 /** The wave-13 compare family (pages/compare.tsx): upstream's
  *  `m.Get("/compare")` + the `/compare/*` path group (web.go:1307-1315) —
- *  the bare URL (both sides the default branch) and the `{base}...{head}`
- *  tail (FIRST `...` splits; a missing separator makes the whole tail the
- *  head — upstream's single-ref family; an empty side falls back to the
- *  default branch at load). The `..` two-dot family (DirectComparison) and
- *  the `{owner}/{repo}:{head}` fork forms stay UNCLAIMED → the engine's 404
- *  (documented divergences: no landed direct-comparison surface, no forks).
+ *  the bare URL (both sides the default branch) and the full
+ *  ParseCompareRouterParam grammar (routers/common/compare.go:74-102): the
+ *  FIRST `...` splits, else the first `..` (DirectComparison — the two-dot
+ *  arm, landed window-crosscompare: the feeds module's own
+ *  parseCompareBaseHead semantics), else the whole tail is the head
+ *  (upstream's single-ref family); an empty side falls back to the default
+ *  branch at load. The head part carries the fork forms (parseHead,
+ *  compare.go:36-46 — grammar forms 2/3/5/6): `{owner}:{ref}` and
+ *  `{owner}/{repo}:{ref}` name the head REPO (the fork-edge resolution
+ *  landed with the API's fork-PR flow); the BASE part never carries a fork
+ *  form upstream (parseHead is head-only) — a colon there is an
+ *  unresolvable ref name → the 404 shell. A `..` left inside a side is the
+ *  same 404 class (refnames can never carry `..`).
  *  The POST on the same tail is the new-PR write
  *  (CompareAndPullRequestPost — the form lives INLINE on the compare page). */
 export interface CompareRoute {
@@ -2461,6 +2468,16 @@ export interface CompareRoute {
   base: string | null;
   /** The head side; `null` = the bare/empty form → the default branch. */
   head: string | null;
+  /** The URL's separator (upstream CompareRouterReq.CompareSeparator /
+   *  CompareInfo.CompareSeparator): `...` diffs from the merge base,
+   *  `..` diffs the two tips (DirectComparison). */
+  separator: "..." | "..";
+  /** The head-side fork form's owner (parseHead); `null` = the same-repo
+   *  head (the owner segment omitted). */
+  headOwner: string | null;
+  /** The fork form's explicit repo name (`{owner}/{repo}:{ref}` form);
+   *  `null` = the bare `{owner}:{ref}` form (the fork edge decides). */
+  headRepoName: string | null;
 }
 
 /** Top-level single-segment paths this router must never claim: the session
@@ -3380,16 +3397,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return { family: "milestone-detail", owner, repo, id };
   }
   // Wave-13: the compare family (pages/compare.tsx — upstream web.go:1307-
-  // 1315). The bare URL and the `{base}...{head}` tail (FIRST `...` splits
-  // the decoded suffix — strings.Cut parity; refnames can never carry `..`,
-  // so the separator is unambiguous and the emitted links always re-parse to
-  // the same pair). A missing separator makes the whole tail the HEAD
-  // (upstream's single-ref family); an empty side is the default-branch
-  // fallback (the loader's util.IfZero arm). The `..` two-dot family
-  // (DirectComparison — a different diff semantic, not a landed surface) and
-  // the `{owner}/{repo}:{head}` fork forms (colon-bearing sides; forks
-  // cannot exist yet, SPEC-0003) stay unclaimed → the engine's 404, exactly
-  // upstream's unregistered-route answer for this slice.
+  // 1315). The bare URL and the full ParseCompareRouterParam tail grammar:
+  // the FIRST `...` splits the decoded suffix (strings.Cut parity), else the
+  // first `..` (the two-dot DirectComparison arm — the feeds module's
+  // parseCompareBaseHead semantics, landed here for the page), else the
+  // whole tail is the HEAD (upstream's single-ref family); an empty side is
+  // the default-branch fallback (the loader's util.IfZero arm) and the head
+  // part carries the fork forms (`{owner}:{ref}` / `{owner}/{repo}:{ref}` —
+  // parseHead; the fork-edge resolution landed with the API's fork-PR flow).
   if (head === "wiki") {
     // Window-2e C2: the WIKI family (pages/repo-wiki.tsx — upstream
     // web.go:1611-1617's two combos; the SUB-PAGES dispatch on the
@@ -3408,14 +3423,24 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return { family: "wiki", owner, repo, rawTail };
   }
   if (head === "compare") {
-    if (rest.length === 0) return { family: "compare", owner, repo, base: null, head: null };
+    const bare: CompareRoute = {
+      family: "compare",
+      owner,
+      repo,
+      base: null,
+      head: null,
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    };
+    if (rest.length === 0) return bare;
     let suffix: string;
     try {
       suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
     } catch {
       return null;
     }
-    if (suffix === "") return { family: "compare", owner, repo, base: null, head: null };
+    if (suffix === "") return bare;
     // Window-2e B2: the .diff/.patch byte feeds (web.go:1309-1310) — claim
     // the suffixed tails BEFORE the page family returns (they would
     // otherwise fall into the single-ref family and 404 at resolution).
@@ -3425,20 +3450,60 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (suffix.endsWith(".patch")) {
       return { family: "compare-feed", owner, repo, ext: "patch", segment: suffix.slice(0, -6) };
     }
-    const separator = suffix.indexOf("...");
-    if (separator < 0) {
-      if (suffix.includes("..") || suffix.includes(":")) return null;
-      return { family: "compare", owner, repo, base: null, head: suffix };
+    // ParseCompareRouterParam (routers/common/compare.go:74-102): the FIRST
+    // `...` splits; failing that, the first `..` (DirectComparison);
+    // failing both, the whole tail is the HEAD (separator stays `...`).
+    let separator: "..." | "..";
+    let basePart: string;
+    let headPart: string;
+    const tri = suffix.indexOf("...");
+    if (tri >= 0) {
+      separator = "...";
+      basePart = suffix.slice(0, tri);
+      headPart = suffix.slice(tri + 3);
+    } else {
+      const bi = suffix.indexOf("..");
+      if (bi >= 0) {
+        separator = "..";
+        basePart = suffix.slice(0, bi);
+        headPart = suffix.slice(bi + 2);
+      } else {
+        separator = "...";
+        basePart = "";
+        headPart = suffix;
+      }
     }
-    const base = suffix.slice(0, separator);
-    const headSide = suffix.slice(separator + 3);
-    if (base.includes("..") || base.includes(":") || headSide.includes("..") || headSide.includes(":")) return null;
+    // parseHead (compare.go:36-46) — the fork forms live on the HEAD part
+    // only. `owner/` with an empty repo name is upstream's unsupported-
+    // syntax invalid-argument → the 404 class.
+    let headOwner: string | null = null;
+    let headRepoName: string | null = null;
+    const colon = headPart.indexOf(":");
+    if (colon >= 0) {
+      const ownerRepo = headPart.slice(0, colon);
+      const slash = ownerRepo.indexOf("/");
+      if (slash > 0) {
+        headOwner = ownerRepo.slice(0, slash);
+        headRepoName = ownerRepo.slice(slash + 1);
+      } else if (slash < 0) {
+        headOwner = ownerRepo;
+      } else {
+        return null;
+      }
+    }
+    // Refname impossibilities inside the sides (`..` never appears in a
+    // refname; the BASE part never carries a fork form): unresolvable
+    // upstream → the same 404 shell via null.
+    if (basePart.includes("..") || basePart.includes(":") || headPart.includes("..")) return null;
     return {
       family: "compare",
       owner,
       repo,
-      base: base === "" ? null : base,
-      head: headSide === "" ? null : headSide,
+      base: basePart === "" ? null : basePart,
+      head: headPart === "" ? null : headPart,
+      separator,
+      headOwner,
+      headRepoName,
     };
   }
   // Wave-16 branches family (pages/branches.tsx — upstream web.go:1478-1482's
@@ -7574,7 +7639,15 @@ async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
 
   if (route.family !== "compare") return respond(await c.notFound()); // registration/parser drift guard
   const page = parsePageNumber(url.searchParams.get("page"));
-  const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
+  const data = await loadCompareData(c.env, c.env.DB, repo, {
+    base: route.base,
+    head: route.head,
+    headOwner: route.headOwner,
+    headRepoName: route.headRepoName,
+    separator: route.separator,
+    viewer,
+    page,
+  });
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
   const canCreate =
     !repo.isArchived &&
@@ -7803,7 +7876,15 @@ async function compareSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   const pair = await findRepositoryById(c.env.DB, repo.id);
   if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
   const page = parsePageNumber(url.searchParams.get("page"));
-  const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
+  const data = await loadCompareData(c.env, c.env.DB, repo, {
+    base: route.base,
+    head: route.head,
+    headOwner: route.headOwner,
+    headRepoName: route.headRepoName,
+    separator: route.separator,
+    viewer,
+    page,
+  });
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
   const form = await readComparePullForm(c.req.raw);
   const result = await createPullFromForm({

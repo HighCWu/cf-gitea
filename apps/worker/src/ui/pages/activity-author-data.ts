@@ -98,25 +98,21 @@
  * is unstable and the feed is a chart source, so the tiebreak is cosmetic
  * determinism (the commit-contained-refs divergence pattern).
  *
- * ## HANDOFF NOTE (for the wiring wave — index.ts is orchestrator-owned)
+ * ## Mount record (MOUNTED at 22599e4, window-2e B2 — the wiring HANDOFF
+ * is retired)
  *
  * Route family `activity-author-data`: the two patterns
  * `/{owner}/{repo}/activity_author_data` and
  * `/{owner}/{repo}/activity_author_data/{period}` (period segment OPTIONAL
- * — the bare route passes null). Mount is the commit-contained-refs
- * recipe verbatim (src/ui/index.ts:968, 1605, 2805, 5212-5233):
- *   1. `import { activityAuthorDataResponse, loadActivityAuthorData } from
- *      "./pages/activity-author-data";`
- *   2. add `family: "activity-author-data"` to the UiRoute union with
- *      `{ owner; repo; period: string | null }`;
- *   3. parse arm: `activity_author_data` exact path → period null;
- *      `activity_author_data/{segment}` → the raw segment (parseActivity
- *      Period defaults unknowns, no 4xx — upstream parity);
- *   4. handler: `resolveUiRequest` → family drift guard →
- *      `loadActivityAuthorData(c.env, repo, route.period, { origin:
- *      url.origin })` (the resolved UiRequest already carries `url`) →
- *      null answers `c.html(renderNotFound(ctx), 404)`; else
- *      `respond(activityAuthorDataResponse(data))`.
+ * — the bare route passes null). Mounted per the commit-contained-refs
+ * recipe: the family rides the UiRoute union with
+ * `{ owner; repo; period: string | null }`; the parse arm answers the
+ * exact path with period null and `activity_author_data/{segment}` with
+ * the raw segment (parseActivityPeriod defaults unknowns, no 4xx —
+ * upstream parity); the handler runs `resolveUiRequest` → family drift
+ * guard → `loadActivityAuthorData(c.env, repo, route.period, { origin:
+ * url.origin })` → null answers `c.html(renderNotFound(ctx), 404)`, else
+ * `respond(activityAuthorDataResponse(data))`.
  * Not a page — the aux-JSON sibling of commit-contained-refs.
  */
 

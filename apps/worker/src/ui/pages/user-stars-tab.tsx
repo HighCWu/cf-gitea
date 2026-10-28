@@ -54,9 +54,7 @@
  * count in the tab strip is the same doer-visible count the activity tab
  * computes (the loadUserProfileData WHERE over ownerId).
  *
- * ## HANDOFF NOTE — the mount recipe (NOT wired in this wave; index.ts is
- *  not this wave's file; the orchestrator folds it in the mount window,
- *  exactly b1bf73a's activity arm)
+ * ## Mount record (MOUNTED at 2f7afe9 — the wiring HANDOFF is retired)
  *
  * In apps/worker/src/ui/index.ts, ownerHomePage's USER half — AFTER the
  * `profile.kind === "missing"` 404 arm, BESIDE the `tab=activity` arm,
@@ -77,27 +75,12 @@
  * user-profile owner, folded in the same window) — header.tmpl renders the
  * Stars anchor AFTER Activity, inside the IsIndividual block, gated
  * `{{if not .DisableStars}}` (default false at the pin → always rendered;
- * user/overview/header.tmpl:36-44):
- *
- * ```tsx
- * // ProfileTabs props grow: starsCount: number — fed data.user.numStars
- * // (the maintained users.num_stars column, migration 0031 — upstream's
- * // `{{if .ContextUser.NumStars}}` label gate).
- * <a class="item" href={`/${props.username}?tab=activity`}>
- *   <Icon name="octicon-rss" /> {userProfileLocale.activity}
- * </a>
- * <a class="item" href={`/${props.username}?tab=stars`}>
- *   <Icon name="octicon-star" /> {userProfileLocale.stars}
- *   {props.starsCount > 0 ? <div class="ui small label">{props.starsCount}</div> : null}
- * </a>
- * ```
- *
- * with `stars: "Starred Repositories", // "user.starred"` added to
- * userProfileLocale (the exact locale_en-US.json string). header.tmpl's
- * `{{else}}` arm swaps the anchor for `?tab=watching` ("user.watched",
- * "Watched Repositories") when DisableStars is set — NOT implemented: the
- * watching page does not exist and the setting defaults false at the pin
- * (profile.go:220-249's watching case — noted for the board only).
+ * user/overview/header.tmpl:36-44) — LANDED: ProfileTabs grew
+ * `starsCount: number` (fed data.user.numStars, the maintained
+ * users.num_stars column — upstream's `{{if .ContextUser.NumStars}}` label
+ * gate) and renders the `?tab=stars` anchor with the count label; the
+ * `?tab=watching` anchor landed beside it with the watching tab's own
+ * mount (user-watching-tab.tsx).
  *
  * ## Documented v1 degradations (§6 method)
  *

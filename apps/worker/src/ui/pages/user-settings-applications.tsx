@@ -1,10 +1,9 @@
 /**
  * The user settings APPLICATIONS tab, `/user/settings/applications` — pages
- * wave 54 (bench row `wave-settings-keys-tags`, TWO-STAGE UNMOUNTED — the
- * route rides the index.ts window; `index.ts` is orchestrator/sibling-owned;
- * the SSH/GPG keys twin is pages/user-settings-keys.tsx).
+ * wave 54 (bench row `wave-settings-keys-tags`, MOUNTED at 0c2b151 — the
+ * route lives in `index.ts`; the SSH/GPG keys twin is pages/user-settings-keys.tsx).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 0c2b151 — the wiring HANDOFF is retired)
  *
  * The module is complete end-to-end over the landed SPEC-0002 TokenService;
  * upstream's exact route group is web.go:680-697 (the access-token half —

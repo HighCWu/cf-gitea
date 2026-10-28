@@ -32,22 +32,20 @@
  * seams — sessions never authorize /api/v1 or git-HTTP (§2.9).
  *
  * ---------------------------------------------------------------------------
- * HANDOFF NOTE — mount recipe (orchestrator-owned `src/index.ts`; landed
- * complete-but-unmounted per the two-phase discipline):
+ * MOUNTED at df1e362 — `src/index.ts` routes the router:
  *
- *   import { firstRunRouter } from "./ui/first-run";
- *   ...
- *   app.route("/", sessionRouter);
- *   app.route("/", firstRunRouter);   // ADD: next to the sessionRouter mount
+ *   app.route("/", firstRunRouter);
  *
- * Order vs the session/ui routers is immaterial: no claimed path overlaps
- * (`/install`, `/user/sign_up` are top-level; the uiRouter's route table
- * has no such literal; `segments.length < 2` paths fall through to
- * `app.fetch` exactly like /login — SPEC-0010 §2.1). No dispatcher changes
- * beyond the one `app.route` line. The OPTIONAL login-page integration (the
- * init form + register link on GET /login proper) is the renderLoginPage
- * HANDOFF NOTE in src/ui/pages/login.tsx — until it lands, GET /install
- * renders the identical page and GET /login stays golden-stable.
+ * BEFORE the uiRouter (9d77172's correction of this note's original
+ * "order immaterial" claim: /user/sign_up is two segments and Hono's
+ * RegExpRouter gives the dynamic /:owner/:repo pair precedence over a
+ * static registered in a LATER-mounted router — /login survived only by
+ * being single-segment). The sessionRouter mounts after (single-segment
+ * /login + /logout, never repo-scoped — SPEC-0010 §2.1). The OPTIONAL
+ * login-page integration (the init form + register link on GET /login
+ * proper) is MOUNTED too (the session router's renderLoginPage call —
+ * the mount record in src/ui/pages/login.tsx); GET /install still
+ * renders the identical page.
  * ---------------------------------------------------------------------------
  */
 
@@ -312,9 +310,8 @@ async function signUpSubmit(c: RouteContext): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// The router — mounted by the dispatcher next to the sessionRouter (the
-// HANDOFF NOTE at the module head):
-//   app.route("/", firstRunRouter);
+// The router — mounted by the dispatcher BEFORE the uiRouter (the mount
+// record at the module head): app.route("/", firstRunRouter);
 // ---------------------------------------------------------------------------
 
 export const firstRunRouter = new Hono<{ Bindings: FirstRunEnv }>();

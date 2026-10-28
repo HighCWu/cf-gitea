@@ -1,8 +1,8 @@
 /**
- * The repo settings GIT HOOKS tab — the bench-row UNMOUNTED module (pages
- * wave 65, bench row `wave-repo-githooks-module`, TWO-STAGE: this file ships
- * the module only; `index.ts` is a sibling owner — the HANDOFF NOTE at the
- * bottom of this header carries the route recipe).
+ * The repo settings GIT HOOKS tab — the bench-row module (pages
+ * wave 65, bench row `wave-repo-githooks-module`; MOUNTED at b54f709,
+ * window-2d — the routes live in `index.ts`; the retired wiring HANDOFF is
+ * the mount record at the bottom of this file).
  *
  * ## Premises verified at the pin (gitea @ fc4936884584-class pin)
  *
@@ -259,7 +259,7 @@ export type RepoGitHookResult = { outcome: "applied" };
  * then hook.Update()'s arms (`writeStoredHook` above). No validation to
  * fail — the outcome is always "applied"; the POST 303s onto
  * `{repoLink}/settings/hooks/git` (upstream's redirect, git_hooks.go:66 —
- * the HANDOFF NOTE's recipe).
+ * the mount record's recipe).
  */
 export async function applyRepoGitHook(
   r2: R2Bucket,
@@ -325,12 +325,13 @@ export function RepoGitHookEditPage(props: { ctx: UiContext; data: GitHookEditDa
 }
 
 // ---------------------------------------------------------------------------
-// HANDOFF NOTE (for the `index.ts` window owner — this module has NO route)
+// MOUNT RECORD (MOUNTED at b54f709, window-2d — the wiring HANDOFF, kept as
+// the landed-shape record)
 // ---------------------------------------------------------------------------
 //
 // Upstream group (web.go:1223-1227, inside the reqRepoAdmin-wrapped settings
-// subtree at web.go:1183/1285-1287). Mount three routes over the shared
-// settingsGate (index.ts:3238 — anonymous 303s onto the login round-trip, a
+// subtree at web.go:1183/1285-1287). Three routes mounted over the shared
+// settingsGate (anonymous 303s onto the login round-trip, a
 // signed-in non-admin 404-shells; the same posture as every settings
 // sub-page):
 //
@@ -350,15 +351,15 @@ export function RepoGitHookEditPage(props: { ctx: UiContext; data: GitHookEditDa
 //          git_hooks.go:66); a non-vocabulary name throws — answer the 404
 //          shell instead (mirror the GET arm).
 //
-// Router claims (parseUiRoute, index.ts:~2431): the numeric `/settings/
+// Router claims (parseUiRoute): the numeric `/settings/
 // hooks/{id}` guard does NOT match `git`, so the two families are disjoint
-// already — add `rest.length === 2 && rest[0] === "hooks" && rest[1] ===
+// already — `rest.length === 2 && rest[0] === "hooks" && rest[1] ===
 // "git"` → family `settings-githooks`, and `rest.length === 3 && rest[0] ===
 // "hooks" && rest[1] === "git"` → family `settings-githook` carrying
 // `name = rest[2]` (decodeURIComponent the name for asGitHookName's
 // case-sensitive vocabulary check; anything non-vocabulary 404-shells in the
-// handlers, so no name validation belongs in the parser). Register the
-// uiRouter.get/post entries BEFORE the wave-14 `:id` block only for
+// handlers, so no name validation belongs in the parser). The
+// uiRouter.get/post entries sit BEFORE the wave-14 `:id` block for
 // readability — hono serves the static `hooks/git` ahead of the param
 // `hooks/:id` regardless (static-wins matching).
 //
@@ -367,8 +368,8 @@ export function RepoGitHookEditPage(props: { ctx: UiContext; data: GitHookEditDa
 // upstream code-unit block (Branches → Tags → Git Hooks → Keys), between
 // Branches and Mirror; GitHooksSettingsNav is deleted and both pages render
 // `SettingsNav` with `active="githooks"` (upstream's CanEditGitHook item gate
-// stays dropped — routes/git-hooks.ts divergence note 4). Survey rows to
-// touch on landing:
+// stays dropped — routes/git-hooks.ts divergence note 4). Survey rows
+// touched on landing:
 // docs/compat/ui-parity-survey.md — the repo-settings family's hooks row
 // (mark the `settings/hooks/git` list + edit pages rendered) and the
 // navbar-reduction note (the Git Hooks item exists upstream at

@@ -111,7 +111,8 @@
  *   the allowlisted rest ride the shared ICON_PATHS. `gitea-exclamation`
  *   keeps its upstream `-1 -1 26 26` viewBox.
  *
- * ## HANDOFF — the route (a later index.ts window; this wave is module-only)
+ * ## Mount record (MOUNTED at 22599e4, window-2e B2 — the wiring HANDOFF
+ * is retired)
  *
  * The route arm maps onto this module as: parser arm `pull-merge-box` —
  * `/{owner}/{repo}/pulls/{index}/merge_box`, GET, inside the pulls group's
@@ -130,8 +131,9 @@
  * (content-type + the zero-option prod Cache-Control, the fragment twin's
  * Response shape). No layout, no window.config — the fragment mounts inside
  * the conversation page's timeline; the `pulls/{index}` conversation route
- * keeps rendering its own reduced summary box until this fragment's mount
- * wave replaces it (issue-detail.tsx's documented degradation).
+ * still renders its own reduced summary box beside the fragment (the
+ * bundle fetches `merge_box` around the page — issue-detail.tsx's
+ * documented degradation).
  */
 
 import { renderToString } from "hono/jsx/dom/server";

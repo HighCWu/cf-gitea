@@ -72,8 +72,8 @@
  * count, Activity), the follow-tabs module's kept-local strip pattern. The
  * eye glyph is NOT in the generated allowlist (scripts/gen-ui-icons.mjs) —
  * it embeds the exact submodule body inline (the
- * repo-blob-excerpt-fragment.tsx FOLD_SVG precedent); the HANDOFF NOTE
- * carries the allowlist migration.
+ * repo-blob-excerpt-fragment.tsx FOLD_SVG precedent); the mount record
+ * keeps the still-pending allowlist migration.
  *
  * ## Visibility (the landed predicates — never a local re-derivation)
  *
@@ -107,7 +107,7 @@
  *   open-pulls chip only.
  * - The eye glyph is embedded inline (the exact submodule path bytes) — the
  *   shared Icon facade's allowlist gains `octicon-eye` in a tooling wave
- *   (the HANDOFF NOTE's diff); the anchor then migrates to
+ *   (the mount record's still-pending diff); the anchor then migrates to
  *   `<Icon name="octicon-eye">`.
  * - The pager is base/paginate.tmpl reduced to the Older/Newer pair (the
  *   org-home convention), carrying `tab=watching` in every href.
@@ -115,13 +115,12 @@
  *   (modules/setting/ui.go:147) — the SAME setting the repositories tab
  *   cites.
  *
- * ## HANDOFF NOTE — the mount recipe (NOT wired in this wave; index.ts is
- *  orchestrator-owned, recipe only; the orchestrator folds it in the mount
- *  window, exactly b1bf73a's activity arm)
+ * ## Mount record (MOUNTED at 2f7afe9 — the wiring HANDOFF is retired;
+ *  the tooling bullet below is the one still-pending item)
  *
  * In apps/worker/src/ui/index.ts, ownerHomePage's USER half — AFTER the
  * `profile.kind === "missing"` 404 arm, BESIDE the `tab=activity` arm (and
- * the stars sibling's `tab=stars` arm when that folds first), BEFORE the
+ * the stars sibling's `tab=stars` arm), BEFORE the
  * default loadUserProfileData fall-through:
  *
  * ```ts
@@ -134,12 +133,12 @@
  * ```
  *
  * (`doer` is ownerHomePage's existing ProfileDoer — the loader resolves the
- * doer's login itself; no richer doer needed.) Strip-anchor diffs — the
- * exact watching anchor for the three family strips (compose with the stars
- * sibling's Stars anchor: header.tmpl renders watching INSTEAD of stars
+ * doer's login itself; no richer doer needed.) Strip-anchor diffs — LANDED
+ * in all three family strips (compose with the stars sibling's Stars anchor:
+ * header.tmpl renders watching INSTEAD of stars
  * under DisableStars, so the landed strips show both and document the
- * collapsed-if; place watching AFTER stars — the pragmatic order). Each
- * diff adds ONE inactive item (the watching page renders its own strip with
+ * collapsed-if; watching placed AFTER stars — the pragmatic order). Each
+ * added ONE inactive item (the watching page renders its own strip with
  * the item ACTIVE):
  *
  * ```tsx
@@ -156,7 +155,7 @@
  *   object gains `watched`).
  * - pages/user-follow-tabs.tsx OverviewTabs (the same anchor — its local
  *   strip; import EyeIcon from this module).
- * - Tooling (optional, one line): add `'octicon-eye',` to ALLOWLIST in
+ * - STILL PENDING (tooling, one line): add `'octicon-eye',` to ALLOWLIST in
  *   scripts/gen-ui-icons.mjs, run `pnpm gen:icons`, then swap this module's
  *   EyeIcon embeds for `<Icon name="octicon-eye">`.
  *
@@ -229,7 +228,7 @@ export interface UserWatchingTabData {
  * (scripts/gen-ui-icons.mjs), so the module embeds the exact `<path d>`
  * bytes inline (the repo-blob-excerpt-fragment.tsx FOLD_SVG precedent): the
  * upstream `{{svg "octicon-eye"}}` DOM (viewBox 0 0 16 16, the
- * `svg octicon-eye` class, aria-hidden). The HANDOFF NOTE carries the
+ * `svg octicon-eye` class, aria-hidden). The mount record keeps the
  * one-line allowlist migration.
  */
 const EYE_SVG_PATH =

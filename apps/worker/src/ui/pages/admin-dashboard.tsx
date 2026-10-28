@@ -1,7 +1,7 @@
 /**
- * The ADMIN DASHBOARD page — `/-/admin` — the bench-row UNMOUNTED module
- * (TWO-STAGE: this file ships the module only; `index.ts` is orchestrator-held,
- * so the routes ride the next window — the HANDOFF NOTE at the bottom of this
+ * The ADMIN DASHBOARD page — `/-/admin` — the bench-row module (MOUNTED at
+ * e31c0cf, window-2c: the routes live in `index.ts` beside the admin gate —
+ * the retired wiring HANDOFF is the mount record at the bottom of this
  * header). Sibling scope: `admin-monitor.tsx` (wave 61) owns the
  * `/-/admin/monitor/*` pages and "none of the dashboard/users/repos pages" —
  * this module is the dashboard half of the `/-/admin` family, the parity
@@ -103,10 +103,9 @@
  * posture paragraph. The flash banner is the no-JS POST answer (the
  * monitor cron page's convention; upstream redirects with a flash).
  *
- * ## HANDOFF NOTE (the routes — this module has NO route)
+ * ## Mount record (MOUNTED at e31c0cf — the routes are live)
  *
- * Route table (`index.ts` — orchestrator-held), shaped like the monitor
- * cron pair:
+ * Route table (`index.ts`), shaped like the monitor cron pair:
  *
  *   GET /-/admin   the admin gate (session resolveUiSession → non-admin 404
  *                  shell, anonymous → the login 303 — web.go:779's posture)

@@ -59,18 +59,19 @@
  * hash: lowercase hex SHA-1 of the file path (upstream test vector
  * utils_test.go:14-17). Ours is async — WebCrypto is the Workers SHA-1.
  *
- * STAGE HANDOFF (wave-45 scope): this module is the MACHINERY stage of the
- * `/blob_excerpt/{sha}` skip (wave-39 cite, index.ts:4525 area). Stage 3 —
- * the `repo/diff/blob_excerpt` HTML fragment and its
- * `/{owner}/{repo}/(wiki/)blob_excerpt/{sha}` route — rides a LATER wave:
- * src/ui/index.ts is sibling-owned (repo-projects). That wave needs exactly
- * what is exported here: `buildBlobExcerptSection` for the row window,
+ * STAGE RECORD (MOUNTED at 67adfb7 — this module was the MACHINERY stage of
+ * the `/blob_excerpt/{sha}` skip; stage 3 LANDED: the
+ * `repo/diff/blob_excerpt` HTML fragment and its
+ * `/{owner}/{repo}/(wiki/)blob_excerpt/{sha}` routes live in
+ * src/ui (pages/repo-blob-excerpt-fragment.tsx + ui/index.ts, the wiki twin
+ * included). That stage consumed exactly what this module exports:
+ * `buildBlobExcerptSection` for the row window,
  * `getExpandDirection` + `blobExcerptQuery` for the next expander button
  * (upstream RenderBlobExcerptButtons, gitdiff.go:232-265, which also builds
- * the `diff-<hash>K<rightIdx>` anchor — left to the HTML wave with
- * `hashFilePathForWebUI`), and `fillHiddenCommentIds` once code comments
- * land. Highlighting (chroma over `highlightSource`) is also stage 3; this
- * module only bounds and carries the source bytes, matching
+ * the `diff-<hash>K<rightIdx>` anchor — with `hashFilePathForWebUI`), and
+ * `fillHiddenCommentIds` once code comments land. Highlighting (chroma over
+ * `highlightSource`) is consumed only through the machinery's span slices —
+ * this module still only bounds and carries the source bytes, matching
  * fillExcerptLines' buf contract.
  *
  * Divergences (documented per AGENTS.md): (1) strings arrive as UTF-8 and

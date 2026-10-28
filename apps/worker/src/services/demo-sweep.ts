@@ -32,25 +32,16 @@
  * flip-off must not strand already-enqueued sweep work — the §2 invariant is
  * about scheduling, which only the producer does.
  *
- * ## HANDOFF NOTE (SPEC-0014 §3.1 — src/index.ts is orchestrator-owned, so
- * this module ships the complete scheduled dispatcher instead):
+ * ## Mount record (MOUNTED at 15e2b62 — the wiring HANDOFF is retired)
  *
- *   1. src/index.ts gains:
- *        import { handleScheduledCron } from "./services/demo-sweep";
- *   2. The inline `scheduled` body (index.ts's `await enqueueDueMirrorSyncs
- *      (env, {})` + `await enqueueDuePushMirrorSyncs(env, {})`) is replaced
- *      with a single delegation:
- *        async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
- *          await handleScheduledCron(controller, env);
- *        },
- *   The dispatcher reproduces today's behavior on every non-hourly entry —
- *   the mirror producers run unconditionally, exactly as the current inline
- *   body does — and runs ONLY the (self-gated) demo producer on the hourly
- *   "0 * * * *" entry. The hourly entry is already in both wrangler configs
- *   (landed with this module), so wiring is the only remaining step.
- *   Tests exercise `handleScheduledCron` / `enqueueDueDemoSweeps` / the
- *   purge.ts consumer arm directly with fabricated ScheduledControllers —
- *   the delegation itself is one await.
+ * index.ts's `scheduled` handler is the single delegation
+ * `await handleScheduledCron(controller, env)`. The dispatcher
+ * reproduces the pre-M1 inline behavior on every non-hourly entry — the
+ * mirror producers run unconditionally — and runs ONLY the (self-gated)
+ * demo producer on the hourly "0 * * * *" entry (carried by
+ * wrangler.jsonc.example). Tests exercise `handleScheduledCron` /
+ * `enqueueDueDemoSweeps` / the purge.ts consumer arm directly with
+ * fabricated ScheduledControllers — the delegation itself is one await.
  */
 
 import { asc, eq, isNull, lt, or, and } from "drizzle-orm";
@@ -244,7 +235,7 @@ export async function enqueueDueDemoSweeps(
 }
 
 // ---------------------------------------------------------------------------
-// The scheduled dispatch (§3.1) — see the HANDOFF NOTE in the module header
+// The scheduled dispatch (§3.1) — see the mount record in the module header
 // ---------------------------------------------------------------------------
 
 /**

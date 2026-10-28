@@ -1,9 +1,9 @@
 /**
  * The ADMIN REPOSITORIES list page — `/-/admin/repos` — the wave-admin-pages
  * bench row (the parity survey row docs/compat/ui-parity-survey.md:549's
- * repos remainder), TWO-STAGE UNMOUNTED: this file ships the module only;
- * `index.ts` is orchestrator-held, so the route rides the next window — the
- * HANDOFF NOTE at the bottom. Sibling scope: `admin-users.tsx` (this wave)
+ * repos remainder), MOUNTED at 2f7afe9 (the mount window): the route lives
+ * in `index.ts`'s admin literal family block — the retired wiring HANDOFF is
+ * the mount record at the bottom. Sibling scope: `admin-users.tsx` (this wave)
  * hosts the shared family chrome and owns the users list; `admin-orgs.tsx`
  * owns the orgs list; the landed dashboard/monitor family owns `/-/admin`
  * and `/-/admin/monitor/*` — none of those files is touched here.
@@ -107,18 +107,18 @@
  * ladder, never a leak). This is the searchExploreRepos reuse shape
  * (services/search.ts:101-131) with upstream's admin option set.
  *
- * ## HANDOFF NOTE (the route — this module has NO route)
+ * ## Mount record (MOUNTED at 2f7afe9 — the route is live)
  *
- * See admin-users.tsx's handoff for the shared recipe; this page's claim in
- * the landed admin literal family block (ui/index.ts:2562-2572):
+ * See admin-users.tsx's mount record for the shared recipe; this page's claim in
+ * the landed admin literal family block:
  *
- *   `if (tail.length === 1 && tail[0] === "repos") return { family:
- *    "admin-repos" };` — static literal BEFORE any dynamic arm; the handler
+ *   `tail.length === 1 && tail[0] === "repos"` returns `{ family:
+ *    "admin-repos" }` — static literal BEFORE any dynamic arm; the handler
  *   is adminPagePrologue(c) → loadAdminReposData(c.env.DB, p.ctx.viewer,
  *   searchParams) → renderAdminReposPage(p.ctx, data) at 200.
  *
  * The AdminFamilyNav import marks this page's item active via
- * `active="repos"`. Survey row to flip on landing:
+ * `active="repos"`. Survey row flipped on landing:
  * docs/compat/ui-parity-survey.md:549.
  */
 

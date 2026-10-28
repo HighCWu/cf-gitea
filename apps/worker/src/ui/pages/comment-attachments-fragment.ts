@@ -57,31 +57,21 @@
  * byte-identical: the attachments-twin re-declaration convention
  * (issue-content-fragments.ts:54-56).
  *
- * ## The mount recipe (HANDOFF — this module is UNMOUNTED, index-owned)
+ * ## Mount record (MOUNTED at fa4fd0d — the wiring HANDOFF is retired)
  *
- * The repo tail parse owns the claim (ui/index.ts's repo dispatcher, where
- * the `activity_author_data` aux heads live): the `comments` head is
- * currently UNCLAIMED (the only landed `comments` arm is the issue-level
- * comment-write POST under `{type}/{index}`, index.ts:3166 — a different
- * namespace), so `GET …/comments/{anything}` hits the engine's 404 until
- * the mount lands.
- *
- * - `head === "comments" && rest.length === 2 && rest[1] ===
- *   "attachments"` → extend the `IssueAuxRoute` family union with
- *   `"comment-attachments"` (the raw id rides the union's `segment`
- *   field), resolve the dispatcher's `RepoRow`, then
- *   `loadCommentAttachmentsFragment(d1, repoRow, segment)` +
- *   `commentAttachmentsFragmentResponse(origin, outcome,
- *   renderNotFound(ctx))`.
- *   GET only; every other method stays unclaimed (upstream registers GET
- *   only — a POST hits chi's 405 there and the engine's 404 here).
- * - Group gates ride the mount (the aux convention): `optSignIn` → the
- *   mount's anonymous-allowed visibility grant (resolveUiRequest's),
- *   `reqRepoIssuesOrPullsReader` → no landed unit-toggle consumer (the
- *   family note above), `RepoAssignment` → the resolved `RepoRow`.
- * - The id parse rides the loader (`pathParamInt64`, the landed
- *   PathParamInt64 port — garbage → 0 → guaranteed miss), so the mount
- *   passes the RAW segment; do not pre-parse.
+ * The repo tail parse claims `head === "comments" && rest.length === 2 &&
+ * rest[1] === "attachments"` as the `IssueAuxRoute` family's
+ * `"comment-attachments"` (the raw id rides the union's `segment` field);
+ * the dispatcher resolves the `RepoRow` and drives
+ * `loadCommentAttachmentsFragment(d1, repoRow, segment)` +
+ * `commentAttachmentsFragmentResponse(origin, outcome, renderNotFound(ctx))`.
+ * GET only — every other method stays unclaimed (upstream registers GET
+ * only — a POST hits chi's 405 there and the engine's 404 here). The group
+ * gates ride the mount (the aux convention): the anonymous-allowed
+ * visibility grant, no landed unit-toggle consumer, the resolved `RepoRow`.
+ * The id parse rides the loader (`pathParamInt64`, the landed
+ * PathParamInt64 port — garbage → 0 → guaranteed miss), so the mount
+ * passes the RAW segment; never pre-parsed.
  */
 
 import { asc, eq } from "drizzle-orm";

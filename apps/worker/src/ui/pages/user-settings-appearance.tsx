@@ -1,7 +1,7 @@
 /**
  * The user settings APPEARANCE tab, `/user/settings/appearance` — pages wave
- * 57 (bench row `wave-user-appearance-module`, TWO-STAGE UNMOUNTED — the
- * route rides the index.ts window; `index.ts` is orchestrator/sibling-owned).
+ * 57 (bench row `wave-user-appearance-module`, MOUNTED at 0c2b151 — the
+ * route lives in `index.ts`).
  *
  * PREMISE VERIFIED: `templates/user/settings/appearance.tmpl` exists at the
  * pin (fc49368, 2026-10-24) and renders THREE forms — the theme select
@@ -11,7 +11,7 @@
  * (Appearance :328, UpdateUIThemePost :349, UpdateUserLang :379,
  * UpdateUserHiddenComments :409 — there is no appearance.go at the pin).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 0c2b151 — the wiring HANDOFF is retired)
  *
  * Upstream's route group is web.go:646-651 (inside the reqSignIn
  * `/user/settings` group). The theme + language arms mount; the
@@ -90,7 +90,7 @@
  * ## Documented reductions (§6 method — never dead controls)
  *
  * - The hidden-comment-types section (appearance.tmpl:62-160) is UNRENDERED:
- *   no landed store (the HANDOFF's hidden_comments arm). Upstream's 14
+ *   no landed store (the mount record's hidden_comments arm). Upstream's 14
  *   checkbox groups (reference/label/milestone/assignee/title/branch/
  *   time_tracking/deadline/dependency/lock/review_request/pull_request_push/
  *   project/issue_ref → the big.Int bitset, forms/user_form_hidden_comments.go)
@@ -415,7 +415,7 @@ export function UserSettingsAppearancePage(props: { ctx: UiContext; data: UserSe
               </form>
             </div>
             {/* ----------------------- Hidden comment types (appearance.tmpl:62-160): UNRENDERED
-                — no landed store (the header's reductions + the HANDOFF's
+                — no landed store (the header's reductions + the mount record's
                 hidden_comments arm). */}
           </div>
         </div>

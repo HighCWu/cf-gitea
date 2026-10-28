@@ -1,8 +1,8 @@
 /**
  * The user settings NOTIFICATIONS tab, `/user/settings/notifications` — the
- * preference-matrix wave (bench row `wave-settings-notifications`, TWO-STAGE
- * UNMOUNTED — the route rides the index.ts window; `index.ts` is
- * orchestrator/sibling-owned). specs/user-notification-settings.md is this
+ * preference-matrix wave (bench row `wave-settings-notifications`, MOUNTED
+ * at 2f7afe9 — the routes live in `index.ts`).
+ * specs/user-notification-settings.md is this
  * module's SPEC.
  *
  * PREMISE VERIFIED: at the pin (fc49368, 2026-10-24) the routes are
@@ -22,9 +22,10 @@
  * two new columns (migration 0034) behind
  * api/services/user-notification-prefs.ts — the SPEC §4 rationale.
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 2f7afe9 — the wiring HANDOFF is retired)
  *
- * Three diffs, all in shared files this wave does not own:
+ * The three diffs below — all in shared files the module wave did not own —
+ * are LANDED as written:
  *
  *   1. ui/index.ts — the route recipes (the userSettingsTabPrologue pair,
  *      the appearance handlers' exact shape — GET without the origin

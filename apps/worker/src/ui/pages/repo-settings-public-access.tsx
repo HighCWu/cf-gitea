@@ -1,8 +1,9 @@
 /**
  * The repo settings PUBLIC ACCESS tab, `/{owner}/{repo}/settings/public_access`
  * — pages wave 77 (M-tier remainder row, PORT-FIRST; bench row
- * `wave-public-access`, TWO-STAGE UNMOUNTED — the route rides the index.ts
- * window; `index.ts` is orchestrator/sibling-owned).
+ * `wave-public-access`, MOUNTED at b54f709, window-2d — the route lives in
+ * `index.ts`; the retired wiring HANDOFF is the mount record at the bottom
+ * of this file).
  *
  * ## Premises verified at the pin (gitea @ fc4936884584-class pin)
  *
@@ -308,12 +309,13 @@ export function RepoPublicAccessPage(props: { ctx: UiContext; data: RepoPublicAc
 }
 
 // ---------------------------------------------------------------------------
-// HANDOFF NOTE (for the `index.ts` window owner — this module has NO route)
+// MOUNT RECORD (MOUNTED at b54f709, window-2d — the wiring HANDOFF, kept as
+// the landed-shape record)
 // ---------------------------------------------------------------------------
 //
 // Upstream group (web.go:1191, inside the reqRepoAdmin-wrapped settings
-// subtree at web.go:1285-1287). Mount two routes over the shared settingsGate
-// (index.ts `settingsGate` — anonymous 303s onto the login round-trip, a
+// subtree at web.go:1285-1287). Two routes mounted over the shared settingsGate
+// (anonymous 303s onto the login round-trip, a
 // signed-in non-admin 404-shells; the same posture as every settings
 // sub-page, settingsPage/settingsSubmit's exact shape):
 //
@@ -329,7 +331,7 @@ export function RepoPublicAccessPage(props: { ctx: UiContext; data: RepoPublicAc
 //         update_settings_success does not render — the no-session-flash
 //         convention; the re-render's moved radio IS the acknowledgment).
 //
-// Router claims (parseUiRoute, the `head === "settings"` block): add
+// Router claims (parseUiRoute, the `head === "settings"` block):
 //   `rest.length === 1 && rest[0] === "public_access"` → family
 //   `settings-public-access` (the GET page + the POST share the Combo("")
 //   shape). No collisions: the static literal is disjoint from
@@ -343,7 +345,7 @@ export function RepoPublicAccessPage(props: { ctx: UiContext; data: RepoPublicAc
 // `hasAnyPublicAccess` grant passed by this page; callers not passing the
 // repo row render the reduced nav without the item); PublicAccessSettingsNav
 // is deleted and the page renders `SettingsNav` with `active="public_access"`.
-// Survey rows to touch on landing:
+// Survey rows touched on landing:
 // docs/compat/ui-parity-survey.md — the repo-settings family's
 // public-access row (mark `/settings/public_access` rendered; NOTE the
 // survey's "collaborator/team access graph" guess was wrong — the page is

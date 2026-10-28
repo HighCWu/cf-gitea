@@ -1,16 +1,19 @@
 /**
  * The file-editor TAIL pages — the two `templates/repo/editor/` confirm pages
- * the landed wave-8 editor did not port 1:1 — as UNMOUNTED bench modules
- * (pages wave 55; `index.ts` is orchestrator/sibling-owned):
+ * the landed wave-8 editor did not port 1:1 (pages wave 55; MOUNTED at
+ * 1d834d6, window-2e C2b — the routes live in `index.ts`; the retired
+ * wiring HANDOFF is the mount record below):
  *
  *   GET+POST /{owner}/{repo}/delete/{branch}/{path}   the DELETE-file confirm
  *                                                     (delete.tmpl — the
  *                                                     faithful DOM over the
  *                                                     LANDED delete arm)
  *   GET+POST /{owner}/{repo}/upload/{branch}[/{dir}]  the UPLOAD confirm
- *                                                     (upload.tmpl — DOM
- *                                                     ported, the write is
- *                                                     DOCUMENTED-UNRENDERED)
+ *                                                     (upload.tmpl — the
+ *                                                     write rides the
+ *                                                     LANDED staging
+ *                                                     family,
+ *                                                     services/upload-staging.ts)
  *
  * One module because the two tails share everything but the read/write: the
  * same commit_form reduction (the wave-8 family's target-branch select), the
@@ -19,41 +22,25 @@
  * leading underscore (`_delete`/`_upload`, web.go:1459-1464); the family's
  * brief pins the bare names (pages/file-editor.tsx header).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 1d834d6 — the wiring HANDOFF is retired)
  *
- * - DELETE — mount-ready NOW, and it is a strict DOM upgrade, not a behavior
- *   change: the landed route family (`file-delete`, index.ts) already parses
- *   and the write is the landed `commitFileFromForm` (pages/file-editor.tsx)
- *   over `applyFileChanges`. To serve this faithful delete.tmpl DOM instead
- *   of the reduced one, branch `fileEditorPage`/`fileEditorSubmit` on
+ * - DELETE — the dispatcher branches `fileEditorPage`/`fileEditorSubmit` on
  *   `mode === "delete"` → `renderEditorDeletePage({ ctx, data, form, error })`
  *   — the SAME `loadFileEditorData(engine, repo, "delete", route.refSuffix,
  *   null)` data (type-shared) and the SAME `readEditorForm` values: this
  *   form posts exactly the landed field set (`tree_path`, `commit_summary`,
- *   `commit_message`, `branch`, `blob_sha`). Keeping the reduction and using
- *   this module as the parity reference is equally fine — one `if`, either
- *   way.
- * - UPLOAD — the DOM is complete, the WRITE FAMILY DOES NOT EXIST YET (the
- *   form's action 404-shells today; documented-unrendered per the brief).
- *   Three pieces are missing, in dependency order:
- *     1. a repo upload STAGING store — upstream's `upload` table + NewUpload
- *        (models/repo/upload.go:59-) with R2-backed uuid-keyed blobs (NOT the
- *        issue-attachments table — a separate upstream model),
- *     2. the dropzone endpoints POST /{owner}/{repo}/upload-file and POST
- *        /{owner}/{repo}/upload-remove (editor_uploader.go:18-63: multipart
- *        `file` part, `upload.Verify` against setting.Repository.Upload.
- *        AllowedTypes, CleanGitTreePath on the name → JSON {"uuid"}; remove
- *        takes `file` = uuid → 204),
- *     3. the commit arm — `applyFileChanges` has NO upload operation; port
- *        files_service.UploadRepoFiles (editor.go:468-478): resolve each
- *        staged uuid under `tree_path`, ONE create-op commit, the default
- *        message `uploadFilesToDirMessage(treePath)` through the standard
- *        summary/body assembly.
- *   `parseUploadForm` (below) is already the POST body seam for that wave.
- *   The route arms would be the editor Combos' last member: web.go:1462-1464
- *   (`Combo("/{editor_action:_upload}/*", MustBeAbleToUpload)` — the upload
- *   setting gate; the landed family has no per-repo upload toggle yet, gate
- *   with the standard canWriteRepo).
+ *   `commit_message`, `branch`, `blob_sha`); the write stays the landed
+ *   `commitFileFromForm` (pages/file-editor.tsx) over `applyFileChanges`.
+ * - UPLOAD — all three pieces LANDED (services/upload-staging.ts): the R2-
+ *   backed uuid staging store, the dropzone endpoints
+ *   POST /{owner}/{repo}/upload-file and POST /{owner}/{repo}/upload-remove,
+ *   and the commit arm `commitUploadFromForm` over `uploadRepoFiles`
+ *   (files_service.UploadRepoFiles editor.go:468-478's port — staged uuids
+ *   resolved under `tree_path`, ONE create-op commit,
+ *   `uploadFilesToDirMessage(treePath)` as the default message). The route
+ *   arms are the editor Combos' last member (web.go:1462-1464's
+ *   `{editor_action:_upload}/*` shape), gated by the editor family's
+ *   shared `fileEditorGate` (no landed per-repo upload toggle).
  *
  * ## DOM contract — DELETE (templates/repo/editor/delete.tmpl at the pin)
  *
@@ -264,8 +251,9 @@ export function uploadFormFromData(data: EditorUploadData): EditorUploadFormValu
 }
 
 /** Parse the urlencoded POST (`tree_path`, `files` (multi), `commit_summary`,
- *  `commit_message`, `branch` — the wiring wave calls this on
- *  readUrlEncodedForm's result; no write exists yet, the HANDOFF NOTE). */
+ *  `commit_message`, `branch` — the dispatcher calls this on
+ *  readUrlEncodedForm's result; the mounted write is the staging family's
+ *  `commitUploadFromForm`, the mount record). */
 export function parseUploadForm(params: URLSearchParams): EditorUploadFormValues {
   return {
     treePath: params.get("tree_path") ?? "",
@@ -363,7 +351,8 @@ function DeleteBreadcrumb(props: { repoSlug: string; branchHref: string; treePat
 
 /** The full-document DELETE confirm render. `data`/`form` are the FAMILY
  *  types (loadFileEditorData("delete") / EditorFormValues / readEditorForm) —
- *  the wiring wave swaps only this render (HANDOFF NOTE). */
+ *  the dispatcher swapped in this render (MOUNTED at 1d834d6, the mount
+ *  record). */
 export function renderEditorDeletePage(options: {
   ctx: UiContext;
   data: FileEditorData;
@@ -503,8 +492,9 @@ function UploadDropzone(props: { repoLink: string }) {
   );
 }
 
-/** The full-document UPLOAD confirm render (bench-only until the staging
- *  family lands — HANDOFF NOTE; the action 404-shells today). */
+/** The full-document UPLOAD confirm render (the staging family LANDED —
+ *  MOUNTED at 1d834d6, the mount record; the POST writes through
+ *  `commitUploadFromForm`). */
 export function renderEditorUploadPage(options: {
   ctx: UiContext;
   data: EditorUploadData;

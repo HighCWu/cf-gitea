@@ -1,8 +1,8 @@
 /**
- * The org settings BLOCKED USERS tab — the bench-row UNMOUNTED module
- * (wave 57, TWO-STAGE: this file ships the module only; `index.ts` AND
- * `org-settings.tsx` are sibling-held, so the route and the navbar item ride
- * the next window — the HANDOFF NOTE at the bottom of this header).
+ * The org settings BLOCKED USERS tab — the bench-row module
+ * (wave 57; MOUNTED at 4f2805f, window-2b: the route lives in `index.ts`
+ * and the navbar item in the shared components/settings-nav — the retired
+ * wiring HANDOFF is the mount record at the bottom of this header).
  *
  * ## Upstream surface (at the pin)
  *
@@ -96,7 +96,8 @@
  *   upstream's binding-failure funnel) parses to the invalid outcome
  *   carrying the honest-absence note; neither is ever emitted by this DOM.
  *
- * ## HANDOFF NOTE (the tab seam + the route — this module has NO route)
+ * ## Mount record (MOUNTED at 4f2805f, window-2b — the wiring HANDOFF is
+ * retired)
  *
  * The settings navbar is the SHARED components/settings-nav
  * OrgSettingsNavbar (the wave-114 swap — this module's mount-scaffolding
@@ -105,12 +106,10 @@
  * page Title (org/block.go:19 sets `ctx.Data["Title"]` to the same key) AND
  * the list header.
  *
- * Route table (`index.ts` — sibling-held): claim `raw[3] ===
- * "blocked_users"` in the settings family's `raw.length === 4` branch as
- * `{ family: "org-settings-blocked", owner }` (ui/index.ts:2176's
- * neighborhood; the family comment there lists blocked_users among the
- * unclaimed tabs), add the family to the union, then two handlers shaped
- * exactly like the wave-53 hooks pair (ui/index.ts:4331-4374):
+ * Route table (`index.ts`): `raw[3] ===
+ * "blocked_users"` claimed in the settings family's `raw.length === 4` branch as
+ * `{ family: "org-settings-blocked", owner }`; the two handlers are shaped
+ * exactly like the wave-53 hooks pair:
  *
  *   GET  /{org}/settings/blocked_users   resolveOrgTeamsRequest →
  *                                        loadOrgBlockedUsers →
@@ -128,7 +127,7 @@
  *
  * The prologue carries the whole posture (anonymous 303 onto the login
  * round-trip, a signed-in non-owner 404-shells, a renamed org 307s) — the
- * handlers add nothing of their own. Survey row to touch on landing:
+ * handlers add nothing of their own. Survey row touched on landing:
  * docs/compat/ui-parity-survey.md:416 lists the blocked_users tail among
  * the "no landed org-scope reads" remainders — stale since inventory batch
  * 9 landed `organizationListBlocks` (routes/blocks.ts:178-193).

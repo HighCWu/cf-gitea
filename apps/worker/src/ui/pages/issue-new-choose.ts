@@ -61,7 +61,7 @@
  * Until then the repo-projects module's note (repo-projects.tsx:92) that
  * the `?project={id}` chooser anchor is unlanded stays accurate.
  *
- * ## Auth + visibility posture (the HANDOFF handler's contract)
+ * ## Auth + visibility posture (the mounted handler's contract)
  *
  * Upstream's `reqUnitIssuesReader` is a unit READER check, so an anonymous
  * viewer of a VISIBLE repo reaches the handler and gets the 303 — the
@@ -75,43 +75,15 @@
  * for anonymous readers — the landed divergence documented in
  * pages/new-issue.tsx, not this module's to change).
  *
- * ## HANDOFF NOTE (for the wiring window — ui/index.ts is not this
- *    module's file; the recipe is exact)
+ * ## Mount record (MOUNTED at fa4fd0d — the wiring HANDOFF is retired)
  *
- * The route tail is UNCLAIMED today: `parseUiRoute` has no arm under
- * `head === "issues"` for `rest = ["new", "choose"]`, and src/index.ts
- * consults `handlesUiRoute` BEFORE Hono, so the live dispatcher hands the
- * URL to the engine's 404. Mounting needs three index.ts edits plus the
- * pin flip:
- *
- *   1. `UiFamily` union (beside `"issue-new"`, ui/index.ts:1488): add
- *      `"issue-new-choose"`.
- *   2. `parseUiRoute`, inside the `if (head === "issues" || head ===
- *      "pulls")` block (ui/index.ts:3136), beside the wave-4 literal:
- *      `if (head === "issues" && rest.length === 2 && rest[0] === "new" &&
- *      rest[1] === "choose") return { family: "issue-new-choose", owner,
- *      repo };` — the length guard keeps the bare `/issues/new` literal
- *      and the integer detail tails unaffected.
- *   3. The handler beside `issueNewPage` (ui/index.ts:4091) — the ladder
- *      then the seam, nothing else:
- *      ```ts
- *      async function issueNewChoosePage(c: Context<{ Bindings: Env }>): Promise<Response> {
- *        const resolved = await resolveUiRequest(c);
- *        if (!resolved.ok) return resolved.response;
- *        const { repo, url, respond } = resolved;
- *        return respond(issueNewChooseRedirect(repo, url));
- *      }
- *      ```
- *   4. Registration beside the issue-new lines (ui/index.ts:10197):
- *      `uiRouter.get("/:owner/:repo/issues/new/choose", (c) =>
- *      issueNewChoosePage(c));`
- *   5. Flip this module's test pins (issue-new-choose.test.ts, the "claim
- *      state" describe): `parseUiRoute` → the family object above,
- *      `handlesUiRoute` → true; then mount the route-level matrix (the
- *      visibility ladder over the REAL dispatcher: anonymous public repo →
- *      303 with the query round-trip; anonymous or stranger at a private
- *      repo → the 404 shell; the sibling literals stay un-overclaimed).
- *      Also revisit repo-projects.tsx:92's unlanded-chooser note.
+ * The route is live exactly per the recipe: the `UiFamily` union carries
+ * `"issue-new-choose"` beside `"issue-new"`; `parseUiRoute` claims
+ * `head === "issues" && rest = ["new", "choose"]` beside the wave-4
+ * literal (the length guard keeps the bare `/issues/new` literal and the
+ * integer detail tails unaffected); the handler is the ladder then the
+ * seam — `resolveUiRequest` → `issueNewChooseRedirect(repo, url)` —
+ * registered as `uiRouter.get("/:owner/:repo/issues/new/choose", …)`.
  *
  * The seam is the entire module: one pure function, no D1, no render, no
  * hono import — the redirect decision upstream makes after an empty

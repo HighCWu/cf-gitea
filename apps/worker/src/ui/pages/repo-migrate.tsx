@@ -1,7 +1,7 @@
 /**
  * The repository-migration page, `/repo/migrate` — the M-bench migrate row
- * (UNMOUNTED two-stage wave: module + colocated tests only; the route rides a
- * later index.ts window — the HANDOFF below is the interface). Upstream
+ * (MOUNTED at 62ef380, window-2e C3a — the route lives in `index.ts`; the
+ * retired wiring HANDOFF is the mount record below). Upstream
  * `repo.Migrate` / `repo.MigratePost` (routers/web/repo/migrate.go:38-66,
  * 134-225) over `templates/repo/migrate/git.tmpl` at the pin — the service
  * "Git" VARIANT, because the landed migrate surface accepts `service` unset
@@ -133,8 +133,7 @@
  * (routes/mirror.ts — the ONE birth emission; services/migrate.ts is silent
  * by design), Sender the migrating doer, through the shared repo-events seam.
  *
- * ## HANDOFF — the route (a later index.ts window; this wave is
- * index.ts-sibling-held)
+ * ## Mount record (MOUNTED at 62ef380 — the wiring HANDOFF is retired)
  *
  * The route arm maps onto this module as: the parser family `repo-migrate` —
  * the exact literal `raw.length === 3 && raw[1] === "repo" && raw[2] ===
@@ -142,7 +141,7 @@
  * posture: upstream's /repo group registers ahead of the dynamic pairs,
  * web.go:1100-1101, so a repository named "migrate" under an owner named
  * "repo" is shadowed identically) — holding `{ family: "repo-migrate" }`.
- * The handler pair then:
+ * The handler pair:
  *
  * 1. GET: `resolveUiSession` → anonymous = `loginRedirect(url.pathname)`;
  *    `loadRepoMigrateData` null = the 404 shell; `?org=` preselects an

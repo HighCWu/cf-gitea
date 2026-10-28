@@ -1,8 +1,9 @@
 /**
- * The repository WIKI family — all five `templates/repo/wiki/` pages as the
- * UNMOUNTED bench module (survey bench-row 8, the last M-tier surface;
- * pages wave 69 — `index.ts` is orchestrator/sibling-owned, this module
- * ships without a route). One module because the five pages share the same
+ * The repository WIKI family — all five `templates/repo/wiki/` pages as one
+ * bench module (survey bench-row 8, the last M-tier surface;
+ * pages wave 69; MOUNTED at 9516bf1, window-2e C2a — the routes live in
+ * `index.ts`, the retired wiring HANDOFF is the mount record below). One
+ * module because the five pages share the same
  * data spine: the sibling `owner/slug.wiki` engine cell through the LANDED
  * wiki service (src/services/wiki.ts — specs/wiki.md) and one route grammar.
  *
@@ -60,12 +61,13 @@
  * 340, 400); a whole-absent wiki renders tplWikiStart (wiki.go:471-475) or
  * redirects to P/wiki (WikiPages wiki.go:537-540, EditWiki wiki.go:692-695).
  *
- * ## HANDOFF NOTE (mount recipe for the index.ts window owner)
+ * ## Mount record (MOUNTED at 9516bf1, window-2e C2a — the wiring HANDOFF
+ * is retired)
  *
  * The mounts ride the standard repo prologue (`resolveUiRequest` — D1 row +
  * viewer) plus the landed wiki gates: `loadRepoSettings(d1, repo.id).hasWiki`
  * 404-shells a disabled wiki (MustEnableWiki, web.go:1614 — the landed
- * blob-excerpt wiki twin's exact posture, index.ts:5439-5442), reads need no
+ * blob-excerpt wiki twin's exact posture), reads need no
  * further gate (reqUnitWikiReader reduces to repo visibility — already the
  * prologue's), writes add `canWriteRepo(env, repo, viewer)` (pages/
  * file-editor.tsx:180) + !repo.isArchived (RepoMustNotBeArchived) + the
@@ -113,8 +115,8 @@
  * the codec's `webPathFromRequest` re-encodes `/`→`%2F` itself
  * (services/wiki.ts:213), so the index.ts wildcard parser hands over
  * `route.rawTail` verbatim (the blob-excerpt twin's rawTail pattern).
- * Survey rows to touch on landing: docs/compat/ui-parity-survey.md row 8
- * (the repo-wiki family row) — page note "bench module landed, unmounted".
+ * Survey rows touched on landing: docs/compat/ui-parity-survey.md row 8
+ * (the repo-wiki family row).
  *
  * ## DOM contracts + documented reductions (per template at the pin)
  *
@@ -1050,7 +1052,7 @@ export function WikiRevisionPage(props: { ctx: UiContext; data: Extract<WikiRevi
 }
 
 // ---------------------------------------------------------------------------
-// Re-exports (the codec spell the mount wave needs at the POST arms)
+// Re-exports (the codec spell the dispatcher's POST arms use)
 // ---------------------------------------------------------------------------
 
 export { webPathFromRequest };

@@ -1,8 +1,7 @@
 /**
  * The user settings ACTIONS SECRETS tab, `/user/settings/actions/secrets` —
- * pages wave 56 (bench row `wave-settings-security-module`, TWO-STAGE
- * UNMOUNTED — the route rides the index.ts window; `index.ts` is
- * orchestrator/sibling-owned).
+ * pages wave 56 (bench row `wave-settings-security-module`, MOUNTED at
+ * 0c2b151 — the route lives in `index.ts`).
  *
  * Upstream pin: the user-scope arm of the shared settings-secrets family —
  * `user/settings/actions.tmpl` (PageType "secrets") including
@@ -13,7 +12,7 @@
  * (routers/web/shared/secrets/secrets.go), mounted at web.go:708-717's
  * `/actions` group inside the reqSignIn `/user/settings` group.
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 0c2b151 — the wiring HANDOFF is retired)
  *
  * Upstream's route group is web.go:498-503 shared across the three scopes;
  * the user scope mounts inside web.go:708-717. Three routes mount:

@@ -79,8 +79,9 @@
  *
  * This module holds the grammar, the resolver and the loader only; the route
  * lives in src/ui/index.ts beside its sibling dispatchers (the
- * resolveUiRequest session/repo prologue is index-owned). UNMOUNTED module —
- * the HANDOFF NOTE in the smoke test carries the mount recipe.
+ * resolveUiRequest session/repo prologue is index-owned). MOUNTED at
+ * 22599e4 (window-2e B2 — the `pull-commit-files` family; the retired
+ * wiring HANDOFF lives on in the smoke test as the recipe record).
  */
 
 import type { Context as ContextType } from "hono";

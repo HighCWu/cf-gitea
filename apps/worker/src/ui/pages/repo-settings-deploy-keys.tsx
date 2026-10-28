@@ -1,8 +1,9 @@
 /**
  * The repo settings DEPLOY KEYS tab, `/{owner}/{repo}/settings/keys` — pages
  * wave 71 (M-tier remainder row, PORT-FIRST; bench row
- * `wave-repo-deploy-keys-page`, TWO-STAGE UNMOUNTED — the route rides the
- * index.ts window; `index.ts` is orchestrator/sibling-owned).
+ * `wave-repo-deploy-keys-page`, MOUNTED at b54f709, window-2d — the route
+ * lives in `index.ts`; the retired wiring HANDOFF is the mount record at
+ * the bottom of this file).
  *
  * ## Premises verified at the pin (gitea @ fc4936884584-class pin)
  *
@@ -432,13 +433,14 @@ export function RepoDeployKeysPage(props: { ctx: UiContext; data: RepoDeployKeys
 }
 
 // ---------------------------------------------------------------------------
-// HANDOFF NOTE (for the `index.ts` window owner — this module has NO route)
+// MOUNT RECORD (MOUNTED at b54f709, window-2d — the wiring HANDOFF, kept as
+// the landed-shape record)
 // ---------------------------------------------------------------------------
 //
 // Upstream group (web.go:1241-1246, inside the reqRepoAdmin-wrapped settings
 // subtree at web.go:1285-1287; the token POSTs /generate-token and
-// /regenerate-token defer with the token arms). Mount three routes over the
-// shared settingsGate (index.ts:3238 — anonymous 303s onto the login
+// /regenerate-token defer with the token arms). Three routes mounted over the
+// shared settingsGate (anonymous 303s onto the login
 // round-trip, a signed-in non-admin 404-shells; the same posture as every
 // settings sub-page):
 //
@@ -463,8 +465,7 @@ export function RepoDeployKeysPage(props: { ctx: UiContext; data: RepoDeployKeys
 //          idempotent delete — a gone key leaves the caller with the state it
 //          asked for, deploy_key.go:80-87).
 //
-// Router claims (parseUiRoute, the `head === "settings"` block at
-// index.ts:2424): add
+// Router claims (parseUiRoute, the `head === "settings"` block):
 //   `rest.length === 1 && rest[0] === "keys"` → family `settings-keys` (the
 //   GET page + the POST add arm share the Combo("") shape), and
 //   `rest.length === 2 && rest[0] === "keys" && rest[1] === "delete"` →
@@ -479,7 +480,7 @@ export function RepoDeployKeysPage(props: { ctx: UiContext; data: RepoDeployKeys
 // `active` union carries "keys" and the Deploy Keys item sits in the upstream
 // code-unit block (Branches → Tags → Git Hooks → Keys, navbar.tmpl:32-34),
 // between Branches and Mirror; DeployKeysSettingsNav is deleted and the page
-// renders `SettingsNav` with `active="keys"`. Survey rows to touch on landing:
+// renders `SettingsNav` with `active="keys"`. Survey rows touched on landing:
 // docs/compat/ui-parity-survey.md — the repo-settings family's deploy-keys
 // row (mark `/settings/keys` rendered) and the navbar-reduction note (the
 // item exists upstream at navbar.tmpl:32-34, admin-gated like the group).

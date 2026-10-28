@@ -501,18 +501,11 @@ export function BaseLayout(props: {
               off (absent/false — every default deployment) this branch emits
               NOTHING: no node, no script, byte-identical pages (the goldens
               pin it).
-              HANDOFF NOTE (the assembler one-liner, orchestrator-owned —
-              landed unmounted per the two-phase discipline; first-run.ts's
-              mount-recipe precedent):
-                1. src/ui/index.ts `resolveUiSession` — add to the ctx
-                   literal:  demoMode: demoModeEnabled(c.env),
-                2. src/ui/session.ts pageContext (the /login render) — same
-                   key in the returned ctx literal,
-                3. src/ui/first-run.ts pageContext (/install, /user/sign_up)
-                   — same key in the returned ctx literal,
-              each importing `demoModeEnabled` from ../services/demo-sweep.
-              Until it lands the banner is test-covered but never armed —
-              exactly the M1 scheduled-dispatch staging. */}
+              MOUNTED at cada11c: the three ctx assemblers — ui/index.ts's
+              resolveUiSession, session.ts's pageContext (/login),
+              first-run.ts's pageContext (/install, /user/sign_up) — each
+              carry `demoMode: demoModeEnabled(c.env)` in their ctx
+              literal. */}
           {ctx.demoMode === true ? <DemoBanner /> : null}
           <div
             role="main"

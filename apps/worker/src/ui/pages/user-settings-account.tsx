@@ -1,8 +1,7 @@
 /**
  * The user settings ACCOUNT tab, `/user/settings/account` — the
  * user-settings family's credentials tab (bench row `wave-settings-account`,
- * TWO-STAGE UNMOUNTED — the routes ride the index.ts window; `index.ts` is
- * orchestrator/sibling-owned).
+ * MOUNTED at 2f7afe9 — the routes live in `index.ts`).
  *
  * Upstream pin: `routers/web/user/setting/account.go` over
  * `templates/user/settings/account.tmpl`, mounted at web.go:641-647's
@@ -17,7 +16,7 @@
  *                                            this tab owns it; verified: the
  *                                            security tab mounts no deletion)
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 2f7afe9 — the wiring HANDOFF is retired)
  *
  * Every arm (GET and POST) resolves the doer's users ROW through
  * `loadUserSettingsAccountPageData` — a `null` (the session doer has no D1
@@ -306,7 +305,7 @@ export function parseUserSettingsAccountEmailForm(params: URLSearchParams): User
   };
 }
 
-/** The email POST's outcomes — the HANDOFF's render map (the module header). */
+/** The email POST's outcomes — the mount record's render map (the module header). */
 export type EmailFormOutcome =
   | { outcome: "added" } // the add arm wrote a row → 303 (upstream Flash.Success + Redirect, account.go:170-176)
   | { outcome: "primary" } // the PRIMARY arm flipped users.email → 303 (upstream Redirect, account.go:76)
@@ -485,7 +484,7 @@ export function parseUserSettingsAccountDeleteForm(params: URLSearchParams): Use
   return { password: params.get("password") ?? "" };
 }
 
-/** The deletion POST's outcomes (the HANDOFF's render map). */
+/** The deletion POST's outcomes (the mount record's render map). */
 export type AccountDeleteOutcome = { outcome: "deleted" } | { outcome: "invalid"; message: string };
 
 /**

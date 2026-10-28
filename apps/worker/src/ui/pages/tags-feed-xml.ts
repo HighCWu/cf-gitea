@@ -1,8 +1,8 @@
 /**
  * The `/{owner}/{repo}/tags.rss` + `/{owner}/{repo}/tags.atom`
- * tags-feed envelopes — pages wave-tags-feeds (PORT-FIRST, UNMOUNTED —
- * `index.ts` is orchestrator/sibling-owned; the HANDOFF NOTE below carries
- * the mount recipe). Byte surfaces over the landed tags data (never a
+ * tags-feed envelopes — pages wave-tags-feeds (PORT-FIRST; MOUNTED at
+ * 2f7afe9 — the retired wiring HANDOFF is the mount record below). Byte
+ * surfaces over the landed tags data (never a
  * self-fetch): no JSX, the two XML documents are composed as strings with
  * the exact Go serializer semantics upstream ships — the gorilla v1.2.0
  * envelope helpers are imported VERBATIM from the landed twin
@@ -137,11 +137,11 @@
  *   page's dead-link rule picks upstream's OWN else-arm target. A
  *   release-backed row keeps `/releases/tag/{name}`.
  *
- * ## HANDOFF NOTE (for the wiring wave — the releases twin's recipe,
- *    index.ts is orchestrator/sibling-owned)
+ * ## Mount record (MOUNTED at 2f7afe9 — the wiring HANDOFF, kept as the
+ *    landed-shape record; the releases twin's recipe)
  *
- * 1. Route type (beside where the releases twin's `ReleasesFeedRoute`
- *    lands — its HANDOFF NOTE's step 1):
+ * 1. Route type (beside the releases twin's `ReleasesFeedRoute` — its
+ *    mount record's step 1):
  *
  *      /** The tags feed tails (pages/tags-feed-xml.ts): upstream
  *       *  web.go:1497-1498's `m.Get(".rss"/".atom", …, repo.TagsListFeed{RSS,Atom})`

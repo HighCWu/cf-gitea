@@ -1,7 +1,7 @@
 /**
  * The user settings WEBHOOKS tab, `/user/settings/hooks` — pages wave 57
- * (bench row `wave-user-webhooks-module`, TWO-STAGE UNMOUNTED — the route
- * rides the index.ts window; `index.ts` is orchestrator/sibling-owned).
+ * (bench row `wave-user-webhooks-module`, MOUNTED at 0c2b151 — the route
+ * lives in `index.ts`).
  *
  * ## PREMISE CORRECTED (the wiki-module's lesson, verified at the pin)
  *
@@ -44,7 +44,7 @@
  *   POST /user/settings/hooks/{type}/{id} → the per-provider edit writes
  *                                          (addWebhookEditRoutes)
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 0c2b151 — the wiring HANDOFF is retired)
  *
  * The module is complete end-to-end over the landed user-hooks family;
  * signed-in only (the reqSignIn group — the user-settings.tsx pattern):

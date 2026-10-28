@@ -1,7 +1,7 @@
 /**
  * The user settings REPOS tab — the LAST survey-(d) remainder (bench row
- * `wave-settings-repos`, UNMOUNTED — the route rides the index.ts window;
- * `index.ts` is orchestrator/sibling-owned): upstream
+ * `wave-settings-repos`, MOUNTED at 484eb92 — the route lives in
+ * `index.ts`): upstream
  * `templates/user/settings/repos.tmpl` at the pin, served by
  * `user_setting.Repos` (routers/web/user/setting/profile.go:222-325) behind
  * `m.Get("/repos", user_setting.Repos)` (web.go:734) inside the reqSignIn
@@ -97,81 +97,28 @@
  *   NOTHING — the degradation posture above; the
  *   octicon-file-directory-fill dir glyph belongs to that branch and is
  *   absent here.
- * - The nav is MOUNT SCAFFOLDING (the notifications-module precedent):
- *   the shared components/settings-nav UserSettingsNavbar markup with the
- *   Repos item appended after Organizations (upstream navbar.tmpl:73-76 —
- *   the template's LAST item); the HANDOFF's nav diff replaces it.
+ * - The nav is the SHARED components/settings-nav `UserSettingsNavbar`
+ *   with `active: "repos"` (the Repos item appended after Organizations,
+ *   upstream navbar.tmpl:73-76 — the template's LAST item; the mount
+ *   window's swap — the module-local scaffolding copy was deleted).
  *
- * ## HANDOFF NOTE (for the wiring wave — this module has NO route)
+ * ## Mount record (MOUNTED at 484eb92 — the wiring HANDOFF is retired)
  *
- * Three diffs, all in shared files this wave does not own:
- *
- *   1. ui/index.ts — the route recipe (GET ONLY — the tab has no write
- *      arm; upstream's POST /user/settings/repos/unadopted,
- *      web.go:735 → adopt.go, stays UNCLAIMED per the degradation
- *      posture). The `userSettingsOrganizationsPage` twin
- *      (index.ts:5515-5521) minus the error param:
- *
- *        GET /user/settings/repos
- *          → userSettingsTabPrologue(c, false)   [web.go:754's reqSignIn group]
- *          → loadUserSettingsReposPageData(c.env.DB, p.viewer.id,
- *                                            p.url.searchParams)
- *          → null 404-shells (renderNotFound) →
- *            p.respond(c.html(renderUserSettingsReposPage(p.ctx, data), 200))
- *
- *      Plus the window's plumbing: the `UserSettingsTabRoute.family`
- *      union gains `"user-settings-repos"` (`id: null`); parseUiRoute
- *      claims the exact tail INSIDE the /user/settings block, after the
- *      organization claims (index.ts:2520-2523 — template order,
- *      static-before-dynamic):
- *
- *        if (tail.length === 1 && tail[0] === "repos") {
- *          return { family: "user-settings-repos", id: null };
- *        }
- *
- *      the handler registers beside userSettingsOrganizationsPage, and
- *      this module's exports join the index.ts:883 import block. The
- *      plural template name is the WIRE name here (unlike the
- *      organizations tab's singular pin) — web.go:734 registers
- *      `/repos` verbatim.
- *
- *   2. ui/components/settings-nav.tsx — the nav item diff (NEVER applied
- *      by this wave): `settingsNavLocale` gains
- *      `repos: "Repositories"` (the "settings.repos" key — locale_en-US
- *      :649), `UserSettingsNavTab` gains `| "repos"`, and the USER
- *      navbar appends after the Organizations item (navbar.tmpl:73-76 —
- *      the template's last item):
- *
- *          [jsx comment: navbar.tmpl:73-76 — the repos tab]
- *          <a class={item("repos")} href="/user/settings/repos">
- *            {settingsNavLocale.repos}
- *          </a>
- *
- *      The header comment's dead-items list drops `Repos` from the
- *      UNRENDERED enumeration (the page is landed with this commit).
- *      NOTE (concurrency, 2026-10-27): the in-tree shared nav already
- *      carries the Account + Notifications items — the concurrent
- *      account/notifications wiring wave applied them; ONLY the repos
- *      item above remains for this module's swap. Until that lands, this
- *      module renders the module-local scaffolding nav below (mirroring
- *      the in-tree shared nav's item set); the wiring wave DELETES
- *      `UserSettingsReposNav`, swaps the page's call site to
- *      `UserSettingsNavbar active="repos"`, and moves the test's nav pin
- *      onto the shared component (the wave-114 precedent — the swap list
- *      gains entry 14).
- *
- *   3. The deferred route test matrix (the organizations pattern — this
- *      wave's test file is module-direct because the route is unmounted
- *      at its gates): anonymous login 303 on GET; the signed-in GET at
- *      200 with the `user settings repos` discriminator; the empty state
- *      through the mounted GET; the Newer/Older shapes off the loader's
- *      more flag; and the `/user/settings/repos/unadopted` POST pin —
- *      parse null, handlesUiRoute false, engine 404 (the degradation
- *      posture's wire answer).
- *
- *   Survey row to flip on landing: docs/compat/ui-parity-survey.md:546
- *   (the `/user/settings/{…,repos}` PARTIAL row — repos moves out of the
- *   STILL-ABSENT enumeration).
+ * All three diffs landed as written: (1) `index.ts` claims the exact
+ * `/user/settings/repos` tail inside the /user/settings block, after the
+ * organization claims (template order, static-before-dynamic — GET ONLY;
+ * upstream's POST /user/settings/repos/unadopted, web.go:735 → adopt.go,
+ * stays UNCLAIMED per the degradation posture), the handler registers
+ * beside its organizations twin, and this module's
+ * exports join the import block. (2) The shared components/settings-nav
+ * gained the `repos` locale key + the `UserSettingsNavTab` `"repos"` item
+ * after Organizations (navbar.tmpl:73-76), this module's local
+ * `UserSettingsReposNav` scaffolding copy was DELETED, and the page's call
+ * site swapped to `UserSettingsNavbar active="repos"` (swap-list entry 14).
+ * (3) The route test matrix rides the mounted GET. Survey row flipped on
+ * landing: docs/compat/ui-parity-survey.md:546 (the
+ * `/user/settings/{…,repos}` PARTIAL row — repos moved out of the
+ * STILL-ABSENT enumeration).
  */
 
 import { asc, eq, inArray, sql } from "drizzle-orm";

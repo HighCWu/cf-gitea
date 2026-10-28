@@ -1,9 +1,9 @@
 /**
  * The user profile FOLLOWERS/FOLLOWING tabs, `/{username}?tab=followers` and
  * `?tab=following` — one module, the two card-list projections of the
- * profile family (MOUNTED by the dispatch window beside the `?tab=activity`
+ * profile family (MOUNTED at 2f7afe9 beside the `?tab=activity`
  * arm: `ownerHomePage`'s user half calls this module's load + render under
- * either tab param — the HANDOFF NOTE at the tail of this header).
+ * either tab param — the mount record at the tail of this header).
  *
  * ## Upstream shape (cited at the pin)
  *
@@ -60,8 +60,8 @@
  * strip (user-profile.tsx's ProfileTabs, activity-feeds.tsx's OverviewTabs)
  * gains anchors: rendering follower anchors in the header would be a
  * divergence, not parity. The mounts make profile_big_avatar.tmpl:25's pair
- * live — the ProfileAvatarCard anchor diff rides the dispatch window (the
- * HANDOFF NOTE). This module renders its own module-local strip (the
+ * live — the ProfileAvatarCard anchor diff shipped with the mount (the
+ * mount record). This module renders its own module-local strip (the
  * activity module's kept-local pattern) with both tabs INACTIVE — exact
  * header.tmpl behavior for `TabName = followers/following`.
  *
@@ -110,13 +110,12 @@
  * rides the profile loader's doer-visible WHERE (loadActivityFeedsData's
  * parity copy — the seePrivate arm is admin/self).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 2f7afe9 — the wiring HANDOFF is retired)
  *
  * The module is complete end-to-end: `loadUserFollowTabsData` (the data
  * seam) + `renderUserFollowTabsPage` (the full-document render). The route
  * arm is `GET /{username}` with `tab=followers` OR `tab=following`, mounted
- * beside the activity arm in `ownerHomePage` (ui/index.ts — orchestrator
- * owned, recipe only):
+ * beside the activity arm in `ownerHomePage`:
  *
  *     // after the `tab=activity` arm, before the repositories default:
  *     if (url.searchParams.get("tab") === "followers" || url.searchParams.get("tab") === "following") {
@@ -126,10 +125,10 @@
  *
  * plus the import `import { loadUserFollowTabsData, renderUserFollowTabsPage } from "./pages/user-follow-tabs";`.
  * The strip modules need NO diff (the header has no follower anchors at
- * this pin — the strip section above). The one sibling diff that MUST ship
- * in the same window (so the anchors never ship dead) is user-profile.tsx's
- * ProfileAvatarCard: profile_big_avatar.tmpl:25's plain-text counts become
- * the two tab anchors — the exact diff rides the dispatch report. Org names
+ * this pin — the strip section above). The one sibling diff that shipped
+ * in the same window (so the anchors never shipped dead) is user-profile.tsx's
+ * ProfileAvatarCard: profile_big_avatar.tmpl:25's plain-text counts became
+ * the two tab anchors. Org names
  * never reach this arm (ownerHomePage's org half answers first, upstream's
  * org.Home-ignores-the-tab parity).
  */
@@ -162,7 +161,7 @@ export type FollowTab = "followers" | "following";
 /**
  * The tab param parse: `following` → the following projection, anything
  * else → followers. The route dispatches only the two literals (the
- * HANDOFF NOTE's arm); the default arm is the loader seam's defensive
+ * mount record's arm); the default arm is the loader seam's defensive
  * fallback, unreachable from the mounted route.
  */
 export function parseFollowTab(raw: string | null): FollowTab {

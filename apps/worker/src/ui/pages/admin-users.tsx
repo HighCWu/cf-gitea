@@ -1,9 +1,9 @@
 /**
  * The ADMIN USERS list page — `/-/admin/users` — the wave-admin-pages bench
  * row (the parity survey row docs/compat/ui-parity-survey.md:549's users
- * remainder), TWO-STAGE UNMOUNTED: this file ships the module only;
- * `index.ts` is orchestrator-held, so the route rides the next window — the
- * HANDOFF NOTE at the bottom of this header. Sibling scope: `admin-orgs.tsx`
+ * remainder), MOUNTED at 2f7afe9 (the mount window): the route lives in
+ * `index.ts`'s admin literal family block — the retired wiring HANDOFF is
+ * the mount record at the bottom of this header. Sibling scope: `admin-orgs.tsx`
  * + `admin-repos.tsx` (this same wave) own the orgs/repos lists; the landed
  * dashboard/monitor family (window-2c, `e31c0cf`) owns `/-/admin` and
  * `/-/admin/monitor/*` — none of those files is touched here.
@@ -139,20 +139,20 @@
  * builder, never string SQL; the §Architecture D1 rule binds route handlers,
  * and this module IS the data seam until a service arm is extracted).
  *
- * ## HANDOFF NOTE (the route — this module has NO route)
+ * ## Mount record (MOUNTED at 2f7afe9 — the route is live)
  *
- * Route table (`index.ts` — orchestrator-held), beside the landed
- * adminPagePrologue pair (index.ts:6247-6256 — session resolveUiSession →
- * anonymous login-303 → non-admin 404 shell, web.go:779's exact posture):
+ * Route table (`index.ts`), beside the landed adminPagePrologue pair
+ * (session resolveUiSession → anonymous login-303 → non-admin 404 shell,
+ * web.go:779's exact posture):
  *
  *   GET /-/admin/users   adminPagePrologue(c) → loadAdminUsersData(c.env.DB,
  *                        c.req.raw's URL searchParams) →
  *                        renderAdminUsersPage(p.ctx, data) at 200
  *
- * The claim sits in the ALREADY-LANDED admin literal family block
- * (index.ts:2562-2572 — `raw[1] === "-" && raw[2] === "admin"`): add
- * `if (tail.length === 1 && tail[0] === "users") return { family:
- * "admin-users" };` BEFORE any dynamic `/users/{id}` arm can exist (the
+ * The claim sits in the landed admin literal family block
+ * (`raw[1] === "-" && raw[2] === "admin"`): `tail.length === 1 &&
+ * tail[0] === "users"` returns `{ family: "admin-users" }` BEFORE any
+ * dynamic `/users/{id}` arm can exist (the
  * static-before-dynamic rule; the detail routes stay unclaimed → 404).
  * Registration order within the file is inert (the parser claims by shape),
  * but the FAMILY block itself must stay ahead of the owner/repo parse (it

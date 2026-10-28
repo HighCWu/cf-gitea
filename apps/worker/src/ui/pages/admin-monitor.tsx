@@ -1,11 +1,12 @@
 /**
- * The ADMIN MONITOR family — `/-/admin/monitor/*` — the bench-row UNMOUNTED
- * module (wave 61, TWO-STAGE: this file ships the module only; `index.ts` is
- * orchestrator-held, so the routes ride the next window — the HANDOFF NOTE at
- * the bottom of this header). Sibling scope note: NO admin web surface is
- * landed at all (`src/ui/pages/` has zero `admin-*` modules — verified
- * 2026-10-26; the whole `/-/admin` family is the parity survey's single ABSENT
- * row, docs/compat/ui-parity-survey.md:386), so this module carries the
+ * The ADMIN MONITOR family — `/-/admin/monitor/*` — the bench-row module
+ * (wave 61; MOUNTED at e31c0cf, window-2c: the routes live in `index.ts` —
+ * the retired wiring HANDOFF is the mount record at the bottom of this
+ * header; the "no admin web surface" state below is the pre-mount record).
+ * Sibling scope note at the two-stage landing: no admin web surface existed
+ * then (`src/ui/pages/` had zero `admin-*` modules; the whole `/-/admin`
+ * family was the parity survey's single ABSENT row,
+ * docs/compat/ui-parity-survey.md:386), so this module carries the
  * monitor family alone and owns none of the dashboard/users/repos pages.
  *
  * ## Upstream surface (at the pin)
@@ -122,9 +123,9 @@
  *   upstream (stacktrace.go:19) and has no source either; the diagnosis form
  *   POSTs an unlanded route. A rendered tab/form would be dead.
  *
- * ## HANDOFF NOTE (the routes — this module has NO route)
+ * ## Mount record (MOUNTED at e31c0cf — the routes are live)
  *
- * Route table (`index.ts` — orchestrator-held): four GET claims in the
+ * Route table (`index.ts`): four GET claims in the
  * admin/monitor neighborhood, each shaped like the blocked-users pair minus
  * the POST (only cron has one):
  *

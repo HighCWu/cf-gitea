@@ -1,7 +1,8 @@
 /**
  * The org settings ACTIONS tab's SECRETS + VARIABLES sub-tabs — pages wave 59
- * (bench row `wave-org-actions-module`, TWO-STAGE UNMOUNTED — the routes ride
- * the index.ts window; `index.ts` is orchestrator/sibling-owned).
+ * (bench row `wave-org-actions-module`, MOUNTED at 4f2805f, window-2b — the
+ * routes live in `index.ts`; the retired wiring HANDOFF is the mount record
+ * below).
  *
  * Upstream pin (VERIFIED at fc4936884584a41931906553d96c2601d750e6ef):
  * `gitea/templates/org/settings/actions.tmpl` EXISTS and is the PageType
@@ -33,7 +34,7 @@
  * `actions.MustEnableActions`; `GET /settings/actions` is upstream's
  * LocationRedirect onto ./actions/general).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 4f2805f — the wiring HANDOFF is retired)
  *
  * The org-settings posture everywhere (org-settings.tsx / org-settings-hooks
  * headers): `resolveOrgForRequest` (api/services/orgs.ts — the 404/307
@@ -81,7 +82,7 @@
  *
  * `GET /{org}/settings/actions` itself is upstream's LocationRedirect onto
  * ./actions/general (web.go:1055) — the general tab is NOT this module's
- * claim (no landed page); the wiring wave may 404-shell it until that slice
+ * claim (no landed page); the dispatcher 404-shells it until that slice
  * lands. `/{org}` in every URL is the LIVE org name (orgLink =
  * `/${org.username}` — a renamed org's next GET renders the new link set).
  *

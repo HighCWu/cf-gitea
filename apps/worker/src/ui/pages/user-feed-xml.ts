@@ -1,12 +1,12 @@
 /**
  * The `/{username}.rss` + `/{username}.atom` user-feed envelopes — pages
- * wave 74 (bench row `wave-rss-atom`, UNMOUNTED — `index.ts` is
- * orchestrator/sibling-owned; the HANDOFF NOTE below carries the mount
- * recipe). Byte surfaces over the landed activity-feed service (never a
+ * wave 74 (bench row `wave-rss-atom`; MOUNTED at 1a59af0, window-2e B1 —
+ * the retired wiring HANDOFF is the mount record below). Byte surfaces over
+ * the landed activity-feed service (never a
  * self-fetch): no JSX, the two XML documents are composed as strings with
  * the exact Go serializer semantics upstream ships.
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 1a59af0 — the wiring HANDOFF is retired)
  *
  * - Upstream has NO dedicated feed route: web.go:910-912 registers
  *   `m.Get("/{username}", webAuth.AllowBasic, user.UsernameSubRoute)` and
@@ -18,9 +18,9 @@
  *   basic auth as other rss/atom routes". The Accept-header dispatch
  *   (`OwnerProfile`, routers/web/user/profile.go:35-45) is UNREGISTERED at
  *   the pin — the suffix families are the only user-feed entry points.
- * - Mount recipe in `resolveUiRoute`'s single-segment owner arm (the block
- *   that already refuses `.keys`/`.gpg`, index.ts:~2081-2089), BEFORE the
- *   `.keys`/`.gpg` refusal (order is irrelevant — disjoint suffixes; the
+ * - The landed claim lives in `resolveUiRoute`'s single-segment owner arm
+ *   (the block that already refuses `.keys`/`.gpg`), BEFORE that refusal
+ *   (order is irrelevant — disjoint suffixes; the
  *   suffix dispatch must win over the bare owner-home claim so a feed URL
  *   can never 404 into the profile):
  *
@@ -641,7 +641,7 @@ function feedsApiUser(viewer: Viewer, origin: string): ApiViewer {
  * title/description arms project ({title, isPull, content} over the page's
  * coordinates→TEXT-id join — the query-shape audit's C2 follow-up), then
  * the channel fields. The visibility gate lives in the route's resolution
- * seam (the HANDOFF NOTE) — the loader takes the already-resolved subject.
+ * seam (the mount record) — the loader takes the already-resolved subject.
  */
 export async function loadUserFeedData(
   d1: D1Database,

@@ -1,9 +1,9 @@
 /**
  * The ADMIN ORGANIZATIONS list page — `/-/admin/orgs` — the wave-admin-pages
  * bench row (the parity survey row docs/compat/ui-parity-survey.md:549's
- * orgs remainder), TWO-STAGE UNMOUNTED: this file ships the module only;
- * `index.ts` is orchestrator-held, so the route rides the next window — the
- * HANDOFF NOTE at the bottom. Sibling scope: `admin-users.tsx` (this wave)
+ * orgs remainder), MOUNTED at 2f7afe9 (the mount window): the route lives in
+ * `index.ts`'s admin literal family block — the retired wiring HANDOFF is
+ * the mount record at the bottom. Sibling scope: `admin-users.tsx` (this wave)
  * hosts the shared family chrome (nav/shell/pager/embedded icons) and owns
  * the users list; `admin-repos.tsx` owns the repos list; the landed
  * dashboard/monitor family owns `/-/admin` and `/-/admin/monitor/*` — none
@@ -83,18 +83,18 @@
  * of 50 + two grouped counts (teams by org_id, repositories by owner_id)
  * for the page's rows.
  *
- * ## HANDOFF NOTE (the route — this module has NO route)
+ * ## Mount record (MOUNTED at 2f7afe9 — the route is live)
  *
- * See admin-users.tsx's handoff for the shared recipe; this page's claim in
- * the landed admin literal family block (ui/index.ts:2562-2572):
+ * See admin-users.tsx's mount record for the shared recipe; this page's claim in
+ * the landed admin literal family block:
  *
- *   `if (tail.length === 1 && tail[0] === "orgs") return { family:
- *    "admin-orgs" };` — static literal BEFORE any dynamic arm; the handler
+ *   `tail.length === 1 && tail[0] === "orgs"` returns `{ family:
+ *    "admin-orgs" }` — static literal BEFORE any dynamic arm; the handler
  *   is adminPagePrologue(c) → loadAdminOrgsData(c.env.DB, searchParams) →
  *   renderAdminOrgsPage(p.ctx, data) at 200.
  *
  * The AdminFamilyNav import marks this page's item active via
- * `active="orgs"`. Survey row to flip on landing:
+ * `active="orgs"`. Survey row flipped on landing:
  * docs/compat/ui-parity-survey.md:549.
  */
 

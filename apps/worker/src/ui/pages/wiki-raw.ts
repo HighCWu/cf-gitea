@@ -95,82 +95,39 @@
  *   convention every landed wiki read already rides (pageBlob probes the
  *   coded path identically); nothing new here.
  *
- * ## HANDOFF RECIPE (the mount is the orchestrator's — index.ts is not this
- * module's file; three claimed shapes must move to `wiki-raw` BEFORE the
- * wiki family arms, mirroring the excerpt twin's exact plumbing)
+ * ## Mount record (MOUNTED at 2f7afe9 — the wiring HANDOFF is retired;
+ * the recipe below is kept as the landed-shape record)
  *
- * 1. ROUTE INTERFACE (beside WikiRoute, ~index.ts:2057-2065):
+ * The three claimed shapes moved to `wiki-raw` BEFORE the
+ * wiki family arms, mirroring the excerpt twin's exact plumbing:
  *
- *      /** The wiki raw byte arm (pages/wiki-raw.ts — web.go:1621's
- *          `m.Get("/raw/*", repo.WikiRaw)`). GET-only. *\/
- *      export interface WikiRawRoute {
- *        family: "wiki-raw";
- *        owner: string;
- *        repo: string;
- *        /** The decoded `/raw` tail (per-segment decode + "/" join — the
- *            wiki family's rawTail convention; "" never claims here: the
- *            bare `/wiki/raw` tail stays with the page family, exactly
- *            upstream's chi wildcard which does not match `/raw`. *\/
- *        rawTail: string;
- *      }
+ * 1. ROUTE INTERFACE (beside the wiki route): `WikiRawRoute { family:
+ *    "wiki-raw"; owner; repo; rawTail }` — the decoded `/raw` tail
+ *    (per-segment decode + "/" join — the wiki family's rawTail
+ *    convention; "" never claims here: the bare `/wiki/raw` tail stays
+ *    with the page family, exactly upstream's chi wildcard which does not
+ *    match `/raw`) — on the `ParsedUiRoute` union.
  *
- *    Add `WikiRawRoute` to the `ParsedUiRoute` union (~index.ts:2386, after
- *    `BlobExcerptRoute`).
+ * 2. PARSE (inside parseUiRoute's early `head === "wiki"` block — the
+ *    excerpt twin's own block; claimed before the later `family: "wiki"`
+ *    return, else the page family would swallow raw tails): the
+ *    `rest.length >= 2 && rest[0] === "raw"` arm returns
+ *    `{ family: "wiki-raw", owner, repo, rawTail }` with the per-segment
+ *    decode in try/catch (decode failure → null → the engine's 404).
  *
- * 2. PARSE (inside parseUiRoute's early `head === "wiki"` block at
- *    ~index.ts:2919-2933 — the excerpt twin's own block; MUST claim before
- *    the later `family: "wiki"` return at ~index.ts:3165-3177, else the
- *    page family swallows raw tails):
- *
- *      if (head === "wiki") {
- *        if (rest.length === 2 && rest[0] === "blob_excerpt") { …existing… }
- *        // Wave-…: the raw byte arm (web.go:1621) — EXACTLY the two-
- *        // segment `raw/{tail}` shape; the bare `/wiki/raw` tail falls
- *        // through to the page family (chi's `/raw/*` does not match
- *        // `/raw`, which serves the reserved-name page miss there).
- *        if (rest.length >= 2 && rest[0] === "raw") {
- *          try {
- *            return {
- *              family: "wiki-raw",
- *              owner,
- *              repo,
- *              rawTail: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
- *            };
- *          } catch {
- *            return null;
- *          }
- *        }
- *      }
- *
- * 3. HANDLER + REGISTRATION (a `wikiRawBlob` handler beside
- *    `blobExcerptFragment`, ~index.ts:7624-7648, registered BEFORE the
- *    `wiki/*` patterns at ~index.ts:10079-10080, after the excerpt lines
- *    ~10075-10076):
- *
- *      uiRouter.get("/:owner/:repo/wiki/raw/*", (c) => wikiRawBlob(c));
- *
- *      async function wikiRawBlob(c: Context<{ Bindings: Env }>): Promise<Response> {
- *        const resolved = await resolveUiRequest(c);
- *        if (!resolved.ok) return resolved.response;
- *        const { route, ctx, respond, repo } = resolved;
- *        if (route.family !== "wiki-raw") return respond(await c.notFound()); // drift guard
- *        const settings = await loadRepoSettings(c.env.DB, repo.id);
- *        if (!settings.hasWiki) return respond(c.html(renderNotFound(ctx), 404)); // MustEnableWiki (web.go:1622)
- *        const pair = await findRepositoryById(c.env.DB, repo.id);
- *        if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
- *        const blob = await loadWikiRawBlob(c.env, pair, route.rawTail);
- *        if (blob === null) return respond(c.html(renderNotFound(ctx), 404)); // wiki.go:638's NotFound
- *        return respond(
- *          wikiRawBlobResponse(blob, {
- *            cacheIsPublic: repo.visibility === "public" && pair.owner.visibility === "public",
- *            ifNoneMatch: c.req.header("if-none-match") ?? null,
- *          }),
- *        );
- *      }
+ * 3. HANDLER + REGISTRATION: the `wikiRawBlob` handler beside the excerpt
+ *    fragment — `resolveUiRequest` → the drift guard →
+ *    `loadRepoSettings` hasWiki 404-shell (MustEnableWiki, web.go:1622) →
+ *    the pair re-read (the wikiPrologue precedent) →
+ *    `loadWikiRawBlob(c.env, pair, route.rawTail)` (null → 404,
+ *    wiki.go:638's NotFound) → `wikiRawBlobResponse(blob, { cacheIsPublic,
+ *    ifNoneMatch })` — registered as
+ *    `uiRouter.get("/:owner/:repo/wiki/raw/*", …)` BEFORE the `wiki/*`
+ *    patterns.
  *
  *    (reqUnitWikiReader reduces to repo visibility — already the §2.5
- *    prologue's; the pair re-read is the wikiPrologue precedent. The group's
- *    `optSignIn` needs no arm — reads need no session.)
+ *    prologue's; the group's `optSignIn` needs no arm — reads need no
+ *    session.)
  *
  * ## Data sourcing (§3.2 — service ops, never a self-fetch)
  *
@@ -191,7 +148,7 @@ import {
 } from "./release-downloads";
 
 /** `readWikiRawBlob` under the module's load* name — the loader seam the
- *  mount recipe's handler calls (the family's loader convention). */
+ *  mounted handler calls (the family's loader convention). */
 export { readWikiRawBlob as loadWikiRawBlob } from "../../services/wiki";
 export type { WikiRawBlob };
 

@@ -86,9 +86,11 @@
  *
  * This module holds the grammars, the loaders and the range-page render
  * only; the routes live in src/ui/index.ts beside their sibling dispatchers
- * (the resolveUiRequest session/repo prologue is index-owned). Bench pair
- * with pages/diffpatch-files.ts (wave 29) — UNMOUNTED module, the HANDOFF
- * NOTE in the tests carries the mount recipe per surface.
+ * (the resolveUiRequest session/repo prologue is index-owned). MOUNTED at
+ * 22599e4 (window-2e B2 — the `pull-files-range` / `pull-commit-files` /
+ * `compare-feed` families; the retired wiring HANDOFF lives on in the
+ * tests as the per-surface recipe record). Bench pair
+ * with pages/diffpatch-files.ts (wave 29).
  */
 
 import type { Context as ContextType } from "hono";

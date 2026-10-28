@@ -26,8 +26,8 @@
  * (signin_inner.tmpl:68–71, `ShowRegistrationButton` → `auth.sign_up_now`).
  * Both props are OPTIONAL and default absent: the SPEC-0010 §5 golden
  * (session-goldens/login.html) is byte-stable, and the session router's
- * call site picks the values up with the mount recipe (HANDOFF NOTE at the
- * bottom — the session.ts delta is orchestrator-owned).
+ * call site passes the values on GET /login (MOUNTED at df1e362 — the
+ * mount record at the bottom).
  */
 
 import { BaseLayout, renderPage } from "../shell";
@@ -180,21 +180,15 @@ export function LoginPage(props: {
  *  invocations live in .tsx modules (render.tsx's split, SPEC-0008 §2.4),
  *  so the router module (ui/session.ts) stays JSX-free.
  *
- * HANDOFF NOTE (first-run amendment, orchestrator-owned call site): pass
- * the two new options once the window/gate go live —
- *
- *   const open = await initWindowOpen(c.env.DB);            // services/user-accounts
- *   const html = renderLoginPage({
- *     ctx: assembled.ctx,
- *     redirectTo,
- *     error: null,
- *     adminInit: open ? { open: true, error: null } : undefined,
- *     signUpLink: allowSignup(c.env),                        // same service module
- *   });
- *
- * (GET /login only; POST /login needs no change. Until this lands, the
- * standalone GET /install route in src/ui/first-run.ts renders the same
- * page with the panel set.) */
+ * MOUNTED at df1e362 (the first-run amendment's orchestrator call site):
+ * the session router passes the two options on GET /login — `adminInit`
+ * from `initWindowOpen(c.env.DB)` (`{ open: true, error: null }` while the
+ * window is open, absent otherwise) and `signUpLink` from
+ * `allowSignup(c.env)`; POST /login needs no change. The standalone GET
+ * /install route (src/ui/first-run.ts) renders the same page with the
+ * panel set. (The first-run router itself mounts BEFORE the uiRouter —
+ * Hono's RegExpRouter gives a later-mounted dynamic /:owner/:repo pair
+ * precedence over statics; the order fix is 9d77172.) */
 export function renderLoginPage(options: {
   ctx: UiContext;
   redirectTo: string | null;

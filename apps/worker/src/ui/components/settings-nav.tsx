@@ -58,10 +58,12 @@
  * owner-only 404-shells), so no settings page ever renders for an anonymous
  * viewer and the nav never branches on viewer state.
  *
- * ## HANDOFF NOTE — the swap list for the window wave
+ * ## Mount record — the swap list (DONE at 94c6851, the 13-site
+ * shared-navbar swap; the wiring HANDOFF is retired)
  *
- * Every committed module carrying a local nav copy to replace with the
- * shared components (file:line = the local component's definition):
+ * The swap is complete: every module below replaced its local nav copy with
+ * the shared components (the list kept as the provenance record;
+ * file:line = the local component's now-deleted definition):
  *
  *   USER family (swap for `UserSettingsNavbar`, `active` = the page's tab):
  *     1. pages/user-settings.tsx:187 — private `UserSettingsNav`
@@ -98,8 +100,8 @@
  *   REPO settings nav (templates/repo/settings/navbar.tmpl — a third
  *   upstream template this brief does not cover).
  *
- *   Per the family convention, each swap DELETES the local copy and its
- *   tests' local-nav expectations move onto the shared component (the
+ *   Per the family convention, each swap DELETED the local copy and the
+ *   tests' local-nav expectations moved onto the shared component (the
  *   WikiSettingsNav deletion precedent, pages/repo-settings-wiki.tsx).
  */
 

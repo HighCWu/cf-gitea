@@ -85,8 +85,8 @@
  *
  * This module holds the loaders + the XML/Response builders only; the
  * handlers live in src/ui/index.ts beside their sibling dispatchers (the
- * resolveUiRequest prologue is index-owned) — the HANDOFF section at the
- * bottom carries the mount recipe.
+ * resolveUiRequest prologue is index-owned) — MOUNTED at 84996c6; the
+ * retired HANDOFF is the mount record at the bottom.
  */
 
 import { and, count, desc, eq } from "drizzle-orm";
@@ -266,7 +266,7 @@ export async function loadUsersSitemap(d1: D1Database, origin: string, idx: numb
 }
 
 // ---------------------------------------------------------------------------
-// Response + HANDOFF
+// Response + mount record
 // ---------------------------------------------------------------------------
 
 /**
@@ -285,35 +285,15 @@ export function sitemapXmlResponse(body: string): Response {
 }
 
 /**
- * HANDOFF — mount recipe (index.ts owns route knowledge; this module is
- * UNMOUNTED). All three routes are GET, claimed as EXACT literal shapes in
+ * MOUNTED at 84996c6 (window-2e A — the wiring HANDOFF is retired). All
+ * three routes are GET, claimed as EXACT literal shapes in
  * `parseUiRoute` BEFORE the owner/repo parse (the explore-family precedent —
  * otherwise `/explore/repos/sitemap-1.xml` reads as owner `explore`), and
- * dispatched beside the explore arms:
- *
- *   // parseUiRoute, beside the explore family:
- *   if (raw.length === 1 && raw[0] === "sitemap.xml") {
- *     return { family: "home-sitemap" };
- *   }
- *   if (raw.length === 4 && raw[1] === "explore" && (raw[2] === "repos" || raw[2] === "users")) {
- *     const idx = parseSitemapIdx(raw[3]);
- *     if (idx !== null) {
- *       return { family: raw[2] === "repos" ? "explore-repos-sitemap" : "explore-users-sitemap", idx };
- *     }
- *     return null; // a non-sitemap tail under /explore/{repos|users} stays unclaimed (404)
- *   }
- *
- *   // the dispatch arms (origin from the request, the apiRepositoryUrl
- *   // convention — repository.ts:76):
- *   if (route.family === "home-sitemap") {
- *     return respond(sitemapXmlResponse(await loadHomeSitemapIndex(c.env.DB, new URL(c.req.url).origin)));
- *   }
- *   if (route.family === "explore-repos-sitemap") {
- *     return respond(sitemapXmlResponse(await loadReposSitemap(c.env.DB, new URL(c.req.url).origin, route.idx)));
- *   }
- *   if (route.family === "explore-users-sitemap") {
- *     return respond(sitemapXmlResponse(await loadUsersSitemap(c.env.DB, new URL(c.req.url).origin, route.idx)));
- *   }
+ * dispatched beside the explore arms, exactly per the recipe: the
+ * `home-sitemap` / `explore-repos-sitemap` / `explore-users-sitemap`
+ * families (the non-sitemap tail under /explore/{repos|users} stays
+ * unclaimed → 404), each dispatch arm answering
+ * `sitemapXmlResponse(await load…(c.env.DB, origin, idx))`.
  *
  * Upstream gates the family behind `sitemapEnabled` (web.go:423-428) and
  * `optExploreSignIn` on the index (web.go:530 — a signed-in viewer's index

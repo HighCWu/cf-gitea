@@ -1,9 +1,9 @@
 /**
  * The user settings SSH/GPG KEYS tab, `/user/settings/keys` — pages wave 54
- * (bench row `wave-settings-keys-tags`, TWO-STAGE UNMOUNTED — the route rides
- * the index.ts window; `index.ts` is orchestrator/sibling-owned).
+ * (bench row `wave-settings-keys-tags`, MOUNTED at 0c2b151 — the route lives
+ * in `index.ts`).
  *
- * ## HANDOFF NOTE (for the wiring wave)
+ * ## Mount record (MOUNTED at 0c2b151 — the wiring HANDOFF is retired)
  *
  * The module is complete end-to-end over the landed stores; upstream's exact
  * route group is web.go:698-700:
