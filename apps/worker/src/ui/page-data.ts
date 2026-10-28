@@ -21,10 +21,12 @@ import type { EngineClient } from "./engine";
  * not exist on this pin's boundary (verified dist-types/repo.d.ts), so this
  * is §3.5's documented interim fallback: one `listLog(ref, {path, n: 1})` RPC
  * per entry, all to the SAME DO (cheap same-DO hops — never the N× HTTP
- * self-fetch spike §6.1 forbids). Resolution failures resolve to `null` and
- * the render path is IDENTICAL to the batched RPC's `null` entries: the muted
- * `.notready` message cell, without the `data-fetch` loader (§3.5 — no
- * partial-refresh endpoint exists in this slice).
+ * self-fetch spike §6.1 forbids), issued CONCURRENTLY (the audit A10
+ * parallelization — the serial loop's wall clock was the sum of ≤ 30 hops).
+ * Resolution failures resolve to `null` and the render path is IDENTICAL to
+ * the batched RPC's `null` entries: the muted `.notready` message cell,
+ * without the `data-fetch` loader (§3.5 — no partial-refresh endpoint exists
+ * in this slice).
  *
  * Budget: entries beyond ENRICH_MAX fall through to `null` unconditionally,
  * bounding the per-request RPC fan-out (50/request subrequest budget on the
@@ -43,14 +45,25 @@ export async function enrichTreeCommits(
   entries: readonly TreeEntryJson[],
   fullPath: (entry: TreeEntryJson) => string,
 ): Promise<CommitByEntry> {
+  const bounded = entries.slice(0, ENRICH_MAX);
+  // Concurrent same-DO roundtrips (Promise.all over the serial loop's exact
+  // per-path calls); each arm degrades to `null` on failure — never a
+  // rejection, so one failed entry cannot sink the page. Results land in
+  // ENTRY order (not completion order) below, keeping the map's insertion
+  // order identical to the serial loop's.
+  const settled = await Promise.all(
+    bounded.map(async (entry): Promise<CommitJson | null> => {
+      try {
+        const log = await engine.listLog(ref, { path: fullPath(entry), ofs: 0, n: 1 });
+        return log?.commits[0] ?? null;
+      } catch {
+        return null; // degraded → notready cell (§3.5)
+      }
+    }),
+  );
   const commits: CommitByEntry = new Map();
-  for (const entry of entries.slice(0, ENRICH_MAX)) {
-    try {
-      const log = await engine.listLog(ref, { path: fullPath(entry), ofs: 0, n: 1 });
-      commits.set(entry.name, log?.commits[0] ?? null);
-    } catch {
-      commits.set(entry.name, null); // degraded → notready cell (§3.5)
-    }
+  for (const [index, entry] of bounded.entries()) {
+    commits.set(entry.name, settled[index] ?? null);
   }
   return commits;
 }

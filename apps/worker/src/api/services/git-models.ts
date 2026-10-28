@@ -50,7 +50,7 @@ import type {
 } from "../models/git";
 import type { ContentsResponse } from "../models/contents";
 import type { EngineReads } from "./engine";
-import { apiUserFromRow, type RepositoryWithOwner, type Viewer } from "./repository";
+import { apiUserFromRow, type RepositoryWithOwner, type UserRow, type Viewer } from "./repository";
 
 /** Files at or under this many bytes carry base64 `content` on GET contents. */
 export const MAX_CONTENTS_RENDER_BYTES = 1024 * 1024;
@@ -97,6 +97,35 @@ export async function usernamesByEmail(d1: D1Database, commits: CommitJson[]): P
     .all();
   for (const row of rows) {
     if (row.email !== null) map.set(row.email.toLowerCase(), row.username);
+  }
+  return map;
+}
+
+/**
+ * The same page-batch as usernamesByEmail, carrying the FULL user rows the
+ * rich Commit view's author/committer `User` blocks render from
+ * (apiUserFromRow). One inArray(lower(email)) select replaces the per-commit
+ * findUserRowByEmail pair (the audit A4/B2 dead-batch + 2N re-query fix);
+ * first row per lowercased email wins, matching findUserRowByEmail's
+ * `limit(1)` parity (not usernamesByEmail's last-wins).
+ */
+export async function userRowsByEmail(d1: D1Database, commits: CommitJson[]): Promise<Map<string, UserRow>> {
+  const emails = new Set<string>();
+  for (const commit of commits) {
+    if (commit.author.email !== "") emails.add(commit.author.email.toLowerCase());
+    if (commit.committer.email !== "") emails.add(commit.committer.email.toLowerCase());
+  }
+  const map = new Map<string, UserRow>();
+  if (emails.size === 0) return map;
+  const rows = await drizzle(d1)
+    .select()
+    .from(users)
+    .where(inArray(sql`lower(${users.email})`, [...emails]))
+    .all();
+  for (const row of rows) {
+    if (row.email === null) continue;
+    const key = row.email.toLowerCase();
+    if (!map.has(key)) map.set(key, row);
   }
   return map;
 }
@@ -171,13 +200,19 @@ export interface CommitRenderOptions {
   files: boolean;
   /** The diff for stats/files, precomputed by callers that batch-render. */
   diff?: DiffResult | null;
+  /** The page-batched author/committer rows (userRowsByEmail, keyed by
+   *  lowercased email) — one inArray select for the whole list instead of a
+   *  findUserRowByEmail pair per commit. Absent = the per-commit D1
+   *  fallback (single-commit callers keep their 1-2 selects). */
+  userRows?: Map<string, UserRow>;
 }
 
 /**
  * convert.ToCommit — the rich Commit view. `stats`/`files` ride one readDiff
  * per commit (id..first-parent; root commits diff against the empty tree,
  * matching `git show`). The author/committer `User` blocks resolve via the
- * commit email against D1 (null upstream when no account matches).
+ * commit email against the pre-fetched page batch when given (userRows),
+ * else the per-commit D1 fallback (null upstream when no account matches).
  */
 export async function toApiCommit(
   d1: D1Database,
@@ -185,7 +220,7 @@ export async function toApiCommit(
   viewer: Viewer,
   pair: RepositoryWithOwner,
   commit: CommitJson,
-  usernames: Map<string, string>,
+  usernames: Map<string, string> | undefined,
   opts: CommitRenderOptions,
 ): Promise<Commit> {
   const owner = encodeURIComponent(pair.repo.ownerNamespace);
@@ -221,9 +256,18 @@ export async function toApiCommit(
     }
   }
 
+  // Author/committer rows from the page batch when the caller pre-fetched
+  // it (one inArray select per list — the audit A4 fix); the per-commit
+  // findUserRowByEmail pair remains the fallback for un-batched callers.
+  // findUserRowByEmail answers null for the empty email without querying;
+  // the batch never holds an "" key, so the map path degrades identically.
+  const resolveUserRow = async (email: string): Promise<UserRow | null> => {
+    if (opts.userRows !== undefined) return opts.userRows.get(email.toLowerCase()) ?? null;
+    return findUserRowByEmail(d1, email);
+  };
   const [authorRow, committerRow] = await Promise.all([
-    findUserRowByEmail(d1, commit.author.email),
-    findUserRowByEmail(d1, commit.committer.email),
+    resolveUserRow(commit.author.email),
+    resolveUserRow(commit.committer.email),
   ]);
 
   return {

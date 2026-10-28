@@ -46,24 +46,23 @@
  * state) is retired with the multi-path generator extension.
  *
  * Data comes from the tier-1 service layer directly (§3.2: never a
- * self-fetch): `listRepoIssues` + `issueLabelRows` +
- * `milestoneIdsByRepoEntries` (src/api/services/issues.ts) plus two small
- * batched D1 lookups (milestone names, poster names). Anonymous, public
- * repos only — the router resolved the row before this loader runs (§2.5).
+ * self-fetch): `listRepoIssues` + `milestoneIdsByRepoEntries`
+ * (src/api/services/issues.ts) plus three small batched D1 lookups (labels,
+ * milestone names, poster names). Anonymous, public repos only — the router
+ * resolved the row before this loader runs (§2.5).
  */
 
-import { inArray } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
   hasWorkInProgressPrefix,
-  issueLabelRows,
   listRepoIssues,
   milestoneIdsByRepoEntries,
   type IssueListFilters,
 } from "../../api/services/issues";
 import type { IssueRow, LabelRow, MilestoneRow } from "../../issues/service";
-import { milestones, pullRequests, users } from "../../db/schema";
+import { issueLabels, labels, milestones, pullRequests, users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import { userLink } from "../links";
 import { parsePageNumber } from "../page-data";
@@ -197,8 +196,8 @@ function unixSeconds(date: Date): number {
 
 /**
  * Load the list (§3.2): one filtered page read + two 1-row count reads (the
- * tab totals) + per-row label joins (≤ 20, same-DB — the enrichTreeCommits
- * fan-out pattern) + two batched name lookups (milestones, posters).
+ * tab totals) + one page-batched label join + three batched name/flag
+ * lookups (PR flags, milestones, posters).
  */
 export async function loadIssuesListData(
   d1: D1Database,
@@ -237,15 +236,35 @@ export async function loadIssuesListData(
     listRepoIssues(d1, repoId, { ...filters, isClosed: true, page: 1, limit: 1 }),
   ]);
 
-  const items: IssueListItem[] = await Promise.all(
-    listPage.items.map(async (issue) => ({
-      issue,
-      labels: await issueLabelRows(d1, issue.id),
-      milestone: null,
-      posterName: null,
-      prMerged: false,
-    })),
-  );
+  // One batched label join for the whole page (issueLabelRows' per-row
+  // select reduced to a single inArray read — the same loader's PR-flags
+  // pattern). Grouped in memory; the asc(labels.id) orderBy preserves
+  // issueLabelRows' per-issue badge order exactly, and issues carry each
+  // label once, so bucket order is the join order.
+  const labelsByIssue = new Map<number, LabelRow[]>();
+  const pageIssueIds = listPage.items.map((issue) => issue.id);
+  if (pageIssueIds.length > 0) {
+    const rows = await db
+      .select({ issueId: issueLabels.issueId, label: labels })
+      .from(issueLabels)
+      .innerJoin(labels, eq(labels.id, issueLabels.labelId))
+      .where(inArray(issueLabels.issueId, pageIssueIds))
+      .orderBy(asc(labels.id))
+      .all();
+    for (const row of rows) {
+      const bucket = labelsByIssue.get(row.issueId);
+      if (bucket === undefined) labelsByIssue.set(row.issueId, [row.label]);
+      else bucket.push(row.label);
+    }
+  }
+
+  const items: IssueListItem[] = listPage.items.map((issue) => ({
+    issue,
+    labels: labelsByIssue.get(issue.id) ?? [],
+    milestone: null,
+    posterName: null,
+    prMerged: false,
+  }));
 
   // Batched PR extension flags for the is_pull rows (the state glyph's
   // merged branch — one read for the whole page, the wave-2 pattern).

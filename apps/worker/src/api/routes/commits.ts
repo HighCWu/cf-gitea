@@ -8,7 +8,7 @@ import { issues, pullRequests } from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
 import { branchRef, engineReads, refTipMap, resolveListStartRef, resolveNamedRef, tagRef } from "../services/engine";
-import { renderPatch, renderUnifiedDiff, toApiCommit, usernamesByEmail } from "../services/git-models";
+import { renderPatch, renderUnifiedDiff, toApiCommit, userRowsByEmail } from "../services/git-models";
 import { toApiPullRequest } from "../services/pulls";
 import { compareSchema, commitListSchema, commitSchema } from "../models/git";
 import { pullRequestSchema } from "../models/pull";
@@ -244,9 +244,15 @@ export function registerCommitRoutes(
       // keeps a next Link relation when the walk reports more
       setPaginationHeaders(c, (listOptions.page - 1) * listOptions.limit + commits.length + (hasMore ? 1 : 0), listOptions);
 
-      const usernames = await usernamesByEmail(c.env.DB, commits);
+      // One batched author/committer row read for the page (userRowsByEmail
+      // — the audit A4 fix; the per-commit findUserRowByEmail pair and the
+      // dead usernames select are gone — `undefined` slots the retired
+      // usernames param kept for the un-batched sibling callers).
+      const userRows = await userRowsByEmail(c.env.DB, commits);
       const rendered = await Promise.all(
-        commits.map((commit) => toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, usernames, { stat: statFlag, files: filesFlag })),
+        commits.map((commit) =>
+          toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, undefined, { stat: statFlag, files: filesFlag, userRows }),
+        ),
       );
       return c.json(rendered, 200);
     },
@@ -287,11 +293,12 @@ export function registerCommitRoutes(
         throw new ApiError(404, "not found");
       }
       const url = new URL(c.req.url);
-      const usernames = await usernamesByEmail(c.env.DB, [commit]);
+      const userRows = await userRowsByEmail(c.env.DB, [commit]);
       return c.json(
-        await toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, usernames, {
+        await toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, undefined, {
           stat: formBoolDefault(url, "stat"),
           files: formBoolDefault(url, "files"),
+          userRows,
         }),
         200,
       );
@@ -443,14 +450,16 @@ export function registerCommitRoutes(
       const url = new URL(c.req.url);
       const statFlag = formBoolDefault(url, "stat");
       const filesFlag = formBoolDefault(url, "files");
-      const usernames = await usernamesByEmail(c.env.DB, walked.commits);
+      const userRows = await userRowsByEmail(c.env.DB, walked.commits);
       // Upstream serves the compare commit list in git-log order (newest
       // first — compare.go's ShowPrettyFormatLogToList); the engine's
       // listCommitsRange is oldest-first (SPEC-0001b §4.1), so the render
       // reverses the walk (the push-payload precedent, webhooks-push.ts).
       const newestFirst = [...walked.commits].reverse();
       const rendered = await Promise.all(
-        newestFirst.map((commit) => toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, usernames, { stat: statFlag, files: filesFlag })),
+        newestFirst.map((commit) =>
+          toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, undefined, { stat: statFlag, files: filesFlag, userRows }),
+        ),
       );
       return c.json({ total_commits: walked.commits.length, commits: rendered }, 200);
     },
