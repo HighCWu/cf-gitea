@@ -329,16 +329,40 @@ describe("the armed producer (§3.1 candidate selection)", () => {
     await seedRepo("admin-repo", { ownerId: 71, ownerNamespace: "admin", createdAt: new Date(0) }); // exempt (§6.2)
     await seedRepo("org-repo", { ownerId: 72, ownerNamespace: "an-org", createdAt: new Date(0) }); // swept
     await seedRepo("orphan", { ownerId: null, createdAt: new Date(0) }); // swept, fail-safe (§3.1 step 2)
+    await seedRepo("dangling", { ownerId: 55, createdAt: new Date(0) }); // owner id with NO users row — swept (day-one §5.3 fix)
 
     const queue = spyQueue();
     const enqueued = await enqueueDueDemoSweeps(armedEnv(queue, "true"), { now: NOW });
-    expect(enqueued).toBe(3);
+    expect(enqueued).toBe(4);
     // Membership (the boundary/admin exclusions) — order-independent, since
-    // two candidates tie on created_at; strict oldest-first ORDER is the
+    // three candidates tie on created_at; strict oldest-first ORDER is the
     // LIMIT test's assertion (distinct timestamps there).
     const sweptIds = (queue.bodies[0] as DemoSweepShape[]).map((m) => m.repoId).sort();
-    expect(sweptIds).toEqual(["org-repo", "orphan", "past"]);
+    expect(sweptIds).toEqual(["dangling", "org-repo", "orphan", "past"]);
     expect(queue.bodies[0]!.some((m) => (m as DemoSweepShape).repoId === "boundary")).toBe(false);
+  });
+
+  it("the orphan arm (day-one §5.3 finding): a DANGLING owner_id (no users row) is sweep-eligible past retention; retention still gates and the admin-exempt arm is unchanged", async () => {
+    await seedUser(70, "plain");
+    await seedUser(71, "admin", { isAdmin: true });
+    // owner_id 55 has NO users row — the production finding's exact shape
+    // (dp3t/p0-shallow, docs/reviews/demo-day1-2026-10-28.md §5.3): under the
+    // old predicate the row escaped BOTH arms (owner_id held a value so the
+    // IS NULL arm was false, and the join's users.is_admin read NULL, whose
+    // `NULL = false` comparison is UNKNOWN — never satisfying the WHERE).
+    await seedRepo("dangling-old", { ownerId: 55, ownerNamespace: "dp3t", createdAt: new Date(0) }); // past retention → ENQUEUED
+    await seedRepo("dangling-young", { ownerId: 55, createdAt: new Date(CUT_MS + 60_000) }); // inside retention → NOT enqueued
+    await seedRepo("admin-repo", { ownerId: 71, ownerNamespace: "admin", createdAt: new Date(0) }); // exempt (§6.2, unchanged)
+    await seedRepo("plain-old", { ownerId: 70, createdAt: new Date(0) }); // the unchanged resolvable-non-admin arm
+
+    const queue = spyQueue();
+    const enqueued = await enqueueDueDemoSweeps(armedEnv(queue, "true"), { now: NOW });
+    expect(enqueued).toBe(2);
+    const sweptIds = (queue.bodies[0] as DemoSweepShape[]).map((m) => m.repoId).sort();
+    expect(sweptIds).toEqual(["dangling-old", "plain-old"]);
+    // The retention-gated and admin-exempt rows stay put.
+    expect(queue.bodies[0]!.some((m) => (m as DemoSweepShape).repoId === "dangling-young")).toBe(false);
+    expect(queue.bodies[0]!.some((m) => (m as DemoSweepShape).repoId === "admin-repo")).toBe(false);
   });
 
   it("LIMIT truncates oldest-first (§7: the deliberate hourly throttle)", async () => {

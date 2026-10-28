@@ -153,12 +153,24 @@ export function isDemoSweepMessage(value: unknown): value is DemoSweepMessage {
  * Candidate selection (§3.1 step 2): `repositories.created_at < now - 72 h`
  * (hour resolution), LEFT JOIN `users` on `owner_id` (the indexed
  * `repositories_owner_id_idx` join column) keeping rows where the owner is
- * NOT a site admin (`users.is_admin = false` — admin-owned repos are
- * exempt, and the demo's standing fixtures live under the bootstrap admin
- * precisely so they survive, §6.2) OR the row has a NULL owner (no
- * exempting principal exists → swept, fail-safe; every landed create path
- * populates ownerId, §3.1 step 2). Oldest first, LIMIT 50 — a backlog
- * (e.g. the §6.4 gate-flip backlog) drains oldest-first over hours.
+ * NOT a RESOLVABLE site admin — either the join resolves no users row
+ * (`users.id IS NULL`, the LEFT JOIN's null-extension marker: BOTH a NULL
+ * `owner_id` — a NULL key never satisfies the join equality — AND a DANGLING
+ * `owner_id` whose users row is gone, the day-one production finding,
+ * docs/reviews/demo-day1-2026-10-28.md §5.3; no exempting principal exists
+ * → swept, fail-safe, exactly the consumer's re-check posture in
+ * purge.ts handleDemoSweep where `owner?.isAdmin === true` is false for an
+ * unresolved owner) OR the resolved owner is not a site admin
+ * (`users.is_admin = false` — admin-owned repos are exempt, and the demo's
+ * standing fixtures live under the bootstrap admin precisely so they
+ * survive, §6.2). The ORIGINAL predicate's third arm `owner_id IS NULL` was
+ * wrong as the disjunct testing ownership: for a dangling id the column
+ * holds a VALUE (arm false), the join's `users.is_admin` is NULL, and
+ * `NULL = false` is UNKNOWN in SQL three-valued logic — `FALSE OR UNKNOWN`
+ * never satisfies the WHERE, so the row escaped every tick, permanently.
+ * `users.id IS NULL` subsumes that arm (a NULL owner_id null-extends the
+ * join too). Oldest first, LIMIT 50 — a backlog (e.g. the §6.4 gate-flip
+ * backlog) drains oldest-first over hours.
  *
  * NO CAS claim, on purpose (§3.1): the consumer's row deletion is the
  * claim. Returns the number of sweep messages enqueued.
@@ -195,7 +207,16 @@ export async function enqueueDueDemoSweeps(
     })
     .from(repositories)
     .leftJoin(users, eq(repositories.ownerId, users.id))
-    .where(and(lt(repositories.createdAt, cut), or(isNull(repositories.ownerId), eq(users.isAdmin, false))))
+    // Sweep-eligible = owner NOT resolvable-as-admin (§3.1 step 2; the day-one
+    // §5.3 fix). `users.id IS NULL` is the LEFT JOIN's null-extension marker
+    // (users.id is the PK — never NULL in a matched row): it covers BOTH a
+    // NULL owner_id and a DANGLING owner_id (users row gone — for which
+    // `users.is_admin = false` reads NULL and `NULL = false` is UNKNOWN, the
+    // three-valued-logic gap the production row escaped through). No
+    // resolvable owner ⇒ no exempting principal ⇒ swept (fail-safe, the same
+    // posture as the consumer's handleDemoSweep re-check); a resolved owner
+    // must be a non-admin.
+    .where(and(lt(repositories.createdAt, cut), or(isNull(users.id), eq(users.isAdmin, false))))
     .orderBy(asc(repositories.createdAt))
     .limit(limit);
 
