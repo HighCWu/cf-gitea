@@ -133,7 +133,74 @@ jobs:
       #   injection, finalize-success-lost retry convergence, cross-pack
       #   delta clone and REF_DELTA incremental fetch (git index-pack/
       #   verify-pack/fsck oracles).
-      - name: Engine checks (git-engine tsx gates — fault-matrix, push-origin, delete-husk, tree-commits, drain-discipline, capability-matrix, correctness-tier)
+      # The OLDER tsx checks (the second wave, wired 2026-10-28): all 13 ran
+      # green locally in this exact shape before landing; the e2e.sh-family
+      # harness scripts stay OUT (the e2e job runs those, against a dev
+      # server these checks deliberately never need).
+      # - check-merge-graph — SPEC-0001b §4.1 graph primitives vs git
+      #   merge-base/rev-list oracles: countDivergence/isAncestor(+Ex) on real
+      #   DAG fixtures, criss-cross base ∈ merge-base --all and stable,
+      #   budget exhaustion propagates, §4.6 read-only snapshot after every
+      #   read RPC.
+      # - check-merge-tree — SPEC-0001b §4.2 tree merge + diff3 vs git
+      #   merge-tree --write-tree / git merge-file: tree-oid equality on clean
+      #   merges (canonical ordering), conflicted-path list for all,
+      #   byte-exact markers per file, caps report too_large/overflow.
+      # - check-merge-engine — SPEC-0001b §4.3-4.5/4.8 merge/rebase RPC
+      #   semantics over a real GitStore: rejection postures (conflict,
+      #   too_large, overflow) and rebaseOnto's too_many/up_to_date/
+      #   invalid-ref arms with its final tree == real git rebase's.
+      # - check-deepen-parse — the G1/G4/G5 parse gates over parseUploadRequest:
+      #   deepen-family recognition (since/not/shallow), combination safety,
+      #   clean protocol-v2 ls-refs ref-prefix parsing (G2's ERR verdicts were
+      #   verified against a real git client in the landing report).
+      # - check-cache-unreachable — the G3 P0 gate: a poisoned deepen-since
+      #   request through the REAL serve fast path makes ZERO planCloneStream
+      #   RPCs and zero R2 interactions; the legal full clone is the control
+      #   (one plan RPC + one R2 get, inline renewal, release at last read).
+      # - check-catalog-rpc — the listPackCatalog RPC over a real GitStore:
+      #   keyset pagination (pack_key order, disjoint pages, exhaustion,
+      #   past-end cursor), tagged-union error cases, all-states visibility
+      #   (superseded rows listed), kind surfacing ('fork'), empty-catalog shape.
+      # - check-fork-replicate — SPEC-0001b §5.3 fork-replication gate (M-F3):
+      #   the production replicate loop over an in-memory R2 against a REAL
+      #   receive-populated parent — git index-pack/fsck/rev-count parity,
+      #   in-store reachable-set walk, R2 byte equality, crash-injection
+      #   re-run convergence with the crashed state un-servable.
+      # - check-read-leases — SPEC-0011 §3 M3.1: atomic plan+lease
+      #   (register-after-check closed by rollback), readable-catalog
+      #   dependency set, renewal/rejection postures (fault A/C, foreign pack,
+      #   unknown plan), release-on-last-read + idempotence + post-release
+      #   refusal, fault B restart survival, expiry sweep, DO-arm integration,
+      #   fast-path re-framing loop, the real RepoCell RPC surface.
+      # - check-segmented-serve — SPEC-0011 §4.1 M3.2: the segmented
+      #   union-serve path with the REAL uploadPack DO arm over a range-aware
+      #   R2 stub — bounded Range GETs with per-segment confirmed renewals,
+      #   lease-before-first-byte on one event timeline, fail-stop rejection,
+      #   the unsorted emission path gates its segments too, loose-only
+      #   guard-free.
+      # - check-compaction — SPEC-0011 §5 M3.3: real runCompaction over a real
+      #   GitStore — threshold round, deferred re-arm, stamp consumption,
+      #   receive exclusion, §5.3's appended row-4 assertion and the two D3
+      #   graceful-failure-exit checks.
+      # - check-gc — SPEC-0011 §2 M3.4: real GC pass over a real GitStore + R2
+      #   — reclaim eligibility vs live read leases (the §7.1 counter-example:
+      #   a reader under lease never sees a deleted pack), gcNow manual
+      #   rounds, alarm stamp gating and post-compaction convergence.
+      # - check-migrations — SPEC-0011 §8 M3.0: DO SQLite forward migrations —
+      #   fresh baseline replay, in-place adoption of a populated 0001a-step4
+      #   legacy DB (rows intact), re-run no-op, 0002 exactly-once, loud
+      #   fail-closed on unrecognized states, forward-only tripwire, registry
+      #   baseline, wipe-path rebuild.
+      # - check-validate-push — SPEC-0013 M2: the engine-side validatePush
+      #   hook contract over the REAL receive flow — classified commands
+      #   (create/fast-forward/force-push/delete via ONE classifyReceive RPC
+      #   over lease-staged rows), pusher identity on the hook context,
+      #   byte-identical legacy flow when no hook is set.
+      # Step budget: all 20 checks measured ~11s wall locally (2026-10-28,
+      # sequential fail-fast) — nowhere near a split; the 45-min job cap is
+      # dominated by the full-suite gate above, not this step.
+      - name: Engine checks (git-engine tsx gates — all 20 e2e check-*.mjs)
         run: |
           TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
           node "$TSX" packages/git-engine/e2e/check-fault-matrix.mjs
@@ -143,6 +210,19 @@ jobs:
           node "$TSX" packages/git-engine/e2e/check-drain-discipline.mjs
           node "$TSX" packages/git-engine/e2e/check-capability-matrix.mjs
           node "$TSX" packages/git-engine/e2e/check-correctness-tier.mjs
+          node "$TSX" packages/git-engine/e2e/check-merge-graph.mjs
+          node "$TSX" packages/git-engine/e2e/check-merge-tree.mjs
+          node "$TSX" packages/git-engine/e2e/check-merge-engine.mjs
+          node "$TSX" packages/git-engine/e2e/check-deepen-parse.mjs
+          node "$TSX" packages/git-engine/e2e/check-cache-unreachable.mjs
+          node "$TSX" packages/git-engine/e2e/check-catalog-rpc.mjs
+          node "$TSX" packages/git-engine/e2e/check-fork-replicate.mjs
+          node "$TSX" packages/git-engine/e2e/check-read-leases.mjs
+          node "$TSX" packages/git-engine/e2e/check-segmented-serve.mjs
+          node "$TSX" packages/git-engine/e2e/check-compaction.mjs
+          node "$TSX" packages/git-engine/e2e/check-gc.mjs
+          node "$TSX" packages/git-engine/e2e/check-migrations.mjs
+          node "$TSX" packages/git-engine/e2e/check-validate-push.mjs
       - name: API contract check (declared routes vs frozen contract, SPEC-0004 §5.1)
         run: pnpm check:api
       - name: "Contract freeze guard (ADR-0002: frozen copy verbatim + sha256)"
