@@ -7,12 +7,10 @@ import { z } from "zod";
 
 import {
   comments,
-  issueAssignees,
   issueDependencies,
   issuePins,
   issueStopwatches,
   issues,
-  pullRequests,
   repositories,
   trackedTimes,
   users,
@@ -20,34 +18,36 @@ import {
 import { CommentType } from "../../issues/comment-types";
 import { IssueNotExistError } from "../../issues/errors";
 import type { IssueRow } from "../../issues/service";
-import { emitIssueEvent, issueEventIdentity } from "../../services/issue-events";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
-import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { issueListSchema, issueSchema } from "../models/issue";
 import type { Issue } from "../models/issue";
-import { toApiPullRequest } from "../services/pulls";
 import { canWriteRepository, isRepositoryAdmin } from "../services/repo-access";
-import { findCollaborator } from "../services/repo-collaborators";
 import {
   GO_ZERO_TIME,
-  apiUserFromRow,
   canViewRepositoryWithTeams,
   findRepositoryByPath,
   findRepositoriesByIds,
   findUserByName,
   viewerOf,
 } from "../services/repository";
-import type { RepositoryRow, RepositoryWithOwner, UserRow, Viewer } from "../services/repository";
+import type { RepositoryRow, RepositoryWithOwner, Viewer } from "../services/repository";
 import {
+  addIssueAssignees,
   findIssueByRepoAndIndex,
   issueErrorToApiError,
   parseQueryTime,
   prefetchIssueRenderContext,
+  removeIssueAssignees,
+  requireAssignable,
+  resolveAssigneesByName,
   toApiIssue,
+  toApiIssueWithAssignees,
+  userNotExistError,
   type IssueRenderContext,
 } from "../services/issues";
+import { emitAssignEvent } from "./issues";
 
 /**
  * Tier-2 issue TABLE-family routes — the operations the issue-write wave
@@ -148,13 +148,19 @@ import {
  *     upstream-exact including the cantSetUser scoping (:108-119).
  *
  * Webhook triggers: the assignees POST/DELETE emit `issue_assign` /
- * `pull_request_assign` through the shared issue-family seam
- * (emitIssueEvent, src/services/issue-events.ts) — ONE `assigned` /
- * `unassigned` event per actually-changed assignee, in the post-write notify
- * position upstream's AddAssignees/RemoveAssignees hold (services/issue/
- * assignee.go:236-247 / :274-286 → services/webhook/notifier.go
- * IssueChangeAssignee:161-202; `changes.added_assignees` /
+ * `pull_request_assign` through routes/issues.ts's exported emitAssignEvent
+ * (the shared issue-family seam, src/services/issue-events.ts underneath) —
+ * ONE `assigned` / `unassigned` event per actually-changed assignee, in the
+ * post-write notify position upstream's AddAssignees/RemoveAssignees hold
+ * (services/issue/assignee.go:236-247 / :274-286 → services/webhook/
+ * notifier.go IssueChangeAssignee:161-202; `changes.added_assignees` /
  * `changes.removed_assignees`, the IsPull discriminant picks the type).
+ *
+ * The assignee write core (name resolution, assignability, the guarded
+ * add/remove loops, the type-9 comments, the enriched wire render) lives in
+ * the shared service seam (src/api/services/issues.ts — the PATCH-assignee
+ * landing's export family); this module carries only route concerns (auth
+ * gates, status codes, the response wire).
  */
 
 // ---------------------------------------------------------------------------
@@ -697,12 +703,6 @@ function notFoundError(): ApiError {
   return new ApiError(404, "not found");
 }
 
-/** `ErrUserNotExist` text; the status is the caller's arm (404 via
- *  APIErrorAuto's ErrNotExist unwrap, 422 for the assignee-name binding). */
-function userNotExistError(name: string, status: 404 | 422): ApiError {
-  return new ApiError(status, `user does not exist [uid: 0, name: ${name}]`);
-}
-
 /** `util.SecToHours` port (modules/util/sec_to_time.go:15-40). */
 function secToHours(totalSeconds: number): string {
   const hours = Math.floor(totalSeconds / 3600);
@@ -714,262 +714,6 @@ function secToHours(totalSeconds: number): string {
     out = unit(totalSeconds, "second");
   }
   return out.replace(/ $/, "");
-}
-
-// ---------------------------------------------------------------------------
-// Assignees (models/issues/assignees.go + services/issue/assignee.go)
-// ---------------------------------------------------------------------------
-
-/** Assignee rows joined with their user rows, insertion (rowid) order —
- *  upstream LoadAssignees' natural-order user join (assignees.go:36-46). */
-async function assigneeUserRows(d1: D1Database, issueId: number) {
-  const rows = await drizzle(d1)
-    .select({ user: users })
-    .from(issueAssignees)
-    .innerJoin(users, eq(users.id, issueAssignees.assigneeId))
-    .where(eq(issueAssignees.issueId, issueId))
-    .orderBy(asc(issueAssignees.id))
-    .all();
-  return rows.map((row) => row.user);
-}
-
-/**
- * CanBeAssigned (models/perm/access/repo_permission.go:588-598) collapsed
- * onto the landed ACL: write access to any unit, or read on the pulls unit
- * — a public repo grants every real user read; a private repo grants the
- * owner, site admins and collaborators (any mode — upstream pulls-unit
- * read covers read-mode collaborators too). Org rows are refused by the
- * caller (requireAssignable).
- */
-async function canBeAssigned(d1: D1Database, found: RepositoryWithOwner, user: { id: number; isAdmin: boolean }): Promise<boolean> {
-  if (found.repo.visibility === "public") {
-    return true;
-  }
-  if (user.isAdmin) {
-    return true;
-  }
-  if (found.repo.ownerId !== null && found.repo.ownerId === user.id) {
-    return true;
-  }
-  return (await findCollaborator(d1, found.repo.id, user.id)) !== null;
-}
-
-/** validateAssignee (services/issue/assignee.go:172-183): an org row is
- *  CanBeAssigned's InvalidArgument → 400; the rest is the access error →
- *  403 (ErrUserDoesNotHaveAccessToRepo via APIErrorAuto, ErrPermissionDenied). */
-async function requireAssignable(d1: D1Database, found: RepositoryWithOwner, user: { id: number; isAdmin: boolean; type: string }): Promise<void> {
-  if (user.type === "org") {
-    throw new ApiError(400, `organization can't be added as assignee [user_id: ${user.id}, repo_id: ${repoIdNumber(found.repo.id)}]`);
-  }
-  if (!(await canBeAssigned(d1, found, user))) {
-    throw new ApiError(403, `user doesn't have access to repo [user_id: ${user.id}, repo_name: ${found.repo.slug}]`);
-  }
-}
-
-/**
- * `GetDoerUserIDsByNames` (user.go:1237) — resolve the login list
- * case-insensitively; the FIRST miss aborts with the upstream 422
- * (updateIssueAssignees:201-209 answers the ErrNotExist text explicitly).
- */
-async function resolveAssigneesByName(d1: D1Database, names: string[]) {
-  const resolved = [];
-  for (const name of names) {
-    const user = await findUserByName(d1, name);
-    if (user === null) {
-      throw userNotExistError(name, 422);
-    }
-    resolved.push(user);
-  }
-  return resolved;
-}
-
-/**
- * The type-9 (assignees) comment + the num_comments fold, mirroring
- * toggleIssueAssignee (assignees.go:115-140): one comment per toggle with
- * the assignee id and the removed flag, poster = doer — one batch per
- * toggle (the guarded edge write has already committed by the time this
- * runs, so the per-toggle transaction is the honest grouping).
- */
-async function writeAssigneeComment(d1: D1Database, issue: IssueRow, assigneeId: number, removed: boolean, actorId: number, now: Date): Promise<void> {
-  await drizzle(d1).batch([
-    drizzle(d1).insert(comments).values({
-      type: CommentType.Assignees,
-      posterId: actorId,
-      issueId: issue.id,
-      assigneeId,
-      removedAssignee: removed ? 1 : 0,
-      content: "",
-      createdAt: now,
-      updatedAt: now,
-    }),
-    drizzle(d1).update(issues).set({ numComments: sql`num_comments + 1` }).where(eq(issues.id, issue.id)),
-  ]);
-}
-
-/**
- * AddAssignees (services/issue/assignee.go:206-247) reduced: per NEW
- * assignee — the guarded insert (AddAssigneeIfNotAssigned) + the type-9
- * comment. Already-assigned users produce NO comment; a non-assignable
- * user aborts with the upstream 400/403 (validateAssignee) before its own
- * insert — earlier inserts of the same call stand (upstream's tx rolls the
- * whole add back; we keep the committed prefix, see header deviations).
- * Returns the assignees actually added — upstream notifies per changed
- * assignee after the writes (assignee.go:236-247).
- *
- * `doerIsAdmin` feeds the validateAssignee blocked arm (assignee.go:169-170,
- * wired by the blocks-enforcement batch): the doer blocked by a NEW
- * assignee answers 403 "user is blocked". Upstream runs the arm inside
- * validateAssignee — after AddAssignees' already-assigned skip
- * (:216-222) and before CanBeAssigned; this loop validates assignability
- * BEFORE the skip (the landed deviation), so the arm sits after the skip
- * and its only precedence divergence is a blocked AND non-assignable name
- * answering the access 403 instead of this one.
- */
-async function addIssueAssignees(
-  d1: D1Database,
-  issue: IssueRow,
-  assignees: UserRow[],
-  found: RepositoryWithOwner,
-  actorId: number,
-  now: Date,
-  doerIsAdmin: boolean,
-): Promise<UserRow[]> {
-  const added: UserRow[] = [];
-  for (const user of assignees) {
-    await requireAssignable(d1, found, user);
-    const existing = await drizzle(d1)
-      .select({ id: issueAssignees.id })
-      .from(issueAssignees)
-      .where(and(eq(issueAssignees.issueId, issue.id), eq(issueAssignees.assigneeId, user.id)))
-      .limit(1)
-      .then((rows) => rows[0]);
-    if (existing !== undefined) {
-      continue; // AddAssigneeIfNotAssigned: already assigned, nothing to do
-    }
-    if (await isUserBlockedBy(d1, { id: actorId, isAdmin: doerIsAdmin }, user.id)) {
-      throw new ApiError(403, BLOCKED_USER_MESSAGE);
-    }
-    const inserted = await drizzle(d1)
-      .insert(issueAssignees)
-      .values({ issueId: issue.id, assigneeId: user.id })
-      .onConflictDoNothing()
-      .returning({ id: issueAssignees.id });
-    if (inserted.length === 0) {
-      continue; // a concurrent add won the unique index — same skip
-    }
-    added.push(user);
-    await writeAssigneeComment(d1, issue, user.id, false, actorId, now);
-  }
-  return added;
-}
-
-/**
- * RemoveAssignees (services/issue/assignee.go:249-286) reduced: per
- * assigned user — the delete + the type-9 removal comment. Users not
- * assigned are skipped silently (isAssigned → continue). Returns the
- * assignees actually removed — upstream notifies per changed assignee
- * after the writes (assignee.go:274-286).
- */
-async function removeIssueAssignees(d1: D1Database, issue: IssueRow, assignees: UserRow[], actorId: number, now: Date): Promise<UserRow[]> {
-  const removed: UserRow[] = [];
-  for (const user of assignees) {
-    const deleted = await drizzle(d1)
-      .delete(issueAssignees)
-      .where(and(eq(issueAssignees.issueId, issue.id), eq(issueAssignees.assigneeId, user.id)))
-      .returning({ id: issueAssignees.id });
-    if (deleted.length === 0) {
-      continue;
-    }
-    removed.push(user);
-    await writeAssigneeComment(d1, issue, user.id, true, actorId, now);
-  }
-  return removed;
-}
-
-/** The single PR row of an issue (upstream `issue.LoadPullRequest`). */
-async function findPullRequestRowByIssueId(d1: D1Database, issueId: number) {
-  const rows = await drizzle(d1).select().from(pullRequests).where(eq(pullRequests.issueId, issueId)).limit(1).all();
-  return rows[0] ?? null;
-}
-
-/**
- * The assignee add/remove webhook (services/webhook/notifier.go
- * IssueChangeAssignee:161-202): ONE event per actually-changed assignee, in
- * the handler AFTER the writes committed (the AddAssignees/RemoveAssignees
- * post-tx notify loops). action=assigned/unassigned; `changes` carries the
- * one-element `added_assignees` / `removed_assignees` side (ChangesPayload,
- * hook.go:486-489 — the lists are omitempty, only the changed side is set).
- * The `issue.IsPull` discriminant picks issue_assign vs pull_request_assign;
- * the payload's issue object renders the POST-change assignee set
- * (upstream's ToAPIIssue LoadAssignees — convert/issue.go:105-112) through
- * the module's assignee-enriched wire; a missing PR row skips the emission
- * (the issues.ts label/milestone pull-arm degradation).
- */
-async function emitAssignEvent(
-  c: Context<ApiEnv>,
-  found: RepositoryWithOwner,
-  issue: IssueRow,
-  assignee: UserRow,
-  removed: boolean,
-): Promise<void> {
-  const event = issueEventIdentity(viewerOf(c), found, c.get("authUser"));
-  const changes = removed
-    ? { removed_assignees: [apiUserFromRow(assignee, viewerOf(c))] }
-    : { added_assignees: [apiUserFromRow(assignee, viewerOf(c))] };
-  const action = removed ? "unassigned" : "assigned";
-  if (issue.isPull) {
-    const pr = await findPullRequestRowByIssueId(c.env.DB, issue.id);
-    if (pr === null) {
-      return;
-    }
-    await emitIssueEvent(c, {
-      repoId: found.repo.id,
-      ownerId: event.ownerId,
-      eventType: "pull_request_assign",
-      payload: {
-        action,
-        number: issue.index,
-        changes,
-        // ToPayloadPullRequest (pull.go:30-37) — the webhook payload renders
-        // the head repo regardless of the doer's visibility.
-        pull_request: await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
-        repository: event.repository,
-        sender: event.sender,
-        commit_id: "",
-      },
-    });
-    return;
-  }
-  await emitIssueEvent(c, {
-    repoId: found.repo.id,
-    ownerId: event.ownerId,
-    eventType: "issue_assign",
-    payload: {
-      action,
-      number: issue.index,
-      changes,
-      issue: await toApiIssueWithAssignees(c.env.DB, viewerOf(c), found, issue),
-      repository: event.repository,
-      sender: event.sender,
-      commit_id: "",
-    },
-  });
-}
-
-/**
- * The issue wire with the assignee/assignees block filled (convert.ToIssue
- * issue.go:105-113 — the first assignee duplicated into `assignee`; empty
- * → both null). The landed toApiIssue renders null (its TODO); only THIS
- * family's responses carry the enrichment until the issues.ts owner folds
- * it in.
- */
-async function toApiIssueWithAssignees(d1: D1Database, viewer: Viewer, found: RepositoryWithOwner, issue: IssueRow): Promise<Issue> {
-  const [base, assigneeRows] = await Promise.all([toApiIssue(d1, viewer, found, issue), assigneeUserRows(d1, issue.id)]);
-  if (assigneeRows.length === 0) {
-    return base;
-  }
-  const rendered = assigneeRows.map((row) => apiUserFromRow(row, viewer));
-  return { ...base, assignee: rendered[0] ?? null, assignees: rendered };
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,7 +1095,7 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     await assertIssueWriter(c, found);
     const names = c.req.valid("json").assignees ?? [];
     const assignees = await resolveAssigneesByName(c.env.DB, names);
-    const added = await addIssueAssignees(c.env.DB, issue, assignees, found, requireDoerId(c), new Date(), c.get("authUser")?.is_admin === true);
+    const added = await addIssueAssignees(c.env.DB, found, issue, assignees, { id: requireDoerId(c), isAdmin: c.get("authUser")?.is_admin === true });
     const reloaded = (await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index)) ?? issue;
     for (const user of added) {
       await emitAssignEvent(c, found, reloaded, user, false);
@@ -1372,7 +1116,7 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     await assertIssueWriter(c, found);
     const names = c.req.valid("json").assignees ?? [];
     const assignees = await resolveAssigneesByName(c.env.DB, names);
-    const removed = await removeIssueAssignees(c.env.DB, issue, assignees, requireDoerId(c), new Date());
+    const removed = await removeIssueAssignees(c.env.DB, issue, assignees, requireDoerId(c));
     const reloaded = (await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index)) ?? issue;
     for (const user of removed) {
       await emitAssignEvent(c, found, reloaded, user, true);
@@ -1390,7 +1134,7 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     await requireIssue(c, found, c.req.valid("param").index);
     const user = await findUserByName(c.env.DB, c.req.valid("param").assignee);
     if (user === null) {
-      throw userNotExistError(c.req.valid("param").assignee, 404);
+      throw userNotExistError(c.req.valid("param").assignee);
     }
     await requireAssignable(c.env.DB, found, user);
     return c.body(null, 204);
@@ -1608,7 +1352,7 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     if (qUser !== "") {
       const user = await findUserByName(c.env.DB, qUser);
       if (user === null) {
-        throw userNotExistError(qUser, 404);
+        throw userNotExistError(qUser);
       }
       userFilter = user.id;
     }
@@ -1686,7 +1430,7 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     if ((body.user_name ?? "") !== "" && (viewer.requester?.is_admin === true || (await isRepositoryAdmin(c, found)))) {
       const user = await findUserByName(c.env.DB, body.user_name ?? "");
       if (user === null) {
-        throw userNotExistError(body.user_name ?? "", 404);
+        throw userNotExistError(body.user_name ?? "");
       }
       userId = user.id;
     }

@@ -1407,13 +1407,17 @@ export async function changeIssueMilestone(
 }
 
 // ---------------------------------------------------------------------------
-// Assignee replace — `issue_service.UpdateAssignees` (services/issue/
-// assignee.go:94-166, pin fc493688). The shared write half of BOTH PATCH
-// assignee arms (issues EditIssue issue.go:772-779, pulls EditPullRequest
-// pull.go:679-694 call the same upstream service); landed here from the
-// pulls.ts port so the two routes share ONE implementation (the pulls side
-// keeps its pull_request_assign emitter, the issues side its IsPull-
-// discriminant assign emitter — the write half below is event-agnostic).
+// Assignee write core — `issue_service` (services/issue/assignee.go, pin
+// fc493688). The shared write half of BOTH PATCH assignee arms (issues
+// EditIssue issue.go:772-779, pulls EditPullRequest pull.go:679-694 call
+// UpdateAssignees:94-166 — replaceIssueAssignees below) AND of the /assignees
+// trio (issue_assignee.go AddIssueAssignees:23 / DeleteIssueAssignees:70 call
+// AddAssignees:206 / RemoveAssignees:249 — addIssueAssignees/
+// removeIssueAssignees below); landed here from the pulls.ts port so every
+// assignee route shares ONE implementation (the emissions stay with the
+// routes: the pulls side its pull_request_assign emitter, the issues PATCH
+// and the trio their IsPull-discriminant assign emitter — the write core
+// below is event-agnostic).
 // ---------------------------------------------------------------------------
 
 /** Assignee rows joined with their user rows, insertion (rowid) order —
@@ -1428,6 +1432,67 @@ export async function listIssueAssignees(d1: D1Database, issueId: number): Promi
     .orderBy(asc(issueAssignees.id))
     .all();
   return rows.map((row) => row.user);
+}
+
+/**
+ * CanBeAssigned (models/perm/access/repo_permission.go:588-598) collapsed
+ * onto the landed ACL: write access to any unit, or read on the pulls unit
+ * — a public repo grants every real user read; a private repo grants the
+ * owner, site admins and collaborators (any mode — upstream pulls-unit
+ * read covers read-mode collaborators too). Org rows are refused by the
+ * callers (requireAssignable). Shared by validateAssignee (the PATCH arm)
+ * and the /assignees trio.
+ */
+export async function canBeAssigned(d1: D1Database, found: RepositoryWithOwner, user: { id: number; isAdmin: boolean }): Promise<boolean> {
+  if (found.repo.visibility === "public") {
+    return true;
+  }
+  if (user.isAdmin) {
+    return true;
+  }
+  if (found.repo.ownerId !== null && found.repo.ownerId === user.id) {
+    return true;
+  }
+  return (await findCollaborator(d1, found.repo.id, user.id)) !== null;
+}
+
+/**
+ * validateAssignee minus the blocked arm — the /assignees trio's shape
+ * (services/issue/assignee.go:172-183): an org row is CanBeAssigned's
+ * InvalidArgument → 400; the rest is the access error → 403
+ * (ErrUserDoesNotHaveAccessToRepo via APIErrorAuto, ErrPermissionDenied).
+ * The org message renders the numeric registry id (the landed
+ * issue-tables-t2 rendering, repoIdNumber of the text id); the PATCH arm's
+ * validateAssignee below answers the same 400 with the raw id — each suite
+ * pins its own text.
+ */
+export async function requireAssignable(d1: D1Database, found: RepositoryWithOwner, user: { id: number; isAdmin: boolean; type: string }): Promise<void> {
+  if (user.type === "org") {
+    throw new ApiError(400, `organization can't be added as assignee [user_id: ${user.id}, repo_id: ${repoIdNumber(found.repo.id)}]`);
+  }
+  if (!(await canBeAssigned(d1, found, user))) {
+    throw new ApiError(403, `user doesn't have access to repo [user_id: ${user.id}, repo_name: ${found.repo.slug}]`);
+  }
+}
+
+/**
+ * `GetDoerUserIDsByNames` (user.go:1237) reduced to the /assignees trio:
+ * resolve the login list case-insensitively in order; the FIRST miss aborts
+ * with the bare ErrUserNotExist 422 (updateIssueAssignees:201-209 answers
+ * the ErrNotExist text explicitly) — the PATCH arm's resolveAssigneeNames
+ * below answers pull.go:688's wrapper text instead (two upstream mappings
+ * of the same lookup).
+ */
+export async function resolveAssigneesByName(d1: D1Database, names: string[]): Promise<UserRow[]> {
+  const resolved: UserRow[] = [];
+  for (const name of names) {
+    const user = await findUserByName(d1, name);
+    if (user === null) {
+      throw new ApiError(422, `user does not exist [uid: 0, name: ${name}]`);
+    }
+    resolved.push(user);
+  }
+  return resolved;
 }
 
 /** `GetDoerUserIDsByNames` reduced to the PATCH arm (user.go:1237): resolve
@@ -1468,12 +1533,7 @@ async function validateAssignee(d1: D1Database, found: RepositoryWithOwner, doer
   if (await isUserBlockedBy(d1, { id: doer.id, isAdmin: doer.isAdmin }, user.id)) {
     throw new ApiError(403, BLOCKED_USER_MESSAGE);
   }
-  const assignable =
-    found.repo.visibility === "public" ||
-    user.isAdmin ||
-    (found.repo.ownerId !== null && found.repo.ownerId === user.id) ||
-    (await findCollaborator(d1, found.repo.id, user.id)) !== null;
-  if (!assignable) {
+  if (!(await canBeAssigned(d1, found, user))) {
     throw new ApiError(403, `user doesn't have access to repo [user_id: ${user.id}, repo_name: ${found.repo.slug}]`);
   }
 }
@@ -1495,6 +1555,88 @@ async function writeAssigneeComment(d1: D1Database, issue: IssueRow, assigneeId:
     }),
     drizzle(d1).update(issues).set({ numComments: sql`num_comments + 1` }).where(eq(issues.id, issue.id)),
   ]);
+}
+
+/**
+ * AddAssignees (services/issue/assignee.go:206-247) reduced — the /assignees
+ * trio's POST arm: per NEW assignee — the guarded insert
+ * (AddAssigneeIfNotAssigned) + the type-9 comment. Already-assigned users
+ * produce NO comment; a non-assignable user aborts with the upstream 400/403
+ * (requireAssignable) before its own insert — earlier inserts of the same
+ * call stand (upstream's tx rolls the whole add back; the landed API keeps
+ * the committed prefix, the issue-tables-t2 header deviation). Returns the
+ * assignees actually added — the caller notifies per changed assignee after
+ * the writes (assignee.go:236-247, the trio's emitAssignEvent loop).
+ *
+ * `doer` feeds the validateAssignee blocked arm (assignee.go:169-170, wired
+ * by the blocks-enforcement batch): the doer blocked by a NEW assignee
+ * answers 403 "user is blocked". Upstream runs the arm inside
+ * validateAssignee — after AddAssignees' already-assigned skip (:216-222)
+ * and before CanBeAssigned; this loop validates assignability BEFORE the
+ * skip (the landed deviation), so the arm sits after the skip and its only
+ * precedence divergence is a blocked AND non-assignable name answering the
+ * access 403 instead of this one.
+ */
+export async function addIssueAssignees(
+  d1: D1Database,
+  found: RepositoryWithOwner,
+  issue: IssueRow,
+  assignees: UserRow[],
+  doer: { id: number; isAdmin: boolean },
+): Promise<UserRow[]> {
+  const actorId = doer.id;
+  const now = new Date();
+  const added: UserRow[] = [];
+  for (const user of assignees) {
+    await requireAssignable(d1, found, user);
+    const existing = await drizzle(d1)
+      .select({ id: issueAssignees.id })
+      .from(issueAssignees)
+      .where(and(eq(issueAssignees.issueId, issue.id), eq(issueAssignees.assigneeId, user.id)))
+      .limit(1)
+      .then((rows) => rows[0]);
+    if (existing !== undefined) {
+      continue; // AddAssigneeIfNotAssigned: already assigned, nothing to do
+    }
+    if (await isUserBlockedBy(d1, { id: actorId, isAdmin: doer.isAdmin }, user.id)) {
+      throw new ApiError(403, BLOCKED_USER_MESSAGE);
+    }
+    const inserted = await drizzle(d1)
+      .insert(issueAssignees)
+      .values({ issueId: issue.id, assigneeId: user.id })
+      .onConflictDoNothing()
+      .returning({ id: issueAssignees.id });
+    if (inserted.length === 0) {
+      continue; // a concurrent add won the unique index — same skip
+    }
+    added.push(user);
+    await writeAssigneeComment(d1, issue, user.id, false, actorId, now);
+  }
+  return added;
+}
+
+/**
+ * RemoveAssignees (services/issue/assignee.go:249-286) reduced — the
+ * /assignees trio's DELETE arm: per assigned user — the delete + the type-9
+ * removal comment. Users not assigned are skipped silently (isAssigned →
+ * continue). Returns the assignees actually removed — the caller notifies
+ * per changed assignee after the writes (assignee.go:274-286).
+ */
+export async function removeIssueAssignees(d1: D1Database, issue: IssueRow, assignees: UserRow[], actorId: number): Promise<UserRow[]> {
+  const now = new Date();
+  const removed: UserRow[] = [];
+  for (const user of assignees) {
+    const deleted = await drizzle(d1)
+      .delete(issueAssignees)
+      .where(and(eq(issueAssignees.issueId, issue.id), eq(issueAssignees.assigneeId, user.id)))
+      .returning({ id: issueAssignees.id });
+    if (deleted.length === 0) {
+      continue;
+    }
+    removed.push(user);
+    await writeAssigneeComment(d1, issue, user.id, true, actorId, now);
+  }
+  return removed;
 }
 
 /**
@@ -1571,6 +1713,23 @@ export async function replaceIssueAssignees(
   for (const user of added) {
     await onAssignee(user, false);
   }
+}
+
+/**
+ * The issue wire with the assignee/assignees block filled (convert.ToIssue
+ * issue.go:105-113 — the first assignee duplicated into `assignee`; empty →
+ * both null). The shared toApiIssue still renders the un-enriched shape
+ * (its TODO); the /assignees trio's responses and the assign emissions
+ * carry the fill until the API-surface fold wave flips every issue response
+ * at once (routes/issues.ts keeps its private twin until that wave).
+ */
+export async function toApiIssueWithAssignees(d1: D1Database, viewer: Viewer, found: RepositoryWithOwner, issue: IssueRow): Promise<Issue> {
+  const [base, assigneeRows] = await Promise.all([toApiIssue(d1, viewer, found, issue), listIssueAssignees(d1, issue.id)]);
+  if (assigneeRows.length === 0) {
+    return base;
+  }
+  const rendered = assigneeRows.map((row) => apiUserFromRow(row, viewer));
+  return { ...base, assignee: rendered[0] ?? null, assignees: rendered };
 }
 
 // ---------------------------------------------------------------------------
