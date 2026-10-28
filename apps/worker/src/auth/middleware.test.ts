@@ -7,10 +7,25 @@
 import { Hono } from "hono";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 
+import { users } from "../db/schema";
 import type { AuthEnv } from "./auth-context";
 import type { RateLimitHook } from "./failure-limiter";
-import { requireScope, requireToken, requireSiteAdmin, resolveAuth, sudo } from "./middleware";
+import {
+  PUBLIC_ONLY_FORBIDDEN_MESSAGE,
+  requireScope,
+  requireToken,
+  requireSiteAdmin,
+  requireContextUser,
+  rejectPublicOnly,
+  rejectPublicOnlyUserAssignment,
+  resolveAuth,
+  sudo,
+  userRedirectDoesNotExist,
+  type UserVisibility,
+} from "./middleware";
 import { basicHeader, basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "./testing/seeds";
 import { TokenService } from "./token-service";
 import { applyAuthD1Migrations } from "./testing/apply-d1-migrations";
@@ -31,6 +46,15 @@ const buildApp = (): Hono<AuthEnv> => {
     const auth = c.get("auth");
     return c.json({ user: auth?.user?.username ?? null, scope: auth?.scope?.toString() ?? null });
   });
+  // The ungated sibling GET mirrors upstream POST /user/repos (api.go:1181):
+  // only the POST arm carries rejectPublicOnly; the GET route has no gate.
+  app.get("/_gated", (c) => c.json({ ok: true }));
+  app.post("/_gated", rejectPublicOnly("POST"), (c) => c.json({ ok: true }));
+  app.get("/_always_gated", rejectPublicOnly(), (c) => c.json({ ok: true }));
+  app.get("/_users/:username", rejectPublicOnlyUserAssignment(), (c) => c.json({ ok: true }));
+  app.get("/_users/:username/tokens", requireContextUser(), (c) =>
+    c.json({ user: c.get("contextUser").username }),
+  );
   return app;
 };
 
@@ -271,6 +295,138 @@ describe("sudo (SPEC-0002 §4.2)", () => {
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ user: "SoloAdmin", scope: "all" });
+  });
+});
+
+describe("public-only enforcement (rejectPublicOnly + the userAssignment arm)", () => {
+  const PUBLIC_ONLY_403 = { message: PUBLIC_ONLY_FORBIDDEN_MESSAGE, url: SWAGGER_URL };
+
+  /** Flip a seeded user's `users.visibility` (seeds default to public). */
+  async function setVisibility(usernameLower: string, visibility: UserVisibility): Promise<void> {
+    await drizzle(env.DB).update(users).set({ visibility }).where(eq(users.usernameLower, usernameLower));
+  }
+
+  async function seedPublicOnly(username: string): Promise<Seeded> {
+    return seedWithToken(username, "public-only,read:user");
+  }
+
+  it("public-only token on a gated route → exact upstream 403", async () => {
+    const seeded = await seedPublicOnly("GatePeon");
+    const response = await call("https://example.com/_always_gated", {
+      headers: { Authorization: `token ${seeded.token}` },
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual(PUBLIC_ONLY_403);
+  });
+
+  it("anonymous and regular-scope tokens pass the gate", async () => {
+    const anon = await call("https://example.com/_always_gated");
+    expect(anon.status).toBe(200);
+
+    const regular = await seedWithToken("RegularDoer", "read:user");
+    const response = await call("https://example.com/_always_gated", {
+      headers: { Authorization: `token ${regular.token}` },
+    });
+    expect(response.status).toBe(200);
+  });
+
+  it("method-scoped arm: the sibling GET passes, the POST arm refuses", async () => {
+    const seeded = await seedPublicOnly("MethodPeon");
+    const get = await call("https://example.com/_gated", {
+      headers: { Authorization: `token ${seeded.token}` },
+    });
+    expect(get.status).toBe(200);
+
+    const post = await call("https://example.com/_gated", {
+      method: "POST",
+      headers: { Authorization: `token ${seeded.token}` },
+    });
+    expect(post.status).toBe(403);
+    expect(await post.json()).toEqual(PUBLIC_ONLY_403);
+  });
+
+  it("requireContextUser: public-only token vs a limited target → masked redirect 404", async () => {
+    await seedVerifiedUser({ username: "LimitedUser" });
+    await setVisibility("limiteduser", "limited");
+    const seeded = await seedPublicOnly("PoVisitor");
+
+    const response = await call("https://example.com/_users/LimitedUser/tokens", {
+      headers: { Authorization: `token ${seeded.token}` },
+    });
+    expect(response.status).toBe(404);
+    // Raw path param in the message, upstream ErrUserRedirectNotExist verbatim.
+    expect(await response.json()).toEqual({
+      message: userRedirectDoesNotExist("LimitedUser"),
+      url: SWAGGER_URL,
+    });
+  });
+
+  it("requireContextUser: a public target resolves contextUser for a public-only token", async () => {
+    await seedVerifiedUser({ username: "OpenUser" });
+    const seeded = await seedPublicOnly("PoVisitor");
+
+    const response = await call("https://example.com/_users/openuser/tokens", {
+      headers: { Authorization: `token ${seeded.token}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ user: "OpenUser" });
+  });
+
+  it("requireContextUser: the arm covers the SELF visit of a limited public-only doer", async () => {
+    const self = await seedWithToken("ShySelf", "public-only,read:user");
+    await setVisibility("shyself", "limited");
+
+    const response = await call("https://example.com/_users/ShySelf/tokens", {
+      headers: { Authorization: `token ${self.token}` },
+    });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      message: userRedirectDoesNotExist("ShySelf"),
+      url: SWAGGER_URL,
+    });
+  });
+
+  it("requireContextUser: a non-public-only doer visits a limited target untouched", async () => {
+    await seedVerifiedUser({ username: "LimitedUser" });
+    await setVisibility("limiteduser", "limited");
+    const seeded = await seedWithToken("NormalVisitor", "read:user");
+
+    const response = await call("https://example.com/_users/limiteduser/tokens", {
+      headers: { Authorization: `token ${seeded.token}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ user: "LimitedUser" });
+  });
+
+  it("mount-shaped arm: limited target → masked 404; unknown target falls through", async () => {
+    await seedVerifiedUser({ username: "LimitedUser" });
+    await setVisibility("limiteduser", "limited");
+    const seeded = await seedPublicOnly("PoVisitor");
+
+    const masked = await call("https://example.com/_users/LimitedUser", {
+      headers: { Authorization: `token ${seeded.token}` },
+    });
+    expect(masked.status).toBe(404);
+    expect(await masked.json()).toEqual({
+      message: userRedirectDoesNotExist("LimitedUser"),
+      url: SWAGGER_URL,
+    });
+
+    // An unknown target is the route's own 404 — the arm stays silent.
+    const unknown = await call("https://example.com/_users/ghost", {
+      headers: { Authorization: `token ${seeded.token}` },
+    });
+    expect(unknown.status).toBe(200);
+    expect(await unknown.json()).toEqual({ ok: true });
+  });
+
+  it("mount-shaped arm: the static /users/search shape is skipped (static-over-param)", async () => {
+    const seeded = await seedPublicOnly("PoVisitor");
+    const response = await call("https://example.com/_users/search", {
+      headers: { Authorization: `token ${seeded.token}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
   });
 });
 

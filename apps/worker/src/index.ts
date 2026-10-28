@@ -2,6 +2,11 @@ import { Hono } from "hono";
 
 import { createDurableGit, Registry, RepoCell } from "@cf-gitea/git-engine";
 import { resolveAuth, tokenRouter } from "./auth";
+import {
+  rejectPublicOnly,
+  rejectPublicOnlyUserAssignment,
+  sudo,
+} from "./auth/middleware";
 import { createApiRouter } from "./api/router";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
@@ -61,6 +66,67 @@ app.get("/healthz", (c) => c.json({ ok: true }));
 // tier-1 surface (version/user/repos/users/markdown + batches), declared
 // against the frozen contract (pnpm check:api).
 app.use("/api/v1/*", resolveAuth());
+
+// Upstream's tree-wide sudo() wrap: the entire v1 tree sits inside one
+// m.Group closed by `}, sudo())` (api.go:999–1872), so admin impersonation
+// via `?sudo=`/`Sudo` runs after credential resolution and before every
+// route gate. The impersonated doer keeps the ADMIN token's scope, and the
+// public-only gates below evaluate that effective credential — upstream
+// keeps `ExtDoerData` on the swapped doer the same way (api.go:129–139).
+app.use("/api/v1/*", sudo());
+
+// Upstream rejectPublicOnly() placements — one mount per chi group / single
+// route arm at the pin, never blanket-applied (a public-only token carries
+// the restriction bit; anonymous and other tokens pass untouched):
+//   /notifications group — the mailbox mixes public and private repo events
+//     (api.go:1044–1051);
+//   /user/settings (1101), /user/emails (1106), /user/actions (1138),
+//     /user/keys (1156), /user/applications (1167), /user/gpg_keys (1175),
+//     /user/gpg_key_token (1176), /user/gpg_key_verify (1177);
+//   POST /user/repos only — the sibling GET stays public-only-visible
+//     (api.go:1181);
+//   /user/times (1192), /user/stopwatches (1193), /user/teams (1195),
+//     /user/hooks (1202), /user/avatar (1207), /user/blocks (1216);
+//   POST /org/{org}/repos deprecated shape (1224), POST /repos/migrate
+//     (1237), POST the generate route (1245), POST /orgs (1723), POST
+//     /orgs/{org}/repos (1731);
+//   the whole /admin group (1867). Not wired here: upstream's
+//     reqOrgOwnership inner gate (api.go:425) and the /user group's
+//     contextAuthenticatedUser wrap (api.go:1217) — route-file-owned
+//     placements recorded as the follow-up.
+app.use("/api/v1/notifications/*", rejectPublicOnly());
+app.use("/api/v1/user/settings/*", rejectPublicOnly());
+app.use("/api/v1/user/emails/*", rejectPublicOnly());
+app.use("/api/v1/user/actions/*", rejectPublicOnly());
+app.use("/api/v1/user/keys/*", rejectPublicOnly());
+app.use("/api/v1/user/applications/*", rejectPublicOnly());
+app.use("/api/v1/user/gpg_keys/*", rejectPublicOnly());
+app.use("/api/v1/user/gpg_key_token", rejectPublicOnly());
+app.use("/api/v1/user/gpg_key_verify", rejectPublicOnly());
+app.use("/api/v1/user/repos", rejectPublicOnly("POST"));
+app.use("/api/v1/user/times", rejectPublicOnly());
+app.use("/api/v1/user/stopwatches", rejectPublicOnly());
+app.use("/api/v1/user/teams", rejectPublicOnly());
+app.use("/api/v1/user/hooks/*", rejectPublicOnly());
+app.use("/api/v1/user/avatar/*", rejectPublicOnly());
+app.use("/api/v1/user/blocks/*", rejectPublicOnly());
+app.use("/api/v1/org/:org/repos", rejectPublicOnly("POST"));
+app.use("/api/v1/repos/migrate", rejectPublicOnly("POST"));
+app.use("/api/v1/repos/:template_owner/:template_repo/generate", rejectPublicOnly("POST"));
+app.use("/api/v1/orgs", rejectPublicOnly("POST"));
+app.use("/api/v1/orgs/:org/repos", rejectPublicOnly("POST"));
+app.use("/api/v1/admin/*", rejectPublicOnly());
+
+// The userAssignment public-only arm (services/context/user.go:61–64) for
+// the /users/{username} resolve paths — upstream chains UserAssignmentAPI
+// onto these groups (api.go:1074, 1715, 1722) while our directory routes
+// resolve the context user themselves. A public-only token resolving a
+// limited/private target answers the masked ErrUserRedirectNotExist 404;
+// the arm skips unknown targets (routes own their miss 404s) and the
+// `search` segment (upstream's static /users/search registration wins over
+// the /{username} param group — static-over-param precedence, api.go:1062).
+app.use("/api/v1/users/:username/*", rejectPublicOnlyUserAssignment());
+
 app.route("/api/v1", tokenRouter);
 app.route("/api/v1", createApiRouter());
 

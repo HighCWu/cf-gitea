@@ -6,9 +6,15 @@
  * upstream anti-enumeration 404, the `IsUserVisibleToViewer` ladder
  * (services/user.ts), the directory search's Types filter + viewer ceiling,
  * and the runtime pagination headers.
+ *
+ * The mounted-chain suite at the bottom exercises the REAL worker composition
+ * through `SELF` — src/index.ts's /api/v1 mount hunks (`resolveAuth` →
+ * `sudo()` → the `rejectPublicOnly`/userAssignment-arm guards) — with D1
+ * minted tokens: the sudo() route-level trio and the public-only route arms
+ * (upstream api.go:111–146 / 249–257 / services/context/user.go:61–64).
  */
 
-import { applyD1Migrations } from "cloudflare:test";
+import { SELF, applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
@@ -17,6 +23,7 @@ import { follows, orgMembers, users } from "../db/schema";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
+import { mintFor, resetAuthTables } from "../auth/testing/seeds";
 
 // The vitest plugin's per-test storage isolation discards setupFiles-era D1
 // writes; schema from `beforeAll` migrations persists for the file (same
@@ -560,5 +567,143 @@ describe("GET /users/search (userSearch)", () => {
       '<https://example.com/users/search?limit=5&page=1>; rel="first",' +
         '<https://example.com/users/search?limit=5&page=1>; rel="prev"',
     );
+  });
+});
+
+describe("mounted chain (SELF — src/index.ts's /api/v1 mounts): sudo trio", () => {
+  beforeEach(async () => {
+    // The mounted chain verifies REAL D1 tokens (unlike the stub-resolver
+    // suites above); credential tables get the same reset the auth suites use.
+    await resetAuthTables();
+    seededById.clear();
+  });
+
+  it("admin + Sudo header impersonates — GET /user answers the TARGET's login", async () => {
+    const admin = await seedUser("SudoAdmin", { isAdmin: true });
+    await seedUser("Impersonated");
+    const minted = await mintFor(admin.id, "sudo-admin", "all");
+
+    const res = await SELF.fetch("https://example.com/api/v1/user", {
+      headers: { Authorization: `token ${minted.plaintext}`, Sudo: "impersonated" },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({ login: "Impersonated" });
+  });
+
+  it("non-admin with ?sudo → 403, upstream message verbatim", async () => {
+    const peon = await seedUser("SudoPeon");
+    const minted = await mintFor(peon.id, "peon-token", "all");
+
+    const res = await SELF.fetch("https://example.com/api/v1/user?sudo=someone", {
+      headers: { Authorization: `token ${minted.plaintext}` },
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ message: "Only administrators allowed to sudo.", url: ERROR_URL });
+  });
+
+  it("admin sudo onto an unknown target → 404 not found", async () => {
+    const admin = await seedUser("SudoAdminGhost", { isAdmin: true });
+    const minted = await mintFor(admin.id, "ghost-admin", "all");
+
+    const res = await SELF.fetch("https://example.com/api/v1/user?sudo=ghost", {
+      headers: { Authorization: `token ${minted.plaintext}` },
+    });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+});
+
+describe("mounted chain (SELF): public-only route arms", () => {
+  beforeEach(async () => {
+    await resetAuthTables();
+    seededById.clear();
+  });
+
+  /** A doer holding a `public-only` token (`rejectPublicOnly`, api.go:249–257). */
+  async function seedPublicOnlyDoer(username: string): Promise<string> {
+    const doer = await seedUser(username);
+    const minted = await mintFor(doer.id, `${username.toLowerCase()}-po`, "public-only,read:user");
+    return minted.plaintext;
+  }
+
+  it("public-only token vs a limited user → masked redirect 404 (userAssignment arm)", async () => {
+    await seedUser("quiet", { visibility: "limited" });
+    const token = await seedPublicOnlyDoer("PoVisitor");
+
+    const res = await SELF.fetch("https://example.com/api/v1/users/quiet", {
+      headers: { Authorization: `token ${token}` },
+    });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({
+      message: "user redirect does not exist [name: quiet]",
+      url: ERROR_URL,
+    });
+  });
+
+  it("public-only token vs a public user → 200", async () => {
+    await seedUser("open");
+    const token = await seedPublicOnlyDoer("PoVisitor");
+
+    const res = await SELF.fetch("https://example.com/api/v1/users/open", {
+      headers: { Authorization: `token ${token}` },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({ login: "open", visibility: "public" });
+  });
+
+  it("admin group refusal per upstream's placement (api.go:1867)", async () => {
+    const token = await seedPublicOnlyDoer("PoVisitor");
+
+    const res = await SELF.fetch("https://example.com/api/v1/admin/users", {
+      headers: { Authorization: `token ${token}` },
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      message: "this endpoint is not available for public-only tokens",
+      url: ERROR_URL,
+    });
+  });
+
+  it("notifications refusal per upstream's placement (api.go:1051)", async () => {
+    const token = await seedPublicOnlyDoer("PoVisitor");
+
+    const res = await SELF.fetch("https://example.com/api/v1/notifications", {
+      headers: { Authorization: `token ${token}` },
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      message: "this endpoint is not available for public-only tokens",
+      url: ERROR_URL,
+    });
+  });
+
+  it("POST /user/repos refuses, the sibling GET stays public-only-visible (api.go:1181)", async () => {
+    const token = await seedPublicOnlyDoer("PoRepoOwner");
+
+    const post = await SELF.fetch("https://example.com/api/v1/user/repos", {
+      method: "POST",
+      headers: { Authorization: `token ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ name: "nope" }),
+    });
+    expect(post.status).toBe(403);
+    expect(await post.json()).toEqual({
+      message: "this endpoint is not available for public-only tokens",
+      url: ERROR_URL,
+    });
+
+    const get = await SELF.fetch("https://example.com/api/v1/user/repos", {
+      headers: { Authorization: `token ${token}` },
+    });
+    expect(get.status).toBe(200);
+    // userCurrentListRepos answers a bare RepositoryList — the doer owns no
+    // repos here; the point is the absence of the public-only 403.
+    expect(await get.json<unknown[]>()).toEqual([]);
   });
 });

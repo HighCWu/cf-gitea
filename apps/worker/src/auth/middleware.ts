@@ -13,7 +13,10 @@
 
 import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 
+import { users } from "../db/schema";
 import type { AuthEnv, AuthInfo, AuthUser } from "./auth-context";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "./httpauth";
 import { D1FailureLimiter, type RateLimitHook, type RateLimitVerdict } from "./failure-limiter";
@@ -25,6 +28,18 @@ const INVALID_CREDENTIAL_MESSAGE = "invalid username, password or token";
 
 /** Unpinned by SPEC-0002 §2.7 (only status + Retry-After are specified). */
 const RATE_LIMITED_MESSAGE = "too many authentication failures, retry later";
+
+/** Upstream `rejectPublicOnly` / `contextAuthenticatedUser` 403 body (api.go:251–256). */
+export const PUBLIC_ONLY_FORBIDDEN_MESSAGE = "this endpoint is not available for public-only tokens";
+
+/** Upstream `user_model.ErrUserRedirectNotExist.Error()` (redirect.go:27–29) —
+ *  the masked 404 body `userAssignment` answers with (services/context/user.go:62). */
+export function userRedirectDoesNotExist(username: string): string {
+  return `user redirect does not exist [name: ${username}]`;
+}
+
+/** The `users.visibility` enum (SPEC-0003 §2.5.6 / upstream VisibleType). */
+export type UserVisibility = "public" | "limited" | "private";
 
 export interface ResolveAuthOptions {
   /** Override the failure-limit backend (defaults to the D1 limiter). */
@@ -233,10 +248,39 @@ export function requireSiteAdmin(): MiddlewareHandler<AuthEnv> {
 }
 
 /**
+ * Upstream `DoerTokenAllowsOwner` (models/user/user_extdata.go:122–124):
+ * a public-only token credential may resolve only PUBLIC owners — the
+ * `publicOnly` restriction bit rides the attached token's scope set, exactly
+ * like upstream's `extDoerToken.publicOnly` (a non-token or anonymous doer
+ * never carries the bit and always passes).
+ */
+export function doerTokenAllowsOwner(
+  scope: ScopeSet | null | undefined,
+  ownerVisibility: UserVisibility,
+): boolean {
+  return scope?.publicOnly !== true || ownerVisibility === "public";
+}
+
+/** The `users.visibility` column by case-folded name, or null for no row. */
+async function userVisibilityByName(db: D1Database, usernameLower: string): Promise<UserVisibility | null> {
+  const row = await drizzle(db)
+    .select({ visibility: users.visibility })
+    .from(users)
+    .where(eq(users.usernameLower, usernameLower))
+    .get();
+  return row?.visibility ?? null;
+}
+
+/**
  * Upstream `context.UserAssignmentAPI()` (services/context/user.go:32–35):
  * resolve the `:username` route target (case-insensitive; the doer short-
  * circuit keeps a display-cased self-visit stable). Unknown users are 404s
  * that do not disclose existence. Sets `c.var.contextUser`.
+ *
+ * Carries upstream's `userAssignment` public-only arm (user.go:61–64): a
+ * public-only token visiting a limited/private target — THEMSELVES included,
+ * the check is over the resolved row — answers the masked
+ * `ErrUserRedirectNotExist` 404.
  */
 export function requireContextUser(): MiddlewareHandler<AuthEnv> {
   return async (c, next) => {
@@ -251,6 +295,9 @@ export function requireContextUser(): MiddlewareHandler<AuthEnv> {
     }
     if (user === null) {
       return apiErrorNotFound(c);
+    }
+    if (!doerTokenAllowsOwner(auth?.scope, await userVisibilityByName(c.env.DB, user.usernameLower) ?? "public")) {
+      return apiErrorResponse(c, 404, userRedirectDoesNotExist(username));
     }
     c.set("contextUser", user);
     return next();
@@ -310,6 +357,65 @@ export function sudo(): MiddlewareHandler<AuthEnv> {
     }
     // Swap the doer; token + scope stay (they belong to the admin's credential).
     c.set("auth", { ...auth, user: impersonated });
+    return next();
+  };
+}
+
+/**
+ * Upstream `rejectPublicOnly()` (api.go:249–257): a token carrying the
+ * `public-only` restriction bit (`IsPublicOnlyDoer` — anonymous and
+ * non-token credentials never carry it) is refused with the exact upstream
+ * 403 body. Upstream chains it onto specific route groups only (the
+ * placements are enumerated where this is mounted); it must never be
+ * blanket-applied.
+ *
+ * With `methods` the gate is scoped to those HTTP methods — upstream arms
+ * like `Post(rejectPublicOnly(), …)` on a path whose sibling GET stays
+ * public-only-visible (POST /user/repos, api.go:1181 — GET /user/repos is
+ * NOT gated).
+ */
+export function rejectPublicOnly(...methods: string[]): MiddlewareHandler<AuthEnv> {
+  return async (c, next) => {
+    if (methods.length > 0 && !methods.includes(c.req.method)) {
+      return next();
+    }
+    const auth = c.get("auth");
+    if (auth?.scope?.publicOnly !== true) {
+      return next();
+    }
+    return apiErrorResponse(c, 403, PUBLIC_ONLY_FORBIDDEN_MESSAGE);
+  };
+}
+
+/**
+ * The `userAssignment` public-only arm (services/context/user.go:61–64) as a
+ * mount-shaped middleware for the `/api/v1/users/{username}` resolve paths:
+ * upstream chains `context.UserAssignmentAPI()` onto those groups
+ * (api.go:1074 — GetInfo/heatmap/repos/projects/tokens/feeds plus the
+ * keys/gpg_keys/followers/following/starred/subscriptions group, 1715
+ * packages, 1722 orgs), while our directory routes resolve the context user
+ * themselves — so the arm mounts above them. A public-only token resolving a
+ * limited/private target answers the masked `ErrUserRedirectNotExist` 404
+ * (existence never disclosed). Unknown targets fall through — the route
+ * owns its own miss 404 — and the `search` segment is skipped: upstream
+ * registers the static `/users/search` route inside the same tree before
+ * the `/{username}` param group (static-over-param precedence), so
+ * `userAssignment` never runs for that shape.
+ */
+export function rejectPublicOnlyUserAssignment(): MiddlewareHandler<AuthEnv> {
+  return async (c, next) => {
+    const username = c.req.param("username") ?? "";
+    if (username === "" || username.toLowerCase() === "search") {
+      return next();
+    }
+    const auth = c.get("auth");
+    if (auth?.scope?.publicOnly !== true) {
+      return next();
+    }
+    const visibility = await userVisibilityByName(c.env.DB, username.toLowerCase());
+    if (visibility !== null && !doerTokenAllowsOwner(auth.scope, visibility)) {
+      return apiErrorResponse(c, 404, userRedirectDoesNotExist(username));
+    }
     return next();
   };
 }

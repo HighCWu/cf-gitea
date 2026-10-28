@@ -15,6 +15,9 @@ export * from "./auth-context";
 export {
   apiErrorNotFound,
   apiErrorResponse,
+  doerTokenAllowsOwner,
+  rejectPublicOnly,
+  rejectPublicOnlyUserAssignment,
   requireBasicAuth,
   requireContextUser,
   requireScope,
