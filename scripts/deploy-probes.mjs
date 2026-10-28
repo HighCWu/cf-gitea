@@ -297,7 +297,7 @@ const usage = () =>
   "  window2-mounts: (no extra options)\n" +
   "  window3-mounts: (no extra options)\n" +
   "  fixwave-parity: (no extra options — needs an ADMIN PAT + wrangler auth for the d1 arms; --d1-scope rides the rotation backdate)\n" +
-  "  branch-protection: (no extra options — needs an ADMIN PAT for the member arm + wrangler auth for the priority id lookup; --d1-scope rides it)\n" +
+  "  branch-protection: (no extra options — needs an ADMIN PAT for the member arm; the priority ids and the slash-glob arm are pure API now)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -2866,11 +2866,19 @@ const fixwaveFailureCleanup = async (ctx) => {
  *      and the list back to [].
  *   2. Priority (repoUpdateBranchProtectionPriories): a second rule, then the
  *      ids POST {ids:[…]} → 204 and the list order follows the renumber. The
- *      ids come from wrangler d1 (--d1-scope): NEITHER the BranchProtection
- *      render (structs/repo_branch.go has no id field) nor the repo render
- *      (repositoryIdNumber parses the TEXT uuid → 0) exposes an addressable
- *      rule id — the D1 lookup is the probe's only lever, and the gap is
- *      recorded here rather than invented around.
+ *      ids come straight off the API render (`id` — the cf-gitea addition
+ *      that closed the probe's recorded gap: upstream's BranchProtection
+ *      struct has no id field, yet its priority op consumes exactly those
+ *      row ids, so ours renders the real integer key; the old wrangler-d1
+ *      lookup is gone and the priority op is API-addressable end to end).
+ *   6. The slash-glob wildcard (the second recorded gap): a GLOB rule
+ *      `release/v*` — a name the single-segment {name} route cannot match —
+ *      is created → 201, then GET/PATCH/DELETE address it through the
+ *      wildcard path (the literal slash in the URL, upstream's chi
+ *      `m.Group("/*")` + ctx.PathParam("*") runtime shape, api.go:1328-1332 +
+ *      branch.go:556) — 200 renders, the PATCH echo, 204 delete, 404 after.
+ *      The declared-constraint arm rides along: the same rule also answers
+ *      through the percent-encoded %2F form (the {name} route).
  *   3. Push-time per-ref rejection (the M2 gate): ONE real `git push` carrying
  *      TWO refs — a fast-forward to the protected main plus a create of an
  *      unprotected sibling. The protected ref answers upstream's per-ref
@@ -2903,12 +2911,13 @@ const fixwaveFailureCleanup = async (ctx) => {
  * CHAINED (the shared-fixture shape — a red in the setup skips the arms that
  * need it, like registry/generate; NOT independent like fixwave-parity: the
  * arms share one repo and the merge gate's verdict reads arms built earlier).
- * Needs an ADMIN PAT (the member-user arm) and wrangler auth for the priority
- * arm's rule-id lookup (--d1-scope picks the database, remote by default —
- * keep it in step with --base-url). A red run sweeps the rules (best-effort
- * explicit deletes, so a failed repo delete still lands the audit back at
- * protected_branches == 0), then the repo (its delete cascades the rest),
- * then the member's token + the member user (the fixwave tail's shape).
+ * Needs an ADMIN PAT (the member-user arm) only — the priority arm reads its
+ * ids off the API render and the slash-glob arm rides the wildcard routes,
+ * so wrangler/D1 auth is no longer part of this battery. A red run sweeps
+ * the rules (best-effort explicit deletes, so a failed repo delete still
+ * lands the audit back at protected_branches == 0), then the repo (its
+ * delete cascades the rest), then the member's token + the member user (the
+ * fixwave tail's shape).
  */
 
 const branchProtectionContext = () => ({
@@ -2918,14 +2927,17 @@ const branchProtectionContext = () => ({
   scratchRule: `bps-${hexId(6)}`,
   devRule: `bpd-${hexId(6)}`,
   globRule: "v*",
+  slashGlobRule: "release/v*", // the wildcard-addressing arm (a slash the {name} route cannot match)
   missingRule: `bp-missing-${hexId(6)}`,
   prNumber: null,
   c1: null, // the pre-push main tip (the rejection's must-not-move pin)
   c2: null, // the push-arm commit (the sibling's tip, the merged PR's head)
   member: `bpmb-${hexId()}`, memberToken: null, memberTokenId: null,
-  // The rules this battery created, in order — { name, created, gone }. The
-  // green cleanup + the red tail both iterate it (explicit deletes so the
-  // audit's protected_branches == 0 holds even when the repo delete fails).
+  // The rules this battery created, in order — { name, id, created, gone }.
+  // `id` is the ADDRESSABLE key straight off the create echo's render (the
+  // priority op's input; the old D1 lookup is gone). The green cleanup + the
+  // red tail both iterate the list (explicit deletes so the audit's
+  // protected_branches == 0 holds even when the repo delete fails).
   rules: [],
   repoCreated: false, repoFullName: null, repoGone: false,
   memberCreated: false, memberGone: false,
@@ -2933,11 +2945,15 @@ const branchProtectionContext = () => ({
 });
 
 /** POST one rule on the battery's repo; marks it created for the failure-tail
- *  sweep and returns the raw response. */
+ *  sweep and records the echo's addressable id (the render's real integer
+ *  key — the priority op's input). Returns the raw response. */
 const createRule = async (ctx, body) => {
   const res = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections`, { method: "POST", body });
   const track = ctx.rules.find((r) => r.name === body.rule_name);
-  if (res.status === 201 && track) track.created = true;
+  if (res.status === 201 && track) {
+    track.created = true;
+    track.id = res.json?.id ?? null;
+  }
   return res;
 };
 
@@ -2971,7 +2987,7 @@ const branchProtectionSteps = (ctx) => [
     id: "bp-rule-create-201",
     expect: `POST …/branch_protections {"rule_name":"${ctx.scratchRule}"} → 201 field-faithful: rule_name + branch_name echo the plain name, priority 1 (MAX+1 on the empty repo — protected_branch.go:502-513), the zero config (enable_push false, required_approvals 0)`,
     run: async () => {
-      ctx.rules.push({ name: ctx.scratchRule, created: false, gone: false });
+      ctx.rules.push({ name: ctx.scratchRule, id: null, created: false, gone: false });
       const res = await createRule(ctx, { rule_name: ctx.scratchRule });
       expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 160)}`);
       expectRuleFields(res.json, [
@@ -3040,7 +3056,7 @@ const branchProtectionSteps = (ctx) => [
     id: "bp-rule-main-create-201",
     expect: `POST …/branch_protections {"rule_name":"main","required_approvals":1} → 201 (the WORKING rule for the push/merge arms: main protected, one approval required, enable_push still false — everyone rejected at the push gate)`,
     run: async () => {
-      ctx.rules.push({ name: "main", created: false, gone: false });
+      ctx.rules.push({ name: "main", id: null, created: false, gone: false });
       const res = await createRule(ctx, { rule_name: "main", required_approvals: 1 });
       expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 160)}`);
       expectRuleFields(res.json, [
@@ -3051,20 +3067,22 @@ const branchProtectionSteps = (ctx) => [
   },
   {
     id: "bp-rule-priority-204",
-    expect: `THE PRIORITY OP: POST a second rule (priority 2) → 201; rule ids read via wrangler d1 (--${opts.d1Scope} — the render carries none: BranchProtection has no id field and the repo render's id parses the TEXT uuid to 0); POST …/branch_protections/priority {"ids":[<dev>,<main>]} → 204; the list order follows the renumber [dev(1), main(2)]`,
+    expect: `THE PRIORITY OP (API-addressable): POST a second rule (priority 2) → 201 whose echo carries the addressable integer id (the cf-gitea render addition — upstream's BranchProtection struct has no id field, yet the priority op consumes exactly these row ids); the LIST renders the SAME ids; POST …/branch_protections/priority {"ids":[<dev>,<main>]} with those render ids → 204; the list order follows the renumber [dev(1), main(2)]`,
     run: async () => {
-      ctx.rules.push({ name: ctx.devRule, created: false, gone: false });
+      ctx.rules.push({ name: ctx.devRule, id: null, created: false, gone: false });
       const dev = await createRule(ctx, { rule_name: ctx.devRule });
       expect(dev.status === 201, `second-rule status ${dev.status} (expected 201): ${dev.text.slice(0, 160)}`);
       expect(dev.json?.priority === 2, `second-rule priority ${dev.json?.priority} (expected 2 — MAX+1)`);
-      const repoRow = await d1Exec(`SELECT id FROM repositories WHERE owner_namespace = '${ctx.user}' AND slug = '${ctx.repo}'`);
-      const repoId = repoRow.at(-1)?.results?.[0]?.id;
-      expect(typeof repoId === "string" && repoId.length > 0, `no D1 repositories row for ${ctx.user}/${ctx.repo} (the probe addresses rules by id; the API render carries none)`);
-      const ruleRows = await d1Exec(`SELECT id, rule_name FROM protected_branches WHERE repo_id = '${repoId}'`);
-      const rows = ruleRows.at(-1)?.results ?? [];
-      const idOf = (name) => rows.find((r) => r.rule_name === name)?.id;
+      // the ids come off the create echoes' render — the recorded gap's
+      // closure; the wrangler-d1 lookup the old arm needed is gone
+      const idOf = (name) => ctx.rules.find((r) => r.name === name)?.id;
       const ids = [idOf(ctx.devRule), idOf("main")];
-      expect(ids.every((v) => Number.isInteger(v)), `rule ids from D1 are not integers: ${JSON.stringify(rows)}`);
+      expect(ids.every((v) => Number.isInteger(v) && v > 0),
+        `the create echoes carry no addressable rule ids: ${JSON.stringify(ctx.rules.map((r) => [r.name, r.id]))}`);
+      // the LIST renders the same addressable ids the echoes did
+      const before = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections`);
+      expect(before.status === 200 && ids.every((v) => (before.json ?? []).some((r) => r.id === v)),
+        `the list render's ids drifted from the create echoes: ${JSON.stringify((before.json ?? []).map((r) => [r.rule_name, r.id]))}`);
       const prio = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections/priority`, { method: "POST", body: { ids } });
       expect(prio.status === 204, `priority status ${prio.status} (expected 204): ${prio.text.slice(0, 160)}`);
       const list = await api(`/repos/${ctx.user}/${ctx.repo}/branch_protections`);
@@ -3072,7 +3090,7 @@ const branchProtectionSteps = (ctx) => [
       expect(list.json?.length === 2 && list.json[0]?.rule_name === ctx.devRule && list.json[0]?.priority === 1 &&
           list.json[1]?.rule_name === "main" && list.json[1]?.priority === 2,
         `the list did not follow the swap: [${order.join(", ")}] (expected [${ctx.devRule}(1), main(2)])`);
-      return `priority swap 204 — the list renumbered to [${order.join(", ")}] (ids via d1)`;
+      return `priority swap 204 — the list renumbered to [${order.join(", ")}] (ids straight off the API render)`;
     },
   },
   {
@@ -3204,7 +3222,7 @@ const branchProtectionSteps = (ctx) => [
     id: "bp-flags-roundtrip",
     expect: `THE WHITELIST/ENFORCE-ADMINS ROUND-TRIP (M4): POST a GLOB rule "${ctx.globRule}" carrying the enforceable flag set (push/force-push/deletion whitelists + merge whitelist + bypass allowlist + approvals whitelist, all [<owner>]; required_approvals 2; block_on_outdated_branch, block_admin_merge_override; status-check contexts; protected-file patterns) → 201 echoing EVERY field (branch_name "" — the glob name is special; the M4 sanitizer keeps the owner, who holds write/any-access, in every list) and the GET echoes it again`,
     run: async () => {
-      ctx.rules.push({ name: ctx.globRule, created: false, gone: false });
+      ctx.rules.push({ name: ctx.globRule, id: null, created: false, gone: false });
       const ownerList = [ctx.user];
       const res = await createRule(ctx, {
         rule_name: ctx.globRule,
@@ -3264,6 +3282,39 @@ const branchProtectionSteps = (ctx) => [
         ["block_admin_merge_override", true],
       ], "the cascade echo");
       return `the flags flipped off + the deletion pair scrubbed; the id lists and absent arms kept (upstream branch.go:894-936)`;
+    },
+  },
+  {
+    id: "bp-slash-glob-wildcard",
+    expect: `THE SLASH-GLOB WILDCARD (the second recorded gap): POST a GLOB rule "${ctx.slashGlobRule}" — a name the single-segment {name} declaration cannot match — → 201 echoing the addressable id; GET …/branch_protections/${ctx.slashGlobRule} with the LITERAL slash → 200 (the wildcard route, upstream's chi m.Group("/*") + ctx.PathParam("*"), api.go:1328-1332 + branch.go:556) rendering branch_name "" + the same id; PATCH it through the same path → 200 echoing the patch; DELETE → 204 then GET → 404; the percent-encoded %2F form answers 200 through the DECLARED {name} route too`,
+    run: async () => {
+      ctx.rules.push({ name: ctx.slashGlobRule, id: null, created: false, gone: false });
+      const created = await createRule(ctx, { rule_name: ctx.slashGlobRule, enable_status_check: true, status_check_contexts: ["ci/bp-slash-glob"] });
+      expect(created.status === 201, `create status ${created.status} (expected 201): ${created.text.slice(0, 200)}`);
+      expect(Number.isInteger(created.json?.id) && created.json.id > 0, `no addressable id on the create echo: ${created.text.slice(0, 120)}`);
+      // LITERAL slash in the path — the wildcard sibling's arm
+      const base = `/repos/${ctx.user}/${ctx.repo}/branch_protections/${ctx.slashGlobRule}`;
+      const read = await api(base);
+      expect(read.status === 200, `wildcard GET status ${read.status} (expected 200): ${read.text.slice(0, 160)}`);
+      expectRuleFields(read.json, [
+        ["rule_name", ctx.slashGlobRule], ["branch_name", ""], // isRuleNameSpecial — the glob name renders the deprecated field EMPTY
+        ["id", created.json.id], ["enable_status_check", true], ["status_check_contexts", ["ci/bp-slash-glob"]],
+      ], "the wildcard GET render");
+      const patched = await api(base, { method: "PATCH", body: { required_approvals: 1 } });
+      expect(patched.status === 200, `wildcard PATCH status ${patched.status} (expected 200): ${patched.text.slice(0, 160)}`);
+      expectRuleFields(patched.json, [["rule_name", ctx.slashGlobRule], ["required_approvals", 1], ["enable_status_check", true]], "the wildcard PATCH echo");
+      // the same rule through the DECLARED route: %2F stays one segment
+      const encoded = await api(`${base.slice(0, base.lastIndexOf("/"))}%2Fv*`);
+      expect(encoded.status === 200, `encoded GET status ${encoded.status} (expected 200 via the {name} route): ${encoded.text.slice(0, 160)}`);
+      expectRuleFields(encoded.json, [["rule_name", ctx.slashGlobRule], ["required_approvals", 1]], "the encoded GET render");
+      // self-contained delete through the wildcard (tracked gone for the sweep)
+      const deleted = await api(base, { method: "DELETE" });
+      expect(deleted.status === 204, `wildcard DELETE status ${deleted.status} (expected 204)`);
+      const track = ctx.rules.find((r) => r.name === ctx.slashGlobRule);
+      if (track) track.gone = true;
+      const after = await api(base);
+      expect(after.status === 404, `wildcard GET after delete ${after.status} (expected 404)`);
+      return `slash-glob rule addressed end to end through the wildcard path (201 → 200 → 200 → 204 → 404; the %2F form rides the declared route)`;
     },
   },
   {

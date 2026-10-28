@@ -2,7 +2,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { createRoute, z } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
-import type { MiddlewareHandler } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 
 import { protectedBranches, teams, users } from "../../db/schema";
 import type { ApiEnv } from "../env";
@@ -51,6 +51,22 @@ import { assertNotArchived, requireRepoAdmin, requireVisibleRepo } from "../serv
  * NOT the glob first-match the gates use; the {name} path parameter is a rule
  * name ("a branch name or a glob match to branch name"). Missing rule and
  * foreign-repo rule are the same plain 404 (ctx.APIErrorNotFound).
+ *
+ * WILDCARD ADDRESSABILITY — upstream DECLARES `{name}` in its swagger but
+ * registers the three name-addressed ops under a chi catch-all group
+ * (api.go:1328-1332: `m.Group("/*", ...)` holding Get/Patch/Delete) and reads
+ * the name with `ctx.PathParam("*")` (branch.go:556) — so glob rule names that
+ * contain slashes (`release/v*`) address correctly on the wire. Ours mirrors
+ * that runtime shape: the declared openapi routes stay `{name}`
+ * single-segment (the frozen contract's shape — upstream's swagger text is
+ * identical), and each has a plain-Hono `/repos/:owner/:repo/
+ * branch_protections/*` sibling (registered after, before the priority POST —
+ * upstream's group order) sharing the same handler core. Slash-free names
+ * match the declared route; only multi-segment names fall through to the
+ * catch-all (hono's param route wins on the shared prefix — probed), so the
+ * two arms never disagree. POST /priority is method-disjoint, exactly like
+ * upstream (a rule literally named "priority" 404s through the same
+ * fall-through).
  *
  * CREATE semantics (branch.go:652-845): `rule_name` falls back to the
  * deprecated `branch_name` (:689-692); both empty is upstream's runtime 400
@@ -116,6 +132,10 @@ const validationErrorResponse = {
   content: { "application/json": { schema: apiErrorSchema } },
 } as const;
 
+/** The wildcard siblings' Hono pattern — the runtime catch-all under the
+ *  same prefix the declared `{name}` route serves (module-header note). */
+const WILDCARD_ROUTE = "/repos/:owner/:repo/branch_protections/*";
+
 const repoArchivedResponse = {
   description: "repoArchivedError",
   content: { "application/json": { schema: apiErrorSchema } },
@@ -136,8 +156,20 @@ const bindValidationHook = ({ success }: { success: boolean }): undefined => {
 /** The rendered BranchProtection (structs/repo_branch.go:33-80) — every field
  *  renders (Go structs carry no omitempty), including the deprecated
  *  `branch_name` and the upstream json-tag quirk `approvals_whitelist_username`
- *  (singular; the Go field is ApprovalsWhitelistUsernames). */
+ *  (singular; the Go field is ApprovalsWhitelistUsernames).
+ *
+ *  DIVERGENCE — `id`: upstream's BranchProtection struct carries NO id field
+ *  (repo_branch.go:33-80; the vendored swagger agrees), yet its priority op
+ *  consumes exactly those row ids (`UpdateBranchProtectionPriories{IDs []int64}`
+ *  → db.ID(id) over ProtectedBranch, protected_branch.go:529-545) — upstream's
+ *  own clients cannot learn the ids from the API. Our rule rows are
+ *  integer-keyed exactly like upstream's (`protected_branches.id` autoincrement,
+ *  the releases/labels render convention: `id: row.id`), so the render exposes
+ *  the real addressable key and the priority op becomes API-addressable
+ *  (SPEC-0013 as-built note; additive field — the frozen contract check pins
+ *  paths + response codes only). */
 export const branchProtectionSchema = z.object({
+  id: z.number().int().openapi({ format: "int64", description: "the addressable rule id (the priority op's input; cf-gitea addition — upstream's struct has no id field)" }),
   branch_name: z.string().openapi({ description: "deprecated (but useful): the rule name when it is a plain branch name, else empty" }),
   rule_name: z.string().openapi({ description: "name of the branch protection rule (a branch name or a glob)" }),
   priority: z.number().int().openapi({ format: "int64", description: "the priority of this branch protection rule" }),
@@ -265,6 +297,11 @@ const editOptionShape = {
   unprotected_file_patterns: z.string().optional(),
   block_admin_merge_override: z.boolean().optional(),
 } as const;
+
+/** The edit body hoisted so the wildcard sibling re-validates it with the
+ *  same shape the declared route binds (module-header note). */
+const editOptionBodySchema = z.object(editOptionShape);
+type EditProtectionForm = z.infer<typeof editOptionBodySchema>;
 
 const ownerRepoParams = {
   owner: z.string().min(1).openapi({ description: "owner of the repo" }),
@@ -452,6 +489,7 @@ async function renderProtection(d1: D1Database, row: ProtectionRow): Promise<z.i
   const teamNamesOf = (ids: number[]): string[] => ids.map((id) => teamNameMap.get(id)).filter((name): name is string => name !== undefined);
 
   return {
+    id: row.id,
     branch_name: isRuleNameSpecial(row.ruleName) ? "" : row.ruleName,
     rule_name: row.ruleName,
     priority: row.priority,
@@ -516,10 +554,242 @@ function configOf(rule: ProtectionRow): ProtectedBranchConfig {
 }
 
 // ---------------------------------------------------------------------------
+// The name-addressed handler cores — shared by the declared {name} routes and
+// their wildcard siblings so the two addressability arms can never disagree
+// (module-header note). The repo gates (requireVisibleRepo/requireRepoAdmin/
+// assertNotArchived) stay in the wrappers: every arm gates identically.
+// ---------------------------------------------------------------------------
+
+/** repoGetBranchProtection's body — the exact-name lookup + render (the
+ *  serialized body object; the wrappers own the typed c.json). */
+async function getBranchProtectionByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ruleName: string): Promise<z.infer<typeof branchProtectionSchema>> {
+  const rule = requireRule(await findRuleByName(c.env.DB, pair.repo.id, ruleName));
+  return renderProtection(c.env.DB, rule);
+}
+
+/** repoEditBranchProtection's body — the pointer-semantics patch + recompute. */
+async function editBranchProtectionByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ruleName: string, form: EditProtectionForm): Promise<z.infer<typeof branchProtectionSchema>> {
+  const rule = requireRule(await findRuleByName(c.env.DB, pair.repo.id, ruleName));
+  const config = configOf(rule);
+  // The short-circuit's comparison side: the config AS LOADED, before any
+  // pointer patch merges over it (sanitizeRuleWhitelists keeps a list the
+  // edit did not change verbatim — updateUserWhitelist :575-577 et al.).
+  const stored = configOf(rule);
+
+  // The push master cascades its sub-flags (branch.go:894-913); the
+  // deploy-key booleans ride the same cascade (HasDeployKeyPush input).
+  let pushDeployKeys = config.whitelistUserIds.includes(DEPLOY_KEY_USER_ID);
+  let forcePushDeployKeys = config.forcePushAllowlistUserIds.includes(DEPLOY_KEY_USER_ID);
+  if (form.enable_push !== undefined) {
+    if (form.enable_push === false) {
+      config.canPush = false;
+      config.enableWhitelist = false;
+      pushDeployKeys = false;
+    } else {
+      config.canPush = true;
+      if (form.enable_push_whitelist !== undefined) {
+        if (form.enable_push_whitelist === false) {
+          config.enableWhitelist = false;
+          pushDeployKeys = false;
+        } else {
+          config.enableWhitelist = true;
+          if (form.push_whitelist_deploy_keys !== undefined) {
+            pushDeployKeys = form.push_whitelist_deploy_keys;
+          }
+        }
+      }
+    }
+  }
+  if (form.enable_force_push !== undefined) {
+    if (form.enable_force_push === false) {
+      config.canForcePush = false;
+      config.enableForcePushAllowlist = false;
+      forcePushDeployKeys = false;
+    } else {
+      config.canForcePush = true;
+      if (form.enable_force_push_allowlist !== undefined) {
+        if (form.enable_force_push_allowlist === false) {
+          config.enableForcePushAllowlist = false;
+          forcePushDeployKeys = false;
+        } else {
+          config.enableForcePushAllowlist = true;
+          if (form.force_push_allowlist_deploy_keys !== undefined) {
+            forcePushDeployKeys = form.force_push_allowlist_deploy_keys;
+          }
+        }
+      }
+    }
+  }
+  if (form.enable_deletion !== undefined) {
+    config.canDelete = form.enable_deletion;
+  }
+  if (form.enable_deletion_allowlist !== undefined) {
+    config.enableDeletionAllowlist = form.enable_deletion_allowlist;
+  }
+  // The post-patch re-conjunction (:935-936).
+  config.canDelete = config.canPush && config.canDelete;
+  config.enableDeletionAllowlist = config.canDelete && config.enableDeletionAllowlist;
+
+  if (form.priority !== undefined) {
+    rule.priority = form.priority;
+  }
+  if (form.enable_merge_whitelist !== undefined) config.enableMergeWhitelist = form.enable_merge_whitelist;
+  if (form.enable_bypass_allowlist !== undefined) config.enableBypassAllowlist = form.enable_bypass_allowlist;
+  if (form.enable_status_check !== undefined) config.enableStatusCheck = form.enable_status_check;
+  if (form.status_check_contexts !== undefined) config.statusCheckContexts = form.status_check_contexts;
+  if (form.required_approvals !== undefined && form.required_approvals >= 0) config.requiredApprovals = form.required_approvals;
+  if (form.enable_approvals_whitelist !== undefined) config.enableApprovalsWhitelist = form.enable_approvals_whitelist;
+  if (form.block_on_rejected_reviews !== undefined) config.blockOnRejectedReviews = form.block_on_rejected_reviews;
+  if (form.block_on_official_review_requests !== undefined) config.blockOnOfficialReviewRequests = form.block_on_official_review_requests;
+  if (form.block_on_codeowner_reviews !== undefined) config.blockOnCodeownerReviews = form.block_on_codeowner_reviews;
+  if (form.dismiss_stale_approvals !== undefined) config.dismissStaleApprovals = form.dismiss_stale_approvals;
+  if (form.ignore_stale_approvals !== undefined) config.ignoreStaleApprovals = form.ignore_stale_approvals;
+  if (form.require_signed_commits !== undefined) config.requireSignedCommits = form.require_signed_commits;
+  if (form.protected_file_patterns !== undefined) config.protectedFilePatterns = form.protected_file_patterns;
+  if (form.unprotected_file_patterns !== undefined) config.unprotectedFilePatterns = form.unprotected_file_patterns;
+  if (form.block_on_outdated_branch !== undefined) config.blockOnOutdatedBranch = form.block_on_outdated_branch;
+  if (form.block_admin_merge_override !== undefined) config.blockAdminMergeOverride = form.block_admin_merge_override;
+
+  // Whitelists: a present name array replaces (422 on unknown), an
+  // absent one keeps the stored ids (:1080-1086). The team arm resolves
+  // on org-owned repos only.
+  const whitelistUsers = (await resolveUserIds(c.env.DB, form.push_whitelist_usernames)) ?? config.whitelistUserIds;
+  const forcePushAllowlistUsers = (await resolveUserIds(c.env.DB, form.force_push_allowlist_usernames)) ?? config.forcePushAllowlistUserIds;
+  const deletionAllowlistUsers = (await resolveUserIds(c.env.DB, form.deletion_allowlist_usernames)) ?? config.deletionAllowlistUserIds;
+  const mergeWhitelistUsers = (await resolveUserIds(c.env.DB, form.merge_whitelist_usernames)) ?? config.mergeWhitelistUserIds;
+  const approvalsWhitelistUsers = (await resolveUserIds(c.env.DB, form.approvals_whitelist_username)) ?? config.approvalsWhitelistUserIds;
+  const bypassAllowlistUsers = (await resolveUserIds(c.env.DB, form.bypass_allowlist_usernames)) ?? config.bypassAllowlistUserIds;
+
+  const isOrg = pair.owner.type === "org";
+  const whitelistTeams = form.push_whitelist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.push_whitelist_teams) : config.whitelistTeamIds;
+  const forcePushAllowlistTeams =
+    form.force_push_allowlist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.force_push_allowlist_teams) : config.forcePushAllowlistTeamIds;
+  const deletionAllowlistTeams =
+    form.deletion_allowlist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.deletion_allowlist_teams) : config.deletionAllowlistTeamIds;
+  const mergeWhitelistTeams = form.merge_whitelist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.merge_whitelist_teams) : config.mergeWhitelistTeamIds;
+  const approvalsWhitelistTeams =
+    form.approvals_whitelist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.approvals_whitelist_teams) : config.approvalsWhitelistTeamIds;
+  const bypassAllowlistTeams =
+    form.bypass_allowlist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.bypass_allowlist_teams) : config.bypassAllowlistTeamIds;
+
+  // The deploy-key persistence dance (:1085-1098): a usernames array that
+  // still carries the pseudo-id re-arms the flag when the form was silent.
+  if (form.push_whitelist_usernames !== undefined && form.push_whitelist_deploy_keys === undefined && whitelistUsers.includes(DEPLOY_KEY_USER_ID)) {
+    pushDeployKeys = true;
+  }
+  if (form.force_push_allowlist_usernames !== undefined && form.force_push_allowlist_deploy_keys === undefined && forcePushAllowlistUsers.includes(DEPLOY_KEY_USER_ID)) {
+    forcePushDeployKeys = true;
+  }
+
+  // Disabled arms clear their arrays before the save (:1180-1192).
+  const bypassEnabled = config.enableBypassAllowlist;
+  const deletionEnabled = config.enableDeletionAllowlist;
+  config.whitelistUserIds = setDeployKeyAllowlist(whitelistUsers, pushDeployKeys);
+  config.whitelistTeamIds = whitelistTeams;
+  config.forcePushAllowlistUserIds = setDeployKeyAllowlist(forcePushAllowlistUsers, forcePushDeployKeys);
+  config.forcePushAllowlistTeamIds = forcePushAllowlistTeams;
+  config.deletionAllowlistUserIds = deletionEnabled ? deletionAllowlistUsers : [];
+  config.deletionAllowlistTeamIds = deletionEnabled ? deletionAllowlistTeams : [];
+  config.mergeWhitelistUserIds = mergeWhitelistUsers;
+  config.mergeWhitelistTeamIds = mergeWhitelistTeams;
+  config.approvalsWhitelistUserIds = approvalsWhitelistUsers;
+  config.approvalsWhitelistTeamIds = approvalsWhitelistTeams;
+  config.bypassAllowlistUserIds = bypassEnabled ? bypassAllowlistUsers : [];
+  config.bypassAllowlistTeamIds = bypassEnabled ? bypassAllowlistTeams : [];
+
+  // The save-side sanitization (M4) — the merged lists pass the
+  // write/any-access/repo-access filters before the row is written; an
+  // absent name array equals the stored list and short-circuits through
+  // untouched (upstream keeps already-stored ids on an unchanged list;
+  // the deletion scrub owns those).
+  await sanitizeRuleWhitelists(c.env.DB, pair.repo, config, stored);
+
+  await drizzle(c.env.DB)
+    .update(protectedBranches)
+    .set({ priority: rule.priority, rules: serializeRuleConfig(config), updatedAt: new Date() })
+    .where(eq(protectedBranches.id, rule.id));
+  const updated = requireRule(await findRuleByName(c.env.DB, pair.repo.id, ruleName));
+
+  // The recheck fan-out (branch.go:1147-1180 — CheckPRsForBaseBranch for
+  // a plain existing rule, FindAllMatchedBranches for a glob; our
+  // recompute's matched-base loop covers both arms).
+  await recomputeLogged(c.env.DB, pair, updated);
+  return renderProtection(c.env.DB, updated);
+}
+
+/** repoDeleteBranchProtection's body — the row delete + the no-rule recompute. */
+async function deleteBranchProtectionByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ruleName: string): Promise<void> {
+  const rule = requireRule(await findRuleByName(c.env.DB, pair.repo.id, ruleName));
+  await drizzle(c.env.DB).delete(protectedBranches).where(eq(protectedBranches.id, rule.id));
+  // The fan-out runs on delete too (upstream skips it there; a deleted
+  // whitelist can only widen officialness — module-header note). The
+  // evaluation config is the NO-RULE state (the service's
+  // isUserOfficialReviewer null-arm: plain write access), matched over
+  // the deleted rule's name so exactly the branches it protected
+  // re-evaluate — evaluating the deleted rule's own config here would
+  // preserve the very restriction that just went away.
+  const noRuleState: ProtectionRow = { ...rule, rules: serializeRuleConfig(emptyRuleConfig()) };
+  await recomputeLogged(c.env.DB, pair, noRuleState);
+}
+
+/**
+ * The wildcard sibling's rule name — the decoded RAW tail after the canonical
+ * prefix (hono's catch-all carries no param; upstream reads ctx.PathParam("*"),
+ * branch.go:556). The handler may see the FULL request path (the worker mounts
+ * the api router at /api/v1 — hono keeps c.req.path unstripped inside the
+ * sub-app), so the cut anchors on the `repos/{owner}/{repo}/branch_protections`
+ * shape found scanning from the LEFT: the real family prefix always precedes
+ * the rule name, so the first match wins whatever the mount depth (and a rule
+ * containing "repos"/"branch_protections" as later segments cannot hijack it).
+ * Decode mirrors hono's own param decode: one decodeURIComponent pass, a
+ * malformed escape keeps the raw text (probed against hono 4.13).
+ */
+function ruleNameOfTail(c: Context<ApiEnv>): string {
+  const segments = c.req.path.split("/");
+  let cut = -1;
+  for (let i = 0; i + 3 < segments.length; i++) {
+    if (segments[i] === "repos" && segments[i + 3] === "branch_protections") {
+      cut = i + 4;
+      break;
+    }
+  }
+  const tail = cut === -1 ? "" : segments.slice(cut).join("/");
+  try {
+    return decodeURIComponent(tail);
+  } catch {
+    return tail;
+  }
+}
+
+/** The wildcard sibling's repo path — the labeled params (owner/repo decode
+ *  exactly like the declared route's). */
+function wildcardRepoPath(c: Context<ApiEnv, typeof WILDCARD_ROUTE>): { owner: string; repo: string } {
+  const { owner, repo } = c.req.param();
+  return { owner, repo };
+}
+
+/** The wildcard edit arm's body — the same shape the declared route binds;
+ *  malformed JSON or a schema miss is the Go bind 422 arm. */
+async function parseWildcardEditBody(c: Context<ApiEnv>): Promise<EditProtectionForm> {
+  let raw: unknown;
+  try {
+    raw = await c.req.json();
+  } catch {
+    throw new ApiError(422, "invalid request body");
+  }
+  const parsed = editOptionBodySchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new ApiError(422, "invalid request body");
+  }
+  return parsed.data;
+}
+
+// ---------------------------------------------------------------------------
 // The routes.
 // ---------------------------------------------------------------------------
 
 export function registerBranchProtectionRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>): void {
+  const wildcards = WILDCARD_ROUTE;
   // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/branch_protections (repoListBranchProtection)
   // -------------------------------------------------------------------------
@@ -706,8 +976,7 @@ export function registerBranchProtectionRoutes(app: OpenAPIHono<ApiEnv>, require
     async (c) => {
       const pair = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoAdmin(c, pair);
-      const rule = requireRule(await findRuleByName(c.env.DB, pair.repo.id, c.req.valid("param").name));
-      return c.json(await renderProtection(c.env.DB, rule), 200);
+      return c.json(await getBranchProtectionByName(c, pair, c.req.valid("param").name), 200);
     },
   );
 
@@ -724,7 +993,7 @@ export function registerBranchProtectionRoutes(app: OpenAPIHono<ApiEnv>, require
       operationId: "repoEditBranchProtection",
       request: {
         params: z.object({ ...ownerRepoParams, ...protectionNameParam }),
-        body: { content: { "application/json": { schema: z.object(editOptionShape) } } },
+        body: { content: { "application/json": { schema: editOptionBodySchema } } },
       },
       responses: {
         200: { description: "BranchProtection", content: { "application/json": { schema: branchProtectionSchema } } },
@@ -737,154 +1006,7 @@ export function registerBranchProtectionRoutes(app: OpenAPIHono<ApiEnv>, require
       const pair = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoAdmin(c, pair);
       assertNotArchived(pair);
-      const form = c.req.valid("json");
-      const ruleName = c.req.valid("param").name;
-      const rule = requireRule(await findRuleByName(c.env.DB, pair.repo.id, ruleName));
-      const config = configOf(rule);
-      // The short-circuit's comparison side: the config AS LOADED, before any
-      // pointer patch merges over it (sanitizeRuleWhitelists keeps a list the
-      // edit did not change verbatim — updateUserWhitelist :575-577 et al.).
-      const stored = configOf(rule);
-
-      // The push master cascades its sub-flags (branch.go:894-913); the
-      // deploy-key booleans ride the same cascade (HasDeployKeyPush input).
-      let pushDeployKeys = config.whitelistUserIds.includes(DEPLOY_KEY_USER_ID);
-      let forcePushDeployKeys = config.forcePushAllowlistUserIds.includes(DEPLOY_KEY_USER_ID);
-      if (form.enable_push !== undefined) {
-        if (form.enable_push === false) {
-          config.canPush = false;
-          config.enableWhitelist = false;
-          pushDeployKeys = false;
-        } else {
-          config.canPush = true;
-          if (form.enable_push_whitelist !== undefined) {
-            if (form.enable_push_whitelist === false) {
-              config.enableWhitelist = false;
-              pushDeployKeys = false;
-            } else {
-              config.enableWhitelist = true;
-              if (form.push_whitelist_deploy_keys !== undefined) {
-                pushDeployKeys = form.push_whitelist_deploy_keys;
-              }
-            }
-          }
-        }
-      }
-      if (form.enable_force_push !== undefined) {
-        if (form.enable_force_push === false) {
-          config.canForcePush = false;
-          config.enableForcePushAllowlist = false;
-          forcePushDeployKeys = false;
-        } else {
-          config.canForcePush = true;
-          if (form.enable_force_push_allowlist !== undefined) {
-            if (form.enable_force_push_allowlist === false) {
-              config.enableForcePushAllowlist = false;
-              forcePushDeployKeys = false;
-            } else {
-              config.enableForcePushAllowlist = true;
-              if (form.force_push_allowlist_deploy_keys !== undefined) {
-                forcePushDeployKeys = form.force_push_allowlist_deploy_keys;
-              }
-            }
-          }
-        }
-      }
-      if (form.enable_deletion !== undefined) {
-        config.canDelete = form.enable_deletion;
-      }
-      if (form.enable_deletion_allowlist !== undefined) {
-        config.enableDeletionAllowlist = form.enable_deletion_allowlist;
-      }
-      // The post-patch re-conjunction (:935-936).
-      config.canDelete = config.canPush && config.canDelete;
-      config.enableDeletionAllowlist = config.canDelete && config.enableDeletionAllowlist;
-
-      if (form.priority !== undefined) {
-        rule.priority = form.priority;
-      }
-      if (form.enable_merge_whitelist !== undefined) config.enableMergeWhitelist = form.enable_merge_whitelist;
-      if (form.enable_bypass_allowlist !== undefined) config.enableBypassAllowlist = form.enable_bypass_allowlist;
-      if (form.enable_status_check !== undefined) config.enableStatusCheck = form.enable_status_check;
-      if (form.status_check_contexts !== undefined) config.statusCheckContexts = form.status_check_contexts;
-      if (form.required_approvals !== undefined && form.required_approvals >= 0) config.requiredApprovals = form.required_approvals;
-      if (form.enable_approvals_whitelist !== undefined) config.enableApprovalsWhitelist = form.enable_approvals_whitelist;
-      if (form.block_on_rejected_reviews !== undefined) config.blockOnRejectedReviews = form.block_on_rejected_reviews;
-      if (form.block_on_official_review_requests !== undefined) config.blockOnOfficialReviewRequests = form.block_on_official_review_requests;
-      if (form.block_on_codeowner_reviews !== undefined) config.blockOnCodeownerReviews = form.block_on_codeowner_reviews;
-      if (form.dismiss_stale_approvals !== undefined) config.dismissStaleApprovals = form.dismiss_stale_approvals;
-      if (form.ignore_stale_approvals !== undefined) config.ignoreStaleApprovals = form.ignore_stale_approvals;
-      if (form.require_signed_commits !== undefined) config.requireSignedCommits = form.require_signed_commits;
-      if (form.protected_file_patterns !== undefined) config.protectedFilePatterns = form.protected_file_patterns;
-      if (form.unprotected_file_patterns !== undefined) config.unprotectedFilePatterns = form.unprotected_file_patterns;
-      if (form.block_on_outdated_branch !== undefined) config.blockOnOutdatedBranch = form.block_on_outdated_branch;
-      if (form.block_admin_merge_override !== undefined) config.blockAdminMergeOverride = form.block_admin_merge_override;
-
-      // Whitelists: a present name array replaces (422 on unknown), an
-      // absent one keeps the stored ids (:1080-1086). The team arm resolves
-      // on org-owned repos only.
-      const whitelistUsers = (await resolveUserIds(c.env.DB, form.push_whitelist_usernames)) ?? config.whitelistUserIds;
-      const forcePushAllowlistUsers = (await resolveUserIds(c.env.DB, form.force_push_allowlist_usernames)) ?? config.forcePushAllowlistUserIds;
-      const deletionAllowlistUsers = (await resolveUserIds(c.env.DB, form.deletion_allowlist_usernames)) ?? config.deletionAllowlistUserIds;
-      const mergeWhitelistUsers = (await resolveUserIds(c.env.DB, form.merge_whitelist_usernames)) ?? config.mergeWhitelistUserIds;
-      const approvalsWhitelistUsers = (await resolveUserIds(c.env.DB, form.approvals_whitelist_username)) ?? config.approvalsWhitelistUserIds;
-      const bypassAllowlistUsers = (await resolveUserIds(c.env.DB, form.bypass_allowlist_usernames)) ?? config.bypassAllowlistUserIds;
-
-      const isOrg = pair.owner.type === "org";
-      const whitelistTeams = form.push_whitelist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.push_whitelist_teams) : config.whitelistTeamIds;
-      const forcePushAllowlistTeams =
-        form.force_push_allowlist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.force_push_allowlist_teams) : config.forcePushAllowlistTeamIds;
-      const deletionAllowlistTeams =
-        form.deletion_allowlist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.deletion_allowlist_teams) : config.deletionAllowlistTeamIds;
-      const mergeWhitelistTeams = form.merge_whitelist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.merge_whitelist_teams) : config.mergeWhitelistTeamIds;
-      const approvalsWhitelistTeams =
-        form.approvals_whitelist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.approvals_whitelist_teams) : config.approvalsWhitelistTeamIds;
-      const bypassAllowlistTeams =
-        form.bypass_allowlist_teams !== undefined && isOrg ? await resolveTeamIds(c.env.DB, pair.owner.id, form.bypass_allowlist_teams) : config.bypassAllowlistTeamIds;
-
-      // The deploy-key persistence dance (:1085-1098): a usernames array that
-      // still carries the pseudo-id re-arms the flag when the form was silent.
-      if (form.push_whitelist_usernames !== undefined && form.push_whitelist_deploy_keys === undefined && whitelistUsers.includes(DEPLOY_KEY_USER_ID)) {
-        pushDeployKeys = true;
-      }
-      if (form.force_push_allowlist_usernames !== undefined && form.force_push_allowlist_deploy_keys === undefined && forcePushAllowlistUsers.includes(DEPLOY_KEY_USER_ID)) {
-        forcePushDeployKeys = true;
-      }
-
-      // Disabled arms clear their arrays before the save (:1180-1192).
-      const bypassEnabled = config.enableBypassAllowlist;
-      const deletionEnabled = config.enableDeletionAllowlist;
-      config.whitelistUserIds = setDeployKeyAllowlist(whitelistUsers, pushDeployKeys);
-      config.whitelistTeamIds = whitelistTeams;
-      config.forcePushAllowlistUserIds = setDeployKeyAllowlist(forcePushAllowlistUsers, forcePushDeployKeys);
-      config.forcePushAllowlistTeamIds = forcePushAllowlistTeams;
-      config.deletionAllowlistUserIds = deletionEnabled ? deletionAllowlistUsers : [];
-      config.deletionAllowlistTeamIds = deletionEnabled ? deletionAllowlistTeams : [];
-      config.mergeWhitelistUserIds = mergeWhitelistUsers;
-      config.mergeWhitelistTeamIds = mergeWhitelistTeams;
-      config.approvalsWhitelistUserIds = approvalsWhitelistUsers;
-      config.approvalsWhitelistTeamIds = approvalsWhitelistTeams;
-      config.bypassAllowlistUserIds = bypassEnabled ? bypassAllowlistUsers : [];
-      config.bypassAllowlistTeamIds = bypassEnabled ? bypassAllowlistTeams : [];
-
-      // The save-side sanitization (M4) — the merged lists pass the
-      // write/any-access/repo-access filters before the row is written; an
-      // absent name array equals the stored list and short-circuits through
-      // untouched (upstream keeps already-stored ids on an unchanged list;
-      // the deletion scrub owns those).
-      await sanitizeRuleWhitelists(c.env.DB, pair.repo, config, stored);
-
-      await drizzle(c.env.DB)
-        .update(protectedBranches)
-        .set({ priority: rule.priority, rules: serializeRuleConfig(config), updatedAt: new Date() })
-        .where(eq(protectedBranches.id, rule.id));
-      const updated = requireRule(await findRuleByName(c.env.DB, pair.repo.id, ruleName));
-
-      // The recheck fan-out (branch.go:1147-1180 — CheckPRsForBaseBranch for
-      // a plain existing rule, FindAllMatchedBranches for a glob; our
-      // recompute's matched-base loop covers both arms).
-      await recomputeLogged(c.env.DB, pair, updated);
-      return c.json(await renderProtection(c.env.DB, updated), 200);
+      return c.json(await editBranchProtectionByName(c, pair, c.req.valid("param").name, c.req.valid("json")), 200);
     },
     bindValidationHook,
   );
@@ -914,28 +1036,51 @@ export function registerBranchProtectionRoutes(app: OpenAPIHono<ApiEnv>, require
       const pair = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoAdmin(c, pair);
       assertNotArchived(pair);
-      const rule = requireRule(await findRuleByName(c.env.DB, pair.repo.id, c.req.valid("param").name));
-      await drizzle(c.env.DB).delete(protectedBranches).where(eq(protectedBranches.id, rule.id));
-      // The fan-out runs on delete too (upstream skips it there; a deleted
-      // whitelist can only widen officialness — module-header note). The
-      // evaluation config is the NO-RULE state (the service's
-      // isUserOfficialReviewer null-arm: plain write access), matched over
-      // the deleted rule's name so exactly the branches it protected
-      // re-evaluate — evaluating the deleted rule's own config here would
-      // preserve the very restriction that just went away.
-      const noRuleState: ProtectionRow = { ...rule, rules: serializeRuleConfig(emptyRuleConfig()) };
-      await recomputeLogged(c.env.DB, pair, noRuleState);
+      await deleteBranchProtectionByName(c, pair, c.req.valid("param").name);
       return c.body(null, 204);
     },
   );
 
   // -------------------------------------------------------------------------
+  // The wildcard siblings — GET/PATCH/DELETE …/branch_protections/* (the
+  // multi-segment rule names: `release/v*`). Upstream DECLARES {name} in its
+  // swagger but registers these three under chi's `m.Group("/*")` and reads
+  // `ctx.PathParam("*")` (api.go:1328-1332, branch.go:556); ours mirrors the
+  // runtime shape with plain Hono routes sharing the declared ops' cores.
+  // Plain routes (never app.openapi): they must NOT appear in the generated
+  // spec — the frozen contract keeps the single-segment {name} declaration,
+  // which is upstream's own swagger text. Registered AFTER the {name} family
+  // and BEFORE the priority POST (upstream's group order); slash-free names
+  // match the declared route first (hono's param route wins the shared
+  // prefix — probed), so the two arms never disagree.
+  // -------------------------------------------------------------------------
+  app.get(wildcards, requireAuth, async (c) => {
+    const pair = await requireVisibleRepo(c, wildcardRepoPath(c));
+    await requireRepoAdmin(c, pair);
+    return c.json(await getBranchProtectionByName(c, pair, ruleNameOfTail(c)), 200);
+  });
+  app.patch(wildcards, requireAuth, async (c) => {
+    const pair = await requireVisibleRepo(c, wildcardRepoPath(c));
+    await requireRepoAdmin(c, pair);
+    assertNotArchived(pair);
+    return c.json(await editBranchProtectionByName(c, pair, ruleNameOfTail(c), await parseWildcardEditBody(c)), 200);
+  });
+  app.delete(wildcards, requireAuth, async (c) => {
+    const pair = await requireVisibleRepo(c, wildcardRepoPath(c));
+    await requireRepoAdmin(c, pair);
+    assertNotArchived(pair);
+    await deleteBranchProtectionByName(c, pair, ruleNameOfTail(c));
+    return c.body(null, 204);
+  });
+
+  // -------------------------------------------------------------------------
   // POST /repos/{owner}/{repo}/branch_protections/priority
   // (repoUpdateBranchProtectionPriories) — 204. Registered AFTER the {name}
-  // family like upstream's group order; POST is method-disjoint from the
-  // {name} routes, so no shadowing exists (only GET/PATCH/DELETE carry a
-  // /{name} segment, and a rule literally named "priority" 404s/edits
-  // exactly like upstream chi's fall-through).
+  // family and the wildcard siblings, like upstream's group order (api.go's
+  // m.Post("/priority") closes the branch_protections group); POST is
+  // method-disjoint from the GET/PATCH/DELETE name+wildcard arms, so no
+  // shadowing exists (a rule literally named "priority" 404s/edits exactly
+  // like upstream chi's fall-through).
   // -------------------------------------------------------------------------
   app.openapi(
     createRoute({

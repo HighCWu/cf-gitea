@@ -21,6 +21,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
+import { Hono } from "hono";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { protectedBranches, pullReviews, repoCollaborators, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users } from "../../db/schema";
@@ -682,5 +683,129 @@ describe("priority op edge cases (M4)", () => {
     expect((await post(`${repoPath(slug)}/priority`, { ids: [] })).status).toBe(204);
     const row = (await db().select().from(protectedBranches).where(eq(protectedBranches.id, a)).all())[0]!;
     expect(row.priority).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Addressability (the probe battery's two recorded gaps closed — SPEC-0013
+// as-built note): the render exposes the real rule id (upstream's struct has
+// none, yet its priority op consumes exactly those ids) and the multi-segment
+// rule names address through the wildcard siblings (upstream's chi
+// `m.Group("/*")` + ctx.PathParam("*") runtime shape, api.go:1328-1332 +
+// branch.go:556).
+// ---------------------------------------------------------------------------
+
+describe("rule-id addressability (render + priority op via the API)", () => {
+  it("the render exposes the real integer id on create/GET/list — one id per rule, stable across reads", async () => {
+    const { slug, repoId } = await seedRepo();
+    const created = await post(repoPath(slug), { rule_name: "main" });
+    expect(created.status).toBe(201);
+    const body = await jsonBody(created);
+    expect(Number.isInteger(body.id)).toBe(true);
+    expect(body.id).toBeGreaterThan(0);
+
+    const one = await get(`${repoPath(slug)}/main`);
+    expect(((await jsonBody(one))).id).toBe(body.id);
+
+    await post(repoPath(slug), { rule_name: "dev" });
+    const list = await (await get(repoPath(slug))).json<Array<Record<string, unknown>>>();
+    const ids = list.map((rule) => rule.id as number);
+    expect(ids.every((id) => Number.isInteger(id) && id > 0)).toBe(true);
+    expect(new Set(ids).size).toBe(2); // distinct rules carry distinct ids
+    // the rendered id IS the storage row's id (not a render-local surrogate)
+    const stored = await ruleRowByName(repoId, "main");
+    expect((stored?.id as number)).toBe(body.id);
+  });
+
+  it("the priority op round-trips ids read straight from the API render (no D1 lever)", async () => {
+    const { slug } = await seedRepo();
+    await post(repoPath(slug), { rule_name: "main" });
+    await post(repoPath(slug), { rule_name: "dev" });
+    // the ids come from the API render exactly like the probe battery's
+    // updated arm — the D1 lookup the old battery needed is gone
+    const list = await (await get(repoPath(slug))).json<Array<{ id: number; rule_name: string }>>();
+    const idOf = new Map(list.map((rule) => [rule.rule_name, rule.id]));
+    const dev = idOf.get("dev");
+    const main = idOf.get("main");
+    expect(Number.isInteger(dev) && Number.isInteger(main)).toBe(true);
+
+    const res = await post(`${repoPath(slug)}/priority`, { ids: [dev, main] });
+    expect(res.status).toBe(204);
+    const after = await (await get(repoPath(slug))).json<Array<{ id: number; rule_name: string; priority: number }>>();
+    expect(after.map((rule) => `${rule.rule_name}(${rule.priority})`)).toEqual([`dev(1)`, `main(2)`]);
+  });
+});
+
+describe("slash-name addressability (the wildcard siblings)", () => {
+  const slashedRule = "release/v1.2";
+
+  it("GET addresses a multi-segment rule name through the wildcard arm", async () => {
+    const { slug, repoId } = await seedRepo();
+    const storedId = await seedRule(repoId, slashedRule);
+    // the LITERAL slash in the path — the single-segment {name} route cannot
+    // match this; the catch-all sibling does
+    const res = await get(`${repoPath(slug)}/${slashedRule}`);
+    expect(res.status).toBe(200);
+    const body = await jsonBody(res);
+    expect(body.rule_name).toBe(slashedRule);
+    expect(body.id).toBe(storedId); // the wildcard arm renders the same render
+    expect(body.priority).toBe(0);
+  });
+
+  it("PATCH and DELETE address the multi-segment name; the declared {name} route still serves the percent-encoded form", async () => {
+    const { slug, repoId } = await seedRepo();
+    await seedRule(repoId, slashedRule, { ...emptyRuleConfig(), canPush: true });
+
+    const patched = await patch(`${repoPath(slug)}/${slashedRule}`, { required_approvals: 1 });
+    expect(patched.status).toBe(200);
+    const body = await jsonBody(patched);
+    expect(body.rule_name).toBe(slashedRule);
+    expect(body.required_approvals).toBe(1);
+    expect(body.enable_push).toBe(true); // the absent arm kept its stored value
+
+    // the same rule through the DECLARED route: %2F stays one segment
+    const encoded = await get(`${repoPath(slug)}/${encodeURIComponent(slashedRule)}`);
+    expect(encoded.status).toBe(200);
+    expect(((await jsonBody(encoded))).required_approvals).toBe(1);
+
+    const deleted = await del(`${repoPath(slug)}/${slashedRule}`);
+    expect(deleted.status).toBe(204);
+    expect(await ruleRowByName(repoId, slashedRule)).toBeUndefined();
+    // 404-after-delete through the SAME wildcard arm
+    expect((await get(`${repoPath(slug)}/${slashedRule}`)).status).toBe(404);
+  });
+
+  it("404s an unknown multi-segment name and keeps the gates (auth + admin) on the wildcard arm", async () => {
+    const { slug } = await seedRepo();
+    const missing = await get(`${repoPath(slug)}/ghost/no-such-rule`);
+    expect(missing.status).toBe(404);
+    expect((await jsonBody(missing)).message).toBe("not found");
+
+    const anonymous = await router()(`${repoPath(slug)}/ghost/no-such-rule`);
+    expect(anonymous.status).toBe(401); // reqToken
+    const nonAdmin = await get(`${repoPath(slug)}/ghost/no-such-rule`, DOER_TOKEN);
+    expect(nonAdmin.status).toBe(403); // reqAdmin — before the lookup
+  });
+
+  it("resolves the tail MOUNT-agnostically: the live worker's /api/v1 mount answers identically", async () => {
+    const { slug, repoId } = await seedRepo();
+    const storedId = await seedRule(repoId, slashedRule);
+    // the LIVE worker mounts the api router at /api/v1 (index.ts) and hono
+    // keeps c.req.path unstripped inside the mounted sub-app — the tail cut
+    // must anchor on the family segment, not a fixed depth. This test
+    // mirrors that composition: a parent Hono holding the family at /api/v1.
+    const root = new Hono<ApiEnv>();
+    const family = new OpenAPIHono<ApiEnv>();
+    family.onError(giteaErrorHandler);
+    registerBranchProtectionRoutes(family, createTokenAuthMiddleware(resolver));
+    root.route("/api/v1", family);
+    const res = await root.fetch(
+      new Request(`https://example.com${repoPath(slug)}/${slashedRule}`, authed(ALICE_TOKEN)),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json<{ rule_name: string; id: number }>();
+    expect(body.rule_name).toBe(slashedRule);
+    expect(body.id).toBe(storedId);
   });
 });

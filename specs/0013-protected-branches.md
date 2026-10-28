@@ -677,3 +677,60 @@ cases; three M3 tests re-seeded for the new filters); repos/lifecycle.test.ts
 delete tests extended with scrub assertions; neighbors pull-merge-protection
 + pull-reviews + webhooks-push + push-stale 72/72. check:api PASS tier-1
 78/78; typecheck clean; eslint clean.
+
+## As-built — addressability (2026-10-28)
+
+The probe battery's two recorded addressability gaps, resolved against the
+pin's own runtime shape:
+
+**The rule id is addressable from the render.** Upstream's `BranchProtection`
+struct carries NO id field (`modules/structs/repo_branch.go:33-80`; the vendored
+swagger agrees), yet its priority op consumes exactly those row ids
+(`UpdateBranchProtectionPriories{IDs []int64}` → `db.GetEngine(ctx).ID(id)` over
+`ProtectedBranch`, `protected_branch.go:529-545`) — upstream's own API clients
+cannot learn the ids their next call needs. Our `protected_branches.id` is an
+integer autoincrement (the releases/labels convention: upstream int64-keyed
+rows render `id: row.id` verbatim), so the render exposes the real storage key:
+`branchProtectionSchema.id` (int64-typed, a documented ADDITIVE divergence from
+the frozen contract — check:api pins paths + response codes only, and the
+frozen swagger's omission is upstream's own gap, not a shape we must
+reproduce) rendered in every arm that returns a rule (create echo, get, list,
+edit echo). The priority op is thereby addressable end to end via the API; the
+probe battery's priority arm reads its ids off the create echoes (the old
+`wrangler d1 execute` lookup — and the battery's `--d1-scope` coupling — is
+gone).
+
+**Slash rule names address through wildcard routes.** Upstream DECLARES
+`{name}` in its swagger but registers the three name-addressed ops under a chi
+catch-all group (`api.go:1328-1332`: `m.Group("/*", ...)` holding
+Get/Patch/Delete) and reads the name with `ctx.PathParam("*")`
+(`branch.go:556`) — glob rule names containing slashes (`release/v*`) address
+correctly on upstream's wire despite the single-segment declaration. Ours
+mirrors that runtime shape exactly: the declared openapi routes stay `{name}`
+(the frozen contract's shape — upstream's own swagger text), and each has a
+plain-Hono `/repos/:owner/:repo/branch_protections/*` sibling sharing the same
+handler core (registered after the `{name}` family, before the priority POST —
+upstream's group order). Plain routes never appear in the generated spec, so
+check:api is untouched; slash-free names match the declared route first and
+only multi-segment names fall through to the catch-all (hono's param route
+wins the shared prefix — probed on hono 4.13), so the two arms cannot
+disagree. The tail decodes once (hono's own param decode convention — a
+malformed escape keeps raw text); POST /priority stays method-disjoint, and a
+rule literally named "priority" 404s through the same fall-through as
+upstream.
+
+Live-run catch (the probe battery found it before it could ship): hono keeps
+`c.req.path` UNSTRIPPED inside a sub-app mounted with `.route()` (index.ts
+mounts the api router at /api/v1), so the tail cut must anchor on the
+`repos/{owner}/{repo}/branch_protections` segment shape scanning from the left
+(a fixed depth silently addressed the wrong name under the mount — green in
+the prefix-stripping test harness, 404 live). A dedicated test mounts the
+family at /api/v1 exactly like index.ts and pins the behavior.
+
+Tests: routes/branch-protections.test.ts 35/35 (+6: the id render on
+create/get/list with the storage-id cross-check, the priority op driven by
+API-render ids, wildcard GET/PATCH/DELETE on a multi-segment name + the
+%2F-encoded declared-route arm + wildcard 404/401/403 gates + the /api/v1
+mount-composition test); probe battery arm `bp-slash-glob-wildcard` added and
+`bp-rule-priority-204` rewritten API-only — the full battery re-run green
+against local `pnpm dev` (18/18 arms, verdict true).

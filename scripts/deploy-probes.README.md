@@ -290,7 +290,15 @@ prints all of them verbatim.
   echoing both (absent = keep), DELETE 204 → GET 404 (404-after-delete) →
   list `[]`; then **the priority op** — a second rule, POST
   `/branch_protections/priority {"ids":[…]}` → 204, the list order/priorities
-  follow the renumber. **(b) push-time per-ref rejection** — ONE real `git
+  follow the renumber; **(e) the slash-glob wildcard** — a GLOB rule
+  `release/v*` (a name the single-segment `{name}` declaration cannot match)
+  created → 201 with the addressable id, then GET/PATCH/DELETE address it
+  through the LITERAL-slash path (the wildcard routes, upstream's chi
+  `m.Group("/*")` + `ctx.PathParam("*")` runtime shape — api.go:1328-1332 +
+  branch.go:556): 200 render (`branch_name` `""`, the same id) → 200 PATCH
+  echo → 204 delete → 404 after, and the percent-encoded `%2F` form answers
+  200 through the declared route. **(b) push-time per-ref rejection** — ONE
+  real `git
   push` carrying TWO refs (a fast-forward to the protected main + a create of
   an unprotected sibling): the protected ref answers upstream's per-ref report
   rejection (git exit 1, `! [remote rejected] … (Not allowed to push to
@@ -318,11 +326,13 @@ prints all of them verbatim.
   keeps WhitelistUserIDs on a flag-off edit; the render maps ids→names
   regardless — branch.go:894-936) and every absent arm keeps its stored value.
   **Auth: an ADMIN PAT** (`--user` must be the site admin — the member arm)
-  and **wrangler auth for the priority arm** (`--d1-scope`): NEITHER render
-  exposes an addressable rule id (`BranchProtection` has no id field and the
-  repo render's `id` parses the TEXT uuid to 0), so the probe reads the rule
-  ids via `wrangler d1 execute` — keep `--d1-scope` in step with
-  `--base-url`. **Failure cleanup (the consistency posture):** a finally-style
+  only. The priority op is API-addressable now: the BranchProtection render
+  exposes the real integer rule id (the cf-gitea addition that closed the
+  recorded gap — upstream's `BranchProtection` struct has no id field, yet its
+  priority op consumes exactly those row ids), so the probe reads the ids off
+  the create echoes/list render and the old `wrangler d1 execute` lookup (and
+  its `--d1-scope` coupling) is gone from this battery. **Failure cleanup (the
+  consistency posture):** a finally-style
   tail deletes the created rules first (best-effort explicit deletes, so a
   failed repo delete still lands the audit back at `protected_branches == 0`),
   then the repo (its delete cascades the rest), then the member's token
