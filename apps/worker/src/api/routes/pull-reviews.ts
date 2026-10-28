@@ -98,9 +98,17 @@
  * (GetCodeCommentsCount review.go:1048). `html_url` renders only for
  * submitted reviews (review.go:1073–1076).
  *
- * Deviations (documented): no diff-hunk capture on created code comments
- * (`patch` stays null → `diff_hunk` renders "" — upstream renders the real
- * hunk through the git blame pipeline); the review `team` field renders null
+ * Diff hunks (the GetCodeCommentPatch port, gitdiff.go:1600–1615): created
+ * code comments store the hunk cut around their line over the PR's
+ * three-dot range (CutDiffAroundLine over the engine's structured hunks)
+ * with the unchanged-line synthetic-patch fallback, so `diff_hunk` renders
+ * upstream's real context. Known limits, documented at the helpers: the cut
+ * runs off DiffFileJson hunks (upstream's `\ No newline` marker arm — a
+ * FIXME upstream too — is unreachable), the stored patch omits the `index`
+ * header line, and a degenerate range (no head/base ref, no merge base)
+ * captures nothing rather than fabricating a hunk.
+ *
+ * Deviations (documented): the review `team` field renders null
  * (team REQUEST rows carry reviewer_team_id; the full upstream Team render
  * lives in the org-teams converter); a missing reviewer row renders
  * `user: null` (upstream renders a Ghost user); `num_comments` bumps on
@@ -123,6 +131,8 @@ import type { Context, MiddlewareHandler } from "hono";
 import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import { z } from "zod";
+
+import type { DiffFileJson } from "@cf-gitea/git-engine";
 
 import { ReviewType, comments, issues, pullReviews, teamMembers, teams, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
@@ -153,6 +163,7 @@ import {
   type Viewer,
 } from "../services/repository";
 import { engineReads } from "../services/engine";
+import { pullRequestDiff } from "../services/pull-engine";
 import { findRule, isUserOfficialReviewer, parseRuleConfig, principalAccessOfRow } from "../../services/branch-protection";
 
 type ReviewRow = typeof pullReviews.$inferSelect;
@@ -515,13 +526,169 @@ async function toApiReview(
 
 /**
  * patch2diff (services/convert/pull_review.go:129–135): the stored hunks
- * render as their LAST hunk only. Created reviews carry no hunks this wave
- * (patch null → "" — documented deviation).
+ * render as their LAST hunk only. Created code comments carry the
+ * GetCodeCommentPatch port below (a single-hunk cut); patch null on
+ * degenerate rows renders "" as before.
  */
 function patchToDiffHunk(patch: string | null): string {
   if (patch === null) return "";
   const split = patch.split("\n@@");
   return split.length === 2 ? `@@${split[1]}` : "";
+}
+
+// ---------------------------------------------------------------------------
+// The diff-hunk capture at code-comment creation — the GetCodeCommentPatch
+// port (services/gitdiff/gitdiff.go:1600–1615): upstream stores, with every
+// code comment, the cut of the file's diff around the commented line
+// (modules/git/diff.go CutDiffAroundLine), and falls back to a synthetic
+// context patch read from the file content when the line is unchanged
+// (gitdiff.go:1621–1668 GeneratePatchForUnchangedLine). The wire renders it
+// through patch2diff → `diff_hunk` (convert/pull_review.go:115).
+// ---------------------------------------------------------------------------
+
+/** `setting.UI.CodeCommentLines` default (modules/setting/ui.go:96) — the
+ *  context window upstream keeps around the commented line. */
+const CODE_COMMENT_LINES = 4;
+
+/** The three-dot diff range the cuts run over (pullRequestDiff's shape). */
+interface CodeCommentRange {
+  files: DiffFileJson[];
+  mergeBase: string | null;
+  head: string;
+}
+
+/**
+ * CutDiffAroundLine (modules/git/diff.go:160–268) over the engine's
+ * structured hunks: the first hunk whose target-side range contains the
+ * line, kept only down to the CODE_COMMENT_LINES lines ENDING at the
+ * commented line (upstream's scan breaks at the target and cuts the
+ * trailing window), with the @@ header recomputed for the cut window —
+ * or returned as-is when the kept prefix still fits (upstream's no-cut
+ * arm, original @@ header). Returns null when no hunk contains the line
+ * (the caller falls to the unchanged-line patch).
+ *
+ * Documented divergences: upstream cuts raw `git diff` text and carries a
+ * `\ No newline at end of file` case (a FIXME upstream too — the engine's
+ * DiffOp stream has no such markers, so that arm is unreachable here), and
+ * the stored patch's `index` header line is omitted (DiffFileJson carries
+ * no abbreviated oid pair; every wire consumer renders from the "@@" tail).
+ */
+function cutDiffAroundLine(file: DiffFileJson, line: number): string | null {
+  if (line === 0) return null; // CutDiffAroundLine: "no line or num of lines => no diff"
+  const old = line < 0;
+  const target = Math.abs(line);
+  const hunk = file.hunks.find((h) => {
+    const begin = old ? h.aStart : h.bStart;
+    const len = old ? h.aLen : h.bLen;
+    return len > 0 && begin <= target && target < begin + len;
+  });
+  if (hunk === undefined) return null;
+
+  const header = [
+    `diff --git a/${file.path} b/${file.path}`,
+    file.old === null ? "--- /dev/null" : `--- a/${file.path}`,
+    file.new === null ? "+++ /dev/null" : `+++ b/${file.path}`,
+  ];
+  const opLine = (op: { tag: "eq" | "del" | "add"; line: string }): string =>
+    op.tag === "eq" ? ` ${op.line}` : op.tag === "add" ? `+${op.line}` : `-${op.line}`;
+
+  // Walk the ops keeping everything up to and including the first op that
+  // COUNTS on the target side and carries the target's line number —
+  // upstream's scan appends it, bumps currentLine past `line`, and breaks.
+  let oldLine = hunk.aStart;
+  let newLine = hunk.bStart;
+  const kept: Array<{ tag: "eq" | "del" | "add"; line: string }> = [];
+  let hit = false;
+  for (const op of hunk.ops) {
+    const opOld = oldLine;
+    const opNew = newLine;
+    if (op.tag !== "add") oldLine += 1;
+    if (op.tag !== "del") newLine += 1;
+    kept.push(op);
+    if ((old ? op.tag !== "add" : op.tag !== "del") && (old ? opOld : opNew) === target) hit = true;
+    if (hit) break;
+  }
+  if (!hit) return null; // defensive: the containment check above already excludes it
+
+  if (kept.length <= CODE_COMMENT_LINES) {
+    // No-cut arm: the kept prefix fits — upstream returns the hunk with its
+    // ORIGINAL header.
+    return [...header, `@@ -${hunk.aStart},${hunk.aLen} +${hunk.bStart},${hunk.bLen} @@`, ...kept.map(opLine)].join("\n");
+  }
+
+  // Cut arm: the trailing window of CODE_COMMENT_LINES kept ops, with the
+  // begins re-walked from the hunk start (upstream's backward count) and
+  // the per-side lengths summed over the window.
+  const window = kept.slice(-CODE_COMMENT_LINES);
+  let wOld = hunk.aStart;
+  let wNew = hunk.bStart;
+  for (const op of kept.slice(0, kept.length - window.length)) {
+    if (op.tag !== "add") wOld += 1;
+    if (op.tag !== "del") wNew += 1;
+  }
+  let oldLen = 0;
+  let newLen = 0;
+  for (const op of window) {
+    if (op.tag !== "add") oldLen += 1;
+    if (op.tag !== "del") newLen += 1;
+  }
+  return [...header, `@@ -${wOld},${oldLen} +${wNew},${newLen} @@`, ...window.map(opLine)].join("\n");
+}
+
+/**
+ * GeneratePatchForUnchangedLine's core (gitdiff.go:1651–1680
+ * generatePatchForUnchangedLineFromReader): a synthetic single-file patch of
+ * the CODE_COMMENT_LINES lines ending at `line`, every line context-prefixed
+ * and the old/new ranges identical. Upstream writes a trailing "\n" after
+ * each line (unlike the cut path's plain join — mirrored). Returns null when
+ * the line is beyond the content (upstream errors the range read and stores
+ * "" — `diff_hunk` renders empty).
+ */
+function syntheticPatchForUnchangedLine(blobText: string, treePath: string, line: number): string | null {
+  const target = Math.abs(line);
+  if (target < 1) return null;
+  const startLine = Math.max(target - CODE_COMMENT_LINES, 1);
+  const allLines = blobText.split("\n");
+  const lines: string[] = [];
+  for (let n = startLine; n <= target; n++) {
+    const value = allLines[n - 1];
+    if (value === undefined) break; // scanner hit EOF — shorter range, upstream's posture
+    lines.push(value);
+  }
+  if (lines.length === 0) return null;
+  return [
+    `diff --git a/${treePath} b/${treePath}`,
+    `--- a/${treePath}`,
+    `+++ b/${treePath}`,
+    `@@ -${startLine},${lines.length} +${startLine},${lines.length} @@`,
+    ...lines.map((content) => ` ${content}`),
+  ].join("\n") + "\n";
+}
+
+/**
+ * GetCodeCommentPatch (gitdiff.go:1600–1615) for one created code comment:
+ * the diff cut around the line, else the unchanged-line synthetic patch read
+ * at the side's context commit — mergeBase for an old-side line (negative),
+ * the head-ref tip for a new-side one. Null = nothing derivable (no hunk,
+ * no readable blob): the row stores no patch and `diff_hunk` renders "".
+ */
+async function codeCommentPatch(
+  c: Context<ApiEnv>,
+  found: RepositoryWithOwner,
+  range: CodeCommentRange,
+  treePath: string,
+  line: number,
+): Promise<string | null> {
+  const file = range.files.find((f) => f.path === treePath);
+  if (file !== undefined) {
+    const cut = cutDiffAroundLine(file, line);
+    if (cut !== null) return cut;
+  }
+  const contextCommit = line < 0 ? range.mergeBase : range.head;
+  if (contextCommit === null) return null;
+  const blob = await engineReads(c.env, found.repo).readBlob(contextCommit, treePath);
+  if (blob === null) return null;
+  return syntheticPatchForUnchangedLine(new TextDecoder().decode(blob.data), treePath, line);
 }
 
 /** ToPullReviewComment (services/convert/pull_review.go:103–127) wire shape. */
@@ -1130,7 +1297,28 @@ export function registerPullReviewRoutes(
           pending = inserted[0]!;
         }
         const pendingId = pending.id;
-        const codeCommentInserts = comments_.map((comment) =>
+        // The diff-hunk capture (GetCodeCommentPatch, gitdiff.go:1600–1615):
+        // ONE three-dot range read per create request, each comment cut
+        // around its line. The range's end is the HEAD REF TIP even when the
+        // form carries an explicit commit_id (upstream's patch reads
+        // pr.GetGitHeadRefName, review.go:265–273 — only CommitSHA follows
+        // the form). A degenerate range (no servable head/base ref, no
+        // merge base) captures nothing — rows store no patch and diff_hunk
+        // renders "" as before; never a fabricated hunk.
+        let range: CodeCommentRange | null = null;
+        if (commitId !== "") {
+          try {
+            const pulled = await pullRequestDiff(c, found, pullRequest);
+            if (pulled.mergeBase !== null) range = pulled;
+          } catch {
+            range = null; // no servable diff range (missing head/base ref) — no hunks
+          }
+        }
+        const patches: Array<string | null> = [];
+        for (const comment of comments_) {
+          patches.push(range === null ? null : await codeCommentPatch(c, found, range, comment.path, lineOf(comment)));
+        }
+        const codeCommentInserts = comments_.map((comment, index) =>
           drizzle(c.env.DB).insert(comments).values({
               type: CommentType.Code,
               posterId: doerId,
@@ -1142,6 +1330,7 @@ export function registerPullReviewRoutes(
               content: comment.body,
               commitSha: commitId,
               oldRef: commitId,
+              patch: patches[index] ?? null,
               reviewId: pendingId,
               createdAt: now,
               updatedAt: now,

@@ -505,6 +505,160 @@ describe("GET /repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments (repoGet
 });
 
 // ---------------------------------------------------------------------------
+// The code-comment diff hunks — the GetCodeCommentPatch port
+// (services/gitdiff/gitdiff.go:1600–1615): created code comments store the
+// hunk cut around their line over the PR's three-dot range
+// (CutDiffAroundLine, modules/git/diff.go:160–268, over the engine's
+// structured hunks), falling back to the synthetic context patch at the
+// side's context commit when the line is unchanged
+// (GeneratePatchForUnchangedLine, gitdiff.go:1621–1668). The wire renders
+// it through patch2diff → diff_hunk (convert/pull_review.go:115).
+// ---------------------------------------------------------------------------
+
+/** SHA-1 of one loose git object (header-prefixed) — the seedBranch recipe. */
+async function looseOid(type: "blob" | "tree" | "commit", data: Uint8Array): Promise<string> {
+  const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+  const bytes = new Uint8Array(header.byteLength + data.byteLength);
+  bytes.set(header);
+  bytes.set(data, header.byteLength);
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-1", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** A commit with the given files, parented on `parent` (null = root) — real
+ *  engine content the three-dot diff can cut hunks out of. */
+async function seedFilesCommit(branch: string, files: Record<string, string>, parent: string | null): Promise<string> {
+  const pair = { ownerNamespace: OWNER, slug: SLUG };
+  const cell = env.REPO.getByName(`${OWNER}/${SLUG}`);
+  const objects: Array<{ oid: string; type: "blob" | "tree" | "commit"; data: Uint8Array }> = [];
+  const entries: Array<{ mode: string; name: string; oid: string }> = [];
+  for (const [name, content] of Object.entries(files)) {
+    const data = new TextEncoder().encode(content);
+    const oid = await looseOid("blob", data);
+    objects.push({ oid, type: "blob", data });
+    entries.push({ mode: "100644", name, oid });
+  }
+  const tree = serializeTree(entries);
+  objects.push({ oid: tree.oid, type: "tree", data: tree.data });
+  const person = { name: "seed", email: "seed@reviews.invalid", time: 1761000000, tz: "+0000" };
+  const commit = serializeCommit({ tree: tree.oid, parents: parent === null ? [] : [parent], author: person, committer: person, message: "seed\n" });
+  objects.push({ oid: commit.oid, type: "commit", data: commit.data });
+  const put = await cell.putApiObjects(objects);
+  if (put.tag !== "ok") throw new Error(`seed putApiObjects failed: ${put.tag}`);
+  const tips = refTipMap(await engineReads(env, pair).listRefs());
+  const landed = await cell.commitApiChange({ ref: branchRef(branch), expectedOldOid: tips.get(branchRef(branch))?.target ?? ZERO_OID, newOid: commit.oid });
+  if (landed.tag !== "committed") throw new Error(`seed branch landing failed: ${landed.tag}`);
+  return commit.oid;
+}
+
+describe("code-comment diff hunks (the GetCodeCommentPatch port)", () => {
+  const FILE = "file.txt";
+  const BASE_LINES = ["L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9", "L10"];
+
+  /** main = the 10-line file; feature (parented on main) edits L5–L7 and
+   *  adds extra.txt — a real merge-base..head diff with an unchanged region
+   *  (L1–L4, L8–L10) and a head-only file. */
+  async function seedDiffScenario(): Promise<{ index: number }> {
+    const repoId = await seedRepo();
+    const mainTip = await seedFilesCommit("main", { [FILE]: `${BASE_LINES.join("\n")}\n` }, null);
+    const edited = [...BASE_LINES];
+    edited[4] = "L5-edited";
+    edited[5] = "L6-edited";
+    edited[6] = "L7-edited";
+    const featureTip = await seedFilesCommit("feature", { [FILE]: `${edited.join("\n")}\n`, "extra.txt": "E1\nE2\n" }, mainTip);
+    const pr = await seedPull(repoId);
+    await seedPullHeadRef(pr.index, featureTip);
+    return { index: pr.index };
+  }
+
+  it("cuts the hunk around a changed new-side line, keeps the full hunk near its start (old side), and synthesizes the unchanged-line patches", async () => {
+    const { index } = await seedDiffScenario();
+    const run = router();
+    const created = (await jsonBody(
+      await run(
+        `/api/v1/repos/${OWNER}/${SLUG}/pulls/${index}/reviews`,
+        authed(DOER_TOKEN, {
+          method: "POST",
+          body: JSON.stringify({
+            event: "COMMENT",
+            body: "hunk check",
+            comments: [
+              { path: FILE, body: "cut window", new_position: 6 },
+              { path: FILE, body: "full hunk", old_position: 5 },
+              { path: "extra.txt", body: "added-file no-cut", new_position: 1 },
+              { path: "extra.txt", body: "merge-base side has no blob", old_position: 1 },
+              { path: FILE, body: "beyond the blob", new_position: 99 },
+            ],
+          }),
+        }),
+      ),
+    ));
+    const res = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${index}/reviews/${String(created.id)}/comments`);
+    expect(res.status).toBe(200);
+    const list = await jsonArray(res);
+    expect(list).toHaveLength(5);
+    const byBody = new Map(list.map((row) => [row.body, row]));
+
+    // Cut arm, new side: the hunk starts at L2 (3 context + 3 edits, git's
+    // dels-then-adds block order), the target sits past CODE_COMMENT_LINES
+    // into it — upstream keeps the trailing window of 4 kept lines ENDING at
+    // the target with a recomputed @@ header (@@ -6,2 +5,2 @@: the
+    // -L6/-L7/+L5-edited/+L6-edited tail of the block).
+    expect(byBody.get("cut window")?.diff_hunk).toBe("@@ -6,2 +5,2 @@\n-L6\n-L7\n+L5-edited\n+L6-edited");
+    // No-cut arm, old side: the target lands within 4 kept lines of the
+    // hunk start — the ORIGINAL header and the kept prefix as-is.
+    expect(byBody.get("full hunk")?.diff_hunk).toBe("@@ -2,9 +2,9 @@\n L2\n L3\n L4\n-L5");
+    // No-cut arm on a NEW file: line 1 of extra.txt is itself an added line
+    // inside the whole-file add hunk — the kept prefix fits, so the ORIGINAL
+    // header renders as-is (the engine's pure-add hunk carries -0,0).
+    expect(byBody.get("added-file no-cut")?.diff_hunk).toBe("@@ -0,0 +1,2 @@\n+E1");
+    // Old side of a head-only file: the merge-base blob read misses — no
+    // fabricated hunk.
+    expect(byBody.get("merge-base side has no blob")?.diff_hunk).toBe("");
+    // Beyond the blob: upstream's range read errors into "".
+    expect(byBody.get("beyond the blob")?.diff_hunk).toBe("");
+  });
+
+  it("an unchanged new-side line synthesizes its context from the head tip", async () => {
+    const { index } = await seedDiffScenario();
+    const run = router();
+    const created = (await jsonBody(
+      await run(
+        `/api/v1/repos/${OWNER}/${SLUG}/pulls/${index}/reviews`,
+        authed(DOER_TOKEN, {
+          method: "POST",
+          body: JSON.stringify({ event: "COMMENT", body: "unchanged", comments: [{ path: FILE, body: "ctx", new_position: 1 }] }),
+        }),
+      ),
+    ));
+    const list = await jsonArray(await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${index}/reviews/${String(created.id)}/comments`));
+    expect(list).toHaveLength(1);
+    // L1 is outside every hunk (the diff starts at L2) — GeneratePatchForUn-
+    // changedLine renders the 1-line window at the head tip.
+    expect(list[0]!.diff_hunk).toBe("@@ -1,1 +1,1 @@\n L1\n");
+  });
+
+  it("a PR without a landed head ref captures nothing — diff_hunk stays empty (the degenerate arm)", async () => {
+    const repoId = await seedRepo();
+    await seedFilesCommit("main", { [FILE]: `${BASE_LINES.join("\n")}\n` }, null);
+    const pr = await seedPull(repoId); // no seedPullHeadRef — no servable range
+    const run = router();
+    const created = (await jsonBody(
+      await run(
+        `/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`,
+        authed(DOER_TOKEN, {
+          method: "POST",
+          body: JSON.stringify({ event: "COMMENT", body: "degenerate", comments: [{ path: FILE, body: "no range", new_position: 6 }] }),
+        }),
+      ),
+    ));
+    expect(created.id).toBeDefined(); // the review still lands (200, no 500)
+    const list = await jsonArray(await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews/${String(created.id)}/comments`));
+    expect(list).toHaveLength(1);
+    expect(list[0]!.diff_hunk).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Dismissal arms
 // ---------------------------------------------------------------------------
 
