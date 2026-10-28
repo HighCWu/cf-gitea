@@ -71,7 +71,7 @@ the REDEPLOY12 tombstone t+0 proof (~1395-1417) and the
 REDEPLOY10 registry re-probe (~991-1030) for the registry sweep. `--dry-run`
 prints all of them verbatim.
 
-- **p0** — the shallow trio against the standing private fixture
+- **p0** — the shallow trio against the user's private fixture
   (`<user>/p0-shallow`, default user `p0probe`): shallow-since and
   shallow-exclude clones exit 128 with the server text naming `'deepen-since'`
   / `'deepen-not'` (only depth-limited shallow fetches are supported);
@@ -81,6 +81,23 @@ prints all of them verbatim.
   anonymous API GET 404, anonymous `info/refs` 401 Basic challenge, anonymous
   web page 404. `--fixture-oid` pins the standing tip
   (`502abd2d5561536873088528a9f57f02cd1633e1` in production).
+  **Self-fixture (no pre-seeded repo needed — the RD24 papercut closed):**
+  before the checks the battery POSTs `/api/v1/user/repos`
+  `{"name":"<fixture-repo>","private":true,"auto_init":true}` — the exact
+  call the RD24 window made by hand. **201** self-seeds (the run logs one
+  `[setup] p0-fixture` line; the create lands the registry entry + the
+  auto-init commit synchronously, and an authenticated `info/refs` settle
+  poll keeps the first check's clone off the fresh-cell race); **409**
+  tolerates the standing fixture a prior run/window created. A self-seeded
+  fixture that survives a GREEN run stays — it becomes the user's standing
+  fixture (the next run 409s onto it, and `cleanup-audit --expect-owner-repos 1`
+  holds). A RED run sweeps the fixture ONLY when this run created it
+  (`[tail] p0-leftover-sweep`); a pre-existing fixture is NEVER deleted —
+  earlier windows' users own theirs — and an inconclusive create answer
+  (neither 201 nor 409) is never deleted either, since the run cannot prove
+  it created it. A self-seeded fixture carries a fresh auto_init tip, so
+  `--fixture-oid` applies only to the standing fixture (the depth-1 check
+  pins the shape unless the oid is passed).
 - **registry** — N tombstone lifecycles (`--trials`, default 3; the REDEPLOY12
   proof ran 3/3): create public repo (201) → anonymous advert settles (exit 0,
   HEAD + main) → PATCH rename (200) → IMMEDIATE anonymous ls-remote on the NEW
@@ -427,6 +444,10 @@ prints all of them verbatim.
   - `forkpr-e2e` — fork, then base, then org;
     `[tail] forkpr-leftover-sweep`.
   - `ui-login` — its fixture repo; `[tail] ui-leftover-sweep`.
+  - `p0` — its SELF-SEEDED fixture only, and only when the run failed;
+    `[tail] p0-leftover-sweep`. A pre-existing fixture (the 409 reuse) is
+    never touched, and a green run keeps its seed on purpose (it becomes the
+    user's standing fixture — the next run 409s onto it).
   - `window2-mounts` — its secret by name (the user API DELETE), then its
     org; `[tail] w2-leftover-sweep`.
   - `window3-mounts` — its two probe repos (content + empty);
@@ -445,10 +466,8 @@ prints all of them verbatim.
     arrive with the row already deleted by the sweep itself.)
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
-  emptied everything, and the gone flags skip the rest). `p0` creates
-  nothing — it only reads the standing fixture — so it has no tail by
-  construction. The audit battery going green right after a red run is the
-  proof.
+  emptied everything, and the gone flags skip the rest). The audit battery
+  going green right after a red run is the proof.
 - Scratch dirs live under `os.tmpdir()` and are removed per battery; the PAT
   file is the operator's to shred.
 
@@ -483,6 +502,11 @@ prints all of them verbatim.
     leaves nothing to sweep — the tail stays silent.
   - `ui-login --force-red ui-labels-cookie-owner` — reds after the fixture
     repo exists; the `[tail] ui-leftover-sweep` line must list its delete.
+  - `p0 --force-red p0-shallow-since` — the setup self-seeds (or 409s onto
+    the standing fixture), the first check reds UNRUN, the rest chain-skip:
+    the `[tail] p0-leftover-sweep` line appears ONLY when THIS run created
+    the fixture; against a pre-existing fixture the tail stays silent — the
+    never-delete guarantee, exercisable under a red too.
   - `window2-mounts --force-red w2-secret-gone` — reds after the secret row
     exists (create green, delete chain-skipped); the
     `[tail] w2-leftover-sweep` line must list the by-name secret delete.
@@ -517,4 +541,7 @@ The committed tree was verified with a full `all` run against `pnpm dev`
 (bootstrap-admin, several local tokens — pass the real count via
 `--expect-tokens` for local audits) and its private `p0-shallow` fixture
 (tip `8582c5545ac5cbc4eafca46363dd5141c7ae87f9`). Production runs use
-`p0probe` and the standing fixture pinned by `--fixture-oid` instead.
+`p0probe` and the standing fixture pinned by `--fixture-oid` instead. A
+fresh scratch user needs NO pre-seeding anymore — the p0 battery
+self-seeds its fixture on first contact and keeps it on green (the next
+run reuses it via the 409 path).

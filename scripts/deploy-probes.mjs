@@ -11,8 +11,15 @@
  * them per deploy. Batteries (all take --base-url + a PAT file, except the
  * D1-only cleanup-audit, which takes neither — REDEPLOY15 friction (a)):
  *
- *   p0             The P0 shallow trio + privacy tail against the standing
- *                  fixture repo (`<user>/p0-shallow` by default).
+ *   p0             The P0 shallow trio + privacy tail against the user's
+ *                  fixture repo (`<user>/p0-shallow` by default) — SELF-
+ *                  SEEDING (the RD24 papercut closed): the setup POSTs
+ *                  /user/repos {name, private:true, auto_init:true} when the
+ *                  fixture is absent (409 = a prior window's standing fixture
+ *                  is reused and never deleted; the failure tail sweeps a
+ *                  fixture ONLY when this run created it AND the run failed —
+ *                  a green run keeps its seed, which becomes the user's
+ *                  standing fixture).
  *   registry       The tombstone / registry sweep: create -> immediate
  *                  anonymous advert -> rename -> carry -> delete -> the very
  *                  next anonymous ls-remote must be dead at t+0. A red run
@@ -167,8 +174,12 @@
  *     deliberate red-run strays lost to the old lfs-e2e leave-for-debug
  *     convention): every battery that creates server-side state carries a
  *     finally-style failureTail (generate-e2e's shape — fullName-tracked
- *     creations, one [tail] line, green runs silent); p0 creates nothing (it
- *     only reads the standing fixture), so it has no tail by construction.
+ *     creations, one [tail] line, green runs silent); p0's tail covers only
+ *     its SELF-SEEDED fixture (the setup's POST /user/repos) and sweeps it
+ *     only when THIS run created it AND the run failed — a pre-existing
+ *     fixture belongs to its earlier window's user and is never deleted,
+ *     and a green run keeps its seed (it becomes the standing fixture the
+ *     next run 409s onto).
  *
  * Canonical expectations ported from the latest evidence block
  * (docs/design/p0-evidence.md, REDEPLOY13 2026-10-26, ~lines 1507-1697;
@@ -178,6 +189,11 @@
  *     naming 'deepen-since' / 'deepen-not'; depth=1 clones exit 0 with
  *     .git/shallow == the HEAD tip, 1 commit, fsck clean (fixture tip
  *     502abd2d… on the standing production repo; pin with --fixture-oid).
+ *   - the fixture self-seeds when absent: POST /user/repos {name,
+ *     private:true, auto_init:true} → 201 (409 = the standing fixture is
+ *     reused verbatim). A self-seeded fixture carries a fresh auto_init tip,
+ *     so --fixture-oid applies only to the standing fixture (the depth-1
+ *     check pins the SHAPE unless the oid is passed).
  *   - the standing fixture is PRIVATE: anonymous API GET 404, anonymous
  *     info/refs 401 Basic challenge, anonymous web page 404.
  *   - after a registry tombstone delete, the VERY NEXT anonymous ls-remote on
@@ -313,7 +329,7 @@ const usage = () =>
   "\n" +
   `batteries: ${BATTERY_NAMES.join(", ")}\n` +
   "battery options:\n" +
-  "  p0:            --fixture-repo p0-shallow  --fixture-oid <sha> (pin the standing tip)\n" +
+  "  p0:            --fixture-repo p0-shallow  --fixture-oid <sha> (pin the standing tip; the fixture self-seeds — private + auto_init — when absent)\n" +
   "  registry:      --trials <1-10>            (default 3, one tombstone lifecycle each)\n" +
   "  generate-e2e:  --strict-generated-clone   (promote the carried git-wire warn to a hard assert)\n" +
   "  forkpr-e2e:    (no extra options)\n" +
@@ -523,12 +539,97 @@ const MIRROR_SETTLE_MS = opts.mirrorSettleMs;
 
 // ---------- battery: p0 (shallow trio + privacy tail) ----------
 
+/**
+ * The RD24 papercut (docs/design/p0-evidence.md, REDEPLOY24): the battery
+ * used to CLONE a pre-existing fixture repo, so a fresh run user 404'd on
+ * first contact and the window's orchestrator had to seed
+ * `<user>/<fixture-repo>` by hand mid-run. The battery is now self-sufficient:
+ * p0Setup (below) runs BEFORE the checks and creates the fixture when absent
+ * — the exact call the window used by hand. The fixture state feeds the tail:
+ * `fixtureCreated` marks a 201 (a 409 reuse NEVER deletes — earlier windows'
+ * users own theirs), `checksStart` fences the tail to this battery's own
+ * check slice, `setupThrew` lets the tail sweep a fixture this run created
+ * even when the setup itself failed after the 201.
+ */
 const p0Context = () => ({
   user: opts.user,
   repo: opts.fixtureRepo,
   url: gitUrl(opts.user, opts.fixtureRepo),
   tmp: null,
+  fixtureCreated: false, fixtureFullName: null, setupThrew: false, checksStart: 0,
 });
+
+/**
+ * The self-fixture setup (the RD24 window's hand step, now the battery's own):
+ * POST /user/repos {name: opts.fixtureRepo, private: true, auto_init: true}
+ * — 201 self-seeds (the create lands the registry entry + the auto-init
+ * commit synchronously; the settle poll is insurance so the FIRST check's
+ * authenticated clone never races a fresh cell), 409 tolerates the standing
+ * fixture from a prior run/window, any other answer fails the setup (main's
+ * catch → exit 2; a fixture we cannot prove we created is never deleted).
+ * A self-seeded fixture that survives a GREEN run stays: it becomes the
+ * user's standing fixture (the next run 409s onto it — the cleanup-audit
+ * `repositories == 1` shape). Runs before p0Steps' checks; the checks
+ * themselves are untouched.
+ */
+const p0Setup = async (ctx) => {
+  ctx.checksStart = results.length;
+  try {
+    const res = await api("/user/repos", {
+      method: "POST",
+      body: { name: ctx.repo, private: true, auto_init: true },
+    });
+    if (res.status === 201) {
+      ctx.fixtureCreated = true;
+      ctx.fixtureFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
+      const settled = await poll(SETTLE_MS, async () => {
+        const refs = await fetchT(`${ctx.url}/info/refs?service=git-upload-pack`, {
+          headers: { authorization: `token ${TOKEN}` },
+        });
+        await refs.text();
+        return refs.status === 200;
+      });
+      if (!settled) {
+        throw new Error(`self-seeded fixture ${ctx.fixtureFullName} never answered an authenticated info/refs 200 within ${SETTLE_MS} ms`);
+      }
+      log(`  [setup] p0-fixture — self-seeded ${ctx.fixtureFullName} (private, auto_init; info/refs settled)`);
+    } else if (res.status === 409) {
+      log(`  [setup] p0-fixture — ${ctx.user}/${ctx.repo} already exists (409) — reusing the standing fixture (never deleted by this battery)`);
+    } else {
+      throw new Error(`fixture self-seed POST /api/v1/user/repos → ${res.status} (expected 201 or 409): ${res.text.slice(0, 120)}`);
+    }
+  } catch (err) {
+    ctx.setupThrew = true; // the tail sweeps a fixture this run created even on a failed setup
+    throw err;
+  }
+};
+
+/**
+ * The red-runs-self-sweep posture for the SELF-SEEDED fixture only: a failed
+ * p0 run (any red check in this battery's slice, or a setup throw after the
+ * 201) sweeps the fixture it created. A PRE-EXISTING fixture (the 409 path)
+ * is never touched, whatever this run's verdict. A green run keeps its
+ * self-seeded fixture ON PURPOSE: it IS the standing fixture the next run
+ * reuses. Best-effort, one [tail] line, never throws (main's finally depends
+ * on it); failures feed left_behind.
+ */
+const p0FailureCleanup = async (ctx) => {
+  if (!ctx.fixtureCreated) return; // nothing self-seeded (409 reuse / setup never reached the POST) — nothing to sweep
+  const mine = results.slice(ctx.checksStart);
+  const runFailed = ctx.setupThrew === true || mine.some((r) => r.status === "fail");
+  if (!runFailed) return; // green: the self-seeded fixture stays (it becomes the standing fixture)
+  const acts = [];
+  const [owner, repo] = String(ctx.fixtureFullName ?? `${ctx.user}/${ctx.repo}`).split("/");
+  try {
+    const out = await deleteRepo(owner, repo);
+    acts.push(typeof out === "string" ? out : out.detail);
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    leftBehind.push(`repo ${owner}/${repo} (p0 failure-cleanup tail: DELETE threw: ${why})`);
+    acts.push(`repo ${owner}/${repo} LEFT BEHIND — DELETE threw: ${why}`);
+  }
+  if (acts.length) log(`  [tail] p0-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
 
 const probeShallowSince = async (ctx) => {
   const dir = path.join(ctx.tmp, "shallow-since");
@@ -3777,7 +3878,7 @@ const auditSteps = (ctx) => [
 // ---------- battery registry ----------
 
 const BATTERIES = {
-  "p0": { title: "P0 shallow trio + privacy tail", context: p0Context, steps: p0Steps },
+  "p0": { title: "P0 shallow trio + privacy tail", context: p0Context, setup: p0Setup, steps: p0Steps, failureTail: p0FailureCleanup },
   "registry": { title: "registry tombstone sweep (carry + t+0 delete)", context: registryContext, steps: (ctx) => Array.from({ length: opts.trials }, (_, i) => registryTrialSteps(ctx, i + 1)).flat(), failureTail: registryFailureCleanup },
   "generate-e2e": { title: "template → generate → carried refs + contents", context: generateContext, steps: generateSteps, failureTail: generateFailureCleanup },
   "forkpr-e2e": { title: "fork → owner:branch PR chain", context: forkprContext, steps: forkprSteps, failureTail: forkprFailureCleanup },
@@ -3911,6 +4012,9 @@ const main = async () => {
     log(``);
     log(`battery ${name} — ${battery.title}`);
     try {
+      // The per-battery setup (p0's self-fixture): runs BEFORE the checks, so
+      // a fresh run user's first contact is a 201 seed, not the RD24 404.
+      if (battery.setup) await battery.setup(ctx);
       if (battery.independent) {
         for (const step of battery.steps(ctx)) await check(step.id, step.run);
       } else {
