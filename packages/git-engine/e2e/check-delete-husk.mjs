@@ -20,7 +20,14 @@
 //   - a content-bearing cell still takes the real wipe path (in-session) and
 //     still answers 200 — the no-op branch is husk-only, not a blanket skip;
 //   - a never-populated cell deletes 200 in-session (registry-independent
-//     admin semantics mod.ts has always kept).
+//     admin semantics mod.ts has always kept);
+//   - a store CONSTRUCTED by a fresh session over an EXISTING database can
+//     still run DDL — CREATE, then DROP of a table that EXISTS — pinning the
+//     cursor-drain root-cause fix: the construction-time tableExists probe
+//     must drain its SELECT cursor (an un-drained SqlStorage cursor bricks
+//     every subsequent DROP TABLE of an existing table on the connection for
+//     the session; docs/research/workerd-ddl-cross-session-locked.md,
+//     workerd#959 — the pre-drain leak re-bricked DDL at every open).
 //
 // The purge driver below replays the queue consumer's exact steps
 // (markDeleted → destroy, SPEC-0003 §2.5.5 steps 2+4) through the real DO RPCs.
@@ -233,6 +240,43 @@ async function main() {
     const res = await del(mf, "husk/empty");
     await mf.dispose();
     if (res.status !== 200 || res.body !== "deleted\n") throw new Error(`expected 200, got ${res.status} ${JSON.stringify(res.body)}`);
+  });
+
+  await check("constructed store over an EXISTING database: DROP of an existing table still works (the construction probe drains its cursor)", async () => {
+    // Session A populates the database: engine tables + a populated migration
+    // journal EXIST from here on.
+    const mf1 = makeMf();
+    const created = await create(mf1, "husk/ddlpin");
+    if (created.status !== 200) throw new Error(`setup create failed: ${created.status} ${created.body}`);
+    await mf1.dispose();
+
+    // Session B's FIRST touch constructs the cell over the existing database —
+    // exactly where the constructor's table-existence probe runs over tables
+    // that exist (on a fresh database the probe throws before any cursor
+    // exists, so only this shape can leak). Pre-drain, the probe discarded one
+    // SELECT cursor per open and workerd bricked every later DROP of an
+    // existing table on the connection (CREATE and DML keep working, and
+    // `DROP TABLE IF EXISTS <nonexistent>` succeeds — the lock bites only
+    // drops of tables that exist), so the scratch table's DROP below failed
+    // with `database table is locked: SQLITE_LOCKED`.
+    const mf2 = makeMf();
+    try {
+      const probe = await sql(mf2, "husk/ddlpin", "CREATE TABLE ddl_pin_probe (id TEXT)");
+      if (probe.error) throw new Error(`CREATE probe failed: ${probe.error}`);
+      const dropped = await sql(mf2, "husk/ddlpin", "DROP TABLE ddl_pin_probe");
+      if (dropped.error) {
+        throw new Error(
+          `DROP of an existing table failed after a fresh-session construction: ${dropped.error} ` +
+            `— the construction-time probe leaked its SELECT cursor (an un-drained SqlStorage cursor ` +
+            `bricks every subsequent DROP TABLE of an existing table for the session)`
+        );
+      }
+      // idempotent tail: the now-nonexistent table drops as a no-op
+      const again = await sql(mf2, "husk/ddlpin", "DROP TABLE IF EXISTS ddl_pin_probe");
+      if (again.error) throw new Error(`idempotent DROP IF EXISTS failed: ${again.error}`);
+    } finally {
+      await mf2.dispose();
+    }
   });
 
   if (failures.length) {

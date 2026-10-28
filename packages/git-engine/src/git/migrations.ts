@@ -385,10 +385,28 @@ function recordApplied(sql: SqlStorage, id: string): void {
 
 /** Table existence without sqlite_master (workerd's DO SQLite does not
  * document metadata relations): a probe SELECT either parses or throws.
- * `name` is engine-controlled — never user input. */
+ * `name` is engine-controlled — never user input.
+ *
+ * The probe cursor MUST be drained. workerd bricks every subsequent
+ * `DROP TABLE` of an EXISTING table on the connection with
+ * `database table is locked: SQLITE_LOCKED` for the rest of the runtime
+ * session when a `SqlStorage` SELECT cursor is discarded un-drained
+ * (docs/research/workerd-ddl-cross-session-locked.md — the DDL distillation;
+ * workerd#959). This probe runs at EVERY store construction over a database
+ * whose tables exist (the common case — every session after first creation),
+ * so the discarded cursor re-leaked once per open and re-bricked DDL in
+ * every new session; on a fresh database the probed table is absent and the
+ * prepare throws before any cursor exists, which is why creation sessions
+ * never showed it. Drain by `.toArray()` — at most the one LIMIT 1 row —
+ * the same idiom every other engine `sql.exec(<SELECT>)` uses and the exact
+ * shape the distillation's CLEAN discriminator verified at runtime. There is
+ * no close()/return() on `SqlStorageCursor` (types @cloudflare/workers-types
+ * 5.20261025.1): `next()`/`toArray()`/`one()`/full iteration are the only
+ * drains. Engine discipline: EVERY `sql.exec(<SELECT>)` cursor is drained;
+ * only DDL/DML (which produce no row cursor) may discard. */
 function tableExists(sql: SqlStorage, name: string): boolean {
   try {
-    sql.exec(`SELECT 1 FROM ${name} LIMIT 1`);
+    sql.exec(`SELECT 1 FROM ${name} LIMIT 1`).toArray();
     return true;
   } catch {
     return false;
