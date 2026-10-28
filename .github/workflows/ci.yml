@@ -37,7 +37,7 @@ jobs:
       - uses: pnpm/action-setup@v4 # version comes from package.json packageManager
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 25
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -116,7 +116,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 25
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -247,7 +247,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 25
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -340,7 +340,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 25
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -382,7 +382,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 25
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -483,7 +483,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 25
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -547,7 +547,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 25
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
