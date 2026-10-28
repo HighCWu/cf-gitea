@@ -182,3 +182,50 @@ refuses whole), a lease past its renew margin plus a mid-renewal reclaim
 rejects the gate and fails the RPC whole (fault A/C, never a partial answer),
 ls-refs peels and `listRefs` peels run under one lease, and a loose-only repo
 (empty catalog) stays guard-free.
+
+## M3.5 fault-matrix / correctness-tier / capability-matrix checks (tsx, no dev server)
+
+Three SPEC-0011 §7 M3.5 scripts — plain Node under tsx, no dev server: a real
+`GitStore` over `node:sqlite` (`helpers/lib.mjs`, real BEGIN/COMMIT), real
+`git` as the oracle where a client is involved.
+
+- `check-fault-matrix.mjs` — SPEC-0011 §7.2's fault-injection matrix,
+  completion tail: over a REAL GitStore, the REAL uploadPack DO arm streaming
+  through a range-aware in-memory R2 bucket stub, and the REAL
+  `runCompaction`/`runGcPass` — a real compaction publish lands MID-STREAM
+  between segment GETs (row 1), a GC pass mid-transfer of a paced fetch is
+  fully lease-blocked with row 12's early-release overlap pinned on the same
+  timeline (rows 2+12), a real mid-stream lease expiry rejects the renewal and
+  abandons the stream before the flush tail (row 3), and the crash-after-
+  publish mid-delete retry convergence on a REAL publish (row 5; row 4's one
+  missing assertion is appended to the landed `check-compaction.mjs` §5.3,
+  which also now carries the two D3 graceful-failure-exit checks, `6545edd`).
+- `check-correctness-tier.mjs` — SPEC-0011 §7.3's correctness-tier CI
+  additions as engine checks (none existed as automated checks before M3.5):
+  drives the REAL Worker-side receive flow — `createDurableGit().fetch` with
+  the real parsePushRequest/stagePack/scan/finalizeReceive pipeline, the DO
+  RPCs over node:sqlite, R2 staged in memory — plus real `git` as the
+  serve-path oracle: the size-parametrized push-boundary trio (under-cap
+  lands; over-cap DECLARED length is a 413 before any DO RPC or R2 write;
+  over-cap UNDECLARED aborts mid-stream with every command rejected and zero
+  refs moved), newTip-exists-tree-missing injection, finalize-success-
+  response-lost retry convergence, full clone with cross-pack delta bases
+  (`git index-pack` WITHOUT --fix-thin accepts, `git verify-pack -v` depth,
+  fsck clean), incremental fetch on REF_DELTA + negotiated haves (exact
+  new-object set, fsck clean).
+- `check-capability-matrix.mjs` — the capability matrix, TEST-GENERATED
+  (round 8's consistency gate; never hand-maintained): derives the
+  advertised-capability tables from the LIVE handshakes (v0 upload-pack, v0
+  receive-pack, protocol v2 `advertisement()` over a real store) and
+  mechanically requires every advertised feature to map onto a REGISTERED
+  PROOF that drives the real serve/control paths — an edit that advertises a
+  capability without a handler proof FAILS, and a proof whose behavior drifts
+  FAILS too; contrapositive pins keep `filter` unadvertised-and-rejected and
+  unknown fetch arguments fail-closed.
+
+```bash
+TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
+node "$TSX" packages/git-engine/e2e/check-fault-matrix.mjs      # 4 checks (as of this draft)
+node "$TSX" packages/git-engine/e2e/check-correctness-tier.mjs  # 7 checks
+node "$TSX" packages/git-engine/e2e/check-capability-matrix.mjs # 18 checks (test-generated at run time)
+```

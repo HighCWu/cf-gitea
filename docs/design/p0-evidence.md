@@ -3251,3 +3251,98 @@ findings (PR head-sync absence, org access revocation, the session
 rotation cookie, tag-only push-create deletion, issue cascade gaps +
 more) drive the fix wave that follows — this block is the review
 baseline's evidence of record.
+
+**REDEPLOY23 LIVE (2026-10-28 morning +0800 — after `29e3a43` (09:31) and
+before `b04a465` (09:37); GO commit NOT RECORDED in the landing docs,
+orchestrator fills; deploy version `a54c6adb`; healthz NOT RECORDED;
+migration 0035 applied remote):**
+
+- **The payload — the wave-130 fix wave reaches production.** 30 landed
+  findings (L1–L30) / 7 deliberate keeps (K1–K7) across 15 commits
+  (`28df818` → `bd6d257`); the authoritative scoreboard — per-finding
+  commits, keeps with rationales, the gate record — is
+  `docs/reviews/wave-130-parity-review.md` (committed at `6165474`), the
+  authority, not duplicated here. The deploy version `a54c6adb` is
+  wrangler's VERSION id, not a git object in this repo — the RD21/22
+  lineage convention (RD22: GO `5f3c26f` → version `73158aa8`;
+  `docs/reviews/wave-131-landing-ledger.md` §1, this window's record).
+- **Migration 0035 `spooky_galactus` applied remote** — the window's only
+  schema change, the additive `ALTER TABLE sessions ADD remember integer
+  DEFAULT false NOT NULL` (one statement; the L2 remember-persistence
+  column). Closes the RELEASE-NOTES fourth addendum's explicit deferral
+  ("which rides the NEXT deploy window — REDEPLOY22 carried none").
+- **Battery verdict: 112 passed / 1 item** (the nine standing batteries).
+  The 1 item is the cleanup-audit's `audit-personal-access-tokens` arm —
+  the per-run PAT still alive at audit time, deleted at wrap close (the
+  standing instrument pattern: RD21's "cleanup-audit 9/1", RD22's "the
+  live run-PAT audit item (deleted at wrap)"); a deliberate
+  audit-instrument step, NOT a product failure. The ledger's derived
+  reading: the standing batteries went fully green except that item, with
+  NO mirror cold-settle item this window (RD22's 108/2 carried one).
+- **Arithmetic NOTE (derived from the committed `id:` census in
+  `scripts/deploy-probes.mjs`, not quoted from a run log):** the nine
+  standing batteries total exactly **113 checks = 112 + 1** — p0 4 ·
+  registry 21 · generate-e2e 10 · forkpr-e2e 8 · mirror 8 · ui-login 5 ·
+  window2-mounts 22 · window3-mounts 25 · cleanup-audit 10.
+- **fixwave-parity accounted SEPARATELY.** The toolkit's 10th battery
+  (`29e3a43`, 22 checks over the fix wave's live shapes, `independent:
+  true` by family design) is not in the 113. Its own live smoke against
+  the STANDING RD22 deploy read **20/1 — every fix-wave arm already
+  green, the one red IS `fw-org-member-preaccess`, the pending org-grant
+  discriminator** ("row-19's git grant rides the next deploy"). Its
+  formal post-deploy green run is part of the RD24 verdict plan; the
+  RD24 block must state which run FIRST recorded the arm green (the
+  wave-131 ledger's flagged tension, §6).
+
+*(REDEPLOY23 — compiled from the landing records; the orchestrator's run
+output did not survive session compaction — every number traced to its
+doc (`docs/reviews/wave-131-landing-ledger.md` §1-§3,
+`docs/reviews/wave-130-parity-review.md`, the `scripts/deploy-probes.mjs`
+census, the migration files). Untraceable fields are marked, not
+invented: the GO commit, the healthz startup time, the run-PAT name, and
+any per-battery split beyond the census derivation above.)*
+
+**REDEPLOY24 LIVE (2026-10-28 __TIME__, GO `__BLANK__` → deploy version
+`__BLANK__`; healthz 200 @__BLANK__s; migrations 0036_fantastic_whirlwind
++ 0037_smart_blizzard applied remote — paste the apply/list output:
+__BLANK__):**
+
+- **The payload** (fill each commit as it lands):
+  - **the perf wave** — `b04a465` (the P0+P1 index wave: migration 0036,
+    10 indexes, the rows_read witness in `bench-d1.test.ts`) + `7dc607f`
+    (the P2 index wave: migration 0037, 8 adds, 9 verified-dead drops,
+    the veto witness) + the S-grade N+1 collapse `c614daa` and the
+    M-grade list batching `fbd0826` + matrix batch fifteen `7c3b7c47`;
+  - **the engine D3 fix** — `6545edd` (graceful publish failures keep the
+    lease row; the sweep, not the round, converges the orphan; two new
+    `check-compaction` checks);
+  - **mirror-HEAD** — `__BLANK__` (in flight at draft time;
+    `fd05b1e`'s sweep found the product-side root cause this fixes);
+  - **wiki-webhook** — `__BLANK__` (in flight at draft time; the webhook
+    coverage refresh's wiki gap, `4556669`);
+  - **tier-2 adoption** — `__BLANK__` (in flight at draft time);
+  - **the addressability fix** — `__BLANK__` (in flight at draft time).
+- **The gate at GO — the full-gate line at the final tree**:
+  `pnpm test:full` (ADR-0006 composite): __BLANK__; `pnpm typecheck`:
+  __BLANK__; `pnpm lint`: __BLANK__; `check-openapi`: __BLANK__.
+- **Battery verdict (the standing batteries + the NEW branch-protection
+  battery — the toolkit's 11th, `e9f37f2`, 17 checks over the SPEC-0013
+  protection flows, verified from its committed `id:` census)**:
+  __BLANK__ (paste per-battery lines; the battery total changes at this
+  deploy — the 17 branch-protection checks join the standing census).
+- **THE DEPLOY DISCRIMINATOR — `fw-org-member-preaccess` GREEN.** The
+  fixwave-parity battery's org-grant arm (row-19's git grant rode RD23)
+  is expected GREEN at this deploy's formal run — paste the verdict and
+  state which run FIRST recorded the arm green (the wave-131 ledger §6
+  tension: RD23's 112/1 reconciles with the nine standing batteries
+  only, so the first formal green is recorded here unless the
+  orchestrator's RD23 record says otherwise): __BLANK__.
+- **Force-red**: __BLANK__ (the branch-protection battery ships a
+  committed force-red arm: `bp-merge-blocked-405`).
+- **`pnpm smoke` (--migrate-check)**: __BLANK__ — expected: the expected
+  table census under the 0036+0037 schema, "No migrations to apply".
+- **Hand spots**: __BLANK__.
+- **Cleanup audit / PAT-audit**: __BLANK__ — expected: every battery
+  self-cleaned (branch-protection's created rules best-effort deleted
+  per its failure-tail enumeration), the run PAT deleted at wrap close,
+  `personal_access_tokens` back to the standing bootstrap = 1.
