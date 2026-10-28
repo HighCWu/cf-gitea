@@ -248,9 +248,15 @@ First push and the default branch: upstream sets `DefaultBranch = <pushed branch
 `IsEmpty = false` on the first non-empty branch push, and rewrites HEAD on disk if the
 branch differs from the instance default (`services/repository/push.go:255-264`,
 `pushNewBranch`). cf-gitea does the same inside the `finalizeReceive` D1 update:
-`is_empty=false`, `default_branch=<first pushed branch>`, and the DO `meta.head` is set
-to that branch (CAS inside the same DO transaction that commits refs — no separate
-`SetDefaultBranch` round trip). Later explicit default-branch changes (API, 0004)
+`is_empty=false`, `default_branch=<the recorded HEAD branch>`, where the adoption
+prefers the engine's own HEAD resolution — the `commitPush` fixup's main → master →
+first-branch pick over the whole command plan (`git/protocol.ts:1615-1623`; the
+receive-path stand-in for upstream's first-pushed-branch op, since a single
+`commitPush` application has no per-op order to read) — taken when it names a landed
+branch, with the alphabetically first branch as the HEAD-less/unborn fallback. The DO
+`meta.head` already carries the engine's pick; the settle re-points it via the engine's
+`setHead` RPC only on the fallback arm's divergence (no separate round trip on the
+common path). Later explicit default-branch changes (API, 0004)
 update D1 + DO `meta.head` via CAS. v0 advertisements of an empty repo carry
 `symref=HEAD:refs/heads/<default>`; v2 uses `unborn` in `ls-refs` (SPEC-0001 §5).
 

@@ -937,14 +937,16 @@ async function serveHead(env: Env, route: GitHttpRoute, defaultBranch: string): 
  *
  * - ANY ref landed (heads ∪ tags ∪ anything else the engine reports) → the
  *   create is real and the row survives. With branches: `status='ready'`,
- *   `is_empty=false`, `default_branch=<first pushed branch>` — one
+ *   `is_empty=false`, `default_branch=<the recorded HEAD branch>` — one
  *   conditional UPDATE (`is_empty`, status-agnostic), so a concurrent
  *   settle can never double-apply. For API-created rows this is the first
  *   is_empty transition; for push-created rows it completes the create.
- *   The DO's meta.head is aligned to the adopted branch via the engine's
- *   setHead RPC when it diverged (the engine's first-push adoption prefers
- *   main/master; see below); the synthetic HEAD endpoint falls back to D1
- *   only for unborn repos.
+ *   The adoption reads the engine's own HEAD resolution (commitPush's
+ *   fixup: main → master → first branch, git/protocol.ts) when it names a
+ *   landed branch, with the alphabetically-first branch as the HEAD-less
+ *   fallback; the DO's meta.head is aligned to the adopted branch via the
+ *   engine's setHead RPC when it diverged (the fallback arm); the synthetic
+ *   HEAD endpoint falls back to D1 only for unborn repos.
  * - Refs landed but NO branch among them (the tag-only first push):
  *   upstream's tag arm (services/repository/push.go:100-139) records
  *   tags/notifications and nothing else — pushNewBranch (:255-270) is
@@ -1028,14 +1030,23 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
     }
 
     // First non-empty branch push adopts the default branch (§2.5.2,
-    // upstream pushNewBranch). listRefs orders by name, so a single-branch
-    // push — the dominant first-push shape — is exact; a multi-branch first
-    // push adopts the alphabetically first branch (upstream adopts the pushed
-    // branch; indistinguishable here without an engine hook). The CAS is
-    // `is_empty` only: every empty row — 'creating', 'ready', 'migrating' —
-    // settles the same way, `status` re-asserting 'ready' for the push-create
-    // rows and a no-op value for the rest.
-    const firstBranch = branches[0]!.slice("refs/heads/".length);
+    // upstream pushNewBranch). The recorded HEAD first: commitPush's fixup
+    // ran over the WHOLE command plan and picked refs/heads/main → master →
+    // first name-ordered branch (git/protocol.ts:1615-1623) — the receive
+    // path's HEAD resolution, and the honest stand-in for upstream's
+    // first-pushed-branch op (push.go:255-268 walks the ops in receive
+    // order; a single commitPush application has no per-op order to read).
+    // Adopt it when it names one of the landed branches; the alphabetically
+    // first branch stays the fallback for a HEAD-less/unborn pick (listRefs
+    // orders by name — the shape every non-receive caller of this settle
+    // relied on before the HEAD hint existed). The CAS is `is_empty` only:
+    // every empty row — 'creating', 'ready', 'migrating' — settles the same
+    // way, `status` re-asserting 'ready' for the push-create rows and a
+    // no-op value for the rest.
+    const landedBranches = branches.map((name) => name.slice("refs/heads/".length));
+    const headBranch = doHead !== null && doHead.startsWith("refs/heads/") ? doHead.slice("refs/heads/".length) : null;
+    const firstBranch =
+      headBranch !== null && landedBranches.includes(headBranch) ? headBranch : landedBranches[0]!;
     const settled = await db
       .update(repositories)
       .set({ status: "ready", isEmpty: false, defaultBranch: firstBranch, updatedAt: new Date() })
@@ -1056,11 +1067,11 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
     }
 
     // §2.5.2 (ENGINE-WAVE): the DO's meta.head must agree with the adopted
-    // branch. The engine's own first-push adoption prefers main/master over
-    // the alphabetically-first rule this settle applies, so a multi-branch
-    // first push can diverge — setHead re-points it (idempotent CAS, bumps
-    // refs_version). Skipped when they already agree, so the common
-    // single-branch push pays no extra RPC.
+    // branch. When the HEAD arm above adopted it, they already agree (no
+    // RPC); the alphabetical FALLBACK arm is the divergence case (an unborn
+    // or HEAD-less receive) — setHead re-points it (idempotent CAS, bumps
+    // refs_version). Skipped when they agree, so the common push pays no
+    // extra RPC.
     if (doHead !== null && doHead !== `refs/heads/${firstBranch}`) {
       try {
         const set = await env.REPO.getByName(engineRepo).setHead(firstBranch);

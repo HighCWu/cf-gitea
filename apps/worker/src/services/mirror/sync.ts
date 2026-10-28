@@ -27,7 +27,8 @@
  *   4. settle D1: success → `last_sync_at = now`, `next_sync_at = now +
  *      interval` (0 → unscheduled), `sync_state='idle'`, clear `last_error`;
  *      the first sync that gives the still-empty repo refs also settles the
- *      repositories row (`is_empty=false` + the engine's HEAD branch — the
+ *      repositories row (`is_empty=false` + the source's advertised HEAD
+ *      branch when it landed, else the engine's recorded HEAD branch — the
  *      import channel's settleDone shape); failure → sanitized `last_error`,
  *      `sync_state='idle'`, `next_sync_at` left DUE so the next cron retries
  *      — upstream's retry posture (mirror_pull.go:303-308).
@@ -247,10 +248,20 @@ async function claimMirrorRow(db: D1Database, repoId: string): Promise<boolean> 
  *  that gave the still-empty repo its first refs flips the repositories row
  *  (the import channel's settleDone shape, imports/service.ts — is_empty +
  *  default_branch; status is NOT written because a mirror repo never leaves
- *  `ready`, unlike an import's `migrating`). Best-effort: the refs are
- *  already in the engine and the next sync's settle re-checks, so a failed
- *  flip here logs and self-heals instead of failing a landed sync. */
-async function settleMirrorSuccess(env: MirrorSyncEnv, repo: RepoRow, mirror: MirrorRow, now: number): Promise<void> {
+ *  `ready`, unlike an import's `migrating`). The source's advertised HEAD
+ *  rides along — upstream's mirror follows it too (a mirror clone IS the
+ *  source's HEAD; MigrateRepositoryGitData reads it back with
+ *  GetDefaultBranch, services/repository/migrate.go:135-145). Best-effort:
+ *  the refs are already in the engine and the next sync's settle re-checks,
+ *  so a failed flip here logs and self-heals instead of failing a landed
+ *  sync. */
+async function settleMirrorSuccess(
+  env: MirrorSyncEnv,
+  repo: RepoRow,
+  mirror: MirrorRow,
+  now: number,
+  advertisedHead: string | null,
+): Promise<void> {
   await drizzle(env.DB)
     .update(repoMirrors)
     .set({
@@ -263,7 +274,7 @@ async function settleMirrorSuccess(env: MirrorSyncEnv, repo: RepoRow, mirror: Mi
     .where(and(eq(repoMirrors.repoId, repo.id), eq(repoMirrors.syncState, "syncing")));
   if (!repo.isEmpty) return; // steady state — already populated, nothing to flip
   try {
-    await settlePopulatedRepo(env, repo);
+    await settlePopulatedRepo(env, repo, advertisedHead);
   } catch (error) {
     console.error(
       `[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: population settle failed (the next sync re-checks): ${errorText(error)}`,
@@ -278,20 +289,33 @@ async function settleMirrorSuccess(env: MirrorSyncEnv, repo: RepoRow, mirror: Mi
  * still-empty repo and must stay `is_empty` (upstream too keeps an empty
  * mirror empty). The `is_empty = true` guard in the UPDATE is the CAS — a
  * concurrent settle or user push can never be double-applied or overwritten.
- * The default branch is the engine's HEAD (the engine's first-receive
- * adoption set meta.head); when the DO head is unborn or non-branch
- * (tags-only source), it falls back to the alphabetically-first branch
- * (listRefs is name-ordered — the push-create settle's rule) and only
- * flips emptiness when no branch exists at all.
+ *
+ * The default branch, in order: the source's ADVERTISED HEAD (`symref`
+ * capability / `symref-target:` — gitclient fetchRefs) when it names a
+ * branch the sync actually landed — upstream-faithful, a mirror clone
+ * carries the source's HEAD and MigrateRepositoryGitData adopts it
+ * (migrate.go:135-145); then the engine's recorded HEAD (commitPush's
+ * post-plan fixup: main → master → first, git/protocol.ts); then the
+ * alphabetically-first branch (listRefs is name-ordered — the push-create
+ * settle's rule) and only flips emptiness when no branch exists at all.
+ * The DO's meta.head is aligned to the adopted branch when it diverged
+ * (upstream SetDefaultBranch, mirror_pull.go:457-458; the engine's fixup
+ * picked main/master, which a source whose HEAD names another landed
+ * branch overrides) — skipped when they already agree, best-effort logged.
  */
-async function settlePopulatedRepo(env: MirrorSyncEnv, repo: RepoRow): Promise<void> {
-  const listed = await env.REPO.getByName(engineName(repo.ownerNamespace, repo.slug)).listRefs();
+async function settlePopulatedRepo(env: MirrorSyncEnv, repo: RepoRow, advertisedHead: string | null): Promise<void> {
+  const cellName = engineName(repo.ownerNamespace, repo.slug);
+  const listed = await env.REPO.getByName(cellName).listRefs();
   if (listed.refs.length === 0) return; // a legitimately empty source — stays empty
   const firstBranch = listed.refs.find((r) => r.name.startsWith("refs/heads/"))?.name.slice("refs/heads/".length);
+  const advertisedBranch =
+    advertisedHead !== null && advertisedHead.startsWith("refs/heads/") ? advertisedHead.slice("refs/heads/".length) : null;
   const branch =
-    listed.head !== null && listed.head.startsWith("refs/heads/")
-      ? listed.head.slice("refs/heads/".length)
-      : (firstBranch ?? null);
+    advertisedBranch !== null && listed.refs.some((r) => r.name === `refs/heads/${advertisedBranch}`)
+      ? advertisedBranch
+      : listed.head !== null && listed.head.startsWith("refs/heads/")
+        ? listed.head.slice("refs/heads/".length)
+        : (firstBranch ?? null);
   await drizzle(env.DB)
     .update(repositories)
     .set({
@@ -300,6 +324,18 @@ async function settlePopulatedRepo(env: MirrorSyncEnv, repo: RepoRow): Promise<v
       updatedAt: new Date(),
     })
     .where(and(eq(repositories.id, repo.id), eq(repositories.isEmpty, true)));
+  if (branch !== null && listed.head !== `refs/heads/${branch}`) {
+    try {
+      const set = await env.REPO.getByName(cellName).setHead(branch);
+      if (set.tag !== "ok") {
+        console.error(`[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: setHead ${branch} rejected: ${set.tag}`);
+      }
+    } catch (error) {
+      console.error(
+        `[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: setHead ${branch} failed: ${errorText(error)}`,
+      );
+    }
+  }
 }
 
 /** §2.6 step 5 — failure settle: `last_error` (sanitized), back to idle,
@@ -751,7 +787,7 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
   try {
     if (plan.wants.length === 0) {
       if (commands.length === 0) {
-        await settleMirrorSuccess(env, repo, mirror, nowSec);
+        await settleMirrorSuccess(env, repo, mirror, nowSec, advert.headSymref);
         await syncMirrorLicenses(env, repo); // mirror_pull.go:406-413 — unconditional on success
         return { ok: true, skipped: "no-changes", created: 0, updated: 0, deleted: 0 };
       }
@@ -786,7 +822,7 @@ export async function handleMirrorSync(env: MirrorSyncEnv, options: MirrorSyncOp
   // successful receive that IS FinalizeCommitted.updates, see
   // notifyMirrorSyncDelta). A notification failure cannot fail the settled
   // sync: notifyMirrorSyncDelta catches its own.
-  await settleMirrorSuccess(env, repo, mirror, nowSec);
+  await settleMirrorSuccess(env, repo, mirror, nowSec, advert.headSymref);
   await notifyMirrorSyncDelta(env, repo, commands);
   // The license arm last, upstream's order (mirror_pull.go:347-413: the
   // notification loop, THEN the license updater enqueue) — unconditional on

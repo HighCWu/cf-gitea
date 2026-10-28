@@ -569,7 +569,7 @@ describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => 
     });
   }
 
-  it("aligns the DO head with the adopted branch when a multi-branch first push diverges", async () => {
+  it("a multi-branch first push adopts the engine's recorded HEAD branch; the alphabetical pick stays a HEAD-less fallback only", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
     const { oid, pack } = await buildPack();
@@ -590,17 +590,21 @@ describe("default branch (SPEC-0003 §2.5.2 — the engine setHead RPC)", () => 
     });
     expect(push.status).toBe(200);
 
-    // The engine's first-push adoption prefers main; the settle's
-    // alphabetical adoption picks develop — the setHead alignment re-points
-    // the DO so the advertisement's HEAD agrees with D1.
+    // The engine's commitPush fixup runs over the WHOLE command plan and
+    // records refs/heads/main (main → master → first); the settle adopts
+    // that recorded HEAD — upstream adopts the pushed branch (push.go
+    // pushNewBranch), and main is the receive's own HEAD resolution. The
+    // alphabetical rule survives only as the fallback for a HEAD-less or
+    // unborn pick — not reachable here, so no setHead divergence exists and
+    // the DO head must NOT be re-pointed away from the adopted branch.
     const svc = service();
     const creating = await svc.getBySlug("alice", "branchy");
     expect(creating).not.toBeNull();
     if (creating === null) throw new Error("unreachable");
     await settleCreatingRepo(env, creating.id, "alice/branchy");
     const settled = (await svc.get(creating.id))!;
-    expect(settled.defaultBranch).toBe("develop");
-    expect((await env.REPO.getByName("alice/branchy").listRefs()).head).toBe("refs/heads/develop");
+    expect(settled.defaultBranch).toBe("main");
+    expect((await env.REPO.getByName("alice/branchy").listRefs()).head).toBe("refs/heads/main");
   });
 
   it("first push to an API-created (ready, is_empty) repo settles is_empty + default_branch via the same handshake (wave-settle-is-empty)", async () => {
