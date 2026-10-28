@@ -3302,10 +3302,10 @@ census, the migration files). Untraceable fields are marked, not
 invented: the GO commit, the healthz startup time, the run-PAT name, and
 any per-battery split beyond the census derivation above.)*
 
-**REDEPLOY24 LIVE (2026-10-28 __TIME__, GO `910a6aa4 → fd571f35 → 1235b4d0 (RD24b)` → deploy version
-`0be1769` (GO tree; two window-findings landed at `9d77172` before the RD24b freeze); healthz 200 @~3s; migrations 0036_fantastic_whirlwind
-+ 0037_smart_blizzard applied remote — paste the apply/list output:
-**REDEPLOY24 LIVE (2026-10-28 evening +0800 — the freeze at RD24b):**
+**REDEPLOY24 LIVE (2026-10-28 evening +0800 — the freeze at RD24b; GO tree
+`0be1769`, two window-findings landed at `9d77172` before the freeze; deploy
+chain 910a6aa4 → fd571f35 → 1235b4d0; healthz 200 @~3s; migrations 0036+
+0037 applied remote ✅✅):**
 
 - **The payload** (fill each commit as it lands):
   - **the perf wave** — `b04a465` (the P0+P1 index wave: migration 0036,
@@ -3332,7 +3332,7 @@ any per-battery split beyond the census derivation above.)*
 - **Battery verdict (the standing batteries + the NEW branch-protection
   battery — the toolkit's 11th, `e9f37f2` + `bd59bc4`'s slash-glob arm, 18 checks over the SPEC-0013
   protection flows, verified from its committed `id:` census)**:
-  **standing nine 121/0** (p0 4 — fixture created for the run user — + registry 21 + generate 9 + forkpr 8 + mirror 8 + ui-login 5 + window2 22 + window3 26) **+ branch-protection 18/0 + fixwave-parity 22/0 + demo 2-pass/1-posture-red/1-info** (banner + signup green post-flip; the config-posture arm reds BY DESIGN on the flipped operator machine); total live checks 163 (the battery total changes at this
+  **standing nine 113/0** (p0 4 — fixture created for the run user — + registry 21 + generate 9 + forkpr 8 + mirror 8 + ui-login 5 + window2 22 + window3 26 + cleanup-audit 10; the wave-131 census arithmetic) **+ branch-protection 18/0 + fixwave-parity 22/0 + demo 2-pass/1-posture-red/1-info** (banner + signup green post-flip; the config-posture arm reds BY DESIGN on the flipped operator machine); total live checks 155 (113+18+22+2-demo-passes; the first draft's 121 double-counted #11's 18 into standing — corrected at finalization) (the battery total changes at this
   deploy — the 17 branch-protection checks join the standing census).
 - **THE DEPLOY DISCRIMINATOR — `fw-org-member-preaccess` GREEN.** The
   fixwave-parity battery's org-grant arm (row-19's git grant rode RD23)

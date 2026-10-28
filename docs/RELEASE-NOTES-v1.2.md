@@ -655,9 +655,11 @@ it). The durable record is
 ws1009 house style: versions verified against the lockfile, a standalone
 ~80-line miniflare-only repro syntax-checked but NOT executed, a 7-item
 could-not-verify ledger; **filing awaits the user's nod**, the #16515
-pattern). **A10-L (LANDED — see the perf(engine,ui) commit)** — the batched `listTreeCommits` engine RPC, the audit's
-one open L-half (the repo home's worst serial wall-clock fan) — is IN
-FLIGHT at append time.
+pattern). **A10-L (LANDED — `bacfd7e`)** — the batched `listTreeCommits` engine RPC, the audit's
+one open L-half (the repo home's worst serial wall-clock fan) — landed
+after that append wrote IN FLIGHT; its UI consumer `f4c2132` adopts the
+batched RPC in the fragment loader, and both ride the RD24 tree
+(finalized in the close-out below).
 
 **The compatibility wave.** The **wiki family wired** (`466092c`): three
 write triggers (created/edited/deleted) fire upstream-faithful wiki
@@ -732,19 +734,53 @@ regenerated from code (`321688b`), the mirror HEAD-adoption fix
 (`e9f37f2` + `bd59bc4`), the slash tag names (`af92937`), and the
 dependency freshness census (`4d039cb`).
 
-**PENDING — the orchestrator finalizes these after the deploy freezes:**
-**RD24 itself** — its evidence block exists as the fill-in template
-(`f9a63ec`): the deploy version, healthz, **migrations 0036 +
-0037 applied remote** (the window's only schema change, both index-only —
-the 65-table count stands), the **battery verdicts** including the
-branch-protection battery — the toolkit's **11th, 18 arms** (`e9f37f2`'s
-17 checks + `bd59bc4`'s slash-glob arm) joining the standing census — and
-**THE DEPLOY DISCRIMINATOR `fw-org-member-preaccess` GREEN**: the
-fixwave-parity arm that read red in RD23's standing smoke (the 20/1) is
-expected green at RD24's formal run, and the block must state which run
-FIRST recorded it green (the wave-131 ledger's flagged §6 tension), plus
-the full-gate line at the final tree. **A10-L (LANDED)** and **M2 (LANDED — banner + quotas, mounted)** finalize when
-their units land. §4 re-check: no line retired — 0036/0037 are index-only
-(the 65-table count stands), `check:api` PASS at the HEAD (`98eb3f6`:
-78/78 + 129/129) keeps the 64-op FEATURE-ABSENT ceiling intact, and the
+**FINALIZED 2026-10-28 (at `62cb441`) — RD24 deployed, frozen at RD24b.**
+The fill-in template (`f9a63ec`) was filled from the run at `baf997a`;
+every number below is quoted from the REDEPLOY24 LIVE block
+(`docs/design/p0-evidence.md`), never re-derived. **The deploy chain**
+(three wrangler version ids, the RD23 lineage convention; GO tree
+`0be1769`): GO `910a6aa4` → `fd571f35` (the demo flip — where the
+stale-dist trap was found and fixed: wrangler deploys dist's GENERATED
+config, so the flip vars and routes never rode until a fresh build) →
+**`1235b4d0` (RD24b, the freeze)**, carrying the window's two live
+findings (`9d77172`); healthz 200 @~3s; **migrations 0036
+`fantastic_whirlwind` + 0037 `smart_blizzard` applied remote** — the
+window's only schema change, both index-only, the 65-table count
+stands. **The full gate at the final tree: `pnpm test:full` PASS — 268
+files, 266 direct + 2 solo-green (pull-engine + demo-quota, the
+load-flaky class), 0 deaths, 150.9 s wall**; typecheck 0, lint 0,
+`check:api` PASS (490/298, tier-1 78/78 + 129/129). **The batteries:
+standing nine 113/0 (the wave-131 census arithmetic) · branch-protection 18/0** (the toolkit's 11th,
+`e9f37f2`'s 17 checks + `bd59bc4`'s slash-glob arm) **· fixwave-parity
+22/0 — with `fw-org-member-preaccess` GREEN for the FIRST time,
+recorded at RD24b (`1235b4d0`)** (2488 ms, `member advert ok —
+refs/heads/main`) — the wave-131 ledger §6 tension closed — **· demo
+2-pass/1-posture-red/1-info** (banner + signup green post-flip; the
+config-posture arm reds BY DESIGN on the flipped operator machine);
+155 total live checks. **The window's two live findings — the window's
+own story, both fixed at `9d77172` before the freeze and both verified
+live after:** (1) the sign_up 404 — firstRunRouter mounted after
+uiRouter, and Hono's RegExpRouter gives the dynamic /:owner/:repo pair
+precedence over a two-segment static in a later-mounted router
+(`/login` survived only by being single-segment); reordered first,
+`/user/sign_up` 200 post-RD24b. (2) the discriminator's red was never
+the grant — POST /orgs/{org}/repos silently ignored `auto_init` (a
+SPEC-0007 implementation gap), the org repo born EMPTY so the arm's
+advert poll exhausted (the admin control empty too — the giveaway);
+the route now runs upstream's CreateUserRepo half. **The demo flip
+landed**: the banner live on both surfaces + signup 200, and
+`cf-gitea-demo.aiapp.run` answered **200 at the freeze** — the cert
+landed minutes after the wrap's provisioning hand-spot, and `e7d4877`
+flipped the README demo line live. **The publish line**: the repo is
+public at `github.com/HighCWu/cf-gitea` (777 commits on `main` at
+finalization) and the Deploy-to-Cloudflare button's target resolves
+against the public tree; the first public CI run tripped a
+workflow-parse orphan, fixed same-day at `62cb441`. **A10-L and M2
+finalized**: A10-L landed at `bacfd7e` (its UI consumer `f4c2132`
+adopts the batched RPC in the fragment loader), M2 landed + mounted
+(`cada11c`, quota guard closed at `9e5005f`) — both ancestors of the
+GO tree, so RD24 is their production ride (the banner hand-spot + the
+demo battery are M2's live verdict). §4 re-check: no line retired —
+0036/0037 are index-only (the 65-table count stands), `check:api` PASS
+at the GO tree keeps the 64-op FEATURE-ABSENT ceiling intact, and the
 ws1009 residuals line stands as written.
