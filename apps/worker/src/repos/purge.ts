@@ -27,8 +27,12 @@
  * purgable content).
  */
 
+import { DEMO_RETENTION_HOURS, isDemoSweepMessage } from "../services/demo-sweep";
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
 import { handlePushMirrorSync, isPushMirrorSyncMessage } from "../services/mirror/push-sync";
+import { drizzle } from "drizzle-orm/d1";
+import { eq } from "drizzle-orm";
+import { users } from "../db/schema";
 import { handleImportTask, isImportMessage } from "./imports/pipeline";
 import { isForkMessage, runForkTask } from "./fork-task";
 import { RepoNotExistError, RepoService, type RepoRow } from "./service";
@@ -116,7 +120,7 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
 }
 
 /**
- * REPO_TASKS consumer. Three message families share the queue (all serialized:
+ * REPO_TASKS consumer. The message families share the queue (all serialized:
  * max_batch_size=1 + max_concurrency=1, SPEC-0003 §3.3):
  *
  *   - repo delete purges ({storageKey, engineNames}): tombstone every engine
@@ -129,6 +133,12 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
  *     enqueueDueMirrorSyncs) CAS-guards the enqueue, and handleMirrorSync
  *     re-checks every state, so redelivery is safe. A throw is that
  *     handler's queue-retry signal.
+ *   - demo sweeps ({kind: "demo-sweep", repoId}, SPEC-0014 §3.2): the
+ *     DEMO_MODE-gated hourly producer's delete requests — handleDemoSweep
+ *     re-checks exemption + age at consume time, then drives the SAME
+ *     deleteRepository cascade as the API's DELETE route. No CAS on the
+ *     enqueue: the row deletion is the claim, so redelivery (and the
+ *     §3.0 DLQ redrive) is absorbed idempotently.
  *
  * Per message: idempotent work, then ack; a throw retries THAT message (the
  * redelivery re-runs the idempotent steps). Storage errors never fail the
@@ -180,6 +190,22 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
       }
       continue;
     }
+    // Demo sweep (SPEC-0014 §3.2) — BEFORE the purge fallback, like every
+    // typed arm: a purge body has no `kind`, so an unclaimed demo message
+    // would otherwise fall into the malformed-purge drop. No gate check
+    // here on purpose: the gate arms the PRODUCER (services/demo-sweep.ts);
+    // a message only exists because an armed producer enqueued it, and a
+    // later gate flip-off must not strand the delete it already scheduled.
+    if (isDemoSweepMessage(message.body)) {
+      try {
+        await handleDemoSweep(env, message.body.repoId);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] demo-sweep ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
     if (!isRepoPurgeMessage(message.body)) {
       console.error(`[repo-tasks] dropping malformed purge message ${message.id}`);
       message.ack();
@@ -223,6 +249,59 @@ export async function purgeRepoMessage(env: Env, body: RepoPurgeMessage): Promis
     } catch {
       // registry rows heal via receivePack upserts; nothing to do
     }
+  }
+}
+
+/**
+ * One demo-sweep message's work (SPEC-0014 §3.2, exported so tests drive it
+ * without fabricating a MessageBatch). The demo arm adds NO deletion logic
+ * of its own — it is a second caller of the same cascade the API's
+ * `DELETE /repos/{owner}/{repo}` route and the gate's engine-shape DELETE
+ * use:
+ *
+ *   1. Load the repo row; GONE → return normally (the arm acks) — a delete
+ *      raced the sweep, and the user delete already ran this same cascade
+ *      (§6.6; the mirror arm's missing-row posture).
+ *   2. Re-check exemption and age at CONSUME time (§3.2 step 2 — the
+ *      enqueue-to-consume window can change the verdict): the owner has
+ *      become a site admin since enqueue (§6.3 — exemption is a property of
+ *      the owner NOW) or the row is inside the retention window → return,
+ *      no delete. A NULL owner has no exempting principal → swept.
+ *   3. RepoService.deleteRepository — the EXISTING cascade unchanged: the
+ *      D1 batch delete of the row + every dependent (the repositories row
+ *      the batch's final statement), the synchronous DO tombstone + registry
+ *      removal, then the enqueue of the standard {storageKey, engineNames}
+ *      purge message whose consumer run finishes the R2 prefix purge +
+ *      RepoDO.destroy() below. Row-deletion is the sweep's only claim (§3.1
+ *      — no CAS), so a duplicate message finds the row gone and acks (§6.7).
+ *
+ * A RepoNotExistError from the cascade is caught-and-acked — the
+ * idempotent-delete semantics deleteRepositoryViaEngineShape documents
+ * (§3.4); anything else throws → the arm retries THAT message.
+ */
+export async function handleDemoSweep(env: Env, repoId: string): Promise<void> {
+  const repo = await new RepoService(env.DB).get(repoId);
+  if (repo === null) return;
+  if (repo.ownerId !== null) {
+    const owner = await drizzle(env.DB)
+      .select({ isAdmin: users.isAdmin })
+      .from(users)
+      .where(eq(users.id, repo.ownerId))
+      .get();
+    if (owner?.isAdmin === true) return;
+  }
+  const cut = new Date(Date.now() - DEMO_RETENTION_HOURS * 60 * 60 * 1000);
+  if (!(repo.createdAt < cut)) return;
+  try {
+    await new RepoService(env.DB, {
+      registry: env.REGISTRY.getByName("registry"),
+      queue: env.REPO_TASKS,
+      tombstone: (engineName) => tombstoneRepoDO(env, engineName),
+    }).deleteRepository(repo.id);
+  } catch (error) {
+    if (!(error instanceof RepoNotExistError)) throw error;
+    // A concurrent delete won the race; the requested end state (the demo
+    // repo gone) already holds — idempotent-delete semantics (§3.4).
   }
 }
 

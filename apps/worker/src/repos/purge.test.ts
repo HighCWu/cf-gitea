@@ -18,9 +18,11 @@
  */
 
 import { env } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { repoRedirects, repositories } from "../db/schema";
 import { handleRepoTasks } from "./purge";
 
 /** Fabricated MessageBatch with ack/retry recorders (imports.test.ts shape). */
@@ -82,5 +84,196 @@ describe("REPO_TASKS mirror-sync dispatch (SPEC-0009 §2.6 wiring)", () => {
 
     expect(acked).toEqual(["mirror"]);
     expect(retried).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC-0014 §3.2 — the demo-sweep arm: {kind: "demo-sweep", repoId} drives
+// the EXISTING deleteRepository cascade (the API DELETE route's own path),
+// with the consume-time exemption/age re-check and the idempotent acks. The
+// producer/gate side lives in src/services/demo-sweep.test.ts (the §2
+// gate-off invariant battery runs there, first).
+//
+// The cascade itself is NOT re-tested here (repos/lifecycle.test.ts pins
+// deleteRepository); the sweep's assertions stop at "the right function ran
+// for the right row" plus end-state row absence (SPEC-0014 §7).
+// ---------------------------------------------------------------------------
+
+/** Recording REPO_TASKS (the demo-sweep.test.ts shape, local copy per the
+ *  test-file-copy precedent): captures the cascade's step-3 purge message. */
+function spyQueue(): Queue & {
+  sends: number;
+  sendBodies: unknown[];
+  sendBatchCalls: number;
+  bodies: unknown[][];
+} {
+  const metadata = { metrics: { backlogCount: 0, backlogBytes: 0 } };
+  const queue = {
+    sends: 0,
+    sendBodies: [] as unknown[],
+    sendBatchCalls: 0,
+    bodies: [] as unknown[][],
+    send: (body: unknown) => {
+      queue.sends += 1;
+      queue.sendBodies.push(body);
+      return Promise.resolve({ metadata });
+    },
+    sendBatch: (messages: MessageSendRequest[]) => {
+      queue.sendBatchCalls += 1;
+      queue.bodies.push(messages.map((m) => m.body));
+      return Promise.resolve({ metadata });
+    },
+    metrics: () => Promise.resolve(metadata.metrics),
+  };
+  return queue;
+}
+
+const totalSends = (queue: ReturnType<typeof spyQueue>): number => queue.sends + queue.sendBatchCalls;
+
+/** The gate-off tripwire (demo-sweep.test.ts copy): a D1 stub that throws on
+ *  first touch — used here to force a real error THROUGH the arm's retry
+ *  path without module mocks. */
+function d1ThatThrows(): D1Database {
+  return new Proxy(
+    {},
+    {
+      get(_target, prop) {
+        throw new Error(`D1 stub: .${String(prop)} (forced throw)`);
+      },
+    },
+  ) as D1Database;
+}
+
+async function resetD1(): Promise<void> {
+  // Storage isolation resets D1 between tests (apply-d1-migrations.ts
+  // header) — re-apply, then wipe defensively anyway.
+  await applyAuthD1Migrations();
+  for (const table of ["repo_mirrors", "push_mirrors", "repo_counters", "repositories", "repo_redirects"]) {
+    await env.DB.prepare(`DELETE FROM ${table}`).run();
+  }
+  await env.DB.prepare("DELETE FROM users").run();
+}
+
+async function seedUser(id: number, username: string, opts: { isAdmin?: boolean } = {}): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO users (id, username, username_lower, is_admin, status, type, created_at) VALUES (?, ?, ?, ?, 'active', 'user', 0)",
+  )
+    .bind(id, username, username, opts.isAdmin === true ? 1 : 0)
+    .run();
+}
+
+async function seedSweepRepo(id: string, ownerId: number): Promise<void> {
+  await drizzle(env.DB).insert(repositories).values({
+    id,
+    storageKey: `r_${id}`,
+    ownerNamespace: `owner-${id}`,
+    ownerId,
+    slug: `repo-${id}`,
+    visibility: "public",
+    refsVersion: 1,
+    backend: "self-hosted",
+    createdAt: new Date(0), // epoch — far past the 72 h retention cut
+  });
+}
+
+const repoRowExists = async (id: string): Promise<boolean> =>
+  (await env.DB.prepare("SELECT id FROM repositories WHERE id = ?").bind(id).first()) !== null;
+
+describe("demo-sweep consumer arm (SPEC-0014 §3.2)", () => {
+  beforeEach(resetD1);
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("drives the EXISTING deleteRepository cascade: row gone, redirects cleared, the standard purge message enqueued", async () => {
+    await seedUser(80, "swept-owner");
+    await seedSweepRepo("8001", 80);
+    // A redirect pointing AT the repo — the cascade must clear it and carry
+    // the redirected engine name in the purge message.
+    await drizzle(env.DB).insert(repoRedirects).values({
+      ownerId: 80,
+      ownerNamespace: "owner-8001",
+      lowerName: "old-name",
+      redirectRepoId: "8001",
+    });
+    const queue = spyQueue();
+    const { batch, acked, retried } = fabricatedBatch([{ id: "sweep-1", body: { kind: "demo-sweep", repoId: "8001" } }]);
+
+    await handleRepoTasks(batch, { ...env, REPO_TASKS: queue });
+
+    expect(acked).toEqual(["sweep-1"]);
+    expect(retried).toEqual([]);
+    expect(await repoRowExists("8001")).toBe(false);
+    expect(await drizzle(env.DB).select().from(repoRedirects).all()).toEqual([]);
+    // The cascade's step 3: the EXACT standard purge message (no demo
+    // variant) — current + redirected engine names, the storage key.
+    expect(queue.sendBodies).toEqual([
+      { storageKey: "r_8001", engineNames: ["owner-8001/repo-8001", "owner-8001/old-name"] },
+    ]);
+  });
+
+  it("re-checks the exemption at consume time: owner promoted to admin since enqueue → ack, no delete (§6.3)", async () => {
+    await seedUser(80, "promoted");
+    await seedSweepRepo("8002", 80);
+    await env.DB.prepare("UPDATE users SET is_admin = 1 WHERE id = 80").run();
+    const queue = spyQueue();
+    const { batch, acked, retried } = fabricatedBatch([{ id: "sweep-2", body: { kind: "demo-sweep", repoId: "8002" } }]);
+
+    await handleRepoTasks(batch, { ...env, REPO_TASKS: queue });
+
+    expect(acked).toEqual(["sweep-2"]);
+    expect(retried).toEqual([]);
+    expect(await repoRowExists("8002")).toBe(true); // exemption is a property of the owner NOW
+    expect(totalSends(queue)).toBe(0); // no cascade ran, no purge message
+  });
+
+  it("acks a sweep for a repo a user already deleted — no error, no retry (§6.6)", async () => {
+    await seedUser(80, "owner");
+    const queue = spyQueue();
+    const { batch, acked, retried } = fabricatedBatch([
+      { id: "sweep-3", body: { kind: "demo-sweep", repoId: "never-created" } },
+    ]);
+
+    await handleRepoTasks(batch, { ...env, REPO_TASKS: queue });
+
+    expect(acked).toEqual(["sweep-3"]);
+    expect(retried).toEqual([]);
+    expect(totalSends(queue)).toBe(0);
+  });
+
+  it("absorbs a duplicate message idempotently: first deletes, second finds the row gone and acks (§6.7)", async () => {
+    await seedUser(80, "owner");
+    await seedSweepRepo("8004", 80);
+    const queue = spyQueue();
+
+    const first = fabricatedBatch([{ id: "sweep-4a", body: { kind: "demo-sweep", repoId: "8004" } }]);
+    await handleRepoTasks(first.batch, { ...env, REPO_TASKS: queue });
+    expect(first.acked).toEqual(["sweep-4a"]);
+    expect(await repoRowExists("8004")).toBe(false);
+
+    // The double-enqueued twin (same repo enqueued twice across a tick
+    // boundary while the purge was still draining) — row-deletion was the
+    // claim, so the second message is a plain ack.
+    const second = fabricatedBatch([{ id: "sweep-4b", body: { kind: "demo-sweep", repoId: "8004" } }]);
+    await handleRepoTasks(second.batch, { ...env, REPO_TASKS: queue });
+    expect(second.acked).toEqual(["sweep-4b"]);
+    expect(second.retried).toEqual([]);
+  });
+
+  it("a throw retries THAT message with the [repo-tasks] demo-sweep log line (the §3.0 DLQ's upstream)", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { batch, acked, retried } = fabricatedBatch([
+      { id: "sweep-err", body: { kind: "demo-sweep", repoId: "8005" } },
+    ]);
+
+    // The tripwire DB: the arm's first D1 read (RepoService.get) throws for
+    // real — no module mocks — and that throw must surface as a RETRY plus
+    // the family's observability line, never a silent drop.
+    await handleRepoTasks(batch, { ...env, DB: d1ThatThrows() });
+
+    expect(retried).toEqual(["sweep-err"]);
+    expect(acked).toEqual([]);
+    const lines = consoleError.mock.calls.map((args) => args.map(String).join(" "));
+    expect(lines.some((line) => line.includes("[repo-tasks] demo-sweep sweep-err retrying"))).toBe(true);
   });
 });

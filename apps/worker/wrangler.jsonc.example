@@ -42,7 +42,15 @@
     // Self-registration gate (SPEC-0010 §6): "true" adds a /user/sign_up page;
     // anything else keeps the instance closed — the first admin comes from the
     // login page's one-shot "initialize this instance" form (zero-user instances).
-    "ALLOW_SIGNUP": "false"
+    "ALLOW_SIGNUP": "false",
+    // SPEC-0014 §2 — the demo-operations gate. ONLY the exact string "true"
+    // arms the demo sweep (hourly cron producer → {kind:"demo-sweep"} → the
+    // existing delete cascade); absent/anything else stays OFF (fail-closed,
+    // §6.8). Default OFF so a self-hosted deployment NEVER schedules cleanup
+    // and NEVER deletes user data — the README's self-host guarantee (the §2
+    // hard invariant). The demo instance is the ONLY deployment that sets it
+    // to "true"; arming is a var edit + redeploy, never a runtime toggle.
+    "DEMO_MODE": "false"
   },
   "observability": {
     "enabled": true,
@@ -120,8 +128,21 @@
   // crons get a 30 s CPU budget (AGENTS.md Workers rules), so the scheduled
   // handler only SELECTs due repo_mirrors rows and enqueues — the mirror-sync
   // work happens in the queue consumer.
+  //
+  // The hourly entry (SPEC-0014 §3.1) is the demo sweep's producer tick. The
+  // scheduled dispatcher (services/demo-sweep.ts handleScheduledCron) routes
+  // it ONLY to enqueueDueDemoSweeps, which checks DEMO_MODE before its first
+  // D1 read — with the gate off (the default above) the invocation is a
+  // silent no-op: zero D1 reads, zero queue sends. At :00 both entries fire
+  // as separate invocations; the mirror producers keep their unconditional
+  // posture on the */10 entries (their CAS guard absorbs any overlap).
+  // OQ-2 (ratified): the entry ships in THIS example config even though a
+  // gate-off deployment pays one no-op hourly invocation — config
+  // monogeneity (this file is the single source of truth) beats a
+  // hand-maintained demo delta whose worst failure is a silently-armed-but-
+  // never-firing sweep.
   "triggers": {
-    "crons": ["*/10 * * * *"]
+    "crons": ["*/10 * * * *", "0 * * * *"]
   },
 
   // Queues: REPO_TASKS drives the repo delete purge (SPEC-0003 §2.5.5 steps
