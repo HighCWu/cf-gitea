@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation first (README + operator runbook)
+    url: https://github.com/HighCWu/cf-gitea#readme
+    about: Deploy walkthroughs, local-dev quickstart, mirror/LFS recipes, and troubleshooting — most usage questions are answered there. If what looks like a bug survives the runbook, file a bug report.
