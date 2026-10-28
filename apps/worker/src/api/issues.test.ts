@@ -16,7 +16,7 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -48,6 +48,9 @@ import { IssuesService } from "../issues/service";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
+import type { TimelineComment } from "./models/issue";
+import { toTimelineComment } from "./services/issues";
+import { findRepositoryByPath, type Viewer } from "./services/repository";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -2369,5 +2372,137 @@ describe("comment list query-shape witness (query-shape-audit A7)", () => {
     }
     expect(thread.find((item) => item.body === "ghost")?.user).toBeNull();
     expect(thread.filter((item) => item.user !== null)).toHaveLength(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A5, tier-2
+// follow-up) — the timeline rendered each row with 1..5 SERIAL selects (the
+// poster plus the timeline's own entity kinds the issue-list context does
+// not carry: old/new milestone, the per-comment label, the assignee). The
+// page now prefetches ONE inArray read per entity kind
+// (prefetchTimelineContext) and renders through toTimelineComment's optional
+// preload; the per-row fallback stays intact for omitted-preload callers —
+// metered side by side below on the SAME rows and viewer.
+// ---------------------------------------------------------------------------
+
+describe("timeline query-shape witness (query-shape-audit A5)", () => {
+  it("renders the page with a constant statement count, deep-equal to the per-row fallback renders", async () => {
+    const owner = await seedUser("Alice");
+    const other = await seedUser("Bob");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "timeline meter", { posterId: owner.id });
+    const empty = await seedIssue(repoId, "empty timeline", { posterId: owner.id });
+    const bug = await seedLabel(repoId, "bug");
+    const v1 = await seedMilestone(repoId, "v1");
+    const v2 = await seedMilestone(repoId, "v2");
+    const now = new Date();
+    const insert = (values: Omit<typeof comments.$inferInsert, "issueId">) =>
+      db().insert(comments).values({ issueId: issue.id, content: "", createdAt: now, updatedAt: now, ...values });
+
+    // Every timeline row kind + every null/missing arm — 14 seeded rows, 13
+    // rendered (the Code row is dropped): plain comments across two posters
+    // (one deduped), change_title, a label on a real AND a dangling id, a
+    // milestone change old→new AND a dangling old, an assignee real AND
+    // dangling, a NULL-poster system close, a reopen, a commit_ref.
+    await insert({ type: CommentType.Comment, posterId: owner.id, content: "note one" });
+    await insert({ type: CommentType.Comment, posterId: other.id, content: "note two" });
+    await insert({ type: CommentType.Comment, posterId: owner.id, content: "note three" }); // poster dedupe
+    await insert({ type: CommentType.ChangeTitle, posterId: owner.id, oldTitle: "a", newTitle: "b" });
+    await insert({ type: CommentType.Label, posterId: other.id, labelId: bug });
+    await insert({ type: CommentType.Label, posterId: other.id, labelId: 999999 }); // dangling label → null
+    await insert({ type: CommentType.Milestone, posterId: owner.id, oldMilestoneId: v1, milestoneId: v2 });
+    await insert({ type: CommentType.Milestone, posterId: owner.id, oldMilestoneId: 999999 }); // dangling old → null
+    await insert({ type: CommentType.Assignees, posterId: other.id, assigneeId: other.id, removedAssignee: 0 });
+    await insert({ type: CommentType.Assignees, posterId: other.id, assigneeId: 999999 }); // dangling assignee → null
+    await insert({ type: CommentType.Close, posterId: null }); // the null-poster arm
+    await insert({ type: CommentType.Reopen, posterId: owner.id });
+    await insert({ type: CommentType.CommitRef, posterId: other.id, commitSha: "abc123", refAction: 1 });
+    await insert({ type: CommentType.Code, posterId: owner.id, content: "dropped" });
+
+    const app = createApiRouter();
+
+    // Batched route: 1 repo resolve + 1 issue lookup + 1 page + 4 prefetch
+    // arms (posters, milestones, labels, assignees) = 7 — page-INDEPENDENT.
+    // The pre-fix shape (audit formula: fixed prefix + R×(1..5)) pays
+    // 3 + 19 = 22 at this N (12 poster selects + 7 metadata — the dangling
+    // ids still paid their per-row select); both bounds fail if any per-row
+    // fan returns.
+    const meter = countedD1();
+    const res = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${issue.index}/timeline`), {
+      ...env,
+      DB: meter.db,
+    });
+    expect(res.status).toBe(200);
+    const timeline = await res.json<Array<Record<string, unknown> & { type: string; user: unknown }>>();
+    expect(timeline).toHaveLength(13);
+    expect(timeline.map((item) => item.type)).toEqual([
+      "comment",
+      "comment",
+      "comment",
+      "change_title",
+      "label",
+      "label",
+      "milestone",
+      "milestone",
+      "assignees",
+      "assignees",
+      "close",
+      "reopen",
+      "commit_ref",
+    ]);
+    const count = meter.count();
+    expect(count).toBeLessThanOrEqual(8);
+    expect(count).toBeLessThan(12); // the 12 per-row posters alone exceed it
+
+    // Empty-skip discipline: a page with NO rows skips every prefetch arm —
+    // exactly the fixed prefix (measured 3, the same count the per-row path
+    // paid on an empty page).
+    const emptyMeter = countedD1();
+    const emptyRes = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${empty.index}/timeline`), {
+      ...env,
+      DB: emptyMeter.db,
+    });
+    expect(emptyRes.status).toBe(200);
+    expect(await emptyRes.json<unknown[]>()).toEqual([]);
+    expect(emptyMeter.count()).toBeLessThanOrEqual(4);
+
+    // The per-row FALLBACK (omitted preload), metered on the same rows and
+    // viewer: 12 poster selects + 7 metadata selects = 19 — the audit's
+    // R×(1..5) arm, alive exactly as before the batching (requirement: the
+    // fallback stays intact). The batched route's count above must beat it.
+    const pair = await findRepositoryByPath(env.DB, "alice", "visible");
+    if (pair === null) throw new Error("repo pair missing");
+    const viewer: Viewer = { origin: "https://example.com", requester: null };
+    const issueRow = await db()
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issue.id))
+      .all()
+      .then((rows) => {
+        const row = rows[0];
+        if (row === undefined) throw new Error("seeded issue row missing");
+        return row;
+      });
+    const rows = await db().select().from(comments).where(eq(comments.issueId, issue.id)).orderBy(asc(comments.id)).all();
+    const fallbackMeter = countedD1();
+    const perRow: TimelineComment[] = [];
+    for (const comment of rows) {
+      if (comment.type === CommentType.Code) continue; // the route's filter arm
+      perRow.push(await toTimelineComment(fallbackMeter.db, viewer, pair, issueRow, comment));
+    }
+    const fallbackCount = fallbackMeter.count();
+    expect(fallbackCount).toBeGreaterThanOrEqual(12); // the per-row posters alone
+    expect(count).toBeLessThan(fallbackCount); // 7 vs 19 at this N
+
+    // Contract discipline: the batched route render is deep-equal to the
+    // per-row fallback render on the SAME rows and viewer — covers every row
+    // kind and the null/dangling arms in one sweep.
+    expect(timeline).toEqual(perRow);
+    expect(timeline.find((item) => item.type === "close")?.user).toBeNull(); // the null-poster arm
+    expect(timeline.filter((item) => item.label !== null)).toHaveLength(1); // the dangling label renders null
+    expect(timeline.filter((item) => item.old_milestone !== null)).toHaveLength(1); // the dangling old renders null
+    expect(timeline.filter((item) => item.milestone !== null)).toHaveLength(1);
+    expect(timeline.filter((item) => item.assignee !== null)).toHaveLength(1); // the dangling assignee renders null
   });
 });

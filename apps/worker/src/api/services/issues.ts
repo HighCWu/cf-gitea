@@ -515,6 +515,87 @@ function refActionName(action: number | null): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Timeline render prefetch (the query-shape audit's A5)
+//
+// The timeline route rendered each row with 1..5 serial selects — the poster
+// plus up to four metadata rows the timeline's entity kinds carry and the
+// issue-list context does not: the OLD milestone, the new milestone, the
+// per-comment label, the assignee. `prefetchTimelineContext` batches each
+// arm across the page into ONE inArray select per entity kind; the route
+// hands the maps to `toTimelineComment` through its optional `preload`.
+// Behavior parity: a map miss renders exactly what the per-row select miss
+// renders (null poster, null old/new milestone, null label, null assignee)
+// — omitted preload keeps the per-row selects verbatim.
+// ---------------------------------------------------------------------------
+
+/** Per-entity page rows backing `toTimelineComment`'s batched render. */
+export interface TimelineRenderContext {
+  /** Comment poster rows by user id (a missing id renders the per-row null). */
+  posters: Map<number, UserRow>;
+  /** Milestone rows by id — the union of the rows' old AND new milestone
+   *  ids; a deleted (dangling) milestone row stays absent → the per-row null. */
+  milestones: Map<number, MilestoneRow>;
+  /** Label rows by id (the per-comment `label` arm); a dangling id → null. */
+  labels: Map<number, LabelRow>;
+  /** Assignee rows by user id (the per-comment `assignee` arm). */
+  assignees: Map<number, UserRow>;
+}
+
+/**
+ * One batched read per entity kind for the timeline page's rows (posters,
+ * milestones, labels, assignees), fanned with Promise.all. Empty pages skip
+ * every arm entirely — 0 statements there, exactly like the per-row path
+ * (whose empty page also fans nothing). The id lists stay far under the D1
+ * 100-variable cap: the API paging clamps at 50 rows
+ * (pagination.ts MAX_RESPONSE_ITEMS).
+ */
+export async function prefetchTimelineContext(d1: D1Database, commentRows: CommentRow[]): Promise<TimelineRenderContext> {
+  const posterIds = [...new Set(commentRows.flatMap((row) => (row.posterId === null ? [] : [row.posterId])))];
+  const milestoneIds = [
+    ...new Set(
+      commentRows.flatMap((row) => [
+        ...(row.oldMilestoneId === null || row.oldMilestoneId === undefined ? [] : [row.oldMilestoneId]),
+        ...(row.milestoneId === null || row.milestoneId === undefined ? [] : [row.milestoneId]),
+      ]),
+    ),
+  ];
+  const labelIds = [...new Set(commentRows.flatMap((row) => (row.labelId === null || row.labelId === undefined ? [] : [row.labelId])))];
+  const assigneeIds = [...new Set(commentRows.flatMap((row) => (row.assigneeId === null || row.assigneeId === undefined ? [] : [row.assigneeId])))];
+  const db = drizzle(d1);
+  const [posterRows, milestoneRows, labelRows, assigneeRows] = await Promise.all([
+    posterIds.length > 0 ? db.select().from(users).where(inArray(users.id, posterIds)).all() : Promise.resolve([]),
+    milestoneIds.length > 0 ? db.select().from(milestones).where(inArray(milestones.id, milestoneIds)).all() : Promise.resolve([]),
+    labelIds.length > 0 ? db.select().from(labels).where(inArray(labels.id, labelIds)).all() : Promise.resolve([]),
+    assigneeIds.length > 0 ? db.select().from(users).where(inArray(users.id, assigneeIds)).all() : Promise.resolve([]),
+  ]);
+  return {
+    posters: new Map(posterRows.map((row) => [row.id, row])),
+    milestones: new Map(milestoneRows.map((row) => [row.id, row])),
+    labels: new Map(labelRows.map((row) => [row.id, row])),
+    assignees: new Map(assigneeRows.map((row) => [row.id, row])),
+  };
+}
+
+/** The context twin of the per-row milestone select — identical null
+ *  semantics (null id or a deleted row → null), 0 reads. */
+function milestoneFromMap(rows: Map<number, MilestoneRow>, id: number | null | undefined): MilestoneRow | null {
+  return id === null || id === undefined ? null : (rows.get(id) ?? null);
+}
+
+/** The context twin of the per-row label select — identical null semantics,
+ *  0 reads. */
+function labelFromMap(rows: Map<number, LabelRow>, id: number | null | undefined): LabelRow | null {
+  return id === null || id === undefined ? null : (rows.get(id) ?? null);
+}
+
+/** The context twin of the per-row assignee select — returns the RAW row
+ *  (the render's `apiUserFromRow` call is shared with the per-row arm);
+ *  identical null semantics, 0 reads. */
+function assigneeRowFromMap(rows: Map<number, UserRow>, id: number | null | undefined): UserRow | null {
+  return id === null || id === undefined ? null : (rows.get(id) ?? null);
+}
+
 /**
  * Timeline renderability — upstream drops `CommentTypeCode` rows from the
  * timeline (ListIssueCommentsAndTimeline) and xref rows whose reference
@@ -530,6 +611,13 @@ function refActionName(action: number | null): string {
  * the Go zero exactly like upstream's empty columns: projects, tracked
  * times, reviews, teams (tier 2/3 surfaces), and the xref/dependency issue
  * enrichment (the xref writers land with the push pipeline).
+ *
+ * The poster plus up to four metadata rows (old/new milestone, label,
+ * assignee) are fetched per render; the timeline ROUTE passes `preload` (the
+ * page-scoped `prefetchTimelineContext` maps — the query-shape audit's A5)
+ * so the reads collapse to lookups — a map miss renders the per-row null
+ * verbatim. Omitted keeps the per-row selects (single-item and fallback
+ * callers).
  */
 export async function toTimelineComment(
   d1: D1Database,
@@ -537,44 +625,53 @@ export async function toTimelineComment(
   pair: RepositoryWithOwner,
   issue: IssueRow,
   comment: CommentRow,
+  preload?: TimelineRenderContext,
 ): Promise<TimelineComment> {
-  const poster = await toPoster(d1, viewer, comment.posterId);
+  const poster = preload === undefined ? await toPoster(d1, viewer, comment.posterId) : posterFromMap(preload.posters, viewer, comment.posterId);
   const issuePageUrl = issueHtmlUrl(pair, viewer.origin, issue.index);
   const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, issue.isPull, comment.id);
 
   const [oldMilestoneRow, milestoneRow, labelRow, assigneeRow] = await Promise.all([
-    comment.oldMilestoneId === null || comment.oldMilestoneId === undefined
-      ? Promise.resolve(null)
-      : drizzle(d1)
-          .select()
-          .from(milestones)
-          .where(eq(milestones.id, comment.oldMilestoneId))
-          .limit(1)
-          .then((rows) => (rows[0] === undefined ? null : rows[0])),
-    comment.milestoneId === null || comment.milestoneId === undefined
-      ? Promise.resolve(null)
-      : drizzle(d1)
-          .select()
-          .from(milestones)
-          .where(eq(milestones.id, comment.milestoneId))
-          .limit(1)
-          .then((rows) => (rows[0] === undefined ? null : rows[0])),
-    comment.labelId === null || comment.labelId === undefined
-      ? Promise.resolve(null)
-      : drizzle(d1)
-          .select()
-          .from(labels)
-          .where(eq(labels.id, comment.labelId))
-          .limit(1)
-          .then((rows) => (rows[0] === undefined ? null : rows[0])),
-    comment.assigneeId === null || comment.assigneeId === undefined
-      ? Promise.resolve(null)
-      : drizzle(d1)
-          .select()
-          .from(users)
-          .where(eq(users.id, comment.assigneeId))
-          .limit(1)
-          .then((rows) => (rows[0] === undefined ? null : rows[0])),
+    preload !== undefined
+      ? milestoneFromMap(preload.milestones, comment.oldMilestoneId)
+      : comment.oldMilestoneId === null || comment.oldMilestoneId === undefined
+        ? Promise.resolve(null)
+        : drizzle(d1)
+            .select()
+            .from(milestones)
+            .where(eq(milestones.id, comment.oldMilestoneId))
+            .limit(1)
+            .then((rows) => (rows[0] === undefined ? null : rows[0])),
+    preload !== undefined
+      ? milestoneFromMap(preload.milestones, comment.milestoneId)
+      : comment.milestoneId === null || comment.milestoneId === undefined
+        ? Promise.resolve(null)
+        : drizzle(d1)
+            .select()
+            .from(milestones)
+            .where(eq(milestones.id, comment.milestoneId))
+            .limit(1)
+            .then((rows) => (rows[0] === undefined ? null : rows[0])),
+    preload !== undefined
+      ? labelFromMap(preload.labels, comment.labelId)
+      : comment.labelId === null || comment.labelId === undefined
+        ? Promise.resolve(null)
+        : drizzle(d1)
+            .select()
+            .from(labels)
+            .where(eq(labels.id, comment.labelId))
+            .limit(1)
+            .then((rows) => (rows[0] === undefined ? null : rows[0])),
+    preload !== undefined
+      ? assigneeRowFromMap(preload.assignees, comment.assigneeId)
+      : comment.assigneeId === null || comment.assigneeId === undefined
+        ? Promise.resolve(null)
+        : drizzle(d1)
+            .select()
+            .from(users)
+            .where(eq(users.id, comment.assigneeId))
+            .limit(1)
+            .then((rows) => (rows[0] === undefined ? null : rows[0])),
   ]);
 
   return {

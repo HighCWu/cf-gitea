@@ -62,6 +62,7 @@ import {
   parseTypeFilter,
   prefetchCommentPosters,
   prefetchIssueRenderContext,
+  prefetchTimelineContext,
   searchIssuesGlobally,
   toApiComment,
   toApiIssue,
@@ -1579,13 +1580,19 @@ export function registerIssueRoutes(
     const before = parseQueryTime(url.searchParams.get("before"));
     const listOptions = parseListOptions(url);
     const rows = await listIssueTimeline(c.env.DB, issue.id, since, before, listOptions.page, listOptions.limit);
-    const rendered: TimelineComment[] = [];
-    for (const comment of rows) {
-      if (comment.type === CommentType.Code) {
-        continue; // upstream drops code comments from the timeline
-      }
-      rendered.push(await toTimelineComment(c.env.DB, viewer, found, issue, comment));
-    }
+    // The query-shape audit's A5: the timeline rendered each row with 1..5
+    // serial selects (poster + old/new milestone + label + assignee); the
+    // page now prefetches ONE inArray read per entity kind (the timeline's
+    // per-comment entity kinds the issue-list context does not carry) and
+    // renders through toTimelineComment's optional preload — the response
+    // shape is unchanged, and the per-row fallback stays intact for
+    // omitted-preload callers.
+    const timelineContext = await prefetchTimelineContext(c.env.DB, rows);
+    const rendered: TimelineComment[] = await Promise.all(
+      rows
+        .filter((comment) => comment.type !== CommentType.Code) // upstream drops code comments
+        .map((comment) => toTimelineComment(c.env.DB, viewer, found, issue, comment, timelineContext)),
+    );
     // Upstream counts the FILTERED list (SetTotalCountHeader(len(apiComments))).
     setPaginationHeaders(c, rendered.length, listOptions);
     return c.json(rendered, 200);
