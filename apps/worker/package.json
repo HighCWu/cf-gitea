@@ -30,5 +30,36 @@
     "vite": "^8.3.5",
     "vitest": "^5.0.5",
     "wrangler": "^4.152.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "APP_URL": {
+        "description": "Public origin for webhook payload URLs. **Leave unset** to use this deployment's own origin automatically; set it when serving behind a custom domain or for mirror deployments."
+      },
+      "DB": {
+        "description": "D1 database holding all relational metadata: users, orgs, repos, issues, pull requests, webhooks."
+      },
+      "REPO_PACKS": {
+        "description": "R2 bucket storing git packs, objects, LFS blobs and editor upload staging."
+      },
+      "ASSETS": {
+        "description": "Static asset binding serving the built Gitea frontend tree (`pnpm build:assets`)."
+      },
+      "REPO": {
+        "description": "Durable Object (`RepoCell`) — per-repository git storage engine and write serialization."
+      },
+      "REGISTRY": {
+        "description": "Durable Object (`Registry`) — repository index resolving owner/slug to repo cells."
+      },
+      "WEBHOOK_DELIVERY": {
+        "description": "Queue carrying webhook delivery jobs from emission to the delivery consumer."
+      },
+      "REPO_TASKS": {
+        "description": "Queue driving background repo work: delete purge, import indexing, mirror syncs."
+      },
+      "MIRROR_SYNC_QUEUE": {
+        "description": "Queue producer alias for mirror-sync messages, multiplexed onto the same consumer as `REPO_TASKS`."
+      }
+    }
   }
 }

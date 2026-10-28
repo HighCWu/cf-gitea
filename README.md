@@ -78,9 +78,11 @@ curl -H "Authorization: token <PAT>" http://127.0.0.1:5173/api/v1/user
 The button clones this repo into your GitHub account, provisions the D1
 database and R2 bucket automatically (ids are filled into the wrangler config
 for you), builds and deploys via Workers Builds — works on the free plan.
-Two manual bits after it finishes: set the three secrets below, and set
-`APP_URL` in your copied `wrangler.jsonc` to your Worker's public origin.
-Prefer the terminal? The same result, explicitly:
+Zero configuration beyond the button: webhook payload URLs automatically use
+your Worker's own origin (`APP_URL` stays optional — set it only when serving
+behind a custom domain, or for mirror deployments whose payload URLs must name
+a different public origin). One manual bit after it finishes: set the secrets
+below. Prefer the terminal? The same result, explicitly:
 
 ```bash
 pnpm exec wrangler login
@@ -89,8 +91,10 @@ pnpm setup:deploy          # idempotent: copies wrangler.jsonc.example → wrang
                            # + R2 cf-gitea-packs, fills the real database_id, applies
                            # remote migrations (read-only drift check: pnpm setup:deploy -- --check)
 cd apps/worker
-pnpm exec wrangler secret put GIT_TOKEN                    # dev-fallback credential
-pnpm exec wrangler secret put MIRROR_ALLOWED_HOST_LIST     # mirror egress allow-list
+pnpm exec wrangler secret put GIT_TOKEN                    # static dev/e2e fallback credential — PAT auth is
+                                                           # the primary path; unset disables ONLY the fallback
+pnpm exec wrangler secret put MIRROR_ALLOWED_HOST_LIST     # mirror egress allow-list (the two MIRROR_* secrets
+                                                           # are needed only for mirror features)
 pnpm exec wrangler secret put MIRROR_CREDENTIAL_KEY        # mirror credential KEK (32 base64 bytes)
 cd ../..
 pnpm db:migrate:remote     # idempotent — setup:deploy applied what existed when it ran;

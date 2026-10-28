@@ -435,7 +435,8 @@ export async function commitUploadFromForm(
 
   // The doer identity (contents.ts:214-222 mirrored onto the session row —
   // the family's commitFileFromForm convention).
-  const hostname = new URL(req.url).hostname;
+  const requestUrl = new URL(req.url);
+  const hostname = requestUrl.hostname;
   const email =
     userRow.email === null || userRow.email === "" ? `${userRow.username}@noreply.${hostname}` : userRow.email;
 
@@ -478,11 +479,14 @@ export async function commitUploadFromForm(
     }
     // The push-family ride (module header): the applied delta through the
     // onPush adapter's own entry, awaited inline like the landed editor's.
+    // The request origin rides along (webhooks-push's options.origin) so the
+    // payload URLs name THIS deployment when the APP_URL var is unset.
     await handleUserPushNotifications(
       env,
       repo,
       [{ ref: result.ref, old: result.built.baseTip, next: result.refTarget }],
       userRow,
+      { origin: requestUrl.origin },
     );
     return {
       outcome: "committed",

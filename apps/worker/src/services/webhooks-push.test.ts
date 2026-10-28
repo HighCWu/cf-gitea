@@ -36,6 +36,10 @@
  * client-forged x-push-user headers ignored on both the gated and the
  * engine-native path; the owner fallback for identity-less receives; the
  * explicit users-row override) and the missing-owner/unknown-repo degrades.
+ *
+ * The payload-URL origin chain (appOrigin): the APP_URL var wins, else the
+ * serving request's origin (the options.origin thread — zero-config fresh
+ * deployments), else upstream's default ROOT_URL.
  */
 
 import { env } from "cloudflare:workers";
@@ -63,10 +67,13 @@ import { OrgService } from "../services/orgs/orgs";
 import { RepoService, type RepoRow } from "../repos/service";
 import { emptyRuleConfig, serializeRuleConfig } from "./branch-protection";
 import {
+  appOrigin,
   emitPushFamilyUpdates,
   handleUserPushEvent,
   handleUserPushNotifications,
   PUSH_ZERO_OID,
+  type WebhookPushEnv,
+  type WebhookPushOptions,
   type WebhookPushWalk,
 } from "./webhooks-push";
 
@@ -917,6 +924,82 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
       ["push", "refs/heads/fresh"],
       ["create", "fresh"],
     ]);
+  });
+});
+
+describe("appOrigin — the APP_URL / request-origin / default chain", () => {
+  /** The real bindings, no APP_URL var: the fresh-deployment shape the
+   *  request-origin fallback serves (the varless env throughout). */
+  const bindings: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS };
+
+  it("unset var, no request origin → upstream's default ROOT_URL (off-request emitters)", () => {
+    expect(appOrigin(bindings)).toBe("http://localhost:3000");
+  });
+
+  it("unset var, request origin → the request origin (zero-config deployments)", () => {
+    expect(appOrigin(bindings, "https://fresh.deploy.workers.dev/")).toBe("https://fresh.deploy.workers.dev");
+  });
+
+  it("the APP_URL var wins over the request origin (precedence pinned)", () => {
+    expect(appOrigin({ ...bindings, APP_URL: "https://custom.example.com" }, "https://request.example.com")).toBe(
+      "https://custom.example.com",
+    );
+  });
+
+  it("the winner is trimmed of trailing slashes like upstream's AppURL", () => {
+    expect(appOrigin({ ...bindings, APP_URL: "https://custom.example.com/base/" })).toBe("https://custom.example.com/base");
+    expect(appOrigin(bindings, "https://request.example.com/base/")).toBe("https://request.example.com/base");
+  });
+});
+
+describe("push-family payload origins — the request-origin fallback", () => {
+  /** The bindings minus the APP_URL var (and minus WEBHOOK_DELIVERY: the
+   *  delivery rows are the assertion surface — payloadContent is written by
+   *  the producer, the consumer's state flip is irrelevant here). */
+  const varlessEnv: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS };
+
+  /** One created-ref delta through the shared builder (the created branch
+   *  emits the bare-AppURL compare_url — the origin-bearing field); returns
+   *  that push payload's compare_url. */
+  async function createdRefCompareUrl(envUsed: WebhookPushEnv, slug: string, options: WebhookPushOptions): Promise<string> {
+    const { row } = await seedRepoWithToken(slug);
+    await seedHook({ repoId: row.id });
+    const pair = (await findRepositoryById(env.DB, row.id))!;
+    const identity = { repository: { full_name: `alice/${slug}` }, pusher: { login: "Alice" }, sender: { login: "Alice" } };
+    await emitPushFamilyUpdates(
+      envUsed,
+      pair,
+      identity,
+      [{ ref: "refs/heads/main", old: PUSH_ZERO_OID, next: "a".repeat(40) }],
+      // The created-ref arm never walks; a resolving stub satisfies the seam.
+      {
+        listCommitsRange: () => Promise.resolve(null),
+        readDiff: () => Promise.resolve(null),
+        readCommit: () => Promise.resolve(null),
+      } satisfies WebhookPushWalk,
+      options,
+    );
+    const rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
+    return (JSON.parse(rows[0]!.payloadContent) as { compare_url: string }).compare_url;
+  }
+
+  it("APP_URL unset + request origin → payload URLs carry the REQUEST origin", async () => {
+    // The bare-AppURL compare_url keeps its explicit trailing "/" (the
+    // zero-commit push event, notifier.go:913 with CompareURL "").
+    expect(await createdRefCompareUrl(varlessEnv, "originreq", { origin: "https://fresh.deploy.workers.dev/" })).toBe(
+      "https://fresh.deploy.workers.dev/",
+    );
+  });
+
+  it("APP_URL unset + no request origin → upstream's default ROOT_URL", async () => {
+    expect(await createdRefCompareUrl(varlessEnv, "origindefault", {})).toBe("http://localhost:3000/");
+  });
+
+  it("APP_URL set → the var wins over the request origin (precedence pinned end-to-end)", async () => {
+    // The real wrangler.jsonc env carries the var; the threaded origin must
+    // NOT override it (custom-domain deployments keep their configured URLs).
+    expect(await createdRefCompareUrl(env, "originvar", { origin: "https://request.example.com" })).toBe(`${EXPECTED_ORIGIN}/`);
   });
 });
 

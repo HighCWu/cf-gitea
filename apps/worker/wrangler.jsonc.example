@@ -29,8 +29,14 @@
     }
   ],
   // Webhook payload compare URLs (mirror sync + user push) — upstream's own
-  // AppURL equivalent. Set to YOUR deployment's public origin. Local dev
-  // overrides via .dev.vars if needed.
+  // AppURL equivalent. OPTIONAL: unset it and payload URLs automatically use
+  // this deployment's own origin (a fresh Deploy-button deployment on
+  // *.workers.dev needs zero configuration). Set it when serving behind a
+  // custom domain, or for mirror deployments whose payload URLs must name a
+  // different public origin. Local dev overrides via .dev.vars if needed.
+  // (The line stays as documentation of the shape — the generated Env types
+  // the declared var, and the fallback chain in
+  // services/webhooks-push.ts `appOrigin` serves unset deployments.)
   "vars": {
     "APP_URL": "https://cf-gitea.YOUR-SUBDOMAIN.workers.dev"
   },

@@ -166,12 +166,12 @@ export const DISMISS_STALE_MESSAGE =
 export interface WebhookPushEnv extends Pick<Env, "DB" | "REPO" | "REPO_PACKS"> {
   /** Upstream `setting.AppURL` — the instance origin the §2.7 payload URLs
    *  are built against. Optional IN THIS SLICE (the generated Env types the
-   *  declared var as required): HTTP paths take the origin from the request,
-   *  and the engine's onPush seam carries none, so test/embedding envs may
-   *  omit it. Unset it falls back to upstream's own default ROOT_URL,
-   *  `http://localhost:3000` (modules/setting/server.go:119-120) — payloads
-   *  stay upstream-shaped and absolute, exactly like a default-installed
-   *  gitea without ROOT_URL. */
+   *  declared var as required): unset, request-serving emitters fall back to
+   *  the serving request's origin (appOrigin's chain), and the engine's
+   *  onPush seam — which carries no request — plus the queue/cron emitters
+   *  fall back to upstream's own default ROOT_URL, `http://localhost:3000`
+   *  (modules/setting/server.go:119-120) — payloads stay upstream-shaped and
+   *  absolute, exactly like a default-installed gitea without ROOT_URL. */
   APP_URL?: string;
 }
 
@@ -203,13 +203,16 @@ interface PushActionContent {
  *  explicitly. */
 const DEFAULT_APP_URL = "http://localhost:3000";
 
-/** `setting.AppURL` equivalent for the onPush seam (no request to take an
- *  origin from): the optional APP_URL var, trailing slashes trimmed like
- *  upstream's AppURL normalization (server.go:127-137). Exported for the
- *  other off-response emitters (the push-create settle) that build §2.7
- *  payload URLs without a request origin. */
-export function appOrigin(env: WebhookPushEnv): string {
-  return (env.APP_URL ?? DEFAULT_APP_URL).replace(/\/+$/, "");
+/** `setting.AppURL` equivalent: the optional APP_URL var, falling back to the
+ *  serving request's origin when the caller has one (the wiki.ts `options.origin`
+ *  pattern — a fresh deployment on *.workers.dev needs zero configuration),
+ *  then upstream's default ROOT_URL for the truly off-request emitters (the
+ *  queue/cron contexts), trailing slashes trimmed like upstream's AppURL
+ *  normalization (server.go:127-137). Exported for the other emitters (the
+ *  push-create settle, the fork viewer) that build payload URLs off the same
+ *  chain. */
+export function appOrigin(env: WebhookPushEnv, requestOrigin?: string): string {
+  return (env.APP_URL ?? requestOrigin ?? DEFAULT_APP_URL).replace(/\/+$/, "");
 }
 
 /** Upstream `RefName.RefType` (modules/git/ref.go:221-231) reduced to the
@@ -283,6 +286,11 @@ export interface WebhookPushOptions {
    *  Doer = the pusher, push.go:292). Undefined/null (the mirror path, an
    *  identity-less receive, tests) attributes the rows to no poster. */
   pusherId?: number | null;
+  /** The serving request's origin for the payload URLs (the wiki.ts
+   *  `options.origin` pattern) — used only when the APP_URL var is unset
+   *  (the var wins). Absent (queue/cron emitters, tests) → the env/default
+   *  chain. */
+  origin?: string;
 }
 
 /** The compat-frozen PushPayload field set (SPEC-0005 §2.7,
@@ -336,7 +344,7 @@ export async function emitPushFamilyUpdates(
   if (notifiable.length === 0) return;
 
   try {
-    const origin = appOrigin(env);
+    const origin = appOrigin(env, options.origin);
     const queue = webhookDeliveryQueue(env);
     const enqueue =
       queue === null
@@ -1029,6 +1037,11 @@ export interface UserPushNotificationOptions {
   walk?: WebhookPushWalk;
   /** Test clock for the delivery rows. */
   now?: Date;
+  /** The serving request's origin for the payload URLs (the wiki.ts
+   *  `options.origin` pattern) — used only when the APP_URL var is unset.
+   *  Absent (the engine's onPush seam carries no request) → the env/default
+   *  chain. */
+  origin?: string;
 }
 
 /**
@@ -1060,7 +1073,7 @@ export async function handleUserPushNotifications(
       console.error(`[push-webhook] ${repo.ownerNamespace}/${repo.slug}: owner row missing — webhook notifications skipped`);
       return;
     }
-    const origin = appOrigin(env);
+    const origin = appOrigin(env, options.origin);
     const viewer: Viewer = { origin, requester: null };
     const sender = apiUserFromRow(pusher ?? pair.owner, viewer);
     const identity: WebhookPushIdentity = {
@@ -1071,6 +1084,7 @@ export async function handleUserPushNotifications(
     const walk = options.walk ?? engineWalk(env, pair);
     await emitPushFamilyUpdates(env, pair, identity, updates, walk, {
       ...(options.now !== undefined ? { now: options.now } : {}),
+      ...(options.origin !== undefined ? { origin: options.origin } : {}),
       // The sync arms' comment attribution rides the authenticated pusher
       // (upstream CreatePushPullComment's Doer); null attributes to no poster.
       pusherId: pusher?.id ?? null,
