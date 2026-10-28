@@ -382,11 +382,16 @@ async function emitCommentEvent(
  * picked by the upstream `issue.IsPull` discriminant (services/webhook/
  * notifier.go IssueChangeLabels:572-605 and IssueClearLabels:46-73). The
  * payload is the shared Issue/PullRequest wrapper with NO `changes` block —
- * upstream's label notifiers set none. The pull arm renders upstream's
- * ToPayloadPullRequest through toApiPullRequest's "payload" mode (the head
- * repo shows regardless of the doer — pull.go:33-37, :197); a missing PR row
- * skips the emission (upstream's LoadPullRequest failure logs and returns
- * before PrepareWebhooks).
+ * upstream's label notifiers set none. BOTH arms render the payload issue
+ * through the SHARED converter — upstream's issue arm is convert.ToAPIIssue
+ * (IssueChangeLabels:598-604) and its pull arm ToPayloadPullRequest
+ * (IssueChangeLabels:601-606, IssueClearLabels:63-69; pull.go:31-34) — so the
+ * assignee block is the real set, the wire render (ToAPIIssue LoadAssignees,
+ * services/convert/issue.go:105-112), exactly like the detach twin
+ * emitLabelDetachEvent. The pull arm rides toApiPullRequest's "payload" mode
+ * (the head repo shows regardless of the doer — pull.go:33-37, :197); a
+ * missing PR row skips the emission (upstream's LoadPullRequest failure logs
+ * and returns before PrepareWebhooks).
  */
 async function emitLabelEvent(
   c: Context<ApiEnv>,
@@ -420,9 +425,10 @@ async function emitLabelEvent(
     eventType: "issue_label",
     payload: issueEventPayload(
       action,
-      // The emission pin (landed payloads render assignees null — the fold's
-      // render split).
-      await toApiIssue(c.env.DB, viewerOf(c), found, issue, { assignees: "emission" }),
+      // Upstream renders the label payload issue through the SHARED ToAPIIssue
+      // (IssueChangeLabels:600 / IssueClearLabels:74 — LoadAssignees, the real
+      // set), so the default wire render — no emission pin.
+      await toApiIssue(c.env.DB, viewerOf(c), found, issue),
       issue.index,
       event.repository,
       event.sender,

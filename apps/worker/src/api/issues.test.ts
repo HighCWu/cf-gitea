@@ -1638,7 +1638,72 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
     expect(added.commit_id).toBe("");
     expect((added.issue as { labels: Array<{ id: number }> }).labels.map((l) => l.id)).toEqual([a, b]);
     expect(added.repository).toMatchObject({ full_name: "alice/visible" });
+    // The EMPTY assignee set renders the Go nils — `null` for both fields
+    // (structs/issue.go:65-66, no omitempty), never [].
+    const emptyIssue = added.issue as { assignee: unknown; assignees: unknown };
+    expect(emptyIssue.assignee).toBeNull();
+    expect(emptyIssue.assignees).toBeNull();
     expect(deliveries[2]!.payloadContent).toContain('\n  "action": "label_cleared"');
+  });
+
+  it("renders the payload issue block with the REAL assignee set across attach/replace/clear (the ToAPIIssue emission witness)", async () => {
+    // The label notifiers render the payload issue through the SHARED
+    // convert.ToAPIIssue on BOTH the attach/replace arm (notifier.go
+    // IssueChangeLabels:598-604) and the clear arm (IssueClearLabels:74):
+    // LoadAssignees, then every assignee into `assignees` with the first
+    // duplicated into the deprecated `assignee` (services/convert/issue.go:
+    // 105-112). emitLabelEvent rides that same folded render (the default
+    // "wire" mode — the emission-align wave) — flipping the site back to the
+    // landed emission-nulls shape must break here, never slip through
+    // silently.
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("neighbor");
+    const recluse = await seedUser("recluse");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "labeled-set");
+    await db().insert(issueAssignees).values([
+      { issueId: issue.id, assigneeId: neighbor.id },
+      { issueId: issue.id, assigneeId: recluse.id },
+    ]);
+    const a = await seedLabel(repoId, "alpha");
+    const b = await seedLabel(repoId, "beta");
+    const hookId = await seedHook(repoId, ["issue_label"]);
+
+    const add = await router()(`/repos/${owner.usernameLower}/visible/issues/${issue.index}/labels`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [a, b] }),
+    });
+    expect(add.status).toBe(200);
+
+    const replace = await router()(`/repos/${owner.usernameLower}/visible/issues/${issue.index}/labels`, {
+      method: "PUT",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [b] }),
+    });
+    expect(replace.status).toBe(200);
+
+    const clear = await router()(`/repos/${owner.usernameLower}/visible/issues/${issue.index}/labels`, {
+      method: "DELETE",
+      headers: authHeaders,
+    });
+    expect(clear.status).toBe(204);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_label", "issue_label", "issue_label"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["label_updated", "label_updated", "label_cleared"]);
+    // Edge-row (insertion) order — the listIssueAssignees orderBy — with the
+    // first assignee duplicated into `assignee` (ToIssue issue.go:105-113),
+    // IDENTICALLY on attach, replace and clear: one shared converter, one
+    // render.
+    for (const delivery of deliveries) {
+      const payload = JSON.parse(delivery.payloadContent) as {
+        issue: { assignee: { login: string } | null; assignees: Array<{ login: string }> | null };
+      };
+      expect(payload.issue.assignees?.map((u) => u.login)).toEqual([neighbor.usernameLower, recluse.usernameLower]);
+      expect(payload.issue.assignee).toMatchObject({ login: neighbor.usernameLower });
+    }
   });
 
   it("stays silent for hooks not subscribed to issue_label", async () => {
@@ -1693,6 +1758,85 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
     // A pull_request_label-subscribed hook never sees issue_label traffic and
     // vice versa: the issue-arm event type would not match this config.
     expect(await db().select().from(webhookDeliveries).all()).toHaveLength(1);
+  });
+
+  it("renders the PR label payload's pull_request block with the REAL assignee set (ToPayloadPullRequest → ToAPIIssue LoadAssignees)", async () => {
+    // Upstream's PR label payload is built by ToPayloadPullRequest (notifier.go
+    // IssueChangeLabels:601-606), which feeds ToAPIIssue through it (pull.go:60)
+    // — the real assignee set rides the payload too: Assignee keeps the first
+    // duplicate and Assignees applies util.SliceNilAsEmpty (pull.go:86-87).
+    // The emission-align wave dropped the payload-mode emission pin, so the
+    // render is the real set — flipping back to the landed nulls must break
+    // here.
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("neighbor");
+    const recluse = await seedUser("recluse");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const labelId = await seedLabel(repoId, "approved");
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "PR label assignees",
+      posterId: 1,
+    });
+    await db().insert(issueAssignees).values([
+      { issueId: pull.issue.id, assigneeId: neighbor.id },
+      { issueId: pull.issue.id, assigneeId: recluse.id },
+    ]);
+    const hookId = await seedHook(repoId, ["pull_request_label"]);
+
+    const add = await router()(`/repos/${owner.usernameLower}/visible/issues/${pull.issue.index}/labels`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [labelId] }),
+    });
+    expect(add.status).toBe(200);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request_label");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      pull_request: { assignee: { login: string } | null; assignees: Array<{ login: string }> | null };
+    };
+    // Edge-row (insertion) order with the first assignee duplicated into the
+    // deprecated `assignee` (ToIssue issue.go:105-113 through pull.go:86).
+    expect(payload.pull_request.assignees?.map((u) => u.login)).toEqual([neighbor.usernameLower, recluse.usernameLower]);
+    expect(payload.pull_request.assignee).toMatchObject({ login: neighbor.usernameLower });
+  });
+
+  it("renders the PR's EMPTY assignee set as [] not null (pull.go:87 SliceNilAsEmpty — the PR-converter nuance the issue arm lacks)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const labelId = await seedLabel(repoId, "approved");
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "PR label empty assignees",
+      posterId: 1,
+    });
+    const hookId = await seedHook(repoId, ["pull_request_label"]);
+
+    const add = await router()(`/repos/${owner.usernameLower}/visible/issues/${pull.issue.index}/labels`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [labelId] }),
+    });
+    expect(add.status).toBe(200);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      pull_request: { assignee: { login: string } | null; assignees: Array<{ login: string }> | null };
+    };
+    // SliceNilAsEmpty turns the nil slice into [] (pull.go:87) while the nil
+    // `assignee` pointer stays null (pull.go:86) — the PR converter's shape,
+    // NOT the issue arm's null/null.
+    expect(payload.pull_request.assignees).toEqual([]);
+    expect(payload.pull_request.assignee).toBeNull();
   });
 });
 

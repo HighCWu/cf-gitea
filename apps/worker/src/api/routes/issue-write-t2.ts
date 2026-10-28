@@ -296,8 +296,11 @@ async function findPullRequestRowByIssueId(d1: D1Database, issueId: number): Pro
  * upstream `issue.IsPull` discriminant, notifier.go IssueChangeLabels:572-
  * 605). Payload = the shared Issue/PullRequest wrapper, action
  * "label_updated", no `changes` block — exactly the family shape routes/
- * issues.ts's emitLabelEvent emits. A missing PR row skips the emission
- * (upstream's LoadPullRequest failure logs and returns before
+ * issues.ts's emitLabelEvent emits (the assign/replace/clear twin; since the
+ * emission-align wave BOTH sites ride the default wire render, so the
+ * assignee blocks match too: issue-side the real set / empty-set Go nils,
+ * PR-side real set with SliceNilAsEmpty's empty-[]). A missing PR row skips
+ * the emission (upstream's LoadPullRequest failure logs and returns before
  * PrepareWebhooks). Never throws.
  */
 async function emitLabelDetachEvent(c: Context<ApiEnv>, found: RepositoryWithOwner, issue: IssueRow): Promise<void> {

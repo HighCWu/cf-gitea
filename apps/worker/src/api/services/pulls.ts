@@ -510,16 +510,15 @@ export async function toApiPullRequest(
 ): Promise<PullRequest> {
   const context = preloaded?.context;
   // B1 (query-shape audit): the PR row is in hand — never re-select it. The
-  // issue render folds the REAL assignee set in the wire modes ("single"/
-  // "list" — upstream pull.go:56,86-87, apiIssue := ToAPIIssue feeding
-  // Assignee/Assignees; "list" keeps the raw null, "single" the
-  // SliceNilAsEmpty [] below); "payload" pins the landed webhook shape
-  // (assignee/assignees null — upstream renders real assignees in payloads,
-  // the disclosed emission divergence the assign landings froze).
+  // issue render folds the REAL assignee set in EVERY mode (upstream pull.go:
+  // 56,86-87 — apiIssue := ToAPIIssue feeding Assignee/Assignees, whose
+  // LoadAssignees is the real set in all three converters, payloads included:
+  // IssueChangeLabels:601-606 builds the PR label payload through
+  // ToPayloadPullRequest → toAPIPullRequest → ToAPIIssue); "list" keeps the
+  // raw null, "single"/"payload" the SliceNilAsEmpty [] below.
   const apiIssue = await toApiIssue(d1, viewer, pair, issue, {
     prRow: pr,
     context: context?.issue,
-    ...(mode === "payload" ? ({ assignees: "emission" } as const) : {}),
   });
   const htmlUrl =
     `${viewer.origin}/${encodeURIComponent(pair.repo.ownerNamespace)}/` +
