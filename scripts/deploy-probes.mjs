@@ -77,6 +77,22 @@
  *                  cascade with the repo), so cleanup-audit needs no new
  *                  residue expectations; a red run sweeps both (the
  *                  failureTail).
+ *   fixwave-parity The RD23 fix wave's LIVE parity matrix — one probe family
+ *                  per landed behavior (each self-cleans; see the battery
+ *                  section below for the per-family shapes): the PR head-sync
+ *                  (a push moves refs/pull/N/head) chained into the merged-PR
+ *                  412 and the strict ghost-ref 404 over one repo, the
+ *                  tag-only push-create survival, the org-team revoke's
+ *                  masked-404 git cut, the private user's anonymous-404 /
+ *                  admin-200 ladder, the sudo pair (admin impersonation +
+ *                  non-admin 403), and the session rotation's full cookie
+ *                  directive (the D1-write backdate arm — the toolkit's first
+ *                  D1 WRITE path, d1Exec). `independent` on purpose: every
+ *                  family reports its own verdict (a red family never
+ *                  chain-skips the rest of the matrix — pre-RD23 all eight
+ *                  families legitimately red; the post-deploy run is the
+ *                  verdict). A red run sweeps its repos + org + member user +
+ *                  session row (the failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -170,7 +186,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -259,6 +275,7 @@ const usage = () =>
   "  ui-login:      --new-label-count <n>      (canonical 3 writer-form occurrences)\n" +
   "  window2-mounts: (no extra options)\n" +
   "  window3-mounts: (no extra options)\n" +
+  "  fixwave-parity: (no extra options — needs an ADMIN PAT + wrangler auth for the d1 arms; --d1-scope rides the rotation backdate)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -305,10 +322,16 @@ const fetchT = (url, init = {}) =>
     signal: AbortSignal.timeout(opts.timeoutMs),
   });
 
-/** Authenticated JSON call against the /api/v1 surface (`Authorization: token <PAT>`). */
-const api = async (apiPath, { method = "GET", body, auth = true, cookie } = {}) => {
-  const headers = {};
-  if (auth) headers.authorization = `token ${TOKEN}`;
+/** Authenticated JSON call against the /api/v1 surface (`Authorization: token <PAT>`).
+ *  `asToken` substitutes another minted credential (the fixwave battery's
+ *  member PAT); `basic` sends HTTP Basic `user:pass` instead (upstream's
+ *  reqBasicAuth gate on token CRUD — the fixwave mint arm); `headers` merges
+ *  extra headers (the `Sudo` impersonation arm). Minted substitution
+ *  credentials are scrubbed by their minting step. */
+const api = async (apiPath, { method = "GET", body, auth = true, cookie, asToken, basic, headers: extraHeaders } = {}) => {
+  const headers = { ...(extraHeaders ?? {}) };
+  if (basic) headers.authorization = `Basic ${Buffer.from(`${basic.user}:${basic.pass}`).toString("base64")}`;
+  else if (auth) headers.authorization = `token ${asToken ?? TOKEN}`;
   if (body !== undefined) headers["content-type"] = "application/json";
   if (cookie) headers.cookie = cookie;
   const res = await fetchT(`${opts.baseUrl}/api/v1${apiPath}`, {
@@ -338,19 +361,21 @@ const run = (cmd, args, { cwd, timeoutMs = 120_000, env } = {}) =>
 
 const GIT_ENV = { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "echo", LC_ALL: "C", LANG: "C" };
 /** git with the credential out of the URL — auth rides `http.extraHeader` (the
- *  evidence methodology; execFile argv needs no shell quoting for the space). */
-const git = (args, cwd, { auth = false } = {}) =>
+ *  evidence methodology; execFile argv needs no shell quoting for the space).
+ *  `as` substitutes another minted credential (the fixwave battery's member
+ *  PAT — scrubbed by its minting step). */
+const git = (args, cwd, { auth = false, as } = {}) =>
   run("git", [
     "-c", "credential.helper=",
-    ...(auth ? ["-c", `http.extraHeader=Authorization: token ${TOKEN}`] : []),
+    ...(auth ? ["-c", `http.extraHeader=Authorization: token ${as ?? TOKEN}`] : []),
     ...args,
   ], { cwd, env: GIT_ENV });
 
 const gitUrl = (owner, repo) => `${opts.baseUrl}/${owner}/${repo}.git`;
 
 /** ls-remote → {ok, code, stderr, refs: Map(ref → oid)}. */
-const lsRemote = async (url, { auth = false } = {}) => {
-  const r = await git(["ls-remote", url], undefined, { auth });
+const lsRemote = async (url, { auth = false, as } = {}) => {
+  const r = await git(["ls-remote", url], undefined, { auth, as });
   const refs = new Map(r.stdout.trim().split("\n").filter(Boolean)
     .map((line) => { const [oid, ref] = line.split("\t"); return [ref, oid]; }));
   return { ...r, refs };
@@ -2224,6 +2249,585 @@ const window3FailureCleanup = async (ctx) => {
   if (acts.length) log(`  [tail] w3-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
 };
 
+// ---------- battery: fixwave-parity (the RD23 fix wave's live shapes) ----------
+
+/**
+ * The fix wave's LIVE parity matrix (the RD23 deploy's verification battery —
+ * one probe family per landed behavior; each family asserts its own shape and
+ * self-cleans):
+ *
+ *   1. PR head-sync (140fc0b): a second push to an open PR's head branch (via
+ *      the REAL gate — the generate-e2e push helpers) moves refs/pull/N/head —
+ *      the PR row's head.sha follows the new tip, the commits list carries it,
+ *      and mergeable re-resolves (the re-armed lazy check settles a boolean,
+ *      never a stuck null). Chained into the SAME repo: the PR merges (POST
+ *      …/merge {"do":"merge"} → 200, GET …/merge → 204), a PATCH state through
+ *      the ISSUES route on the merged PR answers the verbatim 412 (d5b111d:
+ *      "cannot change state of this pull request, it was already merged"), and
+ *      GET /commits?sha=zzz-ghost answers 404 (5539eb9's strict resolver +
+ *      43ddf62's unknown-ref residual — never the default branch's walk).
+ *   2. Tag-only push-create (0626ced — the DATA-LOSS fix): a tag-only FIRST
+ *      push to a fresh name survives the create's settle — the row reads back
+ *      via the API (200) and the pushed tag lists.
+ *   3. Org revoke (f305dd4's row-19 grants): org + private repo + team
+ *      (includes_all_repositories) + member, all via the API; the member's
+ *      own minted PAT reads the advert (ls-remote ok); DELETE the team member;
+ *      the member's advert is 404-masked (git exit 128 `repository not found`)
+ *      and the member's API GET masks too, while the owner still reads.
+ *   4. User visibility (3f48b74): a PRIVATE user created via POST /admin/users
+ *      answers anonymous GET /users/{name} with the fake 404 and the admin
+ *      viewer with 200 + visibility:"private" (the anti-enumeration ladder).
+ *   5. sudo (32eaa73): GET /user with the admin PAT + `Sudo: <target>` shows
+ *      the TARGET's login; the target's own non-admin PAT + Sudo answers the
+ *      exact upstream 403 ("Only administrators allowed to sudo.").
+ *   6. Session rotation (28df818): a POST /login web session (the ui-login
+ *      methodology), `rotated_at` backdated 25 h in D1 (wrangler d1 execute —
+ *      d1Exec, the toolkit's first D1 WRITE path; d1Row was read-only), then
+ *      GET /login re-sets the FULL gitea_session directive (name + Path=/ +
+ *      HttpOnly + Secure + SameSite=Lax — NOT the raw id:secret value that was
+ *      the forced-logout bug), the adopted secret round-trips (303 → /), and
+ *      the stale pre-rotation secret authenticates nothing (the 200 form).
+ *
+ * `independent: true` on purpose (the cleanup-audit precedent): each family
+ * reports its own verdict — a red family must not chain-skip the rest of the
+ * matrix. PRE-RD23 every family legitimately reds (the standing deployment
+ * predates the wave: ignored Sudo header, raw-value rotation cookie, no 412
+ * guard, non-strict ghost walk, no refs/pull sync, the tag-only data-loss,
+ * unwired org git grants, no visibility ladder); the POST-DEPLOY run is the
+ * verdict. A red run sweeps everything it created (the failureTail: repos,
+ * org, member user — its PAT rows cascade — and the session row via D1);
+ * green runs clean through fw-cleanup.
+ *
+ * Requires an ADMIN PAT (--user must be the site admin; POST /admin/users and
+ * the sudo pair need it) and wrangler auth for the d1 arms (--d1-scope picks
+ * the database, remote by default — keep it in step with --base-url).
+ */
+
+const fixwaveContext = () => ({
+  user: opts.user,
+  // Family 1: PR head-sync → merge → 412 → ghost (one shared repo).
+  prRepo: `fwpr-${hexId()}`, prBranch: `fwbr-${hexId()}`,
+  prNumber: null, tip1: null, tip2: null,
+  // Family 2: tag-only push-create.
+  tagRepo: `fwt-${hexId()}`, tagName: `fwv1-${hexId()}`,
+  // Families 4/5/3: the private user (the sudo impersonation target AND the
+  // org family's member — one create, two families).
+  member: `fwu-${hexId()}`, memberToken: null, memberTokenId: null,
+  // Family 3: the org.
+  org: `fworg-${hexId()}`, orgRepo: `fwor-${hexId()}`, teamId: null,
+  // Family 6: the web session (the row id is public; the secret half is
+  // scrubbed at capture).
+  sessionId: null, cookie: null,
+  // Failure-tail bookkeeping (the sibling batteries' convention: mark on the
+  // observable write, sweep what the flags say survived).
+  prRepoCreated: false, prRepoFullName: null, prRepoGone: false,
+  tagRepoCreated: false, tagRepoFullName: null, tagRepoGone: false,
+  orgRepoCreated: false, orgRepoFullName: null, orgRepoGone: false,
+  orgCreated: false, orgGone: false,
+  memberCreated: false, memberGone: false,
+  sessionRowDeleted: false,
+  tmp: null,
+});
+
+const fixwaveSteps = (ctx) => [
+  {
+    id: "fw-pr-repo-201",
+    expect: `POST /api/v1/user/repos {"name":"${ctx.prRepo}","auto_init":true} → 201 (the PR head-sync family's repo)`,
+    run: async () => {
+      const res = await api("/user/repos", { method: "POST", body: { name: ctx.prRepo, auto_init: true } });
+      if (res.status === 201) ctx.prRepoCreated = true; // mark on the observable write
+      ctx.prRepoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.prRepo}`);
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      return `created ${res.json?.full_name}`;
+    },
+  },
+  {
+    id: "fw-pr-head-branch-push",
+    expect: `REAL PUSH (the gate, generate-e2e's helpers): clone, branch ${ctx.prBranch}, one commit, push → ls-remote lists it at tip1`,
+    run: async () => {
+      const tmp = ctx.tmp; // main() owns the battery scratch dir
+      const work = path.join(tmp, "pr");
+      let r = await git(["clone", gitUrl(ctx.user, ctx.prRepo), "pr"], tmp, { auth: true });
+      expect(r.ok, `clone failed: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+      r = await git(["checkout", "-b", ctx.prBranch], work);
+      expect(r.ok, `checkout -b failed: ${r.stderr.trim()}`);
+      await writeFile(path.join(work, "fwpr.txt"), `deploy-probes fixwave head-sync ${ctx.prBranch}\n`);
+      r = await git(["add", "-A"], work);
+      expect(r.ok, `git add failed: ${r.stderr.trim()}`);
+      r = await git(["-c", "user.name=cf-gitea-probes", "-c", "user.email=probes@cf-gitea.invalid",
+        "commit", "-m", "deploy-probes: fixwave PR head commit 1"], work);
+      expect(r.ok, `git commit failed: ${r.stderr.trim()}`);
+      r = await git(["push", "origin", `HEAD:refs/heads/${ctx.prBranch}`], work, { auth: true });
+      expect(r.ok, `push branch failed: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+      const lr = await lsRemote(gitUrl(ctx.user, ctx.prRepo), { auth: true });
+      expect(lr.ok && lr.refs.has(`refs/heads/${ctx.prBranch}`), `ls-remote missing ${ctx.prBranch}`);
+      ctx.tip1 = lr.refs.get(`refs/heads/${ctx.prBranch}`);
+      return `head branch ${ctx.prBranch} at ${ctx.tip1.slice(0, 10)}…`;
+    },
+  },
+  {
+    id: "fw-pr-open-201",
+    expect: `POST /repos/${ctx.user}/${ctx.prRepo}/pulls {"head":"${ctx.prBranch}","base":"main"} → 201 (same-repo head grammar) + settle-polled GET until mergeable leaves null (budget 15s)`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.prRepo}/pulls`, {
+        method: "POST",
+        body: { title: `deploy-probes fixwave head-sync ${ctx.prBranch}`, head: ctx.prBranch, base: "main" },
+      });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 200)}`);
+      expect(Number.isInteger(res.json?.number) && res.json.number > 0, `no PR number in the body: ${res.text.slice(0, 120)}`);
+      ctx.prNumber = res.json.number;
+      const pr = await poll(15_000, async () => {
+        const get = await api(`/repos/${ctx.user}/${ctx.prRepo}/pulls/${ctx.prNumber}`);
+        return get.status === 200 && get.json?.mergeable !== null && get.json?.mergeable !== undefined ? get.json : null;
+      });
+      expect(pr !== null, `PR #${ctx.prNumber} never resolved with a non-null mergeable within 15 s`);
+      expect(pr.head?.sha === ctx.tip1, `pre-push head.sha ${pr.head?.sha} != tip1 ${ctx.tip1}`);
+      return `PR #${ctx.prNumber} open, mergeable ${pr.mergeable} at tip1`;
+    },
+  },
+  {
+    id: "fw-pr-second-push",
+    expect: `second REAL PUSH to the open PR's head branch (one more commit through the gate) → ls-remote at tip2`,
+    run: async () => {
+      const work = path.join(ctx.tmp, "pr");
+      await writeFile(path.join(work, "fwpr2.txt"), `deploy-probes fixwave head-sync second commit\n`);
+      let r = await git(["add", "-A"], work);
+      expect(r.ok, `git add failed: ${r.stderr.trim()}`);
+      r = await git(["-c", "user.name=cf-gitea-probes", "-c", "user.email=probes@cf-gitea.invalid",
+        "commit", "-m", "deploy-probes: fixwave PR head commit 2"], work);
+      expect(r.ok, `git commit failed: ${r.stderr.trim()}`);
+      r = await git(["push", "origin", `HEAD:refs/heads/${ctx.prBranch}`], work, { auth: true });
+      expect(r.ok, `second push failed: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+      const lr = await lsRemote(gitUrl(ctx.user, ctx.prRepo), { auth: true });
+      expect(lr.ok && lr.refs.get(`refs/heads/${ctx.prBranch}`) !== ctx.tip1,
+        `branch tip did not advance past tip1: ${lr.refs.get(`refs/heads/${ctx.prBranch}`)}`);
+      ctx.tip2 = lr.refs.get(`refs/heads/${ctx.prBranch}`);
+      return `head branch advanced to ${ctx.tip2.slice(0, 10)}…`;
+    },
+  },
+  {
+    id: "fw-pr-head-sync",
+    expect: `THE HEAD-SYNC (140fc0b): settle-polled GET the PR (budget ${SETTLE_MS / 1000}s) → head.sha MOVED to tip2 (refs/pull/${"{N}"}/head followed the push); GET …/pulls/${"{N}"}/commits lists tip2; mergeable re-resolves a boolean (the re-armed check, never a stuck null)`,
+    run: async () => {
+      expect(Number.isInteger(ctx.prNumber) && ctx.tip2 !== null, "no open PR from the prior arms (fixture missing)");
+      const pr = await poll(SETTLE_MS, async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.prRepo}/pulls/${ctx.prNumber}`);
+        return res.status === 200 && res.json?.head?.sha === ctx.tip2 ? res.json : null;
+      });
+      expect(pr !== null,
+        `head.sha never reached ${ctx.tip2.slice(0, 10)}… within ${SETTLE_MS} ms — refs/pull/${ctx.prNumber}/head did NOT follow the push (the 140fc0b head-sync)`);
+      const commits = await api(`/repos/${ctx.user}/${ctx.prRepo}/pulls/${ctx.prNumber}/commits`);
+      expect(commits.status === 200, `commits list status ${commits.status} (expected 200)`);
+      expect(Array.isArray(commits.json) && commits.json.some((c) => c.sha === ctx.tip2),
+        `the commits list does not carry the new tip ${ctx.tip2.slice(0, 10)}… (got ${(commits.json ?? []).map((c) => c.sha?.slice(0, 10)).join(", ")})`);
+      expect(typeof pr.mergeable === "boolean", `mergeable ${pr.mergeable} after the sync (expected a re-resolved boolean)`);
+      return `head.sha moved to ${ctx.tip2.slice(0, 10)}… (refs/pull/${ctx.prNumber}/head synced); commits list carries it; mergeable ${pr.mergeable}`;
+    },
+  },
+  {
+    id: "fw-pr-merge-200",
+    expect: `POST …/pulls/${"{N}"}/merge {"do":"merge"} → 200, then GET …/pulls/${"{N}"}/merge → 204 (has-merged)`,
+    run: async () => {
+      expect(Number.isInteger(ctx.prNumber), "no open PR from the prior arms (fixture missing)");
+      const res = await api(`/repos/${ctx.user}/${ctx.prRepo}/pulls/${ctx.prNumber}/merge`, {
+        method: "POST", body: { do: "merge" },
+      });
+      expect(res.status === 200, `merge status ${res.status} (expected 200): ${res.text.slice(0, 160)}`);
+      const check = await api(`/repos/${ctx.user}/${ctx.prRepo}/pulls/${ctx.prNumber}/merge`);
+      expect(check.status === 204, `has-merged GET status ${check.status} (expected 204)`);
+      return `PR #${ctx.prNumber} merged (200 + has-merged 204)`;
+    },
+  },
+  {
+    id: "fw-pr-merged-state-412",
+    expect: `PATCH …/issues/${"{N}"} {"state":"closed"} on the MERGED PR → 412 with the verbatim message "cannot change state of this pull request, it was already merged" (the d5b111d guard — HasMerged before the value)`,
+    run: async () => {
+      expect(Number.isInteger(ctx.prNumber), "no merged PR from the prior arms (fixture missing)");
+      const res = await api(`/repos/${ctx.user}/${ctx.prRepo}/issues/${ctx.prNumber}`, {
+        method: "PATCH", body: { state: "closed" },
+      });
+      expect(res.status === 412, `status ${res.status} (expected 412 on the merged PR's state arm): ${res.text.slice(0, 160)}`);
+      expect(res.json?.message === "cannot change state of this pull request, it was already merged",
+        `message ${JSON.stringify(res.json?.message)} (expected the verbatim merged-PR 412 text)`);
+      return `412 verbatim: ${res.json?.message}`;
+    },
+  },
+  {
+    id: "fw-commits-ghost-404",
+    expect: `GET …/commits?sha=zzz-ghost → 404 (the strict resolver — an unresolvable sha NEVER falls back to the default branch's walk; 5539eb9 + 43ddf62)`,
+    run: async () => {
+      const res = await api(`/repos/${ctx.user}/${ctx.prRepo}/commits?sha=zzz-ghost`);
+      expect(res.status === 404, `status ${res.status} (expected 404 for the unresolvable sha): ${res.text.slice(0, 160)}`);
+      return `404 — zzz-ghost resolves to nothing and answers so`;
+    },
+  },
+  {
+    id: "fw-tagonly-push-0",
+    expect: `TAG-ONLY FIRST PUSH to a FRESH name (0626ced): scratch repo, one commit, git push ${ctx.user}/${ctx.tagRepo}.git HEAD:refs/tags/${ctx.tagName} → exit 0 (push-create through the receive-pack probe)`,
+    run: async () => {
+      const dir = path.join(ctx.tmp, "tagonly");
+      let r = await git(["init", "-b", "main", dir]);
+      expect(r.ok, `git init failed: ${r.stderr.trim()}`);
+      await writeFile(path.join(dir, "tagonly.txt"), `deploy-probes fixwave tag-only ${ctx.tagName}\n`);
+      r = await git(["add", "-A"], dir);
+      expect(r.ok, `git add failed: ${r.stderr.trim()}`);
+      r = await git(["-c", "user.name=cf-gitea-probes", "-c", "user.email=probes@cf-gitea.invalid",
+        "commit", "-m", "deploy-probes: fixwave tag-only push-create"], dir);
+      expect(r.ok, `git commit failed: ${r.stderr.trim()}`);
+      r = await git(["push", gitUrl(ctx.user, ctx.tagRepo), `HEAD:refs/tags/${ctx.tagName}`], dir, { auth: true });
+      if (r.ok) {
+        ctx.tagRepoCreated = true; // mark on the observable write (the push-create landed server-side)
+      } else if (r.killed) {
+        // A TIMED-OUT push may have landed server-side (the operation
+        // succeeded, only the response wait aborted — the AGENTS.md timeout
+        // lesson): probe before deciding whether the failure tail must sweep.
+        const probe = await api(`/repos/${ctx.user}/${ctx.tagRepo}`);
+        if (probe.status === 200) ctx.tagRepoCreated = true;
+      }
+      ctx.tagRepoFullName = `${ctx.user}/${ctx.tagRepo}`;
+      expect(r.ok, `tag-only push-create failed (exit ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+      return `exit 0 — tag-only push-create accepted (refs/tags/${ctx.tagName})`;
+    },
+  },
+  {
+    id: "fw-tagonly-row-survives",
+    expect: `THE SURVIVAL (the settle's three-arm contract): settle-polled GET …/repos/${ctx.user}/${ctx.tagRepo} (budget ${SETTLE_MS / 1000}s) → 200 (the row did NOT vanish mid-settle) and GET …/tags lists ${ctx.tagName}`,
+    run: async () => {
+      const repo = await poll(SETTLE_MS, async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.tagRepo}`);
+        return res.status === 200 ? res : null;
+      });
+      expect(repo !== null,
+        `GET the repo never answered 200 within ${SETTLE_MS} ms — the tag-only create's row did NOT survive the settle (the 0626ced data-loss fix)`);
+      const tags = await poll(SETTLE_MS, async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.tagRepo}/tags`);
+        return res.status === 200 && Array.isArray(res.json) && res.json.some((t) => t.name === ctx.tagName) ? res.json : null;
+      });
+      expect(tags !== null, `the pushed tag ${ctx.tagName} never listed via GET /tags (got ${(tags ?? [])[0]?.name ?? "nothing"})`);
+      return `row survived (200 ${repo.json?.full_name}) + tag ${ctx.tagName} lists`;
+    },
+  },
+  {
+    id: "fw-user-create-201",
+    expect: `POST /api/v1/admin/users {"username":"${ctx.member}","visibility":"private"} → 201 with visibility:"private" (the admin API; PAT-only store — no password)`,
+    run: async () => {
+      const res = await api("/admin/users", {
+        method: "POST",
+        body: {
+          username: ctx.member,
+          email: `${ctx.member}@probes.cf-gitea.invalid`,
+          visibility: "private",
+          must_change_password: false,
+        },
+      });
+      if (res.status === 201) ctx.memberCreated = true; // mark on the observable write
+      expect(res.status === 201, `status ${res.status} (expected 201 — an admin PAT is required): ${res.text.slice(0, 160)}`);
+      expect(res.json?.login === ctx.member, `login ${res.json?.login} (expected ${ctx.member})`);
+      expect(res.json?.visibility === "private", `visibility ${res.json?.visibility} (expected private)`);
+      return `user ${ctx.member} created (private)`;
+    },
+  },
+  {
+    id: "fw-user-visibility",
+    expect: `THE LADDER (3f48b74): anonymous GET /users/${"{name}"} → the fake 404 ({"message":"not found"} — existence never disclosed) while the admin viewer → 200 + visibility:"private"`,
+    run: async () => {
+      expect(ctx.memberCreated, "no private user from the prior arm (fixture missing)");
+      const anon = await api(`/users/${ctx.member}`, { auth: false });
+      expect(anon.status === 404, `anonymous status ${anon.status} (expected 404 — the private row must not leak)`);
+      expect(anon.text.includes("not found"), `anonymous body ${anon.text.slice(0, 120)} (expected the not-found report)`);
+      const admin = await api(`/users/${ctx.member}`);
+      expect(admin.status === 200, `admin status ${admin.status} (expected 200 — the site admin reads every row)`);
+      expect(admin.json?.visibility === "private", `admin-viewed visibility ${admin.json?.visibility} (expected private)`);
+      return `anonymous 404 (masked), admin 200 (private) — the ladder holds`;
+    },
+  },
+  {
+    id: "fw-user-token-mint",
+    expect: `POST /users/${"{name}"}/tokens {"scopes":["all"]} → 201 with the ONE-TIME plaintext under sha1 — over HTTP BASIC (upstream's reqBasicAuth gate on token CRUD: the credential must arrive as user:<PAT>; the token-header form answers 401 "auth required" — the live finding) — requireSelfOrAdmin lets the admin mint for the member; the plaintext is scrubbed from all output`,
+    run: async () => {
+      expect(ctx.memberCreated, "no private user from the prior arm (fixture missing)");
+      const res = await api(`/users/${ctx.member}/tokens`, {
+        method: "POST",
+        basic: { user: ctx.user, pass: TOKEN },
+        body: { name: `fw-probe-${hexId()}`, scopes: ["all"] },
+      });
+      expect(res.status === 201, `status ${res.status} (expected 201 — the mint rides HTTP BASIC, upstream's token-CRUD gate): ${res.text.slice(0, 160)}`);
+      const plaintext = String(res.json?.sha1 ?? "");
+      secrets.push(plaintext); // scrub BEFORE any assert detail could carry it
+      expect(plaintext.length > 0, `no one-time plaintext in the mint body: ${scrub(res.text.slice(0, 120))}`);
+      ctx.memberToken = plaintext;
+      ctx.memberTokenId = res.json?.id;
+      return `token id ${res.json?.id} minted for ${ctx.member} (plaintext captured + scrubbed)`;
+    },
+  },
+  {
+    id: "fw-sudo-impersonates",
+    expect: `THE ADMIN ARM (32eaa73): GET /user with the admin PAT + Sudo: ${"{target}"} → 200 whose login is the TARGET (the doer swapped, the admin token's scope kept)`,
+    run: async () => {
+      expect(ctx.memberCreated, "no impersonation target from the prior arms (fixture missing)");
+      const res = await api("/user", { headers: { sudo: ctx.member } });
+      expect(res.status === 200, `status ${res.status} (expected 200): ${res.text.slice(0, 160)}`);
+      expect(res.json?.login === ctx.member,
+        `login ${res.json?.login} (expected the Sudo target ${ctx.member} — an unmounted sudo() ignores the header and answers the admin's own login)`);
+      return `sudo answered as ${res.json?.login} (impersonation live)`;
+    },
+  },
+  {
+    id: "fw-sudo-non-admin-403",
+    expect: `THE REFUSAL ARM: GET /user with the MEMBER's own PAT + Sudo → 403 "Only administrators allowed to sudo." (the exact upstream text)`,
+    run: async () => {
+      expect(ctx.memberToken !== null, "no member token from the prior arm (fixture missing)");
+      const res = await api("/user", { asToken: ctx.memberToken, headers: { sudo: ctx.user } });
+      expect(res.status === 403, `status ${res.status} (expected 403 — a non-admin never sudoes; an unmounted sudo() would answer 200)`);
+      expect(res.json?.message === "Only administrators allowed to sudo.",
+        `message ${JSON.stringify(res.json?.message)} (expected the exact upstream refusal)`);
+      return `403 "Only administrators allowed to sudo."`;
+    },
+  },
+  {
+    id: "fw-org-setup-201s",
+    expect: `the org fixtures via the API: POST /orgs → 201; POST /orgs/${"{org}"}/repos (PRIVATE) → 201; POST /orgs/${"{org}"}/teams {"permission":"read","includes_all_repositories":true,"units":["repo.code"]} → 201 with an id; PUT /teams/${"{id}"}/members/${"{user}"} → 204`,
+    run: async () => {
+      expect(ctx.memberCreated, "no team member from the prior arms (fixture missing)");
+      const org = await api("/orgs", { method: "POST", body: { username: ctx.org } });
+      if (org.status === 201) ctx.orgCreated = true;
+      expect(org.status === 201, `org status ${org.status} (expected 201): ${org.text.slice(0, 120)}`);
+      const repo = await api(`/orgs/${ctx.org}/repos`, {
+        method: "POST", body: { name: ctx.orgRepo, private: true, auto_init: true },
+      });
+      if (repo.status === 201) {
+        ctx.orgRepoCreated = true;
+        ctx.orgRepoFullName = String(repo.json?.full_name ?? `${ctx.org}/${ctx.orgRepo}`);
+      }
+      expect(repo.status === 201, `org repo status ${repo.status} (expected 201): ${repo.text.slice(0, 120)}`);
+      const team = await api(`/orgs/${ctx.org}/teams`, {
+        method: "POST",
+        body: { name: `fwteam-${hexId()}`, permission: "read", includes_all_repositories: true, units: ["repo.code"] },
+      });
+      expect(team.status === 201, `team status ${team.status} (expected 201): ${team.text.slice(0, 120)}`);
+      expect(Number.isInteger(team.json?.id), `no team id in the body: ${team.text.slice(0, 120)}`);
+      ctx.teamId = team.json.id;
+      const add = await api(`/teams/${ctx.teamId}/members/${ctx.member}`, { method: "PUT" });
+      expect(add.status === 204, `add member status ${add.status} (expected 204)`);
+      return `org + private repo + team ${ctx.teamId} (includes-all) + member, all 201/204`;
+    },
+  },
+  {
+    id: "fw-org-member-preaccess",
+    expect: `the MEMBER's own PAT reads the org repo's advert (settle-polled ls-remote, budget ${SETTLE_MS / 1000}s — the f305dd4 row-19 grant wiring makes team membership git-real)`,
+    run: async () => {
+      expect(ctx.memberToken !== null && Number.isInteger(ctx.teamId), "no member token / team from the prior arms (fixture missing)");
+      const done = await poll(SETTLE_MS, async () => {
+        const r = await lsRemote(gitUrl(ctx.org, ctx.orgRepo), { auth: true, as: ctx.memberToken });
+        return r.ok && r.refs.has("refs/heads/main") ? r : null;
+      });
+      expect(done !== null,
+        `the member's ls-remote never came up within ${SETTLE_MS} ms — team membership did not grant the git read (the f305dd4 row-19 org-grant wiring)`);
+      return `member advert ok — ${[...done.refs.keys()].filter((x) => x !== "HEAD").join(", ")}`;
+    },
+  },
+  {
+    id: "fw-org-revoke-masked",
+    expect: `THE REVOKE: DELETE /teams/${"{id}"}/members/${"{user}"} → 204; the member's VERY NEXT ls-remote → exit 128 'repository not found' (the 404 mask) AND their API GET → 404, while the owner still reads 200`,
+    run: async () => {
+      expect(ctx.memberToken !== null && Number.isInteger(ctx.teamId), "no member token / team from the prior arms (fixture missing)");
+      const del = await api(`/teams/${ctx.teamId}/members/${ctx.member}`, { method: "DELETE" });
+      expect(del.status === 204, `remove member status ${del.status} (expected 204)`);
+      const advert = await lsRemote(gitUrl(ctx.org, ctx.orgRepo), { auth: true, as: ctx.memberToken });
+      expect(advert.code === 128, `member ls-remote exit ${advert.code} (expected 128 — a 0 here means the revoke did not cut the git read)`);
+      // The mask text's CASE is not pinned: the tombstone battery's masked
+      // body is lowercase 'repository not found', the standing deployment's
+      // member-mask reads 'Repository not found' (capital R) — the match is
+      // case-insensitive and the post-deploy run is the verdict on any
+      // unification.
+      expect(/repository not found/i.test(advert.stderr),
+        `member ls-remote stderr ${advert.stderr.trim().slice(0, 160)} (expected the masked not-found text)`);
+      const masked = await api(`/repos/${ctx.org}/${ctx.orgRepo}`, { asToken: ctx.memberToken });
+      expect(masked.status === 404, `member API GET status ${masked.status} (expected the masked 404)`);
+      const owner = await api(`/repos/${ctx.org}/${ctx.orgRepo}`);
+      expect(owner.status === 200, `owner control GET status ${owner.status} (expected 200 — only the member lost access)`);
+      return `revoked: member advert 128 not-found + API 404 (masked); owner still 200`;
+    },
+  },
+  {
+    id: "fw-session-mint-303",
+    expect: `POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session cookie (the ui-login methodology; the value is scrubbed from all output) — the rotation family's live row`,
+    run: async () => {
+      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const res = await fetchT(`${opts.baseUrl}/login`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      await res.text();
+      expect(res.status === 303, `status ${res.status} (expected 303 See Other)`);
+      const setCookie = res.headers.getSetCookie().find((c) => c.startsWith("gitea_session="));
+      expect(setCookie !== undefined, `no gitea_session cookie in Set-Cookie (got ${res.headers.getSetCookie().length} cookies)`);
+      ctx.cookie = setCookie.split(";")[0];
+      const value = ctx.cookie.split("=")[1] ?? "";
+      ctx.sessionId = value.split(":")[0];
+      secrets.push(value);
+      expect(ctx.sessionId.length === 10, `session row id ${ctx.sessionId} is not the 10-char public id shape`);
+      return `303 + gitea_session cookie (row ${ctx.sessionId} minted)`;
+    },
+  },
+  {
+    id: "fw-session-rotation-directive",
+    expect: `THE DIRECTIVE (28df818): backdate rotated_at -25 h in D1 (wrangler d1 execute, --${opts.d1Scope} — d1Exec, the toolkit's first D1 WRITE) → GET /login with the cookie → 303 whose Set-Cookie is the FULL gitea_session directive (name + Path=/ + HttpOnly + Secure + SameSite=Lax) with a FRESH secret — never the raw id:secret value that logged the user out`,
+    run: async () => {
+      expect(ctx.sessionId !== null, "no session row from the prior arm (fixture missing)");
+      await d1Exec(`UPDATE sessions SET rotated_at = rotated_at - 90000 WHERE id = '${ctx.sessionId}'`);
+      const row = await d1Row(`SELECT rotated_at FROM sessions WHERE id = '${ctx.sessionId}'`);
+      expect(Date.now() / 1000 - Number(row.rotated_at) >= 86_400,
+        `the backdate did not stick (rotated_at ${row.rotated_at} is less than a day old) — rotation would not be due`);
+      const res = await fetchT(`${opts.baseUrl}/login`, { headers: { cookie: ctx.cookie } });
+      await res.text();
+      expect(res.status === 303, `status ${res.status} (expected 303 — the backdated session still authenticates)`);
+      expect(res.headers.get("location") === "/", `location ${JSON.stringify(res.headers.get("location"))} (expected "/")`);
+      const rotated = res.headers.getSetCookie().find((c) => c.startsWith("gitea_session="));
+      expect(rotated !== undefined,
+        `no gitea_session Set-Cookie on the rotation response (${res.headers.getSetCookie().length} cookie(s), first: ${scrub(res.headers.getSetCookie()[0] ?? "<none>").slice(0, 48)}) — the RAW-value shape (the forced-logout bug; 28df818 missing)`);
+      for (const attr of ["Path=/", "HttpOnly", "Secure", "SameSite=Lax"]) {
+        expect(rotated.includes(attr), `the rotated Set-Cookie is missing ${attr}: ${scrub(rotated).slice(0, 60)}`);
+      }
+      const newValue = rotated.split(";")[0].slice("gitea_session=".length);
+      secrets.push(newValue);
+      const oldSecret = (ctx.cookie.split("=")[1] ?? "").split(":")[1];
+      expect(newValue.split(":")[1] !== oldSecret, "the rotated cookie re-used the OLD secret (no fresh secret minted)");
+      expect(newValue.split(":")[0] === ctx.sessionId, `the rotated cookie's row id ${newValue.split(":")[0]} != ${ctx.sessionId} (rotation keeps the row)`);
+      ctx.newCookieValue = newValue;
+      return `303 → / with the full directive (name + attrs, fresh secret, same row)`;
+    },
+  },
+  {
+    id: "fw-session-adopted-cookie",
+    expect: `the ADOPTED secret round-trips and the stale one is dead: GET /login with the ROTATED cookie → 303 "/" (the forced-logout regression stays closed); GET /login with the PRE-rotation cookie → 200 (in grace it authenticates nothing)`,
+    run: async () => {
+      expect(ctx.newCookieValue !== null, "no rotated cookie from the prior arm (fixture missing)");
+      const adopted = await fetchT(`${opts.baseUrl}/login`, { headers: { cookie: `gitea_session=${ctx.newCookieValue}` } });
+      await adopted.text();
+      expect(adopted.status === 303, `rotated-cookie status ${adopted.status} (expected 303 — the browser adopting the directive stays signed in)`);
+      expect(adopted.headers.get("location") === "/", `rotated-cookie location ${JSON.stringify(adopted.headers.get("location"))} (expected "/")`);
+      const stale = await fetchT(`${opts.baseUrl}/login`, { headers: { cookie: ctx.cookie } });
+      await stale.text();
+      expect(stale.status === 200, `stale-cookie status ${stale.status} (expected 200 — the pre-rotation secret authenticates nothing)`);
+      return `rotated cookie 303 → / (signed in); stale cookie 200 (the form — anonymous)`;
+    },
+  },
+  {
+    id: "fw-cleanup",
+    expect: `everything DELETEd: org repo + PR repo + tag repo (204 each), the org (204), the member's token (204) + the member user (204), the session row (D1) — a failed cleanup is documented, not fatal (the failure-tail re-sweeps)`,
+    run: async () => {
+      const parts = [];
+      const a = await deleteRepo(ctx.org, ctx.orgRepo);
+      if (typeof a === "string") ctx.orgRepoGone = true;
+      parts.push(typeof a === "string" ? a : a.detail);
+      const b = await deleteRepo(ctx.user, ctx.prRepo);
+      if (typeof b === "string") ctx.prRepoGone = true;
+      parts.push(typeof b === "string" ? b : b.detail);
+      const c = await deleteRepo(ctx.user, ctx.tagRepo);
+      if (typeof c === "string") ctx.tagRepoGone = true;
+      parts.push(typeof c === "string" ? c : c.detail);
+      if (ctx.orgCreated) {
+        const org = await api(`/orgs/${ctx.org}`, { method: "DELETE" });
+        if (org.status === 204) { ctx.orgGone = true; parts.push(`org ${ctx.org} deleted`); }
+        else parts.push(`org ${ctx.org} LEFT BEHIND — DELETE returned ${org.status}`);
+      }
+      if (ctx.memberCreated) {
+        if (ctx.memberTokenId !== null && ctx.memberTokenId !== undefined) {
+          // Token CRUD is HTTP-BASIC-gated (the mint arm's live finding): the
+          // revoke rides the same Basic credential, never the token header.
+          const tok = await api(`/users/${ctx.member}/tokens/${ctx.memberTokenId}`, {
+            method: "DELETE", basic: { user: ctx.user, pass: TOKEN },
+          });
+          parts.push(tok.status === 204 ? `member token ${ctx.memberTokenId} revoked` : `member token revoke returned ${tok.status}`);
+        }
+        const user = await api(`/admin/users/${ctx.member}`, { method: "DELETE" });
+        if (user.status === 204) { ctx.memberGone = true; parts.push(`user ${ctx.member} deleted`); }
+        else parts.push(`user ${ctx.member} LEFT BEHIND — DELETE returned ${user.status}`);
+      }
+      if (ctx.sessionId !== null) {
+        try {
+          await d1Exec(`DELETE FROM sessions WHERE id = '${ctx.sessionId}'`);
+          ctx.sessionRowDeleted = true;
+          parts.push(`session row ${ctx.sessionId} deleted (D1)`);
+        } catch (err) {
+          parts.push(`session row ${ctx.sessionId} LEFT BEHIND — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      await rm(ctx.tmp, { recursive: true, force: true });
+      const bad = parts.filter((p) => p.includes("LEFT BEHIND") || p.includes("returned"));
+      if (bad.length === 0) return `${parts.length} cleanups — all 204/D1-deleted`;
+      return { status: "warn", detail: bad.join("; ") };
+    },
+  },
+];
+
+/** The red-runs-self-sweep posture (the generate-e2e shape) for a battery that
+ *  runs INDEPENDENT steps: a crash outside check() (main's catch) still sweeps
+ *  everything the flags say survived — repos first (the org repo before its
+ *  org: an org delete over a surviving repo would strand it), then the org
+ *  (its delete carries the team + membership), the member user (its PAT rows
+ *  are FK cascades), and the session row via D1. One [tail] line logs every
+ *  action; failures feed left_behind and are never fatal; it never throws
+ *  (main's finally depends on it). */
+const fixwaveFailureCleanup = async (ctx) => {
+  const acts = [];
+  const noteLeftBehind = (what, why) => {
+    leftBehind.push(`${what} (failure-cleanup tail: ${why})`);
+    acts.push(`${what} LEFT BEHIND — ${why}`);
+  };
+  const tryDeleteRepo = async (what, full, fallback) => {
+    const [owner, repo] = String(full ?? fallback).split("/");
+    try {
+      const out = await deleteRepo(owner, repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      noteLeftBehind(`${what} ${owner}/${repo}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  try {
+    if (ctx.orgRepoCreated === true && ctx.orgRepoGone !== true) {
+      await tryDeleteRepo("org repo", ctx.orgRepoFullName, `${ctx.org}/${ctx.orgRepo}`);
+    }
+    if (ctx.prRepoCreated === true && ctx.prRepoGone !== true) {
+      await tryDeleteRepo("PR repo", ctx.prRepoFullName, `${ctx.user}/${ctx.prRepo}`);
+    }
+    if (ctx.tagRepoCreated === true && ctx.tagRepoGone !== true) {
+      await tryDeleteRepo("tag-only repo", ctx.tagRepoFullName, `${ctx.user}/${ctx.tagRepo}`);
+    }
+    if (ctx.orgCreated === true && ctx.orgGone !== true) {
+      try {
+        const res = await api(`/orgs/${ctx.org}`, { method: "DELETE" });
+        if (res.status === 204) acts.push(`org ${ctx.org} deleted (204)`);
+        else noteLeftBehind(`org ${ctx.org}`, `DELETE returned ${res.status}`);
+      } catch (err) {
+        noteLeftBehind(`org ${ctx.org}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (ctx.memberCreated === true && ctx.memberGone !== true) {
+      try {
+        const res = await api(`/admin/users/${ctx.member}`, { method: "DELETE" });
+        if (res.status === 204) acts.push(`user ${ctx.member} deleted (204; its PAT rows are FK cascades)`);
+        else noteLeftBehind(`user ${ctx.member}`, `DELETE returned ${res.status}`);
+      } catch (err) {
+        noteLeftBehind(`user ${ctx.member}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (ctx.sessionId !== null && ctx.sessionRowDeleted !== true) {
+      try {
+        await d1Exec(`DELETE FROM sessions WHERE id = '${ctx.sessionId}'`);
+        acts.push(`session row ${ctx.sessionId} deleted (D1)`);
+      } catch (err) {
+        noteLeftBehind(`session row ${ctx.sessionId}`, `D1 delete threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } catch (err) {
+    acts.push(`the sweep itself failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (acts.length) log(`  [tail] fw-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -2236,9 +2840,12 @@ const AUDIT_TABLES = [
   { key: "user_blocking", sql: `(SELECT COUNT(*) FROM "user_blocking")`, want: () => 0, label: `user_blocking` },
 ];
 
-/** One wrangler d1 execute (--json, --${opts.d1Scope}) → the first row of
- *  the last statement's results (the cleanup-audit + mirror row-settle reads). */
-const d1Row = async (sql) => {
+/** One wrangler d1 execute (--json, --${opts.d1Scope}) → the parsed output
+ *  array. The write-capable half of the D1 plumbing (the fixwave session-
+ *  rotation arm backdates `sessions.rotated_at` through it — the toolkit's
+ *  FIRST D1 WRITE path; until d1Exec the probes were read-only via d1Row).
+ *  Writes carry no result rows; the caller picks what it needs. */
+const d1Exec = async (sql) => {
   const r = await run("pnpm", ["exec", "wrangler", "d1", "execute", "cf-gitea", `--${opts.d1Scope}`, "--json", "--command", sql],
     { cwd: workerDir, timeoutMs: 120_000 });
   expect(r.ok, `wrangler d1 execute failed (code ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
@@ -2248,8 +2855,15 @@ const d1Row = async (sql) => {
   } catch {
     throw new Error(`wrangler --json output is not JSON: ${r.stdout.slice(0, 200)}`);
   }
+  return parsed;
+};
+
+/** One wrangler d1 execute (--json, --${opts.d1Scope}) → the first row of
+ *  the last statement's results (the cleanup-audit + mirror row-settle reads). */
+const d1Row = async (sql) => {
+  const parsed = await d1Exec(sql);
   const row = parsed.at(-1)?.results?.[0];
-  expect(row !== undefined, `no result row from the d1 query (raw: ${r.stdout.slice(0, 200)})`);
+  expect(row !== undefined, `no result row from the d1 query (raw: ${JSON.stringify(parsed).slice(0, 200)})`);
   return row;
 };
 
@@ -2318,11 +2932,18 @@ const BATTERIES = {
   // until the mount window deploys; anything mounted asserts hard. The wiki
   // page write + issue/milestone seeds ride LANDED routes (chain-hard).
   "window3-mounts": { title: "window-3 mounts (feed tails, wiki raw, profile tabs, admin lists, settings account/notifications, milestone detail, content-history list)", context: window3Context, steps: window3Steps, failureTail: window3FailureCleanup },
+  // Independent steps (the cleanup-audit precedent): each fix-wave family
+  // reports its own verdict — a red family never chain-skips the rest of the
+  // matrix (pre-RD23 every family legitimately reds; the post-deploy run is
+  // the verdict). Needs an ADMIN PAT (POST /admin/users + the sudo pair) and
+  // wrangler auth for the d1 arms (the rotation backdate + the session-row
+  // sweep; --d1-scope picks the database).
+  "fixwave-parity": { title: "fix-wave parity (PR head-sync → merged-PR 412 → ghost-404, tag-only push-create, org revoke mask, private-user ladder, sudo pair, session-rotation directive)", context: fixwaveContext, steps: fixwaveSteps, failureTail: fixwaveFailureCleanup, independent: true },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 
