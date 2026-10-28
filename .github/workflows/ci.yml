@@ -85,6 +85,64 @@ jobs:
           name: full-suite-gate-evidence
           path: .full-suite-gate/
           if-no-files-found: ignore
+      # git-engine tsx checks (packages/git-engine/e2e/, plain Node under the
+      # tsx runner, NO dev server — wired 2026-10-28 per the e2e README's
+      # "left to the maintainers" note). Each drives the REAL GitStore/control
+      # plane over node:sqlite (real BEGIN/COMMIT) or the REAL serve path,
+      # with real `git` as the oracle; seconds each (delete-husk boots real
+      # miniflare/workerd with restarts and still runs in ~2s). Invocation is
+      # the README's pnpm-store shape, NOT `pnpm exec tsx`: tsx is
+      # transitive-only in this workspace (no package declares it), so exec
+      # cannot resolve it — but a fresh --frozen-lockfile install always lays
+      # node_modules/.pnpm/tsx@*/... down (peer of the vite/wrangler chain),
+      # which is exactly what the globbed path pins. What each check pins:
+      # - check-fault-matrix — SPEC-0011 §7.2 fault-injection completion tail:
+      #   a real compaction publish lands MID-STREAM between segment GETs, a
+      #   GC pass fully lease-blocks a paced fetch (row 12 early-release
+      #   overlap on the same timeline), mid-stream lease expiry rejects the
+      #   renewal and abandons the stream, crash-after-publish mid-delete
+      #   retries converge on a real publish.
+      # - check-push-origin — the onPush event's request-origin channel:
+      #   event.origin carries the LIVE request's scheme+authority (port,
+      #   https survive) through the real parse/stage/scan/finalize receive
+      #   flow, awaited via a collecting ExecutionContext.
+      # - check-delete-husk — delete-surface husk semantics pinned on the
+      #   REAL dev runtime (miniflare/workerd, NOT node:sqlite): a completed
+      #   async purge leaves an empty husk whose engine DELETE answers 200
+      #   idempotently across restarts (never the historical SQLITE_LOCKED
+      #   500), content-bearing cells still take the real wipe path, and a
+      #   fresh session over an existing database can still CREATE/DROP —
+      #   the cursor-drain root-cause fix (workerd#959).
+      # - check-tree-commits — the listTreeCommits batched per-path
+      #   latest-commit RPC is index-aligned equal to the per-path listLog
+      #   first commit on a real git fixture tree.
+      # - check-drain-discipline — the static tripwire: EVERY SqlStorage
+      #   SELECT cursor under engine src/** proves a full drain
+      #   (.toArray()/.one()/full iteration), fail-closed statement
+      #   classification, and the tripwire self-tests its own mutation class
+      #   (the workerd#959 SELECT-cursor-bricks-DDL discipline).
+      # - check-capability-matrix — TEST-GENERATED at run time: every
+      #   capability advertised by the LIVE handshakes (v0 upload/receive,
+      #   protocol v2 advertisement) must map onto a REGISTERED PROOF driving
+      #   the real paths; `filter` stays unadvertised-and-rejected; unknown
+      #   fetch arguments fail closed.
+      # - check-correctness-tier — SPEC-0011 §7.3 correctness tier on the
+      #   REAL receive flow: push-boundary trio (under-cap lands; over-cap
+      #   DECLARED is a 413 before any write; over-cap UNDECLARED aborts
+      #   mid-stream with zero refs moved), newTip-exists-tree-missing
+      #   injection, finalize-success-lost retry convergence, cross-pack
+      #   delta clone and REF_DELTA incremental fetch (git index-pack/
+      #   verify-pack/fsck oracles).
+      - name: Engine checks (git-engine tsx gates — fault-matrix, push-origin, delete-husk, tree-commits, drain-discipline, capability-matrix, correctness-tier)
+        run: |
+          TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
+          node "$TSX" packages/git-engine/e2e/check-fault-matrix.mjs
+          node "$TSX" packages/git-engine/e2e/check-push-origin.mjs
+          node "$TSX" packages/git-engine/e2e/check-delete-husk.mjs
+          node "$TSX" packages/git-engine/e2e/check-tree-commits.mjs
+          node "$TSX" packages/git-engine/e2e/check-drain-discipline.mjs
+          node "$TSX" packages/git-engine/e2e/check-capability-matrix.mjs
+          node "$TSX" packages/git-engine/e2e/check-correctness-tier.mjs
       - name: API contract check (declared routes vs frozen contract, SPEC-0004 §5.1)
         run: pnpm check:api
       - name: "Contract freeze guard (ADR-0002: frozen copy verbatim + sha256)"
@@ -136,6 +194,13 @@ jobs:
       # were green.
       - name: Apply local D1 migrations
         run: pnpm db:migrate:local
+      # The e2e harness runs git am/commit flows; the runner's git has NO
+      # user identity -> "Patch format detection failed" -> the am-tree check
+      # fails (the +1 vs the allowlist, run 40699376701: 36 observed vs 35).
+      - name: Git identity (the harness's am/commit flows)
+        run: |
+          git config --global user.name "cf-gitea-ci"
+          git config --global user.email "ci@cf-gitea.invalid"
       - name: Start dev Worker (vite dev, workerd)
         run: |
           # GH runner images alias localhost to ::1 AS WELL as 127.0.0.1
