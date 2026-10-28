@@ -124,9 +124,15 @@ jobs:
         run: |
           pnpm dev > /tmp/dev-server.log 2>&1 &
           echo $! > /tmp/dev-server.pid
-          for i in $(seq 1 60); do
+          # 2-core runners boot workerd far slower than dev machines (the
+          # first public CI run: vite ready in ~10s, the worker silent past
+          # the old 120s budget) — 300s + a periodic log tail for diagnosis.
+          for i in $(seq 1 150); do
             if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
               echo "dev server up (attempt $i)"; exit 0
+            fi
+            if [ $((i % 30)) -eq 0 ]; then
+              echo "--- attempt $i: dev log tail ---"; tail -5 /tmp/dev-server.log
             fi
             sleep 2
           done
@@ -223,9 +229,15 @@ jobs:
         run: |
           pnpm dev > /tmp/dev-server.log 2>&1 &
           echo $! > /tmp/dev-server.pid
-          for i in $(seq 1 60); do
+          # 2-core runners boot workerd far slower than dev machines (the
+          # first public CI run: vite ready in ~10s, the worker silent past
+          # the old 120s budget) — 300s + a periodic log tail for diagnosis.
+          for i in $(seq 1 150); do
             if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
               echo "dev server up (attempt $i)"; exit 0
+            fi
+            if [ $((i % 30)) -eq 0 ]; then
+              echo "--- attempt $i: dev log tail ---"; tail -5 /tmp/dev-server.log
             fi
             sleep 2
           done
@@ -322,9 +334,15 @@ jobs:
         run: |
           pnpm dev > /tmp/dev-server.log 2>&1 &
           echo $! > /tmp/dev-server.pid
-          for i in $(seq 1 60); do
+          # 2-core runners boot workerd far slower than dev machines (the
+          # first public CI run: vite ready in ~10s, the worker silent past
+          # the old 120s budget) — 300s + a periodic log tail for diagnosis.
+          for i in $(seq 1 150); do
             if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
               echo "dev server up (attempt $i)"; exit 0
+            fi
+            if [ $((i % 30)) -eq 0 ]; then
+              echo "--- attempt $i: dev log tail ---"; tail -5 /tmp/dev-server.log
             fi
             sleep 2
           done
@@ -462,9 +480,15 @@ jobs:
         run: |
           pnpm dev > /tmp/dev-server.log 2>&1 &
           echo $! > /tmp/dev-server.pid
-          for i in $(seq 1 60); do
+          # 2-core runners boot workerd far slower than dev machines (the
+          # first public CI run: vite ready in ~10s, the worker silent past
+          # the old 120s budget) — 300s + a periodic log tail for diagnosis.
+          for i in $(seq 1 150); do
             if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
               echo "dev server up (attempt $i)"; exit 0
+            fi
+            if [ $((i % 30)) -eq 0 ]; then
+              echo "--- attempt $i: dev log tail ---"; tail -5 /tmp/dev-server.log
             fi
             sleep 2
           done
