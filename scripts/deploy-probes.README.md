@@ -19,8 +19,8 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 ```
 
 - Batteries: `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
-  `ui-login`, `window2-mounts`, `cleanup-audit`, `all` (runs them in that
-  order, audit last).
+  `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
+  `cleanup-audit`, `all` (runs them in that order, audit last).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
@@ -222,6 +222,61 @@ prints all of them verbatim.
   (`DELETE /user/actions/secrets/<name>` — covering the red-before-the-row-id
   edge) and the org (logged on one `[tail] w2-leftover-sweep` line; failures
   feed `left_behind`, never fatal; a green run no-ops silently).
+- **window3-mounts** — the window-3 mount sweep over the ~12
+  committed-unmounted UI surfaces (the RD20 wrap battery): the releases/tags
+  feed tails (`releases.rss|.atom`, `tags.rss|.atom` — exact writeFeed
+  content-types + channel titles + the `MustBeNotEmpty` empty-repo 404 arm),
+  the wiki raw byte arm (`/wiki/raw/*` — a pushed page's coded + `.md`-alias
+  probes, the ETag/304 pair, `text/plain`, the absent-wiki 404), the profile
+  stars/watching/followers/following tabs (the mounted `?tab=activity` arm
+  rides along), the `/-/admin` users/orgs/repos lists (admin-cookie 200s with
+  the pageClass + probe rows, the anonymous login-303 arm), the user-settings
+  account/notifications tabs (read-only — the POST arms are NOT probed), the
+  milestone list→detail round-trip, and the issue content-history list tail
+  (the `{"results":null}` pre-edit empty arm). Login-cookie methodology first
+  (`POST /login` → `gitea_session`; a PAT header never reads a UI page); the
+  wiki write arm sends a same-origin `Origin` header so it exercises §2.8's
+  sameOriginGuard PASS arm. Like window2-mounts, every surface reads the
+  mount state AT RUN TIME: a 404 from a not-yet-mounted path is the
+  documented `[warn]` degradation (for the profile tabs, a 200 that is still
+  the inert repositories view warns the same way), while anything mounted
+  asserts hard. Fixtures: one public auto_init probe repo (the feeds'
+  non-empty gate, the wiki page, the issue, the milestone) + one empty public
+  repo (the feeds' 404 arm) — both DELETEd on green (the issue/milestone/
+  wiki-page rows cascade with the repo), so cleanup-audit needs no new
+  residue expectations. **Failure cleanup (the consistency posture):** a
+  finally-style tail best-effort deletes both repos (logged on one
+  `[tail] w3-leftover-sweep` line; failures feed `left_behind`, never fatal;
+  a green run no-ops silently). No extra options.
+- **fixwave-parity** — the RD23 fix wave's LIVE parity matrix, one probe
+  family per landed behavior (each self-cleans): the PR head-sync (a second
+  push to an open PR moves `refs/pull/N/head`; the PR row's `head.sha`
+  follows and `mergeable` re-resolves) chained into the merged-PR PATCH 412
+  (the verbatim "cannot change state of this pull request, it was already
+  merged") and the strict `?sha=zzz-ghost` commits 404 over one repo; the
+  tag-only FIRST push surviving the create's settle (the row reads back via
+  the API, the pushed tag lists); the org-team revoke's masked-404 git cut
+  (the member's own minted PAT reads the advert before, answers git 128
+  `repository not found` + a masked API GET after, while the owner still
+  reads); the private user's anonymous-404 / admin-200 visibility ladder;
+  the sudo pair (the admin PAT + `Sudo: <target>` shows the TARGET's login;
+  the target's own non-admin PAT + Sudo answers the exact upstream 403
+  "Only administrators allowed to sudo."); and the session rotation's full
+  cookie directive (the `rotated_at` backdated 25 h via wrangler d1 — the
+  toolkit's first D1 WRITE path — then GET /login re-sets the FULL
+  `gitea_session` directive, the adopted secret round-trips, and the stale
+  pre-rotation secret authenticates nothing). **Independent** (the
+  cleanup-audit precedent): every family reports its own verdict — a red
+  family never chain-skips the rest of the matrix (pre-RD23 every family
+  legitimately reds; the post-deploy run is the verdict). Flags: no extra
+  options, but it needs an **ADMIN PAT** (`--user` must be the site admin —
+  `POST /admin/users` and the sudo pair) and **wrangler auth for the D1
+  arms** (`--d1-scope` picks the database, remote by default — keep it in
+  step with `--base-url`). **Failure cleanup (the consistency posture):** a
+  finally-style tail best-effort sweeps the repos (org repo, PR repo,
+  tag-only repo), then the org, the member user (its PAT rows cascade), and
+  the session row via D1 (logged on one `[tail] fw-leftover-sweep` line;
+  failures feed `left_behind`, never fatal; a green run no-ops silently).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -259,6 +314,11 @@ prints all of them verbatim.
   - `ui-login` — its fixture repo; `[tail] ui-leftover-sweep`.
   - `window2-mounts` — its secret by name (the user API DELETE), then its
     org; `[tail] w2-leftover-sweep`.
+  - `window3-mounts` — its two probe repos (content + empty);
+    `[tail] w3-leftover-sweep`.
+  - `fixwave-parity` — its repos, then the org, the member user (its PAT
+    rows cascade), and the session row (the D1 delete);
+    `[tail] fw-leftover-sweep`.
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
   emptied everything, and the gone flags skip the rest). `p0` creates
