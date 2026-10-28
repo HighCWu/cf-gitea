@@ -914,7 +914,7 @@ export function registerPullRoutes(
     setPaginationHeaders(c, total, listOptions);
     // The query-shape audit's A3 (the heaviest list): the per-PR enrichment
     // (issue posters/labels/pins/milestones via the B1 PR-row pass-through,
-    // mergers, fork head-repo pairs + one grant per distinct head) batches
+    // mergers, fork head-repo pairs + the A9 batched grant resolution) batches
     // into a constant number of page-scoped reads; response unchanged.
     const renderContext = await prefetchPullRequestRenderContext(c.env.DB, viewer, found, items);
     const rendered = await Promise.all(

@@ -17,6 +17,7 @@ import {
   findUserByName,
   toApiRepository,
   viewerTeamAccessMode,
+  viewerTeamAccessModes,
   type RepositoryWithOwner,
   type UserRow,
   type Viewer,
@@ -293,9 +294,10 @@ export async function listRepoPullRequests(
 /** The page-scoped batch behind the list route's `toApiPullRequest` renders
  *  (the query-shape audit's A3): the issue-side rows (A2's maps, feeding
  *  toApiIssue through the B1 pass-through), the merger rows of the page's
- *  merged PRs, and the FORK head-repo pairs with ONE resolved grant per
- *  distinct head repo (the same-repo heads never enter the map — they were
- *  already free). */
+ *  merged PRs, and the FORK head-repo pairs with ONE batched grant
+ *  resolution across every distinct head repo (A9 — the
+ *  `viewerTeamAccessModes` twin; the same-repo heads never enter the map —
+ *  they were already free). */
 export interface PullRequestRenderContext {
   issue: IssueRenderContext;
   /** Merger user rows by id (merged PRs only; a missing id renders the
@@ -304,14 +306,16 @@ export interface PullRequestRenderContext {
   /** Head-repo pairs by repo id (a missing id renders the hidden-head
    *  defaults, exactly like the per-row `findRepositoryById` null). */
   headRepos: Map<string, RepositoryWithOwner>;
-  /** One `viewerTeamAccessMode` resolution per `headRepos` entry (null =
+  /** One batched `viewerTeamAccessModes` verdict per `headRepos` entry (null =
    *  the pure matrix decides — anonymous/admin/owner resolve without D1). */
   headRepoModes: Map<string, TeamAccessMode | null>;
 }
 
 /**
- * One batched read per entity kind for the page's PR rows, plus one grant
- * resolution per DISTINCT fork head repo. Id lists stay far under the D1
+ * One batched read per entity kind for the page's PR rows, plus ONE batched
+ * grant resolution across the DISTINCT fork head repos (the A9 fold — the
+ * `viewerTeamAccessModes` twin answers every distinct head with the verdict
+ * its per-call resolution would give). Id lists stay far under the D1
  * 100-variable cap (the paging clamps at 50 rows).
  */
 export async function prefetchPullRequestRenderContext(
@@ -337,11 +341,13 @@ export async function prefetchPullRequestRenderContext(
     findRepositoriesByIds(d1, headRepoIds),
     prefetchIssueRenderContext(d1, rows.map((row) => row.issue)),
   ]);
-  const headRepoModes = new Map<string, TeamAccessMode | null>();
-  await Promise.all(
-    [...headRepos.values()].map(async (headPair) => {
-      headRepoModes.set(headPair.repo.id, await viewerTeamAccessMode(d1, viewer, headPair.repo));
-    }),
+  // The grant batch rides the fetched pairs (ownerId/ownerNamespace feed the
+  // matrix arms) — the page's distinct-head fan collapses to the twin's
+  // constant ≤4 reads (A9: one inArray per underlying grant kind).
+  const headRepoModes = await viewerTeamAccessModes(
+    d1,
+    viewer,
+    [...headRepos.values()].map((headPair) => headPair.repo),
   );
   return {
     issue,

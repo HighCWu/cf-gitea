@@ -22,7 +22,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { comments, issueLabels, issuePins, issues, labels, milestones, pullRequests, pullReviews, repoCounters, repositories, ReviewType, users, webhookDeliveries, webhooks } from "../db/schema";
+import { comments, issueLabels, issuePins, issues, labels, milestones, orgMembers, pullRequests, pullReviews, repoCounters, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
@@ -878,27 +878,43 @@ describe("GET /repos/{owner}/{repo}/pulls/{base}/{head} (repoGetPullRequestByBas
 });
 
 // ---------------------------------------------------------------------------
-// Query-shape witness (docs/research/query-shape-audit.md A3+B1) — the pulls
-// list used to pay, PER ROW: toApiIssue's poster/label/pin (+milestone) fan,
-// the pull_requests re-select of the row the caller already holds (B1), and
-// the fork head-repo pair + grant lookups. The page now prefetches one read
-// per entity kind. Metering pattern identical to bench-d1.test.ts's wrapper
-// (bench-d1 is the index unit's file — this counter lives here).
+// Query-shape witness (docs/research/query-shape-audit.md A3+B1+A9) — the
+// pulls list used to pay, PER ROW: toApiIssue's poster/label/pin (+milestone)
+// fan, the pull_requests re-select of the row the caller already holds (B1),
+// and the fork head-repo pair + grant lookups. The page now prefetches one
+// read per entity kind, and the per-distinct-head grant resolutions folded
+// into ONE batched read per underlying grant kind (A9). Metering pattern
+// identical to bench-d1.test.ts's wrapper (bench-d1 is the index unit's
+// file — this counter lives here).
 // ---------------------------------------------------------------------------
 
 /** prepare()-counting D1 wrapper: every drizzle statement enters through one
- *  prepare() call. Scoped to the requests that pass the returned env. */
-function countedD1(): { db: D1Database; count: () => number } {
+ *  prepare() call. Scoped to the requests that pass the returned env; the
+ *  query texts stay inspectable so a witness can isolate ONE read family. */
+function countedD1(): { db: D1Database; count: () => number; queries: () => string[] } {
   let statements = 0;
+  const sqls: string[] = [];
   const wrapper = Object.create(env.DB) as D1Database;
   wrapper.prepare = (query: string) => {
     statements += 1;
+    sqls.push(query);
     return env.DB.prepare(query);
   };
-  return { db: wrapper, count: () => statements };
+  return { db: wrapper, count: () => statements, queries: () => sqls };
 }
 
-describe("pulls list query-shape witness (query-shape-audit A3/B1)", () => {
+/** The A9 grant tables — the underlying kinds the `viewerTeamAccessMode`
+ *  chain reads per call: `org_members` (the Owners-team bridge),
+ *  `teams` ⋈ `team_members` (the viewer's team rows),
+ *  `team_repo_access` (the per-team coverage probes), `repo_collaborators`
+ *  (the SPEC-0005 collaborator arm). No name is a substring of another. */
+const GRANT_TABLES = ["org_members", "team_members", "team_repo_access", "repo_collaborators"] as const;
+
+function grantQueryCount(queries: string[]): number {
+  return queries.filter((query) => GRANT_TABLES.some((table) => query.includes(table))).length;
+}
+
+describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
   it("renders the page with a constant statement count and a render identical to the per-row path", async () => {
     const owner = await seedUser("Alice");
     const forkOwner = await seedUser("Bob");
@@ -965,5 +981,143 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1)", () => {
     expect(batched).toEqual(perRow);
     expect(batched.find((p) => p.title === "fork head")?.head?.repo_id).toBe(Number(forkId));
     expect(batched.find((p) => p.title === "merged by bob")?.merged_by?.login).toBe("Bob");
+  });
+
+  // The query-shape audit's A9: the M-grade landing still resolved the grant
+  // (viewerTeamAccessMode) once per DISTINCT fork head — `3 + T` reads each.
+  // The page now folds them into ONE batched resolution
+  // (viewerTeamAccessModes) with one inArray per underlying grant kind.
+  it("folds the per-distinct-head grant resolutions into one batched read with per-row-identical verdicts (A9)", async () => {
+    const STUB_USER_ID = 1; // the stub token identity (login cf-gitea-stub)
+    const stubViewer: Viewer = { origin: "https://example.com", requester: { id: STUB_USER_ID, login: "cf-gitea-stub", is_admin: false } };
+    const owner = await seedUser("Alice");
+    const carol = await seedUser("Carol");
+    const baseId = await seedRepo(owner.usernameLower, "visible");
+    await db().update(repositories).set({ ownerId: owner.id }).where(eq(repositories.id, baseId));
+    // Six distinct head ids on one page, one per grant arm:
+    //  H1 Carol's PUBLIC fork — plain grant miss (verdict null), renders
+    //     pull-only;
+    const pubForkId = await seedRepo(carol.usernameLower, "pubfork");
+    await db().update(repositories).set({ ownerId: carol.id }).where(eq(repositories.id, pubForkId));
+    //  H2 Carol's PRIVATE fork, no grant — the no-access arm (hidden);
+    const hiddenForkId = await seedRepo(carol.usernameLower, "hiddenfork");
+    await db().update(repositories).set({ ownerId: carol.id, visibility: "private" }).where(eq(repositories.id, hiddenForkId));
+    //  H3 an org-owned private fork the stub reaches through a WRITE team
+    //     row (the team + coverage arms) — renders push;
+    const orgRows = await db()
+      .insert(users)
+      .values({ username: "teamorg", usernameLower: "teamorg", isAdmin: false, status: "active", type: "org", visibility: "public", createdAt: new Date("2026-01-01T00:00:00Z") })
+      .returning()
+      .all();
+    const teamOrg = orgRows[0];
+    if (teamOrg === undefined) throw new Error("org seed failed");
+    const teamForkId = await seedRepo("teamorg", "teamfork");
+    await db().update(repositories).set({ ownerId: teamOrg.id, visibility: "private" }).where(eq(repositories.id, teamForkId));
+    const teamRows = await db()
+      .insert(teams)
+      .values({ orgId: teamOrg.id, lowerName: "writers", name: "writers", authorize: "write" })
+      .returning({ id: teams.id })
+      .all();
+    const writerTeamId = teamRows[0]?.id;
+    if (writerTeamId === undefined) throw new Error("team seed failed");
+    await db().insert(teamMembers).values({ orgId: teamOrg.id, teamId: writerTeamId, userId: STUB_USER_ID });
+    await db().insert(teamRepoAccess).values({ orgId: teamOrg.id, teamId: writerTeamId, repoId: teamForkId });
+    //  H4 an org-owned private fork whose ORG OWNER is the stub (the
+    //     Owners-team bridge arm) — renders admin;
+    const bridgeRows = await db()
+      .insert(users)
+      .values({ username: "bridgeorg", usernameLower: "bridgeorg", isAdmin: false, status: "active", type: "org", visibility: "public", createdAt: new Date("2026-01-01T00:00:00Z") })
+      .returning()
+      .all();
+    const bridgeOrg = bridgeRows[0];
+    if (bridgeOrg === undefined) throw new Error("bridge org seed failed");
+    const bridgeForkId = await seedRepo("bridgeorg", "bridgefork");
+    await db().update(repositories).set({ ownerId: bridgeOrg.id, visibility: "private" }).where(eq(repositories.id, bridgeForkId));
+    await db().insert(orgMembers).values({ orgId: bridgeOrg.id, userId: STUB_USER_ID, role: "owner", createdAt: new Date("2026-01-01T00:00:00Z") });
+    //  H5 the stub's OWN private fork — the owner matrix arm (grant null
+    //     without D1, still renders);
+    const ownForkId = await seedRepo("cf-gitea-stub", "ownfork");
+    await db().update(repositories).set({ ownerId: STUB_USER_ID, visibility: "private" }).where(eq(repositories.id, ownForkId));
+    //  H6 a head id with NO repositories row — the map-miss arm (hidden).
+    const ghostHeadId = "424242";
+
+    const heads: Array<[string, string]> = [
+      [pubForkId, "head pub"],
+      [hiddenForkId, "head hidden"],
+      [teamForkId, "head team"],
+      [bridgeForkId, "head bridge"],
+      [ownForkId, "head own"],
+      [ghostHeadId, "head ghost"],
+    ];
+    for (const [headRepoId, title] of heads) {
+      const pr = await seedPull(baseId, title, { posterId: owner.id });
+      await db().update(pullRequests).set({ headRepoId }).where(eq(pullRequests.id, pr.prId));
+    }
+
+    // (a) Route-level: the signed-in list render resolves EVERY distinct head
+    // through the batch twin — exactly one statement per grant kind (4),
+    // independent of the head count. The base is public, so the route guard
+    // itself pays no grant reads and the four are all the twin's.
+    const app = createApiRouter();
+    const meter = countedD1();
+    const res = await app.fetch(
+      new Request("https://example.com/repos/Alice/visible/pulls?state=all", { headers: authHeaders }),
+      { ...env, DB: meter.db },
+    );
+    expect(res.status).toBe(200);
+    type WitnessHead = { repo_id?: number; repo?: { permissions?: { admin?: boolean; push?: boolean; pull?: boolean } } | null };
+    const body = await res.json<Array<{ title?: string; head?: WitnessHead }>>();
+    expect(body).toHaveLength(6);
+    expect(grantQueryCount(meter.queries())).toBe(4);
+    // The fixed page arms (auth + repo + count/page + 5 issue-side + heads)
+    // stay ~15; the per-head grant fan alone would add 11 more at this N.
+    expect(meter.count()).toBeLessThanOrEqual(20);
+    const byTitle = new Map(body.map((p) => [p.title, p.head]));
+    // H1: the public stranger fork renders pull-only (the null verdict).
+    expect(byTitle.get("head pub")).toMatchObject({ repo_id: Number(pubForkId) });
+    expect(byTitle.get("head pub")?.repo?.permissions).toEqual({ admin: false, push: false, pull: true });
+    // H2: the no-access private fork stays hidden (repo_id -1, no repo).
+    expect(byTitle.get("head hidden")?.repo_id).toBe(-1);
+    expect(byTitle.get("head hidden")?.repo).toBeUndefined();
+    // H3: the write-team grant admits the private fork with push.
+    expect(byTitle.get("head team")).toMatchObject({ repo_id: Number(teamForkId) });
+    expect(byTitle.get("head team")?.repo?.permissions?.push).toBe(true);
+    // H4: the Owners-team bridge admits with admin.
+    expect(byTitle.get("head bridge")).toMatchObject({ repo_id: Number(bridgeForkId) });
+    expect(byTitle.get("head bridge")?.repo?.permissions?.admin).toBe(true);
+    // H5: the stub's own private fork renders through the matrix arm.
+    expect(byTitle.get("head own")).toMatchObject({ repo_id: Number(ownForkId) });
+    // H6: the vanished head row stays hidden.
+    expect(byTitle.get("head ghost")?.repo_id).toBe(-1);
+    expect(byTitle.get("head ghost")?.repo).toBeUndefined();
+
+    // (b) Contract discipline on the same rows: the frozen per-row path (one
+    // viewerTeamAccessMode per fork head — 3 + 3 + 4 + 1 = 11 grant reads
+    // across H1-H4; the matrix/mapping arms pay zero) vs the batched
+    // prefetch (4). Verdicts must be deep-equal — hidden heads included.
+    const pair = await findRepositoryByPath(env.DB, "alice", "visible");
+    if (pair === null) throw new Error("base repo pair missing");
+    const rows = await db()
+      .select({ issue: issues, pullRequest: pullRequests })
+      .from(pullRequests)
+      .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+      .where(eq(pullRequests.baseRepoId, baseId))
+      .all();
+    const beforeMeter = countedD1();
+    const perRow = await Promise.all(
+      rows.map((row) => toApiPullRequest(beforeMeter.db, stubViewer, pair, row.issue, row.pullRequest, "list")),
+    );
+    expect(grantQueryCount(beforeMeter.queries())).toBe(11);
+
+    const afterMeter = countedD1();
+    const context = await prefetchPullRequestRenderContext(afterMeter.db, stubViewer, pair, rows);
+    expect(grantQueryCount(afterMeter.queries())).toBe(4);
+    const batched = await Promise.all(
+      rows.map((row) => toApiPullRequest(env.DB, stubViewer, pair, row.issue, row.pullRequest, "list", undefined, { context })),
+    );
+    expect(batched).toEqual(perRow);
+    expect(batched.find((p) => p.title === "head team")?.head?.repo?.permissions?.push).toBe(true);
+    expect(batched.find((p) => p.title === "head hidden")?.head?.repo_id).toBe(-1);
+    expect(batched.find((p) => p.title === "head ghost")?.head?.repo).toBeUndefined();
   });
 });

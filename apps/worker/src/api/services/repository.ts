@@ -2,7 +2,17 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } fro
 import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
-import { repoMirrors, repositories, users, type TeamAccessMode } from "../../db/schema";
+import {
+  orgMembers,
+  repoCollaborators,
+  repoMirrors,
+  repositories,
+  teamMembers,
+  teamRepoAccess,
+  teams,
+  users,
+  type TeamAccessMode,
+} from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
 import type { Permission, Repository } from "../models/repository";
@@ -104,7 +114,7 @@ function requesterLoginLower(viewer: Viewer): string | null {
   return viewer.requester?.login?.toLowerCase() ?? null;
 }
 
-function isRepositoryOwner(viewer: Viewer, row: RepositoryRow): boolean {
+function isRepositoryOwner(viewer: Viewer, row: Pick<RepositoryRow, "ownerNamespace">): boolean {
   return requesterLoginLower(viewer) === row.ownerNamespace;
 }
 
@@ -190,6 +200,134 @@ export async function viewerTeamAccessMode(
   if (userId === undefined) return null;
   const mode = await doerRepoAccessMode(d1, row, userId);
   return mode === "none" ? null : mode;
+}
+
+/**
+ * The BATCH twin of `viewerTeamAccessMode` for list-route prefetches (the
+ * query-shape audit's A9 fold): one resolution per DISTINCT repo of a page,
+ * all grant reads batched — ONE `org_members` inArray (the Owners-team
+ * bridge), ONE `teams ⋈ team_members` inArray (the viewer's teams across the
+ * set's orgs), ONE `team_repo_access` inArray pair (the coverage rows of
+ * those teams over the set's repos), ONE `repo_collaborators` inArray —
+ * replacing the per-call fan of `3 + T` reads per repo. The verdict per repo
+ * is the per-call verdict VERBATIM: the same pure-matrix arms short-circuit
+ * without D1 (anonymous / site admin / the repo's own owner / undefined id),
+ * and each pending repo composes `owner`-bridge ? "owner" :
+ * max(team arm, collaborator arm) with the identical units_map collapse and
+ * includes_all/row coverage rule `OrgService.teamRepoAccessMode` applies
+ * row-wise (its per-team probe collapses onto the batched coverage set).
+ * A repo absent from the result map is impossible — every input row gets an
+ * entry — so callers keep their `?? null` misses as pure belt.
+ */
+export async function viewerTeamAccessModes(
+  d1: D1Database,
+  viewer: Viewer,
+  rows: Array<Pick<RepositoryRow, "id" | "ownerId" | "ownerNamespace">>,
+): Promise<Map<string, TeamAccessMode | null>> {
+  const modes = new Map<string, TeamAccessMode | null>();
+  const pending: Array<Pick<RepositoryRow, "id" | "ownerId">> = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
+    // The pure matrix arms decide without D1, exactly like the per-call path.
+    if (viewer.requester === null || viewer.requester.is_admin === true || isRepositoryOwner(viewer, row)) {
+      modes.set(row.id, null);
+      continue;
+    }
+    pending.push(row);
+  }
+  const userId = viewer.requester?.id;
+  if (pending.length === 0 || userId === undefined) {
+    for (const row of pending) modes.set(row.id, null);
+    return modes;
+  }
+
+  const repoIds = pending.map((row) => row.id);
+  const ownerIds = [...new Set(pending.flatMap((row) => (row.ownerId !== null ? [row.ownerId] : [])))];
+
+  const [orgOwnerRows, teamRows, collabRows] = await Promise.all([
+    ownerIds.length > 0
+      ? drizzle(d1)
+          .select({ orgId: orgMembers.orgId })
+          .from(orgMembers)
+          .where(and(eq(orgMembers.userId, userId), eq(orgMembers.role, "owner"), inArray(orgMembers.orgId, ownerIds)))
+          .all()
+      : Promise.resolve([] as Array<{ orgId: number }>),
+    ownerIds.length > 0
+      ? drizzle(d1)
+          .select({
+            id: teams.id,
+            orgId: teams.orgId,
+            authorize: teams.authorize,
+            unitsMap: teams.unitsMap,
+            includesAll: teams.includesAllRepositories,
+          })
+          .from(teams)
+          .innerJoin(teamMembers, eq(teamMembers.teamId, teams.id))
+          .where(and(inArray(teams.orgId, ownerIds), eq(teamMembers.userId, userId)))
+          .all()
+      : Promise.resolve([] as Array<{ id: number; orgId: number; authorize: TeamAccessMode; unitsMap: string | null; includesAll: boolean }>),
+    drizzle(d1)
+      .select({ repoId: repoCollaborators.repoId, mode: repoCollaborators.mode })
+      .from(repoCollaborators)
+      .where(and(eq(repoCollaborators.userId, userId), inArray(repoCollaborators.repoId, repoIds)))
+      .all(),
+  ]);
+
+  const ownerOrgIds = new Set(orgOwnerRows.map((row) => row.orgId));
+  const collabByRepo = new Map(collabRows.map((row) => [row.repoId, row.mode]));
+  const teamsByOrg = new Map<number, typeof teamRows>();
+  for (const team of teamRows) {
+    const list = teamsByOrg.get(team.orgId);
+    if (list === undefined) teamsByOrg.set(team.orgId, [team]);
+    else list.push(team);
+  }
+  // The row-wise per-team coverage probe collapses to one batched read over
+  // the viewer's teams × the page's repos (the (team_id, repo_id) pair is
+  // UNIQUE, so the rows map 1:1 onto the probes the per-call path would run).
+  const teamIds = [...new Set(teamRows.map((team) => team.id))];
+  const coverageRows =
+    teamIds.length > 0
+      ? await drizzle(d1)
+          .select({ teamId: teamRepoAccess.teamId, repoId: teamRepoAccess.repoId })
+          .from(teamRepoAccess)
+          .where(and(inArray(teamRepoAccess.teamId, teamIds), inArray(teamRepoAccess.repoId, repoIds)))
+          .all()
+      : [];
+  const covered = new Set(coverageRows.map((row) => `${row.teamId}:${row.repoId}`));
+
+  const rank: Record<TeamAccessMode, number> = { none: 0, read: 1, write: 2, admin: 3, owner: 4 };
+  for (const row of pending) {
+    // The Owners-team bridge (SPEC-0007 §3.3) ranks first, like the per-call
+    // short-circuit — 'owner' is the rank maximum, so skipping the other arms
+    // cannot change the verdict.
+    if (row.ownerId !== null && ownerOrgIds.has(row.ownerId)) {
+      modes.set(row.id, "owner");
+      continue;
+    }
+    let best: TeamAccessMode = "none";
+    const orgTeams = row.ownerId !== null ? (teamsByOrg.get(row.ownerId) ?? []) : [];
+    for (const team of orgTeams) {
+      // Effective mode = max(authorize, the unit overrides) — the same
+      // units_map collapse `OrgService.teamRepoAccessMode` computes.
+      let effective = team.authorize;
+      if (team.unitsMap !== null) {
+        for (const mode of Object.values(JSON.parse(team.unitsMap) as Record<string, string>)) {
+          const parsed: TeamAccessMode =
+            mode === "read" || mode === "write" || mode === "admin" || mode === "owner" ? mode : "none";
+          if (rank[parsed] > rank[effective]) effective = parsed;
+        }
+      }
+      if (effective === "none" || rank[effective] <= rank[best]) continue;
+      const isCovered = team.includesAll || covered.has(`${team.id}:${row.id}`);
+      if (isCovered) best = effective;
+    }
+    const collabMode = collabByRepo.get(row.id);
+    if (collabMode !== undefined && rank[collabMode] > rank[best]) best = collabMode;
+    modes.set(row.id, best === "none" ? null : best);
+  }
+  return modes;
 }
 
 /**
