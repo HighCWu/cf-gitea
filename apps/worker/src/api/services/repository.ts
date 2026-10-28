@@ -258,13 +258,17 @@ export function userTypeToApiString(type: UserRow["type"]): "User" | "Organizati
 }
 
 /**
- * `Repository.owner` / embedded creators (upstream `ToUserWithAccessMode`'s
- * projection, with the ToUser gating arms: `authed` = the requester is the
- * row themself or a site admin — the gated is_admin/active/prohibit_login
- * flags render the row's real values only for authed viewers, exactly like
- * `toApiUser` (services/user.ts); the review-S11 flag alignment — upstream
- * `ToUserWithAccessMode` hardcodes `authed=false` (convert/user.go:73–75),
- * a divergence we deliberately do not copy so both landed serializers agree).
+ * The CANONICAL `toUser` body (convert/user.go:80–118): both ToUser-shaped
+ * converters render through this one function — the embedded `Repository.owner`
+ * / creators (`ToUserWithAccessMode`'s projection, convert/user.go:68–76) and
+ * the tier-1 directory projection (`toApiUser`, services/user.ts, a thin
+ * delegation so the two never drift — the review-S11 merge).
+ *
+ * `authed` = the requester is the row themself or a site admin — the gated
+ * is_admin/active/prohibit_login flags render the row's real values only for
+ * authed viewers, exactly like `toApiUser` used to inline (upstream
+ * `ToUserWithAccessMode` hardcodes `authed=false` at convert/user.go:73–75,
+ * a divergence we deliberately do not copy so both landed callers agree).
  * `type`/`visibility` render the row's real columns (`userTypeToApiString`,
  * `VisibilityString`). The primary email shows only to the user themself or a
  * site admin (upstream hides private emails behind a placeholder we do not

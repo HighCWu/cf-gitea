@@ -3,7 +3,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { alias } from "drizzle-orm/sqlite-core";
 
 import { orgMembers, users } from "../../db/schema";
-import { GO_ZERO_TIME, userTypeToApiString, type Viewer } from "./repository";
+import { apiUserFromRow, type Viewer } from "./repository";
 import { isFollowing } from "./follows";
 import type { User } from "../models/user";
 
@@ -153,52 +153,18 @@ function canSeeUserCondition(doer: UserVisibilityDoer): SQL {
 }
 
 /**
- * D1 row → contract `User`, mirroring `convert.ToUser` (user.go:40–51 +
- * toUser user.go:80–118): `signed` = a token resolved, `authed` = the
- * requester is the user themself or a site admin. Only `authed` viewers get
- * the gated fields (is_admin/active/prohibit_login/last_login/language/
- * login_name/source_id); the primary email shows only to them — upstream
- * falls back to a placeholder address when hidden (user.go:102–105); our
- * landed pattern (services/repository.ts apiUserFromRow) renders "" until
- * the placeholder rule is ported. `type` renders the row's type column
- * through `UserTypeToString` (user.go:15–22: org rows → "Organization") and
- * `visibility` the real `users.visibility` column (`VisibilityString`,
- * user.go:87 — same "public"/"limited"/"private" spellings as the D1 enum).
+ * D1 row → contract `User` for the tier-1 directory routes, mirroring
+ * `convert.ToUser` (user.go:40–51 + toUser user.go:80–118). The S11 merge:
+ * this is a thin delegation to the canonical body (`apiUserFromRow`,
+ * services/repository.ts) — one serializer, zero drift between the
+ * directory projection and every embedded `User` converter. Only `authed`
+ * viewers (the user themself or a site admin) get the gated fields
+ * (is_admin/active/prohibit_login/last_login/language/login_name/source_id);
+ * the gated columns that do not exist yet render documented zero/defaults
+ * with TODO markers instead of inventing schema.
  */
 export function toApiUser(viewer: Viewer, row: UserRow): User {
-  const authed =
-    viewer.requester !== null &&
-    (viewer.requester.is_admin === true || (viewer.requester.login ?? "").toLowerCase() === row.usernameLower);
-  return {
-    id: row.id,
-    login: row.username,
-    type: userTypeToApiString(row.type),
-    login_name: "", // TODO(SPEC-0005): external authentication sources
-    source_id: 0,
-    full_name: row.displayName ?? "",
-    email: authed ? (row.email ?? "") : "",
-    avatar_url: `${viewer.origin}/avatars/${row.usernameLower}`, // TODO(SPEC-0005): avatar storage
-    html_url: `${viewer.origin}/${row.username}`,
-    language: "", // TODO(SPEC-0005): per-user language column
-    is_admin: authed ? row.isAdmin : false,
-    last_login: GO_ZERO_TIME, // TODO(SPEC-0005): last-login tracking
-    created: row.createdAt.toISOString(),
-    restricted: false, // TODO(SPEC-0007): restricted is a visibility concept (orgs)
-    active: authed ? row.status === "active" : false,
-    prohibit_login: authed ? row.status === "prohibited" : false,
-    location: "",
-    website: "",
-    description: "",
-    visibility: row.visibility,
-    followers_count: 0, // TODO(SPEC-0005): social counters
-    following_count: 0,
-    // Upstream renders the maintained column (user.go:80-118 → StarredRepos,
-    // modules/structs/user.go:60; models/user/user.go:155), not a live
-    // count: the star/unstar batches bump it beside the edge
-    // (services/stars.ts, star.go:48/62), as does the block cascade
-    // (services/blocks.ts). Migration 0031's users.num_stars.
-    starred_repos_count: row.numStars,
-  };
+  return apiUserFromRow(row, viewer);
 }
 
 export interface UserSearchOptions {

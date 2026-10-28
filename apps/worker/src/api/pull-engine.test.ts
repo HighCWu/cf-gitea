@@ -422,6 +422,10 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     // 404 for a non-empty sha GetCommit cannot resolve (commits.go:211-216) —
     // never the default branch's history (the old fallback's 200-with-tip).
     expect((await get(`${REPO}/commits?sha=zzz-ghost`)).status).toBe(404);
+    // The oid arm too: the resolver's 40-hex pass-through is FORMAT-only, so
+    // an UNKNOWN oid used to reach the walk and answer 200 [] — the
+    // existence probe (resolveListStartRef) reads it as null → the same 404.
+    expect((await get(`${REPO}/commits?sha=0123456789abcdef0123456789abcdef01234567`)).status).toBe(404);
 
     await new RepoService(env.DB).create({
       owner: { id: OWNER_ID, usernameLower: OWNER },

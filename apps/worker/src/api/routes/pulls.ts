@@ -65,7 +65,7 @@ import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import { z } from "zod";
 
-import { comments, issues, issueAssignees, PRStatus, pullRequests, users } from "../../db/schema";
+import { comments, issues, issueAssignees, milestones, PRStatus, pullRequests, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssueError, MilestoneNotExistError } from "../../issues/errors";
 import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
@@ -109,7 +109,7 @@ import {
   mergeUpstream as mergeUpstreamEngine,
   pullRequestDiff,
 } from "../services/pull-engine";
-import { branchRef, engineReads } from "../services/engine";
+import { branchRef, engineReads, isFullObjectId, refTipMap, tagRef } from "../services/engine";
 import { findCollaborator } from "../services/repo-collaborators";
 import { renderUnifiedDiff, renderPatch, toApiCommit, toChangedFiles, usernamesByEmail } from "../services/git-models";
 import {
@@ -966,8 +966,34 @@ export function registerPullRoutes(
       const headPair = head.headRepoId === found.repo.id ? found : await requireReadableHeadRepo(c, head.headRepoId);
 
       const reads = engineReads(c.env, found.repo);
+      // parseCompareInfo resolves base and head (pull.go:1104-1113 via
+      // UnstableGuessRefByShortName: branch → tag → existing commit) and the
+      // create route then refuses everything that is not a BRANCH with the
+      // 422 (pull.go:423-425): a tag, or an oid GetCommit RESOLVES, answers
+      // the 422 — the oid check is existence-based (an unknown oid fails the
+      // guess → the family 404s below). The extra probe runs only for a
+      // non-branch 40-hex input, never on the branch path.
+      const baseTips = refTipMap(await reads.listRefs());
+      const headReads = headPair.repo.id === found.repo.id ? reads : engineReads(c.env, headPair.repo);
+      const headTips = headPair.repo.id === found.repo.id ? baseTips : refTipMap(await headReads.listRefs());
+      const baseBranchResolves = baseTips.get(branchRef(baseBranch)) !== undefined;
+      const headBranchResolves = headTips.get(branchRef(head.headBranch)) !== undefined;
+      const baseOidResolves =
+        !baseBranchResolves && baseTips.get(tagRef(baseBranch)) === undefined && isFullObjectId(baseBranch)
+          ? (await reads.readCommit(baseBranch)) !== null
+          : false;
+      const headOidResolves =
+        !headBranchResolves && headTips.get(tagRef(head.headBranch)) === undefined && isFullObjectId(head.headBranch)
+          ? (await headReads.readCommit(head.headBranch)) !== null
+          : false;
+      if (
+        (!baseBranchResolves && (baseTips.get(tagRef(baseBranch)) !== undefined || baseOidResolves)) ||
+        (!headBranchResolves && (headTips.get(tagRef(head.headBranch)) !== undefined || headOidResolves))
+      ) {
+        throw new ApiError(422, "Invalid PullRequest: base and head must be branches");
+      }
       const baseTip = await reads.readCommit(branchRef(baseBranch));
-      const headTip = await engineReads(c.env, headPair.repo).readCommit(branchRef(head.headBranch));
+      const headTip = await headReads.readCommit(branchRef(head.headBranch));
       if (baseTip === null) {
         // parseCompareInfo's base miss → APIErrorNotFound
         throw new ApiError(404, "not found");
@@ -982,16 +1008,34 @@ export function registerPullRoutes(
         throw pullRequestAlreadyExistsError(existing);
       }
 
-      // Milestone validation (GetMilestoneByRepoID miss → the typed 404, the
-      // issues-block convention).
+      // Milestone validation (GetMilestoneByRepoID, pull.go:477-482): the
+      // create route answers a miss with the BARE 404 (ctx.APIErrorNotFound)
+      // — NOT the issues-block typed message, which stays the PATCH/issues
+      // convention — and it runs BEFORE the deadline parse below (both-bad →
+      // 404 not 400, upstream's 477→524 order). The service's inner
+      // validateMilestone stays as the probe→batch race guard (its typed
+      // error re-renders bare at the create catch).
       const milestoneId = form.milestone === undefined || form.milestone === 0 ? null : form.milestone;
+      if (milestoneId !== null) {
+        const milestoneRow = await drizzle(c.env.DB)
+          .select({ id: milestones.id })
+          .from(milestones)
+          .where(and(eq(milestones.id, milestoneId), eq(milestones.repoId, found.repo.id)))
+          .limit(1)
+          .get();
+        if (milestoneRow === undefined) {
+          throw new ApiError(404, "not found");
+        }
+      }
 
       // Labels: unknown ids silently dropped (GetLabelsInRepoByIDs), unlike
       // POST /issues which 404s them.
       const labelIds = await existingRepoLabelIds(c.env.DB, found.repo.id, form.labels ?? []);
 
       // ApplyAPIDeadlineTimestamp port — 400 "invalid date format" on bad
-      // input (runtime-only status, same as the issues block).
+      // input (runtime-only status, same as the issues block). Upstream
+      // parses it AFTER the milestone lookup (pull.go:524-528), so a
+      // both-bad request answers the milestone's 404 (the order above).
       let deadlineAt: Date | null = null;
       if (form.due_date !== undefined && form.due_date !== null && form.due_date !== "") {
         deadlineAt = parseMilestoneDeadline(form.due_date);
@@ -1043,6 +1087,12 @@ export function registerPullRoutes(
           mergeBase: mergeBaseOid,
         }));
       } catch (error) {
+        // The create route's milestone miss renders the BARE 404
+        // (pull.go:477-482's APIErrorNotFound) even on the probe→batch race —
+        // the typed rendering stays the PATCH/issues-block convention.
+        if (error instanceof MilestoneNotExistError) {
+          throw new ApiError(404, "not found");
+        }
         asApiError(error);
         throw error;
       }

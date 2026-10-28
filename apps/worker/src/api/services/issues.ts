@@ -15,6 +15,7 @@ import {
   labels,
   milestones,
   notificationStates,
+  projectIssues,
   pullRequests,
   reactions,
   repositories,
@@ -1160,14 +1161,14 @@ export async function changeIssueMilestone(
  * index counter is NOT rewound (§2.2).
  *
  * The tier-2 arms are the upstream `db.DeleteBeans` set
- * (services/issue/issue.go:234–252) minus two accepted deltas: upstream's
+ * (services/issue/issue.go:234–252) minus one accepted delta: upstream's
  * `IssueUser` bean is not modeled (the derived read-state design — schema's
- * notification_states comment) and the `ProjectIssue` detach stays with the
- * projects owner (same upstream transaction, issue.go:246 — not part of this
- * sweep's seven modeled families). DEVIATION (kept): upstream also removes
- * `refs/pull/N/head` from the engine (services/issue/issue.go:174–181) — the
- * engine ref write lands with the PR routes (SPEC-0005 §3.4) and is
- * deferred with them.
+ * notification_states comment). The `ProjectIssue` detach (issue.go:246)
+ * rides this sweep too — the review-wave closure: without it a deleted issue
+ * left a ghost `project_issues` membership row behind. DEVIATION (kept):
+ * upstream also removes `refs/pull/N/head` from the engine
+ * (services/issue/issue.go:174–181) — the engine ref write lands with the PR
+ * routes (SPEC-0005 §3.4) and is deferred with them.
  *
  * Attachment STORAGE is deleted first (the landed single-attachment delete's
  * storage-first contract — routes/issue-attachments.ts:986-991: a failed R2
@@ -1202,6 +1203,11 @@ export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue
     drizzle(d1).delete(notificationStates).where(eq(notificationStates.issueId, issue.id)),
     drizzle(d1).delete(issueStopwatches).where(eq(issueStopwatches.issueId, issue.id)),
     drizzle(d1).delete(trackedTimes).where(eq(trackedTimes.issueId, issue.id)),
+    // The ProjectIssue detach (issue.go:246) — the review-wave closure of the
+    // orphaned-membership gap: a deleted issue must not survive as a ghost
+    // card on project columns (the projects service joins project_issues to
+    // issues, so the orphan row never rendered, but it stayed in D1).
+    drizzle(d1).delete(projectIssues).where(eq(projectIssues.issueId, issue.id)),
     drizzle(d1).delete(issueAttachments).where(eq(issueAttachments.issueId, issue.id)),
     drizzle(d1).delete(reactions).where(eq(reactions.issueId, issue.id)),
     drizzle(d1).delete(issueSubscriptions).where(eq(issueSubscriptions.issueId, issue.id)),

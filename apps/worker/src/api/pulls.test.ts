@@ -405,12 +405,63 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
     expect(body.milestone?.id).toBe(milestoneId);
     expect(body.due_date).toBe("2030-01-02T23:59:59.000Z");
 
+    // The create route's milestone miss answers the BARE 404
+    // (pull.go:477-482's ctx.APIErrorNotFound) — not the issues-block typed
+    // message, which stays the PATCH/issues convention.
     const unknownMilestone = await createPull("/repos/Alice/visible/pulls", { title: "x", head: "f2", base: "main", milestone: 99 });
     expect(unknownMilestone.status).toBe(404);
-    expect(await unknownMilestone.json()).toEqual({
-      message: `milestone does not exist [id: 99, repo_id: ${repoId}]`,
-      url: ERROR_URL,
+    expect(await unknownMilestone.json()).toEqual({ message: "not found", url: ERROR_URL });
+
+    // The order pin (upstream runs the milestone lookup, pull.go:477, BEFORE
+    // the deadline parse, pull.go:524): a BOTH-bad request answers the
+    // milestone's bare 404, not the deadline's 400.
+    const bothBad = await createPull("/repos/Alice/visible/pulls", { title: "x", head: "f2", base: "main", milestone: 99, due_date: "nope" });
+    expect(bothBad.status).toBe(404);
+    expect(await bothBad.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+
+  it("422s a tag or object-id base/head (must be branches); unknown names keep the family 404s", async () => {
+    const owner = await seedUser("Alice");
+    await seedRepo(owner.usernameLower, "visible");
+    await seedEngineBranches(owner.usernameLower, "visible", ["feature"]);
+    // A lightweight tag on the shared tip, landed through the same public
+    // RPC the branch seeding uses; the DO cell persists, so an
+    // already-present tag from a sibling test is tolerated.
+    const cell = env.REPO.getByName("alice/visible");
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "visible" }).listRefs());
+    const tip = tips.get(branchRef("main"))?.target;
+    if (tip === undefined) throw new Error("main seed missing");
+    const tagResult = await cell.commitApiChange({ ref: "refs/tags/v1", expectedOldOid: ZERO_OID, newOid: tip });
+    if (tagResult.tag !== "committed" && tagResult.tag !== "ref_conflict") {
+      throw new Error(`tag seed failed (${tagResult.tag})`);
+    }
+
+    // Tag base: parseCompareInfo RESOLVES the tag, then the IsBranch refusal
+    // answers the 422 (pull.go:423-425).
+    const tagBase = await createPull("/repos/Alice/visible/pulls", { title: "x", head: "feature", base: "v1" });
+    expect(tagBase.status).toBe(422);
+    expect((await tagBase.json<{ message: string }>()).message).toBe("Invalid PullRequest: base and head must be branches");
+
+    // Object-id head: upstream's guess RESOLVES the oid through GetCommit,
+    // then the IsBranch refusal answers the 422 (pull.go:423-425).
+    const shaHead = await createPull("/repos/Alice/visible/pulls", { title: "x", head: tip, base: "main" });
+    expect(shaHead.status).toBe(422);
+    expect((await shaHead.json<{ message: string }>()).message).toBe("Invalid PullRequest: base and head must be branches");
+
+    // A name resolving to NOTHING keeps the family 404s (base miss /
+    // head miss) — the 422 never fires for it, unknown oids included (the
+    // guess's GetCommit miss is a not-exist error, not a commit-ish).
+    const unknownBase = await createPull("/repos/Alice/visible/pulls", { title: "x", head: "feature", base: "nope" });
+    expect(unknownBase.status).toBe(404);
+    const unknownHead = await createPull("/repos/Alice/visible/pulls", { title: "x", head: "nope", base: "main" });
+    expect(unknownHead.status).toBe(404);
+    expect((await unknownHead.json<{ message: string }>()).message).toBe("Head branch does not exist [name: nope]");
+    const unknownOidHead = await createPull("/repos/Alice/visible/pulls", {
+      title: "x",
+      head: "0123456789abcdef0123456789abcdef01234567",
+      base: "main",
     });
+    expect(unknownOidHead.status).toBe(404);
   });
 
   it("422s head == base, 409s duplicate open targets (issue_id = the index), 400s bad due_date", async () => {

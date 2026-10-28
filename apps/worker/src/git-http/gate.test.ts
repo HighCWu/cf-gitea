@@ -209,6 +209,31 @@ describe("row 1 stays open: anonymous read of a D1-backed PUBLIC repo after sett
   });
 });
 
+describe("the HEAD file runs the rows 4/5 grant like every other read (the S7 alignment)", () => {
+  it("serves the anonymous HEAD of a grant-carrying private repo (row 4) and keeps the 401 without the grant (row 2)", async () => {
+    await pushCreateAndSettle("headgrant");
+    const repo = (await drizzle(env.DB).select().from(repositories).all())[0];
+    if (repo === undefined) throw new Error("repo seed missing");
+
+    // No grant yet: the anonymous HEAD probe stays a row-2 challenge — the
+    // pre-S7 posture the fix preserves for grant-less private repos.
+    const denied = await SELF.fetch("https://example.com/alice/headgrant/HEAD");
+    expect(denied.status).toBe(401);
+    expect(denied.headers.get("www-authenticate")).toBe(CHALLENGE);
+
+    // The code unit's anonymous-read grant (SPEC-0003 §3.1,
+    // upstream git_smart_http_test.go:163-189) admits the same probe the
+    // protocol reads on this repo already allow — the old hardcoded
+    // `unitAnonymousRead: false` challenged it instead.
+    await env.DB.prepare("INSERT INTO repo_units (repo_id, type, anonymous_access_mode) VALUES (?, 'code', 'read')").bind(repo.id).run();
+
+    const allowed = await SELF.fetch("https://example.com/alice/headgrant/HEAD");
+    expect(allowed.status).toBe(200);
+    expect(allowed.headers.get("content-type")).toBe("text/plain");
+    expect(new TextDecoder().decode(await allowed.arrayBuffer())).toBe("ref: refs/heads/main\n");
+  });
+});
+
 describe("transitional passthrough unchanged: repos with NO D1 row (TODO SPEC-0003 ENGINE-WAVE)", () => {
   it("keeps the engine's public-read for a registry-known repo that has no D1 row", async () => {
     // The e2e population shape: engine Registry row only, no repositories row.

@@ -183,9 +183,16 @@ export async function gitHttpGate(
     return handleUnknownRepository(req, env, ctx, engine, url, route, ownerLower, repoLower);
   }
 
-  // Route table row 4: the synthetic HEAD file (a read).
+  // Route table row 4: the synthetic HEAD file (a read) — the SAME rows 4/5
+  // grant computation every other read runs below (the S7 alignment): the
+  // code unit's anonymous-read grant on a private repo admits the anonymous
+  // HEAD probe too. The old hardcoded `false` answered 401 for exactly the
+  // repo shape the grant exists for, while /info/refs and the RPC reads on
+  // the same repo allowed the same client.
   if (route.kind === "head") {
     if (req.method !== "GET") return engine.fetch(req, env, ctx);
+    const unitAnonymousRead =
+      resolved.repo.visibility === "private" ? await codeUnitAnonymousRead(env.DB, resolved.repo.id) : false;
     const decision = await authorizeGitHttp({
       req,
       env,
@@ -194,7 +201,7 @@ export async function gitHttpGate(
       repo: resolved.repo,
       owner: resolved.owner,
       ownerVisibility: resolved.ownerVisibility,
-      unitAnonymousRead: false,
+      unitAnonymousRead,
     });
     if (decision !== true) return decision;
     return serveHead(env, route, resolved.repo.defaultBranch);

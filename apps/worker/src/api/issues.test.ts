@@ -7,7 +7,7 @@
  * the RFC3339 since/before 422s, the CAS 409 on stale content_version, the
  * §4.12 delete cascade (index never reused; the tier-2 child sweep —
  * assignees/dependencies/stopwatches/tracked times/attachments+R2/content
- * history/notification states), and the webhook triggers
+ * history/notification states/project memberships), and the webhook triggers
  * (issues opened/edited/closed/reopened + issue_comment created via
  * emitWebhookDeliveries — rows land inline, the Queue enqueue is the
  * executionCtx-guarded no-op under app.request).
@@ -30,6 +30,8 @@ import {
   labels,
   milestones,
   notificationStates,
+  projectIssues,
+  projects,
   pullRequests,
   repoCollaborators,
   repoCounters,
@@ -68,6 +70,8 @@ beforeEach(async () => {
     "issue_attachments",
     "issue_content_history",
     "notification_states",
+    "project_issues",
+    "projects",
     "pull_requests",
     "comments",
     "issue_labels",
@@ -971,6 +975,18 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index} (issueDelete)", () => {
       { userId: owner.id, issueId: doomed.id, readAtUnix: 42, pinned: true, updatedAt: now },
       { userId: owner.id, issueId: survivor.id, readAtUnix: 42, pinned: true, updatedAt: now }, // control
     ]);
+    // The ProjectIssue detach (issue.go:246): both issues sit on one repo
+    // project's column; the delete must sweep only the doomed membership.
+    const [project] = await db()
+      .insert(projects)
+      .values({ title: "sweep", creatorId: owner.id, repoId, type: 2, createdAt: now, updatedAt: now })
+      .returning()
+      .all();
+    if (project === undefined) throw new Error("project seed failed");
+    await db().insert(projectIssues).values([
+      { issueId: doomed.id, projectId: project.id, projectColumnId: 0, sorting: 0 },
+      { issueId: survivor.id, projectId: project.id, projectColumnId: 0, sorting: 1 }, // control
+    ]);
     // Attachments: one completed (row + R2 object), one row-first-pending
     // (r2_key still NULL — the relay upload never completed) on the doomed
     // issue; a completed control on the survivor.
@@ -1017,6 +1033,8 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index} (issueDelete)", () => {
     expect(await db().select().from(issueContentHistory).where(eq(issueContentHistory.issueId, survivor.id)).all()).toHaveLength(1);
     expect(await db().select().from(notificationStates).where(eq(notificationStates.issueId, doomed.id)).all()).toHaveLength(0);
     expect(await db().select().from(notificationStates).where(eq(notificationStates.issueId, survivor.id)).all()).toHaveLength(1);
+    expect(await db().select().from(projectIssues).where(eq(projectIssues.issueId, doomed.id)).all()).toHaveLength(0);
+    expect(await db().select().from(projectIssues).where(eq(projectIssues.issueId, survivor.id)).all()).toHaveLength(1);
     expect(await db().select().from(issueAttachments).where(eq(issueAttachments.issueId, doomed.id)).all()).toHaveLength(0);
     expect(await db().select().from(issueAttachments).where(eq(issueAttachments.issueId, survivor.id)).all()).toHaveLength(1);
 

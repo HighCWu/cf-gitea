@@ -7,7 +7,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { issues, pullRequests } from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
-import { branchRef, engineReads, refTipMap, resolveNamedRef, tagRef } from "../services/engine";
+import { branchRef, engineReads, refTipMap, resolveListStartRef, resolveNamedRef, tagRef } from "../services/engine";
 import { renderPatch, renderUnifiedDiff, toApiCommit, usernamesByEmail } from "../services/git-models";
 import { toApiPullRequest } from "../services/pulls";
 import { compareSchema, commitListSchema, commitSchema } from "../models/git";
@@ -209,8 +209,11 @@ export function registerCommitRoutes(
       // Upstream GetAllCommits: a non-empty sha that GetCommit cannot resolve
       // is the APIErrorAuto 404 (commits.go:211-216) — never the default
       // branch's tip. The absent-sha arm (start = undefined) is the only
-      // default-branch walk.
-      const startRef = resolveNamedRef(refTipMap(await reads.listRefs()), shaParam);
+      // default-branch walk. The resolver is the existence-probed variant:
+      // the sync oid arm passes 40-hex through on FORMAT alone, so an
+      // unknown oid used to reach the walk and answer 200 [] (the review's
+      // unknown-40-hex residual).
+      const startRef = await resolveListStartRef(reads, shaParam);
       if (startRef === null && shaParam !== "") {
         throw new ApiError(404, "not found");
       }

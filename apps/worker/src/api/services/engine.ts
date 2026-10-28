@@ -142,6 +142,16 @@ export function refTipMap(refs: RefsResult | null): Map<string, RefTip> {
 }
 
 /**
+ * A full-length sha1 object id (40 hex lowercase) — the engine's oid
+ * convention. Upstream's `git.IsStringValidObjectID(format, id)` for the
+ * sha1 repos this backend serves (pull.go:420-421 checks FORMAT, not
+ * existence — a format-valid oid counts as "resolved" there).
+ */
+export function isFullObjectId(ref: string): boolean {
+  return /^[0-9a-f]{40}$/.test(ref);
+}
+
+/**
  * Resolve the `ref` query param to a full ref name: an exact branch, then an
  * exact tag, then a full ref as given, then a 40-char oid (immutable —
  * passable to readCommit directly). STRICTLY null when the ref does not
@@ -166,10 +176,36 @@ export function resolveNamedRef(tips: Map<string, RefTip>, ref: string): { ref: 
       return { ref: candidate, target: tip.target, ...(tip.peeled === undefined ? {} : { peeled: tip.peeled }) };
     }
   }
-  if (/^[0-9a-f]{40}$/.test(ref)) {
+  if (isFullObjectId(ref)) {
     return { ref, target: ref };
   }
   return null;
+}
+
+/**
+ * The EXISTENCE-PROBED variant for the list-walk consumers: the sync
+ * resolver's oid arm (above) is a format-only pass-through — it cannot
+ * probe the object — so `/commits?sha=<unknown 40-hex>` used to slip past
+ * the null arm into `listLog`, which answered an EMPTY page with 200 where
+ * upstream GetAllCommits' GetCommit miss is the APIErrorNotFound 404
+ * (routers/api/v1/repo/commits.go:211-216). This wrapper adds the one
+ * cheap probe the oid arm owes: an oid-shaped ref that readCommit cannot
+ * resolve reads as null, exactly like a failed branch/tag lookup. Named
+ * refs keep the sync path (the tips map already proves their existence —
+ * no extra RPC). Single-commit reads do not need this: their readCommit
+ * null-check IS the probe (review flag, the unknown-40-hex residual).
+ */
+export async function resolveListStartRef(
+  reads: Pick<EngineReads, "listRefs" | "readCommit">,
+  ref: string,
+): Promise<{ ref: string; target: string } | null> {
+  const resolved = resolveNamedRef(refTipMap(await reads.listRefs()), ref);
+  if (resolved === null) return null;
+  if (resolved.ref === ref && isFullObjectId(ref)) {
+    const probe = await reads.readCommit(ref);
+    if (probe === null) return null;
+  }
+  return resolved;
 }
 
 // ---------------------------------------------------------------------------
