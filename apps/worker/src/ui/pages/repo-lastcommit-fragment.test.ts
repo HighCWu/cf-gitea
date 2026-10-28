@@ -9,17 +9,30 @@
  * touches app.ts, commit 2 the README, commit 1 everything else), which is
  * the whole point of the per-entry commit-info loader: the batched walk must
  * attribute each path to its own newest commit, not the tip.
+ *
+ * The A10-L adoption witness arm (the final describe) is stub-driven — the
+ * render.test.tsx A10-L block's harness — because the real fixture cannot
+ * observe RPC counts: it pins ONE listTreeCommits replacing the per-path
+ * listLog fan (logCalls 0 in the common case), the treePath slot riding
+ * paths[0], and the degrade semantics (null/unavailable/throwing batches
+ * fall back to the legacy fan; index gaps ride their own listLog; identical
+ * rows either way).
  */
 
 import { env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 
+import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
+
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
+import type { EngineClient } from "../engine";
+import { ENRICH_MAX } from "../page-data";
 import {
   lastCommitFragmentHtml,
   lastCommitFragmentResponse,
   loadLastCommitFragment,
+  loadLastCommitFragmentFrom,
   parseLastCommitTail,
   parseRefSubUrl,
   type LastCommitFragmentData,
@@ -281,5 +294,212 @@ describe("lastCommitFragmentHtml + lastCommitFragmentResponse", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
     expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+  });
+});
+
+// --- the A10-L adoption witness (stub-driven, the render.test.tsx harness) -----
+
+/**
+ * The fragment loader's A10-L witness — render.test.tsx's A10-L block twin on
+ * the fragment seam (`loadLastCommitFragmentFrom` + counting EngineClient
+ * stubs): the per-path listLog fan is GONE in the common case (ONE
+ * listTreeCommits carrying the ENRICH_MAX path set, treePath slot first),
+ * and the degrade semantics match the established consumer (page-data.ts
+ * enrichTreeCommits) exactly. The real-fixture describes above prove the
+ * rendered output is unchanged end to end; these pins prove the RPC shape.
+ */
+
+function makeCommit(subject: string, oid: string): CommitJson {
+  return {
+    oid,
+    tree: "1".repeat(40),
+    parents: [],
+    author: { name: "Test User", email: "test@example.com", time: 1700000000, tz: "+0000" },
+    committer: { name: "Test User", email: "test@example.com", time: 1700000000, tz: "+0000" },
+    subject,
+    message: `${subject}\n`,
+  };
+}
+
+function entry(name: string, overrides: Partial<TreeEntryJson> = {}): TreeEntryJson {
+  return { name, mode: "100644", type: "blob", oid: "2".repeat(40), size: 10, ...overrides };
+}
+
+/** Counting stub client (render.test.tsx's stubEngine shape): records listLog
+ *  paths + batch path sets, serves canned answers. The base `listTreeCommits`
+ *  answers every path with the batch commit (the success posture); the
+ *  degradation tests override it. */
+function stubClient(
+  overrides: Partial<EngineClient> = {},
+  onListLog?: (path: string | undefined) => void,
+  onBatch?: (paths: string[]) => void,
+): EngineClient {
+  const head = makeCommit("head subject", "a".repeat(40));
+  const batchCommit = makeCommit("batch subject", "b".repeat(40));
+  return {
+    listRefs: () => Promise.resolve({ head: "refs/heads/main", refs: [] }),
+    readCommit: () => Promise.resolve(head),
+    listLog: (_ref, opts) => {
+      onListLog?.(opts?.path);
+      return Promise.resolve({ commits: [head], more: false });
+    },
+    listTree: (_ref, path) =>
+      Promise.resolve({
+        oid: "3".repeat(40),
+        entries: path === "docs" ? [entry("guide.md")] : [entry("README.md", { size: 20 }), entry("app.ts", { size: 30 })],
+      }),
+    readBlob: () => Promise.resolve(null),
+    listTreeCommits: (_ref, paths) => {
+      onBatch?.(paths ?? []);
+      return Promise.resolve({ commits: (paths ?? []).map(() => batchCommit) });
+    },
+    ...overrides,
+  };
+}
+
+function rowSummary(data: LastCommitFragmentData): [string, string | null][] {
+  return data.rows.map((row) => [row.entry.name, row.commit?.oid ?? null]);
+}
+
+describe("loadLastCommitFragmentFrom — the A10-L adoption witness", () => {
+  it("pays exactly ONE listTreeCommits and ZERO listLog when the batch answers (the A10-L witness)", async () => {
+    const batchCalls: string[][] = [];
+    const logPaths: (string | undefined)[] = [];
+    const engine = stubClient(
+      {
+        listTreeCommits: (_ref, paths) => {
+          batchCalls.push([...(paths ?? [])]);
+          return Promise.resolve({ commits: (paths ?? []).map(() => makeCommit("batch subject", "b".repeat(40))) });
+        },
+        listLog: (_ref, opts) => {
+          logPaths.push(opts?.path);
+          return Promise.resolve(null);
+        },
+      },
+    );
+    const data = expectData(await loadLastCommitFragmentFrom(engine, FRAG_REPO, "a".repeat(40), "", "branch/main"));
+    expect(batchCalls).toHaveLength(1);
+    expect(batchCalls[0]).toEqual(["README.md", "app.ts"]); // entry-order root paths
+    expect(logPaths).toHaveLength(0); // the fan is gone on the answered path
+    // Identical rendered posture: rows carry the batch's commits, the root
+    // listing's header box still the read commit itself.
+    const html = lastCommitFragmentHtml(data, "/alice/lastcommit-frag");
+    expect(html).toContain("batch subject");
+    expect(html).toContain("head subject");
+    expect(rowSummary(data)).toEqual([
+      ["README.md", "b".repeat(40)],
+      ["app.ts", "b".repeat(40)],
+    ]);
+    expect(data.treeLastCommit?.oid).toBe("a".repeat(40));
+  });
+
+  it("carries the treePath slot FIRST in the batch for a sub-directory listing", async () => {
+    const batchCalls: string[][] = [];
+    let logCalls = 0;
+    const treeCommit = makeCommit("tree slot", "c".repeat(40));
+    const engine = stubClient(
+      {
+        listTreeCommits: (_ref, paths) => {
+          batchCalls.push([...(paths ?? [])]);
+          const commits = (paths ?? []).map((_p, i) => (i === 0 ? treeCommit : makeCommit("entry slot", "d".repeat(40))));
+          return Promise.resolve({ commits });
+        },
+        listLog: () => {
+          logCalls++;
+          return Promise.resolve(null);
+        },
+      },
+    );
+    const data = expectData(await loadLastCommitFragmentFrom(engine, FRAG_REPO, "a".repeat(40), "docs", "branch/main"));
+    expect(batchCalls).toHaveLength(1);
+    expect(batchCalls[0]).toEqual(["docs", "docs/guide.md"]); // the tree slot rides paths[0]
+    expect(logCalls).toBe(0);
+    expect(data.treeLastCommit?.oid).toBe("c".repeat(40)); // slot 0 = the treePath's own commit
+    expect(rowSummary(data)).toEqual([["guide.md", "d".repeat(40)]]);
+  });
+
+  it("degrades a null / unavailable batch to the legacy fan with IDENTICAL rows", async () => {
+    // (a) the batch resolves null (transport failure) — every budgeted path
+    //     rides the 8-wide listLog fan, answering the same rows the batch arm
+    //     produced above
+    const logPaths: (string | undefined)[] = [];
+    const engineA = stubClient({ listTreeCommits: () => Promise.resolve(null) }, (path) => logPaths.push(path));
+    const dataA = expectData(await loadLastCommitFragmentFrom(engineA, FRAG_REPO, "a".repeat(40), "", "branch/main"));
+    expect(logPaths).toEqual(["README.md", "app.ts"]); // exactly the budgeted path set
+    expect(rowSummary(dataA)).toEqual([
+      ["README.md", "a".repeat(40)],
+      ["app.ts", "a".repeat(40)],
+    ]);
+    // (b) the batch method is ABSENT (an old boundary / stub) — the presence
+    //     guard takes the same fallback without touching the missing method
+    const engineB = stubClient();
+    delete (engineB as Partial<EngineClient>).listTreeCommits;
+    const dataB = expectData(await loadLastCommitFragmentFrom(engineB, FRAG_REPO, "a".repeat(40), "", "branch/main"));
+    expect(rowSummary(dataB)).toEqual(rowSummary(dataA));
+  });
+
+  it("degrades a throwing batch to the fan; a throwing fan entry degrades to null", async () => {
+    // Same null-degrade semantics as the established consumer: never a
+    // rejection, so one failed entry cannot sink the fragment — the batch
+    // falls back to the fan, and the fan's own failed entry lands null.
+    const engine = stubClient({
+      listTreeCommits: () => Promise.reject(new Error("transport")),
+      listLog: (_ref, opts) =>
+        opts?.path === "app.ts"
+          ? Promise.reject(new Error("entry transport"))
+          : Promise.resolve({ commits: [makeCommit("ok", "4".repeat(40))], more: false }),
+    });
+    const data = expectData(await loadLastCommitFragmentFrom(engine, FRAG_REPO, "a".repeat(40), "", "branch/main"));
+    expect(rowSummary(data)).toEqual([
+      ["README.md", "4".repeat(40)],
+      ["app.ts", null], // the failed fan entry → the .notready cell
+    ]);
+    expect(lastCommitFragmentHtml(data, "/alice/lastcommit-frag")).toContain("notready");
+  });
+
+  it("an index-gap slot rides exactly the missed path's own listLog call", async () => {
+    const c1 = makeCommit("one", "1".repeat(40));
+    const fanCommit = makeCommit("fanned", "5".repeat(40));
+    const logPaths: (string | undefined)[] = [];
+    const engine = stubClient({
+      listTreeCommits: () => Promise.resolve({ commits: [c1] }), // slot 1 missing
+      listLog: (_ref, opts) => {
+        logPaths.push(opts?.path);
+        return Promise.resolve({ commits: [fanCommit], more: false });
+      },
+    });
+    const data = expectData(await loadLastCommitFragmentFrom(engine, FRAG_REPO, "a".repeat(40), "", "branch/main"));
+    expect(logPaths).toEqual(["app.ts"]); // exactly the missed slot fanned
+    expect(rowSummary(data)).toEqual([
+      ["README.md", "1".repeat(40)],
+      ["app.ts", "5".repeat(40)],
+    ]);
+  });
+
+  it("caps the ONE batch call at ENRICH_MAX paths; past-budget rows stay notready without RPCs", async () => {
+    const entries = Array.from({ length: 32 }, (_unused, i) => entry(`f-${String(i).padStart(2, "0")}.txt`));
+    const batchCalls: string[][] = [];
+    let logCalls = 0;
+    const engine = stubClient(
+      {
+        listTree: () => Promise.resolve({ oid: "3".repeat(40), entries }),
+        listTreeCommits: (_ref, paths) => {
+          batchCalls.push([...(paths ?? [])]);
+          return Promise.resolve({ commits: (paths ?? []).map(() => makeCommit("batch subject", "b".repeat(40))) });
+        },
+        listLog: () => {
+          logCalls++;
+          return Promise.resolve(null);
+        },
+      },
+    );
+    const data = expectData(await loadLastCommitFragmentFrom(engine, FRAG_REPO, "a".repeat(40), "", "branch/main"));
+    expect(batchCalls).toHaveLength(1);
+    expect(batchCalls[0]).toHaveLength(ENRICH_MAX); // the budget bounds the RPC's paths
+    expect(logCalls).toBe(0);
+    expect(data.rows).toHaveLength(32);
+    for (const row of data.rows.slice(0, ENRICH_MAX)) expect(row.commit?.oid).toBe("b".repeat(40));
+    for (const row of data.rows.slice(ENRICH_MAX)) expect(row.commit).toBeNull(); // f-30, f-31
+    expect(lastCommitFragmentHtml(data, "/alice/lastcommit-wide").match(/notready/g)).toHaveLength(2);
   });
 });

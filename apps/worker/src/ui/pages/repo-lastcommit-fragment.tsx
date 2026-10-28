@@ -44,14 +44,19 @@
  *   documented).
  * - BIG LISTS: upstream's ≥70-paths arm drops the pathspec entirely and
  *   attributes per-path last commits from one pathspec-free walk
- *   (log_name_status.go:26-35). Our boundary has no batched
- *   last-commit-per-path RPC (§3.5's `listTreeCommits` still absent —
- *   page-data.ts's note): each path costs one `listLog(ref, {path, n:1})`,
- *   so the loader pays ONE readCommit + ONE listTree + at most N+1 listLog
- *   RPCs, issued 8-wide against the same DO (the commit-contained-refs.ts
- *   batching convention: polite concurrency on one cell, DO RPC wait is not
- *   CPU). Honest N+ posture: linear in the path universe where upstream's
- *   single process is not — the same class the tree-list BFS documented.
+ *   (log_name_status.go:26-35). Our answer is the boundary's batched
+ *   `listTreeCommits(ref, paths)` RPC (the audit A10-L closure, wired on
+ *   the EngineClient — ui/engine.ts): ONE same-DO walk answers the whole
+ *   ENRICH_MAX-bounded path set with an INDEX-ALIGNED commit per path,
+ *   per-path equal to the path's own `listLog` page (a null slot is the
+ *   walk budget's empty-page answer), the treePath slot riding FIRST
+ *   (commit_info.go's entryNames order preserved). The legacy per-path
+ *   `listLog(ref, {path, n:1})` fan — 8-wide against the same DO, the
+ *   commit-contained-refs.ts batching convention (polite concurrency on
+ *   one cell, DO RPC wait is not CPU) — remains the documented fallback:
+ *   a batch that is unavailable (an old boundary / stub), resolves null,
+ *   throws, or leaves an index gap sends exactly the unanswered paths
+ *   back through it, into the same `.notready` cells.
  * - WALK BOUND: each path-filtered walk is capped engine-side
  *   (PATH_LOG_SCAN = 2000 scanned commits, packages/git-engine/src/repo.ts:
  *   123/1535); a path untouched within that window resolves null → the
@@ -142,15 +147,17 @@
  *
  * ## Cost posture (honest, per request)
  *
- * 1 readCommit + 1 listTree + at most (1 + N) `listLog` RPCs (the tree's own
- * slot rides paths[0] when treePath ≠ ""), 8-wide batches, wall-time free
- * (DO RPC wait is not CPU). Upstream pays one git process for the same
- * answer (plus one ls-tree). Entries beyond the shared ENRICH_MAX budget
- * (page-data.ts §3.5 — the 50-subrequest ceiling) skip their RPC and render
- * `.notready`.
+ * 1 readCommit + 1 listTree + ONE `listTreeCommits` RPC in the common case —
+ * the batch carries the whole ENRICH_MAX path set, the tree's own slot
+ * riding paths[0] when treePath ≠ "". Only a degraded batch (unavailable /
+ * null / thrown / index gaps) re-opens the legacy `listLog` fan — at most
+ * (1 + N) calls, 8-wide, wall-time free (DO RPC wait is not CPU). Upstream
+ * pays one git process for the same answer (plus one ls-tree). Entries
+ * beyond the shared ENRICH_MAX budget (page-data.ts §3.5 — the
+ * 50-subrequest ceiling) never reach the engine and render `.notready`.
  *
- * ## HANDOFF — the route (a later index.ts window; this wave is
- * index.ts-sibling-held)
+ * ## The route (landed in index.ts's wave-46 window — this doc's mapping,
+ * realized verbatim by the `lastCommitFragment` handler)
  *
  * The route arm maps onto this module as: parser arm `lastcommit` (the
  * `/{owner}/{repo}/lastcommit/*` family, GET, beside the wave-39 aux
@@ -171,7 +178,7 @@
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
 
-import { engineReads } from "../../api/services/engine";
+import { engineClient, type EngineClient } from "../engine";
 import { RepoFilesTable } from "../components/file-list";
 import { ENRICH_MAX } from "../page-data";
 import { renderToString } from "hono/jsx/dom/server";
@@ -222,8 +229,9 @@ export interface LastCommitFragmentData {
  *  commit-contained-refs COMMIT_SHA convention). */
 const COMMIT_SHA = /^[0-9a-f]{7,64}$/i;
 
-/** mergeBase batches per DO round-trip group — the batching convention
- *  (commit-contained-refs.ts), applied to the per-path listLog walk. */
+/** The legacy fallback fan's per-DO round-trip group — the batching
+ *  convention (commit-contained-refs.ts), kept on the degraded path only
+ *  (the A10-L batch needs no grouping: one call, one walk). */
 const LASTCOMMIT_BATCH = 8;
 
 /**
@@ -261,25 +269,26 @@ export function parseRefSubUrl(raw: string, commitRef: string): LastCommitLinkCo
 }
 
 /**
- * Load one directory's commit-info listing (the GetCommitsInfo port — see
- * the module doc for the knob-by-knob mapping). `null` = the 404 family:
- * the empty repo (RepoRefByType's early return leaves upstream's Commit nil),
- * a wrong-shape or unresolvable sha (readCommit null — short prefixes fail
- * here: the full-oid divergence), a treePath that resolves to nothing
- * (HandleGitError's tree_path_not_found arm), or a failed read.
+ * Load one directory's commit-info listing through the shared EngineClient
+ * (the GetCommitsInfo port — see the module doc for the knob-by-knob
+ * mapping). `null` = the 404 family: the empty repo (RepoRefByType's early
+ * return leaves upstream's Commit nil), a wrong-shape or unresolvable sha
+ * (readCommit null — short prefixes fail here: the full-oid divergence), a
+ * treePath that resolves to nothing (HandleGitError's tree_path_not_found
+ * arm), or a failed read. The engine-first seam the tests (and a future
+ * engine-passing caller) inject counting clients through.
  */
-export async function loadLastCommitFragment(
-  env: Env,
+export async function loadLastCommitFragmentFrom(
+  engine: EngineClient,
   repo: LastCommitRepo,
   commitRef: string,
   treePath: string,
   refSubUrl: string,
 ): Promise<LastCommitFragmentData | null> {
   if (repo.isEmpty) return null; // RepoRefByType's empty arm (repo.go:930-944)
-  const reads = engineReads(env, repo);
-  const commit = await reads.readCommit(commitRef);
+  const commit = await engine.readCommit(commitRef);
   if (commit === null) return null; // GetCommit's failure arm (the 404 class)
-  const tree = await reads.listTree(commitRef, treePath);
+  const tree = await engine.listTree(commitRef, treePath);
   if (tree === null) return null; // SubTree/ListEntries → tree_path_not_found
 
   // view.go:292 CustomSort(base.NaturalSortCompare) — Entries.CustomSort's
@@ -303,18 +312,45 @@ export async function loadLastCommitFragment(
     paths.push(treePath === "" ? entry.name : `${treePath}/${entry.name}`);
   }
 
-  // One listLog(ref, {path, n:1}) per path — the newest commit whose tree
-  // changed that path (the module doc's N+ posture), 8-wide batches;
-  // anything past the shared budget (or the engine's walk cap, or a failed
-  // RPC) stays null → the .notready cell.
-  const resolved: (CommitJson | null)[] = new Array<CommitJson | null>(paths.length).fill(null);
+  // The batched answer (A10-L): ONE same-DO walk for the whole budgeted
+  // path set, index-aligned with `paths` (per-path equal to the path's own
+  // listLog page — a null slot is the walk budget's empty-page answer, the
+  // `.notready` cell). The presence guard + catch degrade to the legacy fan
+  // on a boundary that predates the RPC (a stub without the method throws
+  // synchronously) or a transport failure, exactly like the established
+  // consumer (page-data.ts enrichTreeCommits); the slice keeps the engine's
+  // over-budget throw out of reach (TREE_COMMITS_MAX_PATHS ≫ ENRICH_MAX).
   const budgeted = Math.min(paths.length, ENRICH_MAX);
-  for (let i = 0; i < budgeted; i += LASTCOMMIT_BATCH) {
-    const end = Math.min(i + LASTCOMMIT_BATCH, budgeted); // never past the budget
+  const batch = engine.listTreeCommits
+    ? await engine.listTreeCommits(commitRef, paths.slice(0, budgeted)).catch(() => null)
+    : null;
+
+  // Slots the batch left unanswered (index gaps — never expected from the
+  // current engine, whose aligned slots cover the whole input) — or, when
+  // the batch degraded wholesale, every budgeted slot — ride the legacy
+  // per-path fan: 8-wide same-DO `listLog(ref, {path, ofs: 0, n: 1})`
+  // roundtrips, each null-degrading (never a rejection, so one failed
+  // entry cannot sink the fragment) into the same `.notready` cell.
+  const resolved: (CommitJson | null)[] = new Array<CommitJson | null>(paths.length).fill(null);
+  const fanSlots: number[] = [];
+  if (batch === null) {
+    for (let slot = 0; slot < budgeted; slot++) fanSlots.push(slot);
+  } else {
+    for (let slot = 0; slot < budgeted; slot++) {
+      const answered = batch.commits[slot];
+      if (answered === undefined) fanSlots.push(slot);
+      else resolved[slot] = answered;
+    }
+  }
+  for (let i = 0; i < fanSlots.length; i += LASTCOMMIT_BATCH) {
     await Promise.all(
-      paths.slice(i, end).map(async (path, offset) => {
-        const log = await reads.listLog(commitRef, { path, ofs: 0, n: 1 });
-        resolved[i + offset] = log?.commits[0] ?? null;
+      fanSlots.slice(i, i + LASTCOMMIT_BATCH).map(async (slot) => {
+        try {
+          const log = await engine.listLog(commitRef, { path: paths[slot], ofs: 0, n: 1 });
+          resolved[slot] = log?.commits[0] ?? null;
+        } catch {
+          resolved[slot] = null; // degraded → the .notready cell
+        }
       }),
     );
   }
@@ -334,6 +370,29 @@ export async function loadLastCommitFragment(
     treeLastCommit,
     link: parseRefSubUrl(refSubUrl, commitRef),
   };
+}
+
+/**
+ * The route-shaped wrapper (the index.ts lastcommit handler's calling
+ * convention: env + the resolved D1 row): builds the shared EngineClient
+ * over the RESOLVED row's combined name (the ui/engine.ts addressing
+ * convention — /ALICE/hello and /alice/hello reach the same cell) and
+ * delegates to loadLastCommitFragmentFrom.
+ */
+export async function loadLastCommitFragment(
+  env: Env,
+  repo: LastCommitRepo,
+  commitRef: string,
+  treePath: string,
+  refSubUrl: string,
+): Promise<LastCommitFragmentData | null> {
+  return loadLastCommitFragmentFrom(
+    engineClient(env, `${repo.ownerNamespace}/${repo.slug}`),
+    repo,
+    commitRef,
+    treePath,
+    refSubUrl,
+  );
 }
 
 /**
