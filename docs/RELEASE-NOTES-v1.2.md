@@ -577,3 +577,174 @@ discriminator, `scripts/deploy-probes.mjs`). §4 re-check: no line retired —
 0036 is index-only (the 65-table count stands; 0036 and 0037 ride RD24),
 `check-openapi` PASS at `b04a465` keeps the 64-op FEATURE-ABSENT ceiling
 intact, and the ws1009 residuals line stands as written.
+
+**Appended 2026-10-28 (HEAD `98eb3f6`) — the sixth addendum: the post-ledger
+mega-window, four waves deep.** The fifth addendum pre-drafted its wave
+before the deploy froze; the window it pointed at then landed whole — **56
+commits, `af1a14a` → `98eb3f6`, 2026-10-28 10:03 – 13:27 +0800** (the delta
+after the fifth addendum's own commit `da78825`). Every hash below was
+re-verified against `git log` at append time; every number is quoted from
+its recording doc or commit, never re-measured.
+
+**The perf wave.** The hot-path query-shape audit (`e85dc1b`,
+`docs/research/query-shape-audit.md` — static and read-only, every claim
+citing `file:line`) ranked **10 N+1 loops** plus the re-fetch/over-fetch
+families into a 15-row fix queue, and the wave it seeded landed the same
+day, per the audit's dated Landing Status table (added `7be89c4`): the
+**S-grade collapse** `c614daa` (A1's label batch, A4/B2's dead-batch wire,
+A10's parallel tree walks); the **M-grade list batching** `fbd0826` (A2/A3/
+A6/B1 — page-independent render contexts, the two heaviest API lists'
+**92-242 roundtrips → 8-10**); the **A5 timeline** `42a07cf` (the mixed
+stream page-batched, **21 → 7 at seed**); **tier-2 preload adoption**
+`57794e7` (**13 more list surfaces** page-independent — both A7 comment
+lists); the **A8 feeds** `30284a6` (R+C per-row reads → two batched arms);
+the **A9 grant folding** `4dc7f54` (the fork-head grant fan folds into one
+batched resolution, **11 → 4 at four grant-bearing heads**; the single-call
+loop stays by design per the audit's caveat); and the **C2 + xml-C2 pair**
+(`6ad06be`, `f23fe6a` — the activity page's issue-title over-read and its
+feed-XML twin both consolidate onto the service, **rows_read 45 → 4,
+twice**). A10's L half stays open (below). Underneath it, migration **0036
+`fantastic_whirlwind`** (`b04a465`) laid **10 hot-path indexes** with the
+always-on **rows_read witness** in `bench-d1`: **reactions 250 → 6, the
+issues list page 480 → 30, subscriptions 200 → 3** (quoted from `b04a465`;
+EXPLAIN asserts the plan per shape). Migration **0037 `smart_blizzard`**
+(`7dc607f` — the fifth addendum's PENDING, now in tree) completed the RD24
+payload: **8 adds, 9 verified-dead drops**, and the wave's key finding —
+**8 of 15 drop candidates were VETOED by the new 15-shape battery** (the
+SQLite-prefers-the-prefix-twin redundancy analysis was empirically wrong:
+SQLite chose the narrow scalar and switched plans after the drop, failing
+the plans-UNCHANGED proof; all 8 stay with keep-notes; the dropped
+`deploy_keys_token_hash` re-adds with the git-HTTP deploy-token arm). The
+durable method record and the wave ledger landed together (`af1a14a`:
+`docs/research/d1-index-engineering.md`,
+`docs/reviews/wave-131-landing-ledger.md` — the latter also reconciled
+RD23's battery arithmetic EXACTLY: nine standing batteries = 113 checks =
+112 passed + 1 audit item, and `a54c6adb` confirmed a deploy-version
+string, not a git object).
+
+**The engine wave.** **D3, the failed-publish lease fix** (`6545edd` — the
+state-transition table's divergence ledger found the gap): graceful publish
+error exits fell through the unconditional finally-deleteLease, destroying
+the expired-lease sweeper's only pointer to written-but-unpublished bytes;
+the published-flag guard now parks a failed round as compaction_in_flight
+exactly like a crashed holder, and the 10-min TTL sweep — not the round —
+converges the orphan (§5.3 checks 8 → 10, mutation-tested; SPEC-0011
+amended, the doc's D3 entry flipped FIXED). **PushEvent.origin**
+(`7079b59`): origin derived AT the emission site from receivePack's live
+request (http/s only; any parse failure degrades to undefined because the
+call site runs POST-finalize on an already-applied push that must never
+500) — and the new check found a REAL engine bug in the same block: the
+wrapper was `waitUntil(Promise.resolve(onPush(...)))`, which evaluates the
+hook BEFORE the promise wrap, so a SYNCHRONOUS throw escaped and, via
+receivePack's outer catch, turned an already-applied push into a 500,
+violating the hook's documented never-fail contract; now
+`Promise.resolve().then(() => onPush(...))` (mutation-witnessed
+500-vs-200). **The husk fix** (`ed0efed`) with its CORRECTED root cause —
+NOT an engine cursor leak: on the pinned miniflare-5-beta/workerd, EVERY
+`DROP TABLE` against a sqlite-DO database created by a PREVIOUS runtime
+session fails SQLITE_LOCKED, deterministically and forever; healthy cells
+just live and die inside one dev session, and purged husks are what LATER
+sessions' cleanups hit. The semantic fix treats a content-less cell
+(schema refused AND no refs + pack rows + loose objects) as no-op success
+200 with only idempotent side effects, never reaching the DROP;
+content-bearing cells still wipe (in-session DDL works) — and the runtime
+defect OUTLIVES the fix for them locally (the first DELETE after a dev
+restart still 500s; queue retries + the new DLQ backstop; NOTICE records
+it). The durable record is
+`docs/research/workerd-ddl-cross-session-locked.md` (`10d5d44` — the
+ws1009 house style: versions verified against the lockfile, a standalone
+~80-line miniflare-only repro syntax-checked but NOT executed, a 7-item
+could-not-verify ledger; **filing awaits the user's nod**, the #16515
+pattern). **A10-L** — the batched `listTreeCommits` engine RPC, the audit's
+one open L-half (the repo home's worst serial wall-clock fan) — is IN
+FLIGHT at append time.
+
+**The compatibility wave.** The **wiki family wired** (`466092c`): three
+write triggers (created/edited/deleted) fire upstream-faithful wiki
+deliveries through one service funnel (API routes and the UI writer emit
+identically) — **21/26 fully emitted, not-emitted-with-feature back to
+ZERO** (the bucket wave-api-wiki's silent landing had re-occupied). The
+**emissions completion** landed RECOVERED (`9ce2ffb`, provenance disclosed
+in the commit: the unit died at the quota reset mid-flight WITHOUT
+reporting; the orchestrator recovered the landing — tree verified coherent,
+tsc 0 across the workspace, 167/167 own-eyes across the five affected
+suites, the diff reviewed hunk-by-hunk): the issue-DELETE route now fires
+the action=deleted dual payloads (issue + PR arms), the branch-delete
+PR-close cascade's DEFERRED webhook fires exactly once per transitioned
+close, and the APP_URL/origin threading folds — the coverage doc caught up
+(`01c00bb`) at **23/26 fully emitted (88%), zero partial rows**, the
+remaining-work list down to housekeeping. That housekeeping then landed:
+the **fork delivery assertion + the full diff_hunk derivation**
+(`4e60408` — the coverage audit's last two tails: fork's forkee = the
+SOURCE repo asserted over webhook_deliveries rows, and `comments.patch`
+now captured at creation via upstream's cut + synthetic-fallback shape,
+with its documented limits), then **PATCH-assignee for issues**
+(`b433fb1` — the stale migration-0012-era rationale retired; the write
+core moved VERBATIM from pulls.ts onto the service seam, the emission
+inverted into an onAssignee callback preserving upstream's post-tx order)
+and the **t2 assignee dedupe** (`98eb3f6`, this addendum's HEAD — 256
+private tier-2 lines onto that seam carrying BOTH upstream shapes
+verbatim, routes 1846 → 1589, byte-equal emissions witnessed by the
+unmodified suites).
+
+**The release wave.** Going public: **LICENSE (MIT) + the root NOTICE**
+(`a5c4b01`); the **example-file graduation** (`0f73ad4` + `f72c697` — the
+AGENTS.md graduation trigger fired: `wrangler.jsonc` untracked and
+gitignored, `wrangler.jsonc.example` the committed template, all 7 CI jobs
+restore from it after checkout, the official Deploy-to-Cloudflare button
+mounted with the explicit self-host guarantee stated). The publish gate's
+two preconditions: the **pre-publish secret scan PUBLIC-SAFE** (`d218b80` —
+full object-database scan, 7419 objects / 2652 blobs, ~100 MB, **zero
+secrets in 720 commits**, both known incidents verified clean) and the
+**fresh-clone proof FRESH-CLONE-OK** (`7781596`) — whose arbitration found
+the scan's placeholder claim WRONG (pre-graduation history has carried the
+real database_id since `ab61b5a`; the placeholder comment lied from day
+one) and made the **acceptance decision: ACCEPTED** — the id is inert per
+AGENTS.md doctrine, and a scrub would invalidate every hash citation in
+the docs; the documentation IS the provenance (rationale appended to
+`docs/reviews/fresh-clone-proof-2026-10-28.md`). Onboarding: the
+**first-run bootstrap** (`515a594` — the zero-user admin install window,
+the empty-table check living IN the INSERT so concurrent first-submissions
+resolve to exactly one admin, plus the ALLOW_SIGNUP gate defaulting to the
+closed self-host posture; mounted `df1e362`) and **APP_URL automation**
+(`57d3382` — the request-origin fallback + the Deploy-button bindings
+metadata) completed by **PushEvent.origin consumption** (`800b180` — the
+appOrigin chain **var > event > request > default**, pinned at unit,
+emission, and adapter levels). Demo ops (SPEC-0014): **M0's repo-tasks
+DLQ** complete (`385f768` the handler half, `de486aa` config + dispatch —
+with the deploy note that the repo-tasks-dlq QUEUE must exist at deploy
+time) and **M1 mounted** (`5c59f1f` the DEMO_MODE gate + the 72 h sweep,
+invariant-first; `15e2b62` the scheduled dispatcher + the dlq kindLabel
+fold — M1 COMPLETE end-to-end); **M2 (banner + quotas) is in flight**. The
+**three harness hardenings** closed the e2e sweep's open issues: the
+mirror harness (`4073027` — checked DELETEs, the run interlock, the
+stale-state sweep, 93/0 three consecutive — and its guard then CAUGHT the
+husk class live, feeding the engine wave), ported to the **lfs + engine**
+harnesses (`37ec111` — abort loudly instead of poisoning silently; the
+engine harness deliberately skips the cell-file sweep, never owning its
+server). Bookkeeping around the waves: the RD23 evidence block drafted
+from the records + the RD24 fill-in template (`f9a63ec`), the audit's
+landing ledger + the submodule-flake note (`7be89c4`), the mirror sweep's
+resolution note (`23d5ab5`), the SPEC-ledger syncs (`aabb6ba`, `4556669`,
+`5c1b497`, `68b622b`, `b3911c4`, `322f666`), the M3 state-transition table
+regenerated from code (`321688b`), the mirror HEAD-adoption fix
+(`071f10b`), the branch-protection battery + its addressability fix
+(`e9f37f2` + `bd59bc4`), the slash tag names (`af92937`), and the
+dependency freshness census (`4d039cb`).
+
+**PENDING — the orchestrator finalizes these after the deploy freezes:**
+**RD24 itself** — its evidence block exists as the fill-in template
+(`f9a63ec`): the deploy version, healthz, **migrations 0036 +
+0037 applied remote** (the window's only schema change, both index-only —
+the 65-table count stands), the **battery verdicts** including the
+branch-protection battery — the toolkit's **11th, 18 arms** (`e9f37f2`'s
+17 checks + `bd59bc4`'s slash-glob arm) joining the standing census — and
+**THE DEPLOY DISCRIMINATOR `fw-org-member-preaccess` GREEN**: the
+fixwave-parity arm that read red in RD23's standing smoke (the 20/1) is
+expected green at RD24's formal run, and the block must state which run
+FIRST recorded it green (the wave-131 ledger's flagged §6 tension), plus
+the full-gate line at the final tree. **A10-L** and **M2** finalize when
+their units land. §4 re-check: no line retired — 0036/0037 are index-only
+(the 65-table count stands), `check:api` PASS at the HEAD (`98eb3f6`:
+78/78 + 129/129) keeps the 64-op FEATURE-ABSENT ceiling intact, and the
+ws1009 residuals line stands as written.

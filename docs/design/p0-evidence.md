@@ -3326,7 +3326,7 @@ __BLANK__):**
   `pnpm test:full` (ADR-0006 composite): __BLANK__; `pnpm typecheck`:
   __BLANK__; `pnpm lint`: __BLANK__; `check-openapi`: __BLANK__.
 - **Battery verdict (the standing batteries + the NEW branch-protection
-  battery — the toolkit's 11th, `e9f37f2`, 17 checks over the SPEC-0013
+  battery — the toolkit's 11th, `e9f37f2` + `bd59bc4`'s slash-glob arm, 18 checks over the SPEC-0013
   protection flows, verified from its committed `id:` census)**:
   __BLANK__ (paste per-battery lines; the battery total changes at this
   deploy — the 17 branch-protection checks join the standing census).
