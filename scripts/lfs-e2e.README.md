@@ -34,6 +34,70 @@ bash scripts/lfs-e2e.sh http://127.0.0.1:5173   # explicit base URL
 - Global git/git-lfs config changes (`git lfs install`) are sandboxed into the
   script's scratch `$HOME` — the developer's real config is never touched.
 
+## Run hygiene: interlock, checked deletes, stale-state guard
+
+Ported 2026-10-28 from `scripts/mirror-e2e.sh` (the sweep hardening; the
+mirror suite's run proved prior-run leftovers and interleaved invocations
+read as PRODUCT failures). Four behaviors, all in `scripts/lfs-e2e.sh`:
+
+1. **Concurrent-run interlock.** At startup the suite takes
+   `apps/worker/.wrangler/state/lfs-e2e-run.lock` (an atomic `mkdir`, holding
+   the runner pid — its OWN path, beside the other harnesses' locks). A
+   second concurrent invocation fails immediately ("another lfs-e2e run is
+   in flight") instead of interleaving two runs on the shared `lfse2e`
+   namespace, the local D1/R2 state, and the dev-server port. A lock left by
+   a SIGKILLed run is reclaimed automatically when its holder pid is gone;
+   if you ever need to force-clear while no run is active:
+   `rm -rf apps/worker/.wrangler/state/lfs-e2e-run.lock`.
+2. **Every setup/cleanup DELETE is checked.** Every pre-clean/cleanup D1
+   statement runs through `d1_checked` (wrangler's exit code and its
+   `success` flag asserted — the plain `d1()` discarded both, which is how a
+   failed pre-clean passed silently in the mirror suite's sweep), the
+   wrong-scope PAT INSERT is checked too, and the pre-clean engine DELETE of
+   `lfse2e/lfsdemo` must answer `200` (a stale cell existed and was purged —
+   logged) or `404` (nothing under that name); anything else — a locked-cell
+   500, a worker restarting mid-request (`curl 000`), a bad token — aborts
+   the run naming the resource and code.
+3. **Absence is verified, not assumed.** A `200` can precede an async cell
+   purge that is still in flight (or was dropped), so the name is polled on
+   the git surface (`GET /lfse2e/lfsdemo.git/info/refs?service=git-upload-pack`)
+   until it reads `404` — the D1 rows are gone by then, so this answers
+   through the registry-existence oracle: a registry-known orphan serves
+   refs (`200`), clean state `404`s. The cleanup mirrors the same
+   verified-purge poll before declaring a green run tidy (while the PAT is
+   still valid).
+4. **Stale prior-run state is wiped and re-verified, not trusted.** At setup
+   the suite counts what it owns (`repositories`/`users` rows under
+   `lfse2e`), wipes it with the checked deletes (including the per-repo
+   `lfs_objects` sweep), and re-verifies the wipe before section 1 — so a
+   crashed or sabotaged run's leftovers cannot poison the next one.
+
+### Pre-server cell-file sweep (own-server runs only)
+
+The mirror suite's product finding applies here too: a completed async cell
+purge can leave the cell's sqlite file behind as an empty husk, and a later
+engine DELETE of that name answers `HTTP 500 — database table is locked:
+SQLITE_LOCKED`, deterministically, across dev-server restarts. When the
+suite starts its OWN dev server (the default `pnpm test:lfs` flow — no
+server answering at `$BASE`), it first removes ONLY the cell files whose
+embedded DO name is under `lfse2e/` — never another suite's cells
+(`demo/*`, `mirrore2e/*`, `dpprobe/*`) — making back-to-back green runs
+self-sufficient. Requires `sqlite3` (GitHub's ubuntu-latest ships it);
+without it the sweep is skipped with a note and the checked DELETEs still
+abort loudly on an unwipeable cell. When a server ALREADY answers at
+`$BASE` the suite reuses it (documented behavior) and the sweep is SKIPPED
+with a note — removing cell files under a live server is what produces the
+locked cells in the first place (`scripts/mirror-e2e.README.md` §
+stale-state recovery); on that path an unwipeable husk aborts pre-clean
+with the recovery pointer. Manual recovery (no dev server may be running):
+
+```bash
+for f in apps/worker/.wrangler/state/v3/do/cf-gitea-RepoCell/*.sqlite; do
+  n=$(sqlite3 "file:$f?mode=ro" "SELECT name FROM __miniflare_do_name LIMIT 1" 2>/dev/null)
+  case "$n" in lfse2e/*) rm -f "$f" "$f-wal" "$f-shm";; esac
+done
+```
+
 ## What is asserted
 
 1. **D1-backed repo via push-create** — a plain first push with the PAT lands

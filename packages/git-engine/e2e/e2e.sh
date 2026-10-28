@@ -7,15 +7,62 @@
 # "devtoken" (provide it via .dev.vars as GIT_TOKEN). Wired into CI as the
 # `e2e` job (.github/workflows/ci.yml) — see e2e/README.md for the wiring and
 # the permanently-by-design failing sections (the documented allowlist).
+#
+# Run hygiene (2026-10-28 hardening, ported from scripts/mirror-e2e.sh — see
+# e2e/README.md § run hygiene; structural deviations are recorded in
+# NOTICE.md): a concurrent-run interlock (its OWN lock path), CHECKED
+# pre-clean/teardown DELETEs (a non-200/404 engine DELETE aborts the run
+# naming the repo), and a stale-state guard over the suite's fixed namespace
+# (demo/demo, demo/private-repo, demo/old-date-repo): prior-run state is
+# wiped and every wipe re-verified on the git surface (registry-existence
+# oracle: a registry-known orphan serves refs → 200, clean state → 404)
+# before section 1.
 BASE=${1:-http://127.0.0.1:8787}
 TOKEN=${2:-devtoken}
 HOSTPORT=${BASE#http://}; HOSTPORT=${HOSTPORT#https://}
 AUTH_BASE=$(echo "$BASE" | sed "s|://|://x:$TOKEN@|")
+ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 DIR=$(mktemp -d /tmp/cgit-e2e.XXXXXX)
+LOCK_DIR=""
+LOCK_HELD=""
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 check() { if [ "$1" = "$2" ]; then ok "$3"; else fail "$3 (got '$1' want '$2')"; fi }
+fatal() { echo "FATAL: $1"; exit 1; }
+
+cleanup() {
+  # Runs from the EXIT trap (registered before the run lock is taken, so even
+  # a preflight fatal never leaks the lock; a SIGKILLed run leaves the lock to
+  # be reclaimed by holder-pid liveness).
+  if [ -n "$LOCK_HELD" ]; then rm -rf "$LOCK_DIR" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
+
+# --- concurrent-run interlock --------------------------------------------------
+# Two concurrent invocations share the dev server's registry/DO cells under
+# this suite's fixed `demo` owner segment (force pushes, deletes and the
+# section-13 teardown interleave and read as product failures). Ported from
+# scripts/mirror-e2e.sh (2026-10-28): mkdir is the atomic test-and-set; the
+# pid file lets a crashed run's lock be reclaimed automatically instead of
+# wedging the suite. Own lock path, alongside the other harnesses' locks.
+LOCK_DIR="$ROOT/apps/worker/.wrangler/state/engine-e2e-run.lock"
+mkdir -p "$(dirname "$LOCK_DIR")"
+if mkdir "$LOCK_DIR" 2>/dev/null; then
+  LOCK_HELD=1
+  echo $$ > "$LOCK_DIR/pid"
+else
+  LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+  if [ -n "$LOCK_PID" ] && ! kill -0 "$LOCK_PID" 2>/dev/null; then
+    echo "== reclaiming stale run lock (holder pid $LOCK_PID is gone) =="
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || fatal "cannot reclaim the run lock $LOCK_DIR"
+    LOCK_HELD=1
+    echo $$ > "$LOCK_DIR/pid"
+  else
+    fatal "another engine e2e run is in flight (lock $LOCK_DIR held by pid ${LOCK_PID:-unknown}) — wait for it to finish; if no run is active: rm -rf $LOCK_DIR"
+  fi
+fi
 
 cd "$DIR"
 export GIT_TERMINAL_PROMPT=0
@@ -50,9 +97,35 @@ git tag lightweight-tag
 for i in 1 2 3 4 5; do echo "line $i" >> docs/guide.txt; git add -A; git commit -qm "guide update $i"; done
 cd "$DIR"
 
-# clean slate for repeat runs
-curl -s -o /dev/null -X DELETE -u "x:$TOKEN" "$BASE/demo"
-curl -s -o /dev/null -X DELETE -u "x:$TOKEN" "$BASE/private-repo"
+# clean slate for repeat runs — CHECKED + VERIFIED (2026-10-28 hardening,
+# ported from scripts/mirror-e2e.sh): the suite owns the fixed names under
+# its owner segment (demo, private-repo, old-date-repo — green runs leave
+# demo and old-date-repo behind by design; a crashed run can leave any of
+# the three), and a stale repo would non-fast-forward the fresh pushes.
+# 200 = a stale repo existed and was purged (logged), 404 = nothing was
+# there — anything else (a locked cell, a worker restarting mid-request,
+# curl 000, a bad token) aborts the run naming the repo.
+for repo in demo private-repo old-date-repo; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -u "x:$TOKEN" "$BASE/$repo" 2>/dev/null)
+  case "$code" in
+    200) echo "  .. wiped stale $repo (engine DELETE 200)";;
+    404) ;;
+    *) fatal "pre-clean engine DELETE $repo returned HTTP ${code:-none} (want 200 or 404) — a stale repo that cannot be wiped poisons the whole run. A 500 (SQLITE_LOCKED) is a purged cell's husk file: stop the dev server, then clear THIS suite's own cell files per packages/git-engine/e2e/README.md (§ run hygiene, stale-state recovery) and re-run";;
+  esac
+done
+# Trust only VERIFIED absence: each name is polled on the git surface until
+# it reads 404 (the registry-existence oracle: a registry-known orphan
+# serves refs → 200, clean state → 404) before section 1.
+for repo in demo private-repo old-date-repo; do
+  code=""
+  for _ in $(seq 1 10); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -u "x:$TOKEN" "$BASE/$repo.git/info/refs?service=git-upload-pack" 2>/dev/null)
+    [ "$code" = "404" ] && break
+    sleep 1
+  done
+  [ "$code" = "404" ] || fatal "stale repo $repo still serves refs after its DELETE (last HTTP ${code:-none})"
+done
+echo "  .. pre-clean verified absent: demo private-repo old-date-repo"
 
 echo "== 1. push =="
 (cd src && $GITC push -q "$AUTH_BASE/demo.git" main --tags); check $? 0 "initial push"
@@ -148,7 +221,10 @@ echo "== 11. config: description/section/owner + registry idle from commit date 
 curl -s -X PUT -u "x:$TOKEN" -d '{"description":"a lovely demo","section":"experiments","owner":"divy"}' "$BASE/demo/config" > /dev/null
 # a repo whose only commit is dated 2010: its index "Updated" age must track that
 # commit's committer date, not the push time (idle = latest commit time)
-curl -s -o /dev/null -X DELETE -u "x:$TOKEN" "$BASE/old-date-repo"
+# CHECKED re-clean (hardening): the pre-clean already swept this name; a
+# non-200/404 answer here means the engine DELETE surface broke mid-run.
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -u "x:$TOKEN" "$BASE/old-date-repo" 2>/dev/null)
+case "$code" in 200|404) ;; *) fatal "engine DELETE old-date-repo returned HTTP ${code:-none} (want 200 or 404)";; esac
 git init -q -b main olddate && (cd olddate && git config user.email o@o && git config user.name o \
   && echo old > o.txt && git add -A \
   && GIT_AUTHOR_DATE="2010-06-15T12:00:00" GIT_COMMITTER_DATE="2010-06-15T12:00:00" git commit -qm "ancient commit" \
@@ -169,8 +245,24 @@ $GITC clone -q "$AUTH_BASE/private-repo.git" priv-auth 2>/dev/null; check $? 0 "
 curl -s "$BASE/" | grep -q "private-repo"; check $? 1 "private repo hidden from index"
 
 echo "== 13. delete repo =="
-check "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -u "x:$TOKEN" "$BASE/private-repo")" "200" "DELETE repo"
-check "$(curl -s -o /dev/null -w '%{http_code}' -u "x:$TOKEN" "$BASE/private-repo/")" "404" "deleted repo is 404"
+# CHECKED teardown (2026-10-28 hardening, ported from scripts/mirror-e2e.sh):
+# the suite's only state-teardown DELETE aborts loudly unless the engine
+# answers 200 — an unverified teardown is exactly the failure class the
+# hardening targets.
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -u "x:$TOKEN" "$BASE/private-repo" 2>/dev/null)
+[ "$code" = "200" ] || fatal "engine DELETE private-repo returned HTTP ${code:-none} (want 200) — leaving state behind"
+ok "DELETE repo"
+# Verified purge: on the headless engine the old trailing-slash page probe
+# was VACUOUS (page-shaped requests 404 before auth even for a LIVE repo),
+# so absence is proven on the git surface — polled until 404 (the registry
+# existence oracle: a registry-known orphan serves refs, clean state 404s).
+code=""
+for _ in $(seq 1 10); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -u "x:$TOKEN" "$BASE/private-repo.git/info/refs?service=git-upload-pack" 2>/dev/null)
+  [ "$code" = "404" ] && break
+  sleep 1
+done
+check "$code" "404" "deleted repo serves 404 on the git surface (purge verified)"
 
 echo "== 14. auth hard checks =="
 check "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/demo.git/info/refs?service=git-receive-pack")" "401" "push advert needs auth"

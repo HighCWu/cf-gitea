@@ -8,9 +8,11 @@ the ONLY copy in this repo). This suite is the correctness gate required by
 `specs/0001-storage-engine.md` §6: every e2e push must be followed by a clean
 `git fsck`.
 
-Status: **wired** (SPEC-0001 M1). The script body is byte-identical to the
-adapted header version; only the invocation adapts (base URL, token, PATH
-shim). CI runs it in `.github/workflows/ci.yml`.
+Status: **wired** (SPEC-0001 M1). The script body was byte-identical to the
+adapted header version until 2026-10-28's run-hygiene hardening (below);
+only the invocation adapts beyond that (base URL, token, PATH shim). Every
+body deviation is recorded in `NOTICE.md` ("Local adaptations", 2026-10-28
+`e2e/e2e.sh` row). CI runs it in `.github/workflows/ci.yml`.
 
 ## How it is wired
 
@@ -56,6 +58,64 @@ pnpm dev &   # wait for http://127.0.0.1:5173/healthz
 PATH="$PWD/packages/git-engine/e2e/shim:$PATH" \
   packages/git-engine/e2e/e2e.sh http://127.0.0.1:5173/demo devtoken
 ```
+
+## Run hygiene: interlock, checked deletes, stale-state guard
+
+Ported 2026-10-28 from `scripts/mirror-e2e.sh` (the sweep hardening; the
+mirror suite's run proved prior-run leftovers and interleaved invocations
+read as PRODUCT failures). Three behaviors, all in `e2e.sh`:
+
+1. **Concurrent-run interlock.** At startup the suite takes
+   `apps/worker/.wrangler/state/engine-e2e-run.lock` (an atomic `mkdir`,
+   holding the runner pid — the suite's OWN path, beside the other
+   harnesses' locks). A second concurrent invocation fails immediately
+   ("another engine e2e run is in flight") instead of interleaving two runs
+   on the fixed `demo` owner segment. A lock left by a SIGKILLed run is
+   reclaimed automatically when its holder pid is gone; if you ever need to
+   force-clear while no run is active:
+   `rm -rf apps/worker/.wrangler/state/engine-e2e-run.lock`.
+2. **Every teardown DELETE is checked.** The clean-slate DELETEs (`demo`,
+   `private-repo`, `old-date-repo` — the third added by the hardening: prior
+   runs leave it behind) and section 13's repo teardown must answer `200`
+   (stale state existed and was purged — logged) or, pre-clean only, `404`
+   (nothing under that name); anything else aborts the run with the repo and
+   code named. A `200` is trusted only after the git surface CONFIRMS
+   absence: the suite polls `GET /<name>.git/info/refs?service=git-upload-pack`
+   until it reads `404` (the registry-existence oracle — a registry-known
+   orphan serves refs, clean state 404s). Section 13's absence probe also
+   MOVED: the old trailing-slash page probe was vacuous here (the headless
+   engine 404s page-shaped requests before auth even for a LIVE repo), so
+   deletion is now proven on the git surface instead.
+3. **Stale prior-run state is wiped and re-verified, not trusted.** The
+   pre-clean wipes everything reachable under the suite's fixed names and
+   re-verifies absence before section 1, so a crashed or red run cannot
+   poison the next one with a non-fast-forwardable ref map.
+
+### Stale-state recovery (manual one-liner)
+
+A completed async cell purge can leave the cell's sqlite file behind as an
+empty husk, and a later engine DELETE of that name answers
+`HTTP 500 — database table is locked: SQLITE_LOCKED` on it, deterministically
+and across dev-server restarts (the mirror suite's product finding,
+reproduced 2026-10-28 on this suite's own `demo/demo`). This suite
+DELIBERATELY does not sweep cell files itself: its contract runs against an
+ALREADY-RUNNING dev server it does not own (CI starts it), and removing cell
+files under a live server is what produces the locked cells in the first
+place (`scripts/mirror-e2e.README.md` § stale-state recovery). When the
+checked DELETE aborts with a 500: stop the dev server, clear ONLY this
+suite's own cell files, and re-run:
+
+```bash
+# no dev server may be running (check the port first)
+for f in apps/worker/.wrangler/state/v3/do/cf-gitea-RepoCell/*.sqlite; do
+  n=$(sqlite3 "file:$f?mode=ro" "SELECT name FROM __miniflare_do_name LIMIT 1" 2>/dev/null)
+  case "$n" in demo/*) rm -f "$f" "$f-wal" "$f-shm";; esac
+done
+```
+
+This touches only cells named `demo/*` — never another suite's
+(`lfse2e/*`, `mirrore2e/*`, `dpprobe/*`). CI is unaffected: its
+`.wrangler/state` starts fresh every job, so husks cannot exist there.
 
 ## Sections and applicability (verified 2026-10-24, engine at M1)
 
