@@ -43,7 +43,17 @@
 //         retired row. Added here: the full composition — a REAL compaction
 //         publish lands, the first GC delete pass crashes mid-R2-batch, the
 //         retry converges, the successor stays ACTIVE and serves.
+//   rows 10+11 (the m3-state-transitions §5 closure appends, 2026-10-28):
+//         row 10 (stream prefetch probe) — a stalled client's R2 GET count is
+//         FROZEN while nobody reads (virtual clock blown past the whole lease
+//         TTL: no background prefetch/renewal exists to race GC) + the static
+//         no-pause()/releaseLock() tripwire over the serve read paths;
+//         row 11 (valid-but-incomplete pack) — the want still resolves but a
+//         closure object's bytes are gone: the walk rejects pre-lease before
+//         any byte ships (tree case), and the emission-path abort errors the
+//         stream before the flush tail with the lease released (blob case).
 const { DatabaseSync } = await import("node:sqlite");
+const { readFileSync } = await import("node:fs");
 
 const { GitStore } = await import("../src/git/store.ts");
 const { NodeSql, assert, assertEq } = await import("./helpers/lib.mjs");
@@ -767,6 +777,191 @@ await check("§7.2 row 5 (crash after publish, mid-delete): REAL publish → the
   assert(out.err === null, `post-convergence fetch completed: ${out.err?.message}`);
   assert(new TextDecoder().decode(out.bytes).endsWith(FLUSH_BYTES), "the post-convergence fetch's flush tail is intact");
   void crashedKey;
+});
+
+// ---------------------------------------------------------------------------
+// §7.2 row 10 (m3-state-transitions §5 closure): stream prefetch probe —
+// "nothing depends on pause-stops-I/O". The design eliminated the assumption
+// rather than testing it (reads are explicit bounded R2 Range GETs issued only
+// after a confirmed renewal), so the pin asserts the NEGATIVE: (a) a runtime
+// probe — the client stalls two frames into the stream and the R2 GET count
+// stays FROZEN while the virtual clock blows past the renew margin AND the
+// whole lease TTL (no background prefetch/renewal loop exists to race GC);
+// (b) the static tripwire — a grep-level assertion that the serve read paths
+// carry no pause()/releaseLock() plumbing. Engine source untouched.
+// ---------------------------------------------------------------------------
+
+/** The stall fixture: 12 packs x 6 chunk-spread blob entries + the loose
+ * tree/commit = 74 marked objects — MORE than one pull batch's 64-object
+ * bound, so emission is genuinely mid-stream while the client is stalled (a
+ * ≤64-object stream would finish inside the first pull, before any client
+ * read, and freeze vacuously). Same shape as seedUnionRepo: 9 MiB recorded
+ * per pack (above the raw-chunk window, sorted emission) and one entry per
+ * 1 MiB chunk (one R2 GET per emitted object). */
+function seedStallRepo(t, objects) {
+  const entries = [];
+  for (let p = 0; p < 12; p++) {
+    const packKey = "pack-" + p.toString(16).padStart(40, "0");
+    const { bytes, rows } = buildPackObject(6);
+    objects.set(packR2Key(STORAGE, packKey), bytes);
+    t.store.packs.putRows(packKey, rows);
+    for (const r of rows) entries.push({ mode: "100644", oid: r.oid, name: `f${entries.length}.txt` });
+    t.store.packs.recordPack(packKey, 9 * MiB, 256);
+  }
+  const tree = serializeTree(entries);
+  t.store.put(tree.oid, "tree", tree.data);
+  const person = { name: "t", email: "t@t", time: 1700000000000 };
+  const commit = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "stall fixture" });
+  t.store.put(commit.oid, "commit", commit.data);
+  t.store.setRef("refs/heads/main", commit.oid);
+  t.store.setHead("refs/heads/main");
+  t.store.setMeta("repo", STORAGE);
+  t.store.setMeta("storage_key", STORAGE);
+  return commit;
+}
+
+await check("§7.2 row 10 (stream prefetch probe): a stalled client's R2 GET count is FROZEN past the lease's whole TTL while nobody reads — no background prefetch/renewal races GC, the lease holds until the stream is abandoned, and the serve read paths carry no pause()/releaseLock() plumbing", async () => {
+  // (b) the static tripwire first: grep-level assertion over the serve read
+  // paths — no non-comment line may call pause()/releaseLock()
+  for (const rel of ["../src/git/protocol.ts", "../src/git/packstore.ts"]) {
+    const lines = readFileSync(new URL(rel, import.meta.url), "utf8").split("\n");
+    const code = lines.filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+    assert(!/\bpause\s*\(/.test(code), `${rel}: a pause() call site crept into the serve read paths`);
+    assert(!/\breleaseLock\s*\(/.test(code), `${rel}: a releaseLock() call site crept into the serve read paths`);
+  }
+
+  // (a) the runtime probe
+  const events = [];
+  const objects = new Map();
+  const t = makeT(events);
+  const commit = seedStallRepo(t, objects);
+  t.store.setR2(fakeBucket(t, objects), STORAGE);
+
+  // 17 s steps keep the per-segment renewals grantable (the row-3 shape);
+  // once the client stalls, 120 s pumps drive the virtual clock past the
+  // renew margin and the whole 60 s TTL while nobody reads
+  const clock = stepClock(17_000);
+  t.seamGuardArmed = true; // every GET that does happen is lease-verified
+  try {
+    const res = await Promise.resolve(uploadPack(t.store, uploadPackRequest(commit.oid)));
+    const reader = res.body.getReader();
+    const countGets = () => events.filter((e) => e.t === "get").length;
+    const countLeaseEvents = () => events.filter((e) => e.t === "lease").length;
+    // poll the GET count stable across real event-loop turns (a background
+    // prefetch loop would keep it growing)
+    const settle = async () => {
+      let prev = -1;
+      for (let n = 0; n < 40; n++) {
+        const cur = countGets();
+        if (cur === prev) return cur;
+        prev = cur;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      return countGets();
+    };
+    // Drain the enqueued preamble (NAK + progress frames, seeded before the
+    // stream's pull loop) and stop reading EXACTLY when the stream's queue
+    // holds an unread batch frame — THAT is the stall: a ReadableStream pulls
+    // eagerly only while its queue is under the high-water mark, so with an
+    // unread frame pending (desiredSize <= 0) the emission loop never fires
+    // again, no matter how long nobody reads.
+    while (res.body.desiredSize > 0 || countGets() === 0) {
+      const r = await reader.read();
+      assert(!r.done, `the stream is still mid-emission at the stall (${countGets()} GETs so far)`);
+    }
+    const getsAtStall = await settle();
+    const leasesAtStall = countLeaseEvents();
+    assert(getsAtStall >= 2, `the stream genuinely started before the stall (${getsAtStall} segment GETs)`);
+    assert(getsAtStall < 72, `emission is genuinely MID-STREAM at the stall (${getsAtStall}/72 packed entries read — not already finished)`);
+    assertEq(liveReadLeaseCount(t), 1, "exactly the one read lease is live mid-stream");
+
+    // the stall: nobody pulls from here. Blow the clock past everything, then
+    // give any hypothetical background prefetch/renewal loop ample event-loop
+    // turns (the settle window) to show itself.
+    clock.step = 120_000;
+    Date.now();
+    Date.now();
+    Date.now();
+    const getsAfterStall = await settle();
+    const leaseRow = t.sql.exec("SELECT expires_at AS e FROM leases WHERE kind = 'read'").toArray()[0];
+    assert(leaseRow && Date.now() > leaseRow.e, "the virtual clock blew past the lease's whole TTL during the stall");
+    assertEq(getsAfterStall, getsAtStall, "R2 GET count FROZEN while nobody reads — the read gate holds the object set stable, no re-fetch loop");
+    assertEq(countLeaseEvents(), leasesAtStall, "no background renewal fired while stalled — nothing depends on pause-stops-I/O");
+    assertEq(liveReadLeaseCount(t), 1, "the stalled reader's lease is still live (GC protection persists through the stall)");
+
+    // the stall ends the way a real slow client ends: the response is
+    // abandoned — the cancel path releases the lease
+    await reader.cancel();
+    assertEq(liveReadLeaseCount(t), 0, "the abandoned stream's cancel released the lease");
+  } finally {
+    clock.restore();
+    t.seamGuardArmed = false;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// §7.2 row 11 (m3-state-transitions §5 closure): valid-but-incomplete pack —
+// "server-side plan rejection is the contract" with client validation as
+// defense-in-depth. The want still resolves (refs + index rows intact) while
+// a closure object's BYTES are gone from the R2 stub. Pinned at both failure
+// depths of that one corruption: (i) a closure TREE's bytes missing → the
+// closure walk inflates it mid-BFS and throws BEFORE planFetch — no Response
+// ever exists (zero bytes ship to a client; the walk's own inflation reads
+// from the INTACT packs are fine), no lease ever taken; (ii) closure BLOB
+// bytes missing (blobs are walk-membership-only) → the plan leases, emission
+// starts, and the first missing read errors the stream BEFORE the flush tail
+// with the lease released by the error path (§6.8's failure discipline: an
+// aborted stream can never carry a success-completing tail).
+// ---------------------------------------------------------------------------
+
+await check("§7.2 row 11 (valid-but-incomplete pack): the want resolves but a closure object's bytes are missing — the walk rejects pre-lease before any byte ships (tree case), and the emission-path abort errors before the flush tail with the lease released (blob case)", async () => {
+  // (i) walk-time rejection: tree2's bytes live in PACK_D
+  {
+    const events = [];
+    const objects = new Map();
+    const t = makeT(events);
+    const oids = seedFourPackRepo(t.store, objects);
+    t.store.setR2(fakeBucket(t, objects), STORAGE);
+    assert(t.store.has(oids.commit2), "the want still resolves (ref + index intact)");
+    objects.delete(packR2Key(STORAGE, PACK_D)); // the closure tree's bytes
+    let threw = null;
+    try {
+      await uploadPack(t.store, uploadPackRequest(oids.commit2));
+    } catch (err) {
+      threw = err;
+    }
+    assert(threw, "the closure walk rejected the fetch (a throw, no Response ever)");
+    assert(/missing R2 object/.test(threw.message), `the rejection names the missing bytes: ${threw.message}`);
+    // the walk's own inflation reads hit only the INTACT packs (commit2 via
+    // PACK_C, tree2's base tree1 via PACK_A) — the missing pack never served
+    for (const g of events.filter((e) => e.t === "get")) {
+      assert(g.packKey !== PACK_D, "the missing pack's bytes were never served");
+    }
+    assertEq(events.filter((e) => e.t === "lease").length, 0, "no read lease was ever taken (pre-plan rejection)");
+    assertEq(liveReadLeaseCount(t), 0, "zero live leases — nothing leaked");
+  }
+
+  // (ii) emission-time rejection: the closure blobs' bytes live in PACK_A
+  {
+    const events = [];
+    const objects = new Map();
+    const t = makeT(events);
+    const commit = seedUnionRepo(t, objects);
+    t.store.setR2(fakeBucket(t, objects), STORAGE);
+    assert(t.store.has(commit.oid), "the want still resolves (ref + index intact)");
+    assertEq(
+      t.sql.exec("SELECT COUNT(*) AS n FROM pack_objects WHERE pack_key = ?", PACK_A).one().n,
+      6,
+      "the closure index rows are intact — the corruption is bytes-only"
+    );
+    objects.delete(packR2Key(STORAGE, PACK_A)); // the closure blobs' bytes
+    const out = await drainCapture(await Promise.resolve(uploadPack(t.store, uploadPackRequest(commit.oid))));
+    assert(out.err !== null, "the stream errored — the server aborted, it did not ship an incomplete pack");
+    assert(/missing R2 object/.test(out.err.message), `the error names the missing bytes: ${out.err.message}`);
+    assert(!new TextDecoder().decode(out.bytes).endsWith(FLUSH_BYTES), "an aborted stream never carries a success-completing tail (§6.8)");
+    assert(events.some((e) => e.t === "lease" && e.kind === "read"), "the plan's read lease WAS taken (the failure is post-plan)");
+    assertEq(liveReadLeaseCount(t), 0, "the error path released the lease");
+  }
 });
 
 // ---------------------------------------------------------------------------

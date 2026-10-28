@@ -281,14 +281,15 @@ implicitly here.
   (`gc.ts:158-170`) — §2's "converges by catalog state, never by assumption"
   states the property; the mechanism is these re-reads.
 
-## 5. §7.2 rows 10 and 11 — status and what would pin them
+## 5. §7.2 rows 10 and 11 — status and the landed pins
 
 Both rows were never claimed by the M3.5 as-built record (its audit covers
 rows 1–5, `specs/0011-compaction-gc.md:375-412`). Status per the M3.5 state
 assessment (`docs/research/spec-0011-m35-state.md:107-128`), restated here
-with the exact pinning work.
+with the pinning work as landed (both pinned 2026-10-28, see the Pinned
+records below).
 
-### Row 10 — stream prefetch probe ("nothing depends on pause-stops-I/O"): holds STRUCTURALLY, unpinned
+### Row 10 — stream prefetch probe ("nothing depends on pause-stops-I/O"): PINNED (2026-10-28; was structural, unpinned)
 
 The design eliminated the assumption rather than testing it: reads are
 explicit bounded R2 Range GETs, not stream-chunk pauses ("pausing
@@ -301,16 +302,27 @@ check-segmented-serve asserts every GET is ≤ `SERVE_SEGMENT_BYTES` and
 check-fault-matrix row 1 exercises reads across a live publish. Nothing
 asserts the negative ("no read path pauses and assumes I/O stops") as such.
 
-To pin it (recommended append to `e2e/check-fault-matrix.mjs`, engine source
-untouched): (a) a runtime probe — start a segmented stream, stall the client
-(never pull from the response body past the first segment), advance the
-clock past the renew margin, and assert the R2 GET count does not grow while
-nobody reads (no background prefetch exists to race GC); (b) a static
-assertion that the serve read paths contain no `pause()`/`releaseLock()`
-plumbing (grep-level assertion over `src/git/protocol.ts`/`src/git/packstore.ts`
-inside the check). (a) is the load-bearing half; (b) is the tripwire.
+Pinned (2026-10-28, `e2e/check-fault-matrix.mjs:823`, engine source
+untouched) as the row-10 check, both prescribed halves: (a) the runtime
+probe — a 74-object fixture (12 × 6 chunk-spread packed entries + loose
+tree/commit, deliberately above one pull batch's 64-object bound so emission
+is genuinely mid-stream) is read until the response's queue holds exactly one
+unread batch frame (`desiredSize <= 0` — the actual stall: a ReadableStream
+pulls eagerly only under its high-water mark, so with a frame pending the
+emission loop never fires again); the virtual clock then blows past the
+renew margin AND the whole 60 s lease TTL (17 s/call steps, then 120 s
+pumps), and across a settle window of real event-loop turns the R2 GET count
+and the lease-event timeline stay FROZEN (no background prefetch exists to
+race GC — an EXPIRED mid-stream plan provably re-fetches nothing), the
+stalled reader's lease stays live (GC protection persists through the
+stall), and `reader.cancel()` releases it; every GET that did happen was
+seam-guard verified (exactly-one live lease, plan member). (b) the tripwire
+— a grep-level assertion inside the check over
+`src/git/protocol.ts`/`src/git/packstore.ts` that no non-comment line
+contains `pause()`/`releaseLock()` plumbing. (a) is the load-bearing half;
+(b) is the tripwire, as prescribed.
 
-### Row 11 — valid-but-incomplete pack ("server-side plan rejection is the contract"): holds PARTIALLY, unpinned
+### Row 11 — valid-but-incomplete pack ("server-side plan rejection is the contract"): PINNED (2026-10-28; was partial, unpinned)
 
 No serve-side fixture constructs a pack whose checksum is correct but whose
 negotiated-object closure is incomplete. What exists covers the
@@ -322,13 +334,26 @@ objects", check-correctness-tier). The general case — want resolvable, one
 closure object's bytes missing while the plan is being computed → the
 SERVER-side plan/walk rejects before any byte ships — is unpinned.
 
-To pin it (same file append): seed a repo, delete one closure object's bytes
-from the R2 stub (or re-point its index row) so the want still resolves but
-its tree/blob does not, drive the REAL `uploadPack` arm, and assert the
-plan/closure walk throws or renders a protocol-shaped ERR BEFORE the flush
-tail (an aborted stream can never carry a success-completing tail — §6.8's
-failure discipline), with the lease released. That pins "server-side plan
-rejection is the contract" with client validation as defense-in-depth.
+Pinned (2026-10-28, `e2e/check-fault-matrix.mjs:917`): the row-11 check
+drives the REAL `uploadPack` arm at BOTH failure depths of the one
+corruption (closure bytes deleted from the R2 stub — packed storage has no
+per-object R2 addressability, so the pack object holding the closure
+entries' bytes is the deletable unit — with refs + index rows intact so the
+want still resolves): (i) a closure TREE's bytes missing (the four-pack
+fixture's PACK_D) → the closure walk inflates it mid-BFS and `uploadPack`
+THROWS `missing R2 object` BEFORE `planFetch` — no Response ever exists
+(zero bytes ship to a client; the walk's own inflation reads from the
+INTACT packs are fine and asserted to never touch the missing pack), no
+lease ever taken, zero live leases; (ii) closure BLOB bytes missing (the
+union fixture's PACK_A — blobs are walk-membership-only, so the walk
+passes) → the plan leases, emission starts, and the first missing read
+errors the stream BEFORE the flush tail, with the error path releasing the
+lease (§6.8's failure discipline: an aborted stream can never carry a
+success-completing tail). Both depths are pinned because the prescription's
+assertion list spans them: "the walk throws" happens pre-lease, "with the
+lease released" is meaningful only post-plan — together they pin
+"server-side plan rejection is the contract" with client validation as
+defense-in-depth.
 
 ## 6. Open issues for the next wave
 
@@ -338,10 +363,12 @@ rejection is the contract" with client validation as defense-in-depth.
    (`e2e/check-compaction.mjs:674,723`, mutation-tested) + the NOTICE.md
    deviation rows and the SPEC-0011 §5.3 as-built amendment. Nothing open.
 2. **D1/D2**: §2/§5 normative-text amendments (spec edit; owner: the spec).
-3. **Row 10/11 pins** (§5 above): two appends to
-   `e2e/check-fault-matrix.mjs`; also the assessment's §6 item 3 housekeeping
-   (the three M3.5 scripts missing from `packages/git-engine/e2e/README.md`'s
-   script list — `docs/research/engine-e2e-health-2026-10-26.md:149-156`).
+3. **Row 10/11 pins** (§5 above): RESOLVED (2026-10-28) — both landed as
+   checks in `e2e/check-fault-matrix.mjs` (4 → 6 checks; the §5 Pinned
+   records). Still open from this item: the assessment's §6 item 3
+   housekeeping (the three M3.5 scripts missing from
+   `packages/git-engine/e2e/README.md`'s script list —
+   `docs/research/engine-e2e-health-2026-10-26.md:149-156`).
 4. **OQ4** (clone-cache retention policy) and **Q3** (sqlite-row cleanup)
    remain open in spec §10; the as-built postures are lease-drain-only and
    row-removal-with-`pack_data` respectively (§3 side ledger, D5).

@@ -225,7 +225,7 @@ Three SPEC-0011 §7 M3.5 scripts — plain Node under tsx, no dev server: a real
 
 ```bash
 TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
-node "$TSX" packages/git-engine/e2e/check-fault-matrix.mjs      # 4 checks (as of this draft)
+node "$TSX" packages/git-engine/e2e/check-fault-matrix.mjs      # 6 checks
 node "$TSX" packages/git-engine/e2e/check-correctness-tier.mjs  # 7 checks
 node "$TSX" packages/git-engine/e2e/check-capability-matrix.mjs # 18 checks (test-generated at run time)
 ```
