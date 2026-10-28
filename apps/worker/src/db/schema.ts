@@ -211,6 +211,16 @@ export const repositories = sqliteTable(
     // SPEC-0004 §2.4: the fork list's source scan (verbatim from the
     // superseded FORKS_DDL_STATEMENTS index).
     index("repositories_fork_parent_idx").on(t.forkParent),
+    // Index audit P1: owner-scoped repo scans. `owner_id` is nullable and NOT
+    // covered by `repositories_owner_slug_uq` (that one leads with the
+    // owner_namespace slug), so every `WHERE owner_id = ?` walk was a full
+    // table scan: the org repo listing (services/orgs/orgs.ts:619-620), the
+    // org-wide branch-protection fan (services/branch-protection.ts:1049),
+    // the block cascade's unwatch/unstar arms (api/services/blocks.ts:464-470)
+    // and the feeds' owner-private probe (api/services/activity-feeds.ts:174).
+    // Upstream carries the same index (`OwnerID int64
+    // xorm:"UNIQUE(s) index"`, models/repo/repo.go).
+    index("repositories_owner_id_idx").on(t.ownerId),
   ],
 );
 
@@ -507,7 +517,28 @@ export const issues = sqliteTable(
     updatedAt: integer("updated_unix", { mode: "timestamp" }),
     closedAt: integer("closed_unix", { mode: "timestamp" }),
   },
-  (t) => [uniqueIndex("issues_repo_index_uq").on(t.repoId, t.index)],
+  (t) => [
+    uniqueIndex("issues_repo_index_uq").on(t.repoId, t.index),
+    // Index audit P0: the issue/PR list page. The shared WHERE builder binds
+    // `repo_id = ?` (or an IN-list), `is_closed = ?` and `is_pull = ?`, then
+    // orders `created_unix DESC, id DESC` (api/services/issues.ts
+    // issueFilterConditions:632-637 + the page ORDER BY:693/714; pulls twin
+    // api/services/pulls.ts:235). Upstream keeps these as scalar INDEXes
+    // (`RepoID xorm:"INDEX UNIQUE(repo_index)"`, `IsClosed xorm:"INDEX"`,
+    // `IsPull xorm:"INDEX"`, `CreatedUnix xorm:"INDEX created"`,
+    // models/issues/issue.go) — the composite collapses them into the exact
+    // filter+order shape, so the page reads an ordered index range instead of
+    // a repo scan + filesort. Plain ASC columns: SQLite scans an index
+    // backwards for DESC (the releases_repo_created_idx precedent).
+    index("issues_repo_pull_closed_created_idx").on(t.repoId, t.isPull, t.isClosed, t.createdAt),
+    // Index audit P1: the poster's own issues — the activity heatmap scan
+    // (`poster_id = ? AND created_unix > cutoff`, api/routes/user-read-t2.ts:
+    // 150-160) and the `?posted_by=` list filter (api/services/issues.ts:661,
+    // pulls.ts:235). Upstream's scalar pair (`PosterID xorm:"INDEX"`,
+    // `CreatedUnix xorm:"INDEX created"`) composed into the two-column shape
+    // both call sites use.
+    index("issues_poster_created_idx").on(t.posterId, t.createdAt),
+  ],
 );
 
 /**
@@ -608,6 +639,12 @@ export const comments = sqliteTable(
     index("comments_issue_covering_idx").on(t.issueId, t.posterId, t.updatedAt, t.createdAt),
     index("comments_ref_issue_idx").on(t.refIssueId),
     index("comments_ref_repo_idx").on(t.refRepoId),
+    // Index audit P1: the poster's own comments — the activity heatmap's
+    // comment half (`poster_id = ? AND created_unix > cutoff`,
+    // api/routes/user-read-t2.ts:163-171). Upstream's scalar
+    // `PosterID int64 xorm:"INDEX"` (models/issues/comment.go) composed with
+    // the created order both heatmap arms filter on.
+    index("comments_poster_created_idx").on(t.posterId, t.createdAt),
   ],
 );
 
@@ -630,7 +667,19 @@ export const labels = sqliteTable("labels", {
   numIssues: integer("num_issues").default(0),
   numClosedIssues: integer("num_closed_issues").default(0),
   archivedAt: integer("archived_unix", { mode: "timestamp" }),
-});
+  }, (t) => [
+    // Index audit P0: the two upstream scalar indexes (models/issues/label.go:
+    // 83-84 — `RepoID int64 xorm:"INDEX"`, `OrgID int64 xorm:"INDEX"`). The
+    // table had NO index: every repo/org label list, the create-time
+    // name-exists precheck and the issue-attach resolution were full scans.
+    // Repo side: api/services/labels.ts:101 (list), :135 (name precheck),
+    // api/services/issues.ts:545 + pulls.ts:646 (attach resolution),
+    // projects.ts:1053. Org side: api/services/labels-t2.ts:69/90/103,
+    // api/services/issues.ts:560, projects.ts:1055-1058.
+    index("labels_repo_id_idx").on(t.repoId),
+    index("labels_org_id_idx").on(t.orgId),
+  ],
+);
 
 /** Issue↔label attachment (SPEC-0005 §3.2). */
 export const issueLabels = sqliteTable(
@@ -660,7 +709,16 @@ export const milestones = sqliteTable("milestones", {
   closedDateAt: integer("closed_date_unix", { mode: "timestamp" }),
   createdAt: integer("created_unix", { mode: "timestamp" }),
   updatedAt: integer("updated_unix", { mode: "timestamp" }),
-});
+  }, (t) => [
+    // Index audit P0: the milestone list/get gate. Upstream's scalar
+    // `RepoID int64 xorm:"INDEX"` (models/issues/milestone.go). The table had
+    // NO index, so every `WHERE repo_id = ?` scan (api/services/milestones.ts:
+    // 133 list, :176/:189 get-or-404; src/issues/service.ts:300;
+    // api/services/issues.ts:597/608 milestone-entry resolution) walked the
+    // whole table.
+    index("milestones_repo_id_idx").on(t.repoId),
+  ],
+);
 
 /**
  * Reactions (mirrors `Reaction`, models/issues/reaction.go:62–74 — release
@@ -680,6 +738,18 @@ export const reactions = sqliteTable(
   },
   (t) => [
     uniqueIndex("reactions_target_uq").on(t.userId, t.issueId, t.commentId, t.releaseId, t.type),
+    // Index audit P0: the reaction page/delete target scan — `WHERE issue_id
+    // = ? AND comment_id = ? AND release_id = 0` (api/services/issue-extras.
+    // ts:59-62 page render, :118-126 delete-by-target). `reactions_target_uq`
+    // leads with user_id, so neither call site could use it. Upstream indexes
+    // (issue_id, comment_id) as the named `issue_comment` composite and
+    // release_id standalone (models/issues/reaction.go — `IssueID …
+    // INDEX(issue_comment)`, `CommentID … INDEX(issue_comment) INDEX`,
+    // `ReleaseID … INDEX`); our one composite carries the release arm as the
+    // trailing column because both call sites bind `release_id = 0` in the
+    // same predicate (documented divergence: a future release-reactions path
+    // querying by release_id alone would need its own index).
+    index("reactions_issue_comment_release_idx").on(t.issueId, t.commentId, t.releaseId),
   ],
 );
 
@@ -757,7 +827,17 @@ export const issueSubscriptions = sqliteTable(
     createdAt: integer("created_unix", { mode: "timestamp" }),
     updatedAt: integer("updated_unix", { mode: "timestamp" }),
   },
-  (t) => [uniqueIndex("issue_subscriptions_user_issue_uq").on(t.userId, t.issueId)],
+  (t) => [
+    uniqueIndex("issue_subscriptions_user_issue_uq").on(t.userId, t.issueId),
+    // Index audit P1: the issue-side probes. The unique arbiter leads with
+    // user_id, so the subscriber listing (`issue_id = ? AND is_watching`,
+    // api/services/issue-extras.ts:175) and the notifications joins
+    // (api/routes/notifications.ts:480/506/798) scanned. Upstream has no
+    // issue-side index (UNIQUE(watch) on (user_id, issue_id) only,
+    // models/issues/issue_watch.go:18-20 — upstream scans too); ours is the
+    // follows/star reverse-index precedent for the read-heavy direction.
+    index("issue_subscriptions_issue_idx").on(t.issueId),
+  ],
 );
 
 /**
@@ -2717,6 +2797,14 @@ export const actions = sqliteTable(
     index("action_user_deleted_created_idx").on(t.userId, t.isDeleted, t.createdAt),
     // Upstream's `au_c_u` composite (action.go:171-172).
     index("action_act_user_created_idx").on(t.actUserId, t.createdAt, t.userId),
+    // Index audit P1: the repo-kind feed page — `repo_id = ? AND
+    // is_deleted = 0` ordered `created_unix DESC` (api/services/
+    // activity-feeds.ts feedCondition:350-356 + getFeedRows' ORDER BY:388).
+    // Upstream's `r_u_d` (action.go:159-160, ported above with user_id in
+    // slot 2) cannot serve this shape's is_deleted filter or the created
+    // order; this composite is the audit's exact (repo_id, is_deleted,
+    // created_unix) page shape (plain ASC — SQLite scans backwards).
+    index("action_repo_deleted_created_idx").on(t.repoId, t.isDeleted, t.createdAt),
   ],
 );
 

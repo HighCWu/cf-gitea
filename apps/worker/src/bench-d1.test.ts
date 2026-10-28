@@ -64,6 +64,15 @@
  * the scripts/bench-d1.mjs header. They are explicitly NOT CI-enforced — a
  * follow-up can turn them into a regression gate (bench-run's --compare
  * pattern) once a couple of runs confirm the variance band.
+ *
+ * INDEX WITNESS (migration 0036 — the perf audit's P0+P1 wave): the second
+ * describe below is the OPPOSITE of bench-gated — it RUNS IN PLAIN
+ * `pnpm test` (no D1_BENCH binding needed). It is the migration's witness:
+ * a small fixed corpus, then per audited query shape an EXPLAIN QUERY PLAN
+ * assertion (must name the new index with it present, must not without it —
+ * deterministic, no wall-clock noise) plus a short timed loop with D1's
+ * rows_read meta as the cost anchor. The gate is the plan assertions; the
+ * timings are informational (##INDEX_WITNESS_JSON## line, like the bench).
  */
 
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
@@ -74,14 +83,17 @@ import { env } from "cloudflare:workers";
 import { applyAuthD1Migrations } from "./auth/testing/apply-d1-migrations";
 import { TokenService } from "./auth/token-service";
 import {
+  actions,
   comments,
   issueLabels,
   issueSubscriptions,
   issues,
   labels,
+  milestones,
   notificationStates,
   personalAccessTokens,
   pullRequests,
+  reactions,
   repoCounters,
   repoWatchers,
   repositories,
@@ -832,4 +844,489 @@ describe.skipIf(!BENCH_ENABLED)("D1 metadata-plane bench", () => {
     };
     console.log(`##D1_BENCH_JSON## ${JSON.stringify(doc)}`);
   }, 600_000);
+});
+
+// ---------------------------------------------------------------------------
+// Index witness (migration 0036 — the D1 index audit's P0+P1 wave).
+//
+// Always-on (the block above stays bench-gated; this one is the migration's
+// test-visible witness). Protocol per audited query shape:
+//   1. with the migrated indexes: EXPLAIN QUERY PLAN must name the new index;
+//   2. after dropping all ten (the honest pre-migration state): the same
+//      EXPLAIN must NOT name it;
+//   3. both states timed over a fixed loop; D1's rows_read meta is the
+//      deterministic cost anchor (wall ms in local workerd is noisy);
+//   4. the ten CREATE INDEX statements are replayed VERBATIM (they are the
+//      migration's exact DDL) and sqlite_master is re-checked, so the file
+//      leaves the schema exactly as migrated.
+// D1 supports EXPLAIN QUERY PLAN through prepare() (plain SQLite; verified
+// by this very test — a rejection would fail the plan step).
+// ---------------------------------------------------------------------------
+
+/** The ten audited indexes: [name, exact migration-0036 DDL]. Keep in lockstep
+ *  with src/db/migrations/0036_fantastic_whirlwind.sql — the drop/recreate
+ *  protocol depends on the replay restoring the migrated schema byte-for-byte. */
+const WITNESS_INDEXES: readonly [name: string, ddl: string][] = [
+  [
+    "labels_repo_id_idx",
+    "CREATE INDEX `labels_repo_id_idx` ON `labels` (`repo_id`)",
+  ],
+  [
+    "labels_org_id_idx",
+    "CREATE INDEX `labels_org_id_idx` ON `labels` (`org_id`)",
+  ],
+  [
+    "reactions_issue_comment_release_idx",
+    "CREATE INDEX `reactions_issue_comment_release_idx` ON `reactions` (`issue_id`,`comment_id`,`release_id`)",
+  ],
+  [
+    "issues_repo_pull_closed_created_idx",
+    "CREATE INDEX `issues_repo_pull_closed_created_idx` ON `issues` (`repo_id`,`is_pull`,`is_closed`,`created_unix`)",
+  ],
+  [
+    "milestones_repo_id_idx",
+    "CREATE INDEX `milestones_repo_id_idx` ON `milestones` (`repo_id`)",
+  ],
+  [
+    "repositories_owner_id_idx",
+    "CREATE INDEX `repositories_owner_id_idx` ON `repositories` (`owner_id`)",
+  ],
+  [
+    "issues_poster_created_idx",
+    "CREATE INDEX `issues_poster_created_idx` ON `issues` (`poster_id`,`created_unix`)",
+  ],
+  [
+    "comments_poster_created_idx",
+    "CREATE INDEX `comments_poster_created_idx` ON `comments` (`poster_id`,`created_unix`)",
+  ],
+  [
+    "action_repo_deleted_created_idx",
+    "CREATE INDEX `action_repo_deleted_created_idx` ON `action` (`repo_id`,`is_deleted`,`created_unix`)",
+  ],
+  [
+    "issue_subscriptions_issue_idx",
+    "CREATE INDEX `issue_subscriptions_issue_idx` ON `issue_subscriptions` (`issue_id`)",
+  ],
+];
+
+/** One audited query shape: the verbatim statement the named service issues
+ *  (binds filled from the witness fixtures), mapped to the index the audit
+ *  says must serve it. */
+interface WitnessShape {
+  name: string;
+  index: string;
+  sql: string;
+  binds: (f: WitnessFixtures) => unknown[];
+}
+
+interface WitnessFixtures {
+  ownerId: number;
+  otherId: number;
+  /** The corpus repo every target scan filters on. */
+  targetRepo: string;
+  /** The distractor repo (another owner's) that fills the scanned tables. */
+  otherRepo: string;
+  /** An issue id in the target repo (reactions/subscriptions probes). */
+  firstTargetIssue: number;
+}
+
+/** The ten shapes: caller cites are the schema.ts index comments. */
+function witnessShapes(f: WitnessFixtures): WitnessShape[] {
+  return [
+    {
+      name: "labels.repo list",
+      index: "labels_repo_id_idx",
+      // api/services/labels.ts:101 (listRepoLabels).
+      sql: "SELECT id, name, color FROM labels WHERE repo_id = ?",
+      binds: () => [f.targetRepo],
+    },
+    {
+      name: "labels.org list",
+      index: "labels_org_id_idx",
+      // api/services/labels-t2.ts:69 (listOrgLabels).
+      sql: "SELECT id, name, color FROM labels WHERE org_id = ?",
+      binds: () => [f.ownerId],
+    },
+    {
+      name: "reactions target scan",
+      index: "reactions_issue_comment_release_idx",
+      // api/services/issue-extras.ts:59-62 (listReactions; the delete twin
+      // at :118-126 binds the same three).
+      sql: "SELECT id, user_id, type, created_unix FROM reactions WHERE issue_id = ? AND comment_id = ? AND release_id = 0 ORDER BY id",
+      binds: () => [f.firstTargetIssue, 0],
+    },
+    {
+      name: "issues repo list page",
+      index: "issues_repo_pull_closed_created_idx",
+      // api/services/issues.ts issueFilterConditions + the page ORDER BY
+      // (:693/:714) — the repo-scoped shape with both state filters bound.
+      sql: "SELECT * FROM issues WHERE repo_id = ? AND is_pull = ? AND is_closed = ? ORDER BY created_unix DESC, id DESC LIMIT 30",
+      binds: () => [f.targetRepo, 0, 0],
+    },
+    {
+      name: "milestones repo list",
+      index: "milestones_repo_id_idx",
+      // api/services/milestones.ts:133 (listRepoMilestones).
+      sql: "SELECT * FROM milestones WHERE repo_id = ?",
+      binds: () => [f.targetRepo],
+    },
+    {
+      name: "repositories owner scan",
+      index: "repositories_owner_id_idx",
+      // services/orgs/orgs.ts:619-620 (org repo listing).
+      sql: "SELECT id, slug, visibility FROM repositories WHERE owner_id = ?",
+      binds: () => [f.ownerId],
+    },
+    {
+      name: "issues poster heatmap",
+      index: "issues_poster_created_idx",
+      // api/routes/user-read-t2.ts:150-160 (activity heatmap, issues half).
+      sql: "SELECT created_unix FROM issues WHERE poster_id = ? AND created_unix > ?",
+      binds: () => [f.ownerId, 0],
+    },
+    {
+      name: "comments poster heatmap",
+      index: "comments_poster_created_idx",
+      // api/routes/user-read-t2.ts:163-171 (activity heatmap, comments half).
+      sql: "SELECT created_unix FROM comments WHERE poster_id = ? AND created_unix > ?",
+      binds: () => [f.ownerId, 0],
+    },
+    {
+      name: "action repo feed page",
+      index: "action_repo_deleted_created_idx",
+      // api/services/activity-feeds.ts feedCondition (kind=repo) + getFeedRows
+      // ORDER BY (:388) — user_id = act_user_id is the column-to-column
+      // parity arm the index cannot serve; it filters the ordered range.
+      sql: 'SELECT * FROM "action" WHERE repo_id = ? AND is_deleted = 0 AND user_id = act_user_id ORDER BY created_unix DESC, id DESC LIMIT 20',
+      binds: () => [f.targetRepo],
+    },
+    {
+      name: "issue_subscribers probe",
+      index: "issue_subscriptions_issue_idx",
+      // api/services/issue-extras.ts:175 (getIssueWatchers subscribers).
+      sql: "SELECT user_id, is_watching FROM issue_subscriptions WHERE issue_id = ? AND is_watching = 1",
+      binds: () => [f.firstTargetIssue],
+    },
+  ];
+}
+
+/** Corpus size (kept small — this block runs in the plain suite): target-repo
+ *  issues + distractor-repo issues, then the derived child rows. */
+const WITNESS_TARGET_ISSUES = 300;
+const WITNESS_OTHER_ISSUES = 250;
+const WITNESS_TIMED_RUNS = 30;
+
+interface WitnessNumber {
+  shape: string;
+  index: string;
+  rowsReadWith: number;
+  rowsReadWithout: number;
+  meanMsWith: number;
+  meanMsWithout: number;
+}
+
+let explainSeq = 0;
+
+/** EXPLAIN QUERY PLAN through a raw prepare (the D1-support verification).
+ *  A unique comment tag is appended per call: the D1 session serves cached
+ *  compiled plans keyed on the SQL string, so a re-explained statement after
+ *  a DROP must look like a different statement or it reports the stale plan
+ *  (observed: post-drop EXPLAIN still named the dropped index). */
+async function explainPlan(raw: D1Database, sql: string, binds: unknown[]): Promise<string> {
+  explainSeq += 1;
+  const result = await raw
+    .prepare(`EXPLAIN QUERY PLAN ${sql} /* witness-${explainSeq} */`)
+    .bind(...binds)
+    .all<{ detail: string }>();
+  return result.results.map((row) => row.detail).join("\n");
+}
+
+/** Timed loop + the deterministic rows_read anchor (one metered call). The
+ *  comment tag defeats the D1 statement cache the same way explainPlan does —
+ *  without it the "without indexes" state would time the cached indexed plan. */
+async function measureShape(
+  raw: D1Database,
+  shape: WitnessShape,
+  binds: unknown[],
+  tag: string,
+): Promise<{ meanMs: number; rowsRead: number }> {
+  const stmt = raw.prepare(`${shape.sql} /* ${tag} */`);
+  for (let i = 0; i < 3; i++) await stmt.bind(...binds).all(); // warmup
+  const metered = await stmt.bind(...binds).all();
+  const t0 = performance.now();
+  for (let i = 0; i < WITNESS_TIMED_RUNS; i++) await stmt.bind(...binds).all();
+  return { meanMs: (performance.now() - t0) / WITNESS_TIMED_RUNS, rowsRead: metered.meta?.rows_read ?? 0 };
+}
+
+describe("index witness (migration 0036 — the audit's P0+P1 wave)", () => {
+  const RUN_TAG = `idxw${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}`;
+  let db!: DrizzleD1Database;
+  let raw!: D1Database;
+  let fixtures!: WitnessFixtures;
+
+  beforeAll(async () => {
+    await applyAuthD1Migrations();
+    raw = env.DB;
+    db = drizzle(raw);
+  });
+
+  afterAll(async () => {
+    // Best-effort scratch cleanup (per-file isolated storage discards it
+    // anyway; the prefix scopes every row the witness created).
+    try {
+      const repoIds = [fixtures.targetRepo, fixtures.otherRepo];
+      const seededIssues = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(inArray(issues.repoId, repoIds))
+        .all();
+      const issueIds = seededIssues.map((row) => row.id);
+      for (const part of chunks(issueIds, 50)) {
+        await db.delete(reactions).where(inArray(reactions.issueId, part));
+        await db.delete(comments).where(inArray(comments.issueId, part));
+        await db.delete(issueSubscriptions).where(inArray(issueSubscriptions.issueId, part));
+      }
+      for (const repoId of repoIds) {
+        await db.delete(labels).where(eq(labels.repoId, repoId));
+        await db.delete(milestones).where(eq(milestones.repoId, repoId));
+        await db.delete(actions).where(eq(actions.repoId, repoId));
+        await db.delete(repositories).where(eq(repositories.id, repoId));
+      }
+      await db.delete(labels).where(eq(labels.orgId, fixtures.ownerId));
+      await db.delete(users).where(sql`username_lower like ${`${RUN_TAG}%`}`);
+    } catch (error) {
+      console.error(
+        `[index-witness] cleanup failed (dev-scratch only): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  });
+
+  test("seeds the corpus, witnesses the plans, times both states, restores the schema", async () => {
+    // -- seed (untimed) -------------------------------------------------------
+    const now = Math.floor(Date.now() / 1000);
+    const insertUser = async (name: string): Promise<number> => {
+      const rows = await db
+        .insert(users)
+        .values({ username: name, usernameLower: name, type: "user", createdAt: new Date() })
+        .returning({ id: users.id })
+        .all();
+      const user = rows[0];
+      if (user === undefined) throw new Error(`witness seed user ${name} failed`);
+      return user.id;
+    };
+    const ownerId = await insertUser(`${RUN_TAG}owner`);
+    const otherId = await insertUser(`${RUN_TAG}other`);
+    const watchers: number[] = [ownerId, otherId];
+    for (let i = 0; i < 3; i++) watchers.push(await insertUser(`${RUN_TAG}watch${i}`));
+    const watcherAt = (i: number): number => {
+      const id = watchers[i % watchers.length];
+      if (id === undefined) throw new Error("witness seed watchers failed");
+      return id;
+    };
+
+    const mkRepo = async (slug: string, repoOwnerId: number): Promise<string> => {
+      const id = crypto.randomUUID();
+      await db.insert(repositories).values({
+        id,
+        storageKey: `r_${id.slice(0, 8)}`,
+        ownerNamespace: RUN_TAG,
+        ownerId: repoOwnerId,
+        slug,
+        visibility: "public",
+        createdAt: new Date(),
+      });
+      return id;
+    };
+    const targetRepo = await mkRepo(`wit-target-${RUN_TAG}`, ownerId);
+    const otherRepo = await mkRepo(`wit-other-${RUN_TAG}`, otherId);
+    // Two extra owner rows so the owner_id scan has sibling rows to skip.
+    await mkRepo(`wit-extra1-${RUN_TAG}`, ownerId);
+    await mkRepo(`wit-extra2-${RUN_TAG}`, otherId);
+
+    const issueValues = (repoId: string, n: number): (typeof issues.$inferInsert)[] =>
+      Array.from({ length: n }, (_, i) => ({
+        repoId,
+        index: i + 1,
+        posterId: i % 5 === 0 ? otherId : ownerId,
+        title: `witness issue ${i + 1}`,
+        isPull: i % 10 === 0,
+        isClosed: i % 3 === 0,
+        createdAt: new Date((now - (n - i) * 60) * 1000),
+        updatedAt: new Date((now - (n - i) * 30) * 1000),
+      }));
+    const targetValues = issueValues(targetRepo, WITNESS_TARGET_ISSUES);
+    // Chunk sizes are the D1 100-variable cap divided by the table's column
+    // count (drizzle's insert lists every column — see `chunks` above).
+    for (const part of chunks(targetValues, 4)) await db.insert(issues).values(part);
+    for (const part of chunks(issueValues(otherRepo, WITNESS_OTHER_ISSUES), 4)) await db.insert(issues).values(part);
+    const seededTargetIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.repoId, targetRepo))
+      .orderBy(asc(issues.id))
+      .all();
+    const targetIssueIds = seededTargetIssues.map((row) => row.id);
+    const firstTargetIssue = targetIssueIds[0];
+    if (firstTargetIssue === undefined) throw new Error("witness seed issues failed");
+
+    const repoLabelValues = Array.from({ length: 30 }, (_, i) => ({
+      repoId: targetRepo,
+      name: `wit-label-${i}`,
+      color: "#00aabb",
+    }));
+    for (const part of chunks(repoLabelValues, 8)) await db.insert(labels).values(part);
+    const orgLabelValues = Array.from({ length: 15 }, (_, i) => ({
+      orgId: ownerId,
+      name: `wit-org-label-${i}`,
+      color: "#00aabb",
+    }));
+    for (const part of chunks(orgLabelValues, 8)) await db.insert(labels).values(part);
+    const otherLabelValues = Array.from({ length: 10 }, (_, i) => ({
+      repoId: otherRepo,
+      name: `wit-other-label-${i}`,
+      color: "#00aabb",
+    }));
+    for (const part of chunks(otherLabelValues, 8)) await db.insert(labels).values(part);
+    const milestoneValues = Array.from({ length: 20 }, (_, i) => ({
+      repoId: targetRepo,
+      name: `wit-milestone-${i}`,
+      createdAt: new Date(),
+    }));
+    for (const part of chunks(milestoneValues, 8)) await db.insert(milestones).values(part);
+    const otherMilestoneValues = Array.from({ length: 10 }, (_, i) => ({
+      repoId: otherRepo,
+      name: `wit-other-milestone-${i}`,
+      createdAt: new Date(),
+    }));
+    for (const part of chunks(otherMilestoneValues, 8)) await db.insert(milestones).values(part);
+    // Six reactions on each of the first 50 target issues (300 rows).
+    for (const issueId of targetIssueIds.slice(0, 50)) {
+      await db.insert(reactions).values(
+        watchers.map((userId) => ({ userId, issueId, commentId: 0, releaseId: 0, type: "+1" })),
+      );
+    }
+    const commentValues = targetIssueIds.slice(0, 60).map((issueId, i) => ({
+      type: 0,
+      posterId: watcherAt(i),
+      issueId,
+      content: `witness comment ${i}`,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }));
+    // ~29 columns → chunk 3 (the cap math in the sibling seed above).
+    for (const part of chunks(commentValues, 3)) await db.insert(comments).values(part);
+    const subscriptionValues = targetIssueIds
+      .slice(0, 100)
+      .flatMap((issueId) => watchers.slice(0, 2).map((userId) => ({ userId, issueId, isWatching: true })));
+    for (const part of chunks(subscriptionValues, 18)) await db.insert(issueSubscriptions).values(part);
+    const targetActionValues = Array.from({ length: 120 }, (_, i) => ({
+      userId: watcherAt(i),
+      opType: 1,
+      actUserId: ownerId,
+      repoId: targetRepo,
+      content: `${i}|witness`,
+      createdAt: new Date((now - i * 60) * 1000),
+    }));
+    for (const part of chunks(targetActionValues, 8)) await db.insert(actions).values(part);
+    const otherActionValues = Array.from({ length: 40 }, (_, i) => ({
+      userId: otherId,
+      opType: 1,
+      actUserId: otherId,
+      repoId: otherRepo,
+      content: `${i}|witness-other`,
+      createdAt: new Date((now - i * 60) * 1000),
+    }));
+    for (const part of chunks(otherActionValues, 8)) await db.insert(actions).values(part);
+    fixtures = { ownerId, otherId, targetRepo, otherRepo, firstTargetIssue };
+
+    // -- state A: migrated (indexes present) ---------------------------------
+    const shapes = witnessShapes(fixtures);
+    for (const shape of shapes) {
+      const plan = await explainPlan(raw, shape.sql, shape.binds(fixtures));
+      expect(plan, `${shape.name}: plan must use ${shape.index} (with indexes)`).toMatch(
+        new RegExp(`USING (COVERING )?INDEX ${shape.index}`),
+      );
+    }
+    const withNumbers = new Map<string, { meanMs: number; rowsRead: number }>();
+    for (const shape of shapes) {
+      withNumbers.set(shape.name, await measureShape(raw, shape, shape.binds(fixtures), "witness-with"));
+    }
+
+    // -- state B: pre-migration (all ten dropped) ----------------------------
+    // DDL goes through D1's exec() (the documented migration/setup path); the
+    // sqlite_master re-check below turns a silent no-op drop into a failure.
+    for (const [name] of WITNESS_INDEXES) {
+      await raw.exec(`DROP INDEX IF EXISTS "${name}";`);
+    }
+    const droppedLeft = await raw
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${WITNESS_INDEXES.map(() => "?").join(",")})`,
+      )
+      .bind(...WITNESS_INDEXES.map(([name]) => name))
+      .all<{ name: string }>();
+    expect(droppedLeft.results, "witness drop must remove all ten indexes").toHaveLength(0);
+    for (const shape of shapes) {
+      const plan = await explainPlan(raw, shape.sql, shape.binds(fixtures));
+      expect(plan, `${shape.name}: plan must NOT use ${shape.index} (indexes dropped)`).not.toMatch(
+        new RegExp(`USING (COVERING )?INDEX ${shape.index}`),
+      );
+    }
+    const withoutNumbers = new Map<string, { meanMs: number; rowsRead: number }>();
+    for (const shape of shapes) {
+      withoutNumbers.set(shape.name, await measureShape(raw, shape, shape.binds(fixtures), "witness-without"));
+    }
+
+    // -- restore: replay the migration DDL verbatim, re-check sqlite_master --
+    for (const [, ddl] of WITNESS_INDEXES) await raw.exec(`${ddl};`);
+    const restored = await raw
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${WITNESS_INDEXES.map(() => "?").join(",")})`,
+      )
+      .bind(...WITNESS_INDEXES.map(([name]) => name))
+      .all<{ name: string }>();
+    expect(restored.results.map((row) => row.name).sort(), "witness restore must leave all ten indexes").toEqual(
+      WITNESS_INDEXES.map(([name]) => name).sort(),
+    );
+
+    // -- the numbers (informational; the gate was the plan assertions) --------
+    const numbers: WitnessNumber[] = shapes.map((shape) => {
+      const withN = withNumbers.get(shape.name);
+      const withoutN = withoutNumbers.get(shape.name);
+      if (withN === undefined || withoutN === undefined) throw new Error(`missing measurement for ${shape.name}`);
+      return {
+        shape: shape.name,
+        index: shape.index,
+        rowsReadWith: withN.rowsRead,
+        rowsReadWithout: withoutN.rowsRead,
+        meanMsWith: Math.round(withN.meanMs * 100) / 100,
+        meanMsWithout: Math.round(withoutN.meanMs * 100) / 100,
+      };
+    });
+    for (const n of numbers) {
+      console.log(
+        `[index-witness] ${n.shape.padEnd(26)} rows_read ${String(n.rowsReadWithout).padStart(6)} -> ` +
+          `${String(n.rowsReadWith).padStart(6)}   mean ms ${String(n.meanMsWithout).padStart(8)} -> ` +
+          `${String(n.meanMsWith).padStart(8)}   (${n.index})`,
+      );
+    }
+    console.log(
+      `##INDEX_WITNESS_JSON## ${JSON.stringify({
+        schema_version: 1,
+        target: "local",
+        corpus: {
+          target_issues: WITNESS_TARGET_ISSUES,
+          other_issues: WITNESS_OTHER_ISSUES,
+          labels: 55,
+          milestones: 30,
+          reactions: 300,
+          comments: 60,
+          subscriptions: 200,
+          actions: 160,
+          repositories: 4,
+        },
+        timed_runs_per_shape: WITNESS_TIMED_RUNS,
+        shapes: numbers,
+      })}`,
+    );
+  }, 300_000);
 });

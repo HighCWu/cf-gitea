@@ -253,6 +253,13 @@
       "when": 1793143190402,
       "tag": "0035_spooky_galactus",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1793150486243,
+      "tag": "0036_fantastic_whirlwind",
+      "breakpoints": true
     }
   ]
 }
