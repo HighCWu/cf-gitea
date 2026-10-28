@@ -3350,3 +3350,147 @@ chain 910a6aa4 → fd571f35 → 1235b4d0; healthz 200 @~3s; migrations 0036+
   self-cleaned (branch-protection's created rules best-effort deleted
   per its failure-tail enumeration), the run PAT deleted at wrap close,
   `personal_access_tokens` back to the standing bootstrap = 1.
+
+**REDEPLOY25 TEMPLATE — pre-drafted 2026-10-28, PRE-WINDOW: the DEP-BUMP
+deploy (execution plan: `docs/ops/rd25-runbook.md`, PRE-WRITTEN at `c40f8b8`
+and tree-verified — the orchestrator executes it top to bottom). Every
+window-time value below is a `__BLANK__` slot for the orchestrator's paste
+per runbook §7.1; every landed fact cited here was verified against the tree
+at HEAD `ada3b73`. The window opens ONLY from a quiet, committed tree
+(runbook §1.1).**
+
+- **The window's purpose — the dependency-freshness census's Window 1,
+  executed** (`docs/research/dep-freshness-2026-10-28.md:110-142`): the FIVE
+  exact-version bumps — hono `4.13.14`, wrangler `4.153.0`,
+  `@cloudflare/vitest-plugin` `1.4.8`, typescript-eslint `8.72.1`,
+  `@cloudflare/workers-types` `5.20261027.1` — the miniflare override
+  `5.20261019.2-beta` → **`5.20261023.0-beta`** (workerd `1.20261023.1`),
+  and BOTH `compatibility_date`s → **`2026-10-23`** (the real gitignored
+  `apps/worker/wrangler.jsonc` AND the committed `wrangler.jsonc.example` —
+  the example must match, or CI restores a different compat date than the
+  deploy runs).
+- **The payload slots** (fill when they land): PRE_BUMP_COMMIT `__BLANK__`
+  (HEAD at window open — rollback §8.2 restores the three paths from it);
+  GO_COMMIT `__BLANK__` — the dep-bump commit, the window's ONE pre-agreed
+  code commit, carrying BOTH the lockfile refresh AND the coordinated config
+  edits (the override + both compat dates) in exactly three paths
+  (`pnpm-lock.yaml`, `pnpm-workspace.yaml`,
+  `apps/worker/wrangler.jsonc.example`; the real config's compat-date edit
+  rides the deploy, NOT the tree — it is gitignored).
+- **The gate at GO — the full suite at the BUMPED runtime** (verdict lines
+  `__BLANK__`): `pnpm test:full` (ADR-0006 composite, `--solo` adjudication;
+  RD24 reference line: 268 files, 266 direct + 2 solo-green (pull-engine +
+  demo-quota, the load-flaky class), 0 deaths — expect ≈268+). The override
+  MOVES workerd under every local gate: pool misbehavior attributed to the
+  moved override (new startup deaths that also die solo, workerd boot
+  failures) is a BLOCKER, not a waiver → rollback §8.2. The engine's
+  delete-husk check moves with the override automatically (prefix-located
+  `miniflare@5.`, newest store entry wins) — expected line `all 6 engine
+  checks passed`; KNOWN CAVEAT: its `compatibilityDate: "2026-10-19"` is
+  HARDCODED (`check-delete-husk.mjs:131`) — stays runnable on the new
+  workerd, but the "exactly the dev server's" parity comment now drifts from
+  `wrangler.jsonc` (runbook open issue 2; one-line follow-up for the next
+  engine-touching unit). `pnpm typecheck`: `__BLANK__`; `pnpm lint`:
+  `__BLANK__` (the NEW toolchain — typescript-eslint 8.72.1, and the worker
+  script's `wrangler types` under wrangler 4.153.0 regenerates Env types +
+  the engine dist-types boundary).
+- **The deploy chain**: version id `__BLANK__` (record via `wrangler
+  deployments list` — the RD23/RD24 lineage convention); healthz PROD
+  `__BLANK__` / DEMO `__BLANK__` (the custom domain must survive the
+  redeploy; a DEMO 522/SSL error → cert re-provisioning, retry after a few
+  minutes before diagnosing further). **THE STALE-DIST TRAP reminder (found
+  at RD24's own flip):** `pnpm build` (prebuild → `gen:icons`) is the LAST
+  action before `pnpm deploy`, every time — wrangler deploys `dist/`'s
+  GENERATED config; a dist built before the §2.2 compat edit would deploy
+  `2026-10-19` while the tree says `2026-10-23`. **Remote migrations: CHECK
+  ONLY, DO NOT APPLY — expect NONE pending** (0036 + 0037 applied at RD24,
+  both index-only; the tree's migrations end at `0037_smart_blizzard.sql`,
+  no 0038 exists — RD25 is schema-silent, the 65-table count stands; a NEW
+  pending row → STOP: the deploy came from a tree you did not think it
+  did). `pnpm smoke (--migrate-check)`: `__BLANK__` — expected 6 pass /
+  0 fail / 1 skip, and the migrate-check line reads "No migrations to
+  apply" with the standing table census UNCHANGED (a dependency bump is
+  schema-silent; any table-count delta means something other than the
+  census five shipped).
+- **Battery verdict — the toolkit's TWELVE** (`BATTERY_NAMES`,
+  `deploy-probes.mjs:251`): standing nine `__BLANK__` (census 113: p0 4 ·
+  registry 21 · generate-e2e 10 · forkpr-e2e 8 · mirror 8 · ui-login 5 ·
+  window2-mounts 22 · window3-mounts 25 · cleanup-audit 10 — record the
+  observed total; derive it from the verdicts, don't force-match) +
+  branch-protection `__BLANK__` (18) + fixwave-parity `__BLANK__` (22) +
+  demo `__BLANK__` (run against `$DEMO`: `node scripts/deploy-probes.mjs
+  demo --base-url $DEMO --token-file …`). **Demo posture, RD24 semantics
+  carried:** `demo-config-posture` REDS BY DESIGN on the flipped operator
+  machine — record the red as the documented posture, do NOT "fix" it (the
+  arm guards the self-host default); `demo-banner-present` + `signup-open`
+  must PASS (a banner warn means the banner regressed);
+  `demo-ttl-mechanics` records the documented [info] on a deployed target
+  (the hourly tick is log-observable only). **THE STANDING DISCRIMINATOR —
+  `fw-org-member-preaccess` (`deploy-probes.mjs:2765`): GREEN = held**
+  (first-green RD24b `1235b4d0`; the carrying code — the org grant + the
+  `auto_init` route fix `9d77172` — is an ancestor of every version
+  since); **RED = a REGRESSION** — diagnose against `wrangler deployments
+  list` first (is the live version the one just deployed?); do not
+  re-write the RD24 discriminator sentence. **The benchgate's NEW posture,
+  post-calibration:** `scripts/bench-baselines/ci.json` LANDED at
+  `f33860e` (from run 40699376701's `bench-ci-baseline` artifact) — the
+  benchmark job's >10% CI-vs-CI gate is ARMED, so the window's push takes
+  the COMPARE branch (the record-only notice is gone): observed verdict
+  `__BLANK__` (a >10% regression FAILS CI — record it here if it fires).
+- **The sweep's NEW ARM — the orphan fix's first production sweep (this
+  window's own verification arm).** `ada3b73` (the sweep's orphan escape —
+  the join-side NULL, not the column-side; the demo day-one finding's fix)
+  rides this deploy: the dangling `dp3t/p0-shallow` row (`repo_id`
+  `fdf47576-749c-45a3-bbf1-cb47359ec328`, `owner_id=55` with NO users row
+  — RD24's hand-D1-delete debris; `docs/reviews/demo-day1-2026-10-28.md`
+  §4-§5) should finally enqueue past retention and go through the FULL
+  cascade — the observable is the cleanup-audit's `"action"` whole-table
+  arm (expects 0; the debris row IS the current 1) going green with the
+  repo row gone. Record what the sweep actually did `__BLANK__` — the
+  sweep, not the round, converges the orphan: if the row is not yet past
+  the 72 h retention at window time, record the enqueue-or-pending state
+  honestly (the fix's own doctrine; its dedicated orphan arm pins
+  past-retention → enqueued, inside → not, admin-exempt unchanged). The
+  standing fixture `p0probe/p0-shallow` stays admin-exempt and untouched
+  (cleanup-audit still expects `owner_repos=1`).
+- **THE DEMO POSTURE DRIFT CHECK — preserved through the window (runbook
+  §1.4, re-verified before any config edit):** the real config's
+  `DEMO_MODE="true"`, `ALLOW_SIGNUP="true"`, the `cf-gitea-demo.aiapp.run`
+  custom-domain route, `workers_dev: true`, and `APP_URL` = the workers.dev
+  origin ride the deploy UNTOUCHED; the window's edit touches ONLY
+  `compatibility_date` + its comment. Never regenerate the real config
+  from the example — the example defaults BOTH gates `"false"` and carries
+  no route; restoring from it would silently stand the demo down (the
+  gates are fail-closed).
+- **Rollback — the runbook's two-halves doctrine by reference (§8):**
+  half 1, the deployed artifact: `wrangler rollback <pre-RD25 version id>`
+  (RD24b's freeze `1235b4d0` or any later), re-verify PROD + DEMO healthz
+  and the demo posture; D1 needs NOTHING (RD25 ships no migration —
+  0036/0037 are index-only and applied). Half 2, the tree's toolchain
+  (any pool/dev/workerd misbehavior attributed to the moved override):
+  restore the three paths from PRE_BUMP_COMMIT via `git checkout` (never
+  reset/rebase), HAND-restore the gitignored config's compat date to
+  `2026-10-19`, `pnpm install`, re-verify. A reverted window is a verdict,
+  not a silence — record it in this block either way.
+- **Cleanup audit / PAT teardown**: `__BLANK__` — expected: every battery
+  self-cleaned, mint-per-run PAT (0600 temp file, shred at wrap; RD24
+  runbook §5.1 discipline verbatim, `/tmp/rd25-*` names) deleted at wrap
+  close, `personal_access_tokens` back to the standing bootstrap = 1,
+  `owner_repos=1` (p0-shallow), and — once the orphan cascade lands — the
+  `"action"` whole-table count at its expected 0.
+
+*(REDEPLOY25 — TEMPLATE pre-drafted by the RD25-template unit, 2026-10-28,
+append-only to this file; every structural claim verified against the tree
+at HEAD `ada3b73`: the five bump versions + override + compat dates (runbook
+§2), the twelve battery names (`deploy-probes.mjs:251`) and the arm ids
+(`:2765`, `:3676`, `:3687`, `:3706`, `:3719`), the delete-husk hardcoded
+date (`check-delete-husk.mjs:131`), the migration tail
+(`0037_smart_blizzard.sql` is the last file on disk), the calibration
+commit (`f33860e` — `scripts/bench-baselines/ci.json` +51), and the orphan
+fix (`ada3b73`, HEAD) with its target row
+(`fdf47576-749c-45a3-bbf1-cb47359ec328`,
+`docs/reviews/demo-day1-2026-10-28.md:242`; `"action"` expects 0 per
+`AUDIT_TABLES` in `deploy-probes.mjs`). The orchestrator fills the
+`__BLANK__` slots at window close per runbook §7.1 — header slots first
+(TIME · PRE_BUMP_COMMIT · GO_COMMIT · the deploy Version ID · healthz on
+BOTH surfaces).)*
