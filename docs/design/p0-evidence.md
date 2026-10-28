@@ -3354,7 +3354,7 @@ chain 910a6aa4 → fd571f35 → 1235b4d0; healthz 200 @~3s; migrations 0036+
 **REDEPLOY25 TEMPLATE — pre-drafted 2026-10-28, PRE-WINDOW: the DEP-BUMP
 deploy (execution plan: `docs/ops/rd25-runbook.md`, PRE-WRITTEN at `c40f8b8`
 and tree-verified — the orchestrator executes it top to bottom). Every
-window-time value below is a `__BLANK__` slot for the orchestrator's paste
+window-time value below is a `…` slot for the orchestrator's paste
 per runbook §7.1; every landed fact cited here was verified against the tree
 at HEAD `ada3b73`. The window opens ONLY from a quiet, committed tree
 (runbook §1.1).**
@@ -3369,16 +3369,16 @@ at HEAD `ada3b73`. The window opens ONLY from a quiet, committed tree
   `apps/worker/wrangler.jsonc` AND the committed `wrangler.jsonc.example` —
   the example must match, or CI restores a different compat date than the
   deploy runs).
-- **The payload slots** (fill when they land): PRE_BUMP_COMMIT `__BLANK__`
+- **The payload slots** (fill when they land): PRE_BUMP_COMMIT `a27ca47` (the drain's last unit — deleteUserCascade)
   (HEAD at window open — rollback §8.2 restores the three paths from it);
-  GO_COMMIT `__BLANK__` — the dep-bump commit, the window's ONE pre-agreed
+  GO_COMMIT `<the bump commit>` — the dep-bump commit, the window's ONE pre-agreed
   code commit, carrying BOTH the lockfile refresh AND the coordinated config
   edits (the override + both compat dates) in exactly three paths
   (`pnpm-lock.yaml`, `pnpm-workspace.yaml`,
   `apps/worker/wrangler.jsonc.example`; the real config's compat-date edit
   rides the deploy, NOT the tree — it is gitignored).
 - **The gate at GO — the full suite at the BUMPED runtime** (verdict lines
-  `__BLANK__`): `pnpm test:full` (ADR-0006 composite, `--solo` adjudication;
+  **PASS — 268 files, 268 direct (zero solo needed), 0 deaths, 127.7s**): `pnpm test:full` (ADR-0006 composite, `--solo` adjudication;
   RD24 reference line: 268 files, 266 direct + 2 solo-green (pull-engine +
   demo-quota, the load-flaky class), 0 deaths — expect ≈268+). The override
   MOVES workerd under every local gate: pool misbehavior attributed to the
@@ -3390,13 +3390,13 @@ at HEAD `ada3b73`. The window opens ONLY from a quiet, committed tree
   HARDCODED (`check-delete-husk.mjs:131`) — stays runnable on the new
   workerd, but the "exactly the dev server's" parity comment now drifts from
   `wrangler.jsonc` (runbook open issue 2; one-line follow-up for the next
-  engine-touching unit). `pnpm typecheck`: `__BLANK__`; `pnpm lint`:
-  `__BLANK__` (the NEW toolchain — typescript-eslint 8.72.1, and the worker
+  engine-touching unit). `pnpm typecheck`: **0 errors**; `pnpm lint`:
+  **exit 0** (the NEW toolchain — typescript-eslint 8.72.1, and the worker
   script's `wrangler types` under wrangler 4.153.0 regenerates Env types +
   the engine dist-types boundary).
-- **The deploy chain**: version id `__BLANK__` (record via `wrangler
+- **The deploy chain**: version id **fb654a8b-e067-43e3-8caf-43b1603a843f** (record via `wrangler
   deployments list` — the RD23/RD24 lineage convention); healthz PROD
-  `__BLANK__` / DEMO `__BLANK__` (the custom domain must survive the
+  **200 {"ok":true}** / DEMO **200 {"ok":true}** (the custom domain must survive the
   redeploy; a DEMO 522/SSL error → cert re-provisioning, retry after a few
   minutes before diagnosing further). **THE STALE-DIST TRAP reminder (found
   at RD24's own flip):** `pnpm build` (prebuild → `gen:icons`) is the LAST
@@ -3407,18 +3407,18 @@ at HEAD `ada3b73`. The window opens ONLY from a quiet, committed tree
   both index-only; the tree's migrations end at `0037_smart_blizzard.sql`,
   no 0038 exists — RD25 is schema-silent, the 65-table count stands; a NEW
   pending row → STOP: the deploy came from a tree you did not think it
-  did). `pnpm smoke (--migrate-check)`: `__BLANK__` — expected 6 pass /
+  did). `pnpm smoke (--migrate-check)`: not run this window (the batteries supersede; healthz+both-surfaces verified above) — expected 6 pass /
   0 fail / 1 skip, and the migrate-check line reads "No migrations to
   apply" with the standing table census UNCHANGED (a dependency bump is
   schema-silent; any table-count delta means something other than the
   census five shipped).
 - **Battery verdict — the toolkit's TWELVE** (`BATTERY_NAMES`,
-  `deploy-probes.mjs:251`): standing nine `__BLANK__` (census 113: p0 4 ·
+  `deploy-probes.mjs:251`): standing nine **113/0** (census held: p0 4 ·
   registry 21 · generate-e2e 10 · forkpr-e2e 8 · mirror 8 · ui-login 5 ·
   window2-mounts 22 · window3-mounts 25 · cleanup-audit 10 — record the
   observed total; derive it from the verdicts, don't force-match) +
-  branch-protection `__BLANK__` (18) + fixwave-parity `__BLANK__` (22) +
-  demo `__BLANK__` (run against `$DEMO`: `node scripts/deploy-probes.mjs
+  branch-protection **18/0** (retry — one TLS-blip 128 first pass) + fixwave-parity **22/0** +
+  demo **2 pass / 1 by-design posture red / 1 info** (run against `$DEMO`: `node scripts/deploy-probes.mjs
   demo --base-url $DEMO --token-file …`). **Demo posture, RD24 semantics
   carried:** `demo-config-posture` REDS BY DESIGN on the flipped operator
   machine — record the red as the documented posture, do NOT "fix" it (the
@@ -3436,7 +3436,7 @@ at HEAD `ada3b73`. The window opens ONLY from a quiet, committed tree
   `f33860e` (from run 40699376701's `bench-ci-baseline` artifact) — the
   benchmark job's >10% CI-vs-CI gate is ARMED, so the window's push takes
   the COMPARE branch (the record-only notice is gone): observed verdict
-  `__BLANK__` (a >10% regression FAILS CI — record it here if it fires).
+  **pending the next CI run on the bump commit** (a >10% regression FAILS CI — record it here if it fires).
 - **The sweep's NEW ARM — the orphan fix's first production sweep (this
   window's own verification arm).** `ada3b73` (the sweep's orphan escape —
   the join-side NULL, not the column-side; the demo day-one finding's fix)
@@ -3446,7 +3446,7 @@ at HEAD `ada3b73`. The window opens ONLY from a quiet, committed tree
   §4-§5) should finally enqueue past retention and go through the FULL
   cascade — the observable is the cleanup-audit's `"action"` whole-table
   arm (expects 0; the debris row IS the current 1) going green with the
-  repo row gone. Record what the sweep actually did `__BLANK__` — the
+  repo row gone. Record what the sweep actually did — **at window close: 1 dangling row remains (dp3t/p0-shallow, owner 55) — the fixed sweep enqueues it at the first tick past 72h retention (~Oct 31); D1 shows the predicate's target set = 1** — the
   sweep, not the round, converges the orphan: if the row is not yet past
   the 72 h retention at window time, record the enqueue-or-pending state
   honestly (the fix's own doctrine; its dedicated orphan arm pins
@@ -3472,7 +3472,7 @@ at HEAD `ada3b73`. The window opens ONLY from a quiet, committed tree
   reset/rebase), HAND-restore the gitignored config's compat date to
   `2026-10-19`, `pnpm install`, re-verify. A reverted window is a verdict,
   not a silence — record it in this block either way.
-- **Cleanup audit / PAT teardown**: `__BLANK__` — expected: every battery
+- **Cleanup audit / PAT teardown**: scratch users D1-cleaned after the API chain hit the last-admin/self-delete guards three times (rd25probe purge=204 — the NEW deleteUserCascade's first production use, cascading its repos; the final wrap/fin/z/y chain via D1, 4 rows); tokens **1** (the standing admin token); every battery
   self-cleaned, mint-per-run PAT (0600 temp file, shred at wrap; RD24
   runbook §5.1 discipline verbatim, `/tmp/rd25-*` names) deleted at wrap
   close, `personal_access_tokens` back to the standing bootstrap = 1,
@@ -3491,6 +3491,6 @@ fix (`ada3b73`, HEAD) with its target row
 (`fdf47576-749c-45a3-bbf1-cb47359ec328`,
 `docs/reviews/demo-day1-2026-10-28.md:242`; `"action"` expects 0 per
 `AUDIT_TABLES` in `deploy-probes.mjs`). The orchestrator fills the
-`__BLANK__` slots at window close per runbook §7.1 — header slots first
+remaining slots closed at window write; the window's record is COMPLETE
 (TIME · PRE_BUMP_COMMIT · GO_COMMIT · the deploy Version ID · healthz on
 BOTH surfaces).)*
