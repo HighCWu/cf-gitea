@@ -54,18 +54,18 @@ import { usableUsernameError } from "./orgs/orgs";
 
 /**
  * The env this service + the first-run router read. `ALLOW_SIGNUP` rides
- * wrangler `vars` (the deploy-page-visible surface) but is kept OPTIONAL
- * here on purpose: the real (gitignored) wrangler.jsonc does not declare it
- * until its operator adds it, so the generated Env never carries it — the
- * same posture as `MirrorSyncEnv.MIRROR_EGRESS_MODE` (services/mirror/
- * sync.ts). The generated Env satisfies this structurally.
+ * wrangler `vars` (the deploy-page-visible surface); BOTH configs declare it
+ * (default `"false"`), so the generated Env types it as that literal — this
+ * alias widens it back to `string | undefined` so tests and any config shape
+ * stay assignable (the `MirrorSyncEnv.MIRROR_EGRESS_MODE` posture,
+ * services/mirror/sync.ts). The generated Env satisfies this structurally.
  */
-export interface FirstRunEnv extends Env {
+export type FirstRunEnv = Omit<Env, "ALLOW_SIGNUP"> & {
   /** `"true"` enables self-registration. Absent, empty, or anything else →
    *  registration closed (the self-host default; upstream's
    *  DISABLE_REGISTRATION default is true, setting/service.go:148). */
   ALLOW_SIGNUP?: string;
-}
+};
 
 /** The gate, absent-safe: FALSE unless the var is explicitly on. */
 export function allowSignup(env: FirstRunEnv): boolean {

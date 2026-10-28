@@ -74,7 +74,7 @@ async function request(
   init?: RequestInit,
   options?: { allowSignup?: string },
 ): Promise<Response> {
-  const testEnv: UiTestEnv & { ALLOW_SIGNUP?: string } = {
+  const testEnv: Omit<UiTestEnv, "ALLOW_SIGNUP"> & { ALLOW_SIGNUP?: string } = {
     ...env,
     ASSETS: fakeAssets,
     ALLOW_SIGNUP: options?.allowSignup,

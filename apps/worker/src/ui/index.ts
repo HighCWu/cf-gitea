@@ -3951,7 +3951,7 @@ function isAssetsFetcher(value: unknown): value is UiAssetsFetcher {
  *  until then this returns `undefined` → `AssetBuildError` → the 503. The
  *  `in` check narrows the unlisted member to `unknown` (TS 4.9+); the shape
  *  guard keeps a stray non-fetcher binding from reaching loadManifest. */
-export function assetsBinding(env: Env): UiAssetsFetcher | undefined {
+export function assetsBinding(env: Pick<Env, "ASSETS">): UiAssetsFetcher | undefined {
   if ("ASSETS" in env) {
     const binding: unknown = env.ASSETS;
     if (isAssetsFetcher(binding)) return binding;
