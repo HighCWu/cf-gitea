@@ -5,7 +5,8 @@
  *
  * SEAM (packages/git-engine mod.ts:1043-1052): after `finalizeReceive` returns
  * `committed` with at least one applied ref update, the engine calls
- * `options.onPush({ repo, updates, commitTime, pusherId?, pusherLogin? }, env)`
+ * `options.onPush({ repo, updates, commitTime, pusherId?, pusherLogin?,
+ * origin? }, env)`
  * inside `ctx.waitUntil`
  * — off the response path, with a catching wrapper so a throwing hook can
  * never fail an already-applied push. `updates` is the exact applied delta
@@ -169,11 +170,11 @@ export const DISMISS_STALE_MESSAGE =
  */
 export interface WebhookPushEnv extends Pick<Env, "DB" | "REPO" | "REPO_PACKS"> {
   /** Upstream `setting.AppURL` — the instance origin the §2.7 payload URLs
-   *  are built against. Optional IN THIS SLICE (the generated Env types the
-   *  declared var as required): unset, request-serving emitters fall back to
-   *  the serving request's origin (appOrigin's chain), and the engine's
-   *  onPush seam — which carries no request — plus the queue/cron emitters
-   *  fall back to upstream's own default ROOT_URL, `http://localhost:3000`
+   *  are built against, and the TOP of the appOrigin chain: unset,
+   *  request-serving emitters fall back to the receive's origin (the engine's
+   *  `PushEvent.origin`, then the threaded request origin — appOrigin's
+   *  chain), and the queue/cron emitters (which carry neither) fall back to
+   *  upstream's own default ROOT_URL, `http://localhost:3000`
    *  (modules/setting/server.go:119-120) — payloads stay upstream-shaped and
    *  absolute, exactly like a default-installed gitea without ROOT_URL. */
   APP_URL?: string;
@@ -207,16 +208,32 @@ interface PushActionContent {
  *  explicitly. */
 const DEFAULT_APP_URL = "http://localhost:3000";
 
-/** `setting.AppURL` equivalent: the optional APP_URL var, falling back to the
- *  serving request's origin when the caller has one (the wiki.ts `options.origin`
+/** `setting.AppURL` equivalent — the payload-URL origin chain, in precedence
+ *  order: the optional APP_URL var, then the engine's `PushEvent.origin`
+ *  (the receive request's literal scheme+authority, derived at the engine's
+ *  emission site — packages/git-engine NOTICE 2026-10-28 row), then the
+ *  caller-threaded serving request's origin (the wiki.ts `options.origin`
  *  pattern — a fresh deployment on *.workers.dev needs zero configuration),
  *  then upstream's default ROOT_URL for the truly off-request emitters (the
- *  queue/cron contexts), trailing slashes trimmed like upstream's AppURL
+ *  queue/cron contexts). Trailing slashes trimmed like upstream's AppURL
  *  normalization (server.go:127-137). Exported for the other emitters (the
  *  push-create settle, the fork viewer) that build payload URLs off the same
- *  chain. */
-export function appOrigin(env: WebhookPushEnv, requestOrigin?: string): string {
-  return (env.APP_URL ?? requestOrigin ?? DEFAULT_APP_URL).replace(/\/+$/, "");
+ *  chain — sibling call sites pass a single origin positionally (arg 2 stays
+ *  the threaded request origin for them).
+ *
+ *  PRECEDENCE (pinned): the var still wins. The event leg outranks the
+ *  threaded leg because it comes from the very receive that produced the
+ *  push (the emission-site derivation holds the live request; when both
+ *  legs ride they name the same request, the engine's being authoritative).
+ *  THE PROXY STANCE: upstream rewrites AppURL from X-Forwarded-*; we ship
+ *  the literal request origin — the engine deliberately did NOT port those
+ *  rewrites and left proxy decisions "to the worker consumer" (the engine
+ *  NOTICE row's own words), so the decision lives HERE: a proxied
+ *  deployment wanting rewritten origins sets the APP_URL var, which
+ *  outranks everything above. Treat event/request origins as client-visible
+ *  data (the NOTICE row's caveat), never as an authenticated value. */
+export function appOrigin(env: WebhookPushEnv, requestOrigin?: string, eventOrigin?: string): string {
+  return (env.APP_URL ?? eventOrigin ?? requestOrigin ?? DEFAULT_APP_URL).replace(/\/+$/, "");
 }
 
 /** Upstream `RefName.RefType` (modules/git/ref.go:221-231) reduced to the
@@ -291,10 +308,16 @@ export interface WebhookPushOptions {
    *  identity-less receive, tests) attributes the rows to no poster. */
   pusherId?: number | null;
   /** The serving request's origin for the payload URLs (the wiki.ts
-   *  `options.origin` pattern) — used only when the APP_URL var is unset
-   *  (the var wins). Absent (queue/cron emitters, tests) → the env/default
-   *  chain. */
+   *  `options.origin` pattern) — outranked by the APP_URL var and by the
+   *  engine's `eventOrigin` below; still outranks the default. Absent
+   *  (queue/cron emitters, tests) → the chain above. */
   origin?: string;
+  /** The engine `PushEvent.origin` — the receive request's literal origin,
+   *  derived at the engine's emission site (packages/git-engine NOTICE
+   *  2026-10-28 row). Sits between the APP_URL var and the threaded request
+   *  origin in the appOrigin chain; the literal origin ships, never a
+   *  proxy-header rewrite (the proxy stance lives on appOrigin). */
+  eventOrigin?: string;
 }
 
 /** The compat-frozen PushPayload field set (SPEC-0005 §2.7,
@@ -348,7 +371,7 @@ export async function emitPushFamilyUpdates(
   if (notifiable.length === 0) return;
 
   try {
-    const origin = appOrigin(env, options.origin);
+    const origin = appOrigin(env, options.origin, options.eventOrigin);
     const queue = webhookDeliveryQueue(env);
     const enqueue =
       queue === null
@@ -1121,10 +1144,13 @@ export interface UserPushNotificationOptions {
   /** Test clock for the delivery rows. */
   now?: Date;
   /** The serving request's origin for the payload URLs (the wiki.ts
-   *  `options.origin` pattern) — used only when the APP_URL var is unset.
-   *  Absent (the engine's onPush seam carries no request) → the env/default
-   *  chain. */
+   *  `options.origin` pattern) — outranked by the APP_URL var and by
+   *  `eventOrigin` below. Absent → the chain above. */
   origin?: string;
+  /** The engine `PushEvent.origin` — the receive request's literal origin
+   *  (the onPush seam's emission-site derivation). Outranked only by the
+   *  APP_URL var; outranks `origin`. */
+  eventOrigin?: string;
 }
 
 /**
@@ -1156,7 +1182,7 @@ export async function handleUserPushNotifications(
       console.error(`[push-webhook] ${repo.ownerNamespace}/${repo.slug}: owner row missing — webhook notifications skipped`);
       return;
     }
-    const origin = appOrigin(env, options.origin);
+    const origin = appOrigin(env, options.origin, options.eventOrigin);
     const viewer: Viewer = { origin, requester: null };
     const sender = apiUserFromRow(pusher ?? pair.owner, viewer);
     const identity: WebhookPushIdentity = {
@@ -1168,6 +1194,7 @@ export async function handleUserPushNotifications(
     await emitPushFamilyUpdates(env, pair, identity, updates, walk, {
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(options.origin !== undefined ? { origin: options.origin } : {}),
+      ...(options.eventOrigin !== undefined ? { eventOrigin: options.eventOrigin } : {}),
       // The sync arms' comment attribution rides the authenticated pusher
       // (upstream CreatePushPullComment's Doer); null attributes to no poster.
       pusherId: pusher?.id ?? null,
@@ -1181,7 +1208,8 @@ export async function handleUserPushNotifications(
 }
 
 /** The engine `PushEvent` — the adapter consumes it verbatim so the
- *  entrypoint wiring stays a one-liner. */
+ *  entrypoint wiring stays a one-liner; `origin` (when the engine derived it
+ *  from the receive request) threads into the payload-URL chain below. */
 export type PushEventLike = PushEvent;
 
 export interface PushReviewLegsOptions {
@@ -1370,7 +1398,10 @@ async function applyPushReviewLegs(
  * no longer resolves and every identity-less receive (repositories without a
  * D1 row — the transitional engine-only population, incl. the e2e suite — and
  * the receive warm-up probes) have no hooks or fall back to the owner —
- * silent no-op or owner attribution, never a log storm.
+ * silent no-op or owner attribution, never a log storm. `event.origin` (the
+ * engine's emission-site derivation, when present) threads into
+ * `handleUserPushNotifications` as the payload-URL chain's event leg — the
+ * APP_URL var still outranks it (appOrigin's pinned precedence).
  */
 export async function handleUserPushEvent(env: WebhookPushEnv, event: PushEventLike): Promise<void> {
   if (event.updates.length === 0) return;
@@ -1390,7 +1421,15 @@ export async function handleUserPushEvent(env: WebhookPushEnv, event: PushEventL
   if (event.pusherId !== undefined) {
     pusher = (await drizzle(env.DB).select().from(users).where(eq(users.id, event.pusherId)).get()) ?? null;
   }
-  await handleUserPushNotifications(env, pair.repo, updates, pusher);
+  await handleUserPushNotifications(env, pair.repo, updates, pusher, {
+    // The engine's emission-site origin (PushEvent.origin — packages/git-engine
+    // NOTICE 2026-10-28 row): the receive request's literal scheme+authority
+    // becomes the payload-URL base unless the APP_URL var outranks it. The
+    // literal origin ships — upstream's X-Forwarded-* rewrite deliberately
+    // lives with the consumer (a proxied deployment wanting rewritten origins
+    // sets the var; the full stance on appOrigin).
+    ...(event.origin !== undefined ? { eventOrigin: event.origin } : {}),
+  });
   // SPEC-0013 §3.4 — the head-push stale/dismiss legs beside the notification
   // fan-out (same never-fail-the-push posture: the applied push stands).
   try {

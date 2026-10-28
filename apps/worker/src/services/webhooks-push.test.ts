@@ -42,7 +42,9 @@
  * explicit users-row override) and the missing-owner/unknown-repo degrades.
  *
  * The payload-URL origin chain (appOrigin): the APP_URL var wins, else the
- * serving request's origin (the options.origin thread — zero-config fresh
+ * engine's PushEvent.origin (the receive request's origin, derived at the
+ * engine's emission site — the adapter threads it), else the serving
+ * request's origin (the options.origin thread — zero-config fresh
  * deployments), else upstream's default ROOT_URL.
  */
 
@@ -534,8 +536,11 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
     // `skipped` is the missing/inactive-hook branch, not this fixture.
     expect(rows.map((r) => r.state)).toEqual(["delivered", "delivered", "delivered", "delivered"]);
 
-    // The branch's zero-commit push payload (§2.7 PushPayload field set;
-    // APP_URL unset → upstream's default ROOT_URL origin).
+    // The branch's zero-commit push payload (§2.7 PushPayload field set).
+    // ORIGIN PRECEDENCE, end-to-end with both legs populated: the engine
+    // derived event.origin from THIS receive's request URL (https://example.com
+    // — the pushThroughGate base) and the adapter threads it, yet the varless
+    // fallback never shows — the configured APP_URL var outranks the event leg.
     const branchPush = JSON.parse(rows[0]!.payloadContent) as Record<string, unknown>;
     expect(branchPush).toMatchObject({
       ref: "refs/heads/main",
@@ -934,7 +939,7 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
   });
 });
 
-describe("appOrigin — the APP_URL / request-origin / default chain", () => {
+describe("appOrigin — the APP_URL / event-origin / request-origin / default chain", () => {
   /** The real bindings, no APP_URL var: the fresh-deployment shape the
    *  request-origin fallback serves (the varless env throughout). */
   const bindings: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS };
@@ -949,6 +954,25 @@ describe("appOrigin — the APP_URL / request-origin / default chain", () => {
 
   it("the APP_URL var wins over the request origin (precedence pinned)", () => {
     expect(appOrigin({ ...bindings, APP_URL: "https://custom.example.com" }, "https://request.example.com")).toBe(
+      "https://custom.example.com",
+    );
+  });
+
+  it("unset var, the engine's event origin → the event origin (trimmed)", () => {
+    expect(appOrigin(bindings, undefined, "https://from-event.example.com/")).toBe("https://from-event.example.com");
+  });
+
+  it("the engine's event origin outranks the threaded request origin when both ride", () => {
+    expect(appOrigin(bindings, "https://request.example.com", "https://event.example.com")).toBe(
+      "https://event.example.com",
+    );
+  });
+
+  it("the APP_URL var wins over the engine's event origin too (the pinned top of the chain)", () => {
+    expect(appOrigin({ ...bindings, APP_URL: "https://custom.example.com" }, undefined, "https://event.example.com")).toBe(
+      "https://custom.example.com",
+    );
+    expect(appOrigin({ ...bindings, APP_URL: "https://custom.example.com" }, "https://request.example.com", "https://event.example.com")).toBe(
       "https://custom.example.com",
     );
   });
@@ -999,6 +1023,21 @@ describe("push-family payload origins — the request-origin fallback", () => {
     );
   });
 
+  it("APP_URL unset + the engine's event origin → payload URLs carry the EVENT origin", async () => {
+    expect(await createdRefCompareUrl(varlessEnv, "originevent", { eventOrigin: "https://from-event.push.workers.dev" })).toBe(
+      "https://from-event.push.workers.dev/",
+    );
+  });
+
+  it("the engine's event origin outranks the threaded request origin (payload-level precedence)", async () => {
+    expect(
+      await createdRefCompareUrl(varlessEnv, "origineventwin", {
+        eventOrigin: "https://event.example.com",
+        origin: "https://request.example.com",
+      }),
+    ).toBe("https://event.example.com/");
+  });
+
   it("APP_URL unset + no request origin → upstream's default ROOT_URL", async () => {
     expect(await createdRefCompareUrl(varlessEnv, "origindefault", {})).toBe("http://localhost:3000/");
   });
@@ -1007,6 +1046,101 @@ describe("push-family payload origins — the request-origin fallback", () => {
     // The real wrangler.jsonc env carries the var; the threaded origin must
     // NOT override it (custom-domain deployments keep their configured URLs).
     expect(await createdRefCompareUrl(env, "originvar", { origin: "https://request.example.com" })).toBe(`${EXPECTED_ORIGIN}/`);
+  });
+
+  it("APP_URL set → the var wins over the engine's event origin too (end-to-end)", async () => {
+    expect(await createdRefCompareUrl(env, "originvarevent", { eventOrigin: "https://event.example.com" })).toBe(`${EXPECTED_ORIGIN}/`);
+  });
+});
+
+describe("PushEvent.origin — the engine adapter threads the receive origin into the payload URLs", () => {
+  /** The bindings minus the APP_URL var — a varless deployment's env view
+   *  (the WebhookPushEnv pattern; the generated Env types the var required,
+   *  this structural slice is exactly what the adapter reads). */
+  const varlessBindings: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS };
+
+  it("the var outranks the live receive origin on the real path; a varless replay carries the event origin (workers.dev shape)", async () => {
+    const { row, token } = await seedRepoWithToken("pushorigin");
+    await seedHook({ repoId: row.id });
+
+    // Landing push 1 (branch create): the engine derives event.origin from
+    // THIS receive's URL (https://example.com, the pushThroughGate base) and
+    // the adapter threads it — yet the payload renders the APP_URL var.
+    const initial = await buildChainPack(null, [
+      { message: "base", files: [{ path: "README.md", content: "base\n" }], time: 1700000160 },
+      { message: "tip b", files: [{ path: "README.md", content: "b\n" }], time: 1700000161 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[1]!, ref: "refs/heads/main" }], initial.pack, token))
+        .status,
+    ).toBe(200);
+    let rows = await deliveries();
+    expect((JSON.parse(rows[0]!.payloadContent) as { compare_url: string }).compare_url).toBe(`${EXPECTED_ORIGIN}/`);
+    await clearDeliveries();
+
+    // Landing push 2 (branch update): the compare URL stays var-shaped.
+    const append = await buildChainPack(initial.tips[1]!, [
+      { message: "work", files: [{ path: "docs.md", content: "work\n" }], time: 1700000162 },
+    ]);
+    expect(
+      (
+        await pushThroughGate(
+          row,
+          wiredEngine,
+          [{ old: initial.tips[1]!, oid: append.tips[0]!, ref: "refs/heads/main" }],
+          append.pack,
+          token,
+        )
+      ).status,
+    ).toBe(200);
+    rows = await deliveries();
+    expect((JSON.parse(rows[0]!.payloadContent) as { compare_url: string }).compare_url).toBe(
+      `${EXPECTED_ORIGIN}/alice/pushorigin/compare/${initial.tips[1]}...${append.tips[0]}`,
+    );
+    await clearDeliveries();
+
+    // The varless *.workers.dev shape: the SAME delta replayed through the
+    // production adapter (handleUserPushEvent) with the event origin the
+    // engine would derive from a workers.dev receive. The cell holds the real
+    // objects (the landing pushes above), so the capped walk, the commit
+    // rendering and the file-list enrichment run for real — only the origin
+    // chain differs (var unset, event origin present).
+    await handleUserPushEvent(varlessBindings, {
+      repo: "alice/pushorigin",
+      updates: [{ ref: "refs/heads/main", old: initial.tips[1]!, new: append.tips[0]! }],
+      commitTime: 1700000162000,
+      origin: "https://pushorigin-test.whc.workers.dev",
+    });
+    rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push"]);
+    const payload = JSON.parse(rows[0]!.payloadContent) as {
+      compare_url: string;
+      commits: Array<{ id: string; url: string }>;
+      head_commit: { id: string; url: string } | null;
+    };
+    expect(payload.compare_url).toBe(
+      `https://pushorigin-test.whc.workers.dev/alice/pushorigin/compare/${initial.tips[1]}...${append.tips[0]}`,
+    );
+    // The commit URLs (toPayloadCommit) ride the same event origin.
+    expect(payload.commits.map((c) => c.url)).toEqual([
+      `https://pushorigin-test.whc.workers.dev/alice/pushorigin/commit/${append.tips[0]}`,
+    ]);
+    expect(payload.head_commit?.url).toBe(`https://pushorigin-test.whc.workers.dev/alice/pushorigin/commit/${append.tips[0]}`);
+  });
+
+  it("an event without origin keeps the downstream chain (varless adapter → upstream's default ROOT_URL)", async () => {
+    // event.origin absent (a request-less emitter's event shape) + varless
+    // bindings + no threaded origin → the chain's bottom leg.
+    const { row } = await seedRepoWithToken("pushnoorigin");
+    await seedHook({ repoId: row.id });
+    await handleUserPushEvent(varlessBindings, {
+      repo: "alice/pushnoorigin",
+      updates: [{ ref: "refs/heads/main", old: PUSH_ZERO_OID, new: "e".repeat(40) }],
+      commitTime: 0,
+    });
+    const rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
+    expect((JSON.parse(rows[0]!.payloadContent) as { compare_url: string }).compare_url).toBe("http://localhost:3000/");
   });
 });
 
