@@ -113,3 +113,20 @@ Plain `pnpm test` and solo runs keep full sourcemaps. The upstream
 chunked-warm-modules fix remains desirable (revisit trigger #2) but is no longer
 blocking. Cache note: the strip era grows a parallel fs-cache tree; a one-time
 `rm -rf apps/worker/node_modules/.vitest-cache` reclaims the keep-era one.
+
+## Addendum (2026-10-28, gate-resilience unit): the A10-L crash class does not reach the gate; the gate now enforces strip mode itself
+
+A10-L's "pool teardown crash" on a raw `src/ui` invocation reproduced as the
+SAME ws1009 startup-death class, purely env-conditional: unstripped, 134 ui
+files lost **97/134 runners at startup** (291 1009 lines = 97×3; every death
+"during started state"; zero unattributed/teardown events — 20-file chunks and
+the same-day stripped 262-file full run were clean), i.e. the per-invocation
+accumulated warm snapshot crossed the ~33.3 MiB cap — the threshold is warm
+BYTES, not file count. The gate's phase-1 shape (stripped, full suite) did not
+reproduce it, and the existing attribution + `--solo` machinery already
+adjudicates the class honestly if it ever returns. No chunked phase-1 and no
+teardown-retry arm were added (both would change or complicate verdict paths
+for a measured-empty population). The one landing: `main()` now forces
+`CF_TEST_STRIP_SOURCEMAPS=1` when unset (explicit `=0` honored with a warning),
+so direct `node scripts/full-suite-gate.mjs` invocations get the same immunity
+`pnpm test:full` already had. Verdict semantics above are unchanged.

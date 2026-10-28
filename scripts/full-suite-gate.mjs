@@ -18,6 +18,22 @@
 //            deaths persisting after that guard round fail the gate with the
 //            count — never silently skipped.
 //
+// Crash-class posture (measured 2026-10-28, the A10-L infra report): the
+// ws1009 death class is env-conditional, not scale-conditional. Without
+// CF_TEST_STRIP_SOURCEMAPS=1 a single `src/ui` invocation (134 files) lost
+// 97/134 runners at startup once the invocation's accumulated warm snapshot
+// crossed workerd's ~33.3 MiB inbound WebSocket cap (291 "Message is too
+// large" lines = 97 events x 3; every death "during started state"; every
+// 1009 event accounted by an attributed death — zero unattributed/teardown
+// population), while 20-file chunks stayed green and the STRIPPED full suite
+// (262 files) ran the same day with zero deaths and zero 1009 lines. The
+// gate therefore does not chunk phase-1 and has no teardown-retry arm: the
+// standing invocation (`pnpm test:full`) exports the strip var, and main()
+// below enforces it for direct invocations too (explicit =0 is honored with
+// a warning — the gate then attributes + solo-adjudicates the death era
+// honestly, exactly as in the unstripped era). Verdict semantics above are
+// untouched by the guard; see the ADR-0006 addendum for the full record.
+//
 // Verdict is PASS (exit 0) only when:
 //   - phase 1 has zero UNATTRIBUTED failures. An assertion failure (any failed
 //     test that is not a pure Test/Hook timeout) fails the gate immediately
@@ -682,6 +698,34 @@ export async function soloAdjudication({ pending, runOne, concurrency = 4, start
 // Main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Strip-mode guard (see the header's crash-class posture note). The vitest
+// plugin keys its strip transform on CF_TEST_STRIP_SOURCEMAPS === "1"; the
+// sourcemap byte family is the one that pushes the warm-snapshot message past
+// workerd's cap. runVitest passes process.env to children, so fixing it here
+// covers phase 1 and every solo re-run. Exported for probe scripts: pass a
+// custom env object to exercise the branches without spawning vitest.
+// ---------------------------------------------------------------------------
+
+export function ensureStripMode(env = process.env, log = console.log) {
+  const strip = env.CF_TEST_STRIP_SOURCEMAPS;
+  if (strip === undefined || strip === '') {
+    env.CF_TEST_STRIP_SOURCEMAPS = '1';
+    log(
+      '[gate] CF_TEST_STRIP_SOURCEMAPS was unset — forcing "1" (strip mode). ' +
+        'Without it the warm-snapshot message re-enters the ws1009 runner-death era ' +
+        '(measured 2026-10-28: 97/134 src/ui runners died in one unstripped invocation).'
+    );
+  } else if (strip !== '1') {
+    log(
+      `[gate] WARNING: CF_TEST_STRIP_SOURCEMAPS=${strip} — honoring it, but this runs the ` +
+        'UNSTRIPPED suite: expect mass ws1009 runner deaths in phase 1 (attributed + ' +
+        'solo-adjudicated honestly, at a large wall-time price).'
+    );
+  }
+  return env.CF_TEST_STRIP_SOURCEMAPS;
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) {
@@ -697,6 +741,8 @@ async function main() {
   }
 
   const gateStarted = Date.now();
+  ensureStripMode();
+
   const artifactDir = opts.baselineJson
     ? path.resolve(path.dirname(opts.baselineJson))
     : fs.mkdtempSync(path.join(os.tmpdir(), 'full-suite-gate-'));
@@ -814,7 +860,12 @@ async function main() {
     const evidence = {
       generatedAt: new Date().toISOString(),
       tool: 'scripts/full-suite-gate.mjs',
-      flags: { maxRetries: opts.maxRetries, solo: opts.solo, soloConcurrency: opts.soloConcurrency },
+      flags: {
+        maxRetries: opts.maxRetries,
+        solo: opts.solo,
+        soloConcurrency: opts.soloConcurrency,
+        stripSourceMaps: process.env.CF_TEST_STRIP_SOURCEMAPS ?? null,
+      },
       tree,
       expectedTestFiles: expected.length,
       verdict,
