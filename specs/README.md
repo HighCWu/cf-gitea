@@ -8,20 +8,16 @@ not yet ratified for implementation), **accepted** (orchestrator-reviewed, imple
 **TIER-1 COMPLETE — 78/78 paths, 129/129 operations** (commit dcb422f,
 2026-10-25 03:35 CST; the forks registration landed as REG-MERGE-4).
 
-**TIER-2 IN PROGRESS — 302/554 frozen-contract operations declared across 194 paths**
-(measured this run, 2026-10-25, at HEAD 2fce4cd via `pnpm check:api`; contract totals by
-tag: repository 229, user 98, organization 88, issue 72, admin 33, miscellaneous 14,
-package 9, notification 7, settings 4). Recent: issue comment/label/pin writes 60e3b0f,
-table-free misc/user reads 99efa92, notifications 2c69209 (+ migration 0011), admin
-71f0b7c, org labels 4211503, issue tables 4bb3c26 (+ migration 0012), repo extras 19 ops
-89f6f1b — one REG commit per family, declared 178→253; then misc-t3 signing-key + key
-stubs 497c973 (253→260), issue attachments bb909c7 / REG f31e1e9 (+ migration 0014,
-260→271), org teams c8c47af / REG 96e8625 (+ migration 0015, 271→291), user
-emails/keys/gpg tables + writes 822172b (+ migration 0016, 291→301), server-driven
-migrate route 0fe6b04 (301→302), list-page covering index aaf1abd (+ migration 0017,
-no API delta). In flight at this writing: the reviews wave (pull-review routes +
-migration 0018, uncommitted working-tree edits — will move the declared count),
-SPEC-0011 M3.5 acceptance-hardening tail landed (157e74e — the ledger row below now carries it), UI pages waves (wave-9 goldens uncommitted).
+**TIER-2 — 490/554 frozen-contract operations declared across 298 paths**
+(measured this run, 2026-10-28, via `pnpm check:api` — `PASS`; tier-1 remains
+terminal at 78/78 paths / 129/129 ops, dcb422f). The port-first matrix is
+saturated: the matrix-coverage census's yield curve called it — "ONE more
+batch, then SATURATED" — and batch 14 (`cee057b`) executed the census's gap
+list, leaving the port-first UI endgame's dispatchable board empty
+(`docs/testing/matrix-coverage-census.md`; the survey's tick-15 re-walked the
+headline unchanged). What is in flight at any given moment is the ledger rows'
+business below — they are the per-SPEC authority; this paragraph carries only
+the contract-count snapshot, so it stays count-fresh rather than wave-by-wave.
 
 Prior status snapshot (kept for the record): **2026-10-25 03:08 CST**. Three `pnpm check:api` readings —
 03:02:41, 03:06:31, 03:08:00 CST — all `PASS` at **77/78 paths, 127/129 ops** (one

@@ -5,10 +5,13 @@
  * wrangler.jsonc stays untouched).
  *
  * Integration test files call `applyAuthD1Migrations()` from a top-level
- * `beforeAll`: the vitest plugin's per-test storage isolation discards
- * writes made in `setupFiles`, but schema applied in `beforeAll` persists
- * for every test in the file (verified against @cloudflare/vitest-plugin
- * 1.4.7).
+ * `beforeAll`. Caution: the vitest plugin's storage isolation is per test —
+ * on the current @cloudflare/vitest-plugin it resets the isolated storage
+ * (D1 schema included) between tests, so schema applied in `beforeAll` does
+ * NOT persist for every test in the file (an earlier "persists" note here was
+ * empirically falsified: a test observed the reset and had to re-apply the
+ * migrations itself). Callers must not assume persistence across tests —
+ * re-apply (or otherwise provision the schema) wherever a test needs it.
  */
 
 import { applyD1Migrations } from "cloudflare:test";

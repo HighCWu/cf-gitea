@@ -493,9 +493,12 @@ commit (`pull-reviews.ts`, migration 0018).
 - **Merge queue / auto-merge schedule** — the 409 on
   `merge_when_checks_succeed` stands (`pulls.ts:1102-1105`); upstream's
   auto-merge deferral semantics (`check.go:187-190`) land with it, if ever.
-- **Tier-2 settings UI** — upstream's rule editor
-  (`routers/web/repo/setting/protected_branch.go`) is API-only for us; the API
-  family is the admin surface.
+- **Tier-2 settings UI** — no longer API-only: upstream's rule editor
+  (`routers/web/repo/setting/protected_branch.go`) has its cf-gitea counterpart
+  in the Hono-JSX settings panel landed at 4cdf464 (pages wave 15 — the
+  1296-line `src/ui/pages/branch-protection.tsx`, the 738-line wave-15 test
+  file, and the `settings-branches` golden); the API family remains the
+  programmatic surface.
 - **Glob complexity**: the full upstream glob grammar ports (§3.2) because it is
   small and load-bearing for matching; the **UI conveniences** around it
   (drag-order priority editing, matched-branch preview) stay out — the priority
