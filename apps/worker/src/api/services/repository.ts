@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
@@ -662,6 +662,27 @@ export async function findRepositoryByPath(
 export async function findRepositoryById(d1: D1Database, id: string): Promise<RepositoryWithOwner | null> {
   const rows = await repositoryWithOwnerQuery(d1).where(eq(repositories.id, id)).limit(1);
   return rows[0] ?? null;
+}
+
+/**
+ * `/repositories/{ids}` — the batch twin of `findRepositoryById` for the
+ * list-route prefetches (the query-shape audit's A6): one repositories ⋈
+ * users read for the page's distinct repo ids. Same join semantics, so an
+ * id with no joined owner row is simply absent from the map — callers
+ * render that exactly like the per-row null.
+ */
+export async function findRepositoriesByIds(d1: D1Database, ids: string[]): Promise<Map<string, RepositoryWithOwner>> {
+  const pairs = new Map<string, RepositoryWithOwner>();
+  if (ids.length === 0) {
+    return pairs;
+  }
+  const rows = await repositoryWithOwnerQuery(d1)
+    .where(inArray(repositories.id, ids))
+    .all();
+  for (const row of rows) {
+    pairs.set(row.repo.id, row);
+  }
+  return pairs;
 }
 
 /** User row by (case-insensitive) username, or null. */

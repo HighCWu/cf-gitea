@@ -60,6 +60,7 @@ import {
   parseQueryTime,
   parseStateFilter,
   parseTypeFilter,
+  prefetchIssueRenderContext,
   searchIssuesGlobally,
   toApiComment,
   toApiIssue,
@@ -74,7 +75,7 @@ import { parseMilestoneDeadline } from "../services/milestones";
 import { toApiPullRequest } from "../services/pulls";
 import {
   canViewRepositoryWithTeams,
-  findRepositoryById,
+  findRepositoriesByIds,
   findRepositoryByPath,
   repositoryPermissions,
   viewerOf,
@@ -961,7 +962,12 @@ export function registerIssueRoutes(
       limit: listOptions.limit,
     });
     setPaginationHeaders(c, total, listOptions);
-    const rendered = await Promise.all(items.map((issue) => toApiIssue(c.env.DB, viewer, found, issue)));
+    // The query-shape audit's A2: the per-issue enrichment selects (poster,
+    // labels, pin order, milestone, PR row) batch into one inArray read per
+    // entity kind for the page, handed to the render through the preload —
+    // the response shape is unchanged.
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, items);
+    const rendered = await Promise.all(items.map((issue) => toApiIssue(c.env.DB, viewer, found, issue, { context: renderContext })));
     return c.json(rendered, 200);
   });
 
@@ -1642,14 +1648,18 @@ export function registerIssueRoutes(
       limit: listOptions.limit,
     });
     setPaginationHeaders(c, total, listOptions);
-    const rendered: Issue[] = [];
-    for (const issue of items) {
-      const pair = await findRepositoryById(c.env.DB, issue.repoId);
-      if (pair === null) {
-        continue;
-      }
-      rendered.push(await toApiIssue(c.env.DB, viewer, pair, issue));
-    }
-    return c.json(rendered, 200);
+    // The query-shape audit's A6: the per-issue repo re-resolution batches
+    // into ONE inArray read for the page's distinct repo ids (a missing pair
+    // keeps the per-row skip), and the issue render batches like the
+    // repo-scoped list above; the render parallelizes over the page.
+    const pairsById = await findRepositoriesByIds(c.env.DB, [...new Set(items.map((issue) => issue.repoId))]);
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, items);
+    const rendered = await Promise.all(
+      items.map(async (issue) => {
+        const pair = pairsById.get(issue.repoId);
+        return pair === undefined ? null : toApiIssue(c.env.DB, viewer, pair, issue, { context: renderContext });
+      }),
+    );
+    return c.json(rendered.filter((item): item is Issue => item !== null), 200);
   });
 }

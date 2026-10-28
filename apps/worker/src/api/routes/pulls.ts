@@ -94,6 +94,7 @@ import {
   findPullRequestByIndex,
   findUnmergedPullRequest,
   listRepoPullRequests,
+  prefetchPullRequestRenderContext,
   pullRequestAlreadyExistsError,
   pullRequestNotExistError,
   resolveHeadRepo,
@@ -911,7 +912,14 @@ export function registerPullRoutes(
       limit: listOptions.limit,
     });
     setPaginationHeaders(c, total, listOptions);
-    const rendered = await Promise.all(items.map(({ issue, pullRequest }) => toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "list")));
+    // The query-shape audit's A3 (the heaviest list): the per-PR enrichment
+    // (issue posters/labels/pins/milestones via the B1 PR-row pass-through,
+    // mergers, fork head-repo pairs + one grant per distinct head) batches
+    // into a constant number of page-scoped reads; response unchanged.
+    const renderContext = await prefetchPullRequestRenderContext(c.env.DB, viewer, found, items);
+    const rendered = await Promise.all(
+      items.map(({ issue, pullRequest }) => toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "list", undefined, { context: renderContext })),
+    );
     return c.json(rendered, 200);
   });
 

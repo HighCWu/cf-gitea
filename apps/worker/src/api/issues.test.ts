@@ -25,6 +25,7 @@ import {
   issueAttachments,
   issueContentHistory,
   issueDependencies,
+  issuePins,
   issueStopwatches,
   issues,
   labels,
@@ -2204,5 +2205,88 @@ describe("blocked-user enforcement (ErrBlockedUser arms)", () => {
     });
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A2) — the issues
+// list used to pay one poster/label/pin (plus milestone/PR-row when set)
+// select PER ROW; the page now prefetches one inArray read per entity kind
+// and renders through toApiIssue's optional preload. Same metering pattern
+// as bench-d1.test.ts's wrapper, route-level: a prepare()-counting D1
+// wrapper rides app.fetch's env parameter (the routes read c.env.DB), so
+// the counter is the request's exact D1 roundtrip count.
+// ---------------------------------------------------------------------------
+
+/** prepare()-counting D1 wrapper: every drizzle statement enters through one
+ *  prepare() call. Scoped to the requests that pass the returned env. */
+function countedD1(): { db: D1Database; count: () => number } {
+  let statements = 0;
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    return env.DB.prepare(query);
+  };
+  return { db: wrapper, count: () => statements };
+}
+
+describe("issues list query-shape witness (query-shape-audit A2)", () => {
+  it("renders the page with a constant statement count, deep-equal to the per-row single GETs", async () => {
+    const owner = await seedUser("Alice");
+    const other = await seedUser("Bob");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const bug = await seedLabel(repoId, "bug");
+    const ui = await seedLabel(repoId, "ui");
+    const v1 = await seedMilestone(repoId, "v1");
+    // Every enrichment shape on one page: two posters, two labels (second
+    // issue attaches them REVERSED — render order is label-id order either
+    // way), a real milestone, a dangling milestone id (the audit's deleted
+    // edge → null), a closed row, a pin, and one PR row.
+    const first = await seedIssue(repoId, "labeled milestone", { posterId: owner.id, labelIds: [bug, ui], milestoneId: v1 });
+    const second = await seedIssue(repoId, "labeled reversed", { posterId: other.id, labelIds: [ui, bug] });
+    await seedIssue(repoId, "plain", { posterId: owner.id });
+    const dangling = await seedIssue(repoId, "dangling milestone", { posterId: other.id });
+    await db().update(issues).set({ milestoneId: 999999 }).where(eq(issues.id, dangling.id));
+    await seedIssue(repoId, "closed one", { posterId: owner.id, closed: true });
+    const pr = await service().createPullRequest({
+      repoId,
+      title: "the PR",
+      posterId: other.id,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "feature",
+    });
+    await db().insert(issuePins).values({ issueId: first.id, repoId, pinOrder: 2 });
+
+    const app = createApiRouter();
+    const meter = countedD1();
+    const listRes = await app.fetch(new Request("https://example.com/repos/Alice/visible/issues?state=all"), {
+      ...env,
+      DB: meter.db,
+    });
+    expect(listRes.status).toBe(200);
+    const list = await listRes.json<Array<Record<string, unknown> & { number: number; labels: Array<{ name: string }>; pull_request: unknown }>>();
+    expect(list).toHaveLength(6);
+    const count = meter.count();
+    // Post-fix: 1 repo resolve + 2 (count + page) + 5 prefetch arms (posters,
+    // labels, pins, milestones, PR rows) = 8 — page-INDEPENDENT. The pre-fix
+    // shape (audit formula 2 + N×3..5) paid 1 + 2 + 6×3 + 2 milestones + 1
+    // PR row = 24 at this N; the bound below fails if any per-row fan
+    // returns (each issue's 3 reads alone would exceed it).
+    expect(count).toBeLessThanOrEqual(10);
+    expect(count).toBeLessThan(6 * 3);
+
+    // Contract discipline: the batched list render must be deep-equal to the
+    // per-row single-GET renders (the unbatched path) for every row —
+    // covers the null poster, the dangling-milestone null, pin_order, the
+    // PR meta block, and the label ordering in one sweep.
+    for (let index = 1; index <= 6; index++) {
+      const singleRes = await app.fetch(new Request(`https://example.com/repos/Alice/visible/issues/${index}`), env);
+      expect(singleRes.status).toBe(200);
+      const single = await singleRes.json<Record<string, unknown>>();
+      expect(single).toEqual(list.find((item) => item.number === index));
+    }
+    expect(list.find((item) => item.number === pr.issue.index)?.pull_request).not.toBeNull();
+    expect(list.find((item) => item.number === second.index)?.labels.map((l: { name: string }) => l.name)).toEqual(["bug", "ui"]);
   });
 });

@@ -1,22 +1,24 @@
 import { and, asc, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { issueLabels, labels, issues, pullRequests, repositories, users, PRFlow } from "../../db/schema";
+import { issueLabels, labels, issues, pullRequests, repositories, users, PRFlow, type TeamAccessMode } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { ApiError } from "../errors";
 import type { PullRequest, PRBranchInfo } from "../models/pull";
 import { findForkByOwner } from "./forks";
-import { hasWorkInProgressPrefix, toApiIssue } from "./issues";
+import { hasWorkInProgressPrefix, prefetchIssueRenderContext, toApiIssue, type IssueRenderContext } from "./issues";
 import { mergeableOfRow } from "./pull-engine";
 import {
   apiUserFromRow,
   canViewRepository,
+  findRepositoriesByIds,
   findRepositoryById,
   findRepositoryByPath,
   findUserByName,
   toApiRepository,
   viewerTeamAccessMode,
   type RepositoryWithOwner,
+  type UserRow,
   type Viewer,
 } from "./repository";
 
@@ -268,6 +270,67 @@ export async function listRepoPullRequests(
 // Converter — services/convert/pull.go toAPIPullRequest / ToAPIPullRequests
 // ---------------------------------------------------------------------------
 
+/** The page-scoped batch behind the list route's `toApiPullRequest` renders
+ *  (the query-shape audit's A3): the issue-side rows (A2's maps, feeding
+ *  toApiIssue through the B1 pass-through), the merger rows of the page's
+ *  merged PRs, and the FORK head-repo pairs with ONE resolved grant per
+ *  distinct head repo (the same-repo heads never enter the map — they were
+ *  already free). */
+export interface PullRequestRenderContext {
+  issue: IssueRenderContext;
+  /** Merger user rows by id (merged PRs only; a missing id renders the
+   *  per-row null `merged_by`). */
+  mergers: Map<number, UserRow>;
+  /** Head-repo pairs by repo id (a missing id renders the hidden-head
+   *  defaults, exactly like the per-row `findRepositoryById` null). */
+  headRepos: Map<string, RepositoryWithOwner>;
+  /** One `viewerTeamAccessMode` resolution per `headRepos` entry (null =
+   *  the pure matrix decides — anonymous/admin/owner resolve without D1). */
+  headRepoModes: Map<string, TeamAccessMode | null>;
+}
+
+/**
+ * One batched read per entity kind for the page's PR rows, plus one grant
+ * resolution per DISTINCT fork head repo. Id lists stay far under the D1
+ * 100-variable cap (the paging clamps at 50 rows).
+ */
+export async function prefetchPullRequestRenderContext(
+  d1: D1Database,
+  viewer: Viewer,
+  basePair: RepositoryWithOwner,
+  rows: PullRequestWithIssue[],
+): Promise<PullRequestRenderContext> {
+  const mergerIds = [
+    ...new Set(
+      rows.flatMap(({ pullRequest }) =>
+        pullRequest.hasMerged && pullRequest.mergerId !== null && pullRequest.mergerId !== undefined
+          ? [pullRequest.mergerId]
+          : [],
+      ),
+    ),
+  ];
+  const headRepoIds = [
+    ...new Set(rows.flatMap(({ pullRequest }) => (pullRequest.headRepoId === basePair.repo.id ? [] : [pullRequest.headRepoId]))),
+  ];
+  const [mergerRows, headRepos, issue] = await Promise.all([
+    mergerIds.length > 0 ? drizzle(d1).select().from(users).where(inArray(users.id, mergerIds)).all() : Promise.resolve([]),
+    findRepositoriesByIds(d1, headRepoIds),
+    prefetchIssueRenderContext(d1, rows.map((row) => row.issue)),
+  ]);
+  const headRepoModes = new Map<string, TeamAccessMode | null>();
+  await Promise.all(
+    [...headRepos.values()].map(async (headPair) => {
+      headRepoModes.set(headPair.repo.id, await viewerTeamAccessMode(d1, viewer, headPair.repo));
+    }),
+  );
+  return {
+    issue,
+    mergers: new Map(mergerRows.map((row) => [row.id, row])),
+    headRepos,
+    headRepoModes,
+  };
+}
+
 /** `GetGitHeadRefName` — the base-repo PR head ref (models/issues/pull.go:406). */
 export function pullHeadRefName(index: number): string {
   return `refs/pull/${index}/head`;
@@ -328,6 +391,12 @@ function baseBranchInfo(viewer: Viewer, pair: RepositoryWithOwner, pr: PullReque
  * `LoadHeadRepo` errors out the whole converter — impossible there, the row
  * is NOT NULL); the AGit-flow arm (pull.go:156-161: head = the base repo,
  * name = "") has no D1 producer (every row is Github flow).
+ *
+ * `context` (optional) is the page-scoped `prefetchPullRequestRenderContext`
+ * result — the fork head pairs and their per-distinct-repo grant modes are
+ * then map reads; without it the per-row lookups run (single-item routes).
+ * A mode-map miss falls back to null (the pure matrix), which renders
+ * identically for the prefetch-filled maps the routes pass.
  */
 async function headBranchInfo(
   d1: D1Database,
@@ -335,6 +404,7 @@ async function headBranchInfo(
   pair: RepositoryWithOwner,
   pr: PullRequestRow,
   isPayload: boolean,
+  context?: PullRequestRenderContext,
 ): Promise<PRBranchInfo> {
   const sameRepo = pr.headRepoId === pair.repo.id;
   if (sameRepo) {
@@ -346,9 +416,12 @@ async function headBranchInfo(
       repo: toApiRepository(viewer, pair),
     };
   }
-  const headPair = await findRepositoryById(d1, pr.headRepoId);
+  const headPair = context === undefined ? await findRepositoryById(d1, pr.headRepoId) : (context.headRepos.get(pr.headRepoId) ?? null);
   if (headPair !== null) {
-    const teamMode = await viewerTeamAccessMode(d1, viewer, headPair.repo);
+    const teamMode =
+      context === undefined
+        ? await viewerTeamAccessMode(d1, viewer, headPair.repo)
+        : (context.headRepoModes.get(headPair.repo.id) ?? null);
     // Upstream's :197 disjunction minus the same-repo arm (handled above):
     // payload mode renders the fork regardless of the doer's permission.
     if (isPayload || canViewRepository(viewer, headPair.repo, teamMode)) {
@@ -392,6 +465,12 @@ async function headBranchInfo(
  * status machine (checking → null, mergeable → true, else false; a merged
  * PR → false) and `base.sha` from the base branch tip — list rendering keeps
  * the null/"" defaults to stay D1-only.
+ *
+ * `preloaded` (optional) is the list route's page-scoped
+ * `prefetchPullRequestRenderContext` — the enrichment reads then collapse to
+ * map lookups (and the caller-held PR row rides toApiIssue's B1 pass-through
+ * in BOTH modes, so the redundant pull_requests re-select never runs on a PR
+ * render). Without it the per-row reads run exactly as before.
  */
 export async function toApiPullRequest(
   d1: D1Database,
@@ -401,8 +480,11 @@ export async function toApiPullRequest(
   pr: PullRequestRow,
   mode: "single" | "list" | "payload",
   extras?: { mergeable?: boolean | null; baseSha?: string },
+  preloaded?: { context?: PullRequestRenderContext },
 ): Promise<PullRequest> {
-  const apiIssue = await toApiIssue(d1, viewer, pair, issue);
+  const context = preloaded?.context;
+  // B1 (query-shape audit): the PR row is in hand — never re-select it.
+  const apiIssue = await toApiIssue(d1, viewer, pair, issue, { prRow: pr, context: context?.issue });
   const htmlUrl =
     `${viewer.origin}/${encodeURIComponent(pair.repo.ownerNamespace)}/` +
     `${encodeURIComponent(pair.repo.slug)}/pulls/${issue.index}`;
@@ -414,12 +496,15 @@ export async function toApiPullRequest(
     mergedAt = pr.mergedAt === null || pr.mergedAt === undefined ? null : pr.mergedAt.toISOString();
     mergeCommitSha = pr.mergedCommitId ?? "";
     if (pr.mergerId !== null && pr.mergerId !== undefined) {
-      const merger = await drizzle(d1)
-        .select()
-        .from(users)
-        .where(eq(users.id, pr.mergerId))
-        .limit(1)
-        .then((rows) => rows[0]);
+      const merger =
+        context === undefined
+          ? await drizzle(d1)
+              .select()
+              .from(users)
+              .where(eq(users.id, pr.mergerId))
+              .limit(1)
+              .then((rows) => rows[0])
+          : context.mergers.get(pr.mergerId);
       mergedBy = merger === undefined ? null : apiUserFromRow(merger, viewer);
     }
   }
@@ -458,7 +543,7 @@ export async function toApiPullRequest(
     merged_by: mergedBy,
     allow_maintainer_edit: pr.allowMaintainerEdit,
     base: { ...baseBranchInfo(viewer, pair, pr), ...(extras?.baseSha === undefined ? {} : { sha: extras.baseSha }) },
-    head: await headBranchInfo(d1, viewer, pair, pr, mode === "payload"),
+    head: await headBranchInfo(d1, viewer, pair, pr, mode === "payload", context),
     merge_base: pr.mergeBase ?? "",
     due_date: apiIssue.due_date,
     created_at: apiIssue.created_at,

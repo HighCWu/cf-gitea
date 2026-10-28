@@ -24,7 +24,7 @@ import {
 } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssueError } from "../../issues/errors";
-import type { CommentRow, IssueRow, LabelRow } from "../../issues/service";
+import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
 import { ApiError } from "../errors";
 import type { Comment, Issue, TimelineComment } from "../models/issue";
 import type { User } from "../models/user";
@@ -35,6 +35,7 @@ import {
   findUserByName,
   GO_ZERO_TIME,
   type RepositoryWithOwner,
+  type UserRow,
   type Viewer,
 } from "./repository";
 
@@ -195,22 +196,28 @@ async function toPoster(d1: D1Database, viewer: Viewer, posterId: number | null)
   return row === undefined ? null : apiUserFromRow(row, viewer);
 }
 
-/** The PullRequestMeta block for PR issues (convert `issue.LoadPullRequest`). */
+/** The PullRequestMeta block for PR issues (convert `issue.LoadPullRequest`).
+ *  `preloadedRow` is the caller-held pull_requests row (toApiPullRequest's B1
+ *  pass-through — the audit's redundant re-select) or the page batch's row;
+ *  omitted keeps the per-row select for the single-item routes. */
 async function pullRequestMetaOf(
   d1: D1Database,
   pair: RepositoryWithOwner,
   origin: string,
   issue: IssueRow,
+  preloadedRow?: PullRequestRow,
 ): Promise<{ merged: boolean; merged_at: string | null; draft: boolean; html_url: string } | null> {
   if (!issue.isPull) {
     return null;
   }
-  const pr = await drizzle(d1)
-    .select()
-    .from(pullRequests)
-    .where(eq(pullRequests.issueId, issue.id))
-    .limit(1)
-    .then((rows) => rows[0]);
+  const pr =
+    preloadedRow ??
+    (await drizzle(d1)
+      .select()
+      .from(pullRequests)
+      .where(eq(pullRequests.issueId, issue.id))
+      .limit(1)
+      .then((rows) => rows[0]));
   const merged = pr?.hasMerged ?? false;
   return {
     merged,
@@ -235,26 +242,133 @@ async function pinOrderOf(d1: D1Database, issueId: number): Promise<number> {
   return row === undefined ? -1 : row.pinOrder;
 }
 
+// ---------------------------------------------------------------------------
+// Page-scoped render prefetch (the list routes' N+1 collapse)
+//
+// The query-shape audit (docs/research/query-shape-audit.md A2/A3): a list
+// page rendered one poster/label/pin/milestone/PR-row select PER ROW —
+// `2 + N×3..5` D1 roundtrips on the default /repos/{owner}/{repo}/issues page
+// (N=30) and more on /pulls. `prefetchIssueRenderContext` batches each arm
+// across the page into ONE inArray select per entity kind; the list routes
+// hand the maps to `toApiIssue` through its optional `preload`. Behavior
+// parity: a map miss renders exactly what the per-row select miss renders
+// (null poster, empty labels, the -1 pin sentinel, null milestone, no PR
+// meta) — the single-item routes keep the unbatched per-row path verbatim.
+// ---------------------------------------------------------------------------
+
+/** Per-entity page rows backing `toApiIssue`'s batched render. */
+export interface IssueRenderContext {
+  /** Poster rows by user id (a missing id renders the per-row null). */
+  posters: Map<number, UserRow>;
+  /** Label rows per issue id, each bucket in label-id order (the per-row
+   *  `issueLabelRows` orderBy, preserved by grouping the globally ordered
+   *  join rows). */
+  labelsByIssue: Map<number, LabelRow[]>;
+  /** Pin order per issue id; a missing issue renders the -1 sentinel. */
+  pinOrders: Map<number, number>;
+  /** Milestone rows by id; a deleted milestone row stays absent (null). */
+  milestones: Map<number, MilestoneRow>;
+  /** PR rows by issue id (PR issues only). */
+  pullRequestsByIssue: Map<number, PullRequestRow>;
+}
+
+/** Optional preloaded reads for `toApiIssue` — the list routes' batch
+ *  plumbing; omitted keeps the per-row selects (single-item routes). */
+export interface IssueRenderPreload {
+  /** The page context from `prefetchIssueRenderContext`. */
+  context?: IssueRenderContext;
+  /** The PR row the caller already holds (toApiPullRequest — the audit's B1
+   *  redundant-re-select fix). Takes precedence over the context map. */
+  prRow?: PullRequestRow;
+}
+
+/**
+ * One batched read per entity kind for the page's rows (posters, the label
+ * join, pin orders, milestones, PR rows), fanned with Promise.all. Empty or
+ * homogeneous pages skip their arms entirely — 0 statements there, exactly
+ * like the per-row path. The id lists stay far under the D1 100-variable
+ * cap: the API paging clamps at 50 rows (pagination.ts MAX_RESPONSE_ITEMS).
+ */
+export async function prefetchIssueRenderContext(d1: D1Database, pageRows: IssueRow[]): Promise<IssueRenderContext> {
+  const issueIds = pageRows.map((row) => row.id);
+  const posterIds = [...new Set(pageRows.flatMap((row) => (row.posterId === null ? [] : [row.posterId])))];
+  const milestoneIds = [...new Set(pageRows.flatMap((row) => (row.milestoneId === null ? [] : [row.milestoneId])))];
+  const prIssueIds = pageRows.flatMap((row) => (row.isPull ? [row.id] : []));
+  const db = drizzle(d1);
+  const [posterRows, labelRows, pinRows, milestoneRows, prRows] = await Promise.all([
+    posterIds.length > 0 ? db.select().from(users).where(inArray(users.id, posterIds)).all() : Promise.resolve([]),
+    issueIds.length > 0
+      ? db
+          .select({ issueId: issueLabels.issueId, label: labels })
+          .from(issueLabels)
+          .innerJoin(labels, eq(labels.id, issueLabels.labelId))
+          .where(inArray(issueLabels.issueId, issueIds))
+          .orderBy(asc(labels.id))
+          .all()
+      : Promise.resolve([]),
+    issueIds.length > 0
+      ? db
+          .select({ issueId: issuePins.issueId, pinOrder: issuePins.pinOrder })
+          .from(issuePins)
+          .where(inArray(issuePins.issueId, issueIds))
+          .all()
+      : Promise.resolve([]),
+    milestoneIds.length > 0 ? db.select().from(milestones).where(inArray(milestones.id, milestoneIds)).all() : Promise.resolve([]),
+    prIssueIds.length > 0 ? db.select().from(pullRequests).where(inArray(pullRequests.issueId, prIssueIds)).all() : Promise.resolve([]),
+  ]);
+  const labelsByIssue = new Map<number, LabelRow[]>();
+  for (const row of labelRows) {
+    const bucket = labelsByIssue.get(row.issueId);
+    if (bucket === undefined) {
+      labelsByIssue.set(row.issueId, [row.label]);
+    } else {
+      bucket.push(row.label);
+    }
+  }
+  return {
+    posters: new Map(posterRows.map((row) => [row.id, row])),
+    labelsByIssue,
+    pinOrders: new Map(pinRows.map((row) => [row.issueId, row.pinOrder])),
+    milestones: new Map(milestoneRows.map((row) => [row.id, row])),
+    pullRequestsByIssue: new Map(prRows.map((row) => [row.issueId, row])),
+  };
+}
+
+/** The context twin of `toPoster` — identical null semantics, 0 reads. */
+function posterFromContext(context: IssueRenderContext, viewer: Viewer, posterId: number | null): User | null {
+  if (posterId === null) {
+    return null;
+  }
+  const row = context.posters.get(posterId);
+  return row === undefined ? null : apiUserFromRow(row, viewer);
+}
+
 /**
  * `convert.ToIssue` → the contract `Issue`. Enrichment reads per render:
  * poster row, label join, milestone row, PR row (PRs only) — the same loads
  * upstream's toIssue performs (LoadPoster/LoadLabels/LoadMilestone/
- * LoadPullRequest).
+ * LoadPullRequest). LIST routes pass `preload` (the page-scoped
+ * `prefetchIssueRenderContext` maps + the caller-held PR row) so the reads
+ * collapse to 0 per row; without it the per-row selects run exactly as
+ * before — the single-item routes' unchanged path.
  */
-export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow): Promise<Issue> {
-  const poster = await toPoster(d1, viewer, issue.posterId);
-  const labelRows = await issueLabelRows(d1, issue.id);
-  const pinOrder = await pinOrderOf(d1, issue.id);
+export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow, preload?: IssueRenderPreload): Promise<Issue> {
+  const context = preload?.context;
+  const poster = context === undefined ? await toPoster(d1, viewer, issue.posterId) : posterFromContext(context, viewer, issue.posterId);
+  const labelRows = context === undefined ? await issueLabelRows(d1, issue.id) : (context.labelsByIssue.get(issue.id) ?? []);
+  const pinOrder = context === undefined ? await pinOrderOf(d1, issue.id) : (context.pinOrders.get(issue.id) ?? -1);
   const milestoneRow =
     issue.milestoneId === null
       ? null
-      : await drizzle(d1)
-          .select()
-          .from(milestones)
-          .where(eq(milestones.id, issue.milestoneId))
-          .limit(1)
-          .then((rows) => (rows[0] === undefined ? null : rows[0]));
-  const pullRequest = await pullRequestMetaOf(d1, pair, viewer.origin, issue);
+      : context === undefined
+        ? await drizzle(d1)
+            .select()
+            .from(milestones)
+            .where(eq(milestones.id, issue.milestoneId))
+            .limit(1)
+            .then((rows) => (rows[0] === undefined ? null : rows[0]))
+        : (context.milestones.get(issue.milestoneId) ?? null);
+  const pullRequest = await pullRequestMetaOf(d1, pair, viewer.origin, issue, preload?.prRow ?? context?.pullRequestsByIssue.get(issue.id));
 
   return {
     id: issue.id,

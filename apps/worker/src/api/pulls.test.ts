@@ -22,10 +22,12 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { comments, issueLabels, issues, labels, milestones, pullRequests, pullReviews, repoCounters, repositories, ReviewType, users, webhookDeliveries, webhooks } from "../db/schema";
+import { comments, issueLabels, issuePins, issues, labels, milestones, pullRequests, pullReviews, repoCounters, repositories, ReviewType, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
+import { prefetchPullRequestRenderContext, toApiPullRequest } from "./services/pulls";
+import { findRepositoryByPath, type Viewer } from "./services/repository";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
 
@@ -872,5 +874,96 @@ describe("GET /repos/{owner}/{repo}/pulls/{base}/{head} (repoGetPullRequestByBas
 
     const ghostFork = await router()("/repos/alice/visible/pulls/main/ghost:feature");
     expect(ghostFork.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A3+B1) — the pulls
+// list used to pay, PER ROW: toApiIssue's poster/label/pin (+milestone) fan,
+// the pull_requests re-select of the row the caller already holds (B1), and
+// the fork head-repo pair + grant lookups. The page now prefetches one read
+// per entity kind. Metering pattern identical to bench-d1.test.ts's wrapper
+// (bench-d1 is the index unit's file — this counter lives here).
+// ---------------------------------------------------------------------------
+
+/** prepare()-counting D1 wrapper: every drizzle statement enters through one
+ *  prepare() call. Scoped to the requests that pass the returned env. */
+function countedD1(): { db: D1Database; count: () => number } {
+  let statements = 0;
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    return env.DB.prepare(query);
+  };
+  return { db: wrapper, count: () => statements };
+}
+
+describe("pulls list query-shape witness (query-shape-audit A3/B1)", () => {
+  it("renders the page with a constant statement count and a render identical to the per-row path", async () => {
+    const owner = await seedUser("Alice");
+    const forkOwner = await seedUser("Bob");
+    const baseId = await seedRepo(owner.usernameLower, "visible");
+    const forkId = await seedRepo(forkOwner.usernameLower, "fork");
+    await db().update(repositories).set({ forkParent: baseId }).where(eq(repositories.id, forkId));
+    const bug = await seedLabel(baseId, "bug");
+    const v1 = await seedMilestone(baseId, "v1");
+    // One PR per enrichment arm: plain, labeled, milestoned, merged (+pinned,
+    // merged by Bob), and a FORK head (Bob's repo).
+    await seedPull(baseId, "plain", { posterId: owner.id });
+    const labeled = await seedPull(baseId, "labeled", { posterId: owner.id });
+    await db().insert(issueLabels).values({ issueId: labeled.id, labelId: bug });
+    const milestoned = await seedPull(baseId, "milestoned", { posterId: forkOwner.id });
+    await db().update(issues).set({ milestoneId: v1 }).where(eq(issues.id, milestoned.id));
+    const merged = await seedPull(baseId, "merged by bob", { posterId: owner.id });
+    const forked = await seedPull(baseId, "fork head", { posterId: owner.id });
+    await db().update(pullRequests).set({ headRepoId: forkId }).where(eq(pullRequests.id, forked.prId));
+    await db()
+      .update(pullRequests)
+      .set({ hasMerged: true, mergerId: forkOwner.id, mergedAt: new Date("2026-03-04T05:06:07Z"), mergedCommitId: "deadbeef" })
+      .where(eq(pullRequests.id, merged.prId));
+    await db().insert(issuePins).values({ issueId: merged.id, repoId: baseId, pinOrder: 1 });
+
+    // (a) Route-level count (anonymous — head grants resolve without D1).
+    const app = createApiRouter();
+    const meter = countedD1();
+    const res = await app.fetch(new Request("https://example.com/repos/Alice/visible/pulls?state=all"), {
+      ...env,
+      DB: meter.db,
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>[]>();
+    expect(body).toHaveLength(5);
+    const count = meter.count();
+    // Post-fix: 1 repo resolve + 2 (count + page) + 5 issue-side arms +
+    // 1 mergers + 1 head repos = 10 — page-INDEPENDENT. The pre-fix shape
+    // paid 1 + 2 + 5×(3 base reads + 1 B1 PR re-select + 1 milestone + 1
+    // merger + 1 fork head repo) = 26 at this N; 5 rows × 4 alone would
+    // break the second bound.
+    expect(count).toBeLessThanOrEqual(12);
+    expect(count).toBeLessThan(5 * 4);
+    // The fork head renders (batched pair lookup worked) and the merged row
+    // carries its merger (the batched mergers arm worked).
+    expect(body.find((p) => p.title === "fork head")?.head).toMatchObject({ repo_id: Number(forkId) });
+    expect(body.find((p) => p.title === "merged by bob")?.merged_by).toMatchObject({ login: "Bob" });
+
+    // (b) Contract discipline: the batched render is deep-equal to the
+    // unbatched per-row path (mode "list", no extras, on the same rows).
+    const pair = await findRepositoryByPath(env.DB, "alice", "visible");
+    if (pair === null) throw new Error("base repo pair missing");
+    const viewer: Viewer = { origin: "https://example.com", requester: null };
+    const rows = await db()
+      .select({ issue: issues, pullRequest: pullRequests })
+      .from(pullRequests)
+      .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+      .where(eq(pullRequests.baseRepoId, baseId))
+      .all();
+    const perRow = await Promise.all(rows.map((row) => toApiPullRequest(env.DB, viewer, pair, row.issue, row.pullRequest, "list")));
+    const context = await prefetchPullRequestRenderContext(env.DB, viewer, pair, rows);
+    const batched = await Promise.all(
+      rows.map((row) => toApiPullRequest(env.DB, viewer, pair, row.issue, row.pullRequest, "list", undefined, { context })),
+    );
+    expect(batched).toEqual(perRow);
+    expect(batched.find((p) => p.title === "fork head")?.head?.repo_id).toBe(Number(forkId));
+    expect(batched.find((p) => p.title === "merged by bob")?.merged_by?.login).toBe("Bob");
   });
 });
