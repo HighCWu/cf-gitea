@@ -7,11 +7,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
 import {
-  issueSubscriptions,
   orgMembers,
-  reactions,
-  repoCollaborators,
-  repoWatchers,
   repositories,
   userRedirects,
   users,
@@ -19,7 +15,7 @@ import {
 import { RepoNameCollisionError, RepoNameInvalidError } from "../../repos/service";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
-import { scrubUserFromAllRules } from "../../services/branch-protection";
+import { deleteUserCascade } from "../../services/user-accounts";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { createOrgOptionSchema, organizationSchema } from "../models/organization";
@@ -27,7 +23,7 @@ import { createRepoOptionSchema, repositorySchema } from "../models/repository";
 import { userListSchema, userSchema } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { toApiOrganization, toCreatedOrgRepository } from "../services/org-repos";
-import { findUserByName, formBoolValue, formString, viewerOf } from "../services/repository";
+import { findUserByName, formBool, formBoolValue, formString, viewerOf } from "../services/repository";
 import { createUserRepository, resolveAutoInitReadme } from "../services/user-repos";
 import { toApiUser } from "../services/user";
 
@@ -83,13 +79,26 @@ import { toApiUser } from "../services/user";
  *      response is still the contract's `User` shape. `send_notify`,
  *      `source_id` and `login_name` (external-auth/mail concepts) are equally
  *      accepted and ignored.
- *   2. **`purge` accepted, not distinguished** (adminDeleteUser): upstream
- *      purge disables the account, deletes owned repositories through the
- *      storage layer and removes last-owner orgs (services/user/user.go:151–
- *      219). cf-gitea's repo deletion is engine-backed (R2/DO), so a purge
- *      that silently dropped rows would orphan blobs; instead BOTH modes run
- *      the same table-free guards — owned repos and org memberships still
- *      422 exactly like upstream's non-purge path (user.go:238–251).
+ *   2. **`purge` distinguished through the real cascade** (adminDeleteUser):
+ *      upstream purge disables the account, deletes every owned repository
+ *      through the repo-deletion service (services/user/user.go:172-182 →
+ *      DeleteOwnerRepositoriesDirectly), removes org memberships and deletes
+ *      last-owner orgs (user.go:184-219), then re-checks both counts inside
+ *      the final transaction (user.go:234-248) whose errors the route maps
+ *      422 (admin/user.go:303-311). cf-gitea rides the SAME shape: purge=true
+ *      drives every owned repo through the engine-backed deleteRepository
+ *      cascade (repos/service.ts — the exact path the demo-sweep consumer
+ *      rides; D1 cascade + tombstone inline, R2-prefix purge/destroy
+ *      enqueued to REPO_TASKS) and removes memberships (a last-owner org
+ *      DELETED through OrgService, upstream's DeleteOrganization(org, true)
+ *      shape); purge=false keeps the table-free guards — owned repos and org
+ *      memberships still 422 exactly like upstream's non-purge path
+ *      (user.go:238-251). The cascade + the census live in the service
+ *      (`deleteUserCascade`, services/user-accounts.ts); the earlier
+ *      accepted-and-undistinguished posture (noted 2026-10-28) predates the
+ *      engine-backed cascade — a purge that silently dropped rows would have
+ *      orphaned blobs, which the cascade's queue purge now prevents. The
+ *      demo sweep stays the fail-safe backstop for hand-D1 user deletes.
  *   3. **`type` conversions**: upstream parses only User/Bot
  *      (services/convert/user.go:27–36 — "Organization" is a 400
  *      `invalid user type "Organization" (expected User, Bot)`, mirrored);
@@ -947,17 +956,20 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
   });
 
   // DELETE /admin/users/{username} — the DeleteUser ladder
-  // (admin/user.go:292–316): the org/self guards, the last-admin guard
-  // (services/user/user.go:147–149), the repo/membership guards
-  // (user.go:238–251), then the row delete (the users FK cascades carry
-  // tokens/memberships/redirects/follows/stars/settings; the FK-less
-  // watcher/collaborator/reaction/subscription rows go in the same batch —
-  // the deleteUser DeleteBeans census, services/user/delete.go:74–103).
-  // Deviation 2: `purge` is parsed but not distinguished.
+  // (admin/user.go:292-316): the org/self guards, the last-admin guard
+  // (services/user/user.go:147-149), then — WITHOUT purge — the repo/
+  // membership count guards upstream checks inside its final transaction
+  // (user.go:234-248, the route's 422 mapping at admin/user.go:303-311).
+  // The cascade itself (purge's owned-repo + membership arms, the
+  // branch-protection scrub, the census batch and the row delete) is the
+  // deleteUserCascade service (services/user-accounts.ts) — the port of
+  // upstream's DeleteUser/deleteUser pair. Deviation 2: purge is now
+  // distinguished through the real repo cascade.
   app.openapi(adminDeleteUserRoute(requireAuth), async (c) => {
     const { username } = c.req.valid("param");
     const target = await resolveTargetRow(c, username);
     const doer = c.get("authUser");
+    const purge = formBool(new URL(c.req.url).searchParams, "purge");
 
     if (target.type === "org") {
       throw new ApiError(422, "target is an organization but not user");
@@ -969,40 +981,31 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
       throw new ApiError(422, `can not delete the last admin user [uid: ${target.id}]`);
     }
 
-    const db = drizzle(c.env.DB);
-    const repoCount = await db
-      .select({ total: sql<number>`count(*)` })
-      .from(repositories)
-      .where(eq(repositories.ownerId, target.id))
-      .get();
-    if ((repoCount?.total ?? 0) > 0) {
-      throw new ApiError(422, `user still has ownership of repositories [uid: ${target.id}]`);
-    }
-    const membershipCount = await db
-      .select({ total: sql<number>`count(*)` })
-      .from(orgMembers)
-      .where(eq(orgMembers.userId, target.id))
-      .get();
-    if ((membershipCount?.total ?? 0) > 0) {
-      throw new ApiError(422, `user still has membership of organizations [uid: ${target.id}]`);
+    if (!purge) {
+      // Upstream's in-tx count guards (user.go:234-248) hold ONLY on the
+      // non-purge path — with purge the cascade removes the repos and the
+      // memberships before the row delete, exactly like upstream running
+      // DeleteOwnerRepositoriesDirectly + the RemoveOrgUser loop first.
+      const db = drizzle(c.env.DB);
+      const repoCount = await db
+        .select({ total: sql<number>`count(*)` })
+        .from(repositories)
+        .where(eq(repositories.ownerId, target.id))
+        .get();
+      if ((repoCount?.total ?? 0) > 0) {
+        throw new ApiError(422, `user still has ownership of repositories [uid: ${target.id}]`);
+      }
+      const membershipCount = await db
+        .select({ total: sql<number>`count(*)` })
+        .from(orgMembers)
+        .where(eq(orgMembers.userId, target.id))
+        .get();
+      if ((membershipCount?.total ?? 0) > 0) {
+        throw new ApiError(422, `user still has membership of organizations [uid: ${target.id}]`);
+      }
     }
 
-    // Branch-protection whitelist scrub (SPEC-0013 M4) — upstream DeleteUser's
-    // "***** START: Branch Protections *****" block (services/user/delete.go:
-    // 134-155): the deleted id is stripped from every allowlist column of every
-    // rule (ids are JSON-serialized, so the sweep pages all rules). Pre-batch
-    // like upstream's in-tx ordering: a failed scrub aborts the delete.
-    await scrubUserFromAllRules(c.env.DB, target.id);
-
-    // The delete sweep: FK-cascade tables ride the users row; the FK-less
-    // user-associable stores are cleared by id (delete.go:74–103 census).
-    await db.batch([
-      db.delete(repoWatchers).where(eq(repoWatchers.userId, target.id)),
-      db.delete(repoCollaborators).where(eq(repoCollaborators.userId, target.id)),
-      db.delete(reactions).where(eq(reactions.userId, target.id)),
-      db.delete(issueSubscriptions).where(eq(issueSubscriptions.userId, target.id)),
-      db.delete(users).where(eq(users.id, target.id)),
-    ]);
+    await deleteUserCascade(c.env, target.id, { purge });
     return c.body(null, 204);
   });
 

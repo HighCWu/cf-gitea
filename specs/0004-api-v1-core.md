@@ -90,7 +90,16 @@ method is explicitly deferred in the mapping table):
   remaining repo metadata, remaining object reads, remaining issue/PR surface. Landed
   by SPEC-0005 and follow-ups until category parity.
 - **Tier 3 (135 paths)** — categories (f)–(k): admin, Actions, packages, projects,
-  wiki, notifications, settings. Explicitly deferred (§2.5).
+  wiki, notifications, settings. Explicitly deferred (§2.5). As-built exception: the
+  table-free `admin` subset (8 ops) has landed (`src/api/routes/admin-t2.ts` — its
+  module header carries the documented deviations). `DELETE /admin/users/{username}`
+  distinguishes `purge` like upstream's `DeleteUser` (services/user/user.go:139–295):
+  non-purge keeps the owned-repos/membership 422 guards; purge drives the user's
+  repos through the SPEC-0003 §2.5.5 `deleteRepository` cascade (the demo sweep's
+  consumer path) and removes memberships — a last-owner org deleted through
+  SPEC-0007's cascade — before the census batch and row delete
+  (`deleteUserCascade`, `src/services/user-accounts.ts`). The DEMO_MODE sweep
+  (SPEC-0014) stays the fail-safe backstop for hand-D1 user deletes.
 
 The tier-1 selection is justified against four real client families: the official
 SDK surface (`code.gitea.io/sdk/gitea` — every tier-1 path has at least one SDK

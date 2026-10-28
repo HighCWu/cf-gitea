@@ -23,7 +23,23 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { orgMembers, personalAccessTokens, protectedBranches, repositories, userRedirects, users } from "../../db/schema";
+import {
+  actions,
+  issueAssignees,
+  issueStopwatches,
+  notificationStates,
+  oauth2Applications,
+  orgMembers,
+  personalAccessTokens,
+  protectedBranches,
+  repositories,
+  repoCounters,
+  userBadges,
+  userRedirects,
+  users,
+} from "../../db/schema";
+import { starRepo } from "../services/stars";
+import { watchRepo } from "../services/repo-watchers";
 import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { createStubAuthResolver, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
@@ -95,6 +111,12 @@ beforeEach(async () => {
     "repo_collaborators",
     "reactions",
     "issue_subscriptions",
+    "notification_states",
+    "stopwatch",
+    "issue_assignees",
+    "user_badge",
+    "oauth2_application",
+    "action",
     "webhook_deliveries",
     "webhooks",
     "issue_pins",
@@ -793,6 +815,101 @@ describe("DELETE /admin/users/{username} (adminDeleteUser)", () => {
     expect(((await member.json<Record<string, unknown>>())).message).toBe(
       `user still has membership of organizations [uid: ${neighborId}]`,
     );
+  });
+
+  it("purge=true cascades BOTH owned repos through the real deleteRepository pipeline (204)", async () => {
+    await seedRepo(neighborId, "neighbor", "first", "9110");
+    await seedRepo(neighborId, "neighbor", "second", "9111");
+    // A repo-scoped dependent under each — the cascade's D1 half clears it.
+    await drizzle(env.DB).insert(repoCounters).values([
+      { repoId: "9110", issueIndex: 3 },
+      { repoId: "9111", issueIndex: 4 },
+    ]);
+    // Engine registry entries for both combined names — only the REAL
+    // pipeline (deleteRepository's registry removal) takes them away; a raw
+    // row drop would leave them resolving against dead storage.
+    const registry = env.REGISTRY.getByName("registry");
+    await registry.upsert("neighbor/first", Date.now());
+    await registry.upsert("neighbor/second", Date.now());
+
+    const res = await adminSend("/admin/users/neighbor?purge=true", authed({ method: "DELETE" }));
+    expect(res.status).toBe(204);
+    expect(await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId))).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(repoCounters).all()).toHaveLength(0);
+    // The engine half ran: both entries are gone.
+    expect(await registry.get("neighbor/first")).toBeNull();
+    expect(await registry.get("neighbor/second")).toBeNull();
+  });
+
+  it("purge=true removes org memberships; a last-owner org is deleted WITH its repos (the RemoveOrgUser/DeleteOrganization loop)", async () => {
+    const orgs = new OrgService(env.DB);
+    // Arm A — plain member of an admin-owned org: membership removed
+    // (counter maintained), the org itself survives.
+    const memberOrg = await orgs.createOrg({ name: "member-org", ownerId: adminId });
+    await orgs.addMember(memberOrg.id, neighborId);
+    // Arm B — neighbor is the LAST OWNER of an org that owns a repo: removeMember
+    // raises the last-owner error, so upstream DELETES the organization with
+    // purge=true (user.go:209 → DeleteOrganization's purge arm deletes the
+    // org's repos first) — mirrored with the same repo cascade + deleteOrg.
+    const ownedOrg = await orgs.createOrg({ name: "owned-org", ownerId: neighborId });
+    await seedRepo(ownedOrg.id, "owned-org", "held", "9120");
+
+    const res = await adminSend("/admin/users/neighbor?purge=true", authed({ method: "DELETE" }));
+    expect(res.status).toBe(204);
+    expect(await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId))).toHaveLength(0);
+    expect(await orgs.getMembership(memberOrg.id, neighborId)).toBeNull();
+    const surviving = await orgs.getOrgById(memberOrg.id);
+    expect(surviving?.numMembers).toBe(1);
+    expect(await orgs.getOrgById(ownedOrg.id)).toBeNull();
+    // Both the owned org's repo and every other repo row are gone.
+    expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
+  });
+
+  it("sweeps the full census without purge: star/watch counters drop with the edges, the FK-less stores clear (204)", async () => {
+    await seedRepo(adminId, "root", "surviving", "9130");
+    // Real counter-maintaining services (stars.ts / repo-watchers.ts): both
+    // repositories counters and the user tally move with the edges.
+    await starRepo(env.DB, neighborId, "9130", NOW);
+    await watchRepo(env.DB, "9130", neighborId, NOW);
+    // The census's post-landing FK-less families, one row each (the landed
+    // route batch covered only watcher/collaborator/reaction/subscription).
+    await drizzle(env.DB).insert(notificationStates).values({ userId: neighborId, issueId: 1 });
+    await drizzle(env.DB).insert(issueStopwatches).values({ issueId: 1, userId: neighborId, createdAt: NOW });
+    await drizzle(env.DB).insert(issueAssignees).values({ issueId: 1, assigneeId: neighborId });
+    await drizzle(env.DB).insert(userBadges).values({ badgeId: 1, userId: neighborId });
+    await drizzle(env.DB).insert(oauth2Applications).values({
+      uid: neighborId,
+      name: "app",
+      clientId: "client-xyz",
+      clientSecret: "secret",
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+    // action: the census deletes the RECEIVER rows (Action{UserID},
+    // delete.go:82) — a row where neighbor only PERFORMED (admin receives)
+    // survives, upstream's ghost-feed posture.
+    await drizzle(env.DB).insert(actions).values([
+      { userId: neighborId, opType: 1, actUserId: adminId, repoId: "9130", createdAt: NOW },
+      { userId: adminId, opType: 1, actUserId: neighborId, repoId: "9130", createdAt: NOW },
+    ]);
+
+    const res = await adminSend("/admin/users/neighbor", authed({ method: "DELETE" }));
+    expect(res.status).toBe(204);
+    expect(await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId))).toHaveLength(0);
+    const survivingRepo = (
+      await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, "9130")).limit(1)
+    )[0];
+    expect(survivingRepo?.numStars).toBe(0);
+    expect(survivingRepo?.numWatches).toBe(0);
+    expect(await drizzle(env.DB).select().from(notificationStates).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(issueStopwatches).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(issueAssignees).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(userBadges).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(oauth2Applications).all()).toHaveLength(0);
+    const remainingActions = await drizzle(env.DB).select().from(actions).all();
+    expect(remainingActions).toHaveLength(1);
+    expect(remainingActions[0]).toMatchObject({ userId: adminId, actUserId: neighborId });
   });
 
   it("404s a missing user", async () => {

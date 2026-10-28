@@ -1,9 +1,11 @@
 /**
- * Individual-user account creation (SPEC-0010 first-run amendment,
- * 2026-10-28): the two creation surfaces the web UI owns — the ONE-SHOT
- * admin-init window (zero-user instances, upstream's install-page
- * admin-creation posture) and regular self-registration (the
- * `ALLOW_SIGNUP` gate).
+ * Individual-user account creation AND deletion. Creation (SPEC-0010
+ * first-run amendment, 2026-10-28): the two creation surfaces the web UI
+ * owns — the ONE-SHOT admin-init window (zero-user instances, upstream's
+ * install-page admin-creation posture) and regular self-registration (the
+ * `ALLOW_SIGNUP` gate). Deletion (2026-10-28): `deleteUserCascade`, the
+ * admin DELETE surface's service — upstream's `DeleteUser` ladder over the
+ * EXISTING repo cascade (section at the bottom of the file).
  *
  * ## Reuse (never duplicate the ladder)
  *
@@ -42,10 +44,31 @@
  * as upstream's `HasUsers` over the unified user table.
  */
 
-import { sql, eq } from "drizzle-orm";
+import { asc, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { userRedirects, users } from "../db/schema";
+import {
+  actions,
+  issueAssignees,
+  issueStopwatches,
+  issueSubscriptions,
+  notificationStates,
+  oauth2Applications,
+  orgMembers,
+  reactions,
+  repoCollaborators,
+  repoWatchers,
+  repositories,
+  stars,
+  userBadges,
+  userRedirects,
+  users,
+} from "../db/schema";
+import { RepoNotExistError, RepoService } from "../repos/service";
+import { tombstoneRepoDO } from "../repos/purge";
+import { OrgService } from "./orgs/orgs";
+import { LastOrgOwnerError } from "./orgs/errors";
+import { scrubUserFromAllRules } from "./branch-protection";
 import { usableUsernameError } from "./orgs/orgs";
 
 // ---------------------------------------------------------------------------
@@ -294,4 +317,194 @@ export async function registerUser(
     if (isUniqueConstraintError(error)) return { outcome: "name-taken" };
     throw error;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Admin user deletion — the upstream DeleteUser ladder over the EXISTING
+// repo cascade (SPEC-0004 category f as-built, 2026-10-28)
+// ---------------------------------------------------------------------------
+
+/**
+ * The deletion's engine arms read four bindings off the generated Env —
+ * `DB` for every D1 step, `REGISTRY`/`REPO_TASKS`/`REPO` for the repo
+ * cascade's engine half (the tombstone rides `tombstoneRepoDO`, whose
+ * signature is the full `Env`, so the parameter is too; both callers — the
+ * admin route and the tests — hold the complete generated Env).
+ */
+export type DeleteUserEnv = Env;
+
+/**
+ * One owner's repositories, driven through the EXISTING deleteRepository
+ * cascade — the port of upstream `DeleteOwnerRepositoriesDirectly`
+ * (services/repository/delete.go:396-421): page over the owner's repos
+ * (oldest first, LIMIT 50 — upstream's `RepositoryListDefaultPageSize`
+ * re-page loop) and delete each through `RepoService.deleteRepository` with
+ * the SAME deps the API's DELETE route and the demo-sweep consumer ride
+ * (repos/service.ts §2.5.5: D1 cascade inline, DO tombstone synchronous,
+ * R2-prefix purge + destroy enqueued to REPO_TASKS). NOT transactional as a
+ * whole, deliberately (upstream's own note, user.go:172-178): each repo's
+ * D1 cascade is its own transaction, so a mid-loop failure leaves the
+ * already-deleted repos deleted and consistent — a retry deletes the rest.
+ * A `RepoNotExistError` per repo is a concurrent delete winning the race;
+ * the requested end state already holds (the handleDemoSweep §3.4 posture).
+ * The page RE-READS after each pass, so repos created concurrently are
+ * captured too (upstream's stated intent, user.go:175-178).
+ */
+async function deleteOwnerRepositories(env: DeleteUserEnv, ownerId: number): Promise<void> {
+  const PAGE_LIMIT = 50; // upstream RepositoryListDefaultPageSize (delete.go:399-403)
+  for (;;) {
+    const page = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(eq(repositories.ownerId, ownerId))
+      .orderBy(asc(repositories.createdAt))
+      .limit(PAGE_LIMIT)
+      .all();
+    if (page.length === 0) return;
+    for (const { id } of page) {
+      try {
+        await new RepoService(env.DB, {
+          registry: env.REGISTRY.getByName("registry"),
+          queue: env.REPO_TASKS,
+          tombstone: (engineName) => tombstoneRepoDO(env, engineName),
+        }).deleteRepository(id);
+      } catch (error) {
+        if (!(error instanceof RepoNotExistError)) throw error;
+      }
+    }
+  }
+}
+
+/**
+ * The user-deletion cascade behind `DELETE /admin/users/{username}` — the
+ * port of upstream `DeleteUser` (services/user/user.go:139-295), which the
+ * admin route drives with `ctx.FormBool("purge")` (admin/user.go:303). The
+ * ROUTE owns the pre-checks upstream runs before the ladder (org target,
+ * self, last-admin — user.go:143-149; the route's 422 mapping at
+ * admin/user.go:292-301, 303-311) and, in the non-purge mode, the two
+ * count guards upstream checks inside its final transaction (owned repos +
+ * org memberships, user.go:234-248 → the route's 422s). Everything below
+ * the guards lives here:
+ *
+ *   1. PURGE — owned repositories (`DeleteOwnerRepositoriesDirectly`,
+ *      user.go:179): each through the real deleteRepository cascade
+ *      (`deleteOwnerRepositories` above), so D1 rows, engine cells, the
+ *      registry index and the R2 prefixes all go — never a silent row drop
+ *      that would orphan blobs (the reason the purge arm originally stayed
+ *      undistinguished, admin-t2 deviation 2, is cured by this cascade).
+ *   2. PURGE — org memberships (user.go:184-219): `RemoveOrgUser` per org
+ *      (OrgService.removeMember — the counter/team-sweep-maintaining port);
+ *      on the last-owner error upstream DELETES the organization
+ *      (`DeleteOrganization(ctx, org, true)`, org.go:209 → services/org/
+ *      org.go:58-70, whose purge arm deletes the ORG's repos first) —
+ *      mirrored with the same cascade + `OrgService.deleteOrg` (the
+ *      SPEC-0007 cascade, which refuses an org that still owns repos).
+ *   3. Branch-protection whitelist scrub (delete.go:137-160, the
+ *      "***** START: Branch Protections *****" block): the deleted id is
+ *      stripped from every allowlist column of every SURVIVING rule —
+ *      pre-batch, so a failed scrub aborts the delete (the landed route
+ *      arm's ordering; ids are JSON-serialized, hence the full-rule pages).
+ *   4. THE CENSUS BATCH — one D1 transaction (delete.go:31-206's
+ *      `deleteUser` shape), statement order FK-safe:
+ *        a. counter decrements FIRST, while the edge rows they read still
+ *           exist: each repo the user stars/watches loses exactly one
+ *           `num_stars`/`num_watches` (delete.go:35-53's DecrByIDs; the
+ *           UNIQUE(user,repo) pair makes the edge count one; the MAX(…,0)
+ *           floor is the landed drift insurance, stars.ts posture), and
+ *           upstream's follower counters have no landed users columns —
+ *           nothing to decrement for follows (n/a);
+ *        b. the FK-less user-associable stores die by id — the DeleteBeans
+ *           census (delete.go:74-103) ∩ our FK-less tables: watch,
+ *           collaboration, reaction, issue-subscription (the landed route
+ *           batch), plus the post-landing families the census names:
+ *           notification (Notification{UserID}, :101), stopwatch
+ *           (Stopwatch{UserID}, :88), the assignee clear (:187), user
+ *           badge (UserBadge{UserID}, :90), the OAuth2 application row
+ *           (DeleteOAuth2RelictsByUserID, models/auth/oauth2.go:679-695)
+ *           and the user's received action rows (Action{UserID} is the
+ *           RECEIVER side, :82 — performed-act copies live on other
+ *           receivers' feeds, upstream keeps them);
+ *        c. the users row LAST — the declared ON DELETE CASCADE FKs carry
+ *           the rest of the census: personal access tokens, sessions, org
+ *           memberships, redirects, follows, stars, user settings, email
+ *           addresses, public keys, GPG keys, blocks, team memberships
+ *           (delete.go:75-103 beans ∩ our FK tables).
+ *
+ * Upstream keeps issues/comments/reviews/projects as ghost data (the
+ * DeleteUser docstring, user.go:139-141) — so do we; the census's
+ * purge-gated comment deletion (delete.go:111-135) is NOT ported (a
+ * purge deletes the user's comments upstream; ours keeps them, the same
+ * ghost posture — documented divergence). The demo sweep stays the
+ * fail-safe backstop: hand-D1 user deletes that skip this service leave
+ * dangling owned repos, which the DEMO_MODE producer still sweeps.
+ */
+export async function deleteUserCascade(
+  env: DeleteUserEnv,
+  userId: number,
+  options: { purge?: boolean } = {},
+): Promise<void> {
+  const d1 = env.DB;
+  if (options.purge === true) {
+    // Upstream runs the two purge arms OUTSIDE the final transaction, each
+    // with its own internal transactions (user.go:172-186) — mirrored.
+    await deleteOwnerRepositories(env, userId);
+    const orgService = new OrgService(d1);
+    const memberships = await drizzle(d1)
+      .select({ orgId: orgMembers.orgId })
+      .from(orgMembers)
+      .where(eq(orgMembers.userId, userId))
+      .all();
+    for (const { orgId } of memberships) {
+      try {
+        await orgService.removeMember(orgId, userId);
+      } catch (error) {
+        if (!(error instanceof LastOrgOwnerError)) throw error;
+        // Upstream deletes the last-owner org — with purge, so the org's
+        // own repos go through the same cascade BEFORE deleteOrg (which
+        // refuses an org that still owns repos, orgs.ts deleteOrg).
+        await deleteOwnerRepositories(env, orgId);
+        await orgService.deleteOrg(orgId);
+      }
+    }
+  }
+
+  // The scrub is pre-batch (upstream runs it inside deleteUser, before the
+  // user-row delete — delete.go:137-160); a failure aborts the delete.
+  await scrubUserFromAllRules(d1, userId);
+
+  const db = drizzle(d1);
+  await db.batch([
+    // (a) counter decrements — see the census doc above.
+    db
+      .update(repositories)
+      .set({ numStars: sql`MAX(num_stars - 1, 0)` })
+      .where(
+        inArray(
+          repositories.id,
+          db.select({ repoId: stars.repoId }).from(stars).where(eq(stars.userId, userId)),
+        ),
+      ),
+    db
+      .update(repositories)
+      .set({ numWatches: sql`MAX(num_watches - 1, 0)` })
+      .where(
+        inArray(
+          repositories.id,
+          db.select({ repoId: repoWatchers.repoId }).from(repoWatchers).where(eq(repoWatchers.userId, userId)),
+        ),
+      ),
+    // (b) the FK-less census stores.
+    db.delete(repoWatchers).where(eq(repoWatchers.userId, userId)),
+    db.delete(repoCollaborators).where(eq(repoCollaborators.userId, userId)),
+    db.delete(reactions).where(eq(reactions.userId, userId)),
+    db.delete(issueSubscriptions).where(eq(issueSubscriptions.userId, userId)),
+    db.delete(notificationStates).where(eq(notificationStates.userId, userId)),
+    db.delete(issueStopwatches).where(eq(issueStopwatches.userId, userId)),
+    db.delete(issueAssignees).where(eq(issueAssignees.assigneeId, userId)),
+    db.delete(userBadges).where(eq(userBadges.userId, userId)),
+    db.delete(oauth2Applications).where(eq(oauth2Applications.uid, userId)),
+    db.delete(actions).where(eq(actions.userId, userId)),
+    // (c) the row — the FK cascades carry the rest of the census.
+    db.delete(users).where(eq(users.id, userId)),
+  ]);
 }
