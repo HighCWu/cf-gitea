@@ -7,7 +7,7 @@ written in **English**.
 
 ## Prerequisites
 
-- **Node >= 22**, **git >= 2.22**, and **pnpm** — the only package manager; use the
+- **Node >= 24** (the plain-Node tooling — e.g. the API contract check — reaches the engine router, which uses the web-platform `URLPattern`; Node 24 is the first LTS shipping it), **git >= 2.22**, and **pnpm** — the only package manager; use the
   version from the `packageManager` field in `package.json` (`corepack enable`).
 - Wrangler ships as a devDependency of `apps/worker`; you only need a Wrangler login
   (`pnpm --filter cf-gitea-worker exec wrangler login`) for the deploy path.

@@ -4,7 +4,7 @@
   "type": "module",
   "packageManager": "pnpm@12.13.0",
   "engines": {
-    "node": ">=24" /* URLPattern (the contract check reaches the engine router in plain Node) ships in Node 24 */
+    "node": ">=24"
   },
   "scripts": {
     "dev": "pnpm --filter cf-gitea-worker dev",
