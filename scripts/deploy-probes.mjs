@@ -114,6 +114,31 @@
  *                  wrangler auth for the priority id lookup (--d1-scope). A
  *                  red run sweeps the rules + repo + member user + its token
  *                  (the failureTail).
+ *   demo           The SPEC-0014 demo-POSTURE battery (§7's named battery)
+ *                  against the deployed demo instance: the committed deploy
+ *                  config's machinery posture (the hourly cron entry beside
+ *                  the standing cadence, the repo-tasks dead_letter_queue +
+ *                  its DLQ consumer entry — M0 — and DEMO_MODE default OFF in
+ *                  BOTH wrangler.jsonc + wrangler.jsonc.example, the §2 hard
+ *                  invariant's config arm), the open-signup posture (anonymous
+ *                  GET /user/sign_up → 200 with the registration form — the
+ *                  ALLOW_SIGNUP=true demo posture; 404 = the gate closed on
+ *                  this deployment, a posture red by design), the §4.4 demo
+ *                  banner marker on GET / (M2 IN FLIGHT: until the banner
+ *                  wave lands a miss is the documented [warn] degradation —
+ *                  the arm asserts hard against the landed marker shape once
+ *                  it does), and the 72 h TTL mechanics — the DEEP arm runs
+ *                  LOCAL-ONLY (--d1-scope local against pnpm dev with
+ *                  DEMO_MODE=true in .dev.vars: fabricate the M1 unit's
+ *                  recipe row — created_at backdated 73 h, owner_id NULLed to
+ *                  the fail-safe swept arm — tick the hourly cron through
+ *                  miniflare's /cdn-cgi/local/scheduled trigger surface, poll
+ *                  the row gone; on a deployed target it records an ops-note
+ *                  [info], the sweep log not being API-reachable).
+ *                  INDEPENDENT (the posture shape): every arm reports its own
+ *                  verdict. A red run sweeps the fabricated TTL repo (D1
+ *                  --local delete + the best-effort API delete — the
+ *                  failureTail); the posture arms create nothing.
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -207,7 +232,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -298,6 +323,7 @@ const usage = () =>
   "  window3-mounts: (no extra options)\n" +
   "  fixwave-parity: (no extra options — needs an ADMIN PAT + wrangler auth for the d1 arms; --d1-scope rides the rotation backdate)\n" +
   "  branch-protection: (no extra options — needs an ADMIN PAT for the member arm; the priority ids and the slash-glob arm are pure API now)\n" +
+  "  demo:          --d1-scope local (against pnpm dev with DEMO_MODE=true in .dev.vars) runs the deep TTL-mechanics arm; a deployed target records an ops-note [info] there (the sweep log is not API-reachable). The banner arm warns until the M2 wave lands.\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -3412,6 +3438,256 @@ const branchProtectionFailureCleanup = async (ctx) => {
   if (acts.length) log(`  [tail] bp-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
 };
 
+// ---------- battery: demo (the SPEC-0014 demo-posture battery) ----------
+
+/**
+ * The SPEC-0014 §7 battery: the deployed demo instance's POSTURE, in four
+ * independent arms (the fixwave/cleanup-audit shape — a red arm never
+ * chain-skips the rest):
+ *
+ *   1. demo-config-posture — the committed deploy config's machinery (the
+ *      source every deploy is cut from): hourly cron entry beside the
+ *      standing cadence (§3.1), the repo-tasks consumer's dead_letter_queue
+ *      + the DLQ consumer entry (M0, §3.0), and DEMO_MODE default "false" in
+ *      BOTH wrangler.jsonc and wrangler.jsonc.example — the §2 hard
+ *      invariant's config arm (a default deployment never arms). The
+ *      deployed instance's armed state rides the banner arm + the README ops
+ *      notes (queue-consumer registration and log lines have no HTTP probe).
+ *   2. demo-banner-present — anonymous GET / carries the §4.4 demo banner:
+ *      the `id="demo-banner"` notice with the approved parameter text, the
+ *      dismiss control, and the sessionStorage dismissal script. M2 IS IN
+ *      FLIGHT (the banner unit lands after M1): until it deploys, a miss is
+ *      the documented [warn] degradation (the window2-mounts shape — the
+ *      page legitimately renders no node pre-M2); anything mounted asserts
+ *      hard. The markers assert the M2 landing's shape as specified at this
+ *      battery's writing (shell.tsx's DemoBanner + the coordination note);
+ *      a shape drift at the M2 landing review moves the asserts with it.
+ *   3. signup-open — anonymous GET /user/sign_up → 200 with the registration
+ *      form: the ALLOW_SIGNUP=true demo posture (OQ-1's resolved convergence
+ *      — one registration surface for self-host and demo; the demo enables
+ *      the var). The route is LANDED (ui/first-run.ts, the first-run wave),
+ *      so a 404 (the gate's closed shape) is a posture RED, not a mount-timing
+ *      warn — running this battery against a default (self-host) deployment
+ *      reds this arm BY DESIGN.
+ *   4. demo-ttl-mechanics — the deep arm, LOCAL-ONLY: with DEMO_MODE=true in
+ *      .dev.vars and --d1-scope local against pnpm dev, fabricate the M1
+ *      unit's recipe row (auto_init repo via the API, then `created_at`
+ *      backdated 73 h past retention and owner_id NULLed — the fail-safe
+ *      swept arm, §3.1 step 2, which also makes the verdict independent of
+ *      the PAT owner's is_admin), tick the hourly cron through miniflare's
+ *      scheduled-trigger surface (/cdn-cgi/local/scheduled?cron=…, forwarded
+ *      by the vite dev server — dev-only, a deployed worker has no such
+ *      route), then poll the row gone: the producer enqueues
+ *      {kind:"demo-sweep"} and the consumer's delete cascade deletes it —
+ *      row-deletion IS the sweep's claim (§3.1, no CAS). On a DEPLOYED
+ *      target the arm records an ops-note [info] and never writes D1: the
+ *      hourly tick is observable only via the [demo-sweep] log line (Cloudflare
+ *      dashboard, Workers → Logs — one line per tick including 0-eligible),
+ *      and fabricating rows on production D1 is out of a probe's posture.
+ *
+ * All four arms are read-only or self-cleaning; the TTL repo is the only
+ * server-side state any arm creates (the failureTail sweeps it — D1 first,
+ * the backdate NULLed the owner so the API delete may not resolve, then the
+ * best-effort API DELETE).
+ */
+
+/** The hourly cron entry the sweep dispatches on — the string mirror of
+ *  services/demo-sweep.ts's DEMO_SWEEP_CRON (kept a literal here; the config
+ *  arm asserts the same string in both committed configs). */
+const DEMO_HOURLY_CRON = "0 * * * *";
+
+/** The TTL arm's settle budget: local queue delivery + the consumer's delete
+ *  cascade are sub-second once warm, but each poll iteration is one
+ *  `wrangler d1 execute` (~2-4 s), so the budget covers ~10 iterations plus
+ *  cold-start slack. (The mirror battery's 30 s precedent, scaled up.) */
+const TTL_SETTLE_MS = 45_000;
+
+/** Tolerant JSONC parse for the committed wrangler configs: a string-aware
+ *  state machine strips `//` line comments (URLs like `https://…` and the
+ *  standing 10-minute cron entry survive unharmed) and trailing commas,
+ *  then JSON.parse. */
+const parseJsonc = (text) => {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      out += ch;
+      if (ch === "\\") {
+        out += text[i + 1] ?? "";
+        i++;
+      } else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      if (text[j] === "}" || text[j] === "]") continue; // drop the trailing comma
+    }
+    out += ch;
+  }
+  return JSON.parse(out);
+};
+
+/** The demo-machinery posture of ONE committed wrangler config (§2/§3.0/
+ *  §3.1): returns the drift list (empty = the posture holds). */
+const demoConfigDrift = (config, label) => {
+  const drift = [];
+  const crons = config?.triggers?.crons;
+  if (!Array.isArray(crons)) drift.push(`${label}: triggers.crons missing`);
+  else {
+    if (!crons.includes(DEMO_HOURLY_CRON)) drift.push(`${label}: crons missing the hourly "${DEMO_HOURLY_CRON}" entry (§3.1)`);
+    if (!crons.includes("*/10 * * * *")) drift.push(`${label}: crons missing the standing "*/10 * * * *" entry`);
+  }
+  const consumers = config?.queues?.consumers;
+  if (!Array.isArray(consumers)) drift.push(`${label}: queues.consumers missing`);
+  else {
+    const repoTasks = consumers.find((c) => c?.queue === "repo-tasks");
+    if (repoTasks?.dead_letter_queue !== "repo-tasks-dlq") {
+      drift.push(`${label}: the repo-tasks consumer carries no dead_letter_queue "repo-tasks-dlq" (§3.0/M0)`);
+    }
+    if (!consumers.some((c) => c?.queue === "repo-tasks-dlq")) {
+      drift.push(`${label}: no repo-tasks-dlq consumer entry (§3.0/M0)`);
+    }
+  }
+  if (config?.vars?.DEMO_MODE !== "false") {
+    drift.push(`${label}: vars.DEMO_MODE is ${JSON.stringify(config?.vars?.DEMO_MODE)} (expected the "false" default — the §2 hard invariant)`);
+  }
+  return drift;
+};
+
+const demoContext = () => ({
+  ttl: null, // { repo, fullName, created, rowGone } — the TTL arm's fabricated repo
+});
+
+const demoSteps = (ctx) => [
+  {
+    id: "demo-config-posture",
+    expect: `the committed deploy configs (wrangler.jsonc + wrangler.jsonc.example — the source every deploy is cut from) carry the demo machinery: the hourly "${DEMO_HOURLY_CRON}" cron entry beside the standing "*/10 * * * *" (§3.1), the repo-tasks consumer's dead_letter_queue "repo-tasks-dlq" + the repo-tasks-dlq consumer entry (M0, §3.0), and vars.DEMO_MODE defaulting to "false" in BOTH (the §2 hard invariant — a default deployment never arms)`,
+    run: async () => {
+      const live = parseJsonc(await readFile(path.join(workerDir, "wrangler.jsonc"), "utf8"));
+      const example = parseJsonc(await readFile(path.join(workerDir, "wrangler.jsonc.example"), "utf8"));
+      const drift = [...demoConfigDrift(live, "wrangler.jsonc"), ...demoConfigDrift(example, "wrangler.jsonc.example")];
+      expect(drift.length === 0, drift.join("; "));
+      return `both configs carry the hourly "${DEMO_HOURLY_CRON}" cron + the repo-tasks-dlq wiring (M0) with DEMO_MODE defaulting "false" — the §2 invariant holds at the config layer (the deployed instance's armed state rides the banner arm + the ops notes)`;
+    },
+  },
+  {
+    id: "demo-banner-present",
+    expect: `GET / (anonymous) → 200 carrying the SPEC-0014 §4.4 demo banner: the id="demo-banner" notice with the "data on this instance is periodically cleaned" text, the id="demo-banner-dismiss" control, and the cf-gitea-demo-banner-dismissed sessionStorage dismissal script (the M2 marker shape as specified at this battery's writing). M2 IN FLIGHT: until the banner wave deploys, a miss is the documented [warn] — pre-M2 the page legitimately renders no node`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}/`);
+      const body = await res.text();
+      expect(res.status === 200, `status ${res.status} (expected 200): ${body.slice(0, 120)}`);
+      if (!body.includes(`id="demo-banner"`)) {
+        return {
+          status: "warn",
+          detail: `no demo-banner node on the anonymous page — SPEC-0014 M2 (the §4.4 banner) is not yet mounted on this deployment; the arm asserts hard once it lands (absence ALSO matches a DEMO_MODE-off posture, which is wrong for the demo target)`,
+        };
+      }
+      expect(body.includes("data on this instance is periodically cleaned"), `the banner node is present but the §4.4 text is missing`);
+      expect(body.includes(`id="demo-banner-dismiss"`), `the banner node is present but the dismiss control is missing (§4.4: dismissible per session)`);
+      expect(body.includes("cf-gitea-demo-banner-dismissed"), `the banner node is present but the sessionStorage dismissal script is missing (§4.4: the dismissal never round-trips the server)`);
+      return `the §4.4 banner renders on GET / (id="demo-banner", dismissible per session) — the DEMO_MODE-on posture`;
+    },
+  },
+  {
+    id: "signup-open",
+    expect: `GET /user/sign_up (anonymous) → 200 carrying the registration form (action="/user/sign_up" + the user_name field) — the ALLOW_SIGNUP=true demo posture (OQ-1's resolved convergence). The landed gate 404s while closed: a 404 is a posture RED (the demo target must have the var on; a default self-host deployment reds this arm by design)`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}/user/sign_up`);
+      const body = await res.text();
+      expect(res.status === 200,
+        `status ${res.status} (expected 200): ${body.slice(0, 120)}${res.status === 404 ? " — the ALLOW_SIGNUP gate is CLOSED here (the demo posture requires it open; on LOCAL dev note: undeclared names in .dev.vars are silently ignored — only vars declared in wrangler.jsonc load, so the open posture cannot be armed locally without a config edit)" : ""}`);
+      expect(body.includes(`action="/user/sign_up"`), `no registration form (action="/user/sign_up") in the body: ${body.slice(0, 200)}`);
+      expect(body.includes(`name="user_name"`), `no user_name field in the registration form`);
+      return `200 — the registration form renders anonymously (ALLOW_SIGNUP open — the demo posture)`;
+    },
+  },
+  {
+    id: "demo-ttl-mechanics",
+    expect: `THE 72 h TTL MECHANICS (deep arm, --d1-scope local against pnpm dev with DEMO_MODE=true in .dev.vars; a deployed target records an ops-note info): fabricate the M1 recipe row — POST /user/repos {"name":"demo-ttl-<hex>","auto_init":true} → 201, then wrangler d1 (--local) backdates created_at 73 h and NULLs owner_id (the fail-safe swept arm, §3.1 step 2) — then tick the hourly cron via miniflare's /cdn-cgi/local/scheduled?cron=<hourly> trigger (forwarded by the vite dev server; dev-only) → the gated producer enqueues {kind:"demo-sweep"} → the consumer's delete cascade lands — poll (budget 45 s) until the fabricated row is GONE (row-deletion IS the sweep's claim, §3.1)`,
+    run: async () => {
+      if (opts.d1Scope !== "local") {
+        return {
+          status: "info",
+          detail: `documented skip on a deployed target — the hourly tick is observable only via the [demo-sweep] log line (Cloudflare dashboard, Workers → Logs: one line per tick, including 0-eligible; logs are not API-reachable and fabricating rows on production D1 is out of a probe's posture). The end-to-end mechanics run against pnpm dev: --d1-scope local --base-url http://127.0.0.1:5173 with DEMO_MODE=true in .dev.vars`,
+        };
+      }
+      const repo = `demo-ttl-${hexId()}`;
+      const ttl = { repo, fullName: null, created: false, rowGone: false };
+      ctx.ttl = ttl;
+      const res = await api("/user/repos", { method: "POST", body: { name: repo, private: false, auto_init: true } });
+      if (res.status === 201) ttl.created = true; // mark on the observable write
+      ttl.fullName = String(res.json?.full_name ?? `${opts.user}/${repo}`);
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      // THE M1 FABRICATION (demo-sweep.test.ts's seedRepo recipe): created_at
+      // past retention, owner NULL — swept regardless of who owns the PAT.
+      const backdated = Math.floor(Date.now() / 1000) - 73 * 60 * 60;
+      await d1Exec(`UPDATE repositories SET created_at = ${backdated}, owner_id = NULL WHERE owner_namespace = '${opts.user}' AND slug = '${repo}'`);
+      const seeded = await d1Row(`SELECT COUNT(*) AS n FROM repositories WHERE owner_namespace = '${opts.user}' AND slug = '${repo}' AND created_at = ${backdated} AND owner_id IS NULL`);
+      expect(seeded.n === 1, `the backdate did not land (rows matching the aged/NULL-owner shape: ${seeded.n})`);
+      // THE TICK: miniflare's scheduled-trigger surface dispatches the hourly
+      // entry through handleScheduledCron — the dispatcher's strict cron
+      // route lands ONLY the demo producer, which (gate armed) SELECTs and
+      // enqueues. The consumer arm then drives the cascade on its own budget.
+      const tick = await fetchT(`${opts.baseUrl}/cdn-cgi/local/scheduled?cron=${encodeURIComponent(DEMO_HOURLY_CRON)}`);
+      const tickBody = (await tick.text()).trim();
+      expect(tick.status === 200,
+        `the scheduled trigger answered ${tick.status} (${tickBody.slice(0, 100)}) — the surface exists only on the local vite dev/miniflare server; run this arm with --d1-scope local against pnpm dev`);
+      expect(tickBody === "ok", `the scheduled trigger outcome ${JSON.stringify(tickBody.slice(0, 100))} (expected "ok")`);
+      // END STATE: row-deletion IS the claim (§3.1) — poll the row gone.
+      const gone = await poll(TTL_SETTLE_MS, async () => {
+        const row = await d1Row(`SELECT COUNT(*) AS n FROM repositories WHERE owner_namespace = '${opts.user}' AND slug = '${repo}'`);
+        return row.n === 0 ? row : null;
+      });
+      expect(gone !== null,
+        `the fabricated row survived ${TTL_SETTLE_MS} ms past the hourly tick — the sweep never deleted it (DEMO_MODE armed in .dev.vars? the queue delivering? the consumer arm mounted?)`);
+      ttl.rowGone = true;
+      return `the aged NULL-owner row is gone after one hourly tick (producer → {kind:"demo-sweep"} → the cascade deleted it); trigger outcome ok`;
+    },
+  },
+];
+
+/** The red-runs-self-sweep posture for the demo battery: the TTL arm's
+ *  fabricated repo is the ONLY server-side state any arm creates (the three
+ *  posture arms are read-only). Green runs arrive with the row already
+ *  deleted by the sweep itself (rowGone); a red before the tick — or a sweep
+ *  that never fired — sweeps it here: D1 first (the backdate NULLed the
+ *  owner, so the API delete may not resolve), then the best-effort API
+ *  DELETE. One [tail] line; never fatal; a green run no-ops silently. */
+const demoFailureCleanup = async (ctx) => {
+  const acts = [];
+  const ttl = ctx.ttl;
+  if (ttl && ttl.created === true && ttl.rowGone !== true) {
+    if (opts.d1Scope === "local") {
+      try {
+        await d1Exec(`DELETE FROM repositories WHERE owner_namespace = '${opts.user}' AND slug = '${ttl.repo}'`);
+        acts.push(`fabricated TTL repo ${ttl.repo} deleted (D1 --local)`);
+      } catch (err) {
+        acts.push(`fabricated TTL repo ${ttl.repo} D1 sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    try {
+      const out = await deleteRepo(opts.user, ttl.repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      acts.push(`repo ${ttl.fullName ?? ttl.repo} API delete threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (acts.length) log(`  [tail] demo-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -3528,11 +3804,18 @@ const BATTERIES = {
   // Needs an ADMIN PAT (the member-user arm) and wrangler auth for the
   // priority arm's rule-id lookup (--d1-scope picks the database).
   "branch-protection": { title: "branch-protection flows (SPEC-0013: rule CRUD + priority, push-time per-ref rejection, merge approval gate 405→200, whitelist flag round-trip)", context: branchProtectionContext, steps: branchProtectionSteps, failureTail: branchProtectionFailureCleanup },
+  // Independent (the fixwave/cleanup-audit posture shape): every demo arm
+  // reports its own verdict. The banner arm reads its surface AT RUN TIME —
+  // a miss while the M2 wave is still in flight is the documented [warn]
+  // degradation; anything mounted asserts hard. The deep TTL arm is
+  // local-only (--d1-scope local against pnpm dev; a deployed target
+  // records the ops-note [info] and never writes D1).
+  "demo": { title: "demo posture (SPEC-0014: config machinery + DEMO_MODE-off default, open signup, the §4.4 banner [warns pre-M2], the 72 h TTL mechanics — the deep arm local-only)", context: demoContext, steps: demoSteps, failureTail: demoFailureCleanup, independent: true },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 

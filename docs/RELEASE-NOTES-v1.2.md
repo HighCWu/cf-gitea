@@ -743,7 +743,7 @@ branch-protection battery — the toolkit's **11th, 18 arms** (`e9f37f2`'s
 fixwave-parity arm that read red in RD23's standing smoke (the 20/1) is
 expected green at RD24's formal run, and the block must state which run
 FIRST recorded it green (the wave-131 ledger's flagged §6 tension), plus
-the full-gate line at the final tree. **A10-L** and **M2** finalize when
+the full-gate line at the final tree. **A10-L (LANDED)** and **M2 (LANDED — banner + quotas, mounted)** finalize when
 their units land. §4 re-check: no line retired — 0036/0037 are index-only
 (the 65-table count stands), `check:api` PASS at the HEAD (`98eb3f6`:
 78/78 + 129/129) keeps the 64-op FEATURE-ABSENT ceiling intact, and the

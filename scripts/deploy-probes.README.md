@@ -20,8 +20,8 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 - Batteries: `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
-  `branch-protection`, `cleanup-audit`, `all` (runs them in that order, audit
-  last).
+  `branch-protection`, `demo`, `cleanup-audit`, `all` (runs them in that
+  order, audit last).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
@@ -339,6 +339,59 @@ prints all of them verbatim.
   (HTTP BASIC) + the member user (logged on one `[tail] bp-leftover-sweep`
   line; failures feed `left_behind`, never fatal; a green run no-ops
   silently).
+- **demo** — the SPEC-0014 demo-POSTURE battery (§7's named battery) against
+  the deployed demo instance (`cf-gitea-demo.aiapp.run` — a default
+  self-host deployment reds the signup arm BY DESIGN; it is not a
+  self-host-posture battery). Four INDEPENDENT arms (the fixwave posture
+  shape — one red never chain-skips the rest): **demo-config-posture** — the
+  committed deploy configs (`wrangler.jsonc` + `wrangler.jsonc.example`, the
+  source every deploy is cut from, parsed with a string-aware JSONC reader)
+  carry the demo machinery: the hourly `0 * * * *` cron entry beside the
+  standing 10-minute cadence (§3.1), the repo-tasks consumer's
+  `dead_letter_queue: "repo-tasks-dlq"` + the `repo-tasks-dlq` consumer
+  entry (M0, §3.0), and `DEMO_MODE` defaulting `"false"` in BOTH — the §2
+  hard invariant's config arm (a default deployment never arms). The
+  DEPLOYED instance's armed state has no further probe-able HTTP surface
+  (queue-consumer registration and log lines are not API-reachable), so the
+  deployed halves ride the banner arm here plus the ops-dashboard checks:
+  the demo zone's `DEMO_MODE` var on the deploy page, and the hourly
+  `[demo-sweep]` log line (Workers → Logs — one line per tick including
+  0-eligible). **demo-banner-present** — anonymous `GET /` → 200 carrying
+  the §4.4 demo banner: the `id="demo-banner"` notice with the
+  "data on this instance is periodically cleaned" text, the
+  `id="demo-banner-dismiss"` control, and the
+  `cf-gitea-demo-banner-dismissed` sessionStorage dismissal script. **M2 IS
+  IN FLIGHT** (the banner+quotas wave lands after M1): until it deploys, a
+  miss is the documented `[warn]` degradation (the window2-mounts shape —
+  pre-M2 the page legitimately renders no node); anything mounted asserts
+  hard against the marker shape specified at this battery's writing, and a
+  shape drift at the M2 landing review moves the asserts with it.
+  **signup-open** — anonymous `GET /user/sign_up` → 200 carrying the
+  registration form (`action="/user/sign_up"` + the `user_name` field): the
+  `ALLOW_SIGNUP=true` demo posture (OQ-1's resolved convergence — one
+  registration surface for self-host and demo alike; the demo enables the
+  var). The route is LANDED (ui/first-run.ts), so the gate's 404-closed
+  shape is a posture RED, not a mount-timing warn. **demo-ttl-mechanics** —
+  the deep arm, LOCAL-ONLY: with `DEMO_MODE=true` in `.dev.vars` and
+  `--d1-scope local` against `pnpm dev`, fabricate the M1 unit's recipe row
+  (`POST /user/repos` an auto_init repo, then wrangler d1 `--local` backdates
+  `created_at` 73 h past retention and NULLs `owner_id` — the fail-safe
+  swept arm, §3.1 step 2, which also makes the verdict independent of the
+  PAT owner's `is_admin`), tick the hourly cron through miniflare's
+  `/cdn-cgi/local/scheduled?cron=…` trigger surface (forwarded by the vite
+  dev server; a deployed worker has no such route), then poll (budget 45 s)
+  until the fabricated row is GONE — the producer enqueued
+  `{kind:"demo-sweep"}` and the consumer's delete cascade deleted it
+  (row-deletion IS the sweep's claim, §3.1). On a DEPLOYED target the arm
+  records an ops-note `[info]` and never writes D1 (fabricating rows on
+  production is out of a probe's posture; logs are not API-reachable).
+  **Failure cleanup (the consistency posture):** the TTL repo is the only
+  server-side state any arm creates — a finally-style tail sweeps it D1
+  first (the backdate NULLed the owner, so the API delete may not resolve),
+  then the best-effort API DELETE (logged on one
+  `[tail] demo-leftover-sweep` line; failures feed `left_behind`, never
+  fatal; a green run no-ops silently because the sweep itself already
+  deleted the row).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -386,6 +439,10 @@ prints all of them verbatim.
     `protected_branches == 0`), then the repo (its delete cascades the rest),
     then the member's token + the member user;
     `[tail] bp-leftover-sweep`.
+  - `demo` — its fabricated TTL repo (D1 `--local` delete first — the
+    backdate NULLed the owner so the API delete may not resolve — then the
+    best-effort API DELETE); `[tail] demo-leftover-sweep`. (Green runs
+    arrive with the row already deleted by the sweep itself.)
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
   emptied everything, and the gone flags skip the rest). `p0` creates
@@ -432,6 +489,11 @@ prints all of them verbatim.
     `--force-red w2-org-last-owner-flash` reds after the org exists; the tail
     must list the org delete. Forcing an arm before the first creation (e.g.
     `w2-login-303`) leaves nothing to sweep — the tail stays silent.
+  - `demo` — the TTL arm is ATOMIC (fabricate → tick → poll inside one
+    check), so `demo --force-red demo-ttl-mechanics` forces the red WITHOUT
+    running any of it: nothing is created and the
+    `[tail] demo-leftover-sweep` line legitimately stays silent (the
+    documented no-op shape for this battery).
   The rehearsal convention: each forced-red run is followed by a
   `cleanup-audit` run, and the audit going green is the sweep's proof.
 - The mirror battery can also be forced honestly through its real budget
