@@ -717,7 +717,10 @@ wins the shared prefix — probed on hono 4.13), so the two arms cannot
 disagree. The tail decodes once (hono's own param decode convention — a
 malformed escape keeps raw text); POST /priority stays method-disjoint, and a
 rule literally named "priority" 404s through the same fall-through as
-upstream.
+upstream. The identical declaration-vs-runtime pattern landed for tag names
+the same day (af92937, 2026-10-28 — the `tags/*` wildcard siblings over
+upstream's chi catch-alls, `tag.go:153/:269`); the tags-side specifics live
+in that commit and its dedicated suite and are not duplicated here.
 
 Live-run catch (the probe battery found it before it could ship): hono keeps
 `c.req.path` UNSTRIPPED inside a sub-app mounted with `.route()` (index.ts

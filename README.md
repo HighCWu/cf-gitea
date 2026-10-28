@@ -47,6 +47,11 @@ pnpm db:migrate:local                          # apply Drizzle migrations to loc
 pnpm dev                                       # http://127.0.0.1:5173 — workerd, real local D1/DO/R2
 ```
 
+On a flaky network the gitea/ submodule fetch can fail transiently mid-stream
+(curl 92 / HTTP/2 CANCEL); git's built-in per-submodule retry usually recovers —
+if the clone errors, just re-run `git submodule update --init --recursive`
+(observed and re-verified in the [fresh-clone proof](docs/reviews/fresh-clone-proof-2026-10-28.md)).
+
 `wrangler.jsonc` declares three required secret names (`GIT_TOKEN`,
 `MIRROR_ALLOWED_HOST_LIST`, `MIRROR_CREDENTIAL_KEY`). Plain local dev — git hosting,
 API, UI — needs only `GIT_TOKEN` (the example file's value); the two `MIRROR_*` keys

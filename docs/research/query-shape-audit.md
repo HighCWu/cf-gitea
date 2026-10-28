@@ -11,6 +11,25 @@ witness lives in `apps/worker/src/bench-d1.test.ts`); this audit targets the
 shape of the queries themselves — how MANY roundtrips a request pays, and
 where a list page turns into 1 + N.
 
+## Landing status (2026-10-28)
+
+The fix wave this audit seeded landed the same day. Every hash below was
+verified against `git log` at bookkeeping time; the findings themselves are
+left as-written (they are the record of the shapes that motivated the fixes).
+
+| Row(s) | Status | Commit |
+| --- | --- | --- |
+| A1, A4, B2, A10 (the S half) | LANDED | `c614daa` — perf(ui,api): the S-grade N+1 collapse — label batch, dead-batch wire, parallel tree walks |
+| A2, A3, A6, B1 | LANDED | `fbd0826` — perf(api): the M-grade list batching — page-independent render contexts, 92-242 roundtrips to 8-10 |
+| A5 | LANDED | `42a07cf` — perf(api): A5 timeline batching — the mixed stream goes page-batched, 21→7 at seed |
+| A7 | LANDED | `57794e7` — perf(api): tier-2 preload adoption — thirteen more list surfaces go page-independent (both A7 comment lists) |
+| A8 | PENDING | in flight at this writing — `57794e7` left the feeds render per-row by design |
+| A9 | PENDING | in flight at this writing — the `orgs.ts` per-team coverage-probe loop is unchanged at HEAD |
+
+A10 caveat: only the S-difficulty fix landed (`enrichTreeCommits` runs
+concurrent via `Promise.all`, `c614daa`); the real fix — the batched
+`listTreeCommits` engine RPC (the L half) — is still open.
+
 ## Realistic N (what "seeded demo data" means here)
 
 There is no bulk demo seed script; the realistic N values come from the fixed
@@ -60,7 +79,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
 
 ## A. Confirmed N+1 loops (per-row selects inside loops)
 
-### A1. UI issues/pulls list — per-row label join (the bench-witnessed one)
+### A1. UI issues/pulls list — per-row label join (the bench-witnessed one) — **LANDED `c614daa`**
 
 - **Route**: `GET /{owner}/{repo}/issues` and `/{owner}/{repo}/pulls`
   (`apps/worker/src/ui/index.ts:8707-8710`).
@@ -85,7 +104,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   `GROUP BY is_closed` instead of two extra `listRepoIssues` calls.
 - **Difficulty**: S.
 
-### A2. API `GET /repos/{owner}/{repo}/issues` — per-issue `toApiIssue`
+### A2. API `GET /repos/{owner}/{repo}/issues` — per-issue `toApiIssue` — **LANDED `fbd0826`**
 
 - **Chain**: `apps/worker/src/api/routes/issues.ts:917-965`; render at
   `:964` — `Promise.all(items.map((issue) => toApiIssue(...)))`. Each
@@ -104,7 +123,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   (`LoadAttributes`-style), so parity holds.
 - **Difficulty**: M.
 
-### A3. API `GET /repos/{owner}/{repo}/pulls` — per-PR `toApiPullRequest` (heaviest list)
+### A3. API `GET /repos/{owner}/{repo}/pulls` — per-PR `toApiPullRequest` (heaviest list) — **LANDED `fbd0826`**
 
 - **Chain**: `apps/worker/src/api/routes/pulls.ts:864-915`, render at `:914`.
   Each `toApiPullRequest` (`apps/worker/src/api/services/pulls.ts:396-470`)
@@ -118,7 +137,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   per distinct head repo.
 - **Difficulty**: M-L.
 
-### A4. API `GET /repos/{owner}/{repo}/commits` — per-commit diff + duplicate email lookups
+### A4. API `GET /repos/{owner}/{repo}/commits` — per-commit diff + duplicate email lookups — **LANDED `c614daa`**
 
 - **Chain**: `apps/worker/src/api/routes/commits.ts:197-251`; the route
   batches author emails ONCE (`usernamesByEmail`, `:247`, one
@@ -139,7 +158,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   exists (`git-models.ts:173`) if a batched RPC lands later.
 - **Difficulty**: S.
 
-### A5. API `GET /repos/{owner}/{repo}/issues/{index}/timeline` — serial per-row metadata
+### A5. API `GET /repos/{owner}/{repo}/issues/{index}/timeline` — serial per-row metadata — **LANDED `42a07cf`**
 
 - **Chain**: `apps/worker/src/api/routes/issues.ts:1558-1576`; the render
   loop at `:1567-1572` is a **serial** `await toTimelineComment` per row.
@@ -155,7 +174,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   the loop (`Promise.all`) as the minimal variant.
 - **Difficulty**: M.
 
-### A6. API `GET /repos/issues/search` — serial per-row repo re-resolution
+### A6. API `GET /repos/issues/search` — serial per-row repo re-resolution — **LANDED `fbd0826`**
 
 - **Chain**: `apps/worker/src/api/routes/issues.ts:1581-1653`; the render
   loop `:1646-1652` re-resolves the repo pair PER ISSUE
@@ -168,7 +187,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   the A2 page-batch; `Promise.all` the render.
 - **Difficulty**: M.
 
-### A7. API comment lists — per-comment poster select
+### A7. API comment lists — per-comment poster select — **LANDED `57794e7`**
 
 - **Routes**: `GET /repos/{owner}/{repo}/issues/comments`
   (`apps/worker/src/api/routes/issues.ts:1070-1079`, render `:1078`) and
@@ -183,7 +202,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   `comments.LoadPosters` is the same fix).
 - **Difficulty**: S.
 
-### A8. Activity feed render — per-distinct-repo pairs + per-comment posters
+### A8. Activity feed render — per-distinct-repo pairs + per-comment posters — **PENDING** (in flight, 2026-10-28)
 
 - **Chain**: `apps/worker/src/api/services/activity-feeds.ts:490-558`
   (`renderFeedItems`, shared by the `/activities/feeds` API family and the UI
@@ -198,7 +217,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   query already exists, `repository.ts:662-665`); batch comment posters.
 - **Difficulty**: S-M.
 
-### A9. `OrgService.teamRepoAccessMode` — per-team coverage probes
+### A9. `OrgService.teamRepoAccessMode` — per-team coverage probes — **PENDING** (in flight, 2026-10-28)
 
 - **Chain**: `apps/worker/src/services/orgs/orgs.ts:710-750`. After one
   teams ⋈ team_members select (`:712-722`), the loop runs a
@@ -213,7 +232,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   as one query, or `inArray` the coverage rows.
 - **Difficulty**: S-M.
 
-### A10. Repo home page — serial per-entry engine RPCs (not D1, but the biggest wall-clock N)
+### A10. Repo home page — serial per-entry engine RPCs (not D1, but the biggest wall-clock N) — **LANDED (S half) `c614daa`**; the batched `listTreeCommits` RPC (the L half) stays open
 
 - **Chain**: `GET /{owner}/{repo}` → `loadHomeData`
   (`apps/worker/src/ui/pages/home.tsx:74-114`) → `enrichTreeCommits`
@@ -234,7 +253,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
 
 ## B. Redundant re-fetches (same row selected twice in one request)
 
-### B1. `toApiPullRequest` → `toApiIssue` re-selects the PR row it already holds
+### B1. `toApiPullRequest` → `toApiIssue` re-selects the PR row it already holds — **LANDED `fbd0826`**
 
 `apps/worker/src/api/services/pulls.ts:405` calls `toApiIssue` while holding
 the `pull_requests` row in hand, and `toApiIssue` unconditionally re-selects
@@ -243,7 +262,7 @@ it through `pullRequestMetaOf`
 PR row on every pulls list (A3) and single GET. Fix: let `toApiIssue` accept
 an optional preloaded PR row (or split a "meta" parameter). Difficulty: S.
 
-### B2. The commits list's batched email map is thrown away
+### B2. The commits list's batched email map is thrown away — **LANDED `c614daa`**
 
 Covered in A4: the route pays one batched `usernamesByEmail` select
 (`apps/worker/src/api/routes/commits.ts:247`) whose result `toApiCommit`
