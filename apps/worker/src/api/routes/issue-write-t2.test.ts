@@ -20,7 +20,7 @@ import { and, asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { comments, issueLabels, issuePins, issues, labels, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
+import { comments, issueAssignees, issueLabels, issuePins, issues, labels, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { createStubAuthResolver, createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -334,6 +334,43 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index}/labels/{id} (issueRemoveLa
     expect(payload.action).toBe("label_updated");
     expect(payload.number).toBe(issueA.index);
     expect(payload.repository).toMatchObject({ full_name: "cf-gitea-stub/writes" });
+    // The EMPTY assignee set renders the Go nils — `null` for both fields
+    // (structs/issue.go:65-66, no omitempty), never [].
+    const emptyIssue = payload.issue as { assignee: unknown; assignees: unknown };
+    expect(emptyIssue.assignee).toBeNull();
+    expect(emptyIssue.assignees).toBeNull();
+  });
+
+  it("renders the payload issue block with the REAL assignee set when present (the ToAPIIssue emission witness)", async () => {
+    // notifyIssueChangeLabel (services/webhook/notifier.go:572-605) renders
+    // the payload issue through the SHARED convert.ToAPIIssue: LoadAssignees,
+    // then every assignee into `assignees` with the first duplicated into the
+    // deprecated `assignee` (services/convert/issue.go:110-118). The detach
+    // emission (emitLabelDetachEvent) rides that same folded render — no
+    // emission preload, the default "wire" mode — so THIS witness pins the
+    // upstream-faithful behavior: flipping the site back to the old
+    // emission-nulls shape must break here, never slip through silently.
+    await drizzle(env.DB)
+      .insert(issueAssignees)
+      .values([
+        { issueId: issueA.id, assigneeId: 1 },
+        { issueId: issueA.id, assigneeId: neighborId },
+      ])
+      .run();
+    const label = await seedAttachedLabel(issueA.id, "bug");
+    const hookId = await seedHook(["issue_label"]);
+
+    expect((await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/labels/${label.id}`, authed({ method: "DELETE" }))).status).toBe(204);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      issue: { assignee: { login: string } | null; assignees: Array<{ login: string }> | null };
+    };
+    // Edge-row (insertion) order — the listIssueAssignees orderBy — with the
+    // first assignee duplicated into `assignee` (ToIssue issue.go:105-113).
+    expect(payload.issue.assignees?.map((u) => u.login)).toEqual(["cf-gitea-stub", "neighbor"]);
+    expect(payload.issue.assignee).toMatchObject({ login: "cf-gitea-stub" });
   });
 
   it("emits on the not-attached (silent-204) path too — upstream RemoveLabel notifies without an affected-rows guard", async () => {
