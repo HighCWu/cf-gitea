@@ -34,7 +34,10 @@ import { viewerOf } from "../services/repository";
  *   - `git/commits/{sha}` accepts a ref, not only a sha (the param contract);
  *   - `compare/{basehead}`: `base...head` (three-dot, merge-base) or
  *     `base..head` (two-dot); `output=diff|patch` answers raw text; a
- *     malformed basehead → the declared 400.
+ *     malformed basehead → the declared 400; the JSON commit list is served
+ *     NEWEST-first (upstream's git-log order, compare.go) — the engine walk
+ *     is oldest-first and the render reverses it; a null merge base
+ *     (unrelated histories) answers EARLY EMPTY like compare.go:91-93.
  *
  * X-Total-Count approximation: the engine's listLog carries no total, so the
  * header counts the walked window (COMMIT_WALK_BOUND) — documented divergence
@@ -140,7 +143,10 @@ export function registerCommitRoutes(
     if (diff === null) {
       throw new ApiError(404, "not found");
     }
-    return c.text(diffType === "patch" ? renderPatch(commit, diff.files) : renderUnifiedDiff(diff.files), 200);
+    // The commit download strips the format-patch signature (upstream's
+    // RawDiffPatch arm runs `format-patch --no-signature`, diff.go:99 — the
+    // PR/compare downloads keep git's default tail, patch.go:74).
+    return c.text(diffType === "patch" ? renderPatch(commit, diff.files, { signature: null }) : renderUnifiedDiff(diff.files), 200);
   };
 
   app.get("/repos/:owner/:repo/git/commits/:segment", async (c, next) => {
@@ -393,10 +399,30 @@ export function registerCommitRoutes(
         throw new ApiError(404, "not found");
       }
       // three-dot diffs/commits from the merge base; two-dot from base itself.
-      let rangeStart = baseCommit.oid;
+      // Upstream GetCompareInfo returns EARLY EMPTY on a null merge base
+      // (unrelated histories — compare.go:91-93 `CompareBase == ""` return):
+      // zero commits and an empty raw diff/patch (git's `base...head` has no
+      // merge-base side). The PR twin already honors this (pull-engine.ts
+      // pullRequestDiff). The engine's budget-exhausted merge-base walk also
+      // reports base=null — the same EMPTY shape, our documented exhaustion
+      // posture (SPEC-0001b §6).
+      let rangeStart: string | null = baseCommit.oid;
       if (sep === "...") {
         const base = await reads.mergeBase(baseCommit.oid, headCommit.oid);
-        rangeStart = base !== null && base.tag === "ok" && base.base !== null ? base.base : baseCommit.oid;
+        rangeStart = base !== null && base.tag === "ok" ? base.base : null;
+      }
+      if (rangeStart === null) {
+        const output = c.req.valid("query").output ?? "";
+        if (output === "diff") {
+          return c.text("", 200);
+        }
+        if (output === "patch") {
+          // The route's landed empty-range patch shape (the header-only mail,
+          // the /pulls/{index}.patch twin) — upstream's format-patch prints
+          // nothing; kept for render consistency, documented divergence.
+          return c.text(renderPatch(headCommit, []), 200);
+        }
+        return c.json({ total_commits: 0, commits: [] }, 200);
       }
 
       const output = c.req.valid("query").output ?? "";
@@ -415,8 +441,13 @@ export function registerCommitRoutes(
       const statFlag = formBoolDefault(url, "stat");
       const filesFlag = formBoolDefault(url, "files");
       const usernames = await usernamesByEmail(c.env.DB, walked.commits);
+      // Upstream serves the compare commit list in git-log order (newest
+      // first — compare.go's ShowPrettyFormatLogToList); the engine's
+      // listCommitsRange is oldest-first (SPEC-0001b §4.1), so the render
+      // reverses the walk (the push-payload precedent, webhooks-push.ts).
+      const newestFirst = [...walked.commits].reverse();
       const rendered = await Promise.all(
-        walked.commits.map((commit) => toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, usernames, { stat: statFlag, files: filesFlag })),
+        newestFirst.map((commit) => toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, usernames, { stat: statFlag, files: filesFlag })),
       );
       return c.json({ total_commits: walked.commits.length, commits: rendered }, 200);
     },

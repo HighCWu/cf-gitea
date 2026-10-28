@@ -28,6 +28,7 @@ import { and, eq } from "drizzle-orm";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { ensureSeededRepo, buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../ui/testing/seed-repo";
+import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
 import { users, protectedBranches, repositories, comments, PRStatus, pullRequests } from "../db/schema";
@@ -40,7 +41,7 @@ import { registerBranchRoutes } from "./routes/branches";
 import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
 import { registerPullRoutes } from "./routes/pulls";
-import { engineReads, refTipMap } from "./services/engine";
+import { engineReads, refTipMap, ZERO_OID } from "./services/engine";
 import { RepoService } from "../repos/service";
 import type { User } from "./models/user";
 
@@ -140,6 +141,16 @@ async function seedBranchWithCommit(branch: string, path: string, content: strin
   return tips.get(`refs/heads/${branch}`)?.target ?? "";
 }
 
+/** Worker-side object hash (workerd crypto.subtle; putApiObjects re-verifies). */
+async function gitObjectOid(type: string, data: Uint8Array): Promise<string> {
+  const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+  const bytes = new Uint8Array(header.byteLength + data.byteLength);
+  bytes.set(header, 0);
+  bytes.set(data, header.byteLength);
+  const digest = await crypto.subtle.digest("SHA-1", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 // ---------------------------------------------------------------------------
 // Create + refs/pull/N/head + the lazy mergeability check
 // ---------------------------------------------------------------------------
@@ -208,7 +219,7 @@ describe("PR diff, patch, commits, files", () => {
     expect((await get(`${REPO}/pulls/1.zip`)).status).toBe(404);
   });
 
-  it("lists the PR commits with the contract X-* header family and stats", async () => {
+  it("lists the PR commits newest-first (upstream git-log order) with newest-side pagination", async () => {
     const res = await get(`${REPO}/pulls/1/commits`);
     expect(res.status).toBe(200);
     expect(res.headers.get("X-Total-Count")).toBe("2");
@@ -216,8 +227,28 @@ describe("PR diff, patch, commits, files", () => {
     expect(res.headers.get("X-Page")).toBe("1");
     const commits: Array<Record<string, unknown>> = await res.json();
     expect(commits).toHaveLength(2);
+    // Upstream serves the range in git-log order (newest first — the route
+    // reverses the engine's oldest-first walk): the range head "topic: b"
+    // renders first, the first range commit "topic: a" second.
     expect((commits[0]?.stats as Record<string, unknown>).total).toBeGreaterThan(0);
-    expect((commits[0]?.files as Array<Record<string, unknown>>)[0]?.filename).toBe("topic-a.txt");
+    expect((commits[0]?.files as Array<Record<string, unknown>>)[0]?.filename).toBe("topic-b.txt");
+    expect((commits[1]?.files as Array<Record<string, unknown>>)[0]?.filename).toBe("topic-a.txt");
+
+    // Newest-side pagination: page 1 carries the NEWEST commit, page 2 the
+    // oldest (upstream pages the git-log list from its head).
+    const page1 = await get(`${REPO}/pulls/1/commits?limit=1`);
+    expect(page1.status).toBe(200);
+    expect(page1.headers.get("X-HasMore")).toBe("true");
+    const first = (await page1.json<Array<Record<string, unknown>>>())[0];
+    expect((first?.files as Array<Record<string, unknown>>)[0]?.filename).toBe("topic-b.txt");
+    const page2 = await get(`${REPO}/pulls/1/commits?limit=1&page=2`);
+    expect(page2.status).toBe(200);
+    expect(page2.headers.get("X-HasMore")).toBe("false");
+    const second = (await page2.json<Array<Record<string, unknown>>>())[0];
+    expect((second?.files as Array<Record<string, unknown>>)[0]?.filename).toBe("topic-a.txt");
+    const past = await get(`${REPO}/pulls/1/commits?limit=1&page=3`);
+    expect(past.status).toBe(200);
+    expect(await past.json<unknown[]>()).toEqual([]);
   });
 
   it("lists the changed files (ChangedFileList) with the X-* header family", async () => {
@@ -405,7 +436,9 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
   });
 
   it("renders a single commit by ref or sha; the dot-suffix diff/patch", async () => {
-    const single = await get(`${REPO}/git/commits/main`);
+    // TIP2 (the seeded second commit) not `main`: later tests in this file
+    // land merges ONTO main, which would move the tip under a full-file run.
+    const single = await get(`${REPO}/git/commits/${TIP2}`);
     expect(single.status).toBe(200);
     const commit: Record<string, unknown> = await single.json();
     expect(commit.sha).not.toBe("");
@@ -423,7 +456,14 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     expect(await diff.text()).toContain("diff --git ");
     const patch = await get(`${REPO}/git/commits/${String(commit.sha)}.patch`);
     expect(patch.status).toBe(200);
-    expect(await patch.text()).toContain("Subject: [PATCH]");
+    const patchText = await patch.text();
+    expect(patchText).toContain("Subject: [PATCH]");
+    // The commit download strips the format-patch signature (upstream's
+    // `--no-signature`, diff.go:99): the body ends on the diff's last line
+    // (TIP2 adds docs/base.txt) — byte-pin the tail; the default
+    // `-- \n2.47.0` mail tail is absent.
+    expect(patchText.endsWith("+base doc")).toBe(true);
+    expect(patchText).not.toContain("\n-- \n");
   });
 
   it("resolves the PR behind a commit sha (the head_sha join)", async () => {
@@ -455,6 +495,57 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
 
     expect((await get(`${REPO}/compare/main`)).status).toBe(400);
     expect((await get(`${REPO}/compare/main...ghost`)).status).toBe(404);
+  });
+
+  it("serves the compare commit list newest-first (upstream git-log order)", async () => {
+    // two commits on one branch: the newest must render first
+    await seedBranchWithCommit("cmporder", "one.txt", "one\n");
+    await send(`${REPO}/contents/two.txt`, jsonInit("POST", { content: btoa("two\n"), branch: "cmporder", message: "second: two.txt" }));
+    const res = await get(`${REPO}/compare/main...cmporder`);
+    expect(res.status).toBe(200);
+    const compare: Record<string, unknown> = await res.json();
+    expect(compare.total_commits).toBe(2);
+    const commits = compare.commits as Array<Record<string, unknown>>;
+    // newest first: the range head ("second: two.txt") renders before "cmporder: one.txt"
+    expect(((commits[0]?.commit as Record<string, unknown>).message as string).startsWith("second: two.txt")).toBe(true);
+    expect(((commits[1]?.commit as Record<string, unknown>).message as string).startsWith("cmporder: one.txt")).toBe(true);
+  });
+
+  it("answers EARLY EMPTY on unrelated histories (three-dot null merge base, compare.go:91-93)", async () => {
+    // An unrelated root on its own branch: putApiObjects + ref CAS (the
+    // contents API cannot create disjoint roots).
+    const cell = env.REPO.getByName(`${OWNER}/${SLUG}`);
+    const person = { name: "seed", email: "seed@api.invalid", time: T0 + 90, tz: "+0000" };
+    const readme = new TextEncoder().encode("# isle\n");
+    const readmeOid = await gitObjectOid("blob", readme);
+    const tree = serializeTree([{ mode: "100644", name: "README.md", oid: readmeOid }]);
+    const root = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "isle root\n" });
+    const put = await cell.putApiObjects([
+      { oid: readmeOid, type: "blob", data: readme },
+      { oid: tree.oid, type: "tree", data: tree.data },
+      { oid: root.oid, type: "commit", data: root.data },
+    ]);
+    expect(put.tag).toBe("ok");
+    const landed = await cell.commitApiChange({ ref: "refs/heads/isle", expectedOldOid: ZERO_OID, newOid: root.oid });
+    expect(landed.tag).toBe("committed");
+
+    // merge_base(main, isle) is null → upstream returns before building any
+    // commit list: total 0, no entries; the raw diff is the empty string.
+    const json = await get(`${REPO}/compare/main...isle`);
+    expect(json.status).toBe(200);
+    expect(await json.json<Record<string, unknown>>()).toEqual({ total_commits: 0, commits: [] });
+
+    const diff = await get(`${REPO}/compare/main...isle?output=diff`);
+    expect(diff.status).toBe(200);
+    expect(await diff.text()).toBe("");
+
+    // the two-dot form reads the literal base..head range (no merge-base
+    // involvement): the disjoint roots make the walk disjoint too — the
+    // engine answers the whole isle line; order and shape still hold.
+    const twoDot = await get(`${REPO}/compare/main..isle`);
+    expect(twoDot.status).toBe(200);
+    const twoDotBody = (await twoDot.json<Record<string, unknown>>());
+    expect((twoDotBody.commits as unknown[]).length).toBeGreaterThan(0);
   });
 });
 

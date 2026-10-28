@@ -533,10 +533,16 @@ M2's push/force/delete predicates pre-ported, `recomputeOfficialForRule`
 isOfficialReviewer's whitelist arm (admin-off-whitelist NOT official —
 upstream-verbatim), official persisted on REQUEST rows, head-push legs
 (`markStaleReviewsOnPush` in webhooks-push: content-change detection via
-merge-base file diff, stale → dismiss_stale_approvals dismissal with the
-fixed comment + num_comments bump → un-stale at the new tip). Deviation:
-`syncCommitDivergence` not ported (lazy mergeability re-heals divergence —
-documented, revisit if a UI ever renders divergence eagerly).
+merge-base + final-tree comparison over the GATE-FREE merge-family RPCs —
+as-built 2026-10-28: the content-path RPCs' reachability gate nulled the
+old-tip readDiff once refs/pull/N/head had been CASed onto the new tip,
+silencing stale marking for exactly the force pushes it exists for; same
+merge base + same final tree = untouched, either moved = changed, with
+upstream's name-only list equality following and the divergence erroring
+in the conservative direction —, stale → dismiss_stale_approvals dismissal
+with the fixed comment + num_comments bump → un-stale at the new tip).
+Deviation: `syncCommitDivergence` not ported (lazy mergeability re-heals
+divergence — documented, revisit if a UI ever renders divergence eagerly).
 
 ## As-built — M2 (d7fdc49, 2026-10-25)
 

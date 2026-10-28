@@ -54,13 +54,14 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { findRepositoryById } from "../api/services/repository";
 import { TeamsService } from "../api/routes/org-teams";
-import { comments, issues, PRStatus, pullRequests, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { comments, issues, PRStatus, protectedBranches, pullRequests, pullReviews, repositories, ReviewType, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { authorize } from "../git-http/authorize";
 import { gitHttpGate } from "../git-http/gate";
 import { OrgService } from "../services/orgs/orgs";
 import { RepoService, type RepoRow } from "../repos/service";
+import { emptyRuleConfig, serializeRuleConfig } from "./branch-protection";
 import {
   emitPushFamilyUpdates,
   handleUserPushEvent,
@@ -189,6 +190,8 @@ beforeEach(async () => {
     "repo_transfer",
     "repo_redirects",
     "repo_counters",
+    "pull_reviews",
+    "protected_branches",
     "pull_requests",
     "comments",
     "issues",
@@ -1152,6 +1155,59 @@ describe("the PR-head sync arms — ref CAS, head_sha, re-check, comment (SPEC-0
     const rows = await pushComments(issueId);
     expect(rows).toHaveLength(1);
     expect(JSON.parse(rows[0]!.content ?? "{}")).toEqual({ is_force_push: true, commit_ids: [after, forced.tips[0]!] });
+  });
+
+  it("a force push stales + dismisses the PR's reviews through the gate-free content comparison", async () => {
+    const { row, token, aliceId, issueId, index, after } = await seedAdvancedPrHead("syncforcestale", "sync force stale");
+    // A dismiss_stale_approvals rule on the base + an approval made against
+    // the pre-force tip.
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId: row.id,
+      ruleName: "main",
+      priority: 0,
+      rules: serializeRuleConfig({ ...emptyRuleConfig(), dismissStaleApprovals: true }),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await drizzle(env.DB).insert(pullReviews).values({
+      type: ReviewType.Approve,
+      reviewerId: aliceId ?? 1,
+      issueId,
+      content: "",
+      official: true,
+      stale: false,
+      dismissed: false,
+      commitId: after,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    // The force push rides the REAL hook: handleUserPushEvent runs the
+    // notification arms FIRST — refs/pull/N/head is CASed onto the new tip,
+    // leaving the old tip UNREACHABLE from every ref — and only then the
+    // stale leg. The rewrite is a REBASE shape (a new commit over the base's
+    // seed, different work.txt content): both merge bases stay non-null, so
+    // upstream's comparison is well-defined and the gate-free read (the
+    // merge-family walks, not the reachability-gated readDiff) must still
+    // see the content change. (An unrelated-root force has a null merge
+    // base — upstream's own MergeBase error skips the check, pull.go:514.)
+    const seedTip = (await env.REPO.getByName(`${row.ownerNamespace}/${row.slug}`).listRefs()).refs.find(
+      (r) => r.name === "refs/heads/main",
+    )!.target;
+    const forced = await buildChainPack(seedTip, [
+      { message: "rewritten", files: [{ path: "work.txt", content: "rewritten\n" }], time: 1700000312 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: after, oid: forced.tips[0]!, ref: "refs/heads/feature" }], forced.pack, token)).status,
+    ).toBe(200);
+    // The sync really moved the head ref (the old tip is genuinely orphaned):
+    await expectRef(row.ownerNamespace, row.slug, `refs/pull/${index}/head`, forced.tips[0]!);
+
+    const review = (await drizzle(env.DB).select().from(pullReviews).all())[0]!;
+    expect(review.stale).toBe(true);
+    expect(review.dismissed).toBe(true); // the dismiss_stale_approvals pass
+    const rows = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueId)).all();
+    expect(rows.some((r) => r.type === CommentType.DismissReview)).toBe(true);
   });
 
   it("a force push reconciles the old push comments (upstream clean-up)", async () => {

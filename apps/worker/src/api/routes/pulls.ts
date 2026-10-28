@@ -1332,7 +1332,8 @@ export function registerPullRoutes(
 
   // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/pulls/{index}/commits (repoGetPullRequestCommits)
-  // — the PR range walk (CommitList carries the contract's X-* header family).
+  // — the PR range walk (CommitList carries the contract's X-* header family;
+  // the newest-first git-log order + newest-side pagination, see the handler).
   // -------------------------------------------------------------------------
   app.openapi(
     createRoute({
@@ -1367,15 +1368,32 @@ export function registerPullRoutes(
 
       const reads = engineReads(c.env, found.repo);
       const range = await pullRequestDiff(c, found, checked);
+      // Upstream serves the PR commit list in git-log order, NEWEST first,
+      // and pages from that side (page 1 = the newest `limit` commits —
+      // compare.go's ShowPrettyFormatLogToList over merge_base..head). The
+      // engine's listCommitsRange is oldest-first with oldest-side page
+      // semantics (SPEC-0001b §4.1), so the handler walks one bounded window
+      // (the upstream full-list bound; X-Total-Count stays the module's
+      // so-far approximation), reverses it, and slices the requested page
+      // out of the reversed order — the push-payload reversal precedent
+      // (webhooks-push.ts).
       const rangeCommits =
-        checked.mergeBase === null ? { commits: [], more: false } : ((await reads.listCommitsRange(checked.mergeBase, range.head, listOptions.limit, listOptions.page - 1)) ?? { commits: [], more: false });
-      const commits = rangeCommits.commits;
+        checked.mergeBase === null
+          ? { commits: [], more: false }
+          : ((await reads.listCommitsRange(checked.mergeBase, range.head, PULL_COMMITS_BOUND)) ?? { commits: [], more: false });
+      const newestFirst = [...rangeCommits.commits].reverse();
+      const start = (listOptions.page - 1) * listOptions.limit;
+      const commits = newestFirst.slice(start, start + listOptions.limit);
+      // Past-the-bound pages stay empty; `more` (the engine's walk-truncation
+      // flag) keeps the next Link relation alive through the last in-bound
+      // page like the previous per-page walk did.
+      const hasMore = start + listOptions.limit < newestFirst.length || rangeCommits.more;
       // X-Total-Count approximation: commits SO FAR (module doc on
       // setCommitListHeaders); the Link header gets a next relation when the
       // walk reports more.
       const soFar = (listOptions.page - 1) * listOptions.limit + commits.length;
-      setPaginationHeaders(c, soFar + (rangeCommits.more ? 1 : 0), listOptions);
-      setCommitListHeaders(c, listOptions, soFar, rangeCommits.more);
+      setPaginationHeaders(c, soFar + (hasMore ? 1 : 0), listOptions);
+      setCommitListHeaders(c, listOptions, soFar, hasMore);
 
       const usernames = await usernamesByEmail(c.env.DB, commits);
       const viewer = viewerOf(c);
@@ -1645,3 +1663,7 @@ export function registerPullRoutes(
     return c.json(await toApiPullRequest(c.env.DB, viewer, found, row.issue, row.pullRequest, "single"), 200);
   });
 }
+
+/** The PR-commits walk window (upstream lists the full range; the handler
+ *  pages the reversed window — the compare route's bound family). */
+const PULL_COMMITS_BOUND = 250;

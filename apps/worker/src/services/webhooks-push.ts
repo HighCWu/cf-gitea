@@ -807,6 +807,40 @@ async function createPushPullComment(
  * degrades to the newest ~1000 of the first two pages, logged (the one
  * documented deviation from upstream's exact window).
  */
+/** The stale-leg content walk window (the PR-rewrite size the tree read
+ *  covers; a bigger rewrite takes the leg's log-and-skip posture). */
+const STALE_CONTENT_WALK_BOUND = 1000;
+
+/**
+ * The OLD tip's final tree, GATE-FREE — the force-push read of the stale
+ * leg's content comparison. The content-path RPCs resolve a bare oid only
+ * while it is reachable from a ref (repo.ts resolveServable); after a force
+ * push plus the PR-head CAS nothing pins the old tip, so the tree is read
+ * over the merge-family range walk, whose resolveCommitish endpoints have
+ * no reachability gate. The walk base is the side's merge base (always a
+ * live-ref ancestor — resolvable), and when the tip IS its own merge base
+ * (a PR head with zero own commits — the walk is empty by definition) the
+ * merge base's own tree answers through readCommit, which resolves it
+ * (reachable). Null = the walk budget ended before reaching the tip (a
+ * rewrite larger than STALE_CONTENT_WALK_BOUND) — the caller's
+ * log-and-skip posture.
+ */
+async function staleSideTree(
+  cell: {
+    listCommitsRange(base: string, head: string, limit: number): Promise<{ commits: Array<{ oid: string; tree: string }>; more: boolean } | null>;
+    readCommit(id: string): Promise<{ oid: string; tree: string } | null>;
+  },
+  mergeBaseOid: string,
+  tip: string,
+): Promise<string | null> {
+  if (tip === mergeBaseOid) {
+    return (await cell.readCommit(mergeBaseOid))?.tree ?? null;
+  }
+  const walk = await cell.listCommitsRange(mergeBaseOid, tip, STALE_CONTENT_WALK_BOUND);
+  if (walk === null) return null;
+  return walk.commits.find((commit) => commit.oid === tip)?.tree ?? null;
+}
+
 async function newestLimitedCommitIds(
   cell: { listCommitsRange(base: string, head: string, limit: number, page?: number): Promise<{ commits: Array<{ oid: string }>; more: boolean } | null> },
   start: string,
@@ -1067,11 +1101,15 @@ export interface PushReviewLegsOptions {
  * run upstream's push-time review maintenance (services/pull/pull.go:425–461):
  *
  *   1. content changed? — checkIfPRContentChanged (:503–538) compares the
- *      PR's patch range old→new; the bounded port diffs both tips against
- *      their merge bases in the pushed repo's cell and compares the results
- *      (same-repo heads, the only population today; a fork-head read failure
- *      degrades to "unchanged" with upstream's log-and-continue posture,
- *      :529–535).
+ *      PR's patch range old→new; the bounded port reads both sides'
+ *      merge bases and final trees through the GATE-FREE merge-family RPCs
+ *      (the force-push fix: the content RPCs' reachability gate nulls the
+ *      old-tip read once refs/pull/N/head has been CASed onto the new tip —
+ *      same merge base + same tree = untouched, either moved = changed,
+ *      with upstream's name-only list equality following) and compares the
+ *      results (same-repo heads, the only population today; a fork-head
+ *      read failure degrades to "unchanged" with upstream's log-and-continue
+ *      posture, :529–535).
  *   2. changed → MarkReviewsAsStale (:440, models/issues/review.go:623–628 —
  *      EVERY review row of the issue), then — when the BASE branch's rule
  *      sets dismiss_stale_approvals — DismissApprovalReviews (:444–453,
@@ -1151,19 +1189,33 @@ async function applyPushReviewLegs(
           `stale marking skipped (upstream's log-and-continue, pull.go:529-535)`,
       );
     } else {
-      const oldDiff = await cell.readDiff(update.old, oldMergeBase.base);
-      const newDiff = await cell.readDiff(update.next, newMergeBase.base);
-      if (oldDiff === null || newDiff === null) {
+      // The content comparison, GATE-FREE (the force-push fix): the
+      // content-path RPCs (readDiff/readCommit) resolve a BARE oid only when
+      // it is reachable from a ref (repo.ts resolveServable → reachableOid),
+      // and by the time this leg runs the notification arm has already CASed
+      // refs/pull/N/head onto the new tip — after a force push NOTHING pins
+      // the old tip, readDiff(update.old, …) returns null, and stale marking
+      // silently skipped exactly the pushes it exists for. The merge-family
+      // RPCs resolve the same oid gate-free (resolveCommitish), so both
+      // sides are read through them: each side's FINAL TREE (the old tip
+      // over the merge-base..tip range walk; the new tip is the pushed
+      // branch's live ref). Upstream's semantic — "the patch/diff with its
+      // merge base is unchanged" (pull.go:503-538, name-only) — at tree
+      // granularity: same merge base AND same final tree = untouched;
+      // either moved = changed. Where upstream's name list would tie while
+      // the trees differ (a rewrite that edits CONTENT within the same file
+      // set, or moves the merge base), ours answers "changed" — the
+      // conservative direction, and MarkReviewsAsNotStale re-freshens any
+      // review already made against the incoming tip.
+      const oldTree = await staleSideTree(cell, oldMergeBase.base, update.old);
+      const newTree = (await cell.readCommit(update.next))?.tree ?? null;
+      if (oldTree === null || newTree === null) {
         log(
-          `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR #${issue.index} diff read failed — ` +
+          `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR #${issue.index} content read failed — ` +
             `stale marking skipped (upstream's log-and-continue, pull.go:529-535)`,
         );
       } else {
-        // The content comparison covers the FILE list only — the DiffResult
-        // envelope carries the tip oids, which differ on every push by
-        // definition (upstream compares `git diff --name-only` output,
-        // pull.go:516).
-        changed = JSON.stringify(oldDiff.files) !== JSON.stringify(newDiff.files);
+        changed = oldMergeBase.base !== newMergeBase.base || oldTree !== newTree;
       }
     }
   }
