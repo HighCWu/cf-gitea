@@ -23,12 +23,22 @@ left as-written (they are the record of the shapes that motivated the fixes).
 | A2, A3, A6, B1 | LANDED | `fbd0826` — perf(api): the M-grade list batching — page-independent render contexts, 92-242 roundtrips to 8-10 |
 | A5 | LANDED | `42a07cf` — perf(api): A5 timeline batching — the mixed stream goes page-batched, 21→7 at seed |
 | A7 | LANDED | `57794e7` — perf(api): tier-2 preload adoption — thirteen more list surfaces go page-independent (both A7 comment lists) |
-| A8 | PENDING | in flight at this writing — `57794e7` left the feeds render per-row by design |
-| A9 | PENDING | in flight at this writing — the `orgs.ts` per-team coverage-probe loop is unchanged at HEAD |
+| A8 | LANDED | `30284a6` — perf(api): A8 — the feeds render goes page-independent, R+C per-row reads to two batched arms |
+| A9 | LANDED | `4dc7f54` — perf(api): A9 — the fork-head grant fan folds into one batched resolution, 11→4 at four grant-bearing heads |
 
 A10 caveat: only the S-difficulty fix landed (`enrichTreeCommits` runs
 concurrent via `Promise.all`, `c614daa`); the real fix — the batched
 `listTreeCommits` engine RPC (the L half) — is still open.
+
+A9 caveat: the landing is the audit's `inArray` variant at the fan site —
+the batched twin `viewerTeamAccessModes` (`repository.ts:222`) runs one
+`inArray` per underlying kind with the per-team coverage probes collapsed
+onto the `(team_id, repo_id)` UNIQUE set (≤4 statements regardless of
+count), and `prefetchPullRequestRenderContext` resolves headRepoModes with
+one call over the distinct pairs. The single-call `doerRepoAccessMode` path
+keeps its loop by design (commit: "the per-call path and single-item routes
+untouched") — the audit's one-query rewrite of the single path was not the
+shape that landed.
 
 ## Realistic N (what "seeded demo data" means here)
 
@@ -202,7 +212,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   `comments.LoadPosters` is the same fix).
 - **Difficulty**: S.
 
-### A8. Activity feed render — per-distinct-repo pairs + per-comment posters — **PENDING** (in flight, 2026-10-28)
+### A8. Activity feed render — per-distinct-repo pairs + per-comment posters — **LANDED `30284a6`**
 
 - **Chain**: `apps/worker/src/api/services/activity-feeds.ts:490-558`
   (`renderFeedItems`, shared by the `/activities/feeds` API family and the UI
@@ -217,7 +227,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   query already exists, `repository.ts:662-665`); batch comment posters.
 - **Difficulty**: S-M.
 
-### A9. `OrgService.teamRepoAccessMode` — per-team coverage probes — **PENDING** (in flight, 2026-10-28)
+### A9. `OrgService.teamRepoAccessMode` — per-team coverage probes — **LANDED `4dc7f54`** (the batched fan; the single-call loop stays by design)
 
 - **Chain**: `apps/worker/src/services/orgs/orgs.ts:710-750`. After one
   teams ⋈ team_members select (`:712-722`), the loop runs a

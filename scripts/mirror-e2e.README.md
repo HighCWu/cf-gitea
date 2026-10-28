@@ -276,6 +276,10 @@ fixed here (product source is out of the harness unit's scope):
    named in `docs/reviews/e2e-sweep-2026-10-28.md` (open issue 2) — a wipe
    retry/backoff, a DLQ or tombstone-era reaper for dropped purge messages,
    husk cleanup — remain open.
+   **Status 2026-10-28: an engine-side fix is in flight** — a sibling unit
+   is fixing it in engine storage; nothing has landed at this writing (this
+   note is bookkeeping, not a landing claim). Until it lands, the pre-server
+   sweep + the checked-DELETE abort above keep runs green harness-side.
 
 1. **v2 advertisement with the `# service=` preamble failed to parse** —
    `apps/worker/src/services/mirror/gitclient.ts` `parseInfoRefsAdvert` only
