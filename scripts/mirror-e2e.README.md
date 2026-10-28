@@ -16,19 +16,27 @@ cleanup on a green run.
 ```bash
 pnpm test:mirror                              # or: bash scripts/mirror-e2e.sh
 bash scripts/mirror-e2e.sh http://127.0.0.1:5199   # explicit base URL
+SHARED_TREE=1 bash scripts/mirror-e2e.sh      # old behavior: run on the live shared tree
+DEV_START_ATTEMPTS=150 bash scripts/mirror-e2e.sh   # extend the dev-boot healthz budget (slow CI runners)
+SETTLE_ATTEMPTS=180 bash scripts/mirror-e2e.sh      # extend the per-sync mirror settle budget
 ```
 
 - Default target is `http://127.0.0.1:5199` — the suite starts its OWN dev
-  server there (`pnpm dev`) and kills it on exit. It deliberately does NOT
-  reuse an already-running dev server: it must start the Worker with
-  `SSL_CERT_FILE` pointing at the fixture's throwaway CA (below), and only a
-  server it owns can get that environment. A server already answering at
-  `$BASE` is a hard error with instructions.
+  server there and kills it on exit. It deliberately does NOT reuse an
+  already-running dev server: it must start the Worker with `SSL_CERT_FILE`
+  pointing at the fixture's throwaway CA (below), and only a server it owns
+  can get that environment. A server already answering at `$BASE` is a hard
+  error with instructions. **Since 2026-10-28 the server it starts runs from
+  a disposable scratch checkout by default, not the live tree — see
+  § scratch isolation below** (`SHARED_TREE=1` opts back into the old
+  shared-tree behavior).
 - The source fixture listens on `https://127.0.0.1:8443` (override with
   `SRC_PORT`; whatever it is, `MIRROR_ALLOWED_HOST_LIST` must cover it).
 - Requirements: `git`, `curl`, `node`, `openssl` (the per-run TLS identity is
-  generated, never committed), `pnpm`, and local migrations applied
-  (`pnpm db:migrate:local` — migration 0010 lands `repo_mirrors`). `sqlite3`
+  generated, never committed), `pnpm`, and — for `SHARED_TREE=1` runs only —
+  local migrations applied (`pnpm db:migrate:local`; a scratch-isolated run,
+  the default, migrates its own fresh state, so the ROOT's migration state
+  is irrelevant to it). `sqlite3`
   is optional but recommended: it powers the pre-server stale-cell-file sweep
   (§ run hygiene); without it the sweep is skipped with a note.
 - The suite bootstraps its own fixtures under the fixed username `mirrore2e`
@@ -38,6 +46,98 @@ bash scripts/mirror-e2e.sh http://127.0.0.1:5199   # explicit base URL
   pre-clean wipes prior-run state with checked deletes and verifies the wipe
   before section 1 (see "Run hygiene" below). Global git config changes are
   sandboxed into the script's scratch `$HOME`.
+
+## Scratch isolation: the dev server runs from a frozen worktree (default)
+
+Mitigation for `docs/reviews/e2e-sweep-2026-10-28.md` open issue 4 (bitten
+again by the RD24 window's LFS healthz race): suites that own a `pnpm dev`
+server and run it on the SHARED tree are poisoned by sibling edits — an HMR
+reload races the healthz polls and a mid-save PARSE_ERROR window reads as
+product failure. Two of three sweep-day mirror runs died exactly there. So
+when this suite starts its own dev server, it first materializes a disposable
+**scratch checkout** — `git worktree add --detach` at a temp path, frozen at
+HEAD — and runs the server from THERE. Sibling agents keep editing the shared
+tree; the server's module graph never sees it (verified: a ROOT-tree `touch`
+triggers zero HMR events, the same touch inside the scratch reloads).
+
+Fast by design — no install happens (a per-run `pnpm install` would cost
+minutes). The honest wall-time delta is ~0.2 s to materialize (worktree add
++ the node_modules copies) plus ~10-15 s for the fresh state's in-place
+migration (miniflare boot + the 12 migrations apply once against an empty
+D1) — paid once per run, against the shared-tree alternative's poisoning
+risk during active waves:
+
+- The workspace root's `node_modules` is re-created inside the scratch as a
+  REAL directory of symlinks into the ROOT's store (pnpm 12 refuses to run
+  scripts when the dir itself is a symlink, and wants
+  `.pnpm-task-run-state-v1` real too), and the `apps/worker` +
+  `packages/git-engine` `node_modules` trees are COPIED (~4 MB of symlinks
+  and shim files) so pnpm's relative symlinks re-root into THIS tree —
+  `@cf-gitea/git-engine` resolves to the scratch's frozen engine copy, not
+  the live one. Materialization measures ~0.2 s wall.
+- The scratch's `pnpm-workspace.yaml` gains one line,
+  `verifyDepsBeforeRun: false` — pnpm 12 otherwise runs a hoist-install
+  against the scratch store before every script.
+- Gitignored dev files are COPIED in (a watching server must not see them
+  change): `wrangler.jsonc`, `.dev.vars`, the generated
+  `src/ui/icons.generated.ts`; `public/assets` is created empty (the suite
+  pins API/git/healthz, not UI). Because a worktree does not check out the
+  `gitea/` submodule, the server starts via
+  `pnpm --filter cf-gitea-worker dev` (the root script's predev
+  `gen:icons` would read the empty submodule); the generated icons file the
+  worker imports comes from the copy above.
+- `apps/worker/.wrangler` is a FRESH state, migrated in place inside the
+  scratch (`wrangler d1 migrations apply cf-gitea --local`) — the shape a CI
+  checkout gets, and deliberately NOT a link or copy of the ROOT's state:
+  two workerd processes on one sqlite state poison each other with
+  `database is locked: SQLITE_BUSY` (observed 2026-10-28: a sibling's live
+  dev server held the ROOT state while a scratch server wrote it — the
+  migrate call 500'd and cascaded into 33 failures), and copying sqlite
+  files under a live writer risks torn copies. The suite sweeps and seeds
+  its own namespace either way, so fresh state costs nothing but the
+  migration; the concurrent-run interlock below keeps its lock on the
+  PHYSICAL ROOT path, so interlocking is unchanged.
+
+`SHARED_TREE=1` opts back into the old behavior (server on the live shared
+tree) — deliberately unguarded: that mode exists FOR quick dirty-tree edit
+loops, and the user accepted the poisoning risk by opting in. If scratch
+materialization FAILS (worktree registration locked, disk full, ...), an
+honest guard decides instead of silently poisoning: a **dirty** shared tree
+(`git status --porcelain` non-empty) is REFUSED with a fatal naming the
+recovery; a clean tree falls back to it with a note. The forced-failure demo
+is one shim away:
+
+```bash
+mkdir -p /tmp/guard-demo-shim
+cat > /tmp/guard-demo-shim/git <<'EOF'
+#!/bin/bash
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "worktree" ] && [ "$a" = "add" ]; then
+    echo "simulated: worktree add unavailable" >&2; exit 1
+  fi
+  prev="$a"
+done
+exec /usr/bin/git "$@"
+EOF
+chmod +x /tmp/guard-demo-shim/git
+PATH=/tmp/guard-demo-shim:$PATH bash scripts/mirror-e2e.sh   # on a dirty tree: FATAL
+```
+
+The suite's own server binds `127.0.0.1` explicitly (`--host 127.0.0.1`):
+GitHub runner-images alias `localhost`→`::1`, which makes vite bind
+IPv6-only while every healthz poll dials 127.0.0.1
+(actions/runner-images#929 — the first CI run lost five dev-server jobs
+to exactly this).
+
+Worktree hygiene: the EXIT trap runs `git worktree remove --force` (with an
+`rm -rf` fallback), so green and red runs leave no registration behind; a
+SIGKILLed run's leftover registration is pruned by the next run's
+`git worktree prune`. Dev-boot budgets are env-tunable for slow CI runners:
+`DEV_START_ATTEMPTS` (healthz poll seconds, default 120) and, for the mirror
+syncs, `SETTLE_ATTEMPTS` (per-sync settle seconds, default 120) — CI exports
+them instead of patching the script. In CI (quiet checkout) the isolation is
+harmless: the worktree freezes the same commit CI checked out.
 
 ## Run hygiene: interlock, checked deletes, stale-state guard
 
@@ -247,7 +347,10 @@ it to PATCH).
           MIRROR_ALLOWED_HOST_LIST=127.0.0.1:8443
           MIRROR_CREDENTIAL_KEY=OR9xOOi4L+VpTHWpz3d9tCwNWGex2CVu5tSO3Q0vbKE=
           EOF
-      - run: bash scripts/mirror-e2e.sh
+      # DEV_START_ATTEMPTS: GitHub's 2-core runners have shown the WORKER boot
+      # exceed 120 s after vite is ready (first CI run lost five dev-server
+      # jobs to it); 300 s matches the workflow's own outer wait budgets.
+      - run: DEV_START_ATTEMPTS=300 bash scripts/mirror-e2e.sh
 ```
 
 (ubuntu-latest ships git, curl, node, openssl; the fixture and dev server are
@@ -258,7 +361,11 @@ to be 32 base64 bytes for the AES-256-GCM KEK.)
 ## Known red
 
 **None on the current tree** — the suite runs fully green against it (the
-run-hygiene layer self-heals the environmental state below harness-side).
+run-hygiene layer self-heals the environmental state below harness-side;
+the isolation wave's full run — 94/0 on a dirty tree under scratch
+isolation — also retired the historical section-7 prune red for good:
+the mirror-HEAD adoption fix (`071f10b`) is what made those four checks
+green, no harness change involved).
 The two product gaps the suite found on its first run were both fixed since
 (the suite is what surfaced them, so they are kept here for the record); the
 third finding below was RESOLVED engine-side on 2026-10-28 (root cause

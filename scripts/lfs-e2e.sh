@@ -29,6 +29,7 @@
 #      -> 401 + `WWW-Authenticate: Basic realm="gitea-lfs"` (§2.2 split).
 #
 # Usage: scripts/lfs-e2e.sh [base-url]        (default http://127.0.0.1:5173)
+#   SHARED_TREE=1 scripts/lfs-e2e.sh    # old behavior: run on the live tree
 #
 # Requirements: git-lfs (>=3), git, curl, node (token minting + JSON
 # parsing), pnpm (wrangler D1/R2 `--local` introspection — the local dev
@@ -36,10 +37,24 @@
 # storage assertions below read the state the server just wrote). When no
 # server answers at $BASE one is started via `pnpm dev` and killed on exit;
 # the D1/R2 assertions assume that default local target (they read its
-# state), mirroring how the git e2e targets 127.0.0.1.
+# state), mirroring how the git e2e targets 127.0.0.1. Since 2026-10-28 an
+# own-server run starts the server from a disposable scratch checkout by
+# default (run-hygiene list above; README § scratch isolation) with its own
+# freshly-migrated dev state — the wrangler introspection below runs against
+# the same scratch, so it still reads exactly the state the server wrote.
 #
 # Run hygiene (2026-10-28 hardening, ported from scripts/mirror-e2e.sh —
 # see scripts/lfs-e2e.README.md § run hygiene):
+#   - SCRATCH-TREE ISOLATION (default; SHARED_TREE=1 opts out): when the suite
+#     starts its OWN dev server, it first materializes a disposable git-worktree
+#     scratch frozen at HEAD (~0.2 s: node_modules reuses the ROOT store) and
+#     runs the server from THERE — sibling agents editing the shared tree
+#     mid-run cannot HMR-reload it (docs/reviews/e2e-sweep-2026-10-28.md open
+#     issue 4; the RD24 window's healthz race hit THIS suite). The scratch
+#     also carries a FRESH, freshly-migrated dev state (see below for why
+#     sharing the ROOT state is itself a poisoning vector), so the run owns
+#     its tree AND its state; a server already answering at $BASE is
+#     reused as before (no scratch — nothing of this run's own to isolate);
 #   - a concurrent-run interlock (a second invocation fails immediately);
 #   - every setup/cleanup DELETE is CHECKED — a failed D1 statement or an
 #     unexpected engine DELETE status aborts the run naming the resource;
@@ -52,6 +67,11 @@
 set -u
 
 BASE=${1:-http://127.0.0.1:5173}
+# Dev-boot budget: healthz poll attempts (1 s apart) while the suite's own dev
+# server boots. Local workerd is ready in ~10-15 s; GitHub's 2-core runners
+# have shown the WORKER boot exceeding 120 s even after vite is ready, so CI
+# exports DEV_START_ATTEMPTS=150 (or more) instead of patching the script.
+DEV_START_ATTEMPTS=${DEV_START_ATTEMPTS:-120}
 OWNER=lfse2e
 REPO=lfsdemo
 SIZE1=150000
@@ -68,6 +88,8 @@ command -v node >/dev/null 2>&1 || { echo "FATAL: node not found"; exit 1; }
 DIR=$(mktemp -d /tmp/cgit-lfs-e2e.XXXXXX)
 SERVER_PID=""
 STARTED_SERVER=0
+SCRATCH=""
+RUN_ROOT=""
 LOCK_DIR=""
 LOCK_HELD=""
 PASS=0; FAIL=0
@@ -76,25 +98,139 @@ fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 check() { if [ "$1" = "$2" ]; then ok "$3"; else fail "$3 (got '$1' want '$2')"; fi }
 fatal() { echo "FATAL: $1"; exit 1; }
 
+kill_tree() { # <pid> — kill descendants FIRST, then the pid. Order matters:
+  # pnpm spawns run-script children in their OWN process group (the plain
+  # group-kill gets pnpm but orphans vite to init), and once a parent dies
+  # its children are reparented and unreachable by pgrep -P. Ported from
+  # scripts/mirror-e2e.sh: the sweep found a leaked server pair "still
+  # holding 5173 and the cell files", and the mirror suite's 2026-10-28 gate
+  # run leaked its vite on 5199 the same way.
+  local pid="$1" kids k
+  [ -n "$pid" ] || return 0
+  kids=$(pgrep -P "$pid" 2>/dev/null || true)
+  for k in $kids; do kill_tree "$k"; done
+  kill "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   # Runs from the EXIT trap (registered before the dev server starts and
   # before the run lock is taken, so even a preflight fatal never leaks the
   # server — or the lock; a SIGKILLed run leaves the lock to be reclaimed by
-  # holder-pid liveness).
+  # holder-pid liveness, and its scratch worktree registration to be pruned
+  # by the next run's `git worktree prune`).
   if [ "$STARTED_SERVER" = 1 ] && [ -n "$SERVER_PID" ]; then
+    kill_tree "$SERVER_PID"
     kill -- -"$SERVER_PID" 2>/dev/null || kill "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [ -n "$SCRATCH" ]; then
+    git -C "$ROOT" worktree remove --force "$SCRATCH" >/dev/null 2>&1 || rm -rf "$SCRATCH"
   fi
   if [ -n "$LOCK_HELD" ]; then rm -rf "$LOCK_DIR" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 
+# --- reuse-or-isolate decision (before the interlock: whether this run owns
+# its dev server determines whether a scratch is built at all) ------------------
+server_answers=0
+if curl -sf -o /dev/null "$BASE/healthz"; then server_answers=1; fi
+if [ "$server_answers" = 1 ]; then
+  echo "  .. (a server already answers at $BASE — reusing it; no scratch is built and the pre-server cell-file sweep is skipped: cell files must never be removed under a live server)"
+fi
+
+# --- scratch-tree isolation (sweep open issue 4) --------------------------------
+# Default ON, own-server runs only (a reused server is somebody else's tree —
+# nothing of this run's own to isolate). When the suite must START its dev
+# server, the server runs from a disposable scratch checkout (git worktree at
+# $DIR/tree, frozen at HEAD) instead of the live shared tree — sibling agents'
+# mid-run edits can then never reach the server's module graph (verified: a
+# ROOT-tree touch triggers zero HMR events, the same touch inside the scratch
+# reloads). SHARED_TREE=1 keeps the old shared-tree behavior for quick loops.
+#
+# What the scratch is (each step honest about WHY):
+#   - worktree add --detach HEAD: the tracked source, frozen at the last
+#     commit — uncommitted sibling edits are exactly what we isolate from;
+#   - node_modules is NOT installed (that would cost minutes): the workspace
+#     root's node_modules is re-created as a REAL directory of symlinks into
+#     the ROOT's store (pnpm 12 refuses to run scripts when the dir itself is
+#     a symlink, and wants .pnpm-task-run-state-v1 real too), and the
+#     apps/worker + packages/git-engine node_modules are COPIED so pnpm's
+#     relative symlinks re-root into THIS tree — `@cf-gitea/git-engine`
+#     resolves to the scratch's frozen engine copy, not the live one;
+#   - the scratch's pnpm-workspace.yaml gains `verifyDepsBeforeRun: false`
+#     (pnpm 12 otherwise runs a hoist-install against the scratch store);
+#   - gitignored dev files are COPIED in (a watching server must not see
+#     them change): wrangler.jsonc, .dev.vars, the generated icons file;
+#     public/assets is created empty (this suite pins API/LFS/healthz, not UI);
+#   - the dev STATE is FRESH, migrated in place — the shape a CI checkout
+#     gets — NOT linked or copied from the ROOT's: two workerd processes on
+#     one sqlite state poison each other with `database is locked:
+#     SQLITE_BUSY` (observed 2026-10-28: a sibling's live dev server held
+#     the ROOT state while a scratch server wrote it — migrate 500'd and
+#     cascaded into 33 failures), and copying sqlite files under a live
+#     writer risks torn copies. The suite sweeps and seeds its own namespace
+#     either way; the run lock below stays on the PHYSICAL ROOT path, so
+#     interlocking is unchanged.
+# If materialization fails, an honest guard decides: a DIRTY shared tree is
+# refused (that is the poisoning scenario), a clean one falls back with a note.
+SCRATCH=""
+RUN_ROOT="$ROOT"
+if [ "${SHARED_TREE:-0}" = "1" ]; then
+  echo "== SHARED_TREE=1 — dev server will run on the LIVE shared tree (no isolation; sibling edits can HMR-poison this run) =="
+elif [ "$server_answers" = 0 ]; then
+  scratch_materialize() {
+    [ -d "$ROOT/node_modules/.pnpm" ] || return 1
+    git -C "$ROOT" worktree prune
+    git -C "$ROOT" worktree add --detach "$DIR/tree" HEAD >/dev/null 2>"$DIR/worktree-add.err" || return 1
+    local S="$DIR/tree" entry name
+    mkdir "$S/node_modules" || return 1
+    while IFS= read -r entry; do
+      name=${entry##*/}
+      if [ "$name" = ".pnpm-task-run-state-v1" ]; then
+        mkdir "$S/node_modules/$name" || return 1
+      else
+        ln -s "$entry" "$S/node_modules/$name" || return 1
+      fi
+    done < <(find "$ROOT/node_modules" -mindepth 1 -maxdepth 1 2>/dev/null)
+    printf '\nverifyDepsBeforeRun: false\n' >> "$S/pnpm-workspace.yaml" || return 1
+    cp -a "$ROOT/apps/worker/node_modules" "$S/apps/worker/node_modules" || return 1
+    rm -rf "$S/apps/worker/node_modules/.vite" "$S/apps/worker/node_modules/.cache" \
+           "$S/apps/worker/node_modules/.mf" "$S/apps/worker/node_modules/.vite-temp"
+    cp -a "$ROOT/packages/git-engine/node_modules" "$S/packages/git-engine/node_modules" || return 1
+    cp "$ROOT/apps/worker/wrangler.jsonc" "$S/apps/worker/wrangler.jsonc" || return 1
+    cp "$ROOT/apps/worker/.dev.vars" "$S/apps/worker/.dev.vars" || return 1
+    cp "$ROOT/apps/worker/src/ui/icons.generated.ts" "$S/apps/worker/src/ui/icons.generated.ts" || return 1
+    mkdir -p "$S/apps/worker/public/assets"
+    # Fresh dev state, migrated in place (the CI-checkout shape — see the
+    # block comment above for why the ROOT state is neither linked nor copied).
+    (cd "$S/apps/worker" && pnpm exec wrangler d1 migrations apply cf-gitea --local >/dev/null 2>&1) || return 1
+    [ -d "$S/apps/worker/.wrangler/state/v3/d1" ] || return 1
+    [ -x "$S/apps/worker/node_modules/.bin/wrangler" ] || return 1
+  }
+  if scratch_materialize; then
+    SCRATCH="$DIR/tree"
+    RUN_ROOT="$SCRATCH"
+    WORKER_DIR="$SCRATCH/apps/worker"
+    echo "== scratch checkout ready at $SCRATCH (frozen at HEAD — shared-tree edits cannot reach the server) =="
+  else
+    rc=$?
+    DIRTY=$(git -C "$ROOT" status --porcelain 2>/dev/null)
+    if [ -n "$DIRTY" ]; then
+      fatal "scratch isolation FAILED (rc=$rc: $(tail -c 200 "$DIR/worktree-add.err" 2>/dev/null | tr '\n' ' ')) and the shared tree is DIRTY — starting the dev server on a dirty shared tree races sibling edits' HMR reloads (docs/reviews/e2e-sweep-2026-10-28.md open issue 4). Recover per scripts/lfs-e2e.README.md (§ scratch isolation), or run deliberately with SHARED_TREE=1."
+    fi
+    echo "  .. scratch isolation failed (rc=$rc) — the shared tree is CLEAN, falling back to it"
+  fi
+fi
+
 # --- concurrent-run interlock --------------------------------------------------
-# Two concurrent invocations share this checkout's local D1/R2 state, the
-# lfse2e namespace, and the dev-server port; interleaved runs poison each
-# other and read as product failures. Ported from scripts/mirror-e2e.sh
-# (2026-10-28): mkdir is the atomic test-and-set; the pid file lets a crashed
-# run's lock be reclaimed automatically instead of wedging the suite.
-LOCK_DIR="$WORKER_DIR/.wrangler/state/lfs-e2e-run.lock"
+# Two concurrent invocations poison each other (interleaved runs read as
+# product failures). Ported from scripts/mirror-e2e.sh (2026-10-28): mkdir is
+# the atomic test-and-set; the pid file lets a crashed run's lock be
+# reclaimed automatically instead of wedging the suite. The lock's path is
+# the PHYSICAL ROOT path — deliberately NOT $WORKER_DIR: every invocation
+# (scratch mode included) takes the same lock, so a second invocation fails
+# immediately even though each scratch has its own state, and the message
+# names a path that outlives the run.
+LOCK_DIR="$ROOT/apps/worker/.wrangler/state/lfs-e2e-run.lock"
 mkdir -p "$(dirname "$LOCK_DIR")"
 if mkdir "$LOCK_DIR" 2>/dev/null; then
   LOCK_HELD=1
@@ -153,12 +289,10 @@ lfs_repo_id() { node -e 'console.log(parseInt(process.argv[1].replaceAll("-","")
 # (scripts/mirror-e2e.README.md § stale-state recovery). Missing sqlite3 also
 # degrades gracefully: the checked DELETEs below still abort loudly on an
 # unwipeable cell, with the recovery pointer.
+# $WORKER_DIR-based (in scratch mode the fresh state lives in the scratch —
+# and nothing has held it open yet; in shared mode this is the ROOT path).
+# $server_answers was probed before the isolation block above.
 CELL_DIR="$WORKER_DIR/.wrangler/state/v3/do/cf-gitea-RepoCell"
-server_answers=0
-if curl -sf -o /dev/null "$BASE/healthz"; then server_answers=1; fi
-if [ "$server_answers" = 1 ]; then
-  echo "  .. (a server already answers at $BASE — reusing it; skipping the pre-server cell-file sweep: cell files must never be removed under a live server)"
-fi
 if [ "$server_answers" = 0 ] && [ -d "$CELL_DIR" ]; then
   if command -v sqlite3 >/dev/null 2>&1; then
     for f in "$CELL_DIR"/*.sqlite; do
@@ -183,17 +317,28 @@ if [ "$server_answers" = 0 ]; then
   # would hang the healthz poll below; vite otherwise auto-increments when the
   # default 5173 is taken). Killed by the EXIT trap.
   PORT=${BASE##*:}
-  echo "== no server at $BASE — starting pnpm dev (port $PORT, strict) =="
-  setsid bash -c "cd '$ROOT' && exec pnpm dev --port $PORT --strictPort" >"$DIR/dev-server.log" 2>&1 &
+  if [ -n "$SCRATCH" ]; then
+    # --filter form, not `pnpm dev`: the root script's predev hook (gen:icons)
+    # reads the gitea/ submodule, which a worktree does not check out. The
+    # generated icons file was copied into the scratch instead. --host
+    # 127.0.0.1: GitHub runner-images alias localhost→::1, which would make
+    # vite bind IPv6-only while the healthz poll dials 127.0.0.1
+    # (actions/runner-images#929); the workflow carries the same flag.
+    echo "== no server at $BASE — starting pnpm dev from the SCRATCH tree (port $PORT, host 127.0.0.1, strict) =="
+    setsid bash -c "cd '$RUN_ROOT' && exec pnpm --filter cf-gitea-worker dev --host 127.0.0.1 --port $PORT --strictPort" >"$DIR/dev-server.log" 2>&1 &
+  else
+    echo "== no server at $BASE — starting pnpm dev from the SHARED tree (port $PORT, host 127.0.0.1, strict) =="
+    setsid bash -c "cd '$RUN_ROOT' && exec pnpm dev --host 127.0.0.1 --port $PORT --strictPort" >"$DIR/dev-server.log" 2>&1 &
+  fi
   SERVER_PID=$!
   STARTED_SERVER=1
   up=0
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 "$DEV_START_ATTEMPTS"); do
     curl -sf -o /dev/null "$BASE/healthz" && { up=1; break; }
     sleep 1
   done
   if [ "$up" != 1 ]; then
-    echo "FATAL: dev server did not become healthy; last log lines:"
+    echo "FATAL: dev server did not become healthy within ${DEV_START_ATTEMPTS}s (DEV_START_ATTEMPTS is the override); last log lines:"
     tail -20 "$DIR/dev-server.log"
     kill -- -"$SERVER_PID" 2>/dev/null || kill "$SERVER_PID" 2>/dev/null
     exit 1
@@ -234,7 +379,9 @@ d1_checked "DELETE FROM repositories WHERE owner_namespace = '$OWNER'" "pre-clea
 d1_checked "DELETE FROM users WHERE username_lower = '$OWNER'" "pre-clean users sweep"   # cascades personal_access_tokens
 check "$(d1_field "SELECT COUNT(*) FROM repositories WHERE owner_namespace = '$OWNER'")" "0" "pre-clean: D1 rows swept"
 
-BOOT=$(node "$ROOT/scripts/bootstrap-admin.mjs" "$OWNER" 2>/dev/null)
+# The SCRATCH copy in isolation mode: its wrangler runs against the scratch's
+# own config copy and fresh state — one tree, one state, one config source.
+BOOT=$(node "$RUN_ROOT/scripts/bootstrap-admin.mjs" "$OWNER" 2>/dev/null)
 TOKEN=$(echo "$BOOT" | grep -oE 'cfg_[0-9a-f]{8}_[A-Z2-9]{32}' | head -1)
 if [ -z "$TOKEN" ]; then echo "FATAL: bootstrap-admin.mjs produced no token"; echo "$BOOT"; exit 1; fi
 ok "bootstrapped $OWNER with an all-scopes PAT"

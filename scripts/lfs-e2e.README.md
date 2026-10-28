@@ -12,16 +12,24 @@ introspection via wrangler) and the git-lfs client, not the vendored engine.
 ```bash
 pnpm test:lfs                       # or: bash scripts/lfs-e2e.sh
 bash scripts/lfs-e2e.sh http://127.0.0.1:5173   # explicit base URL
+SHARED_TREE=1 bash scripts/lfs-e2e.sh           # old behavior: run on the live shared tree
+DEV_START_ATTEMPTS=150 bash scripts/lfs-e2e.sh  # extend the dev-boot healthz budget (slow CI runners)
 ```
 
-- Default target is the local dev server (`pnpm dev`, workerd, bindings from
+- Default target is the local dev server (workerd, bindings from
   `apps/worker/wrangler.jsonc`) at `http://127.0.0.1:5173` — the vite port the
   worker is served through (same convention as the git e2e, see
   `packages/git-engine/e2e/README.md`). When nothing answers at `$BASE/healthz`
-  the script starts `pnpm dev` itself and kills it on exit.
+  the script starts the dev server itself and kills it on exit. **Since
+  2026-10-28 an own-server run starts it from a disposable scratch checkout by
+  default, not the live tree — see § scratch isolation below**
+  (`SHARED_TREE=1` opts back into the old shared-tree behavior).
 - Requirements: `git-lfs` (>= 3), `git`, `curl`, `node`, `pnpm` (wrangler D1/R2
-  `--local` introspection), and local migrations applied (`pnpm db:migrate:local`
-  — the suite needs the `lfs_objects` table of migration 0005).
+  `--local` introspection), and — for `SHARED_TREE=1` runs only — local
+  migrations applied (`pnpm db:migrate:local`; a scratch-isolated run, the
+  default, migrates its own fresh state, so the ROOT's migration state is
+  irrelevant to it; the suite needs the `lfs_objects` table of migration
+  0005 either way).
 - All traffic runs in **relay mode** (SPEC-0006 §2.3): local dev has no R2 S3
   credentials, so `createLfsStore` answers the capability probe with `null` and
   batch hands out Worker-relayed hrefs. That is the day-one deployment shape;
@@ -33,6 +41,85 @@ bash scripts/lfs-e2e.sh http://127.0.0.1:5173   # explicit base URL
   run leaves everything in place for debugging; the next run pre-cleans it.
 - Global git/git-lfs config changes (`git lfs install`) are sandboxed into the
   script's scratch `$HOME` — the developer's real config is never touched.
+
+## Scratch isolation: the dev server runs from a frozen worktree (default)
+
+Mitigation for `docs/reviews/e2e-sweep-2026-10-28.md` open issue 4 — the
+RD24 window's healthz race hit THIS suite: a sibling agent's edit to the
+shared tree HMR-reloads the dev server a run owns, racing its healthz polls;
+a mid-save PARSE_ERROR window poisons the run as apparent product failure.
+So when this suite starts its OWN dev server (nothing answering at `$BASE`),
+it first materializes a disposable **scratch checkout** — `git worktree add
+--detach` at a temp path, frozen at HEAD — and runs the server from THERE.
+Sibling agents keep editing the shared tree; the server's module graph never
+sees it (verified: a ROOT-tree `touch` triggers zero HMR events, the same
+touch inside the scratch reloads). When a server already answers at `$BASE`
+the suite reuses it as before and builds NO scratch — a reused server is
+somebody else's tree; nothing of this run's own to isolate.
+
+Fast by design — no install happens (a per-run `pnpm install` would cost
+minutes). The honest wall-time delta is ~0.2 s to materialize (worktree add
++ the node_modules copies) plus ~10-15 s for the fresh state's in-place
+migration (miniflare boot + the migrations apply once against an empty
+D1) — paid once per run, against the shared-tree alternative's poisoning
+risk during active waves:
+
+- The workspace root's `node_modules` is re-created inside the scratch as a
+  REAL directory of symlinks into the ROOT's store (pnpm 12 refuses to run
+  scripts when the dir itself is a symlink, and wants
+  `.pnpm-task-run-state-v1` real too), and the `apps/worker` +
+  `packages/git-engine` `node_modules` trees are COPIED (~4 MB of symlinks
+  and shim files) so pnpm's relative symlinks re-root into THIS tree —
+  `@cf-gitea/git-engine` resolves to the scratch's frozen engine copy, not
+  the live one. Materialization measures ~0.2 s wall.
+- The scratch's `pnpm-workspace.yaml` gains one line,
+  `verifyDepsBeforeRun: false` — pnpm 12 otherwise runs a hoist-install
+  against the scratch store before every script.
+- Gitignored dev files are COPIED in (a watching server must not see them
+  change): `wrangler.jsonc`, `.dev.vars`, the generated
+  `src/ui/icons.generated.ts`; `public/assets` is created empty (this suite
+  pins API/LFS/healthz, not UI). Because a worktree does not check out the
+  `gitea/` submodule, the server starts via
+  `pnpm --filter cf-gitea-worker dev` (the root script's predev
+  `gen:icons` would read the empty submodule); the generated icons file the
+  worker imports comes from the copy above.
+- `apps/worker/.wrangler` is a FRESH state, migrated in place inside the
+  scratch (`wrangler d1 migrations apply cf-gitea --local`) — the shape a CI
+  checkout gets, and deliberately NOT a link or copy of the ROOT's state:
+  two workerd processes on one sqlite state poison each other with
+  `database is locked: SQLITE_BUSY` (observed 2026-10-28: a sibling's live
+  dev server held the ROOT state while a scratch server wrote it — the
+  migrate call 500'd and cascaded into 33 failures), and copying sqlite
+  files under a live writer risks torn copies. The suite sweeps and seeds
+  its own namespace either way; the concurrent-run interlock below keeps its
+  lock on the PHYSICAL ROOT path, so interlocking is unchanged, and the D1/R2
+  introspection below runs against the same scratch the server uses, so it
+  still reads exactly the state the server wrote.
+
+`SHARED_TREE=1` opts back into the old behavior (server on the live shared
+tree) — deliberately unguarded: that mode exists FOR quick dirty-tree edit
+loops, and the user accepted the poisoning risk by opting in. If scratch
+materialization FAILS (worktree registration locked, disk full, ...), an
+honest guard decides instead of silently poisoning: a **dirty** shared tree
+(`git status --porcelain` non-empty) is REFUSED with a fatal naming the
+recovery; a clean tree falls back to it with a note. The forced-failure demo
+is one shim away (see `scripts/mirror-e2e.README.md` § scratch isolation for
+the copy-paste shim — it fails `git worktree add` and the run must die with
+"scratch isolation FAILED ... and the shared tree is DIRTY").
+
+The suite's own server binds `127.0.0.1` explicitly (`--host 127.0.0.1`):
+GitHub runner-images alias `localhost`→`::1`, which makes vite bind
+IPv6-only while every healthz poll dials 127.0.0.1
+(actions/runner-images#929 — the first CI run lost five dev-server jobs
+to exactly this).
+
+Worktree hygiene: the EXIT trap runs `git worktree remove --force` (with an
+`rm -rf` fallback), so green and red runs leave no registration behind; a
+SIGKILLed run's leftover registration is pruned by the next run's
+`git worktree prune`. Dev-boot budget for slow CI runners: export
+`DEV_START_ATTEMPTS=<seconds>` (default 120) instead of patching the script.
+In CI (quiet checkout) the isolation is harmless: the worktree freezes the
+same commit CI checked out.
 
 ## Run hygiene: interlock, checked deletes, stale-state guard
 
@@ -147,7 +234,10 @@ git-lfs, `apt-get install git-lfs` or the `git-lfs/setup-git-lfs` action):
       # secrets.required for local dev (same as the git e2e job).
       - run: echo "GIT_TOKEN=ci-dev-token" > apps/worker/.dev.vars
       - run: pnpm dev & npx wait-on http://127.0.0.1:5173/healthz
-      - run: bash scripts/lfs-e2e.sh
+      # DEV_START_ATTEMPTS: GitHub's 2-core runners have shown the WORKER boot
+      # exceed 120 s after vite is ready (first CI run lost five dev-server
+      # jobs to it); 300 s matches the workflow's own outer wait budgets.
+      - run: DEV_START_ATTEMPTS=300 bash scripts/lfs-e2e.sh
 ```
 
 ## Known scope limits

@@ -12,6 +12,15 @@
 # full cleanup on a green run. CI wiring stays in scripts/mirror-e2e.README.md.
 #
 # Run hygiene (2026-10-28 sweep hardening, README § run hygiene):
+#   - SCRATCH-TREE ISOLATION (default; SHARED_TREE=1 opts out): when the suite
+#     starts its OWN dev server, it first materializes a disposable git-worktree
+#     scratch frozen at HEAD (~0.2 s: node_modules reuses the ROOT store) and
+#     runs the server from THERE — sibling agents editing the shared tree
+#     mid-run cannot HMR-reload it or catch it in a mid-save PARSE_ERROR window
+#     (docs/reviews/e2e-sweep-2026-10-28.md open issue 4, bitten again by the
+#     RD24 window's LFS healthz race). The scratch also carries a FRESH,
+#     freshly-migrated dev state (see below for why sharing the ROOT state
+#     is itself a poisoning vector), so the run owns its tree AND its state;
 #   - a concurrent-run interlock (a second invocation fails immediately);
 #   - every setup/cleanup DELETE is CHECKED — a failed D1 statement or a
 #     non-200/404 engine DELETE aborts the run naming the resource;
@@ -53,6 +62,7 @@
 #      serves clones (mirrors are snapshots).
 #
 # Usage: scripts/mirror-e2e.sh [base-url]     (default http://127.0.0.1:5199)
+#   SHARED_TREE=1 scripts/mirror-e2e.sh   # old behavior: run on the live tree
 #
 # Requirements: git, curl, node, openssl, pnpm (wrangler D1 --local
 # introspection), local migrations applied (pnpm db:migrate:local — migration
@@ -60,6 +70,15 @@
 set -u
 
 BASE=${1:-http://127.0.0.1:5199}
+# Dev-boot budget: healthz poll attempts (1 s apart) while the suite's own dev
+# server boots. Local workerd is ready in ~10-15 s; GitHub's 2-core runners
+# have shown the WORKER boot exceeding 120 s even after vite is ready, so CI
+# exports DEV_START_ATTEMPTS=150 (or more) instead of patching the script.
+DEV_START_ATTEMPTS=${DEV_START_ATTEMPTS:-120}
+# Mirror-sync settle budget (per sync, seconds): local settles arrive in
+# single-digit seconds, but a slow CI runner needs headroom; same override
+# pattern as DEV_START_ATTEMPTS.
+SETTLE_ATTEMPTS=${SETTLE_ATTEMPTS:-120}
 OWNER=mirrore2e
 SRC_HOST=127.0.0.1
 SRC_PORT=${SRC_PORT:-8443}          # must match MIRROR_ALLOWED_HOST_LIST in .dev.vars
@@ -82,6 +101,8 @@ command -v pnpm >/dev/null 2>&1 || { echo "FATAL: pnpm not found"; exit 1; }
 DIR=$(mktemp -d /tmp/cgit-mirror-e2e.XXXXXX)
 FIXTURE_PID=""
 SERVER_PID=""
+SCRATCH=""
+RUN_ROOT=""
 LOCK_DIR=""
 LOCK_HELD=""
 PASS=0; FAIL=0
@@ -90,24 +111,133 @@ fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 check() { if [ "$1" = "$2" ]; then ok "$3"; else fail "$3 (got '$1' want '$2')"; fi }
 fatal() { echo "FATAL: $1"; exit 1; }
 
+kill_tree() { # <pid> — kill descendants FIRST, then the pid. Order matters:
+  # pnpm spawns run-script children in their OWN process group (the plain
+  # group-kill gets pnpm but orphans vite to init), and once a parent dies
+  # its children are reparented and unreachable by pgrep -P. This is the fix
+  # for the leaked server pair the sweep found "still holding 5173 and the
+  # cell files" (docs/reviews/e2e-sweep-2026-10-28.md) and for this suite's
+  # own 2026-10-28 gate run leaking its vite on 5199 the same way.
+  local pid="$1" kids k
+  [ -n "$pid" ] || return 0
+  kids=$(pgrep -P "$pid" 2>/dev/null || true)
+  for k in $kids; do kill_tree "$k"; done
+  kill "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   # Runs from the EXIT trap (registered before the fixture starts, so even a
   # preflight fatal never leaks either process — or the run lock below; a
-  # SIGKILLed run leaves the lock to be reclaimed by holder-pid liveness).
+  # SIGKILLed run leaves the lock to be reclaimed by holder-pid liveness, and
+  # its scratch worktree registration to be pruned by the next run's
+  # `git worktree prune`).
   if [ -n "$FIXTURE_PID" ]; then kill "$FIXTURE_PID" 2>/dev/null || true; fi
-  if [ -n "$SERVER_PID" ]; then kill -- -"$SERVER_PID" 2>/dev/null || kill "$SERVER_PID" 2>/dev/null || true; fi
+  if [ -n "$SERVER_PID" ]; then
+    kill_tree "$SERVER_PID"
+    kill -- -"$SERVER_PID" 2>/dev/null || kill "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [ -n "$SCRATCH" ]; then
+    git -C "$ROOT" worktree remove --force "$SCRATCH" >/dev/null 2>&1 || rm -rf "$SCRATCH"
+  fi
   if [ -n "$LOCK_HELD" ]; then rm -rf "$LOCK_DIR" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 
+# --- scratch-tree isolation (sweep open issue 4) --------------------------------
+# Default ON. When this suite must START its own dev server, the server runs
+# from a disposable scratch checkout (git worktree at $DIR/tree, frozen at
+# HEAD) instead of the live shared tree — sibling agents' mid-run edits can
+# then never reach the server's module graph (verified: a ROOT-tree touch
+# triggers zero HMR events, the same touch inside the scratch reloads).
+# SHARED_TREE=1 keeps the old shared-tree behavior for quick edit loops.
+#
+# What the scratch is (each step honest about WHY):
+#   - worktree add --detach HEAD: the tracked source, frozen at the last
+#     commit — uncommitted sibling edits are exactly what we isolate from;
+#   - node_modules is NOT installed (that would cost minutes): the workspace
+#     root's node_modules is re-created as a REAL directory of symlinks into
+#     the ROOT's store (pnpm 12 refuses to run scripts when the dir itself is
+#     a symlink, and wants .pnpm-task-run-state-v1 real too), and the
+#     apps/worker + packages/git-engine node_modules are COPIED so pnpm's
+#     relative symlinks re-root into THIS tree — `@cf-gitea/git-engine`
+#     resolves to the scratch's frozen engine copy, not the live one;
+#   - the scratch's pnpm-workspace.yaml gains `verifyDepsBeforeRun: false`
+#     (pnpm 12 otherwise runs a hoist-install against the scratch store);
+#   - gitignored dev files are COPIED in (a watching server must not see
+#     them change): wrangler.jsonc, .dev.vars, the generated icons file;
+#     public/assets is created empty (the suites pin API/git/healthz, not UI);
+#   - the dev STATE is FRESH, migrated in place — the shape a CI checkout
+#     gets — NOT linked or copied from the ROOT's: two workerd processes on
+#     one sqlite state poison each other with `database is locked:
+#     SQLITE_BUSY` (observed 2026-10-28: a sibling's live dev server held
+#     the ROOT state while a scratch server wrote it — migrate 500'd and
+#     cascaded into 33 failures), and copying sqlite files under a live
+#     writer risks torn copies. The suite sweeps and seeds its own namespace
+#     either way; the run lock below stays on the PHYSICAL ROOT path, so
+#     interlocking is unchanged.
+# If materialization fails, an honest guard decides: a DIRTY shared tree is
+# refused (that is the poisoning scenario), a clean one falls back with a note.
+SCRATCH=""
+RUN_ROOT="$ROOT"
+if [ "${SHARED_TREE:-0}" = "1" ]; then
+  echo "== SHARED_TREE=1 — dev server will run on the LIVE shared tree (no isolation; sibling edits can HMR-poison this run) =="
+else
+  scratch_materialize() {
+    [ -d "$ROOT/node_modules/.pnpm" ] || return 1
+    git -C "$ROOT" worktree prune
+    git -C "$ROOT" worktree add --detach "$DIR/tree" HEAD >/dev/null 2>"$DIR/worktree-add.err" || return 1
+    local S="$DIR/tree" entry name
+    mkdir "$S/node_modules" || return 1
+    while IFS= read -r entry; do
+      name=${entry##*/}
+      if [ "$name" = ".pnpm-task-run-state-v1" ]; then
+        mkdir "$S/node_modules/$name" || return 1
+      else
+        ln -s "$entry" "$S/node_modules/$name" || return 1
+      fi
+    done < <(find "$ROOT/node_modules" -mindepth 1 -maxdepth 1 2>/dev/null)
+    printf '\nverifyDepsBeforeRun: false\n' >> "$S/pnpm-workspace.yaml" || return 1
+    cp -a "$ROOT/apps/worker/node_modules" "$S/apps/worker/node_modules" || return 1
+    rm -rf "$S/apps/worker/node_modules/.vite" "$S/apps/worker/node_modules/.cache" \
+           "$S/apps/worker/node_modules/.mf" "$S/apps/worker/node_modules/.vite-temp"
+    cp -a "$ROOT/packages/git-engine/node_modules" "$S/packages/git-engine/node_modules" || return 1
+    cp "$ROOT/apps/worker/wrangler.jsonc" "$S/apps/worker/wrangler.jsonc" || return 1
+    cp "$ROOT/apps/worker/.dev.vars" "$S/apps/worker/.dev.vars" || return 1
+    cp "$ROOT/apps/worker/src/ui/icons.generated.ts" "$S/apps/worker/src/ui/icons.generated.ts" || return 1
+    mkdir -p "$S/apps/worker/public/assets"
+    # Fresh dev state, migrated in place (the CI-checkout shape — see the
+    # block comment above for why the ROOT state is neither linked nor copied).
+    (cd "$S/apps/worker" && pnpm exec wrangler d1 migrations apply cf-gitea --local >/dev/null 2>&1) || return 1
+    [ -d "$S/apps/worker/.wrangler/state/v3/d1" ] || return 1
+    [ -x "$S/apps/worker/node_modules/.bin/wrangler" ] || return 1
+    [ -f "$S/apps/worker/test/fixtures/git-http-server.mjs" ] || return 1
+  }
+  if scratch_materialize; then
+    SCRATCH="$DIR/tree"
+    RUN_ROOT="$SCRATCH"
+    WORKER_DIR="$SCRATCH/apps/worker"
+    FIXTURE="$WORKER_DIR/test/fixtures/git-http-server.mjs"
+    echo "== scratch checkout ready at $SCRATCH (frozen at HEAD — shared-tree edits cannot reach the server) =="
+  else
+    rc=$?
+    DIRTY=$(git -C "$ROOT" status --porcelain 2>/dev/null)
+    if [ -n "$DIRTY" ]; then
+      fatal "scratch isolation FAILED (rc=$rc: $(tail -c 200 "$DIR/worktree-add.err" 2>/dev/null | tr '\n' ' ')) and the shared tree is DIRTY — starting the dev server on a dirty shared tree races sibling edits' HMR reloads (docs/reviews/e2e-sweep-2026-10-28.md open issue 4). Recover per scripts/mirror-e2e.README.md (§ scratch isolation), or run deliberately with SHARED_TREE=1."
+    fi
+    echo "  .. scratch isolation failed (rc=$rc) — the shared tree is CLEAN, falling back to it"
+  fi
+fi
+
 # --- concurrent-run interlock --------------------------------------------------
-# Two concurrent invocations share this checkout's local D1/DO state, the
-# mirrore2e namespace, and the fixture/dev-server ports; interleaved runs
-# poison each other and read as product failures (2026-10-28 sweep run A: two
-# runs interleaved on the shared namespace, a 41/44 storm). mkdir is the
-# atomic test-and-set; the pid file lets a crashed run's lock be reclaimed
-# automatically instead of wedging the suite.
-LOCK_DIR="$WORKER_DIR/.wrangler/state/mirror-e2e-run.lock"
+# Two concurrent invocations poison each other (2026-10-28 sweep run A: two
+# runs interleaved on the shared mirrore2e namespace and dev-server port, a
+# 41/44 storm). mkdir is the atomic test-and-set; the pid file lets a crashed
+# run's lock be reclaimed automatically instead of wedging the suite. The
+# lock's path is the PHYSICAL ROOT path — deliberately NOT $WORKER_DIR: every
+# invocation (scratch mode included) takes the same lock, so a second
+# invocation fails immediately even though each scratch has its own state,
+# and the message names a path that outlives the run.
+LOCK_DIR="$ROOT/apps/worker/.wrangler/state/mirror-e2e-run.lock"
 mkdir -p "$(dirname "$LOCK_DIR")"
 if mkdir "$LOCK_DIR" 2>/dev/null; then
   LOCK_HELD=1
@@ -135,6 +265,8 @@ fi
 # is under its own namespace — never another suite's cells — while no server
 # holds them open. Missing sqlite3 degrades gracefully: the checked DELETEs
 # below still abort loudly on an unwipeable cell, with the recovery pointer.
+# $WORKER_DIR-based (in scratch mode the fresh state lives in the scratch —
+# and nothing has held it open yet; in shared mode this is the ROOT path).
 CELL_DIR="$WORKER_DIR/.wrangler/state/v3/do/cf-gitea-RepoCell"
 if [ -d "$CELL_DIR" ]; then
   if command -v sqlite3 >/dev/null 2>&1; then
@@ -202,6 +334,15 @@ case ",$MIRROR_HOST_ENTRY," in
   *",$SRC_HOST:$SRC_PORT,"*|*",$SRC_HOST:*,"*) ok "MIRROR_ALLOWED_HOST_LIST covers $SRC_HOST:$SRC_PORT";;
   *) fatal "MIRROR_ALLOWED_HOST_LIST=$MIRROR_HOST_ENTRY does not cover the fixture address $SRC_HOST:$SRC_PORT — add an explicit IP entry ($SRC_HOST:$SRC_PORT) to $DEVVARS";;
 esac
+# KEK quality, not just presence: a value that does not decode to exactly 32
+# bytes passes the presence grep but 500s EVERY migrate at the credential
+# encrypt step (observed 2026-10-28: a 36-char legacy value in the shared
+# .dev.vars red-holed a whole run — `MIRROR_CREDENTIAL_KEY must be 32 bytes,
+# base64-encoded` — 33 failures deep). Fail HERE, naming the fix.
+KEK_B64=$(grep -E "^MIRROR_CREDENTIAL_KEY=" "$DEVVARS" | head -1 | cut -d= -f2- | tr -d ' \r')
+KEK_BYTES=$(printf '%s' "$KEK_B64" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+[ "$KEK_BYTES" = "32" ] || fatal "MIRROR_CREDENTIAL_KEY decodes to $KEK_BYTES bytes (want exactly 32) — regenerate it: openssl rand -base64 32, then put the output in $DEVVARS"
+ok "MIRROR_CREDENTIAL_KEY decodes to 32 bytes"
 
 [ "$(d1_field "SELECT COUNT(*) FROM sqlite_master WHERE name = 'repo_mirrors'")" = "1" ] \
   || fatal "local D1 lacks repo_mirrors — run pnpm db:migrate:local first (migration 0010)"
@@ -258,16 +399,29 @@ if curl -sf -o /dev/null "$BASE/healthz"; then
   fatal "a dev server already answers at $BASE — the mirror suite must own the server process (it starts it with SSL_CERT_FILE pointing at the fixture CA so workerd trusts the loopback source); stop it or pass another base URL"
 fi
 PORT=${BASE##*:}
-echo "== no server at $BASE — starting pnpm dev (port $PORT, SSL_CERT_FILE set) =="
-setsid bash -c "cd '$ROOT' && exec env SSL_CERT_FILE='$DIR/tls/ca.pem' pnpm dev --port $PORT --strictPort" >"$DIR/dev-server.log" 2>&1 &
+if [ -n "$SCRATCH" ]; then
+  # --filter form, not `pnpm dev`: the root script's predev hook (gen:icons)
+  # reads the gitea/ submodule, which a worktree does not check out. The
+  # generated icons file was copied into the scratch instead. --host
+  # 127.0.0.1: GitHub runner-images alias localhost→::1, which would make
+  # vite bind IPv6-only while the healthz poll dials 127.0.0.1
+  # (actions/runner-images#929 — the first CI run lost five dev-server jobs
+  # to exactly this); the explicit IPv4 host is the workflow's own fix,
+  # carried here so the harness-internal start matches.
+  echo "== no server at $BASE — starting pnpm dev from the SCRATCH tree (port $PORT, host 127.0.0.1, SSL_CERT_FILE set) =="
+  setsid bash -c "cd '$RUN_ROOT' && exec env SSL_CERT_FILE='$DIR/tls/ca.pem' pnpm --filter cf-gitea-worker dev --host 127.0.0.1 --port $PORT --strictPort" >"$DIR/dev-server.log" 2>&1 &
+else
+  echo "== no server at $BASE — starting pnpm dev from the SHARED tree (port $PORT, host 127.0.0.1, SSL_CERT_FILE set) =="
+  setsid bash -c "cd '$RUN_ROOT' && exec env SSL_CERT_FILE='$DIR/tls/ca.pem' pnpm dev --host 127.0.0.1 --port $PORT --strictPort" >"$DIR/dev-server.log" 2>&1 &
+fi
 SERVER_PID=$!
 up=0
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "$DEV_START_ATTEMPTS"); do
   curl -sf -o /dev/null "$BASE/healthz" && { up=1; break; }
   sleep 1
 done
 if [ "$up" != 1 ]; then
-  echo "FATAL: dev server did not become healthy; last log lines:"
+  echo "FATAL: dev server did not become healthy within ${DEV_START_ATTEMPTS}s (DEV_START_ATTEMPTS is the override); last log lines:"
   tail -20 "$DIR/dev-server.log"
   kill -- -"$SERVER_PID" 2>/dev/null || kill "$SERVER_PID" 2>/dev/null
   exit 1
@@ -298,7 +452,9 @@ d1_checked "DELETE FROM repositories WHERE owner_namespace = '$OWNER'" "pre-clea
 d1_checked "DELETE FROM users WHERE username_lower = '$OWNER'" "pre-clean users sweep"   # cascades personal_access_tokens
 check "$(d1_field "SELECT COUNT(*) FROM repositories WHERE owner_namespace = '$OWNER'")" "0" "pre-clean: D1 rows swept"
 
-BOOT=$(node "$ROOT/scripts/bootstrap-admin.mjs" "$OWNER" 2>/dev/null)
+# The SCRATCH copy in isolation mode: its wrangler runs against the scratch's
+# own config copy and fresh state — one tree, one state, one config source.
+BOOT=$(node "$RUN_ROOT/scripts/bootstrap-admin.mjs" "$OWNER" 2>/dev/null)
 TOKEN=$(echo "$BOOT" | grep -oE 'cfg_[0-9a-f]{8}_[A-Z2-9]{32}' | head -1)
 [ -n "$TOKEN" ] || { echo "$BOOT"; fatal "bootstrap-admin.mjs produced no token"; }
 ok "bootstrapped $OWNER with an all-scopes PAT"
@@ -352,7 +508,7 @@ SETTLED_LAST=""
 SETTLED_ERR=""
 await_settle() { # repo prev want(ok|error) — 0 when settled as wanted, 1 timeout, 2 fast-fail
   local repo="$1" prev="$2" want="$3" i last err
-  for i in $(seq 1 120); do
+  for i in $(seq 1 "$SETTLE_ATTEMPTS"); do
     mirror_status "$repo"
     last=$(ms last_sync_at)
     err=$(ms last_error)
@@ -427,7 +583,7 @@ if await_settle target "" ok; then
 else
   rc=$?
   if [ "$rc" = 2 ]; then fail "initial sync FAILED: last_error=$(ms last_error)"
-  else mirror_status target; fail "initial sync did not settle within 120s (is the dev server delivering MIRROR_SYNC_QUEUE?) — status: $(printf '%s' "$MS_BODY" | head -c 300)"; fi
+  else mirror_status target; fail "initial sync did not settle within ${SETTLE_ATTEMPTS}s (is the dev server delivering MIRROR_SYNC_QUEUE?) — status: $(printf '%s' "$MS_BODY" | head -c 300)"; fi
 fi
 
 # =============================================================================
@@ -478,7 +634,7 @@ if await_settle target "$PREV" ok; then
   ok "delta sync settled (last_sync_at $PREV → $(ms last_sync_at))"
 else
   rc=$?
-  [ "$rc" = 2 ] && fail "delta sync FAILED: $(ms last_error)" || fail "delta sync did not settle within 120s"
+  [ "$rc" = 2 ] && fail "delta sync FAILED: $(ms last_error)" || fail "delta sync did not settle within ${SETTLE_ATTEMPTS}s"
 fi
 (cd "$DIR" && rm -rf clone2 && $GITC clone -q "$AUTH_BASE/$OWNER/target.git" clone2 2>/dev/null); check $? 0 "re-clone after sync"
 check "$(git -C "$DIR/clone2" rev-parse refs/remotes/origin/main)" "$TIP2" "target main advanced to the new source tip"
@@ -551,7 +707,7 @@ check "$API_CODE" "202" "migrate against the v0-only source accepted"
 if await_settle v0target "" ok; then
   ok "v0 initial sync settled"
 else
-  rc=$?; [ "$rc" = 2 ] && fail "v0 sync FAILED: $(ms last_error)" || fail "v0 sync did not settle within 120s"
+  rc=$?; [ "$rc" = 2 ] && fail "v0 sync FAILED: $(ms last_error)" || fail "v0 sync did not settle within ${SETTLE_ATTEMPTS}s"
 fi
 refmap "$SRC_AUTH_URL/v0/repo.git" > "$DIR/refs-src-v0.txt"
 refmap "$AUTH_BASE/$OWNER/v0target.git" > "$DIR/refs-target-v0.txt"
@@ -611,7 +767,7 @@ curl -s -o /dev/null -X POST -H "Authorization: token $TOKEN" "$BASE/api/v1/repo
 if await_settle target "$PREV" error; then
   ok "failed sync recorded last_error and returned to idle"
 else
-  fail "sync against the dead source did not record last_error within 120s"
+  fail "sync against the dead source did not record last_error within ${SETTLE_ATTEMPTS}s"
 fi
 mirror_status target
 check "$(ms sync_state)" "idle" "sync_state back to idle after the failure"
