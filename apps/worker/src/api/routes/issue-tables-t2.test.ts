@@ -1055,8 +1055,9 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     expect(list).toHaveLength(2);
     const count = meter.count();
     // Post-fix: 1 repo resolve + 1 issue lookup + 2 edge rows (edges +
-    // edge issues+repos batch) + 1 foreign-pair batch + 3 issue-context arms
-    // (posters, labels, pins — milestones/PR arms skip) = 8, page-INDEPENDENT.
+    // edge issues+repos batch) + 1 foreign-pair batch + the issue-context
+    // arms (posters, labels, pins, assignees — the fold's added one-statement
+    // arm; milestones/PR arms skip), page-INDEPENDENT.
     // Pre-fix: the same 4 + 2×(1 pair + 3 enrichment) = 14 at this N; any
     // returning per-row fan breaks the bound.
     expect(count).toBeLessThanOrEqual(10);
@@ -1088,9 +1089,10 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     expect(blocks).toHaveLength(2);
     const blocksCount = blocksMeter.count();
     // 1 repo + 1 issue + 3 edge rows (edges + the issues+repos batch) + 1
-    // foreign-pair batch + 3 issue-context arms (posters, labels, pins —
-    // milestone/PR arms skip) = 9, page-INDEPENDENT. Pre-fix: 4 + N×(1 pair
-    // + 3 enrichment) = 14 at this N=2; any returning per-row fan breaks it.
+    // foreign-pair batch + the issue-context arms (posters, labels, pins,
+    // assignees — the fold's added arm; milestone/PR arms skip),
+    // page-INDEPENDENT. Pre-fix: 4 + N×(1 pair + 3 enrichment) = 14 at this
+    // N=2; any returning per-row fan breaks it.
     expect(blocksCount).toBeLessThanOrEqual(10);
     expect(blocksCount).toBeLessThan(14);
     const singleB = await metered(`/repos/cf-gitea-stub/writes/issues/${issueB.index}`);
@@ -1100,9 +1102,10 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
 
     // The tracked-times list embeds the SAME path issue per row — the
     // per-row render paid the full enrichment fan PER TIME ROW; the page
-    // context prefetches it once (3 arms on this issue: posters, labels,
-    // pins — milestone/PR arms skip). The route is doer-scoped (cantSetUser),
-    // so the list and the single GETs ride the SAME owner viewer.
+    // context prefetches it once (the arms on this issue: posters, labels,
+    // pins, assignees — the fold's added arm; milestone/PR arms skip). The
+    // route is doer-scoped (cantSetUser), so the list and the single GETs
+    // ride the SAME owner viewer.
     await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/times`, authed(jsonBody({ time: 90 })));
     await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/times`, authed(jsonBody({ time: 30 })));
     const timesMeter = countedD1();
@@ -1111,8 +1114,9 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     const times = await timesRes.json<Array<Record<string, unknown> & { issue: Record<string, unknown> }>>();
     expect(times).toHaveLength(2);
     const timesCount = timesMeter.count();
-    // 1 repo + 1 issue + 1 rows select + 3 context arms = 6 regardless of
-    // the row count (pre-fix 3 + N×3 = 9 at this N=2; N=30 → 93).
+    // 1 repo + 1 issue + 1 rows select + the context arms (posters, labels,
+    // pins, assignees — the fold's added arm; milestone/PR skip) regardless
+    // of the row count (pre-fix 3 + N×3 = 9 at this N=2; N=30 → 93).
     expect(timesCount).toBeLessThanOrEqual(7);
     expect(timesCount).toBeLessThan(9);
     const singleA = await metered(`/repos/cf-gitea-stub/writes/issues/${issueA.index}`, authed({}));

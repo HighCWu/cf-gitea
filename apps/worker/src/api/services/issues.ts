@@ -285,6 +285,12 @@ export interface IssueRenderContext {
   milestones: Map<number, MilestoneRow>;
   /** PR rows by issue id (PR issues only). */
   pullRequestsByIssue: Map<number, PullRequestRow>;
+  /** Assignee user rows per issue id, each bucket in edge-row (insertion)
+   *  order — the per-row `listIssueAssignees` orderBy, preserved by grouping
+   *  the globally ordered join rows; an issue with no rows (or an edge whose
+   *  user row is gone — the inner join drops it on both paths) renders the
+   *  empty-set nulls. */
+  assigneesByIssue: Map<number, UserRow[]>;
 }
 
 /** Optional preloaded reads for `toApiIssue` — the list routes' batch
@@ -295,14 +301,23 @@ export interface IssueRenderPreload {
   /** The PR row the caller already holds (toApiPullRequest — the audit's B1
    *  redundant-re-select fix). Takes precedence over the context map. */
   prRow?: PullRequestRow;
+  /** The assignee block's source (the fold's one render split): "wire" — the
+   *  DEFAULT — renders the REAL set (the batch map when a context is present,
+   *  the per-row `listIssueAssignees` read otherwise); "emission" pins the
+   *  landed webhook shape (both null, no read). Webhook payloads keep their
+   *  landed identity — upstream renders real assignees in payloads
+   *  (ToAPIIssue), a disclosed divergence the emission landings froze; a
+   *  per-site flip is a deliberate wave, never a side effect of this fold. */
+  assignees?: "wire" | "emission";
 }
 
 /**
  * One batched read per entity kind for the page's rows (posters, the label
- * join, pin orders, milestones, PR rows), fanned with Promise.all. Empty or
- * homogeneous pages skip their arms entirely — 0 statements there, exactly
- * like the per-row path. The id lists stay far under the D1 100-variable
- * cap: the API paging clamps at 50 rows (pagination.ts MAX_RESPONSE_ITEMS).
+ * join, pin orders, milestones, PR rows, the assignee join), fanned with
+ * Promise.all. Empty or homogeneous pages skip their arms entirely — 0
+ * statements there, exactly like the per-row path. The id lists stay far under
+ * the D1 100-variable cap: the API paging clamps at 50 rows
+ * (pagination.ts MAX_RESPONSE_ITEMS).
  */
 export async function prefetchIssueRenderContext(d1: D1Database, pageRows: IssueRow[]): Promise<IssueRenderContext> {
   const issueIds = pageRows.map((row) => row.id);
@@ -310,7 +325,7 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
   const milestoneIds = [...new Set(pageRows.flatMap((row) => (row.milestoneId === null ? [] : [row.milestoneId])))];
   const prIssueIds = pageRows.flatMap((row) => (row.isPull ? [row.id] : []));
   const db = drizzle(d1);
-  const [posterRows, labelRows, pinRows, milestoneRows, prRows] = await Promise.all([
+  const [posterRows, labelRows, pinRows, milestoneRows, prRows, assigneeRows] = await Promise.all([
     posterIds.length > 0 ? db.select().from(users).where(inArray(users.id, posterIds)).all() : Promise.resolve([]),
     issueIds.length > 0
       ? db
@@ -330,6 +345,18 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
       : Promise.resolve([]),
     milestoneIds.length > 0 ? db.select().from(milestones).where(inArray(milestones.id, milestoneIds)).all() : Promise.resolve([]),
     prIssueIds.length > 0 ? db.select().from(pullRequests).where(inArray(pullRequests.issueId, prIssueIds)).all() : Promise.resolve([]),
+    // The assignee join, edge-row order (listIssueAssignees' orderBy) — the
+    // same inner join the per-row read runs, so a dangling assignee id drops
+    // on both paths.
+    issueIds.length > 0
+      ? db
+          .select({ issueId: issueAssignees.issueId, user: users })
+          .from(issueAssignees)
+          .innerJoin(users, eq(users.id, issueAssignees.assigneeId))
+          .where(inArray(issueAssignees.issueId, issueIds))
+          .orderBy(asc(issueAssignees.id))
+          .all()
+      : Promise.resolve([]),
   ]);
   const labelsByIssue = new Map<number, LabelRow[]>();
   for (const row of labelRows) {
@@ -340,12 +367,22 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
       bucket.push(row.label);
     }
   }
+  const assigneesByIssue = new Map<number, UserRow[]>();
+  for (const row of assigneeRows) {
+    const bucket = assigneesByIssue.get(row.issueId);
+    if (bucket === undefined) {
+      assigneesByIssue.set(row.issueId, [row.user]);
+    } else {
+      bucket.push(row.user);
+    }
+  }
   return {
     posters: new Map(posterRows.map((row) => [row.id, row])),
     labelsByIssue,
     pinOrders: new Map(pinRows.map((row) => [row.issueId, row.pinOrder])),
     milestones: new Map(milestoneRows.map((row) => [row.id, row])),
     pullRequestsByIssue: new Map(prRows.map((row) => [row.issueId, row])),
+    assigneesByIssue,
   };
 }
 
@@ -360,18 +397,27 @@ function posterFromContext(context: IssueRenderContext, viewer: Viewer, posterId
 
 /**
  * `convert.ToIssue` → the contract `Issue`. Enrichment reads per render:
- * poster row, label join, milestone row, PR row (PRs only) — the same loads
- * upstream's toIssue performs (LoadPoster/LoadLabels/LoadMilestone/
- * LoadPullRequest). LIST routes pass `preload` (the page-scoped
- * `prefetchIssueRenderContext` maps + the caller-held PR row) so the reads
- * collapse to 0 per row; without it the per-row selects run exactly as
- * before — the single-item routes' unchanged path.
+ * poster row, label join, assignee join, milestone row, PR row (PRs only) —
+ * the same loads upstream's toIssue performs (LoadPoster/LoadLabels/
+ * LoadAssignees/LoadMilestone/LoadPullRequest). LIST routes pass `preload`
+ * (the page-scoped `prefetchIssueRenderContext` maps + the caller-held PR
+ * row) so the reads collapse to 0 per row; without it the per-row selects run
+ * exactly as before — the single-item routes' unchanged path.
+ *
+ * The ASSIGNEE FOLD (the PATCH-assignee landing's named wave): `assignee`/
+ * `assignees` render the REAL set — `convert.ToIssue` issue.go:105-113, the
+ * first assignee duplicated into the deprecated `assignee`, an EMPTY set
+ * leaving both fields the Go nils the writer marshals as `null` (never `[]`).
+ * The one render split: `preload.assignees: "emission"` pins the landed
+ * webhook shape (both null, no read) — see the preload's doc.
  */
 export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow, preload?: IssueRenderPreload): Promise<Issue> {
   const context = preload?.context;
   const poster = context === undefined ? await toPoster(d1, viewer, issue.posterId) : posterFromContext(context, viewer, issue.posterId);
   const labelRows = context === undefined ? await issueLabelRows(d1, issue.id) : (context.labelsByIssue.get(issue.id) ?? []);
   const pinOrder = context === undefined ? await pinOrderOf(d1, issue.id) : (context.pinOrders.get(issue.id) ?? -1);
+  const assigneeRows =
+    preload?.assignees === "emission" ? [] : context === undefined ? await listIssueAssignees(d1, issue.id) : (context.assigneesByIssue.get(issue.id) ?? []);
   const milestoneRow =
     issue.milestoneId === null
       ? null
@@ -384,6 +430,7 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
             .then((rows) => (rows[0] === undefined ? null : rows[0]))
         : (context.milestones.get(issue.milestoneId) ?? null);
   const pullRequest = await pullRequestMetaOf(d1, pair, viewer.origin, issue, preload?.prRow ?? context?.pullRequestsByIssue.get(issue.id));
+  const assignees = assigneeRows.map((row) => apiUserFromRow(row, viewer));
 
   return {
     id: issue.id,
@@ -398,13 +445,11 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
     labels: labelRows.map((row) => toEmbeddedLabel(row, pair, viewer.origin)),
     milestone: milestoneRow === null ? null : toApiMilestone(milestoneRow),
     projects: null, // projects are tier 3 (SPEC-0004 §2.6)
-    // The issue_assignees TABLE landed (migration 0012) but the shared
-    // converter still renders the un-enriched shape — the assignee/assignees
-    // fill is carried per-family (the assign emissions and the t2 responses
-    // render it via the toApiIssueWithAssignees-style overlays) until a
-    // dedicated fold-in wave flips every issue response at once.
-    assignee: null,
-    assignees: null,
+    // ToIssue issue.go:105-113 — the first assignee duplicated into the
+    // deprecated `assignee`; an empty set leaves BOTH null (upstream's
+    // `len > 0` gate — never []).
+    assignee: assignees.length === 0 ? null : (assignees[0] ?? null),
+    assignees: assignees.length === 0 ? null : assignees,
     state: issue.isClosed ? "closed" : "open",
     is_locked: issue.isLocked,
     comments: issue.numComments,
@@ -1716,20 +1761,16 @@ export async function replaceIssueAssignees(
 }
 
 /**
- * The issue wire with the assignee/assignees block filled (convert.ToIssue
- * issue.go:105-113 — the first assignee duplicated into `assignee`; empty →
- * both null). The shared toApiIssue still renders the un-enriched shape
- * (its TODO); the /assignees trio's responses and the assign emissions
- * carry the fill until the API-surface fold wave flips every issue response
- * at once (routes/issues.ts keeps its private twin until that wave).
+ * The /assignees trio's enriched wire render. KEPT as the named seam the t2
+ * trio's routes call (`api/routes/issue-tables-t2.ts` POST/DELETE responses):
+ * since the assignee fold lives in `toApiIssue` itself (the PATCH-assignee
+ * landing's named wave), the old per-row overlay is dead — this is a direct
+ * delegate, byte-identical to the overlay's output (the first assignee
+ * duplicated into `assignee`, empty → both null, convert.ToIssue
+ * issue.go:105-113). The next t2 wave should inline it into its call sites.
  */
 export async function toApiIssueWithAssignees(d1: D1Database, viewer: Viewer, found: RepositoryWithOwner, issue: IssueRow): Promise<Issue> {
-  const [base, assigneeRows] = await Promise.all([toApiIssue(d1, viewer, found, issue), listIssueAssignees(d1, issue.id)]);
-  if (assigneeRows.length === 0) {
-    return base;
-  }
-  const rendered = assigneeRows.map((row) => apiUserFromRow(row, viewer));
-  return { ...base, assignee: rendered[0] ?? null, assignees: rendered };
+  return toApiIssue(d1, viewer, found, issue);
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,7 +1879,10 @@ async function renderIssueDeletedEvent(d1: D1Database, issue: IssueRow, emission
     payload: {
       action: "deleted",
       number: issue.index,
-      issue: await toApiIssue(d1, emission.viewer, pair, issue),
+      // The emission pin: the landed delete payload renders assignees null
+      // (upstream's ToAPIIssue would render the live set — the disclosed
+      // divergence, unchanged by the fold).
+      issue: await toApiIssue(d1, emission.viewer, pair, issue, { assignees: "emission" }),
       repository,
       sender: emission.sender,
       commit_id: "",

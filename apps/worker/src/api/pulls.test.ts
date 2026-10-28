@@ -22,7 +22,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { comments, issueLabels, issuePins, issues, labels, milestones, orgMembers, pullRequests, pullReviews, repoCounters, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users, webhookDeliveries, webhooks } from "../db/schema";
+import { comments, issueAssignees, issueLabels, issuePins, issues, labels, milestones, orgMembers, pullRequests, pullReviews, repoCounters, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
@@ -923,11 +923,17 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
     await db().update(repositories).set({ forkParent: baseId }).where(eq(repositories.id, forkId));
     const bug = await seedLabel(baseId, "bug");
     const v1 = await seedMilestone(baseId, "v1");
-    // One PR per enrichment arm: plain, labeled, milestoned, merged (+pinned,
-    // merged by Bob), and a FORK head (Bob's repo).
+    // One PR per enrichment arm: plain, labeled (+ the fold's MULTI-assignee
+    // set — edges inserted REVERSED to the user-id order: the render is
+    // edge-row/insertion order), milestoned, merged (+pinned, merged by Bob),
+    // and a FORK head (Bob's repo).
     await seedPull(baseId, "plain", { posterId: owner.id });
     const labeled = await seedPull(baseId, "labeled", { posterId: owner.id });
     await db().insert(issueLabels).values({ issueId: labeled.id, labelId: bug });
+    await db().insert(issueAssignees).values([
+      { issueId: labeled.id, assigneeId: forkOwner.id },
+      { issueId: labeled.id, assigneeId: owner.id },
+    ]);
     const milestoned = await seedPull(baseId, "milestoned", { posterId: forkOwner.id });
     await db().update(issues).set({ milestoneId: v1 }).where(eq(issues.id, milestoned.id));
     const merged = await seedPull(baseId, "merged by bob", { posterId: owner.id });
@@ -947,20 +953,27 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
       DB: meter.db,
     });
     expect(res.status).toBe(200);
-    const body = await res.json<Record<string, unknown>[]>();
+    type WitnessPull = { title?: string; assignee?: { login?: string } | null; assignees?: Array<{ login?: string }> | null };
+    const body = await res.json<Array<Record<string, unknown> & WitnessPull>>();
     expect(body).toHaveLength(5);
     const count = meter.count();
-    // Post-fix: 1 repo resolve + 2 (count + page) + 5 issue-side arms +
-    // 1 mergers + 1 head repos = 10 — page-INDEPENDENT. The pre-fix shape
-    // paid 1 + 2 + 5×(3 base reads + 1 B1 PR re-select + 1 milestone + 1
-    // merger + 1 fork head repo) = 26 at this N; 5 rows × 4 alone would
-    // break the second bound.
-    expect(count).toBeLessThanOrEqual(12);
+    // Post-fix: 1 repo resolve + 2 (count + page) + 6 issue-side arms
+    // (posters, labels, pins, milestones, PR rows, assignees — the fold's
+    // added arm) + 1 mergers + 1 head repos = 11 — page-INDEPENDENT. The
+    // pre-fix shape paid 1 + 2 + 5×(3 base reads + 1 B1 PR re-select + 1
+    // milestone + 1 merger + 1 fork head repo) = 26 at this N; 5 rows × 4
+    // alone would break the second bound.
+    expect(count).toBeLessThanOrEqual(11);
     expect(count).toBeLessThan(5 * 4);
     // The fork head renders (batched pair lookup worked) and the merged row
     // carries its merger (the batched mergers arm worked).
     expect(body.find((p) => p.title === "fork head")?.head).toMatchObject({ repo_id: Number(forkId) });
     expect(body.find((p) => p.title === "merged by bob")?.merged_by).toMatchObject({ login: "Bob" });
+    // The folded assignee block ("list" mode keeps the raw array; the first
+    // edge duplicates into the deprecated `assignee`) — edge-row order.
+    const labeledItem = body.find((p) => p.title === "labeled");
+    expect(labeledItem?.assignees?.map((u) => u.login)).toEqual(["Bob", "Alice"]);
+    expect(labeledItem?.assignee?.login).toBe("Bob");
 
     // (b) Contract discipline: the batched render is deep-equal to the
     // unbatched per-row path (mode "list", no extras, on the same rows).
@@ -979,6 +992,9 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
       rows.map((row) => toApiPullRequest(env.DB, viewer, pair, row.issue, row.pullRequest, "list", undefined, { context })),
     );
     expect(batched).toEqual(perRow);
+    // The fold's assignee arm rides BOTH paths (batched map vs the per-row
+    // listIssueAssignees read) — the multi set from the (a) seeds, verbatim.
+    expect(batched.find((p) => p.title === "labeled")?.assignees?.map((u) => u.login)).toEqual(["Bob", "Alice"]);
     expect(batched.find((p) => p.title === "fork head")?.head?.repo_id).toBe(Number(forkId));
     expect(batched.find((p) => p.title === "merged by bob")?.merged_by?.login).toBe("Bob");
   });
@@ -1069,8 +1085,8 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
     const body = await res.json<Array<{ title?: string; head?: WitnessHead }>>();
     expect(body).toHaveLength(6);
     expect(grantQueryCount(meter.queries())).toBe(4);
-    // The fixed page arms (auth + repo + count/page + 5 issue-side + heads)
-    // stay ~15; the per-head grant fan alone would add 11 more at this N.
+    // The fixed page arms (auth + repo + count/page + 6 issue-side + heads)
+    // stay ~16; the per-head grant fan alone would add 11 more at this N.
     expect(meter.count()).toBeLessThanOrEqual(20);
     const byTitle = new Map(body.map((p) => [p.title, p.head]));
     // H1: the public stranger fork renders pull-only (the null verdict).

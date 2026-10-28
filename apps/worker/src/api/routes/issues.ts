@@ -52,7 +52,6 @@ import {
   labelIdsByOrgNames,
   labelIdsByRepoNames,
   labelNamesByIds,
-  listIssueAssignees,
   listIssueComments,
   listIssueTimeline,
   listRepoComments,
@@ -69,6 +68,7 @@ import {
   searchIssuesGlobally,
   toApiComment,
   toApiIssue,
+  toApiIssueWithAssignees,
   toTimelineComment,
   updateCommentBody,
   userIdForFilter,
@@ -87,7 +87,6 @@ import {
   viewerOf,
   type RepositoryWithOwner,
   type UserRow,
-  type Viewer,
 } from "../services/repository";
 
 /**
@@ -366,7 +365,9 @@ async function emitCommentEvent(
     eventType: issue.isPull ? "pull_request_comment" : "issue_comment",
     payload: {
       action,
-      issue: await toApiIssue(c.env.DB, viewerOf(c), found, issue),
+      // The emission pin: landed payloads render assignees null (the fold's
+      // render split — see IssueRenderPreload.assignees).
+      issue: await toApiIssue(c.env.DB, viewerOf(c), found, issue, { assignees: "emission" }),
       comment,
       ...(options.changes === undefined ? {} : { changes: options.changes }),
       repository: event.repository,
@@ -417,7 +418,15 @@ async function emitLabelEvent(
     repoId: found.repo.id,
     ownerId: event.ownerId,
     eventType: "issue_label",
-    payload: issueEventPayload(action, await toApiIssue(c.env.DB, viewerOf(c), found, issue), issue.index, event.repository, event.sender),
+    payload: issueEventPayload(
+      action,
+      // The emission pin (landed payloads render assignees null — the fold's
+      // render split).
+      await toApiIssue(c.env.DB, viewerOf(c), found, issue, { assignees: "emission" }),
+      issue.index,
+      event.repository,
+      event.sender,
+    ),
   });
 }
 
@@ -463,7 +472,15 @@ export async function emitMilestoneEvent(
     repoId: found.repo.id,
     ownerId: event.ownerId,
     eventType: "issue_milestone",
-    payload: issueEventPayload(action, await toApiIssue(c.env.DB, viewerOf(c), found, issue), issue.index, event.repository, event.sender),
+    payload: issueEventPayload(
+      action,
+      // The emission pin (landed payloads render assignees null — the fold's
+      // render split).
+      await toApiIssue(c.env.DB, viewerOf(c), found, issue, { assignees: "emission" }),
+      issue.index,
+      event.repository,
+      event.sender,
+    ),
   });
 }
 
@@ -489,7 +506,9 @@ export async function emitMilestoneEvent(
  * doer — pull.go:33-37, :197); a missing PR row skips the emission (the
  * label/milestone pull-arm degradation). The issue arm renders the POST-
  * change assignee set (upstream ToAPIIssue LoadAssignees) through the
- * enriched overlay below.
+ * service's canonical enriched render — since the assignee fold, that IS
+ * `toApiIssue`'s wire render and this call is its named alias
+ * (services/issues.ts toApiIssueWithAssignees).
  */
 export async function emitAssignEvent(
   c: Context<ApiEnv>,
@@ -537,22 +556,6 @@ export async function emitAssignEvent(
       commit_id: "",
     },
   });
-}
-
-/**
- * The issue wire with the assignee/assignees block filled (convert.ToIssue
- * issue.go:105-113 — the first assignee duplicated into `assignee`; empty →
- * both null). The shared toApiIssue still renders the un-enriched shape
- * (services/issues.ts converter note) — the assign emissions carry the fill
- * until a dedicated fold-in wave flips every issue response at once.
- */
-async function toApiIssueWithAssignees(d1: D1Database, viewer: Viewer, found: RepositoryWithOwner, issue: IssueRow): Promise<Issue> {
-  const [base, assigneeRows] = await Promise.all([toApiIssue(d1, viewer, found, issue), listIssueAssignees(d1, issue.id)]);
-  if (assigneeRows.length === 0) {
-    return base;
-  }
-  const rendered = assigneeRows.map((row) => apiUserFromRow(row, viewer));
-  return { ...base, assignee: rendered[0] ?? null, assignees: rendered };
 }
 
 /**
@@ -1143,6 +1146,11 @@ export function registerIssueRoutes(
         }
       }
 
+      // ONE render serves the 201 body AND the opened/closed payloads below:
+      // this route drops form.assignee(s) (the file-header deviation), so a
+      // fresh issue's assignee set is ALWAYS empty and the fold's wire render
+      // is the emission shape too (both fields null) — the identities coincide
+      // by construction. A future create-assignee wave must split the paths.
       const rendered = await toApiIssue(c.env.DB, viewer, found, issue);
       // Webhooks: opened (always), then closed (form.closed) — the upstream
       // NewIssue → CloseIssue notification order.
@@ -1363,9 +1371,18 @@ export function registerIssueRoutes(
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        payload: issueEventPayload("edited", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender, {
-          changes: { title: { from: oldTitle } },
-        }),
+        payload: issueEventPayload(
+          "edited",
+          // The emission pin (landed payloads render assignees null — the
+          // fold's render split).
+          await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }),
+          issue.index,
+          event.repository,
+          event.sender,
+          {
+            changes: { title: { from: oldTitle } },
+          },
+        ),
       });
     }
 
@@ -1392,9 +1409,18 @@ export function registerIssueRoutes(
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        payload: issueEventPayload("edited", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender, {
-          changes: { body: { from: oldContent } },
-        }),
+        payload: issueEventPayload(
+          "edited",
+          // The emission pin (landed payloads render assignees null — the
+          // fold's render split).
+          await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }),
+          issue.index,
+          event.repository,
+          event.sender,
+          {
+            changes: { body: { from: oldContent } },
+          },
+        ),
       });
     }
 
@@ -1490,7 +1516,9 @@ export function registerIssueRoutes(
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        payload: issueEventPayload("closed", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender),
+        // The emission pin (landed payloads render assignees null — the
+        // fold's render split).
+        payload: issueEventPayload("closed", await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }), issue.index, event.repository, event.sender),
       });
     } else if (state === "open" && issue.isClosed) {
       try {
@@ -1503,7 +1531,9 @@ export function registerIssueRoutes(
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        payload: issueEventPayload("reopened", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender),
+        // The emission pin (landed payloads render assignees null — the
+        // fold's render split).
+        payload: issueEventPayload("reopened", await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }), issue.index, event.repository, event.sender),
       });
     }
 
@@ -1580,7 +1610,9 @@ export function registerIssueRoutes(
         eventType,
         payload: {
           action: "created",
-          issue: await toApiIssue(c.env.DB, viewer, found, issue),
+          // The emission pin (landed payloads render assignees null — the
+          // fold's render split).
+          issue: await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }),
           comment: rendered,
           repository: event.repository,
           sender: event.sender,

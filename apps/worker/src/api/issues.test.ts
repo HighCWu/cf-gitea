@@ -2479,9 +2479,16 @@ describe("issues list query-shape witness (query-shape-audit A2)", () => {
     // Every enrichment shape on one page: two posters, two labels (second
     // issue attaches them REVERSED — render order is label-id order either
     // way), a real milestone, a dangling milestone id (the audit's deleted
-    // edge → null), a closed row, a pin, and one PR row.
+    // edge → null), a closed row, a pin, one PR row, and the assignee arms —
+    // a MULTI-assignee set on the first issue (edges inserted REVERSED to the
+    // user-id order: the render is edge-row/insertion order, never id order)
+    // and an EMPTY set on the second (the upstream nulls).
     const first = await seedIssue(repoId, "labeled milestone", { posterId: owner.id, labelIds: [bug, ui], milestoneId: v1 });
     const second = await seedIssue(repoId, "labeled reversed", { posterId: other.id, labelIds: [ui, bug] });
+    await db().insert(issueAssignees).values([
+      { issueId: first.id, assigneeId: other.id },
+      { issueId: first.id, assigneeId: owner.id },
+    ]);
     await seedIssue(repoId, "plain", { posterId: owner.id });
     const dangling = await seedIssue(repoId, "dangling milestone", { posterId: other.id });
     await db().update(issues).set({ milestoneId: 999999 }).where(eq(issues.id, dangling.id));
@@ -2503,21 +2510,35 @@ describe("issues list query-shape witness (query-shape-audit A2)", () => {
       DB: meter.db,
     });
     expect(listRes.status).toBe(200);
-    const list = await listRes.json<Array<Record<string, unknown> & { number: number; labels: Array<{ name: string }>; pull_request: unknown }>>();
+    const list = await listRes.json<
+      Array<Record<string, unknown> & { number: number; labels: Array<{ name: string }>; pull_request: unknown; assignee: { login: string } | null; assignees: Array<{ login: string }> | null }>
+    >();
     expect(list).toHaveLength(6);
     const count = meter.count();
-    // Post-fix: 1 repo resolve + 2 (count + page) + 5 prefetch arms (posters,
-    // labels, pins, milestones, PR rows) = 8 — page-INDEPENDENT. The pre-fix
-    // shape (audit formula 2 + N×3..5) paid 1 + 2 + 6×3 + 2 milestones + 1
-    // PR row = 24 at this N; the bound below fails if any per-row fan
-    // returns (each issue's 3 reads alone would exceed it).
-    expect(count).toBeLessThanOrEqual(10);
+    // Post-fix: 1 repo resolve + 2 (count + page) + 6 prefetch arms (posters,
+    // labels, pins, milestones, PR rows, assignees) = 9 — page-INDEPENDENT
+    // (the assignees arm is ONE join read for the whole page, the fold's
+    // added arm). The pre-fix shape (audit formula 2 + N×3..5) paid 1 + 2 +
+    // 6×3 + 2 milestones + 1 PR row = 24 at this N; the bounds below fail if
+    // any per-row fan returns (each issue's 3 reads alone would exceed it).
+    expect(count).toBeLessThanOrEqual(9);
     expect(count).toBeLessThan(6 * 3);
+
+    // The folded assignee block: the multi set renders in edge-row (insertion)
+    // order with the FIRST edge duplicated into the deprecated `assignee`
+    // (convert.ToIssue issue.go:105-113); the empty set renders the upstream
+    // nulls — never [].
+    const multi = list.find((item) => item.number === first.index);
+    expect(multi?.assignees?.map((u) => u.login)).toEqual(["Bob", "Alice"]);
+    expect(multi?.assignee?.login).toBe("Bob");
+    expect(list.find((item) => item.number === second.index)?.assignees).toBeNull();
+    expect(list.find((item) => item.number === second.index)?.assignee).toBeNull();
 
     // Contract discipline: the batched list render must be deep-equal to the
     // per-row single-GET renders (the unbatched path) for every row —
     // covers the null poster, the dangling-milestone null, pin_order, the
-    // PR meta block, and the label ordering in one sweep.
+    // PR meta block, the label ordering, and BOTH assignee arms (multi +
+    // empty) in one sweep.
     for (let index = 1; index <= 6; index++) {
       const singleRes = await app.fetch(new Request(`https://example.com/repos/Alice/visible/issues/${index}`), env);
       expect(singleRes.status).toBe(200);
@@ -2526,6 +2547,58 @@ describe("issues list query-shape witness (query-shape-audit A2)", () => {
     }
     expect(list.find((item) => item.number === pr.issue.index)?.pull_request).not.toBeNull();
     expect(list.find((item) => item.number === second.index)?.labels.map((l: { name: string }) => l.name)).toEqual(["bug", "ui"]);
+  });
+
+  // The fold's dynamic arms, route-level: a PATCH assignee replace must show
+  // the POST-change set on the response body AND agree between the batched
+  // list render and the per-row single GETs — multi, then the [] clear (the
+  // upstream empty-set nulls).
+  it("renders the POST-change set deep-equal across list and single GETs after a PATCH assignee replace", async () => {
+    const one = await seedUser("assign-one");
+    const two = await seedUser("assign-two");
+    const repoId = await seedRepo("cf-gitea-stub", "visible");
+    const seeded = await seedIssue(repoId, "assignee page", { posterId: 1 });
+    await db().insert(issueAssignees).values({ issueId: seeded.id, assigneeId: one.id });
+
+    const app = createApiRouter();
+    const patch = (body: Record<string, unknown>) =>
+      app.fetch(new Request("https://example.com/repos/cf-gitea-stub/visible/issues/1", {
+        method: "PATCH",
+        headers: authHeaders,
+        body: JSON.stringify(body),
+      }), env);
+    const listAndSingle = async () => {
+      const list = await (await app.fetch(new Request("https://example.com/repos/cf-gitea-stub/visible/issues?state=all"), env)).json<
+        Array<{ number: number; assignee: { login: string } | null; assignees: Array<{ login: string }> | null }>
+      >();
+      const single = await (await app.fetch(new Request("https://example.com/repos/cf-gitea-stub/visible/issues/1"), env)).json<
+        Record<string, unknown>
+      >();
+      return { list, single };
+    };
+
+    // The replace: one survivor dropped, two names in — the response body and
+    // both render paths carry the POST-change set (upstream EditIssue →
+    // ToAPIIssue LoadAssignees).
+    const replaceRes = await patch({ assignees: [two.usernameLower] });
+    expect(replaceRes.status).toBe(201);
+    const replaced = await replaceRes.json<{ assignee: { login: string } | null; assignees: Array<{ login: string }> | null }>();
+    expect(replaced.assignees?.map((u) => u.login)).toEqual([two.usernameLower]);
+    expect(replaced.assignee?.login).toBe(two.usernameLower);
+    const replacedViews = await listAndSingle();
+    expect(replacedViews.single).toEqual(replacedViews.list.find((item) => item.number === seeded.index));
+    expect(replacedViews.list.find((item) => item.number === seeded.index)?.assignees?.map((u) => u.login)).toEqual([two.usernameLower]);
+
+    // The [] clear: BOTH fields drop to the upstream nulls on every path.
+    const clearRes = await patch({ assignees: [] });
+    expect(clearRes.status).toBe(201);
+    const cleared = await clearRes.json<{ assignee: unknown; assignees: unknown }>();
+    expect(cleared.assignee).toBeNull();
+    expect(cleared.assignees).toBeNull();
+    const clearedViews = await listAndSingle();
+    expect(clearedViews.single).toEqual(clearedViews.list.find((item) => item.number === seeded.index));
+    expect(clearedViews.list.find((item) => item.number === seeded.index)?.assignee).toBeNull();
+    expect(clearedViews.list.find((item) => item.number === seeded.index)?.assignees).toBeNull();
   });
 });
 

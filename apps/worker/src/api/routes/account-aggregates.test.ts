@@ -836,12 +836,13 @@ describe("tracked-time aggregate query-shape witness (query-shape-audit A2/A6, t
     const body = await res.json<Array<{ issue: Record<string, unknown>; issue_id: number; time: number }>>();
     expect(body).toHaveLength(3);
     const count = meter.count();
-    // Post-fix: 1 repo resolve + 1 rows select (the users left join) + 1
-    // issues batch + 3 issue-context arms (posters, labels, pins — the
-    // milestone/PR arms skip: no milestones, no pulls) = 6, page-INDEPENDENT.
-    // Pre-fix: 2 + N×3 = 11 at this N=3 (N=30 → 92); the bound fails if any
-    // per-row fan returns.
-    expect(count).toBeLessThanOrEqual(8);
+    // The issues batch rides the issue-context prefetch — one batched read
+    // per entity kind (posters, labels, pins, assignees; the milestone/PR
+    // arms skip here: no milestones, no pulls). Measured 9 at this N since
+    // the assignee fold added its arm (was 8 — the +1 IS that arm),
+    // page-INDEPENDENT. The pre-batch shape paid 2 + N×3 = 11 at this N=3
+    // (N=30 → 92); the bounds fail if any per-row fan returns.
+    expect(count).toBeLessThanOrEqual(9);
     expect(count).toBeLessThan(11);
     // Contract discipline: every embedded issue is deep-equal to the per-row
     // single GET of its issue (the unbatched path) — the SAME authed viewer,
