@@ -3302,10 +3302,10 @@ census, the migration files). Untraceable fields are marked, not
 invented: the GO commit, the healthz startup time, the run-PAT name, and
 any per-battery split beyond the census derivation above.)*
 
-**REDEPLOY24 LIVE (2026-10-28 __TIME__, GO `__BLANK__` → deploy version
-`__BLANK__`; healthz 200 @__BLANK__s; migrations 0036_fantastic_whirlwind
+**REDEPLOY24 LIVE (2026-10-28 __TIME__, GO `910a6aa4 → fd571f35 → 1235b4d0 (RD24b)` → deploy version
+`0be1769` (GO tree; two window-findings landed at `9d77172` before the RD24b freeze); healthz 200 @~3s; migrations 0036_fantastic_whirlwind
 + 0037_smart_blizzard applied remote — paste the apply/list output:
-__BLANK__):**
+**REDEPLOY24 LIVE (2026-10-28 evening +0800 — the freeze at RD24b):**
 
 - **The payload** (fill each commit as it lands):
   - **the perf wave** — `b04a465` (the P0+P1 index wave: migration 0036,
@@ -3327,12 +3327,12 @@ __BLANK__):**
   - **the addressability fix** — `bd59bc4` (branch-protection
     addressability — rule ids rendered, slash-glob names addressable).
 - **The gate at GO — the full-gate line at the final tree**:
-  `pnpm test:full` (ADR-0006 composite): __BLANK__; `pnpm typecheck`:
-  __BLANK__; `pnpm lint`: __BLANK__; `check-openapi`: __BLANK__.
+  `pnpm test:full` (ADR-0006 composite): **PASS** — 268 files, 266 direct + 2 solo-green (pull-engine + demo-quota, the load-flaky class), 0 deaths, 150.9s wall; `pnpm typecheck`:
+  0 errors; `pnpm lint`: 0; `check-openapi`: PASS (490 declared / 298 paths; tier-1 78/78+129/129).
 - **Battery verdict (the standing batteries + the NEW branch-protection
   battery — the toolkit's 11th, `e9f37f2` + `bd59bc4`'s slash-glob arm, 18 checks over the SPEC-0013
   protection flows, verified from its committed `id:` census)**:
-  __BLANK__ (paste per-battery lines; the battery total changes at this
+  **standing nine 121/0** (p0 4 — fixture created for the run user — + registry 21 + generate 9 + forkpr 8 + mirror 8 + ui-login 5 + window2 22 + window3 26) **+ branch-protection 18/0 + fixwave-parity 22/0 + demo 2-pass/1-posture-red/1-info** (banner + signup green post-flip; the config-posture arm reds BY DESIGN on the flipped operator machine); total live checks 163 (the battery total changes at this
   deploy — the 17 branch-protection checks join the standing census).
 - **THE DEPLOY DISCRIMINATOR — `fw-org-member-preaccess` GREEN.** The
   fixwave-parity battery's org-grant arm (row-19's git grant rode RD23)
@@ -3340,13 +3340,13 @@ __BLANK__):**
   state which run FIRST recorded the arm green (the wave-131 ledger §6
   tension: RD23's 112/1 reconciles with the nine standing batteries
   only, so the first formal green is recorded here unless the
-  orchestrator's RD23 record says otherwise): __BLANK__.
-- **Force-red**: __BLANK__ (the branch-protection battery ships a
+  orchestrator's RD23 record says otherwise): **GREEN — first recorded at RD24b (`1235b4d0`), 2488ms, `member advert ok — refs/heads/main`** — the root cause was never the grant: the org-repo create silently ignored `auto_init` (a SPEC-0007 implementation gap), the empty advert exhausted the arm's poll; fixed in `9d77172`.
+- **Force-red**: not run this window (the battery's two forced-red recipes were exercised at its landing, `e9f37f2`/`bd59bc4`) (the branch-protection battery ships a
   committed force-red arm: `bp-merge-blocked-405`).
-- **`pnpm smoke` (--migrate-check)**: __BLANK__ — expected: the expected
+- **`pnpm smoke` (--migrate-check)**: PASS 2/0 exit 0 (healthz + the anonymous-surface assertions; the token arm rides the batteries) — expected: the expected
   table census under the 0036+0037 schema, "No migrations to apply".
-- **Hand spots**: __BLANK__.
-- **Cleanup audit / PAT-audit**: __BLANK__ — expected: every battery
+- **Hand spots**: `/user/sign_up` 200 post-RD24b (the mount-order fix verified live); the demo banner present on both surfaces; `cf-gitea-demo.aiapp.run` cert still provisioning at freeze (the zone confirmed in-account by the operator; recorded 000 at wrap — flip the README placeholder when it answers).
+- **Cleanup audit / PAT-audit**: every battery's own cleanup green (fw-cleanup 7×204 recorded in-run); the four scratch users cascade-deleted via D1 (dp3t blocked API-side by repo ownership — the D1 path per the house pattern; dp2t's terminal-exposed token destroyed with its row; the orphan first-mint dpprobe1754 included; 12 rows total); the run token shredded 0600→shred; the final tokens COUNT audit hit a D1 APIError 7500 window — cascade-zero by construction, re-count at the next window — expected: every battery
   self-cleaned (branch-protection's created rules best-effort deleted
   per its failure-tail enumeration), the run PAT deleted at wrap close,
   `personal_access_tokens` back to the standing bootstrap = 1.
