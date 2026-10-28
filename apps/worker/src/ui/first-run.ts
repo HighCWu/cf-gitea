@@ -61,6 +61,7 @@ import {
   signUpLocale,
 } from "./pages/first-run";
 import { loginFirstRunLocale } from "./pages/login";
+import { demoModeEnabled } from "../services/demo-sweep";
 import {
   allowSignup,
   initWindowOpen,
@@ -143,7 +144,7 @@ async function pageContext(
   const url = new URL(c.req.url);
   try {
     const manifest = await loadManifest(assetsBinding(c.env), url.origin);
-    return { ctx: { viewer: { kind: "anonymous" }, origin: url.origin, assets: shellAssetsFromManifest(manifest) } };
+    return { ctx: { viewer: { kind: "anonymous" }, origin: url.origin, demoMode: demoModeEnabled(c.env), assets: shellAssetsFromManifest(manifest) } };
   } catch (error) {
     if (error instanceof AssetBuildError) return { response: assetsNotBuilt(error) };
     throw error;

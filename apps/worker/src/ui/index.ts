@@ -1380,6 +1380,7 @@ import {
   loadWatchingData,
   renderNotificationSubscriptionsPage,
 } from "./pages/notification-subscriptions";
+import { demoModeEnabled } from "../services/demo-sweep";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import { resolveViewer, type Viewer } from "./viewer";
 
@@ -4054,6 +4055,7 @@ async function resolveUiSession(c: Context<{ Bindings: Env }>): Promise<Resolved
       viewer: resolution.viewer,
       origin: url.origin,
       notificationCount,
+      demoMode: demoModeEnabled(c.env),
       assets: shellAssetsFromManifest(manifest),
     };
   } catch (error) {

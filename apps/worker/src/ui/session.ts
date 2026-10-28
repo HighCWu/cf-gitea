@@ -47,6 +47,7 @@ import {
 } from "../auth/middleware";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
+import { demoModeEnabled } from "../services/demo-sweep";
 import { allowSignup, initWindowOpen } from "../services/user-accounts";
 import { sessions, users } from "../db/schema";
 import { assetsBinding, assetsNotBuilt } from "./index";
@@ -585,7 +586,7 @@ async function pageContext(
   const url = new URL(c.req.url);
   try {
     const manifest = await loadManifest(assetsBinding(c.env), url.origin);
-    return { ctx: { viewer, origin: url.origin, assets: shellAssetsFromManifest(manifest) } };
+    return { ctx: { viewer, origin: url.origin, demoMode: demoModeEnabled(c.env), assets: shellAssetsFromManifest(manifest) } };
   } catch (error) {
     if (error instanceof AssetBuildError) return { response: assetsNotBuilt(error) };
     throw error;
