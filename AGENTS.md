@@ -117,7 +117,17 @@ scripts/               # Repo-level tooling (contract checks, codegen)
   `git diff HEAD -- <file>` hunk-by-hunk — every hunk must be yours or a
   disclosed integration; attribute an unknown hunk first (ask the pool /
   read the wave log), then fold it in deliberately and say so in the commit
-  message, or re-edit to exclude it.
+  message, or re-edit to exclude it. (7) a JSON-file edit validates
+  `python3 -m json.tool` (or json.load) IN THE SAME COMMAND as the commit —
+  JSON has no comments, and an engines comment shipped broken once (aa9d5ba);
+  (8) command chains never carry a bare newline into git — keep
+  `git add … && git commit … -- paths` on one logical line (the same incident:
+  the failed gate ran the commit+push anyway; cousins of (1)'s pipe-masking
+  and (4)'s pathspec rules); (9) YAML workflow edits get the structural check —
+  every `with:` rides a `uses:` (a cp-step insertion orphaned seven checkout
+  with-blocks; the first public CI run died at PARSE — GitHub's parser is
+  stricter than the PyYAML that passed it, validate locally beyond PyYAML)
+  (62cb441).
 - Generated artifacts stay out (see Structure Rules); `pnpm-lock.yaml` IS committed.
 - **Submodule hygiene**: `gitea/` stays pristine — never run installs or builds
   inside it (asset builds run in scratch dirs, `scripts/build-gitea-assets.mjs`);
@@ -207,6 +217,33 @@ Implementation follows the SPEC; if the design changes during implementation, up
   tasks only. **Cron triggers with intervals < 1 h get only 30 s CPU** (15 min
   wall only for ≥1 h intervals); queue consumers get 15 min wall + the CPU
   limit per invocation — crons enqueue, consumers do the work.
+
+### Local dev & CI environment
+
+- GitHub runner-images deliberately alias localhost → ::1, and vite binds ::1
+  ONLY — every dev-server poll MUST dial the explicit bind
+  (`pnpm dev --host 127.0.0.1`); fast connection refusals are a bind-family
+  mismatch, not a slow boot (actions/runner-images#929/#10061, 05bcd56).
+- The vite plugin NEVER applies D1 migrations (`migrations_dir` is
+  wrangler-CLI-only, verified in the plugin dist) — every CI/dev flow that
+  boots a worker against fresh state runs `pnpm db:migrate:local` first, else
+  the first metadata write 500s "no such table" (34b4a52).
+- URLPattern (the engine router uses it) ships in workerd and Node ≥ 24 only —
+  plain-Node tooling whose bundle reaches it dies on the old floor
+  ("URLPattern is not defined"); this is the engines floor's reason (28c71ce).
+- `actions/upload-artifact` needs `include-hidden-files: true` for
+  dot-directories — without it `.full-suite-gate/` evidence never uploaded and
+  every red run lost its error text (62a2e92).
+
+## Deploy Discipline
+
+- `wrangler deploy` ships `dist/`'s GENERATED config — any vars/routes change
+  REQUIRES `pnpm build` first; the deploy output's var table is the tell for a
+  stale dist (the placeholder-id deploy failure, `docs/ops/runbook.md`).
+- A deployment preserves the on-disk posture: the demo-flip rides the committed
+  config through build+deploy; `.dev.vars` pins keep LOCAL tests in the
+  self-host posture — the vitest plugin injects wrangler VARS into test envs,
+  so a locally flipped config arms demo goldens on its own (ADR-0005 D3).
 
 ## Gitea Compatibility References
 
