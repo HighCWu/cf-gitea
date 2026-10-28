@@ -488,7 +488,7 @@ describe("migrateRepoFromForm — the mirror arm's submit semantics", () => {
       ...baseForm(),
       uid: 987654,
     });
-    expect(ghost).toEqual({ outcome: "invalid", message: "user does not exist [id: 987654]" });
+    expect(ghost).toEqual({ outcome: "invalid", message: "user does not exist [uid: 987654, name: ]" });
 
     // Nothing born, nothing enqueued on any gate failure.
     expect(await repoRow("mirrored")).toBeNull();

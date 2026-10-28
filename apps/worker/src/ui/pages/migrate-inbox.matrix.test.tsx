@@ -450,7 +450,7 @@ describe("GET+POST /repo/migrate (the mounted route — window-2e 62ef380)", () 
       await formPost({ clone_addr: SOURCE_URL, repo_name: "born", mirror: "on", uid: "987654" }, cookie),
     );
     expect(ghost.status).toBe(200);
-    expect(await ghost.text()).toContain("user does not exist [id: 987654]");
+    expect(await ghost.text()).toContain("user does not exist [uid: 987654, name: ]");
 
     expect(await repoRow("born")).toBeNull();
     expect(queue.sent).toEqual([]);
