@@ -31,6 +31,8 @@ import { ApiError } from "../errors";
 import type { ApiEnv } from "../env";
 import type { Comment, Issue, TimelineComment } from "../models/issue";
 import type { User } from "../models/user";
+import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "./blocks";
+import { findCollaborator } from "./repo-collaborators";
 import { toApiPullRequest } from "./pulls";
 import { toApiMilestone } from "./milestones";
 import {
@@ -396,7 +398,12 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
     labels: labelRows.map((row) => toEmbeddedLabel(row, pair, viewer.origin)),
     milestone: milestoneRow === null ? null : toApiMilestone(milestoneRow),
     projects: null, // projects are tier 3 (SPEC-0004 §2.6)
-    assignee: null, // TODO(SPEC-0005 tier 2): issue_assignees table
+    // The issue_assignees TABLE landed (migration 0012) but the shared
+    // converter still renders the un-enriched shape — the assignee/assignees
+    // fill is carried per-family (the assign emissions and the t2 responses
+    // render it via the toApiIssueWithAssignees-style overlays) until a
+    // dedicated fold-in wave flips every issue response at once.
+    assignee: null,
     assignees: null,
     state: issue.isClosed ? "closed" : "open",
     is_locked: issue.isLocked,
@@ -1397,6 +1404,173 @@ export async function changeIssueMilestone(
     );
   }
   await drizzle(d1).batch(statements);
+}
+
+// ---------------------------------------------------------------------------
+// Assignee replace — `issue_service.UpdateAssignees` (services/issue/
+// assignee.go:94-166, pin fc493688). The shared write half of BOTH PATCH
+// assignee arms (issues EditIssue issue.go:772-779, pulls EditPullRequest
+// pull.go:679-694 call the same upstream service); landed here from the
+// pulls.ts port so the two routes share ONE implementation (the pulls side
+// keeps its pull_request_assign emitter, the issues side its IsPull-
+// discriminant assign emitter — the write half below is event-agnostic).
+// ---------------------------------------------------------------------------
+
+/** Assignee rows joined with their user rows, insertion (rowid) order —
+ *  upstream LoadAssignees' natural-order user join (models/issues/
+ *  assignees.go:36-46). */
+export async function listIssueAssignees(d1: D1Database, issueId: number): Promise<UserRow[]> {
+  const rows = await drizzle(d1)
+    .select({ user: users })
+    .from(issueAssignees)
+    .innerJoin(users, eq(users.id, issueAssignees.assigneeId))
+    .where(eq(issueAssignees.issueId, issueId))
+    .orderBy(asc(issueAssignees.id))
+    .all();
+  return rows.map((row) => row.user);
+}
+
+/** `GetDoerUserIDsByNames` reduced to the PATCH arm (user.go:1237): resolve
+ *  case-insensitively; the FIRST miss aborts with pull.go:688's exact 422 —
+ *  `fmt.Sprintf("Assignee does not exist: [name: %s]", err)` renders the
+ *  ErrUserNotExist text INSIDE the wrapper. Upstream's issues-PATCH arm maps
+ *  neither this nor the access error (they fall into APIErrorInternal,
+ *  issue.go:780-783 — a 500); we keep the pulls-side mapping, the same 422
+ *  the landed /assignees routes answer (documented divergence). */
+async function resolveAssigneeNames(d1: D1Database, names: string[]): Promise<UserRow[]> {
+  const resolved: UserRow[] = [];
+  const seen = new Set<number>();
+  for (const name of new Set(names)) {
+    const user = await findUserByName(d1, name);
+    if (user === null) {
+      throw new ApiError(422, `Assignee does not exist: [name: user does not exist [uid: 0, name: ${name}]]`);
+    }
+    if (!seen.has(user.id)) {
+      seen.add(user.id);
+      resolved.push(user);
+    }
+  }
+  return resolved;
+}
+
+/** validateAssignee (services/issue/assignee.go:168-183): the blocked arm
+ *  FIRST (the blocks-enforcement wiring), then CanBeAssigned collapsed onto
+ *  the landed ACL (the issue-tables-t2 port: a public repo grants every real
+ *  user; otherwise owner / site admin / collaborator). The org row and the
+ *  access miss answer the landed family's 400/403 — upstream's PATCH routes
+ *  map neither (they fall into APIErrorInternal, issue.go:780-783 /
+ *  pull.go:691-692); the landed issue-tables-t2 arm's statuses stand here
+ *  too (documented divergence). */
+async function validateAssignee(d1: D1Database, found: RepositoryWithOwner, doer: { id: number; isAdmin: boolean }, user: UserRow): Promise<void> {
+  if (user.type === "org") {
+    throw new ApiError(400, `organization can't be added as assignee [user_id: ${user.id}, repo_id: ${found.repo.id}]`);
+  }
+  if (await isUserBlockedBy(d1, { id: doer.id, isAdmin: doer.isAdmin }, user.id)) {
+    throw new ApiError(403, BLOCKED_USER_MESSAGE);
+  }
+  const assignable =
+    found.repo.visibility === "public" ||
+    user.isAdmin ||
+    (found.repo.ownerId !== null && found.repo.ownerId === user.id) ||
+    (await findCollaborator(d1, found.repo.id, user.id)) !== null;
+  if (!assignable) {
+    throw new ApiError(403, `user doesn't have access to repo [user_id: ${user.id}, repo_name: ${found.repo.slug}]`);
+  }
+}
+
+/** The type-9 (assignees) comment + the num_comments fold — the
+ *  issue-tables-t2 writeAssigneeComment port (toggleIssueAssignee,
+ *  models/issues/assignees.go:107-140). */
+async function writeAssigneeComment(d1: D1Database, issue: IssueRow, assigneeId: number, removed: boolean, actorId: number, now: Date): Promise<void> {
+  await drizzle(d1).batch([
+    drizzle(d1).insert(comments).values({
+      type: CommentType.Assignees,
+      posterId: actorId,
+      issueId: issue.id,
+      assigneeId,
+      removedAssignee: removed ? 1 : 0,
+      content: "",
+      createdAt: now,
+      updatedAt: now,
+    }),
+    drizzle(d1).update(issues).set({ numComments: sql`num_comments + 1` }).where(eq(issues.id, issue.id)),
+  ]);
+}
+
+/**
+ * UpdateAssignees (services/issue/assignee.go:94-166) over the landed
+ * issue_assignees table: resolve + validate EVERY unique name first (the
+ * blocked/access arms fire before any write, upstream's pre-tx
+ * validateAssignee loop), then the removals (toBeRemovedAssignees —
+ * assignee.go:18-31, the current set minus the requested one, each with its
+ * removal comment), then the adds (AddAssigneeIfNotAssigned — assignee.go:
+ * 186-204, the already-assigned skip, the guarded insert, the add comment).
+ * Invokes `onAssignee` once per ACTUALLY-changed assignee after the writes
+ * — removals first, then adds, upstream's post-tx notify order
+ * (assignee.go:155-166) feeding IssueChangeAssignee (services/webhook/
+ * notifier.go:161-202). No-op when the requested set equals the current
+ * one: nothing removed, every add skipped, no comment, no notification.
+ *
+ * `doer` feeds the validateAssignee blocked arm; `now` stamps the type-9
+ * comments. Emits nothing itself — the route passes its emitter (the pulls
+ * PATCH's pull_request_assign delivery, the issues PATCH's IsPull
+ * discriminant assign event).
+ */
+export async function replaceIssueAssignees(
+  d1: D1Database,
+  found: RepositoryWithOwner,
+  issue: IssueRow,
+  names: string[],
+  doer: { id: number; isAdmin: boolean },
+  onAssignee: (user: UserRow, removed: boolean) => Promise<void>,
+): Promise<void> {
+  const actorId = doer.id;
+  const now = new Date();
+  const requested = await resolveAssigneeNames(d1, names);
+  for (const user of requested) {
+    await validateAssignee(d1, found, doer, user);
+  }
+
+  const current = await listIssueAssignees(d1, issue.id);
+  const requestedIds = new Set(requested.map((user) => user.id));
+
+  const added: UserRow[] = [];
+  const removed: UserRow[] = [];
+  // Removals first (upstream's tx order), then adds with the skip.
+  for (const user of current) {
+    if (requestedIds.has(user.id)) continue;
+    const deleted = await drizzle(d1)
+      .delete(issueAssignees)
+      .where(and(eq(issueAssignees.issueId, issue.id), eq(issueAssignees.assigneeId, user.id)))
+      .returning({ id: issueAssignees.id });
+    if (deleted.length === 0) continue;
+    removed.push(user);
+    await writeAssigneeComment(d1, issue, user.id, true, actorId, now);
+  }
+  for (const user of requested) {
+    const existing = await drizzle(d1)
+      .select({ id: issueAssignees.id })
+      .from(issueAssignees)
+      .where(and(eq(issueAssignees.issueId, issue.id), eq(issueAssignees.assigneeId, user.id)))
+      .limit(1)
+      .then((rows) => rows[0]);
+    if (existing !== undefined) continue; // AddAssigneeIfNotAssigned: already assigned, nothing to do
+    const inserted = await drizzle(d1)
+      .insert(issueAssignees)
+      .values({ issueId: issue.id, assigneeId: user.id })
+      .onConflictDoNothing()
+      .returning({ id: issueAssignees.id });
+    if (inserted.length === 0) continue; // a concurrent add won the unique index
+    added.push(user);
+    await writeAssigneeComment(d1, issue, user.id, false, actorId, now);
+  }
+
+  for (const user of removed) {
+    await onAssignee(user, true);
+  }
+  for (const user of added) {
+    await onAssignee(user, false);
+  }
 }
 
 // ---------------------------------------------------------------------------

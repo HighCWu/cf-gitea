@@ -52,6 +52,7 @@ import {
   labelIdsByOrgNames,
   labelIdsByRepoNames,
   labelNamesByIds,
+  listIssueAssignees,
   listIssueComments,
   listIssueTimeline,
   listRepoComments,
@@ -64,6 +65,7 @@ import {
   prefetchCommentPosters,
   prefetchIssueRenderContext,
   prefetchTimelineContext,
+  replaceIssueAssignees,
   searchIssuesGlobally,
   toApiComment,
   toApiIssue,
@@ -77,12 +79,15 @@ import {
 import { parseMilestoneDeadline } from "../services/milestones";
 import { toApiPullRequest } from "../services/pulls";
 import {
+  apiUserFromRow,
   canViewRepositoryWithTeams,
   findRepositoriesByIds,
   findRepositoryByPath,
   repositoryPermissions,
   viewerOf,
   type RepositoryWithOwner,
+  type UserRow,
+  type Viewer,
 } from "../services/repository";
 
 /**
@@ -113,7 +118,11 @@ import {
  *   - PATCH issues/{index}:         409 (stale content_version CAS — upstream
  *                                   EditIssue → StatusConflict "the issue is
  *                                   already changed"), 400 (invalid due_date;
- *                                   Go bind would 422)
+ *                                   Go bind would 422), 422/400 (unknown
+ *                                   assignee login / org assignee — the
+ *                                   shared UpdateAssignees resolution;
+ *                                   upstream's issues-PATCH arm maps neither
+ *                                   and would 500, issue.go:780-783)
  *   - POST …/comments, POST/PUT …/labels: 400 (Go-bind / mixed id+name array
  *                                   equivalents — upstream 422/400 undeclared)
  *   - PATCH …/comments/{id}:        204-family edit of a system comment
@@ -138,7 +147,12 @@ import {
  * services/webhook/notifier.go IssueChangeLabels:572 / IssueClearLabels:46).
  * The PATCH milestone change emits `issue_milestone` / `pull_request_milestone`
  * the same way — emitMilestoneEvent (IssueChangeMilestone:618-647; action
- * milestoned/demilestoned, no `changes` block).
+ * milestoned/demilestoned, no `changes` block). The PATCH assignee replace
+ * (the shared replaceIssueAssignees service, EditIssue → UpdateAssignees,
+ * issue.go:772-779) emits `issue_assign` / `pull_request_assign` the same
+ * way — emitAssignEvent (IssueChangeAssignee:161-202; ONE assigned/unassigned
+ * event per actually-changed assignee, the one-element
+ * changes.added_assignees/removed_assignees side, no events on a no-op).
  *
  * Org labels on org-owned repos (pin survey fc49368845): upstream lets an
  * org's labels ride the repo's issues — the attach/replace arms
@@ -451,6 +465,94 @@ export async function emitMilestoneEvent(
     eventType: "issue_milestone",
     payload: issueEventPayload(action, await toApiIssue(c.env.DB, viewerOf(c), found, issue), issue.index, event.repository, event.sender),
   });
+}
+
+/**
+ * The assignee set/clear webhook: `issue_assign` / `pull_request_assign`
+ * picked by the upstream `issue.IsPull` discriminant (services/webhook/
+ * notifier.go IssueChangeAssignee:161-202 — action=assigned, flipping to
+ * unassigned with `changes.removed_assignees` on the removed arm :163-168;
+ * the IsPull arm :169-187 emits HookEventPullRequestAssign :186 with the
+ * PullRequestPayload, the issue arm :188-202 HookEventIssueAssign :200 with
+ * the IssuePayload; HookEventIssueAssign/HookEventPullRequestAssign are
+ * modules/webhook/type.go:16/:21). ONE event per actually-changed assignee,
+ * in the post-write notify position upstream's UpdateAssignees holds
+ * (services/issue/assignee.go:155-166) — the shared replaceIssueAssignees
+ * core invokes the emitter once per change, removals before adds.
+ * `changes` carries the ONE-ELEMENT added_assignees/removed_assignees side
+ * (ChangesPayload, hook.go:486-489 — the lists are omitempty, only the
+ * changed side is set); both payloads carry the non-omitempty `commit_id: ""`
+ * (hook.go:435 IssuePayload / :484 PullRequestPayload).
+ *
+ * The pull arm renders upstream's ToPayloadPullRequest through
+ * toApiPullRequest's "payload" mode (the head repo shows regardless of the
+ * doer — pull.go:33-37, :197); a missing PR row skips the emission (the
+ * label/milestone pull-arm degradation). The issue arm renders the POST-
+ * change assignee set (upstream ToAPIIssue LoadAssignees) through the
+ * enriched overlay below.
+ */
+export async function emitAssignEvent(
+  c: Context<ApiEnv>,
+  found: RepositoryWithOwner,
+  issue: IssueRow,
+  assignee: UserRow,
+  removed: boolean,
+): Promise<void> {
+  const event = issueEventContext(c, found);
+  const changes = removed
+    ? { removed_assignees: [apiUserFromRow(assignee, viewerOf(c))] }
+    : { added_assignees: [apiUserFromRow(assignee, viewerOf(c))] };
+  const action = removed ? "unassigned" : "assigned";
+  if (issue.isPull) {
+    const pr = await findPullRequestRowByIssueId(c.env.DB, issue.id);
+    if (pr === null) {
+      return;
+    }
+    await emitIssueEvent(c, {
+      repoId: found.repo.id,
+      ownerId: event.ownerId,
+      eventType: "pull_request_assign",
+      payload: pullRequestEventPayload(
+        action,
+        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
+        issue.index,
+        event.repository,
+        event.sender,
+        { changes },
+      ),
+    });
+    return;
+  }
+  await emitIssueEvent(c, {
+    repoId: found.repo.id,
+    ownerId: event.ownerId,
+    eventType: "issue_assign",
+    payload: {
+      action,
+      number: issue.index,
+      changes,
+      issue: await toApiIssueWithAssignees(c.env.DB, viewerOf(c), found, issue),
+      repository: event.repository,
+      sender: event.sender,
+      commit_id: "",
+    },
+  });
+}
+
+/**
+ * The issue wire with the assignee/assignees block filled (convert.ToIssue
+ * issue.go:105-113 — the first assignee duplicated into `assignee`; empty →
+ * both null). The shared toApiIssue still renders the un-enriched shape
+ * (services/issues.ts converter note) — the assign emissions carry the fill
+ * until a dedicated fold-in wave flips every issue response at once.
+ */
+async function toApiIssueWithAssignees(d1: D1Database, viewer: Viewer, found: RepositoryWithOwner, issue: IssueRow): Promise<Issue> {
+  const [base, assigneeRows] = await Promise.all([toApiIssue(d1, viewer, found, issue), listIssueAssignees(d1, issue.id)]);
+  if (assigneeRows.length === 0) {
+    return base;
+  }
+  const rendered = assigneeRows.map((row) => apiUserFromRow(row, viewer));
+  return { ...base, assignee: rendered[0] ?? null, assignees: rendered };
 }
 
 /**
@@ -1317,6 +1419,36 @@ export function registerIssueRoutes(
       }
     }
 
+    // form.assignee(s): upstream REPLACES the assignee set the GitHub way
+    // (EditIssue → UpdateAssignees, issue.go:772-779 → services/issue/
+    // assignee.go:94-166): writer-gated (`canWrite && (Assignees != nil ||
+    // Assignee != nil)`, :772), the requested names validated pre-write by
+    // the shared service (the blocked arm assignee.go:169-170 answers 403
+    // "user is blocked"; CanBeAssigned the 400/403 family), then the
+    // removals+adds ride the landed issue_assignees table with one type-9
+    // comment per toggle; an empty array clears the set. ONE assign webhook
+    // fires per actually-changed assignee, removals before adds (upstream's
+    // post-tx notify loops, assignee.go:155-166 → IssueChangeAssignee,
+    // notifier.go:161-202). Error mapping divergence: upstream's issues-PATCH
+    // arm maps only ErrBlockedUser (:780-783) — an unknown login would fall
+    // into APIErrorInternal (a 500); we answer the pulls-PATCH mapping's 422
+    // "Assignee does not exist: …" (pull.go:688), the same 422 the landed
+    // /assignees routes reply (documented, the shared service's resolution).
+    if (
+      (repositoryPermissions(viewerOf(c), found.repo).admin === true ||
+        repositoryPermissions(viewerOf(c), found.repo).push === true) &&
+      ((form.assignees !== undefined && form.assignees !== null) || (form.assignee !== undefined && form.assignee !== null))
+    ) {
+      await replaceIssueAssignees(
+        c.env.DB,
+        found,
+        issue,
+        [...(form.assignees ?? []), ...(form.assignee ? [form.assignee] : [])],
+        { id: actorId, isAdmin: requester.is_admin === true },
+        (user, removed) => emitAssignEvent(c, found, issue, user, removed),
+      );
+    }
+
     // Milestone: only on actual change (upstream guards with !=).
     const milestone = patchField(form.milestone);
     if (milestone !== undefined && milestone !== issue.milestoneId) {
@@ -1335,9 +1467,6 @@ export function registerIssueRoutes(
       // discriminant picks issue_milestone / pull_request_milestone.
       await emitMilestoneEvent(c, found, issue, newMilestoneId !== null ? "milestoned" : "demilestoned");
     }
-
-    // form.assignee(s): upstream replaces the assignee set — no
-    // issue_assignees table yet; ignored (file-header deviation note).
 
     // State: the merged precondition first — upstream (repo/issue.go:810-817)
     // 412s ANY state arm on a merged PR (the guard runs before the requested

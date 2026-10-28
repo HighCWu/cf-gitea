@@ -1925,6 +1925,241 @@ describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)
 });
 
 // ---------------------------------------------------------------------------
+// issue assign webhook emissions + the UpdateAssignees write path (PATCH
+// /repos/{owner}/{repo}/issues/{index} assignee arm — upstream EditIssue →
+// issue_service.UpdateAssignees, issue.go:772-779 → services/issue/
+// assignee.go:94-166, shared with the pulls PATCH through the landed
+// replaceIssueAssignees service; emissions per services/webhook/notifier.go
+// IssueChangeAssignee:161-202 — ONE event per actually-changed assignee, the
+// one-element changes.added_assignees/removed_assignees side, the IsPull
+// discriminant picking issue_assign vs pull_request_assign).
+// ---------------------------------------------------------------------------
+
+describe("issue assign webhook emissions (issueEditIssue PATCH assignee arm)", () => {
+  /** The stub-owned repo (the doer is the owner → the writer gate passes)
+   *  with one stub-posted issue — the pulls.test.ts seed shape. */
+  async function seedOwnedList(title: string): Promise<{ repoId: string; issueId: number; index: number }> {
+    const repoId = await seedRepo("cf-gitea-stub", "visible");
+    const issue = await seedIssue(repoId, title, { posterId: 1 });
+    return { repoId, issueId: issue.id, index: issue.index };
+  }
+
+  it("emits one issue_assign assigned event per added assignee with changes.added_assignees and the POST-change issue render", async () => {
+    const neighbor = await seedUser("neighbor");
+    const recluse = await seedUser("recluse");
+    const { repoId } = await seedOwnedList("assigned");
+    const hookId = await seedHook(repoId, ["issue_assign"]);
+
+    const res = await router()("/repos/cf-gitea-stub/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: [neighbor.usernameLower, recluse.usernameLower] }),
+    });
+    expect(res.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_assign", "issue_assign"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["assigned", "assigned"]);
+    const first = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 IssuePayload (hook.go:435) + the ChangesPayload assignee side.
+    expect(Object.keys(first).sort()).toEqual(["action", "changes", "commit_id", "issue", "number", "repository", "sender"]);
+    expect(first.number).toBe(1);
+    // The changed side only (ChangesPayload.assignees lists are omitempty)
+    // with the one assignee rendered as the §2.7 User object.
+    expect(Object.keys(first.changes as object).sort()).toEqual(["added_assignees"]);
+    const firstChanges = first.changes as { added_assignees: Array<Record<string, unknown>> };
+    expect(firstChanges.added_assignees).toHaveLength(1);
+    expect(firstChanges.added_assignees[0]).toMatchObject({ login: neighbor.usernameLower });
+    expect(first.commit_id).toBe("");
+    expect(first.sender).toMatchObject({ login: "cf-gitea-stub" });
+    expect(first.repository).toMatchObject({ full_name: "cf-gitea-stub/visible" });
+    // The payload issue renders the POST-change assignee set (upstream
+    // ToAPIIssue LoadAssignees) through the enriched overlay.
+    const second = JSON.parse(deliveries[1]!.payloadContent) as {
+      changes: { added_assignees: Array<{ login: string }> };
+      issue: { assignees: Array<{ login: string }> | null };
+    };
+    expect(second.changes.added_assignees.map((u) => u.login)).toEqual([recluse.usernameLower]);
+    expect(second.issue.assignees?.map((u) => u.login)).toEqual([neighbor.usernameLower, recluse.usernameLower]);
+  });
+
+  it("replaces the set: the unrequested assignee is removed (removal notifies FIRST) with changes.removed_assignees, then the add", async () => {
+    const dana = await seedUser("dana");
+    const bob = await seedUser("bob");
+    const { repoId, issueId } = await seedOwnedList("replaced");
+    await db().insert(issueAssignees).values({ issueId, assigneeId: bob.id });
+    const hookId = await seedHook(repoId, ["issue_assign"]);
+
+    const res = await router()("/repos/cf-gitea-stub/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: [dana.usernameLower] }),
+    });
+    expect(res.status).toBe(201);
+
+    // Upstream's post-tx notify order: removals before adds
+    // (assignee.go:155-166).
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_assign", "issue_assign"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["unassigned", "assigned"]);
+    const removed = JSON.parse(deliveries[0]!.payloadContent) as { changes: { removed_assignees: Array<{ login: string }> } };
+    expect(Object.keys(removed.changes as object).sort()).toEqual(["removed_assignees"]);
+    expect(removed.changes.removed_assignees.map((u) => u.login)).toEqual([bob.usernameLower]);
+    const added = JSON.parse(deliveries[1]!.payloadContent) as { changes: { added_assignees: Array<{ login: string }> } };
+    expect(added.changes.added_assignees.map((u) => u.login)).toEqual([dana.usernameLower]);
+
+    // One type-9 toggle comment per changed assignee; the edge set is the
+    // requested one.
+    const edges = await db().select().from(issueAssignees).all();
+    expect(edges).toHaveLength(1);
+    expect(edges[0]?.assigneeId).toBe(dana.id);
+    const toggles = await db().select().from(comments).all();
+    expect(toggles).toHaveLength(2);
+    expect(toggles.map((t) => t.type)).toEqual([CommentType.Assignees, CommentType.Assignees]);
+    expect(toggles.map((t) => t.removedAssignee)).toEqual([1, 0]);
+  });
+
+  it("stays silent when the PATCH names the unchanged set — no removals, every add skipped, no comment, no notification (UpdateAssignees no-op)", async () => {
+    const neighbor = await seedUser("neighbor");
+    const { repoId, issueId } = await seedOwnedList("quiet");
+    await db().insert(issueAssignees).values({ issueId, assigneeId: neighbor.id });
+    const hookId = await seedHook(repoId, ["issue_assign"]);
+    const pushHook = await seedHook(repoId, ["push"]); // push-only-style selection
+    const issuesHook = await seedHook(repoId, ["issues"]);
+
+    const res = await router()("/repos/cf-gitea-stub/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: [neighbor.usernameLower] }),
+    });
+    expect(res.status).toBe(201);
+    // AddAssigneeIfNotAssigned's already-assigned skip (assignee.go:186-204):
+    // the edge row stands untouched, nothing else is written or fired.
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+    expect(await deliveriesFor(pushHook)).toHaveLength(0);
+    expect(await deliveriesFor(issuesHook)).toHaveLength(0);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(0);
+    expect(await db().select().from(issueAssignees).all()).toHaveLength(1);
+    expect(await db().select().from(comments).all()).toHaveLength(0);
+  });
+
+  it("403s \"user is blocked\" before ANY write when the doer is blocked by a requested assignee (the pre-write validateAssignee loop)", async () => {
+    const neighbor = await seedUser("neighbor");
+    const { repoId } = await seedOwnedList("blocked");
+    const hookId = await seedHook(repoId, ["issue_assign"]);
+    await db().insert(userBlocking).values({ blockerId: neighbor.id, blockeeId: 1, note: "", createdAt: new Date() });
+
+    const res = await router()("/repos/cf-gitea-stub/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: [neighbor.usernameLower] }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ message: "user is blocked", url: ERROR_URL });
+    expect(await db().select().from(issueAssignees).all()).toHaveLength(0);
+    expect(await db().select().from(comments).all()).toHaveLength(0);
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+  });
+
+  it("422s an unknown assignee name with the pulls-PATCH mapping's wrapper message (documented divergence from issue.go:780-783's 500)", async () => {
+    await seedOwnedList("ghosted");
+
+    const res = await router()("/repos/cf-gitea-stub/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: ["ghost"] }),
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      message: "Assignee does not exist: [name: user does not exist [uid: 0, name: ghost]]",
+      url: ERROR_URL,
+    });
+  });
+
+  it("an empty array clears the set (the upstream [] clear arm) and notifies the one removal", async () => {
+    const bob = await seedUser("bob");
+    const { repoId, issueId } = await seedOwnedList("cleared");
+    await db().insert(issueAssignees).values({ issueId, assigneeId: bob.id });
+    const hookId = await seedHook(repoId, ["issue_assign"]);
+
+    const res = await router()("/repos/cf-gitea-stub/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: [] }),
+    });
+    expect(res.status).toBe(201);
+    expect(await db().select().from(issueAssignees).all()).toHaveLength(0);
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_assign"]);
+    expect((JSON.parse(deliveries[0]!.payloadContent) as { action: string }).action).toBe("unassigned");
+  });
+
+  it("the arm sits inside the writer gate — a POSTER without write access PATCHes fine but the assignee fields are ignored (upstream's canWrite arm, issue.go:772)", async () => {
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("neighbor");
+    // The STUB is the poster here, on alice's public repo — poster-or-writer
+    // lets the PATCH through, but the stub holds no write grant on it.
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    await seedIssue(repoId, "poster-gated", { posterId: 1 });
+    const hookId = await seedHook(repoId, ["issue_assign"]);
+
+    const res = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: [neighbor.usernameLower], title: "poster can retitle" }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ title: string }>();
+    expect(body.title).toBe("poster can retitle");
+    expect(await db().select().from(issueAssignees).all()).toHaveLength(0);
+    // The title edit's type-10 comment stands; NO type-9 assignee toggle.
+    expect(
+      await db().select().from(comments).where(eq(comments.type, CommentType.Assignees)).all(),
+    ).toHaveLength(0);
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+  });
+
+  it("routes PR assignee writes to pull_request_assign with the PullRequestPayload field set", async () => {
+    const neighbor = await seedUser("neighbor");
+    const { repoId } = await seedOwnedList("pr-assigned");
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "PR assignees",
+      posterId: 1,
+    });
+    const hookId = await seedHook(repoId, ["pull_request_assign"]);
+    const issuesHook = await seedHook(repoId, ["issue_assign"]);
+
+    const res = await router()(`/repos/cf-gitea-stub/visible/issues/${pull.issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: [neighbor.usernameLower] }),
+    });
+    expect(res.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request_assign");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
+    // §2.7 PullRequestPayload (hook.go:484) + the ChangesPayload assignee
+    // side — the landed pulls.ts emission field set.
+    expect(Object.keys(payload).sort()).toEqual(["action", "changes", "commit_id", "number", "pull_request", "repository", "sender"]);
+    expect(payload.action).toBe("assigned");
+    expect(payload.number).toBe(pull.issue.index);
+    expect((payload.changes as { added_assignees: Array<{ login: string }> }).added_assignees.map((u) => u.login)).toEqual([neighbor.usernameLower]);
+    expect((payload.pull_request as Record<string, unknown>).title).toBe("PR assignees");
+    // A pull_request_assign-subscribed hook never sees issue_assign traffic.
+    expect(await deliveriesFor(issuesHook)).toHaveLength(0);
+    expect(await db().select().from(webhookDeliveries).all()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /repos/{owner}/{repo}/issues/{index}/timeline (issueGetCommentsAndTimeline)
 // ---------------------------------------------------------------------------
 
