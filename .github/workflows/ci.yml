@@ -124,6 +124,18 @@ jobs:
         run: pnpm gen:icons
       - name: Dev vars (GIT_TOKEN=devtoken)
         run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+      # A fresh runner's local D1 is EMPTY: neither `vite dev` nor the
+      # @cloudflare/vite-plugin applies D1 migrations (verified in the plugin
+      # dist — wrangler.jsonc's migrations_dir is only read by the wrangler
+      # CLI, which is exactly what db:migrate:local drives). Without this the
+      # FIRST metadata-touching request 500s "no such table": the suite's
+      # pre-clean `DELETE demo` 500-fataled at setup (runs 40693290410 and
+      # 40695317569), the observed-FAILS file stayed empty and the allowlist
+      # check below then failed on set-inequality. Same step the lfs-e2e and
+      # mirror-e2e jobs already carry — the only two dev-server jobs that
+      # were green.
+      - name: Apply local D1 migrations
+        run: pnpm db:migrate:local
       - name: Start dev Worker (vite dev, workerd)
         run: |
           # GH runner images alias localhost to ::1 AS WELL as 127.0.0.1
@@ -208,16 +220,19 @@ jobs:
 
   # Benchmark regression stage (specs/0001-storage-engine.md §9): external
   # metrics (clone MB/s, incremental-fetch ratio, push wall, info/refs p50/p95)
-  # per fixture size against the committed baseline in
-  # scripts/bench-baselines/, >10% regression fails the job (scripts/
-  # bench-run.mjs). Internal metrics (CPU-ms, peak memory, subrequests) stay
-  # null until the M2 Step 2 T3 instrumentation; a missing baseline file is
-  # report-only by design — per the deferred-baseline policy NO official
-  # baseline exists yet (the receive path is being rewritten in M2), the first
-  # one records when M2 Step 2 lands, so this job is green until then. Only
-  # the 5 MiB fixture runs here (42 MiB opt-in, 500 MiB never in CI) to keep
-  # the job at a few minutes; fixture generation (~1s for 5m) happens on first
-  # use since .bench-fixtures/ is gitignored.
+  # for the 5 MiB fixture against the CI-hardware baseline
+  # scripts/bench-baselines/ci.json — >10% regression fails the job
+  # (scripts/bench-run.mjs). The baseline is self-bootstrapped: the first run
+  # after ci.json is absent RECORDS it (report-only pass) and uploads it
+  # (artifact bench-ci-baseline) for committing; once committed every run
+  # gates CI-vs-CI. NOT --compare m2: m2.json is a dev-box record
+  # (bench-run.mjs BASELINE POLICY — baselines are local-vs-local), and a
+  # 2-core runner measured against a dev box is machine variance, not
+  # regression. Internal metrics (CPU-ms, peak memory, subrequests) stay
+  # null until the M2 Step 2 T3 instrumentation. Only the 5 MiB fixture runs
+  # here (42 MiB opt-in, 500 MiB never in CI) to keep the job at a few
+  # minutes; fixture generation (~1s for 5m) happens on first use since
+  # .bench-fixtures/ is gitignored.
   benchmark:
     runs-on: ubuntu-latest
     steps:
@@ -240,6 +255,12 @@ jobs:
         run: pnpm gen:icons
       - name: Dev vars (GIT_TOKEN=devtoken)
         run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+      # Same fresh-runner empty-D1 class as the e2e job (comment there): the
+      # benchmark's create-by-push of the fixture 500'd "no such table" before
+      # any leg ran (runs 40693290410, 40695317569) — the 10% gate never even
+      # reached the compare. Migrate first.
+      - name: Apply local D1 migrations
+        run: pnpm db:migrate:local
       - name: Start dev Worker (vite dev, workerd)
         run: |
           # GH runner images alias localhost to ::1 AS WELL as 127.0.0.1
@@ -268,8 +289,32 @@ jobs:
           # server bound (the bind-family mismatch class) in the run record.
           echo "--- listen sockets ---"; ss -tln | grep -E ':(5173|5199)' || true
           exit 1
-      - name: Benchmark (compare vs the recorded m2 baseline — 10% regression gate now ENFORCED)
-        run: node scripts/bench-run.mjs --compare m2 --sizes 5m --base-url http://127.0.0.1:5173
+      # Machine-relative trap, fixed 2026-10-28: `--compare m2` measured CI's
+      # 2-core runner against a DEV-BOX record (m2.json, 2026-10-24) —
+      # bench-run.mjs's BASELINE POLICY itself says baselines compare
+      # local-vs-local, and "local" means the machine that recorded the file.
+      # The gate therefore bootstraps its own CI-hardware baseline
+      # (scripts/bench-baselines/ci.json): the first run RECORDS it (passes;
+      # upload below) and every run after it COMPARES — the enforced >10%
+      # gate, CI-vs-CI, no machine multiplier and no skipping (SPEC-0001 §9
+      # requires the stage; skipping it would leave the primary deployment
+      # platform unmeasured).
+      - name: Benchmark (CI-hardware baseline; 10% regression gate once recorded)
+        run: |
+          if [ -f scripts/bench-baselines/ci.json ]; then
+            node scripts/bench-run.mjs --compare ci --sizes 5m --base-url http://127.0.0.1:5173
+          else
+            echo "scripts/bench-baselines/ci.json absent — recording the CI-hardware baseline (report run; the gate arms once it is committed)"
+            node scripts/bench-run.mjs --record ci --sizes 5m --base-url http://127.0.0.1:5173
+            echo "::notice::scripts/bench-baselines/ci.json recorded — commit it from artifact bench-ci-baseline so the next run gates"
+          fi
+      - name: Upload recorded CI baseline (first-run bootstrap)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-ci-baseline
+          path: scripts/bench-baselines/ci.json
+          if-no-files-found: ignore
       - name: Upload benchmark results (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
@@ -513,6 +558,12 @@ jobs:
           GIT_TOKEN=$(openssl rand -hex 32)
           printf 'GIT_TOKEN=%s\n' "$GIT_TOKEN" > apps/worker/.dev.vars
           echo "GIT_TOKEN=$GIT_TOKEN" >> "$GITHUB_ENV"
+      # Same fresh-runner empty-D1 class as the e2e job (comment there): the
+      # battery's setup creates its repos through the admin API, so on the
+      # unmigrated DB every case 500'd at setup within ~200ms — 20/20
+      # setup-fail (runs 40693290410, 40695317569). Migrate first.
+      - name: Apply local D1 migrations
+        run: pnpm db:migrate:local
       - name: Start dev Worker (vite dev, workerd)
         run: |
           # GH runner images alias localhost to ::1 AS WELL as 127.0.0.1

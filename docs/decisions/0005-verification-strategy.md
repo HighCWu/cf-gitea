@@ -63,13 +63,26 @@ here is a file or commit in the tree.
    verdicts against the live Worker (`docs/design/p0-evidence.md`, gates
    G1–G5; the probe repo is left live so a reviewer can re-run them).
    Mandate: the deployed artifact, not the tree, is what users hit.
-6. **CI bench baselines** — `scripts/bench-baselines/m2.json` (recorded
-   2026-10-24, milestone m2, 5 MiB fixture, local workerd: clone
-   14.2 MiB/s · push 192 ms · incremental ratio 0.000245 · info/refs p50
-   12.5 ms); CI's `benchmark` job runs
-   `bench-run.mjs --compare m2 --sizes 5m` and fails the build on >10%
-   regression. Mandate: performance claims are pinned, not remembered
-   (ADR-0001 annex's "CI gate enforced").
+6. **CI bench baselines** — `scripts/bench-baselines/` holds two
+   machine-scoped records, per bench-run.mjs's BASELINE POLICY (baselines
+   compare local-vs-local; a baseline is only comparable on the machine that
+   recorded it): `m2.json` (recorded 2026-10-24 on the dev box, milestone m2,
+   5 MiB fixture, local workerd: clone 14.2 MiB/s · push 192 ms ·
+   incremental ratio 0.000245 · info/refs p50 12.5 ms) stays the dev-box
+   reference, and CI gates on its own `ci.json`, self-bootstrapped by the
+   `benchmark` job — the first run with `ci.json` absent RECORDS it (report
+   pass) and uploads it for committing, every run after compares against it
+   and fails on >10% regression. This replaced the original
+   `--compare m2` wiring (2026-10-28, runs 40693290410/40695317569): those
+   runs also exposed that the job had NEVER executed its compare leg — the
+   fixture create-by-push 500'd on the fresh runner's unmigrated local D1
+   first — but the m2 comparison was machine-relative by construction (a
+   2-core runner vs the dev box), and the alternatives were rejected:
+   softening the gate with a CI multiplier bakes one machine ratio into a
+   gate that should outlive runner generations, and skipping the compare in
+   CI (report-only) would leave the deployment platform — the only place
+   the product actually runs — unmeasured, defeating ADR-0001 annex's "CI
+   gate enforced". Mandate: performance claims are pinned, not remembered.
 
 ## Decisions
 

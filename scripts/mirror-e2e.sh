@@ -573,8 +573,22 @@ check "$(jf "$API_BODY" mirror_interval)" "0" "registered interval (0 = scheduli
 check "$(jf "$API_BODY" enable_prune)" "true" "enable_prune defaults true"
 case "$API_BODY" in *"$SRC_PASS"*) fail "migrate response leaks the source password";; *) ok "migrate response carries no credentials";; esac
 mirror_status target
+# Registration shape is `next_sync_at = now` (due immediately — the insert at
+# src/api/services/mirror.ts "due immediately"); but with mirror_interval "0"
+# a first sync that SETTLES before this read flips next_sync_at back to 0
+# (unscheduled — the documented settle rule, src/services/mirror/sync.ts:
+# success → next_sync_at = now + interval, 0 → unscheduled). That read-after-
+# settle is a pure race — observed red on CI while green locally in the same
+# bytes (run 40695317569: CI's faster loopback sync beat this status GET).
+# The settled shape (last_sync_at set, no error) proves MORE than due-now —
+# the enqueue demonstrably ran — so both are accepted; anything else fails.
 case "$(ms next_sync_at)" in
-  ""|"0") fail "mirror row not registered due-now (next_sync_at='$(ms next_sync_at)')";;
+  ""|"0")
+    if [ -n "$(ms last_sync_at)" ] && [ -z "$(ms last_error)" ]; then
+      ok "mirror row registered; first sync settled before this read (interval 0 → unscheduled) — enqueue proven delivered"
+    else
+      fail "mirror row not registered due-now (next_sync_at='$(ms next_sync_at)', last_sync_at='$(ms last_sync_at)', last_error='$(ms last_error)')"
+    fi;;
   *) ok "mirror row registered due-now (a lost enqueue self-heals at cron)";;
 esac
 

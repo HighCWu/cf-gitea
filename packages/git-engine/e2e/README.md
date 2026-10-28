@@ -138,7 +138,10 @@ The suite's protocol core carries over and passes:
 Sections that fail **permanently, by design** (re-verified 2026-10-25, after
 the Tier-2 UI (SPEC-0008) and sessions (SPEC-0010) landed: 34 passed /
 35 failed, and the failure set is exactly the CI allowlist —
-`.github/workflows/ci.yml`, job `e2e`). They exercise upstream dgit's
+`.github/workflows/ci.yml`, job `e2e`; re-verified again 2026-10-28 against
+the post mirror-HEAD/husk/auto_init wave — same 34/35, set-equal to the
+allowlist; the mirror/push product fixes touch a surface this suite never
+scrapes). They exercise upstream dgit's
 cgit-style web UI, which cf-gitea replaced for good: the engine is created
 with `ui: false` (see "How it is wired" above), so the dgit pages these
 checks scrape do not exist and will never come back:
