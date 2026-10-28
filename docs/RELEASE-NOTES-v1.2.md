@@ -655,7 +655,7 @@ it). The durable record is
 ws1009 house style: versions verified against the lockfile, a standalone
 ~80-line miniflare-only repro syntax-checked but NOT executed, a 7-item
 could-not-verify ledger; **filing awaits the user's nod**, the #16515
-pattern). **A10-L** — the batched `listTreeCommits` engine RPC, the audit's
+pattern). **A10-L (LANDED — see the perf(engine,ui) commit)** — the batched `listTreeCommits` engine RPC, the audit's
 one open L-half (the repo home's worst serial wall-clock fan) — is IN
 FLIGHT at append time.
 

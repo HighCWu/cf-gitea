@@ -28,7 +28,7 @@ left as-written (they are the record of the shapes that motivated the fixes).
 
 A10 caveat: only the S-difficulty fix landed (`enrichTreeCommits` runs
 concurrent via `Promise.all`, `c614daa`); the real fix — the batched
-`listTreeCommits` engine RPC (the L half) — is still open.
+`listTreeCommits` engine RPC (the L half) — LANDED (the A10-L commit, 2026-10-28; the fragment adopter followed).
 
 A9 caveat: the landing is the audit's `inArray` variant at the fan site —
 the batched twin `viewerTeamAccessModes` (`repository.ts:222`) runs one
@@ -242,7 +242,7 @@ below exclude this baseline. API routes pay `requireVisibleRepo` instead:
   as one query, or `inArray` the coverage rows.
 - **Difficulty**: S-M.
 
-### A10. Repo home page — serial per-entry engine RPCs (not D1, but the biggest wall-clock N) — **LANDED (S half) `c614daa`**; the batched `listTreeCommits` RPC (the L half) stays open
+### A10. Repo home page — serial per-entry engine RPCs (not D1, but the biggest wall-clock N) — **LANDED COMPLETE** (S half `c614daa`; the L half — the batched `listTreeCommits` RPC — landed 2026-10-28)
 
 - **Chain**: `GET /{owner}/{repo}` → `loadHomeData`
   (`apps/worker/src/ui/pages/home.tsx:74-114`) → `enrichTreeCommits`
