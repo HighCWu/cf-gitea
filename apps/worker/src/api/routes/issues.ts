@@ -365,9 +365,10 @@ async function emitCommentEvent(
     eventType: issue.isPull ? "pull_request_comment" : "issue_comment",
     payload: {
       action,
-      // The emission pin: landed payloads render assignees null (the fold's
-      // render split — see IssueRenderPreload.assignees).
-      issue: await toApiIssue(c.env.DB, viewerOf(c), found, issue, { assignees: "emission" }),
+      // Upstream renders the comment payload issue through the SHARED
+      // ToAPIIssue on BOTH arms (UpdateComment:447, DeleteComment:523 —
+      // LoadAssignees, the real set), so the default wire render.
+      issue: await toApiIssue(c.env.DB, viewerOf(c), found, issue),
       comment,
       ...(options.changes === undefined ? {} : { changes: options.changes }),
       repository: event.repository,
@@ -480,9 +481,10 @@ export async function emitMilestoneEvent(
     eventType: "issue_milestone",
     payload: issueEventPayload(
       action,
-      // The emission pin (landed payloads render assignees null — the fold's
-      // render split).
-      await toApiIssue(c.env.DB, viewerOf(c), found, issue, { assignees: "emission" }),
+      // Upstream renders the milestone payload issue through the SHARED
+      // ToAPIIssue (IssueChangeMilestone:650 — LoadAssignees, the real set),
+      // so the default wire render.
+      await toApiIssue(c.env.DB, viewerOf(c), found, issue),
       issue.index,
       event.repository,
       event.sender,
@@ -1154,9 +1156,10 @@ export function registerIssueRoutes(
 
       // ONE render serves the 201 body AND the opened/closed payloads below:
       // this route drops form.assignee(s) (the file-header deviation), so a
-      // fresh issue's assignee set is ALWAYS empty and the fold's wire render
-      // is the emission shape too (both fields null) — the identities coincide
-      // by construction. A future create-assignee wave must split the paths.
+      // fresh issue's assignee set is ALWAYS empty and the wire render's
+      // null/null is exactly what upstream's ToAPIIssue (NewIssue:305) would
+      // emit for the same fresh issue — the identities coincide by
+      // construction. A future create-assignee wave must split the paths.
       const rendered = await toApiIssue(c.env.DB, viewer, found, issue);
       // Webhooks: opened (always), then closed (form.closed) — the upstream
       // NewIssue → CloseIssue notification order.
@@ -1379,9 +1382,10 @@ export function registerIssueRoutes(
         eventType: "issues",
         payload: issueEventPayload(
           "edited",
-          // The emission pin (landed payloads render assignees null — the
-          // fold's render split).
-          await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }),
+          // Upstream renders the title-edit payload issue through the SHARED
+          // ToAPIIssue (IssueChangeTitle:238 — LoadAssignees, the real set),
+          // so the default wire render.
+          await toApiIssue(c.env.DB, viewer, found, issue),
           issue.index,
           event.repository,
           event.sender,
@@ -1417,9 +1421,10 @@ export function registerIssueRoutes(
         eventType: "issues",
         payload: issueEventPayload(
           "edited",
-          // The emission pin (landed payloads render assignees null — the
-          // fold's render split).
-          await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }),
+          // Upstream renders the body-edit payload issue through the SHARED
+          // ToAPIIssue (IssueChangeContent:410 — LoadAssignees, the real set),
+          // so the default wire render.
+          await toApiIssue(c.env.DB, viewer, found, issue),
           issue.index,
           event.repository,
           event.sender,
@@ -1522,9 +1527,10 @@ export function registerIssueRoutes(
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        // The emission pin (landed payloads render assignees null — the
-        // fold's render split).
-        payload: issueEventPayload("closed", await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }), issue.index, event.repository, event.sender),
+        // Upstream renders the close payload issue through the SHARED ToAPIIssue
+        // (IssueChangeStatus:274 — LoadAssignees, the real set), so the default
+        // wire render.
+        payload: issueEventPayload("closed", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender),
       });
     } else if (state === "open" && issue.isClosed) {
       try {
@@ -1537,9 +1543,10 @@ export function registerIssueRoutes(
         repoId: found.repo.id,
         ownerId: event.ownerId,
         eventType: "issues",
-        // The emission pin (landed payloads render assignees null — the
-        // fold's render split).
-        payload: issueEventPayload("reopened", await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }), issue.index, event.repository, event.sender),
+        // Upstream renders the reopen payload issue through the SHARED
+        // ToAPIIssue (IssueChangeStatus:274 — the same issue-arm converter),
+        // so the default wire render.
+        payload: issueEventPayload("reopened", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender),
       });
     }
 
@@ -1616,9 +1623,10 @@ export function registerIssueRoutes(
         eventType,
         payload: {
           action: "created",
-          // The emission pin (landed payloads render assignees null — the
-          // fold's render split).
-          issue: await toApiIssue(c.env.DB, viewer, found, issue, { assignees: "emission" }),
+          // Upstream renders the created-comment payload issue through the
+          // SHARED ToAPIIssue (CreateIssueComment:482 — LoadAssignees, the
+          // real set), so the default wire render.
+          issue: await toApiIssue(c.env.DB, viewer, found, issue),
           comment: rendered,
           repository: event.repository,
           sender: event.sender,

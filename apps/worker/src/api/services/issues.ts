@@ -301,14 +301,6 @@ export interface IssueRenderPreload {
   /** The PR row the caller already holds (toApiPullRequest — the audit's B1
    *  redundant-re-select fix). Takes precedence over the context map. */
   prRow?: PullRequestRow;
-  /** The assignee block's source (the fold's one render split): "wire" — the
-   *  DEFAULT — renders the REAL set (the batch map when a context is present,
-   *  the per-row `listIssueAssignees` read otherwise); "emission" pins the
-   *  landed webhook shape (both null, no read). Webhook payloads keep their
-   *  landed identity — upstream renders real assignees in payloads
-   *  (ToAPIIssue), a disclosed divergence the emission landings froze; a
-   *  per-site flip is a deliberate wave, never a side effect of this fold. */
-  assignees?: "wire" | "emission";
 }
 
 /**
@@ -408,16 +400,17 @@ function posterFromContext(context: IssueRenderContext, viewer: Viewer, posterId
  * `assignees` render the REAL set — `convert.ToIssue` issue.go:105-113, the
  * first assignee duplicated into the deprecated `assignee`, an EMPTY set
  * leaving both fields the Go nils the writer marshals as `null` (never `[]`).
- * The one render split: `preload.assignees: "emission"` pins the landed
- * webhook shape (both null, no read) — see the preload's doc.
+ * Webhook payloads ride the SAME render: every upstream notifier builds its
+ * payload issue through the SHARED ToAPIIssue (services/convert/issue.go, the
+ * same LoadAssignees block), so the emission pins that once split the render
+ * are gone — the emission-align waves flipped each site back to this default.
  */
 export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow, preload?: IssueRenderPreload): Promise<Issue> {
   const context = preload?.context;
   const poster = context === undefined ? await toPoster(d1, viewer, issue.posterId) : posterFromContext(context, viewer, issue.posterId);
   const labelRows = context === undefined ? await issueLabelRows(d1, issue.id) : (context.labelsByIssue.get(issue.id) ?? []);
   const pinOrder = context === undefined ? await pinOrderOf(d1, issue.id) : (context.pinOrders.get(issue.id) ?? -1);
-  const assigneeRows =
-    preload?.assignees === "emission" ? [] : context === undefined ? await listIssueAssignees(d1, issue.id) : (context.assigneesByIssue.get(issue.id) ?? []);
+  const assigneeRows = context === undefined ? await listIssueAssignees(d1, issue.id) : (context.assigneesByIssue.get(issue.id) ?? []);
   const milestoneRow =
     issue.milestoneId === null
       ? null
@@ -1879,10 +1872,11 @@ async function renderIssueDeletedEvent(d1: D1Database, issue: IssueRow, emission
     payload: {
       action: "deleted",
       number: issue.index,
-      // The emission pin: the landed delete payload renders assignees null
-      // (upstream's ToAPIIssue would render the live set — the disclosed
-      // divergence, unchanged by the fold).
-      issue: await toApiIssue(d1, emission.viewer, pair, issue, { assignees: "emission" }),
+      // Upstream renders the delete payload issue through the SHARED ToAPIIssue
+      // (DeleteIssue:341 — LoadAssignees, the real set), so the default wire
+      // render (the emission-align wave closed the last null pin — the
+      // pre-delete render still sees the live rows).
+      issue: await toApiIssue(d1, emission.viewer, pair, issue),
       repository,
       sender: emission.sender,
       commit_id: "",

@@ -25,7 +25,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { actions, comments, labels, repoCounters, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { actions, comments, issueAssignees, labels, repoCounters, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
@@ -208,6 +208,11 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index} webhook emissions (upstrea
       labels: [{ name: "bug" }],
       repository: { full_name: "alice/visible" },
     });
+    // The unassigned issue's EMPTY assignee set renders the Go nils — `null`
+    // for both fields (ToAPIIssue's len>0 gate), never [] — upstream's
+    // DeleteIssue:341 ToAPIIssue render for the same issue.
+    expect((payload.issue as { assignee: unknown }).assignee).toBeNull();
+    expect((payload.issue as { assignees: unknown }).assignees).toBeNull();
     expect(payload.repository).toMatchObject({ full_name: "alice/visible" });
     // The doer is the sender (the route's authUser — the stub identity).
     expect(payload.sender).toMatchObject({ login: STUB_USER.login });
@@ -216,6 +221,39 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index} webhook emissions (upstrea
     // method (feed/notifier.go) — no action row, and the swept comment is gone.
     expect(await db().select().from(actions).all()).toHaveLength(0);
     expect(await db().select().from(comments).all()).toHaveLength(0);
+  });
+
+  it("renders the deleted payload's issue block with the REAL assignee set (the ToAPIIssue emission witness)", async () => {
+    // Upstream's DeleteIssue renders the issue payload through the SHARED
+    // convert.ToAPIIssue (notifier.go:341): LoadAssignees, then every assignee
+    // into `assignees` with the first duplicated into the deprecated
+    // `assignee` (services/convert/issue.go:105-112). The emission-align wave
+    // dropped the delete funnel's null pin, so the PRE-delete render carries
+    // the live set — flipping back to the landed nulls must break here.
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const neighbor = await seedUser("neighbor");
+    const recluse = await seedUser("recluse");
+    const doomed = await seedIssue(repoId, "assigned and doomed", { posterId: owner.id });
+    await db().insert(issueAssignees).values([
+      { issueId: doomed.id, assigneeId: neighbor.id },
+      { issueId: doomed.id, assigneeId: recluse.id },
+    ]);
+    const hookId = await seedHook(repoId, ["issues"]);
+
+    const res = await router()(`/repos/alice/visible/issues/${doomed.index}`, { method: "DELETE", headers: authHeaders });
+    expect(res.status).toBe(204);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      issue: { assignee: { login: string } | null; assignees: Array<{ login: string }> | null };
+    };
+    // Edge-row (insertion) order — the listIssueAssignees orderBy — with the
+    // first assignee duplicated into `assignee` (ToIssue issue.go:105-113),
+    // read from the live rows BEFORE the cascade sweeps the edge table.
+    expect(payload.issue.assignees?.map((u) => u.login)).toEqual([neighbor.usernameLower, recluse.usernameLower]);
+    expect(payload.issue.assignee).toMatchObject({ login: neighbor.usernameLower });
   });
 
   it("a PR delete routes the event to pull_request with the PullRequestPayload shape", async () => {

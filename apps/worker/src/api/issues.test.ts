@@ -301,6 +301,34 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
     expect(deliveries[0]!.payloadContent).toContain('\n  "action": "opened"');
   });
 
+  it("renders the opened payload issue block null/null (the ToAPIIssue emission witness — the create route drops assignees)", async () => {
+    // Upstream's NewIssue (notifier.go:305) renders the opened payload issue
+    // through the SHARED ToAPIIssue — for a fresh unassigned issue that is
+    // the Go nils, `null` for both fields (the len>0 gate), never []. This
+    // route drops form.assignee(s) (the file-header deviation), so its fresh
+    // issues are ALWAYS unassigned and the wire render IS upstream's render;
+    // a create-assignee wave must split the paths before any other arm can
+    // exist here.
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const hookId = await seedHook(repoId, ["issues"]);
+
+    const res = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "born empty" }),
+    });
+    expect(res.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action)).toEqual(["opened"]);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      issue: { assignee: unknown; assignees: unknown };
+    };
+    expect(payload.issue.assignee).toBeNull();
+    expect(payload.issue.assignees).toBeNull();
+  });
+
   it("emits the issues opened webhook to subscribed active hooks only", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
@@ -679,10 +707,18 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
     expect(rows[0]?.newTitle).toBe("after");
 
     const deliveries = await deliveriesFor(hookId);
-    const payloads = deliveries.map((d) => JSON.parse(d.payloadContent) as { action: string; changes?: Record<string, { title?: { from: string }; body?: { from: string } }> });
+    const payloads = deliveries.map((d) => JSON.parse(d.payloadContent) as { action: string; issue: { assignee: unknown; assignees: unknown }; changes?: Record<string, { title?: { from: string }; body?: { from: string } }> });
     expect(payloads.map((p) => p.action)).toEqual(["edited", "edited"]);
     expect(payloads[0]?.changes).toEqual({ title: { from: "before" } });
     expect(payloads[1]?.changes).toEqual({ body: { from: "old body" } });
+    // The unassigned issue's EMPTY assignee set renders the Go nils in both
+    // edited payloads — `null` for both fields (ToAPIIssue's len>0 gate),
+    // never [] — upstream's IssueChangeTitle:238 / IssueChangeContent:410
+    // ToAPIIssue render for the same issue.
+    for (const payload of payloads) {
+      expect(payload.issue.assignee).toBeNull();
+      expect(payload.issue.assignees).toBeNull();
+    }
   });
 
   it("CAS-guards body edits on content_version with 409", async () => {
@@ -906,6 +942,70 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
     });
     expect(res.status).toBe(423);
   });
+
+  it("renders the title/body/closed/reopened payload issue blocks with the REAL assignee set (the ToAPIIssue emission witness)", async () => {
+    // Upstream's issue-state notifiers render every payload issue through the
+    // SHARED convert.ToAPIIssue — title edit IssueChangeTitle:238, body edit
+    // IssueChangeContent:410, close/reopen IssueChangeStatus:274 — the same
+    // LoadAssignees block as the wire render (services/convert/issue.go:
+    // 105-112). The emission-align wave dropped the route's four null pins,
+    // so all four payloads ride the default wire render — flipping back to
+    // the landed nulls must break here.
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("neighbor");
+    const recluse = await seedUser("recluse");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "before", { posterId: 1, content: "old body" });
+    await db().insert(issueAssignees).values([
+      { issueId: issue.id, assigneeId: neighbor.id },
+      { issueId: issue.id, assigneeId: recluse.id },
+    ]);
+    const hookId = await seedHook(repoId, ["issues"]);
+
+    const titleEdit = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "after" }),
+    });
+    expect(titleEdit.status).toBe(201);
+
+    const bodyEdit = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "new body" }),
+    });
+    expect(bodyEdit.status).toBe(201);
+
+    const close = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "closed" }),
+    });
+    expect(close.status).toBe(201);
+
+    const reopen = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "open" }),
+    });
+    expect(reopen.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issues", "issues", "issues", "issues"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["edited", "edited", "closed", "reopened"]);
+    // Edge-row (insertion) order — the listIssueAssignees orderBy — with the
+    // first assignee duplicated into `assignee` (ToIssue issue.go:105-113),
+    // IDENTICALLY across all four state emissions: one shared converter, one
+    // render.
+    for (const delivery of deliveries) {
+      const payload = JSON.parse(delivery.payloadContent) as {
+        issue: { assignee: { login: string } | null; assignees: Array<{ login: string }> | null };
+      };
+      expect(payload.issue.assignees?.map((u) => u.login)).toEqual([neighbor.usernameLower, recluse.usernameLower]);
+      expect(payload.issue.assignee).toMatchObject({ login: neighbor.usernameLower });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1102,6 +1202,12 @@ describe("POST /repos/{owner}/{repo}/issues/{index}/comments (issueCreateComment
     const payload = JSON.parse(deliveries[0]!.payloadContent) as Record<string, unknown>;
     expect(Object.keys(payload).sort()).toEqual(["action", "comment", "is_pull", "issue", "repository", "sender"]);
     expect(payload).toMatchObject({ action: "created", is_pull: false });
+    // The fresh issue's EMPTY assignee set renders the Go nils — `null` for
+    // both fields (ToAPIIssue's len>0 gate), never [] — upstream's
+    // CreateIssueComment:482 ToAPIIssue render for the same fresh issue.
+    const emptyIssue = payload.issue as { assignee: unknown; assignees: unknown };
+    expect(emptyIssue.assignee).toBeNull();
+    expect(emptyIssue.assignees).toBeNull();
   });
 
   it("404s a missing issue and 423s archived repos", async () => {
@@ -1962,6 +2068,57 @@ describe("comment edit/delete webhook emissions (issueEditComment / issueDeleteC
     expect(await db().select().from(webhookDeliveries).all()).toHaveLength(0);
     expect(await deliveriesFor(siblingHook)).toHaveLength(0);
   });
+
+  it("renders the payload issue block with the REAL assignee set across created/edited (the ToAPIIssue emission witness)", async () => {
+    // Upstream's comment notifiers render the payload issue through the SHARED
+    // convert.ToAPIIssue on ALL THREE arms (CreateIssueComment:482,
+    // UpdateComment:447, DeleteComment:523): LoadAssignees, then every
+    // assignee into `assignees` with the first duplicated into the deprecated
+    // `assignee` (services/convert/issue.go:105-112). The emission-align wave
+    // dropped the route's null pins, so both emission sites (the POST route's
+    // created payload and emitCommentEvent's edited/deleted payload) ride the
+    // default wire render — flipping back to the landed nulls must break here.
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("neighbor");
+    const recluse = await seedUser("recluse");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "commented-set");
+    await db().insert(issueAssignees).values([
+      { issueId: issue.id, assigneeId: neighbor.id },
+      { issueId: issue.id, assigneeId: recluse.id },
+    ]);
+    const hookId = await seedHook(repoId, ["issue_comment"]);
+
+    const created = await router()(`/repos/alice/visible/issues/${issue.index}/comments`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "a comment" }),
+    });
+    expect(created.status).toBe(201);
+    const comment = await created.json<{ id: number }>();
+
+    const edit = await router()(`/repos/alice/visible/issues/comments/${comment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "edited comment" }),
+    });
+    expect(edit.status).toBe(200);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_comment", "issue_comment"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["created", "edited"]);
+    // Edge-row (insertion) order — the listIssueAssignees orderBy — with the
+    // first assignee duplicated into `assignee` (ToIssue issue.go:105-113),
+    // IDENTICALLY on create and edit: one shared converter, one render.
+    for (const delivery of deliveries) {
+      const payload = JSON.parse(delivery.payloadContent) as {
+        issue: { assignee: { login: string } | null; assignees: Array<{ login: string }> | null };
+      };
+      expect(payload.issue.assignees?.map((u) => u.login)).toEqual([neighbor.usernameLower, recluse.usernameLower]);
+      expect(payload.issue.assignee).toMatchObject({ login: neighbor.usernameLower });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2002,6 +2159,12 @@ describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)
     expect(Object.keys(setPayload).sort()).toEqual(["action", "commit_id", "issue", "number", "repository", "sender"]);
     expect(setPayload.number).toBe(1);
     expect((setPayload.issue as { milestone: { id: number } | null }).milestone?.id).toBe(milestoneId);
+    // The unassigned issue's EMPTY assignee set renders the Go nils — `null`
+    // for both fields (ToAPIIssue's len>0 gate), never [] — upstream's
+    // IssueChangeMilestone:650 ToAPIIssue render for the same issue.
+    const emptyIssue = setPayload.issue as { assignee: unknown; assignees: unknown };
+    expect(emptyIssue.assignee).toBeNull();
+    expect(emptyIssue.assignees).toBeNull();
     expect(setPayload.repository).toMatchObject({ full_name: "alice/visible" });
     expect(deliveries[1]!.payloadContent).toContain('\n  "action": "demilestoned"');
     expect((JSON.parse(deliveries[1]!.payloadContent) as { issue: { milestone: unknown } }).issue.milestone).toBeNull();
@@ -2065,6 +2228,56 @@ describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)
     // traffic and vice versa.
     expect(await deliveriesFor(issuesHook)).toHaveLength(0);
     expect(await db().select().from(webhookDeliveries).all()).toHaveLength(1);
+  });
+
+  it("renders the payload issue block with the REAL assignee set across milestoned/demilestoned (the ToAPIIssue emission witness)", async () => {
+    // Upstream's milestone notifier renders the payload issue through the
+    // SHARED convert.ToAPIIssue (IssueChangeMilestone:650): LoadAssignees,
+    // then every assignee into `assignees` with the first duplicated into the
+    // deprecated `assignee` (services/convert/issue.go:105-112). The
+    // emission-align wave dropped the route's null pin, so the emission rides
+    // the default wire render — flipping back to the landed nulls must break
+    // here.
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("neighbor");
+    const recluse = await seedUser("recluse");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const milestoneId = await seedMilestone(repoId, "v1");
+    const issue = await seedIssue(repoId, "milestoned-set", { posterId: 1 });
+    await db().insert(issueAssignees).values([
+      { issueId: issue.id, assigneeId: neighbor.id },
+      { issueId: issue.id, assigneeId: recluse.id },
+    ]);
+    const hookId = await seedHook(repoId, ["issue_milestone"]);
+
+    const set = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ milestone: milestoneId }),
+    });
+    expect(set.status).toBe(201);
+
+    const clear = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ milestone: 0 }),
+    });
+    expect(clear.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issue_milestone", "issue_milestone"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["milestoned", "demilestoned"]);
+    // Edge-row (insertion) order — the listIssueAssignees orderBy — with the
+    // first assignee duplicated into `assignee` (ToIssue issue.go:105-113),
+    // IDENTICALLY on set and clear: one shared converter, one render.
+    for (const delivery of deliveries) {
+      const payload = JSON.parse(delivery.payloadContent) as {
+        issue: { assignee: { login: string } | null; assignees: Array<{ login: string }> | null };
+      };
+      expect(payload.issue.assignees?.map((u) => u.login)).toEqual([neighbor.usernameLower, recluse.usernameLower]);
+      expect(payload.issue.assignee).toMatchObject({ login: neighbor.usernameLower });
+    }
   });
 });
 
