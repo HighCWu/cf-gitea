@@ -67,12 +67,12 @@ scripts/               # Repo-level tooling (contract checks, codegen)
   - `@types/pako ^2` — latest 3.0.0 is a deprecated stub ("pako provides its own
     type definitions" — pako 3 only); moves with the pako hold, stays 2.0.4.
   - `typescript ~6.0.3` — typescript-eslint peer range caps at `<6.1.0`; bump with it.
-  - `compatibility_date 2026-10-19` — newest date the pinned workerd/miniflare
+  - `compatibility_date 2026-10-23` — newest date the pinned workerd/miniflare
     supports; raise it together with wrangler updates (see wrangler.jsonc comment).
   - `@cloudflare/workers-types ^5.20261025.1` — daily-types package kept at latest
     stable; each fresh version is younger than pnpm's release-age gate, so the
     upgrade adds a `minimumReleaseAgeExclude` entry to pnpm-workspace.yaml.
-  - transitive `miniflare 5.20261019.2-beta` (+ `unenv 2.0.0-rc.24`,
+  - transitive `miniflare 5.20261023.0-beta` (+ `unenv 2.0.0-rc.24`,
     `youch 4.1.0-beta.10`) — upstream's coordinated EXACT pin inside
     wrangler/vite-plugin/vitest-plugin; no stable 5.x exists and forcing 4.x
     mismatches our compatibility_date's workerd. Dev-only, outside the

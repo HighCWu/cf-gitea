@@ -55,6 +55,22 @@ function findInStore(prefix, sub) {
 const esbuildUrl = pathToFileURL(findInStore("esbuild@", "esbuild/lib/main.js")).href;
 const miniflareUrl = pathToFileURL(findInStore("miniflare@5.", "miniflare/dist/src/index.js")).href;
 
+// The repo's compatibility_date, read from apps/worker/wrangler.jsonc (the
+// gitignored real config; the committed example is the fallback on a fresh
+// clone before `pnpm setup:deploy`) — the runtime under test is exactly the
+// dev server's, so the date must FOLLOW the config, never a hardcoded literal
+// (a stale literal silently pins a different runtime than `pnpm dev` runs;
+// the RD25 bump drifted exactly this way — fixed 2026-10-29).
+function readCompatibilityDate() {
+  for (const file of ["wrangler.jsonc", "wrangler.jsonc.example"]) {
+    const text = readFileSync(join(REPO_ROOT, "apps", "worker", file), "utf8");
+    const hit = text.match(/"compatibility_date"\s*:\s*"([^"]+)"/);
+    if (hit) return hit[1];
+  }
+  throw new Error("cannot read compatibility_date from apps/worker/wrangler.jsonc{,.example}");
+}
+const compatibilityDate = readCompatibilityDate();
+
 // The engine the check runs is THIS tree's source, bundled for workerd by
 // esbuild (workerd does not parse TS).
 const scratch = mkdtempSync(join(tmpdir(), "check-delete-husk-"));
@@ -126,9 +142,9 @@ function makeMf() {
           name: "check-delete-husk",
           script,
           modules: true,
-          // the repo's compatibility_date (apps/worker/wrangler.jsonc) — the
-          // runtime under test is exactly the dev server's
-          compatibilityDate: "2026-10-19",
+          // read from apps/worker/wrangler.jsonc above — the runtime under
+          // test is exactly the dev server's
+          compatibilityDate,
           durableObjects: {
             REPO: { className: "RepoCell2", useSQLite: true },
             REGISTRY: { className: "Registry", useSQLite: true },

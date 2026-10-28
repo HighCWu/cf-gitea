@@ -9,6 +9,16 @@ and the `wrangler.jsonc` compatibility-date comment.
 
 Registry facts collected 2026-10-28T01:45–02:00Z. pnpm 12.13.0.
 
+> **EXECUTED 2026-10-29 at the RD25 window** (commit 873da29): this census's
+> Window-1 plan landed — `wrangler` 4.152.0 → **4.153.0**, the `miniflare`
+> override 5.20261019.2-beta → **5.20261023.0-beta** (the version wrangler
+> 4.153.0 itself pairs), BOTH `compatibility_date`s 2026-10-19 → **2026-10-23**,
+> plus `hono` 4.13.14, `@cloudflare/vitest-plugin` 1.4.8, `typescript-eslint`
+> 8.72.1, and the workers-types exclude entry moved to 5.20261027.1. The
+> gate-overshoot hazard held: 4.154.0 / 1.4.9 published as predicted and were
+> left for the next window. The census below stays as the 2026-10-28 record;
+> current versions live in `pnpm-lock.yaml` and `AGENTS.md`.
+
 ## 1. How resolution sees versions (method caveat)
 
 pnpm 12's default `minimumReleaseAge` is **1440 minutes (24 h)**: versions younger

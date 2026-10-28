@@ -3,8 +3,9 @@
   "name": "cf-gitea",
   "main": "src/index.ts",
   // Newest date the pinned local runtime supports (AGENTS.md wants today's
-  // date; re-verified 2026-10-25 — wrangler 4.152.0 still pairs miniflare
-  // 5.20261019.2-beta, the newest 5.x build, so no newer date is runnable).
+  // date; re-verified 2026-10-29 — wrangler 4.153.0 pairs miniflare
+  // 5.20261023.0-beta / workerd 1.20261023.1, which runs compatibility
+  // dates only through 2026-10-23, so no newer date is runnable yet).
   // Bump to the current date together with `pnpm update wrangler` +
   // `pnpm install`, then run `wrangler types`.
   "compatibility_date": "2026-10-23",

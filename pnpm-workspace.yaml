@@ -11,7 +11,7 @@ allowBuilds:
 
 # @cloudflare/vitest-pool-workers@0.23.0 pins an older miniflare alpha whose
 # bundled workerd cannot run the project's compatibility_date. Pin every
-# miniflare consumer to the exact version wrangler 4.152.x itself pairs with,
+# miniflare consumer to the exact version wrangler 4.153.x itself pairs with,
 # so `vite dev`, `vite build`, and `vitest` all run the same runtime.
 minimumReleaseAgeExclude:
   - "@cloudflare/workers-types@5.20261027.1"
