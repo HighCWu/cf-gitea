@@ -495,3 +495,85 @@ headline stands), and the ws1009 residuals stand as written — the gate ran
 clean at REDEPLOY22's tree, and the fix wave's own landing gate surfaced
 exactly three ripples (`bd6d257`: the migrate format's two stale pins + the
 date-rolled admin golden).
+
+**Appended 2026-10-28 (HEAD `7c3b7c4`) — the fifth addendum: the wave-130
+ledger lands, RD23 ships the fix wave, the perf wave opens.** The five-review
+sweep (git-http / services / api / engine / auth) closed with its scoreboard
+committed (`6165474`): **37 SUSPECT findings, resolved as 30 landed (L1–L30,
+each with its commit) + 7 deliberate keeps (K1–K7, each verified against
+upstream source and documented)** — `docs/reviews/wave-130-parity-review.md`
+is the authority for every number in this paragraph, quoted not re-counted.
+The fix wave's gold, one line each per the scoreboard's ledger: **PR head-ref
+sync** (`140fc0b` — pushes move `refs/pull/N/head` through a standalone
+post-commit CAS off the onPush fan-out; merges stop operating on stale code
+after a second push), **resolveNamedRef strictness** (`5539eb9` — the
+existence-oracle `fallbackDefault` param deleted outright after the
+8-consumer verdict table showed all strict, zero legitimate defaults), **the
+org revoke team-grant sweep** (`84da8f8` — `removeMember` revokes team grants
+behind the last-owner guard; `deleteOrg` sweeps the team tables child-first),
+**the issue delete cascade sweep** (`d5b111d` — upstream's full DeleteBeans
+set, all seven tier-2 tables + their R2 objects, storage-first and
+retryable), **session rotation with the remember-cookie re-set** (`28df818` —
+all three rotation sites wrap through `sessionSetCookie` with the row's
+remember bit, the persistence decision carried by migration 0035), **the
+user-visibility ladder** (`3f48b74` — the upstream-exact
+`IsUserVisibleToViewer` reduction, limited → ANY signed-in; invisible users
+fake-404 byte-identical to a miss), **sudo mounted public-only** (`32eaa73` —
+upstream's own tree-wrap mounted cite-for-cite with the public-only family
+wired the same way, never blanket-applied), and the **GPG verify
+minute-boundary guard** (`50880b2` — ≥55 s of slack under the RSA-sign chain;
+found by the review wave's own verdict runs). The keeps stand documented (K1
+in SPEC-0004 §2.4, K3/K4/K5 in SPEC-0002 §4.6 #13–15, K2 in `3d5c9d0`, K6/K7
+in `32eaa73`'s placement table).
+
+**RD23 shipped the fix wave.** Migration **0035 `spooky_galactus`** applied
+remote — the fourth addendum's "rides the NEXT deploy window" honored, and
+the window's only schema change. The probe toolkit gained its **10th battery,
+fixwave-parity** (`29e3a43`): 22 checks over the fix wave's live shapes
+(PR-sync head movement + mergeable re-resolve, merged-412 verbatim,
+strict-ghost 404, tag-only push-create survival, the visibility ladder, sudo
+impersonate/403, the org revoke with its `fw-org-member-preaccess`
+discriminator arm, the session-rotation directive + adopted-cookie
+round-trip via the toolkit's first D1-write helper), with the README's
+battery list brought current for all 10 (`f963ef8`). Its live smoke against
+the standing deploy read **20/1** — every fix-wave arm already green, the one
+red being the pending org-grant deploy (quoted from `29e3a43`). Per the
+orchestrator's deploy record — its evidence block had not landed at append
+time, so these are quoted as given, not re-measured — RD23 deployed worker
+version **`a54c6adb`** with the battery at **112 passed / 1**, the 1 being
+the run-PAT audit item deleted at wrap close (the RD21/RD22 pattern).
+
+**ws1009: filed upstream, watched, not ours.** The filed issue
+(cloudflare/workers-sdk#16515, `640005b` — the v1.2 cut point itself) carries
+the warm-payload mechanism our strip lever routed around (`9e70af5` +
+`2534ca1`: sourcemap bytes stripped from the warm modules — deaths
+**204 → 0**, **−21.66 MB**, both quoted from §1 above); the community
+**PR #16523** proposes the upstream chunked-warm-module-frames fix (16 MiB
+frame budget, ordered envelopes, reassembly before parse) — bot-closed under
+the unvouched-collaborator policy 2026-10-27, pending maintainer triage;
+ADR-0006's revisit trigger #2 stays armed.
+
+**The perf wave opens** (`29e3a43` → `7c3b7c4`, this addendum's tree delta):
+migration **0036 `fantastic_whirlwind`** (`b04a465`) lays **10 hot-path
+indexes** — the labels repo/org pair, reactions' issue/comment/release
+composite, the issues list page's filter+order composite, milestones,
+repositories owner_id, the two poster heatmap composites (issues' is
+COVERING, index-only), the action repo-feed order, `issue_subscriptions`
+(issue) — upstream-matched where an upstream index exists, divergences
+documented at each, with the **always-on rows_read witness** in `bench-d1`:
+**reactions target 250 → 6, the issues list page 480 → 30, subscriptions
+200 → 3** (quoted from `b04a465`; EXPLAIN asserts the plan per shape).
+Matrix batch fifteen (`7c3b7c47`) pinned the fix wave's route-level seams
+from the user side — **133/133** across the four suites (PR-head sync through
+the real gate composition, the sudo seam from both sides, the org revoke's UI
+half; the user-visibility UI half and the compare-empty page arm verified
+already pinned, no gap).
+
+**PENDING — the orchestrator finalizes these lines after the deploy
+freezes:** migration **0037** (the P2 sweep + the verified-dead drops; not
+yet in tree) and **RD24** (payload **0036 + 0037**; verdict arm
+**`fw-org-member-preaccess`** — the fixwave battery's post-deploy
+discriminator, `scripts/deploy-probes.mjs`). §4 re-check: no line retired —
+0036 is index-only (the 65-table count stands; 0036 and 0037 ride RD24),
+`check-openapi` PASS at `b04a465` keeps the 64-op FEATURE-ABSENT ceiling
+intact, and the ws1009 residuals line stands as written.
