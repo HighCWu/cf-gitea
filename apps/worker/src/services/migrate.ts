@@ -116,11 +116,12 @@ export interface MigrateOutcome {
 }
 
 /**
- * Resolve the target owner the way upstream migrate.go:82-99 does:
+ * Resolve the target owner the way upstream migrate.go:60-99 does:
  * `repo_owner` (name) first, then `uid`, then the doer; a non-admin doer may
  * target themself or an org they OWN — anything else is upstream's exact 403
- * texts. Unknown owners are upstream's 422 (`user does not exist [name: x]`,
- * the ErrUserNotExist.Error() text APIError'd verbatim).
+ * texts. Unknown owners are upstream's 422 (migrate.go:72-75 APIErrors the
+ * ErrUserNotExist.Error() text verbatim — user.go:50-52 renders
+ * `[uid: %d, name: %s]`, UID unset = 0 for the name lookup).
  */
 export async function resolveMigrateOwner(
   db: D1Database,
@@ -131,12 +132,14 @@ export async function resolveMigrateOwner(
   if (options.repo_owner !== undefined && options.repo_owner !== "") {
     owner = await findUserByName(db, options.repo_owner);
     if (owner === null) {
-      throw new ApiError(422, `user does not exist [name: ${options.repo_owner}]`);
+      throw new ApiError(422, `user does not exist [uid: 0, name: ${options.repo_owner}]`);
     }
   } else if (options.uid !== undefined) {
     owner = (await drizzle(db).select().from(users).where(eq(users.id, options.uid)).get()) ?? null;
     if (owner === null) {
-      throw new ApiError(422, `user does not exist [id: ${options.uid}]`);
+      // GetUserByID's miss (user.go:1037) renders ErrUserNotExist{UID: id}
+      // with Name unset — Go's %s of "" keeps the trailing `name: `.
+      throw new ApiError(422, `user does not exist [uid: ${options.uid}, name: ]`);
     }
   } else {
     owner = (await drizzle(db).select().from(users).where(eq(users.id, doer.id)).get()) ?? null;

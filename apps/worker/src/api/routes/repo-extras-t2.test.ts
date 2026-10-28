@@ -392,7 +392,9 @@ describe("GET /repos/.../collaborators/{collaborator}/permission (repo-extras-t2
     const ghost = await send(`${REPO_PATH}/collaborators/ghost/permission`, authed());
     expect(ghost.status).toBe(404);
     const ghostBody: { message: string } = await ghost.json();
-    expect(ghostBody.message).toBe("user does not exist [name: ghost]");
+    // collaborators.go:282-288 — APIError(404, ErrUserNotExist.Error()) with
+    // the user.go:50-52 `[uid: %d, name: %s]` render, UID unset = 0.
+    expect(ghostBody.message).toBe("user does not exist [uid: 0, name: ghost]");
   });
 
   it("403s uninvolved users who are not querying themselves (repo-admin gate)", async () => {
@@ -417,7 +419,9 @@ describe("GET /repos/.../assignees/{assignee} (repo-extras-t2)", () => {
     const ghost = await send(`${REPO_PATH}/assignees/ghost`, authed());
     expect(ghost.status).toBe(404);
     const ghostBody: { message: string } = await ghost.json();
-    expect(ghostBody.message).toBe("user does not exist [name: ghost]");
+    // checkAssignableUser (issue_assignee.go:164-169) — APIErrorAuto of
+    // ErrUserNotExist, the same `[uid: 0, name: X]` render.
+    expect(ghostBody.message).toBe("user does not exist [uid: 0, name: ghost]");
     expect((await send(`${REPO_PATH}/assignees/neighbor`)).status).toBe(401); // reqToken
   });
 });

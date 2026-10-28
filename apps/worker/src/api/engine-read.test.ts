@@ -491,6 +491,16 @@ describe("contents reads (repoGetContentsList / repoGetContents) — the union s
       message: "object does not exist [id: , rel_path: no-such]",
       url: `${ORIGIN}/api/swagger`,
     });
+
+    // A BLOB at an intermediate segment (a file where a dir is expected) is
+    // the getTree default arm (modules/git/repo_tree.go:125-129): ErrNotExist
+    // carries the blob's oid with rel_path unset — `rel_path: ` empty.
+    const underBlob = await get(`${REPO_PATH}/contents/README.md/deep.txt`);
+    expect(underBlob.status).toBe(404);
+    expect(await underBlob.json()).toEqual({
+      message: `object does not exist [id: ${fileBody.sha as string}, rel_path: ]`,
+      url: `${ORIGIN}/api/swagger`,
+    });
   });
 
   it("resolves the ?ref= param (branch and tag)", async () => {

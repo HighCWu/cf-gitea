@@ -501,6 +501,45 @@ describe("GET /repos/{owner}/{repo}/issues (issueListIssues)", () => {
     expect(await unknownCase.json()).toEqual({ message: "user does not exist [uid: 0, name: Ghost]", url: ERROR_URL });
   });
 
+  it("resolves assigned_by/mentioned_by — unknown users 404, known users match the empty set", async () => {
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("Bob");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    await seedIssue(repoId, "by alice", { posterId: owner.id });
+
+    // No assignee/mention tracking exists, so a RESOLVED user matches the
+    // empty set — but the resolution itself still runs upstream's
+    // getUserIDForFilter (repo/issue.go:402-406) before any filtering.
+    const known = await router()("/repos/alice/visible/issues?assigned_by=BOB&mentioned_by=Bob");
+    expect(known.status).toBe(200);
+    expect(await known.json<unknown[]>()).toEqual([]);
+
+    // Unknown logins short-circuit with the ErrUserNotExist 404 —
+    // assigned_by first, then mentioned_by (upstream's resolution order).
+    const unknownAssigned = await router()("/repos/alice/visible/issues?assigned_by=ghost");
+    expect(unknownAssigned.status).toBe(404);
+    expect(await unknownAssigned.json()).toEqual({
+      message: "user does not exist [uid: 0, name: ghost]",
+      url: ERROR_URL,
+    });
+
+    const unknownMentioned = await router()("/repos/alice/visible/issues?mentioned_by=ghost");
+    expect(unknownMentioned.status).toBe(404);
+    expect(await unknownMentioned.json()).toEqual({
+      message: "user does not exist [uid: 0, name: ghost]",
+      url: ERROR_URL,
+    });
+
+    // created_by wins the poster filter; a later unknown assigned_by still
+    // 404s even though the list could already be scoped.
+    const mixed = await router()(`/repos/alice/visible/issues?created_by=${neighbor.usernameLower}&assigned_by=ghost`);
+    expect(mixed.status).toBe(404);
+    expect(await mixed.json()).toEqual({
+      message: "user does not exist [uid: 0, name: ghost]",
+      url: ERROR_URL,
+    });
+  });
+
   it("404s an invisible repository", async () => {
     await seedUser("Alice");
     const res = await router()("/repos/alice/ghost/issues");

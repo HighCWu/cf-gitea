@@ -541,7 +541,9 @@ describe("POST /repos/migrate — ACL and validation arms", () => {
 
     const ghost = await postMigrate(migrateBody({ mirror: true, repo_owner: "ghost" }));
     expect(ghost.status).toBe(422);
-    expect(((await ghost.json<{ message: string }>())).message).toBe("user does not exist [name: ghost]");
+    // migrate.go:72-75 APIErrors ErrUserNotExist.Error() verbatim — the
+    // user.go:50-52 `[uid: %d, name: %s]` render with UID unset = 0.
+    expect(((await ghost.json<{ message: string }>())).message).toBe("user does not exist [uid: 0, name: ghost]");
     expect(await createdEmissions()).toHaveLength(0);
   });
 
@@ -622,6 +624,11 @@ describe("POST /repos/migrate — ACL and validation arms", () => {
     // uid of another plain user + non-admin doer → the same 403 family.
     const denied = await postMigrate(migrateBody({ mirror: true, uid: other.id }));
     expect(denied.status).toBe(403);
+    // An unknown uid is GetUserByID's ErrUserNotExist{UID: id} — the Go
+    // render keeps the empty Name (`[uid: 404, name: ]`), still 422.
+    const ghost = await postMigrate(migrateBody({ mirror: true, uid: 404 }));
+    expect(ghost.status).toBe(422);
+    expect(((await ghost.json<{ message: string }>())).message).toBe("user does not exist [uid: 404, name: ]");
     // The doer's own uid → born.
     const ok = await postMigrate(migrateBody({ mirror: true, repo_name: "by-uid", uid: doerId }));
     expect(ok.status).toBe(201);

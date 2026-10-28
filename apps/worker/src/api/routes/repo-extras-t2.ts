@@ -41,6 +41,7 @@ import {
   type Viewer,
 } from "../services/repository";
 import { canWriteRepository, isRepositoryAdmin, requireVisibleRepo } from "../services/repo-access";
+import { userNotExistError } from "../services/issues";
 import { lastCommitForPath } from "../services/contents";
 import { refMissError, treeEntryMissError } from "./contents";
 import { toApiCommit, toContentsEntry, usernamesByEmail } from "../services/git-models";
@@ -256,11 +257,6 @@ type RepoPair = RepositoryWithOwner;
 function doerOf(c: Context<ApiEnv>): { id: number; isAdmin: boolean; login: string | null } {
   const doer = c.get("authUser");
   return { id: doer?.id ?? 0, isAdmin: doer?.is_admin === true, login: doer?.login ?? null };
-}
-
-/** The upstream "user does not exist [name: x]" message (user_model.ErrUserNotExist). */
-function userNotExistError(name: string): ApiError {
-  return new ApiError(404, `user does not exist [name: ${name}]`);
 }
 
 async function userById(d1: D1Database, id: number) {

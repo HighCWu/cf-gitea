@@ -921,19 +921,30 @@ export function registerIssueRoutes(
     const before = parseQueryTime(url.searchParams.get("before"));
     const listOptions = parseListOptions(url);
 
-    // created_by → poster filter; unknown login is the upstream 404
-    // (getUserIDForFilter → APIErrorAuto(ErrUserNotExist)).
+    // created_by/assigned_by/mentioned_by all resolve through
+    // getUserIDForFilter (routers/api/v1/repo/issue.go:398-406, 469-479):
+    // an unknown login is the APIErrorAuto(ErrUserNotExist) 404, resolved in
+    // upstream's order (created → assigned → mentioned).
     let posterId: number | null | undefined;
-    const createdBy = (url.searchParams.get("created_by") ?? "").trim();
-    if (createdBy !== "") {
-      posterId = await userIdForFilter(c.env.DB, createdBy);
-      if (posterId === null) {
-        throw userNotExistError(createdBy);
+    // assigned_by/mentioned_by: no assignee/mention tracking exists yet, so
+    // a RESOLVED user still matches the empty set (upstream's indexer filter
+    // AssignedUserID/MentionedUserID finds nothing) — only the unknown-login
+    // 404 above is observable today.
+    let matchesEmpty = false;
+    for (const filter of ["created_by", "assigned_by", "mentioned_by"] as const) {
+      const name = (url.searchParams.get(filter) ?? "").trim();
+      if (name === "") continue;
+      const id = await userIdForFilter(c.env.DB, name);
+      if (id === null) {
+        throw userNotExistError(name);
+      }
+      if (filter === "created_by") {
+        posterId = id;
+      } else {
+        matchesEmpty = true;
       }
     }
-    // assigned_by/mentioned_by: no assignee/mention tracking exists yet, so
-    // the filters match the empty set (upstream filters the same empty set).
-    if ((url.searchParams.get("assigned_by") ?? "").trim() !== "" || (url.searchParams.get("mentioned_by") ?? "").trim() !== "") {
+    if (matchesEmpty) {
       posterId = -1;
     }
 
