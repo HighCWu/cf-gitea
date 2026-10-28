@@ -101,6 +101,26 @@ export async function findPullRequestByIndex(d1: D1Database, repoId: string, ind
 }
 
 /**
+ * The batch twin of `findPullRequestByIndex` for the pinned-pulls list (the
+ * M-grade list batching's one genuinely new read): ONE select for the page's
+ * PR rows on the exact per-row predicate (`base_repo_id` + `index IN …`),
+ * keyed by index — an index with no PR row is absent from the map, rendering
+ * exactly like the per-row null (the route's missing-pair skip). An empty
+ * page skips to zero statements.
+ */
+export async function findPullRequestsByIndices(d1: D1Database, repoId: string, indices: number[]): Promise<Map<number, PullRequestRow>> {
+  if (indices.length === 0) {
+    return new Map();
+  }
+  const rows = await drizzle(d1)
+    .select()
+    .from(pullRequests)
+    .where(and(eq(pullRequests.baseRepoId, repoId), inArray(pullRequests.index, indices)))
+    .all();
+  return new Map(rows.map((row) => [row.index, row]));
+}
+
+/**
  * `GetPullRequestByBaseHeadInfo` — pure D1 lookup on the base/head columns.
  * `headRepoId` resolves from the fork-form `owner[:name]:branch` head (the
  * route's job); same-repo lookups pass the base repo id.

@@ -35,7 +35,7 @@ import {
   apiUserFromRow,
   canViewRepositoryWithTeams,
   findRepositoryByPath,
-  findRepositoryById,
+  findRepositoriesByIds,
   findUserByName,
   viewerOf,
 } from "../services/repository";
@@ -44,7 +44,9 @@ import {
   findIssueByRepoAndIndex,
   issueErrorToApiError,
   parseQueryTime,
+  prefetchIssueRenderContext,
   toApiIssue,
+  type IssueRenderContext,
 } from "../services/issues";
 
 /**
@@ -1197,24 +1199,59 @@ async function edgeIssueRows(d1: D1Database, ids: number[], homeRepoId: string):
 }
 
 /**
+ * The batched render inputs for the dependency/block lists (the M-grade list
+ * batching's tier-2 adoption): the page's FOREIGN repo pairs (same-repo rows
+ * render on `found` — no read), one grant verdict per distinct foreign repo
+ * (the per-row `canViewRepositoryWithTeams` is deterministic per repo, so a
+ * distinct-id map is exact), and the issue context. A foreign repo with no
+ * joined owner row is absent from `pairs` — rendered exactly like the
+ * per-row `findRepositoryById` null (the fall-through to the redaction).
+ */
+interface BlockerRenderBatch {
+  pairs: Map<string, RepositoryWithOwner>;
+  canView: Map<string, boolean>;
+  context: IssueRenderContext;
+}
+
+async function prepareBlockerBatch(
+  d1: D1Database,
+  viewer: Viewer,
+  found: RepositoryWithOwner,
+  rows: EdgeEntry[],
+): Promise<BlockerRenderBatch> {
+  const foreignIds = [...new Set(rows.flatMap((row) => (row.repo.id === found.repo.id ? [] : [row.repo.id])))];
+  const pairs = await findRepositoriesByIds(d1, foreignIds);
+  const canView = new Map<string, boolean>();
+  await Promise.all(
+    [...pairs.values()].map(async (pair) => {
+      canView.set(pair.repo.id, await canViewRepositoryWithTeams(d1, viewer, pair.repo));
+    }),
+  );
+  const context = await prefetchIssueRenderContext(d1, rows.map((row) => row.issue));
+  return { pairs, canView, context };
+}
+
+/**
  * One dependency-list entry: same-repo or foreign-readable → the full
  * issue; foreign-unreadable → the header-notes redaction (HIDDEN for
- * non-writers, the confidential subset for writers).
+ * non-writers, the confidential subset for writers). Reads come from the
+ * page-scoped `prepareBlockerBatch` maps — 0 per-row statements.
  */
 async function renderBlocker(
-  c: Context<ApiEnv>,
+  d1: D1Database,
   viewer: Viewer,
   found: RepositoryWithOwner,
   row: EdgeEntry,
   canWrite: boolean,
+  batch: BlockerRenderBatch,
 ): Promise<Issue> {
   if (row.repo.id === found.repo.id) {
-    return toApiIssue(c.env.DB, viewer, found, row.issue);
+    return toApiIssue(d1, viewer, found, row.issue, { context: batch.context });
   }
-  if (await canViewRepositoryWithTeams(c.env.DB, viewer, row.repo)) {
-    const pair = await findRepositoryById(c.env.DB, row.repo.id);
-    if (pair !== null) {
-      return toApiIssue(c.env.DB, viewer, pair, row.issue);
+  if (batch.canView.get(row.repo.id) === true) {
+    const pair = batch.pairs.get(row.repo.id);
+    if (pair !== undefined) {
+      return toApiIssue(d1, viewer, pair, row.issue, { context: batch.context });
     }
   }
   if (canWrite) {
@@ -1371,9 +1408,11 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     const { page, limit } = parseListOptions(new URL(c.req.url));
     setPaginationHeaders(c, rows.length, { page, limit });
     const canWrite = await canWriteRepository(c, found);
+    const pageRows = rows.slice((page - 1) * limit, page * limit);
+    const batch = await prepareBlockerBatch(c.env.DB, viewer, found, pageRows);
     const rendered: Issue[] = [];
-    for (const row of rows.slice((page - 1) * limit, page * limit)) {
-      rendered.push(await renderBlocker(c, viewer, found, row, canWrite));
+    for (const row of pageRows) {
+      rendered.push(await renderBlocker(c.env.DB, viewer, found, row, canWrite, batch));
     }
     return c.json(rendered, 200);
   });
@@ -1418,17 +1457,21 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const rows = await blockedRows(c.env.DB, issue);
     const { page, limit } = parseListOptions(new URL(c.req.url));
+    const pageRows = rows.slice((page - 1) * limit, page * limit);
+    const batch = await prepareBlockerBatch(c.env.DB, viewer, found, pageRows);
     const rendered: Issue[] = [];
-    for (const row of rows.slice((page - 1) * limit, page * limit)) {
-      // Upstream SKIPS unreadable foreign blockers here (no redaction).
-      if (row.repo.id !== found.repo.id && !(await canViewRepositoryWithTeams(c.env.DB, viewer, row.repo))) {
+    for (const row of pageRows) {
+      // Upstream SKIPS unreadable foreign blockers here (no redaction); the
+      // batched verdicts render the per-row skip verbatim — an absent pair
+      // (the per-row findRepositoryById null) skips too.
+      if (row.repo.id !== found.repo.id && batch.canView.get(row.repo.id) !== true) {
         continue;
       }
-      const pair = row.repo.id === found.repo.id ? found : await findRepositoryById(c.env.DB, row.repo.id);
-      if (pair === null) {
+      const pair = row.repo.id === found.repo.id ? found : batch.pairs.get(row.repo.id);
+      if (pair === undefined) {
         continue;
       }
-      rendered.push(await toApiIssue(c.env.DB, viewer, pair, row.issue));
+      rendered.push(await toApiIssue(c.env.DB, viewer, pair, row.issue, { context: batch.context }));
     }
     return c.json(rendered, 200);
   });
@@ -1603,11 +1646,16 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
       .orderBy(asc(trackedTimes.id))
       .all();
     setPaginationHeaders(c, rows.length, { page, limit });
+    // Every row embeds the SAME path issue — the per-row render paid the
+    // full enrichment read set PER TIME ROW. The page context prefetches it
+    // once (the arms that miss on this issue skip to zero statements), so
+    // the render is map-lookups only.
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, [issue]);
     const rendered = await Promise.all(
       rows.slice((page - 1) * limit, page * limit).map(async (row) => ({
         id: row.time.id,
         issue_id: row.time.issueId,
-        issue: await toApiIssue(c.env.DB, viewer, found, issue),
+        issue: await toApiIssue(c.env.DB, viewer, found, issue, { context: renderContext }),
         time: row.time.seconds,
         created: isoOrGoZero(row.time.createdAt),
         user_id: row.time.userId,

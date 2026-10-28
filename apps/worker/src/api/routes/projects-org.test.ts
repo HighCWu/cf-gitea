@@ -28,8 +28,11 @@ import { drizzle } from "drizzle-orm/d1";
 
 import {
   comments,
+  issueLabels,
+  issuePins,
   issues,
   labels,
+  milestones,
   orgMembers,
   projectColumns,
   projectIssues,
@@ -45,6 +48,7 @@ import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type Auth
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
+import { registerIssueRoutes } from "./issues";
 import { registerProjectsOrgRoutes } from "./projects-org";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 
@@ -58,6 +62,8 @@ beforeEach(async () => {
     "project_columns",
     "projects",
     "issue_labels",
+    "issue_pins",
+    "milestones",
     "issues",
     "labels",
     "team_repo_access",
@@ -823,5 +829,109 @@ describe("workflows: the org-owner manage gate + CRUD", () => {
     const del = await send(`${base}/${body.id}`, { method: "DELETE", headers: authHeaders(s.owner.id) });
     expect(del.status).toBe(204);
     expect(await db().select().from(projectWorkflows).where(eq(projectWorkflows.id, body.id)).all()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A2/A6, tier-2
+// adoption) — the org column-issue list rendered its enrichment selects PER
+// ROW; the page now prefetches one inArray read per entity kind through
+// toApiIssue's preload, with the pairsById map serving the cross-repo rows.
+// Metering: the prepare()-counting D1 wrapper riding app.fetch's env.
+// ---------------------------------------------------------------------------
+
+/** prepare()-counting D1 wrapper: every drizzle statement enters through one
+ *  prepare() call. Scoped to the requests that pass the returned env. */
+function countedD1(): { db: D1Database; count: () => number } {
+  let statements = 0;
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    return env.DB.prepare(query);
+  };
+  return { db: wrapper, count: () => statements };
+}
+
+describe("org column-issues list query-shape witness (query-shape-audit A2/A6, tier-2)", () => {
+  it("renders the cross-repo column page with a constant statement count, deep-equal to the per-row single GETs", async () => {
+    const s = await seedOrgAndActors("witness");
+    const orgRepo = await seedOrgRepo(s.org, "lib");
+    const orgPrivate = await seedOrgRepo(s.org, "vault", { visibility: "private" });
+    const poster2 = await seedUser("o-poster2");
+    const bug = await db()
+      .insert(labels)
+      .values({ repoId: orgRepo, name: "bug", color: "#00aabb", description: "", numIssues: 0, numClosedIssues: 0 })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const ui = await db()
+      .insert(labels)
+      .values({ repoId: orgRepo, name: "ui", color: "#00ccdd", description: "", numIssues: 0, numClosedIssues: 0 })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const v1 = await db()
+      .insert(milestones)
+      .values({ repoId: orgRepo, name: "v1", content: "", createdAt: NOW, updatedAt: NOW })
+      .returning({ id: milestones.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const first = await seedIssue(orgRepo, 1, { posterId: s.owner.id, milestoneId: v1 });
+    const second = await seedIssue(orgRepo, 2, { posterId: poster2.id });
+    const privIssue = await seedIssue(orgPrivate, 1); // null poster, another repo
+    await db().insert(issueLabels).values([
+      { issueId: first.id, labelId: bug },
+      { issueId: first.id, labelId: ui },
+      { issueId: second.id, labelId: ui },
+      { issueId: second.id, labelId: bug },
+    ]);
+    const project = await seedOrgProject(s.org.id, s.owner.id);
+    const column = await seedColumn(project.id, { title: "Backlog", isDefault: true });
+    for (const issue of [first, second, privIssue]) {
+      await seedMembership(issue.id, project.id, column.id);
+    }
+    await db().insert(issuePins).values({ issueId: first.id, repoId: orgRepo, pinOrder: 2 });
+
+    // The tier-1 issue routes mount beside the org family so the per-row
+    // single GETs (private repo included — the owner bridge reads it) sit
+    // next to the batched list render.
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerProjectsOrgRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    registerIssueRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    const send = async (path: string, init?: RequestInit, dbOverride?: D1Database): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, init), { ...env, DB: dbOverride ?? env.DB });
+
+    const meter = countedD1();
+    const listRes = await send(`/orgs/${s.org.username}/projects/${project.id}/columns/${column.id}/issues`, {
+      headers: authHeaders(s.owner.id),
+    }, meter.db);
+    expect(listRes.status).toBe(200);
+    const list = await listRes.json<Array<Record<string, unknown> & { number: number; labels: Array<{ name: string }>; repository: { full_name: string } }>>();
+    expect(list).toHaveLength(3); // both org repos through the owner bridge
+    expect(list.map((item) => item.repository.full_name).sort()).toEqual([`${s.org.username}/lib`, `${s.org.username}/lib`, `${s.org.username}/vault`]);
+    const count = meter.count();
+    // Post-fix: the route's fixed prefix (org resolve + grant + visible
+    // repos + project + column + membership + count + page) + 5 prefetch
+    // arms — page-INDEPENDENT. The pre-fix shape added N×(1 poster + 1
+    // labels + 1 pin + 1 milestone) = 12 at this N=3; the bound below fails
+    // if any per-row fan returns (each row's 3 reads alone exceed it).
+    expect(count).toBeLessThanOrEqual(20);
+    expect(count).toBeLessThan(21);
+
+    // Contract discipline: every batched render is deep-equal to the
+    // per-row single GET of ITS repo (per-repo indexes, one per repo pair).
+    for (const [repoSlug, index] of [
+      ["lib", first.index],
+      ["lib", second.index],
+      ["vault", privIssue.index],
+    ] as const) {
+      const singleRes = await send(`/repos/${s.org.username}/${repoSlug}/issues/${index}`, { headers: authHeaders(s.owner.id) });
+      expect(singleRes.status).toBe(200);
+      const single = await singleRes.json<Record<string, unknown>>();
+      expect(single).toEqual(list.find((item) => item.number === index && item.repository.full_name === `${s.org.username}/${repoSlug}`));
+    }
+    expect(list.find((item) => item.repository.full_name === `${s.org.username}/vault`)?.user).toBeNull();
+    expect(list.find((item) => item.number === 2)?.labels.map((l: { name: string }) => l.name)).toEqual(["bug", "ui"]);
   });
 });

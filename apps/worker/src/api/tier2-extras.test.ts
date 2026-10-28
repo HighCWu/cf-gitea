@@ -21,7 +21,7 @@ import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { comments, issues, reactions, repositories, users, webhookDeliveries } from "../db/schema";
+import { comments, issueLabels, issuePins, issues, labels, milestones, pullRequests, reactions, repositories, users, webhookDeliveries } from "../db/schema";
 import {
   createOptionalTokenAuthMiddleware,
   createStubAuthResolver,
@@ -30,7 +30,10 @@ import {
 } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
+import { registerIssueRoutes } from "./routes/issues";
 import { registerIssueT2Routes } from "./routes/issue-t2";
+import { findRepositoryByPath, type Viewer } from "./services/repository";
+import { toApiPullRequest } from "./services/pulls";
 import { registerHookDeliveryRoute } from "./routes/hook-delivery";
 import { registerSocialT2Routes } from "./routes/social-t2";
 import { registerTopicItemRoutes } from "./routes/topic-items";
@@ -543,3 +546,140 @@ async function pullRowId(): Promise<number> {
   }
   return row.issueId;
 }
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A2/A3, tier-2
+// adoption) — the pinned lists rendered their enrichment selects PER ROW
+// (issues: poster/label/pin/milestone; pulls: one findPullRequestByIndex per
+// row + the same enrichment fan). Both now prefetch one inArray read per
+// entity kind (the pulls list also fetches the page's PR rows in ONE select
+// on the exact per-row predicate). Metering: the prepare()-counting D1
+// wrapper riding app.fetch's env, route-level.
+// ---------------------------------------------------------------------------
+
+/** prepare()-counting D1 wrapper: every drizzle statement enters through one
+ *  prepare() call. Scoped to the requests that pass the returned env. */
+function countedD1(): { db: D1Database; count: () => number } {
+  let statements = 0;
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    return env.DB.prepare(query);
+  };
+  return { db: wrapper, count: () => statements };
+}
+
+describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", () => {
+  it("renders both pinned lists with a constant statement count, deep-equal to the per-row renders", async () => {
+    // Enrichment shapes across the page: a second poster (the neighbor), a
+    // two-label attachment, a real milestone, and pins on BOTH issues plus
+    // both pulls.
+    await drizzle(env.DB).update(issues).set({ posterId: neighborId }).where(eq(issues.id, issueB.id));
+    const bug = await drizzle(env.DB)
+      .insert(labels)
+      .values({ repoId: REPO_ID, name: "bug", color: "#00aabb", description: "", numIssues: 0, numClosedIssues: 0 })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const v1 = await drizzle(env.DB)
+      .insert(milestones)
+      .values({ repoId: REPO_ID, name: "v1", content: "", createdAt: NOW, updatedAt: NOW })
+      .returning({ id: milestones.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    await drizzle(env.DB).insert(issueLabels).values({ issueId: issueA.id, labelId: bug });
+    await drizzle(env.DB).update(issues).set({ milestoneId: v1 }).where(eq(issues.id, issueA.id));
+    // A second pull so the pulls page carries TWO rows (the batch's win is
+    // page-wide; at N=1 the fixed prefetch arms dominate the meter). The
+    // seeded pull's ISSUE id resolves by its known index (pullRowId would be
+    // ambiguous with two pull rows).
+    const service = new IssuesService(env.DB);
+    const secondPull = await service.createPullRequest({
+      repoId: REPO_ID,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "topic-2",
+      title: "seed pull 2",
+      posterId: neighborId,
+    });
+    const seededPullIssueId = await drizzle(env.DB)
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.repoId, REPO_ID), eq(issues.index, pullIndex)))
+      .limit(1)
+      .all()
+      .then((rows) => {
+        const row = rows[0];
+        if (row === undefined) throw new Error("seeded pull issue missing");
+        return row.id;
+      });
+    const secondPullIssueId = secondPull.issue.id;
+    await drizzle(env.DB).insert(issuePins).values([
+      { issueId: issueB.id, repoId: REPO_ID, pinOrder: 1 },
+      { issueId: issueA.id, repoId: REPO_ID, pinOrder: 2 },
+      { issueId: seededPullIssueId, repoId: REPO_ID, pinOrder: 1 },
+      { issueId: secondPullIssueId, repoId: REPO_ID, pinOrder: 2 },
+    ]);
+
+    // The tier-1 issue routes mount beside the family app so the per-row
+    // single-GET renders sit next to the batched list render.
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerIssueT2Routes(app, createTokenAuthMiddleware(resolver()), createOptionalTokenAuthMiddleware(resolver()));
+    registerIssueRoutes(app, createTokenAuthMiddleware(resolver()), createOptionalTokenAuthMiddleware(resolver()));
+    const send = async (path: string, init?: RequestInit, dbOverride?: D1Database): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, init), { ...env, DB: dbOverride ?? env.DB });
+
+    // (a) Pinned ISSUES: 1 repo resolve + 1 pinned page + 4 arms (posters,
+    // labels, pins, milestones — the PR arm skips: no pulls here) = 6,
+    // page-INDEPENDENT. Pre-fix: 2 + N×(1 poster + 1 labels + 1 pin + 1
+    // milestone) = 12 at this N; any returning per-row fan breaks it.
+    const issuesMeter = countedD1();
+    const pinnedRes = await send("/repos/cf-gitea-stub/extras/issues/pinned", undefined, issuesMeter.db);
+    expect(pinnedRes.status).toBe(200);
+    const pinned = await pinnedRes.json<Array<Record<string, unknown> & { number: number }>>();
+    expect(pinned.map((entry) => entry.number)).toEqual([issueB.index, issueA.index]); // pin_order ASC
+    const issuesCount = issuesMeter.count();
+    expect(issuesCount).toBeLessThanOrEqual(8);
+    expect(issuesCount).toBeLessThan(2 * 5);
+    expect(pinned.find((entry) => entry.number === issueA.index)?.user).toMatchObject({ login: "cf-gitea-stub" });
+    expect(pinned.find((entry) => entry.number === issueB.index)?.user).toMatchObject({ login: "neighbor" });
+    expect(pinned.find((entry) => entry.number === issueA.index)?.milestone).not.toBeNull();
+
+    for (const index of [issueA.index, issueB.index]) {
+      const singleRes = await send(`/repos/cf-gitea-stub/extras/issues/${index}`);
+      expect(singleRes.status).toBe(200);
+      expect(await singleRes.json<Record<string, unknown>>()).toEqual(pinned.find((entry) => entry.number === index));
+    }
+
+    // (b) Pinned PULLS: 1 repo resolve + 1 pinned page + 1 PR-rows batch +
+    // 5 issue-side arms + 0 mergers (unmerged) + 0 head repos (same-repo
+    // heads skip) = 8 — page-INDEPENDENT. Pre-fix: 2 + N×(1 pair + 1 poster
+    // + 1 labels + 1 pin) = 12 at this N; any returning per-row fan breaks it.
+    const pullsMeter = countedD1();
+    const pullsRes = await send("/repos/cf-gitea-stub/extras/pulls/pinned", undefined, pullsMeter.db);
+    expect(pullsRes.status).toBe(200);
+    const pinnedPRs = await pullsRes.json<Array<Record<string, unknown> & { number: number }>>();
+    expect(pinnedPRs.map((entry) => entry.number)).toEqual([pullIndex, secondPull.pullRequest.index]);
+    const pullsCount = pullsMeter.count();
+    expect(pullsCount).toBeLessThanOrEqual(9);
+    expect(pullsCount).toBeLessThan(2 * 5);
+
+    // Contract discipline: the batched pulls render is deep-equal to the
+    // unbatched per-row path (mode "list", no extras, on the same rows) —
+    // the landed pulls.test.ts witness shape, replayed through the pinned
+    // route's rows.
+    const pair = await findRepositoryByPath(env.DB, "cf-gitea-stub", "extras");
+    if (pair === null) throw new Error("repo pair missing");
+    const viewer: Viewer = { origin: "https://example.com", requester: null };
+    const rows = await drizzle(env.DB)
+      .select({ issue: issues, pullRequest: pullRequests })
+      .from(pullRequests)
+      .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+      .where(eq(pullRequests.baseRepoId, REPO_ID))
+      .all();
+    const perRow = await Promise.all(rows.map((row) => toApiPullRequest(env.DB, viewer, pair, row.issue, row.pullRequest, "list")));
+    expect(pinnedPRs).toEqual(perRow);
+    expect(pinnedPRs.find((entry) => entry.number === secondPull.pullRequest.index)?.user).toMatchObject({ login: "neighbor" });
+  });
+});

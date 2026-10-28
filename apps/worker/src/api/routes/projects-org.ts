@@ -80,7 +80,7 @@ import {
   type Project,
 } from "../models/project";
 import { issueSchema } from "../models/issue";
-import { toApiIssue } from "../services/issues";
+import { prefetchIssueRenderContext, toApiIssue } from "../services/issues";
 
 /**
  * Tier-1 org-scoped project-board routes (inventory batch 6 stage 2 — the
@@ -1048,14 +1048,17 @@ export function registerProjectsOrgRoutes(
     );
     setPaginationHeaders(c, total, { page, limit });
     const pairsById = new Map(visible.map((pair) => [pair.repo.id, pair]));
-    const rendered = [];
-    for (const issue of items) {
-      const pair = pairsById.get(issue.repoId);
-      if (pair === undefined) {
-        continue; // both sides read the same visible set — defensive only
-      }
-      rendered.push(await toApiIssue(c.env.DB, viewer, pair, issue));
-    }
+    // The M-grade list batching's tier-2 adoption (routes/issues.ts A2/A6
+    // shape): the render parallelizes over the page with the issue context
+    // prefetched once, the invisible-pair skip preserved (both sides read
+    // the same visible set — defensive only); the response shape is unchanged.
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, items);
+    const rendered = await Promise.all(
+      items.flatMap((issue) => {
+        const pair = pairsById.get(issue.repoId);
+        return pair === undefined ? [] : [toApiIssue(c.env.DB, viewer, pair, issue, { context: renderContext })];
+      }),
+    );
     return c.json(rendered, 200);
   });
 

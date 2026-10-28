@@ -44,6 +44,7 @@ import {
 } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
+import { registerIssueRoutes } from "./issues";
 import { registerIssueTablesT2Routes } from "./issue-tables-t2";
 import { IssuesService } from "../../issues/service";
 import { applyRepoExtrasDdl } from "../testing/repo-ddl";
@@ -1003,5 +1004,121 @@ describe("POST assignees: the validateAssignee blocked arm", () => {
     const res = await post(["neighbor"]);
     expect(res.status).toBe(201);
     expect(await drizzle(env.DB).select().from(issueAssignees).all()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A2, tier-2
+// adoption) — the dependency/block lists rendered each row's enrichment
+// fan PER ROW (poster/label/pin per issue + a pair lookup per readable
+// foreign row), and the tracked-times list re-rendered the SAME path issue
+// PER TIME ROW. All three now prepare one page-scoped batch (the issue
+// context + the foreign repo pairs + one grant verdict per distinct foreign
+// repo). Metering: the prepare()-counting D1 wrapper riding app.fetch's env.
+// ---------------------------------------------------------------------------
+
+/** prepare()-counting D1 wrapper: every drizzle statement enters through one
+ *  prepare() call. Scoped to the requests that pass the returned env. */
+function countedD1(): { db: D1Database; count: () => number } {
+  let statements = 0;
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    return env.DB.prepare(query);
+  };
+  return { db: wrapper, count: () => statements };
+}
+
+/** The family app plus the tier-1 issue routes (the per-row single-GET
+ *  renders sit next to the batched list renders). */
+function witnessSend() {
+  const app = new OpenAPIHono<ApiEnv>();
+  app.onError(giteaErrorHandler);
+  registerIssueTablesT2Routes(app, createTokenAuthMiddleware(resolver()), createOptionalTokenAuthMiddleware(resolver()));
+  registerIssueRoutes(app, createTokenAuthMiddleware(resolver()), createOptionalTokenAuthMiddleware(resolver()));
+  return async (path: string, init?: RequestInit, dbOverride?: D1Database): Promise<Response> =>
+    app.fetch(new Request(`https://example.com${path}`, init), { ...env, DB: dbOverride ?? env.DB });
+}
+
+describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/blocks/times)", () => {
+  it("renders dependencies with a constant statement count, deep-equal to the per-row single GETs", async () => {
+    // issueA depends on issueB (same repo) AND issueC (foreign public repo —
+    // the pair-batch arm; the same-repo arm skips the map).
+    await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/dependencies`, authed(jsonBody({ index: issueB.index, owner: "cf-gitea-stub", repo: "writes" })));
+    await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/dependencies`, authed(jsonBody({ index: issueC.index, owner: "cf-gitea-stub", repo: "other" })));
+
+    const metered = witnessSend();
+    const meter = countedD1();
+    const res = await metered(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/dependencies`, undefined, meter.db);
+    expect(res.status).toBe(200);
+    const list = await res.json<Array<Record<string, unknown> & { number: number }>>();
+    expect(list).toHaveLength(2);
+    const count = meter.count();
+    // Post-fix: 1 repo resolve + 1 issue lookup + 2 edge rows (edges +
+    // edge issues+repos batch) + 1 foreign-pair batch + 3 issue-context arms
+    // (posters, labels, pins — milestones/PR arms skip) = 8, page-INDEPENDENT.
+    // Pre-fix: the same 4 + 2×(1 pair + 3 enrichment) = 14 at this N; any
+    // returning per-row fan breaks the bound.
+    expect(count).toBeLessThanOrEqual(10);
+    expect(count).toBeLessThan(11);
+    // The foreign row rendered through the batched pair (full issue wire).
+    expect(list.find((item) => item.number === issueC.index)?.title).toBe("gamma");
+
+    for (const [repoSlug, index] of [
+      ["writes", issueB.index],
+      ["other", issueC.index],
+    ] as const) {
+      const singleRes = await metered(`/repos/cf-gitea-stub/${repoSlug}/issues/${index}`);
+      expect(singleRes.status).toBe(200);
+      expect(await singleRes.json<Record<string, unknown>>()).toEqual(list.find((item) => item.number === index));
+    }
+  });
+
+  it("renders the blocks list and the tracked-times list with a constant statement count", async () => {
+    // The path issue (A) BLOCKS B and C — two rows so the batch's fixed
+    // arms amortize (at N=1 the arm reads dominate the meter).
+    await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/blocks`, authed(jsonBody({ index: issueB.index, owner: "cf-gitea-stub", repo: "writes" })));
+    await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/blocks`, authed(jsonBody({ index: issueC.index, owner: "cf-gitea-stub", repo: "other" })));
+
+    const metered = witnessSend();
+    const blocksMeter = countedD1();
+    const blocksRes = await metered(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/blocks`, undefined, blocksMeter.db);
+    expect(blocksRes.status).toBe(200);
+    const blocks = await blocksRes.json<Array<Record<string, unknown> & { number: number }>>();
+    expect(blocks).toHaveLength(2);
+    const blocksCount = blocksMeter.count();
+    // 1 repo + 1 issue + 3 edge rows (edges + the issues+repos batch) + 1
+    // foreign-pair batch + 3 issue-context arms (posters, labels, pins —
+    // milestone/PR arms skip) = 9, page-INDEPENDENT. Pre-fix: 4 + N×(1 pair
+    // + 3 enrichment) = 14 at this N=2; any returning per-row fan breaks it.
+    expect(blocksCount).toBeLessThanOrEqual(10);
+    expect(blocksCount).toBeLessThan(14);
+    const singleB = await metered(`/repos/cf-gitea-stub/writes/issues/${issueB.index}`);
+    expect(await singleB.json<Record<string, unknown>>()).toEqual(blocks.find((item) => item.number === issueB.index));
+    const singleC = await metered(`/repos/cf-gitea-stub/other/issues/${issueC.index}`);
+    expect(await singleC.json<Record<string, unknown>>()).toEqual(blocks.find((item) => item.number === issueC.index));
+
+    // The tracked-times list embeds the SAME path issue per row — the
+    // per-row render paid the full enrichment fan PER TIME ROW; the page
+    // context prefetches it once (3 arms on this issue: posters, labels,
+    // pins — milestone/PR arms skip). The route is doer-scoped (cantSetUser),
+    // so the list and the single GETs ride the SAME owner viewer.
+    await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/times`, authed(jsonBody({ time: 90 })));
+    await send(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/times`, authed(jsonBody({ time: 30 })));
+    const timesMeter = countedD1();
+    const timesRes = await metered(`/repos/cf-gitea-stub/writes/issues/${issueA.index}/times`, authed({}), timesMeter.db);
+    expect(timesRes.status).toBe(200);
+    const times = await timesRes.json<Array<Record<string, unknown> & { issue: Record<string, unknown> }>>();
+    expect(times).toHaveLength(2);
+    const timesCount = timesMeter.count();
+    // 1 repo + 1 issue + 1 rows select + 3 context arms = 6 regardless of
+    // the row count (pre-fix 3 + N×3 = 9 at this N=2; N=30 → 93).
+    expect(timesCount).toBeLessThanOrEqual(7);
+    expect(timesCount).toBeLessThan(9);
+    const singleA = await metered(`/repos/cf-gitea-stub/writes/issues/${issueA.index}`, authed({}));
+    const singleAWire = await singleA.json<Record<string, unknown>>();
+    for (const row of times) {
+      expect(row.issue).toEqual(singleAWire);
+    }
   });
 });

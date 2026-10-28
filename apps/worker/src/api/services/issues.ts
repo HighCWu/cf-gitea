@@ -401,10 +401,38 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
 }
 
 /**
+ * One batched poster read for a comment page (the query-shape audit's A7 —
+ * upstream `comments.LoadPosters` is the same fix): one inArray select over
+ * the distinct poster ids; a no-comment or all-null-poster page skips to
+ * zero statements, exactly like the per-row path.
+ */
+export async function prefetchCommentPosters(d1: D1Database, commentRows: CommentRow[]): Promise<Map<number, UserRow>> {
+  const posterIds = [...new Set(commentRows.flatMap((row) => (row.posterId === null ? [] : [row.posterId])))];
+  if (posterIds.length === 0) {
+    return new Map();
+  }
+  const rows = await drizzle(d1).select().from(users).where(inArray(users.id, posterIds)).all();
+  return new Map(rows.map((row) => [row.id, row]));
+}
+
+/** The context twin of `toPoster` for the comment pages — identical null
+ *  semantics, 0 reads. */
+function posterFromMap(posters: Map<number, UserRow>, viewer: Viewer, posterId: number | null): User | null {
+  if (posterId === null) {
+    return null;
+  }
+  const row = posters.get(posterId);
+  return row === undefined ? null : apiUserFromRow(row, viewer);
+}
+
+/**
  * `convert.ToAPIComment` → the contract `Comment`. `issue_url` is the issue
  * page for issues and the EMPTY STRING for PRs; `pull_request_url` the
  * mirror image (models/issues/comment.go IssueURL/PRURL). The poster row is
- * fetched per render (upstream `comments.LoadPosters`).
+ * fetched per render (upstream `comments.LoadPosters`); the comment-LIST
+ * routes pass `preload.posters` (the page-scoped `prefetchCommentPosters`
+ * map) so the read collapses to a lookup — a map miss renders the per-row
+ * null verbatim. Omitted keeps the per-row select (single-item routes).
  */
 export async function toApiComment(
   d1: D1Database,
@@ -412,8 +440,9 @@ export async function toApiComment(
   pair: RepositoryWithOwner,
   issue: IssueRow,
   comment: CommentRow,
+  preload?: { posters?: Map<number, UserRow> },
 ): Promise<Comment> {
-  const poster = await toPoster(d1, viewer, comment.posterId);
+  const poster = preload?.posters === undefined ? await toPoster(d1, viewer, comment.posterId) : posterFromMap(preload.posters, viewer, comment.posterId);
   const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, issue.isPull, comment.id);
   const issuePageUrl = issueHtmlUrl(pair, viewer.origin, issue.index);
   return {

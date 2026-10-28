@@ -60,6 +60,7 @@ import {
   parseQueryTime,
   parseStateFilter,
   parseTypeFilter,
+  prefetchCommentPosters,
   prefetchIssueRenderContext,
   searchIssuesGlobally,
   toApiComment,
@@ -1081,7 +1082,13 @@ export function registerIssueRoutes(
     const listOptions = parseListOptions(url);
     const { items, total } = await listRepoComments(c.env.DB, found.repo.id, since, before, listOptions.page, listOptions.limit);
     setPaginationHeaders(c, total, listOptions);
-    const rendered = await Promise.all(items.map(({ comment, issue }) => toApiComment(c.env.DB, viewer, found, issue, comment)));
+    // The query-shape audit's A7: the per-comment poster select batches into
+    // ONE inArray read for the page (upstream's comments.LoadPosters is the
+    // same fix); the response shape is unchanged.
+    const posters = await prefetchCommentPosters(c.env.DB, items.map((row) => row.comment));
+    const rendered = await Promise.all(
+      items.map(({ comment, issue }) => toApiComment(c.env.DB, viewer, found, issue, comment, { posters })),
+    );
     return c.json(rendered, 200);
   });
 
@@ -1398,7 +1405,10 @@ export function registerIssueRoutes(
     const rows = await listIssueComments(c.env.DB, issue.id, since, before);
     // Upstream sets X-Total-Count but does not paginate this endpoint.
     c.header("X-Total-Count", String(rows.length));
-    const rendered = await Promise.all(rows.map((comment) => toApiComment(c.env.DB, viewer, found, issue, comment)));
+    // The query-shape audit's A7: the per-comment poster select batches into
+    // ONE inArray read for the thread; the response shape is unchanged.
+    const posters = await prefetchCommentPosters(c.env.DB, rows);
+    const rendered = await Promise.all(rows.map((comment) => toApiComment(c.env.DB, viewer, found, issue, comment, { posters })));
     return c.json(rendered, 200);
   });
 

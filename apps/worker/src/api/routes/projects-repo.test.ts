@@ -30,8 +30,11 @@ import { drizzle } from "drizzle-orm/d1";
 
 import {
   comments,
+  issueLabels,
+  issuePins,
   issues,
   labels,
+  milestones,
   projectColumns,
   projectIssues,
   projectWorkflows,
@@ -44,6 +47,7 @@ import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type Auth
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
+import { registerIssueRoutes } from "./issues";
 import { registerProjectsRepoRoutes } from "./projects-repo";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 
@@ -57,6 +61,8 @@ beforeEach(async () => {
     "project_columns",
     "projects",
     "issue_labels",
+    "issue_pins",
+    "milestones",
     "issues",
     "labels",
     "repo_collaborators",
@@ -1010,5 +1016,108 @@ describe("workflows: list / get / create / edit / delete", () => {
     const del = await send(`${base}/${workflowId}`, { method: "DELETE", headers: authHeaders(s.owner.id) });
     expect(del.status).toBe(404); // still foreign — nothing deleted
     void del;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A2, tier-2
+// adoption) — the project-column issue list rendered its enrichment selects
+// (poster/label/pin/milestone) PER ROW; the page now prefetches one inArray
+// read per entity kind through toApiIssue's preload (the routes/issues.ts
+// landed shape). Metering: the prepare()-counting D1 wrapper riding
+// app.fetch's env, route-level — the counter is the request's exact D1
+// roundtrip count.
+// ---------------------------------------------------------------------------
+
+/** prepare()-counting D1 wrapper: every drizzle statement enters through one
+ *  prepare() call. Scoped to the requests that pass the returned env. */
+function countedD1(): { db: D1Database; count: () => number } {
+  let statements = 0;
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    return env.DB.prepare(query);
+  };
+  return { db: wrapper, count: () => statements };
+}
+
+describe("column-issues list query-shape witness (query-shape-audit A2, tier-2)", () => {
+  it("renders the column page with a constant statement count, deep-equal to the per-row single GETs", async () => {
+    const s = await seedRepoAndActors("witness");
+    const project = await seedProject(s.repoId, s.owner.id);
+    const column = await seedColumn(project.id, { title: "Backlog", isDefault: true });
+    // Every enrichment shape on one page: two posters, reversed two-label
+    // attachments, a real milestone, a dangling milestone id (the deleted
+    // row → null edge), and a pin.
+    const bug = await db()
+      .insert(labels)
+      .values({ repoId: s.repoId, name: "bug", color: "#00aabb", description: "", numIssues: 0, numClosedIssues: 0 })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const ui = await db()
+      .insert(labels)
+      .values({ repoId: s.repoId, name: "ui", color: "#00ccdd", description: "", numIssues: 0, numClosedIssues: 0 })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const v1 = await db()
+      .insert(milestones)
+      .values({ repoId: s.repoId, name: "v1", content: "", createdAt: NOW, updatedAt: NOW })
+      .returning({ id: milestones.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const first = await seedIssue(s.repoId, 1, { posterId: s.owner.id, milestoneId: v1 });
+    const second = await seedIssue(s.repoId, 2, { posterId: s.reader.id });
+    const third = await seedIssue(s.repoId, 3);
+    await db().insert(issueLabels).values([
+      { issueId: first.id, labelId: bug },
+      { issueId: first.id, labelId: ui },
+      { issueId: second.id, labelId: ui },
+      { issueId: second.id, labelId: bug },
+    ]);
+    const dangling = await seedIssue(s.repoId, 4, { posterId: s.owner.id });
+    await db().update(issues).set({ milestoneId: 999999 }).where(eq(issues.id, dangling.id));
+    for (const issue of [first, second, third, dangling]) {
+      await seedMembership(issue.id, project.id, column.id);
+    }
+    await db().insert(issuePins).values({ issueId: first.id, repoId: s.repoId, pinOrder: 2 });
+
+    // The witness mount adds the tier-1 issue routes so the per-row single
+    // GET renders sit next to the batched list render.
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerProjectsRepoRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    registerIssueRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    const send = async (path: string, init?: RequestInit, dbOverride?: D1Database): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, init), { ...env, DB: dbOverride ?? env.DB });
+
+    const meter = countedD1();
+    const listRes = await send(`/repos/${s.owner.username.toLowerCase()}/${s.repoId}/projects/${project.id}/columns/${column.id}/issues`, undefined, meter.db);
+    expect(listRes.status).toBe(200);
+    const list = await listRes.json<Array<Record<string, unknown> & { number: number; labels: Array<{ name: string }> }>>();
+    expect(list.map((item) => item.number)).toEqual([4, 3, 2, 1]); // sorting ASC, then created/id DESC — the flat sorting ties reverse on id
+    const count = meter.count();
+    // Post-fix: 1 repo resolve + 1 project/column/membership set + 2 (count
+    // + page) + 5 prefetch arms (posters, labels, pins, milestones — the PR
+    // arm skips: no pulls here) — page-INDEPENDENT. The pre-fix shape paid
+    // 5 + N×(1 poster + 1 labels + 1 pin + 1 milestone) = 21 at this N; the
+    // N×3 bound fails if any per-row fan returns.
+    expect(count).toBeLessThanOrEqual(14);
+    expect(count).toBeLessThan(4 * 3);
+
+    // Contract discipline: the batched list render must be deep-equal to the
+    // per-row single-GET renders for every row — the null poster, the
+    // dangling-milestone null, the pin_order, and the label ordering in one
+    // sweep.
+    for (let index = 1; index <= 4; index++) {
+      const singleRes = await send(`/repos/${s.owner.username.toLowerCase()}/${s.repoId}/issues/${index}`);
+      expect(singleRes.status).toBe(200);
+      const single = await singleRes.json<Record<string, unknown>>();
+      expect(single).toEqual(list.find((item) => item.number === index));
+    }
+    expect(list.find((item) => item.number === 4)?.milestone).toBeNull();
+    expect(list.find((item) => item.number === 2)?.labels.map((l: { name: string }) => l.name)).toEqual(["bug", "ui"]);
+    expect(list.find((item) => item.number === 3)?.user).toBeNull();
   });
 });

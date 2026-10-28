@@ -29,7 +29,11 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
+  issueLabels,
+  issuePins,
   issues,
+  labels,
+  milestones,
   projectColumns,
   projectIssues,
   projects,
@@ -41,6 +45,7 @@ import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type Auth
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
+import { registerIssueRoutes } from "./issues";
 import { registerProjectsUserRoutes } from "./projects-user";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 
@@ -54,6 +59,8 @@ beforeEach(async () => {
     "project_columns",
     "projects",
     "issue_labels",
+    "issue_pins",
+    "milestones",
     "issues",
     "labels",
     "user_redirects",
@@ -682,5 +689,102 @@ describe("userListProjects (api.go:1065-1066)", () => {
       headers: authHeaders(target.id),
     });
     expect(selfIssues.headers.get("x-total-count")).toBe("2");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A2/A6, tier-2
+// adoption) — the /user/projects column-issue list rendered its enrichment
+// selects PER ROW; the page now prefetches one inArray read per entity kind
+// through toApiIssue's preload, with the pairsById map serving the
+// cross-repo rows. Metering: the prepare()-counting D1 wrapper riding
+// app.fetch's env.
+// ---------------------------------------------------------------------------
+
+/** prepare()-counting D1 wrapper: every drizzle statement enters through one
+ *  prepare() call. Scoped to the requests that pass the returned env. */
+function countedD1(): { db: D1Database; count: () => number } {
+  let statements = 0;
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    return env.DB.prepare(query);
+  };
+  return { db: wrapper, count: () => statements };
+}
+
+describe("user column-issues list query-shape witness (query-shape-audit A2/A6, tier-2)", () => {
+  it("renders the cross-repo column page with a constant statement count, deep-equal to the per-row single GETs", async () => {
+    const s = await seedBoard("witness");
+    const repoA = await seedUserRepo(s.owner, "one");
+    const repoB = await seedUserRepo(s.owner, "two");
+    const poster2 = await seedUser("alice-witness-p2");
+    const bug = await db()
+      .insert(labels)
+      .values({ repoId: repoA, name: "bug", color: "#00aabb", description: "", numIssues: 0, numClosedIssues: 0 })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const v1 = await db()
+      .insert(milestones)
+      .values({ repoId: repoA, name: "v1", content: "", createdAt: NOW, updatedAt: NOW })
+      .returning({ id: milestones.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const first = await seedIssue(repoA, 1, { posterId: s.owner.id, milestoneId: v1 });
+    const second = await seedIssue(repoA, 2, { posterId: poster2.id });
+    const third = await seedIssue(repoB, 1); // another repo, null poster
+    await db().insert(issueLabels).values([
+      { issueId: first.id, labelId: bug },
+      { issueId: second.id, labelId: bug },
+    ]);
+    for (const issue of [first, second, third]) {
+      await seedMembership(issue.id, s.project.id, s.column.id);
+    }
+    await db().insert(issuePins).values({ issueId: first.id, repoId: repoA, pinOrder: 2 });
+
+    // The tier-1 issue routes mount beside the user family so the per-row
+    // single GETs sit next to the batched list render.
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerProjectsUserRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    registerIssueRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    const send = async (path: string, init?: RequestInit, dbOverride?: D1Database): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, init), { ...env, DB: dbOverride ?? env.DB });
+
+    const meter = countedD1();
+    const listRes = await send(`/user/projects/${s.project.id}/columns/${s.column.id}/issues`, {
+      headers: authHeaders(s.owner.id),
+    }, meter.db);
+    expect(listRes.status).toBe(200);
+    const list = await listRes.json<Array<Record<string, unknown> & { number: number; labels: Array<{ name: string }>; repository: { full_name: string } }>>();
+    expect(list).toHaveLength(3);
+    expect(list.map((item) => item.repository.full_name).sort()).toEqual([
+      `${s.owner.username.toLowerCase()}/one`,
+      `${s.owner.username.toLowerCase()}/one`,
+      `${s.owner.username.toLowerCase()}/two`,
+    ]);
+    const count = meter.count();
+    // Post-fix: the route's fixed prefix (project + column + membership +
+    // visible repos + count + page) + 5 prefetch arms — page-INDEPENDENT.
+    // The pre-fix shape added N×(1 poster + 1 labels + 1 pin + 1 milestone)
+    // = 12 at this N=3; the bound below fails if any per-row fan returns.
+    expect(count).toBeLessThanOrEqual(20);
+    expect(count).toBeLessThan(21);
+
+    // Contract discipline: every batched render is deep-equal to the
+    // per-row single GET of ITS repo (per-repo indexes).
+    for (const [repoSlug, index] of [
+      ["one", first.index],
+      ["one", second.index],
+      ["two", third.index],
+    ] as const) {
+      const singleRes = await send(`/repos/${s.owner.username.toLowerCase()}/${repoSlug}/issues/${index}`, { headers: authHeaders(s.owner.id) });
+      expect(singleRes.status).toBe(200);
+      const single = await singleRes.json<Record<string, unknown>>();
+      expect(single).toEqual(list.find((item) => item.number === index && item.repository.full_name === `${s.owner.username.toLowerCase()}/${repoSlug}`));
+    }
+    expect(list.find((item) => item.repository.full_name === `${s.owner.username.toLowerCase()}/two`)?.user).toBeNull();
+    expect(list.find((item) => item.number === 1 && item.repository.full_name === `${s.owner.username.toLowerCase()}/one`)?.labels.map((l: { name: string }) => l.name)).toEqual(["bug"]);
   });
 });

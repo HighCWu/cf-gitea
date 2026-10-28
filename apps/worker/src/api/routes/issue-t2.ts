@@ -12,6 +12,7 @@ import {
   findIssueByRepoAndIndex,
   issueApiUrl,
   issueErrorToApiError,
+  prefetchIssueRenderContext,
   toApiComment,
   toApiIssue,
   updateCommentBody,
@@ -49,7 +50,7 @@ import {
   viewerOf,
 } from "../services/repository";
 import type { RepositoryWithOwner, UserRow, Viewer } from "../services/repository";
-import { findPullRequestByIndex, toApiPullRequest } from "../services/pulls";
+import { findPullRequestsByIndices, prefetchPullRequestRenderContext, toApiPullRequest } from "../services/pulls";
 import { toApiUser } from "../services/user";
 
 /**
@@ -739,29 +740,32 @@ export function registerIssueT2Routes(
   });
 
   // -------------------------------------------------------------------------
-  // Pinned lists — the pin rows split by is_pull, pin_order ASC.
+  // Pinned lists — the pin rows split by is_pull, pin_order ASC. The render
+  // batches like the tier-1 lists (routes/issues.ts A2): one inArray read per
+  // entity kind for the page, the pulls list additionally fetching the page's
+  // PR rows in ONE select on the exact per-row predicate (the missing row
+  // keeps the per-row skip).
   // -------------------------------------------------------------------------
   app.openapi(listPinnedIssuesRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
     const rows = await listPinnedIssues(c.env.DB, found.repo.id, false);
-    const rendered = [];
-    for (const issue of rows) {
-      rendered.push(await toApiIssue(c.env.DB, viewer, found, issue));
-    }
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, rows);
+    const rendered = await Promise.all(rows.map((issue) => toApiIssue(c.env.DB, viewer, found, issue, { context: renderContext })));
     return c.json(rendered, 200);
   });
 
   app.openapi(listPinnedPullsRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
     const rows = await listPinnedIssues(c.env.DB, found.repo.id, true);
-    const rendered = [];
-    for (const issue of rows) {
-      const pair = await findPullRequestByIndex(c.env.DB, found.repo.id, issue.index);
-      if (pair === null) {
-        continue;
-      }
-      rendered.push(await toApiPullRequest(c.env.DB, viewer, found, issue, pair.pullRequest, "list"));
-    }
+    const prRowsByIndex = await findPullRequestsByIndices(c.env.DB, found.repo.id, rows.map((issue) => issue.index));
+    const items = rows.flatMap((issue) => {
+      const prRow = prRowsByIndex.get(issue.index);
+      return prRow === undefined ? [] : [{ issue, pullRequest: prRow }];
+    });
+    const renderContext = await prefetchPullRequestRenderContext(c.env.DB, viewer, found, items);
+    const rendered = await Promise.all(
+      items.map(({ issue, pullRequest }) => toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "list", undefined, { context: renderContext })),
+    );
     return c.json(rendered, 200);
   });
 

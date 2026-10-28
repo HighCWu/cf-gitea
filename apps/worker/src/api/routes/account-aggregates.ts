@@ -34,12 +34,12 @@ import {
   GO_ZERO_TIME,
   canViewRepositoryWithTeams,
   findRepositoryByPath,
-  findRepositoryById,
+  findRepositoriesByIds,
   findUserByName,
   viewerOf,
 } from "../services/repository";
 import type { RepositoryWithOwner, UserRow, Viewer } from "../services/repository";
-import { parseQueryTime, toApiIssue } from "../services/issues";
+import { parseQueryTime, prefetchIssueRenderContext, toApiIssue } from "../services/issues";
 
 /**
  * Account aggregates — the remaining user-scoped READ/CRUD surface over
@@ -617,6 +617,10 @@ async function renderTimeRows(
   const issueIds = [...new Set(rows.map((row) => row.issueId))];
   const issueRows = issueIds.length > 0 ? await drizzle(d1).select().from(issues).where(inArray(issues.id, issueIds)).all() : [];
   const issueById = new Map(issueRows.map((row) => [row.id, row]));
+  // The M-grade list batching's tier-2 adoption (routes/issues.ts A2 shape):
+  // the per-issue enrichment reads batch into one inArray per entity kind for
+  // the page; the render below is map lookups. Response shape unchanged.
+  const renderContext = await prefetchIssueRenderContext(d1, issueRows);
   const rendered: Array<Record<string, unknown>> = [];
   for (const row of rows) {
     const issue = issueById.get(row.issueId);
@@ -630,7 +634,7 @@ async function renderTimeRows(
     rendered.push({
       id: row.id,
       issue_id: row.issueId,
-      issue: await toApiIssue(d1, viewer, pair, issue),
+      issue: await toApiIssue(d1, viewer, pair, issue, { context: renderContext }),
       time: row.seconds,
       created: isoOrGoZero(row.createdAt),
       user_id: row.userId,
@@ -1211,15 +1215,19 @@ export function registerAccountAggregatesRoutes(app: OpenAPIHono<ApiEnv>, requir
 
     const issueIds = [...new Set(pageRows.map((row) => row.issueId))];
     const issueRows = issueIds.length > 0 ? await drizzle(c.env.DB).select().from(issues).where(inArray(issues.id, issueIds)).all() : [];
-    const repoIds = [...new Set(issueRows.map((row) => row.repoId))];
-    const pairs = new Map<string, RepositoryWithOwner>();
-    for (const repoId of repoIds) {
-      const pair = await findRepositoryById(c.env.DB, repoId);
-      if (pair !== null && (await canViewRepositoryWithTeams(c.env.DB, viewer, pair.repo))) {
-        pairs.set(repoId, pair);
-      }
-    }
-    return c.json(await renderTimeRows(c.env.DB, viewer, pairs, pageRows), 200);
+    // The per-distinct-repo pair resolution batches into ONE inArray read
+    // (the audit's A6 twin); the grant verdict stays per DISTINCT repo —
+    // the same predicate the per-row path evaluated.
+    const pairs = await findRepositoriesByIds(c.env.DB, [...new Set(issueRows.map((row) => row.repoId))]);
+    const visiblePairs = new Map<string, RepositoryWithOwner>();
+    await Promise.all(
+      [...pairs.values()].map(async (pair) => {
+        if (await canViewRepositoryWithTeams(c.env.DB, viewer, pair.repo)) {
+          visiblePairs.set(pair.repo.id, pair);
+        }
+      }),
+    );
+    return c.json(await renderTimeRows(c.env.DB, viewer, visiblePairs, pageRows), 200);
   });
 
   // -------------------------------------------------------------------------
@@ -1245,14 +1253,28 @@ export function registerAccountAggregatesRoutes(app: OpenAPIHono<ApiEnv>, requir
     setPaginationHeaders(c, rows.length, { page, limit });
 
     const now = new Date();
+    const pageRows = rows.slice((page - 1) * limit, page * limit);
+    // The per-row issue + repo re-resolution batches (the M-grade tier-2
+    // adoption): one inArray for the page's issues, one for their distinct
+    // repos, one grant verdict per DISTINCT repo — the per-row skips render
+    // identically (missing issue → skip; unreadable repo → skip).
+    const issueRows = pageRows.length > 0 ? await drizzle(c.env.DB).select().from(issues).where(inArray(issues.id, [...new Set(pageRows.map((row) => row.issueId))])).all() : [];
+    const issuesById = new Map(issueRows.map((row) => [row.id, row]));
+    const pairs = await findRepositoriesByIds(c.env.DB, [...new Set(issueRows.map((row) => row.repoId))]);
+    const canView = new Map<string, boolean>();
+    await Promise.all(
+      [...pairs.values()].map(async (pair) => {
+        canView.set(pair.repo.id, await canViewRepositoryWithTeams(c.env.DB, viewer, pair.repo));
+      }),
+    );
     const rendered: Array<Record<string, unknown>> = [];
-    for (const row of rows.slice((page - 1) * limit, page * limit)) {
-      const issue = (await drizzle(c.env.DB).select().from(issues).where(eq(issues.id, row.issueId)).limit(1))[0];
+    for (const row of pageRows) {
+      const issue = issuesById.get(row.issueId);
       if (issue === undefined) {
         continue; // GetRepositoryByID failure arm (issue.go:200-204)
       }
-      const pair = await findRepositoryById(c.env.DB, issue.repoId);
-      if (pair === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, pair.repo))) {
+      const pair = pairs.get(issue.repoId);
+      if (pair === undefined || canView.get(issue.repoId) !== true) {
         continue; // CanReadIssuesOrPulls skip (issue.go:214-217)
       }
       const seconds = Math.max(0, Math.floor((now.getTime() - row.createdAt.getTime()) / 1000));

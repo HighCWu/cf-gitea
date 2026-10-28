@@ -2290,3 +2290,84 @@ describe("issues list query-shape witness (query-shape-audit A2)", () => {
     expect(list.find((item) => item.number === second.index)?.labels.map((l: { name: string }) => l.name)).toEqual(["bug", "ui"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A7) — the comment
+// lists used to pay ONE poster select PER COMMENT (toApiComment's toPoster);
+// both list routes now prefetch one inArray read for the page's distinct
+// posters and render through toApiComment's optional preload. The tier-2
+// adoption of the M-grade batching, same metering pattern as the A2 witness
+// above.
+// ---------------------------------------------------------------------------
+
+describe("comment list query-shape witness (query-shape-audit A7)", () => {
+  it("renders both comment lists with a constant statement count, deep-equal to the per-row single GETs", async () => {
+    const owner = await seedUser("Alice");
+    const other = await seedUser("Bob");
+    const third = await seedUser("Carol");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "thread", { posterId: owner.id });
+    const second = await seedIssue(repoId, "other thread", { posterId: other.id });
+    // Eight comment rows across THREE distinct posters spanning TWO issues,
+    // plus one NULL-poster row (the audit's anonymous-system arm — the map
+    // miss must render the per-row null user verbatim).
+    await service().addComment({ issueId: issue.id, posterId: owner.id, content: "first" });
+    await service().addComment({ issueId: issue.id, posterId: other.id, content: "second" });
+    await service().addComment({ issueId: issue.id, posterId: third.id, content: "third" });
+    await service().addComment({ issueId: issue.id, posterId: owner.id, content: "third-b" }); // poster dedupe
+    await service().addComment({ issueId: issue.id, posterId: third.id, content: "third-c" }); // poster dedupe
+    await service().addComment({ issueId: second.id, posterId: owner.id, content: "fourth" });
+    await service().addComment({ issueId: second.id, posterId: third.id, content: "fifth" });
+    await db()
+      .insert(comments)
+      .values({ type: CommentType.Comment, posterId: null, issueId: issue.id, content: "ghost", createdAt: new Date(), updatedAt: new Date() });
+
+    const app = createApiRouter();
+
+    // (a) The issue-scoped thread: 1 repo resolve + 1 issue lookup + 1 page
+    // + 1 poster batch = 4 — page-INDEPENDENT (5 distinct posters dedupe to
+    // one read). The pre-fix shape paid 3 + C×1 (C=6 here); the 6 per-comment
+    // posters alone would break the bound.
+    const threadMeter = countedD1();
+    const threadRes = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${issue.index}/comments`), {
+      ...env,
+      DB: threadMeter.db,
+    });
+    expect(threadRes.status).toBe(200);
+    const thread = await threadRes.json<Array<Record<string, unknown> & { id: number; user: unknown }>>();
+    expect(thread).toHaveLength(6); // the null-poster row renders too
+    const threadCount = threadMeter.count();
+    expect(threadCount).toBeLessThanOrEqual(5);
+    expect(threadCount).toBeLessThan(6); // 6 per-comment posters alone exceed it
+
+    // (b) The repo-wide feed: 1 repo resolve + 2 (count + page) + 1 poster
+    // batch = 4 (pre-fix 3 + C×1 = 11 at C=8).
+    const feedMeter = countedD1();
+    const feedRes = await app.fetch(new Request("https://example.com/repos/alice/visible/issues/comments?state=all"), {
+      ...env,
+      DB: feedMeter.db,
+    });
+    expect(feedRes.status).toBe(200);
+    const feed = await feedRes.json<Array<Record<string, unknown> & { id: number; user: unknown }>>();
+    expect(feed).toHaveLength(8);
+    const feedCount = feedMeter.count();
+    expect(feedCount).toBeLessThanOrEqual(5);
+    expect(feedCount).toBeLessThan(8); // 8 per-comment posters alone exceed it
+
+    // Contract discipline: every batched render is deep-equal to the
+    // per-row single-GET render (the unbatched path) — covers the batched
+    // poster map hits AND the null-poster miss in one sweep.
+    for (const item of thread) {
+      const singleRes = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/comments/${item.id}`), env);
+      expect(singleRes.status).toBe(200);
+      expect(await singleRes.json<Record<string, unknown>>()).toEqual(item);
+    }
+    for (const item of feed) {
+      const singleRes = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/comments/${item.id}`), env);
+      expect(singleRes.status).toBe(200);
+      expect(await singleRes.json<Record<string, unknown>>()).toEqual(item);
+    }
+    expect(thread.find((item) => item.body === "ghost")?.user).toBeNull();
+    expect(thread.filter((item) => item.user !== null)).toHaveLength(5);
+  });
+});

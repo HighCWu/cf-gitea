@@ -27,12 +27,13 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { gpgKeys, issueStopwatches, issues, repositories, trackedTimes, userRedirects, users } from "../../db/schema";
-import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
+import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { TokenService } from "../../auth/token-service";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
 import { registerAccountAggregatesRoutes } from "./account-aggregates";
+import { registerIssueRoutes } from "./issues";
 import { IssuesService } from "../../issues/service";
 import { applyRepoExtrasDdl } from "../testing/repo-ddl";
 
@@ -783,5 +784,131 @@ describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
     const keyId = await seedGpgKey(owner.id, material);
     const res = await router()("/user/gpg_key_verify", jsonAuth(token(owner), { key_id: keyId }));
     expect(res.status).toBe(422);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A2/A6, tier-2
+// adoption) — the tracked-time aggregates re-rendered each row's issue
+// PER ROW (poster/label/pin per entry) and re-resolved the cross-repo
+// pairs PER DISTINCT repo through findRepositoryById; the stopwatch page
+// re-selected the issue AND repo PER ROW. All three now batch (one inArray
+// per entity kind, one grant verdict per distinct repo). Metering: the
+// prepare()-counting D1 wrapper riding app.fetch's env.
+// ---------------------------------------------------------------------------
+
+/** prepare()-counting D1 wrapper: every drizzle statement enters through one
+ *  prepare() call. Scoped to the requests that pass the returned env. */
+function countedD1(): { db: D1Database; count: () => number } {
+  let statements = 0;
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    return env.DB.prepare(query);
+  };
+  return { db: wrapper, count: () => statements };
+}
+
+/** The aggregates app plus the tier-1 issue routes (the per-row single-GET
+ *  renders sit next to the batched aggregate renders). */
+function witnessSend() {
+  const app = new OpenAPIHono<ApiEnv>();
+  app.onError(giteaErrorHandler);
+  const requireAuth = createTokenAuthMiddleware(resolver());
+  registerAccountAggregatesRoutes(app, requireAuth);
+  registerIssueRoutes(app, requireAuth, createOptionalTokenAuthMiddleware(resolver()));
+  return async (path: string, init?: RequestInit, dbOverride?: D1Database): Promise<Response> =>
+    app.fetch(new Request(`https://example.com${path}`, init), { ...env, DB: dbOverride ?? env.DB });
+}
+
+describe("tracked-time aggregate query-shape witness (query-shape-audit A2/A6, tier-2)", () => {
+  it("renders the repo times page with a constant statement count, deep-equal to the per-row single GETs", async () => {
+    const a = await createIssue(REPO_ID, "alpha", owner.id);
+    const b = await createIssue(REPO_ID, "beta", neighbor.id);
+    await seedTime(a.id, owner.id, 60);
+    await seedTime(a.id, owner.id, 30);
+    await seedTime(b.id, neighbor.id, 15);
+
+    const metered = witnessSend();
+    const meter = countedD1();
+    const res = await metered(`/repos/owner/writes/times`, authed(token(owner)), meter.db);
+    expect(res.status).toBe(200);
+    const body = await res.json<Array<{ issue: Record<string, unknown>; issue_id: number; time: number }>>();
+    expect(body).toHaveLength(3);
+    const count = meter.count();
+    // Post-fix: 1 repo resolve + 1 rows select (the users left join) + 1
+    // issues batch + 3 issue-context arms (posters, labels, pins — the
+    // milestone/PR arms skip: no milestones, no pulls) = 6, page-INDEPENDENT.
+    // Pre-fix: 2 + N×3 = 11 at this N=3 (N=30 → 92); the bound fails if any
+    // per-row fan returns.
+    expect(count).toBeLessThanOrEqual(8);
+    expect(count).toBeLessThan(11);
+    // Contract discipline: every embedded issue is deep-equal to the per-row
+    // single GET of its issue (the unbatched path) — the SAME authed viewer,
+    // since the user block's email/active arms are viewer-dependent.
+    for (const row of body) {
+      const index = row.issue_id === a.id ? a.index : b.index;
+      const singleRes = await metered(`/repos/owner/writes/issues/${index}`, authed(token(owner)));
+      expect(singleRes.status).toBe(200);
+      expect(await singleRes.json<Record<string, unknown>>()).toEqual(row.issue);
+    }
+  });
+
+  it("renders /user/times with a batched cross-repo pair resolution (the hidden repo skips)", async () => {
+    const a = await createIssue(REPO_ID, "alpha", owner.id);
+    const b = await createIssue(OTHER_REPO_ID, "beta", owner.id);
+    const hidden = await createIssue(HIDDEN_REPO_ID, "secret", recluse.id);
+    await seedTime(a.id, owner.id, 60);
+    await seedTime(b.id, owner.id, 30);
+    await seedTime(hidden.id, owner.id, 90);
+
+    const metered = witnessSend();
+    const meter = countedD1();
+    const res = await metered(`/user/times`, authed(token(owner)), meter.db);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-total-count")).toBe("3");
+    const body = await res.json<Array<{ issue: Record<string, unknown>; issue_id: number; time: number }>>();
+    expect(body).toHaveLength(2); // the hidden repo skips at render
+    expect(body.map((row) => row.time).sort((x, y) => x - y)).toEqual([30, 60]);
+    const count = meter.count();
+    // Post-fix: 1 doer row + 1 rows select + 1 issues batch + 1 batched
+    // pair fetch + 2 grant probes on the hidden repo + renderTimeRows'
+    // issues re-read + 3 issue-context arms = 11 — CONSTANT in the row and
+    // repo counts (pre-fix paid findRepositoryById PER DISTINCT repo and the
+    // enrichment fan PER row: 11 + 3 repos + 2×3 rows = 20 at this page).
+    // The bound fails if the per-repo loop or any per-row fan returns
+    // (either alone pushes ≥ 14).
+    expect(count).toBeLessThanOrEqual(13);
+    expect(count).toBeLessThan(14);
+  });
+
+  it("renders /user/stopwatches with batched issue+repo resolution (the unreadable skip intact)", async () => {
+    const a = await createIssue(REPO_ID, "alpha", owner.id);
+    const b = await createIssue(OTHER_REPO_ID, "beta", owner.id);
+    const hidden = await createIssue(HIDDEN_REPO_ID, "secret", recluse.id);
+    const startedAt = new Date(Math.floor((Date.now() - 2 * 3600 * 1000) / 1000) * 1000);
+    await drizzle(env.DB).insert(issueStopwatches).values([
+      { issueId: a.id, userId: owner.id, createdAt: startedAt },
+      { issueId: b.id, userId: owner.id, createdAt: startedAt },
+      { issueId: hidden.id, userId: owner.id, createdAt: startedAt },
+    ]);
+
+    const metered = witnessSend();
+    const meter = countedD1();
+    const res = await metered(`/user/stopwatches`, authed(token(owner)), meter.db);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-total-count")).toBe("3");
+    const body = await res.json<Array<Record<string, unknown>>>();
+    expect(body).toHaveLength(2); // the hidden repo skips at render
+    const count = meter.count();
+    // Post-fix: 1 doer row + 1 stopwatches select + 1 issues batch + 1
+    // batched pair fetch + 1-2 grant probes on the hidden repo ≈ 5-6 —
+    // CONSTANT in the row count (pre-fix 1 + N×(1 issue + 1 repo + grant)
+    // = 10 at this N=3, 121 at N=30). The bound fails if any per-row select
+    // returns.
+    expect(count).toBeLessThanOrEqual(8);
+    expect(count).toBeLessThan(10);
+    expect(body[0]).toMatchObject({ issue_index: a.index, repo_name: "writes" });
+    expect(body[1]).toMatchObject({ issue_index: b.index, repo_name: "other" });
   });
 });

@@ -68,7 +68,7 @@ import {
   projectSchema,
 } from "../models/project";
 import { issueSchema } from "../models/issue";
-import { toApiIssue } from "../services/issues";
+import { prefetchIssueRenderContext, toApiIssue } from "../services/issues";
 
 /**
  * Tier-1 repo-scoped project-board routes (inventory batch 6 stage 1 — the
@@ -918,10 +918,12 @@ export function registerProjectsRepoRoutes(
     const { page, limit } = parseListOptions(url);
     const { items, total } = await listColumnIssues(c.env.DB, found.repo.id, project.id, column, page, limit);
     setPaginationHeaders(c, total, { page, limit });
-    const rendered = [];
-    for (const issue of items) {
-      rendered.push(await toApiIssue(c.env.DB, viewer, found, issue));
-    }
+    // The M-grade list batching's tier-2 adoption: the per-issue enrichment
+    // selects (poster, labels, pin order, milestone, PR row) batch into one
+    // inArray read per entity kind for the page, handed to the render through
+    // the preload — the response shape is unchanged (routes/issues.ts A2).
+    const renderContext = await prefetchIssueRenderContext(c.env.DB, items);
+    const rendered = await Promise.all(items.map((issue) => toApiIssue(c.env.DB, viewer, found, issue, { context: renderContext })));
     return c.json(rendered, 200);
   });
   app.openapi(addIssueRoute(requireAuth), async (c) => {
