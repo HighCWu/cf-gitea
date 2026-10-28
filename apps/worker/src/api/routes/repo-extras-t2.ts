@@ -42,6 +42,7 @@ import {
 } from "../services/repository";
 import { canWriteRepository, isRepositoryAdmin, requireVisibleRepo } from "../services/repo-access";
 import { lastCommitForPath } from "../services/contents";
+import { refMissError, treeEntryMissError } from "./contents";
 import { toApiCommit, toContentsEntry, usernamesByEmail } from "../services/git-models";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { repositorySchema } from "../models/repository";
@@ -807,7 +808,7 @@ async function contentsExtPayload(
   const reads = engineReads(c.env, pair.repo);
   const refTarget = await refTargetOrNull(c, pair, refParam);
   if (refTarget === null) {
-    throw new ApiError(404, "not found");
+    throw refMissError(pair.repo.defaultBranch, refParam);
   }
   const dir = treePath === "" ? await reads.listTree(refTarget) : await reads.listTree(refTarget, treePath);
   if (dir !== null) {
@@ -818,7 +819,9 @@ async function contentsExtPayload(
   }
   const entry = await contentsEntryFor(c, pair, reads, refTarget, treePath, true);
   if (entry === null) {
-    throw new ApiError(404, "The target couldn't be found.");
+    // GetContentsOrList → GetTreeEntryByPath — the ErrNotExist family 404
+    // (modules/git/error.go:26), not the web locale string.
+    throw await treeEntryMissError(reads, refTarget, treePath);
   }
   return { file_contents: entry };
 }
@@ -846,7 +849,7 @@ async function fileContentsPayload(
   const reads = engineReads(c.env, pair.repo);
   const refTarget = await refTargetOrNull(c, pair, refParam);
   if (refTarget === null) {
-    throw new ApiError(404, "not found");
+    throw refMissError(pair.repo.defaultBranch, refParam);
   }
   return Promise.all(files.map((file) => contentsEntryFor(c, pair, reads, refTarget, file, true)));
 }

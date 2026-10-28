@@ -921,7 +921,8 @@ export function registerIssueRoutes(
     const before = parseQueryTime(url.searchParams.get("before"));
     const listOptions = parseListOptions(url);
 
-    // created_by → poster filter; unknown login is the upstream 422.
+    // created_by → poster filter; unknown login is the upstream 404
+    // (getUserIDForFilter → APIErrorAuto(ErrUserNotExist)).
     let posterId: number | null | undefined;
     const createdBy = (url.searchParams.get("created_by") ?? "").trim();
     if (createdBy !== "") {
@@ -1586,7 +1587,10 @@ export function registerIssueRoutes(
     if (ownerName !== "") {
       const ownerRow = await userRowByName(c.env.DB, ownerName);
       if (ownerRow === null) {
-        throw new ApiError(400, `user does not exist [name: ${ownerName}]`);
+        // SearchIssuesRepoIDs returns ErrUserNotExist; the search route maps
+        // the ErrNotExist family to the declared 400 with the verbatim text
+        // (routers/common/issue_filter.go:48-52 + repo/issue.go:144-150).
+        throw new ApiError(400, `user does not exist [uid: 0, name: ${ownerName}]`);
       }
       ownerLower = ownerRow.usernameLower;
     }

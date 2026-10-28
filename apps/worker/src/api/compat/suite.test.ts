@@ -2539,7 +2539,9 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
     },
     {
       // The shared fixture repo has no refs at all — the default-branch
-      // resolution is upstream's "The target couldn't be found." 404.
+      // resolution miss is upstream's ErrNotExist 404 (`object does not
+      // exist [id: <default-branch>, rel_path: ]`, utils/git.go:60-62 +
+      // modules/git/error.go:26 — NOT the web locale string).
       name: "repo without a default branch → runtime-body 404",
       status: 404,
       request: (ctx) => ({ path: `${repoPath(ctx)}/contents` }),

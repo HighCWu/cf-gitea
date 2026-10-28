@@ -4,7 +4,7 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
-import { branchRef, engineReads, refTipMap, resolveNamedRef } from "../services/engine";
+import { branchRef, engineReads, refTipMap, resolveNamedRef, type EngineReads } from "../services/engine";
 import { toContentsEntry, toPerson, base64Decode, type FileChange } from "../services/git-models";
 import {
   applyFileChanges,
@@ -108,9 +108,45 @@ async function refTargetOf(c: Context<ApiEnv>, pair: RepoPair, refParam: string 
       ? tips.get(branchRef(pair.repo.defaultBranch))?.target
       : resolveNamedRef(tips, refParam)?.target;
   if (target === undefined) {
-    throw new ApiError(404, "The target couldn't be found.");
+    throw refMissError(pair.repo.defaultBranch, refParam);
   }
   return target;
+}
+
+/**
+ * The ResolveRefCommit miss (routers/api/v1/utils/git.go:60-62 →
+ * git.ErrNotExist{ID: inputRef}): the ErrNotExist family answers 404 with
+ * `object does not exist [id: <ref>, rel_path: ]` (modules/git/error.go:26) —
+ * the raw ref, or the default branch when the param was absent
+ * (file.go:695-700's util.IfZero).
+ */
+export function refMissError(defaultBranch: string, refParam: string | null): ApiError {
+  const inputRef = refParam === null || refParam === "" ? defaultBranch : refParam;
+  return new ApiError(404, `object does not exist [id: ${inputRef}, rel_path: ]`);
+}
+
+/**
+ * The GetTreeEntryByPath miss (modules/git/tree_blob.go:16-59 + tree.go:21-44)
+ * behind the contents path 404s: the walk descends segment by segment, so a
+ * missing INTERMEDIATE segment names itself (`rel_path: no-such` — the
+ * integration pin, tests/integration/api_repo_get_contents_test.go:92), a
+ * blob-where-a-tree-is-expected errors with the blob oid (repo_tree.go:127-131)
+ * and a missing final segment carries the full cleaned path.
+ */
+export async function treeEntryMissError(reads: EngineReads, refTarget: string, filepath: string): Promise<ApiError> {
+  const segments = filepath.split("/").filter((segment) => segment !== "");
+  for (let i = 0; i < segments.length - 1; i++) {
+    const prefix = segments.slice(0, i + 1).join("/");
+    const sub = await reads.listTree(refTarget, prefix);
+    if (sub === null) {
+      const blob = await reads.readBlob(refTarget, prefix);
+      if (blob !== null) {
+        return new ApiError(404, `object does not exist [id: ${blob.oid}, rel_path: ]`);
+      }
+      return new ApiError(404, `object does not exist [id: , rel_path: ${segments[i]}]`);
+    }
+  }
+  return new ApiError(404, `object does not exist [id: , rel_path: ${segments.join("/")}]`);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +228,10 @@ async function contentsPayload(
   }
   const blob = await reads.readBlob(refTarget, filepath);
   if (blob === null) {
-    throw new ApiError(404, "The target couldn't be found.");
+    // GetContentsOrList → GetTreeEntryByPath: the ErrNotExist family 404
+    // (`object does not exist [id: , rel_path: <path>]`) — NOT the web locale
+    // string upstream's UI uses.
+    throw await treeEntryMissError(reads, refTarget, filepath);
   }
   const kind: "file" | "symlink" | "submodule" = blob.mode === "120000" ? "symlink" : blob.mode === "160000" ? "submodule" : "file";
   const name = filepath.split("/").pop() ?? filepath;

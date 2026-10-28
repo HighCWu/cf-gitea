@@ -51,7 +51,8 @@ import {
  *   - Issue converter: `services/convert/issue.go toIssue` (URL/HTMLURL from
  *     Issue.APIURL/HTMLURL, ToAuthor poster, ToAPIMilestone milestone,
  *     SliceNilAsEmpty labels, PullRequestMeta, deadline/closed pointers,
- *     NumComments, PinOrder -1→0, TimeEstimate, ContentVersion);
+ *     NumComments, PinOrder -1→0 (LoadPinOrder, models/issues/issue.go:272),
+ *     TimeEstimate, ContentVersion);
  *   - Comment converter: `services/convert/issue_comment.go ToAPIComment`
  *     (HTMLURL = issue HTMLURL + `#issuecomment-<id>`, IssueURL "" for PRs,
  *     PRURL "" for issues);
@@ -220,6 +221,20 @@ async function pullRequestMetaOf(
 }
 
 /**
+ * `issue.LoadPinOrder` (models/issues/issue.go:272-284) — the pinned row's
+ * pin_order, or the unpinned sentinel -1 (mapped to 0 by the converter).
+ */
+async function pinOrderOf(d1: D1Database, issueId: number): Promise<number> {
+  const row = await drizzle(d1)
+    .select({ pinOrder: issuePins.pinOrder })
+    .from(issuePins)
+    .where(eq(issuePins.issueId, issueId))
+    .limit(1)
+    .then((rows) => rows[0]);
+  return row === undefined ? -1 : row.pinOrder;
+}
+
+/**
  * `convert.ToIssue` → the contract `Issue`. Enrichment reads per render:
  * poster row, label join, milestone row, PR row (PRs only) — the same loads
  * upstream's toIssue performs (LoadPoster/LoadLabels/LoadMilestone/
@@ -228,6 +243,7 @@ async function pullRequestMetaOf(
 export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow): Promise<Issue> {
   const poster = await toPoster(d1, viewer, issue.posterId);
   const labelRows = await issueLabelRows(d1, issue.id);
+  const pinOrder = await pinOrderOf(d1, issue.id);
   const milestoneRow =
     issue.milestoneId === null
       ? null
@@ -264,7 +280,7 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
     time_estimate: issue.timeEstimate,
     pull_request: pullRequest,
     repository: toRepositoryMeta(pair),
-    pin_order: 0, // issue_pins is tier 2 (SPEC-0005 §3.2); upstream -1 → 0
+    pin_order: pinOrder === -1 ? 0 : pinOrder, // LoadPinOrder -1 (unpinned) → 0
     content_version: issue.contentVersion,
   };
 }
@@ -1269,9 +1285,14 @@ export async function userIdForFilter(d1: D1Database, name: string): Promise<num
   return user === null ? null : user.id;
 }
 
-/** `user does not exist` — APIErrorAuto's 422 rendering of ErrUserNotExist. */
+/**
+ * `user does not exist` — the getUserIDForFilter arm (routers/api/v1/repo/
+ * issue.go:469-479): APIErrorAuto(ErrUserNotExist) unwraps to the ErrNotExist
+ * family → 404 with the ErrUserNotExist text (models/user/error.go:46-58,
+ * UID unset = 0).
+ */
 export function userNotExistError(name: string): ApiError {
-  return new ApiError(422, `user does not exist [name: ${name}]`);
+  return new ApiError(404, `user does not exist [uid: 0, name: ${name}]`);
 }
 
 /**

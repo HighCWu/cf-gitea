@@ -477,7 +477,7 @@ describe("GET /repos/{owner}/{repo}/issues (issueListIssues)", () => {
     });
   });
 
-  it("resolves created_by and 422s unknown users", async () => {
+  it("resolves created_by and 404s unknown users with the upstream text", async () => {
     const owner = await seedUser("Alice");
     const neighbor = await seedUser("Bob");
     const repoId = await seedRepo(owner.usernameLower, "visible");
@@ -487,9 +487,18 @@ describe("GET /repos/{owner}/{repo}/issues (issueListIssues)", () => {
     const mine = await router()("/repos/alice/visible/issues?created_by=BOB");
     expect((await mine.json<Array<{ title: string }>>()).map((i) => i.title)).toEqual(["by bob"]);
 
+    // getUserIDForFilter → APIErrorAuto(ErrUserNotExist): the ErrNotExist
+    // family renders 404 with the ErrUserNotExist text, UID unset = 0
+    // (repo/issue.go:469-479, models/user/error.go:46-58).
     const unknown = await router()("/repos/alice/visible/issues?created_by=ghost");
-    expect(unknown.status).toBe(422);
-    expect(await unknown.json()).toEqual({ message: "user does not exist [name: ghost]", url: ERROR_URL });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toEqual({ message: "user does not exist [uid: 0, name: ghost]", url: ERROR_URL });
+
+    // The lookup is case-insensitive (lower_name = ToLower(name)) but the
+    // error echoes the name as given (ErrUserNotExist{Name: name}).
+    const unknownCase = await router()("/repos/alice/visible/issues?created_by=Ghost");
+    expect(unknownCase.status).toBe(404);
+    expect(await unknownCase.json()).toEqual({ message: "user does not exist [uid: 0, name: Ghost]", url: ERROR_URL });
   });
 
   it("404s an invisible repository", async () => {
@@ -561,6 +570,37 @@ describe("GET /repos/{owner}/{repo}/issues/{index} (issueGetIssue)", () => {
       message: `issue does not exist [id: 0, repo_id: ${otherRepoId}, index: 1]`,
       url: ERROR_URL,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pin_order (convert toIssue's LoadPinOrder — models/issues/issue.go:272-284)
+// ---------------------------------------------------------------------------
+
+describe("pin_order renders the real pin order (LoadPinOrder -1→0)", () => {
+  it("renders the pinned row's order and 0 for unpinned issues", async () => {
+    // The beforeEach-pinned stub identity (id 1, login cf-gitea-stub) owns
+    // this repo so the pin route's writer gate passes.
+    const repoId = await seedRepo("cf-gitea-stub", "pins");
+    await seedIssue(repoId, "first");
+    await seedIssue(repoId, "unpinned");
+    await seedIssue(repoId, "third");
+
+    // The write path allocates max_order + 1 per half (issue_pin.go:73-82).
+    expect((await router()("/repos/cf-gitea-stub/pins/issues/1/pin", { method: "POST", headers: authHeaders })).status).toBe(204);
+    expect((await router()("/repos/cf-gitea-stub/pins/issues/3/pin", { method: "POST", headers: authHeaders })).status).toBe(204);
+
+    const first = await router()("/repos/cf-gitea-stub/pins/issues/1");
+    expect(first.status).toBe(200);
+    expect(((await first.json<Record<string, unknown>>())).pin_order).toBe(1);
+
+    const unpinned = await router()("/repos/cf-gitea-stub/pins/issues/2");
+    expect(unpinned.status).toBe(200);
+    expect(((await unpinned.json<Record<string, unknown>>())).pin_order).toBe(0); // -1 → 0
+
+    const third = await router()("/repos/cf-gitea-stub/pins/issues/3");
+    expect(third.status).toBe(200);
+    expect(((await third.json<Record<string, unknown>>())).pin_order).toBe(2);
   });
 });
 
@@ -1944,8 +1984,8 @@ describe("GET /repos/issues/search (issueSearchIssues)", () => {
     await seedUser("Alice");
 
     const unknownOwner = await router()("/repos/issues/search?owner=ghost");
-    expect(unknownOwner.status).toBe(400);
-    expect(await unknownOwner.json()).toEqual({ message: "user does not exist [name: ghost]", url: ERROR_URL });
+    expect(unknownOwner.status).toBe(400); // SearchIssues maps ErrNotExist → 400
+    expect(await unknownOwner.json()).toEqual({ message: "user does not exist [uid: 0, name: ghost]", url: ERROR_URL });
 
     const teamless = await router()("/repos/issues/search?team=owners");
     expect(teamless.status).toBe(400);

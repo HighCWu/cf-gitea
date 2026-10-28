@@ -473,7 +473,24 @@ describe("contents reads (repoGetContentsList / repoGetContents) — the union s
     expect(atob(nestedBody.content as string)).toBe("deep doc\n");
     expect(nestedBody.last_commit_sha).toBe(TIP2); // added by the second seed commit
 
-    expect((await get(`${REPO_PATH}/contents/ghost.txt`)).status).toBe(404);
+    // Path misses ride upstream's GetTreeEntryByPath ErrNotExist text
+    // (modules/git/error.go:26): a missing final segment carries the full
+    // path — NOT the web locale string "The target couldn't be found."
+    const ghost = await get(`${REPO_PATH}/contents/ghost.txt`);
+    expect(ghost.status).toBe(404);
+    expect(await ghost.json()).toEqual({
+      message: "object does not exist [id: , rel_path: ghost.txt]",
+      url: `${ORIGIN}/api/swagger`,
+    });
+
+    // A missing INTERMEDIATE segment names itself (the upstream integration
+    // pin, tests/integration/api_repo_get_contents_test.go:92).
+    const nestedMiss = await get(`${REPO_PATH}/contents/no-such/file.md`);
+    expect(nestedMiss.status).toBe(404);
+    expect(await nestedMiss.json()).toEqual({
+      message: "object does not exist [id: , rel_path: no-such]",
+      url: `${ORIGIN}/api/swagger`,
+    });
   });
 
   it("resolves the ?ref= param (branch and tag)", async () => {
@@ -485,8 +502,14 @@ describe("contents reads (repoGetContentsList / repoGetContents) — the union s
     expect((await jsonBody(tagged)).last_commit_sha).toBe(TIP1);
     // An unknown non-hex ref is the upstream 404 (resolveRefCommit →
     // APIErrorAuto on git.ErrNotExist) — not the default branch's copy of the
-    // file (the strict resolver; upstream file.go:695-700).
-    expect((await get(`${REPO_PATH}/contents/README.md?ref=zzz-ghost`)).status).toBe(404);
+    // file (the strict resolver; upstream file.go:695-700). The ErrNotExist
+    // text rides the raw ref in `id` (modules/git/error.go:26).
+    const ghostRef = await get(`${REPO_PATH}/contents/README.md?ref=zzz-ghost`);
+    expect(ghostRef.status).toBe(404);
+    expect(await ghostRef.json()).toEqual({
+      message: "object does not exist [id: zzz-ghost, rel_path: ]",
+      url: `${ORIGIN}/api/swagger`,
+    });
   });
 });
 
