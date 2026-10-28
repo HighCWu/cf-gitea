@@ -1,6 +1,6 @@
 # Upstream issue draft — workerd/miniflare dev runtime: an un-drained `SqlStorage` cursor bricks `DROP TABLE` (`SQLITE_LOCKED`) on a sqlite-backed Durable Object for the whole session; a construction-time table-existence probe makes it recur in every session ("cross-session")
 
-Status: **READY TO FILE — repro blocker RESOLVED and first-hand re-verified
+Status: **FILED 2026-10-28 as [cloudflare/workers-sdk#16548](https://github.com/cloudflare/workers-sdk/issues/16548) — was READY TO FILE — repro blocker RESOLVED and first-hand re-verified
 2026-10-28** (the distillation pass converged the standalone repro; the
 completion unit re-executed it FOUR times, each with all 26 asserted
 predictions CONFIRMED and the transcripts preserved — including one run on a
