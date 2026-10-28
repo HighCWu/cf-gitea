@@ -28,13 +28,107 @@ bash scripts/mirror-e2e.sh http://127.0.0.1:5199   # explicit base URL
   `SRC_PORT`; whatever it is, `MIRROR_ALLOWED_HOST_LIST` must cover it).
 - Requirements: `git`, `curl`, `node`, `openssl` (the per-run TLS identity is
   generated, never committed), `pnpm`, and local migrations applied
-  (`pnpm db:migrate:local` — migration 0010 lands `repo_mirrors`).
+  (`pnpm db:migrate:local` — migration 0010 lands `repo_mirrors`). `sqlite3`
+  is optional but recommended: it powers the pre-server stale-cell-file sweep
+  (§ run hygiene); without it the sweep is skipped with a note.
 - The suite bootstraps its own fixtures under the fixed username `mirrore2e`
   (admin user + all-scopes PAT via `scripts/bootstrap-admin.mjs` on LOCAL D1)
   and deletes them again on a green run (`DELETE FROM users` cascades the
-  PATs). A red run leaves everything in place for debugging; the next run
-  pre-cleans it. Global git config changes are sandboxed into the script's
-  scratch `$HOME`.
+  PATs). A red run leaves everything in place for debugging; the next run's
+  pre-clean wipes prior-run state with checked deletes and verifies the wipe
+  before section 1 (see "Run hygiene" below). Global git config changes are
+  sandboxed into the script's scratch `$HOME`.
+
+## Run hygiene: interlock, checked deletes, stale-state guard
+
+Three harness behaviors landed 2026-10-28 after the sweep
+(`docs/reviews/e2e-sweep-2026-10-28.md`, open issues 2 and 4) demonstrated how
+prior-run leftovers and interleaved runs read as PRODUCT failures: an orphaned
+`mirrore2e/srcseed` cell carrying a stale DO head cascaded into a 17-failure
+run, and two concurrent invocations interleaved on the shared namespace into a
+41/44 storm. The suite now fails LOUDLY at startup instead.
+
+### 1. Concurrent-run interlock
+
+At startup the suite takes `apps/worker/.wrangler/state/mirror-e2e-run.lock`
+(an atomic `mkdir`, holding the runner pid). A second concurrent invocation
+fails immediately with "another mirror-e2e run is in flight" instead of
+interleaving. A lock left by a SIGKILLed run is reclaimed automatically when
+its holder pid is gone; if you ever need to force-clear while no run is
+active: `rm -rf apps/worker/.wrangler/state/mirror-e2e-run.lock`.
+
+### 2. Every setup/cleanup DELETE is checked
+
+The sweep proved a failed cleanup was invisible (the old setup discarded both
+the wrangler output and the engine DELETE responses — a `SQLITE_LOCKED` 500
+dropped a cell wipe silently and cascaded into product-check failures). Now:
+
+- Every pre-clean/cleanup D1 statement runs through `d1_checked`: wrangler's
+  exit code and its `success` flag are asserted, and a failure aborts the run
+  with the statement, the label naming the resource, and the driver error.
+- Every pre-clean engine DELETE must answer `200` (a stale cell existed and
+  was purged — logged) or `404` (nothing under that name); anything else —
+  a locked-cell 500, a worker restarting mid-request (curl `000`), a bad
+  token — aborts with the resource and code named.
+- A `200` is trusted only after the git surface CONFIRMS absence: the suite
+  polls `GET /mirrore2e/<repo>.git/info/refs?service=git-upload-pack` until
+  it reads `404` (up to 10 s). The D1-missing advert answers through the
+  registry-existence oracle, so a registry-known orphan cell serves refs
+  (`200`) while clean state 404s — the exact stale-cell state that poisoned
+  the 2026-10-28 runs cannot slip past this probe. The cleanup mirrors the
+  same verified-purge poll before declaring a green run tidy.
+
+### 3. Stale prior-run state: wiped and verified, not trusted
+
+Design choice: **(b) verifiable wipe** rather than refuse-to-start. The suite
+already owned a pre-clean phase, so refusing to start would have added a
+manual step between every red run and its retry; wiping keeps green runs
+self-sufficient while an UNVERIFIABLE wipe (purge dropped, cell locked,
+server unhealthy) still aborts the run at startup — naming the resource and
+pointing at the recovery below — instead of surfacing mid-run as failures in
+product checks. At startup the suite counts and reports what it owns from
+prior runs (`repositories`/`users` rows under `mirrore2e`, cells under its
+four fixed repo names), wipes it with the checked deletes above, logs what it
+wiped, and re-verifies absence before section 1.
+
+Two wipes are involved, in order:
+
+1. **Pre-server cell-file sweep.** A completed async cell purge leaves the
+   cell's sqlite file behind as an empty husk, and a later engine DELETE of
+   that name answers `HTTP 500 — database table is locked: SQLITE_LOCKED` on
+   it, deterministically, across dev-server restarts (reproduced 2026-10-28
+   on a quiet fresh server; product-side open issue — see "Known red"). The
+   file level is the only reliable wipe, so — before its dev server starts,
+   while nothing holds the files open — the suite removes ONLY the cell
+   files whose embedded DO name (`__miniflare_do_name`) is under
+   `mirrore2e/`, logging each removal. Other suites' cells (`demo/*`,
+   `lfse2e/*`, `dpprobe/*`) are never touched. Requires `sqlite3` (preflight
+   of the repo's local D1 already implies dev tooling; GitHub's
+   ubuntu-latest ships it); without it the sweep is skipped with a note and
+   the checked DELETEs still abort loudly on an unwipeable cell.
+2. **The checked engine DELETEs + verified absence** (behavior 2 above) for
+   everything reachable through the API/git surface — D1-resolvable rows,
+   registry-known orphans, cells whose purge raced.
+
+### Stale-state recovery (manual one-liner)
+
+With `sqlite3` present the pre-server sweep makes back-to-back runs
+self-sufficient — no manual step. The manual path remains for environments
+without sqlite3, or when a cell file cannot be removed because a foreign
+process holds it open (the suite aborts naming the file):
+
+```bash
+# no dev server may be running (the suite stops its own on exit);
+# check ports 5199/8443 are free first
+rm -rf apps/worker/.wrangler/state/v3/do/cf-gitea-RepoCell
+```
+
+This removes every local repo's DO cell files — dev scratch only (D1 rows and
+R2 packs live elsewhere, and each suite's setup re-creates its own fixtures
+under a swept namespace, so nothing else needs those cells). Then re-run
+`pnpm test:mirror`: the pre-clean re-verifies the slate. If the cell files
+are held open by a still-running dev server, stop it first — removing files
+under a live server is what produced the locked cells in the first place.
 
 ## Dev environment contract (why the extra config)
 
@@ -163,9 +257,25 @@ to be 32 base64 bytes for the AES-256-GCM KEK.)
 
 ## Known red
 
-**None on the current tree** — the suite runs fully green against it. The two
-product gaps the suite found on its first run were both fixed since (the suite
-is what surfaced them, so they are kept here for the record):
+**None on the current tree** — the suite runs fully green against it (the
+run-hygiene layer self-heals the environmental state below harness-side).
+The two product gaps the suite found on its first run were both fixed since
+(the suite is what surfaced them, so they are kept here for the record), and
+one new product-side finding was surfaced by the hardening and REPORTED, not
+fixed here (product source is out of the harness unit's scope):
+
+3. **Engine DELETE 500s (`SQLITE_LOCKED`) on a purged cell's husk file** —
+   after a successful engine DELETE + async purge completes, the cell's
+   sqlite file remains as an empty husk, and EVERY later engine DELETE of
+   that name answers `HTTP 500 — database table is locked: SQLITE_LOCKED`,
+   deterministically and across dev-server restarts (reproduced 2026-10-28
+   on a quiet fresh server for all four `mirrore2e` names). Before the
+   run-hygiene hardening this 500 was invisible (the setup discarded the
+   response) and cascaded into whole-run failure storms; now the pre-server
+   cell-file sweep removes the husk harness-side. The product-side follow-ups
+   named in `docs/reviews/e2e-sweep-2026-10-28.md` (open issue 2) — a wipe
+   retry/backoff, a DLQ or tombstone-era reaper for dropped purge messages,
+   husk cleanup — remain open.
 
 1. **v2 advertisement with the `# service=` preamble failed to parse** —
    `apps/worker/src/services/mirror/gitclient.ts` `parseInfoRefsAdvert` only

@@ -11,6 +11,15 @@
 # lines, wrangler D1 introspection against the dev server's own state, and
 # full cleanup on a green run. CI wiring stays in scripts/mirror-e2e.README.md.
 #
+# Run hygiene (2026-10-28 sweep hardening, README § run hygiene):
+#   - a concurrent-run interlock (a second invocation fails immediately);
+#   - every setup/cleanup DELETE is CHECKED — a failed D1 statement or a
+#     non-200/404 engine DELETE aborts the run naming the resource;
+#   - stale prior-run state is wiped and verified: its own cell FILES pre-server
+#     (a purged cell leaves an unwipeable husk the DELETE surface 500s
+#     SQLITE_LOCKED on — product finding, reported), its D1 rows and cells via
+#     checked DELETEs, and every wipe re-verified (advert 404) before section 1.
+#
 # Dev-environment requirements (the script fails with exact instructions when
 # missing — see the README for why):
 #   apps/worker/.dev.vars must carry GIT_TOKEN, MIRROR_ALLOWED_HOST_LIST (an
@@ -73,6 +82,8 @@ command -v pnpm >/dev/null 2>&1 || { echo "FATAL: pnpm not found"; exit 1; }
 DIR=$(mktemp -d /tmp/cgit-mirror-e2e.XXXXXX)
 FIXTURE_PID=""
 SERVER_PID=""
+LOCK_DIR=""
+LOCK_HELD=""
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
@@ -81,15 +92,90 @@ fatal() { echo "FATAL: $1"; exit 1; }
 
 cleanup() {
   # Runs from the EXIT trap (registered before the fixture starts, so even a
-  # preflight fatal never leaks either process).
+  # preflight fatal never leaks either process — or the run lock below; a
+  # SIGKILLed run leaves the lock to be reclaimed by holder-pid liveness).
   if [ -n "$FIXTURE_PID" ]; then kill "$FIXTURE_PID" 2>/dev/null || true; fi
   if [ -n "$SERVER_PID" ]; then kill -- -"$SERVER_PID" 2>/dev/null || kill "$SERVER_PID" 2>/dev/null || true; fi
+  if [ -n "$LOCK_HELD" ]; then rm -rf "$LOCK_DIR" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 
+# --- concurrent-run interlock --------------------------------------------------
+# Two concurrent invocations share this checkout's local D1/DO state, the
+# mirrore2e namespace, and the fixture/dev-server ports; interleaved runs
+# poison each other and read as product failures (2026-10-28 sweep run A: two
+# runs interleaved on the shared namespace, a 41/44 storm). mkdir is the
+# atomic test-and-set; the pid file lets a crashed run's lock be reclaimed
+# automatically instead of wedging the suite.
+LOCK_DIR="$WORKER_DIR/.wrangler/state/mirror-e2e-run.lock"
+mkdir -p "$(dirname "$LOCK_DIR")"
+if mkdir "$LOCK_DIR" 2>/dev/null; then
+  LOCK_HELD=1
+  echo $$ > "$LOCK_DIR/pid"
+else
+  LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+  if [ -n "$LOCK_PID" ] && ! kill -0 "$LOCK_PID" 2>/dev/null; then
+    echo "== reclaiming stale run lock (holder pid $LOCK_PID is gone) =="
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || fatal "cannot reclaim the run lock $LOCK_DIR"
+    LOCK_HELD=1
+    echo $$ > "$LOCK_DIR/pid"
+  else
+    fatal "another mirror-e2e run is in flight (lock $LOCK_DIR held by pid ${LOCK_PID:-unknown}) — wait for it to finish; if no run is active: rm -rf $LOCK_DIR"
+  fi
+fi
+
+# --- stale-cell file sweep (harness-owned dev scratch, BEFORE the server) -------
+# A completed async cell purge leaves the cell's sqlite file behind as an empty
+# husk, and a later engine DELETE of that name answers HTTP 500
+# `database table is locked: SQLITE_LOCKED` on it — deterministically, across
+# dev-server restarts (2026-10-28, reproduced on a quiet fresh server). The
+# file level is the only reliable wipe (the sweep report's own repair
+# precedent), so the suite removes ONLY the cell files whose embedded DO name
+# is under its own namespace — never another suite's cells — while no server
+# holds them open. Missing sqlite3 degrades gracefully: the checked DELETEs
+# below still abort loudly on an unwipeable cell, with the recovery pointer.
+CELL_DIR="$WORKER_DIR/.wrangler/state/v3/do/cf-gitea-RepoCell"
+if [ -d "$CELL_DIR" ]; then
+  if command -v sqlite3 >/dev/null 2>&1; then
+    for f in "$CELL_DIR"/*.sqlite; do
+      [ -e "$f" ] || continue
+      cellname=$(sqlite3 "file:$f?mode=ro" "SELECT name FROM __miniflare_do_name LIMIT 1" 2>/dev/null)
+      case "$cellname" in
+        "$OWNER"/*)
+          rm -f "$f" "$f-wal" "$f-shm" \
+            || fatal "cannot remove the stale cell file for $cellname ($f) — is a dev server still holding it open? stop it and re-run"
+          echo "  .. removed stale cell file $cellname ($(basename "$f"))"
+          ;;
+      esac
+    done
+  else
+    echo "  .. (sqlite3 not found — skipping the pre-server cell-file sweep; an unwipeable stale cell will abort pre-clean with recovery instructions)"
+  fi
+fi
+
 # --- D1 introspection (wrangler shares the dev server's local state) ---------
 d1() { (cd "$WORKER_DIR" && pnpm exec wrangler d1 execute cf-gitea --local --json --command "$1" 2>/dev/null); }
-d1_field() { d1 "$1" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{const docs=JSON.parse(s.slice(s.indexOf("[")));const row=docs.at(-1).results[0];console.log(row?Object.values(row)[0]:"")}catch{console.log("")}})'; }
+_json_field() { node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{const docs=JSON.parse(s.slice(s.indexOf("[")));const row=docs.at(-1).results[0];console.log(row?Object.values(row)[0]:"")}catch{console.log("")}})'; }
+d1_field() { d1 "$1" | _json_field; }
+# Checked D1 statement: wrangler reports failures with a non-zero exit and an
+# {"error": …} body on stdout (verified: a bad table → exit 1, "no such table").
+# The plain d1() discards all of that — exactly how a failed pre-clean passed
+# silently and poisoned the run (2026-10-28 sweep, open issue 2). Every
+# setup/cleanup DELETE goes through here; on success D1_OUT carries the JSON
+# (for d1_field-style extraction by the caller).
+D1_OUT=""
+d1_checked() { # <sql> <label> — aborts the run unless wrangler reports success
+  local rc
+  D1_OUT=$(d1 "$1"); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fatal "D1 statement FAILED (${2}), wrangler exit ${rc} — statement: ${1}
+       wrangler said: $(printf '%s' "$D1_OUT" | tr '\n' ' ' | head -c 300)
+       if this repeats across runs the local dev scratch may be locked — see scripts/mirror-e2e.README.md (§ stale-state recovery)"
+  fi
+  printf '%s' "$D1_OUT" | grep -q '"success"[[:space:]]*:[[:space:]]*true' \
+    || fatal "D1 statement did not report success (${2}) — statement: ${1}"
+}
 
 # --- JSON field extraction (dot path into an API response body) --------------
 jf() { printf '%s' "$1" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{const v=process.argv[1].split(".").reduce((o,k)=>o===undefined||o===null?o:o[k],JSON.parse(s));console.log(v===undefined||v===null?"":String(v))}catch{console.log("")}})' "$2"; }
@@ -188,23 +274,62 @@ if [ "$up" != 1 ]; then
 fi
 ok "dev server healthy at $BASE (workerd trusts the fixture CA via SSL_CERT_FILE)"
 
-# --- setup: fresh user + PAT, clean slate (D1 + engine) ------------------------
-echo "== setup: bootstrap $OWNER + PAT (local D1), clean slate for repeat runs =="
-d1 "DELETE FROM repo_mirrors WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" >/dev/null
-d1 "DELETE FROM repo_units WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" >/dev/null
-d1 "DELETE FROM repo_counters WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" >/dev/null
-d1 "DELETE FROM repositories WHERE owner_namespace = '$OWNER'" >/dev/null
-d1 "DELETE FROM users WHERE username_lower = '$OWNER'" >/dev/null   # cascades personal_access_tokens
+# --- setup: fresh user + PAT, VERIFIED clean slate (D1 + engine) ----------------
+echo "== setup: verified clean slate for $OWNER (prior-run state detected, wiped, re-verified) =="
+# Stale-state guard (2026-10-28 sweep hardening): cells/rows surviving from a
+# prior run silently poisoned later sections (an orphaned cell carried a
+# pre-fix DO head and cascaded into a 17-failure storm). The suite wipes
+# prior-run state with CHECKED statements and re-verifies the wipe before
+# section 1 — an unverifiable wipe aborts HERE with the resource named,
+# instead of cascading into product-check failures mid-run. Design choice
+# (wipe-and-verify, not refuse-to-start) is documented in the README.
+d1_checked "SELECT COUNT(*) AS n FROM repositories WHERE owner_namespace = '$OWNER'" "stale-state detection (repositories)"
+STALE_REPOS=$(printf '%s' "$D1_OUT" | _json_field)
+d1_checked "SELECT COUNT(*) AS n FROM users WHERE username_lower = '$OWNER'" "stale-state detection (users)"
+STALE_USERS=$(printf '%s' "$D1_OUT" | _json_field)
+[ -n "$STALE_REPOS" ] && [ -n "$STALE_USERS" ] || fatal "cannot read the local D1 to assess prior-run state (wrangler produced no count)"
+if [ "$STALE_REPOS" != "0" ] || [ "$STALE_USERS" != "0" ]; then
+  echo "  .. stale state from a prior run: repositories=$STALE_REPOS, users=$STALE_USERS — wiping"
+fi
+d1_checked "DELETE FROM repo_mirrors WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" "pre-clean repo_mirrors sweep"
+d1_checked "DELETE FROM repo_units WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" "pre-clean repo_units sweep"
+d1_checked "DELETE FROM repo_counters WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" "pre-clean repo_counters sweep"
+d1_checked "DELETE FROM repositories WHERE owner_namespace = '$OWNER'" "pre-clean repositories sweep"
+d1_checked "DELETE FROM users WHERE username_lower = '$OWNER'" "pre-clean users sweep"   # cascades personal_access_tokens
+check "$(d1_field "SELECT COUNT(*) FROM repositories WHERE owner_namespace = '$OWNER'")" "0" "pre-clean: D1 rows swept"
 
 BOOT=$(node "$ROOT/scripts/bootstrap-admin.mjs" "$OWNER" 2>/dev/null)
 TOKEN=$(echo "$BOOT" | grep -oE 'cfg_[0-9a-f]{8}_[A-Z2-9]{32}' | head -1)
 [ -n "$TOKEN" ] || { echo "$BOOT"; fatal "bootstrap-admin.mjs produced no token"; }
 ok "bootstrapped $OWNER with an all-scopes PAT"
-# Best-effort engine-side sweep of a previous red run's cells (D1 rows are gone
-# at this point, so these ride the transitional passthrough; PAT-authorized).
+# Engine-side sweep of a prior run's cells (D1 rows are gone at this point, so
+# these ride the transitional passthrough; PAT-authorized). Every response is
+# CHECKED: 200 = a stale cell existed and was purged (logged), 404 = nothing
+# was there — anything else (a 500 from a locked cell, a worker restarting
+# mid-request, a dropped purge) aborts the run loudly instead of surviving
+# invisibly as the 2026-10-28 sweep proved it could.
 for repo in srcseed target v0target probe; do
-  curl -s -o /dev/null -X DELETE -u "x:$TOKEN" "$BASE/$OWNER/$repo" 2>/dev/null
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -u "x:$TOKEN" "$BASE/$OWNER/$repo" 2>/dev/null)
+  case "$code" in
+    200) echo "  .. wiped stale cell $OWNER/$repo (engine DELETE 200)";;
+    404) ;;
+    *) fatal "pre-clean engine DELETE $OWNER/$repo returned HTTP ${code:-none} (want 200 or 404) — a prior-run cell that cannot be wiped poisons the whole run; recover per scripts/mirror-e2e.README.md (§ stale-state recovery)";;
+  esac
 done
+# Trust only VERIFIED absence: a 200 can precede an async cell purge that is
+# still in flight (or was dropped), so each name is polled on the git surface
+# until it reads 404 (the D1-miss path answers through the registry-existence
+# oracle: a registry-known orphan serves refs → 200, clean state → 404).
+for repo in srcseed target v0target probe; do
+  code=""
+  for _ in $(seq 1 10); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -u "x:$TOKEN" "$BASE/$OWNER/$repo.git/info/refs?service=git-upload-pack" 2>/dev/null)
+    [ "$code" = "404" ] && break
+    sleep 1
+  done
+  [ "$code" = "404" ] || fatal "stale cell $OWNER/$repo still serves refs after its DELETE (last HTTP ${code:-none}) — the purge was dropped or lost the race; recover per scripts/mirror-e2e.README.md (§ stale-state recovery)"
+done
+ok "engine cells verified absent (srcseed target v0target probe)"
 
 AUTH_BASE=$(echo "$BASE" | sed "s|://|://$OWNER:$TOKEN@|")
 
@@ -502,7 +627,7 @@ esac
 check $? 0 "mirror is a snapshot: target still serves full clones with the source dead"
 
 # =============================================================================
-echo "== cleanup: engine DELETE + D1 row sweep =="
+echo "== cleanup: engine DELETE + verified purge + D1 row sweep =="
 if [ "$FAIL" -eq 0 ]; then
   for repo in srcseed target v0target; do
     code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -u "x:$TOKEN" "$BASE/$OWNER/$repo")
@@ -510,11 +635,25 @@ if [ "$FAIL" -eq 0 ]; then
   done
   code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -u "x:$TOKEN" "$BASE/$OWNER/probe")
   case "$code" in 200|404) ok "engine DELETE probe (200 or 404 — the empty probe repo may have no cell)";; *) fail "engine DELETE probe got $code";; esac
-  d1 "DELETE FROM repo_mirrors WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" >/dev/null
-  d1 "DELETE FROM repo_units WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" >/dev/null
-  d1 "DELETE FROM repo_counters WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" >/dev/null
-  d1 "DELETE FROM repositories WHERE owner_namespace = '$OWNER'" >/dev/null
-  d1 "DELETE FROM users WHERE username_lower = '$OWNER'" >/dev/null
+  d1_checked "DELETE FROM repo_mirrors WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" "cleanup repo_mirrors sweep"
+  d1_checked "DELETE FROM repo_units WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" "cleanup repo_units sweep"
+  d1_checked "DELETE FROM repo_counters WHERE repo_id IN (SELECT id FROM repositories WHERE owner_namespace = '$OWNER')" "cleanup repo_counters sweep"
+  d1_checked "DELETE FROM repositories WHERE owner_namespace = '$OWNER'" "cleanup repositories sweep"
+  # Verified purge (the setup guard, mirrored here): the 200s above only
+  # cover the delete response — a dropped async purge would leave a cell
+  # serving stale refs to the NEXT run, so absence is proven on the git
+  # surface before declaring the cleanup done. Runs while the PAT is still
+  # valid (before the users sweep below cascades it).
+  for repo in srcseed target v0target probe; do
+    code=""
+    for _ in $(seq 1 10); do
+      code=$(curl -s -o /dev/null -w '%{http_code}' -u "x:$TOKEN" "$BASE/$OWNER/$repo.git/info/refs?service=git-upload-pack" 2>/dev/null)
+      [ "$code" = "404" ] && break
+      sleep 1
+    done
+    check "$code" "404" "cell purge verified: $OWNER/$repo serves 404"
+  done
+  d1_checked "DELETE FROM users WHERE username_lower = '$OWNER'" "cleanup users sweep"   # cascades personal_access_tokens
   check "$(d1_field "SELECT COUNT(*) FROM repositories WHERE owner_namespace = '$OWNER'")" "0" "repositories rows swept"
   check "$(d1_field "SELECT COUNT(*) FROM repo_mirrors m JOIN repositories r ON r.id = m.repo_id WHERE r.owner_namespace = '$OWNER'")" "0" "mirror rows swept"
 else
