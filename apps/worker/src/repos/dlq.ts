@@ -51,6 +51,7 @@
 
 import { isMirrorSyncMessage } from "../services/mirror/sync";
 import { isPushMirrorSyncMessage } from "../services/mirror/push-sync";
+import { isDemoSweepMessage } from "../services/demo-sweep";
 import { isForkMessage } from "./fork-task";
 import { isImportMessage } from "./imports/pipeline";
 import { isRepoPurgeMessage } from "./purge";
@@ -68,6 +69,7 @@ function kindLabel(body: unknown): string {
   if (isImportMessage(body)) return body.kind;
   if (isMirrorSyncMessage(body)) return "mirror-sync";
   if (isPushMirrorSyncMessage(body)) return "push-mirror-sync";
+  if (isDemoSweepMessage(body)) return "demo-sweep";
   if (isRepoPurgeMessage(body)) return "repo-purge";
   return "unknown";
 }

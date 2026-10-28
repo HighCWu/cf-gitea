@@ -12,9 +12,9 @@ import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
 import { repoTasksDlqHandler } from "./repos/dlq";
-import { enqueueDueMirrorSyncs } from "./services/mirror/sync";
 import { handleUserPushEvent } from "./services/webhooks-push";
-import { enqueueDuePushMirrorSyncs, enqueuePushMirrorSyncsOnCommit } from "./services/mirror/push-sync";
+import { enqueuePushMirrorSyncsOnCommit } from "./services/mirror/push-sync";
+import { handleScheduledCron } from "./services/demo-sweep";
 import { handlesUiRoute, uiRouter } from "./ui";
 import { sessionRouter } from "./ui/session";
 import { firstRunRouter } from "./ui/first-run";
@@ -241,11 +241,11 @@ export default {
   // budget (AGENTS.md Workers rules) — SELECT + enqueue ONLY here; the sync
   // itself runs in the REPO_TASKS consumer (handleRepoTasks →
   // handleMirrorSync).
-  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
-    await enqueueDueMirrorSyncs(env, {});
-    // Push-mirror cadence (SPEC §4): same 30 s cron CPU shape — SELECT +
-    // enqueue only; the REPO_TASKS consumer performs the pushes.
-    await enqueueDuePushMirrorSyncs(env, {});
+  async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
+    // SPEC-0014 M1 dispatch: the hourly string runs ONLY the demo sweep
+    // producer (gate-checked, silent when off); every other cadence runs the
+    // mirror producers unconditionally (their CAS absorbs overlaps).
+    await handleScheduledCron(controller, env);
   },
 
   // Queue consumers: REPO_TASKS = delete purge (SPEC-0003 §2.5.5), import
