@@ -155,13 +155,15 @@ import { drizzle } from "drizzle-orm/d1";
 import { and, eq, inArray } from "drizzle-orm";
 
 import {
+  feedIssueTitles,
   getFeedRows,
   renderFeedItems,
   type Activity,
+  type FeedIssueKey,
 } from "../../api/services/activity-feeds";
 import { renderMarkdownToHtml } from "../../api/services/markdown";
 import type { Viewer as ApiViewer } from "../../api/services/repository";
-import { issues, orgMembers, repositories } from "../../db/schema";
+import { orgMembers, repositories } from "../../db/schema";
 import type { Viewer } from "../viewer";
 import { ellipsisDisplay, issueIndexOf, issueInfos } from "./activity-feeds";
 
@@ -635,10 +637,11 @@ function feedsApiUser(viewer: Viewer, origin: string): ApiViewer {
  * `showUserFeed`'s data arm (profile.go:33-91): the includePrivate ladder
  * (self/admin; the org-member arm for org feeds), `getFeedRows` at page 1 ×
  * 30 with the `?date=` passthrough and `OnlyPerformedBy = kind === "user"`,
- * `renderFeedItems`, the batched live-issue lookups the title/description
- * arms read (the page module's coordinates→TEXT-id join), then the channel
- * fields. The visibility gate lives in the route's resolution seam (the
- * HANDOFF NOTE) — the loader takes the already-resolved subject.
+ * `renderFeedItems`, the service's batched live-issue read the
+ * title/description arms project ({title, isPull, content} over the page's
+ * coordinates→TEXT-id join — the query-shape audit's C2 follow-up), then
+ * the channel fields. The visibility gate lives in the route's resolution
+ * seam (the HANDOFF NOTE) — the loader takes the already-resolved subject.
  */
 export async function loadUserFeedData(
   d1: D1Database,
@@ -681,8 +684,12 @@ export async function loadUserFeedData(
   const activities = await renderFeedItems(d1, feedsApiUser(viewer, origin), rows);
 
   // The live-issue lookups: coordinates → TEXT repositories.id (the
-  // numeric-payload join note) → one batched issues read over the page's
-  // (repoId, index) pairs.
+  // numeric-payload join note) → the service's batched issues read over
+  // the page's (repoId, index) pairs, widened with isPull + content (the
+  // HTMLURL-path split / GetIssueContent arms). The repo-only select this
+  // replaced read EVERY issue of the referenced repos and post-filtered
+  // (the query-shape audit's C2); the consolidated shape filters both
+  // columns through the (repo_id, index) unique index.
   const coordinates = [
     ...new Set(
       activities.map((activity) => `${activity.repo?.owner?.login ?? ""}/${activity.repo?.name ?? ""}`),
@@ -702,37 +709,28 @@ export async function loadUserFeedData(
     }
   }
 
-  const issueLookups: FeedIssueLookups = new Map();
-  const repoIds = new Set<string>();
+  const issueKeys = new Map<string, FeedIssueKey>();
   for (const activity of activities) {
     const index = issueIndexOf(activity.content);
     if (index <= 0) continue;
     const repoId = repoIdByCoordinates.get(
       `${activity.repo?.owner?.login ?? ""}/${activity.repo?.name ?? ""}`,
     );
-    if (repoId !== undefined) repoIds.add(repoId);
+    if (repoId !== undefined) issueKeys.set(`${repoId}#${index}`, { repoId, index });
   }
-  if (repoIds.size > 0) {
-    const issueRows = await drizzle(d1)
-      .select({ repoId: issues.repoId, index: issues.index, title: issues.title, isPull: issues.isPull, content: issues.content })
-      .from(issues)
-      .where(inArray(issues.repoId, [...repoIds]))
-      .all();
-    const repoIdToCoordinates = new Map<string, string[]>();
-    for (const [key, repoId] of repoIdByCoordinates) {
-      const list = repoIdToCoordinates.get(repoId) ?? [];
-      list.push(key);
-      repoIdToCoordinates.set(repoId, list);
-    }
-    for (const row of issueRows) {
-      const keys = repoIdToCoordinates.get(row.repoId) ?? [];
-      for (const key of keys) {
-        issueLookups.set(`${key}#${row.index}`, {
-          title: row.title,
-          isPull: row.isPull,
-          content: row.content ?? "",
-        });
-      }
+  const issueRows = await feedIssueTitles(d1, issueKeys.values(), { withIssueFields: true });
+  const repoIdToCoordinates = new Map<string, string[]>();
+  for (const [key, repoId] of repoIdByCoordinates) {
+    const list = repoIdToCoordinates.get(repoId) ?? [];
+    list.push(key);
+    repoIdToCoordinates.set(repoId, list);
+  }
+  const issueLookups: FeedIssueLookups = new Map();
+  for (const [key, pair] of issueKeys) {
+    const row = issueRows.get(key);
+    if (row === undefined) continue; // referenced pair with no row → the load-error literal
+    for (const coordinate of repoIdToCoordinates.get(pair.repoId) ?? []) {
+      issueLookups.set(`${coordinate}#${pair.index}`, row);
     }
   }
 

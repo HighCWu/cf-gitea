@@ -573,10 +573,11 @@ function numericRepoId(id: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// The page loaders' live-issue-title lookup (GetIssueTitle).
+// The page loaders' live-issue lookup (GetIssueTitle / GetIssueContent /
+// the loaded *Issue's HTMLURL path).
 // ---------------------------------------------------------------------------
 
-/** One referenced (repoId, index) pair the live-title arms need. */
+/** One referenced (repoId, index) pair the live-issue arms need. */
 export interface FeedIssueKey {
   /** TEXT repositories.id. */
   repoId: string;
@@ -584,41 +585,87 @@ export interface FeedIssueKey {
   index: number;
 }
 
+/** The full live-issue row the wide read returns (the user-feed XML's
+ *  projection: GetIssueTitle's title, Issue.HTMLURL's is_pull path split,
+ *  GetIssueContent's body). */
+export interface FeedIssueLookupRow {
+  /** The issues.title column (GetIssueTitle). */
+  title: string;
+  /** The issues.is_pull flag (the issues-vs-pulls HTMLURL path). */
+  isPull: boolean;
+  /** The issues.content body (GetIssueContent); NULL renders "". */
+  content: string;
+}
+
+/** Options for `feedIssueTitles`. Omitted → the title-only read the feed
+ *  page loaders ride. */
+export interface FeedIssueReadOptions {
+  /** Widen the read past the title: also fetch is_pull + content and
+   *  return full `FeedIssueLookupRow`s (the user-feed XML loader's
+   *  projection needs all three — same one select, wider column list). */
+  readonly withIssueFields: true;
+}
+
 /**
- * The batched live-issue-title read behind feeds.tmpl's GetIssueTitle arms
+ * The batched live-issue read behind feeds.tmpl's GetIssueTitle arms
  * (models/activities/action.go:386-403) — the shared shape the feed page
- * loaders' title lookups consolidate onto (the UI activity page's loader
- * rides it since the query-shape audit's C2). ONE issues select over the
- * page's (repoId, index) pairs with BOTH columns filtered: the audit's C2 —
- * a repo-only `inArray(issues.repoId, ...)` read fetched EVERY issue of the
- * referenced repos and post-filtered (hundreds of rows to title ≤ page size
- * on a grown corpus); the added `inArray(issues.index, ...)` rides the
- * (repo_id, index) unique index as exact probes instead. The in-memory pair
- * filter still runs — repo × index cross products can over-match rows — so
- * exactness is unchanged.
+ * loaders' issue lookups consolidate onto (the UI activity page's loader
+ * rides it since the query-shape audit's C2; the user-feed XML loader
+ * since the C2 follow-up). ONE issues select over the page's (repoId,
+ * index) pairs with BOTH columns filtered: the audit's C2 — a repo-only
+ * `inArray(issues.repoId, ...)` read fetched EVERY issue of the referenced
+ * repos and post-filtered (hundreds of rows to title ≤ page size on a
+ * grown corpus); the added `inArray(issues.index, ...)` rides the
+ * (repo_id, index) unique index as exact probes instead. The in-memory
+ * pair filter still runs — repo × index cross products can over-match
+ * rows — so exactness is unchanged.
  *
  * Returns `"repoId#index"` → title (the loaders' join key); a referenced
  * pair with no row is simply absent — the caller renders the upstream
- * load-error literal.
+ * load-error literal. With `{ withIssueFields: true }` the same select
+ * widens its column list and returns `"repoId#index"` →
+ * `FeedIssueLookupRow` instead.
  */
 export async function feedIssueTitles(
   db: D1Database,
   keys: Iterable<FeedIssueKey>,
-): Promise<Map<string, string>> {
+): Promise<Map<string, string>>;
+export async function feedIssueTitles(
+  db: D1Database,
+  keys: Iterable<FeedIssueKey>,
+  options: FeedIssueReadOptions,
+): Promise<Map<string, FeedIssueLookupRow>>;
+export async function feedIssueTitles(
+  db: D1Database,
+  keys: Iterable<FeedIssueKey>,
+  options?: FeedIssueReadOptions,
+): Promise<Map<string, string> | Map<string, FeedIssueLookupRow>> {
   const pairs = [...new Map([...keys].map((key) => [`${key.repoId}#${key.index}`, key] as const)).values()];
-  const titles = new Map<string, string>();
-  if (pairs.length === 0) return titles;
+  if (pairs.length === 0) return new Map<string, string>();
   const wanted = new Set(pairs.map((pair) => `${pair.repoId}#${pair.index}`));
+  const where = and(
+    inArray(issues.repoId, [...new Set(pairs.map((pair) => pair.repoId))]),
+    inArray(issues.index, [...new Set(pairs.map((pair) => pair.index))]),
+  );
+  if (options?.withIssueFields === true) {
+    const rows = await drizzle(db)
+      .select({ repoId: issues.repoId, index: issues.index, title: issues.title, isPull: issues.isPull, content: issues.content })
+      .from(issues)
+      .where(where)
+      .all();
+    const lookups = new Map<string, FeedIssueLookupRow>();
+    for (const row of rows) {
+      const key = `${row.repoId}#${row.index}`;
+      if (wanted.has(key)) lookups.set(key, { title: row.title, isPull: row.isPull, content: row.content ?? "" });
+    }
+    return lookups;
+  }
   const rows = await drizzle(db)
     .select({ repoId: issues.repoId, index: issues.index, title: issues.title })
     .from(issues)
-    .where(
-      and(
-        inArray(issues.repoId, [...new Set(pairs.map((pair) => pair.repoId))]),
-        inArray(issues.index, [...new Set(pairs.map((pair) => pair.index))]),
-      ),
-    )
+    .where(where)
     .all();
+  const titles = new Map<string, string>();
   for (const row of rows) {
     const key = `${row.repoId}#${row.index}`;
     if (wanted.has(key)) titles.set(key, row.title);
