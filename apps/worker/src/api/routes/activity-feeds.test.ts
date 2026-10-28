@@ -10,6 +10,8 @@
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { OpenAPIHono } from "@hono/zod-openapi";
+import { drizzle } from "drizzle-orm/d1";
+import { inArray } from "drizzle-orm";
 
 import {
   createOptionalTokenAuthMiddleware,
@@ -22,7 +24,25 @@ import type { ApiEnv } from "../env";
 import { registerActivityFeedRoutes } from "./activity-feeds";
 import { emitRepoEvent, type RepoEventEmission } from "../../services/repo-events";
 import { emitIssueEvent, type IssueEventEmission } from "../../services/issue-events";
-import { recordAction, ActionType } from "../services/activity-feeds";
+import {
+  ActionType,
+  getFeedRows,
+  opTypeName,
+  recordAction,
+  renderFeedItems,
+  type Activity,
+  type FeedQueryOptions,
+} from "../services/activity-feeds";
+import { toApiComment } from "../services/issues";
+import {
+  apiUserFromRow,
+  findRepositoryById,
+  toApiRepository,
+  type RepositoryWithOwner,
+  type Viewer,
+} from "../services/repository";
+import { type Comment } from "../models/issue";
+import { comments, issues, users } from "../../db/schema";
 
 const NOW = new Date("2026-02-03T04:05:06Z");
 const REPO_ID = "7300";
@@ -52,12 +72,12 @@ function resolver(): AuthResolver {
   };
 }
 
-function familyApp(register: (app: OpenAPIHono<ApiEnv>) => void) {
+function familyApp(register: (app: OpenAPIHono<ApiEnv>) => void, fetchEnv: ApiEnv["Bindings"] = env) {
   const app = new OpenAPIHono<ApiEnv>();
   app.onError(giteaErrorHandler);
   register(app);
   return async (path: string, init?: RequestInit): Promise<Response> =>
-    Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), env));
+    Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), fetchEnv));
 }
 
 const authed = (init?: RequestInit, token = TOKEN): RequestInit => {
@@ -450,5 +470,207 @@ describe("activity feeds — the is_deleted read filter (GetFeeds parity pin)", 
     const res = await feedsApp(`/repos/alice/repo/activities/feeds`);
     expect(res.headers.get("X-Total-Count")).toBe("1");
     expect(await res.json<unknown[]>()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query-shape witness (docs/research/query-shape-audit.md A8) — the feed
+// render resolved each DISTINCT repo through findRepositoryById and each
+// live comment's poster through toApiComment's per-row toPoster (R + C
+// selects per page on top of the fixed prefix). The page now batches both:
+// ONE findRepositoriesByIds join for the repo pairs and ONE
+// prefetchCommentPosters inArray for the posters (upstream
+// comments.LoadPosters is the same fix). The per-row helpers stay intact —
+// metered side by side below on the SAME rows and viewer, the issues.test.ts
+// A2/A5/A7 witness pattern.
+// ---------------------------------------------------------------------------
+
+/** prepare()-counting D1 wrapper: every drizzle statement enters through one
+ *  prepare() call. Scoped to the requests that pass the returned env. */
+function countedD1(): { db: D1Database; count: () => number } {
+  let statements = 0;
+  const wrapper = Object.create(env.DB) as D1Database;
+  wrapper.prepare = (query: string) => {
+    statements += 1;
+    return env.DB.prepare(query);
+  };
+  return { db: wrapper, count: () => statements };
+}
+
+describe("activity feeds query-shape witness (query-shape-audit A8)", () => {
+  it("renders the page with a constant statement count, deep-equal to the per-row fallback render", async () => {
+    // Every render arm on ONE page: two live repos (R=2 distinct), a
+    // public repo whose owner row is MISSING (passes the anonymous SQL
+    // visibility filter, then SKIPS at render — the join-miss arm), two
+    // act users (one arriving via the watcher fan-out copy), three live
+    // comments across two distinct posters (the third dedupes), and one
+    // dangling comment id (renders WITHOUT the comment object).
+    await env.DB.prepare(
+      "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, visibility, created_at) VALUES ('7303', 'r_7303', 'ghost', 2, 'ghostrepo', 'public', unixepoch())",
+    ).run(); // owner_namespace has NO users row — the pair join misses
+    await env.DB.prepare("INSERT INTO repo_watchers (repo_id, user_id) VALUES (?, ?)").bind(ORG_REPO_ID, 1).run();
+    await recordAction(env.DB, { actUserId: 1, repoId: REPO_ID, opType: ActionType.CreateIssue, isPrivate: false, content: "1|one" });
+    await recordAction(env.DB, { actUserId: neighborId, repoId: ORG_REPO_ID, opType: ActionType.CreateIssue, isPrivate: false, content: "2|two" });
+    const issueInsert = await env.DB.prepare(
+      'INSERT INTO issues (repo_id, "index", poster_id, title) VALUES (?, 1, 1, \'T\')',
+    )
+      .bind(REPO_ID)
+      .run();
+    const issueId = issueInsert.meta.last_row_id;
+    const c1 = await env.DB.prepare(
+      "INSERT INTO comments (type, poster_id, issue_id, content, created_unix) VALUES (0, 1, ?, 'hi one', unixepoch())",
+    )
+      .bind(issueId)
+      .run().then((r) => r.meta.last_row_id);
+    const c2 = await env.DB.prepare(
+      "INSERT INTO comments (type, poster_id, issue_id, content, created_unix) VALUES (0, ?, ?, 'hi two', unixepoch())",
+    )
+      .bind(neighborId, issueId)
+      .run().then((r) => r.meta.last_row_id);
+    const c3 = await env.DB.prepare(
+      "INSERT INTO comments (type, poster_id, issue_id, content, created_unix) VALUES (0, 1, ?, 'hi three', unixepoch())",
+    )
+      .bind(issueId)
+      .run().then((r) => r.meta.last_row_id);
+    await recordAction(env.DB, { actUserId: 1, repoId: REPO_ID, opType: ActionType.CommentIssue, isPrivate: false, content: "1|hi one", commentId: c1 });
+    await recordAction(env.DB, { actUserId: 1, repoId: REPO_ID, opType: ActionType.CommentIssue, isPrivate: false, content: "1|hi two", commentId: c2 });
+    await recordAction(env.DB, { actUserId: 1, repoId: REPO_ID, opType: ActionType.CommentIssue, isPrivate: false, content: "1|hi three", commentId: c3 }); // poster dedupes with c1
+    await recordAction(env.DB, { actUserId: 1, repoId: REPO_ID, opType: ActionType.CommentIssue, isPrivate: false, content: "1|ghost", commentId: 999999 }); // dead comment arm
+    await recordAction(env.DB, { actUserId: 1, repoId: "7303", opType: ActionType.CreateIssue, isPrivate: false, content: "1|gone" }); // join-miss arm
+
+    // (a) The route, metered end to end: 1 subject lookup + 2 (count + page)
+    // + 5 batched render reads (act users, repo pairs, comments, issues,
+    // posters) = 8 — page-INDEPENDENT. The pre-fix shape paid
+    // 1 + 2 + 1 + R(3) + 2 + C(3) = 12 at this N; the 3 per-row repo pairs
+    // and 3 per-comment posters alone would break the bound.
+    const meter = countedD1();
+    const meteredApp = familyApp((app) =>
+      registerActivityFeedRoutes(
+        app,
+        createTokenAuthMiddleware(resolver()),
+        createOptionalTokenAuthMiddleware(resolver()),
+      ), { ...env, DB: meter.db });
+    const res = await meteredApp(`/users/cf-gitea-stub/activities/feeds`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Total-Count")).toBe("7"); // total counts ALL matched rows...
+    const body = await res.json<Array<Record<string, unknown> & { act_user_id: number; comment_id: number; comment?: unknown }>>();
+    expect(body).toHaveLength(6); // ...the join-miss repo row is skipped at render
+    const routeCount = meter.count();
+    expect(routeCount).toBeLessThanOrEqual(8);
+    expect(routeCount).toBeLessThan(13); // the pre-fix route shape at this N
+
+    // Empty-skip discipline: an empty page skips every render arm — exactly
+    // the fixed prefix (subject lookup + count + page = 3).
+    const emptyMeter = countedD1();
+    const emptyApp = familyApp((app) =>
+      registerActivityFeedRoutes(
+        app,
+        createTokenAuthMiddleware(resolver()),
+        createOptionalTokenAuthMiddleware(resolver()),
+      ), { ...env, DB: emptyMeter.db });
+    const emptyRes = await emptyApp(`/users/cf-gitea-stub/activities/feeds?date=1999-01-01`);
+    expect(emptyRes.status).toBe(200);
+    expect(await emptyRes.json<unknown[]>()).toEqual([]);
+    expect(emptyMeter.count()).toBeLessThanOrEqual(4);
+
+    // The same rows the route fetched, for the side-by-side arms below.
+    const viewer: Viewer = { origin: "https://example.com", requester: null };
+    const opts: FeedQueryOptions = {
+      kind: "user",
+      requested: { id: STUB_USER.id ?? 1 }, // the seeded stub user row (id 1)
+      actor: null, // the route ran anonymous — the same visibility window
+      includePrivate: false,
+      onlyPerformedBy: false,
+      page: 1,
+      limit: 30,
+    };
+    const { rows } = await getFeedRows(env.DB, opts);
+    expect(rows).toHaveLength(7);
+
+    // (b) The per-row FALLBACK — the pre-fix render body (findRepositoryById
+    // per distinct repo + toApiComment's per-row poster select), metered on
+    // the same rows and viewer: 1 act-user batch + R×repo (R=3, the
+    // join-miss id included) + 2 (comments + issues) + C×poster (C=3) = 9.
+    const fallbackMeter = countedD1();
+    const fdb = drizzle(fallbackMeter.db);
+    const actUserRows = await fdb
+      .select()
+      .from(users)
+      .where(inArray(users.id, [...new Set(rows.map((row) => row.actUserId))]))
+      .all();
+    const actUsersById = new Map(actUserRows.map((row) => [row.id, row]));
+    const pairsById = new Map<string, RepositoryWithOwner>();
+    for (const repoId of [...new Set(rows.map((row) => row.repoId))]) {
+      const pair = await findRepositoryById(fallbackMeter.db, repoId);
+      if (pair !== null) pairsById.set(repoId, pair);
+    }
+    const commentRows = await fdb
+      .select()
+      .from(comments)
+      .where(inArray(comments.id, [...new Set(rows.filter((row) => row.commentId !== 0).map((row) => row.commentId))]))
+      .all();
+    const issueRows = await fdb
+      .select()
+      .from(issues)
+      .where(inArray(issues.id, [...new Set(commentRows.map((row) => row.issueId))]))
+      .all();
+    const issuesById = new Map(issueRows.map((row) => [row.id, row]));
+    const commentRenders = new Map<number, { comment: Comment; issueId: number }>();
+    for (const commentRow of commentRows) {
+      const issueRow = issuesById.get(commentRow.issueId);
+      const pair = issueRow === undefined ? undefined : pairsById.get(issueRow.repoId);
+      if (issueRow === undefined || pair === undefined) continue;
+      commentRenders.set(commentRow.id, {
+        comment: await toApiComment(fallbackMeter.db, viewer, pair, issueRow, commentRow),
+        issueId: issueRow.id,
+      });
+    }
+    const numericRepoId = (id: string): number => {
+      const parsed = Number(id);
+      return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+    };
+    const perRow: Activity[] = [];
+    for (const row of rows) {
+      const actUser = actUsersById.get(row.actUserId);
+      const pair = pairsById.get(row.repoId);
+      if (actUser === undefined || pair === undefined) continue;
+      const renderedComment = commentRenders.get(row.commentId);
+      perRow.push({
+        id: row.id,
+        user_id: row.userId,
+        op_type: opTypeName(row.opType),
+        act_user_id: row.actUserId,
+        act_user: apiUserFromRow(actUser, viewer),
+        repo_id: numericRepoId(row.repoId),
+        repo: toApiRepository(viewer, pair),
+        comment_id: row.commentId,
+        ...(renderedComment === undefined ? {} : { comment: renderedComment.comment }),
+        ref_name: row.refName,
+        is_private: row.isPrivate,
+        content: row.content,
+        created: row.createdAt === null ? "0001-01-01T00:00:00Z" : row.createdAt.toISOString(),
+      });
+    }
+    const fallbackCount = fallbackMeter.count();
+    expect(fallbackCount).toBeGreaterThanOrEqual(6); // the per-row repos + posters alone (R=3 + C=3)
+
+    // (c) The BATCHED render, metered on the same rows and viewer: 5 (act
+    // users + repo pairs + comments + issues + posters) — page-INDEPENDENT
+    // and strictly under the fallback at this N.
+    const renderMeter = countedD1();
+    const rendered = await renderFeedItems(renderMeter.db, viewer, rows);
+    const renderCount = renderMeter.count();
+    expect(renderCount).toBeLessThanOrEqual(5);
+    expect(renderCount).toBeLessThan(fallbackCount); // 5 vs 9 at this N
+
+    // Contract discipline: the batched render AND the route body are
+    // deep-equal to the per-row fallback render — covers both act users,
+    // both live repos, the poster dedupe, the dangling comment (no comment
+    // object) and the skipped join-miss repo in one sweep.
+    expect(rendered).toEqual(perRow);
+    expect(body).toEqual(perRow);
+    expect(new Set(body.map((item) => item.act_user_id))).toEqual(new Set([1, neighborId]));
+    expect(body.filter((item) => item.comment !== undefined)).toHaveLength(3);
+    expect(body.find((item) => item.comment_id === 999999)?.comment).toBeUndefined();
   });
 });

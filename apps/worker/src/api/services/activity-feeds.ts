@@ -19,12 +19,11 @@ import { repositorySchema } from "../models/repository";
 import { userSchema } from "../models/user";
 import {
   apiUserFromRow,
-  findRepositoryById,
+  findRepositoriesByIds,
   toApiRepository,
-  type RepositoryWithOwner,
   type Viewer,
 } from "./repository";
-import { toApiComment } from "./issues";
+import { prefetchCommentPosters, toApiComment } from "./issues";
 
 /**
  * The activity-feed store over the `action` table (specs/activity-feeds.md):
@@ -486,6 +485,15 @@ function isoOrZero(value: Date | null): string {
  * skipped (our delete cascades hard; upstream soft-keeps rows — SPEC §4).
  * The comment renders (with comment_id) ONLY when the comment row is alive,
  * upstream's `if ac.Comment != nil` gate (activity.go:42-46).
+ *
+ * Page-scoped batching (the query-shape audit's A8): the page's distinct
+ * repos resolve through ONE `findRepositoriesByIds` join (the per-row
+ * `findRepositoryById` twin — a map miss skips the row exactly like the
+ * per-row null), and the live comments' posters load through ONE
+ * `prefetchCommentPosters` inArray (upstream `comments.LoadPosters`; a map
+ * miss renders the per-row null user verbatim inside `toApiComment`). The
+ * single-item surface is the feed itself — every caller is a page render —
+ * but the per-row helpers stay intact for the fallback the witness meters.
  */
 export async function renderFeedItems(
   db: D1Database,
@@ -500,16 +508,11 @@ export async function renderFeedItems(
   const usersById = new Map(userRows.map((row) => [row.id, row]));
 
   const repoIds = [...new Set(rows.map((row) => row.repoId))];
-  const repoPairs = new Map<string, RepositoryWithOwner>();
-  await Promise.all(
-    repoIds.map(async (repoId) => {
-      const pair = await findRepositoryById(db, repoId);
-      if (pair !== null) repoPairs.set(repoId, pair);
-    }),
-  );
+  const repoPairs = await findRepositoriesByIds(db, repoIds);
 
   const commentIds = [...new Set(rows.filter((row) => row.commentId !== 0).map((row) => row.commentId))];
-  const commentRenders = new Map<number, { comment: Comment; issueId: number }>();  if (commentIds.length > 0) {
+  const commentRenders = new Map<number, { comment: Comment; issueId: number }>();
+  if (commentIds.length > 0) {
     const commentRows = await d1.select().from(comments).where(inArray(comments.id, commentIds)).all();
     const issueRows = await d1
       .select()
@@ -517,13 +520,14 @@ export async function renderFeedItems(
       .where(inArray(issues.id, [...new Set(commentRows.map((row) => row.issueId))]))
       .all();
     const issuesById = new Map(issueRows.map((row) => [row.id, row]));
+    const posters = await prefetchCommentPosters(db, commentRows);
     await Promise.all(
       commentRows.map(async (commentRow) => {
         const issueRow = issuesById.get(commentRow.issueId);
         const pair = issueRow === undefined ? undefined : repoPairs.get(issueRow.repoId);
         if (issueRow === undefined || pair === undefined) return;
         commentRenders.set(commentRow.id, {
-          comment: await toApiComment(db, viewer, pair, issueRow, commentRow),
+          comment: await toApiComment(db, viewer, pair, issueRow, commentRow, { posters }),
           issueId: issueRow.id,
         });
       }),
