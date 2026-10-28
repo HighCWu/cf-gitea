@@ -1,15 +1,31 @@
 /**
  * The comment-attachments fragment's seam suite (PORT-FIRST: the loader
  * arms — the visibility ladder, the comment-miss arm, the type gate, the
- * empty list — plus the wire arm; the route matrix rides the mount, the
- * module header's HANDOFF recipe).
+ * empty list — plus the wire arm).
  *
- * Fixture discipline (the issue-content-fragments D1-only pattern): the
- * module is UNMOUNTED — the loader and Response builder are driven
- * DIRECTLY on real D1 (workerd, @cloudflare/vitest-plugin) over a seeded
- * user/two repos/issue with comments across the HasAttachmentSupport type
- * arms and attachment rows on both the comment and the direct-issue
- * namespaces.
+ * Coverage split (the issue-new-choose seam's discipline — module-green is
+ * not route-live):
+ *
+ *   - THE MODULE ARMS: the loader and Response builder are driven DIRECTLY
+ *     on real D1 (workerd, @cloudflare/vitest-plugin) over a seeded
+ *     user/two repos/issue with comments across the HasAttachmentSupport
+ *     type arms and attachment rows on both the comment and the
+ *     direct-issue namespaces;
+ *   - THE ROUTE MATRIX (the tick-16 follow-up — the mount landed in
+ *     fa4fd0d): the LIVE uiRouter answers `GET
+ *     /{owner}/{repo}/comments/{id}/attachments` and these arms pin what
+ *     the MOUNT really serves — the with-attachments + empty 200s, the
+ *     visibility ladder through resolveUiRequest (anonymous allowed on a
+ *     visible repo — the group's optSignIn folds to repo visibility;
+ *     invisible repos 404-shell anonymous and signed-in strangers alike
+ *     while the owner's session passes), the miss arms' REAL rendered 404
+ *     shell, the type gate's 500, the GET-only registration, and the
+ *     claim-state pins through the live parseUiRoute/handlesUiRoute.
+ *
+ * Fixture discipline (the issue-content-fragments D1-only pattern): tables
+ * are wiped per test and re-seeded lazily; the route arms ride the same
+ * fixture plus a private repo + an unrelated viewer (the owner session is
+ * minted per request — the users wipe cascades the sessions table).
  *
  * Upstream citations (at the pin): web.go:1337/1342 (route + group gates),
  * issue_comment.go:150-161 (getRepoIssueComment) and :306-326
@@ -22,7 +38,7 @@
 
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
@@ -31,6 +47,9 @@ import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
 import { issueAttachments, repositories } from "../../db/schema";
+import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
+import { uiEnv } from "../__tests__/harness";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import {
   commentAttachmentsFragmentResponse,
   commentHasAttachmentSupport,
@@ -65,6 +84,12 @@ interface Seeded {
   foreignCommentId: number;
   /** The direct-issue attachment row (comment_id = 0) that must stay out. */
   directAttachmentUuid: string;
+  /** The PRIVATE repo — the mounted route's visibility-gate arms. */
+  vaultRepoId: string;
+  /** The vault's fed comment (one attachment) — the owner's pass arm. */
+  vaultCommentId: number;
+  /** The unrelated signed-in viewer — sessions buy no visibility. */
+  strangerId: number;
 }
 
 let seeded: Seeded | undefined;
@@ -118,6 +143,34 @@ async function seed(): Promise<Seeded> {
     { uuid: "aaaaaaaa-bbbb-cccc-dddd-0000000000a9", issueId: issue.id, commentId: 0, uploaderId: owner.id, name: "direct.bin", size: 1, createdAt: at(62) },
   ]);
 
+  // The PRIVATE repo (the mounted route's visibility arms) with its own fed
+  // comment carrying one attachment — the owner's pass arm needs content
+  // behind the gate, the shell arms need a secret that must NOT leak.
+  const stranger = await seedVerifiedUser({ username: "cattachstranger" });
+  const vault = await new RepoService(env.DB).create({
+    owner: { id: owner.id, usernameLower: "cattachowner" },
+    name: "cattachvault",
+    isPrivate: true,
+    status: "ready",
+  });
+  const vaultIssue = await svc.createIssue({
+    repoId: vault.id,
+    title: "vault thread",
+    content: "private body",
+    posterId: owner.id,
+    now: at(40),
+  });
+  const vaultComment = await svc.addComment({ issueId: vaultIssue.id, posterId: owner.id, content: "vault files", now: at(41) });
+  await drizzle(env.DB).insert(issueAttachments).values({
+    uuid: "aaaaaaaa-bbbb-cccc-dddd-0000000000b1",
+    issueId: vaultIssue.id,
+    commentId: vaultComment.id,
+    uploaderId: owner.id,
+    name: "vault-secret.bin",
+    size: 3,
+    createdAt: at(42),
+  });
+
   seeded = {
     ownerId: owner.id,
     repoId: repo.id,
@@ -131,6 +184,9 @@ async function seed(): Promise<Seeded> {
     reviewCommentId: review.id,
     foreignCommentId: foreign.id,
     directAttachmentUuid: "aaaaaaaa-bbbb-cccc-dddd-0000000000a9",
+    vaultRepoId: vault.id,
+    vaultCommentId: vaultComment.id,
+    strangerId: stranger.id,
   };
   return seeded;
 }
@@ -138,6 +194,22 @@ async function seed(): Promise<Seeded> {
 async function repoRow(repoId: string) {
   const row = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!;
   return row;
+}
+
+// --- the mounted-route harness (the issues-list matrix pattern) -----------------
+
+/** The LIVE production path (parse → resolveUiRequest → handler) over the
+ *  mounted uiRouter with the synthetic manifest (the sibling matrices'
+ *  two-arg fetch — this handler attaches no waitUntil work). */
+async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+  return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+}
+
+/** A minted-session cookie header for the user (the real mintSession path,
+ *  minted per request — the beforeEach users wipe cascades the sessions
+ *  table, so a cross-test cookie would go stale). */
+async function sessionHeader(userId: number): Promise<string> {
+  return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
 }
 
 beforeAll(async () => {
@@ -310,5 +382,164 @@ describe("pathParamInt64 + commentHasAttachmentSupport pins", () => {
     expect(commentHasAttachmentSupport(CommentType.DismissReview)).toBe(false);
     expect(commentHasAttachmentSupport(CommentType.Reopen)).toBe(false);
     expect(commentHasAttachmentSupport(CommentType.Label)).toBe(false);
+  });
+});
+
+// --- the mounted route (the tick-16 follow-up — module-green is not route-live) ----
+//
+// fa4fd0d landed the parse family + the registration; the tick-16 re-walk
+// recorded that the route had NO request-level arm. The arms below drive the
+// LIVE router (fetchUi) and pin what the MOUNT really answers — the module
+// outcome union surfacing verbatim through resolveUiRequest's gates:
+// optSignIn folds to repo visibility (anonymous allowed on a visible repo),
+// invisible repos 404-shell, and the loader's outcome union rides the
+// handler's renderNotFound injection.
+
+describe("the mounted route GET /{owner}/{repo}/comments/{id}/attachments (the request-level matrix)", () => {
+  it("the with-attachments arm: the LIVE router answers 200 with the structs.Attachment array (pk order, the request origin in the download URLs)", async () => {
+    const s = await seed();
+    // ANONYMOUS — the group's optSignIn folds to repo visibility, so the
+    // public repo serves the fragment to a signed-out fetch (the official
+    // bundle's dropzone read).
+    const res = await fetchUi(`/cattachowner/cattachrepo/comments/${s.fedCommentId}/attachments`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+
+    const rows = await drizzle(env.DB)
+      .select({ id: issueAttachments.id })
+      .from(issueAttachments)
+      .where(eq(issueAttachments.commentId, s.fedCommentId))
+      .orderBy(asc(issueAttachments.id))
+      .all();
+    const payload = await res.json<
+      Array<{ id: number; name: string; created_at: string; download_count: number; size: number; uuid: string; browser_download_url: string }>
+    >();
+    expect(payload.map((row) => row.name)).toEqual(["spec-a.pdf", "log-a.txt"]); // attachment.go:158-162's predicate + id ASC
+    expect(payload[0]).toEqual({
+      id: rows[0]?.id,
+      name: "spec-a.pdf",
+      created_at: at(60).toISOString(),
+      download_count: 7,
+      size: 2048,
+      uuid: "aaaaaaaa-bbbb-cccc-dddd-0000000000a1",
+      browser_download_url: "https://test.local/attachments/aaaaaaaa-bbbb-cccc-dddd-0000000000a1", // the WebAssetDownloadURL arm over the REQUEST origin
+    });
+    expect(payload[1]?.browser_download_url).toBe("https://test.local/attachments/aaaaaaaa-bbbb-cccc-dddd-0000000000a2");
+  });
+
+  it("the empty arm: the route marshals [] — never null (upstream's make(…, 0) seed riding the mount)", async () => {
+    const s = await seed();
+    const res = await fetchUi(`/cattachowner/cattachrepo/comments/${s.emptyCommentId}/attachments`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    expect(await res.text()).toBe("[]");
+  });
+
+  it("the visibility ladder rides resolveUiRequest: anonymous AND a signed-in stranger 404-shell the private repo, the owner's session passes (200 with the vault attachment)", async () => {
+    const s = await seed();
+    const anonymous = await fetchUi(`/cattachowner/cattachvault/comments/${s.vaultCommentId}/attachments`);
+    expect(anonymous.status).toBe(404); // existence hidden — NO login 303 (optSignIn, not reqSignIn)
+    const anonHtml = await anonymous.text();
+    expect(anonHtml).toContain('<div class="status-page-error">');
+    expect(anonHtml).not.toContain("vault-secret.bin"); // the secret never leaks through the shell
+
+    const stranger = await fetchUi(`/cattachowner/cattachvault/comments/${s.vaultCommentId}/attachments`, {
+      headers: { cookie: await sessionHeader(s.strangerId) },
+    });
+    expect(stranger.status).toBe(404); // sessions buy no visibility
+    expect(await stranger.text()).toContain('<div class="status-page-error">');
+
+    const owner = await fetchUi(`/cattachowner/cattachvault/comments/${s.vaultCommentId}/attachments`, {
+      headers: { cookie: await sessionHeader(s.ownerId) },
+    });
+    expect(owner.status).toBe(200); // the grant line the shells exist to guard
+    const payload = await owner.json<Array<{ uuid: string; name: string }>>();
+    expect(payload).toHaveLength(1);
+    expect(payload[0]?.name).toBe("vault-secret.bin");
+  });
+
+  it("an unknown repo 404-shells with the rendered page (the parse claims the head for ANY owner/repo pair — existence is resolveUiRequest's)", async () => {
+    await seed();
+    const res = await fetchUi("/cattachowner/cattachnowhere/comments/1/attachments");
+    expect(res.status).toBe(404);
+    // Hono's c.html casing (uppercase UTF-8) — the resolveUiRequest shell,
+    // distinct from the loader's own lowercase-utf-8 404 header below.
+    expect(res.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+    const html = await res.text();
+    expect(html).toContain('<div class="status-page-error">');
+    expect(html).toContain("404 Not Found");
+  });
+
+  it("the miss arms ride the route: a nonexistent, garbage, and negative id answer the REAL rendered 404 shell (the unconstrained :id reaches the loader's PathParamInt64 fold)", async () => {
+    await seed();
+    for (const [label, id] of [
+      ["nonexistent", "999999"],
+      ["garbage", "abc"],
+      ["negative", "-5"],
+    ] as const) {
+      const res = await fetchUi(`/cattachowner/cattachrepo/comments/${id}/attachments`);
+      expect(res.status, label).toBe(404);
+      // The HANDLER's shell (renderNotFound rode the builder) — a router-
+      // pattern miss would be Hono's plain text, so the content-type proves
+      // the registration claimed the unconstrained segment.
+      expect(res.headers.get("content-type"), label).toBe("text/html; charset=utf-8");
+      const html = await res.text();
+      expect(html, label).toContain('<div class="status-page-error">');
+      expect(html, label).toContain("404 Not Found");
+    }
+  });
+
+  it("the foreign-repo id 404-shells through the route (GetCommentWithRepoID's repo cross-check riding the mount)", async () => {
+    const s = await seed();
+    const res = await fetchUi(`/cattachowner/cattachrepo/comments/${s.foreignCommentId}/attachments`);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain('<div class="status-page-error">');
+  });
+
+  it("the type gate's 500 through the route: the label comment's plain-text ServerError body verbatim", async () => {
+    const s = await seed();
+    const res = await fetchUi(`/cattachowner/cattachrepo/comments/${s.labelCommentId}/attachments`);
+    expect(res.status).toBe(500);
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(await res.text()).toBe(
+      `GetCommentAttachments: comment type ${CommentType.Label} does not support attachments`,
+    );
+  });
+
+  it("GET-only: a POST on the claimed URL misses the registration (the parse is method-blind, the mounted GET pattern is not — upstream chi answers 405 there, the module header's disclosed divergence)", async () => {
+    const s = await seed();
+    const res = await fetchUi(`/cattachowner/cattachrepo/comments/${s.fedCommentId}/attachments`, { method: "POST" });
+    expect(res.status).toBe(404);
+    expect(res.headers.get("content-type")).not.toContain("text/html"); // the router's plain miss — not the handler's shell
+    expect(await res.text()).not.toContain("spec-a.pdf");
+  });
+});
+
+// --- the claim state (the sibling issue-new-choose seam's pin discipline) ----------
+
+describe("the claim state (parseUiRoute + handlesUiRoute through the live parser)", () => {
+  it("the repo-level comments head is CLAIMED: the family rides the raw id segment", () => {
+    expect(parseUiRoute("/cattachowner/cattachrepo/comments/42/attachments")).toEqual({
+      family: "comment-attachments",
+      owner: "cattachowner",
+      repo: "cattachrepo",
+      segment: "42",
+    });
+    expect(handlesUiRoute("/cattachowner/cattachrepo/comments/42/attachments")).toBe(true);
+  });
+
+  it("the guards overclaim nothing: bare/misspelled/deeper/case shapes stay as they are, the issue-level twins keep their families", () => {
+    // The length-2 + exact-literal guard claims ONLY `comments/{id}/attachments`.
+    expect(parseUiRoute("/cattachowner/cattachrepo/comments/42/attachments/extra")).toBeNull();
+    expect(parseUiRoute("/cattachowner/cattachrepo/comments/42/attachment")).toBeNull();
+    expect(parseUiRoute("/cattachowner/cattachrepo/comments/42/Attachments")).toBeNull(); // lowercase-exact literals
+    expect(parseUiRoute("/cattachowner/cattachrepo/comment/42/attachments")).toBeNull();
+    expect(parseUiRoute("/cattachowner/cattachrepo/commentsx/42/attachments")).toBeNull();
+    // The issue-level namespaces (a different head) keep their fragment/write
+    // families — the new repo-level head must not disturb them.
+    expect(parseUiRoute("/cattachowner/cattachrepo/issues/1/comments")).toMatchObject({ family: "issue-comment" });
+    expect(parseUiRoute("/cattachowner/cattachrepo/issues/1/attachments")).toMatchObject({ family: "issue-attachments" });
+    expect(parseUiRoute("/cattachowner/cattachrepo/pulls/2/attachments")).toMatchObject({ family: "issue-attachments" });
   });
 });
