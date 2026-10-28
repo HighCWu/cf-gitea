@@ -89,14 +89,26 @@ function recordingQueue(): RecordingQueue {
   };
 }
 
+/** Credential-storing mirror writes seal the fixture auth under this KEK
+ *  (readyKek, api/services/mirror.ts: 32 bytes, base64). PINNED — never read
+ *  from the ambient env: the CI checks job materializes .dev.vars from the
+ *  example (no MIRROR_CREDENTIAL_KEY at all → "is not configured"), and a
+ *  hand-copied .dev.vars may carry a wrong-length value (the example's own
+ *  decoded to 27 bytes → "must be 32 bytes"). Both ambient shapes failed the
+ *  write arm with outcome "invalid" (CI run 40687228474, checks job); the
+ *  not-configured arm below still overrides this to `undefined` explicitly. */
+const TEST_MIRROR_CREDENTIAL_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+
 /** The migrate-write env slice: the egress gate lax-ed (explicit absence —
  *  the ambient .dev.vars values are strict-mode and would reject the fixture
- *  hosts; ADR-0005 D3) over the real bindings, with the queue injected. */
+ *  hosts; ADR-0005 D3) and the credential KEK pinned (see above) over the
+ *  real bindings, with the queue injected. */
 function migrateTestEnv(queue: RecordingQueue): MigrateEnv {
   return {
     ...env,
     MIRROR_ALLOWED_HOST_LIST: undefined,
     MIRROR_EGRESS_MODE: undefined,
+    MIRROR_CREDENTIAL_KEY: TEST_MIRROR_CREDENTIAL_KEY,
     MIRROR_SYNC_QUEUE: queue,
   };
 }

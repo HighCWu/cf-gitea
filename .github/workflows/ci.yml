@@ -72,6 +72,10 @@ jobs:
       # npm-style `--` separator here; the gate's parser rejects a literal
       # `--`. The gate writes its phase logs + raw vitest JSON next to the
       # --baseline-json path (that dir is the artifact uploaded below).
+      # The gated suites' guarded arms (UI shell manifest, avatar terminal legs)
+      # skip without the built frontend tree — build it so CI exercises them.
+      - name: Build frontend assets
+        run: pnpm build:assets
       - name: Test (full-suite composite gate — pnpm test:full, solo adjudication)
         run: pnpm test:full --baseline-json .full-suite-gate/full-suite-gate.json
       - name: Upload full-suite gate evidence (baseline JSON + phase logs)
