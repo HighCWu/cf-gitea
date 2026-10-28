@@ -11,6 +11,7 @@ import { createApiRouter } from "./api/router";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
+import { repoTasksDlqHandler } from "./repos/dlq";
 import { enqueueDueMirrorSyncs } from "./services/mirror/sync";
 import { handleUserPushEvent } from "./services/webhooks-push";
 import { enqueueDuePushMirrorSyncs, enqueuePushMirrorSyncsOnCommit } from "./services/mirror/push-sync";
@@ -258,6 +259,11 @@ export default {
     }
     if (batch.queue === "webhook-delivery") {
       return webhookQueueHandler(batch as unknown as Parameters<typeof webhookQueueHandler>[0], env, _ctx);
+    }
+    // SPEC-0014 §3.0 M0: the repo-tasks DLQ — log-and-ack, the record for
+    // manual redrive (the handler takes MessageBatch<unknown> natively).
+    if (batch.queue === "repo-tasks-dlq") {
+      return repoTasksDlqHandler(batch, env, _ctx);
     }
     await handleRepoTasks(batch, env);
   },

@@ -140,14 +140,13 @@
     "consumers": [
       { "queue": "webhook-delivery", "max_retries": 3, "dead_letter_queue": "webhook-delivery-dlq" },
       { "queue": "webhook-delivery-dlq", "max_retries": 1, "max_batch_size": 10 },
+      { "queue": "repo-tasks-dlq", "max_retries": 1, "max_batch_size": 10 },
       {
         "queue": "repo-tasks",
         "max_batch_size": 1,
         "max_concurrency": 1,
-        "max_retries": 5
-        // No dead_letter_queue yet: after max_retries the message is dropped
-        // with an observability-log trace per attempt (the admin-notice
-        // equivalent). A DLQ joins when the import consumer (M5) lands.
+        "max_retries": 5,
+        "dead_letter_queue": "repo-tasks-dlq"
       }
     ]
   },
