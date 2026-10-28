@@ -1,11 +1,5 @@
-# Local dev secrets — copy this file to .dev.vars (gitignored).
-# GIT_TOKEN gates git push/admin on the engine (SPEC-0001 M1); the e2e suite
-# authenticates with this value as the Basic password ("x:<token>").
-# TODO(SPEC-0002): replaced by real user/token auth.
 GIT_TOKEN=devtoken
-# The vitest cloudflare plugin injects BOTH the wrangler vars and this file
-# into test envs — if your (gitignored) wrangler.jsonc flips DEMO_MODE/
-# ALLOW_SIGNUP for a demo deployment, pin them gate-off here so local runs
-# and the goldens stay in the self-host posture (vars from .dev.vars win).
+MIRROR_ALLOWED_HOST_LIST=
+MIRROR_CREDENTIAL_KEY=dGVzdC1rZXktMzItYnl0ZXMtc2VjcmV0LXYx
 DEMO_MODE=false
 ALLOW_SIGNUP=false

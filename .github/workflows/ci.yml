@@ -122,11 +122,17 @@ jobs:
         run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
       - name: Start dev Worker (vite dev, workerd)
         run: |
-          pnpm dev > /tmp/dev-server.log 2>&1 &
+          # GH runner images alias localhost to ::1 AS WELL as 127.0.0.1
+          # (runner-images configure-environment.sh "Add localhost alias to
+          # ::1"), so node resolves localhost to IPv6 first and vite binds
+          # ::1 ONLY. Polls to 127.0.0.1 then get instant connection-refused
+          # forever — misread as a slow workerd boot ("worker silent past the
+          # budget"): vite prints ready in ~7-11s, the worker is up on ::1,
+          # and the 300s poll still exhausts (attempt tails static at the
+          # banner, run 40687228474). Pin the bind family explicitly; the
+          # suite/bench/battery clients all talk to 127.0.0.1.
+          pnpm dev --host 127.0.0.1 > /tmp/dev-server.log 2>&1 &
           echo $! > /tmp/dev-server.pid
-          # 2-core runners boot workerd far slower than dev machines (the
-          # first public CI run: vite ready in ~10s, the worker silent past
-          # the old 120s budget) — 300s + a periodic log tail for diagnosis.
           for i in $(seq 1 150); do
             if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
               echo "dev server up (attempt $i)"; exit 0
@@ -136,7 +142,12 @@ jobs:
             fi
             sleep 2
           done
-          echo "dev server did not come up"; cat /tmp/dev-server.log; exit 1
+          echo "dev server did not come up"
+          cat /tmp/dev-server.log
+          # If this ever fires again, the socket table shows WHICH family the
+          # server bound (the bind-family mismatch class) in the run record.
+          echo "--- listen sockets ---"; ss -tln | grep -E ':(5173|5199)' || true
+          exit 1
       - name: Run e2e suite
         run: |
           PATH="$PWD/packages/git-engine/e2e/shim:$PATH" \
@@ -227,11 +238,17 @@ jobs:
         run: cp apps/worker/.dev.vars.example apps/worker/.dev.vars
       - name: Start dev Worker (vite dev, workerd)
         run: |
-          pnpm dev > /tmp/dev-server.log 2>&1 &
+          # GH runner images alias localhost to ::1 AS WELL as 127.0.0.1
+          # (runner-images configure-environment.sh "Add localhost alias to
+          # ::1"), so node resolves localhost to IPv6 first and vite binds
+          # ::1 ONLY. Polls to 127.0.0.1 then get instant connection-refused
+          # forever — misread as a slow workerd boot ("worker silent past the
+          # budget"): vite prints ready in ~7-11s, the worker is up on ::1,
+          # and the 300s poll still exhausts (attempt tails static at the
+          # banner, run 40687228474). Pin the bind family explicitly; the
+          # suite/bench/battery clients all talk to 127.0.0.1.
+          pnpm dev --host 127.0.0.1 > /tmp/dev-server.log 2>&1 &
           echo $! > /tmp/dev-server.pid
-          # 2-core runners boot workerd far slower than dev machines (the
-          # first public CI run: vite ready in ~10s, the worker silent past
-          # the old 120s budget) — 300s + a periodic log tail for diagnosis.
           for i in $(seq 1 150); do
             if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
               echo "dev server up (attempt $i)"; exit 0
@@ -241,7 +258,12 @@ jobs:
             fi
             sleep 2
           done
-          echo "dev server did not come up"; cat /tmp/dev-server.log; exit 1
+          echo "dev server did not come up"
+          cat /tmp/dev-server.log
+          # If this ever fires again, the socket table shows WHICH family the
+          # server bound (the bind-family mismatch class) in the run record.
+          echo "--- listen sockets ---"; ss -tln | grep -E ':(5173|5199)' || true
+          exit 1
       - name: Benchmark (compare vs the recorded m2 baseline — 10% regression gate now ENFORCED)
         run: node scripts/bench-run.mjs --compare m2 --sizes 5m --base-url http://127.0.0.1:5173
       - name: Upload benchmark results (on failure)
@@ -332,11 +354,17 @@ jobs:
         run: pnpm db:migrate:local
       - name: Start dev Worker (vite dev, workerd)
         run: |
-          pnpm dev > /tmp/dev-server.log 2>&1 &
+          # GH runner images alias localhost to ::1 AS WELL as 127.0.0.1
+          # (runner-images configure-environment.sh "Add localhost alias to
+          # ::1"), so node resolves localhost to IPv6 first and vite binds
+          # ::1 ONLY. Polls to 127.0.0.1 then get instant connection-refused
+          # forever — misread as a slow workerd boot ("worker silent past the
+          # budget"): vite prints ready in ~7-11s, the worker is up on ::1,
+          # and the 300s poll still exhausts (attempt tails static at the
+          # banner, run 40687228474). Pin the bind family explicitly; the
+          # suite/bench/battery clients all talk to 127.0.0.1.
+          pnpm dev --host 127.0.0.1 > /tmp/dev-server.log 2>&1 &
           echo $! > /tmp/dev-server.pid
-          # 2-core runners boot workerd far slower than dev machines (the
-          # first public CI run: vite ready in ~10s, the worker silent past
-          # the old 120s budget) — 300s + a periodic log tail for diagnosis.
           for i in $(seq 1 150); do
             if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
               echo "dev server up (attempt $i)"; exit 0
@@ -346,7 +374,12 @@ jobs:
             fi
             sleep 2
           done
-          echo "dev server did not come up"; cat /tmp/dev-server.log; exit 1
+          echo "dev server did not come up"
+          cat /tmp/dev-server.log
+          # If this ever fires again, the socket table shows WHICH family the
+          # server bound (the bind-family mismatch class) in the run record.
+          echo "--- listen sockets ---"; ss -tln | grep -E ':(5173|5199)' || true
+          exit 1
       - name: Run LFS e2e suite
         run: |
           rc=0
@@ -478,11 +511,17 @@ jobs:
           echo "GIT_TOKEN=$GIT_TOKEN" >> "$GITHUB_ENV"
       - name: Start dev Worker (vite dev, workerd)
         run: |
-          pnpm dev > /tmp/dev-server.log 2>&1 &
+          # GH runner images alias localhost to ::1 AS WELL as 127.0.0.1
+          # (runner-images configure-environment.sh "Add localhost alias to
+          # ::1"), so node resolves localhost to IPv6 first and vite binds
+          # ::1 ONLY. Polls to 127.0.0.1 then get instant connection-refused
+          # forever — misread as a slow workerd boot ("worker silent past the
+          # budget"): vite prints ready in ~7-11s, the worker is up on ::1,
+          # and the 300s poll still exhausts (attempt tails static at the
+          # banner, run 40687228474). Pin the bind family explicitly; the
+          # suite/bench/battery clients all talk to 127.0.0.1.
+          pnpm dev --host 127.0.0.1 > /tmp/dev-server.log 2>&1 &
           echo $! > /tmp/dev-server.pid
-          # 2-core runners boot workerd far slower than dev machines (the
-          # first public CI run: vite ready in ~10s, the worker silent past
-          # the old 120s budget) — 300s + a periodic log tail for diagnosis.
           for i in $(seq 1 150); do
             if curl -sf http://127.0.0.1:5173/healthz > /dev/null; then
               echo "dev server up (attempt $i)"; exit 0
@@ -492,7 +531,12 @@ jobs:
             fi
             sleep 2
           done
-          echo "dev server did not come up"; cat /tmp/dev-server.log; exit 1
+          echo "dev server did not come up"
+          cat /tmp/dev-server.log
+          # If this ever fires again, the socket table shows WHICH family the
+          # server bound (the bind-family mismatch class) in the run record.
+          echo "--- listen sockets ---"; ss -tln | grep -E ':(5173|5199)' || true
+          exit 1
       - name: Run differential battery (ours-only; exit code is the gate)
         run: node scripts/diff-test.mjs --ours http://127.0.0.1:5173 --token "$GIT_TOKEN"
       - name: Stop dev Worker
