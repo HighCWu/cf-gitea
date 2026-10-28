@@ -38,7 +38,11 @@
   // the declared var, and the fallback chain in
   // services/webhooks-push.ts `appOrigin` serves unset deployments.)
   "vars": {
-    "APP_URL": "https://cf-gitea.YOUR-SUBDOMAIN.workers.dev"
+    "APP_URL": "https://cf-gitea.YOUR-SUBDOMAIN.workers.dev",
+    // Self-registration gate (SPEC-0010 §6): "true" adds a /user/sign_up page;
+    // anything else keeps the instance closed — the first admin comes from the
+    // login page's one-shot "initialize this instance" form (zero-user instances).
+    "ALLOW_SIGNUP": "false"
   },
   "observability": {
     "enabled": true,

@@ -82,7 +82,12 @@ Zero configuration beyond the button: webhook payload URLs automatically use
 your Worker's own origin (`APP_URL` stays optional — set it only when serving
 behind a custom domain, or for mirror deployments whose payload URLs must name
 a different public origin). One manual bit after it finishes: set the secrets
-below. Prefer the terminal? The same result, explicitly:
+below. Then open your Worker's URL — the users table starts empty, so the
+login page offers **Initialize This Instance**: create the admin account
+right in the browser and you are signed in (one-shot; once any account exists
+the form is gone). Regular registration stays closed unless you set
+`ALLOW_SIGNUP` to `true` in your copied `wrangler.jsonc`. Prefer the
+terminal? The same result, explicitly:
 
 ```bash
 pnpm exec wrangler login

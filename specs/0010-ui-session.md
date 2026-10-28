@@ -519,3 +519,108 @@ pattern. Time-dependent paths take an injectable `now` (the `TokenService` conve
 - **S3 — resolution widening.** `resolveRepositoryForViewer` over the shared gate
   predicate, private/limited matrix tests, boundary tests (§2.9). Exit: the §2.6 table
   passes end-to-end; `/api/v1` + git suites demonstrably untouched.
+
+## 6. First-run amendment — the admin-init window + the ALLOW_SIGNUP gate (as-built 2026-10-28)
+
+Amendment (ratified design, landed by the first-run-bootstrap unit): a fresh
+deployment (Deploy button, zero shell) becomes usable in one browser step. Two
+surfaces, both web routes under the session model above; implementation:
+`src/services/user-accounts.ts` (service), `src/ui/first-run.ts` (router),
+`src/ui/pages/first-run.tsx` (sign-up page render), `src/ui/pages/login.tsx`
+(the login-page extension).
+
+### 6.1 The zero-user admin-init window (one-shot by construction)
+
+- **Surface**: when `users` is EMPTY, the login page additionally renders the
+  "Administrator Account Settings" panel (`loginFirstRunLocale`, login.tsx);
+  the standalone `GET /install` renders the identical page. This is upstream's
+  install-page admin-creation posture
+  (`gitea/routers/install/install.go:452–478` `initAdminUser` — `IsAdmin: true`,
+  active — over `services/forms/user_form.go:54–57`'s AdminName/AdminEmail/
+  AdminPasswd InstallForm fields and `templates/install.tmpl:227–247`), mounted
+  on OUR login page instead of a separate install wizard.
+- **Routes**: `GET /install` (panel, or 303 `/` once any user row exists —
+  upstream's post-install posture, `routers/install/routes.go:30–32`) and
+  `POST /install` (the atomic creation). Upstream's install family lives on
+  `/` (`routes.go:30–31`); cf-gitea claims `/install` because `/` is a landed
+  app surface (documented divergence). Both carry the §2.8 layer-2 origin
+  check; failures re-render inline at 200 (the §2.2 posture).
+- **Atomicity (the race argument)**: the decision is a SINGLE SQLite statement —
+  `INSERT INTO users (...) SELECT ... WHERE NOT EXISTS (SELECT 1 FROM users)` —
+  so "empty table" is checked by the statement, never by a prior read (no
+  TOCTOU). D1 serializes writers to the one SQLite database, so two
+  simultaneous first-submissions run strictly one-after-another: the winner's
+  insert affects 1 row; the loser's `NOT EXISTS` sees the winner's row and
+  affects 0 (`meta.changes == 0`, the session.ts CAS convention) → the loser
+  re-renders with the clear "This instance is already initialized" verdict,
+  form gone. Exactly one admin exists by construction.
+- **Row shape**: the `POST /admin/users` ladder verbatim (adminCreateUser,
+  `src/api/routes/admin-t2.ts:842–865` — usable-username via the shared
+  `usableUsernameError`, the email-format check, the `UNIQUE(username_lower)`
+  arbiter) — `is_admin=1`, `status='active'`, `type='user'`. NO password store
+  (SPEC-0002 §4.6.7; admin-t2 deviation 1): the install form's password field
+  is accepted-and-ignored for InstallForm parity — the page copy says so.
+- **One browser step**: on success the router mints a web session for the new
+  admin (§2.2 step-5 shape) and 303s to `/` — upstream's auto-login
+  (`install.go:479–490`). The admin then mints PATs in settings for git/API
+  (`bootstrap-admin.mjs` remains the shell path for pre-existing deployments).
+- **Window semantics**: "any user row" includes org rows (`users` holds both
+  types, SPEC-0007) — the same semantics as upstream's `HasUsers` over the
+  unified user table. The window is one-shot by construction; orgs are
+  created by admins only, so it cannot be re-opened.
+
+### 6.2 The ALLOW_SIGNUP gate (regular registration)
+
+- **Surface**: `GET/POST /user/sign_up` — upstream's exact path shape
+  (`routers/web/web.go:597–598`), the page shaped after
+  `templates/user/auth/signup.tmpl` + `signup_inner.tmpl` (page-content
+  `user signin`, required user_name/email/password/retype,
+  `auth.create_new_account` submit, the already-have-account footer), POST
+  semantics per `auth.SignUpPost` (`routers/web/auth/auth.go:548–632`):
+  validation ladder, collision arms, then create + auto sign-in
+  (`handleSignIn`, auth.go:632 — our §2.2 step-5 session mint).
+- **Gate**: the `ALLOW_SIGNUP` wrangler var (deploy-page-visible), default
+  FALSE — the inverted polarity of upstream's `DISABLE_REGISTRATION` default
+  TRUE (`modules/setting/service.go:148`), same self-host posture. Read
+  absent-safe (`FirstRunEnv.ALLOW_SIGNUP?: string`, the
+  `MIRROR_EGRESS_MODE` optional-var pattern): `true`/`1` (any case) enables.
+  While closed, pages AND routes answer **404** (hidden — the unregistered
+  upstream route shape), not 403.
+- **Validation reuse**: the shared account ladder
+  (`services/user-accounts.ts`): `usableUsernameError` (the reserved/pattern
+  list), the email-format port (admin-t2's `invalidEmailMessage`,
+  `email_address.go:120–138`), the retype match (auth.go:577), the
+  name/email collision pre-checks with upstream's web copy
+  (`form.username_been_taken` / `form.email_been_used`), the live
+  `user_redirect` consumption (user.go:798, the adminCreateUser arm), and
+  the UNIQUE arbiter for the two-signups race. Created accounts are plain
+  members (`is_admin=false`), active, public.
+- **Divergences**: no captcha / email-domain blocklist / password
+  complexity/pwned checks (no password store, no mailer — the accepted-and-
+  ignored set again); the per-IP failure limiter stays a login-only budget
+  (signup is account creation, not credential verification — abuse posture
+  rides the gate default-off); signed-in browsers 303 to `/` on all four
+  first-run routes (upstream renders sign_up to signed-in users).
+
+### 6.3 Mounting + login-page integration (two-phase landing)
+
+The router lands complete-but-unmounted (orchestrator-owned `src/index.ts`):
+`app.route("/", firstRunRouter);` next to the sessionRouter mount (order
+immaterial — no claimed path overlaps, `/install` and `/user/sign_up` are
+top-level like `/login`, §2.1). The login page's panel + register link ride
+`renderLoginPage`'s OPTIONAL `adminInit` / `signUpLink` options (default
+absent — the §5 golden stays byte-stable); wiring them on `GET /login` is the
+one-line call-site delta in the orchestrator-owned `session.ts` (the exact
+recipe is the HANDOFF NOTE in `login.tsx`). Until then `GET /install` renders
+the identical page.
+
+### 6.4 Testing plan (§5 extension)
+
+`src/ui/first-run.test.ts` (real D1, handlers direct + sessionRouter
+mounted): the gate's absent-safety; the init happy path (row shape, session
+mint, viewer isAdmin); the window closing (GET 303, POST verdict); THE RACE
+(two concurrent submits → exactly one admin); validation re-renders;
+signup 404/off + on; signup validation reuse (name/email/retype, taken
+name/email, redirect consumption); the init-created admin logging in with a
+PAT (`POST /login`) and holding `is_admin` in `resolveViewer`; the
+login-page extension (default golden-identical, panel, verdict page, link).
