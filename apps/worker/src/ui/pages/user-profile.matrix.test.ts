@@ -582,6 +582,43 @@ describe("unknown names (existence never leaks)", () => {
   });
 });
 
+// --- the ?sudo= parameter is web-UI inert (the sudo seam, wave-matrix-15) ------
+//
+// The fix wave's sudo() mount (32eaa73) rides app.use("/api/v1/*", ...) — the
+// web UI resolves its doer from the session cookie alone (resolveUiSession),
+// and no ui route reads the sudo query. These arms pin the no-cross-
+// contamination half through the REAL owner-home route: an API-style ?sudo=
+// on a web URL never impersonates anyone and never elevates a session.
+
+describe("the ?sudo= parameter is web-UI inert (the API-only mount's seam)", () => {
+  it("an anonymous viewer carrying ?sudo=<an admin> still 404-shells the private profile", async () => {
+    const res = await get("/uppriv?sudo=upadmin");
+    expect(res.status).toBe(404); // sudo bought nothing — the doer stayed anonymous
+    expect(await res.text()).toContain("Page Not Found");
+  });
+
+  it("a signed-in stranger carrying ?sudo=<the owner> still 404-shells the private profile", async () => {
+    // upgal is signed in but unrelated to uppriv (no follow, no shared org).
+    const res = await get("/uppriv?sudo=uppriv", "upgal");
+    expect(res.status).toBe(404); // naming the OWNER in sudo admits no stranger
+    expect(await res.text()).toContain("Page Not Found");
+  });
+
+  it("the owner's own session ignores ?sudo=<someone else> — the doer is never swapped", async () => {
+    const res = await get("/uppriv?sudo=upgal", "uppriv");
+    expect(res.status).toBe(200); // a swapped doer (upgal) would lose self-sight → 404
+    const html = await res.text();
+    expect(html).toContain('class="page-content user profile"');
+    expect(html).toContain(">uppriv<span"); // the owner's own page rendered
+  });
+
+  it("the site admin's session renders without the parameter's help and ignores its target", async () => {
+    const res = await get("/uppriv?sudo=uppal", "upadmin");
+    expect(res.status).toBe(200); // the admin's OWN session ladder, not the sudo target's
+    expect(await res.text()).toContain('class="page-content user profile"');
+  });
+});
+
 // --- the route claim pin (the owner-home family's parse ↔ registration) -------
 
 describe("the route claim pin (the owner-home family)", () => {

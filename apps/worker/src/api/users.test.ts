@@ -24,6 +24,7 @@ import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
 import { mintFor, resetAuthTables } from "../auth/testing/seeds";
+import { mintSession, SESSION_COOKIE_NAME } from "../ui/session";
 
 // The vitest plugin's per-test storage isolation discards setupFiles-era D1
 // writes; schema from `beforeAll` migrations persists for the file (same
@@ -613,6 +614,28 @@ describe("mounted chain (SELF — src/index.ts's /api/v1 mounts): sudo trio", ()
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+
+  it("a browser session cookie never authenticates the API — ?sudo= on cookie-only credentials → 403 (the UI/API seam, wave-matrix-15)", async () => {
+    // The seam behind the sudo mount (32eaa73): the API resolves credentials
+    // from the Authorization header ONLY (resolveAuth), so an admin's web
+    // session cannot ride into /api/v1 — and ?sudo= therefore evaluates the
+    // ANONYMOUS doer, refused before the route's own 401 gate.
+    const admin = await seedUser("SudoSessionAdmin", { isAdmin: true });
+    const cookieValue = await mintSession(env.DB, admin.id);
+
+    const sudoed = await SELF.fetch("https://example.com/api/v1/user?sudo=someone", {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
+    });
+    expect(sudoed.status).toBe(403); // anonymous doer — "Only administrators allowed to sudo."
+    expect(await sudoed.json()).toEqual({ message: "Only administrators allowed to sudo.", url: ERROR_URL });
+
+    // The no-sudo contrast: the same cookie-only request is plain anonymous
+    // at the route gate (401), never the admin identity.
+    const plain = await SELF.fetch("https://example.com/api/v1/user", {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
+    });
+    expect(plain.status).toBe(401);
   });
 });
 

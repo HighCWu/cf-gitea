@@ -69,6 +69,7 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { orgMembers, users } from "../../db/schema";
 import { OrgService } from "../../services/orgs/orgs";
+import { LastOrgOwnerError } from "../../services/orgs/errors";
 import type { UiManifest } from "../manifest";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
@@ -601,5 +602,100 @@ describe("the claim pin (the literal-shadow and 3-segment heads)", () => {
     expect(parseUiRoute("/org/members")).toEqual({ family: "home", owner: "org", repo: "members", refSuffix: null });
     expect(handlesUiRoute("/org/members")).toBe(true);
     expect((await fetchUi("/org/members")).status).toBe(404);
+  });
+});
+
+// --- the removal round-trip's UI half (wave-matrix-15) -------------------------------
+//
+// The fix wave's removeMember sweep (84da8f8: the per-team grant revocation +
+// the guarded counter decrement) lives INSIDE OrgService.removeMember — the
+// one mutation entry the API route and the leave POST both funnel through.
+// Its service arms are pinned in services/orgs/orgs.test.ts (round-trips,
+// grants, last-owner). This block pins the UI HALF: after the mutation, BOTH
+// user-facing pages that read org_members reflect the removal on their very
+// next render — the org's members page drops the row, and the removed
+// member's own organization settings list drops the org.
+
+describe("the removal round-trip's UI half (removeMember reflects on both pages)", () => {
+  /** The seeded ids (the `once` seeder is void-typed — it lands here). */
+  let sweep: { orgId: number; ownerId: number; memberId: number } | null = null;
+  const sweepOf = (): { orgId: number; ownerId: number; memberId: number } => {
+    if (sweep === null) throw new Error("sweep fixture not seeded");
+    return sweep;
+  };
+  const seedSweepOrg = once(async (): Promise<void> => {
+    const orgs = new OrgService(env.DB);
+    const owner = await seedVerifiedUser({ username: "sweep-owner" });
+    const member = await seedVerifiedUser({ username: "sweep-member" });
+    const org = await orgs.createOrg({
+      name: "sweep-org",
+      ownerId: owner.id,
+      visibility: "public",
+      now: new Date(T0 * 1000),
+    });
+    await orgs.addMember(org.id, member.id, { isPublic: true, now: new Date((T0 + 10) * 1000) });
+    sweep = { orgId: org.id, ownerId: owner.id, memberId: member.id };
+  });
+
+  it("both pages carry the membership before the removal", async () => {
+    await seedSweepOrg();
+    const { memberId } = sweepOf();
+    // The org's members page (anonymous — public org, public membership).
+    const members = await fetchUi("/org/sweep-org/members");
+    expect(members.status).toBe(200);
+    expect(await members.text()).toContain('href="/sweep-member"');
+    // The member's own organization settings list.
+    const settings = await fetchUi("/user/settings/organization", { headers: { cookie: await sessionHeader(memberId) } });
+    expect(settings.status).toBe(200);
+    expect(await settings.text()).toContain('href="/sweep-org"');
+  });
+
+  it("after removeMember the members page drops the row and the user's org list drops the org — immediately", async () => {
+    await seedSweepOrg();
+    const { orgId, memberId } = sweepOf();
+    // The landed mutation (the sweep ride-along: team grants + counter).
+    const orgs = new OrgService(env.DB);
+    expect(await orgs.removeMember(orgId, memberId)).toBe(true);
+
+    // The members page, read as the site admin (the full-access arm — the
+    // anonymous listing renders public memberships only, and only the
+    // member's was public): the row is gone on the next render; the owner's
+    // stays.
+    const admin = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "gate-admin")).get();
+    const members = await fetchUi("/org/sweep-org/members", { headers: { cookie: await sessionHeader(admin!.id) } });
+    expect(members.status).toBe(200);
+    const membersHtml = await members.text();
+    expect(membersHtml).not.toContain('href="/sweep-member"');
+    expect(membersHtml).toContain('href="/sweep-owner"');
+
+    // The removed member's organization settings list: the org is gone — the
+    // empty state renders (organizations.tmpl's settings.orgs_none).
+    const settings = await fetchUi("/user/settings/organization", { headers: { cookie: await sessionHeader(memberId) } });
+    expect(settings.status).toBe(200);
+    const settingsHtml = await settings.text();
+    expect(settingsHtml).toContain("user settings organization");
+    expect(settingsHtml).not.toContain('href="/sweep-org"');
+    expect(settingsHtml).toContain("You are not a member of any organizations.");
+  });
+
+  it("the last-owner guard keeps BOTH pages intact when removeMember refuses", async () => {
+    await seedSweepOrg();
+    const { orgId, ownerId } = sweepOf();
+    const orgs = new OrgService(env.DB);
+    // The §4.3 guard raises (the service test pins the error shape); the UI
+    // half pins the pages' unchanged reads after the refusal.
+    const err = await orgs.removeMember(orgId, ownerId).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LastOrgOwnerError);
+
+    // The members page (as the site admin — the owner's membership is
+    // private by default, invisible to the anonymous public-only listing):
+    // the refused removal left the row in place.
+    const admin = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "gate-admin")).get();
+    const members = await fetchUi("/org/sweep-org/members", { headers: { cookie: await sessionHeader(admin!.id) } });
+    expect(members.status).toBe(200);
+    expect(await members.text()).toContain('href="/sweep-owner"');
+    const settings = await fetchUi("/user/settings/organization", { headers: { cookie: await sessionHeader(ownerId) } });
+    expect(settings.status).toBe(200);
+    expect(await settings.text()).toContain('href="/sweep-org"');
   });
 });

@@ -44,14 +44,18 @@
  */
 
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
+import { createDurableGit, type DurableGitHandler } from "@cf-gitea/git-engine";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { issues, PRStatus, pullRequests, repositories, users } from "../../db/schema";
-import { settleCreatingRepo } from "../../git-http/gate";
+import { issues, PRStatus, protectedBranches, pullRequests, repositories, users } from "../../db/schema";
+import { authorize } from "../../git-http/authorize";
+import { gitHttpGate, settleCreatingRepo } from "../../git-http/gate";
+import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
+import { handleUserPushEvent } from "../../services/webhooks-push";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
 import { parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
@@ -1174,5 +1178,360 @@ describe("w129 mode-change arms (the degraded body over the mode-only and mode+c
     expect(html).toContain('data-new-filename="f2.txt"');
     expect(html).toContain("File mode changed.");
     expect(html).toContain(MODE_LABEL);
+  });
+});
+
+// --- the PR-head sync's ROUTE-level reflection (wave-matrix-15) ---------------------
+//
+// The fix wave's c1 (140fc0b) lands the post-push PR-head sync; its unit arms
+// live in services/webhooks-push.test.ts (ref CAS, head_sha, divergence,
+// type-29 comment). This block pins what only the ROUTES can answer once the
+// sync has run on an UPDATE push to the PR's head branch (created refs take
+// the push/create family and never reach the sync arm — the first test pins
+// that baseline): the PR commits page reflects the moved head ref with the
+// NEW count listed newest-first, and the merge-box fragment reflects the
+// synced state both while checking and once the synced divergence lands the
+// outdated blocker under a blockOnOutdatedBranch rule.
+//
+// Determinism: the sync-carrying push goes through the LANDED gate
+// composition (gitHttpGate → engine with the onPush seam wired to
+// handleUserPushEvent — the sync unit file's exact wiredEngine shape, minus
+// the mirror producer this surface never observes) against a collecting
+// ExecutionContext, and every waitUntil drains before any read — the sync's
+// D1 writes are settled by construction, never by timing. The reads still
+// ride the mounted uiRouter through fetchUi, so the pinned bytes are the
+// routes' own.
+
+/** The engine under the sync arms — src/index.ts's production shape. */
+const syncEngine: DurableGitHandler<Env> = createDurableGit<Env>({
+  authorize,
+  ui: false,
+  namespaces: true,
+  onPush: (event, hookEnv) => handleUserPushEvent(hookEnv, event),
+});
+
+class SyncNoopSpan {
+  get isTraced(): boolean {
+    return false;
+  }
+  spanContext(): TracingSpanContext {
+    return { traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 };
+  }
+  setAttribute(_key: string, _value: boolean | number | string): this {
+    return this;
+  }
+  setAttributes(_attributes: Record<string, boolean | number | string | undefined>): this {
+    return this;
+  }
+  recordException(
+    _exception: string | { code: string | number; name?: string; message?: string; stack?: string },
+  ): void {}
+  updateName(_name: string): this {
+    return this;
+  }
+  setStatus(_status: TracingSpanStatus): this {
+    return this;
+  }
+  end(): void {}
+}
+
+const syncWaits: Promise<unknown>[] = [];
+const syncCtx: ExecutionContext = {
+  waitUntil: (promise) => {
+    syncWaits.push(Promise.resolve(promise));
+  },
+  passThroughOnException: () => {},
+  abort: () => {},
+  exports: undefined as never,
+  props: undefined,
+  tracing: {
+    enterSpan: <T, A extends unknown[]>(_name: string, cb: (span: SyncNoopSpan, ...args: A) => T, ...args: A): T =>
+      cb(new SyncNoopSpan(), ...args),
+    startActiveSpan: <T, A extends unknown[]>(_name: string, cb: (span: SyncNoopSpan, ...args: A) => T, ...args: A): T =>
+      cb(new SyncNoopSpan(), ...args),
+    startSpan: () => new SyncNoopSpan(),
+    getActiveSpan: () => undefined,
+    Span: SyncNoopSpan,
+  },
+};
+
+/** Await everything the gate scheduled (the onPush fan-out, the settle legs)
+ *  — webhooks-push.test.ts's drainWaits recipe, file-local. */
+async function drainSyncWaits(): Promise<void> {
+  for (let round = 0; round < 10 && syncWaits.length > 0; round++) {
+    const batch = syncWaits.splice(0, syncWaits.length);
+    await Promise.allSettled(batch);
+  }
+}
+
+const SYNC_RECEIVE_CT = "application/x-git-receive-pack-request";
+
+/** The general receive body: per-command old oids (create = the zero oid),
+ *  capabilities on the first command — buildReceivePackBody is create-only. */
+function syncReceiveBody(commands: { old: string; oid: string; ref: string }[], pack: Uint8Array): Uint8Array {
+  let section = "";
+  commands.forEach((cmd, i) => {
+    const line = i === 0 ? `${cmd.old} ${cmd.oid} ${cmd.ref}\0report-status side-band-64k` : `${cmd.old} ${cmd.oid} ${cmd.ref}`;
+    section += `${(line.length + 4).toString(16).padStart(4, "0")}${line}`;
+  });
+  return new Uint8Array([...new TextEncoder().encode(`${section}0000`), ...pack]);
+}
+
+/** Real client flow through the gate (advert, then the POST receive), with
+ *  every scheduled waitUntil drained before the response is returned. */
+async function syncPush(
+  repoName: string,
+  commands: { old: string; oid: string; ref: string }[],
+  pack: Uint8Array,
+  token: string,
+): Promise<void> {
+  const base = `${ORIGIN}/${repoName}.git`;
+  const advert = await gitHttpGate(
+    new Request(`${base}/info/refs?service=git-receive-pack`, { headers: { authorization: basicTokenHeader(token) } }),
+    env,
+    syncCtx,
+    syncEngine,
+  );
+  expect(advert.status).toBe(200);
+  const response = await gitHttpGate(
+    new Request(`${base}/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": SYNC_RECEIVE_CT },
+      body: syncReceiveBody(commands, pack),
+    }),
+    env,
+    syncCtx,
+    syncEngine,
+  );
+  await drainSyncWaits();
+  expect(response.status).toBe(200);
+}
+
+describe("the PR-head sync's route-level reflection (the second push moves the pages)", () => {
+  const SYNC_COMMITS: SeedCommit[] = [
+    { message: "w111s: seed main", time: T0 + 900, files: [{ path: "README.md", content: "w111s main\n" }] },
+    {
+      message: "w111s: pr head",
+      time: T0 + 960,
+      files: [{ path: "README.md", content: "w111s main\n" }, { path: "feat.txt", content: "w111s one\n" }],
+    },
+    {
+      message: "w111s: second",
+      time: T0 + 1020,
+      files: [
+        { path: "README.md", content: "w111s main\n" },
+        { path: "feat.txt", content: "w111s one\n" },
+        { path: "more.txt", content: "w111s two\n" },
+      ],
+    },
+  ];
+
+  interface SyncWorld {
+    slug: string;
+    index: number;
+    prId: number;
+    tips: string[];
+    token: string;
+  }
+
+  let syncWorld: SyncWorld | null = null;
+
+  /** The sync fixture: repo row + the PR row FIRST (headBranch "feature",
+   *  status Checking as created), then main + feature pushed through the
+   *  gate — the feature push's fan-out must CREATE refs/pull/N/head from the
+   *  zero oid (the missing-ref arm) and land the D1 sync, with NO explicit
+   *  refs/pull in the receive commands (the mechanism under test). */
+  async function ensureSyncFixtures(): Promise<SyncWorld> {
+    if (syncWorld !== null) return syncWorld;
+    const db = drizzle(env.DB);
+    if ((await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, OWNER)).get()) === undefined) {
+      await seedVerifiedUser({ username: OWNER });
+    }
+    const ownerId = (await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, OWNER)).get())!.id;
+    const slug = "w111sync";
+    await ensureRepoRow(slug, false, ownerId);
+    const repo = await db
+      .select()
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, slug)))
+      .get();
+    if (repo === undefined) throw new Error("w111sync repo row missing");
+
+    const existing = await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, repo.id)).get();
+    let index: number;
+    let prId: number;
+    if (existing === undefined) {
+      const created = await new IssuesService(env.DB).createPullRequest({
+        repoId: repo.id,
+        title: "w111s: the synced pull",
+        posterId: ownerId,
+        headRepoId: repo.id,
+        baseBranch: "main",
+        headBranch: "feature",
+        now: new Date((T0 + 905) * 1000),
+      });
+      index = created.issue.index;
+      prId = created.pullRequest.id;
+    } else {
+      const row = await db
+        .select({ index: issues.index, prId: pullRequests.id })
+        .from(issues)
+        .innerJoin(pullRequests, eq(pullRequests.issueId, issues.id))
+        .where(eq(issues.repoId, repo.id))
+        .get();
+      index = row!.index;
+      prId = row!.prId;
+    }
+
+    await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?")
+      .bind(ownerId, "w111-sync-seed")
+      .run();
+    const token = (await mintFor(ownerId, "w111-sync-seed", "write:repository")).plaintext;
+    syncWorld = { slug, index, prId, tips: [], token };
+    return syncWorld;
+  }
+
+  it("created refs fire NO sync — the pre-sync baseline: 404 commits page, checking merge box", async () => {
+    const world = await ensureSyncFixtures();
+    const repoName = `${OWNER}/${world.slug}`;
+    const refs = await env.REPO.getByName(repoName).listRefs();
+    if (refs.head === null) {
+      const { tips, pack } = await buildHistoryPack(SYNC_COMMITS);
+      // The BASELINE lands through the create family (the file's pushRefs —
+      // SELF → gate → engine): created refs take the push/create family and
+      // never reach the PR-sync arm (webhooks-push.ts's created-continue) —
+      // NO refs/pull is pushed here; the sync's missing-ref create is the
+      // UPDATE push's job (the next test).
+      await pushRefs(repoName, [{ ref: "refs/heads/main", oid: tips[0] as string }], pack, world.token);
+      await pushRefs(repoName, [{ ref: "refs/heads/feature", oid: tips[1] as string }], pack, world.token);
+      world.tips = tips;
+    } else {
+      world.tips = SYNC_COMMITS.map(() => "");
+      const refsAfter = await env.REPO.getByName(repoName).listRefs();
+      world.tips[1] = refsAfter.refs.find((ref) => ref.name === "refs/heads/feature")!.target;
+    }
+    // The create family's contract, at the ref level: the PR's head ref
+    // still does not exist.
+    const moved = (await env.REPO.getByName(repoName).listRefs()).refs.find((r) => r.name === `refs/pull/${world.index}/head`);
+    expect(moved).toBeUndefined();
+
+    // The commits page: the unresolvable refs/pull head is the upstream
+    // NotFound arm (the route reads the SYNC's ref, which has not moved yet).
+    const commits = await get(`/${repoName}/pulls/${world.index}/commits`);
+    expect(commits.status).toBe(404);
+    expect(await commits.text()).not.toContain("commits-table");
+
+    // The merge box rides the D1 row alone: the created PR's Checking status
+    // renders the checking poll (the box's pre-sync shape).
+    const box = await get(`/${repoName}/pulls/${world.index}/merge_box`);
+    expect(box.status).toBe(200);
+    const boxHtml = await box.text();
+    expect(boxHtml).toContain("Checking for merge conflicts…");
+    expect(boxHtml).toContain('data-pull-merge-box-reloading-interval="5000"');
+    expect(boxHtml).toContain(`data-pull-link="/${repoName}/pulls/${world.index}"`);
+  });
+
+  it("the UPDATE push syncs — the pages move onto the new tip, the count moves, newest-first", async () => {
+    const world = await ensureSyncFixtures();
+    if (world.tips[2] === undefined || world.tips[2] === "") {
+      // A re-run against a settled world: re-read the tips from the refs.
+      const refs = await env.REPO.getByName(`${OWNER}/${world.slug}`).listRefs();
+      world.tips[2] = refs.refs.find((ref) => ref.name === "refs/heads/feature")!.target;
+    }
+    const repoName = `${OWNER}/${world.slug}`;
+    const refs = await env.REPO.getByName(repoName).listRefs();
+    const featureTip = refs.refs.find((ref) => ref.name === "refs/heads/feature")!.target;
+    if (featureTip === world.tips[1]) {
+      // The append pack: one commit chained on the current feature tip (the
+      // full-tree builder re-walks the whole linear chain — the earlier tips
+      // stay byte-identical, so tips[2] IS the appended commit).
+      const { tips, pack } = await buildHistoryPack(SYNC_COMMITS);
+      await syncPush(
+        repoName,
+        [{ old: featureTip, oid: tips[2] as string, ref: "refs/heads/feature" }],
+        pack,
+        world.token,
+      );
+      world.tips[2] = tips[2] as string;
+    }
+    // The sync CASed the head ref onto the new tip.
+    const moved = (await env.REPO.getByName(repoName).listRefs()).refs.find((r) => r.name === `refs/pull/${world.index}/head`);
+    expect(moved?.target).toBe(world.tips[2]);
+    // The D1 sync rode the same fan-out (head_sha + the re-armed checking):
+    // the state the two routes below render.
+    const prRow = await drizzle(env.DB).select().from(pullRequests).where(eq(pullRequests.id, world.prId)).get();
+    expect(prRow?.headSha).toBe(world.tips[2]);
+    expect(prRow?.status).toBe(PRStatus.Checking);
+    expect(prRow?.commitsAhead).toBe(2);
+
+    // The commits page: the COUNT MOVED and the new tip is listed
+    // newest-first (git-log order over the moved range).
+    const commits = await get(`/${repoName}/pulls/${world.index}/commits`);
+    expect(commits.status).toBe(200);
+    const commitsHtml = await commits.text();
+    expect(commitsHtml).toContain('<div class="flex-text-block">2 Commits</div>');
+    const second = commitsHtml.indexOf("w111s: second");
+    const head = commitsHtml.indexOf("w111s: pr head");
+    expect(second).toBeGreaterThan(-1);
+    expect(head).toBeGreaterThan(second); // newest first
+    expect(commitsHtml).toContain(`<a href="/${repoName}/commit/${world.tips[2]}">w111s: second</a>`);
+    expect(commitsHtml).toContain(`<a href="/${repoName}/commit/${world.tips[1]}">w111s: pr head</a>`);
+
+    // The merge box STILL reflects the NEW divergence: the sync re-armed
+    // checking again (the poll loop the bundle refreshes with).
+    const box = await get(`/${repoName}/pulls/${world.index}/merge_box`);
+    expect(box.status).toBe(200);
+    const boxHtml = await box.text();
+    expect(boxHtml).toContain("Checking for merge conflicts…");
+    expect(boxHtml).toContain('data-pull-merge-box-reloading-interval="5000"');
+    expect(boxHtml).toContain(`data-pull-link="/${repoName}/pulls/${world.index}"`);
+  });
+
+  it("a moved base renders the outdated blocker from the synced divergence — the counts' merge-box landing", async () => {
+    const world = await ensureSyncFixtures();
+    const repoName = `${OWNER}/${world.slug}`;
+    const repo = await drizzle(env.DB)
+      .select()
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, world.slug)))
+      .get();
+    if (repo === undefined) throw new Error("w111sync repo row missing");
+    // The protection rule whose blockOnOutdatedBranch turns the synced
+    // commits_behind into the box's blocker item (the rule storage is the
+    // landed read-and-echo JSON under the exact snake_case keys).
+    const existingRule = await drizzle(env.DB)
+      .select({ id: protectedBranches.id })
+      .from(protectedBranches)
+      .where(and(eq(protectedBranches.repoId, repo.id), eq(protectedBranches.ruleName, "main")))
+      .get();
+    if (existingRule === undefined) {
+      await drizzle(env.DB).insert(protectedBranches).values({
+        repoId: repo.id,
+        ruleName: "main",
+        rules: serializeRuleConfig({ ...emptyRuleConfig(), blockOnOutdatedBranch: true }),
+        createdAt: new Date((T0 + 950) * 1000),
+        updatedAt: new Date((T0 + 950) * 1000),
+      });
+    }
+    // The row state a base advance + the next head sync leaves (the sync's
+    // countDivergence arm — the unit file pins the write; this pins the
+    // ROUTE render over it), CASed the same way the sync leaves it.
+    await drizzle(env.DB)
+      .update(pullRequests)
+      .set({ status: PRStatus.Mergeable, commitsBehind: 2, commitsAhead: 2 })
+      .where(and(eq(pullRequests.id, world.prId), eq(pullRequests.hasMerged, false)));
+    const box = await get(`/${repoName}/pulls/${world.index}/merge_box`);
+    expect(box.status).toBe(200);
+    const boxHtml = await box.text();
+    // The counts moved → the box now blocks on the outdated branch (the
+    // apostrophe renders in its HTML-escaped form).
+    expect(boxHtml).toContain("This pull request is blocked because it&#39;s outdated.");
+    expect(boxHtml).not.toContain("Checking for merge conflicts…");
+    expect(boxHtml).not.toContain("data-pull-merge-box-reloading-interval");
+    // The anonymous viewer's access pair carries no write: the blocker
+    // section renders with the no-merge-access item and NO merge prompt
+    // (prepareMergeBoxProtectionChecks' order, the outdated item first).
+    expect(boxHtml).toContain("You are not authorized to merge this pull request.");
+    expect(boxHtml).not.toContain("This pull request can be merged automatically.");
   });
 });
