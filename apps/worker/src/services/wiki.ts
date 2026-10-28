@@ -54,8 +54,25 @@
  * commit, and `engineCell.putApiObjects` + `commitApiChange` CAS for the
  * landing (the git-http receive path is untouched; serialization across
  * concurrent API writes is the cell's own CAS).
+ *
+ * Webhook emissions (the upstream WikiPayload triple): the three write ops
+ * fan out the `wiki` event through the shared `emitWebhookDeliveries`
+ * pipeline (§3.5) — upstream fires `NewWikiPage`/`EditWikiPage`/
+ * `DeleteWikiPage` (services/webhook/notifier.go:534-562) from BOTH routers
+ * over one notify wrapper, so the service seam is our equivalent shared
+ * funnel: the `/api/v1` routes and the UI writer emit identically. Payload
+ * fidelity: `page` is the resolved WebPath, `comment` is the effective
+ * (router-defaulted) commit message the routers pass upstream — `Add %q` /
+ * `Update %q`, and delete carries none (Go zero-marshals `"comment": ""`).
+ * Sender identity resolves the doer's user row by usernameLower (the push
+ * family's resolve-to-row rule; unresolvable → logged skip, never a failed
+ * write), repository/sender render through the §2.7 converters with the
+ * doer self-view. No activity-feed rows: upstream's feed notifier has no
+ * wiki methods (NullNotifier placeholders only).
  */
 
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 import {
   serializeCommit,
   serializeTree,
@@ -79,7 +96,10 @@ import {
 } from "../api/services/engine";
 import { buildBlobObject, buildFileChangeCommit, type FileChange } from "../api/services/git-models";
 import { lastCommitForPath } from "../api/services/contents";
-import type { RepositoryWithOwner } from "../api/services/repository";
+import { apiUserFromRow, toApiRepository, type RepositoryWithOwner, type Viewer } from "../api/services/repository";
+import { users } from "../db/schema";
+import { emitWebhookDeliveries } from "../issues/webhooks";
+import { appOrigin } from "./webhooks-push";
 
 // ---------------------------------------------------------------------------
 // Go stdlib parity (url.QueryEscape / url.QueryUnescape / url.PathUnescape /
@@ -585,6 +605,119 @@ export async function readWikiRawBlob(
 }
 
 // ---------------------------------------------------------------------------
+// Webhook emissions — the upstream WikiPayload triple (notifier.go:534-562)
+// ---------------------------------------------------------------------------
+
+/** Upstream `HookWikiAction` (modules/structs/hook.go:523-531). */
+export type WikiEventAction = "created" | "edited" | "deleted";
+
+/**
+ * The shared WikiPayload wrapper (§2.7, modules/structs/hook.go:535): action,
+ * repository, sender, page, comment — ALL five fields always present (Go
+ * marshals zero values; upstream's DeleteWikiPage passes no comment, so the
+ * deleted payload carries `"comment": ""`).
+ */
+export function wikiEventPayload(
+  action: WikiEventAction,
+  repository: unknown,
+  sender: unknown,
+  page: string,
+  comment: string,
+): Record<string, unknown> {
+  return { action, repository, sender, page, comment };
+}
+
+/** Structural `WEBHOOK_DELIVERY` queue probe — the repo-events.ts shape. */
+function webhookDeliveryQueue(env: ApiEnv["Bindings"]): {
+  sendBatch(messages: { body: { deliveryId: number } }[]): Promise<unknown>;
+} | null {
+  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
+  if (candidate === undefined || candidate === null) return null;
+  const queue = candidate as { sendBatch?: (messages: { body: { deliveryId: number } }[]) => Promise<unknown> };
+  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The wiki write family's webhook fan-out — fired by the three SERVICE write
+ * ops after their mutation committed and the read-back answered, so the API
+ * routes and the UI writer emit identically (upstream's notify wrapper runs
+ * from both routers the same way; the v1 create route even notifies only
+ * after getWikiPage answered — `if !ctx.Written()`, wiki.go:83-86 — which
+ * our emit-after-readback ordering mirrors). Never throws: the write already
+ * landed and a webhook failure must never fail it.
+ *
+ * Payload identity: `page` = the resolved WebPath, `comment` = the effective
+ * (router-defaulted) message. Sender: upstream `convert.ToUser(ctx, doer,
+ * nil)` — the doer user row, resolved here by usernameLower (WikiDoer.name
+ * is the login on every caller: the API route derives it from the token
+ * identity, the UI mount from the session row). Repository: upstream renders
+ * at constant owner permission (notifier.go:538); we render through the same
+ * §2.7 converters as the REST body with the doer self-view — the
+ * `emitSessionIssueOpened` payload identity (sender email visible, owner
+ * fields visible when the doer owns the repo). Deliberate divergence,
+ * disclosed in docs/compat/webhook-event-coverage.md's wiki row.
+ *
+ * Delivery mechanics are the OFF-REQUEST inline variant (the push-create
+ * settle / fork consumer posture, emitRepoEventInline): the service seam has
+ * no hono executionCtx to offload onto, so the delivery-row insert is
+ * awaited inline and the Queue producer batch is awaited when the binding
+ * exists; without it the rows stay `pending` (the durable source of truth;
+ * the consumer's idempotent CAS makes a later enqueue a safe replay).
+ */
+async function emitWikiPageEvent(
+  env: ApiEnv["Bindings"],
+  pair: RepositoryWithOwner,
+  doer: WikiDoer,
+  action: WikiEventAction,
+  page: string,
+  comment: string,
+  origin: string,
+): Promise<void> {
+  try {
+    const doerRow =
+      (await drizzle(env.DB)
+        .select()
+        .from(users)
+        .where(eq(users.usernameLower, doer.name.toLowerCase()))
+        .get()) ?? null;
+    if (doerRow === null) {
+      console.error(`[wiki] webhook fan-out skipped (${action}): doer row missing [name: ${doer.name}]`);
+      return;
+    }
+    // Self-render bootstrap: apiUserFromRow reads only login/is_admin off the
+    // viewer, so the first pass (anonymous) yields the requester object the
+    // second pass needs to authenticate the doer against themself.
+    const bootstrap: Viewer = { origin, requester: null };
+    const viewer: Viewer = { origin, requester: apiUserFromRow(doerRow, bootstrap) };
+    const payload = wikiEventPayload(
+      action,
+      toApiRepository(viewer, pair),
+      apiUserFromRow(doerRow, viewer),
+      page,
+      comment,
+    );
+    const queue = webhookDeliveryQueue(env);
+    await emitWebhookDeliveries(
+      env.DB,
+      { repoId: pair.repo.id, ownerId: pair.repo.ownerId, eventType: "wiki", payload, refName: null },
+      {
+        enqueue:
+          queue !== null
+            ? (deliveryIds) =>
+                queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(() => undefined)
+            : undefined,
+      },
+    );
+  } catch (error) {
+    console.error(`[wiki] webhook fan-out failed (${action}): ${errorMessage(error)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Write operations (upstream updateWikiPage / DeleteWikiPage semantics)
 // ---------------------------------------------------------------------------
 
@@ -605,6 +738,12 @@ export interface WikiDoer {
 export interface WikiWriteOptions {
   /** author/committer unix-seconds stamp for the landed commit. */
   now?: number;
+  /**
+   * The `wiki` webhook payload's URL origin for the DELETE emission (the
+   * delete op has no origin param — create/edit reuse their `origin`
+   * argument). Absent → `appOrigin(env)`, the off-request rule.
+   */
+  origin?: string;
 }
 
 function wikiPerson(doer: WikiDoer, now?: number): Person {
@@ -738,6 +877,9 @@ export async function createWikiPage(
   if (page === null) {
     throw new ApiError(500, "wiki page vanished after create");
   }
+  // `wiki` created — the router-defaulted message rides the payload as
+  // `comment` (upstream wiki.go:85 passes form.Message post-default).
+  await emitWikiPageEvent(env, pair, doer, "created", wikiName, message, origin);
   return page;
 }
 
@@ -794,6 +936,9 @@ export async function editWikiPage(
   if (page === null) {
     throw new ApiError(500, "wiki page vanished after edit");
   }
+  // `wiki` edited — the page field is the NEW WebPath (upstream wiki.go:157
+  // notifies `string(newWikiName)`, the rename's target included).
+  await emitWikiPageEvent(env, pair, doer, "edited", newWikiName, message, origin);
   return page;
 }
 
@@ -822,6 +967,9 @@ export async function deleteWikiPage(
     doer,
     options,
   );
+  // `wiki` deleted — no `comment` argument upstream (notifier.go:560-562);
+  // Go zero-marshals the field, so the payload carries `"comment": ""`.
+  await emitWikiPageEvent(env, pair, doer, "deleted", wikiName, "", options?.origin ?? appOrigin(env));
 }
 
 // ---------------------------------------------------------------------------

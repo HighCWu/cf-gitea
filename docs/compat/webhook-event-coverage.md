@@ -12,10 +12,13 @@ emission surfaces without changing status: the server-driven migrate route (`0fe
 SPEC-0009 §2.2 landed, `repository` created fires there), PATCH-pull-assignees (`f2e1710` —
 `pull_request_assign` rides the PATCH arm now), and the UI write paths (`165f757` compare-create,
 `d3c8c4b`/`48101dc` releases, `48101dc` tag-delete pair, plus UI branch-delete and review
-surfaces — the API rows' seams carry them). Upstream pin: `gitea` submodule at
-`fc4936884584a41931906553d96c2601d750e6ef` (v1.22.0-rc1-3919-gfc49368845) — unchanged since the
-first edition; every upstream and worker citation below was re-verified in-tree at HEAD.
-`28df818` (session rotation) was checked and has no webhook relevance.
+surfaces — the API rows' seams carry them). POST-REFRESH, IN-TREE: the wiki webhook wiring
+landed (the wiring wave this edition ranked as the top remaining-work item) — `wiki` moved
+NOT-EMITTED → EMITTED; its row, the "our side" seam inventory, and the counts below are current
+for that landing (the row's worker line numbers are the in-tree state, not `4d039cb`). Upstream
+pin: `gitea` submodule at `fc4936884584a41931906553d96c2601d750e6ef` (v1.22.0-rc1-3919-gfc49368845)
+— unchanged since the first edition; every upstream and worker citation below was re-verified
+in-tree at HEAD. `28df818` (session rotation) was checked and has no webhook relevance.
 
 - **Canonical upstream list**: `HookEventType` enum, `gitea/modules/webhook/type.go:10-48`; the
   wire-relevant set is `AllEvents()` (26 types, `type.go:50-77` — it includes `workflow_run`/
@@ -34,7 +37,10 @@ first edition; every upstream and worker citation below was re-verified in-tree 
   fan-out `:173`→`emitWebhookDeliveries:180`), and `emitPushFamilyUpdates`
   (`apps/worker/src/services/webhooks-push.ts:325`). The direct `emitWebhookDeliveries` callers
   (branches/tags API routes, releases, statuses) keep their per-file helpers (`branches.ts:280`
-  /`tags.ts:176` `emitRefWebhook`).
+  /`tags.ts:176` `emitRefWebhook`). Since the wiring wave, a fourth seam rides the SAME
+  `emitWebhookDeliveries` mechanics from inside a service module: the wiki family
+  (`apps/worker/src/services/wiki.ts` `emitWikiPageEvent`, the inline off-request posture —
+  see its row).
 - **Status vocabulary**: EMITTED (real events, all reachable trigger paths) / EMITTED-PARTIAL
   (emitted from a subset of upstream's trigger paths or actions) / NOT-EMITTED (the feature exists,
   only the webhook is missing) / N/A (the triggering feature itself does not exist yet).
@@ -68,7 +74,7 @@ first edition; every upstream and worker citation below was re-verified in-tree 
 | `pull_request_review_comment` | PullRequestReview:751 (pick `:758`) | PullRequestPayload | **EMITTED** (same wave) — the COMMENT arm of the same seam, identical payload shape | tests: `api/routes/pull-reviews.test.ts` | P2 |
 | `pull_request_sync` | PullRequestSynchronized:835→:845 (fired by the push that updates a PR head branch; EventSource = the PR's BASE repo) | PullRequestPayload | **EMITTED** (closed `308fa21`; the `140fc0b` head-sync reshaped the path) — `webhooks-push.ts` `emitPullRequestSyncs:532`, emit `:565-583` (action `synchronized`, before/after oids, base-repo routing for fork heads), invoked `:492-494` on branch updates inside `emitPushFamilyUpdates`. NEW (`140fc0b`): the §3.4 sync arms now PRECEDE the webhook per PR (`syncPullRequestHead:638` — fork-head object carry, CAS `refs/pull/N/head` old→new on the base cell, the D1 row's head_sha/checking/divergence CAS, the type-29 `pull_push` comment with the force-push reconcile), and the payload renders the MOVED row in payload mode (`:577`) — upstream renders ToPayloadPullRequest of the same post-sync state (notifier.go:850). Rides both trigger paths (`:1278` user push, `mirror/sync.ts:391` mirror) | landed; tests: `webhooks-push.test.ts` (sync + head-sync arms), `pull-engine.test.ts` | P2 |
 | `pull_request_review_request` | PullRequestReviewRequest:793→:815 | PullRequestPayload | **EMITTED** (closed by the PR-reviews wave) — POST/DELETE `…/pulls/{index}/requested_reviewers` (`pull-reviews.ts:1612`/`:1674`/`:1701`) emit per actually-created/removed USER request, action `review_requested` / `review_request_removed`, `requested_reviewer` = the reviewer, `sender` = the doer (notifier.go:793–815); a no-op request is silent (upstream `comment == nil`); team-request ADD fires one event with `requested_reviewer` omitted (upstream fans out per team MEMBER — documented deviation); team-request REMOVAL is silent upstream-faithfully (`review_request.go:44–47`); the UI request/revoke form rides the family (`ui/pages/pull-reviews.tsx:951`) | tests: `api/routes/pull-reviews.test.ts` | P2 |
-| `wiki` | NewWikiPage:534→:536; EditWikiPage:547→:549; DeleteWikiPage:560→:562 (callers `routers/web/repo/wiki.go:683` etc. and the v1 wiki routes) | WikiPayload (`hook.go:535`) | **NOT-EMITTED** (was N/A; the feature landed `d3362b1`, wave-api-wiki) — the full six-op surface exists with the three WRITE triggers: POST `/repos/{owner}/{repo}/wiki/new` (`api/routes/wiki.ts:279`), PATCH `…/wiki/page/{pageName}` (`:324`), DELETE (`:366`), backed by `services/wiki.ts` and the UI writer (`ui/pages/repo-wiki.tsx`) — and NO module in that chain emits anything. The family-seam pattern (`repo-events.ts`) is the ready wiring shape | the wiki-webhook wiring wave | P1 |
+| `wiki` | NewWikiPage:534→:536; EditWikiPage:547→:549; DeleteWikiPage:560→:562 (upstream fires from BOTH routers over the one notify wrapper, post-write, passing the ROUTER-DEFAULTED `form.Message` and the resolved WebPath: the v1 routes `routers/api/v1/repo/wiki.go:85`/`:157`/`:244` — create notifies only after getWikiPage answered, `:83-86` — and the web routes `routers/web/repo/wiki.go:683`/`:723`/`:737`) | WikiPayload (`hook.go:535`) | **EMITTED** (the wiring wave; was NOT-EMITTED since `d3362b1` landed the feature silent) — the SERVICE seam `services/wiki.ts` `emitWikiPageEvent:671` fires from all three write ops — created `:882`, edited `:941` (`page` = the NEW WebPath, upstream wiki.go:157), deleted `:972` — so the v1 write routes (`api/routes/wiki.ts`) AND the UI writer (`ui/pages/repo-wiki.tsx` FromForm seams `:425`/`:447`/`:470` → the `ui/index.ts` mount) emit identically. Payload = `wikiEventPayload:620`: all five fields ALWAYS present (Go marshals zero values — the delete carries `"comment": ""`), `page` = the resolved WebPath, `comment` = the effective defaulted message (`Add %q`/`Update %q`, exactly what both upstream routers pass post-default). Sender = the doer row resolved by usernameLower (the push family's resolve-to-row rule; WikiDoer.name is the login on every caller) rendered self-visible like `convert.ToUser(doer, nil)`; repository = the §2.7 converter (the `emitSessionIssueOpened` identity). Deliveries ride the shared `emitWebhookDeliveries` fan-out in the inline off-request posture (`emitRepoEventInline`'s — the service seam has no executionCtx to offload the enqueue onto); no activity-feed rows (upstream's feed notifier has no wiki methods, NullNotifier placeholders only). Documented divergences: upstream renders the repository at constant OWNER permission (notifier.go:538), ours at the doer self-view; the UI delete path's payload URLs use `appOrigin(env)` (no origin param reaches the service from the mount; create/edit carry their request origin, and the API delete route passes it via `WikiWriteOptions.origin`, `api/routes/wiki.ts:386`) | tests: `api/routes/wiki.test.ts` (the write triple upstream-shaped, exactly-once, read/failed-write silence, subscription scoping incl. send_everything), `ui/pages/repo-wiki.smoke.test.tsx` (the UI-writer parity triple) | P1 |
 | `repository` | CreateRepository:114→:116; DeleteRepository:126→:127; RenameRepository:137→:138; MigrateRepository:149→:151 (fork case: :103) | RepositoryPayload (`hook.go:566`) | **EMITTED** — `services/repo-events.ts` (`emitRepoEvent:198`, `emitRepoEventInline:233`): created `api/routes/user-repos.ts:212` + `api/routes/org-repos.ts:231` + admin org-repo create `api/routes/admin-org-extras.ts:214` + push-create settle `src/git-http/gate.ts` (`emitCreatedEvent:1091`, fired `:1026` from the tag-only arm and `:1055` from the branch arm — `0626ced`'s three-arm contract, exactly-once behind the CAS gate) + **the server-driven migrate route** (`api/routes/mirror.ts:200`-`206`, landed `0fe6b04` = SPEC-0009 §2.2: the route creates the `repositories` row itself via `services/migrate.ts` and fires the ONE created there — the previous edition's "unlanded SPEC-0009" plan is now the landed shape); renamed `api/routes/repo.ts:489` (`changes.name.from`); deleted `repo.ts:639` (post-cascade posture: the deleted repo's OWN hooks never hear it — its delivery rows cascade with the repo — owner-level and system hooks do); transfer stays silent upstream-faithfully (NullNotifier no-op). The client-chunked import surface (`api/routes/imports.ts`) still creates no repo rows and stays silent by the parity analysis — its created fires upstream of it (POST /repos or the migrate route) | tests: `api/repo-edit.test.ts`, `git-http/gate.test.ts`, `push-create.test.ts`, `repos/imports/imports.test.ts` (migrate-surface silence guard) | P2 |
 | `release` | sendReleaseHook:872→:879 (shared; NewRelease:889, UpdateRelease:893, DeleteRelease:897; callers `services/release/release.go:198`, `:363`, `:366`, `:437`) | ReleasePayload (`hook.go:332`) | **EMITTED** (closed `705eb9c`) — `api/routes/releases.ts` `emitReleaseWebhook:196` (→ `:208`), `emitReleaseEvent:250` with the drafts-stay-silent guard: published `:492` (POST create), updated / draft→published flip `:578` (PATCH), deleted `:532` (by-tag) / `:591` (by-id); the UI releases family emits the same triple through `emitIssueEvent` (`ui/pages/releases.tsx:546` create, `:663` edit, `:712` delete — `d3c8c4b`/`48101dc`) | landed; tests: `api/releases.test.ts` | P1 |
 | `package` | PackageCreate:968 / PackageDelete:972 → shared notifyPackage:976→:993 (callers `routers/api/packages/container/manifest.go:95` and the debian/rpm/conan registries) | PackagePayload (`hook.go:595`) | **N/A** — no package-registry feature | the future package-registry wave | P2 |
@@ -79,39 +85,34 @@ first edition; every upstream and worker citation below was re-verified in-tree 
 
 ## Coverage ratio
 
-Over the 26 wire event types of `AllEvents()` (`type.go:50-77`), at HEAD `4d039cb`:
+Over the 26 wire event types of `AllEvents()` (`type.go:50-77`), at HEAD `4d039cb` plus the
+in-tree wiki wiring wave:
 
-- **Fully emitted: 20/26** (`push`, `create`, `delete`, `fork`, `issue_assign`,
+- **Fully emitted: 21/26** (`push`, `create`, `delete`, `fork`, `issue_assign`,
   `issue_label`, `issue_milestone`, `issue_comment`, `pull_request_assign`,
   `pull_request_label`, `pull_request_milestone`, `pull_request_comment`,
   `pull_request_review_approved`, `pull_request_review_rejected`,
   `pull_request_review_comment`, `pull_request_review_request`, `pull_request_sync`,
-  `release`, `status`, `repository`) — **77%** (3/26 at the first edition, 18/26 at the
-  9410fde-era refresh, 22/26 at the 2026-10-25 refresh; `issues` and `pull_request` dropped
-  out of this bucket at THIS refresh — see their rows).
-- **At least partially emitted: 22/26 — 85%** (the 20 above plus `issues` and `pull_request`).
-- **NOT-EMITTED with the triggering feature already present: 1/26** — `wiki`: the bucket the
-  2026-10-25 refresh emptied is occupied again, by the wave-api-wiki feature landing
-  (`d3362b1`) whose writes fire no hooks yet.
+  `wiki`, `release`, `status`, `repository`) — **81%** (3/26 at the first edition, 18/26 at the
+  9410fde-era refresh, 22/26 at the 2026-10-25 refresh, 20/26 at this edition's refresh —
+  `issues`/`pull_request` dropped out there — and the wiki wiring brings it back up here).
+- **At least partially emitted: 23/26 — 88%** (the 21 above plus `issues` and `pull_request`).
+- **NOT-EMITTED with the triggering feature already present: 0/26** — the bucket the
+  2026-10-25 refresh emptied, that the wave-api-wiki landing (`d3362b1`) re-occupied, is empty
+  again: the wiki webhook wiring wave closed it (its row).
 - **N/A, feature absent: 3/26** — `package`, `workflow_run`, `workflow_job`.
 
 ## Remaining work (ranked)
 
-1. **Wiki webhook wiring** — NEW top item: the triggering feature is landed (`d3362b1`, all six
-   ops, API + UI writes); only the emissions are missing. Upstream anchors
-   `notifier.go:534-562` (`NewWikiPage`/`EditWikiPage`/`DeleteWikiPage`, each a straight
-   PrepareWebhooks over `WikiPayload`); the `emitRepoEvent`-style family-module pattern is the
-   established wiring shape, and the v1 write routes (`wiki.ts:279`/`:324`/`:366`) plus the UI
-   writer (`repo-wiki.tsx`) are the seams.
-2. **The `issues`/`pull_request` silent arms** — (a) DELETE /issues/{index} should fire the
+1. **The `issues`/`pull_request` silent arms** — (a) DELETE /issues/{index} should fire the
    `action=deleted` delivery through `emitIssueEvent` (payload anchors notifier.go:313-341 — the
    PR arm renders PullRequestPayload, the issue arm IssuePayload, both `action=deleted`); (b) the
    `pull_request` closed webhook deferred by the branch-delete cascade (`140fc0b`'s documented
    deviation, `webhooks-push.ts:931`) — the payload builder lives in the pulls route module, so
    the wiring is an import away (upstream's arm: pull.go:623-649 → status.go:43 → notifier.go:249).
-3. **Gitea-Actions wave** — `workflow_run`/`workflow_job` (+ `schedule`, outside `AllEvents`)
+2. **Gitea-Actions wave** — `workflow_run`/`workflow_job` (+ `schedule`, outside `AllEvents`)
    arrive only with Actions itself; `package` likewise waits for the package registry.
-4. **Housekeeping**: PATCH-assignee support for ISSUES (`issues.ts:1324` still ignores
+3. **Housekeeping**: PATCH-assignee support for ISSUES (`issues.ts:1324` still ignores
    `form.assignee(s)` — its "no table yet" rationale is stale since `f2e1710` built the shared
    table; the pulls side already wires it) would let the issue-assign emissions ride the PATCH
    path like upstream; the `fork` event still lacks a dedicated delivery assertion; the reviews'

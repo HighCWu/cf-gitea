@@ -14,11 +14,11 @@
 
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories, users } from "../../db/schema";
+import { repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { RepositoryWithOwner } from "../../api/services/repository";
@@ -287,5 +287,82 @@ describe("smoke: the revision family (revision.tmpl over listWikiPageRevisions)"
     expect(html).not.toContain('class="item navigation"');
     // Sanity: the decoded base64 round trip the loaders rely on.
     expect(decodeWikiBase64("")).toBe("");
+  });
+});
+
+// --- 6. the WEBHOOK family (the UI writer's path — the same services/wiki.ts
+//        seam the /api/v1 routes ride, so both surfaces emit identically;
+//        the API suite owns the shape assertions, this owns the parity proof)
+
+describe("smoke: the webhook emissions family (the UI writer's path)", () => {
+  it("create/edit/delete through the FromForm seams deliver the same wiki triple", async () => {
+    const { pair } = await ensureFixtures();
+    const hookRows = await drizzle(env.DB)
+      .insert(webhooks)
+      .values({
+        repoId: pair.repo.id,
+        url: "https://hooks.invalid/wiki-smoke",
+        events: JSON.stringify({ choose_events: true, branch_filter: "*", events: { wiki: true } }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const hook = hookRows[0];
+    if (hook === undefined) throw new Error("hook seed failed");
+
+    const created = await createWikiPageFromForm(
+      env,
+      pair,
+      DOER,
+      parseWikiPageForm(new URLSearchParams({ title: "Hook Page", content: "# hook\n", message: "" })),
+      ORIGIN,
+    );
+    expect(created.title).toBe("Hook Page");
+    const edited = await editWikiPageFromForm(
+      env,
+      pair,
+      DOER,
+      "Hook-Page",
+      parseWikiPageForm(new URLSearchParams({ title: "Hook Page Renamed", content: "# renamed\n", message: "ui msg" })),
+      ORIGIN,
+    );
+    expect(edited.title).toBe("Hook Page Renamed");
+    await deleteWikiPageFromForm(env, pair, DOER, "Hook-Page-Renamed");
+
+    const deliveries = await drizzle(env.DB)
+      .select()
+      .from(webhookDeliveries)
+      .where(eq(webhookDeliveries.hookId, hook.id))
+      .orderBy(asc(webhookDeliveries.id))
+      .all();
+    expect(deliveries).toHaveLength(3);
+    for (const delivery of deliveries) {
+      expect(delivery.eventType).toBe("wiki");
+      expect(delivery.eventGroup).toBe("wiki");
+      expect(delivery.repoId).toBe(pair.repo.id);
+      // No `state` assertion: the service seam enqueues through the real
+      // WEBHOOK_DELIVERY binding and index.ts's queue consumer is live in
+      // the vitest workerd (webhooks-push.test.ts's settleDeliveries note)
+      // — the row may already have left `pending` by assert time. State
+      // semantics belong to the consumer's suite; this asserts the emission.
+    }
+    const payloads = deliveries.map((delivery) => JSON.parse(delivery.payloadContent) as Record<string, unknown>);
+    // The triple fires exactly once per write, in order, with the same
+    // upstream WikiPayload field set the API suite pins.
+    expect(payloads.map((payload) => payload.action)).toEqual(["created", "edited", "deleted"]);
+    for (const payload of payloads) {
+      expect(Object.keys(payload).sort()).toEqual(["action", "comment", "page", "repository", "sender"]);
+      expect((payload.sender as Record<string, unknown>).login).toBe("alice");
+      expect((payload.repository as Record<string, unknown>).full_name).toBe("alice/wikismoke");
+    }
+    expect(payloads[0]?.page).toBe("Hook-Page");
+    expect(payloads[0]?.comment).toBe('Add "Hook Page"'); // the router-defaulted template
+    expect(payloads[1]?.page).toBe("Hook-Page-Renamed");
+    expect(payloads[1]?.comment).toBe("ui msg");
+    expect(payloads[2]?.page).toBe("Hook-Page-Renamed");
+    expect(payloads[2]?.comment).toBe(""); // the Go-zero field (delete takes no comment upstream)
   });
 });

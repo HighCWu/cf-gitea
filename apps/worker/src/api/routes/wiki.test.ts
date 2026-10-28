@@ -32,11 +32,11 @@ import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 
 import { ensureSeededRepo } from "../../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories, users } from "../../db/schema";
+import { repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
 import {
   createOptionalTokenAuthMiddleware,
   createTokenAuthMiddleware,
@@ -478,5 +478,175 @@ describe("wiki gates and error arms", () => {
     expect((await get(`${PRIV_PATH}/wiki/pages`)).status).toBe(404);
     const write = await send(`${PRIV_PATH}/wiki/new`, jsonInit("POST", { title: "Priv", content_base64: "" }, OUTSIDER_TOKEN));
     expect(write.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Webhook emissions (services/wiki.ts — the upstream WikiPayload triple,
+// notifier.go:534-562): the three write triggers each fire exactly once
+// through the shared service seam, upstream-shaped; reads and failed writes
+// stay silent. Deliveries are asserted over the webhook_deliveries D1 rows
+// (the delivery log IS the source of truth, SPEC-0005 §3.6).
+// ---------------------------------------------------------------------------
+
+describe("wiki webhook emissions (the upstream WikiPayload triple)", () => {
+  const HOOKS = "whooks";
+  const HOOKS_PATH = `/repos/${OWNER}/${HOOKS}`;
+  let REPO_ID = "";
+  let wikiHookId = 0;
+  let pushHookId = 0;
+  let everythingHookId = 0;
+
+  beforeAll(async () => {
+    await ensureSeededRepo({
+      owner: OWNER,
+      slug: HOOKS,
+      commits: [{ message: "seed: hooks repo", time: 1_760_000_000, files: [{ path: "README.md", content: "# seed\n" }] }],
+    });
+    const repoRow = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, HOOKS)))
+      .get();
+    if (repoRow === undefined) throw new Error("hooks repo row missing");
+    REPO_ID = repoRow.id;
+    wikiHookId = await seedHook(REPO_ID, { choose_events: true, branch_filter: "*", events: { wiki: true } });
+    pushHookId = await seedHook(REPO_ID, { choose_events: true, branch_filter: "*", events: { push: true } });
+    everythingHookId = await seedHook(REPO_ID, { send_everything: true, branch_filter: "*" });
+  });
+
+  /** Active webhook with the given subscription config — the fan-out matcher target. */
+  async function seedHook(repoId: string, config: Record<string, unknown>): Promise<number> {
+    const rows = await drizzle(env.DB)
+      .insert(webhooks)
+      .values({
+        repoId,
+        url: "https://hooks.invalid/wiki-emissions-test",
+        events: JSON.stringify(config),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    const row = rows[0];
+    if (row === undefined) throw new Error("hook seed failed");
+    return row.id;
+  }
+
+  const deliveriesFor = async (hookId: number): Promise<Array<(typeof webhookDeliveries.$inferSelect | undefined)>> =>
+    drizzle(env.DB)
+      .select()
+      .from(webhookDeliveries)
+      .where(eq(webhookDeliveries.hookId, hookId))
+      .orderBy(asc(webhookDeliveries.id))
+      .all();
+
+  /** The parsed payload of delivery N, typed loose at the call sites. */
+  const payloadOf = async (hookId: number, index: number): Promise<Record<string, unknown>> => {
+    const rows = await deliveriesFor(hookId);
+    const row = rows[index];
+    if (row === undefined) throw new Error(`delivery ${index} missing for hook ${hookId}`);
+    return JSON.parse(row.payloadContent) as Record<string, unknown>;
+  };
+
+  it("runs the write triple upstream-shaped — exactly once per trigger, silent reads, silent failed writes", async () => {
+    // --- create with an explicit message: comment = the message verbatim
+    const create = await send(
+      `${HOOKS_PATH}/wiki/new`,
+      jsonInit("POST", { title: "Hooked", content_base64: utf8B64("# hooked\n"), message: "seed msg" }),
+    );
+    expect(create.status).toBe(201);
+    const deliveries = await deliveriesFor(wikiHookId);
+    expect(deliveries).toHaveLength(1);
+    const createdRow = deliveries[0]!;
+    expect(createdRow.eventType).toBe("wiki");
+    expect(createdRow.eventGroup).toBe("wiki"); // the bare type — upstream HookEventWiki.Event()
+    // NOTE: no `state` assertion — the service seam enqueues through the real
+    // WEBHOOK_DELIVERY binding, and index.ts's queue consumer is LIVE in the
+    // vitest workerd (webhooks-push.test.ts's settleDeliveries note): the row
+    // may already have left `pending` by the time this assertion runs. The
+    // emission contract is the row's event/payload columns; state semantics
+    // belong to the consumer's own suite.
+    expect(createdRow.repoId).toBe(REPO_ID);
+    // §2.7 serialization: 2-space JSON, action first (upstream struct order).
+    expect(createdRow.payloadContent).toContain('\n  "action": "created"');
+    const created = await payloadOf(wikiHookId, 0);
+    // ALL five WikiPayload fields (Go marshals zero values — no omitempty).
+    expect(Object.keys(created).sort()).toEqual(["action", "comment", "page", "repository", "sender"]);
+    expect(created.action).toBe("created");
+    expect(created.page).toBe("Hooked");
+    expect(created.comment).toBe("seed msg");
+    const sender = created.sender as Record<string, unknown>;
+    expect(sender.login).toBe(OWNER);
+    expect(sender.id).toBe(OWNER_ID);
+    const repository = created.repository as Record<string, unknown>;
+    expect(repository.full_name).toBe(`${OWNER}/${HOOKS}`);
+    expect(repository.html_url).toBe(`${ORIGIN}/${OWNER}/${HOOKS}`);
+
+    // --- create without a message: comment is the ROUTER-DEFAULTED template
+    // (both upstream routers fill form.Message before notify — v1
+    // wiki.go:64-66 `fmt.Sprintf("Add %q", form.Title)`, web wiki.go:674-676)
+    const create2 = await send(`${HOOKS_PATH}/wiki/new`, jsonInit("POST", { title: "Second Page", content_base64: utf8B64("two\n") }));
+    expect(create2.status).toBe(201);
+    expect(await deliveriesFor(wikiHookId)).toHaveLength(2);
+    const second = await payloadOf(wikiHookId, 1);
+    expect(second.action).toBe("created");
+    expect(second.page).toBe("Second-Page");
+    expect(second.comment).toBe('Add "Second Page"');
+
+    // --- reads/metadata never emit
+    expect((await get(`${HOOKS_PATH}/wiki/pages`)).status).toBe(200);
+    expect((await get(`${HOOKS_PATH}/wiki/page/Hooked`)).status).toBe(200);
+    expect((await get(`${HOOKS_PATH}/wiki/revisions/Hooked`)).status).toBe(200);
+    expect(await deliveriesFor(wikiHookId)).toHaveLength(2);
+
+    // --- edit + rename with an explicit message: page = the NEW WebPath
+    // (upstream wiki.go:157 notifies `string(newWikiName)`)
+    const edit = await send(
+      `${HOOKS_PATH}/wiki/page/Hooked`,
+      jsonInit("PATCH", { title: "Hooked Renamed", content_base64: utf8B64("# renamed\n"), message: "renamed msg" }),
+    );
+    expect(edit.status).toBe(200);
+    expect(await deliveriesFor(wikiHookId)).toHaveLength(3);
+    const edited = await payloadOf(wikiHookId, 2);
+    expect(edited.action).toBe("edited");
+    expect(edited.page).toBe("Hooked-Renamed");
+    expect(edited.comment).toBe("renamed msg");
+
+    // --- in-place edit without a message: the Update %q default
+    const edit2 = await send(`${HOOKS_PATH}/wiki/page/Hooked-Renamed`, jsonInit("PATCH", { content_base64: utf8B64("# again\n") }));
+    expect(edit2.status).toBe(200);
+    expect(await deliveriesFor(wikiHookId)).toHaveLength(4);
+    const edited2 = await payloadOf(wikiHookId, 3);
+    expect(edited2.action).toBe("edited");
+    expect(edited2.page).toBe("Hooked-Renamed");
+    expect(edited2.comment).toBe('Update "Hooked-Renamed"');
+
+    // --- delete: the payload carries the Go-zero comment (upstream's
+    // DeleteWikiPage takes no comment arg, notifier.go:560-562)
+    const del = await send(`${HOOKS_PATH}/wiki/page/Hooked-Renamed`, authed({ method: "DELETE" }));
+    expect(del.status).toBe(204);
+    expect(await deliveriesFor(wikiHookId)).toHaveLength(5);
+    const deleted = await payloadOf(wikiHookId, 4);
+    expect(deleted.action).toBe("deleted");
+    expect(deleted.page).toBe("Hooked-Renamed");
+    expect(deleted.comment).toBe("");
+
+    // --- failed writes stay silent (400 duplicate, 404 ghost)
+    const dup = await send(`${HOOKS_PATH}/wiki/new`, jsonInit("POST", { title: "Second Page", content_base64: utf8B64("x\n") }));
+    expect(dup.status).toBe(400);
+    const ghost = await send(`${HOOKS_PATH}/wiki/page/Ghost`, authed({ method: "DELETE" }));
+    expect(ghost.status).toBe(404);
+    expect(await deliveriesFor(wikiHookId)).toHaveLength(5);
+
+    // --- subscription scoping: the push-only hook never hears wiki;
+    // send_everything hears all five
+    expect(await deliveriesFor(pushHookId)).toHaveLength(0);
+    expect(await deliveriesFor(everythingHookId)).toHaveLength(5);
+    const everyFirst = await payloadOf(everythingHookId, 0);
+    expect(everyFirst.action).toBe("created");
+    expect(everyFirst.page).toBe("Hooked");
   });
 });

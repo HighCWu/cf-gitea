@@ -380,7 +380,11 @@ export function registerWikiRoutes(
     async (c) => {
       const { owner, repo, pageName } = c.req.valid("param");
       const pair = await wikiWriteGuard(c, owner, repo);
-      await deleteWikiPage(c.env, pair, wikiDoer(c), webPathFromRequest(pageName));
+      // The request origin rides into the `wiki` deleted payload's URL fields
+      // (create/edit reuse their `origin` argument; delete carries none).
+      await deleteWikiPage(c.env, pair, wikiDoer(c), webPathFromRequest(pageName), {
+        origin: new URL(c.req.url).origin,
+      });
       return c.body(null, 204);
     },
   );
