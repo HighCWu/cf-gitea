@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "mode": "record",
+  "milestone": "ci",
+  "generated_at": "2026-10-28T13:46:24.422Z",
+  "environment": {
+    "node": "v25.9.0",
+    "git": "git version 2.55.0",
+    "platform": "linux x64",
+    "base_url": "http://127.0.0.1:5173",
+    "target": "local",
+    "baseline_comparable": true,
+    "note": "internal.* metrics are null placeholders — filled by TODO(M2 instrumentation) (SPEC-0001a Step 2 T3 counter)"
+  },
+  "sizes": {
+    "5m": {
+      "fixture": {
+        "target": 5242880,
+        "actual_pack_bytes": 5661809,
+        "pack_sha1": "ba7a2d6b3f93a214313195eab8b315c37c370e35",
+        "commits": 225,
+        "files": 157,
+        "seed": 42,
+        "generated_at": "2026-10-28T13:46:26.233Z",
+        "repo": ".bench-fixtures/5m/repo.git"
+      },
+      "metrics": {
+        "clone_wall_ms": 783.26,
+        "clone_received_bytes": 5694904,
+        "clone_effective_mib_per_s": 6.89,
+        "inforefs_p50_ms": 14.52,
+        "inforefs_p95_ms": 16.75,
+        "inforefs_n": 50,
+        "push_wall_ms": 109.81,
+        "push_bytes": 511,
+        "fetch_incremental_wall_ms": 96.18,
+        "fetch_incremental_bytes": 1396,
+        "fetch_incremental_ratio": 0.000245,
+        "internal": {
+          "push_cpu_ms": null,
+          "push_peak_memory_bytes": null,
+          "push_subrequests": null,
+          "clone_cpu_ms": null,
+          "clone_peak_memory_bytes": null,
+          "clone_subrequests": null
+        }
+      },
+      "notes": []
+    }
+  }
+}

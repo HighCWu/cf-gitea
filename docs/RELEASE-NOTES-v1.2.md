@@ -784,3 +784,125 @@ demo battery are M2's live verdict). §4 re-check: no line retired —
 0036/0037 are index-only (the 65-table count stands), `check:api` PASS
 at the GO tree keeps the 64-op FEATURE-ABSENT ceiling intact, and the
 ws1009 residuals line stands as written.
+
+**Appended 2026-10-28 (append-time HEAD `7741f6a`) — the sixth addendum's
+day-record close: the post-RD24b waves.** The FINALIZED block above ends at
+the RD24b freeze (landed as `aa9e379`, 19:59); the same evening then landed
+four more waves the freeze never carried — the emission align waves, the
+engine drain discipline, the e2e scratch-tree isolation, and the public-CI
+shakedown — beside the community face going live and the survey's tick-16.
+These waves ride the NEXT release's narrative in full; what follows is the
+day-record only, every hash re-verified against `git log` at append time,
+every number quoted from its commit or recording doc.
+
+**The assignee emission story is COMPLETE** (`af8c18c`'s own verdict).
+PATCH-assignee (`b433fb1`) and the t2 dedupe (`98eb3f6`) — both already
+recorded above — were followed by the label attach align + the PR payload
+mode carrying the real set (`a26de7f` — SliceNilAsEmpty upstream pull.go:87:
+empty renders `[]` NOT null, for EVERY PR webhook), then emission align wave
+2 (`af8c18c`) flipping the last 8 assignee pins (comment
+created/edited/deleted, milestone, created, title/body, closed/reopened,
+issue deleted — every family verified upstream-CONFIRMED through the SHARED
+ToAPIIssue); with the last caller gone the dead
+`IssueRenderPreload.assignees` 'wire'|'emission' mode is REMOVED entirely —
+every webhook family renders the real set upstream-faithfully. **The engine
+wave's discipline leg closed**: the cursor drain (`29b966f`) fixed the
+census's exactly-one discarded cursor (tableExists's LIMIT-1 probe,
+reachable from every GitStore/Registry construction and the wipe/gc
+rebuilds) with the runtime-verified `.toArray()` idiom and the discipline
+comment (EVERY SELECT cursor drains, only DDL/DML may discard; workerd#959
+cited), pinned by a new 6th husk arm; the drain-discipline tripwire
+(`d0b54ad`) then made the rule fail-closed static — and corrected the
+census: the TRUE count is **117 exec sites / 114 SqlStorage (65 SELECT
+drained / 49 DDL-DML) / 3 RegExp**, not the grep-shaped 62/17 in the drain
+commit's own message (generic-form `.exec<Row>` sites were invisible to
+grep; all 65 drain today — the discrepancy on record in NOTICE). The
+scanner caught a real bug in itself on its first run (the census re-derived
+56→65, eight sites re-verified by eye).
+
+**The e2e harness got its isolation proof** (`8c4732d`): the dev-server
+suites now run in a scratch tree — git worktree at HEAD + a real directory
+of per-entry absolute symlinks re-rooting the ROOT store (engine
+node_modules COPIED so pnpm's relative links resolve to the frozen copy),
+**202 ms materialize, no install**; the ISOLATION PROOF is a root touch
+producing **ZERO HMR events** in the scratch while the same touch inside
+fires normally (the symlinked-`.wrangler` shortcut and three pnpm
+state-path refusals died to evidence — the dead ends recorded). Three
+harness hardenings rode in-passing, each with evidence: `kill_tree` (pnpm's
+own process group orphaned vite — the sweep's recorded leak class; zero
+servers left post-fix), a KEK preflight (the shared `.dev.vars`' 27-byte
+key had 500'd every migrate — it now fatals with the exact fix), and both
+coordinator addenda (DEV_START_ATTEMPTS/SETTLE_ATTEMPTS env overrides +
+`--host 127.0.0.1` on all four internal invocations). Green-on-dirty while
+siblings edited: mirror 94/0 (the section-7 prune known-red retired) and
+lfs 36/0.
+
+**The public-CI saga, four beats, each beat's lesson now standing rules in
+AGENTS.md** (`f269682`): (1) the first public run died at workflow PARSE —
+the example-restore sed landed each cp step between a checkout's `uses:`
+and its own `with:` block, orphaning it ×7 (dead at 0 s, un-rerunnable;
+local PyYAML accepted the shape — GitHub's parser is the stricter gate),
+fixed at `62cb441`, lesson: every `with` must ride a `uses`. (2) the
+dev-server bind family — the 2-core-slowness theory DISPROVED (fast
+connection refusals, not hangs): runner-images deliberately alias
+localhost→::1, node resolves IPv6 first, vite binds ::1 ONLY, so the
+127.0.0.1 polls refused against a fully-up worker (`05bcd56`, the
+runner-images documented class; the poll budgets had already gone CI-real
+at `188b8fc` — 300 s + periodic log tails); lesson: polls MUST dial
+`--host 127.0.0.1`. (3) one root cause for THREE jobs (`34b4a52`):
+benchmark/e2e/diff-battery never ran `db:migrate:local` and the vite plugin
+PROVABLY never applies D1 migrations (migrations_dir is wrangler-CLI-only,
+verified in the plugin dist) — every fresh runner's first metadata write
+500'd "no such table" (the bench's 10% gate had never executed on ANY run
+ever); the fourth job's red was a race, not a bug — mirror-e2e's interval-0
+registration settles before the status GET, and the settled shape is now
+accepted as the STRONGER proof; lesson: migrate before fresh boots. (4) the
+checks job's contract crash — URLPattern needs Node ≥24: the plain-node
+bundle reaches the engine router's `mod.ts:1399` through the vite graph and
+CI's Node 22 lacks the global (`28c71ce`); CI pins 22→25 across all seven
+jobs and the engines floor rises ≥22→≥24 with the reason inline. The
+connective tissue: the checks job's three solo failures were environment
+sensitivity fixed at both ends (`62a2e92` — a pinned 32-byte fixture KEK
+for the ambient-mirror-KEK read, `describe.skipIf` guards on the built-tree
+arms; the verdict note: the job had NEVER been green in CI — its fixtures
+silently assumed the dev box), the broken-JSON package.json repair with its
+bare-newline lesson (`aa9d5ba`), and the seven engine tsx gates wired into
+the checks job + the e2e git identity (`154a74e`).
+
+**The community face landed, and the upstream thread resolved.**
+CONTRIBUTING.md (93 lines, zero agent jargon — the verified commands table,
+the honest-Tests-line rule, SPEC-first with the SPEC-0012 §1.1 threshold
+example) plus the bug/feature/PR templates with blank issues disabled
+(`6cc985b`; FUNDING skipped — no target exists in-tree), then SECURITY.md
+(`59b1c3c`): GitHub private-vulnerability-reporting as the single channel
+(no invented email/PGP), supported-versions honest (latest tag only, no
+backports), scope boundaries traced (frontend vulns → upstream's own
+SECURITY.md at the pin), and the seven known documented decisions listed as
+duplicate-suppression with SPEC cites — the channel's owner action item
+closed the same day (private reporting ENABLED via the API). Upstream,
+**cloudflare/workers-sdk#16515 was closed as a duplicate of #16349** (Oct
+28) — the earlier, wider warm-payload report — and our measured math went
+over as the contribution comment on #16349's thread: the 33,309,508 B pass
+/ 33,654,312 B die boundary probes, the three-log-line death signature,
+sourcemaps 61.5% of the warm bytes (−21.66 MB stripped, deaths 204→0);
+PR #16523's chunked-frames proposal stands referenced there — ADR-0006's
+revisit trigger #2 stays armed against the surviving issue.
+
+**Tick-16 re-walked the board formally** (`7c57285`): **94/5/17** — three
+flips (the two fa4fd0d D mounts, comments/{id}/attachments +
+issues/new/choose, and GET /user/sign_up at upstream's exact path per the
+SPEC-0010 §6 first-run amendment; the attachments mount's request-level
+route-matrix arm — module-green is not route-live — landed as its recorded
+follow-up at `25658f4`) — **and the baseline corrected**: tick-15's printed
+92/4/20 was a misprint its own tables never carried (a backtick-aware walk
+at both pins tallies 91/5/20 — the /-/admin/* row's genuine PARTIAL had
+been dropped), a misprint the interim arbitration (`f199433` — which at
+least killed the arithmetically impossible 94/2/20 prose amendment)
+enshrined and tick-16 corrected in-place per house precedent; the true
+arithmetic: 91/5/20 + 3 flips = 94/5/17 (94 coincidentally matching the
+prediction — the lost PARTIAL and the third flip cancel). §4 re-check: no
+line retired — the survey remainder stays structural (now 5 PARTIAL / 17
+ABSENT by tick-16's honest count), the 64-op FEATURE-ABSENT ceiling and
+the ws1009 residuals stand as written.
+
+**Same-day rider**: the DDL defect is FILED upstream as [cloudflare/workers-sdk#16548](https://github.com/cloudflare/workers-sdk/issues/16548) — the four-run-confirmed LEAKY/CLEAN standalone repro (the un-drained-cursor trigger; our engine fixed its own leak at `29b966f`, the runtime defect persists upstream). Watch item joined.
