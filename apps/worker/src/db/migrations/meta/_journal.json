@@ -260,6 +260,13 @@
       "when": 1793150486243,
       "tag": "0036_fantastic_whirlwind",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1793155241029,
+      "tag": "0037_smart_blizzard",
+      "breakpoints": true
     }
   ]
 }

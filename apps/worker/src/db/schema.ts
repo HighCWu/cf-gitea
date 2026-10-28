@@ -538,6 +538,14 @@ export const issues = sqliteTable(
     // `CreatedUnix xorm:"INDEX created"`) composed into the two-column shape
     // both call sites use.
     index("issues_poster_created_idx").on(t.posterId, t.createdAt),
+    // Index audit P2: upstream's scalar `MilestoneID int64 xorm:"INDEX"`
+    // (models/issues/issue.go:69). The milestone-filtered list pages bind
+    // repo_id first (the 0036 composite serves them), but the milestone
+    // delete's unassign arm — `UPDATE issues SET milestone_id = NULL WHERE
+    // milestone_id = ?` (src/issues/service.ts deleteMilestone, behind DELETE
+    // /repos/{owner}/{repo}/milestones/{id}) — filters on milestone_id alone
+    // and full-scanned the instance's largest table per delete.
+    index("issues_milestone_idx").on(t.milestoneId),
   ],
 );
 
@@ -581,6 +589,22 @@ export const pullRequests = sqliteTable(
     // §3.4 sync pushes look up open PRs by (head_repo_id, head_branch) —
     // fork pushes included — on every branch push.
     index("pull_requests_head_idx").on(t.headRepoId, t.headBranch),
+    // Index audit P2: the PR-side identity + the PR list page. Every
+    // pull_requests read leads with base_repo_id — findPullRequestByIndex's
+    // `WHERE base_repo_id = ? AND index = ?` (api/services/pulls.ts:96, the
+    // GET /repos/{owner}/{repo}/pulls/{index} path), the list page's first
+    // condition (pulls.ts:215), the compare and create-time duplicate lookups
+    // (pulls.ts:116/:141), the mergeability fan (services/branch-protection.ts
+    // :773), the close-via-commit probe (api/routes/commits.ts:335) and the
+    // delete-cascade base arm (repos/service.ts) — and the table had no
+    // base-side index, so each walk was a full scan. Upstream indexes the
+    // scalar BaseRepoID (`xorm:"INDEX"`, models/issues/pull.go:139; Index
+    // carries no tag — upstream filters it in-code), so the composite extends
+    // the upstream shape with the per-repo number: the by-index lookup reads
+    // one index entry. Uniqueness stays the issues (repo_id, index) uq's job
+    // (base_repo_id mirrors the joined issue's repo_id) — documented
+    // divergence: a plain index, not upstream's UNIQUE(s) composite.
+    index("pull_requests_base_index_idx").on(t.baseRepoId, t.index),
   ],
 );
 
@@ -631,6 +655,11 @@ export const comments = sqliteTable(
   },
   (t) => [
     index("comments_issue_idx").on(t.issueId),
+    // Index audit P2: the scalar issue_id twin above is deliberately KEPT
+    // beside the covering index — `issue_id = ?` is queried directly (15 call
+    // sites) and SQLite's cost model can prefer the narrower scalar for the
+    // bare scan, so dropping it is not plan-dead (the witness battery
+    // surfaced exactly this plan switch).
     // Covering index for the per-issue comment aggregates the derived-thread
     // notifications page probes (last foreign-authored activity +
     // comment-participant existence, 7 correlated evaluations per candidate
@@ -638,7 +667,11 @@ export const comments = sqliteTable(
     // + the timestamp payload, so each probe reads index-only entries.
     index("comments_issue_covering_idx").on(t.issueId, t.posterId, t.updatedAt, t.createdAt),
     index("comments_ref_issue_idx").on(t.refIssueId),
-    index("comments_ref_repo_idx").on(t.refRepoId),
+    // Index audit P2 drop (carried by migration 0037): comments_ref_repo_idx
+    // (upstream `RefRepoID xorm:"index"`, comment.go:350) — ZERO query
+    // references: the xref surface resolves by ref_issue_id only
+    // (api/services/issues.ts:1195); ref_repo_id is written (the §2.2
+    // cross-reference emitters) and never filtered.
     // Index audit P1: the poster's own comments — the activity heatmap's
     // comment half (`poster_id = ? AND created_unix > cutoff`,
     // api/routes/user-read-t2.ts:163-171). Upstream's scalar
@@ -688,7 +721,19 @@ export const issueLabels = sqliteTable(
     issueId: integer("issue_id").notNull(),
     labelId: integer("label_id").notNull(),
   },
-  (t) => [primaryKey({ columns: [t.issueId, t.labelId] })],
+  (t) => [
+    primaryKey({ columns: [t.issueId, t.labelId] }),
+    // Index audit P2: the label-filtered list pages embed `issue_id IN
+    // (SELECT issue_id FROM issue_labels WHERE label_id IN (…))` (the shared
+    // WHERE builders, api/services/issues.ts:671 + pulls.ts:227) and the
+    // label delete cascade detaches edges by label_id (api/services/labels.ts
+    // :234) — the PK leads with issue_id, so neither could seek. Deliberate
+    // divergence from upstream (models/issues/issue_label.go:19-23: the
+    // UNIQUE(s) composite leads with issue_id; upstream scans the label side
+    // too) — the follows/star reverse-index precedent for the read-heavy
+    // direction.
+    index("issue_labels_label_idx").on(t.labelId),
+  ],
 );
 
 /**
@@ -813,6 +858,11 @@ export const releaseAssets = sqliteTable(
   (t) => [
     uniqueIndex("release_assets_uuid_uq").on(t.uuid),
     index("release_assets_release_idx").on(t.releaseId),
+    // Index audit P2: the §4.13 repo purge — the delete cascade detaches
+    // every asset of the repo with `WHERE repo_id = ?` (repos/service.ts),
+    // which full-scanned the table. Upstream-matched: `RepoID int64
+    // xorm:"INDEX"` (models/repo/attachment.go:29).
+    index("release_assets_repo_idx").on(t.repoId),
   ],
 );
 
@@ -871,11 +921,30 @@ export type CommitStatusRow = typeof commitStatuses.$inferSelect;
 export type LabelRow = typeof labels.$inferSelect;
 
 /** Issue pins (tier-2 surface, table now per §3.2). */
-export const issuePins = sqliteTable("issue_pins", {
-  issueId: integer("issue_id").primaryKey(),
-  repoId: text("repo_id"),
-  pinOrder: integer("pin_order").notNull(),
-});
+export const issuePins = sqliteTable(
+  "issue_pins",
+  {
+    issueId: integer("issue_id").primaryKey(),
+    repoId: text("repo_id"),
+    pinOrder: integer("pin_order").notNull(),
+  },
+  (t) => [
+    // Index audit P2: the pinned-issues strips. The pin list per repo joins
+    // `WHERE issue_pins.repo_id = ? AND issues.is_pull = ? ORDER BY
+    // issue_pins.pin_order` (api/services/issue-extras.ts:218-221 on the
+    // issues/PRs list pages, api/routes/issue-write-t2.ts:460 and the
+    // reorder-shift UPDATEs :541-545, issue-tables-t2.ts:1777) and the repo
+    // delete cascade detaches by repo_id (repos/service.ts) — the table's
+    // only index was the issue_id PK, so every walk scanned. Upstream's
+    // IssuePin carries UNIQUE(s)(repo_id, issue_id) (models/issues/
+    // issue_pin.go:19-23), whose repo_id lead already indexes these scans;
+    // ours extends the lead with pin_order so the ordered strip reads the
+    // index in order and the reorder shift gets a range seek (documented
+    // divergence: (repo_id, pin_order), no uniqueness — the PK is the
+    // arbiter).
+    index("issue_pins_repo_order_idx").on(t.repoId, t.pinOrder),
+  ],
+);
 
 /** `webhooks.last_status` — upstream `HookStatus`. */
 export const HookStatus = {
@@ -965,6 +1034,14 @@ export const webhookDeliveries = sqliteTable(
   (t) => [
     uniqueIndex("webhook_deliveries_uuid_uq").on(t.uuid),
     index("webhook_deliveries_hook_idx").on(t.hookId),
+    // Index audit P2: the §4.13 repo purge. `repo_id` exists solely as the
+    // denormalized purge key (see the table comment) and the delete cascade
+    // detaches every delivery with `WHERE repo_id = ?` (repos/service.ts) —
+    // unindexed, that scanned the instance's largest table per repo delete.
+    // Deliberate divergence: upstream's HookTask has no repo_id at all
+    // (models/webhook/hooktask.go:59-66 — the purge joins through hook_id
+    // there); ours carries the denormalized column, so it carries the index.
+    index("webhook_deliveries_repo_idx").on(t.repoId),
   ],
 );
 
@@ -1406,7 +1483,17 @@ export const repoMirrors = sqliteTable(
       .notNull()
       .default(sql`(unixepoch())`),
   },
-  (t) => [check("repo_mirrors_sync_state_check", sql`${t.syncState} IN ('idle', 'queued', 'syncing')`)],
+  (t) => [
+    // Upstream-matched pair for the audit P2: the cron producer's due scan —
+    // `WHERE next_sync_at <= now AND next_sync_at != 0 AND sync_state = 'idle'`
+    // (services/mirror/sync.ts:861) — ran per cron tick with no usable index.
+    // `NextUpdateUnix int64 xorm:"INDEX"` (models/repo/mirror.go:31) is the
+    // upstream scalar; ours carries the same column (the sync_state equality
+    // and the `!= 0` sentinel filter the ordered range, the push_mirrors
+    // sibling's next_sync precedent).
+    index("repo_mirrors_next_sync_idx").on(t.nextSyncAt),
+    check("repo_mirrors_sync_state_check", sql`${t.syncState} IN ('idle', 'queued', 'syncing')`),
+  ],
 );
 
 // ---------------------------------------------------------------------------
@@ -1454,7 +1541,20 @@ export const notificationStates = sqliteTable(
   },
   (t) => [
     uniqueIndex("notification_states_user_issue_uq").on(t.userId, t.issueId),
+    // Index audit P2: the scalar user twin is deliberately KEPT (bare
+    // `user_id = ?` scans have no route today, but SQLite's cost model can
+    // prefer the narrower scalar if one lands, so its removal is not
+    // plan-dead); the issue-side index below is the P2 add.
     index("notification_states_user_idx").on(t.userId),
+    // Index audit P2 add: the issue-delete cascade arm — `WHERE issue_id = ?`
+    // (api/services/issues.ts deleteIssueCascade) full-scanned the table: the
+    // uq leads with user_id, so notification_states was the one issue-scoped
+    // family with no issue-side index (every sibling — comments, reactions,
+    // subscriptions, attachments, tracked times, stopwatches, history — has
+    // one). Deliberate divergence: upstream's notification table carries no
+    // IssueID index (models/activities/notification.go:54-60 — both columns
+    // are bare NOT NULLs; upstream scans the cascade too).
+    index("notification_states_issue_idx").on(t.issueId),
   ],
 );
 
@@ -1751,8 +1851,13 @@ export const teams = sqliteTable(
     unitsMap: text("units_map"),
   },
   (t) => [
-    uniqueIndex("teams_org_lower_uq").on(t.orgId, t.lowerName),
+    // Index audit P2: teams_org_idx (upstream `OrgID xorm:"INDEX"`,
+    // models/organization/team.go) is deliberately KEPT beside the uq — bare
+    // `org_id = ?` scans are real (the org team listings) and SQLite's cost
+    // model can prefer the narrower scalar over the uq's org_id lead, so
+    // dropping it is not plan-dead (the witness battery surfaced this).
     index("teams_org_idx").on(t.orgId),
+    uniqueIndex("teams_org_lower_uq").on(t.orgId, t.lowerName),
   ],
 );
 
@@ -2017,7 +2122,11 @@ export const pullReviews = sqliteTable(
     updatedAt: integer("updated_unix", { mode: "timestamp" }),
   },
   (t) => [
-    // List/recount reads filter by the PR's issue (FindReviews, review_list.go).
+    // Index audit P2: pull_reviews_issue_idx (upstream `IssueID int64
+    // xorm:"index"`, models/issues/review.go:133) is deliberately KEPT beside
+    // the reviewer composite — `issue_id = ?` scans are real (FindReviews,
+    // 23 call sites) and SQLite's cost model can prefer the narrower scalar,
+    // so dropping it is not plan-dead (the witness battery surfaced this).
     index("pull_reviews_issue_idx").on(t.issueId),
     // The latest-review-per-reviewer lookups (GetReviewByIssueIDAndUserID,
     // review.go:586–593) and the official-flag clears key on the reviewer.
@@ -2054,9 +2163,12 @@ export const protectedBranches = sqliteTable(
   },
   (t) => [
     // Upstream's UNIQUE(s) pair (RepoID, RuleName) — protected_branch.go:32,34.
+    // Index audit P2: protected_branches_repo_idx (not upstream — the pair's
+    // repo_id lead covers the scans upstream) is deliberately KEPT: bare
+    // `repo_id = ?` scans are real (the per-push rule loads) and SQLite's
+    // cost model can prefer the narrower scalar, so dropping it is not
+    // plan-dead (the witness battery surfaced this).
     uniqueIndex("protected_branches_repo_rule_uq").on(t.repoId, t.ruleName),
-    // FindRepoProtectedBranchRules loads every repo rule per request
-    // (protected_branch_list.go:38).
     index("protected_branches_repo_idx").on(t.repoId),
   ],
 );
@@ -2128,7 +2240,11 @@ export const deployKeys = sqliteTable(
     // Upstream's xorm INDEX trio (deploykey.go:27,28,38).
     index("deploy_keys_key_id_idx").on(t.keyId),
     index("deploy_keys_repo_id_idx").on(t.repoId),
-    index("deploy_keys_token_hash_idx").on(t.tokenHash),
+    // Index audit P2 drop: deploy_keys_token_hash_idx (upstream `TokenHash
+    // string xorm:"INDEX"`, deploykey.go:36) — ZERO query references: the
+    // deploy-token half exists as rows, but no route resolves a token by
+    // hash yet (the git-HTTP deploy-token auth arm is unlanded; the API
+    // family addresses rows by id/repo). Re-add with that arm.
   ],
 );
 
@@ -2185,8 +2301,13 @@ export const secrets = sqliteTable(
   (t) => [
     // Upstream's UNIQUE(owner_repo_name) (secret.go:38,39,40).
     uniqueIndex("secrets_owner_repo_name_uq").on(t.ownerId, t.repoId, t.name),
-    // Upstream's xorm INDEX pair (secret.go:38,39).
+    // Index audit P2: secrets_owner_idx (upstream's scalar OwnerID INDEX,
+    // secret.go:38) is deliberately KEPT beside the uq — the owner-scoped
+    // reads bind repo_id alongside owner_id (the uq serves those), but
+    // SQLite's cost model can prefer the narrower scalar should a bare
+    // owner scan land, so its removal is not plan-dead.
     index("secrets_owner_idx").on(t.ownerId),
+    // Upstream's xorm INDEX on RepoID (secret.go:39) — the repo-scope list.
     index("secrets_repo_id_idx").on(t.repoId),
   ],
 );
@@ -2224,8 +2345,12 @@ export const actionVariables = sqliteTable(
   (t) => [
     // Upstream's UNIQUE(owner_repo_name) (variable.go:30,31,32).
     uniqueIndex("action_variables_owner_repo_name_uq").on(t.ownerId, t.repoId, t.name),
-    // Upstream's xorm INDEX pair (variable.go:30,31).
+    // Index audit P2: action_variables_owner_idx is deliberately KEPT (not
+    // upstream as a scalar — upstream puts the INDEX tag on RepoID,
+    // variable.go:31 — and the owner-scoped reads bind repo_id alongside,
+    // but the same narrow-scalar cost argument as secrets_owner_idx holds).
     index("action_variables_owner_idx").on(t.ownerId),
+    // Upstream's xorm INDEX on RepoID — the repo-scope list.
     index("action_variables_repo_id_idx").on(t.repoId),
   ],
 );
@@ -2267,8 +2392,10 @@ export const userBlocking = sqliteTable(
     // Upstream's UNIQUE(block) (block.go:26,28).
     uniqueIndex("user_blocking_block_uq").on(t.blockerId, t.blockeeId),
     index("user_blocking_blockee_idx").on(t.blockeeId),
-    // Upstream's `CreatedUnix xorm:"INDEX created"` (block.go:31).
-    index("user_blocking_created_idx").on(t.createdAt),
+    // Index audit P2 drop: user_blocking_created_idx (upstream `CreatedUnix
+    // timeutil.TimeStamp xorm:"INDEX created"`, block.go:31) — ZERO query
+    // references: no route lists blocks by creation time. Re-add with a
+    // sorted block-list surface.
   ],
 );
 
@@ -2430,8 +2557,16 @@ export const projects = sqliteTable(
     updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
   },
   (t) => [
-    // Upstream's xorm INDEX quartet (project.go:87,89,91,94).
-    index("projects_title_idx").on(t.title),
+    // Upstream's xorm INDEX quartet (project.go:87,89,91,94), reduced by the
+    // index audit P2 by one:
+    // - projects_title_idx (upstream Title INDEX) — dropped (migration 0037):
+    //   ZERO query references (titles are rendered, never filtered).
+    // - projects_is_closed_idx (upstream IsClosed INDEX) is deliberately
+    //   KEPT: the is_closed list predicate rides repo/owner-scoped
+    //   conditions (api/services/projects.ts:218), but SQLite's planner can
+    //   still pick the scalar for `WHERE repo_id = ? AND is_closed = ?`
+    //   (the witness battery observed exactly that plan), so its removal is
+    //   not plan-dead.
     index("projects_owner_id_idx").on(t.ownerId),
     index("projects_repo_id_idx").on(t.repoId),
     index("projects_is_closed_idx").on(t.isClosed),
@@ -2472,10 +2607,12 @@ export const projectColumns = sqliteTable(
   },
   (t) => [
     // Upstream's `ProjectID xorm:"INDEX NOT NULL"` (column.go:56) plus the
-    // created/updated INDEX tags (column.go:61,62).
+    // created/updated INDEX tags (column.go:61,62). Index audit P2 drops:
+    // project_columns_created_idx / project_columns_updated_idx (the upstream
+    // timestamp tags) — ZERO query references (columns are listed by project,
+    // served by the project_id index; the timestamps are rendered, never
+    // filtered or ordered alone).
     index("project_columns_project_id_idx").on(t.projectId),
-    index("project_columns_created_idx").on(t.createdAt),
-    index("project_columns_updated_idx").on(t.updatedAt),
   ],
 );
 
@@ -2734,9 +2871,10 @@ export const repoLicenses = sqliteTable(
   (t) => [
     // Upstream's UNIQUE(path) trio (see the table comment).
     uniqueIndex("repo_license_path_uq").on(t.repoId, t.license, t.licensePath),
-    // Upstream's two timestamp INDEXes (license.go:22-23).
-    index("repo_license_created_idx").on(t.createdAt),
-    index("repo_license_updated_idx").on(t.updatedAt),
+    // Index audit P2 drops: repo_license_created_idx / repo_license_updated_idx
+    // (upstream's timestamp INDEXes, license.go:22-23) — ZERO query
+    // references (the licenses listing reads by repo through the uq's
+    // repo_id lead; the timestamps are rendered, never filtered).
   ],
 );
 
@@ -2844,9 +2982,14 @@ export const issueContentHistory = sqliteTable(
     isDeleted: integer("is_deleted", { mode: "boolean" }).notNull().default(false),
   },
   (t) => [
-    // Upstream's three scalar INDEXes (content_history.go:22-26).
+    // Upstream's three scalar INDEXes (content_history.go:22-26), minus the
+    // index audit P2 drop: issue_content_history_edited_idx (upstream
+    // `EditedUnix xorm:"INDEX"`, content_history.go:25) — every edited_unix
+    // reference orders WITHIN an issue/comment-scoped read (api/services/
+    // issues.ts:865, ui/pages/issue-content-fragments.ts:588), served by the
+    // issue/comment indexes plus a bounded sort; the scalar never drives a
+    // plan.
     index("issue_content_history_issue_idx").on(t.issueId),
     index("issue_content_history_comment_idx").on(t.commentId),
-    index("issue_content_history_edited_idx").on(t.editedAt),
   ],
 );

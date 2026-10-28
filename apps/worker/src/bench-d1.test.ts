@@ -65,7 +65,7 @@
  * follow-up can turn them into a regression gate (bench-run's --compare
  * pattern) once a couple of runs confirm the variance band.
  *
- * INDEX WITNESS (migration 0036 — the perf audit's P0+P1 wave): the second
+ * (migration 0036 — the perf audit's P0+P1 wave): the second
  * describe below is the OPPOSITE of bench-gated — it RUNS IN PLAIN
  * `pnpm test` (no D1_BENCH binding needed). It is the migration's witness:
  * a small fixed corpus, then per audited query shape an EXPLAIN QUERY PLAN
@@ -73,6 +73,9 @@
  * deterministic, no wall-clock noise) plus a short timed loop with D1's
  * rows_read meta as the cost anchor. The gate is the plan assertions; the
  * timings are informational (##INDEX_WITNESS_JSON## line, like the bench).
+ * The third describe extends the same protocol to migration 0037 (the P2
+ * wave): eight new indexes witnessed, and the nine verified-dead drops
+ * proven dead by the surviving shapes' plans surviving them byte-identically.
  */
 
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
@@ -84,23 +87,37 @@ import { applyAuthD1Migrations } from "./auth/testing/apply-d1-migrations";
 import { TokenService } from "./auth/token-service";
 import {
   actions,
+  actionVariables,
   comments,
+  deployKeys,
+  issueContentHistory,
   issueLabels,
+  issuePins,
   issueSubscriptions,
   issues,
   labels,
   milestones,
   notificationStates,
   personalAccessTokens,
+  projectColumns,
+  projects,
+  protectedBranches,
   pullRequests,
+  pullReviews,
   reactions,
+  releaseAssets,
+  repoLicenses,
+  repoMirrors,
   repoCounters,
   repoWatchers,
   repositories,
+  secrets,
   teamMembers,
   teamRepoAccess,
   teams,
+  userBlocking,
   users,
+  webhookDeliveries,
   webhooks,
 } from "./db/schema";
 import { IssuesService } from "./issues/service";
@@ -1043,18 +1060,25 @@ async function explainPlan(raw: D1Database, sql: string, binds: unknown[]): Prom
 
 /** Timed loop + the deterministic rows_read anchor (one metered call). The
  *  comment tag defeats the D1 statement cache the same way explainPlan does —
- *  without it the "without indexes" state would time the cached indexed plan. */
+ *  without it the "without indexes" state would time the cached indexed plan.
+ *  `mode: "run"` witnesses mutating shapes (the 0037 purge/cascade arms) —
+ *  D1Result meta carries rows_read on write statements the same way; the
+ *  0037 caller binds values matching zero rows, so neither the warmup, the
+ *  timed loop, nor the metered call mutates the corpus. */
 async function measureShape(
   raw: D1Database,
-  shape: WitnessShape,
+  shape: { name: string; index: string; sql: string },
   binds: unknown[],
   tag: string,
+  mode: "all" | "run" = "all",
 ): Promise<{ meanMs: number; rowsRead: number }> {
   const stmt = raw.prepare(`${shape.sql} /* ${tag} */`);
-  for (let i = 0; i < 3; i++) await stmt.bind(...binds).all(); // warmup
-  const metered = await stmt.bind(...binds).all();
+  const exec =
+    mode === "run" ? () => stmt.bind(...binds).run() : () => stmt.bind(...binds).all();
+  for (let i = 0; i < 3; i++) await exec(); // warmup
+  const metered = await exec();
   const t0 = performance.now();
-  for (let i = 0; i < WITNESS_TIMED_RUNS; i++) await stmt.bind(...binds).all();
+  for (let i = 0; i < WITNESS_TIMED_RUNS; i++) await exec();
   return { meanMs: (performance.now() - t0) / WITNESS_TIMED_RUNS, rowsRead: metered.meta?.rows_read ?? 0 };
 }
 
@@ -1199,7 +1223,9 @@ describe("index witness (migration 0036 — the audit's P0+P1 wave)", () => {
       createdAt: new Date(),
     }));
     for (const part of chunks(otherMilestoneValues, 8)) await db.insert(milestones).values(part);
-    // Six reactions on each of the first 50 target issues (300 rows).
+    // Five reactions on each of the first 50 target issues (250 rows — the
+    // watchers array holds 5 ids; the 0036 witness's committed "250→6"
+    // reactions measurement reflects this count).
     for (const issueId of targetIssueIds.slice(0, 50)) {
       await db.insert(reactions).values(
         watchers.map((userId) => ({ userId, issueId, commentId: 0, releaseId: 0, type: "+1" })),
@@ -1318,7 +1344,7 @@ describe("index witness (migration 0036 — the audit's P0+P1 wave)", () => {
           other_issues: WITNESS_OTHER_ISSUES,
           labels: 55,
           milestones: 30,
-          reactions: 300,
+          reactions: 250,
           comments: 60,
           subscriptions: 200,
           actions: 160,
@@ -1328,5 +1354,921 @@ describe("index witness (migration 0036 — the audit's P0+P1 wave)", () => {
         shapes: numbers,
       })}`,
     );
+  }, 300_000);
+});
+
+// ---------------------------------------------------------------------------
+// Index witness (migration 0037 — the audit's P2 wave: 8 adds + 17 dead
+// drops). Same always-on protocol as the 0036 block above, two batteries:
+//
+//   ADDS — per audited shape: EXPLAIN QUERY PLAN must name the new index
+//   with it present, must not without it (all eight dropped together), then
+//   the exact migration DDL replays verbatim and sqlite_master re-checks.
+//   Mutating shapes (the milestone unassign UPDATE and the three
+//   purge/cascade DELETEs) bind values matching ZERO rows — plans are
+//   value-independent, and the warmup/timed/metered calls never mutate the
+//   corpus; measureShape's run() mode reads the same rows_read meta off the
+//   write D1Result.
+//
+//   DROPS — the dead-proof: fifteen surviving hot shapes across every table
+//   that lost an index are EXPLAINed with the nine re-created (the
+//   migrations already applied the drops — the battery reconstructs the
+//   pre-drop state from the verbatim earlier-migration DDL), then all
+//   nine are dropped via exec(), and every plan must come back
+//   BYTE-IDENTICAL — a changed plan would prove the dropped index was live
+//   (it vetoed eight further candidates — see the P2_DROPPED_INDEXES note).
+//   Belt and braces: each pre-drop plan must also name none of the nine.
+//   The end state is the migrated schema (nothing to restore).
+// ---------------------------------------------------------------------------
+
+/** The eight added indexes: [name, exact migration-0037 DDL]. Keep in lockstep
+ *  with src/db/migrations/0037_brief_spitfire.sql — the replay must restore
+ *  the migrated schema byte-for-byte. */
+const P2_ADDED_INDEXES: readonly [name: string, ddl: string][] = [
+  [
+    "pull_requests_base_index_idx",
+    "CREATE INDEX `pull_requests_base_index_idx` ON `pull_requests` (`base_repo_id`,`index`)",
+  ],
+  [
+    "issues_milestone_idx",
+    "CREATE INDEX `issues_milestone_idx` ON `issues` (`milestone_id`)",
+  ],
+  [
+    "issue_labels_label_idx",
+    "CREATE INDEX `issue_labels_label_idx` ON `issue_labels` (`label_id`)",
+  ],
+  [
+    "issue_pins_repo_order_idx",
+    "CREATE INDEX `issue_pins_repo_order_idx` ON `issue_pins` (`repo_id`,`pin_order`)",
+  ],
+  [
+    "repo_mirrors_next_sync_idx",
+    "CREATE INDEX `repo_mirrors_next_sync_idx` ON `repo_mirrors` (`next_sync_at`)",
+  ],
+  [
+    "webhook_deliveries_repo_idx",
+    "CREATE INDEX `webhook_deliveries_repo_idx` ON `webhook_deliveries` (`repo_id`)",
+  ],
+  [
+    "release_assets_repo_idx",
+    "CREATE INDEX `release_assets_repo_idx` ON `release_assets` (`repo_id`)",
+  ],
+  [
+    "notification_states_issue_idx",
+    "CREATE INDEX `notification_states_issue_idx` ON `notification_states` (`issue_id`)",
+  ],
+];
+
+/** The nine dropped indexes (verified dead — zero query references to their
+ *  column combo, or a scalar that can never drive a plan), with the verbatim
+ *  pre-0037 CREATE DDL each earlier migration generated (extracted from
+ *  src/db/migrations/*.sql). The test database's migrations already applied
+ *  0037 — the battery RECONSTRUCTS the pre-drop state from these, witnesses
+ *  it, re-drops, and asserts the migrated end-state. (Seven further
+ *  prefix-twin drop candidates were REJECTED by this very battery: their
+ *  column combos are queried directly and SQLite's cost model can prefer the
+ *  narrower scalar, so the plan-identity proof failed and the schema keeps
+ *  them — comments_issue_idx, teams_org_idx, protected_branches_repo_idx,
+ *  pull_reviews_issue_idx, notification_states_user_idx, secrets_owner_idx,
+ *  action_variables_owner_idx.) */
+const P2_DROPPED_INDEXES: readonly [name: string, ddl: string][] = [
+  [
+    "deploy_keys_token_hash_idx",
+    "CREATE INDEX `deploy_keys_token_hash_idx` ON `deploy_keys` (`token_hash`)",
+  ],
+  [
+    "issue_content_history_edited_idx",
+    "CREATE INDEX `issue_content_history_edited_idx` ON `issue_content_history` (`edited_unix`)",
+  ],
+  [
+    "project_columns_created_idx",
+    "CREATE INDEX `project_columns_created_idx` ON `project_columns` (`created_unix`)",
+  ],
+  [
+    "project_columns_updated_idx",
+    "CREATE INDEX `project_columns_updated_idx` ON `project_columns` (`updated_unix`)",
+  ],
+  ["projects_title_idx", "CREATE INDEX `projects_title_idx` ON `projects` (`title`)"],
+  [
+    "repo_license_created_idx",
+    "CREATE INDEX `repo_license_created_idx` ON `repo_license` (`created_unix`)",
+  ],
+  [
+    "repo_license_updated_idx",
+    "CREATE INDEX `repo_license_updated_idx` ON `repo_license` (`updated_unix`)",
+  ],
+  [
+    "user_blocking_created_idx",
+    "CREATE INDEX `user_blocking_created_idx` ON `user_blocking` (`created_at`)",
+  ],
+  ["comments_ref_repo_idx", "CREATE INDEX `comments_ref_repo_idx` ON `comments` (`ref_repo_id`)"],
+];
+
+/** One 0037 audited shape. `mode: "run"` marks the mutating shapes (see the
+ *  battery notes above). */
+interface P2WitnessShape {
+  name: string;
+  index: string;
+  sql: string;
+  binds: (f: P2WitnessFixtures) => unknown[];
+  mode?: "all" | "run";
+}
+
+interface P2WitnessFixtures {
+  ownerId: number;
+  otherId: number;
+  targetRepo: string;
+  otherRepo: string;
+  labelA: number;
+  labelB: number;
+}
+
+/** The eight added-index shapes: caller cites are the schema.ts audit
+ *  comments. */
+function p2WitnessShapes(f: P2WitnessFixtures): P2WitnessShape[] {
+  return [
+    {
+      name: "PR list page (base scan)",
+      index: "pull_requests_base_index_idx",
+      // api/services/pulls.ts:215 (the list page's first condition) and
+      // :96/:116/:141 (by-index / compare / duplicate lookups — same lead).
+      sql: "SELECT id, `index`, head_repo_id, head_branch FROM pull_requests WHERE base_repo_id = ?",
+      binds: () => [f.targetRepo],
+    },
+    {
+      name: "milestone unassign arm",
+      index: "issues_milestone_idx",
+      // src/issues/service.ts deleteMilestone — `WHERE milestone_id = ?`;
+      // binds -1 (no such milestone) so the UPDATE is a no-op.
+      sql: "UPDATE issues SET milestone_id = NULL WHERE milestone_id = ?",
+      binds: () => [-1],
+      mode: "run",
+    },
+    {
+      name: "label-filter list subquery",
+      index: "issue_labels_label_idx",
+      // api/services/issues.ts:671 + pulls.ts:227 (the shared WHERE
+      // builders' labelIds filter).
+      sql: "SELECT issue_id FROM issue_labels WHERE label_id IN (?, ?)",
+      binds: (fx) => [fx.labelA, fx.labelB],
+    },
+    {
+      name: "pinned-issues strip",
+      index: "issue_pins_repo_order_idx",
+      // api/services/issue-extras.ts:218-221 (the issues/PRs list strips;
+      // the reorder-shift UPDATEs bind the same (repo_id, pin_order) pair).
+      sql: "SELECT p.issue_id, p.pin_order FROM issue_pins p INNER JOIN issues i ON i.id = p.issue_id WHERE p.repo_id = ? AND i.is_pull = 0 ORDER BY p.pin_order",
+      binds: () => [f.targetRepo],
+    },
+    {
+      name: "mirror cron due scan",
+      index: "repo_mirrors_next_sync_idx",
+      // services/mirror/sync.ts:861 (the cron producer, every tick).
+      sql: "SELECT repo_id FROM repo_mirrors WHERE next_sync_at <= ? AND next_sync_at != 0 AND sync_state = 'idle'",
+      binds: () => [Math.floor(Date.now() / 1000)],
+    },
+    {
+      name: "delivery repo purge",
+      index: "webhook_deliveries_repo_idx",
+      // repos/service.ts deleteRepository — §4.13; binds a repo id matching
+      // no row so the DELETE is a no-op.
+      sql: "DELETE FROM webhook_deliveries WHERE repo_id = ?",
+      binds: () => [`no-such-repo-${RUN_TAG}`],
+      mode: "run",
+    },
+    {
+      name: "asset repo purge",
+      index: "release_assets_repo_idx",
+      // repos/service.ts deleteRepository — §4.13; no-op bind as above.
+      sql: "DELETE FROM release_assets WHERE repo_id = ?",
+      binds: () => [`no-such-repo-${RUN_TAG}`],
+      mode: "run",
+    },
+    {
+      name: "notification cascade arm",
+      index: "notification_states_issue_idx",
+      // api/services/issues.ts deleteIssueCascade — `WHERE issue_id = ?`;
+      // binds -1 (no such issue) so the DELETE is a no-op.
+      sql: "DELETE FROM notification_states WHERE issue_id = ?",
+      binds: () => [-1],
+      mode: "run",
+    },
+  ];
+}
+
+describe("index witness (migration 0037 — the audit's P2 wave)", () => {
+  const RUN_TAG = `idxp2${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}`;
+  let db!: DrizzleD1Database;
+  let raw!: D1Database;
+  let fixtures!: P2WitnessFixtures;
+  /** The second test's (drops battery) scratch root, for afterAll cleanup. */
+  let dropTest: { orgId: number; repoId: string; firstProject: number } | null = null;
+
+  beforeAll(async () => {
+    await applyAuthD1Migrations();
+    raw = env.DB;
+    db = drizzle(raw);
+  });
+
+  afterAll(async () => {
+    // Best-effort scratch cleanup (per-file isolated storage discards it
+    // anyway; the prefix scopes every row the witness created).
+    try {
+      const repoIds = [fixtures.targetRepo, fixtures.otherRepo];
+      const seededIssues = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(inArray(issues.repoId, repoIds))
+        .all();
+      const issueIds = seededIssues.map((row) => row.id);
+      for (const part of chunks(issueIds, 50)) {
+        await db.delete(comments).where(inArray(comments.issueId, part));
+        await db.delete(pullRequests).where(inArray(pullRequests.issueId, part));
+        await db.delete(issueLabels).where(inArray(issueLabels.issueId, part));
+        await db.delete(issuePins).where(inArray(issuePins.issueId, part));
+        await db.delete(pullReviews).where(inArray(pullReviews.issueId, part));
+        await db.delete(notificationStates).where(inArray(notificationStates.issueId, part));
+        await db.delete(issueContentHistory).where(inArray(issueContentHistory.issueId, part));
+      }
+      for (const repoId of repoIds) {
+        await db.delete(webhookDeliveries).where(eq(webhookDeliveries.repoId, repoId));
+        await db.delete(releaseAssets).where(eq(releaseAssets.repoId, repoId));
+        await db.delete(milestones).where(eq(milestones.repoId, repoId));
+        await db.delete(labels).where(eq(labels.repoId, repoId));
+        await db.delete(issuePins).where(eq(issuePins.repoId, repoId));
+        await db.delete(protectedBranches).where(eq(protectedBranches.repoId, repoId));
+        await db.delete(projects).where(eq(projects.repoId, repoId));
+        await db.delete(repoLicenses).where(eq(repoLicenses.repoId, repoId));
+        await db.delete(deployKeys).where(eq(deployKeys.repoId, repoId));
+        await db.delete(secrets).where(eq(secrets.repoId, repoId));
+        await db.delete(actionVariables).where(eq(actionVariables.repoId, repoId));
+        await db.delete(repositories).where(eq(repositories.id, repoId));
+      }
+      await db.delete(repoMirrors).where(sql`repo_id like ${`mir${RUN_TAG}%`}`);
+      await db.delete(secrets).where(eq(secrets.ownerId, fixtures.ownerId));
+      await db.delete(actionVariables).where(eq(actionVariables.ownerId, fixtures.ownerId));
+      await db.delete(teams).where(eq(teams.orgId, fixtures.ownerId));
+      if (dropTest !== null) {
+        const dropIssueIds = (
+          await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, dropTest.repoId)).all()
+        ).map((row) => row.id);
+        for (const part of chunks(dropIssueIds, 50)) {
+          await db.delete(comments).where(inArray(comments.issueId, part));
+          await db.delete(pullReviews).where(inArray(pullReviews.issueId, part));
+          await db.delete(notificationStates).where(inArray(notificationStates.issueId, part));
+          await db.delete(issueContentHistory).where(inArray(issueContentHistory.issueId, part));
+        }
+        await db.delete(issues).where(eq(issues.repoId, dropTest.repoId));
+        await db.delete(protectedBranches).where(eq(protectedBranches.repoId, dropTest.repoId));
+        await db.delete(projects).where(eq(projects.repoId, dropTest.repoId));
+        await db.delete(projectColumns).where(eq(projectColumns.projectId, dropTest.firstProject));
+        await db.delete(repoLicenses).where(eq(repoLicenses.repoId, dropTest.repoId));
+        await db.delete(deployKeys).where(eq(deployKeys.repoId, dropTest.repoId));
+        await db.delete(secrets).where(eq(secrets.repoId, dropTest.repoId));
+        await db.delete(actionVariables).where(eq(actionVariables.repoId, dropTest.repoId));
+        await db.delete(teams).where(eq(teams.orgId, dropTest.orgId));
+        await db.delete(repositories).where(eq(repositories.id, dropTest.repoId));
+      }
+      await db.delete(users).where(sql`username_lower like ${`${RUN_TAG}%`}`);
+    } catch (error) {
+      console.error(
+        `[index-witness-p2] cleanup failed (dev-scratch only): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  });
+
+  test("seeds the P2 corpus, witnesses the adds, proves the drops dead, restores the schema", async () => {
+    // -- seed (untimed) -------------------------------------------------------
+    const now = Math.floor(Date.now() / 1000);
+    const insertUser = async (name: string, isOrg = false): Promise<number> => {
+      const rows = await db
+        .insert(users)
+        .values({ username: name, usernameLower: name, type: isOrg ? "org" : "user", createdAt: new Date() })
+        .returning({ id: users.id })
+        .all();
+      const user = rows[0];
+      if (user === undefined) throw new Error(`p2 witness seed user ${name} failed`);
+      return user.id;
+    };
+    const ownerId = await insertUser(`${RUN_TAG}owner`);
+    const otherId = await insertUser(`${RUN_TAG}other`);
+    const watcherB = await insertUser(`${RUN_TAG}watch`);
+
+    const mkRepo = async (slug: string, repoOwnerId: number): Promise<string> => {
+      const id = crypto.randomUUID();
+      await db.insert(repositories).values({
+        id,
+        storageKey: `r_${id.slice(0, 8)}`,
+        ownerNamespace: RUN_TAG,
+        ownerId: repoOwnerId,
+        slug,
+        visibility: "public",
+        createdAt: new Date(),
+      });
+      return id;
+    };
+    const targetRepo = await mkRepo(`p2-target-${RUN_TAG}`, ownerId);
+    const otherRepo = await mkRepo(`p2-other-${RUN_TAG}`, otherId);
+
+    // Milestones first — the issues' milestone_id arms need real ids.
+    const milestoneIds = (
+      await db
+        .insert(milestones)
+        .values([
+          { repoId: targetRepo, name: `p2-m0-${RUN_TAG}` },
+          { repoId: targetRepo, name: `p2-m1-${RUN_TAG}` },
+          { repoId: otherRepo, name: `p2-mo-${RUN_TAG}` },
+        ])
+        .returning({ id: milestones.id })
+        .all()
+    ).map((row) => row.id);
+    const [milestoneA, milestoneB] = milestoneIds;
+    if (milestoneA === undefined || milestoneB === undefined) throw new Error("p2 seed milestones failed");
+
+    const issueValues = (repoId: string, n: number, milestoneOn: boolean): (typeof issues.$inferInsert)[] =>
+      Array.from({ length: n }, (_, i) => ({
+        repoId,
+        index: i + 1,
+        posterId: i % 4 === 0 ? otherId : ownerId,
+        title: `p2 witness issue ${repoId === targetRepo ? "t" : "o"} ${i + 1}`,
+        isPull: i % 10 === 0,
+        isClosed: i % 3 === 0,
+        milestoneId: milestoneOn ? (i % 2 === 0 ? milestoneA : milestoneB) : null,
+        createdAt: new Date((now - (n - i) * 60) * 1000),
+        updatedAt: new Date((now - (n - i) * 30) * 1000),
+      }));
+    const TARGET_ISSUES = 90;
+    const OTHER_ISSUES = 60;
+    for (const part of chunks(issueValues(targetRepo, TARGET_ISSUES, true), 4)) {
+      await db.insert(issues).values(part);
+    }
+    for (const part of chunks(issueValues(otherRepo, OTHER_ISSUES, false), 4)) {
+      await db.insert(issues).values(part);
+    }
+    const seededIssues = await db
+      .select({ id: issues.id, index: issues.index, repoId: issues.repoId })
+      .from(issues)
+      .where(inArray(issues.repoId, [targetRepo, otherRepo]))
+      .orderBy(asc(issues.id))
+      .all();
+    const targetIssues = seededIssues.filter((row) => row.repoId === targetRepo);
+    const otherIssues = seededIssues.filter((row) => row.repoId === otherRepo);
+    if (targetIssues.length !== TARGET_ISSUES || otherIssues.length !== OTHER_ISSUES) {
+      throw new Error("p2 seed issues failed");
+    }
+
+    // pull_requests: every 2nd target issue (base = target) + every 3rd
+    // other issue (base = other, the distractor arm the scans must skip).
+    const targetPrValues = targetIssues
+      .filter((_, i) => i % 2 === 0)
+      .map((issue) => ({
+        issueId: issue.id,
+        index: issue.index,
+        status: 3,
+        headRepoId: otherRepo,
+        baseRepoId: targetRepo,
+        headBranch: `p2-h-${issue.index}`,
+        baseBranch: "main",
+      }));
+    for (const part of chunks(targetPrValues, 5)) await db.insert(pullRequests).values(part);
+    const otherPrValues = otherIssues
+      .filter((_, i) => i % 3 === 0)
+      .map((issue) => ({
+        issueId: issue.id,
+        index: issue.index,
+        status: 3,
+        headRepoId: targetRepo,
+        baseRepoId: otherRepo,
+        headBranch: `p2-ho-${issue.index}`,
+        baseBranch: "main",
+      }));
+    for (const part of chunks(otherPrValues, 5)) await db.insert(pullRequests).values(part);
+
+    // Labels + edges: two target labels (the filter binds), one distractor.
+    const labelIds = (
+      await db
+        .insert(labels)
+        .values([
+          { repoId: targetRepo, name: `p2-la-${RUN_TAG}`, color: "#00aabb" },
+          { repoId: targetRepo, name: `p2-lb-${RUN_TAG}`, color: "#00aabb" },
+          { repoId: otherRepo, name: `p2-lo-${RUN_TAG}`, color: "#00aabb" },
+        ])
+        .returning({ id: labels.id })
+        .all()
+    ).map((row) => row.id);
+    const [labelA, labelB, labelOther] = labelIds;
+    if (labelA === undefined || labelB === undefined || labelOther === undefined) {
+      throw new Error("p2 seed labels failed");
+    }
+    const edgeValues = [
+      ...targetIssues.map((issue, i) => ({ issueId: issue.id, labelId: i % 2 === 0 ? labelA : labelB })),
+      ...otherIssues.map((issue) => ({ issueId: issue.id, labelId: labelOther })),
+    ];
+    for (const part of chunks(edgeValues, 40)) await db.insert(issueLabels).values(part);
+
+    // Pins: 12 in target (ordered), 6 distractors in other.
+    await db.insert(issuePins).values(
+      targetIssues.slice(0, 12).map((issue, i) => ({ issueId: issue.id, repoId: targetRepo, pinOrder: i + 1 })),
+    );
+    await db.insert(issuePins).values(
+      otherIssues.slice(0, 6).map((issue, i) => ({ issueId: issue.id, repoId: otherRepo, pinOrder: i + 1 })),
+    );
+
+    // Pull mirrors: due / future / syncing thirds (fake repo keys — the
+    // table has no FK; the due scan must seek past the other six).
+    const mirrorValues: (typeof repoMirrors.$inferInsert)[] = Array.from({ length: 12 }, (_, i) => ({
+      repoId: `mir${RUN_TAG}-${i}`,
+      remoteAddress: "https://example.invalid/repo.git",
+      syncState: i % 4 === 3 ? "syncing" : "idle",
+      nextSyncAt: i % 4 === 3 ? 0 : i % 3 === 0 ? now - 120 : now + 999_999,
+    }));
+    await db.insert(repoMirrors).values(mirrorValues);
+
+    // Webhook deliveries + release assets: the purge families.
+    const deliveryValues = (repoId: string, n: number, tag: string): (typeof webhookDeliveries.$inferInsert)[] =>
+      Array.from({ length: n }, (_, i) => ({
+        hookId: 1,
+        repoId,
+        uuid: `p2d-${tag}-${RUN_TAG}-${i}`,
+        eventType: "push",
+        eventGroup: "push",
+        payloadContent: "{}",
+        state: "delivered",
+        isSucceed: true,
+      }));
+    for (const part of chunks(deliveryValues(targetRepo, 90, "t"), 7)) await db.insert(webhookDeliveries).values(part);
+    for (const part of chunks(deliveryValues(otherRepo, 60, "o"), 7)) await db.insert(webhookDeliveries).values(part);
+    const assetValues = (repoId: string, n: number, tag: string): (typeof releaseAssets.$inferInsert)[] =>
+      Array.from({ length: n }, (_, i) => ({
+        uuid: `p2a-${tag}-${RUN_TAG}-${i}`,
+        repoId,
+        releaseId: (i % 3) + 1,
+        name: `asset-${i}.zip`,
+        size: 100 + i,
+        r2Key: `repos/r_x/attachments/${i}/asset.zip`,
+      }));
+    for (const part of chunks(assetValues(targetRepo, 60, "t"), 9)) await db.insert(releaseAssets).values(part);
+    for (const part of chunks(assetValues(otherRepo, 30, "o"), 9)) await db.insert(releaseAssets).values(part);
+
+    // Notification read markers: the cascade arm's family.
+    const stateValues = [
+      ...targetIssues.map((issue, i) => ({
+        userId: i % 3 === 0 ? watcherB : ownerId,
+        issueId: issue.id,
+        readAtUnix: now - 3600,
+      })),
+      ...otherIssues.slice(0, 40).map((issue) => ({ userId: otherId, issueId: issue.id, readAtUnix: now - 60 })),
+    ];
+    for (const part of chunks(stateValues, 15)) await db.insert(notificationStates).values(part);
+
+    fixtures = { ownerId, otherId, targetRepo, otherRepo, labelA, labelB };
+
+    // -- state A: migrated (all indexes present) ------------------------------
+    const shapes = p2WitnessShapes(fixtures);
+    for (const shape of shapes) {
+      const plan = await explainPlan(raw, shape.sql, shape.binds(fixtures));
+      expect(plan, `${shape.name}: plan must use ${shape.index} (with indexes)`).toMatch(
+        new RegExp(`USING (COVERING )?INDEX ${shape.index}`),
+      );
+    }
+    const withNumbers = new Map<string, { meanMs: number; rowsRead: number }>();
+    for (const shape of shapes) {
+      withNumbers.set(shape.name, await measureShape(raw, shape, shape.binds(fixtures), "p2-with", shape.mode));
+    }
+
+    // -- state B: the eight new indexes dropped -------------------------------
+    for (const [name] of P2_ADDED_INDEXES) {
+      await raw.exec(`DROP INDEX IF EXISTS "${name}";`);
+    }
+    const addedLeft = await raw
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${P2_ADDED_INDEXES.map(() => "?").join(",")})`,
+      )
+      .bind(...P2_ADDED_INDEXES.map(([name]) => name))
+      .all<{ name: string }>();
+    expect(addedLeft.results, "p2 witness drop must remove all eight indexes").toHaveLength(0);
+    for (const shape of shapes) {
+      const plan = await explainPlan(raw, shape.sql, shape.binds(fixtures));
+      expect(plan, `${shape.name}: plan must NOT use ${shape.index} (indexes dropped)`).not.toMatch(
+        new RegExp(`USING (COVERING )?INDEX ${shape.index}`),
+      );
+    }
+    const withoutNumbers = new Map<string, { meanMs: number; rowsRead: number }>();
+    for (const shape of shapes) {
+      withoutNumbers.set(shape.name, await measureShape(raw, shape, shape.binds(fixtures), "p2-without", shape.mode));
+    }
+
+    // -- restore: replay the migration DDL verbatim, re-check sqlite_master --
+    for (const [, ddl] of P2_ADDED_INDEXES) await raw.exec(`${ddl};`);
+    const restored = await raw
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${P2_ADDED_INDEXES.map(() => "?").join(",")})`,
+      )
+      .bind(...P2_ADDED_INDEXES.map(([name]) => name))
+      .all<{ name: string }>();
+    expect(restored.results.map((row) => row.name).sort(), "p2 witness restore must leave all eight indexes").toEqual(
+      P2_ADDED_INDEXES.map(([name]) => name).sort(),
+    );
+
+    // -- the numbers (informational; the gate was the plan assertions) --------
+    const numbers: WitnessNumber[] = shapes.map((shape) => {
+      const withN = withNumbers.get(shape.name);
+      const withoutN = withoutNumbers.get(shape.name);
+      if (withN === undefined || withoutN === undefined) throw new Error(`missing measurement for ${shape.name}`);
+      return {
+        shape: shape.name,
+        index: shape.index,
+        rowsReadWith: withN.rowsRead,
+        rowsReadWithout: withoutN.rowsRead,
+        meanMsWith: Math.round(withN.meanMs * 100) / 100,
+        meanMsWithout: Math.round(withoutN.meanMs * 100) / 100,
+      };
+    });
+    for (const n of numbers) {
+      console.log(
+        `[index-witness-p2] ${n.shape.padEnd(26)} rows_read ${String(n.rowsReadWithout).padStart(6)} -> ` +
+          `${String(n.rowsReadWith).padStart(6)}   mean ms ${String(n.meanMsWithout).padStart(8)} -> ` +
+          `${String(n.meanMsWith).padStart(8)}   (${n.index})`,
+      );
+    }
+    console.log(
+      `##P2_INDEX_WITNESS_JSON## ${JSON.stringify({
+        schema_version: 1,
+        target: "local",
+        corpus: {
+          target_issues: TARGET_ISSUES,
+          other_issues: OTHER_ISSUES,
+          pull_requests: 45 + 20,
+          labels: 3,
+          label_edges: 150,
+          pins: 18,
+          repo_mirrors: 12,
+          deliveries: 150,
+          release_assets: 90,
+          notification_states: 130,
+        },
+        timed_runs_per_shape: WITNESS_TIMED_RUNS,
+        shapes: numbers,
+      })}`,
+    );
+  }, 300_000);
+
+  test("proves the nine 0037 drops dead: surviving plans unchanged", async () => {
+    // The plugin's per-test storage isolation resets D1 between tests, so
+    // this test applies the migrations itself (idempotent — applyD1Migrations
+    // records what already ran; the apply-d1-migrations header's "persists
+    // for every test" claim predates the observed reset).
+    await applyAuthD1Migrations();
+    // -- a small corpus across every drop-family table ------------------------
+    const now = Math.floor(Date.now() / 1000);
+    const insertUser = async (name: string, isOrg = false): Promise<number> => {
+      const rows = await db
+        .insert(users)
+        .values({ username: name, usernameLower: name, type: isOrg ? "org" : "user", createdAt: new Date() })
+        .returning({ id: users.id })
+        .all();
+      const user = rows[0];
+      if (user === undefined) throw new Error(`p2 drops seed user ${name} failed`);
+      return user.id;
+    };
+    const ownerId = await insertUser(`${RUN_TAG}downer`);
+    const otherId = await insertUser(`${RUN_TAG}dother`);
+    const orgId = await insertUser(`${RUN_TAG}dorg`, true);
+    const repoId = crypto.randomUUID();
+    await db.insert(repositories).values({
+      id: repoId,
+      storageKey: `r_${repoId.slice(0, 8)}`,
+      ownerNamespace: RUN_TAG,
+      ownerId,
+      slug: `p2-drops-${RUN_TAG}`,
+      visibility: "public",
+      createdAt: new Date(),
+    });
+
+    const dropIssueValues = Array.from({ length: 40 }, (_, i) => ({
+      repoId,
+      index: i + 1,
+      posterId: ownerId,
+      title: `p2 drops issue ${i + 1}`,
+      createdAt: new Date((now - i * 60) * 1000),
+      updatedAt: new Date((now - i * 30) * 1000),
+    }));
+    for (const part of chunks(dropIssueValues, 7)) await db.insert(issues).values(part);
+    const issueRows = (
+      await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.repoId, repoId))
+        .orderBy(asc(issues.id))
+        .all()
+    ).map((row) => row.id);
+
+    const commentRows = issueRows.slice(0, 25).map((issueId, i) => ({
+      type: 0,
+      posterId: i % 2 === 0 ? ownerId : otherId,
+      issueId,
+      content: `p2 drops comment ${i}`,
+      createdAt: new Date(now),
+      updatedAt: new Date(now),
+    }));
+    for (const part of chunks(commentRows, 3)) await db.insert(comments).values(part);
+
+    await db.insert(teams).values(
+      Array.from({ length: 8 }, (_, i) => ({
+        orgId,
+        lowerName: `p2-team-${RUN_TAG}-${i}`,
+        name: `p2 team ${i}`,
+        authorize: "read" as const,
+      })),
+    );
+    await db.insert(protectedBranches).values(
+      Array.from({ length: 15 }, (_, i) => ({
+        repoId,
+        ruleName: `p2-rule-${RUN_TAG}-${i}`,
+        rules: "{}",
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      })),
+    );
+    const pullReviewValues = issueRows.slice(0, 30).map((issueId, i) => ({
+      type: (i % 3) + 1,
+      reviewerId: i % 2 === 0 ? ownerId : otherId,
+      issueId,
+      official: true,
+    }));
+    for (const part of chunks(pullReviewValues, 8)) await db.insert(pullReviews).values(part);
+    const markerValues = issueRows.slice(0, 20).flatMap((issueId) => [
+      { userId: ownerId, issueId, readAtUnix: now },
+      { userId: otherId, issueId, readAtUnix: now },
+    ]);
+    for (const part of chunks(markerValues, 15)) await db.insert(notificationStates).values(part);
+    const secretValues = [
+      ...Array.from({ length: 12 }, (_, i) => ({
+        ownerId,
+        repoId: "",
+        name: `P2_OWNER_SECRET_${i}`,
+        data: "x",
+        createdAt: new Date(now),
+      })),
+      ...Array.from({ length: 8 }, (_, i) => ({
+        ownerId: 0,
+        repoId,
+        name: `P2_REPO_SECRET_${i}`,
+        data: "x",
+        createdAt: new Date(now),
+      })),
+    ];
+    for (const part of chunks(secretValues, 10)) await db.insert(secrets).values(part);
+    const variableValues = [
+      ...Array.from({ length: 10 }, (_, i) => ({
+        ownerId,
+        repoId: "",
+        name: `P2_OWNER_VAR_${i}`,
+        data: "x",
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      })),
+      ...Array.from({ length: 6 }, (_, i) => ({
+        ownerId: 0,
+        repoId,
+        name: `P2_REPO_VAR_${i}`,
+        data: "x",
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      })),
+    ];
+    for (const part of chunks(variableValues, 10)) await db.insert(actionVariables).values(part);
+    const deployKeyValues = Array.from({ length: 20 }, (_, i) => ({
+      keyId: (i % 3) + 1,
+      repoId,
+      name: `p2-deploy-${i}`,
+      keyType: 1,
+      fingerprint: `SHA256:p2${i}`,
+      createdAt: new Date(now),
+      updatedAt: new Date(now),
+    }));
+    for (const part of chunks(deployKeyValues, 8)) await db.insert(deployKeys).values(part);
+    // Distinct blocker users — the UNIQUE(blocker, blockee) pair forbids
+    // repeat pairs, so the 15-row blockee scan needs 15 distinct blockers.
+    const blockerIds: number[] = [];
+    for (let i = 0; i < 15; i++) blockerIds.push(await insertUser(`${RUN_TAG}blkr${i}`));
+    const blockingValues = [
+      ...blockerIds.map((blockerId) => ({
+        blockerId,
+        blockeeId: ownerId,
+        createdAt: new Date(now),
+      })),
+      ...blockerIds.slice(0, 5).map((blockerId) => ({
+        blockerId: ownerId,
+        blockeeId: blockerId,
+        createdAt: new Date(now),
+      })),
+    ];
+    for (const part of chunks(blockingValues, 15)) await db.insert(userBlocking).values(part);
+    const projectValues = [
+      ...Array.from({ length: 24 }, (_, i) => ({
+        title: `p2 project ${i}`,
+        repoId,
+        creatorId: ownerId,
+        type: 2,
+        isClosed: i % 2 === 0,
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      })),
+      ...Array.from({ length: 8 }, (_, i) => ({
+        title: `p2 other project ${i}`,
+        repoId: crypto.randomUUID(),
+        creatorId: ownerId,
+        type: 2,
+        isClosed: false,
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      })),
+    ];
+    for (const part of chunks(projectValues, 7)) await db.insert(projects).values(part);
+    const projectIds = (
+      await db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(eq(projects.repoId, repoId))
+        .orderBy(asc(projects.id))
+        .all()
+    ).map((row) => row.id);
+    const firstProject = projectIds[0];
+    if (firstProject === undefined) throw new Error("p2 drops seed projects failed");
+    dropTest = { orgId, repoId, firstProject };
+    await db.insert(projectColumns).values(
+      Array.from({ length: 12 }, (_, i) => ({
+        title: `p2 column ${i}`,
+        projectId: i % 2 === 0 ? firstProject : (projectIds[i % projectIds.length] as number),
+        creatorId: ownerId,
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      })),
+    );
+    await db.insert(repoLicenses).values(
+      Array.from({ length: 20 }, (_, i) => ({
+        repoId,
+        // UNIQUE(repo_id, license, license_path) — distinct license per row.
+        license: `MIT-${i}`,
+        licensePath: "LICENSE",
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      })),
+    );
+    const historyValues = issueRows.slice(0, 40).map((issueId, i) => ({
+      posterId: ownerId,
+      issueId,
+      commentId: i % 5 === 0 ? 0 : i,
+      editedAt: new Date(now - i * 30),
+      contentText: `p2 history ${i}`,
+    }));
+    for (const part of chunks(historyValues, 12)) await db.insert(issueContentHistory).values(part);
+
+    // The surviving hot shapes: each table that lost an index, probed by its
+    // real read (the cites are the schema.ts audit-drop comments).
+    const survivors: { name: string; sql: string; binds: unknown[] }[] = [
+      {
+        name: "comments by issue",
+        sql: "SELECT id, poster_id FROM comments WHERE issue_id = ?",
+        binds: [issueRows[0]],
+      },
+      {
+        name: "teams by org",
+        sql: "SELECT id, lower_name FROM teams WHERE org_id = ?",
+        binds: [orgId],
+      },
+      {
+        name: "protected branches by repo",
+        sql: "SELECT id, rule_name FROM protected_branches WHERE repo_id = ?",
+        binds: [repoId],
+      },
+      {
+        name: "reviews by issue",
+        sql: "SELECT id, reviewer_id, type FROM pull_reviews WHERE issue_id = ?",
+        binds: [issueRows[0]],
+      },
+      {
+        name: "read markers by user+issue",
+        // api/routes/notifications.ts:845 (the mark-read path) — both columns
+        // bound (the uq serves it).
+        sql: "SELECT read_at_unix, pinned FROM notification_states WHERE user_id = ? AND issue_id = ?",
+        binds: [ownerId, issueRows[0]],
+      },
+      {
+        name: "owner secrets",
+        // api/services/secrets-variables.ts:162 — the owner arm binds both
+        // scope columns (the uq serves it).
+        sql: "SELECT name, data FROM secrets WHERE repo_id = '' AND owner_id = ?",
+        binds: [ownerId],
+      },
+      {
+        name: "repo secrets",
+        sql: "SELECT name FROM secrets WHERE repo_id = ?",
+        binds: [repoId],
+      },
+      {
+        name: "owner variables",
+        sql: "SELECT name FROM action_variables WHERE repo_id = '' AND owner_id = ?",
+        binds: [ownerId],
+      },
+      {
+        name: "repo variables",
+        sql: "SELECT name FROM action_variables WHERE repo_id = ?",
+        binds: [repoId],
+      },
+      {
+        name: "deploy keys by repo",
+        sql: "SELECT id, name FROM deploy_keys WHERE repo_id = ?",
+        binds: [repoId],
+      },
+      {
+        name: "blockees",
+        sql: "SELECT blocker_id FROM user_blocking WHERE blockee_id = ?",
+        binds: [ownerId],
+      },
+      {
+        name: "repo projects closed",
+        sql: "SELECT id, title FROM projects WHERE repo_id = ? AND is_closed = ?",
+        binds: [repoId, 1],
+      },
+      {
+        name: "project columns",
+        sql: "SELECT id, title FROM project_columns WHERE project_id = ?",
+        binds: [firstProject],
+      },
+      {
+        name: "repo licenses",
+        sql: "SELECT license FROM repo_license WHERE repo_id = ?",
+        binds: [repoId],
+      },
+      {
+        name: "history by issue ordered",
+        sql: "SELECT id, edited_unix FROM issue_content_history WHERE issue_id = ? ORDER BY edited_unix",
+        binds: [issueRows[0]],
+      },
+    ];
+
+    // -- reconstruct the pre-0037 state: the migrations already applied the
+    // drops, so the battery re-CREATEs the nine, witnesses the survivors'
+    // plans with them present, then re-drops (the migrated end-state).
+    const absent = await raw
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${P2_DROPPED_INDEXES.map(() => "?").join(",")})`,
+      )
+      .bind(...P2_DROPPED_INDEXES.map(([name]) => name))
+      .all<{ name: string }>();
+    expect(absent.results, "the migration must have dropped all nine").toHaveLength(0);
+    for (const [, ddl] of P2_DROPPED_INDEXES) await raw.exec(`${ddl};`);
+    const created = await raw
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${P2_DROPPED_INDEXES.map(() => "?").join(",")})`,
+      )
+      .bind(...P2_DROPPED_INDEXES.map(([name]) => name))
+      .all<{ name: string }>();
+    expect(created.results.map((row) => row.name).sort()).toEqual(
+      P2_DROPPED_INDEXES.map(([name]) => name).sort(),
+    );
+
+    // -- state A: everything present; capture + the dead-check ----------------
+    const plansBefore = new Map<string, string>();
+    for (const shape of survivors) {
+      const plan = await explainPlan(raw, shape.sql, shape.binds);
+      for (const [dropped] of P2_DROPPED_INDEXES) {
+        expect(plan, `${shape.name}: pre-drop plan must not use dropped ${dropped}`).not.toContain(
+          `USING INDEX ${dropped}`,
+        );
+      }
+      plansBefore.set(shape.name, plan);
+    }
+
+    // -- drop all nine --------------------------------------------------------
+    for (const [name] of P2_DROPPED_INDEXES) {
+      await raw.exec(`DROP INDEX IF EXISTS "${name}";`);
+    }
+    const droppedLeft = await raw
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${P2_DROPPED_INDEXES.map(() => "?").join(",")})`,
+      )
+      .bind(...P2_DROPPED_INDEXES.map(([name]) => name))
+      .all<{ name: string }>();
+    expect(droppedLeft.results, "p2 drops must remove all nine indexes").toHaveLength(0);
+
+    // -- state B: every surviving plan must be byte-identical -----------------
+    for (const shape of survivors) {
+      const planBefore = plansBefore.get(shape.name);
+      if (planBefore === undefined) throw new Error(`missing pre-drop plan for ${shape.name}`);
+      const planAfter = await explainPlan(raw, shape.sql, shape.binds);
+      expect(planAfter, `${shape.name}: plan changed after the drops — the drop was NOT dead`).toBe(planBefore);
+    }
+
+    // -- the end state IS the migrated state (nothing to restore) -------------
+    const left = await raw
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${P2_DROPPED_INDEXES.map(() => "?").join(",")})`,
+      )
+      .bind(...P2_DROPPED_INDEXES.map(([name]) => name))
+      .all<{ name: string }>();
+    expect(left.results, "the re-drop must leave the migrated schema (no nine)").toHaveLength(0);
   }, 300_000);
 });
