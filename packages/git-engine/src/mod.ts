@@ -35,7 +35,8 @@ export { RepoCell } from "./repo";
 export { Registry } from "./registry";
 export type { Env } from "./env";
 export type { RepoInfo, RepoConfig } from "./registry";
-export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, BlobResult, LogResult, DiffResult, DiffFileJson } from "./repo";
+export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, TreeCommitsResult, BlobResult, LogResult, DiffResult, DiffFileJson } from "./repo";
+export { TREE_COMMITS_MAX_PATHS } from "./repo";
 export type { Person } from "./git/objects";
 // object serializers (SPEC-0001a §4.1): the Worker-side builders construct the
 // canonical bytes that putApiObjects verifies and stores

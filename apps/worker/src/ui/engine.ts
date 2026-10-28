@@ -6,10 +6,12 @@
  * precedent: gitHttpGate.serveHead reads `RepoCell.listRefs()` by RPC).
  *
  * Engine RPC surface used (verified `packages/git-engine/dist-types/repo.d.ts`
- * at this pin): `listRefs`, `readCommit`, `listLog`, `listTree`, `readBlob`.
- * §3.5's batched `listTreeCommits(ref?, path?)` enrichment RPC does NOT exist
- * on the boundary yet — the documented §3.5 interim fallback applies (per-entry
- * `listLog(ref, {path})` RPCs to the SAME DO; see page-data.ts).
+ * at this pin): `listRefs`, `readCommit`, `listLog`, `listTree`, `readBlob`,
+ * plus the A10-L batched enrichment RPC `listTreeCommits(ref, paths)` — one
+ * date-ordered walk answering the first commit per path, index-aligned
+ * (`TreeCommitsResult`), replacing the per-entry `listLog(ref, {path, n: 1})`
+ * fan on directory views (see page-data.ts; the per-path fan remains the
+ * documented fallback for entries the batch misses).
  *
  * Failure posture: every method resolves `null` on transport failure (a thrown
  * RPC), mirroring the gate's serveHead catch-and-fall-back (§4.9 "unreadable
@@ -27,7 +29,14 @@
  * this one file, open question 5).
  */
 
-import type { BlobResult, CommitJson, LogResult, RefsResult, TreeResult } from "@cf-gitea/git-engine";
+import type {
+  BlobResult,
+  CommitJson,
+  LogResult,
+  RefsResult,
+  TreeCommitsResult,
+  TreeResult,
+} from "@cf-gitea/git-engine";
 
 /** The exact engine RPC slice the pages consume — `null`-on-failure shape. */
 export interface EngineClient {
@@ -36,6 +45,8 @@ export interface EngineClient {
   listLog(ref?: string, opts?: { path?: string; ofs?: number; n?: number }): Promise<LogResult | null>;
   listTree(ref?: string, path?: string): Promise<TreeResult | null>;
   readBlob(ref: string | undefined, path: string): Promise<BlobResult | null>;
+  /** A10-L batched enrichment: commit per input path, index-aligned. */
+  listTreeCommits(ref: string | undefined, paths: string[]): Promise<TreeCommitsResult | null>;
 }
 
 /** Build the client for one repository from the request's bindings. */
@@ -48,5 +59,6 @@ export function engineClient(env: Env, repoName: string): EngineClient {
     listLog: (ref, opts) => safe(cell.listLog(ref, opts)),
     listTree: (ref, path) => safe(cell.listTree(ref, path)),
     readBlob: (ref, path) => safe(cell.readBlob(ref, path)),
+    listTreeCommits: (ref, paths) => safe(cell.listTreeCommits(ref, paths)),
   };
 }

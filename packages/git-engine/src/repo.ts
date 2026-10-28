@@ -121,6 +121,13 @@ const MAX_DIFF_BLOB = 512 * 1024;
 const MAX_LOG_SCAN = 5000;
 /** a path-filtered log rejects most commits, so bound its walk tighter */
 const PATH_LOG_SCAN = 2000;
+/**
+ * `listTreeCommits` input bound: one request answers at most this many paths
+ * (the consumer's own directory budget is far below it — cf-gitea caps its
+ * listings at 30). Over-budget requests throw, so an index-aligned answer can
+ * never be silently truncated.
+ */
+export const TREE_COMMITS_MAX_PATHS = 100;
 const MAX_STATS_SCAN = 2000;
 /** whole-file blame is memory-bound: cap the tip blob and the history bytes */
 const MAX_BLAME_BYTES = 1024 * 1024;
@@ -175,6 +182,19 @@ export interface CommitJson {
 export interface LogResult {
   commits: CommitJson[];
   more: boolean;
+}
+
+/**
+ * The batched per-path latest-commit answer (`listTreeCommits`): the first
+ * commit that touched each input path, INDEX-ALIGNED with the request's
+ * `paths` array — the same discipline as `ClassifyReceiveResult.kinds`, so a
+ * repeated path can never collide on a key. A `null` slot means the walk
+ * budget found no commit touching the path — exactly the answer the path's
+ * own `listLog(ref, { path, ofs: 0, n: 1 })` would give (empty page), and
+ * never a transport failure (that throws).
+ */
+export interface TreeCommitsResult {
+  commits: (CommitJson | null)[];
 }
 
 export interface TreeEntryJson {
@@ -1149,6 +1169,37 @@ export class RepoCell extends DurableObject<Env> {
     });
   }
 
+  /**
+   * Batched per-path latest-commit enrichment (the audit A10-L RPC): ONE
+   * date-ordered walk answers the first commit that touched EVERY input path,
+   * replacing the N per-path `listLog(ref, { path, ofs: 0, n: 1 })` RPCs a
+   * directory listing used to fan out. The answers are INDEX-ALIGNED with
+   * `paths` and equal, per path, to what that path's own `listLog` page
+   * returns — the walk is walkLog's exact frontier/dedup/budget over the same
+   * `matchesFilter` predicate, just answering for all pending paths per pop
+   * (see walkTreeCommits). An unresolvable/unpeelable ref answers all-null
+   * (the same shape an unresolvable ref gives every per-path `listLog` — the
+   * empty page), never a throw; over-budget input throws (the consumer's
+   * transport-class degradation).
+   */
+  async listTreeCommits(ref?: string, paths: string[] = []): Promise<TreeCommitsResult> {
+    this.rpcBind();
+    if (paths.length > TREE_COMMITS_MAX_PATHS) {
+      throw new Error(`listTreeCommits: too many paths (${paths.length} > ${TREE_COMMITS_MAX_PATHS})`);
+    }
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(ref, gate);
+      const first = rr ? await this.peelToCommit(rr.oid, gate) : null;
+      if (!first) return { commits: paths.map(() => null) };
+      const entries = await this.walkTreeCommits(
+        first,
+        paths.map((p) => decodePath("/" + p)),
+        gate
+      );
+      return { commits: entries.map((e) => (e ? commitJson(e.oid, e.commit) : null)) };
+    });
+  }
+
   async listTree(ref?: string, path = ""): Promise<TreeResult | null> {
     this.rpcBind();
     return this.withContentLease(async (gate) => {
@@ -1576,6 +1627,52 @@ export class RepoCell extends DurableObject<Env> {
       }
     }
     return { entries: out.slice(skip, skip + limit), more: out.length > skip + limit };
+  }
+
+  /**
+   * The ONE shared walk behind `listTreeCommits`: walkLog's exact structure —
+   * same committer-time frontier sort, same `seen` dedup, same per-pop parent
+   * push, same PATH_LOG_SCAN budget for path filters (a shared filter can only
+   * be tighter, never looser) — except each popped commit is checked against
+   * every still-pending path. Because the popped-commit sequence is identical
+   * to walkLog's for the same tip, each path's first match here is exactly the
+   * commit that path's own `listLog(ofs=0, n=1)` walk returns as its first
+   * entry: this walk keeps scanning until every path is answered or the cap
+   * trips, so it can never stop before a pending path's own walk would have.
+   * The pathOid memo is PER PATH — pathOidCached keys entries by root tree
+   * alone (safe inside one single-path walk), so a shared memo across paths
+   * would cross-contaminate answers; per-path maps make each path's tree
+   * reads byte-for-byte the ones its own walk performed.
+   */
+  private async walkTreeCommits(
+    first: LogEntry,
+    filters: string[][],
+    gate?: ReadGate
+  ): Promise<(LogEntry | null)[]> {
+    const answers: (LogEntry | null)[] = filters.map(() => null);
+    const pending = new Set<number>(filters.map((_, i) => i));
+    const memos = filters.map(() => new Map<string, string | null>());
+    const seen = new Set<string>([first.oid]);
+    const frontier: LogEntry[] = [{ oid: first.oid, commit: first.commit }];
+    let scanned = 0;
+    while (frontier.length && pending.size > 0 && scanned++ < PATH_LOG_SCAN) {
+      frontier.sort((a, b) => b.commit.committer.time - a.commit.committer.time);
+      const cur = frontier.shift()!;
+      for (const i of pending) {
+        if (await this.matchesFilter(cur, { path: filters[i] }, memos[i], gate)) {
+          answers[i] = cur;
+          pending.delete(i);
+        }
+      }
+      if (pending.size === 0) break;
+      for (const p of cur.commit.parents) {
+        if (seen.has(p)) continue;
+        seen.add(p);
+        const c = await this.loadCommit(p, gate);
+        if (c) frontier.push({ oid: p, commit: c });
+      }
+    }
+    return answers;
   }
 
   /** First-parent history of a path (for blame), newest first, with blobs. */

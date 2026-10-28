@@ -13,25 +13,32 @@ import { renderMarkdownToHtml } from "../api/services/markdown";
 import type { EngineClient } from "./engine";
 
 // ---------------------------------------------------------------------------
-// §3.5 per-file latest-commit enrichment — the documented interim fallback
+// §3.5 per-file latest-commit enrichment — the A10-L batched RPC + fallback
 // ---------------------------------------------------------------------------
 
 /**
- * The batched `listTreeCommits(ref?, path?)` RPC §3.5 adds to the engine does
- * not exist on this pin's boundary (verified dist-types/repo.d.ts), so this
- * is §3.5's documented interim fallback: one `listLog(ref, {path, n: 1})` RPC
- * per entry, all to the SAME DO (cheap same-DO hops — never the N× HTTP
- * self-fetch spike §6.1 forbids), issued CONCURRENTLY (the audit A10
- * parallelization — the serial loop's wall clock was the sum of ≤ 30 hops).
- * Resolution failures resolve to `null` and the render path is IDENTICAL to
- * the batched RPC's `null` entries: the muted `.notready` message cell,
- * without the `data-fetch` loader (§3.5 — no partial-refresh endpoint exists
- * in this slice).
+ * §3.5's per-file latest-commit enrichment over the engine's BATCHED
+ * `listTreeCommits(ref, paths)` RPC (the audit A10-L closure — the boundary
+ * now carries it, verified dist-types/repo.d.ts): ONE same-DO roundtrip
+ * answers the whole bounded listing with an INDEX-ALIGNED commit per path,
+ * replacing the audit's interim parallel fan (up to ENRICH_MAX
+ * `listLog(ref, {path, n: 1})` RPCs per view via Promise.all — cheap same-DO
+ * hops individually, but N× the subrequests and N walks of the same history).
  *
- * Budget: entries beyond ENRICH_MAX fall through to `null` unconditionally,
- * bounding the per-request RPC fan-out (50/request subrequest budget on the
- * Workers Free plan, §3.2) independent of directory size. Each `listLog` is
- * additionally capped engine-side (PATH_LOG_SCAN walk budget).
+ * Degradation keeps §3.5's null semantics end to end:
+ * - the batch RPC itself is unavailable (an old boundary / stub) or throws —
+ *   the documented interim per-path fan answers EVERY entry instead;
+ * - a path the batch left unanswered (an index gap — never expected from the
+ *   current engine, whose aligned slots cover the whole input) falls back to
+ *   its own `listLog` call like the interim path did;
+ * - every failure resolves `null` and the render path is IDENTICAL to the
+ *   batch RPC's `null` slots: the muted `.notready` message cell, without the
+ *   `data-fetch` loader (§3.5 — no partial-refresh endpoint in this slice).
+ *
+ * Budget: entries beyond ENRICH_MAX never reach the engine at all — the batch
+ * call is sliced to ENRICH_MAX paths and the rest fall through to `null`,
+ * bounding per-request work independent of directory size. The batch answers
+ * each path's commit within the engine's own PATH_LOG_SCAN walk budget.
  */
 export const ENRICH_MAX = 30;
 
@@ -45,26 +52,38 @@ export async function enrichTreeCommits(
   entries: readonly TreeEntryJson[],
   fullPath: (entry: TreeEntryJson) => string,
 ): Promise<CommitByEntry> {
-  const bounded = entries.slice(0, ENRICH_MAX);
-  // Concurrent same-DO roundtrips (Promise.all over the serial loop's exact
-  // per-path calls); each arm degrades to `null` on failure — never a
-  // rejection, so one failed entry cannot sink the page. Results land in
-  // ENTRY order (not completion order) below, keeping the map's insertion
-  // order identical to the serial loop's.
-  const settled = await Promise.all(
-    bounded.map(async (entry): Promise<CommitJson | null> => {
+  const commits: CommitByEntry = new Map();
+  // ONE batched RPC for the bounded listing (A10-L); `.catch` + the presence
+  // guard degrade to the interim fan on transport failure or a boundary that
+  // predates the RPC (a stub without the method throws synchronously).
+  const listing = entries.slice(0, ENRICH_MAX).map((entry) => ({ entry, path: fullPath(entry) }));
+  const batch = engine.listTreeCommits
+    ? await engine.listTreeCommits(ref, listing.map((l) => l.path)).catch(() => null)
+    : null;
+  // Entries the batch left unanswered (index gap) ride the per-path fallback.
+  const fan: { entry: TreeEntryJson; path: string }[] = [];
+  if (batch) {
+    for (const [index, item] of listing.entries()) {
+      const answered = batch.commits[index];
+      if (answered === undefined) fan.push(item);
+      else commits.set(item.entry.name, answered);
+    }
+  } else {
+    fan.push(...listing);
+  }
+  // The documented interim fallback (§3.5), unchanged: concurrent same-DO
+  // `listLog(ref, {path, ofs: 0, n: 1})` roundtrips, each degrading to `null`
+  // on failure — never a rejection, so one failed entry cannot sink the page.
+  await Promise.all(
+    fan.map(async (item) => {
       try {
-        const log = await engine.listLog(ref, { path: fullPath(entry), ofs: 0, n: 1 });
-        return log?.commits[0] ?? null;
+        const log = await engine.listLog(ref, { path: item.path, ofs: 0, n: 1 });
+        commits.set(item.entry.name, log?.commits[0] ?? null);
       } catch {
-        return null; // degraded → notready cell (§3.5)
+        commits.set(item.entry.name, null); // degraded → notready cell (§3.5)
       }
     }),
   );
-  const commits: CommitByEntry = new Map();
-  for (const [index, entry] of bounded.entries()) {
-    commits.set(entry.name, settled[index] ?? null);
-  }
   return commits;
 }
 
