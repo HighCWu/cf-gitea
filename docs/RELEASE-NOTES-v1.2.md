@@ -715,7 +715,7 @@ DLQ** complete (`385f768` the handler half, `de486aa` config + dispatch —
 with the deploy note that the repo-tasks-dlq QUEUE must exist at deploy
 time) and **M1 mounted** (`5c59f1f` the DEMO_MODE gate + the 72 h sweep,
 invariant-first; `15e2b62` the scheduled dispatcher + the dlq kindLabel
-fold — M1 COMPLETE end-to-end); **M2 (banner + quotas) is in flight**. The
+fold — M1 COMPLETE end-to-end); **M2 (banner + quotas — landed + mounted, org guard closed at `9e5005f`)**. The
 **three harness hardenings** closed the e2e sweep's open issues: the
 mirror harness (`4073027` — checked DELETEs, the run interlock, the
 stale-state sweep, 93/0 three consecutive — and its guard then CAUGHT the

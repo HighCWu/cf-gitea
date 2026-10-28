@@ -94,10 +94,11 @@ cached-plan and DDL-`exec()` platform facts, the witness protocol — is
 
 ## 5. PENDING — the orchestrator finalizes
 
-- **Migration 0037 (the P2 index sweep + dead drops) — IN FLIGHT.** Not yet
-  in the tree: no `0037_*` file under `apps/worker/src/db/migrations/` at
-  HEAD `7c3b7c4`, and the working tree is clean. Content per the
-  orchestrator: the audit's P2 tier plus the removal of dead indexes.
+- **Migration 0037 (the P2 index sweep + dead drops) — LANDED** (`7dc607f`):
+  as-built `0037_smart_blizzard.sql` — 8 index adds, 9 verified-dead drops,
+  the veto witness (was IN FLIGHT at this ledger's reference HEAD
+  `7c3b7c4`; content matched the orchestrator's brief — the audit's P2
+  tier plus the removal of dead indexes).
 - **RD24 deploy — PENDING.** Payload: migrations 0036 + 0037 (both
   post-RD23 landings ride it). Verdict arm per the orchestrator: the
   fixwave-parity battery's `fw-org-member-preaccess` check going green.

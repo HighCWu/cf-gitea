@@ -3316,12 +3316,16 @@ __BLANK__):**
   - **the engine D3 fix** — `6545edd` (graceful publish failures keep the
     lease row; the sweep, not the round, converges the orphan; two new
     `check-compaction` checks);
-  - **mirror-HEAD** — `__BLANK__` (in flight at draft time;
+  - **mirror-HEAD** — `071f10b` (HEAD adoption follows the engine's
+    recorded pick — mirrors follow the source's HEAD, upstream-faithful;
     `fd05b1e`'s sweep found the product-side root cause this fixes);
-  - **wiki-webhook** — `__BLANK__` (in flight at draft time; the webhook
-    coverage refresh's wiki gap, `4556669`);
-  - **tier-2 adoption** — `__BLANK__` (in flight at draft time);
-  - **the addressability fix** — `__BLANK__` (in flight at draft time).
+  - **wiki-webhook** — `466092c` (the wiki family wired — 21/26 fully
+    emitted, the not-emitted-with-feature backlog back to ZERO; the
+    webhook coverage refresh's wiki gap, `4556669`);
+  - **tier-2 adoption** — `57794e7` (tier-2 preload adoption — thirteen
+    more list surfaces go page-independent);
+  - **the addressability fix** — `bd59bc4` (branch-protection
+    addressability — rule ids rendered, slash-glob names addressable).
 - **The gate at GO — the full-gate line at the final tree**:
   `pnpm test:full` (ADR-0006 composite): __BLANK__; `pnpm typecheck`:
   __BLANK__; `pnpm lint`: __BLANK__; `check-openapi`: __BLANK__.
