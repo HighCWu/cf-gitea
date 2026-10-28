@@ -3,7 +3,7 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
-import { RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
+import { RepoNameCollisionError, RepoNameInvalidError } from "../../repos/service";
 import { assertDemoRepoQuota, DemoRepoQuotaError } from "../../services/demo-quota";
 import { OrgService } from "../../services/orgs/orgs";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
@@ -13,6 +13,7 @@ import { organizationListSchema } from "../models/organization";
 import type { User } from "../models/user";
 import { createRepoOptionSchema, repositoryListSchema, repositorySchema } from "../models/repository";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { createUserRepository, resolveAutoInitReadme } from "../services/user-repos";
 import {
   listOrgRepositories,
   orgDoerOf,
@@ -126,10 +127,10 @@ const orgReposRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
  * org missing/invisible → 404; create grant missing → 403; duplicate name →
  * 409; invalid/reserved name → 422. The §4.3 demo quota rides the declared
  * 403 arm (the M2 known-gap fold — the user-repos note applies, with the
- * ORG as the quota owner). `auto_init` and the template options are
- * accepted per the contract and deferred to the engine commit-builder wave
- * (SPEC-0004 §3.4) — the landed repos service creates the registry row with
- * instance defaults.
+ * ORG as the quota owner). The create itself is upstream's shared
+ * `CreateUserRepo` service half (`repo.go:493` — `org.AsUser()` IS the
+ * owner), so `auto_init` lands the initial commit through the engine and
+ * `description`/`default_branch` persist, exactly like `POST /user/repos`.
  */
 const createOrgRepoRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
@@ -202,7 +203,8 @@ export function registerOrgRoutes(
     // org to the create (`CreateUserRepo(ctx, org.AsUser(), *opt)`,
     // repo.go:493) and `CanCreateRepoIn` counts the OWNER's repositories
     // under the DOER's admin bypass (user.go:285-295) — the create below
-    // assigns `owner: { id: org.id, … }`, so the assert rides `org.id`
+    // is owned by the org's users row (id = org.id; orgs ARE owners), so
+    // the assert rides `org.id`
     // (orgs ARE owners; a visitor cannot route around the cap via own-orgs).
     // Same mapping as user-repos.ts: the refusal unwraps to
     // ErrPermissionDenied → 403 + err.Error() (repo.go:263-264); the
@@ -217,17 +219,22 @@ export function registerOrgRoutes(
       throw error;
     }
     const form = c.req.valid("json");
-    // The engine registry rides the create (REDEPLOY8 — the user-repos note):
-    // bare construction skips seedRepoExtras' upsert and the org repo 404s on
+    // Upstream CreateUserRepo head: the readme-template 400 lands before any
+    // write (repo.go:231-240), exactly like the /user/repos and admin
+    // create-for-user routes.
+    resolveAutoInitReadme(form);
+    // The 201 rides the SAME upstream service half every other create route
+    // shares: repo.go:493 hands the ORG to `CreateUserRepo(ctx, org.AsUser(),
+    // *opt)` — description/default_branch metadata, the auto_init initial
+    // commit (the owner's git signature, i.e. the org-as-user row — init.go
+    // initRepoCommit(ctx, tmpPath, repo, u)) and the is_empty flip. The
+    // engine registry rides the create (REDEPLOY8 — the user-repos note):
+    // bare construction skips seedRepoExtras' upsert and the repo 404s on
     // info/refs/clone until a push lands.
-    const service = new RepoService(c.env.DB, { registry: c.env.REGISTRY.getByName("registry") });
+    const ownerRow = await orgUserRow(c.env.DB, org);
     let repo;
     try {
-      repo = await service.create({
-        owner: { id: org.id, usernameLower: org.usernameLower },
-        name: form.name,
-        isPrivate: form.private === true,
-      });
+      repo = await createUserRepository(c.env.DB, c.env, ownerRow, form, new Date());
     } catch (error) {
       if (error instanceof RepoNameCollisionError) {
         throw new ApiError(409, "The repository with the same name already exists.");
@@ -257,7 +264,7 @@ export function registerOrgRoutes(
     return c.json(
       toCreatedOrgRepository(viewer, {
         repo,
-        owner: await orgUserRow(c.env.DB, org),
+        owner: ownerRow,
       }),
       201,
     );

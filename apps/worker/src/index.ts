@@ -143,14 +143,17 @@ app.route("/", attachmentsServingRouter);
 // parser owns (/:owner/:repo[/commits|/src]); the dispatcher consults
 // handlesUiRoute BEFORE Hono routes, so a miss here can never swallow an
 // engine route. api registrations stay first; healthz is unaffected.
+// SPEC-0010 §6 first-run amendment: the zero-user install window (/install)
+// and the ALLOW_SIGNUP-gated /user/sign_up. MUST mount BEFORE uiRouter:
+// /user/sign_up is two segments and Hono's RegExpRouter gives the dynamic
+// /:owner/:repo pair precedence over a static registered in a LATER-mounted
+// router (the /explore rule documented at uiRouter's literal block — the
+// first-run HANDOFF's "order immaterial" claim was wrong for this path).
+app.route("/", firstRunRouter);
 app.route("/", uiRouter);
 // SPEC-0010: /login + /logout are single-segment top-level routes (§2.1) —
 // never repo-scoped, so the dispatcher and the engine never see them.
 app.route("/", sessionRouter);
-// SPEC-0010 §6 first-run amendment: the zero-user install window (/install)
-// and the ALLOW_SIGNUP-gated /user/sign_up — no path overlap with the
-// session/ui routers (order immaterial, per the HANDOFF recipe).
-app.route("/", firstRunRouter);
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {

@@ -906,6 +906,58 @@ describe("team grants decide the git-HTTP matrix (SPEC-0007 §3.5 via authorizeG
     expect(new TextDecoder().decode(await ownerClone.arrayBuffer())).toContain(fx.oid);
   });
 
+  it("the fw-org-member-preaccess battery arm shape END-TO-END: the API-created auto_init org repo + the includes-all repo.code team let the member's own token list refs/heads/main", async () => {
+    // The fixwave battery's exact shape (deploy-probes.mjs fw-org-setup-201s
+    // → fw-org-member-preaccess): org via the API, PRIVATE repo with
+    // auto_init via POST /orgs/{org}/repos, team created with
+    // `units: ["repo.code"]` (the assignTeamPermission collapse: authorize
+    // 'none' + the units_map) + includes_all, member added — then the
+    // MEMBER's own all-scopes token ls-remotes. The history this pins:
+    // the member's grant always resolved (the team predicate was green in
+    // isolation), but the org route ignored auto_init, so the repo stayed
+    // empty and `refs/heads/main` never appeared — the arm read "team
+    // membership did not grant the git read" while the true seam was the
+    // never-written initial commit. The advert shape below is the arm's
+    // poll predicate verbatim: status 200 AND a refs/heads/main line.
+    const admin = await seedVerifiedUser({ username: "BatteryAdmin", isAdmin: true });
+    const member = await seedVerifiedUser({ username: "BatteryMember" });
+    const orgs = new OrgService(env.DB);
+    const teamsSvc = new TeamsService(env.DB);
+    const org = await orgs.createOrg({ name: "batorg", ownerId: admin.id });
+
+    const adminToken = (await mintFor(admin.id, "admin", "all")).plaintext;
+    const create = await SELF.fetch("https://example.com/api/v1/orgs/batorg/repos", {
+      method: "POST",
+      headers: { authorization: `token ${adminToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ name: "batrepo", private: true, auto_init: true }),
+    });
+    expect(create.status).toBe(201);
+    const created = await create.json<{ empty?: boolean }>();
+    expect(created.empty).toBe(false); // auto_init landed before the 201 — the arm's refs exist already
+
+    const team = await teamsSvc.createTeam(org, {
+      name: "bat-team",
+      permission: "read",
+      includes_all_repositories: true,
+      units: ["repo.code"],
+    });
+    await teamsSvc.addTeamMember(team, member.id);
+
+    const memberToken = (await mintFor(member.id, "member", "all")).plaintext;
+    const advert = await SELF.fetch("https://example.com/batorg/batrepo.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: `token ${memberToken}` },
+    });
+    expect(advert.status).toBe(200);
+    expect(advert.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+    const advertText = new TextDecoder().decode(await advert.arrayBuffer());
+    expect(advertText).toContain("refs/heads/main");
+
+    // The team predicate stays the unit of record: the shared repository-service
+    // grant resolves 'read' for the member (units_map collapse — repository.ts).
+    const row = (await repoService().getBySlug("batorg", "batrepo"))!;
+    expect(await doerRepoAccessMode(env.DB, { id: row.id, ownerId: row.ownerId }, member.id)).toBe("read");
+  });
+
   it("removeMember revokes a TWO-team member's fetch and push adverts immediately (the services sweep)", async () => {
     const fx = await seedTeamGrantFixture();
     const orgs = new OrgService(env.DB);

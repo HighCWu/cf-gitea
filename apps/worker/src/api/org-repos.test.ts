@@ -319,7 +319,7 @@ describe("POST /orgs/{org}/repos (createOrgRepo)", () => {
     expect(stored).toMatchObject({ owner_id: org.id, owner_namespace: "acme", slug: "widget", visibility: "public" });
   });
 
-  it("honors private and accepts the engine-deferred auto_init option", async () => {
+  it("honors private; auto_init lands the initial commit and flips empty (the shared CreateUserRepo half)", async () => {
     const alice = await seedUser("Alice");
     await seedOrg("Acme", alice.id);
 
@@ -331,10 +331,14 @@ describe("POST /orgs/{org}/repos (createOrgRepo)", () => {
 
     expect(res.status).toBe(201);
     const body = await res.json<Record<string, unknown>>();
-    expect(body).toMatchObject({ name: "secret", private: true });
-    // auto_init is accepted per the contract and deferred to the engine
-    // commit-builder wave (SPEC-0004 §3.4) — the repo stays empty.
-    expect(body.empty).toBe(true);
+    expect(body).toMatchObject({ name: "secret", private: true, empty: false });
+    // Upstream CreateUserRepo(ctx, org.AsUser(), *opt) (repo.go:493): the
+    // initial commit lands through the engine on refs/heads/<default_branch>
+    // and the row's is_empty flips.
+    const stored = await env.DB.prepare(
+      "SELECT is_empty, default_branch FROM repositories WHERE slug = 'secret'",
+    ).first<{ is_empty: number; default_branch: string }>();
+    expect(stored).toMatchObject({ is_empty: 0, default_branch: "trunk" });
   });
 
   it("walks upstream's guard order: missing org 404 → invisible org 404 → grant 403 (exact message)", async () => {
