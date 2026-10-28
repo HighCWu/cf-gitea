@@ -173,7 +173,7 @@ reclaims staging + non-`active` rows.
 Fixtures: 5 MiB / 42 MiB / 500 MiB packs. Metrics per run: clone MB/s, push wall time +
 CPU-ms, p95 read latency, peak memory, subrequest counts. First merge records the
 baseline; CI fails on >10 % regression — with tolerance classes (as-built
-2026-10-28, the calibration commit): fixed-overhead wall metrics (push/fetch
+2026-10-28, the calibration commit `f7abaa8`): fixed-overhead wall metrics (push/fetch
 walls as median-of-3, inforefs p50/p95) fail only on >10 % AND >150 ms absolute
 (single-shot noise on shared runners swings 73 %+; byte metrics stay pct-only —
 they are byte-exact across hosts and carry the teeth). Reference-repo numbers (g1t's 4x pack bloat,

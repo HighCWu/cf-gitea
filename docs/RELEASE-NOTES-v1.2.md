@@ -570,7 +570,8 @@ half; the user-visibility UI half and the compare-empty page arm verified
 already pinned, no gap).
 
 **PENDING — the orchestrator finalizes these lines after the deploy
-freezes:** migration **0037** (the P2 sweep + the verified-dead drops; not
+freezes** (superseded — 0037 landed `7dc607f`; see the sixth addendum):
+migration **0037** (the P2 sweep + the verified-dead drops; not
 yet in tree) and **RD24** (payload **0036 + 0037**; verdict arm
 **`fw-org-member-preaccess`** — the fixwave battery's post-deploy
 discriminator, `scripts/deploy-probes.mjs`). §4 re-check: no line retired —

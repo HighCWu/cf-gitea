@@ -99,12 +99,17 @@ cached-plan and DDL-`exec()` platform facts, the witness protocol — is
   the veto witness (was IN FLIGHT at this ledger's reference HEAD
   `7c3b7c4`; content matched the orchestrator's brief — the audit's P2
   tier plus the removal of dead indexes).
-- **RD24 deploy — PENDING.** Payload: migrations 0036 + 0037 (both
-  post-RD23 landings ride it). Verdict arm per the orchestrator: the
-  fixwave-parity battery's `fw-org-member-preaccess` check going green.
-- **Evidence appends — PENDING.** The RD23 block in
-  `docs/design/p0-evidence.md` (tail currently ends at REDEPLOY22,
-  `p0-evidence.md:3253`) and the RELEASE-NOTES fifth addendum.
+- **RD24 deploy — DONE** (was PENDING at this ledger's reference HEAD
+  `7c3b7c4`). Payload as stated: migrations 0036 + 0037, both applied
+  remote. Deploy chain 910a6aa4 → fd571f35 → 1235b4d0 (wrangler version
+  ids) — the REDEPLOY24 LIVE block, `p0-evidence.md:3305`. The verdict
+  arm resolved: `fw-org-member-preaccess` GREEN, first recorded at RD24b
+  `1235b4d0` (`p0-evidence.md:3343`) — §6's flagged tension below is
+  answered by that discriminator sentence.
+- **Evidence appends — DONE.** The RD23 block landed (REDEPLOY23 LIVE,
+  `p0-evidence.md:3255`, including the honest "GO commit NOT RECORDED"
+  mark) and the RELEASE-NOTES fifth addendum landed (its PENDING block
+  since superseded — see the sixth addendum in the same doc).
 
 One tension flagged for the orchestrator (recorded, not resolved, per this
 ledger's verify-then-write rule): `29e3a43`'s own comment calls

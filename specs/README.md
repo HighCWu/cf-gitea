@@ -50,7 +50,7 @@ direction), [ADR-0002](../docs/decisions/0002-contract-freeze.md) (compatibility
 freeze + re-pin procedure), [ADR-0005](../docs/decisions/0005-verification-strategy.md)
 (verification strategy: layer stack + hard-won rules), [webhook event coverage
 audit](../docs/compat/webhook-event-coverage.md) (upstream pin vs. emitted set — 23/26
-wire types fully emitted, refreshed through 7242825), [release notes
+wire types fully emitted, refreshed through af8c18c), [release notes
 v1.0](../docs/RELEASE-NOTES-v1.0.md) (df973a4; **v1.0 tagged at a2ecd92**, 2026-10-25),
 [tech-route survey](../docs/research/tech-route-survey.md),
 [frozen contract](../apps/worker/src/compat/contract/) (guarded by `pnpm check:contract`).

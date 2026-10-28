@@ -3436,7 +3436,19 @@ at HEAD `ada3b73`. The window opens ONLY from a quiet, committed tree
   `f33860e` (from run 40699376701's `bench-ci-baseline` artifact) — the
   benchmark job's >10% CI-vs-CI gate is ARMED, so the window's push takes
   the COMPARE branch (the record-only notice is gone): observed verdict
-  **pending the next CI run on the bump commit** (a >10% regression FAILS CI — record it here if it fires).
+  **GREEN — run 40726243702's `benchmark` job (1 m 16 s) held the COMPARE
+  branch on the bumped runtime** (head `60c65e1`, queued 2026-10-28
+  16:28Z; a >10% regression FAILS CI — it did not fire). The WARN rides
+  the green, recorded here: the gate flipped red→green across TWO runs of
+  identical worker code — the bump commit's own run 40720149343
+  (`873da29`, a docs-only delta from `60c65e1`) FAILED the same job at
+  15:51Z, 37 minutes earlier; the failing metric is unrecorded (its job
+  log not retrievable via `gh`), the calibration absorbed it — runner
+  noise straddling the calibrated thresholds, exactly the class
+  `f7abaa8`'s own commit message describes ("single-shot noise on shared
+  runners swings 73 %+"). If the pattern repeats on future runs, the
+  wall-metric tolerance classes deserve a re-look (the byte metrics carry
+  the teeth and are byte-exact across hosts).
 - **The sweep's NEW ARM — the orphan fix's first production sweep (this
   window's own verification arm).** `ada3b73` (the sweep's orphan escape —
   the join-side NULL, not the column-side; the demo day-one finding's fix)
