@@ -18,6 +18,11 @@
  * repositories.test.ts harness) so the env can carry the armed gate; the
  * push-create arms drive the real worker `fetch` with an armed env copy
  * (SELF cannot vary bindings).
+ *
+ * Call site 1b is the M2 known-gap fold: `POST /orgs/{org}/repos` rides the
+ * same helper with the ORG as the quota owner (upstream hands the org to the
+ * create — `CreateUserRepo(ctx, org.AsUser(), *opt)`, repo.go:493 — and
+ * CanCreateRepoIn counts the OWNER's repos), mapped to the same declared 403.
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
@@ -29,6 +34,7 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "../../auth/testing/seeds";
 import { repositories, users } from "../../db/schema";
 import { buildPack, buildReceivePackBody } from "../../repos/testing/git-pack";
+import { OrgService } from "../../services/orgs/orgs";
 import { STUB_USER, createStubAuthResolver } from "../auth";
 import { createApiRouter } from "../router";
 import { assertDemoRepoQuota, DEMO_MAX_REPOS_PER_OWNER, DemoRepoQuotaError } from "../../services/demo-quota";
@@ -84,6 +90,21 @@ async function countRepos(ownerId: number): Promise<number> {
     .where(eq(repositories.ownerId, ownerId))
     .all();
   return rows.length;
+}
+
+/** The stub resolver's fixed identity (id 1) must exist as a D1 row —
+ *  routes read it (the users row carries is_admin). */
+async function seedStubRow(isAdmin: boolean): Promise<void> {
+  await drizzle(env.DB)
+    .insert(users)
+    .values({
+      id: 1,
+      username: STUB_USER.login ?? "cf-gitea-stub",
+      usernameLower: (STUB_USER.login ?? "cf-gitea-stub").toLowerCase(),
+      isAdmin,
+      status: "active",
+      createdAt: new Date(0),
+    });
 }
 
 beforeEach(async () => {
@@ -185,21 +206,6 @@ describe("the quota at POST /user/repos (§4.3 call site 1)", () => {
     return res;
   }
 
-  /** The stub resolver's fixed identity (id 1) must exist as a D1 row —
-   *  findDoerRow reads it (the users row carries is_admin). */
-  async function seedStubRow(isAdmin: boolean): Promise<void> {
-    await drizzle(env.DB)
-      .insert(users)
-      .values({
-        id: 1,
-        username: STUB_USER.login ?? "cf-gitea-stub",
-        usernameLower: (STUB_USER.login ?? "cf-gitea-stub").toLowerCase(),
-        isAdmin,
-        status: "active",
-        createdAt: new Date(0),
-      });
-  }
-
   it("gate OFF (the deployed default): create runs exactly as before — 201, zero checks", async () => {
     await seedStubRow(false);
     await seedQuotaRepos(1, "cf-gitea-stub", DEMO_MAX_REPOS_PER_OWNER + 2); // past the cap — irrelevant when off
@@ -245,6 +251,100 @@ describe("the quota at POST /user/repos (§4.3 call site 1)", () => {
     const res = await apiCreate({ name: "admin-fixture", private: true }, armedEnv("true"), adminAuth);
     expect(res.status).toBe(201);
     expect(await countRepos(2)).toBe(DEMO_MAX_REPOS_PER_OWNER + 3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Call site 1b — the org arm (POST /orgs/{org}/repos, the M2 known-gap fold)
+// ---------------------------------------------------------------------------
+
+describe("the quota at POST /orgs/{org}/repos (§4.3 — the M2 known-gap fold)", () => {
+  const apiApp = createApiRouter();
+
+  /** The org route's exact doer shape (services/org-repos.ts `OrgDoer`) at
+   *  the helper boundary: gate off → ZERO reads even with the owner being
+   *  the org id. (The route-level gate-off arm below pins the wire behavior;
+   *  the route's own guards read D1 legitimately, so the tripwire rides the
+   *  helper — the org arm shares the one helper, one gate, one query.) */
+  it("gate OFF (the route's OrgDoer shape, org id as owner): ZERO D1 reads — the tripwire never fires", async () => {
+    const orgDoer: { id: number; isAdmin: boolean } = { id: 7, isAdmin: false };
+    await expect(assertDemoRepoQuota({}, d1ThatThrows(), orgDoer, 7)).resolves.toBeUndefined();
+  });
+
+  /** The stub doer (id 1) owns the org, so the grant guard passes; the
+   *  seeded repos ride the ORG's id — the quota owner (the create assigns
+   *  `owner: { id: org.id, … }`, orgs ARE owners). Route paths are relative
+   *  to the /api/v1 mount (the call-site-1 fetch-shape note applies). */
+  async function seedFullOrg(repoCount: number): Promise<number> {
+    await seedStubRow(false);
+    const org = await new OrgService(env.DB).createOrg({ name: "Acme", ownerId: 1 });
+    if (repoCount > 0) await seedQuotaRepos(org.id, "acme", repoCount);
+    return org.id;
+  }
+
+  async function orgCreate(
+    envOverride?: Env,
+    auth?: ReturnType<typeof createStubAuthResolver>,
+  ): Promise<Response> {
+    const app = auth === undefined ? apiApp : createApiRouter({ auth });
+    const ctx = createExecutionContext();
+    const res = await app.fetch(
+      new Request("https://example.com/orgs/acme/repos", {
+        method: "POST",
+        headers: { authorization: "token stub-token", "content-type": "application/json" },
+        body: JSON.stringify({ name: "org-quota-probe", private: true }),
+      }),
+      envOverride ?? env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    return res;
+  }
+
+  it("gate OFF (the deployed default): a past-cap org create still lands — 201, zero interference (§2)", async () => {
+    const orgId = await seedFullOrg(DEMO_MAX_REPOS_PER_OWNER + 2);
+    const res = await orgCreate();
+    expect(res.status).toBe(201);
+    expect(await countRepos(orgId)).toBe(DEMO_MAX_REPOS_PER_OWNER + 3);
+  });
+
+  it("armed, under the cap: 201, the row is org-owned", async () => {
+    const orgId = await seedFullOrg(DEMO_MAX_REPOS_PER_OWNER - 1);
+    const res = await orgCreate(armedEnv("true"));
+    expect(res.status).toBe(201);
+    expect(await countRepos(orgId)).toBe(DEMO_MAX_REPOS_PER_OWNER);
+  });
+
+  it("armed, at the cap: upstream's 403 + ErrReachLimitOfRepo.Error() verbatim — nothing created (the count is the ORG's)", async () => {
+    const orgId = await seedFullOrg(DEMO_MAX_REPOS_PER_OWNER);
+    const res = await orgCreate(armedEnv("true"));
+    expect(res.status).toBe(403);
+    const body = await res.json<{ message: string; url: string }>();
+    expect(body.message).toBe(`user has reached maximum limit of repositories [limit: ${DEMO_MAX_REPOS_PER_OWNER}]`);
+    expect(body.url).toBe("https://example.com/api/swagger");
+    expect(await countRepos(orgId)).toBe(DEMO_MAX_REPOS_PER_OWNER);
+  });
+
+  it("armed, ADMIN doer into a past-cap org: the upstream bypass — 201 (the grant guard's admin arm passes too)", async () => {
+    const orgId = await seedFullOrg(DEMO_MAX_REPOS_PER_OWNER + 2); // already past the cap
+    // A non-member site admin: requireCanCreateOrgRepo's grant arm
+    // short-circuits on isAdmin (fork.go:97-108) and the quota's bypass is
+    // the same doer flag (user.go:289-291) — the repo still lands ORG-owned.
+    const adminAuth = {
+      resolveToken: () =>
+        Promise.resolve({
+          ...STUB_USER,
+          id: 2,
+          login: "demo-admin",
+          is_admin: true,
+        }),
+    };
+    await drizzle(env.DB)
+      .insert(users)
+      .values({ id: 2, username: "demo-admin", usernameLower: "demo-admin", isAdmin: true, status: "active", createdAt: new Date(0) });
+    const res = await orgCreate(armedEnv("true"), adminAuth);
+    expect(res.status).toBe(201);
+    expect(await countRepos(orgId)).toBe(DEMO_MAX_REPOS_PER_OWNER + 3);
   });
 });
 

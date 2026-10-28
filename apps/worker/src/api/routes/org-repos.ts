@@ -4,6 +4,7 @@ import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
 import { RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
+import { assertDemoRepoQuota, DemoRepoQuotaError } from "../../services/demo-quota";
 import { OrgService } from "../../services/orgs/orgs";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { ApiError, apiErrorSchema } from "../errors";
@@ -123,7 +124,9 @@ const orgReposRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
  * `POST /orgs/{org}/repos` — 201 + the Repository at owner permissions.
  * Guard order (upstream `prepareDoerCreateRepoInOrg` + `CreateUserRepo`):
  * org missing/invisible → 404; create grant missing → 403; duplicate name →
- * 409; invalid/reserved name → 422. `auto_init` and the template options are
+ * 409; invalid/reserved name → 422. The §4.3 demo quota rides the declared
+ * 403 arm (the M2 known-gap fold — the user-repos note applies, with the
+ * ORG as the quota owner). `auto_init` and the template options are
  * accepted per the contract and deferred to the engine commit-builder wave
  * (SPEC-0004 §3.4) — the landed repos service creates the registry row with
  * instance defaults.
@@ -194,6 +197,25 @@ export function registerOrgRoutes(
     const doer = orgDoerOf(c.get("authUser"));
     // Guard chain in upstream order: 404 (missing/invisible) → 403 (grant).
     const org = await requireCanCreateOrgRepo(c.env.DB, orgName, doer);
+    // SPEC-0014 §4.3 (the M2 known-gap fold) — the same gated per-owner quota
+    // as POST /user/repos, with the owner being the ORG: upstream hands the
+    // org to the create (`CreateUserRepo(ctx, org.AsUser(), *opt)`,
+    // repo.go:493) and `CanCreateRepoIn` counts the OWNER's repositories
+    // under the DOER's admin bypass (user.go:285-295) — the create below
+    // assigns `owner: { id: org.id, … }`, so the assert rides `org.id`
+    // (orgs ARE owners; a visitor cannot route around the cap via own-orgs).
+    // Same mapping as user-repos.ts: the refusal unwraps to
+    // ErrPermissionDenied → 403 + err.Error() (repo.go:263-264); the
+    // admin-doer bypass rides the helper. Gate off → zero reads, zero checks
+    // (the §2 invariant).
+    try {
+      await assertDemoRepoQuota(c.env, c.env.DB, doer, org.id);
+    } catch (error) {
+      if (error instanceof DemoRepoQuotaError) {
+        throw new ApiError(403, error.message);
+      }
+      throw error;
+    }
     const form = c.req.valid("json");
     // The engine registry rides the create (REDEPLOY8 — the user-repos note):
     // bare construction skips seedRepoExtras' upsert and the org repo 404s on
