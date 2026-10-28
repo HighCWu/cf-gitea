@@ -28,12 +28,12 @@ jobs:
       # gitea/ submodule: gen:icons reads the committed octicon svg bodies
       # (SPEC-0008 §2.4.1) to emit the gitignored icons.generated.ts.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       # wrangler.jsonc is gitignored (example-file model) — restore it from
       # the committed template so wrangler types / vite tests / dev can read it.
       - name: Wrangler config from example
         run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
-        with:
-          submodules: recursive
       - uses: pnpm/action-setup@v4 # version comes from package.json packageManager
       - uses: actions/setup-node@v4
         with:
@@ -101,14 +101,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # wrangler.jsonc is gitignored (example-file model) — restore it from
-      # the committed template so wrangler types / vite tests / dev can read it.
-      - name: Wrangler config from example
-        run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
         with:
           # gen:icons reads committed svg bodies from the gitea/ submodule;
           # required once src/index.ts imports ./ui (predev regenerates).
           submodules: recursive
+      # wrangler.jsonc is gitignored (example-file model) — restore it from
+      # the committed template so wrangler types / vite tests / dev can read it.
+      - name: Wrangler config from example
+        run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -201,13 +201,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Same as e2e: the dev server loads the ui module graph once wired.
+          submodules: recursive
       # wrangler.jsonc is gitignored (example-file model) — restore it from
       # the committed template so wrangler types / vite tests / dev can read it.
       - name: Wrangler config from example
         run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
-        with:
-          # Same as e2e: the dev server loads the ui module graph once wired.
-          submodules: recursive
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -248,12 +248,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       # wrangler.jsonc is gitignored (example-file model) — restore it from
       # the committed template so wrangler types / vite tests / dev can read it.
       - name: Wrangler config from example
         run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
-        with:
-          submodules: recursive
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -288,14 +288,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # wrangler.jsonc is gitignored (example-file model) — restore it from
-      # the committed template so wrangler types / vite tests / dev can read it.
-      - name: Wrangler config from example
-        run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
         with:
           # gen:icons reads committed svg bodies from the gitea/ submodule
           # (same as the e2e job).
           submodules: recursive
+      # wrangler.jsonc is gitignored (example-file model) — restore it from
+      # the committed template so wrangler types / vite tests / dev can read it.
+      - name: Wrangler config from example
+        run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -372,14 +372,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      # wrangler.jsonc is gitignored (example-file model) — restore it from
-      # the committed template so wrangler types / vite tests / dev can read it.
-      - name: Wrangler config from example
-        run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
         with:
           # Same as e2e: the suite's dev server (pnpm dev, whose predev
           # regenerates icons) loads the ui module graph from gitea/.
           submodules: recursive
+      # wrangler.jsonc is gitignored (example-file model) — restore it from
+      # the committed template so wrangler types / vite tests / dev can read it.
+      - name: Wrangler config from example
+        run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -436,14 +436,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      # wrangler.jsonc is gitignored (example-file model) — restore it from
-      # the committed template so wrangler types / vite tests / dev can read it.
-      - name: Wrangler config from example
-        run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
         with:
           # Same as e2e: the dev server loads the ui module graph (predev
           # regenerates icons; the explicit step below keeps the e2e ordering).
           submodules: recursive
+      # wrangler.jsonc is gitignored (example-file model) — restore it from
+      # the committed template so wrangler types / vite tests / dev can read it.
+      - name: Wrangler config from example
+        run: cp apps/worker/wrangler.jsonc.example apps/worker/wrangler.jsonc
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
