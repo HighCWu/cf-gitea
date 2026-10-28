@@ -27,7 +27,11 @@
  * enrichment, head_commit, compare_url), the delete event, the
  * pull_request_sync family (an updated PR head branch syncs every open
  * github-flow PR on it with the delta; created refs, non-PR branches and
- * closed PRs stay silent; the subscription gates), the refs/pull/*
+ * closed PRs stay silent; the subscription gates), the branch-delete cascade
+ * (the PR closes with the type-11 comment AND the pull_request closed webhook
+ * of upstream's IssueChangeStatus path — exactly once per transitioned PR,
+ * the activity-feed close row riding along; an already-closed PR stays
+ * silent), the refs/pull/*
  * exclusion on a mixed receive, the subscription gates (push_only,
  * branch_filter, inactive, no hooks), owner-level hook resolution, the
  * never-fail-the-push guarantees (the engine's hook catch + the fan-out's
@@ -58,7 +62,8 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { findRepositoryById } from "../api/services/repository";
 import { TeamsService } from "../api/routes/org-teams";
-import { comments, issues, PRStatus, protectedBranches, pullRequests, pullReviews, repositories, ReviewType, users, webhookDeliveries, webhooks } from "../db/schema";
+import { actions, comments, issues, PRStatus, protectedBranches, pullRequests, pullReviews, repositories, ReviewType, users, webhookDeliveries, webhooks } from "../db/schema";
+import { ActionType } from "../api/services/activity-feeds";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { authorize } from "../git-http/authorize";
@@ -188,10 +193,12 @@ beforeEach(async () => {
   for (const table of [
     // Team tables first (gate.test.ts's sweep order); org_members cascades
     // with the users delete below, but team_repo_access.repo_id declares no
-    // FK and is swept explicitly.
+    // FK and is swept explicitly. The activity-feed rows the branch-delete
+    // cascade writes go before their FK targets too.
     "team_repo_access",
     "team_members",
     "teams",
+    "action",
     "personal_access_tokens",
     "repo_units",
     "repo_transfer",
@@ -1349,6 +1356,80 @@ describe("the PR-head sync arms — ref CAS, head_sha, re-check, comment (SPEC-0
     const pushRows = await pushComments(issueId);
     expect(pushRows).toHaveLength(1);
     expect(JSON.parse(pushRows[0]!.content ?? "{}")).toEqual({ is_force_push: false, commit_ids: [after] });
+  });
+
+  it("the branch-delete close fires the pull_request closed webhook exactly once (IssueChangeStatus) with the feed row", async () => {
+    const { row, token, aliceId, index } = await seedAdvancedPrHead("syncclose", "sync close");
+    // The pull_request-subscribed hook (the closed event) + an issues-scoped
+    // control hook (a PR close is a pull_request event upstream —
+    // notifier.go:252-264 — the IsPull discriminant must keep the two apart).
+    const prHook = await seedHook({ repoId: row.id, events: { choose_events: true, events: { pull_request: true } } });
+    const issuesHook = await seedHook({ repoId: row.id, events: { choose_events: true, events: { issues: true } } });
+
+    const featureTip = (await env.REPO.getByName(`${row.ownerNamespace}/${row.slug}`).listRefs()).refs.find(
+      (r) => r.name === "refs/heads/feature",
+    )!.target;
+    const deleteResponse = await pushThroughGate(row, wiredEngine, [{ old: featureTip, oid: PUSH_ZERO_OID, ref: "refs/heads/feature" }], null, token);
+    expect(deleteResponse.status).toBe(200);
+
+    // Exactly one pull_request delivery on the PR hook; the issues-scoped
+    // hook never sees it.
+    const prRows = (await deliveries()).filter((r) => r.hookId === prHook);
+    expect(prRows.map((r) => r.eventType)).toEqual(["pull_request"]);
+    expect(prRows[0]!.eventGroup).toBe("pull_request");
+    expect((await deliveries()).some((r) => r.hookId === issuesHook)).toBe(false);
+    // The IssueChangeStatus payload (notifier.go:252-264): action closed, the
+    // BASE repository render, the moved PR row in payload mode, commit_id ""
+    // (upstream passes no commit on the branch-delete path), sender = the
+    // authenticated pusher (the push family's identity seam).
+    const payload = JSON.parse(prRows[0]!.payloadContent) as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual(["action", "commit_id", "number", "pull_request", "repository", "sender"]);
+    expect(payload.action).toBe("closed");
+    expect(payload.number).toBe(index);
+    expect(payload.commit_id).toBe("");
+    expect(payload.repository).toMatchObject({ full_name: `${row.ownerNamespace}/${row.slug}` });
+    expect((payload.pull_request as { state: string; merged: boolean }).state).toBe("closed");
+    expect((payload.sender as { login: string }).login).toBe("Alice");
+
+    // The actionNotifier half (feed/notifier.go:66-97): close_pull_request
+    // with the "index|" content, attributed to the pusher.
+    const feedRows = await drizzle(env.DB).select().from(actions).all();
+    expect(feedRows).toHaveLength(1);
+    expect(feedRows[0]!.opType).toBe(ActionType.ClosePullRequest);
+    expect(feedRows[0]!.content).toBe(`${index}|`);
+    expect(feedRows[0]!.actUserId).toBe(aliceId);
+  });
+
+  it("an already-closed PR's head-branch deletion stays webhook-silent (no close, no feed row)", async () => {
+    const { row, token } = await seedRepoWithToken("syncclosedsilent");
+    const { issueId } = await seedPull(row.id, "closed pr", { headBranch: "feature", baseBranch: "main", closed: true });
+    const prHook = await seedHook({ repoId: row.id, events: { choose_events: true, events: { pull_request: true } } });
+
+    const initial = await buildChainPack(null, [
+      { message: "seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000340 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/feature" }], initial.pack, token)).status,
+    ).toBe(200);
+    await clearDeliveries();
+
+    const featureTip = (await env.REPO.getByName(`${row.ownerNamespace}/${row.slug}`).listRefs()).refs.find(
+      (r) => r.name === "refs/heads/feature",
+    )!.target;
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: featureTip, oid: PUSH_ZERO_OID, ref: "refs/heads/feature" }], null, token)).status,
+    ).toBe(200);
+
+    // The open-PR head lookup (GetUnmergedPullRequestsByHeadInfo) filters
+    // closed rows: no close webhook, no delete-branch comment, no feed row.
+    // (The type-2 close comment predates the push — seedPull's closed arm.)
+    expect((await deliveries()).filter((r) => r.hookId === prHook)).toHaveLength(0);
+    expect(
+      (await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueId)).all()).filter(
+        (r) => r.type === CommentType.DeleteBranch,
+      ),
+    ).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(actions).all()).toHaveLength(0);
   });
 
   it("a non-PR branch push performs no sync arms", async () => {

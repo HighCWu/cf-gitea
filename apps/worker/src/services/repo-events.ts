@@ -72,6 +72,20 @@ export interface RepoEventRequest {
   readonly executionCtx: RepoEventExecution;
 }
 
+/**
+ * The bindings the repo-family fan-out actually touches — the WebhookPushEnv
+ * pattern (a wrangler rename surfaces as a keyof error HERE instead of hiding
+ * behind a stale generated file). The generated `Env` satisfies this
+ * structurally; the narrow shape lets the off-response callers that carry no
+ * full bindings (the push-create settle's varless APP_URL view,
+ * git-http/gate.ts) reach the inline emitter without a cast.
+ */
+export type RepoEventEnv = Pick<Env, "DB"> & {
+  /** The `WEBHOOK_DELIVERY` producer probe reads this structurally; a
+   *  binding gap degrades to `pending` delivery rows. */
+  WEBHOOK_DELIVERY?: unknown;
+};
+
 /** One repo-family webhook event: where, who owns the repo, what, and the
  *  §2.7 payload (already rendered — see repositoryEventPayload/forkEventPayload). */
 export interface RepoEventEmission {
@@ -84,7 +98,7 @@ export interface RepoEventEmission {
 }
 
 /** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired. */
-function webhookDeliveryQueue(env: Env): {
+function webhookDeliveryQueue(env: RepoEventEnv): {
   sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown>;
 } | null {
   const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
@@ -160,7 +174,7 @@ export function repoActionDraft(emission: RepoEventEmission): ActionDraft | null
 
 /** Best-effort action-row write — caught, logged, never propagated (the
  *  webhook fan-out posture; a lost insert is a feed gap, not an API error). */
-async function recordRepoAction(env: Env, emission: RepoEventEmission): Promise<void> {
+async function recordRepoAction(env: RepoEventEnv, emission: RepoEventEmission): Promise<void> {
   const draft = repoActionDraft(emission);
   if (draft === null) return;
   try {
@@ -171,7 +185,7 @@ async function recordRepoAction(env: Env, emission: RepoEventEmission): Promise<
 }
 
 async function fanOut(
-  env: Env,
+  env: RepoEventEnv,
   emission: RepoEventEmission,
   enqueue: ((deliveryIds: number[]) => Promise<void>) | undefined,
   logLabel: string,
@@ -228,9 +242,10 @@ export async function emitRepoEvent(request: RepoEventRequest, emission: RepoEve
  * The off-response variant for callers with no hono request: the push-create
  * settle already runs inside `ctx.waitUntil` and the fork consumer inside a
  * queue invocation (15-minute wall budget), so the Queue batch is AWAITED
- * inline here. Same failure posture: caught, logged, never propagated.
+ * inline here. Same failure posture: caught, logged, never propagated. Takes
+ * the narrow `RepoEventEnv` — the settle's varless bindings view passes as-is.
  */
-export async function emitRepoEventInline(env: Env, emission: RepoEventEmission): Promise<void> {
+export async function emitRepoEventInline(env: RepoEventEnv, emission: RepoEventEmission): Promise<void> {
   const queue = webhookDeliveryQueue(env);
   await fanOut(
     env,

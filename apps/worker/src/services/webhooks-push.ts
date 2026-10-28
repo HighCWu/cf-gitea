@@ -108,7 +108,10 @@
  * and then the pre-existing `pull_request_sync` webhook (last, like upstream
  * notify.PullRequestSynchronized). A DELETED head branch takes upstream's
  * AdjustPullsCausedByBranchDeleted arm instead (pull.go:622-655): the open
- * PRs on it close, each with the type-11 delete-branch comment.
+ * PRs on it close, each with the type-11 delete-branch comment and — for an
+ * actual transition — the `pull_request` action=closed webhook of upstream's
+ * IssueChangeStatus path (pull.go:625 → status.go:43 → notifier.go:249-271),
+ * routed through the PR's BASE repository.
  */
 
 import type {
@@ -123,6 +126,7 @@ import type {
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
+import { ActionType, recordAction } from "../api/services/activity-feeds";
 import { toApiPullRequest } from "../api/services/pulls";
 import { toPayloadCommit, usernamesByEmail } from "../api/services/git-models";
 import { compareUrl } from "../api/services/hooks";
@@ -414,7 +418,7 @@ export async function emitPushFamilyUpdates(
           // pushDeleteBranch order, push.go:296-311: notify DeleteRef, THEN
           // AdjustPullsCausedByBranchDeleted).
           if (update.ref.startsWith("refs/heads/")) {
-            await closePullRequestsOfDeletedBranch(env, pair, update, options, log);
+            await closePullRequestsOfDeletedBranch(env, pair, identity, origin, update, options, log);
           }
           continue;
         }
@@ -930,15 +934,24 @@ async function reconcileForcePushComments(db: D1Database, issueId: number, newCo
  * every open unmerged github-flow PR whose head it is, each with the type-11
  * delete-branch comment (AddDeletePRBranchComment, issue_update.go:250-264 —
  * `old_ref` carries the branch name). Already-closed PRs are tolerated
- * (upstream skips IsErrIssueIsClosed). DEVIATION: the close webhook
- * (upstream IssueChangeStatus) is deferred — the payload builder lives in the
- * pulls route module; the close itself lands through IssuesService so every
- * read renders closed. The engine's refs/pull/N/head survives, like upstream
- * (only merged-PR cleanup deletes it).
+ * (upstream skips IsErrIssueIsClosed). A close that TRANSITIONED also fires
+ * the `pull_request` action=closed webhook upstream's arm reaches through
+ * issue_service.CloseIssue → notify IssueChangeStatus (pull.go:625 →
+ * status.go:43 → notifier.go:249-271): the payload renders the BASE
+ * repository (EventSource{Repository: issue.Repo}) with ToPayloadPullRequest
+ * of the moved row, sender = the doer (the pusher identity), commit_id ""
+ * (upstream passes no commit on this path) — emitted only for an actual
+ * transition (upstream's `err == nil` gate), exactly once per closed PR, and
+ * recorded into the activity feed like every IssueChangeStatus emission
+ * (feed/notifier.go:66-97, close_pull_request "index|"). The engine's
+ * refs/pull/N/head survives, like upstream (only merged-PR cleanup deletes
+ * it).
  */
 async function closePullRequestsOfDeletedBranch(
   env: WebhookPushEnv,
   pushedPair: RepositoryWithOwner,
+  identity: WebhookPushIdentity,
+  origin: string,
   update: PushRefUpdate,
   options: WebhookPushOptions,
   log: (message: string) => void,
@@ -946,11 +959,13 @@ async function closePullRequestsOfDeletedBranch(
   const branch = update.ref.slice("refs/heads/".length);
   const heads = await openPullRequestsByHeadInfo(env.DB, pushedPair.repo.id, branch, log, pushedPair);
   const now = options.now ?? new Date();
+  const queue = webhookDeliveryQueue(env);
   for (const head of heads) {
     try {
       const service = new IssuesService(env.DB);
+      let closed: typeof issues.$inferSelect | null = null;
       try {
-        await service.closeIssue(head.issue.id, { actorId: options.pusherId ?? null, now });
+        closed = await service.closeIssue(head.issue.id, { actorId: options.pusherId ?? null, now });
       } catch {
         // already closed — upstream tolerates IsErrIssueIsClosed (pull.go:646)
       }
@@ -970,6 +985,74 @@ async function closePullRequestsOfDeletedBranch(
           .set({ numComments: sql`num_comments + 1`, updatedAt: now })
           .where(eq(issues.id, head.issue.id)),
       ]);
+      // The deferred close webhook — IssueChangeStatus's payload render, fired
+      // only when this cascade TRANSITIONED the PR (upstream's `err == nil`
+      // gate), routed through the PR's BASE repository (EventSource). Same-repo
+      // heads reuse the pushed pair in hand; fork heads resolve their base.
+      if (closed !== null) {
+        const basePair =
+          head.pullRequest.baseRepoId === pushedPair.repo.id
+            ? pushedPair
+            : await findRepositoryById(env.DB, head.pullRequest.baseRepoId);
+        if (basePair !== null) {
+          const viewer: Viewer = { origin, requester: null };
+          const payload = {
+            action: "closed",
+            number: head.issue.index,
+            pull_request: await toApiPullRequest(env.DB, viewer, basePair, closed, head.pullRequest, "payload"),
+            repository: toApiRepository(viewer, basePair),
+            sender: identity.sender,
+            commit_id: "",
+          };
+          try {
+            await emitWebhookDeliveries(
+              env.DB,
+              { repoId: basePair.repo.id, ownerId: basePair.owner.id, eventType: "pull_request", payload, refName: null },
+              {
+                ...(queue !== null
+                  ? {
+                      enqueue: async (deliveryIds: number[]): Promise<void> => {
+                        await queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } })));
+                      },
+                    }
+                  : {}),
+                now,
+              },
+            );
+          } catch (error) {
+            log(
+              `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: close webhook failed for PR #${head.issue.index}: ` +
+                `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          // The actionNotifier half of IssueChangeStatus (feed/notifier.go:66-97)
+          // — close_pull_request "index|", same caught-and-logged posture.
+          const senderRecord = typeof identity.sender === "object" && identity.sender !== null ? (identity.sender as Record<string, unknown>) : null;
+          const actUserId = typeof senderRecord?.id === "number" ? senderRecord.id : null;
+          if (actUserId !== null) {
+            try {
+              await recordAction(env.DB, {
+                actUserId,
+                repoId: basePair.repo.id,
+                opType: ActionType.ClosePullRequest,
+                isPrivate: basePair.repo.visibility === "private",
+                content: `${head.issue.index}|`,
+                createdAt: now,
+              });
+            } catch (error) {
+              log(
+                `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: close action row failed for PR #${head.issue.index}: ` +
+                  `${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+          }
+        } else {
+          log(
+            `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: PR #${head.issue.index} base repo ` +
+              `${head.pullRequest.baseRepoId} missing — close webhook skipped`,
+          );
+        }
+      }
     } catch (error) {
       log(
         `[push-webhook] ${pushedPair.repo.ownerNamespace}/${pushedPair.repo.slug}: branch-delete cascade failed for PR #${head.issue.index}: ` +

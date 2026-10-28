@@ -97,7 +97,7 @@ import { repoMirrors, repositories } from "../../db/schema";
 import { authorize } from "../../git-http/authorize";
 import { markGateCleared } from "../../git-http/gate";
 import { parseHostPolicy, type HostPolicy } from "../../webhooks/ssrf";
-import { emitPushFamilyUpdates, engineWalk, type WebhookPushIdentity } from "../webhooks-push";
+import { emitPushFamilyUpdates, engineWalk, appOrigin, type WebhookPushIdentity } from "../webhooks-push";
 import { syncRepoLicensesForDefaultBranch } from "../repo-licenses";
 import { engineName, type RepoRow } from "../../repos/service";
 import {
@@ -141,8 +141,8 @@ export interface MirrorSyncEnv extends Env {
   MIRROR_EGRESS_MODE?: string;
   // MIRROR_ALLOWED_HOST_LIST / MIRROR_CREDENTIAL_KEY / APP_URL ride the
   // inherited generated Env members (declared vars/secrets — required); the
-  // guards in mirrorEgressPolicy/mirrorAuthHeader/instanceOrigin stay as
-  // fail-closed defense, and MIRROR_SYNC_QUEUE likewise (required binding,
+  // guards in mirrorEgressPolicy/mirrorAuthHeader stay as fail-closed
+  // defense, and MIRROR_SYNC_QUEUE likewise (required binding,
   // enqueueDueMirrorSyncs re-guards at runtime).
 }
 
@@ -351,23 +351,6 @@ async function settleMirrorFailure(db: D1Database, repoId: string, errorText: st
 // §2.7 — webhook notifications from the applied updates delta
 // ---------------------------------------------------------------------------
 
-/** Upstream's default ROOT_URL (modules/setting/server.go:119-120:
- *  `defaultAppURL := protocol + "://localhost:" + HTTPPort`, HTTPPort 3000)
- *  — an unset APP_URL behaves like a default-installed gitea, whose payloads
- *  carry localhost URLs. Upstream's AppURL additionally always carries the
- *  trailing "/" suffix (server.go:50-51); `instanceOrigin` returns it
- *  trimmed, and the one site that renders the bare AppURL (the zero-commit
- *  push event's compare_url) appends the suffix explicitly. */
-const DEFAULT_APP_URL = "http://localhost:3000";
-
-/** `setting.AppURL` equivalent for a queue consumer (no request to take an
- *  origin from): the optional APP_URL var, trailing slashes trimmed like
- *  upstream's AppURL normalization (server.go:127-137 strips default ports;
- *  a configured ROOT_URL is used verbatim otherwise). */
-function instanceOrigin(env: MirrorSyncEnv): string {
-  return (env.APP_URL ?? DEFAULT_APP_URL).replace(/\/+$/, "");
-}
-
 /**
  * The §2.7 fan-out: the push-family notifications for one sync's applied ref
  * updates, rendered by the SHARED per-ref builder — `emitPushFamilyUpdates`
@@ -416,7 +399,11 @@ async function notifyMirrorSyncDelta(env: MirrorSyncEnv, repo: RepoRow, updates:
       console.error(`[mirror-sync] ${repo.ownerNamespace}/${repo.slug}: owner row missing — webhook notifications skipped`);
       return;
     }
-    const origin = instanceOrigin(env);
+    // `setting.AppURL` for a queue consumer (no request to take an origin
+    // from): the shared appOrigin chain — the APP_URL var wins, else
+    // upstream's default ROOT_URL (webhooks-push.ts appOrigin; trailing
+    // slashes trimmed like upstream's AppURL normalization, server.go:127-137).
+    const origin = appOrigin(env);
     const viewer: Viewer = { origin, requester: null };
     const sender = apiUserFromRow(pair.owner, viewer);
     const identity: WebhookPushIdentity = {

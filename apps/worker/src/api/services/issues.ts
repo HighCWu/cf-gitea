@@ -1,5 +1,6 @@
 import { and, asc, eq, gte, inArray, lt, or, sql, type SQL } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
+import type { Context } from "hono";
 
 import {
   comments,
@@ -24,16 +25,22 @@ import {
 } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssueError } from "../../issues/errors";
+import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
 import { ApiError } from "../errors";
+import type { ApiEnv } from "../env";
 import type { Comment, Issue, TimelineComment } from "../models/issue";
 import type { User } from "../models/user";
+import { toApiPullRequest } from "./pulls";
 import { toApiMilestone } from "./milestones";
 import {
   apiRepositoryUrl,
   apiUserFromRow,
+  findRepositoryById,
   findUserByName,
   GO_ZERO_TIME,
+  toApiRepository,
+  viewerOf,
   type RepositoryWithOwner,
   type UserRow,
   type Viewer,
@@ -67,7 +74,13 @@ import {
  *   - comment edit/delete: `routers/api/v1/repo/issue_comment.go
  *     editIssueComment/deleteIssueComment` (HasContentSupport gate);
  *   - issue delete: `services/issue/issue.go deleteIssue` (the DeleteBeans
- *     cascade + DecrRepoIssueNumbers; the index counter is never rewound).
+ *     cascade + DecrRepoIssueNumbers; the index counter is never rewound)
+ *     plus its webhook pair — `services/webhook/notifier.go DeleteIssue:313`
+ *     fires the `action=deleted` Issue/PullRequest payload from exactly the
+ *     v1 DELETE route (`routers/api/v1/repo/issue.go:851`→`:886` →
+ *     `services/issue/issue.go:155`→`:183`); ours emits from the same
+ *     `deleteIssueCascade` funnel so API and any UI delete path emit
+ *     identically.
  */
 
 // ---------------------------------------------------------------------------
@@ -1391,6 +1404,161 @@ export async function changeIssueMilestone(
 // ---------------------------------------------------------------------------
 
 /**
+ * Request-scoped emission context for the delete arms — the delete funnel's
+ * optional webhook half (upstream DeleteIssue, notifier.go:313-341, reached
+ * from the v1 DELETE route, routers/api/v1/repo/issue.go:851→:886). Every
+ * caller that holds a request threads it (`issueDeleteEmission`), so the API
+ * route and any future UI delete funnel emit identically through ONE seam
+ * (the house rule — the same funnel posture as the wiki family's service
+ * seam). Omitted → the bare cascade stays webhook-silent (callers with no
+ * request; today's pre-wiring behavior).
+ */
+export interface IssueDeleteEmission {
+  /** The hono request source structurally: the bindings (D1 for the fan-out,
+   *  the optional WEBHOOK_DELIVERY queue) and hono's `executionCtx` GETTER as
+   *  a thunk — read lazily inside the emit guard, because reading it throws
+   *  for in-process callers (tests via router.fetch) that have no execution
+   *  context. */
+  readonly env: { readonly DB: D1Database; readonly WEBHOOK_DELIVERY?: unknown };
+  readonly executionCtx?: () => { waitUntil(promise: Promise<unknown>): void };
+  /** The §2.7 viewer the payload renders against (the route's viewerOf(c)). */
+  readonly viewer: Viewer;
+  /** The doer — the payload's sender (the route's authUser). */
+  readonly sender: unknown;
+}
+
+/** The emission context of one API request (the route's one-line thread:
+ *  `deleteIssueCascade(c.env.DB, c.env.REPO_PACKS, issue, issueDeleteEmission(c))`). */
+export function issueDeleteEmission(c: Context<ApiEnv>): IssueDeleteEmission {
+  return {
+    env: c.env,
+    executionCtx: () => c.executionCtx,
+    viewer: viewerOf(c),
+    sender: c.get("authUser"),
+  };
+}
+
+/** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired — the
+ *  structural probe the routes/issue-events/push modules share (the generated
+ *  Env types the binding as required, this only defends the runtime). */
+function deleteEmissionQueue(env: IssueDeleteEmission["env"]): {
+  sendBatch(messages: { body: { deliveryId: number } }[]): Promise<unknown>;
+} | null {
+  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
+  if (candidate === undefined || candidate === null) return null;
+  const queue = candidate as { sendBatch?: (messages: { body: { deliveryId: number } }[]) => Promise<unknown> };
+  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
+}
+
+/** One resolved delete event: where it routes and what it carries. */
+interface IssueDeletedEvent {
+  repoId: string;
+  ownerId: number | null;
+  eventType: HookEventType;
+  payload: Record<string, unknown>;
+}
+
+/**
+ * The PRE-delete payload render of upstream DeleteIssue's webhook pair
+ * (notifier.go:313-341): the issue arm renders IssuePayload (ToAPIIssue),
+ * the PR arm PullRequestPayload (ToPayloadPullRequest), both `action=deleted`
+ * with `commit_id` "" (upstream sets no commit) and NO `changes` block. The
+ * identity render is the doer-viewer §2.7 converters — every other emission's
+ * render (upstream's issue-arm poster-viewer quirk is sub-visible; the house
+ * render passes the doer viewer throughout). Upstream loads the payload's
+ * attributes BEFORE deleting (issue.go:157-162) and notifies AFTER (:183),
+ * so this render runs on the live rows and the fan-out follows the cascade.
+ * Null = an unresolvable identity (orphaned repo row / missing PR row) — the
+ * push wave's log-and-skip degradation.
+ */
+async function renderIssueDeletedEvent(d1: D1Database, issue: IssueRow, emission: IssueDeleteEmission): Promise<IssueDeletedEvent | null> {
+  const pair = await findRepositoryById(d1, issue.repoId);
+  if (pair === null) {
+    console.error(`[issues] delete webhook skipped (deleted): repository row missing [id: ${issue.repoId}]`);
+    return null;
+  }
+  const repository = toApiRepository(emission.viewer, pair);
+  if (issue.isPull) {
+    const pr = (await drizzle(d1).select().from(pullRequests).where(eq(pullRequests.issueId, issue.id)).limit(1).all())[0] ?? null;
+    if (pr === null) {
+      console.error(`[issues] delete webhook skipped (deleted): PR row missing [issue: ${issue.id}]`);
+      return null;
+    }
+    return {
+      repoId: pair.repo.id,
+      ownerId: pair.repo.ownerId,
+      eventType: "pull_request",
+      payload: {
+        action: "deleted",
+        number: issue.index,
+        pull_request: await toApiPullRequest(d1, emission.viewer, pair, issue, pr, "payload"),
+        repository,
+        sender: emission.sender,
+        commit_id: "",
+      },
+    };
+  }
+  return {
+    repoId: pair.repo.id,
+    ownerId: pair.repo.ownerId,
+    eventType: "issues",
+    payload: {
+      action: "deleted",
+      number: issue.index,
+      issue: await toApiIssue(d1, emission.viewer, pair, issue),
+      repository,
+      sender: emission.sender,
+      commit_id: "",
+    },
+  };
+}
+
+/**
+ * Fire the delete event. The delivery-row insert is AWAITED inline after the
+ * cascade committed (the emitIssueEvent posture — upstream CreateHookTask is
+ * synchronous too); failures are caught and logged, never propagated into the
+ * delete. Only the Queue producer ({deliveryId} batch) hangs off the
+ * executionCtx-guarded waitUntil — in-process callers (tests via
+ * router.fetch) have no execution context, skip the enqueue, and leave the
+ * rows `pending` (the durable source of truth; the consumer's idempotent CAS
+ * makes a later enqueue a safe replay). NO activity-feed row: the upstream
+ * actionNotifier has no DeleteIssue method (feed/notifier.go) — the feed
+ * stays silent upstream-faithfully.
+ */
+async function emitIssueDeletedEvent(d1: D1Database, event: IssueDeletedEvent, emission: IssueDeleteEmission): Promise<void> {
+  let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+  if (emission.executionCtx !== undefined) {
+    try {
+      execCtx = emission.executionCtx();
+    } catch {
+      execCtx = undefined; // in-process caller (tests): no execution context
+    }
+  }
+  const queue = deleteEmissionQueue(emission.env);
+  const ctx = execCtx;
+  try {
+    await emitWebhookDeliveries(
+      d1,
+      { repoId: event.repoId, ownerId: event.ownerId, eventType: event.eventType, payload: event.payload, refName: null },
+      {
+        enqueue:
+          queue !== null && ctx !== undefined
+            ? (deliveryIds: number[]): void => {
+                ctx.waitUntil(
+                  queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(undefined, (error: unknown) => {
+                    console.error(`[issues] delivery enqueue failed (${event.eventType}): ${error instanceof Error ? error.message : String(error)}`);
+                  }),
+                );
+              }
+            : undefined,
+      },
+    );
+  } catch (error) {
+    console.error(`[issues] webhook fan-out failed (${event.eventType}): ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
  * The §4.12 delete cascade in ONE D1 batch: comments (own rows + xref rows
  * pointing here + dependency rows), issue_labels, the tier-2 children
  * (content history, assignees, dependencies in BOTH directions, notification
@@ -1417,8 +1585,24 @@ export async function changeIssueMilestone(
  * The row sweep rides the batch; a NULL `r2_key` (row-first landing, upload
  * not completed) has no object to delete. R2 delete of a missing key is a
  * no-op, so a retry after a partial storage pass is safe.
+ *
+ * WEBHOOKS (upstream DeleteIssue, notifier.go:313-341): with an emission
+ * context threaded, the cascade renders the `action=deleted` payload from the
+ * live rows BEFORE the sweep (upstream's LoadAttributes-before-delete) and
+ * fans out AFTER the batch commits — the issue arm one `issues` event, the
+ * PR arm one `pull_request` event, exactly once per delete (the route 404s
+ * the second attempt; the IsPull discriminant picks the arm, so a delete
+ * never emits both).
  */
-export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue: IssueRow): Promise<void> {
+export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue: IssueRow, emission?: IssueDeleteEmission): Promise<void> {
+  let event: IssueDeletedEvent | null = null;
+  if (emission !== undefined) {
+    try {
+      event = await renderIssueDeletedEvent(d1, issue, emission);
+    } catch (error) {
+      console.error(`[issues] delete webhook render failed (deleted): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   const attachmentKeys = (
     await drizzle(d1)
       .select({ r2Key: issueAttachments.r2Key })
@@ -1503,6 +1687,11 @@ export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue
     );
   }
   await drizzle(d1).batch(statements);
+  // The delete event fans out AFTER the sweep committed (upstream notify
+  // order, issue.go:183) — from the pre-delete render taken above.
+  if (event !== null && emission !== undefined) {
+    await emitIssueDeletedEvent(d1, event, emission);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -304,7 +304,7 @@ export async function gitHttpGate(
   // rejected receive is a no-op and a probe/advert never schedules it (this
   // arm runs only on the receive-pack RPC).
   if (isPush && resolved.repo.isEmpty) {
-    ctx.waitUntil(settleCreatingRepo(env, resolved.repo.id, `${route.owner}/${route.repo}`));
+    ctx.waitUntil(settleCreatingRepo(env, resolved.repo.id, `${route.owner}/${route.repo}`, url.origin));
   }
   return response;
 }
@@ -484,7 +484,7 @@ async function handleUnknownRepository(
       // async settle body starts at call time, so scheduling it before the
       // forward would race the receive's finalize with an empty-DO listRefs).
       const response = await forwardToEngine(req, url, env, ctx, engine, raced.repo.storageKey, verifiedPusher(verified), protectedBranchValidator(env, raced.repo));
-      ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`));
+      ctx.waitUntil(settleCreatingRepo(env, raced.repo.id, `${route.owner}/${route.repo}`, url.origin));
       return response;
     }
     // Upstream masks EVERY PushCreateRepo error as a bare 404 (githttp.go:
@@ -524,7 +524,7 @@ async function handleUnknownRepository(
   // fresh row's storage key: the very first receive already addresses R2 by
   // r_<id>, so no name-addressed prefix ever gets written for this repo.
   const response = await forwardToEngine(req, url, env, ctx, engine, created.storageKey, verifiedPusher(verified), protectedBranchValidator(env, created));
-  ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`));
+  ctx.waitUntil(settleCreatingRepo(env, created.id, `${route.owner}/${route.repo}`, url.origin));
   return response;
 }
 
@@ -971,8 +971,21 @@ async function serveHead(env: Env, route: GitHttpRoute, defaultBranch: string): 
  *
  * `refs_version` is deliberately not synced: the engine's finalize result
  * carries no version (engine gap), and the column is observability-only.
+ *
+ * `requestOrigin` threads the serving request's origin into the settle's
+ * `repository` action=created emission (the appOrigin chain's middle leg —
+ * the APP_URL var still wins when configured): every receive path holds the
+ * Request in hand and passes `url.origin`; request-less callers (the
+ * ui/testing seed-repo settle) omit it and keep the env/default fallback.
  */
-export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: string): Promise<void> {
+export interface SettleEnv extends Pick<Env, "DB" | "REPO" | "REPO_PACKS"> {
+  /** Upstream `setting.AppURL` — optional here so request-less callers can
+   *  pass a varless bindings view (the WebhookPushEnv pattern); the full
+   *  generated Env satisfies this structurally. */
+  APP_URL?: string;
+}
+
+export async function settleCreatingRepo(env: SettleEnv, repoId: string, engineRepo: string, requestOrigin?: string): Promise<void> {
   try {
     const db = drizzle(env.DB);
     const row = await db.select().from(repositories).where(eq(repositories.id, repoId)).get();
@@ -1025,7 +1038,7 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
         .set({ status: "ready", updatedAt: new Date() })
         .where(and(eq(repositories.id, repoId), eq(repositories.status, "creating")))
         .run();
-      if ((settled.meta.changes ?? 0) > 0) await emitCreatedEvent(env, repoId);
+      if ((settled.meta.changes ?? 0) > 0) await emitCreatedEvent(env, repoId, requestOrigin);
       return;
     }
 
@@ -1063,7 +1076,7 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
     // stays silent — the repo was never servable, so there is no deletion to
     // notify.
     if ((settled.meta.changes ?? 0) > 0 && row.status === "creating") {
-      await emitCreatedEvent(env, repoId);
+      await emitCreatedEvent(env, repoId, requestOrigin);
     }
 
     // §2.5.2 (ENGINE-WAVE): the DO's meta.head must agree with the adopted
@@ -1097,12 +1110,14 @@ export async function settleCreatingRepo(env: Env, repoId: string, engineRepo: s
  * settle carries no pusher identity (the push family's documented deviation,
  * webhooks-push.ts header), so the sender is the owner-fallback pusher:
  * upstream push-create only creates in the pusher's own namespace (site-admin
- * overrides aside).
+ * overrides aside). `requestOrigin` feeds the appOrigin chain's middle leg —
+ * the payload URLs render the serving request's origin unless the APP_URL
+ * var wins (the APP_URL unit's precedence); absent → the env/default chain.
  */
-async function emitCreatedEvent(env: Env, repoId: string): Promise<void> {
+async function emitCreatedEvent(env: SettleEnv, repoId: string, requestOrigin?: string): Promise<void> {
   const pair = await findRepositoryById(env.DB, repoId);
   if (pair === null) return;
-  const identity = repositoryEventIdentity({ origin: appOrigin(env), requester: null }, pair);
+  const identity = repositoryEventIdentity({ origin: appOrigin(env, requestOrigin), requester: null }, pair);
   const sender = identity.organization;
   await emitRepoEventInline(env, {
     repoId: pair.repo.id,

@@ -59,6 +59,8 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
+
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { doerRepoAccessMode } from "../api/services/repository";
@@ -640,6 +642,71 @@ describe("settleCreatingRepo emits repository action=created (the push-create ar
     await settleCreatingRepo(env, created.id, "alice/settledoomed");
     expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
     expect(await settleDeliveries(hookId)).toEqual([]);
+  });
+
+  it("the created payload renders the request origin when APP_URL is unset; the var still wins over it", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const hookId = await seedRepositoryHook(alice.id);
+    const service = new RepoService(env.DB);
+    const requestOrigin = "https://push.example.com";
+    const appUrlOrigin = ((env as { APP_URL?: string }).APP_URL ?? "http://localhost:3000").replace(/\/+$/, "");
+
+    /** One 'creating' row + a warmed cell (refs/heads/main landed over the
+     *  cell RPCs — NO gate receive, so the gate's own waitUntil settle never
+     *  races this test's explicit CAS; push-stale.test.ts's seeding shape). */
+    async function seedCreatingRepoWithRef(slug: string): Promise<string> {
+      const row = await service.create({
+        owner: { id: alice.id, usernameLower: "alice" },
+        name: slug,
+        isPrivate: true,
+        status: "creating",
+      });
+      const cell = env.REPO.getByName(`alice/${slug}`);
+      const person = { name: "seed", email: "seed@stale.invalid", time: 1761000000, tz: "+0000" };
+      const readme = new TextEncoder().encode(`# ${slug}\n`);
+      // Worker-side object hash (push-stale.test.ts's shape — the
+      // `type size\0` header, putApiObjects re-verifies).
+      const gitOid = async (type: string, data: Uint8Array): Promise<string> => {
+        const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+        const bytes = new Uint8Array(header.byteLength + data.byteLength);
+        bytes.set(header, 0);
+        bytes.set(data, header.byteLength);
+        const digest = await crypto.subtle.digest("SHA-1", bytes);
+        return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+      };
+      const readmeOid = await gitOid("blob", readme);
+      const tree = serializeTree([{ mode: "100644", name: "README.md", oid: readmeOid }]);
+      const tip = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "seed\n" });
+      const put = await cell.putApiObjects([
+        { oid: readmeOid, type: "blob", data: readme },
+        { oid: tree.oid, type: "tree", data: tree.data },
+        { oid: tip.oid, type: "commit", data: tip.data },
+      ]);
+      if (put.tag !== "ok") throw new Error(`seed putApiObjects failed: ${put.tag}`);
+      const landed = await cell.commitApiChange({ ref: "refs/heads/main", expectedOldOid: "0".repeat(40), newOid: tip.oid });
+      if (landed.tag !== "committed") throw new Error(`seed ref landing failed: ${landed.tag}`);
+      return row.id;
+    }
+
+    // Arm 1 — the varless bindings view + a request origin: the payload URLs
+    // carry the REQUEST origin (appOrigin's middle leg, the zero-config
+    // fallback the settle threads from the receive in hand).
+    const noVarRow = await seedCreatingRepoWithRef("settledorigin");
+    await settleCreatingRepo({ DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS }, noVarRow, "alice/settledorigin", requestOrigin);
+    let rows = await settleDeliveries(hookId);
+    expect(rows).toHaveLength(1);
+    const noVarPayload = JSON.parse(rows[0]!.payloadContent) as { repository: { html_url: string } };
+    expect(noVarPayload.repository.html_url).toBe(`${requestOrigin}/alice/settledorigin`);
+
+    // Arm 2 — the real bindings (the wrangler.jsonc APP_URL var set) + the
+    // same request origin: the var WINS (the APP_URL unit's precedence, now
+    // pinned through the settle path too).
+    const varRow = await seedCreatingRepoWithRef("settledoriginvar");
+    await settleCreatingRepo(env, varRow, "alice/settledoriginvar", requestOrigin);
+    rows = await settleDeliveries(hookId);
+    expect(rows).toHaveLength(2);
+    const varPayload = JSON.parse(rows[1]!.payloadContent) as { repository: { html_url: string } };
+    expect(varPayload.repository.html_url).toBe(`${appUrlOrigin}/alice/settledoriginvar`);
   });
 });
 

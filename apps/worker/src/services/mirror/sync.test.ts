@@ -30,9 +30,9 @@
 
 import { env } from "cloudflare:workers";
 
-/** Payload origin per the service's instanceOrigin(): the wrangler APP_URL
- *  var when configured (tests ride the real config), upstream's default
- *  ROOT_URL otherwise. */
+/** Payload origin per the shared appOrigin chain (webhooks-push.ts): the
+ *  wrangler APP_URL var when configured (tests ride the real config),
+ *  upstream's default ROOT_URL otherwise. */
 const EXPECTED_ORIGIN = ((env as { APP_URL?: string }).APP_URL ?? "http://localhost:3000").replace(/\/+$/, "");
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";

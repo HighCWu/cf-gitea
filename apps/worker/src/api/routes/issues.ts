@@ -44,6 +44,7 @@ import {
   deleteIssueCascade,
   findIssueByRepoAndIndex,
   findRepoCommentById,
+  issueDeleteEmission,
   issueErrorToApiError,
   issueLabelApiUrlBase,
   issueLabelRows,
@@ -1389,8 +1390,10 @@ export function registerIssueRoutes(
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     // Upstream reqAdmin lands with the SPEC-0002 ACL matrix (header note).
     // The bucket rides along: attachment objects go storage-first (see the
-    // cascade's doc comment).
-    await deleteIssueCascade(c.env.DB, c.env.REPO_PACKS, issue);
+    // cascade's doc comment). The emission context threads the request into
+    // the cascade's delete webhook half (upstream DeleteIssue,
+    // notifier.go:313-341 — the `action=deleted` Issue/PR payload).
+    await deleteIssueCascade(c.env.DB, c.env.REPO_PACKS, issue, issueDeleteEmission(c));
     return c.body(null, 204);
   });
 
