@@ -7,7 +7,7 @@ Gitea-API compatible: stock git clients (`clone`/`push`), Gitea tooling (SDKs,
 the official Gitea web UI is served via the asset-reuse strategy (SPEC-0008+).
 Not affiliated with the Gitea project — see [NOTICE.md](NOTICE.md).
 
-**Demo**: <https://cf-gitea-demo.aiapp.run> *(deploying)* — the shared reference
+**Demo**: <https://cf-gitea-demo.aiapp.run> **(live)** — the shared reference
 instance; it wipes content on a 72-hour sweep, a posture of that deployment
 only (what you deploy yourself has none of it — see [Deploy it](#deploy-it)).
 
