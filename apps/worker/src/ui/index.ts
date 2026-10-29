@@ -1344,6 +1344,7 @@ import {
   renderPullFilesSingleCommitPage,
 } from "./pages/pull-files-single-commit";
 import { activityAuthorDataResponse, loadActivityAuthorData } from "./pages/activity-author-data";
+import { loadRepoActivityData, renderRepoActivityPage } from "./pages/repo-activity";
 import {
   commentAttachmentsFragmentResponse,
   loadCommentAttachmentsFragment,
@@ -2278,6 +2279,28 @@ export interface SearchAuxRoute {
   family: "repo-search-aux" | "explore-topic-search-aux" | "repo-migrate";
 }
 
+/** The census R14 repo activity page family (pages/repo-activity.tsx):
+ *  upstream's `/{username}/{reponame}/activity` group — web.go:1629-1630's
+ *  two page GETs over repo.Activity (routers/web/repo/activity.go:22-81),
+ *  gated `optSignIn, RepoAssignment, MustBeNotEmpty, RequireUnitReader(code,
+ *  issues, pulls, releases)` (web.go:1635-1637 — reading ANY of the four
+ *  units admits the group; ours reduces to the visibility read because the
+ *  code unit has no toggle). The period segment is OPTIONAL and its switch
+ *  has NO 4xx arm (activity.go:30-45): unknowns render the WEEKLY window.
+ *  The deeper R15 chart tails (contributors/code-frequency/recent-commits)
+ *  stay unclaimed → the engine's 404 — they serialize after this family
+ *  (the census's R15 row). */
+export interface RepoActivityRoute {
+  family: "repo-activity";
+  owner: string;
+  repo: string;
+  /** The RAW {period} path segment (knowns: daily/halfweekly/weekly/
+   *  monthly/quarterly/semiyearly/yearly — the loader's switch); `null` =
+   *  the bare /activity URL. Unknown segments are kept raw and default to
+   *  the weekly arm at the loader, upstream-exact. */
+  period: string | null;
+}
+
 /** Window-2e B2: the repo-scoped aux feeds + fragments (issues-search-aux,
  *  issue-content-fragments, pull-merge-box, compare-feeds,
  *  pull-files-single-commit, activity-author-data). */
@@ -2468,16 +2491,6 @@ export interface CompareRoute {
   base: string | null;
   /** The head side; `null` = the bare/empty form → the default branch. */
   head: string | null;
-  /** The URL's separator (upstream CompareRouterReq.CompareSeparator /
-   *  CompareInfo.CompareSeparator): `...` diffs from the merge base,
-   *  `..` diffs the two tips (DirectComparison). */
-  separator: "..." | "..";
-  /** The head-side fork form's owner (parseHead); `null` = the same-repo
-   *  head (the owner segment omitted). */
-  headOwner: string | null;
-  /** The fork form's explicit repo name (`{owner}/{repo}:{ref}` form);
-   *  `null` = the bare `{owner}:{ref}` form (the fork edge decides). */
-  headRepoName: string | null;
 }
 
 /** Top-level single-segment paths this router must never claim: the session
@@ -2511,6 +2524,7 @@ export type ParsedUiRoute =
   | GlobalInboxRoute
   | WikiRoute
   | FileEditorRoute
+  | RepoActivityRoute
   | SiteHomeRoute
   | ExploreRoute
   | NotificationsRoute
@@ -3169,6 +3183,26 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 1) return { family: "activity-author-data", owner, repo, segment: rest[0] };
   }
 
+  // The census R14 repo activity page (web.go:1628-1631 — the /activity
+  // group's two page GETs over `repo.Activity`). The period tail is the RAW
+  // segment (the activity-author-data convention): activity.go:30-45's
+  // switch has no 4xx arm, unknown segments render the WEEKLY window with
+  // the weekly item active, and the bare URL parses as period null. The
+  // deeper /activity/{contributors,code-frequency,recent-commits} chart
+  // pages stay UNCLAIMED → the engine's 404 (the census's own R15 row —
+  // those pages serialize after this one; the page's nav menu renders the
+  // live Pulse item only, the dead-link rule).
+  if (head === "activity") {
+    if (rest.length === 0) return { family: "repo-activity", owner, repo, period: null };
+    // The R15 chart literals are NOT period values — upstream chi dispatches
+    // /activity/contributors etc. to the chart group's static routes ahead of
+    // the /{period} param (web.go:1633-1646), and those pages are the
+    // unlanded R15 row: the literals stay unclaimed → the engine's 404.
+    if (rest.length === 1 && rest[0] !== "contributors" && rest[0] !== "code-frequency" && rest[0] !== "recent-commits") {
+      return { family: "repo-activity", owner, repo, period: rest[0] ?? null };
+    }
+  }
+
   if (head === "issues" || head === "pulls") {
     // Window-2e folds: the pulls/new redirect (web.go:1314) — MUST claim or
     // the dispatcher's handlesUiRoute consult hands it to the engine before
@@ -3397,14 +3431,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return { family: "milestone-detail", owner, repo, id };
   }
   // Wave-13: the compare family (pages/compare.tsx — upstream web.go:1307-
-  // 1315). The bare URL and the full ParseCompareRouterParam tail grammar:
-  // the FIRST `...` splits the decoded suffix (strings.Cut parity), else the
-  // first `..` (the two-dot DirectComparison arm — the feeds module's
-  // parseCompareBaseHead semantics, landed here for the page), else the
-  // whole tail is the HEAD (upstream's single-ref family); an empty side is
-  // the default-branch fallback (the loader's util.IfZero arm) and the head
-  // part carries the fork forms (`{owner}:{ref}` / `{owner}/{repo}:{ref}` —
-  // parseHead; the fork-edge resolution landed with the API's fork-PR flow).
+  // 1315). The bare URL and the `{base}...{head}` tail (FIRST `...` splits
+  // the decoded suffix — strings.Cut parity; refnames can never carry `..`,
+  // so the separator is unambiguous and the emitted links always re-parse to
+  // the same pair). A missing separator makes the whole tail the HEAD
+  // (upstream's single-ref family); an empty side is the default-branch
+  // fallback (the loader's util.IfZero arm). The `..` two-dot family
+  // (DirectComparison — a different diff semantic, not a landed surface) and
+  // the `{owner}/{repo}:{head}` fork forms (colon-bearing sides; forks
+  // cannot exist yet, SPEC-0003) stay unclaimed → the engine's 404, exactly
+  // upstream's unregistered-route answer for this slice.
   if (head === "wiki") {
     // Window-2e C2: the WIKI family (pages/repo-wiki.tsx — upstream
     // web.go:1611-1617's two combos; the SUB-PAGES dispatch on the
@@ -3423,24 +3459,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return { family: "wiki", owner, repo, rawTail };
   }
   if (head === "compare") {
-    const bare: CompareRoute = {
-      family: "compare",
-      owner,
-      repo,
-      base: null,
-      head: null,
-      separator: "...",
-      headOwner: null,
-      headRepoName: null,
-    };
-    if (rest.length === 0) return bare;
+    if (rest.length === 0) return { family: "compare", owner, repo, base: null, head: null };
     let suffix: string;
     try {
       suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
     } catch {
       return null;
     }
-    if (suffix === "") return bare;
+    if (suffix === "") return { family: "compare", owner, repo, base: null, head: null };
     // Window-2e B2: the .diff/.patch byte feeds (web.go:1309-1310) — claim
     // the suffixed tails BEFORE the page family returns (they would
     // otherwise fall into the single-ref family and 404 at resolution).
@@ -3450,60 +3476,20 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (suffix.endsWith(".patch")) {
       return { family: "compare-feed", owner, repo, ext: "patch", segment: suffix.slice(0, -6) };
     }
-    // ParseCompareRouterParam (routers/common/compare.go:74-102): the FIRST
-    // `...` splits; failing that, the first `..` (DirectComparison);
-    // failing both, the whole tail is the HEAD (separator stays `...`).
-    let separator: "..." | "..";
-    let basePart: string;
-    let headPart: string;
-    const tri = suffix.indexOf("...");
-    if (tri >= 0) {
-      separator = "...";
-      basePart = suffix.slice(0, tri);
-      headPart = suffix.slice(tri + 3);
-    } else {
-      const bi = suffix.indexOf("..");
-      if (bi >= 0) {
-        separator = "..";
-        basePart = suffix.slice(0, bi);
-        headPart = suffix.slice(bi + 2);
-      } else {
-        separator = "...";
-        basePart = "";
-        headPart = suffix;
-      }
+    const separator = suffix.indexOf("...");
+    if (separator < 0) {
+      if (suffix.includes("..") || suffix.includes(":")) return null;
+      return { family: "compare", owner, repo, base: null, head: suffix };
     }
-    // parseHead (compare.go:36-46) — the fork forms live on the HEAD part
-    // only. `owner/` with an empty repo name is upstream's unsupported-
-    // syntax invalid-argument → the 404 class.
-    let headOwner: string | null = null;
-    let headRepoName: string | null = null;
-    const colon = headPart.indexOf(":");
-    if (colon >= 0) {
-      const ownerRepo = headPart.slice(0, colon);
-      const slash = ownerRepo.indexOf("/");
-      if (slash > 0) {
-        headOwner = ownerRepo.slice(0, slash);
-        headRepoName = ownerRepo.slice(slash + 1);
-      } else if (slash < 0) {
-        headOwner = ownerRepo;
-      } else {
-        return null;
-      }
-    }
-    // Refname impossibilities inside the sides (`..` never appears in a
-    // refname; the BASE part never carries a fork form): unresolvable
-    // upstream → the same 404 shell via null.
-    if (basePart.includes("..") || basePart.includes(":") || headPart.includes("..")) return null;
+    const base = suffix.slice(0, separator);
+    const headSide = suffix.slice(separator + 3);
+    if (base.includes("..") || base.includes(":") || headSide.includes("..") || headSide.includes(":")) return null;
     return {
       family: "compare",
       owner,
       repo,
-      base: basePart === "" ? null : basePart,
-      head: headPart === "" ? null : headPart,
-      separator,
-      headOwner,
-      headRepoName,
+      base: base === "" ? null : base,
+      head: headSide === "" ? null : headSide,
     };
   }
   // Wave-16 branches family (pages/branches.tsx — upstream web.go:1478-1482's
@@ -5002,6 +4988,26 @@ async function activityAuthorDataRoute(c: Context<{ Bindings: Env }>): Promise<R
   );
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(activityAuthorDataResponse(data));
+}
+
+/** GET /{owner}/{repo}/activity[/{period}] (pages/repo-activity.tsx — the
+ *  census R14 pulse page, upstream repo.Activity, web.go:1629-1630 →
+ *  routers/web/repo/activity.go:22-81). The shared visibility read IS the
+ *  group's RequireUnitReader gate (the code unit has no toggle — the module
+ *  doc); `MustBeNotEmpty` 404-shells empty repos (web.go:1636) and the
+ *  loader's null answers the default-branch-miss arm (activity.go:51-60's
+ *  `default_branch_not_exist` NotFound) plus the engine-transport 404
+ *  (the commits-page convention). */
+async function repoActivityPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "repo-activity") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1636)
+  const data = await loadRepoActivityData(c.env, repo, route.period, { now: routeNow() });
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404)); // the default-branch arm
+  return respond(c.html(renderRepoActivityPage(ctx, data), 200));
 }
 
 /** GET /{owner}/{repo}/comments/{id}/attachments (the fragment module's
@@ -10468,6 +10474,12 @@ uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/commits/:sha{^[a-f0-9]{7,64}$}", 
 uiRouter.get("/:owner/:repo/comments/:id/attachments", (c) => commentAttachmentsRoute(c));
 uiRouter.get("/:owner/:repo/activity_author_data", (c) => activityAuthorDataRoute(c));
 uiRouter.get("/:owner/:repo/activity_author_data/:period", (c) => activityAuthorDataRoute(c));
+// The census R14 repo activity page (parseUiRoute claims exactly these
+// shapes — web.go:1628-1631's two page GETs). No existing 3-/4-segment line
+// carries an `activity` literal third segment, and the deeper chart tails
+// stay unclaimed (the parser's R15 note) — the wildcard-free pair is exact.
+uiRouter.get("/:owner/:repo/activity", (c) => repoActivityPage(c));
+uiRouter.get("/:owner/:repo/activity/:period", (c) => repoActivityPage(c));
 // Window-2e C1: the global inbox.
 uiRouter.get("/issues", (c) => globalInboxIssuesPage(c, "issues"));
 uiRouter.get("/pulls", (c) => globalInboxIssuesPage(c, "pulls"));
