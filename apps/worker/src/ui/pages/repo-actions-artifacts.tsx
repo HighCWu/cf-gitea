@@ -522,8 +522,11 @@ export function artifactPreviewContentType(filename: string, sniffed: string): s
 
 /** getSafeName + encodeContentDisposition (content_disposition.go:16-65):
  *  the ASCII-safe quoted form, plus the RFC 2231 filename* twin when any
- *  rune needed masking. */
-export function encodeContentDispositionInline(filename: string): string {
+ *  rune needed masking. `kind` is the disposition word — upstream carries it
+ *  as ContentDispositionType (inline for the preview content, attachment for
+ *  the download arms: ServeSetHeaders' default and the zip-compose set,
+ *  view.go:1245). */
+function encodeContentDisposition(kind: "inline" | "attachment", filename: string): string {
   let safe = "";
   let needsEncoding = false;
   for (const char of filename) {
@@ -539,9 +542,21 @@ export function encodeContentDispositionInline(filename: string): string {
     // mime.FormatMediaType quotes any value beyond Go's isTokenChar set
     // (RFC 2045 token chars: the specials !#$%&'*+-.^_`|~ plus alnum).
     /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(value) ? value : `"${value.replaceAll(`"`, `\\"`)}"`;
-  const base = `inline; filename=${quoted(safe)}`;
+  const base = `${kind}; filename=${quoted(safe)}`;
   if (!needsEncoding) return base;
   return `${base}; filename*=UTF-8''${encodeURIComponent(filename)}`;
+}
+
+/** EncodeContentDispositionInline (content_disposition.go:35). */
+export function encodeContentDispositionInline(filename: string): string {
+  return encodeContentDisposition("inline", filename);
+}
+
+/** EncodeContentDispositionAttachment (content_disposition.go:38) — the
+ *  download family's twin (the runs-artifact module composes both arms from
+ *  it). */
+export function encodeContentDispositionAttachment(filename: string): string {
+  return encodeContentDisposition("attachment", filename);
 }
 
 /** insertArtifactPreviewHelperScript (view_artifact.go:261-306): the sandbox

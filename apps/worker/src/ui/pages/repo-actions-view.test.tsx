@@ -243,7 +243,6 @@ describe("the route claim pin (the runs subtree claims exactly its shapes)", () 
       "/alice/demo/actions/runs/7/delete",
       "/alice/demo/actions/runs/7/workflow",
       "/alice/demo/actions/runs/7/logs",
-      "/alice/demo/actions/runs/7/artifacts/some-name",
       "/alice/demo/actions/runs/7/attempts/2/extra", // deeper than any shape
       "/alice/demo/actions/runs/7/jobs/9/extra",
       "/alice/demo/actions/run/1", // upstream's singular /run — unlanded

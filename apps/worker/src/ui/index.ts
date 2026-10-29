@@ -742,6 +742,7 @@ import {
   renderArtifactPreviewPage,
   serveArtifactPreviewRaw,
 } from "./pages/repo-actions-artifacts";
+import { buildRunArtifactDownload, deleteRunArtifact } from "./pages/repo-actions-artifacts-download";
 import {
   bulkAdminActionsRunners,
   deleteAdminActionsRunner,
@@ -2889,6 +2890,21 @@ export interface ActionsArtifactPreviewRawRoute {
   previewPath: string;
 }
 
+/** The census C4 remainder: the runs-artifact download + delete family
+ *  (pages/repo-actions-artifacts-download.ts — upstream web.go:1595-1596).
+ *  One family for BOTH methods: the GET is the zip-compose/v4 stream, the
+ *  DELETE is the writer-gated pending-deletion mark. The {run} segment
+ *  claims ANY value (chi params — resolveRunByPath's loader arms);
+ *  {artifact_name} is ONE decoded segment (url.PathEscape composes it
+ *  upstream). */
+export interface RepoActionsRunArtifactRoute {
+  family: "actions-run-artifact";
+  owner: string;
+  repo: string;
+  run: string;
+  artifactName: string;
+}
+
 
 /** Window-2e B2: the repo-scoped aux feeds + fragments (issues-search-aux,
  *  issue-content-fragments, pull-merge-box, compare-feeds,
@@ -3236,6 +3252,7 @@ export type ParsedUiRoute =
   | RepoActionsRunViewRoute
   | RepoActionsArtifactPreviewRoute
   | ActionsArtifactPreviewRawRoute
+  | RepoActionsRunArtifactRoute
   | SiteHomeRoute
   | ExploreRoute
   | NotificationsRoute
@@ -3527,7 +3544,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       const tail: string[] = [];
       for (const segment of tailSegments) {
         try {
-          tail.push(decodeURIComponent(segment as string));
+          tail.push(decodeURIComponent(segment));
         } catch {
           return null;
         }
@@ -4342,6 +4359,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 4 && rest[2] === "jobs") {
       return { family: "actions-run-view", owner, repo, run: rest[1] as string, job: rest[3] as string };
     }
+    // The census C4 remainder (pages/repo-actions-artifacts-download.ts —
+    // web.go:1595-1596's /artifacts/{artifact_name} GET+DELETE): the name is
+    // ONE decoded segment; a malformed escape stays unclaimed (upstream chi
+    // 404s it too).
+    if (rest.length === 4 && rest[2] === "artifacts") {
+      let artifactName: string;
+      try {
+        artifactName = decodeURIComponent(rest[3] as string);
+      } catch {
+        return null;
+      }
+      return { family: "actions-run-artifact", owner, repo, run: rest[1] as string, artifactName };
+    }
     return null;
   }
   if (head === "actions" && rest.length === 2 && rest[0] === "runs") {
@@ -4370,7 +4400,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     const tail: string[] = [];
     for (const segment of rest.slice(3)) {
       try {
-        tail.push(decodeURIComponent(segment as string));
+        tail.push(decodeURIComponent(segment));
       } catch {
         return null;
       }
@@ -6440,7 +6470,7 @@ async function actionsArtifactPreviewRaw(c: Context<{ Bindings: Env }>): Promise
   if (!resolved.ok) return resolved.response;
   const route = resolved.route;
   if (route.family !== "actions-artifact-preview-raw") return resolved.respond(await c.notFound()); // drift guard
-  let helperScriptSrc: string | null = null;
+  let helperScriptSrc: string | null;
   try {
     const manifest = await loadManifest(assetsBinding(c.env), resolved.url.origin);
     helperScriptSrc = assetURI(manifest, "web_src/js/external-render-helper.ts");
@@ -6458,6 +6488,55 @@ async function actionsArtifactPreviewRaw(c: Context<{ Bindings: Env }>): Promise
       helperScriptSrc,
     }),
   );
+}
+
+/** GET /{owner}/{repo}/actions/runs/{run}/artifacts/{artifact_name}
+ *  (actions.ArtifactsDownloadView — the census C4 remainder, the C2 read
+ *  ladder): the v4 single-artifact stream with the minimal single-range
+ *  arm, or the legacy family's streaming zip compose. The body is a LIVE
+ *  stream — respond() wraps it unchanged, never buffered. */
+async function actionsRunArtifactDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-run-artifact") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  const run = await resolveRunByPath(c.env.DB, repo.id, resolved.route.run);
+  if (run === null) return respond(c.html(renderNotFound(ctx), 404)); // getCurrentRunByPathParam's NotFound
+  const outcome = await buildRunArtifactDownload(
+    c.env,
+    run,
+    resolved.route.artifactName,
+    resolved.url.searchParams.get("attempt") ?? "",
+    c.req.header("range") ?? null,
+  );
+  if (outcome.outcome === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  if (outcome.outcome === "error") return renderServerErrorShellResponse(c.env, c.req.raw);
+  return respond(outcome.response);
+}
+
+/** DELETE /{owner}/{repo}/actions/runs/{run}/artifacts/{artifact_name}
+ *  (actions.ArtifactsDeleteView — web.go:1596's reqRepoActionsWriter): the
+ *  pending-deletion MARK only (the retention sweep owns deletion), answered
+ *  with ctx.JSON's {} — not Cancel's JSONOK. */
+async function actionsRunArtifactDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-run-artifact") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404)); // RequireUnitWriter's NotFound
+  }
+  const run = await resolveRunByPath(c.env.DB, repo.id, resolved.route.run);
+  if (run === null) return respond(c.html(renderNotFound(ctx), 404));
+  const outcome = await deleteRunArtifact(c.env.DB, run, resolved.route.artifactName, resolved.url.searchParams.get("attempt") ?? "");
+  if (outcome.outcome === "error") return renderServerErrorShellResponse(c.env, c.req.raw);
+  return respond(outcome.response);
 }
 
 /** POST /{owner}/{repo}/actions/runs/{run}/cancel (actions.Cancel — the
@@ -14251,6 +14330,10 @@ uiRouter.get("/-/actions/artifacts/:id/:expires/:signature", (c) => actionsArtif
 uiRouter.get("/-/actions/artifacts/:id/:expires/:signature/*", (c) => actionsArtifactPreviewRaw(c));
 uiRouter.post("/-/actions/artifacts/:id/:expires/:signature", () => methodNotAllowed("GET"));
 uiRouter.post("/-/actions/artifacts/:id/:expires/:signature/*", () => methodNotAllowed("GET"));
+// The census C4 remainder: the runs-artifact download + delete (the first
+// DELETE registration in the UI router — upstream web.go:1595-1596's pair).
+uiRouter.get("/:owner/:repo/actions/runs/:run/artifacts/:name", (c) => actionsRunArtifactDownload(c));
+uiRouter.delete("/:owner/:repo/actions/runs/:run/artifacts/:name", (c) => actionsRunArtifactDelete(c));
 uiRouter.get("/:owner/:repo/activity", (c) => repoActivityPage(c));
 uiRouter.get("/:owner/:repo/activity/:period", (c) => repoActivityPage(c));
 // Window-2e C1: the global inbox.
