@@ -870,3 +870,81 @@ describe("the unclaimed-repo-path 404 carve (upstream context_response.go:129-15
     expect(goGet.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
   });
 });
+
+// --- the app.onError 500 chrome arm (usability sweep, 2026-10-29) --------------
+
+describe("the app.onError 500 chrome arm (upstream routers/common/errpage.go)", () => {
+  // A REAL throwing route: no mounted handler lets plain HTTP trigger a throw
+  // (every parse is guarded — that is why the arm has never been observable),
+  // so the test manufactures a production-class failure: the attachments
+  // seam's uuid resolution reads `issue_attachments` unguarded
+  // (resolveAttachmentByUuid), and dropping the table turns
+  // GET /attachments/{uuid} into a genuine handler error that bubbles through
+  // the sub-app (no onError of its own — unlike services/actions/routes.ts) to
+  // the top-level arm. The table + its indexes are captured from sqlite_master
+  // and restored in the same test — this file's D1 persists across its tests.
+  async function dropIssueAttachmentsTable(): Promise<{ restore: () => Promise<void> }> {
+    const table = await env.DB
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'issue_attachments'")
+      .first<{ sql: string }>();
+    if (table?.sql === undefined) throw new Error("issue_attachments DDL not found in sqlite_master");
+    const indexes = await env.DB
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'issue_attachments' AND sql IS NOT NULL")
+      .all<{ sql: string }>();
+    await env.DB.exec("DROP TABLE issue_attachments");
+    return {
+      restore: async () => {
+        // prepare().run(), NOT exec(): D1's exec splits statements on
+        // newlines, and the stored CREATE TABLE DDL is multi-line.
+        await env.DB.prepare(table.sql).run();
+        for (const index of indexes.results) await env.DB.prepare(index.sql).run();
+      },
+    };
+  }
+
+  const attachmentUrl = "https://example.com/attachments/00000000-0000-0000-0000-000000000000";
+
+  it.skipIf(!UI_ASSETS_BUILT)("renders the shell 500 for a browser Accept — never the stack", async () => {
+    const { restore } = await dropIssueAttachmentsTable();
+    try {
+      const browser = await SELF.fetch(attachmentUrl, { headers: { accept: "text/html" } });
+      expect(browser.status).toBe(500);
+      expect(browser.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+      // SetCacheControlInHeader zero-options (errpage.go:87).
+      expect(browser.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+      const html = await browser.text();
+      // Upstream 500.tmpl shape: the status-page-500 mark, the hardcoded
+      // title line, and the <title> pair "Internal Server Error - {AppName}".
+      expect(html).toContain("status-page-500");
+      expect(html).toContain("500 Internal Server Error");
+      expect(html).toContain("<title>Internal Server Error - ");
+      // The prod posture (errpage.go:114/118-122): no error text, no D1
+      // failure bytes, no stack frames in the body.
+      expect(html).not.toContain("no such table");
+      expect(html).not.toContain("D1_ERROR");
+    } finally {
+      await restore();
+    }
+  });
+
+  it("keeps the plain `Internal Server Error` line for curl — never the stack", async () => {
+    const { restore } = await dropIssueAttachmentsTable();
+    try {
+      const curl = await SELF.fetch(attachmentUrl);
+      expect(curl.status).toBe(500);
+      expect(curl.headers.get("content-type")).toBe("text/plain; charset=UTF-8");
+      // errpage.go:114 plainMsg, byte-exact (Hono's default body, now pinned).
+      expect(await curl.text()).toBe("Internal Server Error");
+    } finally {
+      await restore();
+    }
+  });
+
+  it("restores the table for the sibling tests (restore identity)", async () => {
+    // Runs AFTER the two arms (declaration order): with the table back and
+    // empty, the attachments seam answers its own missing-row 404 again —
+    // the throw is gone, proving the fixture left no residue.
+    const response = await SELF.fetch(attachmentUrl);
+    expect(response.status).toBe(404);
+  });
+});

@@ -25,7 +25,7 @@ import { avatarServingRouter } from "./web/avatar-serving";
 import { attachmentsServingRouter } from "./web/attachments-serving";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
-import { renderNotFoundShellResponse } from "./ui/not-found-response";
+import { renderNotFoundShellResponse, renderServerErrorShellResponse } from "./ui/not-found-response";
 
 /**
  * Git smart-HTTP engine mount (SPEC-0001 M1).
@@ -63,6 +63,58 @@ const gitHttp = createDurableGit<Env>({
 });
 
 const app = new Hono<{ Bindings: Env }>();
+
+// THE 500 CHROME ARM (usability sweep, 2026-10-29): every unhandled handler
+// error used to fall to Hono's default onError — a bare plain-text
+// "Internal Server Error" — so a browser on a failing route saw a naked line,
+// exactly like the pre-carve 404s did. Upstream answers the same failure from
+// its GLOBAL recovery: ProtocolMiddlewares (routers/common/middleware.go:26-28)
+// mounts RequestContextHandler, whose `defer recover()` (middleware.go:83-85)
+// calls renderPanicErrorPage (routers/common/errpage.go:59-90), wired
+// tree-wide — web AND api — at routers/init.go:178; the handler-invoked twin
+// is Context.ServerError (services/context/context_response.go:173-192).
+// The negotiation mirrors upstream per-header-part `text/html` sniffing
+// (errpage.go:43-48): status/500 chrome for browsers (the shell builder in
+// ui/not-found-response.tsx), the plain `Internal Server Error` line
+// otherwise (errpage.go:114's prod plainMsg — byte-identical to Hono's
+// default body, pinned here). The error + its stack go to the LOG only
+// (errpage.go:66-67's log.Error("PANIC: %v", …)); the body never carries
+// them — upstream's dev/admin leak branch (errpage.go:118-122) is deliberately
+// not ported. The actions sub-app keeps its own onError
+// (services/actions/routes.ts:291), so its errors stay connect-shaped and
+// never reach this arm.
+app.onError(async (error, c) => {
+  console.error(`500 answering ${c.req.method} ${c.req.url}`, error);
+  const headers = {
+    // SetCacheControlInHeader zero-options (errpage.go:87 → httpcache.go:29-31).
+    "cache-control": "max-age=0, private, must-revalidate",
+  };
+  const acceptsHtml = (c.req.header("accept") ?? "").includes("text/html");
+  if (!acceptsHtml) {
+    return c.text("Internal Server Error", 500, headers);
+  }
+  // The template-render failure fallback (errpage.go:91-101): a shell that
+  // cannot render answers the plain log-and-report line — never a half
+  // response, never the stack. c.executionCtx is unavailable under direct
+  // router.request() test invocations — the resolver then settles inline
+  // (the web/attachments-serving.ts dispatch pattern).
+  let waitUntil: ((promise: Promise<unknown>) => void) | undefined;
+  try {
+    waitUntil = c.executionCtx.waitUntil.bind(c.executionCtx);
+  } catch {
+    waitUntil = undefined;
+  }
+  try {
+    return await renderServerErrorShellResponse(c.env, c.req.raw, { waitUntil });
+  } catch (renderError) {
+    console.error("500 shell render failed", renderError);
+    return c.text(
+      "Internal server error but failed to render error page template, please collect error logs and report to Gitea issue tracker",
+      500,
+      headers,
+    );
+  }
+});
 
 app.get("/healthz", (c) => c.json({ ok: true }));
 
