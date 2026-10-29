@@ -55,6 +55,7 @@ import {
   accessModeAtLeast,
   determinePackageAccessMode,
   getVersionByNameAndVersion,
+  getPackageByName,
   packagesQuotaFromEnv,
   searchVersions,
 } from "../../services/packages/model";
@@ -127,6 +128,46 @@ import {
   MavenPomParseError,
 } from "../../services/packages/maven";
 
+import {
+  NUGET_EDMX_METADATA_XML,
+  NugetBodyTooLargeError,
+  NugetDuplicatePackageFileError,
+  NugetDuplicateVersionError,
+  NugetInvalidFilesError,
+  NugetInvalidPackageArchiveError,
+  NugetMissingNuspecFileError,
+  NugetMissingPdbFilesError,
+  NugetNuspecFileTooLargeError,
+  NugetNuspecInvalidIDError,
+  NugetNuspecInvalidVersionError,
+  NugetPackageNotExistError,
+  NugetUnexpectedPackageTypeError,
+  NugetLinkBuilder,
+  createEntryXml,
+  createFeedResponseXml,
+  createPackageVersionsJson,
+  createRegistrationIndexJson,
+  createRegistrationLeafJson,
+  createSearchResultJson,
+  createServiceIndexJson,
+  formInt,
+  getNugetDescriptor,
+  getNugetSearchTerm,
+  getNugetVersionsByPackageName,
+  isValidNugetSymbolGuid,
+  nugetCountPackages,
+  nugetCountVersions,
+  nugetSearchAllVersionsPerPackage,
+  nugetSearchLatestVersionsPaginated,
+  nugetSearchVersionsPaginated,
+  openNugetFileForDownload,
+  openNugetSymbolFileForDownload,
+  removeNugetVersion,
+  serviceIndexV2Xml,
+  uploadNugetPackage,
+  uploadNugetSymbolPackage,
+} from "../../services/packages/nuget";
+
 const WWW_AUTHENTICATE = 'Basic realm="Gitea Package API"';
 
 // ---------------------------------------------------------------------------
@@ -139,12 +180,31 @@ interface ResolvedCredential {
   scope: ScopeSet | null;
 }
 
-async function resolveCredential(d1: D1Database, request: Request): Promise<ResolvedCredential> {
+/**
+ * The credential pass shared by every protocol family. `opts.apiKeyHeader`
+ * adds the nuget.Auth fallback (auth.go:23-26 — upstream VerifyAuthToken's
+ * apiKey arm: X-NuGet-ApiKey carries the token when the Authorization header
+ * is absent; Authorization WINS when both are present).
+ */
+async function resolveCredential(
+  d1: D1Database,
+  request: Request,
+  opts: { apiKeyHeader?: boolean } = {},
+): Promise<ResolvedCredential> {
   const header = request.headers.get("Authorization");
   const parsed = header === null ? null : parseAuthorizationHeader(header);
   const credential =
     parsed?.bearerToken?.token ?? (parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null);
   if (parsed === null || credential === null) {
+    if (opts.apiKeyHeader === true) {
+      const apiKey = request.headers.get("X-NuGet-ApiKey");
+      if (apiKey !== null && apiKey !== "") {
+        const verified = await new TokenService(d1).verify(apiKey, { now: new Date() });
+        if (verified !== null) {
+          return { doer: verified.user, scope: ScopeSet.parseLenient(verified.token.scopes) };
+        }
+      }
+    }
     return { doer: null, scope: null };
   }
   const verified = await new TokenService(d1).verify(credential, { now: new Date() });
@@ -216,11 +276,12 @@ async function protocolAccessGate(
 async function protocolContext(
   c: Context<{ Bindings: Env }>,
   required: "read" | "write",
+  opts: { apiKeyHeader?: boolean } = {},
 ): Promise<{ owner: UserRow; cred: ResolvedCredential }> {
   if (packagesDisabled(c.env)) {
     throw new HTTPException(404, { res: plainResponse(404, "not found") });
   }
-  const cred = await resolveCredential(c.env.DB, c.req.raw);
+  const cred = await resolveCredential(c.env.DB, c.req.raw, opts);
   const username = c.req.param("username") ?? "";
   const owner = await resolveOwnerRow(c.env.DB, username);
   if (owner === null) {
@@ -286,6 +347,63 @@ function pypiErrorResponse(status: ContentfulStatus, message: string): Response 
 
 function quotaMessage(error: unknown): string {
   return error instanceof Error ? error.message : "quota exceeded";
+}
+
+/**
+ * nuget.go:30-35 — the family's `{"Message": ...}` JSON error body via
+ * ctx.JSON (Content-Type application/json;charset=utf-8); helper.go:29-44
+ * strips 500s to "internal server error" (the prod posture).
+ */
+function nugetApiError(status: ContentfulStatus, message: string): Response {
+  return new Response(JSON.stringify({ Message: message }), {
+    status,
+    headers: { "content-type": "application/json;charset=utf-8" },
+  });
+}
+
+/** The nuget family's error mapper — the 400 InvalidArgument sentinels, the
+ *  409 duplicates, the 404 not-exist, the quota 403, the 413 caps. */
+function nugetErrorResponse(error: unknown): Response {
+  if (error instanceof HTTPException) throw error;
+  if (
+    error instanceof NugetInvalidPackageArchiveError ||
+    error instanceof NugetMissingNuspecFileError ||
+    error instanceof NugetNuspecFileTooLargeError ||
+    error instanceof NugetNuspecInvalidIDError ||
+    error instanceof NugetNuspecInvalidVersionError ||
+    error instanceof NugetMissingPdbFilesError ||
+    error instanceof NugetInvalidFilesError ||
+    error instanceof NugetUnexpectedPackageTypeError
+  ) {
+    return nugetApiError(400, error.message);
+  }
+  if (error instanceof NugetDuplicateVersionError || error instanceof NugetDuplicatePackageFileError) {
+    return nugetApiError(409, error.message);
+  }
+  if (error instanceof NugetPackageNotExistError) return nugetApiError(404, error.message);
+  if (error instanceof PackageSizeMismatchError) {
+    // A lying Content-Length rejects the upload before any parse — the npm
+    // non-InvalidArgument posture (see the nuget module divergence note).
+    return nugetApiError(500, "internal server error");
+  }
+  if (error instanceof NugetBodyTooLargeError || error instanceof PackageBlobTooLargeError) {
+    return nugetApiError(413, error.message);
+  }
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return nugetApiError(403, quotaMessage(error));
+  }
+  console.error("[packages-nuget] request failed", error);
+  return nugetApiError(500, "internal server error");
+}
+
+/** xmlResponse (nuget.go:37-42) — the atom+xml header + body pair. */
+function nugetXmlResponse(xml: string): Response {
+  return new Response(xml, { status: 200, headers: { "content-type": "application/atom+xml; charset=utf-8" } });
+}
+
+/** ctx.PlainText(200, count) for the /$count arms. */
+function nugetCountResponse(count: number): Response {
+  return new Response(String(count), { status: 200, headers: { "content-type": "text/plain;charset=utf-8" } });
 }
 
 /** The declared Content-Length (null when absent or not a valid integer). */
@@ -723,6 +841,378 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
 
   app.get("/:username/maven/*", (c) => mavenDownload(c));
   app.on("HEAD", "/:username/maven/*", (c) => mavenDownload(c));
+
+  // ------------------------------ NUGET (api.go:348-378) ------------------------------
+  // The V3 JSON family (index/query/registration/package-base-address), the
+  // V2 OData feed (service index, $metadata, Packages()/Search()/
+  // FindPackagesById() + counts, the Packages(Id=..) entry), the write arms
+  // (PUT /, PUT /symbolpackage, DELETE /{id}/{version}) and the symbol query
+  // protocol. The base URL renders the owner name RAW — upstream's fmt
+  // concat does no escaping (nuget.go:46/70).
+
+  const nugetBaseOf = (origin: string, ownerName: string): string => `${origin}/api/packages/${ownerName}/nuget`;
+
+  const nugetUpload = async (c: Context<{ Bindings: Env }>, kind: "dependency" | "symbols"): Promise<Response> => {
+    try {
+      const { owner, cred } = await protocolContext(c, "write", { apiKeyHeader: true });
+      const doer = cred.doer;
+      if (doer === null) {
+        return nugetApiError(401, "user should have specific permission or be a site admin");
+      }
+      const declaredLength = contentLength(c.req.raw);
+      if (declaredLength === null) {
+        return nugetApiError(411, "Content-Length header is required");
+      }
+      const input = {
+        d1: c.env.DB,
+        bucket: c.env.REPO_PACKS,
+        owner,
+        doer,
+        content: bodyStream(c.req.raw),
+        declaredLength,
+        quota: packagesQuotaFromEnv(c.env),
+      };
+      if (kind === "dependency") {
+        await uploadNugetPackage(input);
+      } else {
+        await uploadNugetSymbolPackage(input);
+      }
+      return new Response(null, { status: 201 });
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  };
+  // Upstream registers the publish INSIDE the /nuget group at "/" (api.go:365)
+  // — both the bare and slash forms register (the pypi precedent).
+  app.put("/:username/nuget", (c) => nugetUpload(c, "dependency"));
+  app.put("/:username/nuget/", (c) => nugetUpload(c, "dependency"));
+  app.put("/:username/nuget/symbolpackage", (c) => nugetUpload(c, "symbols"));
+
+  // DeletePackage (nuget.go:675-698) — the group-level /{id}/{version} shape.
+  app.delete("/:username/nuget/:id/:version", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "write", { apiKeyHeader: true });
+      const removed = await removeNugetVersion(
+        c.env.DB,
+        owner,
+        c.req.param("id") ?? "",
+        c.req.param("version") ?? "",
+      );
+      if (!removed) return nugetApiError(404, "package does not exist");
+      return new Response(null, { status: 204 });
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  });
+
+  // ServiceIndexV3 (nuget.go:69-86).
+  app.get("/:username/nuget/index.json", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      return new Response(JSON.stringify(createServiceIndexJson(nugetBaseOf(origin, owner.username))), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  });
+
+  // FeedCapabilityResource (nuget.go:89-91) — the static Edmx document.
+  app.get("/:username/nuget/$metadata", async (c) => {
+    try {
+      await protocolContext(c, "read");
+      return nugetXmlResponse(NUGET_EDMX_METADATA_XML);
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  });
+
+  // ServiceIndexV2 (nuget.go:45-66) — the group's "/" shape.
+  app.get("/:username/nuget", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      return nugetXmlResponse(serviceIndexV2Xml(nugetBaseOf(origin, owner.username)));
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  });
+  app.get("/:username/nuget/", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      return nugetXmlResponse(serviceIndexV2Xml(nugetBaseOf(origin, owner.username)));
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  });
+
+  // SearchServiceV3 (nuget.go:191-219) — /query?q=&skip=&take=.
+  app.get("/:username/nuget/query", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      const builder = new NugetLinkBuilder(nugetBaseOf(origin, owner.username));
+      const params = new URL(c.req.url).searchParams;
+      const term = { value: (params.get("q") ?? "").trim(), exactMatch: false };
+      const found = await nugetSearchAllVersionsPerPackage(
+        c.env.DB,
+        owner.id,
+        term,
+        formInt(params, "skip"),
+        formInt(params, "take"),
+      );
+      const descriptors = [];
+      for (const row of found.rows) descriptors.push(await getNugetDescriptor(c.env.DB, row.pkg, row.version));
+      return new Response(JSON.stringify(createSearchResultJson(builder, found.total, descriptors)), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  });
+
+  // RegistrationIndex (nuget.go:222-247) — semver ascending; the empty arm
+  // answers apiError(404, nil) — the empty message ({"Message": ""}).
+  app.get("/:username/nuget/registration/:id/index.json", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      const builder = new NugetLinkBuilder(nugetBaseOf(origin, owner.username));
+      const rows = await getNugetVersionsByPackageName(c.env.DB, owner.id, c.req.param("id") ?? "");
+      if (rows.length === 0) return nugetApiError(404, "");
+      const descriptors = [];
+      for (const row of rows) descriptors.push(await getNugetDescriptor(c.env.DB, row.pkg, row.version));
+      return new Response(JSON.stringify(createRegistrationIndexJson(builder, descriptors)), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  });
+
+  // RegistrationLeafV3 (nuget.go:280-306) — the .json suffix trimmed.
+  const nugetLeafV3 = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      const builder = new NugetLinkBuilder(nugetBaseOf(origin, owner.username));
+      const id = c.req.param("id") ?? "";
+      const version = (c.req.param("version") ?? "").replace(/\.json$/, "");
+      const pv = await getVersionByNameAndVersion(c.env.DB, owner.id, "nuget", id, version);
+      if (pv === null) return nugetApiError(404, "package does not exist");
+      const pkg = await getPackageByName(c.env.DB, owner.id, "nuget", id);
+      if (pkg === null) return nugetApiError(404, "package does not exist");
+      const descriptor = await getNugetDescriptor(c.env.DB, pkg, pv);
+      return new Response(JSON.stringify(createRegistrationLeafJson(builder, descriptor)), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  };
+  app.get("/:username/nuget/registration/:id/:version", (c) => nugetLeafV3(c));
+
+  // EnumeratePackageVersionsV3 (nuget.go:378-394) — the empty arm 404s with
+  // the empty message.
+  app.get("/:username/nuget/package/:id/index.json", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const rows = await getNugetVersionsByPackageName(c.env.DB, owner.id, c.req.param("id") ?? "");
+      if (rows.length === 0) return nugetApiError(404, "");
+      return new Response(JSON.stringify(createPackageVersionsJson(rows.map((row) => row.version))), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  });
+
+  // DownloadPackageFile (nuget.go:398-422) — ANY file of the version; the
+  // unknown-version/file arms answer 404 "package does not exist".
+  const nugetDownload = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const download = await openNugetFileForDownload(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        c.req.param("id") ?? "",
+        c.req.param("version") ?? "",
+        c.req.param("filename") ?? "",
+        c.req.method === "HEAD" ? "HEAD" : "GET",
+      );
+      if (download === null) return nugetApiError(404, "package does not exist");
+      return fileResponse(c, {
+        stream: download.stream,
+        size: download.size,
+        filename: download.file.name,
+        created: download.file.createdUnix,
+      });
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  };
+  app.get("/:username/nuget/package/:id/:version/:filename", (c) => nugetDownload(c));
+  app.on("HEAD", "/:username/nuget/package/:id/:version/:filename", (c) => nugetDownload(c));
+
+  // DownloadSymbolFile (nuget.go:637-671) — the chi guid regex
+  // ([0-9a-fA-F]{32}[fF]{8}) non-matches fall off the router (404, empty
+  // message); a filename/filename2 mismatch is apiError(400, nil).
+  const nugetSymbolDownload = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const filename = c.req.param("filename") ?? "";
+      const guid = c.req.param("guid") ?? "";
+      const filename2 = c.req.param("filename2") ?? "";
+      if (!isValidNugetSymbolGuid(guid)) return nugetApiError(404, "");
+      if (filename !== filename2) return nugetApiError(400, "");
+      const download = await openNugetSymbolFileForDownload(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        filename,
+        guid.slice(0, 32),
+        c.req.method === "HEAD" ? "HEAD" : "GET",
+      );
+      if (download === null) return nugetApiError(404, "");
+      return fileResponse(c, {
+        stream: download.stream,
+        size: download.size,
+        filename: download.file.name,
+        created: download.file.createdUnix,
+      });
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  };
+  app.get("/:username/nuget/symbols/:filename/:guid/:filename2", (c) => nugetSymbolDownload(c));
+  app.on("HEAD", "/:username/nuget/symbols/:filename/:guid/:filename2", (c) => nugetSymbolDownload(c));
+
+  // RegistrationLeafV2 (nuget.go:250-277) — the namespaced entry. chi routes
+  // the shape through a path regex, `Packages\(Id='([^']+)',Version='([^']+)'\)`;
+  // Hono's router cannot compile embedded params inside parens, so the route
+  // rides the Packages(Id=* prefix wildcard and the handler re-pins upstream's
+  // regex over the decoded remainder (raw-quote and %27 URL shapes decode to
+  // the same string). A non-match is the router's 404.
+  const nugetLeafV2 = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      const builder = new NugetLinkBuilder(nugetBaseOf(origin, owner.username));
+      const rawPath = c.req.path;
+      const marker = "Packages(Id=";
+      const nugetAt = rawPath.indexOf("/nuget/");
+      const markerAt = nugetAt === -1 ? -1 : rawPath.indexOf(marker, nugetAt);
+      const match =
+        markerAt !== -1
+          ? /^'([^']*)',Version='([^']*)'\)$/.exec(rawPath.slice(markerAt + marker.length))
+          : null;
+      if (match === null) return nugetApiError(404, "");
+      const id = match[1] ?? "";
+      const version = match[2] ?? "";
+      const pv = await getVersionByNameAndVersion(c.env.DB, owner.id, "nuget", id, version);
+      if (pv === null) return nugetApiError(404, "package does not exist");
+      const pkg = await getPackageByName(c.env.DB, owner.id, "nuget", id);
+      if (pkg === null) return nugetApiError(404, "package does not exist");
+      const descriptor = await getNugetDescriptor(c.env.DB, pkg, pv);
+      return nugetXmlResponse(createEntryXml(builder, descriptor, true));
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  };
+  app.get("/:username/nuget/Packages(Id=*", (c) => nugetLeafV2(c));
+
+  // The V2 feeds (SearchServiceV2 / EnumeratePackageVersionsV2, nuget.go:124-356)
+  // with the next-link arm when the page filled.
+  const nugetFeed = async (c: Context<{ Bindings: Env }>, kind: "search" | "enumerate"): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      const params = new URL(c.req.url).searchParams;
+      let found;
+      let nextPath: string;
+      const nextQuery: [string, string][] = [];
+      if (kind === "search") {
+        const term = getNugetSearchTerm(params);
+        found = await nugetSearchLatestVersionsPaginated(
+          c.env.DB,
+          owner.id,
+          term,
+          formInt(params, "$skip"),
+          formInt(params, "$top"),
+        );
+        nextPath = "Search()";
+        const searchTerm = (params.get("searchTerm") ?? "").trim();
+        const filter = (params.get("$filter") ?? "").trim();
+        if (searchTerm !== "") nextQuery.push(["searchTerm", searchTerm]);
+        if (filter !== "") nextQuery.push(["$filter", filter]);
+      } else {
+        const packageName = (params.get("id") ?? "")
+          .trim()
+          .replace(/^'+/, "")
+          .replace(/'+$/, "");
+        found = await nugetSearchVersionsPaginated(
+          c.env.DB,
+          owner.id,
+          packageName,
+          formInt(params, "$skip"),
+          formInt(params, "$top"),
+        );
+        nextPath = "FindPackagesById()";
+        if (packageName !== "") nextQuery.push(["id", packageName]);
+      }
+      const next =
+        found.rows.length === found.take
+          ? {
+              path: nextPath,
+              query: [...nextQuery, ["$skip", String(found.skip + found.take)] as [string, string], ["$top", String(found.take)] as [string, string]],
+            }
+          : undefined;
+      const descriptors = [];
+      for (const row of found.rows) descriptors.push(await getNugetDescriptor(c.env.DB, row.pkg, row.version));
+      return nugetXmlResponse(
+        createFeedResponseXml(new NugetLinkBuilder(nugetBaseOf(origin, owner.username), next), found.total, descriptors),
+      );
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  };
+  app.get("/:username/nuget/Packages()", (c) => nugetFeed(c, "search"));
+  app.get("/:username/nuget/Search()", (c) => nugetFeed(c, "search"));
+  app.get("/:username/nuget/FindPackagesById()", (c) => nugetFeed(c, "enumerate"));
+
+  // The /$count arms (nuget.go:176-188 / :359-375) — plain-text integers.
+  const nugetSearchCount = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const term = getNugetSearchTerm(new URL(c.req.url).searchParams);
+      return nugetCountResponse(await nugetCountPackages(c.env.DB, owner.id, term));
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  };
+  app.get("/:username/nuget/Packages()/$count", (c) => nugetSearchCount(c));
+  app.get("/:username/nuget/Search()/$count", (c) => nugetSearchCount(c));
+  app.get("/:username/nuget/FindPackagesById()/$count", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const packageName = (new URL(c.req.url).searchParams.get("id") ?? "")
+        .trim()
+        .replace(/^'+/, "")
+        .replace(/'+$/, "");
+      return nugetCountResponse(await nugetCountVersions(c.env.DB, owner.id, packageName));
+    } catch (error) {
+      return nugetErrorResponse(error);
+    }
+  });
+
   return app;
 }
 
