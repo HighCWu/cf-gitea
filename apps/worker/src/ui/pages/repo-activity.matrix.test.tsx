@@ -10,14 +10,15 @@
  *     Go-AddDate window re-admitting the old closed issue;
  *   - the COUNTS rendering: the Overview bars/cards off the landed D1
  *     aggregates (issues opened/closed/active, PRs opened/merged, the
- *     draft-excluded published releases), the code sentence off the engine
- *     walk (default-branch count, all-branch oid-deduped count, author
- *     count) and the divider lists' shapes (the merged purple row, the
- *     tag-only release's plain text, the unresolved Open row);
- *   - the DEGRADED arms: the counts-first "not yet" placeholder standing in
- *     for the --numstat add/del tail (the census's counts-only doctrine —
- *     the follow-up is the engine-shaped activityStats(ref, period) RPC),
- *     and the no_git_activity empty state with the chart div withheld;
+ *     draft-excluded published releases), the code sentence off the
+ *     activityStats RPC (the M2a boundary: first-parent commit count,
+ *     author count, the numstat add/del/files tail — the ratified
+ *     commitCountInAllBranches cut omits the "to all branches" arm) and
+ *     the divider lists' shapes (the merged purple row, the tag-only
+ *     release's plain text, the unresolved Open row);
+ *   - the CODE ARMS: the real numstat-shaped sentence tail (the counts-
+ *     first "not yet" placeholder is retired with the RPC landing), and
+ *     the no_git_activity empty state with the chart div withheld;
  *   - the VISIBILITY posture: anonymous-on-public 200, anonymous-on-private
  *     404 shell, the MustBeNotEmpty gate (web.go:1636) and the unborn
  *     non-empty row (activity.go:51-60's default_branch_not_exist arm) both
@@ -394,16 +395,23 @@ describe("the activity page mounts (period arms + counts + lists)", () => {
     expect(html).toContain("Closed Issue</a>");
     expect(html).toContain("New Issues</a>");
 
-    // The code sentence (the engine walk): weekly window → the −2d and −1h
-    // commits (the −30d root is out), 2 authors, oid-dedup across ONE branch.
+    // The code sentence (the activityStats RPC — the M2a boundary):
+    // weekly window → the −2d and −1h first-parent commits (the −30d root
+    // is out), 2 authors (alice + bob).
     expect(html).toContain("Excluding merges,");
     expect(html).toContain("<strong>2 authors</strong> have pushed");
-    expect(html).toContain("to main and");
-    expect(html).toContain("to all branches.");
-    // The census's counts-first DEGRADED tail: no additions/deletions text,
-    // the placeholder instead, and the chart div for the official bundle.
-    expect(html).not.toContain("additions");
-    expect(html).toContain("File change statistics are not yet aggregated for this page.");
+    // The ratified M2a cut: no all-branches arm — the first sentence ends
+    // at "to main." (upstream's "and N commits to all branches." is the
+    // omitted CommitCountInAllBranches render, pulse.tmpl:97-98).
+    expect(html).toContain("to main. On main,");
+    expect(html).not.toContain("to all branches");
+    // The RPC's numstat tail (the counts-first placeholder is retired):
+    // the window's two commits each add one README line — 1 path, +2/−0.
+    expect(html).toContain("<strong>1 file</strong> has changed");
+    expect(html).toContain("and there have been");
+    expect(html).toContain('<strong class="tw-text-green">2 additions</strong>');
+    expect(html).toContain('<strong class="tw-text-red">0 deletions</strong>.');
+    // The chart div for the official bundle.
     expect(html).toContain('id="repo-activity-top-authors-chart"');
 
     // The divider lists: merged (purple), proposed, closed, new, unresolved.
@@ -468,8 +476,10 @@ describe("the activity page mounts (period arms + counts + lists)", () => {
     // Out: everything created at −2d or older.
     expect(html).not.toContain(">actmx mid issue</a>");
     expect(html).not.toContain(">actmx first release</a>");
-    // Code: daily window → ONLY the −1h tip (1 commit, 1 author).
-    expect(html).toContain("<strong>1 author</strong> has pushed");  });
+    // Code: daily window → ONLY the −1h tip (1 commit, 1 author, +1/−0).
+    expect(html).toContain("<strong>1 author</strong> has pushed");
+    expect(html).toContain('<strong class="tw-text-green">1 addition</strong>');
+  });
 
   it("an unknown period segment renders the WEEKLY window with the weekly item active (no 4xx)", async () => {
     await seedActmxFixture();
@@ -495,7 +505,9 @@ describe("the activity page mounts (period arms + counts + lists)", () => {
     // rides the closed list.
     expect(html).toContain(`href="/actmx-owner/act/issues/${fx.issueDormant.index}"`);
     expect(html).toContain(">actmx old closed issue</a>");
-    expect(html).toContain("<strong>2 authors</strong>"); // alice + bob (alice authored two) over the yearly walk
+    expect(html).toContain("<strong>2 authors</strong>"); // alice + bob (alice authored two) over the yearly first-parent fold
+    // The fold's numstat tail: all three commits add one README line each.
+    expect(html).toContain('<strong class="tw-text-green">3 additions</strong>');
   });
 
   it("the no-git-activity window renders the empty state and withholds the chart div", async () => {

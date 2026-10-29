@@ -28,22 +28,52 @@
  * canonical period's locale label, so `/activity/bogus` shows the weekly
  * item active — upstream-exact.
  *
- * ## Data (§3.2 — the landed stores; §6 method: counts-first)
+ * ## Data (§3.2 — the git counts on the M2a boundary RPC; the D1 lists stay)
  *
  * The census classifies R14 (b) NEEDS-API with "counts-only degradation
- * shippable first". This module IS that first cut — every number comes off
- * a landed store, no new engine RPC:
+ * shippable first"; the landed cut WAS that degradation. The git-derived
+ * counts now come off the engine's boundary RPC `activityStats(ref,
+ * period)` (SPEC-0015 M2a — the `EngineClient` wrapper in ../engine), fed
+ * the same canonical period the page already renders:
  *
- * - **Issues/PRs/releases/unresolved counters + lists** — plain D1
- *   aggregates over the landed tables, the upstream SQL postures verbatim
- *   (models/activities/repo_activity.go): opened issues = created ≥ from
- *   (newlyCreatedIssues:249-253), closed issues = closed ≥ from
- *   (issuesForActivityStatement:336-346), active issues = created ≥ from OR
- *   closed ≥ from (activeIssues:255-262), opened PRs = the pull_request ⋈
- *   issue join with `is_closed = false AND created_unix ≥ from`
- *   (pullRequestsForActivityStatement:221-239's merged=false arm), merged
- *   PRs = `has_merged AND merged_unix ≥ from`, unresolved = `is_closed =
- *   false AND created < from AND updated ≥ from`
+ * - **Code arm** — upstream's `CodeActivityStats`
+ *   (modules/git/repo_stats.go:20-28): the RPC walks the default branch's
+ *   FIRST-PARENT chain with merges excluded from the fold
+ *   (repo_stats.go:57-66's `log --numstat --no-merges --first-parent
+ *   <branch> --since` arm), windows on COMMITTER time (git --since
+ *   semantics), keys per-author counts by lowercased email
+ *   (repo_stats.go:113-118), and folds the numstat-shaped totals
+ *   (repo_stats.go:119-149). This retires the landed walk's ledger of
+ *   reductions (the all-parents walk, the per-branch caps, the missing
+ *   shortstat): `commitCount`/`authorCount` are upstream-exact and the
+ *   counts-first "not yet" placeholder is GONE — `changedFiles`/
+ *   `additions`/`deletions` render the real sentence tail. The RPC's
+ *   per-author `authors[]` has no SSR render (upstream's pulse renders
+ *   aggregates only) and its `truncated` flag (the MAX_STATS_SCAN budget
+ *   exit — flagged, never null) has no upstream counterpart to render;
+ *   both are ignored here.
+ * - **RATIFIED CUT: CommitCountInAllBranches** — repo_stats.go:26's
+ *   `rev-list --count --no-merges --branches=* --since` arm (:44-55) is
+ *   NOT in the v1 RPC (SPEC-0015 M2a Open question 2, ratified: a second
+ *   all-refs walk per answer is a real per-answer cost for a header
+ *   nicety). Upstream's pulse renders it TWICE and ours omits both: the
+ *   sentence's "and N commits to all branches." middle arm (pulse.tmpl:
+ *   97-98 — ours ends the first sentence at "to {branch}.") and the
+ *   empty-state gate (pulse.tmpl:84-88 gates `no_git_activity` on it —
+ *   ours gates on `commitCount === 0`, the default-branch proxy the cut
+ *   leaves us: identical on single-branch repos; a side-branch-only window
+ *   renders the empty state where upstream would render the sentence).
+ * - **Issues/PRs/releases/unresolved counters + lists** — UNCHANGED plain
+ *   D1 aggregates over the landed tables: upstream derives these from D1
+ *   too (models/activities/repo_activity.go's SQL, NOT git), so only the
+ *   git-derived counts switched source. The postures verbatim: opened
+ *   issues = created ≥ from (newlyCreatedIssues:249-253), closed issues =
+ *   closed ≥ from (issuesForActivityStatement:336-346), active issues =
+ *   created ≥ from OR closed ≥ from (activeIssues:255-262), opened PRs =
+ *   the pull_request ⋈ issue join with `is_closed = false AND
+ *   created_unix ≥ from` (pullRequestsForActivityStatement:221-239's
+ *   merged=false arm), merged PRs = `has_merged AND merged_unix ≥ from`,
+ *   unresolved = `is_closed = false AND created < from AND updated ≥ from`
  *   (FillUnresolvedIssues:225-239), published releases = `is_draft = false
  *   AND published_unix ≥ from` (releasesForActivityStatement:355-359).
  *   Per-arm author counts ride `count(distinct poster_id/publisher_id)`
@@ -51,33 +81,6 @@
  *   List ROWS render up to ACTIVITY_LIST_CAP per arm (upstream renders the
  *   unbounded list; the counts stay exact via separate COUNT reads — the
  *   documented cap divergence).
- * - **Code arm** — the upstream `CodeActivityStats`
- *   (modules/git/repo_stats.go:17-27) counts via the engine walk, the
- *   activity-author-data idiom: `listRefs` gives the branch universe
- *   (name-sorted, ACTIVITY_MAX_BRANCHES-capped), `listLog` pages the
- *   date-ordered walk with the window filter and the `--no-merges` arm
- *   client-of-engine, deduplicated by oid across branches (one
- *   `--branches=*` walk counts a commit once — repo_stats.go:53-60's
- *   `rev-list --count --no-merges --branches=* --since` arm for
- *   `CommitCountInAllBranches`; the default-branch walk for `CommitCount` +
- *   `AuthorCount`). Documented reductions (the activity-author-data module
- *   header carries the full ledger): our walk is ALL-parents
- *   (`git log --date-order`), so side-branch commits reachable from the
- *   default branch count where upstream's `--first-parent` walk excludes
- *   them; per-branch pages cap at ACTIVITY_BRANCH_COMMIT_CAP with a
- *   date-order early stop; a branch whose listLog page fails transport
- *   degrades its share silently (never 500s — upstream's GetCodeActivityStats
- *   error is a ServerError).
- * - **DEGRADED: additions / deletions / changed files** — upstream folds
- *   them out of `git log --numstat` (repo_stats.go:65-68); we have no
- *   shortstat read. The sentence renders without the add/del tail plus the
- *   "not yet" placeholder line, per the census's counts-first doctrine.
- *   The follow-up is the engine-shaped `activityStats(ref, period)` RPC:
- *   the DO's private `computeStats` (packages/git-engine repo.ts, cached
- *   per tip+period, MAX_STATS_SCAN-bounded) already aggregates commits per
- *   author; folding `readDiff`-shaped add/del totals into the same cached
- *   record and exposing it at the boundary is the recorded next step (the
- *   census R14 two-step, engine arm).
  * - **Top-authors chart** — upstream renders it CLIENT-side
  *   (`<div id="repo-activity-top-authors-chart">`, pulse.tmpl:108; the
  *   official bundle's initRepoActivityTopAuthorsChart mounts a Vue app that
@@ -121,17 +124,15 @@ import { and, asc, desc, eq, gte, lt, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { Child } from "hono/jsx";
 
-import type { CommitJson, RefsResult } from "@cf-gitea/git-engine";
-
 import { loadRepoSettings } from "../../api/services/repo-settings";
-import { engineReads } from "../../api/services/engine";
 import { issues, pullRequests, releases } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
+import { engineClient } from "../engine";
 import type { IconName } from "../icons";
 import { pathEscapeSegments } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
-import { ACTIVITY_BRANCH_COMMIT_CAP, ACTIVITY_MAX_BRANCHES, parseActivityPeriod } from "./activity-author-data";
+import { parseActivityPeriod } from "./activity-author-data";
 
 /** Page chrome text (component-local, the tabLocale pattern — the strings
  *  cite upstream's locale keys, locale_en-US.json's repo.activity block). */
@@ -141,8 +142,6 @@ export const activityLocale = {
   filter_label: "Period:", // "repo.activity.period.filter_label"
   overview: "Overview", // "repo.activity.overview"
   no_git_activity: "There has been no commit activity in this period.", // "repo.activity.no_git_activity"
-  stats_pending:
-    "File change statistics are not yet aggregated for this page.", // the counts-first degradation placeholder
   published_label: "Published", // "repo.activity.published_release_label"
   merged_label: "Merged", // "repo.activity.merged_prs_label"
   opened_pr_label: "Proposed", // "repo.activity.opened_prs_label"
@@ -172,8 +171,6 @@ export function periodLabel(key: string): string {
  *  reads; upstream renders the unbounded list (the module doc's cap). */
 export const ACTIVITY_LIST_CAP = 50;
 
-const ENGINE_LOG_PAGE = 100; // the engine's listLog page ceiling (repo.ts listLog)
-
 /** One list row — the render subset of an issue/PR arm. */
 export interface ActivityIssueItem {
   index: number;
@@ -192,18 +189,24 @@ export interface ActivityReleaseItem {
   publishedUnix: number;
 }
 
-/** The code arm's counts (the CodeActivityStats subset ours can compute). */
+/** The code arm's counts — the upstream `CodeActivityStats` render subset
+ *  (repo_stats.go:20-28) minus `CommitCountInAllBranches`: the ratified
+ *  SPEC-0015 M2a cut omits it from the boundary RPC, so the sentence drops
+ *  the all-branches arm (the module doc's divergence note). */
 export interface ActivityCodeCounts {
-  /** Non-merge commits reachable from the default branch in-window
-   *  (upstream `CommitCount`, the `--first-parent defaultBranch` walk —
-   *  ours is the all-parents reduction, the module doc). */
+  /** Non-merge commits on the default branch's first-parent chain in-window
+   *  (upstream `CommitCount` — the `--first-parent` walk, upstream-exact). */
   commitCount: number;
-  /** Non-merge commits across all branches, oid-deduplicated (upstream
-   *  `CommitCountInAllBranches`). */
-  commitCountAllBranches: number;
-  /** Distinct author emails on the default-branch walk (upstream
-   *  `AuthorCount`). */
+  /** Distinct author emails in the window (upstream `AuthorCount`). */
   authorCount: number;
+  /** Distinct paths changed across the window's folded commits (upstream
+   *  `ChangedFiles`; binary/over-cap files still contribute their path). */
+  changedFiles: number;
+  /** Window line-additions total (upstream `Additions`; binary/over-cap
+   *  files contribute their path, not counts — numstat's `-` skip). */
+  additions: number;
+  /** Window line-deletions total (upstream `Deletions`). */
+  deletions: number;
 }
 
 /** The issues arm (upstream ActivityStats' issue half). `activeCount` is
@@ -259,74 +262,6 @@ export interface RepoActivityData {
 // ---------------------------------------------------------------------------
 // The loader
 // ---------------------------------------------------------------------------
-
-/** The engine walk subset (the engineReads slice this module reads). */
-type ActivityReads = ReturnType<typeof engineReads>;
-
-/** One branch's in-window non-merge commits (the activity-author-data
- *  `branchWindowCommits` posture: ENGINE_LOG_PAGE pages under
- *  ACTIVITY_BRANCH_COMMIT_CAP, the window + merge filters client-of-engine,
- *  the date-order early stop). */
-async function branchWindowCommits(reads: ActivityReads, branch: string, cutoffMs: number): Promise<CommitJson[]> {
-  const out: CommitJson[] = [];
-  for (let ofs = 0; ofs < ACTIVITY_BRANCH_COMMIT_CAP; ofs += ENGINE_LOG_PAGE) {
-    const page = await reads.listLog(branch, { ofs, n: ENGINE_LOG_PAGE });
-    if (page === null || page.commits.length === 0) break; // transport failure / walk end
-    for (const commit of page.commits) {
-      if (commit.committer.time * 1000 < cutoffMs) continue; // --since arm
-      if (commit.parents.length > 1) continue; // --no-merges arm
-      out.push(commit);
-    }
-    const oldest = page.commits[page.commits.length - 1];
-    if (!page.more || oldest === undefined || oldest.committer.time * 1000 < cutoffMs) break;
-  }
-  return out;
-}
-
-/** The all-branches count (upstream `rev-list --count --no-merges
- *  --branches=* --since`, repo_stats.go:53-60): name-sorted capped branches,
- *  8-wide batches per DO round-trip group, per-oid dedup. Branch walks that
- *  fail transport degrade their share silently (the module doc). */
-async function allBranchCommitCount(reads: ActivityReads, branches: string[], cutoffMs: number): Promise<number> {
-  const seen = new Set<string>();
-  for (let i = 0; i < branches.length; i += 8) {
-    const groups = await Promise.all(
-      branches.slice(i, i + 8).map((branch) => branchWindowCommits(reads, branch, cutoffMs)),
-    );
-    for (const group of groups) {
-      for (const commit of group) {
-        seen.add(commit.oid);
-      }
-    }
-  }
-  return seen.size;
-}
-
-/** The default-branch walk (upstream `log --numstat --no-merges
- *  --first-parent {branch} --since`, repo_stats.go:65-79 — the count and
- *  author arms; the numstat arm is the degraded placeholder). */
-async function defaultBranchCounts(
-  reads: ActivityReads,
-  branch: string,
-  cutoffMs: number,
-): Promise<{ commitCount: number; authorCount: number }> {
-  const emails = new Set<string>();
-  let count = 0;
-  for (let ofs = 0; ofs < ACTIVITY_BRANCH_COMMIT_CAP; ofs += ENGINE_LOG_PAGE) {
-    const page = await reads.listLog(branch, { ofs, n: ENGINE_LOG_PAGE });
-    if (page === null || page.commits.length === 0) break;
-    for (const commit of page.commits) {
-      if (commit.committer.time * 1000 < cutoffMs) continue;
-      if (commit.parents.length > 1) continue;
-      count += 1;
-      emails.add(commit.author.email.toLowerCase());
-    }
-    const oldest = page.commits[page.commits.length - 1];
-    if (!page.more || oldest === undefined || oldest.committer.time * 1000 < cutoffMs) break;
-  }
-  emails.delete(""); // the empty-email skip (repo_activity.go:95's class)
-  return { commitCount: count, authorCount: emails.size };
-}
 
 /** The issues arm's three SQL arms (upstream FillIssues:174-220 + activeIssues
  *  :255-262) — rows under the cap plus the exact count/author aggregates. */
@@ -504,12 +439,13 @@ async function loadUnresolvedArm(
 }
 
 /**
- * Load the activity page's data. `null` = the 404 family: the engine
- * transport failed on `listRefs` (the commits-page convention — upstream
+ * Load the activity page's data. `null` = the 404 family: the engine RPC
+ * answered null — a transport failure (the commits-page convention: upstream
  * ServerErrors 500, the documented divergence) or the default branch does
- * not exist (activity.go:51-60's `default_branch_not_exist` NotFound arm).
- * The D1 arms are unconditionally computable once the repo resolves; the
- * unit toggles drop whole arms.
+ * not exist / tip unpeelable (activity.go:51-60's `default_branch_not_exist`
+ * NotFound arm — activityStats' unresolvable-ref null covers both). The D1
+ * arms are unconditionally computable once the repo resolves; the unit
+ * toggles drop whole arms.
  */
 export async function loadRepoActivityData(
   env: Env,
@@ -519,34 +455,25 @@ export async function loadRepoActivityData(
 ): Promise<RepoActivityData | null> {
   const now = options.now ?? new Date();
   const { period, from } = parseActivityPeriod(periodSegment, now);
-  const fromMs = from.getTime();
 
-  // The code arm's ref universe — also the default-branch-exist check
-  // (activity.go:51-60): the strict `refs/heads/{defaultBranch}` probe.
-  const reads = engineReads(env, repo);
-  const refs: RefsResult | null = await reads.listRefs();
-  if (refs === null) return null; // transport failure (documented divergence)
-  const branches = refs.refs
-    .map((ref) => ref.name)
-    .filter((name) => name.startsWith("refs/heads/"))
-    .map((name) => name.slice("refs/heads/".length));
-  if (!branches.includes(repo.defaultBranch)) return null; // default_branch_not_exist
+  // The code arm — the engine boundary RPC against the default branch
+  // (activity.go:63-66's canReadCode arm; the code unit has no landed
+  // toggle, so it is always read). The page's CANONICAL period feeds the
+  // RPC (its internal re-normalization is the identity on the seven keys),
+  // so the git counts and the D1 arms share one window even for unknown
+  // segments; the RPC computes its own window start off the wall clock —
+  // the sub-second skew against `from` is immaterial to the counts.
+  const stats = await engineClient(env, `${repo.ownerNamespace}/${repo.slug}`).activityStats(repo.defaultBranch, period);
+  if (stats === null) return null; // transport failure / default_branch_not_exist — the 404 family
 
-  // The engine walks + the unit-gated D1 arms, one fan-out.
+  // The unit-gated D1 arms (upstream's GetActivityStats issue/PR/release
+  // halves are D1 SQL — models/activities/repo_activity.go — they stay on
+  // the landed stores).
   const settings = await loadRepoSettings(env.DB, repo.id);
-  const sorted = branches.sort().slice(0, ACTIVITY_MAX_BRANCHES);
-  const [code, issueStats, pullStats, releaseStats] = await Promise.all([
-    Promise.all([
-      defaultBranchCounts(reads, repo.defaultBranch, fromMs),
-      allBranchCommitCount(reads, sorted, fromMs),
-    ]).then(([defaults, allBranches]) => ({
-      commitCount: defaults.commitCount,
-      authorCount: defaults.authorCount,
-      commitCountAllBranches: allBranches,
-    })),
+  const [issueStats, pullStats, releaseStats] = await Promise.all([
     settings.hasIssues ? loadIssueArm(env.DB, repo.id, from) : Promise.resolve(null),
     settings.hasPullRequests ? loadPullArm(env.DB, repo.id, from) : Promise.resolve(null),
-    settings.hasReleases ? loadReleaseArm(env.DB, repo.id, Math.floor(fromMs / 1000)) : Promise.resolve(null),
+    settings.hasReleases ? loadReleaseArm(env.DB, repo.id, Math.floor(from.getTime() / 1000)) : Promise.resolve(null),
   ]);
 
   // The unresolved arm needs (issues OR pulls) readable, is_pull-narrowed to
@@ -565,7 +492,13 @@ export async function loadRepoActivityData(
     period,
     dateFrom: from,
     dateUntil: now,
-    code,
+    code: {
+      commitCount: stats.commitCount,
+      authorCount: stats.authorCount,
+      changedFiles: stats.changedFiles,
+      additions: stats.additions,
+      deletions: stats.deletions,
+    },
     issues: issueStats,
     pulls: pullStats,
     releases: releaseStats,
@@ -711,9 +644,14 @@ function DividerHeader(props: { id: string; icon: IconName; children: Child }) {
 }
 
 /** The code segment (pulse.tmpl:83-112): the counts sentence + the chart
- *  div, or the no-activity empty state. */
+ *  div, or the no-activity empty state. The empty-state gate and the
+ *  sentence's all-branches arm are upstream's `CommitCountInAllBranches`
+ *  renders (pulse.tmpl:84-88 and :97-98) — both omitted under the ratified
+ *  M2a cut: the gate falls to the default-branch `commitCount`, the
+ *  sentence's first arm ends at "to {branch}." (upstream's locale string
+ *  "to %s and" feeds the dropped middle arm). */
 function CodeSegment(props: { repo: RepoRow; code: ActivityCodeCounts }) {
-  if (props.code.commitCountAllBranches === 0) {
+  if (props.code.commitCount === 0) {
     return (
       <div class="ui tw-text-center segment">
         <h4 class="ui header">{activityLocale.no_git_activity}</h4>
@@ -731,11 +669,19 @@ function CodeSegment(props: { repo: RepoRow; code: ActivityCodeCounts }) {
         <strong>
           {props.code.commitCount} {plural(props.code.commitCount, "commit", "commits")}
         </strong>{" "}
-        to {props.repo.defaultBranch} and{" "}
+        to {props.repo.defaultBranch}. On {props.repo.defaultBranch},{" "}
         <strong>
-          {props.code.commitCountAllBranches} {plural(props.code.commitCountAllBranches, "commit", "commits")}
+          {props.code.changedFiles} {plural(props.code.changedFiles, "file", "files")}
         </strong>{" "}
-        to all branches. <span class="tw-text-grey">{activityLocale.stats_pending}</span>
+        {plural(props.code.changedFiles, "has changed", "have changed")} and there have been{" "}
+        <strong class="tw-text-green">
+          {props.code.additions} {plural(props.code.additions, "addition", "additions")}
+        </strong>{" "}
+        and{" "}
+        <strong class="tw-text-red">
+          {props.code.deletions} {plural(props.code.deletions, "deletion", "deletions")}
+        </strong>
+        .
       </div>
       <div class="ui attached segment">
         {/* pulse.tmpl:108 — the official bundle's chart mount point; the
