@@ -5239,7 +5239,9 @@ async function repoGitHooksPage(c: Context<{ Bindings: Env }>): Promise<Response
   if (gate !== null) return gate;
   const { respond } = resolved;
   if (resolved.route.family !== "settings-githooks") return respond(await c.notFound()); // drift guard
-  const data = await loadRepoGitHooks(c.env.REPO_PACKS, resolved.repo);
+  // c.env.DB rides the loader's optional seam — the nav's conditional Actions
+  // block flag (navbar.tmpl:47; loadRepoGitHooks's producer note).
+  const data = await loadRepoGitHooks(c.env.REPO_PACKS, resolved.repo, c.env.DB);
   return respond(c.html(renderRepoGitHooksListPage({ ctx: resolved.ctx, data }), 200));
 }
 
@@ -5251,8 +5253,9 @@ async function repoGitHookEditPage(c: Context<{ Bindings: Env }>): Promise<Respo
   const { ctx, respond } = resolved;
   const route = resolved.route;
   if (route.family !== "settings-githook" || route.name === undefined) return respond(await c.notFound()); // drift guard
-  // ErrNotValidHook → the 404 shell (the module handoff).
-  const data = await loadRepoGitHookEdit(c.env.REPO_PACKS, resolved.repo, route.name);
+  // ErrNotValidHook → the 404 shell (the module handoff). c.env.DB rides the
+  // loader's optional seam — the nav's Actions flag (navbar.tmpl:47).
+  const data = await loadRepoGitHookEdit(c.env.REPO_PACKS, resolved.repo, route.name, c.env.DB);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderRepoGitHookEditPage({ ctx, data }), 200));
 }
@@ -5268,7 +5271,8 @@ async function repoGitHookSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   const route = resolved.route;
   if (route.family !== "settings-githook" || route.name === undefined) return respond(await c.notFound()); // drift guard
   const form = parseRepoGitHookForm(await readUrlEncodedForm(c.req.raw));
-  const data = await loadRepoGitHookEdit(c.env.REPO_PACKS, repo, route.name);
+  // c.env.DB rides the loader's optional seam — the nav's Actions flag.
+  const data = await loadRepoGitHookEdit(c.env.REPO_PACKS, repo, route.name, c.env.DB);
   if (data === null) return respond(c.html(renderNotFound(resolved.ctx), 404));
   await applyRepoGitHook(c.env.REPO_PACKS, repo, route.name, form);
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/hooks/git` } }));
@@ -5290,6 +5294,9 @@ async function repoTagsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     form: row !== null ? await editFormOfTag(c.env.DB, row) : emptyTagProtectionForm(),
     editing: row,
     saved: url.searchParams.get("saved") === "1",
+    // The nav's conditional Actions block flag (navbar.tmpl:47 — the
+    // settings.tsx hasActions prop).
+    hasActions: (await loadRepoSettings(c.env.DB, repo.id)).hasActions,
   };
   return respond(c.html(renderTagProtectionPage({ ctx, data, error: null }), 200));
 }
@@ -5326,6 +5333,8 @@ async function repoTagsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
     form,
     editing: null,
     saved: false,
+    // The nav's conditional Actions block flag (navbar.tmpl:47).
+    hasActions: (await loadRepoSettings(c.env.DB, repo.id)).hasActions,
   };
   return respond(c.html(renderTagProtectionPage({ ctx, data, error: result.message }), 200));
 }
@@ -5346,6 +5355,8 @@ async function repoTagDetailPage(c: Context<{ Bindings: Env }>): Promise<Respons
     form: await editFormOfTag(c.env.DB, row),
     editing: row,
     saved: false,
+    // The nav's conditional Actions block flag (navbar.tmpl:47).
+    hasActions: (await loadRepoSettings(c.env.DB, repo.id)).hasActions,
   };
   return respond(c.html(renderTagProtectionPage({ ctx, data, error: null }), 200));
 }
@@ -6608,6 +6619,9 @@ async function branchProtectionListPage(c: Context<{ Bindings: Env }>): Promise<
           // The default-branch select's options (ce52935's mount — the
           // archived arm renders neither segment, branches.tmpl's wrap).
           branchOptions: repo.isArchived ? [] : await loadDefaultBranchOptions(c.env, repo),
+          // The nav's conditional Actions block flag (navbar.tmpl:47 — the
+          // settings.tsx hasActions prop).
+          hasActions: (await loadRepoSettings(c.env.DB, repo.id)).hasActions,
         },
       }),
       200,
@@ -6632,13 +6646,23 @@ async function branchProtectionEditPage(c: Context<{ Bindings: Env }>): Promise<
   // header — the POST could only 404).
   if (repo.isArchived) {
     return respond(
-      c.html(renderBranchProtectionEditPage({ ctx, data: { form: emptyBranchProtectionForm(), isOrg, rule: null }, error: null }), 200),
+      c.html(
+        renderBranchProtectionEditPage({
+          ctx,
+          data: { form: emptyBranchProtectionForm(), isOrg, rule: null, hasActions: (await loadRepoSettings(c.env.DB, repo.id)).hasActions },
+          error: null,
+        }),
+        200,
+      ),
     );
   }
   const ruleName = url.searchParams.get("rule_name") ?? "";
   const rule = ruleName === "" ? null : (await loadBranchProtectionRules(c.env.DB, repo.id)).find((item) => item.row.ruleName === ruleName) ?? null;
   const form = rule === null ? emptyBranchProtectionForm() : await editFormOfRule(c.env.DB, pair, rule);
-  return respond(c.html(renderBranchProtectionEditPage({ ctx, data: { form, isOrg, rule }, error: null }), 200));
+  // The nav's conditional Actions block flag (navbar.tmpl:47).
+  return respond(
+    c.html(renderBranchProtectionEditPage({ ctx, data: { form, isOrg, rule, hasActions: (await loadRepoSettings(c.env.DB, repo.id)).hasActions }, error: null }), 200),
+  );
 }
 
 /**
@@ -6683,7 +6707,13 @@ async function branchProtectionEditSubmit(c: Context<{ Bindings: Env }>): Promis
     ruleId === 0
       ? null
       : ((await loadBranchProtectionRules(c.env.DB, repo.id)).find((item) => item.row.id === ruleId) ?? null);
-  const data: BranchProtectionEditData = { form, isOrg, rule };
+  const data: BranchProtectionEditData = {
+    form,
+    isOrg,
+    rule,
+    // The nav's conditional Actions block flag (navbar.tmpl:47).
+    hasActions: (await loadRepoSettings(c.env.DB, repo.id)).hasActions,
+  };
   return respond(c.html(renderBranchProtectionEditPage({ ctx, data, error: result.message }), 200));
 }
 

@@ -20,7 +20,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { PRE_RECEIVE_SAMPLE, UPDATE_SAMPLE } from "../../api/routes/git-hooks";
-import { repositories, users } from "../../db/schema";
+import { repositories, repoSettings, users } from "../../db/schema";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
@@ -312,6 +312,34 @@ describe("the nav and the ctx.repo contract", () => {
       "RepoGitHookEditPage requires ctx.repo",
     );
     expect(() => renderRepoGitHooksListPage({ ctx, data: list })).toThrow("RepoGitHooksPage requires ctx.repo");
+  });
+
+  it("lights the nav's Actions block only while the loaded hasActions flag is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
+    // The loaders' D1 seam: omitted = the store-default false (the reduced
+    // nav — the ui/index.ts producer handoff pending), supplied = the row's
+    // flag (the seeded store has none → false).
+    expect((await loadRepoGitHooks(env.REPO_PACKS, repo)).hasActions).toBe(false);
+    expect((await loadRepoGitHooks(env.REPO_PACKS, repo, env.DB)).hasActions).toBe(false);
+    const edit = await loadRepoGitHookEdit(env.REPO_PACKS, repo, "pre-receive", env.DB);
+    expect(edit).not.toBeNull();
+    expect(edit!.hasActions).toBe(false);
+    const db = drizzle(env.DB);
+    await db.insert(repoSettings).values({ repoId: repo.id, hasActions: true }).onConflictDoNothing();
+    try {
+      expect((await loadRepoGitHooks(env.REPO_PACKS, repo, env.DB)).hasActions).toBe(true);
+      const armedEdit = await loadRepoGitHookEdit(env.REPO_PACKS, repo, "pre-receive", env.DB);
+      expect(armedEdit).not.toBeNull();
+      expect(armedEdit!.hasActions).toBe(true);
+      const html = renderToString(<ListForTest data={await loadRepoGitHooks(env.REPO_PACKS, repo, env.DB)} />);
+      expect(html).toContain('href="/alice/demo/settings/actions/secrets"');
+      expect(html).toContain('href="/alice/demo/settings/actions/variables"');
+      // The reduced default: the d1-less data renders no block.
+      const reduced = renderToString(<ListForTest data={await loadRepoGitHooks(env.REPO_PACKS, repo)} />);
+      expect(reduced).not.toContain("/settings/actions/secrets");
+      expect(reduced).not.toContain("/settings/actions/variables");
+    } finally {
+      await db.delete(repoSettings).where(eq(repoSettings.repoId, repo.id));
+    }
   });
 });
 

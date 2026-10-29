@@ -106,6 +106,7 @@
 import { drizzle } from "drizzle-orm/d1";
 
 import { codeUnitAnonymousRead } from "../../git-http/acl";
+import { loadRepoSettings } from "../../api/services/repo-settings";
 import { repoUnits } from "../../db/schema";
 import { BaseLayout, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
@@ -152,10 +153,12 @@ export type CodeUnitPublicAccess = "not-set" | "anonymous-read";
 // The read + write arms (upstream PublicAccess / PublicAccessPost)
 // ---------------------------------------------------------------------------
 
-/** The page's render inputs: the code unit's mode and the navbar
+/** The page's render inputs: the code unit's mode, the navbar
  *  conditional's second arm (`HasAnyUnitPublicAccess`,
  *  repo_permission.go:63-72 — reduces to the same read: the code unit is the
- *  only unit carrying a mode column). */
+ *  only unit carrying a mode column) and the Actions unit flag (the settings
+ *  nav's conditional Actions block — navbar.tmpl:47's unit conditional, the
+ *  settings.tsx `hasActions` prop). */
 export interface RepoPublicAccessData {
   /** The code unit's `anonymous_access_mode === "read"` (the ACL rows 4/5
    *  value — git-http/acl.ts's `codeUnitAnonymousRead`; absent row = false). */
@@ -163,13 +166,18 @@ export interface RepoPublicAccessData {
   /** upstream navbar.tmpl:7's `.Permission.HasAnyUnitPublicAccess` — same
    *  value as `codeAnonymousRead` on this store (the module header). */
   hasAnyPublicAccess: boolean;
+  /** `repo_settings.has_actions` — arms the nav's conditional Actions
+   *  <details> (navbar.tmpl:41-59; the settings.tsx `hasActions` prop). */
+  hasActions: boolean;
 }
 
 /** The page load — the same read the git-HTTP ACL consumes, so the page and
- *  the gate cannot drift (the SPEC-0010 §2.6 one-copy rule). */
+ *  the gate cannot drift (the SPEC-0010 §2.6 one-copy rule), plus the unit
+ *  flags read for the nav's Actions block (the options page's threading). */
 export async function loadRepoPublicAccess(d1: D1Database, repoId: string): Promise<RepoPublicAccessData> {
   const codeAnonymousRead = await codeUnitAnonymousRead(d1, repoId);
-  return { codeAnonymousRead, hasAnyPublicAccess: codeAnonymousRead };
+  const settings = await loadRepoSettings(d1, repoId);
+  return { codeAnonymousRead, hasAnyPublicAccess: codeAnonymousRead, hasActions: settings.hasActions };
 }
 
 /** Parse the urlencoded POST's radio (upstream FormString(CODE_UNIT_FORM_KEY)
@@ -238,6 +246,7 @@ export function RepoPublicAccessPage(props: { ctx: UiContext; data: RepoPublicAc
           active="public_access"
           repo={repo}
           hasAnyPublicAccess={data.hasAnyPublicAccess}
+          hasActions={data.hasActions}
         />
         <div class="flex-container-main">
           <div class="repo-setting-content">

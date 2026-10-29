@@ -98,6 +98,7 @@ describe("loadRepoWikiSettings (the PATCH arm's store, read side)", () => {
     const data = await loadRepoWikiSettings(env.DB, repo);
     expect(data.hasWiki).toBe(true);
     expect(data.defaultWikiBranch).toBe("main");
+    expect(data.hasActions).toBe(false);
   });
 
   it("carries the stored flag and the repository's effective wiki branch", async () => {
@@ -112,6 +113,28 @@ describe("loadRepoWikiSettings (the PATCH arm's store, read side)", () => {
     expect(data.hasWiki).toBe(false);
     expect(data.defaultWikiBranch).toBe("trunk"); // wikiBranch(pair) = the repo default (services/wiki.ts:348)
   });
+
+  it("lights the nav's Actions block only while the stored has_actions flag is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
+    const { saveRepoSettings } = await import("../../api/services/repo-settings");
+    // The reduced default (no repo_settings row) renders no Actions block.
+    const reduced = await loadRepoWikiSettings(env.DB, repo);
+    expect(reduced.hasActions).toBe(false);
+    expect(renderToString(<PageForTest data={reduced} error={null} saved={false} />)).not.toContain(
+      "/settings/actions/secrets",
+    );
+    // The armed flip lights the <details> + sub-items.
+    await saveRepoSettings(env.DB, repo.id, { hasActions: true }, new Date(T0 * 1000));
+    try {
+      const armed = await loadRepoWikiSettings(env.DB, repo);
+      expect(armed.hasActions).toBe(true);
+      const html = renderToString(<PageForTest data={armed} error={null} saved={false} />);
+      expect(html).toContain('href="/alice/demo/settings/actions/secrets"');
+      expect(html).toContain('href="/alice/demo/settings/actions/variables"');
+    } finally {
+      await saveRepoSettings(env.DB, repo.id, { hasActions: false }, new Date(T0 * 1000));
+    }
+  });
+
 });
 
 // --- the form parse ------------------------------------------------------------
@@ -232,7 +255,7 @@ describe("the wiki panel DOM (options.tmpl:319-355 + 873-880 + 1046-1062 at the 
   });
 
   it("the page renders SettingsNav with the Wiki item active after Mirror (the nav fold: the WikiSettingsNav scaffold is deleted — wave-settingsnav-fold)", () => {
-    const html = renderToString(<PageForTest data={{ hasWiki: true, defaultWikiBranch: "main" }} error={null} saved={false} />);
+    const html = renderToString(<PageForTest data={{ hasWiki: true, hasActions: false, defaultWikiBranch: "main" }} error={null} saved={false} />);
     expect(html).toContain('class="flex-container-nav"');
     expect(html).toContain('href="/alice/demo/settings"');
     expect(html).toContain('href="/alice/demo/settings/collaboration"');
@@ -240,6 +263,8 @@ describe("the wiki panel DOM (options.tmpl:319-355 + 873-880 + 1046-1062 at the 
     expect(html).toContain('href="/alice/demo/settings/branches"');
     expect(html).toContain('href="/alice/demo/settings/mirror"');
     expect(html).toContain('class="active item" href="/alice/demo/settings/wiki"');
+    // The reduced nav carries no Actions block while the flag is false.
+    expect(html).not.toContain("/settings/actions/secrets");
   });
 
   it("throws without a resolved repo (the settings pages' ctx.repo contract)", async () => {

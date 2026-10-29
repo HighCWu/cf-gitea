@@ -121,17 +121,21 @@ export const wikiSettingsLocale = {
 
 /** The panel's render inputs: the stored unit flag (loadRepoSettings) plus
  *  the effective wiki branch (the repository's default — services/wiki.ts's
- *  wikiBranch). */
+ *  wikiBranch) and the Actions unit flag (the settings nav's conditional
+ *  Actions block — navbar.tmpl:47's unit conditional, the settings.tsx
+ *  `hasActions` prop). */
 export interface RepoWikiSettingsData {
   hasWiki: boolean;
+  hasActions: boolean;
   defaultWikiBranch: string;
 }
 
 /** Load the panel (§3.2 — the landed loadRepoSettings read, the same store
- *  the PATCH arm writes and the wiki gate reads). */
+ *  the PATCH arm writes and the wiki gate reads; the same read arms the
+ *  nav's conditional Actions block). */
 export async function loadRepoWikiSettings(d1: D1Database, repo: RepoRow): Promise<RepoWikiSettingsData> {
   const settings = await loadRepoSettings(d1, repo.id);
-  return { hasWiki: settings.hasWiki, defaultWikiBranch: repo.defaultBranch };
+  return { hasWiki: settings.hasWiki, hasActions: settings.hasActions, defaultWikiBranch: repo.defaultBranch };
 }
 
 /** The parsed toggle form — upstream options.tmpl's `enable_wiki` checkbox
@@ -191,7 +195,10 @@ export function RepoWikiSettingsPage(props: {
   return (
     <BaseLayout ctx={ctx} title={wikiSettingsLocale.wiki} pageClass="repository settings wiki">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="wiki" repo={repo} />
+        {/* The panel loads the unit flags — it evaluates navbar.tmpl:47's
+            conditional and lights the nav's Actions block (the options
+            page's hasActions threading). */}
+        <SettingsNav repoLink={repoLink} active="wiki" repo={repo} hasActions={data.hasActions} />
         <div class="flex-container-main">
           {/* options.tmpl's Advanced-section wiki block (options.tmpl:319-355)
               reduced to the landed write arm: the enable checkbox form. */}

@@ -24,7 +24,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import type { RepositoryWithOwner } from "../../api/services/repository";
-import { orgMembers, protectedTags, repositories, teams, users } from "../../db/schema";
+import { orgMembers, protectedTags, repositories, repoSettings, teams, users } from "../../db/schema";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
@@ -169,6 +169,7 @@ function PageForTest(props: { data?: Partial<TagProtectionPageData>; error?: str
     form: props.data?.form ?? emptyTagProtectionForm(),
     editing: props.data?.editing ?? null,
     saved: props.data?.saved ?? false,
+    hasActions: props.data?.hasActions,
   };
   return <TagProtectionPage ctx={{ ...ctx, repo }} data={data} error={props.error ?? null} />;
 }
@@ -434,6 +435,17 @@ describe("the protected-tags panel DOM (tags.tmpl at the pin)", () => {
     expect(renderToString(<PageForTest data={{ isOrg: false }} />)).not.toContain('name="allowlist_teams"');
   });
 
+  it("lights the nav's Actions block only while the data's hasActions flag is set (navbar.tmpl:47 — the settings.tsx hasActions prop)", () => {
+    const armed = renderToString(<PageForTest data={{ hasActions: true }} />);
+    expect(armed).toContain('href="/alice/tagui9100/settings/actions/secrets"');
+    expect(armed).toContain('href="/alice/tagui9100/settings/actions/variables"');
+    // Absent (the reduced default — the ui/index.ts producer handoff pending)
+    // renders no block.
+    const reduced = renderToString(<PageForTest />);
+    expect(reduced).not.toContain("/settings/actions/secrets");
+    expect(reduced).not.toContain("/settings/actions/variables");
+  });
+
   it("renders the rules table: pre pattern cell, No-One cell, user label, edit anchor, delete form", async () => {
     const id = await seedRule(repo.id, "v*", [5]);
     await seedRule(repo.id, "release-*"); // the No-One row
@@ -636,6 +648,26 @@ describe("the mounted list route (GET+POST /{owner}/{repo}/settings/tags) — th
     expect(html).toContain(`class="active item" href="${REPO_PATH}/settings/tags"`);
     expect(html).toContain('id="name_pattern" name="name_pattern"');
     expect(html).toContain(`colspan="3">${tagProtectionLocale.none}</td>`); // the empty arm
+  });
+
+  it("lights the nav's Actions block only while repo_settings.has_actions is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
+    const db = drizzle(env.DB);
+    // The reduced default: no repo_settings row renders no Actions block.
+    const reduced = await adminGet(`${REPO_PATH}/settings/tags`);
+    expect(reduced.status).toBe(200);
+    expect(await reduced.text()).not.toContain("/settings/actions/secrets");
+    // The armed flip through the REAL route: the handler's data literal
+    // passes the loadRepoSettings flag (the settings.tsx hasActions prop).
+    await db.insert(repoSettings).values({ repoId: repo.id, hasActions: true }).onConflictDoNothing();
+    try {
+      const armed = await adminGet(`${REPO_PATH}/settings/tags`);
+      expect(armed.status).toBe(200);
+      const html = await armed.text();
+      expect(html).toContain(`href="${REPO_PATH}/settings/actions/secrets"`);
+      expect(html).toContain(`href="${REPO_PATH}/settings/actions/variables"`);
+    } finally {
+      await db.delete(repoSettings).where(eq(repoSettings.repoId, repo.id));
+    }
   });
 });
 

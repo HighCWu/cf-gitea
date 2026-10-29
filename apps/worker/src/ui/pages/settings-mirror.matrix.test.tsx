@@ -67,7 +67,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { repoMirrors, repositories, users } from "../../db/schema";
+import { repoMirrors, repoSettings, repositories, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
@@ -301,6 +301,27 @@ async function mirrorRow(repoId: string) {
 // --- the §2.5 gates on a private mirror repo (the arms wave-10's public fixture could not carry) ---
 
 describe("the gates on a private mirror repo (anon/stranger/owner/admin)", () => {
+  it("lights the nav's Actions block only while repo_settings.has_actions is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
+    const fx = await ensureFixtures();
+    const db = drizzle(env.DB);
+    // The reduced default: no repo_settings row renders no Actions block.
+    const reduced = await get("/smx-owner/smx-vault/settings/mirror", "smx-owner");
+    expect(reduced.status).toBe(200);
+    expect(await reduced.text()).not.toContain("/settings/actions/secrets");
+    // The armed flip through the REAL route: loadMirrorSettings rides the
+    // unit-flags read (the settings.tsx hasActions prop).
+    await db.insert(repoSettings).values({ repoId: fx.vaultId, hasActions: true }).onConflictDoNothing();
+    try {
+      const armed = await get("/smx-owner/smx-vault/settings/mirror", "smx-owner");
+      expect(armed.status).toBe(200);
+      const html = await armed.text();
+      expect(html).toContain('href="/smx-owner/smx-vault/settings/actions/secrets"');
+      expect(html).toContain('href="/smx-owner/smx-vault/settings/actions/variables"');
+    } finally {
+      await db.delete(repoSettings).where(eq(repoSettings.repoId, fx.vaultId));
+    }
+  });
+
   it("404-shells an anonymous GET invisibly-first (never the login 303; existence hidden)", async () => {
     const res = await get("/smx-owner/smx-vault/settings/mirror");
     expect(res.status).toBe(404);

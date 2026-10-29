@@ -192,6 +192,18 @@ describe("the nav (SettingsNav through the page — the DeployKeysSettingsNav sc
     expect(html).toContain(`>${deployKeysSettingsLocale.deploy_keys}</a>`);
     expect(html).toContain('href="/alice/demo/settings/mirror"');
   });
+
+  it("lights the nav's Actions block only while the loaded hasActions flag is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
+    // No repo_settings row seeded — the store default reads false and the
+    // block stays unrendered.
+    const data = await loadRepoDeployKeys(env.DB, repo);
+    expect(data.hasActions).toBe(false);
+    expect(renderToString(<PageForTest data={data} />)).not.toContain("/settings/actions/secrets");
+    // The armed data lights the <details> + sub-items.
+    const armed = renderToString(<PageForTest data={{ ...data, hasActions: true }} />);
+    expect(armed).toContain('href="/alice/demo/settings/actions/secrets"');
+    expect(armed).toContain('href="/alice/demo/settings/actions/variables"');
+  });
 });
 
 // --- the mounted-route harness (window-2d b54f709; the org-settings-blocked

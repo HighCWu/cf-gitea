@@ -109,6 +109,7 @@
 import { ApiError } from "../../api/errors";
 import { addDeployKeySsh, deleteDeployKeyRow, getDeployKeyRow, listDeployKeys } from "../../api/services/deploy-keys";
 import type { DeployKeyRow } from "../../api/services/deploy-keys";
+import { loadRepoSettings } from "../../api/services/repo-settings";
 import type { IconName } from "../icons";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
@@ -250,10 +251,13 @@ export interface DeployKeyListItem {
 }
 
 /** The page's render inputs. `form` re-renders the add form's submitted
- *  values (the blanks on the plain GET). */
+ *  values (the blanks on the plain GET); `hasActions` arms the settings
+ *  nav's conditional Actions block (navbar.tmpl:47's unit conditional — the
+ *  settings.tsx `hasActions` prop). */
 export interface RepoDeployKeysPageData {
   keys: DeployKeyListItem[];
   form: DeployKeyForm;
+  hasActions: boolean;
 }
 
 /** The web list's single-page ceiling — upstream's web Find is unpaginated
@@ -262,10 +266,12 @@ export interface RepoDeployKeysPageData {
 const LIST_CEILING = 1000;
 
 /** The page load — `now` is the HasRecentActivity clock (fixed-clock tests,
- *  the milestones loader pattern). */
+ *  the milestones loader pattern). The unit-flags read rides along for the
+ *  nav's Actions block (the options page's hasActions threading). */
 export async function loadRepoDeployKeys(d1: D1Database, repo: RepoRow, now: Date = new Date()): Promise<RepoDeployKeysPageData> {
   const activityFloor = now.getTime() - 7 * 24 * 60 * 60 * 1000;
   const { rows } = await listDeployKeys(d1, repo.id, { keyId: 0, fingerprint: "" }, 1, LIST_CEILING);
+  const settings = await loadRepoSettings(d1, repo.id);
   return {
     keys: rows.map((row) => ({
       row,
@@ -273,6 +279,7 @@ export async function loadRepoDeployKeys(d1: D1Database, repo: RepoRow, now: Dat
       hasRecentActivity: row.updatedAt.getTime() > row.createdAt.getTime() && row.updatedAt.getTime() >= activityFloor,
     })),
     form: { title: "", content: "", isWritable: false },
+    hasActions: settings.hasActions,
   };
 }
 
@@ -314,7 +321,10 @@ export function RepoDeployKeysPage(props: { ctx: UiContext; data: RepoDeployKeys
   return (
     <BaseLayout ctx={ctx} title={deployKeysSettingsLocale.deploy_keys} pageClass="repository settings">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="keys" repo={repo} />
+        {/* The page loads the unit flags — it evaluates navbar.tmpl:47's
+            conditional and lights the nav's Actions block (the options
+            page's hasActions threading). */}
+        <SettingsNav repoLink={repoLink} active="keys" repo={repo} hasActions={data.hasActions} />
         <div class="flex-container-main">
           <div class="repo-setting-content">
             <h4 class="ui top attached header">

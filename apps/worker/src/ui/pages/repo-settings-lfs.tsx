@@ -73,6 +73,7 @@ import {
 } from "../../services/lfs/read";
 import { defaultLfsDeps, lfsRepoId } from "../../lfs/router";
 import { isValidPointerFields } from "../../services/lfs/batch";
+import { loadRepoSettings } from "../../api/services/repo-settings";
 import type { RepoRow, UiContext } from "../ui-context";
 import { engineClient } from "../engine";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -119,11 +120,18 @@ function foundText(c: LfsPointerCounters): string {
 // services/lfs/read.ts)
 // ---------------------------------------------------------------------------
 
+/** The settings nav's Actions-block flag (navbar.tmpl:47's unit conditional
+ *  — the settings.tsx `hasActions` prop): the store's unit-flags read, one
+ *  PK query per page load (the options page's hasActions threading). */
+async function navHasActions(env: Env, repo: RepoRow): Promise<boolean> {
+  return (await loadRepoSettings(env.DB, repo.id)).hasActions;
+}
+
 /** The list page's data (LFSFiles). Pure D1 — renders on an unborn HEAD too
  *  (upstream has no MustBeNotEmpty gate on the family). */
 export async function loadLfsFilesPageData(env: Env, repo: RepoRow, page: number): Promise<LfsFilesPageData> {
   const { total, rows } = await listLfsMetaObjects(env.DB, lfsRepoId(repo.id), page, LFS_LIST_PAGE_SIZE);
-  return { total, rows, page, pageSize: LFS_LIST_PAGE_SIZE };
+  return { total, rows, page, pageSize: LFS_LIST_PAGE_SIZE, hasActions: await navHasActions(env, repo) };
 }
 
 /** The detail page's data (LFSFileGet): `null` = the handler's 404 — an
@@ -137,7 +145,7 @@ export async function loadLfsDetailPageData(env: Env, repo: RepoRow, oid: string
   const content = await loadLfsObjectContent(store, repo.storageKey, meta.oid, meta.size);
   // lfs.go:273's RawFileLink — the LFS download endpoint on the .git family.
   const rawLink = `/${repo.ownerNamespace}/${repo.slug}.git/info/lfs/objects/${meta.oid}`;
-  return { meta, content, rawLink };
+  return { meta, content, rawLink, hasActions: await navHasActions(env, repo) };
 }
 
 /** The pointers page's data (LFSPointerFiles). The engine's null ladder
@@ -161,9 +169,10 @@ export async function loadLfsPointersPageData(env: Env, repo: RepoRow, viewerIsA
       pointers: [],
       counters: { numPointers: 0, numAssociated: 0, numAssociatable: 0, numNoExist: 0, numNotAssociated: 0 },
       truncated: false,
+      hasActions: await navHasActions(env, repo),
     };
   }
-  return scanned.answer;
+  return { ...scanned.answer, hasActions: await navHasActions(env, repo) };
 }
 
 /** The find page's data (LFSFileFind): `null` = the handler's 404 — an empty
@@ -181,7 +190,7 @@ export async function loadLfsFindPageData(env: Env, repo: RepoRow, oid: string, 
     refs === null
       ? []
       : await findLfsPointerCommits(scan, refs, listTreeCommits, oid, size, sha);
-  return { oid, size, sha: sha ?? "", results };
+  return { oid, size, sha: sha ?? "", results, hasActions: await navHasActions(env, repo) };
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +202,9 @@ export interface LfsFilesPageData {
   rows: LfsMetaListItem[];
   page: number;
   pageSize: number;
+  /** The settings nav's Actions-block flag (navbar.tmpl:47 — the
+   *  settings.tsx `hasActions` prop). */
+  hasActions: boolean;
 }
 
 export interface LfsFileDetailPageData {
@@ -200,12 +212,18 @@ export interface LfsFileDetailPageData {
   content: LfsObjectContent;
   /** The LFS download endpoint (lfs.go:273's RawFileLink). */
   rawLink: string;
+  /** The settings nav's Actions-block flag (navbar.tmpl:47 — the
+   *  settings.tsx `hasActions` prop). */
+  hasActions: boolean;
 }
 
 export interface LfsPointersPageData {
   pointers: LfsPointerRow[];
   counters: LfsPointerCounters;
   truncated: boolean;
+  /** The settings nav's Actions-block flag (navbar.tmpl:47 — the
+   *  settings.tsx `hasActions` prop). */
+  hasActions: boolean;
 }
 
 export interface LfsFileFindPageData {
@@ -213,6 +231,9 @@ export interface LfsFileFindPageData {
   size: number;
   sha: string;
   results: LfsFindResult[];
+  /** The settings nav's Actions-block flag (navbar.tmpl:47 — the
+   *  settings.tsx `hasActions` prop). */
+  hasActions: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,15 +244,17 @@ export interface LfsFileFindPageData {
  *  upstream templates ("repository settings lfs"). */
 const PAGE_CLASS = "repository settings lfs";
 
-/** The shared shell: BaseLayout + the settings nav with the LFS item lit. */
-function LfsShell(props: { ctx: UiContext; title: string; children: Child }) {
+/** The shared shell: BaseLayout + the settings nav with the LFS item lit.
+ *  `hasActions` arms the nav's conditional Actions block (navbar.tmpl:47 —
+ *  the options page's threading; each page passes its loaded data's flag). */
+function LfsShell(props: { ctx: UiContext; title: string; hasActions: boolean; children: Child }) {
   const repo = props.ctx.repo;
   if (repo === undefined) throw new Error("repo-settings-lfs requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   return (
     <BaseLayout ctx={props.ctx} title={props.title} pageClass={PAGE_CLASS}>
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="lfs" repo={repo} />
+        <SettingsNav repoLink={repoLink} active="lfs" repo={repo} hasActions={props.hasActions} />
         <div class="flex-container-main">{props.children}</div>
       </div>
     </BaseLayout>
@@ -260,7 +283,7 @@ export function RepoSettingsLfsListPage(props: { ctx: UiContext; data: LfsFilesP
   const link = `/${repo.ownerNamespace}/${repo.slug}/settings/lfs`;
   const more = data.page * data.pageSize < data.total;
   return (
-    <LfsShell ctx={ctx} title={repoSettingsLfsLocale.lfs}>
+    <LfsShell ctx={ctx} title={repoSettingsLfsLocale.lfs} hasActions={data.hasActions}>
       <h4 class="ui top attached header">
         {repoSettingsLfsLocale.filelist} ({totalText(data.total)})
         <div class="ui right">
@@ -327,7 +350,7 @@ export function RepoSettingsLfsDetailPage(props: { ctx: UiContext; data: LfsFile
   if (repo === undefined) throw new Error("RepoSettingsLfsDetailPage requires ctx.repo");
   const link = `/${repo.ownerNamespace}/${repo.slug}/settings/lfs`;
   return (
-    <LfsShell ctx={ctx} title={data.meta.oid}>
+    <LfsShell ctx={ctx} title={data.meta.oid} hasActions={data.hasActions}>
       <div class="tab-size-8 non-diff-file-content">
         <h4 class="ui top attached header">
           <a href={link}>{repoSettingsLfsLocale.lfs}</a> / <span class="truncate sha">{data.meta.oid}</span>
@@ -385,7 +408,7 @@ export function RepoSettingsLfsPointersPage(props: { ctx: UiContext; data: LfsPo
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const link = `${repoLink}/settings/lfs`;
   return (
-    <LfsShell ctx={ctx} title={repoSettingsLfsLocale.findpointerfiles}>
+    <LfsShell ctx={ctx} title={repoSettingsLfsLocale.findpointerfiles} hasActions={data.hasActions}>
       <h4 class="ui top attached header">{foundText(data.counters)}</h4>
       {data.truncated ? <div class="ui warning message">{repoSettingsLfsLocale.scan_truncated}</div> : null}
       <div class="ui attached segment">
@@ -456,7 +479,7 @@ export function RepoSettingsLfsFindPage(props: { ctx: UiContext; data: LfsFileFi
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const link = `${repoLink}/settings/lfs`;
   return (
-    <LfsShell ctx={ctx} title={data.oid}>
+    <LfsShell ctx={ctx} title={data.oid} hasActions={data.hasActions}>
       <div class="tab-size-8 non-diff-file-content">
         <h4 class="ui top attached header">
           <a href={link}>{repoSettingsLfsLocale.lfs}</a> / <span class="truncate sha">{data.oid}</span>

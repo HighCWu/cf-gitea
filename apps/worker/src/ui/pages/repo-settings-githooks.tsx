@@ -87,6 +87,7 @@
  */
 
 import { asGitHookName, GIT_HOOK_NAMES, GIT_HOOK_SAMPLES, type GitHookName } from "../../api/routes/git-hooks";
+import { loadRepoSettings } from "../../api/services/repo-settings";
 import type { RepoRow, UiContext } from "../ui-context";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import { SettingsNav } from "./settings";
@@ -148,15 +149,27 @@ export interface GitHookListItem {
 /** The list page's render inputs. */
 export interface RepoGitHooksData {
   hooks: GitHookListItem[];
+  /** `repo_settings.has_actions` — arms the settings nav's conditional
+   *  Actions <details> (navbar.tmpl:41-59; the settings.tsx `hasActions`
+   *  prop). False when the loader's `d1` seam is omitted. */
+  hasActions: boolean;
 }
 
-/** Load the list (the landed repoListGitHooks read arm's page twin: the
- *  fixed three-name set in hookNames order, one R2 read per name). */
-export async function loadRepoGitHooks(r2: R2Bucket, repo: RepoRow): Promise<RepoGitHooksData> {
+/**
+ * Load the list (the landed repoListGitHooks read arm's page twin: the
+ * fixed three-name set in hookNames order, one R2 read per name).
+ *
+ * The D1 seam is OPTIONAL because the hooks storage is R2-only: the mounted
+ * routes pass `c.env.DB` (ui/index.ts's three loader calls) so the nav's
+ * conditional Actions block flag (navbar.tmpl:47 — the settings.tsx
+ * `hasActions` prop) rides the loadRepoSettings read; omitted = the reduced
+ * nav without the block (the direct-render callers' documented reduction).
+ */
+export async function loadRepoGitHooks(r2: R2Bucket, repo: RepoRow, d1?: D1Database): Promise<RepoGitHooksData> {
   const hooks = await Promise.all(
     GIT_HOOK_NAMES.map(async (name) => ({ name, isActive: (await readStoredHook(r2, repo.id, name)) !== null })),
   );
-  return { hooks };
+  return { hooks, hasActions: d1 === undefined ? false : (await loadRepoSettings(d1, repo.id)).hasActions };
 }
 
 /** The full-document render for the list page (the render.tsx pattern). */
@@ -178,7 +191,10 @@ export function RepoGitHooksPage(props: { ctx: UiContext; data: RepoGitHooksData
   return (
     <BaseLayout ctx={ctx} title={gitHooksSettingsLocale.githooks} pageClass="repository settings githooks">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="githooks" repo={repo} />
+        {/* The nav's Actions block rides the loaded unit flag (navbar.tmpl:47
+            — the options page's hasActions threading; the optional-D1
+            producer handoff sits on loadRepoGitHooks). */}
+        <SettingsNav repoLink={repoLink} active="githooks" repo={repo} hasActions={props.data.hasActions} />
         <div class="flex-container-main">
           <div class="repo-setting-content">
             <h4 class="ui top attached header">{gitHooksSettingsLocale.githooks}</h4>
@@ -219,18 +235,20 @@ export function RepoGitHooksPage(props: { ctx: UiContext; data: RepoGitHooksData
 
 /** The edit page's render inputs: the validated hook name, its IsActive and
  *  the textarea prefill — active content, else the sample (the template's
- *  `{{if .IsActive}}{{.Content}}{{else}}{{.Sample}}{{end}}`). */
+ *  `{{if .IsActive}}{{.Content}}{{else}}{{.Sample}}{{end}}`). `hasActions`
+ *  rides the same optional D1 seam as RepoGitHooksData (the note there). */
 export interface GitHookEditData {
   name: GitHookName;
   isActive: boolean;
   content: string;
+  hasActions: boolean;
 }
 
 /** Load the edit form (the landed repoGetGitHook read arm's page twin).
  *  `null` = the 404 shell: a non-vocabulary name — upstream
  *  `git.GetHook`'s ErrNotValidHook → ctx.NotFound (git_hooks.go:37-39),
  *  the route module's exact 404 class. */
-export async function loadRepoGitHookEdit(r2: R2Bucket, repo: RepoRow, name: string): Promise<GitHookEditData | null> {
+export async function loadRepoGitHookEdit(r2: R2Bucket, repo: RepoRow, name: string, d1?: D1Database): Promise<GitHookEditData | null> {
   const hookName = asGitHookName(name);
   if (hookName === null) return null;
   const stored = await readStoredHook(r2, repo.id, hookName);
@@ -238,6 +256,7 @@ export async function loadRepoGitHookEdit(r2: R2Bucket, repo: RepoRow, name: str
     name: hookName,
     isActive: stored !== null,
     content: stored ?? GIT_HOOK_SAMPLES[hookName],
+    hasActions: d1 === undefined ? false : (await loadRepoSettings(d1, repo.id)).hasActions,
   };
 }
 
@@ -296,7 +315,10 @@ export function RepoGitHookEditPage(props: { ctx: UiContext; data: GitHookEditDa
   return (
     <BaseLayout ctx={ctx} title={gitHooksSettingsLocale.githooks} pageClass="repository settings edit githook">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="githooks" repo={repo} />
+        {/* The nav's Actions block rides the loaded unit flag (navbar.tmpl:47
+            — the options page's hasActions threading; the optional-D1
+            producer handoff sits on loadRepoGitHookEdit). */}
+        <SettingsNav repoLink={repoLink} active="githooks" repo={repo} hasActions={props.data.hasActions} />
         <div class="flex-container-main">
           <div class="repo-setting-content">
             <form class="ui form" action={hookLink} method="post">

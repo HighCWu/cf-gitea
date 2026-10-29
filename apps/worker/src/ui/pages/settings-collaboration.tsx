@@ -98,6 +98,7 @@ import {
   listRepoCollaborators,
   type CollaboratorMode,
 } from "../../api/services/repo-collaborators";
+import { loadRepoSettings } from "../../api/services/repo-settings";
 import { TeamsService, type TeamRecord } from "../../api/routes/org-teams";
 import { OrgService } from "../../services/orgs/orgs";
 import { users } from "../../db/schema";
@@ -168,6 +169,10 @@ export interface CollaborationData {
   /** upstream template's CanChangeRepoTeamAccess — gates the team trailing
    *  buttons and swaps the add-team form for the restricted note. */
   canChangeTeams: boolean;
+  /** `repo_settings.has_actions` — arms the settings nav's conditional
+   *  Actions <details> (navbar.tmpl:41-59; the settings.tsx `hasActions`
+   *  prop, the options page's threading). */
+  hasActions: boolean;
 }
 
 /** The repo's owner row within THIS module (the page-module twin read — the
@@ -212,7 +217,10 @@ export async function loadCollaborationData(
   const teams =
     ownerIsOrg && repo.ownerId !== null ? await new TeamsService(d1).listRepoTeams(repo.ownerId, repo.id) : [];
   const canChangeTeams = ownerIsOrg ? await canChangeRepoTeamAccess(env, d1, repo, viewer) : false;
-  return { collaborators: listing.items, teams, ownerIsOrg, canChangeTeams };
+  // The unit flags ride the panel load for the nav's Actions block (the
+  // options page's hasActions threading — navbar.tmpl:47's unit conditional).
+  const settings = await loadRepoSettings(d1, repo.id);
+  return { collaborators: listing.items, teams, ownerIsOrg, canChangeTeams, hasActions: settings.hasActions };
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +522,10 @@ export function CollaborationPage(props: {
             reduces to the visibility arm — this page loads no repo_units
             row, and loadRepoPublicAccess's read stays the public-access
             page's loader). */}
-        <SettingsNav repoLink={repoLink} active="collaboration" repo={repo} />
+        {/* The panel loads the unit flags — it evaluates navbar.tmpl:47's
+            conditional and lights the nav's Actions block (the options
+            page's hasActions threading). */}
+        <SettingsNav repoLink={repoLink} active="collaboration" repo={repo} hasActions={data.hasActions} />
         <div class="flex-container-main">
           <div class="repo-setting-content">
             {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}

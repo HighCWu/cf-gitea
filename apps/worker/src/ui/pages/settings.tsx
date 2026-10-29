@@ -1036,17 +1036,22 @@ export const mirrorLocale = {
 } as const;
 
 /** The mirror page's render inputs: the sync_state row (or null = not a
- *  mirror) and whether the POST queued a sync (the `?sync=queued` flash
- *  reduction — no session-flash plumbing exists). */
+ *  mirror), whether the POST queued a sync (the `?sync=queued` flash
+ *  reduction — no session-flash plumbing exists), and the Actions unit flag
+ *  (`hasActions` arms the settings nav's conditional Actions block —
+ *  navbar.tmpl:47's unit conditional, the settings.tsx `hasActions` prop). */
 export interface MirrorSettingsData {
   status: MirrorStatus | null;
   syncQueued: boolean;
+  hasActions: boolean;
 }
 
 /** Load the mirror panel (§3.2 — the landed getMirrorStatus read; the same
- *  arm GET /api/v1/repos/{owner}/{repo}/mirror serves). */
+ *  arm GET /api/v1/repos/{owner}/{repo}/mirror serves). The unit-flags read
+ *  rides along for the nav's Actions block (the options page's threading). */
 export async function loadMirrorSettings(d1: D1Database, repoId: string, syncQueued = false): Promise<MirrorSettingsData> {
-  return { status: await getMirrorStatus(d1, repoId), syncQueued };
+  const settings = await loadRepoSettings(d1, repoId);
+  return { status: await getMirrorStatus(d1, repoId), syncQueued, hasActions: settings.hasActions };
 }
 
 export type MirrorSyncResult =
@@ -1118,7 +1123,10 @@ function MirrorSettingsPage(props: { ctx: UiContext; data: MirrorSettingsData; e
   return (
     <BaseLayout ctx={ctx} title={mirrorLocale.mirror_settings} pageClass="repository settings mirror">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="mirror" repo={repo} />
+        {/* The panel loads the unit flags — it evaluates navbar.tmpl:47's
+            conditional and lights the nav's Actions block (the options
+            page's hasActions threading). */}
+        <SettingsNav repoLink={repoLink} active="mirror" repo={repo} hasActions={data.hasActions} />
         <div class="flex-container-main">
           <h4 class="ui top attached header">{mirrorLocale.mirror_settings}</h4>
           <div class="ui attached segment">

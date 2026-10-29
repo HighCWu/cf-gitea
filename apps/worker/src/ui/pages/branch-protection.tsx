@@ -968,7 +968,11 @@ export function renderBranchProtectionListPage(options: {
   return renderPage(<BranchProtectionListPage ctx={options.ctx} data={options.data} />);
 }
 
-/** The list page's render inputs. */
+/** The list page's render inputs. The data literal is assembled handler-side
+ *  in ui/index.ts (the /settings/branches GET arm), which passes the
+ *  loadRepoSettings read's has_actions (the options page's options-data
+ *  twin); absent = the reduced nav without the block (the settings.tsx
+ *  prop's documented reduction — the direct-render callers may omit it). */
 export interface BranchProtectionListData {
   rules: RuleListItem[];
   isOrg: boolean;
@@ -983,9 +987,14 @@ export interface BranchProtectionListData {
    *  residue — the segment still renders with the current default alone
    *  when the caller omits it. */
   branchOptions?: string[];
+  /** `repo_settings.has_actions` — arms the settings nav's conditional
+   *  Actions <details> (navbar.tmpl:41-59; the settings.tsx `hasActions`
+   *  prop). The mounted route passes it (the ui/index.ts data literal);
+   *  optional for the direct-render callers. */
+  hasActions?: boolean;
 }
 
-function SettingsBranchesNav(props: { repoLink: string; repo: RepoRow }) {
+function SettingsBranchesNav(props: { repoLink: string; repo: RepoRow; hasActions?: boolean }) {
   // The settings navbar is pages/settings.tsx's shared component (one
   // owner — imported at the top); this module renders it with `branches`
   // active. The repo row arms the conditional Public Access item
@@ -993,7 +1002,9 @@ function SettingsBranchesNav(props: { repoLink: string; repo: RepoRow }) {
   // call site closed; like the five folded tabs the grant arm reduces to
   // the visibility arm — this page loads no repo_units row, and
   // loadRepoPublicAccess's read stays the public-access page's loader).
-  return <SettingsNavHost repoLink={props.repoLink} active="branches" repo={props.repo} />;
+  // The Actions block rides the hasActions pass-through (navbar.tmpl:47's
+  // unit conditional — the settings.tsx prop).
+  return <SettingsNavHost repoLink={props.repoLink} active="branches" repo={props.repo} hasActions={props.hasActions === true} />;
 }
 
 /** The default-branch segment (branches.tmpl:8-30 — upstream's
@@ -1054,7 +1065,7 @@ function BranchProtectionListPage(props: { ctx: UiContext; data: BranchProtectio
   return (
     <BaseLayout ctx={ctx} title={branchProtectionLocale.protected_branch} pageClass="repository settings edit">
       <div class="ui container flex-container">
-        <SettingsBranchesNav repoLink={repoLink} repo={repo} />
+        <SettingsBranchesNav repoLink={repoLink} repo={repo} hasActions={data.hasActions} />
         <div class="flex-container-main">
           {archived ? (
             // branches.tmpl's IsArchived arm: the warning INSTEAD of the
@@ -1160,11 +1171,18 @@ export function renderBranchProtectionEditPage(options: {
 
 /** The edit page's render inputs: the form binding (the stored values on a
  *  plain GET, the kept submission on a re-render), the org gate for the
- *  team inputs and the rule under edit (null = the create form). */
+ *  team inputs and the rule under edit (null = the create form). Same
+ *  hasActions shape as BranchProtectionListData (both /settings/branches
+ *  edit arms pass the loadRepoSettings read's flag handler-side). */
 export interface BranchProtectionEditData {
   form: BranchProtectionForm;
   isOrg: boolean;
   rule: RuleListItem | null;
+  /** `repo_settings.has_actions` — arms the settings nav's conditional
+   *  Actions <details> (navbar.tmpl:41-59; the settings.tsx `hasActions`
+   *  prop). The mounted routes pass it; optional for the direct-render
+   *  callers. */
+  hasActions?: boolean;
 }
 
 /** One radio trio field (the template's `.ui.radio.checkbox` shapes with
@@ -1219,7 +1237,7 @@ function BranchProtectionEditPage(props: { ctx: UiContext; data: BranchProtectio
       pageClass="repository settings branches"
     >
       <div class="ui container flex-container">
-        <SettingsBranchesNav repoLink={repoLink} repo={repo} />
+        <SettingsBranchesNav repoLink={repoLink} repo={repo} hasActions={data.hasActions} />
         <div class="flex-container-main">
           {repo.isArchived ? (
             // The POST would 404 (RepoMustNotBeArchived) — the warning

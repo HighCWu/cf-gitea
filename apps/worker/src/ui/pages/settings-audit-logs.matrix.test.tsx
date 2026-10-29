@@ -17,13 +17,14 @@
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { BatchItem } from "drizzle-orm/batch";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { orgMembers, users } from "../../db/schema";
+import { orgMembers, repoSettings, users } from "../../db/schema";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
 import { AuditActions, auditEventInsert, emitAudit, type AuditEventInput } from "../../services/audit";
@@ -275,6 +276,27 @@ describe("loadSettingsAuditLogs — the repo scope", () => {
     expect(data.events).toEqual([]);
     expect(data.page).toBe(1);
     expect(data.hasNext).toBe(false);
+  });
+
+  it("carries the nav's Actions flag on the repository scope only (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
+    const repoScope: AuditScopePair = { type: "repository", id: repo.id };
+    // No repo_settings row — the store default reads false on both scopes.
+    expect((await loadSettingsAuditLogs(env.DB, repoScope, new URLSearchParams())).hasActions).toBe(false);
+    expect(
+      (await loadSettingsAuditLogs(env.DB, { type: "organization", id: String(org.id) }, new URLSearchParams())).hasActions,
+    ).toBe(false);
+    // The armed repo row lights the repo scope; the org scope stays false
+    // (its navbar carries no Actions block).
+    const db = drizzle(env.DB);
+    await db.insert(repoSettings).values({ repoId: repo.id, hasActions: true }).onConflictDoNothing();
+    try {
+      expect((await loadSettingsAuditLogs(env.DB, repoScope, new URLSearchParams())).hasActions).toBe(true);
+      expect(
+        (await loadSettingsAuditLogs(env.DB, { type: "organization", id: String(org.id) }, new URLSearchParams())).hasActions,
+      ).toBe(false);
+    } finally {
+      await db.delete(repoSettings).where(eq(repoSettings.repoId, repo.id));
+    }
   });
 
   it("the keyset walk forward: page 1 (newest 25), page 2 (the disjoint next 25), page 3 (the short tail)", async () => {

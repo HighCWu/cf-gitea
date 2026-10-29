@@ -45,7 +45,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { protectedBranches, repositories, users } from "../../db/schema";
+import { protectedBranches, repositories, repoSettings, users } from "../../db/schema";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
 import { emptyRuleConfig, parseRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { OrgService } from "../../services/orgs/orgs";
@@ -390,6 +390,28 @@ describe("GET /{owner}/{repo}/settings/branches (the rules list)", () => {
     expect(res.status).toBe(200);
     // The quotes render HTML-escaped (hono/jsx's escaper).
     expect(await res.text()).toContain("Branch protection for rule &quot;main&quot; has been updated.");
+  });
+
+  it("lights the nav's Actions block only while repo_settings.has_actions is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
+    const fixture = await ensureWave15Fixtures();
+    const db = drizzle(env.DB);
+    const row = (await db.select().from(repositories).where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave15"))).get())!;
+    // The reduced default: no repo_settings row renders no Actions block.
+    const reduced = await fetchUi("/alice/wave15/settings/branches", withCookie(fixture.ownerCookie));
+    expect(reduced.status).toBe(200);
+    expect(await reduced.text()).not.toContain("/settings/actions/secrets");
+    // The armed flip through the REAL route: the handler's data literal
+    // passes the loadRepoSettings flag (the settings.tsx hasActions prop).
+    await db.insert(repoSettings).values({ repoId: row.id, hasActions: true }).onConflictDoNothing();
+    try {
+      const armed = await fetchUi("/alice/wave15/settings/branches", withCookie(fixture.ownerCookie));
+      expect(armed.status).toBe(200);
+      const html = await armed.text();
+      expect(html).toContain('href="/alice/wave15/settings/actions/secrets"');
+      expect(html).toContain('href="/alice/wave15/settings/actions/variables"');
+    } finally {
+      await db.delete(repoSettings).where(eq(repoSettings.repoId, row.id));
+    }
   });
 
   it("renders the archived warning instead of the list", async () => {

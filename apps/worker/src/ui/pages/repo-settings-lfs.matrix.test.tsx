@@ -43,7 +43,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { lfsObjects, repositories, users } from "../../db/schema";
+import { lfsObjects, repositories, repoSettings, users } from "../../db/schema";
 import { generatePointer, pointerBlobSha1 } from "../../services/lfs/pointer";
 import { RelayLfsStore, lfsKey } from "../../services/lfs/store";
 import { listLfsMetaObjects, loadLfsPointerRows, LFS_LIST_PAGE_SIZE } from "../../services/lfs/read";
@@ -425,6 +425,27 @@ describe("the mounted routes (the census R11 arm through uiRouter)", () => {
     expect(html).toContain("Find pointer files");
     expect(html).not.toContain("/settings/lfs/locks");
     expect(html).not.toContain("delete-lfs-object");
+  });
+
+  it("lights the nav's Actions block only while repo_settings.has_actions is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
+    const w = await ensureFixtures();
+    const db = drizzle(env.DB);
+    // The reduced default: no repo_settings row (the store default reads
+    // false) renders no Actions block.
+    const reduced = await adminGet(`${REPO_PATH}/settings/lfs`);
+    expect(reduced.status).toBe(200);
+    expect(await reduced.text()).not.toContain("/settings/actions/secrets");
+    // The armed flip: the unit-flag row lights the <details> + sub-items.
+    await db.insert(repoSettings).values({ repoId: w.repoId, hasActions: true }).onConflictDoNothing();
+    try {
+      const armed = await adminGet(`${REPO_PATH}/settings/lfs`);
+      expect(armed.status).toBe(200);
+      const html = await armed.text();
+      expect(html).toContain(`href="${REPO_PATH}/settings/actions/secrets"`);
+      expect(html).toContain(`href="${REPO_PATH}/settings/actions/variables"`);
+    } finally {
+      await db.delete(repoSettings).where(eq(repoSettings.repoId, w.repoId));
+    }
   });
 
   it("renders the pointers page with the found header and the three check columns", async () => {

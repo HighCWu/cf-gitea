@@ -82,7 +82,7 @@ import { addOrUpdateCollaborator, findCollaborator } from "../../api/services/re
 import { TeamsService, type TeamRecord } from "../../api/routes/org-teams";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { teams, userBlocking, users } from "../../db/schema";
+import { repoSettings, teams, userBlocking, users } from "../../db/schema";
 import { OrgService } from "../../services/orgs/orgs";
 import { RepoService } from "../../repos/service";
 import type { UiManifest } from "../manifest";
@@ -675,6 +675,25 @@ describe("the panel's team render contract", () => {
     expect(teamChunk(html, fx.elevated.id)).toContain("Administrator</div>");
     expect(teamChunk(html, fx.units.id)).toContain("Unit Permissions</div>");
     expect(teamChunk(html, fx.root.id)).toContain("Owner</div>");
+  });
+
+  it("lights the nav's Actions block only while repo_settings.has_actions is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
+    // The reduced default: no repo_settings row renders no Actions block.
+    const reduced = await fetchUi(PAINT_PATH, { headers: { cookie: await sessionHeader(fx.ownerId) } });
+    expect(reduced.status).toBe(200);
+    expect(await reduced.text()).not.toContain("/settings/actions/secrets");
+    // The armed flip: the unit-flag row lights the <details> + sub-items.
+    const db = drizzle(env.DB);
+    await db.insert(repoSettings).values({ repoId: fx.paint.id, hasActions: true }).onConflictDoNothing();
+    try {
+      const armed = await fetchUi(PAINT_PATH, { headers: { cookie: await sessionHeader(fx.ownerId) } });
+      expect(armed.status).toBe(200);
+      const html = await armed.text();
+      expect(html).toContain('href="/scm-owner/scm-paint/settings/actions/secrets"');
+      expect(html).toContain('href="/scm-owner/scm-paint/settings/actions/variables"');
+    } finally {
+      await db.delete(repoSettings).where(eq(repoSettings.repoId, fx.paint.id));
+    }
   });
 
   it("the Units lines come from the stored units_map JSON: mapped names, a raw unknown key, and the empty [] → None", async () => {

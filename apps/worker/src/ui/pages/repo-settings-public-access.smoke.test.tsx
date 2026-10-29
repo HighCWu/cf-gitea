@@ -178,7 +178,11 @@ describe("the public-access panel (load + render + the Update Settings write)", 
     // …and back: Anonymous Read stores 'read' again (the upsert re-arms).
     const rearm = parsePublicAccessForm(new URLSearchParams({ [CODE_UNIT_FORM_KEY]: "anonymous-read" }));
     expect((await updateCodeUnitPublicAccess(env.DB, repo.id, rearm)).outcome).toBe("applied");
-    expect(await loadRepoPublicAccess(env.DB, repo.id)).toEqual({ codeAnonymousRead: true, hasAnyPublicAccess: true });
+    expect(await loadRepoPublicAccess(env.DB, repo.id)).toEqual({
+      codeAnonymousRead: true,
+      hasAnyPublicAccess: true,
+      hasActions: false, // no repo_settings row seeded — the store default
+    });
   });
 });
 
@@ -289,6 +293,20 @@ async function bothReaders(): Promise<{ page: boolean; acl: boolean }> {
     acl: await codeUnitAnonymousRead(env.DB, repo.id),
   };
 }
+
+// --- the settings nav's conditional Actions block ---------------------------
+
+describe("the settings nav's conditional Actions block (the hasActions threading)", () => {
+  it("renders the nav's Actions <details> only while the loaded unit flag is set (navbar.tmpl:47's unit conditional — the settings.tsx hasActions prop)", async () => {
+    const loaded = await loadRepoPublicAccess(env.DB, repo.id);
+    const armedHtml = renderToString(<RepoPublicAccessPage ctx={{ ...ctx, repo }} data={{ ...loaded, hasActions: true }} />);
+    expect(armedHtml).toContain("/settings/actions/secrets");
+    expect(armedHtml).toContain("/settings/actions/variables");
+    const reducedHtml = renderToString(<RepoPublicAccessPage ctx={{ ...ctx, repo }} data={{ ...loaded, hasActions: false }} />);
+    expect(reducedHtml).not.toContain("/settings/actions/secrets");
+    expect(reducedHtml).not.toContain("/settings/actions/variables");
+  });
+});
 
 // --- the mounted GET route (window-2d b54f709)
 

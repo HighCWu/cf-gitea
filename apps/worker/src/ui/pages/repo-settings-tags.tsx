@@ -540,9 +540,15 @@ export function renderTagProtectionPage(options: { ctx: UiContext; data: TagProt
 
 /** The page's render inputs: the rules list, the org gate for the team
  *  field, the form binding (the create-empty binding, the stored values on
- *  an edit GET, the kept submission on a re-render) and the rule under edit
+ *  an edit GET, the kept submission on a re-render), the rule under edit
  *  (null = the create form — the mode splits the buttons and the action,
- *  {{.Link}}'s current-path semantics). */
+ *  {{.Link}}'s current-path semantics) and the Actions unit flag.
+ *
+ *  The data literal is assembled handler-side in ui/index.ts (repoTagsPage +
+ *  the submit re-render + the detail arm), each passing the loadRepoSettings
+ *  read's has_actions (the options page's options-data twin); absent = the
+ *  reduced nav without the block (the settings.tsx prop's documented
+ *  reduction — the direct-render callers may omit it). */
 export interface TagProtectionPageData {
   rules: TagRuleListItem[];
   isOrg: boolean;
@@ -550,6 +556,11 @@ export interface TagProtectionPageData {
   editing: ProtectedTagRow | null;
   /** The `?saved=1` flash reduction — display-only (the module header). */
   saved: boolean;
+  /** `repo_settings.has_actions` — arms the settings nav's conditional
+   *  Actions <details> (navbar.tmpl:41-59; the settings.tsx `hasActions`
+   *  prop). The mounted routes pass it (the ui/index.ts data literals);
+   *  optional for the direct-render callers. */
+  hasActions?: boolean;
 }
 
 /** One allowlist names field (the dropdown multiselect's no-JS replacement —
@@ -577,7 +588,10 @@ export function TagProtectionPage(props: { ctx: UiContext; data: TagProtectionPa
   return (
     <BaseLayout ctx={ctx} title={tagProtectionLocale.tags} pageClass="repository settings edit">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="tags" repo={repo} />
+        {/* The nav's Actions block rides the loaded unit flag (navbar.tmpl:47
+            — the options page's hasActions threading; the producer handoff
+            sits on TagProtectionPageData). */}
+        <SettingsNav repoLink={repoLink} active="tags" repo={repo} hasActions={data.hasActions === true} />
         <div class="flex-container-main">
           {repo.isArchived ? (
             // tags.tmpl's IsArchived arm: the warning INSTEAD of the form

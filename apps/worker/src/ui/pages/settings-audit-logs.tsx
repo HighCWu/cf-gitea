@@ -140,6 +140,7 @@ import {
   type AuditOrigin,
   type AuditScopeType,
 } from "../../services/audit";
+import { loadRepoSettings } from "../../api/services/repo-settings";
 import { AdminEmbeddedSvg } from "./admin-users";
 import { formatMonitorFullTime } from "./admin-monitor";
 import { SettingsNav } from "./settings";
@@ -273,15 +274,19 @@ export interface AuditScopePair {
 }
 
 /** The listing's render inputs: the page's rows, the (clamped) page, the
- *  probe's hasNext, the parsed filters (the form's re-render values) and the
+ *  probe's hasNext, the parsed filters (the form's re-render values), the
  *  select's effective action value (exact || prefix — upstream's
- *  AuditFilterAction, audit.go:67-70). */
+ *  AuditFilterAction, audit.go:67-70) and the repo scope's Actions unit flag
+ *  (the settings nav's conditional Actions block — navbar.tmpl:47's unit
+ *  conditional, the settings.tsx `hasActions` prop; false on the org scope,
+ *  whose navbar carries no Actions block). */
 export interface AuditLogsPageData {
   events: AuditEventRow[];
   page: number;
   hasNext: boolean;
   filters: AuditFilters;
   filterAction: string;
+  hasActions: boolean;
 }
 
 /**
@@ -373,12 +378,19 @@ export async function loadSettingsAuditLogs(
       hasNext = probe.length > 0;
     }
   }
+  // The nav's Actions block flag (navbar.tmpl:47's unit conditional): the
+  // REPOSITORY scope's id IS the repo id, so the loader reads the unit flags
+  // directly (the options page's hasActions threading); the org scope has no
+  // repo row and its navbar carries no Actions block — false.
+  const hasActions =
+    scope.type === "repository" ? (await loadRepoSettings(d1, scope.id)).hasActions : false;
   return {
     events,
     page,
     hasNext,
     filters,
     filterAction: filters.action !== "" ? filters.action : filters.actionPrefix,
+    hasActions,
   };
 }
 
@@ -648,7 +660,10 @@ export function RepoSettingsAuditLogsPage(props: { ctx: UiContext; data: AuditLo
   return (
     <BaseLayout ctx={ctx} title={settingsAuditLogsLocale.title} pageClass="repository settings">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="audit" repo={repo} />
+        {/* The loader reads the unit flags on the repo scope — it evaluates
+            navbar.tmpl:47's conditional and lights the nav's Actions block
+            (the options page's hasActions threading). */}
+        <SettingsNav repoLink={repoLink} active="audit" repo={repo} hasActions={props.data.hasActions} />
         <div class="flex-container-main">
           {/* repo/settings/audit_logs.tmpl:2-5 — the content wrapper + h4. */}
           <div class="repo-setting-content">
