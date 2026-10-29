@@ -1,6 +1,6 @@
 # SPEC-0017: The commit-graph page — the `graphData` engine RPC and `GET .../graph`
 
-Status: **accepted** (ratified 2026-10-29, orchestrator — decisions appended at §8) (R09-SPEC unit, 2026-10-29 — for orchestrator ratification) ·
+Status: **accepted** (ratified 2026-10-29, orchestrator — decisions at §8) (R09-SPEC unit, 2026-10-29 — for orchestrator ratification) ·
 Date: 2026-10-29 · Fills census row R09
 ([docs/compat/ui-gap-census-2026-10-29.md](../docs/compat/ui-gap-census-2026-10-29.md):
 `GET .../graph` (ABSENT), size L, the two-step: an in-DO lane/position RPC +
