@@ -1,0 +1,1 @@
+ALTER TABLE `repo_units` ADD `config` text;

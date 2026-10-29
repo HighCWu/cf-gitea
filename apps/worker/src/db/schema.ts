@@ -315,6 +315,24 @@ export const repoUnits = sqliteTable(
     anonymousAccessMode: text("anonymous_access_mode", { enum: ["none", "read"] })
       .notNull()
       .default("none"),
+    /**
+     * SPEC-0012's ActionsConfig store (upstream `RepoUnit.Config`,
+     * models/repo/repo_unit.go:32 — `Config convert.Conversion xorm:"TEXT"`,
+     * the unit-type-specific JSON blob). Only the actions unit carries one
+     * here: the ActionsConfig (models/repo/repo_unit_actions.go:76-93 —
+     * CollaborativeOwnerIDs, TokenPermissionMode, MaxTokenPermissions,
+     * OverrideOwnerConfig plus the workflow-disable maps), serialized/
+     * deserialized by services/actions/config.ts in upstream's exact
+     * Go-marshal shape. NULL = upstream's nil-Config unit: ActionsConfig()
+     * answers the zero value, so the loader treats NULL as the empty config.
+     * The column's lifetime inherits upstream's for free through the landed
+     * unit-toggle lockstep write (repo-settings.ts saveRepoSettings): the
+     * disable arm deletes the actions row (UpdateRepositoryUnits' delete
+     * arm), wiping the config; re-enabling starts fresh — upstream
+     * ActionsUnitPost's newRepoUnit(repo, TypeActions, nil) is the same
+     * reset.
+     */
+    config: text("config"),
   },
   (t) => [primaryKey({ columns: [t.repoId, t.type] })],
 );

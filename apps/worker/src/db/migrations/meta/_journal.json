@@ -302,6 +302,13 @@
       "when": 1793290164628,
       "tag": "0042_rainy_captain_cross",
       "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "6",
+      "when": 1793294487457,
+      "tag": "0043_worthless_morlocks",
+      "breakpoints": true
     }
   ]
 }
