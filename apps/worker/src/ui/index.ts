@@ -7645,15 +7645,7 @@ async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
 
   if (route.family !== "compare") return respond(await c.notFound()); // registration/parser drift guard
   const page = parsePageNumber(url.searchParams.get("page"));
-  const data = await loadCompareData(c.env, c.env.DB, repo, {
-    base: route.base,
-    head: route.head,
-    headOwner: route.headOwner,
-    headRepoName: route.headRepoName,
-    separator: route.separator,
-    viewer,
-    page,
-  });
+  const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
   const canCreate =
     !repo.isArchived &&
@@ -7882,15 +7874,7 @@ async function compareSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   const pair = await findRepositoryById(c.env.DB, repo.id);
   if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
   const page = parsePageNumber(url.searchParams.get("page"));
-  const data = await loadCompareData(c.env, c.env.DB, repo, {
-    base: route.base,
-    head: route.head,
-    headOwner: route.headOwner,
-    headRepoName: route.headRepoName,
-    separator: route.separator,
-    viewer,
-    page,
-  });
+  const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
   const form = await readComparePullForm(c.req.raw);
   const result = await createPullFromForm({
