@@ -118,6 +118,13 @@ import {
   mavenPathExt,
   openMavenFile,
   uploadMavenPackageFile,
+  MavenChecksumTooLargeError,
+  MavenHashMismatchError,
+  MavenInvalidParametersError,
+  MavenPackageFileNotExistError,
+  MavenPackageNotExistError,
+  MavenPomInvalidArgumentError,
+  MavenPomParseError,
 } from "../../services/packages/maven";
 
 const WWW_AUTHENTICATE = 'Basic realm="Gitea Package API"';
@@ -240,6 +247,31 @@ function plainResponse(status: ContentfulStatus, message: string, extraHeaders?:
 type ContentfulStatus = 400 | 401 | 403 | 404 | 409 | 411 | 413 | 500;
 
 /** helm.go:29-37 — `{"error": message}` with the upstream status. */
+
+/** The maven error mapper (the M5a unit's proven shape — plain-text bodies per maven.go:52-56). */
+function mavenErrorResponse(error: unknown): Response {
+  if (error instanceof HTTPException) throw error;
+  if (error instanceof MavenInvalidParametersError) return plainResponse(400, error.message);
+  if (error instanceof MavenPomParseError || error instanceof MavenPomInvalidArgumentError) {
+    return plainResponse(400, error.message);
+  }
+  if (error instanceof PackageSizeMismatchError || error instanceof MavenHashMismatchError) {
+    return plainResponse(400, error.message);
+  }
+  if (error instanceof MavenPackageNotExistError || error instanceof MavenPackageFileNotExistError) {
+    return plainResponse(404, error.message);
+  }
+  if (error instanceof MavenChecksumTooLargeError || error instanceof PackageBlobTooLargeError) {
+    return plainResponse(413, error.message);
+  }
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return plainResponse(403, quotaMessage(error));
+  }
+  if (error instanceof DuplicatePackageFileError) return plainResponse(409, "package file already exists");
+  console.error("[packages-maven] request failed", error);
+  return plainResponse(500, "internal server error");
+}
+
 function helmErrorResponse(status: ContentfulStatus, message: string): Response {
   return new Response(JSON.stringify({ error: message }), {
     status,
@@ -612,7 +644,10 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         const ext = mavenPathExt(params.filename).toLowerCase();
         const bytes = new TextEncoder().encode(doc.xml);
         if (ext === ".md5" || ext === ".sha1" || ext === ".sha256" || ext === ".sha512") {
-          return plainResponse(200, await mavenMetadataChecksum(doc.xml, ext));
+          return new Response(await mavenMetadataChecksum(doc.xml, ext), {
+            status: 200,
+            headers: { "content-type": "text/plain;charset=utf-8" },
+          });
         }
         const headers = new Headers({
           "content-type": "text/xml",
@@ -630,7 +665,10 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         c.req.method === "HEAD" ? "HEAD" : "GET",
       );
       if (opened.kind === "checksum") {
-        return plainResponse(200, opened.hash);
+        return new Response(opened.hash, {
+          status: 200,
+          headers: { "content-type": "text/plain;charset=utf-8" },
+        });
       }
       const headers = new Headers({
         "content-type": opened.contentType,
