@@ -41,9 +41,9 @@
  *   - org nav: Packages and the Actions General/Scoped-workflows sub-items
  *     are UNRENDERED (Applications joined the landed set with the R20-a tab,
  *     Audit with the census R13 org arm, and Runners with the census C7 org
- *     twin's mount — pages/org-settings-actions-runners.tsx; the user
- *     runners page has no landed module, so the user nav's Runners item
- *     stays dead).
+ *     twin's mount — pages/org-settings-actions-runners.tsx; the USER
+ *     twin's Runners item lit with its own module's mount — pages/
+ *     user-settings-actions-runners.tsx).
  *   - The Labels item keeps the landed href `{orgLink}/labels` — upstream's
  *     `{.OrgLink}}/settings/labels` target is the DOCUMENTED wave-14 URL
  *     divergence (pages/org-settings.tsx header: "the target exists so the
@@ -125,7 +125,7 @@ export const settingsNavLocale = {
   applications: "Applications", // "settings.applications" (:29)
   ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys" (:33)
   actions: "Actions", // "actions.actions" (the <details> summary, :41)
-  runners: "Runners", // "actions.runners" (the org navbar.tmpl:35-37 sub-item — lit by the C7 org twin's mount; the USER nav's twin stays dead)
+  runners: "Runners", // "actions.runners" (navbar.tmpl:35-37/43-48 — lit by BOTH twins' mounts: org-settings-actions-runners + user-settings-actions-runners)
   secrets: "Secrets", // "secrets.secrets" (:50)
   variables: "Variables", // "actions.variables" (:53)
   hooks: "Webhooks", // "repo.settings.hooks" (:68)
@@ -150,6 +150,7 @@ export type UserSettingsNavTab =
   | "security" // pages/user-settings-security.tsx
   | "applications" // pages/user-settings-applications.tsx
   | "keys" // pages/user-settings-keys.tsx
+  | "runners" // pages/user-settings-actions-runners.tsx
   | "secrets" // pages/user-settings-secrets.tsx
   | "variables" // pages/user-settings-variables.tsx
   | "hooks" // pages/user-settings-webhooks.tsx
@@ -210,12 +211,19 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
         <a class={item("keys")} href="/user/settings/keys">
           {settingsNavLocale.ssh_gpg_keys}
         </a>
-        {/* navbar.tmpl:39-60 — General/Runners (:43-48) and
-            Scoped-workflows (:55-57) dead; Secrets (:49-51) + Variables
-            (:52-54) landed. Open while either is the active page. */}
-        <details class="item" open={props.active === "secrets" || props.active === "variables" ? true : undefined}>
+        {/* navbar.tmpl:39-60 — General (:41-42) and Scoped-workflows
+            (:55-57) dead; Runners (:43-48) lit by the user twin's mount,
+            Secrets (:49-51) + Variables (:52-54) landed. Open while any of
+            the three is the active page. */}
+        <details
+          class="item"
+          open={props.active === "runners" || props.active === "secrets" || props.active === "variables" ? true : undefined}
+        >
           <summary>{settingsNavLocale.actions}</summary>
           <div class="menu">
+            <a class={item("runners")} href="/user/settings/actions/runners">
+              {settingsNavLocale.runners}
+            </a>
             <a class={item("secrets")} href="/user/settings/actions/secrets">
               {settingsNavLocale.secrets}
             </a>

@@ -101,11 +101,10 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
     ]) {
       expect(html).not.toContain(dead);
     }
-    // The Actions General/Runners/Scoped-workflows sub-items (:43-48,
-    // :55-57) have no landed pages either.
+    // The Actions General/Scoped-workflows sub-items (:41-42, :55-57) have
+    // no landed pages; Runners (:43-48) landed with the user twin's mount.
     for (const deadSub of [
       'href="/user/settings/actions/general"',
-      'href="/user/settings/actions/runners"',
       'href="/user/settings/actions/scoped-workflows"',
     ]) {
       expect(html).not.toContain(deadSub);
@@ -118,6 +117,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
       account: 'href="/user/settings/account"',
       notifications: 'href="/user/settings/notifications"',
       appearance: 'href="/user/settings/appearance"',
+      runners: 'href="/user/settings/actions/runners"',
       security: 'href="/user/settings/security"',
       applications: 'href="/user/settings/applications"',
       keys: 'href="/user/settings/keys"',

@@ -986,6 +986,18 @@ import {
   renderUserSettingsVariablesPage,
 } from "./pages/user-settings-variables";
 import {
+  deleteUserActionsRunner,
+  loadUserSettingsActionsRunnerEditPageData,
+  loadUserSettingsActionsRunnersPageData,
+  parseUserActionsRunnerDescriptionForm,
+  parseUserActionsRunnerDisabledForm,
+  renderUserSettingsActionsRunnerEditPage,
+  renderUserSettingsActionsRunnersPage,
+  resetUserActionsRunnerToken,
+  setUserActionsRunnerDisabled,
+  updateUserActionsRunnerDescription,
+} from "./pages/user-settings-actions-runners";
+import {
   createUserHookFromForm,
   deleteUserHook,
   editUserHookFromForm,
@@ -3061,6 +3073,11 @@ export interface UserSettingsTabRoute {
     | "user-settings-security"
     | "user-settings-secrets"
     | "user-settings-secrets-delete"
+    | "user-settings-actions-runners"
+    | "user-settings-actions-runners-token-reset"
+    | "user-settings-actions-runners-edit"
+    | "user-settings-actions-runners-update"
+    | "user-settings-actions-runners-delete"
     | "user-settings-variables"
     | "user-settings-variables-new"
     | "user-settings-variables-edit"
@@ -3445,6 +3462,28 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (tail.length === 2 && tail[0] === "actions" && tail[1] === "variables") {
       return { family: "user-settings-variables", id: null };
+    }
+    // The user-scope RUNNERS family (pages/user-settings-actions-runners.tsx —
+    // web.go:723's addSettingsRunnersRoutes in the user /settings/actions
+    // group): the reset literal before the digits-only {id} combos (chi
+    // static-first); non-numeric ids stay unclaimed (the junk arm).
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "runners" && tail[2] === "reset_registration_token") {
+      return { family: "user-settings-actions-runners-token-reset", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "runners") {
+      const id = numericId(tail[2]);
+      return id === null ? null : { family: "user-settings-actions-runners-edit", id };
+    }
+    if (tail.length === 4 && tail[0] === "actions" && tail[1] === "runners" && tail[3] === "update-runner") {
+      const id = numericId(tail[2]);
+      return id === null ? null : { family: "user-settings-actions-runners-update", id };
+    }
+    if (tail.length === 4 && tail[0] === "actions" && tail[1] === "runners" && tail[3] === "delete") {
+      const id = numericId(tail[2]);
+      return id === null ? null : { family: "user-settings-actions-runners-delete", id };
+    }
+    if (tail.length === 2 && tail[0] === "actions" && tail[1] === "runners") {
+      return { family: "user-settings-actions-runners", id: null };
     }
     if (tail.length === 3 && tail[0] === "actions" && tail[1] === "variables" && tail[2] === "new") {
       return { family: "user-settings-variables-new", id: null };
@@ -8454,6 +8493,65 @@ async function userSettingsSecretsDelete(c: Context<{ Bindings: Env }>): Promise
   const form = parseUserSettingsSecretDeleteForm(await readUrlEncodedForm(c.req.raw));
   await deleteUserSettingsSecret(c.env.DB, p.viewer.id, form);
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/secrets" } }));
+}
+
+/** The user-scope RUNNERS family's handlers (pages/user-settings-actions-
+ *  runners.tsx — web.go:723; the tab prologue's session gate, writes
+ *  sameOriginGuard-first via the prologue's withOriginGuard arm). */
+async function userActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsActionsRunnersPageData(c.env.DB, p.viewer.id, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderUserSettingsActionsRunnersPage(p.ctx, data), 200));
+}
+
+async function userActionsRunnersTokenReset(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  await resetUserActionsRunnerToken(c.env.DB, p.viewer.id);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/runners" } }));
+}
+
+async function userActionsRunnerEditPage(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserSettingsActionsRunnerEditPageData(c.env.DB, p.viewer.id, runnerId, new URL(c.req.raw.url).searchParams);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserSettingsActionsRunnerEditPage(p.ctx, data), 200));
+}
+
+async function userActionsRunnerEditSubmit(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserActionsRunnerDescriptionForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await updateUserActionsRunnerDescription(c.env.DB, p.viewer.id, runnerId, form.description);
+  if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/runners" } }));
+}
+
+async function userActionsRunnerUpdate(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserActionsRunnerDisabledForm(await readUrlEncodedForm(c.req.raw));
+  if (form.disabled === null) {
+    return p.respond(
+      new Response("missing 'disabled' parameter\n", {
+        status: 400,
+        headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+      }),
+    );
+  }
+  const outcome = await setUserActionsRunnerDisabled(c.env.DB, p.viewer.id, runnerId, form.disabled);
+  if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: `/user/settings/actions/runners/${runnerId}` } }));
+}
+
+async function userActionsRunnerDelete(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const outcome = await deleteUserActionsRunner(c.env.DB, p.viewer.id, runnerId);
+  if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/runners" } }));
 }
 
 // --- the account tab (pages/user-settings-account.tsx — upstream EmailPost /
@@ -13992,6 +14090,17 @@ uiRouter.get("/user/settings/security", (c) => userSettingsSecurityPage(c));
 uiRouter.get("/user/settings/actions/secrets", (c) => userSettingsSecretsPage(c));
 uiRouter.post("/user/settings/actions/secrets", (c) => userSettingsSecretsSubmit(c));
 uiRouter.post("/user/settings/actions/secrets/delete", (c) => userSettingsSecretsDelete(c));
+// The user-scope RUNNERS family (the static reset literal before the {id}
+// arms; the GET-only edit page's POST twin answers chi's 405).
+uiRouter.get("/user/settings/actions/runners", (c) => userActionsRunnersPage(c));
+uiRouter.post("/user/settings/actions/runners/reset_registration_token", (c) => userActionsRunnersTokenReset(c));
+uiRouter.get("/user/settings/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
+uiRouter.get("/user/settings/actions/runners/:id{(\\d+)}", (c) => userActionsRunnerEditPage(c, Number(c.req.param("id"))));
+uiRouter.post("/user/settings/actions/runners/:id{(\\d+)}", (c) => userActionsRunnerEditSubmit(c, Number(c.req.param("id"))));
+uiRouter.post("/user/settings/actions/runners/:id{(\\d+)}/update-runner", (c) => userActionsRunnerUpdate(c, Number(c.req.param("id"))));
+uiRouter.get("/user/settings/actions/runners/:id{(\\d+)}/update-runner", () => methodNotAllowed("POST"));
+uiRouter.post("/user/settings/actions/runners/:id{(\\d+)}/delete", (c) => userActionsRunnerDelete(c, Number(c.req.param("id"))));
+uiRouter.get("/user/settings/actions/runners/:id{(\\d+)}/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/user/settings/actions/variables", (c) => userSettingsVariablesPage(c));
 uiRouter.post("/user/settings/actions/variables/new", (c) => userSettingsVariablesNew(c));
 uiRouter.post("/user/settings/actions/variables/:id/edit", (c) => userSettingsVariablesEdit(c, Number(c.req.param("id"))));
