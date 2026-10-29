@@ -181,6 +181,21 @@ export function parseEngineRoute(pathname: string, method: string): EngineRoute 
   return null;
 }
 
+/**
+ * The wiki family's name marker (upstream `httpBase`,
+ * routers/web/repo/githttp.go:94-101: the `.git` trim leaves `*.wiki`, the
+ * suffix strips and the request resolves the PARENT repository). `x.wiki` →
+ * `x`; null for every other name. Unambiguous by construction: D1 repo names
+ * can never carry the suffix (`RESERVED_REPO_NAME_SUFFIXES`,
+ * src/repos/service.ts), so a `*.wiki` git URL is ALWAYS the sibling cell
+ * `owner/x.wiki` (services/wiki.ts wikiCellName, specs/wiki.md §3).
+ */
+export function splitWikiRepoName(repo: string): string | null {
+  if (!repo.endsWith(".wiki")) return null;
+  const parent = repo.slice(0, -".wiki".length);
+  return parent === "" ? null : parent;
+}
+
 /** Instance default branch (SPEC-0003 §2.5.1); the D1 `default_branch`
  *  column arrives with the M2 lifecycle migration. */
 export const DEFAULT_BRANCH = "main";

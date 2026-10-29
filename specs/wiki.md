@@ -27,10 +27,17 @@ the upstream page-name↔file-path codec, lazy provisioning on first write, and
 the upstream commit-message templates.
 
 **Out of scope** (recorded, not built here):
-- **git-HTTP serving of the wiki repo** (`owner/repo.wiki.git` clone/push): the
-  git gate hard-404s `*.wiki` URLs pending a wiki SPEC (`src/git-http/gate.ts`
-  §4.4 note). This SPEC is that design record for the storage half; teaching
-  the gate is a separate batch (it owns `src/git-http/**`).
+- **git-HTTP serving of the wiki repo** (`owner/repo.wiki.git` clone/push):
+  LANDED by the follow-up gate batch (it owns `src/git-http/**`): the git
+  gate now resolves the PARENT repository for `*.wiki` URLs and serves the
+  sibling cell through the ordinary smart-HTTP machinery — clone AND push
+  (upstream keeps write checks on wiki pushes, githttp.go:186-189), no wiki
+  push-create (githttp.go:215-218), the wiki inheriting the parent's
+  visibility, no parent settle, no D1 storage key on wiki forwards, and a
+  self-healing priv=1 engine-registry seed so protocol/api reads stop 404ing
+  the cell. The authoritative design record (forwarding deltas, the
+  engine-path `.wiki` handling, the R2 carry/purge follow-ups) is
+  `handleWikiGitRoute`'s module doc in `src/git-http/gate.ts`.
 - **Web-UI wiki pages** (`/{owner}/{repo}/wiki/...` HTML).
 - **Repo-delete cascade**: `src/repos/purge.ts` does not yet tombstone/destroy
   the sibling `.wiki` cell — deleting a repo orphans its wiki storage. Flagged

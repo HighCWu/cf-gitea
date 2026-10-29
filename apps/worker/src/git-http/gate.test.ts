@@ -67,6 +67,7 @@ import { doerRepoAccessMode } from "../api/services/repository";
 import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
 import { settleCreatingRepo } from "./gate";
+import { createWikiPage } from "../services/wiki";
 import { repoCounters, repoRedirects, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { purgeRepoMessage } from "../repos/purge";
 import { RepoService } from "../repos/service";
@@ -1242,5 +1243,227 @@ describe("the first-push settle generalizes to API-created empty repos (wave-set
     expect(
       (await drizzle(env.DB).select().from(repoCounters).where(eq(repoCounters.repoId, created.id)).all()),
     ).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The `*.wiki` git family (the wiki SPEC ledger's open follow-up). Upstream
+// serves the wiki twin over git-HTTP at `/{owner}/{repo}.wiki.git` — the
+// marker strips in httpBase and the PARENT repo resolves/authorizes
+// (routers/web/repo/githttp.go:94-101 at the pin); wiki pushes are SERVED
+// with write checks kept deliberately (githttp.go:186-189), wiki push-create
+// is not (githttp.go:215-218), and the wiki pre-receive runs the parent's
+// protected-branch rules (hook_pre_receive.go:123-175). cf-gitea serves the
+// same surface over the sibling ENGINE cell `owner/slug.wiki`
+// (services/wiki.ts wikiCellName): reads clone the pages' objects, receives
+// land in the cell (no parent settle — hook_post_receive.go:96), the wiki
+// inherits the parent's visibility, and the engine's registry row is seeded
+// priv=1 (index-hidden) so protocol/api reads stop 404ing the cell.
+// ---------------------------------------------------------------------------
+
+/** Fixture: `alice/<slug>` via RepoService (real D1 row + registry seed) with
+ *  one wiki page landed through the real service write path (the wiki cell
+ *  then holds a loose root commit on refs/heads/main). Returns the parent's
+ *  owner id and the wiki cell's tip. */
+async function seedWikiParent(slug: string, isPrivate: boolean): Promise<{ aliceId: number; tip: string }> {
+  const alice = await seedVerifiedUser({ username: "Alice" });
+  const created = await repoService().create({
+    owner: { id: alice.id, usernameLower: "alice" },
+    name: slug,
+    isPrivate,
+  });
+  const ownerRow = await drizzle(env.DB).select().from(users).where(eq(users.id, alice.id)).get();
+  if (ownerRow === undefined) throw new Error("wiki fixture: owner row missing");
+  await createWikiPage(
+    env,
+    { repo: created, owner: ownerRow },
+    { name: "alice", email: "alice@example.com" },
+    { title: "Home", content: new TextEncoder().encode("# Home\n"), message: "" },
+    "https://example.com",
+    { now: 1_700_000_000 },
+  );
+  const refs = await env.REPO.getByName(`alice/${slug}.wiki`).listRefs();
+  const tip = refs.refs.find((r) => r.name === "refs/heads/main")?.target;
+  if (tip === undefined) throw new Error("wiki fixture: no refs/heads/main on the sibling cell");
+  return { aliceId: alice.id, tip };
+}
+
+describe("the *.wiki git family (upstream githttp.go:94-101 — the wiki SPEC's open follow-up)", () => {
+  it("serves the anonymous clone advert of a public parent's seeded wiki cell, registry row seeded index-hidden", async () => {
+    const { tip } = await seedWikiParent("openwiki", false);
+
+    const advert = await SELF.fetch("https://example.com/alice/openwiki.wiki.git/info/refs?service=git-upload-pack");
+    expect(advert.status).toBe(200);
+    expect(advert.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+    const body = new TextDecoder().decode(await advert.arrayBuffer());
+    expect(body).toContain("refs/heads/main");
+    expect(body).toContain(tip);
+
+    // The seed discipline: the wiki cell's registry row exists (the engine's
+    // protocol-read prerequisite) with priv=1 — "hidden from index" — so the
+    // services/wiki.ts index-leak posture stays honored with the gate open.
+    const row = await env.REGISTRY.getByName("registry").get("alice/openwiki.wiki");
+    expect(row).not.toBeNull();
+    expect(row?.priv).toBe(1);
+  });
+
+  it("serves the wiki pages' objects through the upload-pack RPC (the clone round trip)", async () => {
+    const { tip } = await seedWikiParent("clonewiki", false);
+
+    // Minimal v0 negotiation: want the tip, flush, done — no side-band, so
+    // the pack streams raw and the response body must carry the pack magic.
+    const negotiation = pktLine(`want ${tip}\n`) + "0000" + pktLine("done\n");
+    const rpc = await SELF.fetch("https://example.com/alice/clonewiki.wiki.git/git-upload-pack", {
+      method: "POST",
+      headers: { "content-type": UPLOAD_CT },
+      body: negotiation,
+    });
+    expect(rpc.status).toBe(200);
+    expect(rpc.headers.get("content-type")).toBe("application/x-git-upload-pack-result");
+    const body = new TextDecoder().decode(await rpc.arrayBuffer());
+    expect(body).toContain("NAK");
+    expect(body).toContain("PACK");
+  });
+
+  it("401-challenges the anonymous clone of a private parent's wiki (the wiki inherits the parent's visibility)", async () => {
+    const { tip } = await seedWikiParent("hiddenwiki", true);
+
+    const advert = await SELF.fetch("https://example.com/alice/hiddenwiki.wiki.git/info/refs?service=git-upload-pack");
+    expect(advert.status).toBe(401);
+    expect(advert.headers.get("www-authenticate")).toBe(CHALLENGE);
+    expect(new TextDecoder().decode(await advert.arrayBuffer())).not.toContain(tip);
+  });
+
+  it("masks the wiki from an authenticated stranger and serves the owner (matrix rows 8/9 over the parent)", async () => {
+    const { aliceId, tip } = await seedWikiParent("strangerwiki", true);
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const bobToken = (await mintFor(bob.id, "r", "read:repository")).plaintext;
+    const aliceToken = (await mintFor(aliceId, "r", "read:repository")).plaintext;
+
+    const stranger = await SELF.fetch("https://example.com/alice/strangerwiki.wiki.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(bobToken) },
+    });
+    expect(stranger.status).toBe(404);
+    const strangerBody = new TextDecoder().decode(await stranger.arrayBuffer());
+    expect(strangerBody).toBe("Repository not found");
+    expect(strangerBody).not.toContain(tip);
+
+    const owner = await SELF.fetch("https://example.com/alice/strangerwiki.wiki.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(aliceToken) },
+    });
+    expect(owner.status).toBe(200);
+    expect(new TextDecoder().decode(await owner.arrayBuffer())).toContain(tip);
+  });
+
+  it("serves the wiki cell's synthetic HEAD from the parent's read rows", async () => {
+    await seedWikiParent("headwiki", false);
+    const head = await SELF.fetch("https://example.com/alice/headwiki.wiki.git/HEAD");
+    expect(head.status).toBe(200);
+    expect(head.headers.get("content-type")).toBe("text/plain");
+    expect(new TextDecoder().decode(await head.arrayBuffer())).toBe("ref: refs/heads/main\n");
+  });
+
+  it("serves wiki receive-pack with the parent's write grant and settles nothing on the parent row", async () => {
+    const created = await (async () => {
+      const alice = await seedVerifiedUser({ username: "Alice" });
+      return repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "wikipush", isPrivate: false });
+    })();
+    const aliceToken = (await mintFor(created.ownerId ?? 0, "w", "write:repository")).plaintext;
+
+    // Anonymous write first: pushes always need identity (rows 2/3), wiki or not.
+    const anon = await SELF.fetch("https://example.com/alice/wikipush.wiki.git/info/refs?service=git-receive-pack");
+    expect(anon.status).toBe(401);
+    expect(anon.headers.get("www-authenticate")).toBe(CHALLENGE);
+
+    // The authenticated receive lands in the SIBLING cell (upstream parity:
+    // githttp.go:186-189 — wiki pushes keep write checks and are served).
+    const { oid, pack } = await buildPack();
+    const body = buildReceivePackBody([{ ref: "refs/heads/notes", oid }], pack);
+    const push = await SELF.fetch("https://example.com/alice/wikipush.wiki.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(aliceToken), "content-type": RECEIVE_CT },
+      body,
+    });
+    expect(push.status).toBe(200);
+
+    const cellRefs = await env.REPO.getByName("alice/wikipush.wiki").listRefs();
+    expect(cellRefs.refs.map((r) => r.name)).toContain("refs/heads/notes");
+
+    // No settle: the parent row keeps its born empty-unborn posture — a wiki
+    // push must not flip the CODE cell's is_empty/default_branch
+    // (hook_post_receive.go:96 — the wiki's post-receive is not supported).
+    const row = await repoService().get(created.id);
+    expect(row).not.toBeNull();
+    expect(row?.isEmpty).toBe(true);
+    expect(row?.status).toBe("ready");
+  });
+
+  it("keeps wiki push-create absent: a receive on an unparented wiki name is the bare 404 (githttp.go:215-218)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const body = buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack);
+    const push = await SELF.fetch("https://example.com/alice/nosuch.wiki.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body,
+    });
+    expect(push.status).toBe(404);
+    // No row was push-created under the wiki name (the suffix is reserved —
+    // the parent never existed, so nothing may bloom).
+    expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
+  });
+
+  it("301s a renamed parent's wiki git URL with the .wiki marker preserved (row 13 over the parent name)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const created = await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "oldwiki", isPrivate: false });
+    await repoService().rename(created.id, "newwiki");
+
+    // (redirect: "manual" — SELF.fetch follows by default.)
+    const moved = await SELF.fetch("https://example.com/alice/oldwiki.wiki.git/info/refs?service=git-upload-pack", {
+      redirect: "manual",
+    });
+    expect(moved.status).toBe(301);
+    const location = moved.headers.get("location");
+    expect(location).toBe("https://example.com/alice/newwiki.wiki.git/info/refs?service=git-upload-pack");
+  });
+
+  it("leaves the non-wiki path unchanged: the parent's own git URLs answer exactly as before", async () => {
+    await seedWikiParent("bothways", false);
+    const parent = await SELF.fetch("https://example.com/alice/bothways.git/info/refs?service=git-upload-pack");
+    expect(parent.status).toBe(200);
+    expect(parent.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+  });
+
+  it("gates the wiki's engine JSON api by the parent's read rows (the seeded row must not reopen the passthrough)", async () => {
+    const { aliceId } = await seedWikiParent("jsonwiki", true);
+
+    const anon = await SELF.fetch("https://example.com/alice/jsonwiki.wiki/api/refs");
+    expect(anon.status).toBe(401);
+    expect(anon.headers.get("www-authenticate")).toBe(CHALLENGE);
+
+    const aliceToken = (await mintFor(aliceId, "r", "read:repository")).plaintext;
+    const owner = await SELF.fetch("https://example.com/alice/jsonwiki.wiki/api/refs", {
+      headers: { authorization: basicTokenHeader(aliceToken) },
+    });
+    expect(owner.status).toBe(200);
+    expect(new TextDecoder().decode(await owner.arrayBuffer())).toContain("refs/heads/main");
+  });
+
+  it("answers admin shapes on wiki names with the bare 404 (a .wiki DELETE never runs the parent cascade)", async () => {
+    const { aliceId } = await seedWikiParent("nodeletewiki", true);
+    const aliceToken = (await mintFor(aliceId, "w", "write:repository")).plaintext;
+
+    const wiped = await SELF.fetch("https://example.com/alice/nodeletewiki.wiki", {
+      method: "DELETE",
+      headers: { authorization: basicTokenHeader(aliceToken) },
+    });
+    expect(wiped.status).toBe(404);
+    // The parent row (and its wiki cell) survive — wiki-cell wipes belong to
+    // the purge cascade, never an engine-shape DELETE on the sibling name.
+    const rows = await drizzle(env.DB).select().from(repositories).all();
+    expect(rows).toHaveLength(1);
+    const cell = await env.REPO.getByName("alice/nodeletewiki.wiki").listRefs();
+    expect(cell.refs.map((r) => r.name)).toContain("refs/heads/main");
   });
 });

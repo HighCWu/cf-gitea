@@ -55,6 +55,18 @@
  * headless-404s it BEFORE its authorize hook, so nothing can leak there. The
  * LFS family (SPEC-0006 §2.1) is intercepted before all of this and is
  * unaffected.
+ *
+ * The `*.wiki` git family (specs/wiki.md §3 made wire-real): the marker
+ * strips and the PARENT repository resolves and authorizes — the wiki
+ * inherits the parent's visibility, upstream's exact surface
+ * (githttp.go:94-101) serving both clone (read) and push (write,
+ * githttp.go:186-189) over the sibling ENGINE cell `owner/slug.wiki`, with
+ * no wiki push-create (:215-218), no parent settle, no D1 storage key (the
+ * cell keeps its name-addressed R2 namespace) and a self-healing priv=1
+ * registry seed so the engine's protocol/api reads stop 404ing the cell
+ * (handleWikiGitRoute's module doc). The engine-path branch (§2.1 widening)
+ * learned the same name handling so the seeded row cannot reopen the
+ * transitional passthrough on `.wiki` JSON/admin shapes.
  */
 
 import { and, eq } from "drizzle-orm";
@@ -76,6 +88,7 @@ import {
   parseEngineRoute,
   parseGitHttpRoute,
   rpcRequestContentType,
+  splitWikiRepoName,
   type EngineRoute,
   type GitHttpRoute,
 } from "./parse";
@@ -168,8 +181,17 @@ export async function gitHttpGate(
     return goGetMeta(url, route.owner, route.repo);
   }
 
-  // §4.4: `*.wiki` URLs are excluded until a wiki SPEC exists — plain 404.
-  if (route.repo.endsWith(".wiki")) return repositoryNotFound();
+  // §4.4 was the `*.wiki` plain-404 exclusion ("until a wiki SPEC exists").
+  // The wiki SPEC landed (specs/wiki.md — the sibling ENGINE cell
+  // `owner/slug.wiki` holding real refs/objects), and upstream serves the
+  // wiki family over git-HTTP (githttp.go:94-101), so the family now flows
+  // through its own branch: the PARENT repository resolves and authorizes
+  // (the wiki inherits the parent's visibility), the sibling cell serves the
+  // protocol. `?go-get=1` already short-circuited ABOVE this with the raw
+  // `repo.wiki` name — upstream's own ordering (httpBase answers go-get
+  // before the `.wiki` strip, githttp.go:63-66 vs :94-101) and shape.
+  const wikiParent = splitWikiRepoName(route.repo);
+  if (wikiParent !== null) return handleWikiGitRoute(req, url, env, ctx, engine, route, wikiParent);
 
   const ownerLower = route.owner.toLowerCase();
   const repoLower = route.repo.toLowerCase();
@@ -308,6 +330,193 @@ export async function gitHttpGate(
     ctx.waitUntil(settleCreatingRepo(env, resolved.repo.id, `${route.owner}/${route.repo}`, url.origin));
   }
   return response;
+}
+
+/**
+ * The `*.wiki` git family (upstream `httpBase`, routers/web/repo/githttp.go:
+ * 94-101 + 215-218 + 243-253): `/{owner}/{repo}.wiki.git/...` resolves the
+ * PARENT repository (the `.wiki` marker strips like upstream's) and serves
+ * the sibling ENGINE cell `owner/{repo}.wiki` (services/wiki.ts wikiCellName,
+ * specs/wiki.md §3) through the ordinary smart-HTTP machinery.
+ *
+ * Surface, upstream-verified at the pin (fc493688):
+ * - READ (upload-pack/HEAD/info-refs) runs the parent's ACL matrix read rows;
+ *   the wiki inherits the parent's visibility — upstream checks
+ *   `p.CanAccess(Read, unit.TypeWiki)` over the parent repo (githttp.go:89,
+ *   :97-101, :197). Anonymous pull parity: upstream's canAnonymousPull
+ *   consults the WIKI UNIT's anonymous grant on a private repo (githttp.go:
+ *   138-145); our `repo_units` carries no `wiki` rows (the enum is
+ *   code|packages, src/db/schema.ts), so the private-parent anonymous wiki
+ *   read stays the default-none challenge — when a wiki unit row lands, the
+ *   grant feeds `unitAnonymousRead` here.
+ * - WRITE (receive-pack) is SERVED — upstream keeps write checks on wiki
+ *   pushes deliberately ("Only the main code repo accepts refs/for pushes,
+ *   so wiki pushes must keep write checks", githttp.go:186-189:
+ *   `CanAccess(Write, TypeWiki)`), and the wiki pre-receive runs the parent's
+ *   protected-branch rules (hook_pre_receive.go:123-175 runs preReceiveBranch
+ *   for wiki refs over `GetFirstMatchProtectedBranchRule(repo.ID, …)`). We
+ *   forward the parent's `protectedBranchValidator` for the same parity. No
+ *   wiki push-create: a missing parent answers the bare 404 for BOTH ops
+ *   (githttp.go:215-218) — wiki URLs never enter the push-create surface.
+ * - The upstream wiki-unit-enabled 403 ("repository wiki is disabled",
+ *   githttp.go:243-253) has no live arm here: cf-gitea's wiki is
+ *   table-free and enabled for every repo (specs/wiki.md §3) — the
+ *   divergence dissolves if/when a per-repo wiki switch lands (the
+ *   `has_packages` precedent, repo_settings).
+ * - The parent's mirrored/archived posture flows through the shared matrix
+ *   (row 10 archived pushes; the mirror 403 below — upstream's
+ *   `!isPull && IsMirror` covers the wiki's receive-pack identically).
+ *
+ * Forwarding shape — two deliberate deltas from the main family:
+ * - NO D1 `storageKey` on any wiki forward. The parent's `r_<id>` is the
+ *   CODE cell's R2 namespace (SPEC-0001a §3 Step 3); attaching it would
+ *   persist the WIKI cell's `meta.storage_key` onto the parent's pack prefix
+ *   and mix the two namespaces. The wiki cell keeps its name-addressed
+ *   storage (control-plane.ts resolveStorageKey: meta.storage_key →
+ *   meta.repo — the same fallback every D1-missing cell uses).
+ * - NO `settleCreatingRepo` after a wiki receive. The parent's
+ *   `is_empty`/`default_branch` describe the code cell; a wiki push must not
+ *   flip them (upstream: the wiki's hook-post-receive is not supported,
+ *   routers/private/hook_post_receive.go:96 — no parent updates, no wiki
+ *   push webhooks; our engine-level onPush consumers resolve
+ *   `owner/x.wiki` to no D1 row and no-op, webhooks-push.ts:1407-1413).
+ * - Protocol READS seed the engine registry row first (ensureWikiRegistryRow
+ *   below): the engine 404s protocol/api reads of registry-unknown names
+ *   (packages/git-engine mod.ts:1492-1495) and wiki cells are deliberately
+ *   registry-unseeded (services/wiki.ts — the index-leak posture of the
+ *   still-404ing gate, now obsolete).
+ */
+async function handleWikiGitRoute(
+  req: Request,
+  url: URL,
+  env: Env,
+  ctx: ExecutionContext,
+  engine: DurableGitHandler<Env>,
+  route: GitHttpRoute,
+  parentName: string,
+): Promise<Response> {
+  const ownerLower = route.owner.toLowerCase();
+  const parentLower = parentName.toLowerCase();
+  const resolved = await resolveRepository(env.DB, ownerLower, parentLower);
+
+  // The PARENT (never the wiki cell) is the D1 entity: redirects and the 404
+  // key on the stripped name, exactly like upstream's LookupRedirect over the
+  // post-strip repoName (githttp.go:110-122). The 301 preserves the `.wiki`
+  // marker so git clients re-request the sibling cell at the canonical name.
+  // No parent row → the bare 404 for every route and credential: the wiki
+  // push-create arm upstream refuses (githttp.go:215-218) and the
+  // transitional engine passthrough must never see wiki names (a wiki cell
+  // belongs to a D1 repo; an unparented one is purge debris).
+  if (resolved === null) {
+    const redirect = await lookupRedirect(env.DB, ownerLower, parentLower);
+    if (redirect !== null) return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug, ".wiki");
+    return repositoryNotFound();
+  }
+
+  // Route table row 4: the wiki cell's synthetic HEAD — the parent's read
+  // rows decide (the S7 alignment's computation, wiki grant posture above).
+  if (route.kind === "head") {
+    if (req.method !== "GET") return engine.fetch(req, env, ctx);
+    const decision = await authorizeGitHttp({
+      req,
+      env,
+      waitUntil: (p) => ctx.waitUntil(p),
+      op: "read",
+      repo: resolved.repo,
+      owner: resolved.owner,
+      ownerVisibility: resolved.ownerVisibility,
+      unitAnonymousRead: false,
+    });
+    if (decision !== true) return decision;
+    return serveHead(env, route, resolved.repo.defaultBranch);
+  }
+
+  // §2.1 item 2: service parse before auth, byte-identical to the main family.
+  let op: "read" | "write";
+  if (route.kind === "info-refs") {
+    const refsOp = infoRefsOp(url);
+    if (refsOp === null) return bareBadRequest();
+    op = refsOp;
+  } else {
+    op = routeOp(route.kind);
+    if (req.method === "POST" && req.headers.get("content-type") !== rpcRequestContentType(route.kind)) {
+      return bareBadRequest();
+    }
+  }
+
+  // §2.1 items 3-4: the parent's ACL matrix — the wiki inherits (no wiki
+  // unit rows exist, so `unitAnonymousRead` is the default-none posture).
+  const decision = await authorizeGitHttp({
+    req,
+    env,
+    waitUntil: (p) => ctx.waitUntil(p),
+    op,
+    repo: resolved.repo,
+    owner: resolved.owner,
+    ownerVisibility: resolved.ownerVisibility,
+    unitAnonymousRead: false,
+  });
+  if (decision !== true) return decision;
+
+  // SPEC-0009 §2.4 row 21 / upstream githttp.go:202-205 — `!isPull` covers
+  // the wiki's receive-pack: a mirrored parent's wiki is read-only too.
+  if (op === "write" && resolved.repo.isMirror) {
+    return new Response("mirror repository is read-only\n", {
+      status: 403,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  // Protocol reads need the wiki cell's registry row (module doc) — seeded
+  // from the D1 row's CANONICAL casing, never the request's (the registry is
+  // case-sensitive; the cells are seeded at the row's lowercase name).
+  if (op === "read") await ensureWikiRegistryRow(env, resolved.repo);
+
+  // §2.1 item 5: the ordinary engine forward — parent-validated receives
+  // (upstream's wiki pre-receive parity), no storage key, no settle.
+  const isPush = route.kind === "receive-pack";
+  const pusher = isPush ? await resolvePushPusher(env, req) : undefined;
+  return forwardToEngine(
+    req,
+    url,
+    env,
+    ctx,
+    engine,
+    undefined,
+    pusher,
+    isPush ? protectedBranchValidator(env, resolved.repo) : undefined,
+  );
+}
+
+/**
+ * One-time registry seed for the sibling wiki cell (the read path's
+ * prerequisite — packages/git-engine mod.ts:1492-1495 404s protocol and API
+ * reads of registry-unknown names, and wiki cells are born registry-less,
+ * services/wiki.ts). `priv: true` ALWAYS, self-healing on later reads: the
+ * registry's documented semantic for priv=1 is "requires auth for all
+ * access, hidden from index" (registry.ts) — the wiki cell must never appear
+ * in any index (upstream's wiki repo is likewise in no repo index), and the
+ * gate-cleared mark owns the actual authorization, so the bit costs nothing
+ * and degrades nothing. The tighten (priv !== 1 → re-pin) also covers the
+ * engine's own push-time `upsert` bookkeeping, which inserts priv at the DDL
+ * default 0 when a wiki receive lands before any read seeded the row. Best
+ * effort: a failed seed only delays the read (the engine 404s the unknown
+ * name; the next read re-seeds) — never fails an authorized request.
+ */
+async function ensureWikiRegistryRow(env: Env, repo: RepositoryRow): Promise<void> {
+  const name = `${repo.ownerNamespace}/${repo.slug}.wiki`;
+  const registry = env.REGISTRY.getByName("registry");
+  try {
+    const known = await registry.get(name);
+    if (known !== null && known.priv === 1) return;
+    // Awaited, not fire-and-forget: the engine's own registry consult (this
+    // same read's forward) must observe the seeded row — an unordered RPC
+    // would race the consult and 404 the read this seed exists to unblock.
+    if (known === null) await registry.upsert(name, Date.now());
+    await registry.setConfig(name, { priv: true });
+  } catch (error) {
+    console.error(`[wiki-git] registry seed ${name} failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /**
@@ -574,7 +783,17 @@ async function handleEnginePathBranch(
   route: EngineRoute,
 ): Promise<Response> {
   const ownerLower = route.owner.toLowerCase();
-  const repoLower = route.repo.toLowerCase();
+  // The wiki family's ENGINE paths (`/{owner}/{repo}.wiki/api/*`, the admin
+  // shapes) gate on the PARENT too (handleWikiGitRoute's module doc): the
+  // sibling cell was born registry-less so these names 404'd through the
+  // oracle below, but the git family's read-path seed (ensureWikiRegistryRow)
+  // makes the row EXIST — the verbatim passthrough would then hand the
+  // engine's grant-less hook every verified token (src/git-http/authorize.ts
+  // returns true for any D1-verifiable credential), so the parent's matrix
+  // decides here. Same name handling as the git family: `.wiki` strips,
+  // the parent resolves (handleWikiGitRoute's D1-entity rule).
+  const wikiParent = splitWikiRepoName(route.repo);
+  const repoLower = (wikiParent ?? route.repo).toLowerCase();
   const resolved = await resolveRepository(env.DB, ownerLower, repoLower);
 
   if (resolved === null) {
@@ -587,7 +806,9 @@ async function handleEnginePathBranch(
       // no /api/v1, redirect-blind clients) stranded renamed repos — the git
       // and LFS families keep the plain 301 (row 13's before-auth semantics,
       // which real git clients follow); the one-shot admin shape resolves.
-      if (route.kind === "admin" && req.method === "DELETE") {
+      // WIKI names never take this arm: the family has no admin surface
+      // (below), and a `.wiki` DELETE must never run the PARENT's cascade.
+      if (wikiParent === null && route.kind === "admin" && req.method === "DELETE") {
         const canonical = await resolveRepository(env.DB, redirect.ownerNamespace, redirect.slug);
         if (canonical === null) return repositoryNotFound();
         const decision = await authorizeGitHttp({
@@ -603,7 +824,7 @@ async function handleEnginePathBranch(
         if (decision !== true) return decision;
         return deleteRepositoryViaEngineShape(env, canonical.repo);
       }
-      return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug);
+      return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug, wikiParent === null ? "" : ".wiki");
     }
     // D1-missing api reads get the same registry-existence oracle as the git
     // reads (engineKnownRead's docstring): the engine's per-isolate memo would
@@ -611,14 +832,44 @@ async function handleEnginePathBranch(
     // miss answers the engine's JSON 404 verbatim; admin shapes keep the
     // verbatim passthrough — the transitional population's engine wipe is
     // idempotent and registry-independent (a second cleanup DELETE must stay
-    // a 200, not a 404).
+    // a 200, not a 404). WIKI names never reach the oracle — their seeded row
+    // would flip it from 404 into the passthrough — so a parent-missing wiki
+    // api path answers the JSON 404 directly (the git family's bare 404,
+    // JSON-shaped for this surface).
     if (route.kind === "api") {
       const name = `${route.owner}/${route.repo}`;
+      if (wikiParent !== null) return engineJsonRepoNotFound(name);
       if ((await env.REGISTRY.getByName("registry").get(name)) === null) {
         return engineJsonRepoNotFound(name);
       }
     }
     return engine.fetch(req, env, ctx);
+  }
+
+  // Wiki-named ENGINE shapes, parent row resolved: admin answers the bare
+  // 404 — upstream registers no admin route on the `.wiki.git` name
+  // (routers/web/githttp.go), the DELETE tail below runs the PARENT's §2.5.5
+  // delete cascade (a `.wiki` URL nuking the repo row is exactly the
+  // confusion this arm exists to prevent), and wiki-cell wipes belong to the
+  // purge cascade (src/repos/purge.ts purgeNames). Wiki-named api paths run
+  // the parent's READ rows and forward gate-cleared — the JSON mirror of the
+  // git family's wiki branch (seed included: the engine 404s api reads of
+  // registry-unknown names the same way).
+  if (wikiParent !== null) {
+    if (route.kind === "admin") return repositoryNotFound();
+    const decision = await authorizeGitHttp({
+      req,
+      env,
+      waitUntil: (p) => ctx.waitUntil(p),
+      op: "read",
+      repo: resolved.repo,
+      owner: resolved.owner,
+      ownerVisibility: resolved.ownerVisibility,
+      unitAnonymousRead: false,
+    });
+    if (decision !== true) return decision;
+    await ensureWikiRegistryRow(env, resolved.repo);
+    return forwardToEngine(req, url, env, ctx, engine);
   }
 
   const op: "read" | "write" = route.kind === "admin" ? "write" : "read";

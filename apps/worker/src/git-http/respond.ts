@@ -72,8 +72,21 @@ export function repositoryArchived(): Response {
  * `LookupRedirect` at services/context/repo.go:420-436; the ordering is
  * required by git clients, per the upstream test comment at
  * tests/integration/git_smart_http_test.go:139).
+ *
+ * `nameSuffix` carries the wiki family's `.wiki` marker (the git-http gate's
+ * wiki branch): a renamed parent's `/{owner}/{old}.wiki.git/...` URL keeps
+ * pointing at the SIBLING cell at the canonical name —
+ * `/{owner}/{new}.wiki.git/...` — instead of silently re-targeting the
+ * parent's code URL. (Upstream's own wiki redirect lands on the parent's web
+ * page, RedirectToRepo — the tail is lost; ours is the tail-preserving fabric
+ * every other row-13 redirect runs, with the marker re-attached.)
  */
-export function redirectPermanent(originalUrl: string, ownerNamespace: string, slug: string): Response {
+export function redirectPermanent(
+  originalUrl: string,
+  ownerNamespace: string,
+  slug: string,
+  nameSuffix = "",
+): Response {
   const source = new URL(originalUrl);
   const target = new URL(source.origin);
   // Raw (still-encoded) path: ["", owner, repo(.git)?, ...tail]. The `.git`
@@ -83,7 +96,7 @@ export function redirectPermanent(originalUrl: string, ownerNamespace: string, s
   const repoSegment = segments[2] ?? "";
   const gitSuffix = repoSegment.endsWith(".git") ? ".git" : "";
   const tail = segments.slice(3).join("/");
-  target.pathname = `/${encodeURIComponent(ownerNamespace)}/${encodeURIComponent(slug)}${gitSuffix}${tail ? `/${tail}` : ""}`;
+  target.pathname = `/${encodeURIComponent(ownerNamespace)}/${encodeURIComponent(slug)}${nameSuffix}${gitSuffix}${tail ? `/${tail}` : ""}`;
   target.search = source.search;
   return new Response(`Moved Permanently\n`, {
     status: 301,
