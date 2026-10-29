@@ -17,6 +17,25 @@
  *   - Destroy (step 4, AFTER the R2 prefix purge — destroy does NOT touch
  *     R2): `RepoCell.destroy()` — one transactional wipe, alarm cleared,
  *     registry row removed via the engine's host hook. Idempotent.
+ *   - Wiki sibling cells (specs/wiki.md §3's purge-cascade closure): every
+ *     name above also owns a SIBLING engine cell `<name>.wiki` — the wiki
+ *     family stores each repo's wiki there (services/wiki.ts wikiCellName,
+ *     upstream's `{repo}.wiki` sibling repo). Its whole state surface is the
+ *     DO cell itself: writes ride direct cell RPCs (putApiObjects /
+ *     commitApiChange — SQLite loose objects + refs), the git receive/clone
+ *     channels that address R2 are unreachable for `*.wiki` names (the gate
+ *     404s them), and there are no D1 rows and no engine-registry row. So
+ *     the wiki cascade needs no R2/D1 arms — the derived name rides the SAME
+ *     three phases. Upstream parity: services/repository/delete.go:335-337
+ *     removes the wiki repo files in the same post-transaction sweep as the
+ *     repo files (best-effort, a notice on failure — here: the log line +
+ *     queue redelivery). Derived at CONSUME time, so in-flight messages
+ *     queued before this cascade landed purge their wikis too, and a
+ *     redirected name's stranded wiki cell (moveEngineCell carries only the
+ *     main cell, so a pre-delete rename orphans the old one) is reclaimed by
+ *     the same sweep. Collision-free by construction:
+ *     RESERVED_REPO_NAME_SUFFIXES (src/repos/service.ts) forbids `*.wiki` D1
+ *     repo names, so a derived name can never host an unrelated repo's cell.
  *
  * DO addressing stays by the combined engine name (`owner/repo`): the cell
  * binds its name from the request path, while the storage key (meta.storage_key,
@@ -24,7 +43,7 @@
  * prefixes. `engineNames` covers every combined name the repo was known by
  * (current + redirected — the registry-fix wave's cell carry makes each
  * rename leave a full copy at the successor name, so every listed cell holds
- * purgable content).
+ * purgable content); each name's `.wiki` sibling is derived below.
  */
 
 import { isAuditRetentionMessage, pruneExpiredAuditEvents } from "../services/audit";
@@ -42,7 +61,9 @@ import { RepoNotExistError, RepoService, type RepoRow } from "./service";
 /** Queue message (REPO_TASKS): what the delete pipeline must purge.
  *  `storageKey` (r_<id>) names the R2 prefixes; `engineNames` is every
  *  combined name the repo was known by (current + redirected) — each names
- *  a RepoCell that must be tombstoned and destroyed. */
+ *  a RepoCell that must be tombstoned and destroyed, TOGETHER WITH its
+ *  `.wiki` sibling cell (derived by the consumer — see wikiEngineName — so
+ *  the message shape stays unchanged across the wiki cascade's landing). */
 export interface RepoPurgeMessage {
   storageKey: string;
   engineNames: string[];
@@ -126,8 +147,9 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
  * max_batch_size=1 + max_concurrency=1, SPEC-0003 §3.3):
  *
  *   - repo delete purges ({storageKey, engineNames}): tombstone every engine
- *     name, purge the storage-key R2 prefixes, then destroy — in that order,
- *     per SPEC-0003 §2.5.5.
+ *     name plus its `.wiki` sibling, purge the storage-key R2 prefixes, then
+ *     destroy — in that order, per SPEC-0003 §2.5.5 (the wiki cascade: the
+ *     module doc's wiki-sibling bullet).
  *   - import tasks ({kind: import-chunk|import-abort|import-sweep, …},
  *     SPEC-0003 §2.6): the chunked import pipeline (src/repos/imports/).
  *   - mirror syncs ({kind: "mirror-sync", repoId}, SPEC-0009 §2.6): one
@@ -246,13 +268,30 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
   }
 }
 
-/** One purge message's work (exported so tests drive it without fabricating
- *  a MessageBatch; the steps are idempotent, so a redelivery re-runs them). */
+/**
+ * The wiki sibling cell's combined engine name for one repo engine name
+ * (`owner/repo` → `owner/repo.wiki`) — services/wiki.ts wikiCellName's
+ * convention (specs/wiki.md §3, upstream's `{repo}.wiki` sibling git repo),
+ * folded to the combined form the REPO namespace addresses.
+ */
+function wikiEngineName(name: string): string {
+  return `${name}.wiki`;
+}
+
+/**
+ * One purge message's work (exported so tests drive it without fabricating
+ * a MessageBatch; the steps are idempotent, so a redelivery re-runs them).
+ * The tombstone/destroy/registry phases run over the main names AND their
+ * derived `.wiki` siblings (wikiEngineName above) — the wiki cascade of the
+ * module doc.
+ */
 export async function purgeRepoMessage(env: Env, body: RepoPurgeMessage): Promise<void> {
-  // Step 2: tombstone every cell the repo was known under. Failures are
-  // logged and the pipeline continues — the steps below still run, and a
-  // redelivery re-executes the idempotent tombstone.
-  for (const name of body.engineNames) {
+  const purgeNames = [...body.engineNames, ...body.engineNames.map(wikiEngineName)];
+
+  // Step 2: tombstone every cell the repo was known under (wiki siblings
+  // included). Failures are logged and the pipeline continues — the steps
+  // below still run, and a redelivery re-executes the idempotent tombstone.
+  for (const name of purgeNames) {
     try {
       await tombstoneRepoDO(env, name);
     } catch (error) {
@@ -261,19 +300,23 @@ export async function purgeRepoMessage(env: Env, body: RepoPurgeMessage): Promis
   }
 
   // Step 3: R2 prefix purge under the immutable storage key. Throws on a
-  // budget overrun → the queue redelivers before destroy ever runs.
+  // budget overrun → the queue redelivers before destroy ever runs. The wiki
+  // cells need no arm here: their writes never leave the DO (module doc —
+  // the receive/clone channels that address R2 are unreachable for *.wiki).
   await purgeRepoStorage(env, body.storageKey);
 
   // Step 4 (final): destroy every cell. A failure throws so the redelivery
   // retries; destroy (and everything above it) is idempotent.
-  for (const name of body.engineNames) {
+  for (const name of purgeNames) {
     await destroyRepoDO(env, name);
   }
 
   // Registry backstop: destroy's host hook already removes the row for cells
   // whose meta bound a name; this sweep covers cells that were never reached
-  // over HTTP. receivePack upserts heal any false removal.
-  for (const name of body.engineNames) {
+  // over HTTP. receivePack upserts heal any false removal. (Wiki cells hold
+  // no registry row today; sweeping the derived names keeps the backstop
+  // total over the whole purge surface.)
+  for (const name of purgeNames) {
     try {
       await env.REGISTRY.getByName("registry").remove(name);
     } catch {

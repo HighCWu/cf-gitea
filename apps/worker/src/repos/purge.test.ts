@@ -20,10 +20,15 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
+import { eq } from "drizzle-orm";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { repoRedirects, repositories } from "../db/schema";
-import { handleRepoTasks } from "./purge";
+import { repoRedirects, repositories, users } from "../db/schema";
+import type { RepositoryRow, RepositoryWithOwner } from "../api/services/repository";
+import { createWikiPage, readWikiPage } from "../services/wiki";
+import { handleRepoTasks, purgeRepoMessage } from "./purge";
+import { RepoService } from "./service";
+import { ZERO_OID } from "./testing/git-pack";
 
 /** Fabricated MessageBatch with ack/retry recorders (imports.test.ts shape). */
 function fabricatedBatch(bodies: { id: string; body: unknown }[]) {
@@ -275,5 +280,147 @@ describe("demo-sweep consumer arm (SPEC-0014 §3.2)", () => {
     expect(acked).toEqual([]);
     const lines = consoleError.mock.calls.map((args) => args.map(String).join(" "));
     expect(lines.some((line) => line.includes("[repo-tasks] demo-sweep sweep-err retrying"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The wiki purge cascade (specs/wiki.md §3 sibling cell — the spec-ledger
+// follow-up): deleting a repo purges the main cell + storage, and the wiki
+// family's SIBLING engine cell `<owner>/<slug>.wiki` (services/wiki.ts
+// wikiCellName — upstream's `{repo}.wiki` sibling repo) must get the same
+// treatment. Upstream parity: services/repository/delete.go:335-337 removes
+// the wiki repo files in the same post-transaction sweep as the repo files.
+//
+// The wiki cell's whole state surface is the DO itself — its writes ride
+// direct cell RPCs, so no R2 prefix, no D1 row and no engine-registry row
+// exist for it (purge.ts module doc) — so the assertions stop at the cell:
+// content GONE (a tombstone-only cell keeps answering reads, so empty refs
+// prove destroy ran) and no tombstone flag left (beginReceive answers ok on
+// the re-initialized empty cell). The wiki page is seeded through the LANDED
+// service (createWikiPage), so the purge and the write path meet at the same
+// naming convention the spec ledger flagged.
+// ---------------------------------------------------------------------------
+
+/** The repo+owner pair the wiki service ops take (seed-wiki.ts loadPair shape). */
+async function wikiPairFor(repo: RepositoryRow, ownerId: number): Promise<RepositoryWithOwner> {
+  const owner = await drizzle(env.DB).select().from(users).where(eq(users.id, ownerId)).get();
+  if (owner === undefined) throw new Error(`wiki cascade test: owner row missing: ${ownerId}`);
+  return { repo, owner };
+}
+
+/** One wiki page through the LANDED write path — provisions the sibling cell
+ *  under the pinned write stamp (deterministic, wall-clock independent). */
+async function seedWikiPage(repo: RepositoryRow, ownerId: number, doer: string, title: string): Promise<void> {
+  await createWikiPage(
+    env,
+    await wikiPairFor(repo, ownerId),
+    { name: doer, email: `${doer}@example.com` },
+    { title, content: new TextEncoder().encode(`# ${title}\n`), message: "" },
+    "https://example.com",
+    { now: 1_700_000_000 },
+  );
+}
+
+/** Ref names of one engine cell (the content probe: refs are the only roots). */
+async function cellRefNames(engineName: string): Promise<string[]> {
+  return (await env.REPO.getByName(engineName).listRefs()).refs.map((ref) => ref.name);
+}
+
+/** The cell carries no tombstone flag: beginReceive answers ok on the
+ *  re-initialized empty cell (the lifecycle delete test's revived probe). */
+async function expectNoTombstone(engineName: string): Promise<void> {
+  const begin = await env.REPO.getByName(engineName).beginReceive({
+    commands: [{ ref: "refs/heads/main", old: ZERO_OID, next: ZERO_OID }],
+    capabilities: [],
+    packBytesHint: null,
+  });
+  expect(begin.tag).toBe("ok");
+  if (begin.tag === "ok") {
+    await env.REPO.getByName(engineName).releaseReceive({ leaseToken: begin.leaseToken, sweep: false });
+  }
+}
+
+describe("repo delete purge wiki cascade (specs/wiki.md §3 sibling cell)", () => {
+  beforeEach(resetD1);
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("purges the wiki sibling cell with the main cell — no orphan remains, redelivery idempotent", async () => {
+    await seedUser(90, "alice");
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: 90, usernameLower: "alice" },
+      name: "doomed",
+      isPrivate: false,
+    });
+    await seedWikiPage(repo, 90, "alice", "Home");
+
+    // Main-cell surroundings (the lifecycle delete test's seeding): R2 under
+    // the immutable storage key + a registry row the engine 404s against.
+    await env.REPO_PACKS.put(`repos/${repo.storageKey}/packs/pack-x.pack`, new Uint8Array([1, 2, 3]));
+    await env.REPO_PACKS.put(`imports/${repo.storageKey}/chunk-0.pack`, new Uint8Array([4]));
+    await env.REGISTRY.getByName("registry").upsert("alice/doomed", Date.now());
+
+    // Producer sanity: the sibling cell is LIVE under the wiki convention —
+    // the page write seated refs/heads/main (the repo's default branch).
+    expect(await cellRefNames("alice/doomed.wiki")).toEqual(["refs/heads/main"]);
+
+    const body = { storageKey: repo.storageKey, engineNames: ["alice/doomed"] };
+    await purgeRepoMessage(env, body);
+
+    // The main arm is unchanged: R2 prefixes swept, registry row gone, the
+    // main cell destroyed (re-initialized empty — no tombstone flag).
+    expect((await env.REPO_PACKS.list({ prefix: `repos/${repo.storageKey}/` })).objects).toHaveLength(0);
+    expect((await env.REPO_PACKS.list({ prefix: `imports/${repo.storageKey}/` })).objects).toHaveLength(0);
+    expect(await env.REGISTRY.getByName("registry").get("alice/doomed")).toBeNull();
+    await expectNoTombstone("alice/doomed");
+
+    // THE CASCADE: the wiki cell is wiped, not tombstoned — refs gone (a
+    // tombstone-only cell still answers reads) and no deleted flag left.
+    expect(await cellRefNames("alice/doomed.wiki")).toEqual([]);
+    await expectNoTombstone("alice/doomed.wiki");
+    // The landed read path agrees: the purged cell answers the empty wiki.
+    expect(await readWikiPage(env, await wikiPairFor(repo, 90), "Home", "https://example.com")).toBeNull();
+
+    // Queue redelivery re-runs every idempotent step cleanly.
+    await purgeRepoMessage(env, body);
+    expect(await cellRefNames("alice/doomed.wiki")).toEqual([]);
+    expect((await env.REPO_PACKS.list({ prefix: `repos/${repo.storageKey}/` })).objects).toHaveLength(0);
+    await expectNoTombstone("alice/doomed.wiki");
+  });
+
+  it("a repo that never provisioned a wiki purges cleanly, and a renamed repo's stranded pre-rename wiki cell is reclaimed too", async () => {
+    await seedUser(91, "bob");
+    const svc = new RepoService(env.DB);
+    const repo = await svc.create({ owner: { id: 91, usernameLower: "bob" }, name: "plain", isPrivate: false });
+    // The pre-rename world: a page written at bob/plain.wiki.
+    await seedWikiPage(repo, 91, "bob", "Old");
+    expect(await cellRefNames("bob/plain.wiki")).toEqual(["refs/heads/main"]);
+
+    // Rename — moveEngineCell carries only the MAIN cell, so bob/plain.wiki
+    // is the stranded-orphan shape this sweep exists to reclaim — then a
+    // post-rename page provisions the NEW sibling at the current name.
+    await svc.rename(repo.id, "renamed");
+    const renamed = (await svc.get(repo.id))!;
+    await seedWikiPage(renamed, 91, "bob", "New");
+    expect(await cellRefNames("bob/renamed.wiki")).toEqual(["refs/heads/main"]);
+
+    // The REAL cascade's engineNames (current + redirected) drive the purge.
+    const { engineNames } = await svc.deleteRepository(repo.id);
+    expect(engineNames.sort()).toEqual(["bob/plain", "bob/renamed"].sort());
+    await purgeRepoMessage(env, { storageKey: renamed.storageKey, engineNames });
+
+    // Both wiki cells wiped — the live one AND the pre-rename orphan.
+    expect(await cellRefNames("bob/renamed.wiki")).toEqual([]);
+    expect(await cellRefNames("bob/plain.wiki")).toEqual([]);
+    await expectNoTombstone("bob/renamed.wiki");
+    await expectNoTombstone("bob/plain.wiki");
+
+    // The never-provisioned arm: a repo with no wiki cell at all — the
+    // derived name is re-initialized empty and destroyed, no throw.
+    const bare = await svc.create({ owner: { id: 91, usernameLower: "bob" }, name: "bare", isPrivate: false });
+    await purgeRepoMessage(env, { storageKey: bare.storageKey, engineNames: ["bob/bare"] });
+    expect(await cellRefNames("bob/bare.wiki")).toEqual([]);
+    await expectNoTombstone("bob/bare.wiki");
   });
 });
