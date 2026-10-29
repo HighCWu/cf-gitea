@@ -191,10 +191,73 @@ Live (first deploy 2026-10-24): **https://cf-gitea.hecongw.workers.dev** —
 smoke-verified end to end: remote admin bootstrap, PAT-authenticated
 create-by-push, `ls-remote`, Basic-auth token API, `last_used_at` updates.
 
-Cloud resources and IDs: `docs/ops/deploy-notes.md`. Secrets: `GIT_TOKEN` is
-declared required in wrangler.jsonc (`wrangler secret put GIT_TOKEN`) — used
-only as the dev-fallback credential until SPEC-0003's ACL lands; do not rely on
-it for real access control in production, mint PATs instead.
+Cloud resources and IDs: `docs/ops/deploy-notes.md`. Secrets: the declared
+required trio in wrangler.jsonc is `GIT_TOKEN` (`wrangler secret put
+GIT_TOKEN` — used only as the dev-fallback credential until SPEC-0003's ACL
+lands; do not rely on it for real access control in production, mint PATs
+instead), plus the mirror pair `MIRROR_ALLOWED_HOST_LIST` and
+`MIRROR_CREDENTIAL_KEY` (SPEC-0009's outbound egress policy and credential
+envelope).
+
+### Building from a fresh worktree
+
+A fresh `git worktree add` checks out neither `gitea/` (submodule dirs start
+empty in new worktrees) nor any gitignored generated file, so a bare `pnpm
+build` dies at prebuild (`gen:icons` reads the submodule). Verified recipe
+(deploy build rehearsal, 2026-10-30):
+
+1. **Symlink `gitea/`** from the main tree into the worktree root — REQUIRED.
+   The submodule is a read-only reference (AGENTS.md), so a symlink is safe;
+   do not re-run `git submodule update --init` in the worktree (it re-downloads
+   what the main tree already has).
+2. **Wire node_modules** by mirroring the main tree's `node_modules` (root plus
+   each workspace package's) the way `wireNodeModules` in
+   `scripts/verify-commit.mjs` does — whole-dir symlink, except pnpm workspace
+   links, which re-point at the same relative path INSIDE the worktree. Do NOT
+   `pnpm install` in the worktree.
+3. **Copy `apps/worker/wrangler.jsonc`** from the main tree — copy, never edit
+   (it is account-local and gitignored; the build generates the dist config
+   from it).
+4. **Copy `apps/worker/public/assets/`** — the 784-file official Gitea
+   frontend bundle (gitignored; only `public/_headers` is committed and
+   arrives with the checkout for free).
+5. **`apps/worker/src/ui/icons.generated.ts`** — optional when `pnpm build`
+   runs (prebuild regenerates it from the symlinked submodule), required if
+   prebuild is bypassed; copying the main tree's copy works either way.
+6. `worker-configuration.d.ts` is NOT needed — `pnpm build` does not typecheck
+   (that generated file is a typecheck-time concern only).
+
+### Post-build verification (shape checks)
+
+After `pnpm build`, before `pnpm deploy` (rehearsal-verified 2026-10-30):
+
+- **Deploy config-redirect**: the build generates
+  `apps/worker/.wrangler/deploy/config.json` pointing at
+  `dist/cf_gitea/wrangler.json` — that redirect is how the real ids
+  (database_id, routes, vars) reach `wrangler deploy`, which reads the
+  GENERATED config from dist. This is the mechanism behind the REQUIRED-build
+  rule above: a dist built before `setup:deploy` filled the ids deploys the
+  placeholder (the first-deploy failure).
+- **Manifest**: `dist/client/assets/.vite/manifest.json` carries all 4
+  `REQUIRED_MANIFEST_KEYS` (`apps/worker/src/ui/manifest.ts` — iife, index,
+  theme-gitea-light.css, user-events.sharedworker); a missing entry is a 503
+  "UI assets not built" at request time, not a build failure.
+- **Asset parity**: `dist/client/assets/` is the 784-file bundle class, byte
+  parity with `apps/worker/public/assets/`.
+
+Scale, for sanity (same rehearsal): full `pnpm build` ≈ 2.2 s wall, 45 MB
+dist, 793 files; upload 11118.48 KiB (gzip 2731.26 KiB). The ~2 s wall means a
+rebuild at final HEAD is cheap — when in doubt, rebuild rather than trust a
+stale dist.
+
+### Expected-benign warnings
+
+- `rules` ignored under Vite — wrangler notes the config's `rules` block does
+  not apply because the Vite plugin owns bundling.
+- The missing-secrets trio — `GIT_TOKEN`, `MIRROR_ALLOWED_HOST_LIST`,
+  `MIRROR_CREDENTIAL_KEY` (the `secrets.required` list): real secrets live
+  server-side (`wrangler secret put`), and a clean worktree has no `.dev.vars`,
+  so build/deploy output warns about all three. Expected, not a fault.
 
 ## Benchmarks
 
