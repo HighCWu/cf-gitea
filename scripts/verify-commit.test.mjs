@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* global Buffer, console, process -- Node globals (repo lint convention: no node env in the flat config) */
 /**
  * Self-tests for scripts/verify-commit.mjs.
  *

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* global process -- Node globals (repo lint convention: no node env in the flat config) */
 /**
  * verify-commit.mjs — pre-commit verification gate for cf-gitea.
  *
@@ -621,7 +622,7 @@ function main() {
   return 0;
 }
 
-let exitCode = 2;
+let exitCode;
 try {
   exitCode = main();
 } catch (err) {
