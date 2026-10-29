@@ -1,36 +1,41 @@
 # cf-gitea v1.3 — Release Notes
 
-Snapshot 2026-10-29, HEAD `72f40ec` — the v1.3 wave, now covering the
-full day: 61 commits, `d68ad62`→`72f40ec`, all on 2026-10-29
-(06:53 – 21:21 +0800). These notes were first cut MID-FLIGHT at
+Snapshot 2026-10-29, HEAD `10cfb97` — the v1.3 wave, now covering the
+full day: 76 commits, `d68ad62`→`10cfb97`, all on 2026-10-29
+(06:53 – 23:43 +0800). These notes were first cut MID-FLIGHT at
 `e5e1432` (28 commits, landed as `37758d5`); the same day's second half
 landed before the freeze — the five cut-time units inside the hour, the
 wiki sibling's full git-HTTP and lifecycle arc, the packages registry's
 run from model to maven, SPEC-0019's acceptance and pages, SPEC-0012's
 demand-gate lift, the second UI wave, and the survey's climb to
-113/1/2 — and is appended below in the same structure (§1's new
-subsections, §2's notes, §3's tables). The window opened with the UI gap
+113/1/2 — was appended at `65809c6`; the day's final third — SPEC-0012's
+M1a+M1b control plane and the UI's first Actions units, the settings
+family's `has_actions` threading, the 500-chrome arm, C9's general page
+with its checkbox retirement, the five-family actions-UI window that
+mounts the Actions tab, and the docs' final syncs — is appended
+below in the same structure (§1's new subsections, §2's notes, §3's
+tables). The window opened with the UI gap
 census that classified and briefed every remaining survey row, landed
 the engine read family at the boundary (grep with a budgeted NFA,
 `activityStats`, `contributorStats`, plus the blame RPC), closed ten
 census rows in one combined UI landing, shipped the audit-events model
 with retention (migration 0038), and ratified four SPECs (0015–0018).
-What still flies is named in §4 (SPEC-0012's M1a, the npm protocol +
-the maven mount, census C8, the admin packages page, the loginRedirect
-fix) — nothing in flight is counted as landed. Every number is quoted
-from the commit or doc that recorded it; nothing was re-measured for
-these notes.
+What still flies is named in §4 (the nuget protocol) — nothing in
+flight is counted as
+landed. Every number is quoted from the commit or doc that recorded it;
+nothing was re-measured for these notes.
 
 **Cut point.** The v1.2 notes close at the seventh addendum (`8b9be25`, the
 RD25 record). This window's first three commits are that release's last
 breath — the RD25 postcheck (`d68ad62`, RESTING-STATE-COHERENT), the
 push_bytes determinism pin (`5f7caed`), and the postcheck's closable batch
 (`173deab`); the census (`b5fd430`) then opened this wave. Everything from
-`d68ad62` to `72f40ec` is the delta these notes cover: `e5e1432` was the
-mid-flight cut (committed at `37758d5`, snapshot that tree), and the
-sections below carry the day's remaining 33 commits as the extension. The
-next window performs the final cut and tag; the in-flight units in §4 land
-into it, and the freeze window owns the wave's deploy record.
+`d68ad62` to `10cfb97` is the delta these notes cover: `e5e1432` was the
+mid-flight cut (committed at `37758d5`, snapshot that tree), `65809c6`
+carried the second half (through `72f40ec`), and the sections below
+carry the final 16 commits as this extension. The 06:15 window performs
+the final cut and tag; the in-flight units in §4 land into it, and the
+freeze window owns the wave's deploy record.
 
 ---
 
@@ -301,7 +306,8 @@ The wiki SPEC's flagged follow-ups closed in sequence the same day:
   MD5 (§2 — Workers' WebCrypto lacks MD5; uploads repair the dedup row's
   `hash_md5` idempotently). 33/33 twice + neighbors 82/82. The mount
   block was delivered verbatim for the next window (a proven copy lives
-  in the test's local router); npm rides the working tree (§4).
+  in the test's local router); npm landed as M4 and the mount itself
+  minutes later (below).
 
 ### SPEC-0019: federation code search — accepted and landed
 
@@ -342,7 +348,8 @@ in-tree); the OIDC issuer. Four open questions ratified (the expression
 evaluator deferred to M3's opening; the hand-rolled codec frozen at
 M1a's wire-freeze; no artifact size cap — parity — with a var escape;
 the fake-runner harness is the E2E, real-runner smoke is M2 docs
-material). M1a dispatched — in flight at notes time (§4). The UI half is
+material). M1a dispatched — landed the same evening at `32ef8bf`
+(below). The UI half is
 drawn by the Actions UI census (`e8f08a2`): 23 routes across the repo
 tab's five handler files, the four-scope settings family behind shared
 builders, and the load-bearing posture finding — upstream's run viewer
@@ -425,6 +432,187 @@ when the in-flight repoUnits docstring lands); `4c8277d` refreshed the
 README status (wiki twin in the engine row, SPEC-0015 COMPLETE, API
 500/554, UI at tick-17 with the post-tick delta named as implied, 26
 SPECs) plus the flagged index syncs.
+
+### The packages registry completes its wire: npm, the maven mount, the repair
+
+- **M4 — npm** (`a7d9bb1`): the full route family on the mounted
+  sub-app — PUT publish (the creator port with hashicorp go-version's
+  full semver validation, attachment+sigstore fallback, tarball scan,
+  the repo-link arm with giturl parse, 409-before-quota), the packument
+  with normalized-version keys + deterministic JSON + weak ETag/304,
+  version metadata, exactly-one-version file downloads,
+  unpublish/dist-tags CRUD (the highest-non-prerelease latest fallback
+  verified against upstream's own fixture), deprecate via
+  attachment-less PUT, search/ping/whoami; errors upstream-verbatim
+  `{"error":…}`. 23/23 round-trip + neighbors 145/145; protocol-common
+  gains the property seam.
+- **The maven family mounts** (`a9fce00`): the M5a unit's delivered
+  block transplanted verbatim from its proven local router into the
+  ecosystem router beside pypi/helm/npm — all four protocol suites
+  green together 86/86 — then **forward-repaired** five minutes later
+  (`ff13b96`): the transplant's incomplete rebinding (mavenErrorResponse
+  references and two 200-success arms against plainResponse's
+  error-status union) fixed properly, the proven error mapper
+  transplanted beside helmErrorResponse, the three duplicate class
+  imports dropped, 86/86 again. §2 carries the repair's process note.
+- The same minutes' **test-env fix** (`27c2502`): UiTestEnv omits
+  `PACKAGES_ENABLED` before overriding — wrangler types generates
+  LITERAL var types, so the old intersection narrowed to `"true" &
+  string` and CI's regenerated Env rejected the `"false"` polarity arm
+  (run 40881266593); the Omit-and-replace widening is the correct
+  override.
+
+### SPEC-0012 M1a: the Actions control plane lands (`32ef8bf`)
+
+The wire freeze hash-verified against actionslib v1.5.0 (dirhash equals
+go.sum:15); migration 0041 `workable_rick_jones`'s twelve `action*`
+tables column-for-column (repo_id TEXT with the `''` sentinel, the
+composite index families, action_log_chunks as the DBFS analog); the
+four procedures — Register (reusable-until-reset per the
+draft-correction), Declare (the capabilities header), FetchTask
+(answer-immediately, 0→1 bootstrap, the stale-version echo, the
+per-isolate pick limiter), Ping — plus the interceptor (constant-time
+digest, debounced heartbeats) over the hand-rolled typed codec; the
+dispatch CAS (task_id=0 AND status=waiting, the race test) with the
+version cascade and self-heal; buildRunnerTask assembles
+contexts/secrets/variables/needs per GenerateGiteaContext. The
+fake-runner harness speaks real connect/proto against the MOUNTED app —
+61/61 + neighbors. The usability pair rides the same entry file:
+unclaimed repo-scoped paths answer the full 404 chrome (upstream
+web.go:1819's negotiation — HTML shell for browsers, the bare line
+otherwise; the gate stays byte-identical) and the empty-repo page is
+upstream's empty.tmpl Quick Guide shape.
+
+### The three-unit index window (`a8e065f`)
+
+Census **C8** — the repo Actions secrets/variables settings pair (the
+org twin's structure mirrored, the disabled-unit 404 polarity pinned;
+59/59 + settings-family 246/246 + twins 300/300); the **loginRedirect
+full-URI fix** (upstream's cookie.go:44 RequestURI — 36 call sites +
+the gate threading, 207/207 with the query-preservation arm); the
+**admin packages list page** (tick-18's last admin-row item: the
+9-live-column table over searchVersions, the two blob-size totals,
+PACKAGES_ENABLED gating; 15/15×4 + admin-family 182/182 + goldens 80/80
++ route table 159/159). Ten admin goldens regenerate one-line each.
+
+### The settings family threads `has_actions` — and catches its strays (`7125c74`)
+
+Every repo-settings SettingsNav call site now evaluates
+`repo_settings.has_actions` (navbar.tmpl:47's conditional per-page, the
+C8 options-page precedent mirrored): wiki/public-access/deploy-keys/
+collaboration/audit/lfs (×4 loaders)/tags/branches (×3 arms)/githooks/
+mirror. Renders stay byte-identical until the unit is enabled (the
+default-false posture); ten suites route-level green 341/341, repo-wide
+tsc zero. The unit's tree census also caught the two STRAY pypi/helm
+protocol tests that `8d177aa`'s staging fallback never picked up
+(`api/routes/packages-{pypi,helm}.test.ts` — untracked since; their
+suites were green locally but never in CI's tree; §2).
+
+### C9: the Actions general page, its catch, and the checkbox retirement
+
+- **The general settings page** (`6fcb561`, census C9): upstream's gate
+  verdict shipped exactly — the page and its unit-toggle POST sit
+  OUTSIDE MustEnableActions (web.go:1262-1265's own comment — the
+  disabled unit's re-entry), the bare /settings/actions redirect 303s
+  to the literal ./actions/general INSIDE the gate (404 while off);
+  FormBool faithful (ParseBool ∪ on); the settings nav's General item
+  unconditional-in-block per navbar.tmpl:42 with the trio riding
+  hasActions; one dead-link pin retired. 19/19 + the settings sweep
+  408/409 (the 1 red is the integrator's in-flight parse state,
+  provably independent).
+- **The unit-row writer fix** (`c1cefaa`, C9's catch): the scan was
+  correct all along (task.go:280-284 joins repo_unit type=actions) —
+  the writers were the gap. saveRepoSettings, the single choke point
+  both the UI toggle and the API PATCH funnel through, now writes the
+  repo_units actions row in lockstep with has_actions in the SAME
+  db.batch (insert onConflictDoNothing / delete; unit-less saves
+  untouched; the unconditional direction write self-heals pre-fix
+  stray rows); the service header's default-off misattribution
+  corrected (upstream's DefaultRepoUnits enables
+  projects/packages/actions at creation). 7/7 new suite incl. the
+  end-to-end scopeRepoIds regression + 20/20 + 34/34 + callers 71/71.
+- **The options checkbox retires** (`42c2af7`): upstream's toggle lives
+  ONLY on actions_general.tmpl — options.tmpl's unit list ends at
+  enable_pulls — and the retirement removes the SAVE ARM, not just the
+  input (§2: the clobber it prevented); the nav block's stored read
+  rides RepoBasicsData.hasActions outside the form (the invalid
+  re-render can never spoof it). 32/32 twice + goldens 80/80 (a
+  surgical one-span byte edit, python-verified, avoiding a full regen
+  sweeping siblings' in-flight renders).
+
+Its two follow-ups were dispatched: the first is the unit-row fix above
+(landed in-window as `c1cefaa`); the second — the ActionsConfig store's
+migration, unlocking the token-permissions + collaborative-owners
+sections `6fcb561` documented-unrendered — flies (§4).
+
+### The five-family actions-UI window: the Actions tab mounts (`0c8da44`)
+
+M1c's integrating window lands the census's dispatch-ready UI families
+in one coherent tree: **C1**'s runs list (the `?run_ids` fragment,
+MustBeNotEmpty + unit gates); **C2**'s run-viewer subtree (the mount div
++ the ViewResponse JSON contract field-by-field vs view.go, the cancel
+CAS with the StopTask handshake, GET/POST resolution asymmetry); **C6**'s
+job-queue pair (the admin off-by-one parse fix — `tail.length===2` —
+plus its fixture gaps: is_empty, the DOCTYPE via the module renderer,
+and a real filterRepoId type bug); **C7**'s runners settings (three
+dead-unit fixture bugs fixed: the NOW=T0+30s heartbeat lie, the
+cross-repo token assertion, the null shape); C9's general trio (landed
+at `6fcb561`, arms fresh) and C8's re-armed pins ride the sweep. The
+shell's Actions tab + repoHasActions threading + the admin nav's
+Actions group (the union member the queue page needed); ten admin
+goldens one-line each; the a11y arrays' Packages debt from `a8e065f`
+repaid alongside. Combined sweep 598/598 (C1 51 + C2 38 + C6 26 +
+C7 32 + C8 59 + C9 20 + neighbors).
+
+### SPEC-0012 M1b: the ingestion half — the control plane completes (`10cfb97`)
+
+UpdateTask's state machine (the cancelling handshake, outputs' resend
+contract, the reported-steps port with in-place relayout); UpdateLog
+byte-for-byte (the DBFS chunk store + R2 seal via multipart merge — the
+workerd no-concat answer, the zigzag LogIndexes, the gap-refusing seal);
+artifacts v1+v4 (md5-tee chunk streaming, the blocklist replay with
+contiguous recomputation, HMAC signed URLs); job summaries; the OIDC
+issuer (RS256 WebCrypto, GitHub-shaped claims, the token_permissions
+grant gate). The fake-runner harness runs the FULL lifecycle as the
+standing E2E — 168/168 across the actions family. insertActionRun
+chunks at 2 rows (the D1 bind cap, the integrator's routed request);
+the rebuild's two self-caught bugs noted (Go-default claim field names;
+server-minted absolute URLs in the harness); the keystore divergence
+and the retention-var wiring are ledgered for the next waves.
+
+### The 500-chrome onError arm (`3a16685`)
+
+Upstream's errpage.go posture ported (the REAL cite:
+renderServerErrorPage's Accept negotiation + the panic-page twin,
+mounted tree-wide via ProtocolMiddlewares): browsers get the 500 shell
+(minimal-deps per 500.tmpl — no repo header, no flash), curl keeps the
+byte-identical plain line now with upstream's zero-options
+cache-control, stacks go to the log never the body, and a shell-render
+throw falls back to upstream's verbatim render-failure sentence. The
+test's throwing-route fixture is REAL (drops issue_attachments
+unguarded-read, restores via prepare() — D1 exec can't re-run
+multi-line DDL). 58/58.
+
+### The documentation's final syncs (`abab71c`, `b2ff251`)
+
+`abab71c` — the SPEC index's final v1.3 sync: SPEC-0012's row catches
+up through the gate lift + M1a with M1b in flight; SPEC-0016 records
+M1–M5a landed with M5b in flight; SPEC-0019 gains its row COMPLETE;
+SPEC-0017's missed complete-mark flipped (`4c8277d`'s second overclaim
+— its message claimed the sync, its diff carried only the 0018 hunk);
+activity-feeds recounted 14/27 code-verified; the wiki row records the
+git-HTTP twin. The two flagged stale sections folded:
+activity-feeds' §3.3 five DEFERRED labels → WIRED, wiki.md's cascade
+bullet → CLOSED. check:api re-run at HEAD: 500/554, PASS. `b2ff251` —
+the README's v1.3 release refresh: snapshot at `3a16685`; the Actions
+paragraph debuts (SPEC-0012's gate lifted per the upstream-parity rule,
+M1a's control plane: the four connect-RPC procedures + dispatch CAS
+over migration 0041's twelve tables, the actionslib v1.5.0 wire freeze,
+the fake-runner oracle, stock act_runner as the self-host runner); the
+engine row carries the key-guard; the UI row at tick-18's 113/1/2 with
+the a8e065f flips marked implied-pending-next-tick; 500/554 re-verified
+PASS. Two TODO(final-window) placeholders await the 06:15 cut (final
+HEAD + the final tick numbers). Every claim unit-verified.
 
 ---
 
@@ -520,6 +708,34 @@ landing commit re-verified, before the tables moved). Documentation that
 outruns its own verification now has a named repair procedure: re-derive
 from the tree, then edit.
 
+The **save-arm clobber that never shipped** (`42c2af7`): retiring the
+options form's enable_actions checkbox meant retiring its SAVE ARM, not
+just the input — the pre-retirement absent-field-false parse would have
+clobbered `has_actions` to 0 on every ordinary options save, silently
+reverting the general page's toggle as a side effect of unrelated saves.
+The class: a retired input is not a retired write path — a form parse
+that defaults absent fields to false is a writer for every field it
+names, and input retirement must audit the parse arm. The same unit's
+golden update was a surgical one-span byte edit (python-verified) rather
+than a full regen, which would have swept the integrator's in-flight
+sibling renders into the commit.
+
+The **fourth pipe-masking incident** was self-inflicted (`ff13b96`):
+the maven mount (`a9fce00`) landed DESPITE a failing guard — the
+committing chain piped the guard's output through tail and the pipe
+masked the exit code, the exact class the verify-commit guard exists to
+close, now observed in the guard-owner's own chains. The repair landed
+five minutes after the mount; the rule is unchanged and now
+twice-written: the guard's exit code must gate the commit directly,
+never behind a display pipe.
+
+The **stray-tests class** got its first catch (`7125c74`): two protocol
+test files (`packages-{pypi,helm}.test.ts`) had been untracked since
+`8d177aa` — green locally on every run, absent from CI's tree on every
+run, because nothing stages an untracked file. The catch was a tree
+census, not a test failure: count what the tree carries against what
+the commits claim. An untracked test is a test that does not exist.
+
 ---
 
 ## 3. Compatibility notes
@@ -531,25 +747,29 @@ from the tree, then edit.
 | 0038 `luxuriant_tempest` | `audit_event` (+5 indexes incl. the EXPLAIN-witnessed `(scope_type, scope_id, created_unix)` composite) | `5c8853c` | applied remote — swept by the deploy-day migration pass |
 | 0039 `talented_retro_girl` | the six `package*` tables (`packages`, `package_versions`, `package_files`, `package_blobs`, `package_properties`, `package_cleanup_rules`) | `8cdf44a` | applied remote ahead of code |
 | 0040 `gorgeous_nico_minoru` | `system_notices` | `8cdf44a` (the shared schema pairing) | applied remote ahead of code |
+| 0041 `workable_rick_jones` | the twelve `action*` tables (`action_runs`, `action_run_jobs`, `action_run_attempts`, `action_task_steps`, `action_task_outputs`, `action_tasks`, `action_tasks_versions`, `action_runners`, `action_runner_tokens`, `action_artifacts`, `action_log_chunks`, `action_run_job_summaries`) | `32ef8bf` | not recorded applied — the freeze window's deploy owns it |
 
-Schema stands at **73 tables** (66 + six `package*` + `system_notices`).
+Schema stands at **85 tables** (73 + the twelve `action*` of 0041).
 0039/0040's "applied remote ahead of code" is `8cdf44a`'s own record
 ("both already applied remote ahead of code by the deploy-day migration
 pass, additive and reader-less until now"); 0038 — pending at the
 mid-flight cut — was necessarily swept by the same pass (a pass that
-applies 0039 applies its ancestors by construction). The working tree
-carries the uncommitted migration 0041 `workable_rick_jones`
-(`action_artifacts` — SPEC-0012 M1a's first of twelve actions tables);
-not counted here.
+applies 0039 applies its ancestors by construction). 0041 landed
+committed with M1a (`32ef8bf`, all twelve tables in the migration); no
+deploy record this window marks it applied remote — the freeze window's
+deploy pass owns it.
 
 ### Declared-operation count: 500
 
 SPEC-0016 M1's landing moved the count to **500/554 operations declared
-across 306 paths** (`check:api` PASS at tick-18's re-run, `72f40ec`;
+across 306 paths** (`check:api` PASS at tick-18's re-run, `72f40ec`,
+re-verified twice since — `abab71c` and `b2ff251`, still 500/554;
 tier-1 terminal 78/78 paths, 129/129 ops) — the +10 is exactly the
 package family's ops (`b6b0180`'s verified arithmetic). The remaining
-54 FEATURE-ABSENT operations are Actions only (SPEC-0012, M1a in
-flight). One intentional divergence is now a documented runtime-only
+54 FEATURE-ABSENT operations are Actions only (SPEC-0012 — M1a's and
+M1b's landings are the `/api/actions` + `/api/actions_pipeline` runner
+and ingestion surfaces, not `/api/v1` ops, so
+the count is unmoved). One intentional divergence is now a documented runtime-only
 exception: the packages unlink 204 (`110cf56` — upstream's handler
 answers StatusNoContent while its own swagger block documents 201 empty;
 our 204 is runtime-faithful, the frozen contract carries the
@@ -572,6 +792,12 @@ still-absent list shrunk to auths/packages/actions); the two ABSENT are
 the actions subsystem rows — SPEC-0012's wave in flight. Router counts
 refreshed: 349 route families, 234 page files (`72f40ec`). README's
 implied 109/1/6 (`4c8277d`) was confirmed sound through `9d7ccd6`.
+No new tick ran after tick-18; the actions surfaces that landed since —
+C8's settings pair and the admin packages list (`a8e065f`, the admin
+PARTIAL row's last named item), C9's general page (`6fcb561`) with the
+unit-row fix (`c1cefaa`), the options retirement (`42c2af7`), and the
+Actions tab mount (`0c8da44`) — are
+implied-pending-next-tick, the README's own marking (`b2ff251`).
 
 ---
 
@@ -580,23 +806,32 @@ implied 109/1/6 (`4c8277d`) was confirmed sound through `9d7ccd6`.
 - **54 FEATURE-ABSENT operations**, all Actions — SPEC-0012's rewrite is
   accepted with its demand gate lifted; the packages family's ten ops
   landed declared at `8cdf44a`.
-- **Five units in flight** (working tree, uncommitted — none counted
-  anywhere in these notes or the README): **SPEC-0012 M1a** (the actions
-  model — `services/actions/` + migration 0041 `workable_rick_jones`,
-  `action_artifacts` first of the twelve), **SPEC-0016's npm protocol**
-  with the **maven mount** riding (`routes/packages-protocols.ts` grows
-  the mount block — the proven copy `dba7f9c` delivered verbatim),
-  **census C8** (the repo settings Actions secrets/variables pages —
-  the census's anytime row, no actions tables needed), the **admin
-  packages page** (its list op has been declared since M1), and the
-  **loginRedirect query-string fix** (the anonymous redirect now carries
-  `url.search`). Sibling riders in the same tree: the empty-repo page's
-  upstream Quick Guide render and the `not-found-response` module.
+- The **seven units most recently named in flight all landed** the
+  same evening: SPEC-0012 M1a (`32ef8bf`) and M1b (`10cfb97`), the npm
+  protocol (`a7d9bb1`)
+  with the maven mount (`a9fce00`) and its forward repair (`ff13b96`),
+  census C8 + the admin packages page + the loginRedirect fix in one
+  window (`a8e065f`), and the five-family actions-UI integrator
+  (`0c8da44`) — all counted above, none carried.
+- **One unit in flight** (working tree, uncommitted — none counted
+  anywhere in these notes or the README): **SPEC-0016 M5b, the nuget
+  protocol** (`services/packages/nuget.ts` + its suite, the mount
+  growing in `packages-protocols.ts`). Beside it, C9's second
+  dispatched follow-up — the ActionsConfig store's migration,
+  unlocking the token-permissions + collaborative-owners sections
+  `6fcb561` documented-unrendered — has not landed.
 - **SPEC-0015 is COMPLETE** (`fdfe73a` closed M3); **SPEC-0019's R02/R05**
   are landed (`f50c9f7` + the `470e946` mounts) — the first cut's §4
-  items for both are retired.
+  items for both are retired. **SPEC-0016 stands at M1–M5a landed**
+  (M6 container + M7 index-builder pending, M5b in flight);
+  **SPEC-0012's control plane is COMPLETE** — M1a (`32ef8bf`) + M1b
+  (`10cfb97`) — plus the M1c UI's first window (`0c8da44` —
+  C1/C2/C6/C7/C8/C9); the M3 trigger chain stages behind the
+  expression-evaluator question.
 - **Deploy posture**: migrations 0039/0040 sit applied-remote ahead of
-  code (`8cdf44a`'s deploy-day migration pass record). The RD25
+  code (`8cdf44a`'s deploy-day migration pass record); 0041 is
+  committed with M1a (`32ef8bf`) but no deploy record this window
+  marks it applied — the freeze window owns it. The RD25
   deployed-reality record in `docs/design/p0-evidence.md` remains the
   last fully-written production verdict; the freeze window owns this
   wave's deploy record. (The probe fix `c7ec2fe` reports all 12
