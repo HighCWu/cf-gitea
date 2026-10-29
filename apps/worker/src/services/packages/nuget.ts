@@ -1859,16 +1859,17 @@ export async function uploadNugetPackage(input: NugetProtocolInput): Promise<Nug
       throw new NugetUnexpectedPackageTypeError();
     }
 
-    // The duplicate-version arbitration wins over quota (packages.go:214-219 —
-    // count quota runs only for a fresh version).
+    // The duplicate-version arbitration wins over quota (the versionCreated
+    // gate, packages.go:188-191 — count quota runs only for a fresh version).
     const existing = await getVersionByNameAndVersion(input.d1, input.owner.id, NUGET_TYPE, parsed.id, parsed.version);
     if (existing !== null) throw new NugetDuplicateVersionError(existing);
 
     // The quota checks precede the inserts (one transaction upstream — a 403
     // leaves no rows). SIZE: CheckSizeQuotaExceeded adds the pending upload to
     // the owner's stored total (packages.go:311-314). COUNT: upstream checks
-    // AFTER the version insert, inside the rolling-back transaction
-    // (packages.go:214-219) — the pre-insert equivalent is count + 1 > limit.
+    // AFTER the version insert, inside the rolling-back transaction (the
+    // versionCreated gate packages.go:188-191 with the totalCount > limit
+    // throw at :380-381) — the pre-insert equivalent is count + 1 > limit.
     if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
       const total = (await countVersions(input.d1, input.owner.id)) + 1;
       if (total > input.quota.limitTotalOwnerCount) {

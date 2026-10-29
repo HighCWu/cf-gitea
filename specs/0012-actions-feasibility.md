@@ -627,6 +627,21 @@ byte format, and uncompressed log objects stream fine. Reads (UI log panel,
    Actions reads them through the same service — no new posture).
 5. DBFS chunk rows → `action_log_chunks` D1 table (same shape, different engine) — §4.3.
 6. `repo_counters.run_index` instead of the `action_run_index` named sequence — §4.5.
+7. As-built (M1b, 10cfb97): the crypto-material home — §4.4/entry 2 spelled a
+   `wrangler secret` (the HS256 signing secret) plus an AES-encrypted PKCS-8
+   row in D1 (the RS256 keypair); both homes required shared files outside the
+   landing unit's exclusive ownership, so M1b persists BOTH in ONE private R2
+   object (`actions/_keystore/instance.json` — Worker-only readable, generated
+   once, never rotated by code, the §4.2 namespace discipline) with
+   `loadKeystore` (`services/actions/secrets.ts`) as the single swap point;
+   landing the spelled homes replaces that function alone.
+8. As-built (M1b, 10cfb97): retention-var wiring pending — `retention.ts`
+   ships the §4.4 sweep arms PARAMETERIZED (the retention trio as arguments;
+   `stopZombieTasks` on its own always-on probe-gated block, upstream's
+   enabled-by-default `stop_zombie_tasks` cron having no retention knob); the
+   strict-polarity env-var caller (the hourly producer block + the
+   `{kind: "actions-retention"}` / `{kind: "actions-zombie"}` consumer arms)
+   was in flight, uncommitted at this as-built read.
 
 ## 5. Edge cases, limits, and failure modes
 
@@ -812,3 +827,113 @@ at M1a's wire-freeze; (3) artifact quota: parity = no size cap (upstream caps
 nothing), with a PACKAGES-style var as the self-host escape; (4) real
 act_runner E2E stays OUT of CI — the fake-runner harness is the E2E; a real
 runner smoke is M2 self-host docs material. M1a dispatched 2026-10-29.
+
+## As-built — M1b (10cfb97, 2026-10-29 — the control plane is COMPLETE)
+
+M1a landed first (32ef8bf, 2026-10-29: the wire freeze hash-verified against
+actionslib v1.5.0, migration 0041's twelve tables, the four-procedure surface
++ interceptor over the hand-rolled codec, the dispatch CAS with the version
+cascade, the harness at 61/61 — recorded in the specs index, abab71c). M1b
+completes the ingestion half; every surface from UpdateTask onward serves:
+
+- **UpdateTask** (`services/actions/update.ts`) — the state machine with the
+  cancelling handshake, outputs' resend contract (§2.2's upsert-if-absent +
+  caps + the `sent_outputs` echo), the reported-steps port with in-place
+  relayout.
+- **UpdateLog** (`services/actions/logs.ts`) — byte-for-byte: the
+  `action_log_chunks` DBFS chunk store, the trim/ack/re-send/past-seal/
+  gap-refusal branches §5.4 enumerates, the R2 seal via **multipart merge**
+  (the workerd no-server-side-concat answer to §4.2's stream-merge proposal),
+  the zigzag `LogIndexes` row→offset map.
+- **Artifacts v1+v4** (`services/actions/artifacts{,-v1,-v4,-merge}.ts`) —
+  md5-tee chunk streaming, the v4 blocklist replay with contiguous
+  recomputation, HMAC signed URLs (§2.5's construction).
+- **Job summaries** (`services/actions/summaries.ts`) and **the OIDC issuer**
+  (`services/actions/oidc.ts` + `secrets.ts`) — RS256 WebCrypto,
+  GitHub-shaped claims, the token_permissions grant gate (null permissions
+  deny while the M3 parser is away — the v1 posture).
+- **The fake-runner harness** (`services/actions/fake-runner.ts`) runs the
+  FULL lifecycle as the standing E2E (§6.2's oracle, realized) — **168/168**
+  across the actions family. The commit notes the rebuild's two self-caught
+  bugs (Go-default claim field names; server-minted absolute URLs in the
+  harness) and `insertActionRun` chunking at 2 rows per batch (the D1 bind
+  cap).
+
+Ledgered residuals: §4.6 entries 7 (the keystore-home divergence) and 8
+(retention-var wiring, env-var caller pending).
+
+## As-built — M1c (the UI family — the census units through b0e1d88)
+
+The §2.10 census units landed across one window (all 2026-10-29), several
+post-dating the §7 table:
+
+- **C8 — a8e065f**: the repo Actions secrets/variables settings pair (the org
+  twin's structure mirrored, the disabled-unit 404 polarity pinned; 59/59 +
+  settings-family 246/246 + twins 300/300). The same three-unit window also
+  carried the loginRedirect full-URI fix and the admin **packages** list page
+  (SPEC-0016's admin row) — cross-SPEC riders, not M1c scope.
+- **C9 — 6fcb561**: the Actions general settings page, upstream's gate
+  verdict shipped exactly (the page + its unit-toggle POST sit OUTSIDE
+  `MustEnableActions` per web.go:1262-1265's own comment — the disabled
+  unit's re-entry; the bare `/settings/actions` redirect 303s to
+  `./actions/general` INSIDE the gate; FormBool faithful). The
+  token-permissions + collaborative-owners sections are
+  documented-unrendered (the ActionsConfig store needs its migration — cites
+  pinned in the commit).
+- **The five-family window — 0c8da44**: the Actions tab mounts. C1's runs
+  list (the `?run_ids` partial-refresh fragment, MustBeNotEmpty + unit
+  gates); C2's run-viewer subtree (the mount div + the ViewResponse JSON
+  contract field-by-field vs view.go, the cancel CAS with the StopTask
+  handshake, GET/POST resolution asymmetry); C6's job-queue pair (incl. the
+  admin off-by-one parse fix and a real filterRepoId type bug); C7's runners
+  settings; C9's arms fresh; C8's re-armed pins. The shell's Actions tab +
+  repoHasActions threading + the admin nav's Actions group; ten admin
+  goldens one-line each. Combined sweep **598/598**.
+- **The writers fixes** — c1cefaa: the unit-row gap closed at the WRITERS
+  (the scan was correct all along — the writers were the gap, C9's catch):
+  `saveRepoSettings`, the single choke point both the UI toggle and the API
+  PATCH funnel through, now writes the `repo_units` actions row in lockstep
+  with `has_actions` in the SAME db.batch (upstream setting.go's
+  UpdateRepositoryUnits shape; the unconditional direction write self-heals
+  pre-fix stray rows). 42c2af7: the options form's `enable_actions` retires
+  INCLUDING its SAVE arm — upstream's toggle lives only on
+  actions_general.tmpl (options.tmpl's unit list ends at enable_pulls), and
+  the pre-retirement absent-field-false parse would have clobbered
+  `has_actions` to 0 on every ordinary options save; the new non-clobber arm
+  pins the stored flag (the nav read rides `RepoBasicsData.hasActions`
+  outside the form).
+- **The creation-defaults flip — b0e1d88**: created repos arm per upstream's
+  DefaultRepoUnits posture per creationKind (normal: actions + packages on;
+  fork: both off per DefaultForkRepoUnits; mirror: packages on, actions
+  off) — the flags AND the `repo_units` actions row seeded in the SAME
+  creation batch, so they can never diverge; pre-flip repos untouched
+  (creation-time writes only, upstream's shape). This is the posture M2's
+  guide prose was corrected against.
+
+**Still open (honest at this as-built read, HEAD b7ef7e5):** C7's org-scope
+runners page in flight (`org-settings-actions-runners.tsx`, an uncommitted
+working-tree page); C3 (log tail + steps) and C4 (artifacts UI) in flight —
+the M1b-dependent units, so the six survey tail GETs (logs /
+workflow / artifacts-download / preview pair / badge.svg /
+workflow-dispatch-inputs) stay unclaimed and the survey's actions row reads
+PARTIAL (b7ef7e5); C5's rerun + rerun-failed DEFER to M3's job emitter (the
+census's flagged split — attempt creation + job re-emission are emitter
+territory; the cancel arm landed inside C2's window); C10's
+scoped-workflows pages defer with M3 (the census's own defer note); and M3
+(the trigger chain) stays staged behind Open question 1 — without it the
+control plane has no automatic producer, jobs arrive via the test-harness
+insertion seams (§3's own sentence).
+
+## As-built — M2 (0143e10, 2026-10-30)
+
+`docs/guide/actions-runners.md` — 447 lines, every claim machine-checked
+against the landed code (22 load-bearing cites spot-verified): what-works-
+today (the four mount families, the wire freeze + divergences, interceptor
+auth, the six-procedure table, token lifecycle, the dispatch payload,
+ingestion); the act_runner recipe (install/register/labels with the
+exact-match warning, an end-to-end walkthrough, the fake-runner as the
+zero-install smoke — OQ-4's resolution exercised); the operator surface
+(retention, secrets, variables); and seven honest limits. The draft's
+pre-flip default-off prose was caught mid-flight and rewritten against
+b0e1d88's creation-defaults flip — the guide's enable instructions reflect
+the flipped posture.

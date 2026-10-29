@@ -685,3 +685,51 @@ audit-retention precedent, landed 5c8853c); (6) container upload state
 deferred to the M6 SPEC-attachment; (7) `repo_units` enum extends in the M2
 migration; (8) the accessMode-collapse fold, upstream parity can arrive as a
 later columns migration.
+
+## As-built — M5b nuget (e26c862, 2026-10-29 — the registry carries SIX protocols)
+
+The §2.1 nuget row's full wire (upstream 698 ln: the V2 OData + V3 JSON dual),
+landed as `services/packages/nuget.ts` (2,227 lines) + the route arms in
+`api/routes/packages-protocols.ts`:
+
+- **The hand-built zip reader** — EOCD + central-directory walk, stored +
+  deflate-raw entries, the bomb gate — no new dependency (the hand-rolled
+  posture, same spirit as the actions connect codec).
+- **The root-nuspec rule** with the fifth-segment normalization.
+- **V3**: the nine-resource service index + registration leaves +
+  byte-parity downloads.
+- **V2 OData**: the Edmx + the `Packages(Id=…)` leaf via a PREFIX-WILDCARD
+  re-pin of upstream's regex — Hono cannot compile chi's embedded-param
+  parens (probe-verified; a documented wire-shape divergence with upstream's
+  match set preserved).
+- **The BSJB symbol extractor** (the symbols endpoint) and the
+  **X-NuGet-ApiKey auth fallback** (upstream's `nuget.Auth` in api.go:97-102).
+- **The +1 post-insert count-quota parity** upstream's transaction ordering
+  produces (the pattern the npm fix below generalizes).
+- Tests: 14/14 own + the six-protocol superset sweep 122/122. The commit
+  flagged npm's missing quota-parity arm for backport — landed (below).
+
+## As-built — npm count-quota parity (54a8fc4, 2026-10-30)
+
+Upstream's count quota is insert-THEN-check inside the rolling-back
+transaction — `CheckCountQuotaExceeded` is called only after `versionCreated`
+(`services/packages/packages.go:188-191`; the `totalCount >
+LimitTotalOwnerCount` comparison at `:380-381`) — so the publish reaching
+limit N succeeds (201) and only N+1 fails (403), the failed publish rolling
+back whole. npm's landed pre-insert check allowed one version MORE at the
+boundary; the fix applies the pre-insert EQUIVALENT — the inline
+`countVersions + 1 > limit` block with admin bypass and `-1` disable
+(mirroring nuget's landed shape) — and the boundary test pins N-th 201 /
+(N+1)-th 403 + the rollback posture. 24/24 own + the six-protocol
+superset sweep 183/183.
+
+The same +1 parity is now family-wide: the pypi/generic/helm/maven sweep
+landed `4e42c8c` (the inline shape at every publish arm — helm's prov path
+included, maven's checksum-verify early return staying quota-free;
+`checkCountQuotaExceeded` deleted from model.ts, zero occurrences left in
+src; boundary tests in all four suites; superset sweep 156/156).
+
+**Open at this as-built read (honest, NOT landed):** nuget is NOT yet in
+the deploy-probes packages-registry battery
+(`scripts/deploy-probes.mjs`, the 49a1502 battery round-trips FIVE of the
+six protocols end-to-end — generic, pypi, npm, helm, maven — nuget pending).
