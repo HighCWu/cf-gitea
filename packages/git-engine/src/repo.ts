@@ -134,6 +134,29 @@ export const MAX_BLAME_BYTES = 1024 * 1024;
 const MAX_BLAME_HISTORY_BYTES = 16 * 1024 * 1024;
 /** blame's first-parent walk holds at most this many changed revisions */
 const MAX_BLAME_REVISIONS = 200;
+/** grep line-scans at most this many blobs per run (SPEC-0015 §3.1 — the
+ *  MAX_STATS_SCAN magnitude) */
+export const MAX_GREP_FILES = 2000;
+/** grep skips blobs over this size — the MAX_DIFF_BLOB value: files bigger
+ *  than the diff cap don't grep (a SKIP, never a budget exit) */
+export const MAX_GREP_BLOB_BYTES = 512 * 1024;
+/** result blocks per answer — upstream's own fallback cap (grep.go:77
+ *  `MaxResultLimit` default 50, enforced SILENTLY there via CancelPipeline;
+ *  ours caps `results` at the same 50 but flags `truncated` honestly) */
+export const MAX_GREP_RESULT_FILES = 50;
+/** total line reads per run — the scan-step stand-in for upstream's 30 s git
+ *  timeout (grep.go:43-45 `grepSearchTimeout`) */
+export const MAX_GREP_SCAN_STEPS = 200000;
+/** total NFA simulation steps per run for regexp mode — a budget SEPARATE from
+ *  the line-scan cap so a pathological pattern burns THIS (the scan answers
+ *  truncated), never the scan budget ordinary greps share (ratified Open
+ *  question 1: regexp ships budgeted). One step = one NFA state expansion
+ *  (~0.1 µs each → worst case well under a second of CPU). The linear
+ *  simulation charges EVERY line position, so this also bounds regexp-mode
+ *  wall on plain large files: corpora past ~2M expansions answer truncated —
+ *  regexp scans tighter than words/exact (whose 200k-line cap runs native
+ *  indexOf), the documented cost of budgeting the mode at all. */
+export const MAX_GREP_REGEXP_STEPS = 2000000;
 // full streaming is a separate follow-up; until then this must fit the isolate
 const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 /** the DO SQLite storage ceiling gc must not cross while duplicating objects */
@@ -259,6 +282,37 @@ export interface BlobResult {
   oid: string;
   mode: string;
   data: Uint8Array;
+}
+
+/**
+ * The in-repo code-search answer (`grep(ref, opts)`, SPEC-0015 §3.1 — the data
+ * behind upstream's `GET .../search` page on the non-indexed fallback path, the
+ * upstream-DEFAULT posture: `setting.Indexer.RepoIndexerEnabled` defaults false
+ * (modules/setting/indexer.go:43) and the repo-search caller passes no
+ * MaxResultLimit override). One block per matching file (upstream
+ * `GrepResult{Filename, LineNumbers[], LineCodes[]}`, grep.go:20-23), MATCH
+ * lines only — upstream collects `--context 1` lines too but the page renders
+ * highlighted match lines; the dropped context is the ledgered divergence
+ * (byte-cheap: context doubles the bytes per hit).
+ */
+export interface GrepResult {
+  /** the ref the answer was computed at — the resolved ref name (HEAD's
+   *  symbolic name when `ref` was absent), or the raw oid for an oid ref */
+  ref: string;
+  /** the resolved tip commit oid (upstream's per-result CommitID,
+   *  gitgrep.go:56) */
+  commit: string;
+  /** one block per matching file, tree order */
+  results: { path: string; lines: { num: number; code: string }[] }[];
+  /** matching-file count BEFORE the 50-result cap sliced `results` — as far as
+   *  the scan budget allowed counting (upstream reports the CAPPED count
+   *  silently, gitgrep.go:50 `total = len(res)`; the honest-total divergence) */
+  total: number;
+  /** any budget exit made the answer a partial: the files cap, the scan-step
+   *  cap, the regexp step budget, OR the result cap cut a larger match set
+   *  (upstream's CancelPipeline exit at grep.go:109 is silent; the blame
+   *  budget-exit rule — a budget-bounded scan is never presented complete) */
+  truncated: boolean;
 }
 
 export interface DiffFileJson {
@@ -1366,6 +1420,120 @@ export class RepoCell extends DurableObject<Env> {
         parts.push(prev === undefined ? { oid, lines } : { oid, previousOid: prev, lines });
       }
       return { firstLine: ofs + 1, parts, commits, totalLines: result.length, truncated };
+    });
+  }
+
+  /**
+   * In-repo content search, `grep(ref, opts)` (the census R10 boundary RPC —
+   * the data behind upstream's `GET .../search`, routers/web/repo/search.go,
+   * on the non-indexed fallback path `gitgrep.PerformSearch` → `git.GrepSearch`
+   * that the upstream-default config actually serves). Budgeted tree walk +
+   * line scan inside the DO: `flattenTree` in path order, per blob the
+   * index-only size gate (`typeAndSize` — no R2 GET for over-cap files), a
+   * binary sniff (the blame idiom; upstream's parser would emit an empty-lines
+   * block per binary hit, ours skips the file entirely — pinned divergence),
+   * then the per-line match scan collecting MATCH lines only. Modes mirror
+   * grep.go:61-72: `exact` = case-sensitive literal substring
+   * (`--fixed-strings`); `words` = the DEFAULT, per-whitespace-word
+   * case-insensitive substring with ALL words required on the SAME line (the
+   * `--and` semantics — per-line in git, verified against the binary);
+   * `regexp` = the step-budgeted NFA matcher below (compile failure → null).
+   * Availability ladder (the blame rule): null on an empty query, an
+   * unresolvable ref / empty repo, a words query with no words, or a regexp
+   * compile failure; budget exits are NEVER null — they answer the partial
+   * with `truncated`. No cache: query-shaped (unbounded key space) — repeat
+   * clicks pay the walk; keeping the walk cheap is the budgets' job.
+   */
+  async grep(ref?: string, opts: { q?: string; mode?: "exact" | "words" | "regexp"; path?: string } = {}): Promise<GrepResult | null> {
+    this.rpcBind();
+    return this.withContentLease(async (gate) => {
+      const q = opts.q ?? "";
+      if (!q) return null; // upstream renders the bare form on Keyword == ""
+      // an unknown mode falls to the default (upstream's switch default is words)
+      const mode = opts.mode === "exact" || opts.mode === "regexp" ? opts.mode : "words";
+      // regexp compiles BEFORE the walk: a bad pattern answers null without scanning
+      let re: GrepMatcher | null = null;
+      let reBudget = { steps: MAX_GREP_REGEXP_STEPS };
+      if (mode === "regexp") {
+        try {
+          re = compileGrepRegexp(q, reBudget);
+        } catch {
+          return null;
+        }
+      }
+      // words: strings.Fields semantics — whitespace runs split, empties dropped;
+      // zero words is refused work (upstream would build an expression-less
+      // --and grep, which git rejects)
+      const words = mode === "words" ? q.split(/\s+/).filter((w) => w.length > 0) : null;
+      const needles = words !== null ? words.map((w) => w.toLowerCase()) : null;
+      if (words !== null && words.length === 0) return null;
+      const rr = await this.resolveRef(ref, gate);
+      if (!rr) return null;
+      const tip = await this.peelToCommit(rr.oid, gate);
+      if (!tip) return null;
+      const prefix = opts.path ? decodePath("/" + opts.path).join("/") : "";
+      const files = new Map<string, { oid: string; mode: string }>();
+      await this.flattenTree(tip.commit.tree, "", files, gate);
+      const results: GrepResult["results"] = [];
+      let total = 0;
+      let truncated = false;
+      let scanned = 0;
+      let scanSteps = MAX_GREP_SCAN_STEPS;
+      scan: for (const [p, entry] of files) {
+        if (prefix && p !== prefix && !p.startsWith(prefix + "/")) continue;
+        if (scanned >= MAX_GREP_FILES) {
+          truncated = true; // the files cap: answer the scanned prefix, flagged
+          break;
+        }
+        // typeAndSize is an index-only SQLite read — no R2 GET, nothing to gate
+        const meta = this.store.typeAndSize(entry.oid);
+        if (!meta || meta.type !== "blob") continue;
+        if (meta.size > MAX_GREP_BLOB_BYTES) continue; // a skip, not a budget exit
+        const obj = await this.store.get(entry.oid, gate);
+        if (!obj || obj.type !== "blob") continue;
+        scanned++;
+        if (isBinary(obj.data)) continue;
+        const lines = td.decode(obj.data).split("\n");
+        // split's trailing "" sits past the final newline — not a real line
+        if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+        let block: GrepResult["results"][number] | null = null;
+        for (let i = 0; i < lines.length; i++) {
+          if (scanSteps <= 0) {
+            truncated = true; // the scan-step cap stands in for the 30 s timeout
+            break scan;
+          }
+          scanSteps--;
+          const line = lines[i];
+          let hit: boolean;
+          if (needles !== null) {
+            const lower = line.toLowerCase();
+            hit = needles.every((n) => lower.includes(n));
+          } else if (re !== null) {
+            try {
+              hit = re.test(line);
+            } catch (err) {
+              if (err instanceof GrepRegexpBudgetExhausted) {
+                truncated = true; // the regexp budget is ITS OWN budget — the
+                break scan; // line-scan cap stays untouched for ordinary greps
+              }
+              throw err;
+            }
+          } else {
+            hit = line.includes(q);
+          }
+          if (!hit) continue;
+          if (block === null) {
+            total++;
+            if (results.length < MAX_GREP_RESULT_FILES) {
+              block = { path: p, lines: [] };
+              results.push(block);
+            } // past the cap: count the file, don't collect its lines
+          }
+          if (block !== null) block.lines.push({ num: i + 1, code: line });
+        }
+      }
+      if (total > results.length) truncated = true; // the 50-result cap cut a larger set
+      return { ref: rr.refName ?? rr.oid, commit: tip.oid, results, total, truncated };
     });
   }
 
@@ -2746,4 +2914,473 @@ function decodePath(p: string): string[] {
     .filter((s) => s.length > 0)
     .map((s) => decodeURIComponent(s))
     .filter((s) => s !== "." && s !== "..");
+}
+
+// ---- grep's regexp mode: a step-budgeted NFA matcher (SPEC-0015 §3.1) --------
+//
+// A native `new RegExp(q).test(line)` cannot be budgeted: backtracking is
+// unbounded INSIDE one call — `(a+)+$` against a 40-char `a`-run already costs
+// ~2^40 steps — and workerd offers no interrupt API, so one pathological line
+// would hang the RPC past any useful limit. grep compiles the pattern to a
+// Thompson NFA and simulates it LINEARLY instead — O(line length × NFA states)
+// per line, so no catastrophic-backtracking case even exists — charging each
+// state expansion to the run's regexp budget (MAX_GREP_REGEXP_STEPS); when the
+// budget runs out mid-scan, test() throws GrepRegexpBudgetExhausted and the
+// RPC answers the partial with truncated (the line-scan cap stays untouched —
+// a pathological pattern must not burn the scan budget ordinary greps share).
+// Supported syntax — the grep-relevant JS RegExp subset (compile failure →
+// the RPC answers null, never a silent mis-parse; stricter-than-JS is safe,
+// looser-than-JS would be wrong): literals, `.`, `\`-escapes (\d \D \w \W \s
+// \S \b \B, control chars, quoted metacharacters), [...] classes with
+// ranges/negation/class escapes, groups (capturing and (?:…)), alternation `|`,
+// quantifiers * + ? {m} {m,} {m,n} — greedy or lazy, identical for boolean
+// matching — and the ^/$ anchors (a line is newline-free, so input anchors are
+// line anchors). NOT supported (compile throws): backreferences, lookahead /
+// lookbehind, named groups, \u/\x/\c escapes, POSIX classes, unknown identity
+// escapes, and expansions past the 1000-repetition / 10000-state caps. The
+// JS-RegExp-here vs PCRE-upstream (--perl-regexp) semantics divergence is
+// ledger-ready: identical for the common pattern classes, and boolean match
+// only — the RPC never reports capture positions.
+
+/** Thrown by a GrepMatcher when the run's regexp step budget is exhausted. */
+class GrepRegexpBudgetExhausted extends Error {
+  constructor() {
+    super("grep regexp budget exhausted");
+  }
+}
+
+interface GrepNfaState {
+  /** consuming transitions: char test → next state */
+  tests: { test: (ch: string) => boolean; to: number }[];
+  /** zero-width transitions: optional position guard → next state */
+  eps: { guard?: (pos: number, prev: string, next: string, len: number) => boolean; to: number }[];
+}
+
+/** A compiled grep regexp: boolean unanchored match (RegExp.test semantics),
+ *  charging `budget.steps` per state expansion; throws
+ *  GrepRegexpBudgetExhausted when the budget runs out. */
+interface GrepMatcher {
+  test(line: string): boolean;
+}
+
+function isGrepWordChar(ch: string): boolean {
+  const c = ch.charCodeAt(0);
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95;
+}
+
+/** JS `\s` (MDN's production: the ASCII run + the Unicode space set). */
+function isGrepSpace(ch: string): boolean {
+  const c = ch.charCodeAt(0);
+  return (
+    c === 32 ||
+    (c >= 9 && c <= 13) ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+const GREP_T_ANY = (ch: string) => ch !== "\n";
+const GREP_T_DIGIT = (ch: string) => ch >= "0" && ch <= "9";
+const GREP_T_WORD = isGrepWordChar;
+const GREP_T_SPACE = isGrepSpace;
+
+/** Pattern → NFA compiler. Compile cost is bounded structurally (the
+ *  repetition and state caps), so it runs outside the step budget. */
+class GrepPatternParser {
+  private i = 0;
+  states: GrepNfaState[] = [];
+  /** fragments share states, so counted repetition re-parses the atom fresh
+   *  per copy; both caps keep a hostile pattern from blowing up compilation */
+  private static MAX_REPEAT = 1000;
+  private static MAX_STATES = 10000;
+
+  constructor(private pat: string) {}
+
+  private peek(): string {
+    return this.pat[this.i];
+  }
+
+  private eat(s: string): boolean {
+    if (this.pat.startsWith(s, this.i)) {
+      this.i += s.length;
+      return true;
+    }
+    return false;
+  }
+
+  private newState(): number {
+    if (this.states.length >= GrepPatternParser.MAX_STATES) {
+      throw new Error(`grep regexp: pattern expands past ${GrepPatternParser.MAX_STATES} NFA states`);
+    }
+    this.states.push({ tests: [], eps: [] });
+    return this.states.length - 1;
+  }
+
+  parsePattern(): { start: number; ends: number[] } {
+    const frag = this.parseAlt();
+    if (this.i < this.pat.length) throw new Error(`grep regexp: unexpected ${JSON.stringify(this.peek())} at ${this.i}`);
+    return frag;
+  }
+
+  /** alt := concat ('|' concat)* */
+  private parseAlt(): { start: number; ends: number[] } {
+    const frags = [this.parseConcat()];
+    while (this.eat("|")) frags.push(this.parseConcat());
+    if (frags.length === 1) return frags[0];
+    const s = this.newState();
+    const ends: number[] = [];
+    for (const f of frags) {
+      this.states[s].eps.push({ to: f.start });
+      ends.push(...f.ends);
+    }
+    return { start: s, ends };
+  }
+
+  /** concat := repeat* (zero atoms = the ε fragment) */
+  private parseConcat(): { start: number; ends: number[] } {
+    const parts: { start: number; ends: number[] }[] = [];
+    while (this.i < this.pat.length && this.peek() !== "|" && this.peek() !== ")") {
+      parts.push(this.parseRepeat());
+    }
+    if (parts.length === 0) {
+      const s = this.newState();
+      return { start: s, ends: [s] };
+    }
+    for (let k = 1; k < parts.length; k++) {
+      for (const e of parts[k - 1].ends) this.states[e].eps.push({ to: parts[k].start });
+    }
+    return { start: parts[0].start, ends: parts[parts.length - 1].ends };
+  }
+
+  /** repeat := atom quantifier? — a quantifier must follow an atom ("a**" and
+   *  a leading "*" are JS SyntaxErrors, so ours throws too) */
+  private parseRepeat(): { start: number; ends: number[] } {
+    const atomIdx = this.i;
+    let frag = this.parseAtom();
+    const q = this.tryQuantifier();
+    if (!q) return frag;
+    if (q.kind !== "counted") {
+      if (q.kind === "*") return this.starOf(frag);
+      if (q.kind === "+") return this.plusOf(frag);
+      return this.optOf(frag);
+    }
+    // counted {m} / {m,} / {m,n}: re-parse the atom fresh per copy
+    const min = q.min ?? 0;
+    const max = q.max;
+    if (min > GrepPatternParser.MAX_REPEAT || (max !== undefined && max > GrepPatternParser.MAX_REPEAT)) {
+      throw new Error(`grep regexp: repetition past ${GrepPatternParser.MAX_REPEAT} unsupported`);
+    }
+    if (max !== undefined && max < min) throw new Error("grep regexp: {m,n} with n < m");
+    const parts: { start: number; ends: number[] }[] = [];
+    for (let k = 0; k < min; k++) parts.push(this.parseAtomAt(atomIdx));
+    if (max === undefined) {
+      if (min === 0) parts.push(this.starOf(this.parseAtomAt(atomIdx)));
+      else parts.push(this.plusOf(this.parseAtomAt(atomIdx)));
+    } else {
+      for (let k = min; k < max; k++) parts.push(this.optOf(this.parseAtomAt(atomIdx)));
+    }
+    if (parts.length === 0) {
+      const s = this.newState();
+      return { start: s, ends: [s] };
+    }
+    for (let k = 1; k < parts.length; k++) {
+      for (const e of parts[k - 1].ends) this.states[e].eps.push({ to: parts[k].start });
+    }
+    return { start: parts[0].start, ends: parts[parts.length - 1].ends };
+  }
+
+  private parseAtomAt(idx: number): { start: number; ends: number[] } {
+    this.i = idx;
+    return this.parseAtom();
+  }
+
+  private starOf(f: { start: number; ends: number[] }): { start: number; ends: number[] } {
+    const s = this.newState();
+    this.states[s].eps.push({ to: f.start });
+    for (const e of f.ends) this.states[e].eps.push({ to: s });
+    return { start: s, ends: [s] };
+  }
+
+  private plusOf(f: { start: number; ends: number[] }): { start: number; ends: number[] } {
+    const s = this.newState();
+    for (const e of f.ends) this.states[e].eps.push({ to: s });
+    this.states[s].eps.push({ to: f.start });
+    return { start: f.start, ends: [s] };
+  }
+
+  private optOf(f: { start: number; ends: number[] }): { start: number; ends: number[] } {
+    const s = this.newState();
+    this.states[s].eps.push({ to: f.start });
+    return { start: s, ends: [...f.ends, s] };
+  }
+
+  /** null = no quantifier at the cursor (an invalid `{…` is a literal, JS's
+   *  rule); {kind: "counted"} carries the parsed min/max */
+  private tryQuantifier(): { kind: "*" | "+" | "?" } | { kind: "counted"; min?: number; max?: number } | null {
+    const c = this.peek();
+    if (c === "*" || c === "+" || c === "?") {
+      this.i++;
+      this.eat("?"); // lazy marker — identical for boolean matching
+      return { kind: c };
+    }
+    if (c === "{") {
+      const save = this.i;
+      this.i++;
+      const num = () => {
+        const start = this.i;
+        while (this.i < this.pat.length && this.pat[this.i] >= "0" && this.pat[this.i] <= "9") this.i++;
+        return start === this.i ? null : parseInt(this.pat.slice(start, this.i), 10);
+      };
+      const min = num();
+      let max: number | undefined;
+      if (this.eat(",")) {
+        max = num() ?? undefined; // {m,} = unbounded
+      } else if (min === null) {
+        this.i = save; // not a quantifier — literal '{'
+        return null;
+      } else {
+        max = min; // {m}
+      }
+      if (!this.eat("}")) {
+        this.i = save;
+        return null;
+      }
+      this.eat("?"); // lazy marker
+      return { kind: "counted", min: min ?? 0, max };
+    }
+    return null;
+  }
+
+  private parseAtom(): { start: number; ends: number[] } {
+    const c = this.peek();
+    if (c === "(") {
+      this.i++;
+      if (this.eat("?")) {
+        if (!this.eat(":")) throw new Error("grep regexp: only (?:…) groups supported (no lookaround/named groups)");
+      }
+      const f = this.parseAlt();
+      if (!this.eat(")")) throw new Error("grep regexp: unterminated group");
+      return f;
+    }
+    if (c === "[") return this.parseClass();
+    if (c === ".") {
+      this.i++;
+      return this.testFrag(GREP_T_ANY);
+    }
+    if (c === "^") {
+      this.i++;
+      return this.assertFrag((pos) => pos === 0);
+    }
+    if (c === "$") {
+      this.i++;
+      return this.assertFrag((pos, _prev, _next, len) => pos === len);
+    }
+    if (c === "\\") return this.parseEscape().frag;
+    if (c === "*" || c === "+" || c === "?") throw new Error(`grep regexp: nothing to repeat at ${this.i}`);
+    // a stray '{' or '}' is a literal (JS's rule); every other char is a literal
+    this.i++;
+    return this.charFrag(c).frag;
+  }
+
+  /** Shared `\`-escape parser. `single` carries the literal char for the
+   *  single-char cases (class ranges need it); class tests (\d etc.) have
+   *  single === undefined and carry their test in `frag`. */
+  private parseEscape(): { frag: { start: number; ends: number[] }; single: string | undefined } {
+    this.i++; // the backslash
+    const c = this.pat[this.i];
+    if (c === undefined) throw new Error("grep regexp: trailing backslash");
+    this.i++;
+    switch (c) {
+      case "d":
+        return { frag: this.testFrag(GREP_T_DIGIT), single: undefined };
+      case "D":
+        return { frag: this.testFrag((ch) => !GREP_T_DIGIT(ch)), single: undefined };
+      case "w":
+        return { frag: this.testFrag(GREP_T_WORD), single: undefined };
+      case "W":
+        return { frag: this.testFrag((ch) => !GREP_T_WORD(ch)), single: undefined };
+      case "s":
+        return { frag: this.testFrag(GREP_T_SPACE), single: undefined };
+      case "S":
+        return { frag: this.testFrag((ch) => !GREP_T_SPACE(ch)), single: undefined };
+      case "b":
+        return { frag: this.assertFrag((pos, prev, next) => isGrepWordChar(prev) !== isGrepWordChar(next)), single: undefined };
+      case "B":
+        return { frag: this.assertFrag((pos, prev, next) => isGrepWordChar(prev) === isGrepWordChar(next)), single: undefined };
+      case "n":
+        return this.charFrag("\n");
+      case "t":
+        return this.charFrag("\t");
+      case "r":
+        return this.charFrag("\r");
+      case "f":
+        return this.charFrag("\f");
+      case "v":
+        return this.charFrag("\v");
+      case "0":
+        return this.charFrag("\0");
+      default:
+        if (c >= "1" && c <= "9") throw new Error("grep regexp: backreferences unsupported");
+        if (c === "u" || c === "x" || c === "c") throw new Error(`grep regexp: \\${c} escapes unsupported`);
+        if (/[A-Za-z]/.test(c)) throw new Error(`grep regexp: unknown identity escape \\${c}`);
+        return this.charFrag(c); // quoted metacharacter (\. \\ \[ \] \( \) …)
+    }
+  }
+
+  private parseClass(): { start: number; ends: number[] } {
+    this.i++; // the '['
+    const negate = this.eat("^");
+    const items: ((ch: string) => boolean)[] = [];
+    // JS: "[]" never opens a valid class (the ']' would close an EMPTY one —
+    // a SyntaxError), so an immediate ']' throws here too
+    if (this.peek() === "]") throw new Error("grep regexp: empty class");
+    while (true) {
+      const c = this.peek();
+      if (c === undefined) throw new Error("grep regexp: unterminated class");
+      if (c === "]") {
+        this.i++;
+        break;
+      }
+      if (c === "[" && this.pat[this.i + 1] === ":") throw new Error("grep regexp: POSIX classes unsupported");
+      let low: string;
+      if (c === "\\") {
+        // class-context escapes: \b is BACKSPACE here (JS's ClassEscape rule,
+        // not a word boundary) and \B is unsupported; everything else defers
+        // to the shared escape parser
+        if (this.pat[this.i + 1] === "b") {
+          this.i += 2;
+          low = "\b";
+        } else if (this.pat[this.i + 1] === "B") {
+          throw new Error("grep regexp: \\B inside a class unsupported");
+        } else {
+          const { frag, single } = this.parseEscape();
+          if (single === undefined) {
+            // a class test (\d \w \s or negations) — no range participation
+            items.push(this.states[frag.start].tests[0].test);
+            continue;
+          }
+          low = single;
+        }
+      } else {
+        this.i++;
+        low = c;
+      }
+      // range?
+      if (this.peek() === "-" && this.pat[this.i + 1] !== undefined && this.pat[this.i + 1] !== "]") {
+        this.i++; // the '-'
+        const hc = this.peek();
+        let high: string;
+        if (hc === "\\") {
+          const h = this.parseEscape();
+          if (h.single === undefined) throw new Error("grep regexp: class range end must be a single char");
+          high = h.single;
+        } else if (hc === undefined) {
+          throw new Error("grep regexp: unterminated class");
+        } else {
+          this.i++;
+          high = hc;
+        }
+        items.push(rangeTest(low, high));
+      } else {
+        items.push((ch) => ch === low);
+      }
+    }
+    // JS: a negated class matches anything not listed, newline included
+    const test = negate ? (ch: string) => !items.some((f) => f(ch)) : (ch: string) => items.some((f) => f(ch));
+    return this.testFrag(test);
+  }
+
+  private charFrag(ch: string): { frag: { start: number; ends: number[] }; single: string | undefined } {
+    return { frag: this.testFrag((c: string) => c === ch), single: ch };
+  }
+
+  private testFrag(test: (ch: string) => boolean): { start: number; ends: number[] } {
+    const s = this.newState();
+    const t = this.newState();
+    this.states[s].tests.push({ test, to: t });
+    return { start: s, ends: [t] };
+  }
+
+  private assertFrag(guard: (pos: number, prev: string, next: string, len: number) => boolean): { start: number; ends: number[] } {
+    const s = this.newState();
+    const t = this.newState();
+    this.states[s].eps.push({ guard, to: t });
+    return { start: s, ends: [t] };
+  }
+}
+
+function rangeTest(low: string, high: string): (ch: string) => boolean {
+  const lo = low.charCodeAt(0);
+  const hi = high.charCodeAt(0);
+  if (hi < lo) throw new Error("grep regexp: class range out of order");
+  return (ch) => {
+    const c = ch.charCodeAt(0);
+    return c >= lo && c <= hi;
+  };
+}
+
+/** Compile `pattern` (JS RegExp source, no flags — grep's modes carry their
+ *  own case rules) into a step-budgeted matcher sharing `budget` across every
+ *  test() of this run. Throws on unsupported syntax (the RPC answers null). */
+function compileGrepRegexp(pattern: string, budget: { steps: number }): GrepMatcher {
+  const parser = new GrepPatternParser(pattern);
+  const frag = parser.parsePattern();
+  const states = parser.states;
+  const accept = new Set(frag.ends);
+
+  /** Position closure: expand every state reachable by zero-width edges,
+   *  evaluating assertion guards with the position's char context. */
+  function closure(seeds: number[], pos: number, len: number, line: string): Set<number> {
+    const out = new Set<number>(seeds);
+    const stack = [...seeds];
+    while (stack.length > 0) {
+      const s = stack.pop() as number;
+      if (budget.steps <= 0) throw new GrepRegexpBudgetExhausted();
+      budget.steps--;
+      for (const e of states[s].eps) {
+        if (e.guard) {
+          const prev = pos > 0 ? line[pos - 1] : "";
+          const next = pos < len ? line[pos] : "";
+          if (!e.guard(pos, prev, next, len)) continue;
+        }
+        if (!out.has(e.to)) {
+          out.add(e.to);
+          stack.push(e.to);
+        }
+      }
+    }
+    return out;
+  }
+
+  return {
+    test(line: string): boolean {
+      const len = line.length;
+      let active = closure([frag.start], 0, len, line);
+      for (let pos = 0; pos <= len; pos++) {
+        for (const a of accept) {
+          if (active.has(a)) return true;
+        }
+        if (pos === len) break;
+        const ch = line[pos];
+        // re-seed the start every position: unanchored search (RegExp.test)
+        const next: number[] = [frag.start];
+        for (const s of active) {
+          if (budget.steps <= 0) throw new GrepRegexpBudgetExhausted();
+          budget.steps--;
+          for (const t of states[s].tests) {
+            if (t.test(ch)) next.push(t.to);
+          }
+        }
+        active = closure(next, pos + 1, len, line);
+      }
+      return false;
+    },
+  };
 }
