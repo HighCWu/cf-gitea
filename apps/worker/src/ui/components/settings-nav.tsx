@@ -126,6 +126,7 @@ export const settingsNavLocale = {
   ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys" (:33)
   actions: "Actions", // "actions.actions" (the <details> summary, :41)
   runners: "Runners", // "actions.runners" (navbar.tmpl:35-37/43-48 — lit by BOTH twins' mounts: org-settings-actions-runners + user-settings-actions-runners)
+  packages: "Packages", // "packages.title" (navbar.tmpl:25 — lit by the org settings packages tab's mount)
   secrets: "Secrets", // "secrets.secrets" (:50)
   variables: "Variables", // "actions.variables" (:53)
   hooks: "Webhooks", // "repo.settings.hooks" (:68)
@@ -163,7 +164,7 @@ export type UserSettingsNavTab =
  *  upstream's PageIsOrgSettingsLabels arm (navbar.tmpl:12 — today the item
  *  links the landed `/{org}/labels` page, which renders no settings nav, so
  *  no caller passes it yet). */
-export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "applications" | "blocked" | "runners" | "secrets" | "variables" | "audit";
+export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "applications" | "blocked" | "packages" | "runners" | "secrets" | "variables" | "audit";
 
 // ---------------------------------------------------------------------------
 // The user settings navbar (user/settings/navbar.tmpl reduced)
@@ -294,6 +295,11 @@ export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsN
             module is committed-unmounted. */}
         <a class={item("blocked")} href={`${props.orgLink}/settings/blocked_users`}>
           {settingsNavLocale.blocked_users}
+        </a>
+        {/* navbar.tmpl:23-27 — lit by the org settings packages tab's mount
+            (pages/org-settings-packages.tsx). */}
+        <a class={item("packages")} href={`${props.orgLink}/settings/packages`}>
+          {settingsNavLocale.packages}
         </a>
         {/* navbar.tmpl:28-48 — General (:32-34) and Scoped-workflows
             (:44-46) dead; Runners (:35-37) lit by the census C7 org twin's

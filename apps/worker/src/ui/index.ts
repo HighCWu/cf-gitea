@@ -931,6 +931,20 @@ import {
   setOrgActionsRunnerDisabled,
   updateOrgActionsRunnerDescription,
 } from "./pages/org-settings-actions-runners";
+import {
+  applyOrgCleanupRuleCreate,
+  applyOrgCleanupRuleEdit,
+  loadOrgCleanupRuleEditPageData,
+  loadOrgCleanupRulePreview,
+  loadOrgPackagesSettingsPageData,
+  orgCleanupRuleEditDataForAdd,
+  orgCleanupRuleEditDataFromForm,
+  orgSettingsPackagesLocale,
+  parseOrgCleanupRuleForm,
+  renderOrgCleanupRuleEditPage,
+  renderOrgCleanupRulePreviewPage,
+  renderOrgSettingsPackagesPage,
+} from "./pages/org-settings-packages";
 // The census R20 (a) arm: the org settings applications tab (org-OWNED
 // oauth2 applications — the landed service's uid-parameterized arms keyed
 // on the org's id).
@@ -3183,6 +3197,10 @@ export interface OrgSettingsRoute {
     | "org-actions-runners-edit" // GET+POST .../runners/{id} (page + the description update)
     | "org-actions-runners-update" // POST .../runners/{id}/update-runner
     | "org-actions-runners-delete" // POST .../runners/{id}/delete
+    | "org-settings-packages" // GET /{org}/settings/packages (the cleanup-rules list)
+    | "org-settings-packages-rule-add" // GET+POST /{org}/settings/packages/rules/add
+    | "org-settings-packages-rule-edit" // GET+POST /{org}/settings/packages/rules/{id}
+    | "org-settings-packages-rule-preview" // GET /{org}/settings/packages/rules/{id}/preview
     | "org-team-edit" // GET+POST /{org}/teams/{id}/edit
     | "org-team-delete" // POST /{org}/teams/{id}/delete
   ;
@@ -4048,6 +4066,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (raw.length === 7 && raw[3] === "actions" && raw[4] === "runners" && raw[6] === "delete" && /^-?\d+$/.test(raw[5] as string)) {
       return { family: "org-actions-runners-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
+    // The org settings PACKAGES family (pages/org-settings-packages.tsx —
+    // web.go:1069-1085's cleanup-rules group; the rules/add literal claims
+    // AHEAD of the {id} combo, chi static-first). The cargo tails stay
+    // unregistered — no substrate.
+    if (raw.length === 4 && raw[3] === "packages") {
+      return { family: "org-settings-packages", owner };
+    }
+    if (raw.length === 6 && raw[3] === "packages" && raw[4] === "rules" && raw[5] === "add") {
+      return { family: "org-settings-packages-rule-add", owner };
+    }
+    if (raw.length === 6 && raw[3] === "packages" && raw[4] === "rules" && /^-?\d+$/.test(raw[5] as string)) {
+      return { family: "org-settings-packages-rule-edit", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    if (raw.length === 7 && raw[3] === "packages" && raw[4] === "rules" && raw[6] === "preview" && /^-?\d+$/.test(raw[5] as string)) {
+      return { family: "org-settings-packages-rule-preview", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
     }
     if (raw.length === 5 && raw[3] === "avatar" && raw[4] === "delete") {
       return { family: "org-settings-avatar-delete", owner };
@@ -9645,6 +9679,97 @@ async function orgActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Res
   return respond(c.html(renderOrgActionsRunnersPage(ctx, data), 200));
 }
 
+/** The org settings PACKAGES family's handlers (pages/org-settings-packages.
+ *  tsx — web.go:1069-1085; the cleanup-rules CRUD + preview over the landed
+ *  table; sameOriginGuard-first on every POST arm, the owner prologue). */
+async function orgPackagesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-packages") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgPackagesSettingsPageData(c.env.DB, org);
+  return respond(c.html(renderOrgSettingsPackagesPage(ctx, data), 200));
+}
+
+async function orgPackagesRuleAddPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-packages-rule-add") return respond(await c.notFound()); // drift guard
+  return respond(c.html(renderOrgCleanupRuleEditPage(ctx, orgCleanupRuleEditDataForAdd(org)), 200));
+}
+
+async function orgPackagesRuleAddSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-packages-rule-add") return respond(await c.notFound()); // drift guard
+  const parsed = parseOrgCleanupRuleForm(await readUrlEncodedForm(c.req.raw));
+  if (Object.keys(parsed.errors).length > 0) {
+    return respond(c.html(renderOrgCleanupRuleEditPage(ctx, orgCleanupRuleEditDataFromForm(org, false, parsed)), 200));
+  }
+  const outcome = await applyOrgCleanupRuleCreate(c.env.DB, org.id, parsed.values, new Date());
+  if (outcome.outcome === "duplicate-type") {
+    return respond(
+      c.html(
+        renderOrgCleanupRuleEditPage(
+          ctx,
+          orgCleanupRuleEditDataFromForm(org, false, parsed, { errType: true, error: orgSettingsPackagesLocale.already_exists }),
+        ),
+        200,
+      ),
+    );
+  }
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/packages/rules/${outcome.ruleId}` } }));
+}
+
+async function orgPackagesRuleEditPage(c: Context<{ Bindings: Env }>, ruleId: number): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-packages-rule-edit") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgCleanupRuleEditPageData(c.env.DB, org, ruleId);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderOrgCleanupRuleEditPage(ctx, data), 200));
+}
+
+async function orgPackagesRuleEditSubmit(c: Context<{ Bindings: Env }>, ruleId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-packages-rule-edit") return respond(await c.notFound()); // drift guard
+  const parsed = parseOrgCleanupRuleForm(await readUrlEncodedForm(c.req.raw));
+  // getCleanupRuleByContext's precedence: the form id first, then the path.
+  const id = parsed.values.id !== 0 ? parsed.values.id : ruleId;
+  if (Object.keys(parsed.errors).length > 0 && parsed.values.action !== "remove") {
+    const data = await loadOrgCleanupRuleEditPageData(c.env.DB, org, id);
+    const base = data ?? orgCleanupRuleEditDataFromForm(org, true, parsed);
+    return respond(c.html(renderOrgCleanupRuleEditPage(ctx, base), 200));
+  }
+  const outcome = await applyOrgCleanupRuleEdit(c.env.DB, org.id, id, parsed.values, new Date());
+  if (outcome.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  if (outcome.outcome === "removed") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/packages` } }));
+  }
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/packages/rules/${outcome.ruleId}` } }));
+}
+
+async function orgPackagesRulePreviewPage(c: Context<{ Bindings: Env }>, ruleId: number): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-packages-rule-preview") return respond(await c.notFound()); // drift guard
+  // A stored pattern that fails to compile THROWS from the loader —
+  // upstream's ServerError arm (the app-level onError answers the 500).
+  const data = await loadOrgCleanupRulePreview(c.env.DB, org, ruleId);
+  if (data.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderOrgCleanupRulePreviewPage(ctx, data), 200));
+}
+
 /** POST /{org}/settings/actions/runners/reset_registration_token
  * (ResetRunnerRegistrationToken, runners.go:275-290): NewRunnerToken at the
  * org scope, then the plain 303 back onto the list URL (upstream's
@@ -14213,6 +14338,16 @@ uiRouter.post("/:owner/settings/actions/variables/:id/delete", (c) => orgActions
 // `runners` tail literals are deeper still, and the GETs on the POST-only
 // tails answer chi's 405 (the repo runners-family convention).
 uiRouter.get("/:owner/settings/actions/runners", (c) => orgActionsRunnersPage(c));
+// The org settings PACKAGES family (the cleanup-rules CRUD + preview; the
+// cargo tails stay unregistered — no substrate).
+uiRouter.get("/:owner/settings/packages", (c) => orgPackagesPage(c));
+uiRouter.post("/:owner/settings/packages", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/settings/packages/rules/add", (c) => orgPackagesRuleAddPage(c));
+uiRouter.post("/:owner/settings/packages/rules/add", (c) => orgPackagesRuleAddSubmit(c));
+uiRouter.get("/:owner/settings/packages/rules/:id{(\\d+)}", (c) => orgPackagesRuleEditPage(c, Number(c.req.param("id"))));
+uiRouter.post("/:owner/settings/packages/rules/:id{(\\d+)}", (c) => orgPackagesRuleEditSubmit(c, Number(c.req.param("id"))));
+uiRouter.get("/:owner/settings/packages/rules/:id{(\\d+)}/preview", (c) => orgPackagesRulePreviewPage(c, Number(c.req.param("id"))));
+uiRouter.post("/:owner/settings/packages/rules/:id{(\\d+)}/preview", () => methodNotAllowed("GET"));
 uiRouter.post("/:owner/settings/actions/runners", () => methodNotAllowed("GET"));
 uiRouter.get("/:owner/settings/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/settings/actions/runners/reset_registration_token", (c) => orgActionsRunnersTokenReset(c));

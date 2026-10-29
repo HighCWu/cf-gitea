@@ -212,10 +212,9 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
     expect(html).not.toContain('href="/acme/settings/labels"');
   });
 
-  it("renders NO dead items — Packages and the General/Scoped-workflows sub-items are omitted (Applications landed with the R20-a tab, Audit with the census R13 org arm, Runners with the C7 org twin's mount)", () => {
+  it("renders NO dead items — the General/Scoped-workflows sub-items are omitted (Applications landed with the R20-a tab, Audit with the census R13 org arm, Runners with the C7 org twin's mount, Packages with the org settings packages tab's mount)", () => {
     const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="options" />);
     for (const dead of [
-      'href="/acme/settings/packages"', // :23-27
       'href="/acme/settings/actions"', // the General sub-item, :32-34
       'href="/acme/settings/actions/scoped-workflows"', // :44-46
     ]) {
