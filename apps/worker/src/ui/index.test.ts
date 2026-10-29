@@ -67,7 +67,11 @@ const fakeAssets: UiAssetsFetcher = {
  * per-fetch env literal. The single `as Env` at the fetch boundary re-widens
  * for the router's Bindings — the shapes agree everywhere the router reads.
  */
-type UiTestEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher; PACKAGES_ENABLED?: string };
+// PACKAGES_ENABLED is omitted too: wrangler types generates LITERAL var types
+// ("true"), and an intersection cannot widen a literal back to string — the
+// override must REPLACE the key (CI's regenerated Env caught what the stale
+// local d.ts hid, run 40881266593).
+type UiTestEnv = Omit<Env, "ASSETS" | "PACKAGES_ENABLED"> & { ASSETS?: UiAssetsFetcher; PACKAGES_ENABLED?: string };
 
 const uiEnv: UiTestEnv = { ...env, ASSETS: fakeAssets };
 
@@ -492,8 +496,10 @@ describe("uiRouter", () => {
 
     // Repo context: header, original-row casing (D1 stores folded names),
     // visibility badge — and the §4.1 empty-repo render (unborn HEAD, the
-    // engine cell was never pushed): clone command + push hint, no file list.
-    expect(html).toContain("<title>Quick Start - alice/hello</title>");
+    // engine cell was never pushed): the upstream repo/empty.tmpl Quick
+    // Guide (the title carries no page prefix — empty.tmpl sets none), no
+    // file list.
+    expect(html).toContain("<title>alice/hello</title>");
     expect(html).toContain('<div class="repo-header flex-left-right">');
     expect(html).toContain('href="/alice/hello"');
     expect(html).toContain('<span class="ui basic orange label">Public Access</span>');
@@ -576,6 +582,29 @@ describe("uiRouter", () => {
     const commits = await fetchUi("/alice/hello/commits/?page=2");
     expect(commits.status).toBe(301);
     expect(commits.headers.get("location")).toBe("https://test.local/alice/hello/commits?page=2");
+  });
+
+  it("carries the FULL request URI (path + query) in the anonymous login bounce", async () => {
+    // Upstream reqSignIn → RedirectLinkUserLogin round-trips
+    // `req.URL.RequestURI()` — path AND query (modules/web/middleware/
+    // cookie.go:44) — so a bounce from /notifications?q=x must not lose
+    // ?q=x (the v1.4 usability sweep's item 1).
+    const bounce = await fetchUi("/notifications?q=alerts");
+    expect(bounce.status).toBe(303);
+    expect(bounce.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/notifications?q=alerts")}`,
+    );
+
+    // Multiple params survive together (& encoded inside the redirect_to
+    // value — a single QueryEscape of the whole URI, like upstream).
+    const multi = await fetchUi("/notifications?q=x&page=2");
+    expect(multi.status).toBe(303);
+    expect(multi.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent("/notifications?q=x&page=2")}`);
+
+    // A query-less request keeps the bare-path shape — no trailing ?.
+    const bare = await fetchUi("/notifications");
+    expect(bare.status).toBe(303);
+    expect(bare.headers.get("location")).toBe("/login?redirect_to=%2Fnotifications");
   });
 
   it("answers 503 plain text when the ASSETS binding is absent (§2.3.4)", async () => {
