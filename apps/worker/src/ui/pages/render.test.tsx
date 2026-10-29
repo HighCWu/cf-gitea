@@ -123,6 +123,9 @@ function stubEngine(
       onBatch?.(paths);
       return Promise.resolve({ commits: paths.map(() => headCommit) });
     },
+    blame: () => Promise.resolve(null),
+    grep: () => Promise.resolve(null), // refused-work posture: pages that never search
+    activityStats: () => Promise.resolve(null), // the unresolvable-ref ladder
     ...overrides,
   };
 }
@@ -521,7 +524,7 @@ describe("file view §4.3 display cap", () => {
     const html = renderToString(<FileViewPage ctx={ctx} data={data} />);
     expect(html).toContain("file-not-rendered-prompt");
     expect(html).toContain("The file is too large to be shown.");
-    expect(html).toContain('href="/api/v1/repos/octocat/hello/raw/huge.bin?ref=main"');
+    expect(html).toContain('href="/octocat/hello/raw/branch/main/huge.bin"');
   });
 
   it("renders an unknown-extension binary as the View Raw prompt", async () => {

@@ -252,9 +252,16 @@ describe("the admin orgs DOM (templates/admin/org/list.tmpl at the pin)", () => 
     const html = render(await load(""));
     expect(html).toContain('class="active item" href="/-/admin/orgs"');
     expect(html).toContain('href="/-/admin/users"');
+    // The census R18 arms landed (the nav fold wave): the four new items.
+    expect(html).toContain('href="/-/admin/badges"');
+    expect(html).toContain('href="/-/admin/emails"');
+    expect(html).toContain('href="/-/admin/applications"');
+    expect(html).toContain('href="/-/admin/hooks"');
     expect(html).not.toContain("/-/admin/auths");
-    expect(html).not.toContain("/-/admin/badges");
-    expect(html).not.toContain("/-/admin/emails");
     expect(html).not.toContain("/-/admin/self_check");
+    expect(html).not.toContain("/-/admin/notices");
+    expect(html).not.toContain("/-/admin/config");
+    expect(html).not.toContain("/-/admin/packages");
+    expect(html).not.toContain("/-/admin/actions");
   });
 });

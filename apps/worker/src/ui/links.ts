@@ -7,9 +7,10 @@
  * - history links: `/{owner}/{repo}/commits?path={path}` for the file view's
  *   History button (§3.3), and the same `/commits/{refType}/{ref}` family for
  *   the branch selector;
- * - raw links: the tier-1 API route
- *   `/api/v1/repos/{owner}/{repo}/raw/{path}?ref={ref}` (§3.3 — documented
- *   divergence from upstream's web-shaped `/raw/branch/…`, open question 3);
+ * - raw links: the upstream WEB shape
+ *   `/{owner}/{repo}/raw/{branch|tag|commit}/{ref}/{path}` (view_file.go:169;
+ *   the former tier-1 API `?ref=` divergence is retired — the web family
+ *   landed and every pasted raw URL now serves);
  * - commit links: `/{owner}/{repo}/commit/{oid}` — upstream-shaped URLs that
  *   land on the 404 shell this slice (§1.2, open question 1);
  * - profile links: `/{username}` — upstream `HomeLink()`'s shape (wave 7's
@@ -32,14 +33,36 @@ export function commitsLink(repoLink: string, refType: RefType, ref: string, tre
   return treePath === "" ? base : `${base}/${pathEscapeSegments(treePath)}`;
 }
 
+/**
+ * The blame page link, `/{owner}/{repo}/blame/{refType}/{ref}/{path}`
+ * (upstream view_file.tmpl:54's file-header button shape — RepoLink +
+ * `/blame/` + RefTypeNameSubURL + PathEscapeSegments TreePath; web.go:1729-1733's
+ * `/blame/{branch,tag,commit}/*` route family). Empty paths never link (the
+ * blame page needs a file path — blame.go's TreePath=="" NotFound arm).
+ */
+export function blameLink(repoLink: string, refType: RefType, ref: string, treePath: string): string {
+  return `${repoLink}/blame/${refType}/${pathEscapeSegments(ref)}/${pathEscapeSegments(treePath)}`;
+}
+
 export function commitLink(repoLink: string, oid: string): string {
   return `${repoLink}/commit/${encodeURIComponent(oid)}`;
 }
 
-/** §3.3: raw links target the tier-1 API route; anonymous GET on a public
- *  repo is allowed and the route streams (SPEC-0004 §2.4). */
-export function rawFileLink(repoLink: string, treePath: string, ref: string): string {
-  return `/api/v1/repos${repoLink}/raw/${pathEscapeSegments(treePath)}?ref=${encodeURIComponent(ref)}`;
+/**
+ * The raw file link — upstream view_file.go:169's WEB shape: RepoLink +
+ * `/raw/` + RefTypeNameSubURL (`branch|tag|commit/{ref}`) + PathEscapeSegments
+ * TreePath (web.go:1707-1713's group; the survey's PARTIAL row this wave
+ * closes — the former tier-1 API link `?ref=` shape is retired, the
+ * documented-divergence note above is history). The refType-less call form
+ * (the repo-home README arm, where upstream's RawFileLink is "") falls to
+ * the deprecated `/{ref}/{path}` catch-all (web.go:1712's RepoRefByType("")
+ * arm) rather than the API route, so every pasted raw URL now lands on the
+ * web family.
+ */
+export function rawFileLink(repoLink: string, treePath: string, ref: string, refType?: RefType): string {
+  const prefix = refType === undefined ? "raw" : `raw/${refType}`;
+  const base = `${repoLink}/${prefix}/${pathEscapeSegments(ref)}`;
+  return treePath === "" ? base : `${base}/${pathEscapeSegments(treePath)}`;
 }
 
 /** The commits page's `?path=` filter form (§3.3 file-view History link). */

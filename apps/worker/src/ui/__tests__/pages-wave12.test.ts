@@ -178,7 +178,13 @@ describe("wave-12 parser families (parseUiRoute / handlesUiRoute)", () => {
     expect(parseUiRoute("/acme/teams/42/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 42 });
     expect(parseUiRoute("/acme/teams/42/delete")).toEqual({ family: "org-team-delete", owner: "acme", id: 42 });
     expect(parseUiRoute("/acme/teams/42/action/join")).toBeNull();
-    expect(parseUiRoute("/acme/teams/not-a-number")).toBeNull();
+    // The census R19 wave: a NON-NUMERIC segment is now the NAME carrier —
+    // upstream's team page takes any {team} param and resolves it
+    // case-folded against the lower names (org.go:213-218), 404-shelling
+    // the miss, so the claim mirrors upstream. The five-segment edit/
+    // delete tails keep their id-only claims.
+    expect(parseUiRoute("/acme/teams/not-a-number")).toEqual({ family: "org-team-detail", owner: "acme", name: "not-a-number" });
+    expect(parseUiRoute("/acme/teams/not-a-number/edit")).toBeNull();
     expect(parseUiRoute("/acme/teams/42/edit/extra")).toBeNull();
     expect(parseUiRoute("/acme/teams/new/more")).toBeNull();
   });

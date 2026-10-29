@@ -213,7 +213,10 @@ describe("wave-9 parser families (parseUiRoute / handlesUiRoute)", () => {
   });
 
   it("leaves every other /explore tail and the same-named namespaces alone", () => {
-    expect(parseUiRoute("/explore/organizations")).toBeNull();
+    // The orgs page (the raw/media wave's R01) claimed the literal — the
+    // stale toBeNull pin updated to the claimed shape (the explore matrix's
+    // disclosure).
+    expect(parseUiRoute("/explore/organizations")).toEqual({ family: "explore-organizations" });
     // Window-2e-A (84996c6) mounted the sitemap literals — the stale
     // toBeNull pin updated to the claimed shape (the explore matrix's
     // disclosure).

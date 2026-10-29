@@ -338,7 +338,11 @@ describe("the admin repos DOM (templates/admin/repo/list.tmpl at the pin)", () =
     expect(html).toContain('href="/-/admin/users"');
     expect(html).toContain('href="/-/admin/orgs"');
     expect(html).not.toContain("/-/admin/packages"); // the Assets group's other item — unlanded
-    expect(html).not.toContain("/-/admin/hooks");
+    // The census R18 arms landed (the nav fold wave): the Integrations group.
+    expect(html).toContain('href="/-/admin/applications"');
+    expect(html).toContain('href="/-/admin/hooks"');
     expect(html).not.toContain("/-/admin/notices");
+    expect(html).not.toContain("/-/admin/config");
+    expect(html).not.toContain("/-/admin/actions");
   });
 });

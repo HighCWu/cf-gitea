@@ -125,6 +125,7 @@ const ALLOWLIST = [
   'octicon-pin',
   'octicon-plus',
   'octicon-project-symlink',
+  'octicon-pulse',
   'octicon-repo',
   'octicon-shield-lock',
   'octicon-three-bars',

@@ -15,7 +15,9 @@
  *
  *   - the claim pins the family never pinned: the trailing-slash folds of
  *     every wildcard shape (wave-12 pinned the bare list only), the `/^\d+$/`
- *     claim's zero and int64-overflow edges, the junk-tail carriers
+ *     claim's zero and int64-overflow edges, the R19 name carrier's claim
+ *     (any decoded non-numeric segment; upstream's {team}-param posture)
+ *     with the id-only edit/delete tails kept, the junk-tail carriers
  *     (`+1`, `1.5`, `-1`, malformed percent-encoding) and the route-level
  *     trailing-slash canonicalization with the POST write NOT laundered;
  *   - the anon 303s on the wave-49 POST tails (edit + delete — wave-12 pinned
@@ -291,7 +293,7 @@ describe("org-teams family claim pins (the folds and edges wave-12 never pinned)
     expect(handlesUiRoute("/acme/teams/42/edit/")).toBe(true);
   });
 
-  it("claims the digit edges and leaves the junk carriers with the engine", () => {
+  it("claims the digit edges and the R19 name carrier, leaving the junk edit tails with the engine", () => {
     // /^\d+$/ admits "0" (the resolve shells it — the detail arm below) and
     // the int64-overflow digits (parseInt folds to 1e20; getTeamById misses).
     expect(parseUiRoute("/acme/teams/0")).toEqual({ family: "org-team-detail", owner: "acme", id: 0 });
@@ -301,14 +303,37 @@ describe("org-teams family claim pins (the folds and edges wave-12 never pinned)
       id: 100000000000000000000,
     });
     expect(parseUiRoute("/acme/teams/0/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 0 });
-    // Junk carriers stay unclaimed → the engine's 404.
-    expect(parseUiRoute("/acme/teams/+1")).toBeNull();
-    expect(parseUiRoute("/acme/teams/1.5")).toBeNull();
-    expect(parseUiRoute("/acme/teams/-1")).toBeNull();
+    // The census R19 wave: a non-numeric segment is now the NAME carrier —
+    // upstream's team page takes any {team} param and resolves it
+    // case-folded against the lower names (org.go:213-218), 404-shelling
+    // the miss, so the claim mirrors upstream (the loader reproduces the
+    // miss as the shell — the detail arm below).
+    expect(parseUiRoute("/acme/teams/not-a-number")).toEqual({
+      family: "org-team-detail",
+      owner: "acme",
+      name: "not-a-number",
+    });
+    expect(parseUiRoute("/acme/teams/Alpha%20Crew")).toEqual({
+      family: "org-team-detail",
+      owner: "acme",
+      name: "Alpha Crew",
+    });
+    // The five-segment edit/delete tails keep their id-only claims: a name
+    // carrier has no landed edit/delete read arms, so name tails stay
+    // unclaimed → the engine's 404.
+    expect(parseUiRoute("/acme/teams/not-a-number/edit")).toBeNull();
+    expect(parseUiRoute("/acme/teams/not-a-number/delete")).toBeNull();
+    // The junk carriers: only the UNDECODABLE segment stays unclaimed — the
+    // `+1`/`1.5`/`-1` shapes are decodable segments, so the R19 name-carrier
+    // claim now takes them exactly like upstream's {team} param (their
+    // lookups miss → the resolved shell, the detail arm below).
+    expect(parseUiRoute("/acme/teams/+1")).toEqual({ family: "org-team-detail", owner: "acme", name: "+1" });
+    expect(parseUiRoute("/acme/teams/1.5")).toEqual({ family: "org-team-detail", owner: "acme", name: "1.5" });
+    expect(parseUiRoute("/acme/teams/-1")).toEqual({ family: "org-team-detail", owner: "acme", name: "-1" });
     expect(parseUiRoute("/acme/teams/%zz")).toBeNull();
     expect(parseUiRoute("/acme/teams/42/%zz")).toBeNull();
     expect(parseUiRoute("/acme/teams/42/delete/x")).toBeNull();
-    expect(handlesUiRoute("/acme/teams/not-a-number")).toBe(false);
+    expect(handlesUiRoute("/acme/teams/not-a-number")).toBe(true);
     expect(handlesUiRoute("/acme/teams/42/delete/x")).toBe(false);
   });
 
@@ -738,18 +763,41 @@ describe("the detail slice's sidebar arms (the permission shapes wave-12 never r
     expect(limitedHtml).toContain(">teamorgmx/secret-repo</a>");
   });
 
-  it("404-shells the zero and overflow ids the parser claims, and leaves the junk tail plainly 404", async () => {
+  it("404-shells the zero and overflow ids the parser claims, and answers the R19 name carrier's miss with the shell", async () => {
     // id 0 and the folded overflow claim parse but never resolve — the shell
     // answers, existence stays hidden.
     await expectNotFoundShell(await getRoute("/teamorgmx/teams/0", world.ownerId));
     await expectNotFoundShell(await getRoute("/teamorgmx/teams/0/edit", world.ownerId));
     await expectNotFoundShell(await getRoute("/teamorgmx/teams/99999999999999999999", world.ownerId));
-    // A junk tail is UNCLAIMED — the plain not-found answers, never the shell.
-    const junk = await getRoute("/teamorgmx/teams/not-a-number", world.ownerId);
-    expect(junk.status).toBe(404);
-    const junkHtml = await junk.text();
-    expect(junkHtml).not.toContain("status-page-error");
-    expect(junkHtml).not.toContain("page-content organization teams");
+    // The R19 name carrier claims any decoded segment (upstream's {team}
+    // param posture): an unknown name is the RESOLVED miss → the shell
+    // (upstream's NotFound page), never the plain engine 404.
+    await expectNotFoundShell(await getRoute("/teamorgmx/teams/not-a-number", world.ownerId));
+  });
+
+  it("resolves the R19 name carrier case-folded through the lower name and shells the foreign-org name", async () => {
+    // The display name "Alpha Crew" stores lower_name "alpha crew"; the
+    // URL carries the display form (upstream links `{{.Team.LowerName |
+    // PathEscape}}`-shaped names) — the case-folded lookup answers, and a
+    // lowercase link resolves the same slice.
+    const byName = await getRoute("/teamorgmx/teams/Alpha%20Crew", world.ownerId);
+    expect(byName.status).toBe(200);
+    const html = await byName.text();
+    expect(html).toContain("page-content organization teams");
+    expect(html).toContain("<strong>Alpha Crew</strong>");
+    expect(html).toContain("Ships the matrix.");
+    const lower = await getRoute("/teamorgmx/teams/ALPHA%20CREW", world.ownerId);
+    expect(lower.status).toBe(200);
+    expect(await lower.text()).toContain("<strong>Alpha Crew</strong>");
+    // The id carrier stays byte-equal (both carriers render the slice).
+    const byId = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
+    expect(await byId.text()).toBe(html);
+    // A name from ANOTHER org 404-shells (the lookup is org-scoped — the
+    // rival team never leaks through its name).
+    await expectNotFoundShell(await getRoute("/teamorgmx/teams/rival-team", world.ownerId));
+    // The owner gate rides both carriers alike: a non-owner 404-shells the
+    // name arm too (the landed requireOrgOwnership posture).
+    await expectNotFoundShell(await getRoute("/teamorgmx/teams/Alpha%20Crew", world.memberId));
   });
 });
 

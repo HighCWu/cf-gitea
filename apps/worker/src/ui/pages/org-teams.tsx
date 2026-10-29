@@ -38,7 +38,14 @@
  *   (`orgGetTeam`/`orgListTeamMembers`/`orgListTeamRepos`) all resolve by the
  *   int64 id (org-teams.ts `intPathParam`), so the slice follows the API
  *   shape; the list rows link their counts to the same detail page (upstream
- *   links the repos count onto the separate repositories page).
+ *   links the repos count onto the separate repositories page). The census
+ *   R19 wave adds the NAME CARRIER on the same route: a non-numeric third
+ *   segment resolves through `loadOrgTeamDetailDataByName` (the case-folded
+ *   lower_name lookup, org.go:213-218's EqualFold walk — upstream's links
+ *   and bookmarks answer), the id carrier stays for the internal links, and
+ *   the repositories sub-list stays merged into the slice (upstream's
+ *   members.tmpl + repositories.tmpl pages show the same two lists; the
+ *   recorded divergence stands).
  * - `/{org}/teams` claims the literal second segment before the repo parse
  *   could read it as a repository named "teams" (the notifications/explore
  *   precedent). Upstream shadows a repo named "teams" identically: the org
@@ -289,6 +296,27 @@ export async function loadOrgTeamDetailData(
     members: members.items,
     repoSlugs: repos.items.map((pair) => pair.repo.slug),
   };
+}
+
+/**
+ * The name-keyed twin (the census R19 separable win): upstream's team page
+ * resolves the `/{team}` segment case-folded against the team lower names
+ * (routers/web/web.go:997's path param walked with
+ * `strings.EqualFold(team.LowerName, teamName)`, services/context/org.go:
+ * 213-218) — `teams.lowerName` is UNIQUE per org here, so the landed
+ * `getTeamByName(orgId, name)` read answers it in one query. `null` = the
+ * 404 shell (unknown name, or a name from another org — the lookup is
+ * org-scoped). The id carrier above stays for the landed internal links;
+ * this arm answers upstream's links and bookmarks.
+ */
+export async function loadOrgTeamDetailDataByName(
+  d1: D1Database,
+  org: OrgRecord,
+  teamName: string,
+): Promise<OrgTeamDetailData | null> {
+  const team = await new TeamsService(d1).getTeamByName(org.id, teamName);
+  if (team === null) return null;
+  return loadOrgTeamDetailData(d1, org, team.id);
 }
 
 /** The create form's fields (upstream new.tmpl's `team_name` +

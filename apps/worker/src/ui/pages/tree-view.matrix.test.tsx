@@ -803,8 +803,10 @@ describe("the /src ref-resolution arms made route-real", () => {
     // c1's README — NOT the tip's v2 text.
     expect(html).toContain("readme v1");
     expect(html).not.toContain("readme v2");
-    // The raw-file link echoes the branch ref URL-encoded (?ref=green%2Fdeep).
-    expect(html).toContain('data-raw-file-link="/api/v1/repos/tvx-owner/tvx-pub/raw/README.md?ref=green%2Fdeep"');
+    // The raw-file link echoes the branch ref in the web family's typed
+    // arm (pathEscapeSegments escapes per SEGMENT — the slash separators
+    // stay literal, and the family's walk re-resolves "green/deep").
+    expect(html).toContain('data-raw-file-link="/tvx-owner/tvx-pub/raw/branch/green/deep/README.md"');
     // The breadcrumb repo link and the active sidebar entry keep the slash.
     expect(html).toContain('href="/tvx-owner/tvx-pub/src/branch/green/deep"');
     expect(html).toContain('<a class="active" href="/tvx-owner/tvx-pub/src/branch/green/deep/README.md">README.md</a>');
@@ -913,18 +915,18 @@ describe("the depth-3 blob view (the cumulative breadcrumb chain + the raw/view 
     expect(html).toContain('<span class="section"><a href="/tvx-owner/tvx-pub/src/branch/main/docs/deep" title="deep">deep</a></span>');
     expect(html).toContain('<span class="active section" title="handbook.md">handbook.md</span>');
     expect(html).toContain('<span class="breadcrumb-divider">/</span>');
-    // The raw/view pair (file header actions): Raw targets the tier-1 API
-    // raw route with the ref query, History the commits page's path filter —
-    // both carrying the slash-bearing deep path (encoded per component).
+    // The raw/view pair (file header actions): Raw targets the web raw
+    // family's typed arm, History the commits page's path filter — both
+    // carrying the slash-bearing deep path (encoded per component).
     expect(html).toContain(
-      '<a class="ui mini basic button" href="/api/v1/repos/tvx-owner/tvx-pub/raw/docs/deep/handbook.md?ref=main">Raw</a>',
+      '<a class="ui mini basic button" href="/tvx-owner/tvx-pub/raw/branch/main/docs/deep/handbook.md">Raw</a>',
     );
     expect(html).toContain(
       '<a class="ui mini basic button" href="/tvx-owner/tvx-pub/commits?path=docs%2Fdeep%2Fhandbook.md">History</a>',
     );
     // The enhancement registry root (the copy button's data source) carries
     // the same raw link, and the sidebar keeps the active sibling split.
-    expect(html).toContain('data-raw-file-link="/api/v1/repos/tvx-owner/tvx-pub/raw/docs/deep/handbook.md?ref=main"');
+    expect(html).toContain('data-raw-file-link="/tvx-owner/tvx-pub/raw/branch/main/docs/deep/handbook.md"');
     expect(html).toContain('<a class="active" href="/tvx-owner/tvx-pub/src/branch/main/docs/deep/handbook.md">handbook.md</a>');
     expect(html).toContain('<a href="/tvx-owner/tvx-pub/src/branch/main/docs/deep/extra.md">extra.md</a>');
     // The file-level latest-commit seam: handbook.md was born at c1 and
@@ -947,11 +949,11 @@ describe("the §4.2 view-raw pair (the binary sniff's two arms)", () => {
     // .png extension → the image embed whose alt/src are BOTH the raw URL.
     expect(html).toContain('<div class="view-raw">');
     expect(html).toContain(
-      '<img alt="/api/v1/repos/tvx-owner/tvx-media/raw/logo.png?ref=main" src="/api/v1/repos/tvx-owner/tvx-media/raw/logo.png?ref=main"/>',
+      '<img alt="/tvx-owner/tvx-media/raw/branch/main/logo.png" src="/tvx-owner/tvx-media/raw/branch/main/logo.png"/>',
     );
     // The registry root still carries the raw link (the copy button's data
     // source) even on the media arm.
-    expect(html).toContain('data-raw-file-link="/api/v1/repos/tvx-owner/tvx-media/raw/logo.png?ref=main"');
+    expect(html).toContain('data-raw-file-link="/tvx-owner/tvx-media/raw/branch/main/logo.png"');
   });
 
   it("a binary WITHOUT a media extension renders the View Raw prompt instead", async () => {
@@ -963,7 +965,7 @@ describe("the §4.2 view-raw pair (the binary sniff's two arms)", () => {
     // View Raw anchor (view_file.tmpl's else branch — rel="nofollow" rides).
     expect(html).toContain('<div class="file-view-raw-prompt tw-p-4">');
     expect(html).toContain(
-      '<a href="/api/v1/repos/tvx-owner/tvx-media/raw/payload.bin?ref=main" rel="nofollow">View Raw</a>',
+      '<a href="/tvx-owner/tvx-media/raw/branch/main/payload.bin" rel="nofollow">View Raw</a>',
     );
     expect(html).not.toContain('<img alt='); // no media embed on the prompt arm
   });

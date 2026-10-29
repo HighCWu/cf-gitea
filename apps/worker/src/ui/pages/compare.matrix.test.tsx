@@ -49,10 +49,30 @@
  *     kept body and writes nothing; the retried POST 303s onto the created
  *     PR (rows + cached headSha + the refs/pull/N/head CAS write), and the
  *     same compare URL then arms to the existing-PR segment — form gone;
- *   - the claim pin (route level): the `..` two-dot family and the
- *     `{owner}/{repo}:{head}` fork forms stay engine-owned — wave-13 pins
- *     the parser nulls; this pins the mounted consequence (the 404 shells
- *     on GET and POST) so the documented divergence cannot silently flip.
+ *   - (window-crosscompare) the TWO-DOT family: the old engine-owned claim
+ *     pin FLIPPED — the `..` separator parses (ParseCompareRouterParam's
+ *     first-`...`-else-first-`..` order) and DirectComparison renders the
+ *     direct two-tip diff (CompareBase = the base tip, services/git/
+ *     compare.go:83-89): the head-behind pair shows the 0-commit table
+ *     beside the reverse delta, the equal-tips pair folds into the PLAIN
+ *     nothing message (DirectComparison folds $allowCreatePR — the
+ *     and_allow_empty_pr text never fires), the tag..branch pair renders
+ *     read-only, and the POST stays separator-blind (pull.go:1318 has no
+ *     DirectComparison gate — the hand-crafted `..` POST creates);
+ *   - (window-crosscompare) the FORK forms: grammar forms 2/3/5/6 land —
+ *     the sibling-repo head (explicit owner/name) renders with the
+ *     cross-repo chrome (the head selector's full name, the base-prefixed
+ *     head-side dropdown items, the head-repo switch link, CommitRepoLink
+ *     sha links), the bare `{owner}:{ref}` form resolves through the
+ *     fork-edge port, the same-repo owner/name alias folds back onto the
+ *     base, a missing fork edge and an unreadable PRIVATE fork 404-shell
+ *     (compare.go:182-188), and the cross-repo POST rides the landed
+ *     create-compare seam (the merge base in the head cell, the head
+ *     closure carried into the base cell, the headRepoId row,
+ *     refs/pull/1/head in the base cell) — the fork round trip arms to the
+ *     existing-PR segment. The BASE-side colon form stays engine-owned
+ *     (parseHead is head-only upstream — the 404 shell is upstream's
+ *     resolution miss).
  *   - (wave-129 matrix-4) the cross-branch edges: the EMPTY-DIFF arm (a
  *     head-at-merge-base pair folds into upstream's nothingToCompare state —
  *     compare.go:397-405 headCommitID == ci.CompareBase — the segment plus
@@ -60,10 +80,8 @@
  *     AllowEmptyPr gate (compare.tmpl:173) with the same-ref control arm
  *     folding it; the ORIGINALLY pinned landed shape folded only at same-tip
  *     and rendered the bare empty diff beside the live form — the divergence
- *     this arm's flip ported), the ELLIPSIS direction (base...head diffs the
- *     head side, pinned through the sha pair's order + the hunk headers),
- *     and the across-fork colon form staying engine-owned even with both
- *     repos and branches present.
+ *     this arm's flip ported), and the ELLIPSIS direction (base...head diffs
+ *     the head side, pinned through the sha pair's order + the hunk headers).
  */
 
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
@@ -77,7 +95,7 @@ import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/
 import { pullRequests, repositories, users } from "../../db/schema";
 import { settleCreatingRepo } from "../../git-http/gate";
 import { RepoService } from "../../repos/service";
-import { parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
+import { uiRouter, type UiAssetsFetcher } from "../index";
 import type { UiManifest } from "../manifest";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
@@ -176,7 +194,17 @@ const MAIN_TIP = 1;
 const DOCS_TIP = 2;
 const DEEP_TIP = 3;
 
+/** The fork's superset history: the base chain plus one fork-only commit —
+ *  its closure is the object set the base cell LACKS, so the create arm's
+ *  carryForkHeadIntoBase does real work (the fork-first flow's own seam). */
+const FORK_COMMITS: SeedCommit[] = [
+  ...W105_COMMITS,
+  { message: "w105: fork-only change", time: T0 + 240, files: [{ path: "f4.txt", content: "fork\n" }] },
+];
+const FORK_TIP_INDEX = 4;
+
 let w105Tips: string[] = [];
+let w105ForkTip: string | null = null;
 
 /** Idempotent repo seed (the branches.matrix recipe over this module's ref
  *  set): token mint, ONE multi-ref push (heads + the lightweight tag) when
@@ -273,31 +301,231 @@ async function ensureFixtures(): Promise<void> {
   // The ghost-default repo: the D1 default names no ref (the §4.9-adjacent
   // unresolvable-default arm — the bare URL must 404, explicit sides work).
   await ensureRepo("w105ghost", BASE_REFS, tips, pack, { defaultBranch: "ghost" });
+
+  await ensureForkFixtures();
+}
+
+/** The cross-repo fixture family (the fork forms' arms): w105pal's PUBLIC
+ *  fork of w105cmp carrying the superset history (main + the divergent
+ *  feature/fork), forkParent riding the forks-matrix direct update, plus a
+ *  PRIVATE empty fork for the head-read-grant arm. */
+async function ensureForkFixtures(): Promise<void> {
+  const db = drizzle(env.DB);
+  const pal = (await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, STRANGER)).get())!;
+  const baseRow = (
+    await db
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w105cmp")))
+      .get()
+  )!;
+
+  const { tips: forkTips, pack: forkPack } = await buildHistoryPack(FORK_COMMITS);
+  w105ForkTip = forkTips[FORK_TIP_INDEX] ?? null;
+
+  const forkName = `${STRANGER}/w105fork`;
+  await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?").bind(pal.id, "w105-seed-fork").run();
+  const token = (await mintFor(pal.id, "w105-seed-fork", "write:repository")).plaintext;
+  if ((await env.REPO.getByName(forkName).listRefs()).head === null) {
+    const response = await SELF.fetch(`https://test.local/${forkName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/x-git-receive-pack-request" },
+      body: buildReceivePackBody(
+        [
+          { ref: "refs/heads/main", oid: forkTips[MAIN_TIP] as string },
+          { ref: "refs/heads/feature/fork", oid: forkTips[FORK_TIP_INDEX] as string },
+        ],
+        forkPack,
+      ),
+    });
+    const responseBody = response.status === 200 ? new TextDecoder().decode(await response.arrayBuffer()) : "";
+    if (response.status !== 200 || responseBody.includes("ng ")) {
+      throw new Error(`w105 fork seed push failed: ${response.status} ${responseBody.slice(0, 400)}`);
+    }
+  }
+
+  let forkRow = await db
+    .select()
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, STRANGER), eq(repositories.slug, "w105fork")))
+    .get();
+  if (forkRow === undefined) {
+    forkRow = await new RepoService(env.DB).create({
+      owner: { id: pal.id, usernameLower: STRANGER },
+      name: "w105fork",
+      isPrivate: false,
+      status: "ready",
+    });
+  } else {
+    await settleCreatingRepo(env, forkRow.id, forkName);
+  }
+  await db.update(repositories).set({ visibility: "public" }).where(eq(repositories.id, forkRow.id));
+  if (forkRow.forkParent !== baseRow.id) {
+    await db.update(repositories).set({ forkParent: baseRow.id }).where(eq(repositories.id, forkRow.id));
+  }
+
+  // The private fork: an EMPTY ready row (the read grant misses before any
+  // engine read — no git content needed).
+  let privRow = await db
+    .select()
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, STRANGER), eq(repositories.slug, "w105forkpriv")))
+    .get();
+  if (privRow === undefined) {
+    privRow = await new RepoService(env.DB).create({
+      owner: { id: pal.id, usernameLower: STRANGER },
+      name: "w105forkpriv",
+      isPrivate: true,
+      status: "ready",
+    });
+  } else {
+    await settleCreatingRepo(env, privRow.id, `${STRANGER}/w105forkpriv`);
+  }
+  await db.update(repositories).set({ visibility: "private" }).where(eq(repositories.id, privRow.id));
+  if (privRow.forkParent !== baseRow.id) {
+    await db.update(repositories).set({ forkParent: baseRow.id }).where(eq(repositories.id, privRow.id));
+  }
 }
 
 beforeAll(async () => {
   await ensureFixtures();
 });
 
-// --- the claim pin (route level) ---------------------------------------------------
+// --- the two-dot arm (the window-crosscompare flip of the engine-owned pin) -------
 
-describe("w105 claim pin (the engine-owned compare tails)", () => {
-  it("404-shells the two-dot family and the fork form on GET and POST alike", async () => {
-    // wave-13 pins the parser nulls; this pins the mounted consequence: the
-    // two-dot DirectComparison family and the cross-repo fork forms are a
-    // DOCUMENTED divergence (not a landed surface — SPEC-0008's slice), so
-    // the routes must keep answering the 404 shell, never a render.
-    expect(parseUiRoute(`/${OWNER}/w105cmp/compare/main..feature/deep`)).toBeNull();
-    expect((await get(`/${OWNER}/w105cmp/compare/main..feature/deep`)).status).toBe(404);
-    expect((await get(`/${OWNER}/w105cmp/compare/main...${OWNER}/w105cmp:feature/deep`)).status).toBe(404);
-    // The POST family answers the unclaimed tail with the same shell (the
-    // form can never be pointed at a two-dot URL, even by hand).
-    const post = await fetchUi(
-      `/${OWNER}/w105cmp/compare/main..feature/deep`,
-      formPost(`/${OWNER}/w105cmp/compare/main..feature/deep`, { title: "Nope" }, await cookieFor(OWNER)),
-    );
-    expect(post.status).toBe(404);
-    expect(await prRowCount("w105cmp")).toBe(0);
+describe("w105 the two-dot family (DirectComparison)", () => {
+  it("renders the direct base..head diff for a head-behind pair: 0 commits, the reverse delta, no form, live toggle", async () => {
+    // feature/deep..main: CompareBase = the BASE tip (services/git/
+    // compare.go:83-89 — never empty, so the no-common-history fold is
+    // unreachable and the head==mergeBase fold misses: main is not the
+    // CompareBase, deep's tip is). The range deep..main is EMPTY (commits_table's
+    // 0 count) while the direct two-tip diff shows the REVERSE delta (f3
+    // goes away), the `$showDiffBox := or .CommitCount .DiffShortStat.
+    // NumFiles` shape. allowCreatePR folds at DirectComparison
+    // (compare.tmpl:173) while allowCreatePull does NOT (compare.go:305-306
+    // — CompareBase != "") → the pull-flavored header with no form.
+    const mainTip = w105Tips[MAIN_TIP];
+    const deepTip = w105Tips[DEEP_TIP];
+    if (mainTip === undefined || deepTip === undefined) throw new Error("w105 seed: tips missing");
+    const res = await get(`/${OWNER}/w105cmp/compare/feature/deep..main`, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("page-content repository diff compare pull");
+    expect(html).toContain("Comparing changes");
+    expect(html).not.toContain("New Pull Request");
+    expect(html).not.toContain('id="new-issue"');
+    expect(html).not.toContain("There are no differences to show");
+    // The commits table: the 0 count beside the sha pair (the direct form's
+    // separator rides the table too).
+    expect(html).toContain("0 Commits");
+    expect(html).toContain(`<div class="compare-separator">..</div>`);
+    // The direct diff: the reverse delta (the snapshot trees — deep={f3}
+    // against main={f1} — so f3 deletes and f1 adds going deep→main; the
+    // mirrored (three-dot) hunks would flip the -/+ pair).
+    expect(html).toContain('data-old-filename="f3.txt"');
+    expect(html).toContain('data-new-filename="f1.txt"');
+    expect(html).toContain('id="diff-file-boxes"');
+    expect(html).toContain('<code class="code-inner">@@ -1,1 +0,0 @@</code>');
+    expect(html).toContain('<code class="code-inner">@@ -0,0 +1,1 @@</code>');
+    expect(html).toContain("1 additions");
+    expect(html).toContain("1 deletions");
+    // The separator switch is LIVE now: the href carries the OTHER
+    // separator (compare.tmpl:99's $compareSeparatorSwitch) with the head
+    // pair; the switch-head-base link keeps the plain ... shape.
+    expect(html).toContain(`href="/${OWNER}/w105cmp/compare/feature/deep...main" title="Switch comparison type"`);
+    expect(html).toContain(`href="/${OWNER}/w105cmp/compare/main...feature/deep" title="Switch head and base"`);
+  });
+
+  it("folds the equal-tips two-dot pair into the plain nothing message with no form", async () => {
+    // main..main-mirror: CompareBase = the main tip = the head tip → the
+    // compare.go:397-405 fold; DirectComparison folds $allowCreatePR, so the
+    // segment shows the PLAIN branch-pair text (never the
+    // and_allow_empty_pr text) and the form never renders.
+    const res = await get(`/${OWNER}/w105cmp/compare/main..main-mirror`, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("There are no differences to show. There is no need to create a pull request.");
+    expect(html).not.toContain("These branches are equal");
+    expect(html).not.toContain('id="new-issue"');
+    expect(html).not.toContain('id="diff-file-boxes"');
+  });
+
+  it("renders the comparable tag..branch two-dot pair read-only", async () => {
+    // v1..feature/docs: the tag base folds the branch-pair gate (code
+    // flavor), the direct comparison stays comparable (1 commit + the docs
+    // delta).
+    const res = await get(`/${OWNER}/w105cmp/compare/v1..feature/docs`, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Compare commits");
+    expect(html).not.toContain("New Pull Request");
+    expect(html).toContain("1 Commits");
+    expect(html).toContain('id="diff-file-boxes"');
+    expect(html).toContain(`<div class="compare-separator">..</div>`);
+  });
+});
+
+// --- the fork forms (grammar forms 2/3/5/6 — the cross-repo compare) ---------------
+
+describe("w105 the fork forms (the cross-repo compare)", () => {
+  it("renders the sibling-repo head (explicit owner/name form) with the cross-repo chrome", async () => {
+    // w105ghost is public and carries the IDENTICAL branch universe — the
+    // head reads all run in ITS cell (services/git/compare.go:70-89: the
+    // merge base, the range and the diff of GetCompareInfo live in
+    // headGitRepo; forks/siblings with shared history need no carry).
+    const pairPath = `/${OWNER}/w105cmp/compare/main...${OWNER}/w105ghost:feature/docs`;
+    const res = await get(pairPath, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("page-content repository diff compare pull");
+    // The head selector shows the HEAD repo's full name; the form posts to
+    // the fork-form URL (the round-trip re-parses to the same pair).
+    expect(html).toContain(">pull from: <strong>w105gal/w105ghost:feature/docs</strong>");
+    expect(html).toContain(`action="/${OWNER}/w105cmp/compare/main...w105gal/w105ghost:feature/docs" method="post"`);
+    // The head-side dropdown lists the BASE repo's branches with the base
+    // prefix (compare.tmpl:131-135); the base-side lists the head repo's
+    // onto the head repo's page (compare.tmpl:60-64).
+    expect(html).toContain(`href="/${OWNER}/w105cmp/compare/main...w105gal/w105cmp:feature/docs"`);
+    expect(html).toContain(`href="/${OWNER}/w105ghost/compare/main...w105gal/w105ghost:feature/docs"`);
+    // The switch link rides the HEAD repo with the base repo prefix
+    // (compare.tmpl:29); the commits table's sha links ride CommitRepoLink =
+    // the head repo (compare.go:383).
+    expect(html).toContain(`href="/${OWNER}/w105ghost/compare/feature/docs...w105gal/w105cmp:main" title="Switch head and base"`);
+    // The comparison itself: the ghost cell's docs delta.
+    expect(html).toContain("1 Commits");
+    expect(html).toContain('id="diff-file-boxes"');
+    // The BASE-side colon form stays unclaimed (parseHead is head-only
+    // upstream — the base ref names no repo; the 404 shell is upstream's
+    // resolution miss).
+    const baseSide = await get(`/${OWNER}/w105cmp/compare/${OWNER}/w105ghost:main...feature/docs`);
+    expect(baseSide.status).toBe(404);
+    expect(await baseSide.text()).toContain("404 Not Found");
+  });
+
+  it("resolves the bare fork-edge form onto the viewer-agnostic fork row and 404-shells the missing edge", async () => {
+    // Grammar form 2: `w105pal:feature/fork` — the fork edge (FindHeadRepo →
+    // the landed resolveHeadRepo port) finds pal's fork of w105cmp without
+    // naming it.
+    const pairPath = `/${OWNER}/w105cmp/compare/main...${STRANGER}:feature/fork`;
+    const res = await get(pairPath, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(">pull from: <strong>w105pal/w105fork:feature/fork</strong>");
+    // An owner with NO fork of the base (and no same-slug repo) misses the
+    // edge → the landed anti-enumeration 404 (the API route's documented
+    // deviation from upstream's 400 message).
+    const missing = await get(`/${OWNER}/w105cmp/compare/main...${STRANGER}-no-fork:main`, OWNER);
+    expect(missing.status).toBe(404);
+  });
+
+  it("404-shells an unreadable private fork head (permHead.CanRead's not-exist arm)", async () => {
+    // w105pal/w105forkpriv is PRIVATE: even the BASE owner fails the head
+    // repo's §2.5 read grant — upstream's
+    // `!permHead.CanRead(unit.TypeCode) → NewNotExistErrorf` 404
+    // (compare.go:182-188), never a render.
+    const res = await get(`/${OWNER}/w105cmp/compare/main...${STRANGER}/w105forkpriv:main`, OWNER);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("404 Not Found");
   });
 });
 
@@ -483,12 +711,12 @@ describe("w105 ?page clamp (parsePageNumber on this route)", () => {
 //     prepareCompareDiff's BeforeCommitID = ci.CompareBase / AfterCommitID =
 //     headCommitID, compare.go:405-407) — pinned through the sha pair's
 //     order and the head-side file boxes.
-//   - the ACROSS-FORK colon form: `{owner}/{repo}:{ref}` sides stay
-//     unclaimed even when both repos and branches exist (w105cmp and the
-//     public w105ghost carry IDENTICAL branch universes — a 404 here is
-//     structural, not fixture-missing).
+//   - the ACROSS-FORK colon form: claimed at window-crosscompare — the
+//     sibling/fork heads resolve through the landed fork-edge port (the
+//     dedicated describe below owns the arms); only the BASE-side colon
+//     form stays engine-owned (parseHead is head-only upstream).
 
-describe("w105 cross-branch edges (the empty range, the direction, the fork form)", () => {
+describe("w105 cross-branch edges (the empty range, the direction, the same-repo alias)", () => {
   it("the empty-diff arm: a head-at-merge-base pair folds into the nothing segment, the form surviving via AllowEmptyPr", async () => {
     // feature/deep...main: the merge base IS main's tip and the head adds
     // nothing — upstream's nothingToCompare fold (compare.go:397-405,
@@ -571,18 +799,17 @@ describe("w105 cross-branch edges (the empty range, the direction, the fork form
     expect(html).not.toContain("View Pull Request"); // no PR on this pair
   });
 
-  it("the across-fork colon form stays engine-owned even with both repos and branches present", async () => {
-    // w105ghost is public and carries the SAME branch universe — the colon
-    // side cannot fall back to "the fixture does not exist": the parse
-    // nulls the fork form (wave-13's claim), the router hands the tail to
-    // the engine, and the engine answers its plain-text 404 (never a UI
-    // render).
-    const headSide = await get(`/${OWNER}/w105cmp/compare/main...${OWNER}/w105ghost:feature/docs`);
-    expect(headSide.status).toBe(404);
-    expect(await headSide.text()).toContain("404 Not Found");
-    const baseSide = await get(`/${OWNER}/w105cmp/compare/${OWNER}/w105ghost:main...feature/docs`);
-    expect(baseSide.status).toBe(404);
-    expect(await baseSide.text()).toContain("404 Not Found");
+  it("the same-repo owner/name alias folds back onto the base repo (GetHeadOwnerAndRepo's same-owner arm)", async () => {
+    // `main...{OWNER}/w105cmp:feature/docs` — the head owner is the base
+    // owner AND the name is the base slug: compare.go:161-163 + 169-171
+    // fold the head back onto the base repo — the render equals the plain
+    // pair's. (The window-crosscompare flip of the old engine-owned pin.)
+    const res = await get(`/${OWNER}/w105cmp/compare/main...${OWNER}/w105cmp:feature/docs`, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`action="/${OWNER}/w105cmp/compare/main...feature/docs" method="post"`);
+    expect(html).toContain("New Pull Request");
+    expect(html).toContain(">pull from: <strong>w105gal/w105cmp:feature/docs</strong>");
   });
 });
 
@@ -730,5 +957,114 @@ describe("w105 form re-render + PR-create round trip (carried values)", () => {
     expect(afterHtml).toContain("View Pull Request");
     expect(afterHtml).not.toContain("pullrequest-form");
     expect(afterHtml).toContain('id="diff-file-boxes"');
+  });
+});
+
+// --- the cross-repo PR-create loop (the fork arm's write half) ----------------------
+// The fork flow's POST: the write rides the landed create-compare seam (the
+// API POST /pulls fork path's own sequence — crossRepoCreateMergeBase in the
+// head cell, carryForkHeadIntoBase into the base cell, the headRepoId row,
+// the refs/pull/N/head CAS in the BASE cell). Rides w105ghost as the BASE so
+// the w105cmp PR indexes above stay undisturbed. Runs LAST: it consumes the
+// fixture fork's branch pair.
+
+describe("w105 the cross-repo create loop (the fork head's PR)", () => {
+  it("creates the fork-head PR through the rendered form: 303, the headRepoId row with the computed merge base, the carried head ref, the has-PR round trip", async () => {
+    if (w105ForkTip === null) throw new Error("w105 seed: fork tip missing");
+    const pairPath = `/${OWNER}/w105ghost/compare/main...${STRANGER}/w105fork:feature/fork`;
+    // The render half: the writer form on the cross-repo pair (the ghost is
+    // the base, the fork the head), the commits table reading the HEAD cell.
+    const res = await get(pairPath, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`action="${pairPath}" method="post"`);
+    expect(html).toContain("New Pull Request");
+    expect(html).toContain("w105: fork-only change</a>"); // the head cell's range
+    expect(html).toContain(`href="/${STRANGER}/w105fork/commit/${w105ForkTip}"`); // CommitRepoLink = the head repo
+    // The POST: the landed fork seam — the merge base computes in the FORK
+    // cell, the fork-only closure carries into the ghost cell, the row lands
+    // with headRepoId = the fork, and refs/pull/1/head CAS-writes in the
+    // GHOST cell at the fork tip.
+    const post = await fetchUi(
+      pairPath,
+      formPost(pairPath, { title: "w105: the fork pr", content: "from the fork" }, await cookieFor(OWNER)),
+    );
+    expect(post.status).toBe(303);
+    expect(post.headers.get("location")).toBe(`/${OWNER}/w105ghost/pulls/1`);
+    const ghostRow = (
+      await drizzle(env.DB)
+        .select({ id: repositories.id })
+        .from(repositories)
+        .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w105ghost")))
+        .get()
+    )!;
+    const forkRow = (
+      await drizzle(env.DB)
+        .select({ id: repositories.id })
+        .from(repositories)
+        .where(and(eq(repositories.ownerNamespace, STRANGER), eq(repositories.slug, "w105fork")))
+        .get()
+    )!;
+    const mainTip = w105Tips[MAIN_TIP];
+    if (mainTip === undefined) throw new Error("w105 seed: main tip missing");
+    const joined = await drizzle(env.DB)
+      .select({ headRepoId: pullRequests.headRepoId, headBranch: pullRequests.headBranch, baseBranch: pullRequests.baseBranch, headSha: pullRequests.headSha, mergeBase: pullRequests.mergeBase })
+      .from(pullRequests)
+      .where(eq(pullRequests.baseRepoId, ghostRow.id))
+      .get();
+    expect(joined).toMatchObject({
+      headRepoId: forkRow.id,
+      headBranch: "feature/fork",
+      baseBranch: "main",
+      headSha: w105ForkTip,
+      mergeBase: mainTip,
+    });
+    // The carried head ref in the GHOST cell (the carry made the fork-only
+    // objects present there).
+    const ghostRefs = (await env.REPO.getByName(`${OWNER}/w105ghost`).listRefs()).refs.map((ref) => ref.name);
+    expect(ghostRefs).toContain("refs/pull/1/head");
+    // The round trip: the same fork-form URL arms to the existing-PR
+    // segment — the cross-repo duplicate check keyed on the HEAD repo.
+    const after = await get(pairPath, OWNER);
+    expect(after.status).toBe(200);
+    const afterHtml = await after.text();
+    expect(afterHtml).toContain("w105: the fork pr");
+    expect(afterHtml).toContain("#1");
+    expect(afterHtml).toContain(`href="/${OWNER}/w105ghost/pulls/1"`);
+    expect(afterHtml).toContain("View Pull Request");
+    expect(afterHtml).not.toContain("pullrequest-form");
+  });
+});
+
+// --- the two-dot POST (runs LAST: it creates a w105cmp PR row, so every
+// index-sensitive arm above must already have run) ---------------------------
+
+describe("w105 the two-dot POST (the separator-blind create)", () => {
+  it("keeps the POST separator-blind (upstream's tips- and separator-blind create): a hand-crafted .. POST creates", async () => {
+    // pull.go:1318 CompareAndPullRequestPost has NO DirectComparison gate —
+    // the form fold (compare.tmpl:173) is the only control — so the
+    // hand-crafted main..feature/deep POST creates like its ... twin (a
+    // different head branch than the round-trip pair, so the two rows stay
+    // disjoint). The location index is whichever open PR count precedes it —
+    // the row is asserted by its branch pair, not the index.
+    const pairPath = `/${OWNER}/w105cmp/compare/main..feature/deep`;
+    const deepTip = w105Tips[DEEP_TIP];
+    if (deepTip === undefined) throw new Error("w105 seed: deep tip missing");
+    const post = await fetchUi(pairPath, formPost(pairPath, { title: "w105: the twodot pr" }, await cookieFor(OWNER)));
+    expect(post.status).toBe(303);
+    expect(post.headers.get("location")).toMatch(new RegExp(`^/${OWNER}/w105cmp/pulls/\\d+$`));
+    const repoRow = (
+      await drizzle(env.DB)
+        .select({ id: repositories.id })
+        .from(repositories)
+        .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w105cmp")))
+        .get()
+    )!;
+    const joined = await drizzle(env.DB)
+      .select({ headBranch: pullRequests.headBranch, baseBranch: pullRequests.baseBranch, headSha: pullRequests.headSha, mergeBase: pullRequests.mergeBase })
+      .from(pullRequests)
+      .where(and(eq(pullRequests.baseRepoId, repoRow.id), eq(pullRequests.headBranch, "feature/deep")))
+      .get();
+    expect(joined).toMatchObject({ headBranch: "feature/deep", baseBranch: "main", headSha: deepTip });
   });
 });

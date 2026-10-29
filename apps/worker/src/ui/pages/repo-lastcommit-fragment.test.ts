@@ -353,6 +353,9 @@ function stubClient(
       onBatch?.(paths ?? []);
       return Promise.resolve({ commits: (paths ?? []).map(() => batchCommit) });
     },
+    blame: () => Promise.resolve(null),
+    grep: () => Promise.resolve(null), // refused-work posture: pages that never search
+    activityStats: () => Promise.resolve(null), // the unresolvable-ref ladder
     ...overrides,
   };
 }

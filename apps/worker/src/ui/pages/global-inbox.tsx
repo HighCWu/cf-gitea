@@ -35,7 +35,10 @@
  *   anonymous requests onto the login round-trip before any loader runs.
  * - Upstream has no past-the-end redirect on any of the three pages (the
  *   pager just renders empty beyond the last page) — matched: a past-end
- *   `?page=` renders the empty-list line under an absent pager.
+ *   `?page=` renders the empty-list line under the pager, whose Newer link
+ *   survives (the landed InboxPager keeps the one-sided arm; pinned in
+ *   migrate-inbox.matrix.test.ts — a past-end page renders "No results" plus
+ *   the Newer href, not an absent pager).
  * - The loaders narrow the viewer to the signed-in slice (throw on
  *   anonymous — upstream reqSignIn guarantees the route never calls them
  *   anonymously).
@@ -199,6 +202,8 @@ import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
+import type { Child } from "hono/jsx";
+
 import { LabelBadge } from "./issues-list";
 import { formatDueDate, milestonesLocale } from "./milestones";
 
@@ -385,6 +390,89 @@ function reposParamValue(ids: string[]): string {
  * (readGrant's isSiteAdmin arm). Returns null when no repo restriction
  * remains (the caller then pushes nothing).
  */
+/**
+ * The ORG inbox scope (this wave's R07 parameterization — census brief:
+ * "parameterize the global-inbox overview loader with a repo-set scope"):
+ * upstream web.go:986-991 mounts user.Issues/Pulls/Milestones under
+ * `context.OrgAssignment(RequireMember: true, RequireTeamMember: true)` and
+ * home.go:455-481 scopes the repo set with
+ * `SearchRepoOptions{Actor: doer, OwnerID: ctxUser.ID (the ORG), Private:
+ * true, AllPublic: false, AllLimited: false}` — "As org: Owns the
+ * repository" (the AllPublic extension only fires on the SELF dashboard,
+ * home.go:479-487, so the org pages never widen) — and the `{team}` tail
+ * sets `repoOpts.TeamID` (home.go:142-144 Milestones' shape). The member's
+ * repo visibility rides the SPEC-0005 posture the census names: org-owner
+ * members (role='owner') and site admins see every repo of the org; plain
+ * members see the public rows plus their team-covered privates — the
+ * `listOrgRepos` teamArm SQL twin (services/orgs/orgs.ts:593-619, the
+ * effective-mode collapse over `units_map`), subquery-shaped to dodge the
+ * D1 100-param cap (the activity-feeds idiom).
+ */
+export interface OverviewOrgScope {
+  orgId: number;
+  /** The org's login — the org pages' basePath segments. */
+  orgName: string;
+  viewerId: number;
+  viewerIsAdmin: boolean;
+  /** `org_members.role = 'owner'` — the all-repos arm. */
+  isOwnerMember: boolean;
+  /** The resolved team (the `{team}` tail); null = the bare route. */
+  teamId: number | null;
+  teamName: string | null;
+}
+
+/** The org pages' canonical list URL (the navbar.tmpl:85-96 anchor shape —
+ *  `.OrganisationLink()/{issues|pulls|milestones}` + the team tail). */
+export function orgInboxBasePath(org: OverviewOrgScope, kind: "issues" | "pulls" | "milestones"): string {
+  const base = `/org/${org.orgName}/${kind}`;
+  return org.teamName === null ? base : `${base}/${org.teamName}`;
+}
+
+/** The org scope conjunct (the interface doc's mapping). */
+function orgRepoScopeSql(org: OverviewOrgScope): SQL {
+  const orgOwned = sql`(${repositories.ownerId} = ${org.orgId} AND ${repositories.isArchived} = false)`;
+  if (org.teamId !== null) {
+    // The team arm: the team's covered repo set (home.go:142-144's TeamID —
+    // includes-all rows count via the flag, materialized rows via the
+    // team_repo_access join; RequireTeamMember has already gated the viewer
+    // INTO this team, so no further visibility filter).
+    return sql`(${orgOwned} AND (
+      EXISTS (
+        SELECT 1 FROM teams t
+        WHERE t.id = ${org.teamId} AND t.org_id = ${org.orgId} AND t.includes_all_repositories = 1
+      )
+      OR EXISTS (
+        SELECT 1 FROM team_repo_access tra
+        WHERE tra.team_id = ${org.teamId} AND tra.repo_id = ${repositories.id}
+      )
+    ))`;
+  }
+  if (org.viewerIsAdmin || org.isOwnerMember) return orgOwned;
+  // The plain-member arm: public rows + the team-covered privates
+  // (listOrgRepos's WHERE twin — the SPEC-0005 posture the census names).
+  const teamArm = sql`EXISTS (
+    SELECT 1 FROM teams t
+    JOIN team_members tm ON tm.team_id = t.id
+    WHERE t.org_id = ${org.orgId}
+      AND tm.user_id = ${org.viewerId}
+      AND (
+        t.authorize <> 'none'
+        OR EXISTS (
+          SELECT 1 FROM json_each(t.units_map) ju
+          WHERE ju.value IN ('read', 'write', 'admin', 'owner')
+        )
+      )
+      AND (
+        t.includes_all_repositories = 1
+        OR EXISTS (
+          SELECT 1 FROM team_repo_access tra
+          WHERE tra.team_id = t.id AND tra.repo_id = ${repositories.id}
+        )
+      )
+  )`;
+  return sql`(${orgOwned} AND (${repositories.visibility} = 'public' OR ${teamArm}))`;
+}
+
 function overviewRepoScopeSql(userId: number, isAdmin: boolean, allPublic: boolean): SQL | null {
   const ownedOrCollaborated = sql`(
     ${repositories.ownerId} = ${userId}
@@ -629,6 +717,10 @@ export interface OverviewIssueItem {
 /** The issues/pulls overview render inputs. */
 export interface OverviewIssuesData {
   listKind: "issues" | "pulls";
+  /** The canonical list URL — `/issues` / `/pulls` on the personal pages,
+   *  `/org/{org}/{kind}[/{team}]` on the org pages (this wave's R07
+   *  parameterization: every href/form action emits it). */
+  basePath: string;
   viewType: OverviewViewType;
   state: "open" | "closed";
   sort: OverviewSortType;
@@ -705,11 +797,15 @@ function overviewConjuncts(
     labels: number[];
     posterId?: number | null;
     assigneeId?: number | null;
+    /** The org scope (the org pages) — replaces the personal repo-set
+     *  conjunct; the AllPublic extension never applies upstream. */
+    org?: OverviewOrgScope;
   },
 ): SQL[] {
   const conditions: SQL[] = [eq(issues.isPull, opts.listKind === "pulls")];
-  // The scope: owned ∪ collaborated (+ public when the arm extends it).
-  const scope = overviewRepoScopeSql(viewer.id, viewer.isAdmin, opts.viewType !== "your_repositories");
+  // The scope: the org's repo set (the org pages) or owned ∪ collaborated
+  // (+ public when the arm extends it — the personal pages).
+  const scope = opts.org !== undefined ? orgRepoScopeSql(opts.org) : overviewRepoScopeSql(viewer.id, viewer.isAdmin, opts.viewType !== "your_repositories");
   if (scope !== null) conditions.push(scope);
   const typeCondition = overviewTypeConditionSql(viewer.id, opts.viewType);
   if (typeCondition !== null) conditions.push(typeCondition);
@@ -744,6 +840,7 @@ export async function loadOverviewIssuesData(
   viewer: Viewer,
   listKind: "issues" | "pulls",
   params: URLSearchParams,
+  org?: OverviewOrgScope,
 ): Promise<OverviewIssuesData> {
   if (viewer.kind !== "user") throw new Error("loadOverviewIssuesData requires a signed-in viewer");
   const db = drizzle(d1);
@@ -771,14 +868,14 @@ export async function loadOverviewIssuesData(
   const [openCount, closedCount, ...armCountValues] = await Promise.all([
     overviewCount(
       db,
-      overviewConjuncts(viewer, { listKind, viewType, state: "open", keyword, labels, posterId, assigneeId }),
+      overviewConjuncts(viewer, { listKind, viewType, state: "open", keyword, labels, posterId, assigneeId, org }),
     ),
     overviewCount(
       db,
-      overviewConjuncts(viewer, { listKind, viewType, state: "closed", keyword, labels, posterId, assigneeId }),
+      overviewConjuncts(viewer, { listKind, viewType, state: "closed", keyword, labels, posterId, assigneeId, org }),
     ),
     ...renderedArms(listKind).map((arm) =>
-      overviewCount(db, overviewConjuncts(viewer, { listKind, viewType: arm, state, keyword, labels })),
+      overviewCount(db, overviewConjuncts(viewer, { listKind, viewType: arm, state, keyword, labels, org })),
     ),
   ]);
   const arms = renderedArms(listKind);
@@ -788,7 +885,7 @@ export async function loadOverviewIssuesData(
   >;
 
   const rows = await overviewJoinedRows(db)
-    .where(and(...overviewConjuncts(viewer, { listKind, viewType, state, keyword, labels, posterId, assigneeId })))
+    .where(and(...overviewConjuncts(viewer, { listKind, viewType, state, keyword, labels, posterId, assigneeId, org })))
     .orderBy(...overviewSortOrder(sort))
     .limit(GLOBAL_INBOX_PAGE_SIZE)
     .offset((page - 1) * GLOBAL_INBOX_PAGE_SIZE);
@@ -847,6 +944,7 @@ export async function loadOverviewIssuesData(
   const total = state === "open" ? openCount : closedCount;
   return {
     listKind,
+    basePath: org !== undefined ? orgInboxBasePath(org, listKind) : `/${listKind}`,
     viewType,
     state,
     sort,
@@ -900,6 +998,9 @@ export interface DashboardMilestoneRepo {
 /** The milestones dashboard render inputs. */
 export interface DashboardMilestonesData {
   state: "open" | "closed";
+  /** The canonical list URL (the basePath rule above — `/milestones`
+   *  personal, `/org/{org}/milestones[/{team}]` org). */
+  basePath: string;
   sort: MilestonesInboxSortType;
   keyword: string;
   /** The parsed `?repos=` id tokens ([] = no filter — the raw echo). */
@@ -926,6 +1027,7 @@ export async function loadDashboardMilestonesData(
   viewer: Viewer,
   params: URLSearchParams,
   now: Date = new Date(),
+  org?: OverviewOrgScope,
 ): Promise<DashboardMilestonesData> {
   if (viewer.kind !== "user") throw new Error("loadDashboardMilestonesData requires a signed-in viewer");
   const db = drizzle(d1);
@@ -942,7 +1044,7 @@ export async function loadDashboardMilestonesData(
   const scopeRows = await db
     .select({ id: repositories.id })
     .from(repositories)
-    .where(sql`(
+    .where(org !== undefined ? orgRepoScopeSql(org) : sql`(
       ${repositories.ownerId} = ${viewer.id}
       OR EXISTS (
         SELECT 1 FROM repo_collaborators rc
@@ -1034,6 +1136,7 @@ export async function loadDashboardMilestonesData(
   const activeTotal = state === "open" ? openCount : closedCount;
   return {
     state,
+    basePath: org !== undefined ? orgInboxBasePath(org, "milestones") : "/milestones",
     sort,
     keyword,
     repoFilter,
@@ -1274,7 +1377,7 @@ function OverviewIssueRow(props: { item: OverviewIssueItem; data: OverviewIssues
                   <a
                     key={label.id}
                     class="item"
-                    href={overviewHref(`/${data.listKind}`, {
+                    href={overviewHref(data.basePath, {
                       viewType: data.viewType,
                       sort: data.sort,
                       state: data.state,
@@ -1329,7 +1432,7 @@ function TypeNavMenu(props: { data: OverviewIssuesData }) {
         <a
           key={arm}
           class={data.viewType === arm ? "active item" : "item"}
-          href={overviewHref(`/${data.listKind}`, {
+          href={overviewHref(data.basePath, {
             viewType: arm,
             sort: data.sort,
             state: data.state,
@@ -1354,12 +1457,15 @@ export function renderOverviewIssuesPage(ctx: UiContext, data: OverviewIssuesDat
 }
 
 /** The issues/pulls overview page (§2.4.1 discriminator:
- *  `dashboard issues` — the ONE upstream template serves both lists). */
-export function OverviewIssuesPage(props: { ctx: UiContext; data: OverviewIssuesData }) {
+ *  `dashboard issues` — the ONE upstream template serves both lists). The
+ *  navbar slot is the personal switcher by default; the org pages pass the
+ *  org right-menu tabs (this wave's R07 pages — the navbar.tmpl:46/79
+ *  branch). */
+export function OverviewIssuesPage(props: { ctx: UiContext; data: OverviewIssuesData; navbar?: Child }) {
   const { ctx, data } = props;
   if (ctx.viewer.kind !== "user") throw new Error("OverviewIssuesPage requires a signed-in viewer");
   const title = data.listKind === "pulls" ? globalInboxLocale.pulls : globalInboxLocale.issues;
-  const base = `/${data.listKind}`;
+  const base = data.basePath;
   const hrefFor = (over: Parameters<typeof overviewHref>[1]): string =>
     overviewHref(base, {
       viewType: data.viewType,
@@ -1373,7 +1479,7 @@ export function OverviewIssuesPage(props: { ctx: UiContext; data: OverviewIssues
     });
   return (
     <BaseLayout ctx={ctx} title={title} pageClass="dashboard issues">
-      <DashboardInboxNavbar selfName={ctx.viewer.username} active={data.listKind} />
+      {props.navbar ?? <DashboardInboxNavbar selfName={ctx.viewer.username} active={data.listKind} />}
       <div class="ui container">
         <div class="flex-container">
           <div class="flex-container-nav">
@@ -1432,6 +1538,7 @@ export function OverviewIssuesPage(props: { ctx: UiContext; data: OverviewIssues
  *  empties omitted; page resets unless given. */
 function milestonesInboxHref(
   opts: {
+    basePath?: string;
     repos?: string[];
     sort?: MilestonesInboxSortType;
     state?: "open" | "closed";
@@ -1439,6 +1546,7 @@ function milestonesInboxHref(
     page?: number;
   },
 ): string {
+  const base = opts.basePath ?? "/milestones";
   const params = new URLSearchParams();
   if (opts.repos !== undefined && opts.repos.length > 0) params.set("repos", reposParamValue(opts.repos));
   if (opts.sort !== undefined && opts.sort !== "closestduedate") params.set("sort", opts.sort);
@@ -1446,7 +1554,7 @@ function milestonesInboxHref(
   if (opts.keyword !== undefined && opts.keyword !== "") params.set("q", opts.keyword);
   if (opts.page !== undefined && opts.page > 1) params.set("page", String(opts.page));
   const query = params.toString();
-  return query === "" ? "/milestones" : `/milestones?${query}`;
+  return query === "" ? base : `${base}?${query}`;
 }
 
 /** The milestones nav sidebar (milestones.tmpl:10-32): the
@@ -1470,7 +1578,13 @@ function MilestonesInboxNav(props: { data: DashboardMilestonesData }) {
           <a
             key={repo.repoId}
             class={repo.active ? "active repo name item" : "repo name item"}
-            href={milestonesInboxHref({ repos: next, sort: data.sort, state: data.state, keyword: data.keyword })}
+            href={milestonesInboxHref({
+              basePath: data.basePath,
+              repos: next,
+              sort: data.sort,
+              state: data.state,
+              keyword: data.keyword,
+            })}
             title={`${repo.ownerNamespace}/${repo.slug}`}
           >
             <span class="tw-inline-block tw-truncate tw-w-3/4">
@@ -1558,8 +1672,9 @@ export function renderDashboardMilestonesPage(ctx: UiContext, data: DashboardMil
 }
 
 /** The milestones dashboard page (§2.4.1 discriminator:
- *  `dashboard issues repository milestones` — milestones.tmpl:4). */
-export function DashboardMilestonesPage(props: { ctx: UiContext; data: DashboardMilestonesData }) {
+ *  `dashboard issues repository milestones` — milestones.tmpl:4). The
+ *  navbar slot mirrors OverviewIssuesPage's org arm. */
+export function DashboardMilestonesPage(props: { ctx: UiContext; data: DashboardMilestonesData; navbar?: Child }) {
   const { ctx, data } = props;
   if (ctx.viewer.kind !== "user") throw new Error("DashboardMilestonesPage requires a signed-in viewer");
   return (
@@ -1568,7 +1683,7 @@ export function DashboardMilestonesPage(props: { ctx: UiContext; data: Dashboard
       title={globalInboxLocale.milestones}
       pageClass="dashboard issues repository milestones"
     >
-      <DashboardInboxNavbar selfName={ctx.viewer.username} active="milestones" />
+      {props.navbar ?? <DashboardInboxNavbar selfName={ctx.viewer.username} active="milestones" />}
       <div class="ui container">
         <div class="flex-container">
           <div class="flex-container-nav">
@@ -1578,12 +1693,14 @@ export function DashboardMilestonesPage(props: { ctx: UiContext; data: Dashboard
             <div class="list-header">
               <InboxToggleTabs
                 hrefOpen={milestonesInboxHref({
+                  basePath: data.basePath,
                   repos: data.repoFilter,
                   sort: data.sort,
                   state: "open",
                   keyword: data.keyword,
                 })}
                 hrefClosed={milestonesInboxHref({
+                  basePath: data.basePath,
                   repos: data.repoFilter,
                   sort: data.sort,
                   state: "closed",
@@ -1596,7 +1713,7 @@ export function DashboardMilestonesPage(props: { ctx: UiContext; data: Dashboard
                 closedGlyph="octicon-check"
               />
               <InboxSearchForm
-                action="/milestones"
+                action={data.basePath}
                 placeholder={globalInboxLocale.milestones}
                 keyword={data.keyword}
                 hidden={[
@@ -1622,6 +1739,7 @@ export function DashboardMilestonesPage(props: { ctx: UiContext; data: Dashboard
             <InboxPager
               href={(page) =>
                 milestonesInboxHref({
+                  basePath: data.basePath,
                   repos: data.repoFilter,
                   sort: data.sort,
                   state: data.state,

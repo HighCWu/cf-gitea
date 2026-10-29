@@ -302,10 +302,19 @@ function actUserCond(opts: FeedQueryOptions): SQL | undefined {
       sql`${actions.actUserId} IN (SELECT org_id FROM ${orgMembers} WHERE user_id = ${opts.requested.id})`,
     );
   }
-  return sql.join(
+  // The branch group MUST be one parenthesized operand: feedCondition ANDs
+  // this blob with the user_id/is_private/repo-access filters, and a bare
+  // OR chain would split that chain at every OR (SQL's AND-binds-tighter
+  // precedence), leaking the actor's own rows past the requested-subject
+  // filter. Upstream never composes this chain bare — it lives INSIDE the
+  // `IN (...)` subquery (action.go:473-497) — so the parens here are the
+  // port's isolation, not a deviation. (org-dashboard matrix catch, the
+  // member-actor probe: requested id 999999 returned the actor's rows
+  // before the wrap.)
+  return sql`(${sql.join(
     branches.map((branch) => sql`(${branch})`),
     sql` OR `,
-  );
+  )})`;
 }
 
 /**

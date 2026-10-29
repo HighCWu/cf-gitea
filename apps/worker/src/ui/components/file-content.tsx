@@ -22,6 +22,8 @@ export const fileViewLocale = {
   raw: "Raw",
   /** "repo.file_history" */
   history: "History",
+  /** "repo.blame" */
+  blame: "Blame",
   /** "copy_content" — the copy button's accessible text (the octicon-copy
    *  glyph is outside the generated icon allowlist). */
   copy: "Copy",
@@ -153,6 +155,11 @@ export function FileContentView(props: {
   /** Decoded line count (text variants only). */
   numLines?: number | null;
   isSymlink?: boolean;
+  /** The typed-ref arm for the raw link's web shape (view_file.go:169's
+   *  RefTypeNameSubURL) — the file view passes the resolved prefix; the
+   *  README arm omits it and falls to the deprecated `/raw/{ref}/{path}`
+   *  catch-all (upstream's RawFileLink is "" there). */
+  refType?: "branch" | "tag" | "commit";
   latestCommit: CommitJson | null;
   readmeInList?: boolean;
   /** Wave 8 (the web file editor): the write actions of view_file.tmpl:72-84
@@ -161,8 +168,14 @@ export function FileContentView(props: {
    *  viewers without write access — the anonymous goldens stay byte-stable). */
   editHref?: string;
   deleteHref?: string;
+  /** The census R08 Blame button (view_file.tmpl:54 — the Raw, [Permalink],
+   *  Blame, History order): the caller passes it only for text-representable
+   *  files the engine can actually blame (size ≤ MAX_BLAME_BYTES, line
+   *  count ≤ MAX_BLAME_LINES — no dead links; the engine 404-shells the
+   *  rest). Undefined = not rendered. */
+  blameHref?: string;
 }) {
-  const rawLink = rawFileLink(props.repoLink, props.treePath, props.ref);
+  const rawLink = rawFileLink(props.repoLink, props.treePath, props.ref, props.refType);
   return (
     <div
       {...(props.readmeInList ? { id: "readme" } : {})}
@@ -217,6 +230,14 @@ export function FileContentView(props: {
             <a class="ui mini basic button" href={rawLink}>
               {fileViewLocale.raw}
             </a>
+            {/* view_file.tmpl:54's Blame button (the Raw, [Permalink], Blame,
+                History order) — the census R08 anchor; the caller gates it on
+                the engine's blame budget (no dead links). */}
+            {!props.readmeInList && props.blameHref !== undefined ? (
+              <a class="ui mini basic button" href={props.blameHref}>
+                {fileViewLocale.blame}
+              </a>
+            ) : null}
             <a class="ui mini basic button" href={commitsHistoryLink(props.repoLink, props.treePath)}>
               {fileViewLocale.history}
             </a>

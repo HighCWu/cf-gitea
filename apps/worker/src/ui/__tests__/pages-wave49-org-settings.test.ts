@@ -171,13 +171,29 @@ describe("wave-49 parser families (parseUiRoute / handlesUiRoute)", () => {
   });
 
   it("leaves the unclaimed tabs and deeper junk with the engine", () => {
-    // The applications/labels/... tabs are separate upstream pages still not
+    // The labels/... tabs are separate upstream pages still not
     // claimed; every other tail stays engine-owned. (Wave 53 lifted the
     // hooks tab out of this set — pages/org-settings-hooks.tsx — so
     // /acme/settings/hooks now parses to its own family.)
     expect(parseUiRoute("/acme/settings/hooks")).toEqual({ family: "org-settings-hooks", owner: "acme" });
     expect(parseUiRoute("/acme/settings/labels")).toBeNull();
-    expect(parseUiRoute("/acme/settings/applications")).toBeNull();
+    // The R20-a applications arm (pages/org-settings-applications.tsx)
+    // lifted the applications tab out of this set — the stale toBeNull pin
+    // updated to the claimed shapes (the window-2b blocked_users precedent).
+    expect(parseUiRoute("/acme/settings/applications")).toEqual({ family: "org-settings-applications", owner: "acme" });
+    expect(parseUiRoute("/acme/settings/applications/oauth2")).toEqual({
+      family: "org-settings-applications-create",
+      owner: "acme",
+    });
+    expect(parseUiRoute("/acme/settings/applications/oauth2/7/delete")).toEqual({
+      family: "org-settings-applications-delete",
+      owner: "acme",
+      id: 7,
+    });
+    // The show/edit + regenerate_secret shapes stay unclaimed (no landed
+    // edit page — the module header).
+    expect(parseUiRoute("/acme/settings/applications/oauth2/7")).toBeNull();
+    expect(parseUiRoute("/acme/settings/applications/oauth2/7/regenerate_secret")).toBeNull();
     // Window-2b (4f2805f) mounted the blocked-users tab — the stale
     // toBeNull pin updated to the claimed shape (the org-settings matrix's
     // escalation).

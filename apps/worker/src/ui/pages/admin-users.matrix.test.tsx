@@ -308,12 +308,17 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(html).toContain('href="/-/admin/repos"');
     expect(html).toContain('href="/-/admin"'); // the landed dashboard
     expect(html).toContain('href="/-/admin/monitor/stats"'); // the landed monitor family
+    // The census R18 arms landed (the nav fold wave): the four new items.
+    expect(html).toContain('href="/-/admin/badges"');
+    expect(html).toContain('href="/-/admin/emails"');
+    expect(html).toContain('href="/-/admin/applications"');
+    expect(html).toContain('href="/-/admin/hooks"');
     expect(html).not.toContain("/-/admin/self_check");
     expect(html).not.toContain("/-/admin/auths");
-    expect(html).not.toContain("/-/admin/badges");
-    expect(html).not.toContain("/-/admin/emails");
     expect(html).not.toContain("/-/admin/notices");
     expect(html).not.toContain("/-/admin/config");
+    expect(html).not.toContain("/-/admin/packages");
+    expect(html).not.toContain("/-/admin/actions");
   });
 
   it("the sortable headers are links — ID toggles oldest/newest, Username carries the default arrow", async () => {

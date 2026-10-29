@@ -1,29 +1,37 @@
 /**
- * The explore pages — `/explore/repos` and `/explore/users` — plus the
- * `/explore` root redirect — pages wave 9 (SPEC-0008 U3 extension), upstream
- * `routers/web/explore/` (repo.go `Repos`, user.go `Users`, web.go:549-556
- * route group):
+ * The explore pages — `/explore/repos`, `/explore/users` and
+ * `/explore/organizations` — plus the `/explore` root redirect — pages wave 9
+ * (SPEC-0008 U3 extension), upstream `routers/web/explore/` (repo.go `Repos`,
+ * user.go `Users`, org.go `Organizations`, web.go:549-557 route group):
  *
- *   GET /explore          → 303 /explore/repos   (web.go:550-552)
- *   GET /explore/repos    → repo search page     (repo.go:146 Repos)
- *   GET /explore/users    → user search page     (user.go:124 Users)
+ *   GET /explore                → 303 /explore/repos   (web.go:550-552)
+ *   GET /explore/repos          → repo search page     (repo.go:146 Repos)
+ *   GET /explore/users          → user search page     (user.go:124 Users)
+ *   GET /explore/organizations  → org search page      (org.go:17 Organizations
+ *                                   — this wave; RenderUserSearch over
+ *                                   UserTypeOrganization, the SAME
+ *                                   tplExploreUsers template, the navbar's
+ *                                   Organizations item)
  *
- * Anonymous-capable (upstream renders both for every viewer; the navbar
+ * Anonymous-capable (upstream renders all three for every viewer; the navbar
  * links them for both — head_navbar.tmpl's `PageIsExplore` item).
  *
  * ## DOM contract (templates/explore/repos.tmpl + users.tmpl +
  *  explore/navbar.tmpl + shared/repo/search.tmpl + shared/search/combo.tmpl +
  *  explore/user_list.tmpl + shared/repo/list.tmpl at the pin)
  *
- * `.page-content.explore.repositories` / `.explore.users`; the
- * `explore/navbar` tab strip (an `overflow-menu.ui.secondary.pointing
- * tabular top attached borderless menu secondary-nav`, centered — the
- * Repositories/Users pair; the Organizations/Code tabs are not rendered:
- * their pages do not exist, dead links forbidden §2.4.1); then
- * `.ui.container` with the search form (shared/search/combo's
- * `.ui.small.fluid.action.input` — `<input type="search" name="q"
- * maxlength={255}>` + submit), the repo list (shared/repo/list rows) or the
- * user list (explore/user_list rows), and the Older/Newer pager.
+ * `.page-content.explore.repositories` / `.explore.users` (BOTH list pages —
+ * org.go renders the same tplExploreUsers, so the orgs page carries the
+ * users class upstream); the `explore/navbar` tab strip (an
+ * `overflow-menu.ui.secondary.pointing tabular top attached borderless menu
+ * secondary-nav`, centered — Repositories/Users/Organizations; the Code tab
+ * needs the indexer, off at the default config — not rendered: its page does
+ * not exist, dead links forbidden §2.4.1); then `.ui.container` with the
+ * search form (shared/search/combo's `.ui.small.fluid.action.input` —
+ * `<input type="search" name="q" maxlength={255}>` + submit), the repo list
+ * (shared/repo/list rows) or the user list (explore/user_list rows — org
+ * rows ride the SAME list upstream: avatar, shared/user/name link, the
+ * Private badge, location, "Joined on"), and the Older/Newer pager.
  *
  * ## Data (the landed search services — api/services/search.ts carries the
  *  reuse/extraction record)
@@ -37,7 +45,24 @@
  * - users: `searchExploreUsers` (the landed `searchUsers` predicate + the
  *   upstream Types/IsActive gates), `?q=`, `?page=`, `?sort=` over the four
  *   upstream sorts, "newest" default.
- * - Page size is upstream `setting.UI.ExplorePagingNum` = 20
+ * - orgs: `loadExploreOrganizationsData` (below — this wave's loader, the
+ *   census's R01 brief): upstream org.go:17-51 is RenderUserSearch over
+ *   `SearchUserOptions{Types: [UserTypeOrganization], Visible: visibleTypes,
+ *   OrderBy: sortOrder}` — org.go:31-34's visibility switch (public for
+ *   anonymous; +limited +private for a signed-in viewer; the census's
+ *   explicit call — upstream's BuildCanSeeUserCondition adds an org_user
+ *   membership arm for private orgs on the signed-in path and is reduced to
+ *   the visibleTypes switch here), `?q=` on `lower_name` ∨ `LOWER(full_name)`
+ *   (models/user/search.go:71-89 — the instr() substring shape, the
+ *   c91f689 LIKE-cap class), the four sorts (newest default), NO IsActive
+ *   gate (org.go passes none — org rows list regardless of status),
+ *   `ExplorePagingNum` 20. The loader lives HERE because api/services/ is
+ *   not this wave's file ownership — the search.ts re-issue precedent
+ *   (its own header documents the same move for the users page), including
+ *   the private `exploreUserOrderBy` switch, re-issued verbatim.
+ * - `Explore.DisableOrganizationsPage` redirects to /explore upstream
+ *   (default OFF — the page serves at the default config; not a landed
+ *   setting). Page size is upstream `setting.UI.ExplorePagingNum` = 20
  *   (modules/setting/ui.go:87).
  *
  * ## Documented v1 degradations (§6 method)
@@ -57,11 +82,13 @@
  *   avatar-slot rule), the `/{username}` name link (shared/user/name), the
  *   Private badge, the location and "Joined on" rows. The email row needs
  *   the ShowUserEmail setting (upstream's default-off gate — not rendered).
+ *   Org rows render the SAME row shape through the same component (upstream's
+ *   shared template) — the census brief's "org cards" render exactly this.
  * - Empty results render upstream's "search.no_results" line in both
  *   lists' `{{else}}` arms.
  */
 
-import { inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, or, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -70,8 +97,9 @@ import {
   searchExploreUsers,
   type ExploreDoer,
   type ExploreUserRow,
+  type ExploreUserSort,
 } from "../../api/services/search";
-import { repoSettings, type repositories } from "../../db/schema";
+import { repoSettings, users, type repositories } from "../../db/schema";
 import { OrgRepoListItem, type OrgHomeRepoItem } from "./org-home";
 import { formatDueDate } from "./milestones";
 import { parsePageNumber } from "../page-data";
@@ -86,8 +114,10 @@ export const exploreLocale = {
   explore: "Explore", // "explore_title"
   repositories: "Repositories", // "explore.repos"
   users: "Users", // "explore.users"
+  organizations: "Organizations", // "explore.organizations"
   repos_placeholder: "Search repos…", // "search.repo_kind"
-  users_placeholder: "Search users…", // "search.user_kind"
+  users_placeholder: "Search users…", // "search.user_kind" (the org page
+  //  renders the SAME shared user-search form upstream — tplExploreUsers)
   search: "Search…", // "search.search" (the submit button's visible text —
   //  upstream renders the octicon-search glyph, which is outside the
   //  generated icon allowlist; the aria-label becomes the button text)
@@ -201,13 +231,97 @@ export async function loadExploreUsersData(d1: D1Database, params: URLSearchPara
 }
 
 // ---------------------------------------------------------------------------
+// The Organizations page (this wave — the census's R01 brief)
+// ---------------------------------------------------------------------------
+
+/** The explore orgs render inputs (the users page's shape — the same
+ *  tplExploreUsers template upstream). */
+export interface ExploreOrgsData {
+  keyword: string;
+  page: number;
+  more: boolean;
+  total: number;
+  items: ExploreUserRow[];
+}
+
+/**
+ * `/explore/organizations` (upstream explore.Organizations, org.go:17-51 —
+ * RenderUserSearch over `Types: [UserTypeOrganization]`): the module header
+ * carries the option mapping. The loader is re-issued here (not in
+ * api/services/search.ts — not this wave's file ownership; the search.ts
+ * header documents the same re-issue shape for the users page, including
+ * the private `exploreUserOrderBy` switch, re-issued verbatim below).
+ */
+export async function loadExploreOrganizationsData(d1: D1Database, viewer: Viewer, params: URLSearchParams): Promise<ExploreOrgsData> {
+  const keyword = parseExploreKeyword(params.get("q"));
+  const page = parsePageNumber(params.get("page"));
+  const sort = parseExploreUserSort(params.get("sort"));
+
+  // org.go:31-34's visibility switch: public for anonymous, all three for a
+  // signed-in viewer (the census's explicit call — upstream's
+  // BuildCanSeeUserCondition membership arm is reduced to the switch).
+  const conditions: SQL[] = [eq(users.type, "org")];
+  if (viewer.kind === "user") {
+    // The Visible triple — no further narrowing.
+  } else {
+    conditions.push(eq(users.visibility, "public"));
+  }
+  if (keyword !== "") {
+    // models/user/search.go:71-89's keyword arms over lower_name ∨
+    // LOWER(full_name) — the instr() substring shape (the c91f689 class).
+    const needle = keyword.toLowerCase();
+    conditions.push(
+      or(sql`instr(${users.usernameLower}, ${needle}) > 0`, sql`instr(lower(${users.fullName}), ${needle}) > 0`) as SQL,
+    );
+  }
+  const where = and(...conditions);
+  const db = drizzle(d1);
+  const totalRows = await db.select({ value: sql<number>`count(*)` }).from(users).where(where);
+  const items = await db
+    .select()
+    .from(users)
+    .where(where)
+    .orderBy(...exploreOrgOrderBy(sort))
+    .limit(EXPLORE_PAGE_SIZE)
+    .offset((page - 1) * EXPLORE_PAGE_SIZE);
+  return {
+    keyword,
+    page,
+    more: page * EXPLORE_PAGE_SIZE < Number(totalRows[0]?.value ?? 0),
+    total: Number(totalRows[0]?.value ?? 0),
+    items,
+  };
+}
+
+/** search.ts's private `exploreUserOrderBy`, re-issued (the user page's
+ *  four web sorts — user.go's orderBy switch; "newest" the page default). */
+function exploreOrgOrderBy(sort: ExploreUserSort): SQL[] {
+  switch (sort) {
+    case "newest":
+      return [desc(users.id)];
+    case "oldest":
+      return [asc(users.id)];
+    case "alphabetically":
+      return [asc(users.usernameLower)];
+    case "reversealphabetically":
+      return [desc(users.usernameLower)];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------
 
-/** explore/navbar.tmpl: the Repositories/Users tab strip (the
- *  Organizations/Code tabs have no pages — module header). */
-export function ExploreNavbar(props: { active: "repos" | "users" }) {
-  const tab = (kind: "repos" | "users", href: string, label: string, icon: "octicon-repo" | "octicon-person") => (
+/** explore/navbar.tmpl: the Repositories/Users/Organizations tab strip (the
+ *  Code tab needs the indexer — off at the default config, not rendered:
+ *  module header; the Organizations item landed with this wave's page). */
+export function ExploreNavbar(props: { active: "repos" | "users" | "organizations" }) {
+  const tab = (
+    kind: "repos" | "users" | "organizations",
+    href: string,
+    label: string,
+    icon: "octicon-repo" | "octicon-person" | "octicon-organization",
+  ) => (
     <a class={props.active === kind ? "active item" : "item"} href={href}>
       <Icon name={icon} /> {label}
     </a>
@@ -217,6 +331,7 @@ export function ExploreNavbar(props: { active: "repos" | "users" }) {
       <div class="overflow-menu-items tw-justify-center">
         {tab("repos", "/explore/repos", exploreLocale.repositories, "octicon-repo")}
         {tab("users", "/explore/users", exploreLocale.users, "octicon-person")}
+        {tab("organizations", "/explore/organizations", exploreLocale.organizations, "octicon-organization")}
       </div>
     </overflow-menu>
   );
@@ -365,6 +480,42 @@ export function ExploreUsersPage(props: { ctx: UiContext; data: ExploreUsersData
           </div>
         )}
         <ExplorePagination basePath="/explore/users" keyword={data.keyword} page={data.page} more={data.more} />
+      </div>
+    </BaseLayout>
+  );
+}
+
+/** The full-document render — the organizations page (org.go renders the
+ *  SAME tplExploreUsers upstream, so the page chrome is the users class —
+ *  module header). */
+export function renderExploreOrganizationsPage(ctx: UiContext, data: ExploreOrgsData): string {
+  return renderPage(<ExploreOrganizationsPage ctx={ctx} data={data} />);
+}
+
+export function ExploreOrganizationsPage(props: { ctx: UiContext; data: ExploreOrgsData }) {
+  const { ctx, data } = props;
+  return (
+    <BaseLayout ctx={ctx} title={exploreLocale.explore} pageClass="explore users" activeNav="explore">
+      <ExploreNavbar active="organizations" />
+      <div class="ui container">
+        <ExploreSearchForm
+          action="/explore/organizations"
+          keyword={data.keyword}
+          placeholder={exploreLocale.users_placeholder}
+        />
+        <div class="divider"></div>
+        {data.items.length === 0 ? (
+          <div class="item">
+            <p>{exploreLocale.no_results}</p>
+          </div>
+        ) : (
+          <div class="flex-divided-list items-with-main">
+            {data.items.map((org) => (
+              <ExploreUserRow key={org.id} user={org} />
+            ))}
+          </div>
+        )}
+        <ExplorePagination basePath="/explore/organizations" keyword={data.keyword} page={data.page} more={data.more} />
       </div>
     </BaseLayout>
   );

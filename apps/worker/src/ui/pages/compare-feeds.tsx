@@ -43,13 +43,32 @@
  * the decoded tail splits on the FIRST `...`, else the first `..`, else the
  * whole tail is the head ref (separator defaults `...`, base falls back to
  * the repo's default branch — util.IfZero over GetPullRequestTargetBranch/
- * DefaultBranch, compare.go:200-201). Each side then goes through
- * ParseRefSuffix (`^`/`~N` ancestry suffixes) + ResolveRefWithSuffix. NOT
- * claimed (→ the 404 family, the landed compare page's own reductions —
- * pages/compare.tsx header): the `{owner}[:{repo}]:{ref}` fork forms (a
- * colon-bearing head; forks cannot exist yet, SPEC-0003) and the ref-suffix
- * family (the engine reads resolve exact names/oids only — a `feature^`
- * side 404s here exactly as it does on the compare page).
+ * DefaultBranch, compare.go:200-201). The HEAD part carries the fork forms
+ * (parseHead, compare.go:36-46 — the route parser's exact grammar,
+ * `parseUiRoute`'s compare arm): `{owner}:{ref}` names the owner's fork of
+ * the base, `{owner}/{repo}:{ref}` an explicit head repo, with the
+ * empty-part folds (`{owner}/:{ref}` → the bare fork form, `/:{ref}` → the
+ * bare single-ref form) and the leading-slash repo part as upstream's
+ * unsupported-syntax → the 404 class. The BASE part never carries a fork
+ * form (parseHead is head-only). Each side then goes through ParseRefSuffix
+ * (`^`/`~N` ancestry suffixes) + ResolveRefWithSuffix — NOT claimed (→ the
+ * 404 family): the ref-suffix family (the engine reads resolve exact
+ * names/oids only — a `feature^` side 404s here exactly as it does on the
+ * compare page).
+ *
+ * The fork-form arms resolve through the landed fork-edge ports — the
+ * compare page loader's own vocabulary (pages/compare.tsx
+ * loadCompareData): the same-owner/name fold back onto the base repo
+ * (compare.go:161-171), `resolveHeadRepo` for the bare fork edge and the
+ * explicit owner/name path, the §2.5 read grant on the head repo
+ * (compare.go:182-189's permHead.CanRead — a miss 404s), then the HEAD-cell
+ * reads: `crossRepoCreateMergeBase` fetches the base commit into the head
+ * cell before the merge base (`..` computes-and-ignores the walk's answer —
+ * the direct diff still reads both tips in the head cell), and the diff
+ * runs over the head cell's engine reads. The loader takes the viewer
+ * optionally; a call WITHOUT one rides the ANONYMOUS read grant on the head
+ * repo (the conservative public posture — the mounted dispatcher's
+ * no-viewer call), never a private fork's bytes.
  *
  * (c) — the route admits `{shaFrom:[a-f0-9]{7,64}}..{shaTo:[a-f0-9]{7,64}}`
  * (web.go:1672 — LOWERCASE hex only, 7..64 per side, the `..` separator
@@ -93,18 +112,22 @@
  * with pages/diffpatch-files.ts (wave 29).
  */
 
-import type { Context as ContextType } from "hono";
+import { Context, type Context as ContextType } from "hono";
 import { drizzle } from "drizzle-orm/d1";
 import { inArray } from "drizzle-orm";
 
+import type { ApiEnv } from "../../api/env";
 import { diffPatchTextResponse } from "./diffpatch-files";
 import { branchRef, engineReads, pullHeadRef, type EngineReads } from "../../api/services/engine";
 import { findIssueByRepoAndIndex } from "../../api/services/issues";
-import { findPullRequestByIndex } from "../../api/services/pulls";
-import { findRepositoryById } from "../../api/services/repository";
+import { findPullRequestByIndex, resolveHeadRepo } from "../../api/services/pulls";
+import { crossRepoCreateMergeBase } from "../../api/services/pull-engine";
+import { findRepositoryById, findRepositoryByPath, type RepositoryWithOwner } from "../../api/services/repository";
 import { renderPatch, renderUnifiedDiff } from "../../api/services/git-models";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { users } from "../../db/schema";
+import { resolveRepositoryForViewer } from "../repo-view";
+import type { Viewer } from "../viewer";
 import { resolveHeadBranch } from "./home";
 import { compareRefKindOf } from "./compare";
 import {
@@ -139,23 +162,32 @@ export function parseCompareFeedTail(tail: string): { basehead: string; ext: Com
   return null;
 }
 
-/** The parsed basehead (ParseCompareRouterParam reduced to the same-repo
- *  forms): `null` sides fall back to the default branch (util.IfZero,
- *  compare.go:200-201); `separator` is the URL's ORIGINAL (compare.go:594 —
- *  it picks the diff semantic downstream). */
+/** The parsed basehead (ParseCompareRouterParam reduced): `null` sides fall
+ *  back to the default branch (util.IfZero, compare.go:200-201); `separator`
+ *  is the URL's ORIGINAL (compare.go:594 — it picks the diff semantic
+ *  downstream). The fork forms ride the HEAD part only (parseHead,
+ *  compare.go:36-46 — the route parser's grammar): `headOwner`/
+ *  `headRepoName` carry the `{owner}:{ref}` / `{owner}/{repo}:{ref}` prefix,
+ *  both `null` for a same-repo head. */
 export interface CompareFeedBaseHead {
   base: string | null;
   head: string | null;
   separator: "..." | "..";
+  headOwner: string | null;
+  headRepoName: string | null;
 }
 
 /**
- * ParseCompareRouterParam (routers/common/compare.go:74-124) reduced:
- * the FIRST `...` splits, else the first `..`, else the whole tail is the
- * head (separator `...`). A colon-bearing side (the cross-repo fork forms)
- * or a `..` left inside a part is `null` — the unclaimed forms 404 (the
- * landed compare family's own reductions; refnames can never carry `:`,
- * and upstream's fork resolution cannot succeed without forks).
+ * ParseCompareRouterParam (routers/common/compare.go:74-124) — the route
+ * parser's exact grammar (`parseUiRoute`'s compare arm): the FIRST `...`
+ * splits, else the first `..`, else the whole tail is the head (separator
+ * `...`). The head part's FIRST colon splits the fork prefix
+ * (`{owner}[/{repo}]:{ref}`); a leading-slash repo part (`/{repo}:{ref}`)
+ * is upstream's "head owner must be specified" unsupported-syntax → null
+ * (the 404 class), the empty owner/repo parts fold to the simpler families
+ * (GetHeadOwnerAndRepo's empty-string branches), and a colon or `..` in the
+ * BASE part / a `..` in the head ref is a refname impossibility → null (the
+ * unresolvable-upstream 404 shell).
  */
 export function parseCompareBaseHead(basehead: string): CompareFeedBaseHead | null {
   let separator: "..." | "..";
@@ -178,13 +210,34 @@ export function parseCompareBaseHead(basehead: string): CompareFeedBaseHead | nu
       headPart = basehead;
     }
   }
-  if (basePart.includes("..") || basePart.includes(":") || headPart.includes("..") || headPart.includes(":")) {
+  let headOwner: string | null = null;
+  let headRepoName: string | null = null;
+  let headRef = headPart;
+  const colon = headPart.indexOf(":");
+  if (colon >= 0) {
+    const ownerRepo = headPart.slice(0, colon);
+    headRef = headPart.slice(colon + 1);
+    const slash = ownerRepo.indexOf("/");
+    if (slash > 0) {
+      headOwner = ownerRepo.slice(0, slash);
+      headRepoName = ownerRepo.slice(slash + 1);
+    } else if (slash < 0) {
+      headOwner = ownerRepo;
+    } else {
+      return null; // `/{repo}:{ref}` — the unsupported-syntax 404 class
+    }
+    if (headOwner === "") headOwner = null; // `/:{ref}` → the bare single-ref form
+    if (headRepoName === "") headRepoName = null; // `{owner}/:{ref}` → the bare fork form
+  }
+  if (basePart.includes("..") || basePart.includes(":") || headRef.includes("..")) {
     return null;
   }
   return {
     base: basePart === "" ? null : basePart,
-    head: headPart === "" ? null : headPart,
+    head: headRef === "" ? null : headRef,
     separator,
+    headOwner,
+    headRepoName,
   };
 }
 
@@ -209,7 +262,15 @@ export type CompareFeedResult =
 /**
  * Load one compare download body. Resolution per side rides the compare
  * page's exact vocabulary (compareRefKindOf: branch → tag → 7..64-hex oid,
- * then readCommit reachability). The `.diff` body is the separator-aware
+ * then readCommit reachability). A fork-form head resolves through the page
+ * loader's ports (the same-owner fold, `resolveHeadRepo`'s fork edge /
+ * explicit path, the §2.5 read grant on the head repo — compare.go:182-189's
+ * permHead.CanRead, a miss 404s) and every downstream read runs in the HEAD
+ * cell over the `crossRepoCreateMergeBase` carry (services/git/compare.go:
+ * 70-89; the `..` form computes-and-ignores the walk's answer). `viewer`
+ * defaults to the anonymous principal — a call WITHOUT one (the mounted
+ * dispatcher's shape) admits only head repos the anonymous grant can read,
+ * never a private fork's bytes. The `.diff` body is the separator-aware
  * unified diff (`.patch`: the head-anchored git-am mail block over the same
  * files, signature ON — GetPatch passes no --no-signature), with the
  * EMPTY-RANGE arms emitting the empty body: upstream's format-patch answers
@@ -221,32 +282,91 @@ export async function loadCompareFeed(
   repo: CompareFeedRepo,
   tail: string,
   ext: CompareFeedExt,
+  viewer: Viewer = { kind: "anonymous" },
 ): Promise<CompareFeedResult> {
   if (repo.isEmpty) return { kind: "notFound" }; // MustBeNotEmpty (web.go:1309-1310)
   const stripped = parseCompareFeedTail(tail);
   if (stripped === null || stripped.ext !== ext) return { kind: "notFound" }; // dispatcher drift guard
   const basehead = parseCompareBaseHead(stripped.basehead);
-  if (basehead === null) return { kind: "notFound" }; // the fork-form / dotted-part 404
+  if (basehead === null) return { kind: "notFound" }; // the dotted-part 404
   const reads = engineReads(env, repo);
   const refs = resolveHeadBranch(await reads.listRefs(), repo.defaultBranch);
   if (refs.headBranch === null) return { kind: "notFound" }; // unborn (belt over the isEmpty gate)
 
   const baseName = basehead.base ?? repo.defaultBranch;
-  const headName = basehead.head ?? repo.defaultBranch;
-  if (compareRefKindOf(baseName, refs) === null || compareRefKindOf(headName, refs) === null) {
-    return { kind: "notFound" }; // unresolvable side (ResolveRefWithSuffix's not-found arm)
+  if (compareRefKindOf(baseName, refs) === null) {
+    return { kind: "notFound" }; // unresolvable base side (ResolveRefWithSuffix's not-found arm)
   }
   const baseCommit = await reads.readCommit(baseName);
-  const headCommit = await reads.readCommit(headName);
-  if (baseCommit === null || headCommit === null) return { kind: "notFound" };
+  if (baseCommit === null) return { kind: "notFound" };
   const baseOid = baseCommit.oid;
+
+  // The read cell (upstream GetCompareInfo over ci.HeadGitRepo): the base
+  // repo itself, or — for a fork-form head — the resolved head repo. The
+  // same-owner/name prefix folds back onto the base (compare.go:161-163 +
+  // 169-171); anything else walks the landed grammar port and must be
+  // readable by the viewer (permHead.CanRead → the §2.5 grant).
+  let cellReads: EngineReads = reads;
+  let cellRefs = refs;
+  let headRepoPair: RepositoryWithOwner | null = null;
+  let basePair: RepositoryWithOwner | null = null;
+  if (basehead.headOwner !== null) {
+    const sameOwner = basehead.headOwner.toLowerCase() === repo.ownerNamespace.toLowerCase();
+    const sameName =
+      basehead.headRepoName === null || basehead.headRepoName.toLowerCase() === repo.slug.toLowerCase();
+    if (!(sameOwner && sameName)) {
+      basePair = await findRepositoryByPath(env.DB, repo.ownerNamespace, repo.slug);
+      if (basePair === null) return { kind: "notFound" }; // the orphaned-base refusal
+      // resolveHeadRepo parses the same `owner[/repo]:ref` grammar (the API
+      // POST's head port). The branch it returns is discarded — the
+      // null-side fallback uses the HEAD repo's default below; the
+      // placeholder keeps the parse well-formed for the null-head call.
+      const headParam = `${basehead.headOwner}${basehead.headRepoName !== null ? `/${basehead.headRepoName}` : ""}:${basehead.head ?? "_"}`;
+      let headRepoId: string;
+      try {
+        headRepoId = (await resolveHeadRepo(env.DB, basePair, headParam)).headRepoId;
+      } catch {
+        return { kind: "notFound" }; // the fork-edge / path-resolution miss (the 404 class)
+      }
+      const headPair = await findRepositoryById(env.DB, headRepoId);
+      if (headPair === null) return { kind: "notFound" };
+      if ((await resolveRepositoryForViewer(env, viewer, headPair.repo.ownerNamespace, headPair.repo.slug)) === null) {
+        return { kind: "notFound" }; // the head repo's code-read miss (compare.go:186-188)
+      }
+      headRepoPair = headPair;
+      cellReads = engineReads(env, headPair.repo);
+      cellRefs = resolveHeadBranch(await cellReads.listRefs(), headPair.repo.defaultBranch);
+      if (cellRefs.headBranch === null) return { kind: "notFound" }; // unborn head repo
+    }
+  }
+
+  const headName =
+    basehead.head ?? (headRepoPair === null ? repo.defaultBranch : headRepoPair.repo.defaultBranch);
+  if (compareRefKindOf(headName, cellRefs) === null) {
+    return { kind: "notFound" }; // unresolvable head side
+  }
+  const headCommit = await cellReads.readCommit(headName);
+  if (headCommit === null) return { kind: "notFound" };
   const headOid = headCommit.oid;
 
   // The compareArg's old side: merge base for `...` (compare.go:594's
   // three-dot form — a missing one is the git-fatal 500 upstream), the base
-  // tip itself for `..` (the direct two-commit diff).
+  // tip itself for `..` (the direct two-commit diff). Cross-repo, the carry
+  // runs first: crossRepoCreateMergeBase fetches the base commit into the
+  // head cell and walks the merge base there — the `..` form's answer is
+  // computed-and-ignored (the page loader's rule; the direct diff below
+  // still reads both tips in the head cell).
   let oldSide: string;
-  if (basehead.separator === "...") {
+  if (headRepoPair !== null && basePair !== null) {
+    const apiCtx = new Context<ApiEnv>(new Request("https://compare-feed.local/"), { env });
+    const merged = await crossRepoCreateMergeBase(apiCtx, basePair, headRepoPair, baseName, baseOid, headOid);
+    if (basehead.separator === "...") {
+      if (merged === null) return { kind: "noMergeBase" };
+      oldSide = merged;
+    } else {
+      oldSide = baseOid;
+    }
+  } else if (basehead.separator === "...") {
     const merged = await reads.mergeBase(baseOid, headOid);
     if (merged === null || merged.tag !== "ok" || merged.base === null) return { kind: "noMergeBase" };
     oldSide = merged.base;
@@ -254,7 +374,7 @@ export async function loadCompareFeed(
     oldSide = baseOid;
   }
 
-  const diff = await reads.readDiff(headOid, oldSide);
+  const diff = await cellReads.readDiff(headOid, oldSide);
   const files = diff?.files ?? [];
   if (ext === "diff") return { kind: "body", body: renderUnifiedDiff(files) };
 
@@ -263,10 +383,10 @@ export async function loadCompareFeed(
   if (basehead.separator === "...") {
     if (baseOid === headOid) return { kind: "body", body: "" };
   } else {
-    const behind = await reads.mergeBase(headOid, baseOid);
+    const behind = await cellReads.mergeBase(headOid, baseOid);
     if (behind !== null && behind.tag === "ok" && behind.base === headOid) return { kind: "body", body: "" };
   }
-  const mailCommit = await reads.readCommit(headOid);
+  const mailCommit = await cellReads.readCommit(headOid);
   if (mailCommit === null) return { kind: "notFound" };
   return { kind: "body", body: renderPatch(mailCommit, files) };
 }

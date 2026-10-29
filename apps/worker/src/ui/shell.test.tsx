@@ -295,15 +295,19 @@ describe("RepoHeader tab strip", () => {
     return html.slice(start, end);
   }
 
-  it("renders exactly the Code, Issues, Pulls, Releases, Commits tabs, in order, with active tracking", () => {
+  it("renders exactly the Code, Issues, Pulls, Releases, Activity, Commits tabs, in order, with active tracking", () => {
     const strip = tabStrip(page({ ctx: repoCtx }));
-    expect(strip.match(/<a class="(?:active )?item"/g)).toHaveLength(5);
+    expect(strip.match(/<a class="(?:active )?item"/g)).toHaveLength(6);
     expect(strip).toContain('<a class="active item" href="/octocat/hello" data-shortcut-keys="g c">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/issues" data-shortcut-keys="g i">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/pulls" data-shortcut-keys="g p">');
     // Wave 20: the Releases tab (header.tmpl:157's shape) resolves — it was
     // the dead-tab 404 this test previously refused to render.
     expect(strip).toContain('<a class="item" href="/octocat/hello/releases" data-shortcut-keys="g r">');
+    // The activity/pulse tab (header.tmpl:177's shape) — unlocked by the
+    // landed /activity page family, no data-shortcut-keys (upstream arms
+    // none on it, unlike its strip neighbors).
+    expect(strip).toContain('<a class="item" href="/octocat/hello/activity">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/commits">');
     // Inline octicon SVGs, upstream {{svg}} shape. The Issues tab degrades to
     // text: its octicon-issue-opened glyph is a 2-path octicon, which the
@@ -311,16 +315,19 @@ describe("RepoHeader tab strip", () => {
     expect(strip).toContain('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" class="svg octicon-code"');
     expect(strip).toContain('class="svg octicon-git-pull-request"');
     expect(strip).toContain('class="svg octicon-tag"');
+    expect(strip).toContain('class="svg octicon-pulse"');
     expect(strip).toContain('class="svg octicon-history"');
     expect(strip.indexOf("> Code</a>")).toBeGreaterThan(0);
     // The degraded Issues tab has no icon, so its text hugs the `>` directly.
     expect(strip.indexOf(">Issues</a>")).toBeGreaterThan(strip.indexOf("> Code</a>"));
     expect(strip.indexOf("> Pull Requests</a>")).toBeGreaterThan(strip.indexOf(">Issues</a>"));
     expect(strip.indexOf("> Releases</a>")).toBeGreaterThan(strip.indexOf("> Pull Requests</a>"));
+    expect(strip.indexOf("> Activity</a>")).toBeGreaterThan(strip.indexOf("> Releases</a>"));
     expect(strip).toContain("> Commits</a>");
+    expect(strip.indexOf("> Commits</a>")).toBeGreaterThan(strip.indexOf("> Activity</a>"));
     expect(strip).not.toContain('class="svg octicon-issue-opened"');
     // Only existing pages: no Wiki/Settings dead tabs (Releases resolved in
-    // wave 20).
+    // wave 20, Activity by the R14 page family).
     for (const dead of ["Wiki", "Settings"]) {
       expect(strip).not.toContain(dead);
     }
@@ -344,6 +351,25 @@ describe("RepoHeader tab strip", () => {
     );
     expect(stripOnCommits).toContain('<a class="item" href="/octocat/hello" data-shortcut-keys="g c">');
     expect(stripOnCommits).toContain('<a class="active item" href="/octocat/hello/commits">');
+    // The commits list shares the activity page's discriminator class but
+    // wins via its explicit activeTab — no double-active pulse tab.
+    expect(stripOnCommits).not.toContain('<a class="active item" href="/octocat/hello/activity">');
+
+    // The activity page renders `page-content repository commits` (upstream
+    // activity.tmpl:2) WITHOUT an explicit activeTab — upstream tracks its
+    // pulse tab through .PageIsActivity (header.tmpl:178), which the shell
+    // derives from that shared discriminator (BaseLayout's activeTab note):
+    // the pulse tab goes active, the commits tab stays inert.
+    const stripOnActivity = tabStrip(
+      renderPage(
+        <BaseLayout ctx={repoCtx} title="Activity" pageClass="repository commits">
+          <p>activity</p>
+        </BaseLayout>,
+      ),
+    );
+    expect(stripOnActivity).toContain('<a class="active item" href="/octocat/hello/activity">');
+    expect(stripOnActivity).toContain('<a class="item" href="/octocat/hello/commits">');
+    expect(stripOnActivity).not.toContain('<a class="active item" href="/octocat/hello/commits">');
   });
 
   it("shows the open-issue/pull count labels from the D1 counters (upstream NumOpenIssues shape)", () => {

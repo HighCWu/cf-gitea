@@ -239,8 +239,10 @@ describe("wave-37 parser claims", () => {
       owner: "wave37-user",
       id: 7,
     });
-    // The `/-` namespace's sibling tails stay unclaimed.
-    expect(parseUiRoute("/wave37-user/-/heatmap")).toBeNull();
+    // The `/-` namespace's sibling tails stay unclaimed — except the
+    // heatmap tail, which the raw/media wave claimed (the owner-heatmap
+    // JSON family).
+    expect(parseUiRoute("/wave37-user/-/heatmap")).toEqual({ family: "owner-heatmap", owner: "wave37-user" });
     expect(parseUiRoute("/wave37-user/-/packages")).toBeNull();
     expect(handlesUiRoute("/wave37-user/-/projects")).toBe(true);
     expect(handlesUiRoute("/wave37-user/-/projects/7")).toBe(true);

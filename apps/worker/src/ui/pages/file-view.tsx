@@ -14,6 +14,7 @@
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
+import { MAX_BLAME_BYTES, MAX_BLAME_LINES } from "@cf-gitea/git-engine";
 
 import { BranchSelector } from "../components/branch-selector";
 import { FileContentView, type MediaKind } from "../components/file-content";
@@ -21,7 +22,7 @@ import { RepoFilesTable } from "../components/file-list";
 import type { EngineClient } from "../engine";
 import { resolveRefSuffix, splitRefSuffix } from "../index";
 import type { RefType } from "../index";
-import { treeLink } from "../links";
+import { blameLink, treeLink } from "../links";
 import {
   classifyBlob,
   enrichTreeCommits,
@@ -59,6 +60,11 @@ export type FileViewData =
       markupHtml?: string;
       text?: string;
       mediaKind?: MediaKind;
+      /** The census R08 Blame anchor's gate: text-representable AND inside
+       *  the engine's blame budget (size ≤ MAX_BLAME_BYTES, lines ≤
+       *  MAX_BLAME_LINES — the loader knows both before rendering; false =
+       *  no button, never a dead link to a 404 blame). */
+      blameable: boolean;
       latestCommit: CommitJson | null;
     }
   | { notFound: true };
@@ -212,6 +218,8 @@ export async function loadFileViewData(
       siblings: parentTree?.entries ?? [],
       entry,
       variant: "too-large",
+      // over the display cap ⇒ necessarily over the engine's 1 MiB blame cap
+      blameable: false,
       latestCommit: tooLargeLog?.commits[0] ?? null,
     };
   }
@@ -226,9 +234,15 @@ export async function loadFileViewData(
   let markupHtml: string | undefined;
   let text: string | undefined;
   let mediaKind: MediaKind | undefined;
+  // The census R08 Blame anchor's gate, computed where the decoded text is
+  // already in hand: text-representable variants only, inside the engine's
+  // tip-size and line-count budgets (MAX_BLAME_BYTES / MAX_BLAME_LINES —
+  // the engine 404s the rest; the dead-link rule forbids the button there).
+  let blameLines: number | undefined;
   if (variant === "markup") {
     // §3.4: the shared renderer with repo context against the file's directory.
     const raw = new TextDecoder().decode(blob.data);
+    blameLines = splitLines(raw).length;
     const html = renderRepoMarkdown({
       text: raw,
       name: entry.name,
@@ -246,9 +260,14 @@ export async function loadFileViewData(
     }
   } else if (variant === "code-view" || variant === "plain-text") {
     text = new TextDecoder().decode(blob.data);
+    blameLines = splitLines(text).length;
   } else if (variant === "view-raw") {
     mediaKind = mediaKindOf(entry.name) ?? undefined;
   }
+  const blameable =
+    (variant === "markup" || variant === "plain-text" || variant === "code-view" || variant === "empty") &&
+    (entry.size ?? 0) <= MAX_BLAME_BYTES &&
+    (blameLines === undefined || blameLines <= MAX_BLAME_LINES);
 
   return {
     kind: "blob",
@@ -261,6 +280,7 @@ export async function loadFileViewData(
     markupHtml,
     text,
     mediaKind,
+    blameable,
     latestCommit: lastCommitLog?.commits[0] ?? null,
   };
 }
@@ -355,6 +375,7 @@ export function FileViewPage(props: { ctx: UiContext; data: FileViewData; canWri
               repoLink={repoLink}
               treePath={data.treePath}
               ref={ref}
+              refType={refType}
               variant={data.variant}
               markupHtml={data.markupHtml}
               text={data.text}
@@ -363,6 +384,7 @@ export function FileViewPage(props: { ctx: UiContext; data: FileViewData; canWri
               numLines={data.text !== undefined ? splitLines(data.text).length : null}
               isSymlink={data.entry.mode === "120000"}
               latestCommit={data.latestCommit}
+              blameHref={data.blameable ? blameLink(repoLink, refType, ref, data.treePath) : undefined}
               editHref={
                 canEdit ? `${repoLink}/edit/${pathEscapeSegments(ref)}/${pathEscapeSegments(data.treePath)}` : undefined
               }

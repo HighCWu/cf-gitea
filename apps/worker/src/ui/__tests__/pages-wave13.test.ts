@@ -14,9 +14,14 @@
  * minted session cookies.
  *
  * Gate posture under test: the page reads for every viewer who can see the
- * repo (anonymous included); the FORM and the POST are writer-gated
- * (`canWriteRepo` — the file-editor predicate, the documented divergence
- * from upstream's reqUnitPullsReader); the create arms run in the landed
+ * repo (anonymous included); the FORM and the POST are PULLS-READER gated —
+ * upstream's chain (web.go:1312 `reqSignIn, RepoMustNotBeArchived,
+ * reqUnitPullsReader`; the GET form arm is the template's `.IsSigned` over
+ * allowCreatePull's CanReadIssuesOrPulls(true), compare.go:305 — the
+ * §2.5 read grant the prologue runs IS that read for the always-on pulls
+ * unit, so any signed-in viewer who sees the repo may create; the former
+ * `canWriteRepo` divergence is flipped, the fork-PR author's shape); the
+ * create arms run in the landed
  * API route's order (same-branch 422 message, no common history, equal
  * tips, non-branch pairs, duplicate open PR, empty title), success 303s
  * onto the created PR's detail page with the refs/pull/N/head ref landed.
@@ -111,7 +116,7 @@ const ORPHAN_COMMITS: SeedCommit[] = [
 
 interface Wave13Fixture {
   aliceCookie: string;
-  palCookie: string; // a signed-in NON-writer
+  palCookie: string; // a signed-in NON-writer (a pulls READER — the fork-PR author the flipped gate admits)
   repoId: string;
   docsTipOid: string;
   mainTipOid: string;
@@ -230,13 +235,25 @@ beforeAll(async () => {
 
 describe("wave-13 parser families (parseUiRoute / handlesUiRoute)", () => {
   it("claims the bare URL, the ... split, and the single-ref form", () => {
-    expect(parseUiRoute("/alice/cmp/compare")).toEqual({ family: "compare", owner: "alice", repo: "cmp", base: null, head: null });
+    expect(parseUiRoute("/alice/cmp/compare")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: null,
+      head: null,
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
     expect(parseUiRoute("/alice/cmp/compare/main...feature/docs")).toEqual({
       family: "compare",
       owner: "alice",
       repo: "cmp",
       base: "main",
       head: "feature/docs",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
     });
     // Slash-bearing refnames: the decoded tail splits on the FIRST separator.
     expect(parseUiRoute("/alice/cmp/compare/main...feature/docs/deep")).toEqual({
@@ -245,6 +262,9 @@ describe("wave-13 parser families (parseUiRoute / handlesUiRoute)", () => {
       repo: "cmp",
       base: "main",
       head: "feature/docs/deep",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
     });
     // Empty sides fall back to the default branch at load (the parser keeps
     // the nulls).
@@ -254,6 +274,9 @@ describe("wave-13 parser families (parseUiRoute / handlesUiRoute)", () => {
       repo: "cmp",
       base: null,
       head: "feature/docs",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
     });
     expect(parseUiRoute("/alice/cmp/compare/main...")).toEqual({
       family: "compare",
@@ -261,6 +284,9 @@ describe("wave-13 parser families (parseUiRoute / handlesUiRoute)", () => {
       repo: "cmp",
       base: "main",
       head: null,
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
     });
     // The single-ref form: the whole tail is the HEAD (upstream's family).
     expect(parseUiRoute("/alice/cmp/compare/main")).toEqual({
@@ -269,19 +295,138 @@ describe("wave-13 parser families (parseUiRoute / handlesUiRoute)", () => {
       repo: "cmp",
       base: null,
       head: "main",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
     });
     expect(handlesUiRoute("/alice/cmp/compare/main...feature/docs")).toBe(true);
     // The trailing-slash form classifies to the same shape (the middleware
     // 301s it to the canonical URL).
-    expect(parseUiRoute("/alice/cmp/compare/")).toEqual({ family: "compare", owner: "alice", repo: "cmp", base: null, head: null });
+    expect(parseUiRoute("/alice/cmp/compare/")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: null,
+      head: null,
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
   });
 
-  it("leaves the .. family, fork forms, and junk with the engine", () => {
-    // The two-dot (DirectComparison) family is not a landed surface.
-    expect(parseUiRoute("/alice/cmp/compare/main..feature/docs")).toBeNull();
-    // Fork-form heads (colon-bearing sides) — forks cannot exist yet.
-    expect(parseUiRoute("/alice/cmp/compare/main...alice/cmp:feature/docs")).toBeNull();
+  it("claims the two-dot family (the window-crosscompare flip of the old engine-owned pin)", () => {
+    // ParseCompareRouterParam: `...` wins over `..`, else the FIRST `..` is
+    // the separator (DirectComparison — the feeds module's own
+    // parseCompareBaseHead semantics, landed here for the page).
+    expect(parseUiRoute("/alice/cmp/compare/main..feature/docs")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: "main",
+      head: "feature/docs",
+      separator: "..",
+      headOwner: null,
+      headRepoName: null,
+    });
+    // A four-dot tail still cuts on the FIRST `...` (strings.Cut parity) —
+    // the head side keeps the leading dot (unresolvable at load → 404,
+    // upstream's resolution miss).
+    expect(parseUiRoute("/alice/cmp/compare/main....feature")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: "main",
+      head: ".feature",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
+    // A `..` left inside a side is a refname impossibility → null (the 404
+    // shell — upstream's resolution miss for the same tail).
+    expect(parseUiRoute("/alice/cmp/compare/main...feat..ure")).toBeNull();
+    expect(parseUiRoute("/alice/cmp/compare/a..b..c")).toBeNull();
+  });
+
+  it("claims the fork forms (the head-side colon grammar, parseHead)", () => {
+    // Grammar form 3: the explicit `{owner}/{repo}:{ref}` head.
+    expect(parseUiRoute("/alice/cmp/compare/main...alice/cmp:feature/docs")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: "main",
+      head: "feature/docs",
+      separator: "...",
+      headOwner: "alice",
+      headRepoName: "cmp",
+    });
+    // Grammar form 2: the bare `{owner}:{ref}` head (the fork edge decides
+    // the repo at load).
+    expect(parseUiRoute("/alice/cmp/compare/main...bob:feature")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: "main",
+      head: "feature",
+      separator: "...",
+      headOwner: "bob",
+      headRepoName: null,
+    });
+    // Grammar forms 5/6: the single-ref tail carries the fork forms too
+    // (parseHead applies to the no-separator case).
+    expect(parseUiRoute("/alice/cmp/compare/bob:feature")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: null,
+      head: "feature",
+      separator: "...",
+      headOwner: "bob",
+      headRepoName: null,
+    });
+    expect(parseUiRoute("/alice/cmp/compare/bob/cmp:feature")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: null,
+      head: "feature",
+      separator: "...",
+      headOwner: "bob",
+      headRepoName: "cmp",
+    });
+    // The BASE part never carries a fork form upstream (parseHead is
+    // head-only): a colon there is an unresolvable refname → null (the 404
+    // shell, upstream's resolution miss).
     expect(parseUiRoute("/alice/cmp/compare/other:main...feature/docs")).toBeNull();
+    // parseHead's empty parts fold to the simpler families: an empty repo
+    // name is the bare `{owner}:{ref}` fork form, an empty owner the bare
+    // single-ref form (compare.go:36-46 + GetHeadOwnerAndRepo's empty-string
+    // branches).
+    expect(parseUiRoute("/alice/cmp/compare/main...bob/:feature")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: "main",
+      head: "feature",
+      separator: "...",
+      headOwner: "bob",
+      headRepoName: null,
+    });
+    expect(parseUiRoute("/alice/cmp/compare/:feature")).toEqual({
+      family: "compare",
+      owner: "alice",
+      repo: "cmp",
+      base: null,
+      head: "feature",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
+    // A repo part with no owner (`/{repo}:{ref}`) is upstream's
+    // unsupported-syntax invalid-argument → the 404 class.
+    expect(parseUiRoute("/alice/cmp/compare/main.../cmp:feature")).toBeNull();
+  });
+
+  it("leaves junk with the engine", () => {
     // Deeper junk: an empty tail segment never parses.
     expect(parseUiRoute("/alice/cmp/compare/main//docs")).toBeNull();
   });
@@ -487,7 +632,7 @@ describe("POST /{owner}/{repo}/compare/{base}...{head} (the new-PR write)", () =
     expect(emptyHtml).toContain("the kept body");
   });
 
-  it("gates the write: anonymous 303, non-writer 404, cross-origin 403", async () => {
+  it("gates the write: anonymous 303, the pulls reader reaches the arms (duplicate 200), cross-origin 403", async () => {
     const fixture = await ensureWave13Fixtures();
     // The create test ran first (file-order storage) — the refusals below
     // must add nothing to that baseline.
@@ -505,11 +650,30 @@ describe("POST /{owner}/{repo}/compare/{base}...{head} (the new-PR write)", () =
     expect(anon.status).toBe(303);
     expect(anon.headers.get("location")).toContain("/login?redirect_to=");
 
+    // The flipped gate: pal holds NO write on the base repo, yet is a pulls
+    // reader (upstream reqUnitPullsReader, web.go:1312 + permission.go:64-76
+    // — the fork-PR author's own grant) — the POST reaches the create arms,
+    // which refuse on the DUPLICATE open PR (the create test's index 2 row),
+    // writing nothing.
     const pal = await fetchUi(
       "/alice/cmp/compare/main...feature/docs",
       formPost("/alice/cmp/compare/main...feature/docs", { title: "Nope" }, fixture.palCookie),
     );
-    expect(pal.status).toBe(404);
+    expect(pal.status).toBe(200);
+    expect(await pal.text()).toContain("pull request already exists for these targets");
+
+    // The GET form rides the same read grant for the non-writer reader
+    // (the template's `.IsSigned` arm over CanReadIssuesOrPulls(true),
+    // compare.go:305) — on a pair with no open PR the inline form renders;
+    // the template's signed-in arm keeps it off the anonymous page.
+    const palForm = await fetchUi("/alice/cmp/compare/feature/docs...main", withCookie(fixture.palCookie));
+    expect(palForm.status).toBe(200);
+    const palFormHtml = await palForm.text();
+    expect(palFormHtml).toContain("New Pull Request");
+    expect(palFormHtml).toContain('id="new-issue"');
+    const anonForm = await fetchUi("/alice/cmp/compare/feature/docs...main");
+    expect(anonForm.status).toBe(200);
+    expect(await anonForm.text()).not.toContain("New Pull Request");
 
     const crossOrigin = await fetchUi(
       "/alice/cmp/compare/main...feature/docs",

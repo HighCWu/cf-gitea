@@ -32,7 +32,8 @@ import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { actions, users } from "../../db/schema";
+import { actions, badges, emailAddresses, oauth2Applications, userBadges, users, webhooks } from "../../db/schema";
+import { createGlobalHook } from "../../api/services/hooks";
 import { demoModeEnabled } from "../../services/demo-sweep";
 import { __setRouteClockForTests, uiRouter } from "../index";
 import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
@@ -231,6 +232,98 @@ beforeAll(async () => {
     content: WIKI_GOLDEN_HOME_CONTENT,
     now: T0 + 210,
   });
+  // The census R18 admin-arms goldens' fixtures (this wave): deterministic
+  // rows in tables NO committed golden reads — email_addresses/badge/
+  // oauth2_application are first-readers here (the users-page golden reads
+  // `users.email`, not these rows; the settings-account golden reads the
+  // same synthesized-primary union at zero rows and stays there — these
+  // inserts are SECONDARY rows for alice/morgan, whose harness users.email
+  // is NULL, so no synthesized row can appear anywhere). The hooks golden's
+  // GLOBAL webhook rows ride the landed create arm below — the harness's
+  // single webhook row is repo-scoped (alice/golden) and the admin list's
+  // `repo_id IS NULL` filter never surfaces it. Idempotent presence guards
+  // like the harness seeds; the autoincrement ids are deterministic through
+  // the fixed seed order (fresh per-file storage).
+  if ((await drizzle(env.DB).select({ id: emailAddresses.id }).from(emailAddresses).limit(1).all()).length === 0) {
+    const [alice, morganRow] = [
+      await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get(),
+      await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "morgan")).get(),
+    ];
+    if (alice === undefined || morganRow === undefined) throw new Error("admin-arms golden owner rows missing");
+    await drizzle(env.DB)
+      .insert(emailAddresses)
+      .values([
+        { userId: alice.id, email: "alice-alt@test.local", lowerEmail: "alice-alt@test.local", isActivated: true, isPrimary: false },
+        { userId: alice.id, email: "alice-doctest@example.com", lowerEmail: "alice-doctest@example.com", isActivated: false, isPrimary: false },
+        { userId: morganRow.id, email: "morgan-alt@test.local", lowerEmail: "morgan-alt@test.local", isActivated: true, isPrimary: false },
+      ])
+      .run();
+  }
+  if ((await drizzle(env.DB).select({ id: badges.id }).from(badges).limit(1).all()).length === 0) {
+    const morganRow = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "morgan")).get();
+    if (morganRow === undefined) throw new Error("morgan row missing before badge seeding");
+    const inserted = await drizzle(env.DB)
+      .insert(badges)
+      .values([
+        { slug: "ci-passed", description: "Awarded for a green build.", imageUrl: "https://img.example.com/ci.png" },
+        { slug: "docs-hero", description: "Awarded for docs work.", imageUrl: null },
+      ])
+      .returning({ id: badges.id })
+      .all();
+    if (inserted[0] !== undefined) {
+      await drizzle(env.DB).insert(userBadges).values({ badgeId: inserted[0].id, userId: morganRow.id }).run();
+    }
+  }
+  if ((await drizzle(env.DB).select({ id: oauth2Applications.id }).from(oauth2Applications).limit(1).all()).length === 0) {
+    await drizzle(env.DB)
+      .insert(oauth2Applications)
+      .values([
+        {
+          uid: 0,
+          name: "instance-ci",
+          clientId: "golden-ci-client",
+          clientSecret: "golden-hash-ci",
+          confidentialClient: true,
+          skipSecondaryAuthorization: false,
+          redirectUris: JSON.stringify(["https://ci.example.com/cb"]),
+          createdAt: new Date(T0 * 1000),
+          updatedAt: new Date(T0 * 1000),
+        },
+        {
+          uid: 0,
+          name: "aaa-mobile",
+          clientId: "golden-mobile-client",
+          clientSecret: "golden-hash-mobile",
+          confidentialClient: false,
+          skipSecondaryAuthorization: false,
+          redirectUris: "[]",
+          createdAt: new Date(T0 * 1000),
+          updatedAt: new Date(T0 * 1000),
+        },
+      ])
+      .run();
+  }
+  {
+    // Two GLOBAL webhook rows (one system, one default) through the landed
+    // create arm — the golden's two sections each render exactly one row.
+    // The idempotence guard is the golden-specific name probe (the harness's
+    // repo hook carries "CI relay").
+    const existing = await drizzle(env.DB).select({ name: webhooks.name }).from(webhooks).all();
+    if (!existing.some((row) => row.name === "golden system relay")) {
+      await createGlobalHook(env.DB, {
+        type: "gitea",
+        name: "golden system relay",
+        config: { url: "https://hooks.example.com/system", content_type: "json", is_system_webhook: "true" },
+        events: ["push"],
+      });
+      await createGlobalHook(env.DB, {
+        type: "gitea",
+        name: "golden default relay",
+        config: { url: "https://hooks.example.com/default", content_type: "json" },
+        events: ["push"],
+      });
+    }
+  }
 });
 
 /** The one copy of the §5.2 assertion/marker protocol, shared by both case
@@ -502,6 +595,30 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   //     wiki-start's landing).
   // ---------------------------------------------------------------------------
   { file: "wiki-view-home.html", path: "/alice/golden-alt/wiki", status: 200, signedIn: true },
+  // ---------------------------------------------------------------------------
+  // The census R18 admin-arms batch (this wave): the four (a) arms through
+  // the real route path as morgan, over the fixtures seeded in the beforeAll
+  // above (email rows / badge catalog + one edge / two uid=0 oauth2 apps /
+  // two GLOBAL webhook rows). Each pins its page's full chrome — the folded
+  // AdminFamilyNav (the R18 nav items), the scoped theads, and the per-arm
+  // row projections over deterministic bytes (fixed client ids, fixed
+  // slugs, fixed hook URLs; the autoincrement row ids render in the delete
+  // forms and ride the fixed seed order).
+  //   - admin-emails: the union listing (three real secondary rows — the
+  //     synthesized-primary arm is unreachable in the harness seed, whose
+  //     users carry no email) with the toggle/delete form arms and the
+  //     four-item sort menu.
+  //   - admin-hooks: the two base_list sections (System FIRST) with the
+  //     status-dot arms and the plain-text rows (the unlanded edit page's
+  //     dead-link omission).
+  //   - admin-badges: the catalog list over the two badge rows with the
+  //     star/pencil pair and the LIVE Create link.
+  //   - admin-applications: the uid=0 app list (id DESC) with the landed
+  //     Remove forms and the closed create details (apps present).
+  { file: "admin-emails.html", path: "/-/admin/emails", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "admin-hooks.html", path: "/-/admin/hooks", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "admin-badges.html", path: "/-/admin/badges", status: 200, signedIn: true, sessionUser: "morgan" },
+  { file: "admin-applications.html", path: "/-/admin/applications", status: 200, signedIn: true, sessionUser: "morgan" },
 ];
 
 describe("wave-129 expansion goldens", () => {

@@ -150,12 +150,12 @@ export type UserSettingsNavTab =
   | "organization" // pages/user-settings-organizations.tsx
   | "repos"; // pages/user-settings-repos.tsx
 
-/** The org settings tabs — options/hooks (landed), blocked (committed-
- *  unmounted), secrets/variables (landed via org-settings-actions), plus
- *  `labels` for upstream's PageIsOrgSettingsLabels arm (navbar.tmpl:12 —
+/** The org settings tabs — options/hooks/applications (landed), blocked
+ *  (committed-unmounted), secrets/variables (landed via org-settings-actions),
+ *  plus `labels` for upstream's PageIsOrgSettingsLabels arm (navbar.tmpl:12 —
  *  today the item links the landed `/{org}/labels` page, which renders no
  *  settings nav, so no caller passes it yet). */
-export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "blocked" | "secrets" | "variables";
+export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "applications" | "blocked" | "secrets" | "variables";
 
 // ---------------------------------------------------------------------------
 // The user settings navbar (user/settings/navbar.tmpl reduced)
@@ -245,7 +245,7 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
  * The shared ORG settings navbar. `orgLink` is `/{org}` (the family's
  * OrgLink); `active` marks the rendered page's tab. Item order is
  * navbar.tmpl's exact order with the dead items dropped: Options, Hooks,
- * Labels, Blocked users, Actions▸(Secrets, Variables).
+ * Labels, Applications, Blocked users, Actions▸(Secrets, Variables).
  */
 export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsNavTab }) {
   const item = (tab: OrgSettingsNavTab) => (props.active === tab ? "active item" : "item");
@@ -267,8 +267,15 @@ export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsN
         <a class={item("labels")} href={`${props.orgLink}/labels`}>
           {settingsNavLocale.labels}
         </a>
-        {/* navbar.tmpl:20-22 (Applications :15-19 + Packages :23-27 dead) —
-            the blocked_users module is committed-unmounted. */}
+        {/* navbar.tmpl:15-19 — lit by the org settings applications tab's
+            mount (the a43d9b1 dead-link omission retired: the target page
+            is landed); upstream gates the item on .EnableOAuth2, cf-gitea's
+            OAuth2 store is unconditional (the page module header). */}
+        <a class={item("applications")} href={`${props.orgLink}/settings/applications`}>
+          {settingsNavLocale.applications}
+        </a>
+        {/* navbar.tmpl:20-22 (Packages :23-27 dead) — the blocked_users
+            module is committed-unmounted. */}
         <a class={item("blocked")} href={`${props.orgLink}/settings/blocked_users`}>
           {settingsNavLocale.blocked_users}
         </a>

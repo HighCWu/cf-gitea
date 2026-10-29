@@ -292,13 +292,13 @@ describe("file view page", () => {
     // §2.4.1 discriminators + registry attributes.
     expect(html).toContain('class="page-content repository file list view file"');
     expect(html).toContain('data-global-init="initRepoFileView"');
-    expect(html).toContain('data-raw-file-link="/api/v1/repos/alice/pages/raw/app.ts?ref=main"');
+    expect(html).toContain('data-raw-file-link="/alice/pages/raw/branch/main/app.ts"');
     expect(html).toContain('data-global-click="onCopyContentButtonClick"');
 
     // Latest-commit box + file header actions.
     expect(html).toContain('id="repo-file-commit-box"');
     expect(html).toContain("add app source and docs");
-    expect(html).toContain('<a class="ui mini basic button" href="/api/v1/repos/alice/pages/raw/app.ts?ref=main">Raw</a>');
+    expect(html).toContain('<a class="ui mini basic button" href="/alice/pages/raw/branch/main/app.ts">Raw</a>');
     expect(html).toContain('<a class="ui mini basic button" href="/alice/pages/commits?path=app.ts">History</a>');
 
     // The §3.3 code-view variant: line-numbered plain rows.
@@ -320,7 +320,7 @@ describe("file view page", () => {
     const html = await (await fetchUi("/alice/pages/src/branch/main/docs/guide.md")).text();
     expect(html).toContain('<div class="file-view markup markdown"');
     expect(html).toContain('<h1 id="user-content-guide">');
-    expect(html).toContain('data-raw-file-link="/api/v1/repos/alice/pages/raw/docs/guide.md?ref=main"');
+    expect(html).toContain('data-raw-file-link="/alice/pages/raw/branch/main/docs/guide.md"');
   });
 
   it("renders a directory as the shared file table with the parent-link row (§5.1)", async () => {
@@ -340,17 +340,17 @@ describe("file view page", () => {
     await ensureSeededRepo({ owner: "alice", slug: "pages", commits: PAGES_COMMITS });
     const html = await (await fetchUi("/alice/pages/src/branch/main/logo.png")).text();
     expect(html).toContain('<div class="view-raw">');
-    expect(html).toContain('<img alt="/api/v1/repos/alice/pages/raw/logo.png?ref=main"');
+    expect(html).toContain('<img alt="/alice/pages/raw/branch/main/logo.png"');
     expect(html).not.toContain("code-view");
   });
 
   it("resolves tag and commit refs (§3.3 ref suffixes)", async () => {
     await ensureSeededRepo({ owner: "alice", slug: "pages", commits: PAGES_COMMITS });
     const tagHtml = await (await fetchUi("/alice/pages/src/tag/v1/app.ts")).text();
-    expect(tagHtml).toContain('data-raw-file-link="/api/v1/repos/alice/pages/raw/app.ts?ref=v1"');
+    expect(tagHtml).toContain('data-raw-file-link="/alice/pages/raw/tag/v1/app.ts"');
 
     const shaHtml = await (await fetchUi(`/alice/pages/src/commit/${pagesTips[0]}/README.md`)).text();
-    expect(shaHtml).toContain(`data-raw-file-link="/api/v1/repos/alice/pages/raw/README.md?ref=${pagesTips[0]}"`);
+    expect(shaHtml).toContain(`data-raw-file-link="/alice/pages/raw/commit/${pagesTips[0]}/README.md"`);
   });
 
   it("404-shells missing paths, the bare /src family, and prefix-less suffixes (§3.3/§4.5)", async () => {

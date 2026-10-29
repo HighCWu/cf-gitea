@@ -180,6 +180,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       settingsNavLocale.org_options, // "org.settings.options"
       settingsNavLocale.hooks, // "repo.settings.hooks"
       settingsNavLocale.labels, // "repo.labels"
+      settingsNavLocale.applications, // "settings.applications" (lit by the R20-a applications tab's mount)
       settingsNavLocale.blocked_users, // "user.block.list"
       settingsNavLocale.actions, // "actions.actions"
       settingsNavLocale.secrets, // "secrets.secrets"
@@ -194,6 +195,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       'href="/acme/settings"',
       'href="/acme/settings/hooks"',
       'href="/acme/labels"', // the wave-14 divergence — upstream: /settings/labels
+      'href="/acme/settings/applications"', // lit by the R20-a applications tab's mount
       'href="/acme/settings/blocked_users"',
       'href="/acme/settings/actions/secrets"',
       'href="/acme/settings/actions/variables"',
@@ -206,10 +208,9 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
     expect(html).not.toContain('href="/acme/settings/labels"');
   });
 
-  it("renders NO dead items — Applications/Packages/Audit and the General/Runners/Scoped-workflows sub-items are omitted", () => {
+  it("renders NO dead items — Packages/Audit and the General/Runners/Scoped-workflows sub-items are omitted (Applications landed with the R20-a tab)", () => {
     const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="options" />);
     for (const dead of [
-      'href="/acme/settings/applications"', // navbar.tmpl:15-19
       'href="/acme/settings/packages"', // :23-27
       'href="/acme/settings/audit_logs"', // :50-52
       'href="/acme/settings/actions"', // the General sub-item, :32-34
@@ -225,13 +226,17 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       options: 'href="/acme/settings"',
       hooks: 'href="/acme/settings/hooks"',
       labels: 'href="/acme/labels"',
+      applications: 'href="/acme/settings/applications"',
       blocked: 'href="/acme/settings/blocked_users"',
       secrets: 'href="/acme/settings/actions/secrets"',
       variables: 'href="/acme/settings/actions/variables"',
     };
     for (const [tab, href] of Object.entries(expectations)) {
       const html = renderToString(
-        <OrgSettingsNavbar orgLink="/acme" active={tab as "options" | "hooks" | "labels" | "blocked" | "secrets" | "variables"} />,
+        <OrgSettingsNavbar
+          orgLink="/acme"
+          active={tab as "options" | "hooks" | "labels" | "applications" | "blocked" | "secrets" | "variables"}
+        />,
       );
       expect(html, `active=${tab}`).toContain(`class="active item" ${href}`);
       expect(html.match(/class="active item" href=/g)?.length, `active=${tab}`).toBe(1);
@@ -251,6 +256,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
     expect(html).toContain('href="/Org-With-Caps/settings"');
     expect(html).toContain('href="/Org-With-Caps/settings/hooks"');
     expect(html).toContain('href="/Org-With-Caps/labels"');
+    expect(html).toContain('href="/Org-With-Caps/settings/applications"');
     expect(html).toContain('href="/Org-With-Caps/settings/blocked_users"');
   });
 });

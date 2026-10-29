@@ -11,7 +11,9 @@
  * head-anchored git-am mail block with the signature tail; the EMPTY bodies
  * of the zero-mail / no-change ranges), the content-type + Cache-Control
  * pair (the diffpatch sibling's builder), the URL grammars' edge cases
- * (empty/missing sides, the fork-form rejection, lowercase-only 7..64 hex,
+ * (empty/missing sides, the head-side fork forms — the route parser's
+ * grammar with the cross-repo downloads over bob's public/private forks,
+ * lowercase-only 7..64 hex,
  * the anchored `..`), and viewPullFiles' admission arms (the half-open
  * "(base, head]" commit list, short-prefix 404s, same-ref and reversed
  * ranges, the broken-PR and unrelated-history 404s).
@@ -191,6 +193,82 @@ async function ensureCmpFeedsRepo(): Promise<{ tips: string[]; lonelyTip: string
     await db.update(repositories).set({ defaultBranch: "main" }).where(eq(repositories.id, row.id));
   }
 
+  // The fork fixtures (the fork-form arms): bob's PUBLIC fork of
+  // alice/cmpfeeds carrying the SHARED history (c0/c1 — the same oids; the
+  // merge base never needs the carry) plus a divergent branch, and an EMPTY
+  // PRIVATE fork for the §2.5 read-grant arm.
+  feedBob =
+    (await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, "bob")).get()) ??
+    (await seedVerifiedUser({ username: "bob" }));
+  await env.DB.prepare("DELETE FROM personal_access_tokens WHERE user_id = ? AND name = ?")
+    .bind(feedBob.id, "ui-page-seed-cmpfeeds-fork")
+    .run();
+  const forkToken = (await mintFor(feedBob.id, "ui-page-seed-cmpfeeds-fork", "write:repository")).plaintext;
+  const FORK_TIP_COMMIT: SeedCommit = {
+    message: "cmpfeeds: the fork diverges\n\nThe fork-only body line.\n",
+    time: T0 + 300,
+    files: [
+      { path: "README.md", content: "cmpfeeds v1\n" },
+      { path: "fork-only.md", content: "# from the fork\n" },
+    ],
+  };
+  const { tips: forkTips, pack: forkPack } = await buildHistoryPack([
+    FEED_COMMITS[0] as SeedCommit,
+    FEED_COMMITS[1] as SeedCommit,
+    FORK_TIP_COMMIT,
+  ]);
+  feedForkTip = forkTips[2] as string;
+  if ((await env.REPO.getByName("bob/cmpfeeds").listRefs()).head === null) {
+    await pushRefs(
+      "bob/cmpfeeds",
+      [
+        { ref: "refs/heads/main", oid: forkTips[1] as string },
+        { ref: "refs/heads/feature/fork", oid: feedForkTip },
+      ],
+      forkPack,
+      forkToken,
+    );
+  }
+  let forkRow = await db
+    .select()
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "bob"), eq(repositories.slug, "cmpfeeds")))
+    .get();
+  if (forkRow === undefined) {
+    forkRow = await new RepoService(env.DB).create({
+      owner: { id: feedBob.id, usernameLower: "bob" },
+      name: "cmpfeeds",
+      isPrivate: false,
+      status: "ready",
+    });
+  }
+  if (forkRow.visibility !== "public") {
+    await db.update(repositories).set({ visibility: "public" }).where(eq(repositories.id, forkRow.id));
+  }
+  if (forkRow.forkParent !== row.id) {
+    await db.update(repositories).set({ forkParent: row.id }).where(eq(repositories.id, forkRow.id));
+  }
+
+  // The private fork: an EMPTY ready row (the read grant misses before any
+  // engine read — no git content needed).
+  let privForkRow = await db
+    .select()
+    .from(repositories)
+    .where(and(eq(repositories.ownerNamespace, "bob"), eq(repositories.slug, "cmpfeedspriv")))
+    .get();
+  if (privForkRow === undefined) {
+    privForkRow = await new RepoService(env.DB).create({
+      owner: { id: feedBob.id, usernameLower: "bob" },
+      name: "cmpfeedspriv",
+      isPrivate: true,
+      status: "ready",
+    });
+  }
+  await db.update(repositories).set({ visibility: "private" }).where(eq(repositories.id, privForkRow.id));
+  if (privForkRow.forkParent !== row.id) {
+    await db.update(repositories).set({ forkParent: row.id }).where(eq(repositories.id, privForkRow.id));
+  }
+
   // The rows: PR #1 open (its head ref IS pushed), PR #2 broken (head branch
   // missing → no refs/pull/2/head → the broken-PR arm), issue #3 non-pull.
   const existing = await db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, row.id)).limit(1).get();
@@ -228,6 +306,9 @@ async function ensureCmpFeedsRepo(): Promise<{ tips: string[]; lonelyTip: string
 
 let feedTips: string[] | null = null;
 let feedLonelyTip: string | null = null;
+/** The fork fixture's divergent tip and owner row (the fork-form arms). */
+let feedForkTip: string | null = null;
+let feedBob: { id: number } | null = null;
 
 function tips(): string[] {
   if (feedTips === null) throw new Error("fixtures not seeded");
@@ -237,6 +318,17 @@ function tips(): string[] {
 function lonelyTip(): string {
   if (feedLonelyTip === null) throw new Error("fixtures not seeded");
   return feedLonelyTip;
+}
+
+function forkTip(): string {
+  if (feedForkTip === null) throw new Error("fixtures not seeded");
+  return feedForkTip;
+}
+
+/** The fork owner's session viewer (the plumbed-call shape of the loader). */
+function bobViewer(): { kind: "user"; id: number; username: string; isAdmin: boolean } {
+  if (feedBob === null) throw new Error("fixtures not seeded");
+  return { kind: "user", id: feedBob.id, username: "bob", isAdmin: false };
 }
 
 /** The loader's repo subset over the seeded row. */
@@ -277,19 +369,106 @@ describe("parseCompareFeedTail (the router's suffix strip)", () => {
 
 describe("parseCompareBaseHead (ParseCompareRouterParam reduced)", () => {
   it("splits on the first ... then .., else the whole tail is the head", () => {
-    expect(parseCompareBaseHead("main...topic")).toEqual({ base: "main", head: "topic", separator: "..." });
-    expect(parseCompareBaseHead("main..topic")).toEqual({ base: "main", head: "topic", separator: ".." });
-    expect(parseCompareBaseHead("topic")).toEqual({ base: null, head: "topic", separator: "..." });
+    expect(parseCompareBaseHead("main...topic")).toEqual({
+      base: "main",
+      head: "topic",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
+    expect(parseCompareBaseHead("main..topic")).toEqual({
+      base: "main",
+      head: "topic",
+      separator: "..",
+      headOwner: null,
+      headRepoName: null,
+    });
+    expect(parseCompareBaseHead("topic")).toEqual({
+      base: null,
+      head: "topic",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
     // Empty sides fall back to the default branch (util.IfZero).
-    expect(parseCompareBaseHead("...topic")).toEqual({ base: null, head: "topic", separator: "..." });
-    expect(parseCompareBaseHead("main...")).toEqual({ base: "main", head: null, separator: "..." });
-    expect(parseCompareBaseHead("")).toEqual({ base: null, head: null, separator: "..." });
+    expect(parseCompareBaseHead("...topic")).toEqual({
+      base: null,
+      head: "topic",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
+    expect(parseCompareBaseHead("main...")).toEqual({
+      base: "main",
+      head: null,
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
+    expect(parseCompareBaseHead("")).toEqual({
+      base: null,
+      head: null,
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
   });
 
-  it("rejects the cross-repo fork forms and dotted parts (the 404 family)", () => {
-    expect(parseCompareBaseHead("other:topic")).toBeNull();
-    expect(parseCompareBaseHead("other/repo:topic")).toBeNull();
-    expect(parseCompareBaseHead("main...other:topic")).toBeNull();
+  it("parses the head-side fork forms (the route parser's grammar, parseHead)", () => {
+    // Grammar form 2: the bare `{owner}:{ref}` head (the fork edge decides
+    // the repo at load); form 3: the explicit `{owner}/{repo}:{ref}` head.
+    expect(parseCompareBaseHead("other:topic")).toEqual({
+      base: null,
+      head: "topic",
+      separator: "...",
+      headOwner: "other",
+      headRepoName: null,
+    });
+    expect(parseCompareBaseHead("other/repo:topic")).toEqual({
+      base: null,
+      head: "topic",
+      separator: "...",
+      headOwner: "other",
+      headRepoName: "repo",
+    });
+    expect(parseCompareBaseHead("main...other:topic")).toEqual({
+      base: "main",
+      head: "topic",
+      separator: "...",
+      headOwner: "other",
+      headRepoName: null,
+    });
+    // The two-dot separator carries the fork forms too.
+    expect(parseCompareBaseHead("main..other:topic")).toEqual({
+      base: "main",
+      head: "topic",
+      separator: "..",
+      headOwner: "other",
+      headRepoName: null,
+    });
+    // The empty-part folds (GetHeadOwnerAndRepo's empty-string branches):
+    // an empty repo name is the bare fork form, an empty owner the bare
+    // single-ref form.
+    expect(parseCompareBaseHead("main...other/:feature")).toEqual({
+      base: "main",
+      head: "feature",
+      separator: "...",
+      headOwner: "other",
+      headRepoName: null,
+    });
+    expect(parseCompareBaseHead(":feature")).toEqual({
+      base: null,
+      head: "feature",
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    });
+    // A repo part with no owner (`/{repo}:{ref}`) is upstream's
+    // unsupported-syntax invalid-argument → null (the 404 class); the BASE
+    // part never carries a fork form (parseHead is head-only); dotted parts
+    // stay refname impossibilities.
+    expect(parseCompareBaseHead("main.../repo:feature")).toBeNull();
+    expect(parseCompareBaseHead("other:main...feature")).toBeNull();
     expect(parseCompareBaseHead("ma..in...topic")).toBeNull();
     expect(parseCompareBaseHead("main...to..pic")).toBeNull();
   });
@@ -396,7 +575,7 @@ describe("loadCompareFeed 404 family + response builders", () => {
     ).toEqual(notFound);
     const repo = await feedRepo();
     expect(await loadCompareFeed(env, repo, "main...ghost.diff", "diff")).toEqual(notFound); // unresolvable side
-    expect(await loadCompareFeed(env, repo, "other:topic.diff", "diff")).toEqual(notFound); // fork form
+    expect(await loadCompareFeed(env, repo, "other:topic.diff", "diff")).toEqual(notFound); // fork edge miss (no "other" user row)
     expect(await loadCompareFeed(env, repo, "ma..in...topic.diff", "diff")).toEqual(notFound); // dotted part
     expect(await loadCompareFeed(env, repo, "main...topic", "diff")).toEqual(notFound); // dispatcher drift: no suffix
     expect(await loadCompareFeed(env, repo, "main...topic.diff", "patch")).toEqual(notFound); // ext mismatch
@@ -410,6 +589,57 @@ describe("loadCompareFeed 404 family + response builders", () => {
     const err = compareFeedServerErrorResponse();
     expect(err.status).toBe(500);
     expect(err.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+  });
+});
+
+// --- the fork-form arms (the cross-repo downloads) -------------------------------
+
+describe("loadCompareFeed fork-form arms (the cross-repo downloads)", () => {
+  it("resolves the bare fork edge and diffs in the fork cell", async () => {
+    const repo = await feedRepo();
+    // The no-viewer call (the mounted dispatcher's shape): the PUBLIC fork
+    // passes the anonymous read grant; the shared history (main's tip is the
+    // merge base) keeps the walk carry-free, and the diff reads run in the
+    // FORK cell (services/git/compare.go:70-89's headGitRepo).
+    const feed = await loadCompareFeed(env, repo, "main...bob:feature/fork.diff", "diff");
+    const body = feedBody(feed);
+    expect(body).toContain("diff --git a/fork-only.md b/fork-only.md");
+    expect(body).toContain("+# from the fork");
+    expect(body).not.toContain("docs/notes.md"); // the base cell's files never leak
+    // The signed-in viewer rides the same grant (the plumbed-call shape).
+    expect(await loadCompareFeed(env, repo, "main...bob:feature/fork.diff", "diff", bobViewer())).toEqual(feed);
+  });
+
+  it("resolves the explicit owner/repo form and renders the fork's patch mail", async () => {
+    const repo = await feedRepo();
+    const feed = await loadCompareFeed(env, repo, "main..bob/cmpfeeds:feature/fork.patch", "patch");
+    const body = feedBody(feed);
+    expect(body.startsWith(`From ${forkTip()} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
+    expect(body).toContain("Subject: [PATCH] cmpfeeds: the fork diverges");
+    expect(body.endsWith("-- \n2.47.0\n")).toBe(true);
+  });
+
+  it("folds the same-owner prefix back onto the base repo (GetHeadOwnerAndRepo's fold)", async () => {
+    const repo = await feedRepo();
+    expect(await loadCompareFeed(env, repo, "main...alice:topic.diff", "diff")).toEqual(
+      await loadCompareFeed(env, repo, "main...topic.diff", "diff"),
+    );
+    expect(await loadCompareFeed(env, repo, "main...alice/cmpfeeds:topic.diff", "diff")).toEqual(
+      await loadCompareFeed(env, repo, "main...topic.diff", "diff"),
+    );
+  });
+
+  it("404s the unreadable private fork head (the §2.5 grant) and the unresolvable fork side", async () => {
+    const repo = await feedRepo();
+    const notFound = { kind: "notFound" };
+    // No viewer rides the anonymous grant — the PRIVATE fork is invisible
+    // (compare.go:182-189's permHead.CanRead miss, the not-exist shell).
+    expect(await loadCompareFeed(env, repo, "main...bob/cmpfeedspriv:main.diff", "diff")).toEqual(notFound);
+    // The owner viewer passes the grant, then the EMPTY fork's unborn head
+    // misses at resolution — the same 404 shell, the honest arm.
+    expect(await loadCompareFeed(env, repo, "main...bob/cmpfeedspriv:main.diff", "diff", bobViewer())).toEqual(notFound);
+    // A fork-resolved head naming no ref in the fork cell misses too.
+    expect(await loadCompareFeed(env, repo, "main...bob:ghost.diff", "diff")).toEqual(notFound);
   });
 });
 

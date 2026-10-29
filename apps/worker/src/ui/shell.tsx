@@ -236,15 +236,17 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificat
 // ---------------------------------------------------------------------------
 
 /** Tabs that back real pages this slice — the strip shows only these.
- *  Upstream order is Code → Issues → Pulls → Releases (header.tmpl:157, the
- *  wave-20 addition — the releases family resolves the tab's 404); Commits
- *  is the cf-gitea addition (SPEC-0008 §2.4.1 — /commits is a slice-1 page)
- *  and keeps last so the upstream relative order stays intact. The upstream
- *  `{{if .NumReleases}}` count label is unrendered: D1 keeps no maintained
- *  num_releases counter and the shared shell would pay a COUNT on every
- *  repo-scoped render for a label most repos never show (pages/releases.tsx
- *  header) — the releases PAGES render the real count in their header menu. */
-export type RepoTab = "code" | "issues" | "pulls" | "projects" | "releases" | "commits";
+ *  Upstream order is Code → Issues → Pulls → Releases → Activity
+ *  (header.tmpl:157, the wave-20 addition; header.tmpl:177, the activity
+ *  page's tab — the releases family and the /activity route resolve both
+ *  tabs' 404s); Commits is the cf-gitea addition (SPEC-0008 §2.4.1 —
+ *  /commits is a slice-1 page) and keeps last so the upstream relative
+ *  order stays intact. The upstream `{{if .NumReleases}}` count label is
+ *  unrendered: D1 keeps no maintained num_releases counter and the shared
+ *  shell would pay a COUNT on every repo-scoped render for a label most
+ *  repos never show (pages/releases.tsx header) — the releases PAGES render
+ *  the real count in their header menu. */
+export type RepoTab = "code" | "issues" | "pulls" | "projects" | "releases" | "activity" | "commits";
 
 /** Tab chrome text for the wave-3 tabs (the components/commit-list.tsx
  *  component-local pattern — locale.ts is shared and not this wave's file). */
@@ -253,6 +255,7 @@ const tabLocale = {
   repo_pulls: "Pull Requests", // "repo.pulls"
   repo_projects: "Projects", // "repo.projects" (wave 45 — the projects tab)
   repo_releases: "Releases", // "repo.releases"
+  repo_activity: "Activity", // "repo.activity" (the pulse tab)
 } as const;
 
 /** Create-menu chrome text (the same component-local pattern — wave 19's
@@ -347,6 +350,20 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
                 label is the documented reduction (RepoTab note). */}
             <a class={activeTab === "releases" ? "active item" : "item"} href={`${repoLink}/releases`} data-shortcut-keys="g r">
               <Icon name="octicon-tag" /> {tabLocale.repo_releases}
+            </a>
+            {/* header.tmpl:177-181 — the activity/pulse tab (the R14 activity
+                page unlocks it, pages/repo-activity.tsx). Upstream gates it on
+                CanReadAny(PullRequests, Issues, Releases, Code) ∧
+                ¬IsEmptyRepo — reading ANY of the four units admits the whole
+                /activity group (web.go:1628-1646's RequireUnitReader), which
+                every page this strip renders on already satisfies, so the
+                landed strip keeps its unit-ungated shape (the releases tab's
+                precedent). Upstream arms no data-shortcut-keys here, and the
+                active state rides .PageIsActivity — the shell derives it from
+                the activity page's discriminator class (BaseLayout's
+                pageClass note below). */}
+            <a class={activeTab === "activity" ? "active item" : "item"} href={`${repoLink}/activity`}>
+              <Icon name="octicon-pulse" /> {tabLocale.repo_activity}
             </a>
             <a class={activeTab === "commits" ? "active item" : "item"} href={`${repoLink}/commits`}>
               <Icon name="octicon-history" /> {locale.repo_commits}
@@ -489,6 +506,16 @@ export function BaseLayout(props: {
   const { ctx } = props;
   const pageTitle = ctx.repo ? `${ctx.repo.ownerNamespace}/${ctx.repo.slug}` : locale.app_name;
   const fullTitle = props.title === undefined ? pageTitle : `${props.title} - ${pageTitle}`;
+  // The activity page's tab track — upstream arms the pulse tab on
+  // `.PageIsActivity` (header.tmpl:178), template data this shell does not
+  // carry; the activity page's discriminator class stands in instead. The
+  // landed pages/repo-activity.tsx renders `page-content repository commits`
+  // (activity.tmpl:2) with NO activeTab of its own, while the commits LIST
+  // page shares that class and sets activeTab="commits" explicitly — so an
+  // explicit tab always wins and the bare commits page-class resolves to the
+  // activity page (the only page that renders it without one).
+  const activeTab =
+    props.activeTab ?? (props.pageClass === "repository commits" ? "activity" : undefined);
   return (
     <html lang="en" data-theme="gitea-light">
       <Head ctx={ctx} title={fullTitle} />
@@ -514,7 +541,7 @@ export function BaseLayout(props: {
             id={props.mainId}
             data-sequence-number={props.mainDataSequence}
           >
-            {ctx.repo ? <RepoHeader ctx={ctx} activeTab={props.activeTab} /> : null}
+            {ctx.repo ? <RepoHeader ctx={ctx} activeTab={activeTab} /> : null}
             {props.children}
           </div>
         </div>

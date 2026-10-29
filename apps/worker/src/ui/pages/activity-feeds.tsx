@@ -28,9 +28,9 @@
  * `templates/user/profile.tmpl:10-17` — the `.TabName == "activity"` branch
  * inside the profile grid (four-wide avatar column + twelve-wide column
  * carrying `user/overview/header`): the `KeepActivityPrivate` info message
- * (`user.disabled_public_activity`), then `user/heatmap` (NOT rendered — no
- * heatmap pipeline on our side, the `/-/heatmap` route is an unclaimed tail,
- * the org-repos header's tail note), then `user/dashboard/feeds.tmpl`. The
+ * (`user.disabled_public_activity`), then `user/heatmap` (RENDERED since
+ * this wave's arm — the `#user-heatmap` div + the `/-/heatmap` JSON route,
+ * ActivityHeatmapSlot's header), then `user/dashboard/feeds.tmpl`. The
  * handler arm (profile.go:162-190): `date = FormString("date")`,
  * `pagingNum = setting.UI.FeedPagingNum` (= 20, modules/setting/ui.go:93),
  * `showPrivate = IsSigned && (admin || self)`, `OnlyPerformedBy: true`,
@@ -120,8 +120,9 @@
  * - `GetIssueTitle`'s failure literals port verbatim: index ≤ 0 →
  *   "<Issue not found>", a missing row → "<500 when get issue>"
  *   (models/activities/action.go:386-403).
- * - The heatmap template arm is not rendered (no pipeline — the header
- *   note).
+ * - The heatmap template arm IS rendered since this wave's slot
+ *   (ActivityHeatmapSlot — the official bundle renders it client-side; the
+ *   former "no pipeline" note predates the `/-/heatmap` JSON route).
  *
  * ## Data (§3.2 — the landed service, never a self-fetch)
  *
@@ -171,6 +172,13 @@ export const activityFeedsLocale = {
   disabled_public_activity: "This user has disabled the public visibility of the activity.", // "user.disabled_public_activity"
   newer: "Newer", // the base/paginate reduction's navigation_label (OrgHomePagination shape)
   older: "Older",
+  // The heatmap widget's locale data attributes (templates/user/heatmap.tmpl
+  // — this wave's arm; the official bundle's initHeatmap reads them,
+  // web_src/js/features/heatmap.ts, and the keys cite locale_en-US.json).
+  heatmap_total_contributions: "%s contributions in the last 12 months", // "heatmap.number_of_contributions_in_the_last_12_months"
+  heatmap_no_contributions: "No contributions", // "heatmap.no_contributions"
+  heatmap_more: "More", // "heatmap.more"
+  heatmap_less: "Less", // "heatmap.less"
 } as const;
 
 /** Upstream `setting.UI.FeedPagingNum` (modules/setting/ui.go:93) — the
@@ -794,6 +802,40 @@ function ActivityFeedsPager(props: { username: string; page: number; more: boole
   );
 }
 
+/**
+ * The heatmap widget slot (templates/user/heatmap.tmpl — this wave's arm;
+ * profile.tmpl:16 renders it between the private-activity message and the
+ * feeds, the exact slot below). The div is upstream's verbatim contract:
+ * `#user-heatmap.is-loading` + `data-heatmap-url` (the `/{username}/-
+ * /heatmap` JSON route this wave mounts) + the four locale data attributes
+ * — the OFFICIAL bundle's `initHeatmap` (web_src/js/features/heatmap.ts,
+ * wired in web_src/js/index.ts's init list) picks the div up on every page
+ * this shell loads, fetches the JSON, and renders the real ActivityHeatmap
+ * client-side, removing `is-loading`. The upstream fetch flow exactly — no
+ * SSR grid reimplementation (the census's render-policy call: upstream's
+ * widget is client-side; the div + the JSON route ARE its shape).
+ * `EnableUserHeatmap` defaults ON upstream (setting/service.go) — always
+ * rendered, like the template's non-disabled arm.
+ */
+function ActivityHeatmapSlot(props: { username: string }) {
+  return (
+    <>
+      <div class="activity-heatmap-container">
+        <div
+          id="user-heatmap"
+          class="is-loading"
+          data-heatmap-url={`/${props.username}/-/heatmap`}
+          data-locale-total-contributions={activityFeedsLocale.heatmap_total_contributions}
+          data-locale-no-contributions={activityFeedsLocale.heatmap_no_contributions}
+          data-locale-more={activityFeedsLocale.heatmap_more}
+          data-locale-less={activityFeedsLocale.heatmap_less}
+        ></div>
+      </div>
+      <div class="divider"></div>
+    </>
+  );
+}
+
 /** The full-document render (the render.tsx pattern — `index.ts` stays a
  *  pure-TS router module, so the JSX invocation lives beside the
  *  component). */
@@ -819,6 +861,7 @@ export function ActivityFeedsPage(props: { ctx: UiContext; data: ActivityFeedsDa
                 <p>{activityFeedsLocale.disabled_public_activity}</p>
               </div>
             ) : null}
+            <ActivityHeatmapSlot username={data.user.username} />
             <ActivityFeedList items={data.items} />
             <ActivityFeedsPager
               username={data.user.username}

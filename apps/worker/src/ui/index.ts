@@ -328,6 +328,20 @@
  *                                          FindOrgMembersOpts.PublicOnly
  *                                          scope is the per-row gate; the
  *                                          landed orgListMembers read)
+ *   /org/{org}/dashboard[/{team}]           org dashboard, GET (pages/
+ *                                          org-dashboard.tsx — the census
+ *                                          R06 row; upstream web.go:982-985
+ *                                          user.Dashboard under
+ *                                          OrgAssignment{RequireMember,
+ *                                          RequireTeamMember} — MEMBER-ONLY,
+ *                                          anonymous and non-members
+ *                                          404-shell (no login redirect);
+ *                                          the org feed through the landed
+ *                                          activity-feeds read, the {team}
+ *                                          tail filtering through the team's
+ *                                          repo set; the heatmap arm is R03,
+ *                                          the issues/pulls/milestones tabs
+ *                                          are R07 — both unrendered)
  *   /{org}/-/repositories                   org repositories view, GET
  *                                          (pages/org-repos.tsx — wave 23;
  *                                          upstream's web.go:1134 route in
@@ -689,6 +703,7 @@ import {
   type ReleaseAttachmentServe,
 } from "./pages/release-downloads";
 import { loadRenderFile, renderFileResponse, renderNotAvailableResponse, type RenderFileTarget } from "./pages/render-files";
+import { loadMediaBlob, loadRawBlob, mediaBlobResponse, rawBlobResponse, type RawMediaTarget } from "./pages/raw-files";
 import {
   canWriteRepo,
   commitFileFromForm,
@@ -740,10 +755,21 @@ import {
   renderNewMilestonePage,
 } from "./pages/milestones";
 import { loadOrgHomeData, renderOrgHomePage, resolveOrgHome } from "./pages/org-home";
+// The census R06 org dashboard (web.go:982-985's /org/{org}/dashboard
+// family) — the member-only page over the landed org-feed reads.
+import {
+  isOrgDashboardMember,
+  isOrgDashboardTeamMember,
+  loadOrgDashboardData,
+  renderOrgDashboardPage,
+  resolveDashboardTeam,
+  resolveOrgDashboardOrg,
+} from "./pages/org-dashboard";
 import {
   canManageOrgTeams,
   createTeamFromForm,
   loadOrgTeamDetailData,
+  loadOrgTeamDetailDataByName,
   loadOrgTeamsData,
   parseTeamNewForm,
   renderOrgTeamDetailPage,
@@ -751,6 +777,7 @@ import {
   renderOrgTeamsPage,
   resolveOrgTeamsOrg,
 } from "./pages/org-teams";
+import type { TeamRecord } from "../api/routes/org-teams";
 import {
   createOrgLabelFromForm,
   deleteOrgLabelFromForm,
@@ -813,6 +840,16 @@ import {
   renderOrgActionsSecretsPage,
   renderOrgActionsVariablesPage,
 } from "./pages/org-settings-actions";
+// The census R20 (a) arm: the org settings applications tab (org-OWNED
+// oauth2 applications — the landed service's uid-parameterized arms keyed
+// on the org's id).
+import {
+  applyOrgApplicationCreate,
+  deleteOrgApplication,
+  loadOrgSettingsApplications,
+  parseOrgApplicationCreateForm,
+  renderOrgApplicationsPage,
+} from "./pages/org-settings-applications";
 import {
   applyUserProfileForm,
   loadUserSettingsPageData,
@@ -929,7 +966,53 @@ import type { AdminMonitorPage } from "./pages/admin-monitor";
 import { loadAdminUsersData, renderAdminUsersPage } from "./pages/admin-users";
 import { loadAdminOrgsData, renderAdminOrgsPage } from "./pages/admin-orgs";
 import { loadAdminReposData, renderAdminReposPage } from "./pages/admin-repos";
-import { loadUserProfileData, renderUserProfilePage, resolveUserProfile } from "./pages/user-profile";
+// The census R18 (a) arms (each module's header carries its mount record):
+// the emails list + the activate/delete writes, the hooks two-list + delete,
+// the badge-catalog family (all seven upstream routes), and the global
+// oauth2 applications (list + create + delete over the landed service).
+import {
+  applyAdminEmailActivate,
+  applyAdminEmailDelete,
+  adminEmailActivateFormValid,
+  loadAdminEmailsData,
+  parseAdminEmailActivateForm,
+  parseAdminEmailDeleteForm,
+  parseAdminEmailsListParams,
+  renderAdminEmailsPage,
+} from "./pages/admin-emails";
+import { applyAdminHookDelete, loadAdminHooksData, renderAdminHooksPage } from "./pages/admin-hooks";
+import {
+  addBadgeUserByName,
+  adminBadgesLocale,
+  createBadgeFromForm,
+  deleteBadgeBySlug,
+  getBadgeBySlug,
+  getBadgeUsersPage,
+  loadAdminBadgesData,
+  parseAdminBadgeForm,
+  removeBadgeUser,
+  renderAdminBadgeEditPage,
+  renderAdminBadgeNewPage,
+  renderAdminBadgeUsersPage,
+  renderAdminBadgeViewPage,
+  renderAdminBadgesPage,
+  updateBadgeFromForm,
+  type AdminBadgeEditData,
+  type AdminBadgeUsersData,
+} from "./pages/admin-badges";
+import {
+  applyAdminApplicationCreate,
+  applyAdminApplicationDelete,
+  loadAdminApplicationsData,
+  parseAdminApplicationCreateForm,
+  renderAdminApplicationsPage,
+} from "./pages/admin-applications";
+import {
+  loadUserProfileData,
+  renderUserProfilePage,
+  resolveUserProfile,
+  type ProfileDoer,
+} from "./pages/user-profile";
 // The profile's sub-tab pages (the ownerHomePage ?tab= dispatch — the
 // activity-feeds precedent; each loader takes the doer, not the viewer).
 import { loadUserFollowTabsData, renderUserFollowTabsPage } from "./pages/user-follow-tabs";
@@ -1078,11 +1161,22 @@ import {
 } from "./pages/repo-fork";
 import { loadDashboardData, renderDashboardPage, renderLandingPage } from "./pages/dashboard";
 import {
+  loadExploreOrganizationsData,
   loadExploreReposData,
   loadExploreUsersData,
+  renderExploreOrganizationsPage,
   renderExploreReposPage,
   renderExploreUsersPage,
 } from "./pages/explore";
+import { loadOwnerHeatmapData, ownerHeatmapJsonBody } from "./pages/owner-heatmap";
+import {
+  loadOrgInboxIssuesData,
+  loadOrgInboxMilestonesData,
+  renderOrgInboxIssuesPage,
+  renderOrgInboxMilestonesPage,
+  resolveOrgInbox,
+  type OrgInboxKind,
+} from "./pages/org-inbox";
 import {
   createIssueFromForm,
   loadNewIssueData,
@@ -1130,6 +1224,9 @@ import {
 } from "./pages/repo-blob-excerpt-fragment";
 import { loadPullCommitsData, renderPullCommitsPage } from "./pages/pull-commits";
 import { loadCommitViewData, renderCommitViewPage } from "./pages/commit-view";
+// The census R08 blame page (web.go:1729-1733's /blame family) over the
+// engine's blame() read RPC.
+import { loadBlameData, renderBlamePage } from "./pages/blame";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
 import {
   applyRepoBasics,
@@ -1705,6 +1802,28 @@ export interface RenderFileRoute {
   sha?: string;
 }
 
+/** The RAW + MEDIA byte-serving families (pages/raw-files.ts — upstream
+ *  web.go:1699-1713's two groups, the survey's PARTIAL rows this wave
+ *  closes): the three typed ref sub-routes (SingleDownload /
+ *  SingleDownloadOrLFS), the `/blob/{sha}` arm (DownloadByID /
+ *  DownloadByIDOrLFS), and the deprecated `/{raw,media}/*` backward-compat
+ *  arm (RepoRefByType("") — getRefNameLegacy's guess). Not a page family:
+ *  the answer is the byte Response (or the 404 family — the module doc
+ *  carries the ServeBlob matrix and the divergence ledger). */
+export interface RawMediaRoute {
+  family: "raw-file" | "media-file";
+  owner: string;
+  repo: string;
+  /** The typed-ref arms: the ref-type literal + the decoded ref+path
+   *  suffix (the /src family's shape). */
+  refType?: RefType;
+  refSuffix?: string;
+  /** The deprecated catch-all's decoded tail (the legacy guess input). */
+  legacySuffix?: string;
+  /** The blob arm's decoded sha segment. */
+  sha?: string;
+}
+
 /** The wave-19 creation families (pages/repo-create.tsx + pages/
  *  org-create.tsx): upstream's reqSignIn `/repo/create` and `/org/create`
  *  groups (web.go:1094-1098 + 970-974 — the parity survey's #2, the
@@ -1748,6 +1867,33 @@ export interface OrgMembersRoute {
 export interface OrgRepositoriesRoute {
   family: "org-repositories";
   /** Decoded owner segment (org rows only at resolve time). */
+  owner: string;
+}
+
+/** The ORG-scoped inbox families (pages/org-inbox.tsx — this wave's R07):
+ *  upstream web.go:986-991's `/org/{org}/{issues|pulls|milestones}` +
+ *  `/{team}` tails under `OrgAssignment(RequireMember, RequireTeamMember)`.
+ *  The `{org}` segment is the URL's login (the team tail is the team's
+ *  DISPLAY name — resolution lowercases). */
+export interface OrgInboxRoute {
+  family: "org-inbox";
+  owner: string;
+  kind: "issues" | "pulls" | "milestones";
+  /** The `{team}` tail's decoded segment (absent = the bare route). */
+  team?: string;
+}
+
+/** The owner HEATMAP JSON family (pages/owner-heatmap.ts — this wave): the
+ *  `/{username}/-` group's `m.Get("/heatmap", user.DashboardHeatmap)`
+ *  (web.go:1135) — the web pair-shape JSON the official bundle's profile
+ *  widget fetches (features/heatmap.ts → `#user-heatmap`'s
+ *  `data-heatmap-url`). Not a page: the answer is the JSON body (or the
+ *  404 shell — the `IsUserVisibleToViewer` gate). The owner resolves
+ *  USER-side (the org arm is census R06's org-scoped aggregation). */
+export interface OwnerHeatmapRoute {
+  family: "owner-heatmap";
+  /** Decoded owner segment (user rows only at resolve time — the R06
+   *  boundary note in the module header). */
   owner: string;
 }
 
@@ -2219,6 +2365,24 @@ export interface FileEditorRoute {
   refSuffix: string;
 }
 
+/** The blame page family (pages/blame.tsx): upstream's blame group —
+ *  web.go:1729-1733's `m.Group("/blame", ...)` with `/branch/*`, `/tag/*`
+ *  and `/commit/*` tails → repo.RefBlame (routers/web/repo/blame.go; the
+ *  census R08 row's route shape). The tail is the decoded
+ *  refType-prefixed ref+path rest — it re-parses through the SAME
+ *  splitRefSuffix/resolveRefSuffix walk the /src family uses (pages/
+ *  blame.tsx's loadBlameData; an empty tree path is blame.go:48-51's
+ *  NotFound arm, answered there as the 404 shell). The bare `/blame` stays
+ *  unclaimed: upstream chi requires the tail, and the engine answers. */
+export interface BlameRoute {
+  family: "blame";
+  owner: string;
+  repo: string;
+  /** Decoded refType+ref+path tail after the family literal (never claimed
+   *  empty; never a bare refType). */
+  refSuffix: string;
+}
+
 /** The wave-9 site root (pages/dashboard.tsx): upstream `Home`
  *  (routers/web/home.go:26-44) — `/` serves the signed-in dashboard, the
  *  anonymous landing. The dispatcher never consults `handlesUiRoute` for it
@@ -2253,15 +2417,17 @@ export interface NotificationsRoute {
 }
 
 /** The wave-9 explore family (pages/explore.tsx): upstream's route group
- *  `m.Group("/explore", …)` (web.go:549-556) — the bare `/explore` redirects
+ *  `m.Group("/explore", …)` (web.go:549-557) — the bare `/explore` redirects
  *  onto `/explore/repos`, which renders the repo search page;
- *  `/explore/users` the user search page. Claimed by EXACT literal shapes
- *  before the owner/repo parse could read `/explore/repos` as a
- *  `{owner: "explore", repo: "repos"}` repository; every other `/explore/*`
- *  tail (organizations/code/sitemap-*, deeper) stays unclaimed → the
- *  engine/parent answer, exactly upstream's unregistered-route 404. */
+ *  `/explore/users` the user search page; `/explore/organizations` the org
+ *  search page (this wave — the census's R01 brief, org.go:17's
+ *  Organizations). Claimed by EXACT literal shapes before the owner/repo
+ *  parse could read `/explore/repos` as a `{owner: "explore", repo:
+ *  "repos"}` repository; every other `/explore/*` tail (code, sitemap-*,
+ *  deeper) stays unclaimed → the engine/parent answer, exactly upstream's
+ *  unregistered-route 404. */
 export interface ExploreRoute {
-  family: "explore-root" | "explore-repos" | "explore-users";
+  family: "explore-root" | "explore-repos" | "explore-users" | "explore-organizations";
 }
 
 /** Window-2e: the sitemap families (pages/sitemap.ts — upstream web.go:530,
@@ -2347,13 +2513,43 @@ export interface UserSettingsRoute {
 
 /** Window-2c: the admin family (pages/admin-dashboard.tsx +
  *  pages/admin-monitor.tsx + the wave's users/orgs/repos pages — upstream's
- *  /-/admin group). */
+ *  /-/admin group). The census R18 (a) arms extend the family union
+ *  additively: emails / hooks / badges / applications (each module's header
+ *  carries its mount record; the remaining upstream arms stay unclaimed —
+ *  config/notices/auths are the census's (b) class, packages/actions the
+ *  (c) gate). */
 export interface AdminRoute {
-  family: "admin-dashboard" | "admin-monitor" | "admin-users" | "admin-orgs" | "admin-repos";
+  family:
+    | "admin-dashboard"
+    | "admin-monitor"
+    | "admin-users"
+    | "admin-orgs"
+    | "admin-repos"
+    | "admin-emails"
+    | "admin-emails-activate"
+    | "admin-emails-delete"
+    | "admin-hooks"
+    | "admin-hooks-delete"
+    | "admin-badges"
+    | "admin-badge-new"
+    | "admin-badge-view"
+    | "admin-badge-edit"
+    | "admin-badge-delete"
+    | "admin-badge-users"
+    | "admin-badge-users-delete"
+    | "admin-applications"
+    | "admin-application-create"
+    | "admin-application-delete";
   /** The monitor page (stats/cron/queue/stacktrace → the module's
    *  AdminMonitorPage union); absent on the dashboard family and the three
    *  listing families. */
   page?: "stats" | "cron" | "queue" | "trace";
+  /** The decoded {badge_slug} path param (the badges slug families —
+   *  upstream chi's own param; a junk-encoding segment never claims). */
+  badgeSlug?: string;
+  /** The positive-integer {id} (the application-delete family — the landed
+   *  PathParamInt64 posture; "007" parses as 7). */
+  applicationId?: number;
 }
 
 /** Window-2a: the user-settings tab families (the two-stage module wave —
@@ -2396,20 +2592,29 @@ export interface UserSettingsTabRoute {
 
 /** The wave-12 org teams families (pages/org-teams.tsx): upstream's
  *  `/{org}/teams` group (web.go:993-1013) at the landed API shapes — the
- *  list, the id-keyed detail slice (upstream links by team name; the slice
- *  follows the landed /teams/{id} read arms), and the create form. The
- *  literal `teams` second segment claims the shapes before the repo parse
- *  could read them as a repository named "teams" — upstream shadows such a
- *  repo identically (web.go:993 registers ahead of :1292's
+ *  list, the detail slice (upstream links by team name; the slice follows
+ *  the landed /teams/{id} read arms), and the create form. The literal
+ *  `teams` second segment claims the shapes before the repo parse could
+ *  read them as a repository named "teams" — upstream shadows such a repo
+ *  identically (web.go:993 registers ahead of :1292's
  *  `/{username}/{reponame}`). The deeper tails (`/{id}/repositories`,
  *  `/{id}/edit`, `/{id}/delete`, the `/action/*` writes) stay unclaimed →
- *  the engine's 404. */
+ *  the engine's 404. The census R19 wave adds the NAME CARRIER on the
+ *  detail family: a non-numeric `/{team}` segment claims the same detail
+ *  arm resolved case-folded through the lower_name (upstream's EqualFold
+ *  walk, services/context/org.go:213-218; a miss 404-shells, org.go:214-
+ *  218 — upstream answers its 404 page for any team param, so the segment
+ *  claim is upstream-shaped), while the five-segment edit/delete tails
+ *  keep their positive-integer-only claims (the wave-49 shapes). */
 export interface OrgTeamsRoute {
   family: "org-teams" | "org-team-new" | "org-team-detail";
   /** Decoded org segment. */
   owner: string;
-  /** The team id (the detail family only). */
+  /** The team id (the detail family's numeric carrier). */
   id?: number;
+  /** The team name (the detail family's R19 name carrier — decoded,
+   *  resolved case-folded against lower_name at load). */
+  name?: string;
 }
 
 /** The wave-14 org labels management families (pages/org-labels.tsx): the
@@ -2450,6 +2655,9 @@ export interface OrgSettingsRoute {
     | "org-settings-hook-detail" // GET+POST /{org}/settings/hooks/{id} (the edit page — wave 53)
     | "org-settings-hook-delete" // POST /{org}/settings/hooks/{id}/delete (wave 53)
     | "org-settings-blocked" // GET+POST /{org}/settings/blocked_users (window-2b)
+    | "org-settings-applications" // GET /{org}/settings/applications (the R20-a oauth2 list)
+    | "org-settings-applications-create" // POST /{org}/settings/applications/oauth2 (the R20-a create)
+    | "org-settings-applications-delete" // POST /{org}/settings/applications/oauth2/{id}/delete (the R20-a delete)
     | "org-actions-secrets" // GET+POST /{org}/settings/actions/secrets (window-2b)
     | "org-actions-secrets-delete" // POST .../secrets/delete (window-2b)
     | "org-actions-variables" // GET /{org}/settings/actions/variables (window-2b)
@@ -2464,6 +2672,30 @@ export interface OrgSettingsRoute {
   /** The team id (the team-edit/delete families) or hook id (the org
    * hook-detail/delete families — wave 53). */
   id?: number;
+}
+
+/** The census R06 org dashboard family (pages/org-dashboard.tsx): upstream's
+ *  `/org/{org}/dashboard` + `/org/{org}/dashboard/{team}` literals
+ *  (web.go:982-985 — `user.Dashboard` under
+ *  `OrgAssignment{RequireMember: true, RequireTeamMember: true}`, the
+ *  MEMBER-ONLY posture the page keeps: anonymous AND non-members 404-shell,
+ *  upstream's RequireMember NotFound with no login redirect). The literal
+ *  `org` first segment and `dashboard` third claim the shapes before the
+ *  repo parse could read them (the org-members exact-literal posture —
+ *  upstream's /org group registers ahead of :1292's `/{username}/{reponame}`,
+ *  and the "org" owner name is create-time reserved besides). The {team}
+ *  tail is any decodable segment: upstream resolves it case-folded against
+ *  the visible teams' lower names and 404s the miss (org.go:213-232, the
+ *  RequireTeamMember arm included). The heatmap tails
+ *  (`/dashboard/-/heatmap[/{team}]` — R03) and every deeper shape stay
+ *  unclaimed → the engine's 404. */
+export interface OrgDashboardRoute {
+  family: "org-dashboard";
+  /** Decoded org segment. */
+  owner: string;
+  /** The decoded team-name tail (the `/{team}` arm — resolved case-folded
+   *  against the org's teams at load). */
+  team?: string;
 }
 
 /** The wave-13 compare family (pages/compare.tsx): upstream's
@@ -2491,6 +2723,16 @@ export interface CompareRoute {
   base: string | null;
   /** The head side; `null` = the bare/empty form → the default branch. */
   head: string | null;
+  /** The URL's separator (upstream CompareRouterReq.CompareSeparator /
+   *  CompareInfo.CompareSeparator): `...` diffs from the merge base,
+   *  `..` diffs the two tips (DirectComparison). */
+  separator: "..." | "..";
+  /** The head-side fork form's owner (parseHead); `null` = the same-repo
+   *  head (the owner segment omitted). */
+  headOwner: string | null;
+  /** The fork form's explicit repo name (`{owner}/{repo}:{ref}` form);
+   *  `null` = the bare `{owner}:{ref}` form (the fork edge decides). */
+  headRepoName: string | null;
 }
 
 /** Top-level single-segment paths this router must never claim: the session
@@ -2524,6 +2766,7 @@ export type ParsedUiRoute =
   | GlobalInboxRoute
   | WikiRoute
   | FileEditorRoute
+  | BlameRoute
   | RepoActivityRoute
   | SiteHomeRoute
   | ExploreRoute
@@ -2536,6 +2779,7 @@ export type ParsedUiRoute =
   | OrgTeamsRoute
   | OrgLabelsRoute
   | OrgSettingsRoute
+  | OrgDashboardRoute
   | CompareRoute
   | BranchesRoute
   | CommitViewRoute
@@ -2567,7 +2811,10 @@ export type ParsedUiRoute =
   | RenderFileRoute
   | LastCommitRoute
   | BlobExcerptRoute
-  | WikiRawRoute;
+  | WikiRawRoute
+  | RawMediaRoute
+  | OwnerHeatmapRoute
+  | OrgInboxRoute;
 
 
 /**
@@ -2617,6 +2864,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 2) return { family: "explore-root" };
     if (raw.length === 3 && raw[2] === "repos") return { family: "explore-repos" };
     if (raw.length === 3 && raw[2] === "users") return { family: "explore-users" };
+    // The org search page (this wave — upstream web.go:557's literal,
+    // org.go:17's Organizations over the shared tplExploreUsers template).
+    if (raw.length === 3 && raw[2] === "organizations") return { family: "explore-organizations" };
     // Window-2e: the topic search aux feed (pages/search-aux.ts — upstream
     // explore.TopicSearch, web.go:564, optSignIn).
     if (raw.length === 4 && raw[2] === "topics" && raw[3] === "search") {
@@ -2770,17 +3020,66 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // top-level `/-` namespace is otherwise unclaimed (a repo cannot be named
   // "-"), so the exact shapes claim ahead of the dynamic owner/repo parse.
   // Only the landed pages claim: /-/admin (dashboard GET+POST), the four
-  // monitor pages (+ cron run POST), and the three listing literals
+  // monitor pages (+ cron run POST), the three listing literals
   // (users/orgs/repos — static-before-dynamic: any future numeric
   // `/-/admin/users/{id}` arm claims AFTER these; the tail-length guards
-  // keep them unambiguous). Every other /-/* tail stays unclaimed
-  // → the engine's 404.
+  // keep them unambiguous), and the census-R18 (a) arms (emails / hooks /
+  // badges / applications — each module's mount record; the slug families
+  // decode the {badge_slug} segment, the application delete claims the
+  // positive-integer {id}). Every other /-/* tail stays unclaimed
+  // → the engine's 404 (upstream's unregistered-route answer).
   if (raw[1] === "-" && raw[2] === "admin") {
     const tail = raw.slice(3);
     if (tail.length === 0) return { family: "admin-dashboard" };
     if (tail.length === 1 && tail[0] === "users") return { family: "admin-users" };
     if (tail.length === 1 && tail[0] === "orgs") return { family: "admin-orgs" };
     if (tail.length === 1 && tail[0] === "repos") return { family: "admin-repos" };
+    // The R18 emails arm (web.go:821-824's /emails group): the list GET and
+    // the two write POSTs (the module's plain-form arms).
+    if (tail.length === 1 && tail[0] === "emails") return { family: "admin-emails" };
+    if (tail.length === 2 && tail[0] === "emails" && tail[1] === "activate") return { family: "admin-emails-activate" };
+    if (tail.length === 2 && tail[0] === "emails" && tail[1] === "delete") return { family: "admin-emails-delete" };
+    // The R18 hooks arm (web.go:836-846's /hooks group): the two-list GET
+    // + the delete POST; the /{id} edit and /{default-hooks|system-hooks}
+    // add families stay unclaimed (unlanded — the module's dead-link note).
+    if (tail.length === 1 && tail[0] === "hooks") return { family: "admin-hooks" };
+    if (tail.length === 2 && tail[0] === "hooks" && tail[1] === "delete") return { family: "admin-hooks-delete" };
+    // The R18 badges arm (web.go:815-824's /badges group): the catalog
+    // list, the new combo, the slug param families (view/edit-combo/delete/
+    // users-combo + users/delete). The slug segment is the decoded
+    // {badge_slug} — a junk encoding never claims (the null return).
+    if (tail.length === 1 && tail[0] === "badges") return { family: "admin-badges" };
+    if (tail.length === 2 && tail[0] === "badges" && tail[1] === "new") return { family: "admin-badge-new" };
+    if (tail.length >= 3 && tail[0] === "badges" && tail[1] === "slug") {
+      let badgeSlug: string;
+      try {
+        badgeSlug = decodeURIComponent(tail[2] as string);
+      } catch {
+        return null;
+      }
+      if (badgeSlug === "") return null;
+      if (tail.length === 3) return { family: "admin-badge-view", badgeSlug };
+      if (tail.length === 4 && tail[3] === "edit") return { family: "admin-badge-edit", badgeSlug };
+      if (tail.length === 4 && tail[3] === "delete") return { family: "admin-badge-delete", badgeSlug };
+      if (tail.length === 4 && tail[3] === "users") return { family: "admin-badge-users", badgeSlug };
+      if (tail.length === 5 && tail[3] === "users" && tail[4] === "delete") return { family: "admin-badge-users-delete", badgeSlug };
+    }
+    // The R18 applications arm (web.go:865-872's /applications group): the
+    // list GET, the create POST, the positive-integer delete POST. The
+    // /oauth2/{id} edit combo + regenerate_secret stay unclaimed (unlanded
+    // — the module's dead-link note; the engine's 404, upstream's own
+    // unregistered-route answer for the same shapes minus these two).
+    if (tail.length === 1 && tail[0] === "applications") return { family: "admin-applications" };
+    if (tail.length === 2 && tail[0] === "applications" && tail[1] === "oauth2") return { family: "admin-application-create" };
+    if (
+      tail.length === 4 &&
+      tail[0] === "applications" &&
+      tail[1] === "oauth2" &&
+      /^\d+$/.test(tail[2] as string) &&
+      tail[3] === "delete"
+    ) {
+      return { family: "admin-application-delete", applicationId: Number.parseInt(tail[2] as string, 10) };
+    }
     if (tail.length === 2 && tail[0] === "monitor") {
       if (tail[1] === "stats") return { family: "admin-monitor", page: "stats" };
       if (tail[1] === "cron") return { family: "admin-monitor", page: "cron" };
@@ -2806,6 +3105,60 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return null;
     }
     return { family: "org-members", owner: orgName };
+  }
+  // The ORG-scoped inbox families (pages/org-inbox.tsx — this wave's R07):
+  // upstream web.go:986-991's exact 4-/5-segment shapes — the literal `org`
+  // first segment (the /org group registers ahead of the dynamic pairs
+  // upstream, the org-members precedent) + the `{org}` login + the three
+  // overview literals + the optional `{team}` tail. Every other /org/*
+  // shape stays unclaimed → the engine's 404.
+  if (raw.length >= 4 && raw[1] === "org" && (raw[3] === "issues" || raw[3] === "pulls" || raw[3] === "milestones")) {
+    if (raw.length > 5) return null;
+    let orgName: string;
+    try {
+      orgName = decodeURIComponent(raw[2] as string);
+    } catch {
+      return null;
+    }
+    const kind = raw[3];
+    if (raw.length === 4) return { family: "org-inbox", owner: orgName, kind };
+    let team: string;
+    try {
+      team = decodeURIComponent(raw[4] as string);
+    } catch {
+      return null;
+    }
+    return { family: "org-inbox", owner: orgName, kind, team };
+  }
+
+  // The census R06 org dashboard family (pages/org-dashboard.tsx —
+  // upstream's /org/{org}/dashboard[/{team}] literals, web.go:982-985): the
+  // exact-literal posture beside org-members (the literal `org` first
+  // segment + the literal `dashboard` third; a repository path
+  // /org/{repo}/dashboard is shadowed identically upstream). The four-
+  // segment shape is the all-teams arm; the five-segment adds the {team}
+  // tail — ANY decodable segment, resolved case-folded against the org's
+  // team lower names at load (org.go:213-218's EqualFold walk, the
+  // RequireTeamMember arm at org.go:226-236 behind it; a miss 404-shells —
+  // upstream answers its NotFound page for any team param, so the segment
+  // claim is upstream-shaped). The heatmap tails (`/dashboard/-/heatmap[…]`,
+  // R03) and every deeper shape stay unclaimed → the engine's 404.
+  if (raw.length >= 4 && raw.length <= 5 && raw[1] === "org" && raw[3] === "dashboard") {
+    let orgName: string;
+    try {
+      orgName = decodeURIComponent(raw[2] as string);
+    } catch {
+      return null;
+    }
+    if (raw.length === 4) return { family: "org-dashboard", owner: orgName };
+    let teamName: string;
+    try {
+      teamName = decodeURIComponent(raw[4] as string);
+    } catch {
+      return null;
+    }
+    if (teamName === "") return null;
+    return { family: "org-dashboard", owner: orgName, team: teamName };
   }
 
   let owner: string;
@@ -2864,17 +3217,29 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // is the list; `new` the create form (the static literal upstream
   // registers ahead of the {team} param, chi tree order); a positive
   // integer the id-keyed detail slice (the landed /teams/{id} read arms —
-  // PathParamInt64 parity, so "007" parses as 7). Wave 49
+  // PathParamInt64 parity, so "007" parses as 7); any OTHER decoded segment
+  // the R19 NAME carrier — upstream's team page takes any {team} param and
+  // resolves it case-folded against the lower names (web.go:997's param,
+  // org.go:213-218's EqualFold walk), 404-shelling the miss, so the claim
+  // mirrors upstream (the loader reproduces the miss as the shell). Wave 49
   // (pages/org-settings.tsx) adds the {id}/edit combo and the {id}/delete
-  // write (web.go:1011-1013 — the same positive-integer claim). Every other
-  // tail (`/{id}/repositories`, the `/action/*` writes) stays unclaimed →
-  // the engine's 404.
+  // write (web.go:1011-1013 — the same positive-integer claim, keyed on the
+  // id carrier only: a name carrier has no landed edit/delete read arms,
+  // so five-segment name tails stay unclaimed → the engine's 404). Every
+  // other tail (`/{id}/repositories`, the `/action/*` writes) stays
+  // unclaimed → the engine's 404.
   if (repo === "teams") {
     if (raw.length === 3) return { family: "org-teams", owner };
     if (raw.length === 4) {
       if (raw[3] === "new") return { family: "org-team-new", owner };
       if (/^\d+$/.test(raw[3] as string)) {
         return { family: "org-team-detail", owner, id: Number.parseInt(raw[3] as string, 10) };
+      }
+      // The R19 name carrier (the module header's route-shape note).
+      try {
+        return { family: "org-team-detail", owner, name: decodeURIComponent(raw[3] as string) };
+      } catch {
+        return null;
       }
     }
     if (raw.length === 5 && /^\d+$/.test(raw[3] as string)) {
@@ -2934,6 +3299,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       // Window-2b: the blocked_users tab (the committed two-stage module);
       // the actions sub-tab tails are claimed below the length-4 block.
       if (raw[3] === "blocked_users") return { family: "org-settings-blocked", owner };
+      // The R20-a applications tab (the committed module — the list; the
+      // create/delete tails are claimed below the length-4 block).
+      if (raw[3] === "applications") return { family: "org-settings-applications", owner };
+    }
+    if (raw.length === 5 && raw[3] === "applications" && raw[4] === "oauth2") {
+      return { family: "org-settings-applications-create", owner };
     }
     if (raw.length === 5 && raw[3] === "actions" && raw[4] === "secrets") {
       return { family: "org-actions-secrets", owner };
@@ -2962,6 +3333,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 6 && raw[3] === "hooks" && /^-?\d+$/.test(raw[4] as string) && raw[5] === "delete") {
       return { family: "org-settings-hook-delete", owner, id: Number.parseInt(raw[4] as string, 10) };
     }
+    // The R20-a delete tail (the landed arm-scoped convention — upstream's
+    // shared list-template `data-url` target; the integer-id claim is the
+    // hooks-family PathParamInt64 parity). The /oauth2/{id} SHOW/EDIT and
+    // regenerate_secret shapes stay UNCLAIMED → the engine's 404 (no landed
+    // edit page — the module header's reduction).
+    if (raw.length === 7 && raw[3] === "applications" && raw[4] === "oauth2" && /^-?\d+$/.test(raw[5] as string) && raw[6] === "delete") {
+      return { family: "org-settings-applications-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
     return null;
   }
 
@@ -2979,6 +3358,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // not landed.
   if (repo === "-" && raw.length === 4 && raw[3] === "repositories") {
     return { family: "org-repositories", owner };
+  }
+  // The owner heatmap JSON tail (pages/owner-heatmap.ts — this wave):
+  // upstream web.go:1135's `m.Get("/heatmap", user.DashboardHeatmap)` in
+  // the `/{username}/-` group. The exact 4-segment shape claims beside the
+  // repositories/projects literals (disjoint third segments — the `-`
+  // pseudo-segment namespace shadows nothing, the ae32b1a rule; the census's
+  // Open Issues #8 note).
+  if (repo === "-" && raw.length === 4 && raw[3] === "heatmap") {
+    return { family: "owner-heatmap", owner };
   }
   if (repo === "-" && raw.length >= 4 && raw[3] === "projects") {
     if (raw.length === 4) return { family: "owner-projects", owner };
@@ -3182,7 +3570,6 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 0) return { family: "activity-author-data", owner, repo };
     if (rest.length === 1) return { family: "activity-author-data", owner, repo, segment: rest[0] };
   }
-
   // The census R14 repo activity page (web.go:1628-1631 — the /activity
   // group's two page GETs over `repo.Activity`). The period tail is the RAW
   // segment (the activity-author-data convention): activity.go:30-45's
@@ -3431,16 +3818,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return { family: "milestone-detail", owner, repo, id };
   }
   // Wave-13: the compare family (pages/compare.tsx — upstream web.go:1307-
-  // 1315). The bare URL and the `{base}...{head}` tail (FIRST `...` splits
-  // the decoded suffix — strings.Cut parity; refnames can never carry `..`,
-  // so the separator is unambiguous and the emitted links always re-parse to
-  // the same pair). A missing separator makes the whole tail the HEAD
-  // (upstream's single-ref family); an empty side is the default-branch
-  // fallback (the loader's util.IfZero arm). The `..` two-dot family
-  // (DirectComparison — a different diff semantic, not a landed surface) and
-  // the `{owner}/{repo}:{head}` fork forms (colon-bearing sides; forks
-  // cannot exist yet, SPEC-0003) stay unclaimed → the engine's 404, exactly
-  // upstream's unregistered-route answer for this slice.
+  // 1315). The bare URL and the full ParseCompareRouterParam tail grammar:
+  // the FIRST `...` splits the decoded suffix (strings.Cut parity), else the
+  // first `..` (the two-dot DirectComparison arm — the feeds module's
+  // parseCompareBaseHead semantics, landed here for the page), else the
+  // whole tail is the HEAD (upstream's single-ref family); an empty side is
+  // the default-branch fallback (the loader's util.IfZero arm) and the head
+  // part carries the fork forms (`{owner}:{ref}` / `{owner}/{repo}:{ref}` —
+  // parseHead; the fork-edge resolution landed with the API's fork-PR flow).
   if (head === "wiki") {
     // Window-2e C2: the WIKI family (pages/repo-wiki.tsx — upstream
     // web.go:1611-1617's two combos; the SUB-PAGES dispatch on the
@@ -3459,14 +3844,24 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return { family: "wiki", owner, repo, rawTail };
   }
   if (head === "compare") {
-    if (rest.length === 0) return { family: "compare", owner, repo, base: null, head: null };
+    const bare: CompareRoute = {
+      family: "compare",
+      owner,
+      repo,
+      base: null,
+      head: null,
+      separator: "...",
+      headOwner: null,
+      headRepoName: null,
+    };
+    if (rest.length === 0) return bare;
     let suffix: string;
     try {
       suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
     } catch {
       return null;
     }
-    if (suffix === "") return { family: "compare", owner, repo, base: null, head: null };
+    if (suffix === "") return bare;
     // Window-2e B2: the .diff/.patch byte feeds (web.go:1309-1310) — claim
     // the suffixed tails BEFORE the page family returns (they would
     // otherwise fall into the single-ref family and 404 at resolution).
@@ -3476,20 +3871,69 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (suffix.endsWith(".patch")) {
       return { family: "compare-feed", owner, repo, ext: "patch", segment: suffix.slice(0, -6) };
     }
-    const separator = suffix.indexOf("...");
-    if (separator < 0) {
-      if (suffix.includes("..") || suffix.includes(":")) return null;
-      return { family: "compare", owner, repo, base: null, head: suffix };
+    // ParseCompareRouterParam (routers/common/compare.go:74-102): the FIRST
+    // `...` splits; failing that, the first `..` (DirectComparison);
+    // failing both, the whole tail is the HEAD (separator stays `...`).
+    let separator: "..." | "..";
+    let basePart: string;
+    let headPart: string;
+    const tri = suffix.indexOf("...");
+    if (tri >= 0) {
+      separator = "...";
+      basePart = suffix.slice(0, tri);
+      headPart = suffix.slice(tri + 3);
+    } else {
+      const bi = suffix.indexOf("..");
+      if (bi >= 0) {
+        separator = "..";
+        basePart = suffix.slice(0, bi);
+        headPart = suffix.slice(bi + 2);
+      } else {
+        separator = "...";
+        basePart = "";
+        headPart = suffix;
+      }
     }
-    const base = suffix.slice(0, separator);
-    const headSide = suffix.slice(separator + 3);
-    if (base.includes("..") || base.includes(":") || headSide.includes("..") || headSide.includes(":")) return null;
+    // parseHead (compare.go:36-46) — the fork forms live on the HEAD part
+    // only; the head REF is everything after the FIRST colon. A leading-
+    // slash repo part (`/{repo}:{ref}`) is upstream's "head owner must be
+    // specified" unsupported-syntax invalid-argument → the 404 class.
+    let headOwner: string | null = null;
+    let headRepoName: string | null = null;
+    let headRef = headPart;
+    const colon = headPart.indexOf(":");
+    if (colon >= 0) {
+      const ownerRepo = headPart.slice(0, colon);
+      headRef = headPart.slice(colon + 1);
+      const slash = ownerRepo.indexOf("/");
+      if (slash > 0) {
+        headOwner = ownerRepo.slice(0, slash);
+        headRepoName = ownerRepo.slice(slash + 1);
+      } else if (slash < 0) {
+        headOwner = ownerRepo;
+      } else {
+        return null;
+      }
+      // parseHead's empty parts fold to upstream's simpler families: an
+      // empty owner (`/:ref`) is the bare single-ref form, an empty repo
+      // name (`{owner}/:{ref}`) is the bare `{owner}:{ref}` fork form
+      // (GetHeadOwnerAndRepo branches on the empty strings).
+      if (headOwner === "") headOwner = null;
+      if (headRepoName === "") headRepoName = null;
+    }
+    // Refname impossibilities inside the sides (`..` never appears in a
+    // refname; the BASE part never carries a fork form): unresolvable
+    // upstream → the same 404 shell via null.
+    if (basePart.includes("..") || basePart.includes(":") || headRef.includes("..")) return null;
     return {
       family: "compare",
       owner,
       repo,
-      base: base === "" ? null : base,
-      head: headSide === "" ? null : headSide,
+      base: basePart === "" ? null : basePart,
+      head: headRef === "" ? null : headRef,
+      separator,
+      headOwner,
+      headRepoName,
     };
   }
   // Wave-16 branches family (pages/branches.tsx — upstream web.go:1478-1482's
@@ -3629,6 +4073,47 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
           refType: rest[0],
           refSuffix: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
         };
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+  // The RAW + MEDIA byte-serving families (pages/raw-files.ts — upstream
+  // web.go:1699-1713's two groups, the survey's PARTIAL rows this wave
+  // closes): the same three shapes the /render group claims, plus the
+  // DEPRECATED catch-all upstream mounts as `m.Get("/*", RepoRefByType(""))`
+  // — getRefNameLegacy's guess (branch → tag → 7..64-hex → the default-
+  // branch fallback). The catch-all claims ≥1 segment: chi's `/*` wildcard
+  // does not match the bare literal, so a bare `/raw`/`/media` stays
+  // unclaimed → the engine's 404, exactly upstream. chi's
+  // static-before-wildcard ranking (`/blob/{sha}` and the typed literals
+  // beat `/*`) is the arm order below.
+  if (head === "raw" || head === "media") {
+    const family = head === "raw" ? "raw-file" : "media-file";
+    if (rest.length === 2 && rest[0] === "blob") {
+      try {
+        return { family, owner, repo, sha: decodeURIComponent(rest[1] as string) };
+      } catch {
+        return null;
+      }
+    }
+    if (rest.length >= 2 && (rest[0] === "branch" || rest[0] === "tag" || rest[0] === "commit")) {
+      try {
+        return {
+          family,
+          owner,
+          repo,
+          refType: rest[0],
+          refSuffix: rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/"),
+        };
+      } catch {
+        return null;
+      }
+    }
+    if (rest.length >= 1) {
+      try {
+        return { family, owner, repo, legacySuffix: rest.map((segment) => decodeURIComponent(segment)).join("/") };
       } catch {
         return null;
       }
@@ -3861,6 +4346,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
   } catch {
     return null;
+  }
+  // The blame page family (web.go:1729-1733's /blame/{branch,tag,commit}/*):
+  // the typed tails claim every rest INCLUDING a bare refType (chi's `/*`
+  // matches the empty tail after /blame/branch — RefBlame resolves the ref
+  // and its empty-TreePath arm NotFounds, which the loader's splitRefSuffix
+  // walk reproduces as the 404 shell). The bare `/blame` is unclaimed — no
+  // upstream route (the editor-literal convention), the engine answers.
+  if (head === "blame") {
+    if (rest.length === 0) return null;
+    return { family: "blame", owner, repo, refSuffix: suffix };
   }
   if (head === "commits") return { family: "commits", owner, repo, refSuffix: rest.length > 0 ? suffix : null };
   if (head === "src") return { family: "src", owner, repo, refSuffix: rest.length > 0 ? suffix : null };
@@ -5011,7 +5506,7 @@ async function repoActivityPage(c: Context<{ Bindings: Env }>): Promise<Response
 }
 
 /** GET /{owner}/{repo}/comments/{id}/attachments (the fragment module's
- *  HANDOFF, web.go:1337): the repo-level comments head, GET-only; the
+ *  mount record, web.go:1337): the repo-level comments head, GET-only; the
  *  404 shells and the type-gate 500 live in the module's outcome union. */
 async function commentAttachmentsRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
@@ -5523,7 +6018,7 @@ async function ownerHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
   // the SAME profile route's user half — the org half above already ignored
   // the query (org.Home has no activity arm), the user half renders the
   // wave-50 feeds page instead of the repositories default (the module
-  // header's HANDOFF NOTE, this window's mount).
+  // header's mount record, this window's mount).
   if (url.searchParams.get("tab") === "activity") {
     const data = await loadActivityFeedsData(c.env.DB, profile.user, viewer, url.origin, url.searchParams);
     return respond(c.html(renderActivityFeedsPage(ctx, data), 200));
@@ -6234,16 +6729,22 @@ async function orgTeamsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   return respond(c.html(renderOrgTeamsPage(ctx, data), 200));
 }
 
-/** GET /{org}/teams/{id} (pages/org-teams.tsx — the detail slice: the
- *  members list + the repo-access list; an unknown or foreign-org id
- *  404-shells). */
+/** GET /{org}/teams/{id|name} (pages/org-teams.tsx — the detail slice: the
+ *  members list + the repo-access list; an unknown or foreign-org carrier
+ *  404-shells — id per getTeamById, name per the R19 case-folded lower_name
+ *  lookup, loadOrgTeamDetailDataByName). */
 async function orgTeamDetailPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveOrgTeamsRequest(c);
   if (!resolved.ok) return resolved.response;
   const { ctx, respond } = resolved;
   const route = resolved.route;
-  if (route.family !== "org-team-detail" || route.id === undefined) return respond(await c.notFound()); // drift guard
-  const data = await loadOrgTeamDetailData(c.env.DB, resolved.org, route.id);
+  if (route.family !== "org-team-detail") return respond(await c.notFound()); // drift guard
+  const data =
+    route.id !== undefined
+      ? await loadOrgTeamDetailData(c.env.DB, resolved.org, route.id)
+      : route.name !== undefined
+        ? await loadOrgTeamDetailDataByName(c.env.DB, resolved.org, route.name)
+        : null;
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderOrgTeamDetailPage(ctx, data), 200));
 }
@@ -6280,6 +6781,51 @@ async function orgTeamNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response
     return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/teams/${result.team.id}` } }));
   }
   return respond(c.html(renderOrgTeamNewPage(ctx, { org, form, error: result.message }), 200));
+}
+
+// ---------------------------------------------------------------------------
+// The census R06 org dashboard (pages/org-dashboard.tsx — upstream's
+// /org/{org}/dashboard[/{team}] literals, web.go:982-985)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /org/{org}/dashboard[/{team}] (pages/org-dashboard.tsx — the
+ * member-only org dashboard; upstream `user.Dashboard` under
+ * `OrgAssignment{RequireMember, RequireTeamMember}`). The ladder: the
+ * session half, the drift guard, the org resolution (a renamed org 307s, a
+ * miss 404-shells), then upstream's RequireMember — anonymous AND signed-in
+ * non-members 404-shell (upstream's NotFound; the group is not reqSignIn'd,
+ * so there is NO login redirect — the census's Open Issues #9 posture).
+ * The {team} tail: the case-folded lower-name resolution (org.go:213-218;
+ * a miss shells like upstream's teamExists arm) behind RequireTeamMember
+ * (org.go:226-236 — owner/site-admin pass, a plain member needs the
+ * team_members row).
+ */
+async function orgDashboardPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-dashboard") return respond(await c.notFound()); // drift guard
+  const doer = orgFamilyDoer(viewer);
+  const org = await resolveOrgDashboardOrg(c.env.DB, route.owner, doer, url.pathname, orgFamilyQuery(url));
+  if (org.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: org.location } }));
+  }
+  if (org.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  if (!(await isOrgDashboardMember(c.env.DB, org.org, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  let team: TeamRecord | null = null;
+  if (route.team !== undefined) {
+    team = await resolveDashboardTeam(c.env.DB, org.org, route.team);
+    if (team === null || !(await isOrgDashboardTeamMember(c.env.DB, org.org, team, viewer))) {
+      return respond(c.html(renderNotFound(ctx), 404));
+    }
+  }
+  const data = await loadOrgDashboardData(c.env.DB, org.org, viewer, url.origin, url.searchParams, team);
+  const viewerName = viewer.kind === "user" ? viewer.username : "";
+  return respond(c.html(renderOrgDashboardPage(ctx, data, viewerName), 200));
 }
 
 // ---------------------------------------------------------------------------
@@ -6767,6 +7313,81 @@ async function orgActionsVariablesDelete(c: Context<{ Bindings: Env }>, variable
 }
 
 // ---------------------------------------------------------------------------
+// The census R20 (a) arm: the org settings applications tab (pages/
+// org-settings-applications.tsx — upstream web.go:1027-1037's /applications
+// group; the org-OWNED oauth2 applications over the landed service's
+// uid-parameterized arms keyed on the org's id). Same prologue, drift
+// guards, sameOriginGuard-first POSTs as the whole /settings family.
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /{org}/settings/applications (pages/org-settings-applications.tsx —
+ * upstream org.Applications, setting_oauth2.go:34-54, over the landed
+ * listOAuth2Applications read keyed uid=org.id): the shared prologue, the
+ * drift guard, then the load → render at 200.
+ */
+async function orgApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond } = resolved;
+  if (resolved.route.family !== "org-settings-applications") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgSettingsApplications(c.env.DB, resolved.org);
+  return respond(c.html(renderOrgApplicationsPage({ ctx, data, error: null }), 200));
+}
+
+/**
+ * POST /{org}/settings/applications/oauth2 — the create (upstream
+ * OAuthApplicationsPost → AddApp's write half, oauth2_common.go:56-88): the
+ * §2.8 guard, the shared prologue, the drift guard, then the form write.
+ * Upstream answers success by rendering the EDIT page with the once-only
+ * secret; with no landed edit page the honest no-JS analog is the FULL LIST
+ * re-rendered at 200 carrying the once-only secret (the admin applications
+ * page's exact reduction — the module header). An invalid form re-renders
+ * at 200 with the banner + the kept submission (the org-team-new
+ * RenderWithErr arm; upstream flashes and redirects to the list).
+ */
+async function orgApplicationsCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-applications-create") return respond(await c.notFound()); // drift guard
+  const form = parseOrgApplicationCreateForm(await readUrlEncodedForm(c.req.raw));
+  const result = await applyOrgApplicationCreate(c.env.DB, org, form);
+  if (result.outcome === "created") {
+    const data = await loadOrgSettingsApplications(c.env.DB, org);
+    data.newClientSecret = result.secret;
+    data.newClientId = result.row.clientId;
+    return respond(c.html(renderOrgApplicationsPage({ ctx, data, error: null }), 200));
+  }
+  const data = await loadOrgSettingsApplications(c.env.DB, org);
+  data.form = form;
+  return respond(c.html(renderOrgApplicationsPage({ ctx, data, error: result.message }), 200));
+}
+
+/**
+ * POST /{org}/settings/applications/oauth2/{id}/delete — the delete
+ * (upstream DeleteApp's write half, oauth2_common.go:177-193, over the
+ * landed (id, uid=org.id) delete): success 303s onto the list (upstream
+ * JSONRedirect's target); a miss 404-shells (the org hooks-page delete
+ * convention and the admin page's identical posture — upstream
+ * ServerErrors a miss instead, the module header's documented divergence;
+ * existence stays hidden either way).
+ */
+async function orgApplicationsDeleteSubmit(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-applications-delete") return respond(await c.notFound()); // drift guard
+  const deleted = await deleteOrgApplication(c.env.DB, org, id);
+  if (!deleted) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/applications` } }));
+}
+
+// ---------------------------------------------------------------------------
 // Window-2c: the admin pages (pages/admin-dashboard.tsx +
 // pages/admin-monitor.tsx — upstream's SignInRequired+AdminRequired gate,
 // web.go:779: anonymous 303s onto the login round-trip, a signed-in
@@ -6868,6 +7489,333 @@ async function adminReposPage(c: Context<{ Bindings: Env }>): Promise<Response> 
   if (!p.ok) return p.response;
   const data = await loadAdminReposData(c.env.DB, p.ctx.viewer, new URL(c.req.raw.url).searchParams);
   return p.respond(c.html(renderAdminReposPage(p.ctx, data)));
+}
+
+// --- the census R18 (a) arms (pages/admin-emails.tsx / admin-hooks.tsx /
+// admin-badges.tsx / admin-applications.tsx — upstream's /-/admin emails,
+// hooks, badges, applications groups; each rides the shared
+// adminPagePrologue; the writes add the §2.8 sameOriginGuard) --------------
+
+/** GET /-/admin/emails (pages/admin-emails.tsx): the prologue → the union
+ *  listing (the loader takes the doer id — the CanChange formula's input,
+ *  collapsed in this store per the module header). */
+async function adminEmailsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const viewer = p.ctx.viewer;
+  const doerId = viewer.kind === "user" ? viewer.id : 0;
+  const data = await loadAdminEmailsData(c.env.DB, doerId, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminEmailsPage(p.ctx, data)));
+}
+
+/** The emails activate/delete POSTs' shared redirect builder — upstream's
+ *  redirect-with-preserved-query arm (emails.go:126-141): q + sort (when
+ *  not the default) + is_primary + is_activated. */
+function adminEmailsRedirect(search: URLSearchParams): string {
+  const params = parseAdminEmailsListParams(search);
+  const next = new URLSearchParams();
+  if (params.keyword !== "") next.set("q", params.keyword);
+  if (params.sort !== "email") next.set("sort", params.sort);
+  if (params.isPrimary !== null) next.set("is_primary", params.isPrimary);
+  if (params.isActivated !== null) next.set("is_activated", params.isActivated);
+  const qs = next.toString();
+  return qs === "" ? "/-/admin/emails" : `/-/admin/emails?${qs}`;
+}
+
+/**
+ * POST /-/admin/emails/activate (pages/admin-emails.tsx — upstream
+ * ActivateEmail, emails.go:101-153): the §2.8 guard + the prologue, the
+ * four-field bind (malformed → the handler's 400), then the write — every
+ * outcome 303s back onto the list with the preserved query (the module's
+ * no-flash reduction; the flash arms have no renderable analog).
+ */
+async function adminEmailsActivate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminEmailActivateForm(await readUrlEncodedForm(c.req.raw));
+  if (!adminEmailActivateFormValid(form)) {
+    return p.respond(new Response("bad request", { status: 400 }));
+  }
+  await applyAdminEmailActivate(c.env.DB, form);
+  return p.respond(
+    new Response(null, {
+      status: 303,
+      headers: { location: adminEmailsRedirect(new URL(c.req.raw.url).searchParams) },
+    }),
+  );
+}
+
+/**
+ * POST /-/admin/emails/delete (upstream DeleteEmail, emails.go:155-187):
+ * the same ladder; the lookup misses 303 silently (the stale-form posture —
+ * the module header's note on upstream's ServerError arms).
+ */
+async function adminEmailsDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminEmailDeleteForm(await readUrlEncodedForm(c.req.raw));
+  await applyAdminEmailDelete(c.env.DB, form);
+  return p.respond(
+    new Response(null, {
+      status: 303,
+      headers: { location: adminEmailsRedirect(new URL(c.req.raw.url).searchParams) },
+    }),
+  );
+}
+
+/** GET /-/admin/hooks (pages/admin-hooks.tsx): the prologue → the two-list
+ *  read (system first, then default — the template's render order). */
+async function adminHooksPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminHooksData(c.env.DB);
+  return p.respond(c.html(renderAdminHooksPage(p.ctx, data)));
+}
+
+/** POST /-/admin/hooks/delete (upstream DeleteDefaultOrSystemWebhook): the
+ *  id into the landed global delete; every outcome 303s back onto the list
+ *  (the flash texts do not render — the module's no-flash note; an unknown
+ *  id is the silent stale-form arm). */
+async function adminHooksDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = await readUrlEncodedForm(c.req.raw);
+  const id = Number.parseInt(form.get("id") ?? "0", 10) || 0;
+  await applyAdminHookDelete(c.env.DB, id);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/hooks" } }));
+}
+
+/** GET /-/admin/badges (pages/admin-badges.tsx): the prologue → the
+ *  catalog listing. */
+async function adminBadgesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminBadgesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminBadgesPage(p.ctx, data)));
+}
+
+/**
+ * GET /-/admin/badges/new (upstream NewBadge): the empty create form. POST
+ * (NewBadgePost) re-renders with the error on the invalid/taken arms (the
+ * module's re-render reduction) and 303s onto the new badge's view page on
+ * success (upstream's JSONRedirect target, badges.go:80).
+ */
+async function adminBadgeNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  return p.respond(
+    c.html(renderAdminBadgeNewPage(p.ctx, { form: { slug: "", description: "", imageUrl: "" }, error: null })),
+  );
+}
+
+async function adminBadgeNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminBadgeForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await createBadgeFromForm(c.env.DB, form);
+  if (outcome === "created") {
+    return p.respond(
+      new Response(null, { status: 303, headers: { location: `/-/admin/badges/slug/${encodeURIComponent(form.slug)}` } }),
+    );
+  }
+  const error =
+    outcome === "slug-taken" ? adminBadgesLocale.slug_been_taken : adminBadgesLocale.required_field;
+  return p.respond(c.html(renderAdminBadgeNewPage(p.ctx, { form, error })));
+}
+
+/** GET /-/admin/badges/slug/{slug} (upstream ViewBadge): the badge info +
+ *  the users preview (page 1); an unknown slug 303s back to the list
+ *  (prepareBadgeInfo's redirect arm, badges.go:84-92 — upstream's own
+ *  NotFound reduction for the miss). */
+async function adminBadgeViewPage(c: Context<{ Bindings: Env }>, badgeSlug: string): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const badge = await getBadgeBySlug(c.env.DB, badgeSlug);
+  if (badge === null) {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/badges" } }));
+  }
+  const usersPage = await getBadgeUsersPage(c.env.DB, badgeSlug, 1);
+  return p.respond(
+    c.html(
+      renderAdminBadgeViewPage(p.ctx, {
+        badge,
+        usersTotal: usersPage.total,
+        usersPreview: usersPage.items.map((user) => ({ id: user.id, username: user.username })),
+      }),
+    ),
+  );
+}
+
+/**
+ * GET+POST /-/admin/badges/slug/{slug}/edit (upstream EditBadge /
+ * EditBadgePost): the badge-scoped edit form; the POST re-renders with the
+ * error on the invalid arm (the module's reduction) and 303s back onto the
+ * view page on success (upstream's JSONRedirect target, badges.go:128). An
+ * unknown slug 303s to the list (prepareBadgeInfo's arm).
+ */
+async function adminBadgeEditPage(c: Context<{ Bindings: Env }>, badgeSlug: string): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const badge = await getBadgeBySlug(c.env.DB, badgeSlug);
+  if (badge === null) {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/badges" } }));
+  }
+  const data: AdminBadgeEditData = {
+    badge,
+    form: { description: badge.description ?? "", imageUrl: badge.imageUrl ?? "" },
+    error: null,
+  };
+  return p.respond(c.html(renderAdminBadgeEditPage(p.ctx, data)));
+}
+
+async function adminBadgeEditSubmit(c: Context<{ Bindings: Env }>, badgeSlug: string): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const badge = await getBadgeBySlug(c.env.DB, badgeSlug);
+  if (badge === null) {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/badges" } }));
+  }
+  const form = parseAdminBadgeForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await updateBadgeFromForm(c.env.DB, badgeSlug, {
+    description: form.description,
+    imageUrl: form.imageUrl,
+  });
+  if (outcome === "updated") {
+    return p.respond(new Response(null, { status: 303, headers: { location: `/-/admin/badges/slug/${encodeURIComponent(badgeSlug)}` } }));
+  }
+  const data: AdminBadgeEditData = {
+    badge,
+    form: { description: form.description, imageUrl: form.imageUrl },
+    error: adminBadgesLocale.required_field,
+  };
+  return p.respond(c.html(renderAdminBadgeEditPage(p.ctx, data)));
+}
+
+/** POST /-/admin/badges/slug/{slug}/delete (upstream DeleteBadge): the
+ *  edges-then-badge delete; every outcome 303s back onto the list
+ *  (badges.go:143's redirect; the flash text does not render). */
+async function adminBadgeDeleteSubmit(c: Context<{ Bindings: Env }>, badgeSlug: string): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  await deleteBadgeBySlug(c.env.DB, badgeSlug);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/badges" } }));
+}
+
+/**
+ * GET+POST /-/admin/badges/slug/{slug}/users + POST .../users/delete
+ * (upstream BadgeUsers / BadgeUsersPost / DeleteBadgeUser): the paged user
+ * list, the add-by-name form (the error arms re-render with the upstream
+ * message lines — the one write whose errors are user-actionable), and the
+ * remove form. An unknown slug 303s to the list (the prepareBadgeInfo arm).
+ */
+async function adminBadgeUsersPage(c: Context<{ Bindings: Env }>, badgeSlug: string, error: string | null, submittedUser: string): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const badge = await getBadgeBySlug(c.env.DB, badgeSlug);
+  if (badge === null) {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/badges" } }));
+  }
+  const search = new URL(c.req.raw.url).searchParams;
+  const page = parsePageNumber(search.get("page"));
+  const usersPage = await getBadgeUsersPage(c.env.DB, badgeSlug, page);
+  const query = new URLSearchParams();
+  const data: AdminBadgeUsersData = {
+    badge,
+    items: usersPage.items.map((user) => ({ id: user.id, username: user.username, fullName: user.fullName })),
+    total: usersPage.total,
+    more: usersPage.more,
+    page,
+    query,
+    error,
+    submittedUser,
+  };
+  return p.respond(c.html(renderAdminBadgeUsersPage(p.ctx, data)));
+}
+
+async function adminBadgeUsersAdd(c: Context<{ Bindings: Env }>, badgeSlug: string): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = await readUrlEncodedForm(c.req.raw);
+  const rawName = form.get("user") ?? "";
+  const outcome = await addBadgeUserByName(c.env.DB, badgeSlug, rawName);
+  const error =
+    outcome === "user-missing"
+      ? adminBadgesLocale.user_not_exist
+      : outcome === "badge-missing"
+        ? adminBadgesLocale.badge_not_found
+        : outcome === "already-has"
+          ? adminBadgesLocale.user_already_has
+          : null;
+  // Upstream redirects back onto the users page with the flash; the re-render
+  // carries the message inline (the module's reduction note).
+  return adminBadgeUsersPage(c, badgeSlug, error, outcome === "added" ? "" : rawName);
+}
+
+async function adminBadgeUsersDelete(c: Context<{ Bindings: Env }>, badgeSlug: string): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = await readUrlEncodedForm(c.req.raw);
+  const id = Number.parseInt(form.get("id") ?? "0", 10) || 0;
+  await removeBadgeUser(c.env.DB, badgeSlug, id);
+  return p.respond(
+    new Response(null, { status: 303, headers: { location: `/-/admin/badges/slug/${encodeURIComponent(badgeSlug)}/users` } }),
+  );
+}
+
+/** GET /-/admin/applications (pages/admin-applications.tsx): the prologue →
+ *  the uid=0 instance-wide list. */
+async function adminApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminApplicationsData(c.env.DB);
+  return p.respond(c.html(renderAdminApplicationsPage(p.ctx, data)));
+}
+
+/**
+ * POST /-/admin/applications/oauth2 (upstream ApplicationsPost → AddApp):
+ * the §2.8 guard + the prologue, the textarea form (redirect URIs
+ * one-per-line), then the landed create — the invalid arms re-render the
+ * full page with the error + the submitted values, the created arm
+ * re-renders with the once-only secret (the module's reduction notes).
+ */
+async function adminApplicationCreate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminApplicationCreateForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyAdminApplicationCreate(c.env.DB, form);
+  return p.respond(c.html(renderAdminApplicationsPage(p.ctx, outcome.data)));
+}
+
+/** POST /-/admin/applications/oauth2/{id}/delete (upstream DeleteApp): the
+ *  (id, uid=0) delete — the miss 404-shells (upstream NotFound on the same
+ *  arm), the hit 303s back onto the list. */
+async function adminApplicationDelete(c: Context<{ Bindings: Env }>, applicationId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  if (!(await applyAdminApplicationDelete(c.env.DB, applicationId))) {
+    return p.respond(c.html(renderNotFound(p.ctx), 404));
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/applications" } }));
 }
 
 /**
@@ -7225,6 +8173,77 @@ async function exploreUsersPage(c: Context<{ Bindings: Env }>): Promise<Response
   const { url, ctx, respond } = resolved;
   const data = await loadExploreUsersData(c.env.DB, url.searchParams);
   return respond(c.html(renderExploreUsersPage(ctx, data), 200));
+}
+
+/** GET /explore/organizations (pages/explore.tsx — this wave's org search
+ *  page; org.go:17's Organizations over the same tplExploreUsers template —
+ *  anonymous sees public orgs, a signed-in viewer all three visibilities,
+ *  org.go:31-34's switch). */
+async function exploreOrganizationsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  const data = await loadExploreOrganizationsData(c.env.DB, viewer, url.searchParams);
+  return respond(c.html(renderExploreOrganizationsPage(ctx, data), 200));
+}
+
+/** GET /{username}/-/heatmap (pages/owner-heatmap.ts — this wave's web JSON
+ *  arm; upstream heatmap.go:32-63's DashboardHeatmap): the owner resolves
+ *  through the profile page's seam (the IsUserVisibleToViewer ladder — the
+ *  gate's miss is the 404 shell; a renamed user 307s like the page), then
+ *  the re-issued aggregation answers the web pair shape. */
+async function ownerHeatmapData(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, viewer, respond } = resolved;
+  if (route.family !== "owner-heatmap") return respond(await c.notFound()); // drift guard
+  const doer: ProfileDoer =
+    viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false };
+  const owner = await resolveUserProfile(c.env.DB, route.owner, doer, resolved.url.pathname, resolved.url.search);
+  if (owner.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: owner.location } }));
+  }
+  if (owner.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const load = await loadOwnerHeatmapData(c.env.DB, owner.user);
+  if (load === null) return respond(c.html(renderNotFound(ctx), 404)); // the gate's miss class
+  return respond(c.json(JSON.parse(ownerHeatmapJsonBody(load))));
+}
+
+/**
+ * GET /org/{org}/{issues|pulls|milestones}[/{team}] (pages/org-inbox.tsx —
+ * this wave's R07): the RequireMember/RequireTeamMember ladder — anonymous
+ * and non-members 404-shell (OrgAssignment never 303s), a renamed org 307s
+ * — then the parameterized overview loaders with the org repo-set scope.
+ */
+async function orgInboxPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, viewer, respond } = resolved;
+  if (route.family !== "org-inbox") return respond(await c.notFound()); // drift guard
+  const resolution = await resolveOrgInbox(
+    c.env.DB,
+    route.owner,
+    viewer,
+    resolved.url.pathname,
+    resolved.url.search,
+    route.team ?? null,
+  );
+  if (resolution.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: resolution.location } }));
+  }
+  if (resolution.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const kind: OrgInboxKind = route.kind;
+  const chrome = {
+    orgName: resolution.org.username,
+    visibility: resolution.org.visibility,
+    teamName: resolution.scope.teamName,
+  };
+  if (kind === "milestones") {
+    const data = await loadOrgInboxMilestonesData(c.env.DB, viewer, resolved.url.searchParams, resolution.scope);
+    return respond(c.html(renderOrgInboxMilestonesPage(ctx, data, chrome), 200));
+  }
+  const data = await loadOrgInboxIssuesData(c.env.DB, viewer, kind, resolved.url.searchParams, resolution.scope);
+  return respond(c.html(renderOrgInboxIssuesPage(ctx, data, chrome), 200));
 }
 
 // ---------------------------------------------------------------------------
@@ -7619,9 +8638,17 @@ async function pullReviewDismissSubmit(c: Context<{ Bindings: Env }>): Promise<R
 
 /** GET /{owner}/{repo}/compare[/{base}...{head}] (pages/compare.tsx — the
  *  comparison view; every viewer who can see the repo reads it; the create
- *  form's writer gate rides along as `canCreate` — the branch-kinds arm
+ *  form's pulls-reader gate rides along as `canCreate` — the branch-kinds arm
  *  (upstream allowCreatePull's IsBranch pair) reads the loaded data, so the
- *  gate computes AFTER the load). */
+ *  gate computes AFTER the load. The gate is the READ grant the prologue
+ *  already ran: upstream's template arm `and .IsSigned .PageIsComparePull`
+ *  over allowCreatePull's `permBase.CanReadIssuesOrPulls(true)`
+ *  (routers/web/repo/compare.go:305) admits any pulls reader, and the §2.5
+ *  resolveRepositoryForViewer grant IS that read for the always-on pulls
+ *  unit — the former `canWriteRepo` divergence is flipped (the fork-PR
+ *  author holds no write on the base; upstream's POST chain admits the same
+ *  class via reqUnitPullsReader, web.go:933 + services/context/permission.go:
+ *  64-76). */
 async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
@@ -7637,7 +8664,11 @@ async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
       isEmpty: repo.isEmpty,
       defaultBranch: repo.defaultBranch,
     };
-  const result = await loadCompareFeed(c.env, repoFeed, route.segment, route.ext);
+  // The viewer wiring (the compare unit's open issue 1): passing the
+  // route-prologue viewer activates the loader's full §2.5 arm — the signed-in
+  // reader's grant resolves on the head repo (private forks serve their
+  // readers; anonymous keeps the conservative public-only grant).
+  const result = await loadCompareFeed(c.env, repoFeed, route.segment, route.ext, viewer);
   if (result.kind === "notFound") return respond(c.html(renderNotFound(ctx), 404));
   if (result.kind === "noMergeBase") return respond(compareFeedServerErrorResponse());
   return respond(compareFeedTextResponse(result.body));
@@ -7645,14 +8676,25 @@ async function comparePage(c: Context<{ Bindings: Env }>): Promise<Response> {
 
   if (route.family !== "compare") return respond(await c.notFound()); // registration/parser drift guard
   const page = parsePageNumber(url.searchParams.get("page"));
-  const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
+  const data = await loadCompareData(c.env, c.env.DB, repo, {
+    base: route.base,
+    head: route.head,
+    headOwner: route.headOwner,
+    headRepoName: route.headRepoName,
+    separator: route.separator,
+    viewer,
+    page,
+  });
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  // The pulls-reader gate (upstream GET: the template's `.IsSigned` arm over
+  // allowCreatePull's CanReadIssuesOrPulls(true), compare.go:305 — the
+  // signed-in fork-PR author's own shape; the read grant itself is the
+  // prologue's resolveRepositoryForViewer, satisfied by reaching this line).
   const canCreate =
     !repo.isArchived &&
     viewer.kind === "user" &&
     data.baseKind === "branch" &&
-    data.headKind === "branch" &&
-    (await canWriteRepo(c.env, repo, viewer));
+    data.headKind === "branch";
   return respond(
     c.html(
       renderComparePage({
@@ -7844,11 +8886,15 @@ async function wikiSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
  * POST /{owner}/{repo}/compare/{base}...{head} (upstream
  * CompareAndPullRequestPost, routers/web/repo/pull.go:1318, over the landed
  * create route's arms): the §2.8 Origin guard, the repo→viewer order, the
- * WRITER gate (`canWriteRepo` — the landed canWriteRepository through
- * ../repo-grants.ts; a signed-in
- * non-writer 404-shells like the editor surfaces, anonymous 303s onto the
- * login round-trip; upstream admits any pulls-reader, the pages/compare.tsx
- * header documents the divergence), then the landed create arms in the API
+ * PULLS-READER gate (upstream's chain web.go:1312 `reqSignIn,
+ * RepoMustNotBeArchived, reqUnitPullsReader` — reqUnitPullsReader is
+ * RequireUnitReader(unit.TypePullRequests), web.go:933 +
+ * services/context/permission.go:64-76, a 404 on the CANREAD miss; the
+ * always-on pulls unit reads through the §2.5 grant the prologue already
+ * ran, so the signed-in viewer passes and the archived arm 404-shells;
+ * anonymous 303s onto the login round-trip — reqSignIn runs BEFORE the unit
+ * check; the former `canWriteRepo` divergence is flipped — the fork-PR
+ * author holds no write on the base), then the landed create arms in the API
  * route's order (head === base, no common history, equal tips, duplicate,
  * empty title) — every refusal re-renders the compare page at 200 with the
  * message and the submitted values (the login failure convention). Success
@@ -7865,8 +8911,12 @@ async function compareSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   // The bare URL carries no form (nothing to compare) — the registration
   // answers it with chi's 405; a null-side tail POST is hand-crafted (404).
   if (route.family !== "compare" || route.head === null) return respond(await c.notFound());
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
-  if (repo.isArchived || !(await canWriteRepo(c.env, repo, viewer))) {
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname)); // reqSignIn (web.go:1312)
+  // RepoMustNotBeArchived + reqUnitPullsReader (web.go:1312): the archived
+  // arm 404-shells; the pulls-unit read is the §2.5 grant the prologue ran
+  // (every signed-in viewer who sees the repo reads its pulls), so the
+  // reader passes — the flipped writer gate.
+  if (repo.isArchived) {
     return respond(c.html(renderNotFound(ctx), 404));
   }
   const doerRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
@@ -7874,7 +8924,15 @@ async function compareSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   const pair = await findRepositoryById(c.env.DB, repo.id);
   if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
   const page = parsePageNumber(url.searchParams.get("page"));
-  const data = await loadCompareData(c.env, c.env.DB, repo, { base: route.base, head: route.head, page });
+  const data = await loadCompareData(c.env, c.env.DB, repo, {
+    base: route.base,
+    head: route.head,
+    headOwner: route.headOwner,
+    headRepoName: route.headRepoName,
+    separator: route.separator,
+    viewer,
+    page,
+  });
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
   const form = await readComparePullForm(c.req.raw);
   const result = await createPullFromForm({
@@ -8238,6 +9296,42 @@ async function renderFileView(c: Context<{ Bindings: Env }>): Promise<Response> 
   if (load.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
   if (load.kind === "no-renderer") return respond(renderNotAvailableResponse());
   return respond(renderFileResponse(load.html));
+}
+
+/**
+ * GET /{owner}/{repo}/raw/{blob/{sha}|branch/*|tag/*|commit/*|*} and the
+ * /media twins (pages/raw-files.ts — upstream web.go:1699-1713's two
+ * groups): the §2.5 prologue + the empty-repo 404 (the group's
+ * MustBeNotEmpty), then the pair re-read for the owner-visibility half of
+ * the cache stamp (the wikiPrologue precedent), then the loader and the
+ * byte builders (the module doc carries the ServeBlob matrix and the
+ * divergence ledger).
+ */
+async function rawMediaFile(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo } = resolved;
+  if (route.family !== "raw-file" && route.family !== "media-file") return respond(await c.notFound()); // drift guard
+  let target: RawMediaTarget;
+  if (route.sha !== undefined) target = { kind: "blob", sha: route.sha };
+  else if (route.refType !== undefined && route.refSuffix !== undefined) {
+    target = { kind: "ref", refType: route.refType, refSuffix: route.refSuffix };
+  } else if (route.legacySuffix !== undefined) {
+    target = { kind: "legacy", refSuffix: route.legacySuffix };
+  } else return respond(await c.notFound()); // drift guard
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  const cacheIsPublic = repo.visibility === "public" && pair.owner.visibility === "public";
+  const ifNoneMatch = c.req.header("if-none-match") ?? null;
+  const ifModifiedSince = c.req.header("if-modified-since") ?? null;
+  if (route.family === "raw-file") {
+    const load = await loadRawBlob(c.env, repo, target);
+    if (load.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+    return respond(rawBlobResponse(load, { cacheIsPublic, ifNoneMatch, ifModifiedSince }));
+  }
+  const load = await loadMediaBlob(c.env, repo, target);
+  if (load.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(mediaBlobResponse(load, { cacheIsPublic, ifNoneMatch, ifModifiedSince }));
 }
 
 // ---------------------------------------------------------------------------
@@ -8818,6 +9912,19 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
     const data = await loadCommitViewData(c.env, c.env.DB, repo, route.sha);
     if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
     return respond(c.html(renderCommitViewPage({ ctx, data }), 200));
+  }
+  // The census R08 dispatch: the blame page (render.tsx never sees this
+  // family). Every blame-unavailable posture (unresolvable ref, missing
+  // path, binary, over-size/over-lines) is the loader's notFound → the
+  // 404 shell — upstream RefBlame's NotFound arms (blame.go:48-51,77-85).
+  if (route.family === "blame") {
+    const data = await loadBlameData(
+      engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`),
+      repo,
+      route.refSuffix,
+    );
+    if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(c.html(renderBlamePage({ ctx, data }), 200));
   }
   // Wave-24 dispatch: the repo social lists (render.tsx never sees these
   // families; the loader's family switch picks the landed read — forks
@@ -10179,6 +11286,22 @@ uiRouter.get("/", (c) => siteHomePage(c));
 uiRouter.get("/explore", () => exploreRoot());
 uiRouter.get("/explore/repos", (c) => exploreReposPage(c));
 uiRouter.get("/explore/users", (c) => exploreUsersPage(c));
+// The org search page (this wave — upstream web.go:557's literal; parseUiRoute
+// claims the exact 3-segment shape).
+uiRouter.get("/explore/organizations", (c) => exploreOrganizationsPage(c));
+// The ORG-scoped inbox families (parseUiRoute claims exactly these 4-/5-
+// segment shapes — upstream web.go:986-991's `/org/{org}` group). Registered
+// in the STATIC block, physically before the dynamic /:owner/:repo pairs:
+// this Hono pin's RegExpRouter lets an earlier dynamic pattern beat a later
+// static one (the wave-9 note's verified rule — /org/{org}/issues would
+// otherwise land in the repo-issues family's drift guard, the first-match
+// class), and the drift guards absorb any future collision loudly.
+uiRouter.get("/org/:owner/issues", (c) => orgInboxPage(c));
+uiRouter.get("/org/:owner/issues/:team", (c) => orgInboxPage(c));
+uiRouter.get("/org/:owner/pulls", (c) => orgInboxPage(c));
+uiRouter.get("/org/:owner/pulls/:team", (c) => orgInboxPage(c));
+uiRouter.get("/org/:owner/milestones", (c) => orgInboxPage(c));
+uiRouter.get("/org/:owner/milestones/:team", (c) => orgInboxPage(c));
 // Wave-10 notifications family (parseUiRoute claims exactly these literal
 // shapes; registered with the wave-9 statics so the literals beat the
 // dynamic owner/repo and owner regexes — the wave-9 RegExpRouter note). The
@@ -10316,6 +11439,20 @@ uiRouter.get("/:owner/settings/actions/variables", (c) => orgActionsVariablesPag
 uiRouter.post("/:owner/settings/actions/variables/new", (c) => orgActionsVariablesNew(c));
 uiRouter.post("/:owner/settings/actions/variables/:id/edit", (c) => orgActionsVariablesEdit(c, Number(c.req.param("id"))));
 uiRouter.post("/:owner/settings/actions/variables/:id/delete", (c) => orgActionsVariablesDelete(c, Number(c.req.param("id"))));
+// The census R20 (a) arm: the applications tab (parseUiRoute claims exactly
+// these shapes — web.go:1027-1037's /applications group: the bare list GET,
+// the create POST, the {id}/delete write). No earlier registration can
+// absorb these: /:owner/settings/applications is a 4-segment
+// literal-second shape (every /:owner/:repo/settings* line needs FIVE
+// segments), the /oauth2 tails are deeper still, and the GETs on the
+// POST-only tails answer chi's 405 (the hooks-family convention). The
+// /oauth2/{id} show/edit + regenerate_secret shapes stay UNREGISTERED →
+// the engine's 404 (no landed edit page — the module header's reduction).
+uiRouter.get("/:owner/settings/applications", (c) => orgApplicationsPage(c));
+uiRouter.post("/:owner/settings/applications/oauth2", (c) => orgApplicationsCreateSubmit(c));
+uiRouter.get("/:owner/settings/applications/oauth2", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/settings/applications/oauth2/:id/delete", (c) => orgApplicationsDeleteSubmit(c, Number(c.req.param("id"))));
+uiRouter.get("/:owner/settings/applications/oauth2/:id/delete", () => methodNotAllowed("POST"));
 // Window-2c: the admin group.
 uiRouter.get("/-/admin", (c) => adminDashboardPage(c));
 uiRouter.post("/-/admin", (c) => adminDashboardSubmit(c));
@@ -10329,6 +11466,36 @@ uiRouter.get("/-/admin/monitor/stacktrace", (c) => adminMonitorPage(c, "trace"))
 uiRouter.get("/-/admin/users", (c) => adminUsersPage(c));
 uiRouter.get("/-/admin/orgs", (c) => adminOrgsPage(c));
 uiRouter.get("/-/admin/repos", (c) => adminReposPage(c));
+// The census R18 (a) arms (parseUiRoute claims exactly these shapes — the
+// same static literals; the writes are POST-only, the badge slug families
+// ride the decoded param, the application delete the positive-integer id).
+uiRouter.get("/-/admin/emails", (c) => adminEmailsPage(c));
+uiRouter.post("/-/admin/emails/activate", (c) => adminEmailsActivate(c));
+uiRouter.post("/-/admin/emails/delete", (c) => adminEmailsDelete(c));
+uiRouter.get("/-/admin/hooks", (c) => adminHooksPage(c));
+uiRouter.post("/-/admin/hooks/delete", (c) => adminHooksDelete(c));
+uiRouter.get("/-/admin/badges", (c) => adminBadgesPage(c));
+uiRouter.get("/-/admin/badges/new", (c) => adminBadgeNewPage(c));
+uiRouter.post("/-/admin/badges/new", (c) => adminBadgeNewSubmit(c));
+uiRouter.get("/-/admin/badges/slug/:slug", (c) => adminBadgeViewPage(c, c.req.param("slug")));
+uiRouter.get("/-/admin/badges/slug/:slug/edit", (c) => adminBadgeEditPage(c, c.req.param("slug")));
+uiRouter.post("/-/admin/badges/slug/:slug/edit", (c) => adminBadgeEditSubmit(c, c.req.param("slug")));
+uiRouter.post("/-/admin/badges/slug/:slug/delete", (c) => adminBadgeDeleteSubmit(c, c.req.param("slug")));
+uiRouter.get("/-/admin/badges/slug/:slug/users", (c) => adminBadgeUsersPage(c, c.req.param("slug"), null, ""));
+uiRouter.post("/-/admin/badges/slug/:slug/users", (c) => adminBadgeUsersAdd(c, c.req.param("slug")));
+uiRouter.post("/-/admin/badges/slug/:slug/users/delete", (c) => adminBadgeUsersDelete(c, c.req.param("slug")));
+uiRouter.get("/-/admin/applications", (c) => adminApplicationsPage(c));
+uiRouter.post("/-/admin/applications/oauth2", (c) => adminApplicationCreate(c));
+uiRouter.post("/-/admin/applications/oauth2/:id{\\d+}/delete", (c) => adminApplicationDelete(c, Number.parseInt(c.req.param("id"), 10)));
+// The POST-only shapes' GET twins answer the methodNotAllowed arm (the
+// method-blind parse convention — upstream chi's own 405 posture).
+uiRouter.get("/-/admin/emails/activate", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/emails/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/hooks/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/badges/slug/:slug/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/badges/slug/:slug/users/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/applications/oauth2", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/applications/oauth2/:id{\\d+}/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
 // Wave-14 org labels family (parseUiRoute claims exactly these shapes; the
 // literal `labels` registers with the wave-9/12 statics so it beats the
@@ -10346,6 +11513,10 @@ uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/src", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/src/*", (c) => uiPage(c));
+// The blame family (web.go:1729-1733): the typed tails only — the parser
+// leaves the bare /blame engine-owned, so the wildcard registration must
+// not claim wider than the parser (the uiPage drift guard 404s it).
+uiRouter.get("/:owner/:repo/blame/*", (c) => uiPage(c));
 // Wave-2 families (parseUiRoute claims exactly these shapes).
 uiRouter.get("/:owner/:repo/tree", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/tree/*", (c) => uiPage(c));
@@ -10596,6 +11767,17 @@ uiRouter.get("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => ownerHomeP
 // future collision loudly).
 uiRouter.get("/org/:owner/members", (c) => orgMembersPage(c));
 uiRouter.get("/:owner/-/repositories", (c) => orgRepositoriesPage(c));
+// The owner heatmap JSON tail (parseUiRoute claims the exact 4-segment
+// shape — the `-` namespace's disjoint literal; GET-only, the JSON feed).
+uiRouter.get("/:owner/-/heatmap", (c) => ownerHeatmapData(c));
+// The census R06 org dashboard (parseUiRoute claims exactly these shapes —
+// upstream web.go:982-985's /org/{org}/dashboard + /org/{org}/dashboard/
+// {team} literals; the wave-23 tail-spot rationale verbatim: the static
+// "org"+"dashboard" segments carry no earlier pattern, the deeper :team
+// tail is a 5-segment shape no registered line matches, and the member-only
+// page 404-shells inside the handler).
+uiRouter.get("/org/:owner/dashboard", (c) => orgDashboardPage(c));
+uiRouter.get("/org/:owner/dashboard/:team", (c) => orgDashboardPage(c));
 // Wave-24 repo social lists (parseUiRoute claims exactly these shapes —
 // upstream's web.go:1759/1766/1767 bare literals; GET-only read pages
 // through the uiPage dispatch, the branches/releases convention).
@@ -10802,6 +11984,23 @@ uiRouter.get("/:owner/:repo/render/branch/*", (c) => renderFileView(c));
 uiRouter.get("/:owner/:repo/render/tag/*", (c) => renderFileView(c));
 uiRouter.get("/:owner/:repo/render/commit/*", (c) => renderFileView(c));
 uiRouter.get("/:owner/:repo/render/blob/:sha", (c) => renderFileView(c));
+// The RAW + MEDIA byte families (parseUiRoute claims exactly these shapes —
+// upstream web.go:1699-1713's two groups: the three typed wildcards, the
+// 2-segment blob arm, and the deprecated catch-all wildcard; the bare
+// `/raw`/`/media` literal is claimed by NOTHING — chi's `/*` does not match
+// the empty tail — so it stays engine-owned). The "raw"/"media" heads are
+// literals no registered pattern carries, and unclaimed shapes never reach
+// the sub-app — the dispatcher consults handlesUiRoute first.
+uiRouter.get("/:owner/:repo/raw/blob/:sha", (c) => rawMediaFile(c));
+uiRouter.get("/:owner/:repo/raw/branch/*", (c) => rawMediaFile(c));
+uiRouter.get("/:owner/:repo/raw/tag/*", (c) => rawMediaFile(c));
+uiRouter.get("/:owner/:repo/raw/commit/*", (c) => rawMediaFile(c));
+uiRouter.get("/:owner/:repo/raw/*", (c) => rawMediaFile(c));
+uiRouter.get("/:owner/:repo/media/blob/:sha", (c) => rawMediaFile(c));
+uiRouter.get("/:owner/:repo/media/branch/*", (c) => rawMediaFile(c));
+uiRouter.get("/:owner/:repo/media/tag/*", (c) => rawMediaFile(c));
+uiRouter.get("/:owner/:repo/media/commit/*", (c) => rawMediaFile(c));
+uiRouter.get("/:owner/:repo/media/*", (c) => rawMediaFile(c));
 // Wave-46 fragment mounts (parseUiRoute claims exactly these shapes — the
 // machinery waves' routes: upstream web.go:1735's `/blob_excerpt/{sha}` repo
 // twin + web.go:1618's wiki twin over repo.ExcerptBlob, and web.go:1761's

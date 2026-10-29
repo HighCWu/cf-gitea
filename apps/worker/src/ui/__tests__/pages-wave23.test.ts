@@ -114,16 +114,19 @@ describe("wave-23 parser claims", () => {
     expect(parseUiRoute("/wave23org/-/repositories")).toEqual({ family: "org-repositories", owner: "wave23org" });
     // The sibling shapes stay unclaimed (the engine's 404), EXCEPT the plain
     // two-segment repo-home shapes, which were already the home family and
-    // resolve to nothing at repo time (no owner "org", no repo "-").
+    // resolve to nothing at repo time (no owner "org", no repo "-") — and
+    // EXCEPT the heatmap tail, which the raw/media wave claimed (the
+    // owner-heatmap JSON family; an org name 404-shells inside the handler,
+    // the R06 boundary).
     expect(parseUiRoute("/org/wave23org/members/extra")).toBeNull();
     expect(parseUiRoute("/org/wave23org")).toEqual({ family: "home", owner: "org", repo: "wave23org", refSuffix: null });
-    expect(parseUiRoute("/wave23org/-/heatmap")).toBeNull();
+    expect(parseUiRoute("/wave23org/-/heatmap")).toEqual({ family: "owner-heatmap", owner: "wave23org" });
     expect(parseUiRoute("/wave23org/-")).toEqual({ family: "home", owner: "wave23org", repo: "-", refSuffix: null });
     expect(parseUiRoute("/wave23org/-/packages")).toBeNull();
     // handlesUiRoute (the dispatcher's gate) answers the same.
     expect(handlesUiRoute("/org/wave23org/members")).toBe(true);
     expect(handlesUiRoute("/wave23org/-/repositories")).toBe(true);
-    expect(handlesUiRoute("/wave23org/-/heatmap")).toBe(false);
+    expect(handlesUiRoute("/wave23org/-/heatmap")).toBe(true);
   });
 });
 
@@ -242,8 +245,12 @@ describe("org repositories page /{org}/-/repositories", () => {
     // Upstream org.Repositories' `org == nil` arm — a user row is a miss.
     expect((await fetchUi("/wave23-out/-/repositories")).status).toBe(404);
     expect((await fetchUi("/wave23-nobody/-/repositories")).status).toBe(404);
-    // The rest of the /- namespace stays unclaimed → the engine's 404.
-    expect((await fetchUi("/wave23org/-/heatmap")).status).toBe(404);
+    // The rest of the /- namespace stays engine-owned → the plain 404; the
+    // heatmap tail renders through its handler — an ORG name hits the
+    // user-gated resolver's type gate (the R06 boundary) and 404-SHELLS.
+    const heatmap = await fetchUi("/wave23org/-/heatmap");
+    expect(heatmap.status).toBe(404);
+    expect(await heatmap.text()).toContain("page-content"); // the shell, not the engine's plain 404
     expect((await fetchUi("/wave23org/-")).status).toBe(404);
   });
 });

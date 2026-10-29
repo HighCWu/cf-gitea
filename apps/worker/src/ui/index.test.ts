@@ -176,16 +176,17 @@ describe("handlesUiRoute", () => {
     "/octo/hello/commit/abc1234/extra", // wave-18 claims the single {sha}
     "/octo/hello/commit", // segment only — deeper tails and the bare literal
                           // stay engine-owned (upstream web.go:1740/1760)
-    "/octo/hello/raw/branch/main/x", // upstream raw shape not in this slice
     "/octo/hello/commitsX", // family literals are exact
     "/octo/hello/commitsx/branch/main",
-    "/explore/organizations", // the wave-9 explore literals bind exactly —
     "/explore/code", // every other tail stays engine/parent-owned
     "/explore/users/extra",
     // NOTE: /octo/hello/settings/keys and /explore/repos/sitemap-1.xml left
     // this table — window-2d (b54f709) and window-2e-A (84996c6) claimed
     // them; the claim pins live in the parse table below (the wiki
-    // matrix's escalation).
+    // matrix's escalation). /octo/hello/raw/branch/main/x and
+    // /explore/organizations left it too — the raw/media wave claimed the
+    // web raw shapes and the orgs page (the raw-files + explore-orgs
+    // matrices' pins).
   ])("does not claim: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(false);
   });
@@ -244,7 +245,10 @@ describe("parseUiRoute", () => {
     ["/explore/", { family: "explore-root" }], // trailing slash canonicalizes
     ["/explore/repos", { family: "explore-repos" }],
     ["/explore/users", { family: "explore-users" }],
-    ["/explore/organizations", null], // the literals bind exactly
+    ["/explore/organizations", { family: "explore-organizations" }], // the orgs page (the raw/media wave's R01)
+    ["/octo/hello/raw/branch/main/x", { family: "raw-file", owner: "octo", repo: "hello", refType: "branch", refSuffix: "main/x" }],
+    ["/octo/hello/media/blob/0123456789abcdef0123456789abcdef01234567", { family: "media-file", owner: "octo", repo: "hello", sha: "0123456789abcdef0123456789abcdef01234567" }],
+    ["/octo/hello/raw/main/x", { family: "raw-file", owner: "octo", repo: "hello", legacySuffix: "main/x" }],
     ["/explore/repos/sitemap-1.xml", { family: "explore-repos-sitemap", idx: 1 }], // window-2e-A (84996c6)
     ["/explore/users/extra", null],
     ["/EXPLORE", { family: "owner-home", owner: "EXPLORE" }], // same-named

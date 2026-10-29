@@ -1,12 +1,13 @@
 /**
- * The activity feeds page module's tests (pages wave 50, the UNMOUNTED
- * `/{username}?tab=activity` module): the type→icon/message matrix over
- * fixture actions of each wired op type → the DOM, plus the loader's
- * service-parameter contract (profile.go:162-190's arm) and the resolution
- * seam. Real D1 via the vitest plugin (generated migrations in beforeAll);
- * the render runs through hono/jsx renderToString — the render.test.tsx
- * harness — with the loader driven directly (the module has no route yet,
- * the HANDOFF NOTE in the module header).
+ * The activity feeds page module's tests (pages wave 50, the
+ * `/{username}?tab=activity` module, MOUNTED at b1bf73a): the
+ * type→icon/message matrix over fixture actions of each wired op type →
+ * the DOM, plus the loader's service-parameter contract (profile.go:162-190's
+ * arm) and the resolution seam. Real D1 via the vitest plugin (generated
+ * migrations in beforeAll); the render runs through hono/jsx renderToString
+ * — the render.test.tsx harness — with the loader driven directly (the
+ * route arm is the module header's mount record — `index.ts`'s
+ * `?tab=activity` dispatch).
  */
 
 import { env } from "cloudflare:test";

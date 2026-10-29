@@ -348,8 +348,9 @@ export type ReleaseAttachmentServe =
 /** The prefetch + sniff split of one R2 body: up to SNIFF_CONTENT_SIZE bytes
  *  come off the front (the sniff buffer), the remainder streams after them —
  *  never more than the window is held (serve.go:203-233's ReadAtMost +
- *  MultiReader shape). */
-async function splitPrefetch(body: ReadableStream<Uint8Array>): Promise<{ prefix: Uint8Array; rest: ReadableStream<Uint8Array> }> {
+ *  MultiReader shape). Exported for the raw/media byte families
+ *  (pages/raw-files.ts). */
+export async function splitPrefetch(body: ReadableStream<Uint8Array>): Promise<{ prefix: Uint8Array; rest: ReadableStream<Uint8Array> }> {
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -496,8 +497,10 @@ export async function loadReleaseDownload(
 // ---------------------------------------------------------------------------
 
 /** The skip-compression extensions (serve.go:85-89 — gzhttp's no-compression
- *  hint carries the value "1"). */
-const SKIP_COMPRESSION_EXTS = new Set([".gz", ".bz2", ".zip", ".xz", ".zst", ".deb", ".apk", ".jar", ".png", ".jpg", ".webp"]);
+ *  hint carries the value "1"). Exported for the raw/media byte families
+ *  (pages/raw-files.ts) — one port, three consumers, the wiki-raw sniffer
+ *  pattern. */
+export const SKIP_COMPRESSION_EXTS = new Set([".gz", ".bz2", ".zip", ".xz", ".zst", ".deb", ".apk", ".jar", ".png", ".jpg", ".webp"]);
 
 function extensionOf(name: string): string {
   const dot = name.lastIndexOf(".");

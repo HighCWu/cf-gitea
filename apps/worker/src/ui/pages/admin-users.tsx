@@ -232,6 +232,12 @@ export const ADMIN_EMBEDDED_ICONS: Record<string, { paths: string[]; viewBox: st
     ],
     viewBox: "0 0 16 16",
   },
+  "octicon-apps": {
+    paths: [
+      "M1.5 3.25c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5A1.75 1.75 0 0 1 5.75 7.5h-2.5A1.75 1.75 0 0 1 1.5 5.75Zm7 0c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5A1.75 1.75 0 0 1 8.5 5.75Zm-7 7c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5a1.75 1.75 0 0 1-1.75-1.75Zm7 0c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5a1.75 1.75 0 0 1-1.75-1.75ZM3.25 3a.25.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5A.25.25 0 0 0 6 5.75v-2.5A.25.25 0 0 0 5.75 3Zm7 0a.25.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Zm-7 7a.25.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Zm7 0a.25.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Z",
+    ],
+    viewBox: "0 0 16 16",
+  },
 };
 
 /** `{{svg "name" size}}`'s DOM for allowlisted AND embedded names (the
@@ -261,10 +267,22 @@ export function AdminEmbeddedSvg(props: { name: string; size?: number; class?: s
 }
 
 /** The admin navbar union — the pages this family's scaffolding links: the
- *  three listing pages PLUS the dashboard and the four monitor pages (the
- *  F7 fold — ONE shared navbar across the whole admin family; upstream's
- *  navbar.tmpl marks the active page's item inside its open group). */
-export type AdminFamilyNavActive = "dashboard" | "users" | "orgs" | "repos" | "stats" | "cron" | "queue" | "trace";
+ *  listings PLUS the dashboard, the monitor family, and the census-R18 arms
+ *  (emails/badges/applications/hooks — this wave's mount window). Upstream's
+ *  navbar.tmpl marks the active page's item inside its open group. */
+export type AdminFamilyNavActive =
+  | "dashboard"
+  | "users"
+  | "orgs"
+  | "repos"
+  | "emails"
+  | "badges"
+  | "applications"
+  | "hooks"
+  | "stats"
+  | "cron"
+  | "queue"
+  | "trace";
 
 /** The family page chrome (component-local, the adminMonitorLocale pattern —
  *  locale.ts is shared and not this wave's file; upstream locale keys cited
@@ -276,8 +294,13 @@ export const adminFamilyLocale = {
   identityAccess: "Identity & Access", // "admin.identity_access" (navbar.tmpl:16)
   organizations: "Organizations", // "admin.organizations"
   userAccounts: "User Accounts", // "admin.users" (the nav item + page Title)
+  badges: "Badges", // "admin.badges" (the R18 arm's nav item)
+  emails: "User Email Addresses", // "admin.emails" (the R18 arm's nav item)
   assets: "Assets", // "admin.assets" (navbar.tmpl:31)
   repositories: "Repositories", // "admin.repositories"
+  integrations: "Integrations", // "admin.integrations" (navbar.tmpl:53 — the R18 wave's group)
+  applications: "Applications", // "settings.applications" (the admin applications arm's nav item)
+  hooks: "Webhooks", // "admin.hooks" (the admin hooks arm's nav item)
   monitoring: "Monitoring", // "admin.monitor"
   stats: "Stats", // "admin.monitor.stats"
   cron: "Cron Tasks", // "admin.monitor.cron"
@@ -286,15 +309,16 @@ export const adminFamilyLocale = {
 } as const;
 
 /** The admin layout's navbar (navbar.tmpl at the pin; the F7 fold — ONE
- *  shared navbar across dashboard/monitor/users/orgs/repos, the
- *  AdminDashboardNav + AdminMonitorNav scaffolding copies deleted): the
- *  Maintenance details (Dashboard), Identity & Access (Organizations + User
- *  Accounts), Assets (Repositories), Monitoring (the monitor family's four
- *  live items). Upstream's per-group `PageIs*` conditions reduce to: the
- *  group containing the active page renders `open`, the active item gets
- *  the `active item` class. auths/badges/emails, packages, audit_logs,
- *  self_check are omitted — all their upstream items are unlanded pages
- *  (the dead-link rule). */
+ *  shared navbar across the whole admin family): the Maintenance details
+ *  (Dashboard), Identity & Access (Organizations + User Accounts + Badges +
+ *  Emails — the R18 arms), Assets (Repositories), Integrations
+ *  (Applications + Webhooks — the R18 arms), Monitoring (the monitor
+ *  family's four live items). Upstream's per-group `PageIs*` conditions
+ *  reduce to: the group containing the active page renders `open`, the
+ *  active item gets the `active item` class. auths, packages, audit_logs,
+ *  self_check, config, notices, actions are omitted — all their upstream
+ *  items are unlanded pages (the dead-link rule; the census's (b)/(c)
+ *  classes). */
 export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
   const item = (href: string, label: string, active: boolean) => (
     <a class={active ? "active item" : "item"} href={href}>
@@ -304,8 +328,10 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
   // navbar.tmpl's per-group PageIs* conditions — the details-open arm
   // derived from the active page (upstream opens the group containing it).
   const maintenanceOpen = props.active === "dashboard";
-  const identityOpen = props.active === "users" || props.active === "orgs";
+  const identityOpen =
+    props.active === "users" || props.active === "orgs" || props.active === "badges" || props.active === "emails";
   const assetsOpen = props.active === "repos";
+  const integrationsOpen = props.active === "applications" || props.active === "hooks";
   const monitorOpen = props.active === "stats" || props.active === "cron" || props.active === "queue" || props.active === "trace";
   const openAttr = (open: boolean) => (open ? true : undefined);
   return (
@@ -321,11 +347,20 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
           <div class="menu">
             {item("/-/admin/orgs", adminFamilyLocale.organizations, props.active === "orgs")}
             {item("/-/admin/users", adminFamilyLocale.userAccounts, props.active === "users")}
+            {item("/-/admin/badges", adminFamilyLocale.badges, props.active === "badges")}
+            {item("/-/admin/emails", adminFamilyLocale.emails, props.active === "emails")}
           </div>
         </details>
         <details class="item" open={openAttr(assetsOpen)}>
           <summary>{adminFamilyLocale.assets}</summary>
           <div class="menu">{item("/-/admin/repos", adminFamilyLocale.repositories, props.active === "repos")}</div>
+        </details>
+        <details class="item" open={openAttr(integrationsOpen)}>
+          <summary>{adminFamilyLocale.integrations}</summary>
+          <div class="menu">
+            {item("/-/admin/applications", adminFamilyLocale.applications, props.active === "applications")}
+            {item("/-/admin/hooks", adminFamilyLocale.hooks, props.active === "hooks")}
+          </div>
         </details>
         <details class="item" open={openAttr(monitorOpen)}>
           <summary>{adminFamilyLocale.monitoring}</summary>

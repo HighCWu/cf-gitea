@@ -11,7 +11,9 @@
  * date-ordered walk answering the first commit per path, index-aligned
  * (`TreeCommitsResult`), replacing the per-entry `listLog(ref, {path, n: 1})`
  * fan on directory views (see page-data.ts; the per-path fan remains the
- * documented fallback for entries the batch misses).
+ * documented fallback for entries the batch misses) — and the census R08
+ * blame RPC `blame(ref, path)` (the blame page's line runs + per-oid commit
+ * metadata).
  *
  * Failure posture: every method resolves `null` on transport failure (a thrown
  * RPC), mirroring the gate's serveHead catch-and-fall-back (§4.9 "unreadable
@@ -31,7 +33,10 @@
 
 import type {
   BlobResult,
+  BlameResult,
   CommitJson,
+  ActivityStatsResult,
+  GrepResult,
   LogResult,
   RefsResult,
   TreeCommitsResult,
@@ -47,6 +52,20 @@ export interface EngineClient {
   readBlob(ref: string | undefined, path: string): Promise<BlobResult | null>;
   /** A10-L batched enrichment: commit per input path, index-aligned. */
   listTreeCommits(ref: string | undefined, paths: string[]): Promise<TreeCommitsResult | null>;
+  /** Per-line blame (the census R08 RPC): same-commit line runs + per-oid
+   *  commit metadata; `null` = unavailable (unresolvable ref, missing path,
+   *  binary, over-size — the engine's availability ladder). */
+  blame(ref: string | undefined, path: string, opts?: { lineOfs?: number; lineLimit?: number }): Promise<BlameResult | null>;
+  /** In-repo content search (SPEC-0015 M1, census R10): exact/words/regexp
+   *  over flattenTree, results capped at 50 with `truncated` honesty;
+   *  `null` = refused (empty/absent q, unresolvable ref, regexp compile
+   *  failure — the availability ladder). */
+  grep(ref: string | undefined, opts?: { q?: string; mode?: "exact" | "words" | "regexp"; path?: string }): Promise<GrepResult | null>;
+  /** Windowed pulse counts (SPEC-0015 M2a, the activity page's arms):
+   *  period-switched first-parent fold with merges excluded, add/del totals,
+   *  per-author counts, a 10-min TTL cache keyed by the immutable tip;
+   *  `null` = unresolvable ref/empty repo (the availability ladder). */
+  activityStats(ref: string | undefined, period?: string): Promise<ActivityStatsResult | null>;
 }
 
 /** Build the client for one repository from the request's bindings. */
@@ -60,5 +79,8 @@ export function engineClient(env: Env, repoName: string): EngineClient {
     listTree: (ref, path) => safe(cell.listTree(ref, path)),
     readBlob: (ref, path) => safe(cell.readBlob(ref, path)),
     listTreeCommits: (ref, paths) => safe(cell.listTreeCommits(ref, paths)),
+    blame: (ref, path, opts) => safe(cell.blame(ref, path, opts)),
+    grep: (ref, opts) => safe(cell.grep(ref, opts)),
+    activityStats: (ref, period) => safe(cell.activityStats(ref, period)),
   };
 }
