@@ -193,6 +193,25 @@ export const CONTRIBUTOR_CACHE_KEY = "contrib";
  *  fixed buckets (w/m/q/y) keep the no-TTL immutability rule (store.ts's
  *  stats_cache docstring) — only windowed keys stamp. */
 export const ACTIVITY_STATS_TTL_MS = 10 * 60 * 1000;
+/** SPEC-0015 §3.3 LFS-scan budget: tree entries the walk VISITS per run —
+ *  trees are cheap DO-SQLite/index reads but unbounded repos exist (the
+ *  MAX_STATS_SCAN family's magnitude). Entries the `path` prefix prunes are
+ *  outside the scan's domain and spend no slot; entries the `oid` filter
+ *  rejects were still visited and do. */
+export const MAX_LFS_SCAN_FILES = 20000;
+/** SPEC-0015 §3.3 LFS-scan budget: candidate rows returned per answer — each
+ *  ≤ 1 KiB, so the worst-case payload is ~500 KiB, the same order as a
+ *  readBlob answer. Filling the cap EXACTLY is not truncation: the flag trips
+ *  only when a further size-gated candidate is proven to exist. */
+export const MAX_LFS_CANDIDATES = 500;
+/** the MetaFileMaxSize gate (upstream `modules/lfs/pointer.go:22` — "the
+ *  maximum size of a pointer file must be smaller than 1024"; the pipeline's
+ *  BlobsLessThan1024FromCatFileBatchCheck keeps `size > 1024 → skip`,
+ *  catfile.go:49-51, so ≤ 1024 passes — the same boundary the landed worker
+ *  parser's PointerTooLargeError draws at > 1024). The gate is an index-only
+ *  `typeAndSize` read: an oversize blob costs one SQLite row, never an R2 GET
+ *  — never inflate a big blob to test it. */
+export const MAX_LFS_POINTER_BYTES = 1024;
 // full streaming is a separate follow-up; until then this must fit the isolate
 const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 /** the DO SQLite storage ceiling gc must not cross while duplicating objects */
@@ -513,6 +532,35 @@ export interface ContributorStatsResult {
   /** the walk hit its cap with history still unvisited — the answer is the
    *  NEWEST MAX_STATS_SCAN commits' fold, the older weeks partial/missing
    *  (flagged, never silent; the blame budget-exit rule) */
+  truncated: boolean;
+}
+
+/**
+ * The LFS pointer-scan answer (`scanLfsPointers(ref, opts)`, SPEC-0015 §3.3 —
+ * the data behind upstream's settings-lfs pointers list, census R11, whose
+ * handler renders `lfs.PointerBlob`s from `lfs.SearchPointerBlobs`).
+ * Deliberately pointer-GRAMMAR-AGNOSTIC (the ratified posture, §2.3): the
+ * engine returns every size-gated candidate blob RAW — valid pointer,
+ * pointer-shaped, binary and plain-text alike — and the WORKER parses with
+ * the landed `parsePointer` (apps/worker/src/services/lfs/pointer.ts,
+ * SPEC-0006's port of pointer.go) and joins `lfsObjects`. The vendored engine
+ * never grows a second copy of a parser SPEC-0006 already owns.
+ */
+export interface LfsPointerScanResult {
+  /** the ref the answer was computed at — the resolved ref name (HEAD's
+   *  symbolic name when `ref` was absent), or the raw oid for an oid ref */
+  ref: string;
+  /** the resolved tip commit oid */
+  commit: string;
+  /** one row per size-gated candidate blob, tree order. `oid`/`size` are the
+   *  GIT blob's (the tree entry's oid, the typeAndSize size); the LFS
+   *  pointer's oid/size come from the worker's parse of `data`. */
+  candidates: { path: string; oid: string; size: number; data: Uint8Array }[];
+  /** any budget exit made the answer a partial: the visited cap tripped with
+   *  entries unvisited, or a further size-gated candidate was proven past the
+   *  500-row cap (the blame budget-exit rule — flagged, never silent, never
+   *  null-for-budget; a skip — oversize, non-blob, oid-mismatch — is not a
+   *  budget exit) */
   truncated: boolean;
 }
 
@@ -2007,6 +2055,80 @@ export class RepoCell extends DurableObject<Env> {
       const tip = await this.peelToCommit(rr.oid, gate);
       if (!tip) return null;
       return this.computeContributorStats(tip.oid, gate);
+    });
+  }
+
+  /**
+   * The LFS pointer scan, `scanLfsPointers(ref, opts)` (the census R11
+   * boundary RPC — the data behind upstream's settings-lfs pointers list,
+   * whose handler renders `lfs.PointerBlob`s from `lfs.SearchPointerBlobs`,
+   * pointer_scanner.go:31: a 4-stage pipeline in the cheap-to-expensive
+   * order — batch-check every object, size-gate ≤ 1024, read the survivors,
+   * parse each). Our split keeps the ENGINE half of that pipeline only:
+   * `flattenTree` in path order, per entry the INDEX-ONLY `typeAndSize` gate
+   * (`size <= MAX_LFS_POINTER_BYTES` — upstream's
+   * BlobsLessThan1024FromCatFileBatchCheck keeps `size > 1024 → skip`,
+   * catfile.go:49-51; a > 1024-byte pointer-shaped blob costs one SQLite row
+   * and is never inflated — no R2 GET is spent on it), then the survivors'
+   * bytes via `store.get` under the gate, returned RAW. Parsing is the
+   * WORKER's (the landed `parsePointer` + the `lfsObjects` join, §2.3's
+   * rationale), so the candidate set is SIZE-gated, never content-gated:
+   * binary and non-pointer small blobs ride along for the worker to reject.
+   *
+   * `opts.path` prefix-filters the walk (the grep arm; entries outside the
+   * prefix are outside the scan's domain — they spend no MAX_LFS_SCAN_FILES
+   * slot). `opts.oid` post-filters on the GIT blob oid — the grammar-free
+   * reading of §3.3's FindLFSFile arm (the ledger note): the engine cannot
+   * compare the LFS sha256 INSIDE the bytes without a parser (the ratified
+   * §2.3 posture forbids exactly that), so the opt matches the candidate's
+   * `oid` field; the FindLFSFile consumer derives the target pointer file's
+   * git oid from the LFS oid via the canonical-pointer identity —
+   * `pointerBlobSha1` (SPEC-0006 §3.4's GC reachability key, landed in
+   * apps/worker/src/services/lfs/pointer.ts) — and for full upstream parity
+   * on NON-canonical pointers it calls without `oid` and post-filters after
+   * its own parse (the bytes are in the answer).
+   *
+   * Availability ladder (the blame rule): null ONLY on an unresolvable ref /
+   * empty repo / unpeelable tip; a path or oid matching nothing answers the
+   * valid empty set; budget exits answer the partial flagged (`truncated`),
+   * never null. No cache — query-shaped like grep: repeat calls pay the
+   * walk; keeping the walk cheap is the budgets' job.
+   */
+  async scanLfsPointers(ref?: string, opts: { path?: string; oid?: string } = {}): Promise<LfsPointerScanResult | null> {
+    this.rpcBind();
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(ref, gate);
+      if (!rr) return null;
+      const tip = await this.peelToCommit(rr.oid, gate);
+      if (!tip) return null;
+      const prefix = opts.path ? decodePath("/" + opts.path).join("/") : "";
+      const oidWanted = opts.oid ?? "";
+      const files = new Map<string, { oid: string; mode: string }>();
+      await this.flattenTree(tip.commit.tree, "", files, gate);
+      const candidates: LfsPointerScanResult["candidates"] = [];
+      let truncated = false;
+      let visited = 0;
+      for (const [p, entry] of files) {
+        if (prefix && p !== prefix && !p.startsWith(prefix + "/")) continue;
+        if (visited >= MAX_LFS_SCAN_FILES) {
+          truncated = true; // the visited cap: answer the visited prefix, flagged
+          break;
+        }
+        visited++;
+        if (oidWanted && entry.oid !== oidWanted) continue;
+        // typeAndSize is an index-only SQLite read — no R2 GET, nothing to gate
+        const meta = this.store.typeAndSize(entry.oid);
+        if (!meta || meta.type !== "blob") continue;
+        if (meta.size > MAX_LFS_POINTER_BYTES) continue; // the MetaFileMaxSize gate — a skip, not a budget exit
+        if (candidates.length >= MAX_LFS_CANDIDATES) {
+          truncated = true; // a proven further candidate: the row cap cut a larger set
+          break;
+        }
+        const obj = await this.store.get(entry.oid, gate);
+        if (!obj || obj.type !== "blob") continue;
+        candidates.push({ path: p, oid: entry.oid, size: meta.size, data: obj.data });
+      }
+      return { ref: rr.refName ?? rr.oid, commit: tip.oid, candidates, truncated };
     });
   }
 
