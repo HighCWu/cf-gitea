@@ -8,6 +8,7 @@ import {
   sudo,
 } from "./auth/middleware";
 import { createApiRouter } from "./api/router";
+import { createPackagesProtocolRouter } from "./api/routes/packages";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
@@ -131,6 +132,17 @@ app.use("/api/v1/users/:username/*", rejectPublicOnlyUserAssignment());
 
 app.route("/api/v1", tokenRouter);
 app.route("/api/v1", createApiRouter());
+
+// /api/packages (SPEC-0016 §3.2): the generic registry protocol — upstream
+// mounts it OUTSIDE /api/v1 (api.go:91's "not /api/v1/packages" note) and so
+// do we. No resolveAuth mount: the protocol router carries its own credential
+// pass (the LFS seam — parse + verify + ScopeSet) because its upstream gate
+// (reqPackageAccess) needs the TOKEN SCOPE, which the ApiEnv seam does not
+// carry; anonymous requests flow through so public-owner downloads work and
+// everything insufficient answers the 401 + WWW-Authenticate challenge
+// (§5.10) that makes real package-manager clients re-prompt. run_worker_first
+// pins /api/* so the asset tree never shadows these paths.
+app.route("/api/packages", createPackagesProtocolRouter());
 
 // Avatar serving (web mux at the pin — routers/web/base.go): mounted BEFORE
 // uiRouter so its literal /avatar, /avatars and /user/avatar routes always

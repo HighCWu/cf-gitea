@@ -40,11 +40,12 @@
  * mirror producers run unconditionally — and runs ONLY the (self-gated)
  * demo producer on the hourly "0 * * * *" entry (carried by
  * wrangler.jsonc.example), plus the (self-gated) audit-retention producer
- * block on that same entry (SPEC-0015 §4.3 — the one sanctioned extension;
- * see the marked block in handleScheduledCron). Tests exercise
- * `handleScheduledCron` / `enqueueDueDemoSweeps` / the purge.ts consumer arm
- * directly with fabricated ScheduledControllers — the delegation itself is
- * one await.
+ * block and the (unconditional, probe-gated) packages-cleanup producer
+ * block on that same entry (SPEC-0015 §4.3 + SPEC-0016 §4.4 — the TWO
+ * sanctioned extensions; see the marked blocks in handleScheduledCron).
+ * Tests exercise `handleScheduledCron` / `enqueueDueDemoSweeps` / the
+ * purge.ts consumer arms directly with fabricated ScheduledControllers —
+ * the delegation itself is one await.
  */
 
 import { asc, eq, isNull, lt, or, and } from "drizzle-orm";
@@ -52,6 +53,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users } from "../db/schema";
 import { enqueueDueAuditRetention } from "./audit";
+import { enqueueDuePackagesCleanup } from "./packages/cleanup";
 import { enqueueDueMirrorSyncs } from "./mirror/sync";
 import { enqueueDuePushMirrorSyncs } from "./mirror/push-sync";
 
@@ -246,16 +248,19 @@ export async function enqueueDueDemoSweeps(
  * The cron dispatcher (§3.1): the hourly entry carries ONLY the demo
  * producer (which self-gates on DEMO_MODE before its first D1 read — gate
  * off → the whole invocation performs zero reads and zero sends, §2's
- * invariant arm 1); every OTHER entry — the standing 10-minute step entry
- * and anything a future config adds — runs the mirror producers exactly as
- * the inline handler always has: unconditional, gate-independent (their CAS
- * guard absorbs any :00 overlap, sync.ts:890-898). The step entry therefore
- * NEVER triggers a sweep, in either gate state.
+ * invariant arm 1), the audit-retention producer (self-gated on
+ * AUDIT_RETENTION_DAYS) and the packages-cleanup producer (ratified
+ * non-demo-gated — SPEC-0016 §4.4 — but probe-gated: no enabled rule AND no
+ * expired orphans → zero sends); every OTHER entry — the standing 10-minute
+ * step entry and anything a future config adds — runs the mirror producers
+ * exactly as the inline handler always has: unconditional, gate-independent
+ * (their CAS guard absorbs any :00 overlap, sync.ts:890-898). The step entry
+ * therefore NEVER triggers a sweep, in either gate state.
  */
 export async function handleScheduledCron(controller: ScheduledController, env: Env): Promise<void> {
   if (controller.cron === DEMO_SWEEP_CRON) {
     await enqueueDueDemoSweeps(env, {});
-    // --- BEGIN audit-retention producer block (SPEC-0015 §4.3; the ONE
+    // --- BEGIN audit-retention producer block (SPEC-0015 §4.3; the FIRST
     // --- sanctioned extension of this dispatcher) -------------------------
     // Rides the hourly entry (the standing cadence closest to the SPEC's
     // daily producer — no new cron entry in wrangler.jsonc). Fully self-
@@ -267,6 +272,30 @@ export async function handleScheduledCron(controller: ScheduledController, env: 
     // the work" — the delete runs in the REPO_TASKS consumer).
     await enqueueDueAuditRetention(env, {});
     // --- END audit-retention producer block --------------------------------
+    // --- BEGIN packages-cleanup producer block (SPEC-0016 §4.4; the SECOND
+    // --- sanctioned extension of this dispatcher) --------------------------
+    // Ratified NON-demo-gated (ratification 5): this is upstream's own
+    // midnight job ([cron.cleanup_packages] ENABLED=true OLDER_THAN=24h),
+    // not the demo sweep's data-deletion invariant — it deletes only
+    // unreferenced blobs past the window and rule-matched versions, exactly
+    // what upstream self-hosters get. It performs ZERO queue sends unless
+    // work exists: services/packages/cleanup.ts probes an enabled rule, an
+    // expired unreferenced blob and an orphan spool object (two indexed
+    // LIMIT-1 reads + one bounded R2 list page) before its single enqueue;
+    // the delete runs in the REPO_TASKS consumer (handlePackagesCleanup —
+    // the purge.ts fold, see the module report). Probe failures are logged
+    // and swallowed HERE: a broken tail arm must not fail the hourly
+    // invocation (the demo/audit producers above already ran) — the next
+    // tick re-probes, and console.error keeps it visible without breaking
+    // the quiet-tick log posture.
+    try {
+      await enqueueDuePackagesCleanup(env, {});
+    } catch (error) {
+      console.error(
+        `[package-cleanup] producer probes failed (retrying next tick): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    // --- END packages-cleanup producer block -------------------------------
     return;
   }
   // The mirror producers, exactly as today (index.ts scheduled) — the

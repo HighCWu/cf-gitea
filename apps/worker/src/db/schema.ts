@@ -3092,3 +3092,277 @@ export const auditEvents = sqliteTable(
     index("idx_audit_event_scope_created").on(t.scopeType, t.scopeId, t.createdUnix),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0016 §4.1 — the package registry model (six tables). Column-for-column
+// ports of §2.2's upstream structs (gitea/models/packages/{package,
+// package_version,package_blob,package_file,package_property,
+// package_cleanup_rule}.go) onto D1 types; every UNIQUE constraint is the
+// upstream `UNIQUE(s)` arbitration the SPEC §2.2 pinned (constraint-first,
+// the org_members_org_user_uq pattern — §4.3: no DO, the D1 UNIQUEs are the
+// mutation arbiter). Owner scoping lives ONLY on the packages row; blobs are
+// content-addressed and global (§4.2 — dedup across owners is the point).
+// ---------------------------------------------------------------------------
+
+/**
+ * The package identity row (upstream `Package`, package.go:191-199).
+ * `UNIQUE(owner_id, type, lower_name)` is TryInsertPackage's arbitration
+ * (one package per owner/type/lower name — package.go:203-213); the
+ * duplicate answer is the EXISTING row (the GetOrInsert shape §5.2 pins).
+ *
+ * Drift vs upstream, reconciled per the audit_event scope_id precedent:
+ * `repo_id` is TEXT, not int64 — upstream `RepoID int64` keys its own int64
+ * repositories table, but OUR `repositories.id` is a client-minted TEXT UUID
+ * (ADR-0001 D3). NULL = global to the owner (upstream 0), and
+ * linkPackage/unlinkPackage set/clear it; the index serves the R16 repo-tab
+ * source query (`RepoID = ?`, routers/web/repo/packages.go:24-33) and the
+ * §5.6 repo-delete unlink arm. `owner_id` stays INTEGER: it keys `users.id`,
+ * which is integer on our side too.
+ */
+export const packages = sqliteTable(
+  "packages",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** users.id of the owner (a user OR an org — orgs are user rows). */
+    ownerId: integer("owner_id").notNull(),
+    /** Optional repo link: the TEXT repositories.id UUID; NULL = global
+     *  (upstream `RepoID` 0-sentinel, adapted to TEXT — see the drift note). */
+    repoId: text("repo_id"),
+    /** Registry type — upstream's open 23-constant string set (package.go:33-53);
+     *  TEXT, no CHECK list, so ecosystem milestones add types without
+     *  migrations (§5.9). */
+    type: text("type").notNull(),
+    /** Display-cased package name. */
+    name: text("name").notNull(),
+    /** Case-folded lookup + uniqueness key (upstream `LowerName`). */
+    lowerName: text("lower_name").notNull(),
+    /** Upstream `SemverCompatible` — display-ordering hint (§5.7). */
+    semverCompatible: integer("semver_compatible", { mode: "boolean" }).notNull().default(false),
+    isInternal: integer("is_internal", { mode: "boolean" }).notNull().default(false),
+  },
+  (t) => [
+    uniqueIndex("packages_owner_type_lower_name_uq").on(t.ownerId, t.type, t.lowerName),
+    // Upstream `RepoID int64 xorm:"UNIQUE(s) INDEX"` — the index half; the
+    // R16 repo-tab filter and the repo-delete unlink arm both scan it.
+    index("packages_repo_id_idx").on(t.repoId),
+  ],
+);
+
+/**
+ * Package versions (upstream `PackageVersion`, package_version.go:27-36).
+ * `UNIQUE(package_id, lower_version)` is GetOrInsertVersion's arbitration —
+ * a re-publish answers the EXISTING row (the ErrDuplicatePackageVersion
+ * sentinel upstream returns with it, package_version.go:48-67; §5.2).
+ * `metadata_json` is the per-ecosystem extension payload (upstream LONGTEXT
+ * JSON); generic writes none (NULL) in v1 (§5.4).
+ */
+export const packageVersions = sqliteTable(
+  "package_versions",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    packageId: integer("package_id").notNull(),
+    /** The doer that published the version (0 = system/unattributed). */
+    creatorId: integer("creator_id").notNull().default(0),
+    /** Display-cased version string. */
+    version: text("version").notNull(),
+    /** Case-folded version — the uniqueness half (upstream `LowerVersion`). */
+    lowerVersion: text("lower_version").notNull(),
+    /** Upstream `CreatedUnix xorm:"INDEX created"` — the §5.7 list order key. */
+    createdUnix: integer("created_unix", { mode: "timestamp" }).notNull(),
+    isInternal: integer("is_internal", { mode: "boolean" }).notNull().default(false),
+    /** Per-ecosystem metadata JSON (upstream `MetadataJSON`); NULL in v1. */
+    metadataJson: text("metadata_json"),
+    /** Bumped by the bare `x + 1` increment on lead-file GET downloads
+     *  (upstream IncrementDownloadCounter, package_version.go:76-79; §5.8). */
+    downloadCount: integer("download_count").notNull().default(0),
+  },
+  (t) => [
+    uniqueIndex("package_versions_package_lower_version_uq").on(t.packageId, t.lowerVersion),
+    // Upstream `CreatedUnix xorm:"INDEX created"` — the default list order
+    // (`created_unix DESC, id DESC`, §5.7) and the cleanup rules' SortCreatedDesc.
+    index("package_versions_created_idx").on(t.createdUnix),
+  ],
+);
+
+/**
+ * Content-addressed blobs (upstream `PackageBlob`, package_blob.go:30-39).
+ * The row is the DEDUP record only — the R2 key IS `hash_sha256` (§4.2:
+ * `packages/blobs/aa/bb/<sha256>`, no r2_key column — the D1-bare-rows rule;
+ * the hash column already names the object, unlike the release-asset uuid
+ * keys, because package blobs dedup). Upstream UNIQUEs each hash column
+ * (UNIQUE(md5)/UNIQUE(sha1)/UNIQUE(sha256)/UNIQUE(sha512), :32-36); the hash
+ * columns stay NULLABLE here (upstream NOT NULL) because our digester
+ * computes the three WebCrypto-supported digests (SHA-1/256/512) per upload
+ * and MD5 is unavailable in Workers' WebCrypto — generic uploads land
+ * hash_md5 NULL, and SQLite unique indexes treat NULLs as distinct so the
+ * nullable UNIQUEs stay sound. Dedup lookup is (size, sha256) + the present
+ * digests — upstream's size+all-four-hashes GetOrInsertBlob
+ * (package_blob.go:52-77) reduced to the columns we always fill.
+ */
+export const packageBlobs = sqliteTable(
+  "package_blobs",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Byte size (upstream `Size int64 NOT NULL DEFAULT 0`). */
+    size: integer("size").notNull().default(0),
+    /** hex digests; md5 (and sha1/sha512) nullable — see the table comment. */
+    hashMd5: text("hash_md5"),
+    hashSha1: text("hash_sha1"),
+    /** The R2 key material (`packages/blobs/aa/bb/<hash>`) — NOT NULL. */
+    hashSha256: text("hash_sha256").notNull(),
+    hashSha512: text("hash_sha512"),
+    createdUnix: integer("created_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("package_blobs_md5_uq").on(t.hashMd5),
+    uniqueIndex("package_blobs_sha1_uq").on(t.hashSha1),
+    uniqueIndex("package_blobs_sha256_uq").on(t.hashSha256),
+    uniqueIndex("package_blobs_sha512_uq").on(t.hashSha512),
+    // Upstream `CreatedUnix xorm:"created INDEX NOT NULL"` — the cleanup
+    // sweep's OLDER_THAN scan (FindExpiredUnreferencedBlobs walks it).
+    index("package_blobs_created_idx").on(t.createdUnix),
+  ],
+);
+
+/**
+ * Files inside a version (upstream `PackageFile`, package_file.go:34-43).
+ * `UNIQUE(version_id, lower_name, composite_key)` is TryInsertFile's
+ * arbitration — a file's identity inside one version; composite_key is the
+ * maven/conan-style disambiguator, always `''` (EmptyFileKey) in v1.
+ */
+export const packageFiles = sqliteTable(
+  "package_files",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    versionId: integer("version_id").notNull(),
+    /** The content-addressed blob this file serves (upstream `BlobID INDEX`). */
+    blobId: integer("blob_id").notNull(),
+    /** Display filename (verbatim; the lower-cased twin is the uq half). */
+    name: text("name").notNull(),
+    lowerName: text("lower_name").notNull(),
+    /** Upstream `CompositeKey` — '' for generic (EmptyFileKey). */
+    compositeKey: text("composite_key").notNull().default(""),
+    /** Lead files bump the version download counter on GET (upstream
+     *  OpenBlobForDownload's IsLead gate, packages.go:655-660). */
+    isLead: integer("is_lead", { mode: "boolean" }).notNull().default(false),
+    createdUnix: integer("created_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("package_files_version_lower_composite_uq").on(t.versionId, t.lowerName, t.compositeKey),
+    // Upstream `BlobID int64 xorm:"INDEX"` — the dedup reference count the
+    // sole-sweeper deletion relies on (ratification 4: a content key is
+    // deletable only when zero file rows reference its blob id).
+    index("package_files_blob_idx").on(t.blobId),
+  ],
+);
+
+/**
+ * Per-ecosystem key-value properties (upstream `PackageProperty`,
+ * package_property.go:31-37) — the extension seam (npm dist-tags, container
+ * digests, alpine fields all land here in later milestones; §5.4: generic
+ * writes none in v1). `ref_type` is upstream's iota: 0=version / 1=file /
+ * 2=package (package_property.go:22-27).
+ */
+export const packageProperties = sqliteTable(
+  "package_properties",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** 0=version / 1=file / 2=package (upstream PropertyType iota). */
+    refType: integer("ref_type").notNull(),
+    /** The referenced row's id within `ref_type`. */
+    refId: integer("ref_id").notNull(),
+    name: text("name").notNull(),
+    /** LONGTEXT upstream; TEXT here. */
+    value: text("value").notNull(),
+  },
+  (t) => [
+    // SPEC-0016 §4.1's pinned index — every property read/delete resolves by
+    // (ref_type, ref_id) (DeleteAllProperties, the descriptor assembly).
+    index("package_properties_ref_idx").on(t.refType, t.refId),
+    // Upstream `Name string xorm:"INDEX"` (package_property.go:33) — the
+    // property-name filter (e.g. container digest lookups, later milestones).
+    index("package_properties_name_idx").on(t.name),
+  ],
+);
+
+/**
+ * Per-owner cleanup rules (upstream `PackageCleanupRule`,
+ * package_cleanup_rule.go:25-40). `UNIQUE(owner_id, type)` — one rule per
+ * owner+type upstream (0 = user-level default owner sentinel). Rules CRUD is
+ * DOWNSTREAM (the settings pages); the table lands with the model so the
+ * cleanup arm has its inputs (§4.1). Patterns are regex strings compiled
+ * case-insensitively anchored at execution time (upstream
+ * `(?i)\A…\z`, package_cleanup_rule.go:41-54).
+ */
+export const packageCleanupRules = sqliteTable(
+  "package_cleanup_rules",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(false),
+    /** Owner sentinel: users.id, 0 = user-level default (upstream OwnerID). */
+    ownerId: integer("owner_id").notNull().default(0),
+    /** Registry type the rule sweeps ('' or a type — TEXT per §5.9). */
+    type: text("type").notNull(),
+    /** Versions newer than this count (by created desc) are always kept. */
+    keepCount: integer("keep_count").notNull().default(0),
+    /** Keep-regex (case-insensitive, anchored at compile time). */
+    keepPattern: text("keep_pattern").notNull().default(""),
+    /** Versions younger than this many days are always kept. */
+    removeDays: integer("remove_days").notNull().default(0),
+    /** Remove-regex — only versions MATCHING it are deletable. */
+    removePattern: text("remove_pattern").notNull().default(""),
+    /** Match `lower_name/lower_version` instead of bare `lower_version`. */
+    matchFullName: integer("match_full_name", { mode: "boolean" }).notNull().default(false),
+    createdUnix: integer("created_unix", { mode: "timestamp" }).notNull(),
+    updatedUnix: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("package_cleanup_rules_owner_type_uq").on(t.ownerId, t.type),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// SPEC-0018 §4.1 — the system notices model (one table). A column-for-column
+// port of §2.2's upstream struct (gitea/models/system/notice.go:29-34,
+// `Notice{ID, Type, Description LONGTEXT, CreatedUnix INDEX created}`) onto
+// D1 types. The rows are SYSTEM-attributed failure reports — no actor, no
+// credential, no owner column (§5.5: nothing cascades; a dead-lettered purge
+// notice about repo X deliberately outlives X) — written by the repo-tasks
+// DLQ consumer (§3.1's emit seam, repos/dlq.ts) and read/deleted by the
+// /-/admin/notices page (§3.1's three routes). No UNIQUEs (an append log —
+// upstream has none), no FKs, and the description is bounded AT EMIT (§5.2),
+// so the upstream LONGTEXT lands as a plain TEXT.
+// ---------------------------------------------------------------------------
+
+/** Upstream `NoticeRepository` (notice.go:23) — repo-subsystem failures
+ *  (the purge/import/fork/mirror DLQ families). */
+export const SYSTEM_NOTICE_TYPE_REPOSITORY = 1;
+/** Upstream `NoticeTask` (notice.go:25) — maintenance-task outcomes (the
+ *  demo-sweep/audit-retention riders). */
+export const SYSTEM_NOTICE_TYPE_TASK = 2;
+
+export const systemNotices = sqliteTable(
+  "system_notices",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Upstream `Type NoticeType` — the closed two-value enum stored as an
+     *  int upstream too (iota+1); INTEGER here, not TEXT, because the page's
+     *  label keys off the number (`admin.notices.type_%d`, notice.go:41-43).
+     *  Upstream table name is `notice`; the drizzle plural convention applies
+     *  (§4.1). */
+    type: integer("type").notNull(),
+    /** The RENDERED one-liner — the DB never stores a template (the audit
+     *  seam's discipline), bounded at emit to 2000 chars with a visible `…`
+     *  (§5.2; upstream LONGTEXT unbounded). */
+    description: text("description").notNull(),
+    /** Upstream `CreatedUnix xorm:"INDEX created"` — the DESC paged read's
+     *  scan key (notice.go:82-88). */
+    createdUnix: integer("created_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream `xorm:"INDEX created"` (notice.go:33) — the list's
+    // `created_unix DESC, id DESC` order (§5.7: the id tiebreak keeps a
+    // same-second DLQ batch in insertion order).
+    index("system_notices_created_idx").on(t.createdUnix),
+  ],
+);

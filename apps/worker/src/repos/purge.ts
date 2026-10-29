@@ -28,6 +28,7 @@
  */
 
 import { isAuditRetentionMessage, pruneExpiredAuditEvents } from "../services/audit";
+import { handlePackagesCleanup, isPackageCleanupMessage } from "../services/packages/cleanup";
 import { DEMO_RETENTION_HOURS, isDemoSweepMessage } from "../services/demo-sweep";
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
 import { handlePushMirrorSync, isPushMirrorSyncMessage } from "../services/mirror/push-sync";
@@ -217,6 +218,20 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] audit-retention ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    // Packages cleanup (SPEC-0016 §4.4, ratified non-demo-gated but
+    // probe-gated — the producer sends only when a rule is enabled OR an
+    // expired orphan exists; failures swallowed at console.error so a broken
+    // tail arm can never fail the invocation).
+    if (isPackageCleanupMessage(message.body)) {
+      try {
+        await handlePackagesCleanup(env);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] package-cleanup ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
         message.retry();
       }
       continue;

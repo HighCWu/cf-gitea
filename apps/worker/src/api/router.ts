@@ -60,6 +60,7 @@ import { registerNotificationsRoutes } from "./routes/notifications";
 import { registerOrgRoutes } from "./routes/org-repos";
 import { registerOrgTeamsRoutes } from "./routes/org-teams";
 import { registerOrgProfileRoutes } from "./routes/orgs";
+import { registerPackagesRoutes } from "./routes/packages";
 import { registerPullAutoMergeRoutes } from "./routes/pull-automerge";
 import { registerPullRoutes } from "./routes/pulls";
 import { registerPullReviewRoutes } from "./routes/pull-reviews";
@@ -309,6 +310,15 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerRepoLicenseRoutes(app, optionalAuth);
   registerGenerateRepoRoute(app, requireAuth);
   registerActivityFeedRoutes(app, requireAuth, optionalAuth);
+  // SPEC-0016 §3.1: the package management family — the 9 `/packages/{owner}/…`
+  // ops + the admin list (the census's FEATURE-ABSENT package class). The
+  // routes carry their own credential pass (the module header documents why
+  // requireAuth is not in their middleware arrays); requireAuth stays the
+  // admin list's identity middleware. The generic PROTOCOL router
+  // (`/api/packages`) mounts separately in src/index.ts — upstream keeps the
+  // two families apart for the same reason (api.go's "mounted on
+  // /api/packages (not /api/v1/packages)" note).
+  registerPackagesRoutes(app, requireAuth);
 
   return app;
 }
