@@ -1,10 +1,11 @@
 /**
- * The M3 registry protocol routes (SPEC-0016 §7): the PYPI and HELM families
- * of upstream's CommonRoutes (api.go:417-421 / api.go:337-341), mounted at
- * `/api/packages` beside the generic family (routes/packages.ts — NOT in the
- * frozen OpenAPI document, upstream keeps the package-manager endpoints
- * outside the v1 swagger too, so this registers as a plain Hono router and
- * src/index.ts mounts it with a second `app.route("/api/packages", …)`).
+ * The M3/M4 registry protocol routes (SPEC-0016 §7): the PYPI, HELM and NPM
+ * families of upstream's CommonRoutes (api.go:417-421 / api.go:337-341 /
+ * api.go:378-414), mounted at `/api/packages` beside the generic family
+ * (routes/packages.ts — NOT in the frozen OpenAPI document, upstream keeps
+ * the package-manager endpoints outside the v1 swagger too, so this
+ * registers as a plain Hono router and src/index.ts mounts it with a second
+ * `app.route("/api/packages", …)`).
  *
  * The gate stack is upstream's per-family wrap — the group carries
  * `reqPackageAccess(read)` with the write arms adding
@@ -16,7 +17,21 @@
  *
  * Error BODIES differ per family, as upstream's apiError helpers do:
  * pypi.apiError answers PLAIN TEXT (pypi.go:41-44, ctx.PlainText) while
- * helm.apiError answers `{"error": message}` JSON (helm.go:29-37, ctx.JSON).
+ * helm.apiError and npm.apiError answer `{"error": message}` JSON (helm.go:29-37
+ * / npm.go:39-44, ctx.JSON).
+ *
+ * The npm family's name-bearing routes are NOT plain `:param` patterns:
+ * upstream routes them through chi's PathGroup with UseUnescapedPath
+ * (api.go:391-414 — the NPM-ROUTE-PATH-PATTERN hint names the three
+ * `@scope%2Fcore` / `%40angular%2Fcore` / `@angular/core` shapes a client
+ * sends), so the name segment can carry an ENCODED slash. Hono's params
+ * cannot span one, so the `/:username/npm/*` wildcard hands the RAW
+ * remainder to `parseNpmTarget`, which decodes it once (upstream's
+ * unescape-first order) and walks the upstream grammar segment-by-segment:
+ * the name is everything before the first `-`/`-rev` marker (scoped names
+ * span segments), dist-tags ride the `-/package/{id}/dist-tags` prefix, and
+ * the `-{version}/` download shape IGNORES the version (upstream's two GET
+ * shapes share DownloadPackageFileByName, a filename-only search).
  */
 
 import { Hono } from "hono";
@@ -39,9 +54,11 @@ import {
   QuotaTypeSizeError,
   accessModeAtLeast,
   determinePackageAccessMode,
+  getVersionByNameAndVersion,
   packagesQuotaFromEnv,
+  searchVersions,
 } from "../../services/packages/model";
-import { PackageSizeMismatchError } from "../../services/packages/blobs";
+import { PackageSizeMismatchError, PackageBlobTooLargeError } from "../../services/packages/blobs";
 import { DuplicatePackageFileError } from "../../services/packages/generic";
 import {
   PypiFormError,
@@ -66,6 +83,32 @@ import {
   uploadHelmChart,
   uploadHelmProvenance,
 } from "../../services/packages/helm";
+import {
+  MAX_NPM_DIST_TAG_BODY_BYTES,
+  NpmBodyTooLargeError,
+  NpmDeprecateNoVersionsError,
+  NpmDuplicateVersionError,
+  NpmInvalidAttachmentError,
+  NpmInvalidIntegrityError,
+  NpmInvalidPackageNameError,
+  NpmInvalidPackageError,
+  NpmInvalidPackageVersionError,
+  NpmInvalidTagError,
+  NpmLinkPermissionError,
+  SortedJsonMap,
+  buildNpmPackument,
+  buildNpmVersionMetadata,
+  deterministicJsonStringify,
+  findNpmVersionForFilename,
+  listNpmDistTags,
+  openNpmFileForDownload,
+  removeNpmPackage,
+  removeNpmVersion,
+  searchNpmPackages,
+  setNpmPackageTag,
+  uploadNpmPackage,
+  validateNpmName,
+} from "../../services/packages/npm";
 
 const WWW_AUTHENTICATE = 'Basic realm="Gitea Package API"';
 
@@ -531,7 +574,379 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   app.post("/:username/helm/api/charts", (c) => helmChartUpload(c));
   app.post("/:username/helm/api/prov", (c) => helmProvUpload(c));
 
+  // ------------------------------ NPM ----------------------------------
+  // api.go:378-414: the metadata endpoints (/-/v1/search, /-/ping, /-/whoami)
+  // plus the chi PathGroup family over the name-bearing shapes — routed
+  // through parseNpmTarget (see the module header's routing note).
+
+  app.on("GET", "/:username/npm/*", (c) => npmDispatch(c));
+  app.on("HEAD", "/:username/npm/*", (c) => npmDispatch(c));
+  app.on("PUT", "/:username/npm/*", (c) => npmDispatch(c));
+  app.on("DELETE", "/:username/npm/*", (c) => npmDispatch(c));
+  app.on("POST", "/:username/npm/*", (c) => npmDispatch(c));
+
   return app;
+}
+
+// ---------------------------------------------------------------------------
+// The npm PathGroup walk — upstream's UseUnescapedPath + name regexes
+// (api.go:391-414) as a manual grammar over the decoded remainder
+// ---------------------------------------------------------------------------
+
+type NpmArm =
+  | "search"
+  | "ping"
+  | "whoami"
+  | "dist-tags"
+  | "put-tag"
+  | "delete-tag"
+  | "packument"
+  | "publish"
+  | "version-metadata"
+  | "download"
+  | "delete-version"
+  | "delete-package"
+  | "delete-preview";
+
+interface NpmTarget {
+  arm: NpmArm;
+  /** The full package name — spans segments for scoped packages. */
+  name: string;
+  version?: string;
+  filename?: string;
+  tag?: string;
+}
+
+/**
+ * The decoded remainder after `/{username}/npm/`: `-/package/{id}/dist-tags`
+ * prefixes first (the metadata endpoints), then the tarball/revision shapes —
+ * the name is everything before the first exact `-`/`-rev` segment (scoped
+ * names span segments), and EVERY name-bearing arm validates the id against
+ * upstream's route regex (creator.go's `(@scope/)?name`, anchor-for-anchor):
+ * chi's MatchPath patterns embed it, so an invalid URL name 404s at ROUTING —
+ * the creator's 400 "package name is invalid" is the arm for a versions
+ * ENTRY whose name disagrees with a routable URL id.
+ */
+export function parseNpmTarget(decoded: string, method: string): NpmTarget | null {
+  const parts = decoded.split("/");
+  if (parts[0] === "-") {
+    if (parts.length === 3 && parts[1] === "v1" && parts[2] === "search" && method === "GET") {
+      return { arm: "search", name: "" };
+    }
+    if (parts.length === 2 && parts[1] === "ping") return { arm: "ping", name: "" };
+    if (parts.length === 2 && parts[1] === "whoami") return { arm: "whoami", name: "" };
+    if (parts[1] === "package") {
+      const distTagsAt = parts.lastIndexOf("dist-tags");
+      if (distTagsAt >= 3) {
+        const name = parts.slice(2, distTagsAt).join("/");
+        const rest = parts.slice(distTagsAt + 1);
+        if (!validateNpmName(name)) return null;
+        if (rest.length === 0 && method === "GET") return { arm: "dist-tags", name };
+        if (rest.length === 1 && method === "PUT") return { arm: "put-tag", name, tag: rest[0] };
+        if (rest.length === 1 && method === "DELETE") return { arm: "delete-tag", name, tag: rest[0] };
+      }
+    }
+    return null;
+  }
+  const revAt = parts.indexOf("-rev");
+  const dashAt = parts.indexOf("-");
+  if (revAt !== -1 && (dashAt === -1 || revAt < dashAt)) {
+    // /{id}/-rev/{revision}
+    if (parts.length !== revAt + 2) return null;
+    const name = parts.slice(0, revAt).join("/");
+    if (!validateNpmName(name)) return null;
+    if (method === "DELETE") return { arm: "delete-package", name };
+    if (method === "PUT") return { arm: "delete-preview", name };
+    return null;
+  }
+  if (dashAt !== -1) {
+    const name = parts.slice(0, dashAt).join("/");
+    if (!validateNpmName(name)) return null;
+    const rest = parts.slice(dashAt + 1);
+    const restRev = rest.indexOf("-rev");
+    if (restRev !== -1) {
+      if (method !== "DELETE" || restRev + 2 !== rest.length) return null;
+      const middle = rest.slice(0, restRev);
+      if (middle.length === 1) return { arm: "delete-version", name, filename: middle[0] };
+      if (middle.length === 2) return { arm: "delete-version", name, filename: middle[1] };
+      return null;
+    }
+    if (method === "GET" || method === "HEAD") {
+      if (rest.length === 1) return { arm: "download", name, filename: rest[0] };
+      if (rest.length === 2) return { arm: "download", name, version: rest[0], filename: rest[1] };
+    }
+    return null;
+  }
+  // The grammar tail (api.go:405-410): `GET {id}/{version}` then
+  // `GET {id}` / `PUT {id}` — the id regex disambiguates a two-segment path:
+  // a leading `@` consumes the next segment (the scope cannot stand alone),
+  // a bare name does not.
+  const first = parts[0] ?? "";
+  if (first.startsWith("@")) {
+    if (parts.length === 2) {
+      const name = `${first}/${parts[1] ?? ""}`;
+      if (!validateNpmName(name)) return null;
+      if (method === "GET" || method === "HEAD") return { arm: "packument", name };
+      if (method === "PUT") return { arm: "publish", name };
+      return null;
+    }
+    if (parts.length === 3 && method === "GET") {
+      const name = `${first}/${parts[1] ?? ""}`;
+      if (!validateNpmName(name)) return null;
+      return { arm: "version-metadata", name, version: parts[2] };
+    }
+    return null;
+  }
+  if (parts.length === 1) {
+    if (!validateNpmName(first)) return null;
+    if (method === "GET" || method === "HEAD") return { arm: "packument", name: first };
+    if (method === "PUT") return { arm: "publish", name: first };
+    return null;
+  }
+  if (parts.length === 2 && method === "GET") {
+    if (!validateNpmName(first)) return null;
+    return { arm: "version-metadata", name: first, version: parts[1] };
+  }
+  return null;
+}
+
+/** npm.go:39-44 — the family's JSON error body. */
+function npmErrorResponse(status: ContentfulStatus | 304, message: string): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** RFC 7232 §2.3 weak comparison (Go http.ServeContent's If-None-Match arm). */
+function etagMatches(headerValue: string, etag: string): boolean {
+  for (const candidate of headerValue.split(",")) {
+    const trimmed = candidate.trim().replace(/^W\//, "").replace(/^"|"$/g, "");
+    if (trimmed === etag || trimmed === "*") return true;
+  }
+  return false;
+}
+
+/** npm.go:87-95 — the deterministic body + W/etag, with the 304 short-cut. */
+function npmJsonMetadataResponse(c: Context<{ Bindings: Env }>, build: { body: string; etag: string }): Response {
+  const ifNoneMatch = c.req.header("if-none-match");
+  if (ifNoneMatch !== undefined && etagMatches(ifNoneMatch, build.etag)) {
+    return new Response(null, { status: 304, headers: { etag: `W/"${build.etag}"` } });
+  }
+  return new Response(build.body, {
+    status: 200,
+    headers: {
+      "content-type": "application/json;charset=utf-8",
+      etag: `W/"${build.etag}"`,
+    },
+  });
+}
+
+async function npmDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const rawPath = c.req.path;
+    const segments = rawPath.split("/");
+    // ["", "api", "packages", {username}, "npm", ...] — c.req.path arrives
+    // decodeURI'd (Hono getPath): RESERVED escapes like %2F and %40 survive,
+    // which is exactly upstream's UseUnescapedPath order — the encoded slash
+    // keeps the name one routing segment, and this walk decodes the remainder
+    // FULLY (a malformed escape cannot match the grammar below and 404s).
+    const prefix = `/api/packages/${segments[3] ?? ""}/npm/`;
+    if (!rawPath.startsWith(prefix)) {
+      return npmErrorResponse(404, "");
+    }
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(rawPath.slice(prefix.length));
+    } catch {
+      return npmErrorResponse(404, "");
+    }
+    const target = parseNpmTarget(decoded, c.req.method);
+    if (target === null) {
+      return npmErrorResponse(404, "");
+    }
+    // The group's read wrap with the write arms' extra check (api.go:379-414).
+    const WRITE_ARMS: ReadonlySet<NpmArm> = new Set([
+      "publish",
+      "put-tag",
+      "delete-tag",
+      "delete-version",
+      "delete-package",
+      "delete-preview",
+    ]);
+    const { owner, cred } = await protocolContext(c, WRITE_ARMS.has(target.arm) ? "write" : "read");
+    const origin = new URL(c.req.url).origin;
+    // buildNpmRegistryURL (npm.go:56-58): AppURL + api/packages/{owner}/npm.
+    const registryUrl = `${origin}/api/packages/${encodeURIComponent(owner.username)}/npm`;
+
+    switch (target.arm) {
+      case "ping":
+        // npm.go:511-513.
+        return new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } });
+      case "whoami": {
+        // npm.go:515-521.
+        if (cred.doer === null) return npmErrorResponse(401, "Unauthorized");
+        return new Response(JSON.stringify({ username: cred.doer.username }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      case "search": {
+        const form = new URL(c.req.url).searchParams;
+        const text = (form.get("text") ?? "").trim();
+        const from = Number.parseInt(form.get("from") ?? "", 10);
+        const size = Number.parseInt(form.get("size") ?? "", 10);
+        const result = await searchNpmPackages(
+          c.env.DB,
+          owner,
+          text,
+          Number.isSafeInteger(from) ? from : 0,
+          Number.isSafeInteger(size) ? size : 0,
+          registryUrl,
+        );
+        return new Response(JSON.stringify({ objects: result.objects, total: result.total }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      case "packument": {
+        const build = await buildNpmPackument(c.env.DB, registryUrl, owner, target.name);
+        if (build === null) return npmErrorResponse(404, "");
+        return npmJsonMetadataResponse(c, build);
+      }
+      case "version-metadata": {
+        const built = await buildNpmVersionMetadata(c.env.DB, registryUrl, owner, target.name, target.version ?? "");
+        if (built === null) return npmErrorResponse(404, `version not found: ${target.version}`);
+        if ("fallback" in built) {
+          // npm.go:120-123 — unset "latest" serves the packument's fallback.
+          const packument = await buildNpmPackument(c.env.DB, registryUrl, owner, target.name);
+          const latest = packument?.distTags.latest;
+          const versionBody = latest !== undefined ? packument?.versionBodies.get(latest) : undefined;
+          if (packument === null || latest === undefined || versionBody === undefined) {
+            return npmErrorResponse(404, "");
+          }
+          return npmJsonMetadataResponse(c, versionBody);
+        }
+        return npmJsonMetadataResponse(c, built);
+      }
+      case "download": {
+        const download = await openNpmFileForDownload(
+          c.env.DB,
+          c.env.REPO_PACKS,
+          owner,
+          target.name,
+          target.filename ?? "",
+          c.req.method === "HEAD" ? "HEAD" : "GET",
+        );
+        if (download === null) return npmErrorResponse(404, ""); // apiError(404, nil)
+        return fileResponse(c, {
+          stream: download.stream,
+          size: download.size,
+          filename: download.file.name,
+          created: download.file.createdUnix,
+        });
+      }
+      case "publish": {
+        const doer = cred.doer;
+        if (doer === null) return npmErrorResponse(401, "user should have specific permission or be a site admin");
+        const declaredLength = contentLength(c.req.raw);
+        if (declaredLength === null) return npmErrorResponse(411, "Content-Length header is required");
+        const result = await uploadNpmPackage({
+          d1: c.env.DB,
+          bucket: c.env.REPO_PACKS,
+          owner,
+          doer,
+          content: bodyStream(c.req.raw),
+          declaredLength,
+          quota: packagesQuotaFromEnv(c.env),
+          instanceOrigin: origin,
+        });
+        // deprecatePackage's 200 (npm.go:334) / UploadPackage's 201 (npm.go:277).
+        return new Response(null, { status: result.kind === "deprecated" ? 200 : 201 });
+      }
+      case "dist-tags": {
+        const tags = await listNpmDistTags(c.env.DB, owner, target.name, registryUrl);
+        if (tags === null) return npmErrorResponse(404, "");
+        return new Response(deterministicJsonStringify(new SortedJsonMap(tags)), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      case "put-tag": {
+        // The body is a quoted version string, bounded (npm.go:408-419).
+        const body = await c.req.raw.text();
+        if (body.length > MAX_NPM_DIST_TAG_BODY_BYTES) return npmErrorResponse(413, "request body too large");
+        const version = body.replace(/^"/, "").replace(/"$/, "");
+        const targetVersion = await getVersionByNameAndVersion(c.env.DB, owner.id, "npm", target.name, version);
+        if (targetVersion === null) return npmErrorResponse(404, "package does not exist");
+        const outcome = await setNpmPackageTag(c.env.DB, target.tag ?? "", targetVersion, false);
+        if (outcome === "invalid-tag") return npmErrorResponse(400, "The tag name is invalid");
+        return new Response(null, { status: 200 });
+      }
+      case "delete-tag": {
+        const { rows } = await searchVersions(c.env.DB, {
+          ownerId: owner.id,
+          type: "npm",
+          name: target.name,
+          exact: true,
+          excludeInternal: true,
+          page: 1,
+          limit: 100000,
+        });
+        const newest = rows[0]?.version;
+        if (newest !== undefined) {
+          const outcome = await setNpmPackageTag(c.env.DB, target.tag ?? "", newest, true);
+          if (outcome === "invalid-tag") return npmErrorResponse(400, "The tag name is invalid");
+        }
+        return new Response(null, { status: 200 });
+      }
+      case "delete-version": {
+        // npm unpublish by tarball (npm.go:337-350): packageVersionByFilename
+        // (a filename-only search, NO download-counter bump) + RemovePackageVersion.
+        const found = await findNpmVersionForFilename(c.env.DB, owner, target.name, target.filename ?? "");
+        if (found === null) return npmErrorResponse(404, "");
+        await removeNpmVersion(c.env.DB, found.id);
+        return new Response(null, { status: 200 });
+      }
+      case "delete-package": {
+        // npm unpublish of the whole package (npm.go:352-375).
+        const removed = await removeNpmPackage(c.env.DB, owner, target.name);
+        if (!removed) return npmErrorResponse(404, "");
+        return new Response(null, { status: 200 });
+      }
+      case "delete-preview":
+        // DeletePreview does nothing (npm.go:280-284) — the client's
+        // bookkeeping call after deleting a version.
+        return new Response(null, { status: 200 });
+    }
+  } catch (error) {
+    if (error instanceof HTTPException) throw error;
+    if (
+      error instanceof NpmInvalidPackageError ||
+      error instanceof NpmInvalidPackageNameError ||
+      error instanceof NpmInvalidPackageVersionError ||
+      error instanceof NpmInvalidAttachmentError ||
+      error instanceof NpmInvalidIntegrityError ||
+      error instanceof NpmDeprecateNoVersionsError
+    ) {
+      return npmErrorResponse(400, error.message); // the InvalidArgument arm
+    }
+    if (error instanceof NpmInvalidTagError) return npmErrorResponse(400, error.message); // errInvalidTagName
+    if (error instanceof NpmDuplicateVersionError) return npmErrorResponse(409, error.message);
+    if (error instanceof NpmLinkPermissionError) return npmErrorResponse(403, error.message);
+    if (error instanceof NpmBodyTooLargeError) return npmErrorResponse(413, error.message);
+    if (error instanceof PackageSizeMismatchError) {
+      // A lying Content-Length truncates the JSON document — upstream's
+      // non-InvalidArgument parse-failure arm (npm.go:186-188).
+      return npmErrorResponse(500, "internal server error");
+    }
+    if (error instanceof PackageBlobTooLargeError) return npmErrorResponse(413, error.message);
+    if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+      return npmErrorResponse(403, quotaMessage(error));
+    }
+    console.error("[packages-npm] request failed", error);
+    return npmErrorResponse(500, "internal server error");
+  }
 }
 
 /** The request body as a byte stream (an absent body is a closed stream). */
