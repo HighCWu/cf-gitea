@@ -170,7 +170,15 @@
  *                  unpublish (-rev → 200), the helm Chart.yaml tarball →
  *                  index.yaml entries → the chart back verbatim, the maven
  *                  pom+jar PUTs → the generated maven-metadata.xml → the jar
- *                  back verbatim. Cleanup is SELF-CLEANING at the row layer:
+ *                  back verbatim, the nuget V3 flat-container publish (a
+ *                  hand-built stored-entry .nupkg whose ROOT .nuspec carries
+ *                  the fifth-segment version 1.04.5.2.5-rc.1+probe — every
+ *                  read answers the NORMALIZED 1.4.5.2-rc.1) via the
+ *                  X-NuGet-ApiKey fallback → the registration leaf + the
+ *                  nupkg back verbatim + the V2 Edmx/Packages(Id=..) pair →
+ *                  the REST management purge (204 → 404s). Cleanup is
+ *                  SELF-CLEANING at the row layer: generic/npm/nuget
+ *                  self-clean via their protocol/management deletes, while
  *                  pypi/helm/maven expose no protocol delete, so a wrangler
  *                  d1 sweep (the fixwave/demo D1-arm precedent; --d1-scope
  *                  picks the database — needs wrangler auth) deletes the
@@ -4015,7 +4023,7 @@ const wikiGitSteps = (ctx) => {
 // ---------- battery: packages-registry (the /api/packages protocol families) ----------
 
 /**
- * The v1.3 package-registry sweep (SPEC-0016 M3/M4 — the five protocol
+ * The v1.3 package-registry sweep (SPEC-0016 M3/M4/M5 — the six protocol
  * families over ONE owner-scoped fixture set: a public probe repo as the
  * owner vehicle + the run PAT, which carries write:package via `all`):
  *
@@ -4036,14 +4044,31 @@ const wikiGitSteps = (ctx) => {
  *   - maven    the pom PUT (a minimal <project> XML — the metadata parse)
  *              + the jar PUT → 201/201, the GENERATED maven-metadata.xml
  *              answers the coordinates, the jar download decodes verbatim.
+ *   - nuget    the V3 flat-container publish of a hand-built STORED-entry
+ *              .nupkg (EOCD + central directory — the server's zip reader
+ *              walk; a ROOT .nuspec beside a nested lib/ entry the root rule
+ *              must skip) whose version carries the fifth segment
+ *              ("1.04.5.2.5-rc.1+probe" — every read answers the NORMALIZED
+ *              "1.4.5.2-rc.1"): the V3 service index (3.0.0, 9 resources),
+ *              the PUT with X-NuGet-ApiKey and NO Authorization header (the
+ *              nuget.Auth fallback arm) → 201, the registration index + leaf
+ *              at the normalized version, the lead .nupkg download
+ *              BYTE-PARITY with the lowercased disposition; the V2 OData pair
+ *              (the static Edmx $metadata + the Packages(Id=..,Version=..)
+ *              entry with d:NormalizedVersion); then the REST management
+ *              list carries the pushed package/version and the whole-package
+ *              DELETE purges it (deletePackageAndReferences' D1 cascade) —
+ *              the versions read and the V3 registration index answer 404
+ *              after.
  *
  * Self-cleaning: the repo DELETEs 204, but packages are OWNER-scoped rows
- * (the repo delete never touches them) and pypi/helm/maven expose no
- * protocol delete — so the battery also sweeps its probe ROWS through
- * wrangler d1 (the fixwave/demo D1-arm precedent; --d1-scope picks the
- * database; needs wrangler auth) in deletePackageAndReferences' cascade
- * order, then asserts zero package rows remain for the probe names. The R2
- * content keys are DOCUMENTED RESIDUE: the unreferenced-blob sweep (the
+ * (the repo delete never touches them): generic/npm/nuget self-clean via
+ * their protocol/management deletes, while pypi/helm/maven expose no
+ * protocol delete — so the battery also sweeps the remaining probe ROWS
+ * through wrangler d1 (the fixwave/demo D1-arm precedent; --d1-scope picks
+ * the database; needs wrangler auth) in deletePackageAndReferences' cascade
+ * order, then asserts zero package rows remain for ALL the probe names. The
+ * R2 content keys are DOCUMENTED RESIDUE: the unreferenced-blob sweep (the
  * cleanup queue, >24 h) is by design the SOLE content-key deleter —
  * row deletes never touch R2 (packages/model.ts deletePackageAndReferences
  * docstring). A red run sweeps the rows + the repo (the failureTail).
@@ -4077,6 +4102,69 @@ const tarBytes = (entries) => {
 };
 
 const shaHex = (algorithm, bytes) => createHash(algorithm).update(bytes).digest("hex");
+
+// The nuget .nupkg fixture — a hand-built STORED-entry zip (the same
+// central-directory layout the worker's nuget zip reader walks: local file
+// headers, the central directory, the EOCD). Method 0 keeps the builder
+// dependency-free (no CompressionStream needed) and plain-Node-exact.
+
+/** The zip CRC-32 (IEEE, reflected — the stored entries carry it). */
+const CRC32_TABLE = (() => {
+  const table = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+const crc32 = (bytes) => {
+  let crc = 0xffffffff;
+  for (const byte of bytes) crc = (CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8)) >>> 0;
+  return (crc ^ 0xffffffff) >>> 0;
+};
+
+/** One minimal zip of STORED entries (`zipStoredBytes([name, bytes])`) —
+ *  32-bit sizes/offsets (a probe fixture stays far under 4 GiB), no zip64,
+ *  no extra fields, zeroed timestamps. Enough for the EOCD +
+ *  central-directory walk parseNugetPackage does. */
+const zipStoredBytes = (entries) => {
+  const u16 = (v) => Buffer.from([v & 0xff, (v >>> 8) & 0xff]);
+  const u32 = (v) => Buffer.from([v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const [name, content] of entries) {
+    const nameBuf = Buffer.from(name, "utf8");
+    const crc = crc32(content);
+    // Local file header: sig, version-needed, flags, method(0=stored),
+    // time, date, crc, compressed size, uncompressed size, name len, extra len.
+    const local = Buffer.concat([
+      u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(crc), u32(content.length), u32(content.length),
+      u16(nameBuf.length), u16(0), nameBuf, content,
+    ]);
+    locals.push(local);
+    // Central directory record: sig, version made by, version needed, flags,
+    // method, time, date, crc, sizes, name len, extra/comment len, disk start,
+    // internal attrs, external attrs, local header offset.
+    centrals.push(Buffer.concat([
+      u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(crc), u32(content.length), u32(content.length),
+      u16(nameBuf.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset),
+      nameBuf,
+    ]));
+    offset += local.length;
+  }
+  const centralBytes = Buffer.concat(centrals);
+  // EOCD: sig, disk numbers, entry counts, central size + offset, comment len.
+  return Buffer.concat([
+    ...locals, centralBytes,
+    u32(0x06054b50), u16(0), u16(0), u16(entries.length), u16(entries.length),
+    u32(centralBytes.length), u32(offset), u16(0),
+  ]);
+};
 
 /** Twine's multipart form: small text fields + the `content` file part
  *  (pypi.ts's scan reads exactly this shape). */
@@ -4185,7 +4273,14 @@ const packagesSteps = (ctx) => {
   const npmName = `probe-npm-${hexId()}`, npmVersion = "1.0.0";
   const helmName = `probe-helm-${hexId()}`, helmVersion = "1.0.0";
   const mavenGroup = "com.example", mavenArtifact = `probe-maven-${hexId()}`, mavenVersion = "1.0.0";
-  ctx.packageNames = [genericName, pypiName, npmName, helmName, `${mavenGroup}:${mavenArtifact}`];
+  // nuget: the ID follows the NuGet dotted convention (the id regex allows
+  // [.-] separators); the version carries the fifth segment + metadata so the
+  // wire proves toNormalizedVersion ("1.04.5.2.5-rc.1+probe" stores and reads
+  // as "1.4.5.2-rc.1" — the fifth segment and the metadata dropped).
+  const nugetId = `Probe.Nuget.${hexId()}`;
+  const NUGET_VERSION_RAW = "1.04.5.2.5-rc.1+probe";
+  const NUGET_VERSION_NORM = "1.4.5.2-rc.1";
+  ctx.packageNames = [genericName, pypiName, npmName, helmName, `${mavenGroup}:${mavenArtifact}`, nugetId];
   const genericBytes = Buffer.from(`deploy-probes generic round-trip ${genericName}\n`, "utf8");
   const pypiBytes = Buffer.from(`deploy-probes pypi wheel payload for ${pypiName}\n`, "utf8");
   const jarBytes = Buffer.from(`deploy-probes maven jar payload for ${mavenArtifact}\n`, "utf8");
@@ -4211,6 +4306,25 @@ const packagesSteps = (ctx) => {
     `  <name>deploy-probes maven probe</name>`,
     `</project>`,
   ].join("\n");
+  // nuget nupkg: the ROOT .nuspec (case-insensitive suffix, no slash) beside
+  // a nested lib/ entry the root rule must skip — stored entries, real CRCs.
+  const nugetNuspec = [
+    `<?xml version="1.0" encoding="utf-8"?>`,
+    `<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">`,
+    `  <metadata>`,
+    `    <id>${nugetId}</id>`,
+    `    <version>${NUGET_VERSION_RAW}</version>`,
+    `    <authors>deploy-probes</authors>`,
+    `    <description>deploy-probes nuget round-trip probe</description>`,
+    `    <projectUrl>https://gitea.io/</projectUrl>`,
+    `  </metadata>`,
+    `</package>`,
+  ].join("\n");
+  const nugetNupkg = zipStoredBytes([
+    ["package.nuspec", Buffer.from(nugetNuspec, "utf8")],
+    ["lib/net45/payload.bin", Buffer.from(`deploy-probes nuget payload ${nugetId}\n`, "utf8")],
+  ]);
+  const nugetLeadName = `${nugetId}.${NUGET_VERSION_NORM}.nupkg`; // stored LOWERCASED (strings.ToLower)
   return [
     {
       id: "pkg-create-repo-201",
@@ -4371,6 +4485,98 @@ const packagesSteps = (ctx) => {
       },
     },
     {
+      id: "pkg-nuget-v3-publish-roundtrip",
+      expect: `nuget V3: GET /nuget/index.json → 200 (version 3.0.0, 9 resources, PackagePublish/2.0.0 at the base); PUT /nuget/ the stored-entry .nupkg (root .nuspec) with X-NuGet-ApiKey and NO Authorization header (the nuget.Auth fallback arm) → 201; GET /registration/${nugetId}/index.json → 200 with the NORMALIZED ${NUGET_VERSION_NORM} (the fifth-segment rule over "${NUGET_VERSION_RAW}"); GET the leaf .json → 200 Package @type + the normalized packageContent; GET the lead .nupkg → the archive VERBATIM + the lowercased disposition`,
+      run: async () => {
+        const nugetBase = `${opts.baseUrl}/api/packages/${ctx.user}/nuget`;
+        const index = await pkgFetch(`/${ctx.user}/nuget/index.json`);
+        expect(index.status === 200, `service-index status ${index.status} (expected 200)`);
+        const idx = JSON.parse(index.text);
+        expect(idx?.version === "3.0.0", `service-index version ${JSON.stringify(idx?.version)} (expected 3.0.0)`);
+        expect(Array.isArray(idx?.resources) && idx.resources.length === 9,
+          `service-index carries ${JSON.stringify(idx?.resources?.length)} resources (expected 9)`);
+        const publish = Array.isArray(idx?.resources) ? idx.resources.find((r) => r?.["@type"] === "PackagePublish/2.0.0") : null;
+        expect(publish?.["@id"] === nugetBase, `service-index publish resource ${JSON.stringify(publish)} (expected ${nugetBase})`);
+        // The upload: X-NuGet-ApiKey carries the token, the Authorization
+        // header stays ABSENT — upstream's apiKey fallback arm (auth.go:23-26;
+        // fetch sets Content-Length for the Buffer body — the 411 arm's door).
+        const put = await fetchT(`${nugetBase}/`, {
+          method: "PUT",
+          headers: { "X-NuGet-ApiKey": TOKEN, "content-type": "application/octet-stream" },
+          body: nugetNupkg,
+        });
+        const putText = Buffer.from(await put.arrayBuffer()).toString("utf8");
+        expect(put.status === 201, `nupkg upload status ${put.status} (expected 201): ${putText.slice(0, 120) || "(empty body)"}`);
+        const reg = await pkgFetch(`/${ctx.user}/nuget/registration/${nugetId}/index.json`);
+        expect(reg.status === 200, `registration-index status ${reg.status} (expected 200)`);
+        const regJson = JSON.parse(reg.text);
+        const page = Array.isArray(regJson?.items) ? regJson.items[0] : null;
+        expect(regJson?.count === 1 && page?.count === 1,
+          `registration counts ${JSON.stringify([regJson?.count, page?.count])} (expected 1/1)`);
+        expect(page?.lower === NUGET_VERSION_NORM && page?.upper === NUGET_VERSION_NORM,
+          `registration bounds ${JSON.stringify([page?.lower, page?.upper])} (expected ${NUGET_VERSION_NORM} — the NORMALIZED version)`);
+        const leafItem = Array.isArray(page?.items) ? page.items[0] : null;
+        expect(leafItem?.catalogEntry?.id === nugetId && leafItem?.catalogEntry?.version === NUGET_VERSION_NORM,
+          `catalogEntry ${JSON.stringify(leafItem?.catalogEntry?.id)}/${JSON.stringify(leafItem?.catalogEntry?.version)} (expected ${nugetId}/${NUGET_VERSION_NORM})`);
+        expect(leafItem?.["@id"] === `${nugetBase}/registration/${nugetId}/${NUGET_VERSION_NORM}.json`,
+          `leaf @id ${JSON.stringify(leafItem?.["@id"])} (expected the normalized .json URL)`);
+        const leaf = await pkgFetch(`/${ctx.user}/nuget/registration/${nugetId}/${NUGET_VERSION_NORM}.json`);
+        expect(leaf.status === 200, `registration-leaf status ${leaf.status} (expected 200)`);
+        const leafJson = JSON.parse(leaf.text);
+        expect(Array.isArray(leafJson?.["@type"]) && leafJson["@type"][0] === "Package",
+          `registration-leaf @type ${JSON.stringify(leafJson?.["@type"])} (expected Package first)`);
+        expect(leafJson?.packageContent === `${nugetBase}/package/${nugetId}/${NUGET_VERSION_NORM}/${nugetLeadName}`,
+          `registration-leaf packageContent ${JSON.stringify(leafJson?.packageContent)} (expected the normalized download URL)`);
+        const dl = await pkgFetch(`/${ctx.user}/nuget/package/${nugetId}/${NUGET_VERSION_NORM}/${nugetLeadName}`);
+        expect(dl.status === 200, `nupkg download status ${dl.status} (expected 200)`);
+        expect(dl.bytes.equals(nugetNupkg), `nupkg bytes != the uploaded archive (${dl.bytes.length} vs ${nugetNupkg.length})`);
+        expect(String(dl.headers.get("content-disposition") ?? "").includes(nugetLeadName.toLowerCase()),
+          `nupkg disposition missing the lowercased lead name ${nugetLeadName.toLowerCase()}`);
+        return `service index 9 resources; upload 201 via X-NuGet-ApiKey; registration index/leaf answer ${NUGET_VERSION_NORM}; nupkg verbatim`;
+      },
+    },
+    {
+      id: "pkg-nuget-v2-odata",
+      expect: `nuget V2: GET /nuget/$metadata → 200 (the static Edmx document, the V2FeedPackage entity); GET /nuget/Packages(Id='${nugetId}',Version='${NUGET_VERSION_NORM}') → 200 atom entry with d:Id + d:NormalizedVersion + the self-closing <content/> at the lead nupkg`,
+      run: async () => {
+        const md = await pkgFetch(`/${ctx.user}/nuget/$metadata`);
+        expect(md.status === 200, `$metadata status ${md.status} (expected 200)`);
+        expect(md.text.includes('<edmx:Edmx xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx" Version="1.0">'),
+          `$metadata missing the Edmx root`);
+        expect(md.text.includes('<EntityType Name="V2FeedPackage" m:HasStream="true">'),
+          `$metadata missing the V2FeedPackage entity`);
+        const entry = await pkgFetch(`/${ctx.user}/nuget/Packages(Id='${nugetId}',Version='${NUGET_VERSION_NORM}')`);
+        expect(entry.status === 200, `Packages(Id=..) entry status ${entry.status} (expected 200)`);
+        expect(entry.text.includes(`<d:Id>${nugetId}</d:Id>`), `entry missing <d:Id>${nugetId}</d:Id>`);
+        expect(entry.text.includes(`<d:NormalizedVersion>${NUGET_VERSION_NORM}</d:NormalizedVersion>`),
+          `entry missing <d:NormalizedVersion>${NUGET_VERSION_NORM}</d:NormalizedVersion>`);
+        expect(entry.text.includes(
+          `<content type="application/zip" src="${opts.baseUrl}/api/packages/${ctx.user}/nuget/package/${nugetId}/${NUGET_VERSION_NORM}/${nugetLeadName}"/>`,
+        ), `entry missing the self-closing <content/> at ${nugetLeadName}`);
+        return `Edmx + Packages(Id='${nugetId}') entry answer the normalized version`;
+      },
+    },
+    {
+      id: "pkg-nuget-management-purge",
+      expect: `nuget cascade: GET /api/v1/packages/${ctx.user}?type=nuget&q=${nugetId} lists ${nugetId}@${NUGET_VERSION_NORM}; DELETE /api/v1/packages/${ctx.user}/nuget/${nugetId} → 204 (deletePackageAndReferences' cascade — the whole-package purge); the versions read then shows the package GONE (404 or an empty list) and the V3 registration index 404s`,
+      run: async () => {
+        const list = await api(`/packages/${ctx.user}?type=nuget&q=${encodeURIComponent(nugetId)}`);
+        expect(list.status === 200, `management-list status ${list.status} (expected 200)`);
+        const row = Array.isArray(list.json)
+          ? list.json.find((p) => p?.type === "nuget" && p?.name === nugetId && p?.version === NUGET_VERSION_NORM)
+          : null;
+        expect(row !== null, `management list carries no ${nugetId}@${NUGET_VERSION_NORM} (body: ${list.text.slice(0, 120)})`);
+        const del = await api(`/packages/${ctx.user}/nuget/${encodeURIComponent(nugetId)}`, { method: "DELETE" });
+        expect(del.status === 204, `purge status ${del.status} (expected 204)`);
+        const gone = await api(`/packages/${ctx.user}/nuget/${encodeURIComponent(nugetId)}`);
+        expect(gone.status === 404 || (gone.status === 200 && Array.isArray(gone.json) && gone.json.length === 0),
+          `post-purge versions read ${gone.status} ${gone.text.slice(0, 80)} (expected 404 or an empty list)`);
+        const regGone = await pkgFetch(`/${ctx.user}/nuget/registration/${nugetId}/index.json`);
+        expect(regGone.status === 404, `post-purge V3 registration status ${regGone.status} (expected 404)`);
+        return `management list carried ${nugetId}@${NUGET_VERSION_NORM}; purge 204 → versions gone + V3 registration 404`;
+      },
+    },
+    {
       id: "pkg-cleanup-rows-d1",
       expect: `the row sweep (wrangler d1 --${opts.d1Scope}; needs wrangler auth): the probe's package/version/file/property/blob ROWS delete in deletePackageAndReferences' cascade order, then zero package rows remain for the probe names — the R2 content keys are DOCUMENTED residue (the unreferenced-blob sweep is the SOLE content-key deleter, >24 h cleanup cadence)`,
       run: async () => {
@@ -4524,7 +4730,7 @@ const BATTERIES = {
   // wrangler D1 plumbing (--d1-scope picks the database, wrangler auth
   // required — the fixwave/branch-protection precedent). The R2 content-key
   // residue is documented in the battery header.
-  "packages-registry": { title: "packages registry (v1.3: generic round-trip + delete, pypi multipart → simple index, npm publish → packument → unpublish, helm chart → index.yaml, maven pom/jar → metadata.xml, then the D1 row sweep + repo delete)", context: packagesContext, steps: packagesSteps, failureTail: packagesFailureCleanup },
+  "packages-registry": { title: "packages registry (v1.3: generic round-trip + delete, pypi multipart → simple index, npm publish → packument → unpublish, helm chart → index.yaml, maven pom/jar → metadata.xml, nuget V3 publish (X-NuGet-ApiKey, normalized version) → registration/leaf/download + V2 Edmx/Packages(Id=..) → the management purge, then the D1 row sweep + repo delete)", context: packagesContext, steps: packagesSteps, failureTail: packagesFailureCleanup },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
