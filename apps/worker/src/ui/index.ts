@@ -688,6 +688,7 @@ import { trimTrailingSlash } from "hono/trailing-slash";
 
 import { isReservedOwnerName } from "../repos/service";
 import { users } from "../db/schema";
+import type { RunRow } from "../services/actions/model";
 import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
 import { AssetBuildError, loadManifest } from "./manifest";
@@ -712,6 +713,48 @@ import {
   readEditorForm,
   renderFileEditorPage,
 } from "./pages/file-editor";
+import {
+  loadRepoActionsRunsData,
+  parseActionRunQuery,
+  renderRepoActionsRunsFragment,
+  renderRepoActionsRunsPage,
+} from "./pages/repo-actions-runs";
+import {
+  loadJobQueuePageData,
+  renderAdminActionsJobQueuePage,
+  renderJobQueueFragment,
+  renderRepoActionsJobQueuePage,
+} from "./pages/repo-actions-queue";
+import {
+  buildViewResponse,
+  cancelActionRun,
+  loadRepoActionsViewPageData,
+  parsePathParamInt64,
+  readViewRequest,
+  renderRepoActionsViewPage,
+  resolveRunAttemptAndJobs,
+  resolveRunByPath,
+  resolveRunForView,
+} from "./pages/repo-actions-view";
+import {
+  deleteRepoActionsRunner,
+  loadRepoActionsRunnerEditPageData,
+  loadRepoActionsRunnersPageData,
+  parseRepoActionsRunnerDescriptionForm,
+  parseRepoActionsRunnerDisabledForm,
+  renderRepoActionsRunnerEditPage,
+  renderRepoActionsRunnersPage,
+  resetRepoActionsRunnerToken,
+  setRepoActionsRunnerDisabled,
+  updateRepoActionsRunnerDescription,
+} from "./pages/repo-settings-actions-runners";
+import {
+  applyRepoActionsUnitToggle,
+  loadRepoActionsGeneralPageData,
+  parseRepoActionsUnitForm,
+  REPO_ACTIONS_GENERAL_REDIRECT_TARGET,
+  renderRepoActionsGeneralPage,
+} from "./pages/repo-settings-actions-general";
 import {
   applyIssueLabels,
   createCommentFromForm,
@@ -1747,7 +1790,25 @@ export interface SettingsRoute {
     | "settings-actions-variables" // GET /settings/actions/variables
     | "settings-actions-variables-new" // POST /settings/actions/variables/new
     | "settings-actions-variables-edit" // POST /settings/actions/variables/{id}/edit
-    | "settings-actions-variables-delete"; // POST /settings/actions/variables/{id}/delete
+    | "settings-actions-variables-delete" // POST /settings/actions/variables/{id}/delete
+    // The census C7 arm: the repo settings Actions RUNNERS sub-tab
+    // (pages/repo-settings-actions-runners.tsx — upstream web.go:506-513's
+    // addSettingsRunnersRoutes inside the /actions group). The literal
+    // reset_registration_token claims ahead of the {id} combo (chi's
+    // static-first order, web.go:507-512).
+    | "settings-actions-runners" // GET /settings/actions/runners
+    | "settings-actions-runners-token-reset" // POST /settings/actions/runners/reset_registration_token
+    | "settings-actions-runners-edit" // GET+POST /settings/actions/runners/{id} (page + the description update)
+    | "settings-actions-runners-update" // POST /settings/actions/runners/{id}/update-runner
+    | "settings-actions-runners-delete" // POST /settings/actions/runners/{id}/delete
+    // The census C9 arm: the repo settings Actions GENERAL sub-tab (pages/
+    // repo-settings-actions-general.tsx — upstream web.go:1262-1278). The
+    // page + its unit-toggle POST sit OUTSIDE MustEnableActions (the
+    // disabled unit's re-entry); the bare literal's redirect carries the
+    // unit arm INSIDE the gate (the enabled unit's shortcut).
+    | "settings-actions" // GET /settings/actions (the redirect onto ./actions/general)
+    | "settings-actions-general" // GET /settings/actions/general
+    | "settings-actions-general-unit"; // POST /settings/actions/general/actions_unit
   owner: string;
   repo: string;
   /** The hook id (the detail/test/delete families only) or the rule id (the
@@ -2693,6 +2754,65 @@ export interface GraphRoute {
   repo: string;
 }
 
+/** The census C1 runs-list family (pages/repo-actions-runs.tsx): upstream
+ *  web.go:1606-1608's `m.Get("", actions.List)` in the /actions group —
+ *  group middleware `optSignIn, RepoAssignment, repo.MustBeNotEmpty,
+ *  reqRepoActionsReader, actions.MustEnableActions` (the READ page needs no
+ *  sign-in on a readable repo; the not-empty + unit-flag arms are the
+ *  handler's). The family claims the BARE `/actions` literal only — the
+ *  sibling tails (`/job_queue` C6's, `/runs/{run}` C2's, `/run`,
+ *  `/disable`, `/enable`, `/workflow-dispatch-inputs`,
+ *  `/approve-all-checks`, the badge route) stay unclaimed → the engine's
+ *  404 until their units land. The `?run_ids=` fragment arm is a QUERY
+ *  discriminator (actions.go:632 `Form.Has("run_ids")`), not a path shape. */
+export interface RepoActionsRunsRoute {
+  family: "repo-actions-runs";
+  owner: string;
+  repo: string;
+}
+
+/** The census C6 job-queue family (pages/repo-actions-queue.tsx): upstream
+ *  web.go:1570's `m.Get("/job_queue", actions.JobQueue)` in the /actions
+ *  group — the SAME read-group middleware ladder as the runs list (the C1
+ *  family's gate note: optSignIn + RepoAssignment + MustBeNotEmpty +
+ *  reqRepoActionsReader + MustEnableActions). The `?refresh=1` fragment arm
+ *  is a QUERY discriminator (job_queue.go:128 FormBool), not a path shape. */
+export interface RepoActionsJobQueueRoute {
+  family: "repo-actions-job-queue";
+  owner: string;
+  repo: string;
+}
+
+/** The census C2 run-viewer family (pages/repo-actions-view.tsx): upstream
+ *  web.go:1602-1605's three GET+POST pairs — `m.Get`+`m.Post` on
+ *  `/runs/{run}`, `/runs/{run}/attempts/{attempt}` and `/runs/{run}/jobs/{job}`
+ *  (one View shell / ViewPost JSON pair per shape) — plus web.go:1601's
+ *  `m.Post("/runs/{run}/cancel", reqRepoActionsWriter, actions.Cancel)` (the
+ *  census C5-adjacent arm; the rerun/rerun-failed tails are
+ *  emitter-dependent and stay unclaimed per the census C5 flag). The same
+ *  read-group middleware ladder gates every shape (the C1 family's note:
+ *  optSignIn + RepoAssignment + MustBeNotEmpty + reqRepoActionsReader +
+ *  MustEnableActions). The segments claim for ANY single-segment value (chi
+ *  params; PathParamInt64 parses junk to 0 — the loader's 404/absent arms),
+ *  the exact literal tails only; every deeper tail and the remaining
+ *  siblings (`/run`, `/disable`, `/enable`, `/workflow-dispatch-inputs`,
+ *  `/approve-all-checks`, `/runs/{run}/rerun*`, `/runs/{run}/workflow`,
+ *  `/runs/{run}/logs`, the artifacts tails) stay unclaimed → the engine's
+ *  404 until their units land. */
+export interface RepoActionsRunViewRoute {
+  family: "actions-run-view" | "actions-run-cancel";
+  owner: string;
+  repo: string;
+  /** The raw {run} segment: the run row id, the legacy per-repo run index,
+   *  or the "latest" literal (junk parses to the loader's 404). */
+  run: string;
+  /** The raw {attempt} segment (the attempts shape only). */
+  attempt?: string;
+  /** The raw {job} segment (the jobs shape only). */
+  job?: string;
+}
+
+
 /** Window-2e B2: the repo-scoped aux feeds + fragments (issues-search-aux,
  *  issue-content-fragments, pull-merge-box, compare-feeds,
  *  pull-files-single-commit, activity-author-data). */
@@ -2771,7 +2891,13 @@ export interface AdminRoute {
     | "admin-config"
     | "admin-notices"
     | "admin-notices-delete"
-    | "admin-notices-empty";
+    | "admin-notices-empty"
+    // The census C6 arm: the admin JOB QUEUE page (pages/repo-actions-queue.tsx
+    // — web.go:904's `GET /actions/job_queue` shared_actions.JobQueue inside
+    // the /-/admin group's /actions group; the group's runners/variables/
+    // scoped-workflows tails stay unclaimed — their admin pages are not
+    // landed, the dead-link rule).
+    | "admin-actions-job-queue";
   /** The monitor page (stats/cron/queue/stacktrace → the module's
    *  AdminMonitorPage union); absent on the dashboard family and the three
    *  listing families. */
@@ -3004,6 +3130,9 @@ export type ParsedUiRoute =
   | RepoActivityRoute
   | RepoChartRoute
   | GraphRoute
+  | RepoActionsRunsRoute
+  | RepoActionsJobQueueRoute
+  | RepoActionsRunViewRoute
   | SiteHomeRoute
   | ExploreRoute
   | NotificationsRoute
@@ -3345,6 +3474,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 1 && tail[0] === "notices") return { family: "admin-notices" };
     if (tail.length === 2 && tail[0] === "notices" && tail[1] === "delete") return { family: "admin-notices-delete" };
     if (tail.length === 2 && tail[0] === "notices" && tail[1] === "empty") return { family: "admin-notices-empty" };
+    // The census C6 arm (pages/repo-actions-queue.tsx — web.go:898-905's
+    // /actions group's job_queue GET): the exact two-tail literal under the
+    // admin scope. The group's bare literal (upstream's ./actions/runners
+    // LocationRedirect) and its runners/variables/scoped-workflows tails
+    // stay unclaimed — the admin pages are not landed (the dead-link rule),
+    // the engine's 404.
+    if (tail.length === 2 && tail[0] === "actions" && tail[1] === "job_queue") {
+      return { family: "admin-actions-job-queue" };
+    }
     if (tail.length === 2 && tail[0] === "monitor") {
       if (tail[1] === "stats") return { family: "admin-monitor", page: "stats" };
       if (tail[1] === "cron") return { family: "admin-monitor", page: "cron" };
@@ -3929,6 +4067,57 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
   }
 
+  // The census C1 runs-list family (pages/repo-actions-runs.tsx — upstream
+  // web.go:1606-1608's `m.Get("", actions.List)` opening the /actions
+  // group). The BARE literal claims; every sibling tail (`/job_queue` C6's,
+  // `/runs/{run}` C2's, `/run`, `/disable`, `/enable`,
+  // `/workflow-dispatch-inputs`, `/approve-all-checks`, the badge route)
+  // stays unclaimed → the engine's 404 until its unit lands (the
+  // RepoActionsRunsRoute interface's claim note). The `?run_ids=` fragment
+  // discriminator rides the query, not the path.
+  if (head === "actions" && rest.length === 0) {
+    return { family: "repo-actions-runs", owner, repo };
+  }
+
+  // The census C6 job-queue family (pages/repo-actions-queue.tsx — upstream
+  // web.go:1570's `m.Get("/job_queue", actions.JobQueue)` inside the /actions
+  // group, beside the C1 runs-list claim above). The exact literal only:
+  // `/actions/job_queue/anything` and every other sibling tail (`/runs/{run}`
+  // C2's, `/run`, `/disable`, `/enable`, `/workflow-dispatch-inputs`,
+  // `/approve-all-checks`, the badge route) stay unclaimed → the engine's
+  // 404 until their units land. The `?refresh=1` fragment discriminator
+  // rides the query, not the path.
+  if (head === "actions" && rest.length === 1 && rest[0] === "job_queue") {
+    return { family: "repo-actions-job-queue", owner, repo };
+  }
+
+  // The census C2 run-viewer subtree (pages/repo-actions-view.tsx —
+  // web.go:1601-1605's cancel POST + the three GET+POST view pairs under
+  // /runs). The {run}/{attempt}/{job} segments claim for ANY single-segment
+  // value (chi params — junk parses to PathParamInt64's 0, the loader's
+  // 404/absent arms), the exact literal tails only; every deeper tail
+  // (`/runs/{run}/attempts/{n}/...`) and the remaining siblings (`/run`,
+  // `/disable`, `/enable`, `/workflow-dispatch-inputs`,
+  // `/approve-all-checks`, `/runs/{run}/rerun*`, `/runs/{run}/workflow`,
+  // `/runs/{run}/logs`, the artifacts tails) stay unclaimed → the engine's
+  // 404 until their units land (the RepoActionsRunViewRoute interface's
+  // note).
+  if (head === "actions" && rest.length >= 3 && rest[0] === "runs") {
+    if (rest.length === 3 && rest[2] === "cancel") {
+      return { family: "actions-run-cancel", owner, repo, run: rest[1] as string };
+    }
+    if (rest.length === 4 && rest[2] === "attempts") {
+      return { family: "actions-run-view", owner, repo, run: rest[1] as string, attempt: rest[3] as string };
+    }
+    if (rest.length === 4 && rest[2] === "jobs") {
+      return { family: "actions-run-view", owner, repo, run: rest[1] as string, job: rest[3] as string };
+    }
+    return null;
+  }
+  if (head === "actions" && rest.length === 2 && rest[0] === "runs") {
+    return { family: "actions-run-view", owner, repo, run: rest[1] as string };
+  }
+
   if (head === "issues" || head === "pulls") {
     // Window-2e folds: the pulls/new redirect (web.go:1314) — MUST claim or
     // the dispatcher's handlesUiRoute consult hands it to the engine before
@@ -4126,6 +4315,45 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (rest.length === 4 && rest[0] === "actions" && rest[1] === "variables" && rest[3] === "delete" && /^-?\d+$/.test(rest[2] as string)) {
       return { family: "settings-actions-variables-delete", owner, repo, id: Number.parseInt(rest[2] as string, 10) };
+    }
+    // The census C7 arm (pages/repo-settings-actions-runners.tsx — upstream
+    // web.go:506-513's addSettingsRunnersRoutes inside the /actions group):
+    // the list GET, the reset-token POST (the LITERAL claims ahead of the
+    // {id} combo — chi's static-first dispatch, web.go:507-512), the
+    // {id} edit combo (GET page + POST description) and the two write POSTs.
+    // The runner ids claim integers only (the settings-actions-variables
+    // PathParamInt64 parity: junk fails the parse, a negative parses and
+    // 404-shells on the scope lookup). Every other tail (bare /runners/{id}/
+    // junk, deeper) stays engine-owned.
+    if (rest.length === 2 && rest[0] === "actions" && rest[1] === "runners") {
+      return { family: "settings-actions-runners", owner, repo };
+    }
+    if (rest.length === 3 && rest[0] === "actions" && rest[1] === "runners" && rest[2] === "reset_registration_token") {
+      return { family: "settings-actions-runners-token-reset", owner, repo };
+    }
+    if (rest.length === 3 && rest[0] === "actions" && rest[1] === "runners" && /^-?\d+$/.test(rest[2] as string)) {
+      return { family: "settings-actions-runners-edit", owner, repo, id: Number.parseInt(rest[2] as string, 10) };
+    }
+    if (rest.length === 4 && rest[0] === "actions" && rest[1] === "runners" && rest[3] === "update-runner" && /^-?\d+$/.test(rest[2] as string)) {
+      return { family: "settings-actions-runners-update", owner, repo, id: Number.parseInt(rest[2] as string, 10) };
+    }
+    if (rest.length === 4 && rest[0] === "actions" && rest[1] === "runners" && rest[3] === "delete" && /^-?\d+$/.test(rest[2] as string)) {
+      return { family: "settings-actions-runners-delete", owner, repo, id: Number.parseInt(rest[2] as string, 10) };
+    }
+    // The census C9 arm (pages/repo-settings-actions-general.tsx — upstream
+    // web.go:1262-1278's general group, mounted OUTSIDE MustEnableActions):
+    // the bare literal (the redirect — its unit arm rides the HANDLER, not
+    // the parse), the general page, and the actions_unit POST. The exact
+    // literals only; the unlanded token-permissions/collaborative-owners
+    // tails stay engine-owned (the module's documented-unrendered reduction).
+    if (rest.length === 1 && rest[0] === "actions") {
+      return { family: "settings-actions", owner, repo };
+    }
+    if (rest.length === 2 && rest[0] === "actions" && rest[1] === "general") {
+      return { family: "settings-actions-general", owner, repo };
+    }
+    if (rest.length === 3 && rest[0] === "actions" && rest[1] === "general" && rest[2] === "actions_unit") {
+      return { family: "settings-actions-general-unit", owner, repo };
     }
     if (rest.length === 1 && rest[0] === "public_access") {
       return { family: "settings-public-access", owner, repo };
@@ -5084,6 +5312,12 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
   const settings = await loadRepoSettings(c.env.DB, repo.id);
   resolved.ctx.repoHasProjects = settings.hasProjects;
   resolved.ctx.repoHasPackages = settings.hasPackages;
+  // The Actions unit toggle (SPEC-0012 M1c C1 — repo_settings.has_actions,
+  // the repoHasPackages twin): the shell's Actions tab (repo/header.tmpl:
+  // 130-139's unit conditional) reads this flag; the /actions handler
+  // re-reads the store for its MustEnableActions 404 arm (the C8 gate's
+  // polarity).
+  resolved.ctx.repoHasActions = settings.hasActions;
   return { ...resolved, repo };
 }
 
@@ -5744,6 +5978,437 @@ async function repoActionsVariablesDelete(c: Context<{ Bindings: Env }>, variabl
   const outcome = await deleteRepoActionsVariable(c.env.DB, repo.id, variableId);
   if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/variables` } }));
+}
+
+// ---------------------------------------------------------------------------
+// The census C1 arm: the repo Actions tab's RUNS LIST (pages/
+// repo-actions-runs.tsx — upstream web.go:1606-1608's /actions group with
+// actions.List). The READ group's gate ladder mirrors the group middleware
+// exactly: resolveUiRequest IS optSignIn + RepoAssignment (a public repo
+// renders for anonymous — NO settingsGate here), then repo.MustBeNotEmpty
+// (actions.go's GetBranchCommit miss → NotFoundPrompt 404; the empty-repo
+// shell's own arm), then MustEnableActions' repo-unit arm — the C8 gate's
+// has_actions polarity (a disabled unit answers the 404 shell and the
+// navbar's conditional renders from the same flag). The `?run_ids=` query
+// presence is the fragment discriminator (actions.go:632 Form.Has): the
+// partial-refresh arm renders the runs_list fragment ALONE — the morph
+// root the bundle's initActionRunsList timer polls.
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/actions (actions.List) — the full page, or the
+ *  `?run_ids=` fragment. */
+async function repoActionsRunsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "repo-actions-runs") return respond(await c.notFound()); // drift guard
+  // repo.MustBeNotEmpty (web.go:1608's group middleware) — an empty repo
+  // has no default branch to list workflows from; upstream 404s the group
+  // (actions.go:90-98's GetBranchCommit miss arm).
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  // MustEnableActions' repo-unit arm (actions.go:67-81 → the landed
+  // repo_settings.has_actions) — the C8 gate's polarity verbatim.
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasActions) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadRepoActionsRunsData({
+    d1: c.env.DB,
+    engine: engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`),
+    repo,
+    query: parseActionRunQuery(url.searchParams),
+    requestUri: url.pathname + url.search,
+    canWriteActions: viewer.kind === "user" && (await canWriteRepo(c.env, repo, viewer)),
+    nowSeconds: Math.floor(routeNow().getTime() / 1000),
+  });
+  if (resolved.url.searchParams.has("run_ids")) {
+    return respond(c.html(renderRepoActionsRunsFragment(data, `/${repo.ownerNamespace}/${repo.slug}`), 200));
+  }
+  return respond(c.html(renderRepoActionsRunsPage(ctx, data), 200));
+}
+
+// ---------------------------------------------------------------------------
+// The census C2 arm: the run-viewer subtree (pages/repo-actions-view.tsx —
+// web.go:1601-1605's cancel POST + the three GET+POST view pairs). The gate
+// ladder is the C1 read group's verbatim (the run viewer needs NO sign-in on
+// a readable repo — upstream's optSignIn + reqRepoActionsReader), the write
+// arms add RequireUnitWriter's NotFound (the cancel POST 404-shells an
+// anonymous viewer — a fetch arm, never the login 303). The GET is the SSR
+// mount shell (view.tmpl's two data attributes + the locale set); the POST
+// is the ViewResponse JSON twin (the official bundle's Vue app polls it).
+// ---------------------------------------------------------------------------
+
+/** The view subtree's shared read gate: the C1 handler's MustBeNotEmpty +
+ *  MustEnableActions arms verbatim. Returns the Response to answer, or null
+ *  to proceed. */
+async function actionsRunViewGate(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+): Promise<Response | null> {
+  const { ctx, repo, respond } = resolved;
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasActions) return respond(c.html(renderNotFound(ctx), 404));
+  return null;
+}
+
+/** The resolved run for one view request, answering the 404/redirect arms
+ *  upstream's resolution returns. */
+async function resolveActionsRunOrAnswer(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+  runRaw: string,
+  jobRaw: string,
+  idFirst: boolean,
+): Promise<Response | { answer: "run"; run: RunRow }> {
+  const { url, ctx, repo, respond } = resolved;
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  const outcome = idFirst
+    ? await (async () => {
+        const run = await resolveRunByPath(c.env.DB, repo.id, runRaw);
+        return run === null ? { outcome: "not-found" as const } : { outcome: "run" as const, run };
+      })()
+    : await resolveRunForView(
+        c.env.DB,
+        repo.id,
+        runRaw,
+        jobRaw,
+        url.searchParams.get("by_id") === "1",
+        url.searchParams.get("by_index") === "1",
+        repoLink,
+      );
+  if (outcome.outcome === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  if (outcome.outcome === "redirect") {
+    // ctx.Redirect(..., http.StatusFound) — the legacy index-URL
+    // canonicalization (view.go:123-128/225-233), a 302 Found.
+    return respond(new Response(null, { status: 302, headers: { location: outcome.location } }));
+  }
+  return { answer: "run", run: outcome.run };
+}
+
+/** GET /{owner}/{repo}/actions/runs/{run}[/attempts/{n}][/jobs/{n}]
+ *  (actions.View) — the SSR mount shell. */
+async function actionsRunViewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-run-view") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  const route = resolved.route;
+  const run = await resolveActionsRunOrAnswer(c, resolved, route.run, route.job ?? "", false);
+  if (!("answer" in run)) return run;
+  const attemptNum = route.attempt === undefined ? 0 : parsePathParamInt64(route.attempt);
+  const jobId = route.job === undefined ? 0 : parsePathParamInt64(route.job);
+  const runLink = `/${repo.ownerNamespace}/${repo.slug}/actions/runs/${run.run.id}`;
+  // ActionsViewURL (view.go:311-324): the endpoint the Vue app POSTs its
+  // state polls to — attempt-scoped, job-scoped, or the bare run link.
+  const actionsViewUrl =
+    attemptNum > 0 ? `${runLink}/attempts/${attemptNum}` : jobId > 0 ? `${runLink}/jobs/${jobId}` : runLink;
+  const data = await loadRepoActionsViewPageData(c.env.DB, run.run, jobId);
+  data.actionsViewUrl = actionsViewUrl;
+  return respond(c.html(renderRepoActionsViewPage(ctx, data), 200));
+}
+
+/** POST /{owner}/{repo}/actions/runs/{run}[/attempts/{n}][/jobs/{n}]
+ *  (actions.ViewPost) — the ViewResponse JSON the official bundle's Vue app
+ *  renders from (and polls while `!state.run.done`). The sameOriginGuard
+ *  rides first (the census open question 5's posture — a same-origin fetch
+ *  sends Origin; cross-origin 403s before any read). */
+async function actionsRunViewJson(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-run-view") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  const route = resolved.route;
+  // ViewPost resolves through getCurrentRunJobsByPathParam — the ID-based
+  // lookup WITHOUT the GET's index disambiguation (the module header's
+  // GET/POST asymmetry note).
+  const run = await resolveActionsRunOrAnswer(c, resolved, route.run, route.job ?? "", true);
+  if (!("answer" in run)) return run;
+  const { attempt, jobs } = await resolveRunAttemptAndJobs(c.env.DB, run.run, route.attempt ?? "", route.job ?? "");
+  const request = await readViewRequest(c.req.raw);
+  const built = await buildViewResponse(c.env.DB, run.run, { attempt, jobs }, {
+    env: c.env,
+    repo,
+    canWriteActions: viewer.kind === "user" && (await canWriteRepo(c.env, repo, viewer)),
+    isSigned: viewer.kind === "user",
+    logCursors: request.logCursors,
+    attemptRaw: route.attempt ?? "",
+    jobRaw: route.job ?? "",
+  });
+  if (built.outcome === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  // ctx.JSON's content type (services/context/base.go:115-117).
+  return respond(
+    new Response(JSON.stringify(built.response), {
+      status: 200,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
+/** POST /{owner}/{repo}/actions/runs/{run}/cancel (actions.Cancel — the
+ *  census C5-adjacent arm): the writer gate (RequireUnitWriter's NotFound —
+ *  anonymous 404-shells, never the login 303), the latest-attempt check
+ *  (view.go:944-951), then the CancelRun v1 reduction, answering
+ *  ctx.JSONOK's `{"ok":true}` dummy the frontend seldom reads. */
+async function actionsRunCancel(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-run-cancel") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404)); // RequireUnitWriter's NotFound
+  }
+  const route = resolved.route;
+  const run = await resolveActionsRunOrAnswer(c, resolved, route.run, "", true);
+  if (!("answer" in run)) return run;
+  const { attempt, jobs } = await resolveRunAttemptAndJobs(c.env.DB, run.run, "", "");
+  // checkLatestAttempt (view.go:944-951): only the run's latest attempt
+  // cancels — a historical attempt URL answers the 404 shell.
+  if (attempt !== null && run.run.latestAttemptId !== attempt.id) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  await cancelActionRun(c.env.DB, run.run, jobs);
+  return respond(
+    new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The census C6 arm: the Actions JOB QUEUE pages (pages/repo-actions-queue.tsx
+// — the repo tab arm web.go:1570 + the admin instance arm web.go:904 over
+// the ONE shared fragment; `?refresh=1` answers the fragment ONLY — the
+// morph contract the bundle's initActionJobQueueList timer polls). The repo
+// arm's gate ladder is the C1 runs-list arm's (optSignIn + RepoAssignment
+// via resolveUiRequest, then repo.MustBeNotEmpty, then MustEnableActions'
+// repo-unit arm — the C8 gate's polarity; NO settingsGate: the read page
+// renders for any viewer who can read the repo). The admin arm rides the
+// shared adminPagePrologue (SignInRequired+AdminRequired, web.go:779).
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/actions/job_queue (repo/actions.JobQueue) — the full
+ * page, or the `?refresh=1` fragment. */
+async function repoActionsJobQueuePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "repo-actions-job-queue") return respond(await c.notFound()); // drift guard
+  // repo.MustBeNotEmpty (web.go:1571's group middleware) — the C1 arm's
+  // empty-repo posture.
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  // MustEnableActions' repo-unit arm (job_queue.go:83's RenderJobQueue sits
+  // behind the group middleware; the landed repo_settings.has_actions).
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasActions) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadJobQueuePageData(
+    c.env.DB,
+    { kind: "repo", repoId: repo.id, repoLink: `/${repo.ownerNamespace}/${repo.slug}` },
+    url.searchParams,
+  );
+  if (url.searchParams.has("refresh")) {
+    return respond(c.html(renderJobQueueFragment(data), 200));
+  }
+  return respond(c.html(renderRepoActionsJobQueuePage(ctx, data), 200));
+}
+
+/** GET /-/admin/actions/job_queue (shared_actions.JobQueue's admin arm,
+ * job_queue.go:21-31 — RenderJobQueue(ctx, 0, "admin/actions")). */
+async function adminActionsJobQueuePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const search = new URL(c.req.raw.url).searchParams;
+  const data = await loadJobQueuePageData(c.env.DB, { kind: "admin" }, search);
+  if (search.has("refresh")) {
+    return p.respond(c.html(renderJobQueueFragment(data), 200));
+  }
+  return p.respond(c.html(renderAdminActionsJobQueuePage(p.ctx, data), 200));
+}
+
+// ---------------------------------------------------------------------------
+// The census C7 arm: the repo settings Actions RUNNERS sub-tab (pages/
+// repo-settings-actions-runners.tsx — upstream web.go:506-513's
+// addSettingsRunnersRoutes at the REPO scope, behind the C8 gate's exact
+// posture: the shared settingsGate (reqRepoAdmin) PLUS MustEnableActions'
+// repo-unit arm, sameOriginGuard-first POSTs).
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/settings/actions/runners (shared_actions.Runners'
+ * repo arm, runners.go:102-155) through the gates. */
+async function repoActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-runners") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoActionsRunnersPageData(c.env.DB, repo, new URL(c.req.raw.url).searchParams);
+  return respond(c.html(renderRepoActionsRunnersPage(ctx, data), 200));
+}
+
+/** POST /{owner}/{repo}/settings/actions/runners/reset_registration_token
+ * (ResetRunnerRegistrationToken, runners.go:275-290): NewRunnerToken at the
+ * repo scope, then the plain 303 back onto the list URL (upstream's
+ * JSONRedirect — the no-session-flash 303 reduction, the secrets arms'
+ * convention). */
+async function repoActionsRunnersTokenReset(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-runners-token-reset") return respond(await c.notFound()); // drift guard
+  await resetRepoActionsRunnerToken(c.env.DB, repo.id);
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/runners` } }));
+}
+
+/** GET /{owner}/{repo}/settings/actions/runners/{id} (RunnersEdit,
+ * runners.go:158-210): the scope-guarded runner plus its recent tasks; a
+ * foreign/stale/junk id answers the 404 shell (upstream's findActionsRunner
+ * + EditableInContext NotFound arms — both fold into the module's scope
+ * predicate). */
+async function repoActionsRunnerEditPage(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-runners-edit") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoActionsRunnerEditPageData(c.env.DB, repo, runnerId, new URL(c.req.raw.url).searchParams);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderRepoActionsRunnerEditPage(ctx, data), 200));
+}
+
+/** POST /{owner}/{repo}/settings/actions/runners/{id} (RunnersEditPost,
+ * runners.go:212-246): the description overwrite; "updated" 303s back onto
+ * the LIST URL (upstream's Redirect(redirectTo) with the flash line not
+ * rendered — the no-session-flash reduction); "missing" is the scope
+ * guard's 404 shell. */
+async function repoActionsRunnerEditSubmit(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-runners-edit") return respond(await c.notFound()); // drift guard
+  const form = parseRepoActionsRunnerDescriptionForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await updateRepoActionsRunnerDescription(c.env.DB, repo.id, runnerId, form.description);
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/runners` } }));
+}
+
+/** POST /{owner}/{repo}/settings/actions/runners/{id}/update-runner
+ * (RunnerUpdatePost, runners.go:328-369): the required `disabled` flip —
+ * an absent param answers upstream's exact 400 ("missing 'disabled'
+ * parameter"); "updated" 303s back onto the EDIT page (upstream's
+ * JSONRedirect("") stays-on-page arm, the no-JS reduction); "missing" is
+ * the 404 shell. */
+async function repoActionsRunnerUpdate(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-runners-update") return respond(await c.notFound()); // drift guard
+  const form = parseRepoActionsRunnerDisabledForm(await readUrlEncodedForm(c.req.raw));
+  if (form.disabled === null) {
+    return respond(new Response("missing 'disabled' parameter\n", { status: 400, headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" } }));
+  }
+  const outcome = await setRepoActionsRunnerDisabled(c.env.DB, repo.id, runnerId, form.disabled);
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/runners/${runnerId}` } }));
+}
+
+/** POST /{owner}/{repo}/settings/actions/runners/{id}/delete
+ * (RunnerDeletePost, runners.go:292-326): the scope-guarded hard delete —
+ * "deleted" 303s onto the list URL; "missing" is the 404 shell (upstream's
+ * findActionsRunner NotFound arm deletes nothing). */
+async function repoActionsRunnerDelete(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-runners-delete") return respond(await c.notFound()); // drift guard
+  const outcome = await deleteRepoActionsRunner(c.env.DB, repo.id, runnerId);
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/runners` } }));
+}
+
+// ---------------------------------------------------------------------------
+// The census C9 arm: the repo settings Actions GENERAL sub-tab (pages/
+// repo-settings-actions-general.tsx — upstream web.go:1262-1278). Upstream's
+// gate verdict ships exactly: the general page and its unit-toggle POST sit
+// OUTSIDE MustEnableActions (actions.go:23-93's own comment — the disabled
+// unit's re-entry), so both ride the shared settingsGate ONLY; the bare
+// literal's redirect carries the unit arm INSIDE the gate (the enabled
+// unit's shortcut, web.go:1266-1268).
+// ---------------------------------------------------------------------------
+
+/** GET /{owner}/{repo}/settings/actions — the bare literal's redirect onto
+ *  the general sub-tab: the settingsGate, then MustEnableActions' repo-unit
+ *  arm (a disabled unit answers the 404 shell), then the 303 with upstream's
+ *  literal relative location bytes (REPO_ACTIONS_GENERAL_REDIRECT_TARGET). */
+async function repoActionsSettingsRedirect(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions") return respond(await c.notFound()); // drift guard
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasActions) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: REPO_ACTIONS_GENERAL_REDIRECT_TARGET } }));
+}
+
+/** GET /{owner}/{repo}/settings/actions/general (ActionsGeneralSettings,
+ * actions.go:23-36) — the settingsGate ONLY (NO unit arm: web.go:1262-1265
+ * mounts the general group OUTSIDE MustEnableActions — the disabled unit's
+ * re-entry, the C8 gate's polarity inverted). */
+async function repoActionsGeneralPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-general") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoActionsGeneralPageData(c.env.DB, repo.id);
+  return respond(c.html(renderRepoActionsGeneralPage(ctx, data), 200));
+}
+
+/** POST /{owner}/{repo}/settings/actions/general/actions_unit
+ * (ActionsUnitPost, actions.go:38-93): the FormBool enable_actions toggle
+ * through the landed store write; the settingsGate ONLY, then the 303 back
+ * onto the general page (upstream's ctx.Redirect of the same URL). */
+async function repoActionsUnitSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-general-unit") return respond(await c.notFound()); // drift guard
+  const form = parseRepoActionsUnitForm(await readUrlEncodedForm(c.req.raw));
+  await applyRepoActionsUnitToggle(c.env.DB, repo.id, form);
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/general` } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -12708,6 +13373,13 @@ uiRouter.post("/-/admin/notices/empty", (c) => adminNoticesEmpty(c));
 // Upstream's ChangeConfig POST is the §3.2 §-out: no POST twin exists, the
 // unregistered method falls to the sub-app's 404 (never a page render).
 uiRouter.get("/-/admin/config", (c) => adminConfigPage(c));
+// The census C6 arm: the admin actions job queue (pages/repo-actions-queue.tsx
+// — web.go:904's `GET /actions/job_queue`; the group's bare /actions literal
+// and its runners/variables/scoped-workflows tails stay unregistered — the
+// admin pages are not landed, the engine's 404). GET-only upstream — a POST
+// answers chi's 405.
+uiRouter.get("/-/admin/actions/job_queue", (c) => adminActionsJobQueuePage(c));
+uiRouter.post("/-/admin/actions/job_queue", () => methodNotAllowed("GET"));
 // The POST-only shapes' GET twins answer the methodNotAllowed arm (the
 // method-blind parse convention — upstream chi's own 405 posture).
 uiRouter.get("/-/admin/emails/activate", () => methodNotAllowed("POST"));
@@ -12860,6 +13532,31 @@ uiRouter.get("/:owner/:repo/settings/actions/variables/:id/edit", () => methodNo
 uiRouter.post("/:owner/:repo/settings/actions/variables/:id/edit", (c) => repoActionsVariablesEdit(c, Number(c.req.param("id"))));
 uiRouter.get("/:owner/:repo/settings/actions/variables/:id/delete", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/settings/actions/variables/:id/delete", (c) => repoActionsVariablesDelete(c, Number(c.req.param("id"))));
+// The census C7 arm: the repo settings Actions runners sub-tab (upstream
+// web.go:506-513's addSettingsRunnersRoutes). The literal reset tail
+// registers before the :id combo (the static-before-dynamic rule — the same
+// literal-second shape is a param match otherwise); the combo is GET+POST
+// (upstream's m.Combo); the POST-only write tails answer GET with chi's 405.
+uiRouter.get("/:owner/:repo/settings/actions/runners", (c) => repoActionsRunnersPage(c));
+uiRouter.post("/:owner/:repo/settings/actions/runners", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/:repo/settings/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/runners/reset_registration_token", (c) => repoActionsRunnersTokenReset(c));
+uiRouter.get("/:owner/:repo/settings/actions/runners/:id", (c) => repoActionsRunnerEditPage(c, Number(c.req.param("id"))));
+uiRouter.post("/:owner/:repo/settings/actions/runners/:id", (c) => repoActionsRunnerEditSubmit(c, Number(c.req.param("id"))));
+uiRouter.get("/:owner/:repo/settings/actions/runners/:id/update-runner", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/runners/:id/update-runner", (c) => repoActionsRunnerUpdate(c, Number(c.req.param("id"))));
+uiRouter.get("/:owner/:repo/settings/actions/runners/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/runners/:id/delete", (c) => repoActionsRunnerDelete(c, Number(c.req.param("id"))));
+// The census C9 arm: the repo settings Actions general sub-tab (upstream
+// web.go:1262-1278). The bare literal's GET is the redirect; the general
+// page is the GET side of the combo, the actions_unit write its POST-only
+// tail (the GET twin answers chi's 405, the audit arm's convention).
+uiRouter.get("/:owner/:repo/settings/actions", (c) => repoActionsSettingsRedirect(c));
+uiRouter.post("/:owner/:repo/settings/actions", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/:repo/settings/actions/general", (c) => repoActionsGeneralPage(c));
+uiRouter.post("/:owner/:repo/settings/actions/general", () => methodNotAllowed("POST"));
+uiRouter.get("/:owner/:repo/settings/actions/general/actions_unit", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/general/actions_unit", (c) => repoActionsUnitSubmit(c));
 // Window-2e pass 1: sitemap + search aux.
 uiRouter.get("/sitemap.xml", (c) => sitemapRoute(c));
 uiRouter.get("/explore/repos/sitemap-:file", (c) => sitemapRoute(c));
@@ -12913,6 +13610,30 @@ uiRouter.get("/:owner/:repo/activity/recent-commits/data", (c) => repoChartDataR
 // carries an `activity` literal third segment — the chart literals above
 // claim first (the R15 family), and the wildcard-free pair is exact for the
 // rest.
+// The census C1 arm: the repo Actions runs list (pages/repo-actions-runs.tsx
+// — web.go:1606-1608's group's `m.Get("", actions.List)`). The bare literal
+// only; the sibling tails stay unclaimed (the family interface's note).
+// GET-only upstream — a POST answers chi's 405 (the audit arm's convention).
+uiRouter.get("/:owner/:repo/actions", (c) => repoActionsRunsPage(c));
+uiRouter.post("/:owner/:repo/actions", () => methodNotAllowed("GET"));
+// The census C6 arm: the repo Actions job queue (pages/repo-actions-queue.tsx
+// — web.go:1570's group tail; the literal registers beside the runs list's
+// bare literal, the same static-before-dynamic rule). GET-only upstream — a
+// POST answers chi's 405 (the audit arm's convention).
+uiRouter.get("/:owner/:repo/actions/job_queue", (c) => repoActionsJobQueuePage(c));
+uiRouter.post("/:owner/:repo/actions/job_queue", () => methodNotAllowed("GET"));
+// The census C2 arm: the run-viewer subtree (pages/repo-actions-view.tsx —
+// web.go:1601-1605). The three view pairs share the ONE handler pair (the
+// shape's params ride the family); the cancel POST is the C5-adjacent write,
+// its GET answers chi's 405 (the audit arm's convention).
+uiRouter.get("/:owner/:repo/actions/runs/:run", (c) => actionsRunViewPage(c));
+uiRouter.post("/:owner/:repo/actions/runs/:run", (c) => actionsRunViewJson(c));
+uiRouter.get("/:owner/:repo/actions/runs/:run/attempts/:attempt", (c) => actionsRunViewPage(c));
+uiRouter.post("/:owner/:repo/actions/runs/:run/attempts/:attempt", (c) => actionsRunViewJson(c));
+uiRouter.get("/:owner/:repo/actions/runs/:run/jobs/:job", (c) => actionsRunViewPage(c));
+uiRouter.post("/:owner/:repo/actions/runs/:run/jobs/:job", (c) => actionsRunViewJson(c));
+uiRouter.get("/:owner/:repo/actions/runs/:run/cancel", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/actions/runs/:run/cancel", (c) => actionsRunCancel(c));
 uiRouter.get("/:owner/:repo/activity", (c) => repoActivityPage(c));
 uiRouter.get("/:owner/:repo/activity/:period", (c) => repoActivityPage(c));
 // Window-2e C1: the global inbox.

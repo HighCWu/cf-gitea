@@ -321,7 +321,13 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     // group's first item renders (navbar.tmpl:34-38, the EnablePackages arm
     // armed by default).
     expect(html).toContain('href="/-/admin/packages"');
-    expect(html).not.toContain("/-/admin/actions");
+    // The census C6 arm landed (the Actions group's Job-queue item,
+    // navbar.tmpl:73-89 — pages/repo-actions-queue.tsx's mount); the group's
+    // unlanded siblings stay dead links (the dead-link rule).
+    expect(html).toContain('href="/-/admin/actions/job_queue"');
+    expect(html).not.toContain('href="/-/admin/actions/runners"');
+    expect(html).not.toContain('href="/-/admin/actions/variables"');
+    expect(html).not.toContain("/-/admin/actions/scoped-workflows");
   });
 
   it("the sortable headers are links — ID toggles oldest/newest, Username carries the default arrow", async () => {

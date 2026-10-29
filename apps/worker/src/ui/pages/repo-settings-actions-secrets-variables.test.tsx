@@ -1020,10 +1020,32 @@ describe("the route claim pin (the settings family claims exactly the actions su
       repo: "demo",
       id: 12,
     });
+    // The sibling arms landed (the shared index window): the bare /actions
+    // redirect (C9 — upstream's LocationRedirect), the general page (C9)
+    // and the runners list (C7) now claim.
+    expect(parseUiRoute("/alice/demo/settings/actions")).toEqual({
+      family: "settings-actions",
+      owner: "alice",
+      repo: "demo",
+    });
+    expect(parseUiRoute("/alice/demo/settings/actions/general")).toEqual({
+      family: "settings-actions-general",
+      owner: "alice",
+      repo: "demo",
+    });
+    expect(parseUiRoute("/alice/demo/settings/actions/runners")).toEqual({
+      family: "settings-actions-runners",
+      owner: "alice",
+      repo: "demo",
+    });
+    expect(parseUiRoute("/alice/demo/settings/actions/general/actions_unit")).toEqual({
+      family: "settings-actions-general-unit",
+      owner: "alice",
+      repo: "demo",
+    });
     for (const path of [
-      "/alice/demo/settings/actions", // upstream's LocationRedirect — the unlanded general tab stays unclaimed
-      "/alice/demo/settings/actions/general",
-      "/alice/demo/settings/actions/runners",
+      "/alice/demo/settings/actions/general/extra", // the C9 page's junk deeper tail
+      "/alice/demo/settings/actions/general/actions_unit/extra", // the write tail's junk deeper tail
       "/alice/demo/settings/actions/scoped-workflows",
       "/alice/demo/settings/actions/secret", // the singular misspelling
       "/alice/demo/settings/actions/secrets/extra",

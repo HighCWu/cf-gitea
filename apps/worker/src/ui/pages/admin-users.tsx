@@ -288,7 +288,11 @@ export type AdminFamilyNavActive =
   | "stats"
   | "cron"
   | "queue"
-  | "trace";
+  | "trace"
+  // The census C6 arm: the admin actions JOB QUEUE page (pages/
+  // repo-actions-queue.tsx — navbar.tmpl:87-89's item; the Actions group's
+  // other items stay unlanded).
+  | "actions-job-queue";
 
 /** The family page chrome (component-local, the adminMonitorLocale pattern —
  *  locale.ts is shared and not this wave's file; upstream locale keys cited
@@ -311,6 +315,8 @@ export const adminFamilyLocale = {
   configuration: "Configuration", // "admin.config" (navbar.tmpl:93 — the SPEC-0018 §3.2 arm's group)
   configSummary: "Summary", // "admin.config_summary" (navbar.tmpl:95-97; config.go:61's Title)
   notices: "System Notices", // "admin.notices" (the SPEC-0018 §3.1 arm's nav item)
+  actions: "Actions", // "actions.actions" (navbar.tmpl:76 — the C6 arm's group summary)
+  jobQueue: "Job queue", // "actions.job_queue.title" (navbar.tmpl:88 — the C6 arm's item)
   monitoring: "Monitoring", // "admin.monitor"
   stats: "Stats", // "admin.monitor.stats"
   cron: "Cron Tasks", // "admin.monitor.cron"
@@ -352,6 +358,11 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
   const integrationsOpen = props.active === "applications" || props.active === "hooks";
   const configOpen = props.active === "config";
   const monitorOpen = props.active === "stats" || props.active === "cron" || props.active === "queue" || props.active === "trace";
+  // The census C6 arm — navbar.tmpl:73-89's Actions group opens with its
+  // landed item (the job queue; the Runners/Variables/Scoped-workflows
+  // items stay omitted — their admin pages are not landed, the dead-link
+  // rule; the AdminFamilyNavActive note).
+  const actionsOpen = props.active === "actions-job-queue";
   const openAttr = (open: boolean) => (open ? true : undefined);
   return (
     <div class="flex-container-nav">
@@ -403,6 +414,15 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
             item after the Configuration group and before Monitor
             (navbar.tmpl:104-106); the landed nav keeps that order. */}
         {item("/-/admin/notices", adminFamilyLocale.notices, props.active === "notices")}
+        {/* navbar.tmpl:73-89 — the Actions group, between Notices and
+            Monitor. The census C6 arm lights its landed Job-queue item
+            (:87-89); the Runners/Variables/Scoped-workflows items
+            (:78-86) stay omitted — their admin pages are not landed (the
+            dead-link rule, the family's fold-note convention). */}
+        <details class="item" open={openAttr(actionsOpen)}>
+          <summary>{adminFamilyLocale.actions}</summary>
+          <div class="menu">{item("/-/admin/actions/job_queue", adminFamilyLocale.jobQueue, props.active === "actions-job-queue")}</div>
+        </details>
         <details class="item" open={openAttr(monitorOpen)}>
           <summary>{adminFamilyLocale.monitoring}</summary>
           <div class="menu">

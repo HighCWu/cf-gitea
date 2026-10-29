@@ -256,13 +256,14 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificat
  *  repo-scoped render for a label most repos never show (pages/releases.tsx
  *  header) — the releases PAGES render the real count in their header
  *  menu. */
-export type RepoTab = "code" | "issues" | "pulls" | "packages" | "projects" | "releases" | "activity" | "commits";
+export type RepoTab = "code" | "issues" | "pulls" | "actions" | "packages" | "projects" | "releases" | "activity" | "commits";
 
 /** Tab chrome text for the wave-3 tabs (the components/commit-list.tsx
  *  component-local pattern — locale.ts is shared and not this wave's file). */
 const tabLocale = {
   repo_issues: "Issues", // "repo.issues"
   repo_pulls: "Pull Requests", // "repo.pulls"
+  repo_actions: "Actions", // "actions.actions" (header.tmpl:130-139 — SPEC-0012 M1c C1)
   repo_packages: "Packages", // "packages.title" (header.tmpl:140-144 — SPEC-0016 M2)
   repo_projects: "Projects", // "repo.projects" (wave 45 — the projects tab)
   repo_releases: "Releases", // "repo.releases"
@@ -340,6 +341,22 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
               <Icon name="octicon-git-pull-request" /> {tabLocale.repo_pulls}
               {openPulls > 0 ? <span class="ui small label">{openPulls}</span> : null}
             </a>
+            {/* header.tmpl:130-139 — the Actions tab (SPEC-0012 M1c C1, the
+                census C1's navbar arm), gated on the SAME unit condition as
+                upstream (EnableActions ∧ CanRead(TypeActions) → the loaded
+                repoHasActions toggle, the packages tab's reduction) plus the
+                ¬IsEmptyRepo arm upstream carries verbatim (the empty repo
+                404s the whole /actions group — MustBeNotEmpty). Upstream
+                order: Actions sits between Pulls and Packages. The
+                NumOpenActionRuns count label is the documented reduction
+                (no maintained open-runs counter in D1 — the releases tab's
+                precedent); the icon is the allowlist's octicon-play
+                (upstream's own). */}
+            {props.ctx.repoHasActions && !repo.isEmpty ? (
+              <a class={activeTab === "actions" ? "active item" : "item"} href={`${repoLink}/actions`} data-shortcut-keys="g a">
+                <Icon name="octicon-play" /> {tabLocale.repo_actions}
+              </a>
+            ) : null}
             {/* header.tmpl:140-144 — the packages tab (SPEC-0016 M2), gated
                 on the landed unit-flag reduction (repo_settings.has_packages
                 via the ctx repoHasPackages member — the projects tab's

@@ -69,6 +69,16 @@ export interface UiContext {
    *  renders nothing and the route 404-shells (upstream DefaultRepoUnits
    *  ships packages disabled). */
   repoHasPackages?: boolean;
+  /** The repo's Actions unit toggle (SPEC-0012 M1c C1 — `repo_settings.
+   *  has_actions`, the repoHasPackages twin for the Actions tab/route;
+   *  repo/header.tmpl:130-139 gates the tab on `EnableActions ∧
+   *  CanRead(TypeActions) ∧ ¬IsEmptyRepo`, our landed reduction carries the
+   *  unit flag from the SAME loadRepoSettings read). The shell's Actions
+   *  tab reads it alongside the row's isEmpty; the `/actions` handler
+   *  re-reads the store for its MustEnableActions 404 arm (the C8 gate's
+   *  polarity). Absent/false = the tab renders nothing and the route
+   *  404-shells (the store default — the unit starts disabled). */
+  repoHasActions?: boolean;
   /** The global PACKAGES_ENABLED gate (SPEC-0016 M2 — the strict-polarity
    *  var; absent/true = enabled, only the exact "false" disables — the
    *  DEMO_MODE discipline). Gates the R04 tab anchors (the profile's
