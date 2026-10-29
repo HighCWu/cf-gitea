@@ -48,6 +48,16 @@ const HTTP_METHODS = new Set(["get", "put", "post", "delete", "options", "head",
  * omits (SPEC-0004 §2.5). Warned as documented exceptions, not failures.
  */
 const RUNTIME_ONLY_RESPONSES = {
+  "/packages/{owner}/{type}/{name}/-/unlink": {
+    post: {
+      // Upstream's own handler answers ctx.Status(http.StatusNoContent) on
+      // success (gitea/routers/api/v1/packages/package.go:465) while its
+      // swagger block documents "201 empty" (package.go:439-440) — the
+      // runtime-faithful 204 is what we ship; the frozen contract carries
+      // the never-emitted 201.
+      204: "upstream UnlinkPackage answers StatusNoContent at runtime; its swagger documents 201 empty (package.go:465 vs :439)",
+    },
+  },
   "/user": {
     get: {
       // reqToken() 401s anonymous callers (gitea/routers/api/v1/api.go); the
