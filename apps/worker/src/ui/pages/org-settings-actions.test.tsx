@@ -413,11 +413,15 @@ describe("the secrets page DOM (org/settings/actions.tmpl PageType secrets + sha
     expect(html).toContain("open"); // the PageIsSharedSettingsSecrets open arm
     expect(html).toContain('class="active item" href="/coalition/settings/actions/secrets"');
     expect(html).toContain('href="/coalition/settings/actions/variables"'); // the sibling sub-item
+    expect(html).toContain('href="/coalition/settings/actions/runners"'); // lit by the C7 org twin's mount (navbar.tmpl:35-37)
     expect(html).toContain('href="/coalition/settings"'); // the landed settings tabs stay linked
     expect(html).toContain('href="/coalition/settings/hooks"');
     expect(html).toContain('href="/coalition/labels"');
-    expect(html).not.toContain("settings/actions/runners"); // the unlanded sub-items render nothing
+    // The still-unlanded sub-items render nothing (the General href's dead
+    // anchor can never appear — the literal is a prefix of the landed tails,
+    // so the assert pins the quoted attribute shape).
     expect(html).not.toContain("scoped-workflows");
+    expect(html).not.toContain('href="/coalition/settings/actions"');
   });
 
   it("renders the empty arm (secrets.none) and the add form with the upstream contract", async () => {

@@ -38,9 +38,12 @@
  *     their pages landed (upstream gates them on disabled-features /
  *     EnableNotifyMail; both settings pin FALSE/TRUE so the items always
  *     render — the modules' SPEC §3 reduction).
- *   - org nav: Packages and the Actions General/Runners/Scoped-workflows
- *     sub-items are UNRENDERED (Applications joined the landed set with the
- *     R20-a tab, Audit with the census R13 org arm).
+ *   - org nav: Packages and the Actions General/Scoped-workflows sub-items
+ *     are UNRENDERED (Applications joined the landed set with the R20-a tab,
+ *     Audit with the census R13 org arm, and Runners with the census C7 org
+ *     twin's mount — pages/org-settings-actions-runners.tsx; the user
+ *     runners page has no landed module, so the user nav's Runners item
+ *     stays dead).
  *   - The Labels item keeps the landed href `{orgLink}/labels` — upstream's
  *     `{.OrgLink}}/settings/labels` target is the DOCUMENTED wave-14 URL
  *     divergence (pages/org-settings.tsx header: "the target exists so the
@@ -122,6 +125,7 @@ export const settingsNavLocale = {
   applications: "Applications", // "settings.applications" (:29)
   ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys" (:33)
   actions: "Actions", // "actions.actions" (the <details> summary, :41)
+  runners: "Runners", // "actions.runners" (the org navbar.tmpl:35-37 sub-item — lit by the C7 org twin's mount; the USER nav's twin stays dead)
   secrets: "Secrets", // "secrets.secrets" (:50)
   variables: "Variables", // "actions.variables" (:53)
   hooks: "Webhooks", // "repo.settings.hooks" (:68)
@@ -153,11 +157,12 @@ export type UserSettingsNavTab =
   | "repos"; // pages/user-settings-repos.tsx
 
 /** The org settings tabs — options/hooks/applications/audit (landed),
- *  blocked (committed-unmounted), secrets/variables (landed via
- *  org-settings-actions), plus `labels` for upstream's PageIsOrgSettingsLabels
- *  arm (navbar.tmpl:12 — today the item links the landed `/{org}/labels`
- *  page, which renders no settings nav, so no caller passes it yet). */
-export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "applications" | "blocked" | "secrets" | "variables" | "audit";
+ *  blocked (committed-unmounted), secrets/variables/runners (landed via
+ *  org-settings-actions / org-settings-actions-runners), plus `labels` for
+ *  upstream's PageIsOrgSettingsLabels arm (navbar.tmpl:12 — today the item
+ *  links the landed `/{org}/labels` page, which renders no settings nav, so
+ *  no caller passes it yet). */
+export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "applications" | "blocked" | "runners" | "secrets" | "variables" | "audit";
 
 // ---------------------------------------------------------------------------
 // The user settings navbar (user/settings/navbar.tmpl reduced)
@@ -247,7 +252,8 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
  * The shared ORG settings navbar. `orgLink` is `/{org}` (the family's
  * OrgLink); `active` marks the rendered page's tab. Item order is
  * navbar.tmpl's exact order with the dead items dropped: Options, Hooks,
- * Labels, Applications, Blocked users, Actions▸(Secrets, Variables), Audit.
+ * Labels, Applications, Blocked users, Actions▸(Runners, Secrets,
+ * Variables), Audit.
  */
 export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsNavTab }) {
   const item = (tab: OrgSettingsNavTab) => (props.active === tab ? "active item" : "item");
@@ -281,12 +287,20 @@ export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsN
         <a class={item("blocked")} href={`${props.orgLink}/settings/blocked_users`}>
           {settingsNavLocale.blocked_users}
         </a>
-        {/* navbar.tmpl:28-48 — General/Runners (:32-37) and
-            Scoped-workflows (:44-46) dead; Secrets (:38-40) + Variables
-            (:41-43) landed. Open while either is the active page. */}
-        <details class="item" open={props.active === "secrets" || props.active === "variables" ? true : undefined}>
+        {/* navbar.tmpl:28-48 — General (:32-34) and Scoped-workflows
+            (:44-46) dead; Runners (:35-37) lit by the census C7 org twin's
+            mount (pages/org-settings-actions-runners.tsx), Secrets (:38-40) +
+            Variables (:41-43) landed. Open while any of the three is the
+            active page (navbar.tmpl:29's or-arm). */}
+        <details
+          class="item"
+          open={props.active === "runners" || props.active === "secrets" || props.active === "variables" ? true : undefined}
+        >
           <summary>{settingsNavLocale.actions}</summary>
           <div class="menu">
+            <a class={item("runners")} href={`${props.orgLink}/settings/actions/runners`}>
+              {settingsNavLocale.runners}
+            </a>
             <a class={item("secrets")} href={`${props.orgLink}/settings/actions/secrets`}>
               {settingsNavLocale.secrets}
             </a>

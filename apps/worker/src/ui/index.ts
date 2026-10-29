@@ -883,6 +883,21 @@ import {
   renderOrgActionsSecretsPage,
   renderOrgActionsVariablesPage,
 } from "./pages/org-settings-actions";
+// The census C7 arm's ORG scope: the org settings Actions RUNNERS sub-tab
+// (the repo twin's module-level ports reused where scope-neutral; this
+// module's org cond/find/writes over the M1a runner/token store).
+import {
+  deleteOrgActionsRunner,
+  loadOrgActionsRunnerEditPageData,
+  loadOrgActionsRunnersPageData,
+  parseOrgActionsRunnerDescriptionForm,
+  parseOrgActionsRunnerDisabledForm,
+  renderOrgActionsRunnerEditPage,
+  renderOrgActionsRunnersPage,
+  resetOrgActionsRunnerToken,
+  setOrgActionsRunnerDisabled,
+  updateOrgActionsRunnerDescription,
+} from "./pages/org-settings-actions-runners";
 // The census R20 (a) arm: the org settings applications tab (org-OWNED
 // oauth2 applications — the landed service's uid-parameterized arms keyed
 // on the org's id).
@@ -3023,6 +3038,11 @@ export interface OrgSettingsRoute {
     | "org-actions-variables-new" // POST .../variables/new (window-2b)
     | "org-actions-variables-edit" // POST .../variables/{id}/edit (window-2b)
     | "org-actions-variables-delete" // POST .../variables/{id}/delete (window-2b)
+    | "org-actions-runners" // GET /{org}/settings/actions/runners (the census C7 org arm)
+    | "org-actions-runners-token-reset" // POST .../runners/reset_registration_token
+    | "org-actions-runners-edit" // GET+POST .../runners/{id} (page + the description update)
+    | "org-actions-runners-update" // POST .../runners/{id}/update-runner
+    | "org-actions-runners-delete" // POST .../runners/{id}/delete
     | "org-team-edit" // GET+POST /{org}/teams/{id}/edit
     | "org-team-delete" // POST /{org}/teams/{id}/delete
   ;
@@ -3734,6 +3754,30 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (raw.length === 7 && raw[3] === "actions" && raw[4] === "variables" && raw[6] === "delete" && /^-?\d+$/.test(raw[5] as string)) {
       return { family: "org-actions-variables-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    // The census C7 org arm (pages/org-settings-actions-runners.tsx —
+    // upstream web.go:1058's addSettingsRunnersRoutes inside the org
+    // /actions group): the list GET, the reset-token POST (the LITERAL
+    // claims ahead of the {id} combo — chi's static-first dispatch,
+    // web.go:507-512), the {id} edit combo (GET page + POST description)
+    // and the two write POSTs. The runner ids claim integers only (the
+    // repo runners family's PathParamInt64 parity: junk fails the parse, a
+    // negative parses and 404-shells on the scope lookup). Every other
+    // tail stays unclaimed → the engine's 404.
+    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "runners") {
+      return { family: "org-actions-runners", owner };
+    }
+    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "runners" && raw[5] === "reset_registration_token") {
+      return { family: "org-actions-runners-token-reset", owner };
+    }
+    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "runners" && /^-?\d+$/.test(raw[5] as string)) {
+      return { family: "org-actions-runners-edit", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    if (raw.length === 7 && raw[3] === "actions" && raw[4] === "runners" && raw[6] === "update-runner" && /^-?\d+$/.test(raw[5] as string)) {
+      return { family: "org-actions-runners-update", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    if (raw.length === 7 && raw[3] === "actions" && raw[4] === "runners" && raw[6] === "delete" && /^-?\d+$/.test(raw[5] as string)) {
+      return { family: "org-actions-runners-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
     }
     if (raw.length === 5 && raw[3] === "avatar" && raw[4] === "delete") {
       return { family: "org-settings-avatar-delete", owner };
@@ -8843,6 +8887,112 @@ async function orgActionsVariablesDelete(c: Context<{ Bindings: Env }>, variable
 }
 
 // ---------------------------------------------------------------------------
+// The census C7 org arm: the org settings Actions RUNNERS sub-tab (pages/
+// org-settings-actions-runners.tsx — upstream web.go:1058's
+// addSettingsRunnersRoutes inside the org /actions group; the require-owner
+// prologue IS the gate — the org arm of MustEnableActions checks only the
+// instance-level flags at this scope, both compile-time TRUE in the landed
+// posture, the module header — sameOriginGuard-first POSTs).
+// ---------------------------------------------------------------------------
+
+/** GET /{org}/settings/actions/runners (shared_actions.Runners' org arm,
+ * runners.go:102-155) through the require-owner prologue. */
+async function orgActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-runners") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgActionsRunnersPageData(c.env.DB, org, new URL(c.req.raw.url).searchParams);
+  return respond(c.html(renderOrgActionsRunnersPage(ctx, data), 200));
+}
+
+/** POST /{org}/settings/actions/runners/reset_registration_token
+ * (ResetRunnerRegistrationToken, runners.go:275-290): NewRunnerToken at the
+ * org scope, then the plain 303 back onto the list URL (upstream's
+ * JSONRedirect — the no-session-flash 303 reduction, the repo twin's
+ * convention). */
+async function orgActionsRunnersTokenReset(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-runners-token-reset") return respond(await c.notFound()); // drift guard
+  await resetOrgActionsRunnerToken(c.env.DB, org.id);
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/runners` } }));
+}
+
+/** GET /{org}/settings/actions/runners/{id} (RunnersEdit, runners.go:158-216):
+ * the scope-guarded runner plus its recent tasks; a foreign/global/stale id
+ * answers the 404 shell (upstream's findActionsRunner org arm +
+ * EditableInContext NotFound arms — both fold into the module's scope
+ * predicate). */
+async function orgActionsRunnerEditPage(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-runners-edit") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgActionsRunnerEditPageData(c.env.DB, org, runnerId, new URL(c.req.raw.url).searchParams);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderOrgActionsRunnerEditPage(ctx, data), 200));
+}
+
+/** POST /{org}/settings/actions/runners/{id} (RunnersEditPost,
+ * runners.go:219-254): the description overwrite; "updated" 303s back onto
+ * the LIST URL (upstream's Redirect(redirectTo) with the flash line not
+ * rendered — the no-session-flash reduction); "missing" is the 404 shell. */
+async function orgActionsRunnerEditSubmit(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-runners-edit") return respond(await c.notFound()); // drift guard
+  const form = parseOrgActionsRunnerDescriptionForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await updateOrgActionsRunnerDescription(c.env.DB, org.id, runnerId, form.description);
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/runners` } }));
+}
+
+/** POST /{org}/settings/actions/runners/{id}/update-runner
+ * (RunnerUpdatePost, runners.go:328-369): the required `disabled` flip —
+ * an absent param answers upstream's exact 400 ("missing 'disabled'
+ * parameter"); "updated" 303s back onto the EDIT page (upstream's
+ * JSONRedirect("") stays-on-page arm, the no-JS reduction); "missing" is
+ * the 404 shell. */
+async function orgActionsRunnerUpdate(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-runners-update") return respond(await c.notFound()); // drift guard
+  const form = parseOrgActionsRunnerDisabledForm(await readUrlEncodedForm(c.req.raw));
+  if (form.disabled === null) {
+    return respond(new Response("missing 'disabled' parameter\n", { status: 400, headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" } }));
+  }
+  const outcome = await setOrgActionsRunnerDisabled(c.env.DB, org.id, runnerId, form.disabled);
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/runners/${runnerId}` } }));
+}
+
+/** POST /{org}/settings/actions/runners/{id}/delete
+ * (RunnerDeletePost, runners.go:292-326): the scope-guarded hard delete —
+ * "deleted" 303s onto the list URL; "missing" is the 404 shell (upstream's
+ * findActionsRunner NotFound arm deletes nothing). */
+async function orgActionsRunnerDelete(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-runners-delete") return respond(await c.notFound()); // drift guard
+  const outcome = await deleteOrgActionsRunner(c.env.DB, org.id, runnerId);
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/runners` } }));
+}
+
+// ---------------------------------------------------------------------------
 // The census R20 (a) arm: the org settings applications tab (pages/
 // org-settings-applications.tsx — upstream web.go:1027-1037's /applications
 // group; the org-OWNED oauth2 applications over the landed service's
@@ -13306,6 +13456,22 @@ uiRouter.get("/:owner/settings/actions/variables", (c) => orgActionsVariablesPag
 uiRouter.post("/:owner/settings/actions/variables/new", (c) => orgActionsVariablesNew(c));
 uiRouter.post("/:owner/settings/actions/variables/:id/edit", (c) => orgActionsVariablesEdit(c, Number(c.req.param("id"))));
 uiRouter.post("/:owner/settings/actions/variables/:id/delete", (c) => orgActionsVariablesDelete(c, Number(c.req.param("id"))));
+// The census C7 org arm: the runners sub-tab (parseUiRoute claims exactly
+// these shapes — web.go:1058's addSettingsRunnersRoutes at the org scope,
+// the require-owner prologue as the gate). No earlier registration can
+// absorb these: the `settings` second segment is the org block's static, the
+// `runners` tail literals are deeper still, and the GETs on the POST-only
+// tails answer chi's 405 (the repo runners-family convention).
+uiRouter.get("/:owner/settings/actions/runners", (c) => orgActionsRunnersPage(c));
+uiRouter.post("/:owner/settings/actions/runners", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/settings/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/settings/actions/runners/reset_registration_token", (c) => orgActionsRunnersTokenReset(c));
+uiRouter.get("/:owner/settings/actions/runners/:id", (c) => orgActionsRunnerEditPage(c, Number(c.req.param("id"))));
+uiRouter.post("/:owner/settings/actions/runners/:id", (c) => orgActionsRunnerEditSubmit(c, Number(c.req.param("id"))));
+uiRouter.get("/:owner/settings/actions/runners/:id/update-runner", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/settings/actions/runners/:id/update-runner", (c) => orgActionsRunnerUpdate(c, Number(c.req.param("id"))));
+uiRouter.get("/:owner/settings/actions/runners/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/settings/actions/runners/:id/delete", (c) => orgActionsRunnerDelete(c, Number(c.req.param("id"))));
 // The census R20 (a) arm: the applications tab (parseUiRoute claims exactly
 // these shapes — web.go:1027-1037's /applications group: the bare list GET,
 // the create POST, the {id}/delete write). No earlier registration can

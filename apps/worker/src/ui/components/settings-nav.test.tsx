@@ -183,6 +183,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       settingsNavLocale.applications, // "settings.applications" (lit by the R20-a applications tab's mount)
       settingsNavLocale.blocked_users, // "user.block.list"
       settingsNavLocale.actions, // "actions.actions"
+      settingsNavLocale.runners, // "actions.runners" (lit by the C7 org twin's mount)
       settingsNavLocale.secrets, // "secrets.secrets"
       settingsNavLocale.variables, // "actions.variables"
       settingsNavLocale.audit, // "audit.title" (lit by the census R13 org arm's mount)
@@ -198,6 +199,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       'href="/acme/labels"', // the wave-14 divergence — upstream: /settings/labels
       'href="/acme/settings/applications"', // lit by the R20-a applications tab's mount
       'href="/acme/settings/blocked_users"',
+      'href="/acme/settings/actions/runners"', // lit by the C7 org twin's mount — navbar.tmpl:35-37, before Secrets
       'href="/acme/settings/actions/secrets"',
       'href="/acme/settings/actions/variables"',
       'href="/acme/settings/audit_logs"', // lit by the census R13 org arm's mount — LAST, navbar.tmpl:50-52
@@ -210,12 +212,11 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
     expect(html).not.toContain('href="/acme/settings/labels"');
   });
 
-  it("renders NO dead items — Packages and the General/Runners/Scoped-workflows sub-items are omitted (Applications landed with the R20-a tab, Audit with the census R13 org arm)", () => {
+  it("renders NO dead items — Packages and the General/Scoped-workflows sub-items are omitted (Applications landed with the R20-a tab, Audit with the census R13 org arm, Runners with the C7 org twin's mount)", () => {
     const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="options" />);
     for (const dead of [
       'href="/acme/settings/packages"', // :23-27
       'href="/acme/settings/actions"', // the General sub-item, :32-34
-      'href="/acme/settings/actions/runners"', // :35-37
       'href="/acme/settings/actions/scoped-workflows"', // :44-46
     ]) {
       expect(html).not.toContain(dead);
@@ -229,6 +230,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       labels: 'href="/acme/labels"',
       applications: 'href="/acme/settings/applications"',
       blocked: 'href="/acme/settings/blocked_users"',
+      runners: 'href="/acme/settings/actions/runners"',
       secrets: 'href="/acme/settings/actions/secrets"',
       variables: 'href="/acme/settings/actions/variables"',
       audit: 'href="/acme/settings/audit_logs"',
@@ -244,6 +246,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
               | "labels"
               | "applications"
               | "blocked"
+              | "runners"
               | "secrets"
               | "variables"
               | "audit"
@@ -255,7 +258,8 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
     }
   });
 
-  it("opens the Actions disclosure while a secrets/variables page renders, closed otherwise (navbar.tmpl:29)", () => {
+  it("opens the Actions disclosure while a runners/secrets/variables page renders, closed otherwise (navbar.tmpl:29)", () => {
+    expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="runners" />)).toContain('<details class="item" open');
     expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="secrets" />)).toContain('<details class="item" open');
     expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="variables" />)).toContain('<details class="item" open');
     const closed = renderToString(<OrgSettingsNavbar orgLink="/acme" active="blocked" />);
