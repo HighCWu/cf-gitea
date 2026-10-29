@@ -337,7 +337,9 @@ describe("the admin repos DOM (templates/admin/repo/list.tmpl at the pin)", () =
     expect(html).toContain('class="active item" href="/-/admin/repos"');
     expect(html).toContain('href="/-/admin/users"');
     expect(html).toContain('href="/-/admin/orgs"');
-    expect(html).not.toContain("/-/admin/packages"); // the Assets group's other item — unlanded
+    // The tick-18 packages arm landed (the nav-fold rider): the Assets
+    // group's other item renders beside Repositories (navbar.tmpl:34-38).
+    expect(html).toContain('href="/-/admin/packages"');
     // The census R18 arms landed (the nav fold wave): the Integrations group.
     expect(html).toContain('href="/-/admin/applications"');
     expect(html).toContain('href="/-/admin/hooks"');

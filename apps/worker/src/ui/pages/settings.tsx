@@ -257,6 +257,7 @@ import { publicAccessLocale } from "./repo-settings-public-access";
 import { tagProtectionLocale } from "./repo-settings-tags";
 import { wikiSettingsLocale } from "./repo-settings-wiki";
 import { repoSettingsLfsLocale } from "./repo-settings-lfs";
+import { repoSettingsActionsLocale } from "./repo-settings-actions-secrets-variables";
 import { settingsAuditLogsLocale } from "./settings-audit-logs";
 
 /** Page chrome text (component-local, the issuesLocale pattern — locale.ts
@@ -524,8 +525,18 @@ export function renderRepoSettingsPage(options: {
  *     pages/settings-audit-logs.tsx mount; before that page landed the item
  *     rode the dead-link omission (the module header's v1-degradations
  *     note, now retired for Audit). LFS (navbar.tmpl:35-39) is the census
- *     R11 arm's item — lit by the pages/repo-settings-lfs.tsx mount; only
- *     Actions stays dead.
+ *     R11 arm's item — lit by the pages/repo-settings-lfs.tsx mount.
+ *   - The Actions <details> (navbar.tmpl:41-59) is the census C8 arm — the
+ *     Secrets (:51-53) and Variables (:54-56) sub-items light with the
+ *     pages/repo-settings-actions-secrets-variables.tsx mount; General
+ *     (:44-46) and Runners (:47-50) stay dead (no landed pages — the
+ *     dead-link rule). Upstream wraps the trio in
+ *     `{{if and .EnableActions (.Permission.CanRead Actions)}}`
+ *     (navbar.tmpl:47): the instance flag `.EnableActions` is vacuous here
+ *     (actions are this deployment's core), the repo-unit arm is the
+ *     caller's `hasActions` read — reduced like the conditional Public
+ *     Access item: call sites that cannot evaluate it render the reduced
+ *     nav without the block.
  *
  * The tab items' texts import the owning page modules' locale objects (the
  * one-copy rule). Wave-settingsnav-fold deleted the five modules' scaffold
@@ -547,7 +558,9 @@ export function SettingsNav(props: {
     | "lfs" // pages/repo-settings-lfs.tsx (the census R11 arm)
     | "mirror"
     | "wiki"
-    | "audit"; // pages/settings-audit-logs.tsx (the census R13 arm)
+    | "audit" // pages/settings-audit-logs.tsx (the census R13 arm)
+    | "secrets" // pages/repo-settings-actions-secrets-variables.tsx (the census C8 arm)
+    | "variables"; // pages/repo-settings-actions-secrets-variables.tsx (the census C8 arm)
   /** The repo row, arming the conditional Public Access item (navbar.tmpl:
    *  7-11). */
   repo?: RepoRow;
@@ -556,6 +569,16 @@ export function SettingsNav(props: {
    *  the code unit's, so the other tabs reduce the conditional to the
    *  visibility arm). */
   hasAnyPublicAccess?: boolean;
+  /** The repo-unit arm of navbar.tmpl:47's
+   *  `{{if and .EnableActions (.Permission.CanRead Actions)}}` — the
+   *  caller's `repo_settings.has_actions` read (the instance flag is
+   *  vacuous here): the Actions <details> with the landed Secrets +
+   *  Variables sub-items (the census C8 arm) renders only while the unit
+   *  is enabled. Reduced like the conditional Public Access item: call
+   *  sites that cannot evaluate it render the reduced nav without the
+   *  block; the actions pages pass `true` behind their MustEnableActions
+   *  route gate. */
+  hasActions?: boolean;
 }) {
   const showPublicAccess =
     props.repo !== undefined && (props.repo.visibility === "private" || props.hasAnyPublicAccess === true);
@@ -617,8 +640,36 @@ export function SettingsNav(props: {
         <a class={props.active === "wiki" ? "active item" : "item"} href={`${props.repoLink}/settings/wiki`}>
           {wikiSettingsLocale.wiki}
         </a>
+        {/* navbar.tmpl:41-59 — the Actions <details>, between the code-unit
+            block and Audit (Audit stays LAST, upstream's menu order). Open
+            while either landed sub-tab renders; the General (:44-46) and
+            Runners (:47-50) sub-items render nothing (no landed pages — the
+            dead-link rule). The whole block rides the caller's hasActions
+            read of navbar.tmpl:47's unit conditional (the prop doc). */}
+        {props.hasActions === true ? (
+          <details
+            class="item"
+            open={props.active === "secrets" || props.active === "variables" ? true : undefined}
+          >
+            <summary>{repoSettingsActionsLocale.actions}</summary>
+            <div class="menu">
+              <a
+                class={props.active === "secrets" ? "active item" : "item"}
+                href={`${props.repoLink}/settings/actions/secrets`}
+              >
+                {repoSettingsActionsLocale.secrets_nav}
+              </a>
+              <a
+                class={props.active === "variables" ? "active item" : "item"}
+                href={`${props.repoLink}/settings/actions/variables`}
+              >
+                {repoSettingsActionsLocale.variables_nav}
+              </a>
+            </div>
+          </details>
+        ) : null}
         {/* navbar.tmpl:60-62 — Audit, LAST in upstream's menu (after the
-            dead Actions details block). Lit by the settings-audit-logs page's
+            Actions details block). Lit by the settings-audit-logs page's
             mount (the census R13 arm — the SettingsNav dead-link omission
             retired). */}
         <a class={props.active === "audit" ? "active item" : "item"} href={`${props.repoLink}/settings/audit_logs`}>
@@ -652,7 +703,9 @@ export function RepoSettingsPage(props: { ctx: UiContext; data: RepoBasicsData; 
   return (
     <BaseLayout ctx={ctx} title={settingsLocale.settings} pageClass="repository settings options">
       <div class="ui container flex-container">
-        <SettingsNav repoLink={repoLink} active="options" repo={repo} />
+        {/* The options page loads the unit flags (data.units) — it evaluates
+            navbar.tmpl:47's conditional and lights the Actions block. */}
+        <SettingsNav repoLink={repoLink} active="options" repo={repo} hasActions={units.hasActions} />
         <div class="flex-container-main">
           <h4 class="ui top attached header">{settingsLocale.basic_settings}</h4>
           <div class="ui attached segment">

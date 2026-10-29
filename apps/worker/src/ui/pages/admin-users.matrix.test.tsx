@@ -317,7 +317,10 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(html).not.toContain("/-/admin/auths");
     expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
     expect(html).toContain('href="/-/admin/config"'); // SPEC-0018 §3.2's Configuration group (the Summary item)
-    expect(html).not.toContain("/-/admin/packages");
+    // The tick-18 packages arm landed (the nav-fold rider): the Assets
+    // group's first item renders (navbar.tmpl:34-38, the EnablePackages arm
+    // armed by default).
+    expect(html).toContain('href="/-/admin/packages"');
     expect(html).not.toContain("/-/admin/actions");
   });
 

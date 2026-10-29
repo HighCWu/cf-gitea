@@ -167,13 +167,14 @@
  * AdminMonitorNav scaffolding copies deleted): it renders upstream's
  * navbar.tmpl reduced to the LANDED pages — Maintenance (Dashboard),
  * Identity & Access (Organizations + Users + Badges + Emails), Assets
- * (Repositories), Integrations (Applications + Webhooks), the Configuration
+ * (Repositories + Packages — the tick-18 arm, gated on the global packages
+ * flag), Integrations (Applications + Webhooks), the Configuration
  * group (SPEC-0018 §3.2's Summary item), the top-level System Notices item
  * (SPEC-0018 §3.1), Monitoring (the four live monitor items; audit_logs
  * omitted) — with the details-open + active-item arms derived from the
  * `active` prop (upstream's per-group PageIs* conditions), and OMITS every
  * group whose items are all unlanded (self_check, auths — SPEC-0018 §3.3's
- * omission verdict, packages, actions). Survey row flipped on landing:
+ * omission verdict, actions). Survey row flipped on landing:
  * docs/compat/ui-parity-survey.md:549 (the `/-/admin/*` row — users/orgs/
  * repos go PARTIAL→listed).
  */
@@ -277,6 +278,7 @@ export type AdminFamilyNavActive =
   | "users"
   | "orgs"
   | "repos"
+  | "packages"
   | "emails"
   | "badges"
   | "applications"
@@ -302,6 +304,7 @@ export const adminFamilyLocale = {
   emails: "User Email Addresses", // "admin.emails" (the R18 arm's nav item)
   assets: "Assets", // "admin.assets" (navbar.tmpl:31)
   repositories: "Repositories", // "admin.repositories"
+  packages: "Packages", // "packages.title" (the admin packages arm's nav item, navbar.tmpl:35)
   integrations: "Integrations", // "admin.integrations" (navbar.tmpl:53 — the R18 wave's group)
   applications: "Applications", // "settings.applications" (the admin applications arm's nav item)
   hooks: "Webhooks", // "admin.hooks" (the admin hooks arm's nav item)
@@ -318,18 +321,20 @@ export const adminFamilyLocale = {
 /** The admin layout's navbar (navbar.tmpl at the pin; the F7 fold — ONE
  *  shared navbar across the whole admin family): the Maintenance details
  *  (Dashboard), Identity & Access (Organizations + User Accounts + Badges +
- *  Emails — the R18 arms), Assets (Repositories), Integrations
- *  (Applications + Webhooks — the R18 arms), the Configuration group (the
- *  SPEC-0018 §3.2 arm's Summary item, navbar.tmpl:93-102 — the settings-
- *  editor item omitted by the dead-link rule), the TOP-LEVEL System Notices
- *  item (the SPEC-0018 §3.1 arm, navbar.tmpl:104-106's position), and
- *  Monitoring (the monitor family's four live items). Upstream's per-group
- *  `PageIs*` conditions reduce to: the group containing the active page
- *  renders `open`, the active item gets the `active item` class. auths,
- *  packages, audit_logs, self_check, actions are omitted — all their
- *  upstream items are unlanded pages (the dead-link rule; the census's
- *  (b)/(c) classes; the auths omission is SPEC-0018 §3.3's verdict). */
-export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
+ *  Emails — the R18 arms), Assets (Packages — the tick-18 arm, gated on the
+ *  global packages flag like navbar.tmpl:34's `{{if .EnablePackages}}` —
+ *  then Repositories), Integrations (Applications + Webhooks — the R18
+ *  arms), the Configuration group (the SPEC-0018 §3.2 arm's Summary item,
+ *  navbar.tmpl:93-102 — the settings-editor item omitted by the dead-link
+ *  rule), the TOP-LEVEL System Notices item (the SPEC-0018 §3.1 arm,
+ *  navbar.tmpl:104-106's position), and Monitoring (the monitor family's
+ *  four live items). Upstream's per-group `PageIs*` conditions reduce to:
+ *  the group containing the active page renders `open`, the active item
+ *  gets the `active item` class. auths, audit_logs, self_check, actions are
+ *  omitted — all their upstream items are unlanded pages (the dead-link
+ *  rule; the census's (b)/(c) classes; the auths omission is SPEC-0018
+ *  §3.3's verdict). */
+export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEnabled?: boolean }) {
   const item = (href: string, label: string, active: boolean) => (
     <a class={active ? "active item" : "item"} href={href}>
       {label}
@@ -340,7 +345,10 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
   const maintenanceOpen = props.active === "dashboard";
   const identityOpen =
     props.active === "users" || props.active === "orgs" || props.active === "badges" || props.active === "emails";
-  const assetsOpen = props.active === "repos";
+  // navbar.tmpl:33: `{{if or .PageIsAdminRepositories (and .EnablePackages
+  // .PageIsAdminPackages)}}open{{end}}` — the packages arm only opens the
+  // group while the feature is enabled.
+  const assetsOpen = props.active === "repos" || (props.packagesEnabled !== false && props.active === "packages");
   const integrationsOpen = props.active === "applications" || props.active === "hooks";
   const configOpen = props.active === "config";
   const monitorOpen = props.active === "stats" || props.active === "cron" || props.active === "queue" || props.active === "trace";
@@ -364,7 +372,16 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
         </details>
         <details class="item" open={openAttr(assetsOpen)}>
           <summary>{adminFamilyLocale.assets}</summary>
-          <div class="menu">{item("/-/admin/repos", adminFamilyLocale.repositories, props.active === "repos")}</div>
+          <div class="menu">
+            {/* navbar.tmpl:34-38: the Packages item sits BEFORE Repositories,
+                rendered only when the global packages flag arms (the strict
+                polarity — absent/true = enabled, the ctx.packagesEnabled
+                value the shell threads). */}
+            {props.packagesEnabled !== false
+              ? item("/-/admin/packages", adminFamilyLocale.packages, props.active === "packages")
+              : null}
+            {item("/-/admin/repos", adminFamilyLocale.repositories, props.active === "repos")}
+          </div>
         </details>
         <details class="item" open={openAttr(integrationsOpen)}>
           <summary>{adminFamilyLocale.integrations}</summary>
@@ -402,12 +419,14 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
 
 /** The admin layout shell (layout_head.tmpl verbatim around the content
  *  block): the family pageClass, the fluid padded flex container, the
- *  navbar, then `.flex-container-main` wrapping `.admin-setting-content`. */
+ *  navbar, then `.flex-container-main` wrapping `.admin-setting-content`.
+ *  The shell threads ctx.packagesEnabled into the nav (the Assets group's
+ *  Packages item arms on it — navbar.tmpl's EnablePackages condition). */
 export function AdminFamilyShell(props: { ctx: UiContext; title: string; pageClass: string; active: AdminFamilyNavActive; children: Child }) {
   return (
     <BaseLayout ctx={props.ctx} title={props.title} pageClass={props.pageClass}>
       <div class="ui container fluid padded flex-container">
-        <AdminFamilyNav active={props.active} />
+        <AdminFamilyNav active={props.active} packagesEnabled={props.ctx.packagesEnabled !== false} />
         <div class="flex-container-main">
           <div class="admin-setting-content">{props.children}</div>
         </div>

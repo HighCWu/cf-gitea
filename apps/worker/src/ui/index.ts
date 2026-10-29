@@ -974,6 +974,9 @@ import type { AdminMonitorPage } from "./pages/admin-monitor";
 import { loadAdminUsersData, renderAdminUsersPage } from "./pages/admin-users";
 import { loadAdminOrgsData, renderAdminOrgsPage } from "./pages/admin-orgs";
 import { loadAdminReposData, renderAdminReposPage } from "./pages/admin-repos";
+// The tick-18 packages arm (pages/admin-packages.tsx — upstream
+// /-/admin/packages, web.go:852-858's /packages group GET).
+import { loadAdminPackagesData, renderAdminPackagesPage } from "./pages/admin-packages";
 // The census R18 (a) arms (each module's header carries its mount record):
 // the emails list + the activate/delete writes, the hooks two-list + delete,
 // the badge-catalog family (all seven upstream routes), and the global
@@ -1403,6 +1406,23 @@ import {
   renderRepoSettingsLfsListPage,
   renderRepoSettingsLfsPointersPage,
 } from "./pages/repo-settings-lfs";
+// The census C8 arm: the repo settings Actions secrets/variables sub-tabs
+// (the org twin's route shape — org-settings-actions.tsx — under the shared
+// settingsGate + MustEnableActions' repo_settings.has_actions arm).
+import {
+  applyRepoActionsSecretForm,
+  applyRepoActionsVariableCreate,
+  applyRepoActionsVariableUpdate,
+  deleteRepoActionsSecret,
+  deleteRepoActionsVariable,
+  loadRepoActionsSecretsPageData,
+  loadRepoActionsVariablesPageData,
+  parseRepoActionsSecretDeleteForm,
+  parseRepoActionsSecretForm,
+  parseRepoActionsVariableForm,
+  renderRepoActionsSecretsPage,
+  renderRepoActionsVariablesPage,
+} from "./pages/repo-settings-actions-secrets-variables";
 // Window-2e C2b: the editor tails + cherrypick/patch modules.
 import {
   loadEditorUploadData,
@@ -1717,7 +1737,17 @@ export interface SettingsRoute {
     | "settings-lfs-find" // GET /settings/lfs/find
     | "settings-public-access" // GET+POST /settings/public_access
     | "settings-wiki" // GET+POST /settings/wiki (window-2d pass 2)
-    | "settings-audit-logs"; // GET /settings/audit_logs (the census R13 arm — GET only upstream, web.go:1279)
+    | "settings-audit-logs" // GET /settings/audit_logs (the census R13 arm — GET only upstream, web.go:1279)
+    // The census C8 arm: the repo settings Actions secrets/variables
+    // sub-tabs (pages/repo-settings-actions-secrets-variables.tsx —
+    // upstream web.go:1266-1278's `m.Group("/actions", ...)` behind
+    // actions.MustEnableActions, inside the reqRepoAdmin settings group).
+    | "settings-actions-secrets" // GET+POST /settings/actions/secrets
+    | "settings-actions-secrets-delete" // POST /settings/actions/secrets/delete
+    | "settings-actions-variables" // GET /settings/actions/variables
+    | "settings-actions-variables-new" // POST /settings/actions/variables/new
+    | "settings-actions-variables-edit" // POST /settings/actions/variables/{id}/edit
+    | "settings-actions-variables-delete"; // POST /settings/actions/variables/{id}/delete
   owner: string;
   repo: string;
   /** The hook id (the detail/test/delete families only) or the rule id (the
@@ -2722,6 +2752,7 @@ export interface AdminRoute {
     | "admin-users"
     | "admin-orgs"
     | "admin-repos"
+    | "admin-packages"
     | "admin-emails"
     | "admin-emails-activate"
     | "admin-emails-delete"
@@ -3248,6 +3279,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 1 && tail[0] === "users") return { family: "admin-users" };
     if (tail.length === 1 && tail[0] === "orgs") return { family: "admin-orgs" };
     if (tail.length === 1 && tail[0] === "repos") return { family: "admin-repos" };
+    // The tick-18 packages arm (pages/admin-packages.tsx — web.go:852-858's
+    // /packages group): the bare list GET only. The group's delete/cleanup
+    // POSTs stay unclaimed — unlanded writes (the module's dead-link note),
+    // the engine's 404; the group's `packagesEnabled` qualifier rides the
+    // handler's ctx.packagesEnabled arm, not the parse.
+    if (tail.length === 1 && tail[0] === "packages") return { family: "admin-packages" };
     // The R18 emails arm (web.go:821-824's /emails group): the list GET and
     // the two write POSTs (the module's plain-form arms).
     if (tail.length === 1 && tail[0] === "emails") return { family: "admin-emails" };
@@ -4061,6 +4098,35 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // any deeper tail stays unclaimed → the engine's 404, upstream's
     // unregistered-route answer.
     if (rest.length === 1 && rest[0] === "audit_logs") return { family: "settings-audit-logs", owner, repo };
+    // The census C8 arm (pages/repo-settings-actions-secrets-variables.tsx —
+    // upstream web.go:1266-1278's `m.Group("/actions", ...)` with the shared
+    // secrets/variables builders web.go:498-506/489-496, behind
+    // actions.MustEnableActions inside the reqRepoAdmin settings group): the
+    // two sub-tabs' CRUD arms. The bare `/actions` LocationRedirect
+    // (web.go:1267 — onto ./actions/general) and the runners/general/
+    // scoped-workflows tails stay unclaimed — the engine's 404, upstream's
+    // unregistered-route answer for the unlanded general tab (the org twin's
+    // posture). The variable path ids claim integers only (the
+    // settings-tag-detail PathParamInt64 parity: junk fails the parse, a
+    // negative parses and 404-shells on the scope lookup).
+    if (rest.length === 2 && rest[0] === "actions" && rest[1] === "secrets") {
+      return { family: "settings-actions-secrets", owner, repo };
+    }
+    if (rest.length === 3 && rest[0] === "actions" && rest[1] === "secrets" && rest[2] === "delete") {
+      return { family: "settings-actions-secrets-delete", owner, repo };
+    }
+    if (rest.length === 2 && rest[0] === "actions" && rest[1] === "variables") {
+      return { family: "settings-actions-variables", owner, repo };
+    }
+    if (rest.length === 3 && rest[0] === "actions" && rest[1] === "variables" && rest[2] === "new") {
+      return { family: "settings-actions-variables-new", owner, repo };
+    }
+    if (rest.length === 4 && rest[0] === "actions" && rest[1] === "variables" && rest[3] === "edit" && /^-?\d+$/.test(rest[2] as string)) {
+      return { family: "settings-actions-variables-edit", owner, repo, id: Number.parseInt(rest[2] as string, 10) };
+    }
+    if (rest.length === 4 && rest[0] === "actions" && rest[1] === "variables" && rest[3] === "delete" && /^-?\d+$/.test(rest[2] as string)) {
+      return { family: "settings-actions-variables-delete", owner, repo, id: Number.parseInt(rest[2] as string, 10) };
+    }
     if (rest.length === 1 && rest[0] === "public_access") {
       return { family: "settings-public-access", owner, repo };
     }
@@ -5023,16 +5089,19 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
 
 /**
  * The authed-page redirect (SPEC-0010 §2.5, the session wave's convention):
- * an anonymous viewer 303s onto the login form with this path as the
- * `redirect_to` round-trip target (the session router re-validates it
- * through `safeRedirectTarget` at use time). Repo resolution happens FIRST,
+ * an anonymous viewer 303s onto the login form with this request URI as the
+ * `redirect_to` round-trip target — the FULL `pathname + search` (Go's
+ * `req.URL.RequestURI()`), exactly what upstream's middleware carries
+ * (modules/web/middleware/cookie.go RedirectLinkUserLogin, consumed by
+ * reqSignIn at routers/web/web.go) — and the session router re-validates it
+ * through `safeRedirectTarget` at use time. Repo resolution happens FIRST,
  * so an invisible repo 404-shells and never reveals itself through the
  * redirect.
  */
-function loginRedirect(pathname: string): Response {
+function loginRedirect(requestUri: string): Response {
   return new Response(null, {
     status: 303,
-    headers: { location: `/login?redirect_to=${encodeURIComponent(pathname)}` },
+    headers: { location: `/login?redirect_to=${encodeURIComponent(requestUri)}` },
   });
 }
 
@@ -5053,7 +5122,7 @@ async function issueNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, repo, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const data = await loadNewIssueData(c.env.DB, repo.id);
   const milestoneParam = (url.searchParams.get("milestone") ?? "").trim();
   const milestoneId =
@@ -5088,7 +5157,7 @@ async function issueNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, repo, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const form = await readNewIssueForm(c.req.raw);
   // Archived repos refuse the write (the API create route's
   // assertNotArchived posture — the message cites it verbatim).
@@ -5117,7 +5186,7 @@ async function settingsGate(
   resolved: Extract<ResolvedUiRequest, { ok: true }>,
 ): Promise<Response | null> {
   const { url, ctx, viewer, repo, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (!(await canAdminRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
   return null;
 }
@@ -5496,6 +5565,177 @@ async function repoLfsFindPage(c: Context<{ Bindings: Env }>): Promise<Response>
 }
 
 // ---------------------------------------------------------------------------
+// The census C8 arm: the repo settings Actions secrets/variables sub-tabs
+// (pages/repo-settings-actions-secrets-variables.tsx — upstream web.go:1266-
+// 1278's `m.Group("/actions", ...)` with the shared secrets/variables
+// builders web.go:498-506/489-496; the org twin's route shape —
+// org-settings-actions.tsx — under the shared settingsGate PLUS the
+// /actions group's MustEnableActions arm, sameOriginGuard-first POSTs).
+// ---------------------------------------------------------------------------
+
+/** The actions-arm gate: the shared settingsGate, then MustEnableActions'
+ *  repo-unit arm (routers/web/repo/actions/actions.go:67-81 — for the repo
+ *  scope it is `Permission.CanRead(TypeActions)`; the landed store's unit
+ *  flag is repo_settings.has_actions, DEFAULT false). A disabled unit
+ *  answers the 404 shell (upstream ctx.NotFound) — the same answer the
+ *  navbar's conditional renders from (the SettingsNav hasActions prop).
+ *  Returns the Response to answer, or `null` to proceed. */
+async function repoActionsGate(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+): Promise<Response | null> {
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const settings = await loadRepoSettings(c.env.DB, resolved.repo.id);
+  if (!settings.hasActions) return resolved.respond(c.html(renderNotFound(resolved.ctx), 404));
+  return null;
+}
+
+/** GET /{owner}/{repo}/settings/actions/secrets (repo_setting.Secrets,
+ *  secrets.go:76-95) through the gates. */
+async function repoActionsSecretsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-secrets") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoActionsSecretsPageData(c.env.DB, repo.id);
+  return respond(c.html(renderRepoActionsSecretsPage(ctx, data), 200));
+}
+
+/** POST /{owner}/{repo}/settings/actions/secrets (SecretsPost →
+ *  PerformSecretsPost, secrets.go:98-117 / shared/secrets/secrets.go:35-56):
+ *  "saved" 303s back onto the list URL (the no-session-flash reduction);
+ *  "invalid" re-renders with the error line + the carried name/description
+ *  only — the plaintext value never enters the DOM (the org twin's
+ *  carried-form contract). */
+async function repoActionsSecretsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-secrets") return respond(await c.notFound()); // drift guard
+  const form = parseRepoActionsSecretForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyRepoActionsSecretForm(c.env.DB, repo.id, form);
+  if (outcome.outcome === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/secrets` } }));
+  }
+  const data = await loadRepoActionsSecretsPageData(c.env.DB, repo.id);
+  // Carried name/description only — plaintext never enters the DOM.
+  data.form = { name: form.name, data: "", description: form.description };
+  return respond(c.html(renderRepoActionsSecretsPage(ctx, data, outcome.message)));
+}
+
+/** POST /{owner}/{repo}/settings/actions/secrets/delete (SecretsDelete →
+ *  PerformSecretsDelete, secrets.go:119-132 / shared/secrets/secrets.go:58-
+ *  71): both outcomes 303 back — a null/foreign/stale id answers "missing"
+ *  and deletes nothing (the idempotent-303 reduction). */
+async function repoActionsSecretsDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-secrets-delete") return respond(await c.notFound()); // drift guard
+  const form = parseRepoActionsSecretDeleteForm(await readUrlEncodedForm(c.req.raw));
+  await deleteRepoActionsSecret(c.env.DB, repo.id, form);
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/secrets` } }));
+}
+
+/** GET /{owner}/{repo}/settings/actions/variables (shared_actions.Variables'
+ *  repo arm, variables.go:83-105) through the gates. */
+async function repoActionsVariablesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-variables") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoActionsVariablesPageData(c.env.DB, repo.id);
+  return respond(c.html(renderRepoActionsVariablesPage(ctx, data), 200));
+}
+
+/** POST /{owner}/{repo}/settings/actions/variables/new (VariableCreate,
+ *  variables.go:107-129): "saved" 303s back; "invalid" re-renders with ALL
+ *  THREE fields carried (the value rides along, unlike secrets); the
+ *  "missing" arm cannot arise on create — a non-ApiError (the UNIQUE
+ *  duplicate-name db error) propagates to the generic error handler, the
+ *  twins' shape. */
+async function repoActionsVariablesNew(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-variables-new") return respond(await c.notFound()); // drift guard
+  const form = parseRepoActionsVariableForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyRepoActionsVariableCreate(c.env.DB, repo.id, form);
+  if (outcome.outcome === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/variables` } }));
+  }
+  const data = await loadRepoActionsVariablesPageData(c.env.DB, repo.id);
+  if (outcome.outcome === "invalid") {
+    data.form = { name: form.name, data: form.data, description: form.description };
+    return respond(c.html(renderRepoActionsVariablesPage(ctx, data, outcome.message)));
+  }
+  return respond(c.html(renderNotFound(ctx), 404));
+}
+
+/** POST /{owner}/{repo}/settings/actions/variables/{id}/edit
+ *  (VariableUpdate, variables.go:131-161): "saved" 303s back; "missing" is
+ *  upstream's findActionsVariable arm — a genuine ctx.NotFound(nil)
+ *  (variables.go:172-175) — the 404 shell; "invalid" re-renders with all
+ *  three fields carried. */
+async function repoActionsVariablesEdit(c: Context<{ Bindings: Env }>, variableId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-variables-edit") return respond(await c.notFound()); // drift guard
+  const form = parseRepoActionsVariableForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyRepoActionsVariableUpdate(c.env.DB, repo.id, variableId, form);
+  if (outcome.outcome === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/variables` } }));
+  }
+  if (outcome.outcome === "missing") {
+    // Upstream's findActionsVariable miss → ctx.NotFound(nil) — a genuine
+    // 404 (the org twin's fidelity call).
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const data = await loadRepoActionsVariablesPageData(c.env.DB, repo.id);
+  data.form = { name: form.name, data: form.data, description: form.description };
+  return respond(c.html(renderRepoActionsVariablesPage(ctx, data, outcome.message)));
+}
+
+/** POST /{owner}/{repo}/settings/actions/variables/{id}/delete
+ *  (VariableDelete, variables.go:179-200): "deleted" 303s back; "missing"
+ *  is the same NotFound arm (variables.go:186-191). */
+async function repoActionsVariablesDelete(c: Context<{ Bindings: Env }>, variableId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await repoActionsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-variables-delete") return respond(await c.notFound()); // drift guard
+  const outcome = await deleteRepoActionsVariable(c.env.DB, repo.id, variableId);
+  if (outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/variables` } }));
+}
+
+// ---------------------------------------------------------------------------
 // Window-2e folds: the branches writer forms' POST arms (the wave-63 module
 // handoff — upstream web.go:1477-1486's editor middlewares: writer grant +
 // RepoMustNotBeArchived + MustBeNotEmpty), replaying the API create/rename
@@ -5662,7 +5902,7 @@ async function repoSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Respon
   // reqSignIn (web.go:1097-1103). The API-layer Viewer needs the contract
   // User — built from the D1 row via the auth mapper (toApiUser, exported
   // for this bridge).
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
   if (userRow === undefined) return respond(c.html(renderNotFound(resolved.ctx), 404)); // the session doer vanished
   const apiViewer = {
@@ -5716,7 +5956,7 @@ async function repoMigratePage(c: Context<{ Bindings: Env }>): Promise<Response>
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
   if (resolved.route.family !== "repo-migrate") return respond(await c.notFound()); // drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const data = await loadRepoMigrateData(c.env.DB, viewer);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderRepoMigratePage({ ctx, data, form: { uid: null, cloneAddr: "", authUsername: "", authPassword: "", repoName: "", description: "", isPrivate: false, mirror: true }, error: null }), 200));
@@ -5729,7 +5969,7 @@ async function repoMigrateSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
   if (resolved.route.family !== "repo-migrate") return respond(await c.notFound()); // drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const data = await loadRepoMigrateData(c.env.DB, viewer);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   const form = parseRepoMigrateForm(await readUrlEncodedForm(c.req.raw));
@@ -5797,7 +6037,7 @@ async function issuesSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Resp
   if (!resolved.ok) return resolved.response;
   const { url, ctx, repo, viewer, respond } = resolved;
   if (resolved.route.family !== "issues-search-aux") return respond(await c.notFound()); // drift guard
-  if (viewer.kind !== "user") return respond(loginRedirect(url.pathname)); // reqSignIn (web.go:1440)
+  if (viewer.kind !== "user") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn (web.go:1440)
   const data = await loadIssuesSearchAux(
     c.env,
     { id: repo.id, isArchived: repo.isArchived },
@@ -6549,7 +6789,7 @@ async function branchDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   const { url, ctx, viewer, repo, respond } = resolved;
   const route = resolved.route;
   if (route.family !== "branch-delete") return respond(await c.notFound()); // registration/parser drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (repo.isArchived || repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
   const name = parseBranchDeleteForm(await readUrlEncodedForm(c.req.raw));
   if (name === "") return respond(c.html(renderNotFound(ctx), 404));
@@ -6716,7 +6956,7 @@ async function userSettingsPage(c: Context<{ Bindings: Env }>): Promise<Response
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const data = await loadUserSettingsPageData(c.env.DB, viewer.id);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderUserSettingsPage(ctx, data), 200));
@@ -6736,7 +6976,7 @@ async function userSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const row = await loadUserSettingsPageData(c.env.DB, viewer.id);
   if (row === null) return respond(c.html(renderNotFound(ctx), 404));
   const form = parseUserProfileForm(await readUrlEncodedForm(c.req.raw));
@@ -6766,7 +7006,7 @@ async function userSettingsTabPrologue(c: Context<{ Bindings: Env }>, withOrigin
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return { ok: false, response: resolved.response };
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname)) };
+  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname + url.search)) };
   return { ok: true, url, ctx, viewer, respond };
 }
 
@@ -7175,7 +7415,7 @@ async function repoCreatePage(c: Context<{ Bindings: Env }>): Promise<Response> 
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const data = await loadRepoCreateData(c.env.DB, viewer);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   const orgParam = url.searchParams.get("org") ?? "";
@@ -7215,7 +7455,7 @@ async function repoCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const data = await loadRepoCreateData(c.env.DB, viewer);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   const form = parseRepoCreateForm(await readUrlEncodedForm(c.req.raw));
@@ -7238,7 +7478,7 @@ async function orgCreatePage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   return respond(
     c.html(
       renderOrgCreatePage({
@@ -7269,7 +7509,7 @@ async function orgCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response>
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // sessions are user-shaped
   const form = parseOrgCreateForm(await readUrlEncodedForm(c.req.raw));
   const result = await createOrgFromForm(c.env.DB, viewer, form);
@@ -7306,7 +7546,7 @@ async function resolveOrgTeamsRequest(c: Context<{ Bindings: Env }>): Promise<Re
     return { ok: false, response: respond(new Response(null, { status: 307, headers: { location: org.location } })) };
   }
   if (org.kind === "missing") return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
-  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname)) };
+  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname + url.search)) };
   if (!(await canManageOrgTeams(c.env.DB, org.org, viewer))) {
     return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
   }
@@ -8020,7 +8260,7 @@ async function adminPagePrologue(c: Context<{ Bindings: Env }>): Promise<
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return { ok: false, response: resolved.response };
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname)) };
+  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname + url.search)) };
   if (!viewer.isAdmin) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
   return { ok: true, ctx, respond };
 }
@@ -8106,6 +8346,21 @@ async function adminReposPage(c: Context<{ Bindings: Env }>): Promise<Response> 
   if (!p.ok) return p.response;
   const data = await loadAdminReposData(c.env.DB, p.ctx.viewer, new URL(c.req.raw.url).searchParams);
   return p.respond(c.html(renderAdminReposPage(p.ctx, data)));
+}
+
+/** GET /-/admin/packages (pages/admin-packages.tsx — upstream web.go:852-858's
+ *  /packages group; the group's `packagesEnabled` qualifier rides the
+ *  strict-polarity PACKAGES_ENABLED var through ctx.packagesEnabled, the
+ *  R04 prologue's 404-shell arm verbatim): the prologue → the paged packages
+ *  listing. The group's delete/cleanup POSTs stay UNCLAIMED — unlanded
+ *  writes (the module's dead-link note), the engine's 404, the admin-repos
+ *  delete-tail posture. */
+async function adminPackagesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  if (p.ctx.packagesEnabled === false) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const data = await loadAdminPackagesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminPackagesPage(p.ctx, data)));
 }
 
 // --- the census R18 (a) arms (pages/admin-emails.tsx / admin-hooks.tsx /
@@ -8598,7 +8853,7 @@ async function fileEditorGate(
   resolved: Extract<ResolvedUiRequest, { ok: true }>,
 ): Promise<Response | null> {
   const { url, ctx, viewer, repo, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (repo.isArchived || !(await canWriteRepo(c.env, repo, viewer))) {
     return respond(c.html(renderNotFound(ctx), 404));
   }
@@ -8981,7 +9236,7 @@ async function notificationsPage(c: Context<{ Bindings: Env }>): Promise<Respons
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   // The tab param is upstream's two-arg FormString default shape —
   // `FormString("type", FormString("q"))` (notification.go:69): the legacy
   // `?q=` alias feeds the same tab select when `type` is absent (the `??`
@@ -9006,7 +9261,7 @@ async function notificationsNew(c: Context<{ Bindings: Env }>): Promise<Response
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const count = await countUnreadNotifications(c.env.DB, viewer.id).catch(() => 0);
   return respond(c.json({ new: count }, 200));
 }
@@ -9028,7 +9283,7 @@ async function notificationStatusSubmit(c: Context<{ Bindings: Env }>): Promise<
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const { id, action } = parseNotificationStatusForm(await readUrlEncodedForm(c.req.raw));
   if (action === null) {
     // Unknown action — ignored with an empty 200 (upstream `default: return`).
@@ -9059,7 +9314,7 @@ async function notificationPurgeSubmit(c: Context<{ Bindings: Env }>): Promise<R
   const resolved = await resolveUiSession(c);
   if (!resolved.ok) return resolved.response;
   const { url, viewer, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   await purgeNotifications(c.env.DB, viewer.id, new Date());
   return respond(c.json({ redirect: "/notifications" }, 200));
 }
@@ -9119,7 +9374,7 @@ async function issueCommentSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
   const { url, ctx, viewer, repo, respond } = resolved;
   const route = resolved.route;
   if (route.family !== "issue-comment") return respond(await c.notFound()); // registration/parser drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
 
   const issue = await findIssueByRepoAndIndex(c.env.DB, repo.id, route.index);
   if (issue === null) return respond(c.html(renderNotFound(ctx), 404));
@@ -9161,7 +9416,7 @@ async function issueLabelsSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, repo, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (!(await canAdminRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
 
   const form = parseIssueLabelForm(await readUrlEncodedForm(c.req.raw));
@@ -9203,7 +9458,7 @@ async function pullReviewSubmit(c: Context<{ Bindings: Env }>): Promise<Response
   const { url, ctx, viewer, repo, respond } = resolved;
   const route = resolved.route;
   if (route.family !== "pull-review-submit" || route.index === undefined) return respond(await c.notFound());
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   // RepoMustNotBeArchived wraps upstream's reviews group (web.go:1677).
   if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404));
 
@@ -9260,7 +9515,7 @@ async function pullReviewRequestSubmit(c: Context<{ Bindings: Env }>): Promise<R
   const { url, ctx, viewer, repo, respond } = resolved;
   const route = resolved.route;
   if (route.family !== "issue-request-review") return respond(await c.notFound());
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived (web.go:1419-1421)
 
   const form = parseReviewRequestForm(await readUrlEncodedForm(c.req.raw));
@@ -9324,7 +9579,7 @@ async function pullReviewDismissSubmit(c: Context<{ Bindings: Env }>): Promise<R
   const { url, ctx, viewer, repo, respond } = resolved;
   const route = resolved.route;
   if (route.family !== "issue-dismiss-review") return respond(await c.notFound());
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (!(await canAdminRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404)); // reqRepoAdmin
   if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived (web.go:1436's group)
 
@@ -9443,7 +9698,7 @@ async function globalInboxIssuesPage(c: Context<{ Bindings: Env }>, listKind: "i
   const { url, viewer, respond } = resolved;
   const family = listKind === "issues" ? "global-issues" : "global-pulls";
   if (resolved.route.family !== family) return respond(await c.notFound()); // drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const data = await loadOverviewIssuesData(c.env.DB, viewer, listKind, url.searchParams);
   return respond(c.html(renderOverviewIssuesPage(resolved.ctx, data), 200));
 }
@@ -9453,7 +9708,7 @@ async function globalMilestonesPage(c: Context<{ Bindings: Env }>): Promise<Resp
   if (!resolved.ok) return resolved.response;
   const { url, viewer, respond } = resolved;
   if (resolved.route.family !== "global-milestones") return respond(await c.notFound()); // drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const data = await loadDashboardMilestonesData(c.env.DB, viewer, url.searchParams);
   return respond(c.html(renderDashboardMilestonesPage(resolved.ctx, data), 200));
 }
@@ -9466,7 +9721,7 @@ async function notificationSubscriptionsPage(c: Context<{ Bindings: Env }>, watc
   const { url, ctx, viewer, respond } = resolved;
   const family = watching ? "notification-watching" : "notification-subscriptions";
   if (resolved.route.family !== family) return respond(await c.notFound()); // drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   const data = watching
     ? await loadWatchingData(c.env.DB, viewer, url.searchParams)
     : await loadSubscriptionsData(c.env.DB, viewer, url.searchParams);
@@ -9633,7 +9888,7 @@ async function compareSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   // The bare URL carries no form (nothing to compare) — the registration
   // answers it with chi's 405; a null-side tail POST is hand-crafted (404).
   if (route.family !== "compare" || route.head === null) return respond(await c.notFound());
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname)); // reqSignIn (web.go:1312)
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn (web.go:1312)
   // RepoMustNotBeArchived + reqUnitPullsReader (web.go:1312): the archived
   // arm 404-shells; the pulls-unit read is the §2.5 grant the prologue ran
   // (every signed-in viewer who sees the repo reads its pulls), so the
@@ -10185,7 +10440,7 @@ async function tagsDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond, repo } = resolved;
   if (resolved.route.family !== "tags-delete") return respond(await c.notFound()); // drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname)); // reqSignIn
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn
   if (repo.isEmpty || repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty + RepoMustNotBeArchived
   if (!(await canWriteRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404)); // reqRepoCodeWriter
   const subject = parseTagDeleteForm(await readUrlEncodedForm(c.req.raw));
@@ -10393,7 +10648,7 @@ async function releasesWriteGate(
   resolved: Extract<ResolvedUiRequest, { ok: true }>,
 ): Promise<Response | null> {
   const { url, ctx, viewer, repo, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (repo.isArchived || !(await releasesReadGate(c.env.DB, repo))) {
     return respond(c.html(renderNotFound(ctx), 404));
   }
@@ -11056,7 +11311,14 @@ function ownerProjectWriteGate(
   c: Context<{ Bindings: Env }>,
   depth: Extract<ResolvedProjectDepth, { ok: true }>,
 ): Promise<Response | null> {
-  return ownerProjectWriteGateAt(c, depth.owner, depth.viewer, depth.ctx, depth.respond, depth.url.pathname);
+  return ownerProjectWriteGateAt(
+    c,
+    depth.owner,
+    depth.viewer,
+    depth.ctx,
+    depth.respond,
+    depth.url.pathname + depth.url.search,
+  );
 }
 
 /** The write gate's free-variable form (the /new handlers' inline owner). */
@@ -11066,9 +11328,9 @@ async function ownerProjectWriteGateAt(
   viewer: Viewer,
   ctx: UiContext,
   respond: (res: Response) => Response,
-  pathname: string,
+  requestUri: string,
 ): Promise<Response | null> {
-  if (viewer.kind === "anonymous") return respond(loginRedirect(pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(requestUri));
   if (!(await ownerProjectWriteAccess(c.env.DB, owner, boardDoer(viewer)))) {
     return respond(c.html(renderNotFound(ctx), 404));
   }
@@ -11108,8 +11370,8 @@ async function resolveOwnerEntry(c: Context<{ Bindings: Env }>): Promise<Resolve
 async function ownerProjectNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const entry = await resolveOwnerEntry(c);
   if (!entry.ok) return entry.response;
-  const { ctx, viewer, respond, owner } = entry;
-  const gate = await ownerProjectWriteGateAt(c, owner, viewer, ctx, respond, new URL(c.req.url).pathname);
+  const { url, ctx, viewer, respond, owner } = entry;
+  const gate = await ownerProjectWriteGateAt(c, owner, viewer, ctx, respond, url.pathname + url.search);
   if (gate !== null) return gate;
   const counts = await loadProjectChromeCounts(c.env.DB, owner, viewer);
   return respond(
@@ -11128,8 +11390,8 @@ async function ownerProjectNewSubmit(c: Context<{ Bindings: Env }>): Promise<Res
   if (guard !== null) return guard;
   const entry = await resolveOwnerEntry(c);
   if (!entry.ok) return entry.response;
-  const { ctx, viewer, respond, owner } = entry;
-  const gate = await ownerProjectWriteGateAt(c, owner, viewer, ctx, respond, new URL(c.req.url).pathname);
+  const { url, ctx, viewer, respond, owner } = entry;
+  const gate = await ownerProjectWriteGateAt(c, owner, viewer, ctx, respond, url.pathname + url.search);
   if (gate !== null) return gate;
   const doer = boardDoer(viewer);
   if (doer.id === null) return respond(c.html(renderNotFound(ctx), 404));
@@ -11539,7 +11801,7 @@ async function repoLabelsWriteGate(
   resolved: Extract<ResolvedUiRequest, { ok: true }>,
 ): Promise<Response | null> {
   const { url, ctx, viewer, repo, respond } = resolved;
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (repo.isArchived || !(await canWriteRepo(c.env, repo, viewer))) {
     return respond(c.html(renderNotFound(ctx), 404));
   }
@@ -12111,7 +12373,7 @@ async function repoForkPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond, repo } = resolved;
   if (resolved.route.family !== "repo-fork") return respond(await c.notFound()); // drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
   const data = await loadRepoForkData(c.env, c.env.DB, repo, viewer);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
@@ -12135,7 +12397,7 @@ async function repoForkSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, respond, repo } = resolved;
   if (resolved.route.family !== "repo-fork") return respond(await c.notFound()); // drift guard
-  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
   const data = await loadRepoForkData(c.env, c.env.DB, repo, viewer);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
@@ -12381,6 +12643,10 @@ uiRouter.get("/-/admin/monitor/stacktrace", (c) => adminMonitorPage(c, "trace"))
 uiRouter.get("/-/admin/users", (c) => adminUsersPage(c));
 uiRouter.get("/-/admin/orgs", (c) => adminOrgsPage(c));
 uiRouter.get("/-/admin/repos", (c) => adminReposPage(c));
+// The tick-18 packages arm (parseUiRoute claims exactly the bare literal —
+// web.go:852-858's list GET; the group's delete/cleanup POSTs stay
+// unregistered, the engine's 404).
+uiRouter.get("/-/admin/packages", (c) => adminPackagesPage(c));
 // The census R18 (a) arms (parseUiRoute claims exactly these shapes — the
 // same static literals; the writes are POST-only, the badge slug families
 // ride the decoded param, the application delete the positive-integer id).
@@ -12545,6 +12811,25 @@ uiRouter.post("/:owner/:repo/settings/lfs/find", () => methodNotAllowed("GET"));
 // compare family's methodNotAllowed convention).
 uiRouter.get("/:owner/:repo/settings/audit_logs", (c) => repoAuditLogsPage(c));
 uiRouter.post("/:owner/:repo/settings/audit_logs", () => methodNotAllowed("GET"));
+// The census C8 arm: the repo settings Actions secrets/variables sub-tabs
+// (upstream web.go:1269-1270's shared builders under the /actions group).
+// The bare /settings/actions (upstream's LocationRedirect onto the unlanded
+// general tab) stays unregistered — the engine's 404 (the org twin's
+// posture). GET-only upstream tails answer the 405 (the audit arm's
+// convention); the variable path ids ride the parse guard (junk ids never
+// reach the handlers).
+uiRouter.get("/:owner/:repo/settings/actions/secrets", (c) => repoActionsSecretsPage(c));
+uiRouter.post("/:owner/:repo/settings/actions/secrets", (c) => repoActionsSecretsSubmit(c));
+uiRouter.get("/:owner/:repo/settings/actions/secrets/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/secrets/delete", (c) => repoActionsSecretsDelete(c));
+uiRouter.get("/:owner/:repo/settings/actions/variables", (c) => repoActionsVariablesPage(c));
+uiRouter.post("/:owner/:repo/settings/actions/variables", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/:repo/settings/actions/variables/new", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/variables/new", (c) => repoActionsVariablesNew(c));
+uiRouter.get("/:owner/:repo/settings/actions/variables/:id/edit", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/variables/:id/edit", (c) => repoActionsVariablesEdit(c, Number(c.req.param("id"))));
+uiRouter.get("/:owner/:repo/settings/actions/variables/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/variables/:id/delete", (c) => repoActionsVariablesDelete(c, Number(c.req.param("id"))));
 // Window-2e pass 1: sitemap + search aux.
 uiRouter.get("/sitemap.xml", (c) => sitemapRoute(c));
 uiRouter.get("/explore/repos/sitemap-:file", (c) => sitemapRoute(c));
