@@ -241,9 +241,10 @@ describe("wave-37 parser claims", () => {
     });
     // The `/-` namespace's sibling tails stay unclaimed — except the
     // heatmap tail, which the raw/media wave claimed (the owner-heatmap
-    // JSON family).
+    // JSON family), and the packages literal, which SPEC-0016 M2 claimed
+    // (pages/packages.tsx; the depth arms are its own subtree).
     expect(parseUiRoute("/wave37-user/-/heatmap")).toEqual({ family: "owner-heatmap", owner: "wave37-user" });
-    expect(parseUiRoute("/wave37-user/-/packages")).toBeNull();
+    expect(parseUiRoute("/wave37-user/-/packages")).toEqual({ family: "owner-packages", owner: "wave37-user" });
     expect(handlesUiRoute("/wave37-user/-/projects")).toBe(true);
     expect(handlesUiRoute("/wave37-user/-/projects/7")).toBe(true);
   });

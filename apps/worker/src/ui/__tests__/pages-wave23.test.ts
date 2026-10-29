@@ -117,12 +117,13 @@ describe("wave-23 parser claims", () => {
     // resolve to nothing at repo time (no owner "org", no repo "-") — and
     // EXCEPT the heatmap tail, which the raw/media wave claimed (the
     // owner-heatmap JSON family; an org name 404-shells inside the handler,
-    // the R06 boundary).
+    // the R06 boundary) — and the packages literal, which SPEC-0016 M2
+    // claimed (pages/packages.tsx; the depth arms are its own subtree).
     expect(parseUiRoute("/org/wave23org/members/extra")).toBeNull();
     expect(parseUiRoute("/org/wave23org")).toEqual({ family: "home", owner: "org", repo: "wave23org", refSuffix: null });
     expect(parseUiRoute("/wave23org/-/heatmap")).toEqual({ family: "owner-heatmap", owner: "wave23org" });
     expect(parseUiRoute("/wave23org/-")).toEqual({ family: "home", owner: "wave23org", repo: "-", refSuffix: null });
-    expect(parseUiRoute("/wave23org/-/packages")).toBeNull();
+    expect(parseUiRoute("/wave23org/-/packages")).toEqual({ family: "owner-packages", owner: "wave23org" });
     // handlesUiRoute (the dispatcher's gate) answers the same.
     expect(handlesUiRoute("/org/wave23org/members")).toBe(true);
     expect(handlesUiRoute("/wave23org/-/repositories")).toBe(true);

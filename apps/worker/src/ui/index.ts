@@ -1068,6 +1068,36 @@ import {
   renderOwnerProjectsPage,
   resolveOwnerProjects,
 } from "./pages/owner-projects";
+// The SPEC-0016 M2 packages families (pages/packages.tsx — the R04 owner
+// subtree + the R16 repo tab over the LANDED packages model service; the
+// owner-projects pattern's loaders + renderers + the resolution seam).
+import {
+  loadOwnerPackageVersionViewData,
+  loadOwnerPackageVersionsData,
+  loadOwnerPackagesData,
+  loadPackageFileDownload,
+  loadRepoPackagesData,
+  packageFileDownloadResponse,
+  renderOwnerPackageVersionViewPage,
+  renderOwnerPackageVersionsPage,
+  renderOwnerPackagesPage,
+  renderRepoPackagesPage,
+  resolveLatestVersionRedirect,
+  resolvePackagesOwner,
+  type PackagesOwner,
+} from "./pages/packages";
+// The SPEC-0016 M2 quota/env config (the profile tab's strict-polarity
+// global — resolveUiSession arms `ctx.packagesEnabled` from it, and the R04
+// prologue 404-shells the subtree when the feature is off).
+import { getVersionByNameAndVersion, packagesQuotaFromEnv } from "../services/packages/model";
+// The codesearch-M1 owner code-search family (pages/user-code-search.tsx —
+// the `/-` namespace's code tail over the federation seeds; the packages
+// family's owner-resolution twin without the package-access gate).
+import {
+  loadUserCodeSearchData,
+  renderUserCodeSearchPage,
+  resolveUserCodeSearchOwner,
+} from "./pages/user-code-search";
 // Wave-40 owner projects BOARD families (the survey's follow-up row — the
 // board view + write group + workflow tails over the landed service
 // predicates).
@@ -1185,6 +1215,9 @@ import {
   renderExploreReposPage,
   renderExploreUsersPage,
 } from "./pages/explore";
+// The SPEC-0019 M2 explore code-search page (pages/explore-code.tsx — the
+// navbar's fourth tab, the federation scan over every visible repo).
+import { loadExploreCodeSearchData, renderExploreCodePage } from "./pages/explore-code";
 import { loadOwnerHeatmapData, ownerHeatmapJsonBody } from "./pages/owner-heatmap";
 import {
   loadOrgInboxIssuesData,
@@ -1930,6 +1963,46 @@ export interface OrgRepositoriesRoute {
   owner: string;
 }
 
+/** The SPEC-0016 M2 owner packages subtree (pages/packages.tsx): upstream's
+ *  `/{username}/-` group's packages routes (web.go:1109-1121 — the group's
+ *  `context.PackageAssignment()` + `reqPackageAccess(read)` wraps fold into
+ *  the resolution seam) — the list literal (ListPackages), `/{type}/{name}`
+ *  the RedirectToLastVersion 303 (package.go:137), the `/versions` tail
+ *  (ListPackageVersions, the static literal outranking the `{version}`
+ *  param exactly as chi registers it), the `/{version}` view
+ *  (ViewPackageVersion), and the `/{version}/files/{fileid}` byte download
+ *  (DownloadPackageFile, package.go:530). */
+export interface OwnerPackagesRoute {
+  family:
+    | "owner-packages" // GET /packages
+    | "owner-package-redirect" // GET /packages/{type}/{name} → 303 latest
+    | "owner-package-versions" // GET /packages/{type}/{name}/versions
+    | "owner-package-version-view" // GET /packages/{type}/{name}/{version}
+    | "owner-package-file-download" // GET .../{version}/files/{fileid}
+  ;
+  /** Decoded owner segment (user-or-org rows at resolve time). */
+  owner: string;
+  /** The decoded registry type + package name (the depth families). */
+  type?: string;
+  name?: string;
+  /** The decoded version (the view + download families). */
+  version?: string;
+  /** The parsed file id (the download family; the PathParamInt64 parity —
+   *  "007" parses as 7, junk shapes stay unclaimed). */
+  fileId?: number;
+}
+
+/** The SPEC-0016 M2 repo packages tab (pages/packages.tsx): upstream's
+ *  `/{username}/{reponame}/packages` group's bare literal (web.go:1546 —
+ *  repo.Packages). The group's MustEnableRepoProjects-shaped unit gate
+ *  (`repo_settings.has_packages`) runs at the handler off the
+ *  resolveUiRequest flag — the shell tab reads the SAME toggle. */
+export interface RepoPackagesRoute {
+  family: "repo-packages";
+  owner: string;
+  repo: string;
+}
+
 /** The ORG-scoped inbox families (pages/org-inbox.tsx — this wave's R07):
  *  upstream web.go:986-991's `/org/{org}/{issues|pulls|milestones}` +
  *  `/{team}` tails under `OrgAssignment(RequireMember, RequireTeamMember)`.
@@ -1954,6 +2027,19 @@ export interface OwnerHeatmapRoute {
   family: "owner-heatmap";
   /** Decoded owner segment (user rows only at resolve time — the R06
    *  boundary note in the module header). */
+  owner: string;
+}
+
+/** The codesearch-M1 owner code-search family (pages/user-code-search.tsx —
+ *  this wave): the `/{username}/-` group's `/code` literal (upstream
+ *  user.CodeSearch, web.go:1136's `m.Get("/code", user.CodeSearch)` in the
+ *  `/{username}/-` group) — the federated code search page over the
+ *  owner's repos. The owner resolves user-or-org at load time (the
+ *  packages family's owner-resolution twin without the package-access
+ *  gate — the module header's §5.4/§5.9 note). */
+export interface UserCodeSearchRoute {
+  family: "user-code-search";
+  /** Decoded owner segment (user-or-org rows at resolve time). */
   owner: string;
 }
 
@@ -2497,11 +2583,13 @@ export interface NotificationsRoute {
  *  search page (this wave — the census's R01 brief, org.go:17's
  *  Organizations). Claimed by EXACT literal shapes before the owner/repo
  *  parse could read `/explore/repos` as a `{owner: "explore", repo:
- *  "repos"}` repository; every other `/explore/*` tail (code, sitemap-*,
+ *  "repos"}` repository; the SPEC-0019 M2 code search tail
+ *  (`/explore/code` — SPEC-0019 M2's landed page, the navbar's fourth item)
+ *  claims beside the literals; every other `/explore/*` tail (sitemap-*,
  *  deeper) stays unclaimed → the engine/parent answer, exactly upstream's
  *  unregistered-route 404. */
 export interface ExploreRoute {
-  family: "explore-root" | "explore-repos" | "explore-users" | "explore-organizations";
+  family: "explore-root" | "explore-repos" | "explore-users" | "explore-organizations" | "explore-code";
 }
 
 /** Window-2e: the sitemap families (pages/sitemap.ts — upstream web.go:530,
@@ -2905,6 +2993,8 @@ export type ParsedUiRoute =
   | OrgCreateRoute
   | OrgMembersRoute
   | OrgRepositoriesRoute
+  | OwnerPackagesRoute
+  | RepoPackagesRoute
   | OwnerProjectsRoute
   | OwnerProjectBoardRoute
   | RepoProjectsRoute
@@ -2931,6 +3021,7 @@ export type ParsedUiRoute =
   | WikiRawRoute
   | RawMediaRoute
   | OwnerHeatmapRoute
+  | UserCodeSearchRoute
   | OrgInboxRoute;
 
 
@@ -2972,11 +3063,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
 
   // The wave-9 explore family (pages/explore.tsx — upstream web.go:549-556):
   // EXACT literal shapes claimed before the owner/repo parse could read
-  // `/explore/repos` as a repository. Any other tail (organizations, code,
-  // sitemap-*, deeper) stays unclaimed — the engine/parent 404s it, exactly
-  // like upstream's unregistered routes. A same-named user namespace
-  // (`/EXPLORE`, or `/e%78plore`'s decoded form) keeps the owner-home
-  // family — the literals bind case-sensitively, like the chi patterns.
+  // `/explore/repos` as a repository. The SPEC-0019 M2 code search tail
+  // claims beside the literals (pages/explore-code.tsx — the navbar's
+  // fourth item, the tab's dead-link reason expired when its page landed).
+  // Any other tail (sitemap-*, deeper) stays unclaimed — the engine/parent
+  // 404s it, exactly like upstream's unregistered routes. A same-named user
+  // namespace (`/EXPLORE`, or `/e%78plore`'s decoded form) keeps the
+  // owner-home family — the literals bind case-sensitively, like the chi
+  // patterns.
   if (raw[1] === "explore") {
     if (raw.length === 2) return { family: "explore-root" };
     if (raw.length === 3 && raw[2] === "repos") return { family: "explore-repos" };
@@ -2984,6 +3078,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // The org search page (this wave — upstream web.go:557's literal,
     // org.go:17's Organizations over the shared tplExploreUsers template).
     if (raw.length === 3 && raw[2] === "organizations") return { family: "explore-organizations" };
+    // The SPEC-0019 M2 code search page (upstream web.go:558's literal,
+    // code.go's explore.Code over the federation seeds).
+    if (raw.length === 3 && raw[2] === "code") return { family: "explore-code" };
     // Window-2e: the topic search aux feed (pages/search-aux.ts — upstream
     // explore.TopicSearch, web.go:564, optSignIn).
     if (raw.length === 4 && raw[2] === "topics" && raw[3] === "search") {
@@ -3506,6 +3603,67 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // Open Issues #8 note).
   if (repo === "-" && raw.length === 4 && raw[3] === "heatmap") {
     return { family: "owner-heatmap", owner };
+  }
+  // The codesearch-M1 owner code-search tail (pages/user-code-search.tsx —
+  // this wave): upstream web.go:1136's `m.Get("/code", user.CodeSearch)` in
+  // the `/{username}/-` group. The exact 4-segment shape claims beside the
+  // heatmap/repositories/projects literals (disjoint third segments — the
+  // `-` pseudo-segment namespace shadows nothing, the ae32b1a rule).
+  if (repo === "-" && raw.length === 4 && raw[3] === "code") {
+    return { family: "user-code-search", owner };
+  }
+  // The SPEC-0016 M2 packages subtree (pages/packages.tsx — upstream's
+  // web.go:1109-1121 packages routes in the `/{username}/-` group): the
+  // list literal beside the repositories/heatmap/code/projects siblings,
+  // then the depth — `/{type}/{name}` the RedirectToLastVersion 303, the
+  // `/versions` static tail outranking the `{version}` param (chi
+  // registers the literal first), `/{version}` the view, and the
+  // `/files/{fileid}` download (the id claim is the PathParamInt64 parity —
+  // "007" parses as 7; junk segments stay unclaimed → the engine's 404,
+  // exactly upstream's unregistered-tail answer). The type/name/version
+  // decodes ride the /src family's try/catch shape.
+  if (repo === "-" && raw.length >= 4 && raw[3] === "packages") {
+    if (raw.length === 4) return { family: "owner-packages", owner };
+    // The bare {type} tail claims nothing — the type facet rides the list's
+    // `?type=` query (the landed parseTypeFacet), so a 5-segment shape stays
+    // unclaimed → the engine's 404.
+    if (raw.length === 5) return null;
+    let type: string;
+    let name: string;
+    try {
+      type = decodeURIComponent(raw[4] as string);
+      name = decodeURIComponent(raw[5] as string);
+    } catch {
+      return null;
+    }
+    if (raw.length === 6) return { family: "owner-package-redirect", owner, type, name };
+    if (raw.length === 7) {
+      if (raw[6] === "versions") return { family: "owner-package-versions", owner, type, name };
+      let version: string;
+      try {
+        version = decodeURIComponent(raw[6] as string);
+      } catch {
+        return null;
+      }
+      return { family: "owner-package-version-view", owner, type, name, version };
+    }
+    if (raw.length === 9 && raw[7] === "files" && /^\d+$/.test(raw[8] as string)) {
+      let version: string;
+      try {
+        version = decodeURIComponent(raw[6] as string);
+      } catch {
+        return null;
+      }
+      return {
+        family: "owner-package-file-download",
+        owner,
+        type,
+        name,
+        version,
+        fileId: Number.parseInt(raw[8] as string, 10),
+      };
+    }
+    return null;
   }
   if (repo === "-" && raw.length >= 4 && raw[3] === "projects") {
     if (raw.length === 4) return { family: "owner-projects", owner };
@@ -4170,6 +4328,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     return null;
   }
+  // The SPEC-0016 M2 repo packages tab (pages/packages.tsx — upstream's
+  // `/{username}/{reponame}/packages` group's bare literal, web.go:1546's
+  // `m.Group("/packages", repo.Packages)`): the bare URL only; the deeper
+  // space stays unclaimed → the engine's 404 (upstream's group registers
+  // no deeper web tail — the API family owns the registry protocol).
+  if (head === "packages") {
+    if (rest.length === 0) return { family: "repo-packages", owner, repo };
+    return null;
+  }
   if (head === "releases") {
     if (rest.length === 0) return { family: "releases", owner, repo };
     if (rest.length === 1 && rest[0] === "new") return { family: "release-new", owner, repo };
@@ -4801,6 +4968,10 @@ async function resolveUiSession(c: Context<{ Bindings: Env }>): Promise<Resolved
       origin: url.origin,
       notificationCount,
       demoMode: demoModeEnabled(c.env),
+      // The SPEC-0016 M2 global quota arm (PACKAGES_ENABLED, the strict
+      // polarity — absent/"true" arms, "false" drops): the profile page's
+      // Packages tab anchor and the R04 subtree's route gate read it.
+      packagesEnabled: packagesQuotaFromEnv(c.env).packagesEnabled,
       assets: shellAssetsFromManifest(manifest),
     };
   } catch (error) {
@@ -4840,7 +5011,13 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
   // repo-scoped request. The shell's Projects tab (upstream repo/header.
   // tmpl:146-154 gates the tab on the SAME unit condition) and the
   // /projects group's handlers both read this flag.
-  resolved.ctx.repoHasProjects = (await loadRepoSettings(c.env.DB, repo.id)).hasProjects;
+  // The Packages unit toggle rides the SAME read (SPEC-0016 M2 —
+  // repo_settings.has_packages, the R16 gate): the shell's Packages tab
+  // and the /packages tab handler read this flag (the has_projects
+  // pattern).
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  resolved.ctx.repoHasProjects = settings.hasProjects;
+  resolved.ctx.repoHasPackages = settings.hasPackages;
   return { ...resolved, repo };
 }
 
@@ -8691,6 +8868,19 @@ async function exploreOrganizationsPage(c: Context<{ Bindings: Env }>): Promise<
   return respond(c.html(renderExploreOrganizationsPage(ctx, data), 200));
 }
 
+/** GET /explore/code (pages/explore-code.tsx — the SPEC-0019 M2 code search
+ *  page; upstream web.go:558's literal, code.go's explore.Code): the
+ *  exploreReposPage twin — the session prologue, then the federation scan
+ *  over every viewer-visible repo (the bare form answers without a seed
+ *  read, the module's early-return arm). */
+async function exploreCodePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  const data = await loadExploreCodeSearchData(c.env, c.env.DB, viewer, url.searchParams);
+  return respond(c.html(renderExploreCodePage(ctx, data), 200));
+}
+
 /** GET /{username}/-/heatmap (pages/owner-heatmap.ts — this wave's web JSON
  *  arm; upstream heatmap.go:32-63's DashboardHeatmap): the owner resolves
  *  through the profile page's seam (the IsUserVisibleToViewer ladder — the
@@ -8711,6 +8901,34 @@ async function ownerHeatmapData(c: Context<{ Bindings: Env }>): Promise<Response
   const load = await loadOwnerHeatmapData(c.env.DB, owner.user);
   if (load === null) return respond(c.html(renderNotFound(ctx), 404)); // the gate's miss class
   return respond(c.json(JSON.parse(ownerHeatmapJsonBody(load))));
+}
+
+/** GET /{owner}/-/code (pages/user-code-search.tsx — the codesearch-M1
+ *  owner code-search page; upstream user.CodeSearch, web.go:1136 in the
+ *  `/{username}/-` group): the heatmap twin's resolution shape — the owner
+ *  ladder (a renamed owner 307s, an invisible one 404-shells; the packages
+ *  family's owner-resolution twin WITHOUT the package-access gate), then
+ *  the federated seed search over the owner's visible repos. */
+async function userCodeSearchPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, viewer, respond } = resolved;
+  if (route.family !== "user-code-search") return respond(await c.notFound()); // drift guard
+  const doer: ProfileDoer =
+    viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false };
+  const owner = await resolveUserCodeSearchOwner(
+    c.env.DB,
+    route.owner,
+    doer,
+    resolved.url.pathname,
+    resolved.url.search,
+  );
+  if (owner.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: owner.location } }));
+  }
+  if (owner.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadUserCodeSearchData(c.env, c.env.DB, owner, doer, resolved.url.searchParams);
+  return respond(c.html(renderUserCodeSearchPage(ctx, data), 200));
 }
 
 /**
@@ -10562,6 +10780,191 @@ async function ownerProjectsPage(c: Context<{ Bindings: Env }>): Promise<Respons
 }
 
 // ---------------------------------------------------------------------------
+// The SPEC-0016 M2 packages families (pages/packages.tsx — upstream's
+// web.go:1109-1121 `/{username}/-` packages group [context.PackageAssignment
+// + reqPackageAccess(read) fold into the resolution seam] and the R16
+// web.go:1546 repo tab). The R04 subtree shares one prologue (the
+// owner-projects list page's resolution shape: the quota gate → the gate
+// ladder → rename-307 / invisible-404); every depth arm re-runs the SAME
+// ladder, exactly upstream's group-wrap semantics.
+// ---------------------------------------------------------------------------
+
+/** The R04 families' drift guard — the shared prologue accepts exactly
+ *  these (the list literal beside its four depth arms; each handler then
+ *  narrows to its own family). */
+function isOwnerPackagesRoute(route: ParsedUiRoute): route is OwnerPackagesRoute {
+  return (
+    route.family === "owner-packages" ||
+    route.family === "owner-package-redirect" ||
+    route.family === "owner-package-versions" ||
+    route.family === "owner-package-version-view" ||
+    route.family === "owner-package-file-download"
+  );
+}
+
+/** The packages subtree's shared prologue: the global quota gate first
+ *  (PACKAGES_ENABLED=false 404-shells the whole subtree — the profile
+ *  tab's strict-polarity twin), then resolvePackagesOwner's gate ladder
+ *  (a renamed owner 307s, an invisible one 404-shells — the org half's
+ *  rename seam + the read-mode rank). */
+async function resolveOwnerPackagesRequest(
+  c: Context<{ Bindings: Env }>,
+): Promise<
+  | {
+      ok: true;
+      url: URL;
+      ctx: UiContext;
+      viewer: Viewer;
+      respond: (res: Response) => Response;
+      route: OwnerPackagesRoute;
+      owner: PackagesOwner;
+    }
+  | { ok: false; response: Response }
+> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved;
+  const { url, ctx, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (!isOwnerPackagesRoute(route)) return { ok: false, response: await c.notFound() }; // drift guard
+  if (ctx.packagesEnabled === false) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  const owner = await resolvePackagesOwner(c.env.DB, route.owner, orgFamilyDoer(viewer), url.pathname, orgFamilyQuery(url));
+  if (owner.kind === "redirect") {
+    return {
+      ok: false,
+      response: respond(new Response(null, { status: 307, headers: { location: owner.location } })),
+    };
+  }
+  if (owner.kind === "missing") return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  return { ok: true, url, ctx, viewer, respond, route, owner };
+}
+
+/** The resolved owner's id (the depth arms' owner-scoped reads — the page
+ *  module's ownerIdOf seam, inlined: PackagesOwner carries exactly one id
+ *  half per arm). */
+function packagesOwnerIdOf(owner: PackagesOwner): number {
+  return owner.kind === "org" ? owner.org.id : owner.user.id;
+}
+
+/** GET /{owner}/-/packages (pages/packages.tsx — the R04 list, upstream
+ *  ListPackages web.go:1109): the latest-version-per-package rows over the
+ *  gate-laddered owner. */
+async function ownerPackagesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, route, owner } = resolved;
+  if (route.family !== "owner-packages") return respond(await c.notFound()); // drift guard
+  const data = await loadOwnerPackagesData(c.env.DB, owner, viewer, url.origin, url.searchParams);
+  return respond(c.html(renderOwnerPackagesPage(ctx, data), 200));
+}
+
+/** GET /{owner}/-/packages/{type}/{name} (upstream RedirectToLastVersion,
+ *  package.go:137): the 303 onto the latest non-internal version's page; a
+ *  package (or every-version) miss 404-shells. */
+async function ownerPackageLatestRedirect(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond, route, owner } = resolved;
+  if (route.family !== "owner-package-redirect") return respond(await c.notFound()); // drift guard
+  const latest = await resolveLatestVersionRedirect(
+    c.env.DB,
+    packagesOwnerIdOf(owner),
+    route.type ?? "",
+    route.name ?? "",
+  );
+  if (latest.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(new Response(null, { status: 303, headers: { location: latest.location } }));
+}
+
+/** GET /{owner}/-/packages/{type}/{name}/versions (upstream
+ *  ListPackageVersions, package.go:322): the joined version page; a
+ *  package miss 404-shells (upstream's NotFound). */
+async function ownerPackageVersionsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, route, owner } = resolved;
+  if (route.family !== "owner-package-versions") return respond(await c.notFound()); // drift guard
+  const data = await loadOwnerPackageVersionsData(
+    c.env.DB,
+    owner,
+    viewer,
+    route.type ?? "",
+    route.name ?? "",
+    url.searchParams,
+  );
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderOwnerPackageVersionsPage(ctx, data), 200));
+}
+
+/** GET /{owner}/-/packages/{type}/{name}/{version} (upstream
+ *  ViewPackageVersion, package.go:188): the version view; a null answer at
+ *  either identity hop 404-shells. */
+async function ownerPackageVersionViewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond, route, owner } = resolved;
+  if (route.family !== "owner-package-version-view") return respond(await c.notFound()); // drift guard
+  const data = await loadOwnerPackageVersionViewData(
+    c.env.DB,
+    owner,
+    viewer,
+    url.origin,
+    route.type ?? "",
+    route.name ?? "",
+    route.version ?? "",
+  );
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderOwnerPackageVersionViewPage(ctx, data), 200));
+}
+
+/** GET /{owner}/-/packages/{type}/{name}/{version}/files/{fileid} (upstream
+ *  DownloadPackageFile, package.go:530): the {version} segment is the
+ *  identity hop (GetVersionByNameAndVersion), then the file pair arbitrates
+ *  under it and the byte answer streams (the attachment disposition, the
+ *  If-Modified-Since 304 — the release-downloads reduction). */
+async function ownerPackageFileDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, respond, route, owner } = resolved;
+  if (route.family !== "owner-package-file-download") return respond(await c.notFound()); // drift guard
+  const versionRow = await getVersionByNameAndVersion(
+    c.env.DB,
+    packagesOwnerIdOf(owner),
+    route.type ?? "",
+    route.name ?? "",
+    route.version ?? "",
+  );
+  if (versionRow === null) return respond(c.html(renderNotFound(ctx), 404));
+  const download = await loadPackageFileDownload(
+    c.env.REPO_PACKS,
+    c.env.DB,
+    versionRow.id,
+    route.fileId ?? 0,
+    "GET",
+  );
+  if (download.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    packageFileDownloadResponse(download, { ifModifiedSince: c.req.header("if-modified-since") ?? null }),
+  );
+}
+
+/** GET /{owner}/{repo}/packages (pages/packages.tsx — the R16 tab, upstream
+ *  repo.Packages web.go:1546): the repo-faceted list over the SAME
+ *  latest-version rows. The `repo_settings.has_packages` toggle gates (the
+ *  shell tab reads the SAME resolveUiRequest flag — the has_projects
+ *  pattern), and the writer grant arms the empty-repo hint (the releases
+ *  canCreate pattern). */
+async function repoPackagesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "repo-packages") return respond(await c.notFound()); // drift guard
+  if (resolved.ctx.repoHasPackages !== true) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadRepoPackagesData(c.env.DB, repo, viewer, url.origin, url.searchParams);
+  data.canWritePackages = await canWriteRepo(c.env, repo, viewer);
+  return respond(c.html(renderRepoPackagesPage(ctx, data), 200));
+}
+
+// ---------------------------------------------------------------------------
 // The wave-40 owner projects BOARD families (pages/owner-project-board.tsx —
 // upstream's web.go:1140-1155 board view + write group + the web.go:327-345
 // board/workflow helper POSTs). Every handler rides the LIST page's
@@ -11793,6 +12196,9 @@ uiRouter.get("/explore/users", (c) => exploreUsersPage(c));
 // The org search page (this wave — upstream web.go:557's literal; parseUiRoute
 // claims the exact 3-segment shape).
 uiRouter.get("/explore/organizations", (c) => exploreOrganizationsPage(c));
+// The SPEC-0019 M2 code search page (upstream web.go:558's literal; the
+// exact 3-segment literal beside its siblings — the navbar's fourth tab).
+uiRouter.get("/explore/code", (c) => exploreCodePage(c));
 // The ORG-scoped inbox families (parseUiRoute claims exactly these 4-/5-
 // segment shapes — upstream web.go:986-991's `/org/{org}` group). Registered
 // in the STATIC block, physically before the dynamic /:owner/:repo pairs:
@@ -12329,6 +12735,11 @@ uiRouter.get("/:owner/-/repositories", (c) => orgRepositoriesPage(c));
 // The owner heatmap JSON tail (parseUiRoute claims the exact 4-segment
 // shape — the `-` namespace's disjoint literal; GET-only, the JSON feed).
 uiRouter.get("/:owner/-/heatmap", (c) => ownerHeatmapData(c));
+// The codesearch-M1 owner code-search page (parseUiRoute claims the exact
+// 4-segment shape — the `-` namespace's disjoint literal beside the
+// heatmap/repositories/projects tails; GET only, the page handler runs the
+// session prologue like every GET page).
+uiRouter.get("/:owner/-/code", (c) => userCodeSearchPage(c));
 // The census R06 org dashboard (parseUiRoute claims exactly these shapes —
 // upstream web.go:982-985's /org/{org}/dashboard + /org/{org}/dashboard/
 // {team} literals; the wave-23 tail-spot rationale verbatim: the static
@@ -12604,3 +13015,23 @@ uiRouter.get("/:owner/:repo/wiki/*", (c) => wikiPage(c));
 uiRouter.post("/:owner/:repo/wiki", (c) => wikiSubmit(c));
 uiRouter.post("/:owner/:repo/wiki/*", (c) => wikiSubmit(c));
 uiRouter.get("/:owner/:repo/lastcommit/*", (c) => lastCommitFragment(c));
+// The SPEC-0016 M2 packages subtree + repo tab (parseUiRoute claims exactly
+// these shapes — upstream web.go:1109-1121's `/{username}/-` packages
+// group and web.go:1546's repo `/packages` literal; GET only, the byte
+// download rides the same shapes). No earlier registration can absorb
+// these: the static "-" segment namespace carries no earlier
+// /:owner/-/packages* shape, and within it the `/versions` literal is
+// registered ahead of the dynamic `:version` pattern (chi's
+// static-before-dynamic order, the projects `/new` precedent — hono
+// answers the first match). The repo tab's `packages` literal head matches
+// shapes no earlier registered pattern carries; its {repo} param carries
+// the `[^-].*` constraint because the static-second-segment `/-` twin NOW
+// EXISTS (the ae32b1a convention — the wave-45 projects case verbatim:
+// hono's static second segments do NOT outrank params, so the plain
+// pattern could shadow /:owner/-/packages).
+uiRouter.get("/:owner/-/packages", (c) => ownerPackagesPage(c));
+uiRouter.get("/:owner/-/packages/:type/:name", (c) => ownerPackageLatestRedirect(c));
+uiRouter.get("/:owner/-/packages/:type/:name/versions", (c) => ownerPackageVersionsPage(c));
+uiRouter.get("/:owner/-/packages/:type/:name/:version", (c) => ownerPackageVersionViewPage(c));
+uiRouter.get("/:owner/-/packages/:type/:name/:version/files/:fileid{[0-9]+}", (c) => ownerPackageFileDownload(c));
+uiRouter.get("/:owner/:repo{[^-].*}/packages", (c) => repoPackagesPage(c));

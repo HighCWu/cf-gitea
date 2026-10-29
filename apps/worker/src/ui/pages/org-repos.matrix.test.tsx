@@ -248,7 +248,7 @@ describe("the dash-namespace grammar pins (the folds wave-23 never pinned)", () 
     expect(parseUiRoute("/acme/-/repositories/%zz")).toBeNull();
     expect(handlesUiRoute("/acme/-/repositories/")).toBe(true);
     expect(handlesUiRoute("/acme/-/repositories/extra")).toBe(false);
-    expect(handlesUiRoute("/acme/-/code")).toBe(false); // the unclaimed survey tail
+    expect(handlesUiRoute("/acme/-/code")).toBe(true); // the codesearch-M1 tail claimed it (pages/user-code-search.tsx)
   });
 
   it("301s the trailing-slash GET onto the canonical URL with the query preserved", async () => {

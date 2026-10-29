@@ -288,8 +288,17 @@ export const repoUnits = sqliteTable(
   "repo_units",
   {
     repoId: text("repo_id").notNull(),
-    /** Unit type; 'code' is the only unit today. */
-    type: text("type", { enum: ["code"] }).notNull().default("code"),
+    /**
+     * Unit type; SPEC-0016 M2 (ratification 7) extends the enum with
+     * 'packages' (upstream unit 9, models/unit/unit.go:34 TypePackages) so
+     * the R16 tab/visibility work can carry per-unit rows. The TEXT column
+     * carries no CHECK constraint — the extension is type-level only, no SQL
+     * migration (drizzle's SQLite enum is TS-only), verified by the
+     * db:generate no-drift gate. The R16 gate itself rides
+     * `repo_settings.has_packages` (the landed MustEnableRepoPackages
+     * reduction, the has_projects precedent).
+     */
+    type: text("type", { enum: ["code", "packages"] }).notNull().default("code"),
     /** What anonymous visitors may do on this unit: 'none' | 'read'. */
     anonymousAccessMode: text("anonymous_access_mode", { enum: ["none", "read"] })
       .notNull()

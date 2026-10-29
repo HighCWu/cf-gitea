@@ -91,6 +91,8 @@ const ALLOWLIST = [
   'octicon-checklist',
   'octicon-clock',
   'octicon-code',
+  'octicon-database', // SPEC-0016 M2 — the package view's blob-size row (view.tmpl)
+  'octicon-download', // SPEC-0016 M2 — the package view's download-count row (view.tmpl)
   'octicon-file-zip',
   'octicon-git-commit',
   'octicon-info',
@@ -128,6 +130,7 @@ const ALLOWLIST = [
   'octicon-pulse',
   'octicon-repo',
   'octicon-shield-lock',
+  'octicon-terminal', // SPEC-0016 M2 — the generic install block's label (content/generic.tmpl)
   'octicon-three-bars',
   'octicon-trash',
 ];

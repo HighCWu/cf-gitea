@@ -178,7 +178,6 @@ describe("handlesUiRoute", () => {
                           // stay engine-owned (upstream web.go:1740/1760)
     "/octo/hello/commitsX", // family literals are exact
     "/octo/hello/commitsx/branch/main",
-    "/explore/code", // every other tail stays engine/parent-owned
     "/explore/users/extra",
     // NOTE: /octo/hello/settings/keys and /explore/repos/sitemap-1.xml left
     // this table — window-2d (b54f709) and window-2e-A (84996c6) claimed
@@ -186,7 +185,9 @@ describe("handlesUiRoute", () => {
     // matrix's escalation). /octo/hello/raw/branch/main/x and
     // /explore/organizations left it too — the raw/media wave claimed the
     // web raw shapes and the orgs page (the raw-files + explore-orgs
-    // matrices' pins).
+    // matrices' pins). /explore/code left it as well — SPEC-0019 M2
+    // claimed the literal (the explore-code matrix's pin beside the
+    // navbar's fourth tab).
   ])("does not claim: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(false);
   });

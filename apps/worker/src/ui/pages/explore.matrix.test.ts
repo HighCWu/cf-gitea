@@ -7,11 +7,14 @@
  * with the minted-session pattern (the org-blocked/public-access matrix
  * harness — repo-settings-public-access.smoke.test.tsx, 8a22db6):
  *
- *   1. the claim pin's UNCLAIMED side: /explore/code (and the deeper,
- *      topic-neighbor, and non-sitemap dotted tails) parse to null and
- *      handlesUiRoute refuses them; the trailing-slash forms canonicalize
- *      (parse side) and 301 (route side, hono's trimTrailingSlash default —
- *      the redirect target, not the slash form, carries the claim);
+ *   1. the claim pin's UNCLAIMED side: the deeper, topic-neighbor, and
+ *      non-sitemap dotted tails parse to null and handlesUiRoute refuses
+ *      them; the trailing-slash forms canonicalize (parse side) and 301
+ *      (route side, hono's trimTrailingSlash default — the redirect target,
+ *      not the slash form, carries the claim). /explore/code LEFT this
+ *      pin's unclaimed side — SPEC-0019 M2 claimed the literal (the
+ *      explore-code matrix owns its page arms); the pin keeps its deeper
+ *      tail;
  *   2. the bare /explore redirect has no viewer seam (signed-in = anonymous);
  *   3. the mounted routes' method edge: no write surface — a POST misses
  *      into the plain 404 (every explore registration is GET-only);
@@ -223,9 +226,9 @@ function countOf(haystack: string, needle: string): number {
 // --- the claim pin (the UNCLAIMED side — wave 9 owns the claimed literals) -----
 
 describe("the explore claim pin's unclaimed side (parseUiRoute / handlesUiRoute)", () => {
-  it("refuses /explore/code and every deeper tail — the engine/parent owns them", () => {
-    expect(parseUiRoute("/explore/code")).toBeNull();
-    expect(handlesUiRoute("/explore/code")).toBe(false);
+  it("claims /explore/code (SPEC-0019 M2 — pages/explore-code.tsx) and refuses every deeper tail", () => {
+    expect(parseUiRoute("/explore/code")).toEqual({ family: "explore-code" });
+    expect(handlesUiRoute("/explore/code")).toBe(true);
     expect(parseUiRoute("/explore/code/deeper")).toBeNull();
     expect(handlesUiRoute("/explore/code/deeper")).toBe(false);
   });
@@ -264,10 +267,10 @@ describe("the bare /explore redirect", () => {
 // --- the mounted routes' edges (GET-only surface, trailing slash, unclaimed) ----
 
 describe("the mounted explore routes' edges", () => {
-  it("404s an unclaimed /explore/code GET — never the explore shell", async () => {
+  it("renders the claimed /explore/code GET through the explore shell (SPEC-0019 M2's page — the bare form, no q)", async () => {
     const res = await fetchUi("/explore/code");
-    expect(res.status).toBe(404);
-    expect(await res.text()).not.toContain("page-content explore");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("page-content explore");
   });
 
   it("301s the trailing-slash forms onto the canonical paths — claimed or not (the slash form itself never renders)", async () => {
