@@ -1,7 +1,12 @@
 /**
  * SPEC-0014 §3.0 (repo-tasks DLQ) tests for `src/repos/dlq.ts` — the
  * log-and-ack contract, stub queue batches + console spy (the webhook DLQ
- * test's house pattern; no bindings — the handler performs no I/O).
+ * test's house pattern). The handler performs no I/O HERE: the SPEC-0018
+ * §3.1 notice emit needs a DB, and these unit stubs pass none — every
+ * message additionally takes the §5.3 log-only degrade line, which the
+ * `redriveLines` filter separates from the asserted redrive lines. The emit
+ * seam's positive-path tests (rows per family, the degrade arm, the clip)
+ * live in services/notices.test.ts over real D1.
  */
 
 import { afterEach, describe, expect, it, vi, type MockInstance } from "vitest";
@@ -61,20 +66,29 @@ function loggedLines(consoleError: MockInstance): string[] {
   return consoleError.mock.calls.map((args) => args.map(String).join(" "));
 }
 
+/** The redrive log lines only — every [repo-tasks-dlq] record line (and the
+ *  hostile-body fallback line) carries the verbatim `body=` field; the
+ *  SPEC-0018 emit-degrade lines do not, so the filter isolates the contract
+ *  under assertion from the §5.3 log-only degrade noise the DB-less stub
+ *  produces per message. */
+function redriveLines(consoleError: MockInstance): string[] {
+  return loggedLines(consoleError).filter((line) => line.includes("body="));
+}
+
 describe("repoTasksDlqHandler (SPEC-0014 §3.0)", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("logs and acks every known family with its redrive fields and verbatim body", () => {
+  it("logs and acks every known family with its redrive fields and verbatim body", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const { batch, acked, retried } = stubBatch(KNOWN_FAMILIES);
-    repoTasksDlqHandler(batch, {} as Env, {} as ExecutionContext);
+    await repoTasksDlqHandler(batch, {} as Env, {} as ExecutionContext);
 
     expect(acked()).toBe(KNOWN_FAMILIES.length);
     expect(retried()).toBe(0);
 
-    const lines = loggedLines(consoleError);
+    const lines = redriveLines(consoleError);
     expect(lines).toHaveLength(KNOWN_FAMILIES.length);
     expect(lines.every((line) => line.includes("[repo-tasks-dlq]"))).toBe(true);
     expect(lines.every((line) => line.includes("kind="))).toBe(true);
@@ -117,14 +131,14 @@ describe("repoTasksDlqHandler (SPEC-0014 §3.0)", () => {
     expect(lines.every((line) => line.includes("id=dlq-") && line.includes("attempts=5"))).toBe(true);
   });
 
-  it("logs and acks malformed and unknown bodies (never crashes on them)", () => {
+  it("logs and acks malformed and unknown bodies (never crashes on them)", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const { batch, acked, retried } = stubBatch(["not-json{{", '"a json string, no known kind"', 42, null, { oops: true }]);
-    repoTasksDlqHandler(batch, {} as Env, {} as ExecutionContext);
+    await repoTasksDlqHandler(batch, {} as Env, {} as ExecutionContext);
 
     expect(acked()).toBe(5);
     expect(retried()).toBe(0);
-    const lines = loggedLines(consoleError);
+    const lines = redriveLines(consoleError);
     expect(lines).toHaveLength(5);
     expect(lines.every((line) => line.includes("kind=unknown"))).toBe(true);
     // The malformed string is logged verbatim — a redrive can still see it.
@@ -133,16 +147,16 @@ describe("repoTasksDlqHandler (SPEC-0014 §3.0)", () => {
     expect(lines.some((line) => line.includes('body={"oops":true}'))).toBe(true);
   });
 
-  it("treats an empty batch as a no-op", () => {
+  it("treats an empty batch as a no-op", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const { batch, acked, retried } = stubBatch([]);
-    expect(() => repoTasksDlqHandler(batch, {} as Env, {} as ExecutionContext)).not.toThrow();
+    await expect(repoTasksDlqHandler(batch, {} as Env, {} as ExecutionContext)).resolves.toBeUndefined();
     expect(acked()).toBe(0);
     expect(retried()).toBe(0);
     expect(loggedLines(consoleError)).toHaveLength(0);
   });
 
-  it("NEVER throws: cyclic and hostile-getter bodies still get a line and their ack", () => {
+  it("NEVER throws: cyclic and hostile-getter bodies still get a line and their ack", async () => {
     const cyclic: Record<string, unknown> = { kind: "mirror-sync", repoId: "r_cyc" };
     cyclic.self = cyclic; // JSON.stringify throws on the cycle
     const hostile = {
@@ -156,11 +170,11 @@ describe("repoTasksDlqHandler (SPEC-0014 §3.0)", () => {
 
     // The handler does not throw — a throwing arm in a fed message never
     // escapes, and both messages still got their ack.
-    expect(() => repoTasksDlqHandler(batch, {} as Env, {} as ExecutionContext)).not.toThrow();
+    await expect(repoTasksDlqHandler(batch, {} as Env, {} as ExecutionContext)).resolves.toBeUndefined();
     expect(acked()).toBe(2);
     expect(retried()).toBe(0);
 
-    const lines = loggedLines(consoleError);
+    const lines = redriveLines(consoleError);
     // The cyclic body: classified, and its body logged via the guarded
     // serializer's unserializable marker instead of crashing.
     expect(lines.some((line) => line.includes("dlq-0") && line.includes("kind=mirror-sync") && line.includes("<unserializable:"))).toBe(
@@ -169,5 +183,16 @@ describe("repoTasksDlqHandler (SPEC-0014 §3.0)", () => {
     // The hostile getter: the fallback arm still emits an id-bearing
     // [repo-tasks-dlq] line for the message, and the ack already happened.
     expect(lines.some((line) => line.includes("dlq-1") && line.includes("[repo-tasks-dlq]"))).toBe(true);
+  });
+
+  it("the SPEC-0018 emit degrades to log-only when no DB is bound (the §5.3 posture, per message)", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { batch, acked } = stubBatch([{ kind: "mirror-sync", repoId: "r_5" }]);
+    await repoTasksDlqHandler(batch, {} as Env, {} as ExecutionContext);
+    expect(acked()).toBe(1); // the ack path is untouched by the emit failure
+    const all = loggedLines(consoleError);
+    // The redrive line AND the degrade line both carried the fact.
+    expect(redriveLines(consoleError)).toHaveLength(1);
+    expect(all.some((line) => line.includes("notice emit degraded to log-only") && line.includes("dlq-0"))).toBe(true);
   });
 });

@@ -166,12 +166,13 @@
  * shared navbar (the mount window's F7 fold — the AdminDashboardNav +
  * AdminMonitorNav scaffolding copies deleted): it renders upstream's
  * navbar.tmpl reduced to the LANDED pages — Maintenance (Dashboard),
- * Identity & Access (Organizations + Users), Assets (Repositories),
- * Monitoring (the four live monitor items; audit_logs omitted) — with the
- * details-open + active-item arms derived from the `active` prop (upstream's
- * per-group PageIs* conditions), and OMITS every group whose items are all
- * unlanded (self_check, auths, badges, emails, packages, integrations,
- * actions, config, notices). Survey row flipped on landing:
+ * Identity & Access (Organizations + Users + Badges + Emails), Assets
+ * (Repositories), Integrations (Applications + Webhooks), the top-level
+ * System Notices item (SPEC-0018 §3.1), Monitoring (the four live monitor
+ * items; audit_logs omitted) — with the details-open + active-item arms
+ * derived from the `active` prop (upstream's per-group PageIs* conditions),
+ * and OMITS every group whose items are all unlanded (self_check, auths,
+ * packages, actions, config). Survey row flipped on landing:
  * docs/compat/ui-parity-survey.md:549 (the `/-/admin/*` row — users/orgs/
  * repos go PARTIAL→listed).
  */
@@ -279,6 +280,7 @@ export type AdminFamilyNavActive =
   | "badges"
   | "applications"
   | "hooks"
+  | "notices"
   | "stats"
   | "cron"
   | "queue"
@@ -301,6 +303,7 @@ export const adminFamilyLocale = {
   integrations: "Integrations", // "admin.integrations" (navbar.tmpl:53 — the R18 wave's group)
   applications: "Applications", // "settings.applications" (the admin applications arm's nav item)
   hooks: "Webhooks", // "admin.hooks" (the admin hooks arm's nav item)
+  notices: "System Notices", // "admin.notices" (the SPEC-0018 §3.1 arm's nav item)
   monitoring: "Monitoring", // "admin.monitor"
   stats: "Stats", // "admin.monitor.stats"
   cron: "Cron Tasks", // "admin.monitor.cron"
@@ -312,13 +315,14 @@ export const adminFamilyLocale = {
  *  shared navbar across the whole admin family): the Maintenance details
  *  (Dashboard), Identity & Access (Organizations + User Accounts + Badges +
  *  Emails — the R18 arms), Assets (Repositories), Integrations
- *  (Applications + Webhooks — the R18 arms), Monitoring (the monitor
- *  family's four live items). Upstream's per-group `PageIs*` conditions
- *  reduce to: the group containing the active page renders `open`, the
- *  active item gets the `active item` class. auths, packages, audit_logs,
- *  self_check, config, notices, actions are omitted — all their upstream
- *  items are unlanded pages (the dead-link rule; the census's (b)/(c)
- *  classes). */
+ *  (Applications + Webhooks — the R18 arms), the TOP-LEVEL System Notices
+ *  item (the SPEC-0018 §3.1 arm, navbar.tmpl:104-106's position), and
+ *  Monitoring (the monitor family's four live items). Upstream's per-group
+ *  `PageIs*` conditions reduce to: the group containing the active page
+ *  renders `open`, the active item gets the `active item` class. auths,
+ *  packages, audit_logs, self_check, config, actions are omitted — all
+ *  their upstream items are unlanded pages (the dead-link rule; the
+ *  census's (b)/(c) classes). */
 export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
   const item = (href: string, label: string, active: boolean) => (
     <a class={active ? "active item" : "item"} href={href}>
@@ -362,6 +366,10 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
             {item("/-/admin/hooks", adminFamilyLocale.hooks, props.active === "hooks")}
           </div>
         </details>
+        {/* The SPEC-0018 §3.1 notices arm — upstream renders it as a TOP-LEVEL
+            item after the (unlanded here) Configuration group and before
+            Monitor (navbar.tmpl:104-106); the landed nav keeps that order. */}
+        {item("/-/admin/notices", adminFamilyLocale.notices, props.active === "notices")}
         <details class="item" open={openAttr(monitorOpen)}>
           <summary>{adminFamilyLocale.monitoring}</summary>
           <div class="menu">
