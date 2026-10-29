@@ -273,7 +273,7 @@ const parseArgs = (argv) => {
     // when the flows were smaller; AbortSignal only bites when actually slow.
     timeoutMs: 60_000,
     trials: 3, fixtureRepo: "p0-shallow", fixtureOid: null, newLabelCount: 3,
-    strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 1,
+    strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 2,
     mirrorSettleMs: 30_000, forceRed: null,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -3880,11 +3880,11 @@ const auditSteps = (ctx) => [
   })),
   {
     id: "audit-personal-access-tokens",
-    expect: `personal_access_tokens (whole table) = ${opts.expectTokens} (the standing bootstrap PAT; per-run PATs DELETEd by the operator)`,
+    expect: `personal_access_tokens = the standing bootstrap set, one per standing user (admin + p0probe = 2 since the probe user gained its own bootstrap 2026-10-28; per-run PATs DELETEd by the operator — the historical whole-table=1 encoding predates the second standing user and false-fired from 2026-10-29)`,
     run: () => {
       const n = ctx.counts.personal_access_tokens;
       expect(n === opts.expectTokens, `${n} tokens (expected ${opts.expectTokens})`);
-      return `${n} (the standing bootstrap PAT)`;
+      return `${n} (the standing bootstrap set: one per standing user)`;
     },
   },
 ];
