@@ -2993,3 +2993,102 @@ export const issueContentHistory = sqliteTable(
     index("issue_content_history_comment_idx").on(t.commentId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// SPEC-0015 §4.1 — audit events (audit_event).
+// ---------------------------------------------------------------------------
+
+/**
+ * One row per audit event — the column-for-column port of upstream `Event`
+ * (gitea/models/audit/audit_event.go:22-38, table `audit_event`), served by
+ * the repo/org settings audit tabs downstream (upstream web.go:1279 + the
+ * org twin web.go:1063). The emit seam + action registry live in
+ * services/audit.ts; slice-one instrumentation emits `repository:create`
+ * (RepoService.create) and `organization:create` (OrgService.createOrg) from
+ * inside their write batches, so an audit row commits (or rolls back)
+ * atomically with the write it describes (§4.2).
+ *
+ * Drift vs upstream, reconciled per the SPEC's port instruction:
+ * - `scope_id` is TEXT, not int64: upstream's entities (users/orgs/repos)
+ *   all carry int64 keys, but OUR `repositories.id` is a client-minted TEXT
+ *   UUID (ADR-0001 D3), so a single typed column must be TEXT. Encoding:
+ *   repository scope stores the `repositories.id` UUID; user/organization
+ *   scope stores the `users.id` as its decimal string (SQLite TEXT affinity
+ *   makes the numeric→text conversion explicit in the emitters). `''` is the
+ *   system scope (upstream: "zero for system", audit_event.go:30).
+ * - `scope_type`/`origin` are plain TEXT (the TS union is the enum; drizzle-kit
+ *   emits no CHECK for SQLite enums) — upstream ScopeType (scopes.go:11-16)
+ *   and Origin (origin.go:9-14) verbatim.
+ * - Upstream's `Message` is rendered from the action's template at emit time
+ *   (the DB never stores the template); `Metadata` is a JSON TEXT column
+ *   (upstream LONGTEXT JSON), nullable, decoded by the seam.
+ */
+export const auditEvents = sqliteTable(
+  "audit_event",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Hierarchical colon id (`repository:create`, `organization:team:add`,
+     *  …) — registered with its message template in services/audit.ts
+     *  (upstream `Action`, action.go:65+). */
+    action: text("action").notNull(),
+    actorId: integer("actor_id").notNull(),
+    /** Snapshot at emit time (upstream `ActorName`). */
+    actorName: text("actor_name").notNull().default(""),
+    /** Credential the actor acted with ("access-token:<id>", …); null when
+     *  the write rode a session (upstream `ActorCredential`). */
+    actorCredential: text("actor_credential"),
+    /** Admin acting as the actor; 0 = no impersonation (upstream
+     *  `ImpersonatorID`, audit_event.go:28). */
+    impersonatorId: integer("impersonator_id").notNull().default(0),
+    impersonatorName: text("impersonator_name"),
+    /** 'system' | 'user' | 'organization' | 'repository' (scopes.go:11-16). */
+    scopeType: text("scope_type", {
+      enum: ["system", "user", "organization", "repository"],
+    }).notNull(),
+    /** See the drift note above — TEXT UUID (repo) / decimal string
+     *  (user/org) / '' (system). */
+    scopeId: text("scope_id").notNull().default(""),
+    /** Snapshot at emit time (upstream `ScopeName`). */
+    scopeName: text("scope_name"),
+    /** 'ui' | 'api' | 'cli' | 'system' (origin.go:9-14). */
+    origin: text("origin", { enum: ["ui", "api", "cli", "system"] }).notNull(),
+    /** Rendered from the action's registered template at emit time. */
+    message: text("message").notNull().default(""),
+    /** Target-specific details as JSON text (upstream `Metadata`); null when
+     *  the message carries everything. */
+    metadata: text("metadata"),
+    ipAddress: text("ip_address"),
+    createdUnix: integer("created_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream-matched scalar `Action INDEX` (audit_event.go:24). Serves the
+    // exact-action filter arm AND the family-prefix filter (`action LIKE
+    // 'repository:%'` walks the index range [prefix:, prefix;) — upstream
+    // ActionFilters' family filtering, action.go:38-54).
+    index("idx_audit_event_action").on(t.action),
+    // Upstream-matched scalar `ActorID INDEX` (:25) — the actor's own trail
+    // (impersonated events belong to both ids upstream; ToConds ORs
+    // actor_id/impersonator_id, audit_event.go:182-184).
+    index("idx_audit_event_actor").on(t.actorId),
+    // Upstream-matched scalar `ImpersonatorID INDEX` (:28).
+    index("idx_audit_event_impersonator").on(t.impersonatorId),
+    // Upstream-matched scalar `TimestampUnix INDEX` (:37) — the GLOBAL
+    // time-ordered page (scope-less listing) and the retention sweep's
+    // existence probe / paged delete (`created_unix < cut`).
+    index("idx_audit_event_created").on(t.createdUnix),
+    // Index decision (SPEC-0015 §4.1 + ratification §7 item 6 — decided at
+    // db:generate time against the query plan, per
+    // docs/research/d1-index-engineering.md): upstream composes `INDEX(scope)`
+    // = (ScopeType, ScopeID) (:30-31) and leaves the created order to its
+    // scalar TimestampUnix index, so the paged read `WHERE scope_type = ? AND
+    // scope_id = ? ORDER BY created_unix DESC` (the settings tab's keyset
+    // pager, mirroring ToOrders' "timestamp_unix DESC, id DESC",
+    // audit_event.go:200-205) pays a sort step upstream. COLLAPSE divergence
+    // per the research note's class 1: folding `created_unix` as the trailing
+    // composite column turns the page into an ordered index range SQLite
+    // walks backwards (the issues_repo_pull_closed_created_idx precedent,
+    // schema.ts:522-533). The EXPLAIN witness in services/audit.test.ts pins
+    // the plan to this index with no sort step.
+    index("idx_audit_event_scope_created").on(t.scopeType, t.scopeId, t.createdUnix),
+  ],
+);

@@ -39,15 +39,19 @@
  * reproduces the pre-M1 inline behavior on every non-hourly entry — the
  * mirror producers run unconditionally — and runs ONLY the (self-gated)
  * demo producer on the hourly "0 * * * *" entry (carried by
- * wrangler.jsonc.example). Tests exercise `handleScheduledCron` /
- * `enqueueDueDemoSweeps` / the purge.ts consumer arm directly with
- * fabricated ScheduledControllers — the delegation itself is one await.
+ * wrangler.jsonc.example), plus the (self-gated) audit-retention producer
+ * block on that same entry (SPEC-0015 §4.3 — the one sanctioned extension;
+ * see the marked block in handleScheduledCron). Tests exercise
+ * `handleScheduledCron` / `enqueueDueDemoSweeps` / the purge.ts consumer arm
+ * directly with fabricated ScheduledControllers — the delegation itself is
+ * one await.
  */
 
 import { asc, eq, isNull, lt, or, and } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users } from "../db/schema";
+import { enqueueDueAuditRetention } from "./audit";
 import { enqueueDueMirrorSyncs } from "./mirror/sync";
 import { enqueueDuePushMirrorSyncs } from "./mirror/push-sync";
 
@@ -251,6 +255,18 @@ export async function enqueueDueDemoSweeps(
 export async function handleScheduledCron(controller: ScheduledController, env: Env): Promise<void> {
   if (controller.cron === DEMO_SWEEP_CRON) {
     await enqueueDueDemoSweeps(env, {});
+    // --- BEGIN audit-retention producer block (SPEC-0015 §4.3; the ONE
+    // --- sanctioned extension of this dispatcher) -------------------------
+    // Rides the hourly entry (the standing cadence closest to the SPEC's
+    // daily producer — no new cron entry in wrangler.jsonc). Fully self-
+    // gated in services/audit.ts: without a positive-integer
+    // AUDIT_RETENTION_DAYS var it returns before its FIRST D1 read and
+    // before any queue send (the demoModeEnabled posture), so a default
+    // deployment's tick stays a silent no-op; armed, it is ONE indexed
+    // existence probe + at most ONE enqueue ("crons enqueue, consumers do
+    // the work" — the delete runs in the REPO_TASKS consumer).
+    await enqueueDueAuditRetention(env, {});
+    // --- END audit-retention producer block --------------------------------
     return;
   }
   // The mirror producers, exactly as today (index.ts scheduled) — the

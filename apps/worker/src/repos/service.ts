@@ -45,6 +45,7 @@ import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import type { Registry } from "@cf-gitea/git-engine";
 
 import { IssuesService } from "../issues/service";
+import { AuditActions, auditEventInsert, type AuditOrigin } from "../services/audit";
 import {
   actions,
   comments,
@@ -242,6 +243,10 @@ export interface CreateRepoInput {
   isPrivate: boolean;
   /** 'creating' for push-create (§2.5.2); 'ready' for API creates. */
   status?: "ready" | "creating";
+  /** SPEC-0015 §4.2: the audit event's origin hint. Service-level v1 default
+   *  "api" (every current call site is an API route or the git push-create
+   *  settle); the downstream audit wave threads the real per-request origin. */
+  origin?: AuditOrigin;
 }
 
 export class RepoService {
@@ -282,6 +287,7 @@ export class RepoService {
     if (!isUsableRepoName(input.name)) throw new RepoNameInvalidError(input.name);
     const lower = input.name.toLowerCase();
     const id = crypto.randomUUID();
+    const createdAt = new Date();
     try {
       await this.db.batch([
         this.db.insert(repositories).values({
@@ -297,7 +303,7 @@ export class RepoService {
           isArchived: false,
           status: input.status ?? "ready",
           refsVersion: 0,
-          createdAt: new Date(),
+          createdAt,
         }),
         // Immutable thereafter; renames/transfers never touch it (ADR-0001 D3).
         this.db
@@ -315,6 +321,29 @@ export class RepoService {
               eq(repoRedirects.lowerName, lower),
             ),
           ),
+        // SPEC-0015 §4.2 slice-one: the `repository:create` audit row rides
+        // the SAME batch — it commits (or rolls back) atomically with the
+        // repositories row, making "audit rows must not outlive the write
+        // they describe" structural (a name collision or invalid name throws
+        // before the batch and emits nothing; a seedRepoExtras failure after
+        // the batch leaves a real repositories row, so the event is
+        // truthful). Actor = the owner from the input (fully attributed);
+        // scope_id is the client-minted UUID, known before the batch.
+        auditEventInsert(this.db, {
+          action: AuditActions.RepositoryCreate,
+          actorId: input.owner.id,
+          actorName: input.owner.usernameLower,
+          scopeType: "repository",
+          scopeId: id,
+          scopeName: `${input.owner.usernameLower}/${lower}`,
+          origin: input.origin ?? "api",
+          vars: { scope: `${input.owner.usernameLower}/${lower}` },
+          metadata: {
+            visibility: input.isPrivate ? "private" : "public",
+            status: input.status ?? "ready",
+          },
+          timestamp: createdAt,
+        }),
       ]);
     } catch (error) {
       if (isUniqueViolation(error)) throw new RepoNameCollisionError(input.owner.usernameLower, lower);

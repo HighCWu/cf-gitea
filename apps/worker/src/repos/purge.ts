@@ -27,6 +27,7 @@
  * purgable content).
  */
 
+import { isAuditRetentionMessage, pruneExpiredAuditEvents } from "../services/audit";
 import { DEMO_RETENTION_HOURS, isDemoSweepMessage } from "../services/demo-sweep";
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
 import { handlePushMirrorSync, isPushMirrorSyncMessage } from "../services/mirror/push-sync";
@@ -202,6 +203,20 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] demo-sweep ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    // Audit retention (SPEC-0015 M4 §4.3) — the same typed-arm placement: a
+    // paged drizzle delete, idempotent across redeliveries, window defaulting
+    // to 90 on the consumer side (the producer is AUDIT_RETENTION_DAYS-gated
+    // in services/demo-sweep.ts; no gate here, same rationale as demo-sweep).
+    if (isAuditRetentionMessage(message.body)) {
+      try {
+        await pruneExpiredAuditEvents(env);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] audit-retention ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
         message.retry();
       }
       continue;

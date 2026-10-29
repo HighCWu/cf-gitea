@@ -42,6 +42,7 @@ import {
   users,
   type TeamAccessMode,
 } from "../../db/schema";
+import { AuditActions, auditEventInsert, type AuditOrigin } from "../audit";
 import {
   LastOrgOwnerError,
   MAX_ORG_NAME_LENGTH,
@@ -256,6 +257,10 @@ export interface CreateOrgInput {
    *  (modules/structs/org.go:46–48) — carried through Create verbatim
    *  (routers/api/v1/org/org.go:278). */
   repoAdminChangeTeamAccess?: boolean;
+  /** SPEC-0015 §4.2: the audit event's origin hint. Service-level v1 default
+   *  "api" (the current call sites are API routes); the downstream audit wave
+   *  threads the real per-request origin. */
+  origin?: AuditOrigin;
   now?: Date;
 }
 
@@ -450,6 +455,26 @@ export class OrgService {
           isPublic: false,
           role: "owner",
           createdAt: now,
+        }),
+        // SPEC-0015 §4.2 slice-one: the `organization:create` audit row rides
+        // the SAME batch — atomic with the users row it describes (a name
+        // collision throws before/inside the batch and the audit row rolls
+        // back with it). The org's numeric id is allocated by the insert
+        // above, so scope_id resolves through the same scalar subquery the
+        // membership row uses, cast to text (the schema's scope_id drift
+        // note: decimal string for numeric entities); actor_name snapshots
+        // the creator's username through its own subquery (upstream
+        // ActorName, audit_event.go:26).
+        auditEventInsert(this.db, {
+          action: AuditActions.OrganizationCreate,
+          actorId: input.ownerId,
+          actorName: sql`(select username from users where id = ${input.ownerId})`,
+          scopeType: "organization",
+          scopeId: sql`(select cast(id as text) from users where username_lower = ${lower})`,
+          scopeName: input.name,
+          origin: input.origin ?? "api",
+          vars: { scope: input.name },
+          timestamp: now,
         }),
       ]);
     } catch (error) {

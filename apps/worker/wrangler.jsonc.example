@@ -51,7 +51,11 @@
     // and NEVER deletes user data — the README's self-host guarantee (the §2
     // hard invariant). The demo instance is the ONLY deployment that sets it
     // to "true"; arming is a var edit + redeploy, never a runtime toggle.
-    "DEMO_MODE": "false"
+    "DEMO_MODE": "false",
+    // Audit-event retention window in days (SPEC-0015 M4 §4.3). Any value
+    // other than a positive integer DISARMS the retention producer entirely
+    // (fail-closed: no reads, no sends); the consumer defaults to 90.
+    "AUDIT_RETENTION_DAYS": "90"
   },
   "observability": {
     "enabled": true,
