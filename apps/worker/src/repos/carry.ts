@@ -17,11 +17,35 @@
  *   - Packs (everything that arrived by git push): the fork-replication lease
  *     (beginForkImport → listCatalogPage/adoptForkPacks → finalizeForkImport,
  *     SPEC-0001b §5.3 — the same machinery src/repos/fork-task.ts drives).
- *     Rename/transfer never change the immutable storage key, so the target's
- *     R2 keys EQUAL the source's: R2-backed packs need NO byte move (adopt's
- *     tail verification reads the same key; copying a key onto itself would
- *     stream-read it while overwriting it). sqlite-location packs rehydrate
- *     from the page's inline `packData`, exactly like the fork consumer.
+ *     For a CODE cell, rename/transfer never change the immutable storage
+ *     key, so the target's R2 keys EQUAL the source's: R2-backed packs need
+ *     NO byte move (adopt's tail verification reads the same key; copying a
+ *     key onto itself would stream-read it while overwriting it).
+ *     sqlite-location packs rehydrate from the page's inline `packData`,
+ *     exactly like the fork consumer.
+ *
+ * WIKI SIBLING (the wiki-git landing's carry follow-up, specs/wiki.md): the
+ * `*.wiki` pair (service.ts moveEngineCell passes the derived names WITH THE
+ * PARENT'S D1 storage key) is the one case where the same-key assumption is
+ * FALSE. The wiki twin (git-http) forwards pushes with NO x-storage-key, so a
+ * wiki cell that received git pushes persists its own COMBINED NAME as the
+ * storage key (control-plane.ts resolveStorageKey's meta.repo fallback) and
+ * stages its packs NAME-ADDRESSED at `repos/<owner>/<slug>.wiki/` — never the
+ * parent's `r_<id>` namespace. The target sibling cannot keep ITS name either:
+ * the import lease's beginForkImport validates slash-free keys only (the
+ * engine's isValidStorageKey), so the wiki arm re-keys the target onto
+ * wikiCarryStorageKey (`<parent key>.wiki` — slash-free, unique and immutable
+ * through every rename, collision-free against both other key classes) and
+ * BYTE-MOVES every pack (and idx sidecar) from the source cell's prefixes
+ * before the page's adopt (copy-before-stage — adopt's tail verification
+ * reads the target's keys). Source candidates, in order: the carried key
+ * (this wiki was itself carried before — its persisted meta.storage_key) then
+ * the name-addressed prefix its pushes staged at; a candidate EQUAL to the
+ * destination (rename-back) is skipped — the bytes already sit at the target's
+ * key. Loose objects + refs ride the unchanged exact-reconstruction channel
+ * (a wiki is small-grained Worker/git content), and the old prefixes stay
+ * until the delete purge reclaims them (purge.ts's wiki R2 arms), exactly
+ * like a code cell's shared prefix outlives its tombstoned old cell.
  *   - Loose objects (Worker-authored API content: auto_init commits, API
  *     commits, merge/rebase objects — putApiObjects/putRebaseObjects are the
  *     ONLY loose-object writers, and each authored its objects with this
@@ -92,6 +116,7 @@
  */
 
 import {
+  copyObject,
   serializeCommit,
   serializeTag,
   serializeTree,
@@ -102,7 +127,7 @@ import {
   type TreeEntryJson,
 } from "@cf-gitea/git-engine";
 
-import { destroyRepoDO } from "./purge";
+import { destroyRepoDO, wikiCarryStorageKey } from "./purge";
 
 /** Structural source surface (RepoCell RPCs, the fork-task.ts wrapping style
  *  that strips the stub's Promise-intersection types). */
@@ -173,10 +198,44 @@ export function idxR2Key(storageKey: string, packKey: string): string {
   return `repos/${storageKey}/packs/${packKey}.idx`;
 }
 
+/** Stream-copy the first PRESENT candidate key onto `to` (the wiki arm's two
+ *  source prefixes — see the module doc's WIKI SIBLING note; R2ObjectBody.body
+ *  is single-read, so probe with head, then let the engine's copyObject do the
+ *  FixedLengthStream move). Candidate order is load-bearing: the NAME-ADDRESSED
+ *  prefix first (every first carry's real source), the CARRIED key second —
+ *  which equals the destination by construction, so reaching it means the
+ *  source cell was itself carried before (its persisted meta.storage_key IS
+ *  this key) and the bytes already sit at the target's key: a same-key copy
+ *  would stream-read while overwriting itself. Exhausting every candidate is
+ *  a loud carry failure, never a silent skip (a half-carried wiki must fail
+ *  into the caller's destroy-and-log floor instead of adopting refs whose
+ *  bytes do not exist). */
+async function copyFirstPresent(
+  bucket: R2Bucket,
+  candidates: string[],
+  to: string,
+  from: string,
+  toName: string,
+  what: string,
+): Promise<void> {
+  for (const key of candidates) {
+    if (key === to) return;
+    if ((await bucket.head(key)) !== null) {
+      await copyObject(bucket, key, to);
+      return;
+    }
+  }
+  fail("packs", from, toName, `${what} missing at every source prefix (${candidates.join(", ")})`);
+}
+
 /**
  * Carry the full content of the `fromEngine` cell into the `toEngine` cell
  * (which is destroyed and rebuilt first). `storageKey` is the repo's immutable
- * D1 storage key — both cells address the same R2 prefixes. Throws on failure.
+ * D1 storage key — for a CODE cell both cells address the same R2 prefixes
+ * under it; for the WIKI-SIBLING pair (`*.wiki` names, still the PARENT's key
+ * per service.ts's call shape) the wiki arm derives the target's key with
+ * wikiCarryStorageKey and byte-moves the packs (module doc, WIKI SIBLING).
+ * Throws on failure.
  */
 export async function carryRepoCell(
   env: Env,
@@ -185,6 +244,20 @@ export async function carryRepoCell(
   storageKey: string,
 ): Promise<void> {
   if (fromEngine === toEngine) return;
+  const fromWiki = fromEngine.endsWith(".wiki");
+  if (fromWiki !== toEngine.endsWith(".wiki")) {
+    // Structural caller bug (a wiki name must carry to its derived sibling,
+    // a code name to its code successor) — fail loudly instead of silently
+    // re-keying one side onto the wrong prefix class.
+    fail("init", fromEngine, toEngine, "mixed wiki/code cell pair");
+  }
+  const targetStorageKey = fromWiki ? wikiCarryStorageKey(storageKey) : storageKey;
+  // The wiki source's prefixes, most-specific first: the NAME-ADDRESSED
+  // prefix its git-HTTP pushes staged at, then the carried key (this wiki was
+  // itself carried before — its persisted meta.storage_key; that candidate
+  // equals the target's key, which copyFirstPresent reads as "bytes already
+  // in place", never as a first-carry shortcut).
+  const wikiSourceKeys = fromWiki ? [fromEngine, wikiCarryStorageKey(storageKey)] : [];
   const bucket = env.REPO_PACKS;
   if (!bucket) {
     // The sqlite-pack rehydration needs the bucket; without it the carry
@@ -218,14 +291,18 @@ export async function carryRepoCell(
   // engine's idempotent wipe (re-initializes an empty cell).
   await destroyRepoDO(env, toEngine);
 
-  const begin = await target.beginForkImport(storageKey);
+  const begin = await target.beginForkImport(targetStorageKey);
   if (begin.tag === "invalid") fail("begin", fromEngine, toEngine, begin.reason);
 
   try {
     const refs = await source.listRefs();
 
-    // 1. Pack catalog: page the source, adopt on the target. Same storage key
-    // on both sides ⇒ R2-backed packs are already at the target's keys.
+    // 1. Pack catalog: page the source, adopt on the target. A code cell's
+    // rename/transfer kept the immutable storage key, so its R2-backed packs
+    // are already at the target's keys — no byte move. The WIKI arm re-keyed
+    // (targetStorageKey above): copy every pack (and its idx sidecar) from
+    // the source's prefixes BEFORE the page's adopt — copy-before-stage,
+    // adopt's tail verification reads the target's keys.
     const packed = new Set<string>();
     let cursor = "";
     for (;;) {
@@ -233,12 +310,33 @@ export async function carryRepoCell(
       for (const p of page.packs) {
         if (p.rowsFrom !== "") continue; // continuation slice: byte work is done
         if (p.location === "r2") {
-          // The bytes (and the idx sidecar, when any) sit at the target's own
-          // keys already — a self-copy would race its own overwrite.
+          if (fromWiki) {
+            await copyFirstPresent(
+              bucket,
+              wikiSourceKeys.map((key) => packR2Key(key, p.packKey)),
+              packR2Key(targetStorageKey, p.packKey),
+              fromEngine,
+              toEngine,
+              `pack ${p.packKey}`,
+            );
+            if (p.idxBytes > 0) {
+              await copyFirstPresent(
+                bucket,
+                wikiSourceKeys.map((key) => idxR2Key(key, p.packKey)),
+                idxR2Key(targetStorageKey, p.packKey),
+                fromEngine,
+                toEngine,
+                `idx sidecar ${p.packKey}`,
+              );
+            }
+          }
+          // Code cell: the bytes (and the idx sidecar, when any) sit at the
+          // target's own keys already — a self-copy would race its own
+          // overwrite.
         } else if (p.packData) {
           // sqlite-location pack: bytes rode the page (DO-local pack_data
-          // rehydration) — one plain put into the (shared) R2 prefix.
-          await bucket.put(packR2Key(storageKey, p.packKey), p.packData);
+          // rehydration) — one plain put into the target's R2 prefix.
+          await bucket.put(packR2Key(targetStorageKey, p.packKey), p.packData);
         } else {
           fail("packs", fromEngine, toEngine, `sqlite pack without inline bytes: ${p.packKey}`);
         }

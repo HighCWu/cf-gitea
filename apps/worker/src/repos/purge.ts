@@ -20,13 +20,20 @@
  *   - Wiki sibling cells (specs/wiki.md §3's purge-cascade closure): every
  *     name above also owns a SIBLING engine cell `<name>.wiki` — the wiki
  *     family stores each repo's wiki there (services/wiki.ts wikiCellName,
- *     upstream's `{repo}.wiki` sibling repo). Its whole state surface is the
- *     DO cell itself: writes ride direct cell RPCs (putApiObjects /
- *     commitApiChange — SQLite loose objects + refs), the git receive/clone
- *     channels that address R2 are unreachable for `*.wiki` names (the gate
- *     404s them), and there are no D1 rows and no engine-registry row. So
- *     the wiki cascade needs no R2/D1 arms — the derived name rides the SAME
- *     three phases. Upstream parity: services/repository/delete.go:335-337
+ *     upstream's `{repo}.wiki` sibling repo). Writes ride direct cell RPCs
+ *     (putApiObjects / commitApiChange — SQLite loose objects + refs) AND,
+ *     since the wiki-git landing (the gate's `{repo}.wiki.git` twin), git
+ *     pushes: a wiki cell that received pushes persists its own COMBINED
+ *     NAME as the storage key (the gate forwards no x-storage-key for wiki
+ *     routes, so control-plane.ts resolveStorageKey falls back to meta.repo)
+ *     and stages packs/staging/clone-cache NAME-ADDRESSED at
+ *     `repos/<owner>/<slug>.wiki/`. A RENAMED wiki re-keys onto
+ *     wikiCarryStorageKey (`repos/<parent key>.wiki/` — carry.ts's wiki arm;
+ *     the engine's import lease validates slash-free keys, so the target
+ *     cannot keep a slashed name). So the wiki cascade's R2 arm sweeps BOTH
+ *     prefix classes below, while the D1 side stays wiki-free (no wiki rows,
+ *     no engine-registry row). Upstream parity:
+ *     services/repository/delete.go:335-337
  *     removes the wiki repo files in the same post-transaction sweep as the
  *     repo files (best-effort, a notice on failure — here: the log line +
  *     queue redelivery). Derived at CONSUME time, so in-flight messages
@@ -117,14 +124,28 @@ async function purgePrefix(bucket: R2Bucket, prefix: string, budget: { calls: nu
  * §2.5.5 step 3 — R2 prefix purge for the repo's immutable storage key
  * (repos/<storage_key>/ since the Step 3 key layout: packs, staging and the
  * clone cache share ONE prefix; imports/<storage_key>/ is the import
- * channel's). Idempotent; throws when the subrequest budget runs out (queue
- * redelivery resumes).
+ * channel's) PLUS the wiki family's prefixes: the carried wiki key
+ * (wikiCarryStorageKey — a renamed wiki's packs) and every known engine
+ * name's name-addressed sibling prefix (a pushed wiki's packs, current or
+ * pre-rename orphan). Idempotent; throws when the subrequest budget runs out
+ * (queue redelivery resumes).
  */
-export async function purgeRepoStorage(env: Env, storageKey: string): Promise<void> {
+export async function purgeRepoStorage(env: Env, storageKey: string, engineNames: string[] = []): Promise<void> {
   const bucket = env.REPO_PACKS;
   if (!bucket) return;
   const budget = { calls: 0 };
-  for (const prefix of [`repos/${storageKey}/`, `imports/${storageKey}/`]) {
+  const prefixes = [
+    `repos/${storageKey}/`,
+    `imports/${storageKey}/`,
+    // The wiki family (the wiki-git landing's purge follow-up): the
+    // carried-scheme key first (a renamed wiki's packs + its post-carry
+    // pushes), then each known name's name-addressed sibling prefix
+    // (push-provisioned cells, pre-rename orphans). No imports/<wiki> arm:
+    // the import channel is D1-row-driven and never addresses a wiki cell.
+    `repos/${wikiCarryStorageKey(storageKey)}/`,
+    ...engineNames.map((name) => `repos/${wikiEngineName(name)}/`),
+  ];
+  for (const prefix of prefixes) {
     await purgePrefix(bucket, prefix, budget);
   }
 }
@@ -279,6 +300,24 @@ function wikiEngineName(name: string): string {
 }
 
 /**
+ * The R2 storage key a CARRIED wiki cell addresses (carry.ts's wiki arm):
+ * `<parent storage key>.wiki`. A wiki cell that received git pushes is
+ * NAME-addressed (meta.storage_key = its combined engine name, e.g.
+ * `owner/repo.wiki` — the git-http wiki twin forwards no x-storage-key), but
+ * a RENAME cannot re-key the target onto its own name: the engine's
+ * beginForkImport validates slash-free keys only (isValidStorageKey). The
+ * carry therefore lands the target sibling on this derived key — slash-free
+ * (the engine's STORAGE_KEY_RE class), unique and immutable through every
+ * rename (the parent D1 key is both), and collision-free against the other
+ * key classes (a D1 key is `r_<id>`, a name-addressed key always carries a
+ * slash). Exported so the carry and this purge derive the SAME key from the
+ * one parent storage key the purge message carries.
+ */
+export function wikiCarryStorageKey(storageKey: string): string {
+  return `${storageKey}.wiki`;
+}
+
+/**
  * One purge message's work (exported so tests drive it without fabricating
  * a MessageBatch; the steps are idempotent, so a redelivery re-runs them).
  * The tombstone/destroy/registry phases run over the main names AND their
@@ -299,11 +338,12 @@ export async function purgeRepoMessage(env: Env, body: RepoPurgeMessage): Promis
     }
   }
 
-  // Step 3: R2 prefix purge under the immutable storage key. Throws on a
-  // budget overrun → the queue redelivers before destroy ever runs. The wiki
-  // cells need no arm here: their writes never leave the DO (module doc —
-  // the receive/clone channels that address R2 are unreachable for *.wiki).
-  await purgeRepoStorage(env, body.storageKey);
+  // Step 3: R2 prefix purge under the immutable storage key, PLUS the wiki
+  // family's prefixes (the carried wiki key + every known name's
+  // name-addressed sibling prefix — the wiki-git landing's pushed packs).
+  // Throws on a budget overrun → the queue redelivers before destroy ever
+  // runs.
+  await purgeRepoStorage(env, body.storageKey, body.engineNames);
 
   // Step 4 (final): destroy every cell. A failure throws so the redelivery
   // retries; destroy (and everything above it) is idempotent.

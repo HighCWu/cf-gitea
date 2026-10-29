@@ -17,18 +17,19 @@
  *     ack, never retry.
  */
 
-import { env } from "cloudflare:test";
+import { SELF, env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
 import { repoRedirects, repositories, users } from "../db/schema";
 import type { RepositoryRow, RepositoryWithOwner } from "../api/services/repository";
 import { createWikiPage, readWikiPage } from "../services/wiki";
 import { handleRepoTasks, purgeRepoMessage } from "./purge";
 import { RepoService } from "./service";
-import { ZERO_OID } from "./testing/git-pack";
+import { ZERO_OID, buildPack, buildReceivePackBody } from "./testing/git-pack";
 
 /** Fabricated MessageBatch with ack/retry recorders (imports.test.ts shape). */
 function fabricatedBatch(bodies: { id: string; body: unknown }[]) {
@@ -422,5 +423,61 @@ describe("repo delete purge wiki cascade (specs/wiki.md §3 sibling cell)", () =
     await purgeRepoMessage(env, { storageKey: bare.storageKey, engineNames: ["bob/bare"] });
     expect(await cellRefNames("bob/bare.wiki")).toEqual([]);
     await expectNoTombstone("bob/bare.wiki");
+  });
+
+  it("a wiki cell that received GIT PUSHES purges its R2 prefixes too — name-addressed and carried (the wiki-git landing's purge follow-up)", async () => {
+    await seedUser(92, "carol");
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: 92, usernameLower: "carol" },
+      name: "pushed",
+      isPrivate: false,
+    });
+
+    // The REAL staging path: a git push through the wiki twin (info/refs
+    // preflight first — the protocol forward binds the cell's name, which the
+    // storage-key-less receive then persists). The pack lands NAME-ADDRESSED
+    // under repos/carol/pushed.wiki/ — never the parent's r_<id> namespace.
+    const token = (await mintFor(92, "w", "write:repository")).plaintext;
+    const { oid, pack } = await buildPack();
+    const advert = await SELF.fetch("https://example.com/carol/pushed.wiki.git/info/refs?service=git-receive-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(advert.status).toBe(200);
+    const push = await SELF.fetch("https://example.com/carol/pushed.wiki.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": "application/x-git-receive-pack-request" },
+      body: buildReceivePackBody([{ ref: "refs/heads/notes", oid }], pack),
+    });
+    expect(push.status).toBe(200);
+
+    const nameAddressedPrefix = "repos/carol/pushed.wiki/";
+    expect((await env.REPO_PACKS.list({ prefix: nameAddressedPrefix })).objects.length).toBeGreaterThan(0);
+
+    // The carried key a rename re-keys onto (carry.ts's wiki arm) — seed it
+    // directly: the delete sweep must reclaim BOTH wiki prefix classes, and a
+    // carried wiki's post-carry pushes stage exactly here.
+    const carriedPrefix = `repos/${repo.storageKey}.wiki/`;
+    await env.REPO_PACKS.put(`${carriedPrefix}packs/pack-carried.pack`, new Uint8Array([9]));
+
+    // Main-cell surroundings (the lifecycle delete test's seeding).
+    await env.REPO_PACKS.put(`repos/${repo.storageKey}/packs/pack-x.pack`, new Uint8Array([1, 2, 3]));
+    await env.REPO_PACKS.put(`imports/${repo.storageKey}/chunk-0.pack`, new Uint8Array([4]));
+
+    const body = { storageKey: repo.storageKey, engineNames: ["carol/pushed"] };
+    await purgeRepoMessage(env, body);
+
+    // Every prefix the repo's family ever addressed is swept: the parent's,
+    // the wiki's name-addressed staging, and the wiki's carried key.
+    for (const prefix of [nameAddressedPrefix, carriedPrefix, `repos/${repo.storageKey}/`, `imports/${repo.storageKey}/`]) {
+      expect((await env.REPO_PACKS.list({ prefix })).objects).toHaveLength(0);
+    }
+    // The wiki cell itself is destroyed as ever.
+    expect(await cellRefNames("carol/pushed.wiki")).toEqual([]);
+    await expectNoTombstone("carol/pushed.wiki");
+
+    // Redelivery re-runs every idempotent sweep cleanly.
+    await purgeRepoMessage(env, body);
+    expect((await env.REPO_PACKS.list({ prefix: nameAddressedPrefix })).objects).toHaveLength(0);
+    expect((await env.REPO_PACKS.list({ prefix: carriedPrefix })).objects).toHaveLength(0);
   });
 });

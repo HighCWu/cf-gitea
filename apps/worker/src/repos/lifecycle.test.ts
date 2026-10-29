@@ -1317,6 +1317,81 @@ describe("wiki sibling cell (specs/wiki.md §3 — the 0b619be follow-ups)", () 
     await expectTombstoned("alice/wiki-movable.wiki");
   });
 
+  it("rename carries a wiki cell that received GIT PUSHES: the R2 pack is reachable at the new name (the wiki-git landing's carry follow-up)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const svc = service();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "wikipacked");
+    // Both content classes in one sibling: a Worker-authored page (the loose
+    // channel) and a real GIT PUSH through the wiki twin — the gate forwards
+    // no x-storage-key for wiki routes, so the pack stages NAME-ADDRESSED
+    // under the sibling cell's own combined name.
+    await seedWikiPage(repo, alice.id, "alice", "Home");
+    const { oid, pack } = await buildPack();
+    // The info/refs preflight first — every git client's shape, and the step
+    // that binds the sibling cell's name (the protocol forward sets x-repo,
+    // whose bindR2 persists meta.repo — the storage-key fallback the
+    // storage-key-less receive then resolves and persists).
+    const advert = await SELF.fetch("https://example.com/alice/wikipacked.wiki.git/info/refs?service=git-receive-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(advert.status).toBe(200);
+    const push = await SELF.fetch("https://example.com/alice/wikipacked.wiki.git/git-receive-pack", {
+      method: "POST",
+      headers: {
+        authorization: basicTokenHeader(token),
+        "content-type": "application/x-git-receive-pack-request",
+      },
+      body: buildReceivePackBody([{ ref: "refs/heads/notes", oid }], pack),
+    });
+    expect(push.status).toBe(200);
+
+    // Producer sanity: the pack sits at the NAME-ADDRESSED prefix and the
+    // parent's r_<id> namespace was never touched (the two must not mix).
+    const nameAddressedPrefix = "repos/alice/wikipacked.wiki/";
+    const staged = await env.REPO_PACKS.list({ prefix: `${nameAddressedPrefix}packs/` });
+    expect(staged.objects.length).toBeGreaterThan(0);
+    expect((await env.REPO_PACKS.list({ prefix: `repos/${repo.storageKey}/` })).objects).toHaveLength(0);
+    const stagedKeys = staged.objects.map((o) => o.key);
+
+    await svc.rename(repo.id, "wikipacked2");
+
+    // The carried key (carry.ts's wiki arm: <parent key>.wiki — slash-free,
+    // the import lease's validated shape) now holds EVERY staged object, pack
+    // bytes included.
+    const carriedPrefix = `repos/${repo.storageKey}.wiki/`;
+    for (const key of stagedKeys) {
+      expect(await env.REPO_PACKS.head(`${carriedPrefix}${key.slice(nameAddressedPrefix.length)}`)).not.toBeNull();
+    }
+    // The old name-addressed bytes remain the old cell's until the delete
+    // purge reclaims them (the same outlives-the-move posture as a code
+    // cell's shared prefix).
+    for (const key of stagedKeys) {
+      expect(await env.REPO_PACKS.head(key)).not.toBeNull();
+    }
+
+    // Reachability through the NEW cell: the pushed oid reads through the
+    // adopted catalog (a packed-object walk), and both channels' refs moved —
+    // the pushed notes AND the page seed's main.
+    const moved = env.REPO.getByName("alice/wikipacked2.wiki");
+    expect(await moved.readCommit(oid)).not.toBeNull();
+    expect((await moved.listRefs()).refs.map((r) => r.name).sort()).toEqual(
+      ["refs/heads/main", "refs/heads/notes"].sort(),
+    );
+    // The loose channel agrees: the page reads at the new name.
+    const movedRepo = (await svc.get(repo.id))!;
+    const page = await readWikiPage(env, await wikiPairFor(movedRepo, alice.id), "Home", "https://example.com");
+    expect(page).not.toBeNull();
+    expect(atob(page!.content_base64)).toContain("# Home");
+
+    // The parent's pack prefix is still untouched — the pre-fix carry keyed
+    // the sibling onto it (beginForkImport(r_<id>), adopt verifying against
+    // the parent's namespace).
+    expect((await env.REPO_PACKS.list({ prefix: `repos/${repo.storageKey}/` })).objects).toHaveLength(0);
+    // The old sibling is tombstoned as ever.
+    await expectTombstoned("alice/wikipacked.wiki");
+  });
+
   it("delete sync-tombstones every main cell AND its .wiki sibling (current + renamed alias)", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const svc = service();
