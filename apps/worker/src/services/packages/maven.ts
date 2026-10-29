@@ -80,8 +80,10 @@ import {
   type PackageOwnerRow,
   type PackagesQuotaConfig,
   type PackageVersionRow,
-  checkCountQuotaExceeded,
+  UNLIMITED_QUOTA,
+  QuotaTotalCountError,
   checkSizeQuotaExceeded,
+  countVersions,
   deletePackageFile,
   getFileForVersionByName,
   getOrInsertPackage,
@@ -979,9 +981,17 @@ export async function uploadMavenPackageFile(input: UploadMavenPackageFileInput)
       return { kind: "checksum-verified" };
     }
 
-    // The count quota rides the landed family idiom (up-front, the pypi
-    // docstring's note — upstream runs it only when the version is created).
-    await checkCountQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, input.quota);
+    // COUNT: upstream checks AFTER the version insert, inside the
+    // rolling-back transaction (the versionCreated gate, packages.go:188-191)
+    // and throws when totalCount > limit (packages.go:380-381) — the
+    // pre-insert equivalent is count + 1 > limit, so an exactly-at-limit
+    // owner publishes the version that REACHES the cap but not one past.
+    if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
+      const total = (await countVersions(input.d1, input.owner.id)) + 1;
+      if (total > input.quota.limitTotalOwnerCount) {
+        throw new QuotaTotalCountError();
+      }
+    }
 
     // If it's the package pom file extract the metadata (maven.go:359-394):
     // the parse is 400 on a malformed pom, BEFORE the quota/creation arms —

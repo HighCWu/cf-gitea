@@ -27,8 +27,10 @@ import {
   type PackageFileRow,
   type PackageOwnerRow,
   type PackagesQuotaConfig,
-  checkCountQuotaExceeded,
+  UNLIMITED_QUOTA,
+  QuotaTotalCountError,
   checkSizeQuotaExceeded,
+  countVersions,
   deletePackageFile,
   deletePackageVersionAndReferences,
   getFileDescriptors,
@@ -115,7 +117,11 @@ export interface UploadGenericFileResult {
 /**
  * The generic PUT's service walk:
  *   1. quota (count + size, admin bypass — the upstream checks run inside
- *      addFileToPackageVersion, packages.go:305-312);
+ *      addFileToPackageVersion, packages.go:303-306; the count arm carries
+ *      the +1 post-insert parity — upstream's versionCreated gate checks
+ *      AFTER the version insert, packages.go:188-191, and throws when
+ *      totalCount > limit, packages.go:380-381, so the pre-insert
+ *      equivalent is count + 1 > limit);
  *   2. PASS 1 — spool-and-hash (the store owns the 413 cap + 400 mismatch);
  *   3. get-or-insert package → version → blob (the D1 dedup decides whether
  *      the second pass runs at all);
@@ -125,7 +131,12 @@ export interface UploadGenericFileResult {
  */
 export async function uploadGenericFile(input: UploadGenericFileInput): Promise<UploadGenericFileResult> {
   const now = input.now ?? new Date();
-  await checkCountQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, input.quota);
+  if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
+    const total = (await countVersions(input.d1, input.owner.id)) + 1;
+    if (total > input.quota.limitTotalOwnerCount) {
+      throw new QuotaTotalCountError();
+    }
+  }
   // The size quota reads the DECLARED length pre-stream (the real size is
   // enforced identical by the FixedLengthStream); the count check needs no size.
   await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, "generic", input.declaredLength, input.quota);

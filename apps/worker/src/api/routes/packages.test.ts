@@ -396,6 +396,40 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
     void adminWriter;
   });
 
+  it("the count-quota boundary (+1 parity): the Nth publish reaches the cap, the (N+1)th 403s", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    // LIMIT = 2. Upstream inserts the version THEN checks count > limit inside
+    // the rolling-back transaction (packages.go:188-191 with the throw at
+    // 380-381), so the publish that REACHES the limit passes and only one
+    // past 403s — a pre-insert `count > limit` check would allow one version
+    // MORE than upstream at exactly this boundary.
+    const capped = protocol({ PACKAGES_LIMIT_TOTAL_OWNER_COUNT: "2" });
+    const cappedPut = (version: string): Promise<Response> =>
+      capped("/api/packages/alice/generic/bnd/" + version + "/f.bin", {
+        method: "PUT",
+        headers: { ...authHeaders(writer), "content-length": "3" },
+        body: "abc",
+      });
+
+    // N-1 → N: the publish that REACHES the limit succeeds (1 + 1 ≤ 2).
+    const reach = await cappedPut("1.0.0");
+    expect(reach.status).toBe(201);
+    await reach.text();
+    // The Nth publish succeeds with the owner exactly AT the limit (2 + 1 →
+    // count 2; 2 > 2 is false upstream).
+    const atLimit = await cappedPut("2.0.0");
+    expect(atLimit.status).toBe(201);
+    await atLimit.text();
+
+    // The (N+1)th publish past the cap → 403 ErrQuotaTotalCount, and the
+    // rollback posture leaves the two landed versions untouched.
+    const over = await cappedPut("3.0.0");
+    expect(over.status).toBe(403);
+    expect(await over.text()).toBe("package quota count limit exceeded");
+    expect((await db().select().from(packageVersions).all())).toHaveLength(2);
+  });
+
   it("DELETE per-file (the last file takes the version) and per-version", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");

@@ -26,7 +26,6 @@ import {
 import {
   PropertyType,
   type PackageOwnerRow,
-  checkCountQuotaExceeded,
   checkSizeQuotaExceeded,
   calculateFileSize,
   countVersions,
@@ -416,18 +415,16 @@ describe("quota config parsing", () => {
   });
 });
 
-describe("quota checks (CheckCount/CheckSizeQuotaExceeded)", () => {
-  it("count: admin bypass, -1 disabled, cap enforced over the owner's versions", async () => {
+describe("quota checks (CheckSizeQuotaExceeded + the CountVersions primitive)", () => {
+  it("count: CountVersions totals the owner's non-internal versions (the publish arms' primitive)", async () => {
     const owner = await seedUser("alice");
     await seedPackageVersion(owner.id, "a", "1.0");
     await seedPackageVersion(owner.id, "b", "1.0");
-    const config = { ...packagesQuotaFromEnv({}), limitTotalOwnerCount: 2 };
-    await expect(checkCountQuotaExceeded(env.DB, false, owner.id, config)).resolves.toBeUndefined(); // 2 <= 2
-    await expect(checkCountQuotaExceeded(env.DB, false, owner.id, { ...config, limitTotalOwnerCount: 1 })).rejects.toThrow();
-    await expect(
-      checkCountQuotaExceeded(env.DB, true, owner.id, { ...config, limitTotalOwnerCount: 0 }),
-    ).resolves.toBeUndefined(); // admin bypass
-    await expect(checkCountQuotaExceeded(env.DB, false, owner.id, packagesQuotaFromEnv({}))).resolves.toBeUndefined();
+    expect(await countVersions(env.DB, owner.id)).toBe(2);
+    // A different owner's versions stay out of the total.
+    const other = await seedUser("bob");
+    await seedPackageVersion(other.id, "c", "1.0");
+    expect(await countVersions(env.DB, other.id)).toBe(1);
     expect(await countVersions(env.DB, owner.id)).toBe(2);
   });
 

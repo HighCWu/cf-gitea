@@ -60,8 +60,10 @@ import {
   type PackageOwnerRow,
   type PackagesQuotaConfig,
   type PackageVersionRow,
-  checkCountQuotaExceeded,
+  UNLIMITED_QUOTA,
+  QuotaTotalCountError,
   checkSizeQuotaExceeded,
+  countVersions,
   deletePackageFile,
   getFileDescriptors,
   getFileForVersionByName,
@@ -576,14 +578,24 @@ export interface UploadHelmResult {
 }
 
 /**
- * The POST /api/charts walk. Count quota up-front (the landed generic
- * idiom); the size quota runs after the archive parsed, with the archive's
- * real size (upstream checks inside addFileToPackageVersion with the file
- * size, packages.go:305-312).
+ * The POST /api/charts walk. The quota checks precede the inserts (one
+ * transaction upstream — a 403 leaves no rows); the size quota runs after
+ * the archive parsed, with the archive's real size (upstream checks inside
+ * addFileToPackageVersion with the file size, packages.go:303-306). COUNT:
+ * upstream checks AFTER the version insert, inside the rolling-back
+ * transaction (the versionCreated gate, packages.go:188-191) and throws
+ * when totalCount > limit (packages.go:380-381) — the pre-insert equivalent
+ * is count + 1 > limit, so an exactly-at-limit owner publishes the version
+ * that REACHES the cap but not one past.
  */
 export async function uploadHelmChart(input: UploadHelmChartInput): Promise<UploadHelmResult> {
   const now = input.now ?? new Date();
-  await checkCountQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, input.quota);
+  if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
+    const total = (await countVersions(input.d1, input.owner.id)) + 1;
+    if (total > input.quota.limitTotalOwnerCount) {
+      throw new QuotaTotalCountError();
+    }
+  }
 
   // PASS 1 — spool the whole archive (the store owns the 413 cap + length
   // check; the chart file IS the whole body here).
@@ -686,7 +698,16 @@ export type UploadHelmProvenanceInput = UploadHelmChartInput;
  */
 export async function uploadHelmProvenance(input: UploadHelmProvenanceInput): Promise<UploadHelmResult> {
   const now = input.now ?? new Date();
-  await checkCountQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, input.quota);
+  // The same count-quota shape as the chart walk (packages.go:188-191 with
+  // the throw at 380-381 — count + 1 > limit pre-insert). This path adds to
+  // an EXISTING version only (404 below otherwise), so it never lands a new
+  // version row; the check keeps the family idiom on every publish path.
+  if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
+    const total = (await countVersions(input.d1, input.owner.id)) + 1;
+    if (total > input.quota.limitTotalOwnerCount) {
+      throw new QuotaTotalCountError();
+    }
+  }
 
   const spooled: SpooledBlob = await spoolAndHash({
     bucket: input.bucket,

@@ -731,24 +731,6 @@ export async function countVersions(d1: D1Database, ownerId: number): Promise<nu
 }
 
 /**
- * `CheckCountQuotaExceeded` (packages.go:366-388) — admins bypass
- * (packages.go:391-393), `-1` disables. Throws QuotaTotalCountError (→ 403).
- */
-export async function checkCountQuotaExceeded(
-  d1: D1Database,
-  doerIsAdmin: boolean,
-  ownerId: number,
-  config: PackagesQuotaConfig,
-): Promise<void> {
-  if (doerIsAdmin) return;
-  if (config.limitTotalOwnerCount > UNLIMITED_QUOTA) {
-    if ((await countVersions(d1, ownerId)) > config.limitTotalOwnerCount) {
-      throw new QuotaTotalCountError();
-    }
-  }
-}
-
-/**
  * `CheckSizeQuotaExceeded` (packages.go:390-457) — the per-type cap (v1
  * carries only the generic entry, §3.4) then the owner total re-computation.
  * Throws QuotaTypeSizeError / QuotaTotalSizeError (→ 403).

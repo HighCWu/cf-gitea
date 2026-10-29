@@ -38,8 +38,10 @@ import {
   type PackagesQuotaConfig,
   type PackageRow,
   type PackageVersionRow,
-  checkCountQuotaExceeded,
+  UNLIMITED_QUOTA,
+  QuotaTotalCountError,
   checkSizeQuotaExceeded,
+  countVersions,
   getFileDescriptors,
   getFileForVersionByName,
   getOrInsertPackage,
@@ -541,14 +543,25 @@ export interface UploadPypiPackageResult {
 }
 
 /**
- * The twine POST's service walk. The COUNT quota runs up-front (the landed
- * generic idiom); the SIZE quota runs after the scan with the FILE's real
- * byte count (upstream checks inside addFileToPackageVersion with the file
- * size, packages.go:305-312 — the multipart envelope is not charged).
+ * The twine POST's service walk. The quota checks precede the inserts (one
+ * transaction upstream — a 403 leaves no rows). SIZE runs after the scan
+ * with the FILE's real byte count (upstream checks inside
+ * addFileToPackageVersion with the file size, packages.go:303-306 — the
+ * multipart envelope is not charged). COUNT: upstream checks AFTER the
+ * version insert, inside the rolling-back transaction (the versionCreated
+ * gate, packages.go:188-191) and throws when totalCount > limit
+ * (packages.go:380-381) — the pre-insert equivalent is count + 1 > limit,
+ * so an exactly-at-limit owner publishes the version that REACHES the cap
+ * but not one past.
  */
 export async function uploadPypiPackage(input: UploadPypiPackageInput): Promise<UploadPypiPackageResult> {
   const now = input.now ?? new Date();
-  await checkCountQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, input.quota);
+  if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
+    const total = (await countVersions(input.d1, input.owner.id)) + 1;
+    if (total > input.quota.limitTotalOwnerCount) {
+      throw new QuotaTotalCountError();
+    }
+  }
 
   // PASS 1 — spool the whole multipart body (the store owns the 413 cap and
   // the length check; the cap covers the envelope, a conservative superset
