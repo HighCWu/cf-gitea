@@ -397,7 +397,7 @@ describe("repo delete purge wiki cascade (specs/wiki.md §3 sibling cell)", () =
     await seedWikiPage(repo, 91, "bob", "Old");
     expect(await cellRefNames("bob/plain.wiki")).toEqual(["refs/heads/main"]);
 
-    // Rename — moveEngineCell carries only the MAIN cell, so bob/plain.wiki
+    // Rename — moveEngineCell carries only the MAIN cell for THIS bare service (production wires the wiki carry since 2026-10-29; the general statement retired), so bob/plain.wiki
     // is the stranded-orphan shape this sweep exists to reclaim — then a
     // post-rename page provisions the NEW sibling at the current name.
     await svc.rename(repo.id, "renamed");

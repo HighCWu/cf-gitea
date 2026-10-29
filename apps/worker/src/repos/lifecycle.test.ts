@@ -14,6 +14,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
+import type { RepositoryRow, RepositoryWithOwner } from "../api/services/repository";
 import {
   RepoNameCollisionError,
   RepoNameInvalidError,
@@ -27,6 +28,7 @@ import { purgeRepoMessage, tombstoneRepoDO } from "./purge";
 import { settleCreatingRepo } from "../git-http/gate";
 import { protectedBranches, repoCounters, repoRedirects, repositories, repoTransfer, repoUnits, stars, users } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
+import { createWikiPage, readWikiPage } from "../services/wiki";
 import { starRepo } from "../api/services/stars";
 import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "./testing/git-pack";
 
@@ -1206,6 +1208,192 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
     // re-materialization for the packed class) and re-peel from the bytes.
     const after = await env.REPO.getByName("alice/carry-packedtag2").listRefs();
     expect(after.refs.find((r) => r.name === "refs/tags/v1")).toEqual({ name: "refs/tags/v1", target: tagOid, peeled: commitOid });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The wiki sibling cell (specs/wiki.md §3 — the wiki purge landing 0b619be's
+// two service-side follow-ups): the `<owner>/<slug>.wiki` engine cell
+// (services/wiki.ts wikiCellName — upstream's `{repo}.wiki` sibling repo)
+// joins the delete tombstone SYNCHRONOUSLY and moves with the rename/transfer
+// carry. Upstream parity: delete.go:335-337 removes the wiki repo files in
+// the delete's post-transaction sweep; transfer.go:316-326 (transferOwnership)
+// and :396-399 (changeRepositoryName) rename the wiki repo with the repo,
+// guarded by HasWiki (repository.go:329-334) so a wiki-less repo's wiki is a
+// no-op — the wikiExists dep's contract.
+// ---------------------------------------------------------------------------
+
+/** The repo+owner pair the wiki service ops take (purge.test.ts's shape). */
+async function wikiPairFor(repo: RepositoryRow, ownerId: number): Promise<RepositoryWithOwner> {
+  const owner = await drizzle(env.DB).select().from(users).where(eq(users.id, ownerId)).get();
+  if (owner === undefined) throw new Error(`wiki sibling test: owner row missing: ${ownerId}`);
+  return { repo, owner };
+}
+
+/** One wiki page through the LANDED write path — provisions the sibling cell
+ *  under the pinned write stamp (deterministic, wall-clock independent). */
+async function seedWikiPage(repo: RepositoryRow, ownerId: number, doer: string, title: string): Promise<void> {
+  await createWikiPage(
+    env,
+    await wikiPairFor(repo, ownerId),
+    { name: doer, email: `${doer}@example.com` },
+    { title, content: new TextEncoder().encode(`# ${title}\n`), message: "" },
+    "https://example.com",
+    { now: 1_700_000_000 },
+  );
+}
+
+/** The cell carries the tombstone flag: beginReceive is refused outright. */
+async function expectTombstoned(engineName: string): Promise<void> {
+  const begin = await env.REPO.getByName(engineName).beginReceive({
+    commands: [{ ref: "refs/heads/main", old: ZERO_OID, next: ZERO_OID }],
+    capabilities: [],
+    packBytesHint: null,
+  });
+  expect(begin.tag).toBe("rejected");
+  if (begin.tag === "rejected") {
+    expect(begin.results).toEqual([{ ref: "refs/heads/main", ok: false, message: "repository deleted" }]);
+  }
+}
+
+/** The cell carries no tombstone flag: beginReceive answers ok on the fresh
+ *  or re-initialized empty cell (purge.test.ts's expectNoTombstone shape). */
+async function expectNoTombstone(engineName: string): Promise<void> {
+  const begin = await env.REPO.getByName(engineName).beginReceive({
+    commands: [{ ref: "refs/heads/main", old: ZERO_OID, next: ZERO_OID }],
+    capabilities: [],
+    packBytesHint: null,
+  });
+  expect(begin.tag).toBe("ok");
+  if (begin.tag === "ok") {
+    await env.REPO.getByName(engineName).releaseReceive({ leaseToken: begin.leaseToken, sweep: false });
+  }
+}
+
+describe("wiki sibling cell (specs/wiki.md §3 — the 0b619be follow-ups)", () => {
+  it("rename carries the wiki sibling: pages readable at the new name, the old sibling tombstoned", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const svc = service();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "wikicarry");
+    await seedWikiPage(repo, alice.id, "alice", "Home");
+    // Producer sanity: the sibling is live under the wiki convention.
+    expect((await env.REPO.getByName("alice/wikicarry.wiki").listRefs()).refs.map((r) => r.name)).toEqual([
+      "refs/heads/main",
+    ]);
+
+    await svc.rename(repo.id, "wikicarry2");
+
+    // The pages read at the NEW name through the landed read path (the carry's
+    // loose round trip: the wiki cell holds Worker-authored objects only).
+    const moved = (await svc.get(repo.id))!;
+    const page = await readWikiPage(env, await wikiPairFor(moved, alice.id), "Home", "https://example.com");
+    expect(page).not.toBeNull();
+    expect(atob(page!.content_base64)).toContain("# Home");
+    // The sibling's ref carried to the derived new name.
+    expect((await env.REPO.getByName("alice/wikicarry2.wiki").listRefs()).refs.map((r) => r.name)).toEqual([
+      "refs/heads/main",
+    ]);
+    // The OLD sibling is tombstoned (upstream's move semantics — the old wiki
+    // repo path ceases; here the cell refuses new leases).
+    await expectTombstoned("alice/wikicarry.wiki");
+  });
+
+  it("transfer carries the wiki sibling to the new owner namespace", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const svc = service();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "wiki-movable");
+    await seedWikiPage(repo, alice.id, "alice", "Home");
+
+    await svc.requestTransfer(repo.id, alice.id, bob.id);
+    await svc.acceptTransfer(repo.id, { id: alice.id, isAdmin: false });
+
+    // The same sibling move, one namespace over.
+    const moved = (await svc.get(repo.id))!;
+    expect(moved.ownerNamespace).toBe("bob");
+    const page = await readWikiPage(env, await wikiPairFor(moved, bob.id), "Home", "https://example.com");
+    expect(page).not.toBeNull();
+    expect(atob(page!.content_base64)).toContain("# Home");
+    await expectTombstoned("alice/wiki-movable.wiki");
+  });
+
+  it("delete sync-tombstones every main cell AND its .wiki sibling (current + renamed alias)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const svc = service();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "wiki-doomed");
+    await seedWikiPage(repo, alice.id, "alice", "Home");
+    await svc.rename(repo.id, "wiki-doomed2"); // leaves the alias wiki-doomed (+ its derived sibling)
+
+    // The DELETE's sync half only — the queue cascade below is deliberate.
+    const { engineNames } = await svc.deleteRepository(repo.id);
+    expect(engineNames.sort()).toEqual(["alice/wiki-doomed", "alice/wiki-doomed2"].sort());
+
+    // The sync tombstone reached the main cells AND the derived wiki
+    // siblings — including the renamed alias's never-provisioned one
+    // (markDeleted on a fresh cell is the consumer's same
+    // initialize-and-tombstone, idempotent).
+    await expectTombstoned("alice/wiki-doomed2");
+    await expectTombstoned("alice/wiki-doomed2.wiki");
+    await expectTombstoned("alice/wiki-doomed");
+    await expectTombstoned("alice/wiki-doomed.wiki");
+
+    // The queue cascade finishes the family: destroy wipes every cell
+    // (refs gone, no tombstone flag left).
+    await purgeRepoMessage(env, { storageKey: repo.storageKey, engineNames });
+    for (const name of ["alice/wiki-doomed2", "alice/wiki-doomed2.wiki", "alice/wiki-doomed", "alice/wiki-doomed.wiki"]) {
+      await expectNoTombstone(name);
+      expect((await env.REPO.getByName(name).listRefs()).refs).toEqual([]);
+    }
+    // The landed read path agrees: the purged wiki answers empty.
+    expect(await readWikiPage(env, await wikiPairFor(repo, alice.id), "Home", "https://example.com")).toBeNull();
+  });
+
+  it("a never-provisioned wiki stays unprovisioned across rename when the HasWiki probe gates it", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const makeService = (wikiExists: (name: string) => Promise<boolean>) => {
+      const carryCalls: string[] = [];
+      const tombstoneCalls: string[] = [];
+      const probeCalls: string[] = [];
+      const svc = new RepoService(env.DB, {
+        registry: env.REGISTRY.getByName("registry"),
+        tombstone: async (name) => {
+          tombstoneCalls.push(name);
+          await tombstoneRepoDO(env, name);
+        },
+        carry: async (from, to, storageKey) => {
+          carryCalls.push(`${from} -> ${to}`);
+          await carryRepoCell(env, from, to, storageKey);
+        },
+        wikiExists: async (name) => {
+          probeCalls.push(name);
+          return wikiExists(name);
+        },
+      });
+      return { svc, carryCalls, tombstoneCalls, probeCalls };
+    };
+
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "wikigate");
+    // Arm 1 — upstream's HasWiki=false (transfer.go:396-399): the wiki steps
+    // never fire — the sibling gets no tombstone, no carry.
+    const skipped = makeService(() => Promise.resolve(false));
+    await skipped.svc.rename(repo.id, "wikigate2");
+    expect(skipped.carryCalls).toEqual(["alice/wikigate -> alice/wikigate2"]);
+    expect(skipped.tombstoneCalls).toEqual(["alice/wikigate"]);
+    expect(skipped.probeCalls).toEqual(["alice/wikigate.wiki"]);
+    // The new name's wiki answers empty through the landed read path — the
+    // lazy-provisioning state, unchanged by the rename.
+    const moved = (await skipped.svc.get(repo.id))!;
+    expect(await readWikiPage(env, await wikiPairFor(moved, alice.id), "Home", "https://example.com")).toBeNull();
+
+    // Arm 2 — HasWiki=true opens the gate: the sibling joins both steps.
+    const opened = makeService(() => Promise.resolve(true));
+    await opened.svc.rename(moved.id, "wikigate3");
+    expect(opened.carryCalls).toEqual([
+      "alice/wikigate2 -> alice/wikigate3",
+      "alice/wikigate2.wiki -> alice/wikigate3.wiki",
+    ]);
+    expect(opened.tombstoneCalls).toEqual(["alice/wikigate2", "alice/wikigate2.wiki"]);
+    expect(opened.probeCalls).toEqual(["alice/wikigate2.wiki"]);
   });
 });
 

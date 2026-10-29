@@ -38,6 +38,21 @@
  * keeps resolving — both live here (the carry + the redirect rows; the old
  * name 301s to the canonical path rather than serving in place, the §2.5.3
  * row-13 divergence already on record).
+ *
+ * The wiki sibling cell (specs/wiki.md §3): every repo also owns the engine
+ * cell `<owner>/<slug>.wiki` (services/wiki.ts wikiCellName — upstream's
+ * `{repo}.wiki` sibling git repo), so the mutations above drag it along:
+ * deleteRepository sync-tombstones each engine name's sibling (upstream
+ * delete.go:335-337 removes the wiki repo files in the same post-transaction
+ * sweep as the repo files; the queue consumer derives the same siblings itself
+ * — src/repos/purge.ts's wiki cascade — so the sync arm is defense-in-depth
+ * for the pre-consumer window), and the rename/transfer carry moves the
+ * sibling with the main cell (upstream renames the wiki repo too:
+ * transferOwnership's IsRepositoryExist-guarded wiki rename,
+ * services/repository/transfer.go:316-326, and changeRepositoryName's
+ * HasWiki-guarded one, transfer.go:396-399 — the guard is the wikiExists
+ * dep's contract, so a never-provisioned wiki stays unprovisioned at the new
+ * name).
  */
 
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -195,6 +210,18 @@ export function engineName(ownerNamespace: string, slug: string): string {
 }
 
 /**
+ * The sibling wiki cell's combined engine name (`owner/repo` → `owner/repo.wiki`)
+ * — services/wiki.ts wikiCellName's convention folded to the combined form the
+ * REPO namespace addresses (specs/wiki.md §3, upstream's `{repo}.wiki` sibling
+ * git repo). Collision-free by construction: isUsableRepoName forbids the
+ * `.wiki` suffix (RESERVED_REPO_NAME_SUFFIXES), so a derived name can never
+ * host an unrelated repo's cell.
+ */
+export function wikiEngineName(name: string): string {
+  return `${name}.wiki`;
+}
+
+/**
  * Row 13 / §2.5.3: resolve an old URL to its canonical location via
  * `repo_redirects` (upstream `LookupRedirect`, models/repo/redirect.go:67-79;
  * applies to git HTTP and, later, web/API lookups alike). Returns the repo's
@@ -233,8 +260,19 @@ export interface RepoEngineDeps {
   /** Engine-cell carry (the registry-fix wave): moves the OLD combined name's
    *  cell content into the NEW name's cell at rename/transfer time, so the
    *  new URL serves the same git data immediately (src/repos/carry.ts).
-   *  Best-effort: a carry failure is logged, the D1 mutation stands. */
+   *  Best-effort: a carry failure is logged, the D1 mutation stands. The wiki
+   *  sibling rides the same channel with the derived `*.wiki` names. */
   carry?: (fromEngine: string, toEngine: string, storageKey: string) => Promise<void>;
+  /** Wiki-cell existence probe — upstream's `HasWiki`
+   *  (services/repository/repository.go:329-334), the guard that keeps the
+   *  wiki rename a no-op for a repo without one (transfer.go:318-326 checks
+   *  IsRepositoryExist on the old wiki repo; :396-399 gates on HasWiki).
+   *  Optional: unwired, the rename/transfer wiki steps run unconditionally —
+   *  a never-provisioned sibling tombstones and carries as the fresh-empty
+   *  cell the new name would lazily get on its first wiki write anyway. A
+   *  throwing probe falls the same way (attempt the move; the empty round
+   *  trip is harmless, the provisioned one preserves the pages). */
+  wikiExists?: (wikiEngineName: string) => Promise<boolean>;
 }
 
 export interface CreateRepoInput {
@@ -571,10 +609,13 @@ export class RepoService {
    * a same-name repo can be re-created immediately (§4.8; fresh storage_key).
    *
    * Then the DO tombstone (best-effort, synchronous; the engine's
-   * markDeleted RPC) and the queue purge message (best-effort; a lost
-   * enqueue strands R2 bytes and is logged — the upstream `CreateNotice`
-   * analog — never failing the user-facing delete). The consumer runs the
-   * storage-key R2 prefix purge and the final destroy (src/repos/purge.ts).
+   * markDeleted RPC — every name's `.wiki` sibling included, the wiki
+   * cascade's sync arm, upstream delete.go:335-337) and the queue purge
+   * message (best-effort; a lost enqueue strands R2 bytes and is logged —
+   * the upstream `CreateNotice` analog — never failing the user-facing
+   * delete). The consumer runs the storage-key R2 prefix purge and the final
+   * destroy, deriving each name's `.wiki` sibling itself (src/repos/purge.ts),
+   * so the message shape stays `{storageKey, engineNames}`.
    *
    * Returns the engine names the repo was known by (current + redirected), so
    * the purge consumer tombstones and destroys every cell the repo ever
@@ -703,9 +744,15 @@ export class RepoService {
     // Step 2: DO tombstone (markDeleted RPC) — refuses new receive leases and
     // aborts in-flight finalizes (§4.2). Best-effort: D1 already won; a
     // tombstone failure is logged and retried by the queue consumer (the
-    // steps are idempotent).
+    // steps are idempotent). Each name's `.wiki` sibling tombstones with it
+    // (the wiki cascade's sync arm — upstream delete.go:335-337 removes the
+    // wiki repo files in the same post-transaction sweep as the repo files;
+    // defense-in-depth: the consumer derives the same siblings itself, so
+    // this only shrinks the pre-consumer window. markDeleted on a
+    // never-created sibling is the same fresh-empty initialize-and-tombstone
+    // the consumer relies on).
     if (this.deps.tombstone) {
-      for (const name of engineNames) {
+      for (const name of [...engineNames, ...engineNames.map(wikiEngineName)]) {
         try {
           await this.deps.tombstone(name);
         } catch (error) {
@@ -721,6 +768,8 @@ export class RepoService {
     // the consumer ran: D1 was gone, the tombstoned cell kept answering
     // reads, and the engine's registry hit authorized them. Best-effort like
     // every registry sync; the purge's backstop sweep below is unchanged.
+    // (No arm for the derived `*.wiki` siblings: a wiki cell holds no
+    // registry row, and the consumer's backstop sweeps the names anyway.)
     if (this.deps.registry) {
       for (const name of engineNames) {
         try {
@@ -748,7 +797,8 @@ export class RepoService {
    * The engine half of a rename/transfer, after the D1 batch won (registry-fix
    * wave — the P1 probe's symptom 1): the engine's RepoCells are NAME-addressed,
    * so the new combined name would otherwise resolve a FRESH, EMPTY cell while
-   * the content stayed under the old one. Three best-effort steps, in order:
+   * the content stayed under the old one. The main cell's three best-effort
+   * steps, in order:
    *
    *   1. tombstone the OLD cell (straggler receive leases abort cleanly §4.2;
    *      reads keep answering for the carry below);
@@ -761,6 +811,20 @@ export class RepoService {
    *      forks (ADR-0001 D3 holds);
    *   3. move the registry entry (upsert new → remove old, the no-miss-window
    *      order) — the engine 404s/serves off this index.
+   *
+   * The WIKI SIBLING `<old>.wiki` moves with the repo (specs/wiki.md §3; the
+   * wiki purge landing's follow-up — upstream renames the wiki repo with the
+   * repo: transferOwnership's IsRepositoryExist-guarded wiki rename,
+   * services/repository/transfer.go:316-326, and changeRepositoryName's
+   * HasWiki-guarded one, transfer.go:396-399): the same tombstone + carry
+   * steps through the same deps, minus the registry arm (a `*.wiki` cell
+   * holds no registry row). wikiExists (upstream's HasWiki) keeps a
+   * never-provisioned wiki a no-op at the new name; the sibling's whole state
+   * surface is Worker-authored loose objects + refs (the git channels that
+   * pack are 404-gated for *.wiki), so the carry's loose round trip moves it
+   * exactly. A failed sibling carry strands the pages at the old cell until
+   * the delete purge reclaims them (logged, never thrown — the same degraded
+   * floor as the main carry).
    *
    * Every step logs and continues on failure: D1 is the source of truth, the
    * degraded floor is the pre-fix behavior, and receivePack upserts heal the
@@ -783,8 +847,43 @@ export class RepoService {
           `[repos] cell carry failed ${oldEngine} -> ${newEngine} (repo ${repo.id}, new url serves empty until healed): ${errorMessage(error)}`,
         );
       }
+      // The wiki sibling (upstream transfer.go:316-326 + :396-399, HasWiki-
+      // gated): tombstone the old sibling, carry it to the new name — the
+      // main cell's steps 1-2 over the derived `*.wiki` names.
+      const oldWiki = wikiEngineName(oldEngine);
+      if (await this.wikiSiblingProvisioned(oldWiki)) {
+        if (this.deps.tombstone) {
+          try {
+            await this.deps.tombstone(oldWiki);
+          } catch (error) {
+            console.error(`[repos] wiki tombstone failed for ${oldWiki}: ${errorMessage(error)}`);
+          }
+        }
+        try {
+          await this.deps.carry(oldWiki, wikiEngineName(newEngine), repo.storageKey);
+        } catch (error) {
+          console.error(
+            `[repos] wiki cell carry failed ${oldWiki} -> ${wikiEngineName(newEngine)} (repo ${repo.id}, pages stranded at the old cell until the delete purge reclaims them): ${errorMessage(error)}`,
+          );
+        }
+      }
     }
     await this.syncRegistryMove(oldEngine, newEngine, repo.visibility === "private");
+  }
+
+  /** The HasWiki gate for the wiki sibling's move steps (moveEngineCell):
+   *  true when the probe is unwired or throws — attempt the move either way
+   *  (a fresh-empty sibling's round trip is the lazy-provisioning equivalent,
+   *  and a provisioned one must not strand its pages on a probe hiccup);
+   *  the wired probe's verdict otherwise. */
+  private async wikiSiblingProvisioned(oldWiki: string): Promise<boolean> {
+    if (this.deps.wikiExists === undefined) return true;
+    try {
+      return await this.deps.wikiExists(oldWiki);
+    } catch (error) {
+      console.error(`[repos] wikiExists probe failed for ${oldWiki}: ${errorMessage(error)}`);
+      return true;
+    }
   }
 
   /** Engine-registry move helper: upsert the new key BEFORE removing the old,
