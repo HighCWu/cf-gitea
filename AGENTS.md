@@ -245,6 +245,17 @@ Implementation follows the SPEC; if the design changes during implementation, up
   self-host posture — the vitest plugin injects wrangler VARS into test envs,
   so a locally flipped config arms demo goldens on its own (ADR-0005 D3).
 
+## Upstream-Parity Decision Rule
+
+**Upstream behavior IS the default decision.** When upstream Gitea has an
+answer (an architecture, a protocol, a posture), implementing it faithfully is
+not a decision point — proceed and record it in the SPEC; never ask the user.
+Ask only when (a) upstream itself has no answer for the surface, or (b) the
+Workers platform makes upstream's shape impossible and MULTIPLE equally
+upstream-faithful adaptations exist. Learned 2026-10-29 (the SPEC-0012
+"external runner decision" that wasn't one: upstream's own architecture puts
+execution outside the server — the control plane is pure parity work).
+
 ## Gitea Compatibility References
 
 When implementing or reviewing an API endpoint, check upstream behavior in the submodule:
