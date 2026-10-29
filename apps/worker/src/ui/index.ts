@@ -4066,6 +4066,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (raw.length === 7 && raw[3] === "actions" && raw[4] === "runners" && raw[6] === "delete" && /^-?\d+$/.test(raw[5] as string)) {
       return { family: "org-actions-runners-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
     // The org settings PACKAGES family (pages/org-settings-packages.tsx —
     // web.go:1069-1085's cleanup-rules group; the rules/add literal claims
     // AHEAD of the {id} combo, chi static-first). The cargo tails stay
@@ -4081,7 +4082,6 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (raw.length === 7 && raw[3] === "packages" && raw[4] === "rules" && raw[6] === "preview" && /^-?\d+$/.test(raw[5] as string)) {
       return { family: "org-settings-packages-rule-preview", owner, id: Number.parseInt(raw[5] as string, 10) };
-    }
     }
     if (raw.length === 5 && raw[3] === "avatar" && raw[4] === "delete") {
       return { family: "org-settings-avatar-delete", owner };

@@ -600,13 +600,13 @@ describe("the mounted org runners routes (the census C7 org mount: the minted-se
     expect(parseUiRoute(`${RUNNERS_URL}/7`)).toMatchObject({ family: "org-actions-runners-edit", id: 7 });
     expect(parseUiRoute(`${RUNNERS_URL}/7/update-runner`)).toMatchObject({ family: "org-actions-runners-update", id: 7 });
     expect(parseUiRoute(`${RUNNERS_URL}/7/delete`)).toMatchObject({ family: "org-actions-runners-delete", id: 7 });
-    // Junk ids, deeper tails and the user namespace never claim; the literal
-    // beats the combo. The /user/settings/actions/runners shape stays
-    // UNCLAIMED (the user runners page is unlanded — the census C7 scope
-    // matrix's dead arm; the org block excludes the `user` first segment).
+    // Junk ids and deeper tails never claim; the literal beats the combo.
+    // The /user/settings/actions/runners shape FLIPPED at 72af05a — the
+    // user twin's own suite pins its mounted matrix; this org suite only
+    // asserts the org block's junk arms.
     expect(parseUiRoute(`${RUNNERS_URL}/junk`)).toBeNull();
     expect(parseUiRoute(`${RUNNERS_URL}/7/extra`)).toBeNull();
-    expect(parseUiRoute(`/user/settings/actions/runners`)).toBeNull();
+    expect(parseUiRoute(`/user/settings/actions/runners`)).toMatchObject({ family: "user-settings-actions-runners" });
     expect(handlesUiRoute(RUNNERS_URL)).toBe(true);
   });
 

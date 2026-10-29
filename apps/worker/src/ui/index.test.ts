@@ -416,6 +416,14 @@ describe("parseUiRoute", () => {
     ["/-/actions/artifacts/7/x/c2lnbmF0dXJl", null], // junk expiry
     ["/-/actions/artifacts/7/1893456000/c2lnbmF0dXJl/%zz", null], // undecodable tail
     ["/-/actions/other", null], // the /-/actions group claims only the artifacts subtree
+    // The org settings packages family (the nesting-bug guard — these shapes
+    // once sat inside the runners-delete arm and were unreachable).
+    ["/acme/settings/packages", { family: "org-settings-packages", owner: "acme" }],
+    ["/acme/settings/packages/rules/add", { family: "org-settings-packages-rule-add", owner: "acme" }],
+    ["/acme/settings/packages/rules/7", { family: "org-settings-packages-rule-edit", owner: "acme", id: 7 }],
+    ["/acme/settings/packages/rules/7/preview", { family: "org-settings-packages-rule-preview", owner: "acme", id: 7 }],
+    ["/acme/settings/packages/cargo/initialize", null], // the cargo tails stay unregistered
+    ["/acme/settings/packages/rules/junk", null], // non-numeric id
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {
