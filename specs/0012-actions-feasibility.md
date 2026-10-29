@@ -627,21 +627,43 @@ byte format, and uncompressed log objects stream fine. Reads (UI log panel,
    Actions reads them through the same service — no new posture).
 5. DBFS chunk rows → `action_log_chunks` D1 table (same shape, different engine) — §4.3.
 6. `repo_counters.run_index` instead of the `action_run_index` named sequence — §4.5.
-7. As-built (M1b, 10cfb97): the crypto-material home — §4.4/entry 2 spelled a
-   `wrangler secret` (the HS256 signing secret) plus an AES-encrypted PKCS-8
-   row in D1 (the RS256 keypair); both homes required shared files outside the
-   landing unit's exclusive ownership, so M1b persists BOTH in ONE private R2
-   object (`actions/_keystore/instance.json` — Worker-only readable, generated
+7. RESOLVED (3bc5d29) — the crypto-material home. History: §4.4/entry 2
+   spelled a `wrangler secret` (the HS256 signing secret) plus an
+   AES-encrypted PKCS-8 row in D1 (the RS256 keypair); both homes required
+   shared files outside the landing unit's exclusive ownership, so M1b
+   (10cfb97) persisted BOTH in ONE private R2 object
+   (`actions/_keystore/instance.json` — Worker-only readable, generated
    once, never rotated by code, the §4.2 namespace discipline) with
-   `loadKeystore` (`services/actions/secrets.ts`) as the single swap point;
-   landing the spelled homes replaces that function alone.
-8. As-built (M1b, 10cfb97): retention-var wiring pending — `retention.ts`
-   ships the §4.4 sweep arms PARAMETERIZED (the retention trio as arguments;
-   `stopZombieTasks` on its own always-on probe-gated block, upstream's
-   enabled-by-default `stop_zombie_tasks` cron having no retention knob); the
-   strict-polarity env-var caller (the hourly producer block + the
-   `{kind: "actions-retention"}` / `{kind: "actions-zombie"}` consumer arms)
-   was in flight, uncommitted at this as-built read.
+   `loadKeystore` (`services/actions/secrets.ts`) as the single swap point.
+   As-built resolution: upstream stores NEITHER piece in a models table
+   (the HS256 secret lives in the setting store, oauth2.go:129-150; the
+   RS256 key is an AppData PEM, oidc.go:40-54) — the ratified no-app.ini
+   substrate's D1 analog is the landed home: migration 0042's
+   `system_keystore` table (write-once rows, one per piece; rotation is
+   operator-only, exactly upstream's edit-app.ini-and-restart);
+   generate-once-save-back with the race loser adopting the winner's
+   material; the kid switched to upstream's exact
+   base64url(SHA-256(SPKI DER)) spelling (util/keypair.go:48-56); and a
+   one-time legacy adoption of M1b's R2 object on a cold D1 miss (the
+   adopted pieces only — the object itself is never written or deleted by
+   code).
+8. RESOLVED (3bc5d29) — the retention-var wiring. History: M1b (10cfb97)
+   shipped `retention.ts`'s §4.4 sweep arms PARAMETERIZED (the retention
+   trio as arguments) with the env-var caller in flight. As-built
+   resolution: the strict-polarity trio (ACTIONS_ARTIFACT_RETENTION_DAYS /
+   ACTIONS_LOG_RETENTION_DAYS / ACTIONS_RUN_RETENTION_DAYS — any value
+   other than a positive integer disarms that arm); the hourly producer
+   block (gate before the first D1 read → one indexed LIMIT-1 probe per
+   armed arm → at most ONE `{kind: "actions-retention"}` message CARRYING
+   the parsed values, so the consumer runs exactly what was armed); the
+   `{kind: "actions-zombie"}` pair riding the */10 step entry probe-gated
+   (upstream's `stop_zombie_tasks` is an always-on @every 5m cron with NO
+   retention knob, cron/tasks_actions.go:26-35 — hourly mounting would
+   have degraded zombie latency to ~70 min); two typed consumer arms in
+   `src/repos/purge.ts` before the purge fallback; and
+   `wrangler.jsonc.example` documents the trio fail-closed (a default
+   deployment NEVER deletes actions data — upstream's always-on defaults
+   are opt-in here).
 
 ## 5. Edge cases, limits, and failure modes
 
@@ -910,19 +932,26 @@ post-dating the §7 table:
   (creation-time writes only, upstream's shape). This is the posture M2's
   guide prose was corrected against.
 
-**Still open (honest at this as-built read, HEAD b7ef7e5):** C7's org-scope
-runners page in flight (`org-settings-actions-runners.tsx`, an uncommitted
-working-tree page); C3 (log tail + steps) and C4 (artifacts UI) in flight —
-the M1b-dependent units, so the six survey tail GETs (logs /
-workflow / artifacts-download / preview pair / badge.svg /
-workflow-dispatch-inputs) stay unclaimed and the survey's actions row reads
-PARTIAL (b7ef7e5); C5's rerun + rerun-failed DEFER to M3's job emitter (the
-census's flagged split — attempt creation + job re-emission are emitter
-territory; the cancel arm landed inside C2's window); C10's
-scoped-workflows pages defer with M3 (the census's own defer note); and M3
-(the trigger chain) stays staged behind Open question 1 — without it the
-control plane has no automatic producer, jobs arrive via the test-harness
-insertion seams (§3's own sentence).
+**Still open (honest at this as-built read — updated for the three closures
+below; the original read was HEAD b7ef7e5):** C7's org-scope runners page
+LANDED (3ab7532: the org Runners settings twin over the M1a store at the
+(orgId, '') scope, the WithAvailable cond porting upstream's org polarity —
+org's own + globals, a repo-scoped runner never lists in the org scope —
+with the shared OrgSettingsNavbar's Runners sub-item lit). C3 (log
+tail/steps) and C4 (artifacts preview UI + signed raw serving) LANDED in
+cd7eec4 with the routes mounted in the SAME commit — the previewLink flip
+went live beside the two index.ts route families (the repo preview subtree
+and the viewer-less root signed-raw family; the HMAC is the auth), the
+dead-link rule honored. Remaining: the C4 census tails — the per-name
+artifact download/delete pair (GET+DELETE
+/actions/runs/{run}/artifacts/{name}) — a separate unit. C5's rerun +
+rerun-failed still DEFER to M3's job emitter (the census's flagged split —
+attempt creation + job re-emission are emitter territory; the cancel arm
+landed inside C2's window); C10's scoped-workflows pages defer with M3
+(the census's own defer note); and M3 (the trigger chain) stays staged
+behind Open question 1 — without it the control plane has no automatic
+producer, jobs arrive via the test-harness insertion seams (§3's own
+sentence).
 
 ## As-built — M2 (0143e10, 2026-10-30)
 
