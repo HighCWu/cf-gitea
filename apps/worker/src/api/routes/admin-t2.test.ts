@@ -907,9 +907,12 @@ describe("DELETE /admin/users/{username} (adminDeleteUser)", () => {
     expect(await drizzle(env.DB).select().from(issueAssignees).all()).toHaveLength(0);
     expect(await drizzle(env.DB).select().from(userBadges).all()).toHaveLength(0);
     expect(await drizzle(env.DB).select().from(oauth2Applications).all()).toHaveLength(0);
+    // The cascade's action delete covers BOTH columns (the probe-caught fix,
+    // 2026-10-29): the neighbor's ACTOR row below dies with them now — the
+    // pre-fix cascade keyed the receiver column alone and this row survived
+    // (that orphan class was the live observation that caught the bug).
     const remainingActions = await drizzle(env.DB).select().from(actions).all();
-    expect(remainingActions).toHaveLength(1);
-    expect(remainingActions[0]).toMatchObject({ userId: adminId, actUserId: neighborId });
+    expect(remainingActions).toHaveLength(0);
   });
 
   it("404s a missing user", async () => {

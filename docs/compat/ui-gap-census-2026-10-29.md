@@ -525,3 +525,42 @@ the engine RPC slice; R14/R06/R07 as the second wave; the (b)-engine family
 9. **Member-only posture** — R06/R07 are `RequireMember: true` upstream;
    keep the 404-for-non-members posture rather than softening to public
    visibility (the survey's divergence-ledger discipline).
+
+---
+
+## Landing ledger (2026-10-29)
+
+Appended 2026-10-29 at HEAD `e5e1432`; every hash below was verified against
+`git log` before writing. Ten census rows closed (nine whole-row flips plus
+R20's applications arm), five units in flight, five SPEC'd — row → closing
+commit:
+
+| Row | Census class | Disposition | Commit(s) |
+|---|---|---|---|
+| R01 `GET /explore/organizations` | (a) | **LANDED** | `77e8567` (the `explore-organizations` family over the visibility-ladder org listing) |
+| R03 `GET /{username}/-/heatmap` | (a) | **LANDED** | `77e8567` (the web JSON route + the SSR widget arm in the profile feed) |
+| R06 `GET /org/{org}/dashboard[/{team}]` | (a) | **LANDED** | `77e8567` (member-gated 404-shell posture kept; the `/dashboard/-/heatmap` tail stays unclaimed — a recorded reduction) |
+| R07 `GET /org/{org}/issues\|pulls\|milestones[/{team}]` | (a) | **LANDED** | `77e8567` (the org-inbox family, member-ladder scope + the team arm) |
+| R08 `GET .../blame/...` | (b, engine) | **LANDED** | boundary RPC `aa1fb29`; page + the file-view Blame anchor `77e8567` |
+| R14 `GET .../activity[/{period}]` | (b, engine) | **LANDED** | page counts-first `5f5e167` → `activityStats` RPC `7a310b3` (SPEC-0015 M2a) → shell Activity tab + route wiring `77e8567` → the engine upgrade (numstat trio) `c14359c` |
+| R19 `GET /{org}/teams/{team}` name-keyed | (a) | **LANDED** | `77e8567` (the name carrier; the merged members+repositories slice stays, the census's recorded closer-port call) |
+| R20 applications arm ("R20a") | (a) | **LANDED** | `77e8567` (`org-settings-applications.tsx` behind the org-admin gate; row R20 itself stays PARTIAL — its audit arm is R13's) |
+| R21 `GET .../raw/...` | (d) | **LANDED** | `77e8567` (the raw-file family incl. the deprecated legacy-guess catch-all; `links.ts` switched to the upstream web shape — the tier-1 API link divergence is retired) |
+| R22 `GET .../media/...` | (d) | **LANDED** | `77e8567` (the media-file family with LFS pointer resolution through the landed store) |
+| R10 in-repo code search | (b, engine) | RPC **LANDED**; page **IN FLIGHT** | RPC `0644597` (SPEC-0015 M1: exact/words/regexp, the regexp arm a step-counted NFA, all four budgets explicit); page `pages/repo-search.tsx` uncommitted at append time |
+| R13 `.../settings/audit_logs` (+R20 arm) | (b, model) | Model **LANDED**; page **IN FLIGHT** | Model `5c8853c` (SPEC-0015 M4: `audit_event` table, migration 0038, emit seam, 90-day retention); page `pages/settings-audit-logs.tsx` uncommitted |
+| R15 activity charts | (b, engine) | RPC **LANDED**; pages **IN FLIGHT** | RPC `449400a` (SPEC-0015 M2b `contributorStats`); pages `pages/repo-charts.tsx` uncommitted |
+| R09 `GET .../graph` | (b, engine) | **SPEC'D**; RPC **IN FLIGHT** | SPEC-0017 accepted (`0717de7`, draft `8dd664b`); the `graphData` RPC is in the working tree, absent at HEAD |
+| R11 `.../settings/lfs[/...]` | (b) | **SPEC'D**; pages not yet dispatched | The pointer-scan prerequisite is SPEC-0015's M3 (`5025476`, accepted; M3 pending at the boundary) |
+| R04 / R16 packages | (c) | **SPEC'D**; M1 **IN FLIGHT** | SPEC-0016 accepted (`8dd664b` draft, `0717de7`); M1 routes + services + migration 0039 uncommitted; the R04/R16 UI pages stay downstream of the API |
+| R18/R20 remaining (b) arms — admin config/notices/auths | (b) | **SPEC'D**; nothing built | SPEC-0018 accepted (`36d9b52`: notices BUILD, config BUILD read-only, auths OMIT) |
+| R02 + R05 code search (explore, user) | (d) | **UNCHANGED** | The grep RPC deliberately does not open them (SPEC-0015 out-of-scope: the indexer-class subsystem is the gate) |
+| R12 + R17 Actions settings/run surface | (c) | **UNCHANGED** | The SPEC-0012 demand gate stands |
+
+Ledger arithmetic: the survey's tick-16 headline **94/5/17** moves to
+**103 LANDED / 2 PARTIAL / 11 ABSENT** of 116 when the survey's next formal
+tick re-walks programmatically — nine whole-row flips (six ABSENT → LANDED:
+R01/R03/R06/R07/R08/R14; three PARTIAL → LANDED: R19/R21/R22), R18 and R20
+staying PARTIAL with their landed arms recorded above. The tick itself is
+not part of this ledger; per-row status remains the survey's authority until
+it runs.

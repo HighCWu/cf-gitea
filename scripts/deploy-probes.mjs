@@ -3661,8 +3661,22 @@ const demoConfigDrift = (config, label) => {
       drift.push(`${label}: no repo-tasks-dlq consumer entry (§3.0/M0)`);
     }
   }
-  if (config?.vars?.DEMO_MODE !== "false") {
-    drift.push(`${label}: vars.DEMO_MODE is ${JSON.stringify(config?.vars?.DEMO_MODE)} (expected the "false" default — the §2 hard invariant)`);
+  // DEMO_MODE posture (revised 2026-10-29): the §2 hard invariant binds the
+  // EXAMPLE template (a default self-host deployment never arms) — the
+  // example MUST carry "false". The LIVE wrangler.jsonc may carry either:
+  // "false" (self-host posture) or "true" ONLY as the deliberate reference-
+  // instance posture, which is exactly characterized by the demo custom
+  // domain route — armed without the route would put the bare workers.dev
+  // surface into demo quotas with no demo face, which is never intended.
+  // Pre-revision this check hard-required "false" in both files and false-
+  // fired on every post-demo-launch deploy (observed run of 2026-10-29).
+  const demoRoute = Array.isArray(config?.routes) && config.routes.some((r) => typeof r?.pattern === "string" && r.pattern.includes("cf-gitea-demo"));
+  if (config?.vars?.DEMO_MODE === "true") {
+    if (label === "wrangler.jsonc.example" || !demoRoute) {
+      drift.push(`${label}: vars.DEMO_MODE "true" ${label === "wrangler.jsonc.example" ? "in the example template (the §2 hard invariant — a default deployment never arms)" : "without the cf-gitea-demo route (armed demo posture on a bare surface is never the intent)"}`);
+    }
+  } else if (config?.vars?.DEMO_MODE !== "false") {
+    drift.push(`${label}: vars.DEMO_MODE is ${JSON.stringify(config?.vars?.DEMO_MODE)} (expected "false", or "true" with the demo route)`);
   }
   return drift;
 };

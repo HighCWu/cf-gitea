@@ -44,7 +44,7 @@
  * as upstream's `HasUsers` over the unified user table.
  */
 
-import { asc, eq, inArray, sql } from "drizzle-orm";
+import { asc, eq, inArray, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -503,7 +503,12 @@ export async function deleteUserCascade(
     db.delete(issueAssignees).where(eq(issueAssignees.assigneeId, userId)),
     db.delete(userBadges).where(eq(userBadges.userId, userId)),
     db.delete(oauth2Applications).where(eq(oauth2Applications.uid, userId)),
-    db.delete(actions).where(eq(actions.userId, userId)),
+    // BOTH action columns: userId is the RECEIVER side, actUserId the ACTOR
+    // — the mirror of upstream's delete keyed the receiver alone, so every
+    // deleted user's create_repo actor rows orphaned (probe-caught 2026-10-29:
+    // the fw battery's user-deletes left action id 387 behind; user 55 gone,
+    // act_user_id 55 row survived).
+    db.delete(actions).where(or(eq(actions.userId, userId), eq(actions.actUserId, userId))),
     // (c) the row — the FK cascades carry the rest of the census.
     db.delete(users).where(eq(users.id, userId)),
   ]);
