@@ -180,7 +180,6 @@ export async function loadLfsPointerRows(
 ): Promise<LfsPointerScanAnswer> {
   const result = await scan(options.ref ?? undefined);
   if (result === null) return { answer: null };
-  const db = drizzle(d1);
 
   // The candidate set can hold one row per path; upstream's table is one row
   // per unique pointer blob — dedup by GIT blob oid, first (tree order) wins.
@@ -212,7 +211,7 @@ export async function loadLfsPointerRows(
 
     const inRepo = await getLfsMetaObject(d1, options.repoId, pointer.oid) !== null;
 
-    let stat: LfsObjectStat | null = null;
+    let stat: LfsObjectStat | null;
     try {
       stat = await store.head(lfsKey(options.storageKey, pointer.oid));
     } catch {
