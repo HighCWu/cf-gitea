@@ -20,12 +20,21 @@ import { repoSettings, repoUnits, repositories } from "../../db/schema";
  * `repo_id`, upstream keeps the columns on the repository row) so the hot
  * `repositories` schema stays untouched.
  *
- * Defaults are the landed house posture: code/issues/pulls/releases/wiki
- * enabled, projects/packages/actions disabled (upstream's DefaultRepoUnits at
- * the pin actually enables projects, packages AND actions —
- * models/unit/unit.go:60-72; the disabled-on-arrival trio is a documented
- * house divergence, the default-false render posture), with empty
- * description/website.
+ * Defaults: upstream arms the full DefaultRepoUnits at creation (code/
+ * issues/pulls/releases/wiki/projects/packages/actions — models/unit/
+ * unit.go:66-75), and since the 2026-10-29 upstream-parity flip the
+ * creation writer does too: every repo is born with a seeded settings row
+ * whose has_actions/has_packages follow upstream's per-kind unit lists
+ * (actions + packages armed for normal creates; forks get neither;
+ * mirrors get packages only — the DefaultRepoUnits switch,
+ * services/repository/create.go:349-355; the seeding lives in
+ * repos/service.ts create, one batch with the repository row). Projects
+ * remains the one documented house divergence at creation (still false).
+ * DEFAULT_REPO_SETTINGS below is deliberately the PRE-FLIP posture: it is
+ * the missing-row fallback, and a missing row means a repo created before
+ * the flip (or a hand-seeded row) — the on-disk posture of existing repos
+ * is preserved, exactly as upstream's unit rows are written at creation
+ * only.
  */
 
 /**
@@ -63,7 +72,11 @@ export interface RepoSettings {
   hasActions: boolean;
 }
 
-/** The upstream-default settings (what every repo renders before a PATCH). */
+/** The missing-row fallback settings — deliberately the PRE-FLIP posture
+ *  (actions/packages off). Repos created since the 2026-10-29 default-units
+ *  flip carry a seeded row (repos/service.ts create) whose stored flags
+ *  win; this fallback renders only for rows-missing repos (pre-flip
+ *  creations, hand-seeded rows), preserving their on-disk posture. */
 export const DEFAULT_REPO_SETTINGS: RepoSettings = {
   description: "",
   website: "",

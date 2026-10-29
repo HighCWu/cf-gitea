@@ -142,7 +142,9 @@ async function seedRepo(owner: { id: number; usernameLower: string }, name: stri
     isPrivate,
     status: "ready",
   });
-  await db().insert(repoSettings).values({ repoId: repo.id, hasProjects: true });
+  // Creation now seeds the row (the upstream DefaultRepoUnits flip) — the
+  // fixture's projects arm rides the conflict update.
+  await db().insert(repoSettings).values({ repoId: repo.id, hasProjects: true }).onConflictDoUpdate({ target: repoSettings.repoId, set: { hasProjects: true } });
   return repo;
 }
 

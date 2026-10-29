@@ -116,6 +116,9 @@ export async function createFork(
     name: input.name,
     isPrivate: source.visibility === "private",
     status: "creating",
+    // Upstream forks get DefaultForkRepoUnits (code + pulls) at birth —
+    // no actions/packages units (create.go:351-352's isFork arm).
+    creationKind: "fork",
   });
 
   // Upstream copies DefaultBranch + Description + IsPrivate at insert time.

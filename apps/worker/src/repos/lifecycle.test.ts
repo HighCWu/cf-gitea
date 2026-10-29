@@ -2,7 +2,9 @@
  * Repo lifecycle — SPEC-0003 §2.5 (M2): rename/redirects, transfer,
  * visibility (repo + owner), ACL rows 4/5/10/13, delete ordering (§2.5.5,
  * §4.2 push-during-delete), §4.8 recreate-with-fresh-storage_key, the
- * SPEC-0008 `assets` reservation and the §2.5.1 counter seeding.
+ * SPEC-0008 `assets` reservation, the §2.5.1 counter seeding, and the
+ * 2026-10-29 creation default-units seeding (the upstream DefaultRepoUnits
+ * parity flip — actions/packages posture per creationKind).
  *
  * Real D1 + real engine DOs/R2 (SELF.fetch + direct service calls).
  */
@@ -15,6 +17,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import type { RepositoryRow, RepositoryWithOwner } from "../api/services/repository";
+import { loadRepoSettings, saveRepoSettings } from "../api/services/repo-settings";
 import {
   RepoNameCollisionError,
   RepoNameInvalidError,
@@ -26,7 +29,7 @@ import {
 import { carryRepoCell } from "./carry";
 import { purgeRepoMessage, tombstoneRepoDO } from "./purge";
 import { settleCreatingRepo } from "../git-http/gate";
-import { protectedBranches, repoCounters, repoRedirects, repositories, repoTransfer, repoUnits, stars, users } from "../db/schema";
+import { protectedBranches, repoCounters, repoRedirects, repoSettings, repositories, repoTransfer, repoUnits, stars, users } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createWikiPage, readWikiPage } from "../services/wiki";
 import { starRepo } from "../api/services/stars";
@@ -45,7 +48,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["personal_access_tokens", "protected_branches", "repo_units", "repo_transfer", "repo_redirects", "repo_counters", "stars", "repositories"]) {
+  for (const table of ["personal_access_tokens", "protected_branches", "repo_units", "repo_settings", "repo_transfer", "repo_redirects", "repo_counters", "stars", "repositories"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare("DELETE FROM users WHERE username_lower != 'assets'").run();
@@ -1570,5 +1573,92 @@ describe("SPEC-0008 'assets' reservation and create bookkeeping", () => {
     expect((await env.REPO_PACKS.list({ prefix: "repos/forged-key/" })).objects).toHaveLength(0);
     const keyed = await env.REPO_PACKS.list({ prefix: `repos/${repo.storageKey}/packs/` });
     expect(keyed.objects.length).toBeGreaterThan(0);
+  });
+});
+
+describe("creation default-units seeding (the 2026-10-29 upstream-parity flip, create.go:349-355)", () => {
+  /** The actions unit row presence — the runner scan's join gate. */
+  const actionsRow = async (repoId: string) =>
+    drizzle(env.DB)
+      .select({ type: repoUnits.type })
+      .from(repoUnits)
+      .where(eq(repoUnits.repoId, repoId))
+      .all()
+      .then((rows) => rows.some((row) => row.type === "actions"));
+
+  it("arms actions + packages on a normal create: settings row seeded and the repo_units actions row written (DefaultRepoUnits, unit.go:66-75)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "armed");
+
+    const settings = await loadRepoSettings(env.DB, repo.id);
+    expect(settings.hasActions).toBe(true);
+    expect(settings.hasPackages).toBe(true);
+    // has_projects stays the documented house divergence (upstream arms it).
+    expect(settings.hasProjects).toBe(false);
+    expect(await actionsRow(repo.id)).toBe(true);
+  });
+
+  it("a fork-kind create leaves actions and packages off with no actions row (DefaultForkRepoUnits, unit.go:80-83)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const repo = await service().create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "forked",
+      isPrivate: false,
+      creationKind: "fork",
+    });
+
+    const settings = await loadRepoSettings(env.DB, repo.id);
+    expect(settings.hasActions).toBe(false);
+    expect(settings.hasPackages).toBe(false);
+    expect(await actionsRow(repo.id)).toBe(false);
+  });
+
+  it("a mirror-kind create arms packages but not actions (DefaultMirrorRepoUnits, unit.go:86-93)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const repo = await service().create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "mirrored",
+      isPrivate: false,
+      creationKind: "mirror",
+    });
+
+    const settings = await loadRepoSettings(env.DB, repo.id);
+    expect(settings.hasActions).toBe(false);
+    expect(settings.hasPackages).toBe(true);
+    expect(await actionsRow(repo.id)).toBe(false);
+  });
+
+  it("the settings toggle still disables a creation-armed repo cleanly (the c1cefaa lockstep: flag and row fall together)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "toggle-off");
+    expect(await actionsRow(repo.id)).toBe(true);
+
+    // The PATCH's disable arm (saveRepoSettings' delete-unit branch) on a
+    // repo the CREATION seeded: the flag flips and the actions row dies in
+    // one batch — a created repo and a toggle-enabled one behave alike.
+    await saveRepoSettings(env.DB, repo.id, { hasActions: false }, new Date());
+
+    const settings = await loadRepoSettings(env.DB, repo.id);
+    expect(settings.hasActions).toBe(false);
+    expect(await actionsRow(repo.id)).toBe(false);
+
+    // Re-enabling restores the row (the insert arm is conflict-tolerant).
+    await saveRepoSettings(env.DB, repo.id, { hasActions: true }, new Date());
+    expect((await loadRepoSettings(env.DB, repo.id)).hasActions).toBe(true);
+    expect(await actionsRow(repo.id)).toBe(true);
+  });
+
+  it("deleting the repo sweeps the seeded settings and actions rows (the §2.5.5 cascade covers the new writes)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "swept");
+    await service().deleteRepository(repo.id);
+
+    expect(await actionsRow(repo.id)).toBe(false);
+    const stored = await drizzle(env.DB)
+      .select({ repoId: repoSettings.repoId })
+      .from(repoSettings)
+      .where(eq(repoSettings.repoId, repo.id))
+      .get();
+    expect(stored).toBeUndefined();
   });
 });

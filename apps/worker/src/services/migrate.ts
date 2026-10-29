@@ -220,6 +220,11 @@ export async function migrateRepository(
       owner: { id: owner.id, usernameLower: owner.usernameLower },
       name: options.repo_name,
       isPrivate: options.private === true,
+      // A mirror migration births a DefaultMirrorRepoUnits repo upstream
+      // (CreateRepositoryDirectly's IsMirror arm, gitea_uploader.go:108 →
+      // create.go:353-354): packages armed, actions not. A plain migration
+      // takes the normal posture.
+      creationKind: options.mirror === true ? "mirror" : "normal",
     });
   } catch (error) {
     if (error instanceof RepoNameCollisionError) {

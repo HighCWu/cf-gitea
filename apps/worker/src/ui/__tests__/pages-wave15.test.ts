@@ -396,13 +396,16 @@ describe("GET /{owner}/{repo}/settings/branches (the rules list)", () => {
     const fixture = await ensureWave15Fixtures();
     const db = drizzle(env.DB);
     const row = (await db.select().from(repositories).where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave15"))).get())!;
-    // The reduced default: no repo_settings row renders no Actions block.
+    // The reduced arm: creation now seeds actions-ON (the upstream
+    // DefaultRepoUnits flip) — drive the OFF polarity explicitly through the
+    // landed lockstep writer so both polarities stay pinned.
+    await db.update(repoSettings).set({ hasActions: false }).where(eq(repoSettings.repoId, row.id));
     const reduced = await fetchUi("/alice/wave15/settings/branches", withCookie(fixture.ownerCookie));
     expect(reduced.status).toBe(200);
     expect(await reduced.text()).not.toContain("/settings/actions/secrets");
     // The armed flip through the REAL route: the handler's data literal
     // passes the loadRepoSettings flag (the settings.tsx hasActions prop).
-    await db.insert(repoSettings).values({ repoId: row.id, hasActions: true }).onConflictDoNothing();
+    await db.insert(repoSettings).values({ repoId: row.id, hasActions: true }).onConflictDoUpdate({ target: repoSettings.repoId, set: { hasActions: true } });
     try {
       const armed = await fetchUi("/alice/wave15/settings/branches", withCookie(fixture.ownerCookie));
       expect(armed.status).toBe(200);

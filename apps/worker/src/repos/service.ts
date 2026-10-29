@@ -281,11 +281,42 @@ export interface CreateRepoInput {
   isPrivate: boolean;
   /** 'creating' for push-create (§2.5.2); 'ready' for API creates. */
   status?: "ready" | "creating";
+  /** The create-time default-units posture selector (upstream's
+   *  DefaultRepoUnits switch, services/repository/create.go:349-355).
+   *  "normal" — the default — arms actions + packages (DefaultRepoUnits,
+   *  models/unit/unit.go:66-75); "fork" leaves both off
+   *  (DefaultForkRepoUnits, unit.go:80-83); "mirror" arms packages only
+   *  (DefaultMirrorRepoUnits, unit.go:86-93). Generate-from-template needs
+   *  no kind: upstream's GenerateRepository creates with the NORMAL list
+   *  (template.go:90 passes isFork=false and leaves IsTemplate unset). */
+  creationKind?: RepoCreationKind;
   /** SPEC-0015 §4.2: the audit event's origin hint. Service-level v1 default
    *  "api" (every current call site is an API route or the git push-create
    *  settle); the downstream audit wave threads the real per-request origin. */
   origin?: AuditOrigin;
 }
+
+/** The creation kinds that select a default-units posture (see
+ *  CreateRepoInput.creationKind). */
+export type RepoCreationKind = "normal" | "fork" | "mirror";
+
+/**
+ * The actions/packages arming per creation kind — the 2026-10-29
+ * upstream-parity flip of the creation defaults. Upstream's
+ * createRepositoryInDB inserts a repo_units row per DefaultRepoUnits entry
+ * in the same transaction (create.go:347-395), and the has_* state IS the
+ * unit presence there (UnitEnabled reads the rows, models/repo/repo.go
+ * :385-391); our reduction seeds the `repo_settings` side row (the flag
+ * store) plus the `repo_units` actions row (the owner-scope runner scan's
+ * join gate) with the same per-kind posture. `has_projects` stays false for
+ * every kind — the remaining documented house divergence (upstream arms it
+ * for normal/mirror/template; flipping it is its own alignment).
+ */
+const CREATION_UNIT_POSTURE: Record<RepoCreationKind, { actions: boolean; packages: boolean }> = {
+  normal: { actions: true, packages: true },
+  fork: { actions: false, packages: false },
+  mirror: { actions: false, packages: true },
+};
 
 export class RepoService {
   private readonly db: DrizzleD1Database;
@@ -318,14 +349,18 @@ export class RepoService {
    * SPEC's insert→last_row_id→UPDATE note; with client-minted TEXT ids the
    * unique placeholder merely keeps the UNIQUE column satisfied
    * mid-transaction). Also performs the §4.11 shadow rule (create at a
-   * redirected name consumes the redirect), seeds the issue/PR counter row,
-   * and mirrors the repo into the engine Registry.
+   * redirected name consumes the redirect), seeds the issue/PR counter row
+   * (post-batch, seedRepoExtras), seeds the default-units posture (the
+   * `repo_settings` row + the `repo_units` actions row, per creationKind —
+   * upstream inserts the DefaultRepoUnits rows in the same transaction,
+   * create.go:347-395), and mirrors the repo into the engine Registry.
    */
   async create(input: CreateRepoInput): Promise<RepoRow> {
     if (!isUsableRepoName(input.name)) throw new RepoNameInvalidError(input.name);
     const lower = input.name.toLowerCase();
     const id = crypto.randomUUID();
     const createdAt = new Date();
+    const posture = CREATION_UNIT_POSTURE[input.creationKind ?? "normal"];
     try {
       await this.db.batch([
         this.db.insert(repositories).values({
@@ -348,6 +383,28 @@ export class RepoService {
           .update(repositories)
           .set({ storageKey: sql`'r_' || ${repositories.id}` })
           .where(eq(repositories.id, id)),
+        // The default-units seed (the upstream-parity flip, 2026-10-29): the
+        // settings side row (the has_* flag store) with the per-kind
+        // actions/packages posture, and — when the posture arms actions —
+        // the `repo_units` actions row (the runner scan's join gate; the
+        // same row the settings toggle's enable arm writes, so a created
+        // repo and a toggle-enabled one are indistinguishable downstream).
+        // One batch = one SQLite transaction: the flags and the row commit
+        // atomically with the repository row, upstream's units-insert shape.
+        this.db.insert(repoSettings).values({
+          repoId: id,
+          description: "",
+          website: "",
+          hasIssues: true,
+          hasWiki: true,
+          hasPullRequests: true,
+          hasReleases: true,
+          hasProjects: false,
+          hasPackages: posture.packages,
+          hasActions: posture.actions,
+          updatedAt: createdAt,
+        }),
+        ...(posture.actions ? [this.db.insert(repoUnits).values({ repoId: id, type: "actions" })] : []),
         // §4.11: creating at a live redirect consumes it (redirect rows are
         // not part of the repo namespace; upstream's IsUsableRepoName ignores
         // them, and NewRedirect's delete-first keeps at most one row).
