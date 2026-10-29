@@ -678,21 +678,25 @@ describe("the panel's team render contract", () => {
   });
 
   it("lights the nav's Actions block only while repo_settings.has_actions is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
-    // The reduced default: no repo_settings row renders no Actions block.
-    const reduced = await fetchUi(PAINT_PATH, { headers: { cookie: await sessionHeader(fx.ownerId) } });
-    expect(reduced.status).toBe(200);
-    expect(await reduced.text()).not.toContain("/settings/actions/secrets");
-    // The armed flip: the unit-flag row lights the <details> + sub-items.
+    // b0e1d88's creation-default flip seeds the ARMED row at create
+    // (DefaultRepoUnits) — drive the polarity explicitly (the wave15 idiom):
+    // the disabled row renders no Actions block.
     const db = drizzle(env.DB);
-    await db.insert(repoSettings).values({ repoId: fx.paint.id, hasActions: true }).onConflictDoNothing();
+    await db.update(repoSettings).set({ hasActions: false }).where(eq(repoSettings.repoId, fx.paint.id));
     try {
+      const reduced = await fetchUi(PAINT_PATH, { headers: { cookie: await sessionHeader(fx.ownerId) } });
+      expect(reduced.status).toBe(200);
+      expect(await reduced.text()).not.toContain("/settings/actions/secrets");
+      // The armed flip: the unit-flag row lights the <details> + sub-items.
+      await db.update(repoSettings).set({ hasActions: true }).where(eq(repoSettings.repoId, fx.paint.id));
       const armed = await fetchUi(PAINT_PATH, { headers: { cookie: await sessionHeader(fx.ownerId) } });
       expect(armed.status).toBe(200);
       const html = await armed.text();
       expect(html).toContain('href="/scm-owner/scm-paint/settings/actions/secrets"');
       expect(html).toContain('href="/scm-owner/scm-paint/settings/actions/variables"');
     } finally {
-      await db.delete(repoSettings).where(eq(repoSettings.repoId, fx.paint.id));
+      // Restore the creation-default armed posture for later tests in the file.
+      await db.update(repoSettings).set({ hasActions: true }).where(eq(repoSettings.repoId, fx.paint.id));
     }
   });
 

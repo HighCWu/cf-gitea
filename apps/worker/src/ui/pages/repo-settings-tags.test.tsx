@@ -652,7 +652,10 @@ describe("the mounted list route (GET+POST /{owner}/{repo}/settings/tags) — th
 
   it("lights the nav's Actions block only while repo_settings.has_actions is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
     const db = drizzle(env.DB);
-    // The reduced default: no repo_settings row renders no Actions block.
+    // The reduced phase: the fixture hand-seeds the repository row (raw
+    // INSERT, no RepoService.create), so b0e1d88's creation-default ARMED
+    // seed never fires and no repo_settings row exists — the store default
+    // renders no Actions block.
     const reduced = await adminGet(`${REPO_PATH}/settings/tags`);
     expect(reduced.status).toBe(200);
     expect(await reduced.text()).not.toContain("/settings/actions/secrets");

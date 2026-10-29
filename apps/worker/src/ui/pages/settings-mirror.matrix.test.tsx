@@ -304,21 +304,25 @@ describe("the gates on a private mirror repo (anon/stranger/owner/admin)", () =>
   it("lights the nav's Actions block only while repo_settings.has_actions is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
     const fx = await ensureFixtures();
     const db = drizzle(env.DB);
-    // The reduced default: no repo_settings row renders no Actions block.
-    const reduced = await get("/smx-owner/smx-vault/settings/mirror", "smx-owner");
-    expect(reduced.status).toBe(200);
-    expect(await reduced.text()).not.toContain("/settings/actions/secrets");
-    // The armed flip through the REAL route: loadMirrorSettings rides the
-    // unit-flags read (the settings.tsx hasActions prop).
-    await db.insert(repoSettings).values({ repoId: fx.vaultId, hasActions: true }).onConflictDoNothing();
+    // b0e1d88's creation-default flip seeds the ARMED row at create
+    // (DefaultRepoUnits) — drive the polarity explicitly (the wave15 idiom):
+    // the disabled row renders no Actions block.
+    await db.update(repoSettings).set({ hasActions: false }).where(eq(repoSettings.repoId, fx.vaultId));
     try {
+      const reduced = await get("/smx-owner/smx-vault/settings/mirror", "smx-owner");
+      expect(reduced.status).toBe(200);
+      expect(await reduced.text()).not.toContain("/settings/actions/secrets");
+      // The armed flip through the REAL route: loadMirrorSettings rides the
+      // unit-flags read (the settings.tsx hasActions prop).
+      await db.update(repoSettings).set({ hasActions: true }).where(eq(repoSettings.repoId, fx.vaultId));
       const armed = await get("/smx-owner/smx-vault/settings/mirror", "smx-owner");
       expect(armed.status).toBe(200);
       const html = await armed.text();
       expect(html).toContain('href="/smx-owner/smx-vault/settings/actions/secrets"');
       expect(html).toContain('href="/smx-owner/smx-vault/settings/actions/variables"');
     } finally {
-      await db.delete(repoSettings).where(eq(repoSettings.repoId, fx.vaultId));
+      // Restore the creation-default armed posture for later tests in the file.
+      await db.update(repoSettings).set({ hasActions: true }).where(eq(repoSettings.repoId, fx.vaultId));
     }
   });
 

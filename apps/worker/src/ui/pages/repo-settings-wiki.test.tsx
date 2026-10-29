@@ -116,7 +116,10 @@ describe("loadRepoWikiSettings (the PATCH arm's store, read side)", () => {
 
   it("lights the nav's Actions block only while the stored has_actions flag is set (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
     const { saveRepoSettings } = await import("../../api/services/repo-settings");
-    // The reduced default (no repo_settings row) renders no Actions block.
+    // The reduced phase: the fixture hand-seeds the repository row and
+    // beforeEach wipes repo_settings, so b0e1d88's creation-default ARMED
+    // seed never fires — the no-row store default renders no Actions block
+    // (the loader-seam read, not the mounted creation pipeline).
     const reduced = await loadRepoWikiSettings(env.DB, repo);
     expect(reduced.hasActions).toBe(false);
     expect(renderToString(<PageForTest data={reduced} error={null} saved={false} />)).not.toContain(
