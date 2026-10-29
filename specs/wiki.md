@@ -39,7 +39,7 @@ the upstream commit-message templates.
   engine-path `.wiki` handling, the R2 carry/purge follow-ups) is — LANDED 2026-10-29 (the carried <parent-key>.wiki scheme; slash-free per the engine storage-key grammar)
   `handleWikiGitRoute`'s module doc in `src/git-http/gate.ts`.
 - **Web-UI wiki pages** (`/{owner}/{repo}/wiki/...` HTML).
-- **Repo-delete cascade**: `src/repos/purge.ts` does not yet tombstone/destroy
+ * Repo-delete cascade: CLOSED — purge.ts tombstones/purges the .wiki cell and its R2 prefixes (0b619be + 2de9def); the wiki DELETE hole closed at 99db2c1.
   the sibling `.wiki` cell — deleting a repo orphans its wiki storage. Flagged
   to the purge owner; no `src/repos/**` file is touched by this batch.
 - **Unit gating** (`mustEnableUnit(unit.TypeWiki)`, api.go:1391): the landed

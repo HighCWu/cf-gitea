@@ -177,22 +177,22 @@ Upstream `ActionType` (`action.go:23-56`), numeric values preserved:
 | 4 | watch_repo | never | same — never written upstream |
 | 5 | commit_repo | DEFERRED | git-http push path — outside this batch's file ownership (`git-http/**` untouchable) |
 | 6 | create_issue | YES | issue-events `issues` action=opened |
-| 7 | create_pull_request | DEFERRED | PR opens emit through routes/pulls.ts' LOCAL `emitPullWebhook` seam, not `emitIssueEvent` |
+| 7 | create_pull_request | WIRED (pulls.ts/releases.ts local seams since 64ade9f; recounted 14/27 at the v1.3 final sync) | PR opens emit through routes/pulls.ts' LOCAL `emitPullWebhook` seam, not `emitIssueEvent` |
 | 8 | transfer_repo | DEFERRED | transfer is a pending-202 with NO emission (repo-events header: upstream's webhook parity is equally silent) |
 | 9 | push_tag | DEFERRED | git-http push path |
 | 10 | comment_issue | YES | issue-events `issue_comment` action=created (content `index|body`) |
-| 11 | merge_pull_request | DEFERRED | pulls.ts local seam |
+| 11 | merge_pull_request | WIRED (pulls.ts/releases.ts local seams since 64ade9f; recounted 14/27 at the v1.3 final sync) | pulls.ts local seam |
 | 12 | close_issue | YES | issue-events `issues` action=closed (content `index|`) |
 | 13 | reopen_issue | YES | issue-events `issues` action=reopened |
-| 14 | close_pull_request | DEFERRED | pulls.ts local seam |
-| 15 | reopen_pull_request | DEFERRED | pulls.ts local seam |
+| 14 | close_pull_request | WIRED (pulls.ts/releases.ts local seams since 64ade9f; recounted 14/27 at the v1.3 final sync) | pulls.ts local seam |
+| 15 | reopen_pull_request | WIRED (pulls.ts/releases.ts local seams since 64ade9f; recounted 14/27 at the v1.3 final sync) | pulls.ts local seam |
 | 16 | delete_tag | DEFERRED | git-http push path |
 | 17 | delete_branch | DEFERRED | git-http push path |
 | 18-20 | mirror_sync_* | DEFERRED | import/mirror path emits `repository` created instead (documented divergence) |
 | 21 | approve_pull_request | YES | issue-events `pull_request_review_approved` (content `index|review body`) |
 | 22 | reject_pull_request | YES | issue-events `pull_request_review_rejected` |
 | 23 | comment_pull | YES | issue-events `pull_request_comment` created + `pull_request_review_comment` (upstream: PR comments and review comments are both ActionCommentPull, notifier.go:99-124/207-275) |
-| 24 | publish_release | DEFERRED | releases.ts LOCAL `emitReleaseWebhook` seam |
+| 24 | publish_release | WIRED (pulls.ts/releases.ts local seams since 64ade9f; recounted 14/27 at the v1.3 final sync) | releases.ts LOCAL `emitReleaseWebhook` seam |
 | 25 | pull_review_dismissed | DEFERRED | no webhook event type exists for dismissals (HookEventType union has none) |
 | 26 | pull_request_ready_for_review | DEFERRED | no landed seam (pulls.ts) |
 | 27 | auto_merge_pull_request | DEFERRED | pull-automerge arm, pulls.ts family |
