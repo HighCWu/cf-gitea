@@ -225,9 +225,12 @@ const SCHEMA_VERSION = 1;
 const REGRESSION_THRESHOLD = 0.1; // >10% delta counts as a regression (SPEC-0001 §9)
 // Overhead-class metrics fail only when the worse-delta exceeds BOTH the
 // percentage band AND this absolute floor (see TOLERANCE CLASSES in the
-// header; calibrated above the 131 ms largest observed identical-code noise
-// delta — CI run 40710895496, inforefs p95).
-const OVERHEAD_ABS_FLOOR_MS = 150;
+// header; calibrated above the largest observed identical-code noise delta —
+// inforefs p95, the single worst-behaved micro-metric: 131 ms (run
+// 40710895496) then 181 ms (run 40829486610, whose failed-job rerun passed
+// — the spike was a throttled runner's one slow poll, not code); floor
+// raised 150→200 over that observed range, 2026-10-29).
+const OVERHEAD_ABS_FLOOR_MS = 200;
 // Byte-overhead class: push_bytes' residual variance is framing-level, not
 // content-level. The pinned cycles (see benchSize) make every pushed pack
 // structurally identical, leaving only zlib's compressed-length wobble on the
