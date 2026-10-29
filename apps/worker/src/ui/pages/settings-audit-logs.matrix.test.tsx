@@ -280,22 +280,26 @@ describe("loadSettingsAuditLogs — the repo scope", () => {
 
   it("carries the nav's Actions flag on the repository scope only (navbar.tmpl:47's unit conditional — the hasActions threading)", async () => {
     const repoScope: AuditScopePair = { type: "repository", id: repo.id };
-    // No repo_settings row — the store default reads false on both scopes.
-    expect((await loadSettingsAuditLogs(env.DB, repoScope, new URLSearchParams())).hasActions).toBe(false);
-    expect(
-      (await loadSettingsAuditLogs(env.DB, { type: "organization", id: String(org.id) }, new URLSearchParams())).hasActions,
-    ).toBe(false);
-    // The armed repo row lights the repo scope; the org scope stays false
-    // (its navbar carries no Actions block).
     const db = drizzle(env.DB);
-    await db.insert(repoSettings).values({ repoId: repo.id, hasActions: true }).onConflictDoNothing();
+    // b0e1d88's creation-default flip seeds the ARMED row at create
+    // (DefaultRepoUnits) — drive the polarity explicitly (the wave15 idiom):
+    // the disabled row reads false on both scopes.
+    await db.update(repoSettings).set({ hasActions: false }).where(eq(repoSettings.repoId, repo.id));
     try {
+      expect((await loadSettingsAuditLogs(env.DB, repoScope, new URLSearchParams())).hasActions).toBe(false);
+      expect(
+        (await loadSettingsAuditLogs(env.DB, { type: "organization", id: String(org.id) }, new URLSearchParams())).hasActions,
+      ).toBe(false);
+      // The armed repo row lights the repo scope; the org scope stays false
+      // (its navbar carries no Actions block).
+      await db.update(repoSettings).set({ hasActions: true }).where(eq(repoSettings.repoId, repo.id));
       expect((await loadSettingsAuditLogs(env.DB, repoScope, new URLSearchParams())).hasActions).toBe(true);
       expect(
         (await loadSettingsAuditLogs(env.DB, { type: "organization", id: String(org.id) }, new URLSearchParams())).hasActions,
       ).toBe(false);
     } finally {
-      await db.delete(repoSettings).where(eq(repoSettings.repoId, repo.id));
+      // Restore the creation-default armed posture for later tests in the file.
+      await db.update(repoSettings).set({ hasActions: true }).where(eq(repoSettings.repoId, repo.id));
     }
   });
 

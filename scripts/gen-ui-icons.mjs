@@ -133,6 +133,26 @@ const ALLOWLIST = [
   'octicon-terminal', // SPEC-0016 M2 — the generic install block's label (content/generic.tmpl)
   'octicon-three-bars',
   'octicon-trash',
+  // SPEC-0012 M1c C1 — the repo Actions runs list (pages/repo-actions-runs.tsx)
+  // + the shell's Actions tab: the tab glyph (octicon-play), the
+  // action_status.tmpl icon set (the circle-fill variants, skip/stop/circle/
+  // blocked, x; octicon-sync stands in for the stroke-based gitea-running
+  // spinner — see the page module's header), the dropdown carets, the
+  // empty-state and error glyphs and the run-row meta marks (calendar is
+  // already landed; stopwatch), plus the filter/sidebar chrome.
+  'octicon-alert',
+  'octicon-blocked',
+  'octicon-check-circle-fill',
+  'octicon-circle',
+  'octicon-no-entry',
+  'octicon-play',
+  'octicon-skip',
+  'octicon-stop',
+  'octicon-stopwatch',
+  'octicon-sync',
+  'octicon-triangle-down',
+  'octicon-x',
+  'octicon-x-circle-fill',
 ];
 
 // What shell.tsx's Icon component hardcodes; a body needing anything else
