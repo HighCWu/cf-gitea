@@ -1,494 +1,814 @@
-# SPEC-0012: Gitea Actions protocol compatibility (self-hosted act_runner server surface) — feasibility, gated
+# SPEC-0012: Gitea Actions — the upstream-parity control plane (runner protocol, artifacts, registry APIs, UI family), the trigger chain staged behind the expression-evaluator question
 
-Status: **draft — gated** (research-only; surface inventory at the pin verified in this
-document. NOTHING in it is built until the §1.1 entry criteria fire — same discipline
-as SPEC-0010's pre-ratification shape and SPEC-0011's gated ratification) ·
-Date: 2026-10-24 · Fills the ADR-0001 deferred item "Gitea Actions compat"
-(`docs/decisions/0001-technical-direction.md:126-127`, still listed as out of scope
-at ADR-0001:128-130).
-Depends on: SPEC-0002 (auth semantics), SPEC-0004 (API conventions + contract
-discipline), SPEC-0005 (push/create/delete family through the engine `onPush` seam),
-SPEC-0006 (R2 relay/presign precedent for chunked blob upload).
-Owns: the `/api/actions` runner protocol surface, the `/api/actions_pipeline` artifacts
-v1 family, the `/twirp/...ArtifactService` v4 family, the Actions OIDC token endpoint,
-job-summary upload, the workflow trigger chain (server-side YAML parsing), and the
-Actions D1 schema (runs, jobs, tasks, runners, runner tokens, secrets/variables).
+Status: **accepted** (rewrite of the 2026-10-24 gated feasibility draft; the gate is
+LIFTED by the Upstream-Parity Decision Rule, AGENTS.md:248-257, learned 2026-10-29 —
+see §1.1) · Date: 2026-10-29 · Fills the ADR-0001 deferred item "Gitea Actions
+compat" (`docs/decisions/0001-technical-direction.md:126-127`, still listed as out
+of scope at ADR-0001:128-130).
+Depends on: SPEC-0002 (auth semantics — token digests, the scope grammar),
+SPEC-0004 (API conventions + contract discipline), SPEC-0005 (the push/create
+family through the engine `onPush` seam — the trigger chain's entry), SPEC-0006
+(R2 key-namespace + presign/relay precedent), SPEC-0009 (the cron-producer →
+serialized queue-consumer idiom), SPEC-0013 (protected branches — the
+required-check globs the skipped-status arm consults), SPEC-0016 (the R04/R16
+house staging idiom this SPEC mirrors).
+Owns: the `/api/actions` runner protocol surface, the `/api/actions_pipeline`
+artifacts-v1 family, the `/twirp/...ArtifactService` v4 family, the Actions OIDC
+issuer, job-summary upload, the Actions D1 schema (runners, registration tokens,
+runs, jobs, attempts, tasks, steps, outputs, tasks-version, artifacts, summaries —
+secrets and variables ALREADY EXIST, §4.1), the `/api/v1` registry-management
+additions, the Actions UI page family, and the M3 trigger chain (workflow
+detection → run/job rows → commit statuses → dispatch), staged behind Open
+question 1.
 
-Upstream findings are against the vendored submodule (`gitea/`, read-only, pin
-`v1.22.0-rc1-3919-gfc493688` / `fc49368845`). Landed-code findings are against
-`apps/worker/**` as of 2026-10-24.
+Upstream findings are against the vendored submodule (`gitea/`, READ-ONLY, pin
+`fc4936884584` — describe `v29.0.0-dev-208-gfc49368845`; the 2026-10-24 draft's
+"v1.22.0-rc1-3919" label was stale, the commit hash is identical). Cite
+convention (the SPEC-0016 idiom): bare `file.go:N` cites resolve inside the
+Actions packages — `gitea/routers/api/actions/`, `gitea/models/actions/`,
+`gitea/services/actions/`, `gitea/modules/actions/`, `gitea/modules/setting/` —
+and same-basename files (`runner.go`, `task.go`, `oidc.go`, `run.go`) are
+prefixed with their parent directory wherever the section's first mention does
+not already disambiguate them. Our-substrate findings are against
+`apps/worker/**` and `apps/worker/wrangler.jsonc.example` as of 2026-10-29.
+
+---
 
 ## 1. Problem and scope
 
-ADR-0001 D2 makes cf-gitea a headless Gitea whose Tier-1 contract serves "CLI tools,
-release tooling, CI, Gitea-API SDKs" (`docs/decisions/0001-technical-direction.md:72-75`).
-The one Tier-1 client class cf-gitea cannot serve today is CI: a user who pushes
-`.gitea/workflows/*.yml` gets a repo that silently ignores them. Gitea's answer is
-Gitea Actions: the server stores runs/jobs/logs/artifacts and matches workflows to
-events, while a **self-hosted `act_runner`** polls the server, claims jobs, executes
-them (containers are the runner's problem), and streams results back. The protocol
-boundary is exactly the surface a Workers reimplementation must speak.
+### 1.1 The posture: parity, not feasibility (the gate is lifted)
 
-**Proposed compatibility level:** a stock, unmodified `act_runner` can (a) register
-against cf-gitea, (b) long-poll for and claim jobs, (c) stream logs, (d) upload and
-download artifacts, (e) mint OIDC tokens, and (f) post job summaries — while cf-gitea
-parses workflow YAML server-side **only where the trigger chain and API/UI surface
-need it**. We do not execute any workflow step server-side; the runner does.
+The 2026-10-24 draft gated this SPEC on "a concrete CI demand" plus three entry
+criteria. That gate misread upstream's architecture as a decision we had to make.
+Upstream Gitea's own design puts **execution outside the server**: the pinned
+submodule contains no workflow-execution code anywhere — the only "runner" code
+in-tree is the protocol server (`routers/api/actions/`), and execution belongs to
+the external `act_runner` binary. The server-side slice — registration, dispatch,
+log/artifact ingestion, OIDC, the registry APIs, the UI — is therefore **pure
+parity work with nothing to decide**, and per the Upstream-Parity Decision Rule
+(AGENTS.md:248-257, recorded the same day as this rewrite) implementing it
+faithfully is not a decision point. The gate is lifted; the demand criterion is
+void.
 
-### 1.1 Entry-criteria decision (the gate on this SPEC)
+What remains genuinely undecided is exactly one slice: **the trigger chain's
+expression evaluation**. Upstream delegates the workflow schema model AND the
+GitHub-expression evaluator to the external Go module `gitea.dev/actionslib
+v1.5.0` (`gitea/go.mod:11`; imported by `modules/actions/jobparser/jobparser.go:12-14`)
+— the server evaluates job-level `if:`, concurrency, and matrix expressions
+itself (§2.9), so a faithful port needs a Go-expression evaluator on Workers
+(Open question 1). The control plane (M1) does not depend on it: jobs can be
+inserted by tests and the harness without the trigger chain, which is exactly how
+upstream's own suites exercise the protocol.
 
-**Decision: implement when a concrete CI demand exists against a deployed cf-gitea
-instance; until then this SPEC stays `draft` and nothing in it is built.**
+### 1.2 The staged posture
 
-The implementation window opens when ALL of:
+- **M1 — the control plane (no decisions).** A stock, unmodified `act_runner`
+  can register, poll, claim, stream logs, upload/download artifacts, mint OIDC
+  tokens, and post step summaries against cf-gitea; the `/api/v1` registry family
+  and the UI family land with it. Protocol truth comes from the in-tree handlers
+  (§2) plus the hash-pinned actionslib proto retrieved at wire-freeze (§6.1) —
+  no invented upstream behavior.
+- **M2 — self-host docs.** A deployment guide for registering a real runner
+  against a deployed instance (the README's self-host guarantee applies: we
+  never execute user code; the operator's runner does).
+- **The managed runner is explicitly OUT — a product question, not a milestone.**
+  Hosting execution ourselves (Cloudflare-hosted runner fleet) has no upstream
+  answer to copy, carries a cost/abuse profile this project does not want to
+  default into, and stays out until someone with budget asks. It is recorded
+  here ONLY so it is not silently re-decided (§1.4, §7).
 
-1. **Demand** — a concrete user/project requirement that a real repository hosted on
-   cf-gitea runs CI (upstream parity for its own sake is explicitly not demand;
-   SPEC-0010 §1.1's rationale applies verbatim: the correct resting state of a
-   demand-shaped feature is `draft`).
-2. **A runner operator** — someone committed to operating at least one self-hosted
-   act_runner against that instance (Actions is useless without one; the runner is
-   an external binary — the pinned submodule contains no runner execution code, only
-   the server side, and the wire contracts live in an external module, `gitea/go.mod:11`
-   `gitea.dev/actionslib v1.5.0`).
-3. **A wire capture** — before M1 lands, a capture of a real act_runner session
-   against a reference Gitea instance at (or near) the pin, to freeze: the connect
-   protocol variant the runner actually speaks, the exact service procedure names
-   (§2.2), and the codec. In-tree evidence says the endpoints are connect-RPC
-   procedure mounts (`gitea/routers/api/actions/runner/runner.go:30-37`), but the
-   generated `runnerv1connect.RunnerServiceName` string and the proto codec bytes are
-   defined in the external actionslib module, which is not vendored — we will not
-   guess them (GATE: no invented upstream behavior).
+### 1.3 In scope
 
-Rationale (recorded so the gate survives personnel changes): Actions is the largest
-single compat surface after the web UI — the server-side slice measured in §2 spans
-~25 event hooks, five runner RPCs, three artifact protocols, an OIDC issuer, and a
-job-dependency state machine. Building it speculatively spends the platform's scarcest
-budget (review + wave slots) on surface nobody may poll. When the gate fires, this
-SPEC is reviewed, ratified to `accepted`, and implemented milestone by milestone (§5).
-
-### 1.2 In scope (when the gate opens)
-
-1. The runner protocol: ping + Register/Declare/FetchTask/UpdateTask/UpdateLog (§2.2).
+1. The runner protocol: ping + the five `RunnerService` procedures (§2.2).
 2. Artifacts v1 (`/api/actions_pipeline/_apis/pipelines/...`) and v4
-   (`/twirp/github.actions.results.api.v1.ArtifactService/...`) on R2 (§2.3–2.4, §4.2).
-3. Job-summary upload (§2.5) and the Actions OIDC issuer (§2.6).
-4. The trigger chain: push/branch-create/delete events → workflow match → run/job
-   rows → commit statuses → task claim (§3.1, §4.5).
-5. Log ingest + storage + the `/api/v1` logs-download endpoint (§4.3).
-6. The registry-management `/api/v1` additions Actions requires: runner registration
-   tokens, runners CRUD, secrets/variables, runs/jobs listing (§2.7).
-7. D1 schema for the above + retention/cleanup jobs (§3.6).
+   (`/twirp/github.actions.results.api.v1.ArtifactService/...`) on R2 (§2.4-2.5,
+   §4.2).
+3. Job-summary upload (§2.6) and the Actions OIDC issuer (§2.7).
+4. The `/api/v1` registry family Actions adds: registration tokens, runners CRUD,
+   secrets/variables (secrets/variables tables already exist, §4.1), runs/jobs
+   listing, workflows enable/disable (§2.8).
+5. The Actions D1 schema (§4.1) + retention/cleanup arms (§4.4).
+6. The Actions UI page family (§2.10) — runs list, run viewer with the job log
+   panel, runners/variables admin pages, artifact preview.
+7. The trigger chain (M3, gated on Open question 1): push/branch-create/delete
+   events → workflow detection → run/job rows → commit statuses → dispatch
+   (§2.9).
 
-### 1.3 Out of scope (v1, and §5 lists what stays out even later)
+### 1.4 Out of scope (v1, and what stays out even later)
 
-- **Executing steps**: containers, node runtimes, action checkout/download — act_runner
-  owns all of it. The server never runs user code; its only execution-adjacent job is
-  handing the runner a single-job YAML payload at claim time (§3.2).
-- Marketplace/action hosting beyond answering the checkout-shim question (§6 OQ-4).
-- Tier-2 Actions UI pages (runs list, run viewer, runners admin — `gitea/routers/web/web.go:1567-1589`,
-  `508-513`, artifact preview `web.go:293`).
-- Scheduled (`on: schedule`) workflows in v1 (§4.5 note); scoped workflows
-  (`modules/actions/scoped_workflows.go`) and reusable-workflow call expansion in v1
-  (upstream: `services/actions/reusable_workflow.go`, 562 lines) — v2.
+- **Executing steps** — containers, node runtimes, action checkout/download:
+  act_runner owns all of it. The server never runs user code; its only
+  execution-adjacent job is handing the runner a single-job YAML payload at
+  claim time (§2.3).
+- **The managed runner** (§1.2) — product question, no milestone.
+- **Marketplace/action hosting** beyond documenting that runners fetch `uses:`
+  actions from GitHub by default (`modules/setting/actions.go:50,76-88`).
+- **Scheduled (`on: schedule`) workflows** — the `action_schedule` +
+  `action_schedule_spec` tables and the cron machinery
+  (`services/actions/schedule_tasks.go`, 195 lines) stage as an M3 follow-up
+  riding our existing cron entries; not in M1/M3's first cut.
+- **Scoped workflows** (`modules/actions/scoped_workflows.go`,
+  `action_scoped_workflow_source` table) and **reusable-workflow call expansion**
+  (`services/actions/reusable_workflow.go`, 562 lines) — v2; the schema columns
+  land with the model (they are NOT NULL DEFAULT 0/'' ports) but nothing reads
+  them in v1.
+- **Rerun/attempts > 1** — `services/actions/rerun.go` (685 lines) is v2; v1
+  always has exactly one attempt row per run (attempt = 1), which the schema
+  models naturally (§4.1).
 
-## 2. Surface inventory at the pin
+## 2. The protocol surface (upstream at the pin)
 
 ### 2.1 Mount points
 
-`routers/init.go:196-206`, gated on `setting.Actions.Enabled` (`init.go:196`):
+`routers/init.go:196-206`, gated on `setting.Actions.Enabled` (default **true**,
+`modules/setting/actions.go:49`):
 
-- `POST|GET /api/actions/*` — `actions_router.Routes(prefix)` (`init.go:197-198`):
-  OIDC group (`routers/api/actions/actions.go:16-20`), ping (`actions.go:22-23`),
-  runner service (`actions.go:25-26`). Handler mounts strip the prefix and serve
-  connect-RPC procedures under `/<service-name>/` (`ping/ping.go:24`,
+- `POST /api/actions/*` — `actions_router.Routes(prefix)` (`init.go:197-198`):
+  the OIDC group (`routers/api/actions/actions.go:16-20`), the ping service
+  (`actions.go:22-23`), and the runner service (`actions.go:25-26`). The ping and
+  runner handlers are connect-RPC procedure mounts served under
+  `/<service-name>/` after prefix-strip (`ping/ping.go:24`,
   `runner/runner.go:36`).
-- `/api/actions_pipeline/*` — artifacts v1 + job summaries (`init.go:203-204`,
-  route table `routers/api/actions/artifacts.go:108-131`).
+- `POST|GET|PUT|PATCH /api/actions_pipeline/*` — artifacts v1 + job summaries
+  (`init.go:203-204`; route table `routers/api/actions/artifacts.go:107-130`).
+  Upstream's own comment: "TODO: Pipeline api used for runner internal
+  communication with gitea server. but only artifact is used for now"
+  (`init.go:200-202`).
 - `/twirp/github.actions.results.api.v1.ArtifactService` — artifacts v4
-  (`init.go:205-206`; route base const `routers/api/actions/artifactsv4.go:124`).
+  (`init.go:205-206`; base const `artifactsv4.go:124`).
 
-Upstream's own comment on the pipeline prefix: "TODO: Pipeline api used for runner
-internal communication with gitea server. but only artifact is used for now"
-(`init.go:201-202`).
+### 2.2 The runner RPC family (connect-RPC, five procedures + ping)
 
-### 2.2 Runner protocol (connect-RPC, five procedures)
+The wire contracts live in the external module `gitea.dev/actionslib v1.5.0`
+(`go.mod:11`, go.sum-pinned `h1:dC3v2HTWbbvyNBSdg2W3kd4WNC/p+FnZaKpl1MdzM00=`):
+`runnerv1` messages (`gitea.dev/actionslib/runner/v1`) + `runnerv1connect`
+service name (`.../runner/v1/runnerv1connect`), `pingv1`
+(`gitea.dev/actionslib/ping/v1`). The module is public on the Go module proxy —
+M1a's wire-freeze fetches and hash-verifies it, then transcribes the `.proto`
+files into the repo's contract fixtures (§6.1). Message shapes below are
+reconstructed from the Go handlers' field usage; every field listed is
+handler-touched, none invented.
 
-Auth: every procedure except `Register` requires the runner's UUID + token headers
-(`interceptor.go:46-68`: `protocol.UUIDHeader`/`TokenHeader` at `:26-29`, lookup by
-UUID `:59`, constant-time hash compare `:97-107`); `Register` bypasses auth
-(`interceptor.go:51-53`). The interceptor also debounces `last_active`/`last_online`
-DB writes to avoid write-per-poll load (`interceptor.go:70-90`).
+**Auth interceptor** (`routers/api/actions/runner/interceptor.go`): every
+procedure except `Register` requires the runner's UUID + token headers —
+`protocol.UUIDHeader` / `protocol.TokenHeader` constants (`interceptor.go:26-29`,
+values come from actionslib's protocol package; exact header strings transcribed
+at wire-freeze). Lookup by UUID (`:59`), constant-time token-hash compare with an
+LRU digest cache (`:97-107`). The interceptor also debounces `last_active` /
+`last_online` DB writes — `ShouldPersistLastActive`/`ShouldPersistLastOnline`
+(`models/actions/runner.go:89-99`) — because UpdateLog "fires many times per
+second" and polls are frequent (`interceptor.go:72-84`). Plain errors reach
+runners as connect `CodeUnknown` with their message (`withErrorMessages`,
+`interceptor.go:36-44`, asserted in `runner_test.go:31-37`).
 
-| Procedure | Handler | Wire-relevant facts at the pin |
+| Procedure | Handler | Request → response (fields the handler touches) |
 |---|---|---|
-| `Register` | `runner/runner.go:44-114` | Body carries a one-time registration token (`GetRunnerToken` `:52`), name, labels, version, `Ephemeral`, capabilities (`:73-87`); token is single-use — flipped inactive on success (`:96-98`). Registration tokens are scoped global/org/repo (`models/actions/runner_token.go:21-29`). Advertised capability string `cancelling` (`runner.go:119`). |
-| `Declare` | `runner.go:142-165` | Periodic re-label/version; server replies with feature negotiation via the `X-Gitea-Actions-Capabilities` response header (`runner.go:151-154`). |
-| `FetchTask` | `runner.go:168-217` | **Not a server-held long poll** — the runner polls, the server answers immediately with a task or empty + a `tasksVersion` counter (`:175-217`). Task pick is throttled per-process (`MAX_CONCURRENT_TASK_PICKS`, `services/actions/task.go:43-53`; setting at `modules/setting/actions.go:43-47`); a throttled runner "will retry on its next poll" (`runner.go:202-207`). Version bump semantics at `models/actions/tasks_version.go:31-75`. |
-| `UpdateTask` | `runner.go:220-285` | State machine update (`UpdateTaskByState` `models/actions/task.go:481`), job outputs (key ≤255 B, value ≤1 MiB, `runner.go:232-249`), commit status refresh (`:263`), downstream job emission (`:270-276`). |
-| `UpdateLog` | `runner.go:288-359` | Rows + ack-index protocol; runner "sends all pending log rows in one UpdateLog" so the server keeps unlimited read size (`runner.go:34-35`, `WithReadMaxBytes(0)`); finalize (`NoMore`) seals the log and transfers it to storage (`:343-349`); re-sent finalize is idempotent, appends past the seal error (`:311-317`). |
+| `Register` | `runner/runner.go:44-114` | `RegisterRequest{token, name, agent_labels[], version, ephemeral, capabilities[]}` → `RegisterResponse{runner{id, uuid, token, name, version, labels, ephemeral}}`. Validates token+name non-empty (`:48`); looks up `ActionRunnerToken` by the raw token string (`:52`), requires `is_active` (`:57` — reset semantics below); creates `ActionRunner{uuid: uuid.New(), name(≤255), owner/repo from the token, version, labels, ephemeral, has_cancelling_support iff capabilities contains "cancelling"}` (`:73-87`); `GenerateAndFillToken` mints the runner's polling token (`:88`). NOTE (draft correction): the post-success `runnerToken.IsActive = true` write (`:96-98`, unchanged since 4011821c94 "Implement actions") is a vestigial no-op — at this pin a registration token is **reusable until reset**: `NewRunnerTokenWithValue` deactivates all same-scope tokens in one transaction before inserting the new active one (`models/actions/runner_token.go:75-107`), so "reset" = create-new-and-deactivate-old, and one active token registers a fleet. The 2026-10-24 draft's "single-use, flipped inactive" claim was wrong. |
+| `Declare` | `runner.go:142-165` | `DeclareRequest{version, labels, capabilities}` → `DeclareResponse{runner{id, uuid, token, name, version, labels}}`. Updates `agent_labels`, `version`, `has_cancelling_support` (`:128-140`); advertises server capabilities via the `X-Gitea-Actions-Capabilities` response header — `actions_model.RunnerCapabilities()` returns `"job-summary"` today (`models/actions/run_job_summary.go:30-34`) — "to avoid a hard dependency on a proto bump" (`:151-154`). |
+| `FetchTask` | `runner.go:168-217` | `FetchTaskRequest{tasks_version}` → `FetchTaskResponse{task?, tasks_version}`. **Answer-immediately, not a held long poll**: the runner polls; the server compares the runner's `tasks_version` against `GetTasksVersionByScope(owner, repo)` (`:176`), bootstrapping the counter to 1 on first sight so the runner never sees version 0 ("would treat it as an old version of Gitea", `:179-187`). On mismatch it re-loads the runner fresh (a disable-while-polling race, `:190-195`) and calls `TryPickTask` — which is **throttled per-process** (`MAX_CONCURRENT_TASK_PICKS`, default 16, `modules/setting/actions.go:18,45,55`; `services/actions/task.go:31-53`): a throttled pick keeps the response's `tasks_version` at the runner's stale value so it retries on its next poll instead of sleeping to the next bump (`:202-207`). Version bumps cascade global→owner→repo counters (`IncreaseTaskVersion`, `models/actions/tasks_version.go:66-86`). |
+| `UpdateTask` | `runner.go:220-285` | `UpdateTaskRequest{state{id, result: Result enum}, outputs: map<string,string>}` → `UpdateTaskResponse{state{id, result}, sent_outputs[]}`. State machine via `UpdateTaskByState` (`models/actions/task.go:481`); outputs are upsert-if-absent with caps — key ≤255 B, value ≤1 MiB, oversized keys/values logged-and-skipped (`:231-249`); responds with the keys actually stored so the runner can resend the rest (`:250-254`). Then: commit statuses for the job (`:263`), `NotifyWorkflowJobStatusUpdateWithTask` when done (`:265-267`), and when the result is non-UNSPECIFIED the job emitter re-resolves the run's needs graph (`EmitJobsIfReadyByRun`, `:270-276`) + run-level status notification (`:273-275`). |
+| `UpdateLog` | `runner.go:288-359` | `UpdateLogRequest{task_id, index (row index of rows[0]), rows[]{time, content}, no_more}` → `UpdateLogResponse{ack_index}`. Ownership check (`runner.ID == task.RunnerID`, `:299-301`); the ack protocol: rows the server already holds are trimmed `rows[ack-index:]` (`:304-308`); a re-sent finalize with no new rows is acked idempotently (`:311-317`); appending rows past the seal errors `AlreadyExists` (`:312-313`); a `no_more` finalize with a gap (runner outran the server) is refused so the log never archives with holes (`:322-325`); `WriteLogs` appends bytes to the DBFS file — even with zero rows at offset 0, to bootstrap an empty file (`:327-330`); `task.LogLength` (row count), `task.LogSize` (byte size), `task.LogIndexes` (per-row byte offsets) advance (`:334-338`); `no_more` seals: `log_in_storage = true` + `TransferLogs` to object storage (`:343-348`). The mount keeps unlimited read size ("runners send all pending log rows in one UpdateLog", `:34-35`, `WithReadMaxBytes(0)`). |
 
-Wire format: connect handlers accept connect/gRPC/gRPC-Web (`connecthttp.Mount`,
-`runner.go:35`); the runner's actual protocol+codec is OQ-1 (§6) pending the wire
-capture. Service name strings come from the external actionslib module (`go.mod:11`);
-in-tree procedure-name evidence: `Register` (`interceptor.go:52`),
-`UpdateTask`/`UpdateLog` (`interceptor.go:75`), the generated client interface
-assertion (`runner.go:39`).
+**PingService** (`ping/ping.go:31-42`): `Ping(PingRequest{data})` →
+`PingResponse{data}` — an echo used by runners as a connectivity probe.
 
-### 2.3 Artifacts v1 (`/api/actions_pipeline/_apis/pipelines/workflows/{run_id}/artifacts`)
+**Wire format**: connect handlers accept connect/gRPC/gRPC-Web
+(`connecthttp.Mount`, `runner.go:35`; compression floor `WithCompressMinBytes(1024)`).
+The exact protocol variant + codec a stock act_runner speaks is settled by the
+same wire-freeze fetch (the generated client code is in the module), and the
+E2E real-runner test (§6.5) is the empirical confirmation.
 
-Auth: `Authorization: Bearer <ACTIONS_RUNTIME_TOKEN>` — a per-task HS256 JWT
-(`artifacts.go:146-155`; claims/shape `services/actions/auth.go:43-70`, scoped
-`Actions.Results:{runID}:{jobID}` at `:55`); legacy runners use the raw task token
-(`artifacts.go:170-180`, `models/actions/task.go:187`). Run-id must match the token's
-job (`artifacts_utils.go:35-44`).
+### 2.3 The claim-time Task payload
+
+`PickTask` (`services/actions/task.go:66-131`) → `CreateTaskForRunner`
+(`models/actions/task.go:265-331`: keyset-paginated scan of waiting jobs,
+`pickTaskBatchSize = 100`, ordered oldest-first; label intersection via
+`CanMatchLabel`/`CanMatchLabels`, `models/actions/runner.go:202-204`; ephemeral
+runners are refused new tasks while their task lives and deleted after it
+finishes, `services/actions/task.go:77-95`) → `claimJobForRunner` (`:333-414`): the claim is a
+conditional UPDATE — `task_id = 0 AND status = waiting` guard, one row affected
+or `errJobAlreadyClaimed` (`:392-400`) — and task creation also inserts the
+workflow's step rows (`:373-389`) and sets `LogFilename` from
+`logFileName(repoFullName, taskID)` (`:369`). A failed payload assembly releases
+the claim (`ReleaseTaskForRunner`, `:420`), as does a cancelled request context
+(`services/actions/task.go:123-128`).
+
+`buildRunnerTask` (`services/actions/task.go:135-174`) returns the
+`runnerv1.Task{id, workflow_payload, context, secrets, vars, needs}`:
+
+- `workflow_payload` — the job's stored single-job `SingleWorkflow` bytes re-
+  serialized with the job's `if:` forced to `always()` (`runnerWorkflowPayload`,
+  `:176-187`): the server already decided; the runner must not re-evaluate.
+- `context` — the `gitea`/`github` context struct (`generateTaskContext`,
+  `:189-215`; `GenerateGiteaContext`, `services/actions/context.go`) plus
+  `token` (the task's polling token) and `gitea_runtime_token` (the HS256 JWT of
+  §4.4), plus `actions_id_token_request_url`/`..._token` when OIDC is permitted
+  (`:203-212`).
+- `secrets` — `GetSecretsOfTask` (repo/org/user scope merge, `models/secret` —
+  our `secrets` table already exists, §4.1).
+- `vars` — `GetVariablesOfRun` (our `action_variables` table, §4.1).
+- `needs` — `findTaskNeeds` (`:217-230`): map of job-id →
+  `TaskNeed{outputs, result}` read from the needs' tasks' outputs.
+
+### 2.4 Artifacts v1 (`/api/actions_pipeline/_apis/pipelines/workflows/{run_id}/artifacts`)
+
+Auth: `Authorization: Bearer <ACTIONS_RUNTIME_TOKEN>` — the per-task HS256 JWT
+(§4.4; `artifacts.go:146-155`); legacy runners send the raw task token
+(`artifacts.go:170-180`). Run-id must match the token's job
+(`artifacts_utils.go:35-44`).
 
 Protocol (documented verbatim in `artifacts.go:6-61`):
 
-1. `POST .../artifacts` → upload URL keyed by `md5(name)` (`artifacts.go:119, 237`);
-   `?retentionDays=` rides the returned URL (`artifacts.go:232-234`).
-2. `PUT .../{artifact_hash}/upload` — chunked, headers `x-tfs-filelength`,
+1. `POST .../artifacts` → upload URL keyed by `md5(name)`; `?retentionDays=`
+   rides the returned URL (`artifacts.go:119, 232-238`).
+2. `PUT .../{artifact_hash}/upload` — chunked; headers `x-tfs-filelength`,
    `x-actions-results-md5`, `content-range: bytes s-e/total`
-   (`artifacts.go:121`; header consts `artifacts_utils.go:18-21`; chunk save with
-   streamed md5 verification `artifacts_chunks.go:75-125`).
-3. `PATCH .../upload` — confirm; server merges chunks in order into one stored
-   object (`artifacts.go:119`; merge `artifacts_chunks.go:260-296, 311-399`: ordered
-   MultiReader → single `Save`, optional sha256 verification `:350-387`).
+   (`artifacts.go:121`; consts `artifacts_utils.go:18-21`; streamed-md5 chunk
+   save `artifacts_chunks.go:75-125`; chunk objects named
+   `{run}-{artifact}-{start}-{end}.chunk`, `artifacts_chunks.go:44-51`).
+3. `PATCH .../upload` — confirm; the server merges chunks in byte order into one
+   stored object (ordered MultiReader → single `Save`, optional sha256
+   verification, `artifacts_chunks.go:260-296, 311-399`; storage path analog
+   `:298-307`).
 4. `GET .../artifacts` (list), `GET .../{artifact_hash}/download_url`,
    `GET .../{artifact_id}/download` (`artifacts.go:119-124`).
 
-### 2.4 Artifacts v4 (twirp-style, the modern toolkit path)
+### 2.5 Artifacts v4 (twirp-style, the modern toolkit path)
 
 Routes (`artifactsv4.go:140-161`): `POST CreateArtifact | FinalizeArtifact |
-ListArtifacts | GetSignedArtifactURL | DeleteArtifact` (`:149-153`), `PUT
-UploadArtifact` and `GET DownloadArtifact` on HMAC-signed URLs (`:156-157`). Bodies
-are protojson (`parseProtobufBody` `:298-316`), capped at 1 MiB (`maxProtobufBodySize`
-`:296`) — only the upload/download URLs carry bulk bytes. Signed URLs: HMAC-SHA256
-over (tag, endpoint, expires, artifactName, taskID, artifactID) with the general
-token-signing secret (`modules/actions/artifacts.go:19-29`), 60-minute expiry
-(`artifactsv4.go:168`), verified at `artifactsv4.go:217-261`. Upload semantics:
-`?comp=block|appendBlock|blocklist` — Azure-Blob-flavored block upload with an XML
-blocklist naming the final block order (`artifactsv4.go:404-456`, `BlockList` XML
-`:458-460`, ordered replay `artifacts_chunks.go:186-258`).
+ListArtifacts | GetSignedArtifactURL | DeleteArtifact`, `PUT UploadArtifact` and
+`GET DownloadArtifact` on HMAC-signed URLs. **The proto is IN-TREE** —
+`routers/api/actions/artifact.proto` defines all five request/response pairs
+(`CreateArtifactRequest{workflow_run_backend_id, workflow_job_run_backend_id,
+name, expires_at, version, mime_type}` → `{ok, signed_upload_url}`;
+`FinalizeArtifactRequest{..., size, hash}` → `{ok, artifact_id}`;
+`ListArtifacts...`; `GetSignedArtifactURL...` → `{signed_url}`;
+`DeleteArtifact...`) — so the v4 codec needs no external material. Bodies are
+protojson, capped at 1 MiB (`parseProtobufBody` `:298-316`,
+`maxProtobufBodySize` `:296`) — only the upload/download URLs carry bulk bytes.
+Signed URLs: HMAC-SHA256 over (tag, endpoint, expires, artifactName, taskID,
+artifactID) with the general token-signing secret (`modules/actions/artifacts.go:19-29`;
+build at `artifactsv4.go:162-175`), 60-minute expiry (`:168`), verified at
+`:217-261`. Upload semantics: `?comp=block|appendBlock|blocklist` — Azure-Blob-
+flavored block upload with an XML blocklist naming the final block order
+(`:404-460`; ordered replay `artifacts_chunks.go:186-258`; tmp object
+`tmp-upload/run-{id}-v4`, `artifacts_chunks.go:35-37`).
 
-### 2.5 Job summaries (`GITHUB_STEP_SUMMARY`)
+### 2.6 Job summaries (`GITHUB_STEP_SUMMARY`)
 
 `PUT /api/actions_pipeline/_apis/pipelines/workflows/{run_id}/jobs/{job_id}/steps/{step_index}/summary`
-(route base `job_summary.go:19`, table `artifacts.go:128`). Validates the job and
-step index against the task (`job_summary.go:27-47`), markdown-only content type
-(`:91-104`), empty body clears (`:62-69`), per-step cap 1 MiB
-(`models/actions/run_job_summary.go:22-23`) with an aggregate cap error path
-(`job_summary.go:71-74`).
+(route base `job_summary.go:19`, table `artifacts.go:128`). Validates job + step
+index against the task (`job_summary.go:27-47`), markdown-only content type
+(`:91-104`), empty body clears (`:62-69`), per-step cap 1 MiB and aggregate
+per-job cap 1 MiB ("matches GitHub's documented cap", `models/actions/run_job_summary.go:23-29`).
 
-### 2.6 Actions OIDC issuer
+### 2.7 The Actions OIDC issuer
 
-Three GETs under `/api/actions/oidc` (`actions.go:16-20`):
+Three GETs under `/api/actions/oidc` (`actions.go:16-20`,
+`routers/api/actions/oidc.go`):
 
 - `/.well-known/openid-configuration` — issuer = `<AppURL>api/actions/oidc`
-  (`services/actions/oidc.go:102-104`), discovery doc `routers/api/actions/oidc.go:17-28`.
-- `/jwks` — RS256 public key (`services/actions/oidc.go:33`; key lazily
-  created/persisted at `<AppDataPath>/jwt/actions_oidc.pem` `:41-54`).
+  (`services/actions/oidc.go:102-104`); discovery doc `oidc.go:17-28`.
+- `/jwks` — RS256 public JWK (`oidc.go:31-49`; key lazily created/persisted as
+  PEM at `<AppDataPath>/jwt/actions_oidc.pem`, `services/actions/oidc.go:41-54`).
 - `/token` — **token exchange, not OAuth2**: bearer = a short-scoped
   `Actions.IDTokenRequest` JWT minted for the task when the workflow declares
-  `id-token: write` (`services/actions/auth.go:20`, minted in
-  `services/actions/task.go:203-212`), + `?audience=`; verifies the task is running
-  and permitted (`services/actions/oidc.go:115-139`), returns `{value: <id_token>}`.
+  `id-token: write` (`services/actions/auth.go:20`; minted in
+  `services/actions/task.go:203-212`), + `?audience=`; verifies the task is
+  running and permitted (`services/actions/oidc.go:115-139`), returns
+  `{value: <id_token>}` with `Cache-Control: no-store` (`oidc.go:52-60`).
 
 ID-token claims mirror GitHub's (`services/actions/oidc.go:56-82`): immutable-ID
-subject `repo:<owner>@<ownerID>/<repo>@<repoID>...` (`:172-178`), 5-minute expiry with
-5-minute not-before backdating (`:193-194`), `runner_environment: "self-hosted"`
-(`:221`). Signing: RS256 over a persisted PEM — on Workers this becomes a
-generated-and-stored keypair (§4.6).
+subject (`:172-178`), 5-minute expiry with 5-minute not-before backdating
+(`:193-194`), `runner_environment: "self-hosted"` (`:221`).
 
-### 2.7 The `/api/v1` surface Actions adds
+### 2.8 The `/api/v1` registry family Actions adds
 
-Registration shared by repo/org/user scopes via `addActionsRoutes`
-(`routers/api/v1/api.go:964-996`): secrets (`:968-972`), variables (`:974-982`),
-runners incl. `POST /actions/runners/registration-token` (`:984-990`), runs/jobs
-listing (`:992-993`). Repo-level additionally: workflows list/get/runs/enable/disable/
-`POST dispatches` (`:1255-1263`) and `GET /actions/jobs/{job_id}/logs` (`:1264-1267`).
-User-level mirror at `:1112-1133`. These are ordinary JSON APIs — no new machinery,
-but they are the registration-token mint the runner protocol consumes (§2.2).
+Shared registration via `addActionsRoutes` (`routers/api/v1/api.go:964-996`),
+wired at repo level (`:1255` — `reqRepoReader(unit.TypeActions)` reads /
+`reqOwner()` writes; **unit.TypeActions = unit 10**, `models/unit/unit.go:35`),
+org level, and user level (`:1112-1133`):
 
-## 3. Division of labor: what the server provides vs what act_runner owns
+- secrets: `GET /actions/secrets`, `PUT|DELETE /actions/secrets/{secretname}`
+  (`api.go:968-972`) — our `secrets` table + service exist (§4.1).
+- variables: `GET`, `GET|DELETE|POST|PUT /actions/variables/{variablename}`
+  (`:974-982`) — our `action_variables` table + service exist.
+- runners: `GET /actions/runners`, `POST /actions/runners/registration-token`,
+  `GET|DELETE|PATCH /actions/runners/{runner_id}` (`:984-990`) — the
+  registration-token mint the runner protocol consumes (§2.2).
+- runs/jobs listing: `GET /actions/runs`, `GET /actions/jobs` (`:992-993`).
+- Repo-level extras: workflows `GET .../actions/workflows[...]/runs`,
+  `PUT .../disable|enable`, `POST .../{workflow_id}/dispatches` (`:1255-1263`)
+  and `GET /actions/jobs/{job_id}/logs` (`:1264-1267`).
 
-### 3.1 Server-side: trigger → run → job rows → claim
+Scope enforcement rides the surrounding groups' `tokenRequiresScopes` — the
+`/repos` group carries the `repository` category (`api.go:1554`), org/user
+groups carry `organization`/`user` — all three categories already exist in our
+frozen 19-bit grammar with headroom (`apps/worker/src/auth/scopes.ts:16-26`).
+No new scope category is needed.
 
-The Actions notifier implements the `notify_service.Notifier` interface — ~25 hooks
-(`services/actions/notifier.go:33-36`): issues/labels/milestones/comments
-(`:41-306`), PRs (`:355-424, 467-500`), push/create/delete (`:541, 573, 591`),
-releases (`:645-661`), packages (`:664-671`). Each hook builds a webhook payload and
-calls `notify` (`notifier_helper.go:136`), which: opens the repo at the pushed commit,
-`DetectWorkflows` (`notifier_helper.go:205` → `modules/actions/workflows.go:180-240`),
-schedules or inserts runs (`buildApproveAndInsertRun` `notifier_helper.go:376`,
-`InsertRun` `services/actions/run.go:63`), and posts skipped-run commit statuses for
-path/branch-filtered workflows (`handleFilteredWorkflows` `notifier_helper.go:442`).
+### 2.9 The trigger chain (the M3 slice)
 
-Workflow matching lives in `modules/actions/workflows.go`: workflow files are
+The Actions notifier implements the `notify_service.Notifier` interface — 35
+hook methods (`services/actions/notifier.go:41-784`): issues/labels/milestones/
+comments (`:41-306`), PRs + reviews (`:355-540`), push/create/delete
+(`:541-644`), releases (`:645-663`), packages (`:664-673`), wikis
+(`:737-783`), migrations/automerge (`:674-736`). Each hook builds a webhook
+payload and calls `notify` (`notifier_helper.go:136`), which: breaks the
+Actions-user cycle ("a comment … will trigger the runner to add a new comment …
+and trigger the runner again", `:139-155`), skips empty/archived/unit-disabled
+repos (`:156-172`), falls back to the default branch for default-branch-only
+events (`:178-189`), applies `[skip ci]`-family suppression
+(`skipWorkflows`; strings `modules/setting/actions.go:51`), then
+`DetectWorkflows` (`modules/actions/workflows.go:180-240`): workflow files are
 `.yml`/`.yaml` under `.gitea/workflows` + `.github/workflows`
-(`modules/setting/actions.go:52`; `IsWorkflow` `workflows.go:53-73`), enumerated
-recursively from the commit tree (`ListWorkflows` `workflows.go:75-108`), read with a
-**1 MiB per-file cap** (`GetContentFromEntry` `workflows.go:110-121`, cap at `:115`),
-events extracted per file (`GetEventsFromContent` `:123-126`), then matched per event
-— push matching incl. branch filters/paths-ignore (`matchPushEvent` `workflows.go:390`),
-plus issue/PR/release/package/workflow_run matchers (`workflows.go:499-898`).
-`[skip ci]`-family suppression (`skipWorkflows` `notifier_helper.go:298`; strings at
-`modules/setting/actions.go:51`).
+(`WORKFLOW_DIRS`, `modules/setting/actions.go:52`), enumerated recursively
+from the commit tree (`workflows.go:75-108`), read with a **1 MiB per-file cap**
+(`GetContentFromEntry`, `workflows.go:110-121`), events extracted per file, then
+matched per event — push matching incl. branch filters/paths-ignore
+(`matchPushEvent` `workflows.go:390`), plus issue/PR/release/package/workflow_run
+matchers (`workflows.go:499-898`). Path/branch-filtered workflows still post a
+**skipped commit status** when the context is a required check
+(`handleFilteredWorkflows`; `CreateSkippedCommitStatusForFilteredWorkflow`,
+`services/actions/commit_status.go:218`).
 
-Parsing leans on the external actionslib module: `jobparser` imports
-`actionslib/pkg/{expreval,exprparser,model}` (`modules/actions/jobparser/jobparser.go:12-14`)
-— i.e. the workflow schema model AND the GitHub-expression evaluator are external Go,
-not vendored. **This is the single largest port cost** (§5 M2).
+`InsertRun` (`services/actions/run.go:63-…`): per-repo run index from the named
+sequence `action_run_index` via `db.GetNextResourceIndex` (`:67` — our
+`repo_counters` idiom, §4.5), run + attempt-1 rows, workflow-level concurrency
+evaluation, then jobs parsed and inserted with their `WorkflowPayload` bytes.
+The **job emitter** re-resolves needs/`if`/concurrency after insert and after
+every task completion (`EmitJobsIfReadyByRun`/`ByJobs`,
+`services/actions/job_emitter.go:41-64`; the resolver `jobStatusResolver`
+`:451-548`; run-level concurrency `:183`; max-parallel slots
+`services/actions/max_parallel.go`; deferred matrices expand when needs finish,
+`modules/actions/jobparser/jobparser.go:16-31`; bounded by
+`MaxJobNumPerRun = 256`, `models/actions/run_job.go:29`). Upstream drives the
+emitter through its own internal queue `actions_ready_job`
+(`services/actions/init.go:63-67`).
 
-Job graph: after insert and after every task completion the job emitter re-resolves
-`needs`/`if`/concurrency (`EmitJobsIfReadyByRun` `services/actions/job_emitter.go:31`,
-resolver `:489-548`, run-level concurrency `:183`, wake propagation `:154`), expands
-deferred matrices (`services/actions/matrix.go:43`, bounded by `MaxJobNumPerRun = 256`
-`models/actions/run_job.go:29`). Note the server (not the runner) evaluates job-level
-`if:` and concurrency expressions — expression evaluation is server work (§4.5 budget).
+**Expression evaluation is server work**: the parser imports actionslib's
+`expreval`/`exprparser`/`model` (`modules/actions/jobparser/jobparser.go:12-14`;
+the interpreter wiring `interpeter.go:24-64`) — the workflow schema model AND
+the GitHub-expression evaluator are external Go, not vendored. This is the
+largest single port cost and the reason M3 is staged behind Open question 1;
+the control plane never evaluates expressions (the claim payload forces
+`if: always()`).
 
-Task claim: `FetchTask` → `TryPickTask` → `CreateTaskForRunner`
-(`models/actions/task.go:265-327`): keyset-paginated scan of waiting jobs
-(`pickTaskBatchSize = 100` `:259`), label intersection (`CanMatchLabels` call `:310`),
-then an atomic optimistic-lock claim (`claimJobForRunner` `:333-414`; the
-`task_id = 0 AND status = waiting` guard `:392-400`); a failed assembly releases the
-claim (`ReleaseTaskForRunner` `:420-451`).
+Commit statuses: context `"<workflow> / <job> (<event>)"`
+(`WorkflowStatusContextName`, `modules/actions/workflows.go:159-165`), posted
+for push/PR/release-family events (`ShouldEventCreateCommitStatus`, `:172-178`)
+via `CreateCommitStatusForRunJobs` (`services/actions/commit_status.go:31`),
+state mapping `toCommitStatus` (`:357`), required-check globs consulted for
+pending-job replacement (`:184-217`).
 
-### 3.2 What the server hands the runner at claim time
+### 2.10 The UI family (page census for the M1c wave)
 
-`buildRunnerTask` (`services/actions/task.go:135-174`) returns: the single-job
-re-serialized workflow payload with `if:` forced to `always()` (the server already
-decided; the runner must not re-evaluate — `runnerWorkflowPayload` `:176-187`), the
-`github`/`gitea` context struct (`generateTaskContext` `:189-215`, built by
-`GenerateGiteaContext` `services/actions/context.go`), the `token` +
-`gitea_runtime_token` (`:201-202`), OIDC request URL+token when permitted
-(`:203-212`), task secrets (`:141`), repo/org/global variables (`:146`), and the
-resolved outputs of `needs` (`findTaskNeeds` `:217-230`).
+- **Repo Actions tab** (`routers/web/web.go:1566-1609`): `GET /{owner}/{repo}/actions`
+  (runs list `actions.List`), `/job_queue`, workflow enable/disable + run +
+  dispatch-inputs + approve-all-checks, and the run viewer subtree
+  `/runs/{run}[/attempts/{attempt}][/jobs/{job}]` (view + log streaming
+  `GET /runs/{run}/jobs/{job}/logs`, rerun/cancel/approve/delete POSTs,
+  artifact download/delete per name, workflow-file view). Templates:
+  `templates/repo/actions/` — 10 files (`list.tmpl`, `runs_list.tmpl`,
+  `view.tmpl`, `view_component.tmpl`, `sidebar.tmpl`, `no_workflows.tmpl`,
+  `job_queue.tmpl`, `workflow_dispatch.tmpl`, `workflow_dispatch_inputs.tmpl`,
+  `artifact_preview.tmpl`). Handlers: `routers/web/repo/actions/` — 9 files
+  (`actions.go`, `view.go`, `view_artifact.go`, `badge.go`, `job_queue.go`).
+  The log viewer is live-tail shaped (the `view.go` + `Logs` handler polling
+  `ReadLogs` ranges).
+- **Owner settings** (org/user, `web.go:489-522`): variables CRUD,
+  runners list/edit/delete/reset-registration-token, scoped-workflows admin.
+- **Repo settings** (`web.go:491-513` shared builders): the same runners +
+  variables + secrets pages.
+- **Admin** (`web.go:898-904`): runners bulk actions + the global job queue page.
+- **Shared templates**: `templates/shared/actions/` — 11 files (`runner_list`,
+  `runner_edit`, two runner_badge variants, `job_queue_list`,
+  `owner_general_settings`, `permission_mode_select`, `permissions_table(+unit)`,
+  `scoped_workflows`, `workflow_run`); handlers `routers/web/shared/actions/` —
+  6 files (`runners.go`, `variables.go`, `job_queue.go`, `general.go`,
+  `scoped_workflows.go`).
+- **Mail**: `templates/mail/repo/actions/`.
+- **Artifact preview**: `GET /-/actions/artifacts/{id}/{expires}/{signature}/*`
+  (`web.go:293` — no session; the sandboxed iframe sends no cookies), gated by
+  `ARTIFACT_PREVIEW_MAX_SIZE` (default 10 MiB, `modules/setting/actions.go:47,56`).
 
-### 3.3 Runner-side (external act_runner — none of it lands in this repo)
+## 3. The v1 surface staged
 
-The runner: clones the repo itself using the handed token; downloads `uses:` actions
-from the internet (GitHub by default — `DefaultActionsURL` setting,
-`modules/setting/actions.go:46, defaultActionsURLGitHub`); provisions containers or
-the host environment; executes steps; evaluates step-level expressions; batches logs
-into `UpdateLog` rows; uploads artifacts via §2.3/§2.4; calls the OIDC endpoint. The
-server's only real-time involvement is being polled. (The pinned tree has no runner
-execution code anywhere — the only "runner" code is the protocol server of §2.2.)
+**M1 lands (the control plane; §7 sizes):** mounts §2.1; runner protocol §2.2;
+claim payload §2.3; artifacts v1+v4 §2.4-2.5; summaries §2.6; OIDC §2.7; the
+`/api/v1` registry family §2.8; the D1 schema §4.1 (control-plane tables);
+R2 log/artifact keys §4.2-4.3; retention arms §4.4; the UI family §2.10.
 
-### 3.4 The webhook/notify surface Actions adds
+**M3 lands (the trigger chain; gated on Open question 1):** the notifier hooks
+census §2.9 wired to our `onPush`/event seams, workflow detection + matchers,
+the YAML model port, the expression subset of OQ-1, `InsertRun` + the job
+emitter + max-parallel, commit-status publication, `[skip ci]` suppression.
+Without M3 the M1 control plane has no automatic producer — jobs arrive via the
+test harness/fixtures (how upstream's own protocol suites run too) and, once M3
+ships, from real events.
 
-Beyond the notifier hooks above (§3.1), Actions contributes: commit-status publication
-for jobs — context `"<workflow> / <job> (<event>)"` (`modules/actions/workflows.go:158-165`),
-posted for push/PR/release-family events (`ShouldEventCreateCommitStatus`
-`workflows.go:172-178`) via `CreateCommitStatusForRunJobs`
-(`services/actions/commit_status.go:31`); internal status-update notifications
-(`NotifyWorkflow*` family `services/actions/notify.go:16-133`); and the cancel/
-timeout machinery (`StopTask` `models/actions/task.go:568`; zombie/endless/abandoned
-timeouts `modules/setting/actions.go:138-140`).
+**Deferred beyond M3:** scheduled workflows (§1.4), scoped + reusable workflows,
+rerun/multi-attempt, packages triggers, the checkout shim (§1.4), the managed
+runner (§1.2).
 
-## 4. Workers capability mapping
+## 4. Data model
 
-### 4.1 Runner polling — fits request/response natively
+### 4.1 D1 tables (one migration family via `pnpm db:generate`)
 
-The runner polls US; nothing needs us to hold sockets open. In-tree evidence that
-upstream's FetchTask is answer-immediately (`runner.go:202-207` "it will retry on its
-next poll"; `interceptor.go:80-84` warns about write load "on every poll" — i.e. polls
-are frequent, short requests). A Hono route answering FetchTask from D1 is the same
-shape as our existing API routes. No DO, no websockets, no event consumers on the hot
-path. The `X-Gitea-Actions-Capabilities` header and uuid/token headers are plain HTTP
-headers (§2.2).
+Column-for-column ports of `gitea/models/actions/*` onto D1 types (TEXT enum
+convention per the schema's house style; booleans as integer 0/1). Twelve new
+tables below (the schedule pair is deferred, §1.4); two already exist:
 
-### 4.2 Artifacts on R2
+- **`action_runners`** (port of `ActionRunner`, `models/actions/runner.go:26-51`): `id` pk;
+  `uuid` TEXT UNIQUE; `name` TEXT(255); `version` TEXT(64); `owner_id` idx
+  (0 = global); `repo_id` idx; `description` TEXT; `base` int (0 native /
+  1 docker / 2 VM); `repo_range` TEXT; `token_hash` TEXT UNIQUE (sha256 — the
+  SPEC-0002 digest model); `token_salt` TEXT; `last_online` / `last_active` int
+  idx; `agent_labels` TEXT (JSON array); `ephemeral`, `is_disabled`,
+  `has_cancelling_support` int NOT NULL DEFAULT 0; `created`/`updated`/`deleted`
+  int. The plaintext token is never stored (`Token xorm:"-"`).
+- **`action_runner_tokens`** (port of `ActionRunnerToken`,
+  `models/actions/runner_token.go:26-37`): `id` pk; `token` TEXT UNIQUE — the
+  registration token is stored RAW upstream (`GetRunnerToken` looks it up by
+  the presented string, `:50-58`) and stays raw for parity (unlike the
+  post-registration runner token, which is salted-hash); `owner_id` idx;
+  `repo_id` idx; `is_active` int (the reset lifecycle, §2.2);
+  `created`/`updated`/`deleted`.
+- **`action_runs`** (port of `ActionRun`, `models/actions/run.go:32-76`): `id` pk; `repo_id` UNIQUE(repo_index) +
+  idx(repo_status); `owner_id` idx; `workflow_id` idx; `index` int
+  UNIQUE(repo_index) — the per-repo run number (`action_run_index` sequence,
+  §2.9 → our `repo_counters` + a new `runIndex` column, §4.5); `trigger_user_id`
+  idx; `schedule_id` int DEFAULT 0; `ref` idx; `commit_sha` idx;
+  `is_fork_pull_request`, `need_approval` int; `approved_by` idx;
+  `event` TEXT; `event_payload` TEXT (JSON); `trigger_event` TEXT; `status` int
+  idx (the 10-value Status enum, `models/actions/status.go:15-25`);
+  `version` int (optimistic lock); `raw_concurrency` TEXT; `workflow_repo_id`,
+  `workflow_commit_sha`, `is_scoped_run` (parity columns, unread in v1);
+  `started`/`stopped` int; `previous_duration` int DEFAULT 0 (legacy-only);
+  `latest_attempt_id` idx DEFAULT 0; `created`/`updated`.
+- **`action_run_jobs`** (`run_job.go:24-130+`): `id` pk; `run_id` idx; `repo_id`
+  idx(repo_concurrency) idx(repo_status); `owner_id` idx; `commit_sha` idx;
+  `is_fork_pull_request`; `name` TEXT(255); `attempt` int; `workflow_payload`
+  BLOB (the single-job YAML); `job_id` TEXT(255) (the YAML job key);
+  `needs`/`runs_on` TEXT (JSON arrays); `task_id` idx(pickup) DEFAULT 0;
+  `source_task_id` DEFAULT 0; `status` int idx; `raw_concurrency` TEXT;
+  `is_concurrency_evaluated` int; `concurrency_group` TEXT idx(repo_concurrency)
+  DEFAULT ''; `concurrency_cancel` int DEFAULT 0; `token_permissions` TEXT
+  (JSON); `max_parallel` int DEFAULT 0; `is_matrix_deferred` int DEFAULT 0;
+  `deferred_matrix_payload` BLOB; `run_attempt_id` idx DEFAULT 0;
+  `attempt_job_id` idx DEFAULT 0; the reusable-workflow columns
+  (`workflow_source_repo_id`, `workflow_source_commit_sha`, `is_reusable_caller`,
+  `is_expanded`, `call_uses`, `reusable_workflow_content`, `reusable_workflow_ref`,
+  `call_secrets`, `call_payload`, `parent_job_id` idx, `continue_on_error`) —
+  all parity-ported, unread in v1.
+- **`action_run_attempts`** (`run_attempt.go`): `id` pk; `repo_id`
+  idx(repo_concurrency_status); `run_id` + `attempt` UNIQUE(run_attempt);
+  `trigger_user_id`; concurrency columns; `status` idx; `started`/`stopped`;
+  `created`/`updated`. v1 always attempt = 1.
+- **`action_tasks`** (port of `ActionTask`, `models/actions/task.go:40-66`): `id` pk; `job_id`; `attempt`; `runner_id`
+  idx; `status` idx; `started` idx; `stopped` idx(stopped_log_expired); `repo_id`
+  idx; `owner_id` idx; `commit_sha` idx; `is_fork_pull_request`; `token_hash`
+  UNIQUE; `token_salt`; `token_last_eight` idx; `log_filename` TEXT;
+  `log_in_storage` int; `log_length` int (rows); `log_size` int (bytes);
+  `log_indexes` BLOB (row→offset map); `log_expired` idx(stopped_log_expired);
+  `created`/`updated` idx.
+- **`action_task_steps`** (`task_step.go`): `id` pk; `name` TEXT(255);
+  `task_id` + `index` UNIQUE(task_index); `repo_id` idx; `status` idx;
+  `log_index`/`log_length` int; `stage` int DEFAULT 0; `number` int DEFAULT 0;
+  `started`/`stopped`/`created`/`updated`.
+- **`action_task_outputs`** (`task_output.go`): `id` pk; `task_id` +
+  `output_key` UNIQUE(task_id_output_key); `output_value` TEXT.
+- **`action_tasks_versions`** (`tasks_version.go:16-24`): `id` pk; `owner_id`
+  UNIQUE(owner_repo); `repo_id` UNIQUE(owner_repo); `version` int;
+  `created`/`updated`. Scopes: (0,0) global, (owner,0) owner, (0,repo) repo —
+  bumps cascade all three (§2.2).
+- **`action_artifacts`** (port of `ActionArtifact`, `artifact.go:62-90`): `id` pk; `run_id`
+  UNIQUE(runid_attempt_name_path) idx; `run_attempt_id` (uq part) DEFAULT 0;
+  `runner_id`; `repo_id` idx; `owner_id`; `commit_sha`; `storage_path` TEXT;
+  `file_size`/`file_compressed_size` int; `content_encoding_or_type` TEXT
+  DEFAULT ''; `artifact_path` + `artifact_name` (uq parts) TEXT; `status` int
+  idx (UploadPending=1 → UploadConfirmed=2 → Expired=4 → PendingDeletion=5 →
+  Deleted=6; UploadError=3 reserved, `artifact.go:25-30`); `created`/`updated`
+  idx; `expired_unix` idx (0 = keep forever).
+- **`action_run_job_summaries`** (port of `ActionRunJobSummary`,
+  `models/actions/run_job_summary.go:36-49`): `id` pk; `repo_id`
+  + `run_id` + `run_attempt_id` + `job_id` + `step_index` UNIQUE(summary_key);
+  `content` TEXT; `content_type` TEXT DEFAULT 'text/markdown'; `content_size`
+  int DEFAULT 0; `created`/`updated`.
+- **`action_log_chunks`** (our DBFS analog, §4.3 — no upstream table of its
+  own; upstream scopes its log chunks inside the generic `dbfs` table):
+  `id` pk; `task_id` idx; `seq` int (append order); `bytes` BLOB.
+  UNIQUE(`task_id`, `seq`) guards the append order; rows are deleted when the
+  log seals to R2.
+- **`action_schedule_specs`** / **`action_schedules`** — deferred to the
+  scheduled-workflows milestone (§1.4); NOT in the M1a migration (no reader).
+- **Already exist** (verified `apps/worker/src/db/schema.ts`): `secrets`
+  (`schema.ts:2292` — upstream-parity columns incl. the owner/repo scope
+  encoding and the documented plaintext divergence) and `action_variables`
+  (`schema.ts:2334`). `commit_statuses` (`schema.ts:906`) serves §2.9's
+  publication arm. No new table for them — M1a only adds the read-side service
+  arms (`GetSecretsOfTask`/`GetVariablesOfRun` equivalents).
 
-Layout proposal (mirrors the LFS prefix precedent, `services/lfs/store.ts:78`):
+### 4.2 R2 keys
+
+Under the shared `REPO_PACKS` bucket (the only binding,
+`wrangler.jsonc.example:94-101`), one new namespace, keys as pure functions of
+validated segments (the LFS injection-proof rule, `services/lfs/store.ts:5-9`;
+D1 stores bare rows only):
 
 ```
-actions/tmp/<run_id>/v3/<run>-<artifact>-<start>-<end>.chunk     # v1 chunks (name format upstream, artifacts_chunks.go:41-47)
-actions/tmp/<run_id>/v4/block-<run>-<artifact>-<size>-<b64blockid>  # v4 blocks (artifactsv4.go:179-182)
-actions/tmp/<run_id>/v4/<run>-<artifact>-blocklist               # XML blocklist (artifactsv4.go:448)
-actions/artifacts/<run_id>/<artifact_id>/<attempt>-<ts>          # merged object (generateArtifactStoragePath analog, artifacts_chunks.go:298-307)
+actions/logs/<log_filename>                       # sealed task logs (§4.3; log_filename is logFileName(repoFullName, taskID))
+actions/tmp/<run_id>/v3/<run>-<artifact>-<s>-<e>.chunk    # v1 chunks (artifacts_chunks.go:44-51 shape)
+actions/tmp/<run_id>/v4/tmp-upload/run-<run_id>-v4        # v4 spool object (artifacts_chunks.go:35-37)
+actions/artifacts/<run_id>/<artifact_id>          # merged artifact (storage_path; artifacts_chunks.go:298-307 analog)
 ```
 
-- **Chunk ingest** is a streaming R2 PUT per request — no memory scaling (AGENTS.md:155
-  stream-don't-buffer; the Workers isolate memory cap is 128 MiB, so buffering even a
-  4 MiB-class artifact would be fine but buffering a 10 GiB one is impossible; every
-  path below streams).
-- **The merge is the hard part**: upstream merges by re-reading chunks in order
-  through an in-process MultiReader (`artifacts_chunks.go:333-349`). R2 has no server-side
-  concatenation and no append (the same gap SPEC-0001a recorded for copies —
-  workerd#1349, `docs/decisions/0001-technical-direction.md:199`).
-  Proposal: stream-merge inside ONE request — open chunk objects sequentially and pipe
-  them into a single R2 multipart upload, part by part (flat memory; wall time is R2
-  throughput, which is free — HTTP wall time is unbounded while the client stays
-  connected, AGENTS.md:163-165; only CPU counts, and piping is near-zero CPU). Cap
-  per-merge wall time by chunk count via a queue consumer for very large artifacts if
-  the request budget proves tight (OQ-3).
-- **Size caps**: upstream has no hard artifact size cap in code — the effective caps
-  are config retention (default 90 days, `modules/setting/actions.go:19, 32, 58`) and
-  storage. We propose an explicit quota per run (product decision, OQ-5) plus the
-  existing 1 MiB proto/summary caps verbatim (§2.4, §2.5).
-- v4 signed URLs map cleanly onto our own HMAC scheme — same construction as upstream
-  (`modules/actions/artifacts.go:19-29`), and SPEC-0006's relay/presign duality
-  (`services/lfs/router.ts:375`) is the precedent for serving downloads.
+- Chunk/block ingest is a streaming R2 PUT per request — never buffered
+  (AGENTS.md stream-don't-buffer rule; the isolate memory cap makes buffering a
+  10 GiB artifact impossible; every path streams).
+- **The merge**: upstream re-reads chunks in order through an in-process
+  MultiReader (`artifacts_chunks.go:333-349`). R2 has no server-side
+  concatenation (the same gap SPEC-0001a recorded — workerd#1349). Proposal
+  (unchanged from the draft, §5.5 for failure windows): stream-merge inside ONE
+  request — open chunk objects sequentially and pipe into a single R2 multipart
+  upload part by part (near-zero CPU; wall time is R2 throughput, free under the
+  unbounded-HTTP-wall rule). Very large finalizes can move to the `repo-tasks`
+  consumer if instrumentation says so (§8 note).
+- Downloads: v4's HMAC-signed URLs map onto our own HMAC scheme — same
+  construction as upstream (`modules/actions/artifacts.go:19-29`); the
+  presign/relay duality precedent is SPEC-0006's LFS store
+  (`services/lfs/batch.ts:16-24`).
 
-### 4.3 Log streaming
+### 4.3 Log storage: the DBFS mapping is direct
 
-Upstream appends rows to a DBFS file (row format `"<RFC3339-time> <content>"`,
-`modules/actions/log.go:24-30`; append API `WriteLogs` `:35-78`, explicitly chosen
-"because it's not efficient to append content to object storage" `:32-34`), then
-seals it into object storage with zstd 128 KiB blocks on `NoMore`
-(`TransferLogs` `:126-129`; block-size rationale `:114-119`). Rows are ≤64 KiB
-(`MaxLineSize` `:25`).
+Upstream's hot log store is **DBFS — a database-backed virtual file** (chunk
+rows in the `dbfs` table; `WriteLogs` opens `actions_log/<log_filename>` with
+O_APPEND semantics, refuses writes past a shrunk file to avoid content holes,
+seeks to the offset, and appends the row-formatted bytes,
+`modules/actions/log.go:35-78`). Row format: `"<RFC3339 7-digit-fraction UTC> <content>\n"`,
+newlines inside content escaped as literal `\n`, lines truncated at 64 KiB
+(`MaxLineSize`, `FormatLog`, `log.go:24-30, 213-220`). Sealing: `TransferLogs`
+copies the file into object storage — compressed ONLY when the filename ends
+`.zst` (the `LOG_COMPRESSION` setting; upstream's own default is zstd but
+`none` is a valid setting, `modules/setting/actions.go:30,137-138`) — then
+deletes the DBFS file.
 
-Workers options, in preference order:
+Workers mapping (parity, not deviation): **`action_log_chunks`** — D1 rows
+`(task_id, seq, bytes)` mirroring DBFS chunk rows scoped to one log file; the
+`UpdateLog` handler appends one chunk row per call (the protocol already batches
+rows per call), maintaining `log_length`/`log_size`/`log_indexes` on the task
+row exactly as upstream. On `no_more`, a same-request stream-merge (D1 chunk
+rows → one R2 object `actions/logs/<log_filename>`) flips `log_in_storage`;
+the DBFS row family is deleted after the object is durable (upstream's `remove()`,
+`routers/api/actions/runner/runner.go:354-356`). Divergence (documented): sealed logs are stored
+**uncompressed** — upstream's `LOG_COMPRESSION = none` shape — because zstd is
+not a Workers platform primitive; gzip would be a gratuitous deviation from the
+byte format, and uncompressed log objects stream fine. Reads (UI log panel,
+`GET /actions/jobs/{id}/logs`) hit D1 hot chunks or the R2 sealed object via
+`ReadLogs`-equivalent parsing (same line format, same 64 KiB cap).
 
-1. **D1-held active rows + R2 sealed object** (proposed): while a task runs, `UpdateLog`
-   appends row batches to a D1 `action_task_logs` table (upstream keeps the same data
-   hot in DBFS); on `NoMore` a `ctx.waitUntil`/queue job streams rows into one R2
-   object (optionally zstd) and flips `log_in_storage` (upstream column parity,
-   `runner.go:351`). Reads (UI/API `GET /actions/jobs/{id}/logs`, §2.7) hit D1 hot or
-   R2 sealed. This keeps the runner protocol's ack-index semantics byte-identical.
-2. A per-task DO holding the live log stream (append-friendly), sealed to R2. Rejected
-   for v1: adds a DO class + migration for state D1 already models, and the write rate
-   (rows per second per running task, `interceptor.go:72-75` notes UpdateLog can fire
-   many times per second) is D1-appropriate at hobby scale.
+### 4.4 Auth, keys, retention
 
-### 4.4 Job queue & scheduling
+- **Runtime JWT** (artifacts/auth; §2.4): HS256 over claims
+  `{scp: "Actions.Results:{run}:{job}", ac: <cache-scope JSON>, task_id, run_id,
+  job_id}` with 1 h + EndlessTaskTimeout expiry (`services/actions/auth.go:22-70`;
+  timeout defaults `modules/setting/actions.go:133-135`, endless = 3 h) signed with the
+  general token-signing secret → one Worker secret (`wrangler secret`), replacing
+  `GetGeneralTokenSigningSecret`. The OIDC request JWT reuses the same signer
+  with `scp = "Actions.IDTokenRequest"` (`auth.go:20, 92-112`).
+- **OIDC signing key**: upstream persists an RS256 PEM on disk
+  (`services/actions/oidc.go:41-54`). Workers: generate once (Web Crypto RS256
+  is native), store the private PKCS-8 in D1 (the AES-encrypted secret pattern,
+  SPEC-0009's mirror-credential precedent), publish the JWK at `/jwks`.
+- **Runner tokens**: salted sha256 (`auth_model.HashToken`), the SPEC-0002
+  digest model verbatim (`interceptor.go:97-107`).
+- **Retention** (`modules/setting/actions.go:19-21,57-59`): artifacts 90 d,
+  logs 365 d, runs 400 d — the cleanup arm (§4.5) ports
+  `cleanup/Task` equivalents as `ACTIONS_ARTIFACT_RETENTION_DAYS` /
+  `ACTIONS_LOG_RETENTION_DAYS` / `ACTIONS_RUN_RETENTION_DAYS` strict-polarity
+  vars with upstream defaults. Upstream has no artifact SIZE cap in code — that
+  gap is Open question 3.
 
-Upstream's queue is D1: waiting jobs are rows (`FindJobQueueJobs`
-`models/actions/run_job_queue.go:59`, ordered oldest-first `:54`), claiming is a
-conditional UPDATE CAS (`task.go:392-400`), and the runner's poll is the dequeue
-trigger. **D1 alone is the right v1 design** — no Queues, no DO needed for the claim
-itself; the claim race is a single conditional UPDATE, exactly the D1+Drizzle pattern
-the repo already uses. Where Cloudflare Queues DO join: (a) kicking the job emitter
-after `UpdateTask` (needs-graph re-resolution is a bounded D1 transaction — upstream
-runs it inline, `runner.go:270-276`; we can too, falling back to enqueue if the
-transaction grows), and (b) retention/cleanup sweeps riding the existing `repo-tasks`
-consumer (wrangler.jsonc:105, dispatch `apps/worker/src/index.ts:125`). Cron: the
-existing `*/10` trigger (wrangler.jsonc:92) already proves the sub-hour cadence;
-schedule workflows are a v2 add-on riding the same producer pattern (§1.3).
+### 4.5 Queue, cron, and the no-DO posture
 
-### 4.5 The trigger chain — our landed onPush seam
+- **Poll/claim is request/response**: the runner polls US; FetchTask answers
+  immediately from D1 (§2.2) — no DO, no websockets, no held sockets.
+- **The claim race is a conditional UPDATE** (`task.go:392-400`) — the exact
+  D1+Drizzle CAS pattern the repo already uses; D1 serializes it per-row.
+- **The job emitter** (M3): upstream runs it inline in UpdateTask through its
+  internal `actions_ready_job` queue (`services/actions/init.go:63-67`). Our
+  mapping: bounded emitter work (needs-graph re-resolution over one run's jobs)
+  runs inline in the UpdateTask request exactly as upstream's handler does,
+  with a `repo-tasks` enqueue fallback (`{kind: "actions-emit", runId}` joining
+  the serialized `handleRepoTasks` dispatch, `src/repos/purge.ts` family) if a
+  run's emitter work grows beyond the inline budget. The message kind joins the
+  authoritative dispatch-arms doc (`src/repos/dlq.ts:30`).
+- **Retention/cleanup**: an hourly-producer block joins the scheduled dispatcher
+  (the SPEC-0014 §3 sanctioned-extension pattern: SELECT due work → enqueue;
+  the consumer executes — artifact expiry flips + R2 deletes, log sealing
+  orphans, run/log row expiry, `StopTask` zombie sweep below).
+- **Run numbering**: upstream's `action_run_index` named sequence
+  (`services/actions/run.go:67`) maps onto `repo_counters` — a new `run_index`
+  column beside `issue_index` (the `syncMaxIssueIndex` CAS idiom,
+  `src/issues/service.ts:264-272`).
+- **The pick limiter**: upstream's `MAX_CONCURRENT_TASK_PICKS` is a per-process
+  semaphore (`services/actions/task.go:31-53`). On Workers each isolate carries
+  its own semaphore — the throttle degrades to per-isolate (still safe: the CAS
+  is the correctness mechanism; the limiter only damps herd load). Documented
+  divergence, not a design change.
 
-The push half of upstream's ~25 notifier hooks is the v1 wedge:
+### 4.6 Divergence ledger (documented, each upstream-sanctioned or forced)
 
-```
-engine receive finalize
-  → onPush seam (apps/worker/src/index.ts:29, wired :42; adapter
-    handleUserPushEvent apps/worker/src/services/webhooks-push.ts:465)
-  → [NEW, queue consumer] resolve commit tree from RepoCell → list workflow files
-    → parse YAML → match on: push (branches/paths filters) → insert run + job rows
-    (D1) → post commit statuses (POST /repos/{owner}/{repo}/statuses/{sha} service
-    already exists: apps/worker/src/api/routes/statuses.ts:110-114, mounted
-    apps/worker/src/api/router.ts:48)
-```
+1. Sealed logs uncompressed (upstream's `LOG_COMPRESSION=none`; zstd unavailable
+   on Workers) — §4.3.
+2. OIDC private key in encrypted D1 instead of a PEM file — §4.4 (no disk).
+3. Per-isolate pick limiter — §4.5.
+4. Secrets stored plaintext (the existing `secrets` divergence, schema.ts:2288-2291;
+   Actions reads them through the same service — no new posture).
+5. DBFS chunk rows → `action_log_chunks` D1 table (same shape, different engine) — §4.3.
+6. `repo_counters.run_index` instead of the `action_run_index` named sequence — §4.5.
 
-`emitPushFamilyUpdates` already fans out per-ref from the same seam
-(`services/webhooks-push.ts:220, 441`); the Actions consumer joins it as one more
-fan-out leg — but parse+match must NOT run inline in `waitUntil` (30 s hard cap,
-AGENTS.md:166-167): it enqueues a `repo-tasks` message (the pattern SPEC-0009's sync
-notifications already use, `specs/README.md:39`).
+## 5. Edge cases, limits, and failure modes
 
-**CPU/time budget for workflow parsing** (the real constraint): per pushed ref, cost
-is O(files × parse). Upstream caps each file at 1 MiB (`workflows.go:115`) and skips
-non-`.yml`/`.yaml` paths (`workflows.go:62-63`); the D1-free path is: engine tree
-list (one RPC) + per-file blob read (one RPC each — batchable) + YAML parse. A
-10-workflow repo at ~50 KB average is ~500 KB of YAML; a JS YAML parse of that is
-milliseconds-to-tens-of-ms of CPU — comfortably inside `limits.cpu_ms: 300000`
-(wrangler.jsonc:11) per request. The budget risk is not per-request CPU but **port
-fidelity of the parser itself** (matrix expansion, expression subset used by `if:` —
-server-side per §3.1; OQ-2).
+1. **Runner offline / heartbeat load** — online status is the debounced
+   `last_online` (`ShouldPersistLastOnline`, `models/actions/runner.go:89-99`; `IsOnline`,
+   `:145-156`); polls and log flushes must NOT write per-request (upstream's
+   debounce exists because "writing on every poll is a major source of DB load",
+   `interceptor.go:80-84`). Our interceptor-equivalent middleware carries the
+   same debounce constants.
+2. **tasks_version races** — bumps cascade global→owner→repo in one transaction
+   (`models/actions/tasks_version.go:66-86`); a missing row self-heals by re-insert
+   (`:49-59`); FetchTask bootstraps 0→1 so old runners don't misread
+   (`routers/api/actions/runner/runner.go:179-187`); a throttled pick returns the
+   runner's STALE version so it retries instead of sleeping (`:202-207`). The
+   runner-served version is advisory only — the server always tries a pick on
+   mismatch.
+3. **Claim races** — the `task_id = 0 AND status = waiting` conditional UPDATE
+   answers `errJobAlreadyClaimed` on loss (`models/actions/task.go:392-400`); the outer loop
+   advances to the next candidate (`:303-331`). A crashed assembly releases via
+   `ReleaseTaskForRunner` with a FRESH context (the request context is already
+   cancelled — the exact upstream comment, `services/actions/task.go:55-64`).
+   Ephemeral runners: one task per lifetime; the runner row is deleted after the
+   task finishes and the next poll errors ("runner has been removed",
+   `services/actions/task.go:77-95`).
+4. **Log chunk ordering / sealing** — the ack-index protocol (§2.2): trim
+   already-acked rows; refuse seals with gaps; ack re-sent finalizes
+   idempotently; `AlreadyExists` for appends past the seal; the empty-log
+   bootstrap write (offset 0, zero rows) so sealing an output-less task works
+   (`routers/api/actions/runner/runner.go:311-330`). Our consumer mirrors each
+   branch byte-for-byte —
+   these are contract fixtures, not prose.
+5. **Artifact expiry** — `expired_unix` 0 = forever; retention flips status
+   Expired → PendingDeletion → Deleted with the R2 delete in the consumer arm
+   (`artifact.go:21-44`); a re-upload of the same (run, attempt, name, path)
+   is UNIQUE-blocked (`runid_attempt_name_path`) — the v1/v4 families answer
+   with the existing row semantics, not a duplicate object.
+6. **Zombie/endless/abandoned tasks** — upstream timeouts: zombie 10 min, endless
+   3 h, abandoned job 24 h (`modules/setting/actions.go:133-135`); the hourly
+   consumer arm sweeps (`StopTask`, `models/actions/task.go:568`). v1 ports the
+   sweep; the var names ride §4.4's strict-polarity pattern.
+7. **Caps** — proto/summary bodies 1 MiB (`artifactsv4.go:296`;
+   `run_job_summary.go:23-29`); output keys 255 B / values 1 MiB, skipped not
+   fatal (`routers/api/actions/runner/runner.go:231-249`); log lines 64 KiB (`log.go:25`); workflow files
+   1 MiB (`workflows.go:115`); matrix ≤256 jobs (`run_job.go:29`).
+8. **Cycle break** — events triggered BY the Actions user never re-trigger
+   (the `ActionsUserID` guard, `notifier_helper.go:139-155`); M3 ports it (our
+   trigger chain must recognize the system doer).
+9. **Default-branch fallback** — events that only fire on the default branch
+   read workflows from the default branch even when the push ref differs
+   (`notifier_helper.go:178-189`).
+10. **Proto-body parsing** — v4 accepts protojson only within the 1 MiB cap;
+    oversized bodies fail before any R2 call (checked before and during
+    streaming, the release-asset discipline).
 
-### 4.6 Auth & keys
+## 6. Testing plan
 
-- Runtime JWT (artifacts/auth): HS256 with a server-wide signing secret
-  (`services/actions/auth.go:63-70`) → one Worker secret (`wrangler secret`),
-  replacing upstream's `GetGeneralTokenSigningSecret`.
-- OIDC signing key: upstream persists an RS256 PEM on disk
-  (`services/actions/oidc.go:41-54`). Workers equivalent: generate once, store the
-  private key in D1 (encrypted with the existing AES pattern, SPEC-0009 §4.2
-  precedent) or derive from a secret; publish the JWK at `/jwks`. Web Crypto supports
-  RS256 sign/verify natively.
-- Runner tokens: upstream stores salt+hash (`interceptor.go:97-107`,
-  `auth_model.HashToken`) — identical to SPEC-0002's SHA-256-digest token model
-  (ADR-0001 D3, `docs/decisions/0001-technical-direction.md:82`).
+### 6.1 Wire freeze (M1a step 0)
 
-### 4.7 Schema
+Fetch `gitea.dev/actionslib v1.5.0` from the public Go module proxy; verify the
+hash against the in-tree go.sum line (`gitea/go.sum:15-16`,
+`h1:dC3v2HTWbbvyNBSdg2W3kd4WNC/p+FnZaKpl1MdzM00=`); transcribe the `ping/v1`
+and `runner/v1` `.proto` files into the repo as contract fixtures with the hash
+recorded beside them. This replaces the draft's "capture a live session" M0 with
+a cheaper, MORE precise freeze — the proto is pinned upstream truth, not
+observed behavior. The header-name constants (`UUIDHeader`/`TokenHeader`) come
+from the same fetch.
 
-New D1 tables (one migration family, Drizzle per AGENTS.md:38-39): `action_runners`,
-`action_runner_tokens`, `action_runs`, `action_run_jobs`, `action_tasks`,
-`action_task_steps`, `action_task_outputs`, `action_task_logs` (v1-deviation, §4.3),
-`action_artifacts`, `action_run_job_summaries`, `action_secrets`, `action_variables`
-— column-for-column ports of `gitea/models/actions/{runner,run,run_job,task,
-task_step,task_output,artifact,run_job_summary,variable}.go` minus upstream's ORM
-plumbing, plus the tasks-version counter (`models/actions/tasks_version.go`).
+### 6.2 The fake-runner harness (the oracle)
 
-## 5. Milestones, effort, and what stays out
+A Node act_runner-protocol client (`tests/actions/fake-runner.ts` or
+equivalent) implementing the FULL runner lifecycle over HTTP against the real
+routes in workerd: ping → register (with a minted registration token) → declare
+→ FetchTask poll loop (with a tasks_version cache) → receive the claim payload →
+emit canned UpdateLog batches (rows, re-sends, past-seal appends, gap seals) →
+UpdateTask result + outputs → v4 artifact create/upload-blocks/finalize/list/
+download → v1-family round-trip → OIDC mint-and-verify → job-summary upload.
+Every §5 branch that has a wire answer (trim/ack/AlreadyExists/gap-refusal,
+throttled-pick version echo, output resend keys) is asserted from the runner's
+seat. This harness is the standing oracle: it IS an act_runner for CI purposes,
+and the real binary (§6.5) is the acceptance bar on top of it.
 
-Effort is in **wave units** — one wave ≈ one background-agent landing unit with review
-(AGENTS.md pool discipline, AGENTS.md:91-108). Estimates are honest first-passes with
-the uncertainty source named; they assume the §1.1 wire capture has happened.
+### 6.3 Unit + model tests (vitest, real bindings)
 
-| # | Milestone | Content | Est. | Why |
+- Claim CAS under concurrent FetchTasks (two harnesses racing one waiting job —
+  exactly one wins, the other gets `tasks_version` echo semantics);
+  ephemeral-runner lifecycle; ephemeral refusal while its task lives.
+- tasks_version cascade (global/owner/repo rows) + self-heal re-insert.
+- UpdateTaskByState transitions incl. the optimistic-lock `version` column;
+  output upsert-if-absent + resend-key list.
+- Log math: `log_length`/`log_size`/`log_indexes` under trim/re-send; seal
+  refuses gaps; empty-log bootstrap; hot→R2 seal flips `log_in_storage` and
+  deletes chunks; ReadLogs round-trip parses the upstream line format.
+- Artifacts: chunk name parse (v3), blocklist XML replay (v4), streamed-md5
+  verification failure rejects, merge produces the merged object + row flip,
+  HMAC signature verify/reject (expired, tampered name/taskID).
+- OIDC: discovery doc shape, JWKS, exchange happy-path + wrong-scope/wrong-task
+  rejections.
+- Retention arms: expiry flips, R2 deletes, strict-polarity var disarm.
+
+### 6.4 Trigger-chain tests (M3)
+
+Workflow matchers differential-tested against recorded upstream input/output
+pairs (push/PR/release filter semantics — the SPEC-0001b differential precedent);
+the expression evaluator against the GitHub expression conformance cases
+actionslib's own tests encode (extracted at wire-freeze); `[skip ci]` strings;
+cycle break; default-branch fallback; commit-status context naming.
+
+### 6.5 E2E acceptance bar
+
+A real act_runner binary against local workerd running a trivial workflow
+(echo → upload artifact → download → assert), log ack/resume, and OIDC
+mint-and-verify. Unmodified runner, green suite — the §1.2 acceptance sentence,
+empirically. Runs as a manual/release gate initially (CI container posture is
+Open question 4).
+
+### 6.6 Gates
+
+`pnpm typecheck`; `pnpm test:full` per ADR-0006 — a single-file `pnpm test` pass
+is never cited as suite-green; the `Tests ` line is read with our own eyes.
+
+## 7. Milestones
+
+Sizes are wave units (one wave ≈ one background-agent landing unit with review,
+AGENTS.md pool discipline). M1 is staged for dispatch NOW; M2 follows M1; M3 is
+gated on Open question 1's resolution.
+
+| # | Milestone | Content | Size | Notes |
 |---|---|---|---|---|
-| M0 | Wire-capture freeze | Capture act_runner ↔ reference Gitea; pin protocol variant, procedure names, codec; record in this SPEC | 0.5 | External tooling only, no repo code |
-| M1 | Schema + runner protocol | D1 tables; connect-RPC-compatible codec (hand-rolled or a protobuf lib — OQ-1); Register/Declare/FetchTask/UpdateTask; ping | 2 | New wire machinery; codec risk is the unknown |
-| M2 | Trigger chain | YAML model + `on:` push matching + matrix expansion + job `if:`/needs resolver (TS port of the actionslib model subset, §3.1); onPush consumer; commit statuses | 3 | Largest port surface; expression evaluation fidelity (OQ-2) |
-| M3 | Claim + state machine | `CreateTaskForRunner` CAS port, tasks_version, UpdateTask outputs, job emitter v1 (needs graph, serial-first), timeouts/cancel | 2 | Concurrency subtleties; emitter is 718 lines upstream |
-| M4 | Logs | UpdateLog ack protocol, D1 hot rows, seal→R2, jobs/{id}/logs endpoint | 1 | Protocol simple; storage choice settled (§4.3) |
-| M5 | Artifacts v4 + v1 | Signed URLs, block upload, streaming merge to R2, download, delete; v1 family for old runners | 2 | Merge choreography (§4.2); v1 is mostly mechanical once v4 lands |
-| M6 | Registry APIs + OIDC + summaries + retention | §2.7 v1 additions; RS256 issuer; job summaries; cleanup sweeps; swagger contract entries | 1.5 | Broad but shallow; rides existing patterns |
+| M1a | Model + registration + dispatch | Migration (12 tables §4.1); the connect-RPC codec (per OQ-2); wire freeze §6.1; ping + Register/Declare; runner-token lifecycle (§2.2 NOTE); the `/api/v1` registration-token + runners-CRUD ops; FetchTask + tasks_version + the claim CAS + `TryPickTask`; `buildRunnerTask` payload (contexts, secrets/vars reads, needs); the interceptor middleware (uuid/token auth + debounced heartbeats); the fake-runner harness skeleton through claim | **L** | The codec is the unknown (OQ-2); everything else is ported shapes |
+| M1b | UpdateTask + log + artifact ingestion | UpdateTask state machine + outputs + resend keys; UpdateLog ack/seal protocol + `action_log_chunks` + R2 seal + the logs-download endpoint; artifacts v4 (proto in-tree) then v1; job summaries; the OIDC issuer; retention/zombie consumer arm; harness grows to the full lifecycle (§6.2) | **L** | The streaming merge is the platform-hard part (§4.2) |
+| M1c | The UI family | The repo Actions tab (runs list, run viewer + log panel, dispatch inputs, artifact preview/download, badge), owner/repo settings pages (runners, variables), admin runners + job queue — the §2.10 census, upstream-template-shaped under our UI conventions (SPEC-0008/0010 posture) | **L** | The largest single UI family after the core web UI; runs_list + view are the deep pages |
+| M2 | Self-host runner docs | README/docs: enable Actions, mint a registration token, register act_runner, labels ↔ runs-on guidance, artifact/log retention defaults; the divergence ledger (§4.6) restated for operators | **S** | Rides M1a's registration flow; publishable after M1b (a runner is only useful once it can report) |
+| M3 | The trigger chain | NOT the brief's "managed runner" (that stays out, §1.2): notifier census §2.9 wired to the `onPush`/create/delete seams via `repo-tasks` messages; workflow detection + YAML model port; the OQ-1 expression subset; InsertRun + run numbering; the job emitter + max-parallel + concurrency; commit statuses (+ skipped-status arm); `[skip ci]`; cycle break; harness + differential tests §6.4 | **L** | Gated on OQ-1; the port-fidelity risk lives here |
 
-**Total: ~12 waves** (M0 0.5 + 11.5 implementation). For calibration: SPEC-0009
-(mirrors+import) landed end-to-end across roughly a comparable multi-wave arc
-(`specs/README.md:39`). Items that could blow the estimate: expression-evaluation
-fidelity (M2), and v1-artifacts-era runner compatibility (dropped if OQ-1 says modern
-runners only speak v4 — saves ~0.5 wave).
+**Deferred (each its own future SPEC-attachment):** scheduled workflows (tables
++ cron producer riding the existing `*/10` entry — upstream's own cadence),
+scoped + reusable workflows, rerun/multi-attempt, packages triggers, the v1
+artifacts-family trimming if wire-freeze shows no legacy runners in practice.
 
-**Deliberately NOT built in v1** (and gated even later unless a demand arrives):
-marketplace/self-hosted action hosting beyond documenting that runners check out
-actions from GitHub by default (`modules/setting/actions.go:46`) — the "checkout shim"
-(question: do we ever need to proxy/cache `uses:` downloads; answer deferred, OQ-4);
-container orchestration of any kind (the runner owns containers, §3.3); Actions UI
-pages (§1.3); scheduled workflows; scoped + reusable workflows; packages triggers;
-workflow_dispatch beyond the API endpoint if trivial (§2.7), else v2.
+## 8. Open questions
 
-## 6. Open questions
+1. **The expression evaluator's Workers port (gates M3).** Upstream evaluates
+   job-level `if:`, concurrency, and matrix expressions with actionslib's Go
+   `expreval`/`exprparser` (§2.9) — no JS equivalent exists. Candidates:
+   (a) hand-port the evaluator subset the server actually needs, rejecting
+   unsupported expressions at insert with a visible error (the SPEC-0005
+   visible-error discipline); (b) a full library port; (c) WASM-compile the Go
+   evaluator. Decide at M3 dispatch; (a) is the working proposal.
+2. **Codec implementation strategy (M1a).** Hand-rolled protobuf
+   encode/decode for the ~15 frozen message shapes vs a JS protobuf library
+   (@bufbuild/protobuf or protobufjs) as a new dependency. Upstream uses
+   generated Go — no JS answer to copy. Working proposal: hand-rolled minimal
+   wire codec over the transcribed protos (no new deps, the frozen shape set is
+   small and the contract fixtures pin it), revisited if varint/bytes edge
+   cases pile up.
+3. **Per-run artifact/log quota defaults.** Upstream caps NOTHING by size —
+   only retention (90/365/400 d, §4.4). R2 spend protection wants an explicit
+   per-run cap; propose `ACTIONS_ARTIFACT_MAX_RUN_BYTES` strict-polarity var
+   (default: a 1 GiB run cap) enforced at upload-URL mint. No upstream answer
+   exists; the var relaxes it to upstream's unlimited.
+4. **Real-runner E2E posture in CI.** The acceptance bar (§6.5) needs act_runner
+   + a container runtime in CI; our runners are container-less GitHub runners
+   today. Working proposal: the fake-runner harness runs in CI (it IS the
+   protocol oracle), the real binary gates releases manually. Revisit if
+   act_runner grows a no-docker `--local` exec mode suitable for CI.
 
-- **OQ-1 (gating M1)**: Which connect protocol variant + codec does act_runner
-  actually emit (connect-proto vs gRPC), and what are the exact service/procedure
-  name strings? Answered by the M0 wire capture; the submodule does not contain them
-  (external module, `gitea/go.mod:11`).
-- **OQ-2 (M2 scope)**: Which expression subset must the server evaluate? Upstream
-  evaluates job-level `if:`, concurrency groups, and matrix (§3.1) — full GitHub
-  expressions live in actionslib's evaluator. Candidate simplification: v1 supports
-  literal/needs-result conditions only and rejects workflows using richer expressions
-  at insert time (visible error instead of silent mismatch). Decide at ratification.
-- **OQ-3 (M5)**: Streaming merge wall time for multi-GiB artifacts — does the
-  request-path merge hold, or do very large finalizes move to the `repo-tasks`
-  consumer? Instrument at M5; the CPU ceiling is not the constraint (§4.2).
-- **OQ-4 (product)**: Checkout shim for `uses:` actions — GitHub-hosted default
-  (`modules/setting/actions.go:46`) means runners need general internet egress; a
-  future self-hosted actions proxy is a separate SPEC if anyone asks.
-- **OQ-5 (product)**: Per-run artifact/log quota numbers (upstream: retention 90/365/
-  400 days, `modules/setting/actions.go:19-21`; no size cap in code). Propose
-  matching retention defaults, plus an explicit size quota to protect R2 spend.
-- **OQ-6 (D1)**: Row-cost of `action_task_steps`/logs at hobby scale — upstream
-  inserts one step row per workflow step (`task.go:374-389`) and debounce logic
-  exists precisely because log writes are hot (`interceptor.go:70-79`). Re-check
-  D1 write pricing against the ADR-0001 annex cost model before ratification.
+### Ratification (2026-10-29, orchestrator — pending)
 
-## 7. Testing plan (when ratified)
+This rewrite supersedes the 2026-10-24 gated draft. The gate's three criteria
+are void per the Upstream-Parity Decision Rule (AGENTS.md:248-257): the
+protocol is parity work (§1.1), the wire-freeze replaces the capture gate with
+a hash-pinned fetch (§6.1), and demand ceases to be an entry criterion for
+parity surfaces. Milestones M1a/M1b are dispatch-ready; M1c follows M1b; M2 is
+docs-on-top; M3 waits on Open question 1.
 
-- **Contract**: the runner protocol and artifacts families are outside
-  `/api/v1`'s swagger, so they get their own contract fixture: recorded M0 wire
-  captures replayed against our routes (byte-level for codec paths) — the
-  flare-forge discipline ADR-0001 D3 applies (`docs/decisions/0001-technical-direction.md:89-90`).
-- **Unit**: workflow matchers differential-tested against upstream Go behavior via a
-  table of recorded input/output pairs (the SPEC-0001b diff3 precedent, ADR-0001
-  annex `docs/decisions/0001-technical-direction.md:191-192`); claim-CAS races under
-  vitest-pool-workers real D1 (SPEC-0005's consumer-test pattern,
-  `apps/worker/src/webhooks/consumer.test.ts` exists as the template).
-- **E2E**: a real act_runner binary against local workerd, running a trivial
-  workflow (echo → upload artifact → download → assert), plus log ack/resume and
-  OIDC mint-and-verify. This is the acceptance bar: unmodified runner, green suite.
+### Ratification (2026-10-29, orchestrator)
+
+The rewrite lifts the demand gate per the Upstream-Parity Decision Rule. The
+four open questions resolve: (1) the expression evaluator is an M3-only
+question (the trigger chain) — deferred to M3's opening, never blocking
+M1a/b/c; (2) hand-rolled codec, frozen against the actionslib v1.5.0 source
+at M1a's wire-freeze; (3) artifact quota: parity = no size cap (upstream caps
+nothing), with a PACKAGES-style var as the self-host escape; (4) real
+act_runner E2E stays OUT of CI — the fake-runner harness is the E2E; a real
+runner smoke is M2 self-host docs material. M1a dispatched 2026-10-29.
