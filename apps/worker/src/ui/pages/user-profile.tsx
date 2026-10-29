@@ -58,8 +58,10 @@
  * - The overview menu (user/overview/header.tmpl) renders its two LIVE
  *   tabs (Repositories — ACTIVE here; Activity — the mounted `?tab=activity`
  *   page, both header.tmpl:12-34 hrefs): Overview needs a profile-readme
- *   pipeline, Projects/Packages/Code/Stars need their pages (dead links
- *   forbidden, §2.4.1).
+ *   pipeline, Projects/Code/Stars need their pages (dead links forbidden,
+ *   §2.4.1). SPEC-0016 M2 arms the Packages anchor (header.tmpl:22-25)
+ *   whenever `ctx.packagesEnabled !== false` — the `/{username}/-/packages`
+ *   family is live (pages/packages.tsx).
  * - The visibility badge next to the username follows the task brief and
  *   the org-header badge DOM (`ui large basic horizontal label`) — upstream
  *   badges org profiles only at this pin (org_profile_avatar.tmpl:9-10); an
@@ -104,6 +106,7 @@ export const userProfileLocale = {
   followers: "followers", // "user.followers"
   following: "following", // "user.following"
   repositories: "Repositories", // "user.repositories" (header.tmpl:13)
+  packages: "Packages", // "packages.title" (header.tmpl:22-25's item — SPEC-0016 M2)
   activity: "Public Activity", // "user.activity" (header.tmpl:34)
   starred: "Starred Repositories", // "user.starred" (header.tmpl:38)
   watched: "Watched Repositories", // "user.watched" (header.tmpl:45)
@@ -396,7 +399,8 @@ export function ProfileAvatarCard(props: { user: UserProfileRow; followers: numb
   );
 }
 
-/** The overview header (user/overview/header.tmpl:12-34 reduced to its live
+/**
+ * The overview header (user/overview/header.tmpl:12-34 reduced to its live
  *  tabs): Repositories ACTIVE (header.tmpl:12's exact `?tab=repositories`
  *  href — the tab pages' twin renders it inactive), the Activity anchor
  *  (header.tmpl:33-34), then the Stars anchor (header.tmpl:36-44) and the
@@ -406,8 +410,26 @@ export function ProfileAvatarCard(props: { user: UserProfileRow; followers: numb
  *  and watching is direct-URL-only with NOTHING active. The landed
  *  reduction cannot model a setting that does not exist, so BOTH anchors
  *  render here INACTIVE (the repositories tab keeps the ACTIVE item) —
- *  never watching instead of stars. */
-function ProfileTabs(props: { username: string; repoCount: number; starsCount: number }) {
+ *  never watching instead of stars.
+ *
+ * SPEC-0016 M2: the optional `packagesTab` item (header.tmpl:22-25's
+ * Packages anchor — rendered between Projects, unlanded, and Code;
+ * `octicon-package`, no count label upstream) rides the same optional-prop
+ * pattern OrgMenu's projectsTab set: absent keeps the byte-stable prior
+ * DOM; present renders INACTIVE unless `active` (the packages family's own
+ * pages pass active — pages/packages.tsx). The profile page arms it whenever
+ * `ctx.packagesEnabled !== false` (the strict-polarity global — absent
+ * means enabled).
+ */
+export function ProfileTabs(props: {
+  username: string;
+  repoCount: number;
+  starsCount: number;
+  /** The upstream Packages tab (header.tmpl:22-25), present only when the
+   *  consumer owns the `/{username}/-/packages` family (the OrgMenu
+   *  projectsTab precedent). */
+  packagesTab?: { active: boolean; href: string };
+}) {
   return (
     <overflow-menu class="ui secondary pointing tabular borderless menu tw-mb-4">
       <div class="overflow-menu-items">
@@ -415,6 +437,11 @@ function ProfileTabs(props: { username: string; repoCount: number; starsCount: n
           <Icon name="octicon-repo" /> {userProfileLocale.repositories}
           {props.repoCount > 0 ? <div class="ui small label">{props.repoCount}</div> : null}
         </a>
+        {props.packagesTab ? (
+          <a class={props.packagesTab.active ? "active item" : "item"} href={props.packagesTab.href}>
+            <Icon name="octicon-package" /> {userProfileLocale.packages}
+          </a>
+        ) : null}
         <a class="item" href={`/${props.username}?tab=activity`}>
           <Icon name="octicon-rss" /> {userProfileLocale.activity}
         </a>
@@ -450,7 +477,14 @@ export function UserProfilePage(props: { ctx: UiContext; data: UserProfileData }
             <ProfileAvatarCard user={data.user} followers={data.followers} following={data.following} />
           </div>
           <div class="ui twelve wide column tw-mb-4">
-            <ProfileTabs username={data.user.username} repoCount={data.total} starsCount={data.user.numStars} />
+            <ProfileTabs
+              username={data.user.username}
+              repoCount={data.total}
+              starsCount={data.user.numStars}
+              packagesTab={
+                ctx.packagesEnabled !== false ? { active: false, href: `/${data.user.username}/-/packages` } : undefined
+              }
+            />
             {/* shared/repo/list.tmpl: the wrapper renders unconditionally
                 (zero repos = an empty list, upstream's own shape — the org
                 home's empty-placeholder is home.tmpl's, not this template). */}

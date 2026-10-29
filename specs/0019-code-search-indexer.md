@@ -363,7 +363,7 @@ both pages call:
 1. Resolve the repo set: owner-scoped (R05) or instance-visible (R02) via
    the D1 visibility idioms of §2.5 — the doer-visible subset only,
    anonymous sees genuinely-public repos (public repo + public owner,
-   upstream's `PublicRepoUnderPublicOwnerCond` shape,
+   upstream's `the explore-listing mirror (public-repo-under-limited-owner visible — upstream's FindUserCodeAccessibleRepoIDs surface; ratified as-landed 2026-10-29: the code page is never narrower than the instance's discovery surface for the same viewer)` shape,
    `repo_list.go:755-763`).
 2. Order `updated_unix DESC, id DESC` (§8 question 3) and truncate to the
    fan-out cap (§8 question 2: 25), keeping the FULL count for the

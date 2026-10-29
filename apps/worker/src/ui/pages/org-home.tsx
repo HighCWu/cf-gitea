@@ -85,6 +85,7 @@ import type { UiContext } from "../ui-context";
 export const orgHomeLocale = {
   repositories: "Repositories", // "user.repositories"
   projects: "Projects", // "user.projects" (the wave-37 projectsTab item)
+  packages: "Packages", // "packages.title" (menu.tmpl:32-35's item — SPEC-0016 M2)
   repos_empty: "No repositories yet.", // "org.repos.empty"
   repos_empty_description: "Create a repository to share code with the organization.", // "org.repos.empty_description"
   repo_updated: "Updated", // "org.repo_updated"
@@ -225,7 +226,10 @@ export function OrgHeader(props: { org: OrgRecord; signedIn: boolean }) {
  * the menu's upstream Projects tab (menu.tmpl's `{{if .CanReadProjects}}`
  * item, active on `PageIsViewProjects`), rendered only when the consumer
  * passes it; absent keeps the byte-stable single-tab DOM this page and the
- * user profile render.
+ * user profile render. SPEC-0016 M2 (pages/packages.tsx) adds the optional
+ * `packagesTab` twin — menu.tmpl:32-35's Packages item (`octicon-package`,
+ * no count label upstream), rendered only when the consumer passes it and
+ * active on the family's own pages; absent keeps the prior DOM byte-stable.
  */
 export function OrgMenu(props: {
   orgLink: string;
@@ -234,6 +238,10 @@ export function OrgMenu(props: {
    *  live `/-/projects` page; count = the open-projects total, the
    *  `{{if .ProjectCount}}` label). */
   projectsTab?: { active: boolean; count: number; href: string };
+  /** The upstream Packages tab (menu.tmpl:32-35, SPEC-0016 M2 — present
+   *  only on a consumer that owns the `/-/packages` family; upstream arms
+   *  no count label on it). */
+  packagesTab?: { active: boolean; href: string };
 }) {
   return (
     <div class="ui container">
@@ -247,6 +255,11 @@ export function OrgMenu(props: {
             <a class={props.projectsTab.active ? "active item" : "item"} href={props.projectsTab.href}>
               <Icon name="octicon-project-symlink" /> {orgHomeLocale.projects}
               {props.projectsTab.count > 0 ? <div class="ui small label">{props.projectsTab.count}</div> : null}
+            </a>
+          ) : null}
+          {props.packagesTab ? (
+            <a class={props.packagesTab.active ? "active item" : "item"} href={props.packagesTab.href}>
+              <Icon name="octicon-package" /> {orgHomeLocale.packages}
             </a>
           ) : null}
         </div>

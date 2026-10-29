@@ -22,11 +22,12 @@
  *
  * `.page-content.explore.repositories` / `.explore.users` (BOTH list pages —
  * org.go renders the same tplExploreUsers, so the orgs page carries the
- * users class upstream); the `explore/navbar` tab strip (an
- * `overflow-menu.ui.secondary.pointing tabular top attached borderless menu
- * secondary-nav`, centered — Repositories/Users/Organizations; the Code tab
- * needs the indexer, off at the default config — not rendered: its page does
- * not exist, dead links forbidden §2.4.1); then `.ui.container` with the
+ * users class upstream — and explore/code.tmpl:3 does too); the `explore/navbar`
+ * tab strip (an `overflow-menu.ui.secondary.pointing tabular top attached
+ * borderless menu secondary-nav`, centered — Repositories/Users/Organizations/
+ * Code; upstream gates the Code tab on `.IsRepoIndexerEnabled` and the page's
+ * absence kept it unrendered here — SPEC-0019 M2 landed the ungated page, the
+ * tab's dead-link reason); then `.ui.container` with the
  * search form (shared/search/combo's `.ui.small.fluid.action.input` —
  * `<input type="search" name="q" maxlength={255}>` + submit), the repo list
  * (shared/repo/list rows) or the user list (explore/user_list rows — org
@@ -124,6 +125,7 @@ export const exploreLocale = {
   no_results: "No matching results found.", // "search.no_results"
   joined_on: "Joined on", // "user.joined_on"
   user_private: "Private", // "repo.desc.private" (user_list.tmpl's badge)
+  code: "Code", // "explore.code" (navbar.tmpl's fourth item — SPEC-0019 M2)
 } as const;
 
 /** Upstream `setting.UI.ExplorePagingNum` (modules/setting/ui.go:87). */
@@ -312,15 +314,19 @@ function exploreOrgOrderBy(sort: ExploreUserSort): SQL[] {
 // Components
 // ---------------------------------------------------------------------------
 
-/** explore/navbar.tmpl: the Repositories/Users/Organizations tab strip (the
- *  Code tab needs the indexer — off at the default config, not rendered:
- *  module header; the Organizations item landed with this wave's page). */
-export function ExploreNavbar(props: { active: "repos" | "users" | "organizations" }) {
+/** explore/navbar.tmpl: the Repositories/Users/Organizations/Code tab strip
+ *  (upstream gates the Code item on `.IsRepoIndexerEnabled` — navbar.tmpl's
+ *  `{{if and … .IsRepoIndexerEnabled …}}`; our substrate's code-search pages
+ *  are NOT config-gated (SPEC-0019 §3.3 item 5 — the always-on scan arm is
+ *  the ratified posture, §5.10 records the kill-switch absence), so the item
+ *  renders unconditionally now that its page exists — pages/explore-code.tsx,
+ *  M2; the item was dead-link-forbidden only while the page was missing). */
+export function ExploreNavbar(props: { active: "repos" | "users" | "organizations" | "code" }) {
   const tab = (
-    kind: "repos" | "users" | "organizations",
+    kind: "repos" | "users" | "organizations" | "code",
     href: string,
     label: string,
-    icon: "octicon-repo" | "octicon-person" | "octicon-organization",
+    icon: "octicon-repo" | "octicon-person" | "octicon-organization" | "octicon-code",
   ) => (
     <a class={props.active === kind ? "active item" : "item"} href={href}>
       <Icon name={icon} /> {label}
@@ -332,6 +338,7 @@ export function ExploreNavbar(props: { active: "repos" | "users" | "organization
         {tab("repos", "/explore/repos", exploreLocale.repositories, "octicon-repo")}
         {tab("users", "/explore/users", exploreLocale.users, "octicon-person")}
         {tab("organizations", "/explore/organizations", exploreLocale.organizations, "octicon-organization")}
+        {tab("code", "/explore/code", exploreLocale.code, "octicon-code")}
       </div>
     </overflow-menu>
   );
