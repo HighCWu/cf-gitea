@@ -1025,7 +1025,6 @@ describe("the mounted repo actions route (the census C1: the minted-session rout
       "/alice/demo/actions/run",
       "/alice/demo/actions/disable",
       "/alice/demo/actions/enable",
-      "/alice/demo/actions/workflow-dispatch-inputs",
       "/alice/demo/actions/extra",
     ]) {
       expect(parseUiRoute(path)).toBeNull();

@@ -743,6 +743,10 @@ import {
   serveArtifactPreviewRaw,
 } from "./pages/repo-actions-artifacts";
 import { buildRunArtifactDownload, deleteRunArtifact } from "./pages/repo-actions-artifacts-download";
+import { actionsJobLogsResponse, loadActionsRunJobLogs } from "./pages/repo-actions-logs";
+import { resolveActionsRunWorkflowFile } from "./pages/repo-actions-workflow";
+import { renderWorkflowBadgeSvg, resolveWorkflowBadge } from "./pages/repo-actions-badge";
+import { loadWorkflowDispatchInputsFragment } from "./pages/repo-actions-dispatch-inputs";
 import {
   bulkAdminActionsRunners,
   deleteAdminActionsRunner,
@@ -2844,7 +2848,7 @@ export interface RepoActionsJobQueueRoute {
  *  `/runs/{run}/logs`, the artifacts tails) stay unclaimed → the engine's
  *  404 until their units land. */
 export interface RepoActionsRunViewRoute {
-  family: "actions-run-view" | "actions-run-cancel";
+  family: "actions-run-view" | "actions-run-cancel" | "actions-run-job-logs" | "actions-run-workflow";
   owner: string;
   repo: string;
   /** The raw {run} segment: the run row id, the legacy per-repo run index,
@@ -2903,6 +2907,28 @@ export interface RepoActionsRunArtifactRoute {
   repo: string;
   run: string;
   artifactName: string;
+}
+
+/** The F-row tail: the workflow BADGE family (pages/repo-actions-badge.ts —
+ *  upstream web.go:1606's `/workflows/{workflow_name}/badge.svg` inside
+ *  the /actions group). The {workflow_name} segment rides raw (chi's own
+ *  param; the resolver tolerates both workflow-id spellings). */
+export interface RepoActionsWorkflowBadgeRoute {
+  family: "repo-actions-workflow-badge";
+  owner: string;
+  repo: string;
+  workflowName: string;
+}
+
+/** The F-row tail: the dispatch-modal inputs FRAGMENT (pages/
+ *  repo-actions-dispatch-inputs.tsx — upstream web.go:1572's
+ *  `/workflow-dispatch-inputs` aux GET, an HTML fragment the official
+ *  bundle's data-fetch-sync swaps into the modal). GET-only, writer-gated
+ *  per upstream's reqRepoActionsWriter on the route. */
+export interface RepoActionsDispatchInputsRoute {
+  family: "repo-actions-dispatch-inputs";
+  owner: string;
+  repo: string;
 }
 
 
@@ -3253,6 +3279,8 @@ export type ParsedUiRoute =
   | RepoActionsArtifactPreviewRoute
   | ActionsArtifactPreviewRawRoute
   | RepoActionsRunArtifactRoute
+  | RepoActionsWorkflowBadgeRoute
+  | RepoActionsDispatchInputsRoute
   | SiteHomeRoute
   | ExploreRoute
   | NotificationsRoute
@@ -4353,6 +4381,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 3 && rest[2] === "cancel") {
       return { family: "actions-run-cancel", owner, repo, run: rest[1] as string };
     }
+    // The F-row tail: the run→workflow-file redirect (web.go:1591 — the
+    // exact 3-segment literal, disjoint from cancel's).
+    if (rest.length === 3 && rest[2] === "workflow") {
+      return { family: "actions-run-workflow", owner, repo, run: rest[1] as string };
+    }
     if (rest.length === 4 && rest[2] === "attempts") {
       return { family: "actions-run-view", owner, repo, run: rest[1] as string, attempt: rest[3] as string };
     }
@@ -4372,12 +4405,27 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       }
       return { family: "actions-run-artifact", owner, repo, run: rest[1] as string, artifactName };
     }
+    // The F-row tail: the JOB-SCOPED log download (web.go:1589 — the exact
+    // 5-segment shape; upstream has NO run-level logs route).
+    if (rest.length === 5 && rest[4] === "logs") {
+      return { family: "actions-run-job-logs", owner, repo, run: rest[1] as string, job: rest[3] as string };
+    }
     return null;
   }
   if (head === "actions" && rest.length === 2 && rest[0] === "runs") {
     return { family: "actions-run-view", owner, repo, run: rest[1] as string };
   }
 
+  // The F-row tail: the workflow BADGE (web.go:1606 — the exact 3-segment
+  // /workflows/{name}/badge.svg shape; the name rides raw, chi's own param).
+  if (head === "actions" && rest.length === 3 && rest[0] === "workflows" && rest[2] === "badge.svg") {
+    return { family: "repo-actions-workflow-badge", owner, repo, workflowName: rest[1] as string };
+  }
+  // The F-row tail: the dispatch-modal inputs FRAGMENT (web.go:1572 — the
+  // exact literal; the ref/workflow facets ride the query).
+  if (head === "actions" && rest.length === 1 && rest[0] === "workflow-dispatch-inputs") {
+    return { family: "repo-actions-dispatch-inputs", owner, repo };
+  }
   // The census C4 artifacts preview subtree (pages/repo-actions-artifacts.tsx
   // — web.go:1602-1603's /artifacts/{artifact_id}/preview[/...] inside the
   // /actions group): the {id} claims digits only (the house PathParamInt64
@@ -6537,6 +6585,101 @@ async function actionsRunArtifactDelete(c: Context<{ Bindings: Env }>): Promise<
   const outcome = await deleteRunArtifact(c.env.DB, run, resolved.route.artifactName, resolved.url.searchParams.get("attempt") ?? "");
   if (outcome.outcome === "error") return renderServerErrorShellResponse(c.env, c.req.raw);
   return respond(outcome.response);
+}
+
+/** GET /{owner}/{repo}/actions/runs/{run}/jobs/{job}/logs (the F-row tail,
+ *  pages/repo-actions-logs.ts — web.go:1589): the raw job-log download over
+ *  M1b's chunk store/R2 seal, bytes re-issued without the line parse (a
+ *  download serves bytes even when a line is malformed). C2 read ladder. */
+async function actionsRunJobLogsRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-run-job-logs") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  const route = resolved.route;
+  const outcome = await loadActionsRunJobLogs(c.env.DB, c.env, repo.id, route.run, route.job ?? "");
+  if (outcome.outcome === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  if (outcome.outcome === "throw") throw new Error(outcome.reason); // upstream's ctx.ServerError arm
+  return respond(actionsJobLogsResponse(outcome.bytes, outcome.filename));
+}
+
+/** GET /{owner}/{repo}/actions/runs/{run}/workflow (the F-row tail, pages/
+ *  repo-actions-workflow.ts — web.go:1591): upstream renders NO page here —
+ *  a 303 onto the workflow file's blob/src view via the engine read family,
+ *  tolerating both workflow-id spellings the store carries. */
+async function actionsRunWorkflowRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-run-workflow") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  const route = resolved.route;
+  const outcome = await resolveActionsRunWorkflowFile(
+    c.env.DB,
+    engineReads(c.env, repo),
+    repo,
+    route.run ?? "",
+    `/${repo.ownerNamespace}/${repo.slug}`,
+  );
+  if (outcome.outcome === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  if (outcome.outcome === "throw") throw new Error(outcome.reason); // upstream's ctx.ServerError arm
+  return respond(new Response(null, { status: 303, headers: { location: outcome.location } }));
+}
+
+/** GET /{owner}/{repo}/actions/workflows/{workflow_name}/badge.svg (the
+ *  F-row tail, pages/repo-actions-badge.ts — web.go:1606): the shields-style
+ *  status SVG over the run store — C1 read ladder, anonymous reads pass. */
+async function repoActionsWorkflowBadgeRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, url, repo, respond } = resolved;
+  if (resolved.route.family !== "repo-actions-workflow-badge") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasActions) return respond(c.html(renderNotFound(ctx), 404));
+  const badge = await resolveWorkflowBadge(c.env.DB, repo, {
+    workflowName: resolved.route.workflowName,
+    branch: url.searchParams.get("branch") ?? undefined,
+    event: url.searchParams.get("event") ?? undefined,
+    style: url.searchParams.get("style") ?? undefined,
+  });
+  return respond(
+    new Response(renderWorkflowBadgeSvg(badge), {
+      status: 200,
+      headers: { "content-type": "image/svg+xml" },
+    }),
+  );
+}
+
+/** GET /{owner}/{repo}/actions/workflow-dispatch-inputs (the F-row tail,
+ *  pages/repo-actions-dispatch-inputs.tsx — web.go:1572): the dispatch
+ *  modal's inputs HTML fragment — read ladder PLUS the writer gate (upstream
+ *  mounts it under reqRepoActionsWriter), GET-only so no sameOriginGuard. */
+async function repoActionsDispatchInputsRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, url, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "repo-actions-dispatch-inputs") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasActions) return respond(c.html(renderNotFound(ctx), 404));
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404)); // reqRepoActionsWriter's NotFound
+  }
+  const formInt64 = (raw: string | null): number => (raw !== null && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : 0);
+  const outcome = await loadWorkflowDispatchInputsFragment({
+    reads: engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`),
+    repo,
+    ref: url.searchParams.get("ref") ?? "",
+    workflow: url.searchParams.get("workflow") ?? "",
+    scopedWorkflowSourceRepoId: formInt64(url.searchParams.get("scoped_workflow_source_repo_id")),
+  });
+  if (outcome.status === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  if (outcome.status === "throw") throw new Error(outcome.reason); // upstream's ctx.ServerError arm
+  return respond(c.html(outcome.html, 200));
 }
 
 /** POST /{owner}/{repo}/actions/runs/{run}/cancel (actions.Cancel — the
@@ -14334,6 +14477,17 @@ uiRouter.post("/-/actions/artifacts/:id/:expires/:signature/*", () => methodNotA
 // DELETE registration in the UI router — upstream web.go:1595-1596's pair).
 uiRouter.get("/:owner/:repo/actions/runs/:run/artifacts/:name", (c) => actionsRunArtifactDownload(c));
 uiRouter.delete("/:owner/:repo/actions/runs/:run/artifacts/:name", (c) => actionsRunArtifactDelete(c));
+// The F-row tails (the survey's six, now all mounted): the job-scoped log
+// download, the workflow-file redirect, the badge SVG, and the
+// dispatch-modal inputs fragment — GET-only upstream, chi-405 POST twins.
+uiRouter.get("/:owner/:repo/actions/runs/:run/jobs/:job/logs", (c) => actionsRunJobLogsRoute(c));
+uiRouter.post("/:owner/:repo/actions/runs/:run/jobs/:job/logs", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/:repo/actions/runs/:run/workflow", (c) => actionsRunWorkflowRoute(c));
+uiRouter.post("/:owner/:repo/actions/runs/:run/workflow", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/:repo/actions/workflows/:workflowName/badge.svg", (c) => repoActionsWorkflowBadgeRoute(c));
+uiRouter.post("/:owner/:repo/actions/workflows/:workflowName/badge.svg", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/:repo/actions/workflow-dispatch-inputs", (c) => repoActionsDispatchInputsRoute(c));
+uiRouter.post("/:owner/:repo/actions/workflow-dispatch-inputs", () => methodNotAllowed("GET"));
 uiRouter.get("/:owner/:repo/activity", (c) => repoActivityPage(c));
 uiRouter.get("/:owner/:repo/activity/:period", (c) => repoActivityPage(c));
 // Window-2e C1: the global inbox.

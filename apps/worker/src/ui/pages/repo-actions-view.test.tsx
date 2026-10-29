@@ -241,13 +241,11 @@ describe("the route claim pin (the runs subtree claims exactly its shapes)", () 
       "/alice/demo/actions/runs/7/rerun-failed",
       "/alice/demo/actions/runs/7/approve",
       "/alice/demo/actions/runs/7/delete",
-      "/alice/demo/actions/runs/7/workflow",
       "/alice/demo/actions/runs/7/logs",
       "/alice/demo/actions/runs/7/attempts/2/extra", // deeper than any shape
       "/alice/demo/actions/runs/7/jobs/9/extra",
       "/alice/demo/actions/run/1", // upstream's singular /run — unlanded
       "/alice/demo/actions/disable",
-      "/alice/demo/actions/workflow-dispatch-inputs",
     ]) {
       expect(parseUiRoute(path)).toBeNull();
       expect(handlesUiRoute(path)).toBe(false);
