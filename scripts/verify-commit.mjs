@@ -51,12 +51,23 @@
  *      links re-pointed INTO the worktree), and gitignored GENERATED files
  *      the typecheck imports are copied from the main tree
  *      (apps/worker/src/ui/icons.generated.ts, apps/worker/
- *      worker-configuration.d.ts). wrangler.jsonc / .dev.vars are NOT needed
- *      for this typecheck-only scope (worker-configuration.d.ts carries what
- *      `wrangler types` would emit; .dev.vars is runtime-only) — they are
- *      copied only in the cold-start fallback where the main tree has no
- *      worker-configuration.d.ts yet and `wrangler types` must be run inside
- *      the worktree.
+ *      worker-configuration.d.ts). .dev.vars is runtime-only and never needed
+ *      for this typecheck-only scope.
+ *   5. CI-PARITY TYPES (2026-10-29, the 8155e16 incident class): CI restores
+ *      wrangler.jsonc from wrangler.jsonc.example and REGENERATES types, so a
+ *      stale LOCAL worker-configuration.d.ts can hide type errors CI catches
+ *      (8155e16: a TS2322 committed under a green guard). Whenever the worker
+ *      typecheck target runs against candidate-or-HEAD content under
+ *      apps/worker, the gate copies wrangler.jsonc.example → wrangler.jsonc
+ *      INSIDE the worktree (scratch only — the MAIN tree's real wrangler.jsonc
+ *      is never touched) and runs `wrangler types` there, overwriting the
+ *      copied generated file with example-derived types. If that regeneration
+ *      fails (offline, missing binary) the gate prints a loud WARNING and
+ *      proceeds with the copied file — a tooling hiccup must not turn the gate
+ *      red; but when it succeeds, tsc sees exactly what CI sees. The
+ *      cold-start fallback (main tree has no worker-configuration.d.ts yet)
+ *      keeps its hard die(2) — there is no fallback file to proceed with —
+ *      and prefers the example, falling back to the account-local config.
  *
  * SCOPE (v1)
  *   `pnpm typecheck`-equivalent only: every workspace package (from
@@ -453,8 +464,12 @@ ISOLATION
   Neither the working tree, nor the real index, nor any ref is touched.
   node_modules are symlinked in (workspace links re-pointed into the worktree);
   gitignored generated files (icons.generated.ts, worker-configuration.d.ts)
-  are copied from the main tree. wrangler.jsonc/.dev.vars are only copied in
-  the cold-start fallback where the main tree lacks worker-configuration.d.ts.
+  are copied from the main tree. CI-parity types: wrangler.jsonc.example is
+  copied as wrangler.jsonc INSIDE the worktree (the main tree's real config is
+  never touched) and \`wrangler types\` regenerates worker-configuration.d.ts
+  from it before tsc — mirroring CI; a regeneration failure only warns (the
+  run proceeds with the copied types). Cold start (no local generated file)
+  keeps the hard error: there is no fallback file to proceed with.
 
 SCOPE (v1)
   \`pnpm typecheck\`-equivalent (workspace packages with a
@@ -552,28 +567,81 @@ function main() {
     }
     targets.push({ pkg, tscBin, tscArgs: translated.tscArgs, needsWranglerTypes: translated.needsWranglerTypes });
   }
-  const wranglerTargets = targets.filter((t) => t.needsWranglerTypes && !wranglerTypesProvided);
-  if (wranglerTargets.length > 0) {
-    // Cold start: the main tree has no worker-configuration.d.ts yet — run
-    // `wrangler types` INSIDE the worktree (needs the account-local
-    // wrangler.jsonc copied in; .dev.vars is runtime-only and NOT needed here).
-    const cfgRel = 'apps/worker/wrangler.jsonc';
-    const cfgSrc = path.join(state.repoRoot, cfgRel);
-    if (!fs.existsSync(cfgSrc)) {
-      die(2, `main tree has neither ${'apps/worker/worker-configuration.d.ts'} nor ${cfgRel} — run \`pnpm typecheck\` once in the main repo (or \`pnpm setup:deploy\`) and retry`);
-    }
-    fs.copyFileSync(cfgSrc, path.join(wt, cfgRel));
+  // --- CI-parity types: regenerate worker-configuration.d.ts from the EXAMPLE
+  // (mirrors CI: restore wrangler.jsonc from wrangler.jsonc.example →
+  // `wrangler types` → tsc). A stale LOCAL generated file must not let type
+  // errors CI catches sail through green — observed 2026-10-29: 8155e16's
+  // TS2322 (admin-packages.matrix.test.tsx) passed this guard against stale
+  // local types and died in CI. Runs only when the candidate (or HEAD — the
+  // worktree is checked out at the candidate commit, so any apps/worker
+  // content in it is what tsc compiles) touches apps/worker.
+  const workerTarget = targets.find((t) => t.pkg === 'apps/worker');
+  const workerTouched = workerTarget !== undefined && (
+    entries.some((e) => e.path.startsWith('apps/worker/')) ||
+    fs.existsSync(path.join(wt, 'apps/worker'))
+  );
+  if (workerTouched) {
+    const exampleRel = 'apps/worker/wrangler.jsonc.example';
+    const exampleSrc = path.join(state.repoRoot, exampleRel);
+    const workerDir = path.join(wt, 'apps/worker');
     const wranglerBin = path.join(wt, 'apps/worker/node_modules/.bin/wrangler');
-    if (!fs.existsSync(wranglerBin)) {
-      die(2, 'no wrangler binary in the main tree — run `pnpm install` in the main repo first');
-    }
-    const res = spawnSync(wranglerBin, ['types'], {
-      cwd: path.join(wt, 'apps/worker'),
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024,
-    });
-    if (res.status !== 0) {
-      die(2, `wrangler types failed inside the candidate worktree:\n${res.stdout || ''}\n${res.stderr || ''}`);
+    if (wranglerTypesProvided) {
+      // Normal path: the main tree's generated file was copied in — OVERWRITE
+      // it with a fresh example-derived regeneration so tsc sees what CI sees.
+      // The example is copied AS wrangler.jsonc inside the scratch worktree
+      // only; the MAIN tree's real wrangler.jsonc is never read or written.
+      if (fs.existsSync(exampleSrc) && fs.existsSync(wranglerBin)) {
+        fs.copyFileSync(exampleSrc, path.join(workerDir, 'wrangler.jsonc'));
+        const res = spawnSync(wranglerBin, ['types'], {
+          cwd: workerDir,
+          encoding: 'utf8',
+          maxBuffer: 64 * 1024 * 1024,
+        });
+        if (res.status === 0) {
+          process.stdout.write(
+            'verify-commit: CI-parity — worker-configuration.d.ts regenerated from wrangler.jsonc.example inside the candidate worktree (mirrors CI)\n',
+          );
+        } else {
+          // Infrastructure hiccup, not a candidate verdict: warn loudly and
+          // proceed with the copied (possibly stale) file, exactly as before
+          // this hardening existed.
+          process.stdout.write(
+            `verify-commit: WARNING — could not regenerate CI-parity types from wrangler.jsonc.example inside the candidate worktree` +
+            ` (wrangler types exit ${res.status}${res.error ? `: ${res.error.message}` : ''}); proceeding with the main tree's worker-configuration.d.ts,` +
+            ' which may be STALE vs the example — CI may catch type errors this run misses.\n' +
+            `${`${res.stdout || ''}${res.stderr || ''}`.trim()}\n`,
+          );
+        }
+      } else {
+        process.stdout.write(
+          'verify-commit: WARNING — CI-parity type regeneration skipped (' +
+          `${fs.existsSync(exampleSrc) ? 'no wrangler binary in the main tree' : `${exampleRel} not found in the main tree`}); ` +
+          "proceeding with the main tree's worker-configuration.d.ts, which may be STALE vs the example — CI may catch type errors this run misses.\n",
+        );
+      }
+    } else {
+      // Cold start (pre-existing hard-fail semantics): the main tree has NO
+      // worker-configuration.d.ts, so `wrangler types` is the only source of
+      // Env types — a failure here is an environment error, not a verdict.
+      // Prefer the example (the committed CI-restored config); fall back to
+      // the account-local wrangler.jsonc for pre-example trees.
+      const cfgRel = fs.existsSync(exampleSrc) ? exampleRel : 'apps/worker/wrangler.jsonc';
+      const cfgSrc = path.join(state.repoRoot, cfgRel);
+      if (!fs.existsSync(cfgSrc)) {
+        die(2, `main tree has neither ${'apps/worker/worker-configuration.d.ts'} nor ${cfgRel} — run \`pnpm typecheck\` once in the main repo (or \`pnpm setup:deploy\`) and retry`);
+      }
+      fs.copyFileSync(cfgSrc, path.join(wt, 'apps/worker/wrangler.jsonc'));
+      if (!fs.existsSync(wranglerBin)) {
+        die(2, 'no wrangler binary in the main tree — run `pnpm install` in the main repo first');
+      }
+      const res = spawnSync(wranglerBin, ['types'], {
+        cwd: workerDir,
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      if (res.status !== 0) {
+        die(2, `wrangler types failed inside the candidate worktree:\n${res.stdout || ''}\n${res.stderr || ''}`);
+      }
     }
   }
 

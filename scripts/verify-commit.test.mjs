@@ -14,7 +14,14 @@
  *      worktree survives;
  *   3. staged-index mode (no --paths) verifies the staged content and fails
  *      on a staged type error;
- *   4. a docs-only pathspec skips with exit 0.
+ *   4. a docs-only pathspec skips with exit 0;
+ *   5. CI-parity wrangler-types regen (the 8155e16 incident class): the
+ *      scratch worker package's extra source only compiles against the
+ *      REGENERATED types, so a PASS proves wrangler.jsonc.example was copied
+ *      into the worktree and `wrangler types` ran BEFORE tsc (the
+ *      pre-hardening guard fails this same candidate against the stale file);
+ *   6. a wrangler-types failure inside the worktree only WARNS: the verdict
+ *      still comes from tsc, so a self-consistent candidate still exits 0.
  *
  * The scratch repo is fully owned by this test — the real repo is only read
  * (its typescript binary via absolute symlink). Run: `node
@@ -77,7 +84,7 @@ fs.mkdirSync(repo, { recursive: true });
 git(['init', '-b', 'main']);
 git(['config', 'user.name', 'verify-commit-selftest']);
 git(['config', 'user.email', 'selftest@local']);
-fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n');
+fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\napps/worker/worker-configuration.d.ts\n');
 fs.writeFileSync(path.join(repo, 'pnpm-workspace.yaml'), 'packages:\n  - "apps/*"\n');
 fs.writeFileSync(
   path.join(repo, 'README.md'),
@@ -96,6 +103,60 @@ const GOOD_TS = 'export const good: number = 1;\n';
 const BAD_TS = 'const broken: string = 123;\nexport { broken };\n';
 const okTs = path.join(repo, 'apps/app/src/ok.ts');
 fs.writeFileSync(okTs, GOOD_TS);
+
+// --- Worker-flavored package: exercises the CI-parity wrangler-types regen --
+// The fake wrangler derives worker-configuration.d.ts from the wrangler.jsonc
+// found in its cwd and REFUSES when that config was not copied from the
+// example — so a gate PASS here proves the example-copy + regen step ran.
+const WORKER_EXAMPLE_MARKER = '__SELFTEST_EXAMPLE_MARKER__';
+const WORKER_FAIL_MARKER = '__SELFTEST_FAIL_WRANGLER_TYPES__';
+const WORKER_EXAMPLE = `// scratch wrangler config (selftest)\n${WORKER_EXAMPLE_MARKER}\n`;
+const WORKER_STALE_DTS =
+  '// stale LOCAL generated types (selftest) — deliberately lacks OnlyFresh\n' +
+  'type MarkerKind = "example-derived";\n';
+fs.mkdirSync(path.join(repo, 'apps/worker/src'), { recursive: true });
+fs.writeFileSync(
+  path.join(repo, 'apps/worker/package.json'),
+  JSON.stringify({ name: 'scratch-worker', private: true, type: 'module', scripts: { typecheck: 'wrangler types && tsc --noEmit' } }, null, 2) + '\n',
+);
+fs.writeFileSync(
+  path.join(repo, 'apps/worker/tsconfig.json'),
+  JSON.stringify({ compilerOptions: { strict: true, noEmit: true, types: [] }, include: ['src/**/*.ts', 'worker-configuration.d.ts'] }, null, 2) + '\n',
+);
+fs.writeFileSync(path.join(repo, 'apps/worker/wrangler.jsonc.example'), WORKER_EXAMPLE);
+fs.writeFileSync(path.join(repo, 'apps/worker/worker-configuration.d.ts'), WORKER_STALE_DTS);
+fs.writeFileSync(path.join(repo, 'apps/worker/src/base.ts'), 'export const marker: MarkerKind = "example-derived";\n');
+// Compiles ONLY against the regenerated types (OnlyFresh is absent from the
+// stale copied file) — the type-level proof that regen output reached tsc.
+fs.writeFileSync(path.join(repo, 'apps/worker/src/fresh-user.ts'), 'export const fresh: OnlyFresh = "fresh-only";\n');
+const FAKE_WRANGLER = `#!/usr/bin/env node
+// Selftest stand-in for \`wrangler types\`: derives worker-configuration.d.ts
+// from the wrangler.jsonc present in cwd. Exits 3 when the config is absent
+// or not copied from the example, 1 on the simulated-failure marker.
+import fs from 'node:fs';
+const cfg = fs.existsSync('wrangler.jsonc') ? fs.readFileSync('wrangler.jsonc', 'utf8') : '';
+if (!cfg.includes('${WORKER_EXAMPLE_MARKER}')) {
+  console.error('fake-wrangler: no example-derived wrangler.jsonc in cwd');
+  process.exit(3);
+}
+if (cfg.includes('${WORKER_FAIL_MARKER}')) {
+  console.error('fake-wrangler: simulated wrangler types failure');
+  process.exit(1);
+}
+fs.writeFileSync('worker-configuration.d.ts', [
+  '// fresh example-derived generated types (selftest)',
+  'type MarkerKind = "example-derived";',
+  'type OnlyFresh = "fresh-only";',
+  '',
+].join('\\n'));
+`;
+// The scratch package's wrangler is this fake (plain file under the
+// gitignored node_modules); its tsc is the REAL repo's TypeScript.
+fs.mkdirSync(path.join(repo, 'apps/worker/node_modules/.bin'), { recursive: true });
+fs.writeFileSync(path.join(repo, 'apps/worker/node_modules/.bin/wrangler'), FAKE_WRANGLER);
+fs.chmodSync(path.join(repo, 'apps/worker/node_modules/.bin/wrangler'), 0o755);
+fs.symlinkSync(REAL_TSC, path.join(repo, 'apps/worker/node_modules/.bin/tsc'));
+
 // The scratch package's tsc is the REAL repo's TypeScript (absolute symlink);
 // verify-commit must wire this node_modules into its candidate worktree.
 fs.mkdirSync(path.join(repo, 'apps/app/node_modules/.bin'), { recursive: true });
@@ -189,6 +250,42 @@ const baselineTmp = tmpSessionDirs();
 {
   const res = runGate(['--paths', 'does/not/exist.ts']);
   check('pathspec matching nothing exits 2', res.status === 2, `status=${res.status}\nstdout=${res.stdout}`);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: CI-parity wrangler-types regen — the example is copied into the
+// worktree, `wrangler types` runs BEFORE tsc, and tsc compiles against the
+// regenerated types. fresh-user.ts references OnlyFresh, which exists ONLY in
+// the regenerated output (the stale copied file lacks it), so a PASS is the
+// type-level proof the regen ran and its output was used. The pre-hardening
+// guard FAILED this same candidate (stale types -> TS2304 on OnlyFresh).
+// ---------------------------------------------------------------------------
+{
+  const res = runGate(['--paths', 'apps/worker/src/base.ts']);
+  check('worker candidate exits 0 with CI-parity regen', res.status === 0, `status=${res.status}\nstdout=${res.stdout}\nstderr=${res.stderr}`);
+  check('worker candidate reports the example-derived regeneration',
+    res.stdout.includes('regenerated') && res.stdout.includes('wrangler.jsonc.example'), res.stdout);
+  check('worker candidate tsc verdict is PASS', res.stdout.includes('typecheck apps/worker: PASS'), res.stdout);
+  check('no OnlyFresh diagnostics (tsc saw the regenerated types)', !res.stdout.includes('error TS'), res.stdout);
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: wrangler-types failure inside the worktree only WARNS — the gate
+// must not go red for infrastructure reasons. The stale file is made
+// self-consistent (OnlyFresh loosely declared) so tsc passes WITHOUT the
+// regen, and the example carries the simulated-failure marker.
+// ---------------------------------------------------------------------------
+{
+  fs.writeFileSync(path.join(repo, 'apps/worker/worker-configuration.d.ts'),
+    WORKER_STALE_DTS + 'type OnlyFresh = "fresh-only";\n');
+  fs.writeFileSync(path.join(repo, 'apps/worker/wrangler.jsonc.example'), WORKER_EXAMPLE + WORKER_FAIL_MARKER + '\n');
+  const res = runGate(['--paths', 'apps/worker/src/base.ts']);
+  check('wrangler-types failure does NOT fail the run (warning path)', res.status === 0, `status=${res.status}\nstdout=${res.stdout}\nstderr=${res.stderr}`);
+  check('warning path prints a loud WARNING naming the example',
+    res.stdout.includes('WARNING') && res.stdout.includes('wrangler.jsonc.example'), res.stdout);
+  check('warning path does not claim a regeneration happened',
+    !res.stdout.includes('regenerated from wrangler.jsonc.example'), res.stdout);
+  check('warning path still reaches the tsc verdict', res.stdout.includes('typecheck apps/worker: PASS'), res.stdout);
 }
 
 // ---------------------------------------------------------------------------
