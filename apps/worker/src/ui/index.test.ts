@@ -20,7 +20,9 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
-import { repositories, users } from "../db/schema";
+import { repositories, repoSettings, users } from "../db/schema";
+import { getOrInsertBlob, packageBlobContentKey } from "../services/packages/blobs";
+import { getOrInsertPackage, getOrInsertVersion, tryInsertFile } from "../services/packages/model";
 import { resetManifestCache, type UiManifest } from "./manifest";
 import {
   assetsBinding,
@@ -60,10 +62,12 @@ const fakeAssets: UiAssetsFetcher = {
  * reads. The landed wrangler.jsonc assets block makes Env.ASSETS the
  * generated `Fetcher`; these tests inject a synthetic manifest fetcher (or
  * drop the binding entirely to exercise the 503 path), so the member is
- * re-declared optional. The single `as Env` at the fetch boundary re-widens
+ * re-declared optional. PACKAGES_ENABLED is re-declared beside it — the
+ * SPEC-0016 M2 quota gate's strict-polarity rows override the var on a
+ * per-fetch env literal. The single `as Env` at the fetch boundary re-widens
  * for the router's Bindings — the shapes agree everywhere the router reads.
  */
-type UiTestEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+type UiTestEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher; PACKAGES_ENABLED?: string };
 
 const uiEnv: UiTestEnv = { ...env, ASSETS: fakeAssets };
 
@@ -96,6 +100,43 @@ async function seedRepo(
   });
 }
 
+/**
+ * One package + version through the LANDED model service (the SPEC-0016 M2
+ * route-level fixtures' arm — the packages matrix's seed shape; a distinct
+ * `now` per call drives the created-desc "latest" pick).
+ */
+async function seedPackageVersion(
+  ownerId: number,
+  name: string,
+  version: string,
+  now: Date,
+): Promise<{ packageId: number; versionId: number }> {
+  const { row: pkg } = await getOrInsertPackage(env.DB, { ownerId, type: "generic", name, now });
+  const { row: ver } = await getOrInsertVersion(env.DB, {
+    packageId: pkg.id,
+    creatorId: ownerId,
+    version,
+    now,
+  });
+  return { packageId: pkg.id, versionId: ver.id };
+}
+
+/**
+ * One file (and its content-addressed blob row + R2 object) under a version —
+ * the upload pipeline's landing half without the HTTP pass. Answers the file
+ * row id (the download URL's {fileid} segment).
+ */
+async function seedPackageFile(versionId: number, name: string, payload: string): Promise<number> {
+  const bytes = new TextEncoder().encode(payload);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const sha256 = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const { row: blob } = await getOrInsertBlob(env.DB, { size: bytes.byteLength, sha256 });
+  const inserted = await tryInsertFile(env.DB, { versionId, blobId: blob.id, name });
+  if (inserted.outcome !== "created") throw new Error("package file seed failed");
+  await env.REPO_PACKS.put(packageBlobContentKey(sha256), bytes);
+  return inserted.row.id;
+}
+
 beforeAll(async () => {
   await applyAuthD1Migrations();
 });
@@ -104,6 +145,15 @@ beforeEach(async () => {
   resetManifestCache();
   for (const table of [
     "personal_access_tokens",
+    // The SPEC-0016 M2 fixture tables (children first — the packages matrix's
+    // sweep convention) + the R16 gate's settings row.
+    "package_properties",
+    "package_files",
+    "package_blobs",
+    "package_versions",
+    "package_cleanup_rules",
+    "packages",
+    "repo_settings",
     "repo_units",
     "repo_counters",
     "repo_redirects",
@@ -149,6 +199,17 @@ describe("handlesUiRoute", () => {
     "/explore", // the wave-9 explore group: the bare literal's 303 + the
     "/explore/repos", // two search pages (claimed before the repo-scoped
     "/explore/users", // owner/repo parse could read them as a repository)
+    "/explore/code", // SPEC-0019 M2 claimed the literal (the navbar's fourth
+                     // tab; the explore-code matrix pins the page render)
+    "/octo/-/packages", // the SPEC-0016 M2 `/-` packages subtree: the list
+    "/octo/-/packages/generic/proj", // literal, the {type}/{name} redirect,
+    "/octo/-/packages/generic/proj/versions", // the /versions literal (it
+                                              // outranks the {version} param),
+    "/octo/-/packages/generic/proj/1.0.0", // the {version} view, and the
+    "/octo/-/packages/generic/proj/1.0.0/files/7", // {fileid} download
+    "/octo/-/code", // the code-search twin in the same `/-` namespace
+    "/octo/hello/packages", // the R16 repo tab literal (the settings row
+                            // gates the handler — the route-level rows below)
   ])("claims UI family: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(true);
   });
@@ -179,6 +240,12 @@ describe("handlesUiRoute", () => {
     "/octo/hello/commitsX", // family literals are exact
     "/octo/hello/commitsx/branch/main",
     "/explore/users/extra",
+    "/octo/-/packages/generic", // the bare {type} facet rides the list's ?type=
+    "/octo/-/PACKAGES", // the family literal is lowercase-exact
+    "/octo/-/packages/generic/proj/1.0.0/files", // the download tail claims a
+    "/octo/-/packages/generic/proj/1.0.0/files/x", // numeric {fileid} only
+    "/octo/-/packages/generic/proj/1.0.0/extra", // deeper tails stay engine-owned
+    "/octo/hello/packages/extra", // the repo tab claims the bare literal only
     // NOTE: /octo/hello/settings/keys and /explore/repos/sitemap-1.xml left
     // this table — window-2d (b54f709) and window-2e-A (84996c6) claimed
     // them; the claim pins live in the parse table below (the wiki
@@ -254,6 +321,62 @@ describe("parseUiRoute", () => {
     ["/explore/users/extra", null],
     ["/EXPLORE", { family: "owner-home", owner: "EXPLORE" }], // same-named
     ["/Explore/repos", { family: "home", owner: "Explore", repo: "repos", refSuffix: null }], // namespaces keep their families (case-exact literals)
+    // The SPEC-0016 M2 packages subtree (the `/-` namespace's depth — upstream
+    // web.go:1109-1121): the /versions literal outranks the {version} param
+    // (chi registers the static tail first), the fileid is the PathParamInt64
+    // parity ("007" parses as 7), and every junk shape stays unclaimed → the
+    // engine's 404. Type/name/version decode like the /src family.
+    ["/octo/-/packages", { family: "owner-packages", owner: "octo" }],
+    ["/octo/-/packages/generic", null], // the bare {type} facet rides ?type=
+    [
+      "/octo/-/packages/generic/proj",
+      { family: "owner-package-redirect", owner: "octo", type: "generic", name: "proj" },
+    ],
+    [
+      "/octo/-/packages/gener%69c/proj",
+      { family: "owner-package-redirect", owner: "octo", type: "generic", name: "proj" },
+    ],
+    ["/octo/-/packages/%zz/proj", null], // undecodable escapes stay unclaimed
+    [
+      "/octo/-/packages/generic/proj/versions",
+      { family: "owner-package-versions", owner: "octo", type: "generic", name: "proj" },
+    ],
+    [
+      "/octo/-/packages/generic/proj/1.0.0",
+      { family: "owner-package-version-view", owner: "octo", type: "generic", name: "proj", version: "1.0.0" },
+    ],
+    [
+      "/octo/-/packages/generic/proj/1.0.0/files/7",
+      {
+        family: "owner-package-file-download",
+        owner: "octo",
+        type: "generic",
+        name: "proj",
+        version: "1.0.0",
+        fileId: 7,
+      },
+    ],
+    [
+      "/octo/-/packages/generic/proj/1.0.0/files/007",
+      {
+        family: "owner-package-file-download",
+        owner: "octo",
+        type: "generic",
+        name: "proj",
+        version: "1.0.0",
+        fileId: 7, // the PathParamInt64 parity — the zero-padded id parses
+      },
+    ],
+    ["/octo/-/packages/generic/proj/1.0.0/files", null],
+    ["/octo/-/packages/generic/proj/1.0.0/files/x", null], // junk fileid
+    ["/octo/-/packages/generic/proj/1.0.0/extra", null],
+    // The SPEC-0019 M2 code-search twins and the R16 repo tab (upstream
+    // web.go:1136's `/-/code` literal, web.go:558's explore literal,
+    // web.go:1546's bare repo `/packages`).
+    ["/octo/-/code", { family: "user-code-search", owner: "octo" }],
+    ["/explore/code", { family: "explore-code" }],
+    ["/octo/hello/packages", { family: "repo-packages", owner: "octo", repo: "hello" }],
+    ["/octo/hello/packages/extra", null],
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {
@@ -472,5 +595,126 @@ describe("uiRouter", () => {
     await seedRepo("alice", "hello");
     const res = await uiRouter.fetch(new Request("https://test.local/alice/hello", { method: "HEAD" }), uiEnv);
     expect(res.status).toBe(200);
+  });
+
+  it("renders the SPEC-0016 M2 owner packages subtree over a seeded package (list → 303 → versions → view → download)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    // The first version is deliberately named "versions" — the ordering pin
+    // below only reads honestly when the {version} param HAS a body to match.
+    await seedPackageVersion(alice.id, "proj", "versions", new Date(1_700_000_000 * 1000));
+    const latest = await seedPackageVersion(alice.id, "proj", "1.0.0", new Date(1_700_000_100 * 1000));
+
+    // The list (GET /alice/-/packages): the R04 page over the created-desc
+    // latest-version rows — the rendered link carries the DISPLAY owner name
+    // (the rows fold case at resolution, like every owner-scoped family).
+    const list = await fetchUi("/alice/-/packages");
+    expect(list.status).toBe(200);
+    const listHtml = await list.text();
+    expect(listHtml).toContain("<title>Packages - cf-gitea</title>");
+    expect(listHtml).toContain('class="page-content user profile packages"');
+    expect(listHtml).toContain('href="/Alice/-/packages/generic/proj/1.0.0"');
+
+    // The {type}/{name} tail: upstream RedirectToLastVersion's 303 onto the
+    // latest non-internal version.
+    const redirect = await fetchUi("/alice/-/packages/generic/proj");
+    expect(redirect.status).toBe(303);
+    expect(redirect.headers.get("location")).toBe("/Alice/-/packages/generic/proj/1.0.0");
+
+    // The /versions literal outranks the {version} param (chi registers the
+    // static tail first; hono answers the first match) — EVEN with a version
+    // literally named "versions" seeded: the URL answers the versions page
+    // (the view's title would be the package name), never a view of it.
+    const versions = await fetchUi("/alice/-/packages/generic/proj/versions");
+    expect(versions.status).toBe(200);
+    const versionsHtml = await versions.text();
+    expect(versionsHtml).toContain("<title>Packages - cf-gitea</title>");
+    expect(versionsHtml).toContain("<strong>Versions</strong>");
+    expect(versionsHtml).toContain('href="/Alice/-/packages/generic/proj/versions"');
+
+    // The {version} view.
+    const view = await fetchUi("/alice/-/packages/generic/proj/1.0.0");
+    expect(view.status).toBe(200);
+    const viewHtml = await view.text();
+    expect(viewHtml).toContain("<title>proj - cf-gitea</title>");
+
+    // The {fileid} download: the version is the identity hop, the blob streams
+    // from the content-addressed R2 object behind the attachment disposition.
+    const fileId = await seedPackageFile(latest.versionId, "pkg-notes.txt", "package payload bytes");
+    const download = await fetchUi(`/alice/-/packages/generic/proj/1.0.0/files/${fileId}`);
+    expect(download.status).toBe(200);
+    expect(download.headers.get("content-disposition") ?? "").toContain("pkg-notes.txt");
+    expect(await download.text()).toBe("package payload bytes");
+  });
+
+  it("404-shells the owner packages subtree's miss arms (unknown owner, missing package)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+
+    for (const path of [
+      "/nobody/-/packages", // an invisible owner collapses to the bare shell
+      "/alice/-/packages/generic/missing", // RedirectToLastVersion's miss arm
+    ]) {
+      const res = await fetchUi(path);
+      expect(res.status, path).toBe(404);
+      const html = await res.text();
+      expect(html, path).toContain("<title>Page Not Found - cf-gitea</title>");
+      expect(html, path).toContain('<div class="status-page-error">');
+    }
+  });
+
+  it("404-shells the whole owner packages subtree when PACKAGES_ENABLED=false (the strict-polarity quota gate)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    await seedPackageVersion(alice.id, "proj", "1.0.0", new Date());
+
+    const res = await fetchUi("/alice/-/packages", { ...uiEnv, PACKAGES_ENABLED: "false" });
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain("<title>Page Not Found - cf-gitea</title>");
+    expect(html).toContain('<div class="status-page-error">');
+  });
+
+  it("gates the repo packages tab on the repo_settings.has_packages row (both polarities)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    await seedRepo("alice", "hello");
+    const repo = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, "hello")).get();
+    if (repo === undefined) throw new Error("seed repo missing");
+
+    // Off polarity: no settings row renders the upstream defaults
+    // (has_packages false) — the tab route 404-shells INSIDE the repo shell
+    // (ctx.repo is resolved before the gate, so the header stays).
+    const off = await fetchUi("/alice/hello/packages");
+    expect(off.status).toBe(404);
+    const offHtml = await off.text();
+    expect(offHtml).toContain("<title>Page Not Found - alice/hello</title>");
+    expect(offHtml).toContain('<div class="repo-header flex-left-right">');
+    expect(offHtml).toContain('<div class="status-page-error">');
+
+    // On polarity: the settings row arms the tab — the R16 page renders the
+    // repo-scoped list with the Packages tab active.
+    await drizzle(env.DB).insert(repoSettings).values({ repoId: repo.id, hasPackages: true });
+    const on = await fetchUi("/alice/hello/packages");
+    expect(on.status).toBe(200);
+    const onHtml = await on.text();
+    expect(onHtml).toContain("<title>Packages - alice/hello</title>");
+    expect(onHtml).toContain('class="page-content repository packages"');
+  });
+
+  it("renders the SPEC-0019 M2 code-search twins (/explore/code + /{owner}/-/code)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+
+    // The explore page: the bare form answers without a seed read; the
+    // navbar's fourth tab is live (the active explore item).
+    const explore = await fetchUi("/explore/code");
+    expect(explore.status).toBe(200);
+    const exploreHtml = await explore.text();
+    expect(exploreHtml).toContain("<title>Explore - cf-gitea</title>");
+    expect(exploreHtml).toContain('action="/explore/code"');
+    expect(exploreHtml).toContain('<a class="active item" href="/explore/repos">');
+
+    // The owner twin: the same federated search block over the owner's base.
+    const own = await fetchUi("/alice/-/code");
+    expect(own.status).toBe(200);
+    const ownHtml = await own.text();
+    expect(ownHtml).toContain("<title>Code - cf-gitea</title>");
+    expect(ownHtml).toContain('action="/Alice/-/code"');
   });
 });
