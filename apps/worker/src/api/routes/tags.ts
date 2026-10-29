@@ -349,7 +349,7 @@ async function emitRefWebhook(
 
 /**
  * The zero-commit `push` payload around an API tag write — the push family's
- * created/deleted-ref shape (services/webhooks-push.ts:260-272, upstream's
+ * created/deleted-ref shape (services/webhooks-push.ts:400-410, upstream's
  * mirror path: SyncPushCommits → notifier.go:901-909 with an empty
  * PushCommits struct, mirror_pull.go:347): FULL ref, before/after oids,
  * compare_url the bare origin + "/" (AppURL + CompareURL ""), no commits,

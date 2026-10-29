@@ -302,7 +302,7 @@ async function emitStatusWebhook(
       return; // upstream parity: no resolvable commit, no webhook
     }
     const usernames = await usernamesByEmail(c.env.DB, [commit]);
-    // The literal re-assert mirrors webhooks-push.ts:326 (the converter's
+    // The literal re-assert mirrors webhooks-push.ts:472-473 (the converter's
     // CommitJson oid typing drifts from the wire field).
     const rendered = await enrichCommitsWithFileLists([{ ...toPayloadCommit(commit, found, usernames, new URL(c.req.url).origin), id: commit.oid }], (id) =>
       reads.readDiff(id),

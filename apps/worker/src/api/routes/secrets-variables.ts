@@ -194,7 +194,7 @@ const variableNameParams = {
 
 /**
  * `reqOwner` (routers/api/v1/api.go:354-361) — the repo's owner user (the
- * ownerNamespace login match, services/repository.ts:100-102's private
+ * ownerNamespace login match, services/repository.ts:117-119's private
  * seam), the site admin (checked explicitly upstream at :356), or an org
  * owner-team member (`doerRepoAccessMode === "owner"`, the
  * GetUserRepoPermission owners-team bridge, repo_permission.go:514).

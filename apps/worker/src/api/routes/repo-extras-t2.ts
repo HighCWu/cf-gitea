@@ -63,7 +63,7 @@ import { contentsResponseSchema, type ContentsResponse } from "../models/content
  *   - POST /repos/{owner}/{repo}/transfer/accept (acceptRepoTransfer,
  *     routers/api/v1/repo/transfer.go:137-178): 202 + the moved Repository;
  *     the landed repos service runs the §2.5.4 transaction
- *     (repos/service.ts:415-460).
+ *     (repos/service.ts:498-543).
  *   - POST /repos/{owner}/{repo}/transfer/reject (rejectRepoTransfer,
  *     transfer.go:181-220): 200 + the untouched Repository; the pending-row
  *     delete rides RepoService.cancelTransfer with the eligibility gate
@@ -143,7 +143,7 @@ import { contentsResponseSchema, type ContentsResponse } from "../models/content
  *   - transfer/accept admission: upstream admits ONLY the pending recipient
  *     (models/repo/transfer.go:143-159 CanUserAcceptOrRejectTransfer); the
  *     landed repos service also admits the current repo owner and site admins
- *     (repos/service.ts:422). The service is not edited by this batch — its
+ *     (repos/service.ts:505). The service is not edited by this batch — its
  *     broader grant stands.
  *   - transfer/reject admission: upstream-strict recipient-only (admins act
  *     via sudo) — asymmetric with accept by construction (see above).
@@ -895,7 +895,7 @@ export function registerRepoExtrasT2Routes(
       // NOT LIKE: D1 caps LIKE patterns at 50 bytes, so a long `?q=` needle
       // threw D1_ERROR and the route answered a plain 500. The substring
       // goes through instr() instead — the documented user-search precedent
-      // (services/user.ts:81-97, the org-members 943e1e9 shape). The needle
+      // (services/user.ts:192-211, the org-members 943e1e9 shape). The needle
       // pre-lowers and topics are stored lowercase (services/repo-topics.ts:
       // 63), so the pair stays case-insensitive like the LIKE was.
       const filter = keyword === "" ? undefined : sql`instr(${repoTopics.topic}, ${keyword}) > 0`;

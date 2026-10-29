@@ -90,7 +90,7 @@ import { PackageSizeMismatchError } from "../../services/packages/blobs";
  * ApiEnv seam carries the verified identity but not the token scope (its
  * `auth` variable is the identity slice only), so this module resolves the
  * presented credential ITSELF — the LFS router's seam
- * (src/lfs/router.ts:300-360): parse → TokenService.verify → ScopeSet — one
+ * (src/lfs/router.ts:275-368): parse → TokenService.verify → ScopeSet — one
  * pass per request, covering reqToken (401 "token is required"),
  * tokenRequiresScopes (403, the exact upstream message) and reqPackageAccess
  * (401 + the challenge header) in upstream's order. The nine routes therefore

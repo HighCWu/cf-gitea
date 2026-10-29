@@ -679,7 +679,7 @@ export class TeamsService {
       // NOT LIKE: D1 caps LIKE patterns at 50 bytes, so a long keyword threw
       // D1_ERROR and the route answered a plain 500. The substring goes
       // through instr() instead — the documented user-search precedent
-      // (services/user.ts:81-97, the org-members 943e1e9 shape). The needle
+      // (services/user.ts:192-211, the org-members 943e1e9 shape). The needle
       // pre-lowers for the case-insensitive pair (lowerName is stored
       // lowercase; description lower()s in SQL, exactly what the LIKE
       // wrapped).

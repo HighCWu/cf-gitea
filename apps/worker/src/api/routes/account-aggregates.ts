@@ -50,7 +50,7 @@ import { parseQueryTime, prefetchIssueRenderContext, toApiIssue } from "../servi
  *       (userGetTokens / userCreateToken / userDeleteAccessToken —
  *       routers/api/v1/user/app.go ListAccessTokens:27 / CreateAccessToken:79
  *       / DeleteAccessToken:169 over the landed personal_access_tokens table,
- *       schema.ts:294, through the SPEC-0002 TokenService).
+ *       schema.ts:432, through the SPEC-0002 TokenService).
  *   - GET /repos/{owner}/{repo}/times[/{user}] + GET /user/times
  *       (repoTrackedTimes / userTrackedTimes / userCurrentTrackedTimes —
  *       repo/issue_tracked_time.go ListTrackedTimesByRepository:417 /
