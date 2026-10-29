@@ -200,7 +200,7 @@ jobs:
       # Step budget: all 20 checks measured ~11s wall locally (2026-10-28,
       # sequential fail-fast) — nowhere near a split; the 45-min job cap is
       # dominated by the full-suite gate above, not this step.
-      - name: Engine checks (git-engine tsx gates — all 23 e2e check-*.mjs)
+      - name: Engine checks (git-engine tsx gates — all 24 e2e check-*.mjs)
         run: |
           TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
           node "$TSX" packages/git-engine/e2e/check-fault-matrix.mjs
@@ -226,6 +226,7 @@ jobs:
           node "$TSX" packages/git-engine/e2e/check-grep.mjs
           node "$TSX" packages/git-engine/e2e/check-activity-stats.mjs
           node "$TSX" packages/git-engine/e2e/check-contributor-stats.mjs
+          node "$TSX" packages/git-engine/e2e/check-graph.mjs
       - name: API contract check (declared routes vs frozen contract, SPEC-0004 §5.1)
         run: pnpm check:api
       - name: "Contract freeze guard (ADR-0002: frozen copy verbatim + sha256)"

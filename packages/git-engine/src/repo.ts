@@ -157,6 +157,24 @@ export const MAX_GREP_SCAN_STEPS = 200000;
  *  regexp scans tighter than words/exact (whose 200k-line cap runs native
  *  indexOf), the documented cost of budgeting the mode at all. */
 export const MAX_GREP_REGEXP_STEPS = 2000000;
+/** SPEC-0017 §3.2 graph budget: commit pops per request — the walk ALWAYS
+ *  starts at row 0 (pages are skip-windows inside ONE walk, upstream's
+ *  `-n 100*page` + in-stream skip, graph.go:41/:52/:71-82), so skip + row +
+ *  count pops all spend this budget and the cap bounds page depth too. The
+ *  frontier exhausting inside the cap yields the exact `total`; the cap
+ *  tripping first yields `total: null` + `truncated` (the honest-partial
+ *  rule — a budget-bounded WALK is not `null`, repo.d.ts's blame idiom). */
+export const MAX_GRAPH_SCAN = 20000;
+/** SPEC-0017 §3.2 graph budget: tips seeded per request — a repo with more
+ *  heads+tags walks the first 500 (listRefs order) and flags `truncated`
+ *  (upstream seeds every ref; the cap bounds the walk's fan-in). */
+export const MAX_GRAPH_REFS = 500;
+/** SPEC-0017 §3.2 graph budget: simultaneously-open lanes — lane allocation
+ *  past the cap stops the walk with `truncated` (rows so far are returned;
+ *  upstream's parser grows flows freely, gitgraph has no width cap — the cap
+ *  bounds the row-edge arrays a pathological repo would produce, and the
+ *  rendered width stays inside the page's scroll: 128 * 10px + 10 = 1290px). */
+export const MAX_GRAPH_LANES = 128;
 /** stats_cache key prefix for the stats family's windowed arm (SPEC-0015
  *  §3.2) — `act:<period>` beside the fixed buckets' bare w/m/q/y keys */
 const ACTIVITY_CACHE_PREFIX = "act:";
@@ -330,6 +348,72 @@ export interface GrepResult {
    *  cap, the regexp step budget, OR the result cap cut a larger match set
    *  (upstream's CancelPipeline exit at grep.go:109 is silent; the blame
    *  budget-exit rule — a budget-bounded scan is never presented complete) */
+  truncated: boolean;
+}
+
+/** One drawn segment crossing a graph row (SPEC-0017 §3.4): top-of-row
+ *  column `from` to bottom-of-row column `to` — every edge moves at most ONE
+ *  column per row (§3.3.3; wider transitions decompose into relation rows),
+ *  drawn in the lane's `color` NUMBER (the page's CSS class is `color % 16`,
+ *  the upstream `Color16` analog, graph_models.go:170-173). */
+export interface GraphEdge {
+  from: number;
+  to: number;
+  color: number;
+}
+
+/** The per-commit payload of a graph row (§3.4): git identity only — the
+ *  email→user chips / avatar stack / sign badges are the DOWNSTREAM
+ *  enrichment (ratified Open question 4; lands later with no RPC change). */
+export interface GraphCommitJson {
+  oid: string;
+  subject: string;
+  author: Person;
+  committer: Person;
+  parents: string[];
+  /** decorations carried by this commit, upstream RefGroup'd
+   *  (heads|tags|remotes|pull|for, ref.go:191-208; a ref outside every
+   *  namespace groups as ""); annotated tags land on their PEELED commit, so
+   *  the chip sits on the row the commit occupies. Upstream also strips a
+   *  `HEAD -> ` prefix out of %D (graph_models.go:250-251) — we never emit
+   *  one: the branch decoration itself covers the HEAD chip. */
+  refs: { name: string; group: string }[];
+}
+
+/** One rendered row (§3.4): a commit dot at `column` (color `color`) plus
+ *  the lane edges crossing THIS row — `commit: null` marks a RELATION row
+ *  (§3.3.4): commit-less, `column: -1`, carrying only edges — the
+ *  decomposition of transitions a single row cannot express (the ledgered
+ *  stand-in for upstream's `_`/`.` horizontal glyph segments, Open
+ *  question 2). Rows map to SVG geometry positionally: rows[i] is SVG row
+ *  minRow + i at 5px/12px units — the page computes minColumn/minRow/width/
+ *  height exactly as upstream's Graph.Width()/Height() do (graph_models.go:
+ *  48-55); the engine carries none of them. */
+export interface GraphRow {
+  commit: GraphCommitJson | null;
+  column: number;
+  color: number;
+  edges: GraphEdge[];
+}
+
+/**
+ * The commit-graph page's answer (`graphData(opts)`, SPEC-0017 §3 — the
+ * census R09 step 1, the in-DO lane/position RPC upstream backs with `git
+ * log --graph` + a glyph parser). `total` is the exact commit count of the
+ * walked tip set when the frontier exhausted inside MAX_GRAPH_SCAN, else
+ * null (upstream's count is an unbounded `rev-list --count` — we cannot
+ * afford that, and the honest answer is the null total, not a fake one;
+ * the page's hybrid pager: numbered when `total` lands, Newer/Older +
+ * bound note when null, ratified Open question 3). `truncated` flags ANY
+ * budget exit — the scan, refs or lanes cap — never null-for-budget.
+ */
+export interface GraphDataResult {
+  /** the tip set actually walked — resolved full ref names (a raw-oid tip
+   *  carries the oid), one entry per unique seed in seed order (tips
+   *  resolving to the same oid seed once, their decorations merging) */
+  refs: string[];
+  rows: GraphRow[];
+  total: number | null;
   truncated: boolean;
 }
 
@@ -1651,6 +1735,183 @@ export class RepoCell extends DurableObject<Env> {
       }
       if (total > results.length) truncated = true; // the 50-result cap cut a larger set
       return { ref: rr.refName ?? rr.oid, commit: tip.oid, results, total, truncated };
+    });
+  }
+
+  /**
+   * The commit-graph page's data, `graphData(opts)` (SPEC-0017 §3 — the
+   * census R09 boundary RPC; upstream serves the page from `git log --graph
+   * --date-order` + a stateful glyph parser, graph.go/parser.go. We have no
+   * git binary, so the walkLog frontier generalizes to N tips and lane/
+   * position assignment runs in-DO per §3.3 — the ratified lane algorithm,
+   * NOT a port of the glyph parser: visual parity on the 5px/12px grid is
+   * the bar, glyph identity is not, and the mechanical divergences are
+   * ledgered in Open question 2 / graphLaneRows below).
+   *
+   * Tips (§3.1): `refs` absent/empty seeds the DEFAULT tip set — every
+   * refs/heads/* and refs/tags/* (the `--tags --branches` semantics,
+   * graph.go:36-38; remotes and pull refs walk only when explicitly named).
+   * `hidePRRefs` drops refs/pull/* from the DEFAULT expansion — the
+   * `--exclude=refs/pull/*` analog, which never touches EXPLICITLY named
+   * refs (graph.go:32-34 bites wildcard expansion only), so a caller-named
+   * pull ref survives; on today's default expansion the filter is a no-op,
+   * carried so the semantics hold if the default ever widens. Every tip
+   * resolves + peels (annotated tags → their commit); unresolvable tips
+   * skip silently; when EVERY requested tip is unresolvable the walk falls
+   * back to the default set — upstream's bad-ref retry (commit.go:130-142) —
+   * and only a repo with NO refs at all (unborn HEAD) answers `null` (the
+   * page 404-shells; upstream's MustBeNotEmpty). Tips resolving to the same
+   * oid seed once, their decorations merging.
+   *
+   * The walk (§3.2): ONE date-ordered frontier walk from row 0 (committer
+   * time DESC, the stable-sort tie rule; `seen` dedup; per-pop parent push —
+   * walkLog's exact discipline generalized to N seeds). Pages are
+   * skip-windows inside that one walk: `(page-1)*limit` COMMIT pops are
+   * skipped while lane state accumulates across them (upstream feeds every
+   * skipped line through its parser, graph.go:77-82 — page N's lanes
+   * continue page N-1's seamlessly and a commit's column is independent of
+   * the page it appears on); relation rows never count toward the skip or
+   * the limit (§3.3.4). Past the window the walk continues count-only (lane
+   * assignment stops; a pop is one small commit read) until the frontier
+   * empties — the exact `total` — or MAX_GRAPH_SCAN trips (`total: null` +
+   * `truncated`; upstream's count is an unbounded `rev-list --count`, which
+   * we cannot afford — the honest null, not a fake one). No cache v1: the
+   * answer is page- and tip-set-shaped (query-keyed, the grep rule).
+   */
+  async graphData(
+    opts: { refs?: string[]; page?: number; limit?: number; hidePRRefs?: boolean } = {}
+  ): Promise<GraphDataResult | null> {
+    this.rpcBind();
+    return this.withContentLease(async (gate) => {
+      // the ref table (with tag peels — listRefs' exact loop) feeds both the
+      // tip-set selection and the decorations map
+      const allRefs: RefsResult["refs"] = [];
+      for (const r of this.store.refs()) {
+        const entry: RefsResult["refs"][number] = { name: r.name, target: r.oid };
+        if (r.name.startsWith("refs/tags/")) {
+          const peeled = await this.store.peeledRefTarget(r.name, r.oid, gate);
+          if (peeled && peeled !== r.oid) entry.peeled = peeled;
+        }
+        allRefs.push(entry);
+      }
+      const defaultTipNames = () =>
+        allRefs
+          .filter((r) => r.name.startsWith("refs/heads/") || r.name.startsWith("refs/tags/"))
+          .map((r) => r.name);
+      let truncatedRefs = false;
+      let tipNames: string[];
+      if (opts.refs && opts.refs.length > 0) {
+        tipNames = opts.refs; // explicit names: hidePRRefs never touches them (§3.1)
+      } else {
+        tipNames = defaultTipNames();
+        if (opts.hidePRRefs === true) tipNames = tipNames.filter((n) => !n.startsWith("refs/pull/"));
+      }
+      if (tipNames.length > MAX_GRAPH_REFS) {
+        tipNames = tipNames.slice(0, MAX_GRAPH_REFS); // §3.2.3: the first 500 walk, flagged
+        truncatedRefs = true;
+      }
+      // resolve + peel every tip; unresolvable tips skip silently (§3.1)
+      const seeds: LogEntry[] = [];
+      const walkedNames: string[] = [];
+      const seedOids = new Set<string>();
+      const seedTip = async (name: string) => {
+        const rr = await this.resolveRef(name, gate);
+        if (!rr) return;
+        const c = await this.peelToCommit(rr.oid, gate);
+        if (!c || seedOids.has(c.oid)) return;
+        seedOids.add(c.oid);
+        seeds.push({ oid: c.oid, commit: c.commit });
+        walkedNames.push(rr.refName ?? name);
+      };
+      for (const n of tipNames) await seedTip(n);
+      if (seeds.length === 0 && opts.refs && opts.refs.length > 0) {
+        // upstream's bad-ref retry (commit.go:130-142): every requested tip
+        // was unresolvable — answer unfiltered rather than fail ("a retry
+        // isn't harmful"); only an empty repo still nulls below
+        for (const n of defaultTipNames()) await seedTip(n);
+      }
+      if (seeds.length === 0) return null; // empty repo / unborn HEAD (§3.1)
+      // decorations: every ref, tags landing on their PEELED commit, grouped
+      // by the upstream RefGroup rule (§3.4)
+      const deco = new Map<string, { name: string; group: string }[]>();
+      for (const r of allRefs) {
+        const target = r.peeled ?? r.target;
+        const list = deco.get(target);
+        if (list) list.push({ name: r.name, group: refGroup(r.name) });
+        else deco.set(target, [{ name: r.name, group: refGroup(r.name) }]);
+      }
+      const limit = Math.min(Math.max(opts.limit ?? 100, 1), 100); // upstream's GraphMaxCommitNum default (ui.go:95)
+      const skip = (Math.max(opts.page ?? 1, 1) - 1) * limit;
+      if (skip >= MAX_GRAPH_SCAN) {
+        // §5: past the scan cap a deeper page answers the empty flagged shape
+        return { refs: walkedNames, rows: [], total: null, truncated: true };
+      }
+      const seen = new Set<string>();
+      const frontier: LogEntry[] = [];
+      for (const s of seeds) {
+        seen.add(s.oid);
+        frontier.push(s);
+      }
+      const laneState: GraphLaneState = { lanes: [], nextColor: 1 };
+      const rows: GraphRow[] = [];
+      let pops = 0; // skip + row + count pops all spend MAX_GRAPH_SCAN (§3.2.3)
+      let skipped = 0;
+      let collected = 0;
+      let total = 0;
+      let truncated = truncatedRefs;
+      let exhausted = true;
+      while (frontier.length > 0) {
+        if (pops >= MAX_GRAPH_SCAN) {
+          truncated = true; // the scan cap tripped first — total is not delivered
+          exhausted = false;
+          break;
+        }
+        frontier.sort((a, b) => b.commit.committer.time - a.commit.committer.time);
+        const cur = frontier.shift()!;
+        pops++;
+        total++;
+        if (collected < limit) {
+          // lane assignment runs through the skip too (§3.2.4: lane state
+          // accumulates across the page boundary, upstream graph.go:81)
+          const placed = graphLaneRows(cur.oid, cur.commit.parents, laneState);
+          if (placed === null) {
+            truncated = true; // the lane cap stops the walk; the rows so far stand
+            exhausted = false;
+            break;
+          }
+          if (skipped < skip) {
+            skipped++; // commit pops count toward the skip; relation rows never do
+          } else {
+            for (const edges of placed.before) {
+              rows.push({ commit: null, column: -1, color: 0, edges }); // §3.3.4 — the approach rows
+            }
+            rows.push({
+              commit: {
+                oid: cur.oid,
+                subject: cur.commit.subject,
+                author: cur.commit.author,
+                committer: cur.commit.committer,
+                parents: cur.commit.parents,
+                refs: deco.get(cur.oid) ?? [],
+              },
+              column: placed.column,
+              color: placed.color,
+              edges: placed.edges,
+            });
+            for (const edges of placed.relations) {
+              rows.push({ commit: null, column: -1, color: 0, edges }); // §3.3.4
+            }
+            collected++;
+          }
+        } // past the window: count-only pops (§3.2.5) — one small commit read
+        for (const p of cur.commit.parents) {
+          if (seen.has(p)) continue;
+          seen.add(p);
+          const c = await this.loadCommit(p, gate);
+          if (c) frontier.push({ oid: p, commit: c });
+        }
+      }
+      return { refs: walkedNames, rows, total: exhausted ? total : null, truncated };
     });
   }
 
@@ -3345,6 +3606,218 @@ function commitJson(oid: string, c: Commit): CommitJson {
     subject: c.subject,
     message: c.message,
   };
+}
+
+/** The upstream RefGroup rule (gitea/modules/git/ref.go:191-208): the
+ *  namespace graph rows' decoration chips cluster under; a ref outside every
+ *  known namespace groups as "" (upstream returns ""). */
+function refGroup(name: string): string {
+  if (name.startsWith("refs/heads/")) return "heads";
+  if (name.startsWith("refs/tags/")) return "tags";
+  if (name.startsWith("refs/remotes/")) return "remotes";
+  if (name.startsWith("refs/pull/")) return "pull";
+  if (name.startsWith("refs/for/")) return "for";
+  return "";
+}
+
+/** The lane model's open state (SPEC-0017 §3.3): slot i of `lanes` is column
+ *  i; an open lane descends toward `target` (the oid its line reaches at the
+ *  commit that owns it) in `color`. Colors come from a MONOTONIC counter —
+ *  unique per lane, never pool-recycled (the ledgered divergence from
+ *  upstream's rotating color pool, graph_models.go:170-173 — the visual
+ *  wrap stays identical: the page's CSS class is color % 16, Color16). */
+interface GraphLaneState {
+  lanes: ({ target: string; color: number } | null)[];
+  nextColor: number;
+}
+
+/**
+ * One pop's lane assignment (SPEC-0017 §3.3 — the ratified algorithm).
+ *
+ * - Land the commit (§3.3.1): every lane targeting this oid draws its final
+ *   segment into the dot and clears; the LOWEST incoming lane wins the
+ *   column (merge convergence draws to the leftmost incoming lane). No
+ *   incoming lane → a new tip line: the lowest free slot, a fresh color.
+ * - Place the parents (§3.3.3), in `parents` order: parent 0 extends the
+ *   vacated slot (the straight-line fast path — a lane elsewhere targeting
+ *   the same parent simply converges at the parent's own pop); each extra
+ *   parent either BENDS to a lane already targeting it (shared lane, no
+ *   allocation — two children converging on one parent) or takes the lowest
+ *   free slot right of the commit with a fresh color.
+ * - Every drawn edge crosses at most ONE column per row (§3.3.3); a wider
+ *   shift TRAVELS one column per relation row (§3.3.4) until it reaches its
+ *   slot — our relation rows are the ledgered stand-in for upstream's
+ *   `_`/`.` horizontal glyph segments (Open question 2: visual parity on
+ *   the 5px/12px grid is the bar, glyph identity is not). Extra parents
+ *   depart ONE ROW APART — parent 1 on the commit row, one relation row per
+ *   further parent — git's staggered octopus fan-out, decomposed into
+ *   commit-less rows. A lane born traveling draws nothing at its slot until
+ *   it arrives, so no floating segments appear above an in-flight diagonal.
+ * - Relation rows carry the parked lanes' verticals alongside the traveling
+ *   segments, so the lane picture continues seamlessly across them; the
+ *   caller emits them without consuming `limit` or the skip (§3.3.4).
+ *
+ * Returns the commit row's column/color/edges plus the relation rows' edge
+ * lists in row order — `before` (pre-commit rows: far incoming lanes'
+ * one-column-per-row approach toward the dot, git's `|/` shift lines) and
+ * `relations` (post-commit rows: the staggered extra-parent departures and
+ * the travelers completing their shifts) — or null when an allocation would
+ * cross MAX_GRAPH_LANES (the caller stops the walk and flags `truncated`,
+ * §3.2.3). The caller emits before-rows, the commit row, then relations;
+ * relation rows never consume `limit` or the skip (§3.3.4).
+ */
+function graphLaneRows(
+  oid: string,
+  parents: string[],
+  state: GraphLaneState
+): { column: number; color: number; edges: GraphEdge[]; before: GraphEdge[][]; relations: GraphEdge[][] } | null {
+  const lanes = state.lanes;
+  const commitEdges: GraphEdge[] = [];
+  const before: GraphEdge[][] = [];
+
+  // §3.3.1 — land the commit
+  const incoming: number[] = [];
+  for (let i = 0; i < lanes.length; i++) {
+    if (lanes[i] !== null && lanes[i]!.target === oid) incoming.push(i);
+  }
+  let ccol: number;
+  let ccolor: number;
+  if (incoming.length > 0) {
+    ccol = incoming[0]; // ascending scan — the lowest incoming lane
+    ccolor = lanes[ccol]!.color;
+    // Pre-commit relation rows: an incoming lane farther than one column
+    // from the commit travels one column per row toward it, so the commit
+    // row's convergence edges stay within the ≤1-column rule the page's SVG
+    // geometry draws (§4.2: verticals and ±1 diagonals only) — git's `|/`
+    // shift-line art, decomposed into commit-less rows (§3.3.4). Travel is
+    // DRAW-ONLY: the array slots stay until the commit row clears them, and
+    // an arrival parks at its drawn position even where another lane sits —
+    // overlapping paths are upstream's own answer (its parser accumulates
+    // per-flow glyph lists, and the SVG renders one path per flow).
+    const pos = new Map<number, number>(incoming.map((j) => [j, j]));
+    for (;;) {
+      const movers = incoming.filter((j) => Math.abs(pos.get(j)! - ccol) > 1);
+      if (movers.length === 0) break;
+      const edges: GraphEdge[] = [];
+      const moving = new Set(movers);
+      for (let i = 0; i < lanes.length; i++) {
+        const l = lanes[i];
+        if (l === null || moving.has(i)) continue;
+        const p = pos.get(i) ?? i;
+        edges.push({ from: p, to: p, color: l.color });
+      }
+      for (const j of movers) {
+        const p = pos.get(j)!;
+        const step = p > ccol ? p - 1 : p + 1;
+        edges.push({ from: p, to: step, color: lanes[j]!.color });
+        pos.set(j, step);
+      }
+      before.push(edges);
+    }
+    for (const j of incoming) {
+      // the lane at the commit's own column continues as parent 0's edge
+      // below — drawing its convergence too would duplicate the `|` (its
+      // approach rows above already carried its travel)
+      if (!(j === ccol && parents.length > 0)) {
+        const p = pos.get(j) ?? j;
+        commitEdges.push({ from: p, to: ccol, color: lanes[j]!.color });
+      }
+      lanes[j] = null;
+    }
+  } else {
+    const free = lanes.indexOf(null);
+    if (free < 0 && lanes.length >= MAX_GRAPH_LANES) return null;
+    ccol = free < 0 ? lanes.length : free;
+    ccolor = state.nextColor++;
+    lanes[ccol] = { target: oid, color: ccolor }; // placeholder parent 0 extends below
+  }
+
+  // §3.3.3 — place the parents. `depart` draws one transition's first
+  // segment (≤1 column) on `row` and queues the rest as travel from row+1
+  // (into `queued` — the row loop's own working set, so remainders queued
+  // mid-assembly are never lost). Slots allocated this pop (their lanes are
+  // born traveling) never draw row verticals until they arrive.
+  const newSlots = new Set<number>();
+  const arrived = new Set<number>();
+  const staggered: { row: number; from: number; to: number; color: number }[] = [];
+  let queued: { row: number; from: number; to: number; color: number }[] = [];
+  const depart = (into: GraphEdge[], row: number, from: number, to: number, color: number) => {
+    if (to === from) {
+      into.push({ from, to, color });
+      if (newSlots.has(to)) arrived.add(to); // landed on its slot this row
+      return;
+    }
+    const step = to > from ? from + 1 : from - 1;
+    into.push({ from, to: step, color });
+    if (step === to) {
+      if (newSlots.has(to)) arrived.add(to); // landed on its slot this row
+    } else {
+      queued.push({ row: row + 1, from: step, to, color });
+    }
+  };
+  if (parents.length === 0) {
+    lanes[ccol] = null; // a root commit: the lane ends at the dot
+  } else {
+    // parent 0: the vacated slot is free (the landing cleared it, or holds
+    // this commit's own placeholder) — the straight-line fast path
+    lanes[ccol] = { target: parents[0], color: ccolor };
+    depart(commitEdges, 0, ccol, ccol, ccolor);
+    for (let k = 1; k < parents.length; k++) {
+      const p = parents[k];
+      const row = k - 1; // parent 1 departs on the commit row, one relation row per further parent
+      const existing = lanes.findIndex((l) => l !== null && l.target === p);
+      if (existing >= 0) {
+        staggered.push({ row, from: ccol, to: existing, color: lanes[existing]!.color });
+      } else {
+        let slot = lanes.indexOf(null, ccol + 1);
+        if (slot < 0 && lanes.length >= MAX_GRAPH_LANES) return null;
+        if (slot < 0) slot = lanes.length;
+        lanes[slot] = { target: p, color: state.nextColor++ };
+        newSlots.add(slot);
+        staggered.push({ row, from: ccol, to: slot, color: lanes[slot]!.color });
+      }
+    }
+  }
+  // Assemble the rows: row 0 is the commit row; every further row is a
+  // relation row (§3.3.4) carrying the parked lanes' verticals, this row's
+  // staggered departure, then one step of every traveler scheduled for it.
+  const relations: GraphEdge[][] = [];
+  const maxRow = staggered.length > 0 ? staggered[staggered.length - 1].row : 0;
+  for (let row = 0; ; row++) {
+    const edges = row === 0 ? commitEdges : (relations[relations.length] = []);
+    if (row === 0) {
+      // verticals of lanes that neither converged nor were placed this pop
+      // (the commit's own column drew via parent 0's segment)
+      for (let i = 0; i < lanes.length; i++) {
+        const l = lanes[i];
+        if (l !== null && i !== ccol && !newSlots.has(i)) edges.push({ from: i, to: i, color: l.color });
+      }
+    } else {
+      // parked lanes only — lanes born this pop draw nothing at their slot
+      // while still traveling (no floating segments above an in-flight line)
+      for (let i = 0; i < lanes.length; i++) {
+        const l = lanes[i];
+        if (l !== null && !(newSlots.has(i) && !arrived.has(i))) edges.push({ from: i, to: i, color: l.color });
+      }
+    }
+    for (const s of staggered) {
+      if (s.row === row) depart(edges, row, s.from, s.to, s.color);
+    }
+    const rest: typeof queued = [];
+    for (const t of queued) {
+      if (t.row !== row) {
+        rest.push(t);
+        continue;
+      }
+      const step = t.to > t.from ? t.from + 1 : t.from - 1;
+      edges.push({ from: t.from, to: step, color: t.color });
+      if (step === t.to) arrived.add(t.to);
+      else rest.push({ row: row + 1, from: step, to: t.to, color: t.color });
+    }
+    queued = rest;
+    if (row >= maxRow && queued.length === 0) break;
+  }
+  return { column: ccol, color: ccolor, edges: commitEdges, before, relations };
 }
 
 function decodePath(p: string): string[] {
