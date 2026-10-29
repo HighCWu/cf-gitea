@@ -360,7 +360,15 @@ describe("AdminPackagesPage — the nine-column table", () => {
 // The route level — the gate ladder through the shared adminPagePrologue
 // ---------------------------------------------------------------------------
 
-type RouteEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher; PACKAGES_ENABLED?: string };
+// PACKAGES_ENABLED rides the Omit too — the generated Env carries the
+// example's LITERAL "true" (wrangler types), and a plain intersection with
+// { PACKAGES_ENABLED?: string } narrows back to "true", rejecting the
+// disabled-posture "false" (the 27c2502 lesson, CI-caught: local types can
+// go stale when the example changes).
+type RouteEnv = Omit<Env, "ASSETS" | "PACKAGES_ENABLED"> & {
+  ASSETS?: UiAssetsFetcher;
+  PACKAGES_ENABLED?: string;
+};
 const routeEnv: RouteEnv = {
   ...env,
   ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
