@@ -743,34 +743,71 @@ CLEAN at this measurement — IN-FLIGHT by dispatch ownership, do not
 re-dispatch; the tab is a reduction note inside a LANDED row, so the
 totals exclude nothing). Headline **115/1/0, zero rows in flight**
 (116 rows).
+**Ticked 2026-10-30** a twenty-first time, at HEAD `6bf9c17` — the
+post-actions maintenance re-walk, PROGRAMMATIC (the backtick-aware
+family walk run on this file BEFORE the edits — it reproduces
+tick-20's headline exactly: A 23/1/0, B 18/0/0, C 26/0/0, D 22/0/0,
+E 12/0/0, F 14/0/0 = **115/1/0**, 116 rows, zero in flight — and
+again AFTER, where its counts must equal the headline below). TWO
+landings since tick-20, ZERO status flips — both complete arms inside
+already-LANDED rows, each verified against the tree (new parse
+families + the registrations + the nav fold at committed HEAD, not
+assumed from commit messages): `6bf9c17` mounts the org settings
+upstream `packages` management page (web.go:1069-1085 — the B
+settings row's in-flight marker retires: `pages/org-settings-packages.tsx`,
+the cleanup-rules CRUD + the preview over migration 0039's
+`package_cleanup_rules`, four `org-settings-packages*` families,
+eight brace-form registrations with chi-405 twins at
+index.ts:14343-14350, Cargo NOT rendered nor routed — no substrate;
+the OrgSettingsNavTab fold lights Packages), and `72af05a` mounts the
+USER-scope `/user/settings/actions` Runners twin (web.go:721-732's
+group — the A tabs row was already LANDED with secrets/variables from
+window-2a, so this moves its data note only: five
+`user-settings-actions-runners*` families, the registrations' reset
+literal ahead of the brace-form `{id}` combos with chi-405 twins at
+index.ts:14219-14229, the UserSettingsNavbar Actions disclosure
+lights Runners FIRST per navbar.tmpl:39-60). The user group's
+remaining pieces stay recorded reductions: the bare redirect
+(web.go:722) + the general page (723-726) + scoped-workflows. No-count
+movers in the same window: `ce76247` (the admin actions `{id}`
+registrations join the brace form — a production 404 bug fixed inside
+LANDED rows), `d580d1f` (five new-page goldens), `d431826` (fixture
+debt), `16a63b6` (the /install window counts HUMANS — outside the
+surveyed web.go surface). The walk-instructions parenthetical (stale
+since tick-20 at 374/248) refreshed to 412/269. Headline **115/1/0,
+zero rows in flight** (116 rows).
 
 - **Pin**: `fc4936884584a41931906553d96c2601d750e6ef` (v1.22.0-rc1-3919;
   verified `git -C gitea rev-parse HEAD`). Every `web.go:N` cite is
   `gitea/routers/web/web.go` at that commit unless another file is named.
 - **Our side**: the route table + parser families in
-  `apps/worker/src/ui/index.ts` at HEAD `1ff87d1` (refreshed at
-  tick-20; tick-19's measurements were at `e26c862`, tick-18's at
+  `apps/worker/src/ui/index.ts` at HEAD `6bf9c17` (refreshed at
+  tick-21; tick-20's measurements were at `1ff87d1`, tick-19's at
+  `e26c862`, tick-18's at
   `eba0060`, tick-17's at
   `c7ec2fe`, tick-16's at `59b1c3c`) — the header inventory
   (the route-family comment block) and the `ParsedUiRoute` union
-  (index.ts:3251 at this tick) are the exhaustive family list (a family
+  (index.ts:3286 at this tick) are the exhaustive family list (a family
   exists iff a parse branch returns it); the pages under
-  `apps/worker/src/ui/pages/` (265 files committed at this tick: 140 page
-  modules + 125 test modules; up from 248 files at `e26c862`, 234 at `eba0060` and 221 at `c7ec2fe`) and the
+  `apps/worker/src/ui/pages/` (269 files committed at this tick: 142 page
+  modules + 127 test modules; up from 265 files at `1ff87d1`, 248 at `e26c862`, 234 at `eba0060` and 221 at `c7ec2fe`) and the
   session router (`src/ui/session.ts`) + the first-run router
   (`src/ui/first-run.ts` — the `/install` window + the ALLOW_SIGNUP-gated
   `/user/sign_up`, mounted BEFORE `uiRouter`, `9d77172`) carry the renders, with the
   `src/web/` seam routers (avatar serving, attachments serving) mounted in
   `src/index.ts`. Every count reads committed HEAD
-  (`git show` / `git ls-tree HEAD`); the tracked tree was CLEAN at
-  this tick's measurement, and sibling-owned uncommitted edits
-  materialized in the working tree while the tick was being written
-  (`user-accounts.ts` + its test, `goldens.test.ts`, `first-run.ts`,
-  `RELEASE-NOTES-v1.3.md` — outside this survey's ownership) plus one
-  sibling UNTRACKED scratch doc (`docs/run-pending-9am-task.md`) —
+  (`git show` / `git ls-tree HEAD`); the tracked tree at this
+  tick's measurement carried sibling-owned edits (`specs/README.md`),
+  and the user-packages twin's own work-in-progress materialized
+  while the tick was being written (`index.ts`, `index.test.ts`, the
+  goldens set, the UNTRACKED `pages/user-settings-packages.tsx` — the
+  very surface the In-flight note names — outside this survey's
+  ownership) plus one sibling UNTRACKED scratch doc
+  (`docs/run-pending-9am-task.md`) —
   not characterized, changes no counts. The survey's
-  `grep -c "family:"` parse-branch count stands at 403 and index.ts at
-  14,927 lines at this tick (374 / 14,073 at tick-19; 349 / 13,037 at
+  `grep -c "family:"` parse-branch count stands at 412 and index.ts at
+  15,171 lines at this tick (403 / 14,927 at tick-20; 374 / 14,073 at
+  tick-19; 349 / 13,037 at
   tick-18; 330 / 12,341 at
   tick-17; 286 / 10,764 at tick-16; 263 / 10,054 when
   the session began).
@@ -782,9 +819,10 @@ totals exclude nothing). Headline **115/1/0, zero rows in flight**
      surfaces excluded per the preamble) — the row set is pin-stable
      apart from that split.
   2. Ours (committed HEAD only): `git show HEAD:apps/worker/src/ui/index.ts | grep
-     -c "family:"` (the parse branches — 374 at this tick) +
+     -c "family:"` (the parse branches — 412 at this tick) +
      `git ls-tree HEAD --name-only apps/worker/src/ui/pages/ | wc -l`
-     (the renders — 248 files; 234 at `eba0060`); anything
+     (the renders — 269 files; 265 at `1ff87d1`, 248 at
+     `e26c862`); anything
      spec-bearing or unfamiliar means HEAD is not the right base.
   3. API dependencies: `node scripts/check-openapi.mjs` (ends `PASS`) —
      `grep` its `[ok]` lines for the op named per row.
@@ -948,6 +986,12 @@ rows. Data notes: the E row's two sections render (`97cb70e`), the B
 row's org actions tab gains runners (`3ab7532`) and its upstream
 packages tab goes IN FLIGHT (sibling-owned, excluded — a reduction
 note inside a LANDED row, no row count moves).
+The `6bf9c17` tick (tick-21): ZERO status flips — the two landings
+complete arms inside LANDED rows: the B settings row's upstream
+`packages` management tab MOUNTS (`6bf9c17`, the in-flight marker
+retires), and the A tabs row's user actions group gains Runners
+(`72af05a`; the row was already LANDED with secrets/variables) — the
+headline **115/1/0 + 0** stands at 116 rows.
 
 ## In-flight (excluded from the totals — do not re-dispatch)
 
@@ -1047,6 +1091,22 @@ tracked tree was CLEAN at the measurement; sibling-owned uncommitted
 edits materialized while the tick was being written
 (`user-accounts.ts` + its test, `goldens.test.ts`, `first-run.ts`,
 `RELEASE-NOTES-v1.3.md`) plus one sibling UNTRACKED scratch doc
+(`docs/run-pending-9am-task.md`) — outside this survey's ownership,
+not characterized, changes no counts; every count reads committed
+HEAD.
+Tick-21: tick-20's pending surface RESOLVED — the org settings
+upstream `packages` management page MOUNTED `6bf9c17` (the B row's
+note updates; no row moves). Zero rows in flight. TWO NEW
+sibling-owned surfaces are PENDING (dispatch lanes, NOT in-flight
+rows, per the tick-17/tick-20 convention): the USER packages settings
+twin (upstream's `/user/settings/packages` group, web.go:701-720 —
+the user twin of the org page just landed) and gate-v4 (machinery).
+A sibling unit owns both; do not re-dispatch, do not count. The
+tracked tree at this measurement carried sibling-owned edits
+(`specs/README.md`), and the twin's own work-in-progress materialized
+while the tick was being written (`index.ts`, `index.test.ts`, the
+goldens set, the UNTRACKED `pages/user-settings-packages.tsx`) plus
+the sibling UNTRACKED scratch doc
 (`docs/run-pending-9am-task.md`) — outside this survey's ownership,
 not characterized, changes no counts; every count reads committed
 HEAD.
@@ -1178,6 +1238,7 @@ the slice ledger below):
 | the census's staged D pair MOUNTS (the arbitration's queued re-walk counts them) | `GET .../comments/{id}/attachments` (web.go:1337 — the repo-level comments head beside the aux family, GET-only, the outcome union over the global-id cross-check + HasAttachmentSupport) + `GET .../issues/new/choose` (web.go:1357 — the no-template 303 arm as the page) — the `29b67cf` modules' HANDOFF recipes executed; flips the D family's last two ABSENT rows | `fa4fd0d` |
 | the SPEC-0012 actions-UI window (C8 + C9 + the five-family index window) | `GET|POST .../settings/actions*` (web.go:1262-1278 — secrets/variables `a8e065f`, the general page module `6fcb561`, its arms + the bare `/actions` redirect + the runners pages `0c8da44`; flips the E row LANDED), `GET .../actions` + `/job_queue` + the `runs/{run}[/{attempt}|/jobs/{job}]` view subtree (web.go:1567-1568,1576-1587 — `0c8da44`; flips the F row PARTIAL, the tail GETs unclaimed), `GET /-/admin/actions/job_queue` (web.go:904 — `0c8da44`) and `GET /-/admin/packages` (web.go:852-858 — `a8e065f`; both shrink the A admin row's absent list) | `a8e065f` + `6fcb561` + `0c8da44` |
 | the actions tail window (tick-20) — the F row completes | `GET .../runs/{run}/jobs/{job}/logs` (web.go:1589) + `GET .../runs/{run}/workflow` (1591) + `GET .../workflows/{workflow_name}/badge.svg` (1606) + `GET .../workflow-dispatch-inputs` (1572 — the HTML fragment) — `1ff87d1`; `GET|DELETE .../runs/{run}/artifacts/{artifact_name}` (1595-1596) — `6f07849`; `GET .../artifacts/{artifact_id}/preview[/...]` (1602-1603) — `cd7eec4`: flips the F row LANDED (every page-bearing GET in web.go:1566-1608 serves). Riding the same window: `GET /-/admin/actions` + the runners/variables pages (web.go:898-904, `b5923ed` — the A admin row's absent list shrinks to auths; scoped-workflows the documented reduction), the org runners twin (web.go:1058, `3ab7532` — the B row's actions-tab note), and the ActionsConfig store (migration 0043, `97cb70e` — the E row's two sections render) | `3ab7532` + `cd7eec4` + `b5923ed` + `6f07849` + `97cb70e` + `1ff87d1` |
+| the tick-21 maintenance window — two in-row arm completions | the org settings packages management page (web.go:1069-1085 — the cleanup-rules CRUD + preview over migration 0039's `package_cleanup_rules`, four `org-settings-packages*` families, brace-form registrations with chi-405 twins, Cargo honest-absent, the OrgSettingsNavTab fold; `6bf9c17` — flips NO row: the B settings row was already LANDED, its in-flight marker retires) + the user-scope actions Runners twin (web.go:721-732 — `pages/user-settings-actions-runners.tsx`, five `user-settings-actions-runners*` families, the reset literal ahead of the brace-form `{id}` combos, the UserSettingsNavbar Actions disclosure lit; `72af05a` — flips NO row: the A tabs row was already LANDED with secrets/variables) | `6bf9c17` + `72af05a` |
 
 Non-UI landings in the same window that moved Data columns below: the
 projects family completed all three API scopes (repo `0d5b480`/`fc123b0`,
@@ -1209,7 +1270,7 @@ onto).
 | `GET /user/login` | web.go:577 | LANDED as `/login` (SPEC-0010 divergence) | landed | core | — |
 | `GET /user/sign_up` | web.go:595 | LANDED (SPEC-0010 §6's first-run amendment: `515a594` + mount `df1e362` — GET+POST at upstream's exact path over the extracted `registerUser` ladder (`services/user-accounts.ts`: the account-form validation, the email check, UNIQUE unwrapping, the redirect consumption), success mints the session and 303s `/` (upstream's handleSignIn, auth.go:632); request-level arms in BOTH gate states. DIVERGENCES ledgered: the `ALLOW_SIGNUP` var gates pages AND routes — default FALSE answers the hidden full-shell 404 while closed (the inverted DISABLE_REGISTRATION default, service.go:148); signed-in browsers 303 to `/` where upstream renders; the password is accepted-and-ignored per SPEC-0002 §4.6.7, the form says so on-page; no email-confirmation/captcha arms — upstream default-config form parity. The sibling `/install` window (upstream `routers/install/routes.go:30-31`) is OUTSIDE this survey's web.go walk — not a row) | landed (`services/user-accounts.ts`) | core | — |
 | `GET /user/settings` (profile) | web.go:634 | LANDED (`pages/user-settings.tsx`) | landed | authoring | — |
-| `/user/settings/{account,notifications,appearance,security,applications,keys,organization,repos}` | web.go:641-735 | LANDED — window-2a MOUNTED the tab family (`0c2b151`, 8 modules, 19 routes: appearance GET + theme/language POSTs, security, actions secrets+variables with full write arms, hooks list/detail/delete, keys, applications with the one-shot newToken banner, organization — SINGULAR wire path per web.go:740 — with leave; shared `userSettingsTabPrologue`, sameOriginGuard-first POSTs). Wave-126 MOUNTED the account tab (GET page + the email/email-delete/delete POST arms over the landed email + PAT stores) and the notifications tab (GET + the two preference POSTs, no EnableNotifyMail arm — always-mounted per SPEC §3); the shared navbar carries both items. The repos tab — the group's last absence — MOUNTED `484eb92` (GET-only arm per the `03ef47c` module's HANDOFF: `loadUserSettingsReposPageData` → null 404-shells → render; the navbar gains the Repos item per navbar.tmpl:74-76, the template's LAST): every tab in upstream's group now serves | landed | authoring | — |
+| `/user/settings/{account,notifications,appearance,security,applications,keys,organization,repos}` | web.go:641-735 | LANDED — window-2a MOUNTED the tab family (`0c2b151`, 8 modules, 19 routes: appearance GET + theme/language POSTs, security, actions secrets+variables with full write arms, hooks list/detail/delete, keys, applications with the one-shot newToken banner, organization — SINGULAR wire path per web.go:740 — with leave; shared `userSettingsTabPrologue`, sameOriginGuard-first POSTs). Wave-126 MOUNTED the account tab (GET page + the email/email-delete/delete POST arms over the landed email + PAT stores) and the notifications tab (GET + the two preference POSTs, no EnableNotifyMail arm — always-mounted per SPEC §3); the shared navbar carries both items. The repos tab — the group's last absence — MOUNTED `484eb92` (GET-only arm per the `03ef47c` module's HANDOFF: `loadUserSettingsReposPageData` → null 404-shells → render; the navbar gains the Repos item per navbar.tmpl:74-76, the template's LAST): every tab in upstream's group now serves. Tick-21: the user-scope Actions group gains RUNNERS `72af05a` (the list + token lifecycle + the edit/update/delete arms at the user scope, `pages/user-settings-actions-runners.tsx`, five `user-settings-actions-runners*` families, the registrations' reset literal ahead of the brace-form `{id}` combos, the shared navbar's Actions disclosure lighting Runners FIRST per navbar.tmpl:39-60) — the group's secrets/variables/runners pages all serve; its bare redirect + general + scoped-workflows pieces stay the recorded reduction | landed | authoring | — |
 | `GET /notifications` + `/new` + `/status` + `/purge` | web.go:1785,1788-1789,1791 | LANDED (`pages/notifications.tsx`; tick-14: the legacy `?q=` alias adopted at both read sites `e91f075` — notification.go:69's `FormString("type", FormString("q"))` type-then-q fold, consulted only when type is ABSENT, so `?type=&q=read` folds to unread exactly upstream; the GET page read + the status-POST re-render both carry it, the pager canonicalizes to `type=` and the tab hrefs stay `?type=`-only — zero render change) | landed | authoring | — |
 | `/notifications/subscriptions`, `/watching`, `/purge-page` | web.go:1786-1787,1790 | LANDED (window-2e C3b `5ca1727` — the committed module's loaders + one-template render over both GET arms, 8 issue sorts verbatim, facet tri-states. Tick-15: the group's last unclaimed member — the POST `/purge-page` write arm (web.go:1790) — MOUNTED `ea6a49d` (NotificationPurgePagePost, notification.go:207-218: the `notification-purge-page` parse family + the POST-only registration beside the purge pair, the posted ids filtered through `isOwnMailboxThread` — foreign/unknown silently drop — one batched `markThread` read upsert, the bare `{"redirect": ""}` JSONRedirect answer per context.go:239-241; upstream's mark_page_as_read page-shape reduced to the fragment contract's JSONRedirect, the dead-surface note retired; the matrix-6 interim 404 pin flipped to the mount, 26/26 — rides the deploy AFTER RD21) | landed | authoring | — |
 | `/-/admin/*` (dashboard, users, repos, orgs, config, monitor, notices, auths, emails, badges, packages, hooks, applications, actions) | web.go:780-906 | PARTIAL — window-2c MOUNTED the admin group (`e31c0cf`, 7 routes: `GET|POST /-/admin` dashboard + the stats/cron/queue/stacktrace monitor pages + the cron run; shared adminPagePrologue — session → anonymous login-303 → non-admin 404 shell per upstream's hidden-surface posture, web.go:779). Wave-126 MOUNTED the users/orgs/repos LISTING pages (GET literal trio over the landed paged loaders; the ONE shared family navbar — AdminFamilyNav — carries every landed item with the details-open + active arms derived from the active page). Tick-13: the a11y sweeps scoped every admin table's th cells — users' 9 `132fec0`, orgs/repos/monitor's 27 `ec2dd70` — and the admin-orgs listing's settings pencil gained its aria-label `967a5d4` (the R5 catch the admin-orgs golden's probe made on first sight; list.tmpl:70's icon-only anchor, the peer-icon-anchor precedent); goldens landed for users/orgs/repos (`b4e9ca7`, the admin-repos golden via the q-arm `5058f5a`); the monitor golden-skip is RESOLVED (tick-14): R6's definition-shape exemption made the thead-less policy call structurally (`ff3b4fb` — upstream renders key/value tables thead-less BY DESIGN, stats.tmpl's label/count rows + dashboard.tmpl's label/run rows: the label IS the row header; the TOTAL structural test — ≥1 row, zero th anywhere, every row exactly two td — classifies them, any deviation falls back to the data-table path so real tables' protection is unchanged) and the monitor goldens LANDED — stats+queue in `ff3b4fb`, cron in `df348c8` first-sight clean (thead+scope from birth, the run button titled) with the ROUTE_CLOCK test seam (module-scope, test-only setter, null = exact pre-seam bytes; 7 rendered-byte call sites, 20 write-path stamps deliberately left) pinning the wall-clock Next-Run column deterministically — the wallclock audit's final hop and the LAST admin golden. STILL ABSENT: the auths page ONLY (no admin login-source read family
@@ -1263,7 +1324,7 @@ the actions tails (`b5923ed`, the shared-nav fold `92d2e87`) | partial (user/rep
 | `GET /{org}/teams/new` | web.go:1009 | LANDED | landed | authoring | — |
 | `GET|POST /{org}/teams/{team}/edit` (+ the team delete write) | web.go:1011-1013 | LANDED (`pages/org-settings.tsx`'s edit arm, `8380cf0` — new.tmpl's edit form over every landed `editTeam` field: name, description, the visibility radio triple, permission radios checked by the team's `authorize` (blanket read/write/admin — the landed enum has no `none`), stored per-unit teams rendering their unit rows with `units_present=1` and form-convert semantics per upstream's ParseAccessMode-first order; the `repo_access` radios dead-control-unrendered — the landed arm ignores the field; the red Delete Team button a real form POST, the confirm dialog reduced) | landed (`orgEditTeam`/`orgDeleteTeam` declared) | authoring | — |
 | `GET|POST /{org}/settings` (options) + the avatar pair + the danger-zone writes | web.go:1017-1021,1065-1067 | LANDED (`pages/org-settings.tsx`, wave 49 `8380cf0` — the options combo over `orgEdit`: full_name/email/description/website/location + `repo_admin_change_team_access` + the visibility modal's write; the avatar pair multipart-bridged through the landed avatar pipeline (`processAvatarImage`/`uploadAvatar`); rename/delete/visibility as three `<details>` disclosure forms — the dialog reduction, every control live; `max_repo_creation` honest-absent, no landed key nor column; the navbar's unlanded tabs render nothing, the dead-link rule) | landed (`orgEdit`/`renameOrg`/`orgDelete`/`orgUpdateAvatar`/`orgDeleteAvatar` declared) | authoring | — |
-| `/{org}/settings/{hooks,applications,blocked_users}` (+ `audit_logs`; the `packages`/`actions` tabs FEATURE-ABSENT) | web.go:1022-1041,1063,1069-1089 | LANDED — hooks `54264ae`; blocked_users + the actions-tab secrets/variables surfaces `4f2805f` (the org twins of the user settings arms, full write sets); applications `77e8567` (the R20-a oauth2 list/create/delete, `pages/org-settings-applications.tsx`); audit_logs `781d8a3` (the org arm of the shared `pages/settings-audit-logs.tsx` module — GET-only upstream, web.go:1069). Upstream's `packages`/`actions` management tabs stay FEATURE-ABSENT-gated (our actions-tab surfaces serve org secrets/variables AND runners — the org-scope twin `3ab7532` at web.go:1058; the upstream `packages` management page is IN FLIGHT — a sibling unit owns it, do not re-dispatch; the actions tab's general page + bare redirect + scoped-workflows stay the recorded reduction) | landed (org hooks ops ALL declared — `orgListHooks`/`orgGetHook`/`orgCreateHook`/`orgEditHook`/`orgDeleteHook`; the blocked_users/applications/audit org-scope reads all landed) | authoring | — |
+| `/{org}/settings/{hooks,applications,blocked_users}` (+ `audit_logs`, `packages`; the `actions` tab's general/bare-redirect/scoped-workflows pieces FEATURE-ABSENT-gated) | web.go:1022-1041,1063,1069-1089 | LANDED — hooks `54264ae`; blocked_users + the actions-tab secrets/variables surfaces `4f2805f` (the org twins of the user settings arms, full write sets); applications `77e8567` (the R20-a oauth2 list/create/delete, `pages/org-settings-applications.tsx`); audit_logs `781d8a3` (the org arm of the shared `pages/settings-audit-logs.tsx` module — GET-only upstream, web.go:1069). Upstream's `packages` management tab LANDED `6bf9c17` (tick-21 — the in-flight marker retires: `pages/org-settings-packages.tsx`, the cleanup-rules CRUD ported write-arm-exact — add-ignores-action INSERTs per upstream's literal shape, the dup gate, edit resolves the rule BEFORE the action branch, save never overwrites Type, success 303s onto the rule URL — plus the preview = the cleanup consumer's candidate ladder verbatim, over migration 0039's `package_cleanup_rules`; four `org-settings-packages*` families, eight brace-form registrations with chi-405 twins, the OrgSettingsNavTab fold lights Packages; Cargo NOT rendered nor routed — no substrate — and no quota, the template is cleanup-rules + cargo only). Our actions-tab surfaces serve org secrets/variables AND runners (the org-scope twin `3ab7532` at web.go:1058); the actions tab's general page + bare redirect + scoped-workflows stay the recorded reduction | landed (org hooks ops ALL declared — `orgListHooks`/`orgGetHook`/`orgCreateHook`/`orgEditHook`/`orgDeleteHook`; the blocked_users/applications/audit org-scope reads all landed; the cleanup-rules CRUD rides migration 0039's table) | authoring | — |
 | `GET /org/{org}/settings/labels` | web.go:1043-1049 | LANDED at `/{org}/labels` (documented divergence; the three POST segments ride upstream's literals) | landed | authoring | — |
 
 **B: 18 rows — 18 LANDED, 0 PARTIAL, 0 ABSENT.**
@@ -1374,7 +1435,7 @@ the actions tails (`b5923ed`, the shared-nav fold `92d2e87`) | partial (user/rep
 
 **116 rows: 115 LANDED, 1 PARTIAL, 0 ABSENT — zero IN-FLIGHT; the
 counted sums cover all 116 rows** (programmatic tally, re-walked at
-tick-20 — see the header note; tick-18's heal of tick-17's
+tick-21 — see the header note; tick-18's heal of tick-17's
 five-of-thirteen edit gap and tick-16's correction of tick-15's
 printed baseline stand). (The window consumed the module wave — nothing is
 excluded; the tick-9 correction of the tick-8 "111 counted"
@@ -1416,7 +1477,8 @@ users/orgs/repos/config/notices/emails/hooks/badges/applications
 pages, the blame page, the commit graph, the in-repo + user/org +
 explore code-search trio, the heatmap, the repo activity page + the
 three chart pages, the LFS settings family + the audit-log settings
-(repo AND org), and the packages user/repo surfaces — plus the actions
+(repo AND org), and the packages user/repo surfaces AND the org
+settings packages management tab — plus the actions
 settings pages (general/secrets/variables/runners), the actions runs
 list + job-queue + run-viewer pages (repo and admin scopes, the admin
 packages list), and the actions tail surface (the job-scoped log
@@ -1428,11 +1490,13 @@ login-source read family is declared — needs-API-first). Everything
 else this survey still lacks is the recorded-reductions class inside
 LANDED rows (the compare
 two-dot/fork forms, the org dashboard's heatmap tail, the teams'
-five-segment name tails, the org settings upstream
-packages-management tab — IN FLIGHT, a sibling unit owns the page —
-plus the actions-tab reductions: the org general page + bare
+five-segment name tails, plus the actions-tab reductions: the org
+general page + bare
 redirect + scoped-workflows, the admin scoped-workflows page, and the
-whole user-scope `/user/settings/actions` group, web.go:725-732).
+user actions group's bare redirect + general + scoped-workflows pages
+(web.go:721-732 — its secrets/variables/runners pages all serve since
+`72af05a`)). The user packages settings twin is IN FLIGHT (a sibling
+unit owns it — see In-flight).
 
 ## Recommendation — re-ranked queue by demand-per-effort
 
@@ -1449,7 +1513,7 @@ needs-API-first, feature-gated (actions/packages), or no-RPC-gated
 to dispatch without a SPEC or an API landing first.
 `node scripts/check-openapi.mjs` PASS
 re-run at this HEAD (500 ops / 306 paths unchanged, tier-1 78/78
-paths, 129/129 ops; re-verified at tick-20's `1ff87d1` — identical
+paths, 129/129 ops; re-verified at tick-21's `6bf9c17` — identical
 counts; tick-17's `-/unlink` flag closed `110cf56` as a
 documented runtime-only exception) — the packages M1/M3 landings
 closed the last API gap except the admin login-source reads (the
@@ -1500,16 +1564,17 @@ download+delete `6f07849`, the preview pair `cd7eec4` — the F row is
 LANDED), the admin actions group's remaining pages LANDED (`b5923ed`
 — the runners/variables tabs + the bare redirect; scoped-workflows
 its DOCUMENTED REDUCTION), and the org runners twin LANDED
-(`3ab7532`). What remains, in full: (1) the org settings upstream
-`packages` management page — IN FLIGHT, a sibling unit owns it, do
-not re-dispatch; (2) the USER-SCOPE TWINS — the
-`/user/settings/actions` group (web.go:725-732: the bare redirect +
-general + runners + secrets + variables + scoped-workflows, the
-user-scope mount of the same shared routes the admin scope just
-landed) and the org actions tab's remaining general/bare-redirect/
+(`3ab7532`). Tick-21 consumed the last dispatch-lane item: the org
+settings upstream `packages` management page LANDED `6bf9c17`. What
+remains, in full: (1) the USER actions group's REMAINING sub-tabs —
+the bare redirect + general + scoped-workflows (web.go:721-732;
+runners joined secrets/variables `72af05a`) and the org actions tab's
+remaining general/bare-redirect/
 scoped-workflows pieces — recorded reductions inside LANDED rows
 (the A tabs row and the B settings row), polish-class only if a
-future dispatch wants them; (3) the admin auths page —
+future dispatch wants them; (2) the USER packages settings twin —
+IN FLIGHT (with gate-v4), a sibling unit owns it, do not
+re-dispatch; (3) the admin auths page —
 NEEDS-API-FIRST (below), the survey's one PARTIAL row. The
 no-RPC class is
 EMPTY — blame (`aa1fb29`), graph (`7a21493`), all three code-search
@@ -1527,6 +1592,6 @@ PARTIAL-by-divergence posture is retired; the tick-19 actions window
 handed the section NEW opportunistic targets (the F row's tail GETs +
 the admin actions pages, all over landed data) and tick-20 CONSUMED
 them all (`1ff87d1`/`6f07849`/`cd7eec4`/`b5923ed`, counted above) —
-the section's remaining names are the tick-20 list in the GATED
-paragraph (the org packages page in flight, the user-scope twins,
-auths needs-API).
+the section's remaining names are the tick-21 list in the GATED
+paragraph (the user packages twin in flight, the user actions group's
+general/scoped-workflows sub-tabs, auths needs-API).
