@@ -36,6 +36,7 @@ import type {
   BlameResult,
   CommitJson,
   ActivityStatsResult,
+  ContributorStatsResult,
   GrepResult,
   LogResult,
   RefsResult,
@@ -66,6 +67,12 @@ export interface EngineClient {
    *  per-author counts, a 10-min TTL cache keyed by the immutable tip;
    *  `null` = unresolvable ref/empty repo (the availability ladder). */
   activityStats(ref: string | undefined, period?: string): Promise<ActivityStatsResult | null>;
+  /** Per-author weekly add/del timeline (SPEC-0015 M2b, the R15 charts'
+   *  substrate): full-history walk (merges excluded from the fold, counted
+   *  as cap slots), Sunday-anchored Unix-ms buckets computed in each
+   *  commit's recorded timezone, oldest-name precedence; NO TTL (the
+   *  fixed-history immutability argument); `truncated` on the scan cap. */
+  contributorStats(ref: string | undefined): Promise<ContributorStatsResult | null>;
 }
 
 /** Build the client for one repository from the request's bindings. */
@@ -82,5 +89,6 @@ export function engineClient(env: Env, repoName: string): EngineClient {
     blame: (ref, path, opts) => safe(cell.blame(ref, path, opts)),
     grep: (ref, opts) => safe(cell.grep(ref, opts)),
     activityStats: (ref, period) => safe(cell.activityStats(ref, period)),
+    contributorStats: (ref) => safe(cell.contributorStats(ref)),
   };
 }

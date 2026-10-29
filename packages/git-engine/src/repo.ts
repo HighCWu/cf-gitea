@@ -160,6 +160,13 @@ export const MAX_GREP_REGEXP_STEPS = 2000000;
 /** stats_cache key prefix for the stats family's windowed arm (SPEC-0015
  *  §3.2) — `act:<period>` beside the fixed buckets' bare w/m/q/y keys */
 const ACTIVITY_CACHE_PREFIX = "act:";
+/** contributorStats' stats_cache key (SPEC-0015 §3.2) — beside the activity
+ *  family's `act:<period>` keys. NO TTL: the fold is a fixed-history function
+ *  of the tip oid (upstream's 10-minute freshness is a cache-POPULATION
+ *  concern there; an immutable-tip fold never goes stale — the store.ts
+ *  docstring's immutability rule, the same one computeStats' w/m/q/y keys
+ *  ride). */
+export const CONTRIBUTOR_CACHE_KEY = "contrib";
 /** activityStats' cache freshness (SPEC-0015 §3.2): a `--since = now − window`
  *  answer SHIFTS as wall time advances even under an immutable tip, so the
  *  `act:` cache entry stamps computedAt and a hit older than this TTL
@@ -377,6 +384,53 @@ export interface ActivityStatsResult {
  *  result minus the period (the cache key carries it) plus the computed-at
  *  stamp the TTL check reads. */
 type ActivityStatsAgg = Omit<ActivityStatsResult, "period"> & { computedAt: number };
+
+/** One Sunday bucket of the contributor graphs (upstream `WeekData`,
+ *  contributors_graph.go:41-46 — the JSON shape the charts consume:
+ *  web_src/js/components/RepoContributors.vue and RepoCodeFrequency.vue read
+ *  `.week/.additions/.deletions/.commits` from the weeks VALUES, since JSON
+ *  map keys are strings — the inline `week` field is load-bearing). */
+export interface ContributorWeek {
+  /** Unix MILLISECOND timestamp of the bucket's Sunday 00:00 UTC
+   *  (contributors_graph.go:47 "Starting day of the week as Unix timestamp") */
+  week: number;
+  additions: number;
+  deletions: number;
+  commits: number;
+}
+
+/** One git identity's week-folded contribution record (the engine half of
+ *  upstream `ContributorData`, contributors_graph.go:49-58 — git identity
+ *  only; the email → user PRIMARY-email normalization and the
+ *  login/avatar_link/home_link decorations are the DOWNSTREAM service's job
+ *  over D1, SPEC-0015 §3.2). */
+export interface ContributorStatsAuthor {
+  name: string;
+  /** the lowercased author email — always === its contributors-map key */
+  email: string;
+  totalCommits: number;
+  /** keyed by `ContributorWeek.week` (the Sunday's Unix ms) */
+  weeks: Record<number, ContributorWeek>;
+}
+
+/**
+ * The charts' `/data` answer (`contributorStats(ref)`, SPEC-0015 §3.2 — the
+ * data behind upstream's `GET .../{contributors|code-frequency|recent-commits}/data`,
+ * census R15: ContributorsData serves this whole map (with downstream adding
+ * upstream's `"total"` pseudo-entry), CodeFrequencyData serves the total's
+ * `weeks` record). Deliberately NO `ref`/`commit` fields (the SPEC shape) and
+ * NO `computedAt` stamp (the cache is immutable-tip keyed, no TTL).
+ */
+export interface ContributorStatsResult {
+  contributors: Record<string, ContributorStatsAuthor>;
+  /** the walk's raw cost: reachable commits examined (merges included — they
+   *  cost a cap slot, never a fold), capped at MAX_STATS_SCAN */
+  count: number;
+  /** the walk hit its cap with history still unvisited — the answer is the
+   *  NEWEST MAX_STATS_SCAN commits' fold, the older weeks partial/missing
+   *  (flagged, never silent; the blame budget-exit rule) */
+  truncated: boolean;
+}
 
 export interface DiffFileJson {
   path: string;
@@ -1648,6 +1702,50 @@ export class RepoCell extends DurableObject<Env> {
         count: agg.count,
         truncated: agg.truncated,
       };
+    });
+  }
+
+  /**
+   * The contributor graphs' answer, `contributorStats(ref)` (the census R15
+   * boundary RPC — the data behind upstream's `GET .../{contributors|
+   * code-frequency|recent-commits}/data`, all three mounting
+   * GetContributorStats, contributors_graph.go:80). The walk is the resolved
+   * tip's FULL history — every parent, NOT first-parent (upstream's command
+   * carries no --first-parent, contributors_graph.go:119) — so side-branch
+   * work folded through merges IS counted, unlike activityStats' chain; merge
+   * commits themselves are excluded from the fold (upstream --no-merges — they
+   * cost the walk a cap slot, never a fold). Per non-merge commit the fold
+   * keys the AUTHOR email lowercased (empty skipped, :223-226) into Sunday
+   * buckets: `weekMs` is the last Sunday before the author DATE-ONLY rendered
+   * in the commit's recorded timezone (upstream buckets git's `%as` string
+   * through findLastSundayBeforeDate + UnixMilli, :61-73 + :258-261 — the
+   * timezone-honoring arithmetic, contributorWeekMs below), accumulating
+   * numstat-shaped add/del vs the first parent (the readDiff/computeDiff
+   * idiom) plus `commits`, and a per-author `totalCommits`. The engine returns
+   * git identities only — upstream's `"total"` pseudo-entry, its
+   * GetUserByEmail PRIMARY-email merge, and the login/avatar/home decorations
+   * are assembled DOWNSTREAM over D1 (SPEC §3.2, the activity-author-data
+   * idiom); the ratification also fixes NO pre-warm (Open question 3): the
+   * first uncached call computes synchronously under budget and answers
+   * complete-or-truncated, never upstream's 202 ErrAwaitGeneration (Workers
+   * cannot hold a 5 s await-then-background walk). Availability ladder (the
+   * blame rule): null ONLY on an unresolvable ref / unpeelable tip; a budget
+   * exit answers the partial flagged (`truncated`), never null. Pinned
+   * divergences (ledger-ready, the M2a family's): no rename detection (a
+   * rename folds as full delete+add, the --no-renames oracle mirrors);
+   * binary/over-cap files contribute 0/0 (what --shortstat's totals show for
+   * them); a commit past MAX_DIFF_FILES folds its first 100 paths; and an
+   * EMPTY commit folds 0/0/commits++ where upstream's blind 4-line scan
+   * skips it entirely (no shortstat line — its parser warn-skips the block).
+   */
+  async contributorStats(ref?: string): Promise<ContributorStatsResult | null> {
+    this.rpcBind();
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(ref, gate);
+      if (!rr) return null;
+      const tip = await this.peelToCommit(rr.oid, gate);
+      if (!tip) return null;
+      return this.computeContributorStats(tip.oid, gate);
     });
   }
 
@@ -3001,6 +3099,63 @@ ${items}
     return result;
   }
 
+  /**
+   * The charts' fold behind `contributorStats` (SPEC-0015 §3.2) — the stats
+   * family's FULL-HISTORY arm, cache-keyed `contrib` under the immutable tip
+   * oid with NO TTL and NO stamp: a fixed-history function of the tip never
+   * goes stale (the store.ts immutability rule; upstream's 10-minute cache
+   * timeout is a population concern — the TTL contract stays the windowed
+   * `act:` arm's). The walk rides walkLog's shared frontier (all parents,
+   * committer-time pop order, `seen` dedup so a diamond history folds each
+   * commit once — required for a full-history fold); the unfiltered walk
+   * grows one entry per pop, so `more === true` is EXACTLY the
+   * MAX_STATS_SCAN cap cutting older history (`truncated`), and merges ride
+   * in `entries` costing cap slots but never folding (`count` = the raw walk
+   * cost). The fold iterates the entries REVERSED: upstream's walk is
+   * `--reverse` (oldest-first) so its first-seen name per email is the OLDEST
+   * commit's — the opposite of the pulse fold's newest-name precedence
+   * (repo_stats.go's parser reads a newest-first log); reversing mirrors that
+   * precedence on our newest-first entries (exact for linear chains, the
+   * oracle-fixture case). Add/del ride computeDiff against the first parent
+   * (readDiff's default pair; the root commit diffs against the empty tree)
+   * into the commit's Sunday bucket — contributorWeekMs below for the bucket
+   * arithmetic.
+   */
+  private async computeContributorStats(tipOid: string, gate?: ReadGate): Promise<ContributorStatsResult> {
+    const cached = this.store.getStatsCache(tipOid, CONTRIBUTOR_CACHE_KEY);
+    if (cached) return JSON.parse(cached); // no TTL — the tip's history is immutable
+    const { entries, more } = await this.walkLog(tipOid, 0, MAX_STATS_SCAN, {}, gate);
+    const contributors = new Map<string, ContributorStatsAuthor>();
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (e.commit.parents.length > 1) continue; // --no-merges: merges never fold
+      const email = e.commit.author.email.toLowerCase();
+      if (!email) continue; // empty-email skip (contributors_graph.go:223-226)
+      let author = contributors.get(email);
+      if (!author) {
+        author = { name: e.commit.author.name, email, totalCommits: 0, weeks: {} };
+        contributors.set(email, author);
+      }
+      const week = contributorWeekMs(e.commit.author.time, e.commit.author.tz);
+      const w = author.weeks[week] ?? (author.weeks[week] = { week, additions: 0, deletions: 0, commits: 0 });
+      const parent = e.commit.parents[0] ? await this.loadCommit(e.commit.parents[0], gate) : null;
+      const { files } = await this.computeDiff(parent?.tree ?? null, e.commit.tree, gate);
+      for (const f of files) {
+        w.additions += f.add;
+        w.deletions += f.del;
+      }
+      w.commits++;
+      author.totalCommits++;
+    }
+    const result: ContributorStatsResult = {
+      contributors: Object.fromEntries(contributors),
+      count: entries.length,
+      truncated: more,
+    };
+    this.store.setStatsCache(tipOid, CONTRIBUTOR_CACHE_KEY, JSON.stringify(result));
+    return result;
+  }
+
   private async statsPage(repo: string, h: string | undefined, period: string, gate?: ReadGate): Promise<Response> {
     const r = `/${repoUrl(repo)}`;
     const base = await this.base(repo, "stats", h, `${r}/stats/`, gate);
@@ -3122,6 +3277,34 @@ function activityWindowStart(period: string, now: number): number {
     default:
       return now - 168 * 3600 * 1000; // weekly (unknown never reaches here)
   }
+}
+
+// ---- contributorStats' bucket helper (SPEC-0015 §3.2) --------------------------
+//
+// Upstream buckets the AUTHOR date through git's `%as` (the date-only string
+// rendered in the COMMIT's recorded timezone) run through
+// findLastSundayBeforeDate (contributors_graph.go:61-73) — Go time.Parse with
+// time.DateOnly reads that string as UTC midnight, so the anchor is the
+// calendar date in the commit's own zone, not the UTC date of the epoch. The
+// arithmetic below reconstructs that from Person's epoch + tz: apply the
+// offset, take the local Y/M/D as a UTC-midnight epoch, subtract the weekday.
+// Go's `daysToSubtract := int(weekday) - int(time.Sunday)` is the weekday
+// itself (Sunday = 0, the negative branch is dead), so a SUNDAY dates to
+// ITSELF — the bucket is that day, not the previous week (the :258-261
+// `UnixMilli()` call renders the anchor in Unix milliseconds).
+
+/** The Sunday bucket (Unix ms, 00:00 UTC) of a commit authored at
+ *  `authorTimeSec` with recorded timezone `tz` — upstream's
+ *  findLastSundayBeforeDate + UnixMilli arithmetic (contributors_graph.go
+ *  :61-73 + :258-261) over `%as` semantics. */
+function contributorWeekMs(authorTimeSec: number, tz: string): number {
+  const m = /^[+-]\d{4}$/.test(tz) ? tz : null; // parsePerson already normalizes, but stay defensive
+  const offMin = m
+    ? (tz[0] === "-" ? -1 : 1) * (parseInt(tz.slice(1, 3), 10) * 60 + parseInt(tz.slice(3, 5), 10))
+    : 0;
+  const local = new Date(authorTimeSec * 1000 + offMin * 60000);
+  const dayMs = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate());
+  return dayMs - local.getUTCDay() * 86400000; // getUTCDay(): 0 = Sunday, Go time.Weekday's Sunday = 0
 }
 
 function renderHunk(hk: Hunk): string {

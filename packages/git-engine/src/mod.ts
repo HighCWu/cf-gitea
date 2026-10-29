@@ -35,7 +35,7 @@ export { RepoCell } from "./repo";
 export { Registry } from "./registry";
 export type { Env } from "./env";
 export type { RepoInfo, RepoConfig } from "./registry";
-export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, TreeCommitsResult, BlobResult, LogResult, DiffResult, DiffFileJson, BlameResult, BlamePartJson, GrepResult, ActivityStatsResult, ActivityAuthor } from "./repo";
+export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, TreeCommitsResult, BlobResult, LogResult, DiffResult, DiffFileJson, BlameResult, BlamePartJson, GrepResult, ActivityStatsResult, ActivityAuthor, ContributorStatsResult } from "./repo";
 export { TREE_COMMITS_MAX_PATHS, MAX_BLAME_BYTES } from "./repo";
 export { MAX_BLAME_LINES } from "./git/blame";
 export type { Person } from "./git/objects";

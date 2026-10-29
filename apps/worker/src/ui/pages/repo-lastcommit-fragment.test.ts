@@ -356,6 +356,7 @@ function stubClient(
     blame: () => Promise.resolve(null),
     grep: () => Promise.resolve(null), // refused-work posture: pages that never search
     activityStats: () => Promise.resolve(null), // the unresolvable-ref ladder
+    contributorStats: () => Promise.resolve(null),
     ...overrides,
   };
 }
