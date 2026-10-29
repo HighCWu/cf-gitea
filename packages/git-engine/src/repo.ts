@@ -157,6 +157,17 @@ export const MAX_GREP_SCAN_STEPS = 200000;
  *  regexp scans tighter than words/exact (whose 200k-line cap runs native
  *  indexOf), the documented cost of budgeting the mode at all. */
 export const MAX_GREP_REGEXP_STEPS = 2000000;
+/** stats_cache key prefix for the stats family's windowed arm (SPEC-0015
+ *  §3.2) — `act:<period>` beside the fixed buckets' bare w/m/q/y keys */
+const ACTIVITY_CACHE_PREFIX = "act:";
+/** activityStats' cache freshness (SPEC-0015 §3.2): a `--since = now − window`
+ *  answer SHIFTS as wall time advances even under an immutable tip, so the
+ *  `act:` cache entry stamps computedAt and a hit older than this TTL
+ *  recomputes — the stats family's one freshness contract (upstream's
+ *  contributor generation timeout, contributors_graph.go:33 `60*10` s). The
+ *  fixed buckets (w/m/q/y) keep the no-TTL immutability rule (store.ts's
+ *  stats_cache docstring) — only windowed keys stamp. */
+export const ACTIVITY_STATS_TTL_MS = 10 * 60 * 1000;
 // full streaming is a separate follow-up; until then this must fit the isolate
 const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 /** the DO SQLite storage ceiling gc must not cross while duplicating objects */
@@ -314,6 +325,58 @@ export interface GrepResult {
    *  budget-exit rule — a budget-bounded scan is never presented complete) */
   truncated: boolean;
 }
+
+/** One per-author row of the pulse answer (upstream `CodeActivityAuthor`,
+ *  repo_stats.go:30-34) — git identity only; the email → user display
+ *  mapping is the downstream service's job over D1 (SPEC-0015 §3.2, the
+ *  landed activity-author-data idiom). */
+export interface ActivityAuthor {
+  name: string;
+  email: string;
+  commits: number;
+}
+
+/**
+ * The pulse page's code-unit answer (`activityStats(ref, period)`, SPEC-0015
+ * §3.2 — the data behind upstream's `GET .../activity[/{period}]`, census
+ * R14): upstream's `CodeActivityStats` (repo_stats.go:20-28) plus our
+ * honesty fields (`count`/`truncated`). `commitCountInAllBranches`
+ * (repo_stats.go:26) is NOT in v1 — ratified Open question 2 (a second
+ * all-refs walk per answer is a real per-answer cost for a header nicety).
+ */
+export interface ActivityStatsResult {
+  /** the normalized period — upstream's exact set (activity.go:29-45);
+   *  unknown/absent input answers the weekly default */
+  period: string;
+  /** distinct author emails in the window (upstream AuthorCount) */
+  authorCount: number;
+  /** non-merge commits in the window on the first-parent chain (upstream
+   *  CommitCount) */
+  commitCount: number;
+  /** distinct paths changed across the window's folded commits (upstream
+   *  ChangedFiles — the numstat file set, repo_stats.go:149) */
+  changedFiles: number;
+  /** window totals from the per-commit diffs (upstream Additions/Deletions,
+   *  repo_stats.go:125/:130 — binary/over-cap files contribute their path
+   *  but no counts, the `-` skip upstream's parser applies at :123/:128) */
+  additions: number;
+  deletions: number;
+  /** per-email commit counts, commits-DESC (repo_stats.go:145) */
+  authors: ActivityAuthor[];
+  /** the walk's raw cost: first-parent chain commits examined inside the
+   *  window (merges included — they cost a step, never a count), capped at
+   *  MAX_STATS_SCAN */
+  count: number;
+  /** the walk hit its cap before the window's oldest edge — the answer's
+   *  window is then a partial prefix (flagged, never silent; the blame
+   *  budget-exit rule) */
+  truncated: boolean;
+}
+
+/** The cache-stamped internal shape behind activityStats — the boundary
+ *  result minus the period (the cache key carries it) plus the computed-at
+ *  stamp the TTL check reads. */
+type ActivityStatsAgg = Omit<ActivityStatsResult, "period"> & { computedAt: number };
 
 export interface DiffFileJson {
   path: string;
@@ -1537,6 +1600,57 @@ export class RepoCell extends DurableObject<Env> {
     });
   }
 
+  /**
+   * Commit-activity aggregation for the pulse page, `activityStats(ref,
+   * period)` (the census R14 boundary RPC — the data behind upstream's
+   * `GET .../activity[/{period}]`, routers/web/repo/activity.go, whose code
+   * unit runs GetCodeActivityStats → `git log --numstat --no-merges
+   * --first-parent <branch> --since=<RFC3339>`, repo_stats.go:55-59). The
+   * walk is the resolved tip's FIRST-PARENT chain (upstream --first-parent —
+   * a tighter, cheaper walk than walkLog's frontier) with merge commits
+   * excluded from the fold (--no-merges: they cost the walk a step, never a
+   * count); window membership is COMMITTER time (git --since semantics: the
+   * commit date decides, and --since sets no upper bound) while author
+   * identity is the AUTHOR name/email (%aN/%aE), keyed by lowercased email
+   * (repo_stats.go:113-118). The add/del fold runs per in-window non-merge
+   * commit via computeDiff against the first parent (readDiff's default
+   * pair) into WINDOW TOTALS plus the distinct path set (repo_stats.go:
+   * 119-149) — the landed diff budgets ride along (binary files and
+   * MAX_DIFF_BLOB-over files contribute their path with add=del=0, the same
+   * shape upstream's parser gets from numstat's `-` rows; a commit past
+   * MAX_DIFF_FILES counts its first 100 paths — upstream's numstat is
+   * uncapped, the ledgered divergence). Availability ladder (the blame
+   * rule): null ONLY on an unresolvable ref / unpeelable tip; a budget exit
+   * answers the partial flagged (`truncated`), never null. Unknown/absent
+   * `period` answers the weekly default (upstream activity.go:29). The
+   * email → user display mapping (login/avatar/home) is the DOWNSTREAM
+   * service's job over D1 — the engine returns git identities only
+   * (SPEC §3.2); `commitCountInAllBranches` (repo_stats.go:26) is NOT in v1
+   * (ratified Open question 2).
+   */
+  async activityStats(ref?: string, period?: string): Promise<ActivityStatsResult | null> {
+    this.rpcBind();
+    return this.withContentLease(async (gate) => {
+      const rr = await this.resolveRef(ref, gate);
+      if (!rr) return null;
+      const tip = await this.peelToCommit(rr.oid, gate);
+      if (!tip) return null;
+      const p = activityPeriodOrDefault(period);
+      const agg = await this.computeActivityStats(tip.oid, p, gate);
+      return {
+        period: p,
+        authorCount: agg.authorCount,
+        commitCount: agg.commitCount,
+        changedFiles: agg.changedFiles,
+        additions: agg.additions,
+        deletions: agg.deletions,
+        authors: agg.authors,
+        count: agg.count,
+        truncated: agg.truncated,
+      };
+    });
+  }
+
   /** The content methods over HTTP. GET-only; routed from ui(). */
   private async api(path: string, q: URLSearchParams): Promise<Response> {
     const h = q.get("h") ?? undefined;
@@ -2751,9 +2865,14 @@ ${items}
   }
 
   /**
-   * Commit-activity aggregation for a fixed (tip commit oid, period) pair.
-   * History under an immutable commit oid never changes, so a cache hit
-   * needs no version check — only the pair itself as key.
+   * Commit-activity aggregation for a fixed (tip commit oid, period) pair —
+   * the stats family's FIXED-BUCKET arm (w/m/q/y, the cgit stats page):
+   * commit counts only, bucketed by committer time. History under an
+   * immutable commit oid never changes, so a cache hit needs no version
+   * check and no TTL — only the pair itself as key. The windowed pulse arm
+   * lives beside it: computeActivityStats under `act:<period>` keys
+   * (SPEC-0015 §3.2) — same table, TTL-stamped (that answer shifts with
+   * wall time under a fixed tip).
    */
   private async computeStats(
     tipOid: string,
@@ -2797,6 +2916,88 @@ ${items}
       count: entries.length,
     };
     this.store.setStatsCache(tipOid, period, JSON.stringify(result));
+    return result;
+  }
+
+  /**
+   * The pulse fold behind `activityStats` (SPEC-0015 §3.2) — the stats
+   * family's WINDOWED arm, cache-keyed `act:<period>` beside computeStats's
+   * fixed buckets. The (tip_oid, period) immutability argument covers the
+   * TIP, but a `--since = now − window` answer SHIFTS as wall time advances
+   * under a fixed tip, so the entry stamps computedAt and a hit older than
+   * ACTIVITY_STATS_TTL_MS recomputes (the family's one freshness contract,
+   * upstream's contributors timeout, contributors_graph.go:33); the fixed
+   * buckets keep the no-TTL rule (the store docstring). The walk is the
+   * FIRST-PARENT chain from the tip (upstream --first-parent — parents[0]
+   * only, no frontier); merge commits are excluded from the fold (upstream
+   * --no-merges) but still cost the walk a step, so `count` is the raw
+   * chain cost and `commitCount` the counted subset. Window membership is
+   * COMMITTER time with no upper bound (git --since semantics); the walk
+   * caps at MAX_STATS_SCAN (the existing stats budget) and `truncated`
+   * flags the cap tripping BEFORE the window's oldest edge — the answer's
+   * window is then a partial prefix, flagged never silent (the blame rule).
+   */
+  private async computeActivityStats(tipOid: string, period: string, gate?: ReadGate): Promise<ActivityStatsAgg> {
+    const cacheKey = ACTIVITY_CACHE_PREFIX + period;
+    const cached = this.store.getStatsCache(tipOid, cacheKey);
+    if (cached) {
+      const hit = JSON.parse(cached) as ActivityStatsAgg;
+      if (Date.now() - hit.computedAt < ACTIVITY_STATS_TTL_MS) return hit;
+      // stale: fall through — the recompute below rewrites the stamp
+    }
+    const sinceSec = Math.floor(activityWindowStart(period, Date.now()) / 1000);
+    const authors = new Map<string, ActivityAuthor>();
+    const files = new Set<string>();
+    let additions = 0;
+    let deletions = 0;
+    let commitCount = 0;
+    let count = 0;
+    let truncated = false;
+    let cur = await this.peelToCommit(tipOid, gate);
+    while (cur) {
+      if (cur.commit.committer.time < sinceSec) break; // the window's oldest edge — the complete answer
+      if (count >= MAX_STATS_SCAN) {
+        truncated = true; // the cap tripped before the edge: a partial window
+        break;
+      }
+      count++; // merges cost the walk a step; only non-merges fold below
+      const firstParent = cur.commit.parents[0] ?? null;
+      if (cur.commit.parents.length <= 1) {
+        commitCount++;
+        // per-email commit counts, lowercased keying, first-seen name wins
+        // (the walk is newest-first, so "first seen" = the newest commit —
+        // the same precedence upstream's log-order parser gives, :113-118)
+        const email = cur.commit.author.email.toLowerCase();
+        const known = authors.get(email);
+        if (known) known.commits++;
+        else authors.set(email, { name: cur.commit.author.name, email, commits: 1 });
+        // numstat-shaped add/del vs the first parent (readDiff's default
+        // pair); binary/toolarge entries ride computeDiff's kinds with
+        // add=del=0 — their PATH still reaches the set, upstream's `-` skip
+        const parent = firstParent ? await this.loadCommit(firstParent, gate) : null;
+        const { files: diffFiles } = await this.computeDiff(parent?.tree ?? null, cur.commit.tree, gate);
+        for (const f of diffFiles) {
+          files.add(f.path);
+          additions += f.add;
+          deletions += f.del;
+        }
+      }
+      cur = firstParent ? await this.peelToCommit(firstParent, gate) : null;
+    }
+    const result: ActivityStatsAgg = {
+      authorCount: authors.size,
+      commitCount,
+      changedFiles: files.size,
+      additions,
+      deletions,
+      // commits-DESC (repo_stats.go:145); ties keep first-seen order — Go's
+      // sort.Slice there is unstable, ours stays deterministic
+      authors: [...authors.values()].sort((a, b) => b.commits - a.commits),
+      count,
+      truncated,
+      computedAt: Date.now(),
+    };
+    this.store.setStatsCache(tipOid, cacheKey, JSON.stringify(result));
     return result;
   }
 
@@ -2866,6 +3067,61 @@ export function tooLargeResponse(maxBytes: number): Response {
     status: 413,
     headers: { "content-type": "text/plain; charset=utf-8" },
   });
+}
+
+// ---- activityStats' window helpers (SPEC-0015 §3.2) ---------------------------
+//
+// The pulse page's period set + durations are upstream's exact switch
+// (routers/web/repo/activity.go:29-45): fixed hours for daily/halfweekly/
+// weekly, Go AddDate calendar arithmetic for monthly/quarterly/semiyearly/
+// yearly, unknown/absent falling to weekly. Calendar subtraction normalizes
+// identically in Go and JS (Mar 31 − 1 month → Mar 3 in both; Feb 29 − 1
+// year → Mar 1 in both), so the UTC date arithmetic below computes the same
+// window upstream's server-local AddDate does — the comparison stays
+// absolute-epoch either way (upstream formats RFC3339 with the server zone
+// and git --since parses it back to the epoch).
+
+/** Normalize a pulse-period request to upstream's set (activity.go:29-45);
+ *  unknown/absent answers the weekly default (upstream's own fallback). */
+function activityPeriodOrDefault(period?: string): string {
+  switch (period) {
+    case "daily":
+    case "halfweekly":
+    case "weekly":
+    case "monthly":
+    case "quarterly":
+    case "semiyearly":
+    case "yearly":
+      return period;
+    default:
+      return "weekly";
+  }
+}
+
+/** Epoch-ms start of the window `period` wide ending at `now` — upstream's
+ *  timeFrom arithmetic (activity.go:29-45). */
+function activityWindowStart(period: string, now: number): number {
+  switch (period) {
+    case "daily":
+      return now - 24 * 3600 * 1000;
+    case "halfweekly":
+      return now - 72 * 3600 * 1000;
+    case "monthly":
+    case "quarterly":
+    case "semiyearly": {
+      const months = period === "monthly" ? 1 : period === "quarterly" ? 3 : 6;
+      const d = new Date(now);
+      d.setUTCMonth(d.getUTCMonth() - months);
+      return d.getTime();
+    }
+    case "yearly": {
+      const d = new Date(now);
+      d.setUTCFullYear(d.getUTCFullYear() - 1);
+      return d.getTime();
+    }
+    default:
+      return now - 168 * 3600 * 1000; // weekly (unknown never reaches here)
+  }
 }
 
 function renderHunk(hk: Hunk): string {
