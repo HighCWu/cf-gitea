@@ -11,7 +11,7 @@
 import { applyD1Migrations, SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { eq, inArray } from "drizzle-orm";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -549,6 +549,128 @@ describe("artifacts v4 (the twirp family)", () => {
       body: JSON.stringify({ pad: "x".repeat(1024 * 1024 + 10) }),
     });
     expect(big.status).toBe(413);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The upload-time expiry ceiling (artifact.go:94-107 via
+// ACTIONS_ARTIFACT_RETENTION_DAYS — the strict-polarity arm both families read)
+// ---------------------------------------------------------------------------
+
+/** The ceiling pin on the AMBIENT test env (the session.test.ts mutation
+ *  view): SELF.fetch dispatches with this same env object, so the pinned
+ *  value reaches the route handlers without touching the account-local
+ *  config. Every ceiling test restores it in afterEach — the file's other
+ *  batteries stay whatever-polarity the surrounding config injects. */
+type RetentionPinEnv = { ACTIONS_ARTIFACT_RETENTION_DAYS?: string };
+function pinArtifactRetention(value: string | undefined): void {
+  (env as RetentionPinEnv).ACTIONS_ARTIFACT_RETENTION_DAYS = value;
+}
+
+describe("the artifact expiry ceiling (artifact.go:94-107)", () => {
+  afterEach(() => {
+    pinArtifactRetention(undefined);
+  });
+
+  /** The v1 upload-url POST, with the runner's optional RetentionDays. */
+  async function createUploadUrl(harness: Harness, name: string, retentionDays?: number): Promise<string> {
+    const res = await SELF.fetch(
+      `${BASE}/api/actions_pipeline/_apis/pipelines/workflows/${harness.runId}/artifacts`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${harness.runtimeToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          Type: "actions_storage",
+          Name: name,
+          ...(retentionDays !== undefined ? { RetentionDays: retentionDays } : {}),
+        }),
+      },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json<{ fileContainerResourceUrl: string }>();
+    return body.fileContainerResourceUrl;
+  }
+
+  /** One md5-verified chunk PUT — enough to run CreateArtifact (the row). */
+  async function putSingleChunk(harness: Harness, uploadUrl: string, itemPath: string, bytes: Uint8Array): Promise<void> {
+    // The armed URL already carries ?retentionDays=… — join with `&` there.
+    const sep = uploadUrl.includes("?") ? "&" : "?";
+    const res = await SELF.fetch(`${uploadUrl}${sep}itemPath=${encodeURIComponent(itemPath)}`, {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${harness.runtimeToken}`,
+        "content-range": `bytes 0-${bytes.length - 1}/${bytes.length}`,
+        "x-tfs-filelength": String(bytes.length),
+        "x-actions-results-md5": base64StdMd5(bytes),
+      },
+      body: bytes,
+    });
+    expect(res.status).toBe(200);
+  }
+
+  it("v1: the armed var clamps the runner's RetentionDays down (the min arm)", async () => {
+    pinArtifactRetention("7");
+    const harness = await seedRunningTask();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const uploadUrl = await createUploadUrl(harness, "ceiling-artifact", 365);
+    expect(uploadUrl).toContain("?retentionDays=365");
+    await putSingleChunk(harness, uploadUrl, "ceiling-artifact/f.bin", ARTIFACT_CONTENT);
+
+    const rows = await db().select().from(actionArtifacts).where(eq(actionArtifacts.runId, harness.runId));
+    const expiredUnix = rows[0]?.expiredUnix ?? 0;
+    // now + 7d (the ceiling), NOT now + 365d (the runner's ask).
+    expect(expiredUnix).toBeGreaterThanOrEqual(nowSec + 7 * 86400);
+    expect(expiredUnix).toBeLessThanOrEqual(nowSec + 7 * 86400 + 120);
+  });
+
+  it("v1: unarmed keeps an expiry-less upload forever (expired_unix 0)", async () => {
+    pinArtifactRetention(undefined);
+    const harness = await seedRunningTask();
+    const uploadUrl = await createUploadUrl(harness, "forever-artifact");
+    expect(uploadUrl).not.toContain("retentionDays");
+    await putSingleChunk(harness, uploadUrl, "forever-artifact/f.bin", ARTIFACT_CONTENT);
+
+    const rows = await db().select().from(actionArtifacts).where(eq(actionArtifacts.runId, harness.runId));
+    expect(rows[0]?.expiredUnix).toBe(0); // artifactKeepForever
+  });
+
+  it("v4: the armed var clamps a far-future expires_at down (the min arm)", async () => {
+    pinArtifactRetention("7");
+    const armed = await seedRunningTask();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const res = await SELF.fetch(`${TWIRP}/CreateArtifact`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${armed.runtimeToken}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        workflow_run_backend_id: String(armed.runId),
+        workflow_job_run_backend_id: String(armed.jobId),
+        name: "clamped-artifact",
+        expires_at: { seconds: nowSec + 400 * 86400, nanos: 0 }, // the runner's far-future ask
+      }),
+    });
+    expect(res.status).toBe(200);
+    const armedRows = await db().select().from(actionArtifacts).where(eq(actionArtifacts.runId, armed.runId));
+    const clamped = armedRows[0]?.expiredUnix ?? 0;
+    // now + 7d (the ceiling), NOT now + 400d.
+    expect(clamped).toBeGreaterThanOrEqual(nowSec + 7 * 86400);
+    expect(clamped).toBeLessThanOrEqual(nowSec + 7 * 86400 + 120);
+  });
+
+  it("v4: unarmed keeps an expiry-less create forever (expired_unix 0)", async () => {
+    pinArtifactRetention(undefined);
+    const unarmed = await seedRunningTask();
+    const res = await SELF.fetch(`${TWIRP}/CreateArtifact`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${unarmed.runtimeToken}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        workflow_run_backend_id: String(unarmed.runId),
+        workflow_job_run_backend_id: String(unarmed.jobId),
+        name: "forever-v4",
+      }),
+    });
+    expect(res.status).toBe(200);
+    const unarmedRows = await db().select().from(actionArtifacts).where(eq(actionArtifacts.runId, unarmed.runId));
+    expect(unarmedRows[0]?.expiredUnix).toBe(0); // artifactKeepForever
   });
 });
 

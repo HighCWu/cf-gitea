@@ -40,12 +40,15 @@
  *     outbound sync (specs/push-mirror-outbound.md §4)
  *   - {kind: "demo-sweep", repoId} — the demo cleaner's delete (SPEC-0014 §3.2)
  *   - {kind: "audit-retention"} — the audit retention prune (SPEC-0015 §4.3)
+ *   - {kind: "actions-retention", …days} — the actions retention sweep
+ *     (SPEC-0012 §4.5; the day members are present only when armed)
+ *   - {kind: "actions-zombie"} — the zombie task stop (SPEC-0012 §5.6)
  *
  * The notice TYPE mapping (§3.1) mirrors upstream's repository-vs-task split
  * (notice.go:21-26 — repo-subsystem failures vs maintenance-task outcomes):
  * the repo-scoped families (purge/import/fork/mirror-sync/push-mirror-sync)
- * emit type 1; the instance-scoped riders (demo-sweep, audit-retention) and
- * unclassifiable bodies emit type 2.
+ * emit type 1; the instance-scoped riders (demo-sweep, audit-retention,
+ * actions-retention, actions-zombie) and unclassifiable bodies emit type 2.
  *
  * The "error digest" honesty note: a dead-lettered queue message carries NO
  * error text — the per-attempt errors live only in the retrying consumer's
@@ -71,6 +74,7 @@ import { isMirrorSyncMessage } from "../services/mirror/sync";
 import { isPushMirrorSyncMessage } from "../services/mirror/push-sync";
 import { isDemoSweepMessage } from "../services/demo-sweep";
 import { isAuditRetentionMessage } from "../services/audit";
+import { isActionsRetentionMessage, isActionsZombieStopMessage } from "../services/actions/retention";
 import { recordNotice } from "../services/notices";
 import { isForkMessage } from "./fork-task";
 import { isImportMessage } from "./imports/pipeline";
@@ -91,6 +95,8 @@ function kindLabel(body: unknown): string {
   if (isPushMirrorSyncMessage(body)) return "push-mirror-sync";
   if (isDemoSweepMessage(body)) return "demo-sweep";
   if (isAuditRetentionMessage(body)) return "audit-retention";
+  if (isActionsRetentionMessage(body)) return "actions-retention";
+  if (isActionsZombieStopMessage(body)) return "actions-zombie";
   if (isRepoPurgeMessage(body)) return "repo-purge";
   return "unknown";
 }
@@ -118,10 +124,11 @@ function noticeTypeForLabel(label: string): 1 | 2 {
 
 /**
  * The repo identity a decoded body carries, for the notice description.
- * Null for the identity-less arms (audit-retention, unknown) — their
- * descriptions drop the "for <identity>" clause. Reads only fields the
- * family guards already matched; a hostile getter throws into the caller's
- * classify arm (the never-throw contract catches it there).
+ * Null for the identity-less arms (audit-retention, actions-retention,
+ * actions-zombie, unknown) — their descriptions drop the "for <identity>"
+ * clause. Reads only fields the family guards already matched; a hostile
+ * getter throws into the caller's classify arm (the never-throw contract
+ * catches it there).
  */
 function repoIdentityOf(label: string, body: unknown): string | null {
   if (typeof body !== "object" || body === null) return null;
@@ -140,7 +147,7 @@ function repoIdentityOf(label: string, body: unknown): string | null {
     case "demo-sweep":
       return typeof record.repoId === "string" ? record.repoId : null;
     default:
-      return null; // audit-retention / unknown — no repo identity
+      return null; // audit-retention / actions-* / unknown — no repo identity
   }
 }
 

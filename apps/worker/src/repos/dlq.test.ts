@@ -60,6 +60,11 @@ const KNOWN_FAMILIES: unknown[] = [
   { kind: "mirror-sync", repoId: "r_5" },
   // Push-mirror outbound sync
   { kind: "push-mirror-sync", repoId: "r_6", pushMirrorId: 12 },
+  // Actions retention sweep (SPEC-0012 §4.5 — the armed day members are the
+  // producer's exact shape)
+  { kind: "actions-retention", artifactRetentionDays: 90, logRetentionDays: 365, runRetentionDays: 400 },
+  // Actions zombie stop (SPEC-0012 §5.6)
+  { kind: "actions-zombie" },
 ];
 
 function loggedLines(consoleError: MockInstance): string[] {
@@ -126,6 +131,19 @@ describe("repoTasksDlqHandler (SPEC-0014 §3.0)", () => {
     expect(
       lines.some((line) => line.includes("kind=push-mirror-sync") && line.includes('"repoId":"r_6"') && line.includes('"pushMirrorId":12')),
     ).toBe(true);
+
+    // The actions riders: the armed day members verbatim, and the bare
+    // zombie kind (instance-scoped — no repo identity in either body).
+    expect(
+      lines.some(
+        (line) =>
+          line.includes("kind=actions-retention") &&
+          line.includes('"artifactRetentionDays":90') &&
+          line.includes('"logRetentionDays":365') &&
+          line.includes('"runRetentionDays":400'),
+      ),
+    ).toBe(true);
+    expect(lines.some((line) => line.includes("kind=actions-zombie") && line.includes('body={"kind":"actions-zombie"}'))).toBe(true);
 
     // Message id + attempts ride every line (full observability context).
     expect(lines.every((line) => line.includes("id=dlq-") && line.includes("attempts=5"))).toBe(true);

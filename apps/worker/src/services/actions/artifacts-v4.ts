@@ -38,7 +38,29 @@ import {
   v4Dir,
 } from "./artifacts";
 import { listOrderedChunksForArtifact, writeMergedArtifact, type ByteSource, type ChunkItem } from "./artifacts-merge";
+import { retentionDaysFromEnv } from "./retention";
 import { actionsBuildSignature, base64RawUrlDecode, base64RawUrlEncode, signaturesEqual, taskIdFromToken } from "./secrets";
+
+/**
+ * The upload-time expiry ceiling (artifact.go:94-107's
+ * `setting.Actions.ArtifactRetentionDays` arm) — the SAME helper shape as the
+ * v1 family: ACTIONS_ARTIFACT_RETENTION_DAYS armed (strict polarity —
+ * positive integer) returns the day count that clamps every expiry down to
+ * now + days; un-armed (unset/garbage/zero) reads 0 = no ceiling and
+ * keep-forever for expiry-less creates (the fail-closed posture: a default
+ * deployment NEVER deletes). The env slice is the ActionsRetentionEnv
+ * posture (retention.ts): the bindings rider keeps a property overlap with
+ * Env so a generated Env from a config that predates the vars still
+ * satisfies it (the weak-type check), and the parse is retentionDaysFromEnv
+ * — no second parser.
+ */
+type ArtifactRetentionEnv = Partial<Pick<Env, "DB" | "REPO_PACKS">> & {
+  ACTIONS_ARTIFACT_RETENTION_DAYS?: string;
+};
+
+function artifactRetentionCeiling(env: ArtifactRetentionEnv): number {
+  return retentionDaysFromEnv(env.ACTIONS_ARTIFACT_RETENTION_DAYS) ?? 0;
+}
 
 /** ArtifactV4RouteBase (artifactsv4.go:124) — the FULL mount path. */
 export const ARTIFACT_V4_ROUTE_BASE = "/twirp/github.actions.results.api.v1.ArtifactService";
@@ -457,9 +479,16 @@ async function createArtifactV4(c: C): Promise<Response> {
     encoding = CONTENT_TYPE_ZIP;
     fileName = `${artifactName}.zip`;
   }
+  // Expiry (artifact.go:94-107): the request's expires_at clamps up to
+  // tomorrow (v4 clients use the runner's clock) and down to the armed
+  // ACTIONS_ARTIFACT_RETENTION_DAYS ceiling; no expires_at → the armed
+  // ceiling or keep-forever (0). Computed HERE at CreateArtifact — the only
+  // arm upstream computes expiry in (FinalizeArtifact never re-visits it);
+  // un-armed var = 0 = no ceiling + keep-forever (the fail-closed default
+  // NEVER deletes — the sweep itself stays producer-gated on the same var).
   const expiredUnix = artifactExpiry(
     expirySeconds !== undefined ? Math.floor(expirySeconds / 1000) : null,
-    { retentionDays: 0 },
+    { retentionDays: artifactRetentionCeiling(c.env) },
   );
   // create or get artifact — the v4 path is (name, fileName-as-path).
   const artifact = await createArtifact(c.env.DB, task, job, artifactName, fileName, expiredUnix);

@@ -44,6 +44,7 @@ import {
 } from "./artifacts";
 import { listV3ChunksByRun, planOrderedChunks, writeMergedArtifact, type ByteSource } from "./artifacts-merge";
 import { verifyRunnerToken } from "./model";
+import { retentionDaysFromEnv } from "./retention";
 import { parseAuthorizationToken } from "./secrets";
 import {
   JobSummaryAggregateExceededError,
@@ -243,6 +244,27 @@ function getUploadFileSize(c: C): number {
   return len !== undefined && len !== null ? Number(len) : 0;
 }
 
+/**
+ * The upload-time expiry ceiling (artifact.go:94-107's
+ * `setting.Actions.ArtifactRetentionDays` arm) for BOTH artifact families:
+ * ACTIONS_ARTIFACT_RETENTION_DAYS armed (strict polarity — positive integer)
+ * returns the day count that clamps every expiry down to now + days;
+ * un-armed (unset/garbage/zero) reads 0 = no ceiling and keep-forever for
+ * expiry-less uploads (the fail-closed posture: a default deployment NEVER
+ * deletes — the sweep itself stays producer-gated on the same var). The env
+ * slice is the ActionsRetentionEnv posture (retention.ts): the bindings
+ * rider keeps a property overlap with Env so a generated Env from a config
+ * that predates the vars still satisfies it (the weak-type check), and the
+ * parse is retentionDaysFromEnv — no second parser.
+ */
+type ArtifactRetentionEnv = Partial<Pick<Env, "DB" | "REPO_PACKS">> & {
+  ACTIONS_ARTIFACT_RETENTION_DAYS?: string;
+};
+
+function artifactRetentionCeiling(env: ArtifactRetentionEnv): number {
+  return retentionDaysFromEnv(env.ACTIONS_ARTIFACT_RETENTION_DAYS) ?? 0;
+}
+
 export function createArtifactsV1Router(): Hono<{ Bindings: Env; Variables: Vars }> {
   const r = new Hono<{ Bindings: Env; Variables: Vars }>();
 
@@ -309,13 +331,16 @@ async function uploadArtifact(c: C): Promise<Response> {
   const { name: artifactName, path: artifactPath } = parsed;
 
   const fileRealTotalSize = getUploadFileSize(c);
-  // retentionDays rides the upload URL (artifacts.go:232-238 +
-  // 257-259): expiry = now + days. The retention ceiling joins when the
-  // ACTIONS_* retention vars land (the sweep's caller supplies them).
+  // retentionDays rides the upload URL (artifacts.go:232-238 + 257-259):
+  // requested expiry = now + days; the armed ACTIONS_ARTIFACT_RETENTION_DAYS
+  // then clamps it down (artifact.go:94-107's min arm). This CreateArtifact
+  // call is the ONLY arm upstream computes expiry in — confirm/merge never
+  // re-visits it; un-armed var = 0 = no ceiling, keep-forever when the
+  // runner sent no days.
   const retentionDaysRaw = Number(c.req.query("retentionDays") ?? "0");
   const expiredUnix = artifactExpiry(
     retentionDaysRaw > 0 ? Math.floor(Date.now() / 1000) + retentionDaysRaw * 86400 : null,
-    { retentionDays: 0 },
+    { retentionDays: artifactRetentionCeiling(c.env) },
   );
   const artifact = await createArtifact(c.env.DB, task, job, artifactName, artifactPath, expiredUnix);
 
