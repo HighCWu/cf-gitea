@@ -19,8 +19,13 @@ beforeAll(async () => {
 // state persists across tests within this file, so every test starts from a
 // clean registry. The engine Registry DO keeps its rows (it is not D1) —
 // stale registered names only ever make the engine serve an empty advert.
+// repo_counters goes first: the creation batch inserts it with an FK to
+// repositories (SPEC-0008 §5.1's ensureSeededRepo pushes through the real
+// receive flow), and a bare repositories delete fails the constraint
+// whenever an ensureSeededRepo test ran earlier in the file.
 beforeEach(async () => {
   await resetAuthTables();
+  await env.DB.prepare("DELETE FROM repo_counters").run();
   await env.DB.prepare("DELETE FROM repositories").run();
 });
 
@@ -791,5 +796,77 @@ describe("Tier-2 UI mount (dispatcher branch order: api → ui → gate)", () =>
     const root = await SELF.fetch("https://example.com/demo/absent/");
     expect(root.status).toBe(404);
     expect(root.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
+  });
+});
+
+// --- the unclaimed-repo-path 404 carve (usability sweep, 2026-10-29) ----------
+
+describe("the unclaimed-repo-path 404 carve (upstream context_response.go:129-151)", () => {
+  // Upstream's NotFound renders the full status/404.tmpl chrome for
+  // text/html requests and a plain line otherwise; the headless engine only
+  // ever served the plain arm here — a browser on a mistyped repo URL got
+  // naked `not found` text.
+  it.skipIf(!UI_ASSETS_BUILT)("renders the 404 chrome for an HTML GET the engine cannot serve", async () => {
+    const response = await SELF.fetch("https://example.com/no-such-user/no-such-repo/junk", {
+      headers: { accept: "text/html" },
+    });
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+    const html = await response.text();
+    expect(html).toContain("status-page-error");
+    expect(html).toContain("404 Not Found");
+    // No resolvable repo → the headerless shell (upstream IsRepo=false).
+    expect(html).not.toContain("repo-header");
+  });
+
+  it.skipIf(!UI_ASSETS_BUILT)("renders the repo header when the repository resolves for the viewer", async () => {
+    const seeded = await ensureSeededRepo({
+      owner: "alice",
+      slug: "absent-tail",
+      commits: [{ message: "seed the tree", time: 1_700_000_000, files: [{ path: "README.md", content: "# hi\n" }] }],
+    });
+    expect(seeded.tips.length).toBeGreaterThan(0);
+    const response = await SELF.fetch("https://example.com/alice/absent-tail/junk-tail", {
+      headers: { accept: "text/html" },
+    });
+    expect(response.status).toBe(404);
+    const html = await response.text();
+    expect(html).toContain("status-page-error");
+    // Upstream IsRepo=true: the 404 keeps the repo header (empty.tmpl's
+    // `{{template "repo/header" .}}` sibling arm in status/404.tmpl).
+    expect(html).toContain("repo-header");
+  });
+
+  it("keeps the plain-text engine answer for non-HTML clients (git/curl/e2e)", async () => {
+    const response = await SELF.fetch("https://example.com/no-such-user/no-such-repo/junk");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
+    expect(await response.text()).toBe("not found\n");
+  });
+
+  it("keeps the git/LFS/engine tails and ?go-get=1 on the gate", async () => {
+    const htmlHeader = { accept: "text/html" };
+    // The protocol, HEAD-file and engine-JSON tails stay delegated even with
+    // an HTML Accept — the engine's shapes are excluded from the carve.
+    const refs = await SELF.fetch("https://example.com/no-such-user/no-such-repo/info/refs?service=git-upload-pack", {
+      headers: htmlHeader,
+    });
+    expect(refs.status).toBe(404);
+    expect(refs.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
+
+    const headFile = await SELF.fetch("https://example.com/no-such-user/no-such-repo/HEAD", { headers: htmlHeader });
+    expect(headFile.status).toBe(404);
+    expect(headFile.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
+
+    const api = await SELF.fetch("https://example.com/no-such-user/no-such-repo/api/refs", { headers: htmlHeader });
+    expect(api.status).toBe(404);
+    expect(api.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
+
+    // The go tool's meta probe never gets HTML on any shape.
+    const goGet = await SELF.fetch("https://example.com/no-such-user/no-such-repo/junk?go-get=1", {
+      headers: htmlHeader,
+    });
+    expect(goGet.status).toBe(404);
+    expect(goGet.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
   });
 });

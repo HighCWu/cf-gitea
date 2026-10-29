@@ -1,5 +1,14 @@
 import { desc, sql } from "drizzle-orm";
-import { check, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import {
+  blob,
+  check,
+  index,
+  integer,
+  primaryKey,
+  sqliteTable,
+  text,
+  uniqueIndex,
+} from "drizzle-orm/sqlite-core";
 
 /**
  * D1 schema.
@@ -297,8 +306,11 @@ export const repoUnits = sqliteTable(
      * db:generate no-drift gate. The R16 gate itself rides
      * `repo_settings.has_packages` (the landed MustEnableRepoPackages
      * reduction, the has_projects precedent).
+     * SPEC-0012 M1a adds 'actions' (upstream unit 10,
+     * models/unit/unit.go:35 TypeActions) — the owner-scope runner scan's
+     * unit gate (services/actions CreateTaskForRunner's repo_unit join).
      */
-    type: text("type", { enum: ["code", "packages"] }).notNull().default("code"),
+    type: text("type", { enum: ["code", "packages", "actions"] }).notNull().default("code"),
     /** What anonymous visitors may do on this unit: 'none' | 'read'. */
     anonymousAccessMode: text("anonymous_access_mode", { enum: ["none", "read"] })
       .notNull()
@@ -3373,5 +3385,565 @@ export const systemNotices = sqliteTable(
     // `created_unix DESC, id DESC` order (§5.7: the id tiebreak keeps a
     // same-second DLQ batch in insertion order).
     index("system_notices_created_idx").on(t.createdUnix),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// SPEC-0012 §4.1 — the Actions control-plane model (twelve tables). A
+// column-for-column port of the §4 census (gitea/models/actions/{runner,
+// runner_token,run,run_job,run_attempt,task,task_step,task_output,
+// tasks_version,artifact,run_job_summary}.go; action_log_chunks is OUR DBFS
+// analog, §4.3 — upstream scopes its log chunks inside the generic `dbfs`
+// table). The schedule pair (action_schedules + action_schedule_specs) is
+// deferred to the scheduled-workflows milestone (SPEC §1.4 — no reader);
+// `secrets` + `action_variables` + `commit_statuses` already exist and are
+// shared, not re-created.
+//
+// House adaptations, each the landed precedent:
+//  - `repo_id` is TEXT (the repositories.id UUID) with the secrets-table
+//    sentinel encoding — '' stands for upstream's 0 (not-repo-scoped) on the
+//    scope tables (runners, runner_tokens, tasks_versions); repo-bound rows
+//    (runs, jobs, attempts, tasks, steps, artifacts, summaries, log_chunks)
+//    carry a real id and are NOT NULL. A nullable repo_id would be unsound
+//    wherever it participates in a UNIQUE: NULLs are DISTINCT in SQLite
+//    unique indexes (the secrets-table comment).
+//  - `owner_id` stays INTEGER (users.id is integer here too) with upstream's
+//    0 = global sentinel intact.
+//  - upstream `timeutil.TimeStamp` zero sentinels (Started/Stopped/Deleted/
+//    LastOnline/LastActive/ExpiredUnix is 0=forever) — nullable INTEGER,
+//    NULL = never, EXCEPT expired_unix which keeps the 0-sentinel (the
+//    retention arithmetic reads it as a number).
+//  - xorm `created`/`updated` auto columns land as `created`/`updated`
+//    integer unix seconds (upstream's own column names — the actions tables
+//    do not use the `created_unix` spelling of the secrets family).
+//  - JSON list columns (agent_labels/needs/runs_on/token_permissions) are
+//    TEXT, the issues-schema convention.
+//  - workflow_source_repo_id / workflow_repo_id are repo REFERENCES and so
+//    take the TEXT adaptation even though they are unread parity columns
+//    (SPEC §1.4: the schema columns land, nothing reads them in v1).
+// ---------------------------------------------------------------------------
+
+/**
+ * A registered runner (upstream `ActionRunner`, runner.go:26-60). Scopes:
+ * (0,'') global, (owner,'') org/user, ('',repo)... i.e. repo-level rows carry
+ * owner_id=0 + the repo id — upstream's "never both non-zero" rule
+ * (runner.go:31-36). The plaintext runner token is never stored:
+ * `token_hash` is the salted sha256 hex digest (SPEC-0002 §3 model;
+ * upstream salted-pbkdf2 at auth_model.HashToken, interceptor.go:97-107).
+ */
+export const actionRunners = sqliteTable(
+  "action_runners",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** CHAR(36) UNIQUE — minted at Register. */
+    uuid: text("uuid").notNull().unique(),
+    /** Display name, ellipsized to 255 runes at Register (runner.go:75). */
+    name: text("name").notNull().default(""),
+    /** Runner version string as advertised by the binary (VARCHAR(64)). */
+    version: text("version").notNull().default(""),
+    /** users.id; 0 = global (upstream `OwnerID int64 xorm:"index"`). */
+    ownerId: integer("owner_id").notNull().default(0),
+    /** TEXT repositories.id; '' = not repo-scoped (upstream `RepoID` 0). */
+    repoId: text("repo_id").notNull().default(""),
+    description: text("description").notNull().default(""),
+    /** 0 native / 1 docker / 2 VM (upstream `Base int`). */
+    base: integer("base").notNull().default(0),
+    /** Glob match for which repositories may use this runner. */
+    repoRange: text("repo_range").notNull().default(""),
+    /** Salted sha256 hex of the runner's polling token (UNIQUE). */
+    tokenHash: text("token_hash").notNull().unique(),
+    tokenSalt: text("token_salt").notNull().default(""),
+    /** Heartbeats — debounced writes (30 s online / 5 s active windows,
+     *  interceptor.go:72-84); NULL = never seen (upstream 0). */
+    lastOnline: integer("last_online", { mode: "timestamp" }),
+    lastActive: integer("last_active", { mode: "timestamp" }),
+    /** JSON array of label strings (upstream `AgentLabels []string TEXT`). */
+    agentLabels: text("agent_labels").notNull().default("[]"),
+    /** One task per lifetime (task.go:77-95 refuses + deletes after). */
+    ephemeral: integer("ephemeral", { mode: "boolean" }).notNull().default(false),
+    isDisabled: integer("is_disabled", { mode: "boolean" }).notNull().default(false),
+    /** Supports the transitional StatusCancelling flow ("cancelling"
+     *  capability string, runner.go:70-72). */
+    hasCancellingSupport: integer("has_cancelling_support", { mode: "boolean" })
+      .notNull()
+      .default(false),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+    /** NULL = live (upstream `Deleted` 0 sentinel). */
+    deleted: integer("deleted", { mode: "timestamp" }),
+  },
+  (t) => [
+    index("action_runners_owner_id_idx").on(t.ownerId),
+    index("action_runners_repo_id_idx").on(t.repoId),
+    index("action_runners_last_online_idx").on(t.lastOnline),
+    index("action_runners_last_active_idx").on(t.lastActive),
+  ],
+);
+
+/**
+ * A registration token (upstream `ActionRunnerToken`,
+ * runner_token.go:26-37). Stored RAW upstream (`GetRunnerToken` looks it up
+ * by the presented string, runner_token.go:50-58) and stays raw for parity —
+ * unlike the post-registration runner token, which is salted-hash. Reset =
+ * create-new-and-deactivate-old: `NewRunnerTokenWithValue` deactivates every
+ * same-scope active token in one transaction before inserting the new active
+ * one (runner_token.go:75-107), so one active token registers a fleet until
+ * the next reset (SPEC §2.2 NOTE — the corrected semantics).
+ */
+export const actionRunnerTokens = sqliteTable(
+  "action_runner_tokens",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The RAW token string (UNIQUE — the lookup key). */
+    token: text("token").notNull().unique(),
+    /** users.id; 0 = global (the same three-scope rule as runners). */
+    ownerId: integer("owner_id").notNull().default(0),
+    /** TEXT repositories.id; '' = not repo-scoped. */
+    repoId: text("repo_id").notNull().default(""),
+    /** true = usable; a reset flips same-scope predecessors to false. */
+    isActive: integer("is_active", { mode: "boolean" }).notNull().default(true),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+    /** NULL = not deleted (upstream `Deleted` 0 sentinel). */
+    deleted: integer("deleted", { mode: "timestamp" }),
+  },
+  (t) => [
+    index("action_runner_tokens_owner_id_idx").on(t.ownerId),
+    index("action_runner_tokens_repo_id_idx").on(t.repoId),
+  ],
+);
+
+/**
+ * A workflow run (upstream `ActionRun`, run.go:32-76). `UNIQUE(repo_id,
+ * index)` is the per-repo run-number arbitration (upstream
+ * `unique(repo_index)` over the `action_run_index` named sequence → our
+ * `repo_counters.run_index` at M3, SPEC §4.5). `version` is the optimistic
+ * lock for concurrent status writes (run.go:67). The three
+ * workflow-source/scoped parity columns are unread in v1 (SPEC §1.4).
+ */
+export const actionRuns = sqliteTable(
+  "action_runs",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    title: text("title").notNull().default(""),
+    repoId: text("repo_id").notNull(),
+    ownerId: integer("owner_id").notNull(),
+    /** The workflow file path (the run's workflow identity). */
+    workflowId: text("workflow_id").notNull().default(""),
+    /** The per-repo run number (UNIQUE with repo_id). */
+    index: integer("index").notNull(),
+    triggerUserId: integer("trigger_user_id").notNull().default(0),
+    /** Deferred scheduled-workflow link (SPEC §1.4). */
+    scheduleId: integer("schedule_id").notNull().default(0),
+    /** The commit/tag/… ref that caused the run. */
+    ref: text("ref").notNull().default(""),
+    commitSha: text("commit_sha").notNull().default(""),
+    isForkPullRequest: integer("is_fork_pull_request", { mode: "boolean" }).notNull().default(false),
+    needApproval: integer("need_approval", { mode: "boolean" }).notNull().default(false),
+    /** users.id of the approver. */
+    approvedBy: integer("approved_by").notNull().default(0),
+    /** The webhook event type that caused the run. */
+    event: text("event").notNull().default(""),
+    /** The webhook payload JSON. */
+    eventPayload: text("event_payload").notNull().default("{}"),
+    /** The trigger event from the workflow's `on:` configuration. */
+    triggerEvent: text("trigger_event").notNull().default(""),
+    /** The 10-value Status enum (models/actions/status.go:15-25). */
+    status: integer("status").notNull().default(0),
+    /** Optimistic lock (upstream `xorm:"version default 0"`). */
+    version: integer("version").notNull().default(0),
+    rawConcurrency: text("raw_concurrency").notNull().default(""),
+    /** Parity columns, unread in v1 (SPEC §1.4). */
+    workflowRepoId: text("workflow_repo_id").notNull().default(""),
+    workflowCommitSha: text("workflow_commit_sha").notNull().default(""),
+    isScopedRun: integer("is_scoped_run", { mode: "boolean" }).notNull().default(false),
+    /** Latest-attempt timing mirrors; NULL = not started/stopped. */
+    started: integer("started", { mode: "timestamp" }),
+    stopped: integer("stopped", { mode: "timestamp" }),
+    /** Legacy-only (pre-attempt runs); v1 always 0. */
+    previousDuration: integer("previous_duration").notNull().default(0),
+    latestAttemptId: integer("latest_attempt_id").notNull().default(0),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream `unique(repo_index)` — the (repo, run-number) arbitration.
+    uniqueIndex("action_runs_repo_index_uq").on(t.repoId, t.index),
+    // Upstream `index(repo_status)` = (RepoID, Status).
+    index("action_runs_repo_status_idx").on(t.repoId, t.status),
+    index("action_runs_owner_id_idx").on(t.ownerId),
+    index("action_runs_workflow_id_idx").on(t.workflowId),
+    index("action_runs_trigger_user_id_idx").on(t.triggerUserId),
+    index("action_runs_ref_idx").on(t.ref),
+    index("action_runs_commit_sha_idx").on(t.commitSha),
+    // Upstream `Status xorm:"index index(repo_status)"` — scalar + composite.
+    index("action_runs_status_idx").on(t.status),
+    index("action_runs_approved_by_idx").on(t.approvedBy),
+    index("action_runs_latest_attempt_id_idx").on(t.latestAttemptId),
+  ],
+);
+
+/**
+ * A job of a run (upstream `ActionRunJob`, run_job.go:34-130+). The
+ * `workflow_payload` is the single-job YAML (act/jobparser.SingleWorkflow
+ * bytes) the runner receives at claim. `needs`/`runs_on` are JSON string
+ * arrays; `UNIQUE`-less — the claim CAS (`task_id = 0 AND status = waiting`,
+ * task.go:392-400) is the concurrency arbiter, exactly as upstream. The
+ * reusable-workflow column family is parity-ported, unread in v1 (SPEC
+ * §1.4); the composite indexes follow upstream's xorm tag composition
+ * (repo_status / pickup / repo_concurrency, run_job.go:36-77).
+ */
+export const actionRunJobs = sqliteTable(
+  "action_run_jobs",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    runId: integer("run_id").notNull(),
+    repoId: text("repo_id").notNull(),
+    ownerId: integer("owner_id").notNull(),
+    commitSha: text("commit_sha").notNull().default(""),
+    isForkPullRequest: integer("is_fork_pull_request", { mode: "boolean" }).notNull().default(false),
+    /** Display name (VARCHAR(255)). */
+    name: text("name").notNull().default(""),
+    /** Which attempt this job belongs to; v1 always 1 (SPEC §1.4). */
+    attempt: integer("attempt").notNull().default(1),
+    /** The single-job YAML payload (BLOB) served at claim time. */
+    workflowPayload: blob("workflow_payload").notNull(),
+    /** The YAML job key (not the row id). */
+    jobId: text("job_id").notNull().default(""),
+    /** JSON string arrays (upstream `xorm:"JSON TEXT"`). */
+    needs: text("needs").notNull().default("[]"),
+    runsOn: text("runs_on").notNull().default("[]"),
+    /** The task created by this job in its own attempt; 0 = unclaimed. */
+    taskId: integer("task_id").notNull().default(0),
+    /** Points at a historical task when a rerun reuses an earlier result. */
+    sourceTaskId: integer("source_task_id").notNull().default(0),
+    status: integer("status").notNull().default(0),
+    rawConcurrency: text("raw_concurrency").notNull().default(""),
+    isConcurrencyEvaluated: integer("is_concurrency_evaluated", { mode: "boolean" })
+      .notNull()
+      .default(false),
+    concurrencyGroup: text("concurrency_group").notNull().default(""),
+    concurrencyCancel: integer("concurrency_cancel", { mode: "boolean" }).notNull().default(false),
+    /** JSON repo_model.ActionsTokenPermissions; NULL = unspecified. */
+    tokenPermissions: text("token_permissions"),
+    maxParallel: integer("max_parallel").notNull().default(0),
+    isMatrixDeferred: integer("is_matrix_deferred", { mode: "boolean" }).notNull().default(false),
+    deferredMatrixPayload: blob("deferred_matrix_payload"),
+    runAttemptId: integer("run_attempt_id").notNull().default(0),
+    attemptJobId: integer("attempt_job_id").notNull().default(0),
+    // The reusable-workflow family — parity-ported, unread in v1 (SPEC §1.4).
+    workflowSourceRepoId: text("workflow_source_repo_id").notNull().default(""),
+    workflowSourceCommitSha: text("workflow_source_commit_sha").notNull().default(""),
+    isReusableCaller: integer("is_reusable_caller", { mode: "boolean" }).notNull().default(false),
+    isExpanded: integer("is_expanded", { mode: "boolean" }).notNull().default(false),
+    callUses: text("call_uses").notNull().default(""),
+    reusableWorkflowContent: blob("reusable_workflow_content"),
+    reusableWorkflowRef: text("reusable_workflow_ref").notNull().default(""),
+    callSecrets: text("call_secrets").notNull().default(""),
+    callPayload: text("call_payload").notNull().default(""),
+    parentJobId: integer("parent_job_id").notNull().default(0),
+    continueOnError: integer("continue_on_error", { mode: "boolean" }).notNull().default(false),
+    started: integer("started", { mode: "timestamp" }),
+    stopped: integer("stopped", { mode: "timestamp" }),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    index("action_run_jobs_run_id_idx").on(t.runId),
+    // Upstream `index(repo_status)` = (RepoID, Status).
+    index("action_run_jobs_repo_status_idx").on(t.repoId, t.status),
+    index("action_run_jobs_owner_id_idx").on(t.ownerId),
+    index("action_run_jobs_commit_sha_idx").on(t.commitSha),
+    // Upstream `index(pickup)` = (TaskID, Status) — the dispatch scan.
+    index("action_run_jobs_pickup_idx").on(t.taskId, t.status),
+    index("action_run_jobs_status_idx").on(t.status),
+    // Upstream `index(repo_concurrency)` = (RepoID, ConcurrencyGroup, Status).
+    index("action_run_jobs_repo_concurrency_idx").on(t.repoId, t.concurrencyGroup, t.status),
+    index("action_run_jobs_run_attempt_id_idx").on(t.runAttemptId),
+    index("action_run_jobs_attempt_job_id_idx").on(t.attemptJobId),
+    index("action_run_jobs_is_reusable_caller_idx").on(t.isReusableCaller),
+    index("action_run_jobs_parent_job_id_idx").on(t.parentJobId),
+  ],
+);
+
+/**
+ * A single execution attempt of a run (upstream `ActionRunAttempt`,
+ * run_attempt.go:17-35, table `action_run_attempt` upstream too). v1 always
+ * has exactly attempt = 1 per run (SPEC §1.4 — rerun is v2).
+ * `UNIQUE(run_id, attempt)` is upstream `UNIQUE(run_attempt)`.
+ */
+export const actionRunAttempts = sqliteTable(
+  "action_run_attempts",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: text("repo_id").notNull(),
+    runId: integer("run_id").notNull(),
+    attempt: integer("attempt").notNull().default(1),
+    triggerUserId: integer("trigger_user_id").notNull().default(0),
+    concurrencyGroup: text("concurrency_group").notNull().default(""),
+    concurrencyCancel: integer("concurrency_cancel", { mode: "boolean" }).notNull().default(false),
+    status: integer("status").notNull().default(0),
+    started: integer("started", { mode: "timestamp" }),
+    stopped: integer("stopped", { mode: "timestamp" }),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("action_run_attempts_run_attempt_uq").on(t.runId, t.attempt),
+    // Upstream `index(repo_concurrency_status)` = (RepoID, ConcurrencyGroup,
+    // Status) (run_attempt.go:21,29).
+    index("action_run_attempts_repo_concurrency_status_idx").on(t.repoId, t.concurrencyGroup, t.status),
+    index("action_run_attempts_status_idx").on(t.status),
+  ],
+);
+
+/**
+ * A claimed task (upstream `ActionTask`, task.go:40-66) — the runner-facing
+ * execution unit created at claim time. `token_hash` is the task's polling
+ * token (salted sha256 hex, UNIQUE); `log_*` columns mirror upstream's log
+ * math (`log_length` = rows, `log_size` = bytes, `log_indexes` = the
+ * varint row→offset map, §4.3); `log_filename` is
+ * `logFileName(repoFullName, taskID)` — `"<full_name>/<id%256:02x>/<id>.log"`
+ * (task.go:657-665, no `.zst` suffix: the LOG_COMPRESSION=none posture,
+ * SPEC §4.6 divergence 1).
+ */
+export const actionTasks = sqliteTable(
+  "action_tasks",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The claimed job (action_run_jobs.id). */
+    jobId: integer("job_id").notNull(),
+    attempt: integer("attempt").notNull().default(1),
+    runnerId: integer("runner_id").notNull().default(0),
+    status: integer("status").notNull().default(0),
+    started: integer("started", { mode: "timestamp" }),
+    stopped: integer("stopped", { mode: "timestamp" }),
+    repoId: text("repo_id").notNull(),
+    ownerId: integer("owner_id").notNull(),
+    commitSha: text("commit_sha").notNull().default(""),
+    isForkPullRequest: integer("is_fork_pull_request", { mode: "boolean" }).notNull().default(false),
+    /** Salted sha256 hex of the task's polling token (UNIQUE). */
+    tokenHash: text("token_hash").notNull().unique(),
+    tokenSalt: text("token_salt").notNull().default(""),
+    /** The last eight token chars (upstream's recovery surface). */
+    tokenLastEight: text("token_last_eight").notNull().default(""),
+    /** DBFS-analog filename (see the table comment). */
+    logFilename: text("log_filename").notNull().default(""),
+    /** true once the log has sealed to R2 (§4.3). */
+    logInStorage: integer("log_in_storage", { mode: "boolean" }).notNull().default(false),
+    /** Row count (upstream `LogLength int64`). */
+    logLength: integer("log_length").notNull().default(0),
+    /** Byte size (upstream `LogSize int64`). */
+    logSize: integer("log_size").notNull().default(0),
+    /** The row→byte-offset map (upstream varint-encoded `LogIndexes`). */
+    logIndexes: blob("log_indexes"),
+    logExpired: integer("log_expired", { mode: "boolean" }).notNull().default(false),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    index("action_tasks_runner_id_idx").on(t.runnerId),
+    index("action_tasks_status_idx").on(t.status),
+    index("action_tasks_started_idx").on(t.started),
+    // Upstream `index(stopped_log_expired)` over (Stopped, LogExpired).
+    index("action_tasks_stopped_log_expired_idx").on(t.stopped, t.logExpired),
+    index("action_tasks_repo_id_idx").on(t.repoId),
+    index("action_tasks_owner_id_idx").on(t.ownerId),
+    index("action_tasks_commit_sha_idx").on(t.commitSha),
+    index("action_tasks_token_last_eight_idx").on(t.tokenLastEight),
+    index("action_tasks_updated_idx").on(t.updated),
+  ],
+);
+
+/**
+ * A step of a task (upstream `ActionTaskStep`, task_step.go:17-36).
+ * `UNIQUE(task_id, index)` is upstream `unique(task_index)`. `stage` is a
+ * runnerv1.StepStage (0 = parsed-from-workflow, not runner-reported);
+ * M1a lands the table with the model — step ROWS are inserted by the
+ * workflow-parse pipeline (M1b/M3); runner-REPORTED steps ride M1b's
+ * UpdateTask. `number` is the step's index in the workflow file for
+ * PRE/MAIN/POST stage rows.
+ */
+export const actionTaskSteps = sqliteTable(
+  "action_task_steps",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Display name, truncated at 255 runes. */
+    name: text("name").notNull().default(""),
+    taskId: integer("task_id").notNull(),
+    index: integer("index").notNull(),
+    repoId: text("repo_id").notNull(),
+    status: integer("status").notNull().default(0),
+    logIndex: integer("log_index").notNull().default(0),
+    logLength: integer("log_length").notNull().default(0),
+    /** runnerv1.StepStage; 0 = unspecified (workflow-parsed). */
+    stage: integer("stage").notNull().default(0),
+    number: integer("number").notNull().default(0),
+    started: integer("started", { mode: "timestamp" }),
+    stopped: integer("stopped", { mode: "timestamp" }),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("action_task_steps_task_index_uq").on(t.taskId, t.index),
+    index("action_task_steps_index_idx").on(t.index),
+    index("action_task_steps_repo_id_idx").on(t.repoId),
+    index("action_task_steps_status_idx").on(t.status),
+  ],
+);
+
+/**
+ * A task output (upstream `ActionTaskOutput`, task_output.go:17-23).
+ * `UNIQUE(task_id, output_key)` is the upsert-if-absent arbitration
+ * (InsertTaskOutputIfNotExist) behind M1b's UpdateTask output caps.
+ */
+export const actionTaskOutputs = sqliteTable(
+  "action_task_outputs",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    taskId: integer("task_id").notNull(),
+    /** VARCHAR(255) — the cap lives in the writer (M1b). */
+    outputKey: text("output_key").notNull(),
+    /** MEDIUMTEXT upstream; TEXT here. */
+    outputValue: text("output_value").notNull().default(""),
+  },
+  (t) => [
+    uniqueIndex("action_task_outputs_task_key_uq").on(t.taskId, t.outputKey),
+    index("action_task_outputs_task_id_idx").on(t.taskId),
+  ],
+);
+
+/**
+ * The per-scope dispatch counter (upstream `ActionTasksVersion`,
+ * tasks_version.go:16-24). Scope rows: (0,'') global, (owner,'') owner,
+ * (''→0,repo) repo — bumps cascade all three (IncreaseTaskVersion,
+ * tasks_version.go:66-86); a missing row self-heals by re-insert at version
+ * 1 (tasks_version.go:49-59), and FetchTask bootstraps 0→1 so a runner never
+ * reads version 0 (runner.go:179-187). The '' repo_id sentinel keeps the
+ * UNIQUE(owner_id, repo_id) arbitration sound (NULLs would be DISTINCT).
+ */
+export const actionTasksVersions = sqliteTable(
+  "action_tasks_versions",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    ownerId: integer("owner_id").notNull().default(0),
+    repoId: text("repo_id").notNull().default(""),
+    version: integer("version").notNull().default(1),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("action_tasks_versions_owner_repo_uq").on(t.ownerId, t.repoId),
+    // Upstream `RepoID int64 xorm:"INDEX UNIQUE(owner_repo)"` — the scalar.
+    index("action_tasks_versions_repo_id_idx").on(t.repoId),
+  ],
+);
+
+/**
+ * An uploaded artifact (upstream `ActionArtifact`, artifact.go:62-90).
+ * `UNIQUE(run_id, run_attempt_id, artifact_path, artifact_name)` is upstream
+ * `unique(runid_attempt_name_path)` — a re-upload of the same identity is
+ * UNIQUE-blocked (§5.5). `status`: 1 upload-pending → 2 confirmed →
+ * 4 expired → 5 pending-deletion → 6 deleted (3 upload-error reserved,
+ * artifact.go:21-29); the retention consumer owns the flips (§4.4).
+ * `expired_unix` keeps upstream's 0 = keep-forever sentinel.
+ */
+export const actionArtifacts = sqliteTable(
+  "action_artifacts",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    runId: integer("run_id").notNull(),
+    runAttemptId: integer("run_attempt_id").notNull().default(0),
+    runnerId: integer("runner_id").notNull().default(0),
+    repoId: text("repo_id").notNull(),
+    ownerId: integer("owner_id").notNull().default(0),
+    commitSha: text("commit_sha").notNull().default(""),
+    /** The R2 object key (actions/artifacts/<run_id>/<artifact_id>, §4.2). */
+    storagePath: text("storage_path").notNull().default(""),
+    fileSize: integer("file_size").notNull().default(0),
+    fileCompressedSize: integer("file_compressed_size").notNull().default(0),
+    /** Upstream `ContentEncodingOrType`, column `content_encoding`. */
+    contentEncodingOrType: text("content_encoding").notNull().default(""),
+    artifactPath: text("artifact_path").notNull().default(""),
+    artifactName: text("artifact_name").notNull().default(""),
+    status: integer("status").notNull().default(1),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+    /** 0 = kept forever (upstream artifactKeepForever). */
+    expiredUnix: integer("expired_unix").notNull().default(0),
+  },
+  (t) => [
+    // Upstream `unique(runid_attempt_name_path)`.
+    uniqueIndex("action_artifacts_run_attempt_name_path_uq").on(
+      t.runId,
+      t.runAttemptId,
+      t.artifactPath,
+      t.artifactName,
+    ),
+    index("action_artifacts_run_id_idx").on(t.runId),
+    index("action_artifacts_repo_id_idx").on(t.repoId),
+    index("action_artifacts_status_idx").on(t.status),
+    index("action_artifacts_updated_idx").on(t.updated),
+    index("action_artifacts_expired_unix_idx").on(t.expiredUnix),
+  ],
+);
+
+/**
+ * A per-step job summary (upstream `ActionRunJobSummary`,
+ * run_job_summary.go:36-49). `UNIQUE(repo_id, run_id, run_attempt_id,
+ * job_id, step_index)` is upstream `UNIQUE(summary_key)`; per-step and
+ * aggregate 1 MiB caps live in the M1b writer (run_job_summary.go:23-29).
+ */
+export const actionRunJobSummaries = sqliteTable(
+  "action_run_job_summaries",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: text("repo_id").notNull(),
+    runId: integer("run_id").notNull(),
+    runAttemptId: integer("run_attempt_id").notNull().default(0),
+    /** The action_run_jobs.id of the summary's job. */
+    jobId: integer("job_id").notNull(),
+    stepIndex: integer("step_index").notNull(),
+    content: text("content").notNull().default(""),
+    contentType: text("content_type").notNull().default("text/markdown"),
+    /** Byte length, stored explicitly (the multibyte LENGTH() trap,
+     *  run_job_summary.go:44-48). */
+    contentSize: integer("content_size").notNull().default(0),
+    created: integer("created", { mode: "timestamp" }).notNull(),
+    updated: integer("updated", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream `UNIQUE(summary_key)` (run_job_summary.go:38-42).
+    uniqueIndex("action_run_job_summaries_summary_key_uq").on(
+      t.repoId,
+      t.runId,
+      t.runAttemptId,
+      t.jobId,
+      t.stepIndex,
+    ),
+  ],
+);
+
+/**
+ * OUR DBFS analog (§4.3 — no upstream table; upstream scopes log chunks in
+ * the generic `dbfs` table): hot log bytes per task, one row per UpdateLog
+ * append (the protocol already batches rows per call), `(task_id, seq)`
+ * UNIQUE guarding append order. Rows stream-merge into the R2 sealed object
+ * `actions/logs/<log_filename>` at `no_more` and are deleted after the
+ * object is durable (upstream's remove(), runner.go:354-356). M1a lands the
+ * table with the model; the append/seal writers are M1b.
+ */
+export const actionLogChunks = sqliteTable(
+  "action_log_chunks",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    taskId: integer("task_id").notNull(),
+    /** Append order within the task's log. */
+    seq: integer("seq").notNull(),
+    bytes: blob("bytes").notNull(),
+  },
+  (t) => [
+    uniqueIndex("action_log_chunks_task_seq_uq").on(t.taskId, t.seq),
+    index("action_log_chunks_task_id_idx").on(t.taskId),
   ],
 );

@@ -10,6 +10,7 @@ import {
 import { createApiRouter } from "./api/router";
 import { createPackagesProtocolRouter } from "./api/routes/packages";
 import { createEcosystemProtocolRouter } from "./api/routes/packages-protocols";
+import { createActionsRouter } from "./services/actions/routes";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
@@ -24,6 +25,7 @@ import { avatarServingRouter } from "./web/avatar-serving";
 import { attachmentsServingRouter } from "./web/attachments-serving";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
+import { renderNotFoundShellResponse } from "./ui/not-found-response";
 
 /**
  * Git smart-HTTP engine mount (SPEC-0001 M1).
@@ -152,6 +154,15 @@ app.route("/api/packages", createPackagesProtocolRouter());
 // inside).
 app.route("/api/packages", createEcosystemProtocolRouter());
 
+// /api/actions (SPEC-0012 §2.1, M1a): the runner protocol — the ping echo +
+// the connect-RPC RunnerService mounts under /<service-name>/<Method>
+// (upstream actions.go:22-26), with the runner interceptor living inside the
+// sub-app (x-runner-uuid/token auth + debounced heartbeats). No resolveAuth
+// mount: the runner protocol's credential model is its own (registration
+// tokens + runner polling tokens, NOT /api/v1 tokens). UpdateTask/UpdateLog
+// authenticate, then answer unimplemented until M1b.
+app.route("/api/actions", createActionsRouter());
+
 // Avatar serving (web mux at the pin — routers/web/base.go): mounted BEFORE
 // uiRouter so its literal /avatar, /avatars and /user/avatar routes always
 // win over the UI's /:owner/:repo parser shape.
@@ -249,6 +260,37 @@ export default {
         (lastcommitTrailingSlash || (!pathname.endsWith("/") && handlesUiRoute(pathname)))
       ) {
         return app.fetch(req, env, ctx);
+      }
+      // THE UNCLAIMED-PATH 404 CARVE (usability sweep, 2026-10-29): a GET
+      // whose shape no router claims used to reach the headless engine,
+      // whose classify (packages/git-engine mod.ts) bare-404s (`not found\n`
+      // plain text) everything that is not git-protocol/LFS/engine-JSON —
+      // a browser on a mistyped repo URL saw naked text. Upstream answers
+      // from the web router's NotFound with full 404 chrome for HTML
+      // requests and a plain `Not found.` line otherwise
+      // (routers/web/web.go:1819, context_response.go:129-151) — so the
+      // negotiation below keeps the plain arm exactly where it was (the
+      // gate/engine answer, byte-identical: git clients, curl, HEAD, POST,
+      // trailing slashes, the e2e passthrough) and renders the shell only
+      // for an HTML GET that the engine provably cannot serve. The tail
+      // test mirrors the engine's escape set: `info/refs` and `HEAD` (the
+      // gate's git routes), `info/lfs/*` (the gate's LFS branch),
+      // `api/*` (the engine JSON surface) stay delegated; everything else —
+      // junk tails AND unclaimed bare pairs (/explore/junk — the reserved
+      // owner never parses, and the engine headless-404s the repo root
+      // shape too) — is pages-shaped. `?go-get=1` stays delegated on any
+      // shape — the go tool's meta probe must never get HTML.
+      if (req.method === "GET" && !pathname.endsWith("/") && new URL(req.url).searchParams.get("go-get") !== "1") {
+        const acceptsHtml = (req.headers.get("accept") ?? "").includes("text/html");
+        const tail = `/${segments.slice(2).join("/")}`;
+        const engineServed =
+          tail === "/info/refs" ||
+          tail === "/HEAD" ||
+          tail.startsWith("/info/lfs/") ||
+          tail.startsWith("/api/");
+        if (acceptsHtml && !engineServed) {
+          return renderNotFoundShellResponse(env, req, { waitUntil: ctx.waitUntil.bind(ctx) });
+        }
       }
       return gitHttpGate(req, env, ctx, gitHttp);
     }

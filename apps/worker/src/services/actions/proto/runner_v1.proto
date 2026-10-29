@@ -1,0 +1,164 @@
+// Contract fixture — SPEC-0012 §6.1 wire freeze (2026-10-29).
+//
+// Transcribed from the FileDescriptorProto embedded in
+// gitea.dev/actionslib@v1.5.0/runner/v1/messages.pb.go + services.pb.go
+// (hash-verified against gitea/go.sum:15, see WIRE-FREEZE.md). Field names,
+// numbers, labels, deprecated options, and enum values are the frozen wire
+// contract for the RunnerService family; edit ONLY via a new wire freeze
+// against a new actionslib version.
+
+syntax = "proto3";
+
+package runner.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// ── enums ────────────────────────────────────────────────────────────────
+
+// RunnerStatus (messages.pb.go:37-...)
+enum RunnerStatus {
+  RUNNER_STATUS_UNSPECIFIED = 0;
+  RUNNER_STATUS_IDLE = 1;
+  RUNNER_STATUS_ACTIVE = 2;
+  RUNNER_STATUS_OFFLINE = 3;
+}
+
+// Result (consistent with models/actions/status.go 0-4).
+enum Result {
+  RESULT_UNSPECIFIED = 0;
+  RESULT_SUCCESS = 1;
+  RESULT_FAILURE = 2;
+  RESULT_CANCELLED = 3;
+  RESULT_SKIPPED = 4;
+}
+
+enum StepStage {
+  STEP_STAGE_UNSPECIFIED = 0;
+  STEP_STAGE_SETUP = 1;
+  STEP_STAGE_INIT_CONTAINERS = 2;
+  STEP_STAGE_PRE = 3;
+  STEP_STAGE_MAIN = 4;
+  STEP_STAGE_POST = 5;
+  STEP_STAGE_STOP_CONTAINERS = 6;
+  STEP_STAGE_CLEANUP = 7;
+}
+
+// ── messages ─────────────────────────────────────────────────────────────
+
+message RegisterRequest {
+  string name = 1;
+  string token = 2;
+  repeated string agent_labels = 3 [deprecated = true];
+  repeated string custom_labels = 4 [deprecated = true];
+  string version = 5;
+  repeated string labels = 6;
+  bool ephemeral = 7;
+  repeated string capabilities = 8;
+}
+
+message RegisterResponse {
+  Runner runner = 1;
+}
+
+message DeclareRequest {
+  string version = 1;
+  repeated string labels = 2;
+  repeated string capabilities = 3;
+}
+
+message DeclareResponse {
+  Runner runner = 1;
+}
+
+message FetchTaskRequest {
+  int64 tasks_version = 1;
+}
+
+message FetchTaskResponse {
+  optional Task task = 1;
+  int64 tasks_version = 2;
+}
+
+message UpdateTaskRequest {
+  TaskState state = 1;
+  map<string, string> outputs = 2;
+}
+
+message UpdateTaskResponse {
+  TaskState state = 1;
+  repeated string sent_outputs = 2;
+}
+
+message UpdateLogRequest {
+  int64 task_id = 1;
+  int64 index = 2;
+  repeated LogRow rows = 3;
+  bool no_more = 4;
+}
+
+message UpdateLogResponse {
+  int64 ack_index = 1;
+}
+
+message Runner {
+  int64 id = 1;
+  string uuid = 2;
+  string token = 3;
+  string name = 4;
+  RunnerStatus status = 5;
+  repeated string agent_labels = 6 [deprecated = true];
+  repeated string custom_labels = 7 [deprecated = true];
+  string version = 8;
+  repeated string labels = 9;
+  bool ephemeral = 10;
+}
+
+message Task {
+  int64 id = 1;
+  optional bytes workflow_payload = 2;
+  optional google.protobuf.Struct context = 3;
+  map<string, string> secrets = 4;
+  string machine = 5 [deprecated = true];
+  map<string, TaskNeed> needs = 6;
+  map<string, string> vars = 7;
+}
+
+message TaskNeed {
+  map<string, string> outputs = 1;
+  Result result = 2;
+}
+
+message TaskState {
+  int64 id = 1;
+  Result result = 2;
+  google.protobuf.Timestamp started_at = 3;
+  google.protobuf.Timestamp stopped_at = 4;
+  repeated StepState steps = 5;
+  repeated StepState reported_steps = 6;
+}
+
+message StepState {
+  int64 id = 1;
+  Result result = 2;
+  google.protobuf.Timestamp started_at = 3;
+  google.protobuf.Timestamp stopped_at = 4;
+  int64 log_index = 5;
+  int64 log_length = 6;
+  string name = 7;
+  StepStage stage = 8;
+  int64 number = 9;
+}
+
+message LogRow {
+  google.protobuf.Timestamp time = 1;
+  string content = 2;
+}
+
+service RunnerService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Declare(DeclareRequest) returns (DeclareResponse);
+  rpc FetchTask(FetchTaskRequest) returns (FetchTaskResponse);
+  rpc UpdateTask(UpdateTaskRequest) returns (UpdateTaskResponse);
+  rpc UpdateLog(UpdateLogRequest) returns (UpdateLogResponse);
+}

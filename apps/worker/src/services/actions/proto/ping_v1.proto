@@ -1,0 +1,23 @@
+// Contract fixture — SPEC-0012 §6.1 wire freeze (2026-10-29).
+//
+// Transcribed from the FileDescriptorProto embedded in
+// gitea.dev/actionslib@v1.5.0/ping/v1/messages.pb.go + services.pb.go
+// (hash-verified against gitea/go.sum:15, see WIRE-FREEZE.md). This file is
+// the frozen wire contract for the PingService family; edit ONLY via a new
+// wire freeze against a new actionslib version.
+
+syntax = "proto3";
+
+package ping.v1;
+
+message PingRequest {
+  string data = 1;
+}
+
+message PingResponse {
+  string data = 1;
+}
+
+service PingService {
+  rpc Ping(PingRequest) returns (PingResponse);
+}

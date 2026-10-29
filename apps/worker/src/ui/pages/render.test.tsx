@@ -211,22 +211,31 @@ describe("loadHomeData + HomePage degradation paths", () => {
     const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
     const data = await loadHomeData(engine, repo, ctx.origin);
     const html = renderToString(<HomePage ctx={ctx} data={data} />);
-    // The headline + the two block headers (upstream repo/empty.tmpl's
-    // analog shapes).
-    expect(html).toContain("This repository is empty. Push to create it");
-    expect(html).toContain("Create a new repository on the command line");
-    expect(html).toContain("Push an existing repository");
-    // The create-from-scratch recipe: the full sequence with the origin
-    // clone URL and the default-branch push hint.
+    // The upstream header + the two block headings (repo.quick_guide,
+    // repo.create_new_repo_command, repo.push_exist_repo) — the pin's own
+    // markup since the 2026-10-29 usability sweep replaced the old bespoke
+    // banner ("This repository is empty…") with repo/empty.tmpl's shapes.
+    expect(html).toContain("Quick Guide");
+    expect(html).toContain("Creating a new repository on the command line");
+    expect(html).toContain("Pushing an existing repository from the command line");
+    expect(html).toContain('class="ui attached segment empty-repo-guide flex-relaxed-list"');
+    expect(html).not.toContain("This repository is empty. Push to create it");
+    // The create-from-scratch recipe: upstream's exact line sequence, with
+    // the `git checkout -b main` line a non-master default inserts.
     expect(html).toContain("touch README.md");
     expect(html).toContain("git init");
-    expect(html).toContain("git add .");
+    expect(html).toContain("git checkout -b main");
+    expect(html).toContain("git add README.md");
     // The commit subject's quotes are HTML-escaped in the pre text (hono/jsx).
     expect(html).toContain("git commit -m &quot;first commit&quot;");
-    expect(html).toContain("git remote add origin https://test.local/octocat/hello.git");
+    // The remote line's URL rides the js-clone-url span (upstream's
+    // `<span class="js-clone-url">` — the bundle keeps it in sync).
+    expect(html).toContain(
+      'git remote add origin <span class="js-clone-url">https://test.local/octocat/hello.git</span>',
+    );
     expect(html).toContain("git push -u origin main");
-    // The push-existing hint is the remote+push pair only (no init recipe).
-    expect(html.match(/git remote add origin https:\/\/test\.local\/octocat\/hello\.git/g)?.length).toBe(2);
+    // The clone URL rides the two js-clone-url spans (one per block).
+    expect(html.match(/js-clone-url/g)?.length).toBe(2);
     expect(html.match(/git push -u origin main/g)?.length).toBe(2);
   });
 
@@ -238,7 +247,9 @@ describe("loadHomeData + HomePage degradation paths", () => {
     const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
     const data = await loadHomeData(engine, trunkCtx.repo as RepoRow, ctx.origin);
     const html = renderToString(<HomePage ctx={trunkCtx} data={data} />);
+    expect(html).toContain("git checkout -b trunk");
     expect(html).toContain("git push -u origin trunk");
+    expect(html).not.toContain("git checkout -b main");
     expect(html).not.toContain("git push -u origin main");
   });
 

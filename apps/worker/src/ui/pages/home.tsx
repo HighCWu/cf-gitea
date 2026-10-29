@@ -17,10 +17,10 @@
  * release, language stats) are deferred — each needs data surfaces this
  * unit does not own; the grid already reserves their slots.
  *
- * Empty repos (§4.1: public, unborn HEAD) render the upstream repo/empty.tmpl
- * analog — clone command from the request origin + create-by-push hint, no
- * file list, no README, no sidebar (upstream's empty.tmpl has none) — never
- * a crash on `readCommit(null)`.
+ * Empty repos (§4.1: public, unborn HEAD) render upstream repo/empty.tmpl's
+ * writer arm — the Quick Guide with the two command-line blocks (the clone
+ * URL from the request origin), no file list, no README, no sidebar
+ * (upstream's empty.tmpl has none) — never a crash on `readCommit(null)`.
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
@@ -33,6 +33,20 @@ import { enrichTreeCommits, pickReadme, renderRepoMarkdown } from "../page-data"
 import { BaseLayout, Icon } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
 import { searchPageLocale } from "./repo-search";
+
+/** The empty-repo page's upstream strings (options/locale locale_en-US.json,
+ *  the `repo.*` keys — the same values status templates render through
+ *  ctx.Locale.Tr). */
+const emptyRepoLocale = {
+  /** "repo.quick_guide" */
+  quick_guide: "Quick Guide",
+  /** "repo.clone_this_repo" */
+  clone_this_repo: "Clone this repository",
+  /** "repo.create_new_repo_command" */
+  create_new_repo_command: "Creating a new repository on the command line",
+  /** "repo.push_exist_repo" */
+  push_exist_repo: "Pushing an existing repository from the command line",
+};
 
 /** The ref universe + resolved default branch behind one page render. */
 export interface ResolvedRefs extends SelectorRefs {
@@ -128,27 +142,76 @@ export async function loadHomeData(engine: EngineClient, repo: RepoRow, origin: 
   return { isEmpty: false, refs, entries, commits, latestCommit, readme };
 }
 
-/** The §4.1 empty-repo render (upstream repo/empty.tmpl analog): clone
- *  command from the request origin + create-by-push hint. */
+/** The §4.1 empty-repo render — upstream repo/empty.tmpl at the pin, the
+ *  CanWriteCode arm: the `repository quickstart` page with the Quick Guide
+ *  header, the "Clone this repository" item and the two command-line items
+ *  (locale repo.quick_guide / repo.clone_this_repo / repo.create_new_repo_command
+ *  / repo.push_exist_repo; the command blocks carry upstream's exact lines —
+ *  `git checkout -b` only when the default branch is not `master`, the
+ *  `.js-clone-url` span the official bundle wires). Deferred like the wiki
+ *  clone-button surface (pages/repo-wiki.tsx:143): the item's
+ *  repo-button-row (New File / Upload File / the clone-button group) needs
+ *  the CloneButtonOriginLink data + bundle plumbing this module does not
+ *  own — the command blocks carry the same clone URL meanwhile. Upstream's
+ *  sha256 `--object-format` arm is omitted: every landed row is sha1. */
 export function EmptyRepoPage(props: { ctx: UiContext }) {
   const { ctx } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("EmptyRepoPage requires ctx.repo");
   const cloneUrl = `${ctx.origin}/${repo.ownerNamespace}/${repo.slug}.git`;
+  const branch = repo.defaultBranch;
+  // Upstream renders `git checkout -b <branch>` only when the default is
+  // not `master` (empty.tmpl's `{{if ne .Repository.DefaultBranch "master"}}`).
+  const checkoutLine = branch === "master" ? [] : [`git checkout -b ${branch}`];
   return (
-    <BaseLayout ctx={ctx} title="Quick Start" pageClass="repository quickstart" activeTab="code">
+    <BaseLayout ctx={ctx} pageClass="repository quickstart" activeTab="code">
       <div class="ui container">
-        <div class="ui segment">
-          <h2 class="ui top header">
-            This repository is empty. Push to create it (SPEC-0003 §2.5.2).
-          </h2>
-          <h3 class="ui top attached header">Create a new repository on the command line</h3>
-          <div class="ui attached segment">
-            <pre>{`touch README.md\ngit init\ngit add .\ngit commit -m "first commit"\ngit remote add origin ${cloneUrl}\ngit push -u origin ${repo.defaultBranch}`}</pre>
-          </div>
-          <h3 class="ui top attached header">Push an existing repository</h3>
-          <div class="ui attached segment">
-            <pre>{`git remote add origin ${cloneUrl}\ngit push -u origin ${repo.defaultBranch}`}</pre>
+        <div class="ui grid">
+          <div class="sixteen wide column content">
+            <h4 class="ui top attached header">{emptyRepoLocale.quick_guide}</h4>
+            <div class="ui attached segment empty-repo-guide flex-relaxed-list">
+              <div class="item">
+                <h3>
+                  {emptyRepoLocale.clone_this_repo}{" "}
+                  <small>
+                    Need help cloning? Visit{" "}
+                    <a target="_blank" rel="noopener noreferrer" href="http://git-scm.com/book/en/v2/Git-Basics-Getting-a-Git-Repository">
+                      Help
+                    </a>
+                    .
+                  </small>
+                </h3>
+              </div>
+              <div class="divider" />
+              <div class="item">
+                <h3>{emptyRepoLocale.create_new_repo_command}</h3>
+                <div class="markup">
+                  <pre>
+                    <code>
+                      {`touch README.md
+git init
+${checkoutLine.length > 0 ? checkoutLine[0] + "\n" : ""}git add README.md
+git commit -m "first commit"
+git remote add origin `}                      <span class="js-clone-url">{cloneUrl}</span>
+                      {`
+git push -u origin ${branch}`}
+                    </code>
+                  </pre>
+                </div>
+              </div>
+              <div class="item">
+                <h3>{emptyRepoLocale.push_exist_repo}</h3>
+                <div class="markup">
+                  <pre>
+                    <code>
+                      {`git remote add origin `}<span class="js-clone-url">{cloneUrl}</span>
+                      {`
+git push -u origin ${branch}`}
+                    </code>
+                  </pre>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
