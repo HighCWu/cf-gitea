@@ -381,6 +381,41 @@ describe("parseUiRoute", () => {
     ["/explore/code", { family: "explore-code" }],
     ["/octo/hello/packages", { family: "repo-packages", owner: "octo", repo: "hello" }],
     ["/octo/hello/packages/extra", null],
+    // The census C4 artifacts preview subtree: the repo family (digits-only
+    // {id}, the decoded /preview tail with "/" separators rejoined) and the
+    // root SIGNED raw family (base64url signature verbatim, junk stays
+    // engine-owned).
+    ["/octo/hello/actions/artifacts/7/preview", { family: "actions-artifact-preview", owner: "octo", repo: "hello", artifactId: 7, previewPath: "" }],
+    [
+      "/octo/hello/actions/artifacts/007/preview/dir/sub%20file.txt",
+      {
+        family: "actions-artifact-preview",
+        owner: "octo",
+        repo: "hello",
+        artifactId: 7, // the PathParamInt64 parity — zero-padded parses
+        previewPath: "dir/sub file.txt",
+      },
+    ],
+    ["/octo/hello/actions/artifacts/x/preview", null], // junk id
+    ["/octo/hello/actions/artifacts/7", null], // the bare sibling stays unclaimed
+    [
+      "/-/actions/artifacts/7/1893456000/c2lnbmF0dXJl",
+      { family: "actions-artifact-preview-raw", artifactId: 7, expires: 1893456000, signature: "c2lnbmF0dXJl", previewPath: "" },
+    ],
+    [
+      "/-/actions/artifacts/7/1893456000/c2lnbmF0dXJl/dir/f%2Fname.bin",
+      {
+        family: "actions-artifact-preview-raw",
+        artifactId: 7,
+        expires: 1893456000,
+        signature: "c2lnbmF0dXJl",
+        previewPath: "dir/f/name.bin",
+      },
+    ],
+    ["/-/actions/artifacts/x/1893456000/c2lnbmF0dXJl", null], // junk id
+    ["/-/actions/artifacts/7/x/c2lnbmF0dXJl", null], // junk expiry
+    ["/-/actions/artifacts/7/1893456000/c2lnbmF0dXJl/%zz", null], // undecodable tail
+    ["/-/actions/other", null], // the /-/actions group claims only the artifacts subtree
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {

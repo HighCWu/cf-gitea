@@ -63,11 +63,16 @@
  * nothing outside its current surface is imported; the landing dedup notes
  * sit on each helper.
  *
- * The `state.currentJob.steps` + `logs.stepsLog` arms are C3's (task steps +
- * log cursors over M1b's log store): this module ships the SHELL — title +
- * detail + `steps: []` + `stepsLog: []`, marshaled as arrays not null
- * (view.go's explicit `make([]…, 0)` comment), exactly the response a
- * waiting job (EffectiveTaskID() == 0) gets upstream.
+ * The `state.currentJob.steps` + `logs.stepsLog` arms (the census C3 unit,
+ * landed over M1b's log store): `convertToViewModel` (view.go:835-917) is
+ * ported whole — FullSteps' pre/post synthesis (modules/actions/task_state.go),
+ * the cancelling overlay, the waiting→pending wire flip, the per-cursor
+ * `validCursor` guards, and the log-expired arm — reading the steps through
+ * M1b's `getTaskStepsByTaskId` and the log rows through M1b's
+ * `readTaskLogs` (the read seam M1b's report named). A job without a task
+ * (EffectiveTaskID() == 0, e.g. waiting) still gets the empty arrays —
+ * view.go's explicit `make([]…, 0)` shell, exactly the response upstream
+ * gives it.
  *
  * ## Documented divergences (§6 method — each cites its upstream arm)
  *
@@ -99,11 +104,15 @@
  *   cascade is unread in v1 rows; the commit-status/notifier legs have no
  *   platform analog. The runner handshake (HasCancellingSupport + the
  *   1-minute report timeout, StopTask) IS ported.
- * - Artifact `previewLink` carries the upstream computation but is gated
- *   OFF by a module constant until the C4 preview route lands (the
- *   dead-link rule: the Vue app renders a preview button from a non-empty
- *   link; a link to an unclaimed route would 404). C4 flips the flag and
- *   the JSON gains the link.
+ * - Artifact `previewLink` carries the upstream computation and is LIVE
+ *   (the C4 flip): pages/repo-actions-artifacts.ts is the census C4 module —
+ *   the preview page (artifact_preview.tmpl port) + the signed raw-content
+ *   serving the link composes from. The route arms that mount them
+ *   (`/{owner}/{repo}/actions/artifacts/{id}/preview[/*]` and the root
+ *   `/-/actions/artifacts/{id}/{expires}/{signature}/*`) live in the
+ *   orchestrator-owned ui/index.ts — C4's landing reports them, and the
+ *   flip rides the same landing (the dead-link rule: the link must never
+ *   point at an unclaimed route).
  * - The GET resolves the run through the FULL ID-vs-index disambiguation
  *   (resolveCurrentRunForView — index URLs 302 onto the canonical id URL);
  *   the POST twins resolve ID-based ONLY (getCurrentRunByPathParam —
@@ -137,7 +146,9 @@ import {
   type RunAttemptRow,
   type RunJobRow,
   type RunRow,
+  type TaskRow,
 } from "../../services/actions/model";
+import { getTaskStepsByTaskId, readTaskLogs, type TaskStepRow } from "../../services/actions/update";
 import { avatarLinkWithSize, defaultAvatarLink, type AvatarChainUser } from "../../services/avatars";
 import { BaseLayout, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
@@ -836,6 +847,28 @@ export interface ViewArtifactsItem {
   previewLink?: string;
 }
 
+/** ViewJobStep (view.go:401-405) — the currentJob steps' shape. */
+export interface ViewJobStep {
+  summary: string;
+  duration: string;
+  status: string;
+}
+
+/** ViewStepLogLine (view.go:413-417) — timestamp is float seconds (upstream
+ *  UnixNano()/1e9). */
+export interface ViewStepLogLine {
+  index: number;
+  message: string;
+  timestamp: number;
+}
+
+/** ViewStepLog (view.go:407-411) — the advanced cursor + the new lines. */
+export interface ViewStepLog {
+  step: number;
+  cursor: number;
+  lines: ViewStepLogLine[];
+}
+
 export interface ViewResponse {
   artifacts: ViewArtifactsItem[];
   state: {
@@ -875,12 +908,242 @@ export interface ViewResponse {
     currentJob: {
       title: string;
       detail: string;
-      steps: Array<{ summary: string; duration: string; status: string }>;
+      steps: ViewJobStep[];
     };
   };
   logs: {
-    stepsLog: Array<{ step: number; cursor: number; lines: Array<{ index: number; message: string; timestamp: number }> }>;
+    stepsLog: ViewStepLog[];
   };
+}
+
+// ---------------------------------------------------------------------------
+// The C3 arm: the currentJob steps + the log cursors (view.go:835-917's
+// convertToViewModel over FullSteps, modules/actions/task_state.go — the
+// census C3 unit's read arms, riding M1b's log store)
+// ---------------------------------------------------------------------------
+
+/** "Logs have been purged because they were too old."
+ *  ("actions.runs.expire_log_message" — the log-expired arm's one line). */
+export const EXPIRED_LOG_MESSAGE = "Logs have been purged because they were too old.";
+
+/** The step shape the view arms read: the stored rows verbatim plus the two
+ *  synthesized boundary steps, each carrying only the fields FullSteps
+ *  assigns (upstream constructs the pre/post steps as fresh structs —
+ *  zero-valued Updated is the duration fallback's OFF state). */
+interface FullStep {
+  name: string;
+  logIndex: number;
+  logLength: number;
+  started: Date | null;
+  stopped: Date | null;
+  status: number;
+  /** Null on the synthesized steps (upstream's zero TimeStamp). */
+  updated: Date | null;
+}
+
+function toFullStep(step: TaskStepRow): FullStep {
+  return {
+    name: step.name,
+    logIndex: step.logIndex,
+    logLength: step.logLength,
+    started: step.started,
+    stopped: step.stopped,
+    status: step.status,
+    updated: step.updated,
+  };
+}
+
+/** Status.HasRun (status.go:58-60) — success or failure. */
+function statusHasRun(status: number): boolean {
+  return status === 1 /* success */ || status === 2 /* failure */;
+}
+
+/** fullStepsOfEmptySteps (task_state.go:97-127): a task with no parsed steps
+ *  renders exactly "Set up job" + "Complete job" carrying the task's own
+ *  log range; a done task colors both (success → both success, else
+ *  cancelled). */
+function fullStepsOfEmptySteps(task: TaskRow): FullStep[] {
+  const preStep: FullStep = {
+    name: "Set up job",
+    logIndex: 0,
+    logLength: task.logLength,
+    started: task.started,
+    stopped: task.stopped,
+    status: ACTION_STATUS_RUNNING,
+    updated: null,
+  };
+  const postStep: FullStep = {
+    name: "Complete job",
+    logIndex: task.logLength,
+    logLength: 0,
+    started: task.stopped,
+    stopped: task.stopped,
+    status: ACTION_STATUS_WAITING,
+    updated: null,
+  };
+  if (isDoneStatusValue(task.status)) {
+    preStep.status = task.status;
+    postStep.status = task.status === 1 /* success */ ? 1 : ACTION_STATUS_CANCELLED;
+  }
+  return [preStep, postStep];
+}
+
+/** FullSteps (task_state.go:16-95) — the stored steps bracketed by the
+ *  synthesized "Set up job" / "Complete job" boundary steps. A
+ *  runner-reported layout (steps[0].IsReport(), stage != 0) rides verbatim —
+ *  the runner reports its own setup and cleanup. */
+export function fullStepsOfTask(task: TaskRow, steps: TaskStepRow[]): FullStep[] {
+  if (steps.length === 0) return fullStepsOfEmptySteps(task);
+  if (steps[0]!.stage !== 0) return steps.map(toFullStep);
+
+  // firstStep: the first step that has run or is running (preStep excluded —
+  // it does not exist yet); lastHasRunStep: the last step that has run — its
+  // Stopped becomes postStep's Started once nothing is left to run.
+  let firstStep: TaskStepRow | null = null;
+  let lastHasRun: TaskStepRow | null = null;
+  let logIndex = 0;
+  for (const step of steps) {
+    if (firstStep === null && (statusHasRun(step.status) || step.status === ACTION_STATUS_RUNNING)) {
+      firstStep = step;
+    }
+    if (statusHasRun(step.status)) lastHasRun = step;
+    logIndex += step.logLength;
+  }
+
+  const preStep: FullStep = {
+    name: "Set up job",
+    logIndex: 0,
+    logLength: task.logLength,
+    started: task.started,
+    stopped: null,
+    status: ACTION_STATUS_RUNNING,
+    updated: null,
+  };
+  // No step has run or is running: preStep IS the task.
+  if (firstStep === null) {
+    preStep.stopped = task.stopped;
+    preStep.status = task.status;
+  } else {
+    preStep.logLength = firstStep.logIndex;
+    preStep.stopped = firstStep.started;
+    preStep.status = 1; // success
+  }
+  logIndex += preStep.logLength;
+  const lastHasRunStep = lastHasRun !== null ? toFullStep(lastHasRun) : preStep;
+
+  const postStep: FullStep = {
+    name: "Complete job",
+    logIndex: 0,
+    logLength: 0,
+    started: null,
+    stopped: null,
+    status: ACTION_STATUS_WAITING,
+    updated: null,
+  };
+  // Nothing left to run, or the last run step failed: postStep has started.
+  const lastStored = steps[steps.length - 1]!;
+  if (lastHasRunStep.status === ACTION_STATUS_FAILURE || isDoneStatusValue(lastStored.status)) {
+    postStep.logIndex = logIndex;
+    postStep.logLength = task.logLength - postStep.logIndex;
+    postStep.started = lastHasRunStep.stopped;
+    postStep.status = ACTION_STATUS_RUNNING;
+  }
+  if (isDoneStatusValue(task.status)) {
+    postStep.status = task.status;
+    postStep.stopped = task.stopped;
+  }
+  return [preStep, ...steps.map(toFullStep), postStep];
+}
+
+/** ActionTaskStep.Duration() (task_step.go:36-38) over the step's own
+ *  timestamps. Synthesized steps carry updated = null — upstream's zero
+ *  TimeStamp, whose fallback arm can never fire, so the fallback epoch
+ *  below (0 < started always) returns 0 exactly like upstream. */
+function fullStepDurationMs(step: FullStep): number {
+  return calculateDurationMs(step.started, step.stopped, step.status, step.updated ?? new Date(0));
+}
+
+/**
+ * convertToViewModel (view.go:835-917): the steps list plus the log lines
+ * each EXPANDED cursor's step still needs. The cursor protocol: `cursor`
+ * counts the step's lines the client already holds; the answer reports
+ * `cursor + len(lines)` and the 1-based line indexes — a `validCursor`
+ * miss (the step's next line not stored yet) answers the SAME cursor with
+ * empty lines so the client retries.
+ */
+export async function convertToViewModel(
+  env: Env,
+  cursors: ViewStepLogInput[],
+  task: TaskRow,
+  steps: TaskStepRow[],
+): Promise<{ steps: ViewJobStep[]; logs: ViewStepLog[] }> {
+  const full = fullStepsOfTask(task, steps);
+
+  const viewSteps = full.map((v) => {
+    let status = v.status;
+    // The cancelling overlay: running steps read cancelling with their task.
+    if (task.status === ACTION_STATUS_CANCELLING && status === ACTION_STATUS_RUNNING) {
+      status = ACTION_STATUS_CANCELLING;
+    }
+    // Waiting renders as "pending" in the steps list (view.go:849's Iif).
+    const wire = status === ACTION_STATUS_WAITING ? 9 : status; // StatusPending
+    return {
+      summary: v.name,
+      duration: goDurationString(fullStepDurationMs(v)),
+      status: actionStatusName(wire),
+    };
+  });
+
+  const logs: ViewStepLog[] = [];
+  for (const cursor of cursors) {
+    if (!cursor.expanded || cursor.step < 0 || cursor.step >= full.length) continue;
+    const step = full[cursor.step]!;
+
+    // The log-expired arm: one consistent line on the first fetch only.
+    if (task.logExpired) {
+      if (cursor.cursor === 0) {
+        logs.push({
+          step: cursor.step,
+          cursor: 1,
+          lines: [
+            {
+              index: 1,
+              message: EXPIRED_LOG_MESSAGE,
+              // "doesn't mean anything" upstream — the task's updated stands in.
+              timestamp: task.updated.getTime() / 1000,
+            },
+          ],
+        });
+      }
+      continue;
+    }
+
+    const lines: ViewStepLogLine[] = [];
+    const index = step.logIndex + cursor.cursor;
+    // Upstream's third guard bounds by len(task.LogIndexes) — "task data
+    // older than step data". One LogIndexes entry per stored row makes our
+    // row-count column the same bound (update.ts's UpdateLog advances both
+    // atomically), and our read seam is ROW-indexed (logs.ts's header), so
+    // no byte-offset decode is needed here.
+    const validCursor = cursor.cursor >= 0 && cursor.cursor < step.logLength && index < task.logLength;
+
+    if (validCursor) {
+      const length = step.logLength - cursor.cursor;
+      const logRows = await readTaskLogs(env, task, index, length);
+      for (let i = 0; i < logRows.length; i++) {
+        const row = logRows[i]!;
+        lines.push({
+          index: cursor.cursor + i + 1, // start at 1
+          message: row.content,
+          timestamp: row.time.getTime() / 1000,
+        });
+      }
+    }
+
+    logs.push({ step: cursor.step, cursor: cursor.cursor + lines.length, lines });
+  }
+
+  return { steps: viewSteps, logs };
 }
 
 /** The builder's resolved inputs (the handler's one-time computation). */
@@ -895,8 +1158,7 @@ export interface BuildViewResponseInput {
   /** Whether a viewer is signed in (ctx.IsSigned — the artifact preview
    *  arm's first gate). */
   isSigned: boolean;
-  /** The POST twin's logCursors body (C3's arm consumes it; the shell
-   *  accepts and ignores). */
+  /** The POST twin's logCursors body (the C3 arm's tail requests). */
   logCursors?: ViewStepLogInput[];
   /** The URL's path params (the strings the mount/JSON armed from). */
   attemptRaw: string;
@@ -1086,6 +1348,30 @@ export async function buildViewResponse(
     }
   }
 
+  // The C3 arm: the effective task (EffectiveTaskID, run_job.go:158-163)
+  // feeds FullSteps + the log cursors. No task (a waiting job's taskId 0, or
+  // a stale id whose row vanished — upstream's GetTaskByID error arm aside)
+  // keeps the empty arrays, view.go's make([]…, 0) shell.
+  let stepViews: ViewJobStep[] = [];
+  let stepLogs: ViewStepLog[] = [];
+  if (current !== undefined) {
+    const effectiveTaskId = current.taskId > 0 ? current.taskId : current.sourceTaskId;
+    if (effectiveTaskId > 0) {
+      const taskRows = await drizzle(d1)
+        .select()
+        .from(actionTasks)
+        .where(eq(actionTasks.id, effectiveTaskId))
+        .limit(1);
+      const task = taskRows[0];
+      if (task !== undefined) {
+        const stepRows = await getTaskStepsByTaskId(d1, task.id);
+        const model = await convertToViewModel(input.env, input.logCursors ?? [], task, stepRows);
+        stepViews = model.steps;
+        stepLogs = model.logs;
+      }
+    }
+  }
+
   const response: ViewResponse = {
     artifacts,
     state: {
@@ -1122,14 +1408,13 @@ export async function buildViewResponse(
       currentJob: {
         title: currentTitle,
         detail: currentDetail,
-        // C3's arm: task steps ride M1b's log store; the shell ships the
-        // empty array (view.go marshals `[]` not null).
-        steps: [],
+        // The C3 arm: FullSteps over the effective task's rows; the empty
+        // array (never null) when the job has no task.
+        steps: stepViews,
       },
     },
-    logs: { stepsLog: [] },
+    logs: { stepsLog: stepLogs },
   };
-  void input.logCursors; // C3's arm consumes the cursors; the shell ignores them.
   return { outcome: "response", response };
 }
 
@@ -1332,9 +1617,11 @@ export function isArtifactPreviewSizeAllowed(size: number): boolean {
   return size <= ARTIFACT_PREVIEW_MAX_SIZE;
 }
 
-/** The dead-link gate: OFF until the C4 preview route lands (the module
- *  header). C4's landing flips this and the JSON gains upstream's link. */
-const artifactPreviewLinkEnabled = false;
+/** The C4 gate, FLIPPED: the preview page + raw serving live in
+ *  pages/repo-actions-artifacts.ts (the census C4 module); the mounting
+ *  route arms are the orchestrator's ui/index.ts edit C4's landing reports.
+ *  The link and the routes must land together (the dead-link rule). */
+const artifactPreviewLinkEnabled = true;
 
 /** pendingNeeds (view.go:889-908): the needs entries whose same-parent jobs
  *  are missing or unfinished. */
@@ -1403,7 +1690,7 @@ function parsedStringArray(raw: string): string[] {
 
 // ---------------------------------------------------------------------------
 // The ViewRequest POST body (view.go:282-290 — the client's refresh polling
-// arm; the cursors are C3's arm, accepted and ignored here)
+// arm; the cursors ride the C3 arm's per-step tail requests)
 // ---------------------------------------------------------------------------
 
 export function parseViewRequest(body: string): { logCursors: ViewStepLogInput[] } {

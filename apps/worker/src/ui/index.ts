@@ -691,7 +691,8 @@ import { users } from "../db/schema";
 import type { RunRow } from "../services/actions/model";
 import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
-import { AssetBuildError, loadManifest } from "./manifest";
+import { AssetBuildError, assetURI, loadManifest } from "./manifest";
+import { renderServerErrorShellResponse } from "./not-found-response";
 import { parsePageNumber, pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
@@ -736,6 +737,11 @@ import {
   resolveRunByPath,
   resolveRunForView,
 } from "./pages/repo-actions-view";
+import {
+  loadArtifactPreviewPageData,
+  renderArtifactPreviewPage,
+  serveArtifactPreviewRaw,
+} from "./pages/repo-actions-artifacts";
 import {
   deleteRepoActionsRunner,
   loadRepoActionsRunnerEditPageData,
@@ -2827,6 +2833,40 @@ export interface RepoActionsRunViewRoute {
   job?: string;
 }
 
+/** The census C4 artifacts preview subtree (pages/repo-actions-artifacts.tsx
+ *  — upstream web.go:1602-1603's `m.Get("/artifacts/{artifact_id}/preview",
+ *  ...)` + the `/*` tail inside the /actions group). The {id} claims digits
+ *  only (the house PathParamInt64 idiom — "007" parses as 7); the tail
+ *  beyond /preview/ is decoded per segment and rejoined with "/" separators
+ *  (pathEscapeSegments keeps them). The siblings (`/runs/{run}/artifacts/
+ *  {name}`'s download zip-compose + delete, `/artifacts/{id}` alone) stay
+ *  unclaimed → the engine's 404 until their units land. */
+export interface RepoActionsArtifactPreviewRoute {
+  family: "actions-artifact-preview";
+  owner: string;
+  repo: string;
+  artifactId: number;
+  /** The decoded /preview tail ("" on the bare URL). */
+  previewPath: string;
+}
+
+/** The C4 artifacts preview SIGNED raw family (root scope, upstream's
+ *  `/-/actions/artifacts/{id}/{expires}/{signature}[/...]` — view_artifact.
+ *  go:392-484): the HMAC IS the auth, no session arm, so no viewer gate at
+ *  the route. The {id}/{expires} segments claim digits only; {signature}
+ *  is the base64url segment verbatim; the tail decodes per segment with
+ *  "/" separators rejoined. Every other /-/actions/* tail stays unclaimed
+ *  → the engine's 404. */
+export interface ActionsArtifactPreviewRawRoute {
+  family: "actions-artifact-preview-raw";
+  artifactId: number;
+  expires: number;
+  /** The path's base64url signature segment (compared over encoded bytes). */
+  signature: string;
+  /** The decoded route tail ("" at the bare signed root). */
+  previewPath: string;
+}
+
 
 /** Window-2e B2: the repo-scoped aux feeds + fragments (issues-search-aux,
  *  issue-content-fragments, pull-merge-box, compare-feeds,
@@ -3153,6 +3193,8 @@ export type ParsedUiRoute =
   | RepoActionsRunsRoute
   | RepoActionsJobQueueRoute
   | RepoActionsRunViewRoute
+  | RepoActionsArtifactPreviewRoute
+  | ActionsArtifactPreviewRawRoute
   | SiteHomeRoute
   | ExploreRoute
   | NotificationsRoute
@@ -3422,6 +3464,43 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // decode the {badge_slug} segment, the application delete claims the
   // positive-integer {id}). Every other /-/* tail stays unclaimed
   // → the engine's 404 (upstream's unregistered-route answer).
+  // The C4 artifacts preview SIGNED raw family (pages/repo-actions-artifacts.
+  // tsx — upstream's /-/actions/artifacts/{id}/{expires}/{signature}[/...]
+  // route, view_artifact.go:392-484): the HMAC itself is the auth (no
+  // session arm). The {id}/{expires} segments claim digits only (the house
+  // idiom — junk stays engine-owned); {signature} is the base64url segment
+  // verbatim (no percent-decode ambiguity); the tail decodes per segment
+  // with "/" separators rejoined. Every other /-/actions/* tail stays
+  // unclaimed → the engine's 404.
+  if (
+    raw[1] === "-" &&
+    raw[2] === "actions" &&
+    raw[3] === "artifacts" &&
+    raw.length >= 7 &&
+    /^\d+$/.test(raw[4] as string) &&
+    /^\d+$/.test(raw[5] as string)
+  ) {
+    const tailSegments = raw.slice(7);
+    let previewPath = "";
+    if (tailSegments.length > 0) {
+      const tail: string[] = [];
+      for (const segment of tailSegments) {
+        try {
+          tail.push(decodeURIComponent(segment as string));
+        } catch {
+          return null;
+        }
+      }
+      previewPath = tail.join("/");
+    }
+    return {
+      family: "actions-artifact-preview-raw",
+      artifactId: Number.parseInt(raw[4] as string, 10),
+      expires: Number.parseInt(raw[5] as string, 10),
+      signature: raw[6] as string,
+      previewPath,
+    };
+  }
   if (raw[1] === "-" && raw[2] === "admin") {
     const tail = raw.slice(3);
     if (tail.length === 0) return { family: "admin-dashboard" };
@@ -4160,6 +4239,36 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   if (head === "actions" && rest.length === 2 && rest[0] === "runs") {
     return { family: "actions-run-view", owner, repo, run: rest[1] as string };
+  }
+
+  // The census C4 artifacts preview subtree (pages/repo-actions-artifacts.tsx
+  // — web.go:1602-1603's /artifacts/{artifact_id}/preview[/...] inside the
+  // /actions group): the {id} claims digits only (the house PathParamInt64
+  // idiom — "007" parses as 7; junk stays engine-owned, upstream's
+  // unregistered-tail answer); the tail beyond /preview/ decodes per segment
+  // and rejoins with "/" separators (pathEscapeSegments keeps them). The
+  // siblings (`/runs/{run}/artifacts/{name}` download/delete, the bare
+  // `/artifacts/{id}`) stay unclaimed → the engine's 404.
+  if (
+    head === "actions" &&
+    rest.length >= 3 &&
+    rest[0] === "artifacts" &&
+    rest[2] === "preview" &&
+    /^\d+$/.test(rest[1] as string)
+  ) {
+    const artifactId = Number.parseInt(rest[1] as string, 10);
+    if (rest.length === 3) {
+      return { family: "actions-artifact-preview", owner, repo, artifactId, previewPath: "" };
+    }
+    const tail: string[] = [];
+    for (const segment of rest.slice(3)) {
+      try {
+        tail.push(decodeURIComponent(segment as string));
+      } catch {
+        return null;
+      }
+    }
+    return { family: "actions-artifact-preview", owner, repo, artifactId, previewPath: tail.join("/") };
   }
 
   if (head === "issues" || head === "pulls") {
@@ -6189,6 +6298,57 @@ async function actionsRunViewJson(c: Context<{ Bindings: Env }>): Promise<Respon
     new Response(JSON.stringify(built.response), {
       status: 200,
       headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
+/** GET /{owner}/{repo}/actions/artifacts/{id}/preview[/...] (actions.
+ *  ArtifactsView — the census C4 SSR file browser, view_artifact.go:341-390).
+ *  The C2 read ladder (MustBeNotEmpty + the actions unit gate); the disable
+ *  arm answers the 404 shell, upstream's ServerError arms (a missing or
+ *  unconfirmed artifact, a missing run) answer the 500 chrome — a missing
+ *  artifact IS a ServerError on this route, not a 404. */
+async function actionsArtifactPreviewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-artifact-preview") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  const outcome = await loadArtifactPreviewPageData(c.env, repo, resolved.route.artifactId, resolved.route.previewPath);
+  if (outcome.outcome === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  if (outcome.outcome === "error") return renderServerErrorShellResponse(c.env, c.req.raw);
+  return respond(c.html(renderArtifactPreviewPage(ctx, outcome.data), 200));
+}
+
+/** GET /-/actions/artifacts/{id}/{expires}/{signature}[/...] — the C4 SIGNED
+ *  raw serving (view_artifact.go:392-484): the HMAC is the auth, so the
+ *  route runs viewer-less; every gate/family/entry miss is an opaque 404,
+ *  the size cap 413s, the sniffer gate 415s, and document navigations 302
+ *  to the repo-scoped preview page. The sandbox helper script rides the
+ *  manifest's web_src/js/external-render-helper.ts entry — an absent entry
+ *  or unbuilt assets degrade to no injection (the null arm). */
+async function actionsArtifactPreviewRaw(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const route = resolved.route;
+  if (route.family !== "actions-artifact-preview-raw") return resolved.respond(await c.notFound()); // drift guard
+  let helperScriptSrc: string | null = null;
+  try {
+    const manifest = await loadManifest(assetsBinding(c.env), resolved.url.origin);
+    helperScriptSrc = assetURI(manifest, "web_src/js/external-render-helper.ts");
+  } catch (error) {
+    if (!(error instanceof AssetBuildError)) throw error;
+    helperScriptSrc = null; // unbuilt assets / absent entry — the null arm skips injection
+  }
+  return resolved.respond(
+    await serveArtifactPreviewRaw(c.env, {
+      artifactId: route.artifactId,
+      expires: route.expires,
+      signature: route.signature,
+      tail: route.previewPath,
+      secFetchDest: c.req.header("sec-fetch-dest") ?? null,
+      helperScriptSrc,
     }),
   );
 }
@@ -13800,6 +13960,16 @@ uiRouter.get("/:owner/:repo/actions/runs/:run/jobs/:job", (c) => actionsRunViewP
 uiRouter.post("/:owner/:repo/actions/runs/:run/jobs/:job", (c) => actionsRunViewJson(c));
 uiRouter.get("/:owner/:repo/actions/runs/:run/cancel", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/actions/runs/:run/cancel", (c) => actionsRunCancel(c));
+// The census C4 artifacts preview subtree (GET-only upstream — the POST
+// twins answer chi's 405): the SSR file browser + the signed raw serving.
+uiRouter.get("/:owner/:repo/actions/artifacts/:id/preview", (c) => actionsArtifactPreviewPage(c));
+uiRouter.get("/:owner/:repo/actions/artifacts/:id/preview/*", (c) => actionsArtifactPreviewPage(c));
+uiRouter.post("/:owner/:repo/actions/artifacts/:id/preview", () => methodNotAllowed("GET"));
+uiRouter.post("/:owner/:repo/actions/artifacts/:id/preview/*", () => methodNotAllowed("GET"));
+uiRouter.get("/-/actions/artifacts/:id/:expires/:signature", (c) => actionsArtifactPreviewRaw(c));
+uiRouter.get("/-/actions/artifacts/:id/:expires/:signature/*", (c) => actionsArtifactPreviewRaw(c));
+uiRouter.post("/-/actions/artifacts/:id/:expires/:signature", () => methodNotAllowed("GET"));
+uiRouter.post("/-/actions/artifacts/:id/:expires/:signature/*", () => methodNotAllowed("GET"));
 uiRouter.get("/:owner/:repo/activity", (c) => repoActivityPage(c));
 uiRouter.get("/:owner/:repo/activity/:period", (c) => repoActivityPage(c));
 // Window-2e C1: the global inbox.
