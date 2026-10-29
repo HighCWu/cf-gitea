@@ -4,7 +4,9 @@
  * web surfaces that make a fresh deployment usable in one browser step.
  *
  *   GET  /install        — the login page + Administrator Account Settings
- *                          panel (zero-user instances only; initialized
+ *                          panel (instances with no HUMAN user yet — the
+ *                          migration-seeded system service principals don't
+ *                          count, see the service gate; initialized
  *                          instances 303 to `/`)
  *   POST /install        — the atomic first-admin creation; the winner is
  *                          signed in immediately (session mint + Set-Cookie,
@@ -183,9 +185,10 @@ async function renderInstall(
 // The admin-init window (GET/POST /install)
 // ---------------------------------------------------------------------------
 
-/** GET /install — the panel when the users table is empty; 303 to `/` once
- *  ANY user row exists (upstream's post-install posture: the install page
- *  simply goes away). */
+/** GET /install — the panel while NO human user row exists (the service
+ *  gate's predicate — the migration-seeded system principals `assets` and
+ *  `gitea:deploy-key` never close it); 303 to `/` once one exists
+ *  (upstream's post-install posture: the install page simply goes away). */
 async function installPage(c: RouteContext): Promise<Response> {
   const signedIn = await redirectIfSignedIn(c);
   if (signedIn !== null) return signedIn;

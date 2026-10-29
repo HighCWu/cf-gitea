@@ -531,6 +531,18 @@ surfaces, both web routes under the session model above; implementation:
 
 ### 6.1 The zero-user admin-init window (one-shot by construction)
 
+> **As-built amendment (2026-10-30)**: the gate counts HUMANS, not rows —
+> the migration-seeded SYSTEM service principals (`assets` via 0003,
+> `gitea:deploy-key` via 0020) don't close the window. The predicate is the
+> codified system-row shape's negation (`status='prohibited'` + `is_admin=0`
+> + no email) shared by `initWindowOpen` and the atomic insert's NOT EXISTS
+> guard (services/user-accounts.ts, `NON_SYSTEM_USER_ROW`); a
+> prohibit-logged human keeps its email and never reopens the window. The
+> "zero-user/empty" phrasing below is the ratified-era text — read it as
+> "no human user yet". Found by the act_runner smoke (a freshly-migrated
+> instance's window was dead under the empty-table gate); pinned by the
+> seeded-system regression tests in user-accounts.test.ts.
+
 - **Surface**: when `users` is EMPTY, the login page additionally renders the
   "Administrator Account Settings" panel (`loginFirstRunLocale`, login.tsx);
   the standalone `GET /install` renders the identical page. This is upstream's

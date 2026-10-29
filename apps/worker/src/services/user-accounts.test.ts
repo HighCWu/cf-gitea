@@ -7,6 +7,14 @@
  * no route-level suite exercised the cascade's action arm, which is why it
  * shipped. This suite pins BOTH columns delete.
  *
+ * Plus (2026-10-30) the admin-init window's seeded-system premise — the
+ * act_runner smoke's finding 4: migration 0003 seeds the `assets` system
+ * user on EVERY migrated instance, and the old "users table empty" gate
+ * closed the one-shot /install window on fresh deployments. The first-run
+ * route suite never saw it — its beforeEach wipes the users table. The
+ * bottom describe re-creates the REAL post-migration state (both seeds
+ * present) and pins the gate's arms.
+ *
  * The per-test storage reset (apply-d1-migrations.ts's caution note) means
  * each test re-applies the schema before seeding.
  */
@@ -15,7 +23,7 @@ import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:test";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { deleteUserCascade } from "./user-accounts";
+import { deleteUserCascade, initWindowOpen, initializeAdminUser } from "./user-accounts";
 
 async function seedActorPair(): Promise<{ actorId: number; receiverId: number }> {
   await applyAuthD1Migrations();
@@ -63,5 +71,99 @@ describe("deleteUserCascade: the action rows (both columns)", () => {
     // Row 1 (user_id = the deleted receiver) dies; row 2 (no 9102 column)
     // survives — the cascade never over-deletes foreign rows.
     expect(await survivingRows()).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// The admin-init window counts HUMANS only — the act_runner smoke's finding 4
+// (2026-10-30): migration 0003 seeds the `assets` system user on EVERY
+// migrated instance, and the old "users table empty" gate kept the one-shot
+// /install window closed on fresh self-hosted deployments. The seeds are the
+// codebase's SYSTEM SERVICE PRINCIPALS — `assets` (0003, id 1) and
+// `gitea:deploy-key` (0020, id -3, re-asserted on demand by
+// api/services/deploy-keys.ts) — always prohibited, non-admin, no email.
+// ---------------------------------------------------------------------------------
+
+/**
+ * The post-migration users table, hermetic against this file's sibling
+ * tests (pool isolation is per FILE here — seedActorPair's note): wipe,
+ * then re-assert the two migration seeds EXACTLY as 0003/0020 land them
+ * (the shape schema.ts's deploy-keys doc calls "the migration-0003 'assets'
+ * reservation row").
+ */
+async function seedSystemPremise(): Promise<void> {
+  await applyAuthD1Migrations();
+  await env.DB.prepare("DELETE FROM users").run();
+  await env.DB.prepare(
+    "INSERT INTO users (id, username, username_lower, is_admin, status, created_at) VALUES " +
+      "(1, 'assets', 'assets', 0, 'prohibited', unixepoch()), " +
+      "(-3, 'gitea:deploy-key', 'gitea:deploy-key', 0, 'prohibited', unixepoch())",
+  ).run();
+}
+
+const ADMIN_FORM = { username: "Root", email: "root@example.com", password: "ignored", retype: "ignored" };
+
+describe("the admin-init window counts HUMANS only (act_runner smoke 2026-10-30, finding 4)", () => {
+  it("a seeded system user ALONE leaves the window OPEN — and the init insert wins", async () => {
+    await seedSystemPremise();
+    // `assets` alone (the literal 0003 state — the smoke's dead instance)…
+    await env.DB.prepare("DELETE FROM users WHERE id = -3").run();
+    expect(await initWindowOpen(env.DB)).toBe(true);
+    // …and with the deploy-key principal re-asserted (0020 / on-demand),
+    // STILL open — the old gate closed here.
+    await env.DB.prepare(
+      "INSERT INTO users (id, username, username_lower, is_admin, status, created_at) " +
+        "VALUES (-3, 'gitea:deploy-key', 'gitea:deploy-key', 0, 'prohibited', unixepoch())",
+    ).run();
+    expect(await initWindowOpen(env.DB)).toBe(true);
+
+    // The one-shot creation itself succeeds on the migrated instance: the
+    // first submission WINS despite the seeds (the smoke's dead path).
+    const result = await initializeAdminUser(env.DB, ADMIN_FORM);
+    expect(result.outcome).toBe("created");
+    expect(await initWindowOpen(env.DB)).toBe(false);
+  });
+
+  it("a seeded system user + one human keeps the window CLOSED (the one-shot holds)", async () => {
+    await seedSystemPremise();
+    const first = await initializeAdminUser(env.DB, ADMIN_FORM);
+    expect(first.outcome).toBe("created");
+
+    // Both seeds still sit beside the admin (prohibited + non-admin + no
+    // email = the system shape; the admin matches none of it).
+    const seeds = await env.DB
+      .prepare("SELECT COUNT(*) AS n FROM users WHERE status = 'prohibited' AND is_admin = 0 AND email IS NULL")
+      .first<{ n: number }>();
+    expect(Number(seeds?.n ?? 0)).toBe(2);
+    expect(await initWindowOpen(env.DB)).toBe(false);
+
+    // A second submission still loses — one admin, terminal verdict.
+    const second = await initializeAdminUser(env.DB, {
+      username: "Second",
+      email: "second@example.com",
+      password: "x",
+      retype: "x",
+    });
+    expect(second.outcome).toBe("already-initialized");
+  });
+
+  it("an org row beside the seeds keeps the window CLOSED (the unified-table semantic)", async () => {
+    await seedSystemPremise();
+    await env.DB.prepare(
+      "INSERT INTO users (username, username_lower, email, is_admin, status, type, created_at) " +
+        "VALUES ('Acme', 'acme', 'acme@example.com', 0, 'active', 'org', unixepoch())",
+    ).run();
+    expect(await initWindowOpen(env.DB)).toBe(false);
+  });
+
+  it("a prohibit-logged human NEVER reopens the window (upstream's install lock)", async () => {
+    await seedSystemPremise();
+    const first = await initializeAdminUser(env.DB, ADMIN_FORM);
+    expect(first.outcome).toBe("created");
+    // The admin gets prohibit_login (the admin PATCH arm): the row keeps its
+    // email, so it is STILL human — a bare active-count gate would have
+    // resurrected /install here; the identity-of-origin predicate does not.
+    await env.DB.prepare("UPDATE users SET status = 'prohibited' WHERE username_lower = 'root'").run();
+    expect(await initWindowOpen(env.DB)).toBe(false);
   });
 });

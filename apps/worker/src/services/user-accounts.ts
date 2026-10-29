@@ -1,9 +1,11 @@
 /**
  * Individual-user account creation AND deletion. Creation (SPEC-0010
  * first-run amendment, 2026-10-28): the two creation surfaces the web UI
- * owns — the ONE-SHOT admin-init window (zero-user instances, upstream's
- * install-page admin-creation posture) and regular self-registration (the
- * `ALLOW_SIGNUP` gate). Deletion (2026-10-28): `deleteUserCascade`, the
+ * owns — the ONE-SHOT admin-init window (instances with no human user yet —
+ * the migration-seeded system service principals don't count, see the
+ * seeded-system premise below; upstream's install-page admin-creation
+ * posture) and regular self-registration (the `ALLOW_SIGNUP` gate).
+ * Deletion (2026-10-28): `deleteUserCascade`, the
  * admin DELETE surface's service — upstream's `DeleteUser` ladder over the
  * EXISTING repo cascade (section at the bottom of the file).
  *
@@ -29,10 +31,11 @@
  *
  * ## The one-shot window's atomicity (the §2 race argument)
  *
- * "Empty users table" is checked by the STATEMENT, not by a prior read:
+ * "No human user yet" is checked by the STATEMENT, not by a prior read:
  * the init insert is a single SQLite statement
  *
- *     INSERT INTO users (...) SELECT ... WHERE NOT EXISTS (SELECT 1 FROM users)
+ *     INSERT INTO users (...) SELECT ...
+ *     WHERE NOT EXISTS (SELECT 1 FROM users WHERE <non-system user>)
  *
  * D1 serializes writes to the one SQLite database, so two simultaneous
  * first-submissions run strictly one-after-another: the winner's insert
@@ -40,8 +43,27 @@
  * 0 — exactly one admin exists, and the loser reports
  * "already-initialized" (meta.changes == 0, the session.ts CAS convention).
  * A count-guarded pre-read would TOCTOU-race; this cannot. The window also
- * closes on ORG rows (`users` holds both types, SPEC-0007) — same semantics
- * as upstream's `HasUsers` over the unified user table.
+ * closes on ORG rows (`users` holds both types, SPEC-0007; an org only ever
+ * exists after a human created it) — same semantics as upstream's `HasUsers`
+ * over the unified user table.
+ *
+ * ## The seeded-system premise (the 2026-10-30 act_runner smoke, finding 4)
+ *
+ * The gate does NOT count the migration-seeded SYSTEM SERVICE PRINCIPALS:
+ * `assets` (migration 0003 — the SPEC-0008 name reservation, the smoke's
+ * window-closer) and `gitea:deploy-key` (migration 0020, upstream
+ * user_system.go:76 id -3, re-asserted on demand by api/services/
+ * deploy-keys.ts). Their codified row shape (schema.ts's deploy-keys doc:
+ * "the migration-0003 'assets' reservation row") is `status='prohibited'` +
+ * `is_admin=0` + no email — `NON_SYSTEM_USER_ROW` below is that shape's
+ * exact negation. Every HUMAN creation path stores a validated email and
+ * lands 'active' (the init insert here, registerUser, admin-t2
+ * adminCreateUser), and a later prohibit_login PATCH keeps the email — so a
+ * prohibit-logged human NEVER reopens the window (upstream's install lock
+ * never reopens; a bare active-count gate would). A freshly-migrated
+ * instance (seeds only, no humans) therefore still has its one-shot
+ * first-admin window open — the exact state the smoke found dead under the
+ * old "users table empty" gate.
  */
 
 import { asc, eq, inArray, or, sql } from "drizzle-orm";
@@ -220,13 +242,31 @@ async function insertAccountRow(
 }
 
 // ---------------------------------------------------------------------------
-// The admin-init window (zero users)
+// The admin-init window (no HUMAN user yet — the seeded system principals
+// don't count)
 // ---------------------------------------------------------------------------
 
-/** `true` when NO user row exists (individuals AND orgs — the unified
- *  upstream user table; module header). One indexed-exists probe. */
+/**
+ * SQL predicate: TRUE for a HUMAN (non-SYSTEM) user row — the init window's
+ * only counting unit (the seeded-system premise, module header). The shape
+ * it excludes is exactly the migration-seeded service principals'
+ * (`assets` 0003, `gitea:deploy-key` 0020): prohibited, non-admin, no
+ * email. Shared VERBATIM by `initWindowOpen`'s probe and the init insert's
+ * `NOT EXISTS` guard, so the GET and POST windows can never disagree.
+ */
+const NON_SYSTEM_USER_ROW = sql`(${users.status} <> 'prohibited' OR ${users.isAdmin} <> 0 OR ${users.email} IS NOT NULL)`;
+
+/** `true` while NO human user row exists (individuals AND orgs — the unified
+ *  upstream user table; module header). The migration-seeded system service
+ *  principals do NOT close the window. One exists-probe over the shared
+ *  predicate. */
 export async function initWindowOpen(d1: D1Database): Promise<boolean> {
-  const probe = await drizzle(d1).select({ id: users.id }).from(users).limit(1).get();
+  const probe = await drizzle(d1)
+    .select({ id: users.id })
+    .from(users)
+    .where(NON_SYSTEM_USER_ROW)
+    .limit(1)
+    .get();
   return probe === undefined;
 }
 
@@ -239,9 +279,10 @@ export type AdminInitOutcome =
  * The ONE-SHOT first-admin creation (upstream install `initAdminUser`,
  * routers/install/install.go:452–478: `IsAdmin: true`, active, then the
  * auto-login). Validation runs first (friendly inline errors for the
- * still-open window); the decision itself is the count-guarded single
- * statement (module header — the race argument). Returns the created row
- * (the caller mints the session, install.go:479–490 parity) or
+ * still-open window); the decision itself is the single existence-guarded
+ * statement (module header — the race argument, now over HUMAN rows: the
+ * seeded system principals never win the NOT EXISTS). Returns the created
+ * row (the caller mints the session, install.go:479–490 parity) or
  * "already-initialized" — the race loser's clear, terminal verdict.
  */
 export async function initializeAdminUser(
@@ -254,14 +295,15 @@ export async function initializeAdminUser(
 
   const now = options?.now ?? new Date();
   const lower = form.username.toLowerCase();
-  // The count-guarded insert: `meta.changes` is the whole verdict. D1
+  // The existence-guarded insert: `meta.changes` is the whole verdict. D1
   // serializes writers, so exactly one concurrent submission sees changes
-  // == 1 (module header).
+  // == 1 (module header). The guard rides the SAME NON_SYSTEM_USER_ROW
+  // predicate as `initWindowOpen` — GET and POST cannot disagree.
   const result = await drizzle(d1)
     .run(
       sql`INSERT INTO users (username, username_lower, email, display_name, is_admin, status, visibility, type, created_at)
           SELECT ${form.username}, ${lower}, ${form.email}, NULL, 1, 'active', 'public', 'user', ${Math.floor(now.getTime() / 1000)}
-          WHERE NOT EXISTS (SELECT 1 FROM ${users})`,
+          WHERE NOT EXISTS (SELECT 1 FROM ${users} WHERE ${NON_SYSTEM_USER_ROW})`,
     );
   if ((result.meta.changes ?? 0) === 0) {
     return { outcome: "already-initialized" };
