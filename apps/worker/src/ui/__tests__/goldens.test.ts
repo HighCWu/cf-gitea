@@ -43,6 +43,7 @@ import {
   badges,
   emailAddresses,
   oauth2Applications,
+  packageCleanupRules,
   repositories,
   userBadges,
   users,
@@ -227,6 +228,11 @@ const WIKI_GOLDEN_HOME_CONTENT = [
  */
 const ACTIONS_GOLDEN_GLOBAL_TOKEN = "a1f0c0ffee0a1f0c0ffee0a1f0c0ffee0a1f0c0ffe";
 const ACTIONS_GOLDEN_ORG_TOKEN = "b2e1d0dead0b2e1d0dead0b2e1d0dead0b2e1d0dea";
+/** The round-two scopes: alice's USER-scope token (repoId "") and the
+ *  REPO-scope token on the admin-golden fixture (normalization forces
+ *  ownerId 0 there — model.ts's normalizeTokenScope). */
+const ACTIONS_GOLDEN_USER_TOKEN = "c3d2e1feed0c3d2e1feed0c3d2e1feed0c3d2e1fee";
+const ACTIONS_GOLDEN_REPO_TOKEN = "d4e5f6cafe0d4e5f6cafe0d4e5f6cafe0d4e5f6caf";
 
 beforeAll(async () => {
   await drizzle(env.DB).update(users).set({ isAdmin: true }).where(eq(users.usernameLower, "morgan"));
@@ -673,6 +679,80 @@ beforeAll(async () => {
         ])
         .run();
     }
+
+    // The goldens-round-two scopes (this wave): the two REMAINING runners
+    // registration-token scopes and the org packages list's one cleanup
+    // rule — rows the three new cases render, first-read here, and inert
+    // for every committed golden:
+    //
+    //   - The USER-scope token (alice, repoId "") and the REPO-scope token
+    //     (ownerId 0, admin-golden) pin the token-panel inputs of the two
+    //     new runners goldens through the loader's ACTIVE-token reuse arm
+    //     (runner_token.go:127-134 — the constants block's argument); bare
+    //     GETs would otherwise MINT a crypto-random token per render. Scope
+    //     isolation keeps the committed runners goldens byte-still:
+    //     getLatestRunnerToken filters (ownerId, repoId), so the admin
+    //     list's (0, "") read and the org list's (acme, "") read never see
+    //     these rows.
+    //   - The cleanup rule is a DIRECT row insert because the landed writer
+    //     (org-settings-packages.tsx's add arm) stamps wall-clock
+    //     created/updated_unix; the pinned stamps keep the NOT NULL columns
+    //     fixture-honest even though the list page renders neither stamp
+    //     (determinism insurance for the loader's no-ORDER-BY read — D1's
+    //     rowid default order). Inert everywhere else:
+    //     package_cleanup_rules is first-read here (the admin stats COUNT
+    //     list has no package tables — verified against
+    //     loadAdminMonitorStats), and the admin packages page carries no
+    //     committed golden. History: the golden was EXCLUDED at first
+    //     landing because the real-route drive answered 404 — index.ts's
+    //     org-settings parse block had all four org-settings-packages*
+    //     arms nested INSIDE the org-actions-runners-delete if-body (the
+    //     ce76247 class; the module's loader-direct suite cannot see parse
+    //     reachability). The orchestrator's parse fix landed in-tree and
+    //     this golden rides it.
+    {
+      const aliceTokenOwner = await drizzle(env.DB)
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.usernameLower, "alice"))
+        .get();
+      if (aliceTokenOwner === undefined) throw new Error("alice row missing before the round-two token seeding");
+      const roundTwoTokens = await drizzle(env.DB).select({ token: actionRunnerTokens.token }).from(actionRunnerTokens).all();
+      if (!roundTwoTokens.some((row) => row.token === ACTIONS_GOLDEN_USER_TOKEN)) {
+        await drizzle(env.DB)
+          .insert(actionRunnerTokens)
+          .values({ token: ACTIONS_GOLDEN_USER_TOKEN, ownerId: aliceTokenOwner.id, repoId: "", isActive: true, created: t(0), updated: t(0) })
+          .run();
+      }
+      if (!roundTwoTokens.some((row) => row.token === ACTIONS_GOLDEN_REPO_TOKEN)) {
+        await drizzle(env.DB)
+          .insert(actionRunnerTokens)
+          .values({ token: ACTIONS_GOLDEN_REPO_TOKEN, ownerId: 0, repoId: artifactsRepoRow.id, isActive: true, created: t(0), updated: t(0) })
+          .run();
+      }
+      const acmeRules = await drizzle(env.DB)
+        .select({ id: packageCleanupRules.id })
+        .from(packageCleanupRules)
+        .where(eq(packageCleanupRules.ownerId, acmeOrgRow.id))
+        .all();
+      if (acmeRules.length === 0) {
+        await drizzle(env.DB)
+          .insert(packageCleanupRules)
+          .values({
+            enabled: true,
+            ownerId: acmeOrgRow.id,
+            type: "container",
+            keepCount: 5,
+            keepPattern: "^release-",
+            removeDays: 30,
+            removePattern: "",
+            matchFullName: false,
+            createdUnix: t(0),
+            updatedUnix: t(0),
+          })
+          .run();
+      }
+    }
   }
 });
 
@@ -1087,6 +1167,70 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   {
     file: "repo-actions-artifacts-preview.html",
     path: "/morgan/admin-golden/actions/artifacts/1/preview",
+    status: 200,
+    signedIn: true,
+    sessionUser: "morgan",
+  },
+  // ---------------------------------------------------------------------------
+  // The goldens-round-two batch (this wave): the two runners settings LIST
+  // pages plus the org packages management list, all through the real route
+  // path. Fixtures ride the beforeAll's round-two block above (the two
+  // ACTIVE token scopes + acme's one cleanup rule); NO new
+  // action_runners row may land — the admin list's "Total: 3" golden above
+  // counts EVERY runner row — so the runners pages render over the EXISTING
+  // census:
+  //
+  //   - repo-settings-actions-runners:
+  //     /morgan/admin-golden/settings/actions/runners signed in as morgan
+  //     (the repoActionsGate ladder — the shared settingsGate plus the
+  //     hasActions unit arm the artifacts block already armed on this same
+  //     fixture repo). The WithAvailable REPO scope lists the repo's own
+  //     runner (id 3 — the belongs-to tooltip "morgan/admin-golden" and THE
+  //     pencil, EditableInContext's repo arm) and the global runner (id 1 —
+  //     no pencil, the plain Global cell): "Total 2", both rows the
+  //     NULL-heartbeat Offline/Never arms (no TimeSince bytes — the
+  //     determinism seam), row ORDER the fixed id tiebreak (the default
+  //     sort's status rank is 2 for every row). The token panel input is
+  //     the FIXED repo-scope token (the seeded active row's reuse arm).
+  //   - user-settings-actions-runners: /user/settings/actions/runners
+  //     signed in as alice (the default session principal), the census C7
+  //     USER arm. The WithAvailable USER cond (owner_id = doer OR global —
+  //     runner.go:260-266) lists EXACTLY the global runner: the org- and
+  //     repo-scoped rows never surface ("Total 1", no pencil on the global
+  //     row — EditableInContext's owner arm), the shared UserSettingsNavbar
+  //     renders with active="runners" (the Actions disclosure open, the
+  //     72af05a fold), and the token panel input is the FIXED alice-scope
+  //     token.
+  //   - org-settings-packages: /acme/settings/packages signed in as morgan
+  //     (the require-owner prologue), SPEC-0016's staged management page.
+  //     The OrgHeader + OrgSettingsNavbar (active "packages" — the 6bf9c17
+  //     fold) over the one seeded rule row: the Container type name, the
+  //     Enabled arm, the keep-count / keep-pattern / remove-days bodies, and
+  //     the row's Edit + Preview links keyed on the rule's autoincrement id
+  //     (1 — the fresh file storage's first insert, the fixed seed order
+  //     precedent). No cargo section (the module's documented reduction) and
+  //     no timestamps — the created_unix pin in the fixture block is
+  //     determinism insurance, not a rendered byte. History: this golden was
+  //     EXCLUDED at first landing because the real-route drive answered 404 —
+  //     index.ts's parse block had the four org-settings-packages* arms
+  //     nested inside the org-actions-runners-delete if-body, so no length-4
+  //     /{org}/settings/packages path could ever reach them (the ce76247
+  //     class: the module's loader-direct suite cannot see parse
+  //     reachability; 6bf9c17 shipped with the routes 404ing in production).
+  //     The orchestrator's parse fix + the index.test.ts parse-table cases
+  //     landed in-tree, and this golden is its real-route proof.
+  // ---------------------------------------------------------------------------
+  {
+    file: "repo-settings-actions-runners.html",
+    path: "/morgan/admin-golden/settings/actions/runners",
+    status: 200,
+    signedIn: true,
+    sessionUser: "morgan",
+  },
+  { file: "user-settings-actions-runners.html", path: "/user/settings/actions/runners", status: 200, signedIn: true },
+  {
+    file: "org-settings-packages.html",
+    path: "/acme/settings/packages",
     status: 200,
     signedIn: true,
     sessionUser: "morgan",
