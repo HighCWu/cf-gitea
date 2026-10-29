@@ -146,6 +146,42 @@
  *                  verdict. A red run sweeps the fabricated TTL repo (D1
  *                  --local delete + the best-effort API delete — the
  *                  failureTail); the posture arms create nothing.
+ *   wiki-git       The v1.3 `*.wiki.git` WIRE round-trip over one PRIVATE
+ *                  probe repo: the wiki REST create (POST
+ *                  /api/v1/repos/.../wiki/new, content_base64) → a REAL
+ *                  `git clone …/{owner}/{repo}.wiki.git` (the p0 clone
+ *                  methodology, auth via http.extraHeader) carries the page's
+ *                  root commit (Home.md bytes verbatim, 1 commit, subject
+ *                  `Add "Home"`) → a wiki PUSH (append + commit + push to
+ *                  main) → the page API read-back carries the appended bytes
+ *                  → the privacy tail (anonymous info/refs 401 Basic
+ *                  challenge + anonymous ls-remote 128) → DELETE 204 and an
+ *                  authenticated ls-remote proves the wiki twin cell is dead
+ *                  at t+0 (it rode the repo purge). A red run sweeps the
+ *                  probe repo it created (the failureTail).
+ *   packages-registry The v1.3 /api/packages protocol families in ONE
+ *                  owner-scoped sweep (one probe repo fixture + the run PAT):
+ *                  the generic PUT/GET round-trip (+ DELETE version → 204 →
+ *                  404), the pypi twine multipart upload → the PEP 503
+ *                  simple index (anchor + #sha256=) → the file back verbatim,
+ *                  the npm couchdb publish PUT (the tarball attachment +
+ *                  sha512 integrity) → packument + dist-tags + version
+ *                  metadata + the tarball back verbatim → the whole-package
+ *                  unpublish (-rev → 200), the helm Chart.yaml tarball →
+ *                  index.yaml entries → the chart back verbatim, the maven
+ *                  pom+jar PUTs → the generated maven-metadata.xml → the jar
+ *                  back verbatim. Cleanup is SELF-CLEANING at the row layer:
+ *                  pypi/helm/maven expose no protocol delete, so a wrangler
+ *                  d1 sweep (the fixwave/demo D1-arm precedent; --d1-scope
+ *                  picks the database — needs wrangler auth) deletes the
+ *                  probe's package/version/file/property/blob ROWS in
+ *                  deletePackageAndReferences' cascade order and asserts zero
+ *                  rows remain; the R2 content keys are documented residue
+ *                  (the unreferenced-blob sweep is the SOLE content-key
+ *                  deleter, >24 h cleanup cadence). The probe repo DELETEs
+ *                  204 (packages are owner-scoped — the repo delete never
+ *                  touches them, which is exactly why the D1 sweep exists).
+ *                  A red run sweeps the rows + the repo (the failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -234,10 +270,11 @@
 /* global fetch, AbortSignal, URLSearchParams -- Web globals provided by Node >= 22 (no node: module exports them) */
 import { execFile } from "node:child_process";
 import console from "node:console";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { gzipSync } from "node:zlib";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -248,7 +285,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -340,6 +377,8 @@ const usage = () =>
   "  fixwave-parity: (no extra options — needs an ADMIN PAT + wrangler auth for the d1 arms; --d1-scope rides the rotation backdate)\n" +
   "  branch-protection: (no extra options — needs an ADMIN PAT for the member arm; the priority ids and the slash-glob arm are pure API now)\n" +
   "  demo:          --d1-scope local (against pnpm dev with DEMO_MODE=true in .dev.vars) runs the deep TTL-mechanics arm; a deployed target records an ops-note [info] there (the sweep log is not API-reachable). The banner arm warns until the M2 wave lands.\n" +
+  "  wiki-git:      (no extra options)\n" +
+  "  packages-registry: (no extra options — the row-cleanup arm reuses --d1-scope and needs wrangler auth, the fixwave precedent)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -3803,6 +3842,556 @@ const demoFailureCleanup = async (ctx) => {
   if (acts.length) log(`  [tail] demo-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
 };
 
+// ---------- battery: wiki-git (the *.wiki.git wire round-trip) ----------
+
+/**
+ * The v1.3 wiki git-HTTP surface (specs/wiki.md §3 — the sibling engine cell
+ * `owner/{slug}.wiki` served at `…/{owner}/{repo}.wiki.git`, git-http/parse.ts
+ * splitWikiRepoName + gate.ts's wiki family): the battery seeds one page
+ * through the LANDED wiki REST API (POST /api/v1/repos/{owner}/{repo}/wiki/new
+ * with content_base64 — no session-cookie dance needed, the PAT carries it),
+ * then drives the WIRE like p0 drives the code wire: a REAL authenticated
+ * clone of the .wiki.git URL carries the page's root commit (Home.md bytes
+ * verbatim, exactly 1 commit, the router-defaulted subject `Add "Home"`),
+ * an append commit PUSHES back (wiki pushes are served with the parent's
+ * write grant), the page API read-back carries the appended bytes, the
+ * privacy tail proves a PRIVATE parent's wiki twin challenges anonymous
+ * readers (info/refs 401 Basic + ls-remote 128), and the cleanup asserts the
+ * tombstone: DELETE 204 on the parent and the wiki cell is dead at t+0 (the
+ * cell rode deleteRepository's purge — no wiki residue).
+ *
+ * Fixtures: ONE private auto_init probe repo. A green run deletes it (the
+ * wiki cell cascades with it), so cleanup-audit needs no new expectations;
+ * a red run sweeps it (the failureTail).
+ */
+
+/** The Home page seeded through the wiki REST API. */
+const WIKI_HOME_TEXT = "# deploy-probes wiki-git probe\n";
+/** The line the push step appends (the read-back asserts it). */
+const WIKI_APPEND_TEXT = "Appended by the wiki-git push probe.\n";
+
+/** `repoCreated`/`repoFullName`/`repoGone` drive the failure-cleanup tail
+ *  (the generate-e2e shape): a red before wikigit-cleanup sweeps the probe
+ *  repo under the fullName the CREATE returned. */
+const wikiGitContext = () => ({
+  user: opts.user, repo: `wiki-${hexId()}`, wikiUrl: null, tmp: null,
+  repoCreated: false, repoFullName: null, repoGone: false,
+});
+
+const wikiGitFailureCleanup = async (ctx) => {
+  const acts = [];
+  if (ctx.repoCreated === true && ctx.repoGone !== true) {
+    const [owner, repo] = String(ctx.repoFullName ?? `${ctx.user}/${ctx.repo}`).split("/");
+    try {
+      const out = await deleteRepo(owner, repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      leftBehind.push(`repo ${owner}/${repo} (failure-cleanup tail: DELETE threw: ${err instanceof Error ? err.message : String(err)})`);
+      acts.push(`repo ${owner}/${repo} LEFT BEHIND — DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (acts.length) log(`  [tail] wikigit-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
+const wikiGitSteps = (ctx) => {
+  // Constructed lazily INSIDE the run functions: dry-run builds the step list
+  // with ctx.tmp still null (main owns the scratch dir's mkdtemp).
+  const cloneDir = () => path.join(ctx.tmp, "wiki-clone");
+  ctx.wikiUrl = `${opts.baseUrl ?? "https://<base-url>"}/${ctx.user}/${ctx.repo}.wiki.git`;
+  return [
+    {
+      id: "wikigit-create-repo-201",
+      expect: `POST /api/v1/user/repos {"name":"${ctx.repo}","private":true,"auto_init":true} → 201 (PRIVATE — the privacy tail needs the anonymous challenge)`,
+      run: async () => {
+        const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, private: true, auto_init: true } });
+        expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+        ctx.repoCreated = true; // the failure-cleanup tail deletes it if a later step reds
+        ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
+        return `created ${res.json?.full_name} (private, auto_init)`;
+      },
+    },
+    {
+      id: "wikigit-page-create-201",
+      expect: `POST /api/v1/repos/${ctx.user}/${ctx.repo}/wiki/new {"title":"Home","content_base64":…} → 201 with the title echoed + content_base64 round-tripping VERBATIM (the LANDED wiki REST writer seeds the page the wire serves)`,
+      run: async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.repo}/wiki/new`, {
+          method: "POST",
+          body: { title: "Home", content_base64: Buffer.from(WIKI_HOME_TEXT, "utf8").toString("base64") },
+        });
+        expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 160)}`);
+        expect(res.json?.title === "Home", `title ${JSON.stringify(res.json?.title)} (expected "Home")`);
+        const decoded = Buffer.from(String(res.json?.content_base64 ?? ""), "base64").toString("utf8");
+        expect(decoded === WIKI_HOME_TEXT, `content_base64 decoded ${JSON.stringify(decoded.slice(0, 60))} != the seeded bytes`);
+        return `201 — page "Home" created, content_base64 round-trips`;
+      },
+    },
+    {
+      id: "wikigit-clone-root-commit",
+      expect: `REAL git clone of ${ctx.user}/${ctx.repo}.wiki.git (authenticated via http.extraHeader; settle-polled advert, budget ${SETTLE_MS / 1000}s) → exit 0; Home.md carries the seeded bytes VERBATIM; exactly 1 commit (the root commit the first page write landed); subject = Add "Home" (the router-defaulted message)`,
+      run: async () => {
+        const up = await poll(SETTLE_MS, async () => {
+          const r = await lsRemote(ctx.wikiUrl, { auth: true });
+          return r.ok ? r : null;
+        });
+        expect(up !== null, `the wiki twin never answered an authenticated ls-remote within ${SETTLE_MS} ms (the API-created cell did not settle)`);
+        const dir = cloneDir();
+        const r = await git(["clone", ctx.wikiUrl, dir], undefined, { auth: true });
+        expect(r.ok, `clone .wiki.git failed (exit ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 240)}`);
+        const pageBytes = await readFile(path.join(dir, "Home.md"), "utf8");
+        expect(pageBytes === WIKI_HOME_TEXT, `Home.md ${JSON.stringify(pageBytes.slice(0, 60))} != the seeded bytes`);
+        const count = await git(["rev-list", "--count", "HEAD"], dir);
+        expect(count.stdout.trim() === "1", `commit count ${count.stdout.trim()} (expected 1 — the first page write lands the root commit)`);
+        const subj = await git(["log", "-1", "--format=%s"], dir);
+        expect(subj.stdout.trim() === `Add "Home"`, `subject ${JSON.stringify(subj.stdout.trim())} (expected Add "Home")`);
+        return `clone 0 — Home.md verbatim, 1 root commit, subject Add "Home"`;
+      },
+    },
+    {
+      id: "wikigit-push-append",
+      expect: `REAL git push to the wiki twin (append one line to Home.md, commit, push origin HEAD:refs/heads/main with the PAT) → exit 0 — wiki receives are SERVED and land in the cell (no parent settle)`,
+      run: async () => {
+        await writeFile(path.join(cloneDir(), "Home.md"), WIKI_HOME_TEXT + WIKI_APPEND_TEXT);
+        let r = await git(["add", "-A"], cloneDir());
+        expect(r.ok, `git add failed: ${r.stderr.trim()}`);
+        r = await git(["-c", "user.name=cf-gitea-probes", "-c", "user.email=probes@cf-gitea.invalid",
+          "commit", "-m", "deploy-probes: wiki append probe"], cloneDir());
+        expect(r.ok, `git commit failed: ${r.stderr.trim()}`);
+        r = await git(["push", "origin", "HEAD:refs/heads/main"], cloneDir(), { auth: true });
+        expect(r.ok, `push to .wiki.git failed (exit ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+        return `push 0 — the append landed on main in the ${ctx.user}/${ctx.repo}.wiki cell`;
+      },
+    },
+    {
+      id: "wikigit-read-back-appended",
+      expect: `GET /api/v1/repos/${ctx.user}/${ctx.repo}/wiki/page/Home → 200 (settle-polled, budget ${SETTLE_MS / 1000}s) with content_base64 decoding to the ORIGINAL bytes + the pushed append — the wire push and the service read walk the SAME cell`,
+      run: async () => {
+        const res = await poll(SETTLE_MS, async () => {
+          const r = await api(`/repos/${ctx.user}/${ctx.repo}/wiki/page/Home`);
+          return r.status === 200 ? r : null;
+        });
+        expect(res !== null, `GET wiki/page/Home never answered 200 within ${SETTLE_MS} ms`);
+        const decoded = Buffer.from(String(res.json?.content_base64 ?? ""), "base64").toString("utf8");
+        expect(decoded === WIKI_HOME_TEXT + WIKI_APPEND_TEXT,
+          `read-back ${JSON.stringify(decoded.slice(0, 120))} != the seeded + appended bytes`);
+        return `content_base64 carries the appended bytes — push → cell → page read agree`;
+      },
+    },
+    {
+      id: "wikigit-privacy-anon",
+      expect: `the PRIVATE parent's wiki twin stays private: anonymous info/refs → 401 Basic challenge, anonymous ls-remote → exit 128 (the gate resolves ${ctx.user}/${ctx.repo}.wiki to the PARENT's visibility)`,
+      run: async () => {
+        const refs = await fetchT(`${ctx.wikiUrl}/info/refs?service=git-upload-pack`);
+        await refs.text();
+        expect(refs.status === 401, `anonymous info/refs status ${refs.status} (expected 401 — the parent is private)`);
+        const wwwAuth = String(refs.headers.get("www-authenticate") ?? "");
+        expect(wwwAuth.includes("Basic"), `anonymous info/refs www-authenticate ${wwwAuth} (expected a Basic challenge)`);
+        const lr = await lsRemote(ctx.wikiUrl);
+        expect(lr.code === 128, `anonymous ls-remote exit ${lr.code} (expected 128)`);
+        expect(/authentication failed/i.test(lr.stderr),
+          `anonymous ls-remote stderr ${lr.stderr.trim().slice(0, 200)} (expected an authentication failure)`);
+        return `info/refs 401 (${wwwAuth}), ls-remote 128 — the wiki twin inherits the parent's privacy`;
+      },
+    },
+    {
+      id: "wikigit-cleanup-tombstone",
+      expect: `DELETE /api/v1/repos/${ctx.user}/${ctx.repo} → 204, and the AUTHENTICATED ls-remote on the .wiki.git URL is dead AT T+0 (exit 128, 'repository not found') — the wiki cell rode the repo purge, no residue`,
+      run: async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.repo}`, { method: "DELETE" });
+        expect(res.status === 204, `status ${res.status} (expected 204)`);
+        ctx.repoGone = true;
+        const lr = await lsRemote(ctx.wikiUrl, { auth: true });
+        expect(lr.code === 128, `post-delete ls-remote exit ${lr.code} (expected 128 — a 0 here means the wiki cell survived the purge)`);
+        // Git relays the server's message on the "remote:" line and echoes its
+        // own "fatal: repository '<url>' not found"; both spellings carry the
+        // phrase, only the capitalization differs.
+        expect(/repository not found/i.test(lr.stderr),
+          `post-delete ls-remote stderr ${lr.stderr.trim().slice(0, 200)} (expected 'repository not found')`);
+        return `204; the wiki twin is dead at t+0 — the cell rode the repo purge`;
+      },
+    },
+  ];
+};
+
+// ---------- battery: packages-registry (the /api/packages protocol families) ----------
+
+/**
+ * The v1.3 package-registry sweep (SPEC-0016 M3/M4 — the five protocol
+ * families over ONE owner-scoped fixture set: a public probe repo as the
+ * owner vehicle + the run PAT, which carries write:package via `all`):
+ *
+ *   - generic  PUT /api/packages/{u}/generic/{name}/{version}/{file} → 201,
+ *              GET → the bytes verbatim, DELETE version → 204, GET → 404.
+ *   - pypi     twine's multipart POST (name/version fields + the `content`
+ *              file part + sha256_digest, services/packages/pypi.ts's
+ *              streamed scan) → 201, the PEP 503 simple index carries the
+ *              anchor with #sha256=, the file download decodes verbatim.
+ *   - npm      the couchdb publish PUT (versions map + the base64 _attachments
+ *              tarball + dist.integrity sha512) → 201, packument + dist-tags
+ *              + version metadata answer the publish, the tarball download
+ *              decodes verbatim, the whole-package unpublish (-rev) → 200.
+ *   - helm     a hand-built ustar+gzip Chart.yaml archive (`<chart>/Chart.yaml`,
+ *              exactly one slash — the scanner's rule) POSTs to
+ *              /helm/api/charts → 201, index.yaml lists the entry, the
+ *              canonical .tgz download decodes verbatim.
+ *   - maven    the pom PUT (a minimal <project> XML — the metadata parse)
+ *              + the jar PUT → 201/201, the GENERATED maven-metadata.xml
+ *              answers the coordinates, the jar download decodes verbatim.
+ *
+ * Self-cleaning: the repo DELETEs 204, but packages are OWNER-scoped rows
+ * (the repo delete never touches them) and pypi/helm/maven expose no
+ * protocol delete — so the battery also sweeps its probe ROWS through
+ * wrangler d1 (the fixwave/demo D1-arm precedent; --d1-scope picks the
+ * database; needs wrangler auth) in deletePackageAndReferences' cascade
+ * order, then asserts zero package rows remain for the probe names. The R2
+ * content keys are DOCUMENTED RESIDUE: the unreferenced-blob sweep (the
+ * cleanup queue, >24 h) is by design the SOLE content-key deleter —
+ * row deletes never touch R2 (packages/model.ts deletePackageAndReferences
+ * docstring). A red run sweeps the rows + the repo (the failureTail).
+ */
+
+/** One minimal ustar archive of regular files (`tarBytes({name: bytes})`) —
+ *  512-byte headers, 8-space checksum placeholder filled the POSIX way, two
+ *  zero end blocks. Enough for the helm scanner and the npm tarball scan. */
+const tarBytes = (entries) => {
+  const blocks = [];
+  for (const [name, content] of entries) {
+    const header = Buffer.alloc(512);
+    header.write(name, 0);
+    header.write("0000644\0", 100); // mode
+    header.write("0000000\0", 108); // uid
+    header.write("0000000\0", 116); // gid
+    header.write(`${content.length.toString(8).padStart(11, "0")}\0`, 124); // size (octal)
+    header.write("00000000000\0", 136); // mtime
+    header.write("        ", 148); // checksum placeholder (8 spaces, summed)
+    header.write("0", 156); // typeflag: regular file
+    header.write("ustar\0", 257); // magic
+    header.write("00", 263); // version
+    let sum = 0;
+    for (const byte of header) sum += byte;
+    header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148);
+    const pad = Buffer.alloc((512 - (content.length % 512)) % 512);
+    blocks.push(header, content, pad);
+  }
+  blocks.push(Buffer.alloc(1024)); // the two zero end blocks
+  return Buffer.concat(blocks);
+};
+
+const shaHex = (algorithm, bytes) => createHash(algorithm).update(bytes).digest("hex");
+
+/** Twine's multipart form: small text fields + the `content` file part
+ *  (pypi.ts's scan reads exactly this shape). */
+const twineMultipart = (fields, filename, fileBytes) => {
+  const boundary = `probe-boundary-${hexId(16)}`;
+  const parts = [];
+  for (const [name, value] of Object.entries(fields)) {
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, "utf8"));
+  }
+  parts.push(Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="content"; filename="${filename}"\r\n` +
+    `Content-Type: application/octet-stream\r\n\r\n`,
+    "utf8",
+  ));
+  parts.push(fileBytes, Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"));
+  return { contentType: `multipart/form-data; boundary=${boundary}`, body: Buffer.concat(parts) };
+};
+
+/** The protocol families' raw-body PUT/POST/GET (the Authorization rides the
+ *  run PAT; Content-Length is REQUIRED by every write arm — fetch sets it
+ *  for a Buffer body). `raw` skips the api() JSON wrapper. */
+const pkgFetch = async (apiPath, { method = "GET", body } = {}) => {
+  const res = await fetchT(`${opts.baseUrl}/api/packages${apiPath}`, {
+    method,
+    headers: { authorization: `token ${TOKEN}` },
+    ...(body === undefined ? {} : { body }),
+  });
+  const bytes = Buffer.from(await res.arrayBuffer());
+  return { status: res.status, bytes, text: bytes.toString("utf8"), headers: res.headers };
+};
+
+/** `repoCreated`/`repoGone` + `packageNames`/`rowsSwept` drive the
+ *  failure-cleanup tail: a red run sweeps the probe's package ROWS (D1) and
+ *  deletes the probe repo under the fullName the CREATE returned. */
+const packagesContext = () => ({
+  user: opts.user, repo: `pkg-${hexId()}`, tmp: null,
+  repoCreated: false, repoFullName: null, repoGone: false,
+  packageNames: [], rowsSwept: false,
+});
+
+/** The package-ROW sweep (the self-cleaning contract; see the battery doc):
+ *  deletePackageAndReferences' cascade order in wrangler-d1 statements scoped
+ *  to the probe's names under the run user, then a zero-rows assert.
+ *  Returns the action lines for the [pass]/[tail] details; throws on failure
+ *  (the in-chain step wants the red; the failureTail catches). */
+const packagesDeleteProbeRows = async (ctx) => {
+  const names = ctx.packageNames;
+  if (names.length === 0) return [];
+  const nameList = names.map((n) => `'${n}'`).join(", ");
+  const ownerClause = `owner_id = (SELECT id FROM users WHERE username_lower = '${opts.user}')`;
+  const results = (parsed) => parsed.at(-1)?.results ?? [];
+  const ids = (rows, key) => [...new Set(rows.map((row) => row[key]).filter((v) => v !== null && v !== undefined))];
+  const inList = (list) => (list.length > 0 ? `IN (${list.join(",")})` : "IN (-1)");
+  const pids = ids(results(await d1Exec(`SELECT id FROM packages WHERE ${ownerClause} AND name IN (${nameList})`)), "id");
+  if (pids.length === 0) return ["no package rows found for the probe names (already clean)"];
+  const vids = ids(results(await d1Exec(`SELECT id FROM package_versions WHERE package_id ${inList(pids)}`)), "id");
+  const fileRows = results(await d1Exec(`SELECT id, blob_id FROM package_files WHERE version_id ${inList(vids)}`));
+  const fids = ids(fileRows, "id");
+  const bids = ids(fileRows, "blob_id");
+  // The property cascade: 0=version / 1=file / 2=package (upstream's iota).
+  if (fids.length > 0) await d1Exec(`DELETE FROM package_properties WHERE ref_type = 1 AND ref_id ${inList(fids)}`);
+  if (vids.length > 0) await d1Exec(`DELETE FROM package_properties WHERE ref_type = 0 AND ref_id ${inList(vids)}`);
+  await d1Exec(`DELETE FROM package_properties WHERE ref_type = 2 AND ref_id ${inList(pids)}`);
+  if (fids.length > 0) await d1Exec(`DELETE FROM package_files WHERE id ${inList(fids)}`);
+  if (vids.length > 0) await d1Exec(`DELETE FROM package_versions WHERE id ${inList(vids)}`);
+  await d1Exec(`DELETE FROM packages WHERE id ${inList(pids)}`);
+  // Blob rows only when no file references them (dedup makes sharing legal).
+  if (bids.length > 0) {
+    await d1Exec(`DELETE FROM package_blobs WHERE id ${inList(bids)} AND id NOT IN (SELECT blob_id FROM package_files)`);
+  }
+  const left = results(await d1Exec(`SELECT COUNT(*) AS n FROM packages WHERE ${ownerClause} AND name IN (${nameList})`))[0]?.n;
+  expect(left === 0, `${left} probe package rows survived the sweep`);
+  return [
+    `${pids.length} package(s) / ${vids.length} version(s) / ${fids.length} file(s) / ${bids.length} blob row(s) deleted via D1 (--${opts.d1Scope})`,
+  ];
+};
+
+const packagesFailureCleanup = async (ctx) => {
+  const acts = [];
+  if (ctx.rowsSwept !== true && ctx.packageNames.length > 0) {
+    try {
+      acts.push(...(await packagesDeleteProbeRows(ctx)));
+    } catch (err) {
+      leftBehind.push(`package rows ${ctx.packageNames.join(", ")} (failure-cleanup tail: ${err instanceof Error ? err.message : String(err)})`);
+      acts.push(`package-row sweep FAILED — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (ctx.repoCreated === true && ctx.repoGone !== true) {
+    const [owner, repo] = String(ctx.repoFullName ?? `${ctx.user}/${ctx.repo}`).split("/");
+    try {
+      const out = await deleteRepo(owner, repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      leftBehind.push(`repo ${owner}/${repo} (failure-cleanup tail: DELETE threw: ${err instanceof Error ? err.message : String(err)})`);
+      acts.push(`repo ${owner}/${repo} LEFT BEHIND — DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (acts.length) log(`  [tail] pkg-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
+const packagesSteps = (ctx) => {
+  // Per-family fixture names — ALL registered for the D1 row sweep.
+  const genericName = `probe-generic-${hexId()}`, genericVersion = "1.0.0", genericFile = `probe-${hexId()}.bin`;
+  const pypiName = `probe-pypi-${hexId()}`, pypiVersion = "1.0.0";
+  const pypiFile = `${pypiName.replace(/-/g, "_")}-${pypiVersion}-py3-none-any.whl`;
+  const npmName = `probe-npm-${hexId()}`, npmVersion = "1.0.0";
+  const helmName = `probe-helm-${hexId()}`, helmVersion = "1.0.0";
+  const mavenGroup = "com.example", mavenArtifact = `probe-maven-${hexId()}`, mavenVersion = "1.0.0";
+  ctx.packageNames = [genericName, pypiName, npmName, helmName, `${mavenGroup}:${mavenArtifact}`];
+  const genericBytes = Buffer.from(`deploy-probes generic round-trip ${genericName}\n`, "utf8");
+  const pypiBytes = Buffer.from(`deploy-probes pypi wheel payload for ${pypiName}\n`, "utf8");
+  const jarBytes = Buffer.from(`deploy-probes maven jar payload for ${mavenArtifact}\n`, "utf8");
+  // npm tarball: package/package.json (one slash — the scan's script arm).
+  const npmTarball = gzipSync(tarBytes([[
+    "package/package.json",
+    Buffer.from(JSON.stringify({ name: npmName, version: npmVersion, main: "index.js" }), "utf8"),
+  ]]));
+  // helm chart: <chart>/Chart.yaml with exactly one slash (the scanner's rule).
+  const chartTarball = gzipSync(tarBytes([[
+    `${helmName}/Chart.yaml`,
+    Buffer.from(
+      `apiVersion: v2\nname: ${helmName}\nversion: ${helmVersion}\ntype: application\ndescription: deploy-probes helm chart probe\n`,
+      "utf8",
+    ),
+  ]]));
+  const pomXml = [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<project>`,
+    `  <groupId>${mavenGroup}</groupId>`,
+    `  <artifactId>${mavenArtifact}</artifactId>`,
+    `  <version>${mavenVersion}</version>`,
+    `  <name>deploy-probes maven probe</name>`,
+    `</project>`,
+  ].join("\n");
+  return [
+    {
+      id: "pkg-create-repo-201",
+      expect: `POST /api/v1/user/repos {"name":"${ctx.repo}","auto_init":true} → 201 (the owner fixture vehicle — packages are OWNER-scoped rows, the repo only proves coexistence)`,
+      run: async () => {
+        const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, private: false, auto_init: true } });
+        expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+        ctx.repoCreated = true; // the failure-cleanup tail deletes it if a later step reds
+        ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
+        return `created ${res.json?.full_name}`;
+      },
+    },
+    {
+      id: "pkg-generic-roundtrip",
+      expect: `generic: PUT /generic/${genericName}/${genericVersion}/${genericFile} → 201; GET → the bytes VERBATIM; DELETE version → 204; GET → 404`,
+      run: async () => {
+        const put = await pkgFetch(`/${ctx.user}/generic/${genericName}/${genericVersion}/${genericFile}`, { method: "PUT", body: genericBytes });
+        expect(put.status === 201, `PUT status ${put.status} (expected 201): ${put.text.slice(0, 120)}`);
+        const get = await pkgFetch(`/${ctx.user}/generic/${genericName}/${genericVersion}/${genericFile}`);
+        expect(get.status === 200, `GET status ${get.status} (expected 200)`);
+        expect(get.bytes.equals(genericBytes), `GET bytes != the uploaded bytes (${get.bytes.length} vs ${genericBytes.length})`);
+        const del = await pkgFetch(`/${ctx.user}/generic/${genericName}/${genericVersion}`, { method: "DELETE" });
+        expect(del.status === 204, `DELETE status ${del.status} (expected 204)`);
+        const gone = await pkgFetch(`/${ctx.user}/generic/${genericName}/${genericVersion}/${genericFile}`);
+        expect(gone.status === 404, `post-delete GET status ${gone.status} (expected 404)`);
+        return `PUT 201 → GET verbatim → DELETE 204 → GET 404`;
+      },
+    },
+    {
+      id: "pkg-pypi-upload-simple-index",
+      expect: `pypi: twine multipart POST /pypi (name/version/sha256_digest + the content part) → 201; GET /pypi/simple/${pypiName} → 200 text/html with the anchor carrying #sha256=<digest>; GET the file → the bytes VERBATIM`,
+      run: async () => {
+        const digest = shaHex("sha256", pypiBytes);
+        const form = twineMultipart(
+          { name: pypiName, version: pypiVersion, sha256_digest: digest },
+          pypiFile,
+          pypiBytes,
+        );
+        const put = await fetchT(`${opts.baseUrl}/api/packages/${ctx.user}/pypi`, {
+          method: "POST",
+          headers: { authorization: `token ${TOKEN}`, "content-type": form.contentType },
+          body: form.body,
+        });
+        const putText = Buffer.from(await put.arrayBuffer()).toString("utf8");
+        expect(put.status === 201, `upload status ${put.status} (expected 201): ${putText.slice(0, 120) || "(empty body)"}`);
+        const index = await pkgFetch(`/${ctx.user}/pypi/simple/${pypiName}`);
+        expect(index.status === 200, `simple-index status ${index.status} (expected 200)`);
+        expect(String(index.headers.get("content-type") ?? "").includes("text/html"),
+          `simple-index content-type ${JSON.stringify(index.headers.get("content-type"))} (expected text/html)`);
+        expect(index.text.includes(`Links for ${pypiName}`), `simple-index missing the "Links for" heading`);
+        expect(index.text.includes(`#sha256=${digest}`), `simple-index anchor missing #sha256=${digest.slice(0, 12)}…`);
+        expect(index.text.includes(pypiFile), `simple-index anchor missing the filename ${pypiFile}`);
+        const file = await pkgFetch(`/${ctx.user}/pypi/files/${pypiName}/${pypiVersion}/${pypiFile}`);
+        expect(file.status === 200, `file GET status ${file.status} (expected 200)`);
+        expect(file.bytes.equals(pypiBytes), `file bytes != the uploaded bytes`);
+        return `upload 201; simple index anchors the file at #sha256=${digest.slice(0, 12)}…; download verbatim`;
+      },
+    },
+    {
+      id: "pkg-npm-publish-packument",
+      expect: `npm: couchdb publish PUT /npm/${npmName} (versions map + base64 _attachments tarball + dist.integrity sha512) → 201; packument + dist-tags + version metadata answer the publish; the tarball download decodes verbatim; the whole-package unpublish (-rev) → 200`,
+      run: async () => {
+        const integrity = `sha512-${createHash("sha512").update(npmTarball).digest("base64")}`;
+        const doc = {
+          _id: npmName,
+          name: npmName,
+          description: "deploy-probes npm publish probe",
+          "dist-tags": { latest: npmVersion },
+          versions: {
+            [npmVersion]: {
+              _id: `${npmName}@${npmVersion}`,
+              name: npmName,
+              version: npmVersion,
+              description: "deploy-probes npm publish probe",
+              dist: { integrity, shasum: shaHex("sha1", npmTarball) },
+            },
+          },
+          _attachments: {
+            [`${npmName}-${npmVersion}.tgz`]: {
+              content_type: "application/octet-stream",
+              data: npmTarball.toString("base64"),
+              length: npmTarball.length,
+            },
+          },
+        };
+        const put = await fetchT(`${opts.baseUrl}/api/packages/${ctx.user}/npm/${encodeURIComponent(npmName)}`, {
+          method: "PUT",
+          headers: { authorization: `token ${TOKEN}`, "content-type": "application/json" },
+          body: JSON.stringify(doc),
+        });
+        const putText = Buffer.from(await put.arrayBuffer()).toString("utf8");
+        expect(put.status === 201, `publish status ${put.status} (expected 201): ${putText.slice(0, 120) || "(empty body)"}`);
+        const packument = await pkgFetch(`/${ctx.user}/npm/${encodeURIComponent(npmName)}`);
+        expect(packument.status === 200, `packument status ${packument.status} (expected 200)`);
+        const pjson = JSON.parse(packument.text);
+        expect(pjson?.name === npmName, `packument name ${JSON.stringify(pjson?.name)} (expected ${npmName})`);
+        expect(pjson?.versions?.[npmVersion] !== undefined, `packument missing versions.${npmVersion}`);
+        const tags = await pkgFetch(`/${ctx.user}/npm/-/package/${encodeURIComponent(npmName)}/dist-tags`);
+        expect(tags.status === 200 && JSON.parse(tags.text).latest === npmVersion,
+          `dist-tags ${tags.status} ${tags.text.slice(0, 80)} (expected latest ${npmVersion})`);
+        const meta = await pkgFetch(`/${ctx.user}/npm/${encodeURIComponent(npmName)}/${npmVersion}`);
+        expect(meta.status === 200, `version-metadata status ${meta.status} (expected 200)`);
+        const tarball = await pkgFetch(`/${ctx.user}/npm/${encodeURIComponent(npmName)}/-/${encodeURIComponent(`${npmName}-${npmVersion}.tgz`)}`);
+        expect(tarball.status === 200, `tarball GET status ${tarball.status} (expected 200)`);
+        expect(tarball.bytes.equals(npmTarball), `tarball bytes != the attachment (${tarball.bytes.length} vs ${npmTarball.length})`);
+        const unpublish = await pkgFetch(`/${ctx.user}/npm/${encodeURIComponent(npmName)}/-rev/revision-1`, { method: "DELETE" });
+        expect(unpublish.status === 200, `unpublish status ${unpublish.status} (expected 200)`);
+        const gone = await pkgFetch(`/${ctx.user}/npm/${encodeURIComponent(npmName)}`);
+        expect(gone.status === 404, `post-unpublish packument status ${gone.status} (expected 404)`);
+        return `publish 201; packument + dist-tags + metadata + tarball agree; unpublish 200 → packument 404`;
+      },
+    },
+    {
+      id: "pkg-helm-chart-index",
+      expect: `helm: POST /helm/api/charts with the <chart>/Chart.yaml tarball → 201; GET /helm/index.yaml → 200 listing ${helmName} ${helmVersion}; GET the canonical .tgz → the archive VERBATIM`,
+      run: async () => {
+        const put = await fetchT(`${opts.baseUrl}/api/packages/${ctx.user}/helm/api/charts`, {
+          method: "POST",
+          headers: { authorization: `token ${TOKEN}`, "content-type": "application/octet-stream" },
+          body: chartTarball,
+        });
+        const putText = Buffer.from(await put.arrayBuffer()).toString("utf8");
+        expect(put.status === 201, `chart upload status ${put.status} (expected 201): ${putText.slice(0, 160) || "(empty body)"}`);
+        const index = await pkgFetch(`/${ctx.user}/helm/index.yaml`);
+        expect(index.status === 200, `index.yaml status ${index.status} (expected 200)`);
+        expect(index.text.includes("entries:"), `index.yaml missing the entries: root`);
+        expect(index.text.includes(`name: ${helmName}`), `index.yaml missing the chart name`);
+        expect(index.text.includes(helmVersion), `index.yaml missing the version ${helmVersion}`);
+        const chartFile = `${helmName}-${helmVersion}.tgz`;
+        expect(index.text.includes(chartFile), `index.yaml missing the canonical filename ${chartFile}`);
+        const chart = await pkgFetch(`/${ctx.user}/helm/${chartFile}`);
+        expect(chart.status === 200, `chart GET status ${chart.status} (expected 200)`);
+        expect(chart.bytes.equals(chartTarball), `chart bytes != the uploaded archive`);
+        return `upload 201; index.yaml lists ${helmName} ${helmVersion}; download verbatim`;
+      },
+    },
+    {
+      id: "pkg-maven-pom-metadata-jar",
+      expect: `maven: PUT the .pom (minimal <project> XML) → 201, PUT the .jar → 201; GET maven-metadata.xml → 200 text/xml with the coordinates + version; GET the jar → the bytes VERBATIM`,
+      run: async () => {
+        const base = `/${ctx.user}/maven/${mavenGroup.replace(/\./g, "/")}/${mavenArtifact}`;
+        const pom = await pkgFetch(`${base}/${mavenVersion}/${mavenArtifact}-${mavenVersion}.pom`, { method: "PUT", body: Buffer.from(pomXml, "utf8") });
+        expect(pom.status === 201, `pom PUT status ${pom.status} (expected 201): ${pom.text.slice(0, 120)}`);
+        const jar = await pkgFetch(`${base}/${mavenVersion}/${mavenArtifact}-${mavenVersion}.jar`, { method: "PUT", body: jarBytes });
+        expect(jar.status === 201, `jar PUT status ${jar.status} (expected 201): ${jar.text.slice(0, 120)}`);
+        const meta = await pkgFetch(`${base}/maven-metadata.xml`);
+        expect(meta.status === 200, `metadata.xml status ${meta.status} (expected 200)`);
+        expect(String(meta.headers.get("content-type") ?? "").includes("text/xml"),
+          `metadata content-type ${JSON.stringify(meta.headers.get("content-type"))} (expected text/xml)`);
+        expect(meta.text.includes(`<groupId>${mavenGroup}</groupId>`), `metadata missing <groupId>`);
+        expect(meta.text.includes(`<artifactId>${mavenArtifact}</artifactId>`), `metadata missing <artifactId>`);
+        expect(meta.text.includes(`<version>${mavenVersion}</version>`), `metadata missing <version>`);
+        expect(meta.text.includes(`<latest>${mavenVersion}</latest>`), `metadata missing <latest>`);
+        const got = await pkgFetch(`${base}/${mavenVersion}/${mavenArtifact}-${mavenVersion}.jar`);
+        expect(got.status === 200, `jar GET status ${got.status} (expected 200)`);
+        expect(got.bytes.equals(jarBytes), `jar bytes != the uploaded bytes`);
+        return `pom + jar 201; maven-metadata.xml answers the coordinates; jar download verbatim`;
+      },
+    },
+    {
+      id: "pkg-cleanup-rows-d1",
+      expect: `the row sweep (wrangler d1 --${opts.d1Scope}; needs wrangler auth): the probe's package/version/file/property/blob ROWS delete in deletePackageAndReferences' cascade order, then zero package rows remain for the probe names — the R2 content keys are DOCUMENTED residue (the unreferenced-blob sweep is the SOLE content-key deleter, >24 h cleanup cadence)`,
+      run: async () => {
+        const acts = await packagesDeleteProbeRows(ctx);
+        ctx.rowsSwept = true; // the failure tail no-ops on a green sweep
+        return `${acts.join("; ")} — rows gone; R2 content keys ride the cleanup queue`;
+      },
+    },
+    {
+      id: "pkg-cleanup-repo-204",
+      expect: `DELETE /api/v1/repos/${ctx.user}/${ctx.repo} → 204 (the owner vehicle leaves; the package rows were already swept — the repo delete never touches them)`,
+      run: async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.repo}`, { method: "DELETE" });
+        expect(res.status === 204, `status ${res.status} (expected 204)`);
+        ctx.repoGone = true;
+        return "204";
+      },
+    },
+  ];
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -3926,11 +4515,21 @@ const BATTERIES = {
   // local-only (--d1-scope local against pnpm dev; a deployed target
   // records the ops-note [info] and never writes D1).
   "demo": { title: "demo posture (SPEC-0014: config machinery + DEMO_MODE-off default, open signup, the §4.4 banner [warns pre-M2], the 72 h TTL mechanics — the deep arm local-only)", context: demoContext, steps: demoSteps, failureTail: demoFailureCleanup, independent: true },
+  // Chained (the shared-fixture shape — a red before the cleanup skips the
+  // arms that need the fixtures, like registry/generate). The v1.3 wiki
+  // wire: REST create → real .wiki.git clone → push → page read-back →
+  // private-parent privacy tail → the purge tombstone.
+  "wiki-git": { title: "wiki git wire (v1.3: REST page create → real .wiki.git clone carries the root commit → the append push → page read-back → the anonymous 401 tail → the purge tombstone)", context: wikiGitContext, steps: wikiGitSteps, failureTail: wikiGitFailureCleanup },
+  // Chained over the five protocol families; the row-cleanup arm rides the
+  // wrangler D1 plumbing (--d1-scope picks the database, wrangler auth
+  // required — the fixwave/branch-protection precedent). The R2 content-key
+  // residue is documented in the battery header.
+  "packages-registry": { title: "packages registry (v1.3: generic round-trip + delete, pypi multipart → simple index, npm publish → packument → unpublish, helm chart → index.yaml, maven pom/jar → metadata.xml, then the D1 row sweep + repo delete)", context: packagesContext, steps: packagesSteps, failureTail: packagesFailureCleanup },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 
