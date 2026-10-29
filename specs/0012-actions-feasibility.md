@@ -899,9 +899,18 @@ post-dating the §7 table:
   `MustEnableActions` per web.go:1262-1265's own comment — the disabled
   unit's re-entry; the bare `/settings/actions` redirect 303s to
   `./actions/general` INSIDE the gate; FormBool faithful). The
-  token-permissions + collaborative-owners sections are
-  documented-unrendered (the ActionsConfig store needs its migration — cites
-  pinned in the commit).
+  token-permissions + collaborative-owners sections shipped
+  documented-unrendered at 6fcb561 (the ActionsConfig store then needed its
+  migration — cites pinned in the commit); RESOLVED as-built 97cb70e: the
+  ActionsConfig store over `repo_units.config` (migration 0043 — nullable,
+  NULL = upstream's nil-Config unit) serialized in upstream's exact
+  Go-marshal RepoUnit.Config shape (`models/repo/repo_unit.go:32`,
+  `repo_unit_actions.go:76-93` — CollaborativeOwnerIDs,
+  TokenPermissionMode, MaxTokenPermissions, OverrideOwnerConfig, the
+  workflow-disable maps), the two sections now rendering over the store
+  and persisting through the page's POST arm; the column's lifetime rides
+  the unit-toggle lockstep (the disable arm deletes the actions row,
+  wiping config — upstream ActionsUnitPost's reset).
 - **The five-family window — 0c8da44**: the Actions tab mounts. C1's runs
   list (the `?run_ids` partial-refresh fragment, MustBeNotEmpty + unit
   gates); C2's run-viewer subtree (the mount div + the ViewResponse JSON
@@ -931,9 +940,21 @@ post-dating the §7 table:
   creation batch, so they can never diverge; pre-flip repos untouched
   (creation-time writes only, upstream's shape). This is the posture M2's
   guide prose was corrected against.
+- **The harvest-window closures (2026-10-30)** — the admin actions tails
+  b5923ed (the survey's named opportunistic target: the admin runners
+  family over the M1a store with upstream's ADMIN polarity — the empty
+  cond lists EVERY runner, globals listed and editable — plus the global
+  variables family and the bare group's relative 303; scoped-workflows an
+  honest 404 with the nav item omitted); and the survey's F row COMPLETE
+  1ff87d1: the F-row tail GETs all mounted — the job-scoped log download
+  (raw bytes re-issued over M1b's chunk store/R2, the C2 read ladder), the
+  run→workflow-file 303 (upstream's Base.Redirect), the shields-style
+  badge.svg (both templates ported, anonymous-passing per the C1 ladder),
+  and the dispatch-inputs HTML fragment (46/46 module + 327/327 sweep at
+  landing).
 
-**Still open (honest at this as-built read — updated for the three closures
-below; the original read was HEAD b7ef7e5):** C7's org-scope runners page
+**Still open (honest at this as-built read — updated 2026-10-30; the
+original read was HEAD b7ef7e5):** C7's org-scope runners page
 LANDED (3ab7532: the org Runners settings twin over the M1a store at the
 (orgId, '') scope, the WithAvailable cond porting upstream's org polarity —
 org's own + globals, a repo-scoped runner never lists in the org scope —
@@ -942,16 +963,19 @@ tail/steps) and C4 (artifacts preview UI + signed raw serving) LANDED in
 cd7eec4 with the routes mounted in the SAME commit — the previewLink flip
 went live beside the two index.ts route families (the repo preview subtree
 and the viewer-less root signed-raw family; the HMAC is the auth), the
-dead-link rule honored. Remaining: the C4 census tails — the per-name
-artifact download/delete pair (GET+DELETE
-/actions/runs/{run}/artifacts/{name}) — a separate unit. C5's rerun +
-rerun-failed still DEFER to M3's job emitter (the census's flagged split —
-attempt creation + job re-emission are emitter territory; the cancel arm
-landed inside C2's window); C10's scoped-workflows pages defer with M3
-(the census's own defer note); and M3 (the trigger chain) stays staged
-behind Open question 1 — without it the control plane has no automatic
-producer, jobs arrive via the test-harness insertion seams (§3's own
-sentence).
+dead-link rule honored. The C4 census tails CLOSED: the per-name artifact
+download/delete pair (GET+DELETE /actions/runs/{run}/artifacts/{name})
+landed 6f07849 — the GET streams the confirmed row's stored content direct
+from R2 (legacy families a composed zip), the DELETE the writer-gated
+pending-deletion mark — and the F-row tail GETs landed 1ff87d1 (the
+harvest-window bullet above). With those closures every M1c census unit is
+LANDED except two, both M3-deferred: C5's rerun + rerun-failed DEFER to
+M3's job emitter (the census's flagged split — attempt creation + job
+re-emission are emitter territory; the cancel arm landed inside C2's
+window) and C10's scoped-workflows pages defer with M3 (the census's own
+defer note). M3 (the trigger chain) stays staged behind Open question 1 —
+without it the control plane has no automatic producer, jobs arrive via
+the test-harness insertion seams (§3's own sentence).
 
 ## As-built — M2 (0143e10, 2026-10-30)
 
