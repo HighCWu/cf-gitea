@@ -169,7 +169,14 @@ async function seedOrgHomeWorld(): Promise<OrgHomeWorld> {
 
   // The row-shape carriers: alpha's batched description body, its open-pulls
   // subtraction (3 pulls − 1 closed → 2) and its Updated timestamp.
-  await drizzle(env.DB).insert(repoSettings).values({ repoId: alpha.id, description: "The public workhorse." }).run();
+  // b0e1d88's creation-default flip seeds the repo_settings row at create
+  // (DefaultRepoUnits), so the former explicit INSERT collides on the UNIQUE
+  // repo_id — set the description by UPDATE (the 0276a82 sweep's idiom).
+  await drizzle(env.DB)
+    .update(repoSettings)
+    .set({ description: "The public workhorse." })
+    .where(eq(repoSettings.repoId, alpha.id))
+    .run();
   await drizzle(env.DB)
     .update(repositories)
     .set({ numPulls: 3, numClosedPulls: 1, updatedAt: new Date(T0) })

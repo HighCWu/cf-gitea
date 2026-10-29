@@ -258,9 +258,14 @@ async function ensureProjectsFixtures(): Promise<ProjectsFixture> {
           status: "ready",
         })
       ).id;
-    // The projects unit is the settings row's flag (a missing row is the
-    // disabled default) — idempotent upsert.
-    await db.insert(repoSettings).values({ repoId: id, hasProjects: true }).onConflictDoNothing();
+    // The projects unit is the settings row's flag: b0e1d88's creation-default
+    // flip seeds the repo_settings row at create with hasProjects FALSE (the
+    // flip armed actions+packages, NOT projects — the documented divergence),
+    // so the former insert/onConflictDoNothing upsert was a NO-OP against the
+    // app-seeded row and every unit-gated repo page 404'd — arm the unit
+    // explicitly by UPDATE (the 0276a82 sweep's idiom; the row always exists
+    // because the repo above is born through RepoService.create).
+    await db.update(repoSettings).set({ hasProjects: true }).where(eq(repoSettings.repoId, id));
     return id;
   }
   const labRepoId = await ensureRepo(REPO_SLUG);

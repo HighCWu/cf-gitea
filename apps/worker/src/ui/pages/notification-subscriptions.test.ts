@@ -448,7 +448,11 @@ describe("loadWatchingData — the WatchedByID read", () => {
   it("lists watched repos through the readGrant scope and batches descriptions", async () => {
     const s = await seed();
     const db = drizzle(env.DB);
-    await db.insert(repoSettings).values({ repoId: s.publicRepoId, description: "visible description" }).onConflictDoNothing();
+    // b0e1d88's creation-default flip seeds the repo_settings row at create
+    // (description ""), so the former insert/onConflictDoNothing form was a
+    // NO-OP against the app-seeded row and the batched description read "" —
+    // set it by UPDATE so the description actually lands (the 0276a82 idiom).
+    await db.update(repoSettings).set({ description: "visible description" }).where(eq(repoSettings.repoId, s.publicRepoId));
     await watchRepo(s.publicRepoId);
     await watchRepo(s.privateRepoId); // watched but unreadable for the non-admin
     await watchRepo(s.ownRepoId); // the isOwner grant arm

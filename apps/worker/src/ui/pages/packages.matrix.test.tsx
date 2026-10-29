@@ -722,14 +722,17 @@ describe("the R16 repo tab — the enum gate arm, the repo facet, the render", (
 
   it("reads the has_packages toggle both ways (the gate arm)", async () => {
     const { repoA, repoB } = await seedRepoWorld();
-    expect(await repoPackagesEnabled(env.DB, repoA.id)).toBe(false); // the upstream default
-    await db()
-      .insert(repoSettings)
-      .values({ repoId: repoA.id, hasPackages: true })
-      .onConflictDoUpdate({ target: repoSettings.repoId, set: { hasPackages: true } })
-      .run();
+    // b0e1d88's creation-default flip arms hasPackages TRUE at create
+    // (DefaultRepoUnits: normal creation seeds actions+packages) — the old
+    // "false is the upstream default" premise is dead. The tested BEHAVIOR is
+    // that the gate reads the toggle BOTH ways, so drive the disabled posture
+    // explicitly (the 0276a82 update idiom), then flip it back; repoB holds
+    // the new creation default (armed).
+    await db().update(repoSettings).set({ hasPackages: false }).where(eq(repoSettings.repoId, repoA.id));
+    expect(await repoPackagesEnabled(env.DB, repoA.id)).toBe(false); // the explicitly disabled posture
+    await db().update(repoSettings).set({ hasPackages: true }).where(eq(repoSettings.repoId, repoA.id));
     expect(await repoPackagesEnabled(env.DB, repoA.id)).toBe(true);
-    expect(await repoPackagesEnabled(env.DB, repoB.id)).toBe(false);
+    expect(await repoPackagesEnabled(env.DB, repoB.id)).toBe(true); // the creation default is armed now
   });
 
   it("filters by RepoID: two repos, one owner — each tab sees only its own rows", async () => {
@@ -842,20 +845,25 @@ describe("the repo_units enum extension (ratification 7)", () => {
     const owner = await seedUser("uniters");
     const repoService = new RepoService(env.DB);
     const repo = await repoService.create({ owner: { id: owner.id, usernameLower: "uniters" }, name: "unitrepo", isPrivate: false, status: "ready" });
-    // The create service seeds no unit rows (repo_units rows are the
-    // public-access settings page's writes) — seed the 'code' twin beside
-    // the new 'packages' type explicitly.
+    // The create service seeds the repo_units 'actions' row since b0e1d88's
+    // creation-default flip (repo_units rows are otherwise the public-access
+    // settings page's writes) — seed the 'code' twin beside the new
+    // 'packages' type explicitly, and expect the seeded 'actions' row in the
+    // read-back.
     await db()
       .batch([
         db().insert(repoUnits).values({ repoId: repo.id, type: "code", anonymousAccessMode: "none" }).onConflictDoNothing(),
         db().insert(repoUnits).values({ repoId: repo.id, type: "packages", anonymousAccessMode: "none" }).onConflictDoNothing(),
       ]);
     const row = await db().select().from(repoUnits).where(eq(repoUnits.repoId, repo.id)).all();
-    expect(row.map((unit) => unit.type).sort()).toEqual(["code", "packages"]);
+    expect(row.map((unit) => unit.type).sort()).toEqual(["actions", "code", "packages"]);
     const packagesRow = row.find((unit) => unit.type === "packages");
     expect(packagesRow?.anonymousAccessMode).toBe("none");
     await db().delete(repoUnits).where(eq(repoUnits.type, "packages")).run();
-    expect((await db().select().from(repoUnits).where(eq(repoUnits.repoId, repo.id)).all()).map((unit) => unit.type)).toEqual(["code"]);
+    expect((await db().select().from(repoUnits).where(eq(repoUnits.repoId, repo.id)).all()).map((unit) => unit.type).sort()).toEqual([
+      "actions",
+      "code",
+    ]);
   });
 });
 
