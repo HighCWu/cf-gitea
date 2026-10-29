@@ -18,10 +18,13 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
                                                       # D1-only: --base-url/--token-file optional
 ```
 
-- Batteries: `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
+- Batteries (14): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
-  `branch-protection`, `demo`, `cleanup-audit`, `all` (runs them in that
-  order, audit last).
+  `branch-protection`, `demo`, `wiki-git`, `packages-registry`,
+  `cleanup-audit`, `all` (runs the 14 in that order, audit last).
+  `all --dry-run` plans **176 probes** across them (the counts in the
+  table below were read off that dry-run at this writing; `registry`
+  scales with `--trials`).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
@@ -39,10 +42,11 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   (`/user` → 401) fails fast in the same shape. The D1-only `cleanup-audit`
   has no HTTP surface and never triggers it.
 - Against LOCAL dev: `--base-url http://127.0.0.1:5173 --d1-scope local` for
-  the HTTP batteries (the mirror row-settle arm reuses `--d1-scope`); mint the
+  the HTTP batteries (the mirror row-settle arm and the packages-registry
+  row sweep reuse `--d1-scope`); mint the
   PAT with `node scripts/bootstrap-admin.mjs <user>` on local D1, and pass the
   matching `--user`. A local self-test (the seven batteries committed at the
-  time — `window2-mounts` landed after) was run green
+  time — `window2-mounts` landed after; the toolkit now carries 14) was run green
   from this tree; see "Local self-test fixtures" below.
 - `--json` puts only the final JSON summary on stdout (progress to stderr),
   same contract as deploy-smoke.
@@ -59,10 +63,35 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   summary are scrubbed against it — and against the `gitea_session` value the
   ui-login battery captures.
 - After the run the operator DELETEs the per-run PAT (by id/prefix) and re-checks
-  the token count with `cleanup-audit --expect-tokens 1` (the standing
-  bootstrap PAT).
+  the token count with `cleanup-audit` — the default expectation is the
+  standing bootstrap SET, one token per standing user (admin + p0probe = 2
+  since the probe user gained its own bootstrap 2026-10-28; pass
+  `--expect-tokens <n>` when the standing set differs, e.g. local scratch
+  users).
 
 ## Batteries and their canonical expectations
+
+The registry at this writing — 14 batteries, **176 probes** (`all
+--dry-run`; `registry`'s count scales with `--trials`, here at its
+default 3):
+
+| Battery | Probes | What it verifies | Auth & env |
+|---|---|---|---|
+| `p0` | 4 | the shallow trio (deepen-since/deepen-not exit 128 with the server text, depth-1 shape, fsck) + the privacy tail; the fixture self-seeds | HTTP — `--base-url` + `--token-file`; `--fixture-oid` pins a standing tip |
+| `registry` | 21 | tombstone lifecycles: create → anonymous advert → rename → the carry → delete → t+0 dead on both paths | HTTP |
+| `generate-e2e` | 10 | template → real push → PATCH template → generate → carried refs at the identical tip → contents round-trip | HTTP |
+| `forkpr-e2e` | 8 | fork into a doer-owned org → cross-repo bare `owner:branch` PR → head chain + `mergeable` | HTTP |
+| `mirror` | 8 | push-mirror registration-time SSRF egress gate + the `.invalid` sync-settle lifecycle | HTTP + **wrangler auth** (the row re-read rides `--d1-scope`) |
+| `ui-login` | 5 | the login-cookie methodology: anonymous vs owner labels view | HTTP (login cookie) |
+| `window2-mounts` | 22 | user-settings tab family: anon 303s, pageClass 200s, the secret round-trip, keys negative, last-owner flash | HTTP (login cookie) |
+| `window3-mounts` | 26 | feed tails, wiki raw bytes, profile tabs, admin lists, settings account/notifications, milestone detail, content-history list | HTTP (login cookie) |
+| `fixwave-parity` | 22 | the RD23 parity matrix: PR head-sync, merged-PR 412, ghost-404, tag-only push-create, revoke mask, visibility ladder, sudo pair, session-rotation directive | HTTP + **ADMIN PAT** + **wrangler auth** (the rotation backdate + session-row sweep are D1 writes) |
+| `branch-protection` | 18 | SPEC-0013 flows: rule CRUD + priority swap, per-ref push rejection, approval gate 405→200, whitelist flag round-trip | HTTP + **ADMIN PAT** (the priority ids and slash-glob arm are pure API — no wrangler) |
+| `demo` | 4 | demo posture: committed-config machinery, `DEMO_MODE`-off default, open signup, the §4.4 banner ([warn] pre-M2) | HTTP against the demo instance; the TTL-mechanics arm is LOCAL-only (`--d1-scope local` + `DEMO_MODE=true` in `.dev.vars` against `pnpm dev`) |
+| `wiki-git` | 7 | the `.wiki.git` wire: REST page create → real clone carries the root commit → push → read-back → privacy tail → t+0 tombstone | HTTP |
+| `packages-registry` | 11 | all SIX protocols end-to-end (generic/pypi/npm/helm/maven/nuget) + the D1 row sweep + repo delete | HTTP + **wrangler auth** (the row sweep rides `--d1-scope`) |
+| `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
+| **`all`** | **176** | every battery in registry order, audit last | union of the above |
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
@@ -409,6 +438,57 @@ prints all of them verbatim.
   `[tail] demo-leftover-sweep` line; failures feed `left_behind`, never
   fatal; a green run no-ops silently because the sweep itself already
   deleted the row).
+- **wiki-git** — the v1.3 `*.wiki.git` WIRE round-trip over one PRIVATE
+  probe repo (49a1502's battery; `99db2c1`'s git-HTTP twin is the server
+  side): the wiki REST create (`POST /api/v1/repos/{owner}/{repo}/wiki/new`,
+  `content_base64` — no session-cookie dance needed, the PAT carries it),
+  then the wire driven like p0 drives the code wire: a REAL authenticated
+  `git clone …/{owner}/{repo}.wiki.git` (auth via `http.extraHeader`)
+  carries the page's root commit (Home.md bytes verbatim, exactly 1
+  commit, the router-defaulted subject `Add "Home"`) → an append commit
+  PUSHES back (wiki pushes are served with the parent's write grant) →
+  the page API read-back carries the appended bytes → the privacy tail
+  proves a PRIVATE parent's wiki twin challenges anonymous readers
+  (`info/refs` 401 Basic + ls-remote 128) → DELETE 204 and an
+  authenticated ls-remote asserts the tombstone: the wiki cell is dead
+  at t+0 (it rode deleteRepository's purge — no wiki residue). Fixtures:
+  ONE private auto_init probe repo — a green run deletes it (the wiki
+  cell cascades with it), so cleanup-audit needs no new expectations.
+  **Failure cleanup (the consistency posture):** a finally-style tail
+  sweeps the probe repo under the fullName the create returned (logged
+  on one `[tail] wikigit-leftover-sweep` line; failures feed
+  `left_behind`, never fatal; a green run no-ops silently).
+- **packages-registry** — the v1.3 `/api/packages` protocol families in
+  ONE owner-scoped sweep (49a1502's battery, nuget joined at 07221df;
+  one probe repo fixture + the run PAT): the generic PUT/GET round-trip
+  (+ DELETE version → 204 → 404), the pypi twine multipart upload → the
+  PEP 503 simple index (anchor + `#sha256=`) → the file back verbatim,
+  the npm couchdb publish PUT (the tarball attachment + sha512
+  integrity) → packument + dist-tags + version metadata + the tarball
+  back verbatim → the whole-package unpublish (`-rev` → 200), the helm
+  Chart.yaml tarball → `index.yaml` entries → the chart back verbatim,
+  the maven pom+jar PUTs → the generated `maven-metadata.xml` → the jar
+  back verbatim, and the nuget family — the V3 flat-container publish
+  (a hand-built stored-entry `.nupkg` whose ROOT `.nuspec` carries the
+  fifth-segment version `1.04.5.2.5-rc.1+probe`; every read answers the
+  NORMALIZED `1.4.5.2-rc.1`) via the `X-NuGet-ApiKey` fallback → the
+  registration leaf + the `.nupkg` back verbatim + the V2
+  Edmx/`Packages(Id=..)` pair → the REST management purge (204 → 404s).
+  Cleanup is SELF-CLEANING at the row layer: generic/npm/nuget self-clean
+  via their protocol/management deletes, while pypi/helm/maven expose no
+  protocol delete, so a wrangler d1 sweep (the fixwave/demo D1-arm
+  precedent; `--d1-scope` picks the database — needs wrangler auth)
+  deletes the probe's package/version/file/property/blob ROWS in
+  deletePackageAndReferences' cascade order and asserts zero rows remain;
+  the R2 content keys are documented residue (the unreferenced-blob sweep
+  is the SOLE content-key deleter, >24 h cleanup cadence). The probe repo
+  DELETEs 204 (packages are owner-scoped — the repo delete never touches
+  them, which is exactly why the D1 sweep exists). **Failure cleanup (the
+  consistency posture):** a finally-style tail sweeps the package rows
+  (D1, unless the in-chain sweep already ran) then deletes the probe repo
+  under the fullName the create returned (logged on one
+  `[tail] pkg-leftover-sweep` line; failures feed `left_behind`, never
+  fatal; a green run no-ops silently).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -416,8 +496,12 @@ prints all of them verbatim.
   `p0-shallow`, `--expect-owner-repos`), `status='creating'` == 0, `action`
   == 0 (the 389da18 delete sweep — NO hand-sweep), `stars` == 0,
   `push_mirrors` == 0, `protected_branches` == 0, `repo_redirects` == 0,
-  `user_blocking` == 0, `personal_access_tokens` == 1 (the standing bootstrap
-  PAT, `--expect-tokens`). The one honest exception to `action == 0`: a push
+  `user_blocking` == 0, `personal_access_tokens` == the standing bootstrap
+  SET, one per standing user (admin + p0probe = 2 by default since the
+  probe user gained its own bootstrap 2026-10-28 — the historical
+  whole-table=1 encoding predated the second standing user and false-fired
+  from 2026-10-29; `--expect-tokens <n>` overrides). The one honest
+  exception to `action == 0`: a push
   to the still-live fixture (the local seed flow) leaves its own action rows —
   production probe runs only clone it, so the canonical whole-table 0 holds.
 
@@ -464,6 +548,11 @@ prints all of them verbatim.
     backdate NULLed the owner so the API delete may not resolve — then the
     best-effort API DELETE); `[tail] demo-leftover-sweep`. (Green runs
     arrive with the row already deleted by the sweep itself.)
+  - `wiki-git` — its probe repo (the wiki cell cascades with it);
+    `[tail] wikigit-leftover-sweep`.
+  - `packages-registry` — its package rows (D1, unless the in-chain
+    sweep already ran), then its probe repo;
+    `[tail] pkg-leftover-sweep`.
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
   emptied everything, and the gone flags skip the rest). The audit battery
@@ -518,6 +607,22 @@ prints all of them verbatim.
     running any of it: nothing is created and the
     `[tail] demo-leftover-sweep` line legitimately stays silent (the
     documented no-op shape for this battery).
+  - `wiki-git --force-red wikigit-clone-root-commit` — reds after the
+    probe repo + the wiki page exist (the clone UNRUN); the
+    `[tail] wikigit-leftover-sweep` line must list the repo delete.
+    `--force-red wikigit-push-append` reds after the clone greened, same
+    single-delete tail. Forcing an arm before the create (e.g.
+    `wikigit-create-repo-201`) leaves nothing to sweep — the tail stays
+    silent.
+  - `packages-registry --force-red pkg-npm-publish-packument` — reds
+    after the repo + the generic and pypi rows exist (the npm arm itself
+    UNRUN; all six probe names are registered at step-list construction,
+    so the tail's D1 sweep covers them and the unpublished ones answer
+    "already clean"); the `[tail] pkg-leftover-sweep` line must list the
+    D1 row sweep + the repo delete. `--force-red pkg-cleanup-repo-204`
+    reds after every protocol arm greened and the in-chain row sweep
+    already ran — the tail then carries only the repo delete (the
+    `rowsSwept` gone-flag skipping the row sweep, the documented shape).
   The rehearsal convention: each forced-red run is followed by a
   `cleanup-audit` run, and the audit going green is the sweep's proof.
 - The mirror battery can also be forced honestly through its real budget
@@ -537,7 +642,9 @@ prints all of them verbatim.
 ## Local self-test fixtures
 
 The committed tree was verified with a full `all` run against `pnpm dev`
-(local D1, migrations applied). Local scratch keeps: the `dpprobe` user
+(local D1, migrations applied) — the battery set at that verification;
+the v1.3 pair landed later and 49a1502's landing window ran its own
+local green suite battery-by-battery. Local scratch keeps: the `dpprobe` user
 (bootstrap-admin, several local tokens — pass the real count via
 `--expect-tokens` for local audits) and its private `p0-shallow` fixture
 (tip `8582c5545ac5cbc4eafca46363dd5141c7ae87f9`). Production runs use

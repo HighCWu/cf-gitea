@@ -1,8 +1,12 @@
 # cf-gitea v1.3 — Release Notes
 
-Snapshot 2026-10-29, HEAD `10cfb97` — the v1.3 wave, now covering the
-full day: 76 commits, `d68ad62`→`10cfb97`, all on 2026-10-29
-(06:53 – 23:43 +0800). These notes were first cut MID-FLIGHT at
+Snapshot pre-draft 2026-10-30, HEAD `0f25339` — the v1.3 wave, now
+covering the full day and past midnight: **92 commits,
+`d68ad62`→`0f25339`** (2026-10-29 06:53 → 2026-10-30 00:53 +0800).
+**TODO(final-window): the 9:00 convergence run replaces this snapshot
+line with the freeze HEAD and the final commit count** — anything
+landing between this pre-draft and the cut appends in the same
+structure. These notes were first cut MID-FLIGHT at
 `e5e1432` (28 commits, landed as `37758d5`); the same day's second half
 landed before the freeze — the five cut-time units inside the hour, the
 wiki sibling's full git-HTTP and lifecycle arc, the packages registry's
@@ -12,29 +16,42 @@ demand-gate lift, the second UI wave, and the survey's climb to
 M1a+M1b control plane and the UI's first Actions units, the settings
 family's `has_actions` threading, the 500-chrome arm, C9's general page
 with its checkbox retirement, the five-family actions-UI window that
-mounts the Actions tab, and the docs' final syncs — is appended
-below in the same structure (§1's new subsections, §2's notes, §3's
+mounts the Actions tab, and the docs' final syncs — was recorded in
+`345443d`'s own delta sweep; and the day's last stretch — nuget
+completing the registry's six protocols with the +1 quota-parity sweep,
+the creation-defaults flip, M1c's org window and the run-viewer's deep
+arms, both M1b residuals' closure, M2's runner guide, the probe
+toolkit's v1.3 battery pair (taking it to fourteen), tick-19, and the
+escaped-landing
+recoveries — is appended below in the same structure (§1's new
+subsections, §2's notes, §3's
 tables). The window opened with the UI gap
 census that classified and briefed every remaining survey row, landed
 the engine read family at the boundary (grep with a budgeted NFA,
 `activityStats`, `contributorStats`, plus the blame RPC), closed ten
 census rows in one combined UI landing, shipped the audit-events model
 with retention (migration 0038), and ratified four SPECs (0015–0018).
-What still flies is named in §4 (the nuget protocol) — nothing in
-flight is counted as
+What remains open is named in §4 against the SPECs' own still-open
+lists — nothing landed is left uncounted and nothing in flight is
+counted as
 landed. Every number is quoted from the commit or doc that recorded it;
-nothing was re-measured for these notes.
+nothing was re-measured for these notes except the probe toolkit's
+plan output (§1's probe subsection quotes the dry-run this pre-draft
+ran itself — no live probe ran).
 
 **Cut point.** The v1.2 notes close at the seventh addendum (`8b9be25`, the
 RD25 record). This window's first three commits are that release's last
 breath — the RD25 postcheck (`d68ad62`, RESTING-STATE-COHERENT), the
 push_bytes determinism pin (`5f7caed`), and the postcheck's closable batch
 (`173deab`); the census (`b5fd430`) then opened this wave. Everything from
-`d68ad62` to `10cfb97` is the delta these notes cover: `e5e1432` was the
+`d68ad62` to `0f25339` is the delta these notes cover: `e5e1432` was the
 mid-flight cut (committed at `37758d5`, snapshot that tree), `65809c6`
-carried the second half (through `72f40ec`), and the sections below
-carry the final 16 commits as this extension. The 06:15 window performs
-the final cut and tag; the in-flight units in §4 land into it, and the
+carried the second half (through `72f40ec`), `345443d` recorded the third
+(through `10cfb97`) and is itself the first of the final 16, and the
+sections below carry those 16 (`345443d`→`0f25339`) as this pre-draft's
+extension. The 9:00 convergence
+window performs the final cut and tag — it fills the two TODO(final-window)
+placeholders (the snapshot line above, §3's tick numbers) — and the
 freeze window owns the wave's deploy record.
 
 ---
@@ -45,9 +62,10 @@ The directive is the census's own: **upstream Gitea serves it → cf-gitea
 serves it** (`docs/compat/ui-gap-census-2026-10-29.md`, `b5fd430`). The
 survey tick-16 remainder — 22 non-landed rows (17 ABSENT + 5 PARTIAL of
 116) — was classified, briefed, and ranked; this window then executed the
-top of that board, and by the day's last survey tick the board reads
-113 LANDED / 1 PARTIAL / 2 ABSENT (`72f40ec`) — what remains is the
-actions subsystem now being built (§4). The per-row landing ledger (row →
+top of that board, and by the last survey tick (tick-19, `b7ef7e5` — the
+survey's first programmatic walk) the board reads
+114 LANDED / 2 PARTIAL / 0 ABSENT — what remains is the actions tails
+and the deferred M3-class work (§4). The per-row landing ledger (row →
 closing commit, hashes verified) is appended to the census itself; what
 follows is the wave view.
 
@@ -612,7 +630,221 @@ the fake-runner oracle, stock act_runner as the self-host runner); the
 engine row carries the key-guard; the UI row at tick-18's 113/1/2 with
 the a8e065f flips marked implied-pending-next-tick; 500/554 re-verified
 PASS. Two TODO(final-window) placeholders await the 06:15 cut (final
-HEAD + the final tick numbers). Every claim unit-verified.
+HEAD + the final tick numbers) — b2ff251's own marking, then planned
+for 06:15; the cut is the 9:00 convergence window as these notes are
+written. Every claim unit-verified.
+
+### The packages registry completes its protocols: nuget (M5b) and the +1 quota-parity sweep
+
+- **M5b — nuget** (`e26c862`): the registry's SIXTH protocol family.
+  The hand-built zip reader (EOCD + central-directory walk, stored +
+  deflate-raw, the zip-bomb gate), the root-nuspec rule with the
+  fifth-segment version normalization (`1.04.5.2.5-rc.1+probe` →
+  `1.4.5.2-rc.1`), V3's nine-resource service index + registration
+  leaves + byte-parity downloads, V2 OData (the Edmx, the
+  `Packages(Id=…)` leaf via a prefix wildcard re-pinning upstream's
+  regex — Hono cannot compile chi's embedded-param parens,
+  probe-verified), the BSJB symbol extractor, the `X-NuGet-ApiKey`
+  auth fallback, and the +1 post-insert quota parity upstream's
+  transaction ordering produces. 14/14 + the six-protocol sweep
+  122/122. SPEC-0016 stands at M1–M5b (M6 container + M7
+  index-builder pending).
+- **The +1 post-insert quota parity swept the whole family.** npm
+  first (`54a8fc4`): upstream inserts THEN checks inside the
+  rolling-back transaction (`packages.go:188-191` with the throw at
+  `:380-381`, at this pin), so the publish that reaches limit N
+  succeeds and only N+1 fails — npm's pre-insert check allowed one
+  version MORE at the boundary; the boundary test pins the N-th 201 /
+  (N+1)-th 403 / the rollback posture; 24/24 + the superset sweep
+  183/183. Then the remaining four in one commit (`4e42c8c`): pypi
+  (twine POST), generic (PUT), helm (chart POST + the prov path,
+  keeping the family idiom on every publish arm), and maven (after
+  the checksum-verify early return, which stays quota-free) all swap
+  the dead pre-insert `checkCountQuotaExceeded` for the inline
+  `countVersions + 1 > limit` shape (admin bypass, −1 disable);
+  `checkCountQuotaExceeded` is deleted from `model.ts` (zero
+  occurrences left in src); boundary tests in all four suites;
+  superset sweep 156/156. The stale `packages.go:305-312` size cites
+  corrected to `:303-306` at the pin. The class, cousin of §2's maven
+  MD5 note: port the transaction ORDERING, not just the check — a
+  faithful check on the wrong side of the insert is a divergent
+  quota.
+
+### The creation defaults flip (`b0e1d88`)
+
+Repo creation now arms upstream's `DefaultRepoUnits` posture per
+creationKind — normal: actions + packages armed; fork: both off
+(`DefaultForkRepoUnits`); mirror: packages on, actions off — the flags
+AND the `repo_units` actions row seeded in the SAME creation batch (one
+transaction, so the row and the flag can never diverge). Packages rode
+along (it was also default-off); projects stays the documented
+divergence; pre-flip repos untouched (creation-time writes only,
+upstream's shape). Five new lifecycle tests incl. the lockstep
+round-trip on a creation-armed repo; the two UI fixtures the flip
+surfaced fixed in-commit; 70/70. The flip's premise reached past its
+own commit — §2's premise-death note.
+
+### SPEC-0012's hour of giants: the org window, the run-viewer's deep arms, both M1b residuals, and the guide
+
+- **The org-scope Runners twin** (`3ab7532`, C7's census org arm —
+  the M1c org window closes): the org page over the M1a store at the
+  `(orgId, '')` scope; the WithAvailable cond ports upstream's org
+  polarity (org's own + globals — a repo-scoped runner NEVER lists in
+  the org scope, `runners.go`'s ToConds :262-266); the token
+  lifecycle with reset scope-guarded; the write arms (edit tasks
+  enrichment, the global-runner NotFound arm per findActionsRunner's
+  owner pin). Mounted per `web.go:1058` behind the require-owner
+  prologue — at org scope upstream's MustEnableActions reduces to the
+  instance-level flags (both compile-time true in the landed
+  posture). PageClasses upstream-exact per the org family's genuinely
+  distinct edit template; the shared OrgSettingsNavbar lights the
+  Runners sub-item (`navbar.tmpl:35-37`) before Secrets. 10
+  registrations incl. the 405 twins, the reset literal ahead of the
+  `{id}` combo (chi static-first). 32 new tests (the org cond
+  polarity, token reuse, cross-org isolation, the mounted matrix incl.
+  the exact 400 arm); neighbors 147/148 — the one red the pre-existing
+  `b0e1d88` fixture premise, fixed separately (§2).
+- **C3 + C4 over the run-viewer** (`cd7eec4`): C3 fills ViewResponse's
+  two placeholders per `view.go:722-917` — `fullStepsOfTask` is
+  FullSteps ported verbatim (the Set up job/Complete job boundary
+  synthesis with the firstStep/lastHasRun log-range math, the reported
+  layout riding verbatim) with convertToViewModel's cancelling overlay
+  + waiting→pending flip; `logs.stepsLog` is the full cursor protocol
+  (expanded-only in-range steps, the three-guard validCursor, 1-based
+  lines, float-second stamps, same-cursor-empty retry, the logExpired
+  purge arm) reading through M1b's `getTaskStepsByTaskId`/
+  `readTaskLogs` seams (hot chunks + the R2-sealed read both tested).
+  C4's previewLink flip goes LIVE in the same commit as its routes
+  (the dead-link rule): `repo-actions-artifacts.tsx` carries
+  artifact_preview.tmpl's SSR file browser (depth/selected tree,
+  three banners, the sandbox iframe hook) over `view_artifact.go:
+  341-390`'s assembly + the SIGNED raw serving (`:392-484`) — HMAC
+  gate, Sec-Fetch-Dest document 302, v4 zip central-directory listing
+  + stored/deflate-raw inflation, legacy gzip gunzip, 404/413/415
+  gates, the helper-script injection. The index.ts mounts (the repo
+  preview subtree + the viewer-less root signed-raw family — the HMAC
+  is the auth) are GET-only with chi-405 POST twins, digits-only
+  `{id}` claims, per-segment-decoded tails with '/' rejoined; 10 new
+  parse-table cases pin the claim shapes incl. junk/undecodable
+  negatives. 61/61 own (six self-caught expectation bugs + one real
+  disposition-regex fix) + parse+matrix 230/230 and 77/77.
+- **Both M1b ledgered residuals close** (`3bc5d29`): the
+  retention-var wiring — `runRetentionSweep`'s signature tightened
+  from `Partial<>` (the deletion hazard: omitted arms silently
+  defaulted 90/365/400) to a required triple with 0 = arm off
+  (upstream's `<= 0` polarity); `retentionDaysFromEnv` strict-polarity
+  parse; `enqueueDueActionsRetention` rides the hourly entry as the
+  third sanctioned producer block (gate before the first D1 read, one
+  indexed LIMIT-1 probe per armed arm, at most ONE message carrying
+  the parsed values — the consumer runs exactly what was armed); the
+  zombie pair rides the */10 step entry probe-gated (upstream's
+  stop_zombie_tasks is an always-on @every 5m cron with NO retention
+  knob, `cron/tasks_actions.go:26-35` — hourly mounting would have
+  degraded zombie latency to ~70min); two typed consumer arms in
+  `purge.ts`; `wrangler.jsonc.example` gains the strict-polarity trio
+  fail-closed (a default deployment NEVER deletes actions data —
+  upstream's always-on defaults are opt-in here). The keystore: 
+  upstream stores NEITHER crypto piece in a models table (the HS256
+  secret in the setting store, `oauth2.go:129-150`; the RS256 key an
+  AppData PEM, `oidc.go:40-54`) — the ratified no-app.ini substrate
+  makes D1 the analog home: **migration 0042 `rainy_captain_cross`'s
+  `system_keystore`** (write-once rows; rotation operator-only,
+  exactly upstream's edit-app.ini-and-restart), generate-once-save-back
+  with the race loser adopting the winner's material, the kid switched
+  to upstream's exact `base64url(SHA-256(SPKI DER))` spelling
+  (`util/keypair.go:48-56`), one-time legacy adoption of M1b's R2
+  object on a cold D1 miss. Two disclosed boundary touches
+  (demo-sweep's disarm pins per the `AUDIT_RETENTION_DAYS` precedent;
+  artifacts' persistence assertion moved from the R2 object to the D1
+  rows). db:generate no-drift re-verified; 119/119 across six neighbor
+  files.
+- **M2 — the self-hosted-runner guide** (`0143e10`):
+  `docs/guide/actions-runners.md` (447 lines) — what works today (the
+  four mount families, the wire freeze + divergences, interceptor
+  auth, the six-procedure table, token lifecycle, the dispatch
+  payload, ingestion); the act_runner recipe (install/register/labels
+  with the exact-match warning, an end-to-end walkthrough, the
+  fake-runner as the zero-install smoke); the operator surface; seven
+  honest limits — every claim machine-checked against the landed code
+  (22 load-bearing cites spot-verified); the draft's pre-flip
+  default-off prose was caught mid-flight and rewritten against
+  `b0e1d88`'s landing.
+
+### The deploy-probe toolkit grows to fourteen batteries (`49a1502`, `07221df`)
+
+The v1.3 battery pair landed ahead of cleanup-audit: **wiki-git** (a
+real clone of the wiki twin — REST page create → the clone asserting
+the root commit verbatim → a real push → the three-way read agreement
+→ privacy tails → the t+0 tombstone) and **packages-registry** (the
+live protocols end-to-end: generic round-trip, the pypi twine multipart
++ PEP 503 anchor, the npm couchdb publish with a hand-built tgz →
+packument/tarball/unpublish, helm's index.yaml, maven's generated
+metadata.xml — then the D1 row sweep in cascade order + the documented
+R2-blob residue note). 14 batteries / 173 probes at the pair's
+landing, locally green run-by-run with the failure-tail self-sweep
+proven live. The nuget arm then joined the packages battery
+(`07221df`) — three chained probes (the V3 publish round-trip via
+`X-NuGet-ApiKey` with the fifth-segment normalization exercised, the
+V2 OData Edmx/`Packages(Id=…)` pair, the management purge cascade)
+with a hand-built stored-entry zip fixture (`zipStoredBytes()` — local
+headers + central directory + EOCD, real CRC-32, a root package.nuspec
+beside a nested lib/net45 payload the root-nuspec rule must skip),
+**176 probes across the 14 batteries** at this pre-draft's own dry-run
+(verified again here; no live probe ran — the freeze window's deploy
+probe run exercises them for real).
+
+### The escaped-landing recoveries (`d7a6f73`, `c269ff0`)
+
+Two same-hour fix commits closed what the giants' landings left
+behind: the **runs-list icon set** — `gen-ui-icons.mjs`'s ALLOWLIST
+addition (the action_status circle-fill variants, skip/stop/circle/
+blocked/x, octicon-sync standing in for the stroke-based
+gitea-running spinner, the dropdown carets, the empty-state/error
+glyphs, stopwatch — 13 glyphs the landed C1 runs list requests) had
+escaped `0c8da44`'s commit; and the **two `b0e1d88` premise deaths**
+in the committed matrices — the audit-logs (`d7a6f73`) and LFS
+(`c269ff0`) hasActions-threading tests still built on the 'no
+repo_settings row' creation-default premise the flip had invalidated;
+both rebuilt on explicit update-based polarity phases (the wave15
+idiom), disabled→no Actions block, armed→sub-items lit, the creation
+default restored in a finally. `c269ff0` also drops `read.ts`'s dead
+drizzle binding and useless-initializer lint errors. 46/46 own-eyes;
+LFS family 62/62 + the matrix 17/17.
+
+### The survey reaches tick-19; the as-built records sync (`b7ef7e5`, `d33a413`, `0f25339`)
+
+Tick-19 (`b7ef7e5`) is the survey's first PROGRAMMATIC walk — the
+pre-edit run reproduces tick-18 exactly, the post-edit run equals the
+headline: **114 LANDED / 2 PARTIAL / 0 ABSENT** of 116 at `e26c862`,
+zero rows in flight, the dispatch gate list EMPTY. Two flips off the
+actions window: the E settings/actions row LANDED (every page-bearing
+GET in `web.go:1262-1278` serves); the F repo-actions row flips
+PARTIAL, not LANDED (runs list + job queue + the run-viewer subtree
+serve; the six tail GETs stayed unclaimed per C2's own note at the
+tick's HEAD). The admin row stays PARTIAL with its absent list shrunk
+(packages `a8e065f`, job-queue `0c8da44`; auths + the admin actions
+tails remain). specs/README.md's post-giants sync rode the same
+commit; the survey's own note hands the root README's refresh to the
+release docs. The as-built syncs followed the landings they record:
+`d33a413` — SPEC-0012's ledger entries 7 (the keystore home, then
+still the R2 stopgap) and 8 (retention-var wiring, then pending), the
+as-builts for M1b (fake-runner full lifecycle 168/168), M1c (through
+the writers fixes and the creation flip, with the honest still-open
+list), M2; SPEC-0016's as-builts for M5b nuget + npm quota parity
+(wording corrected to the actual pre-insert `countVersions + 1 >
+limit` equivalent) with the four-service sweep recorded LANDED at
+landing time; nuget.ts's two stale `packages.go:214-219` cites
+corrected to the pin's 188-191/380-381 (comment-only, flagged by two
+units). `0f25339` — the post-landing sync an hour later: entries 7
+and 8 rewritten RESOLVED against `3bc5d29`'s landed truth (the
+keystore arc readable in place — the §4.4 spelled homes → M1b's
+R2-object stopgap → the D1 `system_keystore`; the strict-polarity
+trio, the hourly producer block, the */10 probe-gated zombie pair, the
+two purge.ts arms); the M1c still-open list updated for the three
+closures (org runners `3ab7532`, C3+C4 `cd7eec4` with the routes
+mounted same-commit per the dead-link rule, both M1b residuals via
+`3bc5d29`) — leaving the per-name artifact download/delete pair the
+only C4 tail, C5/C10 with M3.
 
 ---
 
@@ -736,6 +968,25 @@ run, because nothing stages an untracked file. The catch was a tree
 census, not a test failure: count what the tree carries against what
 the commits claim. An untracked test is a test that does not exist.
 
+The **premise-death and escaped-landing pair** closed the final hour
+(`d7a6f73`, `c269ff0`): the creation-defaults flip (`b0e1d88`) changed
+a posture that committed tests had encoded, and the deaths surfaced in
+three waves — the flip's own commit fixed pages-wave15's default-off
+arm and the seedRepo UNIQUE collision, then the audit-logs and LFS
+hasActions-threading matrices died on the same 'no repo_settings row'
+premise (the flip seeds the ARMED row at create, so a reduced-phase
+read of TRUE is no longer reachable by doing nothing); both were
+rebuilt on explicit update-based polarity phases (the wave15 idiom),
+disabled→no Actions block, armed→sub-items lit, the creation default
+restored in a finally. Beside them, the second escaped-landing catch:
+the runs-list icon set — 13 glyphs the landed C1 pages request — sat
+in `gen-ui-icons.mjs`'s ALLOWLIST uncommitted since `0c8da44`. The
+classes: a test that encodes a posture dies when the posture changes
+(drive the polarity explicitly, never rest on a creation default), and
+a landed page's dependencies are part of the landing (the
+verify-commit guard's own class, this time a file the committing
+window never staged).
+
 ---
 
 ## 3. Compatibility notes
@@ -748,22 +999,26 @@ the commits claim. An untracked test is a test that does not exist.
 | 0039 `talented_retro_girl` | the six `package*` tables (`packages`, `package_versions`, `package_files`, `package_blobs`, `package_properties`, `package_cleanup_rules`) | `8cdf44a` | applied remote ahead of code |
 | 0040 `gorgeous_nico_minoru` | `system_notices` | `8cdf44a` (the shared schema pairing) | applied remote ahead of code |
 | 0041 `workable_rick_jones` | the twelve `action*` tables (`action_runs`, `action_run_jobs`, `action_run_attempts`, `action_task_steps`, `action_task_outputs`, `action_tasks`, `action_tasks_versions`, `action_runners`, `action_runner_tokens`, `action_artifacts`, `action_log_chunks`, `action_run_job_summaries`) | `32ef8bf` | not recorded applied — the freeze window's deploy owns it |
+| 0042 `rainy_captain_cross` | `system_keystore` — the Actions crypto-material home (write-once rows, operator-only rotation, the upstream-exact `base64url(SHA-256(SPKI DER))` kid, one-time legacy adoption of M1b's R2 object) | `3bc5d29` | not recorded applied — the freeze window's deploy owns it (with 0041) |
 
-Schema stands at **85 tables** (73 + the twelve `action*` of 0041).
+Schema stands at **86 tables** (73 + the twelve `action*` of 0041 +
+`system_keystore` of 0042 — counted in the 0042 migration snapshot).
 0039/0040's "applied remote ahead of code" is `8cdf44a`'s own record
 ("both already applied remote ahead of code by the deploy-day migration
 pass, additive and reader-less until now"); 0038 — pending at the
 mid-flight cut — was necessarily swept by the same pass (a pass that
 applies 0039 applies its ancestors by construction). 0041 landed
-committed with M1a (`32ef8bf`, all twelve tables in the migration); no
-deploy record this window marks it applied remote — the freeze window's
-deploy pass owns it.
+committed with M1a (`32ef8bf`, all twelve tables in the migration) and
+0042 with the M1b residuals' closure (`3bc5d29`); no deploy record this
+window marks either applied remote — the freeze window's deploy pass
+owns both.
 
 ### Declared-operation count: 500
 
 SPEC-0016 M1's landing moved the count to **500/554 operations declared
 across 306 paths** (`check:api` PASS at tick-18's re-run, `72f40ec`,
-re-verified twice since — `abab71c` and `b2ff251`, still 500/554;
+re-verified three times since — `abab71c`, `b2ff251`, and tick-19's
+re-run at `0143e10` (`b7ef7e5`), still 500/554;
 tier-1 terminal 78/78 paths, 129/129 ops) — the +10 is exactly the
 package family's ops (`b6b0180`'s verified arithmetic). The remaining
 54 FEATURE-ABSENT operations are Actions only (SPEC-0012 — M1a's and
@@ -792,12 +1047,28 @@ still-absent list shrunk to auths/packages/actions); the two ABSENT are
 the actions subsystem rows — SPEC-0012's wave in flight. Router counts
 refreshed: 349 route families, 234 page files (`72f40ec`). README's
 implied 109/1/6 (`4c8277d`) was confirmed sound through `9d7ccd6`.
-No new tick ran after tick-18; the actions surfaces that landed since —
-C8's settings pair and the admin packages list (`a8e065f`, the admin
-PARTIAL row's last named item), C9's general page (`6fcb561`) with the
-unit-row fix (`c1cefaa`), the options retirement (`42c2af7`), and the
-Actions tab mount (`0c8da44`) — are
-implied-pending-next-tick, the README's own marking (`b2ff251`).
+
+Tick-19 (`b7ef7e5`) — the survey's first PROGRAMMATIC walk, its
+pre-edit run reproducing tick-18 exactly before applying its own
+edits — moved the board to **114 LANDED / 2 PARTIAL / 0 ABSENT** of
+116 at `e26c862`, zero rows in flight, the dispatch gate list EMPTY:
+the E settings/actions row flipped LANDED (secrets/variables `a8e065f`
++ general `6fcb561` + arms/redirect/runners `0c8da44` — every
+page-bearing GET in `web.go:1262-1278` serves), the F repo-actions row
+flipped PARTIAL (the runs list + job queue + run-viewer subtree serve;
+the six tail GETs — logs/workflow/artifacts-download/preview pair/
+badge.svg/workflow-dispatch-inputs — stayed unclaimed at the tick's
+HEAD), and the admin row stays PARTIAL with its absent list shrunk
+(packages `a8e065f`, job-queue `0c8da44`; auths + the admin actions
+tails remain). **TODO(final-window): the final ui-parity tick
+numbers** — the 9:00 run's tick or standing re-count fills the final
+X/Y/Z of 116. No tick has run since (tick-19 measured at `e26c862`);
+the post-tick landings are implied-pending-next-tick, the survey's own
+convention: the org runners twin (`3ab7532`) and C3's log tail/steps +
+C4's artifacts preview and signed raw serving (`cd7eec4`) — the F
+row's unclaimed tails shrink by the logs tail and the preview pair,
+and C4's per-name artifact download/delete pair remains that family's
+only census tail.
 
 ---
 
@@ -813,31 +1084,55 @@ implied-pending-next-tick, the README's own marking (`b2ff251`).
   census C8 + the admin packages page + the loginRedirect fix in one
   window (`a8e065f`), and the five-family actions-UI integrator
   (`0c8da44`) — all counted above, none carried.
-- **One unit in flight** (working tree, uncommitted — none counted
-  anywhere in these notes or the README): **SPEC-0016 M5b, the nuget
-  protocol** (`services/packages/nuget.ts` + its suite, the mount
-  growing in `packages-protocols.ts`). Beside it, C9's second
-  dispatched follow-up — the ActionsConfig store's migration,
-  unlocking the token-permissions + collaborative-owners sections
-  `6fcb561` documented-unrendered — has not landed.
+- **The actions tails are IN FLIGHT** (working tree, uncommitted at
+  this pre-draft's snapshot — none counted anywhere in these notes or
+  the README): the F-row tail pages — `repo-actions-logs`,
+  `repo-actions-workflow`, `repo-actions-artifacts-download`,
+  `repo-actions-badge`, `repo-actions-dispatch-inputs` (each with its
+  suite) — and the admin actions pages (`admin-actions-runners`,
+  `admin-actions-variables`, with their matrices), riding a
+  working-tree change to `repo-actions-artifacts.tsx` (the
+  attachment-disposition twin the download family composes). This is
+  tick-19's "the actions tails over landed data become the new
+  polish-class targets" executing; anything that lands before the cut
+  appends in §1's structure and moves §3's numbers. Beyond the working
+  tree, the residual board, straight from the SPECs' own still-open
+  lists: the **C4 census tails** — the per-name artifact
+  download/delete pair (GET+DELETE
+  `/actions/runs/{run}/artifacts/{name}`), a separate unit; **C5's**
+  rerun + rerun-failed defer to M3's job emitter (the census's flagged
+  split — attempt creation + job re-emission are emitter territory;
+  the cancel arm landed inside C2's window) and **C10's**
+  scoped-workflow pages defer with M3; the **M3 trigger chain** stages
+  behind Open question 1 (without it the control plane has no
+  automatic producer — jobs arrive via the test-harness insertion
+  seams); **C9's dispatched follow-up** — the ActionsConfig store's
+  migration, unlocking the token-permissions + collaborative-owners
+  sections `6fcb561` documented-unrendered — has not landed; and
+  **SPEC-0016's M6 container + M7 index-builder** remain pending.
 - **SPEC-0015 is COMPLETE** (`fdfe73a` closed M3); **SPEC-0019's R02/R05**
   are landed (`f50c9f7` + the `470e946` mounts) — the first cut's §4
-  items for both are retired. **SPEC-0016 stands at M1–M5a landed**
-  (M6 container + M7 index-builder pending, M5b in flight);
-  **SPEC-0012's control plane is COMPLETE** — M1a (`32ef8bf`) + M1b
-  (`10cfb97`) — plus the M1c UI's first window (`0c8da44` —
-  C1/C2/C6/C7/C8/C9); the M3 trigger chain stages behind the
-  expression-evaluator question.
+  items for both are retired. **SPEC-0016 stands at M1–M5b landed**
+  (`e26c862` closed M5b; M6 container + M7 index-builder pending);
+  **SPEC-0012's control plane is COMPLETE** (M1a `32ef8bf` + M1b
+  `10cfb97`, both ledgered residuals closed by `3bc5d29`) with **M2's
+  guide landed** (`0143e10`) and **M1c's UI through the org window**
+  (`3ab7532`) **and the run-viewer's deep arms** (`cd7eec4` — C3+C4,
+  routes mounted same-commit); the named tails above are what remains;
+  the M3 trigger chain stages behind the expression-evaluator question.
 - **Deploy posture**: migrations 0039/0040 sit applied-remote ahead of
-  code (`8cdf44a`'s deploy-day migration pass record); 0041 is
-  committed with M1a (`32ef8bf`) but no deploy record this window
-  marks it applied — the freeze window owns it. The RD25
-  deployed-reality record in `docs/design/p0-evidence.md` remains the
-  last fully-written production verdict; the freeze window owns this
-  wave's deploy record. (The probe fix `c7ec2fe` reports all 12
+  code (`8cdf44a`'s deploy-day migration pass record); 0041
+  (`32ef8bf`) and 0042 (`3bc5d29`) are committed but no deploy record
+  this window marks either applied — the freeze window owns both. The
+  RD25 deployed-reality record in `docs/design/p0-evidence.md` remains
+  the last fully-written production verdict; the freeze window owns
+  this wave's deploy record. (The probe fix `c7ec2fe` reports all 12
   batteries green against deployed version `4e2fb76b` — a mid-window
-  redeploy is implied by that line, but no deploy write-up landed in the
-  docs this pass could verify.)
+  redeploy is implied by that line, but no deploy write-up landed in
+  the docs this pass could verify. The toolkit now carries 14
+  batteries / 176 probes — `49a1502` + `07221df` — so the freeze
+  window's probe run is the new pair's and the nuget arm's first live
+  exercise.)
 - Carried unchanged from v1.2 §4: the ws1009 residuals (strip-mode trades
   original-position failure-frame mapping; the upstream chunked-frames fix
   remains desirable — ADR-0006's revisit trigger stays armed against

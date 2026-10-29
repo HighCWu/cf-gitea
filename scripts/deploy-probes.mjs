@@ -117,9 +117,9 @@
  *                  main advanced), and the whitelist/enforce-admins flag set
  *                  round-tripping the serializer (glob name → branch_name "",
  *                  the M4 sanitizer keeps the owner, the enable_push=false
- *                  cascade). CHAINED (shared fixtures). Needs an ADMIN PAT +
- *                  wrangler auth for the priority id lookup (--d1-scope). A
- *                  red run sweeps the rules + repo + member user + its token
+ *                  cascade). CHAINED (shared fixtures). Needs an ADMIN PAT
+ *                  (the priority id lookup rides the pure API). A red run
+ *                  sweeps the rules + repo + member user + its token
  *                  (the failureTail).
  *   demo           The SPEC-0014 demo-POSTURE battery (§7's named battery)
  *                  against the deployed demo instance: the committed deploy
@@ -387,7 +387,7 @@ const usage = () =>
   "  demo:          --d1-scope local (against pnpm dev with DEMO_MODE=true in .dev.vars) runs the deep TTL-mechanics arm; a deployed target records an ops-note [info] there (the sweep log is not API-reachable). The banner arm warns until the M2 wave lands.\n" +
   "  wiki-git:      (no extra options)\n" +
   "  packages-registry: (no extra options — the row-cleanup arm reuses --d1-scope and needs wrangler auth, the fixwave precedent)\n" +
-  "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1)\n" +
+  "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (2 — the standing bootstrap set)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
 // ---------- plumbing ----------
