@@ -97,6 +97,13 @@ const cronController = (cron: string): ScheduledController => ({ cron }) as Sche
 function scheduledEnv(demoMode: string): Env {
   const copy = { ...env };
   (copy as { DEMO_MODE: string }).DEMO_MODE = demoMode;
+  // The audit-retention producer rides the same hourly entry and is NOT
+  // demo-gated (SPEC-0015 M4's ratified posture) — pin it DISARMED here so
+  // this suite's zero-D1/zero-send tripwires stay about the DEMO gate alone,
+  // whatever the surrounding config injects (the ADR-0005 D3 lesson applied
+  // at the test-env level; the armed posture is pinned in audit.test.ts
+  // under explicit envs).
+  (copy as { AUDIT_RETENTION_DAYS?: string }).AUDIT_RETENTION_DAYS = "off";
   return copy;
 }
 
