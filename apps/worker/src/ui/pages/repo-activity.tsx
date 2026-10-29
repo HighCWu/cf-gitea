@@ -113,11 +113,10 @@
  * (the releases precedent): section headers render h3 where upstream's h4
  * would skip upward past the h2; the stats-table bar cells carry
  * aria-labels (upstream's bare `<a>` cells have no accessible name); the
- * nav menu renders the live Pulse item only — the contributors/
- * code-frequency/recent-commits items target the unlanded R15 chart pages
- * (the dead-link rule, the releases-navbar reduction); the dropdown's
- * triangle-down svg is unrendered (the generated icon table has no
- * octicon-triangle-down entry).
+ * nav menu rides pages/repo-charts.tsx's shared RepoActivityNavMenu — all
+ * four items LIVE since the R15 chart family landed (the pulse item active
+ * here); the dropdown's triangle-down svg is unrendered (the generated icon
+ * table has no octicon-triangle-down entry).
  */
 
 import { and, asc, desc, eq, gte, lt, or, sql } from "drizzle-orm";
@@ -133,6 +132,7 @@ import { pathEscapeSegments } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
 import { parseActivityPeriod } from "./activity-author-data";
+import { RepoActivityNavMenu } from "./repo-charts";
 
 /** Page chrome text (component-local, the tabLocale pattern — the strings
  *  cite upstream's locale keys, locale_en-US.json's repo.activity block). */
@@ -708,14 +708,9 @@ export function RepoActivityPage(props: { ctx: UiContext; data: RepoActivityData
     <BaseLayout ctx={ctx} title={activityLocale.page_title} pageClass="repository commits">
       <div class="ui container flex-container">
         <div class="flex-container-nav">
-          <div class="ui fluid vertical menu">
-            {/* repo/navbar.tmpl:4-7 — the live Pulse item only; the
-                contributors/code-frequency/recent-commits items target the
-                unlanded R15 chart pages (the dead-link rule). */}
-            <a class="active item" href={`${repoLink}/activity`}>
-              {activityLocale.navbar_pulse}
-            </a>
-          </div>
+          {/* repo/navbar.tmpl:2-17 — the four-item strip (pulse + the three
+              R15 chart pages, all LIVE); PageIsPulse active here. */}
+          <RepoActivityNavMenu repoLink={repoLink} active="pulse" />
         </div>
         <div class="flex-container-main">
           <h2 class="ui header activity-header">

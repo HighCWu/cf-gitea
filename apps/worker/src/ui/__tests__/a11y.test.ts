@@ -390,6 +390,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Repositories",
       "Applications",
       "Webhooks",
+      "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
       "Stats",
       "Cron Tasks",
       "Queues",
@@ -442,6 +443,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Repositories",
       "Applications",
       "Webhooks",
+      "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
       "Stats",
       "Cron Tasks",
       "Queues",
@@ -513,6 +515,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Repositories",
       "Applications",
       "Webhooks",
+      "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
       "Stats",
       "Cron Tasks",
       "Queues",
@@ -582,6 +585,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Repositories",
       "Applications",
       "Webhooks",
+      "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
       "Stats",
       "Cron Tasks",
       "Queues",

@@ -26,7 +26,8 @@
  *     (hasIssues off → PR-only Overview, hasReleases off → no releases arm).
  *
  * The parse claims (repo-activity family, the raw period segment, the
- * unclaimed R15 chart tails) are pinned in the FIRST describe over pure
+ * unclaimed-vs-claimed R15 chart literals) are pinned in the FIRST describe
+ * over pure
  * parseUiRoute/handlesUiRoute — no D1. Mount arms ride the releases.matrix
  * minted-session harness (per-test D1 wipe + idempotent re-seed, REAL
  * pushed content for the engine walk; the commit/row clocks are relative
@@ -345,18 +346,34 @@ describe("repo-activity claim pins (parseUiRoute / handlesUiRoute)", () => {
     });
   });
 
-  it("stays unclaimed on the deeper tails (the R15 chart pages serialize later)", () => {
-    // web.go:1633-1646's chart group is the census's own R15 row — the
-    // engine's 404 owns them until that wave.
-    expect(parseUiRoute("/octo/hello/activity/contributors")).toBeNull();
-    expect(parseUiRoute("/octo/hello/activity/code-frequency")).toBeNull();
-    expect(parseUiRoute("/octo/hello/activity/recent-commits")).toBeNull();
-    expect(parseUiRoute("/octo/hello/activity/contributors/data")).toBeNull();
-    // Deeper junk tails too.
+  it("the three chart literals claim to the R15 family; junk tails stay unclaimed", () => {
+    // web.go:1633-1646's chart group LANDED (the census's R15 row): the
+    // literals + their /data tails claim to pages/repo-charts.tsx's
+    // repo-charts family (the chart matrix pins the full shape set); the
+    // PERIOD arm is untouched by them.
+    expect(parseUiRoute("/octo/hello/activity/contributors")).toEqual({
+      family: "repo-charts",
+      owner: "octo",
+      repo: "hello",
+      kind: "contributors",
+      tail: null,
+    });
+    expect(parseUiRoute("/octo/hello/activity/recent-commits/data")).toEqual({
+      family: "repo-charts",
+      owner: "octo",
+      repo: "hello",
+      kind: "recent-commits",
+      tail: "data",
+    });
+    // Deeper junk tails stay unclaimed (chi registers only '' and '/data'
+    // per chart group) — the engine's 404 owns them.
     expect(parseUiRoute("/octo/hello/activity/daily/extra")).toBeNull();
+    expect(parseUiRoute("/octo/hello/activity/contributors/extra")).toBeNull();
+    expect(parseUiRoute("/octo/hello/activity/daily/data")).toBeNull();
     expect(handlesUiRoute("/octo/hello/activity")).toBe(true);
     expect(handlesUiRoute("/octo/hello/activity/daily")).toBe(true);
-    expect(handlesUiRoute("/octo/hello/activity/contributors")).toBe(false);
+    expect(handlesUiRoute("/octo/hello/activity/contributors")).toBe(true);
+    expect(handlesUiRoute("/octo/hello/activity/contributors/extra")).toBe(false);
   });
 });
 
@@ -379,7 +396,8 @@ describe("the activity page mounts (period arms + counts + lists)", () => {
     expect(html).toContain('href="/actmx-owner/act/activity/daily"');
     expect(html).toContain('href="/actmx-owner/act/activity/yearly"');
     expect(html).toContain('class="active item" href="/actmx-owner/act/activity/weekly"');
-    // The nav's live Pulse item (the R15 siblings dead-link-omitted).
+    // The nav strip (repo/navbar.tmpl — all four items LIVE since the R15
+    // chart family landed; the chart matrix pins the full four-item strip).
     expect(html).toContain("Pulse</a>");
 
     // Overview counts (the landed D1 aggregates): 2 open issues + 1 old

@@ -65,9 +65,10 @@
  *   confirmation); the confirmation step is not reproduced — the checkbox is
  *   a plain POST behind the Origin guard.
  * - Not rendered: the avatar field (no avatar pipeline), the mirror/archive
- *   tint sections, and the navbar items with no landed pages (LFS/Actions/
- *   Audit — the SettingsNav dead-link rule; the landed tabs' items folded
- *   in, wave-settingsnav-fold). Template/website WERE in this list until
+ *   tint sections, and the navbar items with no landed pages (LFS/Actions —
+ *   the SettingsNav dead-link rule; the landed tabs' items folded in,
+ *   wave-settingsnav-fold; Audit joined the landed set with the census R13
+ *   arm, see the SettingsNav note). Template/website WERE in this list until
  *   wave-settings-options landed them (below).
  * - The options form's full field set (wave 129 — upstream options.tmpl at
  *   the pin renders TWO forms with action-routed POST handling: the basic
@@ -254,6 +255,7 @@ import { gitHooksSettingsLocale } from "./repo-settings-githooks";
 import { publicAccessLocale } from "./repo-settings-public-access";
 import { tagProtectionLocale } from "./repo-settings-tags";
 import { wikiSettingsLocale } from "./repo-settings-wiki";
+import { settingsAuditLogsLocale } from "./settings-audit-logs";
 
 /** Page chrome text (component-local, the issuesLocale pattern — locale.ts
  *  is shared and not this wave's file). */
@@ -514,13 +516,19 @@ export function renderRepoSettingsPage(options: {
  *   - Wiki is the wave-54 divergence: upstream has no wiki navbar item (the
  *     block lives in options.tmpl) — placed after Mirror per the mirror
  *     item's placement rule.
+ *   - Audit (navbar.tmpl:60-62) is the census R13 arm's item — LAST in
+ *     upstream's menu, rendered after the wiki item here (the Actions
+ *     <details> block it follows upstream has no landed pages). Lit by the
+ *     pages/settings-audit-logs.tsx mount; before that page landed the item
+ *     rode the dead-link omission (the module header's v1-degradations
+ *     note, now retired for Audit — LFS and Actions stay dead).
  *
  * The tab items' texts import the owning page modules' locale objects (the
  * one-copy rule). Wave-settingsnav-fold deleted the five modules' scaffold
  * navs (GitHooksSettingsNav, TagSettingsNav, DeployKeysSettingsNav,
  * PublicAccessSettingsNav, WikiSettingsNav) onto this component. Exported
  * for pages/branch-protection.tsx (`branches`), pages/
- * settings-collaboration.tsx (`collaboration`) and the five tab modules. */
+ * settings-collaboration.tsx (`collaboration`) and the tab modules. */
 export function SettingsNav(props: {
   repoLink: string;
   active:
@@ -533,7 +541,8 @@ export function SettingsNav(props: {
     | "githooks"
     | "keys"
     | "mirror"
-    | "wiki";
+    | "wiki"
+    | "audit"; // pages/settings-audit-logs.tsx (the census R13 arm)
   /** The repo row, arming the conditional Public Access item (navbar.tmpl:
    *  7-11). */
   repo?: RepoRow;
@@ -593,6 +602,13 @@ export function SettingsNav(props: {
             rule (upstream renders no wiki navbar item). */}
         <a class={props.active === "wiki" ? "active item" : "item"} href={`${props.repoLink}/settings/wiki`}>
           {wikiSettingsLocale.wiki}
+        </a>
+        {/* navbar.tmpl:60-62 — Audit, LAST in upstream's menu (after the
+            dead Actions details block). Lit by the settings-audit-logs page's
+            mount (the census R13 arm — the SettingsNav dead-link omission
+            retired). */}
+        <a class={props.active === "audit" ? "active item" : "item"} href={`${props.repoLink}/settings/audit_logs`}>
+          {settingsAuditLogsLocale.title}
         </a>
       </div>
     </div>

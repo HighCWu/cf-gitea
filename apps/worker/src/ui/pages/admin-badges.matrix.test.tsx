@@ -293,6 +293,6 @@ describe("the badge family DOM (templates/admin/badge/*.tmpl at the pin)", () =>
     expect(html).toContain('href="/-/admin/emails"');
     expect(html).toContain('href="/-/admin/applications"');
     expect(html).not.toContain("/-/admin/auths");
-    expect(html).not.toContain("/-/admin/notices");
+    expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
   });
 });

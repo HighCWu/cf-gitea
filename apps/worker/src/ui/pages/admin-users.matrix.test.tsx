@@ -315,7 +315,7 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(html).toContain('href="/-/admin/hooks"');
     expect(html).not.toContain("/-/admin/self_check");
     expect(html).not.toContain("/-/admin/auths");
-    expect(html).not.toContain("/-/admin/notices");
+    expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
     expect(html).not.toContain("/-/admin/config");
     expect(html).not.toContain("/-/admin/packages");
     expect(html).not.toContain("/-/admin/actions");

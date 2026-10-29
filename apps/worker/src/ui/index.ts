@@ -850,6 +850,14 @@ import {
   parseOrgApplicationCreateForm,
   renderOrgApplicationsPage,
 } from "./pages/org-settings-applications";
+// The census R13 arm: the settings audit log pages (ONE shared module —
+// upstream routers/web/shared/audit — with the repo and the org mounts; the
+// scope pairs key the M4 instrumentation's encodings).
+import {
+  loadSettingsAuditLogs,
+  renderOrgSettingsAuditLogsPage,
+  renderRepoSettingsAuditLogsPage,
+} from "./pages/settings-audit-logs";
 import {
   applyUserProfileForm,
   loadUserSettingsPageData,
@@ -1007,6 +1015,7 @@ import {
   parseAdminApplicationCreateForm,
   renderAdminApplicationsPage,
 } from "./pages/admin-applications";
+import { adminNoticesLocale, loadAdminNoticesData, renderAdminNoticesPage } from "./pages/admin-notices";
 import {
   loadUserProfileData,
   renderUserProfilePage,
@@ -1227,6 +1236,9 @@ import { loadCommitViewData, renderCommitViewPage } from "./pages/commit-view";
 // The census R08 blame page (web.go:1729-1733's /blame family) over the
 // engine's blame() read RPC.
 import { loadBlameData, renderBlamePage } from "./pages/blame";
+// The census R10 in-repo code search page (web.go:1768's /search literal)
+// over the engine's grep() read RPC (SPEC-0015 M1).
+import { loadRepoSearchData, renderRepoSearchPage } from "./pages/repo-search";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
 import {
   applyRepoBasics,
@@ -1296,6 +1308,7 @@ import { findRepositoryById } from "../api/services/repository";
 import { toApiUser } from "../api/auth";
 import { ApiError } from "../api/errors";
 import { IssuesService } from "../issues/service";
+import { deleteNoticesByIds, emptyNotices, parseNoticeIds } from "../services/notices";
 import type { OrgRecord } from "../services/orgs/orgs";
 // Window-2d: the four repo-settings tab modules.
 import {
@@ -1442,6 +1455,15 @@ import {
 } from "./pages/pull-files-single-commit";
 import { activityAuthorDataResponse, loadActivityAuthorData } from "./pages/activity-author-data";
 import { loadRepoActivityData, renderRepoActivityPage } from "./pages/repo-activity";
+import {
+  chartDataResponse,
+  loadChartFrequencyData,
+  loadRepoContributorsData,
+  renderRepoCodeFrequencyPage,
+  renderRepoContributorsPage,
+  renderRepoRecentCommitsPage,
+  type RepoChartKind,
+} from "./pages/repo-charts";
 import {
   commentAttachmentsFragmentResponse,
   loadCommentAttachmentsFragment,
@@ -1625,7 +1647,8 @@ export interface SettingsRoute {
     | "settings-keys" // GET+POST /settings/keys
     | "settings-keys-delete" // POST /settings/keys/delete
     | "settings-public-access" // GET+POST /settings/public_access
-    | "settings-wiki"; // GET+POST /settings/wiki (window-2d pass 2)
+    | "settings-wiki" // GET+POST /settings/wiki (window-2d pass 2)
+    | "settings-audit-logs"; // GET /settings/audit_logs (the census R13 arm — GET only upstream, web.go:1279)
   owner: string;
   repo: string;
   /** The hook id (the detail/test/delete families only) or the rule id (the
@@ -2383,6 +2406,20 @@ export interface BlameRoute {
   refSuffix: string;
 }
 
+/** The census R10 in-repo code search page family (pages/repo-search.tsx):
+ *  upstream web.go:1768's `m.Get("/search", reqUnitCodeReader, repo.Search)`
+ *  — the exact bare literal inside the stars/watchers group (web.go:1764-1773,
+ *  `optSignIn, context.RepoAssignment`; no MustBeNotEmpty). The query arms
+ *  (`q`, `search_mode`, `page`, and our `path` pathspec passthrough) ride the
+ *  URL, not the path — the family claims the bare literal only; deeper tails
+ *  stay unclaimed → the engine's 404, exactly upstream's unregistered-route
+ *  answer. */
+export interface RepoSearchRoute {
+  family: "repo-search";
+  owner: string;
+  repo: string;
+}
+
 /** The wave-9 site root (pages/dashboard.tsx): upstream `Home`
  *  (routers/web/home.go:26-44) — `/` serves the signed-in dashboard, the
  *  anonymous landing. The dispatcher never consults `handlesUiRoute` for it
@@ -2453,9 +2490,8 @@ export interface SearchAuxRoute {
  *  units admits the group; ours reduces to the visibility read because the
  *  code unit has no toggle). The period segment is OPTIONAL and its switch
  *  has NO 4xx arm (activity.go:30-45): unknowns render the WEEKLY window.
- *  The deeper R15 chart tails (contributors/code-frequency/recent-commits)
- *  stay unclaimed → the engine's 404 — they serialize after this family
- *  (the census's R15 row). */
+ *  The three chart literals are NOT period values — the R15 chart group's
+ *  static routes claim them first (RepoChartRoute below, web.go:1633-1646). */
 export interface RepoActivityRoute {
   family: "repo-activity";
   owner: string;
@@ -2465,6 +2501,28 @@ export interface RepoActivityRoute {
    *  the bare /activity URL. Unknown segments are kept raw and default to
    *  the weekly arm at the loader, upstream-exact. */
   period: string | null;
+}
+
+/** The census R15 chart family (pages/repo-charts.tsx): the three static
+ *  chart pages + their `/data` JSON tails — upstream's nested group
+ *  (web.go:1633-1646):
+ *
+ *      m.Group("/contributors",   m.Get("") + m.Get("/data"))
+ *      m.Group("/code-frequency", m.Get("") + m.Get("/data"))
+ *      m.Group("/recent-commits", m.Get("") + m.Get("/data"))  // same data as code-frequency
+ *
+ *  registered AHEAD of the /{period} param inside the /activity group, gated
+ *  by the group middleware + `reqUnitCodeReader` (web.go:1634 — the code
+ *  unit demand; ours reduces to the visibility read, the repo-activity
+ *  precedent). Anything past the /data tail (or a non-literal tail deeper
+ *  than /{period}) is unclaimed — chi has no such route, the engine 404s. */
+export interface RepoChartRoute {
+  family: "repo-charts";
+  owner: string;
+  repo: string;
+  kind: RepoChartKind;
+  /** `"data"` on the JSON tails; `null` on the three page GETs. */
+  tail: "data" | null;
 }
 
 /** Window-2e B2: the repo-scoped aux feeds + fragments (issues-search-aux,
@@ -2514,10 +2572,10 @@ export interface UserSettingsRoute {
 /** Window-2c: the admin family (pages/admin-dashboard.tsx +
  *  pages/admin-monitor.tsx + the wave's users/orgs/repos pages — upstream's
  *  /-/admin group). The census R18 (a) arms extend the family union
- *  additively: emails / hooks / badges / applications (each module's header
- *  carries its mount record; the remaining upstream arms stay unclaimed —
- *  config/notices/auths are the census's (b) class, packages/actions the
- *  (c) gate). */
+ *  additively: emails / hooks / badges / applications, and SPEC-0018 §3.1's
+ *  notices arm (each module's header carries its mount record; the remaining
+ *  upstream arms stay unclaimed — config/auths are the census's (b) class,
+ *  packages/actions the (c) gate). */
 export interface AdminRoute {
   family:
     | "admin-dashboard"
@@ -2539,7 +2597,10 @@ export interface AdminRoute {
     | "admin-badge-users-delete"
     | "admin-applications"
     | "admin-application-create"
-    | "admin-application-delete";
+    | "admin-application-delete"
+    | "admin-notices"
+    | "admin-notices-delete"
+    | "admin-notices-empty";
   /** The monitor page (stats/cron/queue/stacktrace → the module's
    *  AdminMonitorPage union); absent on the dashboard family and the three
    *  listing families. */
@@ -2658,6 +2719,7 @@ export interface OrgSettingsRoute {
     | "org-settings-applications" // GET /{org}/settings/applications (the R20-a oauth2 list)
     | "org-settings-applications-create" // POST /{org}/settings/applications/oauth2 (the R20-a create)
     | "org-settings-applications-delete" // POST /{org}/settings/applications/oauth2/{id}/delete (the R20-a delete)
+    | "org-settings-audit-logs" // GET /{org}/settings/audit_logs (the R20 +audit arm / R13 org mount — GET only upstream, web.go:1069)
     | "org-actions-secrets" // GET+POST /{org}/settings/actions/secrets (window-2b)
     | "org-actions-secrets-delete" // POST .../secrets/delete (window-2b)
     | "org-actions-variables" // GET /{org}/settings/actions/variables (window-2b)
@@ -2767,7 +2829,9 @@ export type ParsedUiRoute =
   | WikiRoute
   | FileEditorRoute
   | BlameRoute
+  | RepoSearchRoute
   | RepoActivityRoute
+  | RepoChartRoute
   | SiteHomeRoute
   | ExploreRoute
   | NotificationsRoute
@@ -3080,6 +3144,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     ) {
       return { family: "admin-application-delete", applicationId: Number.parseInt(tail[2] as string, 10) };
     }
+    // The SPEC-0018 §3.1 notices arm (web.go:882-886's /notices group): the
+    // paged GET and the two plain-form write POSTs (the module's mount
+    // record). NO create route — notices are system-generated, upstream
+    // and here.
+    if (tail.length === 1 && tail[0] === "notices") return { family: "admin-notices" };
+    if (tail.length === 2 && tail[0] === "notices" && tail[1] === "delete") return { family: "admin-notices-delete" };
+    if (tail.length === 2 && tail[0] === "notices" && tail[1] === "empty") return { family: "admin-notices-empty" };
     if (tail.length === 2 && tail[0] === "monitor") {
       if (tail[1] === "stats") return { family: "admin-monitor", page: "stats" };
       if (tail[1] === "cron") return { family: "admin-monitor", page: "cron" };
@@ -3285,9 +3356,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // PathParamInt64 parity so "007" parses as 7 and a negative 404-shells on
   // the lookup) + the {id}/delete write (the landed repo page's arm-scoped
   // convention — upstream's shared /delete?id= target is the list trash
-  // buttons' form, which this UI does not render). Every other tail (the
-  // applications/packages/actions/blocked_users/audit_logs tabs — separate
-  // pages not landed) stays unclaimed → the engine's 404.
+  // buttons' form, which this UI does not render). The landed tabs' claims
+  // grew with their waves (hooks, blocked_users, applications, audit_logs —
+  // each literal's line carries its citation); every other tail (the
+  // packages/actions-management tabs — separate pages not landed) stays
+  // unclaimed → the engine's 404.
   if (repo === "settings" && owner.toLowerCase() !== "user") {
     if (raw.length === 3) return { family: "org-settings", owner };
     if (raw.length === 4) {
@@ -3302,6 +3375,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       // The R20-a applications tab (the committed module — the list; the
       // create/delete tails are claimed below the length-4 block).
       if (raw[3] === "applications") return { family: "org-settings-applications", owner };
+      // The R20 +audit_logs arm / R13 org mount (pages/settings-audit-logs.tsx
+      // — web.go:1069's literal `m.Get("/audit_logs", org_setting.ViewAudit
+      // Logs)`, GET only; the shared renderer sits under the group's
+      // RequireOwner gate). Query arms ride the URL, so any deeper tail stays
+      // unclaimed → the engine's 404.
+      if (raw[3] === "audit_logs") return { family: "org-settings-audit-logs", owner };
     }
     if (raw.length === 5 && raw[3] === "applications" && raw[4] === "oauth2") {
       return { family: "org-settings-applications-create", owner };
@@ -3575,17 +3654,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // segment (the activity-author-data convention): activity.go:30-45's
   // switch has no 4xx arm, unknown segments render the WEEKLY window with
   // the weekly item active, and the bare URL parses as period null. The
-  // deeper /activity/{contributors,code-frequency,recent-commits} chart
-  // pages stay UNCLAIMED → the engine's 404 (the census's own R15 row —
-  // those pages serialize after this one; the page's nav menu renders the
-  // live Pulse item only, the dead-link rule).
+  // three chart literals claim to the R15 chart family (pages/repo-charts.tsx)
+  // BEFORE the period arm — upstream chi dispatches the chart group's static
+  // routes ahead of the /{period} param (web.go:1633-1646, the R15 census
+  // row, LANDED); deeper junk tails stay unclaimed → the engine's 404.
   if (head === "activity") {
     if (rest.length === 0) return { family: "repo-activity", owner, repo, period: null };
     // The R15 chart literals are NOT period values — upstream chi dispatches
     // /activity/contributors etc. to the chart group's static routes ahead of
-    // the /{period} param (web.go:1633-1646), and those pages are the
-    // unlanded R15 row: the literals stay unclaimed → the engine's 404.
-    if (rest.length === 1 && rest[0] !== "contributors" && rest[0] !== "code-frequency" && rest[0] !== "recent-commits") {
+    // the /{period} param (web.go:1633-1646). Page GETs claim kind + tail
+    // null; the /data JSON tails claim tail "data" (chi registers exactly
+    // "" and "/data" per group — anything else falls through to the 404).
+    if (rest[0] === "contributors" || rest[0] === "code-frequency" || rest[0] === "recent-commits") {
+      const kind: RepoChartKind = rest[0];
+      if (rest.length === 1) return { family: "repo-charts", owner, repo, kind, tail: null };
+      if (rest.length === 2 && rest[1] === "data") return { family: "repo-charts", owner, repo, kind, tail: "data" };
+    } else if (rest.length === 1) {
       return { family: "repo-activity", owner, repo, period: rest[0] ?? null };
     }
   }
@@ -3724,6 +3808,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 2 && rest[0] === "keys" && rest[1] === "delete") {
       return { family: "settings-keys-delete", owner, repo };
     }
+    // The census R13 arm (pages/settings-audit-logs.tsx — web.go:1279's
+    // literal `m.Get("/audit_logs", repo_setting.ViewAuditLogs)`, GET only;
+    // the shared renderer sits under reqRepoAdmin like the whole settings
+    // group). Query arms ride the URL (sort/action/origin/actor/page), so
+    // any deeper tail stays unclaimed → the engine's 404, upstream's
+    // unregistered-route answer.
+    if (rest.length === 1 && rest[0] === "audit_logs") return { family: "settings-audit-logs", owner, repo };
     if (rest.length === 1 && rest[0] === "public_access") {
       return { family: "settings-public-access", owner, repo };
     }
@@ -4128,6 +4219,17 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // singular `/fork` combo below is wave 26's — a distinct literal.)
   if (head === "forks" || head === "stars" || head === "watchers") {
     if (rest.length === 0) return { family: head, owner, repo };
+    return null;
+  }
+  // The census R10 in-repo code search (pages/repo-search.tsx — upstream
+  // web.go:1768's bare literal, registered in THIS SAME group as the social
+  // trio: `m.Get("/search", reqUnitCodeReader, repo.Search)` at
+  // web.go:1766): the exact bare literal, GET-only. The query arms ride the
+  // URL (?q, ?search_mode, ?page, our ?path pathspec passthrough), so any
+  // deeper tail stays unclaimed → the engine's 404, exactly upstream's
+  // unregistered-route answer.
+  if (head === "search") {
+    if (rest.length === 0) return { family: "repo-search", owner, repo };
     return null;
   }
   // Wave-26 fork form (pages/repo-fork.tsx — upstream web.go:1490's
@@ -4927,6 +5029,28 @@ async function repoTagDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/tags?saved=1` } }));
 }
 
+/**
+ * GET /{owner}/{repo}/settings/audit_logs (pages/settings-audit-logs.tsx —
+ * the census R13 repo arm; upstream web.go:1279's
+ * `m.Get("/audit_logs", repo_setting.ViewAuditLogs)` over the shared audit
+ * renderer): the settings family's settingsGate posture (the whole upstream
+ * group closes behind reqRepoAdmin, web.go:1283-1286 — anonymous 303s onto
+ * the login round-trip, a signed-in non-admin 404-shells), then the shared
+ * load → render at 200. The scope pair keys the M4 instrumentation's
+ * encoding: scope_type "repository" + scope_id repo.id, the repositories.id
+ * UUID the create emit carried (repos/service.ts:336-338).
+ */
+async function repoAuditLogsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, url, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-audit-logs") return respond(await c.notFound()); // drift guard
+  const data = await loadSettingsAuditLogs(c.env.DB, { type: "repository", id: repo.id }, url.searchParams);
+  return respond(c.html(renderRepoSettingsAuditLogsPage({ ctx, data }), 200));
+}
+
 async function repoDeployKeysPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
@@ -5503,6 +5627,76 @@ async function repoActivityPage(c: Context<{ Bindings: Env }>): Promise<Response
   const data = await loadRepoActivityData(c.env, repo, route.period, { now: routeNow() });
   if (data === null) return respond(c.html(renderNotFound(ctx), 404)); // the default-branch arm
   return respond(c.html(renderRepoActivityPage(ctx, data), 200));
+}
+
+/** GET /{owner}/{repo}/activity/{contributors|code-frequency|recent-commits}
+ *  (pages/repo-charts.tsx — the census R15 chart pages, web.go:1635/1639/1643
+ *  → repo.Contributors/CodeFrequency/RecentCommits, all rendering the
+ *  repo/activity template). The shared visibility read IS the chart group's
+ *  gates (the group middleware + reqUnitCodeReader, web.go:1646-1649 — the
+ *  code unit has no landed toggle, the repo-activity precedent);
+ *  `MustBeNotEmpty` 404-shells empty repos (web.go:1648). */
+async function repoChartPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "repo-charts" || route.tail !== null) return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1648)
+  const html =
+    route.kind === "contributors"
+      ? renderRepoContributorsPage(ctx)
+      : route.kind === "code-frequency"
+        ? renderRepoCodeFrequencyPage(ctx)
+        : renderRepoRecentCommitsPage(ctx);
+  return respond(c.html(html, 200));
+}
+
+/** GET …/activity/{contributors|code-frequency|recent-commits}/data (the R15
+ *  JSON tails, web.go:1636/1640/1644): contributors serves the FULL
+ *  ContributorData map (the "total" pseudo-entry included,
+ *  contributors.go:36); code-frequency AND recent-commits serve the same
+ *  total-weeks object (upstream registers repo.CodeFrequencyData for both —
+ *  web.go:1644's own comment). The loader's null (unresolvable ref /
+ *  transport failure — the aux-JSON convention) 404-shells; upstream would
+ *  ServerError 500 there, the documented divergence. Our synchronous RPC
+ *  never answers upstream's 202 ErrAwaitGeneration (the ratified no-pre-warm
+ *  posture — the module header). */
+async function repoChartDataRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "repo-charts" || route.tail !== "data") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1648)
+  if (route.kind === "contributors") {
+    const data = await loadRepoContributorsData(c.env, repo, { origin: url.origin });
+    if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(chartDataResponse(data));
+  }
+  const data = await loadChartFrequencyData(c.env, repo);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(chartDataResponse(data));
+}
+
+/** GET /{owner}/{repo}/search (pages/repo-search.tsx — the census R10 code
+ *  search page, upstream web.go:1768 → routers/web/repo/search.go:22-68).
+ *  The shared visibility read IS the group's reqUnitCodeReader gate (the
+ *  code unit has no toggle — the repo-activity precedent); the bare-form arm
+ *  (`q` empty) renders WITHOUT any engine call, upstream-exact
+ *  (search.go:25-28 returns before the ref resolution), so an empty repo
+ *  still renders the form; a keyword search on an unresolvable default
+ *  branch 404-shells (the loader's null — upstream ServerErrors the unborn
+ *  branch, gitgrep.go:63's TODO, the documented reduction). */
+async function repoSearchPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "repo-search") return respond(await c.notFound()); // drift guard
+  const data = await loadRepoSearchData(engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`), repo, url.searchParams);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderRepoSearchPage({ ctx, data }), 200));
 }
 
 /** GET /{owner}/{repo}/comments/{id}/attachments (the fragment module's
@@ -7387,6 +7581,28 @@ async function orgApplicationsDeleteSubmit(c: Context<{ Bindings: Env }>, id: nu
   return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/applications` } }));
 }
 
+/**
+ * GET /{org}/settings/audit_logs (pages/settings-audit-logs.tsx — the R20
+ * `+audit_logs` arm / the census R13 org mount; upstream web.go:1069's
+ * `m.Get("/audit_logs", org_setting.ViewAuditLogs)` over the SAME shared
+ * audit renderer as the repo arm): the org settings family's
+ * resolveOrgTeamsRequest prologue (the require-owner gate — anonymous 303s
+ * onto the login round-trip, a member non-owner 404-shells, upstream's
+ * RequireOwner OrgAssignment NotFound), then the shared load → render at
+ * 200. The scope pair keys the M4 instrumentation's encoding: scope_type
+ * "organization" + scope_id String(org.id), the decimal users.id string the
+ * org-create emit carried (services/orgs/orgs.ts:473, the cast(id as text)
+ * subquery).
+ */
+async function orgAuditLogsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-audit-logs") return respond(await c.notFound()); // drift guard
+  const data = await loadSettingsAuditLogs(c.env.DB, { type: "organization", id: String(org.id) }, url.searchParams);
+  return respond(c.html(renderOrgSettingsAuditLogsPage({ ctx, org, data }), 200));
+}
+
 // ---------------------------------------------------------------------------
 // Window-2c: the admin pages (pages/admin-dashboard.tsx +
 // pages/admin-monitor.tsx — upstream's SignInRequired+AdminRequired gate,
@@ -7816,6 +8032,54 @@ async function adminApplicationDelete(c: Context<{ Bindings: Env }>, application
     return p.respond(c.html(renderNotFound(p.ctx), 404));
   }
   return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/applications" } }));
+}
+
+// --- the SPEC-0018 §3.1 notices arm (pages/admin-notices.tsx — upstream's
+// /-/admin notices group, web.go:882-886; the shared adminPagePrologue; the
+// writes add the §2.8 sameOriginGuard) -------------------------------------
+
+/** GET /-/admin/notices (pages/admin-notices.tsx): the prologue → the paged
+ *  DESC listing (25 per page, the module's loader). */
+async function adminNoticesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminNoticesPage(p.ctx, data)));
+}
+
+/**
+ * POST /-/admin/notices/delete (upstream DeleteNotices, notice.go:46-63):
+ * the §2.8 guard + the prologue, the §5.4 ids[] discipline (non-numeric and
+ * non-positive entries ignored — the shared parseNoticeIds; an
+ * empty-after-filter set deletes nothing), then the write. Upstream answers
+ * flash + 200 REGARDLESS of matched rows; with no session-flash queue the
+ * admin-dashboard's re-render idiom answers both arms: a fresh listing with
+ * the delete_success flash at 200.
+ */
+async function adminNoticesDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = await readUrlEncodedForm(c.req.raw);
+  await deleteNoticesByIds(c.env.DB, parseNoticeIds(form.getAll("ids[]")));
+  const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminNoticesPage(p.ctx, data, { kind: "positive", text: adminNoticesLocale.deleteSuccess })));
+}
+
+/**
+ * POST /-/admin/notices/empty (upstream EmptyNotices, notice.go:66-75): the
+ * same ladder, the ONE bare table-wide delete. Upstream redirects onto the
+ * same GET; the re-render IS that reduction (the module header's note).
+ */
+async function adminNoticesEmpty(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  await emptyNotices(c.env.DB);
+  const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminNoticesPage(p.ctx, data, { kind: "positive", text: adminNoticesLocale.deleteSuccess })));
 }
 
 /**
@@ -11453,6 +11717,11 @@ uiRouter.post("/:owner/settings/applications/oauth2", (c) => orgApplicationsCrea
 uiRouter.get("/:owner/settings/applications/oauth2", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/settings/applications/oauth2/:id/delete", (c) => orgApplicationsDeleteSubmit(c, Number(c.req.param("id"))));
 uiRouter.get("/:owner/settings/applications/oauth2/:id/delete", () => methodNotAllowed("POST"));
+// The R20 +audit_logs arm / census R13 org mount (parseUiRoute claims
+// exactly the 4-segment literal — web.go:1069's GET-only page; the POST
+// answers chi's 405, the compare family's convention).
+uiRouter.get("/:owner/settings/audit_logs", (c) => orgAuditLogsPage(c));
+uiRouter.post("/:owner/settings/audit_logs", () => methodNotAllowed("GET"));
 // Window-2c: the admin group.
 uiRouter.get("/-/admin", (c) => adminDashboardPage(c));
 uiRouter.post("/-/admin", (c) => adminDashboardSubmit(c));
@@ -11487,6 +11756,11 @@ uiRouter.post("/-/admin/badges/slug/:slug/users/delete", (c) => adminBadgeUsersD
 uiRouter.get("/-/admin/applications", (c) => adminApplicationsPage(c));
 uiRouter.post("/-/admin/applications/oauth2", (c) => adminApplicationCreate(c));
 uiRouter.post("/-/admin/applications/oauth2/:id{\\d+}/delete", (c) => adminApplicationDelete(c, Number.parseInt(c.req.param("id"), 10)));
+// The SPEC-0018 §3.1 notices arm (parseUiRoute claims exactly these shapes —
+// the same static literals; the writes are POST-only).
+uiRouter.get("/-/admin/notices", (c) => adminNoticesPage(c));
+uiRouter.post("/-/admin/notices/delete", (c) => adminNoticesDelete(c));
+uiRouter.post("/-/admin/notices/empty", (c) => adminNoticesEmpty(c));
 // The POST-only shapes' GET twins answer the methodNotAllowed arm (the
 // method-blind parse convention — upstream chi's own 405 posture).
 uiRouter.get("/-/admin/emails/activate", () => methodNotAllowed("POST"));
@@ -11496,6 +11770,8 @@ uiRouter.get("/-/admin/badges/slug/:slug/delete", () => methodNotAllowed("POST")
 uiRouter.get("/-/admin/badges/slug/:slug/users/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/-/admin/applications/oauth2", () => methodNotAllowed("POST"));
 uiRouter.get("/-/admin/applications/oauth2/:id{\\d+}/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/notices/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/notices/empty", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/settings/hooks/:id/delete", () => methodNotAllowed("POST"));
 // Wave-14 org labels family (parseUiRoute claims exactly these shapes; the
 // literal `labels` registers with the wave-9/12 statics so it beats the
@@ -11597,6 +11873,11 @@ uiRouter.get("/:owner/:repo/settings/public_access", (c) => repoPublicAccessPage
 uiRouter.post("/:owner/:repo/settings/public_access", (c) => repoPublicAccessSubmit(c));
 uiRouter.get("/:owner/:repo/settings/wiki", (c) => repoWikiSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/wiki", (c) => repoWikiSettingsSubmit(c));
+// The census R13 audit arm (parseUiRoute claims exactly the 5-segment
+// literal — web.go:1279's GET-only page; the POST answers chi's 405, the
+// compare family's methodNotAllowed convention).
+uiRouter.get("/:owner/:repo/settings/audit_logs", (c) => repoAuditLogsPage(c));
+uiRouter.post("/:owner/:repo/settings/audit_logs", () => methodNotAllowed("GET"));
 // Window-2e pass 1: sitemap + search aux.
 uiRouter.get("/sitemap.xml", (c) => sitemapRoute(c));
 uiRouter.get("/explore/repos/sitemap-:file", (c) => sitemapRoute(c));
@@ -11629,10 +11910,23 @@ uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/commits/:sha{^[a-f0-9]{7,64}$}", 
 uiRouter.get("/:owner/:repo/comments/:id/attachments", (c) => commentAttachmentsRoute(c));
 uiRouter.get("/:owner/:repo/activity_author_data", (c) => activityAuthorDataRoute(c));
 uiRouter.get("/:owner/:repo/activity_author_data/:period", (c) => activityAuthorDataRoute(c));
+// The census R15 chart family (parseUiRoute claims exactly these six shapes
+// — web.go:1633-1646's page + /data pairs). Registered ahead of the /:period
+// line below: Hono's RegExpRouter gives static literals precedence over the
+// param anyway, and the parser is the real gate (the drift guard makes any
+// precedence regression a loud 404, the repo-charts matrix's first mount
+// pin).
+uiRouter.get("/:owner/:repo/activity/contributors", (c) => repoChartPage(c));
+uiRouter.get("/:owner/:repo/activity/contributors/data", (c) => repoChartDataRoute(c));
+uiRouter.get("/:owner/:repo/activity/code-frequency", (c) => repoChartPage(c));
+uiRouter.get("/:owner/:repo/activity/code-frequency/data", (c) => repoChartDataRoute(c));
+uiRouter.get("/:owner/:repo/activity/recent-commits", (c) => repoChartPage(c));
+uiRouter.get("/:owner/:repo/activity/recent-commits/data", (c) => repoChartDataRoute(c));
 // The census R14 repo activity page (parseUiRoute claims exactly these
 // shapes — web.go:1628-1631's two page GETs). No existing 3-/4-segment line
-// carries an `activity` literal third segment, and the deeper chart tails
-// stay unclaimed (the parser's R15 note) — the wildcard-free pair is exact.
+// carries an `activity` literal third segment — the chart literals above
+// claim first (the R15 family), and the wildcard-free pair is exact for the
+// rest.
 uiRouter.get("/:owner/:repo/activity", (c) => repoActivityPage(c));
 uiRouter.get("/:owner/:repo/activity/:period", (c) => repoActivityPage(c));
 // Window-2e C1: the global inbox.
@@ -11784,6 +12078,13 @@ uiRouter.get("/org/:owner/dashboard/:team", (c) => orgDashboardPage(c));
 uiRouter.get("/:owner/:repo/forks", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/stars", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/watchers", (c) => uiPage(c));
+// The census R10 code search page (parseUiRoute claims exactly this shape —
+// upstream web.go:1768's bare /search literal registered in the same group
+// as the social trio just above; GET-only read page over the engine's grep
+// RPC, the dedicated-handler convention like repoActivityPage). No earlier
+// registration can absorb it: every other 3-segment dynamic line carries a
+// constrained or known literal third segment.
+uiRouter.get("/:owner/:repo/search", (c) => repoSearchPage(c));
 // Wave-24 collaboration panel (parseUiRoute claims exactly these shapes —
 // upstream web.go:1194-1204's group; the POSTs run the §2.8 sameOriginGuard
 // first and the four POST-only write tails answer GET with chi's 405 — the

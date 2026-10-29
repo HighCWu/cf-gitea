@@ -29,12 +29,23 @@
 
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { actions, badges, emailAddresses, oauth2Applications, userBadges, users, webhooks } from "../../db/schema";
+import {
+  actions,
+  auditEvents,
+  badges,
+  emailAddresses,
+  oauth2Applications,
+  repositories,
+  userBadges,
+  users,
+  webhooks,
+} from "../../db/schema";
 import { createGlobalHook } from "../../api/services/hooks";
 import { demoModeEnabled } from "../../services/demo-sweep";
+import { AuditActions, emitAudit } from "../../services/audit";
 import { __setRouteClockForTests, uiRouter } from "../index";
 import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
 import { seedWikiPage } from "../testing/seed-wiki";
@@ -321,6 +332,99 @@ beforeAll(async () => {
         name: "golden default relay",
         config: { url: "https://hooks.example.com/default", content_type: "json" },
         events: ["push"],
+      });
+    }
+  }
+  {
+    // The census R13 audit-arms goldens' fixtures (this wave): deterministic
+    // audit rows over the EXISTING scope fixtures. The shared settings audit
+    // pages key the M4 instrumentation's encodings, so the harness's OWN
+    // emits (golden's repository:create via ensureSeededRepo →
+    // RepoService.create; acme's organization:create via seedGoldenOrg →
+    // OrgService.createOrg) ARE the pages' rows — only their stamps need
+    // pinning: RepoService.create hardcodes createdAt = new Date()
+    // (repos/service.ts:290) and the audit emit rides it, so a plain render
+    // would carry wall-clock bytes (the actions-pin precedent above; the
+    // wiki-fixedtime write-seam shape, applied store-side). Inert for every
+    // other golden: audit_event is first-read here (no committed page read
+    // it before this wave).
+    const goldenRepo = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "golden")))
+      .get();
+    if (goldenRepo === undefined) throw new Error("golden repo row missing before the audit-arms seeding");
+    // T0+220: the unused fixture slot between the wiki commit (+210) and
+    // the org extra below (+230). The golden scope's single emit moves onto
+    // it; the rich extra (below) takes T0+221 so the DESC order stays
+    // deterministic without the id tiebreak.
+    await drizzle(env.DB)
+      .update(auditEvents)
+      .set({ createdUnix: new Date((T0 + 220) * 1000) })
+      .where(and(eq(auditEvents.scopeType, "repository"), eq(auditEvents.scopeId, goldenRepo.id)))
+      .run();
+    const acmeOrg = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "acme"))
+      .get();
+    if (acmeOrg === undefined) throw new Error("acme org row missing before the audit-arms seeding");
+    // The org scope's createOrg emit already carries now = T0
+    // (seedGoldenOrg's now: new Date(T0 * 1000)); the pin keeps it honest
+    // if the service's timestamp default ever moves.
+    await drizzle(env.DB)
+      .update(auditEvents)
+      .set({ createdUnix: new Date(T0 * 1000) })
+      .where(and(eq(auditEvents.scopeType, "organization"), eq(auditEvents.scopeId, String(acmeOrg.id))))
+      .run();
+    // The rich extras through the LANDED emit seam — a scope-filtered page
+    // must show impersonation + credential + IP arms, and the org page its
+    // member-add row. Presence-guarded on the pinned stamps (the fixtures'
+    // idempotence convention).
+    const stamped = await drizzle(env.DB)
+      .select({ createdUnix: auditEvents.createdUnix })
+      .from(auditEvents)
+      .all();
+    const stamps = new Set(stamped.map((row) => row.createdUnix.getTime()));
+    if (!stamps.has((T0 + 221) * 1000)) {
+      const [aliceRow, morganRow] = [
+        await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get(),
+        await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "morgan")).get(),
+      ];
+      if (aliceRow === undefined || morganRow === undefined) throw new Error("audit-arms actor rows missing");
+      await emitAudit(drizzle(env.DB), {
+        action: AuditActions.RepositoryVisibility,
+        actorId: aliceRow.id,
+        actorName: "alice",
+        impersonatorId: morganRow.id,
+        impersonatorName: "morgan",
+        actorCredential: "access-token:7",
+        scopeType: "repository",
+        scopeId: goldenRepo.id,
+        scopeName: "alice/golden",
+        origin: "ui",
+        ipAddress: "203.0.113.7",
+        vars: { scope: "alice/golden", visibility: "private" },
+        timestamp: new Date((T0 + 221) * 1000),
+      });
+    }
+    if (!stamps.has((T0 + 230) * 1000)) {
+      const [aliceRow, morganRow] = [
+        await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get(),
+        await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "morgan")).get(),
+      ];
+      if (aliceRow === undefined || morganRow === undefined) throw new Error("audit-arms actor rows missing");
+      await emitAudit(drizzle(env.DB), {
+        action: AuditActions.OrganizationMemberAdd,
+        actorId: morganRow.id,
+        actorName: "morgan",
+        scopeType: "organization",
+        scopeId: String(acmeOrg.id),
+        scopeName: "acme",
+        origin: "ui",
+        ipAddress: "192.0.2.9",
+        vars: { member: "alice", scope: "acme" },
+        timestamp: new Date((T0 + 230) * 1000),
       });
     }
   }
@@ -619,6 +723,35 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "admin-hooks.html", path: "/-/admin/hooks", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "admin-badges.html", path: "/-/admin/badges", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "admin-applications.html", path: "/-/admin/applications", status: 200, signedIn: true, sessionUser: "morgan" },
+  // ---------------------------------------------------------------------------
+  // The census R13 audit-arms batch (this wave): the two settings audit
+  // mounts through the real route path over the fixtures seeded in the
+  // beforeAll above. Each pins the shared list's full chrome — the filter
+  // form (the hidden sort carrier, the actor input + search button, both
+  // selects), the scoped-th 7-column table, the row anatomy (actor links,
+  // the impersonator "as" line, the credential code, the scope link, the
+  // action/origin code cells, the stored rendered message, the IP, the
+  // FullTime stamp) and the ABSENT single-page pager:
+  //   - repo-settings-audit-logs: /alice/golden/settings/audit_logs signed
+  //     in as alice (the owner — the settingsGate admin posture). The scope
+  //     is golden's repository pair: the pinned create emit (T0+220) + the
+  //     rich visibility row (T0+221, morgan impersonating alice with the
+  //     access-token credential + the IP).
+  //   - org-settings-audit-logs: /acme/settings/audit_logs signed in as
+  //     morgan (acme's owner — the require-owner prologue). The scope is
+  //     acme's organization pair: the pinned createOrg emit (T0) + the
+  //     member-add row (T0+230).
+  //   Both stay single-page (≤ 25 rows), pinning paginate.tmpl's collapsed
+  //   unlimited-pager arm (no pager bytes at all — paginator.go:67-72).
+  // ---------------------------------------------------------------------------
+  { file: "repo-settings-audit-logs.html", path: "/alice/golden/settings/audit_logs", status: 200, signedIn: true },
+  {
+    file: "org-settings-audit-logs.html",
+    path: "/acme/settings/audit_logs",
+    status: 200,
+    signedIn: true,
+    sessionUser: "morgan",
+  },
 ];
 
 describe("wave-129 expansion goldens", () => {

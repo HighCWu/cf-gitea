@@ -38,8 +38,9 @@
  *     their pages landed (upstream gates them on disabled-features /
  *     EnableNotifyMail; both settings pin FALSE/TRUE so the items always
  *     render — the modules' SPEC §3 reduction).
- *   - org nav: Applications, Packages, Audit, and the Actions General/
- *     Runners/Scoped-workflows sub-items are UNRENDERED.
+ *   - org nav: Packages and the Actions General/Runners/Scoped-workflows
+ *     sub-items are UNRENDERED (Applications joined the landed set with the
+ *     R20-a tab, Audit with the census R13 org arm).
  *   - The Labels item keeps the landed href `{orgLink}/labels` — upstream's
  *     `{.OrgLink}}/settings/labels` target is the DOCUMENTED wave-14 URL
  *     divergence (pages/org-settings.tsx header: "the target exists so the
@@ -131,6 +132,7 @@ export const settingsNavLocale = {
   org_options: "Organization", // "org.settings.options" (:5)
   labels: "Labels", // "repo.labels" (:13)
   blocked_users: "Blocked users", // "user.block.list" (:21)
+  audit: "Audit Log", // "audit.title" (:51 — the census R13 org arm's item)
 } as const;
 
 /** The user settings tabs this nav can mark active — one per landed or
@@ -150,12 +152,12 @@ export type UserSettingsNavTab =
   | "organization" // pages/user-settings-organizations.tsx
   | "repos"; // pages/user-settings-repos.tsx
 
-/** The org settings tabs — options/hooks/applications (landed), blocked
- *  (committed-unmounted), secrets/variables (landed via org-settings-actions),
- *  plus `labels` for upstream's PageIsOrgSettingsLabels arm (navbar.tmpl:12 —
- *  today the item links the landed `/{org}/labels` page, which renders no
- *  settings nav, so no caller passes it yet). */
-export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "applications" | "blocked" | "secrets" | "variables";
+/** The org settings tabs — options/hooks/applications/audit (landed),
+ *  blocked (committed-unmounted), secrets/variables (landed via
+ *  org-settings-actions), plus `labels` for upstream's PageIsOrgSettingsLabels
+ *  arm (navbar.tmpl:12 — today the item links the landed `/{org}/labels`
+ *  page, which renders no settings nav, so no caller passes it yet). */
+export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "applications" | "blocked" | "secrets" | "variables" | "audit";
 
 // ---------------------------------------------------------------------------
 // The user settings navbar (user/settings/navbar.tmpl reduced)
@@ -245,7 +247,7 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
  * The shared ORG settings navbar. `orgLink` is `/{org}` (the family's
  * OrgLink); `active` marks the rendered page's tab. Item order is
  * navbar.tmpl's exact order with the dead items dropped: Options, Hooks,
- * Labels, Applications, Blocked users, Actions▸(Secrets, Variables).
+ * Labels, Applications, Blocked users, Actions▸(Secrets, Variables), Audit.
  */
 export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsNavTab }) {
   const item = (tab: OrgSettingsNavTab) => (props.active === tab ? "active item" : "item");
@@ -293,7 +295,13 @@ export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsN
             </a>
           </div>
         </details>
-        {/* navbar.tmpl:50-52 (Audit) dead. */}
+        {/* navbar.tmpl:50-52 — Audit, LAST in upstream's menu. Lit by the
+            org settings audit tab's mount (the census R13 org arm — the
+            dead-link omission retired); the user family's Audit item
+            (:36-38) stays dead, its arm is not in the R13 scope. */}
+        <a class={item("audit")} href={`${props.orgLink}/settings/audit_logs`}>
+          {settingsNavLocale.audit}
+        </a>
       </div>
     </div>
   );

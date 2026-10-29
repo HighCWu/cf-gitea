@@ -214,7 +214,7 @@ describe("the dashboard DOM (templates/admin/dashboard.tmpl at the pin)", () => 
     expect(html).not.toContain(`<details class="item" open=""><summary>${adminFamilyLocale.identityAccess}</summary>`);
     expect(html).not.toContain("self_check"); // unlanded — the dead-link rule
     expect(html).not.toContain('href="/-/admin/config"');
-    expect(html).not.toContain('href="/-/admin/notices"');
+    expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
   });
 
   it("the flash arm renders the POST answer banner inside the form (the no-JS convention)", async () => {

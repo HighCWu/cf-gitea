@@ -198,7 +198,9 @@ describe("wave-49 parser families (parseUiRoute / handlesUiRoute)", () => {
     // toBeNull pin updated to the claimed shape (the org-settings matrix's
     // escalation).
     expect(parseUiRoute("/acme/settings/blocked_users")).toEqual({ family: "org-settings-blocked", owner: "acme" });
-    expect(parseUiRoute("/acme/settings/audit_logs")).toBeNull();
+    // R13 mounted the org audit-logs tab (M4's findAuditEvents behind the
+    // require-owner prologue) — the stale toBeNull pin updated to the claim.
+    expect(parseUiRoute("/acme/settings/audit_logs")).toEqual({ family: "org-settings-audit-logs", owner: "acme" });
     expect(parseUiRoute("/acme/settings/rename/extra")).toBeNull();
     expect(parseUiRoute("/acme/settings/")).toEqual({ family: "org-settings", owner: "acme" });
   });

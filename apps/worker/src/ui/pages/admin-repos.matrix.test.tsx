@@ -341,7 +341,7 @@ describe("the admin repos DOM (templates/admin/repo/list.tmpl at the pin)", () =
     // The census R18 arms landed (the nav fold wave): the Integrations group.
     expect(html).toContain('href="/-/admin/applications"');
     expect(html).toContain('href="/-/admin/hooks"');
-    expect(html).not.toContain("/-/admin/notices");
+    expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
     expect(html).not.toContain("/-/admin/config");
     expect(html).not.toContain("/-/admin/actions");
   });
