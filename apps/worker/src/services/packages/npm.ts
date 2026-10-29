@@ -76,8 +76,10 @@ import {
   type PackagesQuotaConfig,
   type PackageRow,
   type PackageVersionRow,
-  checkCountQuotaExceeded,
+  UNLIMITED_QUOTA,
+  QuotaTotalCountError,
   checkSizeQuotaExceeded,
+  countVersions,
   deletePackageVersionAndReferences,
   getFileDescriptors,
   getOrInsertPackage,
@@ -1263,7 +1265,9 @@ export type UploadNpmPackageResult =
  * publish — the repo-link permission (403), the duplicate-version
  * arbitration (409), the COUNT + SIZE quota checks (403 — run BEFORE the
  * inserts, because upstream wraps the walk in ONE transaction whose rollback
- * leaves no rows on a quota denial), then the package/version rows, the
+ * leaves no rows on a quota denial; the count arm carries the +1 post-insert
+ * parity upstream's insert-then-check ordering produces — see below), then
+ * the package/version rows, the
  * metadata write, the blob row + content object (the decoded tarball goes
  * straight to its content key — the parse already materialized the bytes, no
  * ranged second pass), the lead file row, the dist-tag properties, and the
@@ -1315,12 +1319,21 @@ export async function uploadNpmPackage(input: UploadNpmPackageInput): Promise<Up
     const existing = await getVersionByNameAndVersion(input.d1, input.owner.id, "npm", pkgDoc.name, pkgDoc.version);
     if (existing !== null) throw new NpmDuplicateVersionError(existing);
 
-    // The quota checks precede the inserts: upstream wraps the whole walk in
-    // ONE transaction, so a quota 403 rolls the version row back — the
-    // observable outcome is "no rows persisted". Count runs only for a fresh
-    // version (packages.go:214-219), size at addFileToPackageVersion's start
-    // (packages.go:303-306) with the TARBALL's size, not the envelope's.
-    await checkCountQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, input.quota);
+    // The quota checks precede the inserts (one transaction upstream — a 403
+    // leaves no rows). SIZE: CheckSizeQuotaExceeded runs at
+    // addFileToPackageVersion's start (packages.go:303-306) with the TARBALL's
+    // size, not the envelope's. COUNT: upstream checks AFTER the version
+    // insert, inside the rolling-back transaction (the versionCreated gate,
+    // packages.go:188-191) and throws when totalCount > limit
+    // (packages.go:380-381) — the pre-insert equivalent is count + 1 > limit,
+    // so an exactly-at-limit owner publishes the version that REACHES the cap
+    // but not one past (the nuget.ts twin carries the same parity).
+    if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
+      const total = (await countVersions(input.d1, input.owner.id)) + 1;
+      if (total > input.quota.limitTotalOwnerCount) {
+        throw new QuotaTotalCountError();
+      }
+    }
     await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, "npm", pkgDoc.data.byteLength, input.quota);
 
     // createPackageAndVersion with allowDuplicate = FALSE: the D1 UNIQUE
