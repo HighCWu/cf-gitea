@@ -982,10 +982,17 @@ async function receivePack<E extends Env>(
     const wantStatus = push.caps.includes("report-status");
 
     // 2. open the lease (refname validation happens before any byte streams).
-    // The x-storage-key header (SPEC-0001a §3 Step 3) carries the D1-minted
-    // immutable storage key when the caller knows it (cf-gitea's git-http
-    // gate sets it from the repositories row); absent, the DO falls back to
-    // its persisted meta.storage_key / meta.repo — see control-plane.ts.
+    // FIRST, bind the cell's name (repo.ts bindRepo): this entry is a direct
+    // RPC and never runs the cell's fetch handler, whose bindR2 was upstream
+    // dgit's receive-entry binding — without it a never-fetched cell (no
+    // prior info/refs advert; create-by-push reaches unknown names by
+    // design) has neither meta.storage_key nor meta.repo, and the lease's
+    // key resolution lands on the degenerate `repos//` staging prefix. The
+    // x-storage-key header below (SPEC-0001a §3 Step 3) still wins when the
+    // caller knows the D1-minted key; absent, the freshly bound name IS the
+    // documented fallback. The parse above ran first, so a malformed command
+    // section never touches the cell.
+    await stub.bindRepo(repo);
     const begin = await stub.beginReceive({
       commands: push.commands,
       capabilities: push.caps,
@@ -1210,7 +1217,8 @@ async function receivePack<E extends Env>(
     // a hook, the per-ref rejections are merged back in by position
     if (wantStatus) emit(renderStatus(statusOfCommands(push.commands, hookRejects, fin.results), unpackError, sideband));
 
-    const doRpcs = 2 + metrics.rowRpcs + metrics.lookupRpcs;
+    // begin + the entry's name bind (bindRepo) + finalize
+    const doRpcs = 3 + metrics.rowRpcs + metrics.lookupRpcs;
     const subrequests =
       metrics.stagingPuts +
       metrics.stagingParts +

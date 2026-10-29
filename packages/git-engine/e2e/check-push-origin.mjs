@@ -252,6 +252,12 @@ function makeRepo() {
   };
   t.store.setR2(t.bucket, STORAGE);
   const impl = {
+    // the receive entry's name bind (repo.ts bindRepo): idempotent here — the
+    // harness cell is pre-bound to the same STORAGE name
+    bindRepo: async (name) => {
+      t.rpcs.push(`bindRepo:${name}`);
+      if (t.store.getMeta("repo") !== name) t.store.setMeta("repo", name);
+    },
     beginReceive: async (input) => {
       t.rpcs.push("beginReceive");
       return controlPlane.beginReceive(t.host, input);

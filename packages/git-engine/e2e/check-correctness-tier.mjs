@@ -374,6 +374,12 @@ function makeRepo({ maxPushMb = "1" } = {}) {
   // the DO namespace stub: every RPC the receive flow makes, executed by the
   // real control plane over the host; anything else fails loudly
   const impl = {
+    // the receive entry's name bind (repo.ts bindRepo): idempotent here — the
+    // harness cell is pre-bound to the same STORAGE name
+    bindRepo: async (name) => {
+      t.rpcs.push(`bindRepo:${name}`);
+      if (t.store.getMeta("repo") !== name) t.store.setMeta("repo", name);
+    },
     beginReceive: async (input) => {
       t.rpcs.push("beginReceive");
       return controlPlane.beginReceive(t.host, input);

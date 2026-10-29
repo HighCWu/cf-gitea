@@ -1266,6 +1266,28 @@ export class RepoCell extends DurableObject<Env> {
     };
   }
 
+  /**
+   * Bind the cell's name from the Worker's DO-name knowledge — the receive
+   * entry's first contact (mod.ts receivePack calls this before
+   * beginReceive). Upstream dgit's receive entered through the cell's fetch
+   * handler, whose bindR2 ran on EVERY request and persisted meta.repo
+   * before any key was derived; the SPEC-0001a split moved the entry to the
+   * direct beginReceive RPC, which never runs fetch — and rpcBind below can
+   * only rebind from an ALREADY-persisted name. Without this bind a direct
+   * receive-pack POST on a never-fetched cell (no prior info/refs advert —
+   * the protocol permits it, and the engine's create-by-push depends on
+   * reaching unknown names) resolved the EMPTY storage key in
+   * control-plane.ts's fallback chain and staged at the degenerate
+   * `repos//` prefix. Unconditional, like the fetch entry's bindR2:
+   * idempotent on a bound cell (one meta read when the name matches).
+   */
+  async bindRepo(repo: string): Promise<void> {
+    // sealed cells (SPEC-0011 §8): binding reads meta — mirror rpcBind's
+    // refusal-adjacent skip so the destroy/delete RPCs stay reachable
+    if (this.store.schemaState.refused !== null) return;
+    this.bindR2(repo);
+  }
+
   async beginReceive(input: BeginReceiveInput): Promise<BeginReceiveResult> {
     return beginReceive(this.leaseHost(), input);
   }
