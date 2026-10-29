@@ -279,6 +279,13 @@ porting upstream runner.go:202-205). Consequences:
 - `--ephemeral` registers a one-shot runner (one task per lifetime — the
   runner row is deleted after its task finishes; dispatch.ts:179-197). Pairs
   with disposable CI containers.
+- **A config file with populated `runner.labels` CLOBBERS the registered
+  labels at daemon start** — the runner rewrites its local `.runner` file and
+  re-declares server-side, discarding whatever `--labels` you registered
+  with (verified against the live wire, act_runner v0.2.13 — the smoke
+  record at docs/research/act-runner-smoke-2026-10-30.md). Pick ONE source
+  of truth: register with `--labels` and leave `runner.labels` empty in the
+  config, or manage labels only through the config file.
 
 ### 2.5 Run
 
@@ -326,6 +333,12 @@ heartbeat shows in Settings → Actions → Runners.
 
 Before (or instead of) installing a real runner, you can drive the whole
 lifecycle with the repo's own harness — no runner install, no docker.
+**The REAL binary is now proven too**: stock act_runner v0.2.13
+(sha256-verified) registered, declared, fetched, executed a containerized
+green job, and sealed logs to R2 against the local dev Worker — the full
+wire transcript lives at
+docs/research/act-runner-smoke-2026-10-30.md. The harness below remains
+the zero-install standing E2E.
 
 - **What it is**: `apps/worker/src/services/actions/fake-runner.ts` — a
   Node/fetch client speaking the REAL connect/proto routes over HTTP. It
