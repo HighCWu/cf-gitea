@@ -33,6 +33,11 @@ import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import {
+  actionArtifacts,
+  actionRunnerTokens,
+  actionRunners,
+  actionRuns,
+  actionVariables,
   actions,
   auditEvents,
   badges,
@@ -43,6 +48,8 @@ import {
   users,
   webhooks,
 } from "../../db/schema";
+import { ARTIFACT_STATUS_UPLOAD_CONFIRMED } from "../../services/actions/artifacts";
+import { saveRepoSettings } from "../../api/services/repo-settings";
 import { createGlobalHook } from "../../api/services/hooks";
 import { demoModeEnabled } from "../../services/demo-sweep";
 import { AuditActions, emitAudit } from "../../services/audit";
@@ -175,6 +182,52 @@ const WIKI_GOLDEN_HOME_CONTENT = [
  * has no admin-conditional chrome. The flag renders nowhere outside
  * /-/admin/* (no navbar link, no explore badge), so no other golden moves.
  */
+/**
+ * The actions-family goldens' fixtures (this wave — the nav-fold unit's
+ * flagged follow-up: the admin actions RUNNERS list + edit pages, the admin
+ * actions VARIABLES page, the org-scope Runners settings page, and the repo
+ * artifacts PREVIEW page, all now that AdminFamilyShell's fold is stable).
+ * Every row lands DIRECTLY with fixed identity columns and T0-pinned stamps
+ * (the webhookDeliveries fixed-uuid precedent) because the landed writers
+ * stamp wall-clock/random values the pages render:
+ *
+ *   - Registration tokens: `getOrCreateActiveRunnerToken` MINTS a
+ *     crypto-random token on the bare GET and the token renders in the
+ *     token-panel input — so BOTH scopes the pages read (global {0,""} and
+ *     acme's owner scope {orgId,""}) get a pre-seeded ACTIVE row; the loader
+ *     reuses the active token verbatim (runner_token.go:127-134), pinning
+ *     the input's bytes. Inert elsewhere: the token tables were first-read
+ *     here.
+ *   - Runner rows: NULL heartbeats (lastOnline/lastActive) — the status
+ *     model's never-seen arm (`runnerStatusOf` → offline, the list's
+ *     "Never" cell, no TimeSince bytes at all) and the default sort's
+ *     status-rank CASE ranks every row 2, so the ladder falls to the id
+ *     tiebreak and row ORDER is the fixed insert order. Fixed uuid/tokenHash
+ *     (both UNIQUE, and createRunner would mint a random salted hash). The
+ *     table was first-read here — no committed golden counts it (verified:
+ *     loadAdminMonitorStats counts users/repos/issues/… only, no actions
+ *     tables).
+ *   - Variable rows: direct inserts (createVariableRow stamps wall-clock
+ *     created_unix) with the name-ASC order the service's FindVariablesOptions
+ *     uses; the page's "Added on" cell renders the pinned stamp through
+ *     formatRepoActionsDate (UTC absolute — pure). First-read table.
+ *   - The artifact family rides the EXISTING fixed-id morgan/admin-golden
+ *     repo (the ADMIN_GOLDEN_REPO_ID row) — a NEW repositories row would
+ *     shift the admin-monitor-stats golden's Repo COUNT(*) (an existing
+ *     golden outside this file's new-filename ownership), while flipping the
+ *     EXISTING row's isEmpty/hasActions booleans moves no rendered byte
+ *     (the admin-repos table renders neither column; the golden's `?q=`
+ *     keyword arm filters to the row regardless). The booleans are what the
+ *     preview route's gate ladder reads (actionsRunViewGate: non-empty +
+ *     actions enabled). The run + two legacy artifact rows (status
+ *     upload-confirmed, no content type → the one-path-per-row legacy
+ *     listing, D1-only — no R2 object is touched on the bare preview render)
+ *     give the page its back-link/Files-menu anatomy; runAttemptId 0 pins
+ *     the no-attempt back-link arm. First-read tables.
+ */
+const ACTIONS_GOLDEN_GLOBAL_TOKEN = "a1f0c0ffee0a1f0c0ffee0a1f0c0ffee0a1f0c0ffe";
+const ACTIONS_GOLDEN_ORG_TOKEN = "b2e1d0dead0b2e1d0dead0b2e1d0dead0b2e1d0dea";
+
 beforeAll(async () => {
   await drizzle(env.DB).update(users).set({ isAdmin: true }).where(eq(users.usernameLower, "morgan"));
   // The admin-repos golden's fixture row (the case comment below): a PRIVATE
@@ -426,6 +479,199 @@ beforeAll(async () => {
         vars: { member: "alice", scope: "acme" },
         timestamp: new Date((T0 + 230) * 1000),
       });
+    }
+  }
+  {
+    // The actions-family goldens' fixtures (this wave — the constants block
+    // above holds the determinism argument per table). Autoincrement ids are
+    // deterministic through the fixed insert order on the fresh per-file
+    // storage (the fixtures' convention): tokens 1-2, runners 1-3 (global,
+    // org, repo), variables 1-2, the run 1, the artifacts 1-2 — the literals
+    // the case paths below pin (the milestone-detail "the seed order makes
+    // its id" precedent).
+    const t = (offsetSeconds: number): Date => new Date((T0 + offsetSeconds) * 1000);
+    const acmeOrgRow = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "acme"))
+      .get();
+    if (acmeOrgRow === undefined) throw new Error("acme org row missing before the actions-arms seeding");
+    const artifactsRepoRow = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, "morgan"), eq(repositories.slug, "admin-golden")))
+      .get();
+    if (artifactsRepoRow === undefined) throw new Error("morgan/admin-golden repo row missing before the actions-arms seeding");
+    const morganActionsRow = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "morgan"))
+      .get();
+    if (morganActionsRow === undefined) throw new Error("morgan row missing before the actions-arms seeding");
+
+    // The ACTIVE registration tokens for the two scopes the pages read — the
+    // loader's reuse arm pins the token-panel inputs (the constants block).
+    const existingTokens = await drizzle(env.DB).select({ token: actionRunnerTokens.token }).from(actionRunnerTokens).all();
+    if (!existingTokens.some((row) => row.token === ACTIONS_GOLDEN_GLOBAL_TOKEN)) {
+      await drizzle(env.DB)
+        .insert(actionRunnerTokens)
+        .values([
+          { token: ACTIONS_GOLDEN_GLOBAL_TOKEN, ownerId: 0, repoId: "", isActive: true, created: t(0), updated: t(0) },
+          { token: ACTIONS_GOLDEN_ORG_TOKEN, ownerId: acmeOrgRow.id, repoId: "", isActive: true, created: t(0), updated: t(0) },
+        ])
+        .run();
+    }
+
+    // The fixture repo's preview-route posture: the actionsRunViewGate ladder
+    // reads repo.isEmpty off the repositories row and settings.hasActions off
+    // the repo_settings row through the LANDED settings writer (the unit-row
+    // maintenance rides it — the missing-row fallback's actions-off default
+    // would 404 the gate). The constants block holds the zero-byte-move
+    // argument for the EXISTING admin-golden row.
+    await drizzle(env.DB)
+      .update(repositories)
+      .set({ isEmpty: false })
+      .where(eq(repositories.id, artifactsRepoRow.id));
+    await saveRepoSettings(env.DB, artifactsRepoRow.id, { hasActions: true }, t(0));
+
+    // The runner census: one row per owner-type arm, NULL heartbeats (the
+    // offline/Never arms + the id-order fallback). Repo-scoped row hangs off
+    // the artifact fixture repo — the belongs-to tooltip reads
+    // "morgan/admin-golden" off the same row.
+    if ((await drizzle(env.DB).select({ id: actionRunners.id }).from(actionRunners).limit(1).all()).length === 0) {
+      await drizzle(env.DB)
+        .insert(actionRunners)
+        .values([
+          {
+            uuid: "a0000000-0000-4000-8000-000000000001",
+            name: "golden-global-runner",
+            version: "6.3.1",
+            ownerId: 0,
+            repoId: "",
+            description: "Instance-wide fixture runner.",
+            tokenHash: "1100000000000000000000000000000000000000000000000000000000000000",
+            tokenSalt: "golden-salt-global",
+            agentLabels: JSON.stringify(["ubuntu-latest"]),
+            created: t(0),
+            updated: t(0),
+          },
+          {
+            uuid: "a0000000-0000-4000-8000-000000000002",
+            name: "golden-org-runner",
+            version: "6.3.1",
+            ownerId: acmeOrgRow.id,
+            repoId: "",
+            description: "Acme org fixture runner.",
+            tokenHash: "2200000000000000000000000000000000000000000000000000000000000000",
+            tokenSalt: "golden-salt-org",
+            agentLabels: JSON.stringify(["ubuntu-latest", "self-hosted"]),
+            created: t(1),
+            updated: t(1),
+          },
+          {
+            uuid: "a0000000-0000-4000-8000-000000000003",
+            name: "golden-repo-runner",
+            version: "6.3.0",
+            ownerId: 0,
+            repoId: artifactsRepoRow.id,
+            description: "Repo-scoped fixture runner.",
+            tokenHash: "3300000000000000000000000000000000000000000000000000000000000000",
+            tokenSalt: "golden-salt-repo",
+            agentLabels: JSON.stringify(["golden-label"]),
+            created: t(2),
+            updated: t(2),
+          },
+        ])
+        .run();
+    }
+
+    // The GLOBAL-scope variables the admin variables page lists (name-ASC —
+    // the service's FindVariablesOptions order).
+    if ((await drizzle(env.DB).select({ id: actionVariables.id }).from(actionVariables).limit(1).all()).length === 0) {
+      await drizzle(env.DB)
+        .insert(actionVariables)
+        .values([
+          {
+            ownerId: 0,
+            repoId: "",
+            name: "GOLDEN_DEPLOY_CHANNEL",
+            data: "staging",
+            description: "Where golden fixtures deploy.",
+            createdAt: t(0),
+            updatedAt: t(0),
+          },
+          {
+            ownerId: 0,
+            repoId: "",
+            name: "GOLDEN_FEATURE_FLAG",
+            data: "enabled",
+            description: "",
+            createdAt: t(1),
+            updatedAt: t(1),
+          },
+        ])
+        .run();
+    }
+
+    // The artifact family: one run + two legacy (content-type-less) rows in
+    // the upload-confirmed state — the bare preview render reads D1 only
+    // (no R2 object, no signed-URL hop: the bare preview's previewContentUrl
+    // stays "").
+    if ((await drizzle(env.DB).select({ id: actionArtifacts.id }).from(actionArtifacts).limit(1).all()).length === 0) {
+      const runInsert = await drizzle(env.DB)
+        .insert(actionRuns)
+        .values({
+          title: "golden: seed the artifact fixture run",
+          repoId: artifactsRepoRow.id,
+          ownerId: morganActionsRow.id,
+          workflowId: ".gitea/workflows/golden.yml",
+          index: 1,
+          triggerUserId: morganActionsRow.id,
+          ref: "refs/heads/main",
+          commitSha: "0123456789abcdef0123456789abcdef01234567",
+          event: "push",
+          triggerEvent: "push",
+          status: 1, // success — unread on the preview page
+          created: t(0),
+          updated: t(0),
+        })
+        .returning({ id: actionRuns.id });
+      const runId = runInsert[0]!.id;
+      await drizzle(env.DB)
+        .insert(actionArtifacts)
+        .values([
+          {
+            runId,
+            runAttemptId: 0,
+            repoId: artifactsRepoRow.id,
+            ownerId: morganActionsRow.id,
+            commitSha: "0123456789abcdef0123456789abcdef01234567",
+            storagePath: `actions/artifacts/${runId}/1`,
+            fileSize: 1200,
+            contentEncodingOrType: "",
+            artifactPath: "logs/build.log",
+            artifactName: "golden-logs",
+            status: ARTIFACT_STATUS_UPLOAD_CONFIRMED,
+            created: t(1),
+            updated: t(1),
+          },
+          {
+            runId,
+            runAttemptId: 0,
+            repoId: artifactsRepoRow.id,
+            ownerId: morganActionsRow.id,
+            commitSha: "0123456789abcdef0123456789abcdef01234567",
+            storagePath: `actions/artifacts/${runId}/2`,
+            fileSize: 3400,
+            contentEncodingOrType: "",
+            artifactPath: "logs/test.log",
+            artifactName: "golden-logs",
+            status: ARTIFACT_STATUS_UPLOAD_CONFIRMED,
+            created: t(2),
+            updated: t(2),
+          },
+        ])
+        .run();
     }
   }
 });
@@ -752,6 +998,99 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
     signedIn: true,
     sessionUser: "morgan",
   },
+  // ---------------------------------------------------------------------------
+  // The actions-family batch (this wave — the nav-fold unit's flagged
+  // follow-up, landed now that AdminFamilyShell's fold is stable at 92d2e87
+  // and the goldens re-baselined at f1bfff9). The fixtures ride the
+  // beforeAll's actions-arms block above; every page renders through the
+  // real route path behind its own prologue (the shared admin gate / the
+  // org require-owner prologue / the repo read ladder):
+  //
+  //   - admin-actions-runners: `/-/admin/actions/runners`, the ADMIN scope
+  //     of the four-scope runners builders. Pins the family nav's Actions
+  //     group, the token panel (the FIXED global token — the seeded active
+  //     row's reuse arm), the "Total: 3" count form, the search form, and
+  //     the admin-polarity arms upstream reserves to IsAdmin: the bulk
+  //     checkbox column + toolbar (AllowBulkActions) and the unconditional
+  //     edit pencil (EditableInContext(0,0) = true). The three rows pin all
+  //     three owner-type cells (Global / Organization tooltip acme /
+  //     Repository tooltip morgan/admin-golden), the NULL-heartbeat offline
+  //     labels and "Never" cells (no TimeSince bytes — the determinism
+  //     seam), and row ORDER is the fixed insert order (the default sort's
+  //     status-rank CASE ranks every row 2 → the id tiebreak).
+  //   - admin-actions-runners-edit: `/-/admin/actions/runners/3`, the
+  //     tplAdminRunnerEdit page over the repo-scoped fixture runner (id 3 =
+  //     the third actions-arms insert — the literal IS the derivation, the
+  //     milestone-detail precedent). Pins the runner_edit anatomy: the
+  //     basic-info fields (offline basic label, the Enabled availability
+  //     arm, Never, the agent labels, the Repository belongs-to tooltip),
+  //     the description form, the enable-flip + delete plain POSTs, and the
+  //     task table's no-tasks arm (no tasks seeded — the empty arm is the
+  //     family's honest default; a tasks fixture is a follow-up if the
+  //     twin's fold-back ever lands the job links). This golden is ALSO the
+  //     regression pin for the wave's index.ts mount fix (ce76247): the
+  //     route's ten `:id(\d+)` paren registrations matched but captured NO
+  //     param (param("id") → undefined → the handler parsed 0 → every real
+  //     id 404'd) — this file's first end-to-end drive of the page exposed
+  //     it; the brace-form `:id{\d+}` registrations land with the fix and
+  //     the "the captured param reaches the handler" arm below pins the
+  //     discriminators the parse-level matrix pins cannot see.
+  //   - admin-actions-variables: `/-/admin/actions/variables`, the GLOBAL
+  //     scope of the shared variables builders. Pins the variable_list
+  //     contract at the admin URLs: the two name-ordered rows (the
+  //     plaintext value body, the "Added on Nov 14, 2023" stamps — the
+  //     pinned created_unix through the UTC absolute formatter), the
+  //     pre-filled edit disclosures over the rows' own /{id}/edit URLs, the
+  //     delete forms (the autoincrement ids 1/2 ride the fixed seed order),
+  //     and the inline add form (the dialog reduction) with the empty-triple
+  //     arm.
+  //   - org-settings-actions-runners: `/acme/settings/actions/runners`
+  //     signed in as morgan (the require-owner prologue), the census C7 ORG
+  //     arm. Pins the OrgHeader + OrgSettingsNavbar (active "runners") over
+  //     the "Total 2" list: the WithAvailable scope arm — the org's own
+  //     runner WITH the pencil and the global runner listing WITHOUT it
+  //     (EditableInContext's owner arm) — and the FIXED org-scope
+  //     registration token. Repo-scoped rows never appear here (the org
+  //     cond) — the admin list above is the arm that pins them.
+  //   - repo-actions-artifacts-preview:
+  //     `/morgan/admin-golden/actions/artifacts/1/preview` signed in as
+  //     morgan (the private fixture repo's owner; artifact id 1 = the first
+  //     actions-arms artifact insert). Pins the artifact_preview.tmpl SSR
+  //     browser over the legacy two-row family: the no-attempt back link
+  //     ("Back to action run #1"), the artifact-name summary + download
+  //     link, the Files menu's directory row + two file rows (the legacy
+  //     one-path-per-row listing — D1-only, no R2 hop), and the BARE
+  //     preview URL's no-iframe arm. The signed-URL iframe is deliberately
+  //     NOT pinned: previewContentUrl renders only on a /preview/{path} tail
+  //     and carries `Date.now()` + 1h expiry bytes (artifactPreviewRawLink)
+  //     with NO route-clock seam (the loader reads the wall clock directly,
+  //     not routeNow()) — the same class as the admin-monitor cron skip, and
+  //     the tail case stays excluded until a route-clock hop lands in the
+  //     page module (outside this file's ownership).
+  // ---------------------------------------------------------------------------
+  { file: "admin-actions-runners.html", path: "/-/admin/actions/runners", status: 200, signedIn: true, sessionUser: "morgan" },
+  {
+    file: "admin-actions-runners-edit.html",
+    path: "/-/admin/actions/runners/3",
+    status: 200,
+    signedIn: true,
+    sessionUser: "morgan",
+  },
+  { file: "admin-actions-variables.html", path: "/-/admin/actions/variables", status: 200, signedIn: true, sessionUser: "morgan" },
+  {
+    file: "org-settings-actions-runners.html",
+    path: "/acme/settings/actions/runners",
+    status: 200,
+    signedIn: true,
+    sessionUser: "morgan",
+  },
+  {
+    file: "repo-actions-artifacts-preview.html",
+    path: "/morgan/admin-golden/actions/artifacts/1/preview",
+    status: 200,
+    signedIn: true,
+    sessionUser: "morgan",
+  },
 ];
 
 describe("wave-129 expansion goldens", () => {
@@ -760,6 +1099,43 @@ describe("wave-129 expansion goldens", () => {
       await renderGoldenCase(golden);
     });
   }
+});
+
+/**
+ * The index.ts mount-fix pin (ce76247 — the admin-actions-runners-edit
+ * golden's finding): the route's param registrations must CAPTURE the id,
+ * not merely match the path. The pre-fix paren form (`:id(\d+)`) 404'd
+ * every real id because `param("id")` came back undefined and the handler
+ * parsed 0; under BOTH forms a stale id 404s — so the PAIR below is the
+ * discriminator the parse-level matrix pins cannot see: the real id must
+ * reach the handler (the fixture runner's own bytes render) AND the stale
+ * id must still answer the NotFound arm. The runners {id} GET is the
+ * spot-check the landing review asked for (the POST arms ride the same
+ * brace-form fix and stay with the write-arm suites).
+ */
+describe("admin-actions-runners-edit mount pin (the ce76247 closure)", () => {
+  const EDIT_CASE: GoldenCase = {
+    file: "admin-actions-runners-edit.html",
+    path: "/-/admin/actions/runners/3",
+    status: 200,
+    signedIn: true,
+    sessionUser: "morgan",
+  };
+
+  it("delivers the captured id to the handler; a stale id still 404s", async () => {
+    const { status, html } = await renderCase(EDIT_CASE);
+    expect(status).toBe(200);
+    // The page is the EDITOR for fixture runner 3 — its name in the header,
+    // its repo-scope belongs-to tooltip, and the id-3 form targets are the
+    // bytes the id=0 pre-fix render could not produce.
+    expect(html).toContain("golden-repo-runner");
+    expect(html).toContain("morgan/admin-golden");
+    expect(html).toContain('action="/-/admin/actions/runners/3"');
+
+    const stale = await renderCase({ ...EDIT_CASE, path: "/-/admin/actions/runners/999999" });
+    expect(stale.status).toBe(404);
+    expect(stale.html).toContain("Page Not Found");
+  });
 });
 
 /**
