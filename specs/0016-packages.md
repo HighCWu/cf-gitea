@@ -42,15 +42,15 @@ FEATURE-GATED"). This document is that gate. Upstream's package subsystem is
 not one feature but two stacked ones:
 
 1. **A package model + blob store** — owner-scoped (user OR org), repo-linked
- (optional), with content-addressed deduplicated blobs. Every registry type
- and every UI page rides this.
+   (optional), with content-addressed deduplicated blobs. Every registry type
+   and every UI page rides this.
 2. **Per-ecosystem registry protocols** — 21 protocol families on
- `/api/packages/{username}/…` (`api.go:91` `CommonRoutes`) plus the OCI
- distribution API on `/v2/…` (`api.go:509` `ContainerRoutes`). Each is a
- wire contract a real package-manager client speaks (`npm publish`,
- `pip install`, `docker push`, …), and their weights differ by an order of
- magnitude (pypi ≈ 230 lines upstream; nuget ≈ 700; the container family
- ≈ 2,000 + a JWT token flow).
+   `/api/packages/{username}/…` (`api.go:91` `CommonRoutes`) plus the OCI
+   distribution API on `/v2/…` (`api.go:509` `ContainerRoutes`). Each is a
+   wire contract a real package-manager client speaks (`npm publish`,
+   `pip install`, `docker push`, …), and their weights differ by an order of
+   magnitude (pypi ≈ 230 lines upstream; nuget ≈ 700; the container family
+   ≈ 2,000 + a JWT token flow).
 
 A v1 that serves rows R04/R16 honestly needs (1) in full and (2) exactly one
 representative protocol — **generic** — which needs no client-specific wire
@@ -64,25 +64,25 @@ quota checks (§3.4), the cleanup arm (§4.4), and the tests (§6).
 Out of scope (each named so it is not silently re-decided):
 
 - **Every non-generic registry protocol** — npm/pypi/container/maven/nuget/
- helm/debian/alpine/rpm/arch/cargo/conan/composer/chef/conda/cran/go/pub/
- rubygems/swift/terraform/vagrant. §2.1 sizes each; §7 stages them. The
- MODEL makes them possible; none is IMPLEMENTED here.
+  helm/debian/alpine/rpm/arch/cargo/conan/composer/chef/conda/cran/go/pub/
+  rubygems/swift/terraform/vagrant. §2.1 sizes each; §7 stages them. The
+  MODEL makes them possible; none is IMPLEMENTED here.
 - **The R04/R16 UI pages themselves** (`user/overview/packages*.tsx`-family +
- the repo packages tab) and the user/org settings + admin packages pages —
- downstream wave, unlocked the moment M1 lands (the census's own split:
- "the UI pages are downstream of their APIs … then `pages/*-packages*.tsx`").
+  the repo packages tab) and the user/org settings + admin packages pages —
+  downstream wave, unlocked the moment M1 lands (the census's own split:
+  "the UI pages are downstream of their APIs … then `pages/*-packages*.tsx`").
 - **The container token-auth flow** (JWT mint/verify,
- `gitea/services/packages/auth.go:31`), chunked blob uploads
- (`gitea/services/packages/container/blob_uploader.go:26`) and manifests —
- M5's subject, not v1's.
+  `gitea/services/packages/auth.go:31`), chunked blob uploads
+  (`gitea/services/packages/container/blob_uploader.go:26`) and manifests —
+  M5's subject, not v1's.
 - **Cargo's git-backed index repo** (`_cargo-index`,
- `gitea/services/packages/cargo/index.go:29` — a real repository whose
- files commit through the files service) — the heaviest single ecosystem;
- own SPEC-attached milestone.
+  `gitea/services/packages/cargo/index.go:29` — a real repository whose
+  files commit through the files service) — the heaviest single ecosystem;
+  own SPEC-attached milestone.
 - **Repository signing keys** (alpine/debian/rpm `GetRepositoryKey` arms, the
- chef keypair, `DefaultRPMSignEnabled`,
- `gitea/modules/setting/packages.go:42`) — no signing key exists in our
- substrate; the index-builder milestones will propose their posture.
+  chef keypair, `DefaultRPMSignEnabled`,
+  `gitea/modules/setting/packages.go:42`) — no signing key exists in our
+  substrate; the index-builder milestones will propose their posture.
 
 ## 2. The subsystem — upstream cites, our substrate, the gap
 
@@ -93,21 +93,21 @@ The model's type list is 23 constants (`gitea/models/packages/package.go:33-53`:
 is two routers (`api.go`):
 
 - **`CommonRoutes()`** (`api.go:91`) mounted on `/api/packages` (NOT
- `/api/v1` — the file's comment: "These are mounted on `/api/packages` (not
- `/api/v1/packages`)"): 21 ecosystem groups, each wrapped in
- `reqPackageAccess(perm.AccessModeRead)` with write arms inside
- (`reqPackageAccess(perm.AccessModeWrite)`), over auth methods
- `{OAuth2, Basic, nuget.Auth, Auth, chef.Auth}` (`api.go:97-102`). The
- v1-management group's note in `routers/api/v1/api.go:1695` says it
- plainly: "these are Gitea package management API - see
- packages.CommonRoutes and packages.DockerContainerRoutes for endpoints
- that implement package manager APIs".
+  `/api/v1` — the file's comment: "These are mounted on `/api/packages` (not
+  `/api/v1/packages`)"): 21 ecosystem groups, each wrapped in
+  `reqPackageAccess(perm.AccessModeRead)` with write arms inside
+  (`reqPackageAccess(perm.AccessModeWrite)`), over auth methods
+  `{OAuth2, Basic, nuget.Auth, Auth, chef.Auth}` (`api.go:97-102`). The
+  v1-management group's note in `routers/api/v1/api.go:1695` says it
+  plainly: "these are Gitea package management API - see
+  packages.CommonRoutes and packages.DockerContainerRoutes for endpoints
+  that implement package manager APIs".
 - **`ContainerRoutes()`** (`api.go:509`) mounted on `/v2/` (the OCI
- distribution spec): token auth (`/token` → `container.Authenticate`,
- `api.go:530`), catalog, and the per-image blobs/uploads + manifests
- groups (`api.go:536-557`), over `{Basic, Auth{AllowGhostUser}}`
- (`api.go:512-515` — "container auth requires token, so container.
- Authenticate issues a Ghost user token for anonymous access").
+  distribution spec): token auth (`/token` → `container.Authenticate`,
+  `api.go:530`), catalog, and the per-image blobs/uploads + manifests
+  groups (`api.go:536-557`), over `{Basic, Auth{AllowGhostUser}}`
+  (`api.go:512-515` — "container auth requires token, so container.
+  Authenticate issues a Ghost user token for anonymous access").
 
 Per-ecosystem weight (verified upstream line counts at the pin, handlers +
 wire-format module):
@@ -136,43 +136,43 @@ whole family on a SPEC.
 Six tables; owner scoping is on the package row; dedup is content-addressed:
 
 - **`Package`** (`package.go:191-199`): `ID`, `OwnerID` +
- `Type` + `LowerName` sharing `UNIQUE(s)` (one package per owner/type/lower
- name — `TryInsertPackage` checks `owner_id/type/lower_name`,
- `package.go:203-213`), `RepoID` (INDEX — the optional repo link), `Name`,
- `SemverCompatible`, `IsInternal`. NOT NULL everywhere that matters; the
- duplicate error is `ErrDuplicatePackage` (`package.go:20-23`).
+  `Type` + `LowerName` sharing `UNIQUE(s)` (one package per owner/type/lower
+  name — `TryInsertPackage` checks `owner_id/type/lower_name`,
+  `package.go:203-213`), `RepoID` (INDEX — the optional repo link), `Name`,
+  `SemverCompatible`, `IsInternal`. NOT NULL everywhere that matters; the
+  duplicate error is `ErrDuplicatePackage` (`package.go:20-23`).
 - **`PackageVersion`** (`package_version.go:27-36`): `ID`, `PackageID` +
- `LowerVersion` sharing `UNIQUE(s)` (one version row per package+lowercased
- version — `GetOrInsertVersion` answers the existing row with
- `ErrDuplicatePackageVersion`, `package_version.go:48-67`), `CreatorID`,
- `Version`, `CreatedUnix` (INDEX), `IsInternal`, `MetadataJSON` (LONGTEXT —
- the per-ecosystem metadata blob), `DownloadCount`. The semver flag lives on
- the package; `IsPrerelease` is a substring test
- (`package_version.go:40-44`).
+  `LowerVersion` sharing `UNIQUE(s)` (one version row per package+lowercased
+  version — `GetOrInsertVersion` answers the existing row with
+  `ErrDuplicatePackageVersion`, `package_version.go:48-67`), `CreatorID`,
+  `Version`, `CreatedUnix` (INDEX), `IsInternal`, `MetadataJSON` (LONGTEXT —
+  the per-ecosystem metadata blob), `DownloadCount`. The semver flag lives on
+  the package; `IsPrerelease` is a substring test
+  (`package_version.go:40-44`).
 - **`PackageBlob`** (`package_blob.go:30-39`): `ID`, `Size`, and FOUR hash
- columns each `UNIQUE`-indexed (`HashMD5` char(32), `HashSHA1` char(40),
- `HashSHA256` char(64), `HashSHA512` char(128)) + `CreatedUnix`. Dedup is
- `GetOrInsertBlob`: lookup by `size+all four hashes`, existing row returned
- with `exists=true` (`package_blob.go:52-77`).
+  columns each `UNIQUE`-indexed (`HashMD5` char(32), `HashSHA1` char(40),
+  `HashSHA256` char(64), `HashSHA512` char(128)) + `CreatedUnix`. Dedup is
+  `GetOrInsertBlob`: lookup by `size+all four hashes`, existing row returned
+  with `exists=true` (`package_blob.go:52-77`).
 - **`PackageFile`** (`package_file.go:34-43`): `ID`, `VersionID` +
- `LowerName` + `CompositeKey` sharing `UNIQUE(s)` (a file's identity inside
- a version; `CompositeKey` is the maven/conan-style disambiguator,
- `EmptyFileKey = ""` at `package_file.go:31`), `BlobID` (INDEX), `Name`,
- `IsLead`, `CreatedUnix`. `TryInsertFile` answers
- `ErrDuplicatePackageFile` (`package_file.go:46-58`).
+  `LowerName` + `CompositeKey` sharing `UNIQUE(s)` (a file's identity inside
+  a version; `CompositeKey` is the maven/conan-style disambiguator,
+  `EmptyFileKey = ""` at `package_file.go:31`), `BlobID` (INDEX), `Name`,
+  `IsLead`, `CreatedUnix`. `TryInsertFile` answers
+  `ErrDuplicatePackageFile` (`package_file.go:46-58`).
 - **`PackageProperty`** (`package_property.go:31-37`): `ID`, `RefType`
- (0=version / 1=file / 2=package, `package_property.go:22-27`), `RefID`,
- `Name` (INDEX), `Value` (LONGTEXT). This is the per-ecosystem extension
- seam: npm dist-tags, container digests/repo names
- (`routers/api/packages/container/blob.go:111` inserts a
- `PropertyTypePackage` `PropertyRepository`; `:154` a `PropertyTypeFile`
- `PropertyDigest`), alpine branch/architecture fields — all properties, no
- per-type tables.
+  (0=version / 1=file / 2=package, `package_property.go:22-27`), `RefID`,
+  `Name` (INDEX), `Value` (LONGTEXT). This is the per-ecosystem extension
+  seam: npm dist-tags, container digests/repo names
+  (`routers/api/packages/container/blob.go:111` inserts a
+  `PropertyTypePackage` `PropertyRepository`; `:154` a `PropertyTypeFile`
+  `PropertyDigest`), alpine branch/architecture fields — all properties, no
+  per-type tables.
 - **`PackageCleanupRule`** (`package_cleanup_rule.go:25-40`): per-owner
- (`OwnerID` + `Type` in `UNIQUE(s)`, 0 = user-level default), `Enabled`,
- `KeepCount`, `KeepPattern`/`RemovePattern` (regex, compiled case-
- insensitively anchored `(?i)\A…\z`, `package_cleanup_rule.go:41-54`),
- `RemoveDays`, `MatchFullName`.
+  (`OwnerID` + `Type` in `UNIQUE(s)`, 0 = user-level default), `Enabled`,
+  `KeepCount`, `KeepPattern`/`RemovePattern` (regex, compiled case-
+  insensitively anchored `(?i)\A…\z`, `package_cleanup_rule.go:41-54`),
+  `RemoveDays`, `MatchFullName`.
 
 The descriptor aggregation (`models/packages/descriptor.go:56-77`) is the
 read shape every UI/API consumer renders: `PackageDescriptor{Package, Owner,
@@ -279,42 +279,42 @@ they manage.
 ### 2.6 Limits, quota, cleanup
 
 - **Per-type size caps + owner totals** (`gitea/modules/setting/packages.go:7-43`):
- `LimitTotalOwnerCount` (default **-1** = unlimited, `packages.go:46-48`),
- `LimitTotalOwnerSize`, and `LimitSize{Type}` for all 23 types — each
- `-1` by default (the ini keys load through `mustBytes` with the `-1`
- no-limit sentinel, `packages.go:96-99`). Enforcement:
- `CheckCountQuotaExceeded` (`gitea/services/packages/packages.go:366`) and
- `CheckSizeQuotaExceeded` (`packages.go:390-457`) — admins bypass
- (`packages.go:391-393`), the type cap compares the single upload, the
- owner total re-computes `CalculateFileSize` over the owner's files
- (`packages.go:449-456`). Quota rejections map to **403** at the protocol
- layer (`ErrQuotaTotalCount/ErrQuotaTypeSize/ErrQuotaTotalSize`, e.g.
- `routers/api/packages/generic/generic.go:128-131`).
+  `LimitTotalOwnerCount` (default **-1** = unlimited, `packages.go:46-48`),
+  `LimitTotalOwnerSize`, and `LimitSize{Type}` for all 23 types — each
+  `-1` by default (the ini keys load through `mustBytes` with the `-1`
+  no-limit sentinel, `packages.go:96-99`). Enforcement:
+  `CheckCountQuotaExceeded` (`gitea/services/packages/packages.go:366`) and
+  `CheckSizeQuotaExceeded` (`packages.go:390-457`) — admins bypass
+  (`packages.go:391-393`), the type cap compares the single upload, the
+  owner total re-computes `CalculateFileSize` over the owner's files
+  (`packages.go:449-456`). Quota rejections map to **403** at the protocol
+  layer (`ErrQuotaTotalCount/ErrQuotaTypeSize/ErrQuotaTotalSize`, e.g.
+  `routers/api/packages/generic/generic.go:128-131`).
 - **Upload size ceilings** are per-protocol, not model-level: npm caps its
- parsed body at **256 MiB** (`routers/api/packages/npm/npm.go:180`
- `http.MaxBytesReader(…, 256*1024*1024)`); the container manifest cap is
- **10 MiB** (`routers/api/packages/container/container.go:42`).
+  parsed body at **256 MiB** (`routers/api/packages/npm/npm.go:180`
+  `http.MaxBytesReader(…, 256*1024*1024)`); the container manifest cap is
+  **10 MiB** (`routers/api/packages/container/container.go:42`).
 - **Cleanup** has two arms (`gitea/services/packages/cleanup/cleanup.go:26-32`
- `CleanupTask` = `ExecuteCleanupRules` + `CleanupExpiredData`): rules
- execute per enabled `PackageCleanupRule` with per-type index rebuilds
- after deletions (`cleanup.go:115-145` — debian/alpine/rpm/arch/cargo
- `BuildAllRepositoryFiles`/`UpdatePackageIndexIfExists`), and expired
- UNREFERENCED blobs are deleted past `OLDER_THAN` (the cron:
- `custom/conf/app.example.ini:2378-2392` — `[cron.cleanup_packages]`,
- `SCHEDULE = @midnight`, `OLDER_THAN = 24h`).
+  `CleanupTask` = `ExecuteCleanupRules` + `CleanupExpiredData`): rules
+  execute per enabled `PackageCleanupRule` with per-type index rebuilds
+  after deletions (`cleanup.go:115-145` — debian/alpine/rpm/arch/cargo
+  `BuildAllRepositoryFiles`/`UpdatePackageIndexIfExists`), and expired
+  UNREFERENCED blobs are deleted past `OLDER_THAN` (the cron:
+  `custom/conf/app.example.ini:2378-2392` — `[cron.cleanup_packages]`,
+  `SCHEDULE = @midnight`, `OLDER_THAN = 24h`).
 - **Our posture (verified):** `limits.cpu_ms: 300000`
- (wrangler.jsonc.example:12-14) — the 5-minute CPU maximum (AGENTS.md
- Workers rules); crons under 1 h get 30 s CPU, so the cleanup arm must be a
- producer enqueuing onto the serialized REPO_TASKS consumer, the
- SPEC-0014 §3 idiom (demo-sweep.ts:12-13 at 2026-10-29 — "hourly cron →
- REPO_TASKS messages … the EXISTING serialized consumer"; the scheduled
- dispatcher already carries a sanctioned hourly extension block for audit
- retention, the marked block at demo-sweep.ts:258-269 — a packages-cleanup
- producer is the same class of extension, gated the same way; the file is
- sibling-owned mid-flight, so the QUOTED sentences are the anchors, not
- the line numbers). Quota vars ride `vars` in
- wrangler.jsonc.example (the `DEMO_MODE` strict-polarity precedent,
- demo-sweep.ts §6.8 note); there is no per-type settings UI in v1.
+  (wrangler.jsonc.example:12-14) — the 5-minute CPU maximum (AGENTS.md
+  Workers rules); crons under 1 h get 30 s CPU, so the cleanup arm must be a
+  producer enqueuing onto the serialized REPO_TASKS consumer, the
+  SPEC-0014 §3 idiom (demo-sweep.ts:12-13 at 2026-10-29 — "hourly cron →
+  REPO_TASKS messages … the EXISTING serialized consumer"; the scheduled
+  dispatcher already carries a sanctioned hourly extension block for audit
+  retention, the marked block at demo-sweep.ts:258-269 — a packages-cleanup
+  producer is the same class of extension, gated the same way; the file is
+  sibling-owned mid-flight, so the QUOTED sentences are the anchors, not
+  the line numbers). Quota vars ride `vars` in
+  wrangler.jsonc.example (the `DEMO_MODE` strict-polarity precedent,
+  demo-sweep.ts §6.8 note); there is no per-type settings UI in v1.
 
 ## 3. The v1 surface (PROPOSAL)
 
@@ -350,15 +350,15 @@ enforcement: `read:package` / `write:package` via the EXISTING
 mirrors `api.go:318-335` + `gitea/routers/api/packages/generic/generic.go`:
 
 - `PUT` upload (streams the body; upstream validates name/version/filename
- against regexes — `generic.go:20-21`, `isValidPackageName`/`isValidFileName`
- at :53-66 — and rejects duplicates with **409** for an identical file,
- :128); quota rejections **403**.
+  against regexes — `generic.go:20-21`, `isValidPackageName`/`isValidFileName`
+  at :53-66 — and rejects duplicates with **409** for an identical file,
+  :128); quota rejections **403**.
 - `GET`/`HEAD` download (404 unknown; Content-Disposition per upstream's
- `helper.ServePackageFile`, `routers/api/packages/helper/helper.go:52`).
+  `helper.ServePackageFile`, `routers/api/packages/helper/helper.go:52`).
 - `DELETE` per-file and per-package (`generic.go:130-202`, DeletePackage at :140 / DeletePackageFile at :164) — write scope.
 - Auth: the resolveAuth stack (Basic + PAT; the protocols are the Basic-auth
- consumers our httpauth already parses). NO container-style anonymous or
- client-native token flows in v1.
+  consumers our httpauth already parses). NO container-style anonymous or
+  client-native token flows in v1.
 
 ### 3.3 The web routes (R04/R16) — mount contract only
 
@@ -388,42 +388,42 @@ Column-for-column ports of §2.2's structs onto D1 types (TEXT enum convention
 per the schema's `org_members.role` note):
 
 - **`packages`**: `id` pk autoincrement; `owner_id` int NOT NULL;
- `repo_id` int NULL (the optional link — NULL = global to the owner, and
- `linkPackage`/`unlinkPackage` set it); `type` TEXT NOT NULL; `name` TEXT
- NOT NULL; `lower_name` TEXT NOT NULL; `semver_compatible` int (bool)
- NOT NULL default 0; `is_internal` int (bool) NOT NULL default 0.
- **`UNIQUE(owner_id, type, lower_name)`** — the `TryInsertPackage`
- arbitration point (upstream `UNIQUE(s)`, package.go:192-196). Index on
- `repo_id`.
+  `repo_id` int NULL (the optional link — NULL = global to the owner, and
+  `linkPackage`/`unlinkPackage` set it); `type` TEXT NOT NULL; `name` TEXT
+  NOT NULL; `lower_name` TEXT NOT NULL; `semver_compatible` int (bool)
+  NOT NULL default 0; `is_internal` int (bool) NOT NULL default 0.
+  **`UNIQUE(owner_id, type, lower_name)`** — the `TryInsertPackage`
+  arbitration point (upstream `UNIQUE(s)`, package.go:192-196). Index on
+  `repo_id`.
 - **`package_versions`**: `id` pk; `package_id` int NOT NULL; `creator_id`
- int NOT NULL default 0; `version` TEXT NOT NULL; `lower_version` TEXT NOT
- NULL; `created_unix` int NOT NULL; `is_internal` int NOT NULL default 0;
- `metadata_json` TEXT (JSON, NULL); `download_count` int NOT NULL default 0.
- **`UNIQUE(package_id, lower_version)`** (package_version.go:28-30).
+  int NOT NULL default 0; `version` TEXT NOT NULL; `lower_version` TEXT NOT
+  NULL; `created_unix` int NOT NULL; `is_internal` int NOT NULL default 0;
+  `metadata_json` TEXT (JSON, NULL); `download_count` int NOT NULL default 0.
+  **`UNIQUE(package_id, lower_version)`** (package_version.go:28-30).
 - **`package_blobs`**: `id` pk; `size` int NOT NULL default 0; `hash_md5`
- TEXT; `hash_sha1` TEXT; `hash_sha256` TEXT NOT NULL; `hash_sha512` TEXT;
- `created_unix` int NOT NULL. UNIQUE on each hash column
- (package_blob.go:32-36 — md5/sha1 stay nullable: some protocols know only
- sha256, e.g. container digests; upstream computes all four because every
- upload streams through a HashedSizeReader that hashes all four at once).
+  TEXT; `hash_sha1` TEXT; `hash_sha256` TEXT NOT NULL; `hash_sha512` TEXT;
+  `created_unix` int NOT NULL. UNIQUE on each hash column
+  (package_blob.go:32-36 — md5/sha1 stay nullable: some protocols know only
+  sha256, e.g. container digests; upstream computes all four because every
+  upload streams through a HashedSizeReader that hashes all four at once).
 - **`package_files`**: `id` pk; `version_id` int NOT NULL; `blob_id` int NOT
- NULL; `name` TEXT NOT NULL; `lower_name` TEXT NOT NULL; `composite_key`
- TEXT NOT NULL default ''; `is_lead` int NOT NULL default 0; `created_unix`
- int NOT NULL. **`UNIQUE(version_id, lower_name, composite_key)`**
- (package_file.go:35-40).
+  NULL; `name` TEXT NOT NULL; `lower_name` TEXT NOT NULL; `composite_key`
+  TEXT NOT NULL default ''; `is_lead` int NOT NULL default 0; `created_unix`
+  int NOT NULL. **`UNIQUE(version_id, lower_name, composite_key)`**
+  (package_file.go:35-40).
 - **`package_properties`**: `id` pk; `ref_type` int NOT NULL (0=version,
- 1=file, 2=package — upstream's iota order, package_property.go:22-27);
- `ref_id` int NOT NULL; `name` TEXT NOT NULL; `value` TEXT NOT NULL.
- Index (`ref_type`, `ref_id`).
+  1=file, 2=package — upstream's iota order, package_property.go:22-27);
+  `ref_id` int NOT NULL; `name` TEXT NOT NULL; `value` TEXT NOT NULL.
+  Index (`ref_type`, `ref_id`).
 - **`package_cleanup_rules`**: `id` pk; `enabled` int NOT NULL default 0;
- `owner_id` int NOT NULL default 0; `type` TEXT NOT NULL; `keep_count` int
- NOT NULL default 0; `keep_pattern` TEXT NOT NULL default '';
- `remove_days` int NOT NULL default 0; `remove_pattern` TEXT NOT NULL
- default ''; `match_full_name` int NOT NULL default 0; `created_unix` /
- `updated_unix` int NOT NULL. **`UNIQUE(owner_id, type)`** (the rules are
- one-per-owner+type upstream, package_cleanup_rule.go:26-29). Rules CRUD is
- DOWNSTREAM (the settings pages) — the table lands with the model so the
- cleanup arm has its inputs.
+  `owner_id` int NOT NULL default 0; `type` TEXT NOT NULL; `keep_count` int
+  NOT NULL default 0; `keep_pattern` TEXT NOT NULL default '';
+  `remove_days` int NOT NULL default 0; `remove_pattern` TEXT NOT NULL
+  default ''; `match_full_name` int NOT NULL default 0; `created_unix` /
+  `updated_unix` int NOT NULL. **`UNIQUE(owner_id, type)`** (the rules are
+  one-per-owner+type upstream, package_cleanup_rule.go:26-29). Rules CRUD is
+  DOWNSTREAM (the settings pages) — the table lands with the model so the
+  cleanup arm has its inputs.
 
 Org access-mode fold (§2.4 PROPOSAL, recorded as a documented divergence):
 team grants come from the team row's `accessMode` (`teams.access_mode ≥
@@ -435,14 +435,14 @@ column, consistent with the landed teams collapse (schema.ts SPEC-0007 note).
 Under the shared `REPO_PACKS` bucket, one new namespace:
 
 - **Content blobs**: `packages/blobs/aa/bb/<sha256>` — upstream's
- `KeyToRelativePath` shard (`content_store.go:69-71`) under a `packages/`
- root. The key is content-addressed and GLOBAL (owner scoping lives purely
- in D1, as upstream's model does: a blob row has no owner column) — two
- owners uploading identical bytes share one R2 object, which is the point
- of the four-hash dedup row.
+  `KeyToRelativePath` shard (`content_store.go:69-71`) under a `packages/`
+  root. The key is content-addressed and GLOBAL (owner scoping lives purely
+  in D1, as upstream's model does: a blob row has no owner column) — two
+  owners uploading identical bytes share one R2 object, which is the point
+  of the four-hash dedup row.
 - **Upload spool**: `packages/tmp/<upload_uuid>` — the hash-then-key staging
- object (§5.1). Never read by anything but the upload that created it;
- deleted on both success and failure paths.
+  object (§5.1). Never read by anything but the upload that created it;
+  deleted on both success and failure paths.
 
 Namespace rules inherited from the landed families: keys are pure functions
 of validated segments (the LFS injection-proof rule, lfs/store.ts:5-9);
@@ -470,13 +470,13 @@ demo-sweep.ts mount record — §2.6's quote anchors): SELECT due cleanup work a
 (`src/repos/purge.ts` dispatch family) executes:
 
 1. `CleanupExpiredData`: delete `package_blobs` rows with zero
- `package_files` references older than the `PACKAGE_CLEANUP_OLDER_THAN`
- var (default 24h, upstream's `OLDER_THAN`), then `bucket.delete` their
- `packages/blobs/…` keys.
+   `package_files` references older than the `PACKAGE_CLEANUP_OLDER_THAN`
+   var (default 24h, upstream's `OLDER_THAN`), then `bucket.delete` their
+   `packages/blobs/…` keys.
 2. `ExecuteCleanupRules`: iterate enabled rules (keep-count / keep-pattern /
- remove-days / remove-pattern) deleting matching versions — the
- index-rebuild riders of upstream cleanup.go:115-145 do NOT exist in v1
- (no non-generic ecosystems yet) and arrive per-ecosystem.
+   remove-days / remove-pattern) deleting matching versions — the
+   index-rebuild riders of upstream cleanup.go:115-145 do NOT exist in v1
+   (no non-generic ecosystems yet) and arrive per-ecosystem.
 
 The arm never runs unless a rule is enabled or orphans exist; no DEMO-gating
 parallel — this is upstream's own midnight job, not the demo sweep's
@@ -487,71 +487,71 @@ versions, exactly what upstream self-hosters get). Ratification confirms
 ## 5. Edge cases, limits, and failure modes
 
 1. **Hash-then-key ordering** — the generic PUT must know the sha256 BEFORE
- the final R2 key exists, but the body can only be read once. PROPOSAL:
- single-pass hash-and-forward into `packages/tmp/<uuid>` (the LFS
- relay-store pipeline verbatim, digest in the same pass), then ONE bounded
- second pass streaming `bucket.get(tmp)` → `bucket.put(final-key)`, then
- `bucket.delete(tmp)` — intra-datacenter bandwidth, no egress, ≤2
- subrequest-classes per upload, and the D1 row lands only after the final
- key is durably stored (row-first landing inverted: object-first here,
- because D1 rows are only useful once the bytes they point at exist — the
- release-asset relay completion idiom). Failure windows: a crash between
- tmp-put and final-put leaves an orphan tmp object — the cleanup arm's
- OLDER_THAN sweep deletes `packages/tmp/` objects past the window; a
- crash between final-put and D1-insert leaves an unreferenced content blob
- — the same sweep deletes unreferenced `packages/blobs/…` rows+keys.
- (Alternative rejected: keying blobs by upload uuid like release assets —
- loses cross-owner dedup, the reason the blob table has four hash
- UNIQUEs.)
+   the final R2 key exists, but the body can only be read once. PROPOSAL:
+   single-pass hash-and-forward into `packages/tmp/<uuid>` (the LFS
+   relay-store pipeline verbatim, digest in the same pass), then ONE bounded
+   second pass streaming `bucket.get(tmp)` → `bucket.put(final-key)`, then
+   `bucket.delete(tmp)` — intra-datacenter bandwidth, no egress, ≤2
+   subrequest-classes per upload, and the D1 row lands only after the final
+   key is durably stored (row-first landing inverted: object-first here,
+   because D1 rows are only useful once the bytes they point at exist — the
+   release-asset relay completion idiom). Failure windows: a crash between
+   tmp-put and final-put leaves an orphan tmp object — the cleanup arm's
+   OLDER_THAN sweep deletes `packages/tmp/` objects past the window; a
+   crash between final-put and D1-insert leaves an unreferenced content blob
+   — the same sweep deletes unreferenced `packages/blobs/…` rows+keys.
+   (Alternative rejected: keying blobs by upload uuid like release assets —
+   loses cross-owner dedup, the reason the blob table has four hash
+   UNIQUEs.)
 2. **Duplicate-upload semantics** — upstream returns the EXISTING version
- row with `ErrDuplicatePackageVersion` on re-publish
- (package_version.go:48-67) and per-file duplicates answer 409
- (generic.go:128-131). Our services must mirror BOTH: `GetOrInsert`
- shapes for version/blob, 409 only when the same file
- (version+lower_name+composite_key) exists with DIFFERENT bytes; identical
- bytes → the idempotent no-op upstream's `GetOrInsertBlob` models.
+   row with `ErrDuplicatePackageVersion` on re-publish
+   (package_version.go:48-67) and per-file duplicates answer 409
+   (generic.go:128-131). Our services must mirror BOTH: `GetOrInsert`
+   shapes for version/blob, 409 only when the same file
+   (version+lower_name+composite_key) exists with DIFFERENT bytes; identical
+   bytes → the idempotent no-op upstream's `GetOrInsertBlob` models.
 3. **Streaming under the CPU cap** — `limits.cpu_ms` 300000 with waiting-on-
- R2 free (AGENTS.md Workers rules): the 512 MiB cap streams in 8 MiB
- multipart parts when Content-Length is absent-for-the-part (the
- release-asset multipart rule, release-assets.ts:33-51); the protocol
- routes REQUIRE Content-Length (411) like every landed upload family.
+   R2 free (AGENTS.md Workers rules): the 512 MiB cap streams in 8 MiB
+   multipart parts when Content-Length is absent-for-the-part (the
+   release-asset multipart rule, release-assets.ts:33-51); the protocol
+   routes REQUIRE Content-Length (411) like every landed upload family.
 4. **Property explosion** — properties are LONGTEXT key-value rows; a
- hostile client cannot create unbounded rows on one version (uploads are
- the only property writers in v1, and generic writes no properties at
- all). npm dist-tags and container digests arrive with their milestones
- and inherit the same writer-side discipline.
+   hostile client cannot create unbounded rows on one version (uploads are
+   the only property writers in v1, and generic writes no properties at
+   all). npm dist-tags and container digests arrive with their milestones
+   and inherit the same writer-side discipline.
 5. **Owner deletion cascade** — upstream `RemoveAllPackages`
- (packages.go:720-744) rides user/org deletion. Our user/org deletion
- cascade must add: delete the owner's `packages` rows (versions/files/
- properties/blobs rows) and their `packages/blobs/…` keys — EXCEPT keys
- still referenced by another owner's files (dedup makes ownership of
- bytes non-exclusive). PROPOSAL: the consumer deletes a content key only
- after confirming zero remaining file references (a SELECT before each
- delete, or the unreferenced-blob sweep as the sole deleter — decided at
- implementation, Open question 4).
+   (packages.go:720-744) rides user/org deletion. Our user/org deletion
+   cascade must add: delete the owner's `packages` rows (versions/files/
+   properties/blobs rows) and their `packages/blobs/…` keys — EXCEPT keys
+   still referenced by another owner's files (dedup makes ownership of
+   bytes non-exclusive). PROPOSAL: the consumer deletes a content key only
+   after confirming zero remaining file references (a SELECT before each
+   delete, or the unreferenced-blob sweep as the sole deleter — decided at
+   implementation, Open question 4).
 6. **Repo deletion does NOT touch packages** — the repo link is a pointer
- (`Package.RepoID`); upstream's repo delete unlinks, not deletes (the
- packages survive owner-scoped). Our purge pipeline
- (`src/repos/purge.ts`) needs NO changes in v1 because packages never
- write under `repos/<storage_key>/`; the purge arm adds an unlink
- (`UPDATE packages SET repo_id = NULL WHERE repo_id = ?`) to the repo
- delete transaction family — a service arm, not a purge change.
+   (`Package.RepoID`); upstream's repo delete unlinks, not deletes (the
+   packages survive owner-scoped). Our purge pipeline
+   (`src/repos/purge.ts`) needs NO changes in v1 because packages never
+   write under `repos/<storage_key>/`; the purge arm adds an unlink
+   (`UPDATE packages SET repo_id = NULL WHERE repo_id = ?`) to the repo
+   delete transaction family — a service arm, not a purge change.
 7. **Version ordering** — `lower_version` uniqueness makes version
- comparison a display concern; upstream sorts semver-aware types with
- hashicorp/go-version at the descriptor (`descriptor.go` `SemVer`). v1
- lists order by `created_unix DESC` (insertion recency, upstream's own
- default ordering for non-semver types); a JS semver compare arrives with
- the npm milestone (its consumers need it), not in the model.
+   comparison a display concern; upstream sorts semver-aware types with
+   hashicorp/go-version at the descriptor (`descriptor.go` `SemVer`). v1
+   lists order by `created_unix DESC` (insertion recency, upstream's own
+   default ordering for non-semver types); a JS semver compare arrives with
+   the npm milestone (its consumers need it), not in the model.
 8. **Download counters** — `IncrementDownloadCounter` is a bare SQL
- increment upstream (package_version.go:76-79). Drizzle-side: the same
- `SET x = x + 1` expression; D1 serializes it correctly per-row.
+   increment upstream (package_version.go:76-79). Drizzle-side: the same
+   `SET x = x + 1` expression; D1 serializes it correctly per-row.
 9. **The name/type enum surface** — `type` is upstream's string set; our D1
- column stays TEXT (not a CHECK list) so ecosystem milestones add types
- without migrations, matching upstream's open `Type` string model.
+   column stays TEXT (not a CHECK list) so ecosystem milestones add types
+   without migrations, matching upstream's open `Type` string model.
 10. **401 shape** — upstream's `reqPackageAccess` sets
- `WWW-Authenticate: Basic realm="Gitea Package API"` on scope failure
- (api.go:52-60) — our protocol routes mirror that header so real
- package-manager clients re-prompt for credentials.
+    `WWW-Authenticate: Basic realm="Gitea Package API"` on scope failure
+    (api.go:52-60) — our protocol routes mirror that header so real
+    package-manager clients re-prompt for credentials.
 
 ## 6. Testing plan
 
@@ -559,33 +559,33 @@ Worker vitest (real bindings, the `applyD1Migrations` + seeded-env idiom of
 the landed suites):
 
 - **Model**: TryInsert/GetOrInsert shapes (duplicate package → existing row;
- duplicate version → existing row + duplicate sentinel; blob dedup across
- owners — two owners, one blob row, two file rows); the UNIQUE arbitrations
- under concurrent inserts (D1 serializes — assert the constraint answers,
- not a race).
+  duplicate version → existing row + duplicate sentinel; blob dedup across
+  owners — two owners, one blob row, two file rows); the UNIQUE arbitrations
+  under concurrent inserts (D1 serializes — assert the constraint answers,
+  not a race).
 - **Storage service**: key construction format-gates (invalid sha256 segment
- → thrown before any R2 call); the PUT pipeline — tmp spool, final key,
- tmp deleted, hash verified (a corrupted-body test asserts the mismatch
- deletes the spool and rejects); Content-Length absent → 411; over-cap →
- 413 checked before and during streaming.
+  → thrown before any R2 call); the PUT pipeline — tmp spool, final key,
+  tmp deleted, hash verified (a corrupted-body test asserts the mismatch
+  deletes the spool and rejects); Content-Length absent → 411; over-cap →
+  413 checked before and during streaming.
 - **Generic protocol**: PUT/GET/HEAD/DELETE round-trip with a real
- package-manager-shaped body (curl-level conformance); name/version/filename
- validation rejections (upstream's regex set, generic.go:20-66); 409 on
- duplicate-different-bytes, idempotent on duplicate-same-bytes; 403 on
- quota; 401 with the `WWW-Authenticate` header on scope failure; download
- counters increment.
+  package-manager-shaped body (curl-level conformance); name/version/filename
+  validation rejections (upstream's regex set, generic.go:20-66); 409 on
+  duplicate-different-bytes, idempotent on duplicate-same-bytes; 403 on
+  quota; 401 with the `WWW-Authenticate` header on scope failure; download
+  counters increment.
 - **Management API**: the 9 ops against the wire shapes (structs/package.go
- fixtures); link/unlink round-trip; the repo filter of R16's source query
- (two repos, one owner — each tab sees only its own).
+  fixtures); link/unlink round-trip; the repo filter of R16's source query
+  (two repos, one owner — each tab sees only its own).
 - **Cleanup arm**: orphan blob + orphan spool sweep (a tmp object and an
- unreferenced blob older than the window are gone; young ones survive);
- rule execution (keep-count, remove-days) without index rebuilds; the
- producer gate (no rules enabled + no orphans → zero queue sends).
+  unreferenced blob older than the window are gone; young ones survive);
+  rule execution (keep-count, remove-days) without index rebuilds; the
+  producer gate (no rules enabled + no orphans → zero queue sends).
 - **Quota**: owner-total accumulation across two packages; admin bypass;
- `-1` defaults disable every check (the strict-polarity tripwire test
- pattern).
+  `-1` defaults disable every check (the strict-polarity tripwire test
+  pattern).
 - **Gates**: `pnpm typecheck`; `pnpm test:full` per ADR-0006 — a single-file
- `pnpm test` pass is never cited as suite-green.
+  `pnpm test` pass is never cited as suite-green.
 
 No engine-check `.mjs` arms exist for this SPEC — packages touches no engine
 code (§4.3); the vitest suites are the whole plan (the 0015 engine-check
@@ -594,39 +594,39 @@ idiom applies only where the vendored engine grows).
 ## 7. Milestones (the census's sizing, serializable)
 
 - **M1 — model + generic registry + management API** (size **L**; the
- census's package class is the whole family — this is its v1 core):
- migration + `src/services/packages/` (store + quota + descriptor) +
- generic protocol routes + the 9 ops + admin list + the cleanup arm +
- tests. Lands R04/R16's prerequisite (their rows un-defer the moment this
- ships) and closes the 9-op FEATURE-ABSENT class. No DO. One commit-unit;
- file-ownership: schema + services + api routes + a small index.ts mount
- addition (the `/api/packages` router — the orchestrator-designated owner
- rule applies to index.ts).
+  census's package class is the whole family — this is its v1 core):
+  migration + `src/services/packages/` (store + quota + descriptor) +
+  generic protocol routes + the 9 ops + admin list + the cleanup arm +
+  tests. Lands R04/R16's prerequisite (their rows un-defer the moment this
+  ships) and closes the 9-op FEATURE-ABSENT class. No DO. One commit-unit;
+  file-ownership: schema + services + api routes + a small index.ts mount
+  addition (the `/api/packages` router — the orchestrator-designated owner
+  rule applies to index.ts).
 - **M2 — R04/R16 UI pages** (size **M** per page, the census's own sizing
- for management tabs): the seven R04 arms + the R16 repo tab + the
- downstream settings/admin pages when their wave opens. UI wave —
- dispatches only after M1.
+  for management tabs): the seven R04 arms + the R16 repo tab + the
+  downstream settings/admin pages when their wave opens. UI wave —
+  dispatches only after M1.
 - **M3 — pypi + helm protocols** (size **S-M**): the two smallest
- index-render families (~250 lines upstream each) — the first real
- package-manager client conformance (`pip install -i …`). Rides M1's
- storage service unchanged.
+  index-render families (~250 lines upstream each) — the first real
+  package-manager client conformance (`pip install -i …`). Rides M1's
+  storage service unchanged.
 - **M4 — npm protocol** (size **M-L**): the multipart creator port
- (modules/packages/npm/creator.go, 486 lines upstream) + dist-tag
- properties + scoped-name paths + the semver ordering consumer.
+  (modules/packages/npm/creator.go, 486 lines upstream) + dist-tag
+  properties + scoped-name paths + the semver ordering consumer.
 - **M5 — maven + nuget** (size **M** each): path-group layout serving +
- metadata.xml generation; the OData/V3 dual wire.
+  metadata.xml generation; the OData/V3 dual wire.
 - **M6 — container (OCI)** (size **L**): the JWT token flow (an HS256
- secret posture — PROPOSAL: reuse the token-service discipline, decided at
- the milestone), chunked blob uploads with their upload-state machine,
- manifests, the `PropertyDigest` file properties, HEAD/GC-aware deletes.
- The only milestone that may need new infrastructure posture.
+  secret posture — PROPOSAL: reuse the token-service discipline, decided at
+  the milestone), chunked blob uploads with their upload-state machine,
+  manifests, the `PropertyDigest` file properties, HEAD/GC-aware deletes.
+  The only milestone that may need new infrastructure posture.
 - **M7 — the index-builder family** (size **L** each, demand-driven):
- debian/alpine/rpm/arch index renders (pure computation over the model +
- signed-key posture decisions), cargo LAST (the git-backed `_cargo-index`
- repo needs the files-service write path to exist for owner-scoped repos).
+  debian/alpine/rpm/arch index renders (pure computation over the model +
+  signed-key posture decisions), cargo LAST (the git-backed `_cargo-index`
+  repo needs the files-service write path to exist for owner-scoped repos).
 - **The long tail** (conan/composer/chef/conda/cran/go/pub/rubygems/swift/
- terraform/vagrant): no committed milestone — each is a client wire contract
- over the SAME model; dispatch on demand, sizes S-M.
+  terraform/vagrant): no committed milestone — each is a client wire contract
+  over the SAME model; dispatch on demand, sizes S-M.
 
 Entry criteria: ratified SPEC (this document → accepted), then M1 as a
 worker unit; M2+ per the census's wave discipline. Each ecosystem milestone
@@ -635,43 +635,43 @@ updates §2.1's table + the divergence ledger with its documented reductions.
 ## 8. Open questions (resolve at ratification)
 
 1. **Blob storage mechanics** — the tmp-spool + second-pass copy of §5.1 vs
- waiting for an R2 server-side copy affordance. Proposal: ship the two-pass
- (it is bounded, idempotent-failure-safe, and needs nothing new); revisit
- only if the second pass shows up in CPU profiles.
+   waiting for an R2 server-side copy affordance. Proposal: ship the two-pass
+   (it is bounded, idempotent-failure-safe, and needs nothing new); revisit
+   only if the second pass shows up in CPU profiles.
 2. **R2 namespace** — `packages/blobs/<sharded-sha256>` global-dedup
- (§4.2, upstream's model) vs per-owner prefixes (`packages/<owner_key>/…`,
- purge-friendly but dedup-losing). Proposal: global dedup; owner deletion
- uses the reference-counted delete of §5.5.
+   (§4.2, upstream's model) vs per-owner prefixes (`packages/<owner_key>/…`,
+   purge-friendly but dedup-losing). Proposal: global dedup; owner deletion
+   uses the reference-counted delete of §5.5.
 3. **Quota defaults** — `PACKAGES_LIMIT_SIZE_GENERIC` at 512 MiB
- (SPEC-0005 posture) vs upstream's unlimited-generic default. Proposal:
- 512 MiB — self-host R2 cost safety beats upstream parity; the var
- relaxes it.
+   (SPEC-0005 posture) vs upstream's unlimited-generic default. Proposal:
+   512 MiB — self-host R2 cost safety beats upstream parity; the var
+   relaxes it.
 4. **Cross-owner blob deletion** — confirm the reference-counted rule
- (§5.5): a content key is deletable only when zero file rows reference
- its blob id. Proposal: the unreferenced-sweep as the SOLE deleter of
- content keys (simpler, eventually-consistent), owner-cascade deleting
- rows only.
+   (§5.5): a content key is deletable only when zero file rows reference
+   its blob id. Proposal: the unreferenced-sweep as the SOLE deleter of
+   content keys (simpler, eventually-consistent), owner-cascade deleting
+   rows only.
 5. **Cleanup arm gating** — the packages cleanup is NOT demo-gated
- (§4.4), unlike the demo sweep; it deletes only what upstream's own
- midnight cron deletes. Confirm ratification accepts this as the second
- sanctioned producer block on the hourly entry (alongside audit
- retention).
+   (§4.4), unlike the demo sweep; it deletes only what upstream's own
+   midnight cron deletes. Confirm ratification accepts this as the second
+   sanctioned producer block on the hourly entry (alongside audit
+   retention).
 6. **Container upload state (M6 pre-read)** — upstream's
- `blob_uploader.go` persists upload sessions; on Workers the candidates
- are R2 multipart-upload handles (native, resumable, no D1 state) vs a D1
- upload-rows model. Deferred to the M6 SPEC-attachment; noted so it is
- not silently re-decided.
+   `blob_uploader.go` persists upload sessions; on Workers the candidates
+   are R2 multipart-upload handles (native, resumable, no D1 state) vs a D1
+   upload-rows model. Deferred to the M6 SPEC-attachment; noted so it is
+   not silently re-decided.
 7. **`repo_units` enum extension** — the packages unit (`TypePackages`,
- upstream unit 9) arrives when R16's tab visibility + repo settings
- toggle land (M2); the enum is `["code"]` today (schema.ts:292) and
- `repositories.hasPackages` (schema.ts:1301) is already carried. Proposal:
- extend the enum in the M2 migration, not M1 (no UI reads it before).
+   upstream unit 9) arrives when R16's tab visibility + repo settings
+   toggle land (M2); the enum is `["code"]` today (schema.ts:292) and
+   `repositories.hasPackages` (schema.ts:1301) is already carried. Proposal:
+   extend the enum in the M2 migration, not M1 (no UI reads it before).
 8. **Org-team package grants** — the accessMode-collapse fold of §4.1
- (team row mode ≥ read/write grants package access, no per-unit column)
- vs adding a `team_unit` packages row upstream-parity. Proposal: the
- collapse, consistent with the landed teams model; upstream parity can
- arrive as a columns migration later if a deployment needs per-unit
- granularity.
+   (team row mode ≥ read/write grants package access, no per-unit column)
+   vs adding a `team_unit` packages row upstream-parity. Proposal: the
+   collapse, consistent with the landed teams model; upstream parity can
+   arrive as a columns migration later if a deployment needs per-unit
+   granularity.
 
 ### Ratification (2026-10-29, orchestrator)
 
